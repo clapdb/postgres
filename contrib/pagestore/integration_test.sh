@@ -120,6 +120,24 @@ else
 fi
 rm -f "$out"
 
+# --- 5. per-page WAL index: decode WAL (reusing PG's reader) and query it ---
+$P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
+        AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE FUNCTION pagestore_walidx_count(regclass,int,int) RETURNS int
+        AS 'pagestore','pagestore_walidx_count' LANGUAGE C STRICT;" >/dev/null
+# write a fresh table and decode just-written WAL (still present in pg_wal)
+lsn0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE widx(id int) TABLESPACE ts; INSERT INTO widx SELECT generate_series(1,1000);" >/dev/null
+lsn1=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_index_wal('$lsn0', '$lsn1');" >/dev/null
+widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
+if [ "${widx:-0}" -gt 0 ]; then
+	echo "ok   - per-page WAL index built by decoding WAL (widx block 0 has $widx records)"
+else
+	echo "FAIL - per-page WAL index empty for widx block 0 (got '$widx')"
+	fail=1
+fi
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

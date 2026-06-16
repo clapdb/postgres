@@ -492,6 +492,34 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 	ls_exec(ch);
 }
 
+/* Record in the store that the WAL record at 'lsn' modifies (key, block). */
+void
+pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
+							  uint64 lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_WAL_INDEX_ADD;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+}
+
+/* Number of indexed WAL records that modify (key, block) on this timeline. */
+int
+pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
+{
+	PsChannel  *ch = ls_chan();
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = block;
+	ch->req_lsn = PG_UINT64_MAX;	/* all records */
+	ls_exec(ch);
+	return (int) ch->result;
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)
