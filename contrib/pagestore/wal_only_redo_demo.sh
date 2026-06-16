@@ -37,8 +37,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-store_size() { du -sb "$S" 2>/dev/null | cut -f1; }
-
 mkdir -p "$S"
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$S" >/dev/null 2>&1 &
@@ -81,10 +79,12 @@ done
 # table t's relation file exists locally (the writer did not page-ship it)
 relfile=$($P -c "SELECT pg_relation_filepath('t');")
 [ -f "$D/$relfile" ] && echo "ok   - writer kept table pages local (no page-ship): $relfile" \
-	|| { echo "FAIL - expected local relation file $relfile"; }
+	|| { echo "FAIL - expected local relation file $relfile"; exit 1; }
 "$BIN/pg_ctl" -D "$D" -m fast -w stop >/dev/null 2>&1
 
-before=$(store_size)
+# Remove the local heap file so that any later read of table t can ONLY be
+# served from the store -- i.e. from pages the redo worker materialized.
+rm -f "$D/$relfile"*
 
 # redo worker: now route relations to the store and recover from shipped WAL.
 sed -i 's/^pagestore.route_all = off/pagestore.route_all = on/' "$D/postgresql.conf"
@@ -94,19 +94,12 @@ rm -f "$D"/pg_wal/0000000*
 
 if "$BIN/pg_ctl" -D "$D" -l "$D/r.log" -w start >/dev/null 2>&1; then
 	val=$($P -c "SELECT v FROM t WHERE id=1;" 2>/dev/null)
-	after=$(store_size)
 	if [ "$val" = "changed" ]; then
-		echo "ok   - redo materialized table t into the store from WAL alone (v=changed)"
-	else
-		echo "FAIL - recovered value '$val', expected 'changed'"; exit 1
+		echo "ok   - table read served from the store (local heap removed); redo built it from WAL"
+		echo "wal-only redo demo: PASS"
+		exit 0
 	fi
-	if [ "${after:-0}" -gt "${before:-0}" ]; then
-		echo "ok   - store grew via redo (${before} -> ${after} bytes; pages produced by redo, not the compute)"
-	else
-		echo "FAIL - store did not grow ($before -> $after); redo produced no pages"; exit 1
-	fi
-	echo "wal-only redo demo: PASS"
-	exit 0
+	echo "FAIL - read '$val', expected 'changed' (store should hold redo-built pages)"
 else
 	echo "FAIL - redo worker did not start; log:"; tail -5 "$D/r.log" 2>/dev/null
 fi
