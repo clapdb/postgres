@@ -478,6 +478,15 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	char	   *buf;
 	uint64		off = 0;
 
+	/*
+	 * Only ship real WAL segment files.  The archiver also offers backup
+	 * history (".backup") and timeline history (".history") files, whose names
+	 * begin with a segment number -- shipping them would clobber that segment's
+	 * WAL in the store.  Report them archived without storing them.
+	 */
+	if (!IsXLogFileName(file))
+		return true;
+
 	XLogFromFileName(file, &tli, &segno, wal_segment_size);
 	XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, seg_start);
 

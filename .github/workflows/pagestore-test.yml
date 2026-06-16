@@ -59,3 +59,6 @@ jobs:
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
+
+      - name: Run WAL-redo worker demo
+        run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
