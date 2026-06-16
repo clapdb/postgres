@@ -56,6 +56,19 @@ check(int cond, const char *fmt, ...)
 	va_end(ap);
 }
 
+/* Best-effort recursive remove of a directory (test setup/teardown). */
+static void
+rm_rf(const char *path)
+{
+	char		cmd[512];
+
+	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
+	if (system(cmd) != 0)
+	{
+		/* ignore: cleanup is best-effort */
+	}
+}
+
 /* ===================== client side of the IPC protocol ================= */
 
 static void *cl_shm;
@@ -357,7 +370,6 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 {
 	char		shm[64];
 	char		store[256];
-	char		cmd[512];
 	pid_t		dpid;
 	unsigned char *pa,
 			   *pb,
@@ -367,9 +379,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_%u", (int) getpid(), page_size);
 	snprintf(store, sizeof(store), "%s/store_%u", tmpbase, page_size);
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", store);
-	if (system(cmd) != 0)	/* fresh store */
-		 /* ignore */ ;
+	rm_rf(store);				/* start from a clean store */
 	shm_unlink(shm);
 
 	pa = malloc(page_size);
@@ -453,9 +463,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	client_detach();
 	stop_daemon(dpid);
 
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", store);
-	if (system(cmd) != 0)
-		 /* ignore */ ;
+	rm_rf(store);
 	shm_unlink(shm);
 	free(pa);
 	free(pb);
