@@ -197,8 +197,16 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.forkNum = key->forkNum;
 }
 
-/* --- vtable ops --------------------------------------------------------- */
+/*
+ * --- vtable ops ---------------------------------------------------------
+ *
+ * Each op fills the claimed channel's request fields and calls ls_exec(),
+ * which posts it to the daemon and waits for the result.  See the
+ * PageStoreBackend interface in pagestore_backend.h for the exact contract of
+ * each operation.
+ */
 
+/* Create the fork (make it exist with zero blocks). */
 static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
@@ -210,6 +218,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 	ls_exec(ch);
 }
 
+/* Does the fork exist in the store? */
 static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
@@ -221,6 +230,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 	return ch->result != 0;
 }
 
+/* Remove the fork entirely. */
 static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
@@ -232,6 +242,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 	ls_exec(ch);
 }
 
+/* Current size of the fork, in blocks. */
 static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
@@ -243,6 +254,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 	return (BlockNumber) ch->result;
 }
 
+/* Shrink the fork to 'nblocks' blocks. */
 static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
@@ -256,6 +268,11 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ls_exec(ch);
 }
 
+/*
+ * Read nblocks pages starting at blocknum into buffers[].  A request carries at
+ * most one io_unit of page data, so larger reads are split into io_unit-sized
+ * chunks; the daemon's page bytes are copied out of the channel buffer.
+ */
 static void
 ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
@@ -279,6 +296,10 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 	}
 }
 
+/*
+ * Overwrite nblocks existing pages starting at blocknum from buffers[].  Pages
+ * are copied into the channel buffer and sent in io_unit-sized chunks.
+ */
 static void
 ls_writev(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void **buffers, BlockNumber nblocks,
@@ -303,6 +324,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 	}
 }
 
+/* Grow the fork by one block at blocknum, written from buffer. */
 static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
@@ -318,6 +340,10 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 	ls_exec(ch);
 }
 
+/*
+ * Grow the fork by nblocks zero-filled blocks at blocknum, with no page data
+ * sent (bulk pre-allocation; the new pages read back as zeros).
+ */
 static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
@@ -332,6 +358,7 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ls_exec(ch);
 }
 
+/* Flush the fork's data durably in the daemon (fsync). */
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
