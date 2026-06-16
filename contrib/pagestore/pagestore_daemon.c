@@ -628,6 +628,100 @@ wal_recover_one(uint32_t tl)
 	close(fd);
 }
 
+/* ===================== per-page WAL index ============================== */
+
+/*
+ * Maps (timeline, key, block) -> the LSNs of WAL records that modify that page,
+ * in ascending order.  This is the lookup single-page materialization needs: to
+ * rebuild page P as-of LSN L, take P's newest stored image and replay the WAL
+ * records whose LSNs fall after it and <= L.  Populated by decoding shipped WAL
+ * (next milestone); queried via PS_OP_WAL_INDEX_GET.
+ *
+ * In-memory only for now (rebuilt by re-decoding WAL after a restart).
+ */
+typedef struct WalIdxEnt
+{
+	struct WalIdxEnt *next;
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t   *lsns;			/* ascending */
+	int			n;
+	int			cap;
+} WalIdxEnt;
+
+static WalIdxEnt *walidx[IDX_BUCKETS];
+
+static void
+walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	uint32_t	h = page_hash(tl, key, block);
+	WalIdxEnt  *e;
+
+	for (e = walidx[h & IDX_MASK]; e; e = e->next)
+		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+			break;
+	if (!e)
+	{
+		e = calloc(1, sizeof(*e));
+		e->timeline = tl;
+		e->key = *key;
+		e->block = block;
+		e->next = walidx[h & IDX_MASK];
+		walidx[h & IDX_MASK] = e;
+	}
+	if (e->n == e->cap)
+	{
+		e->cap = e->cap ? e->cap * 2 : 4;
+		e->lsns = realloc(e->lsns, (size_t) e->cap * sizeof(uint64_t));
+	}
+	/* keep ascending; WAL is appended in LSN order, so usually just append */
+	if (e->n == 0 || lsn >= e->lsns[e->n - 1])
+		e->lsns[e->n++] = lsn;
+	else
+	{
+		int			i = e->n;
+
+		while (i > 0 && e->lsns[i - 1] > lsn)
+		{
+			e->lsns[i] = e->lsns[i - 1];
+			i--;
+		}
+		e->lsns[i] = lsn;
+		e->n++;
+	}
+}
+
+/* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
+ * max_out); return how many.  Walks the timeline ancestry. */
+static int
+walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
+		   uint64_t *out, int max_out)
+{
+	int			got = 0;
+
+	for (;;)
+	{
+		uint32_t	h = page_hash(tl, key, block);
+		WalIdxEnt  *e;
+
+		for (e = walidx[h & IDX_MASK]; e; e = e->next)
+			if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+			{
+				for (int i = 0; i < e->n && got < max_out; i++)
+					if (e->lsns[i] <= lsn_max)
+						out[got++] = e->lsns[i];
+				break;
+			}
+		if (!timeline_has_parent(tl))
+			break;
+		if (timelines[tl].branch_lsn < lsn_max)
+			lsn_max = timelines[tl].branch_lsn;
+		tl = (uint32_t) timelines[tl].parent;
+	}
+	return got;
+}
+
 /* ===================== write / read primitives ========================= */
 
 /* The page's own pd_lsn lives in its first 8 bytes (xlogid, xrecoff). */
@@ -869,6 +963,16 @@ handle_request(PsChannel *ch)
 
 		case PS_OP_WAL_READ:
 			ch->result = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
+			break;
+
+		case PS_OP_WAL_INDEX_ADD:
+			walidx_add(tl, &ch->key, ch->blocknum, ch->req_lsn);
+			break;
+
+		case PS_OP_WAL_INDEX_GET:
+			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
+											   ch->req_lsn, (uint64_t *) ch->data,
+											   (int) (PS_IO_UNIT / sizeof(uint64_t)));
 			break;
 
 		case PS_OP_IMMEDSYNC:
