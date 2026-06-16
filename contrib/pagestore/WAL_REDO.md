@@ -36,8 +36,15 @@ read pages at an LSN.
      `pagestore_walrestore` does this and works as a `restore_command`
      (`pagestore_walrestore --shm NAME --timeline N --segsize B %f %p`); the
      integration test reconstructs a shipped segment as a full standard segment.
-   - **3b** Bring up a PG node in standby/recovery with `route_all` on the store
-     and point its WAL source at the store; verify it materializes pages.
+   - **3b** Bring up a PG node in archive recovery with `route_all` on the store
+     and its WAL fetched from the store; verify it materializes pages. ✅
+     `redo_worker_demo.sh`: a base backup (`pg_backup_start`/`stop`) marks the
+     recovery start, then the instance recovers with
+     `restore_command = pagestore_walrestore` and empty local pg_wal, so all WAL
+     comes from the store; recovery's rm_redo replays it into the store and the
+     post-backup change is recovered.  Reuses PostgreSQL's redo wholesale.
+     Caveat: the redo instance runs with `recovery_prefetch = off` (the
+     backend's recovery-prefetch/AIO path is not wired yet).
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
      everything.  This is where a `--wal-redo`-style single-page helper, or a
