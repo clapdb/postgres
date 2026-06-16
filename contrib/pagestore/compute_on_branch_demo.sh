@@ -47,7 +47,7 @@ DATA=$(mktemp -d)/pgdata
 STORE=$(mktemp -d)/store
 SHM=/pscob_$$
 PORT=54450
-P="$BIN/psql -p $PORT -U postgres -tA"
+P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
