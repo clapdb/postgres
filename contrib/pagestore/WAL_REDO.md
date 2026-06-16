@@ -54,7 +54,15 @@ read pages at an LSN.
      point of redo: the store's pages come from WAL, not from the compute.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
-     everything.  A `--wal-redo`-style single-page helper, or bounded recovery.
+     everything.
+       - **3c-1** Per-page WAL index. ✅ The store maps (timeline, key, block) ->
+         the LSNs of WAL records that modify that page (`PS_OP_WAL_INDEX_ADD` /
+         `PS_OP_WAL_INDEX_GET`, with branch read-through capped at the fork LSN).
+         This is the lookup the single-page redo needs.  (Populating it by
+         decoding shipped WAL via PostgreSQL's XLogReader / pg_walinspect is next;
+         reimplementing the WAL format in the daemon is deliberately avoided.)
+       - **3c-2** A `--wal-redo`-style single-page helper: take a page's newest
+         stored image plus its indexed records up to L and apply rm_redo.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no
