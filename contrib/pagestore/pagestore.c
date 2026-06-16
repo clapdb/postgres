@@ -419,6 +419,32 @@ pagestore_read_at(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * pagestore_create_branch(new_timeline int, parent_timeline int, lsn pg_lsn)
+ *
+ * Create a copy-on-write branch: a new timeline forked from parent_timeline at
+ * the given LSN.  Instant -- no page data is copied; the branch shares the
+ * parent's pages until it writes.  A compute can then run on the branch by
+ * setting pagestore.timeline to new_timeline.
+ */
+PG_FUNCTION_INFO_V1(pagestore_create_branch);
+
+Datum
+pagestore_create_branch(PG_FUNCTION_ARGS)
+{
+	int32		new_tl = PG_GETARG_INT32(0);
+	int32		parent_tl = PG_GETARG_INT32(1);
+	XLogRecPtr	lsn = PG_GETARG_LSN(2);
+
+	if (new_tl <= 0)
+		ereport(ERROR,
+				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
+
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) lsn);
+	PG_RETURN_VOID();
+}
+
 void
 _PG_init(void)
 {
