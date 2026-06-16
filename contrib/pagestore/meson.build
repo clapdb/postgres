@@ -26,6 +26,22 @@ pagestore_daemon = executable('pagestore_daemon',
 )
 contrib_targets += pagestore_daemon
 
+# Import an existing PGDATA's relation files into the daemon, so a whole
+# database can be moved onto the page store.  Freestanding like the daemon.
+pagestore_import = executable('pagestore_import',
+  files('pagestore_import.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_import
+
+# Reconstruct a standard WAL segment from the store's shipped WAL; usable as a
+# restore_command so a recovery instance can replay store-resident WAL.
+pagestore_walrestore = executable('pagestore_walrestore',
+  files('pagestore_walrestore.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_walrestore
+
 # Standalone test harness: drives the daemon over the shared-memory protocol
 # with no PostgreSQL instance.  Run independently of the PG test suites with:
 #   meson test -C <build> --suite pagestore
