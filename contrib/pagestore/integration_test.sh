@@ -30,7 +30,9 @@ TS=$(mktemp -d)/ts
 STORE=$(mktemp -d)/store
 SHM=/psint_$$
 PORT=54460
-P="$BIN/psql -p $PORT -U postgres -tA"
+# connect over TCP: the server's unix-socket directory varies by build/distro,
+# but -A trust allows 127.0.0.1, so TCP is portable across environments (CI).
+P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 fail=0
 
 assert() {  # $1=actual $2=expected $3=message
