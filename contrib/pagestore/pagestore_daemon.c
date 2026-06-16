@@ -71,6 +71,7 @@ on_signal(int sig)
 typedef struct SegRecHdr
 {
 	uint32_t	magic;			/* SEG_MAGIC; also the end-of-log sentinel */
+	uint32_t	timeline;		/* timeline the version belongs to */
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;			/* the page's pd_lsn at write time */
@@ -127,11 +128,13 @@ seg_fd(int id, int create)
  * Two chained hash tables form the indirection map that lets a single logical
  * page be located inside the large append-only segments:
  *
- *	 page_idx: (key, block) -> chain of every stored version {lsn, seg, off}
- *	 fork_idx: (key)        -> current size of the fork in blocks
+ *	 page_idx: (timeline, key, block) -> chain of versions {lsn, seg, off}
+ *	 fork_idx: (timeline, key)        -> size of the fork on that timeline
  *
- * Both are pure in-memory state, rebuilt from the segments by recover() at
- * startup.  (Prototype: no GC/compaction, so the version chain only grows.)
+ * Entries are keyed by timeline so a branch's writes are isolated; reads that
+ * miss on a timeline fall through to its parent (see read_through()).  Both
+ * tables are in-memory state, rebuilt from the segments by recover().
+ * (Prototype: no GC/compaction, so the version chain only grows.)
  */
 #define IDX_BUCKETS		(1 << 16)
 #define IDX_MASK		(IDX_BUCKETS - 1)
@@ -144,10 +147,11 @@ typedef struct PageVer
 	uint64_t	off;			/* byte offset of the page within that segment */
 } PageVer;
 
-/* Hash entry: all versions ever written for one (key, block), in arrival order. */
+/* Hash entry: all versions of one (timeline, key, block), in arrival order. */
 typedef struct PageEnt
 {
 	struct PageEnt *next;		/* bucket chain */
+	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	block;
 	PageVer    *vers;			/* dynamic array, length nver, capacity cap */
@@ -155,16 +159,33 @@ typedef struct PageEnt
 	int			cap;
 } PageEnt;
 
-/* Hash entry: the block count of one relation fork. */
+/* Hash entry: the block count of one fork on one timeline. */
 typedef struct ForkEnt
 {
 	struct ForkEnt *next;		/* bucket chain */
+	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	nblocks;
 } ForkEnt;
 
 static PageEnt *page_idx[IDX_BUCKETS];
 static ForkEnt *fork_idx[IDX_BUCKETS];
+
+/*
+ * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
+ * parent and the LSN at which it forked; reads of pages the branch never wrote
+ * fall through to the parent as-of that branch LSN, so the branch is a stable
+ * copy-on-write snapshot.
+ */
+#define MAX_TIMELINES	1024
+typedef struct TimelineMeta
+{
+	int			defined;		/* 1 if this timeline exists */
+	int			parent;			/* parent timeline id, or -1 for the root */
+	uint64_t	branch_lsn;		/* parent LSN this timeline forked at */
+} TimelineMeta;
+
+static TimelineMeta timelines[MAX_TIMELINES];
 
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
@@ -189,37 +210,44 @@ key_eq(const PsKey *a, const PsKey *b)
 		a->relNumber == b->relNumber && a->forkNum == b->forkNum;
 }
 
-/* --- page index --- */
+/* --- page index (keyed by timeline, key, block) --- */
+
+static uint32_t
+page_hash(uint32_t timeline, const PsKey *key, uint32_t block)
+{
+	return fnv(key, sizeof(*key)) ^ (block * 2654435761u) ^ (timeline * 40503u);
+}
 
 static PageEnt *
-page_find(const PsKey *key, uint32_t block)
+page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 {
-	uint32_t	h = fnv(key, sizeof(*key)) ^ (block * 2654435761u);
+	uint32_t	h = page_hash(timeline, key, block);
 	PageEnt    *e;
 
 	for (e = page_idx[h & IDX_MASK]; e; e = e->next)
-		if (e->block == block && key_eq(&e->key, key))
+		if (e->timeline == timeline && e->block == block && key_eq(&e->key, key))
 			return e;
 	return NULL;
 }
 
 /*
- * Record a new version of (key, block).  This only ever appends to the version
- * chain -- existing versions are never dropped -- which is what makes the store
- * copy-on-write.  Called both from the live write path (append_page) and from
+ * Record a new version of (timeline, key, block).  Only ever appends to the
+ * version chain -- existing versions are never dropped -- which is what makes
+ * the store copy-on-write.  The version is tagged with the writing timeline, so
+ * a branch's writes never disturb its parent.  Called from append_page and from
  * recover() while replaying segments.
  */
 static void
-page_add_version(const PsKey *key, uint32_t block, uint64_t lsn,
-				 int seg, uint64_t off)
+page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
+				 uint64_t lsn, int seg, uint64_t off)
 {
-	uint32_t	h = fnv(key, sizeof(*key)) ^ (block * 2654435761u);
-	PageEnt    *e = page_find(key, block);
+	uint32_t	h = page_hash(timeline, key, block);
+	PageEnt    *e = page_find(timeline, key, block);
 
 	if (!e)
 	{
-		/* first version of this page: create the bucket entry */
 		e = calloc(1, sizeof(*e));
+		e->timeline = timeline;
 		e->key = *key;
 		e->block = block;
 		e->next = page_idx[h & IDX_MASK];
@@ -236,66 +264,46 @@ page_add_version(const PsKey *key, uint32_t block, uint64_t lsn,
 	e->nver++;
 }
 
-/* Newest version overall -- what an ordinary (current) read returns. */
+/* Newest version on this entry with lsn <= read_lsn, or NULL if none. */
 static PageVer *
-page_current(PageEnt *e)
+page_visible(PageEnt *e, uint64_t read_lsn)
 {
 	PageVer    *best = NULL;
-
-	for (int i = 0; i < e->nver; i++)
-		if (!best || e->vers[i].lsn >= best->lsn)
-			best = &e->vers[i];
-	return best;
-}
-
-/*
- * Time-travel read: the version visible as-of snapshot LSN 'target', i.e. the
- * newest version with lsn <= target.  If the target predates every recorded
- * version (none qualifies) we fall back to the oldest version we have, so an
- * as-of read never returns "nothing" for a page that exists.  This is the read
- * side of COW.
- */
-static PageVer *
-page_asof(PageEnt *e, uint64_t target)
-{
-	PageVer    *best = NULL;	/* best so far with lsn <= target */
-	PageVer    *oldest = NULL;	/* fallback if nothing is <= target */
 
 	for (int i = 0; i < e->nver; i++)
 	{
 		PageVer    *v = &e->vers[i];
 
-		if (!oldest || v->lsn < oldest->lsn)
-			oldest = v;
-		if (v->lsn <= target && (!best || v->lsn >= best->lsn))
+		if (v->lsn <= read_lsn && (!best || v->lsn >= best->lsn))
 			best = v;
 	}
-	return best ? best : oldest;
+	return best;
 }
 
-/* --- fork size index --- */
+/* --- fork size index (keyed by timeline, key) --- */
 
 static ForkEnt *
-fork_find(const PsKey *key)
+fork_find(uint32_t timeline, const PsKey *key)
 {
-	uint32_t	h = fnv(key, sizeof(*key));
+	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
 	ForkEnt    *e;
 
 	for (e = fork_idx[h & IDX_MASK]; e; e = e->next)
-		if (key_eq(&e->key, key))
+		if (e->timeline == timeline && key_eq(&e->key, key))
 			return e;
 	return NULL;
 }
 
 static ForkEnt *
-fork_get_or_create(const PsKey *key)
+fork_get_or_create(uint32_t timeline, const PsKey *key)
 {
-	uint32_t	h = fnv(key, sizeof(*key));
-	ForkEnt    *e = fork_find(key);
+	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	ForkEnt    *e = fork_find(timeline, key);
 
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
+		e->timeline = timeline;
 		e->key = *key;
 		e->nblocks = 0;
 		e->next = fork_idx[h & IDX_MASK];
@@ -305,23 +313,23 @@ fork_get_or_create(const PsKey *key)
 }
 
 static void
-fork_grow(const PsKey *key, uint32_t to_nblocks)
+fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks)
 {
-	ForkEnt    *e = fork_get_or_create(key);
+	ForkEnt    *e = fork_get_or_create(timeline, key);
 
 	if (to_nblocks > e->nblocks)
 		e->nblocks = to_nblocks;
 }
 
 static void
-fork_remove(const PsKey *key)
+fork_remove(uint32_t timeline, const PsKey *key)
 {
-	uint32_t	h = fnv(key, sizeof(*key));
+	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
 	ForkEnt   **pp = &fork_idx[h & IDX_MASK];
 
 	while (*pp)
 	{
-		if (key_eq(&(*pp)->key, key))
+		if ((*pp)->timeline == timeline && key_eq(&(*pp)->key, key))
 		{
 			ForkEnt    *dead = *pp;
 
@@ -331,6 +339,127 @@ fork_remove(const PsKey *key)
 		}
 		pp = &(*pp)->next;
 	}
+}
+
+/* --- timeline metadata + read-through --- */
+
+static void
+timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
+{
+	if (id >= MAX_TIMELINES)
+		return;
+	timelines[id].defined = 1;
+	timelines[id].parent = parent;
+	timelines[id].branch_lsn = branch_lsn;
+}
+
+static int
+timeline_has_parent(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timelines[timeline].defined &&
+		timelines[timeline].parent >= 0;
+}
+
+/*
+ * Resolve a read by walking the timeline ancestry: return the newest version of
+ * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
+ * the page (or only after read_lsn), descend to the parent, capping read_lsn at
+ * the branch LSN so the branch sees a frozen snapshot of the parent.  Returns
+ * the chosen PageVer, or NULL if no ancestor has the page.
+ */
+static PageVer *
+read_through(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn)
+{
+	for (;;)
+	{
+		PageEnt    *e = page_find(timeline, key, block);
+		PageVer    *v = e ? page_visible(e, read_lsn) : NULL;
+
+		if (v)
+			return v;
+		if (!timeline_has_parent(timeline))
+			return NULL;
+		if (timelines[timeline].branch_lsn < read_lsn)
+			read_lsn = timelines[timeline].branch_lsn;
+		timeline = (uint32_t) timelines[timeline].parent;
+	}
+}
+
+/* Fork size visible on 'timeline', inheriting the parent's when not local. */
+static uint32_t
+fork_nblocks_through(uint32_t timeline, const PsKey *key)
+{
+	for (;;)
+	{
+		ForkEnt    *e = fork_find(timeline, key);
+
+		if (e)
+			return e->nblocks;
+		if (!timeline_has_parent(timeline))
+			return 0;
+		timeline = (uint32_t) timelines[timeline].parent;
+	}
+}
+
+/* Does the fork exist on 'timeline' or any ancestor? */
+static int
+fork_exists_through(uint32_t timeline, const PsKey *key)
+{
+	for (;;)
+	{
+		if (fork_find(timeline, key))
+			return 1;
+		if (!timeline_has_parent(timeline))
+			return 0;
+		timeline = (uint32_t) timelines[timeline].parent;
+	}
+}
+
+/*
+ * Timeline metadata is persisted as an append-only log of fixed records in
+ * "<store>/timelines", so branches survive a daemon restart.  (The page data
+ * itself is already durable in the segments.)
+ */
+typedef struct TimelineRec
+{
+	uint32_t	id;
+	int32_t		parent;
+	uint64_t	branch_lsn;
+} TimelineRec;
+
+static void
+timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
+{
+	char		path[4096];
+	int			fd;
+	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
+
+	snprintf(path, sizeof(path), "%s/timelines", store_dir);
+	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	if (fd < 0)
+		return;					/* best-effort */
+	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
+	{
+		/* ignore: best-effort */
+	}
+	close(fd);
+}
+
+static void
+load_timelines(void)
+{
+	char		path[4096];
+	int			fd;
+	TimelineRec rec;
+
+	snprintf(path, sizeof(path), "%s/timelines", store_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;					/* none yet */
+	while (read(fd, &rec, sizeof(rec)) == (ssize_t) sizeof(rec))
+		timeline_define(rec.id, rec.parent, rec.branch_lsn);
+	close(fd);
 }
 
 /* ===================== write / read primitives ========================= */
@@ -354,7 +483,8 @@ page_lsn(const unsigned char *page)
  * NVMe/SPDK and network transports.
  */
 static int
-append_page(const PsKey *key, uint32_t block, const unsigned char *page)
+append_page(uint32_t timeline, const PsKey *key, uint32_t block,
+			const unsigned char *page)
 {
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
@@ -372,6 +502,7 @@ append_page(const PsKey *key, uint32_t block, const unsigned char *page)
 		return -1;
 
 	hdr.magic = SEG_MAGIC;
+	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
 	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
@@ -385,7 +516,7 @@ append_page(const PsKey *key, uint32_t block, const unsigned char *page)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(key, block, hdr.lsn, cur_seg, data_off);
+	page_add_version(timeline, key, block, hdr.lsn, cur_seg, data_off);
 	cur_off += reclen;
 	return 0;
 }
@@ -445,9 +576,9 @@ recover(void)
 				hdr.len != page_size)
 				break;
 
-			page_add_version(&hdr.key, hdr.block, hdr.lsn, id,
+			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
 							 off + sizeof(hdr));
-			fork_grow(&hdr.key, hdr.block + 1);
+			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
 		close(fd);
@@ -466,51 +597,49 @@ recover(void)
 static void
 handle_request(PsChannel *ch)
 {
+	uint32_t	tl = ch->timeline;
+
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
 
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_CREATE:
-			fork_get_or_create(&ch->key);
+			fork_get_or_create(tl, &ch->key);
 			break;
 
 		case PS_OP_EXISTS:
-			ch->result = (fork_find(&ch->key) != NULL) ? 1 : 0;
+			ch->result = fork_exists_through(tl, &ch->key) ? 1 : 0;
 			break;
 
 		case PS_OP_UNLINK:
-			fork_remove(&ch->key);
+			fork_remove(tl, &ch->key);
 			break;
 
 		case PS_OP_NBLOCKS:
-			{
-				ForkEnt    *fe = fork_find(&ch->key);
-
-				ch->result = fe ? fe->nblocks : 0;
-				break;
-			}
+			ch->result = fork_nblocks_through(tl, &ch->key);
+			break;
 
 		case PS_OP_TRUNCATE:
-			fork_get_or_create(&ch->key)->nblocks = ch->nblocks;
+			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;
 			break;
 
 		case PS_OP_EXTEND:
-			if (append_page(&ch->key, ch->blocknum, ch->data) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data) != 0)
 				ch->status = PS_STATUS_ERROR;
 			else
-				fork_grow(&ch->key, ch->blocknum + 1);
+				fork_grow(tl, &ch->key, ch->blocknum + 1);
 			break;
 
 		case PS_OP_ZEROEXTEND:
 			/* allocation only: grow size, no page data stored (reads -> 0) */
-			fork_grow(&ch->key, ch->blocknum + ch->nblocks);
+			fork_grow(tl, &ch->key, ch->blocknum + ch->nblocks);
 			break;
 
 		case PS_OP_WRITEV:
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
-				if (append_page(&ch->key, ch->blocknum + i,
+				if (append_page(tl, &ch->key, ch->blocknum + i,
 								 ch->data + (size_t) i * page_size) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
@@ -518,15 +647,16 @@ handle_request(PsChannel *ch)
 				}
 			}
 			if (ch->status == PS_STATUS_OK)
-				fork_grow(&ch->key, ch->blocknum + ch->nblocks);
+				fork_grow(tl, &ch->key, ch->blocknum + ch->nblocks);
 			break;
 
 		case PS_OP_READV:
+			/* "current" read on this timeline: read-through at max LSN */
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				unsigned char *dst = ch->data + (size_t) i * page_size;
-				PageEnt    *e = page_find(&ch->key, ch->blocknum + i);
-				PageVer    *v = e ? page_current(e) : NULL;
+				PageVer    *v = read_through(tl, &ch->key, ch->blocknum + i,
+											 UINT64_MAX);
 
 				if (!v || read_version(v, dst) != 0)
 					memset(dst, 0, page_size);	/* unwritten -> zeros */
@@ -535,13 +665,32 @@ handle_request(PsChannel *ch)
 
 		case PS_OP_READ_AT:
 			{
-				PageEnt    *e = page_find(&ch->key, ch->blocknum);
-				PageVer    *v = e ? page_asof(e, ch->req_lsn) : NULL;
+				/* as-of read on this timeline, honoring branch ancestry */
+				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
+											 ch->req_lsn);
 
 				if (!v || read_version(v, ch->data) != 0)
 					memset(ch->data, 0, page_size);
 				break;
 			}
+
+		case PS_OP_CREATE_BRANCH:
+			/*
+			 * Instant clone: just record metadata.  Timeline ch->timeline forks
+			 * from ch->parent_timeline at LSN ch->req_lsn.  No page data is
+			 * copied -- the branch shares the parent's pages by read-through
+			 * until it writes (copy-on-write).
+			 */
+			if (ch->timeline == 0 || ch->timeline >= MAX_TIMELINES)
+				ch->status = PS_STATUS_ERROR;
+			else
+			{
+				timeline_define(ch->timeline, (int) ch->parent_timeline,
+								ch->req_lsn);
+				timeline_persist(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn);
+			}
+			break;
 
 		case PS_OP_IMMEDSYNC:
 			for (int id = 0; id < segs_cap; id++)
@@ -593,7 +742,9 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	/* rebuild indexes from existing segments before serving any request */
+	/* timeline 0 is the root; load any persisted branches, then replay data */
+	timeline_define(0, -1, 0);
+	load_timelines();
 	recover();
 
 	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
