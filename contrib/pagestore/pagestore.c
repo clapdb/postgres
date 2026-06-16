@@ -644,6 +644,111 @@ pagestore_walidx_count(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(n);
 }
 
+/*
+ * pagestore_redo_page(rel regclass, forknum int, blocknum int, lsn pg_lsn)
+ *   -> bytea
+ *
+ * Single-page materialization, base-image step: return the newest full-page
+ * image of the page at/below 'lsn', found via the per-page index and restored
+ * with RestoreBlockImage -- reconstructing a page from WAL alone, on demand,
+ * for one page (instead of replaying everything).
+ *
+ * Note this returns the *base* image: a WAL full-page image is the page as it
+ * was when that record needed torn-page protection, so to get the page exactly
+ * as-of 'lsn' a single-page redo must then apply the delta records after the
+ * image with rm_redo (the `--wal-redo`-style helper -- the remaining step).
+ * Returns NULL if no full-page image for the page is indexed at/below lsn.
+ */
+#define PS_REDO_MAX_RECS 4096
+
+PG_FUNCTION_INFO_V1(pagestore_redo_page);
+
+Datum
+pagestore_redo_page(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	Relation	rel;
+	PageStoreRelKey key;
+	uint64	   *lsns;
+	int			n;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char	   *page;
+	bytea	   *result = NULL;
+
+	rel = relation_open(relid, AccessShareLock);
+	key.spcOid = rel->rd_locator.spcOid;
+	key.dbOid = rel->rd_locator.dbOid;
+	key.relNumber = rel->rd_locator.relNumber;
+	key.forkNum = forknum;
+	relation_close(rel, AccessShareLock);
+
+	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
+									  lsns, PS_REDO_MAX_RECS);
+	if (n == 0)
+		PG_RETURN_NULL();
+
+	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+	{
+		pfree(pd);
+		PG_RETURN_NULL();
+	}
+	page = palloc(BLCKSZ);
+
+	/* newest indexed record first: find one carrying a full-page image */
+	for (int i = n - 1; i >= 0 && result == NULL; i--)
+	{
+		char	   *errm;
+		XLogRecord *rec;
+
+		XLogBeginRead(reader, lsns[i]);
+		rec = XLogReadRecord(reader, &errm);
+		if (rec == NULL)
+			continue;
+
+		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		{
+			RelFileLocator rloc;
+			ForkNumber	fk;
+			BlockNumber blk;
+
+			if (!XLogRecHasBlockImage(reader, b))
+				continue;
+			XLogRecGetBlockTagExtended(reader, b, &rloc, &fk, &blk, NULL);
+			if (rloc.relNumber != key.relNumber || rloc.dbOid != key.dbOid ||
+				rloc.spcOid != key.spcOid || fk != forknum ||
+				blk != (BlockNumber) blocknum)
+				continue;
+			if (RestoreBlockImage(reader, b, page))
+			{
+				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+				SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+				memcpy(VARDATA(result), page, BLCKSZ);
+			}
+			break;
+		}
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(lsns);
+	pfree(page);
+
+	if (result == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(result);
+}
+
 void
 _PG_init(void)
 {
