@@ -70,8 +70,18 @@ read pages at an LSN.
          shipped; the SQL function lets a test drive it (integration test indexes
          a fresh table and confirms its block has records).  No daemon-side WAL
          parser is written.
-       - **3c-3** A `--wal-redo`-style single-page helper: take a page's newest
-         stored image plus its indexed records up to L and apply rm_redo.
+       - **3c-3** Reconstruct a single page's base image from WAL. ✅
+         `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
+         find the newest full-page image at/below lsn and restores it
+         (`RestoreBlockImage`) -- rebuilding one page from WAL on demand.  Note a
+         WAL full-page image is the page *before* that record's change (torn-page
+         protection), so this returns the base image, not the page exactly as-of
+         lsn.
+       - **3c-4** The `--wal-redo`-style helper: apply the delta records after
+         the base image with `rm_redo` to get the page exactly as-of lsn.  This
+         is the one piece that needs PostgreSQL's redo run against a single held
+         page (Neon's wal-redo process / a small core mode) -- the last hard
+         piece of the read path.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no

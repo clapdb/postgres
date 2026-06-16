@@ -138,6 +138,28 @@ else
 	fail=1
 fi
 
+# --- 6. base page image reconstructed from a WAL full-page image (redo 3c-3) -
+# pagestore_redo_page returns the newest full-page image <= lsn -- the base a
+# single-page redo would then apply deltas onto.  (Applying the deltas needs
+# rm_redo; that wal-redo helper is the remaining step.)
+$P -c "CREATE FUNCTION pagestore_redo_page(regclass,int,int,pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_redo_page' LANGUAGE C STRICT;" >/dev/null
+rlsn0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE rp(id int primary key, v text) TABLESPACE ts;
+       INSERT INTO rp VALUES (1,'rp_committed'); CHECKPOINT;" >/dev/null
+# first modify after the checkpoint logs a full-page image of rp's block 0
+$P -c "UPDATE rp SET v='rp_later' WHERE id=1;" >/dev/null
+rlsn1=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_index_wal('$rlsn0', '$rlsn1');" >/dev/null
+# reconstruct rp's block 0 image from WAL alone; it carries the committed row
+rebuilt=$($P -c "SELECT position('rp_committed'::bytea in pagestore_redo_page('rp',0,0,'$rlsn1')) > 0;")
+if [ "$rebuilt" = "t" ]; then
+	echo "ok   - base page image reconstructed from a WAL full-page image"
+else
+	echo "FAIL - could not reconstruct page image from WAL FPI (got '$rebuilt')"
+	fail=1
+fi
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
