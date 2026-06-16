@@ -69,6 +69,8 @@ typedef enum PsOpcode
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
+	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
+	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
 } PsOpcode;
 
 /* Status codes */
