@@ -206,7 +206,10 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * each operation.
  */
 
-/* Create the fork (make it exist with zero blocks). */
+/*
+ * Make the fork exist in the store (with zero blocks).  isRedo is set during
+ * WAL replay, where re-creating an existing fork must be tolerated.
+ */
 static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
@@ -254,7 +257,11 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 	return (BlockNumber) ch->result;
 }
 
-/* Shrink the fork to 'nblocks' blocks. */
+/*
+ * Shrink the fork from old_blocks down to nblocks blocks (e.g. VACUUM trimming
+ * trailing empty pages).  In this COW store the daemon only lowers the fork's
+ * recorded size; historical versions of the trimmed blocks stay in the log.
+ */
 static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
@@ -297,7 +304,8 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 }
 
 /*
- * Overwrite nblocks existing pages starting at blocknum from buffers[].  Pages
+ * Overwrite nblocks existing pages starting at blocknum from buffers[] (the
+ * dirty-page flush path); unlike extend() this does not grow the fork.  Pages
  * are copied into the channel buffer and sent in io_unit-sized chunks.
  */
 static void
@@ -324,7 +332,11 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 	}
 }
 
-/* Grow the fork by one block at blocknum, written from buffer. */
+/*
+ * Grow the fork by exactly one block at blocknum, written from buffer -- the
+ * single-page grow path.  Contrast: zeroextend() bulk-adds many empty blocks,
+ * and writev() overwrites existing blocks instead of growing the fork.
+ */
 static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
@@ -364,7 +376,10 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ls_exec(ch);
 }
 
-/* Flush the fork's data durably in the daemon (fsync). */
+/*
+ * Force the fork's data durable in the daemon immediately (fsync now), versus
+ * the normal path where writev() lets durability be deferred to a checkpoint.
+ */
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
