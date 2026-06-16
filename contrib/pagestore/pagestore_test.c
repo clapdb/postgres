@@ -247,6 +247,36 @@ op_read_one(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out)
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* Vectored write of n contiguous pages in a single op. */
+static void
+op_writev(uint32_t rel, int32_t fork, uint32_t block, const unsigned char *pages,
+		  uint32_t n)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = n;
+	memcpy(ch->data, pages, (size_t) n * cl_page_size);
+	cl_exec();
+}
+
+/* Vectored read of n contiguous pages in a single op. */
+static void
+op_readv(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out,
+		 uint32_t n)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = n;
+	cl_exec();
+	memcpy(out, ch->data, (size_t) n * cl_page_size);
+}
+
 static void
 op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 		   unsigned char *out)
@@ -740,6 +770,134 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 }
 
+/*
+ * Vectored I/O: a single WRITEV/READV carrying many pages, exercising the
+ * daemon's multi-block loop (the single-block suites never do nblocks > 1).
+ */
+static void
+run_vectored_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint32_t	nb = 16;		/* fits one io_unit (256K / 8K = 32) */
+	unsigned char *wbuf,
+			   *rbuf;
+	int			ok = 1;
+
+	fprintf(stderr, "== vectored I/O ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_vec", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_vec", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	wbuf = malloc((size_t) nb * ps);
+	rbuf = malloc((size_t) nb * ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	for (uint32_t i = 0; i < nb; i++)
+		fill_page(wbuf + (size_t) i * ps, ps, 1000 + i, (unsigned char) (i + 1));
+
+	op_writev(REL_A, FORK0, 5, wbuf, nb);	/* one op, nb pages, at block 5 */
+	check(op_nblocks(REL_A, FORK0) == 5 + nb, "nblocks after vectored write");
+
+	op_readv(REL_A, FORK0, 5, rbuf, nb);	/* one op, read them all back */
+	for (uint32_t i = 0; i < nb; i++)
+		if (!page_has_tag(rbuf + (size_t) i * ps, ps, (unsigned char) (i + 1)))
+			ok = 0;
+	check(ok, "vectored read returns every page intact");
+
+	/* and each block is individually addressable */
+	op_read_one(REL_A, FORK0, 5 + nb / 2, rbuf);
+	check(page_has_tag(rbuf, ps, (unsigned char) (nb / 2 + 1)),
+		  "single-block read of a vector-written block");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(wbuf);
+	free(rbuf);
+}
+
+/* One concurrent client: own channel, own relation, write then verify. */
+static int
+conc_child(const char *shm_name, uint32_t ps, int id)
+{
+	uint32_t	rel = 20000 + (uint32_t) id;
+	unsigned char *p = malloc(ps);
+	unsigned char *r = malloc(ps);
+	int			rc = 0;
+
+	client_attach(shm_name, ps);
+	for (uint32_t b = 0; b < 50; b++)
+	{
+		fill_page(p, ps, 1000 + b, (unsigned char) (id * 7 + b + 1));
+		op_write_one(rel, FORK0, b, p);
+	}
+	for (uint32_t b = 0; b < 50; b++)
+	{
+		op_read_one(rel, FORK0, b, r);
+		if (!page_has_tag(r, ps, (unsigned char) (id * 7 + b + 1)))
+			rc = 2;
+	}
+	client_detach();
+	free(p);
+	free(r);
+	return rc;
+}
+
+/*
+ * Concurrency: many clients, each claiming its own channel, hit the daemon at
+ * once on independent relations.  Exercises channel allocation and the
+ * multi-channel poll loop.
+ */
+static void
+run_concurrency_suite(const char *daemon_path, const char *tmpbase)
+{
+#define NKIDS 8
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	pid_t		kids[NKIDS];
+	uint32_t	ps = 8192;
+
+	fprintf(stderr, "== concurrency (%d clients) ==\n", NKIDS);
+	snprintf(shm, sizeof(shm), "/pstest_%d_conc", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_conc", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);		/* parent does not claim a channel */
+
+	for (int i = 0; i < NKIDS; i++)
+	{
+		pid_t		pid = fork();
+
+		if (pid == 0)
+			_exit(conc_child(shm, ps, i));
+		kids[i] = pid;
+	}
+	for (int i = 0; i < NKIDS; i++)
+	{
+		int			st = 1;
+
+		waitpid(kids[i], &st, 0);
+		check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+			  "concurrent client %d completed correctly", i);
+	}
+
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+#undef NKIDS
+}
+
 int
 main(int argc, char **argv)
 {
@@ -771,6 +929,12 @@ main(int argc, char **argv)
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
+
+	/* vectored multi-page I/O */
+	run_vectored_suite(daemon_path, tmpbase);
+
+	/* many concurrent clients */
+	run_concurrency_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 
