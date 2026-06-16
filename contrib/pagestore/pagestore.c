@@ -30,11 +30,17 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "access/relation.h"
+#include "access/xlog_internal.h"
+#include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
+#include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
 #include "storage/md.h"
@@ -443,6 +449,81 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 									 (uint64) lsn);
 	PG_RETURN_VOID();
+}
+
+/* --- archive module: ship completed WAL segments to the store ---------- */
+
+/*
+ * pagestore can also act as an archive_library: when a WAL segment fills, the
+ * archiver hands it here and we stream it to the daemon's per-timeline WAL log.
+ * This is the compute-side half of WAL shipping (transport + durability).  It
+ * uses the official archive module API, so no core changes are needed; the
+ * granularity is one completed segment (force one with pg_switch_wal()).
+ */
+static bool
+pagestore_archive_configured(ArchiveModuleState *state)
+{
+	/* only meaningful when relations are served by the localsvc backend */
+	return strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") == 0;
+}
+
+static bool
+pagestore_archive_file(ArchiveModuleState *state, const char *file,
+					   const char *path)
+{
+	TimeLineID	tli;
+	XLogSegNo	segno;
+	XLogRecPtr	seg_start;
+	int			fd;
+	char	   *buf;
+	uint64		off = 0;
+
+	XLogFromFileName(file, &tli, &segno, wal_segment_size);
+	XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, seg_start);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("pagestore archive: could not open WAL segment \"%s\": %m",
+						path)));
+		return false;
+	}
+
+	buf = palloc(PS_IO_UNIT);
+	for (;;)
+	{
+		ssize_t		n = read(fd, buf, PS_IO_UNIT);
+
+		if (n < 0)
+		{
+			pfree(buf);
+			close(fd);
+			return false;
+		}
+		if (n == 0)
+			break;
+		/* ship this chunk at its WAL position */
+		pagestore_localsvc_wal_append(seg_start + off, buf, (uint32) n);
+		off += (uint64) n;
+	}
+	pfree(buf);
+	close(fd);
+	return true;
+}
+
+static const ArchiveModuleCallbacks pagestore_archive_callbacks = {
+	.startup_cb = NULL,
+	.check_configured_cb = pagestore_archive_configured,
+	.archive_file_cb = pagestore_archive_file,
+	.shutdown_cb = NULL,
+};
+
+const ArchiveModuleCallbacks *
+_PG_archive_module_init(void)
+{
+	return &pagestore_archive_callbacks;
 }
 
 void
