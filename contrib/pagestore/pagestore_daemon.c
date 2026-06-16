@@ -504,6 +504,83 @@ load_timelines(void)
 	close(fd);
 }
 
+/* ===================== shipped WAL log (per timeline) ================== */
+
+/*
+ * Each timeline has an append-only WAL log "wal_<tl>" of self-describing
+ * records [WalRecHdr | bytes].  This is the durability/transport half of WAL
+ * shipping: the compute ships its WAL stream here so it is persisted by the
+ * store, per timeline.  (Replaying these records to materialize pages -- redo
+ * -- is a later milestone; it would reuse PostgreSQL's rmgr redo.)
+ */
+#define WAL_MAGIC	0x57414c52	/* "WALR" */
+
+typedef struct WalRecHdr
+{
+	uint32_t	magic;
+	uint32_t	len;			/* WAL bytes following the header */
+	uint64_t	start_lsn;		/* LSN of the first byte */
+} WalRecHdr;
+
+/* highest end LSN (start+len) received per timeline */
+static uint64_t wal_end[MAX_TIMELINES];
+
+static int
+wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
+		   uint32_t len)
+{
+	char		path[4096];
+	int			fd;
+	WalRecHdr	h;
+
+	if (tl >= MAX_TIMELINES)
+		return -1;
+	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
+	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	if (fd < 0)
+		return -1;
+
+	h.magic = WAL_MAGIC;
+	h.len = len;
+	h.start_lsn = start_lsn;
+	if (write(fd, &h, sizeof(h)) != (ssize_t) sizeof(h) ||
+		write(fd, data, len) != (ssize_t) len)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	if (start_lsn + len > wal_end[tl])
+		wal_end[tl] = start_lsn + len;
+	return 0;
+}
+
+/* Rebuild wal_end[tl] by scanning the timeline's WAL log at startup. */
+static void
+wal_recover_one(uint32_t tl)
+{
+	char		path[4096];
+	int			fd;
+	off_t		off = 0;
+	WalRecHdr	h;
+
+	if (tl >= MAX_TIMELINES)
+		return;
+	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	while (pread(fd, &h, sizeof(h), off) == (ssize_t) sizeof(h) &&
+		   h.magic == WAL_MAGIC)
+	{
+		if (h.start_lsn + h.len > wal_end[tl])
+			wal_end[tl] = h.start_lsn + h.len;
+		off += sizeof(h) + h.len;
+	}
+	close(fd);
+}
+
 /* ===================== write / read primitives ========================= */
 
 /* The page's own pd_lsn lives in its first 8 bytes (xlogid, xrecoff). */
@@ -734,6 +811,15 @@ handle_request(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 			break;
 
+		case PS_OP_WAL_APPEND:
+			if (wal_append(tl, ch->req_lsn, ch->data, ch->datalen) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+
+		case PS_OP_WAL_SIZE:
+			ch->req_lsn = wal_end[tl];	/* output: end LSN of this timeline's WAL */
+			break;
+
 		case PS_OP_IMMEDSYNC:
 			for (int id = 0; id < segs_cap; id++)
 				if (seg_fds[id] >= 0)
@@ -788,6 +874,11 @@ main(int argc, char **argv)
 	timeline_define(0, -1, 0);
 	load_timelines();
 	recover();
+
+	/* rebuild each timeline's shipped-WAL end LSN from its log */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (tl == 0 || timelines[tl].defined)
+			wal_recover_one(tl);
 
 	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
 	if (fd < 0)
