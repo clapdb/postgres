@@ -62,3 +62,6 @@ jobs:
 
       - name: Run WAL-redo worker demo
         run: contrib/pagestore/redo_worker_demo.sh "$(pwd)/build"
+
+      - name: Run WAL-only (non-redundant) redo demo
+        run: contrib/pagestore/wal_only_redo_demo.sh "$(pwd)/build"
