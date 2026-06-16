@@ -337,6 +337,34 @@ op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* --- shipped-WAL operations --- */
+
+/* Append len WAL bytes at start_lsn on a timeline. */
+static void
+op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	memcpy(ch->data, data, len);
+	cl_exec();
+}
+
+/* Return the end LSN of a timeline's shipped WAL. */
+static uint64_t
+op_wal_size(uint32_t tl)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_SIZE;
+	cl_exec();
+	return ch->req_lsn;
+}
+
 /* ===================== page helpers ==================================== */
 
 /* Encode lsn into the page's first 8 bytes (xlogid, xrecoff), tag the rest. */
@@ -658,6 +686,60 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	free(rb);
 }
 
+/*
+ * Shipped WAL: the store persists a per-timeline WAL log durably, branches keep
+ * their own log, and the end LSN survives a daemon restart.  (This is the
+ * transport/durability layer; replaying it to pages -- redo -- is future work.)
+ */
+static void
+run_wal_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char buf[512];
+
+	fprintf(stderr, "== shipped WAL ==\n");
+	memset(buf, 0xAB, sizeof(buf));
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_wal", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	check(op_wal_size(0) == 0, "empty timeline has no WAL");
+	op_wal_append(0, 1000, buf, 500);
+	check(op_wal_size(0) == 1500, "WAL end LSN advances after append");
+	op_wal_append(0, 1500, buf, 500);
+	check(op_wal_size(0) == 2000, "WAL end LSN advances after second append");
+
+	/* a branch keeps its own WAL log */
+	op_create_branch(1, 0, 2000);
+	op_wal_append(1, 2000, buf, 300);
+	check(op_wal_size(1) == 2300, "branch WAL advances independently");
+	check(op_wal_size(0) == 2000, "parent WAL unaffected by branch WAL");
+
+	/* WAL end LSNs survive a daemon restart (recovered from the logs) */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
+	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -686,6 +768,9 @@ main(int argc, char **argv)
 
 	/* branch / snapshot isolation (page-size independent, run once) */
 	run_branch_suite(daemon_path, tmpbase);
+
+	/* shipped-WAL durability */
+	run_wal_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 
