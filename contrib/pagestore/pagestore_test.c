@@ -395,6 +395,21 @@ op_wal_size(uint32_t tl)
 	return ch->req_lsn;
 }
 
+/* Read len WAL bytes from start_lsn into out; returns bytes filled. */
+static uint32_t
+op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	cl_exec();
+	memcpy(out, ch->data, len);
+	return ch->result;
+}
+
 /* ===================== page helpers ==================================== */
 
 /* Encode lsn into the page's first 8 bytes (xlogid, xrecoff), tag the rest. */
@@ -728,10 +743,14 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	char		store[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
-	unsigned char buf[512];
+	unsigned char bufa[500];
+	unsigned char bufb[500];
+	unsigned char rback[512];
+	int			ok;
 
 	fprintf(stderr, "== shipped WAL ==\n");
-	memset(buf, 0xAB, sizeof(buf));
+	memset(bufa, 0xAA, sizeof(bufa));	/* WAL [1000,1500) */
+	memset(bufb, 0xBB, sizeof(bufb));	/* WAL [1500,2000) */
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_wal", tmpbase);
@@ -743,14 +762,25 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_attach(shm, ps);
 
 	check(op_wal_size(0) == 0, "empty timeline has no WAL");
-	op_wal_append(0, 1000, buf, 500);
+	op_wal_append(0, 1000, bufa, 500);
 	check(op_wal_size(0) == 1500, "WAL end LSN advances after append");
-	op_wal_append(0, 1500, buf, 500);
+	op_wal_append(0, 1500, bufb, 500);
 	check(op_wal_size(0) == 2000, "WAL end LSN advances after second append");
+
+	/* read the WAL back, spanning the two records, and check positions */
+	check(op_wal_read(0, 1400, 200, rback) == 200, "WAL read returns the requested bytes");
+	ok = 1;
+	for (int i = 0; i < 100; i++)	/* [1400,1500) came from the 0xAA record */
+		if (rback[i] != 0xAA)
+			ok = 0;
+	for (int i = 100; i < 200; i++)	/* [1500,1600) from the 0xBB record */
+		if (rback[i] != 0xBB)
+			ok = 0;
+	check(ok, "WAL read assembles the right bytes across records (at their LSNs)");
 
 	/* a branch keeps its own WAL log */
 	op_create_branch(1, 0, 2000);
-	op_wal_append(1, 2000, buf, 300);
+	op_wal_append(1, 2000, bufa, 300);
 	check(op_wal_size(1) == 2300, "branch WAL advances independently");
 	check(op_wal_size(0) == 2000, "parent WAL unaffected by branch WAL");
 

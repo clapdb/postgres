@@ -68,6 +68,7 @@ typedef enum PsOpcode
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
+	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 } PsOpcode;
 
 /* Status codes */
