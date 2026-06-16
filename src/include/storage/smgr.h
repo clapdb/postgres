@@ -74,6 +74,76 @@ typedef SMgrRelationData *SMgrRelation;
 #define SmgrIsTemp(smgr) \
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
 
+/*
+ * This struct of function pointers defines the API between smgr.c and the
+ * storage manager implementations behind it.  All storage managers must
+ * provide all of these functions.  An entry may be NULL only where the comment
+ * below says so.
+ *
+ * The struct lives in this header (rather than being private to smgr.c) so
+ * that out-of-core storage managers can be registered at runtime via
+ * smgr_register().  See storage/smgr/README.
+ */
+typedef struct f_smgr
+{
+	void		(*smgr_init) (void);	/* may be NULL */
+	void		(*smgr_shutdown) (void);	/* may be NULL */
+	void		(*smgr_open) (SMgrRelation reln);
+	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
+								bool isRedo);
+	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
+								bool isRedo);
+	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, const void *buffer, bool skipFsync);
+	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum, int nblocks, bool skipFsync);
+	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber blocknum, int nblocks);
+	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum);
+	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber blocknum,
+							   void **buffers, BlockNumber nblocks);
+	void		(*smgr_startreadv) (PgAioHandle *ioh,
+									SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum,
+									void **buffers, BlockNumber nblocks);
+	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum,
+								const void **buffers, BlockNumber nblocks,
+								bool skipFsync);
+	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, BlockNumber nblocks);
+	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber old_blocks, BlockNumber nblocks);
+	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
+	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
+} f_smgr;
+
+/* "which" index of the built-in magnetic disk manager (md.c). */
+#define SMGR_MD			0
+
+/*
+ * Hook to let a registered storage manager claim relations.  Given a
+ * relation's locator, it returns the smgr "which" index that should handle it,
+ * or SMGR_MD to use the built-in magnetic disk manager.  NULL means "always
+ * md".
+ */
+typedef int (*smgr_which_hook_type) (RelFileLocator rlocator, ProcNumber backend);
+extern PGDLLIMPORT smgr_which_hook_type smgr_which_hook;
+
+/*
+ * Register an additional storage manager implementation and return the "which"
+ * index to be reported by smgr_which_hook for relations it handles.  Must be
+ * called before backends are forked (i.e. from a shared_preload_libraries
+ * module's _PG_init) so the registration is inherited by every backend.
+ */
+extern int	smgr_register(const f_smgr *smgr);
+
 extern PGDLLIMPORT const PgAioTargetInfo aio_smgr_target_info;
 
 extern void smgrinit(void);
