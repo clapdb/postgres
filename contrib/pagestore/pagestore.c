@@ -35,6 +35,8 @@
 
 #include "access/relation.h"
 #include "access/xlog_internal.h"
+#include "access/xlogreader.h"
+#include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
 #include "fmgr.h"
@@ -467,6 +469,84 @@ pagestore_archive_configured(ArchiveModuleState *state)
 	return strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") == 0;
 }
 
+/*
+ * Decode the WAL in [start, end) and record, for each block a record modifies,
+ * an entry in the store's per-page WAL index.  Reuses PostgreSQL's WAL reader
+ * (read_local_xlog_page) -- which is why this must run in a normal backend, not
+ * the archiver (the archiver lacks the recovery/timeline context the reader
+ * asserts on).  In production a background worker would call this as WAL is
+ * shipped; the SQL wrapper below lets a test drive it.
+ */
+static void
+pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	XLogRecPtr	first;
+
+	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+	{
+		pfree(pd);
+		return;
+	}
+
+	first = XLogFindNextRecord(reader, start);
+	while (!XLogRecPtrIsInvalid(first))
+	{
+		char	   *errm;
+		XLogRecord *rec = XLogReadRecord(reader, &errm);
+
+		if (rec == NULL)
+			break;				/* end of flushed WAL / torn tail */
+		if (reader->ReadRecPtr >= end)
+			break;
+
+		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		{
+			RelFileLocator rloc;
+			ForkNumber	fk;
+			BlockNumber blk;
+			PageStoreRelKey key;
+
+			if (!XLogRecHasBlockRef(reader, b))
+				continue;
+			XLogRecGetBlockTagExtended(reader, b, &rloc, &fk, &blk, NULL);
+			key.spcOid = rloc.spcOid;
+			key.dbOid = rloc.dbOid;
+			key.relNumber = rloc.relNumber;
+			key.forkNum = fk;
+			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
+		}
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+}
+
+/*
+ * pagestore_index_wal(start_lsn pg_lsn, end_lsn pg_lsn) -> void
+ *
+ * Decode WAL in [start, end) and populate the per-page WAL index.  Stand-in for
+ * the background worker that would do this continuously.
+ */
+PG_FUNCTION_INFO_V1(pagestore_index_wal);
+
+Datum
+pagestore_index_wal(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start = PG_GETARG_LSN(0);
+	XLogRecPtr	end = PG_GETARG_LSN(1);
+
+	pagestore_index_wal_range(start, end);
+	PG_RETURN_VOID();
+}
+
 static bool
 pagestore_archive_file(ArchiveModuleState *state, const char *file,
 					   const char *path)
@@ -533,6 +613,35 @@ const ArchiveModuleCallbacks *
 _PG_archive_module_init(void)
 {
 	return &pagestore_archive_callbacks;
+}
+
+/*
+ * pagestore_walidx_count(rel regclass, forknum int, blocknum int) -> int
+ *
+ * How many shipped WAL records the store has indexed as modifying that page.
+ * Lets a test confirm the per-page WAL index is populated from real WAL.
+ */
+PG_FUNCTION_INFO_V1(pagestore_walidx_count);
+
+Datum
+pagestore_walidx_count(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	Relation	rel;
+	PageStoreRelKey key;
+	int			n;
+
+	rel = relation_open(relid, AccessShareLock);
+	key.spcOid = rel->rd_locator.spcOid;
+	key.dbOid = rel->rd_locator.dbOid;
+	key.relNumber = rel->rd_locator.relNumber;
+	key.forkNum = forknum;
+	n = pagestore_localsvc_walidx_count(&key, (BlockNumber) blocknum);
+	relation_close(rel, AccessShareLock);
+
+	PG_RETURN_INT32(n);
 }
 
 void
