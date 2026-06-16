@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		2
+#define PS_SHM_VERSION		3
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -65,6 +65,7 @@ typedef enum PsOpcode
 	PS_OP_READV,				/* read nblocks pages at blocknum into data */
 	PS_OP_IMMEDSYNC,
 	PS_OP_READ_AT,				/* read 1 page at blocknum as-of req_lsn (COW) */
+	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
 } PsOpcode;
 
 /* Status codes */
@@ -93,8 +94,9 @@ typedef struct PsChannel
 	uint32_t	blocknum;
 	uint32_t	nblocks;
 	uint32_t	old_nblocks;
-	uint32_t	pad0;
-	uint64_t	req_lsn;		/* READ_AT: snapshot LSN to read as-of */
+	uint32_t	timeline;		/* timeline this op targets (0 = main) */
+	uint32_t	parent_timeline;	/* CREATE_BRANCH: parent timeline */
+	uint64_t	req_lsn;		/* READ_AT: as-of LSN; CREATE_BRANCH: branch LSN */
 	PsKey		key;
 
 	/* result */
