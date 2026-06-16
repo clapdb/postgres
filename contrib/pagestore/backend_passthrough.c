@@ -95,7 +95,18 @@ passthrough_extend(const PageStoreRelKey *key, void *localreln,
 			 blocknum, buffer, skipFsync);
 }
 
-/* Grow the fork by nblocks zero-filled blocks at blocknum (bulk allocate). */
+/*
+ * Bulk-extend the fork by nblocks zero-filled blocks starting at blocknum,
+ * without supplying any page contents.
+ *
+ * This is the batch counterpart to extend(): extend() adds exactly one block
+ * written from a caller-provided buffer, whereas zeroextend() pre-allocates
+ * many empty blocks in a single call.  PostgreSQL uses it to grow a relation
+ * by several pages at once (e.g. under concurrent insertion) far more cheaply
+ * than issuing one extend() per page; md.c implements it with
+ * posix_fallocate()/ftruncate().  The new blocks read back as zeros until they
+ * are actually written.
+ */
 static void
 passthrough_zeroextend(const PageStoreRelKey *key, void *localreln,
 					   BlockNumber blocknum, int nblocks, bool skipFsync)
