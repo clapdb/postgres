@@ -74,26 +74,45 @@ typedef struct PageStoreBackend
 	/* one-time per-backend initialization (may be NULL) */
 	void		(*init) (void);
 
-	/* fork lifecycle / metadata */
+	/* --- fork lifecycle / metadata --- */
+
+	/* create the fork (make it exist with zero blocks) */
 	void		(*create) (const PageStoreRelKey *key, void *localreln, bool isRedo);
+	/* does the fork exist? */
 	bool		(*fork_exists) (const PageStoreRelKey *key, void *localreln);
+	/* remove the fork entirely */
 	void		(*unlink) (const PageStoreRelKey *key, bool isRedo);
+	/* current size of the fork, in blocks */
 	BlockNumber (*nblocks) (const PageStoreRelKey *key, void *localreln);
+	/* shrink the fork from old_blocks down to nblocks blocks */
 	void		(*truncate) (const PageStoreRelKey *key, void *localreln,
 							 BlockNumber old_blocks, BlockNumber nblocks);
 
-	/* data plane (vectored: nblocks contiguous BLCKSZ buffers) */
+	/* --- data plane (vectored: nblocks contiguous BLCKSZ buffers) --- */
+
+	/* read nblocks pages starting at blocknum into buffers[] */
 	void		(*readv) (const PageStoreRelKey *key, void *localreln,
 						  BlockNumber blocknum, void **buffers, BlockNumber nblocks);
+	/* overwrite nblocks existing pages starting at blocknum from buffers[] */
 	void		(*writev) (const PageStoreRelKey *key, void *localreln,
 						   BlockNumber blocknum, const void **buffers,
 						   BlockNumber nblocks, bool skipFsync);
+	/* grow the fork by one block at blocknum, written from buffer */
 	void		(*extend) (const PageStoreRelKey *key, void *localreln,
 						   BlockNumber blocknum, const void *buffer, bool skipFsync);
+	/*
+	 * Grow the fork by nblocks *zero-filled* blocks starting at blocknum,
+	 * without supplying page contents.  This is the bulk pre-allocation
+	 * counterpart to extend(): the engine uses it to add many empty pages in
+	 * one call (e.g. when extending a relation under concurrent insertion).
+	 * The new pages read back as zeros until later written.
+	 */
 	void		(*zeroextend) (const PageStoreRelKey *key, void *localreln,
 							   BlockNumber blocknum, int nblocks, bool skipFsync);
 
-	/* durability */
+	/* --- durability --- */
+
+	/* flush the fork's data durably to storage (immediate fsync equivalent) */
 	void		(*immedsync) (const PageStoreRelKey *key, void *localreln);
 
 	/*
