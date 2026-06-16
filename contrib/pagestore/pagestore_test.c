@@ -153,6 +153,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->key.dbOid = 1;
 	ch->key.relNumber = rel;
 	ch->key.forkNum = fork;
+	ch->timeline = 0;			/* default to the main timeline */
 }
 
 /* --- typed operations --- */
@@ -253,6 +254,69 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
+/* --- timeline-aware operations (for branch tests) --- */
+
+/* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
+static void
+op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	cl_exec();
+}
+
+/* Write one page on a specific timeline. */
+static void
+op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+			const unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
+/* Read one page (current) on a specific timeline. */
+static void
+op_read_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+		   unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
+/* Read one page as-of an LSN on a specific timeline. */
+static void
+op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+			  uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
@@ -363,6 +427,7 @@ stop_daemon(pid_t pid)
 /* ===================== the test suite ================================== */
 
 #define REL_A	16000
+#define REL_B	17000
 #define FORK0	0
 
 static void
@@ -470,6 +535,101 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	free(rb);
 }
 
+/*
+ * Branch / snapshot isolation: a branch is an instant, copy-on-write clone.
+ * It shares the parent's pages by read-through until it writes; its writes do
+ * not affect the parent or sibling branches; and it sees the parent frozen at
+ * the branch LSN, not the parent's later writes.
+ */
+static void
+run_branch_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char *p,
+			   *rb;
+
+	fprintf(stderr, "== branches ==\n");
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_br", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_br", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	p = malloc(ps);
+	rb = malloc(ps);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* base data on the main timeline (block 0 = tag 11 @ lsn 1000) */
+	fill_page(p, ps, 1000, 11);
+	op_write_tl(0, REL_B, FORK0, 0, p);
+
+	/* branch T1 off main at LSN 1500 -- instant, no data copied */
+	op_create_branch(1, 0, 1500);
+	op_read_tl(1, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11), "branch sees parent page via read-through (no copy)");
+
+	/* writing on T1 diverges it (copy-on-write) */
+	fill_page(p, ps, 2000, 22);
+	op_write_tl(1, REL_B, FORK0, 0, p);
+	op_read_tl(1, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 22), "branch read sees its own write");
+	op_read_tl(0, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11), "parent unaffected by branch write (isolation)");
+
+	/* a second, independent branch off main */
+	op_create_branch(2, 0, 1500);
+	op_read_tl(2, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11), "second branch independent, sees parent");
+	fill_page(p, ps, 3000, 33);
+	op_write_tl(2, REL_B, FORK0, 0, p);
+	op_read_tl(2, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 33), "T2 read sees T2 write");
+	op_read_tl(1, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 22), "T1 unaffected by T2 (three-way isolation)");
+	op_read_tl(0, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11), "main unaffected by T1/T2");
+
+	/* as-of read on a branch, before its own write, falls through to parent */
+	op_read_at_tl(1, REL_B, FORK0, 0, 1900, rb);
+	check(page_has_tag(rb, ps, 11), "as-of read on branch before its write -> parent");
+
+	/* snapshot semantics: parent evolves after the branch point (LSN > 1500) */
+	fill_page(p, ps, 1200, 51);
+	op_write_tl(0, REL_B, FORK0, 5, p);		/* block5 @ lsn 1200 (< branch) */
+	fill_page(p, ps, 2000, 52);
+	op_write_tl(0, REL_B, FORK0, 5, p);		/* block5 @ lsn 2000 (> branch) */
+	op_read_tl(1, REL_B, FORK0, 5, rb);
+	check(page_has_tag(rb, ps, 51),
+		  "branch sees parent as-of branch LSN, not later writes (snapshot)");
+	op_read_tl(0, REL_B, FORK0, 5, rb);
+	check(page_has_tag(rb, ps, 52), "main sees its latest write to block5");
+
+	/* branches survive a daemon restart (timeline metadata is persisted) */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_tl(1, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 22), "branch write survives daemon restart");
+	op_read_tl(1, REL_B, FORK0, 5, rb);
+	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(p);
+	free(rb);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -495,6 +655,9 @@ main(int argc, char **argv)
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
 		run_suite(daemon_path, tmpbase, sizes[i]);
+
+	/* branch / snapshot isolation (page-size independent, run once) */
+	run_branch_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 
