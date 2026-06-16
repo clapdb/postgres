@@ -410,6 +410,39 @@ op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 	return ch->result;
 }
 
+/* --- per-page WAL index operations --- */
+
+static void
+op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_ADD;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
+/* Returns count; fills out[] with the record LSNs <= lsn_max. */
+static int
+op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+			  uint64_t lsn_max, uint64_t *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int			n;
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = block;
+	ch->req_lsn = lsn_max;
+	n = (int) cl_exec()->result;
+	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
+	return n;
+}
+
 /* ===================== page helpers ==================================== */
 
 /* Encode lsn into the page's first 8 bytes (xlogid, xrecoff), tag the rest. */
@@ -801,6 +834,59 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 }
 
 /*
+ * Per-page WAL index: record which WAL LSNs modify each page and query the ones
+ * visible as-of an LSN -- the lookup single-page materialization will use.
+ */
+static void
+run_walidx_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint64_t	out[16];
+	int		n;
+
+	fprintf(stderr, "== per-page WAL index ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_widx", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_widx", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* block 0 changed by records at LSN 100, 200, 300; block 1 at 150 */
+	op_walidx_add(0, REL_A, FORK0, 0, 100);
+	op_walidx_add(0, REL_A, FORK0, 0, 200);
+	op_walidx_add(0, REL_A, FORK0, 0, 300);
+	op_walidx_add(0, REL_A, FORK0, 1, 150);
+
+	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
+	check(n == 2 && out[0] == 100 && out[1] == 200,
+		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
+	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
+	check(n == 3 && out[2] == 300, "index returns all records up to a high lsn");
+	check(op_walidx_get(0, REL_A, FORK0, 0, 50, out) == 0, "no records below the first lsn");
+	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
+	check(n == 1 && out[0] == 150, "per-block separation (block 1 -> [150])");
+	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+
+	/* a branch sees its own records plus the parent's, capped at the fork LSN */
+	op_create_branch(1, 0, 250);
+	op_walidx_add(1, REL_A, FORK0, 0, 400);
+	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
+	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
+	check(n == 3, "branch index reads through to parent capped at the branch lsn");
+
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+}
+
+/*
  * Vectored I/O: a single WRITEV/READV carrying many pages, exercising the
  * daemon's multi-block loop (the single-block suites never do nblocks > 1).
  */
@@ -959,6 +1045,9 @@ main(int argc, char **argv)
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
+
+	/* per-page WAL index */
+	run_walidx_suite(daemon_path, tmpbase);
 
 	/* vectored multi-page I/O */
 	run_vectored_suite(daemon_path, tmpbase);
