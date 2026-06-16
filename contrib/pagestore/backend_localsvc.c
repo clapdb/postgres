@@ -341,8 +341,14 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 }
 
 /*
- * Grow the fork by nblocks zero-filled blocks at blocknum, with no page data
- * sent (bulk pre-allocation; the new pages read back as zeros).
+ * Bulk-extend the fork by nblocks zero-filled blocks starting at blocknum.
+ *
+ * Unlike extend() (which adds one block written from a buffer), zeroextend()
+ * pre-allocates many empty blocks in one call and sends no page data at all --
+ * only the block count.  The engine uses it to grow a relation by several
+ * pages at once (e.g. under concurrent insertion).  In this backend the daemon
+ * just advances the fork's recorded size; the new blocks have no stored
+ * version yet, so they read back as zeros until written.
  */
 static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
