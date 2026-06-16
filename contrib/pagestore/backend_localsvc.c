@@ -520,6 +520,27 @@ pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 	return (int) ch->result;
 }
 
+/* Fetch up to maxn record LSNs (<= lsn_max) for (key, block) into out;
+ * returns how many.  Ascending order. */
+int
+pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
+							  uint64 lsn_max, uint64 *out, int maxn)
+{
+	PsChannel  *ch = ls_chan();
+	int			n;
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = block;
+	ch->req_lsn = lsn_max;
+	ls_exec(ch);
+	n = (int) ch->result;
+	if (n > maxn)
+		n = maxn;
+	memcpy(out, ch->data, (size_t) n * sizeof(uint64));
+	return n;
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)
