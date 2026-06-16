@@ -386,18 +386,31 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 }
 
-/* Fork size visible on 'timeline', inheriting the parent's when not local. */
+/*
+ * Fork size visible on 'timeline': the maximum block count across the timeline
+ * and all its ancestors.  A branch that has written only some blocks of a fork
+ * still inherits the parent's full size (the unwritten blocks are served by
+ * read_through), so we must take the max rather than the first entry found --
+ * otherwise the branch would under-report the size and reads of inherited
+ * blocks would look out of range.
+ *
+ * (Prototype limitation: nblocks is not itself versioned, so if the parent
+ * *grows* a fork after the branch point the branch sees the larger size; for a
+ * quiescent parent -- the usual branch case -- this is correct.)
+ */
 static uint32_t
 fork_nblocks_through(uint32_t timeline, const PsKey *key)
 {
+	uint32_t	maxnb = 0;
+
 	for (;;)
 	{
 		ForkEnt    *e = fork_find(timeline, key);
 
-		if (e)
-			return e->nblocks;
+		if (e && e->nblocks > maxnb)
+			maxnb = e->nblocks;
 		if (!timeline_has_parent(timeline))
-			return 0;
+			return maxnb;
 		timeline = (uint32_t) timelines[timeline].parent;
 	}
 }
