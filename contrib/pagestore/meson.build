@@ -1,0 +1,42 @@
+# Copyright (c) 2022-2025, PostgreSQL Global Development Group
+
+pagestore_sources = files(
+  'backend_localsvc.c',
+  'backend_passthrough.c',
+  'pagestore.c',
+)
+
+if host_system == 'windows'
+  pagestore_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
+    '--NAME', 'pagestore',
+    '--FILEDESC', 'pagestore - pluggable storage backend smgr shim',])
+endif
+
+pagestore = shared_module('pagestore',
+  pagestore_sources,
+  kwargs: contrib_mod_args,
+)
+contrib_targets += pagestore
+
+# Standalone storage daemon for the "localsvc" backend.  Freestanding: it
+# includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
+pagestore_daemon = executable('pagestore_daemon',
+  files('pagestore_daemon.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_daemon
+
+# Standalone test harness: drives the daemon over the shared-memory protocol
+# with no PostgreSQL instance.  Run independently of the PG test suites with:
+#   meson test -C <build> --suite pagestore
+pagestore_test = executable('pagestore_test',
+  files('pagestore_test.c'),
+  install: false,
+)
+test('pagestore_standalone',
+  pagestore_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 120,
+)
