@@ -23,18 +23,21 @@
 #include "storage/md.h"
 #include "storage/smgr.h"
 
+/* Create the fork's underlying file(s). */
 static void
 passthrough_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
 	mdcreate((SMgrRelation) localreln, (ForkNumber) key->forkNum, isRedo);
 }
 
+/* Report whether the fork's file exists on disk. */
 static bool
 passthrough_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
 	return mdexists((SMgrRelation) localreln, (ForkNumber) key->forkNum);
 }
 
+/* Delete the fork's file(s). */
 static void
 passthrough_unlink(const PageStoreRelKey *key, bool isRedo)
 {
@@ -48,12 +51,14 @@ passthrough_unlink(const PageStoreRelKey *key, bool isRedo)
 	mdunlink(rlocator, (ForkNumber) key->forkNum, isRedo);
 }
 
+/* Current number of blocks in the fork. */
 static BlockNumber
 passthrough_nblocks(const PageStoreRelKey *key, void *localreln)
 {
 	return mdnblocks((SMgrRelation) localreln, (ForkNumber) key->forkNum);
 }
 
+/* Shrink the fork to 'nblocks' blocks. */
 static void
 passthrough_truncate(const PageStoreRelKey *key, void *localreln,
 					 BlockNumber old_blocks, BlockNumber nblocks)
@@ -62,6 +67,7 @@ passthrough_truncate(const PageStoreRelKey *key, void *localreln,
 			   old_blocks, nblocks);
 }
 
+/* Read nblocks pages from blocknum into buffers[]. */
 static void
 passthrough_readv(const PageStoreRelKey *key, void *localreln,
 				  BlockNumber blocknum, void **buffers, BlockNumber nblocks)
@@ -70,6 +76,7 @@ passthrough_readv(const PageStoreRelKey *key, void *localreln,
 			blocknum, buffers, nblocks);
 }
 
+/* Overwrite nblocks existing pages at blocknum from buffers[]. */
 static void
 passthrough_writev(const PageStoreRelKey *key, void *localreln,
 				   BlockNumber blocknum, const void **buffers,
@@ -79,6 +86,7 @@ passthrough_writev(const PageStoreRelKey *key, void *localreln,
 			 blocknum, buffers, nblocks, skipFsync);
 }
 
+/* Grow the fork by one block at blocknum, written from buffer. */
 static void
 passthrough_extend(const PageStoreRelKey *key, void *localreln,
 				   BlockNumber blocknum, const void *buffer, bool skipFsync)
@@ -87,6 +95,7 @@ passthrough_extend(const PageStoreRelKey *key, void *localreln,
 			 blocknum, buffer, skipFsync);
 }
 
+/* Grow the fork by nblocks zero-filled blocks at blocknum (bulk allocate). */
 static void
 passthrough_zeroextend(const PageStoreRelKey *key, void *localreln,
 					   BlockNumber blocknum, int nblocks, bool skipFsync)
@@ -95,6 +104,7 @@ passthrough_zeroextend(const PageStoreRelKey *key, void *localreln,
 				 blocknum, nblocks, skipFsync);
 }
 
+/* Flush the fork's data durably (fsync). */
 static void
 passthrough_immedsync(const PageStoreRelKey *key, void *localreln)
 {
