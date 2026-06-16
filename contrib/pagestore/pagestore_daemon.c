@@ -556,6 +556,53 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	return 0;
 }
 
+/*
+ * Read up to 'len' WAL bytes starting at WAL position 'start' from a timeline's
+ * log into 'out'; returns the number of bytes filled.  Bytes not covered by any
+ * record are left as-is.  This is what a redo worker uses to pull WAL from the
+ * store for replay.  (Single timeline for now; reading a branch's WAL across
+ * its fork point is a refinement.)
+ */
+static uint32_t
+wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
+{
+	char		path[4096];
+	int			fd;
+	off_t		off = 0;
+	WalRecHdr	h;
+	uint32_t	filled = 0;
+
+	if (tl >= MAX_TIMELINES)
+		return 0;
+	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	while (pread(fd, &h, sizeof(h), off) == (ssize_t) sizeof(h) &&
+		   h.magic == WAL_MAGIC)
+	{
+		uint64_t	rs = h.start_lsn;
+		uint64_t	re = rs + h.len;
+		uint64_t	ws = start;
+		uint64_t	we = start + len;
+		uint64_t	os = rs > ws ? rs : ws;	/* overlap start */
+		uint64_t	oe = re < we ? re : we;	/* overlap end */
+
+		if (os < oe)
+		{
+			off_t		src = off + sizeof(h) + (off_t) (os - rs);
+			ssize_t		n = pread(fd, out + (os - start), (size_t) (oe - os), src);
+
+			if (n > 0)
+				filled += (uint32_t) n;
+		}
+		off += sizeof(h) + h.len;
+	}
+	close(fd);
+	return filled;
+}
+
 /* Rebuild wal_end[tl] by scanning the timeline's WAL log at startup. */
 static void
 wal_recover_one(uint32_t tl)
@@ -818,6 +865,10 @@ handle_request(PsChannel *ch)
 
 		case PS_OP_WAL_SIZE:
 			ch->req_lsn = wal_end[tl];	/* output: end LSN of this timeline's WAL */
+			break;
+
+		case PS_OP_WAL_READ:
+			ch->result = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
 			break;
 
 		case PS_OP_IMMEDSYNC:
