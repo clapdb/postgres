@@ -31,6 +31,7 @@ SUBDIRS = \
 		oid2name	\
 		old_snapshot	\
 		pageinspect	\
+		pagestore	\
 		passwordcheck	\
 		pg_buffercache	\
 		pg_freespacemap \
