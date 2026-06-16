@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# integration_test.sh -- in-engine (PostgreSQL + daemon) integration test for
+# the pagestore module.  Unlike the standalone test, this exercises the real
+# path: the smgr hijack, the localsvc backend talking to the daemon, the COW
+# read_at SQL function, and WAL shipping via the archive module.
+#
+# Self-asserting: prints "ok"/"FAIL" lines and exits non-zero on any failure.
+# Needs a full PostgreSQL build; pass the meson build directory as $1.
+#
+#   contrib/pagestore/integration_test.sh /path/to/build
+#
+set -uo pipefail
+
+BUILD=${1:?usage: integration_test.sh <meson-build-dir>}
+# Locate the temporary install tree robustly (its path depends on the configured
+# prefix), by finding pg_ctl under tmp_install.
+PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' -type f 2>/dev/null | head -1)
+if [ -z "$PGCTL" ]; then
+	echo "FAIL - no tmp_install found under $BUILD/tmp_install (run: meson test -C $BUILD --suite setup)"
+	exit 1
+fi
+BIN=$(dirname "$PGCTL")
+ROOT=$(dirname "$BIN")
+export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
+DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
+
+DATA=$(mktemp -d)/pgdata
+TS=$(mktemp -d)/ts
+STORE=$(mktemp -d)/store
+SHM=/psint_$$
+PORT=54460
+P="$BIN/psql -p $PORT -U postgres -tA"
+fail=0
+
+assert() {  # $1=actual $2=expected $3=message
+	if [ "$1" = "$2" ]; then
+		echo "ok   - $3"
+	else
+		echo "FAIL - $3 (got '$1', want '$2')"
+		fail=1
+	fi
+}
+
+cleanup() {
+	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
+	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")"
+	rm -f "/dev/shm$SHM"
+}
+trap cleanup EXIT
+
+mkdir -p "$TS"
+"$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
+"$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
+DPID=$!
+sleep 0.5
+
+cat >> "$DATA/postgresql.conf" <<EOF
+shared_preload_libraries = 'pagestore'
+pagestore.backend = 'localsvc'
+pagestore.localsvc_shm = '$SHM'
+pagestore.route_user_tablespaces = on
+io_method = sync
+archive_mode = on
+archive_library = 'pagestore'
+port = $PORT
+EOF
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+
+# --- 1. localsvc round-trip: a routed table's I/O goes to the daemon --------
+$P -c "CREATE TABLESPACE ts LOCATION '$TS';" >/dev/null
+$P -c "CREATE TABLE t(id int primary key, v text) TABLESPACE ts;
+       INSERT INTO t SELECT g, md5(g::text) FROM generate_series(1,20000) g;
+       CHECKPOINT;" >/dev/null
+ck1=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM t;")
+nfiles=$(find "$TS" -type f | wc -l | tr -d ' ')
+assert "$nfiles" "0" "routed tablespace has no local relation files (I/O went to daemon)"
+
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1   # evict shared_buffers
+ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM t;")
+assert "$ck2" "$ck1" "data intact after restart (read back from daemon)"
+assert "$($P -c 'SELECT count(*) FROM t;')" "20000" "row count after restart"
+
+# --- 2. copy-on-write time-travel read -------------------------------------
+$P -c "CREATE FUNCTION pagestore_read_at(regclass,int,int,pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE TABLE c(id int, note text) TABLESPACE ts;
+       INSERT INTO c VALUES (1,'cow_old'); CHECKPOINT;" >/dev/null
+l1=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "UPDATE c SET note='cow_new' WHERE id=1; CHECKPOINT;" >/dev/null
+has_old=$($P -c "SELECT position('cow_old'::bytea in pagestore_read_at('c',0,0,'$l1'::pg_lsn))>0;")
+has_new=$($P -c "SELECT position('cow_new'::bytea in pagestore_read_at('c',0,0,'$l1'::pg_lsn))=0;")
+cur_new=$($P -c "SELECT position('cow_new'::bytea in pagestore_read_at('c',0,0,'FFFFFFFF/FFFFFFFF'))>0;")
+assert "$has_old" "t" "as-of read returns the pre-update page (COW retained)"
+assert "$has_new" "t" "as-of read does not contain the post-update value"
+assert "$cur_new" "t" "current page contains the new value"
+
+# --- 3. WAL shipping: completed segments reach the daemon ------------------
+$P -c "CREATE TABLE wgen(x text) TABLESPACE ts;" >/dev/null
+for i in 1 2; do
+	$P -c "INSERT INTO wgen SELECT repeat('w',100) FROM generate_series(1,50000);
+	       SELECT pg_switch_wal();" >/dev/null
+done
+sleep 2
+walsz=$(stat -c %s "$STORE/wal_0" 2>/dev/null || echo 0)
+if [ "$walsz" -gt 0 ]; then echo "ok   - WAL shipped to daemon (wal_0 = $walsz bytes)"; else echo "FAIL - no WAL shipped"; fail=1; fi
+
+echo "----"
+[ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
+exit $fail
