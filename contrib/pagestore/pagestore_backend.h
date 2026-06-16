@@ -143,5 +143,7 @@ extern const PageStoreBackend PageStoreBackendLocalSvc;
 extern void pagestore_localsvc_init(void);
 extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
+extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+											 uint64 branch_lsn);
 
 #endif							/* PAGESTORE_BACKEND_H */
