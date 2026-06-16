@@ -1,0 +1,36 @@
+# Standalone CI for the contrib/pagestore module.
+#
+# The pagestore daemon and its test harness are freestanding C (they include
+# only pagestore_ipc.h and libc), so this runs WITHOUT building PostgreSQL --
+# it just compiles the two programs and runs the test, which exercises the
+# storage logic, COW versioning, segment rollover and crash recovery across
+# page sizes 4K/8K/16K.  Seconds, not minutes.
+name: pagestore
+
+on:
+  push:
+    paths:
+      - 'contrib/pagestore/**'
+      - '.github/workflows/pagestore-test.yml'
+  pull_request:
+    paths:
+      - 'contrib/pagestore/**'
+      - '.github/workflows/pagestore-test.yml'
+  workflow_dispatch:
+
+jobs:
+  standalone-test:
+    name: standalone daemon test (no PostgreSQL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile daemon and test harness
+        working-directory: contrib/pagestore
+        run: |
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
+
+      - name: Run standalone test suite
+        working-directory: contrib/pagestore
+        run: ./pagestore_test ./pagestore_daemon
