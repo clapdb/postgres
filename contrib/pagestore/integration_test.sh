@@ -108,6 +108,18 @@ sleep 2
 walsz=$(stat -c %s "$STORE/wal_0" 2>/dev/null || echo 0)
 if [ "$walsz" -gt 0 ]; then echo "ok   - WAL shipped to daemon (wal_0 = $walsz bytes)"; else echo "FAIL - no WAL shipped"; fail=1; fi
 
+# --- 4. reconstruct a standard WAL segment from the store (redo step 3a) ----
+seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)" .done)
+out=$(mktemp)
+if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
+		--shm "$SHM" --timeline 0 --segsize 16777216 "$seg" "$out"; then
+	assert "$(stat -c %s "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
+else
+	echo "FAIL - walrestore could not reconstruct segment '$seg'"
+	fail=1
+fi
+rm -f "$out"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
