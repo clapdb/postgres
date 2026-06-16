@@ -45,13 +45,20 @@ read pages at an LSN.
      post-backup change is recovered.  Reuses PostgreSQL's redo wholesale.
      Caveat: the redo instance runs with `recovery_prefetch = off` (the
      backend's recovery-prefetch/AIO path is not wired yet).
+   - **3d-1** WAL-only compute -> non-redundant redo. ✅ `wal_only_redo_demo.sh`:
+     the writer runs with `route_all = off`, so its relation pages stay local
+     and only its WAL is shipped; the redo worker (`route_all = on`) then
+     materializes the relations into the store purely by replaying that WAL.
+     Verified the table never reached the store from the compute (its file is
+     local) yet exists in the store after redo, and the store grew.  This is the
+     point of redo: the store's pages come from WAL, not from the compute.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
-     everything.  This is where a `--wal-redo`-style single-page helper, or a
-     bounded recovery, comes in.
-   - **3d** Branch WAL read-through (serve a branch's WAL across its fork point)
-     and SLRU/clog + `pg_control` on the store, so an independent compute can
-     run on a branch with no local state.
+     everything.  A `--wal-redo`-style single-page helper, or bounded recovery.
+   - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
+     read-through (serve a branch's WAL across its fork point), so multiple
+     independent computes can run concurrently on different branches with no
+     shared local state.
 
 ## Known scope boundaries
 
