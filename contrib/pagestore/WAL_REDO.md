@@ -61,7 +61,16 @@ read pages at an LSN.
          This is the lookup the single-page redo needs.  (Populating it by
          decoding shipped WAL via PostgreSQL's XLogReader / pg_walinspect is next;
          reimplementing the WAL format in the daemon is deliberately avoided.)
-       - **3c-2** A `--wal-redo`-style single-page helper: take a page's newest
+       - **3c-2** Populate the index by decoding shipped WAL. ✅ Reuses
+         PostgreSQL's own WAL reader (`read_local_xlog_page`), exposed as
+         `pagestore_index_wal(start, end)`.  Note: decoding **must run in a
+         normal backend** -- the archiver process lacks the recovery/timeline
+         context the reader asserts on (both `read_local_xlog_page` and `WALRead`
+         abort there).  In production a background worker would call it as WAL is
+         shipped; the SQL function lets a test drive it (integration test indexes
+         a fresh table and confirms its block has records).  No daemon-side WAL
+         parser is written.
+       - **3c-3** A `--wal-redo`-style single-page helper: take a page's newest
          stored image plus its indexed records up to L and apply rm_redo.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
