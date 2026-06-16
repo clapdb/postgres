@@ -34,3 +34,28 @@ jobs:
       - name: Run standalone test suite
         working-directory: contrib/pagestore
         run: ./pagestore_test ./pagestore_daemon
+
+  # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
+  # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --
+  # it compiles PostgreSQL -- so it is a separate job.
+  integration-test:
+    name: in-engine integration test (PostgreSQL + daemon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex meson ninja-build pkg-config perl python3
+
+      - name: Configure and build PostgreSQL (minimal)
+        run: |
+          meson setup build -Dcassert=true -Dauto_features=disabled
+          ninja -C build
+
+      - name: Prepare temporary install tree
+        run: meson test -C build --suite setup
+
+      - name: Run pagestore integration test
+        run: contrib/pagestore/integration_test.sh "$(pwd)/build"
