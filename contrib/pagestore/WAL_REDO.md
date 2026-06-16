@@ -31,9 +31,11 @@ read pages at an LSN.
 2. **WAL serving** — store hands WAL back by LSN range, so a redo worker can pull
    it. ✅ (`PS_OP_WAL_READ`; `wal_read()` assembles bytes across records.)
 3. **Redo worker** — a recovery PostgreSQL that consumes the store's WAL and
-   materializes pages into the store. ⬜ Next milestones:
-   - **3a** Reconstruct standard WAL segment files from the `wal_<tl>` log (or a
-     `restore_command`/streaming shim) so recovery can consume it.
+   materializes pages into the store. 🔶 In progress:
+   - **3a** Reconstruct standard WAL segment files from the `wal_<tl>` log. ✅
+     `pagestore_walrestore` does this and works as a `restore_command`
+     (`pagestore_walrestore --shm NAME --timeline N --segsize B %f %p`); the
+     integration test reconstructs a shipped segment as a full standard segment.
    - **3b** Bring up a PG node in standby/recovery with `route_all` on the store
      and point its WAL source at the store; verify it materializes pages.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
