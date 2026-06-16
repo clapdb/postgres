@@ -23,7 +23,11 @@
 #include "storage/md.h"
 #include "storage/smgr.h"
 
-/* Create the fork's underlying file(s). */
+/*
+ * Make the fork exist (create its underlying file).  isRedo is set when called
+ * during WAL replay, where an already-existing file is tolerated rather than
+ * treated as an error.
+ */
 static void
 passthrough_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
@@ -58,7 +62,11 @@ passthrough_nblocks(const PageStoreRelKey *key, void *localreln)
 	return mdnblocks((SMgrRelation) localreln, (ForkNumber) key->forkNum);
 }
 
-/* Shrink the fork to 'nblocks' blocks. */
+/*
+ * Shrink the fork from old_blocks down to nblocks blocks (e.g. when VACUUM
+ * trims trailing empty pages).  old_blocks is the size before truncation,
+ * which md uses to know which segment files to drop.
+ */
 static void
 passthrough_truncate(const PageStoreRelKey *key, void *localreln,
 					 BlockNumber old_blocks, BlockNumber nblocks)
@@ -76,7 +84,12 @@ passthrough_readv(const PageStoreRelKey *key, void *localreln,
 			blocknum, buffers, nblocks);
 }
 
-/* Overwrite nblocks existing pages at blocknum from buffers[]. */
+/*
+ * Overwrite nblocks already-existing blocks starting at blocknum from
+ * buffers[] (the dirty-page flush path).  Unlike extend(), this does not grow
+ * the fork -- the blocks must already exist.  skipFsync defers the fsync to the
+ * next checkpoint (md registers a sync request instead of syncing now).
+ */
 static void
 passthrough_writev(const PageStoreRelKey *key, void *localreln,
 				   BlockNumber blocknum, const void **buffers,
@@ -86,7 +99,12 @@ passthrough_writev(const PageStoreRelKey *key, void *localreln,
 			 blocknum, buffers, nblocks, skipFsync);
 }
 
-/* Grow the fork by one block at blocknum, written from buffer. */
+/*
+ * Grow the fork by exactly one block at blocknum, written from buffer -- the
+ * single-page grow path.  Contrast: zeroextend() bulk-adds many empty blocks
+ * with no content, and writev() overwrites blocks that already exist rather
+ * than growing the fork.
+ */
 static void
 passthrough_extend(const PageStoreRelKey *key, void *localreln,
 				   BlockNumber blocknum, const void *buffer, bool skipFsync)
@@ -115,7 +133,11 @@ passthrough_zeroextend(const PageStoreRelKey *key, void *localreln,
 				 blocknum, nblocks, skipFsync);
 }
 
-/* Flush the fork's data durably (fsync). */
+/*
+ * Force the fork's data durable immediately (fsync now), as opposed to the
+ * usual path where writev() defers the fsync to the next checkpoint.  Used when
+ * a relation must be on disk before proceeding (e.g. after an unlogged build).
+ */
 static void
 passthrough_immedsync(const PageStoreRelKey *key, void *localreln)
 {
