@@ -474,6 +474,24 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 	ls_exec(ch);
 }
 
+/*
+ * Ship a chunk of WAL (len bytes starting at WAL position start_lsn) to the
+ * daemon, tagged with this process's timeline.  Used by the archive module to
+ * stream completed WAL segments into the store.  len must be <= PS_IO_UNIT.
+ */
+void
+pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->timeline = (uint32) localsvc_timeline;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	memcpy(ch->data, data, len);
+	ls_exec(ch);
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)
