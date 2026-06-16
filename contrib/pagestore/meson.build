@@ -26,6 +26,14 @@ pagestore_daemon = executable('pagestore_daemon',
 )
 contrib_targets += pagestore_daemon
 
+# Import an existing PGDATA's relation files into the daemon, so a whole
+# database can be moved onto the page store.  Freestanding like the daemon.
+pagestore_import = executable('pagestore_import',
+  files('pagestore_import.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_import
+
 # Standalone test harness: drives the daemon over the shared-memory protocol
 # with no PostgreSQL instance.  Run independently of the PG test suites with:
 #   meson test -C <build> --suite pagestore
