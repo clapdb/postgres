@@ -38,6 +38,9 @@
 /* GUC: name of the POSIX shm object shared with the daemon */
 static char *localsvc_shm_name = NULL;
 
+/* GUC: timeline this backend reads/writes on (0 = main; >0 = a branch) */
+static int	localsvc_timeline = 0;
+
 /* per-backend attachment state */
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
@@ -195,6 +198,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.dbOid = key->dbOid;
 	ch->key.relNumber = key->relNumber;
 	ch->key.forkNum = key->forkNum;
+	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
 }
 
 /*
@@ -452,7 +456,25 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 	memcpy(out, ch->data, BLCKSZ);
 }
 
-/* Called from _PG_init to register the GUC owned by this backend. */
+/*
+ * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
+ * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
+ * for the pagestore_create_branch() SQL function.
+ */
+void
+pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
+								 uint64 branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec(ch);
+}
+
+/* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)
 {
@@ -464,4 +486,14 @@ pagestore_localsvc_init(void)
 							   PGC_POSTMASTER,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pagestore.timeline",
+							"Timeline (branch) this backend reads and writes on; 0 is the main timeline.",
+							NULL,
+							&localsvc_timeline,
+							0,
+							0, 1023,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
 }
