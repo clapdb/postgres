@@ -28,7 +28,7 @@ jobs:
       - name: Compile daemon and test harness
         working-directory: contrib/pagestore
         run: |
-          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c storage_posix.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
 
       - name: Run standalone test suite
