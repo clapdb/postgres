@@ -362,8 +362,9 @@ timeline_has_parent(uint32_t timeline)
 
 /*
  * Validate a branch-creation request before it is recorded.  read_through() and
- * the fork-size walks follow the parent chain assuming it is finite and well
- * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
+ * the fork-size / per-page WAL ancestry walks follow the parent chain assuming
+ * it is finite and well formed, so a bad CREATE_BRANCH must be rejected rather
+ * than persisted.  Refuse:
  *	- a new id that is out of range, the root (0), or already defined (otherwise
  *	  re-creating an id silently rewrites an existing branch's ancestry);
  *	- a parent that is out of range or not yet defined (the requested parent must
