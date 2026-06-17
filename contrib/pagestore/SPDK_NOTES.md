@@ -188,10 +188,22 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
       recovery, all with pages on actual NVMe.
     - Gotcha: SPDK v26.01 needs `opts.opts_size = sizeof(opts)` set *before*
       `spdk_env_opts_init` (else "Invalid opts->opts_size 40 too small").
-  - **S1.2c-2 (next) — pipeline it**: loop issues I/O for many ready channels and
-    serves replies from completion callbacks (per-channel in-flight tracking),
-    instead of polling each op to completion, to approach the S0 ceiling
-    (432 K IOPS).  Then benchmark POSIX vs SPDK.
+  - **S1.2c-2 — batched (overlapped) reads (DONE).** A multi-block READV now
+    issues up to 64 page reads at once on the NVMe queue via `ps_spdk_readv`
+    (a DMA-buffer pool + `spdk_nvme_ns_cmd_read` per block, then one drain),
+    instead of one I/O at a time -- so a request uses real queue depth.  Reads of
+    the current (buffered) append segment are still served from memory.  Still
+    110/110.  `pagestore_bench.c` (forks a daemon, writes a dataset spanning many
+    segments, times reading it back) gives an indicative number on the control
+    disk: **read 754 MiB/s, 96 Kpages/s** at 8 KiB pages, combine=32, through the
+    full IPC + index + read path -- vs the S0 raw ceiling 1688 MiB/s / 432 KIOPS
+    (4 KiB, QD128).  ~45% of raw bandwidth at far lower effective QD.
+    (POSIX-vs-SPDK is not benchmarked here: the POSIX store lands on tmpfs / a
+    different disk and reads through the OS page cache, so it would be RAM-vs-NVMe.)
+  - **S1.2c-3 (next) — cross-channel pipelining**: the loop issues I/O for many
+    ready channels and serves replies from completion callbacks (per-channel
+    in-flight tracking) instead of completing one request before the next, to lift
+    effective queue depth past one request's worth and approach the S0 ceiling.
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.
