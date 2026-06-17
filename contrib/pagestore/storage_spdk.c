@@ -41,12 +41,29 @@
 #include "pagestore_storage.h"
 #include "storage_spdk.h"
 
-/* Async read engine: a pool of DMA buffers to overlap page reads of one request
- * on the NVMe queue (see ps_spdk_readv).  Each buffer holds one aligned page
- * read; 64 KiB covers any page size we use plus the alignment slack. */
-#define PS_SPDK_POOL	64
+/*
+ * Async read engine (see storage_spdk.h): a pool of DMA buffers lets many page
+ * reads -- across many request channels -- be in flight on the NVMe queue at
+ * once.  Each buffer holds one aligned page read; 64 KiB covers any page size we
+ * use plus the alignment slack.  Buffer index == its completion context; a
+ * free-list hands them out.
+ */
+#define PS_SPDK_POOL	256
 #define PS_SPDK_BUFSZ	65536
-static char *g_pool[PS_SPDK_POOL];
+
+typedef struct PsSpdkRd
+{
+	void	   *dst;			/* caller's destination (shared memory) */
+	uint64_t	slice;			/* byte offset of the page within the DMA buffer */
+	uint32_t	len;
+	PsSpdkDone	done;
+	void	   *arg;
+} PsSpdkRd;
+
+static char *g_pool[PS_SPDK_POOL];	/* DMA buffers */
+static PsSpdkRd g_rd[PS_SPDK_POOL]; /* one in-flight read context per buffer */
+static int	g_free[PS_SPDK_POOL];	/* free-list of buffer indices */
+static int	g_nfree;
 
 #define SPDK_SUPER_MAGIC	0x53504b53	/* "SPKS" */
 
@@ -282,7 +299,9 @@ spdk_open(const char *path, uint64_t segment_size)
 			fprintf(stderr, "storage_spdk: read-pool DMA allocation failed\n");
 			return -1;
 		}
+		g_free[j] = j;
 	}
+	g_nfree = PS_SPDK_POOL;
 
 	super_read();				/* segment count: fresh dir -> 0 */
 
@@ -388,87 +407,87 @@ spdk_seg_size(int seg)
 }
 
 /*
- * Batched asynchronous reads (the hot read path; see storage_spdk.h).  Reads of
- * the current append segment are served from the DMA buffer; every other read is
- * submitted to the NVMe queue, and a chunk of up to PS_SPDK_POOL of them is
- * overlapped before we wait, so a multi-block request uses real queue depth
- * instead of one I/O at a time.  A failed read leaves its dst zero-filled.
+ * Completion of one queued device read: deliver the page (zero-fill on error),
+ * return the buffer to the free-list, and notify the caller.  Runs inside
+ * spdk_nvme_qpair_process_completions, i.e. single-threaded with the loop.
  */
-int
-ps_spdk_readv(const PsSpdkRead *reqs, int n)
+static void
+rd_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
-	int			i = 0;
+	int			b = (int) (intptr_t) arg;	/* buffer/context index */
+	PsSpdkRd   *rd = &g_rd[b];
+	int			ok = !spdk_nvme_cpl_is_error(cpl);
 
-	while (i < n)
+	if (ok)
+		memcpy(rd->dst, g_pool[b] + rd->slice, rd->len);
+	else
+		memset(rd->dst, 0, rd->len);
+	g_free[g_nfree++] = b;		/* free the buffer before notifying */
+	rd->done(rd->arg, ok);
+}
+
+int
+ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
+				   PsSpdkDone done, void *arg)
+{
+	uint64_t	byte0,
+				start,
+				end;
+	uint32_t	sectors;
+	int			b;
+	PsSpdkRd   *rd;
+
+	/* current append segment is authoritative in memory */
+	if (seg == g_curseg)
 	{
-		struct io_ctx ctx[PS_SPDK_POOL];
-		uint64_t	slice[PS_SPDK_POOL];	/* byte offset of the page in g_pool[k] */
-		const PsSpdkRead *r[PS_SPDK_POOL];	/* the request served by slot k */
-		int			chunk = 0;
-		int			done;
+		memcpy(dst, g_curbuf + off, len);
+		done(arg, 1);
+		return 0;
+	}
+	if ((uint32_t) seg >= g_num_segments)
+	{
+		memset(dst, 0, len);	/* no such segment */
+		done(arg, 1);
+		return 0;
+	}
 
-		/* fill a chunk: buffered/missing reads served inline, device reads queued */
-		while (i < n && chunk < PS_SPDK_POOL)
-		{
-			const PsSpdkRead *q = &reqs[i++];
-			uint64_t	byte0,
-						start,
-						end;
-			uint32_t	sectors;
+	byte0 = (uint64_t) seg * g_segsize + off;
+	start = byte0 - (byte0 % g_sector);
+	end = byte0 + len;
+	if (end % g_sector)
+		end += g_sector - (end % g_sector);
+	sectors = (uint32_t) ((end - start) / g_sector);
+	if ((uint64_t) sectors * g_sector > PS_SPDK_BUFSZ)
+	{
+		memset(dst, 0, len);	/* read too large for a pool buffer */
+		done(arg, 0);
+		return 0;
+	}
 
-			if (q->seg == g_curseg)
-			{
-				memcpy(q->dst, g_curbuf + q->off, q->len);
-				continue;
-			}
-			if ((uint32_t) q->seg >= g_num_segments)
-			{
-				memset(q->dst, 0, q->len);
-				continue;
-			}
-			byte0 = (uint64_t) q->seg * g_segsize + q->off;
-			start = byte0 - (byte0 % g_sector);
-			end = byte0 + q->len;
-			if (end % g_sector)
-				end += g_sector - (end % g_sector);
-			sectors = (uint32_t) ((end - start) / g_sector);
-			if ((uint64_t) sectors * g_sector > PS_SPDK_BUFSZ)
-			{
-				memset(q->dst, 0, q->len);	/* read too large for a pool buffer */
-				continue;
-			}
-			ctx[chunk].done = 0;
-			ctx[chunk].err = 0;
-			slice[chunk] = byte0 - start;
-			r[chunk] = q;
-			if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_pool[chunk], start / g_sector,
-									  sectors, io_cb, &ctx[chunk], 0) != 0)
-			{
-				memset(q->dst, 0, q->len);	/* submission failed */
-				continue;
-			}
-			chunk++;
-		}
-
-		/* wait for this chunk's overlapped reads, then deliver the pages */
-		done = 0;
-		while (done < chunk)
-		{
-			spdk_nvme_qpair_process_completions(g_qpair, 0);
-			done = 0;
-			for (int k = 0; k < chunk; k++)
-				if (ctx[k].done)
-					done++;
-		}
-		for (int k = 0; k < chunk; k++)
-		{
-			if (ctx[k].err)
-				memset(r[k]->dst, 0, r[k]->len);
-			else
-				memcpy(r[k]->dst, g_pool[k] + slice[k], r[k]->len);
-		}
+	/* take a free DMA buffer, polling completions until one frees if needed */
+	while (g_nfree == 0)
+		spdk_nvme_qpair_process_completions(g_qpair, 0);
+	b = g_free[--g_nfree];
+	rd = &g_rd[b];
+	rd->dst = dst;
+	rd->slice = byte0 - start;
+	rd->len = len;
+	rd->done = done;
+	rd->arg = arg;
+	if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_pool[b], start / g_sector,
+							  sectors, rd_cb, (void *) (intptr_t) b, 0) != 0)
+	{
+		g_free[g_nfree++] = b;	/* submission failed: give the buffer back */
+		memset(dst, 0, len);
+		done(arg, 0);
 	}
 	return 0;
+}
+
+int
+ps_spdk_poll(void)
+{
+	return spdk_nvme_qpair_process_completions(g_qpair, 0);
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */
