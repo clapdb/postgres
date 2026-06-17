@@ -194,16 +194,38 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     instead of one I/O at a time -- so a request uses real queue depth.  Reads of
     the current (buffered) append segment are still served from memory.  Still
     110/110.  `pagestore_bench.c` (forks a daemon, writes a dataset spanning many
-    segments, times reading it back) gives an indicative number on the control
-    disk: **read 754 MiB/s, 96 Kpages/s** at 8 KiB pages, combine=32, through the
-    full IPC + index + read path -- vs the S0 raw ceiling 1688 MiB/s / 432 KIOPS
-    (4 KiB, QD128).  ~45% of raw bandwidth at far lower effective QD.
-    (POSIX-vs-SPDK is not benchmarked here: the POSIX store lands on tmpfs / a
-    different disk and reads through the OS page cache, so it would be RAM-vs-NVMe.)
+    segments, times reading it back; supports a store dir, a `PS_BENCH_DROPCACHE`
+    cold-read mode, and `PS_BENCH_RANDOM` chunk shuffling) measured 256 MiB at
+    8 KiB pages, combine=32, through the full IPC + index + read path:
+
+    | daemon / store        | read pattern | MiB/s | note                         |
+    |-----------------------|--------------|-------|------------------------------|
+    | POSIX, /home (nvme1)  | seq, warm    | 3610  | OS page cache (RAM)          |
+    | POSIX, /home (nvme1)  | seq, cold    | 1574  | kernel readahead helps a lot |
+    | POSIX, /home (nvme1)  | random, cold |  748  | readahead defeated           |
+    | SPDK, nvme2           | sequential   |  756  | no readahead                 |
+    | SPDK, nvme2           | random       |  754  | order-insensitive            |
+
+    Key finding: **SPDK loses sequential reads to POSIX only because it gave up
+    the kernel page cache + readahead** (POSIX seq-cold 1574 vs SPDK 756); on
+    random reads the two tie (~750), and SPDK is order-insensitive.  Both hit
+    ~750 MiB/s at combine=32 -- the single-request-at-a-time loop caps effective
+    QD at one request's worth.  (S0 raw ceiling 1688 MiB/s / 432 KIOPS at QD128.)
+    This directly motivates a **userspace page cache + readahead in the daemon**
+    (SPDK bypasses the kernel, so the daemon must cache itself) and cross-channel
+    pipelining for QD -- the two levers to beat, not match, the kernel path.
   - **S1.2c-3 (next) — cross-channel pipelining**: the loop issues I/O for many
     ready channels and serves replies from completion callbacks (per-channel
     in-flight tracking) instead of completing one request before the next, to lift
     effective queue depth past one request's worth and approach the S0 ceiling.
+  - **S1.2d — userspace page cache + readahead in the daemon (high priority).**
+    SPDK bypasses the kernel, so the daemon must do its own caching -- the
+    benchmark above shows the kernel page cache + readahead is exactly why POSIX
+    wins sequential reads.  A shared, sharded page cache (hot pages kept in
+    hugepage RAM, keyed by (timeline,key,block,lsn)) plus sequential readahead
+    turns most reads into memory hits and prefetches the rest.  This also moves us
+    toward serving reads with zero device I/O for the working set -- the page
+    server model -- and composes with the LSM layers (S4) and sharding (S3).
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.
