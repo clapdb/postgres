@@ -83,12 +83,27 @@ blob handles / LBA ranges.
 
 ## Architecture decisions
 
-**A. Who owns the main loop?**  The daemon is a standalone process (not a PG
-backend), so it can hand its threads to SPDK.
-- **A1 (recommended):** daemon *is* an SPDK app — `spdk_app_start()` owns the
-  reactors; the current IPC channel poll loop becomes an `spdk_poller`.
-- A2: run SPDK in a side thread, keep the existing loop — fights SPDK's
-  threading; only a stepping stone, not the target.
+**A. Packaging: two binaries, one shared brain (DECIDED).**  SPDK must be an
+*optional* higher-performance choice with the IPC ABI unchanged, because some
+machines cannot run SPDK.  So:
+- `pagestore_daemon` (POSIX) keeps its current synchronous poll loop, libc-only,
+  no SPDK dependency — the portable default, unchanged in behaviour.
+- `pagestore_daemon_spdk` (opt-in build) is a separate binary: its own loop that
+  also polls SPDK, async request handling, the SPDK storage backend.
+- The **brain is single-sourced** in `pagestore_core.{c,h}` and compiled into
+  both: the in-memory indexes, COW/`read_through`, timelines, per-page WAL index,
+  shipped-WAL metadata, recovery, and all the non-I/O request handling
+  (`ps_handle_meta`).  Only the request *loop* and the page **byte** I/O differ
+  per binary (sync vs async), and the byte I/O already goes through `PsStorage`.
+- Seam: the brain exposes `ps_locate` (read-through lookup → PsPageVer),
+  `ps_reserve` (advance the append cursor) and `ps_record` (index a written
+  page); a frontend does the actual `seg_read`/`seg_write` between them (inline
+  for POSIX, callback-driven for SPDK).  `ps_handle_meta(ch)` handles every op
+  except the four byte-I/O ops (EXTEND/WRITEV/READV/READ_AT), which each frontend
+  does itself.  Adding an op touches the shared switch once.
+- SPDK runs in **library mode** (`spdk_env_init` + `spdk_thread_poll` inside our
+  loop), so even the SPDK frontend keeps its own loop rather than surrendering it
+  to `spdk_app_start`.
 
 **B. Storage layout.**
 - Start: **blobstore, one blob per segment** (and per `wal_<tl>`). Least code,
@@ -129,9 +144,22 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     behind `#ifdef PAGESTORE_SPDK`.  Zero behaviour change: standalone suite
     110/110, `integration_test.sh` PASS.  IPC ABI and compute side untouched —
     SPDK will be a *second* `PsStorage` implementation, never an ABI change.
-  - **S1.2 (next) — the SPDK backend** (`storage_spdk.c`, opt-in compile): one
-    reactor, async `spdk_bdev_*` behind the same vtable, plus the daemon's
-    request loop made callback-driven for in-flight reads.
+  - **S1.2a — shared brain extracted (DONE).** The store's logic moved to
+    `pagestore_core.{c,h}` (indexes, COW/`read_through`, timelines, per-page WAL
+    index, shipped-WAL metadata, recovery, and `ps_handle_meta` for all non-I/O
+    ops).  `pagestore_daemon.c` is now a thin POSIX frontend: the synchronous
+    channel loop + the four byte-I/O ops via `append_page`/`read_through`/
+    `read_version`.  Both compiled into `pagestore_daemon`.  Zero behaviour
+    change: standalone 110/110, `integration_test.sh` PASS.  This sets up the
+    two-binary split — the SPDK daemon will reuse `pagestore_core.c` verbatim.
+  - **S1.2b (next) — SPDK build wiring**: meson `-Dpagestore_spdk` option that
+    finds SPDK libs/headers; `storage_spdk.c` skeleton + `pagestore_daemon_spdk.c`
+    skeleton that links SPDK, inits the env in library mode, and enumerates the
+    control disk.  Compile/link path first, no real I/O yet.
+  - **S1.2c — async SPDK I/O + dispatch**: implement `PsStorage` over async
+    `spdk_bdev_*`; the SPDK frontend's loop polls channels + `spdk_thread_poll`,
+    issues reads/writes with completions, tracks in-flight per channel.  Gate:
+    `integration_test.sh` PASS against the SPDK daemon; compare to the S0 ceiling.
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.

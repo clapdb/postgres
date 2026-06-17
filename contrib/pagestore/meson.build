@@ -21,7 +21,7 @@ contrib_targets += pagestore
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
-  files('pagestore_daemon.c', 'storage_posix.c'),
+  files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c'),
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
