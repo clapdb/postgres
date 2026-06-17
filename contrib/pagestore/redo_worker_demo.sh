@@ -95,7 +95,15 @@ echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 
 rm -f "$D"/pg_wal/0000000*	# remove local WAL: recovery must fetch from the store
 
 if "$BIN/pg_ctl" -D "$D" -l "$D/r.log" -w start >/dev/null 2>&1; then
-	val=$($P -c "SELECT v FROM t WHERE id=1;")
+	# pg_ctl -w returns once the server accepts connections, which (with hot
+	# standby) is during recovery -- so retry the read until replay has caught up
+	# to the shipped UPDATE rather than racing ahead of it.
+	val=
+	for _ in $(seq 1 100); do
+		val=$($P -c "SELECT v FROM t WHERE id=1;" 2>/dev/null)
+		[ "$val" = "changed" ] && break
+		sleep 0.2
+	done
 	if [ "$val" = "changed" ]; then
 		echo "ok   - redo worker recovered 'changed' from store-resident WAL"
 		grep -q "restored log file" "$D/r.log" && \
