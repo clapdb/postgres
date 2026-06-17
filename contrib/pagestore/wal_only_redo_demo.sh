@@ -97,7 +97,14 @@ echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 
 rm -f "$D"/pg_wal/0000000*
 
 if "$BIN/pg_ctl" -D "$D" -l "$D/r.log" -w start >/dev/null 2>&1; then
-	val=$($P -c "SELECT v FROM t WHERE id=1;" 2>/dev/null)
+	# hot standby accepts connections during recovery, so retry until replay has
+	# rebuilt the table from WAL (it does not exist until CREATE TABLE is replayed)
+	val=
+	for _ in $(seq 1 100); do
+		val=$($P -c "SELECT v FROM t WHERE id=1;" 2>/dev/null)
+		[ "$val" = "changed" ] && break
+		sleep 0.2
+	done
 	if [ "$val" = "changed" ]; then
 		echo "ok   - table read served from the store (local heap removed); redo built it from WAL"
 		echo "wal-only redo demo: PASS"
