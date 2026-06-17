@@ -168,10 +168,30 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
       also links `storage_posix.c` (core's default `ps_storage` references
       `PsStoragePosix`).  Not wired into PG's meson (SPDK is a local-only,
       bound-disk artifact); the script is the compile switch.
-  - **S1.2c — async SPDK I/O + dispatch**: implement `PsStorage` over async
-    `spdk_bdev_*`; the SPDK frontend's loop polls channels + `spdk_thread_poll`,
-    issues reads/writes with completions, tracks in-flight per channel.  Gate:
-    `integration_test.sh` PASS against the SPDK daemon; compare to the S0 ceiling.
+  - **S1.2c-1 — SPDK I/O on real NVMe (DONE).** `storage_spdk.c` now does real
+    I/O via the async `spdk_nvme_ns_cmd_read/write` API, polled to completion per
+    op (correct; cross-channel pipelining is S1.2c-2).  Layout: page **segments**
+    live on the raw namespace (segment S byte O -> device byte S*segsize+O), each
+    written as one sector-aligned zero-padded extent so recover() stops at the
+    zero tail (no per-segment length tracking); the current append segment is a
+    DMA buffer flushed on roll-over/sync, older segments read with an aligned
+    read + slice.  The shipped **WAL and timeline metadata** stay on the
+    filesystem under `--store` (delegated to the POSIX backend) -- small, not hot,
+    and awkward to lay out per-timeline on raw blocks; on-device is a later LSM
+    refinement.  Segment count persists in `<store>/spdk_super` so a fresh
+    `--store` dir is a fresh store and a restart continues.
+    - **Validated on the control disk**: the SPDK daemon is argument-compatible
+      with the standalone harness (PCI via `$PS_SPDK_PCI`), so
+      `sudo PS_SPDK_PCI=0000:06:00.0 ./pagestore_test ./pagestore_daemon_spdk`
+      runs the full suite -- **110/110**, exercising page I/O, COW, branches,
+      shipped WAL, vectored I/O, 8-client concurrency, and daemon-restart
+      recovery, all with pages on actual NVMe.
+    - Gotcha: SPDK v26.01 needs `opts.opts_size = sizeof(opts)` set *before*
+      `spdk_env_opts_init` (else "Invalid opts->opts_size 40 too small").
+  - **S1.2c-2 (next) — pipeline it**: loop issues I/O for many ready channels and
+    serves replies from completion callbacks (per-channel in-flight tracking),
+    instead of polling each op to completion, to approach the S0 ceiling
+    (432 K IOPS).  Then benchmark POSIX vs SPDK.
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.
