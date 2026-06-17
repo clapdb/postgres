@@ -123,6 +123,20 @@ main(int argc, char **argv)
 		return 2;
 	}
 
+	/*
+	 * The WAL segment size must be a power of two in [1 MB, 1 GB] (PostgreSQL's
+	 * own constraint).  Reject anything else before dividing by it: a zero or
+	 * bogus --segsize would divide-by-zero / miscompute the LSN and break
+	 * recovery.
+	 */
+	if (segsize < 1024 * 1024 || segsize > 1024 * 1024 * 1024 ||
+		(segsize & (segsize - 1)) != 0)
+	{
+		fprintf(stderr, "invalid --segsize %llu (must be a power of two, "
+				"1MB..1GB)\n", (unsigned long long) segsize);
+		return 2;
+	}
+
 	/* segment file name is TLI(8 hex) + xlogid(8 hex) + segment-in-id(8 hex) */
 	if (sscanf(segname, "%8X%8X%8X", &tli, &hi, &lo) != 3)
 	{
