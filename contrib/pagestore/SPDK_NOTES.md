@@ -218,14 +218,18 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     ready channels and serves replies from completion callbacks (per-channel
     in-flight tracking) instead of completing one request before the next, to lift
     effective queue depth past one request's worth and approach the S0 ceiling.
-  - **S1.2d — userspace page cache + readahead in the daemon (high priority).**
-    SPDK bypasses the kernel, so the daemon must do its own caching -- the
-    benchmark above shows the kernel page cache + readahead is exactly why POSIX
-    wins sequential reads.  A shared, sharded page cache (hot pages kept in
-    hugepage RAM, keyed by (timeline,key,block,lsn)) plus sequential readahead
-    turns most reads into memory hits and prefetches the rest.  This also moves us
-    toward serving reads with zero device I/O for the working set -- the page
-    server model -- and composes with the LSM layers (S4) and sharding (S3).
+  - **S1.2d — database-adapted materialization cache (high priority, NOT a
+    block cache).**  The benchmark shows the kernel page cache + readahead is why
+    POSIX wins sequential reads -- but a userspace block-address LRU is the wrong
+    answer: it is filled with the same I/O bandwidth (re-implementing the kernel
+    cache we bypassed) and a seqscan thrashes it.  Instead, cache database
+    *semantics* (see DESIGN_NOTES.md #3): materialized page versions keyed by
+    (timeline,key,block,LSN) so a hit skips device read *and* redo; value-aware
+    admission (keep index/catalog/long-redo-chain pages); scan-resistant
+    (BAS_BULKREAD-style ring); structure-aware prefetch from compute hints;
+    unified with the LSM image layers (the RAM cache is the hot tier of the same
+    materialization), per-shard and lock-free.  Co-designed with S3/S4, not a
+    bolt-on.
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.

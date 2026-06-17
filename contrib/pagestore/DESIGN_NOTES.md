@@ -57,6 +57,46 @@ keep a per-core layer map, and run compaction/GC per shard.  In other words, the
 choice of data structure (item 1) must account for how it is owned and accessed
 across cores (item 2).
 
+## 3. The in-memory cache must be database-adapted, not an fs page cache
+
+SPDK bypasses the kernel, so it loses the OS page cache and readahead.  A
+benchmark made this concrete: on sequential reads POSIX (kernel readahead +
+page cache) does ~1574 MiB/s cold vs SPDK ~756; on *random* reads the kernel's
+advantage evaporates and the two tie (~750).  The naive fix -- a userspace
+block-address LRU -- is the wrong design: **you still fill it with the same I/O
+bandwidth**, so it merely re-implements the kernel cache we just bypassed, and a
+single big seqscan thrashes it.  You cannot out-bandwidth a cold/streaming
+workload, so don't try; be selective and cache at the level of database
+semantics, where the store knows things a block cache cannot:
+
+- **Cache materialized page versions, not blocks.**  Key by
+  `(timeline, key, block, LSN)`; the value is the reconstructed page image.  A
+  hit then skips both the device read *and* the WAL replay (single-page redo,
+  3c-4) that is the genuinely expensive work -- this is the page-server insight
+  (Neon's pageserver caches redo outputs).  Branches share a parent's cached
+  page by read-through instead of duplicating it.
+- **Value-aware admission/eviction, not pure LRU.**  Keep what is expensive to
+  reproduce and likely reused -- B-tree interior nodes, catalog/SLRU, pages with
+  long redo chains -- ranked by `reproduction-cost x reuse-probability`, not
+  recency alone.
+- **Scan-resistant.**  A bulk seqscan must not evict the hot set; use a
+  ring/probation policy (exactly what PostgreSQL's buffer access strategies,
+  e.g. `BAS_BULKREAD`, do).  Detect sequential block runs, or take a hint.
+- **Structure-aware prefetch, not blind readahead.**  Prefetch driven by access
+  type (index range scan, bitmap heap scan) -- ideally from hints the compute's
+  AIO prefetcher already computes -- rather than guessing from offsets.
+- **Unified with the LSM image layers (item 1).**  An image layer is a persisted
+  materialization of pages at an LSN over a key range; the RAM cache is just the
+  hot tier of that same materialization.  So cache, image-layer materialization,
+  and compaction are one system with one policy (what to materialize, keep hot,
+  persist, evict), not a bolt-on LRU.
+- **Per-shard and lock-free (item 2):** each core owns its cache slice.
+
+In short, the cache's job is not "read the disk less" (a block cache does that
+and still needs the bandwidth) but "do less of the work the database makes
+expensive" -- redo replay and repeated index traversal -- while staying
+disciplined about scans.  Items 1, 2 and 3 are co-designed.
+
 ## Other known simplifications (smaller)
 
 - Indexes are in-memory and rebuilt on restart; the per-page WAL index is not
