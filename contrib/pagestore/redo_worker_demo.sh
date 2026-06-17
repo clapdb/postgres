@@ -73,12 +73,16 @@ SELECT labelfile FROM pg_backup_stop();
 SQL
 $P -c "UPDATE t SET v='changed' WHERE id=1;" >/dev/null
 
-# the segment holding the backup start point must reach the store; wait until
-# it (and the WAL after it) is archived, since archiving is asynchronous
-startseg=$(sed -n 's/.*(file \([0-9A-F]\{24\}\)).*/\1/p' "$D/backup_label")
-for _ in $(seq 1 50); do
+# The UPDATE's WAL must reach the store before recovery, and archiving is
+# asynchronous.  Capture the segment the UPDATE landed in, force it to complete,
+# and wait until *that* segment is archived -- which implies the backup-start
+# segment and everything between are too (the archiver ships in order).  Waiting
+# only for the backup-start segment races: the UPDATE is in a later segment that
+# may not be shipped yet (this is what intermittently failed in CI).
+updseg=$($P -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
+for _ in $(seq 1 100); do
 	$P -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-	[ -f "$D/pg_wal/archive_status/$startseg.done" ] && break
+	[ -f "$D/pg_wal/archive_status/$updseg.done" ] && break
 	sleep 0.2
 done
 "$BIN/pg_ctl" -D "$D" -m fast -w stop >/dev/null 2>&1

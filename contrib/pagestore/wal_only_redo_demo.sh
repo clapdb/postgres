@@ -70,10 +70,13 @@ SQL
 # create the table and change it; its pages are written LOCALLY, never shipped
 $P -c "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (1,'base');" >/dev/null
 $P -c "UPDATE t SET v='changed' WHERE id=1;" >/dev/null
-startseg=$(sed -n 's/.*(file \([0-9A-F]\{24\}\)).*/\1/p' "$D/backup_label")
-for _ in $(seq 1 50); do
+# Wait until the UPDATE's WAL segment is archived to the store (async), not just
+# the backup-start segment -- the change is in a later segment, and waiting only
+# for the start segment races on slower CI runners.
+updseg=$($P -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
+for _ in $(seq 1 100); do
 	$P -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-	[ -f "$D/pg_wal/archive_status/$startseg.done" ] && break
+	[ -f "$D/pg_wal/archive_status/$updseg.done" ] && break
 	sleep 0.2
 done
 # table t's relation file exists locally (the writer did not page-ship it)
