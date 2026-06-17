@@ -28,9 +28,17 @@ set -euo pipefail
 
 BUILD=${1:?usage: compute_on_branch_demo.sh <meson-build-dir>}
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
-ROOT="$BUILD/tmp_install$BUILD/install"
-BIN="$ROOT/bin"
-export LD_LIBRARY_PATH="$ROOT/lib64"
+
+# Locate the installed binaries under the meson tmp_install tree by finding
+# pg_ctl, rather than hard-coding the install prefix (which varies by build).
+PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' 2>/dev/null | head -1)
+if [ -z "$PGCTL" ]; then
+	echo "could not find pg_ctl under $BUILD/tmp_install (run 'meson install' / a build that stages tmp_install)" >&2
+	exit 1
+fi
+BIN=$(dirname "$PGCTL")
+ROOT=$(dirname "$BIN")
+export LD_LIBRARY_PATH="$ROOT/lib64:$ROOT/lib"
 
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 IMPORT="$BUILD/contrib/pagestore/pagestore_import"

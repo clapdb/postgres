@@ -276,6 +276,19 @@ op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 	cl_exec();
 }
 
+/* Like op_create_branch but returns the daemon's status (for negative tests). */
+static int
+op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	return cl_exec()->status;
+}
+
 /* Write one page on a specific timeline. */
 static void
 op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
@@ -621,6 +634,21 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 22), "branch write survives daemon restart");
 	op_read_tl(1, REL_B, FORK0, 5, rb);
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
+
+	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
+	 * walk (timelines 0,1,2 are defined here) */
+	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "reject re-creating an existing timeline id");
+	check(op_create_branch_status(9, 900, 1500) == PS_STATUS_ERROR,
+		  "reject branch off an undefined parent");
+	check(op_create_branch_status(9, 9, 1500) == PS_STATUS_ERROR,
+		  "reject self-parent (would loop the read path)");
+	check(op_create_branch_status(0, 0, 1500) == PS_STATUS_ERROR,
+		  "reject redefining the root timeline");
+	check(op_create_branch_status(7, 2, 1500) == PS_STATUS_OK,
+		  "valid branch off a defined branch still accepted");
+	op_read_tl(7, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11), "new valid branch reads through to root");
 
 	client_detach();
 	stop_daemon(dpid);
