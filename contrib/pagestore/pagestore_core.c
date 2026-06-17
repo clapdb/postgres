@@ -426,9 +426,21 @@ load_timelines(void)
 	TimelineRec rec;
 	uint64_t	off = 0;
 
+	/*
+	 * Records are appended in creation order, so a record's parent is defined by
+	 * an earlier record (or is the root).  Re-validate each with the same check
+	 * used at creation, so a corrupt, truncated, or duplicated persisted record
+	 * cannot reintroduce an undefined parent or a cycle that the creation path
+	 * rejects -- which would otherwise hang read_through()'s ancestry walk after
+	 * a restart.  Invalid records are skipped, not applied.
+	 */
 	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		timeline_define(rec.id, rec.parent, rec.branch_lsn);
+		if (branch_request_ok(rec.id, rec.parent))
+			timeline_define(rec.id, rec.parent, rec.branch_lsn);
+		else
+			fprintf(stderr, "pagestore: skipping invalid timeline record "
+					"(id=%u parent=%d)\n", rec.id, rec.parent);
 		off += sizeof(rec);
 	}
 }
