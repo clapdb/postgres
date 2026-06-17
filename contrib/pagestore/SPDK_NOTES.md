@@ -152,10 +152,22 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     `read_version`.  Both compiled into `pagestore_daemon`.  Zero behaviour
     change: standalone 110/110, `integration_test.sh` PASS.  This sets up the
     two-binary split — the SPDK daemon will reuse `pagestore_core.c` verbatim.
-  - **S1.2b (next) — SPDK build wiring**: meson `-Dpagestore_spdk` option that
-    finds SPDK libs/headers; `storage_spdk.c` skeleton + `pagestore_daemon_spdk.c`
-    skeleton that links SPDK, inits the env in library mode, and enumerates the
-    control disk.  Compile/link path first, no real I/O yet.
+  - **S1.2b — SPDK build wiring (DONE).** `storage_spdk.c` (the SPDK PsStorage
+    backend) + `pagestore_daemon_spdk.c` (frontend skeleton) + `spdk_build.sh`.
+    Library-mode bring-up works: `ps_storage->open()` does `spdk_env_init` +
+    `spdk_nvme_probe` on the control disk's PCI address and grabs ns1 + an I/O
+    qpair; the frontend reuses `ps_core_open` (the shared brain) and reports
+    ready.  Verified: `sudo pagestore_daemon_spdk --pci 0000:06:00.0` attaches
+    the disk (sector=512, 976773168 sectors, ~466 GiB).  Byte I/O is stubbed.
+    - Build recipe (in `spdk_build.sh`): SPDK static libs need
+      `-Wl,--whole-archive ... pkg-config --libs spdk_nvme spdk_env_dpdk ...
+      --no-whole-archive` plus `pkg-config --libs --static spdk_syslibs`;
+      `PKG_CONFIG_PATH` must include both `$SPDK/build/lib/pkgconfig` and
+      `$SPDK/dpdk/build/lib/pkgconfig`; DPDK is shared, so rpath
+      `$SPDK/{build,dpdk/build}/lib` to avoid `LD_LIBRARY_PATH`.  The SPDK build
+      also links `storage_posix.c` (core's default `ps_storage` references
+      `PsStoragePosix`).  Not wired into PG's meson (SPDK is a local-only,
+      bound-disk artifact); the script is the compile switch.
   - **S1.2c — async SPDK I/O + dispatch**: implement `PsStorage` over async
     `spdk_bdev_*`; the SPDK frontend's loop polls channels + `spdk_thread_poll`,
     issues reads/writes with completions, tracks in-flight per channel.  Gate:
