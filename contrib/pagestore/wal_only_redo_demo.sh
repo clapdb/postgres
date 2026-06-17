@@ -74,9 +74,10 @@ $P -c "UPDATE t SET v='changed' WHERE id=1;" >/dev/null
 # the backup-start segment -- the change is in a later segment, and waiting only
 # for the start segment races on slower CI runners.
 updseg=$($P -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
-for _ in $(seq 1 100); do
+for _ in $(seq 1 150); do
 	$P -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-	[ -f "$D/pg_wal/archive_status/$updseg.done" ] && break
+	last=$($P -c "SELECT last_archived_wal FROM pg_stat_archiver;" 2>/dev/null)
+	[[ -n "$last" && ! "$last" < "$updseg" ]] && break	# archived through updseg
 	sleep 0.2
 done
 # table t's relation file exists locally (the writer did not page-ship it)

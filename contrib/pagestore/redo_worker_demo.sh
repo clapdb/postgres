@@ -80,9 +80,10 @@ $P -c "UPDATE t SET v='changed' WHERE id=1;" >/dev/null
 # only for the backup-start segment races: the UPDATE is in a later segment that
 # may not be shipped yet (this is what intermittently failed in CI).
 updseg=$($P -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
-for _ in $(seq 1 100); do
+for _ in $(seq 1 150); do
 	$P -c "SELECT pg_switch_wal();" >/dev/null 2>&1
-	[ -f "$D/pg_wal/archive_status/$updseg.done" ] && break
+	last=$($P -c "SELECT last_archived_wal FROM pg_stat_archiver;" 2>/dev/null)
+	[[ -n "$last" && ! "$last" < "$updseg" ]] && break	# archived through updseg
 	sleep 0.2
 done
 "$BIN/pg_ctl" -D "$D" -m fast -w stop >/dev/null 2>&1
