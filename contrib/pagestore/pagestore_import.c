@@ -15,6 +15,11 @@
  * blocks to the daemon over the shared-memory protocol -- exactly the keys the
  * smgr shim will later use.  Freestanding: only pagestore_ipc.h and libc.
  *
+ * Limitation: only the default tablespace (base/) and shared catalogs (global/)
+ * are imported; relations in user-created tablespaces (pg_tblspc/<oid>/...) are
+ * not, and would be missing under route_all.  The tool warns if any exist.  Use
+ * the default tablespace, or extend the walk to resolve pg_tblspc links.
+ *
  * Usage: pagestore_import --shm NAME --pgdata DIR [--page-size N]
  *
  * src/../contrib/pagestore/pagestore_import.c
@@ -23,6 +28,7 @@
  */
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,10 +70,13 @@ client_attach(const char *shm_name)
 	}
 	close(fd);
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->page_size != page_size)
+	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		hdr->page_size != page_size)
 	{
-		fprintf(stderr, "shm header mismatch (daemon page_size=%u, expected %u)\n",
-				hdr->page_size, page_size);
+		fprintf(stderr, "shm header mismatch (daemon magic=0x%x version=%u "
+				"page_size=%u; expected version=%u page_size=%u)\n",
+				hdr->magic, hdr->version, hdr->page_size,
+				PS_SHM_VERSION, page_size);
 		exit(2);
 	}
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
@@ -204,10 +213,15 @@ import_dir(const char *dirpath, uint32_t spc, uint32_t db)
 
 		put_create(spc, db, rel, fork);
 
-		while ((n = read(fd, page, page_size)) > 0)
+		while ((n = read(fd, page, page_size)) != 0)
 		{
 			uint32_t	block;
 
+			if (n < 0)			/* I/O error: abort rather than import partially */
+			{
+				fprintf(stderr, "read %s: %s\n", path, strerror(errno));
+				exit(2);
+			}
 			if ((uint32_t) n < page_size)	/* pad a short trailing block */
 				memset((char *) page + n, 0, page_size - n);
 			block = seg * seg_blocks + local_blk;
@@ -275,6 +289,29 @@ main(int argc, char **argv)
 			import_dir(dbpath, DEFAULTTABLESPACE_OID, db);
 		}
 		closedir(based);
+	}
+
+	/*
+	 * Limitation: only the default tablespace (base/) and shared catalogs
+	 * (global/) are imported.  Relations in user-created tablespaces live under
+	 * pg_tblspc/<oid>/... and are NOT walked, so route_all=on would miss them.
+	 * Warn loudly rather than silently produce a partial import.
+	 */
+	snprintf(path, sizeof(path), "%s/pg_tblspc", pgdata);
+	based = opendir(path);
+	if (based)
+	{
+		int			n = 0;
+
+		while ((de = readdir(based)) != NULL)
+			if (de->d_name[0] != '.')
+				n++;
+		closedir(based);
+		if (n > 0)
+			fprintf(stderr, "pagestore_import: WARNING: %d user tablespace(s) in "
+					"pg_tblspc are NOT imported; relations there will be missing "
+					"under route_all (unsupported -- use the default tablespace)\n",
+					n);
 	}
 
 	fprintf(stderr, "pagestore_import: done (%s -> timeline 0)\n", pgdata);
