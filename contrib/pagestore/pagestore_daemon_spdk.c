@@ -4,18 +4,18 @@
  *	  SPDK frontend for the page-store daemon (optional, higher performance).
  *
  * Reuses the shared brain pagestore_core.c verbatim; this file supplies the
- * SPDK-specific bring-up and the request loop.  SPDK is used in *library mode*:
- * we own the loop, and the SPDK storage backend's byte ops poll the NVMe qpair
- * to completion internally (S1.2c-1).  Pipelining many requests in flight across
- * channels is S1.2c-2.  The portable POSIX daemon is unaffected and remains the
+ * SPDK-specific bring-up and an *asynchronous, cross-channel* request loop.
+ * SPDK is used in library mode (we own the loop).  The loop scans the channels
+ * and begins each ready request without blocking: metadata and (buffered) write
+ * ops complete synchronously, while read ops submit their page reads to the NVMe
+ * queue and the channel's reply is published from the read completions.  So many
+ * requests are in flight at once -- effective queue depth is no longer one
+ * request's worth.  The portable POSIX daemon is unaffected and remains the
  * default; this binary is built separately (spdk_build.sh) and links SPDK.
  *
- * Argument-compatible with pagestore_daemon (so the standalone test harness can
- * drive it): --shm/--store/--page-size/--segment-size.  The control disk's PCI
- * address is taken from --pci or $PS_SPDK_PCI (so the test, which only passes
- * the common args, can set it via the environment).  --store is the dir for the
- * spdk_super file and the delegated WAL/timeline metadata; page segments live on
- * the NVMe device.
+ * Argument-compatible with pagestore_daemon so the standalone test harness can
+ * drive it: --shm/--store/--page-size/--segment-size; the control disk's PCI
+ * address is --pci or $PS_SPDK_PCI.
  *
  *-------------------------------------------------------------------------
  */
@@ -33,6 +33,9 @@
 #include "pagestore_core.h"
 #include "storage_spdk.h"
 
+/* most page reads a single request can carry (nblocks * page_size <= io_unit) */
+#define MAX_BLOCKS	128
+
 static volatile sig_atomic_t stop_requested = 0;
 
 static void
@@ -42,12 +45,39 @@ on_signal(int sig)
 	stop_requested = 1;
 }
 
+/* per-channel in-flight read request */
+typedef struct ReqState
+{
+	PsChannel  *ch;
+	int			active;			/* a read request is in flight on this channel */
+	int			pending;		/* page reads not yet completed */
+} ReqState;
+
+static ReqState reqstate[PS_MAX_CHANNELS];
+
+/* one page read finished; when the last of a request lands, publish the reply */
+static void
+read_done(void *arg, int ok)
+{
+	ReqState   *rs = arg;
+
+	(void) ok;					/* the engine already delivered/zeroed the page */
+	if (--rs->pending == 0)
+	{
+		rs->active = 0;			/* clear before publishing DONE */
+		ps_store_release(&rs->ch->state, PS_STATE_DONE);
+	}
+}
+
 /*
- * Serve one request.  Metadata ops go to the shared brain; the four byte-I/O
- * ops use the SPDK storage backend (which polls NVMe completions internally).
+ * Begin serving the request on channel 'i'.  Synchronous ops (metadata, buffered
+ * writes) finish and publish DONE here; read ops submit their page reads and
+ * return, leaving DONE to read_done().  Index pointers from read_through() are
+ * dereferenced (seg/off taken) synchronously here, never held across the async
+ * wait, so a concurrent write reallocating a version array cannot dangle them.
  */
 static void
-handle_request(PsChannel *ch)
+begin(uint32_t i, PsChannel *ch)
 {
 	uint32_t	tl = ch->timeline;
 
@@ -55,7 +85,10 @@ handle_request(PsChannel *ch)
 	ch->result = 0;
 
 	if (ps_handle_meta(ch))
+	{
+		ps_store_release(&ch->state, PS_STATE_DONE);
 		return;
+	}
 
 	switch ((PsOpcode) ch->opcode)
 	{
@@ -64,13 +97,14 @@ handle_request(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 			else
 				fork_grow(tl, &ch->key, ch->blocknum + 1);
-			break;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			return;
 
 		case PS_OP_WRITEV:
-			for (uint32_t i = 0; i < ch->nblocks; i++)
+			for (uint32_t b = 0; b < ch->nblocks; b++)
 			{
-				if (append_page(tl, &ch->key, ch->blocknum + i,
-								 ch->data + (size_t) i * page_size) != 0)
+				if (append_page(tl, &ch->key, ch->blocknum + b,
+								 ch->data + (size_t) b * page_size) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -78,61 +112,74 @@ handle_request(PsChannel *ch)
 			}
 			if (ch->status == PS_STATUS_OK)
 				fork_grow(tl, &ch->key, ch->blocknum + ch->nblocks);
-			break;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			return;
 
 		case PS_OP_READV:
 			{
-				/* batch up to 64 page reads at a time so the device reads
-				 * overlap on the NVMe queue (see ps_spdk_readv) */
-				PsSpdkRead	reqs[64];
-				uint32_t	i = 0;
+				PageVer    *locs[MAX_BLOCKS];
+				uint32_t	nb = ch->nblocks;
+				ReqState   *rs = &reqstate[i];
 
-				while (i < ch->nblocks)
+				if (nb > MAX_BLOCKS || (uint64_t) nb * page_size > PS_IO_UNIT)
 				{
-					int			nr = 0;
-
-					while (i < ch->nblocks && nr < 64)
-					{
-						unsigned char *dst = ch->data + (size_t) i * page_size;
-						PageVer    *v = read_through(tl, &ch->key,
-													 ch->blocknum + i, UINT64_MAX);
-
-						if (!v)
-							memset(dst, 0, page_size);	/* unwritten -> zeros */
-						else
-						{
-							reqs[nr].seg = v->seg;
-							reqs[nr].off = v->off;
-							reqs[nr].dst = dst;
-							reqs[nr].len = page_size;
-							nr++;
-						}
-						i++;
-					}
-					ps_spdk_readv(reqs, nr);
+					ch->status = PS_STATUS_ERROR;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
 				}
-				break;
+				rs->ch = ch;
+				rs->pending = 0;
+				for (uint32_t b = 0; b < nb; b++)
+				{
+					locs[b] = read_through(tl, &ch->key, ch->blocknum + b,
+										   UINT64_MAX);
+					if (locs[b])
+						rs->pending++;
+				}
+				if (rs->pending == 0)	/* all unwritten -> zeros */
+				{
+					memset(ch->data, 0, (size_t) nb * page_size);
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
+				}
+				rs->active = 1;
+				for (uint32_t b = 0; b < nb; b++)
+				{
+					unsigned char *dst = ch->data + (size_t) b * page_size;
+
+					if (!locs[b])
+						memset(dst, 0, page_size);
+					else
+						ps_spdk_read_async(locs[b]->seg, locs[b]->off, dst,
+										   page_size, read_done, rs);
+				}
+				return;			/* DONE published by read_done */
 			}
 
 		case PS_OP_READ_AT:
 			{
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
 											 ch->req_lsn);
+				ReqState   *rs = &reqstate[i];
 
 				if (!v)
-					memset(ch->data, 0, page_size);
-				else
 				{
-					PsSpdkRead	r = {v->seg, v->off, ch->data, page_size};
-
-					ps_spdk_readv(&r, 1);
+					memset(ch->data, 0, page_size);
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
 				}
-				break;
+				rs->ch = ch;
+				rs->pending = 1;
+				rs->active = 1;
+				ps_spdk_read_async(v->seg, v->off, ch->data, page_size,
+								   read_done, rs);
+				return;
 			}
 
 		default:
 			ch->status = PS_STATUS_ERROR;
-			break;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			return;
 	}
 }
 
@@ -174,7 +221,6 @@ main(int argc, char **argv)
 				"[--page-size N] [--segment-size N]\n", argv[0]);
 		return 2;
 	}
-	/* the PCI address reaches the storage backend through $PS_SPDK_PCI */
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
 
@@ -223,23 +269,31 @@ main(int argc, char **argv)
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
 			PS_MAX_CHANNELS);
 
+	/*
+	 * Cross-channel async loop: start every ready request that is not already in
+	 * flight, then drive NVMe completions.  Read requests stay "active" until
+	 * their completions publish DONE, so many overlap on the queue.
+	 */
 	while (!stop_requested)
 	{
-		int			did_work = 0;
+		int			work = 0;
 
 		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
 		{
 			PsChannel  *ch = ps_channel(shm, i);
 
-			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
-				continue;
-
-			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
-			did_work = 1;
+			if (!reqstate[i].active &&
+				ps_load_acquire(&ch->state) == PS_STATE_REQUEST)
+			{
+				begin(i, ch);
+				work = 1;
+			}
 		}
 
-		if (!did_work)
+		if (ps_spdk_poll() > 0)
+			work = 1;
+
+		if (!work)
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
 

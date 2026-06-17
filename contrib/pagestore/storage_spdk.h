@@ -5,8 +5,10 @@
  *	  used only by the SPDK daemon frontend for the asynchronous read path.
  *
  * The PsStorage vtable stays synchronous (the shared brain and recover() use
- * it); this batched read API lets the SPDK frontend overlap many page reads of
- * one request on the NVMe queue instead of waiting for each in turn.
+ * it).  This async submit/poll API lets the SPDK frontend keep many page reads
+ * -- across many request channels -- in flight on the NVMe queue at once and
+ * serve each reply from its completion, instead of finishing one request before
+ * starting the next.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,20 +17,22 @@
 
 #include <stdint.h>
 
-/* One page read: 'len' bytes at (seg, off) copied into 'dst' (shared memory). */
-typedef struct PsSpdkRead
-{
-	int			seg;
-	uint64_t	off;
-	void	   *dst;
-	uint32_t	len;
-} PsSpdkRead;
+/* Completion callback: ok=1 if the page was delivered, 0 on a device error
+ * (in which case the engine has zero-filled dst). */
+typedef void (*PsSpdkDone) (void *arg, int ok);
 
 /*
- * Issue all 'n' reads, overlapping the device reads on the NVMe queue, and wait
- * for them all.  Reads of the current (buffered) append segment are served from
- * memory.  A read that fails leaves its 'dst' zero-filled.  Returns 0.
+ * Submit one page read of 'len' bytes at (seg, off) into 'dst' (shared memory).
+ * A read of the current (buffered) append segment is served from memory and
+ * 'done' is called before returning; a device read is queued and 'done' fires
+ * later from ps_spdk_poll().  Either way the engine copies into dst (or zeroes
+ * it on error) before calling done.  If no DMA buffer is free it polls until one
+ * frees, so submission always eventually succeeds.  Returns 0.
  */
-extern int	ps_spdk_readv(const PsSpdkRead *reqs, int n);
+extern int	ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
+							   PsSpdkDone done, void *arg);
+
+/* Drive NVMe completions; returns the number processed. */
+extern int	ps_spdk_poll(void);
 
 #endif							/* STORAGE_SPDK_H */

@@ -214,10 +214,28 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     This directly motivates a **userspace page cache + readahead in the daemon**
     (SPDK bypasses the kernel, so the daemon must cache itself) and cross-channel
     pipelining for QD -- the two levers to beat, not match, the kernel path.
-  - **S1.2c-3 (next) — cross-channel pipelining**: the loop issues I/O for many
-    ready channels and serves replies from completion callbacks (per-channel
-    in-flight tracking) instead of completing one request before the next, to lift
-    effective queue depth past one request's worth and approach the S0 ceiling.
+  - **S1.2c-3 — cross-channel pipelining (DONE).** The SPDK daemon loop is now
+    asynchronous: `ps_spdk_read_async` + `ps_spdk_poll` (storage_spdk.h) with a
+    256-buffer DMA pool and free-list; the loop `begin()`s every ready channel
+    without blocking (metadata/buffered-write ops finish inline; read ops submit
+    their page reads and the reply is published from `read_done` when the last
+    lands), tracking per-channel in-flight state.  Index pointers from
+    `read_through` are dereferenced (seg/off taken) synchronously inside
+    `begin()`, never held across the async wait, so a concurrent write
+    reallocating a version array cannot dangle them.  Still 110/110 (the 8-client
+    phase now genuinely overlaps in flight).  `pagestore_bench.c` grew
+    `PS_BENCH_CLIENTS=N` (N reader processes, each its own channel); random reads
+    on the control disk scale with concurrency:
+
+    | clients | MiB/s | Kpages/s |
+    |---------|-------|----------|
+    | 1       |  671  |  86      |
+    | 4       | 2167  | 277      |
+    | 16      | 2443  | 313      |
+
+    3.6x from cross-channel queue depth; at 16 clients ~2.4 GiB/s, well past the
+    single-stream POSIX cold-random 748 MiB/s -- concurrency is the lever the
+    one-request-at-a-time loop was missing.
   - **S1.2d — database-adapted materialization cache (high priority, NOT a
     block cache).**  The benchmark shows the kernel page cache + readahead is why
     POSIX wins sequential reads -- but a userspace block-address LRU is the wrong
