@@ -13,7 +13,12 @@
  * shootout -- it is mainly here to show the SPDK daemon's read path moving real
  * bytes off NVMe and the effect of batched (overlapped) reads.
  *
- * Usage: [PS_SPDK_PCI=...] pagestore_bench <daemon-path> [total-MiB]
+ * For a fair cold-read POSIX comparison, set PS_BENCH_DROPCACHE=1 (needs root):
+ * the OS page cache is dropped between the write and read phases so POSIX reads
+ * hit the disk rather than RAM.  It is a no-op for SPDK (no OS cache).
+ *
+ * Usage: [PS_SPDK_PCI=...] [PS_BENCH_DROPCACHE=1] \
+ *            pagestore_bench <daemon-path> [total-MiB] [store-base-dir]
  *
  *-------------------------------------------------------------------------
  */
@@ -113,8 +118,9 @@ main(int argc, char **argv)
 {
 	const char *daemon = argc > 1 ? argv[1] : NULL;
 	uint64_t	total_mib = argc > 2 ? strtoull(argv[2], NULL, 10) : 256;
+	const char *base = argc > 3 ? argv[3] : "/tmp";
 	const char *shm = "/psbench";
-	char		store[] = "/tmp/psbenchstoreXXXXXX";
+	char		store[1024];
 	uint32_t	npages = (uint32_t) (total_mib * 1024 * 1024 / PAGE);
 	uint32_t	combine = PS_IO_UNIT / PAGE;
 	unsigned char *buf;
@@ -123,9 +129,11 @@ main(int argc, char **argv)
 				wsec,
 				rsec;
 
+	snprintf(store, sizeof(store), "%s/psbenchstoreXXXXXX", base);
 	if (!daemon || !mkdtemp(store))
 	{
-		fprintf(stderr, "usage: %s <daemon-path> [total-MiB]\n", argv[0]);
+		fprintf(stderr, "usage: %s <daemon-path> [total-MiB] [store-base-dir]\n",
+				argv[0]);
 		return 2;
 	}
 	shm_unlink(shm);
@@ -159,24 +167,66 @@ main(int argc, char **argv)
 	exec1();
 	wsec = now() - t0;
 
-	/* read phase */
-	t0 = now();
-	for (uint32_t b = 0; b < npages; b += combine)
+	/* optional: drop the OS page cache so POSIX reads hit the disk (root only) */
+	if (getenv("PS_BENCH_DROPCACHE"))
 	{
-		uint32_t	k = npages - b < combine ? npages - b : combine;
-		PsChannel  *c = chp();
+		FILE	   *f;
 
-		c->key.spcOid = 1;
-		c->key.dbOid = 1;
-		c->key.relNumber = REL;
-		c->key.forkNum = 0;
-		c->timeline = 0;
-		c->opcode = PS_OP_READV;
-		c->blocknum = b;
-		c->nblocks = k;
-		exec1();
+		sync();
+		f = fopen("/proc/sys/vm/drop_caches", "w");
+		if (f)
+		{
+			fputs("3\n", f);
+			fclose(f);
+		}
+		else
+			fprintf(stderr, "bench: could not drop caches (run as root)\n");
 	}
-	rsec = now() - t0;
+
+	/* build the chunk order; shuffle it for a random read pattern (defeats the
+	 * OS readahead that favors POSIX on sequential reads) */
+	{
+		uint32_t	nchunks = (npages + combine - 1) / combine;
+		uint32_t   *starts = malloc((size_t) nchunks * sizeof(uint32_t));
+		int			random = getenv("PS_BENCH_RANDOM") != NULL;
+		uint64_t	rng = 0x9e3779b97f4a7c15ull;
+
+		for (uint32_t i = 0; i < nchunks; i++)
+			starts[i] = i * combine;
+		if (random)
+			for (uint32_t i = nchunks; i > 1; i--)	/* Fisher-Yates, fixed seed */
+			{
+				uint32_t	j;
+				uint32_t	t;
+
+				rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+				j = (uint32_t) ((rng >> 33) % i);
+				t = starts[i - 1];
+				starts[i - 1] = starts[j];
+				starts[j] = t;
+			}
+
+		t0 = now();
+		for (uint32_t ci = 0; ci < nchunks; ci++)
+		{
+			uint32_t	b = starts[ci];
+			uint32_t	k = npages - b < combine ? npages - b : combine;
+			PsChannel  *c = chp();
+
+			c->key.spcOid = 1;
+			c->key.dbOid = 1;
+			c->key.relNumber = REL;
+			c->key.forkNum = 0;
+			c->timeline = 0;
+			c->opcode = PS_OP_READV;
+			c->blocknum = b;
+			c->nblocks = k;
+			exec1();
+		}
+		rsec = now() - t0;
+		free(starts);
+		printf("  (read pattern: %s)\n", random ? "random chunk order" : "sequential");
+	}
 
 	printf("daemon=%s  %llu MiB  page=%u  combine=%u\n", daemon,
 		   (unsigned long long) total_mib, PAGE, combine);
@@ -189,5 +239,14 @@ main(int argc, char **argv)
 	munmap(g_shm, PS_SHM_SIZE);
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
+
+	/* best-effort cleanup of the store dir we created */
+	{
+		char		cmd[1100];
+
+		snprintf(cmd, sizeof(cmd), "rm -rf '%s'", store);
+		if (system(cmd) != 0)
+			fprintf(stderr, "bench: cleanup of %s failed\n", store);
+	}
 	return 0;
 }
