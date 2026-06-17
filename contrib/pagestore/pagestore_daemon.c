@@ -43,12 +43,16 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+#include "pagestore_storage.h"
 
 static volatile sig_atomic_t stop_requested = 0;
 static const char *store_dir;
 static const char *shm_name;
 static uint32_t page_size = PS_DEFAULT_PAGE_SIZE;
 static uint64_t segment_size = 8 * 1024 * 1024;
+
+/* the active storage backend (POSIX by default; see --storage) */
+const PsStorage *ps_storage = &PsStoragePosix;
 
 static void
 on_signal(int sig)
@@ -79,48 +83,12 @@ typedef struct SegRecHdr
 } SegRecHdr;
 
 /*
- * Segments are plain append-only files seg_00000000, seg_00000001, ...  We keep
- * one OS fd open per segment (opened lazily, never closed during a run) and an
+ * Segments are addressed by (id, byte offset); how they are stored is the
+ * storage backend's business (see pagestore_storage.h).  Here we keep only the
  * append cursor (cur_seg, cur_off) marking where the next record goes.
  */
-static int *seg_fds;			/* open fd per segment id (-1 if not open) */
-static int	segs_cap;			/* allocated length of seg_fds[] */
 static int	cur_seg = -1;		/* segment currently being appended (-1: none yet) */
 static uint64_t cur_off;		/* append cursor within cur_seg */
-
-static void
-seg_path(char *buf, size_t buflen, int id)
-{
-	snprintf(buf, buflen, "%s/seg_%08d", store_dir, id);
-}
-
-/* Return a cached fd for segment 'id', opening (optionally creating) it once. */
-static int
-seg_fd(int id, int create)
-{
-	char		path[4096];
-	int			fd;
-
-	if (id < segs_cap && seg_fds[id] >= 0)
-		return seg_fds[id];
-
-	/* grow the fd cache to cover 'id', initializing new slots to -1 */
-	if (id >= segs_cap)
-	{
-		int			newcap = (id + 16) * 2;
-
-		seg_fds = realloc(seg_fds, (size_t) newcap * sizeof(int));
-		for (int i = segs_cap; i < newcap; i++)
-			seg_fds[i] = -1;
-		segs_cap = newcap;
-	}
-
-	seg_path(path, sizeof(path), id);
-	fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-	if (fd >= 0)
-		seg_fds[id] = fd;
-	return fd;
-}
 
 /* ===================== in-memory indexes =============================== */
 
@@ -474,35 +442,22 @@ typedef struct TimelineRec
 static void
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
-	char		path[4096];
-	int			fd;
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	snprintf(path, sizeof(path), "%s/timelines", store_dir);
-	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
-	if (fd < 0)
-		return;					/* best-effort */
-	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
-	{
-		/* ignore: best-effort */
-	}
-	close(fd);
+	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
 }
 
 static void
 load_timelines(void)
 {
-	char		path[4096];
-	int			fd;
 	TimelineRec rec;
+	uint64_t	off = 0;
 
-	snprintf(path, sizeof(path), "%s/timelines", store_dir);
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		return;					/* none yet */
-	while (read(fd, &rec, sizeof(rec)) == (ssize_t) sizeof(rec))
+	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
+	{
 		timeline_define(rec.id, rec.parent, rec.branch_lsn);
-	close(fd);
+		off += sizeof(rec);
+	}
 }
 
 /* ===================== shipped WAL log (per timeline) ================== */
@@ -530,27 +485,16 @@ static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
 {
-	char		path[4096];
-	int			fd;
 	WalRecHdr	h;
 
 	if (tl >= MAX_TIMELINES)
-		return -1;
-	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
-	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
-	if (fd < 0)
 		return -1;
 
 	h.magic = WAL_MAGIC;
 	h.len = len;
 	h.start_lsn = start_lsn;
-	if (write(fd, &h, sizeof(h)) != (ssize_t) sizeof(h) ||
-		write(fd, data, len) != (ssize_t) len)
-	{
-		close(fd);
+	if (ps_storage->wal_append(tl, &h, sizeof(h), data, len) != 0)
 		return -1;
-	}
-	close(fd);
 
 	if (start_lsn + len > wal_end[tl])
 		wal_end[tl] = start_lsn + len;
@@ -567,20 +511,14 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 static uint32_t
 wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 {
-	char		path[4096];
-	int			fd;
-	off_t		off = 0;
+	uint64_t	off = 0;
 	WalRecHdr	h;
 	uint32_t	filled = 0;
 
 	if (tl >= MAX_TIMELINES)
 		return 0;
-	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		return 0;
 
-	while (pread(fd, &h, sizeof(h), off) == (ssize_t) sizeof(h) &&
+	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
 		uint64_t	rs = h.start_lsn;
@@ -592,15 +530,15 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 
 		if (os < oe)
 		{
-			off_t		src = off + sizeof(h) + (off_t) (os - rs);
-			ssize_t		n = pread(fd, out + (os - start), (size_t) (oe - os), src);
+			uint64_t	src = off + sizeof(h) + (os - rs);
+			int			n = ps_storage->wal_read(tl, src, out + (os - start),
+												 (uint32_t) (oe - os));
 
 			if (n > 0)
 				filled += (uint32_t) n;
 		}
 		off += sizeof(h) + h.len;
 	}
-	close(fd);
 	return filled;
 }
 
@@ -608,25 +546,18 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 static void
 wal_recover_one(uint32_t tl)
 {
-	char		path[4096];
-	int			fd;
-	off_t		off = 0;
+	uint64_t	off = 0;
 	WalRecHdr	h;
 
 	if (tl >= MAX_TIMELINES)
 		return;
-	snprintf(path, sizeof(path), "%s/wal_%u", store_dir, tl);
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		return;
-	while (pread(fd, &h, sizeof(h), off) == (ssize_t) sizeof(h) &&
+	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
 		if (h.start_lsn + h.len > wal_end[tl])
 			wal_end[tl] = h.start_lsn + h.len;
 		off += sizeof(h) + h.len;
 	}
-	close(fd);
 }
 
 /* ===================== per-page WAL index ============================== */
@@ -749,7 +680,6 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 {
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
-	int			fd;
 	uint64_t	data_off;
 
 	/* roll over to a fresh segment when the current one would overflow */
@@ -758,9 +688,6 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		cur_seg = (cur_seg < 0) ? 0 : cur_seg + 1;
 		cur_off = 0;
 	}
-	fd = seg_fd(cur_seg, 1);
-	if (fd < 0)
-		return -1;
 
 	hdr.magic = SEG_MAGIC;
 	hdr.timeline = timeline;
@@ -770,10 +697,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
-	if (pwrite(fd, &hdr, sizeof(hdr), cur_off) != (ssize_t) sizeof(hdr))
+	if (ps_storage->seg_write(cur_seg, cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
 	data_off = cur_off + sizeof(hdr);
-	if (pwrite(fd, page, page_size, data_off) != (ssize_t) page_size)
+	if (ps_storage->seg_write(cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
@@ -786,11 +713,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 static int
 read_version(const PageVer *v, unsigned char *out)
 {
-	int			fd = seg_fd(v->seg, 0);
-
-	if (fd < 0)
-		return -1;
-	if (pread(fd, out, page_size, v->off) != (ssize_t) page_size)
+	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
 		return -1;
 	return 0;
 }
@@ -812,29 +735,18 @@ recover(void)
 {
 	for (int id = 0;; id++)
 	{
-		char		path[4096];
-		int			fd;
 		uint64_t	off = 0;
-		struct stat st;
 
-		seg_path(path, sizeof(path), id);
-		fd = open(path, O_RDONLY);
-		if (fd < 0)
+		if (ps_storage->seg_size(id) < 0)
 			break;				/* no more segments -> done */
-		if (fstat(fd, &st) != 0)
-		{
-			close(fd);
-			break;
-		}
 
 		/* replay records until one fails to validate (end of log) */
 		for (;;)
 		{
 			SegRecHdr	hdr;
-			ssize_t		n = pread(fd, &hdr, sizeof(hdr), off);
 
-			if (n != (ssize_t) sizeof(hdr) || hdr.magic != SEG_MAGIC ||
-				hdr.len != page_size)
+			if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
+				hdr.magic != SEG_MAGIC || hdr.len != page_size)
 				break;
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
@@ -842,7 +754,6 @@ recover(void)
 			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
-		close(fd);
 
 		/* this segment is the newest seen so far; append continues after it */
 		cur_seg = id;
@@ -977,9 +888,7 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			for (int id = 0; id < segs_cap; id++)
-				if (seg_fds[id] >= 0)
-					fsync(seg_fds[id]);
+			ps_storage->sync();
 			break;
 
 		default:
@@ -1006,23 +915,41 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
+		{
+			const char *name = argv[++i];
+
+			if (strcmp(name, "posix") == 0)
+				ps_storage = &PsStoragePosix;
+#ifdef PAGESTORE_SPDK
+			else if (strcmp(name, "spdk") == 0)
+				ps_storage = &PsStorageSpdk;
+#endif
+			else
+			{
+				fprintf(stderr, "unknown --storage backend '%s'\n", name);
+				return 2;
+			}
+		}
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
-					"[--page-size N] [--segment-size N]\n", argv[0]);
+					"[--page-size N] [--segment-size N] [--storage NAME]\n",
+					argv[0]);
 			return 2;
 		}
 	}
 	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
-				"[--page-size N] [--segment-size N]\n", argv[0]);
+				"[--page-size N] [--segment-size N] [--storage NAME]\n",
+				argv[0]);
 		return 2;
 	}
 
-	if (mkdir(store_dir, 0700) != 0 && errno != EEXIST)
+	if (ps_storage->open(store_dir, segment_size) != 0)
 	{
-		perror("mkdir store");
+		perror("storage open");
 		return 1;
 	}
 
@@ -1077,9 +1004,10 @@ main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
-	fprintf(stderr, "pagestore_daemon: shm=%s store=%s page_size=%u io_unit=%u "
-			"channels=%d ready\n",
-			shm_name, store_dir, page_size, PS_IO_UNIT, PS_MAX_CHANNELS);
+	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
+			"io_unit=%u channels=%d ready\n",
+			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+			PS_MAX_CHANNELS);
 
 	while (!stop_requested)
 	{
