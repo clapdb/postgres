@@ -120,6 +120,18 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
   `spdk_app`; channel poll becomes a poller; replace segment `pread`/`pwrite`
   with async `spdk_bdev_*`; make request handling in-flight/callback-driven.
   Gate: the existing `integration_test.sh` passes against an SPDK-backed store.
+  - **S1.1 — pluggable storage seam (DONE).** All raw byte movement and
+    enumeration now go through a `PsStorage` vtable (`pagestore_storage.h`); the
+    daemon's indexes, append cursor, timeline metadata and request handling stay
+    storage-agnostic.  `storage_posix.c` is the libc-only default backend
+    (the prior file layout, moved verbatim), selectable via `--storage posix`
+    (default).  A `--storage spdk` slot and `extern PsStorageSpdk` are stubbed
+    behind `#ifdef PAGESTORE_SPDK`.  Zero behaviour change: standalone suite
+    110/110, `integration_test.sh` PASS.  IPC ABI and compute side untouched —
+    SPDK will be a *second* `PsStorage` implementation, never an ABI change.
+  - **S1.2 (next) — the SPDK backend** (`storage_spdk.c`, opt-in compile): one
+    reactor, async `spdk_bdev_*` behind the same vtable, plus the daemon's
+    request loop made callback-driven for in-flight reads.
 - **S2 — blobstore for segments + WAL; persistent metadata.** Blob per segment /
   per timeline log; index persisted in blob xattrs or a metadata blob → drop the
   scan-on-restart.
