@@ -49,13 +49,59 @@ chp(void)
 }
 
 static void
-exec1(void)
+exec_on(int chan)
 {
-	PsChannel  *c = chp();
+	PsChannel  *c = ps_channel(g_shm, chan);
 
 	ps_store_release(&c->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&c->state) != PS_STATE_DONE)
 		;
+}
+
+static void
+exec1(void)
+{
+	exec_on(g_chan);
+}
+
+/* claim any free channel for this (possibly forked) reader; -1 if none */
+static int
+claim_channel(void)
+{
+	PsShmHeader *h = g_shm;
+
+	for (uint32_t c = 0; c < h->nchannels; c++)
+		if (ps_cas(&ps_channel(g_shm, c)->claimed, 0, 1))
+			return (int) c;
+	return -1;
+}
+
+/* read chunks [from, to) of the shuffled order on our own channel */
+static void
+read_range(const uint32_t *starts, uint32_t from, uint32_t to,
+		   uint32_t npages, uint32_t combine)
+{
+	int			chan = claim_channel();
+
+	if (chan < 0)
+		_exit(3);
+	for (uint32_t ci = from; ci < to; ci++)
+	{
+		uint32_t	b = starts[ci];
+		uint32_t	k = npages - b < combine ? npages - b : combine;
+		PsChannel  *c = ps_channel(g_shm, chan);
+
+		c->key.spcOid = 1;
+		c->key.dbOid = 1;
+		c->key.relNumber = REL;
+		c->key.forkNum = 0;
+		c->timeline = 0;
+		c->opcode = PS_OP_READV;
+		c->blocknum = b;
+		c->nblocks = k;
+		exec_on(chan);
+	}
+	ps_store_release(&ps_channel(g_shm, chan)->claimed, 0);
 }
 
 static double
@@ -183,14 +229,20 @@ main(int argc, char **argv)
 			fprintf(stderr, "bench: could not drop caches (run as root)\n");
 	}
 
-	/* build the chunk order; shuffle it for a random read pattern (defeats the
-	 * OS readahead that favors POSIX on sequential reads) */
+	/* build the chunk order; shuffle for a random pattern (defeats the OS
+	 * readahead that favors POSIX on sequential reads); optionally split the
+	 * chunks across PS_BENCH_CLIENTS reader processes, each on its own channel,
+	 * to drive cross-channel queue depth on the daemon. */
 	{
 		uint32_t	nchunks = (npages + combine - 1) / combine;
 		uint32_t   *starts = malloc((size_t) nchunks * sizeof(uint32_t));
 		int			random = getenv("PS_BENCH_RANDOM") != NULL;
+		int			clients = getenv("PS_BENCH_CLIENTS") ?
+			atoi(getenv("PS_BENCH_CLIENTS")) : 1;
 		uint64_t	rng = 0x9e3779b97f4a7c15ull;
 
+		if (clients < 1)
+			clients = 1;
 		for (uint32_t i = 0; i < nchunks; i++)
 			starts[i] = i * combine;
 		if (random)
@@ -207,25 +259,28 @@ main(int argc, char **argv)
 			}
 
 		t0 = now();
-		for (uint32_t ci = 0; ci < nchunks; ci++)
+		if (clients == 1)
+			read_range(starts, 0, nchunks, npages, combine);
+		else
 		{
-			uint32_t	b = starts[ci];
-			uint32_t	k = npages - b < combine ? npages - b : combine;
-			PsChannel  *c = chp();
+			for (int c = 0; c < clients; c++)
+			{
+				uint32_t	from = (uint32_t) ((uint64_t) c * nchunks / clients);
+				uint32_t	to = (uint32_t) ((uint64_t) (c + 1) * nchunks / clients);
 
-			c->key.spcOid = 1;
-			c->key.dbOid = 1;
-			c->key.relNumber = REL;
-			c->key.forkNum = 0;
-			c->timeline = 0;
-			c->opcode = PS_OP_READV;
-			c->blocknum = b;
-			c->nblocks = k;
-			exec1();
+				if (fork() == 0)
+				{
+					read_range(starts, from, to, npages, combine);
+					_exit(0);
+				}
+			}
+			for (int c = 0; c < clients; c++)
+				wait(NULL);
 		}
 		rsec = now() - t0;
 		free(starts);
-		printf("  (read pattern: %s)\n", random ? "random chunk order" : "sequential");
+		printf("  (read pattern: %s, clients: %d)\n",
+			   random ? "random chunk order" : "sequential", clients);
 	}
 
 	printf("daemon=%s  %llu MiB  page=%u  combine=%u\n", daemon,
