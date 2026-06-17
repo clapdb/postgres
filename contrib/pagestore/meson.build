@@ -42,6 +42,14 @@ pagestore_walrestore = executable('pagestore_walrestore',
 )
 contrib_targets += pagestore_walrestore
 
+# Throughput probe: forks a daemon, writes a dataset, times reading it back.
+# Indicative only (see pagestore_bench.c); freestanding like the daemon.
+pagestore_bench = executable('pagestore_bench',
+  files('pagestore_bench.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_bench
+
 # Standalone test harness: drives the daemon over the shared-memory protocol
 # with no PostgreSQL instance.  Run independently of the PG test suites with:
 #   meson test -C <build> --suite pagestore

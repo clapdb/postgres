@@ -31,6 +31,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "storage_spdk.h"
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -80,24 +81,52 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READV:
-			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
-				unsigned char *dst = ch->data + (size_t) i * page_size;
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum + i,
-											 UINT64_MAX);
+				/* batch up to 64 page reads at a time so the device reads
+				 * overlap on the NVMe queue (see ps_spdk_readv) */
+				PsSpdkRead	reqs[64];
+				uint32_t	i = 0;
 
-				if (!v || read_version(v, dst) != 0)
-					memset(dst, 0, page_size);
+				while (i < ch->nblocks)
+				{
+					int			nr = 0;
+
+					while (i < ch->nblocks && nr < 64)
+					{
+						unsigned char *dst = ch->data + (size_t) i * page_size;
+						PageVer    *v = read_through(tl, &ch->key,
+													 ch->blocknum + i, UINT64_MAX);
+
+						if (!v)
+							memset(dst, 0, page_size);	/* unwritten -> zeros */
+						else
+						{
+							reqs[nr].seg = v->seg;
+							reqs[nr].off = v->off;
+							reqs[nr].dst = dst;
+							reqs[nr].len = page_size;
+							nr++;
+						}
+						i++;
+					}
+					ps_spdk_readv(reqs, nr);
+				}
+				break;
 			}
-			break;
 
 		case PS_OP_READ_AT:
 			{
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
 											 ch->req_lsn);
 
-				if (!v || read_version(v, ch->data) != 0)
+				if (!v)
 					memset(ch->data, 0, page_size);
+				else
+				{
+					PsSpdkRead	r = {v->seg, v->off, ch->data, page_size};
+
+					ps_spdk_readv(&r, 1);
+				}
 				break;
 			}
 
