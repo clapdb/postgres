@@ -122,6 +122,23 @@ img_sort_cmp(const void *pa, const void *pb)
 	return 0;
 }
 
+/*
+ * Necessary-condition prune: can layer 'd' possibly hold (key, block)?  Uses the
+ * layer's key range and global block range (min/max across all its entries).
+ * A 0 means definitely-absent, so the caller can skip the layer without reading
+ * its footer/index/data.  (block range is coarse -- it is the global min/max,
+ * not per-key -- but a block outside it is still definitely absent.)
+ */
+static int
+layer_covers(const PsLayerDesc *d, const PsKey *key, uint32_t block)
+{
+	if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0)
+		return 0;
+	if (block < d->start_block || block > d->end_block)
+		return 0;
+	return 1;
+}
+
 static const PsLayerLocation *
 img_local_loc(const PsLayerDesc *layer)
 {
@@ -404,6 +421,11 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 	uint64_t	idx_bytes;
 	int			rc = -1;
 
+	/* prune: skip without any IO if this layer cannot hold (key,block) or its
+	 * LSN range does not overlap the requested (lo_lsn, hi_lsn] */
+	if (!layer_covers(layer, key, block) ||
+		layer->lsn_end <= lo_lsn || layer->lsn_start > hi_lsn)
+		return 0;
 	if (!loc || loc->size < sizeof(PsDeltaFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
@@ -766,6 +788,10 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	int			found = 0;
 	int			rc = -1;
 
+	/* prune: skip without any IO if this layer cannot hold (key,block) or has no
+	 * version at/below read_lsn */
+	if (!layer_covers(layer, key, block) || read_lsn < layer->lsn_start)
+		return 0;
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
