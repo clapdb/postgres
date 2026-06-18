@@ -28,9 +28,10 @@ jobs:
       - name: Compile daemon and test harness
         working-directory: contrib/pagestore
         run: |
-          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_test pagestore_layer_test.c pagestore_layer.c pagestore_layer_store.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_pgcache_test pagestore_pgcache_test.c pagestore_pgcache.c -lrt
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
@@ -39,6 +40,10 @@ jobs:
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
         run: ./pagestore_layer_test
+
+      - name: Run materialized-page cache unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_pgcache_test
 
   # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
   # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --
