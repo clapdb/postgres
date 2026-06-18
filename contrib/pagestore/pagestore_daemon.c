@@ -231,9 +231,13 @@ main(int argc, char **argv)
 
 		if (!did_work)
 		{
-			struct timespec ts = {0, 20000};	/* 20us */
+			/* idle: do one unit of background compaction before sleeping */
+			if (!ps_core_maintenance())
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
 
-			nanosleep(&ts, NULL);
+				nanosleep(&ts, NULL);
+			}
 		}
 	}
 

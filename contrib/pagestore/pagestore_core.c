@@ -261,13 +261,6 @@ cleanup:
 	return rc;
 }
 
-static void
-maybe_compact(uint32_t timeline)
-{
-	if (count_image_layers(timeline) > (uint32_t) compact_layers)
-		compact_timeline(timeline);
-}
-
 /* ===================== segment storage (log-structured) ================= */
 
 #define SEG_MAGIC	0x53454752	/* "SEGR" */
@@ -927,7 +920,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (ps_memtable_full(g_memtable))
 		{
 			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
-			maybe_compact(timeline);	/* bound the image-layer count */
+			/* backpressure only: normal compaction runs off the write path in
+			 * ps_core_maintenance() when the daemon is idle.  Compact inline
+			 * here only if the layer count is running away far past the
+			 * threshold (writes outpacing background compaction). */
+			if (count_image_layers(timeline) > (uint32_t) compact_layers * 4)
+				compact_timeline(timeline);
 		}
 	}
 	return 0;
@@ -1221,6 +1219,28 @@ ps_core_close(void)
 	}
 	ps_pgcache_free();
 	ps_manifest_close();
+}
+
+/*
+ * Off-the-write-path background maintenance: compact one timeline whose image
+ * layer count exceeds the (low-water) threshold.  The daemon calls this when it
+ * is otherwise idle; doing at most one compaction per call keeps the serve loop
+ * responsive.  Returns 1 if it compacted (the caller should not sleep), 0 if
+ * nothing was due.
+ */
+int
+ps_core_maintenance(void)
+{
+	if (!use_layers)
+		return 0;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if ((tl == 0 || timelines[tl].defined) &&
+			count_image_layers(tl) > (uint32_t) compact_layers)
+		{
+			compact_timeline(tl);
+			return 1;
+		}
+	return 0;
 }
 
 /*
