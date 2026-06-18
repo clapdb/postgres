@@ -79,4 +79,65 @@ extern int	ps_layer_map_reserve(PsLayerMap *map, uint32_t capacity);
 extern int	ps_layer_map_add(PsLayerMap *map, const PsLayerDesc *desc);
 extern uint32_t ps_layer_map_count(const PsLayerMap *map);
 
+/* ---------------------------------------------------------------------------
+ * Image layer file format (phase 2).
+ *
+ * An image layer is an immutable file holding full-page versions:
+ *     [ page data : nrecs * page_size, back to back ]
+ *     [ index     : nrecs * PsImgIndexEnt, sorted by (key, block, lsn) ]
+ *     [ footer    : PsImgFooter, fixed-size trailer at end of file ]
+ * It stores *multiple versions* per (key, block) (keyed by page_lsn), so a read
+ * picks the newest version <= read_lsn -- matching the current version-chain
+ * (COW) semantics, just persisted immutably.  Data, index and footer carry
+ * checksums.
+ * ------------------------------------------------------------------------- */
+#define PS_IMG_MAGIC	0x47494d50	/* "PIMG" */
+#define PS_IMG_VERSION	1
+
+typedef struct PsImgIndexEnt
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;			/* page_lsn of this version */
+	uint64_t	data_off;		/* byte offset of the page within the file */
+} PsImgIndexEnt;
+
+typedef struct PsImgFooter
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	page_size;
+	uint32_t	nrecs;
+	uint64_t	index_off;		/* == page-data section size */
+	uint32_t	data_crc;		/* crc of the page-data section */
+	uint32_t	index_crc;		/* crc of the index section */
+} PsImgFooter;
+
+/* One full-page version to write into an image layer. */
+typedef struct PsImgRec
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	const void *page;
+} PsImgRec;
+
+/*
+ * Write 'n' page versions into image layer 'layer_id' via the layer store, seal
+ * it, and fill *out with the resulting descriptor (key/block/LSN range, local
+ * location).  Returns 0 on success.
+ */
+extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
+								 const PsImgRec *recs, uint32_t n,
+								 uint32_t page_size, PsLayerDesc *out);
+
+/*
+ * Look up the newest version of (key, block) with lsn <= read_lsn in image
+ * layer 'layer'.  On a hit copies page_size bytes into out and returns 1; 0 if
+ * the layer has no such page; -1 on read/format error.
+ */
+extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
+								  uint32_t block, uint64_t read_lsn,
+								  void *out, uint32_t page_size);
+
 #endif							/* PAGESTORE_LAYER_H */

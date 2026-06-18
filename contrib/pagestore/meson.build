@@ -66,3 +66,14 @@ test('pagestore_standalone',
   suite: ['pagestore'],
   timeout: 120,
 )
+
+# Unit test for the immutable image-layer file format (no daemon, no PG).
+pagestore_layer_test = executable('pagestore_layer_test',
+  files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_layer_store.c'),
+  install: false,
+)
+test('pagestore_layer',
+  pagestore_layer_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
