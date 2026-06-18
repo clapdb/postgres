@@ -195,6 +195,7 @@ main(int argc, char **argv)
 	const char *pci_addr = NULL;
 
 	ps_storage = &PsStorageSpdk;
+	use_layers = 0;				/* SPDK reads serve by segment offset for now */
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -304,6 +305,7 @@ main(int argc, char **argv)
 	}
 
 	fprintf(stderr, "pagestore_daemon_spdk: shutting down\n");
+	ps_core_close();			/* flush the memtable into a layer before detaching */
 	ps_storage->close();
 	munmap(shm, PS_SHM_SIZE);
 	return 0;

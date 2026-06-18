@@ -36,10 +36,14 @@ typedef struct PageVer
 extern uint32_t page_size;
 extern uint64_t segment_size;
 extern int	flush_pages;		/* memtable flush threshold in pages */
+extern int	use_layers;			/* rebuild read state from layers (vs segments) */
 extern const PsStorage *ps_storage;
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
 extern int	ps_core_open(const char *store_dir);
+
+/* Clean-shutdown: flush the memtable into a layer and close the manifest. */
+extern void ps_core_close(void);
 
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);

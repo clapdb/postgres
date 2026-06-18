@@ -41,6 +41,14 @@
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
 int			flush_pages = 256;	/* memtable flush threshold (pages) */
+/*
+ * Use the LSM read path: rebuild the index from image layers on restart and
+ * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
+ * the SPDK daemon leaves it off for now because its async read path serves pages
+ * by segment offset (async layer reads are a later step), so it must keep the
+ * segment-scan recovery that gives versions real segment locations.
+ */
+int			use_layers = 1;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -758,6 +766,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 int
 read_version(const PageVer *v, unsigned char *out)
 {
+	if (v->seg < 0)				/* layer-origin version (no segment copy) */
+		return -1;
 	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
 		return -1;
 	return 0;
@@ -987,10 +997,55 @@ ps_handle_meta(PsChannel *ch)
 /* ===================== lifecycle ====================================== */
 
 /*
+ * Rebuild the page and fork indexes from the image layers' on-disk indexes
+ * (the persistent LSM index) instead of scanning every segment record.  The
+ * versions are tagged with seg = -1 (no segment copy); read_resolve serves them
+ * from the layer they came from.
+ */
+static void
+rebuild_from_layers(void)
+{
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting)
+			continue;
+		if (ps_image_layer_read_index(d, &idx, &n) != 0)
+			continue;			/* skip an unreadable layer */
+		for (uint32_t j = 0; j < n; j++)
+		{
+			page_add_version(d->timeline, &idx[j].key, idx[j].block,
+							 idx[j].lsn, -1, 0);
+			fork_grow(d->timeline, &idx[j].key, idx[j].block + 1);
+		}
+		free(idx);
+	}
+}
+
+/* Flush the memtable and close the manifest on a clean shutdown, so a restart
+ * rebuilds the full state from layers without scanning segments. */
+void
+ps_core_close(void)
+{
+	if (g_memtable)
+	{
+		ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
+		ps_memtable_destroy(g_memtable);
+		g_memtable = NULL;
+	}
+	ps_manifest_close();
+}
+
+/*
  * Open the store and rebuild all in-memory state from it: define the root
- * timeline, load persisted branches, replay the segments to rebuild the page
- * and fork indexes, and recompute each timeline's shipped-WAL end LSN.  The
- * frontend must set page_size, segment_size and ps_storage beforehand.
+ * timeline, load persisted branches, rebuild the page/fork indexes from the
+ * image layers (falling back to a segment scan only for a store that has no
+ * layers yet -- e.g. a pre-LSM store being migrated), and recompute each
+ * timeline's shipped-WAL end LSN.  The frontend must set page_size,
+ * segment_size and ps_storage beforehand.
  */
 int
 ps_core_open(const char *store_dir)
@@ -1017,10 +1072,24 @@ ps_core_open(const char *store_dir)
 			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
 			(unsigned long long) g_next_layer_id);
 
-	/* timeline 0 is the root; load any persisted branches, then replay data */
+	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
 	load_timelines();
-	recover();
+	if (use_layers && ps_layer_map.nlayers > 0)
+	{
+		/* layers are the durable read state -- rebuild from their indexes and
+		 * position the append cursor at a fresh segment (a cheap stat loop, no
+		 * per-record scan).  Segments are written but no longer scanned. */
+		int			id = 0;
+
+		rebuild_from_layers();
+		while (ps_storage->seg_size(id) >= 0)
+			id++;
+		cur_seg = id;
+		cur_off = 0;
+	}
+	else
+		recover();				/* segment scan (SPDK path, or no layers yet) */
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
