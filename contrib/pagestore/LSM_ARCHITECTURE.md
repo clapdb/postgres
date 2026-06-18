@@ -289,6 +289,14 @@ nearest image layer at or before read_lsn
 If a child timeline lacks a page version, the planner walks to the parent
 timeline as of the branch LSN.
 
+The planner must prune layers before reading them: use each layer's min/max key
+range (`PsLayerDesc.start_key`/`end_key`) and a per-layer bloom filter to skip
+layers that cannot hold the key, instead of scanning every layer of a timeline
+(RocksDB/ScyllaDB both rely on this).  The prototype's `layer_map_lookup`
+currently scans all of a timeline's image layers; read amplification grows with
+the layer count, so this pruning is required as layer counts rise (and per
+shard).
+
 ## Compaction path
 
 ```mermaid
@@ -312,6 +320,19 @@ Compaction goals:
 
 Compaction must be install-new-before-delete-old.  Old layers remain readable
 until the manifest durably exposes the replacement.
+
+Execution & strategy (informed by RocksDB/ScyllaDB; see `SHARDING.md`):
+
+- **Run compaction in the background, never on the foreground write/serve
+  thread.**  The current prototype calls it inline from the write path; that must
+  become a background per-shard task with write backpressure (high-water mark on
+  layer count / memtable backlog) before multi-core sharding, à la ScyllaDB's
+  compaction/flush controllers.
+- **Use a real strategy, not "merge all".**  Start with size-tiered (merge
+  similarly-sized layers); adopt an incremental/fragmented scheme (ScyllaDB ICS)
+  if temporary space amplification during a merge matters.
+- Version-level GC (drop versions below the retained-LSN horizon) happens during
+  compaction; the prototype currently keeps every version.
 
 ## Tiering path
 
