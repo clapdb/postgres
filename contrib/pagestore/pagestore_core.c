@@ -33,6 +33,8 @@
 #include <string.h>
 
 #include "pagestore_core.h"
+#include "pagestore_layer_store.h"
+#include "pagestore_manifest.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -852,6 +854,12 @@ int
 ps_core_open(const char *store_dir)
 {
 	if (ps_storage->open(store_dir, segment_size) != 0)
+		return -1;
+	if (ps_layer_store->open(store_dir) != 0)
+		return -1;
+	if (ps_manifest_open(store_dir) != 0)
+		return -1;
+	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
 
 	/* timeline 0 is the root; load any persisted branches, then replay data */
