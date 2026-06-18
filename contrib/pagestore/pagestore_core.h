@@ -36,6 +36,7 @@ typedef struct PageVer
 extern uint32_t page_size;
 extern uint64_t segment_size;
 extern int	flush_pages;		/* memtable flush threshold in pages */
+extern int	compact_layers;		/* compact a timeline past this many image layers */
 extern int	use_layers;			/* rebuild read state from layers (vs segments) */
 extern const PsStorage *ps_storage;
 

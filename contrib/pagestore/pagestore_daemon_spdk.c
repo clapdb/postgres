@@ -211,6 +211,8 @@ main(int argc, char **argv)
 			segment_size = strtoull(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
 			flush_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
+			compact_layers = atoi(argv[++i]);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
