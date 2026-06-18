@@ -30,6 +30,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -126,6 +127,8 @@ main(int argc, char **argv)
 			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
 			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
+			cache_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -237,13 +240,19 @@ main(int argc, char **argv)
 	{
 		uint64_t	rm,
 					rl,
-					rs;
+					rs,
+					ch,
+					cm,
+					ce;
 
 		ps_core_read_stats(&rm, &rl, &rs);
+		ps_pgcache_stats(&ch, &cm, &ce);
 		fprintf(stderr, "pagestore_daemon: shutting down (%u image layers; reads "
-				"mem=%llu layer=%llu seg=%llu)\n", ps_core_layer_count(),
+				"mem=%llu layer=%llu seg=%llu; pgcache hit=%llu miss=%llu evict=%llu)\n",
+				ps_core_layer_count(),
 				(unsigned long long) rm, (unsigned long long) rl,
-				(unsigned long long) rs);
+				(unsigned long long) rs, (unsigned long long) ch,
+				(unsigned long long) cm, (unsigned long long) ce);
 	}
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);

@@ -23,7 +23,7 @@ contrib_targets += pagestore
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
-        'pagestore_memtable.c'),
+        'pagestore_memtable.c', 'pagestore_pgcache.c'),
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
@@ -74,6 +74,17 @@ pagestore_layer_test = executable('pagestore_layer_test',
 )
 test('pagestore_layer',
   pagestore_layer_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
+pagestore_pgcache_test = executable('pagestore_pgcache_test',
+  files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
+  install: false,
+)
+test('pagestore_pgcache',
+  pagestore_pgcache_test,
   suite: ['pagestore'],
   timeout: 60,
 )

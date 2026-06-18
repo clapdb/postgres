@@ -36,12 +36,14 @@
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
+#include "pagestore_pgcache.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
 int			flush_pages = 256;	/* memtable flush threshold (pages) */
 int			compact_layers = 8;	/* compact a timeline past this many image layers */
+int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -1002,21 +1004,33 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (pv)
 		{
 			uint64_t	l;
+			int			served;
+
+			/* fast path: materialized-page cache, keyed by the resolved version */
+			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+				return 1;
 
 			if (g_memtable &&
 				ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
 				rr_mem++;
-				return 1;		/* served from the memtable */
+				served = 1;		/* served from the memtable */
 			}
-			if (layer_map_lookup(tl, key, block, rl, &l, out) && l == pv->lsn)
+			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
+					 l == pv->lsn)
 			{
 				rr_layer++;
-				return 1;		/* served from an image layer */
+				served = 1;		/* served from an image layer */
 			}
-			rr_seg++;
-			return read_version(pv, out) == 0 ? 1 : 0;	/* segment fallback */
+			else
+			{
+				rr_seg++;
+				served = (read_version(pv, out) == 0);	/* segment fallback */
+			}
+			if (served)
+				ps_pgcache_insert(tl, key, block, pv->lsn, out);
+			return served ? 1 : 0;
 		}
 		if (!timeline_has_parent(tl))
 			return 0;
@@ -1205,6 +1219,7 @@ ps_core_close(void)
 		ps_memtable_destroy(g_memtable);
 		g_memtable = NULL;
 	}
+	ps_pgcache_free();
 	ps_manifest_close();
 }
 
@@ -1243,6 +1258,7 @@ ps_core_open(const char *store_dir)
 		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
 		if (!g_memtable)
 			return -1;
+		ps_pgcache_init((uint32_t) cache_pages, page_size);
 	}
 	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
 			"replay (next layer id %llu)\n", ps_layer_map.nlayers,

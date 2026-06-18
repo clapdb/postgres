@@ -213,6 +213,8 @@ main(int argc, char **argv)
 			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
 			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
+			cache_pages = atoi(argv[++i]);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
