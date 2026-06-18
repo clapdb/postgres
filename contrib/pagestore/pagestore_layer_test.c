@@ -139,6 +139,47 @@ main(void)
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
 	}
 
+	/* --- read plan: base image + ordered delta chain --- */
+	{
+		PsLayerDesc img,
+					dl;
+		PsLayerMap	map;
+		PsReadPlan	plan;
+		PsImgRec	irecs[2] = {{k5, 0, 100, pg[0]}, {k5, 0, 200, pg[1]}};
+		PsDeltaRec	drecs[3] = {
+			{k5, 0, 150, "x150", 4}, {k5, 0, 250, "x250", 4}, {k5, 0, 300, "x300", 4},
+		};
+
+		check(ps_image_layer_write(9, 0, irecs, 2, psz, &img) == 0, "plan: image");
+		check(ps_delta_layer_write(10, 0, drecs, 3, &dl) == 0, "plan: delta");
+		ps_layer_map_init(&map);
+		ps_layer_map_add(&map, &img);
+		ps_layer_map_add(&map, &dl);
+
+		/* @250: base=image@200 (0xA2); deltas in (200,250] = {250} */
+		check(ps_read_plan_build(&map, 0, &k5, 0, 250, psz, &plan) == 0, "plan@250");
+		check(plan.has_base && plan.base_lsn == 200 && plan.base[0] == 0xA2,
+			  "plan@250 base = image@200");
+		check(plan.ndelta == 1 && plan.deltas[0].lsn == 250 &&
+			  memcmp(plan.deltas[0].bytes, "x250", 4) == 0, "plan@250 one delta");
+		ps_read_plan_free(&plan);
+
+		/* @300: base=image@200; deltas in (200,300] = {250,300} ascending */
+		check(ps_read_plan_build(&map, 0, &k5, 0, 300, psz, &plan) == 0, "plan@300");
+		check(plan.base_lsn == 200 && plan.ndelta == 2 &&
+			  plan.deltas[0].lsn == 250 && plan.deltas[1].lsn == 300,
+			  "plan@300 chain {250,300}");
+		ps_read_plan_free(&plan);
+
+		/* @180: base=image@100 (0xA1); deltas in (100,180] = {150} */
+		check(ps_read_plan_build(&map, 0, &k5, 0, 180, psz, &plan) == 0, "plan@180");
+		check(plan.base_lsn == 100 && plan.base[0] == 0xA1 && plan.ndelta == 1 &&
+			  plan.deltas[0].lsn == 150, "plan@180 base@100 + delta150");
+		ps_read_plan_free(&plan);
+
+		ps_layer_map_free(&map);
+	}
+
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

@@ -421,6 +421,125 @@ out:
 	return rc;
 }
 
+/* ===================== read plan (phase 7b) ============================ */
+
+#define PS_PLAN_MAX_CHAIN	1024	/* per-layer delta cap (chains are bounded
+									 * by compaction policy) */
+
+static int
+plan_delta_cmp(const void *pa, const void *pb)
+{
+	uint64_t	a = ((const PsPlanDelta *) pa)->lsn;
+	uint64_t	b = ((const PsPlanDelta *) pb)->lsn;
+
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+void
+ps_read_plan_free(PsReadPlan *plan)
+{
+	if (!plan)
+		return;
+	free(plan->base);
+	for (uint32_t i = 0; i < plan->ndelta; i++)
+		free(plan->deltas[i].bytes);
+	free(plan->deltas);
+	plan->base = NULL;
+	plan->deltas = NULL;
+	plan->ndelta = 0;
+	plan->has_base = 0;
+}
+
+int
+ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
+				   uint32_t block, uint64_t read_lsn, uint32_t page_size,
+				   PsReadPlan *plan)
+{
+	unsigned char *tmp = malloc(page_size);
+	uint64_t	lo;
+	uint32_t	cap = 0;
+	int			rc = -1;
+
+	memset(plan, 0, sizeof(*plan));
+	if (!tmp)
+		return -1;
+
+	/* 1. base = newest image-layer version <= read_lsn on this timeline */
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		const PsLayerDesc *d = &map->layers[i];
+		uint64_t	l;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
+			continue;
+		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
+								  &l) == 1 && (!plan->has_base || l > plan->base_lsn))
+		{
+			if (!plan->base)
+				plan->base = malloc(page_size);
+			if (!plan->base)
+				goto out;
+			memcpy(plan->base, tmp, page_size);
+			plan->base_lsn = l;
+			plan->has_base = 1;
+		}
+	}
+	lo = plan->has_base ? plan->base_lsn : 0;
+
+	/* 2. deltas in (lo, read_lsn] across this timeline's delta layers */
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		const PsLayerDesc *d = &map->layers[i];
+		PsDeltaOut	outs[PS_PLAN_MAX_CHAIN];
+		uint32_t	tn = 0;
+
+		if (d->kind != PS_LAYER_DELTA || d->deleting || d->timeline != timeline)
+			continue;
+		if (ps_delta_layer_collect(d, key, block, lo, read_lsn, outs,
+								   PS_PLAN_MAX_CHAIN, &tn) != 0)
+			goto out;
+		for (uint32_t j = 0; j < tn; j++)
+		{
+			unsigned char *bytes;
+
+			if (plan->ndelta == cap)
+			{
+				uint32_t	nc = cap ? cap * 2 : 16;
+				PsPlanDelta *nd = realloc(plan->deltas,
+										  (size_t) nc * sizeof(PsPlanDelta));
+
+				if (!nd)
+					goto out;
+				plan->deltas = nd;
+				cap = nc;
+			}
+			bytes = malloc(outs[j].data_len);
+			if (!bytes ||
+				ps_layer_store->read_layer_block(d, outs[j].data_off, bytes,
+												 outs[j].data_len) != 0)
+			{
+				free(bytes);
+				goto out;
+			}
+			plan->deltas[plan->ndelta].lsn = outs[j].lsn;
+			plan->deltas[plan->ndelta].len = outs[j].data_len;
+			plan->deltas[plan->ndelta].bytes = bytes;
+			plan->ndelta++;
+		}
+	}
+
+	/* 3. order the chain by ascending LSN (it spans multiple layers) */
+	if (plan->ndelta > 1)
+		qsort(plan->deltas, plan->ndelta, sizeof(PsPlanDelta), plan_delta_cmp);
+	rc = 0;
+
+out:
+	free(tmp);
+	if (rc != 0)
+		ps_read_plan_free(plan);
+	return rc;
+}
+
 int
 ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 						  uint32_t *n)
