@@ -128,6 +128,8 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
+			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -236,7 +238,8 @@ main(int argc, char **argv)
 		}
 	}
 
-	fprintf(stderr, "pagestore_daemon: shutting down\n");
+	fprintf(stderr, "pagestore_daemon: shutting down (%u image layers)\n",
+			ps_core_layer_count());
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }

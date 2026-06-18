@@ -22,8 +22,8 @@ contrib_targets += pagestore
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
-        'pagestore_layer.c',
-        'pagestore_layer_store.c', 'pagestore_manifest.c'),
+        'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c'),
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
