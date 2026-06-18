@@ -80,6 +80,12 @@ manifest_find_layer(PsLayerMap *map, uint64_t layer_id)
 	return NULL;
 }
 
+static int
+manifest_layer_desc_valid(const PsLayerDesc *desc)
+{
+	return desc->location_count <= PS_LAYER_MAX_LOCATIONS;
+}
+
 static void
 manifest_remove_from_map(PsLayerMap *map, uint64_t layer_id)
 {
@@ -132,8 +138,9 @@ ps_manifest_replay(PsLayerMap *map)
 		n = read(fd, &rec, sizeof(rec));
 		if (n == 0)
 			break;
-		if (n != (ssize_t) sizeof(rec) ||
-			rec.magic != PS_MANIFEST_MAGIC ||
+		if (n != (ssize_t) sizeof(rec))
+			break;				/* torn tail */
+		if (rec.magic != PS_MANIFEST_MAGIC ||
 			rec.version != PS_MANIFEST_VERSION)
 		{
 			close(fd);
@@ -145,9 +152,17 @@ ps_manifest_replay(PsLayerMap *map)
 			case PS_MANIFEST_ADD_LAYER:
 				{
 					PsLayerDesc desc;
+					ssize_t		nread;
 
-					if (rec.len != sizeof(desc) ||
-						read(fd, &desc, sizeof(desc)) != (ssize_t) sizeof(desc) ||
+					if (rec.len != sizeof(desc))
+					{
+						close(fd);
+						return -1;
+					}
+					nread = read(fd, &desc, sizeof(desc));
+					if (nread != (ssize_t) sizeof(desc))
+						goto done;	/* torn tail */
+					if (!manifest_layer_desc_valid(&desc) ||
 						ps_layer_map_add(map, &desc) != 0)
 					{
 						close(fd);
@@ -160,13 +175,16 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
+					ssize_t		nread;
 
-					if (rec.len != sizeof(ev) ||
-						read(fd, &ev, sizeof(ev)) != (ssize_t) sizeof(ev))
+					if (rec.len != sizeof(ev))
 					{
 						close(fd);
 						return -1;
 					}
+					nread = read(fd, &ev, sizeof(ev));
+					if (nread != (ssize_t) sizeof(ev))
+						goto done;	/* torn tail */
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 					{
@@ -180,13 +198,16 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
+					ssize_t		nread;
 
-					if (rec.len != sizeof(ev) ||
-						read(fd, &ev, sizeof(ev)) != (ssize_t) sizeof(ev))
+					if (rec.len != sizeof(ev))
 					{
 						close(fd);
 						return -1;
 					}
+					nread = read(fd, &ev, sizeof(ev));
+					if (nread != (ssize_t) sizeof(ev))
+						goto done;	/* torn tail */
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 						layer->deleting = true;
@@ -196,13 +217,16 @@ ps_manifest_replay(PsLayerMap *map)
 			case PS_MANIFEST_REMOVE_LAYER:
 				{
 					PsManifestLayerIdEvent ev;
+					ssize_t		nread;
 
-					if (rec.len != sizeof(ev) ||
-						read(fd, &ev, sizeof(ev)) != (ssize_t) sizeof(ev))
+					if (rec.len != sizeof(ev))
 					{
 						close(fd);
 						return -1;
 					}
+					nread = read(fd, &ev, sizeof(ev));
+					if (nread != (ssize_t) sizeof(ev))
+						goto done;	/* torn tail */
 					manifest_remove_from_map(map, ev.layer_id);
 					break;
 				}
@@ -211,13 +235,16 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
+					ssize_t		nread;
 
-					if (rec.len != sizeof(ev) ||
-						read(fd, &ev, sizeof(ev)) != (ssize_t) sizeof(ev))
+					if (rec.len != sizeof(ev))
 					{
 						close(fd);
 						return -1;
 					}
+					nread = read(fd, &ev, sizeof(ev));
+					if (nread != (ssize_t) sizeof(ev))
+						goto done;	/* torn tail */
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 					{
@@ -237,6 +264,7 @@ ps_manifest_replay(PsLayerMap *map)
 		}
 	}
 
+done:
 	close(fd);
 	return 0;
 }
@@ -244,6 +272,8 @@ ps_manifest_replay(PsLayerMap *map)
 int
 ps_manifest_add_layer(const PsLayerDesc *desc)
 {
+	if (!manifest_layer_desc_valid(desc))
+		return -1;
 	if (manifest_append(PS_MANIFEST_ADD_LAYER, desc, sizeof(*desc)) != 0)
 		return -1;
 	return ps_layer_map_add(&ps_layer_map, desc);
