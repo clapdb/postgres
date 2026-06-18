@@ -50,6 +50,20 @@ local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 }
 
 static int
+local_fsync_dir(void)
+{
+	int			fd;
+	int			rc;
+
+	fd = open(layer_dir, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
+}
+
+static int
 local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 {
 	char		path[4096];
@@ -62,6 +76,11 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 	if (fd < 0)
 		return -1;
 	close(fd);
+	if (local_fsync_dir() != 0)
+	{
+		unlink(path);
+		return -1;
+	}
 	n = snprintf(uri, uri_len, "%s", path);
 	if (n < 0 || (uint32_t) n >= uri_len)
 	{
