@@ -35,10 +35,14 @@ typedef struct PageVer
 /* Configuration shared with the frontend; set by the frontend before open. */
 extern uint32_t page_size;
 extern uint64_t segment_size;
+extern int	flush_pages;		/* memtable flush threshold in pages */
 extern const PsStorage *ps_storage;
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
 extern int	ps_core_open(const char *store_dir);
+
+/* Number of image layers currently in the layer map (for stats/diagnostics). */
+extern uint32_t ps_core_layer_count(void);
 
 /*
  * Handle every request that is NOT page byte I/O and return 1.  The four
