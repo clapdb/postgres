@@ -57,13 +57,46 @@ int			use_layers = 1;
 const PsStorage *ps_storage = &PsStoragePosix;
 
 /*
- * LSM phase 2: a mutable memtable stages recent page versions and flushes them
- * into immutable image layers.  Writes still also go to the segment log (the
- * source of truth until reads + restart move onto layers in 2c/2d), so this is
- * additive.
+ * Per-shard state (LSM phase 9, sharding step 2).  One thread per shard will own
+ * its index / staging / cache lock-free; the shard is chosen from the logical
+ * key only (block- and timeline-independent), so a key's blocks and all its
+ * timelines live on one shard.  NSHARDS == 1 for now -- behavior identical to
+ * the old single global state -- and shard_for() hashes the key once NSHARDS > 1.
+ *
+ * Each shard's memtable stages recent page versions and flushes them into
+ * immutable image layers (writes still also go to the segment log, the source of
+ * truth).  (The segment append cursor and layer-id allocator stay global for now;
+ * they become per-shard with per-shard segment namespaces / manifests in step 4.)
  */
-static PsMemtable *g_memtable;
-static uint64_t g_next_layer_id = 1;
+#define IDX_BUCKETS		(1 << 16)
+#define IDX_MASK		(IDX_BUCKETS - 1)
+
+struct PageEnt;
+struct ForkEnt;
+struct WalIdxEnt;
+
+typedef struct Shard
+{
+	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
+	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
+	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
+	PsMemtable *memtable;		/* staging -> image layers */
+	uint64_t	rr_mem,			/* read-source counters */
+				rr_layer,
+				rr_seg;
+} Shard;
+
+#define NSHARDS 1
+static Shard g_shards[NSHARDS];
+
+static Shard *
+shard_for(const PsKey *key)
+{
+	(void) key;					/* NSHARDS == 1: always shard 0 */
+	return &g_shards[0];
+}
+
+static uint64_t g_next_layer_id = 1;	/* global for now (per-shard in step 4) */
 
 uint32_t
 ps_core_layer_count(void)
@@ -71,20 +104,27 @@ ps_core_layer_count(void)
 	return ps_layer_map.nlayers;
 }
 
-/* read-path source counters (memtable / image layer / segment fallback) */
-static uint64_t rr_mem,
-			rr_layer,
-			rr_seg;
-
+/* read-path source counters (memtable / image layer / segment fallback),
+ * summed across shards */
 void
 ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 {
+	uint64_t	m = 0,
+				l = 0,
+				s = 0;
+
+	for (uint32_t i = 0; i < NSHARDS; i++)
+	{
+		m += g_shards[i].rr_mem;
+		l += g_shards[i].rr_layer;
+		s += g_shards[i].rr_seg;
+	}
 	if (mem)
-		*mem = rr_mem;
+		*mem = m;
 	if (layer)
-		*layer = rr_layer;
+		*layer = l;
 	if (seg)
-		*seg = rr_seg;
+		*seg = s;
 }
 
 static uint64_t
@@ -304,8 +344,6 @@ static uint64_t cur_off;		/* append cursor within cur_seg */
  * tables are in-memory state, rebuilt from the segments by recover().
  * (Prototype: no GC/compaction, so the version chain only grows.)
  */
-#define IDX_BUCKETS		(1 << 16)
-#define IDX_MASK		(IDX_BUCKETS - 1)
 
 /* PageVer (one stored version's location) is defined in pagestore_core.h. */
 
@@ -329,9 +367,6 @@ typedef struct ForkEnt
 	PsKey		key;
 	uint32_t	nblocks;
 } ForkEnt;
-
-static PageEnt *page_idx[IDX_BUCKETS];
-static ForkEnt *fork_idx[IDX_BUCKETS];
 
 /*
  * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
@@ -384,9 +419,10 @@ static PageEnt *
 page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 {
 	uint32_t	h = page_hash(timeline, key, block);
+	Shard	   *s = shard_for(key);
 	PageEnt    *e;
 
-	for (e = page_idx[h & IDX_MASK]; e; e = e->next)
+	for (e = s->page_idx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == timeline && e->block == block && key_eq(&e->key, key))
 			return e;
 	return NULL;
@@ -404,6 +440,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 				 uint64_t lsn, int seg, uint64_t off)
 {
 	uint32_t	h = page_hash(timeline, key, block);
+	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
 
 	if (!e)
@@ -412,8 +449,8 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->timeline = timeline;
 		e->key = *key;
 		e->block = block;
-		e->next = page_idx[h & IDX_MASK];
-		page_idx[h & IDX_MASK] = e;
+		e->next = s->page_idx[h & IDX_MASK];
+		s->page_idx[h & IDX_MASK] = e;
 	}
 	if (e->nver == e->cap)		/* grow the version array geometrically */
 	{
@@ -448,9 +485,10 @@ static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
 	ForkEnt    *e;
 
-	for (e = fork_idx[h & IDX_MASK]; e; e = e->next)
+	for (e = s->fork_idx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == timeline && key_eq(&e->key, key))
 			return e;
 	return NULL;
@@ -460,6 +498,7 @@ static ForkEnt *
 fork_get_or_create(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_find(timeline, key);
 
 	if (!e)
@@ -468,8 +507,8 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 		e->timeline = timeline;
 		e->key = *key;
 		e->nblocks = 0;
-		e->next = fork_idx[h & IDX_MASK];
-		fork_idx[h & IDX_MASK] = e;
+		e->next = s->fork_idx[h & IDX_MASK];
+		s->fork_idx[h & IDX_MASK] = e;
 	}
 	return e;
 }
@@ -487,7 +526,8 @@ static void
 fork_remove(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
-	ForkEnt   **pp = &fork_idx[h & IDX_MASK];
+	Shard	   *s = shard_for(key);
+	ForkEnt   **pp = &s->fork_idx[h & IDX_MASK];
 
 	while (*pp)
 	{
@@ -787,15 +827,14 @@ typedef struct WalIdxEnt
 	int			cap;
 } WalIdxEnt;
 
-static WalIdxEnt *walidx[IDX_BUCKETS];
-
 static void
 walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
 	uint32_t	h = page_hash(tl, key, block);
+	Shard	   *s = shard_for(key);
 	WalIdxEnt  *e;
 
-	for (e = walidx[h & IDX_MASK]; e; e = e->next)
+	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
 			break;
 	if (!e)
@@ -804,8 +843,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 		e->timeline = tl;
 		e->key = *key;
 		e->block = block;
-		e->next = walidx[h & IDX_MASK];
-		walidx[h & IDX_MASK] = e;
+		e->next = s->walidx[h & IDX_MASK];
+		s->walidx[h & IDX_MASK] = e;
 	}
 	if (e->n == e->cap)
 	{
@@ -835,6 +874,7 @@ static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		   uint64_t *out, int max_out)
 {
+	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 	int			got = 0;
 
 	for (;;)
@@ -842,7 +882,7 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		uint32_t	h = page_hash(tl, key, block);
 		WalIdxEnt  *e;
 
-		for (e = walidx[h & IDX_MASK]; e; e = e->next)
+		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
 			{
 				for (int i = 0; i < e->n && got < max_out; i++)
@@ -886,6 +926,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
 	uint64_t	data_off;
+	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
 	if (cur_seg < 0 || cur_off + reclen > segment_size)
@@ -914,12 +955,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
-	if (g_memtable)
+	if (s->memtable)
 	{
-		ps_memtable_put(g_memtable, timeline, key, block, hdr.lsn, page);
-		if (ps_memtable_full(g_memtable))
+		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
+		if (ps_memtable_full(s->memtable))
 		{
-			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, NULL);
 			/* backpressure only: normal compaction runs off the write path in
 			 * ps_core_maintenance() when the daemon is idle.  Compact inline
 			 * here only if the layer count is running away far past the
@@ -993,6 +1034,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 {
 	uint32_t	tl = timeline;
 	uint64_t	rl = read_lsn;
+	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 
 	for (;;)
 	{
@@ -1008,22 +1050,22 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
 				return 1;
 
-			if (g_memtable &&
-				ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
+			if (s->memtable &&
+				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
-				rr_mem++;
+				s->rr_mem++;
 				served = 1;		/* served from the memtable */
 			}
 			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
-				rr_layer++;
+				s->rr_layer++;
 				served = 1;		/* served from an image layer */
 			}
 			else
 			{
-				rr_seg++;
+				s->rr_seg++;
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
 			if (served)
@@ -1211,11 +1253,16 @@ rebuild_from_layers(void)
 void
 ps_core_close(void)
 {
-	if (g_memtable)
+	for (uint32_t i = 0; i < NSHARDS; i++)
 	{
-		ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
-		ps_memtable_destroy(g_memtable);
-		g_memtable = NULL;
+		Shard	   *s = &g_shards[i];
+
+		if (s->memtable)
+		{
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, NULL);
+			ps_memtable_destroy(s->memtable);
+			s->memtable = NULL;
+		}
 	}
 	ps_pgcache_free();
 	ps_manifest_close();
@@ -1272,13 +1319,16 @@ ps_core_open(const char *store_dir)
 			g_next_layer_id = ps_layer_map.layers[i].layer_id + 1;
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
-	 * the read path; the SPDK daemon stays on the segment path for now */
+	 * the read path; the SPDK daemon stays on the segment path for now.  One
+	 * memtable per shard. */
 	if (use_layers)
-	{
-		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
-		if (!g_memtable)
-			return -1;
-	}
+		for (uint32_t i = 0; i < NSHARDS; i++)
+		{
+			g_shards[i].memtable = ps_memtable_create(page_size,
+													  (uint32_t) flush_pages);
+			if (!g_shards[i].memtable)
+				return -1;
+		}
 	/* the materialized-page cache helps both read paths (read_resolve and the
 	 * SPDK async path), so it is not gated on use_layers */
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
