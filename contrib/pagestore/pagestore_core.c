@@ -35,13 +35,46 @@
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
+#include "pagestore_memtable.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
+int			flush_pages = 256;	/* memtable flush threshold (pages) */
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
+
+/*
+ * LSM phase 2: a mutable memtable stages recent page versions and flushes them
+ * into immutable image layers.  Writes still also go to the segment log (the
+ * source of truth until reads + restart move onto layers in 2c/2d), so this is
+ * additive.
+ */
+static PsMemtable *g_memtable;
+static uint64_t g_next_layer_id = 1;
+
+uint32_t
+ps_core_layer_count(void)
+{
+	return ps_layer_map.nlayers;
+}
+
+static uint64_t
+alloc_layer_id(void *ctx)
+{
+	(void) ctx;
+	return g_next_layer_id++;
+}
+
+static int
+record_layer(void *ctx, const PsLayerDesc *desc)
+{
+	(void) ctx;
+	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
+	 * map (idempotently); do not add to the map a second time. */
+	return ps_manifest_add_layer(desc);
+}
 
 /* ===================== segment storage (log-structured) ================= */
 
@@ -693,6 +726,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	/* index points at the page bytes (data_off), so reads skip the header */
 	page_add_version(timeline, key, block, hdr.lsn, cur_seg, data_off);
 	cur_off += reclen;
+
+	/* stage the version for the LSM memtable; flush to an image layer when full
+	 * (additive in phase 2 -- the segment write above is still authoritative) */
+	if (g_memtable)
+	{
+		ps_memtable_put(g_memtable, timeline, key, block, hdr.lsn, page);
+		if (ps_memtable_full(g_memtable))
+			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
+	}
 	return 0;
 }
 
@@ -861,6 +903,19 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
+
+	/* layer ids continue past the highest one the manifest restored */
+	g_next_layer_id = 1;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id >= g_next_layer_id)
+			g_next_layer_id = ps_layer_map.layers[i].layer_id + 1;
+
+	g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
+	if (!g_memtable)
+		return -1;
+	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
+			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
+			(unsigned long long) g_next_layer_id);
 
 	/* timeline 0 is the root; load any persisted branches, then replay data */
 	timeline_define(0, -1, 0);

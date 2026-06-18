@@ -208,6 +208,8 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
+			flush_pages = atoi(argv[++i]);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
