@@ -108,6 +108,36 @@ timeline tree under a brief coordination point, not on the read/write hot path.
 Each step is independently testable; step 2 is the big mechanical change and is
 behavior-preserving, so the risky parallelism (step 4) sits on a proven refactor.
 
+## Engine refinements this sharding depends on (informed by ScyllaDB)
+
+ScyllaDB is the reference for share-nothing shard-per-core LSM (Seastar:
+`hash(key) -> core`, per-core memtable/SSTable/cache, shard-aware clients,
+per-core I/O scheduler).  This design matches it.  But a few engine details must
+change *before or with* sharding, or per-shard threads will stall:
+
+1. **Compaction must move off the serve thread (hard prerequisite).** Today
+   `maybe_compact()` runs inline in `append_page()` on the write path.  Once each
+   shard is a single thread, an inline compaction blocks that shard's reads and
+   writes for the whole merge.  Compaction must become a **background per-shard
+   task** with **backpressure** (throttle/stall writes only when the layer count
+   or memtable backlog crosses a high-water mark), à la ScyllaDB's compaction /
+   flush controllers.  Until this lands, sharding would just multiply stalls.
+2. **Real compaction strategy, not "merge all".** The current policy rewrites all
+   of a timeline's image layers into one whenever the count exceeds a threshold —
+   unbounded read/space amplification control.  Adopt **size-tiered** (simplest:
+   merge similarly-sized layers) first; if space amplification matters, an
+   **incremental / fragmented** scheme (ScyllaDB ICS) bounds the temporary space a
+   compaction needs.  Per-shard, so it stays lock-free.
+3. **Per-layer key range (min/max) + bloom to skip layers.** `layer_map_lookup`
+   scans every image layer of a timeline (O(layers)).  Record each layer's
+   min/max key (already have start/end_key in `PsLayerDesc`) and *use it to
+   prune*, and add a per-layer bloom filter, so a read touches only layers that
+   can hold the key — RocksDB/ScyllaDB both rely on this.  Read amplification
+   only gets worse with more layers per shard.
+
+These are tracked as co-requisites: step 4 (real parallelism) should not ship
+without (1); (2) and (3) can land incrementally alongside.
+
 ## Invariants
 
 - Every version/timeline/block of a given key lives on exactly one shard.
