@@ -3,6 +3,9 @@
 This document describes the intended LSM-like architecture for `contrib/pagestore`.
 It complements `LSM_OBJECT_STORAGE_PLAN.md`: that document is the phased plan;
 this document is the target architecture and module boundary reference.
+See `MATERIALIZATION.md` for the deployment-agnostic ingest/materialize
+abstraction (page-ingest vs wal-ingest, and where redo runs: local worker vs
+cloud serverless) that this layer model plugs into.
 
 ## Design intent
 
