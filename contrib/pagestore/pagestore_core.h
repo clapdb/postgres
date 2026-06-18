@@ -47,6 +47,10 @@ extern int	ps_core_open(const char *store_dir);
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */
 extern void ps_core_close(void);
 
+/* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
+ * did work (caller should not sleep), 0 if nothing was due. */
+extern int	ps_core_maintenance(void);
+
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 

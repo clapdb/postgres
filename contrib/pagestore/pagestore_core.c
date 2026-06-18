@@ -1023,13 +1023,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 						"staged pages (still durable in the segment log)\n");
 				ps_memtable_reset(g_memtable);
 			}
-			/* a flush groups by timeline and can emit a layer for several of
-			 * them, so compact every timeline now over the threshold -- not only
-			 * the one this write belongs to (a colder timeline could otherwise
-			 * grow unbounded until it happens to cross the flush threshold) */
+			/* Normal compaction runs off the write path in ps_core_maintenance()
+			 * when the daemon is idle.  As a backpressure guard, compact inline
+			 * here any timeline whose layer count is running away far past the
+			 * threshold (a flush groups by timeline and can emit layers for
+			 * several, so check them all, not just this write's). */
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
 				if ((ct == 0 || timelines[ct].defined) &&
-					count_image_layers(ct) > (uint32_t) compact_layers)
+					count_image_layers(ct) > (uint32_t) compact_layers * 4)
 					compact_timeline(ct);
 		}
 	}
@@ -1310,6 +1311,28 @@ ps_core_close(void)
 	}
 	ps_pgcache_free();
 	ps_manifest_close();
+}
+
+/*
+ * Off-the-write-path background maintenance: compact one timeline whose image
+ * layer count exceeds the (low-water) threshold.  The daemon calls this when it
+ * is otherwise idle; doing at most one compaction per call keeps the serve loop
+ * responsive.  Returns 1 if it compacted (the caller should not sleep), 0 if
+ * nothing was due.
+ */
+int
+ps_core_maintenance(void)
+{
+	if (!use_layers)
+		return 0;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if ((tl == 0 || timelines[tl].defined) &&
+			count_image_layers(tl) > (uint32_t) compact_layers)
+		{
+			compact_timeline(tl);
+			return 1;
+		}
+	return 0;
 }
 
 /*
