@@ -1,0 +1,140 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_layer_store.c
+ *	  Local implementation of immutable layer byte access.
+ *
+ * Object storage will be added behind this interface.  Phase 1 only supports
+ * local files and returns "unsupported" for remote operations.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "pagestore_layer_store.h"
+
+static char layer_dir[2048];
+
+const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
+
+static int
+local_open(const char *store_dir)
+{
+	snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
+	return 0;
+}
+
+static void
+local_close(void)
+{
+	layer_dir[0] = '\0';
+}
+
+static void
+local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
+{
+	snprintf(buf, buflen, "%s/layer_%016llx",
+			 layer_dir, (unsigned long long) layer_id);
+}
+
+static int
+local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
+{
+	char		path[4096];
+	int			fd;
+
+	local_layer_path(layer_id, path, sizeof(path));
+	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+		return -1;
+	close(fd);
+	snprintf(uri, uri_len, "%s", path);
+	return 0;
+}
+
+static int
+local_seal_local_layer(uint64_t layer_id)
+{
+	(void) layer_id;
+	return 0;
+}
+
+static int
+local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
+					   void *buf, uint32_t len)
+{
+	const char *path = NULL;
+	int			fd;
+	ssize_t		n;
+
+	for (uint32_t i = 0; i < layer->location_count; i++)
+	{
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+			layer->locations[i].available)
+		{
+			path = layer->locations[i].uri;
+			break;
+		}
+	}
+
+	if (path == NULL)
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = pread(fd, buf, len, (off_t) off);
+	close(fd);
+	return n == (ssize_t) len ? 0 : -1;
+}
+
+static int
+local_unsupported_layer_op(const PsLayerDesc *layer)
+{
+	(void) layer;
+	errno = ENOTSUP;
+	return -1;
+}
+
+static int
+local_delete_local_layer(const PsLayerDesc *layer)
+{
+	int			rc = 0;
+
+	for (uint32_t i = 0; i < layer->location_count; i++)
+	{
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+			layer->locations[i].available)
+		{
+			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
+				rc = -1;
+		}
+	}
+	return rc;
+}
+
+static int
+local_layer_exists_remote(const PsLayerDesc *layer)
+{
+	(void) layer;
+	return 0;
+}
+
+const PsLayerStore PsLayerStoreLocal = {
+	.name = "local",
+	.open = local_open,
+	.close = local_close,
+	.create_local_layer = local_create_local_layer,
+	.seal_local_layer = local_seal_local_layer,
+	.read_layer_block = local_read_layer_block,
+	.upload_layer = local_unsupported_layer_op,
+	.download_layer = local_unsupported_layer_op,
+	.delete_local_layer = local_delete_local_layer,
+	.delete_remote_layer = local_unsupported_layer_op,
+	.layer_exists_remote = local_layer_exists_remote,
+};
