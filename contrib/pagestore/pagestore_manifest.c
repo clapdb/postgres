@@ -44,7 +44,22 @@ typedef struct PsManifestLayerIdEvent
 } PsManifestLayerIdEvent;
 
 static char manifest_path[4096];
+static char manifest_dir[2048];
 PsLayerMap ps_layer_map;
+
+static int
+manifest_fsync_dir(void)
+{
+	int			fd;
+	int			rc;
+
+	fd = open(manifest_dir, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
+}
 
 static int
 manifest_append(uint32_t type, const void *payload, uint32_t len)
@@ -52,10 +67,13 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	PsManifestRecord rec;
 	int			fd;
 	int			rc = 0;
+	int			created = 0;
 
 	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
 		return -1;
+	if (lseek(fd, 0, SEEK_END) == 0)
+		created = 1;
 
 	rec.magic = PS_MANIFEST_MAGIC;
 	rec.version = PS_MANIFEST_VERSION;
@@ -66,6 +84,8 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 		(len > 0 && write(fd, payload, len) != (ssize_t) len))
 		rc = -1;
 	if (fsync(fd) != 0)
+		rc = -1;
+	if (created && manifest_fsync_dir() != 0)
 		rc = -1;
 	close(fd);
 	return rc;
@@ -105,7 +125,14 @@ manifest_remove_from_map(PsLayerMap *map, uint64_t layer_id)
 int
 ps_manifest_open(const char *store_dir)
 {
-	snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
+	int			n;
+
+	n = snprintf(manifest_dir, sizeof(manifest_dir), "%s", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(manifest_dir))
+		return -1;
+	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(manifest_path))
+		return -1;
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }
@@ -121,8 +148,10 @@ int
 ps_manifest_replay(PsLayerMap *map)
 {
 	int			fd;
+	off_t		good_off = 0;
+	int			truncate_tail = 0;
 
-	fd = open(manifest_path, O_RDONLY);
+	fd = open(manifest_path, O_RDWR);
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
@@ -134,12 +163,17 @@ ps_manifest_replay(PsLayerMap *map)
 	{
 		PsManifestRecord rec;
 		ssize_t		n;
+		off_t		rec_off = good_off;
 
 		n = read(fd, &rec, sizeof(rec));
 		if (n == 0)
 			break;
 		if (n != (ssize_t) sizeof(rec))
+		{
+			truncate_tail = 1;
+			good_off = rec_off;
 			break;				/* torn tail */
+		}
 		if (rec.magic != PS_MANIFEST_MAGIC ||
 			rec.version != PS_MANIFEST_VERSION)
 		{
@@ -161,7 +195,11 @@ ps_manifest_replay(PsLayerMap *map)
 					}
 					nread = read(fd, &desc, sizeof(desc));
 					if (nread != (ssize_t) sizeof(desc))
+					{
+						truncate_tail = 1;
+						good_off = rec_off;
 						goto done;	/* torn tail */
+					}
 					if (!manifest_layer_desc_valid(&desc) ||
 						ps_layer_map_add(map, &desc) != 0)
 					{
@@ -184,7 +222,11 @@ ps_manifest_replay(PsLayerMap *map)
 					}
 					nread = read(fd, &ev, sizeof(ev));
 					if (nread != (ssize_t) sizeof(ev))
+					{
+						truncate_tail = 1;
+						good_off = rec_off;
 						goto done;	/* torn tail */
+					}
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 					{
@@ -207,7 +249,11 @@ ps_manifest_replay(PsLayerMap *map)
 					}
 					nread = read(fd, &ev, sizeof(ev));
 					if (nread != (ssize_t) sizeof(ev))
+					{
+						truncate_tail = 1;
+						good_off = rec_off;
 						goto done;	/* torn tail */
+					}
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 						layer->deleting = true;
@@ -226,7 +272,11 @@ ps_manifest_replay(PsLayerMap *map)
 					}
 					nread = read(fd, &ev, sizeof(ev));
 					if (nread != (ssize_t) sizeof(ev))
+					{
+						truncate_tail = 1;
+						good_off = rec_off;
 						goto done;	/* torn tail */
+					}
 					manifest_remove_from_map(map, ev.layer_id);
 					break;
 				}
@@ -244,7 +294,11 @@ ps_manifest_replay(PsLayerMap *map)
 					}
 					nread = read(fd, &ev, sizeof(ev));
 					if (nread != (ssize_t) sizeof(ev))
+					{
+						truncate_tail = 1;
+						good_off = rec_off;
 						goto done;	/* torn tail */
+					}
 					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 					{
@@ -262,9 +316,21 @@ ps_manifest_replay(PsLayerMap *map)
 				close(fd);
 				return -1;
 		}
+		good_off = lseek(fd, 0, SEEK_CUR);
+		if (good_off < 0)
+		{
+			close(fd);
+			return -1;
+		}
 	}
 
 done:
+	if (truncate_tail &&
+		(ftruncate(fd, good_off) != 0 || fsync(fd) != 0))
+	{
+		close(fd);
+		return -1;
+	}
 	close(fd);
 	return 0;
 }
