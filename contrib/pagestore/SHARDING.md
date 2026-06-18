@@ -1,5 +1,34 @@
 # pagestore — multi-core sharding design
 
+## Guiding principle: follow ScyllaDB
+
+ScyllaDB is our primary reference for the concurrency/engine model.  Concrete
+principles we commit to (adopt incrementally; adapt, don't clone Seastar):
+
+- **Share-nothing shard-per-core.** `hash(key) -> shard`; each core owns its
+  data and takes no global lock on the hot path; cross-shard only by message
+  passing.
+- **Run-to-completion, never block a shard thread.** Per-core async/polled IO
+  (SPDK qpair per thread); the synchronous POSIX backend is the explicit slow-path
+  exception.
+- **Autonomous controllers + backpressure.** Compaction/flush are not merely
+  "background" — they are scheduled under CPU/IO shares with backpressure (throttle
+  writes only at a high-water mark) so foreground read latency stays bounded.
+- **Per-core I/O scheduler with priority classes:** query > flush > compaction;
+  background work must not starve foreground reads.
+- **Engine-managed memory:** cache + memtable share a per-shard memory budget the
+  engine evicts under pressure (à la Scylla's unified cache), not fixed separate
+  allocations.
+- **Semantic cache** (materialized pages, like Scylla's row cache), client-side
+  shard routing (like shard-aware drivers).
+
+Adaptation limits: we are a freestanding daemon talking to PostgreSQL over shared
+memory, not a networked DB on Seastar.  Adopt the principles; build a custom
+allocator / full scheduler only where it pays.  Redo/materialization is our own
+cross-process concern (see `MATERIALIZATION.md`), not a Scylla mechanism.
+
+## Overview
+
 The daemon is single-threaded: one thread polls every channel and owns all state
 lock-free.  On fast NVMe/SPDK that single core is the throughput ceiling.  This
 doc commits to a shard-by-key model that keeps each shard single-owner and
