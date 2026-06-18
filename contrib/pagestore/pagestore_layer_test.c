@@ -90,6 +90,38 @@ main(void)
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
 	check(r == 0, "absent key -> no version");
 
+	/* --- delta layer: ordered collect in an LSN range --- */
+	{
+		PsLayerDesc dd;
+		PsDeltaRec	drecs[4] = {
+			{k5, 0, 300, "D300", 4}, {k5, 0, 100, "D100", 4},
+			{k5, 0, 200, "DD200", 5}, {k5, 1, 150, "E150", 4},
+		};
+		PsDeltaOut	outs[8];
+		uint32_t	dn = 0;
+		unsigned char dbuf[16];
+
+		check(ps_delta_layer_write(8, 0, drecs, 4, &dd) == 0, "write delta layer");
+		check(dd.kind == PS_LAYER_DELTA && dd.lsn_start == 100 &&
+			  dd.lsn_end == 300, "delta layer kind + lsn range");
+
+		/* (5,0) in (100, 300]: expect 200 then 300, ascending; 100 excluded */
+		r = ps_delta_layer_collect(&dd, &k5, 0, 100, 300, outs, 8, &dn);
+		check(r == 0 && dn == 2, "delta collect (100,300] -> 2 records");
+		check(outs[0].lsn == 200 && outs[1].lsn == 300, "deltas in ascending LSN");
+		check(ps_layer_store->read_layer_block(&dd, outs[0].data_off, dbuf,
+											   outs[0].data_len) == 0 &&
+			  outs[0].data_len == 5 && memcmp(dbuf, "DD200", 5) == 0,
+			  "delta payload readable (200)");
+
+		dn = 0;
+		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, outs, 8, &dn);
+		check(r == 0 && dn == 3, "delta collect (0,1000] -> all 3 of (5,0)");
+		dn = 0;
+		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, outs, 8, &dn);
+		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
+	}
+
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
