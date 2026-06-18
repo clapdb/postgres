@@ -102,6 +102,33 @@ ps_memtable_full(const PsMemtable *mt)
 	return mt->n >= mt->threshold;
 }
 
+int
+ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
+				   uint32_t block, uint64_t read_lsn, uint64_t *out_lsn,
+				   void *out)
+{
+	const MemEnt *best = NULL;
+
+	for (uint32_t i = 0; i < mt->n; i++)
+	{
+		const MemEnt *e = &mt->ents[i];
+
+		if (e->timeline != timeline || e->block != block)
+			continue;
+		if (e->key.spcOid != key->spcOid || e->key.dbOid != key->dbOid ||
+			e->key.relNumber != key->relNumber || e->key.forkNum != key->forkNum)
+			continue;
+		if (e->lsn <= read_lsn && (!best || e->lsn >= best->lsn))
+			best = e;
+	}
+	if (!best)
+		return 0;
+	memcpy(out, best->page, mt->page_size);
+	if (out_lsn)
+		*out_lsn = best->lsn;
+	return 1;
+}
+
 static int
 ent_timeline_cmp(const void *pa, const void *pb)
 {

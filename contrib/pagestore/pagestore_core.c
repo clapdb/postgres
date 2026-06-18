@@ -60,6 +60,22 @@ ps_core_layer_count(void)
 	return ps_layer_map.nlayers;
 }
 
+/* read-path source counters (memtable / image layer / segment fallback) */
+static uint64_t rr_mem,
+			rr_layer,
+			rr_seg;
+
+void
+ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
+{
+	if (mem)
+		*mem = rr_mem;
+	if (layer)
+		*layer = rr_layer;
+	if (seg)
+		*seg = rr_seg;
+}
+
 static uint64_t
 alloc_layer_id(void *ctx)
 {
@@ -745,6 +761,90 @@ read_version(const PageVer *v, unsigned char *out)
 	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
 		return -1;
 	return 0;
+}
+
+/*
+ * Newest image-layer version of (timeline, key, block) with lsn <= read_lsn on
+ * this exact timeline (ancestry is the caller's job).  Tries every image layer
+ * of that timeline (key-range/bloom pruning is a later optimization).
+ */
+static int
+layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
+				 uint64_t read_lsn, uint64_t *out_lsn, unsigned char *out)
+{
+	unsigned char *tmp = malloc(page_size);
+	int			found = 0;
+	uint64_t	best = 0;
+
+	if (!tmp)
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		uint64_t	l;
+
+		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
+			continue;
+		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
+								  &l) == 1 && (!found || l > best))
+		{
+			best = l;
+			memcpy(out, tmp, page_size);
+			found = 1;
+		}
+	}
+	free(tmp);
+	if (found && out_lsn)
+		*out_lsn = best;
+	return found;
+}
+
+/*
+ * Resolve a read into out (page_size bytes): walk the timeline ancestry as
+ * read_through() does, but serve the bytes from the memtable or an image layer
+ * when they hold the authoritative version, falling back to the segment.  The
+ * page index (page_visible) still selects the authoritative version at each
+ * level, so the result matches the segment-only read; layers/memtable just serve
+ * the bytes without touching the segment.  Returns 1 if a version was found and
+ * out filled, 0 if the page is unwritten (caller zero-fills).
+ */
+int
+read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, unsigned char *out)
+{
+	uint32_t	tl = timeline;
+	uint64_t	rl = read_lsn;
+
+	for (;;)
+	{
+		PageEnt    *e = page_find(tl, key, block);
+		PageVer    *pv = e ? page_visible(e, rl) : NULL;
+
+		if (pv)
+		{
+			uint64_t	l;
+
+			if (g_memtable &&
+				ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
+				l == pv->lsn)
+			{
+				rr_mem++;
+				return 1;		/* served from the memtable */
+			}
+			if (layer_map_lookup(tl, key, block, rl, &l, out) && l == pv->lsn)
+			{
+				rr_layer++;
+				return 1;		/* served from an image layer */
+			}
+			rr_seg++;
+			return read_version(pv, out) == 0 ? 1 : 0;	/* segment fallback */
+		}
+		if (!timeline_has_parent(tl))
+			return 0;
+		if (timelines[tl].branch_lsn < rl)
+			rl = timelines[tl].branch_lsn;
+		tl = (uint32_t) timelines[tl].parent;
+	}
 }
 
 /* ===================== recovery (rebuild index from segments) ========== */
