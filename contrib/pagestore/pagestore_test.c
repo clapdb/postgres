@@ -494,9 +494,11 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		char		psbuf[16];
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
-		/* small segments so the tests exercise segment rollover */
+		/* small segments exercise rollover; a small flush threshold makes the
+		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
-			  "--page-size", psbuf, "--segment-size", "65536", (char *) NULL);
+			  "--page-size", psbuf, "--segment-size", "65536",
+			  "--flush-pages", "8", (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}

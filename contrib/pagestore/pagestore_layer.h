@@ -133,11 +133,13 @@ extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 
 /*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
- * layer 'layer'.  On a hit copies page_size bytes into out and returns 1; 0 if
- * the layer has no such page; -1 on read/format error.
+ * layer 'layer'.  On a hit copies page_size bytes into out, stores that
+ * version's lsn in *out_lsn (if non-NULL), and returns 1; 0 if the layer has no
+ * such page; -1 on read/format error.
  */
 extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  uint32_t block, uint64_t read_lsn,
-								  void *out, uint32_t page_size);
+								  void *out, uint32_t page_size,
+								  uint64_t *out_lsn);
 
 #endif							/* PAGESTORE_LAYER_H */

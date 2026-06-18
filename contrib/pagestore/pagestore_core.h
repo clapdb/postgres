@@ -44,6 +44,9 @@ extern int	ps_core_open(const char *store_dir);
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 
+/* Read-path source counts: served from memtable / image layer / segment. */
+extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
+
 /*
  * Handle every request that is NOT page byte I/O and return 1.  The four
  * byte-I/O ops (EXTEND/WRITEV/READV/READ_AT) and unknown ops return 0 for the
@@ -57,6 +60,14 @@ extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);
+
+/*
+ * Resolve a read into out (page_size bytes), serving from memtable / image
+ * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
+ * page is unwritten.
+ */
+extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, unsigned char *out);
 extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
 
 #endif							/* PAGESTORE_CORE_H */

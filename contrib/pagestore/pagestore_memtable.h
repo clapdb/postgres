@@ -39,6 +39,15 @@ extern uint32_t ps_memtable_count(const PsMemtable *mt);
 extern int	ps_memtable_full(const PsMemtable *mt);	/* count >= threshold */
 
 /*
+ * Newest staged version of (timeline, key, block) with lsn <= read_lsn (this
+ * timeline only -- ancestry is the caller's job).  On a hit copies page_size
+ * bytes into out, stores its lsn in *out_lsn, and returns 1; else 0.
+ */
+extern int	ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline,
+							   const PsKey *key, uint32_t block,
+							   uint64_t read_lsn, uint64_t *out_lsn, void *out);
+
+/*
  * Flush all staged versions: group by timeline, write one image layer per
  * timeline, invoke on_layer() for each, then empty the memtable.  Returns 0 on
  * success (the memtable is emptied even on a partial failure path is avoided --

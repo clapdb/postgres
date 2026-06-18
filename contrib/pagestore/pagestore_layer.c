@@ -227,7 +227,7 @@ out:
 int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn,
-					  void *out, uint32_t page_size)
+					  void *out, uint32_t page_size, uint64_t *out_lsn)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
@@ -276,6 +276,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
 		goto out;
+	if (out_lsn)
+		*out_lsn = best_lsn;
 	rc = 1;
 
 out:
