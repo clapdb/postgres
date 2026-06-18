@@ -142,4 +142,13 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  void *out, uint32_t page_size,
 								  uint64_t *out_lsn);
 
+/*
+ * Read an image layer's full index (every (key, block, lsn) entry), for
+ * rebuilding the in-memory version index at startup without scanning page data.
+ * On success *out is a malloc'd array of *n entries (caller frees) and the
+ * return is 0; -1 on read/format/checksum error.
+ */
+extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
+									  PsImgIndexEnt **out, uint32_t *n);
+
 #endif							/* PAGESTORE_LAYER_H */

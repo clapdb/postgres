@@ -225,6 +225,41 @@ out:
 }
 
 int
+ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
+						  uint32_t *n)
+{
+	const PsLayerLocation *loc = img_local_loc(layer);
+	PsImgFooter foot;
+	PsImgIndexEnt *idx;
+	uint64_t	idx_bytes;
+
+	*out = NULL;
+	*n = 0;
+	if (!loc || loc->size < sizeof(PsImgFooter))
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
+										 &foot, sizeof(foot)) != 0)
+		return -1;
+	if (foot.magic != PS_IMG_MAGIC || foot.version != PS_IMG_VERSION ||
+		foot.nrecs == 0)
+		return -1;
+	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsImgIndexEnt);
+	idx = malloc((size_t) idx_bytes);
+	if (!idx)
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
+										 (uint32_t) idx_bytes) != 0 ||
+		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
+	{
+		free(idx);
+		return -1;
+	}
+	*out = idx;
+	*n = foot.nrecs;
+	return 0;
+}
+
+int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn,
 					  void *out, uint32_t page_size, uint64_t *out_lsn)
