@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "pagestore_manifest.h"
@@ -42,6 +43,45 @@ typedef struct PsManifestLayerIdEvent
 	uint64_t	layer_id;
 	uint64_t	value;
 } PsManifestLayerIdEvent;
+
+typedef struct PsManifestKeyDisk
+{
+	uint32_t	spcOid;
+	uint32_t	dbOid;
+	uint32_t	relNumber;
+	int32_t		forkNum;
+} PsManifestKeyDisk;
+
+typedef struct PsManifestLocationDisk
+{
+	uint32_t	tier;
+	char		uri[PS_LAYER_URI_MAX];
+	uint64_t	size;
+	uint32_t	generation;
+	uint8_t		available;
+	uint8_t		pad[3];
+} PsManifestLocationDisk;
+
+typedef struct PsManifestLayerDisk
+{
+	uint64_t	layer_id;
+	uint32_t	kind;
+	uint32_t	timeline;
+	PsManifestKeyDisk start_key;
+	PsManifestKeyDisk end_key;
+	uint32_t	start_block;
+	uint32_t	end_block;
+	uint64_t	lsn_start;
+	uint64_t	lsn_end;
+	uint32_t	location_count;
+	PsManifestLocationDisk locations[PS_LAYER_MAX_LOCATIONS];
+	uint64_t	created_at_lsn;
+	uint64_t	remote_uploaded_lsn;
+	uint8_t		remote_durable;
+	uint8_t		local_pinned;
+	uint8_t		deleting;
+	uint8_t		pad;
+} PsManifestLayerDisk;
 
 static char manifest_path[4096];
 static char manifest_dir[2048];
@@ -113,6 +153,92 @@ manifest_layer_desc_valid(const PsLayerDesc *desc)
 }
 
 static void
+manifest_encode_key(PsManifestKeyDisk *dst, const PsKey *src)
+{
+	dst->spcOid = src->spcOid;
+	dst->dbOid = src->dbOid;
+	dst->relNumber = src->relNumber;
+	dst->forkNum = src->forkNum;
+}
+
+static void
+manifest_decode_key(PsKey *dst, const PsManifestKeyDisk *src)
+{
+	dst->spcOid = src->spcOid;
+	dst->dbOid = src->dbOid;
+	dst->relNumber = src->relNumber;
+	dst->forkNum = src->forkNum;
+}
+
+static int
+manifest_encode_layer(PsManifestLayerDisk *dst, const PsLayerDesc *src)
+{
+	if (!manifest_layer_desc_valid(src))
+		return -1;
+	memset(dst, 0, sizeof(*dst));
+	dst->layer_id = src->layer_id;
+	dst->kind = (uint32_t) src->kind;
+	dst->timeline = src->timeline;
+	manifest_encode_key(&dst->start_key, &src->start_key);
+	manifest_encode_key(&dst->end_key, &src->end_key);
+	dst->start_block = src->start_block;
+	dst->end_block = src->end_block;
+	dst->lsn_start = src->lsn_start;
+	dst->lsn_end = src->lsn_end;
+	dst->location_count = src->location_count;
+	for (uint32_t i = 0; i < src->location_count; i++)
+	{
+		dst->locations[i].tier = (uint32_t) src->locations[i].tier;
+		memcpy(dst->locations[i].uri, src->locations[i].uri,
+			   sizeof(dst->locations[i].uri));
+		dst->locations[i].uri[PS_LAYER_URI_MAX - 1] = '\0';
+		dst->locations[i].size = src->locations[i].size;
+		dst->locations[i].generation = src->locations[i].generation;
+		dst->locations[i].available = src->locations[i].available ? 1 : 0;
+	}
+	dst->created_at_lsn = src->created_at_lsn;
+	dst->remote_uploaded_lsn = src->remote_uploaded_lsn;
+	dst->remote_durable = src->remote_durable ? 1 : 0;
+	dst->local_pinned = src->local_pinned ? 1 : 0;
+	dst->deleting = src->deleting ? 1 : 0;
+	return 0;
+}
+
+static int
+manifest_decode_layer(PsLayerDesc *dst, const PsManifestLayerDisk *src)
+{
+	if (src->location_count > PS_LAYER_MAX_LOCATIONS)
+		return -1;
+	memset(dst, 0, sizeof(*dst));
+	dst->layer_id = src->layer_id;
+	dst->kind = (PsLayerKind) src->kind;
+	dst->timeline = src->timeline;
+	manifest_decode_key(&dst->start_key, &src->start_key);
+	manifest_decode_key(&dst->end_key, &src->end_key);
+	dst->start_block = src->start_block;
+	dst->end_block = src->end_block;
+	dst->lsn_start = src->lsn_start;
+	dst->lsn_end = src->lsn_end;
+	dst->location_count = src->location_count;
+	for (uint32_t i = 0; i < src->location_count; i++)
+	{
+		dst->locations[i].tier = (PsLayerTier) src->locations[i].tier;
+		memcpy(dst->locations[i].uri, src->locations[i].uri,
+			   sizeof(dst->locations[i].uri));
+		dst->locations[i].uri[PS_LAYER_URI_MAX - 1] = '\0';
+		dst->locations[i].size = src->locations[i].size;
+		dst->locations[i].generation = src->locations[i].generation;
+		dst->locations[i].available = src->locations[i].available != 0;
+	}
+	dst->created_at_lsn = src->created_at_lsn;
+	dst->remote_uploaded_lsn = src->remote_uploaded_lsn;
+	dst->remote_durable = src->remote_durable != 0;
+	dst->local_pinned = src->local_pinned != 0;
+	dst->deleting = src->deleting != 0;
+	return 0;
+}
+
+static void
 manifest_remove_from_map(PsLayerMap *map, uint64_t layer_id)
 {
 	for (uint32_t i = 0; i < map->nlayers; i++)
@@ -156,6 +282,8 @@ ps_manifest_replay(PsLayerMap *map)
 	int			fd;
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
+	off_t		file_size;
+	struct stat st;
 
 	fd = open(manifest_path, O_RDWR);
 	if (fd < 0)
@@ -164,6 +292,12 @@ ps_manifest_replay(PsLayerMap *map)
 			return 0;
 		return -1;
 	}
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	file_size = st.st_size;
 
 	for (;;)
 	{
@@ -183,6 +317,12 @@ ps_manifest_replay(PsLayerMap *map)
 		if (rec.magic != PS_MANIFEST_MAGIC ||
 			rec.version != PS_MANIFEST_VERSION)
 		{
+			if (rec_off + (off_t) sizeof(rec) >= file_size)
+			{
+				truncate_tail = 1;
+				good_off = rec_off;
+				break;			/* invalid torn tail header */
+			}
 			close(fd);
 			return -1;
 		}
@@ -191,22 +331,23 @@ ps_manifest_replay(PsLayerMap *map)
 		{
 			case PS_MANIFEST_ADD_LAYER:
 				{
+					PsManifestLayerDisk disk;
 					PsLayerDesc desc;
 					ssize_t		nread;
 
-					if (rec.len != sizeof(desc))
+					if (rec.len != sizeof(disk))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &desc, sizeof(desc));
-					if (nread != (ssize_t) sizeof(desc))
+					nread = read(fd, &disk, sizeof(disk));
+					if (nread != (ssize_t) sizeof(disk))
 					{
 						truncate_tail = 1;
 						good_off = rec_off;
 						goto done;	/* torn tail */
 					}
-					if (!manifest_layer_desc_valid(&desc) ||
+					if (manifest_decode_layer(&desc, &disk) != 0 ||
 						(!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
 					{
@@ -345,11 +486,17 @@ done:
 int
 ps_manifest_add_layer(const PsLayerDesc *desc)
 {
+	PsManifestLayerDisk disk;
+
 	if (!manifest_layer_desc_valid(desc))
 		return -1;
 	if (manifest_layer_exists(&ps_layer_map, desc->layer_id))
 		return 0;
-	if (manifest_append(PS_MANIFEST_ADD_LAYER, desc, sizeof(*desc)) != 0)
+	if (ps_layer_map_reserve(&ps_layer_map, ps_layer_map_count(&ps_layer_map) + 1) != 0)
+		return -1;
+	if (manifest_encode_layer(&disk, desc) != 0)
+		return -1;
+	if (manifest_append(PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
 		return -1;
 	return ps_layer_map_add(&ps_layer_map, desc);
 }
