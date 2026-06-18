@@ -222,4 +222,39 @@ extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 								   uint64_t hi_lsn, PsDeltaOut *outs,
 								   uint32_t cap, uint32_t *n);
 
+/* ---------------------------------------------------------------------------
+ * Read plan (phase 7b): how to reconstruct (key, block) as of read_lsn from the
+ * layers -- the newest image-layer version <= read_lsn (the base) plus every
+ * delta in (base_lsn, read_lsn], in ascending LSN order.  The redo helper (7c)
+ * applies the deltas onto the base; if there are no deltas the base *is* the
+ * page.  Payloads are materialized into the plan so the consumer needs no layer
+ * access.  Single timeline for now (branch ancestry is a follow-up).
+ * ------------------------------------------------------------------------- */
+typedef struct PsPlanDelta
+{
+	uint64_t	lsn;
+	uint32_t	len;
+	unsigned char *bytes;		/* malloc'd payload */
+} PsPlanDelta;
+
+typedef struct PsReadPlan
+{
+	int			has_base;
+	uint64_t	base_lsn;
+	unsigned char *base;		/* malloc'd page_size, or NULL if no base */
+	PsPlanDelta *deltas;		/* malloc'd, ascending lsn */
+	uint32_t	ndelta;
+} PsReadPlan;
+
+/*
+ * Build the read plan for (timeline, key, block) as of read_lsn from 'map'.
+ * Returns 0 on success (plan filled; plan->has_base may be 0 if no image covers
+ * it), -1 on a read/format error.  Free with ps_read_plan_free.
+ */
+extern int	ps_read_plan_build(const PsLayerMap *map, uint32_t timeline,
+							   const PsKey *key, uint32_t block,
+							   uint64_t read_lsn, uint32_t page_size,
+							   PsReadPlan *plan);
+extern void ps_read_plan_free(PsReadPlan *plan);
+
 #endif							/* PAGESTORE_LAYER_H */
