@@ -397,6 +397,9 @@ state and retention rules permit deletion.
 
 ## Sharding model
 
+See `SHARDING.md` for the detailed shard-by-key design, shared-state handling,
+client-side routing, and the behavior-preserving migration plan.
+
 Later multi-core implementation should shard by logical key:
 
 ```mermaid
