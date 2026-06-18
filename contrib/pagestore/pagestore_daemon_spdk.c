@@ -31,6 +31,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "pagestore_pgcache.h"
 #include "storage_spdk.h"
 
 /* most page reads a single request can carry (nblocks * page_size <= io_unit) */
@@ -45,23 +46,39 @@ on_signal(int sig)
 	stop_requested = 1;
 }
 
+/* per-block context for one async page read: lets the completion populate the
+ * materialized-page cache and find its parent request */
+typedef struct BlkCtx
+{
+	struct ReqState *rs;
+	uint32_t	tl;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	unsigned char *dst;
+} BlkCtx;
+
 /* per-channel in-flight read request */
 typedef struct ReqState
 {
 	PsChannel  *ch;
 	int			active;			/* a read request is in flight on this channel */
 	int			pending;		/* page reads not yet completed */
+	BlkCtx		blk[MAX_BLOCKS];	/* one per submitted (cache-missed) read */
 } ReqState;
 
 static ReqState reqstate[PS_MAX_CHANNELS];
 
-/* one page read finished; when the last of a request lands, publish the reply */
+/* one page read finished: cache the page, and when the last of a request lands
+ * publish the reply */
 static void
 read_done(void *arg, int ok)
 {
-	ReqState   *rs = arg;
+	BlkCtx	   *bc = arg;
+	ReqState   *rs = bc->rs;
 
-	(void) ok;					/* the engine already delivered/zeroed the page */
+	if (ok)						/* the engine delivered the page into bc->dst */
+		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
 	if (--rs->pending == 0)
 	{
 		rs->active = 0;			/* clear before publishing DONE */
@@ -117,7 +134,6 @@ begin(uint32_t i, PsChannel *ch)
 
 		case PS_OP_READV:
 			{
-				PageVer    *locs[MAX_BLOCKS];
 				uint32_t	nb = ch->nblocks;
 				ReqState   *rs = &reqstate[i];
 
@@ -129,31 +145,39 @@ begin(uint32_t i, PsChannel *ch)
 				}
 				rs->ch = ch;
 				rs->pending = 0;
-				for (uint32_t b = 0; b < nb; b++)
-				{
-					locs[b] = read_through(tl, &ch->key, ch->blocknum + b,
-										   UINT64_MAX);
-					if (locs[b])
-						rs->pending++;
-				}
-				if (rs->pending == 0)	/* all unwritten -> zeros */
-				{
-					memset(ch->data, 0, (size_t) nb * page_size);
-					ps_store_release(&ch->state, PS_STATE_DONE);
-					return;
-				}
 				rs->active = 1;
+				/* completions only fire from ps_spdk_poll() (the main loop), not
+				 * during submit, so incrementing pending as we go is safe */
 				for (uint32_t b = 0; b < nb; b++)
 				{
 					unsigned char *dst = ch->data + (size_t) b * page_size;
+					uint32_t	blk = ch->blocknum + b;
+					PageVer    *v = read_through(tl, &ch->key, blk, UINT64_MAX);
+					BlkCtx	   *bc;
 
-					if (!locs[b])
-						memset(dst, 0, page_size);
-					else
-						ps_spdk_read_async(locs[b]->seg, locs[b]->off, dst,
-										   page_size, read_done, rs);
+					if (!v)
+					{
+						memset(dst, 0, page_size);	/* unwritten -> zeros */
+						continue;
+					}
+					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
+						continue;	/* RAM hit -> no device read */
+					bc = &rs->blk[rs->pending++];
+					bc->rs = rs;
+					bc->tl = tl;
+					bc->key = ch->key;
+					bc->block = blk;
+					bc->lsn = v->lsn;
+					bc->dst = dst;
+					ps_spdk_read_async(v->seg, v->off, dst, page_size,
+									   read_done, bc);
 				}
-				return;			/* DONE published by read_done */
+				if (rs->pending == 0)	/* all cached or unwritten */
+				{
+					rs->active = 0;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+				}
+				return;			/* DONE published by read_done otherwise */
 			}
 
 		case PS_OP_READ_AT:
@@ -161,6 +185,7 @@ begin(uint32_t i, PsChannel *ch)
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
 											 ch->req_lsn);
 				ReqState   *rs = &reqstate[i];
+				BlkCtx	   *bc;
 
 				if (!v)
 				{
@@ -168,11 +193,24 @@ begin(uint32_t i, PsChannel *ch)
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
+				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
+									  ch->data))
+				{
+					ps_store_release(&ch->state, PS_STATE_DONE);	/* RAM hit */
+					return;
+				}
 				rs->ch = ch;
 				rs->pending = 1;
 				rs->active = 1;
+				bc = &rs->blk[0];
+				bc->rs = rs;
+				bc->tl = tl;
+				bc->key = ch->key;
+				bc->block = ch->blocknum;
+				bc->lsn = v->lsn;
+				bc->dst = ch->data;
 				ps_spdk_read_async(v->seg, v->off, ch->data, page_size,
-								   read_done, rs);
+								   read_done, bc);
 				return;
 			}
 
@@ -308,7 +346,16 @@ main(int argc, char **argv)
 		}
 	}
 
-	fprintf(stderr, "pagestore_daemon_spdk: shutting down\n");
+	{
+		uint64_t	ch,
+					cm,
+					ce;
+
+		ps_pgcache_stats(&ch, &cm, &ce);
+		fprintf(stderr, "pagestore_daemon_spdk: shutting down (pgcache hit=%llu "
+				"miss=%llu evict=%llu)\n", (unsigned long long) ch,
+				(unsigned long long) cm, (unsigned long long) ce);
+	}
 	ps_core_close();			/* flush the memtable into a layer before detaching */
 	ps_storage->close();
 	munmap(shm, PS_SHM_SIZE);
