@@ -243,6 +243,7 @@ main(int argc, char **argv)
 				(unsigned long long) rm, (unsigned long long) rl,
 				(unsigned long long) rs);
 	}
+	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }
