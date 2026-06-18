@@ -75,19 +75,19 @@ main(void)
 	check(d.lsn_start == 100 && d.lsn_end == 300, "layer lsn range");
 
 	/* newest version <= read_lsn */
-	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz);
+	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL);
 	check(r == 1 && out[0] == 0xA2, "(5,0)@<=250 -> version 200");
-	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz);
+	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL);
 	check(r == 1 && out[0] == 0xA3, "(5,0)@<=1000 -> version 300");
-	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz);
+	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL);
 	check(r == 1 && out[0] == 0xA1, "(5,0)@<=100 -> version 100 (exact)");
-	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz);
+	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz, NULL);
 	check(r == 0, "(5,0)@<=50 -> no version (older than oldest)");
-	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz);
+	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz, NULL);
 	check(r == 1 && out[0] == 0xB1, "(5,1) -> version 150");
-	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz);
+	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL);
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
-	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz);
+	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
 	check(r == 0, "absent key -> no version");
 
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
