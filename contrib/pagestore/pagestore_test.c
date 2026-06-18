@@ -498,7 +498,7 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
 			  "--page-size", psbuf, "--segment-size", "65536",
-			  "--flush-pages", "8", (char *) NULL);
+			  "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}

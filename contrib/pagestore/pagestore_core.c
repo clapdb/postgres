@@ -41,6 +41,7 @@
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
 int			flush_pages = 256;	/* memtable flush threshold (pages) */
+int			compact_layers = 8;	/* compact a timeline past this many image layers */
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -98,6 +99,171 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
 	return ps_manifest_add_layer(desc);
+}
+
+/* ===================== compaction & GC (LSM phase 3) =================== */
+
+static uint32_t
+count_image_layers(uint32_t timeline)
+{
+	uint32_t	c = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
+			c++;
+	}
+	return c;
+}
+
+/*
+ * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
+ * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
+ * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
+ */
+static void
+gc_resume(void)
+{
+	PsLayerDesc *dead;
+	uint32_t	m = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].deleting)
+			m++;
+	if (m == 0)
+		return;
+	dead = malloc((size_t) m * sizeof(PsLayerDesc));
+	if (!dead)
+		return;
+	m = 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].deleting)
+			dead[m++] = ps_layer_map.layers[i];
+	for (uint32_t k = 0; k < m; k++)
+	{
+		ps_layer_store->delete_local_layer(&dead[k]);
+		ps_manifest_remove_layer(dead[k].layer_id);
+	}
+	free(dead);
+}
+
+/*
+ * Merge all of a timeline's image layers into one fresh layer (bounding the
+ * layer count and the per-read layer scan), then GC the merged-away layers.
+ * Install-new-before-delete-old: the new layer is written and recorded durably
+ * before any old layer is marked for deletion, so a crash at any point leaves
+ * the data readable and GC resumable.  Keeps every version (dedup-free: each
+ * version lives in exactly one source layer); version-level GC by retained-LSN
+ * horizon is a later step.
+ */
+static int
+compact_timeline(uint32_t timeline)
+{
+	PsLayerDesc *old;
+	uint32_t	nold = count_image_layers(timeline);
+	PsImgRec   *recs = NULL;
+	unsigned char **pages = NULL;
+	uint32_t	nrec = 0,
+				cap = 0;
+	uint64_t	nid;
+	PsLayerDesc newdesc;
+	int			rc = -1;
+
+	if (nold < 2)
+		return 0;				/* nothing worth merging */
+
+	old = malloc((size_t) nold * sizeof(PsLayerDesc));
+	if (!old)
+		return -1;
+	nold = 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
+			old[nold++] = *d;
+	}
+
+	/* gather every version (page bytes) from the old layers */
+	for (uint32_t k = 0; k < nold; k++)
+	{
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+
+		if (ps_image_layer_read_index(&old[k], &idx, &n) != 0)
+			goto cleanup;
+		for (uint32_t j = 0; j < n; j++)
+		{
+			unsigned char *pg;
+
+			if (nrec == cap)
+			{
+				uint32_t	nc = cap ? cap * 2 : 256;
+				PsImgRec   *nr = realloc(recs, (size_t) nc * sizeof(PsImgRec));
+				unsigned char **np = realloc(pages, (size_t) nc * sizeof(*pages));
+
+				if (!nr || !np)
+				{
+					free(nr ? nr : recs);
+					free(np ? np : pages);
+					recs = NULL;
+					pages = NULL;
+					free(idx);
+					goto cleanup;
+				}
+				recs = nr;
+				pages = np;
+				cap = nc;
+			}
+			pg = malloc(page_size);
+			if (!pg || ps_layer_store->read_layer_block(&old[k], idx[j].data_off,
+														pg, page_size) != 0)
+			{
+				free(pg);
+				free(idx);
+				goto cleanup;
+			}
+			recs[nrec].key = idx[j].key;
+			recs[nrec].block = idx[j].block;
+			recs[nrec].lsn = idx[j].lsn;
+			recs[nrec].page = pg;
+			pages[nrec] = pg;
+			nrec++;
+		}
+		free(idx);
+	}
+	if (nrec == 0)
+		goto cleanup;
+
+	/* install the new merged layer durably, THEN delete the old ones */
+	nid = alloc_layer_id(NULL);
+	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
+							 &newdesc) != 0 || record_layer(NULL, &newdesc) != 0)
+		goto cleanup;
+	for (uint32_t k = 0; k < nold; k++)
+	{
+		ps_manifest_mark_delete(old[k].layer_id);
+		ps_layer_store->delete_local_layer(&old[k]);
+		ps_manifest_remove_layer(old[k].layer_id);
+	}
+	rc = 0;
+
+cleanup:
+	for (uint32_t j = 0; j < nrec; j++)
+		free(pages[j]);
+	free(recs);
+	free(pages);
+	free(old);
+	return rc;
+}
+
+static void
+maybe_compact(uint32_t timeline)
+{
+	if (count_image_layers(timeline) > (uint32_t) compact_layers)
+		compact_timeline(timeline);
 }
 
 /* ===================== segment storage (log-structured) ================= */
@@ -757,7 +923,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		ps_memtable_put(g_memtable, timeline, key, block, hdr.lsn, page);
 		if (ps_memtable_full(g_memtable))
+		{
 			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
+			maybe_compact(timeline);	/* bound the image-layer count */
+		}
 	}
 	return 0;
 }
@@ -1058,6 +1227,8 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
+	if (use_layers)
+		gc_resume();			/* finish any GC interrupted by a crash */
 
 	/* layer ids continue past the highest one the manifest restored */
 	g_next_layer_id = 1;
@@ -1065,9 +1236,14 @@ ps_core_open(const char *store_dir)
 		if (ps_layer_map.layers[i].layer_id >= g_next_layer_id)
 			g_next_layer_id = ps_layer_map.layers[i].layer_id + 1;
 
-	g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
-	if (!g_memtable)
-		return -1;
+	/* the LSM write side (memtable/flush/compaction) runs only when layers are
+	 * the read path; the SPDK daemon stays on the segment path for now */
+	if (use_layers)
+	{
+		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
+		if (!g_memtable)
+			return -1;
+	}
 	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
 			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
 			(unsigned long long) g_next_layer_id);
