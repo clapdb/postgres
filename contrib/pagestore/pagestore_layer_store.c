@@ -74,8 +74,18 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 static int
 local_seal_local_layer(uint64_t layer_id)
 {
-	(void) layer_id;
-	return 0;
+	char		path[4096];
+	int			fd;
+	int			rc;
+
+	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
 }
 
 static int
