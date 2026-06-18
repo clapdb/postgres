@@ -253,6 +253,174 @@ out:
 	return rc;
 }
 
+/* ===================== delta layer file format ========================= */
+
+typedef struct DeltaSort
+{
+	PsDeltaIndexEnt ent;
+	uint32_t	src;
+} DeltaSort;
+
+static int
+delta_sort_cmp(const void *pa, const void *pb)
+{
+	const DeltaSort *a = pa;
+	const DeltaSort *b = pb;
+	int			c = key_cmp(&a->ent.key, &b->ent.key);
+
+	if (c)
+		return c;
+	if (a->ent.block != b->ent.block)
+		return a->ent.block < b->ent.block ? -1 : 1;
+	if (a->ent.lsn != b->ent.lsn)
+		return a->ent.lsn < b->ent.lsn ? -1 : 1;
+	return 0;
+}
+
+int
+ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
+					 const PsDeltaRec *recs, uint32_t n, PsLayerDesc *out)
+{
+	DeltaSort  *sorted;
+	char	   *filebuf;
+	char	   *idxsec;
+	PsDeltaFooter foot;
+	uint64_t	data_bytes = 0;
+	uint64_t	idx_bytes = (uint64_t) n * sizeof(PsDeltaIndexEnt);
+	uint64_t	total;
+	uint64_t	off;
+	char		uri[PS_LAYER_URI_MAX];
+	int			rc = -1;
+
+	if (n == 0)
+		return -1;
+	for (uint32_t i = 0; i < n; i++)
+		data_bytes += recs[i].delta_len;
+	total = data_bytes + idx_bytes + sizeof(PsDeltaFooter);
+
+	sorted = malloc((size_t) n * sizeof(DeltaSort));
+	filebuf = malloc((size_t) total);
+	if (!sorted || !filebuf)
+		goto out;
+
+	for (uint32_t i = 0; i < n; i++)
+	{
+		sorted[i].ent.key = recs[i].key;
+		sorted[i].ent.block = recs[i].block;
+		sorted[i].ent.lsn = recs[i].lsn;
+		sorted[i].ent.data_len = recs[i].delta_len;
+		sorted[i].src = i;
+	}
+	qsort(sorted, n, sizeof(DeltaSort), delta_sort_cmp);
+
+	off = 0;
+	for (uint32_t i = 0; i < n; i++)
+	{
+		sorted[i].ent.data_off = off;
+		memcpy(filebuf + off, recs[sorted[i].src].delta, sorted[i].ent.data_len);
+		off += sorted[i].ent.data_len;
+	}
+	idxsec = filebuf + data_bytes;
+	for (uint32_t i = 0; i < n; i++)
+		memcpy(idxsec + (size_t) i * sizeof(PsDeltaIndexEnt), &sorted[i].ent,
+			   sizeof(PsDeltaIndexEnt));
+	memset(&foot, 0, sizeof(foot));
+	foot.magic = PS_DELTA_MAGIC;
+	foot.version = PS_DELTA_VERSION;
+	foot.nrecs = n;
+	foot.index_off = data_bytes;
+	foot.data_crc = img_crc(filebuf, (size_t) data_bytes);
+	foot.index_crc = img_crc(idxsec, (size_t) idx_bytes);
+	memcpy(filebuf + data_bytes + idx_bytes, &foot, sizeof(foot));
+
+	if (ps_layer_store->create_local_layer(layer_id, uri, sizeof(uri)) != 0)
+		goto out;
+	if (ps_layer_store->write_local_layer(layer_id, filebuf, total) != 0 ||
+		ps_layer_store->seal_local_layer(layer_id) != 0)
+		goto out;
+
+	memset(out, 0, sizeof(*out));
+	out->layer_id = layer_id;
+	out->kind = PS_LAYER_DELTA;
+	out->timeline = timeline;
+	out->start_key = sorted[0].ent.key;
+	out->end_key = sorted[n - 1].ent.key;
+	out->start_block = sorted[0].ent.block;
+	out->end_block = sorted[n - 1].ent.block;
+	out->lsn_start = sorted[0].ent.lsn;
+	out->lsn_end = sorted[0].ent.lsn;
+	for (uint32_t i = 0; i < n; i++)
+	{
+		if (sorted[i].ent.lsn < out->lsn_start)
+			out->lsn_start = sorted[i].ent.lsn;
+		if (sorted[i].ent.lsn > out->lsn_end)
+			out->lsn_end = sorted[i].ent.lsn;
+		if (sorted[i].ent.block < out->start_block)
+			out->start_block = sorted[i].ent.block;
+		if (sorted[i].ent.block > out->end_block)
+			out->end_block = sorted[i].ent.block;
+	}
+	out->created_at_lsn = out->lsn_end;
+	out->location_count = 1;
+	out->locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+	out->locations[0].size = total;
+	out->locations[0].available = true;
+	snprintf(out->locations[0].uri, sizeof(out->locations[0].uri), "%s", uri);
+	rc = 0;
+
+out:
+	free(sorted);
+	free(filebuf);
+	return rc;
+}
+
+int
+ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
+					   uint32_t block, uint64_t lo_lsn, uint64_t hi_lsn,
+					   PsDeltaOut *outs, uint32_t cap, uint32_t *n)
+{
+	const PsLayerLocation *loc = img_local_loc(layer);
+	PsDeltaFooter foot;
+	PsDeltaIndexEnt *idx;
+	uint64_t	idx_bytes;
+	int			rc = -1;
+
+	if (!loc || loc->size < sizeof(PsDeltaFooter))
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
+										 &foot, sizeof(foot)) != 0)
+		return -1;
+	if (foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
+		foot.nrecs == 0)
+		return -1;
+	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
+	idx = malloc((size_t) idx_bytes);
+	if (!idx)
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
+										 (uint32_t) idx_bytes) != 0 ||
+		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
+		goto out;
+
+	/* index is sorted by (key, block, lsn): matches are contiguous + ascending */
+	for (uint32_t i = 0; i < foot.nrecs && *n < cap; i++)
+	{
+		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
+			continue;
+		if (idx[i].lsn <= lo_lsn || idx[i].lsn > hi_lsn)
+			continue;
+		outs[*n].lsn = idx[i].lsn;
+		outs[*n].data_off = (uint32_t) idx[i].data_off;
+		outs[*n].data_len = idx[i].data_len;
+		(*n)++;
+	}
+	rc = 0;
+
+out:
+	free(idx);
+	return rc;
+}
+
 int
 ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 						  uint32_t *n)

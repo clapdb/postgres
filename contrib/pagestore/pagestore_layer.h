@@ -156,4 +156,75 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
  * read page bytes directly (compaction) validate them against idx[].crc. */
 extern uint32_t ps_image_page_crc(const void *page, uint32_t len);
 
+/* ---------------------------------------------------------------------------
+ * Delta layer file format (phase 7).
+ *
+ * A delta layer is an immutable file holding redo inputs (WAL records / page
+ * deltas) keyed by (key, block, record_lsn), variable length:
+ *     [ delta payloads, back to back ]
+ *     [ index : nrecs * PsDeltaIndexEnt, sorted by (key, block, lsn) ]
+ *     [ footer : PsDeltaFooter ]
+ * A read applies the deltas of (key, block) in ascending LSN order on top of a
+ * base image (an image layer) to reconstruct the page as of read_lsn.  The redo
+ * itself (rm_redo on a held page) is the wal-redo helper -- this format just
+ * stores and serves the ordered deltas.
+ * ------------------------------------------------------------------------- */
+#define PS_DELTA_MAGIC		0x544c4450	/* "PDLT" */
+#define PS_DELTA_VERSION	1
+
+typedef struct PsDeltaIndexEnt
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;			/* record LSN of this delta */
+	uint64_t	data_off;		/* byte offset of the payload in the file */
+	uint32_t	data_len;		/* payload length */
+} PsDeltaIndexEnt;
+
+typedef struct PsDeltaFooter
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	nrecs;
+	uint32_t	_pad;
+	uint64_t	index_off;		/* == payload section size */
+	uint32_t	data_crc;
+	uint32_t	index_crc;
+} PsDeltaFooter;
+
+/* One delta (redo input) to write into a delta layer. */
+typedef struct PsDeltaRec
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	const void *delta;
+	uint32_t	delta_len;
+} PsDeltaRec;
+
+/* A delta read back from a layer (payload pointer is into a caller-freed buf). */
+typedef struct PsDeltaOut
+{
+	uint64_t	lsn;
+	uint32_t	data_off;
+	uint32_t	data_len;
+} PsDeltaOut;
+
+/* Write 'n' deltas into delta layer 'layer_id', seal it, fill *out. */
+extern int	ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
+								 const PsDeltaRec *recs, uint32_t n,
+								 PsLayerDesc *out);
+
+/*
+ * Collect the deltas of (key, block) with lo_lsn < lsn <= hi_lsn from delta
+ * layer 'layer', in ascending LSN order.  Appends up to *cap entries to outs
+ * (each describing offset+len of the payload within the layer) and updates *n;
+ * call ps_layer_store read_layer_block at (data_off,data_len) to fetch a
+ * payload.  Returns 0 on success, -1 on read/format error.
+ */
+extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
+								   uint32_t block, uint64_t lo_lsn,
+								   uint64_t hi_lsn, PsDeltaOut *outs,
+								   uint32_t cap, uint32_t *n);
+
 #endif							/* PAGESTORE_LAYER_H */
