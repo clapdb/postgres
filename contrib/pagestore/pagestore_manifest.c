@@ -101,6 +101,12 @@ manifest_find_layer(PsLayerMap *map, uint64_t layer_id)
 }
 
 static int
+manifest_layer_exists(PsLayerMap *map, uint64_t layer_id)
+{
+	return manifest_find_layer(map, layer_id) != NULL;
+}
+
+static int
 manifest_layer_desc_valid(const PsLayerDesc *desc)
 {
 	return desc->location_count <= PS_LAYER_MAX_LOCATIONS;
@@ -201,7 +207,8 @@ ps_manifest_replay(PsLayerMap *map)
 						goto done;	/* torn tail */
 					}
 					if (!manifest_layer_desc_valid(&desc) ||
-						ps_layer_map_add(map, &desc) != 0)
+						(!manifest_layer_exists(map, desc.layer_id) &&
+						 ps_layer_map_add(map, &desc) != 0))
 					{
 						close(fd);
 						return -1;
@@ -340,6 +347,8 @@ ps_manifest_add_layer(const PsLayerDesc *desc)
 {
 	if (!manifest_layer_desc_valid(desc))
 		return -1;
+	if (manifest_layer_exists(&ps_layer_map, desc->layer_id))
+		return 0;
 	if (manifest_append(PS_MANIFEST_ADD_LAYER, desc, sizeof(*desc)) != 0)
 		return -1;
 	return ps_layer_map_add(&ps_layer_map, desc);
