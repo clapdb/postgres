@@ -1258,8 +1258,10 @@ ps_core_open(const char *store_dir)
 		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
 		if (!g_memtable)
 			return -1;
-		ps_pgcache_init((uint32_t) cache_pages, page_size);
 	}
+	/* the materialized-page cache helps both read paths (read_resolve and the
+	 * SPDK async path), so it is not gated on use_layers */
+	ps_pgcache_init((uint32_t) cache_pages, page_size);
 	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
 			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
 			(unsigned long long) g_next_layer_id);
