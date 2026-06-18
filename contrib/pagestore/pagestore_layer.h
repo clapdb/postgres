@@ -17,6 +17,7 @@
 
 #include "pagestore_ipc.h"
 
+#define PS_LAYER_MAX_LOCATIONS	3
 #define PS_LAYER_URI_MAX	512
 
 typedef enum PsLayerKind
@@ -56,7 +57,7 @@ typedef struct PsLayerDesc
 	uint64_t	lsn_end;
 
 	uint32_t	location_count;
-	PsLayerLocation locations[3];
+	PsLayerLocation locations[PS_LAYER_MAX_LOCATIONS];
 
 	uint64_t	created_at_lsn;
 	uint64_t	remote_uploaded_lsn;
