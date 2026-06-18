@@ -154,6 +154,7 @@ static int
 local_delete_local_layer(const PsLayerDesc *layer)
 {
 	int			rc = 0;
+	int			unlinked = 0;
 	uint32_t	nlocs;
 
 	nlocs = layer->location_count;
@@ -168,8 +169,12 @@ local_delete_local_layer(const PsLayerDesc *layer)
 		{
 			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
 				rc = -1;
+			else
+				unlinked = 1;
 		}
 	}
+	if (unlinked && local_fsync_dir() != 0)
+		rc = -1;
 	return rc;
 }
 

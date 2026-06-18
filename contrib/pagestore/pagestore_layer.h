@@ -75,6 +75,7 @@ typedef struct PsLayerMap
 
 extern void ps_layer_map_init(PsLayerMap *map);
 extern void ps_layer_map_free(PsLayerMap *map);
+extern int	ps_layer_map_reserve(PsLayerMap *map, uint32_t capacity);
 extern int	ps_layer_map_add(PsLayerMap *map, const PsLayerDesc *desc);
 extern uint32_t ps_layer_map_count(const PsLayerMap *map);
 
