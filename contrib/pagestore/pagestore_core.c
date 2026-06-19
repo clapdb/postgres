@@ -201,19 +201,27 @@ compact_timeline(uint32_t timeline)
 			if (nrec == cap)
 			{
 				uint32_t	nc = cap ? cap * 2 : 256;
-				PsImgRec   *nr = realloc(recs, (size_t) nc * sizeof(PsImgRec));
-				unsigned char **np = realloc(pages, (size_t) nc * sizeof(*pages));
+				PsImgRec   *nr;
+				unsigned char **np;
 
-				if (!nr || !np)
+				/* Grow one buffer at a time, committing each on success, so
+				 * 'cleanup' always sees valid recs/pages.  A failed realloc
+				 * leaves the original allocation intact -- never free or NULL it
+				 * here, or cleanup would double-free / deref NULL while leaking
+				 * the page allocations. */
+				nr = realloc(recs, (size_t) nc * sizeof(PsImgRec));
+				if (!nr)
 				{
-					free(nr ? nr : recs);
-					free(np ? np : pages);
-					recs = NULL;
-					pages = NULL;
 					free(idx);
 					goto cleanup;
 				}
 				recs = nr;
+				np = realloc(pages, (size_t) nc * sizeof(*pages));
+				if (!np)
+				{
+					free(idx);
+					goto cleanup;
+				}
 				pages = np;
 				cap = nc;
 			}
