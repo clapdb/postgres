@@ -152,4 +152,8 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 
+/* Per-page checksum (matches the writer's per-page index crc); lets callers that
+ * read page bytes directly (compaction) validate them against idx[].crc. */
+extern uint32_t ps_image_page_crc(const void *page, uint32_t len);
+
 #endif							/* PAGESTORE_LAYER_H */

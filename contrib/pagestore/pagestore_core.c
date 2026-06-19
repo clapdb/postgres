@@ -143,8 +143,10 @@ gc_resume(void)
 			dead[m++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < m; k++)
 	{
-		ps_layer_store->delete_local_layer(&dead[k]);
-		ps_manifest_remove_layer(dead[k].layer_id);
+		/* record removal only once the file is gone; a failed unlink keeps the
+		 * layer 'deleting' for the next gc_resume rather than orphaning it */
+		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
+			ps_manifest_remove_layer(dead[k].layer_id);
 	}
 	free(dead);
 }
@@ -233,6 +235,16 @@ compact_timeline(uint32_t timeline)
 				free(idx);
 				goto cleanup;
 			}
+			/* verify against the per-page index crc -- compaction reads bytes
+			 * directly (bypassing ps_image_layer_lookup's check), so a corrupt
+			 * page must abort the merge, not be laundered into the new layer with
+			 * a fresh checksum */
+			if (ps_image_page_crc(pg, page_size) != idx[j].crc)
+			{
+				free(pg);
+				free(idx);
+				goto cleanup;
+			}
 			recs[nrec].key = idx[j].key;
 			recs[nrec].block = idx[j].block;
 			recs[nrec].lsn = idx[j].lsn;
@@ -259,8 +271,11 @@ compact_timeline(uint32_t timeline)
 		 * finishes the removal on the next start. */
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			continue;
-		ps_layer_store->delete_local_layer(&old[k]);
-		ps_manifest_remove_layer(old[k].layer_id);
+		/* record the removal only after the file is actually gone; if unlink
+		 * fails, leave the layer 'deleting' so gc_resume() retries it instead of
+		 * orphaning the file with a dropped manifest entry */
+		if (ps_layer_store->delete_local_layer(&old[k]) == 0)
+			ps_manifest_remove_layer(old[k].layer_id);
 	}
 	rc = 0;
 

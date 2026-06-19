@@ -76,6 +76,15 @@ img_crc(const void *p, size_t n)
 	return h;
 }
 
+/* Public wrapper so callers that read page bytes directly (compaction) can
+ * verify a page against its per-page index crc, matching what the writer
+ * stored. */
+uint32_t
+ps_image_page_crc(const void *page, uint32_t len)
+{
+	return img_crc(page, len);
+}
+
 static int
 key_cmp(const PsKey *a, const PsKey *b)
 {
@@ -149,6 +158,9 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 	filebuf = malloc((size_t) total);
 	if (!sorted || !filebuf)
 		goto out;
+	/* zero so struct padding isn't persisted (no heap leak to disk/objects, and
+	 * the on-disk index bytes don't depend on compiler padding) */
+	memset(sorted, 0, (size_t) n * sizeof(ImgSort));
 
 	for (uint32_t i = 0; i < n; i++)
 	{
