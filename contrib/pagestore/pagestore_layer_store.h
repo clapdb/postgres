@@ -23,6 +23,9 @@ typedef struct PsLayerStore
 	void		(*close) (void);
 	int			(*create_local_layer) (uint64_t layer_id, char *uri,
 									   uint32_t uri_len);
+	/* append-write the whole sealed contents of a created local layer */
+	int			(*write_local_layer) (uint64_t layer_id, const void *buf,
+									  uint64_t len);
 	int			(*seal_local_layer) (uint64_t layer_id);
 	int			(*read_layer_block) (const PsLayerDesc *layer, uint64_t off,
 									 void *buf, uint32_t len);

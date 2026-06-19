@@ -22,8 +22,8 @@ contrib_targets += pagestore
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
-        'pagestore_layer.c',
-        'pagestore_layer_store.c', 'pagestore_manifest.c'),
+        'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c'),
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
@@ -65,4 +65,15 @@ test('pagestore_standalone',
   depends: [pagestore_daemon],
   suite: ['pagestore'],
   timeout: 120,
+)
+
+# Unit test for the immutable image-layer file format (no daemon, no PG).
+pagestore_layer_test = executable('pagestore_layer_test',
+  files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_layer_store.c'),
+  install: false,
+)
+test('pagestore_layer',
+  pagestore_layer_test,
+  suite: ['pagestore'],
+  timeout: 60,
 )

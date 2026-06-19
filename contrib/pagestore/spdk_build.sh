@@ -39,7 +39,7 @@ cc -O2 -Wall -Wextra -DPAGESTORE_SPDK -I"$here" $cflags \
 	"$here/pagestore_daemon_spdk.c" "$here/pagestore_core.c" \
 	"$here/storage_spdk.c" "$here/storage_posix.c" \
 	"$here/pagestore_layer.c" "$here/pagestore_layer_store.c" \
-	"$here/pagestore_manifest.c" \
+	"$here/pagestore_manifest.c" "$here/pagestore_memtable.c" \
 	$rpath $spdk_libs -lrt
 set +x
 echo "built $out"

@@ -79,28 +79,22 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READV:
-			/* "current" read on this timeline: read-through at max LSN */
+			/* "current" read on this timeline: resolve at max LSN, serving from
+			 * memtable / image layers with a segment fallback */
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				unsigned char *dst = ch->data + (size_t) i * page_size;
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum + i,
-											 UINT64_MAX);
 
-				if (!v || read_version(v, dst) != 0)
+				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst))
 					memset(dst, 0, page_size);	/* unwritten -> zeros */
 			}
 			break;
 
 		case PS_OP_READ_AT:
-			{
-				/* as-of read on this timeline, honoring branch ancestry */
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 ch->req_lsn);
-
-				if (!v || read_version(v, ch->data) != 0)
-					memset(ch->data, 0, page_size);
-				break;
-			}
+			/* as-of read on this timeline, honoring branch ancestry */
+			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+				memset(ch->data, 0, page_size);
+			break;
 
 		default:
 			ch->status = PS_STATUS_ERROR;
@@ -128,6 +122,10 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
+			flush_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
+			compact_layers = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -236,7 +234,18 @@ main(int argc, char **argv)
 		}
 	}
 
-	fprintf(stderr, "pagestore_daemon: shutting down\n");
+	{
+		uint64_t	rm,
+					rl,
+					rs;
+
+		ps_core_read_stats(&rm, &rl, &rs);
+		fprintf(stderr, "pagestore_daemon: shutting down (%u image layers; reads "
+				"mem=%llu layer=%llu seg=%llu)\n", ps_core_layer_count(),
+				(unsigned long long) rm, (unsigned long long) rl,
+				(unsigned long long) rs);
+	}
+	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }

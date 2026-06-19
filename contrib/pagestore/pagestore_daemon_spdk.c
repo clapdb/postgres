@@ -195,6 +195,7 @@ main(int argc, char **argv)
 	const char *pci_addr = NULL;
 
 	ps_storage = &PsStorageSpdk;
+	use_layers = 0;				/* SPDK reads serve by segment offset for now */
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -208,6 +209,10 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
+			flush_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
+			compact_layers = atoi(argv[++i]);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
@@ -302,6 +307,7 @@ main(int argc, char **argv)
 	}
 
 	fprintf(stderr, "pagestore_daemon_spdk: shutting down\n");
+	ps_core_close();			/* flush the memtable into a layer before detaching */
 	ps_storage->close();
 	munmap(shm, PS_SHM_SIZE);
 	return 0;

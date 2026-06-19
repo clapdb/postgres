@@ -35,10 +35,22 @@ typedef struct PageVer
 /* Configuration shared with the frontend; set by the frontend before open. */
 extern uint32_t page_size;
 extern uint64_t segment_size;
+extern int	flush_pages;		/* memtable flush threshold in pages */
+extern int	compact_layers;		/* compact a timeline past this many image layers */
+extern int	use_layers;			/* rebuild read state from layers (vs segments) */
 extern const PsStorage *ps_storage;
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
 extern int	ps_core_open(const char *store_dir);
+
+/* Clean-shutdown: flush the memtable into a layer and close the manifest. */
+extern void ps_core_close(void);
+
+/* Number of image layers currently in the layer map (for stats/diagnostics). */
+extern uint32_t ps_core_layer_count(void);
+
+/* Read-path source counts: served from memtable / image layer / segment. */
+extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 
 /*
  * Handle every request that is NOT page byte I/O and return 1.  The four
@@ -53,6 +65,14 @@ extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);
+
+/*
+ * Resolve a read into out (page_size bytes), serving from memtable / image
+ * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
+ * page is unwritten.
+ */
+extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, unsigned char *out);
 extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
 
 #endif							/* PAGESTORE_CORE_H */
