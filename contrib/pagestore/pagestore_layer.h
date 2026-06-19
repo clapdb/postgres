@@ -239,7 +239,10 @@ extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 /* ---------------------------------------------------------------------------
  * Read plan (phase 7b): how to reconstruct (key, block) as of read_lsn from the
  * layers -- the newest image-layer version <= read_lsn (the base) plus every
- * delta in (base_lsn, read_lsn], in ascending LSN order.  The redo helper (7c)
+ * delta in [base_lsn, read_lsn), in ascending LSN order (half-open: delta keys
+ * are WAL record start-LSNs, and base_lsn is the start of the first record to
+ * apply, so the base's record is included and one starting at read_lsn is not).
+ * The redo helper (7c)
  * applies the deltas onto the base; if there are no deltas the base *is* the
  * page.  Payloads are materialized into the plan so the consumer needs no layer
  * access.  Single timeline for now (branch ancestry is a follow-up).

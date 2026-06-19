@@ -223,6 +223,40 @@ main(void)
 		ps_layer_map_free(&map);
 	}
 
+	/* --- read plan: cross-layer ambiguity + corrupt base both fail the plan --- */
+	{
+		PsLayerDesc a,
+					b;
+		PsLayerMap	map;
+		PsReadPlan	plan;
+		PsImgRec	ra[1] = {{k5, 0, 500, pg[0]}};
+		PsImgRec	rb[1] = {{k5, 0, 500, pg[1]}};	/* same (key,block,lsn) */
+
+		check(ps_image_layer_write(12, 0, ra, 1, psz, &a) == 0, "amb: layer A@500");
+		check(ps_image_layer_write(13, 0, rb, 1, psz, &b) == 0, "amb: layer B@500");
+		ps_layer_map_init(&map);
+		ps_layer_map_add(&map, &a);
+		ps_layer_map_add(&map, &b);
+		/* same page LSN split across two image layers -> ambiguous base -> reject
+		 * (caller would serve from the authoritative segment) */
+		check(ps_read_plan_build(&map, 0, &k5, 0, 600, psz, &plan) == -1,
+			  "cross-layer same-lsn base -> plan rejects (ambiguous)");
+
+		/* a covering image layer that is corrupt must fail the plan, not fall back
+		 * to an older base: corrupt B's page on disk, read at 500 */
+		{
+			int			fd = open(b.locations[0].uri, O_WRONLY);
+			unsigned char bad = 0xFF;
+
+			check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1, "amb: corrupt B page");
+			if (fd >= 0)
+				close(fd);
+			check(ps_read_plan_build(&map, 0, &k5, 0, 600, psz, &plan) == -1,
+				  "corrupt covering base layer -> plan fails (no stale fallback)");
+		}
+		ps_layer_map_free(&map);
+	}
+
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

@@ -481,6 +481,18 @@ plan_delta_cmp(const void *pa, const void *pb)
 	return a < b ? -1 : (a > b ? 1 : 0);
 }
 
+/* order image-base candidates newest-first by their layer LSN range (lsn_end). */
+static int
+img_cand_newest_first(const void *pa, const void *pb)
+{
+	const PsLayerDesc *a = *(const PsLayerDesc *const *) pa;
+	const PsLayerDesc *b = *(const PsLayerDesc *const *) pb;
+
+	if (a->lsn_end != b->lsn_end)
+		return a->lsn_end > b->lsn_end ? -1 : 1;
+	return 0;
+}
+
 void
 ps_read_plan_free(PsReadPlan *plan)
 {
@@ -512,52 +524,100 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	if (!tmp)
 		return -1;
 
-	/* 1. base = newest image-layer version <= read_lsn on this timeline */
-	for (uint32_t i = 0; i < map->nlayers; i++)
+	/* 1. base = newest unambiguous image-layer version <= read_lsn.  Probe
+	 * candidates newest-first (by layer lsn_end) so the freshest base is chosen
+	 * before older layers: a clearly-superseded layer (lsn_end below the base
+	 * found) is then skipped without being read, while a covering layer that could
+	 * still be the base but is corrupt/unavailable fails the plan rather than
+	 * silently selecting an older base (there may be no delta chain that recreates
+	 * the skipped image). */
 	{
-		const PsLayerDesc *d = &map->layers[i];
-		uint64_t	l;
-		int			amb;
-		int			r;
+		const PsLayerDesc **cand = NULL;
+		uint32_t	ncand = 0;
+		int			base_ok = 1;
+		int			base_ambiguous = 0;
 
-		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
-			continue;
-		/* skip an image layer whose metadata cannot hold a version of (key,block)
-		 * at or below read_lsn: an unrelated tiered-out/corrupt layer must not be
-		 * read (and so cannot fail the whole plan), matching the delta scan below */
-		if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0 ||
-			block < d->start_block || block > d->end_block ||
-			d->lsn_start > read_lsn)
-			continue;
-		/* a layer whose newest version is at or below the base we already have can
-		 * only tie or lose, so skip it -- this also means a damaged superseded
-		 * layer can never fail a read that a newer layer already satisfies */
-		if (plan->has_base && d->lsn_end <= plan->base_lsn)
-			continue;
-		r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size, &l,
-								  &amb);
-		if (r < 0)
-			continue;			/* unavailable/corrupt: a newer valid layer (or an
-								 * older base + deltas) can still satisfy the read */
-		/* reject an ambiguous base: when several versions share this page LSN
-		 * (a hint-bit/same-lsn rewrite) the lsn cannot identify the right bytes,
-		 * so do not start materialization from it (the live read path serves such
-		 * pages from the authoritative segment instead) */
-		if (r == 1 && !amb && (!plan->has_base || l > plan->base_lsn))
+		if (map->nlayers)
 		{
-			if (!plan->base)
-				plan->base = malloc(page_size);
-			if (!plan->base)
+			cand = malloc((size_t) map->nlayers * sizeof(*cand));
+			if (!cand)
 				goto out;
-			memcpy(plan->base, tmp, page_size);
-			plan->base_lsn = l;
-			plan->has_base = 1;
 		}
+		for (uint32_t i = 0; i < map->nlayers; i++)
+		{
+			const PsLayerDesc *d = &map->layers[i];
+
+			if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+				d->timeline != timeline)
+				continue;
+			/* skip a layer whose metadata cannot hold a version of (key,block)
+			 * at or below read_lsn (never read it) */
+			if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0 ||
+				block < d->start_block || block > d->end_block ||
+				d->lsn_start > read_lsn)
+				continue;
+			cand[ncand++] = d;
+		}
+		qsort(cand, ncand, sizeof(*cand), img_cand_newest_first);
+		for (uint32_t j = 0; j < ncand; j++)
+		{
+			const PsLayerDesc *d = cand[j];
+			uint64_t	l;
+			int			amb;
+			int			r;
+
+			/* sorted newest-first: once a candidate's whole range is below the
+			 * base already found it cannot beat or tie it, and neither can the
+			 * rest -- stop without reading them */
+			if (plan->has_base && d->lsn_end < plan->base_lsn)
+				break;
+			r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
+									  &l, &amb);
+			if (r < 0)
+			{
+				base_ok = 0;	/* a covering candidate is corrupt/unavailable */
+				break;
+			}
+			if (r != 1)
+				continue;
+			if (amb)			/* several versions share this lsn in one layer */
+			{
+				base_ambiguous = 1;
+				break;
+			}
+			if (!plan->has_base || l > plan->base_lsn)
+			{
+				if (!plan->base)
+					plan->base = malloc(page_size);
+				if (!plan->base)
+				{
+					base_ok = 0;
+					break;
+				}
+				memcpy(plan->base, tmp, page_size);
+				plan->base_lsn = l;
+				plan->has_base = 1;
+			}
+			else if (l == plan->base_lsn)
+			{
+				base_ambiguous = 1;		/* same lsn across two layers */
+				break;
+			}
+		}
+		free(cand);
+		/* an ambiguous base (same-lsn rewrite) or a corrupt covering layer cannot
+		 * be materialized safely; fail so the caller serves from the authoritative
+		 * segment, as read_resolve() does via page_lsn_ambiguous() */
+		if (!base_ok || base_ambiguous)
+			goto out;
 	}
 	lo = plan->has_base ? plan->base_lsn : 0;
 
-	/* 2. deltas in [lo, read_lsn) across this timeline's delta layers */
-	for (uint32_t i = 0; i < map->nlayers; i++)
+	/* 2. deltas in [lo, read_lsn) across this timeline's delta layers.  When the
+	 * base already reaches read_lsn the interval is empty -- skip the scan
+	 * entirely so an irrelevant remote-only/corrupt delta layer at that boundary
+	 * cannot fail a read the base image alone already satisfies. */
+	for (uint32_t i = 0; lo < read_lsn && i < map->nlayers; i++)
 	{
 		const PsLayerDesc *d = &map->layers[i];
 		uint32_t	tn = 0;
