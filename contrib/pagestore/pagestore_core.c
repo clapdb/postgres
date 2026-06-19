@@ -1370,20 +1370,23 @@ ps_core_close(void)
 	 * compact it back under so repeated short-lived runs don't accumulate image
 	 * layers (each of which every read would then scan).  compaction is capped at
 	 * COMPACT_BATCH per call, so loop per timeline until it is under the threshold
-	 * or stops making progress (corrupt layer / ENOSPC). */
-	for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
-	{
-		if (ct != 0 && !timelines[ct].defined)
-			continue;
-		while (count_image_layers(ct) > (uint32_t) compact_layers)
+	 * or stops making progress (corrupt layer / ENOSPC).  Only in the layer mode:
+	 * a segment-path-only daemon (use_layers == 0, e.g. SPDK) has no memtable and
+	 * must stay layer-free, like ps_core_maintenance(). */
+	if (use_layers)
+		for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
 		{
-			uint32_t	before = count_image_layers(ct);
+			if (ct != 0 && !timelines[ct].defined)
+				continue;
+			while (count_image_layers(ct) > (uint32_t) compact_layers)
+			{
+				uint32_t	before = count_image_layers(ct);
 
-			if (compact_timeline(ct) != 0 ||
-				count_image_layers(ct) >= before)
-				break;			/* failed or no progress: stop draining this one */
+				if (compact_timeline(ct) != 0 ||
+					count_image_layers(ct) >= before)
+					break;		/* failed or no progress: stop draining this one */
+			}
 		}
-	}
 	ps_pgcache_free();
 	ps_manifest_close();
 }
