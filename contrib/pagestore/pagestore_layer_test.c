@@ -10,9 +10,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
@@ -89,6 +91,21 @@ main(void)
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
 	check(r == 0, "absent key -> no version");
+
+	/* corrupt a page byte on disk -> lookup must reject it (per-page crc),
+	 * not hand back bad bytes.  (5,0)@100 sorts first, so its page is at off 0. */
+	{
+		int			fd = open(d.locations[0].uri, O_WRONLY);
+		unsigned char bad = 0xFF;
+
+		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1, "corrupt a page byte");
+		if (fd >= 0)
+			close(fd);
+		r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL);
+		check(r == -1, "corrupted page -> lookup rejects (data crc)");
+		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL);
+		check(r == 1 && out[0] == 0xA2, "uncorrupted page still served");
+	}
 
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;

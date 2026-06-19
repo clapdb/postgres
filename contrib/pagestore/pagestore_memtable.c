@@ -180,7 +180,18 @@ ps_memtable_flush(PsMemtable *mt, PsAllocLayerId alloc, PsOnLayer on_layer,
 			on_layer(ctx, &desc) != 0)
 		{
 			free(recs);
-			return -1;			/* partial flush: memtable kept for retry */
+			/* Partial flush: runs [0,i) are already written and recorded in the
+			 * manifest.  Drop them so a retry does not re-emit them as duplicate
+			 * layers; keep the unflushed tail [i,n) for the retry. */
+			for (uint32_t r = 0; r < i; r++)
+				free(mt->ents[r].page);
+			if (i > 0)
+			{
+				memmove(mt->ents, mt->ents + i,
+						(size_t) (mt->n - i) * sizeof(MemEnt));
+				mt->n -= i;
+			}
+			return -1;
 		}
 		free(recs);
 		i = j;
