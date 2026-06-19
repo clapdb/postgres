@@ -114,7 +114,8 @@ main(void)
 			{k5, 0, 300, "D300", 4}, {k5, 0, 100, "D100", 4},
 			{k5, 0, 200, "DD200", 5}, {k5, 1, 150, "E150", 4},
 		};
-		PsDeltaOut	outs[8];
+		PsDeltaOut *outs = NULL;	/* growable: no fixed per-layer chain cap */
+		uint32_t	ocap = 0;
 		uint32_t	dn = 0;
 		unsigned char dbuf[16];
 
@@ -123,7 +124,7 @@ main(void)
 			  dd.lsn_end == 300, "delta layer kind + lsn range");
 
 		/* (5,0) in (100, 300]: expect 200 then 300, ascending; 100 excluded */
-		r = ps_delta_layer_collect(&dd, &k5, 0, 100, 300, outs, 8, &dn);
+		r = ps_delta_layer_collect(&dd, &k5, 0, 100, 300, &outs, &ocap, &dn);
 		check(r == 0 && dn == 2, "delta collect (100,300] -> 2 records");
 		check(outs[0].lsn == 200 && outs[1].lsn == 300, "deltas in ascending LSN");
 		check(ps_layer_store->read_layer_block(&dd, outs[0].data_off, dbuf,
@@ -132,17 +133,24 @@ main(void)
 			  "delta payload readable (200)");
 
 		dn = 0;
-		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, outs, 8, &dn);
+		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, &outs, &ocap, &dn);
 		check(r == 0 && dn == 3, "delta collect (0,1000] -> all 3 of (5,0)");
 		dn = 0;
-		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, outs, 8, &dn);
+		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, &outs, &ocap, &dn);
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
 
-		/* overflow: (5,0) has 3 matches but the cap is 2 -> error, not a silent
-		 * truncated chain */
-		dn = 0;
-		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, outs, 2, &dn);
-		check(r == -1, "delta collect overflow (cap < matches) -> error");
+		/* a small starting buffer must grow to hold all matches (no fixed cap):
+		 * collect into a fresh NULL/0 buffer and expect all 3, not an overflow */
+		{
+			PsDeltaOut *g = NULL;
+			uint32_t	gcap = 0,
+						gn = 0;
+
+			r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, &g, &gcap, &gn);
+			check(r == 0 && gn == 3, "delta collect grows buffer -> all 3 (no cap)");
+			free(g);
+		}
+		free(outs);
 	}
 
 	/* --- read plan: base image + ordered delta chain --- */

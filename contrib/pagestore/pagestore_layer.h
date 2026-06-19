@@ -219,15 +219,17 @@ extern int	ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
 
 /*
  * Collect the deltas of (key, block) with lo_lsn < lsn <= hi_lsn from delta
- * layer 'layer', in ascending LSN order.  Appends up to *cap entries to outs
- * (each describing offset+len of the payload within the layer) and updates *n;
- * call ps_layer_store read_layer_block at (data_off,data_len) to fetch a
+ * layer 'layer', in ascending LSN order, appending to *outs and updating *n.
+ * *outs and *cap are a caller-owned growable buffer (start them NULL and 0; the
+ * callee realloc's as needed and the caller frees *outs); there is no fixed
+ * per-layer chain cap.  Each entry describes offset+len+crc of the payload in the
+ * layer; call ps_layer_store read_layer_block at (data_off,data_len) to fetch a
  * payload.  Returns 0 on success, -1 on read/format error.
  */
 extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 								   uint32_t block, uint64_t lo_lsn,
-								   uint64_t hi_lsn, PsDeltaOut *outs,
-								   uint32_t cap, uint32_t *n);
+								   uint64_t hi_lsn, PsDeltaOut **outs,
+								   uint32_t *cap, uint32_t *n);
 
 /* ---------------------------------------------------------------------------
  * Read plan (phase 7b): how to reconstruct (key, block) as of read_lsn from the

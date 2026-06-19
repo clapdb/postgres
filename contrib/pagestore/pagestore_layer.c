@@ -396,7 +396,7 @@ out:
 int
 ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 					   uint32_t block, uint64_t lo_lsn, uint64_t hi_lsn,
-					   PsDeltaOut *outs, uint32_t cap, uint32_t *n)
+					   PsDeltaOut **outs, uint32_t *cap, uint32_t *n)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsDeltaFooter foot;
@@ -439,12 +439,23 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 		if (idx[i].data_off > foot.index_off ||
 			idx[i].data_len > foot.index_off - idx[i].data_off)
 			goto out;
-		if (*n == cap)
-			goto out;			/* rc stays -1: the chain would be truncated */
-		outs[*n].lsn = idx[i].lsn;
-		outs[*n].data_off = idx[i].data_off;
-		outs[*n].data_len = idx[i].data_len;
-		outs[*n].crc = idx[i].crc;
+		/* grow the output as needed -- no fixed per-layer cap, since a hot page
+		 * can legitimately have many deltas in one sealed layer and the caller's
+		 * plan->deltas is itself growable */
+		if (*n == *cap)
+		{
+			uint32_t	nc = *cap ? *cap * 2 : 16;
+			PsDeltaOut *no = realloc(*outs, (size_t) nc * sizeof(PsDeltaOut));
+
+			if (!no)
+				goto out;
+			*outs = no;
+			*cap = nc;
+		}
+		(*outs)[*n].lsn = idx[i].lsn;
+		(*outs)[*n].data_off = idx[i].data_off;
+		(*outs)[*n].data_len = idx[i].data_len;
+		(*outs)[*n].crc = idx[i].crc;
 		(*n)++;
 	}
 	rc = 0;
@@ -455,9 +466,6 @@ out:
 }
 
 /* ===================== read plan (phase 7b) ============================ */
-
-#define PS_PLAN_MAX_CHAIN	1024	/* per-layer delta cap (chains are bounded
-									 * by compaction policy) */
 
 static int
 plan_delta_cmp(const void *pa, const void *pb)
@@ -491,6 +499,8 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	unsigned char *tmp = malloc(page_size);
 	uint64_t	lo;
 	uint32_t	cap = 0;
+	PsDeltaOut *douts = NULL;	/* growable collect buffer, reused per layer */
+	uint32_t	dcap = 0;
 	int			rc = -1;
 
 	memset(plan, 0, sizeof(*plan));
@@ -507,10 +517,21 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 
 		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
 			continue;
+		/* skip an image layer whose metadata cannot hold a version of (key,block)
+		 * at or below read_lsn: an unrelated tiered-out/corrupt layer must not be
+		 * read (and so cannot fail the whole plan), matching the delta scan below */
+		if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0 ||
+			block < d->start_block || block > d->end_block ||
+			d->lsn_start > read_lsn)
+			continue;
 		r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size, &l);
 		if (r < 0)
 			goto out;			/* read/format error: do not pick a wrong base */
-		if (r == 1 && (!plan->has_base || l > plan->base_lsn))
+		/* '>=' so that on an equal page LSN (a same-lsn rewrite, e.g. hint bits)
+		 * the later-created layer wins -- map order follows layer creation, so a
+		 * newer image for the same (key,block,lsn) is authoritative over an older
+		 * one carrying the same page LSN */
+		if (r == 1 && (!plan->has_base || l >= plan->base_lsn))
 		{
 			if (!plan->base)
 				plan->base = malloc(page_size);
@@ -527,7 +548,6 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
 		const PsLayerDesc *d = &map->layers[i];
-		PsDeltaOut	outs[PS_PLAN_MAX_CHAIN];
 		uint32_t	tn = 0;
 
 		if (d->kind != PS_LAYER_DELTA || d->deleting || d->timeline != timeline)
@@ -539,8 +559,8 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 			block < d->start_block || block > d->end_block ||
 			d->lsn_end <= lo || d->lsn_start > read_lsn)
 			continue;
-		if (ps_delta_layer_collect(d, key, block, lo, read_lsn, outs,
-								   PS_PLAN_MAX_CHAIN, &tn) != 0)
+		if (ps_delta_layer_collect(d, key, block, lo, read_lsn, &douts,
+								   &dcap, &tn) != 0)
 			goto out;
 		for (uint32_t j = 0; j < tn; j++)
 		{
@@ -557,19 +577,19 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 				plan->deltas = nd;
 				cap = nc;
 			}
-			bytes = malloc(outs[j].data_len);
+			bytes = malloc(douts[j].data_len);
 			if (!bytes ||
-				ps_layer_store->read_layer_block(d, outs[j].data_off, bytes,
-												 outs[j].data_len) != 0 ||
-				img_crc(bytes, outs[j].data_len) != outs[j].crc)
+				ps_layer_store->read_layer_block(d, douts[j].data_off, bytes,
+												 douts[j].data_len) != 0 ||
+				img_crc(bytes, douts[j].data_len) != douts[j].crc)
 			{
 				/* a payload that fails its per-record crc is corrupt: reject the
 				 * read instead of feeding bad bytes to the redo helper */
 				free(bytes);
 				goto out;
 			}
-			plan->deltas[plan->ndelta].lsn = outs[j].lsn;
-			plan->deltas[plan->ndelta].len = outs[j].data_len;
+			plan->deltas[plan->ndelta].lsn = douts[j].lsn;
+			plan->deltas[plan->ndelta].len = douts[j].data_len;
 			plan->deltas[plan->ndelta].bytes = bytes;
 			plan->ndelta++;
 		}
@@ -582,6 +602,7 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 
 out:
 	free(tmp);
+	free(douts);
 	if (rc != 0)
 		ps_read_plan_free(plan);
 	return rc;
