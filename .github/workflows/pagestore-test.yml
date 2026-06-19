@@ -40,6 +40,11 @@ jobs:
   # it compiles PostgreSQL -- so it is a separate job.
   integration-test:
     name: in-engine integration test (PostgreSQL + daemon)
+    # The PG extension is a per-version smgr/xlog shim; build it only on the
+    # release branches whose PostgreSQL it matches (branchdb_NN).  The dev branch
+    # (pagestore) tracks upstream master, where the smgr/xlog APIs differ, so this
+    # job is skipped there -- the freestanding daemon is covered by standalone-test.
+    if: ${{ startsWith(github.ref_name, 'branchdb_') || startsWith(github.base_ref, 'branchdb_') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
