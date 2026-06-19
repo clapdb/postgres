@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
@@ -109,6 +110,11 @@ record_layer(void *ctx, const PsLayerDesc *desc)
  * bounded I/O (a "nonblocking slice") instead of rewriting a whole timeline and
  * stalling the serve loop; successive idle calls finish the rest. */
 #define COMPACT_BATCH	8
+
+/* Seconds an idle daemon waits before re-attempting a compaction that made no
+ * progress (corrupt layer / ENOSPC), so it doesn't spin re-reading failing
+ * layers; a flush/compaction that changes layer state clears the backoff early. */
+#define MAINT_COOLDOWN_SECS 5
 
 static uint32_t
 count_image_layers(uint32_t timeline)
@@ -1313,13 +1319,23 @@ ps_core_close(void)
 		ps_memtable_destroy(g_memtable);
 		g_memtable = NULL;
 		/* the shutdown flush can push a timeline over the compaction threshold;
-		 * run the same compaction/GC append_page does so repeated short-lived
-		 * runs don't accumulate one image layer per clean shutdown (each of which
-		 * every read would then scan) */
+		 * compact it back under so repeated short-lived runs don't accumulate
+		 * image layers (each of which every read would then scan).  compaction is
+		 * capped at COMPACT_BATCH per call, so loop per timeline until it is under
+		 * the threshold or stops making progress (corrupt layer / ENOSPC). */
 		for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
-			if ((ct == 0 || timelines[ct].defined) &&
-				count_image_layers(ct) > (uint32_t) compact_layers)
-				compact_timeline(ct);
+		{
+			if (ct != 0 && !timelines[ct].defined)
+				continue;
+			while (count_image_layers(ct) > (uint32_t) compact_layers)
+			{
+				uint32_t	before = count_image_layers(ct);
+
+				if (compact_timeline(ct) != 0 ||
+					count_image_layers(ct) >= before)
+					break;		/* failed or no progress: stop draining this one */
+			}
+		}
 	}
 	ps_pgcache_free();
 	ps_manifest_close();
@@ -1335,7 +1351,16 @@ ps_core_close(void)
 int
 ps_core_maintenance(void)
 {
+	static time_t cooldown_until = 0;	/* skip attempts until this wall time */
+	int			attempted = 0;
+
 	if (!use_layers)
+		return 0;
+	/* If a recent attempt made no progress (a corrupt layer, or repeated ENOSPC
+	 * while reading/writing the merge), don't re-read the same failing layers on
+	 * every idle tick -- cool down until either new layer state appears or the
+	 * window passes. */
+	if (cooldown_until != 0 && time(NULL) < cooldown_until)
 		return 0;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if ((tl == 0 || timelines[tl].defined) &&
@@ -1347,11 +1372,20 @@ ps_core_maintenance(void)
 			 * compaction actually reduced the layer count.  A timeline that can't
 			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
 			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
-			 * must not keep the daemon spinning; try the next timeline, and if
-			 * none progress fall through to return 0 so the caller backs off. */
+			 * must not keep the daemon spinning; try the next timeline. */
+			attempted = 1;
 			if (compact_timeline(tl) == 0 && count_image_layers(tl) < before)
+			{
+				cooldown_until = 0;	/* progress: clear any backoff */
 				return 1;
+			}
 		}
+	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
+	 * otherwise-idle daemon doesn't re-attempt the same failing merge every 20us.
+	 * A later flush/compaction that changes layer state will return 1 and clear
+	 * this; otherwise the window simply expires and we retry. */
+	if (attempted)
+		cooldown_until = time(NULL) + MAINT_COOLDOWN_SECS;
 	return 0;
 }
 
