@@ -73,8 +73,9 @@ rm_rf(const char *path)
 
 static void *cl_shm;
 static int	cl_shm_fd;
-static int	cl_pool[PS_NSHARDS];	/* one claimed channel per shard */
+static int	cl_pool[PS_NSHARDS];	/* channel claimed in each shard pool, -1 = none */
 static uint32_t cl_nshards;			/* shard count published by the daemon */
+static uint32_t cl_nchannels;		/* channel count published by the daemon */
 static uint32_t cl_page_size;
 
 static void
@@ -97,38 +98,21 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 	}
 	hdr = (PsShmHeader *) cl_shm;
 	check(hdr->magic == PS_SHM_MAGIC, "shm magic");
+	check(hdr->version == PS_SHM_VERSION, "shm version %u expected %u",
+		  hdr->version, PS_SHM_VERSION);
 	check(hdr->page_size == expect_page_size,
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
 	cl_page_size = hdr->page_size;
 
-	/* claim one channel in each shard's pool, so a request can be routed to the
-	 * shard that owns its key (identity at nshards == 1) */
+	/* Channels are claimed lazily, one per shard pool on first use (cl_route), so
+	 * a client that only touches one relation reserves one channel rather than
+	 * tying up a channel in every pool at attach. */
+	cl_nchannels = hdr->nchannels;
 	cl_nshards = hdr->nshards ? hdr->nshards : 1;
 	if (cl_nshards > PS_NSHARDS)
 		cl_nshards = PS_NSHARDS;
 	for (uint32_t s = 0; s < cl_nshards; s++)
-	{
-		uint32_t	first,
-					cnt;
-
 		cl_pool[s] = -1;
-		ps_shard_channel_range(s, cl_nshards, hdr->nchannels, &first, &cnt);
-		for (uint32_t i = first; i < first + cnt; i++)
-		{
-			PsChannel  *ch = ps_channel(cl_shm, i);
-
-			if (ps_cas(&ch->claimed, 0, 1))
-			{
-				cl_pool[s] = (int) i;
-				break;
-			}
-		}
-		if (cl_pool[s] < 0)
-		{
-			fprintf(stderr, "no free channel in shard %u\n", s);
-			exit(2);
-		}
-	}
 }
 
 static void
@@ -158,20 +142,46 @@ cl_exec(PsChannel *ch)
 	return ch;
 }
 
+/* the channel this client uses for shard 's', claiming one in that shard's pool
+ * on first use */
+static PsChannel *
+cl_claim_shard(uint32_t s)
+{
+	if (cl_pool[s] < 0)
+	{
+		uint32_t	first,
+					cnt;
+
+		ps_shard_channel_range(s, cl_nshards, cl_nchannels, &first, &cnt);
+		for (uint32_t i = first; i < first + cnt; i++)
+			if (ps_cas(&ps_channel(cl_shm, i)->claimed, 0, 1))
+			{
+				cl_pool[s] = (int) i;
+				break;
+			}
+		if (cl_pool[s] < 0)
+		{
+			fprintf(stderr, "no free channel in shard %u\n", s);
+			exit(2);
+		}
+	}
+	return ps_channel(cl_shm, cl_pool[s]);
+}
+
 /* route a request for (rel, fork) to the channel in that key's shard pool */
 static PsChannel *
 cl_route(uint32_t rel, int32_t fork)
 {
 	PsKey		k = {1, 1, rel, fork};
 
-	return ps_channel(cl_shm, cl_pool[ps_shard_for_key(&k, cl_nshards)]);
+	return cl_claim_shard(ps_shard_for_key(&k, cl_nshards));
 }
 
 /* keyless ops (branch/timeline create) go to shard 0's channel */
 static PsChannel *
 cl_route0(void)
 {
-	return ps_channel(cl_shm, cl_pool[0]);
+	return cl_claim_shard(0);
 }
 
 static void
@@ -549,6 +559,7 @@ wait_ready(const char *shm, uint32_t page_size)
 			if (h != MAP_FAILED)
 			{
 				int			ready = (h->magic == PS_SHM_MAGIC &&
+									 h->version == PS_SHM_VERSION &&
 									 h->page_size == page_size &&
 									 h->nchannels == PS_MAX_CHANNELS);
 
@@ -1080,13 +1091,20 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 static void
 run_sharding_contract(void)
 {
-	for (uint32_t ns = 1; ns <= 8; ns++)
+	/* include large, non-divisible shard counts up to PS_MAX_CHANNELS */
+	uint32_t	cases[] = {1, 2, 3, 5, 7, 8, 33, 96, PS_MAX_CHANNELS};
+
+	for (uint32_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++)
 	{
+		uint32_t	ns = cases[ci];
 		uint32_t	prev_end = 0,
-					covered = 0;
+					covered = 0,
+					mincnt = PS_MAX_CHANNELS,
+					maxcnt = 0;
 		int			tiled = 1;
 
-		/* the channel pools tile [0, PS_MAX_CHANNELS): contiguous, no gap/overlap */
+		/* the channel pools tile [0, PS_MAX_CHANNELS): contiguous, no gap/overlap,
+		 * no empty pool, and balanced to within one channel (no last-pool dumping) */
 		for (uint32_t s = 0; s < ns; s++)
 		{
 			uint32_t	first,
@@ -1095,11 +1113,17 @@ run_sharding_contract(void)
 			ps_shard_channel_range(s, ns, PS_MAX_CHANNELS, &first, &cnt);
 			if (first != prev_end || cnt == 0)
 				tiled = 0;
+			if (cnt < mincnt)
+				mincnt = cnt;
+			if (cnt > maxcnt)
+				maxcnt = cnt;
 			prev_end = first + cnt;
 			covered += cnt;
 		}
 		check(tiled && prev_end == PS_MAX_CHANNELS && covered == PS_MAX_CHANNELS,
 			  "shard channel pools tile [0,nchannels) for nshards=%u", ns);
+		check(maxcnt - mincnt <= 1,
+			  "shard channel pools balanced within 1 for nshards=%u", ns);
 
 		/* key -> shard is in range, deterministic, and (for ns>1) spreads */
 		{

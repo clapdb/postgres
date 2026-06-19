@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		4
+#define PS_SHM_VERSION		5			/* 5: pad0 -> nshards (shard-pool routing) */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -54,6 +54,11 @@
  * request for 'key' is routed to ps_shard_for_key(key)'s pool.
  */
 #define PS_NSHARDS			1
+
+/* Each shard owns a non-empty channel pool, so there must be at least as many
+ * channels as shards (see ps_shard_channel_range). */
+_Static_assert(PS_NSHARDS >= 1 && PS_NSHARDS <= PS_MAX_CHANNELS,
+			   "PS_NSHARDS must be in [1, PS_MAX_CHANNELS]");
 
 /* Mailbox state (atomic uint32) */
 #define PS_STATE_IDLE		0
@@ -187,19 +192,24 @@ ps_shard_for_key(const PsKey *key, uint32_t nshards)
  * *count, partitioning [0, nchannels) into nshards near-equal ranges.  A client
  * claims a channel within ps_shard_for_key(key)'s pool so the request reaches the
  * shard that owns the key; at nshards == 1 the pool is the whole array.
+ *
+ * Proportional boundaries (shard*nchannels/nshards) spread any remainder evenly
+ * instead of dumping it all on the last shard, so every shard's pool size (its
+ * available concurrency) is within one of the others.  Requires
+ * nshards <= nchannels so no pool is empty (enforced for PS_NSHARDS by the
+ * _Static_assert above and clamped by the daemon at startup).
  */
 static inline void
 ps_shard_channel_range(uint32_t shard, uint32_t nshards, uint32_t nchannels,
 					   uint32_t *first, uint32_t *count)
 {
-	uint32_t	per;
+	uint32_t	end;
 
 	if (nshards == 0)
 		nshards = 1;
-	per = nchannels / nshards;
-	*first = shard * per;
-	/* the last shard absorbs the remainder when nchannels isn't a multiple */
-	*count = (shard == nshards - 1) ? (nchannels - *first) : per;
+	*first = (uint32_t) ((uint64_t) shard * nchannels / nshards);
+	end = (uint32_t) ((uint64_t) (shard + 1) * nchannels / nshards);
+	*count = end - *first;
 }
 
 /* --- atomic helpers (acquire/release) ---------------------------------- */
