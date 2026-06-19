@@ -1029,7 +1029,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
 		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l) == 1 && (!found || l > best))
+								  &l, NULL) == 1 && (!found || l > best))
 		{
 			best = l;
 			memcpy(out, tmp, page_size);

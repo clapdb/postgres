@@ -77,20 +77,36 @@ main(void)
 	check(d.lsn_start == 100 && d.lsn_end == 300, "layer lsn range");
 
 	/* newest version <= read_lsn */
-	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL);
 	check(r == 1 && out[0] == 0xA2, "(5,0)@<=250 -> version 200");
-	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
 	check(r == 1 && out[0] == 0xA3, "(5,0)@<=1000 -> version 300");
-	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL);
 	check(r == 1 && out[0] == 0xA1, "(5,0)@<=100 -> version 100 (exact)");
-	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz, NULL, NULL);
 	check(r == 0, "(5,0)@<=50 -> no version (older than oldest)");
-	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz, NULL, NULL);
 	check(r == 1 && out[0] == 0xB1, "(5,1) -> version 150");
-	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL);
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
-	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
+	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
 	check(r == 0, "absent key -> no version");
+
+	/* same-lsn duplicate versions of one (key,block) -> lookup reports ambiguous
+	 * (the read plan must not start materialization from such a base) */
+	{
+		PsLayerDesc da;
+		PsImgRec	dup[2] = {{k5, 0, 400, pg[0]}, {k5, 0, 400, pg[1]}};
+		int			amb = -1;
+
+		check(ps_image_layer_write(11, 0, dup, 2, psz, &da) == 0,
+			  "write same-lsn duplicate layer");
+		r = ps_image_layer_lookup(&da, &k5, 0, 400, out, psz, NULL, &amb);
+		check(r == 1 && amb == 1, "same-lsn duplicate -> ambiguous");
+		amb = -1;
+		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, &amb);
+		check(r == 1 && amb == 0, "distinct lsn -> not ambiguous");
+	}
 
 	/* corrupt a page byte on disk -> lookup must reject it (per-page crc),
 	 * not hand back bad bytes.  (5,0)@100 sorts first, so its page is at off 0. */
@@ -101,9 +117,9 @@ main(void)
 		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1, "corrupt a page byte");
 		if (fd >= 0)
 			close(fd);
-		r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL);
+		r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL);
 		check(r == -1, "corrupted page -> lookup rejects (data crc)");
-		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL);
+		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL);
 		check(r == 1 && out[0] == 0xA2, "uncorrupted page still served");
 	}
 
@@ -123,18 +139,18 @@ main(void)
 		check(dd.kind == PS_LAYER_DELTA && dd.lsn_start == 100 &&
 			  dd.lsn_end == 300, "delta layer kind + lsn range");
 
-		/* (5,0) in (100, 300]: expect 200 then 300, ascending; 100 excluded */
+		/* (5,0) in [100, 300): half-open -> 100 then 200, ascending; 300 excluded */
 		r = ps_delta_layer_collect(&dd, &k5, 0, 100, 300, &outs, &ocap, &dn);
-		check(r == 0 && dn == 2, "delta collect (100,300] -> 2 records");
-		check(outs[0].lsn == 200 && outs[1].lsn == 300, "deltas in ascending LSN");
-		check(ps_layer_store->read_layer_block(&dd, outs[0].data_off, dbuf,
-											   outs[0].data_len) == 0 &&
-			  outs[0].data_len == 5 && memcmp(dbuf, "DD200", 5) == 0,
+		check(r == 0 && dn == 2, "delta collect [100,300) -> 2 records");
+		check(outs[0].lsn == 100 && outs[1].lsn == 200, "deltas in ascending LSN");
+		check(ps_layer_store->read_layer_block(&dd, outs[1].data_off, dbuf,
+											   outs[1].data_len) == 0 &&
+			  outs[1].data_len == 5 && memcmp(dbuf, "DD200", 5) == 0,
 			  "delta payload readable (200)");
 
 		dn = 0;
 		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, &outs, &ocap, &dn);
-		check(r == 0 && dn == 3, "delta collect (0,1000] -> all 3 of (5,0)");
+		check(r == 0 && dn == 3, "delta collect [0,1000) -> all 3 of (5,0)");
 		dn = 0;
 		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, &outs, &ocap, &dn);
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
@@ -170,22 +186,21 @@ main(void)
 		ps_layer_map_add(&map, &img);
 		ps_layer_map_add(&map, &dl);
 
-		/* @250: base=image@200 (0xA2); deltas in (200,250] = {250} */
+		/* @250: base=image@200 (0xA2); deltas in [200,250) = {} (250 excluded) */
 		check(ps_read_plan_build(&map, 0, &k5, 0, 250, psz, &plan) == 0, "plan@250");
 		check(plan.has_base && plan.base_lsn == 200 && plan.base[0] == 0xA2,
 			  "plan@250 base = image@200");
-		check(plan.ndelta == 1 && plan.deltas[0].lsn == 250 &&
-			  memcmp(plan.deltas[0].bytes, "x250", 4) == 0, "plan@250 one delta");
+		check(plan.ndelta == 0, "plan@250 no deltas (250 is exclusive upper bound)");
 		ps_read_plan_free(&plan);
 
-		/* @300: base=image@200; deltas in (200,300] = {250,300} ascending */
+		/* @300: base=image@200; deltas in [200,300) = {250} (300 excluded) */
 		check(ps_read_plan_build(&map, 0, &k5, 0, 300, psz, &plan) == 0, "plan@300");
-		check(plan.base_lsn == 200 && plan.ndelta == 2 &&
-			  plan.deltas[0].lsn == 250 && plan.deltas[1].lsn == 300,
-			  "plan@300 chain {250,300}");
+		check(plan.base_lsn == 200 && plan.ndelta == 1 &&
+			  plan.deltas[0].lsn == 250 &&
+			  memcmp(plan.deltas[0].bytes, "x250", 4) == 0, "plan@300 chain {250}");
 		ps_read_plan_free(&plan);
 
-		/* @180: base=image@100 (0xA1); deltas in (100,180] = {150} */
+		/* @180: base=image@100 (0xA1); deltas in [100,180) = {150} */
 		check(ps_read_plan_build(&map, 0, &k5, 0, 180, psz, &plan) == 0, "plan@180");
 		check(plan.base_lsn == 100 && plan.base[0] == 0xA1 && plan.ndelta == 1 &&
 			  plan.deltas[0].lsn == 150, "plan@180 base@100 + delta150");

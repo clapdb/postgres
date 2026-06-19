@@ -135,13 +135,15 @@ extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 /*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
  * layer 'layer'.  On a hit copies page_size bytes into out, stores that
- * version's lsn in *out_lsn (if non-NULL), and returns 1; 0 if the layer has no
- * such page; -1 on read/format error.
+ * version's lsn in *out_lsn (if non-NULL), sets *out_ambiguous (if non-NULL) to
+ * 1 when more than one version shares that lsn (a same-lsn rewrite the lsn can't
+ * disambiguate), and returns 1; 0 if the layer has no such page; -1 on
+ * read/format error.
  */
 extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  uint32_t block, uint64_t read_lsn,
 								  void *out, uint32_t page_size,
-								  uint64_t *out_lsn);
+								  uint64_t *out_lsn, int *out_ambiguous);
 
 /*
  * Read an image layer's full index (every (key, block, lsn) entry), for
@@ -218,8 +220,11 @@ extern int	ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
 								 PsLayerDesc *out);
 
 /*
- * Collect the deltas of (key, block) with lo_lsn < lsn <= hi_lsn from delta
+ * Collect the deltas of (key, block) with lo_lsn <= lsn < hi_lsn from delta
  * layer 'layer', in ascending LSN order, appending to *outs and updating *n.
+ * (Half-open: delta keys are WAL record start-LSNs and an image base_lsn is the
+ * start of the first record to apply, so the base's record is included and a
+ * record starting exactly at hi_lsn==read_lsn is excluded.)
  * *outs and *cap are a caller-owned growable buffer (start them NULL and 0; the
  * callee realloc's as needed and the caller frees *outs); there is no fixed
  * per-layer chain cap.  Each entry describes offset+len+crc of the payload in the

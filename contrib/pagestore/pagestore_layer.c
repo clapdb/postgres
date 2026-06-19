@@ -431,7 +431,12 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 	{
 		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
 			continue;
-		if (idx[i].lsn <= lo_lsn || idx[i].lsn > hi_lsn)
+		/* half-open [lo_lsn, hi_lsn): delta keys are WAL record *start* LSNs while
+		 * an image/page LSN is the previous record's end == the next record's
+		 * start.  So a base at lo_lsn needs the record whose start == lo_lsn
+		 * applied, and a record starting exactly at hi_lsn (== read_lsn) is past
+		 * the requested state and must be excluded. */
+		if (idx[i].lsn < lo_lsn || idx[i].lsn >= hi_lsn)
 			continue;
 		/* the payload must lie wholly inside the payload section [0, index_off);
 		 * a corrupt offset/len (even with a matching index crc) must fail the
@@ -512,7 +517,7 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	{
 		const PsLayerDesc *d = &map->layers[i];
 		uint64_t	l;
-
+		int			amb;
 		int			r;
 
 		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
@@ -524,14 +529,21 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 			block < d->start_block || block > d->end_block ||
 			d->lsn_start > read_lsn)
 			continue;
-		r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size, &l);
+		/* a layer whose newest version is at or below the base we already have can
+		 * only tie or lose, so skip it -- this also means a damaged superseded
+		 * layer can never fail a read that a newer layer already satisfies */
+		if (plan->has_base && d->lsn_end <= plan->base_lsn)
+			continue;
+		r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size, &l,
+								  &amb);
 		if (r < 0)
-			goto out;			/* read/format error: do not pick a wrong base */
-		/* '>=' so that on an equal page LSN (a same-lsn rewrite, e.g. hint bits)
-		 * the later-created layer wins -- map order follows layer creation, so a
-		 * newer image for the same (key,block,lsn) is authoritative over an older
-		 * one carrying the same page LSN */
-		if (r == 1 && (!plan->has_base || l >= plan->base_lsn))
+			continue;			/* unavailable/corrupt: a newer valid layer (or an
+								 * older base + deltas) can still satisfy the read */
+		/* reject an ambiguous base: when several versions share this page LSN
+		 * (a hint-bit/same-lsn rewrite) the lsn cannot identify the right bytes,
+		 * so do not start materialization from it (the live read path serves such
+		 * pages from the authoritative segment instead) */
+		if (r == 1 && !amb && (!plan->has_base || l > plan->base_lsn))
 		{
 			if (!plan->base)
 				plan->base = malloc(page_size);
@@ -544,7 +556,7 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	}
 	lo = plan->has_base ? plan->base_lsn : 0;
 
-	/* 2. deltas in (lo, read_lsn] across this timeline's delta layers */
+	/* 2. deltas in [lo, read_lsn) across this timeline's delta layers */
 	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
 		const PsLayerDesc *d = &map->layers[i];
@@ -552,12 +564,12 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 
 		if (d->kind != PS_LAYER_DELTA || d->deleting || d->timeline != timeline)
 			continue;
-		/* skip a layer whose key/block/LSN range cannot overlap (lo, read_lsn]:
+		/* skip a layer whose key/block/LSN range cannot overlap [lo, read_lsn):
 		 * its metadata already proves it is irrelevant, so a remote-only/evicted/
 		 * corrupt unrelated layer must not be touched (let alone fail the read) */
 		if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0 ||
 			block < d->start_block || block > d->end_block ||
-			d->lsn_end <= lo || d->lsn_start > read_lsn)
+			d->lsn_end < lo || d->lsn_start >= read_lsn)
 			continue;
 		if (ps_delta_layer_collect(d, key, block, lo, read_lsn, &douts,
 								   &dcap, &tn) != 0)
@@ -650,7 +662,8 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn,
-					  void *out, uint32_t page_size, uint64_t *out_lsn)
+					  void *out, uint32_t page_size, uint64_t *out_lsn,
+					  int *out_ambiguous)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
@@ -698,10 +711,25 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 			found = 1;
 		}
 	}
+	if (out_ambiguous)
+		*out_ambiguous = 0;
 	if (!found)
 	{
 		rc = 0;
 		goto out;
+	}
+	/* report whether the chosen version's page LSN is ambiguous within this layer
+	 * (more than one version of (key,block) shares best_lsn -- a same-lsn rewrite,
+	 * e.g. hint bits); the caller cannot trust lsn alone to identify it */
+	if (out_ambiguous)
+	{
+		uint32_t	dup = 0;
+
+		for (uint32_t i = 0; i < foot.nrecs; i++)
+			if (idx[i].block == block && key_cmp(&idx[i].key, key) == 0 &&
+				idx[i].lsn == best_lsn && ++dup > 1)
+				break;
+		*out_ambiguous = (dup > 1);
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
 		goto out;
