@@ -1329,8 +1329,16 @@ ps_core_maintenance(void)
 		if ((tl == 0 || timelines[tl].defined) &&
 			count_image_layers(tl) > (uint32_t) compact_layers)
 		{
-			compact_timeline(tl);
-			return 1;
+			uint32_t	before = count_image_layers(tl);
+
+			/* Report progress (so the caller skips its idle sleep) only if the
+			 * compaction actually reduced the layer count.  A timeline that can't
+			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
+			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
+			 * must not keep the daemon spinning; try the next timeline, and if
+			 * none progress fall through to return 0 so the caller backs off. */
+			if (compact_timeline(tl) == 0 && count_image_layers(tl) < before)
+				return 1;
 		}
 	return 0;
 }
