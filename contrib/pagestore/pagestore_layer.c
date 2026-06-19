@@ -600,8 +600,17 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 			}
 			else if (l == plan->base_lsn)
 			{
-				base_ambiguous = 1;		/* same lsn across two layers */
-				break;
+				/* same lsn in two layers: tolerate an identical-bytes duplicate --
+				 * crash-safe compaction (install-new-before-delete-old) briefly
+				 * leaves the old and new image layers both live with the same
+				 * version -- but a genuine same-lsn rewrite (different bytes, e.g.
+				 * hint bits) is ambiguous and must fail to the segment path */
+				if (memcmp(plan->base, tmp, page_size) != 0)
+				{
+					base_ambiguous = 1;
+					break;
+				}
+				/* identical duplicate base -> keep the one already chosen */
 			}
 		}
 		free(cand);

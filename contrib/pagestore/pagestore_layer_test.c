@@ -237,10 +237,10 @@ main(void)
 		ps_layer_map_init(&map);
 		ps_layer_map_add(&map, &a);
 		ps_layer_map_add(&map, &b);
-		/* same page LSN split across two image layers -> ambiguous base -> reject
-		 * (caller would serve from the authoritative segment) */
+		/* same page LSN in two image layers with *different* bytes (a genuine
+		 * same-lsn rewrite) -> ambiguous base -> reject (segment serves it) */
 		check(ps_read_plan_build(&map, 0, &k5, 0, 600, psz, &plan) == -1,
-			  "cross-layer same-lsn base -> plan rejects (ambiguous)");
+			  "cross-layer same-lsn base, differing bytes -> plan rejects");
 
 		/* a covering image layer that is corrupt must fail the plan, not fall back
 		 * to an older base: corrupt B's page on disk, read at 500 */
@@ -281,6 +281,29 @@ main(void)
 			  "dedup: plan built");
 		check(plan.ndelta == 1 && plan.deltas[0].lsn == 200,
 			  "overlapping layers expose record @200 once (deduped)");
+		ps_read_plan_free(&plan);
+		ps_layer_map_free(&map);
+	}
+
+	/* --- read plan: identical-bytes duplicate base is tolerated, not rejected --- */
+	{
+		PsLayerDesc a,
+					b;
+		PsLayerMap	map;
+		PsReadPlan	plan;
+		/* two image layers with the SAME (key,block,lsn) AND identical bytes --
+		 * the crash-safe compaction overlap (install-new-before-delete-old) */
+		PsImgRec	ra[1] = {{k5, 0, 700, pg[2]}};
+		PsImgRec	rb[1] = {{k5, 0, 700, pg[2]}};
+
+		check(ps_image_layer_write(17, 0, ra, 1, psz, &a) == 0, "dupbase: layer A");
+		check(ps_image_layer_write(18, 0, rb, 1, psz, &b) == 0, "dupbase: layer B");
+		ps_layer_map_init(&map);
+		ps_layer_map_add(&map, &a);
+		ps_layer_map_add(&map, &b);
+		check(ps_read_plan_build(&map, 0, &k5, 0, 800, psz, &plan) == 0 &&
+			  plan.has_base && plan.base_lsn == 700 && plan.base[0] == 0xA3,
+			  "identical duplicate base across layers -> tolerated (not ambiguous)");
 		ps_read_plan_free(&plan);
 		ps_layer_map_free(&map);
 	}
