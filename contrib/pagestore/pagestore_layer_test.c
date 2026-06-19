@@ -92,17 +92,26 @@ main(void)
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
 	check(r == 0, "absent key -> no version");
 
-	/* same-lsn duplicate versions of one (key,block) -> lookup reports ambiguous
-	 * (the read plan must not start materialization from such a base) */
+	/* same-lsn duplicate versions of one (key,block): ambiguous only when the
+	 * bytes differ (a genuine rewrite).  Identical-byte duplicates within a layer
+	 * are benign (compaction merges crash-overlapped layers into one). */
 	{
-		PsLayerDesc da;
-		PsImgRec	dup[2] = {{k5, 0, 400, pg[0]}, {k5, 0, 400, pg[1]}};
+		PsLayerDesc da,
+					di;
+		PsImgRec	dup[2] = {{k5, 0, 400, pg[0]}, {k5, 0, 400, pg[1]}};	/* differ */
+		PsImgRec	idup[2] = {{k5, 0, 400, pg[2]}, {k5, 0, 400, pg[2]}};	/* same */
 		int			amb = -1;
 
 		check(ps_image_layer_write(11, 0, dup, 2, psz, &da) == 0,
-			  "write same-lsn duplicate layer");
+			  "write same-lsn differing-bytes layer");
 		r = ps_image_layer_lookup(&da, &k5, 0, 400, out, psz, NULL, &amb);
-		check(r == 1 && amb == 1, "same-lsn duplicate -> ambiguous");
+		check(r == 1 && amb == 1, "same-lsn differing bytes -> ambiguous");
+		amb = -1;
+		check(ps_image_layer_write(19, 0, idup, 2, psz, &di) == 0,
+			  "write same-lsn identical-bytes layer");
+		r = ps_image_layer_lookup(&di, &k5, 0, 400, out, psz, NULL, &amb);
+		check(r == 1 && amb == 0 && out[0] == 0xA3,
+			  "same-lsn identical bytes -> not ambiguous (compaction overlap)");
 		amb = -1;
 		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, &amb);
 		check(r == 1 && amb == 0, "distinct lsn -> not ambiguous");
@@ -283,6 +292,24 @@ main(void)
 			  "overlapping layers expose record @200 once (deduped)");
 		ps_read_plan_free(&plan);
 		ps_layer_map_free(&map);
+
+		/* but two same-LSN delta records with *different* payloads are a real
+		 * conflict (qsort order is arbitrary) -> fail the plan, don't guess */
+		{
+			PsLayerDesc d3;
+			PsDeltaRec	dc[1] = {{k5, 0, 200, "zZZZ", 4}};	/* same lsn, diff bytes */
+			PsLayerMap	m2;
+			PsReadPlan	p2;
+
+			check(ps_delta_layer_write(20, 0, dc, 1, &d3) == 0, "conflict: delta3");
+			ps_layer_map_init(&m2);
+			ps_layer_map_add(&m2, &img);
+			ps_layer_map_add(&m2, &d1);		/* y200 */
+			ps_layer_map_add(&m2, &d3);		/* zZZZ @200 */
+			check(ps_read_plan_build(&m2, 0, &k5, 0, 300, psz, &p2) == -1,
+				  "conflicting same-lsn delta payloads -> plan rejects");
+			ps_layer_map_free(&m2);
+		}
 	}
 
 	/* --- read plan: identical-bytes duplicate base is tolerated, not rejected --- */

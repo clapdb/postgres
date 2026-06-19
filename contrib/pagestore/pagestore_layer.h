@@ -244,13 +244,18 @@ extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
  * apply, so the base's record is included and one starting at read_lsn is not).
  *
  * Precondition: read_lsn must be a record-boundary LSN -- a page LSN / pd_lsn,
- * i.e. the end of one record == the start of the next.  Every caller in this
- * system passes one (read_resolve a version's pd_lsn, read_at a snapshot LSN), so
- * the start-LSN-keyed [base_lsn, read_lsn) is exact: a version visible at end
- * E_j is produced by a record starting at E_{j-1}, and the records to apply are
- * exactly those with start in [base_lsn, read_lsn).  A read_lsn that fell *inside*
- * a record would wrongly include that record (whose result is newer than
- * read_lsn); such non-boundary LSNs are not produced by the page store.
+ * i.e. the end of one record == the start of the next.  Under it the start-LSN-
+ * keyed [base_lsn, read_lsn) is exact: a version visible at end E_j is produced
+ * by a record starting at E_{j-1}, so the records to apply are exactly those with
+ * start in [base_lsn, read_lsn).  A read_lsn that fell *inside* a record would
+ * wrongly include that record (whose result is newer than read_lsn).
+ *
+ * This is the *materialization* path (reconstructing a committed page version);
+ * it is not the arbitrary-LSN time-travel path.  The live read path -- including
+ * read_at, whose SQL entry takes an arbitrary pg_lsn that may fall between
+ * versions -- is served by read_resolve()/the version chain (newest version <=
+ * read_lsn), not by this planner.  Wiring the planner to arbitrary read-LSNs
+ * would first require keying deltas by record *end* LSN (a follow-up).
  *
  * The redo helper (7c)
  * applies the deltas onto the base; if there are no deltas the base *is* the

@@ -684,10 +684,17 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	 * layer added before the old ones are marked deleting in the install-new-
 	 * before-delete-old compaction flow) can expose the same WAL record (same
 	 * record LSN) twice; applying it twice in rm_redo would corrupt the page.
-	 * Sorted by LSN above, so duplicates are adjacent -- keep the first. */
+	 * Sorted by LSN above, so duplicates are adjacent.  Only drop a duplicate that
+	 * is byte-identical -- two same-LSN records with *different* payloads (a stale
+	 * replacement or a corrupt-but-self-consistent layer) are a real conflict that
+	 * qsort would resolve arbitrarily, so fail the plan instead of guessing. */
 	for (uint32_t i = 1; i < plan->ndelta; i++)
 		if (plan->deltas[i].lsn == plan->deltas[i - 1].lsn)
 		{
+			if (plan->deltas[i].len != plan->deltas[i - 1].len ||
+				memcmp(plan->deltas[i].bytes, plan->deltas[i - 1].bytes,
+					   plan->deltas[i].len) != 0)
+				goto out;		/* conflicting duplicate record -> reject */
 			free(plan->deltas[i].bytes);
 			memmove(&plan->deltas[i], &plan->deltas[i + 1],
 					(size_t) (plan->ndelta - i - 1) * sizeof(PsPlanDelta));
@@ -802,18 +809,23 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		rc = 0;
 		goto out;
 	}
-	/* report whether the chosen version's page LSN is ambiguous within this layer
-	 * (more than one version of (key,block) shares best_lsn -- a same-lsn rewrite,
-	 * e.g. hint bits); the caller cannot trust lsn alone to identify it */
+	/* report whether the chosen version's page LSN is ambiguous within this layer:
+	 * more than one version of (key,block) shares best_lsn *with differing bytes*
+	 * (a genuine same-lsn rewrite, e.g. hint bits), which lsn alone can't identify.
+	 * Identical-byte duplicates are benign -- compaction copies the versions of
+	 * crash-overlapped layers (install-new-before-delete-old) into one new layer,
+	 * so the same (key,block,lsn) can legitimately appear twice with equal bytes;
+	 * compare the per-page crc rather than just counting. */
 	if (out_ambiguous)
 	{
-		uint32_t	dup = 0;
-
+		*out_ambiguous = 0;
 		for (uint32_t i = 0; i < foot.nrecs; i++)
 			if (idx[i].block == block && key_cmp(&idx[i].key, key) == 0 &&
-				idx[i].lsn == best_lsn && ++dup > 1)
+				idx[i].lsn == best_lsn && idx[i].crc != best_crc)
+			{
+				*out_ambiguous = 1;
 				break;
-		*out_ambiguous = (dup > 1);
+			}
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
 		goto out;
