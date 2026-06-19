@@ -136,6 +136,7 @@ begin(uint32_t i, PsChannel *ch)
 			{
 				uint32_t	nb = ch->nblocks;
 				ReqState   *rs = &reqstate[i];
+				uint32_t	nsub = 0;
 
 				if (nb > MAX_BLOCKS || (uint64_t) nb * page_size > PS_IO_UNIT)
 				{
@@ -144,10 +145,12 @@ begin(uint32_t i, PsChannel *ch)
 					return;
 				}
 				rs->ch = ch;
-				rs->pending = 0;
+				/* start pending at 1 as a submit guard: ps_spdk_read_async() can
+				 * invoke read_done inline (the active append segment, error
+				 * paths), so without this the request could publish DONE / clear
+				 * active mid-loop while later blocks are still being submitted */
+				rs->pending = 1;
 				rs->active = 1;
-				/* completions only fire from ps_spdk_poll() (the main loop), not
-				 * during submit, so incrementing pending as we go is safe */
 				for (uint32_t b = 0; b < nb; b++)
 				{
 					unsigned char *dst = ch->data + (size_t) b * page_size;
@@ -162,17 +165,20 @@ begin(uint32_t i, PsChannel *ch)
 					}
 					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */
-					bc = &rs->blk[rs->pending++];
+					bc = &rs->blk[nsub++];
 					bc->rs = rs;
 					bc->tl = tl;
 					bc->key = ch->key;
 					bc->block = blk;
 					bc->lsn = v->lsn;
 					bc->dst = dst;
+					rs->pending++;
 					ps_spdk_read_async(v->seg, v->off, dst, page_size,
 									   read_done, bc);
 				}
-				if (rs->pending == 0)	/* all cached or unwritten */
+				/* release the submit guard; if every read already completed
+				 * (inline) or there were none, this publishes DONE now */
+				if (--rs->pending == 0)
 				{
 					rs->active = 0;
 					ps_store_release(&ch->state, PS_STATE_DONE);

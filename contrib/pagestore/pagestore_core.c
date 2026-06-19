@@ -1069,23 +1069,25 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		{
 			uint64_t	l;
 			int			served;
+			/* If pv->lsn is ambiguous (a same-lsn rewrite, e.g. hint bits) the
+			 * lsn does not uniquely identify a version, so every lsn-keyed fast
+			 * path -- the materialized-page cache, the memtable and the image
+			 * layers -- may return an older version than the authoritative latest
+			 * append.  Bypass all of them (including caching the result) and serve
+			 * from the segment (pv's exact location). */
+			int			ambig = page_lsn_ambiguous(e, pv->lsn);
 
-			/* fast path: materialized-page cache, keyed by the resolved version */
-			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+			if (!ambig && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
 				return 1;
 
-			/* The memtable / image-layer fast paths identify a version only by
-			 * lsn; if that lsn is ambiguous (a same-lsn rewrite, e.g. hint bits),
-			 * a same-lsn hit may be an older version than the authoritative latest
-			 * append, so serve from the segment (pv's exact location) instead. */
-			if (!page_lsn_ambiguous(e, pv->lsn) && g_memtable &&
+			if (!ambig && g_memtable &&
 				ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
 				rr_mem++;
 				served = 1;		/* served from the memtable */
 			}
-			else if (!page_lsn_ambiguous(e, pv->lsn) &&
+			else if (!ambig &&
 					 layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
@@ -1097,7 +1099,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				rr_seg++;
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
-			if (served)
+			if (served && !ambig)
 				ps_pgcache_insert(tl, key, block, pv->lsn, out);
 			return served ? 1 : 0;
 		}
