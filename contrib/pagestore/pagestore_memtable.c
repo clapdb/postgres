@@ -103,6 +103,12 @@ ps_memtable_full(const PsMemtable *mt)
 	return mt->n >= mt->threshold;
 }
 
+void
+ps_memtable_reset(PsMemtable *mt)
+{
+	free_pages(mt);				/* drop staged page copies; n -> 0 */
+}
+
 int
 ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 				   uint32_t block, uint64_t read_lsn, uint64_t *out_lsn,

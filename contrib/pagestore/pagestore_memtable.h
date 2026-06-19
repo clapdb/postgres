@@ -39,6 +39,13 @@ extern uint32_t ps_memtable_count(const PsMemtable *mt);
 extern int	ps_memtable_full(const PsMemtable *mt);	/* count >= threshold */
 
 /*
+ * Drop all staged versions without flushing (frees the page copies).  Used to
+ * bound memory when a flush fails persistently: the pages are already durable in
+ * the segment log, so the staging can be discarded and rebuilt later.
+ */
+extern void ps_memtable_reset(PsMemtable *mt);
+
+/*
  * Newest staged version of (timeline, key, block) with lsn <= read_lsn (this
  * timeline only -- ancestry is the caller's job).  On a hit copies page_size
  * bytes into out, stores its lsn in *out_lsn, and returns 1; else 0.
