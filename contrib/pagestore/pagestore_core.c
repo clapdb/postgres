@@ -632,6 +632,45 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 }
 
 /*
+ * Like read_through(), but for frontends that cache pages keyed by
+ * (timeline,key,block,lsn).  It also reports the timeline the version was found
+ * on (*src_tl): a read falls through to ancestor timelines, so an inherited page
+ * must be cached under its source timeline, not the requested one -- otherwise a
+ * branch that later writes its own same-lsn copy of the block would keep hitting
+ * the inherited bytes.  And it reports whether that version's page LSN is
+ * ambiguous (*ambiguous): a same-lsn rewrite (e.g. hint bits) means the lsn does
+ * not uniquely identify the version, so it is not safe to serve from or store in
+ * an lsn-keyed cache.  Returns the chosen PageVer, or NULL (with *src_tl set to
+ * the requested timeline and *ambiguous cleared).
+ */
+PageVer *
+read_through_cacheable(uint32_t timeline, const PsKey *key, uint32_t block,
+					   uint64_t read_lsn, uint32_t *src_tl, int *ambiguous)
+{
+	for (;;)
+	{
+		PageEnt    *e = page_find(timeline, key, block);
+		PageVer    *v = e ? page_visible(e, read_lsn) : NULL;
+
+		if (v)
+		{
+			*src_tl = timeline;
+			*ambiguous = page_lsn_ambiguous(e, v->lsn);
+			return v;
+		}
+		if (!timeline_has_parent(timeline))
+		{
+			*src_tl = timeline;
+			*ambiguous = 0;
+			return NULL;
+		}
+		if (timelines[timeline].branch_lsn < read_lsn)
+			read_lsn = timelines[timeline].branch_lsn;
+		timeline = (uint32_t) timelines[timeline].parent;
+	}
+}
+
+/*
  * Fork size visible on 'timeline': the maximum block count across the timeline
  * and all its ancestors.  A branch that has written only some blocks of a fork
  * still inherits the parent's full size (the unwritten blocks are served by

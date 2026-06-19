@@ -51,10 +51,11 @@ on_signal(int sig)
 typedef struct BlkCtx
 {
 	struct ReqState *rs;
-	uint32_t	tl;
+	uint32_t	tl;				/* resolved source timeline (the cache key) */
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	int			cacheable;		/* 0 if the version's lsn is ambiguous */
 	unsigned char *dst;
 } BlkCtx;
 
@@ -77,7 +78,7 @@ read_done(void *arg, int ok)
 	BlkCtx	   *bc = arg;
 	ReqState   *rs = bc->rs;
 
-	if (ok)						/* the engine delivered the page into bc->dst */
+	if (ok && bc->cacheable)	/* the engine delivered the page into bc->dst */
 		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
 	if (--rs->pending == 0)
 	{
@@ -155,7 +156,11 @@ begin(uint32_t i, PsChannel *ch)
 				{
 					unsigned char *dst = ch->data + (size_t) b * page_size;
 					uint32_t	blk = ch->blocknum + b;
-					PageVer    *v = read_through(tl, &ch->key, blk, UINT64_MAX);
+					uint32_t	stl;
+					int			ambig;
+					PageVer    *v = read_through_cacheable(tl, &ch->key, blk,
+														  UINT64_MAX, &stl,
+														  &ambig);
 					BlkCtx	   *bc;
 
 					if (!v)
@@ -163,14 +168,18 @@ begin(uint32_t i, PsChannel *ch)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 						continue;
 					}
-					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
+					/* cache by the resolved source timeline; bypass the cache for
+					 * same-lsn-ambiguous versions (the lsn key can't tell them
+					 * apart), matching read_resolve() on the POSIX path */
+					if (!ambig && ps_pgcache_lookup(stl, &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */
 					bc = &rs->blk[nsub++];
 					bc->rs = rs;
-					bc->tl = tl;
+					bc->tl = stl;
 					bc->key = ch->key;
 					bc->block = blk;
 					bc->lsn = v->lsn;
+					bc->cacheable = !ambig;
 					bc->dst = dst;
 					rs->pending++;
 					ps_spdk_read_async(v->seg, v->off, dst, page_size,
@@ -188,8 +197,11 @@ begin(uint32_t i, PsChannel *ch)
 
 		case PS_OP_READ_AT:
 			{
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 ch->req_lsn);
+				uint32_t	stl;
+				int			ambig;
+				PageVer    *v = read_through_cacheable(tl, &ch->key,
+													  ch->blocknum, ch->req_lsn,
+													  &stl, &ambig);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
@@ -199,8 +211,10 @@ begin(uint32_t i, PsChannel *ch)
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
-				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
-									  ch->data))
+				/* cache by the resolved source timeline; bypass for ambiguous
+				 * same-lsn versions (see READV above) */
+				if (!ambig && ps_pgcache_lookup(stl, &ch->key, ch->blocknum,
+												v->lsn, ch->data))
 				{
 					ps_store_release(&ch->state, PS_STATE_DONE);	/* RAM hit */
 					return;
@@ -210,10 +224,11 @@ begin(uint32_t i, PsChannel *ch)
 				rs->active = 1;
 				bc = &rs->blk[0];
 				bc->rs = rs;
-				bc->tl = tl;
+				bc->tl = stl;
 				bc->key = ch->key;
 				bc->block = ch->blocknum;
 				bc->lsn = v->lsn;
+				bc->cacheable = !ambig;
 				bc->dst = ch->data;
 				ps_spdk_read_async(v->seg, v->off, ch->data, page_size,
 								   read_done, bc);

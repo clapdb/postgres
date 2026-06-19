@@ -65,6 +65,14 @@ extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 						const unsigned char *page);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
+/*
+ * read_through() variant for lsn-keyed page caches: also reports the timeline the
+ * version was found on (*src_tl, the correct cache key under COW inheritance) and
+ * whether its page LSN is ambiguous (*ambiguous, i.e. unsafe to cache by lsn).
+ */
+extern PageVer *read_through_cacheable(uint32_t timeline, const PsKey *key,
+									   uint32_t block, uint64_t read_lsn,
+									   uint32_t *src_tl, int *ambiguous);
 extern int	read_version(const PageVer *v, unsigned char *out);
 
 /*
