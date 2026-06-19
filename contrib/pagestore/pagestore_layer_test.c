@@ -257,6 +257,34 @@ main(void)
 		ps_layer_map_free(&map);
 	}
 
+	/* --- read plan: overlapping delta layers expose a record only once --- */
+	{
+		PsLayerDesc img,
+					d1,
+					d2;
+		PsLayerMap	map;
+		PsReadPlan	plan;
+		PsImgRec	irecs[1] = {{k5, 0, 100, pg[0]}};
+		/* two delta layers both carrying the (5,0)@200 record (e.g. a replacement
+		 * layer added before the old one is marked deleting in compaction) */
+		PsDeltaRec	da[1] = {{k5, 0, 200, "y200", 4}};
+		PsDeltaRec	db[1] = {{k5, 0, 200, "y200", 4}};
+
+		check(ps_image_layer_write(14, 0, irecs, 1, psz, &img) == 0, "dedup: image");
+		check(ps_delta_layer_write(15, 0, da, 1, &d1) == 0, "dedup: delta1");
+		check(ps_delta_layer_write(16, 0, db, 1, &d2) == 0, "dedup: delta2");
+		ps_layer_map_init(&map);
+		ps_layer_map_add(&map, &img);
+		ps_layer_map_add(&map, &d1);
+		ps_layer_map_add(&map, &d2);
+		check(ps_read_plan_build(&map, 0, &k5, 0, 300, psz, &plan) == 0,
+			  "dedup: plan built");
+		check(plan.ndelta == 1 && plan.deltas[0].lsn == 200,
+			  "overlapping layers expose record @200 once (deduped)");
+		ps_read_plan_free(&plan);
+		ps_layer_map_free(&map);
+	}
+
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

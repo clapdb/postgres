@@ -50,7 +50,10 @@ The choice is per-deployment policy, not a code fork (see the binding table).
 materialize(timeline, key, block, target_lsn)
    = read plan (LSM_ARCHITECTURE read path):
        base = newest image layer version <= target_lsn
-       deltas = delta layers covering (base_lsn, target_lsn]   (ascending)
+       deltas = delta layers covering [base_lsn, target_lsn)   (ascending)
+                (half-open: delta keys are WAL record start-LSNs and base_lsn is
+                 the start of the first record to apply; target_lsn must be a
+                 record-boundary / page LSN -- see ps_read_plan_build())
    -> apply deltas onto base via PG rm_redo
    -> new image-layer page version  -> manifest ADD_LAYER
 ```

@@ -670,6 +670,21 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 	/* 3. order the chain by ascending LSN (it spans multiple layers) */
 	if (plan->ndelta > 1)
 		qsort(plan->deltas, plan->ndelta, sizeof(PsPlanDelta), plan_delta_cmp);
+
+	/* 4. drop duplicate records: overlapping delta layers (e.g. a replacement
+	 * layer added before the old ones are marked deleting in the install-new-
+	 * before-delete-old compaction flow) can expose the same WAL record (same
+	 * record LSN) twice; applying it twice in rm_redo would corrupt the page.
+	 * Sorted by LSN above, so duplicates are adjacent -- keep the first. */
+	for (uint32_t i = 1; i < plan->ndelta; i++)
+		if (plan->deltas[i].lsn == plan->deltas[i - 1].lsn)
+		{
+			free(plan->deltas[i].bytes);
+			memmove(&plan->deltas[i], &plan->deltas[i + 1],
+					(size_t) (plan->ndelta - i - 1) * sizeof(PsPlanDelta));
+			plan->ndelta--;
+			i--;				/* re-check the new entry now at i */
+		}
 	rc = 0;
 
 out:

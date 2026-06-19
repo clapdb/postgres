@@ -242,6 +242,16 @@ extern int	ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
  * delta in [base_lsn, read_lsn), in ascending LSN order (half-open: delta keys
  * are WAL record start-LSNs, and base_lsn is the start of the first record to
  * apply, so the base's record is included and one starting at read_lsn is not).
+ *
+ * Precondition: read_lsn must be a record-boundary LSN -- a page LSN / pd_lsn,
+ * i.e. the end of one record == the start of the next.  Every caller in this
+ * system passes one (read_resolve a version's pd_lsn, read_at a snapshot LSN), so
+ * the start-LSN-keyed [base_lsn, read_lsn) is exact: a version visible at end
+ * E_j is produced by a record starting at E_{j-1}, and the records to apply are
+ * exactly those with start in [base_lsn, read_lsn).  A read_lsn that fell *inside*
+ * a record would wrongly include that record (whose result is newer than
+ * read_lsn); such non-boundary LSNs are not produced by the page store.
+ *
  * The redo helper (7c)
  * applies the deltas onto the base; if there are no deltas the base *is* the
  * page.  Payloads are materialized into the plan so the consumer needs no layer
