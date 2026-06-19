@@ -302,6 +302,9 @@ ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
 	filebuf = malloc((size_t) total);
 	if (!sorted || !filebuf)
 		goto out;
+	/* zero so struct padding isn't persisted (no heap leak to disk/objects, and
+	 * the on-disk index bytes don't depend on compiler padding) */
+	memset(sorted, 0, (size_t) n * sizeof(DeltaSort));
 
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -318,6 +321,8 @@ ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
 	{
 		sorted[i].ent.data_off = off;
 		memcpy(filebuf + off, recs[sorted[i].src].delta, sorted[i].ent.data_len);
+		sorted[i].ent.crc = img_crc(recs[sorted[i].src].delta,
+								   sorted[i].ent.data_len);
 		off += sorted[i].ent.data_len;
 	}
 	idxsec = filebuf + data_bytes;
@@ -337,7 +342,21 @@ ps_delta_layer_write(uint64_t layer_id, uint32_t timeline,
 		goto out;
 	if (ps_layer_store->write_local_layer(layer_id, filebuf, total) != 0 ||
 		ps_layer_store->seal_local_layer(layer_id) != 0)
+	{
+		/* remove the unmanifested file so its reused layer_id can't dead-lock
+		 * create_local_layer's O_EXCL on a later flush (see ps_image_layer_write) */
+		PsLayerDesc orphan;
+
+		memset(&orphan, 0, sizeof(orphan));
+		orphan.layer_id = layer_id;
+		orphan.location_count = 1;
+		orphan.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		orphan.locations[0].available = true;
+		snprintf(orphan.locations[0].uri, sizeof(orphan.locations[0].uri),
+				 "%s", uri);
+		ps_layer_store->delete_local_layer(&orphan);
 		goto out;
+	}
 
 	memset(out, 0, sizeof(*out));
 	out->layer_id = layer_id;
@@ -394,6 +413,11 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 		foot.nrecs == 0)
 		return -1;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
+	/* reject a footer whose index section would not fit in the file (guards a
+	 * corrupt/forged nrecs/index_off from driving a huge allocation or an OOB
+	 * read), matching the image-layer reader */
+	if (foot.index_off + idx_bytes + sizeof(foot) > loc->size)
+		return -1;
 	idx = malloc((size_t) idx_bytes);
 	if (!idx)
 		return -1;
@@ -409,11 +433,18 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 			continue;
 		if (idx[i].lsn <= lo_lsn || idx[i].lsn > hi_lsn)
 			continue;
+		/* the payload must lie wholly inside the payload section [0, index_off);
+		 * a corrupt offset/len (even with a matching index crc) must fail the
+		 * layer, not expose index/footer bytes as a WAL payload (overflow-safe) */
+		if (idx[i].data_off > foot.index_off ||
+			idx[i].data_len > foot.index_off - idx[i].data_off)
+			goto out;
 		if (*n == cap)
 			goto out;			/* rc stays -1: the chain would be truncated */
 		outs[*n].lsn = idx[i].lsn;
 		outs[*n].data_off = idx[i].data_off;
 		outs[*n].data_len = idx[i].data_len;
+		outs[*n].crc = idx[i].crc;
 		(*n)++;
 	}
 	rc = 0;
@@ -501,6 +532,13 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 
 		if (d->kind != PS_LAYER_DELTA || d->deleting || d->timeline != timeline)
 			continue;
+		/* skip a layer whose key/block/LSN range cannot overlap (lo, read_lsn]:
+		 * its metadata already proves it is irrelevant, so a remote-only/evicted/
+		 * corrupt unrelated layer must not be touched (let alone fail the read) */
+		if (key_cmp(key, &d->start_key) < 0 || key_cmp(key, &d->end_key) > 0 ||
+			block < d->start_block || block > d->end_block ||
+			d->lsn_end <= lo || d->lsn_start > read_lsn)
+			continue;
 		if (ps_delta_layer_collect(d, key, block, lo, read_lsn, outs,
 								   PS_PLAN_MAX_CHAIN, &tn) != 0)
 			goto out;
@@ -522,8 +560,11 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 			bytes = malloc(outs[j].data_len);
 			if (!bytes ||
 				ps_layer_store->read_layer_block(d, outs[j].data_off, bytes,
-												 outs[j].data_len) != 0)
+												 outs[j].data_len) != 0 ||
+				img_crc(bytes, outs[j].data_len) != outs[j].crc)
 			{
+				/* a payload that fails its per-record crc is corrupt: reject the
+				 * read instead of feeding bad bytes to the redo helper */
 				free(bytes);
 				goto out;
 			}

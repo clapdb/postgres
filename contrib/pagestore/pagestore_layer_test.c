@@ -183,6 +183,20 @@ main(void)
 			  plan.deltas[0].lsn == 150, "plan@180 base@100 + delta150");
 		ps_read_plan_free(&plan);
 
+		/* corrupt a delta payload byte on disk -> the read plan must reject it
+		 * (per-record crc), not feed bad WAL bytes to redo.  x150 sorts first, so
+		 * its payload is at offset 0. */
+		{
+			int			fd = open(dl.locations[0].uri, O_WRONLY);
+			unsigned char bad = 0xFF;
+
+			check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1, "corrupt a delta byte");
+			if (fd >= 0)
+				close(fd);
+			check(ps_read_plan_build(&map, 0, &k5, 0, 180, psz, &plan) == -1,
+				  "corrupted delta payload -> read plan rejects (crc)");
+		}
+
 		ps_layer_map_free(&map);
 	}
 

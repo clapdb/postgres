@@ -170,7 +170,7 @@ extern uint32_t ps_image_page_crc(const void *page, uint32_t len);
  * stores and serves the ordered deltas.
  * ------------------------------------------------------------------------- */
 #define PS_DELTA_MAGIC		0x544c4450	/* "PDLT" */
-#define PS_DELTA_VERSION	1
+#define PS_DELTA_VERSION	2			/* v2 added the per-record crc */
 
 typedef struct PsDeltaIndexEnt
 {
@@ -179,6 +179,7 @@ typedef struct PsDeltaIndexEnt
 	uint64_t	lsn;			/* record LSN of this delta */
 	uint64_t	data_off;		/* byte offset of the payload in the file */
 	uint32_t	data_len;		/* payload length */
+	uint32_t	crc;			/* checksum of this payload, verified before use */
 } PsDeltaIndexEnt;
 
 typedef struct PsDeltaFooter
@@ -208,6 +209,7 @@ typedef struct PsDeltaOut
 	uint64_t	lsn;
 	uint64_t	data_off;
 	uint32_t	data_len;
+	uint32_t	crc;			/* expected checksum of the payload bytes */
 } PsDeltaOut;
 
 /* Write 'n' deltas into delta layer 'layer_id', seal it, fill *out. */
