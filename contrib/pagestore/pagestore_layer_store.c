@@ -23,7 +23,11 @@ const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
 static int
 local_open(const char *store_dir)
 {
-	snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
+	int			n;
+
+	n = snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(layer_dir))
+		return -1;
 	return 0;
 }
 
@@ -33,11 +37,30 @@ local_close(void)
 	layer_dir[0] = '\0';
 }
 
-static void
+static int
 local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 {
-	snprintf(buf, buflen, "%s/layer_%016llx",
-			 layer_dir, (unsigned long long) layer_id);
+	int			n;
+
+	n = snprintf(buf, buflen, "%s/layer_%016llx",
+				 layer_dir, (unsigned long long) layer_id);
+	if (n < 0 || (size_t) n >= buflen)
+		return -1;
+	return 0;
+}
+
+static int
+local_fsync_dir(void)
+{
+	int			fd;
+	int			rc;
+
+	fd = open(layer_dir, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
 }
 
 static int
@@ -45,21 +68,43 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 {
 	char		path[4096];
 	int			fd;
+	int			n;
 
-	local_layer_path(layer_id, path, sizeof(path));
+	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
 	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 		return -1;
 	close(fd);
-	snprintf(uri, uri_len, "%s", path);
+	if (local_fsync_dir() != 0)
+	{
+		unlink(path);
+		return -1;
+	}
+	n = snprintf(uri, uri_len, "%s", path);
+	if (n < 0 || (uint32_t) n >= uri_len)
+	{
+		unlink(path);
+		return -1;
+	}
 	return 0;
 }
 
 static int
 local_seal_local_layer(uint64_t layer_id)
 {
-	(void) layer_id;
-	return 0;
+	char		path[4096];
+	int			fd;
+	int			rc;
+
+	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
 }
 
 static int
@@ -69,8 +114,13 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	const char *path = NULL;
 	int			fd;
 	ssize_t		n;
+	uint32_t	nlocs;
 
-	for (uint32_t i = 0; i < layer->location_count; i++)
+	nlocs = layer->location_count;
+	if (nlocs > PS_LAYER_MAX_LOCATIONS)
+		return -1;
+
+	for (uint32_t i = 0; i < nlocs; i++)
 	{
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
@@ -104,8 +154,14 @@ static int
 local_delete_local_layer(const PsLayerDesc *layer)
 {
 	int			rc = 0;
+	int			unlinked = 0;
+	uint32_t	nlocs;
 
-	for (uint32_t i = 0; i < layer->location_count; i++)
+	nlocs = layer->location_count;
+	if (nlocs > PS_LAYER_MAX_LOCATIONS)
+		return -1;
+
+	for (uint32_t i = 0; i < nlocs; i++)
 	{
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
@@ -113,8 +169,12 @@ local_delete_local_layer(const PsLayerDesc *layer)
 		{
 			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
 				rc = -1;
+			else
+				unlinked = 1;
 		}
 	}
+	if (unlinked && local_fsync_dir() != 0)
+		rc = -1;
 	return rc;
 }
 
