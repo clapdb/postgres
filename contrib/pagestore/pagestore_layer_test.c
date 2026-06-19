@@ -164,6 +164,14 @@ main(void)
 		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, &outs, &ocap, &dn);
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
 
+		/* boundary: lo == the layer's newest record (300).  [300,400) must still
+		 * return that record -- the early layer-level prune must use lsn_end < lo,
+		 * not <= lo, or a delta starting exactly at the base LSN is dropped. */
+		dn = 0;
+		r = ps_delta_layer_collect(&dd, &k5, 0, 300, 400, &outs, &ocap, &dn);
+		check(r == 0 && dn == 1 && outs[0].lsn == 300,
+			  "delta collect [300,400) keeps record at lo (lsn_end==lo)");
+
 		/* a small starting buffer must grow to hold all matches (no fixed cap):
 		 * collect into a fresh NULL/0 buffer and expect all 3, not an overflow */
 		{

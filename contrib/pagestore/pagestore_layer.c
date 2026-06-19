@@ -422,9 +422,12 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 	int			rc = -1;
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or its
-	 * LSN range does not overlap the requested (lo_lsn, hi_lsn] */
+	 * LSN range does not overlap the requested half-open [lo_lsn, hi_lsn).  Use
+	 * '<'/'>=' so a layer whose newest record is exactly lo_lsn (a delta starting
+	 * at the base LSN, which the scan includes) is not dropped, and one starting
+	 * exactly at hi_lsn (== read_lsn, excluded) is. */
 	if (!layer_covers(layer, key, block) ||
-		layer->lsn_end <= lo_lsn || layer->lsn_start > hi_lsn)
+		layer->lsn_end < lo_lsn || layer->lsn_start >= hi_lsn)
 		return 0;
 	if (!loc || loc->size < sizeof(PsDeltaFooter))
 		return -1;

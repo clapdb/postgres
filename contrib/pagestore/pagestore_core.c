@@ -105,6 +105,11 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 
 /* ===================== compaction & GC (LSM phase 3) =================== */
 
+/* Max image layers merged in one compact_timeline() call, so a single call does
+ * bounded I/O (a "nonblocking slice") instead of rewriting a whole timeline and
+ * stalling the serve loop; successive idle calls finish the rest. */
+#define COMPACT_BATCH	8
+
 static uint32_t
 count_image_layers(uint32_t timeline)
 {
@@ -189,6 +194,13 @@ compact_timeline(uint32_t timeline)
 		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
 			old[nold++] = *d;
 	}
+	/* Bound the work per call: merge at most COMPACT_BATCH layers, not the whole
+	 * timeline.  A single all-layers merge can read+rewrite every image layer,
+	 * which would stall the foreground serve loop that triggers maintenance; an
+	 * over-threshold timeline is instead compacted in nonblocking slices across
+	 * successive idle calls (and ps_core_maintenance reports more-to-do). */
+	if (nold > COMPACT_BATCH)
+		nold = COMPACT_BATCH;
 
 	/* gather every version (page bytes) from the old layers */
 	for (uint32_t k = 0; k < nold; k++)
