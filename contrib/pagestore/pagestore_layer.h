@@ -206,7 +206,7 @@ typedef struct PsDeltaRec
 typedef struct PsDeltaOut
 {
 	uint64_t	lsn;
-	uint32_t	data_off;
+	uint64_t	data_off;
 	uint32_t	data_len;
 } PsDeltaOut;
 

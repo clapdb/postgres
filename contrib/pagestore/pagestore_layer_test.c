@@ -137,6 +137,12 @@ main(void)
 		dn = 0;
 		r = ps_delta_layer_collect(&dd, &k5, 1, 0, 1000, outs, 8, &dn);
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
+
+		/* overflow: (5,0) has 3 matches but the cap is 2 -> error, not a silent
+		 * truncated chain */
+		dn = 0;
+		r = ps_delta_layer_collect(&dd, &k5, 0, 0, 1000, outs, 2, &dn);
+		check(r == -1, "delta collect overflow (cap < matches) -> error");
 	}
 
 	/* --- read plan: base image + ordered delta chain --- */

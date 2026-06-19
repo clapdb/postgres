@@ -403,14 +403,16 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 		goto out;
 
 	/* index is sorted by (key, block, lsn): matches are contiguous + ascending */
-	for (uint32_t i = 0; i < foot.nrecs && *n < cap; i++)
+	for (uint32_t i = 0; i < foot.nrecs; i++)
 	{
 		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
 			continue;
 		if (idx[i].lsn <= lo_lsn || idx[i].lsn > hi_lsn)
 			continue;
+		if (*n == cap)
+			goto out;			/* rc stays -1: the chain would be truncated */
 		outs[*n].lsn = idx[i].lsn;
-		outs[*n].data_off = (uint32_t) idx[i].data_off;
+		outs[*n].data_off = idx[i].data_off;
 		outs[*n].data_len = idx[i].data_len;
 		(*n)++;
 	}
@@ -470,10 +472,14 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 		const PsLayerDesc *d = &map->layers[i];
 		uint64_t	l;
 
+		int			r;
+
 		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
 			continue;
-		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l) == 1 && (!plan->has_base || l > plan->base_lsn))
+		r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size, &l);
+		if (r < 0)
+			goto out;			/* read/format error: do not pick a wrong base */
+		if (r == 1 && (!plan->has_base || l > plan->base_lsn))
 		{
 			if (!plan->base)
 				plan->base = malloc(page_size);
