@@ -92,6 +92,28 @@ main(void)
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
 	check(r == 0, "absent key -> no version");
 
+	/* bloom read cache: the lookups above built this layer's bloom from its
+	 * index; present keys must still be found (no false negative) and absent keys
+	 * still rejected via the cached bloom */
+	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
+	check(r == 1 && out[0] == 0xA3, "bloom-cached: (5,0) still found");
+	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL);
+	check(r == 1 && out[0] == 0xC1, "bloom-cached: (6,0) still found");
+	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
+	check(r == 0, "bloom-cached: absent key still rejected");
+	{
+		int			ok = 1;
+
+		for (uint32_t rel = 100; rel < 400; rel++)	/* many absent keys */
+		{
+			PsKey		ka = {1, 1, rel, 0};
+
+			if (ps_image_layer_lookup(&d, &ka, 0, 1000, out, psz, NULL, NULL) != 0)
+				ok = 0;
+		}
+		check(ok, "bloom-cached: 300 absent keys all rejected");
+	}
+
 	/* same-lsn duplicate versions of one (key,block): ambiguous only when the
 	 * bytes differ (a genuine rewrite).  Identical-byte duplicates within a layer
 	 * are benign (compaction merges crash-overlapped layers into one). */
