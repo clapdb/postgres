@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "pagestore_layer_store.h"
 #include "pagestore_memtable.h"
 
 typedef struct MemEnt
@@ -129,6 +130,23 @@ ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 	return 1;
 }
 
+/*
+ * Drop the already-flushed runs [0,i): their pages were written into image layers
+ * and recorded in the manifest, so a retry must not re-emit them as duplicates.
+ * Keeps the unflushed tail [i,n) (with its still-owned pages) for the retry.
+ */
+static void
+drop_flushed_prefix(PsMemtable *mt, uint32_t i)
+{
+	for (uint32_t r = 0; r < i; r++)
+		free(mt->ents[r].page);
+	if (i > 0)
+	{
+		memmove(mt->ents, mt->ents + i, (size_t) (mt->n - i) * sizeof(MemEnt));
+		mt->n -= i;
+	}
+}
+
 static int
 ent_timeline_cmp(const void *pa, const void *pb)
 {
@@ -165,7 +183,10 @@ ps_memtable_flush(PsMemtable *mt, PsAllocLayerId alloc, PsOnLayer on_layer,
 
 		recs = malloc((size_t) m * sizeof(PsImgRec));
 		if (!recs)
-			return -1;			/* leave memtable intact for retry */
+		{
+			drop_flushed_prefix(mt, i);	/* don't re-emit already-flushed runs */
+			return -1;
+		}
 		for (uint32_t r = 0; r < m; r++)
 		{
 			recs[r].key = mt->ents[i + r].key;
@@ -175,22 +196,20 @@ ps_memtable_flush(PsMemtable *mt, PsAllocLayerId alloc, PsOnLayer on_layer,
 		}
 
 		layer_id = alloc(ctx);
-		if (ps_image_layer_write(layer_id, tl, recs, m, mt->page_size,
-								 &desc) != 0 ||
-			on_layer(ctx, &desc) != 0)
+		if (ps_image_layer_write(layer_id, tl, recs, m, mt->page_size, &desc) != 0)
 		{
+			free(recs);			/* write failed: it removed its own file */
+			drop_flushed_prefix(mt, i);
+			return -1;
+		}
+		if (on_layer(ctx, &desc) != 0)
+		{
+			/* the layer was written + sealed but never recorded in the manifest;
+			 * remove it so its reused id can't later wedge create_local_layer's
+			 * O_EXCL (g_next_layer_id is rebuilt from the manifest) */
+			ps_layer_store->delete_local_layer(&desc);
 			free(recs);
-			/* Partial flush: runs [0,i) are already written and recorded in the
-			 * manifest.  Drop them so a retry does not re-emit them as duplicate
-			 * layers; keep the unflushed tail [i,n) for the retry. */
-			for (uint32_t r = 0; r < i; r++)
-				free(mt->ents[r].page);
-			if (i > 0)
-			{
-				memmove(mt->ents, mt->ents + i,
-						(size_t) (mt->n - i) * sizeof(MemEnt));
-				mt->n -= i;
-			}
+			drop_flushed_prefix(mt, i);
 			return -1;
 		}
 		free(recs);

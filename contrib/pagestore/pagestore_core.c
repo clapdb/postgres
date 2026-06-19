@@ -1273,6 +1273,15 @@ ps_core_open(const char *store_dir)
 	 * the read path; the SPDK daemon stays on the segment path for now */
 	if (use_layers)
 	{
+		/* reject a non-positive threshold before the unsigned cast: a negative
+		 * --flush-pages would otherwise become a huge unsigned threshold and the
+		 * memtable would never flush (unbounded RAM) */
+		if (flush_pages <= 0)
+		{
+			fprintf(stderr, "pagestore_core: --flush-pages must be positive "
+					"(got %d)\n", flush_pages);
+			return -1;
+		}
 		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
 		if (!g_memtable)
 			return -1;
