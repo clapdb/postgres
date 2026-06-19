@@ -1366,7 +1366,15 @@ ps_core_open(const char *store_dir)
 			return -1;
 	}
 	/* the materialized-page cache helps both read paths (read_resolve and the
-	 * SPDK async path), so it is not gated on use_layers */
+	 * SPDK async path), so it is not gated on use_layers.  Reject a negative
+	 * --cache-pages before the unsigned cast (it would become a huge capacity and
+	 * make ps_pgcache_init attempt an enormous allocation); 0 disables the cache. */
+	if (cache_pages < 0)
+	{
+		fprintf(stderr, "pagestore_core: --cache-pages must be >= 0 (got %d)\n",
+				cache_pages);
+		return -1;
+	}
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
 	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
 			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
