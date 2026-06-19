@@ -92,7 +92,7 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * checksums.
  * ------------------------------------------------------------------------- */
 #define PS_IMG_MAGIC	0x47494d50	/* "PIMG" */
-#define PS_IMG_VERSION	1
+#define PS_IMG_VERSION	2			/* v2 added the per-page crc */
 
 typedef struct PsImgIndexEnt
 {
@@ -100,6 +100,7 @@ typedef struct PsImgIndexEnt
 	uint32_t	block;
 	uint64_t	lsn;			/* page_lsn of this version */
 	uint64_t	data_off;		/* byte offset of the page within the file */
+	uint32_t	crc;			/* checksum of this page, verified before serving */
 } PsImgIndexEnt;
 
 typedef struct PsImgFooter

@@ -252,7 +252,13 @@ compact_timeline(uint32_t timeline)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
-		ps_manifest_mark_delete(old[k].layer_id);
+		/* Only unlink the local file once the layer is durably marked deleting;
+		 * otherwise a crash could leave a "live" manifest entry whose file is
+		 * gone, so later reads/compactions hit a missing file.  If REMOVE_LAYER
+		 * then fails the layer stays 'deleting' -- reads skip it and gc_resume()
+		 * finishes the removal on the next start. */
+		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
+			continue;
 		ps_layer_store->delete_local_layer(&old[k]);
 		ps_manifest_remove_layer(old[k].layer_id);
 	}
@@ -265,13 +271,6 @@ cleanup:
 	free(pages);
 	free(old);
 	return rc;
-}
-
-static void
-maybe_compact(uint32_t timeline)
-{
-	if (count_image_layers(timeline) > (uint32_t) compact_layers)
-		compact_timeline(timeline);
 }
 
 /* ===================== segment storage (log-structured) ================= */
@@ -453,6 +452,24 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 			best = v;
 	}
 	return best;
+}
+
+/*
+ * Is 'lsn' ambiguous on this entry -- more than one stored version at this exact
+ * lsn?  PostgreSQL can rewrite a page without advancing its page LSN (e.g. hint
+ * bits), so an lsn does not uniquely identify a version.  When it is ambiguous a
+ * same-lsn image-layer hit may be an older version than the authoritative latest
+ * append, so the read must come from the segment instead.
+ */
+static int
+page_lsn_ambiguous(const PageEnt *e, uint64_t lsn)
+{
+	int			seen = 0;
+
+	for (int i = 0; i < e->nver; i++)
+		if (e->vers[i].lsn == lsn && ++seen > 1)
+			return 1;
+	return 0;
 }
 
 /* --- fork size index (keyed by timeline, key) --- */
@@ -933,7 +950,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (ps_memtable_full(g_memtable))
 		{
 			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
-			maybe_compact(timeline);	/* bound the image-layer count */
+			/* a flush groups by timeline and can emit a layer for several of
+			 * them, so compact every timeline now over the threshold -- not only
+			 * the one this write belongs to (a colder timeline could otherwise
+			 * grow unbounded until it happens to cross the flush threshold) */
+			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
+				if ((ct == 0 || timelines[ct].defined) &&
+					count_image_layers(ct) > (uint32_t) compact_layers)
+					compact_timeline(ct);
 		}
 	}
 	return 0;
@@ -1011,17 +1035,24 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		{
 			uint64_t	l;
 
-			if (g_memtable &&
-				ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
-				l == pv->lsn)
+			/* The memtable / image-layer fast paths identify a version only by
+			 * lsn; if that lsn is ambiguous (a same-lsn rewrite, e.g. hint bits),
+			 * a same-lsn hit may be an older version than the authoritative latest
+			 * append, so serve from the segment (pv's exact location) instead. */
+			if (!page_lsn_ambiguous(e, pv->lsn))
 			{
-				rr_mem++;
-				return 1;		/* served from the memtable */
-			}
-			if (layer_map_lookup(tl, key, block, rl, &l, out) && l == pv->lsn)
-			{
-				rr_layer++;
-				return 1;		/* served from an image layer */
+				if (g_memtable &&
+					ps_memtable_lookup(g_memtable, tl, key, block, rl, &l, out) &&
+					l == pv->lsn)
+				{
+					rr_mem++;
+					return 1;	/* served from the memtable */
+				}
+				if (layer_map_lookup(tl, key, block, rl, &l, out) && l == pv->lsn)
+				{
+					rr_layer++;
+					return 1;	/* served from an image layer */
+				}
 			}
 			rr_seg++;
 			return read_version(pv, out) == 0 ? 1 : 0;	/* segment fallback */

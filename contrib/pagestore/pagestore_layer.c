@@ -166,6 +166,7 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 		sorted[i].ent.data_off = (uint64_t) i * page_size;
 		memcpy(filebuf + sorted[i].ent.data_off, recs[sorted[i].src].page,
 			   page_size);
+		sorted[i].ent.crc = img_crc(recs[sorted[i].src].page, page_size);
 	}
 	/* index section */
 	idxsec = filebuf + data_bytes;
@@ -274,6 +275,7 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	uint64_t	idx_bytes;
 	uint64_t	best_off = 0;
 	uint64_t	best_lsn = 0;
+	uint32_t	best_crc = 0;
 	int			found = 0;
 	int			rc = -1;
 
@@ -309,6 +311,7 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		{
 			best_lsn = idx[i].lsn;
 			best_off = idx[i].data_off;
+			best_crc = idx[i].crc;
 			found = 1;
 		}
 	}
@@ -319,6 +322,9 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
 		goto out;
+	if (img_crc(out, page_size) != best_crc)
+		goto out;				/* corrupt page bytes -- rc stays -1, caller falls
+								 * back to the segment copy */
 	if (out_lsn)
 		*out_lsn = best_lsn;
 	rc = 1;
