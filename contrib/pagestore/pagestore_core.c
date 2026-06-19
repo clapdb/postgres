@@ -259,9 +259,16 @@ compact_timeline(uint32_t timeline)
 
 	/* install the new merged layer durably, THEN delete the old ones */
 	nid = alloc_layer_id(NULL);
-	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
-							 &newdesc) != 0 || record_layer(NULL, &newdesc) != 0)
+	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size, &newdesc) != 0)
+		goto cleanup;			/* write failed: it removed its own file */
+	if (record_layer(NULL, &newdesc) != 0)
+	{
+		/* written + sealed but not recorded in the manifest: delete it so its
+		 * reused layer id can't later wedge create_local_layer's O_EXCL (the same
+		 * orphan-cleanup the memtable flush path does) */
+		ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
+	}
 	for (uint32_t k = 0; k < nold; k++)
 	{
 		/* Only unlink the local file once the layer is durably marked deleting;
@@ -964,7 +971,17 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		ps_memtable_put(g_memtable, timeline, key, block, hdr.lsn, page);
 		if (ps_memtable_full(g_memtable))
 		{
-			ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
+			/* The page is already durable in the segment log (above), which is
+			 * what recover() rebuilds from, so a failed flush must not let the
+			 * memtable grow without bound across retries: drop the staging (it is
+			 * reconstructable) instead of keeping it at/over the threshold. */
+			if (ps_memtable_flush(g_memtable, alloc_layer_id, record_layer,
+								  NULL) != 0)
+			{
+				fprintf(stderr, "pagestore_core: memtable flush failed; dropping "
+						"staged pages (still durable in the segment log)\n");
+				ps_memtable_reset(g_memtable);
+			}
 			/* a flush groups by timeline and can emit a layer for several of
 			 * them, so compact every timeline now over the threshold -- not only
 			 * the one this write belongs to (a colder timeline could otherwise
@@ -1273,13 +1290,21 @@ ps_core_open(const char *store_dir)
 	 * the read path; the SPDK daemon stays on the segment path for now */
 	if (use_layers)
 	{
-		/* reject a non-positive threshold before the unsigned cast: a negative
-		 * --flush-pages would otherwise become a huge unsigned threshold and the
-		 * memtable would never flush (unbounded RAM) */
+		/* reject non-positive thresholds before their unsigned casts: a negative
+		 * --flush-pages would become a huge flush threshold (memtable never
+		 * flushes -> unbounded RAM), and a negative --compact-layers a huge
+		 * compaction threshold (compaction never runs -> layers grow without
+		 * bound, every read scanning an ever-larger map) */
 		if (flush_pages <= 0)
 		{
 			fprintf(stderr, "pagestore_core: --flush-pages must be positive "
 					"(got %d)\n", flush_pages);
+			return -1;
+		}
+		if (compact_layers <= 0)
+		{
+			fprintf(stderr, "pagestore_core: --compact-layers must be positive "
+					"(got %d)\n", compact_layers);
 			return -1;
 		}
 		g_memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
