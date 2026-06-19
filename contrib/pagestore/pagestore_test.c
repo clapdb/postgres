@@ -73,7 +73,8 @@ rm_rf(const char *path)
 
 static void *cl_shm;
 static int	cl_shm_fd;
-static int	cl_chan;
+static int	cl_pool[PS_NSHARDS];	/* one claimed channel per shard */
+static uint32_t cl_nshards;			/* shard count published by the daemon */
 static uint32_t cl_page_size;
 
 static void
@@ -100,21 +101,33 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
 	cl_page_size = hdr->page_size;
 
-	cl_chan = -1;
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
+	/* claim one channel in each shard's pool, so a request can be routed to the
+	 * shard that owns its key (identity at nshards == 1) */
+	cl_nshards = hdr->nshards ? hdr->nshards : 1;
+	if (cl_nshards > PS_NSHARDS)
+		cl_nshards = PS_NSHARDS;
+	for (uint32_t s = 0; s < cl_nshards; s++)
 	{
-		PsChannel  *ch = ps_channel(cl_shm, i);
+		uint32_t	first,
+					cnt;
 
-		if (ps_cas(&ch->claimed, 0, 1))
+		cl_pool[s] = -1;
+		ps_shard_channel_range(s, cl_nshards, hdr->nchannels, &first, &cnt);
+		for (uint32_t i = first; i < first + cnt; i++)
 		{
-			cl_chan = (int) i;
-			break;
+			PsChannel  *ch = ps_channel(cl_shm, i);
+
+			if (ps_cas(&ch->claimed, 0, 1))
+			{
+				cl_pool[s] = (int) i;
+				break;
+			}
 		}
-	}
-	if (cl_chan < 0)
-	{
-		fprintf(stderr, "no free channel\n");
-		exit(2);
+		if (cl_pool[s] < 0)
+		{
+			fprintf(stderr, "no free channel in shard %u\n", s);
+			exit(2);
+		}
 	}
 }
 
@@ -123,8 +136,9 @@ client_detach(void)
 {
 	if (cl_shm)
 	{
-		if (cl_chan >= 0)
-			ps_store_release(&ps_channel(cl_shm, cl_chan)->claimed, 0);
+		for (uint32_t s = 0; s < cl_nshards; s++)
+			if (cl_pool[s] >= 0)
+				ps_store_release(&ps_channel(cl_shm, cl_pool[s])->claimed, 0);
 		munmap(cl_shm, PS_SHM_SIZE);
 		cl_shm = NULL;
 	}
@@ -136,14 +150,28 @@ client_detach(void)
 }
 
 static PsChannel *
-cl_exec(void)
+cl_exec(PsChannel *ch)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
-
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;					/* busy wait; single in-flight request */
 	return ch;
+}
+
+/* route a request for (rel, fork) to the channel in that key's shard pool */
+static PsChannel *
+cl_route(uint32_t rel, int32_t fork)
+{
+	PsKey		k = {1, 1, rel, fork};
+
+	return ps_channel(cl_shm, cl_pool[ps_shard_for_key(&k, cl_nshards)]);
+}
+
+/* keyless ops (branch/timeline create) go to shard 0's channel */
+static PsChannel *
+cl_route0(void)
+{
+	return ps_channel(cl_shm, cl_pool[0]);
 }
 
 static void
@@ -161,89 +189,89 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 static void
 op_create(uint32_t rel, int32_t fork)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_CREATE;
-	cl_exec();
+	cl_exec(ch);
 }
 
 static int
 op_exists(uint32_t rel, int32_t fork)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_EXISTS;
-	return cl_exec()->result != 0;
+	return cl_exec(ch)->result != 0;
 }
 
 static void
 op_unlink(uint32_t rel, int32_t fork)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_UNLINK;
-	cl_exec();
+	cl_exec(ch);
 }
 
 static uint32_t
 op_nblocks(uint32_t rel, int32_t fork)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_NBLOCKS;
-	return cl_exec()->result;
+	return cl_exec(ch)->result;
 }
 
 static void
 op_truncate(uint32_t rel, int32_t fork, uint32_t nblocks)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->nblocks = nblocks;
-	cl_exec();
+	cl_exec(ch);
 }
 
 static void
 op_zeroextend(uint32_t rel, int32_t fork, uint32_t block, uint32_t nblocks)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_ZEROEXTEND;
 	ch->blocknum = block;
 	ch->nblocks = nblocks;
-	cl_exec();
+	cl_exec(ch);
 }
 
 static void
 op_write_one(uint32_t rel, int32_t fork, uint32_t block, const unsigned char *page)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_WRITEV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	memcpy(ch->data, page, cl_page_size);
-	cl_exec();
+	cl_exec(ch);
 }
 
 static void
 op_read_one(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, cl_page_size);
 }
 
@@ -252,14 +280,14 @@ static void
 op_writev(uint32_t rel, int32_t fork, uint32_t block, const unsigned char *pages,
 		  uint32_t n)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_WRITEV;
 	ch->blocknum = block;
 	ch->nblocks = n;
 	memcpy(ch->data, pages, (size_t) n * cl_page_size);
-	cl_exec();
+	cl_exec(ch);
 }
 
 /* Vectored read of n contiguous pages in a single op. */
@@ -267,13 +295,13 @@ static void
 op_readv(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out,
 		 uint32_t n)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = n;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, (size_t) n * cl_page_size);
 }
 
@@ -281,13 +309,13 @@ static void
 op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 		   unsigned char *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, cl_page_size);
 }
 
@@ -297,26 +325,26 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 static void
 op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route0();
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
-	cl_exec();
+	cl_exec(ch);
 }
 
 /* Like op_create_branch but returns the daemon's status (for negative tests). */
 static int
 op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route0();
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
-	return cl_exec()->status;
+	return cl_exec(ch)->status;
 }
 
 /* Write one page on a specific timeline. */
@@ -324,7 +352,7 @@ static void
 op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			const unsigned char *page)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
@@ -332,7 +360,7 @@ op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	memcpy(ch->data, page, cl_page_size);
-	cl_exec();
+	cl_exec(ch);
 }
 
 /* Read one page (current) on a specific timeline. */
@@ -340,14 +368,14 @@ static void
 op_read_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 		   unsigned char *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, cl_page_size);
 }
 
@@ -356,14 +384,14 @@ static void
 op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			  uint64_t lsn, unsigned char *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, cl_page_size);
 }
 
@@ -373,25 +401,25 @@ op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 static void
 op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route0();
 
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_APPEND;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	memcpy(ch->data, data, len);
-	cl_exec();
+	cl_exec(ch);
 }
 
 /* Return the end LSN of a timeline's shipped WAL. */
 static uint64_t
 op_wal_size(uint32_t tl)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route0();
 
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_SIZE;
-	cl_exec();
+	cl_exec(ch);
 	return ch->req_lsn;
 }
 
@@ -399,13 +427,13 @@ op_wal_size(uint32_t tl)
 static uint32_t
 op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route0();
 
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_READ;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
-	cl_exec();
+	cl_exec(ch);
 	memcpy(out, ch->data, len);
 	return ch->result;
 }
@@ -415,14 +443,14 @@ op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 static void
 op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
-	cl_exec();
+	cl_exec(ch);
 }
 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
@@ -430,7 +458,7 @@ static int
 op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			  uint64_t lsn_max, uint64_t *out)
 {
-	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsChannel  *ch = cl_route(rel, fork);
 	int			n;
 
 	cl_setkey(ch, rel, fork);
@@ -438,7 +466,7 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
-	n = (int) cl_exec()->result;
+	n = (int) cl_exec(ch)->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
 	return n;
 }
@@ -1044,6 +1072,66 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 #undef NKIDS
 }
 
+/*
+ * Unit-test the shard-routing contract (pure helpers in pagestore_ipc.h, no
+ * daemon).  Clients and the daemon both rely on these for any nshards, so verify
+ * them for nshards > 1 too even though the daemon currently runs nshards = 1.
+ */
+static void
+run_sharding_contract(void)
+{
+	for (uint32_t ns = 1; ns <= 8; ns++)
+	{
+		uint32_t	prev_end = 0,
+					covered = 0;
+		int			tiled = 1;
+
+		/* the channel pools tile [0, PS_MAX_CHANNELS): contiguous, no gap/overlap */
+		for (uint32_t s = 0; s < ns; s++)
+		{
+			uint32_t	first,
+						cnt;
+
+			ps_shard_channel_range(s, ns, PS_MAX_CHANNELS, &first, &cnt);
+			if (first != prev_end || cnt == 0)
+				tiled = 0;
+			prev_end = first + cnt;
+			covered += cnt;
+		}
+		check(tiled && prev_end == PS_MAX_CHANNELS && covered == PS_MAX_CHANNELS,
+			  "shard channel pools tile [0,nchannels) for nshards=%u", ns);
+
+		/* key -> shard is in range, deterministic, and (for ns>1) spreads */
+		{
+			int			inrange = 1,
+						stable = 1;
+			uint32_t	hit0 = 0,
+						hitN = 0;
+
+			for (uint32_t rel = 0; rel < 256; rel++)
+			{
+				PsKey		k = {1, 1, rel, 0};
+				uint32_t	a = ps_shard_for_key(&k, ns);
+
+				if (a >= ns)
+					inrange = 0;
+				if (a != ps_shard_for_key(&k, ns))
+					stable = 0;
+				if (a == 0)
+					hit0++;
+				else
+					hitN++;
+			}
+			check(inrange && stable,
+				  "ps_shard_for_key in [0,%u) and deterministic", ns);
+			if (ns > 1)
+				check(hit0 > 0 && hitN > 0,
+					  "ps_shard_for_key spreads keys across shards (nshards=%u)",
+					  ns);
+		}
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1065,6 +1153,9 @@ main(int argc, char **argv)
 		perror("mkdtemp");
 		return 2;
 	}
+
+	/* shard-routing contract (pure helpers; no daemon) */
+	run_sharding_contract();
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)

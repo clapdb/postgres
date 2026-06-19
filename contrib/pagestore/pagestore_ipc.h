@@ -45,6 +45,16 @@
 /* Geometry */
 #define PS_MAX_CHANNELS		128
 
+/*
+ * Shard count (LSM phase 9 / sharding).  The daemon owns one Shard per core and
+ * publishes this in the shm header (PsShmHeader.nshards) so clients route the
+ * same way.  PS_NSHARDS == 1 keeps behavior identical to the single-owner daemon;
+ * real per-shard worker threads arrive in a later step.  The channel array is
+ * partitioned into nshards contiguous pools (see ps_shard_channel_range), and a
+ * request for 'key' is routed to ps_shard_for_key(key)'s pool.
+ */
+#define PS_NSHARDS			1
+
 /* Mailbox state (atomic uint32) */
 #define PS_STATE_IDLE		0
 #define PS_STATE_REQUEST	1
@@ -121,7 +131,7 @@ typedef struct PsShmHeader
 	uint32_t	page_size;		/* logical page size negotiated with engine */
 	uint32_t	io_unit;		/* == PS_IO_UNIT */
 	uint32_t	nchannels;
-	uint32_t	pad0;
+	uint32_t	nshards;		/* daemon's shard count; clients route to match */
 	uint64_t	channel_stride;
 	uint64_t	channels_off;
 } PsShmHeader;
@@ -144,6 +154,52 @@ ps_channel_data_offset(uint32_t idx)
 {
 	return PS_CHANNELS_OFF + (uint64_t) idx * PS_CHANNEL_STRIDE +
 		offsetof(PsChannel, data);
+}
+
+/* --- sharding: key -> shard and the channel pool a shard owns ----------- */
+
+/*
+ * Which shard owns 'key'.  Block- and timeline-independent (per the sharding
+ * design): every block and every timeline of a logical key live on one shard, so
+ * only the four key fields feed the hash (FNV-1a).  nshards <= 1 -> shard 0.
+ */
+static inline uint32_t
+ps_shard_for_key(const PsKey *key, uint32_t nshards)
+{
+	uint32_t	vals[4];
+	uint32_t	h = 2166136261u;	/* FNV-1a offset basis, mixed per 32-bit word */
+
+	if (nshards <= 1)
+		return 0;
+	vals[0] = key->spcOid;
+	vals[1] = key->dbOid;
+	vals[2] = key->relNumber;
+	vals[3] = (uint32_t) key->forkNum;
+	for (unsigned i = 0; i < 4; i++)
+	{
+		h = (h ^ vals[i]) * 16777619u;
+	}
+	return h % nshards;
+}
+
+/*
+ * The contiguous channel pool shard 'shard' owns: *first channel index and
+ * *count, partitioning [0, nchannels) into nshards near-equal ranges.  A client
+ * claims a channel within ps_shard_for_key(key)'s pool so the request reaches the
+ * shard that owns the key; at nshards == 1 the pool is the whole array.
+ */
+static inline void
+ps_shard_channel_range(uint32_t shard, uint32_t nshards, uint32_t nchannels,
+					   uint32_t *first, uint32_t *count)
+{
+	uint32_t	per;
+
+	if (nshards == 0)
+		nshards = 1;
+	per = nchannels / nshards;
+	*first = shard * per;
+	/* the last shard absorbs the remainder when nchannels isn't a multiple */
+	*count = (shard == nshards - 1) ? (nchannels - *first) : per;
 }
 
 /* --- atomic helpers (acquire/release) ---------------------------------- */

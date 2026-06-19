@@ -322,6 +322,7 @@ main(int argc, char **argv)
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
+	hdr->nshards = PS_NSHARDS;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 

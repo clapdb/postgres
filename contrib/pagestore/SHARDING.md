@@ -121,16 +121,23 @@ timeline tree under a brief coordination point, not on the read/write hot path.
 
 ## Migration plan (each step keeps the standalone suite green)
 
-1. **This design.**
+1. **This design.** ✅
 2. **Refactor global state into a `Shard` struct, `nshards = 1`, still one
-   thread.** Pure mechanical refactor (page_idx/fork_idx/memtable/pgcache/
-   layer_map/cursor/next_layer_id become `shard->...`); behavior identical,
-   116/116 unchanged.  De-risks everything below.
+   thread.** ✅ Pure mechanical refactor (page_idx/fork_idx/memtable/pgcache/
+   layer_map/cursor/next_layer_id become `shard->...`); behavior identical.
+   De-risks everything below.
 3. **Partition channels + client-side routing**, still `nshards = 1` (routing is
-   identity) — proves the routing path without parallelism.
+   identity) — proves the routing path without parallelism. ✅ The contract lives
+   in `pagestore_ipc.h` (`PS_NSHARDS`, `ps_shard_for_key`, `ps_shard_channel_range`),
+   the daemon publishes `nshards` in the shm header and routes keys with
+   `shard_for` → `ps_shard_for_key`, and the standalone client claims one channel
+   per shard pool and routes each op to its key's shard (a unit test checks the
+   helpers for `nshards` up to 8).  The in-engine client (`backend_localsvc`)
+   keeps its single channel — correct at `nshards = 1` (the sole pool) — and
+   adopts per-key routing in step 4 when `nshards > 1` requires it.
 4. **`nshards > 1` + one worker thread per shard** (POSIX first).  Per-shard
-   manifest files + shard-namespaced layer/segment files.  This is where real
-   parallelism lands.
+   manifest files + shard-namespaced layer/segment files; `backend_localsvc`
+   per-shard channel pool + routing.  This is where real parallelism lands.
 5. **SPDK per-thread qpairs** so the async path scales per core.
 6. **Branch-create coordination** for the shared timeline tree.
 
