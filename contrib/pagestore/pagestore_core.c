@@ -1229,6 +1229,14 @@ ps_core_close(void)
 		ps_memtable_flush(g_memtable, alloc_layer_id, record_layer, NULL);
 		ps_memtable_destroy(g_memtable);
 		g_memtable = NULL;
+		/* the shutdown flush can push a timeline over the compaction threshold;
+		 * run the same compaction/GC append_page does so repeated short-lived
+		 * runs don't accumulate one image layer per clean shutdown (each of which
+		 * every read would then scan) */
+		for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
+			if ((ct == 0 || timelines[ct].defined) &&
+				count_image_layers(ct) > (uint32_t) compact_layers)
+				compact_timeline(ct);
 	}
 	ps_manifest_close();
 }
