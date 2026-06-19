@@ -200,7 +200,23 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 		goto out;
 	if (ps_layer_store->write_local_layer(layer_id, filebuf, total) != 0 ||
 		ps_layer_store->seal_local_layer(layer_id) != 0)
+	{
+		/* The file exists but is unwritten/unsealed and was never recorded in the
+		 * manifest.  Remove it: g_next_layer_id is rebuilt from the manifest, so a
+		 * left-behind id would be reused and create_local_layer's O_EXCL would
+		 * then fail every retry, stranding the layer path. */
+		PsLayerDesc orphan;
+
+		memset(&orphan, 0, sizeof(orphan));
+		orphan.layer_id = layer_id;
+		orphan.location_count = 1;
+		orphan.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		orphan.locations[0].available = true;
+		snprintf(orphan.locations[0].uri, sizeof(orphan.locations[0].uri),
+				 "%s", uri);
+		ps_layer_store->delete_local_layer(&orphan);
 		goto out;
+	}
 
 	memset(out, 0, sizeof(*out));
 	out->layer_id = layer_id;
