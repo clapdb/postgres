@@ -244,6 +244,10 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 		foot.nrecs == 0)
 		return -1;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsImgIndexEnt);
+	/* reject a footer whose index section would not fit in the file (guards a
+	 * corrupt/forged nrecs from driving a huge allocation) */
+	if (foot.index_off + idx_bytes + sizeof(foot) > loc->size)
+		return -1;
 	idx = malloc((size_t) idx_bytes);
 	if (!idx)
 		return -1;
@@ -283,6 +287,10 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		return -1;
 
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsImgIndexEnt);
+	/* reject a footer whose index section would not fit in the file (guards a
+	 * corrupt/forged nrecs from driving a huge allocation) */
+	if (foot.index_off + idx_bytes + sizeof(foot) > loc->size)
+		return -1;
 	idx = malloc((size_t) idx_bytes);
 	if (!idx)
 		return -1;

@@ -545,6 +545,15 @@ stop_daemon(pid_t pid)
 	waitpid(pid, NULL, 0);
 }
 
+/* Hard crash: SIGKILL gives the daemon no chance to flush the memtable, so only
+ * what is durable in the segment log may survive the restart. */
+static void
+kill_daemon_hard(pid_t pid)
+{
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+}
+
 /* ===================== the test suite ================================== */
 
 #define REL_A	16000
@@ -626,21 +635,32 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
+	/* a fresh write right before the crash (while still attached): it is
+	 * acknowledged and durable in the segment log, but likely still unflushed --
+	 * exactly the tail a layer-only restart would drop */
+	fill_page(pa, page_size, 12000, 222);
+	op_write_one(REL_A, FORK0, 9, pa);
+
 	client_detach();
 
-	/* --- crash recovery: restart daemon, rebuild index from segments --- */
-	stop_daemon(dpid);
+	/* --- crash recovery: a HARD crash (SIGKILL -- no clean shutdown, so the
+	 * memtable is never flushed) must not lose writes already durable in the
+	 * segment log. --- */
+	kill_daemon_hard(dpid);
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
 
-	check(op_exists(REL_A, FORK0), "fork still exists after daemon restart");
+	check(op_exists(REL_A, FORK0), "fork still exists after a hard crash");
+	op_read_one(REL_A, FORK0, 9, rb);
+	check(page_has_tag(rb, page_size, 222),
+		  "write just before SIGKILL survives (segment-log durability)");
 	op_read_one(REL_A, FORK0, 5, rb);
-	check(page_has_tag(rb, page_size, 6), "block 5 survives restart (recovered)");
+	check(page_has_tag(rb, page_size, 6), "block 5 survives a hard crash (recovered)");
 	op_read_at(REL_A, FORK0, 0, 7000, rb);
 	check(page_has_tag(rb, page_size, 100),
-		  "COW history survives restart (read_at old version)");
+		  "COW history survives a hard crash (read_at old version)");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
