@@ -1165,35 +1165,6 @@ ps_handle_meta(PsChannel *ch)
 
 /* ===================== lifecycle ====================================== */
 
-/*
- * Rebuild the page and fork indexes from the image layers' on-disk indexes
- * (the persistent LSM index) instead of scanning every segment record.  The
- * versions are tagged with seg = -1 (no segment copy); read_resolve serves them
- * from the layer they came from.
- */
-static void
-rebuild_from_layers(void)
-{
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
-		PsImgIndexEnt *idx;
-		uint32_t	n;
-
-		if (d->kind != PS_LAYER_IMAGE || d->deleting)
-			continue;
-		if (ps_image_layer_read_index(d, &idx, &n) != 0)
-			continue;			/* skip an unreadable layer */
-		for (uint32_t j = 0; j < n; j++)
-		{
-			page_add_version(d->timeline, &idx[j].key, idx[j].block,
-							 idx[j].lsn, -1, 0);
-			fork_grow(d->timeline, &idx[j].key, idx[j].block + 1);
-		}
-		free(idx);
-	}
-}
-
 /* Flush the memtable and close the manifest on a clean shutdown, so a restart
  * rebuilds the full state from layers without scanning segments. */
 void
@@ -1251,21 +1222,19 @@ ps_core_open(const char *store_dir)
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
 	load_timelines();
-	if (use_layers && ps_layer_map.nlayers > 0)
-	{
-		/* layers are the durable read state -- rebuild from their indexes and
-		 * position the append cursor at a fresh segment (a cheap stat loop, no
-		 * per-record scan).  Segments are written but no longer scanned. */
-		int			id = 0;
-
-		rebuild_from_layers();
-		while (ps_storage->seg_size(id) >= 0)
-			id++;
-		cur_seg = id;
-		cur_off = 0;
-	}
-	else
-		recover();				/* segment scan (SPDK path, or no layers yet) */
+	/*
+	 * Rebuild the authoritative page index from the complete segment log.  The
+	 * segment log is the source of truth: every acknowledged write is appended
+	 * there before it enters the memtable, and the memtable is only flushed at a
+	 * threshold or on clean shutdown.  A crash -- or a failed shutdown flush --
+	 * can therefore leave durable segment records that no image layer covers; if
+	 * we rebuilt only from the layer indexes those newer versions would be
+	 * dropped and acknowledged writes lost.  Scanning the segments recovers them.
+	 * (The manifest-replayed layer map above still serves reads; skipping the
+	 * already-flushed segment prefix via a persisted flush watermark is a
+	 * deferred optimization.)
+	 */
+	recover();
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
