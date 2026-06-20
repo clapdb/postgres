@@ -11,14 +11,95 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "pagestore_layer_store.h"
 
 static char layer_dir[2048];
 
+/*
+ * Object tier (LSM phase 4).  A configured object store is, for now, a local
+ * directory standing in for a remote bucket: "upload" copies a sealed layer file
+ * into it keyed by layer id, "download" copies it back, keyed the same way.  A
+ * real provider (S3, ...) drops in behind these same four ops.  Empty until
+ * ps_layer_store_set_object_dir() configures it; the remote ops then return
+ * ENOTSUP, so a daemon without an object tier behaves exactly as before.
+ */
+static char object_dir[2048];
+
 const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
+
+void
+ps_layer_store_set_object_dir(const char *dir)
+{
+	if (dir == NULL)
+		object_dir[0] = '\0';
+	else
+		snprintf(object_dir, sizeof(object_dir), "%s", dir);
+}
+
+static int
+object_path(uint64_t layer_id, char *buf, size_t buflen)
+{
+	int			n;
+
+	if (object_dir[0] == '\0')
+		return -1;				/* no object tier configured */
+	n = snprintf(buf, buflen, "%s/obj_%016llx",
+				 object_dir, (unsigned long long) layer_id);
+	if (n < 0 || (size_t) n >= buflen)
+		return -1;
+	return 0;
+}
+
+/* Copy src -> dst (whole file) and fsync dst.  Used for upload/download, since
+ * the object store is a local directory here. */
+static int
+copy_file(const char *src, const char *dst)
+{
+	int			in,
+				out,
+				rc = 0;
+	char		buf[1 << 16];
+	ssize_t		r;
+
+	in = open(src, O_RDONLY);
+	if (in < 0)
+		return -1;
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (out < 0)
+	{
+		close(in);
+		return -1;
+	}
+	while ((r = read(in, buf, sizeof(buf))) > 0)
+	{
+		ssize_t		off = 0;
+
+		while (off < r)
+		{
+			ssize_t		w = write(out, buf + off, (size_t) (r - off));
+
+			if (w <= 0)
+			{
+				rc = -1;
+				goto done;
+			}
+			off += w;
+		}
+	}
+	if (r < 0)
+		rc = -1;
+done:
+	if (rc == 0 && fsync(out) != 0)
+		rc = -1;
+	close(in);
+	close(out);
+	return rc;
+}
 
 static int
 local_open(const char *store_dir)
@@ -171,11 +252,71 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 }
 
 static int
-local_unsupported_layer_op(const PsLayerDesc *layer)
+object_fsync_dir(void)
 {
-	(void) layer;
-	errno = ENOTSUP;
-	return -1;
+	int			fd;
+	int			rc;
+
+	fd = open(object_dir, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	rc = fsync(fd);
+	close(fd);
+	return rc;
+}
+
+/* Upload the sealed local layer into the object store (copy + durable). */
+static int
+local_upload_layer(const PsLayerDesc *layer)
+{
+	char		local[4096],
+				obj[4096];
+
+	if (local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
+		return -1;
+	if (object_path(layer->layer_id, obj, sizeof(obj)) != 0)
+	{
+		errno = ENOTSUP;		/* no object tier configured */
+		return -1;
+	}
+	if (copy_file(local, obj) != 0)
+		return -1;
+	return object_fsync_dir();
+}
+
+/* Download a remote-durable layer back to its canonical local path. */
+static int
+local_download_layer(const PsLayerDesc *layer)
+{
+	char		local[4096],
+				obj[4096];
+
+	if (local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
+		return -1;
+	if (object_path(layer->layer_id, obj, sizeof(obj)) != 0)
+	{
+		errno = ENOTSUP;
+		return -1;
+	}
+	if (copy_file(obj, local) != 0)
+		return -1;
+	return local_fsync_dir();
+}
+
+/* Remove the layer's object-store copy (idempotent). */
+static int
+local_delete_remote_layer(const PsLayerDesc *layer)
+{
+	char		obj[4096];
+
+	if (object_path(layer->layer_id, obj, sizeof(obj)) != 0)
+	{
+		errno = ENOTSUP;
+		return -1;
+	}
+	if (unlink(obj) != 0 && errno != ENOENT)
+		return -1;
+	return object_fsync_dir();
 }
 
 static int
@@ -206,11 +347,16 @@ local_delete_local_layer(const PsLayerDesc *layer)
 	return rc;
 }
 
+/* 1 if the layer has an object-store copy, 0 if not (or no tier configured). */
 static int
 local_layer_exists_remote(const PsLayerDesc *layer)
 {
-	(void) layer;
-	return 0;
+	char		obj[4096];
+	struct stat st;
+
+	if (object_path(layer->layer_id, obj, sizeof(obj)) != 0)
+		return 0;
+	return stat(obj, &st) == 0 ? 1 : 0;
 }
 
 const PsLayerStore PsLayerStoreLocal = {
@@ -221,9 +367,9 @@ const PsLayerStore PsLayerStoreLocal = {
 	.write_local_layer = local_write_local_layer,
 	.seal_local_layer = local_seal_local_layer,
 	.read_layer_block = local_read_layer_block,
-	.upload_layer = local_unsupported_layer_op,
-	.download_layer = local_unsupported_layer_op,
+	.upload_layer = local_upload_layer,
+	.download_layer = local_download_layer,
 	.delete_local_layer = local_delete_local_layer,
-	.delete_remote_layer = local_unsupported_layer_op,
+	.delete_remote_layer = local_delete_remote_layer,
 	.layer_exists_remote = local_layer_exists_remote,
 };

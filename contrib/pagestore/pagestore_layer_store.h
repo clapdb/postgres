@@ -39,4 +39,11 @@ typedef struct PsLayerStore
 extern const PsLayerStore PsLayerStoreLocal;
 extern const PsLayerStore *ps_layer_store;
 
+/*
+ * Configure the object tier (LSM phase 4): 'dir' is the object store (a local
+ * directory standing in for a remote bucket).  NULL/unset disables it, and the
+ * upload/download/delete-remote ops then return ENOTSUP.  Call before open.
+ */
+extern void ps_layer_store_set_object_dir(const char *dir);
+
 #endif							/* PAGESTORE_LAYER_STORE_H */
