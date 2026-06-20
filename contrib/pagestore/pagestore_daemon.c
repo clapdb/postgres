@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,6 +40,57 @@ on_signal(int sig)
 {
 	(void) sig;
 	stop_requested = 1;
+}
+
+static void handle_request(PsChannel *ch);
+
+/* one per-shard worker thread (sharding step 4c-iv) */
+typedef struct Worker
+{
+	pthread_t	tid;
+	void	   *shm;
+	uint32_t	shard;			/* this worker's shard index */
+	uint32_t	first;			/* its channel pool: [first, first+count) */
+	uint32_t	count;
+} Worker;
+
+/*
+ * Serve loop for one shard: poll only this shard's channel pool, so two workers
+ * never touch the same channel.  Each request self-routes by key to this shard's
+ * state, and idle time runs this shard's own compaction.
+ */
+static void *
+worker_main(void *arg)
+{
+	Worker	   *w = arg;
+
+	while (!stop_requested)
+	{
+		int			did_work = 0;
+
+		for (uint32_t i = w->first; i < w->first + w->count; i++)
+		{
+			PsChannel  *ch = ps_channel(w->shm, i);
+
+			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			did_work = 1;
+		}
+
+		if (!did_work)
+		{
+			/* idle: one unit of this shard's background compaction, else sleep */
+			if (!ps_core_maintenance_shard(w->shard))
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -228,32 +280,41 @@ main(int argc, char **argv)
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
 			PS_MAX_CHANNELS);
 
-	while (!stop_requested)
+	/*
+	 * One worker thread per shard, each serving only its channel pool (sharding
+	 * step 4c-iv).  Per-shard state is single-owner; the small shared state is
+	 * synchronized (segment fd cache mutex, timeline 'defined' atomics, shard-0
+	 * branch/WAL routing).  At nshards == 1 this is a single worker == the old
+	 * single-threaded loop.  The main thread waits for a signal, then joins.
+	 */
 	{
-		int			did_work = 0;
+		Worker	   *workers = calloc(ps_nshards, sizeof(Worker));
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
-				continue;
-
-			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
-			did_work = 1;
+			perror("calloc workers");
+			return 1;
 		}
-
-		if (!did_work)
+		for (uint32_t s = 0; s < ps_nshards; s++)
 		{
-			/* idle: do one unit of background compaction before sleeping */
-			if (!ps_core_maintenance())
+			workers[s].shm = shm;
+			workers[s].shard = s;
+			ps_shard_channel_range(s, ps_nshards, PS_MAX_CHANNELS,
+								   &workers[s].first, &workers[s].count);
+			if (pthread_create(&workers[s].tid, NULL, worker_main,
+							   &workers[s]) != 0)
 			{
-				struct timespec ts = {0, 20000};	/* 20us */
-
-				nanosleep(&ts, NULL);
+				perror("pthread_create");
+				stop_requested = 1;
+				for (uint32_t j = 0; j < s; j++)
+					pthread_join(workers[j].tid, NULL);
+				free(workers);
+				return 1;
 			}
 		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			pthread_join(workers[s].tid, NULL);
+		free(workers);
 	}
 
 	{

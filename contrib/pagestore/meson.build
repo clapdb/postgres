@@ -24,6 +24,7 @@ pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c'),
+  dependencies: thread_dep,  # per-shard worker threads + segment fd-cache mutex
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
