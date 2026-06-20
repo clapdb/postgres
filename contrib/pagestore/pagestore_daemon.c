@@ -195,13 +195,20 @@ main(int argc, char **argv)
 	 */
 	hdr = (PsShmHeader *) shm;
 	memset(shm, 0, PS_SHM_SIZE);
-	hdr->magic = PS_SHM_MAGIC;
+	/* Fill every descriptive field first, then publish 'magic' last as the
+	 * readiness sentinel (wait_ready / clients gate on it), so a client that
+	 * observes the daemon ready also sees nshards and the channel geometry. */
 	hdr->version = PS_SHM_VERSION;
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
+	hdr->nshards = PS_NSHARDS;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	/* publish magic with a release store so the readers' acquire-load of it has a
+	 * matching release on the same field, giving a happens-before edge for the
+	 * descriptive fields written above */
+	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

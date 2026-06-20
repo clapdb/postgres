@@ -87,14 +87,15 @@ typedef struct Shard
 				rr_seg;
 } Shard;
 
-#define NSHARDS 1
+#define NSHARDS PS_NSHARDS		/* shared with clients via pagestore_ipc.h */
 static Shard g_shards[NSHARDS];
 
 static Shard *
 shard_for(const PsKey *key)
 {
-	(void) key;					/* NSHARDS == 1: always shard 0 */
-	return &g_shards[0];
+	/* same hash clients route with, so a request always lands on the shard that
+	 * owns the key (identity at NSHARDS == 1) */
+	return &g_shards[ps_shard_for_key(key, NSHARDS)];
 }
 
 static uint64_t g_next_layer_id = 1;	/* global for now (per-shard in step 4) */

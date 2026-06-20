@@ -100,8 +100,10 @@ ls_attach(void)
 	}
 
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
-		hdr->page_size != BLCKSZ)
+	/* acquire-load magic (the daemon's readiness sentinel) so the header fields
+	 * the daemon published before it are visible; pairs with its release store */
+	if (ps_load_acquire(&hdr->magic) != PS_SHM_MAGIC ||
+		hdr->version != PS_SHM_VERSION || hdr->page_size != BLCKSZ)
 	{
 		uint32		got_page_size = hdr->page_size;
 
@@ -111,6 +113,24 @@ ls_attach(void)
 				(errmsg("pagestore localsvc shared memory incompatible"),
 				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
 						   got_page_size, BLCKSZ, hdr->magic, hdr->version)));
+	}
+
+	/*
+	 * This client owns a single arbitrary channel and does not yet route per key
+	 * to a shard's channel pool, so it cannot talk to a multi-shard daemon: a
+	 * request could land on a channel the owning shard never polls.  Fail fast
+	 * until per-shard routing is implemented (sharding step 4c).
+	 */
+	if (hdr->nshards > 1)
+	{
+		uint32		got_nshards = hdr->nshards;
+
+		munmap(shm, PS_SHM_SIZE);
+		close(fd);
+		ereport(ERROR,
+				(errmsg("pagestore localsvc does not support a multi-shard daemon"),
+				 errdetail("daemon nshards=%u; this client requires nshards=1",
+						   got_nshards)));
 	}
 
 	/*
