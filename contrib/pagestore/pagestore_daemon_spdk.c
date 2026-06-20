@@ -79,7 +79,8 @@ read_done(void *arg, int ok)
 	ReqState   *rs = bc->rs;
 
 	if (ok && bc->cacheable)	/* the engine delivered the page into bc->dst */
-		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
+		ps_pgcache_insert(ps_core_pgcache_for(&bc->key), bc->tl, &bc->key,
+						  bc->block, bc->lsn, bc->dst);
 	if (--rs->pending == 0)
 	{
 		rs->active = 0;			/* clear before publishing DONE */
@@ -171,7 +172,9 @@ begin(uint32_t i, PsChannel *ch)
 					/* cache by the resolved source timeline; bypass the cache for
 					 * same-lsn-ambiguous versions (the lsn key can't tell them
 					 * apart), matching read_resolve() on the POSIX path */
-					if (!ambig && ps_pgcache_lookup(stl, &ch->key, blk, v->lsn, dst))
+					if (!ambig &&
+						ps_pgcache_lookup(ps_core_pgcache_for(&ch->key), stl,
+										  &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */
 					bc = &rs->blk[nsub++];
 					bc->rs = rs;
@@ -213,8 +216,9 @@ begin(uint32_t i, PsChannel *ch)
 				}
 				/* cache by the resolved source timeline; bypass for ambiguous
 				 * same-lsn versions (see READV above) */
-				if (!ambig && ps_pgcache_lookup(stl, &ch->key, ch->blocknum,
-												v->lsn, ch->data))
+				if (!ambig &&
+					ps_pgcache_lookup(ps_core_pgcache_for(&ch->key), stl,
+									  &ch->key, ch->blocknum, v->lsn, ch->data))
 				{
 					ps_store_release(&ch->state, PS_STATE_DONE);	/* RAM hit */
 					return;
@@ -401,7 +405,7 @@ main(int argc, char **argv)
 					cm,
 					ce;
 
-		ps_pgcache_stats(&ch, &cm, &ce);
+		ps_core_pgcache_stats(&ch, &cm, &ce);
 		fprintf(stderr, "pagestore_daemon_spdk: shutting down (pgcache hit=%llu "
 				"miss=%llu evict=%llu)\n", (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);

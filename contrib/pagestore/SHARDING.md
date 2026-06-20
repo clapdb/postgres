@@ -166,8 +166,12 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        device offset, single current-segment buffer) runs a single shard until
        step 5; the POSIX file backend handles the per-shard sparse id space
        directly.
-     - **4c-ii** — per-shard materialized-page cache (`ps_pgcache_*` → per-shard
-       handle).
+     - **4c-ii — per-shard materialized-page cache.** ✅ `ps_pgcache_*` is now a
+       `PsPgcache` handle held by value in each `Shard` (no file-scope globals);
+       `read_resolve` uses `&s->pgcache`, and the SPDK async path reaches the right
+       shard's cache via `ps_core_pgcache_for(key)`.  `--cache-pages` is the total
+       budget, split evenly across shards (total RAM independent of nshards; whole
+       budget to shard 0 at `nshards == 1`).  Stats sum across shards.
      - **4c-iii** — timeline-tree coordination (`timelines[]` is read on every
        ancestry walk; branch-create writes it).
      - **4c-iv** — spawn one POSIX worker thread per shard, each polling only its

@@ -265,7 +265,7 @@ main(int argc, char **argv)
 					ce;
 
 		ps_core_read_stats(&rm, &rl, &rs);
-		ps_pgcache_stats(&ch, &cm, &ce);
+		ps_core_pgcache_stats(&ch, &cm, &ce);
 		fprintf(stderr, "pagestore_daemon: shutting down (%u image layers; reads "
 				"mem=%llu layer=%llu seg=%llu; pgcache hit=%llu miss=%llu evict=%llu)\n",
 				ps_core_layer_count(),

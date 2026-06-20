@@ -24,21 +24,43 @@
 
 #include "pagestore_ipc.h"
 
+/*
+ * One cache instance.  Held by value in each shard (sharding step 4c-ii) so a
+ * shard's cache is single-owner and lock-free; the pointer members are owned by
+ * ps_pgcache_init/free.  Treat the fields as private to pagestore_pgcache.c.
+ */
+struct PgcSlot;					/* defined in pagestore_pgcache.c */
+
+typedef struct PsPgcache
+{
+	uint32_t	max;			/* capacity in pages (0 = disabled) */
+	uint32_t	psz;
+	struct PgcSlot *slots;
+	unsigned char *pages;		/* max * psz, slot i at i*psz */
+	int		   *buckets;		/* nbuckets heads (slot index or -1) */
+	uint32_t	nbuckets;
+	uint32_t	nused;			/* slots populated so far (<= max) */
+	uint32_t	hand;			/* CLOCK hand */
+	uint64_t	hits,
+				misses,
+				evict;
+} PsPgcache;
+
 /* Initialize with a capacity in pages (0 disables the cache). */
-extern void ps_pgcache_init(uint32_t max_pages, uint32_t page_size);
-extern void ps_pgcache_free(void);
+extern void ps_pgcache_init(PsPgcache *c, uint32_t max_pages, uint32_t page_size);
+extern void ps_pgcache_free(PsPgcache *c);
 
 /* Look up (timeline, key, block, version_lsn); on hit copy page_size bytes into
  * out and return 1, else 0. */
-extern int	ps_pgcache_lookup(uint32_t timeline, const PsKey *key,
+extern int	ps_pgcache_lookup(PsPgcache *c, uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t version_lsn, void *out);
 
 /* Insert/refresh (timeline, key, block, version_lsn) -> page. */
-extern void ps_pgcache_insert(uint32_t timeline, const PsKey *key,
+extern void ps_pgcache_insert(PsPgcache *c, uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t version_lsn,
 							  const void *page);
 
-extern void ps_pgcache_stats(uint64_t *hits, uint64_t *misses,
-							 uint64_t *evictions);
+extern void ps_pgcache_stats(const PsPgcache *c, uint64_t *hits,
+							 uint64_t *misses, uint64_t *evictions);
 
 #endif							/* PAGESTORE_PGCACHE_H */
