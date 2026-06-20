@@ -1759,11 +1759,18 @@ ps_core_open(const char *store_dir)
 		}
 		/* The materialized-page cache helps both read paths (read_resolve and the
 		 * SPDK async path), so it is not gated on use_layers.  --cache-pages is the
-		 * total budget across shards; split it evenly so total RAM is independent
-		 * of nshards (each shard's cache stays single-owner).  At nshards == 1 the
-		 * shard gets the whole budget -- identical to before. */
-		ps_pgcache_init(&s->pgcache, (uint32_t) cache_pages / ps_nshards,
-						page_size);
+		 * total budget across shards; split it so total RAM is independent of
+		 * nshards (each shard's cache stays single-owner).  Hand the division
+		 * remainder to the first shards rather than flooring it away, so a small
+		 * positive budget (e.g. cache_pages < nshards) still caches its pages
+		 * instead of disabling every shard's cache.  At nshards == 1 the shard gets
+		 * the whole budget -- identical to before. */
+		{
+			uint32_t	budget = (uint32_t) cache_pages;
+			uint32_t	per = budget / ps_nshards + (i < budget % ps_nshards ? 1 : 0);
+
+			ps_pgcache_init(&s->pgcache, per, page_size);
+		}
 	}
 	fprintf(stderr, "pagestore_core: %u image layer(s) across %u shard(s) after "
 			"manifest replay\n", ps_core_layer_count(), ps_nshards);
