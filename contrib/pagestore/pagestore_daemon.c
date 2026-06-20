@@ -18,6 +18,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -26,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -201,9 +203,26 @@ main(int argc, char **argv)
 		else if (strcmp(argv[i], "--object-dir") == 0 && i + 1 < argc)
 		{
 			/* enable the object tier: maintenance uploads sealed layers here */
-			if (ps_layer_store_set_object_dir(argv[++i]) != 0)
+			const char *od = argv[++i];
+
+			if (ps_layer_store_set_object_dir(od) != 0)
 			{
 				fprintf(stderr, "--object-dir path too long\n");
+				return 2;
+			}
+			/* Fail fast on an unusable directory rather than start, acknowledge
+			 * writes, and have every background upload silently fail (leaving the
+			 * requested remote durability absent).  Create it if missing, then
+			 * require it to be a writable directory. */
+			if (mkdir(od, 0700) != 0 && errno != EEXIST)
+			{
+				fprintf(stderr, "--object-dir %s: %s\n", od, strerror(errno));
+				return 2;
+			}
+			if (access(od, W_OK | X_OK) != 0)
+			{
+				fprintf(stderr, "--object-dir %s not writable: %s\n",
+						od, strerror(errno));
 				return 2;
 			}
 			ps_object_tier = 1;

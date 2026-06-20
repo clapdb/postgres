@@ -330,19 +330,23 @@ count_image_layers(Shard *s, uint32_t timeline)
 }
 
 /*
- * Finish removing a 'deleting' layer: drop its local file, then its object copy
- * (when the object tier holds one), and only then record the manifest removal.
- * Ordered so a failed unlink or remote delete leaves the layer 'deleting' for the
- * next gc_resume rather than orphaning a file/object whose manifest entry is gone;
- * delete_remote_layer is idempotent, so a retry is safe.
+ * Finish removing a 'deleting' layer: drop its local file, then record the
+ * manifest removal -- only once the file is gone, so a failed unlink leaves the
+ * layer 'deleting' for the next gc_resume rather than orphaning a file whose
+ * manifest entry is dropped.
+ *
+ * The object copy of an uploaded layer is intentionally NOT deleted here.  Such
+ * layers are removed by compaction, whose merged replacement is not yet
+ * remote-durable at this point; deleting the old object now would drop the only
+ * remote protection for that key range until a later idle upload, losing data the
+ * object tier had already protected if the daemon stops or an upload fails in that
+ * window.  The superseded object is left for a remote-aware GC pass (phase 6) that
+ * removes it only after the replacement is durably remote.
  */
 static void
 gc_remove_layer(Shard *s, const PsLayerDesc *d)
 {
 	if (ps_layer_store->delete_local_layer(d) != 0)
-		return;
-	if (ps_object_tier && d->remote_durable &&
-		ps_layer_store->delete_remote_layer(d) != 0)
 		return;
 	ps_manifest_remove_layer(&s->manifest, d->layer_id);
 }
