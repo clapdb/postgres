@@ -99,6 +99,97 @@ key_cmp(const PsKey *a, const PsKey *b)
 	return 0;
 }
 
+/* ---- per-layer (key,block) bloom filter, in-memory read cache --------------
+ * The read planner and layer_map_lookup() probe every image layer of a timeline.
+ * A bloom of each layer's (key,block) pairs lets a read answer "definitely
+ * absent" for a layer without re-reading its index from disk.  The filter is
+ * built from the index the first time a layer is read -- so there is no new
+ * on-disk format and no manifest change -- and cached here, direct-mapped by
+ * layer_id (ids are monotonic and never reused).  A cache miss costs only the
+ * index read we would have done anyway; a hit on a negative skips it.
+ *
+ * Single-threaded with the daemon's serve loop; per-shard worker threads (a
+ * later sharding step) would shard this cache or guard it with a lock.
+ */
+#define PS_LAYER_BLOOM_BYTES	512			/* 4096 bits per layer */
+#define PS_LAYER_BLOOM_BITS		(PS_LAYER_BLOOM_BYTES * 8)
+#define PS_LAYER_BLOOM_SLOTS	1024		/* direct-mapped by layer_id */
+
+typedef struct LayerBloom
+{
+	uint64_t	layer_id;
+	int			valid;
+	uint8_t		bits[PS_LAYER_BLOOM_BYTES];
+} LayerBloom;
+
+static LayerBloom layer_bloom_cache[PS_LAYER_BLOOM_SLOTS];
+
+/* two independent hashes of (key,block) -> bit positions (FNV-1a variants) */
+static void
+bloom_bits(const PsKey *key, uint32_t block, uint32_t *b1, uint32_t *b2)
+{
+	uint32_t	v[5];
+	uint32_t	h1 = 2166136261u;
+	uint32_t	h2 = 2166136261u;
+
+	v[0] = key->spcOid;
+	v[1] = key->dbOid;
+	v[2] = key->relNumber;
+	v[3] = (uint32_t) key->forkNum;
+	v[4] = block;
+	for (unsigned i = 0; i < 5; i++)
+	{
+		h1 = (h1 ^ v[i]) * 16777619u;
+		h2 = (h2 ^ v[i]) * 2654435761u;
+	}
+	*b1 = h1 % PS_LAYER_BLOOM_BITS;
+	*b2 = h2 % PS_LAYER_BLOOM_BITS;
+}
+
+static void
+bloom_set(uint8_t *bits, const PsKey *key, uint32_t block)
+{
+	uint32_t	b1,
+				b2;
+
+	bloom_bits(key, block, &b1, &b2);
+	bits[b1 >> 3] |= (uint8_t) (1u << (b1 & 7));
+	bits[b2 >> 3] |= (uint8_t) (1u << (b2 & 7));
+}
+
+/* 1 if (key,block) might be present, 0 if it is definitely absent */
+static int
+bloom_test(const uint8_t *bits, const PsKey *key, uint32_t block)
+{
+	uint32_t	b1,
+				b2;
+
+	bloom_bits(key, block, &b1, &b2);
+	return (bits[b1 >> 3] & (1u << (b1 & 7))) &&
+		(bits[b2 >> 3] & (1u << (b2 & 7)));
+}
+
+/* the direct-mapped cache slot for a layer; caller checks ->valid && ->layer_id
+ * to know whether it already holds THIS layer's bloom */
+static LayerBloom *
+bloom_slot(uint64_t layer_id)
+{
+	return &layer_bloom_cache[layer_id % PS_LAYER_BLOOM_SLOTS];
+}
+
+/*
+ * Drop every cached bloom.  layer_ids are only unique within a single store, so a
+ * process that closes one store and opens another (ps_core_close/open) could
+ * otherwise hit a slot still holding the previous store's bloom for the same
+ * layer_id and wrongly skip a layer.  The open path calls this so each store
+ * starts with an empty cache.
+ */
+void
+ps_image_bloom_reset(void)
+{
+	memset(layer_bloom_cache, 0, sizeof(layer_bloom_cache));
+}
+
 /* internal sort record: on-disk index entry plus its source page index */
 typedef struct ImgSort
 {
@@ -791,9 +882,15 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	int			found = 0;
 	int			rc = -1;
 
+	LayerBloom *be = bloom_slot(layer->layer_id);
+	int			cached = (be->valid && be->layer_id == layer->layer_id);
+
 	/* prune: skip without any IO if this layer cannot hold (key,block) or has no
 	 * version at/below read_lsn */
 	if (!layer_covers(layer, key, block) || read_lsn < layer->lsn_start)
+		return 0;
+	/* finer prune: a cached bloom can rule (key,block) out with no index read */
+	if (cached && !bloom_test(be->bits, key, block))
 		return 0;
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
@@ -817,6 +914,17 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		goto out;
 	if (img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
 		goto out;				/* corrupt index */
+
+	/* first read of this layer: build its bloom from the verified index so later
+	 * reads can skip it without this index read */
+	if (!cached)
+	{
+		memset(be->bits, 0, sizeof(be->bits));
+		for (uint32_t i = 0; i < foot.nrecs; i++)
+			bloom_set(be->bits, &idx[i].key, idx[i].block);
+		be->layer_id = layer->layer_id;
+		be->valid = 1;
+	}
 
 	/* newest version of (key, block) with lsn <= read_lsn */
 	for (uint32_t i = 0; i < foot.nrecs; i++)

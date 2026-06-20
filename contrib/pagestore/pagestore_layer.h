@@ -158,6 +158,10 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
  * read page bytes directly (compaction) validate them against idx[].crc. */
 extern uint32_t ps_image_page_crc(const void *page, uint32_t len);
 
+/* Drop the in-memory per-layer bloom cache (layer_ids are store-local, so the
+ * cache must be cleared when the process switches stores). */
+extern void ps_image_bloom_reset(void);
+
 /* ---------------------------------------------------------------------------
  * Delta layer file format (phase 7).
  *
