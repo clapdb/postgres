@@ -157,6 +157,23 @@ record_layer(void *ctx, const PsLayerDesc *desc)
  * layers; a flush/compaction that changes layer state clears the backoff early. */
 #define MAINT_COOLDOWN_SECS 5
 
+/* Size-tiered compaction: only merge image layers whose sizes are within this
+ * factor of each other, so a large layer isn't rewritten just because small ones
+ * accumulated -- this bounds write/space amplification (à la RocksDB/ScyllaDB
+ * size-tiered) instead of the old "merge every layer in the timeline".  A single
+ * merge still does at most COMPACT_BATCH layers. */
+#define COMPACT_TIER_RATIO	4
+
+/* qsort: order image layers by on-disk size ascending (for tier selection). */
+static int
+layer_size_cmp(const void *a, const void *b)
+{
+	uint64_t	sa = ((const PsLayerDesc *) a)->locations[0].size;
+	uint64_t	sb = ((const PsLayerDesc *) b)->locations[0].size;
+
+	return (sa > sb) - (sa < sb);
+}
+
 static uint32_t
 count_image_layers(uint32_t timeline)
 {
@@ -241,13 +258,44 @@ compact_timeline(uint32_t timeline)
 		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
 			old[nold++] = *d;
 	}
-	/* Bound the work per call: merge at most COMPACT_BATCH layers, not the whole
-	 * timeline.  A single all-layers merge can read+rewrite every image layer,
-	 * which would stall the foreground serve loop that triggers maintenance; an
-	 * over-threshold timeline is instead compacted in nonblocking slices across
-	 * successive idle calls (and ps_core_maintenance reports more-to-do). */
-	if (nold > COMPACT_BATCH)
-		nold = COMPACT_BATCH;
+
+	/*
+	 * Size-tiered selection: sort by size and merge the longest run of layers
+	 * that all fall within COMPACT_TIER_RATIO of the run's smallest, capped at
+	 * COMPACT_BATCH.  Merging a same-size tier (rather than the whole timeline)
+	 * keeps write amplification bounded -- a freshly merged, larger layer climbs
+	 * to a higher tier and isn't rewritten again just because new small layers
+	 * appear.  The per-call cap also keeps the work a nonblocking slice so the
+	 * serve loop that triggers maintenance isn't stalled; an over-threshold
+	 * timeline converges across successive idle calls (ps_core_maintenance
+	 * reports more-to-do).  If no two layers are within the ratio, fall back to
+	 * the two smallest so progress is still guaranteed.
+	 */
+	qsort(old, nold, sizeof(PsLayerDesc), layer_size_cmp);
+	{
+		uint32_t	best_i = 0,
+					best_len = 0;
+
+		for (uint32_t i = 0; i < nold; i++)
+		{
+			uint64_t	base = old[i].locations[0].size;
+			uint32_t	j = i;
+
+			while (j < nold && j - i < COMPACT_BATCH &&
+				   old[j].locations[0].size <= base * COMPACT_TIER_RATIO)
+				j++;
+			if (j - i > best_len)
+			{
+				best_len = j - i;
+				best_i = i;
+			}
+		}
+		if (best_len < 2)		/* no same-size tier: merge the two smallest */
+			best_i = 0, best_len = 2;
+		if (best_i > 0)
+			memmove(old, old + best_i, (size_t) best_len * sizeof(PsLayerDesc));
+		nold = best_len;
+	}
 
 	/* gather every version (page bytes) from the old layers */
 	for (uint32_t k = 0; k < nold; k++)
