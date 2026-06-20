@@ -198,9 +198,15 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        release / read acquire (branch-create on shard 0 writes peers' replicas),
        and branch/WAL ops route to shard 0.  At `nshards == 1` it is a single
        worker == the old loop.  Verified race-free under ThreadSanitizer at
-       nshards 1 and 4.  (`backend_localsvc` still requires `nshards == 1`; its
-       per-shard routing -- needed to enable `nshards > 1` with the real engine,
-       and testable only by the integration suite -- is a focused follow-up.)
+       nshards 1 and 4.
+     - **4c-v — in-engine client per-shard routing.** ✅ `backend_localsvc` now
+       claims one channel per shard pool (lazily, on first use of that shard) and
+       routes each request to its key's shard (keyless timeline/WAL ops -> shard
+       0), mirroring the standalone client and satisfying the daemon's
+       single-owner worker guard.  This enables `nshards > 1` with the real
+       PostgreSQL engine; `pagestore_import` still fails fast on a multi-shard
+       daemon (its per-shard routing is a later utility-side step).  Exercised by
+       the in-engine integration suite (it is PG-side code, not standalone).
 5. **SPDK per-thread qpairs** so the async path scales per core.
 6. **Branch-create coordination** for the shared timeline tree.
 
