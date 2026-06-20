@@ -100,8 +100,10 @@ ls_attach(void)
 	}
 
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
-		hdr->page_size != BLCKSZ)
+	/* acquire-load magic (the daemon's readiness sentinel) so the header fields
+	 * the daemon published before it are visible; pairs with its release fence */
+	if (ps_load_acquire(&hdr->magic) != PS_SHM_MAGIC ||
+		hdr->version != PS_SHM_VERSION || hdr->page_size != BLCKSZ)
 	{
 		uint32		got_page_size = hdr->page_size;
 

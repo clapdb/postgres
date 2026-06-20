@@ -97,20 +97,28 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 		exit(2);
 	}
 	hdr = (PsShmHeader *) cl_shm;
-	check(hdr->magic == PS_SHM_MAGIC, "shm magic");
+	/* acquire-load magic (the daemon's readiness sentinel) so the descriptive
+	 * fields published before it -- nshards, geometry -- are visible here; pairs
+	 * with the daemon's release fence before the magic store */
+	check(ps_load_acquire(&hdr->magic) == PS_SHM_MAGIC, "shm magic");
 	check(hdr->version == PS_SHM_VERSION, "shm version %u expected %u",
 		  hdr->version, PS_SHM_VERSION);
 	check(hdr->page_size == expect_page_size,
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
 	cl_page_size = hdr->page_size;
 
-	/* Channels are claimed lazily, one per shard pool on first use (cl_route), so
-	 * a client that only touches one relation reserves one channel rather than
-	 * tying up a channel in every pool at attach. */
+	/* The client is built with the same PS_NSHARDS as the daemon (version-gated),
+	 * so the channel-pool partition lines up.  Reject a mismatch rather than
+	 * clamp: a smaller client nshards would route keys to fewer pools than the
+	 * daemon serves, misrouting once each shard polls only its own pool. */
 	cl_nchannels = hdr->nchannels;
 	cl_nshards = hdr->nshards ? hdr->nshards : 1;
-	if (cl_nshards > PS_NSHARDS)
-		cl_nshards = PS_NSHARDS;
+	if (cl_nshards != PS_NSHARDS)
+	{
+		fprintf(stderr, "daemon nshards=%u != client PS_NSHARDS=%u\n",
+				cl_nshards, PS_NSHARDS);
+		exit(2);
+	}
 	for (uint32_t s = 0; s < cl_nshards; s++)
 		cl_pool[s] = -1;
 }
@@ -558,7 +566,10 @@ wait_ready(const char *shm, uint32_t page_size)
 
 			if (h != MAP_FAILED)
 			{
-				int			ready = (h->magic == PS_SHM_MAGIC &&
+				/* acquire-load magic first: it is the daemon's readiness sentinel,
+				 * so observing it published makes the fields written before it
+				 * visible (pairs with the daemon's pre-magic release fence) */
+				int			ready = (ps_load_acquire(&h->magic) == PS_SHM_MAGIC &&
 									 h->version == PS_SHM_VERSION &&
 									 h->page_size == page_size &&
 									 h->nchannels == PS_MAX_CHANNELS);
