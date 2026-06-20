@@ -32,13 +32,21 @@ static char object_dir[2048];
 
 const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
 
-void
+int
 ps_layer_store_set_object_dir(const char *dir)
 {
 	if (dir == NULL)
+	{
 		object_dir[0] = '\0';
-	else
-		snprintf(object_dir, sizeof(object_dir), "%s", dir);
+		return 0;
+	}
+	if ((size_t) snprintf(object_dir, sizeof(object_dir), "%s", dir)
+		>= sizeof(object_dir))
+	{
+		object_dir[0] = '\0';	/* reject rather than store a truncated path */
+		return -1;
+	}
+	return 0;
 }
 
 static int
@@ -55,21 +63,29 @@ object_path(uint64_t layer_id, char *buf, size_t buflen)
 	return 0;
 }
 
-/* Copy src -> dst (whole file) and fsync dst.  Used for upload/download, since
- * the object store is a local directory here. */
+/*
+ * Copy src -> dst durably.  Layer copies are immutable, so never truncate an
+ * existing dst in place: write to "<dst>.tmp", fsync it, then atomically rename
+ * it over dst (single writer per layer id, so a fixed temp suffix is safe).  A
+ * crash leaves either the old complete copy or a stale .tmp, never a truncated
+ * dst.  Used for upload/download (the object store is a local directory here).
+ */
 static int
 copy_file(const char *src, const char *dst)
 {
 	int			in,
 				out,
 				rc = 0;
+	char		tmp[4096];
 	char		buf[1 << 16];
 	ssize_t		r;
 
+	if ((size_t) snprintf(tmp, sizeof(tmp), "%s.tmp", dst) >= sizeof(tmp))
+		return -1;
 	in = open(src, O_RDONLY);
 	if (in < 0)
 		return -1;
-	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (out < 0)
 	{
 		close(in);
@@ -98,6 +114,10 @@ done:
 		rc = -1;
 	close(in);
 	close(out);
+	if (rc == 0 && rename(tmp, dst) != 0)
+		rc = -1;
+	if (rc != 0)
+		unlink(tmp);			/* don't leave a partial temp behind */
 	return rc;
 }
 
@@ -221,6 +241,7 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 					   void *buf, uint32_t len)
 {
 	const char *path = NULL;
+	char		canon[4096];
 	int			fd;
 	ssize_t		n;
 	uint32_t	nlocs;
@@ -239,6 +260,18 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 			break;
 		}
 	}
+
+	/*
+	 * No available local location, but a just-downloaded layer lives at the
+	 * canonical local path even when the descriptor still marks its local copy
+	 * evicted (download takes a const desc and cannot flip the flag).  Fall back
+	 * to that path when the file is actually present, so a downloaded
+	 * remote-durable layer is readable through the layer store.
+	 */
+	if (path == NULL &&
+		local_layer_path(layer->layer_id, canon, sizeof(canon)) == 0 &&
+		access(canon, R_OK) == 0)
+		path = canon;
 
 	if (path == NULL)
 		return -1;
