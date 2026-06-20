@@ -335,19 +335,22 @@ count_image_layers(Shard *s, uint32_t timeline)
  * layer 'deleting' for the next gc_resume rather than orphaning a file whose
  * manifest entry is dropped.
  *
- * The object copy of an uploaded layer is intentionally NOT deleted here.  Such
- * layers are removed by compaction, whose merged replacement is not yet
- * remote-durable at this point; deleting the old object now would drop the only
- * remote protection for that key range until a later idle upload, losing data the
- * object tier had already protected if the daemon stops or an upload fails in that
- * window.  The superseded object is left for a remote-aware GC pass (phase 6) that
- * removes it only after the replacement is durably remote.
+ * Exception: a remote-durable layer compacted away keeps both its object copy AND
+ * its manifest entry, as a tombstone (still marked 'deleting', so reads skip it).
+ * Its merged replacement is not yet remote-durable, so removing it now would drop
+ * the only recorded remote protection for that key range -- and dropping just the
+ * entry would leave the object undiscoverable.  A phase-6 remote-aware GC removes
+ * the tombstone (entry + object) once the replacement range is durably remote.
+ * The stale local location on the tombstone is harmless (deleting layers are never
+ * read); its local file is still reclaimed here.
  */
 static void
 gc_remove_layer(Shard *s, const PsLayerDesc *d)
 {
 	if (ps_layer_store->delete_local_layer(d) != 0)
 		return;
+	if (ps_object_tier && d->remote_durable)
+		return;					/* keep the entry as a remote tombstone */
 	ps_manifest_remove_layer(&s->manifest, d->layer_id);
 }
 

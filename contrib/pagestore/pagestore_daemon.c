@@ -213,10 +213,19 @@ main(int argc, char **argv)
 			/* Fail fast on an unusable directory rather than start, acknowledge
 			 * writes, and have every background upload silently fail (leaving the
 			 * requested remote durability absent).  Create it if missing, then
-			 * require it to be a writable directory. */
+			 * require it to be an actual writable directory -- an existing regular
+			 * file would pass mkdir(EEXIST)+access but make every obj_* create
+			 * fail with ENOTDIR. */
+			struct stat odst;
+
 			if (mkdir(od, 0700) != 0 && errno != EEXIST)
 			{
 				fprintf(stderr, "--object-dir %s: %s\n", od, strerror(errno));
+				return 2;
+			}
+			if (stat(od, &odst) != 0 || !S_ISDIR(odst.st_mode))
+			{
+				fprintf(stderr, "--object-dir %s is not a directory\n", od);
 				return 2;
 			}
 			if (access(od, W_OK | X_OK) != 0)
