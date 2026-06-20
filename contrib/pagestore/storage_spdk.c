@@ -66,14 +66,15 @@ typedef struct PsSpdkRd
 	void	   *arg;
 } PsSpdkRd;
 
-#define SPDK_SUPER_MAGIC	0x53504b53	/* "SPKS" */
+#define SPDK_SUPER_MAGIC	0x53504b54	/* "SPKT" (per-shard segment counts) */
 
 typedef struct SpdkSuper
 {
 	uint32_t	magic;
 	uint32_t	sector_size;
 	uint64_t	segment_size;
-	uint32_t	num_segments;
+	uint32_t	nshards;		/* the store's shard count (must match to reuse) */
+	uint32_t	num_segments[PS_MAX_SHARDS];	/* per-shard local segment count */
 } SpdkSuper;
 
 /*
@@ -178,11 +179,16 @@ static void
 super_write(void)
 {
 	char		path[2300];
-	/* single shard for now (step 5a); per-shard counts arrive with multi-shard
-	 * SPDK in step 5b */
-	SpdkSuper	s = {SPDK_SUPER_MAGIC, g_sector, g_segsize,
-		g_spdk[0].num_segments};
+	SpdkSuper	s;
 	FILE	   *f;
+
+	memset(&s, 0, sizeof(s));
+	s.magic = SPDK_SUPER_MAGIC;
+	s.sector_size = g_sector;
+	s.segment_size = g_segsize;
+	s.nshards = g_nshards;
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		s.num_segments[sh] = g_spdk[sh].num_segments;
 
 	super_path(path, sizeof(path));
 	f = fopen(path, "wb");
@@ -199,14 +205,19 @@ super_read(void)
 	SpdkSuper	s;
 	FILE	   *f;
 
-	g_spdk[0].num_segments = 0;	/* default: fresh store */
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		g_spdk[sh].num_segments = 0;	/* default: fresh store */
 	super_path(path, sizeof(path));
 	f = fopen(path, "rb");
 	if (!f)
 		return;
+	/* reuse the on-device data only if geometry AND shard count match (a different
+	 * nshards reinterprets the interleaved seg-id space, so treat it as fresh) */
 	if (fread(&s, sizeof(s), 1, f) == 1 && s.magic == SPDK_SUPER_MAGIC &&
-		s.sector_size == g_sector && s.segment_size == g_segsize)
-		g_spdk[0].num_segments = s.num_segments;
+		s.sector_size == g_sector && s.segment_size == g_segsize &&
+		s.nshards == g_nshards)
+		for (uint32_t sh = 0; sh < g_nshards; sh++)
+			g_spdk[sh].num_segments = s.num_segments[sh];
 	fclose(f);
 }
 

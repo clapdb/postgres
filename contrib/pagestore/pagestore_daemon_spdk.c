@@ -20,6 +20,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,7 +44,7 @@ static void
 on_signal(int sig)
 {
 	(void) sig;
-	stop_requested = 1;
+	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);	/* seen by all workers */
 }
 
 /* per-block context for one async page read: lets the completion populate the
@@ -246,6 +247,68 @@ begin(uint32_t i, PsChannel *ch)
 	}
 }
 
+/* one per-shard worker thread (sharding step 5b): its own NVMe qpair + buffers */
+typedef struct Worker
+{
+	pthread_t	tid;
+	void	   *shm;
+	uint32_t	shard;			/* this worker's shard index */
+	uint32_t	first;			/* its channel pool: [first, first+count) */
+	uint32_t	count;
+} Worker;
+
+/*
+ * Async serve loop for one shard: scan only this shard's channel pool, begin each
+ * ready request (reads submit to this shard's qpair and stay 'active' until their
+ * completions publish DONE), and drive this shard's qpair completions.  Two
+ * workers never touch the same channel or the same qpair, so shards run the
+ * device concurrently with no shared mutable state.
+ */
+static void *
+spdk_worker_main(void *arg)
+{
+	Worker	   *w = arg;
+
+	while (!__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
+	{
+		int			work = 0;
+
+		for (uint32_t i = w->first; i < w->first + w->count; i++)
+		{
+			PsChannel  *ch = ps_channel(w->shm, i);
+			uint32_t	owner;
+
+			if (reqstate[i].active ||
+				ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+			/* single-owner guard (as the POSIX daemon): a keyed request always
+			 * belongs to this shard's pool; reject a misrouted one rather than
+			 * drive another shard's state/qpair from this thread.  PS_ANY_SHARD
+			 * ops (e.g. IMMEDSYNC) run anywhere. */
+			owner = ps_request_shard(ch);
+			if (owner != PS_ANY_SHARD && owner != w->shard)
+			{
+				ch->status = PS_STATUS_ERROR;
+				ps_store_release(&ch->state, PS_STATE_DONE);
+			}
+			else
+				begin(i, ch);	/* publishes DONE (sync) or via read_done (async) */
+			work = 1;
+		}
+
+		if (ps_spdk_poll(w->shard) > 0)
+			work = 1;
+
+		if (!work)
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -299,20 +362,6 @@ main(int argc, char **argv)
 				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
-	/*
-	 * The SPDK backend maps a segment id linearly to a device offset and buffers
-	 * a single current segment, so multiple concurrent per-shard segment streams
-	 * would skew the id space (premature device-end), thrash that buffer, and
-	 * leave recoverable gaps on a reused device.  Multi-shard SPDK needs
-	 * per-thread qpairs + per-shard device regions (SHARDING.md step 5); until
-	 * then the SPDK daemon runs a single shard.
-	 */
-	if (ps_nshards != 1)
-	{
-		fprintf(stderr, "pagestore_daemon_spdk: multi-shard not supported on the "
-				"SPDK backend yet (SHARDING.md step 5); using --nshards 1\n");
-		ps_nshards = 1;
-	}
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
 
@@ -353,51 +402,57 @@ main(int argc, char **argv)
 	hdr->nshards = ps_nshards;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	/* publish magic with a release store so the readers' acquire-load of it has a
-	 * matching release on the same field, giving a happens-before edge for the
-	 * descriptive fields written above */
-	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
-	fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
-			"page_size=%u io_unit=%u channels=%d ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
-
 	/*
-	 * Cross-channel async loop: start every ready request that is not already in
-	 * flight, then drive NVMe completions.  Read requests stay "active" until
-	 * their completions publish DONE, so many overlap on the queue.
+	 * One worker thread per shard, each with its own NVMe qpair (allocated by
+	 * spdk_open) and channel pool, running the async cross-channel loop on its own
+	 * shard.  Magic is published only after every worker exists, so a client that
+	 * sees the shm ready knows all shards are being served.
 	 */
-	while (!stop_requested)
 	{
-		int			work = 0;
+		Worker	   *workers = calloc(ps_nshards, sizeof(Worker));
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (!reqstate[i].active &&
-				ps_load_acquire(&ch->state) == PS_STATE_REQUEST)
+			perror("calloc workers");
+			return 1;
+		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+		{
+			workers[s].shm = shm;
+			workers[s].shard = s;
+			ps_shard_channel_range(s, ps_nshards, PS_MAX_CHANNELS,
+								   &workers[s].first, &workers[s].count);
+			if (pthread_create(&workers[s].tid, NULL, spdk_worker_main,
+							   &workers[s]) != 0)
 			{
-				begin(i, ch);
-				work = 1;
+				perror("pthread_create");
+				/* magic not yet published, so no client treats the shm as ready;
+				 * stop the workers already started and bail */
+				__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
+				for (uint32_t j = 0; j < s; j++)
+					pthread_join(workers[j].tid, NULL);
+				free(workers);
+				return 1;
 			}
 		}
 
-		if (ps_spdk_poll(0) > 0)	/* single shard for now (step 5a) */
-			work = 1;
+		/* all workers exist: publish magic with a release store (readers' acquire
+		 * pairs with it), making the shm ready to serve */
+		ps_store_release(&hdr->magic, PS_SHM_MAGIC);
+		fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
+				"page_size=%u io_unit=%u channels=%d nshards=%u ready\n",
+				shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+				PS_MAX_CHANNELS, ps_nshards);
 
-		if (!work)
-		{
-			struct timespec ts = {0, 20000};	/* 20us */
-
-			nanosleep(&ts, NULL);
-		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			pthread_join(workers[s].tid, NULL);
+		free(workers);
 	}
 
 	{

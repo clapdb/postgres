@@ -207,7 +207,21 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        PostgreSQL engine; `pagestore_import` still fails fast on a multi-shard
        daemon (its per-shard routing is a later utility-side step).  Exercised by
        the in-engine integration suite (it is PG-side code, not standalone).
-5. **SPDK per-thread qpairs** so the async path scales per core.
+5. **SPDK per-thread qpairs** so the async path scales per core. ✅
+     - **5a — per-shard SPDK I/O state.** The SPDK backend's single qpair /
+       current-segment buffer / read DMA pool / segment count became a per-shard
+       `SpdkShard` array, indexed by `seg % nshards` (interleaved ids, as the POSIX
+       backend uses), so an op only ever touches its shard's state.  The control
+       device stays shared and read-only after open.  Behavior-preserving at
+       nshards == 1.
+     - **5b — per-shard SPDK worker threads.** The SPDK daemon spawns one worker
+       per shard, each with its own qpair + buffers, running the async
+       cross-channel loop on its own channel pool and draining its own qpair, with
+       the same single-owner guard (`ps_request_shard`) and spawn → publish-magic →
+       join lifecycle as the POSIX daemon (step 4c-iv).  `spdk_super` stores
+       per-shard segment counts; the `nshards == 1` clamp is gone.  Verified on the
+       real NVMe device: `nshards=4` brings up 4 workers and a write/read round-trip
+       across all four shards passes (0 mismatches).
 6. **Branch-create coordination** for the shared timeline tree.
 
 Each step is independently testable; step 2 is the big mechanical change and is
