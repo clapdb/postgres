@@ -58,16 +58,14 @@ int			use_layers = 1;
 const PsStorage *ps_storage = &PsStoragePosix;
 
 /*
- * Per-shard state (LSM phase 9, sharding step 2).  One thread per shard will own
- * its index / staging / cache lock-free; the shard is chosen from the logical
- * key only (block- and timeline-independent), so a key's blocks and all its
- * timelines live on one shard.  NSHARDS == 1 for now -- behavior identical to
- * the old single global state -- and shard_for() hashes the key once NSHARDS > 1.
- *
- * Each shard's memtable stages recent page versions and flushes them into
- * immutable image layers (writes still also go to the segment log, the source of
- * truth).  (The segment append cursor and layer-id allocator stay global for now;
- * they become per-shard with per-shard segment namespaces / manifests in step 4.)
+ * Per-shard state (LSM phase 9).  One thread per shard will own its index /
+ * staging / cache lock-free; the shard is chosen from the logical key only
+ * (block- and timeline-independent), so a key's blocks and all its timelines live
+ * on one shard.  The live count ps_nshards is chosen at startup (--nshards) and
+ * shard_for() hashes the key into it; at ps_nshards == 1 behavior is identical to
+ * the old single global state.  Each shard has its own manifest + layer map (step
+ * 4a) and a shard-namespaced layer-id allocator.  Step 4c gives each its own
+ * thread; for now a single serve loop drives every shard's channel pool.
  */
 #define IDX_BUCKETS		(1 << 16)
 #define IDX_MASK		(IDX_BUCKETS - 1)
@@ -82,7 +80,7 @@ typedef struct Shard
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
 	PsMemtable *memtable;		/* staging -> image layers */
-	uint32_t	index;			/* this shard's id (0 .. NSHARDS-1) */
+	uint32_t	index;			/* this shard's id (0 .. ps_nshards-1) */
 	PsManifest	manifest;		/* per-shard durable layer log + layer map */
 	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
 	uint64_t	rr_mem,			/* read-source counters */
@@ -90,22 +88,24 @@ typedef struct Shard
 				rr_seg;
 } Shard;
 
-#define NSHARDS PS_NSHARDS		/* shared with clients via pagestore_ipc.h */
-static Shard g_shards[NSHARDS];
+/* live shard count (1..PS_MAX_SHARDS); the frontend sets it before ps_core_open.
+ * The array is sized to the compile-time cap; only [0, ps_nshards) are used. */
+uint32_t	ps_nshards = 1;
+static Shard g_shards[PS_MAX_SHARDS];
 
 static Shard *
 shard_for(const PsKey *key)
 {
 	/* same hash clients route with, so a request always lands on the shard that
-	 * owns the key (identity at NSHARDS == 1) */
-	return &g_shards[ps_shard_for_key(key, NSHARDS)];
+	 * owns the key (identity at ps_nshards == 1) */
+	return &g_shards[ps_shard_for_key(key, ps_nshards)];
 }
 
 /*
  * layer_id namespacing: the high LAYER_ID_SHARD_SHIFT bits hold the shard id and
  * the low bits a per-shard counter, so ids (and the layer files named by them)
  * never collide across shards while each shard allocates independently.  At
- * NSHARDS == 1, shard 0's ids are 1, 2, 3, ... -- identical to the old global
+ * ps_nshards == 1, shard 0's ids are 1, 2, 3, ... -- identical to the old global
  * allocator.
  */
 #define LAYER_ID_SHARD_SHIFT	48
@@ -116,7 +116,7 @@ ps_core_layer_count(void)
 {
 	uint32_t	n = 0;
 
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 		n += g_shards[i].manifest.map.nlayers;
 	return n;
 }
@@ -130,7 +130,7 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 				l = 0,
 				s = 0;
 
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		m += g_shards[i].rr_mem;
 		l += g_shards[i].rr_layer;
@@ -1428,7 +1428,7 @@ ps_handle_meta(PsChannel *ch)
 void
 ps_core_close(void)
 {
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		Shard	   *s = &g_shards[i];
 
@@ -1447,7 +1447,7 @@ ps_core_close(void)
 	 * layer mode: a segment-path-only daemon (use_layers == 0, e.g. SPDK) has no
 	 * memtable and must stay layer-free, like ps_core_maintenance(). */
 	if (use_layers)
-		for (uint32_t i = 0; i < NSHARDS; i++)
+		for (uint32_t i = 0; i < ps_nshards; i++)
 		{
 			Shard	   *s = &g_shards[i];
 
@@ -1466,7 +1466,7 @@ ps_core_close(void)
 			}
 		}
 	ps_pgcache_free();
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 		ps_manifest_close(&g_shards[i].manifest);
 }
 
@@ -1491,7 +1491,7 @@ ps_core_maintenance(void)
 	 * window passes. */
 	if (cooldown_until != 0 && time(NULL) < cooldown_until)
 		return 0;
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		Shard	   *s = &g_shards[i];
 
@@ -1568,7 +1568,7 @@ ps_core_open(const char *store_dir)
 	/* per-shard: open + replay its manifest, finish any interrupted GC, continue
 	 * layer ids past the highest the manifest restored (low bits only -- the
 	 * shard id is OR'd in at allocation), and create the shard's memtable */
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		Shard	   *s = &g_shards[i];
 
@@ -1607,7 +1607,7 @@ ps_core_open(const char *store_dir)
 	}
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
 	fprintf(stderr, "pagestore_core: %u image layer(s) across %u shard(s) after "
-			"manifest replay\n", ps_core_layer_count(), (uint32_t) NSHARDS);
+			"manifest replay\n", ps_core_layer_count(), ps_nshards);
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);

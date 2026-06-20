@@ -144,8 +144,14 @@ timeline tree under a brief coordination point, not on the read/write hot path.
      store dir.  Compaction/GC/lookup are parameterized by `Shard *`.  Behavior
      identical at one shard (ids 1,2,3…; one manifest) — de-risks the threading
      slice like step 2 did.
-   - **4b** — runtime `nshards > 1`, still single-threaded serve loop over all
-     pools (proves multi-shard data partitioning end-to-end before threads).
+   - **4b — runtime `nshards > 1`, still single-threaded** serve loop over all
+     pools. ✅ Shard count is chosen at startup (`--nshards`, default 1, capped by
+     compile-time `PS_MAX_SHARDS`) and published in the shm header; `ps_nshards`
+     replaces the old compile-time constant in routing/loops, the array is sized
+     to the cap.  The one serve loop already scans every channel, so it drives all
+     shards' pools with no threads yet — proving multi-shard data partitioning
+     (and per-shard manifests/recovery) end-to-end.  The standalone battery runs
+     at `nshards = 1` and `nshards = 4`.
    - **4c** — one POSIX worker thread per shard; `backend_localsvc` per-shard
      channel pool + routing.  This is where real parallelism lands.
 5. **SPDK per-thread qpairs** so the async path scales per core.

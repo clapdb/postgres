@@ -46,19 +46,20 @@
 #define PS_MAX_CHANNELS		128
 
 /*
- * Shard count (LSM phase 9 / sharding).  The daemon owns one Shard per core and
- * publishes this in the shm header (PsShmHeader.nshards) so clients route the
- * same way.  PS_NSHARDS == 1 keeps behavior identical to the single-owner daemon;
- * real per-shard worker threads arrive in a later step.  The channel array is
- * partitioned into nshards contiguous pools (see ps_shard_channel_range), and a
- * request for 'key' is routed to ps_shard_for_key(key)'s pool.
+ * Sharding (LSM phase 9).  The daemon owns one Shard per core; the actual count
+ * is chosen at startup (--nshards, default 1) and published in the shm header
+ * (PsShmHeader.nshards) so clients route the same way.  PS_MAX_SHARDS only caps
+ * the compile-time array sizing on both sides; the live count is runtime.  The
+ * channel array is partitioned into nshards contiguous pools (see
+ * ps_shard_channel_range), and a request for 'key' goes to ps_shard_for_key()'s
+ * pool.  nshards == 1 is identical to the old single-owner daemon.
  */
-#define PS_NSHARDS			1
+#define PS_MAX_SHARDS		64
 
-/* Each shard owns a non-empty channel pool, so there must be at least as many
- * channels as shards (see ps_shard_channel_range). */
-_Static_assert(PS_NSHARDS >= 1 && PS_NSHARDS <= PS_MAX_CHANNELS,
-			   "PS_NSHARDS must be in [1, PS_MAX_CHANNELS]");
+/* Each shard owns a non-empty channel pool, so there can't be more shards than
+ * channels (see ps_shard_channel_range). */
+_Static_assert(PS_MAX_SHARDS >= 1 && PS_MAX_SHARDS <= PS_MAX_CHANNELS,
+			   "PS_MAX_SHARDS must be in [1, PS_MAX_CHANNELS]");
 
 /* Mailbox state (atomic uint32) */
 #define PS_STATE_IDLE		0
@@ -196,8 +197,8 @@ ps_shard_for_key(const PsKey *key, uint32_t nshards)
  * Proportional boundaries (shard*nchannels/nshards) spread any remainder evenly
  * instead of dumping it all on the last shard, so every shard's pool size (its
  * available concurrency) is within one of the others.  Requires
- * nshards <= nchannels so no pool is empty (enforced for PS_NSHARDS by the
- * _Static_assert above and clamped by the daemon at startup).
+ * nshards <= nchannels so no pool is empty (PS_MAX_SHARDS <= PS_MAX_CHANNELS by
+ * the _Static_assert above; the daemon validates --nshards at startup).
  */
 static inline void
 ps_shard_channel_range(uint32_t shard, uint32_t nshards, uint32_t nchannels,
