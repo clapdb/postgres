@@ -222,7 +222,17 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        per-shard segment counts; the `nshards == 1` clamp is gone.  Verified on the
        real NVMe device: `nshards=4` brings up 4 workers and a write/read round-trip
        across all four shards passes (0 mismatches).
-6. **Branch-create coordination** for the shared timeline tree.
+6. **Branch-create coordination** for the shared timeline tree. ✅
+     Branch-create is routed to shard 0, validated against shard 0's copy, persisted
+     durably, then `timeline_define` *synchronously* broadcasts the definition into
+     every shard's replicated timeline copy before the op publishes DONE -- the
+     contract a client relies on to write the branch on any shard immediately after
+     creating it, without a round of acks (an async delivery queue would reopen that
+     visibility gap).  The cross-thread write is race-free: a fields-then-`defined`
+     release store pairs with every reader's `tl_defined()` acquire load.  Covered
+     by a cross-shard branch test (read-through + copy-on-write + isolation over
+     relations that hash to different shards), so a branch reaching only shard 0
+     would fail at nshards > 1.
 
 Each step is independently testable; step 2 is the big mechanical change and is
 behavior-preserving, so the risky parallelism (step 4) sits on a proven refactor.

@@ -847,9 +847,16 @@ fork_remove(uint32_t timeline, const PsKey *key)
 /*
  * Define timeline 'id' in every shard's replicated copy.  Branch-create is rare
  * and the tree is append-only, so a broadcast keeps every shard's lock-free read
- * copy in sync; at ps_nshards == 1 it writes the single copy.  (Single-threaded
- * here; step 4c-iv delivers the update to each shard's thread via a per-shard
- * queue instead of writing peer shards' memory directly.)
+ * copy in sync; at ps_nshards == 1 it writes the single copy.
+ *
+ * The broadcast is synchronous (the CREATE_BRANCH worker writes every shard's copy
+ * before publishing DONE), which is the coordination contract clients rely on: a
+ * client that observes its branch-create complete can immediately write the branch
+ * on any shard and find the timeline defined there -- without a round of acks.  An
+ * asynchronous per-shard delivery queue would reopen exactly that visibility gap.
+ * The cross-thread write is data-race-free: each fields-then-'defined' publish is a
+ * release store (below) and every reader gates on tl_defined()'s acquire load, so
+ * parent/branch_lsn are visible once 'defined' reads 1; the slot only flips 0->1.
  */
 static void
 timeline_define(uint32_t id, int parent, uint64_t branch_lsn)

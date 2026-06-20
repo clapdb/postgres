@@ -854,6 +854,56 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	op_read_tl(7, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "new valid branch reads through to root");
 
+	/*
+	 * Cross-shard branch coordination (sharding step 6): a branch is created on
+	 * shard 0, but its pages route by key to every shard, so each shard must see
+	 * the timeline (timeline_define broadcasts the definition to all shards'
+	 * replicas).  Use several relations whose keys hash to different shards and
+	 * check read-through + copy-on-write + isolation on each -- so a branch that
+	 * reached only shard 0 would fail here at nshards > 1.
+	 */
+	{
+		uint32_t	rels[] = {41001, 41002, 41003, 41004,
+			41005, 41006, 41007, 41008};
+		uint32_t	nrels = sizeof(rels) / sizeof(rels[0]);
+		uint32_t	shardmask = 0;
+
+		/* seed each rel on main (@ lsn 1000, before the T8 branch point) */
+		for (uint32_t i = 0; i < nrels; i++)
+		{
+			PsKey		k = {1, 1, rels[i], FORK0};
+
+			if (g_nshards > 1)
+				shardmask |= 1u << (ps_shard_for_key(&k, g_nshards) % 32);
+			fill_page(p, ps, 1000, (unsigned char) (100 + i));
+			op_write_tl(0, rels[i], FORK0, 0, p);
+		}
+		if (g_nshards > 1)
+			check(__builtin_popcount(shardmask) > 1,
+				  "cross-shard branch test spans multiple shards");
+
+		op_create_branch(8, 0, 1500);	/* branch off main @ 1500 */
+
+		for (uint32_t i = 0; i < nrels; i++)
+		{
+			/* the branch must be visible on this rel's shard: read-through to
+			 * the parent's page seeded above */
+			op_read_tl(8, rels[i], FORK0, 0, rb);
+			check(page_has_tag(rb, ps, (unsigned char) (100 + i)),
+				  "cross-shard branch reads through to parent on its shard");
+			/* copy-on-write on the branch, on this shard */
+			fill_page(p, ps, 2000, (unsigned char) (200 + i));
+			op_write_tl(8, rels[i], FORK0, 0, p);
+			op_read_tl(8, rels[i], FORK0, 0, rb);
+			check(page_has_tag(rb, ps, (unsigned char) (200 + i)),
+				  "cross-shard branch sees its own write on its shard");
+			/* parent unaffected (isolation) on this shard */
+			op_read_tl(0, rels[i], FORK0, 0, rb);
+			check(page_has_tag(rb, ps, (unsigned char) (100 + i)),
+				  "cross-shard parent unaffected by branch write");
+		}
+	}
+
 	client_detach();
 	stop_daemon(dpid);
 	rm_rf(store);
