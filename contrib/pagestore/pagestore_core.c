@@ -128,6 +128,34 @@ shard_for(const PsKey *key)
 }
 
 /*
+ * Which shard must serve a request, so a per-shard worker can reject one that was
+ * posted on the wrong channel pool (a non-routing client would otherwise have
+ * worker A mutate shard B's single-owner state).  Keyed ops go to their key's
+ * shard; timeline/shipped-WAL ops are shard-0 global state; a global sync or a
+ * no-op may run on any worker (returns PS_ANY_SHARD).  At ps_nshards == 1 every
+ * request maps to shard 0, so nothing is ever rejected.
+ */
+#define PS_ANY_SHARD	UINT32_MAX
+
+uint32_t
+ps_request_shard(const PsChannel *ch)
+{
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_SIZE:
+		case PS_OP_WAL_READ:
+			return 0;			/* timeline / shipped-WAL: shard-0 global state */
+		case PS_OP_IMMEDSYNC:
+		case PS_OP_NONE:
+			return PS_ANY_SHARD;	/* global sync / no-op: safe on any worker */
+		default:
+			return ps_shard_for_key(&ch->key, ps_nshards);
+	}
+}
+
+/*
  * layer_id namespacing: the high LAYER_ID_SHARD_SHIFT bits hold the shard id and
  * the low bits a per-shard counter, so ids (and the layer files named by them)
  * never collide across shards while each shard allocates independently.  At
@@ -964,12 +992,12 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
-static void
+static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
+	return ps_storage->meta_append(&rec, sizeof(rec));
 }
 
 static void
@@ -1511,17 +1539,19 @@ ps_handle_meta(PsChannel *ch)
 			 * until it writes (copy-on-write).
 			 */
 			/* branch-create is routed to shard 0, so validate against shard 0's
-			 * copy; timeline_define then broadcasts to every shard */
-			if (branch_request_ok(&g_shards[0], ch->timeline,
-								  (int) ch->parent_timeline))
-			{
+			 * copy.  Persist the branch durably BEFORE timeline_define publishes
+			 * its 'defined' flag to every shard: under per-shard threads a peer
+			 * shard that observes 'defined' could acknowledge writes on the branch,
+			 * which must not outlive a crash before the metadata is durable. */
+			if (!branch_request_ok(&g_shards[0], ch->timeline,
+								   (int) ch->parent_timeline))
+				ch->status = PS_STATUS_ERROR;
+			else if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
+									  ch->req_lsn) != 0)
+				ch->status = PS_STATUS_ERROR;
+			else
 				timeline_define(ch->timeline, (int) ch->parent_timeline,
 								ch->req_lsn);
-				timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn);
-			}
-			else
-				ch->status = PS_STATUS_ERROR;
 			break;
 
 		case PS_OP_WAL_APPEND:

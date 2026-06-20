@@ -33,13 +33,17 @@
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 
+/* Set by the signal handler and read by every worker thread, so accesses are
+ * atomic: volatile sig_atomic_t only covers the signal-handler/main case, not
+ * inter-thread visibility.  RELAXED is enough -- it only gates loop exit, and the
+ * channel state machine carries the real ordering. */
 static volatile sig_atomic_t stop_requested = 0;
 
 static void
 on_signal(int sig)
 {
 	(void) sig;
-	stop_requested = 1;
+	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
 }
 
 static void handle_request(PsChannel *ch);
@@ -64,17 +68,27 @@ worker_main(void *arg)
 {
 	Worker	   *w = arg;
 
-	while (!stop_requested)
+	while (!__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
 	{
 		int			did_work = 0;
 
 		for (uint32_t i = w->first; i < w->first + w->count; i++)
 		{
 			PsChannel  *ch = ps_channel(w->shm, i);
+			uint32_t	owner;
 
 			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
 				continue;
-			handle_request(ch);
+			/* Single-owner guard: only serve a request that belongs to this
+			 * shard.  A correctly-routing client always posts on the owning
+			 * shard's pool; a non-routing client (or a stale one) that lands a
+			 * keyed request here is rejected rather than allowed to mutate another
+			 * shard's state from this thread.  PS_ANY_SHARD ops run anywhere. */
+			owner = ps_request_shard(ch);
+			if (owner != PS_ANY_SHARD && owner != w->shard)
+				ch->status = PS_STATUS_ERROR;
+			else
+				handle_request(ch);
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			did_work = 1;
 		}
@@ -255,9 +269,9 @@ main(int argc, char **argv)
 	 */
 	hdr = (PsShmHeader *) shm;
 	memset(shm, 0, PS_SHM_SIZE);
-	/* Fill every descriptive field first, then publish 'magic' last as the
-	 * readiness sentinel (wait_ready / clients gate on it), so a client that
-	 * observes the daemon ready also sees nshards and the channel geometry. */
+	/* Fill every descriptive field now, but publish 'magic' (the readiness
+	 * sentinel clients gate on) only after all workers exist -- otherwise a client
+	 * could attach and post into a pool no thread is serving yet. */
 	hdr->version = PS_SHM_VERSION;
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
@@ -265,20 +279,11 @@ main(int argc, char **argv)
 	hdr->nshards = ps_nshards;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	/* publish magic with a release store so the readers' acquire-load of it has a
-	 * matching release on the same field, giving a happens-before edge for the
-	 * descriptive fields written above */
-	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
-
-	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-			"io_unit=%u channels=%d ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
 
 	/*
 	 * One worker thread per shard, each serving only its channel pool (sharding
@@ -305,13 +310,24 @@ main(int argc, char **argv)
 							   &workers[s]) != 0)
 			{
 				perror("pthread_create");
-				stop_requested = 1;
+				/* never published magic, so no client treats the shm as ready;
+				 * stop the workers already started and bail */
+				__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
 				for (uint32_t j = 0; j < s; j++)
 					pthread_join(workers[j].tid, NULL);
 				free(workers);
 				return 1;
 			}
 		}
+
+		/* all workers exist: publish magic with a release store (the readers'
+		 * acquire-load of it pairs with this), making the shm ready to serve */
+		ps_store_release(&hdr->magic, PS_SHM_MAGIC);
+		fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
+				"io_unit=%u channels=%d nshards=%u ready\n",
+				shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+				PS_MAX_CHANNELS, ps_nshards);
+
 		for (uint32_t s = 0; s < ps_nshards; s++)
 			pthread_join(workers[s].tid, NULL);
 		free(workers);

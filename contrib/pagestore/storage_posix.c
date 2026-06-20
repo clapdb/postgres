@@ -105,10 +105,32 @@ posix_close(void)
 static int
 posix_sync(void)
 {
-	for (int id = 0; id < segs_cap; id++)
-		if (seg_fds[id] >= 0 && fsync(seg_fds[id]) != 0)
-			return -1;
-	return 0;
+	int		   *fds;
+	int			n;
+	int			rc = 0;
+
+	/* Snapshot the fd cache under seg_mtx so a concurrent seg_fd() realloc on
+	 * another shard's worker can't free/move the array under us; fsync the copied
+	 * fds outside the lock so the sync doesn't block other shards' writes.  The
+	 * fds are stable (a segment is opened once and only closed at shutdown, after
+	 * the workers have joined). */
+	pthread_mutex_lock(&seg_mtx);
+	n = segs_cap;
+	fds = n > 0 ? malloc((size_t) n * sizeof(int)) : NULL;
+	if (n > 0 && !fds)
+	{
+		pthread_mutex_unlock(&seg_mtx);
+		return -1;
+	}
+	for (int id = 0; id < n; id++)
+		fds[id] = seg_fds[id];
+	pthread_mutex_unlock(&seg_mtx);
+
+	for (int id = 0; id < n; id++)
+		if (fds[id] >= 0 && fsync(fds[id]) != 0)
+			rc = -1;
+	free(fds);
+	return rc;
 }
 
 static int
