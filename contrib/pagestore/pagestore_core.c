@@ -56,6 +56,12 @@ int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
  */
 int			use_layers = 1;
 
+/* Object tier (LSM phase 4): when set, off-path maintenance uploads sealed
+ * layers to the configured object store and marks them remote_durable.  The
+ * frontend sets it (with ps_layer_store_set_object_dir) when --object-dir is
+ * given; 0 keeps the daemon local-only. */
+int			ps_object_tier = 0;
+
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
 
@@ -1640,11 +1646,42 @@ ps_core_close(void)
 }
 
 /*
+ * Upload one sealed layer that isn't yet remote-durable to the object tier and
+ * mark it durable (LSM phase 4).  Off the write path (maintenance), one per call
+ * so it stays a nonblocking slice; restart re-attempts any still-not-durable
+ * layer, and upload is idempotent (keyed by layer id).  Returns 1 if it uploaded
+ * one, 0 if none were pending or the tier could not take it this round.
+ */
+static int
+upload_one(Shard *s)
+{
+	PsLayerMap *map = &s->manifest.map;
+
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		PsLayerDesc *d = &map->layers[i];
+
+		if (d->remote_durable || d->deleting)
+			continue;
+		/* upload, then confirm it is really there before marking durable, so a
+		 * local copy is never treated as evictable on an unverified upload */
+		if (ps_layer_store->upload_layer(d) != 0 ||
+			ps_layer_store->layer_exists_remote(d) != 1)
+			return 0;			/* tier unusable / I/O error: stop this round */
+		if (ps_manifest_set_remote_durable(&s->manifest, d->layer_id,
+										   d->lsn_end) != 0)
+			return 0;
+		return 1;
+	}
+	return 0;
+}
+
+/*
  * One unit of off-the-write-path background maintenance for a single shard:
- * compact one of its timelines whose image-layer count exceeds the (low-water)
- * threshold.  Per shard so each worker thread (sharding step 4c) runs its own
- * maintenance with no shared state.  Returns 1 if it compacted (caller should not
- * sleep), 0 if nothing was due.
+ * compact one of its timelines past the (low-water) threshold, else upload one
+ * not-yet-remote-durable layer to the object tier.  Per shard so each worker
+ * thread (sharding step 4c) runs its own maintenance with no shared state.
+ * Returns 1 if it did work (caller should not sleep), 0 if nothing was due.
  */
 static int
 maintain_shard(Shard *s)
@@ -1678,6 +1715,9 @@ maintain_shard(Shard *s)
 				return 1;
 			}
 		}
+	/* nothing to compact: with an object tier, push one not-yet-durable layer */
+	if (ps_object_tier && upload_one(s))
+		return 1;
 	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
 	 * otherwise-idle shard doesn't re-attempt the same failing merge every 20us. */
 	if (attempted)

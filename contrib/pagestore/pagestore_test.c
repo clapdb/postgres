@@ -18,6 +18,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -77,6 +78,7 @@ static int	cl_pool[PS_MAX_SHARDS]; /* channel claimed in each shard pool, -1 = n
 static uint32_t cl_nshards;			/* shard count published by the daemon */
 static uint32_t cl_nchannels;		/* channel count published by the daemon */
 static uint32_t g_nshards = 1;		/* --nshards to spawn the daemon with */
+static const char *g_object_dir = NULL;	/* if set, spawn the daemon with --object-dir */
 static uint32_t cl_page_size;
 
 static void
@@ -539,16 +541,29 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 	{
 		char		psbuf[16];
 		char		nsbuf[16];
+		const char *argv[24];
+		int			a = 0;
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
 		snprintf(nsbuf, sizeof(nsbuf), "%u", g_nshards);
 		/* small segments exercise rollover; a small flush threshold makes the
 		 * tests flush into image layers so the layer read path is exercised */
-		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
-			  "--page-size", psbuf, "--segment-size", "65536",
-			  "--flush-pages", "8", "--compact-layers", "3",
-			  "--nshards", nsbuf, (char *) NULL);
-		perror("execl daemon");
+		argv[a++] = daemon_path;
+		argv[a++] = "--shm";		argv[a++] = shm;
+		argv[a++] = "--store";		argv[a++] = store;
+		argv[a++] = "--page-size";	argv[a++] = psbuf;
+		argv[a++] = "--segment-size"; argv[a++] = "65536";
+		argv[a++] = "--flush-pages"; argv[a++] = "8";
+		argv[a++] = "--compact-layers"; argv[a++] = "3";
+		argv[a++] = "--nshards";	argv[a++] = nsbuf;
+		if (g_object_dir != NULL)
+		{
+			argv[a++] = "--object-dir";
+			argv[a++] = g_object_dir;
+		}
+		argv[a] = NULL;
+		execv(daemon_path, (char *const *) argv);
+		perror("execv daemon");
 		_exit(127);
 	}
 	return pid;
@@ -1102,6 +1117,102 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
  * daemon).  Clients and the daemon both rely on these for any nshards, so verify
  * them for nshards > 1 too even though the daemon currently runs nshards = 1.
  */
+/* count files named obj_* in 'dir' (the object-tier uploads) */
+static int
+count_obj_files(const char *dir)
+{
+	DIR		   *d = opendir(dir);
+	struct dirent *e;
+	int			n = 0;
+
+	if (!d)
+		return -1;
+	while ((e = readdir(d)) != NULL)
+		if (strncmp(e->d_name, "obj_", 4) == 0)
+			n++;
+	closedir(d);
+	return n;
+}
+
+/*
+ * Object tier (LSM phase 4): with --object-dir set, the daemon uploads sealed
+ * image layers off the write path, so after some flushed writes the object store
+ * fills, and the data is still readable locally -- across a restart, where the
+ * already-uploaded layers stay durable (no re-upload) and reads still serve.
+ */
+static void
+run_object_tier_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	char		objdir[256];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	unsigned char pg[8192];
+	unsigned char rb[8192];
+	int			objs = 0;
+
+	fprintf(stderr, "== object tier ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_obj", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_obj", tmpbase);
+	snprintf(objdir, sizeof(objdir), "%s/objstore", tmpbase);
+	rm_rf(store);
+	rm_rf(objdir);
+	shm_unlink(shm);
+	if (mkdir(objdir, 0700) != 0)
+	{
+		check(0, "object tier: mkdir objdir");
+		return;
+	}
+
+	g_object_dir = objdir;
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+
+	/* write enough pages (flush-pages=8) to seal a few image layers */
+	op_create(REL_A, FORK0);
+	for (uint32_t b = 0; b < 24; b++)
+	{
+		memset(pg, (unsigned char) (0x40 + b), ps);
+		op_write_one(REL_A, FORK0, b, pg);
+	}
+
+	/* the daemon uploads when idle; poll the object dir (up to ~3s) */
+	for (int t = 0; t < 300 && objs <= 0; t++)
+	{
+		struct timespec ts = {0, 10 * 1000 * 1000};	/* 10ms */
+
+		nanosleep(&ts, NULL);
+		objs = count_obj_files(objdir);
+	}
+	check(objs > 0, "object tier: layers uploaded to the object store (%d)", objs);
+
+	/* data still served locally */
+	memset(pg, 0x40 + 5, ps);
+	op_read_one(REL_A, FORK0, 5, rb);
+	check(memcmp(rb, pg, ps) == 0, "object tier: read serves correct bytes");
+
+	/* clean restart: uploaded layers stay durable, reads still work */
+	stop_daemon(dpid);
+	client_detach();
+	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(REL_A, FORK0, 5, rb);
+	check(memcmp(rb, pg, ps) == 0, "object tier: read correct after restart");
+	op_read_one(REL_A, FORK0, 23, rb);
+	memset(pg, (unsigned char) (0x40 + 23), ps);
+	check(memcmp(rb, pg, ps) == 0, "object tier: last block correct after restart");
+
+	stop_daemon(dpid);
+	client_detach();
+	rm_rf(store);
+	rm_rf(objdir);
+	shm_unlink(shm);
+	g_object_dir = NULL;
+}
+
 static void
 run_sharding_contract(void)
 {
@@ -1227,6 +1338,10 @@ main(int argc, char **argv)
 		/* many concurrent clients */
 		run_concurrency_suite(daemon_path, tmpbase);
 	}
+
+	/* object tier (single shard is enough to exercise upload + restart) */
+	g_nshards = 1;
+	run_object_tier_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 

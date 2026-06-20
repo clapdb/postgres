@@ -31,6 +31,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "pagestore_layer_store.h"
 #include "pagestore_pgcache.h"
 
 /* Set by the signal handler and read by every worker thread, so accesses are
@@ -197,6 +198,16 @@ main(int argc, char **argv)
 			cache_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
 			ps_nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--object-dir") == 0 && i + 1 < argc)
+		{
+			/* enable the object tier: maintenance uploads sealed layers here */
+			if (ps_layer_store_set_object_dir(argv[++i]) != 0)
+			{
+				fprintf(stderr, "--object-dir path too long\n");
+				return 2;
+			}
+			ps_object_tier = 1;
+		}
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
