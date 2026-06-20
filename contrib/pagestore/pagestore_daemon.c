@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,13 +33,78 @@
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 
+/* Set by the signal handler and read by every worker thread, so accesses are
+ * atomic: volatile sig_atomic_t only covers the signal-handler/main case, not
+ * inter-thread visibility.  RELAXED is enough -- it only gates loop exit, and the
+ * channel state machine carries the real ordering. */
 static volatile sig_atomic_t stop_requested = 0;
 
 static void
 on_signal(int sig)
 {
 	(void) sig;
-	stop_requested = 1;
+	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
+}
+
+static void handle_request(PsChannel *ch);
+
+/* one per-shard worker thread (sharding step 4c-iv) */
+typedef struct Worker
+{
+	pthread_t	tid;
+	void	   *shm;
+	uint32_t	shard;			/* this worker's shard index */
+	uint32_t	first;			/* its channel pool: [first, first+count) */
+	uint32_t	count;
+} Worker;
+
+/*
+ * Serve loop for one shard: poll only this shard's channel pool, so two workers
+ * never touch the same channel.  Each request self-routes by key to this shard's
+ * state, and idle time runs this shard's own compaction.
+ */
+static void *
+worker_main(void *arg)
+{
+	Worker	   *w = arg;
+
+	while (!__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
+	{
+		int			did_work = 0;
+
+		for (uint32_t i = w->first; i < w->first + w->count; i++)
+		{
+			PsChannel  *ch = ps_channel(w->shm, i);
+			uint32_t	owner;
+
+			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+			/* Single-owner guard: only serve a request that belongs to this
+			 * shard.  A correctly-routing client always posts on the owning
+			 * shard's pool; a non-routing client (or a stale one) that lands a
+			 * keyed request here is rejected rather than allowed to mutate another
+			 * shard's state from this thread.  PS_ANY_SHARD ops run anywhere. */
+			owner = ps_request_shard(ch);
+			if (owner != PS_ANY_SHARD && owner != w->shard)
+				ch->status = PS_STATUS_ERROR;
+			else
+				handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			did_work = 1;
+		}
+
+		if (!did_work)
+		{
+			/* idle: one unit of this shard's background compaction, else sleep */
+			if (!ps_core_maintenance_shard(w->shard))
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -168,6 +234,19 @@ main(int argc, char **argv)
 				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
+	/*
+	 * The SPDK backend keeps a single qpair + current-segment buffer, so multiple
+	 * per-shard worker threads driving it would race/corrupt that state.  Multi-
+	 * shard SPDK needs per-thread qpairs (SHARDING.md step 5); until then run a
+	 * single shard whenever this daemon uses the SPDK storage (the dedicated
+	 * pagestore_daemon_spdk clamps the same way).
+	 */
+	if (strcmp(ps_storage->name, "spdk") == 0 && ps_nshards != 1)
+	{
+		fprintf(stderr, "pagestore_daemon: --storage spdk does not support "
+				"--nshards > 1 yet (SHARDING.md step 5); using --nshards 1\n");
+		ps_nshards = 1;
+	}
 
 	if (ps_core_open(store_dir) != 0)
 	{
@@ -203,9 +282,9 @@ main(int argc, char **argv)
 	 */
 	hdr = (PsShmHeader *) shm;
 	memset(shm, 0, PS_SHM_SIZE);
-	/* Fill every descriptive field first, then publish 'magic' last as the
-	 * readiness sentinel (wait_ready / clients gate on it), so a client that
-	 * observes the daemon ready also sees nshards and the channel geometry. */
+	/* Fill every descriptive field now, but publish 'magic' (the readiness
+	 * sentinel clients gate on) only after all workers exist -- otherwise a client
+	 * could attach and post into a pool no thread is serving yet. */
 	hdr->version = PS_SHM_VERSION;
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
@@ -213,47 +292,58 @@ main(int argc, char **argv)
 	hdr->nshards = ps_nshards;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	/* publish magic with a release store so the readers' acquire-load of it has a
-	 * matching release on the same field, giving a happens-before edge for the
-	 * descriptive fields written above */
-	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
-	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-			"io_unit=%u channels=%d ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
-
-	while (!stop_requested)
+	/*
+	 * One worker thread per shard, each serving only its channel pool (sharding
+	 * step 4c-iv).  Per-shard state is single-owner; the small shared state is
+	 * synchronized (segment fd cache mutex, timeline 'defined' atomics, shard-0
+	 * branch/WAL routing).  At nshards == 1 this is a single worker == the old
+	 * single-threaded loop.  The main thread waits for a signal, then joins.
+	 */
 	{
-		int			did_work = 0;
+		Worker	   *workers = calloc(ps_nshards, sizeof(Worker));
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
-				continue;
-
-			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
-			did_work = 1;
+			perror("calloc workers");
+			return 1;
 		}
-
-		if (!did_work)
+		for (uint32_t s = 0; s < ps_nshards; s++)
 		{
-			/* idle: do one unit of background compaction before sleeping */
-			if (!ps_core_maintenance())
+			workers[s].shm = shm;
+			workers[s].shard = s;
+			ps_shard_channel_range(s, ps_nshards, PS_MAX_CHANNELS,
+								   &workers[s].first, &workers[s].count);
+			if (pthread_create(&workers[s].tid, NULL, worker_main,
+							   &workers[s]) != 0)
 			{
-				struct timespec ts = {0, 20000};	/* 20us */
-
-				nanosleep(&ts, NULL);
+				perror("pthread_create");
+				/* never published magic, so no client treats the shm as ready;
+				 * stop the workers already started and bail */
+				__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
+				for (uint32_t j = 0; j < s; j++)
+					pthread_join(workers[j].tid, NULL);
+				free(workers);
+				return 1;
 			}
 		}
+
+		/* all workers exist: publish magic with a release store (the readers'
+		 * acquire-load of it pairs with this), making the shm ready to serve */
+		ps_store_release(&hdr->magic, PS_SHM_MAGIC);
+		fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
+				"io_unit=%u channels=%d nshards=%u ready\n",
+				shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+				PS_MAX_CHANNELS, ps_nshards);
+
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			pthread_join(workers[s].tid, NULL);
+		free(workers);
 	}
 
 	{

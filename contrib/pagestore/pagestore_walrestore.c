@@ -58,13 +58,25 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 		fprintf(stderr, "bad shm header\n");
 		exit(2);
 	}
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
-		{
-			chan = (int) i;
-			return;
-		}
-	fprintf(stderr, "no free channel\n");
+	/*
+	 * WAL_READ is a shipped-WAL op, which a multi-shard daemon serves only on
+	 * shard 0; claim from shard 0's channel pool so the request reaches the worker
+	 * that owns it (at nshards == 1 the pool is the whole array).
+	 */
+	{
+		uint32_t	first,
+					cnt,
+					ns = hdr->nshards ? hdr->nshards : 1;
+
+		ps_shard_channel_range(0, ns, hdr->nchannels, &first, &cnt);
+		for (uint32_t i = first; i < first + cnt; i++)
+			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+			{
+				chan = (int) i;
+				return;
+			}
+	}
+	fprintf(stderr, "no free channel in shard 0\n");
 	exit(2);
 }
 

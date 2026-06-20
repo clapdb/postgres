@@ -50,14 +50,23 @@ extern int	ps_core_open(const char *store_dir);
 extern void ps_core_close(void);
 
 /* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
- * did work (caller should not sleep), 0 if nothing was due. */
+ * did work (caller should not sleep), 0 if nothing was due.  The (void) form
+ * sweeps every shard (single-threaded frontends); the per-shard form is for a
+ * worker thread that owns just its shard. */
 extern int	ps_core_maintenance(void);
+extern int	ps_core_maintenance_shard(uint32_t shard);
 
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
+
+/* The shard that must serve a request; PS_ANY_SHARD if any worker may.  A
+ * per-shard worker rejects a request whose shard isn't its own (guards the
+ * single-owner invariant against a client that posts on the wrong channel). */
+#define PS_ANY_SHARD	UINT32_MAX
+extern uint32_t ps_request_shard(const PsChannel *ch);
 
 /* The per-shard materialized-page cache that owns 'key' (for a frontend caching
  * pages outside read_resolve, e.g. the SPDK async path). */

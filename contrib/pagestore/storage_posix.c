@@ -16,6 +16,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,9 +32,15 @@ static char posix_dir[2048];
  * One cached OS fd per segment id (opened lazily, never closed during a run).
  * Only the segment log keeps fds; the WAL and metadata logs open per call,
  * matching the original daemon (they are not on the hot path).
+ *
+ * Per-shard worker threads (sharding step 4c) append to disjoint segment ids but
+ * share this fd cache, so seg_mtx guards the lookup/grow.  The cached fd (an int)
+ * is copied out under the lock; the actual pread/pwrite then runs lock-free and
+ * concurrently (positioned I/O on a shared fd is thread-safe).
  */
 static int *seg_fds;
 static int	segs_cap;
+static pthread_mutex_t seg_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 seg_path(char *buf, size_t buflen, int id)
@@ -48,8 +55,13 @@ seg_fd(int id, int create)
 	char		path[4096];
 	int			fd;
 
+	pthread_mutex_lock(&seg_mtx);
 	if (id < segs_cap && seg_fds[id] >= 0)
-		return seg_fds[id];
+	{
+		fd = seg_fds[id];
+		pthread_mutex_unlock(&seg_mtx);
+		return fd;
+	}
 
 	if (id >= segs_cap)
 	{
@@ -65,6 +77,7 @@ seg_fd(int id, int create)
 	fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
 	if (fd >= 0)
 		seg_fds[id] = fd;
+	pthread_mutex_unlock(&seg_mtx);
 	return fd;
 }
 
@@ -92,10 +105,20 @@ posix_close(void)
 static int
 posix_sync(void)
 {
+	int			rc = 0;
+
+	/* Hold seg_mtx across the whole walk so a concurrent seg_fd() realloc on
+	 * another shard's worker can't free/move the array under us.  fsync runs under
+	 * the lock (so seg_fd() briefly blocks during a sync), which is fine: an
+	 * immediate sync is rare, and keeping the path allocation-free means it can't
+	 * fail to report -- a snapshot copy's malloc could fail and leave an
+	 * acknowledged sync that fsynced nothing. */
+	pthread_mutex_lock(&seg_mtx);
 	for (int id = 0; id < segs_cap; id++)
 		if (seg_fds[id] >= 0 && fsync(seg_fds[id]) != 0)
-			return -1;
-	return 0;
+			rc = -1;
+	pthread_mutex_unlock(&seg_mtx);
+	return rc;
 }
 
 static int

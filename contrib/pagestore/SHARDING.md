@@ -189,9 +189,18 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        and lock-free.  (Remaining shared hot-path state for the threads: the POSIX
        segment fd cache -- a brief mutex -- and the timeline `defined` flag -- an
        atomic release/acquire -- land with 4c-iv.)
-     - **4c-iv** — spawn one POSIX worker thread per shard, each polling only its
-       channel pool; `backend_localsvc` per-shard channel pool + routing.  Real
-       parallelism lands here.
+     - **4c-iv — per-shard POSIX worker threads.** ✅ The POSIX daemon spawns one
+       worker thread per shard, each polling only its channel pool and running its
+       own compaction (`ps_core_maintenance_shard`), so requests on different
+       shards run in parallel with no shared per-shard state.  The remaining shared
+       state is synchronized: the segment fd cache takes a brief mutex (the
+       `pread`/`pwrite` stay concurrent), the timeline `defined` flag is published
+       release / read acquire (branch-create on shard 0 writes peers' replicas),
+       and branch/WAL ops route to shard 0.  At `nshards == 1` it is a single
+       worker == the old loop.  Verified race-free under ThreadSanitizer at
+       nshards 1 and 4.  (`backend_localsvc` still requires `nshards == 1`; its
+       per-shard routing -- needed to enable `nshards > 1` with the real engine,
+       and testable only by the integration suite -- is a focused follow-up.)
 5. **SPDK per-thread qpairs** so the async path scales per core.
 6. **Branch-create coordination** for the shared timeline tree.
 

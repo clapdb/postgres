@@ -107,6 +107,7 @@ typedef struct Shard
 	uint64_t	cur_off;		/* append cursor within cur_seg */
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
+	time_t		maint_cooldown;	/* skip compaction attempts until this wall time */
 	TimelineMeta timelines[MAX_TIMELINES];	/* replicated timeline tree */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
@@ -124,6 +125,34 @@ shard_for(const PsKey *key)
 	/* same hash clients route with, so a request always lands on the shard that
 	 * owns the key (identity at ps_nshards == 1) */
 	return &g_shards[ps_shard_for_key(key, ps_nshards)];
+}
+
+/*
+ * Which shard must serve a request, so a per-shard worker can reject one that was
+ * posted on the wrong channel pool (a non-routing client would otherwise have
+ * worker A mutate shard B's single-owner state).  Keyed ops go to their key's
+ * shard; timeline/shipped-WAL ops are shard-0 global state; a global sync or a
+ * no-op may run on any worker (returns PS_ANY_SHARD).  At ps_nshards == 1 every
+ * request maps to shard 0, so nothing is ever rejected.
+ */
+#define PS_ANY_SHARD	UINT32_MAX
+
+uint32_t
+ps_request_shard(const PsChannel *ch)
+{
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_SIZE:
+		case PS_OP_WAL_READ:
+			return 0;			/* timeline / shipped-WAL: shard-0 global state */
+		case PS_OP_IMMEDSYNC:
+		case PS_OP_NONE:
+			return PS_ANY_SHARD;	/* global sync / no-op: safe on any worker */
+		default:
+			return ps_shard_for_key(&ch->key, ps_nshards);
+	}
 }
 
 /*
@@ -784,15 +813,27 @@ timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
 
 		t->parent = parent;
 		t->branch_lsn = branch_lsn;
-		t->defined = 1;
+		/* publish 'defined' last with a release store: branch-create (shard 0)
+		 * writes peer shards' copies while their threads read them, so the
+		 * acquire-load in tl_defined() pairs with this to make parent/branch_lsn
+		 * visible.  The tree is append-only, so a slot only ever flips 0 -> 1. */
+		__atomic_store_n(&t->defined, 1, __ATOMIC_RELEASE);
 	}
+}
+
+/* acquire-load of a timeline slot's 'defined' flag (pairs with timeline_define's
+ * release store; the slot's other fields are valid once this reads 1) */
+static int
+tl_defined(const Shard *s, uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES &&
+		__atomic_load_n(&s->timelines[timeline].defined, __ATOMIC_ACQUIRE);
 }
 
 static int
 timeline_has_parent(const Shard *s, uint32_t timeline)
 {
-	return timeline < MAX_TIMELINES && s->timelines[timeline].defined &&
-		s->timelines[timeline].parent >= 0;
+	return tl_defined(s, timeline) && s->timelines[timeline].parent >= 0;
 }
 
 /*
@@ -810,15 +851,15 @@ timeline_has_parent(const Shard *s, uint32_t timeline)
 static int
 branch_request_ok(const Shard *s, uint32_t new_tl, int parent)
 {
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || s->timelines[new_tl].defined)
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES || tl_defined(s, new_tl))
 		return 0;
-	if (parent < 0 || parent >= MAX_TIMELINES || !s->timelines[parent].defined)
+	if (parent < 0 || parent >= MAX_TIMELINES || !tl_defined(s, (uint32_t) parent))
 		return 0;
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = s->timelines[t].parent)
 	{
 		if ((uint32_t) t == new_tl)
 			return 0;			/* cycle */
-		if (!s->timelines[t].defined)
+		if (!tl_defined(s, (uint32_t) t))
 			return 0;			/* broken chain: refuse rather than risk a loop */
 	}
 	return 1;
@@ -951,12 +992,12 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
-static void
+static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
+	return ps_storage->meta_append(&rec, sizeof(rec));
 }
 
 static void
@@ -1262,7 +1303,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * several, so check them all, not just this write's).  This shard only:
 			 * the flush added layers to this shard's map. */
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
-				if ((ct == 0 || s->timelines[ct].defined) &&
+				if ((ct == 0 || tl_defined(s, ct)) &&
 					count_image_layers(s, ct) > (uint32_t) compact_layers * 4)
 					compact_timeline(s, ct);
 		}
@@ -1498,17 +1539,19 @@ ps_handle_meta(PsChannel *ch)
 			 * until it writes (copy-on-write).
 			 */
 			/* branch-create is routed to shard 0, so validate against shard 0's
-			 * copy; timeline_define then broadcasts to every shard */
-			if (branch_request_ok(&g_shards[0], ch->timeline,
-								  (int) ch->parent_timeline))
-			{
+			 * copy.  Persist the branch durably BEFORE timeline_define publishes
+			 * its 'defined' flag to every shard: under per-shard threads a peer
+			 * shard that observes 'defined' could acknowledge writes on the branch,
+			 * which must not outlive a crash before the metadata is durable. */
+			if (!branch_request_ok(&g_shards[0], ch->timeline,
+								   (int) ch->parent_timeline))
+				ch->status = PS_STATUS_ERROR;
+			else if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
+									  ch->req_lsn) != 0)
+				ch->status = PS_STATUS_ERROR;
+			else
 				timeline_define(ch->timeline, (int) ch->parent_timeline,
 								ch->req_lsn);
-				timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn);
-			}
-			else
-				ch->status = PS_STATUS_ERROR;
 			break;
 
 		case PS_OP_WAL_APPEND:
@@ -1535,7 +1578,8 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			ps_storage->sync();
+			if (ps_storage->sync() != 0)
+				ch->status = PS_STATUS_ERROR;	/* report a failed durable sync */
 			break;
 
 		default:
@@ -1576,7 +1620,7 @@ ps_core_close(void)
 
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
 			{
-				if (ct != 0 && !s->timelines[ct].defined)
+				if (ct != 0 && !tl_defined(s, ct))
 					continue;
 				while (count_image_layers(s, ct) > (uint32_t) compact_layers)
 				{
@@ -1596,16 +1640,15 @@ ps_core_close(void)
 }
 
 /*
- * Off-the-write-path background maintenance: compact one timeline whose image
- * layer count exceeds the (low-water) threshold.  The daemon calls this when it
- * is otherwise idle; doing at most one compaction per call keeps the serve loop
- * responsive.  Returns 1 if it compacted (the caller should not sleep), 0 if
- * nothing was due.
+ * One unit of off-the-write-path background maintenance for a single shard:
+ * compact one of its timelines whose image-layer count exceeds the (low-water)
+ * threshold.  Per shard so each worker thread (sharding step 4c) runs its own
+ * maintenance with no shared state.  Returns 1 if it compacted (caller should not
+ * sleep), 0 if nothing was due.
  */
-int
-ps_core_maintenance(void)
+static int
+maintain_shard(Shard *s)
 {
-	static time_t cooldown_until = 0;	/* skip attempts until this wall time */
 	int			attempted = 0;
 
 	if (!use_layers)
@@ -1614,38 +1657,53 @@ ps_core_maintenance(void)
 	 * while reading/writing the merge), don't re-read the same failing layers on
 	 * every idle tick -- cool down until either new layer state appears or the
 	 * window passes. */
-	if (cooldown_until != 0 && time(NULL) < cooldown_until)
+	if (s->maint_cooldown != 0 && time(NULL) < s->maint_cooldown)
 		return 0;
-	for (uint32_t i = 0; i < ps_nshards; i++)
-	{
-		Shard	   *s = &g_shards[i];
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if ((tl == 0 || tl_defined(s, tl)) &&
+			count_image_layers(s, tl) > (uint32_t) compact_layers)
+		{
+			uint32_t	before = count_image_layers(s, tl);
 
-		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-			if ((tl == 0 || s->timelines[tl].defined) &&
-				count_image_layers(s, tl) > (uint32_t) compact_layers)
+			/* Report progress (so the caller skips its idle sleep) only if the
+			 * compaction actually reduced the layer count.  A timeline that can't
+			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
+			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
+			 * must not keep the daemon spinning; try the next one. */
+			attempted = 1;
+			if (compact_timeline(s, tl) == 0 &&
+				count_image_layers(s, tl) < before)
 			{
-				uint32_t	before = count_image_layers(s, tl);
-
-				/* Report progress (so the caller skips its idle sleep) only if the
-				 * compaction actually reduced the layer count.  A timeline that
-				 * can't make progress -- nothing mergeable (e.g. compact_layers=0
-				 * with a single layer) or a failing compaction (ENOSPC / corrupt
-				 * layer) -- must not keep the daemon spinning; try the next one. */
-				attempted = 1;
-				if (compact_timeline(s, tl) == 0 &&
-					count_image_layers(s, tl) < before)
-				{
-					cooldown_until = 0;	/* progress: clear any backoff */
-					return 1;
-				}
+				s->maint_cooldown = 0;	/* progress: clear any backoff */
+				return 1;
 			}
-	}
+		}
 	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
-	 * otherwise-idle daemon doesn't re-attempt the same failing merge every 20us.
-	 * A later flush/compaction that changes layer state will return 1 and clear
-	 * this; otherwise the window simply expires and we retry. */
+	 * otherwise-idle shard doesn't re-attempt the same failing merge every 20us. */
 	if (attempted)
-		cooldown_until = time(NULL) + MAINT_COOLDOWN_SECS;
+		s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+	return 0;
+}
+
+/* Maintenance for one shard by index (the per-shard worker threads call this). */
+int
+ps_core_maintenance_shard(uint32_t shard)
+{
+	if (shard >= ps_nshards)
+		return 0;
+	return maintain_shard(&g_shards[shard]);
+}
+
+/*
+ * Maintenance across all shards (the single-threaded frontends, e.g. SPDK, call
+ * this).  Returns 1 if any shard compacted.
+ */
+int
+ps_core_maintenance(void)
+{
+	for (uint32_t i = 0; i < ps_nshards; i++)
+		if (maintain_shard(&g_shards[i]))
+			return 1;
 	return 0;
 }
 
@@ -1832,7 +1890,7 @@ ps_core_open(const char *store_dir)
 	/* rebuild each timeline's shipped-WAL end LSN from its log (WAL is shard-0,
 	 * single-threaded here; all shards' timeline copies are identical) */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if (tl == 0 || g_shards[0].timelines[tl].defined)
+		if (tl == 0 || tl_defined(&g_shards[0], tl))
 			wal_recover_one(tl);
 
 	return 0;
