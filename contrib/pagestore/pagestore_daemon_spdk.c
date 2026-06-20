@@ -295,6 +295,20 @@ main(int argc, char **argv)
 				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
+	/*
+	 * The SPDK backend maps a segment id linearly to a device offset and buffers
+	 * a single current segment, so multiple concurrent per-shard segment streams
+	 * would skew the id space (premature device-end), thrash that buffer, and
+	 * leave recoverable gaps on a reused device.  Multi-shard SPDK needs
+	 * per-thread qpairs + per-shard device regions (SHARDING.md step 5); until
+	 * then the SPDK daemon runs a single shard.
+	 */
+	if (ps_nshards != 1)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: multi-shard not supported on the "
+				"SPDK backend yet (SHARDING.md step 5); using --nshards 1\n");
+		ps_nshards = 1;
+	}
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
 

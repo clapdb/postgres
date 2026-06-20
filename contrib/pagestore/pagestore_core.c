@@ -27,11 +27,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
@@ -1569,6 +1571,69 @@ ps_core_maintenance(void)
 }
 
 /*
+ * The store records the shard count it was created with.  Per-shard segment and
+ * manifest namespaces -- and how recover() partitions segments -- are derived
+ * from ps_nshards, so reopening with a different count would mis-route or skip
+ * live data; reject the mismatch.  A pre-sharding store (segment data present but
+ * no shard-count file) is only reopenable at nshards == 1, since recovery would
+ * otherwise replay its single global segment stream out of order.  Returns 0 on
+ * match / first-time record, -1 on mismatch or I/O error.
+ */
+static int
+validate_store_nshards(const char *store_dir)
+{
+	char		path[4096];
+	char		buf[32];
+	int			fd;
+	ssize_t		n;
+
+	if (snprintf(path, sizeof(path), "%s/nshards", store_dir) >= (int) sizeof(path))
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		uint32_t	stored;
+
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			return -1;
+		buf[n] = '\0';
+		stored = (uint32_t) strtoul(buf, NULL, 10);
+		if (stored != ps_nshards)
+		{
+			fprintf(stderr, "pagestore_core: store was created with %u shard(s); "
+					"reopen with --nshards %u\n", stored, stored);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* no shard-count file: a pre-sharding store (already holds segment data) is
+	 * only valid at one shard */
+	if (ps_storage->seg_size(0) >= 0 && ps_nshards != 1)
+	{
+		fprintf(stderr, "pagestore_core: pre-sharding store; reopen with "
+				"--nshards 1\n");
+		return -1;
+	}
+
+	/* first open of this store: record the shard count durably */
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	n = snprintf(buf, sizeof(buf), "%u\n", ps_nshards);
+	if (write(fd, buf, (size_t) n) != n || fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
  * Open the store and rebuild all in-memory state from it: define the root
  * timeline, load persisted branches, rebuild the page/fork indexes from the
  * image layers (falling back to a segment scan only for a store that has no
@@ -1582,6 +1647,8 @@ ps_core_open(const char *store_dir)
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
+		return -1;
+	if (validate_store_nshards(store_dir) != 0)
 		return -1;
 	/* layer_ids are unique only within a store; drop any blooms cached from a
 	 * previously-opened store so a reused id can't return a stale "absent" */

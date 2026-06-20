@@ -155,11 +155,17 @@ timeline tree under a brief coordination point, not on the read/write hot path.
    - **4c — per-shard threads**, in sub-slices (each behaviour-preserving at
      `nshards = 1`, suite green at 1 and 4, until the last):
      - **4c-i — per-shard segment namespace.** ✅ The append cursor
-       (`cur_seg`/`cur_off`) moves into `Shard`; segment ids are shard-namespaced
-       (high bits = shard, like `layer_id`) so each shard appends to disjoint
-       segment files, and `recover()` scans + positions each shard's cursor
-       independently.  Removes the last shared write-path mutable state on the
-       segment log.
+       (`cur_seg`/`cur_off`) moves into `Shard`; segment ids are interleaved per
+       shard (`s, s+nshards, s+2·nshards, …`) so each shard appends to disjoint
+       segment files while the id space stays dense, and `recover()` scans +
+       positions each shard's cursor independently (a shard's own segments are
+       sequential, so per-shard recovery preserves append order for its
+       same-LSN rewrites).  The store records its shard count and a restart with a
+       different `--nshards` (or a pre-sharding store at `nshards > 1`) is rejected,
+       since ownership/recovery derive from it.  The SPDK backend (linear id →
+       device offset, single current-segment buffer) runs a single shard until
+       step 5; the POSIX file backend handles the per-shard sparse id space
+       directly.
      - **4c-ii** — per-shard materialized-page cache (`ps_pgcache_*` → per-shard
        handle).
      - **4c-iii** — timeline-tree coordination (`timelines[]` is read on every
