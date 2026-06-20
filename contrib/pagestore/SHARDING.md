@@ -135,9 +135,19 @@ timeline tree under a brief coordination point, not on the read/write hot path.
    helpers for `nshards` up to 8).  The in-engine client (`backend_localsvc`)
    keeps its single channel — correct at `nshards = 1` (the sole pool) — and
    adopts per-key routing in step 4 when `nshards > 1` requires it.
-4. **`nshards > 1` + one worker thread per shard** (POSIX first).  Per-shard
-   manifest files + shard-namespaced layer/segment files; `backend_localsvc`
-   per-shard channel pool + routing.  This is where real parallelism lands.
+4. **`nshards > 1` + one worker thread per shard** (POSIX first), in sub-slices:
+   - **4a — per-shard manifest + layer map + id namespace** (still `nshards = 1`,
+     single thread). ✅ The manifest is now a `PsManifest` handle (durable log +
+     layer map) owned per shard; each shard has its own `layers.<shard>.manifest`
+     and its own `next_local_id`, and `layer_id` is shard-namespaced (high bits =
+     shard) so the id-named layer files never collide across shards in the one
+     store dir.  Compaction/GC/lookup are parameterized by `Shard *`.  Behavior
+     identical at one shard (ids 1,2,3…; one manifest) — de-risks the threading
+     slice like step 2 did.
+   - **4b** — runtime `nshards > 1`, still single-threaded serve loop over all
+     pools (proves multi-shard data partitioning end-to-end before threads).
+   - **4c** — one POSIX worker thread per shard; `backend_localsvc` per-shard
+     channel pool + routing.  This is where real parallelism lands.
 5. **SPDK per-thread qpairs** so the async path scales per core.
 6. **Branch-create coordination** for the shared timeline tree.
 

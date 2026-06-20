@@ -83,17 +83,13 @@ typedef struct PsManifestLayerDisk
 	uint8_t		pad;
 } PsManifestLayerDisk;
 
-static char manifest_path[4096];
-static char manifest_dir[2048];
-PsLayerMap ps_layer_map;
-
 static int
-manifest_fsync_dir(void)
+manifest_fsync_dir(PsManifest *m)
 {
 	int			fd;
 	int			rc;
 
-	fd = open(manifest_dir, O_RDONLY);
+	fd = open(m->dir, O_RDONLY);
 	if (fd < 0)
 		return -1;
 	rc = fsync(fd);
@@ -102,14 +98,14 @@ manifest_fsync_dir(void)
 }
 
 static int
-manifest_append(uint32_t type, const void *payload, uint32_t len)
+manifest_append(PsManifest *m, uint32_t type, const void *payload, uint32_t len)
 {
 	PsManifestRecord rec;
 	int			fd;
 	int			rc = 0;
 	int			created = 0;
 
-	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	fd = open(m->path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
 		return -1;
 	if (lseek(fd, 0, SEEK_END) == 0)
@@ -125,7 +121,7 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 		rc = -1;
 	if (fsync(fd) != 0)
 		rc = -1;
-	if (created && manifest_fsync_dir() != 0)
+	if (created && manifest_fsync_dir(m) != 0)
 		rc = -1;
 	close(fd);
 	return rc;
@@ -255,37 +251,51 @@ manifest_remove_from_map(PsLayerMap *map, uint64_t layer_id)
 }
 
 int
-ps_manifest_open(const char *store_dir)
+ps_manifest_open(PsManifest *m, const char *store_dir, uint32_t shard)
 {
 	int			n;
 
-	n = snprintf(manifest_dir, sizeof(manifest_dir), "%s", store_dir);
-	if (n < 0 || (size_t) n >= sizeof(manifest_dir))
+	n = snprintf(m->dir, sizeof(m->dir), "%s", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(m->dir))
 		return -1;
-	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
-	if (n < 0 || (size_t) n >= sizeof(manifest_path))
+	/*
+	 * One manifest file per shard; the shard id keeps them distinct in the one
+	 * store directory (layer files are likewise shard-namespaced via layer_id).
+	 * Shard 0 keeps the historical unsuffixed name "layers.manifest": its ids are
+	 * 0<<shift | local == the pre-sharding ids, so a store created before sharding
+	 * reopens cleanly at nshards == 1 -- its layers replay into shard 0 and seed
+	 * next_local_id past them, with no migration and no O_EXCL id collision on the
+	 * next flush.
+	 */
+	if (shard == 0)
+		n = snprintf(m->path, sizeof(m->path), "%s/layers.manifest", store_dir);
+	else
+		n = snprintf(m->path, sizeof(m->path), "%s/layers.%u.manifest",
+					 store_dir, shard);
+	if (n < 0 || (size_t) n >= sizeof(m->path))
 		return -1;
-	ps_layer_map_init(&ps_layer_map);
+	ps_layer_map_init(&m->map);
 	return 0;
 }
 
 void
-ps_manifest_close(void)
+ps_manifest_close(PsManifest *m)
 {
-	ps_layer_map_free(&ps_layer_map);
-	manifest_path[0] = '\0';
+	ps_layer_map_free(&m->map);
+	m->path[0] = '\0';
 }
 
 int
-ps_manifest_replay(PsLayerMap *map)
+ps_manifest_replay(PsManifest *m)
 {
+	PsLayerMap *map = &m->map;
 	int			fd;
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
 	off_t		file_size;
 	struct stat st;
 
-	fd = open(manifest_path, O_RDWR);
+	fd = open(m->path, O_RDWR);
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
@@ -484,34 +494,35 @@ done:
 }
 
 int
-ps_manifest_add_layer(const PsLayerDesc *desc)
+ps_manifest_add_layer(PsManifest *m, const PsLayerDesc *desc)
 {
 	PsManifestLayerDisk disk;
 
 	if (!manifest_layer_desc_valid(desc))
 		return -1;
-	if (manifest_layer_exists(&ps_layer_map, desc->layer_id))
+	if (manifest_layer_exists(&m->map, desc->layer_id))
 		return 0;
-	if (ps_layer_map_reserve(&ps_layer_map, ps_layer_map_count(&ps_layer_map) + 1) != 0)
+	if (ps_layer_map_reserve(&m->map, ps_layer_map_count(&m->map) + 1) != 0)
 		return -1;
 	if (manifest_encode_layer(&disk, desc) != 0)
 		return -1;
-	if (manifest_append(PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
+	if (manifest_append(m, PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
 		return -1;
-	return ps_layer_map_add(&ps_layer_map, desc);
+	return ps_layer_map_add(&m->map, desc);
 }
 
 int
-ps_manifest_set_remote_durable(uint64_t layer_id, uint64_t uploaded_lsn)
+ps_manifest_set_remote_durable(PsManifest *m, uint64_t layer_id,
+							   uint64_t uploaded_lsn)
 {
 	PsManifestLayerIdEvent ev;
 	PsLayerDesc *layer;
 
 	ev.layer_id = layer_id;
 	ev.value = uploaded_lsn;
-	if (manifest_append(PS_MANIFEST_SET_REMOTE_DURABLE, &ev, sizeof(ev)) != 0)
+	if (manifest_append(m, PS_MANIFEST_SET_REMOTE_DURABLE, &ev, sizeof(ev)) != 0)
 		return -1;
-	layer = manifest_find_layer(&ps_layer_map, layer_id);
+	layer = manifest_find_layer(&m->map, layer_id);
 	if (layer != NULL)
 	{
 		layer->remote_durable = true;
@@ -521,30 +532,30 @@ ps_manifest_set_remote_durable(uint64_t layer_id, uint64_t uploaded_lsn)
 }
 
 int
-ps_manifest_mark_delete(uint64_t layer_id)
+ps_manifest_mark_delete(PsManifest *m, uint64_t layer_id)
 {
 	PsManifestLayerIdEvent ev;
 	PsLayerDesc *layer;
 
 	ev.layer_id = layer_id;
 	ev.value = 0;
-	if (manifest_append(PS_MANIFEST_MARK_DELETE, &ev, sizeof(ev)) != 0)
+	if (manifest_append(m, PS_MANIFEST_MARK_DELETE, &ev, sizeof(ev)) != 0)
 		return -1;
-	layer = manifest_find_layer(&ps_layer_map, layer_id);
+	layer = manifest_find_layer(&m->map, layer_id);
 	if (layer != NULL)
 		layer->deleting = true;
 	return 0;
 }
 
 int
-ps_manifest_remove_layer(uint64_t layer_id)
+ps_manifest_remove_layer(PsManifest *m, uint64_t layer_id)
 {
 	PsManifestLayerIdEvent ev;
 
 	ev.layer_id = layer_id;
 	ev.value = 0;
-	if (manifest_append(PS_MANIFEST_REMOVE_LAYER, &ev, sizeof(ev)) != 0)
+	if (manifest_append(m, PS_MANIFEST_REMOVE_LAYER, &ev, sizeof(ev)) != 0)
 		return -1;
-	manifest_remove_from_map(&ps_layer_map, layer_id);
+	manifest_remove_from_map(&m->map, layer_id);
 	return 0;
 }

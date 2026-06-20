@@ -82,6 +82,9 @@ typedef struct Shard
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
 	PsMemtable *memtable;		/* staging -> image layers */
+	uint32_t	index;			/* this shard's id (0 .. NSHARDS-1) */
+	PsManifest	manifest;		/* per-shard durable layer log + layer map */
+	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -98,12 +101,24 @@ shard_for(const PsKey *key)
 	return &g_shards[ps_shard_for_key(key, NSHARDS)];
 }
 
-static uint64_t g_next_layer_id = 1;	/* global for now (per-shard in step 4) */
+/*
+ * layer_id namespacing: the high LAYER_ID_SHARD_SHIFT bits hold the shard id and
+ * the low bits a per-shard counter, so ids (and the layer files named by them)
+ * never collide across shards while each shard allocates independently.  At
+ * NSHARDS == 1, shard 0's ids are 1, 2, 3, ... -- identical to the old global
+ * allocator.
+ */
+#define LAYER_ID_SHARD_SHIFT	48
+#define LAYER_ID_LOCAL_MASK		(((uint64_t) 1 << LAYER_ID_SHARD_SHIFT) - 1)
 
 uint32_t
 ps_core_layer_count(void)
 {
-	return ps_layer_map.nlayers;
+	uint32_t	n = 0;
+
+	for (uint32_t i = 0; i < NSHARDS; i++)
+		n += g_shards[i].manifest.map.nlayers;
+	return n;
 }
 
 /* read-path source counters (memtable / image layer / segment fallback),
@@ -129,20 +144,24 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 		*seg = s;
 }
 
+/* ctx is the owning Shard* (passed through the memtable flush / compaction
+ * callbacks), so id allocation and the manifest write stay on that shard. */
 static uint64_t
 alloc_layer_id(void *ctx)
 {
-	(void) ctx;
-	return g_next_layer_id++;
+	Shard	   *s = ctx;
+
+	return ((uint64_t) s->index << LAYER_ID_SHARD_SHIFT) | s->next_local_id++;
 }
 
 static int
 record_layer(void *ctx, const PsLayerDesc *desc)
 {
-	(void) ctx;
+	Shard	   *s = ctx;
+
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
-	return ps_manifest_add_layer(desc);
+	return ps_manifest_add_layer(&s->manifest, desc);
 }
 
 /* ===================== compaction & GC (LSM phase 3) =================== */
@@ -175,13 +194,14 @@ layer_size_cmp(const void *a, const void *b)
 }
 
 static uint32_t
-count_image_layers(uint32_t timeline)
+count_image_layers(Shard *s, uint32_t timeline)
 {
+	const PsLayerMap *map = &s->manifest.map;
 	uint32_t	c = 0;
 
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerDesc *d = &map->layers[i];
 
 		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
 			c++;
@@ -195,13 +215,14 @@ count_image_layers(uint32_t timeline)
  * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
  */
 static void
-gc_resume(void)
+gc_resume(Shard *s)
 {
+	const PsLayerMap *map = &s->manifest.map;
 	PsLayerDesc *dead;
 	uint32_t	m = 0;
 
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting)
+	for (uint32_t i = 0; i < map->nlayers; i++)
+		if (map->layers[i].deleting)
 			m++;
 	if (m == 0)
 		return;
@@ -209,15 +230,15 @@ gc_resume(void)
 	if (!dead)
 		return;
 	m = 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting)
-			dead[m++] = ps_layer_map.layers[i];
+	for (uint32_t i = 0; i < map->nlayers; i++)
+		if (map->layers[i].deleting)
+			dead[m++] = map->layers[i];
 	for (uint32_t k = 0; k < m; k++)
 	{
 		/* record removal only once the file is gone; a failed unlink keeps the
 		 * layer 'deleting' for the next gc_resume rather than orphaning it */
 		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
-			ps_manifest_remove_layer(dead[k].layer_id);
+			ps_manifest_remove_layer(&s->manifest, dead[k].layer_id);
 	}
 	free(dead);
 }
@@ -232,10 +253,11 @@ gc_resume(void)
  * horizon is a later step.
  */
 static int
-compact_timeline(uint32_t timeline)
+compact_timeline(Shard *s, uint32_t timeline)
 {
+	const PsLayerMap *map = &s->manifest.map;
 	PsLayerDesc *old;
-	uint32_t	nold = count_image_layers(timeline);
+	uint32_t	nold = count_image_layers(s, timeline);
 	PsImgRec   *recs = NULL;
 	unsigned char **pages = NULL;
 	uint32_t	nrec = 0,
@@ -251,9 +273,9 @@ compact_timeline(uint32_t timeline)
 	if (!old)
 		return -1;
 	nold = 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerDesc *d = &map->layers[i];
 
 		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
 			old[nold++] = *d;
@@ -367,10 +389,10 @@ compact_timeline(uint32_t timeline)
 		goto cleanup;
 
 	/* install the new merged layer durably, THEN delete the old ones */
-	nid = alloc_layer_id(NULL);
+	nid = alloc_layer_id(s);
 	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size, &newdesc) != 0)
 		goto cleanup;			/* write failed: it removed its own file */
-	if (record_layer(NULL, &newdesc) != 0)
+	if (record_layer(s, &newdesc) != 0)
 	{
 		/* written + sealed but not recorded in the manifest: delete it so its
 		 * reused layer id can't later wedge create_local_layer's O_EXCL (the same
@@ -385,13 +407,13 @@ compact_timeline(uint32_t timeline)
 		 * gone, so later reads/compactions hit a missing file.  If REMOVE_LAYER
 		 * then fails the layer stays 'deleting' -- reads skip it and gc_resume()
 		 * finishes the removal on the next start. */
-		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
+		if (ps_manifest_mark_delete(&s->manifest, old[k].layer_id) != 0)
 			continue;
 		/* record the removal only after the file is actually gone; if unlink
 		 * fails, leave the layer 'deleting' so gc_resume() retries it instead of
 		 * orphaning the file with a dropped manifest entry */
 		if (ps_layer_store->delete_local_layer(&old[k]) == 0)
-			ps_manifest_remove_layer(old[k].layer_id);
+			ps_manifest_remove_layer(&s->manifest, old[k].layer_id);
 	}
 	rc = 0;
 
@@ -1125,7 +1147,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * memtable grow without bound across retries: drop the staging (it is
 			 * reconstructable) instead of keeping it at/over the threshold. */
 			if (ps_memtable_flush(s->memtable, alloc_layer_id, record_layer,
-								  NULL) != 0)
+								  s) != 0)
 			{
 				fprintf(stderr, "pagestore_core: memtable flush failed; dropping "
 						"staged pages (still durable in the segment log)\n");
@@ -1135,11 +1157,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * when the daemon is idle.  As a backpressure guard, compact inline
 			 * here any timeline whose layer count is running away far past the
 			 * threshold (a flush groups by timeline and can emit layers for
-			 * several, so check them all, not just this write's). */
+			 * several, so check them all, not just this write's).  This shard only:
+			 * the flush added layers to this shard's map. */
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
 				if ((ct == 0 || timelines[ct].defined) &&
-					count_image_layers(ct) > (uint32_t) compact_layers * 4)
-					compact_timeline(ct);
+					count_image_layers(s, ct) > (uint32_t) compact_layers * 4)
+					compact_timeline(s, ct);
 		}
 	}
 	return 0;
@@ -1162,18 +1185,19 @@ read_version(const PageVer *v, unsigned char *out)
  * of that timeline (key-range/bloom pruning is a later optimization).
  */
 static int
-layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
+layer_map_lookup(Shard *s, uint32_t timeline, const PsKey *key, uint32_t block,
 				 uint64_t read_lsn, uint64_t *out_lsn, unsigned char *out)
 {
+	const PsLayerMap *map = &s->manifest.map;
 	unsigned char *tmp = malloc(page_size);
 	int			found = 0;
 	uint64_t	best = 0;
 
 	if (!tmp)
 		return 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		const PsLayerDesc *d = &map->layers[i];
 		uint64_t	l;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
@@ -1237,7 +1261,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				served = 1;		/* served from the memtable */
 			}
 			else if (!ambig &&
-					 layer_map_lookup(tl, key, block, rl, &l, out) &&
+					 layer_map_lookup(s, tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
 				s->rr_layer++;
@@ -1410,7 +1434,7 @@ ps_core_close(void)
 
 		if (s->memtable)
 		{
-			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, NULL);
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
 			ps_memtable_destroy(s->memtable);
 			s->memtable = NULL;
 		}
@@ -1418,26 +1442,32 @@ ps_core_close(void)
 	/* the shutdown flush can push a timeline over the compaction threshold;
 	 * compact it back under so repeated short-lived runs don't accumulate image
 	 * layers (each of which every read would then scan).  compaction is capped at
-	 * COMPACT_BATCH per call, so loop per timeline until it is under the threshold
-	 * or stops making progress (corrupt layer / ENOSPC).  Only in the layer mode:
-	 * a segment-path-only daemon (use_layers == 0, e.g. SPDK) has no memtable and
-	 * must stay layer-free, like ps_core_maintenance(). */
+	 * COMPACT_BATCH per call, so loop per (shard, timeline) until it is under the
+	 * threshold or stops making progress (corrupt layer / ENOSPC).  Only in the
+	 * layer mode: a segment-path-only daemon (use_layers == 0, e.g. SPDK) has no
+	 * memtable and must stay layer-free, like ps_core_maintenance(). */
 	if (use_layers)
-		for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
+		for (uint32_t i = 0; i < NSHARDS; i++)
 		{
-			if (ct != 0 && !timelines[ct].defined)
-				continue;
-			while (count_image_layers(ct) > (uint32_t) compact_layers)
-			{
-				uint32_t	before = count_image_layers(ct);
+			Shard	   *s = &g_shards[i];
 
-				if (compact_timeline(ct) != 0 ||
-					count_image_layers(ct) >= before)
-					break;		/* failed or no progress: stop draining this one */
+			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
+			{
+				if (ct != 0 && !timelines[ct].defined)
+					continue;
+				while (count_image_layers(s, ct) > (uint32_t) compact_layers)
+				{
+					uint32_t	before = count_image_layers(s, ct);
+
+					if (compact_timeline(s, ct) != 0 ||
+						count_image_layers(s, ct) >= before)
+						break;	/* failed or no progress: stop draining this one */
+				}
 			}
 		}
 	ps_pgcache_free();
-	ps_manifest_close();
+	for (uint32_t i = 0; i < NSHARDS; i++)
+		ps_manifest_close(&g_shards[i].manifest);
 }
 
 /*
@@ -1461,24 +1491,30 @@ ps_core_maintenance(void)
 	 * window passes. */
 	if (cooldown_until != 0 && time(NULL) < cooldown_until)
 		return 0;
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if ((tl == 0 || timelines[tl].defined) &&
-			count_image_layers(tl) > (uint32_t) compact_layers)
-		{
-			uint32_t	before = count_image_layers(tl);
+	for (uint32_t i = 0; i < NSHARDS; i++)
+	{
+		Shard	   *s = &g_shards[i];
 
-			/* Report progress (so the caller skips its idle sleep) only if the
-			 * compaction actually reduced the layer count.  A timeline that can't
-			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
-			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
-			 * must not keep the daemon spinning; try the next timeline. */
-			attempted = 1;
-			if (compact_timeline(tl) == 0 && count_image_layers(tl) < before)
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+			if ((tl == 0 || timelines[tl].defined) &&
+				count_image_layers(s, tl) > (uint32_t) compact_layers)
 			{
-				cooldown_until = 0;	/* progress: clear any backoff */
-				return 1;
+				uint32_t	before = count_image_layers(s, tl);
+
+				/* Report progress (so the caller skips its idle sleep) only if the
+				 * compaction actually reduced the layer count.  A timeline that
+				 * can't make progress -- nothing mergeable (e.g. compact_layers=0
+				 * with a single layer) or a failing compaction (ENOSPC / corrupt
+				 * layer) -- must not keep the daemon spinning; try the next one. */
+				attempted = 1;
+				if (compact_timeline(s, tl) == 0 &&
+					count_image_layers(s, tl) < before)
+				{
+					cooldown_until = 0;	/* progress: clear any backoff */
+					return 1;
+				}
 			}
-		}
+	}
 	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
 	 * otherwise-idle daemon doesn't re-attempt the same failing merge every 20us.
 	 * A later flush/compaction that changes layer state will return 1 and clear
@@ -1506,29 +1542,15 @@ ps_core_open(const char *store_dir)
 	/* layer_ids are unique only within a store; drop any blooms cached from a
 	 * previously-opened store so a reused id can't return a stale "absent" */
 	ps_image_bloom_reset();
-	if (ps_manifest_open(store_dir) != 0)
-		return -1;
-	if (ps_manifest_replay(&ps_layer_map) != 0)
-		return -1;
-	if (use_layers)
-		gc_resume();			/* finish any GC interrupted by a crash */
-
-	/* layer ids continue past the highest one the manifest restored */
-	g_next_layer_id = 1;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].layer_id >= g_next_layer_id)
-			g_next_layer_id = ps_layer_map.layers[i].layer_id + 1;
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
-	 * the read path; the SPDK daemon stays on the segment path for now.  One
-	 * memtable per shard. */
+	 * the read path; the SPDK daemon stays on the segment path for now.  Reject
+	 * non-positive thresholds before their unsigned casts: a negative
+	 * --flush-pages would become a huge flush threshold (memtable never flushes
+	 * -> unbounded RAM), and a negative --compact-layers a huge compaction
+	 * threshold (compaction never runs -> layers grow without bound). */
 	if (use_layers)
 	{
-		/* reject non-positive thresholds before their unsigned casts: a negative
-		 * --flush-pages would become a huge flush threshold (memtable never
-		 * flushes -> unbounded RAM), and a negative --compact-layers a huge
-		 * compaction threshold (compaction never runs -> layers grow without
-		 * bound, every read scanning an ever-larger map) */
 		if (flush_pages <= 0)
 		{
 			fprintf(stderr, "pagestore_core: --flush-pages must be positive "
@@ -1541,11 +1563,35 @@ ps_core_open(const char *store_dir)
 					"(got %d)\n", compact_layers);
 			return -1;
 		}
-		for (uint32_t i = 0; i < NSHARDS; i++)
+	}
+
+	/* per-shard: open + replay its manifest, finish any interrupted GC, continue
+	 * layer ids past the highest the manifest restored (low bits only -- the
+	 * shard id is OR'd in at allocation), and create the shard's memtable */
+	for (uint32_t i = 0; i < NSHARDS; i++)
+	{
+		Shard	   *s = &g_shards[i];
+
+		s->index = i;
+		if (ps_manifest_open(&s->manifest, store_dir, i) != 0)
+			return -1;
+		if (ps_manifest_replay(&s->manifest) != 0)
+			return -1;
+		if (use_layers)
+			gc_resume(s);
+		s->next_local_id = 1;
+		for (uint32_t j = 0; j < s->manifest.map.nlayers; j++)
 		{
-			g_shards[i].memtable = ps_memtable_create(page_size,
-													  (uint32_t) flush_pages);
-			if (!g_shards[i].memtable)
+			uint64_t	local = s->manifest.map.layers[j].layer_id &
+				LAYER_ID_LOCAL_MASK;
+
+			if (local >= s->next_local_id)
+				s->next_local_id = local + 1;
+		}
+		if (use_layers)
+		{
+			s->memtable = ps_memtable_create(page_size, (uint32_t) flush_pages);
+			if (!s->memtable)
 				return -1;
 		}
 	}
@@ -1560,9 +1606,8 @@ ps_core_open(const char *store_dir)
 		return -1;
 	}
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
-	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
-			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
-			(unsigned long long) g_next_layer_id);
+	fprintf(stderr, "pagestore_core: %u image layer(s) across %u shard(s) after "
+			"manifest replay\n", ps_core_layer_count(), (uint32_t) NSHARDS);
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
