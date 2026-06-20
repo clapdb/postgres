@@ -111,18 +111,9 @@ key_cmp(const PsKey *a, const PsKey *b)
  * Single-threaded with the daemon's serve loop; per-shard worker threads (a
  * later sharding step) would shard this cache or guard it with a lock.
  */
-#define PS_LAYER_BLOOM_BYTES	512			/* 4096 bits per layer */
 #define PS_LAYER_BLOOM_BITS		(PS_LAYER_BLOOM_BYTES * 8)
-#define PS_LAYER_BLOOM_SLOTS	1024		/* direct-mapped by layer_id */
-
-typedef struct LayerBloom
-{
-	uint64_t	layer_id;
-	int			valid;
-	uint8_t		bits[PS_LAYER_BLOOM_BYTES];
-} LayerBloom;
-
-static LayerBloom layer_bloom_cache[PS_LAYER_BLOOM_SLOTS];
+/* PS_LAYER_BLOOM_BYTES / _SLOTS and the cache types live in pagestore_layer.h;
+ * the cache is owned per shard by the caller (no file-scope global). */
 
 /* two independent hashes of (key,block) -> bit positions (FNV-1a variants) */
 static void
@@ -171,10 +162,10 @@ bloom_test(const uint8_t *bits, const PsKey *key, uint32_t block)
 
 /* the direct-mapped cache slot for a layer; caller checks ->valid && ->layer_id
  * to know whether it already holds THIS layer's bloom */
-static LayerBloom *
-bloom_slot(uint64_t layer_id)
+static PsLayerBloomSlot *
+bloom_slot(PsLayerBloom *bc, uint64_t layer_id)
 {
-	return &layer_bloom_cache[layer_id % PS_LAYER_BLOOM_SLOTS];
+	return &bc->slots[layer_id % PS_LAYER_BLOOM_SLOTS];
 }
 
 /*
@@ -185,9 +176,9 @@ bloom_slot(uint64_t layer_id)
  * starts with an empty cache.
  */
 void
-ps_image_bloom_reset(void)
+ps_image_bloom_reset(PsLayerBloom *bc)
 {
-	memset(layer_bloom_cache, 0, sizeof(layer_bloom_cache));
+	memset(bc, 0, sizeof(*bc));
 }
 
 /* internal sort record: on-disk index entry plus its source page index */
@@ -688,7 +679,7 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 			if (plan->has_base && d->lsn_end < plan->base_lsn)
 				break;
 			r = ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-									  &l, &amb);
+									  &l, &amb, NULL);
 			if (r < 0)
 			{
 				base_ok = 0;	/* a covering candidate is corrupt/unavailable */
@@ -870,7 +861,7 @@ int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn,
 					  void *out, uint32_t page_size, uint64_t *out_lsn,
-					  int *out_ambiguous)
+					  int *out_ambiguous, PsLayerBloom *bc)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
@@ -882,8 +873,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	int			found = 0;
 	int			rc = -1;
 
-	LayerBloom *be = bloom_slot(layer->layer_id);
-	int			cached = (be->valid && be->layer_id == layer->layer_id);
+	PsLayerBloomSlot *be = bc ? bloom_slot(bc, layer->layer_id) : NULL;
+	int			cached = (be && be->valid && be->layer_id == layer->layer_id);
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or has no
 	 * version at/below read_lsn */
@@ -916,8 +907,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		goto out;				/* corrupt index */
 
 	/* first read of this layer: build its bloom from the verified index so later
-	 * reads can skip it without this index read */
-	if (!cached)
+	 * reads can skip it without this index read (only when a cache was given) */
+	if (be && !cached)
 	{
 		memset(be->bits, 0, sizeof(be->bits));
 		for (uint32_t i = 0; i < foot.nrecs; i++)

@@ -22,6 +22,8 @@
 static int	run = 0,
 			failed = 0;
 
+static PsLayerBloom tb;		/* the test's bloom cache (mirrors a shard's) */
+
 static void
 check(int cond, const char *msg)
 {
@@ -77,29 +79,29 @@ main(void)
 	check(d.lsn_start == 100 && d.lsn_end == 300, "layer lsn range");
 
 	/* newest version <= read_lsn */
-	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xA2, "(5,0)@<=250 -> version 200");
-	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xA3, "(5,0)@<=1000 -> version 300");
-	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xA1, "(5,0)@<=100 -> version 100 (exact)");
-	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 50, out, psz, NULL, NULL, &tb);
 	check(r == 0, "(5,0)@<=50 -> no version (older than oldest)");
-	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 1, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xB1, "(5,1) -> version 150");
-	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
-	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 0, "absent key -> no version");
 
 	/* bloom read cache: the lookups above built this layer's bloom from its
 	 * index; present keys must still be found (no false negative) and absent keys
 	 * still rejected via the cached bloom */
-	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xA3, "bloom-cached: (5,0) still found");
-	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k6, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 1 && out[0] == 0xC1, "bloom-cached: (6,0) still found");
-	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL);
+	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL, NULL, &tb);
 	check(r == 0, "bloom-cached: absent key still rejected");
 	{
 		int			ok = 1;
@@ -108,7 +110,7 @@ main(void)
 		{
 			PsKey		ka = {1, 1, rel, 0};
 
-			if (ps_image_layer_lookup(&d, &ka, 0, 1000, out, psz, NULL, NULL) != 0)
+			if (ps_image_layer_lookup(&d, &ka, 0, 1000, out, psz, NULL, NULL, &tb) != 0)
 				ok = 0;
 		}
 		check(ok, "bloom-cached: 300 absent keys all rejected");
@@ -116,7 +118,7 @@ main(void)
 
 	/* bloom cache reset: layer_ids are unique only within a store, so a process
 	 * that opens a second store can see a new layer reuse an id whose slot still
-	 * holds the old store's bloom.  ps_image_bloom_reset() (called by ps_core_open)
+	 * holds the old store's bloom.  ps_image_bloom_reset(&tb) (called by ps_core_open)
 	 * must clear it.  Simulate: build the bloom for d's id (holds rel 5/6), then a
 	 * different layer that reuses that id but holds rel 7 -- after a reset its
 	 * absent-from-the-old-bloom key must still be found, not masked. */
@@ -125,18 +127,18 @@ main(void)
 		PsKey		k7 = {1, 1, 7, 0};	/* not in d's bloom */
 		PsImgRec	rr[1] = {{k7, 0, 100, pg[2]}};	/* 0xA3 */
 
-		r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
+		r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL, &tb);
 		check(r == 1, "bloom-reset: prime old bloom for the id");
 		check(ps_image_layer_write(21, 0, rr, 1, psz, &reuse) == 0,
 			  "bloom-reset: write reuse layer");
 		reuse.layer_id = d.layer_id;	/* force the id (slot) collision */
-		ps_image_bloom_reset();
-		r = ps_image_layer_lookup(&reuse, &k7, 0, 1000, out, psz, NULL, NULL);
+		ps_image_bloom_reset(&tb);
+		r = ps_image_layer_lookup(&reuse, &k7, 0, 1000, out, psz, NULL, NULL, &tb);
 		check(r == 1 && out[0] == 0xA3,
 			  "bloom-reset: reused-id layer found after reset (not masked)");
 		/* that lookup cached reuse's bloom under d's id; clear it so the checks
 		 * below that read d again rebuild d's own bloom */
-		ps_image_bloom_reset();
+		ps_image_bloom_reset(&tb);
 	}
 
 	/* same-lsn duplicate versions of one (key,block): ambiguous only when the
@@ -151,16 +153,16 @@ main(void)
 
 		check(ps_image_layer_write(11, 0, dup, 2, psz, &da) == 0,
 			  "write same-lsn differing-bytes layer");
-		r = ps_image_layer_lookup(&da, &k5, 0, 400, out, psz, NULL, &amb);
+		r = ps_image_layer_lookup(&da, &k5, 0, 400, out, psz, NULL, &amb, &tb);
 		check(r == 1 && amb == 1, "same-lsn differing bytes -> ambiguous");
 		amb = -1;
 		check(ps_image_layer_write(19, 0, idup, 2, psz, &di) == 0,
 			  "write same-lsn identical-bytes layer");
-		r = ps_image_layer_lookup(&di, &k5, 0, 400, out, psz, NULL, &amb);
+		r = ps_image_layer_lookup(&di, &k5, 0, 400, out, psz, NULL, &amb, &tb);
 		check(r == 1 && amb == 0 && out[0] == 0xA3,
 			  "same-lsn identical bytes -> not ambiguous (compaction overlap)");
 		amb = -1;
-		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, &amb);
+		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, &amb, &tb);
 		check(r == 1 && amb == 0, "distinct lsn -> not ambiguous");
 	}
 
@@ -173,9 +175,9 @@ main(void)
 		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1, "corrupt a page byte");
 		if (fd >= 0)
 			close(fd);
-		r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL);
+		r = ps_image_layer_lookup(&d, &k5, 0, 100, out, psz, NULL, NULL, &tb);
 		check(r == -1, "corrupted page -> lookup rejects (data crc)");
-		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL);
+		r = ps_image_layer_lookup(&d, &k5, 0, 250, out, psz, NULL, NULL, &tb);
 		check(r == 1 && out[0] == 0xA2, "uncorrupted page still served");
 	}
 
