@@ -3,6 +3,9 @@
  * pagestore_pgcache.c
  *	  Scan-resistant CLOCK materialized-page cache.  See pagestore_pgcache.h.
  *
+ * One instance per shard (PsPgcache), so a shard's cache is single-owner and
+ * lock-free; all state lives in the handle, no file-scope globals.
+ *
  *-------------------------------------------------------------------------
  */
 #include <stdlib.h>
@@ -18,25 +21,13 @@ typedef struct PgKey
 	PsKey		key;
 } PgKey;
 
-typedef struct Slot
+struct PgcSlot
 {
 	int			valid;
 	uint8_t		ref;			/* CLOCK reference bit */
 	PgKey		k;
 	int			hnext;			/* next slot in its hash bucket, or -1 */
-} Slot;
-
-static uint32_t cache_max;		/* capacity in pages (0 = disabled) */
-static uint32_t cache_psz;
-static Slot *slots;
-static unsigned char *pages;	/* cache_max * cache_psz, slot i at i*psz */
-static int *buckets;			/* nbuckets heads (slot index or -1) */
-static uint32_t nbuckets;
-static uint32_t nused;			/* slots populated so far (<= cache_max) */
-static uint32_t hand;			/* CLOCK hand */
-static uint64_t st_hits,
-			st_misses,
-			st_evict;
+};
 
 static uint32_t
 key_hash(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
@@ -66,139 +57,138 @@ key_eq(const PgKey *a, uint32_t tl, const PsKey *key, uint32_t block,
 }
 
 void
-ps_pgcache_init(uint32_t max_pages, uint32_t page_size)
+ps_pgcache_init(PsPgcache *c, uint32_t max_pages, uint32_t page_size)
 {
-	cache_max = max_pages;
-	cache_psz = page_size;
-	st_hits = st_misses = st_evict = 0;
-	nused = hand = 0;
+	memset(c, 0, sizeof(*c));
+	c->max = max_pages;
+	c->psz = page_size;
 	if (max_pages == 0)
 		return;
-	nbuckets = max_pages * 2 + 1;
-	slots = calloc(max_pages, sizeof(Slot));
-	pages = malloc((size_t) max_pages * page_size);
-	buckets = malloc((size_t) nbuckets * sizeof(int));
-	if (!slots || !pages || !buckets)
+	c->nbuckets = max_pages * 2 + 1;
+	c->slots = calloc(max_pages, sizeof(struct PgcSlot));
+	c->pages = malloc((size_t) max_pages * page_size);
+	c->buckets = malloc((size_t) c->nbuckets * sizeof(int));
+	if (!c->slots || !c->pages || !c->buckets)
 	{
-		ps_pgcache_free();
-		cache_max = 0;
+		ps_pgcache_free(c);
 		return;
 	}
-	for (uint32_t i = 0; i < nbuckets; i++)
-		buckets[i] = -1;
+	for (uint32_t i = 0; i < c->nbuckets; i++)
+		c->buckets[i] = -1;
 }
 
 void
-ps_pgcache_free(void)
+ps_pgcache_free(PsPgcache *c)
 {
-	free(slots);
-	free(pages);
-	free(buckets);
-	slots = NULL;
-	pages = NULL;
-	buckets = NULL;
-	cache_max = 0;
+	free(c->slots);
+	free(c->pages);
+	free(c->buckets);
+	c->slots = NULL;
+	c->pages = NULL;
+	c->buckets = NULL;
+	c->max = 0;
 }
 
 static int
-find_slot(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
-		  uint32_t *out_bucket)
+find_slot(PsPgcache *c, uint32_t tl, const PsKey *key, uint32_t block,
+		  uint64_t lsn, uint32_t *out_bucket)
 {
-	uint32_t	b = key_hash(tl, key, block, lsn) % nbuckets;
+	uint32_t	b = key_hash(tl, key, block, lsn) % c->nbuckets;
 
 	if (out_bucket)
 		*out_bucket = b;
-	for (int i = buckets[b]; i >= 0; i = slots[i].hnext)
-		if (slots[i].valid && key_eq(&slots[i].k, tl, key, block, lsn))
+	for (int i = c->buckets[b]; i >= 0; i = c->slots[i].hnext)
+		if (c->slots[i].valid && key_eq(&c->slots[i].k, tl, key, block, lsn))
 			return i;
 	return -1;
 }
 
 int
-ps_pgcache_lookup(uint32_t tl, const PsKey *key, uint32_t block,
+ps_pgcache_lookup(PsPgcache *c, uint32_t tl, const PsKey *key, uint32_t block,
 				  uint64_t version_lsn, void *out)
 {
 	int			s;
 
-	if (cache_max == 0)
+	if (c->max == 0)
 		return 0;
-	s = find_slot(tl, key, block, version_lsn, NULL);
+	s = find_slot(c, tl, key, block, version_lsn, NULL);
 	if (s < 0)
 	{
-		st_misses++;
+		c->misses++;
 		return 0;
 	}
-	slots[s].ref = 1;			/* re-reference: survives the next sweep */
-	memcpy(out, pages + (size_t) s * cache_psz, cache_psz);
-	st_hits++;
+	c->slots[s].ref = 1;		/* re-reference: survives the next sweep */
+	memcpy(out, c->pages + (size_t) s * c->psz, c->psz);
+	c->hits++;
 	return 1;
 }
 
 /* unlink slot s from its hash bucket chain */
 static void
-bucket_remove(int s)
+bucket_remove(PsPgcache *c, int s)
 {
-	uint32_t	b = key_hash(slots[s].k.timeline, &slots[s].k.key,
-							 slots[s].k.block, slots[s].k.lsn) % nbuckets;
-	int		   *pp = &buckets[b];
+	uint32_t	b = key_hash(c->slots[s].k.timeline, &c->slots[s].k.key,
+							 c->slots[s].k.block, c->slots[s].k.lsn) % c->nbuckets;
+	int		   *pp = &c->buckets[b];
 
 	while (*pp >= 0 && *pp != s)
-		pp = &slots[*pp].hnext;
+		pp = &c->slots[*pp].hnext;
 	if (*pp == s)
-		*pp = slots[s].hnext;
+		*pp = c->slots[s].hnext;
 }
 
 void
-ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
+ps_pgcache_insert(PsPgcache *c, uint32_t tl, const PsKey *key, uint32_t block,
 				  uint64_t version_lsn, const void *page)
 {
 	uint32_t	b;
 	int			s;
 
-	if (cache_max == 0)
+	if (c->max == 0)
 		return;
-	s = find_slot(tl, key, block, version_lsn, &b);
+	s = find_slot(c, tl, key, block, version_lsn, &b);
 	if (s >= 0)
 	{							/* already present: refresh bytes + reference */
-		memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
-		slots[s].ref = 1;
+		memcpy(c->pages + (size_t) s * c->psz, page, c->psz);
+		c->slots[s].ref = 1;
 		return;
 	}
 
-	if (nused < cache_max)
-		s = (int) nused++;		/* still filling */
+	if (c->nused < c->max)
+		s = (int) c->nused++;	/* still filling */
 	else
 	{
 		/* CLOCK: advance over referenced slots (clearing), evict first ref=0 */
-		while (slots[hand].ref)
+		while (c->slots[c->hand].ref)
 		{
-			slots[hand].ref = 0;
-			hand = (hand + 1) % cache_max;
+			c->slots[c->hand].ref = 0;
+			c->hand = (c->hand + 1) % c->max;
 		}
-		s = (int) hand;
-		hand = (hand + 1) % cache_max;
-		bucket_remove(s);
-		st_evict++;
+		s = (int) c->hand;
+		c->hand = (c->hand + 1) % c->max;
+		bucket_remove(c, s);
+		c->evict++;
 	}
 
-	slots[s].valid = 1;
-	slots[s].ref = 0;			/* scan-resistant: new entries start unreferenced */
-	slots[s].k.timeline = tl;
-	slots[s].k.key = *key;
-	slots[s].k.block = block;
-	slots[s].k.lsn = version_lsn;
-	memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
-	slots[s].hnext = buckets[b];
-	buckets[b] = s;
+	c->slots[s].valid = 1;
+	c->slots[s].ref = 0;		/* scan-resistant: new entries start unreferenced */
+	c->slots[s].k.timeline = tl;
+	c->slots[s].k.key = *key;
+	c->slots[s].k.block = block;
+	c->slots[s].k.lsn = version_lsn;
+	memcpy(c->pages + (size_t) s * c->psz, page, c->psz);
+	c->slots[s].hnext = c->buckets[b];
+	c->buckets[b] = s;
 }
 
 void
-ps_pgcache_stats(uint64_t *hits, uint64_t *misses, uint64_t *evictions)
+ps_pgcache_stats(const PsPgcache *c, uint64_t *hits, uint64_t *misses,
+				 uint64_t *evictions)
 {
 	if (hits)
-		*hits = st_hits;
+		*hits = c->hits;
 	if (misses)
-		*misses = st_misses;
+		*misses = c->misses;
 	if (evictions)
-		*evictions = st_evict;
+		*evictions = c->evict;
 }

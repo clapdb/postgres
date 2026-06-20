@@ -87,6 +87,7 @@ typedef struct Shard
 	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
 	int			cur_seg;		/* segment being appended (-1: none yet) */
 	uint64_t	cur_off;		/* append cursor within cur_seg */
+	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -168,6 +169,44 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 		*layer = l;
 	if (seg)
 		*seg = s;
+}
+
+/*
+ * The materialized-page cache for 'key' -- i.e. its shard's.  A frontend (the
+ * SPDK async path) that caches pages outside read_resolve uses this to reach the
+ * right per-shard cache; routing by the key matches read_resolve.
+ */
+PsPgcache *
+ps_core_pgcache_for(const PsKey *key)
+{
+	return &shard_for(key)->pgcache;
+}
+
+/* materialized-page cache counters, summed across shards */
+void
+ps_core_pgcache_stats(uint64_t *hits, uint64_t *misses, uint64_t *evictions)
+{
+	uint64_t	h = 0,
+				m = 0,
+				e = 0;
+
+	for (uint32_t i = 0; i < ps_nshards; i++)
+	{
+		uint64_t	sh,
+					sm,
+					se;
+
+		ps_pgcache_stats(&g_shards[i].pgcache, &sh, &sm, &se);
+		h += sh;
+		m += sm;
+		e += se;
+	}
+	if (hits)
+		*hits = h;
+	if (misses)
+		*misses = m;
+	if (evictions)
+		*evictions = e;
 }
 
 /* ctx is the owning Shard* (passed through the memtable flush / compaction
@@ -1279,7 +1318,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * from the segment (pv's exact location). */
 			int			ambig = page_lsn_ambiguous(e, pv->lsn);
 
-			if (!ambig && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+			if (!ambig && ps_pgcache_lookup(&s->pgcache, tl, key, block,
+											pv->lsn, out))
 				return 1;
 
 			if (!ambig && s->memtable &&
@@ -1302,7 +1342,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
 			if (served && !ambig)
-				ps_pgcache_insert(tl, key, block, pv->lsn, out);
+				ps_pgcache_insert(&s->pgcache, tl, key, block, pv->lsn, out);
 			return served ? 1 : 0;
 		}
 		if (!timeline_has_parent(tl))
@@ -1511,9 +1551,11 @@ ps_core_close(void)
 				}
 			}
 		}
-	ps_pgcache_free();
 	for (uint32_t i = 0; i < ps_nshards; i++)
+	{
+		ps_pgcache_free(&g_shards[i].pgcache);
 		ps_manifest_close(&g_shards[i].manifest);
+	}
 }
 
 /*
@@ -1675,6 +1717,15 @@ ps_core_open(const char *store_dir)
 			return -1;
 		}
 	}
+	/* reject a negative --cache-pages before the unsigned cast below (it would
+	 * become a huge per-shard capacity and make ps_pgcache_init attempt an
+	 * enormous allocation); 0 disables the cache */
+	if (cache_pages < 0)
+	{
+		fprintf(stderr, "pagestore_core: --cache-pages must be >= 0 (got %d)\n",
+				cache_pages);
+		return -1;
+	}
 
 	/* per-shard: open + replay its manifest, finish any interrupted GC, continue
 	 * layer ids past the highest the manifest restored (low bits only -- the
@@ -1706,18 +1757,14 @@ ps_core_open(const char *store_dir)
 			if (!s->memtable)
 				return -1;
 		}
+		/* The materialized-page cache helps both read paths (read_resolve and the
+		 * SPDK async path), so it is not gated on use_layers.  --cache-pages is the
+		 * total budget across shards; split it evenly so total RAM is independent
+		 * of nshards (each shard's cache stays single-owner).  At nshards == 1 the
+		 * shard gets the whole budget -- identical to before. */
+		ps_pgcache_init(&s->pgcache, (uint32_t) cache_pages / ps_nshards,
+						page_size);
 	}
-	/* the materialized-page cache helps both read paths (read_resolve and the
-	 * SPDK async path), so it is not gated on use_layers.  Reject a negative
-	 * --cache-pages before the unsigned cast (it would become a huge capacity and
-	 * make ps_pgcache_init attempt an enormous allocation); 0 disables the cache. */
-	if (cache_pages < 0)
-	{
-		fprintf(stderr, "pagestore_core: --cache-pages must be >= 0 (got %d)\n",
-				cache_pages);
-		return -1;
-	}
-	ps_pgcache_init((uint32_t) cache_pages, page_size);
 	fprintf(stderr, "pagestore_core: %u image layer(s) across %u shard(s) after "
 			"manifest replay\n", ps_core_layer_count(), ps_nshards);
 

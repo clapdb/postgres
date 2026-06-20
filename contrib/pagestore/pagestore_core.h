@@ -23,6 +23,7 @@
 
 #include "pagestore_ipc.h"
 #include "pagestore_storage.h"
+#include "pagestore_pgcache.h"
 
 /* One stored version of a page: its LSN and where the bytes live in the store. */
 typedef struct PageVer
@@ -57,6 +58,14 @@ extern uint32_t ps_core_layer_count(void);
 
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
+
+/* The per-shard materialized-page cache that owns 'key' (for a frontend caching
+ * pages outside read_resolve, e.g. the SPDK async path). */
+extern PsPgcache *ps_core_pgcache_for(const PsKey *key);
+
+/* Materialized-page cache hit/miss/eviction counts, summed across shards. */
+extern void ps_core_pgcache_stats(uint64_t *hits, uint64_t *misses,
+								  uint64_t *evictions);
 
 /*
  * Handle every request that is NOT page byte I/O and return 1.  The four
