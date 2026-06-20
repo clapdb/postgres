@@ -1128,8 +1128,14 @@ count_obj_files(const char *dir)
 	if (!d)
 		return -1;
 	while ((e = readdir(d)) != NULL)
-		if (strncmp(e->d_name, "obj_", 4) == 0)
+	{
+		size_t		len = strlen(e->d_name);
+
+		/* count only durably-renamed objects, not the "<obj>.tmp" staging file */
+		if (strncmp(e->d_name, "obj_", 4) == 0 &&
+			!(len >= 4 && strcmp(e->d_name + len - 4, ".tmp") == 0))
 			n++;
+	}
 	closedir(d);
 	return n;
 }
@@ -1193,9 +1199,12 @@ run_object_tier_suite(const char *daemon_path, const char *tmpbase)
 	op_read_one(REL_A, FORK0, 5, rb);
 	check(memcmp(rb, pg, ps) == 0, "object tier: read serves correct bytes");
 
-	/* clean restart: uploaded layers stay durable, reads still work */
+	/* clean restart: uploaded layers stay durable, reads still work.  Recreate the
+	 * shm (as the other restart tests do) so wait_ready cannot return against the
+	 * previous daemon's stale magic before the new one re-initializes it. */
 	stop_daemon(dpid);
 	client_detach();
+	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);

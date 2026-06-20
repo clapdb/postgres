@@ -330,6 +330,24 @@ count_image_layers(Shard *s, uint32_t timeline)
 }
 
 /*
+ * Finish removing a 'deleting' layer: drop its local file, then its object copy
+ * (when the object tier holds one), and only then record the manifest removal.
+ * Ordered so a failed unlink or remote delete leaves the layer 'deleting' for the
+ * next gc_resume rather than orphaning a file/object whose manifest entry is gone;
+ * delete_remote_layer is idempotent, so a retry is safe.
+ */
+static void
+gc_remove_layer(Shard *s, const PsLayerDesc *d)
+{
+	if (ps_layer_store->delete_local_layer(d) != 0)
+		return;
+	if (ps_object_tier && d->remote_durable &&
+		ps_layer_store->delete_remote_layer(d) != 0)
+		return;
+	ps_manifest_remove_layer(&s->manifest, d->layer_id);
+}
+
+/*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
  * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
  * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
@@ -354,12 +372,7 @@ gc_resume(Shard *s)
 		if (map->layers[i].deleting)
 			dead[m++] = map->layers[i];
 	for (uint32_t k = 0; k < m; k++)
-	{
-		/* record removal only once the file is gone; a failed unlink keeps the
-		 * layer 'deleting' for the next gc_resume rather than orphaning it */
-		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
-			ps_manifest_remove_layer(&s->manifest, dead[k].layer_id);
-	}
+		gc_remove_layer(s, &dead[k]);
 	free(dead);
 }
 
@@ -529,11 +542,10 @@ compact_timeline(Shard *s, uint32_t timeline)
 		 * finishes the removal on the next start. */
 		if (ps_manifest_mark_delete(&s->manifest, old[k].layer_id) != 0)
 			continue;
-		/* record the removal only after the file is actually gone; if unlink
-		 * fails, leave the layer 'deleting' so gc_resume() retries it instead of
-		 * orphaning the file with a dropped manifest entry */
-		if (ps_layer_store->delete_local_layer(&old[k]) == 0)
-			ps_manifest_remove_layer(&s->manifest, old[k].layer_id);
+		/* drop local file (+ object copy if uploaded), then the manifest entry;
+		 * a failure leaves the layer 'deleting' so gc_resume() retries it instead
+		 * of orphaning a file/object with a dropped manifest entry */
+		gc_remove_layer(s, &old[k]);
 	}
 	rc = 0;
 
@@ -1647,10 +1659,14 @@ ps_core_close(void)
 
 /*
  * Upload one sealed layer that isn't yet remote-durable to the object tier and
- * mark it durable (LSM phase 4).  Off the write path (maintenance), one per call
- * so it stays a nonblocking slice; restart re-attempts any still-not-durable
- * layer, and upload is idempotent (keyed by layer id).  Returns 1 if it uploaded
- * one, 0 if none were pending or the tier could not take it this round.
+ * mark it durable (LSM phase 4).  Runs in maintenance (only when the worker found
+ * no pending request), one layer per call, between channel-poll cycles -- the
+ * same model as compact_timeline().  For the local-directory object store the
+ * copy is fast; with a slow remote provider a single layer's upload would still
+ * block this shard's polling for its duration, so when a real remote backend
+ * lands this moves to a background uploader.  Restart re-attempts any still-not-
+ * durable layer and upload is idempotent (keyed by layer id).  Returns 1 if it
+ * uploaded one, 0 if none were pending, -1 if a layer was pending but failed.
  */
 static int
 upload_one(Shard *s)
@@ -1664,16 +1680,18 @@ upload_one(Shard *s)
 		if (d->remote_durable || d->deleting)
 			continue;
 		/* upload, then confirm it is really there before marking durable, so a
-		 * local copy is never treated as evictable on an unverified upload */
+		 * local copy is never treated as evictable on an unverified upload.  A
+		 * failure is reported distinctly from "nothing pending" so the caller can
+		 * back off instead of hot-looping on an unwritable/unavailable store. */
 		if (ps_layer_store->upload_layer(d) != 0 ||
 			ps_layer_store->layer_exists_remote(d) != 1)
-			return 0;			/* tier unusable / I/O error: stop this round */
+			return -1;			/* a layer was pending but the upload failed */
 		if (ps_manifest_set_remote_durable(&s->manifest, d->layer_id,
 										   d->lsn_end) != 0)
-			return 0;
-		return 1;
+			return -1;
+		return 1;				/* uploaded one */
 	}
-	return 0;
+	return 0;					/* nothing pending */
 }
 
 /*
@@ -1715,11 +1733,21 @@ maintain_shard(Shard *s)
 				return 1;
 			}
 		}
-	/* nothing to compact: with an object tier, push one not-yet-durable layer */
-	if (ps_object_tier && upload_one(s))
-		return 1;
-	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
-	 * otherwise-idle shard doesn't re-attempt the same failing merge every 20us. */
+	/* nothing to compact: with an object tier, push one not-yet-durable layer.
+	 * Treat a failed upload like a failed compaction -- back off, so an unwritable
+	 * or unavailable object store doesn't turn into a 20us retry storm. */
+	if (ps_object_tier)
+	{
+		int			u = upload_one(s);
+
+		if (u > 0)
+			return 1;
+		if (u < 0)
+			attempted = 1;
+	}
+	/* Over-threshold timeline(s) exist but none could be compacted, or an upload
+	 * failed: back off so an otherwise-idle shard doesn't re-attempt the same
+	 * failing work every 20us. */
 	if (attempted)
 		s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
 	return 0;
