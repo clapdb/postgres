@@ -258,10 +258,20 @@ ps_manifest_open(PsManifest *m, const char *store_dir, uint32_t shard)
 	n = snprintf(m->dir, sizeof(m->dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(m->dir))
 		return -1;
-	/* one manifest file per shard; the shard id keeps them distinct in the one
-	 * store directory (layer files are likewise shard-namespaced via layer_id) */
-	n = snprintf(m->path, sizeof(m->path), "%s/layers.%u.manifest", store_dir,
-				 shard);
+	/*
+	 * One manifest file per shard; the shard id keeps them distinct in the one
+	 * store directory (layer files are likewise shard-namespaced via layer_id).
+	 * Shard 0 keeps the historical unsuffixed name "layers.manifest": its ids are
+	 * 0<<shift | local == the pre-sharding ids, so a store created before sharding
+	 * reopens cleanly at nshards == 1 -- its layers replay into shard 0 and seed
+	 * next_local_id past them, with no migration and no O_EXCL id collision on the
+	 * next flush.
+	 */
+	if (shard == 0)
+		n = snprintf(m->path, sizeof(m->path), "%s/layers.manifest", store_dir);
+	else
+		n = snprintf(m->path, sizeof(m->path), "%s/layers.%u.manifest",
+					 store_dir, shard);
 	if (n < 0 || (size_t) n >= sizeof(m->path))
 		return -1;
 	ps_layer_map_init(&m->map);
