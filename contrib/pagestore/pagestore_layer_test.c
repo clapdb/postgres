@@ -114,6 +114,31 @@ main(void)
 		check(ok, "bloom-cached: 300 absent keys all rejected");
 	}
 
+	/* bloom cache reset: layer_ids are unique only within a store, so a process
+	 * that opens a second store can see a new layer reuse an id whose slot still
+	 * holds the old store's bloom.  ps_image_bloom_reset() (called by ps_core_open)
+	 * must clear it.  Simulate: build the bloom for d's id (holds rel 5/6), then a
+	 * different layer that reuses that id but holds rel 7 -- after a reset its
+	 * absent-from-the-old-bloom key must still be found, not masked. */
+	{
+		PsLayerDesc reuse;
+		PsKey		k7 = {1, 1, 7, 0};	/* not in d's bloom */
+		PsImgRec	rr[1] = {{k7, 0, 100, pg[2]}};	/* 0xA3 */
+
+		r = ps_image_layer_lookup(&d, &k5, 0, 1000, out, psz, NULL, NULL);
+		check(r == 1, "bloom-reset: prime old bloom for the id");
+		check(ps_image_layer_write(21, 0, rr, 1, psz, &reuse) == 0,
+			  "bloom-reset: write reuse layer");
+		reuse.layer_id = d.layer_id;	/* force the id (slot) collision */
+		ps_image_bloom_reset();
+		r = ps_image_layer_lookup(&reuse, &k7, 0, 1000, out, psz, NULL, NULL);
+		check(r == 1 && out[0] == 0xA3,
+			  "bloom-reset: reused-id layer found after reset (not masked)");
+		/* that lookup cached reuse's bloom under d's id; clear it so the checks
+		 * below that read d again rebuild d's own bloom */
+		ps_image_bloom_reset();
+	}
+
 	/* same-lsn duplicate versions of one (key,block): ambiguous only when the
 	 * bytes differ (a genuine rewrite).  Identical-byte duplicates within a layer
 	 * are benign (compaction merges crash-overlapped layers into one). */

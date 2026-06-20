@@ -1503,6 +1503,9 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
+	/* layer_ids are unique only within a store; drop any blooms cached from a
+	 * previously-opened store so a reused id can't return a stale "absent" */
+	ps_image_bloom_reset();
 	if (ps_manifest_open(store_dir) != 0)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)

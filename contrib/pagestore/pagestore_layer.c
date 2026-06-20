@@ -177,6 +177,19 @@ bloom_slot(uint64_t layer_id)
 	return &layer_bloom_cache[layer_id % PS_LAYER_BLOOM_SLOTS];
 }
 
+/*
+ * Drop every cached bloom.  layer_ids are only unique within a single store, so a
+ * process that closes one store and opens another (ps_core_close/open) could
+ * otherwise hit a slot still holding the previous store's bloom for the same
+ * layer_id and wrongly skip a layer.  The open path calls this so each store
+ * starts with an empty cache.
+ */
+void
+ps_image_bloom_reset(void)
+{
+	memset(layer_bloom_cache, 0, sizeof(layer_bloom_cache));
+}
+
 /* internal sort record: on-disk index entry plus its source page index */
 typedef struct ImgSort
 {
