@@ -389,7 +389,7 @@ main(int argc, char **argv)
 			}
 		}
 
-		if (ps_spdk_poll() > 0)
+		if (ps_spdk_poll(0) > 0)	/* single shard for now (step 5a) */
 			work = 1;
 
 		if (!work)
