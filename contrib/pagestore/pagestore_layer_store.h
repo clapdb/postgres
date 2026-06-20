@@ -30,7 +30,9 @@ typedef struct PsLayerStore
 	int			(*read_layer_block) (const PsLayerDesc *layer, uint64_t off,
 									 void *buf, uint32_t len);
 	int			(*upload_layer) (const PsLayerDesc *layer);
-	int			(*download_layer) (const PsLayerDesc *layer);
+	/* downloads to the canonical local path and, on success, restores (or adds)
+	 * a usable available local location in *layer so readers can find it */
+	int			(*download_layer) (PsLayerDesc *layer);
 	int			(*delete_local_layer) (const PsLayerDesc *layer);
 	int			(*delete_remote_layer) (const PsLayerDesc *layer);
 	int			(*layer_exists_remote) (const PsLayerDesc *layer);
@@ -38,5 +40,13 @@ typedef struct PsLayerStore
 
 extern const PsLayerStore PsLayerStoreLocal;
 extern const PsLayerStore *ps_layer_store;
+
+/*
+ * Configure the object tier (LSM phase 4): 'dir' is the object store (a local
+ * directory standing in for a remote bucket).  NULL/unset disables it, and the
+ * upload/download/delete-remote ops then return ENOTSUP.  Call before open.
+ * Returns -1 (and disables the tier) if 'dir' is too long to store.
+ */
+extern int	ps_layer_store_set_object_dir(const char *dir);
 
 #endif							/* PAGESTORE_LAYER_STORE_H */

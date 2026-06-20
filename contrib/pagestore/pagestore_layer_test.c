@@ -392,6 +392,53 @@ main(void)
 		ps_layer_map_free(&map);
 	}
 
+	/* --- object tier (phase 4): upload / exists / evict-local / download --- */
+	{
+		char		objdir[] = "/tmp/psobjtestXXXXXX";
+		PsLayerDesc od;
+		PsImgRec	orecs[1] = {{k5, 0, 900, pg[2]}};	/* 0xA3 */
+
+		check(ps_image_layer_write(31, 0, orecs, 1, psz, &od) == 0,
+			  "obj: write layer");
+
+		/* with no object tier configured, the remote ops are unsupported */
+		check(ps_layer_store->upload_layer(&od) == -1, "obj: upload unsupported off");
+		check(ps_layer_store->layer_exists_remote(&od) == 0, "obj: not remote off");
+
+		check(mkdtemp(objdir) != NULL, "obj: mkdtemp");
+		ps_layer_store_set_object_dir(objdir);
+
+		check(ps_layer_store->layer_exists_remote(&od) == 0, "obj: absent before upload");
+		check(ps_layer_store->upload_layer(&od) == 0, "obj: upload");
+		check(ps_layer_store->layer_exists_remote(&od) == 1, "obj: present after upload");
+
+		/*
+		 * Simulate a durable local eviction: remove the file AND mark the local
+		 * location unavailable (as manifest replay of PS_MANIFEST_DROP_LOCAL
+		 * would).  The read path then bails on the missing available location
+		 * before any IO, so download must restore that location to make the
+		 * layer readable again -- not merely recreate the file.
+		 */
+		check(ps_layer_store->delete_local_layer(&od) == 0, "obj: drop local file");
+		for (uint32_t i = 0; i < od.location_count; i++)
+			if (od.locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+				od.locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
+				od.locations[i].available = false;
+		check(ps_image_layer_lookup(&od, &k5, 0, 1000, out, psz, NULL, NULL, NULL)
+			  == -1, "obj: read fails after eviction (no available local loc)");
+		check(ps_layer_store->download_layer(&od) == 0, "obj: download");
+		check(ps_image_layer_lookup(&od, &k5, 0, 1000, out, psz, NULL, NULL, NULL)
+			  == 1 && out[0] == 0xA3, "obj: read after download (location restored)");
+
+		/* remote delete is idempotent and clears existence */
+		check(ps_layer_store->delete_remote_layer(&od) == 0, "obj: delete remote");
+		check(ps_layer_store->layer_exists_remote(&od) == 0, "obj: gone after delete");
+		check(ps_layer_store->delete_remote_layer(&od) == 0, "obj: delete remote idempotent");
+
+		ps_layer_store_set_object_dir(NULL);
+		rmdir(objdir);			/* empty after delete_remote (best-effort cleanup) */
+	}
+
 	fprintf(stderr, "%d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
