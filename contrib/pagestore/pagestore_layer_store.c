@@ -241,7 +241,6 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 					   void *buf, uint32_t len)
 {
 	const char *path = NULL;
-	char		canon[4096];
 	int			fd;
 	ssize_t		n;
 	uint32_t	nlocs;
@@ -260,18 +259,6 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 			break;
 		}
 	}
-
-	/*
-	 * No available local location, but a just-downloaded layer lives at the
-	 * canonical local path even when the descriptor still marks its local copy
-	 * evicted (download takes a const desc and cannot flip the flag).  Fall back
-	 * to that path when the file is actually present, so a downloaded
-	 * remote-durable layer is readable through the layer store.
-	 */
-	if (path == NULL &&
-		local_layer_path(layer->layer_id, canon, sizeof(canon)) == 0 &&
-		access(canon, R_OK) == 0)
-		path = canon;
 
 	if (path == NULL)
 		return -1;
@@ -317,15 +304,26 @@ local_upload_layer(const PsLayerDesc *layer)
 	return object_fsync_dir();
 }
 
-/* Download a remote-durable layer back to its canonical local path. */
+/*
+ * Download a remote-durable layer back to its canonical local path and restore a
+ * usable local location, so readers (which require an available local location,
+ * with its size) can find it even after a durable eviction marked the old local
+ * copy unavailable.  Reuses an existing local-tier slot if present, else appends
+ * one; size comes from the downloaded file.
+ */
 static int
-local_download_layer(const PsLayerDesc *layer)
+local_download_layer(PsLayerDesc *layer)
 {
 	char		local[4096],
 				obj[4096];
+	struct stat st;
+	PsLayerLocation *loc = NULL;
+	bool		appended = false;
 
 	if (local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
+	if (strlen(local) >= PS_LAYER_URI_MAX)
+		return -1;				/* would not fit a location uri */
 	if (object_path(layer->layer_id, obj, sizeof(obj)) != 0)
 	{
 		errno = ENOTSUP;
@@ -333,7 +331,37 @@ local_download_layer(const PsLayerDesc *layer)
 	}
 	if (copy_file(obj, local) != 0)
 		return -1;
-	return local_fsync_dir();
+	if (local_fsync_dir() != 0 || stat(local, &st) != 0)
+		return -1;
+
+	/* find an existing local-tier slot to restore, else append one */
+	for (uint32_t i = 0; i < layer->location_count &&
+		 i < PS_LAYER_MAX_LOCATIONS; i++)
+		if (layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
+		{
+			loc = &layer->locations[i];
+			break;
+		}
+	if (loc == NULL)
+	{
+		if (layer->location_count >= PS_LAYER_MAX_LOCATIONS)
+			return -1;
+		loc = &layer->locations[layer->location_count++];
+		loc->tier = PS_LAYER_TIER_LOCAL_HOT;
+		loc->generation = 0;
+		appended = true;
+	}
+	if ((size_t) snprintf(loc->uri, sizeof(loc->uri), "%s", local)
+		>= sizeof(loc->uri))
+	{
+		if (appended)
+			layer->location_count--;
+		return -1;
+	}
+	loc->size = (uint64_t) st.st_size;
+	loc->available = true;
+	return 0;
 }
 
 /* Remove the layer's object-store copy (idempotent). */

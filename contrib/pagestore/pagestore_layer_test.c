@@ -412,13 +412,23 @@ main(void)
 		check(ps_layer_store->upload_layer(&od) == 0, "obj: upload");
 		check(ps_layer_store->layer_exists_remote(&od) == 1, "obj: present after upload");
 
-		/* drop the local copy, then download it back from the object store */
-		check(ps_layer_store->delete_local_layer(&od) == 0, "obj: drop local");
+		/*
+		 * Simulate a durable local eviction: remove the file AND mark the local
+		 * location unavailable (as manifest replay of PS_MANIFEST_DROP_LOCAL
+		 * would).  The read path then bails on the missing available location
+		 * before any IO, so download must restore that location to make the
+		 * layer readable again -- not merely recreate the file.
+		 */
+		check(ps_layer_store->delete_local_layer(&od) == 0, "obj: drop local file");
+		for (uint32_t i = 0; i < od.location_count; i++)
+			if (od.locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+				od.locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
+				od.locations[i].available = false;
 		check(ps_image_layer_lookup(&od, &k5, 0, 1000, out, psz, NULL, NULL, NULL)
-			  == -1, "obj: read fails with no local copy");
+			  == -1, "obj: read fails after eviction (no available local loc)");
 		check(ps_layer_store->download_layer(&od) == 0, "obj: download");
 		check(ps_image_layer_lookup(&od, &k5, 0, 1000, out, psz, NULL, NULL, NULL)
-			  == 1 && out[0] == 0xA3, "obj: read after download matches");
+			  == 1 && out[0] == 0xA3, "obj: read after download (location restored)");
 
 		/* remote delete is idempotent and clears existence */
 		check(ps_layer_store->delete_remote_layer(&od) == 0, "obj: delete remote");

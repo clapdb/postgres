@@ -30,7 +30,9 @@ typedef struct PsLayerStore
 	int			(*read_layer_block) (const PsLayerDesc *layer, uint64_t off,
 									 void *buf, uint32_t len);
 	int			(*upload_layer) (const PsLayerDesc *layer);
-	int			(*download_layer) (const PsLayerDesc *layer);
+	/* downloads to the canonical local path and, on success, restores (or adds)
+	 * a usable available local location in *layer so readers can find it */
+	int			(*download_layer) (PsLayerDesc *layer);
 	int			(*delete_local_layer) (const PsLayerDesc *layer);
 	int			(*delete_remote_layer) (const PsLayerDesc *layer);
 	int			(*layer_exists_remote) (const PsLayerDesc *layer);
