@@ -79,6 +79,18 @@ client_attach(const char *shm_name)
 				PS_SHM_VERSION, page_size);
 		exit(2);
 	}
+	/*
+	 * This importer reuses one channel for every key, which a multi-shard daemon
+	 * (per-shard workers serving only their own pool) would reject for keys that
+	 * hash to another shard.  Per-shard routing here is a later step; fail fast so
+	 * an import can't silently abort partway.
+	 */
+	if (hdr->nshards > 1)
+	{
+		fprintf(stderr, "pagestore_import does not support a multi-shard daemon "
+				"(nshards=%u); import against an nshards=1 daemon\n", hdr->nshards);
+		exit(2);
+	}
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
 		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 		{

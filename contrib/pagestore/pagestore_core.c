@@ -1578,7 +1578,8 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			ps_storage->sync();
+			if (ps_storage->sync() != 0)
+				ch->status = PS_STATUS_ERROR;	/* report a failed durable sync */
 			break;
 
 		default:
