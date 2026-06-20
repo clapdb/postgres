@@ -27,11 +27,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
@@ -83,6 +85,8 @@ typedef struct Shard
 	uint32_t	index;			/* this shard's id (0 .. ps_nshards-1) */
 	PsManifest	manifest;		/* per-shard durable layer log + layer map */
 	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
+	int			cur_seg;		/* segment being appended (-1: none yet) */
+	uint64_t	cur_off;		/* append cursor within cur_seg */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -110,6 +114,28 @@ shard_for(const PsKey *key)
  */
 #define LAYER_ID_SHARD_SHIFT	48
 #define LAYER_ID_LOCAL_MASK		(((uint64_t) 1 << LAYER_ID_SHARD_SHIFT) - 1)
+
+/*
+ * Per-shard segment namespace by interleaving: shard s owns segment ids
+ * s, s + nshards, s + 2*nshards, ...  Each shard thus appends to its own segment
+ * files with no shared append cursor, while the id space stays *dense* (ids run
+ * 0..~total with no large gaps) -- which the SPDK backend requires, since it maps
+ * a segment id linearly to a device offset (seg * segment_size).  shard = id %
+ * nshards, local index = id / nshards.  At ps_nshards == 1 this is the identity
+ * 0, 1, 2, ... -- byte-for-byte the old single-stream layout.  (The mapping is
+ * fixed for a store's life by its nshards, like the per-shard manifests.)
+ */
+static int
+seg_id(uint32_t shard, uint32_t local)
+{
+	return (int) (shard + local * ps_nshards);
+}
+
+static uint32_t
+seg_local(int seg)
+{
+	return (uint32_t) seg / ps_nshards;
+}
 
 uint32_t
 ps_core_layer_count(void)
@@ -449,11 +475,11 @@ typedef struct SegRecHdr
 
 /*
  * Segments are addressed by (id, byte offset); how they are stored is the
- * storage backend's business (see pagestore_storage.h).  Here we keep only the
- * append cursor (cur_seg, cur_off) marking where the next record goes.
+ * storage backend's business (see pagestore_storage.h).  The append cursor
+ * (cur_seg, cur_off) marking where the next record goes is per shard (Shard),
+ * and segment ids are shard-namespaced (seg_id), so shards append to disjoint
+ * segment files with no shared cursor.
  */
-static int	cur_seg = -1;		/* segment currently being appended (-1: none yet) */
-static uint64_t cur_off;		/* append cursor within cur_seg */
 
 /* ===================== in-memory indexes =============================== */
 
@@ -1110,11 +1136,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	data_off;
 	Shard	   *s = shard_for(key);
 
-	/* roll over to a fresh segment when the current one would overflow */
-	if (cur_seg < 0 || cur_off + reclen > segment_size)
+	/* roll over to a fresh segment in this shard's namespace when the current one
+	 * would overflow (local index 0, 1, 2, ... within the shard) */
+	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
 	{
-		cur_seg = (cur_seg < 0) ? 0 : cur_seg + 1;
-		cur_off = 0;
+		uint32_t	local = (s->cur_seg < 0) ? 0 : seg_local(s->cur_seg) + 1;
+
+		s->cur_seg = seg_id(s->index, local);
+		s->cur_off = 0;
 	}
 
 	hdr.magic = SEG_MAGIC;
@@ -1125,15 +1154,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
-	if (ps_storage->seg_write(cur_seg, cur_off, &hdr, sizeof(hdr)) != 0)
+	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
-	data_off = cur_off + sizeof(hdr);
-	if (ps_storage->seg_write(cur_seg, data_off, page, page_size) != 0)
+	data_off = s->cur_off + sizeof(hdr);
+	if (ps_storage->seg_write(s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, hdr.lsn, cur_seg, data_off);
-	cur_off += reclen;
+	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off);
+	s->cur_off += reclen;
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
@@ -1299,35 +1328,52 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 static void
 recover(void)
 {
-	for (int id = 0;; id++)
+	/* Each shard owns a disjoint segment-id namespace, so scan and replay each
+	 * shard's segments and position its own append cursor.  page_add_version()
+	 * self-routes by key, so a record always lands on the shard that wrote it. */
+	for (uint32_t si = 0; si < ps_nshards; si++)
 	{
-		uint64_t	off = 0;
+		Shard	   *s = &g_shards[si];
 
-		if (ps_storage->seg_size(id) < 0)
-			break;				/* no more segments -> done */
-
-		/* replay records until one fails to validate (end of log) */
-		for (;;)
+		for (uint32_t local = 0;; local++)
 		{
-			SegRecHdr	hdr;
+			int			id = seg_id(s->index, local);
+			uint64_t	off = 0;
 
-			if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
-				hdr.magic != SEG_MAGIC || hdr.len != page_size)
+			if (ps_storage->seg_size(id) < 0)
+				break;			/* no more segments in this shard -> done */
+
+			/* replay records until one fails to validate (end of log) */
+			for (;;)
+			{
+				SegRecHdr	hdr;
+
+				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
+					hdr.magic != SEG_MAGIC || hdr.len != page_size)
+					break;
+
+				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
+								 off + sizeof(hdr));
+				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
+				off += sizeof(hdr) + hdr.len;
+			}
+
+			/* A segment with no valid records is this shard's end-of-log: the
+			 * shard's own segments are written densely in 'local', so the first
+			 * empty one is the tail.  (On SPDK seg_size() reports any id below the
+			 * global high-water as present even if another shard owns that slot, so
+			 * stop here rather than on seg_size.)  */
+			if (off == 0)
 				break;
-
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
-							 off + sizeof(hdr));
-			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
-			off += sizeof(hdr) + hdr.len;
+			/* newest segment seen for this shard; its append continues after it */
+			s->cur_seg = id;
+			s->cur_off = off;
 		}
-
-		/* this segment is the newest seen so far; append continues after it */
-		cur_seg = id;
-		cur_off = off;
+		if (s->cur_seg >= 0)
+			fprintf(stderr, "pagestore_daemon: shard %u recovered through segment "
+					"%d (off %llu)\n", s->index, s->cur_seg,
+					(unsigned long long) s->cur_off);
 	}
-	if (cur_seg >= 0)
-		fprintf(stderr, "pagestore_daemon: recovered through segment %d (off %llu)\n",
-				cur_seg, (unsigned long long) cur_off);
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -1525,6 +1571,69 @@ ps_core_maintenance(void)
 }
 
 /*
+ * The store records the shard count it was created with.  Per-shard segment and
+ * manifest namespaces -- and how recover() partitions segments -- are derived
+ * from ps_nshards, so reopening with a different count would mis-route or skip
+ * live data; reject the mismatch.  A pre-sharding store (segment data present but
+ * no shard-count file) is only reopenable at nshards == 1, since recovery would
+ * otherwise replay its single global segment stream out of order.  Returns 0 on
+ * match / first-time record, -1 on mismatch or I/O error.
+ */
+static int
+validate_store_nshards(const char *store_dir)
+{
+	char		path[4096];
+	char		buf[32];
+	int			fd;
+	ssize_t		n;
+
+	if (snprintf(path, sizeof(path), "%s/nshards", store_dir) >= (int) sizeof(path))
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		uint32_t	stored;
+
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			return -1;
+		buf[n] = '\0';
+		stored = (uint32_t) strtoul(buf, NULL, 10);
+		if (stored != ps_nshards)
+		{
+			fprintf(stderr, "pagestore_core: store was created with %u shard(s); "
+					"reopen with --nshards %u\n", stored, stored);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* no shard-count file: a pre-sharding store (already holds segment data) is
+	 * only valid at one shard */
+	if (ps_storage->seg_size(0) >= 0 && ps_nshards != 1)
+	{
+		fprintf(stderr, "pagestore_core: pre-sharding store; reopen with "
+				"--nshards 1\n");
+		return -1;
+	}
+
+	/* first open of this store: record the shard count durably */
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	n = snprintf(buf, sizeof(buf), "%u\n", ps_nshards);
+	if (write(fd, buf, (size_t) n) != n || fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
  * Open the store and rebuild all in-memory state from it: define the root
  * timeline, load persisted branches, rebuild the page/fork indexes from the
  * image layers (falling back to a segment scan only for a store that has no
@@ -1538,6 +1647,8 @@ ps_core_open(const char *store_dir)
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
+		return -1;
+	if (validate_store_nshards(store_dir) != 0)
 		return -1;
 	/* layer_ids are unique only within a store; drop any blooms cached from a
 	 * previously-opened store so a reused id can't return a stale "absent" */
@@ -1573,6 +1684,7 @@ ps_core_open(const char *store_dir)
 		Shard	   *s = &g_shards[i];
 
 		s->index = i;
+		s->cur_seg = -1;		/* recover() positions the append cursor */
 		if (ps_manifest_open(&s->manifest, store_dir, i) != 0)
 			return -1;
 		if (ps_manifest_replay(&s->manifest) != 0)

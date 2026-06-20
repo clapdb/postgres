@@ -152,8 +152,27 @@ timeline tree under a brief coordination point, not on the read/write hot path.
      shards' pools with no threads yet — proving multi-shard data partitioning
      (and per-shard manifests/recovery) end-to-end.  The standalone battery runs
      at `nshards = 1` and `nshards = 4`.
-   - **4c** — one POSIX worker thread per shard; `backend_localsvc` per-shard
-     channel pool + routing.  This is where real parallelism lands.
+   - **4c — per-shard threads**, in sub-slices (each behaviour-preserving at
+     `nshards = 1`, suite green at 1 and 4, until the last):
+     - **4c-i — per-shard segment namespace.** ✅ The append cursor
+       (`cur_seg`/`cur_off`) moves into `Shard`; segment ids are interleaved per
+       shard (`s, s+nshards, s+2·nshards, …`) so each shard appends to disjoint
+       segment files while the id space stays dense, and `recover()` scans +
+       positions each shard's cursor independently (a shard's own segments are
+       sequential, so per-shard recovery preserves append order for its
+       same-LSN rewrites).  The store records its shard count and a restart with a
+       different `--nshards` (or a pre-sharding store at `nshards > 1`) is rejected,
+       since ownership/recovery derive from it.  The SPDK backend (linear id →
+       device offset, single current-segment buffer) runs a single shard until
+       step 5; the POSIX file backend handles the per-shard sparse id space
+       directly.
+     - **4c-ii** — per-shard materialized-page cache (`ps_pgcache_*` → per-shard
+       handle).
+     - **4c-iii** — timeline-tree coordination (`timelines[]` is read on every
+       ancestry walk; branch-create writes it).
+     - **4c-iv** — spawn one POSIX worker thread per shard, each polling only its
+       channel pool; `backend_localsvc` per-shard channel pool + routing.  Real
+       parallelism lands here.
 5. **SPDK per-thread qpairs** so the async path scales per core.
 6. **Branch-create coordination** for the shared timeline tree.
 
