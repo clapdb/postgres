@@ -133,17 +133,39 @@ extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 								 uint32_t page_size, PsLayerDesc *out);
 
 /*
+ * Per-layer (key,block) bloom cache: lets a lookup answer "definitely absent"
+ * for a layer without re-reading its index.  One instance per shard (held by the
+ * caller) so it is single-owner and lock-free under per-shard threads; built
+ * lazily from the index, direct-mapped + validated by layer_id.  ~537 KiB.
+ */
+#define PS_LAYER_BLOOM_BYTES	512			/* 4096 bits per layer */
+#define PS_LAYER_BLOOM_SLOTS	1024		/* direct-mapped by layer_id */
+
+typedef struct PsLayerBloomSlot
+{
+	uint64_t	layer_id;
+	int			valid;
+	uint8_t		bits[PS_LAYER_BLOOM_BYTES];
+} PsLayerBloomSlot;
+
+typedef struct PsLayerBloom
+{
+	PsLayerBloomSlot slots[PS_LAYER_BLOOM_SLOTS];
+} PsLayerBloom;
+
+/*
  * Look up the newest version of (key, block) with lsn <= read_lsn in image
  * layer 'layer'.  On a hit copies page_size bytes into out, stores that
  * version's lsn in *out_lsn (if non-NULL), sets *out_ambiguous (if non-NULL) to
  * 1 when more than one version shares that lsn (a same-lsn rewrite the lsn can't
  * disambiguate), and returns 1; 0 if the layer has no such page; -1 on
- * read/format error.
+ * read/format error.  'bc' is the caller's bloom cache (NULL to skip caching).
  */
 extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  uint32_t block, uint64_t read_lsn,
 								  void *out, uint32_t page_size,
-								  uint64_t *out_lsn, int *out_ambiguous);
+								  uint64_t *out_lsn, int *out_ambiguous,
+								  PsLayerBloom *bc);
 
 /*
  * Read an image layer's full index (every (key, block, lsn) entry), for
@@ -158,9 +180,9 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
  * read page bytes directly (compaction) validate them against idx[].crc. */
 extern uint32_t ps_image_page_crc(const void *page, uint32_t len);
 
-/* Drop the in-memory per-layer bloom cache (layer_ids are store-local, so the
- * cache must be cleared when the process switches stores). */
-extern void ps_image_bloom_reset(void);
+/* Drop a bloom cache (layer_ids are store-local, so clear it when the process
+ * switches stores). */
+extern void ps_image_bloom_reset(PsLayerBloom *bc);
 
 /* ---------------------------------------------------------------------------
  * Delta layer file format (phase 7).

@@ -180,6 +180,15 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        Single-threaded here writes peer copies directly; 4c-iv delivers the branch
        to each shard's thread via a per-shard queue instead.  (`wal_end[]` stays a
        single copy -- WAL ops are shard-0-only.)
+     - **4c-iv-prep — per-shard bloom cache.** ✅ The per-layer (key,block) bloom
+       cache moves from a file-scope global into a `PsLayerBloom` held per shard
+       (`s->bloom`, passed to `ps_image_layer_lookup`).  As a global it raced under
+       threads -- shard-namespaced layer ids collide mod the slot count, so two
+       shard threads thrash + concurrently write one slot, and a half-built bloom
+       could yield a false "absent" (a wrong result).  Per shard it is single-owner
+       and lock-free.  (Remaining shared hot-path state for the threads: the POSIX
+       segment fd cache -- a brief mutex -- and the timeline `defined` flag -- an
+       atomic release/acquire -- land with 4c-iv.)
      - **4c-iv** — spawn one POSIX worker thread per shard, each polling only its
        channel pool; `backend_localsvc` per-shard channel pool + routing.  Real
        parallelism lands here.

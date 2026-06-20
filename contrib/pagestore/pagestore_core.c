@@ -106,6 +106,7 @@ typedef struct Shard
 	int			cur_seg;		/* segment being appended (-1: none yet) */
 	uint64_t	cur_off;		/* append cursor within cur_seg */
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
+	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
 	TimelineMeta timelines[MAX_TIMELINES];	/* replicated timeline tree */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
@@ -1304,7 +1305,7 @@ layer_map_lookup(Shard *s, uint32_t timeline, const PsKey *key, uint32_t block,
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
 		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l, NULL) == 1 && (!found || l > best))
+								  &l, NULL, &s->bloom) == 1 && (!found || l > best))
 		{
 			best = l;
 			memcpy(out, tmp, page_size);
@@ -1728,9 +1729,6 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (validate_store_nshards(store_dir) != 0)
 		return -1;
-	/* layer_ids are unique only within a store; drop any blooms cached from a
-	 * previously-opened store so a reused id can't return a stale "absent" */
-	ps_image_bloom_reset();
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  Reject
@@ -1772,6 +1770,9 @@ ps_core_open(const char *store_dir)
 
 		s->index = i;
 		s->cur_seg = -1;		/* recover() positions the append cursor */
+		/* layer_ids are unique only within a store; drop blooms cached from a
+		 * previously-opened store so a reused id can't return a stale "absent" */
+		ps_image_bloom_reset(&s->bloom);
 		if (ps_manifest_open(&s->manifest, store_dir, i) != 0)
 			return -1;
 		if (ps_manifest_replay(&s->manifest) != 0)
