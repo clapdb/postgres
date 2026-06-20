@@ -234,6 +234,19 @@ main(int argc, char **argv)
 				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
+	/*
+	 * The SPDK backend keeps a single qpair + current-segment buffer, so multiple
+	 * per-shard worker threads driving it would race/corrupt that state.  Multi-
+	 * shard SPDK needs per-thread qpairs (SHARDING.md step 5); until then run a
+	 * single shard whenever this daemon uses the SPDK storage (the dedicated
+	 * pagestore_daemon_spdk clamps the same way).
+	 */
+	if (strcmp(ps_storage->name, "spdk") == 0 && ps_nshards != 1)
+	{
+		fprintf(stderr, "pagestore_daemon: --storage spdk does not support "
+				"--nshards > 1 yet (SHARDING.md step 5); using --nshards 1\n");
+		ps_nshards = 1;
+	}
 
 	if (ps_core_open(store_dir) != 0)
 	{
