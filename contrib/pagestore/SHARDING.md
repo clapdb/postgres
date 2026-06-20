@@ -172,8 +172,14 @@ timeline tree under a brief coordination point, not on the read/write hot path.
        shard's cache via `ps_core_pgcache_for(key)`.  `--cache-pages` is the total
        budget, split evenly across shards (total RAM independent of nshards; whole
        budget to shard 0 at `nshards == 1`).  Stats sum across shards.
-     - **4c-iii** — timeline-tree coordination (`timelines[]` is read on every
-       ancestry walk; branch-create writes it).
+     - **4c-iii — per-shard replicated timeline tree.** ✅ `timelines[]` moves
+       into `Shard` as a replicated copy; every ancestry walk reads its own shard's
+       copy (`shard_for(key)->timelines`) lock-free, and `timeline_define`
+       broadcasts a branch to every shard's copy.  The tree is append-only and
+       branch-create is routed to shard 0, so the only writer is well-defined.
+       Single-threaded here writes peer copies directly; 4c-iv delivers the branch
+       to each shard's thread via a per-shard queue instead.  (`wal_end[]` stays a
+       single copy -- WAL ops are shard-0-only.)
      - **4c-iv** — spawn one POSIX worker thread per shard, each polling only its
        channel pool; `backend_localsvc` per-shard channel pool + routing.  Real
        parallelism lands here.

@@ -76,6 +76,24 @@ struct PageEnt;
 struct ForkEnt;
 struct WalIdxEnt;
 
+/*
+ * Timeline tree.  Timeline 0 is the root (no parent).  A branch records its
+ * parent and the LSN at which it forked; reads of pages the branch never wrote
+ * fall through to the parent as-of that branch LSN, so the branch is a stable
+ * copy-on-write snapshot.  The tree is read on every ancestry walk, so each
+ * shard holds a *replicated* copy (s->timelines) -- a shard reads its own copy
+ * lock-free; branch-create (rare) writes every shard's copy (sharding step
+ * 4c-iii).  The tree is append-only: a slot only goes undefined -> defined and a
+ * defined slot's fields never change.
+ */
+#define MAX_TIMELINES	1024
+typedef struct TimelineMeta
+{
+	int			defined;		/* 1 if this timeline exists */
+	int			parent;			/* parent timeline id, or -1 for the root */
+	uint64_t	branch_lsn;		/* parent LSN this timeline forked at */
+} TimelineMeta;
+
 typedef struct Shard
 {
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
@@ -88,6 +106,7 @@ typedef struct Shard
 	int			cur_seg;		/* segment being appended (-1: none yet) */
 	uint64_t	cur_off;		/* append cursor within cur_seg */
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
+	TimelineMeta timelines[MAX_TIMELINES];	/* replicated timeline tree */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
@@ -564,15 +583,8 @@ typedef struct ForkEnt
  * fall through to the parent as-of that branch LSN, so the branch is a stable
  * copy-on-write snapshot.
  */
-#define MAX_TIMELINES	1024
-typedef struct TimelineMeta
-{
-	int			defined;		/* 1 if this timeline exists */
-	int			parent;			/* parent timeline id, or -1 for the root */
-	uint64_t	branch_lsn;		/* parent LSN this timeline forked at */
-} TimelineMeta;
-
-static TimelineMeta timelines[MAX_TIMELINES];
+/* TimelineMeta and the timeline tree are defined above the Shard struct (each
+ * shard holds a replicated copy in s->timelines); see there. */
 
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
@@ -753,21 +765,33 @@ fork_remove(uint32_t timeline, const PsKey *key)
 
 /* --- timeline metadata + read-through --- */
 
+/*
+ * Define timeline 'id' in every shard's replicated copy.  Branch-create is rare
+ * and the tree is append-only, so a broadcast keeps every shard's lock-free read
+ * copy in sync; at ps_nshards == 1 it writes the single copy.  (Single-threaded
+ * here; step 4c-iv delivers the update to each shard's thread via a per-shard
+ * queue instead of writing peer shards' memory directly.)
+ */
 static void
 timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	if (id >= MAX_TIMELINES)
 		return;
-	timelines[id].defined = 1;
-	timelines[id].parent = parent;
-	timelines[id].branch_lsn = branch_lsn;
+	for (uint32_t i = 0; i < ps_nshards; i++)
+	{
+		TimelineMeta *t = &g_shards[i].timelines[id];
+
+		t->parent = parent;
+		t->branch_lsn = branch_lsn;
+		t->defined = 1;
+	}
 }
 
 static int
-timeline_has_parent(uint32_t timeline)
+timeline_has_parent(const Shard *s, uint32_t timeline)
 {
-	return timeline < MAX_TIMELINES && timelines[timeline].defined &&
-		timelines[timeline].parent >= 0;
+	return timeline < MAX_TIMELINES && s->timelines[timeline].defined &&
+		s->timelines[timeline].parent >= 0;
 }
 
 /*
@@ -783,17 +807,17 @@ timeline_has_parent(uint32_t timeline)
  * Returns 1 if (new_tl, parent) is safe to define.
  */
 static int
-branch_request_ok(uint32_t new_tl, int parent)
+branch_request_ok(const Shard *s, uint32_t new_tl, int parent)
 {
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || timelines[new_tl].defined)
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES || s->timelines[new_tl].defined)
 		return 0;
-	if (parent < 0 || parent >= MAX_TIMELINES || !timelines[parent].defined)
+	if (parent < 0 || parent >= MAX_TIMELINES || !s->timelines[parent].defined)
 		return 0;
-	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
+	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = s->timelines[t].parent)
 	{
 		if ((uint32_t) t == new_tl)
 			return 0;			/* cycle */
-		if (!timelines[t].defined)
+		if (!s->timelines[t].defined)
 			return 0;			/* broken chain: refuse rather than risk a loop */
 	}
 	return 1;
@@ -810,6 +834,8 @@ PageVer *
 read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn)
 {
+	const Shard *s = shard_for(key);	/* its replicated timeline copy */
+
 	for (;;)
 	{
 		PageEnt    *e = page_find(timeline, key, block);
@@ -817,11 +843,11 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (v)
 			return v;
-		if (!timeline_has_parent(timeline))
+		if (!timeline_has_parent(s, timeline))
 			return NULL;
-		if (timelines[timeline].branch_lsn < read_lsn)
-			read_lsn = timelines[timeline].branch_lsn;
-		timeline = (uint32_t) timelines[timeline].parent;
+		if (s->timelines[timeline].branch_lsn < read_lsn)
+			read_lsn = s->timelines[timeline].branch_lsn;
+		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
 }
 
@@ -841,6 +867,8 @@ PageVer *
 read_through_cacheable(uint32_t timeline, const PsKey *key, uint32_t block,
 					   uint64_t read_lsn, uint32_t *src_tl, int *ambiguous)
 {
+	const Shard *s = shard_for(key);	/* its replicated timeline copy */
+
 	for (;;)
 	{
 		PageEnt    *e = page_find(timeline, key, block);
@@ -852,15 +880,15 @@ read_through_cacheable(uint32_t timeline, const PsKey *key, uint32_t block,
 			*ambiguous = page_lsn_ambiguous(e, v->lsn);
 			return v;
 		}
-		if (!timeline_has_parent(timeline))
+		if (!timeline_has_parent(s, timeline))
 		{
 			*src_tl = timeline;
 			*ambiguous = 0;
 			return NULL;
 		}
-		if (timelines[timeline].branch_lsn < read_lsn)
-			read_lsn = timelines[timeline].branch_lsn;
-		timeline = (uint32_t) timelines[timeline].parent;
+		if (s->timelines[timeline].branch_lsn < read_lsn)
+			read_lsn = s->timelines[timeline].branch_lsn;
+		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
 }
 
@@ -879,6 +907,7 @@ read_through_cacheable(uint32_t timeline, const PsKey *key, uint32_t block,
 static uint32_t
 fork_nblocks_through(uint32_t timeline, const PsKey *key)
 {
+	const Shard *s = shard_for(key);
 	uint32_t	maxnb = 0;
 
 	for (;;)
@@ -887,9 +916,9 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key)
 
 		if (e && e->nblocks > maxnb)
 			maxnb = e->nblocks;
-		if (!timeline_has_parent(timeline))
+		if (!timeline_has_parent(s, timeline))
 			return maxnb;
-		timeline = (uint32_t) timelines[timeline].parent;
+		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
 }
 
@@ -897,13 +926,15 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key)
 static int
 fork_exists_through(uint32_t timeline, const PsKey *key)
 {
+	const Shard *s = shard_for(key);
+
 	for (;;)
 	{
 		if (fork_find(timeline, key))
 			return 1;
-		if (!timeline_has_parent(timeline))
+		if (!timeline_has_parent(s, timeline))
 			return 0;
-		timeline = (uint32_t) timelines[timeline].parent;
+		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
 }
 
@@ -943,7 +974,9 @@ load_timelines(void)
 	 */
 	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		if (branch_request_ok(rec.id, rec.parent))
+		/* startup, single-threaded: validate against shard 0's copy (all copies
+		 * are identical), then define broadcasts to every shard */
+		if (branch_request_ok(&g_shards[0], rec.id, rec.parent))
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		else
 			fprintf(stderr, "pagestore: skipping invalid timeline record "
@@ -1137,11 +1170,11 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 						out[got++] = e->lsns[i];
 				break;
 			}
-		if (!timeline_has_parent(tl))
+		if (!timeline_has_parent(s, tl))
 			break;
-		if (timelines[tl].branch_lsn < lsn_max)
-			lsn_max = timelines[tl].branch_lsn;
-		tl = (uint32_t) timelines[tl].parent;
+		if (s->timelines[tl].branch_lsn < lsn_max)
+			lsn_max = s->timelines[tl].branch_lsn;
+		tl = (uint32_t) s->timelines[tl].parent;
 	}
 	return got;
 }
@@ -1228,7 +1261,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * several, so check them all, not just this write's).  This shard only:
 			 * the flush added layers to this shard's map. */
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
-				if ((ct == 0 || timelines[ct].defined) &&
+				if ((ct == 0 || s->timelines[ct].defined) &&
 					count_image_layers(s, ct) > (uint32_t) compact_layers * 4)
 					compact_timeline(s, ct);
 		}
@@ -1345,11 +1378,11 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				ps_pgcache_insert(&s->pgcache, tl, key, block, pv->lsn, out);
 			return served ? 1 : 0;
 		}
-		if (!timeline_has_parent(tl))
+		if (!timeline_has_parent(s, tl))
 			return 0;
-		if (timelines[tl].branch_lsn < rl)
-			rl = timelines[tl].branch_lsn;
-		tl = (uint32_t) timelines[tl].parent;
+		if (s->timelines[tl].branch_lsn < rl)
+			rl = s->timelines[tl].branch_lsn;
+		tl = (uint32_t) s->timelines[tl].parent;
 	}
 }
 
@@ -1463,7 +1496,10 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline))
+			/* branch-create is routed to shard 0, so validate against shard 0's
+			 * copy; timeline_define then broadcasts to every shard */
+			if (branch_request_ok(&g_shards[0], ch->timeline,
+								  (int) ch->parent_timeline))
 			{
 				timeline_define(ch->timeline, (int) ch->parent_timeline,
 								ch->req_lsn);
@@ -1539,7 +1575,7 @@ ps_core_close(void)
 
 			for (uint32_t ct = 0; ct < MAX_TIMELINES; ct++)
 			{
-				if (ct != 0 && !timelines[ct].defined)
+				if (ct != 0 && !s->timelines[ct].defined)
 					continue;
 				while (count_image_layers(s, ct) > (uint32_t) compact_layers)
 				{
@@ -1584,7 +1620,7 @@ ps_core_maintenance(void)
 		Shard	   *s = &g_shards[i];
 
 		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-			if ((tl == 0 || timelines[tl].defined) &&
+			if ((tl == 0 || s->timelines[tl].defined) &&
 				count_image_layers(s, tl) > (uint32_t) compact_layers)
 			{
 				uint32_t	before = count_image_layers(s, tl);
@@ -1792,9 +1828,10 @@ ps_core_open(const char *store_dir)
 	 */
 	recover();
 
-	/* rebuild each timeline's shipped-WAL end LSN from its log */
+	/* rebuild each timeline's shipped-WAL end LSN from its log (WAL is shard-0,
+	 * single-threaded here; all shards' timeline copies are identical) */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if (tl == 0 || timelines[tl].defined)
+		if (tl == 0 || g_shards[0].timelines[tl].defined)
 			wal_recover_one(tl);
 
 	return 0;
