@@ -39,6 +39,7 @@ extern int	flush_pages;		/* memtable flush threshold in pages */
 extern int	compact_layers;		/* compact a timeline past this many image layers */
 extern int	cache_pages;		/* materialized-page cache size (pages; 0=off) */
 extern int	use_layers;			/* rebuild read state from layers (vs segments) */
+extern uint32_t ps_nshards;		/* live shard count (1..PS_MAX_SHARDS); set before open */
 extern const PsStorage *ps_storage;
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */

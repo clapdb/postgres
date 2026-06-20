@@ -274,17 +274,25 @@ main(int argc, char **argv)
 			compact_layers = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
+			ps_nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-					"[--page-size N] [--segment-size N]\n", argv[0]);
+					"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
 			return 2;
 		}
 	}
 	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-				"[--page-size N] [--segment-size N]\n", argv[0]);
+				"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
+		return 2;
+	}
+	if (ps_nshards < 1 || ps_nshards > PS_MAX_SHARDS)
+	{
+		fprintf(stderr, "--nshards must be in [1, %d] (got %u)\n",
+				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
 	if (pci_addr)
@@ -324,7 +332,7 @@ main(int argc, char **argv)
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
-	hdr->nshards = PS_NSHARDS;	/* clients route to the same shard pools */
+	hdr->nshards = ps_nshards;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	/* publish magic with a release store so the readers' acquire-load of it has a

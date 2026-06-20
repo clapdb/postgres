@@ -73,9 +73,10 @@ rm_rf(const char *path)
 
 static void *cl_shm;
 static int	cl_shm_fd;
-static int	cl_pool[PS_NSHARDS];	/* channel claimed in each shard pool, -1 = none */
+static int	cl_pool[PS_MAX_SHARDS]; /* channel claimed in each shard pool, -1 = none */
 static uint32_t cl_nshards;			/* shard count published by the daemon */
 static uint32_t cl_nchannels;		/* channel count published by the daemon */
+static uint32_t g_nshards = 1;		/* --nshards to spawn the daemon with */
 static uint32_t cl_page_size;
 
 static void
@@ -107,16 +108,15 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
 	cl_page_size = hdr->page_size;
 
-	/* The client is built with the same PS_NSHARDS as the daemon (version-gated),
-	 * so the channel-pool partition lines up.  Reject a mismatch rather than
-	 * clamp: a smaller client nshards would route keys to fewer pools than the
-	 * daemon serves, misrouting once each shard polls only its own pool. */
+	/* Adopt the daemon's published shard count and route to match.  It must fit
+	 * the client's compile-time cap (both build from PS_MAX_SHARDS); reject an
+	 * out-of-range count rather than mis-size the pool array. */
 	cl_nchannels = hdr->nchannels;
 	cl_nshards = hdr->nshards ? hdr->nshards : 1;
-	if (cl_nshards != PS_NSHARDS)
+	if (cl_nshards > PS_MAX_SHARDS)
 	{
-		fprintf(stderr, "daemon nshards=%u != client PS_NSHARDS=%u\n",
-				cl_nshards, PS_NSHARDS);
+		fprintf(stderr, "daemon nshards=%u exceeds client PS_MAX_SHARDS=%u\n",
+				cl_nshards, (uint32_t) PS_MAX_SHARDS);
 		exit(2);
 	}
 	for (uint32_t s = 0; s < cl_nshards; s++)
@@ -538,13 +538,16 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 	if (pid == 0)
 	{
 		char		psbuf[16];
+		char		nsbuf[16];
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
+		snprintf(nsbuf, sizeof(nsbuf), "%u", g_nshards);
 		/* small segments exercise rollover; a small flush threshold makes the
 		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
 			  "--page-size", psbuf, "--segment-size", "65536",
-			  "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
+			  "--flush-pages", "8", "--compact-layers", "3",
+			  "--nshards", nsbuf, (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}
@@ -1192,24 +1195,38 @@ main(int argc, char **argv)
 	/* shard-routing contract (pure helpers; no daemon) */
 	run_sharding_contract();
 
-	/* run the whole suite once per page size: proves page-size independence */
-	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
-		run_suite(daemon_path, tmpbase, sizes[i]);
+	/*
+	 * Run the whole daemon-driven battery once single-shard and once multi-shard.
+	 * At nshards > 1 the client routes each key to its shard's channel pool and
+	 * the (still single-threaded) daemon serves every pool; identical results
+	 * prove the data partitions correctly across shards end-to-end.
+	 */
+	uint32_t	shard_cases[] = {1, 4};
 
-	/* branch / snapshot isolation (page-size independent, run once) */
-	run_branch_suite(daemon_path, tmpbase);
+	for (uint32_t si = 0; si < sizeof(shard_cases) / sizeof(shard_cases[0]); si++)
+	{
+		g_nshards = shard_cases[si];
+		fprintf(stderr, "\n#### nshards=%u ####\n", g_nshards);
 
-	/* shipped-WAL durability */
-	run_wal_suite(daemon_path, tmpbase);
+		/* run the whole suite once per page size: proves page-size independence */
+		for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+			run_suite(daemon_path, tmpbase, sizes[i]);
 
-	/* per-page WAL index */
-	run_walidx_suite(daemon_path, tmpbase);
+		/* branch / snapshot isolation (page-size independent, run once) */
+		run_branch_suite(daemon_path, tmpbase);
 
-	/* vectored multi-page I/O */
-	run_vectored_suite(daemon_path, tmpbase);
+		/* shipped-WAL durability */
+		run_wal_suite(daemon_path, tmpbase);
 
-	/* many concurrent clients */
-	run_concurrency_suite(daemon_path, tmpbase);
+		/* per-page WAL index */
+		run_walidx_suite(daemon_path, tmpbase);
+
+		/* vectored multi-page I/O */
+		run_vectored_suite(daemon_path, tmpbase);
+
+		/* many concurrent clients */
+		run_concurrency_suite(daemon_path, tmpbase);
+	}
 
 	rmdir(tmpbase);
 
