@@ -327,8 +327,10 @@ main(int argc, char **argv)
 	hdr->nshards = PS_NSHARDS;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	hdr->magic = PS_SHM_MAGIC;
+	/* publish magic with a release store so the readers' acquire-load of it has a
+	 * matching release on the same field, giving a happens-before edge for the
+	 * descriptive fields written above */
+	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
