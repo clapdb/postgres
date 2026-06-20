@@ -44,7 +44,12 @@ static int	localsvc_timeline = 0;
 /* per-backend attachment state */
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
-static int	ls_channel = -1;
+/* One claimed channel per shard pool (-1 = not yet claimed), claimed lazily on
+ * first use of that shard so a backend that only touches a few relations doesn't
+ * tie up a channel in every pool.  ls_nshards/ls_nchannels come from the daemon. */
+static int	ls_pool[PS_MAX_SHARDS];
+static uint32 ls_nshards = 1;
+static uint32 ls_nchannels = 0;
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -54,14 +59,13 @@ ls_detach(int code, Datum arg)
 {
 	if (ls_shm != NULL)
 	{
-		if (ls_channel >= 0)
-		{
-			PsChannel  *ch = ps_channel(ls_shm, ls_channel);
-
-			/* release the channel for reuse by a future backend */
-			ps_store_release(&ch->claimed, 0);
-			ls_channel = -1;
-		}
+		/* release every channel this backend claimed, for reuse by a future one */
+		for (uint32 s = 0; s < ls_nshards; s++)
+			if (ls_pool[s] >= 0)
+			{
+				ps_store_release(&ps_channel(ls_shm, ls_pool[s])->claimed, 0);
+				ls_pool[s] = -1;
+			}
 		munmap(ls_shm, PS_SHM_SIZE);
 		ls_shm = NULL;
 	}
@@ -116,58 +120,81 @@ ls_attach(void)
 	}
 
 	/*
-	 * This client owns a single arbitrary channel and does not yet route per key
-	 * to a shard's channel pool, so it cannot talk to a multi-shard daemon: a
-	 * request could land on a channel the owning shard never polls.  Fail fast
-	 * until per-shard routing is implemented (sharding step 4c).
+	 * Adopt the daemon's shard count and route each request to its key's shard
+	 * pool (ls_chan).  It must fit this client's compile-time cap (both build from
+	 * PS_MAX_SHARDS); reject an out-of-range count rather than mis-size the pool.
+	 * Channels are claimed lazily, one per shard pool on first use.
 	 */
-	if (hdr->nshards > 1)
+	if (hdr->nshards > PS_MAX_SHARDS)
 	{
 		uint32		got_nshards = hdr->nshards;
 
 		munmap(shm, PS_SHM_SIZE);
 		close(fd);
 		ereport(ERROR,
-				(errmsg("pagestore localsvc does not support a multi-shard daemon"),
-				 errdetail("daemon nshards=%u; this client requires nshards=1",
-						   got_nshards)));
+				(errmsg("pagestore localsvc shard count too high"),
+				 errdetail("daemon nshards=%u exceeds client PS_MAX_SHARDS=%d",
+						   got_nshards, PS_MAX_SHARDS)));
 	}
-
-	/*
-	 * Claim a free channel with an atomic compare-and-swap on its 'claimed'
-	 * flag.  This is the only contended operation between backends; once a
-	 * channel is claimed it is owned exclusively until ls_detach() releases it,
-	 * so all subsequent mailbox traffic on it is single-producer/single-consumer.
-	 */
-	for (uint32 i = 0; i < hdr->nchannels; i++)
-	{
-		PsChannel  *ch = ps_channel(shm, i);
-
-		if (ps_cas(&ch->claimed, 0, 1))
-		{
-			ls_channel = (int) i;
-			break;
-		}
-	}
-	if (ls_channel < 0)
-	{
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc: no free channel (max %d)",
-						PS_MAX_CHANNELS)));
-	}
+	ls_nchannels = hdr->nchannels;
+	ls_nshards = hdr->nshards ? hdr->nshards : 1;
+	for (uint32 s = 0; s < ls_nshards; s++)
+		ls_pool[s] = -1;
 
 	ls_shm = shm;
 	ls_shm_fd = fd;
 	on_proc_exit(ls_detach, 0);
 }
 
+/*
+ * The channel this backend uses for shard 's', claiming a free one in that
+ * shard's pool on first use.  Claiming is the only contended op between backends;
+ * once claimed a channel is owned exclusively until ls_detach() releases it, so
+ * its mailbox traffic is single-producer/single-consumer.
+ */
 static PsChannel *
-ls_chan(void)
+ls_claim_shard(uint32 s)
 {
+	if (ls_pool[s] < 0)
+	{
+		uint32		first,
+					cnt;
+
+		ps_shard_channel_range(s, ls_nshards, ls_nchannels, &first, &cnt);
+		for (uint32 i = first; i < first + cnt; i++)
+			if (ps_cas(&ps_channel(ls_shm, i)->claimed, 0, 1))
+			{
+				ls_pool[s] = (int) i;
+				break;
+			}
+		if (ls_pool[s] < 0)
+			ereport(ERROR,
+					(errmsg("pagestore localsvc: no free channel in shard %u", s)));
+	}
+	return ps_channel(ls_shm, ls_pool[s]);
+}
+
+/*
+ * Route a request to the channel of the shard that owns 'key' (NULL for a
+ * keyless timeline/WAL op -> shard 0, where the daemon keeps that global state).
+ */
+static PsChannel *
+ls_chan(const PageStoreRelKey *key)
+{
+	uint32		shard = 0;
+
 	ls_attach();
-	return ps_channel(ls_shm, ls_channel);
+	if (key != NULL)
+	{
+		PsKey		k;
+
+		k.spcOid = key->spcOid;
+		k.dbOid = key->dbOid;
+		k.relNumber = key->relNumber;
+		k.forkNum = key->forkNum;
+		shard = ps_shard_for_key(&k, ls_nshards);
+	}
+	return ls_claim_shard(shard);
 }
 
 /*
@@ -237,7 +264,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
@@ -249,7 +276,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
@@ -261,7 +288,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
@@ -273,7 +300,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
@@ -290,7 +317,7 @@ static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
@@ -308,7 +335,7 @@ static void
 ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -337,7 +364,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void **buffers, BlockNumber nblocks,
 		  bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -365,7 +392,7 @@ static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
@@ -390,7 +417,7 @@ static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -407,7 +434,7 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_IMMEDSYNC;
@@ -418,7 +445,7 @@ static bool
 ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 			   BlockNumber nblocks, int *out_fd, uint64 *out_offset)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	if (nblocks > LS_MAX_PAGES_PER_OP)
 		ereport(ERROR,
@@ -432,9 +459,13 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->nblocks = nblocks;
 	ls_exec(ch);
 
-	/* the pages now live in the channel data buffer, readable via the shm fd */
+	/* the pages now live in the channel data buffer, readable via the shm fd;
+	 * report that buffer's offset for the routed channel (index recovered from the
+	 * pointer, since the channel is now chosen per shard) */
 	*out_fd = ls_shm_fd;
-	*out_offset = ps_channel_data_offset((uint32) ls_channel);
+	*out_offset = ps_channel_data_offset((uint32)
+										 (((char *) ch - (char *) ls_shm -
+										   PS_CHANNELS_OFF) / PS_CHANNEL_STRIDE));
 	return true;
 }
 
@@ -465,7 +496,7 @@ void
 pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 						   uint64 lsn, void *out)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_READ_AT;
@@ -485,7 +516,7 @@ void
 pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 								 uint64 branch_lsn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(NULL);
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
@@ -502,7 +533,7 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 void
 pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(NULL);
 
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_APPEND;
@@ -517,7 +548,7 @@ void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
@@ -530,7 +561,7 @@ pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 int
 pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_GET;
@@ -546,7 +577,7 @@ int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn_max, uint64 *out, int maxn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan(key);
 	int			n;
 
 	ls_fill_key(ch, key);
