@@ -76,13 +76,22 @@ static ReqState reqstate[PS_MAX_CHANNELS];
  * by its own worker, so a global durability barrier can't flush every shard from
  * one thread.  Instead the worker that receives IMMEDSYNC flushes its own shard
  * and sets g_flush_req[s] for every other shard; each worker flushes its own
- * curbuf when it sees its flag set.  g_super_mtx serializes the superblock write
- * so two concurrent syncs can't corrupt it.
+ * curbuf when it sees its flag set.  The whole barrier runs under g_barrier_mtx
+ * (below), so only one coordinator owns these per-shard slots at a time.
  */
 static volatile int g_flush_req[PS_MAX_SHARDS];		/* 1 = flush requested */
 static volatile int g_flush_rc[PS_MAX_SHARDS];		/* 0 ok / -1 failed flush */
 static volatile uint32_t g_flush_snap[PS_MAX_SHARDS];	/* seg count at flush */
-static pthread_mutex_t g_super_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Serializes the whole IMMEDSYNC barrier so two concurrent syncs can't share the
+ * per-shard flush slots above (one resetting another's result/snapshot mid-flight
+ * and turning a failed flush into a false success).  The worker TRYLOCKs this
+ * rather than blocking: a worker that can't start its own barrier returns to its
+ * loop and keeps servicing the active barrier's flush requests, which is what
+ * prevents a deadlock between a coordinator and a would-be coordinator.
+ */
+static pthread_mutex_t g_barrier_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flush this shard's own buffer, recording the result + post-flush count where
  * the barrier coordinator collects them. */
@@ -97,12 +106,14 @@ flush_self(uint32_t shard)
 }
 
 /*
- * Durability barrier for one IMMEDSYNC, run by the receiving worker for 'shard'.
- * Each shard can only flush its own qpair, so request every other shard to flush
- * itself and wait; the persisted superblock uses each shard's post-flush count
- * snapshot, never a live counter a concurrent writer advanced.  Returns 0 if all
- * shards flushed durably, -1 if any flush failed or shutdown aborted the wait
- * (so the client learns the sync did not complete).
+ * Durability barrier for one IMMEDSYNC, run by the receiving worker for 'shard'
+ * while holding g_barrier_mtx (so it owns the flush slots exclusively).  Each
+ * shard can only flush its own qpair, so request every other shard to flush
+ * itself and wait.  The superblock is persisted from each shard's post-flush
+ * count snapshot, and ONLY when every shard flushed: a failed flush leaves a
+ * count covering data that never reached the device, which recover() must not
+ * trust.  Returns 0 if all shards flushed durably, -1 if any failed or shutdown
+ * aborted the wait.
  */
 static int
 immedsync_barrier(uint32_t shard)
@@ -123,13 +134,6 @@ immedsync_barrier(uint32_t shard)
 
 		if (__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
 			return -1;			/* shutdown: abort rather than spin forever */
-		/* service a request aimed at us too, so two concurrent syncs (each
-		 * waiting on the other) cannot deadlock */
-		if (__atomic_load_n(&g_flush_req[shard], __ATOMIC_ACQUIRE))
-		{
-			flush_self(shard);
-			__atomic_store_n(&g_flush_req[shard], 0, __ATOMIC_RELEASE);
-		}
 		for (uint32_t s = 0; s < ps_nshards; s++)
 			if (s != shard && __atomic_load_n(&g_flush_req[s], __ATOMIC_ACQUIRE))
 				pending = 1;
@@ -148,10 +152,8 @@ immedsync_barrier(uint32_t shard)
 			rc = -1;
 		counts[s] = g_flush_snap[s];
 	}
-	/* persist the snapshot once, serialized against a concurrent sync */
-	pthread_mutex_lock(&g_super_mtx);
-	ps_spdk_super_write_counts(counts);
-	pthread_mutex_unlock(&g_super_mtx);
+	if (rc == 0)				/* never advance the super past a failed flush */
+		ps_spdk_super_write_counts(counts);
 	return rc;
 }
 
@@ -374,12 +376,20 @@ spdk_worker_main(void *arg)
 			{
 				/* global durability barrier: each shard flushes its own qpair
 				 * (begin()->spdk_sync would flush every shard from this one
-				 * thread, racing the other shards' single-owner qpairs).  Report
-				 * a failed/aborted barrier so the client doesn't believe the data
-				 * is durable. */
-				ch->status = immedsync_barrier(w->shard) == 0 ?
-					PS_STATUS_OK : PS_STATUS_ERROR;
-				ps_store_release(&ch->state, PS_STATE_DONE);
+				 * thread, racing the other shards' single-owner qpairs).  Trylock
+				 * to serialize barriers; if another barrier holds it, leave this
+				 * request pending and retry next iteration -- staying in the loop so
+				 * we keep servicing that barrier's flush request below (blocking
+				 * here would deadlock it).  Report a failed/aborted barrier so the
+				 * client doesn't believe the data is durable. */
+				if (pthread_mutex_trylock(&g_barrier_mtx) == 0)
+				{
+					int			brc = immedsync_barrier(w->shard);
+
+					pthread_mutex_unlock(&g_barrier_mtx);
+					ch->status = brc == 0 ? PS_STATUS_OK : PS_STATUS_ERROR;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+				}
 			}
 			else if (owner != PS_ANY_SHARD && owner != w->shard)
 			{
