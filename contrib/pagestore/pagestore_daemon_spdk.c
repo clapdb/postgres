@@ -104,6 +104,10 @@ flush_self(uint32_t shard)
 
 	g_flush_snap[shard] = cnt;
 	g_flush_rc[shard] = rc;
+	/* capture this shard's synced cursor here, on its own worker, right after the
+	 * flush: the coordinator commits the watermark from these per-shard snapshots
+	 * rather than reading live cursors that other shards may have advanced */
+	ps_core_wm_capture(shard);
 }
 
 /*
@@ -154,7 +158,14 @@ immedsync_barrier(uint32_t shard)
 		counts[s] = g_flush_snap[s];
 	}
 	if (rc == 0)				/* never advance the super past a failed flush */
-		ps_spdk_super_write_counts(counts);
+	{
+		/* the superblock must be durable BEFORE the watermark: if a crash kept the
+		 * watermark but lost the new counts, recovery would scan the old (shorter)
+		 * extent and refuse as short of the watermark, bricking the store */
+		if (ps_spdk_super_write_counts(counts) != 0 ||
+			ps_core_write_sync_watermark() != 0)
+			rc = -1;
+	}
 	return rc;
 }
 

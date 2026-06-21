@@ -79,6 +79,23 @@ test('pagestore_layer',
   timeout: 60,
 )
 
+# In-process segment-recovery tests (no daemon, no PG): drives ps_core_open /
+# append_page / recover / read_resolve directly and injects corruption through the
+# storage vtable, so recovery semantics (CRC, store generation, sync watermark) are
+# verified without spawning a daemon.
+pagestore_recover_test = executable('pagestore_recover_test',
+  files('pagestore_recover_test.c', 'pagestore_core.c', 'storage_posix.c',
+        'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+  dependencies: thread_dep,
+  install: false,
+)
+test('pagestore_recover',
+  pagestore_recover_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),

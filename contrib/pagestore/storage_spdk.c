@@ -29,11 +29,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "spdk/env.h"
 #include "spdk/nvme.h"
@@ -188,12 +190,19 @@ super_path(char *buf, size_t buflen)
 /* Write the superblock from an explicit per-shard segment-count array, so the
  * IMMEDSYNC coordinator can persist a consistent post-flush snapshot rather than
  * the live counters that concurrent shard writers keep advancing. */
-static void
+/*
+ * Persist the superblock durably.  recover() trusts these per-shard segment counts
+ * as the synced extent, and the sync watermark is committed right after this on an
+ * IMMEDSYNC, so the super must hit the disk before the watermark does -- otherwise a
+ * crash that loses the super leaves a watermark pointing past the counts recovery
+ * can see, bricking the store.  Returns 0 on success, -1 on any I/O failure.
+ */
+static int
 super_write_counts(const uint32_t *counts)
 {
 	char		path[2300];
 	SpdkSuper	s;
-	FILE	   *f;
+	int			fd;
 
 	memset(&s, 0, sizeof(s));
 	s.magic = SPDK_SUPER_MAGIC;
@@ -204,22 +213,38 @@ super_write_counts(const uint32_t *counts)
 		s.num_segments[sh] = counts[sh];
 
 	super_path(path, sizeof(path));
-	f = fopen(path, "wb");
-	if (!f)
-		return;					/* best-effort */
-	fwrite(&s, sizeof(s), 1, f);
-	fclose(f);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	if (write(fd, &s, sizeof(s)) != (ssize_t) sizeof(s) || fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	/* make the directory entry durable on first create; propagate failure so the
+	 * caller never advances the watermark past a super that isn't durably linked */
+	fd = open(g_store, O_RDONLY);
+	if (fd < 0 || fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
 }
 
-/* Superblock from the live counters; safe at close (main thread, workers joined). */
-static void
+/* Superblock from the live counters; safe at close (main thread, workers joined).
+ * Returns 0 on success, -1 if it could not be made durable. */
+static int
 super_write(void)
 {
 	uint32_t	counts[PS_MAX_SHARDS];
 
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
 		counts[sh] = g_spdk[sh].num_segments;
-	super_write_counts(counts);
+	return super_write_counts(counts);
 }
 
 /*
@@ -476,8 +501,10 @@ spdk_sync(void)
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
 		if (flush_curbuf(&g_spdk[sh]) != 0)
 			return -1;
-	super_write();
-	return 0;
+	/* propagate a failed superblock write: the clean-close path advances the sync
+	 * watermark on a 0 return, and a watermark past a non-persisted super would brick
+	 * the store on the next open */
+	return super_write();
 }
 
 /* --- segment byte I/O ---------------------------------------------------- */
@@ -657,11 +684,13 @@ ps_spdk_flush(uint32_t shard, uint32_t *out_count)
 
 /* Persist the superblock from a caller-supplied per-shard count snapshot (taken
  * at flush time by ps_spdk_flush), so the persisted counts cover exactly the
- * flushed data and never a segment a concurrent writer added but did not flush. */
-void
+ * flushed data and never a segment a concurrent writer added but did not flush.
+ * Returns 0 on success, -1 if the superblock could not be made durable -- the
+ * caller must not advance the sync watermark past a super it failed to persist. */
+int
 ps_spdk_super_write_counts(const uint32_t *counts)
 {
-	super_write_counts(counts);
+	return super_write_counts(counts);
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */

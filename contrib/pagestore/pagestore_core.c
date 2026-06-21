@@ -29,6 +29,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +107,9 @@ ps_crc32c(const void *buf, size_t len)
 
 /* per-store generation, stamped into every segment record (0 = uninitialized) */
 static uint64_t g_store_gen;
+
+/* store directory, stashed at open for metadata writes after open (sync watermark) */
+static char g_store_dir[4000];
 
 /*
  * Load the store's generation from <store_dir>/store_gen, creating a durable
@@ -259,6 +263,12 @@ typedef struct Shard
 	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
 	int			cur_seg;		/* segment being appended (-1: none yet) */
 	uint64_t	cur_off;		/* append cursor within cur_seg */
+	/* Last committed durable position packed as (seg << 32 | off), updated only
+	 * after a record's bytes are written, read atomically by the sync-watermark
+	 * capture.  Unlike the cur_seg/cur_off append cursor, this is never the bare
+	 * (new_seg, 0) a rollover publishes before any record exists there, so a
+	 * concurrent capture can't pair a fresh segment with a stale/zero offset. */
+	uint64_t	cur_cursor;
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
 	time_t		maint_cooldown;	/* skip compaction attempts until this wall time */
@@ -340,6 +350,181 @@ static uint32_t
 seg_local(int seg)
 {
 	return (uint32_t) seg / ps_nshards;
+}
+
+/*
+ * Durable per-shard sync watermark.
+ *
+ * Appends are not synced per record, so on recovery a record that fails to verify
+ * may be an unsynced torn tail (expected after a crash -- truncate it) or
+ * corruption of data an IMMEDSYNC already made durable (fail loudly).  The
+ * watermark is the (segment local index, byte offset) each shard was synced
+ * through; it is persisted on every IMMEDSYNC and on clean close, after the data
+ * itself is durable.  recover() compares the position it actually rebuilt each
+ * shard to its watermark to tell the two apart.
+ */
+#define SYNC_WM_MAGIC	0x53574d31u		/* "SWM1" */
+
+typedef struct SyncWmEnt
+{
+	uint32_t	local;			/* local index of the synced segment */
+	uint32_t	_pad;
+	uint64_t	off;			/* synced byte offset within it */
+} SyncWmEnt;
+
+typedef struct SyncWmFile
+{
+	uint32_t	magic;
+	uint32_t	nshards;
+	uint32_t	crc;			/* ps_crc32c over the struct with crc == 0 */
+	uint32_t	_pad;
+	SyncWmEnt	ent[PS_MAX_SHARDS];
+} SyncWmFile;
+
+static SyncWmEnt g_wm[PS_MAX_SHARDS];	/* loaded watermark, per shard */
+static int	g_wm_valid;					/* a trustworthy watermark was loaded */
+static SyncWmEnt g_wm_pending[PS_MAX_SHARDS];	/* snapshot staged for the next commit */
+/* serializes the POSIX IMMEDSYNC capture+commit so concurrent syncs on different
+ * worker threads don't race on g_wm_pending or the sync_wm.tmp file (the SPDK path
+ * is already serialized by its barrier mutex) */
+static pthread_mutex_t g_wm_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Load the persisted watermark into g_wm; g_wm_valid stays 0 (no fail-open) when
+ * absent or untrustworthy, so such a store keeps the safe truncate-only behavior. */
+static void
+load_sync_watermark(void)
+{
+	char		path[4100];
+	int			fd;
+	SyncWmFile	f;
+	uint32_t	stored;
+
+	g_wm_valid = 0;
+	memset(g_wm, 0, sizeof(g_wm));
+	snprintf(path, sizeof(path), "%s/sync_wm", g_store_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	if (read(fd, &f, sizeof(f)) != (ssize_t) sizeof(f))
+	{
+		close(fd);
+		return;
+	}
+	close(fd);
+	if (f.magic != SYNC_WM_MAGIC || f.nshards != ps_nshards)
+		return;
+	stored = f.crc;
+	f.crc = 0;
+	if (ps_crc32c(&f, sizeof(f)) != stored)
+		return;					/* torn/partial watermark write: ignore */
+	for (uint32_t i = 0; i < ps_nshards; i++)
+		g_wm[i] = f.ent[i];
+	g_wm_valid = 1;
+}
+
+/*
+ * Snapshot one shard's current append cursor into the pending watermark.  The
+ * watermark must never exceed what the impending sync makes durable, so this is
+ * called either by the shard's own worker right after it flushes (SPDK), or by the
+ * sync coordinator just before the sync (POSIX) / on clean close -- in every case
+ * the captured position is <= what becomes durable, and a slightly stale read only
+ * understates (safe: a too-small watermark just treats more of the tail as
+ * unsynced, never raises a false "corrupt acknowledged data").  Atomic loads make
+ * the cross-thread read on the POSIX path well-defined.
+ */
+void
+ps_core_wm_capture(uint32_t shard)
+{
+	Shard	   *s = &g_shards[shard];
+	/* one atomic load of the packed (seg, off) so the pair is always consistent --
+	 * never a freshly-rolled segment with a stale offset (cur_cursor is 0 until a
+	 * record is committed, and only ever holds a position whose bytes are written) */
+	uint64_t	c = __atomic_load_n(&s->cur_cursor, __ATOMIC_ACQUIRE);
+	int			seg = (int) (uint32_t) (c >> 32);
+	uint64_t	off = (uint32_t) c;
+
+	if (c == 0)					/* no committed record yet */
+	{
+		g_wm_pending[shard].local = 0;
+		g_wm_pending[shard].off = 0;
+		return;
+	}
+	g_wm_pending[shard].local = seg_local(seg);
+	g_wm_pending[shard].off = off;
+}
+
+/*
+ * Persist the pending watermark snapshot (captured via ps_core_wm_capture) for
+ * every shard.  Call only after the segment data through those positions is durable
+ * (post IMMEDSYNC / clean close); written via a temp file + rename so a crash never
+ * leaves a half-updated watermark.  Returns 0 on success, -1 if it could not be
+ * made durable.
+ */
+int
+ps_core_write_sync_watermark(void)
+{
+	char		path[4100];
+	char		tmp[4120];
+	SyncWmFile	f;
+	int			fd;
+
+	memset(&f, 0, sizeof(f));
+	f.magic = SYNC_WM_MAGIC;
+	f.nshards = ps_nshards;
+	for (uint32_t i = 0; i < ps_nshards; i++)
+		f.ent[i] = g_wm_pending[i];	/* the snapshot captured at the sync, not live */
+	f.crc = ps_crc32c(&f, sizeof(f));
+
+	snprintf(path, sizeof(path), "%s/sync_wm", g_store_dir);
+	snprintf(tmp, sizeof(tmp), "%s/sync_wm.tmp", g_store_dir);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	if (write(fd, &f, sizeof(f)) != (ssize_t) sizeof(f) || fsync(fd) != 0)
+	{
+		close(fd);
+		unlink(tmp);
+		return -1;
+	}
+	close(fd);
+	if (rename(tmp, path) != 0)
+	{
+		unlink(tmp);
+		return -1;
+	}
+	/* the rename itself must be durable: a failure here means a crash could lose the
+	 * watermark, so report it rather than acknowledge a non-durable sync */
+	fd = open(g_store_dir, O_RDONLY);
+	if (fd < 0 || fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
+ * One IMMEDSYNC / clean-shutdown durability step: capture every shard's cursor,
+ * sync the segment data, then commit the watermark -- all under g_wm_mtx so two
+ * concurrent syncs (the POSIX daemon serves IMMEDSYNC on any worker) can't race on
+ * the shared snapshot or the sync_wm temp file.  Capturing before the sync keeps
+ * the watermark from ever exceeding what is made durable.  Returns 0 on success.
+ */
+int
+ps_core_sync_and_watermark(void)
+{
+	int			rc;
+
+	pthread_mutex_lock(&g_wm_mtx);
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		ps_core_wm_capture(s);
+	rc = ps_storage->sync();
+	if (rc == 0)
+		rc = ps_core_write_sync_watermark();
+	pthread_mutex_unlock(&g_wm_mtx);
+	return rc;
 }
 
 uint32_t
@@ -1483,8 +1668,11 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		uint32_t	local = (s->cur_seg < 0) ? 0 : seg_local(s->cur_seg) + 1;
 
-		s->cur_seg = seg_id(s->index, local);
-		s->cur_off = 0;
+		/* atomic so a concurrent sync-watermark capture on another thread reads a
+		 * consistent cursor; cur_off is published only after the record's bytes are
+		 * written (below), so a captured offset is always already-written data */
+		__atomic_store_n(&s->cur_seg, seg_id(s->index, local), __ATOMIC_RELEASE);
+		__atomic_store_n(&s->cur_off, (uint64_t) 0, __ATOMIC_RELEASE);
 	}
 
 	memset(&hdr, 0, sizeof(hdr));	/* deterministic padding: the crc covers it */
@@ -1511,7 +1699,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * the page CRC so the read path can verify the bytes it later fetches */
 	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off,
 					 ps_crc32c(page, page_size));
-	s->cur_off += reclen;
+	/* publish the advanced cursor only now, after the bytes are written */
+	__atomic_store_n(&s->cur_off, s->cur_off + reclen, __ATOMIC_RELEASE);
+	/* publish the committed (seg, off) as one atomic word for the watermark capture,
+	 * only here -- never the bare (rolled-seg, 0) above -- so a capture always sees a
+	 * position whose record bytes are written */
+	__atomic_store_n(&s->cur_cursor,
+					 ((uint64_t) (uint32_t) s->cur_seg << 32) | (uint32_t) s->cur_off,
+					 __ATOMIC_RELEASE);
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
@@ -1680,25 +1875,6 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 /* ===================== recovery (rebuild index from segments) ========== */
 
 /*
- * Rebuild the entire in-memory index at startup by replaying the segments in
- * order.  Each record is self-describing, so replaying append_page's effect
- * (page_add_version + fork_grow) for every record reconstructs both indexes and
- * leaves the append cursor positioned just past the last valid record.
- *
- * The scan stops at the first record that fails its magic/gen/len/CRC check
- * (end-of-log).  Because appends are not synced per record, that record may be an
- * unsynced torn tail (expected after a crash) or corruption of already-synced
- * data; without a durable per-shard sync watermark the two are indistinguishable,
- * so recovery truncates there rather than refusing to open over a normal tail.
- * Returns 0 on success, -1 only on allocation failure (so ps_core_open() does not
- * open with an empty index over a real store).
- *
- * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.  Telling synced-data corruption from an
- * unsynced tail (to fail loudly on the former) is deferred to the sync-watermark
- * work noted in SPDK_NOTES.
- */
-/*
  * Physically clear the written bytes from (seg, off) forward in a shard's
  * segments, so a truncated tail cannot be resurrected: the old records past a
  * truncation point keep valid CRCs at their own offsets, so after the daemon
@@ -1771,6 +1947,26 @@ zero_shard_forward(uint32_t shard, int seg, uint64_t off)
 	return err ? -1 : wrote;
 }
 
+/*
+ * Rebuild the entire in-memory index at startup by replaying the segments in
+ * order.  Each record is self-describing, so replaying append_page's effect
+ * (page_add_version + fork_grow) for every record reconstructs both indexes and
+ * leaves the append cursor positioned just past the last valid record.
+ *
+ * The scan stops at the first record that fails its magic/gen/len/CRC check.  Each
+ * shard ends at its first non-full segment (a full one always rolled, so it is a
+ * clean natural boundary; continuing past a partial one would index a later
+ * segment while leaving the cursor mid-this-one).  Whether the stop is an expected
+ * unsynced torn tail or corruption of already-synced data is then decided against
+ * the durable sync watermark: recovering short of it means committed records are
+ * missing -> fail open; stopping at/after it is the normal tail (valid unsynced
+ * records past it are still replayed, honoring ack-durability).  Returns 0 on
+ * success, -1 on such corruption or on allocation failure (so ps_core_open() does
+ * not open with an empty/short index over a real store).
+ *
+ * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
+ * effects are not reproduced on restart.
+ */
 static int
 recover(void)
 {
@@ -1779,6 +1975,7 @@ recover(void)
 
 	if (!pg)
 		return -1;				/* don't open with an empty index over a real store */
+	load_sync_watermark();		/* tells synced-data corruption from an unsynced tail */
 	/* Each shard owns a disjoint segment-id namespace, so scan and replay each
 	 * shard's segments and position its own append cursor.  page_add_version()
 	 * self-routes by key, so a record always lands on the shard that wrote it. */
@@ -1786,11 +1983,14 @@ recover(void)
 	{
 		Shard	   *s = &g_shards[si];
 
+		uint64_t	reclen = sizeof(SegRecHdr) + page_size;
+
 		for (uint32_t local = 0;; local++)
 		{
 			int			id = seg_id(s->index, local);
 			uint64_t	off = 0;
 			int64_t		sz = ps_storage->seg_size(id);
+			int			full = 0;	/* segment filled (rolled): a clean natural end */
 
 			if (sz < 0)
 				break;			/* no more segments in this shard -> done */
@@ -1800,12 +2000,19 @@ recover(void)
 			{
 				SegRecHdr	hdr;
 
+				/* A full segment (no room for another record) is a clean natural
+				 * boundary -- mark it and let the shard continue to the next. */
+				if (off + reclen > segment_size)
+				{
+					full = 1;
+					break;
+				}
 				/*
-				 * Stop at the first record that does not verify -- a torn/unsynced
-				 * trailing append, a never-written tail, or stale device bytes from
-				 * before this store.  Truncating here is safe (it never refuses to
-				 * open over a normal post-crash tail), and zero_shard_forward() below
-				 * physically discards the rest.
+				 * Otherwise stop at the first record that does not verify -- a
+				 * torn/unsynced trailing append, a never-written tail, or stale
+				 * bytes.  Whether that is an expected unsynced tail or corruption of
+				 * already-synced data is decided after the shard scan against the
+				 * sync watermark; zero_shard_forward() below physically discards it.
 				 *
 				 * But distinguish an expected short tail from a real backend read
 				 * error: a full record needs sizeof(hdr)+page_size bytes present, so
@@ -1813,10 +2020,10 @@ recover(void)
 				 * seg_read failure WITHIN that size is an actual I/O error -- fail the
 				 * open rather than truncate, which could otherwise zero live data on a
 				 * transient read fault.  (On SPDK seg_size() reports a present segment
-				 * as full, so its tail is detected by the magic/gen/CRC check on the
-				 * stale bytes, and only a real do_io failure reaches the -1 paths.)
+				 * as full, so its tail is detected by the magic/gen/CRC check on stale
+				 * bytes and only a real do_io failure reaches the -1 paths.)
 				 */
-				if (off + sizeof(hdr) + page_size > (uint64_t) sz)
+				if (off + reclen > (uint64_t) sz)
 					break;
 				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0)
 				{
@@ -1840,8 +2047,7 @@ recover(void)
 				if (seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
 				{
 					fprintf(stderr, "pagestore: shard %u segment %d off %llu: record "
-							"failed CRC; treating as end of log\n",
-							s->index, id, (unsigned long long) off);
+							"failed CRC\n", s->index, id, (unsigned long long) off);
 					break;
 				}
 
@@ -1851,22 +2057,46 @@ recover(void)
 				off += sizeof(hdr) + hdr.len;
 			}
 
-			/* A segment with no valid records is this shard's end-of-log: the
-			 * shard's own segments are written densely in 'local', so the first
-			 * empty one is the tail.  (On SPDK seg_size() reports any id below the
-			 * global high-water as present even if another shard owns that slot, so
-			 * stop here rather than on seg_size.)  */
-			if (off == 0)
+			/* An empty, not-full segment is this shard's end-of-log. */
+			if (off == 0 && !full)
 				break;
 			/* newest segment seen for this shard; its append continues after it */
 			s->cur_seg = id;
 			s->cur_off = off;
-			/* If the scan stopped with room left for another record, this segment is
-			 * the shard's end -- a tail or a mid-log corruption -- not a rolled-full
-			 * one.  Stop the shard here; continuing would index a later segment while
-			 * leaving the cursor mid-this-one, silently dropping the gap between. */
-			if (off + sizeof(SegRecHdr) + page_size <= segment_size)
+			/* seed the packed cursor so a watermark capture before the first new
+			 * append still reflects the recovered position */
+			s->cur_cursor = ((uint64_t) (uint32_t) id << 32) | (uint32_t) off;
+			/* A segment that stopped with room left (not full) is the shard's tail or
+			 * a mid-log corruption -- the shard ends here, never continue past it
+			 * (which would index a later segment yet leave the cursor mid-this-one). */
+			if (!full)
 				break;
+		}
+
+		/*
+		 * Did we rebuild the whole durable log?  If a trustworthy watermark says
+		 * this shard was synced through (local, off) but recovery stopped short of
+		 * it, the missing records were synced -- this is corruption of acknowledged
+		 * data, not an unsynced tail.  Fail open so it is visible rather than
+		 * silently dropping committed writes.  (Stopping at/after the watermark is
+		 * the normal case: any valid records past it are unsynced and still
+		 * replayed; a failure past it is just the expected torn tail.)
+		 */
+		if (s->cur_seg >= 0 && g_wm_valid)
+		{
+			uint32_t	fl = seg_local(s->cur_seg);
+
+			if (fl < g_wm[si].local ||
+				(fl == g_wm[si].local && s->cur_off < g_wm[si].off))
+			{
+				fprintf(stderr, "pagestore: shard %u recovered only through segment "
+						"%d off %llu but was synced through local %u off %llu: "
+						"corrupt acknowledged data; refusing to recover\n",
+						s->index, s->cur_seg, (unsigned long long) s->cur_off,
+						g_wm[si].local, (unsigned long long) g_wm[si].off);
+				free(pg);
+				return -1;
+			}
 		}
 		if (s->cur_seg >= 0)
 			fprintf(stderr, "pagestore_daemon: shard %u recovered through segment "
@@ -1875,30 +2105,70 @@ recover(void)
 
 		if (s->cur_seg < 0)
 		{
-			/*
-			 * Recovered nothing from this shard.  If its first segment nonetheless
-			 * holds non-zero data, we could not replay it -- a wrong --page-size, a
-			 * corrupt or foreign store_gen, or corruption of the very first record.
-			 * That is indistinguishable from stale raw-device bytes, and zeroing it
-			 * would erase a valid store merely opened with the wrong config, so fail
-			 * open instead.  A fresh store has no first segment (or an all-zero one
-			 * from a prior truncation) and opens normally.
-			 */
 			int			first = seg_id(s->index, 0);
-			SegRecHdr	probe;
 
-			if (ps_storage->seg_size(first) >= 0 &&
-				ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
-				for (size_t k = 0; k < sizeof(probe); k++)
-					if (((unsigned char *) &probe)[k])
+			if (g_wm_valid)
+			{
+				/*
+				 * The watermark is authoritative.  If it says this shard was synced
+				 * through real data but recovery rebuilt nothing, that committed data
+				 * is gone (a missing/truncated/all-zero first segment, or lost SPDK
+				 * counts) -- fail rather than silently open empty.
+				 */
+				if (g_wm[si].local > 0 || g_wm[si].off > 0)
+				{
+					fprintf(stderr, "pagestore: shard %u: watermark says synced "
+							"through local %u off %llu but recovery found no records; "
+							"refusing to recover\n", s->index, g_wm[si].local,
+							(unsigned long long) g_wm[si].off);
+					free(pg);
+					return -1;
+				}
+				/*
+				 * Watermark is exactly (0,0): the shard was synced while empty, so any
+				 * bytes now in the first segment are an unsynced torn append past the
+				 * watermark.  Discard them (don't mistake them for corruption) so a
+				 * clean post-crash tail opens instead of bricking.
+				 */
+				if (ps_storage->seg_size(first) >= 0)
+				{
+					int			z = zero_shard_forward(s->index, first, 0);
+
+					if (z < 0)
 					{
-						fprintf(stderr, "pagestore: shard %u: existing segment data "
-								"could not be recovered (wrong --page-size, or a "
-								"corrupt/foreign store generation); refusing to "
-								"recover\n", s->index);
 						free(pg);
 						return -1;
 					}
+					if (z)
+						need_sync = 1;
+				}
+			}
+			else
+			{
+				/*
+				 * No trustworthy watermark: if the first segment holds non-zero data
+				 * we could not replay it -- a wrong --page-size, a corrupt/foreign
+				 * store_gen, or corruption of the very first record.  That is
+				 * indistinguishable from stale raw-device bytes, and zeroing it would
+				 * erase a valid store merely opened with the wrong config, so fail open
+				 * instead.  A fresh store has no first segment (or an all-zero one from
+				 * a prior truncation) and opens normally.
+				 */
+				SegRecHdr	probe;
+
+				if (ps_storage->seg_size(first) >= 0 &&
+					ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
+					for (size_t k = 0; k < sizeof(probe); k++)
+						if (((unsigned char *) &probe)[k])
+						{
+							fprintf(stderr, "pagestore: shard %u: existing segment "
+									"data could not be recovered (wrong --page-size, or "
+									"a corrupt/foreign store generation); refusing to "
+									"recover\n", s->index);
+							free(pg);
+							return -1;
+						}
+			}
 		}
 		else
 		{
@@ -2021,7 +2291,8 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			if (ps_storage->sync() != 0)
+			/* capture-before-sync + commit, serialized against concurrent syncs */
+			if (ps_core_sync_and_watermark() != 0)
 				ch->status = PS_STATUS_ERROR;	/* report a failed durable sync */
 			break;
 
@@ -2038,6 +2309,10 @@ ps_handle_meta(PsChannel *ch)
 void
 ps_core_close(void)
 {
+	/* clean shutdown is a durability point: capture each shard's cursor, sync the
+	 * segment data, and commit the watermark, so the next recover() trusts the full
+	 * log as synced */
+	ps_core_sync_and_watermark();
 	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		Shard	   *s = &g_shards[i];
@@ -2358,6 +2633,7 @@ int
 ps_core_open(const char *store_dir)
 {
 	crc32c_init();				/* before recover() and any worker thread */
+	snprintf(g_store_dir, sizeof(g_store_dir), "%s", store_dir);
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
@@ -2418,6 +2694,14 @@ ps_core_open(const char *store_dir)
 				(unsigned long long) segment_size);
 		return -1;
 	}
+	/* the sync-watermark capture packs (seg, off) into one 64-bit word with the
+	 * offset in the low 32 bits, so a segment must be addressable in 32 bits */
+	if (segment_size > 0xFFFFFFFFULL)
+	{
+		fprintf(stderr, "pagestore_core: segment_size %llu exceeds 4 GiB\n",
+				(unsigned long long) segment_size);
+		return -1;
+	}
 
 	/* per-shard: open + replay its manifest, finish any interrupted GC, continue
 	 * layer ids past the highest the manifest restored (low bits only -- the
@@ -2428,6 +2712,10 @@ ps_core_open(const char *store_dir)
 
 		s->index = i;
 		s->cur_seg = -1;		/* recover() positions the append cursor */
+		s->cur_off = 0;
+		s->cur_cursor = 0;		/* clear any packed cursor from a prior open of
+								 * this process, so a capture before recover/append
+								 * doesn't read a stale watermark position */
 		/* layer_ids are unique only within a store; drop blooms cached from a
 		 * previously-opened store so a reused id can't return a stale "absent" */
 		ps_image_bloom_reset(&s->bloom);
