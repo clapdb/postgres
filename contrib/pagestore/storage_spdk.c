@@ -222,12 +222,16 @@ super_write_counts(const uint32_t *counts)
 		return -1;
 	}
 	close(fd);
-	fd = open(g_store, O_RDONLY);	/* make the entry durable on first create */
-	if (fd >= 0)
+	/* make the directory entry durable on first create; propagate failure so the
+	 * caller never advances the watermark past a super that isn't durably linked */
+	fd = open(g_store, O_RDONLY);
+	if (fd < 0 || fsync(fd) != 0)
 	{
-		fsync(fd);
-		close(fd);
+		if (fd >= 0)
+			close(fd);
+		return -1;
 	}
+	close(fd);
 	return 0;
 }
 

@@ -2688,6 +2688,10 @@ ps_core_open(const char *store_dir)
 
 		s->index = i;
 		s->cur_seg = -1;		/* recover() positions the append cursor */
+		s->cur_off = 0;
+		s->cur_cursor = 0;		/* clear any packed cursor from a prior open of
+								 * this process, so a capture before recover/append
+								 * doesn't read a stale watermark position */
 		/* layer_ids are unique only within a store; drop blooms cached from a
 		 * previously-opened store so a reused id can't return a stale "absent" */
 		ps_image_bloom_reset(&s->bloom);
