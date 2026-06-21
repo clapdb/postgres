@@ -2106,45 +2106,69 @@ recover(void)
 		if (s->cur_seg < 0)
 		{
 			int			first = seg_id(s->index, 0);
-			SegRecHdr	probe;
 
-			/*
-			 * Recovered nothing from this shard.  If a trustworthy watermark says it
-			 * was synced through real data, that committed data is now gone (a
-			 * missing/truncated/all-zero first segment, or lost SPDK segment counts)
-			 * -- fail rather than silently open an empty store.
-			 */
-			if (g_wm_valid && (g_wm[si].local > 0 || g_wm[si].off > 0))
+			if (g_wm_valid)
 			{
-				fprintf(stderr, "pagestore: shard %u: watermark says synced through "
-						"local %u off %llu but recovery found no records; refusing to "
-						"recover\n", s->index, g_wm[si].local,
-						(unsigned long long) g_wm[si].off);
-				free(pg);
-				return -1;
-			}
+				/*
+				 * The watermark is authoritative.  If it says this shard was synced
+				 * through real data but recovery rebuilt nothing, that committed data
+				 * is gone (a missing/truncated/all-zero first segment, or lost SPDK
+				 * counts) -- fail rather than silently open empty.
+				 */
+				if (g_wm[si].local > 0 || g_wm[si].off > 0)
+				{
+					fprintf(stderr, "pagestore: shard %u: watermark says synced "
+							"through local %u off %llu but recovery found no records; "
+							"refusing to recover\n", s->index, g_wm[si].local,
+							(unsigned long long) g_wm[si].off);
+					free(pg);
+					return -1;
+				}
+				/*
+				 * Watermark is exactly (0,0): the shard was synced while empty, so any
+				 * bytes now in the first segment are an unsynced torn append past the
+				 * watermark.  Discard them (don't mistake them for corruption) so a
+				 * clean post-crash tail opens instead of bricking.
+				 */
+				if (ps_storage->seg_size(first) >= 0)
+				{
+					int			z = zero_shard_forward(s->index, first, 0);
 
-			/*
-			 * Otherwise (no watermark): if the first segment holds non-zero data we
-			 * could not replay it -- a wrong --page-size, a corrupt or foreign
-			 * store_gen, or corruption of the very first record.  That is
-			 * indistinguishable from stale raw-device bytes, and zeroing it would
-			 * erase a valid store merely opened with the wrong config, so fail open
-			 * instead.  A fresh store has no first segment (or an all-zero one from a
-			 * prior truncation) and opens normally.
-			 */
-			if (ps_storage->seg_size(first) >= 0 &&
-				ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
-				for (size_t k = 0; k < sizeof(probe); k++)
-					if (((unsigned char *) &probe)[k])
+					if (z < 0)
 					{
-						fprintf(stderr, "pagestore: shard %u: existing segment data "
-								"could not be recovered (wrong --page-size, or a "
-								"corrupt/foreign store generation); refusing to "
-								"recover\n", s->index);
 						free(pg);
 						return -1;
 					}
+					if (z)
+						need_sync = 1;
+				}
+			}
+			else
+			{
+				/*
+				 * No trustworthy watermark: if the first segment holds non-zero data
+				 * we could not replay it -- a wrong --page-size, a corrupt/foreign
+				 * store_gen, or corruption of the very first record.  That is
+				 * indistinguishable from stale raw-device bytes, and zeroing it would
+				 * erase a valid store merely opened with the wrong config, so fail open
+				 * instead.  A fresh store has no first segment (or an all-zero one from
+				 * a prior truncation) and opens normally.
+				 */
+				SegRecHdr	probe;
+
+				if (ps_storage->seg_size(first) >= 0 &&
+					ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
+					for (size_t k = 0; k < sizeof(probe); k++)
+						if (((unsigned char *) &probe)[k])
+						{
+							fprintf(stderr, "pagestore: shard %u: existing segment "
+									"data could not be recovered (wrong --page-size, or "
+									"a corrupt/foreign store generation); refusing to "
+									"recover\n", s->index);
+							free(pg);
+							return -1;
+						}
+			}
 		}
 		else
 		{

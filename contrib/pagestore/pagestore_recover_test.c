@@ -124,8 +124,7 @@ setup_synced(const char *store)		/* append 5, watermark all, clean close */
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 5, 20);
-	ps_core_wm_capture(0);
-	if (ps_core_write_sync_watermark() != 0)
+	if (ps_core_sync_and_watermark() != 0)	/* real IMMEDSYNC path: sync then commit */
 		return 1;
 	ps_core_close();
 	return 0;
@@ -137,8 +136,7 @@ setup_crash_tail(const char *store)	/* watermark first 3, append 2 more, no clos
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 30);
-	ps_core_wm_capture(0);
-	if (ps_core_write_sync_watermark() != 0)
+	if (ps_core_sync_and_watermark() != 0)	/* real IMMEDSYNC path: sync then commit */
 		return 1;
 	append_blocks(store, 3, 5, 30);
 	fflush(stdout);
@@ -202,8 +200,7 @@ setup_crash_tail40(const char *store)	/* like setup_crash_tail but tag base 40 *
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 40);
-	ps_core_wm_capture(0);
-	if (ps_core_write_sync_watermark() != 0)
+	if (ps_core_sync_and_watermark() != 0)	/* real IMMEDSYNC path: sync then commit */
 		return 1;
 	append_blocks(store, 3, 5, 40);
 	fflush(stdout);
@@ -216,8 +213,7 @@ setup_resurrect(const char *store)	/* 0-2 synced, 3-5 unsynced, crash */
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 50);
-	ps_core_wm_capture(0);
-	if (ps_core_write_sync_watermark() != 0)
+	if (ps_core_sync_and_watermark() != 0)	/* real IMMEDSYNC path: sync then commit */
 		return 1;
 	append_blocks(store, 3, 6, 50);		/* blocks 3,4,5 in segment 1, unsynced */
 	fflush(stdout);
@@ -252,6 +248,35 @@ recover_no_resurrect(const char *store)	/* new block 3 only; old 4,5 not resurre
 		return 1;				/* old block 4 must NOT come back */
 	if (read_resolve(0, &key, 5, ~0ull, rb) != 0)
 		return 1;
+	return 0;
+}
+
+static int
+setup_empty_then_tail(const char *store)	/* sync empty (wm 0,0), append, crash */
+{
+	unsigned char pg[8192];
+
+	if (ps_core_open(store) != 0)
+		return 1;
+	if (ps_core_sync_and_watermark() != 0)	/* watermark = (0,0): synced while empty */
+		return 1;
+	fill_page(pg, page_size, 1000, 60);
+	if (append_page(0, &key, 0, pg) != 0)	/* one unsynced append past the watermark */
+		return 1;
+	fork_grow(0, &key, 1);
+	fflush(stdout);
+	_exit(0);
+}
+
+static int
+recover_open_empty(const char *store)	/* a torn tail past a (0,0) wm opens, not bricks */
+{
+	unsigned char rb[8192];
+
+	if (ps_core_open(store) != 0)
+		return 1;
+	if (read_resolve(0, &key, 0, ~0ull, rb) != 0)
+		return 1;				/* the torn unsynced append must be discarded */
 	return 0;
 }
 
@@ -343,6 +368,14 @@ main(void)
 	}
 	check(phase(recover_expect_fail, dir) == 0,
 		  "wm-vs-empty: refuse to open when committed data is gone");
+
+	/* 7: a (0,0) watermark (shard synced while empty) + a torn first append must
+	 * truncate that unsynced tail and open, not brick as foreign corruption */
+	dir = sdir("G");
+	check(phase(setup_empty_then_tail, dir) == 0, "empty-wm: setup (sync empty, append, crash)");
+	corrupt_byte(dir, 0, 100);	/* tear the lone unsynced record */
+	check(phase(recover_open_empty, dir) == 0,
+		  "empty-wm: torn tail past (0,0) watermark opens, not bricks");
 
 	{
 		char		cmd[4200];
