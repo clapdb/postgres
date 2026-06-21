@@ -343,13 +343,17 @@ count_image_layers(Shard *s, uint32_t timeline)
  * the tombstone (entry + object) once the replacement range is durably remote.
  * The stale local location on the tombstone is harmless (deleting layers are never
  * read); its local file is still reclaimed here.
+ *
+ * The decision keys off the persisted remote_durable flag, NOT ps_object_tier:
+ * a store with uploaded layers reopened without --object-dir must still keep the
+ * tombstone, or the object becomes undiscoverable if the tier is re-enabled later.
  */
 static void
 gc_remove_layer(Shard *s, const PsLayerDesc *d)
 {
 	if (ps_layer_store->delete_local_layer(d) != 0)
 		return;
-	if (ps_object_tier && d->remote_durable)
+	if (d->remote_durable)
 		return;					/* keep the entry as a remote tombstone */
 	ps_manifest_remove_layer(&s->manifest, d->layer_id);
 }
@@ -1684,7 +1688,14 @@ upload_one(Shard *s)
 	{
 		PsLayerDesc *d = &map->layers[i];
 
-		if (d->remote_durable || d->deleting)
+		if (d->deleting)
+			continue;
+		/* Skip only layers whose object is actually present in the configured
+		 * tier.  The persisted remote_durable flag alone is not proof: a store
+		 * reopened against a different or freshly-recreated --object-dir replays
+		 * the flag but the object is absent in this run's tier, so re-upload it
+		 * rather than leave remote durability silently missing. */
+		if (d->remote_durable && ps_layer_store->layer_exists_remote(d) == 1)
 			continue;
 		/* upload, then confirm it is really there before marking durable, so a
 		 * local copy is never treated as evictable on an unverified upload.  A

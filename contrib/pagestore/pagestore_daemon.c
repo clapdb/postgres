@@ -228,9 +228,11 @@ main(int argc, char **argv)
 				fprintf(stderr, "--object-dir %s is not a directory\n", od);
 				return 2;
 			}
-			if (access(od, W_OK | X_OK) != 0)
+			/* R_OK too: uploads fsync the directory via an O_RDONLY open, which
+			 * fails on a write-only (e.g. mode 0300) directory */
+			if (access(od, R_OK | W_OK | X_OK) != 0)
 			{
-				fprintf(stderr, "--object-dir %s not writable: %s\n",
+				fprintf(stderr, "--object-dir %s not accessible: %s\n",
 						od, strerror(errno));
 				return 2;
 			}
