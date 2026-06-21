@@ -81,11 +81,116 @@ read pages at an LSN.
          the base image with `rm_redo` to get the page exactly as-of lsn.  This
          is the one piece that needs PostgreSQL's redo run against a single held
          page (Neon's wal-redo process / a small core mode) -- the last hard
-         piece of the read path.
+         piece of the read path.  📐 Designed, not yet implemented: see
+         "3c-4 detailed design" below.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no
      shared local state.
+
+## 3c-4 detailed design — single-page redo (apply deltas onto a base image)
+
+This is the last hard piece of the per-page read path.  3c-3 already gives the
+*base* image (newest full-page image at/below the target LSN); 3c-4 applies the
+WAL **delta** records after it, via PostgreSQL's `rm_redo`, to produce the page
+*exactly as-of* a target LSN.  This is the `materialize()` step from
+MATERIALIZATION.md (`base + deltas -> rm_redo -> image-layer page`).
+
+### Why it needs a dedicated mechanism
+
+`rm_redo` handlers do not take a page argument; they fetch the page they mutate
+through `XLogReadBufferForRedo` -> `XLogReadBufferForRedoExtended` ->
+`XLogReadBufferExtended` (the buffer manager / smgr), and that path drives the
+gating we must honor (see `xlogutils.c`):
+
+- if the record carries a usable full-page image, it is restored and the call
+  returns `BLK_RESTORED`;
+- else if `record_lsn <= PageGetLSN(page)` it returns `BLK_DONE` (already
+  applied) and the handler skips the block;
+- else `BLK_NEEDS_REDO` and the handler mutates the buffer.
+
+So to redo *one* page in isolation we must make those buffer reads return our
+single held page for the target `(rlocator, forknum, blkno)` (seeded to the base
+image with its LSN = base_lsn so the gating applies exactly the records in
+`(base_lsn, target_lsn]`), and return `BLK_NOTFOUND` for any *other* block a
+record touches (multi-block records: heap update, btree split, …) so the handler
+simply skips those — correct, because each page is materialized independently.
+Doing this inside a normal backend is unsafe: the handlers assume a recovery-ish
+context, and they would read/dirty the *real* shared buffers.
+
+### Approach: a sandboxed `postgres --wal-redo` process (Neon model)
+
+A dedicated, short-lived process that holds exactly one page and applies records
+to it — the approach the doc has pointed at throughout.  Chosen over an in-backend
+hack for correctness (isolation from shared buffers / concurrency) and security
+(it only ever sees a base page + record bytes; it can be seccomp-sandboxed, so
+decoding attacker-influenced WAL cannot touch the system).
+
+**Process**: a new `--wal-redo` startup mode (bootstrap-like: no postmaster, no
+catalog access), holding one `BLCKSZ` slot as its entire "buffer pool", driven by
+a length-prefixed binary protocol on a pipe pair:
+
+| msg | payload | effect |
+|-----|---------|--------|
+| `BEGIN` | rlocator, forknum, blkno | set the target page identity |
+| `PUSHBASE` | page bytes \| (none = zero) | seed the held page (base FPI, or zero for a WILL_INIT first record) |
+| `APPLY` | record LSN, raw WAL record bytes | decode + `rm_redo` the record onto the held page |
+| `GET` | — | return the current page bytes (the as-of result) |
+
+Buffer redirection is the only core change in the loop: under an `am_walredo`
+flag, `XLogReadBufferExtended` returns the held buffer for the target tag and
+`BLK_NOTFOUND` otherwise (a wal-redo-specific tiny smgr, or a guarded branch in
+the read path — to be decided in the patch; the smgr route keeps core untouched).
+
+### Driver side (normal backend, contrib/pagestore)
+
+`pagestore_redo_page_asof(rel, fork, block, lsn) -> bytea`:
+
+1. `base, base_lsn` = 3c-3 (`pagestore_redo_page`): newest FPI at/below lsn — or a
+   zero page if the first relevant record has `BKPBLOCK_WILL_INIT`.
+2. `deltas` = `walidx_get(key, block, lsn)` restricted to `(base_lsn, lsn]`,
+   ascending (the same half-open range as `ps_read_plan_build`).
+3. open (or reuse a pooled) wal-redo process; `BEGIN(target)`; `PUSHBASE(base)`;
+   for each delta read its bytes with the local `XLogReader` and `APPLY`; `GET`.
+4. return the page as-of lsn.
+
+This is the function both the **background materializer** and the **on-demand
+read-miss** path call.  Per MATERIALIZATION.md redo stays *off the hot read
+path*: the materializer turns delta layers into image-layer pages (write back via
+`WRITEV` / `ADD_LAYER`) so later reads are already materialized; an uncovered
+cold read drives the same function for just that page.
+
+### Edge cases / failure modes
+
+- **WILL_INIT first record** — no base needed; seed a zero page, the record
+  initializes it.
+- **Multi-block record** — only the target is held; other blocks return
+  `BLK_NOTFOUND` and are skipped.
+- **A delta carries a newer FPI** — handled inside redo (`BLK_RESTORED`); start
+  effectively re-bases there.
+- **target_lsn must be a record boundary** (a page LSN) — same constraint as the
+  read plan's half-open delta range.
+- **Unretrievable / short WAL** — fail the materialization (NULL/error); the page
+  stays un-materialized rather than wrong.
+- **wal-redo process crash/timeout** — driver sees pipe EOF, retries on a fresh
+  process; state is per-page so restart is safe.
+
+### Test plan
+
+- Unit: write rows to a table, index its WAL (3c-2), assert
+  `pagestore_redo_page_asof(block, lsn)` equals a direct read of that page as-of
+  `lsn`, for several LSNs across multiple updates.
+- WILL_INIT: a freshly-created page materializes from zero.
+- Multi-block: a btree split / heap update — target page correct, neighbor
+  untouched.
+- Integration: extend `redo_worker_demo.sh` / `wal_only_redo_demo.sh` to assert
+  per-page materialization matches full-recovery materialization.
+
+### What 3c-4 unblocks
+
+The store can then serve any page as-of any LSN from WAL alone (background or
+on-demand), completing the per-page read path.  With 3d-2/3 (SLRU/clog + branch
+WAL read-through) it removes the single-compute-per-branch boundary.
 
 ## Known scope boundaries
 
