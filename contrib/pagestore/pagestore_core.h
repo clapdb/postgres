@@ -51,6 +51,11 @@ extern int	ps_core_open(const char *store_dir);
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */
 extern void ps_core_close(void);
 
+/* Persist the per-shard sync watermark at the current append cursors.  Call after
+ * the segment data is durable (post sync / clean close); recovery uses it to tell
+ * an unsynced torn tail from corruption of already-synced data. */
+extern int	ps_core_write_sync_watermark(void);
+
 /* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
  * did work (caller should not sleep), 0 if nothing was due.  The (void) form
  * sweeps every shard (single-threaded frontends); the per-shard form is for a
