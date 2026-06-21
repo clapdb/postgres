@@ -31,6 +31,7 @@ typedef struct PageVer
 	uint64_t	lsn;			/* the page's pd_lsn when it was written */
 	int			seg;			/* segment id holding the bytes */
 	uint64_t	off;			/* byte offset of the page within that segment */
+	uint32_t	crc;			/* CRC32C of the page bytes (verified on read) */
 } PageVer;
 
 /* Configuration shared with the frontend; set by the frontend before open. */
@@ -98,6 +99,9 @@ extern PageVer *read_through_cacheable(uint32_t timeline, const PsKey *key,
 									   uint32_t block, uint64_t read_lsn,
 									   uint32_t *src_tl, int *ambiguous);
 extern int	read_version(const PageVer *v, unsigned char *out);
+
+/* CRC32C of a buffer (page-integrity checks shared with the SPDK read path). */
+extern uint32_t ps_crc32c(const void *buf, size_t len);
 
 /*
  * Resolve a read into out (page_size bytes), serving from memtable / image

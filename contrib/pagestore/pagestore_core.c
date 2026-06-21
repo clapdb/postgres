@@ -66,6 +66,115 @@ int			ps_object_tier = 0;
 const PsStorage *ps_storage = &PsStoragePosix;
 
 /*
+ * Segment-record integrity (no filesystem under the raw NVMe backend, so we carry
+ * our own checks).  CRC32C (Castagnoli) detects bit rot / torn writes; a per-store
+ * generation distinguishes our records from stale device bytes (a reused disk, or
+ * a previous store) that happen to carry a SEG_MAGIC, which a CRC alone can't.
+ */
+static uint32_t crc32c_tab[256];
+
+static void
+crc32c_init(void)
+{
+	for (uint32_t i = 0; i < 256; i++)
+	{
+		uint32_t	c = i;
+
+		for (int k = 0; k < 8; k++)
+			c = (c & 1) ? (c >> 1) ^ 0x82F63B78u : (c >> 1);
+		crc32c_tab[i] = c;
+	}
+}
+
+static uint32_t
+crc32c_upd(uint32_t crc, const void *buf, size_t len)
+{
+	const unsigned char *p = buf;
+
+	while (len--)
+		crc = crc32c_tab[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	return crc;
+}
+
+/* page-only CRC32C, stored per version and verified on the read path */
+uint32_t
+ps_crc32c(const void *buf, size_t len)
+{
+	return crc32c_upd(0xFFFFFFFFu, buf, len) ^ 0xFFFFFFFFu;
+}
+
+/* per-store generation, stamped into every segment record (0 = uninitialized) */
+static uint64_t g_store_gen;
+
+/*
+ * Load the store's generation from <store_dir>/store_gen, creating a durable
+ * random one on first open.  Stamped into each SegRecHdr so recover() can reject
+ * stale records left on a reused raw device (different/zero generation) instead of
+ * replaying them as live data.
+ */
+static void
+load_store_gen(const char *store_dir)
+{
+	char		path[2200];
+	int			fd;
+	uint64_t	g = 0;
+
+	snprintf(path, sizeof(path), "%s/store_gen", store_dir);
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
+			g = 0;
+		close(fd);
+	}
+	if (g == 0)
+	{
+		fd = open("/dev/urandom", O_RDONLY);
+		if (fd >= 0)
+		{
+			if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
+				g = 0;
+			close(fd);
+		}
+		if (g == 0)
+		{
+			uint64_t	h = 1469598103934665603ULL;	/* FNV-1a(path) fallback */
+
+			for (const char *p = store_dir; *p; p++)
+				h = (h ^ (unsigned char) *p) * 1099511628211ULL;
+			g = h ? h : 1;
+		}
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0)
+		{
+			ssize_t		w = write(fd, &g, sizeof(g));
+
+			(void) w;
+			fsync(fd);
+			close(fd);
+			fd = open(store_dir, O_RDONLY);		/* make the entry durable */
+			if (fd >= 0)
+			{
+				fsync(fd);
+				close(fd);
+			}
+		}
+		else
+		{
+			/* lost a create race: adopt the peer's persisted generation */
+			fd = open(path, O_RDONLY);
+			if (fd >= 0)
+			{
+				if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
+					g = g ? g : 1;
+				close(fd);
+			}
+		}
+	}
+	g_store_gen = g;
+}
+
+/*
  * Per-shard state (LSM phase 9).  One thread per shard will own its index /
  * staging / cache lock-free; the shard is chosen from the logical key only
  * (block- and timeline-independent), so a key's blocks and all its timelines live
@@ -608,7 +717,29 @@ typedef struct SegRecHdr
 	uint32_t	block;
 	uint64_t	lsn;			/* the page's pd_lsn at write time */
 	uint32_t	len;			/* page bytes following the header */
+	uint32_t	crc;			/* CRC32C over (pos, header[crc=0], page bytes) */
+	uint64_t	gen;			/* per-store generation (rejects stale device bytes) */
 } SegRecHdr;
+
+/*
+ * CRC32C covering the record's position (segment id + byte offset, to catch a
+ * misdirected write that landed elsewhere), the header with its own crc field
+ * zeroed, and the page bytes.  Computed at write, checked at recover.
+ */
+static uint32_t
+seg_rec_crc(int seg, uint64_t recoff, const SegRecHdr *h,
+			const unsigned char *page)
+{
+	SegRecHdr	tmp = *h;
+	uint32_t	crc = 0xFFFFFFFFu;
+
+	tmp.crc = 0;
+	crc = crc32c_upd(crc, &seg, sizeof(seg));
+	crc = crc32c_upd(crc, &recoff, sizeof(recoff));
+	crc = crc32c_upd(crc, &tmp, sizeof(tmp));
+	crc = crc32c_upd(crc, page, page_size);
+	return crc ^ 0xFFFFFFFFu;
+}
 
 /*
  * Segments are addressed by (id, byte offset); how they are stored is the
@@ -718,7 +849,7 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  */
 static void
 page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t lsn, int seg, uint64_t off)
+				 uint64_t lsn, int seg, uint64_t off, uint32_t crc)
 {
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
@@ -741,6 +872,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
+	e->vers[e->nver].crc = crc;
 	e->nver++;
 }
 
@@ -1316,12 +1448,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		s->cur_off = 0;
 	}
 
+	memset(&hdr, 0, sizeof(hdr));	/* deterministic padding: the crc covers it */
 	hdr.magic = SEG_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
 	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
 	hdr.len = page_size;
+	hdr.gen = g_store_gen;
+	hdr.crc = seg_rec_crc(s->cur_seg, s->cur_off, &hdr, page);
 
 	/* write header then page bytes contiguously at the append cursor */
 	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
@@ -1330,8 +1465,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (ps_storage->seg_write(s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
-	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off);
+	/* index points at the page bytes (data_off), so reads skip the header; carry
+	 * the page CRC so the read path can verify the bytes it later fetches */
+	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off,
+					 ps_crc32c(page, page_size));
 	s->cur_off += reclen;
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
@@ -1374,6 +1511,10 @@ read_version(const PageVer *v, unsigned char *out)
 	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
 	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
+		return -1;
+	/* verify the bytes against the version's stored CRC: catches bit rot or a
+	 * misread that happened since the index was built */
+	if (ps_crc32c(out, page_size) != v->crc)
 		return -1;
 	return 0;
 }
@@ -1499,6 +1640,10 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 static void
 recover(void)
 {
+	unsigned char *pg = malloc(page_size);	/* scratch to read+verify each page */
+
+	if (!pg)
+		return;
 	/* Each shard owns a disjoint segment-id namespace, so scan and replay each
 	 * shard's segments and position its own append cursor.  page_add_version()
 	 * self-routes by key, so a record always lands on the shard that wrote it. */
@@ -1520,11 +1665,19 @@ recover(void)
 				SegRecHdr	hdr;
 
 				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
-					hdr.magic != SEG_MAGIC || hdr.len != page_size)
+					hdr.magic != SEG_MAGIC || hdr.len != page_size ||
+					hdr.gen != g_store_gen)
+					break;
+				/* read the page and verify the record CRC (position + header +
+				 * bytes); a record that matches SEG_MAGIC but fails the CRC or the
+				 * store generation is a torn write or stale device data, so it is
+				 * this segment's end-of-log, not live state to replay */
+				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0 ||
+					seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
 					break;
 
 				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
-								 off + sizeof(hdr));
+								 off + sizeof(hdr), ps_crc32c(pg, page_size));
 				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 				off += sizeof(hdr) + hdr.len;
 			}
@@ -1545,6 +1698,7 @@ recover(void)
 					"%d (off %llu)\n", s->index, s->cur_seg,
 					(unsigned long long) s->cur_off);
 	}
+	free(pg);
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -1900,10 +2054,12 @@ validate_store_nshards(const char *store_dir)
 int
 ps_core_open(const char *store_dir)
 {
+	crc32c_init();				/* before recover() and any worker thread */
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
+	load_store_gen(store_dir);	/* generation stamped into every segment record */
 	if (validate_store_nshards(store_dir) != 0)
 		return -1;
 

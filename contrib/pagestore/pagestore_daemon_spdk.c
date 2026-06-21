@@ -56,6 +56,7 @@ typedef struct BlkCtx
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint32_t	crc;			/* expected page CRC32C (from the version index) */
 	int			cacheable;		/* 0 if the version's lsn is ambiguous */
 	unsigned char *dst;
 } BlkCtx;
@@ -165,6 +166,15 @@ read_done(void *arg, int ok)
 	BlkCtx	   *bc = arg;
 	ReqState   *rs = bc->rs;
 
+	/* verify the delivered page against the version's CRC: device bit rot or a
+	 * misread must not be served as valid or cached.  Zero-fill and fail the
+	 * request rather than hand the client corrupt bytes. */
+	if (ok && ps_crc32c(bc->dst, page_size) != bc->crc)
+	{
+		memset(bc->dst, 0, page_size);
+		rs->ch->status = PS_STATUS_ERROR;
+		ok = 0;
+	}
 	if (ok && bc->cacheable)	/* the engine delivered the page into bc->dst */
 		ps_pgcache_insert(ps_core_pgcache_for(&bc->key), bc->tl, &bc->key,
 						  bc->block, bc->lsn, bc->dst);
@@ -269,6 +279,7 @@ begin(uint32_t i, PsChannel *ch)
 					bc->key = ch->key;
 					bc->block = blk;
 					bc->lsn = v->lsn;
+					bc->crc = v->crc;
 					bc->cacheable = !ambig;
 					bc->dst = dst;
 					rs->pending++;
@@ -319,6 +330,7 @@ begin(uint32_t i, PsChannel *ch)
 				bc->key = ch->key;
 				bc->block = ch->blocknum;
 				bc->lsn = v->lsn;
+				bc->crc = v->crc;
 				bc->cacheable = !ambig;
 				bc->dst = ch->data;
 				ps_spdk_read_async(v->seg, v->off, ch->data, page_size,
