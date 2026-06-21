@@ -137,21 +137,65 @@ a length-prefixed binary protocol on a pipe pair:
 | `APPLY` | record LSN, raw WAL record bytes | decode + `rm_redo` the record onto the held page |
 | `GET` | — | return the current page bytes (the as-of result) |
 
-Buffer redirection is the only core change in the loop: under an `am_walredo`
-flag, `XLogReadBufferExtended` returns the held buffer for the target tag and
-`BLK_NOTFOUND` otherwise (a wal-redo-specific tiny smgr, or a guarded branch in
-the read path — to be decided in the patch; the smgr route keeps core untouched).
+Buffer redirection (under an `am_walredo` flag):
+
+- **Target block** → the held buffer, seeded to the base image with its page LSN
+  set to the base record's *end* LSN (Driver step 1) so the
+  `BLK_DONE`/`BLK_NEEDS_REDO` gating is exact.
+- **Non-target blocks a record also registers** → a *scratch* buffer, **not**
+  `BLK_NOTFOUND`.  Some multi-block handlers init-then-dereference
+  unconditionally — e.g. `btree_xlog_split()` does `XLogInitBufferForRedo(record,
+  1)` for the right sibling and writes it before touching the original page — so
+  returning not-found would leave them operating on an invalid buffer and crash.
+  Every registered block therefore gets a usable buffer; only the target's
+  contents are returned by `GET`, the scratch buffers are discarded.
+- **Side effects beyond the buffer read must also be stubbed.** Redo handlers
+  reach auxiliary storage outside `XLogReadBufferExtended`: heap redo calls
+  `visibilitymap_pin`/`visibilitymap_clear` and `XLogRecordPageWithFreeSpace`
+  when VM/FSM bits change.  Under `am_walredo` these must be no-ops (or serve
+  scratch buffers) so single-page redo never reads or dirties real VM/FSM
+  storage.  The patch enumerates every such call reachable from `rm_redo` and
+  guards it — this is the bulk of the "small core mode" work (Neon's wal-redo
+  does the same).
+
+Mechanism (wal-redo-specific tiny smgr vs guarded branches in the read path) is a
+patch detail; the smgr route keeps core least-touched, but the VM/FSM guards are
+needed either way.
 
 ### Driver side (normal backend, contrib/pagestore)
 
 `pagestore_redo_page_asof(rel, fork, block, lsn) -> bytea`:
 
-1. `base, base_lsn` = 3c-3 (`pagestore_redo_page`): newest FPI at/below lsn — or a
-   zero page if the first relevant record has `BKPBLOCK_WILL_INIT`.
-2. `deltas` = `walidx_get(key, block, lsn)` restricted to `(base_lsn, lsn]`,
-   ascending (the same half-open range as `ps_read_plan_build`).
-3. open (or reuse a pooled) wal-redo process; `BEGIN(target)`; `PUSHBASE(base)`;
-   for each delta read its bytes with the local `XLogReader` and `APPLY`; `GET`.
+0. **Truncation/drop check first.** `walidx_get` only knows records that register
+   *this* block, so it misses page-removing records that carry just a relation
+   locator — `XLOG_SMGR_TRUNCATE` (new block count), relation drop.  Before
+   replaying anything, consult fork-size / truncation / drop metadata as-of `lsn`:
+   if the relation was truncated below `block` (or dropped) after the base, the
+   page is gone — return "no page", never a stale replay.  (This requires the
+   store to track per-fork size / truncation LSNs; called out as a dependency.)
+1. `base, base_end_lsn` = 3c-3 (`pagestore_redo_page`, extended): newest FPI
+   at/below `lsn`, **and the end LSN of the record that carried it** — or a zero
+   page if the first relevant record has `BKPBLOCK_WILL_INIT`.  The end LSN
+   matters: normal redo sets a restored page's LSN to `record->EndRecPtr`, and the
+   held page must be seeded with that LSN (not bytes alone) or the gating treats
+   already-covered records as needing redo / mis-orders the chain.
+2. `deltas` = the WAL records for this page in `[base_end_lsn, lsn)` from the
+   per-page index, ascending.  The index is keyed by record **start** LSN while
+   page LSNs / redo gating use record **end** LSN; this is the same half-open,
+   start-LSN-keyed window `ps_read_plan_build` builds (`[base_lsn, read_lsn)`),
+   *not* `(base_lsn, lsn]` — a closed upper bound would replay a record starting
+   exactly at `lsn` and overshoot.
+   - **Chain completeness is mandatory.** A single `walidx_get` response is capped
+     by the IPC payload (`PS_IO_UNIT / sizeof(uint64)`) with no continuation, so a
+     hot page with more records than fit would be silently shortened and
+     materialize an *older* page while reporting success.  The lookup must paginate
+     / range-seek (cursor by start LSN) or return an explicit overflow error;
+     truncation is never silently accepted.
+3. open (or reuse a pooled) wal-redo process; `BEGIN(target)`; `PUSHBASE(base,
+   base_end_lsn)`; for each delta **read the raw record bytes from the store's WAL
+   service** (`PS_OP_WAL_READ`, the same source `pagestore_walrestore` uses) — not
+   a local `XLogReader`, because the target stateless/WAL-only compute has an empty
+   local `pg_wal`; the bytes live in the store.  `APPLY` each; `GET`.
 4. return the page as-of lsn.
 
 This is the function both the **background materializer** and the **on-demand
@@ -164,14 +208,21 @@ cold read drives the same function for just that page.
 
 - **WILL_INIT first record** — no base needed; seed a zero page, the record
   initializes it.
-- **Multi-block record** — only the target is held; other blocks return
-  `BLK_NOTFOUND` and are skipped.
+- **Multi-block record** — only the target is materialized, but every registered
+  block gets a usable (scratch) buffer so init-then-deref handlers (btree split)
+  don't crash; non-target results are discarded (see Buffer redirection).
 - **A delta carries a newer FPI** — handled inside redo (`BLK_RESTORED`); start
   effectively re-bases there.
+- **Page removed after the base** — `XLOG_SMGR_TRUNCATE` / drop below `block`
+  means "no page", not a stale replay; caught by Driver step 0, which needs
+  per-fork size / truncation metadata in the store.
+- **WAL-index chain overflow** — more indexed records than one IPC response holds
+  must paginate or error, never silently truncate to an older page (Driver step
+  2).
 - **target_lsn must be a record boundary** (a page LSN) — same constraint as the
   read plan's half-open delta range.
-- **Unretrievable / short WAL** — fail the materialization (NULL/error); the page
-  stays un-materialized rather than wrong.
+- **Unretrievable / short WAL** (from the store WAL service) — fail the
+  materialization (NULL/error); the page stays un-materialized rather than wrong.
 - **wal-redo process crash/timeout** — driver sees pipe EOF, retries on a fresh
   process; state is per-page so restart is safe.
 
@@ -182,7 +233,17 @@ cold read drives the same function for just that page.
   `lsn`, for several LSNs across multiple updates.
 - WILL_INIT: a freshly-created page materializes from zero.
 - Multi-block: a btree split / heap update — target page correct, neighbor
-  untouched.
+  untouched (and the split's right-sibling init does not crash the helper).
+- VM/FSM: a heap change that sets all-visible / updates free space materializes
+  the heap page without touching real VM/FSM storage.
+- Truncation: truncate a relation below a block after its base image, then
+  `redo_page_asof` for that block returns "no page", not the stale pre-truncation
+  page.
+- Hot page: more indexed records for one page than fit in a single index response
+  still replays the full chain (pagination), or fails loudly — never silently
+  returns an older page.
+- WAL bytes come from the store: run the materializer on a compute with empty
+  local `pg_wal` (WAL-only/stateless) and confirm it still reconstructs the page.
 - Integration: extend `redo_worker_demo.sh` / `wal_only_redo_demo.sh` to assert
   per-page materialization matches full-recovery materialization.
 
