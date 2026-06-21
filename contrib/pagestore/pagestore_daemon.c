@@ -18,6 +18,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -26,11 +27,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "pagestore_layer_store.h"
 #include "pagestore_pgcache.h"
 
 /* Set by the signal handler and read by every worker thread, so accesses are
@@ -197,6 +200,44 @@ main(int argc, char **argv)
 			cache_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
 			ps_nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--object-dir") == 0 && i + 1 < argc)
+		{
+			/* enable the object tier: maintenance uploads sealed layers here */
+			const char *od = argv[++i];
+
+			if (ps_layer_store_set_object_dir(od) != 0)
+			{
+				fprintf(stderr, "--object-dir path too long\n");
+				return 2;
+			}
+			/* Fail fast on an unusable directory rather than start, acknowledge
+			 * writes, and have every background upload silently fail (leaving the
+			 * requested remote durability absent).  Create it if missing, then
+			 * require it to be an actual writable directory -- an existing regular
+			 * file would pass mkdir(EEXIST)+access but make every obj_* create
+			 * fail with ENOTDIR. */
+			struct stat odst;
+
+			if (mkdir(od, 0700) != 0 && errno != EEXIST)
+			{
+				fprintf(stderr, "--object-dir %s: %s\n", od, strerror(errno));
+				return 2;
+			}
+			if (stat(od, &odst) != 0 || !S_ISDIR(odst.st_mode))
+			{
+				fprintf(stderr, "--object-dir %s is not a directory\n", od);
+				return 2;
+			}
+			/* R_OK too: uploads fsync the directory via an O_RDONLY open, which
+			 * fails on a write-only (e.g. mode 0300) directory */
+			if (access(od, R_OK | W_OK | X_OK) != 0)
+			{
+				fprintf(stderr, "--object-dir %s not accessible: %s\n",
+						od, strerror(errno));
+				return 2;
+			}
+			ps_object_tier = 1;
+		}
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];

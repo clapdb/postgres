@@ -56,6 +56,12 @@ int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
  */
 int			use_layers = 1;
 
+/* Object tier (LSM phase 4): when set, off-path maintenance uploads sealed
+ * layers to the configured object store and marks them remote_durable.  The
+ * frontend sets it (with ps_layer_store_set_object_dir) when --object-dir is
+ * given; 0 keeps the daemon local-only. */
+int			ps_object_tier = 0;
+
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
 
@@ -108,6 +114,7 @@ typedef struct Shard
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
 	time_t		maint_cooldown;	/* skip compaction attempts until this wall time */
+	time_t		upload_cooldown;	/* skip object-tier uploads until this wall time */
 	TimelineMeta timelines[MAX_TIMELINES];	/* replicated timeline tree */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
@@ -272,10 +279,14 @@ static int
 record_layer(void *ctx, const PsLayerDesc *desc)
 {
 	Shard	   *s = ctx;
+	int			rc;
 
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
-	return ps_manifest_add_layer(&s->manifest, desc);
+	rc = ps_manifest_add_layer(&s->manifest, desc);
+	if (rc == 0)
+		s->upload_cooldown = 0;	/* a fresh layer to upload ends any idle backoff */
+	return rc;
 }
 
 /* ===================== compaction & GC (LSM phase 3) =================== */
@@ -324,6 +335,50 @@ count_image_layers(Shard *s, uint32_t timeline)
 }
 
 /*
+ * Finish removing a 'deleting' layer: drop its local file, then record the
+ * manifest removal -- only once the file is gone, so a failed unlink leaves the
+ * layer 'deleting' for the next gc_resume rather than orphaning a file whose
+ * manifest entry is dropped.
+ *
+ * Exception: a remote-durable layer compacted away keeps both its object copy AND
+ * its manifest entry, as a tombstone (still marked 'deleting', so reads skip it).
+ * Its merged replacement is not yet remote-durable, so removing it now would drop
+ * the only recorded remote protection for that key range -- and dropping just the
+ * entry would leave the object undiscoverable.  A phase-6 remote-aware GC removes
+ * the tombstone (entry + object) once the replacement range is durably remote.
+ * The stale local location on the tombstone is harmless (deleting layers are never
+ * read); its local file is still reclaimed here.
+ *
+ * The decision keys off the persisted remote_durable flag, NOT ps_object_tier:
+ * a store with uploaded layers reopened without --object-dir must still keep the
+ * tombstone, or the object becomes undiscoverable if the tier is re-enabled later.
+ */
+static void
+gc_remove_layer(Shard *s, const PsLayerDesc *d)
+{
+	if (ps_layer_store->delete_local_layer(d) != 0)
+		return;
+	if (d->remote_durable)
+		return;					/* keep the entry as a remote tombstone */
+	/* Not remote-durable, but an upload may have copied the object before the
+	 * daemon crashed without persisting SET_REMOTE_DURABLE.  With the tier
+	 * configured, delete that orphan before dropping the entry (keep the entry if
+	 * the delete fails, so a later gc_resume retries).  With the tier disabled we
+	 * cannot check or delete it, so if this store ever used the object tier keep
+	 * the entry until a tier-enabled run can prove/clean it -- dropping it now
+	 * would leak an object no later run could discover. */
+	if (ps_object_tier)
+	{
+		if (ps_layer_store->layer_exists_remote(d) == 1 &&
+			ps_layer_store->delete_remote_layer(d) != 0)
+			return;
+	}
+	else if (ps_layer_store_object_used())
+		return;
+	ps_manifest_remove_layer(&s->manifest, d->layer_id);
+}
+
+/*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
  * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
  * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
@@ -348,12 +403,7 @@ gc_resume(Shard *s)
 		if (map->layers[i].deleting)
 			dead[m++] = map->layers[i];
 	for (uint32_t k = 0; k < m; k++)
-	{
-		/* record removal only once the file is gone; a failed unlink keeps the
-		 * layer 'deleting' for the next gc_resume rather than orphaning it */
-		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
-			ps_manifest_remove_layer(&s->manifest, dead[k].layer_id);
-	}
+		gc_remove_layer(s, &dead[k]);
 	free(dead);
 }
 
@@ -523,11 +573,10 @@ compact_timeline(Shard *s, uint32_t timeline)
 		 * finishes the removal on the next start. */
 		if (ps_manifest_mark_delete(&s->manifest, old[k].layer_id) != 0)
 			continue;
-		/* record the removal only after the file is actually gone; if unlink
-		 * fails, leave the layer 'deleting' so gc_resume() retries it instead of
-		 * orphaning the file with a dropped manifest entry */
-		if (ps_layer_store->delete_local_layer(&old[k]) == 0)
-			ps_manifest_remove_layer(&s->manifest, old[k].layer_id);
+		/* drop local file (+ object copy if uploaded), then the manifest entry;
+		 * a failure leaves the layer 'deleting' so gc_resume() retries it instead
+		 * of orphaning a file/object with a dropped manifest entry */
+		gc_remove_layer(s, &old[k]);
 	}
 	rc = 0;
 
@@ -1640,11 +1689,55 @@ ps_core_close(void)
 }
 
 /*
+ * Upload one sealed layer that isn't yet remote-durable to the object tier and
+ * mark it durable (LSM phase 4).  Runs in maintenance (only when the worker found
+ * no pending request), one layer per call, between channel-poll cycles -- the
+ * same model as compact_timeline().  For the local-directory object store the
+ * copy is fast; with a slow remote provider a single layer's upload would still
+ * block this shard's polling for its duration, so when a real remote backend
+ * lands this moves to a background uploader.  Restart re-attempts any still-not-
+ * durable layer and upload is idempotent (keyed by layer id).  Returns 1 if it
+ * uploaded one, 0 if none were pending, -1 if a layer was pending but failed.
+ */
+static int
+upload_one(Shard *s)
+{
+	PsLayerMap *map = &s->manifest.map;
+
+	for (uint32_t i = 0; i < map->nlayers; i++)
+	{
+		PsLayerDesc *d = &map->layers[i];
+
+		if (d->deleting)
+			continue;
+		/* Skip only layers whose object is actually present in the configured
+		 * tier.  The persisted remote_durable flag alone is not proof: a store
+		 * reopened against a different or freshly-recreated --object-dir replays
+		 * the flag but the object is absent in this run's tier, so re-upload it
+		 * rather than leave remote durability silently missing. */
+		if (d->remote_durable && ps_layer_store->layer_exists_remote(d) == 1)
+			continue;
+		/* upload, then confirm it is really there before marking durable, so a
+		 * local copy is never treated as evictable on an unverified upload.  A
+		 * failure is reported distinctly from "nothing pending" so the caller can
+		 * back off instead of hot-looping on an unwritable/unavailable store. */
+		if (ps_layer_store->upload_layer(d) != 0 ||
+			ps_layer_store->layer_exists_remote(d) != 1)
+			return -1;			/* a layer was pending but the upload failed */
+		if (ps_manifest_set_remote_durable(&s->manifest, d->layer_id,
+										   d->lsn_end) != 0)
+			return -1;
+		return 1;				/* uploaded one */
+	}
+	return 0;					/* nothing pending */
+}
+
+/*
  * One unit of off-the-write-path background maintenance for a single shard:
- * compact one of its timelines whose image-layer count exceeds the (low-water)
- * threshold.  Per shard so each worker thread (sharding step 4c) runs its own
- * maintenance with no shared state.  Returns 1 if it compacted (caller should not
- * sleep), 0 if nothing was due.
+ * compact one of its timelines past the (low-water) threshold, else upload one
+ * not-yet-remote-durable layer to the object tier.  Per shard so each worker
+ * thread (sharding step 4c) runs its own maintenance with no shared state.
+ * Returns 1 if it did work (caller should not sleep), 0 if nothing was due.
  */
 static int
 maintain_shard(Shard *s)
@@ -1653,35 +1746,54 @@ maintain_shard(Shard *s)
 
 	if (!use_layers)
 		return 0;
-	/* If a recent attempt made no progress (a corrupt layer, or repeated ENOSPC
-	 * while reading/writing the merge), don't re-read the same failing layers on
-	 * every idle tick -- cool down until either new layer state appears or the
-	 * window passes. */
-	if (s->maint_cooldown != 0 && time(NULL) < s->maint_cooldown)
-		return 0;
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if ((tl == 0 || tl_defined(s, tl)) &&
-			count_image_layers(s, tl) > (uint32_t) compact_layers)
-		{
-			uint32_t	before = count_image_layers(s, tl);
-
-			/* Report progress (so the caller skips its idle sleep) only if the
-			 * compaction actually reduced the layer count.  A timeline that can't
-			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
-			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
-			 * must not keep the daemon spinning; try the next one. */
-			attempted = 1;
-			if (compact_timeline(s, tl) == 0 &&
-				count_image_layers(s, tl) < before)
+	/*
+	 * Compaction backs off on its own cooldown after a no-progress attempt (a
+	 * corrupt layer, or repeated ENOSPC during the merge), so it doesn't re-read
+	 * the same failing layers every idle tick.
+	 */
+	if (s->maint_cooldown == 0 || time(NULL) >= s->maint_cooldown)
+	{
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+			if ((tl == 0 || tl_defined(s, tl)) &&
+				count_image_layers(s, tl) > (uint32_t) compact_layers)
 			{
-				s->maint_cooldown = 0;	/* progress: clear any backoff */
-				return 1;
+				uint32_t	before = count_image_layers(s, tl);
+
+				/* progress only if the layer count actually dropped; a timeline
+				 * that can't make progress must not keep the daemon spinning */
+				attempted = 1;
+				if (compact_timeline(s, tl) == 0 &&
+					count_image_layers(s, tl) < before)
+				{
+					s->maint_cooldown = 0;	/* progress: clear any backoff */
+					return 1;
+				}
 			}
+		if (attempted)
+			s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+	}
+	/*
+	 * Object-tier upload backs off on a SEPARATE cooldown: a temporarily
+	 * unwritable/full object store must not suppress local compaction (which still
+	 * reduces read amplification), and a failed upload must not become a 20us retry
+	 * storm.  Compaction above already runs regardless of this cooldown.
+	 */
+	if (ps_object_tier &&
+		(s->upload_cooldown == 0 || time(NULL) >= s->upload_cooldown))
+	{
+		int			u = upload_one(s);
+
+		if (u > 0)
+		{
+			s->upload_cooldown = 0;	/* drained one; retry next tick for the rest */
+			return 1;
 		}
-	/* Over-threshold timeline(s) exist but none could be compacted: back off so an
-	 * otherwise-idle shard doesn't re-attempt the same failing merge every 20us. */
-	if (attempted)
-		s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+		/* u == 0 (nothing pending) or u < 0 (failed): back off either way, so a
+		 * quiescent daemon doesn't re-scan the manifest -- stat()-ing every durable
+		 * layer -- on every 20us idle tick.  A newly sealed layer waits at most one
+		 * cooldown before its upload, which is fine off the write path. */
+		s->upload_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+	}
 	return 0;
 }
 
