@@ -146,13 +146,10 @@ load_store_gen(const char *store_dir)
 		close(fd);
 	}
 	if (g == 0)
-	{
-		uint64_t	h = 1469598103934665603ULL;	/* FNV-1a(path) fallback */
-
-		for (const char *p = store_dir; *p; p++)
-			h = (h ^ (unsigned char) *p) * 1099511628211ULL;
-		g = h ? h : 1;
-	}
+		return -1;				/* no entropy: refuse rather than derive a
+								 * predictable generation -- a path hash would repeat
+								 * for a store recreated at the same path on a reused
+								 * raw device, defeating the stale-bytes guard */
 
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
@@ -183,6 +180,8 @@ load_store_gen(const char *store_dir)
 	{
 		if (fd >= 0)
 			close(fd);
+		unlink(path);			/* dir entry not durable: don't let a retry adopt
+								 * this file as "already durable" */
 		return -1;
 	}
 	close(fd);
@@ -1474,14 +1473,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.gen = g_store_gen;
 	hdr.crc = seg_rec_crc(s->cur_seg, s->cur_off, &hdr, page);
 
-	/* Write the page first, then the header as the commit point: recover() trusts
-	 * a record only once it sees a fully-framed header, so a torn trailing append
-	 * (page written, header not yet) reads back as no-record / end-of-log rather
-	 * than as a framed-but-corrupt record that would fail recovery. */
+	/* write header then page bytes contiguously at the append cursor.  (Ordering
+	 * page-before-header would not make a torn tail unambiguous without an fsync
+	 * barrier between the two writes, which we don't pay per append; recover()
+	 * instead treats any unverifiable record as end-of-log -- see there.) */
+	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
+		return -1;
 	data_off = s->cur_off + sizeof(hdr);
 	if (ps_storage->seg_write(s->cur_seg, data_off, page, page_size) != 0)
-		return -1;
-	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header; carry
@@ -1662,14 +1661,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * (page_add_version + fork_grow) for every record reconstructs both indexes and
  * leaves the append cursor positioned just past the last valid record.
  *
- * A torn trailing append (header not yet written -- it is written last) reads as
- * no record and ends the scan; a fully-framed record whose page fails its CRC is
- * corruption of persisted data and aborts recovery (returns -1) rather than
- * silently dropping every later record.  Returns 0 on success, -1 on corruption
- * or allocation failure, so ps_core_open() can refuse to open over a real store.
+ * The scan stops at the first record that fails its magic/gen/len/CRC check
+ * (end-of-log).  Because appends are not synced per record, that record may be an
+ * unsynced torn tail (expected after a crash) or corruption of already-synced
+ * data; without a durable per-shard sync watermark the two are indistinguishable,
+ * so recovery truncates there rather than refusing to open over a normal tail.
+ * Returns 0 on success, -1 only on allocation failure (so ps_core_open() does not
+ * open with an empty index over a real store).
  *
  * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.
+ * effects are not reproduced on restart.  Telling synced-data corruption from an
+ * unsynced tail (to fail loudly on the former) is deferred to the sync-watermark
+ * work noted in SPDK_NOTES.
  */
 static int
 recover(void)
@@ -1698,27 +1701,29 @@ recover(void)
 			{
 				SegRecHdr	hdr;
 
-				/* No valid record framed here: a torn trailing append (the header
-				 * is written last, after the page -- see append_page), a never-
-				 * written tail, or stale device bytes from before this store.  This
-				 * is the end of the log; stop. */
+				/* Stop at the first record that does not verify -- a torn/unsynced
+				 * trailing append, a never-written tail, or stale device bytes from
+				 * before this store.  Writes are not synced per append, so without a
+				 * durable end-of-log watermark we cannot tell an unsynced torn tail
+				 * from corruption of an already-synced record; truncating here is the
+				 * safe choice (it never refuses to open over a normal post-crash
+				 * tail).  The CRC/gen check still detects the bad bytes and stops the
+				 * replay at them.  Distinguishing the two (fail on synced-data
+				 * corruption, truncate only the unsynced tail) needs a persisted
+				 * per-shard sync watermark -- see SPDK_NOTES "Verification & recovery".
+				 * A read error (vs a mismatch) is flagged before stopping. */
 				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
 					hdr.magic != SEG_MAGIC || hdr.len != page_size ||
 					hdr.gen != g_store_gen)
 					break;
-				/* The header is fully framed as ours, so the page was written (it
-				 * precedes the header).  A read error or CRC mismatch here is thus
-				 * corruption of an already-persisted record, NOT a clean tail --
-				 * fail recovery rather than silently truncate every later record by
-				 * treating this as end-of-log. */
-				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0 ||
-					seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
+				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0)
+					break;
+				if (seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
 				{
-					fprintf(stderr, "pagestore: shard %u segment %d off %llu: "
-							"corrupt persisted record (crc); refusing to recover\n",
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: record "
+							"failed CRC; treating as end of log\n",
 							s->index, id, (unsigned long long) off);
-					free(pg);
-					return -1;
+					break;
 				}
 
 				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,

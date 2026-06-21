@@ -370,3 +370,23 @@ Gaps (worth closing before this path is trusted for durability):
   namespace, so the stale-magic risk above is real on a reused disk.  Options: a
   per-store generation/uuid stamped into each `SegRecHdr` (mismatch == end-of-log),
   or trimming/zeroing the device region a store owns at first open.
+
+Status (implemented):
+- `SegRecHdr` now carries a CRC32C (over position + header + page) and a per-store
+  generation persisted durably in `<store>/store_gen` (random; open fails if it
+  can't be made durable or if there is no entropy -- a predictable generation would
+  not guard a reused raw device).  `recover()` and the read paths verify both;
+  reads fail (not zero-fill) on a CRC mismatch.
+
+Remaining gap -- sync watermark:
+- Appends are not synced per record, so a record that fails to verify at the tail
+  may be an *unsynced torn tail* (expected after a crash) or *corruption of an
+  already-synced record*.  We cannot tell them apart without a durable per-shard
+  **sync watermark** (the (segment, offset) that `IMMEDSYNC`/close last made
+  durable).  Until that exists, `recover()` truncates at the first unverifiable
+  record: it never refuses to open over a normal post-crash tail, but a corruption
+  inside already-synced data truncates the later records rather than failing loudly.
+  The fix is to persist the watermark on sync and, during recovery, treat a
+  verification failure *below* it as corruption (fail open) and *at/above* it as the
+  unsynced tail (truncate).  For SPDK the superblock's per-shard segment count is
+  already a coarse (segment-granular) version of this.
