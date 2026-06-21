@@ -66,15 +66,26 @@ typedef struct PsSpdkRd
 	void	   *arg;
 } PsSpdkRd;
 
-#define SPDK_SUPER_MAGIC	0x53504b53	/* "SPKS" */
+#define SPDK_SUPER_MAGIC	0x53504b54	/* "SPKT" (per-shard segment counts) */
+#define SPDK_SUPER_MAGIC_V1 0x53504b53	/* "SPKS" (legacy single segment count) */
 
 typedef struct SpdkSuper
 {
 	uint32_t	magic;
 	uint32_t	sector_size;
 	uint64_t	segment_size;
-	uint32_t	num_segments;
+	uint32_t	nshards;		/* the store's shard count (must match to reuse) */
+	uint32_t	num_segments[PS_MAX_SHARDS];	/* per-shard local segment count */
 } SpdkSuper;
+
+/* legacy on-disk superblock (pre-step-5b): one global segment count, no nshards */
+typedef struct SpdkSuperV1
+{
+	uint32_t	magic;
+	uint32_t	sector_size;
+	uint64_t	segment_size;
+	uint32_t	num_segments;
+} SpdkSuperV1;
 
 /*
  * Per-shard I/O state (sharding step 5).  Each shard's worker thread owns its own
@@ -174,15 +185,23 @@ super_path(char *buf, size_t buflen)
 	snprintf(buf, buflen, "%s/spdk_super", g_store);
 }
 
+/* Write the superblock from an explicit per-shard segment-count array, so the
+ * IMMEDSYNC coordinator can persist a consistent post-flush snapshot rather than
+ * the live counters that concurrent shard writers keep advancing. */
 static void
-super_write(void)
+super_write_counts(const uint32_t *counts)
 {
 	char		path[2300];
-	/* single shard for now (step 5a); per-shard counts arrive with multi-shard
-	 * SPDK in step 5b */
-	SpdkSuper	s = {SPDK_SUPER_MAGIC, g_sector, g_segsize,
-		g_spdk[0].num_segments};
+	SpdkSuper	s;
 	FILE	   *f;
+
+	memset(&s, 0, sizeof(s));
+	s.magic = SPDK_SUPER_MAGIC;
+	s.sector_size = g_sector;
+	s.segment_size = g_segsize;
+	s.nshards = g_nshards;
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		s.num_segments[sh] = counts[sh];
 
 	super_path(path, sizeof(path));
 	f = fopen(path, "wb");
@@ -192,22 +211,78 @@ super_write(void)
 	fclose(f);
 }
 
+/* Superblock from the live counters; safe at close (main thread, workers joined). */
 static void
+super_write(void)
+{
+	uint32_t	counts[PS_MAX_SHARDS];
+
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		counts[sh] = g_spdk[sh].num_segments;
+	super_write_counts(counts);
+}
+
+/*
+ * Load the persisted per-shard segment counts.  Returns 0 on success (fresh
+ * store, current format, or a migrated legacy single-shard store) and -1 on an
+ * incompatible superblock, so the caller fails the open rather than silently
+ * treating existing on-device data as fresh and overwriting it.
+ */
+static int
 super_read(void)
 {
 	char		path[2300];
-	SpdkSuper	s;
+	uint32_t	magic;
 	FILE	   *f;
 
-	g_spdk[0].num_segments = 0;	/* default: fresh store */
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		g_spdk[sh].num_segments = 0;	/* default: fresh store */
 	super_path(path, sizeof(path));
 	f = fopen(path, "rb");
 	if (!f)
-		return;
-	if (fread(&s, sizeof(s), 1, f) == 1 && s.magic == SPDK_SUPER_MAGIC &&
-		s.sector_size == g_sector && s.segment_size == g_segsize)
-		g_spdk[0].num_segments = s.num_segments;
+		return 0;				/* no super -> fresh store */
+	if (fread(&magic, sizeof(magic), 1, f) != 1)
+	{
+		fclose(f);
+		return -1;				/* unreadable/corrupt */
+	}
+	rewind(f);
+
+	if (magic == SPDK_SUPER_MAGIC)
+	{
+		SpdkSuper	s;
+
+		/* reuse the on-device data only if geometry AND shard count match -- a
+		 * different nshards reinterprets the interleaved seg-id space */
+		if (fread(&s, sizeof(s), 1, f) == 1 && s.sector_size == g_sector &&
+			s.segment_size == g_segsize && s.nshards == g_nshards)
+		{
+			for (uint32_t sh = 0; sh < g_nshards; sh++)
+				g_spdk[sh].num_segments = s.num_segments[sh];
+			fclose(f);
+			return 0;
+		}
+		fclose(f);
+		return -1;				/* current format but mismatched geometry/nshards */
+	}
+	if (magic == SPDK_SUPER_MAGIC_V1)
+	{
+		SpdkSuperV1 v1;
+
+		/* legacy single-count store is only meaningful at nshards == 1 (seg ids
+		 * were 0,1,2,...); migrate it, else refuse rather than lose the data */
+		if (g_nshards == 1 && fread(&v1, sizeof(v1), 1, f) == 1 &&
+			v1.sector_size == g_sector && v1.segment_size == g_segsize)
+		{
+			g_spdk[0].num_segments = v1.num_segments;
+			fclose(f);
+			return 0;
+		}
+		fclose(f);
+		return -1;
+	}
 	fclose(f);
+	return -1;					/* unknown magic */
 }
 
 /* --- current-segment buffer management ----------------------------------- */
@@ -350,7 +425,12 @@ spdk_open(const char *path, uint64_t segment_size)
 		S->nfree = PS_SPDK_POOL;
 	}
 
-	super_read();				/* segment count: fresh dir -> 0 */
+	if (super_read() != 0)		/* segment counts: fresh dir -> 0, else load/migrate */
+	{
+		fprintf(stderr, "storage_spdk: incompatible spdk_super "
+				"(format/geometry/nshards mismatch); refusing to open\n");
+		return -1;
+	}
 
 	fprintf(stderr, "storage_spdk: %s ns1 sector=%u segsize=%llu segments=%u "
 			"nshards=%u\n", pci, g_sector, (unsigned long long) g_segsize,
@@ -553,6 +633,35 @@ ps_spdk_poll(uint32_t shard)
 	if (shard >= g_nshards)
 		return 0;
 	return spdk_nvme_qpair_process_completions(g_spdk[shard].qpair, 0);
+}
+
+/*
+ * Flush one shard's current-segment buffer to the device.  Must be called from
+ * that shard's own worker thread (it drives the shard's qpair), which is how the
+ * SPDK daemon coordinates a cross-shard IMMEDSYNC: each shard flushes itself.
+ * On return *out_count (if non-NULL) holds that shard's segment count AS OF the
+ * flush, so the coordinator can persist a count covering exactly the flushed data
+ * even if the shard appends more afterwards.
+ */
+int
+ps_spdk_flush(uint32_t shard, uint32_t *out_count)
+{
+	int			rc = 0;
+
+	if (shard < g_nshards)
+		rc = flush_curbuf(&g_spdk[shard]);
+	if (out_count)
+		*out_count = (shard < g_nshards) ? g_spdk[shard].num_segments : 0;
+	return rc;
+}
+
+/* Persist the superblock from a caller-supplied per-shard count snapshot (taken
+ * at flush time by ps_spdk_flush), so the persisted counts cover exactly the
+ * flushed data and never a segment a concurrent writer added but did not flush. */
+void
+ps_spdk_super_write_counts(const uint32_t *counts)
+{
+	super_write_counts(counts);
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */

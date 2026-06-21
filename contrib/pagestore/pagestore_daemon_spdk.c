@@ -20,6 +20,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,7 +44,7 @@ static void
 on_signal(int sig)
 {
 	(void) sig;
-	stop_requested = 1;
+	__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);	/* seen by all workers */
 }
 
 /* per-block context for one async page read: lets the completion populate the
@@ -69,6 +70,92 @@ typedef struct ReqState
 } ReqState;
 
 static ReqState reqstate[PS_MAX_CHANNELS];
+
+/*
+ * Cross-shard IMMEDSYNC coordination.  A shard's curbuf/qpair may only be touched
+ * by its own worker, so a global durability barrier can't flush every shard from
+ * one thread.  Instead the worker that receives IMMEDSYNC flushes its own shard
+ * and sets g_flush_req[s] for every other shard; each worker flushes its own
+ * curbuf when it sees its flag set.  The whole barrier runs under g_barrier_mtx
+ * (below), so only one coordinator owns these per-shard slots at a time.
+ */
+static volatile int g_flush_req[PS_MAX_SHARDS];		/* 1 = flush requested */
+static volatile int g_flush_rc[PS_MAX_SHARDS];		/* 0 ok / -1 failed flush */
+static volatile uint32_t g_flush_snap[PS_MAX_SHARDS];	/* seg count at flush */
+
+/*
+ * Serializes the whole IMMEDSYNC barrier so two concurrent syncs can't share the
+ * per-shard flush slots above (one resetting another's result/snapshot mid-flight
+ * and turning a failed flush into a false success).  The worker TRYLOCKs this
+ * rather than blocking: a worker that can't start its own barrier returns to its
+ * loop and keeps servicing the active barrier's flush requests, which is what
+ * prevents a deadlock between a coordinator and a would-be coordinator.
+ */
+static pthread_mutex_t g_barrier_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Flush this shard's own buffer, recording the result + post-flush count where
+ * the barrier coordinator collects them. */
+static void
+flush_self(uint32_t shard)
+{
+	uint32_t	cnt = 0;
+	int			rc = ps_spdk_flush(shard, &cnt);
+
+	g_flush_snap[shard] = cnt;
+	g_flush_rc[shard] = rc;
+}
+
+/*
+ * Durability barrier for one IMMEDSYNC, run by the receiving worker for 'shard'
+ * while holding g_barrier_mtx (so it owns the flush slots exclusively).  Each
+ * shard can only flush its own qpair, so request every other shard to flush
+ * itself and wait.  The superblock is persisted from each shard's post-flush
+ * count snapshot, and ONLY when every shard flushed: a failed flush leaves a
+ * count covering data that never reached the device, which recover() must not
+ * trust.  Returns 0 if all shards flushed durably, -1 if any failed or shutdown
+ * aborted the wait.
+ */
+static int
+immedsync_barrier(uint32_t shard)
+{
+	uint32_t	counts[PS_MAX_SHARDS];
+	int			rc = 0;
+
+	flush_self(shard);			/* this worker's own shard */
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		if (s != shard)
+		{
+			g_flush_rc[s] = 0;
+			__atomic_store_n(&g_flush_req[s], 1, __ATOMIC_RELEASE);
+		}
+	for (;;)
+	{
+		int			pending = 0;
+
+		if (__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
+			return -1;			/* shutdown: abort rather than spin forever */
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			if (s != shard && __atomic_load_n(&g_flush_req[s], __ATOMIC_ACQUIRE))
+				pending = 1;
+		if (!pending)
+			break;
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	/* collect each shard's flush result + post-flush count snapshot */
+	for (uint32_t s = 0; s < ps_nshards; s++)
+	{
+		if (g_flush_rc[s] != 0)
+			rc = -1;
+		counts[s] = g_flush_snap[s];
+	}
+	if (rc == 0)				/* never advance the super past a failed flush */
+		ps_spdk_super_write_counts(counts);
+	return rc;
+}
 
 /* one page read finished: cache the page, and when the last of a request lands
  * publish the reply */
@@ -246,6 +333,96 @@ begin(uint32_t i, PsChannel *ch)
 	}
 }
 
+/* one per-shard worker thread (sharding step 5b): its own NVMe qpair + buffers */
+typedef struct Worker
+{
+	pthread_t	tid;
+	void	   *shm;
+	uint32_t	shard;			/* this worker's shard index */
+	uint32_t	first;			/* its channel pool: [first, first+count) */
+	uint32_t	count;
+} Worker;
+
+/*
+ * Async serve loop for one shard: scan only this shard's channel pool, begin each
+ * ready request (reads submit to this shard's qpair and stay 'active' until their
+ * completions publish DONE), and drive this shard's qpair completions.  Two
+ * workers never touch the same channel or the same qpair, so shards run the
+ * device concurrently with no shared mutable state.
+ */
+static void *
+spdk_worker_main(void *arg)
+{
+	Worker	   *w = arg;
+
+	while (!__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
+	{
+		int			work = 0;
+
+		for (uint32_t i = w->first; i < w->first + w->count; i++)
+		{
+			PsChannel  *ch = ps_channel(w->shm, i);
+			uint32_t	owner;
+
+			if (reqstate[i].active ||
+				ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+			/* single-owner guard (as the POSIX daemon): a keyed request always
+			 * belongs to this shard's pool; reject a misrouted one rather than
+			 * drive another shard's state/qpair from this thread.  PS_ANY_SHARD
+			 * ops (e.g. IMMEDSYNC) run anywhere. */
+			owner = ps_request_shard(ch);
+			if (ch->opcode == PS_OP_IMMEDSYNC)
+			{
+				/* global durability barrier: each shard flushes its own qpair
+				 * (begin()->spdk_sync would flush every shard from this one
+				 * thread, racing the other shards' single-owner qpairs).  Trylock
+				 * to serialize barriers; if another barrier holds it, leave this
+				 * request pending and retry next iteration -- staying in the loop so
+				 * we keep servicing that barrier's flush request below (blocking
+				 * here would deadlock it).  Report a failed/aborted barrier so the
+				 * client doesn't believe the data is durable. */
+				if (pthread_mutex_trylock(&g_barrier_mtx) == 0)
+				{
+					int			brc = immedsync_barrier(w->shard);
+
+					pthread_mutex_unlock(&g_barrier_mtx);
+					ch->status = brc == 0 ? PS_STATUS_OK : PS_STATUS_ERROR;
+					ps_store_release(&ch->state, PS_STATE_DONE);
+				}
+			}
+			else if (owner != PS_ANY_SHARD && owner != w->shard)
+			{
+				ch->status = PS_STATUS_ERROR;
+				ps_store_release(&ch->state, PS_STATE_DONE);
+			}
+			else
+				begin(i, ch);	/* publishes DONE (sync) or via read_done (async) */
+			work = 1;
+		}
+
+		/* flush our own shard if another shard's IMMEDSYNC barrier requested it
+		 * (records the result + post-flush count the coordinator collects) */
+		if (__atomic_load_n(&g_flush_req[w->shard], __ATOMIC_ACQUIRE))
+		{
+			flush_self(w->shard);
+			__atomic_store_n(&g_flush_req[w->shard], 0, __ATOMIC_RELEASE);
+			work = 1;
+		}
+
+		if (ps_spdk_poll(w->shard) > 0)
+			work = 1;
+
+		if (!work)
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -299,20 +476,6 @@ main(int argc, char **argv)
 				PS_MAX_SHARDS, ps_nshards);
 		return 2;
 	}
-	/*
-	 * The SPDK backend maps a segment id linearly to a device offset and buffers
-	 * a single current segment, so multiple concurrent per-shard segment streams
-	 * would skew the id space (premature device-end), thrash that buffer, and
-	 * leave recoverable gaps on a reused device.  Multi-shard SPDK needs
-	 * per-thread qpairs + per-shard device regions (SHARDING.md step 5); until
-	 * then the SPDK daemon runs a single shard.
-	 */
-	if (ps_nshards != 1)
-	{
-		fprintf(stderr, "pagestore_daemon_spdk: multi-shard not supported on the "
-				"SPDK backend yet (SHARDING.md step 5); using --nshards 1\n");
-		ps_nshards = 1;
-	}
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
 
@@ -353,51 +516,57 @@ main(int argc, char **argv)
 	hdr->nshards = ps_nshards;	/* clients route to the same shard pools */
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
-	/* publish magic with a release store so the readers' acquire-load of it has a
-	 * matching release on the same field, giving a happens-before edge for the
-	 * descriptive fields written above */
-	ps_store_release(&hdr->magic, PS_SHM_MAGIC);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
-	fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
-			"page_size=%u io_unit=%u channels=%d ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
-
 	/*
-	 * Cross-channel async loop: start every ready request that is not already in
-	 * flight, then drive NVMe completions.  Read requests stay "active" until
-	 * their completions publish DONE, so many overlap on the queue.
+	 * One worker thread per shard, each with its own NVMe qpair (allocated by
+	 * spdk_open) and channel pool, running the async cross-channel loop on its own
+	 * shard.  Magic is published only after every worker exists, so a client that
+	 * sees the shm ready knows all shards are being served.
 	 */
-	while (!stop_requested)
 	{
-		int			work = 0;
+		Worker	   *workers = calloc(ps_nshards, sizeof(Worker));
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (!reqstate[i].active &&
-				ps_load_acquire(&ch->state) == PS_STATE_REQUEST)
+			perror("calloc workers");
+			return 1;
+		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+		{
+			workers[s].shm = shm;
+			workers[s].shard = s;
+			ps_shard_channel_range(s, ps_nshards, PS_MAX_CHANNELS,
+								   &workers[s].first, &workers[s].count);
+			if (pthread_create(&workers[s].tid, NULL, spdk_worker_main,
+							   &workers[s]) != 0)
 			{
-				begin(i, ch);
-				work = 1;
+				perror("pthread_create");
+				/* magic not yet published, so no client treats the shm as ready;
+				 * stop the workers already started and bail */
+				__atomic_store_n(&stop_requested, 1, __ATOMIC_RELAXED);
+				for (uint32_t j = 0; j < s; j++)
+					pthread_join(workers[j].tid, NULL);
+				free(workers);
+				return 1;
 			}
 		}
 
-		if (ps_spdk_poll(0) > 0)	/* single shard for now (step 5a) */
-			work = 1;
+		/* all workers exist: publish magic with a release store (readers' acquire
+		 * pairs with it), making the shm ready to serve */
+		ps_store_release(&hdr->magic, PS_SHM_MAGIC);
+		fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
+				"page_size=%u io_unit=%u channels=%d nshards=%u ready\n",
+				shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+				PS_MAX_CHANNELS, ps_nshards);
 
-		if (!work)
-		{
-			struct timespec ts = {0, 20000};	/* 20us */
-
-			nanosleep(&ts, NULL);
-		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			pthread_join(workers[s].tid, NULL);
+		free(workers);
 	}
 
 	{
