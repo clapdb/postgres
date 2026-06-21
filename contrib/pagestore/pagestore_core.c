@@ -1800,6 +1800,40 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 /* ===================== recovery (rebuild index from segments) ========== */
 
 /*
+ * Physically clear everything from (seg, off) forward in a shard's segments, so a
+ * truncated tail cannot be resurrected: the old records past a truncation point
+ * keep valid CRCs at their own offsets, so after the daemon overwrites only some of
+ * them and crashes again, the next recover would otherwise replay the untouched
+ * ones.  Zeroing their headers makes them unreadable.  zbuf is page_size zeros.
+ * Returns 1 if it wrote anything (caller must sync), 0 if nothing, -1 on error.
+ */
+static int
+zero_shard_forward(uint32_t shard, int seg, uint64_t off, unsigned char *zbuf)
+{
+	uint32_t	local = seg_local(seg);
+	int			wrote = 0;
+
+	for (;; local++, off = 0)
+	{
+		int			id = seg_id(shard, local);
+
+		if (ps_storage->seg_size(id) < 0)
+			break;				/* no more segments in this shard */
+		for (uint64_t p = off; p < segment_size;)
+		{
+			uint32_t	n = (segment_size - p > page_size)
+				? page_size : (uint32_t) (segment_size - p);
+
+			if (ps_storage->seg_write(id, p, zbuf, n) != 0)
+				return -1;
+			p += n;
+			wrote = 1;
+		}
+	}
+	return wrote;
+}
+
+/*
  * Rebuild the entire in-memory index at startup by replaying the segments in
  * order.  Each record is self-describing, so replaying append_page's effect
  * (page_add_version + fork_grow) for every record reconstructs both indexes and

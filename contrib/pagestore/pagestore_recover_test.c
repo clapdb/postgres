@@ -206,6 +206,50 @@ setup_crash_tail40(const char *store)	/* like setup_crash_tail but tag base 40 *
 	_exit(0);
 }
 
+static int
+setup_resurrect(const char *store)	/* 0-2 synced, 3-5 unsynced, crash */
+{
+	if (ps_core_open(store) != 0)
+		return 1;
+	append_blocks(store, 0, 3, 50);
+	if (ps_core_write_sync_watermark() != 0)
+		return 1;
+	append_blocks(store, 3, 6, 50);		/* blocks 3,4,5 in segment 1, unsynced */
+	fflush(stdout);
+	_exit(0);
+}
+
+static int
+recover_overwrite(const char *store)	/* recover (zeroes torn tail), reappend, crash */
+{
+	unsigned char pg[8192];
+
+	if (ps_core_open(store) != 0)
+		return 1;
+	fill_page(pg, page_size, 9000, 99);	/* a fresh block 3 over the zeroed tail */
+	if (append_page(0, &key, 3, pg) != 0)
+		return 1;
+	fork_grow(0, &key, 4);
+	fflush(stdout);
+	_exit(0);					/* crash before syncing: blocks 4,5 must stay gone */
+}
+
+static int
+recover_no_resurrect(const char *store)	/* new block 3 only; old 4,5 not resurrected */
+{
+	unsigned char rb[8192];
+
+	if (ps_core_open(store) != 0)
+		return 1;
+	if (read_resolve(0, &key, 3, ~0ull, rb) != 1 || !page_has_tag(rb, page_size, 99))
+		return 1;
+	if (read_resolve(0, &key, 4, ~0ull, rb) != 0)
+		return 1;				/* old block 4 must NOT come back */
+	if (read_resolve(0, &key, 5, ~0ull, rb) != 0)
+		return 1;
+	return 0;
+}
+
 int
 main(void)
 {
@@ -246,6 +290,17 @@ main(void)
 	corrupt_byte("/tmp/psD", 1, 9000);	/* block 4 (segment 1), above watermark */
 	check(phase(recover_truncated_tail, "/tmp/psD") == 0,
 		  "torn-tail: truncates (not brick); torn block dropped");
+
+	/* 5: a truncated tail is physically discarded, not resurrected by a partial
+	 * overwrite + second crash */
+	if (system("rm -rf /tmp/psE && mkdir -p /tmp/psE") != 0)
+		return 2;
+	check(phase(setup_resurrect, "/tmp/psE") == 0, "resurrect: setup (crash)");
+	corrupt_byte("/tmp/psE", 1, 100);	/* corrupt block 3 (first unsynced record) */
+	check(phase(recover_overwrite, "/tmp/psE") == 0,
+		  "resurrect: recover zeroes tail, reappends block 3, crashes");
+	check(phase(recover_no_resurrect, "/tmp/psE") == 0,
+		  "resurrect: old blocks 4,5 stay gone (no resurrection)");
 
 	printf("%d checks, %d failed\n", checks, fails);
 	return fails ? 1 : 0;
