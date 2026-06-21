@@ -231,15 +231,16 @@ super_write_counts(const uint32_t *counts)
 	return 0;
 }
 
-/* Superblock from the live counters; safe at close (main thread, workers joined). */
-static void
+/* Superblock from the live counters; safe at close (main thread, workers joined).
+ * Returns 0 on success, -1 if it could not be made durable. */
+static int
 super_write(void)
 {
 	uint32_t	counts[PS_MAX_SHARDS];
 
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
 		counts[sh] = g_spdk[sh].num_segments;
-	super_write_counts(counts);
+	return super_write_counts(counts);
 }
 
 /*
@@ -496,8 +497,10 @@ spdk_sync(void)
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
 		if (flush_curbuf(&g_spdk[sh]) != 0)
 			return -1;
-	super_write();
-	return 0;
+	/* propagate a failed superblock write: the clean-close path advances the sync
+	 * watermark on a 0 return, and a watermark past a non-persisted super would brick
+	 * the store on the next open */
+	return super_write();
 }
 
 /* --- segment byte I/O ---------------------------------------------------- */

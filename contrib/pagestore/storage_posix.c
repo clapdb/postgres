@@ -118,6 +118,19 @@ posix_sync(void)
 		if (seg_fds[id] >= 0 && fsync(seg_fds[id]) != 0)
 			rc = -1;
 	pthread_mutex_unlock(&seg_mtx);
+
+	/* fsync the store directory too: a newly rolled segment file (seg_NNN created
+	 * with O_CREAT) is only durable as a directory entry once the directory is
+	 * synced, so without this a crash could keep the sync watermark while losing the
+	 * new segment, leaving recovery short of the watermark */
+	{
+		int			d = open(posix_dir, O_RDONLY);
+
+		if (d < 0 || fsync(d) != 0)
+			rc = -1;
+		if (d >= 0)
+			close(d);
+	}
 	return rc;
 }
 
