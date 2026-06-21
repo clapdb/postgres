@@ -79,26 +79,55 @@ static ReqState reqstate[PS_MAX_CHANNELS];
  * curbuf when it sees its flag set.  g_super_mtx serializes the superblock write
  * so two concurrent syncs can't corrupt it.
  */
-static volatile int g_flush_req[PS_MAX_SHARDS];
+static volatile int g_flush_req[PS_MAX_SHARDS];		/* 1 = flush requested */
+static volatile int g_flush_rc[PS_MAX_SHARDS];		/* 0 ok / -1 failed flush */
+static volatile uint32_t g_flush_snap[PS_MAX_SHARDS];	/* seg count at flush */
 static pthread_mutex_t g_super_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* Durability barrier for one IMMEDSYNC, run by the receiving worker 'w'. */
+/* Flush this shard's own buffer, recording the result + post-flush count where
+ * the barrier coordinator collects them. */
 static void
+flush_self(uint32_t shard)
+{
+	uint32_t	cnt = 0;
+	int			rc = ps_spdk_flush(shard, &cnt);
+
+	g_flush_snap[shard] = cnt;
+	g_flush_rc[shard] = rc;
+}
+
+/*
+ * Durability barrier for one IMMEDSYNC, run by the receiving worker for 'shard'.
+ * Each shard can only flush its own qpair, so request every other shard to flush
+ * itself and wait; the persisted superblock uses each shard's post-flush count
+ * snapshot, never a live counter a concurrent writer advanced.  Returns 0 if all
+ * shards flushed durably, -1 if any flush failed or shutdown aborted the wait
+ * (so the client learns the sync did not complete).
+ */
+static int
 immedsync_barrier(uint32_t shard)
 {
-	ps_spdk_flush(shard);		/* this worker's own shard */
+	uint32_t	counts[PS_MAX_SHARDS];
+	int			rc = 0;
+
+	flush_self(shard);			/* this worker's own shard */
 	for (uint32_t s = 0; s < ps_nshards; s++)
 		if (s != shard)
+		{
+			g_flush_rc[s] = 0;
 			__atomic_store_n(&g_flush_req[s], 1, __ATOMIC_RELEASE);
+		}
 	for (;;)
 	{
 		int			pending = 0;
 
+		if (__atomic_load_n(&stop_requested, __ATOMIC_RELAXED))
+			return -1;			/* shutdown: abort rather than spin forever */
 		/* service a request aimed at us too, so two concurrent syncs (each
 		 * waiting on the other) cannot deadlock */
 		if (__atomic_load_n(&g_flush_req[shard], __ATOMIC_ACQUIRE))
 		{
-			ps_spdk_flush(shard);
+			flush_self(shard);
 			__atomic_store_n(&g_flush_req[shard], 0, __ATOMIC_RELEASE);
 		}
 		for (uint32_t s = 0; s < ps_nshards; s++)
@@ -112,10 +141,18 @@ immedsync_barrier(uint32_t shard)
 			nanosleep(&ts, NULL);
 		}
 	}
-	/* persist the per-shard segment counts once, serialized */
+	/* collect each shard's flush result + post-flush count snapshot */
+	for (uint32_t s = 0; s < ps_nshards; s++)
+	{
+		if (g_flush_rc[s] != 0)
+			rc = -1;
+		counts[s] = g_flush_snap[s];
+	}
+	/* persist the snapshot once, serialized against a concurrent sync */
 	pthread_mutex_lock(&g_super_mtx);
-	ps_spdk_super_sync();
+	ps_spdk_super_write_counts(counts);
 	pthread_mutex_unlock(&g_super_mtx);
+	return rc;
 }
 
 /* one page read finished: cache the page, and when the last of a request lands
@@ -337,9 +374,11 @@ spdk_worker_main(void *arg)
 			{
 				/* global durability barrier: each shard flushes its own qpair
 				 * (begin()->spdk_sync would flush every shard from this one
-				 * thread, racing the other shards' single-owner qpairs) */
-				immedsync_barrier(w->shard);
-				ch->status = PS_STATUS_OK;
+				 * thread, racing the other shards' single-owner qpairs).  Report
+				 * a failed/aborted barrier so the client doesn't believe the data
+				 * is durable. */
+				ch->status = immedsync_barrier(w->shard) == 0 ?
+					PS_STATUS_OK : PS_STATUS_ERROR;
 				ps_store_release(&ch->state, PS_STATE_DONE);
 			}
 			else if (owner != PS_ANY_SHARD && owner != w->shard)
@@ -352,10 +391,11 @@ spdk_worker_main(void *arg)
 			work = 1;
 		}
 
-		/* flush our own shard if another shard's IMMEDSYNC barrier requested it */
+		/* flush our own shard if another shard's IMMEDSYNC barrier requested it
+		 * (records the result + post-flush count the coordinator collects) */
 		if (__atomic_load_n(&g_flush_req[w->shard], __ATOMIC_ACQUIRE))
 		{
-			ps_spdk_flush(w->shard);
+			flush_self(w->shard);
 			__atomic_store_n(&g_flush_req[w->shard], 0, __ATOMIC_RELEASE);
 			work = 1;
 		}

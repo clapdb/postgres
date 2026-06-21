@@ -37,11 +37,13 @@ extern int	ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 extern int	ps_spdk_poll(uint32_t shard);
 
 /* Flush one shard's current-segment buffer; call from that shard's worker thread
- * (drives the shard's qpair).  Used to coordinate a cross-shard IMMEDSYNC. */
-extern int	ps_spdk_flush(uint32_t shard);
+ * (drives the shard's qpair).  *out_count (if non-NULL) returns the shard's
+ * segment count as of the flush, for a consistent superblock snapshot.  Used to
+ * coordinate a cross-shard IMMEDSYNC. */
+extern int	ps_spdk_flush(uint32_t shard, uint32_t *out_count);
 
-/* Persist the per-shard segment counts (superblock); call once after all shards
- * have flushed for an IMMEDSYNC. */
-extern void ps_spdk_super_sync(void);
+/* Persist the superblock from a per-shard count snapshot (from ps_spdk_flush);
+ * call once after all shards have flushed for an IMMEDSYNC. */
+extern void ps_spdk_super_write_counts(const uint32_t *counts);
 
 #endif							/* STORAGE_SPDK_H */

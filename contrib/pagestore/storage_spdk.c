@@ -185,8 +185,11 @@ super_path(char *buf, size_t buflen)
 	snprintf(buf, buflen, "%s/spdk_super", g_store);
 }
 
+/* Write the superblock from an explicit per-shard segment-count array, so the
+ * IMMEDSYNC coordinator can persist a consistent post-flush snapshot rather than
+ * the live counters that concurrent shard writers keep advancing. */
 static void
-super_write(void)
+super_write_counts(const uint32_t *counts)
 {
 	char		path[2300];
 	SpdkSuper	s;
@@ -198,7 +201,7 @@ super_write(void)
 	s.segment_size = g_segsize;
 	s.nshards = g_nshards;
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
-		s.num_segments[sh] = g_spdk[sh].num_segments;
+		s.num_segments[sh] = counts[sh];
 
 	super_path(path, sizeof(path));
 	f = fopen(path, "wb");
@@ -206,6 +209,17 @@ super_write(void)
 		return;					/* best-effort */
 	fwrite(&s, sizeof(s), 1, f);
 	fclose(f);
+}
+
+/* Superblock from the live counters; safe at close (main thread, workers joined). */
+static void
+super_write(void)
+{
+	uint32_t	counts[PS_MAX_SHARDS];
+
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		counts[sh] = g_spdk[sh].num_segments;
+	super_write_counts(counts);
 }
 
 /*
@@ -625,23 +639,29 @@ ps_spdk_poll(uint32_t shard)
  * Flush one shard's current-segment buffer to the device.  Must be called from
  * that shard's own worker thread (it drives the shard's qpair), which is how the
  * SPDK daemon coordinates a cross-shard IMMEDSYNC: each shard flushes itself.
+ * On return *out_count (if non-NULL) holds that shard's segment count AS OF the
+ * flush, so the coordinator can persist a count covering exactly the flushed data
+ * even if the shard appends more afterwards.
  */
 int
-ps_spdk_flush(uint32_t shard)
+ps_spdk_flush(uint32_t shard, uint32_t *out_count)
 {
-	if (shard >= g_nshards)
-		return 0;
-	return flush_curbuf(&g_spdk[shard]);
+	int			rc = 0;
+
+	if (shard < g_nshards)
+		rc = flush_curbuf(&g_spdk[shard]);
+	if (out_count)
+		*out_count = (shard < g_nshards) ? g_spdk[shard].num_segments : 0;
+	return rc;
 }
 
-/* Persist the per-shard segment counts (the superblock).  Called once, by the
- * worker coordinating an IMMEDSYNC, after every shard has flushed; the counts
- * only grow and a short/empty trailing segment reads as end-of-log, so a count
- * that a concurrent append nudged up is safe for recover(). */
+/* Persist the superblock from a caller-supplied per-shard count snapshot (taken
+ * at flush time by ps_spdk_flush), so the persisted counts cover exactly the
+ * flushed data and never a segment a concurrent writer added but did not flush. */
 void
-ps_spdk_super_sync(void)
+ps_spdk_super_write_counts(const uint32_t *counts)
 {
-	super_write();
+	super_write_counts(counts);
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */
