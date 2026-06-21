@@ -1790,8 +1790,9 @@ recover(void)
 		{
 			int			id = seg_id(s->index, local);
 			uint64_t	off = 0;
+			int64_t		sz = ps_storage->seg_size(id);
 
-			if (ps_storage->seg_size(id) < 0)
+			if (sz < 0)
 				break;			/* no more segments in this shard -> done */
 
 			/* replay records until one fails to validate (end of log) */
@@ -1799,23 +1800,43 @@ recover(void)
 			{
 				SegRecHdr	hdr;
 
-				/* Stop at the first record that does not verify -- a torn/unsynced
+				/*
+				 * Stop at the first record that does not verify -- a torn/unsynced
 				 * trailing append, a never-written tail, or stale device bytes from
-				 * before this store.  Writes are not synced per append, so without a
-				 * durable end-of-log watermark we cannot tell an unsynced torn tail
-				 * from corruption of an already-synced record; truncating here is the
-				 * safe choice (it never refuses to open over a normal post-crash
-				 * tail).  The CRC/gen check still detects the bad bytes and stops the
-				 * replay at them.  Distinguishing the two (fail on synced-data
-				 * corruption, truncate only the unsynced tail) needs a persisted
-				 * per-shard sync watermark -- see SPDK_NOTES "Verification & recovery".
-				 * A read error (vs a mismatch) is flagged before stopping. */
-				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
-					hdr.magic != SEG_MAGIC || hdr.len != page_size ||
+				 * before this store.  Truncating here is safe (it never refuses to
+				 * open over a normal post-crash tail), and zero_shard_forward() below
+				 * physically discards the rest.
+				 *
+				 * But distinguish an expected short tail from a real backend read
+				 * error: a full record needs sizeof(hdr)+page_size bytes present, so
+				 * bytes past the segment's written size are the tail (break), while a
+				 * seg_read failure WITHIN that size is an actual I/O error -- fail the
+				 * open rather than truncate, which could otherwise zero live data on a
+				 * transient read fault.  (On SPDK seg_size() reports a present segment
+				 * as full, so its tail is detected by the magic/gen/CRC check on the
+				 * stale bytes, and only a real do_io failure reaches the -1 paths.)
+				 */
+				if (off + sizeof(hdr) + page_size > (uint64_t) sz)
+					break;
+				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0)
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: header "
+							"read failed; refusing to recover\n",
+							s->index, id, (unsigned long long) off);
+					free(pg);
+					return -1;
+				}
+				if (hdr.magic != SEG_MAGIC || hdr.len != page_size ||
 					hdr.gen != g_store_gen)
 					break;
 				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0)
-					break;
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: page "
+							"read failed; refusing to recover\n",
+							s->index, id, (unsigned long long) off);
+					free(pg);
+					return -1;
+				}
 				if (seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
 				{
 					fprintf(stderr, "pagestore: shard %u segment %d off %llu: record "
@@ -2192,6 +2213,19 @@ ps_core_maintenance(void)
 	return 0;
 }
 
+/* fsync a store directory so a freshly created metadata file's entry is durable */
+static void
+fsync_store_dir(const char *store_dir)
+{
+	int			fd = open(store_dir, O_RDONLY);
+
+	if (fd >= 0)
+	{
+		fsync(fd);
+		close(fd);
+	}
+}
+
 /*
  * The store records the shard count it was created with.  Per-shard segment and
  * manifest namespaces -- and how recover() partitions segments -- are derived
@@ -2252,6 +2286,7 @@ validate_store_nshards(const char *store_dir)
 		return -1;
 	}
 	close(fd);
+	fsync_store_dir(store_dir);	/* make the new file's directory entry durable */
 	return 0;
 }
 
@@ -2307,6 +2342,7 @@ validate_store_segment_size(const char *store_dir)
 		return -1;
 	}
 	close(fd);
+	fsync_store_dir(store_dir);	/* make the new file's directory entry durable */
 	return 0;
 }
 
