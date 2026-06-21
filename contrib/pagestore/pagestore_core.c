@@ -145,11 +145,14 @@ load_store_gen(const char *store_dir)
 	 * segment data already exists, a missing or short store_gen means lost or
 	 * mismatched metadata (a restored/copied store, a deleted file), and minting a
 	 * new generation would make recover() treat every existing record as stale and
-	 * silently discard the whole log.  Fail open so the loss is visible.
-	 * (Segment id 0 is shard 0's first segment -- the first one any store writes.)
+	 * silently discard the whole log.  Fail open so the loss is visible.  Check
+	 * every shard's first segment (seg id == shard for local index 0), since with
+	 * nshards > 1 a store may have written only to a nonzero shard, leaving seg 0
+	 * absent while later shard-local segments exist.
 	 */
-	if (ps_storage->seg_size(0) >= 0)
-		return -1;
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		if (ps_storage->seg_size((int) s) >= 0)
+			return -1;
 
 	/*
 	 * Fresh store: a leftover short/zero file (e.g. a crash mid-create) cannot have
@@ -1763,6 +1766,12 @@ recover(void)
 			/* newest segment seen for this shard; its append continues after it */
 			s->cur_seg = id;
 			s->cur_off = off;
+			/* If the scan stopped with room left for another record, this segment is
+			 * the shard's end -- a tail or a mid-log corruption -- not a rolled-full
+			 * one.  Stop the shard here; continuing would index a later segment while
+			 * leaving the cursor mid-this-one, silently dropping the gap between. */
+			if (off + sizeof(SegRecHdr) + page_size <= segment_size)
+				break;
 		}
 		if (s->cur_seg >= 0)
 			fprintf(stderr, "pagestore_daemon: shard %u recovered through segment "
