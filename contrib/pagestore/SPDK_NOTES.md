@@ -378,15 +378,22 @@ Status (implemented):
   not guard a reused raw device).  `recover()` and the read paths verify both;
   reads fail (not zero-fill) on a CRC mismatch.
 
-Remaining gap -- sync watermark:
+Sync watermark (implemented):
 - Appends are not synced per record, so a record that fails to verify at the tail
   may be an *unsynced torn tail* (expected after a crash) or *corruption of an
-  already-synced record*.  We cannot tell them apart without a durable per-shard
-  **sync watermark** (the (segment, offset) that `IMMEDSYNC`/close last made
-  durable).  Until that exists, `recover()` truncates at the first unverifiable
-  record: it never refuses to open over a normal post-crash tail, but a corruption
-  inside already-synced data truncates the later records rather than failing loudly.
-  The fix is to persist the watermark on sync and, during recovery, treat a
-  verification failure *below* it as corruption (fail open) and *at/above* it as the
-  unsynced tail (truncate).  For SPDK the superblock's per-shard segment count is
-  already a coarse (segment-granular) version of this.
+  already-synced record*.  A durable per-shard **sync watermark** -- the (segment
+  local index, byte offset) each shard was synced through -- tells them apart.  It
+  lives in `<store>/sync_wm` (magic + per-shard entry + CRC), written via temp-file
+  + rename + fsync on every `IMMEDSYNC` (POSIX `ps_handle_meta`, the SPDK barrier)
+  and on clean close, always after the data through that cursor is durable.
+- `recover()` rebuilds each shard, ending at its first non-full segment, then
+  compares the rebuilt position to the watermark: short of it -> committed data is
+  missing -> fail open; at/after it is the normal tail (valid records past it are
+  still replayed, so process-crash ack-durability holds).  A store with no
+  trustworthy watermark keeps the safe truncate-only behavior.
+- A truncated tail is then physically zeroed from the append cursor forward (and
+  synced), so old records past the truncation can't be resurrected by a later
+  partial overwrite + crash.
+- Tested in-process (no daemon) by `pagestore_recover_test`: clean round-trip,
+  synced-corruption-fails, valid-unsynced-tail-replayed, torn-tail-truncates, and
+  no-resurrection.

@@ -1800,60 +1800,6 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 /* ===================== recovery (rebuild index from segments) ========== */
 
 /*
- * Physically clear everything from (seg, off) forward in a shard's segments, so a
- * truncated tail cannot be resurrected: the old records past a truncation point
- * keep valid CRCs at their own offsets, so after the daemon overwrites only some of
- * them and crashes again, the next recover would otherwise replay the untouched
- * ones.  Zeroing their headers makes them unreadable.  zbuf is page_size zeros.
- * Returns 1 if it wrote anything (caller must sync), 0 if nothing, -1 on error.
- */
-static int
-zero_shard_forward(uint32_t shard, int seg, uint64_t off, unsigned char *zbuf)
-{
-	uint32_t	local = seg_local(seg);
-	int			wrote = 0;
-
-	for (;; local++, off = 0)
-	{
-		int			id = seg_id(shard, local);
-
-		if (ps_storage->seg_size(id) < 0)
-			break;				/* no more segments in this shard */
-		for (uint64_t p = off; p < segment_size;)
-		{
-			uint32_t	n = (segment_size - p > page_size)
-				? page_size : (uint32_t) (segment_size - p);
-
-			if (ps_storage->seg_write(id, p, zbuf, n) != 0)
-				return -1;
-			p += n;
-			wrote = 1;
-		}
-	}
-	return wrote;
-}
-
-/*
- * Rebuild the entire in-memory index at startup by replaying the segments in
- * order.  Each record is self-describing, so replaying append_page's effect
- * (page_add_version + fork_grow) for every record reconstructs both indexes and
- * leaves the append cursor positioned just past the last valid record.
- *
- * The scan stops at the first record that fails its magic/gen/len/CRC check.  Each
- * shard ends at its first non-full segment (a full one always rolled, so it is a
- * clean natural boundary; continuing past a partial one would index a later
- * segment while leaving the cursor mid-this-one).  Whether the stop is an expected
- * unsynced torn tail or corruption of already-synced data is then decided against
- * the durable sync watermark: recovering short of it means committed records are
- * missing -> fail open; stopping at/after it is the normal tail (valid unsynced
- * records past it are still replayed, honoring ack-durability).  Returns 0 on
- * success, -1 on such corruption or on allocation failure (so ps_core_open() does
- * not open with an empty/short index over a real store).
- *
- * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.
- */
-/*
  * Physically clear the written bytes from (seg, off) forward in a shard's
  * segments, so a truncated tail cannot be resurrected: the old records past a
  * truncation point keep valid CRCs at their own offsets, so after the daemon
@@ -1926,6 +1872,26 @@ zero_shard_forward(uint32_t shard, int seg, uint64_t off)
 	return err ? -1 : wrote;
 }
 
+/*
+ * Rebuild the entire in-memory index at startup by replaying the segments in
+ * order.  Each record is self-describing, so replaying append_page's effect
+ * (page_add_version + fork_grow) for every record reconstructs both indexes and
+ * leaves the append cursor positioned just past the last valid record.
+ *
+ * The scan stops at the first record that fails its magic/gen/len/CRC check.  Each
+ * shard ends at its first non-full segment (a full one always rolled, so it is a
+ * clean natural boundary; continuing past a partial one would index a later
+ * segment while leaving the cursor mid-this-one).  Whether the stop is an expected
+ * unsynced torn tail or corruption of already-synced data is then decided against
+ * the durable sync watermark: recovering short of it means committed records are
+ * missing -> fail open; stopping at/after it is the normal tail (valid unsynced
+ * records past it are still replayed, honoring ack-durability).  Returns 0 on
+ * success, -1 on such corruption or on allocation failure (so ps_core_open() does
+ * not open with an empty/short index over a real store).
+ *
+ * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
+ * effects are not reproduced on restart.
+ */
 static int
 recover(void)
 {
