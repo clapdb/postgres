@@ -34,11 +34,13 @@
 #include <unistd.h>
 
 #include "access/relation.h"
+#include "access/rmgr.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage_xlog.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
@@ -522,6 +524,42 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 			key.relNumber = rloc.relNumber;
 			key.forkNum = fk;
 			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
+			/* a reference to block 'blk' means the fork was at least blk+1 blocks
+			 * by this record's end -- an extension (grow-only) size event */
+			pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
+											blk + 1, false);
+		}
+
+		/* smgr truncation shrinks a fork to an exact size -- a size event no
+		 * per-block reference carries, but the redo "is this block live?" check
+		 * needs it.  Record the exact new size for each truncated fork. */
+		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
+			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
+		{
+			xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(reader);
+			PageStoreRelKey key;
+
+			key.spcOid = xlrec->rlocator.spcOid;
+			key.dbOid = xlrec->rlocator.dbOid;
+			key.relNumber = xlrec->rlocator.relNumber;
+			if (xlrec->flags & SMGR_TRUNCATE_HEAP)
+			{
+				key.forkNum = MAIN_FORKNUM;
+				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
+												xlrec->blkno, true);
+			}
+			if (xlrec->flags & SMGR_TRUNCATE_VM)
+			{
+				key.forkNum = VISIBILITYMAP_FORKNUM;
+				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
+												xlrec->blkno, true);
+			}
+			if (xlrec->flags & SMGR_TRUNCATE_FSM)
+			{
+				key.forkNum = FSM_FORKNUM;
+				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
+												xlrec->blkno, true);
+			}
 		}
 	}
 

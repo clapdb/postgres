@@ -1002,13 +1002,24 @@ typedef struct PageEnt
 	int			cap;
 } PageEnt;
 
+/* One LSN-versioned size change of a fork: its block count became 'nblocks' as
+ * of WAL record 'lsn' (an extension grows it; a truncation shrinks it). */
+typedef struct ForkSz
+{
+	uint64_t	lsn;
+	uint32_t	nblocks;
+} ForkSz;
+
 /* Hash entry: the block count of one fork on one timeline. */
 typedef struct ForkEnt
 {
 	struct ForkEnt *next;		/* bucket chain */
 	uint32_t	timeline;
 	PsKey		key;
-	uint32_t	nblocks;
+	uint32_t	nblocks;		/* current count (unversioned; used by NBLOCKS) */
+	ForkSz	   *sz;				/* LSN-versioned size history, ascending by lsn */
+	int			nsz;
+	int			szcap;
 } ForkEnt;
 
 /*
@@ -1191,6 +1202,7 @@ fork_remove(uint32_t timeline, const PsKey *key)
 			ForkEnt    *dead = *pp;
 
 			*pp = dead->next;
+			free(dead->sz);
 			free(dead);
 			return;
 		}
@@ -1374,6 +1386,82 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key)
 			return maxnb;
 		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
+}
+
+/*
+ * The fork's block count as of 'lsn': the nblocks of the newest size event at or
+ * below 'lsn', walking the timeline ancestry (a branch inherits the parent's size
+ * as of its fork LSN until its own first size event).  Returns -1 if no size
+ * event is known at/below 'lsn' (caller decides how to treat "unknown").
+ */
+static int
+fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn)
+{
+	const Shard *s = shard_for(key);
+
+	for (;;)
+	{
+		ForkEnt    *e = fork_find(timeline, key);
+
+		if (e)
+			for (int i = e->nsz - 1; i >= 0; i--)
+				if (e->sz[i].lsn <= lsn)
+					return (int) e->sz[i].nblocks;
+		if (!timeline_has_parent(s, timeline))
+			return -1;
+		if (s->timelines[timeline].branch_lsn < lsn)
+			lsn = s->timelines[timeline].branch_lsn;
+		timeline = (uint32_t) s->timelines[timeline].parent;
+	}
+}
+
+/*
+ * Record an LSN-versioned size change for the redo "is this block live as-of LSN?"
+ * check.  is_trunc distinguishes the two sources, which prune differently:
+ *   - a truncation (is_trunc) sets the exact new size; recorded unless the size at
+ *     'lsn' already equals it;
+ *   - an extension (!is_trunc) only grows the fork, so it is recorded only when
+ *     'nblocks' exceeds the size already in effect at 'lsn' -- a WAL reference to a
+ *     low block of a larger fork must not look like a shrink.
+ * Events store the exact size as of their LSN, so fork_nblocks_at() (latest <= lsn)
+ * reads them directly.  Kept ascending by lsn (usually an append).
+ */
+void
+fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn,
+			  uint32_t nblocks, bool is_trunc)
+{
+	int			cur = fork_nblocks_at(timeline, key, lsn);
+	ForkEnt    *e;
+	int			i;
+
+	if (is_trunc ? (cur == (int) nblocks) : (cur >= (int) nblocks))
+		return;					/* no effect on the size in force at 'lsn' */
+
+	e = fork_get_or_create(timeline, key);
+	/* an event already at exactly this lsn: overwrite (same record, corrected) */
+	for (i = e->nsz - 1; i >= 0; i--)
+		if (e->sz[i].lsn == lsn)
+		{
+			e->sz[i].nblocks = nblocks;
+			return;
+		}
+		else if (e->sz[i].lsn < lsn)
+			break;
+
+	if (e->nsz == e->szcap)
+	{
+		e->szcap = e->szcap ? e->szcap * 2 : 4;
+		e->sz = realloc(e->sz, (size_t) e->szcap * sizeof(ForkSz));
+	}
+	i = e->nsz;
+	while (i > 0 && e->sz[i - 1].lsn > lsn)
+	{
+		e->sz[i] = e->sz[i - 1];
+		i--;
+	}
+	e->sz[i].lsn = lsn;
+	e->sz[i].nblocks = nblocks;
+	e->nsz++;
 }
 
 /* Does the fork exist on 'timeline' or any ancestor? */
@@ -2248,6 +2336,20 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_NBLOCKS:
 			ch->result = fork_nblocks_through(tl, &ch->key);
 			break;
+
+		case PS_OP_FORK_SIZE_ADD:
+			/* blocknum carries is_trunc (1 = truncation, 0 = extension) */
+			fork_size_add(tl, &ch->key, ch->req_lsn, ch->nblocks,
+						  ch->blocknum != 0);
+			break;
+
+		case PS_OP_FORK_SIZE_AT:
+		{
+			int			nb = fork_nblocks_at(tl, &ch->key, ch->req_lsn);
+
+			ch->result = (nb < 0) ? PS_FORKSIZE_UNKNOWN : (uint32_t) nb;
+			break;
+		}
 
 		case PS_OP_TRUNCATE:
 			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;

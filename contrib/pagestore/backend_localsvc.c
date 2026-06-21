@@ -604,6 +604,35 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	return n;
 }
 
+/* Record in the store that the fork's size became nblocks as of WAL record 'lsn'
+ * (is_trunc = a truncation's exact new size; else an extension that only grows). */
+void
+pagestore_localsvc_forksize_add(const PageStoreRelKey *key, uint64 lsn,
+								BlockNumber nblocks, bool is_trunc)
+{
+	PsChannel  *ch = ls_chan(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_FORK_SIZE_ADD;
+	ch->req_lsn = lsn;
+	ch->nblocks = nblocks;
+	ch->blocknum = is_trunc ? 1 : 0;
+	ls_exec(ch);
+}
+
+/* The fork's size (blocks) as of 'lsn', or -1 if no size event is known there. */
+int
+pagestore_localsvc_forksize_at(const PageStoreRelKey *key, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_FORK_SIZE_AT;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result == PS_FORKSIZE_UNKNOWN ? -1 : (int) ch->result;
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)

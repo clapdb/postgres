@@ -473,6 +473,36 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec(ch);
 }
 
+/* Record: this fork's size became nblocks as of WAL record 'lsn' (is_trunc=1 for
+ * a truncation -- exact shrink; is_trunc=0 for an extension -- grow-only). */
+static void
+op_forksize_add(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
+				uint32_t nblocks, int is_trunc)
+{
+	PsChannel  *ch = cl_route(rel, fork);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_FORK_SIZE_ADD;
+	ch->req_lsn = lsn;
+	ch->nblocks = nblocks;
+	ch->blocknum = (uint32_t) is_trunc;
+	cl_exec(ch);
+}
+
+/* The fork's size (blocks) as of 'lsn'; PS_FORKSIZE_UNKNOWN if none at/below it. */
+static uint32_t
+op_forksize_at(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = cl_route(rel, fork);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_FORK_SIZE_AT;
+	ch->req_lsn = lsn;
+	return cl_exec(ch)->result;
+}
+
 /* Returns count; fills out[] with the record LSNs <= lsn_max, and -- when
  * out_tl != NULL -- the parallel source timeline of each LSN. */
 static int
@@ -1049,6 +1079,31 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		check(from_child == 1 && from_parent == 2,
 			  "branch index tags each LSN with its source timeline (400->tl1, 100/200->tl0)");
 	}
+
+	/* --- LSN-versioned fork size (the redo step-0 "is block live as-of LSN" check) --- */
+
+	/* REL_B fork grows to 10 blocks @100, truncated to 3 @200, re-extended to 7 @300 */
+	op_forksize_add(0, REL_B, FORK0, 100, 10, 0);
+	op_forksize_add(0, REL_B, FORK0, 200, 3, 1);
+	op_forksize_add(0, REL_B, FORK0, 300, 7, 0);
+	/* an extension to a block below the current size must NOT shrink it */
+	op_forksize_add(0, REL_B, FORK0, 320, 4, 0);
+
+	check(op_forksize_at(0, REL_B, FORK0, 50) == PS_FORKSIZE_UNKNOWN,
+		  "fork size unknown before the first size event");
+	check(op_forksize_at(0, REL_B, FORK0, 150) == 10, "fork size as-of 150 -> 10 (after extend)");
+	check(op_forksize_at(0, REL_B, FORK0, 250) == 3, "fork size as-of 250 -> 3 (after truncate)");
+	check(op_forksize_at(0, REL_B, FORK0, 1000) == 7, "fork size as-of 1000 -> 7 (re-extend; low write ignored)");
+	/* block 5 is gone at 250 (size 3) but live again at 1000 (size 7) */
+	check(op_forksize_at(0, REL_B, FORK0, 250) <= 5 && op_forksize_at(0, REL_B, FORK0, 1000) > 5,
+		  "truncate-then-re-extend: block 5 dead as-of 250, live as-of 1000");
+
+	/* a branch inherits the parent's size as-of the fork LSN, then overrides */
+	op_create_branch(2, 0, 250);		/* fork REL_B's timeline at lsn 250 (size 3) */
+	op_forksize_add(2, REL_B, FORK0, 400, 9, 0);
+	check(op_forksize_at(2, REL_B, FORK0, 300) == 3,
+		  "branch sees parent size capped at the fork lsn (3, not the parent's later 7)");
+	check(op_forksize_at(2, REL_B, FORK0, 500) == 9, "branch's own later size event wins (9)");
 
 	client_detach();
 	stop_daemon(dpid);
