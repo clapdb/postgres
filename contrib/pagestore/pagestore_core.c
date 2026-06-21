@@ -27,6 +27,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -64,6 +65,153 @@ int			ps_object_tier = 0;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
+
+/*
+ * Segment-record integrity (no filesystem under the raw NVMe backend, so we carry
+ * our own checks).  CRC32C (Castagnoli) detects bit rot / torn writes; a per-store
+ * generation distinguishes our records from stale device bytes (a reused disk, or
+ * a previous store) that happen to carry a SEG_MAGIC, which a CRC alone can't.
+ */
+static uint32_t crc32c_tab[256];
+
+static void
+crc32c_init(void)
+{
+	for (uint32_t i = 0; i < 256; i++)
+	{
+		uint32_t	c = i;
+
+		for (int k = 0; k < 8; k++)
+			c = (c & 1) ? (c >> 1) ^ 0x82F63B78u : (c >> 1);
+		crc32c_tab[i] = c;
+	}
+}
+
+static uint32_t
+crc32c_upd(uint32_t crc, const void *buf, size_t len)
+{
+	const unsigned char *p = buf;
+
+	while (len--)
+		crc = crc32c_tab[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+	return crc;
+}
+
+/* page-only CRC32C, stored per version and verified on the read path */
+uint32_t
+ps_crc32c(const void *buf, size_t len)
+{
+	return crc32c_upd(0xFFFFFFFFu, buf, len) ^ 0xFFFFFFFFu;
+}
+
+/* per-store generation, stamped into every segment record (0 = uninitialized) */
+static uint64_t g_store_gen;
+
+/*
+ * Load the store's generation from <store_dir>/store_gen, creating a durable
+ * random one on first open.  Stamped into each SegRecHdr so recover() can reject
+ * stale records left on a reused raw device (different/zero generation) instead of
+ * replaying them as live data.  Returns 0 on success, -1 if a fresh generation
+ * cannot be made durable -- the caller must then fail the open, since records
+ * stamped with a generation that a crash could lose would be rejected (i.e. lost)
+ * by the next recover().
+ */
+static int
+load_store_gen(const char *store_dir)
+{
+	char		path[2200];
+	int			fd;
+	uint64_t	g = 0;
+	int			existed = 0;
+
+	snprintf(path, sizeof(path), "%s/store_gen", store_dir);
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		ssize_t		r = read(fd, &g, sizeof(g));
+
+		close(fd);
+		existed = 1;
+		if (r == (ssize_t) sizeof(g) && g != 0)
+		{
+			g_store_gen = g;
+			return 0;			/* already durable from a prior open */
+		}
+		g = 0;
+	}
+
+	/*
+	 * No usable generation on disk.  Only mint one for a genuinely fresh store: if
+	 * segment data already exists, a missing or short store_gen means lost or
+	 * mismatched metadata (a restored/copied store, a deleted file), and minting a
+	 * new generation would make recover() treat every existing record as stale and
+	 * silently discard the whole log.  Fail open so the loss is visible.  Check
+	 * every shard's first segment (seg id == shard for local index 0), since with
+	 * nshards > 1 a store may have written only to a nonzero shard, leaving seg 0
+	 * absent while later shard-local segments exist.
+	 */
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		if (ps_storage->seg_size((int) s) >= 0)
+			return -1;
+
+	/*
+	 * Fresh store: a leftover short/zero file (e.g. a crash mid-create) cannot have
+	 * stamped any record yet, so remove and recreate it rather than wedging every
+	 * future open on the EEXIST path below.
+	 */
+	if (existed)
+		unlink(path);
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0)
+	{
+		if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
+			g = 0;
+		close(fd);
+	}
+	if (g == 0)
+		return -1;				/* no entropy: refuse rather than derive a
+								 * predictable generation -- a path hash would repeat
+								 * for a store recreated at the same path on a reused
+								 * raw device, defeating the stale-bytes guard */
+
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+	{
+		/* lost a create race: adopt the peer's now-durable generation */
+		if (errno == EEXIST && (fd = open(path, O_RDONLY)) >= 0)
+		{
+			ssize_t		r = read(fd, &g, sizeof(g));
+
+			close(fd);
+			if (r == (ssize_t) sizeof(g) && g != 0)
+			{
+				g_store_gen = g;
+				return 0;
+			}
+		}
+		return -1;
+	}
+	if (write(fd, &g, sizeof(g)) != (ssize_t) sizeof(g) || fsync(fd) != 0)
+	{
+		close(fd);
+		unlink(path);
+		return -1;				/* not durable: caller fails the open */
+	}
+	close(fd);
+	fd = open(store_dir, O_RDONLY);		/* make the directory entry durable */
+	if (fd < 0 || fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		unlink(path);			/* dir entry not durable: don't let a retry adopt
+								 * this file as "already durable" */
+		return -1;
+	}
+	close(fd);
+	g_store_gen = g;
+	return 0;
+}
 
 /*
  * Per-shard state (LSM phase 9).  One thread per shard will own its index /
@@ -608,7 +756,29 @@ typedef struct SegRecHdr
 	uint32_t	block;
 	uint64_t	lsn;			/* the page's pd_lsn at write time */
 	uint32_t	len;			/* page bytes following the header */
+	uint32_t	crc;			/* CRC32C over (pos, header[crc=0], page bytes) */
+	uint64_t	gen;			/* per-store generation (rejects stale device bytes) */
 } SegRecHdr;
+
+/*
+ * CRC32C covering the record's position (segment id + byte offset, to catch a
+ * misdirected write that landed elsewhere), the header with its own crc field
+ * zeroed, and the page bytes.  Computed at write, checked at recover.
+ */
+static uint32_t
+seg_rec_crc(int seg, uint64_t recoff, const SegRecHdr *h,
+			const unsigned char *page)
+{
+	SegRecHdr	tmp = *h;
+	uint32_t	crc = 0xFFFFFFFFu;
+
+	tmp.crc = 0;
+	crc = crc32c_upd(crc, &seg, sizeof(seg));
+	crc = crc32c_upd(crc, &recoff, sizeof(recoff));
+	crc = crc32c_upd(crc, &tmp, sizeof(tmp));
+	crc = crc32c_upd(crc, page, page_size);
+	return crc ^ 0xFFFFFFFFu;
+}
 
 /*
  * Segments are addressed by (id, byte offset); how they are stored is the
@@ -718,7 +888,7 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  */
 static void
 page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t lsn, int seg, uint64_t off)
+				 uint64_t lsn, int seg, uint64_t off, uint32_t crc)
 {
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
@@ -741,6 +911,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
+	e->vers[e->nver].crc = crc;
 	e->nver++;
 }
 
@@ -1316,22 +1487,30 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		s->cur_off = 0;
 	}
 
+	memset(&hdr, 0, sizeof(hdr));	/* deterministic padding: the crc covers it */
 	hdr.magic = SEG_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
 	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
 	hdr.len = page_size;
+	hdr.gen = g_store_gen;
+	hdr.crc = seg_rec_crc(s->cur_seg, s->cur_off, &hdr, page);
 
-	/* write header then page bytes contiguously at the append cursor */
+	/* write header then page bytes contiguously at the append cursor.  (Ordering
+	 * page-before-header would not make a torn tail unambiguous without an fsync
+	 * barrier between the two writes, which we don't pay per append; recover()
+	 * instead treats any unverifiable record as end-of-log -- see there.) */
 	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
 	data_off = s->cur_off + sizeof(hdr);
 	if (ps_storage->seg_write(s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
-	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off);
+	/* index points at the page bytes (data_off), so reads skip the header; carry
+	 * the page CRC so the read path can verify the bytes it later fetches */
+	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off,
+					 ps_crc32c(page, page_size));
 	s->cur_off += reclen;
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
@@ -1367,14 +1546,23 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	return 0;
 }
 
-/* Read a specific version's page bytes into out (page_size bytes). */
+/*
+ * Read a specific version's page bytes into out (page_size bytes).  Returns 0 on
+ * success, -1 if the version has no segment copy (layer-origin), and -2 on an
+ * integrity error -- a device read failure or a CRC mismatch (bit rot / misread)
+ * -- which the caller must surface rather than treat as an unwritten page.
+ */
 int
 read_version(const PageVer *v, unsigned char *out)
 {
 	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
 	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
-		return -1;
+		return -2;
+	/* verify the bytes against the version's stored CRC: catches bit rot or a
+	 * misread that happened since the index was built */
+	if (ps_crc32c(out, page_size) != v->crc)
+		return -2;
 	return 0;
 }
 
@@ -1469,8 +1657,13 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 			else
 			{
+				int			rv;
+
 				s->rr_seg++;
-				served = (read_version(pv, out) == 0);	/* segment fallback */
+				rv = read_version(pv, out);		/* segment fallback */
+				if (rv == -2)
+					return -1;	/* corrupt stored page: surface, don't zero-fill */
+				served = (rv == 0);
 			}
 			if (served && !ambig)
 				ps_pgcache_insert(&s->pgcache, tl, key, block, pv->lsn, out);
@@ -1492,13 +1685,100 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * (page_add_version + fork_grow) for every record reconstructs both indexes and
  * leaves the append cursor positioned just past the last valid record.
  *
+ * The scan stops at the first record that fails its magic/gen/len/CRC check
+ * (end-of-log).  Because appends are not synced per record, that record may be an
+ * unsynced torn tail (expected after a crash) or corruption of already-synced
+ * data; without a durable per-shard sync watermark the two are indistinguishable,
+ * so recovery truncates there rather than refusing to open over a normal tail.
+ * Returns 0 on success, -1 only on allocation failure (so ps_core_open() does not
+ * open with an empty index over a real store).
+ *
  * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.  Also a partial/torn trailing record
- * is simply treated as end-of-log (the magic/len check below stops the scan).
+ * effects are not reproduced on restart.  Telling synced-data corruption from an
+ * unsynced tail (to fail loudly on the former) is deferred to the sync-watermark
+ * work noted in SPDK_NOTES.
  */
-static void
+/*
+ * Physically clear the written bytes from (seg, off) forward in a shard's
+ * segments, so a truncated tail cannot be resurrected: the old records past a
+ * truncation point keep valid CRCs at their own offsets, so after the daemon
+ * overwrites only some of them and crashes again, the next recover would otherwise
+ * replay the untouched ones.
+ *
+ * Idempotent and self-bounding: it reads each chunk (only up to the segment's
+ * written size) and rewrites zeros ONLY where it finds non-zero bytes.  So a clean
+ * tail (cursor already at the segment's end) scans nothing, an already-zeroed tail
+ * costs reads but no writes/sync, and -- crucially -- a recovery interrupted partway
+ * through zeroing is finished by the next one (it scans the whole tail rather than
+ * trusting a single probe).  Returns 1 if it wrote anything (caller must sync), 0
+ * if nothing, -1 on error.
+ */
+static int
+zero_shard_forward(uint32_t shard, int seg, uint64_t off)
+{
+	uint32_t	local = seg_local(seg);
+	unsigned char *zbuf = calloc(1, page_size);
+	unsigned char *rb = malloc(page_size);
+	int			wrote = 0;
+	int			err = 0;
+
+	if (!zbuf || !rb)
+	{
+		free(zbuf);
+		free(rb);
+		return -1;
+	}
+	for (;; local++, off = 0)
+	{
+		int			id = seg_id(shard, local);
+		int64_t		sz = ps_storage->seg_size(id);
+
+		if (sz < 0)
+			break;				/* no more segments in this shard */
+		for (uint64_t p = off; p < (uint64_t) sz && !err;)
+		{
+			uint32_t	n = ((uint64_t) sz - p > page_size)
+				? page_size : (uint32_t) ((uint64_t) sz - p);
+			int			nz = 0;
+
+			if (ps_storage->seg_read(id, p, rb, n) != 0)
+			{
+				err = 1;
+				break;
+			}
+			for (uint32_t k = 0; k < n; k++)
+				if (rb[k])
+				{
+					nz = 1;
+					break;
+				}
+			if (nz)
+			{
+				if (ps_storage->seg_write(id, p, zbuf, n) != 0)
+				{
+					err = 1;
+					break;
+				}
+				wrote = 1;
+			}
+			p += n;
+		}
+		if (err)
+			break;
+	}
+	free(zbuf);
+	free(rb);
+	return err ? -1 : wrote;
+}
+
+static int
 recover(void)
 {
+	unsigned char *pg = malloc(page_size);	/* scratch to read+verify each page */
+	int			need_sync = 0;	/* a tail was zeroed and must be made durable */
+
+	if (!pg)
+		return -1;				/* don't open with an empty index over a real store */
 	/* Each shard owns a disjoint segment-id namespace, so scan and replay each
 	 * shard's segments and position its own append cursor.  page_add_version()
 	 * self-routes by key, so a record always lands on the shard that wrote it. */
@@ -1510,8 +1790,9 @@ recover(void)
 		{
 			int			id = seg_id(s->index, local);
 			uint64_t	off = 0;
+			int64_t		sz = ps_storage->seg_size(id);
 
-			if (ps_storage->seg_size(id) < 0)
+			if (sz < 0)
 				break;			/* no more segments in this shard -> done */
 
 			/* replay records until one fails to validate (end of log) */
@@ -1519,12 +1800,53 @@ recover(void)
 			{
 				SegRecHdr	hdr;
 
-				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
-					hdr.magic != SEG_MAGIC || hdr.len != page_size)
+				/*
+				 * Stop at the first record that does not verify -- a torn/unsynced
+				 * trailing append, a never-written tail, or stale device bytes from
+				 * before this store.  Truncating here is safe (it never refuses to
+				 * open over a normal post-crash tail), and zero_shard_forward() below
+				 * physically discards the rest.
+				 *
+				 * But distinguish an expected short tail from a real backend read
+				 * error: a full record needs sizeof(hdr)+page_size bytes present, so
+				 * bytes past the segment's written size are the tail (break), while a
+				 * seg_read failure WITHIN that size is an actual I/O error -- fail the
+				 * open rather than truncate, which could otherwise zero live data on a
+				 * transient read fault.  (On SPDK seg_size() reports a present segment
+				 * as full, so its tail is detected by the magic/gen/CRC check on the
+				 * stale bytes, and only a real do_io failure reaches the -1 paths.)
+				 */
+				if (off + sizeof(hdr) + page_size > (uint64_t) sz)
 					break;
+				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0)
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: header "
+							"read failed; refusing to recover\n",
+							s->index, id, (unsigned long long) off);
+					free(pg);
+					return -1;
+				}
+				if (hdr.magic != SEG_MAGIC || hdr.len != page_size ||
+					hdr.gen != g_store_gen)
+					break;
+				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0)
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: page "
+							"read failed; refusing to recover\n",
+							s->index, id, (unsigned long long) off);
+					free(pg);
+					return -1;
+				}
+				if (seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: record "
+							"failed CRC; treating as end of log\n",
+							s->index, id, (unsigned long long) off);
+					break;
+				}
 
 				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
-								 off + sizeof(hdr));
+								 off + sizeof(hdr), ps_crc32c(pg, page_size));
 				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 				off += sizeof(hdr) + hdr.len;
 			}
@@ -1539,12 +1861,77 @@ recover(void)
 			/* newest segment seen for this shard; its append continues after it */
 			s->cur_seg = id;
 			s->cur_off = off;
+			/* If the scan stopped with room left for another record, this segment is
+			 * the shard's end -- a tail or a mid-log corruption -- not a rolled-full
+			 * one.  Stop the shard here; continuing would index a later segment while
+			 * leaving the cursor mid-this-one, silently dropping the gap between. */
+			if (off + sizeof(SegRecHdr) + page_size <= segment_size)
+				break;
 		}
 		if (s->cur_seg >= 0)
 			fprintf(stderr, "pagestore_daemon: shard %u recovered through segment "
 					"%d (off %llu)\n", s->index, s->cur_seg,
 					(unsigned long long) s->cur_off);
+
+		if (s->cur_seg < 0)
+		{
+			/*
+			 * Recovered nothing from this shard.  If its first segment nonetheless
+			 * holds non-zero data, we could not replay it -- a wrong --page-size, a
+			 * corrupt or foreign store_gen, or corruption of the very first record.
+			 * That is indistinguishable from stale raw-device bytes, and zeroing it
+			 * would erase a valid store merely opened with the wrong config, so fail
+			 * open instead.  A fresh store has no first segment (or an all-zero one
+			 * from a prior truncation) and opens normally.
+			 */
+			int			first = seg_id(s->index, 0);
+			SegRecHdr	probe;
+
+			if (ps_storage->seg_size(first) >= 0 &&
+				ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
+				for (size_t k = 0; k < sizeof(probe); k++)
+					if (((unsigned char *) &probe)[k])
+					{
+						fprintf(stderr, "pagestore: shard %u: existing segment data "
+								"could not be recovered (wrong --page-size, or a "
+								"corrupt/foreign store generation); refusing to "
+								"recover\n", s->index);
+						free(pg);
+						return -1;
+					}
+		}
+		else
+		{
+			/*
+			 * Physically clear any written bytes past the append cursor so a
+			 * torn/corrupt/stale tail can't resurrect after a partial overwrite +
+			 * crash.  zero_shard_forward() is idempotent and self-bounding: a clean
+			 * tail (cursor at the segment's written end) scans nothing, an already-
+			 * zeroed tail writes nothing, and a previously-interrupted zeroing is
+			 * finished here -- so it is safe to run unconditionally.
+			 */
+			int			z = zero_shard_forward(s->index, s->cur_seg, s->cur_off);
+
+			if (z < 0)
+			{
+				free(pg);
+				return -1;
+			}
+			if (z)
+				need_sync = 1;
+		}
 	}
+	if (need_sync && ps_storage->sync() != 0)
+	{
+		/* the truncation is only in memory; opening now would let a later crash
+		 * replay the stale records we meant to drop -- fail the open instead */
+		fprintf(stderr, "pagestore: could not durably zero a truncated tail; "
+				"refusing to recover\n");
+		free(pg);
+		return -1;
+	}
+	free(pg);
+	return 0;
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -1826,6 +2213,19 @@ ps_core_maintenance(void)
 	return 0;
 }
 
+/* fsync a store directory so a freshly created metadata file's entry is durable */
+static void
+fsync_store_dir(const char *store_dir)
+{
+	int			fd = open(store_dir, O_RDONLY);
+
+	if (fd >= 0)
+	{
+		fsync(fd);
+		close(fd);
+	}
+}
+
 /*
  * The store records the shard count it was created with.  Per-shard segment and
  * manifest namespaces -- and how recover() partitions segments -- are derived
@@ -1886,6 +2286,63 @@ validate_store_nshards(const char *store_dir)
 		return -1;
 	}
 	close(fd);
+	fsync_store_dir(store_dir);	/* make the new file's directory entry durable */
+	return 0;
+}
+
+/*
+ * Persist and validate the store's segment_size.  recover() interprets segment
+ * boundaries (where a segment is "full" and rolls) from segment_size, so reopening
+ * a POSIX store with a different --segment-size would mis-locate the log tail and
+ * could truncate/zero live later segments.  (SPDK records segment_size in its
+ * superblock; this gives POSIX -- and any backend -- the same protection.)
+ * Returns 0 on match / first-time record, -1 on mismatch or I/O error.
+ */
+static int
+validate_store_segment_size(const char *store_dir)
+{
+	char		path[4096];
+	char		buf[64];
+	int			fd;
+	ssize_t		n;
+
+	if (snprintf(path, sizeof(path), "%s/segment_size", store_dir) >=
+		(int) sizeof(path))
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		uint64_t	stored;
+
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			return -1;
+		buf[n] = '\0';
+		stored = strtoull(buf, NULL, 10);
+		if (stored != segment_size)
+		{
+			fprintf(stderr, "pagestore_core: store was created with segment_size "
+					"%llu; reopen with --segment-size %llu\n",
+					(unsigned long long) stored, (unsigned long long) stored);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* first open of this store: record segment_size durably */
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	n = snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long) segment_size);
+	if (write(fd, buf, (size_t) n) != n || fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	fsync_store_dir(store_dir);	/* make the new file's directory entry durable */
 	return 0;
 }
 
@@ -1900,12 +2357,26 @@ validate_store_nshards(const char *store_dir)
 int
 ps_core_open(const char *store_dir)
 {
+	crc32c_init();				/* before recover() and any worker thread */
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
+	/* Validate --nshards against the stored value BEFORE minting a generation: the
+	 * freshness check below probes the live shards' first segments, so a wrong
+	 * nshards could misjudge an existing store as fresh and durably write a new
+	 * store_gen before this rejected the mismatch -- leaving the real records'
+	 * generations stale on the next correct-nshards open. */
 	if (validate_store_nshards(store_dir) != 0)
 		return -1;
+	if (validate_store_segment_size(store_dir) != 0)
+		return -1;
+	if (load_store_gen(store_dir) != 0)	/* generation stamped into each record */
+	{
+		fprintf(stderr, "pagestore_core: could not durably establish store "
+				"generation in %s\n", store_dir);
+		return -1;
+	}
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  Reject
@@ -1935,6 +2406,16 @@ ps_core_open(const char *store_dir)
 	{
 		fprintf(stderr, "pagestore_core: --cache-pages must be >= 0 (got %d)\n",
 				cache_pages);
+		return -1;
+	}
+	/* a segment record (header + one page) must fit in a segment; otherwise a
+	 * grossly-wrong --page-size would make recover()'s first record overflow the
+	 * segment and be mis-handled */
+	if (sizeof(SegRecHdr) + page_size > segment_size)
+	{
+		fprintf(stderr, "pagestore_core: page_size %u + record header exceeds "
+				"segment_size %llu\n", page_size,
+				(unsigned long long) segment_size);
 		return -1;
 	}
 
@@ -2004,7 +2485,8 @@ ps_core_open(const char *store_dir)
 	 * already-flushed segment prefix via a persisted flush watermark is a
 	 * deferred optimization.)
 	 */
-	recover();
+	if (recover() != 0)			/* corruption or OOM: don't open over a real store */
+		return -1;
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log (WAL is shard-0,
 	 * single-threaded here; all shards' timeline copies are identical) */

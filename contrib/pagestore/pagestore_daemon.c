@@ -154,16 +154,30 @@ handle_request(PsChannel *ch)
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				unsigned char *dst = ch->data + (size_t) i * page_size;
+				int			r = read_resolve(tl, &ch->key, ch->blocknum + i,
+											 UINT64_MAX, dst);
 
-				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst))
+				if (r < 0)		/* corrupt stored page: fail, don't serve zeros */
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
+				if (r == 0)
 					memset(dst, 0, page_size);	/* unwritten -> zeros */
 			}
 			break;
 
 		case PS_OP_READ_AT:
 			/* as-of read on this timeline, honoring branch ancestry */
-			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
-				memset(ch->data, 0, page_size);
+			{
+				int			r = read_resolve(tl, &ch->key, ch->blocknum,
+											 ch->req_lsn, ch->data);
+
+				if (r < 0)
+					ch->status = PS_STATUS_ERROR;
+				else if (r == 0)
+					memset(ch->data, 0, page_size);
+			}
 			break;
 
 		default:
