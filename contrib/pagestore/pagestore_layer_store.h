@@ -49,4 +49,12 @@ extern const PsLayerStore *ps_layer_store;
  */
 extern int	ps_layer_store_set_object_dir(const char *dir);
 
+/*
+ * 1 if this store has ever used the object tier (its object-id marker exists).
+ * GC uses it to decide whether a non-remote-durable layer being removed while the
+ * tier is disabled might still have an orphaned object that must be preserved for
+ * a later tier-enabled cleanup.
+ */
+extern int	ps_layer_store_object_used(void);
+
 #endif							/* PAGESTORE_LAYER_STORE_H */

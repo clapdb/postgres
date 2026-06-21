@@ -41,26 +41,43 @@ static uint64_t object_store_id;
 
 const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
 
-/* Load the persisted store id from <store_dir>/object_store_id, generating and
- * persisting a fresh one (random, else a hash of the path) on first open. */
-static void
-load_store_id(const char *store_dir)
+static int	local_fsync_dir(void);	/* forward: defined below */
+
+/* path of the per-store object-id marker, under layer_dir */
+static int
+store_id_path(char *buf, size_t buflen)
+{
+	int			n = snprintf(buf, buflen, "%s/object_store_id", layer_dir);
+
+	return (n < 0 || (size_t) n >= buflen) ? -1 : 0;
+}
+
+/*
+ * Load the persisted store id, generating + durably persisting a fresh one on
+ * first use of the object tier.  Returns 0 on success, -1 if a fresh id cannot be
+ * made durable (file contents + directory entry fsync'd) -- the caller then fails
+ * the open, since uploading objects under an id a crash could lose would orphan
+ * them irrecoverably.
+ */
+static int
+load_store_id(void)
 {
 	char		path[2200];
 	int			fd;
 
 	object_store_id = 0;
-	snprintf(path, sizeof(path), "%s/object_store_id", store_dir);
+	if (store_id_path(path, sizeof(path)) != 0)
+		return -1;
 
 	fd = open(path, O_RDONLY);
 	if (fd >= 0)
 	{
-		if (read(fd, &object_store_id, sizeof(object_store_id)) !=
-			(ssize_t) sizeof(object_store_id))
-			object_store_id = 0;
+		ssize_t		r = read(fd, &object_store_id, sizeof(object_store_id));
+
 		close(fd);
-		if (object_store_id != 0)
-			return;
+		if (r == (ssize_t) sizeof(object_store_id) && object_store_id != 0)
+			return 0;			/* already durable from a prior open */
+		object_store_id = 0;
 	}
 
 	fd = open("/dev/urandom", O_RDONLY);
@@ -76,32 +93,47 @@ load_store_id(const char *store_dir)
 		/* deterministic fallback: FNV-1a of the store path (distinct per store) */
 		uint64_t	h = 1469598103934665603ULL;
 
-		for (const char *p = store_dir; *p; p++)
+		for (const char *p = layer_dir; *p; p++)
 			h = (h ^ (unsigned char) *p) * 1099511628211ULL;
 		object_store_id = h ? h : 1;
 	}
 
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-	if (fd >= 0)
+	if (fd < 0)
 	{
-		ssize_t		w = write(fd, &object_store_id, sizeof(object_store_id));
-
-		(void) w;				/* best-effort persist */
-		fsync(fd);
-		close(fd);
-	}
-	else
-	{
-		/* lost a create race: adopt the persisted id */
-		fd = open(path, O_RDONLY);
-		if (fd >= 0)
+		/* lost a create race: adopt the peer's now-durable id */
+		if (errno == EEXIST && (fd = open(path, O_RDONLY)) >= 0)
 		{
 			ssize_t		r = read(fd, &object_store_id, sizeof(object_store_id));
 
-			(void) r;			/* on a short read keep our generated id */
 			close(fd);
+			if (r == (ssize_t) sizeof(object_store_id) && object_store_id != 0)
+				return 0;
 		}
+		return -1;
 	}
+	if (write(fd, &object_store_id, sizeof(object_store_id)) !=
+		(ssize_t) sizeof(object_store_id) || fsync(fd) != 0)
+	{
+		close(fd);
+		unlink(path);
+		return -1;
+	}
+	close(fd);
+	return local_fsync_dir();	/* make the new id's directory entry durable */
+}
+
+/* 1 if this store has ever used the object tier (the id marker exists), so a
+ * tier-off GC keeps entries that might still have an orphaned object. */
+int
+ps_layer_store_object_used(void)
+{
+	char		path[2200];
+	struct stat st;
+
+	if (layer_dir[0] == '\0' || store_id_path(path, sizeof(path)) != 0)
+		return 0;
+	return stat(path, &st) == 0 ? 1 : 0;
 }
 
 int
@@ -203,7 +235,10 @@ local_open(const char *store_dir)
 	n = snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(layer_dir))
 		return -1;
-	load_store_id(store_dir);	/* per-store object-key namespace */
+	/* establish a durable per-store object-key namespace only when the object
+	 * tier is configured; failing to make the id durable fails the open */
+	if (object_dir[0] != '\0' && load_store_id() != 0)
+		return -1;
 	return 0;
 }
 

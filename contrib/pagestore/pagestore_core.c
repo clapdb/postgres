@@ -357,12 +357,19 @@ gc_remove_layer(Shard *s, const PsLayerDesc *d)
 	if (d->remote_durable)
 		return;					/* keep the entry as a remote tombstone */
 	/* Not remote-durable, but an upload may have copied the object before the
-	 * daemon crashed without persisting SET_REMOTE_DURABLE.  Delete that orphan
-	 * before dropping the entry, else the object tier leaks an object no future
-	 * GC can find.  Best-effort: if the delete fails, keep the entry so a later
-	 * gc_resume retries rather than orphaning it. */
-	if (ps_object_tier && ps_layer_store->layer_exists_remote(d) == 1 &&
-		ps_layer_store->delete_remote_layer(d) != 0)
+	 * daemon crashed without persisting SET_REMOTE_DURABLE.  With the tier
+	 * configured, delete that orphan before dropping the entry (keep the entry if
+	 * the delete fails, so a later gc_resume retries).  With the tier disabled we
+	 * cannot check or delete it, so if this store ever used the object tier keep
+	 * the entry until a tier-enabled run can prove/clean it -- dropping it now
+	 * would leak an object no later run could discover. */
+	if (ps_object_tier)
+	{
+		if (ps_layer_store->layer_exists_remote(d) == 1 &&
+			ps_layer_store->delete_remote_layer(d) != 0)
+			return;
+	}
+	else if (ps_layer_store_object_used())
 		return;
 	ps_manifest_remove_layer(&s->manifest, d->layer_id);
 }
@@ -1774,11 +1781,14 @@ maintain_shard(Shard *s)
 
 		if (u > 0)
 		{
-			s->upload_cooldown = 0;
+			s->upload_cooldown = 0;	/* drained one; retry next tick for the rest */
 			return 1;
 		}
-		if (u < 0)
-			s->upload_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+		/* u == 0 (nothing pending) or u < 0 (failed): back off either way, so a
+		 * quiescent daemon doesn't re-scan the manifest -- stat()-ing every durable
+		 * layer -- on every 20us idle tick.  A newly sealed layer waits at most one
+		 * cooldown before its upload, which is fine off the write path. */
+		s->upload_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
 	}
 	return 0;
 }
