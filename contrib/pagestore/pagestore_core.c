@@ -279,10 +279,14 @@ static int
 record_layer(void *ctx, const PsLayerDesc *desc)
 {
 	Shard	   *s = ctx;
+	int			rc;
 
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
-	return ps_manifest_add_layer(&s->manifest, desc);
+	rc = ps_manifest_add_layer(&s->manifest, desc);
+	if (rc == 0)
+		s->upload_cooldown = 0;	/* a fresh layer to upload ends any idle backoff */
+	return rc;
 }
 
 /* ===================== compaction & GC (LSM phase 3) =================== */
