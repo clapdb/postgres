@@ -122,6 +122,7 @@ load_store_gen(const char *store_dir)
 	char		path[2200];
 	int			fd;
 	uint64_t	g = 0;
+	int			existed = 0;
 
 	snprintf(path, sizeof(path), "%s/store_gen", store_dir);
 	fd = open(path, O_RDONLY);
@@ -130,6 +131,7 @@ load_store_gen(const char *store_dir)
 		ssize_t		r = read(fd, &g, sizeof(g));
 
 		close(fd);
+		existed = 1;
 		if (r == (ssize_t) sizeof(g) && g != 0)
 		{
 			g_store_gen = g;
@@ -137,6 +139,25 @@ load_store_gen(const char *store_dir)
 		}
 		g = 0;
 	}
+
+	/*
+	 * No usable generation on disk.  Only mint one for a genuinely fresh store: if
+	 * segment data already exists, a missing or short store_gen means lost or
+	 * mismatched metadata (a restored/copied store, a deleted file), and minting a
+	 * new generation would make recover() treat every existing record as stale and
+	 * silently discard the whole log.  Fail open so the loss is visible.
+	 * (Segment id 0 is shard 0's first segment -- the first one any store writes.)
+	 */
+	if (ps_storage->seg_size(0) >= 0)
+		return -1;
+
+	/*
+	 * Fresh store: a leftover short/zero file (e.g. a crash mid-create) cannot have
+	 * stamped any record yet, so remove and recreate it rather than wedging every
+	 * future open on the EEXIST path below.
+	 */
+	if (existed)
+		unlink(path);
 
 	fd = open("/dev/urandom", O_RDONLY);
 	if (fd >= 0)
