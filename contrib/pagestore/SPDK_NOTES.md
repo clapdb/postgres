@@ -304,5 +304,69 @@ contrib/pagestore/spdk_setup.sh
 - Does the daemon stay one `spdk_app`, or split (control-plane PG contrib +
   data-plane SPDK app)?  Leaning single app for now.
 - Hugepage reservation persistence across reboot (sysctl `vm.nr_hugepages`).
-</content>
-</invoke>
+
+## Why raw NVMe, not the SPDK blobstore
+
+The backend (`storage_spdk.c`) uses the **raw NVMe driver** (`spdk/nvme.h` +
+`spdk/env.h`): `spdk_nvme_probe`/`attach`, one `spdk_nvme_ctrlr_alloc_io_qpair`
+per shard, and `spdk_nvme_ns_cmd_read/write` against the namespace.  It is **not**
+built on the SPDK blobstore (`spdk/blob.h`, `spdk_bs_*`) and does not go through
+the bdev layer.
+
+- Segment id `S`, offset `O` maps **linearly** to device byte `S*segment_size+O`;
+  the current append segment is held in a DMA buffer and flushed on roll-over /
+  sync.  A small superblock `<store>/spdk_super` records each shard's segment
+  count (which segments hold data); `recover()` scans those to rebuild the index.
+- Rationale: the page store's upper half is already an LSM (memtable -> image /
+  delta layers, a persistent manifest, COW branches, an object tier).  It only
+  needs "append immutable segment bytes to a raw device and read them back by
+  offset."  The blobstore's blob allocation, cluster map, and metadata
+  persistence would duplicate — and could fight — our own manifest/layer
+  lifecycle.  The thinnest layer (raw namespace + linear map, all metadata ours)
+  matches the "follow ScyllaDB, stay lean" principle.
+- Cost / assumptions: we own sector alignment, segment-count durability, and space
+  reclamation; segments are fixed-size and laid out linearly, which is why
+  multi-shard uses interleaved seg ids (`shard + k*nshards`) to keep the id space
+  dense (a sparse map would punch large holes at `S*segment_size`).  We assume a
+  **single store owns the raw namespace exclusively**.  Thin provisioning,
+  device-level snapshots, or several stores sharing one disk would argue for the
+  blobstore (or a self-managed extent allocator) later.
+
+## Verification & recovery without a filesystem
+
+On the raw namespace there is no FS to provide file existence, atomic rename,
+directory durability, sparse-zero reads, or fsck.  What we cover ourselves, and
+the gaps that remain on the SPDK path:
+
+Covered:
+- **Which segments are valid** — `spdk_super` per-shard segment counts, written
+  from a post-flush snapshot at IMMEDSYNC (so it never advertises an unflushed
+  segment) and re-derived by `recover()`.  Geometry/`nshards` mismatch or a
+  legacy/foreign superblock is rejected (or migrated when `nshards==1`) instead of
+  treated as fresh.
+- **End-of-log within a segment** — each page record carries `SegRecHdr.magic`
+  (`SEGR`) + `len`; `recover()` replays until the first record that fails
+  `magic == SEG_MAGIC && len == page_size`, and a segment with no valid record is
+  the shard's end-of-log.
+- **Layer integrity** — image/delta layers are checksummed (`img_crc` per page +
+  footer `data_crc`/`index_crc` + `PS_IMG_MAGIC`), and compaction re-verifies a
+  page against its index crc.
+
+Gaps (worth closing before this path is trusted for durability):
+- **No per-record/per-page checksum on the segment path.**  `SegRecHdr` has magic
+  + len but no crc, and the SPDK daemon serves reads straight from segments
+  (`use_layers = 0`), so a torn write, bit rot, or — on a raw device that is *not*
+  zeroed — stale prior-tenant bytes that happen to carry a `SEGR` magic would be
+  replayed/served as a valid page with no detection.  An FS would mask the
+  last case (a never-written extent reads back as zeros); a raw namespace does
+  not.  Plan: add a crc over (header + page) to `SegRecHdr`, verify it in
+  `recover()` and on the SPDK read path, and treat a magic-match-but-crc-fail
+  record as end-of-log.
+- **No torn-write atomicity** beyond the magic sentinel: a partial record mid
+  segment with a plausible header is only caught once the crc above exists.
+- **No cross-structure consistency check (fsck-equivalent)** that the superblock
+  counts, the on-device segment contents, and the manifest's layers agree.
+- **Device hygiene**: nothing zeroes or generation-stamps a freshly claimed
+  namespace, so the stale-magic risk above is real on a reused disk.  Options: a
+  per-store generation/uuid stamped into each `SegRecHdr` (mismatch == end-of-log),
+  or trimming/zeroing the device region a store owns at first open.
