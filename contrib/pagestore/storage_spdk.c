@@ -67,6 +67,7 @@ typedef struct PsSpdkRd
 } PsSpdkRd;
 
 #define SPDK_SUPER_MAGIC	0x53504b54	/* "SPKT" (per-shard segment counts) */
+#define SPDK_SUPER_MAGIC_V1 0x53504b53	/* "SPKS" (legacy single segment count) */
 
 typedef struct SpdkSuper
 {
@@ -76,6 +77,15 @@ typedef struct SpdkSuper
 	uint32_t	nshards;		/* the store's shard count (must match to reuse) */
 	uint32_t	num_segments[PS_MAX_SHARDS];	/* per-shard local segment count */
 } SpdkSuper;
+
+/* legacy on-disk superblock (pre-step-5b): one global segment count, no nshards */
+typedef struct SpdkSuperV1
+{
+	uint32_t	magic;
+	uint32_t	sector_size;
+	uint64_t	segment_size;
+	uint32_t	num_segments;
+} SpdkSuperV1;
 
 /*
  * Per-shard I/O state (sharding step 5).  Each shard's worker thread owns its own
@@ -198,11 +208,17 @@ super_write(void)
 	fclose(f);
 }
 
-static void
+/*
+ * Load the persisted per-shard segment counts.  Returns 0 on success (fresh
+ * store, current format, or a migrated legacy single-shard store) and -1 on an
+ * incompatible superblock, so the caller fails the open rather than silently
+ * treating existing on-device data as fresh and overwriting it.
+ */
+static int
 super_read(void)
 {
 	char		path[2300];
-	SpdkSuper	s;
+	uint32_t	magic;
 	FILE	   *f;
 
 	for (uint32_t sh = 0; sh < g_nshards; sh++)
@@ -210,15 +226,49 @@ super_read(void)
 	super_path(path, sizeof(path));
 	f = fopen(path, "rb");
 	if (!f)
-		return;
-	/* reuse the on-device data only if geometry AND shard count match (a different
-	 * nshards reinterprets the interleaved seg-id space, so treat it as fresh) */
-	if (fread(&s, sizeof(s), 1, f) == 1 && s.magic == SPDK_SUPER_MAGIC &&
-		s.sector_size == g_sector && s.segment_size == g_segsize &&
-		s.nshards == g_nshards)
-		for (uint32_t sh = 0; sh < g_nshards; sh++)
-			g_spdk[sh].num_segments = s.num_segments[sh];
+		return 0;				/* no super -> fresh store */
+	if (fread(&magic, sizeof(magic), 1, f) != 1)
+	{
+		fclose(f);
+		return -1;				/* unreadable/corrupt */
+	}
+	rewind(f);
+
+	if (magic == SPDK_SUPER_MAGIC)
+	{
+		SpdkSuper	s;
+
+		/* reuse the on-device data only if geometry AND shard count match -- a
+		 * different nshards reinterprets the interleaved seg-id space */
+		if (fread(&s, sizeof(s), 1, f) == 1 && s.sector_size == g_sector &&
+			s.segment_size == g_segsize && s.nshards == g_nshards)
+		{
+			for (uint32_t sh = 0; sh < g_nshards; sh++)
+				g_spdk[sh].num_segments = s.num_segments[sh];
+			fclose(f);
+			return 0;
+		}
+		fclose(f);
+		return -1;				/* current format but mismatched geometry/nshards */
+	}
+	if (magic == SPDK_SUPER_MAGIC_V1)
+	{
+		SpdkSuperV1 v1;
+
+		/* legacy single-count store is only meaningful at nshards == 1 (seg ids
+		 * were 0,1,2,...); migrate it, else refuse rather than lose the data */
+		if (g_nshards == 1 && fread(&v1, sizeof(v1), 1, f) == 1 &&
+			v1.sector_size == g_sector && v1.segment_size == g_segsize)
+		{
+			g_spdk[0].num_segments = v1.num_segments;
+			fclose(f);
+			return 0;
+		}
+		fclose(f);
+		return -1;
+	}
 	fclose(f);
+	return -1;					/* unknown magic */
 }
 
 /* --- current-segment buffer management ----------------------------------- */
@@ -361,7 +411,12 @@ spdk_open(const char *path, uint64_t segment_size)
 		S->nfree = PS_SPDK_POOL;
 	}
 
-	super_read();				/* segment count: fresh dir -> 0 */
+	if (super_read() != 0)		/* segment counts: fresh dir -> 0, else load/migrate */
+	{
+		fprintf(stderr, "storage_spdk: incompatible spdk_super "
+				"(format/geometry/nshards mismatch); refusing to open\n");
+		return -1;
+	}
 
 	fprintf(stderr, "storage_spdk: %s ns1 sector=%u segsize=%llu segments=%u "
 			"nshards=%u\n", pci, g_sector, (unsigned long long) g_segsize,
@@ -564,6 +619,29 @@ ps_spdk_poll(uint32_t shard)
 	if (shard >= g_nshards)
 		return 0;
 	return spdk_nvme_qpair_process_completions(g_spdk[shard].qpair, 0);
+}
+
+/*
+ * Flush one shard's current-segment buffer to the device.  Must be called from
+ * that shard's own worker thread (it drives the shard's qpair), which is how the
+ * SPDK daemon coordinates a cross-shard IMMEDSYNC: each shard flushes itself.
+ */
+int
+ps_spdk_flush(uint32_t shard)
+{
+	if (shard >= g_nshards)
+		return 0;
+	return flush_curbuf(&g_spdk[shard]);
+}
+
+/* Persist the per-shard segment counts (the superblock).  Called once, by the
+ * worker coordinating an IMMEDSYNC, after every shard has flushed; the counts
+ * only grow and a short/empty trailing segment reads as end-of-log, so a count
+ * that a concurrent append nudged up is safe for recover(). */
+void
+ps_spdk_super_sync(void)
+{
+	super_write();
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */

@@ -71,6 +71,53 @@ typedef struct ReqState
 
 static ReqState reqstate[PS_MAX_CHANNELS];
 
+/*
+ * Cross-shard IMMEDSYNC coordination.  A shard's curbuf/qpair may only be touched
+ * by its own worker, so a global durability barrier can't flush every shard from
+ * one thread.  Instead the worker that receives IMMEDSYNC flushes its own shard
+ * and sets g_flush_req[s] for every other shard; each worker flushes its own
+ * curbuf when it sees its flag set.  g_super_mtx serializes the superblock write
+ * so two concurrent syncs can't corrupt it.
+ */
+static volatile int g_flush_req[PS_MAX_SHARDS];
+static pthread_mutex_t g_super_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Durability barrier for one IMMEDSYNC, run by the receiving worker 'w'. */
+static void
+immedsync_barrier(uint32_t shard)
+{
+	ps_spdk_flush(shard);		/* this worker's own shard */
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		if (s != shard)
+			__atomic_store_n(&g_flush_req[s], 1, __ATOMIC_RELEASE);
+	for (;;)
+	{
+		int			pending = 0;
+
+		/* service a request aimed at us too, so two concurrent syncs (each
+		 * waiting on the other) cannot deadlock */
+		if (__atomic_load_n(&g_flush_req[shard], __ATOMIC_ACQUIRE))
+		{
+			ps_spdk_flush(shard);
+			__atomic_store_n(&g_flush_req[shard], 0, __ATOMIC_RELEASE);
+		}
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			if (s != shard && __atomic_load_n(&g_flush_req[s], __ATOMIC_ACQUIRE))
+				pending = 1;
+		if (!pending)
+			break;
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	/* persist the per-shard segment counts once, serialized */
+	pthread_mutex_lock(&g_super_mtx);
+	ps_spdk_super_sync();
+	pthread_mutex_unlock(&g_super_mtx);
+}
+
 /* one page read finished: cache the page, and when the last of a request lands
  * publish the reply */
 static void
@@ -286,13 +333,30 @@ spdk_worker_main(void *arg)
 			 * drive another shard's state/qpair from this thread.  PS_ANY_SHARD
 			 * ops (e.g. IMMEDSYNC) run anywhere. */
 			owner = ps_request_shard(ch);
-			if (owner != PS_ANY_SHARD && owner != w->shard)
+			if (ch->opcode == PS_OP_IMMEDSYNC)
+			{
+				/* global durability barrier: each shard flushes its own qpair
+				 * (begin()->spdk_sync would flush every shard from this one
+				 * thread, racing the other shards' single-owner qpairs) */
+				immedsync_barrier(w->shard);
+				ch->status = PS_STATUS_OK;
+				ps_store_release(&ch->state, PS_STATE_DONE);
+			}
+			else if (owner != PS_ANY_SHARD && owner != w->shard)
 			{
 				ch->status = PS_STATUS_ERROR;
 				ps_store_release(&ch->state, PS_STATE_DONE);
 			}
 			else
 				begin(i, ch);	/* publishes DONE (sync) or via read_done (async) */
+			work = 1;
+		}
+
+		/* flush our own shard if another shard's IMMEDSYNC barrier requested it */
+		if (__atomic_load_n(&g_flush_req[w->shard], __ATOMIC_ACQUIRE))
+		{
+			ps_spdk_flush(w->shard);
+			__atomic_store_n(&g_flush_req[w->shard], 0, __ATOMIC_RELEASE);
 			work = 1;
 		}
 
