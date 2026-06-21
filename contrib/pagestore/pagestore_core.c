@@ -1698,10 +1698,45 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * unsynced tail (to fail loudly on the former) is deferred to the sync-watermark
  * work noted in SPDK_NOTES.
  */
+/*
+ * Physically clear everything from (seg, off) forward in a shard's segments, so a
+ * truncated tail cannot be resurrected: the old records past a truncation point
+ * keep valid CRCs at their own offsets, so after the daemon overwrites only some of
+ * them and crashes again, the next recover would otherwise replay the untouched
+ * ones.  Zeroing their headers makes them unreadable.  zbuf is page_size zeros.
+ * Returns 1 if it wrote anything (caller must sync), 0 if nothing, -1 on error.
+ */
+static int
+zero_shard_forward(uint32_t shard, int seg, uint64_t off, unsigned char *zbuf)
+{
+	uint32_t	local = seg_local(seg);
+	int			wrote = 0;
+
+	for (;; local++, off = 0)
+	{
+		int			id = seg_id(shard, local);
+
+		if (ps_storage->seg_size(id) < 0)
+			break;				/* no more segments in this shard */
+		for (uint64_t p = off; p < segment_size;)
+		{
+			uint32_t	n = (segment_size - p > page_size)
+				? page_size : (uint32_t) (segment_size - p);
+
+			if (ps_storage->seg_write(id, p, zbuf, n) != 0)
+				return -1;
+			p += n;
+			wrote = 1;
+		}
+	}
+	return wrote;
+}
+
 static int
 recover(void)
 {
 	unsigned char *pg = malloc(page_size);	/* scratch to read+verify each page */
+	int			need_sync = 0;	/* a tail was zeroed and must be made durable */
 
 	if (!pg)
 		return -1;				/* don't open with an empty index over a real store */
@@ -1777,7 +1812,47 @@ recover(void)
 			fprintf(stderr, "pagestore_daemon: shard %u recovered through segment "
 					"%d (off %llu)\n", s->index, s->cur_seg,
 					(unsigned long long) s->cur_off);
+
+		/*
+		 * Physically clear the tail past the append cursor when it could hold
+		 * resurrectable records: either segments exist beyond the cursor, or the
+		 * stop point holds non-zero (torn/corrupt/stale) bytes rather than a clean
+		 * unwritten tail.  A clean tail (cursor at the true end, nothing after) is
+		 * left untouched so normal recovery does no extra I/O.
+		 */
+		if (s->cur_seg >= 0)
+		{
+			int			next = seg_id(s->index, seg_local(s->cur_seg) + 1);
+			int			stale = (ps_storage->seg_size(next) >= 0);
+			SegRecHdr	probe;
+
+			if (!stale &&
+				ps_storage->seg_read(s->cur_seg, s->cur_off, &probe,
+									 sizeof(probe)) == 0)
+				for (size_t k = 0; k < sizeof(probe); k++)
+					if (((unsigned char *) &probe)[k])
+					{
+						stale = 1;
+						break;
+					}
+			if (stale)
+			{
+				int			z;
+
+				memset(pg, 0, page_size);
+				z = zero_shard_forward(s->index, s->cur_seg, s->cur_off, pg);
+				if (z < 0)
+				{
+					free(pg);
+					return -1;
+				}
+				if (z)
+					need_sync = 1;
+			}
+		}
 	}
+	if (need_sync)
+		ps_storage->sync();		/* make the tail truncation durable */
 	free(pg);
 	return 0;
 }
