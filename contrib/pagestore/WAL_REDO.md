@@ -128,15 +128,29 @@ hack for correctness (isolation from shared buffers / concurrency) and security
 decoding attacker-influenced WAL cannot touch the system).
 
 **Process**: a new `--wal-redo` startup mode (bootstrap-like: no postmaster, no
-catalog access), holding one `BLCKSZ` slot as its entire "buffer pool", driven by
-a length-prefixed binary protocol on a pipe pair:
+catalog access).  Its "buffer pool" is a **small fake buffer table keyed by block
+id**, not a single `BLCKSZ` slot: a record can hold several registered buffers
+live at once (e.g. `btree_xlog_split()` keeps the new right sibling, the original
+page, and possibly the right neighbor pinned until it finishes), so one slot would
+alias releases / overwrite contents.  One entry is the target (kept); the rest are
+scratch (discarded).  Driven by a length-prefixed binary protocol on a pipe pair:
 
 | msg | payload | effect |
 |-----|---------|--------|
 | `BEGIN` | rlocator, forknum, blkno | set the target page identity |
 | `PUSHBASE` | base_end_lsn, page bytes \| (none = zero) | seed the held page (base FPI, or zero for a WILL_INIT first record) **and set its page LSN to base_end_lsn** — `RestoreBlockImage` copies only bytes; PG sets `pd_lsn` separately, so the gating needs the LSN sent explicitly |
-| `APPLY` | record LSN, raw WAL record bytes | decode + `rm_redo` the record onto the held page |
+| `APPLY` | record **start LSN, end LSN**, raw record bytes | `rm_redo` the record onto the held page; `EndRecPtr` is set from the supplied end LSN |
 | `GET` | — | return the current page bytes (the as-of result) |
+
+The record **end LSN must come from a real decode**, not from the byte length: a
+record can span a WAL page, so its end pointer accounts for continuation page
+headers/padding.  The driver decodes each delta with `XLogReader` over the store
+WAL (segments reconstructed à la `pagestore_walrestore`), which yields a
+`DecodedXLogRecord` with the correct `EndRecPtr`, and sends that end LSN in
+`APPLY`.  (Equivalently the helper could run the `XLogReader` itself; keeping it in
+the driver leaves the helper a pure record-applier.)  Both redo gating
+(`XLogReadBufferForRedoExtended`) and the page LSN it stamps use
+`record->EndRecPtr`, so getting it wrong skips or replays the wrong records.
 
 Buffer redirection (under an `am_walredo` flag):
 
@@ -210,12 +224,19 @@ wrapper that resolves the locator stays only as a test convenience.
    start-LSN-keyed window `ps_read_plan_build` builds (`[base_lsn, read_lsn)`),
    *not* `(base_lsn, lsn]` — a closed upper bound would replay a record starting
    exactly at `lsn` and overshoot.
-   - **Order across timeline ancestry.** On a branched read `walidx_get()` walks
-     the branch by appending the child timeline's LSNs after the parent's capped
-     LSNs (`pagestore_core.c` ~1614–1631), so the raw result is *not* globally
-     ascending — applying it as-is would replay child WAL before inherited parent
-     WAL.  The driver must merge/sort the records into a single ascending chain by
-     LSN across the ancestry before sending `APPLY`.
+   - **Order across timeline ancestry, and keep each record's source timeline.**
+     On a branched read `walidx_get()` walks the branch by appending the child
+     timeline's LSNs after the parent's capped LSNs (`pagestore_core.c`
+     ~1614–1631), so the raw result is *not* globally ascending — applying it
+     as-is would replay child WAL before inherited parent WAL.  The driver must
+     merge/sort into a single ascending chain before `APPLY`.  Sorting by LSN
+     alone is insufficient: the current response is a bare `uint64` LSN array, and
+     `PS_OP_WAL_READ` / `wal_read()` are single-timeline, so an inherited parent
+     LSN fetched against the child stream would hit a hole / short read.  So each
+     delta must carry its **source timeline** (the index returns `(timeline, lsn)`
+     pairs), and step 3 fetches each record from *that* timeline's WAL — or
+     `WAL_READ` becomes branch-aware.  Dependency: `walidx_get` exposing the
+     source timeline per LSN.
    - **Chain completeness is mandatory.** A single `walidx_get` response is capped
      by the IPC payload (`PS_IO_UNIT / sizeof(uint64)`) with no continuation, so a
      hot page with more records than fit would be silently shortened and
@@ -223,10 +244,12 @@ wrapper that resolves the locator stays only as a test convenience.
      / range-seek (cursor by start LSN) or return an explicit overflow error;
      truncation is never silently accepted.
 3. open (or reuse a pooled) wal-redo process; `BEGIN(target)`; `PUSHBASE(base,
-   base_end_lsn)`; for each delta **read the raw record bytes from the store's WAL
-   service** (`PS_OP_WAL_READ`, the same source `pagestore_walrestore` uses) — not
-   a local `XLogReader`, because the target stateless/WAL-only compute has an empty
-   local `pg_wal`; the bytes live in the store.  `APPLY` each; `GET`.
+   base_end_lsn)`; for each delta **read+decode the record from the store's WAL
+   service**, fetching from the record's *own* source timeline (`PS_OP_WAL_READ`,
+   the same per-timeline source `pagestore_walrestore` uses) — not a local
+   `XLogReader`, because the target stateless/WAL-only compute has an empty local
+   `pg_wal`; the bytes live in the store.  The decode yields the record's
+   `EndRecPtr`; `APPLY(start, end, bytes)`; `GET`.
 4. return the page as-of lsn.
 
 This is the function both the **background materializer** and the **on-demand
@@ -249,8 +272,12 @@ cold read drives the same function for just that page.
   truncate-then-re-extend before `lsn` makes the block live again — materialize it
   from the post-truncation chain, don't treat the truncation as terminal.
 - **Branched read ordering** — the per-page index returns child-then-parent LSNs,
-  not globally ascending; merge/sort by LSN across ancestry before replay (Driver
-  step 2).
+  not globally ascending; merge/sort across ancestry *and* fetch each record from
+  its own source timeline before replay (Driver steps 2–3).
+- **Record spans a WAL page** — its end LSN ≠ start + byte length; the driver's
+  `XLogReader` decode supplies the real `EndRecPtr` in `APPLY` (don't infer it).
+- **Concurrent multi-buffer redo** — a record holding several registered buffers
+  live at once (btree split) needs the fake-buffer *table*, not one slot.
 - **WAL-index chain overflow** — more indexed records than one IPC response holds
   must paginate or error, never silently truncate to an older page (Driver step
   2).
@@ -276,8 +303,11 @@ cold read drives the same function for just that page.
   page; and a truncate-then-re-extend before the target LSN materializes the
   re-created block from its post-truncation chain.
 - Branched ordering: a page modified on both a parent and its child branch
-  materializes with parent WAL applied before child WAL (merge/sort), matching a
-  full branch recovery.
+  materializes with parent WAL applied before child WAL, each record fetched from
+  its own timeline's WAL (merge/sort + source-timeline), matching a full branch
+  recovery.
+- Page-spanning record: a delta large enough to cross a WAL page boundary
+  materializes correctly (the decoded `EndRecPtr`, not start+len, drives gating).
 - Hot page: more indexed records for one page than fit in a single index response
   still replays the full chain (pagination), or fails loudly — never silently
   returns an older page.
