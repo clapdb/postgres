@@ -38,8 +38,12 @@
 #include "spdk/env.h"
 #include "spdk/nvme.h"
 
+#include "pagestore_ipc.h"		/* PS_MAX_SHARDS */
 #include "pagestore_storage.h"
 #include "storage_spdk.h"
+
+/* shard count, set by the frontend before open(); drives the seg-id interleave */
+extern uint32_t ps_nshards;
 
 /*
  * Async read engine (see storage_spdk.h): a pool of DMA buffers lets many page
@@ -53,17 +57,14 @@
 
 typedef struct PsSpdkRd
 {
+	struct SpdkShard *sh;		/* shard whose qpair/pool this read uses */
+	int			idx;			/* this context's buffer index in that shard */
 	void	   *dst;			/* caller's destination (shared memory) */
 	uint64_t	slice;			/* byte offset of the page within the DMA buffer */
 	uint32_t	len;
 	PsSpdkDone	done;
 	void	   *arg;
 } PsSpdkRd;
-
-static char *g_pool[PS_SPDK_POOL];	/* DMA buffers */
-static PsSpdkRd g_rd[PS_SPDK_POOL]; /* one in-flight read context per buffer */
-static int	g_free[PS_SPDK_POOL];	/* free-list of buffer indices */
-static int	g_nfree;
 
 #define SPDK_SUPER_MAGIC	0x53504b53	/* "SPKS" */
 
@@ -75,21 +76,52 @@ typedef struct SpdkSuper
 	uint32_t	num_segments;
 } SpdkSuper;
 
-/* the single control device this daemon owns */
+/*
+ * Per-shard I/O state (sharding step 5).  Each shard's worker thread owns its own
+ * NVMe queue pair, current-append-segment buffer, and read DMA pool, so shards
+ * drive the device concurrently with no shared mutable state.  Segment ids are
+ * interleaved (seg % nshards == owning shard, seg / nshards == that shard's local
+ * index), so every op derives its shard from the seg id and only ever touches
+ * that shard's state; a worker thread therefore uses only its own qpair, which
+ * SPDK requires (qpairs are not safe for concurrent use).
+ */
+typedef struct SpdkShard
+{
+	struct spdk_nvme_qpair *qpair;
+	char	   *curbuf;			/* segment_size bytes, DMA-able */
+	int			curseg;			/* which segment curbuf holds (-1: none) */
+	int			dirty;			/* curbuf has unflushed writes */
+	char	   *iobuf;			/* segment_size scratch for aligned reads */
+	char	   *pool[PS_SPDK_POOL];		/* read DMA buffers */
+	PsSpdkRd	rd[PS_SPDK_POOL];		/* in-flight read context per buffer */
+	int			free[PS_SPDK_POOL];		/* free-list of buffer indices */
+	int			nfree;
+	uint32_t	num_segments;	/* this shard's segment count (local indices) */
+} SpdkShard;
+
+static SpdkShard g_spdk[PS_MAX_SHARDS];
+static uint32_t g_nshards = 1;	/* segment-id interleave factor (== ps_nshards) */
+
+/* the single control device this daemon owns (shared, read-only after open) */
 static struct spdk_nvme_ctrlr *g_ctrlr;
 static struct spdk_nvme_ns *g_ns;
-static struct spdk_nvme_qpair *g_qpair;
 static uint32_t g_sector;		/* device LBA size (e.g. 512) */
 static uint64_t g_segsize;		/* bytes per segment */
 static uint32_t g_secs_per_seg; /* sectors per segment */
-static uint32_t g_num_segments; /* segments that hold data */
 static char g_store[2048];		/* --store dir (for spdk_super + WAL/meta) */
 
-/* DMA buffers: the current append segment, and a scratch buffer for reads */
-static char *g_curbuf;			/* segment_size bytes, DMA-able */
-static int	g_curseg = -1;		/* which segment g_curbuf holds (-1: none) */
-static int	g_dirty;			/* g_curbuf has unflushed writes */
-static char *g_iobuf;			/* segment_size scratch for aligned reads */
+/* the shard that owns segment 'seg' and its local index within that shard */
+static inline SpdkShard *
+shard_of(int seg)
+{
+	return &g_spdk[(uint32_t) seg % g_nshards];
+}
+
+static inline uint32_t
+seg_local(int seg)
+{
+	return (uint32_t) seg / g_nshards;
+}
 
 /* --- low-level synchronous-but-polled NVMe I/O --------------------------- */
 
@@ -108,20 +140,23 @@ io_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 	c->done = 1;
 }
 
-/* read/write 'sectors' LBAs at 'lba' to/from DMA buffer 'buf'; poll to done. */
+/* read/write 'sectors' LBAs at 'lba' to/from DMA buffer 'buf' on 'qpair'; poll to
+ * done.  The qpair is the calling shard's own (or, during recovery before workers
+ * spawn, used single-threaded by the main thread). */
 static int
-do_io(void *buf, uint64_t lba, uint32_t sectors, int is_write)
+do_io(struct spdk_nvme_qpair *qpair, void *buf, uint64_t lba, uint32_t sectors,
+	  int is_write)
 {
 	struct io_ctx c = {0, 0};
 	int			rc;
 
 	rc = is_write
-		? spdk_nvme_ns_cmd_write(g_ns, g_qpair, buf, lba, sectors, io_cb, &c, 0)
-		: spdk_nvme_ns_cmd_read(g_ns, g_qpair, buf, lba, sectors, io_cb, &c, 0);
+		? spdk_nvme_ns_cmd_write(g_ns, qpair, buf, lba, sectors, io_cb, &c, 0)
+		: spdk_nvme_ns_cmd_read(g_ns, qpair, buf, lba, sectors, io_cb, &c, 0);
 	if (rc != 0)
 		return -1;
 	while (!c.done)
-		spdk_nvme_qpair_process_completions(g_qpair, 0);
+		spdk_nvme_qpair_process_completions(qpair, 0);
 	return c.err;
 }
 
@@ -143,7 +178,10 @@ static void
 super_write(void)
 {
 	char		path[2300];
-	SpdkSuper	s = {SPDK_SUPER_MAGIC, g_sector, g_segsize, g_num_segments};
+	/* single shard for now (step 5a); per-shard counts arrive with multi-shard
+	 * SPDK in step 5b */
+	SpdkSuper	s = {SPDK_SUPER_MAGIC, g_sector, g_segsize,
+		g_spdk[0].num_segments};
 	FILE	   *f;
 
 	super_path(path, sizeof(path));
@@ -161,45 +199,45 @@ super_read(void)
 	SpdkSuper	s;
 	FILE	   *f;
 
-	g_num_segments = 0;			/* default: fresh store */
+	g_spdk[0].num_segments = 0;	/* default: fresh store */
 	super_path(path, sizeof(path));
 	f = fopen(path, "rb");
 	if (!f)
 		return;
 	if (fread(&s, sizeof(s), 1, f) == 1 && s.magic == SPDK_SUPER_MAGIC &&
 		s.sector_size == g_sector && s.segment_size == g_segsize)
-		g_num_segments = s.num_segments;
+		g_spdk[0].num_segments = s.num_segments;
 	fclose(f);
 }
 
 /* --- current-segment buffer management ----------------------------------- */
 
 static int
-flush_curbuf(void)
+flush_curbuf(SpdkShard *sh)
 {
-	if (g_curseg < 0 || !g_dirty)
+	if (sh->curseg < 0 || !sh->dirty)
 		return 0;
-	if (do_io(g_curbuf, seg_lba(g_curseg), g_secs_per_seg, 1) != 0)
+	if (do_io(sh->qpair, sh->curbuf, seg_lba(sh->curseg), g_secs_per_seg, 1) != 0)
 		return -1;
-	g_dirty = 0;
+	sh->dirty = 0;
 	return 0;
 }
 
-/* Make g_curbuf hold segment 'seg' (loading it from the device if it exists). */
+/* Make this shard's curbuf hold segment 'seg' (loading it if it exists). */
 static int
-load_curbuf(int seg)
+load_curbuf(SpdkShard *sh, int seg)
 {
-	if (flush_curbuf() != 0)
+	if (flush_curbuf(sh) != 0)
 		return -1;
-	if ((uint32_t) seg < g_num_segments)
+	if (seg_local(seg) < sh->num_segments)
 	{
-		if (do_io(g_curbuf, seg_lba(seg), g_secs_per_seg, 0) != 0)
+		if (do_io(sh->qpair, sh->curbuf, seg_lba(seg), g_secs_per_seg, 0) != 0)
 			return -1;
 	}
 	else
-		memset(g_curbuf, 0, g_segsize);		/* fresh segment: zero tail */
-	g_curseg = seg;
-	g_dirty = 0;
+		memset(sh->curbuf, 0, g_segsize);	/* fresh segment: zero tail */
+	sh->curseg = seg;
+	sh->dirty = 0;
 	return 0;
 }
 
@@ -280,57 +318,73 @@ spdk_open(const char *path, uint64_t segment_size)
 	}
 	g_secs_per_seg = (uint32_t) (g_segsize / g_sector);
 
-	g_qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, NULL, 0);
-	g_curbuf = spdk_zmalloc(g_segsize, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
-							SPDK_MALLOC_DMA);
-	g_iobuf = spdk_zmalloc(g_segsize, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY,
-						   SPDK_MALLOC_DMA);
-	if (!g_qpair || !g_curbuf || !g_iobuf)
+	/* one qpair + buffer set per shard, so each shard's worker drives the device
+	 * independently (sharding step 5); the frontend set ps_nshards before open */
+	g_nshards = (ps_nshards >= 1 && ps_nshards <= PS_MAX_SHARDS) ? ps_nshards : 1;
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
 	{
-		fprintf(stderr, "storage_spdk: qpair/DMA buffer allocation failed\n");
-		return -1;
-	}
-	for (int j = 0; j < PS_SPDK_POOL; j++)
-	{
-		g_pool[j] = spdk_zmalloc(PS_SPDK_BUFSZ, 0x1000, NULL,
+		SpdkShard  *S = &g_spdk[sh];
+
+		S->curseg = -1;
+		S->qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, NULL, 0);
+		S->curbuf = spdk_zmalloc(g_segsize, 0x1000, NULL,
 								 SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-		if (!g_pool[j])
+		S->iobuf = spdk_zmalloc(g_segsize, 0x1000, NULL,
+								SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+		if (!S->qpair || !S->curbuf || !S->iobuf)
 		{
-			fprintf(stderr, "storage_spdk: read-pool DMA allocation failed\n");
+			fprintf(stderr, "storage_spdk: qpair/DMA buffer allocation failed\n");
 			return -1;
 		}
-		g_free[j] = j;
+		for (int j = 0; j < PS_SPDK_POOL; j++)
+		{
+			S->pool[j] = spdk_zmalloc(PS_SPDK_BUFSZ, 0x1000, NULL,
+									  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+			if (!S->pool[j])
+			{
+				fprintf(stderr, "storage_spdk: read-pool DMA allocation failed\n");
+				return -1;
+			}
+			S->free[j] = j;
+		}
+		S->nfree = PS_SPDK_POOL;
 	}
-	g_nfree = PS_SPDK_POOL;
 
 	super_read();				/* segment count: fresh dir -> 0 */
 
-	fprintf(stderr, "storage_spdk: %s ns1 sector=%u segsize=%llu segments=%u\n",
-			pci, g_sector, (unsigned long long) g_segsize, g_num_segments);
+	fprintf(stderr, "storage_spdk: %s ns1 sector=%u segsize=%llu segments=%u "
+			"nshards=%u\n", pci, g_sector, (unsigned long long) g_segsize,
+			g_spdk[0].num_segments, g_nshards);
 	return 0;
 }
 
 static void
 spdk_close(void)
 {
-	flush_curbuf();
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		flush_curbuf(&g_spdk[sh]);
 	super_write();
-	if (g_curbuf)
-		spdk_free(g_curbuf);
-	if (g_iobuf)
-		spdk_free(g_iobuf);
-	for (int j = 0; j < PS_SPDK_POOL; j++)
-		if (g_pool[j])
-		{
-			spdk_free(g_pool[j]);
-			g_pool[j] = NULL;
-		}
-	if (g_qpair)
-		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+	{
+		SpdkShard  *S = &g_spdk[sh];
+
+		if (S->curbuf)
+			spdk_free(S->curbuf);
+		if (S->iobuf)
+			spdk_free(S->iobuf);
+		for (int j = 0; j < PS_SPDK_POOL; j++)
+			if (S->pool[j])
+			{
+				spdk_free(S->pool[j]);
+				S->pool[j] = NULL;
+			}
+		if (S->qpair)
+			spdk_nvme_ctrlr_free_io_qpair(S->qpair);
+		S->curbuf = S->iobuf = NULL;
+		S->qpair = NULL;
+	}
 	if (g_ctrlr)
 		spdk_nvme_detach(g_ctrlr);
-	g_curbuf = g_iobuf = NULL;
-	g_qpair = NULL;
 	g_ctrlr = NULL;
 	g_ns = NULL;
 	PsStoragePosix.close();
@@ -339,8 +393,9 @@ spdk_close(void)
 static int
 spdk_sync(void)
 {
-	if (flush_curbuf() != 0)
-		return -1;
+	for (uint32_t sh = 0; sh < g_nshards; sh++)
+		if (flush_curbuf(&g_spdk[sh]) != 0)
+			return -1;
 	super_write();
 	return 0;
 }
@@ -350,20 +405,23 @@ spdk_sync(void)
 static int
 spdk_seg_write(int seg, uint64_t off, const void *buf, uint32_t len)
 {
+	SpdkShard  *sh = shard_of(seg);
+
 	if (off + len > g_segsize)
 		return -1;
-	if (seg != g_curseg && load_curbuf(seg) != 0)
+	if (seg != sh->curseg && load_curbuf(sh, seg) != 0)
 		return -1;
-	memcpy(g_curbuf + off, buf, len);
-	g_dirty = 1;
-	if ((uint32_t) seg + 1 > g_num_segments)
-		g_num_segments = (uint32_t) seg + 1;
+	memcpy(sh->curbuf + off, buf, len);
+	sh->dirty = 1;
+	if (seg_local(seg) + 1 > sh->num_segments)
+		sh->num_segments = seg_local(seg) + 1;
 	return 0;
 }
 
 static int
 spdk_seg_read(int seg, uint64_t off, void *buf, uint32_t len)
 {
+	SpdkShard  *sh = shard_of(seg);
 	uint64_t	byte0,
 				start,
 				end,
@@ -374,12 +432,12 @@ spdk_seg_read(int seg, uint64_t off, void *buf, uint32_t len)
 		return -1;
 
 	/* current append segment is authoritative in the buffer */
-	if (seg == g_curseg)
+	if (seg == sh->curseg)
 	{
-		memcpy(buf, g_curbuf + off, len);
+		memcpy(buf, sh->curbuf + off, len);
 		return 0;
 	}
-	if ((uint32_t) seg >= g_num_segments)
+	if (seg_local(seg) >= sh->num_segments)
 		return -1;				/* no such segment -> end of log for recover() */
 
 	/* aligned read of the covering sectors, then slice out [off, off+len) */
@@ -392,16 +450,18 @@ spdk_seg_read(int seg, uint64_t off, void *buf, uint32_t len)
 	sectors = (uint32_t) ((end - start) / g_sector);
 	if ((uint64_t) sectors * g_sector > g_segsize)
 		return -1;				/* scratch buffer is one segment */
-	if (do_io(g_iobuf, lba, sectors, 0) != 0)
+	if (do_io(sh->qpair, sh->iobuf, lba, sectors, 0) != 0)
 		return -1;
-	memcpy(buf, g_iobuf + (byte0 - start), len);
+	memcpy(buf, sh->iobuf + (byte0 - start), len);
 	return 0;
 }
 
 static int64_t
 spdk_seg_size(int seg)
 {
-	if ((uint32_t) seg < g_num_segments || seg == g_curseg)
+	SpdkShard  *sh = shard_of(seg);
+
+	if (seg_local(seg) < sh->num_segments || seg == sh->curseg)
 		return (int64_t) g_segsize;
 	return -1;
 }
@@ -414,15 +474,15 @@ spdk_seg_size(int seg)
 static void
 rd_cb(void *arg, const struct spdk_nvme_cpl *cpl)
 {
-	int			b = (int) (intptr_t) arg;	/* buffer/context index */
-	PsSpdkRd   *rd = &g_rd[b];
+	PsSpdkRd   *rd = arg;
+	SpdkShard  *sh = rd->sh;
 	int			ok = !spdk_nvme_cpl_is_error(cpl);
 
 	if (ok)
-		memcpy(rd->dst, g_pool[b] + rd->slice, rd->len);
+		memcpy(rd->dst, sh->pool[rd->idx] + rd->slice, rd->len);
 	else
 		memset(rd->dst, 0, rd->len);
-	g_free[g_nfree++] = b;		/* free the buffer before notifying */
+	sh->free[sh->nfree++] = rd->idx;	/* free the buffer before notifying */
 	rd->done(rd->arg, ok);
 }
 
@@ -430,6 +490,7 @@ int
 ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 				   PsSpdkDone done, void *arg)
 {
+	SpdkShard  *sh = shard_of(seg);
 	uint64_t	byte0,
 				start,
 				end;
@@ -438,13 +499,13 @@ ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 	PsSpdkRd   *rd;
 
 	/* current append segment is authoritative in memory */
-	if (seg == g_curseg)
+	if (seg == sh->curseg)
 	{
-		memcpy(dst, g_curbuf + off, len);
+		memcpy(dst, sh->curbuf + off, len);
 		done(arg, 1);
 		return 0;
 	}
-	if ((uint32_t) seg >= g_num_segments)
+	if (seg_local(seg) >= sh->num_segments)
 	{
 		memset(dst, 0, len);	/* no such segment */
 		done(arg, 1);
@@ -465,19 +526,21 @@ ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 	}
 
 	/* take a free DMA buffer, polling completions until one frees if needed */
-	while (g_nfree == 0)
-		spdk_nvme_qpair_process_completions(g_qpair, 0);
-	b = g_free[--g_nfree];
-	rd = &g_rd[b];
+	while (sh->nfree == 0)
+		spdk_nvme_qpair_process_completions(sh->qpair, 0);
+	b = sh->free[--sh->nfree];
+	rd = &sh->rd[b];
+	rd->sh = sh;
+	rd->idx = b;
 	rd->dst = dst;
 	rd->slice = byte0 - start;
 	rd->len = len;
 	rd->done = done;
 	rd->arg = arg;
-	if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_pool[b], start / g_sector,
-							  sectors, rd_cb, (void *) (intptr_t) b, 0) != 0)
+	if (spdk_nvme_ns_cmd_read(g_ns, sh->qpair, sh->pool[b], start / g_sector,
+							  sectors, rd_cb, rd, 0) != 0)
 	{
-		g_free[g_nfree++] = b;	/* submission failed: give the buffer back */
+		sh->free[sh->nfree++] = b;	/* submission failed: give the buffer back */
 		memset(dst, 0, len);
 		done(arg, 0);
 	}
@@ -485,9 +548,11 @@ ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 }
 
 int
-ps_spdk_poll(void)
+ps_spdk_poll(uint32_t shard)
 {
-	return spdk_nvme_qpair_process_completions(g_qpair, 0);
+	if (shard >= g_nshards)
+		return 0;
+	return spdk_nvme_qpair_process_completions(g_spdk[shard].qpair, 0);
 }
 
 /* --- WAL + timeline metadata: delegated to the POSIX backend ------------- */

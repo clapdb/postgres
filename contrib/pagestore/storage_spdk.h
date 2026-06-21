@@ -32,7 +32,8 @@ typedef void (*PsSpdkDone) (void *arg, int ok);
 extern int	ps_spdk_read_async(int seg, uint64_t off, void *dst, uint32_t len,
 							   PsSpdkDone done, void *arg);
 
-/* Drive NVMe completions; returns the number processed. */
-extern int	ps_spdk_poll(void);
+/* Drive NVMe completions on shard's queue pair; returns the number processed.
+ * Each shard's worker polls only its own qpair (sharding step 5). */
+extern int	ps_spdk_poll(uint32_t shard);
 
 #endif							/* STORAGE_SPDK_H */
