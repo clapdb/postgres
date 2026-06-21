@@ -51,9 +51,16 @@ extern int	ps_core_open(const char *store_dir);
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */
 extern void ps_core_close(void);
 
-/* Persist the per-shard sync watermark at the current append cursors.  Call after
- * the segment data is durable (post sync / clean close); recovery uses it to tell
- * an unsynced torn tail from corruption of already-synced data. */
+/* Snapshot one shard's current append cursor into the pending sync watermark.
+ * Capture each shard before the sync that makes its data durable (or, on SPDK,
+ * from the shard's own worker right after it flushes), then commit with
+ * ps_core_write_sync_watermark().  Captured positions never exceed what the sync
+ * persists, so the watermark cannot raise a false corruption on recovery. */
+extern void ps_core_wm_capture(uint32_t shard);
+
+/* Persist the captured per-shard sync watermark snapshot.  Call after the segment
+ * data through those positions is durable (post sync / clean close); recovery uses
+ * it to tell an unsynced torn tail from corruption of already-synced data. */
 extern int	ps_core_write_sync_watermark(void);
 
 /* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it

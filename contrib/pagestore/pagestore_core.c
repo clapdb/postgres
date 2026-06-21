@@ -376,6 +376,7 @@ typedef struct SyncWmFile
 
 static SyncWmEnt g_wm[PS_MAX_SHARDS];	/* loaded watermark, per shard */
 static int	g_wm_valid;					/* a trustworthy watermark was loaded */
+static SyncWmEnt g_wm_pending[PS_MAX_SHARDS];	/* snapshot staged for the next commit */
 
 /* Load the persisted watermark into g_wm; g_wm_valid stays 0 (no fail-open) when
  * absent or untrustworthy, so such a store keeps the safe truncate-only behavior. */
@@ -411,10 +412,32 @@ load_sync_watermark(void)
 }
 
 /*
- * Persist the watermark at each shard's current append cursor.  Call only after
- * the segment data through that cursor is durable (post IMMEDSYNC / clean close);
- * written via a temp file + rename so a crash never leaves a half-updated
- * watermark.  Returns 0 on success, -1 if it could not be made durable.
+ * Snapshot one shard's current append cursor into the pending watermark.  The
+ * watermark must never exceed what the impending sync makes durable, so this is
+ * called either by the shard's own worker right after it flushes (SPDK), or by the
+ * sync coordinator just before the sync (POSIX) / on clean close -- in every case
+ * the captured position is <= what becomes durable, and a slightly stale read only
+ * understates (safe: a too-small watermark just treats more of the tail as
+ * unsynced, never raises a false "corrupt acknowledged data").  Atomic loads make
+ * the cross-thread read on the POSIX path well-defined.
+ */
+void
+ps_core_wm_capture(uint32_t shard)
+{
+	Shard	   *s = &g_shards[shard];
+	int			seg = __atomic_load_n(&s->cur_seg, __ATOMIC_ACQUIRE);
+	uint64_t	off = __atomic_load_n(&s->cur_off, __ATOMIC_ACQUIRE);
+
+	g_wm_pending[shard].local = (seg < 0) ? 0 : seg_local(seg);
+	g_wm_pending[shard].off = (seg < 0) ? 0 : off;
+}
+
+/*
+ * Persist the pending watermark snapshot (captured via ps_core_wm_capture) for
+ * every shard.  Call only after the segment data through those positions is durable
+ * (post IMMEDSYNC / clean close); written via a temp file + rename so a crash never
+ * leaves a half-updated watermark.  Returns 0 on success, -1 if it could not be
+ * made durable.
  */
 int
 ps_core_write_sync_watermark(void)
@@ -428,12 +451,7 @@ ps_core_write_sync_watermark(void)
 	f.magic = SYNC_WM_MAGIC;
 	f.nshards = ps_nshards;
 	for (uint32_t i = 0; i < ps_nshards; i++)
-	{
-		Shard	   *s = &g_shards[i];
-
-		f.ent[i].local = (s->cur_seg < 0) ? 0 : seg_local(s->cur_seg);
-		f.ent[i].off = (s->cur_seg < 0) ? 0 : s->cur_off;
-	}
+		f.ent[i] = g_wm_pending[i];	/* the snapshot captured at the sync, not live */
 	f.crc = ps_crc32c(&f, sizeof(f));
 
 	snprintf(path, sizeof(path), "%s/sync_wm", g_store_dir);
@@ -1603,8 +1621,11 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		uint32_t	local = (s->cur_seg < 0) ? 0 : seg_local(s->cur_seg) + 1;
 
-		s->cur_seg = seg_id(s->index, local);
-		s->cur_off = 0;
+		/* atomic so a concurrent sync-watermark capture on another thread reads a
+		 * consistent cursor; cur_off is published only after the record's bytes are
+		 * written (below), so a captured offset is always already-written data */
+		__atomic_store_n(&s->cur_seg, seg_id(s->index, local), __ATOMIC_RELEASE);
+		__atomic_store_n(&s->cur_off, (uint64_t) 0, __ATOMIC_RELEASE);
 	}
 
 	memset(&hdr, 0, sizeof(hdr));	/* deterministic padding: the crc covers it */
@@ -1631,7 +1652,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * the page CRC so the read path can verify the bytes it later fetches */
 	page_add_version(timeline, key, block, hdr.lsn, s->cur_seg, data_off,
 					 ps_crc32c(page, page_size));
-	s->cur_off += reclen;
+	/* publish the advanced cursor only now, after the bytes are written */
+	__atomic_store_n(&s->cur_off, s->cur_off + reclen, __ATOMIC_RELEASE);
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
@@ -2027,18 +2049,34 @@ recover(void)
 
 		if (s->cur_seg < 0)
 		{
-			/*
-			 * Recovered nothing from this shard.  If its first segment nonetheless
-			 * holds non-zero data, we could not replay it -- a wrong --page-size, a
-			 * corrupt or foreign store_gen, or corruption of the very first record.
-			 * That is indistinguishable from stale raw-device bytes, and zeroing it
-			 * would erase a valid store merely opened with the wrong config, so fail
-			 * open instead.  A fresh store has no first segment (or an all-zero one
-			 * from a prior truncation) and opens normally.
-			 */
 			int			first = seg_id(s->index, 0);
 			SegRecHdr	probe;
 
+			/*
+			 * Recovered nothing from this shard.  If a trustworthy watermark says it
+			 * was synced through real data, that committed data is now gone (a
+			 * missing/truncated/all-zero first segment, or lost SPDK segment counts)
+			 * -- fail rather than silently open an empty store.
+			 */
+			if (g_wm_valid && (g_wm[si].local > 0 || g_wm[si].off > 0))
+			{
+				fprintf(stderr, "pagestore: shard %u: watermark says synced through "
+						"local %u off %llu but recovery found no records; refusing to "
+						"recover\n", s->index, g_wm[si].local,
+						(unsigned long long) g_wm[si].off);
+				free(pg);
+				return -1;
+			}
+
+			/*
+			 * Otherwise (no watermark): if the first segment holds non-zero data we
+			 * could not replay it -- a wrong --page-size, a corrupt or foreign
+			 * store_gen, or corruption of the very first record.  That is
+			 * indistinguishable from stale raw-device bytes, and zeroing it would
+			 * erase a valid store merely opened with the wrong config, so fail open
+			 * instead.  A fresh store has no first segment (or an all-zero one from a
+			 * prior truncation) and opens normally.
+			 */
 			if (ps_storage->seg_size(first) >= 0 &&
 				ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
 				for (size_t k = 0; k < sizeof(probe); k++)
@@ -2173,7 +2211,11 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			/* sync the data first, then advance the durable watermark past it */
+			/* Capture every shard's cursor BEFORE the sync so the watermark never
+			 * exceeds what the sync makes durable (other shards' workers may append
+			 * concurrently), then sync, then commit the snapshot. */
+			for (uint32_t s = 0; s < ps_nshards; s++)
+				ps_core_wm_capture(s);
 			if (ps_storage->sync() != 0 || ps_core_write_sync_watermark() != 0)
 				ch->status = PS_STATUS_ERROR;	/* report a failed durable sync */
 			break;
@@ -2191,8 +2233,11 @@ ps_handle_meta(PsChannel *ch)
 void
 ps_core_close(void)
 {
-	/* clean shutdown is a durability point: sync the segment data and advance the
-	 * watermark past it, so the next recover() trusts the full log as synced */
+	/* clean shutdown is a durability point: capture each shard's cursor, sync the
+	 * segment data, and commit the watermark, so the next recover() trusts the full
+	 * log as synced */
+	for (uint32_t i = 0; i < ps_nshards; i++)
+		ps_core_wm_capture(i);
 	if (ps_storage->sync() == 0)
 		ps_core_write_sync_watermark();
 	for (uint32_t i = 0; i < ps_nshards; i++)

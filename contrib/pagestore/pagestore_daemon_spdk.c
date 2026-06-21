@@ -104,6 +104,10 @@ flush_self(uint32_t shard)
 
 	g_flush_snap[shard] = cnt;
 	g_flush_rc[shard] = rc;
+	/* capture this shard's synced cursor here, on its own worker, right after the
+	 * flush: the coordinator commits the watermark from these per-shard snapshots
+	 * rather than reading live cursors that other shards may have advanced */
+	ps_core_wm_capture(shard);
 }
 
 /*

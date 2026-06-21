@@ -123,6 +123,7 @@ setup_synced(const char *store)		/* append 5, watermark all, clean close */
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 5, 20);
+	ps_core_wm_capture(0);
 	if (ps_core_write_sync_watermark() != 0)
 		return 1;
 	ps_core_close();
@@ -135,6 +136,7 @@ setup_crash_tail(const char *store)	/* watermark first 3, append 2 more, no clos
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 30);
+	ps_core_wm_capture(0);
 	if (ps_core_write_sync_watermark() != 0)
 		return 1;
 	append_blocks(store, 3, 5, 30);
@@ -199,6 +201,7 @@ setup_crash_tail40(const char *store)	/* like setup_crash_tail but tag base 40 *
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 40);
+	ps_core_wm_capture(0);
 	if (ps_core_write_sync_watermark() != 0)
 		return 1;
 	append_blocks(store, 3, 5, 40);
@@ -212,6 +215,7 @@ setup_resurrect(const char *store)	/* 0-2 synced, 3-5 unsynced, crash */
 	if (ps_core_open(store) != 0)
 		return 1;
 	append_blocks(store, 0, 3, 50);
+	ps_core_wm_capture(0);
 	if (ps_core_write_sync_watermark() != 0)
 		return 1;
 	append_blocks(store, 3, 6, 50);		/* blocks 3,4,5 in segment 1, unsynced */
@@ -301,6 +305,22 @@ main(void)
 		  "resurrect: recover zeroes tail, reappends block 3, crashes");
 	check(phase(recover_no_resurrect, "/tmp/psE") == 0,
 		  "resurrect: old blocks 4,5 stay gone (no resurrection)");
+
+	/* 6: the watermark says this shard had synced data, but the segment is gone --
+	 * recovery must refuse, not silently open an empty store */
+	if (system("rm -rf /tmp/psF && mkdir -p /tmp/psF") != 0)
+		return 2;
+	check(phase(setup_synced, "/tmp/psF") == 0, "wm-vs-empty: setup");
+	{
+		int			fd = open("/tmp/psF/seg_00000000", O_RDWR);
+
+		if (fd < 0 || ftruncate(fd, 0) != 0)	/* segment lost after the watermark */
+			check(0, "wm-vs-empty: truncate segment");
+		if (fd >= 0)
+			close(fd);
+	}
+	check(phase(recover_expect_fail, "/tmp/psF") == 0,
+		  "wm-vs-empty: refuse to open when committed data is gone");
 
 	printf("%d checks, %d failed\n", checks, fails);
 	return fails ? 1 : 0;
