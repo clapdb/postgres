@@ -114,6 +114,7 @@ typedef struct Shard
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
 	time_t		maint_cooldown;	/* skip compaction attempts until this wall time */
+	time_t		upload_cooldown;	/* skip object-tier uploads until this wall time */
 	TimelineMeta timelines[MAX_TIMELINES];	/* replicated timeline tree */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
@@ -355,6 +356,14 @@ gc_remove_layer(Shard *s, const PsLayerDesc *d)
 		return;
 	if (d->remote_durable)
 		return;					/* keep the entry as a remote tombstone */
+	/* Not remote-durable, but an upload may have copied the object before the
+	 * daemon crashed without persisting SET_REMOTE_DURABLE.  Delete that orphan
+	 * before dropping the entry, else the object tier leaks an object no future
+	 * GC can find.  Best-effort: if the delete fails, keep the entry so a later
+	 * gc_resume retries rather than orphaning it. */
+	if (ps_object_tier && ps_layer_store->layer_exists_remote(d) == 1 &&
+		ps_layer_store->delete_remote_layer(d) != 0)
+		return;
 	ps_manifest_remove_layer(&s->manifest, d->layer_id);
 }
 
@@ -1726,48 +1735,51 @@ maintain_shard(Shard *s)
 
 	if (!use_layers)
 		return 0;
-	/* If a recent attempt made no progress (a corrupt layer, or repeated ENOSPC
-	 * while reading/writing the merge), don't re-read the same failing layers on
-	 * every idle tick -- cool down until either new layer state appears or the
-	 * window passes. */
-	if (s->maint_cooldown != 0 && time(NULL) < s->maint_cooldown)
-		return 0;
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if ((tl == 0 || tl_defined(s, tl)) &&
-			count_image_layers(s, tl) > (uint32_t) compact_layers)
-		{
-			uint32_t	before = count_image_layers(s, tl);
-
-			/* Report progress (so the caller skips its idle sleep) only if the
-			 * compaction actually reduced the layer count.  A timeline that can't
-			 * make progress -- nothing mergeable (e.g. compact_layers=0 with a
-			 * single layer) or a failing compaction (ENOSPC / corrupt layer) --
-			 * must not keep the daemon spinning; try the next one. */
-			attempted = 1;
-			if (compact_timeline(s, tl) == 0 &&
-				count_image_layers(s, tl) < before)
+	/*
+	 * Compaction backs off on its own cooldown after a no-progress attempt (a
+	 * corrupt layer, or repeated ENOSPC during the merge), so it doesn't re-read
+	 * the same failing layers every idle tick.
+	 */
+	if (s->maint_cooldown == 0 || time(NULL) >= s->maint_cooldown)
+	{
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+			if ((tl == 0 || tl_defined(s, tl)) &&
+				count_image_layers(s, tl) > (uint32_t) compact_layers)
 			{
-				s->maint_cooldown = 0;	/* progress: clear any backoff */
-				return 1;
+				uint32_t	before = count_image_layers(s, tl);
+
+				/* progress only if the layer count actually dropped; a timeline
+				 * that can't make progress must not keep the daemon spinning */
+				attempted = 1;
+				if (compact_timeline(s, tl) == 0 &&
+					count_image_layers(s, tl) < before)
+				{
+					s->maint_cooldown = 0;	/* progress: clear any backoff */
+					return 1;
+				}
 			}
-		}
-	/* nothing to compact: with an object tier, push one not-yet-durable layer.
-	 * Treat a failed upload like a failed compaction -- back off, so an unwritable
-	 * or unavailable object store doesn't turn into a 20us retry storm. */
-	if (ps_object_tier)
+		if (attempted)
+			s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
+	}
+	/*
+	 * Object-tier upload backs off on a SEPARATE cooldown: a temporarily
+	 * unwritable/full object store must not suppress local compaction (which still
+	 * reduces read amplification), and a failed upload must not become a 20us retry
+	 * storm.  Compaction above already runs regardless of this cooldown.
+	 */
+	if (ps_object_tier &&
+		(s->upload_cooldown == 0 || time(NULL) >= s->upload_cooldown))
 	{
 		int			u = upload_one(s);
 
 		if (u > 0)
+		{
+			s->upload_cooldown = 0;
 			return 1;
+		}
 		if (u < 0)
-			attempted = 1;
+			s->upload_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
 	}
-	/* Over-threshold timeline(s) exist but none could be compacted, or an upload
-	 * failed: back off so an otherwise-idle shard doesn't re-attempt the same
-	 * failing work every 20us. */
-	if (attempted)
-		s->maint_cooldown = time(NULL) + MAINT_COOLDOWN_SECS;
 	return 0;
 }
 

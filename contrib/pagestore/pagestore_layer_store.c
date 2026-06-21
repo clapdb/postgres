@@ -30,7 +30,79 @@ static char layer_dir[2048];
  */
 static char object_dir[2048];
 
+/*
+ * Per-store id mixed into object keys.  Layer ids are only store-local (they start
+ * at 1), so two different stores sharing one object directory would otherwise both
+ * claim obj_<layer_id> -- and one reopened against the other's data would fetch the
+ * wrong bytes.  Keying objects by a persisted random store id keeps each store's
+ * objects disjoint; layer_exists_remote then only ever matches this store's own.
+ */
+static uint64_t object_store_id;
+
 const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
+
+/* Load the persisted store id from <store_dir>/object_store_id, generating and
+ * persisting a fresh one (random, else a hash of the path) on first open. */
+static void
+load_store_id(const char *store_dir)
+{
+	char		path[2200];
+	int			fd;
+
+	object_store_id = 0;
+	snprintf(path, sizeof(path), "%s/object_store_id", store_dir);
+
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		if (read(fd, &object_store_id, sizeof(object_store_id)) !=
+			(ssize_t) sizeof(object_store_id))
+			object_store_id = 0;
+		close(fd);
+		if (object_store_id != 0)
+			return;
+	}
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0)
+	{
+		if (read(fd, &object_store_id, sizeof(object_store_id)) !=
+			(ssize_t) sizeof(object_store_id))
+			object_store_id = 0;
+		close(fd);
+	}
+	if (object_store_id == 0)
+	{
+		/* deterministic fallback: FNV-1a of the store path (distinct per store) */
+		uint64_t	h = 1469598103934665603ULL;
+
+		for (const char *p = store_dir; *p; p++)
+			h = (h ^ (unsigned char) *p) * 1099511628211ULL;
+		object_store_id = h ? h : 1;
+	}
+
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd >= 0)
+	{
+		ssize_t		w = write(fd, &object_store_id, sizeof(object_store_id));
+
+		(void) w;				/* best-effort persist */
+		fsync(fd);
+		close(fd);
+	}
+	else
+	{
+		/* lost a create race: adopt the persisted id */
+		fd = open(path, O_RDONLY);
+		if (fd >= 0)
+		{
+			ssize_t		r = read(fd, &object_store_id, sizeof(object_store_id));
+
+			(void) r;			/* on a short read keep our generated id */
+			close(fd);
+		}
+	}
+}
 
 int
 ps_layer_store_set_object_dir(const char *dir)
@@ -56,8 +128,10 @@ object_path(uint64_t layer_id, char *buf, size_t buflen)
 
 	if (object_dir[0] == '\0')
 		return -1;				/* no object tier configured */
-	n = snprintf(buf, buflen, "%s/obj_%016llx",
-				 object_dir, (unsigned long long) layer_id);
+	/* key by store id + layer id so stores sharing a dir never collide */
+	n = snprintf(buf, buflen, "%s/obj_%016llx_%016llx", object_dir,
+				 (unsigned long long) object_store_id,
+				 (unsigned long long) layer_id);
 	if (n < 0 || (size_t) n >= buflen)
 		return -1;
 	return 0;
@@ -129,6 +203,7 @@ local_open(const char *store_dir)
 	n = snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(layer_dir))
 		return -1;
+	load_store_id(store_dir);	/* per-store object-key namespace */
 	return 0;
 }
 
