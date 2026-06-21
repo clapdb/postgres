@@ -106,7 +106,8 @@ extern uint32_t ps_crc32c(const void *buf, size_t len);
 /*
  * Resolve a read into out (page_size bytes), serving from memtable / image
  * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
- * page is unwritten.
+ * page is unwritten, and -1 on an integrity error (a corrupt or failed segment
+ * read) -- which the caller must surface as an error, not serve as zeros.
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, unsigned char *out);

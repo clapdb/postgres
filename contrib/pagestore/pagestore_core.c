@@ -27,6 +27,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -110,9 +111,12 @@ static uint64_t g_store_gen;
  * Load the store's generation from <store_dir>/store_gen, creating a durable
  * random one on first open.  Stamped into each SegRecHdr so recover() can reject
  * stale records left on a reused raw device (different/zero generation) instead of
- * replaying them as live data.
+ * replaying them as live data.  Returns 0 on success, -1 if a fresh generation
+ * cannot be made durable -- the caller must then fail the open, since records
+ * stamped with a generation that a crash could lose would be rejected (i.e. lost)
+ * by the next recover().
  */
-static void
+static int
 load_store_gen(const char *store_dir)
 {
 	char		path[2200];
@@ -123,55 +127,67 @@ load_store_gen(const char *store_dir)
 	fd = open(path, O_RDONLY);
 	if (fd >= 0)
 	{
+		ssize_t		r = read(fd, &g, sizeof(g));
+
+		close(fd);
+		if (r == (ssize_t) sizeof(g) && g != 0)
+		{
+			g_store_gen = g;
+			return 0;			/* already durable from a prior open */
+		}
+		g = 0;
+	}
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd >= 0)
+	{
 		if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
 			g = 0;
 		close(fd);
 	}
 	if (g == 0)
 	{
-		fd = open("/dev/urandom", O_RDONLY);
-		if (fd >= 0)
-		{
-			if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
-				g = 0;
-			close(fd);
-		}
-		if (g == 0)
-		{
-			uint64_t	h = 1469598103934665603ULL;	/* FNV-1a(path) fallback */
+		uint64_t	h = 1469598103934665603ULL;	/* FNV-1a(path) fallback */
 
-			for (const char *p = store_dir; *p; p++)
-				h = (h ^ (unsigned char) *p) * 1099511628211ULL;
-			g = h ? h : 1;
-		}
-		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-		if (fd >= 0)
-		{
-			ssize_t		w = write(fd, &g, sizeof(g));
-
-			(void) w;
-			fsync(fd);
-			close(fd);
-			fd = open(store_dir, O_RDONLY);		/* make the entry durable */
-			if (fd >= 0)
-			{
-				fsync(fd);
-				close(fd);
-			}
-		}
-		else
-		{
-			/* lost a create race: adopt the peer's persisted generation */
-			fd = open(path, O_RDONLY);
-			if (fd >= 0)
-			{
-				if (read(fd, &g, sizeof(g)) != (ssize_t) sizeof(g))
-					g = g ? g : 1;
-				close(fd);
-			}
-		}
+		for (const char *p = store_dir; *p; p++)
+			h = (h ^ (unsigned char) *p) * 1099511628211ULL;
+		g = h ? h : 1;
 	}
+
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+	{
+		/* lost a create race: adopt the peer's now-durable generation */
+		if (errno == EEXIST && (fd = open(path, O_RDONLY)) >= 0)
+		{
+			ssize_t		r = read(fd, &g, sizeof(g));
+
+			close(fd);
+			if (r == (ssize_t) sizeof(g) && g != 0)
+			{
+				g_store_gen = g;
+				return 0;
+			}
+		}
+		return -1;
+	}
+	if (write(fd, &g, sizeof(g)) != (ssize_t) sizeof(g) || fsync(fd) != 0)
+	{
+		close(fd);
+		unlink(path);
+		return -1;				/* not durable: caller fails the open */
+	}
+	close(fd);
+	fd = open(store_dir, O_RDONLY);		/* make the directory entry durable */
+	if (fd < 0 || fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	close(fd);
 	g_store_gen = g;
+	return 0;
 }
 
 /*
@@ -1458,11 +1474,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.gen = g_store_gen;
 	hdr.crc = seg_rec_crc(s->cur_seg, s->cur_off, &hdr, page);
 
-	/* write header then page bytes contiguously at the append cursor */
-	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
-		return -1;
+	/* Write the page first, then the header as the commit point: recover() trusts
+	 * a record only once it sees a fully-framed header, so a torn trailing append
+	 * (page written, header not yet) reads back as no-record / end-of-log rather
+	 * than as a framed-but-corrupt record that would fail recovery. */
 	data_off = s->cur_off + sizeof(hdr);
 	if (ps_storage->seg_write(s->cur_seg, data_off, page, page_size) != 0)
+		return -1;
+	if (ps_storage->seg_write(s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header; carry
@@ -1504,18 +1523,23 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	return 0;
 }
 
-/* Read a specific version's page bytes into out (page_size bytes). */
+/*
+ * Read a specific version's page bytes into out (page_size bytes).  Returns 0 on
+ * success, -1 if the version has no segment copy (layer-origin), and -2 on an
+ * integrity error -- a device read failure or a CRC mismatch (bit rot / misread)
+ * -- which the caller must surface rather than treat as an unwritten page.
+ */
 int
 read_version(const PageVer *v, unsigned char *out)
 {
 	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
 	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
-		return -1;
+		return -2;
 	/* verify the bytes against the version's stored CRC: catches bit rot or a
 	 * misread that happened since the index was built */
 	if (ps_crc32c(out, page_size) != v->crc)
-		return -1;
+		return -2;
 	return 0;
 }
 
@@ -1610,8 +1634,13 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 			else
 			{
+				int			rv;
+
 				s->rr_seg++;
-				served = (read_version(pv, out) == 0);	/* segment fallback */
+				rv = read_version(pv, out);		/* segment fallback */
+				if (rv == -2)
+					return -1;	/* corrupt stored page: surface, don't zero-fill */
+				served = (rv == 0);
 			}
 			if (served && !ambig)
 				ps_pgcache_insert(&s->pgcache, tl, key, block, pv->lsn, out);
@@ -1633,17 +1662,22 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * (page_add_version + fork_grow) for every record reconstructs both indexes and
  * leaves the append cursor positioned just past the last valid record.
  *
+ * A torn trailing append (header not yet written -- it is written last) reads as
+ * no record and ends the scan; a fully-framed record whose page fails its CRC is
+ * corruption of persisted data and aborts recovery (returns -1) rather than
+ * silently dropping every later record.  Returns 0 on success, -1 on corruption
+ * or allocation failure, so ps_core_open() can refuse to open over a real store.
+ *
  * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.  Also a partial/torn trailing record
- * is simply treated as end-of-log (the magic/len check below stops the scan).
+ * effects are not reproduced on restart.
  */
-static void
+static int
 recover(void)
 {
 	unsigned char *pg = malloc(page_size);	/* scratch to read+verify each page */
 
 	if (!pg)
-		return;
+		return -1;				/* don't open with an empty index over a real store */
 	/* Each shard owns a disjoint segment-id namespace, so scan and replay each
 	 * shard's segments and position its own append cursor.  page_add_version()
 	 * self-routes by key, so a record always lands on the shard that wrote it. */
@@ -1664,17 +1698,28 @@ recover(void)
 			{
 				SegRecHdr	hdr;
 
+				/* No valid record framed here: a torn trailing append (the header
+				 * is written last, after the page -- see append_page), a never-
+				 * written tail, or stale device bytes from before this store.  This
+				 * is the end of the log; stop. */
 				if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
 					hdr.magic != SEG_MAGIC || hdr.len != page_size ||
 					hdr.gen != g_store_gen)
 					break;
-				/* read the page and verify the record CRC (position + header +
-				 * bytes); a record that matches SEG_MAGIC but fails the CRC or the
-				 * store generation is a torn write or stale device data, so it is
-				 * this segment's end-of-log, not live state to replay */
+				/* The header is fully framed as ours, so the page was written (it
+				 * precedes the header).  A read error or CRC mismatch here is thus
+				 * corruption of an already-persisted record, NOT a clean tail --
+				 * fail recovery rather than silently truncate every later record by
+				 * treating this as end-of-log. */
 				if (ps_storage->seg_read(id, off + sizeof(hdr), pg, page_size) != 0 ||
 					seg_rec_crc(id, off, &hdr, pg) != hdr.crc)
-					break;
+				{
+					fprintf(stderr, "pagestore: shard %u segment %d off %llu: "
+							"corrupt persisted record (crc); refusing to recover\n",
+							s->index, id, (unsigned long long) off);
+					free(pg);
+					return -1;
+				}
 
 				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
 								 off + sizeof(hdr), ps_crc32c(pg, page_size));
@@ -1699,6 +1744,7 @@ recover(void)
 					(unsigned long long) s->cur_off);
 	}
 	free(pg);
+	return 0;
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -2059,7 +2105,12 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
-	load_store_gen(store_dir);	/* generation stamped into every segment record */
+	if (load_store_gen(store_dir) != 0)	/* generation stamped into each record */
+	{
+		fprintf(stderr, "pagestore_core: could not durably establish store "
+				"generation in %s\n", store_dir);
+		return -1;
+	}
 	if (validate_store_nshards(store_dir) != 0)
 		return -1;
 
@@ -2160,7 +2211,8 @@ ps_core_open(const char *store_dir)
 	 * already-flushed segment prefix via a persisted flush watermark is a
 	 * deferred optimization.)
 	 */
-	recover();
+	if (recover() != 0)			/* corruption or OOM: don't open over a real store */
+		return -1;
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log (WAL is shard-0,
 	 * single-threaded here; all shards' timeline copies are identical) */
