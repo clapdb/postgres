@@ -1813,49 +1813,80 @@ recover(void)
 					"%d (off %llu)\n", s->index, s->cur_seg,
 					(unsigned long long) s->cur_off);
 
-		/*
-		 * Physically clear the tail past the append cursor when it could hold
-		 * resurrectable records: either segments exist beyond the cursor, or the
-		 * stop point holds non-zero (torn/corrupt/stale) bytes rather than a clean
-		 * unwritten tail.  A clean tail (cursor at the true end, nothing after) is
-		 * left untouched so normal recovery does no extra I/O.
-		 */
+		if (s->cur_seg < 0)
 		{
-			/* Start clearing at the append cursor, or -- when recovery rebuilt
-			 * nothing because the shard's very first segment's first record was
-			 * already invalid -- at that first segment, so its stale later records
-			 * can't resurrect either. */
-			int			zseg = (s->cur_seg >= 0) ? s->cur_seg : seg_id(s->index, 0);
-			uint64_t	zoff = (s->cur_seg >= 0) ? s->cur_off : 0;
+			/*
+			 * Recovered nothing from this shard.  If its first segment nonetheless
+			 * holds non-zero data, we could not replay it -- a wrong --page-size, a
+			 * corrupt or foreign store_gen, or corruption of the very first record.
+			 * That is indistinguishable from stale raw-device bytes, and zeroing it
+			 * would erase a valid store merely opened with the wrong config, so fail
+			 * open instead.  A fresh store has no first segment (or an all-zero one
+			 * from a prior truncation) and opens normally.
+			 */
+			int			first = seg_id(s->index, 0);
+			SegRecHdr	probe;
 
-			if (ps_storage->seg_size(zseg) >= 0)
+			if (ps_storage->seg_size(first) >= 0 &&
+				ps_storage->seg_read(first, 0, &probe, sizeof(probe)) == 0)
+				for (size_t k = 0; k < sizeof(probe); k++)
+					if (((unsigned char *) &probe)[k])
+					{
+						fprintf(stderr, "pagestore: shard %u: existing segment data "
+								"could not be recovered (wrong --page-size, or a "
+								"corrupt/foreign store generation); refusing to "
+								"recover\n", s->index);
+						free(pg);
+						return -1;
+					}
+		}
+		else
+		{
+			/*
+			 * Physically clear the tail past the append cursor when it actually
+			 * holds non-zero bytes -- a torn/corrupt/stale record at the cursor, or
+			 * at the start of the next segment -- so those records can't resurrect
+			 * after a partial overwrite + crash.  Probing content (not mere segment
+			 * existence) means a tail a previous recovery already zeroed is not
+			 * re-zeroed on every restart.
+			 */
+			int			stale = 0;
+			SegRecHdr	probe;
+
+			if (ps_storage->seg_read(s->cur_seg, s->cur_off, &probe,
+									 sizeof(probe)) == 0)
+				for (size_t k = 0; k < sizeof(probe); k++)
+					if (((unsigned char *) &probe)[k])
+					{
+						stale = 1;
+						break;
+					}
+			if (!stale)
 			{
-				int			next = seg_id(s->index, seg_local(zseg) + 1);
-				int			stale = (ps_storage->seg_size(next) >= 0);
-				SegRecHdr	probe;
+				int			next = seg_id(s->index, seg_local(s->cur_seg) + 1);
 
-				if (!stale &&
-					ps_storage->seg_read(zseg, zoff, &probe, sizeof(probe)) == 0)
+				if (ps_storage->seg_size(next) >= 0 &&
+					ps_storage->seg_read(next, 0, &probe, sizeof(probe)) == 0)
 					for (size_t k = 0; k < sizeof(probe); k++)
 						if (((unsigned char *) &probe)[k])
 						{
 							stale = 1;
 							break;
 						}
-				if (stale)
-				{
-					int			z;
+			}
+			if (stale)
+			{
+				int			z;
 
-					memset(pg, 0, page_size);
-					z = zero_shard_forward(s->index, zseg, zoff, pg);
-					if (z < 0)
-					{
-						free(pg);
-						return -1;
-					}
-					if (z)
-						need_sync = 1;
+				memset(pg, 0, page_size);
+				z = zero_shard_forward(s->index, s->cur_seg, s->cur_off, pg);
+				if (z < 0)
+				{
+					free(pg);
+					return -1;
 				}
+				if (z)
+					need_sync = 1;
 			}
 		}
 	}
@@ -2272,6 +2303,16 @@ ps_core_open(const char *store_dir)
 	{
 		fprintf(stderr, "pagestore_core: --cache-pages must be >= 0 (got %d)\n",
 				cache_pages);
+		return -1;
+	}
+	/* a segment record (header + one page) must fit in a segment; otherwise a
+	 * grossly-wrong --page-size would make recover()'s first record overflow the
+	 * segment and be mis-handled */
+	if (sizeof(SegRecHdr) + page_size > segment_size)
+	{
+		fprintf(stderr, "pagestore_core: page_size %u + record header exceeds "
+				"segment_size %llu\n", page_size,
+				(unsigned long long) segment_size);
 		return -1;
 	}
 
