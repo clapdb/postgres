@@ -153,6 +153,7 @@ extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn_max,
-										  uint64 *out, int maxn);
+										  uint64 *out, uint32 *out_tl, int maxn,
+										  bool *overflow);
 
 #endif							/* PAGESTORE_BACKEND_H */

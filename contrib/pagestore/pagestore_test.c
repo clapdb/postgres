@@ -473,10 +473,11 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec(ch);
 }
 
-/* Returns count; fills out[] with the record LSNs <= lsn_max. */
+/* Returns count; fills out[] with the record LSNs <= lsn_max, and -- when
+ * out_tl != NULL -- the parallel source timeline of each LSN. */
 static int
 op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
-			  uint64_t lsn_max, uint64_t *out)
+			  uint64_t lsn_max, uint64_t *out, uint32_t *out_tl)
 {
 	PsChannel  *ch = cl_route(rel, fork);
 	int			n;
@@ -488,6 +489,9 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->req_lsn = lsn_max;
 	n = (int) cl_exec(ch)->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
+	if (out_tl)
+		memcpy(out_tl, ch->data + (size_t) PS_WALIDX_CAP * sizeof(uint64_t),
+			   (size_t) n * sizeof(uint32_t));
 	return n;
 }
 
@@ -1011,22 +1015,38 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 0, 300);
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
 
-	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
+	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out, NULL);
 	check(n == 2 && out[0] == 100 && out[1] == 200,
 		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
-	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
+	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out, NULL);
 	check(n == 3 && out[2] == 300, "index returns all records up to a high lsn");
-	check(op_walidx_get(0, REL_A, FORK0, 0, 50, out) == 0, "no records below the first lsn");
-	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
+	check(op_walidx_get(0, REL_A, FORK0, 0, 50, out, NULL) == 0, "no records below the first lsn");
+	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out, NULL);
 	check(n == 1 && out[0] == 150, "per-block separation (block 1 -> [150])");
-	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out, NULL) == 0, "unindexed block -> empty");
 
-	/* a branch sees its own records plus the parent's, capped at the fork LSN */
+	/* a branch sees its own records plus the parent's, capped at the fork LSN,
+	 * and each returned LSN is tagged with the timeline it came from */
 	op_create_branch(1, 0, 250);
 	op_walidx_add(1, REL_A, FORK0, 0, 400);
-	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
-	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
-	check(n == 3, "branch index reads through to parent capped at the branch lsn");
+	{
+		uint32_t	tls[64];
+		int			from_child = 0,
+					from_parent = 0;
+
+		n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out, tls);
+		/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
+		check(n == 3, "branch index reads through to parent capped at the branch lsn");
+		for (int i = 0; i < n; i++)
+		{
+			if (out[i] == 400)
+				from_child += (tls[i] == 1);
+			else
+				from_parent += (tls[i] == 0);
+		}
+		check(from_child == 1 && from_parent == 2,
+			  "branch index tags each LSN with its source timeline (400->tl1, 100/200->tl0)");
+	}
 
 	client_detach();
 	stop_daemon(dpid);

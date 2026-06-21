@@ -687,8 +687,18 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	relation_close(rel, AccessShareLock);
 
 	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
-	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  lsns, PS_REDO_MAX_RECS);
+	{
+		bool		overflow = false;
+
+		n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
+										  (uint64) lsn, lsns, NULL,
+										  PS_REDO_MAX_RECS, &overflow);
+		if (overflow)
+			ereport(WARNING,
+					(errmsg("pagestore WAL-index chain for block %d exceeds %d records; "
+							"base-image scan may miss the newest full-page image",
+							blocknum, PS_REDO_MAX_RECS)));
+	}
 	if (n == 0)
 		PG_RETURN_NULL();
 
