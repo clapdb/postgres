@@ -1820,39 +1820,54 @@ recover(void)
 		 * unwritten tail.  A clean tail (cursor at the true end, nothing after) is
 		 * left untouched so normal recovery does no extra I/O.
 		 */
-		if (s->cur_seg >= 0)
 		{
-			int			next = seg_id(s->index, seg_local(s->cur_seg) + 1);
-			int			stale = (ps_storage->seg_size(next) >= 0);
-			SegRecHdr	probe;
+			/* Start clearing at the append cursor, or -- when recovery rebuilt
+			 * nothing because the shard's very first segment's first record was
+			 * already invalid -- at that first segment, so its stale later records
+			 * can't resurrect either. */
+			int			zseg = (s->cur_seg >= 0) ? s->cur_seg : seg_id(s->index, 0);
+			uint64_t	zoff = (s->cur_seg >= 0) ? s->cur_off : 0;
 
-			if (!stale &&
-				ps_storage->seg_read(s->cur_seg, s->cur_off, &probe,
-									 sizeof(probe)) == 0)
-				for (size_t k = 0; k < sizeof(probe); k++)
-					if (((unsigned char *) &probe)[k])
-					{
-						stale = 1;
-						break;
-					}
-			if (stale)
+			if (ps_storage->seg_size(zseg) >= 0)
 			{
-				int			z;
+				int			next = seg_id(s->index, seg_local(zseg) + 1);
+				int			stale = (ps_storage->seg_size(next) >= 0);
+				SegRecHdr	probe;
 
-				memset(pg, 0, page_size);
-				z = zero_shard_forward(s->index, s->cur_seg, s->cur_off, pg);
-				if (z < 0)
+				if (!stale &&
+					ps_storage->seg_read(zseg, zoff, &probe, sizeof(probe)) == 0)
+					for (size_t k = 0; k < sizeof(probe); k++)
+						if (((unsigned char *) &probe)[k])
+						{
+							stale = 1;
+							break;
+						}
+				if (stale)
 				{
-					free(pg);
-					return -1;
+					int			z;
+
+					memset(pg, 0, page_size);
+					z = zero_shard_forward(s->index, zseg, zoff, pg);
+					if (z < 0)
+					{
+						free(pg);
+						return -1;
+					}
+					if (z)
+						need_sync = 1;
 				}
-				if (z)
-					need_sync = 1;
 			}
 		}
 	}
-	if (need_sync)
-		ps_storage->sync();		/* make the tail truncation durable */
+	if (need_sync && ps_storage->sync() != 0)
+	{
+		/* the truncation is only in memory; opening now would let a later crash
+		 * replay the stale records we meant to drop -- fail the open instead */
+		fprintf(stderr, "pagestore: could not durably zero a truncated tail; "
+				"refusing to recover\n");
+		free(pg);
+		return -1;
+	}
 	free(pg);
 	return 0;
 }
@@ -2215,14 +2230,19 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
+	/* Validate --nshards against the stored value BEFORE minting a generation: the
+	 * freshness check below probes the live shards' first segments, so a wrong
+	 * nshards could misjudge an existing store as fresh and durably write a new
+	 * store_gen before this rejected the mismatch -- leaving the real records'
+	 * generations stale on the next correct-nshards open. */
+	if (validate_store_nshards(store_dir) != 0)
+		return -1;
 	if (load_store_gen(store_dir) != 0)	/* generation stamped into each record */
 	{
 		fprintf(stderr, "pagestore_core: could not durably establish store "
 				"generation in %s\n", store_dir);
 		return -1;
 	}
-	if (validate_store_nshards(store_dir) != 0)
-		return -1;
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  Reject
