@@ -263,6 +263,12 @@ typedef struct Shard
 	uint64_t	next_local_id;	/* next layer id within this shard (low bits) */
 	int			cur_seg;		/* segment being appended (-1: none yet) */
 	uint64_t	cur_off;		/* append cursor within cur_seg */
+	/* Last committed durable position packed as (seg << 32 | off), updated only
+	 * after a record's bytes are written, read atomically by the sync-watermark
+	 * capture.  Unlike the cur_seg/cur_off append cursor, this is never the bare
+	 * (new_seg, 0) a rollover publishes before any record exists there, so a
+	 * concurrent capture can't pair a fresh segment with a stale/zero offset. */
+	uint64_t	cur_cursor;
 	PsPgcache	pgcache;		/* per-shard materialized-page cache */
 	PsLayerBloom bloom;			/* per-shard per-layer (key,block) bloom cache */
 	time_t		maint_cooldown;	/* skip compaction attempts until this wall time */
@@ -430,11 +436,21 @@ void
 ps_core_wm_capture(uint32_t shard)
 {
 	Shard	   *s = &g_shards[shard];
-	int			seg = __atomic_load_n(&s->cur_seg, __ATOMIC_ACQUIRE);
-	uint64_t	off = __atomic_load_n(&s->cur_off, __ATOMIC_ACQUIRE);
+	/* one atomic load of the packed (seg, off) so the pair is always consistent --
+	 * never a freshly-rolled segment with a stale offset (cur_cursor is 0 until a
+	 * record is committed, and only ever holds a position whose bytes are written) */
+	uint64_t	c = __atomic_load_n(&s->cur_cursor, __ATOMIC_ACQUIRE);
+	int			seg = (int) (uint32_t) (c >> 32);
+	uint64_t	off = (uint32_t) c;
 
-	g_wm_pending[shard].local = (seg < 0) ? 0 : seg_local(seg);
-	g_wm_pending[shard].off = (seg < 0) ? 0 : off;
+	if (c == 0)					/* no committed record yet */
+	{
+		g_wm_pending[shard].local = 0;
+		g_wm_pending[shard].off = 0;
+		return;
+	}
+	g_wm_pending[shard].local = seg_local(seg);
+	g_wm_pending[shard].off = off;
 }
 
 /*
@@ -1685,6 +1701,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 					 ps_crc32c(page, page_size));
 	/* publish the advanced cursor only now, after the bytes are written */
 	__atomic_store_n(&s->cur_off, s->cur_off + reclen, __ATOMIC_RELEASE);
+	/* publish the committed (seg, off) as one atomic word for the watermark capture,
+	 * only here -- never the bare (rolled-seg, 0) above -- so a capture always sees a
+	 * position whose record bytes are written */
+	__atomic_store_n(&s->cur_cursor,
+					 ((uint64_t) (uint32_t) s->cur_seg << 32) | (uint32_t) s->cur_off,
+					 __ATOMIC_RELEASE);
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
@@ -2041,6 +2063,9 @@ recover(void)
 			/* newest segment seen for this shard; its append continues after it */
 			s->cur_seg = id;
 			s->cur_off = off;
+			/* seed the packed cursor so a watermark capture before the first new
+			 * append still reflects the recovered position */
+			s->cur_cursor = ((uint64_t) (uint32_t) id << 32) | (uint32_t) off;
 			/* A segment that stopped with room left (not full) is the shard's tail or
 			 * a mid-log corruption -- the shard ends here, never continue past it
 			 * (which would index a later segment yet leave the cursor mid-this-one). */
@@ -2642,6 +2667,14 @@ ps_core_open(const char *store_dir)
 	{
 		fprintf(stderr, "pagestore_core: page_size %u + record header exceeds "
 				"segment_size %llu\n", page_size,
+				(unsigned long long) segment_size);
+		return -1;
+	}
+	/* the sync-watermark capture packs (seg, off) into one 64-bit word with the
+	 * offset in the low 32 bits, so a segment must be addressable in 32 bits */
+	if (segment_size > 0xFFFFFFFFULL)
+	{
+		fprintf(stderr, "pagestore_core: segment_size %llu exceeds 4 GiB\n",
 				(unsigned long long) segment_size);
 		return -1;
 	}

@@ -159,8 +159,11 @@ immedsync_barrier(uint32_t shard)
 	}
 	if (rc == 0)				/* never advance the super past a failed flush */
 	{
-		ps_spdk_super_write_counts(counts);
-		if (ps_core_write_sync_watermark() != 0)	/* durable end-of-log marker */
+		/* the superblock must be durable BEFORE the watermark: if a crash kept the
+		 * watermark but lost the new counts, recovery would scan the old (shorter)
+		 * extent and refuse as short of the watermark, bricking the store */
+		if (ps_spdk_super_write_counts(counts) != 0 ||
+			ps_core_write_sync_watermark() != 0)
 			rc = -1;
 	}
 	return rc;

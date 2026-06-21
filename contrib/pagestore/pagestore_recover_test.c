@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -254,9 +255,33 @@ recover_no_resurrect(const char *store)	/* new block 3 only; old 4,5 not resurre
 	return 0;
 }
 
+/* per-run scenario directory under the test's private base, so concurrent test
+ * runs (separate build dirs / overlapping CI jobs) never share a store path */
+static const char *g_base;
+
+static const char *
+sdir(const char *name)
+{
+	static char buf[4096];
+
+	snprintf(buf, sizeof(buf), "%s/%s", g_base, name);
+	if (mkdir(buf, 0700) != 0)
+	{
+		printf("FAIL: mkdir %s\n", buf);
+		exit(2);
+	}
+	return buf;
+}
+
 int
 main(void)
 {
+	char		base[] = "/tmp/ps_recover.XXXXXX";
+	const char *dir;
+
+	if (!(g_base = mkdtemp(base)))
+		return 2;
+
 	page_size = 8192;
 	segment_size = 32768;		/* ~3 records/segment -> multi-segment shards */
 	ps_nshards = 1;
@@ -266,62 +291,66 @@ main(void)
 	compact_layers = 1 << 20;
 
 	/* 1: clean write -> close -> recover -> read */
-	if (system("rm -rf /tmp/psA && mkdir -p /tmp/psA") != 0)
-		return 2;
-	check(phase(setup_synced, "/tmp/psA") == 0, "clean: setup (write + watermark)");
-	check(phase(recover_read_all5_synced, "/tmp/psA") == 0,
-		  "clean: recover reads all records") ;
+	dir = sdir("A");
+	check(phase(setup_synced, dir) == 0, "clean: setup (write + watermark)");
+	check(phase(recover_read_all5_synced, dir) == 0,
+		  "clean: recover reads all records");
 
 	/* 2: corruption of SYNCED data (below watermark) refuses to open */
-	if (system("rm -rf /tmp/psB && mkdir -p /tmp/psB") != 0)
-		return 2;
-	check(phase(setup_synced, "/tmp/psB") == 0, "synced-corrupt: setup");
-	corrupt_byte("/tmp/psB", 0, 9000);	/* inside block 1, segment 0 */
-	check(phase(recover_expect_fail, "/tmp/psB") == 0,
+	dir = sdir("B");
+	check(phase(setup_synced, dir) == 0, "synced-corrupt: setup");
+	corrupt_byte(dir, 0, 9000);	/* inside block 1, segment 0 */
+	check(phase(recover_expect_fail, dir) == 0,
 		  "synced-corrupt: recovery refuses (acknowledged data corrupt)");
 
 	/* 3: a valid UNSYNCED tail past the watermark is still replayed */
-	if (system("rm -rf /tmp/psC && mkdir -p /tmp/psC") != 0)
-		return 2;
-	check(phase(setup_crash_tail, "/tmp/psC") == 0, "unsynced-tail: setup (crash)");
-	check(phase(recover_read_all5, "/tmp/psC") == 0,
+	dir = sdir("C");
+	check(phase(setup_crash_tail, dir) == 0, "unsynced-tail: setup (crash)");
+	check(phase(recover_read_all5, dir) == 0,
 		  "unsynced-tail: valid tail past watermark recovered");
 
 	/* 4: a corrupt UNSYNCED tail truncates, does not brick */
-	if (system("rm -rf /tmp/psD && mkdir -p /tmp/psD") != 0)
-		return 2;
-	check(phase(setup_crash_tail40, "/tmp/psD") == 0, "torn-tail: setup (crash)");
-	corrupt_byte("/tmp/psD", 1, 9000);	/* block 4 (segment 1), above watermark */
-	check(phase(recover_truncated_tail, "/tmp/psD") == 0,
+	dir = sdir("D");
+	check(phase(setup_crash_tail40, dir) == 0, "torn-tail: setup (crash)");
+	corrupt_byte(dir, 1, 9000);	/* block 4 (segment 1), above watermark */
+	check(phase(recover_truncated_tail, dir) == 0,
 		  "torn-tail: truncates (not brick); torn block dropped");
 
 	/* 5: a truncated tail is physically discarded, not resurrected by a partial
 	 * overwrite + second crash */
-	if (system("rm -rf /tmp/psE && mkdir -p /tmp/psE") != 0)
-		return 2;
-	check(phase(setup_resurrect, "/tmp/psE") == 0, "resurrect: setup (crash)");
-	corrupt_byte("/tmp/psE", 1, 100);	/* corrupt block 3 (first unsynced record) */
-	check(phase(recover_overwrite, "/tmp/psE") == 0,
+	dir = sdir("E");
+	check(phase(setup_resurrect, dir) == 0, "resurrect: setup (crash)");
+	corrupt_byte(dir, 1, 100);	/* corrupt block 3 (first unsynced record) */
+	check(phase(recover_overwrite, dir) == 0,
 		  "resurrect: recover zeroes tail, reappends block 3, crashes");
-	check(phase(recover_no_resurrect, "/tmp/psE") == 0,
+	check(phase(recover_no_resurrect, dir) == 0,
 		  "resurrect: old blocks 4,5 stay gone (no resurrection)");
 
 	/* 6: the watermark says this shard had synced data, but the segment is gone --
 	 * recovery must refuse, not silently open an empty store */
-	if (system("rm -rf /tmp/psF && mkdir -p /tmp/psF") != 0)
-		return 2;
-	check(phase(setup_synced, "/tmp/psF") == 0, "wm-vs-empty: setup");
+	dir = sdir("F");
+	check(phase(setup_synced, dir) == 0, "wm-vs-empty: setup");
 	{
-		int			fd = open("/tmp/psF/seg_00000000", O_RDWR);
+		char		seg[4200];
+		int			fd;
 
+		snprintf(seg, sizeof(seg), "%s/seg_00000000", dir);
+		fd = open(seg, O_RDWR);
 		if (fd < 0 || ftruncate(fd, 0) != 0)	/* segment lost after the watermark */
 			check(0, "wm-vs-empty: truncate segment");
 		if (fd >= 0)
 			close(fd);
 	}
-	check(phase(recover_expect_fail, "/tmp/psF") == 0,
+	check(phase(recover_expect_fail, dir) == 0,
 		  "wm-vs-empty: refuse to open when committed data is gone");
 
+	{
+		char		cmd[4200];
+
+		snprintf(cmd, sizeof(cmd), "rm -rf %s", g_base);
+		if (system(cmd) != 0)
+			printf("warning: could not clean up %s\n", g_base);
+	}
 	printf("%d checks, %d failed\n", checks, fails);
 	return fails ? 1 : 0;
 }
