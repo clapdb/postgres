@@ -29,6 +29,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,6 +378,10 @@ typedef struct SyncWmFile
 static SyncWmEnt g_wm[PS_MAX_SHARDS];	/* loaded watermark, per shard */
 static int	g_wm_valid;					/* a trustworthy watermark was loaded */
 static SyncWmEnt g_wm_pending[PS_MAX_SHARDS];	/* snapshot staged for the next commit */
+/* serializes the POSIX IMMEDSYNC capture+commit so concurrent syncs on different
+ * worker threads don't race on g_wm_pending or the sync_wm.tmp file (the SPDK path
+ * is already serialized by its barrier mutex) */
+static pthread_mutex_t g_wm_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Load the persisted watermark into g_wm; g_wm_valid stays 0 (no fail-open) when
  * absent or untrustworthy, so such a store keeps the safe truncate-only behavior. */
@@ -471,13 +476,39 @@ ps_core_write_sync_watermark(void)
 		unlink(tmp);
 		return -1;
 	}
-	fd = open(g_store_dir, O_RDONLY);		/* durable rename */
-	if (fd >= 0)
+	/* the rename itself must be durable: a failure here means a crash could lose the
+	 * watermark, so report it rather than acknowledge a non-durable sync */
+	fd = open(g_store_dir, O_RDONLY);
+	if (fd < 0 || fsync(fd) != 0)
 	{
-		fsync(fd);
-		close(fd);
+		if (fd >= 0)
+			close(fd);
+		return -1;
 	}
+	close(fd);
 	return 0;
+}
+
+/*
+ * One IMMEDSYNC / clean-shutdown durability step: capture every shard's cursor,
+ * sync the segment data, then commit the watermark -- all under g_wm_mtx so two
+ * concurrent syncs (the POSIX daemon serves IMMEDSYNC on any worker) can't race on
+ * the shared snapshot or the sync_wm temp file.  Capturing before the sync keeps
+ * the watermark from ever exceeding what is made durable.  Returns 0 on success.
+ */
+int
+ps_core_sync_and_watermark(void)
+{
+	int			rc;
+
+	pthread_mutex_lock(&g_wm_mtx);
+	for (uint32_t s = 0; s < ps_nshards; s++)
+		ps_core_wm_capture(s);
+	rc = ps_storage->sync();
+	if (rc == 0)
+		rc = ps_core_write_sync_watermark();
+	pthread_mutex_unlock(&g_wm_mtx);
+	return rc;
 }
 
 uint32_t
@@ -2211,12 +2242,8 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			/* Capture every shard's cursor BEFORE the sync so the watermark never
-			 * exceeds what the sync makes durable (other shards' workers may append
-			 * concurrently), then sync, then commit the snapshot. */
-			for (uint32_t s = 0; s < ps_nshards; s++)
-				ps_core_wm_capture(s);
-			if (ps_storage->sync() != 0 || ps_core_write_sync_watermark() != 0)
+			/* capture-before-sync + commit, serialized against concurrent syncs */
+			if (ps_core_sync_and_watermark() != 0)
 				ch->status = PS_STATUS_ERROR;	/* report a failed durable sync */
 			break;
 
@@ -2236,10 +2263,7 @@ ps_core_close(void)
 	/* clean shutdown is a durability point: capture each shard's cursor, sync the
 	 * segment data, and commit the watermark, so the next recover() trusts the full
 	 * log as synced */
-	for (uint32_t i = 0; i < ps_nshards; i++)
-		ps_core_wm_capture(i);
-	if (ps_storage->sync() == 0)
-		ps_core_write_sync_watermark();
+	ps_core_sync_and_watermark();
 	for (uint32_t i = 0; i < ps_nshards; i++)
 	{
 		Shard	   *s = &g_shards[i];

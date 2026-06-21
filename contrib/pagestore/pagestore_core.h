@@ -63,6 +63,11 @@ extern void ps_core_wm_capture(uint32_t shard);
  * it to tell an unsynced torn tail from corruption of already-synced data. */
 extern int	ps_core_write_sync_watermark(void);
 
+/* One serialized IMMEDSYNC / clean-shutdown step: capture every shard's cursor,
+ * sync the segment data, and commit the watermark, under one lock so concurrent
+ * syncs don't race.  Returns 0 on success, -1 if the durable sync failed. */
+extern int	ps_core_sync_and_watermark(void);
+
 /* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
  * did work (caller should not sleep), 0 if nothing was due.  The (void) form
  * sweeps every shard (single-threaded frontends); the per-shard form is for a
