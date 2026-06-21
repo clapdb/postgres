@@ -166,10 +166,14 @@ read_done(void *arg, int ok)
 	BlkCtx	   *bc = arg;
 	ReqState   *rs = bc->rs;
 
+	/* A failed engine read (submission/device error, or a read too large for the
+	 * async buffer) must not be published as OK with stale/zero data. */
+	if (!ok)
+		rs->ch->status = PS_STATUS_ERROR;
 	/* verify the delivered page against the version's CRC: device bit rot or a
 	 * misread must not be served as valid or cached.  Zero-fill and fail the
 	 * request rather than hand the client corrupt bytes. */
-	if (ok && ps_crc32c(bc->dst, page_size) != bc->crc)
+	else if (ps_crc32c(bc->dst, page_size) != bc->crc)
 	{
 		memset(bc->dst, 0, page_size);
 		rs->ch->status = PS_STATUS_ERROR;

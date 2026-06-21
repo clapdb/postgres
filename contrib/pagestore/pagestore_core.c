@@ -1699,37 +1699,76 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * work noted in SPDK_NOTES.
  */
 /*
- * Physically clear everything from (seg, off) forward in a shard's segments, so a
- * truncated tail cannot be resurrected: the old records past a truncation point
- * keep valid CRCs at their own offsets, so after the daemon overwrites only some of
- * them and crashes again, the next recover would otherwise replay the untouched
- * ones.  Zeroing their headers makes them unreadable.  zbuf is page_size zeros.
- * Returns 1 if it wrote anything (caller must sync), 0 if nothing, -1 on error.
+ * Physically clear the written bytes from (seg, off) forward in a shard's
+ * segments, so a truncated tail cannot be resurrected: the old records past a
+ * truncation point keep valid CRCs at their own offsets, so after the daemon
+ * overwrites only some of them and crashes again, the next recover would otherwise
+ * replay the untouched ones.
+ *
+ * Idempotent and self-bounding: it reads each chunk (only up to the segment's
+ * written size) and rewrites zeros ONLY where it finds non-zero bytes.  So a clean
+ * tail (cursor already at the segment's end) scans nothing, an already-zeroed tail
+ * costs reads but no writes/sync, and -- crucially -- a recovery interrupted partway
+ * through zeroing is finished by the next one (it scans the whole tail rather than
+ * trusting a single probe).  Returns 1 if it wrote anything (caller must sync), 0
+ * if nothing, -1 on error.
  */
 static int
-zero_shard_forward(uint32_t shard, int seg, uint64_t off, unsigned char *zbuf)
+zero_shard_forward(uint32_t shard, int seg, uint64_t off)
 {
 	uint32_t	local = seg_local(seg);
+	unsigned char *zbuf = calloc(1, page_size);
+	unsigned char *rb = malloc(page_size);
 	int			wrote = 0;
+	int			err = 0;
 
+	if (!zbuf || !rb)
+	{
+		free(zbuf);
+		free(rb);
+		return -1;
+	}
 	for (;; local++, off = 0)
 	{
 		int			id = seg_id(shard, local);
+		int64_t		sz = ps_storage->seg_size(id);
 
-		if (ps_storage->seg_size(id) < 0)
+		if (sz < 0)
 			break;				/* no more segments in this shard */
-		for (uint64_t p = off; p < segment_size;)
+		for (uint64_t p = off; p < (uint64_t) sz && !err;)
 		{
-			uint32_t	n = (segment_size - p > page_size)
-				? page_size : (uint32_t) (segment_size - p);
+			uint32_t	n = ((uint64_t) sz - p > page_size)
+				? page_size : (uint32_t) ((uint64_t) sz - p);
+			int			nz = 0;
 
-			if (ps_storage->seg_write(id, p, zbuf, n) != 0)
-				return -1;
+			if (ps_storage->seg_read(id, p, rb, n) != 0)
+			{
+				err = 1;
+				break;
+			}
+			for (uint32_t k = 0; k < n; k++)
+				if (rb[k])
+				{
+					nz = 1;
+					break;
+				}
+			if (nz)
+			{
+				if (ps_storage->seg_write(id, p, zbuf, n) != 0)
+				{
+					err = 1;
+					break;
+				}
+				wrote = 1;
+			}
 			p += n;
-			wrote = 1;
 		}
+		if (err)
+			break;
 	}
-	return wrote;
+	free(zbuf);
+	free(rb);
+	return err ? -1 : wrote;
 }
 
 static int
@@ -1843,51 +1882,22 @@ recover(void)
 		else
 		{
 			/*
-			 * Physically clear the tail past the append cursor when it actually
-			 * holds non-zero bytes -- a torn/corrupt/stale record at the cursor, or
-			 * at the start of the next segment -- so those records can't resurrect
-			 * after a partial overwrite + crash.  Probing content (not mere segment
-			 * existence) means a tail a previous recovery already zeroed is not
-			 * re-zeroed on every restart.
+			 * Physically clear any written bytes past the append cursor so a
+			 * torn/corrupt/stale tail can't resurrect after a partial overwrite +
+			 * crash.  zero_shard_forward() is idempotent and self-bounding: a clean
+			 * tail (cursor at the segment's written end) scans nothing, an already-
+			 * zeroed tail writes nothing, and a previously-interrupted zeroing is
+			 * finished here -- so it is safe to run unconditionally.
 			 */
-			int			stale = 0;
-			SegRecHdr	probe;
+			int			z = zero_shard_forward(s->index, s->cur_seg, s->cur_off);
 
-			if (ps_storage->seg_read(s->cur_seg, s->cur_off, &probe,
-									 sizeof(probe)) == 0)
-				for (size_t k = 0; k < sizeof(probe); k++)
-					if (((unsigned char *) &probe)[k])
-					{
-						stale = 1;
-						break;
-					}
-			if (!stale)
+			if (z < 0)
 			{
-				int			next = seg_id(s->index, seg_local(s->cur_seg) + 1);
-
-				if (ps_storage->seg_size(next) >= 0 &&
-					ps_storage->seg_read(next, 0, &probe, sizeof(probe)) == 0)
-					for (size_t k = 0; k < sizeof(probe); k++)
-						if (((unsigned char *) &probe)[k])
-						{
-							stale = 1;
-							break;
-						}
+				free(pg);
+				return -1;
 			}
-			if (stale)
-			{
-				int			z;
-
-				memset(pg, 0, page_size);
-				z = zero_shard_forward(s->index, s->cur_seg, s->cur_off, pg);
-				if (z < 0)
-				{
-					free(pg);
-					return -1;
-				}
-				if (z)
-					need_sync = 1;
-			}
+			if (z)
+				need_sync = 1;
 		}
 	}
 	if (need_sync && ps_storage->sync() != 0)
@@ -2246,6 +2256,61 @@ validate_store_nshards(const char *store_dir)
 }
 
 /*
+ * Persist and validate the store's segment_size.  recover() interprets segment
+ * boundaries (where a segment is "full" and rolls) from segment_size, so reopening
+ * a POSIX store with a different --segment-size would mis-locate the log tail and
+ * could truncate/zero live later segments.  (SPDK records segment_size in its
+ * superblock; this gives POSIX -- and any backend -- the same protection.)
+ * Returns 0 on match / first-time record, -1 on mismatch or I/O error.
+ */
+static int
+validate_store_segment_size(const char *store_dir)
+{
+	char		path[4096];
+	char		buf[64];
+	int			fd;
+	ssize_t		n;
+
+	if (snprintf(path, sizeof(path), "%s/segment_size", store_dir) >=
+		(int) sizeof(path))
+		return -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd >= 0)
+	{
+		uint64_t	stored;
+
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			return -1;
+		buf[n] = '\0';
+		stored = strtoull(buf, NULL, 10);
+		if (stored != segment_size)
+		{
+			fprintf(stderr, "pagestore_core: store was created with segment_size "
+					"%llu; reopen with --segment-size %llu\n",
+					(unsigned long long) stored, (unsigned long long) stored);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* first open of this store: record segment_size durably */
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	n = snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long) segment_size);
+	if (write(fd, buf, (size_t) n) != n || fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
  * Open the store and rebuild all in-memory state from it: define the root
  * timeline, load persisted branches, rebuild the page/fork indexes from the
  * image layers (falling back to a segment scan only for a store that has no
@@ -2267,6 +2332,8 @@ ps_core_open(const char *store_dir)
 	 * store_gen before this rejected the mismatch -- leaving the real records'
 	 * generations stale on the next correct-nshards open. */
 	if (validate_store_nshards(store_dir) != 0)
+		return -1;
+	if (validate_store_segment_size(store_dir) != 0)
 		return -1;
 	if (load_store_gen(store_dir) != 0)	/* generation stamped into each record */
 	{
