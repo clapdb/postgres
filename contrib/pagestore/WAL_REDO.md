@@ -110,13 +110,14 @@ gating we must honor (see `xlogutils.c`):
 - else `BLK_NEEDS_REDO` and the handler mutates the buffer.
 
 So to redo *one* page in isolation we must make those buffer reads return our
-single held page for the target `(rlocator, forknum, blkno)` (seeded to the base
-image with its LSN = base_lsn so the gating applies exactly the records in
-`(base_lsn, target_lsn]`), and return `BLK_NOTFOUND` for any *other* block a
-record touches (multi-block records: heap update, btree split, …) so the handler
-simply skips those — correct, because each page is materialized independently.
-Doing this inside a normal backend is unsafe: the handlers assume a recovery-ish
-context, and they would read/dirty the *real* shared buffers.
+single held page for the target `(rlocator, forknum, blkno)`, seeded to the base
+image with its page LSN = the base record's end LSN so the gating applies exactly
+the records in the half-open window the driver sends.  Other blocks a record also
+touches are served by *scratch* buffers marked already-applied (details under
+"Buffer redirection" below) — returning `BLK_NOTFOUND` is wrong, because some
+handlers init-then-dereference those blocks unconditionally.  Doing this inside a
+normal backend is unsafe: the handlers assume a recovery-ish context, and they
+would read/dirty the *real* shared buffers.
 
 ### Approach: a sandboxed `postgres --wal-redo` process (Neon model)
 
@@ -133,7 +134,7 @@ a length-prefixed binary protocol on a pipe pair:
 | msg | payload | effect |
 |-----|---------|--------|
 | `BEGIN` | rlocator, forknum, blkno | set the target page identity |
-| `PUSHBASE` | page bytes \| (none = zero) | seed the held page (base FPI, or zero for a WILL_INIT first record) |
+| `PUSHBASE` | base_end_lsn, page bytes \| (none = zero) | seed the held page (base FPI, or zero for a WILL_INIT first record) **and set its page LSN to base_end_lsn** — `RestoreBlockImage` copies only bytes; PG sets `pd_lsn` separately, so the gating needs the LSN sent explicitly |
 | `APPLY` | record LSN, raw WAL record bytes | decode + `rm_redo` the record onto the held page |
 | `GET` | — | return the current page bytes (the as-of result) |
 
@@ -149,30 +150,54 @@ Buffer redirection (under an `am_walredo` flag):
   returning not-found would leave them operating on an invalid buffer and crash.
   Every registered block therefore gets a usable buffer; only the target's
   contents are returned by `GET`, the scratch buffers are discarded.
-- **Side effects beyond the buffer read must also be stubbed.** Redo handlers
-  reach auxiliary storage outside `XLogReadBufferExtended`: heap redo calls
-  `visibilitymap_pin`/`visibilitymap_clear` and `XLogRecordPageWithFreeSpace`
-  when VM/FSM bits change.  Under `am_walredo` these must be no-ops (or serve
-  scratch buffers) so single-page redo never reads or dirties real VM/FSM
-  storage.  The patch enumerates every such call reachable from `rm_redo` and
-  guards it — this is the bulk of the "small core mode" work (Neon's wal-redo
-  does the same).
+  - **The scratch buffer must read as already-applied.** A fresh zero scratch
+    page has `pd_lsn = 0`, so `XLogReadBufferForRedo` would return
+    `BLK_NEEDS_REDO` and a handler (e.g. heap update touching the *other* page)
+    would dereference its bogus line pointers.  So a non-target scratch read
+    returns `BLK_DONE` (equivalently, present `pd_lsn >= record->EndRecPtr`) — the
+    handler skips it — **except** for a block actually flagged `WILL_INIT`, which
+    is meant to be zero-initialized and replayed; that one is initialized
+    normally.  We never need the scratch *result*, only that the handler doesn't
+    crash and doesn't touch the target.
+- **Side effects beyond the buffer read must also be stubbed — target-aware.**
+  Redo handlers reach auxiliary storage outside `XLogReadBufferExtended`: heap
+  redo calls `visibilitymap_pin`/`visibilitymap_clear` and
+  `XLogRecordPageWithFreeSpace` when VM/FSM bits change.  When the requested fork
+  is the **heap (main) fork**, these are no-ops under `am_walredo` (don't read or
+  dirty real VM/FSM storage).  But when the requested fork **is** the VM or FSM,
+  those very calls *are* the change to capture — so the redirection must route
+  the VM/FSM update to the held page instead of no-oping it.  A wrinkle: some heap
+  records clear VM bits without registering the VM block in the per-page index, so
+  materializing a VM page cannot rely on `walidx_get` alone; the VM/FSM forks need
+  their own derive-from-heap rebuild rule (or be excluded from on-demand redo and
+  always rebuilt), documented as a follow-up (3c-4b).  The patch enumerates every
+  such call reachable from `rm_redo` and guards it per target fork — the bulk of
+  the "small core mode" work (Neon's wal-redo does the same).
 
 Mechanism (wal-redo-specific tiny smgr vs guarded branches in the read path) is a
-patch detail; the smgr route keeps core least-touched, but the VM/FSM guards are
-needed either way.
+patch detail; the smgr route keeps core least-touched, but the scratch-LSN and
+fork-aware VM/FSM guards are needed either way.
 
 ### Driver side (normal backend, contrib/pagestore)
 
-`pagestore_redo_page_asof(rel, fork, block, lsn) -> bytea`:
+Core API — keyed by store identity, not a live relation:
+`redo_page_asof(timeline, RelFileLocator/PageStoreRelKey, fork, block, lsn) ->
+page`.  The background materializer and read-miss callers work in page-store keys
+and must materialize pages for relations that are dropped, rewritten, or absent
+from any catalog the helper can see; resolving a `regclass`/`rel` could fail or
+point at the wrong relfilenode.  A `pagestore_redo_page_asof(rel regclass, …)` SQL
+wrapper that resolves the locator stays only as a test convenience.
 
-0. **Truncation/drop check first.** `walidx_get` only knows records that register
-   *this* block, so it misses page-removing records that carry just a relation
-   locator — `XLOG_SMGR_TRUNCATE` (new block count), relation drop.  Before
-   replaying anything, consult fork-size / truncation / drop metadata as-of `lsn`:
-   if the relation was truncated below `block` (or dropped) after the base, the
-   page is gone — return "no page", never a stale replay.  (This requires the
-   store to track per-fork size / truncation LSNs; called out as a dependency.)
+0. **Truncation/drop check first — by fork size at the target LSN.** `walidx_get`
+   only knows records that register *this* block, so it misses page-removing
+   records that carry just a relation locator — `XLOG_SMGR_TRUNCATE` (new block
+   count), relation drop.  Decide from the **fork size as-of `lsn`** (equivalently
+   the latest remove vs. any later re-creation): if `block >= size_at(lsn)` (or
+   the relation is dropped with no later re-create at `lsn`) the page is gone —
+   return "no page".  A truncation followed by re-extension/reinit before `lsn` is
+   *not* terminal: the block exists again and is materialized from the
+   post-truncation `WILL_INIT`/FPI chain.  (Requires the store to track per-fork
+   size / truncation+create LSNs; a dependency.)
 1. `base, base_end_lsn` = 3c-3 (`pagestore_redo_page`, extended): newest FPI
    at/below `lsn`, **and the end LSN of the record that carried it** — or a zero
    page if the first relevant record has `BKPBLOCK_WILL_INIT`.  The end LSN
@@ -185,6 +210,12 @@ needed either way.
    start-LSN-keyed window `ps_read_plan_build` builds (`[base_lsn, read_lsn)`),
    *not* `(base_lsn, lsn]` — a closed upper bound would replay a record starting
    exactly at `lsn` and overshoot.
+   - **Order across timeline ancestry.** On a branched read `walidx_get()` walks
+     the branch by appending the child timeline's LSNs after the parent's capped
+     LSNs (`pagestore_core.c` ~1614–1631), so the raw result is *not* globally
+     ascending — applying it as-is would replay child WAL before inherited parent
+     WAL.  The driver must merge/sort the records into a single ascending chain by
+     LSN across the ancestry before sending `APPLY`.
    - **Chain completeness is mandatory.** A single `walidx_get` response is capped
      by the IPC payload (`PS_IO_UNIT / sizeof(uint64)`) with no continuation, so a
      hot page with more records than fit would be silently shortened and
@@ -213,9 +244,13 @@ cold read drives the same function for just that page.
   don't crash; non-target results are discarded (see Buffer redirection).
 - **A delta carries a newer FPI** — handled inside redo (`BLK_RESTORED`); start
   effectively re-bases there.
-- **Page removed after the base** — `XLOG_SMGR_TRUNCATE` / drop below `block`
-  means "no page", not a stale replay; caught by Driver step 0, which needs
-  per-fork size / truncation metadata in the store.
+- **Page removed after the base** — `XLOG_SMGR_TRUNCATE` / drop below the
+  fork size as-of `lsn` means "no page", not a stale replay (Driver step 0). But a
+  truncate-then-re-extend before `lsn` makes the block live again — materialize it
+  from the post-truncation chain, don't treat the truncation as terminal.
+- **Branched read ordering** — the per-page index returns child-then-parent LSNs,
+  not globally ascending; merge/sort by LSN across ancestry before replay (Driver
+  step 2).
 - **WAL-index chain overflow** — more indexed records than one IPC response holds
   must paginate or error, never silently truncate to an older page (Driver step
   2).
@@ -238,7 +273,11 @@ cold read drives the same function for just that page.
   the heap page without touching real VM/FSM storage.
 - Truncation: truncate a relation below a block after its base image, then
   `redo_page_asof` for that block returns "no page", not the stale pre-truncation
-  page.
+  page; and a truncate-then-re-extend before the target LSN materializes the
+  re-created block from its post-truncation chain.
+- Branched ordering: a page modified on both a parent and its child branch
+  materializes with parent WAL applied before child WAL (merge/sort), matching a
+  full branch recovery.
 - Hot page: more indexed records for one page than fit in a single index response
   still replays the full chain (pagination), or fails loudly — never silently
   returns an older page.
