@@ -418,11 +418,19 @@ it builds and runs from a normal tree:
     ninja -C BUILD src/backend/postgres        # the --wal-redo mode
 
 4a is verified end-to-end against the built binary by driving the protocol on
-stdin/stdout: `BEGIN` + `PUSHBASE`(8 KB page, base_end_lsn) + `GET` returns the
-page with `pd_lsn` stamped to base_end_lsn and the body intact.  4b's APPLY is
-testable the same way against real WAL: `initdb`, generate WAL with an FPI plus a
-later record (e.g. CHECKPOINT then UPDATE), and feed `PUSHBASE`(FPI) + `APPLY`(the
-record) and compare `GET` to the heap block's on-disk content.
+stdin/stdout (in wire order): `BEGIN` + `PUSHBASE`(base_end_lsn, then the 8 KB
+page) + `GET` returns the page with `pd_lsn` stamped to base_end_lsn and the body
+intact.
+
+4b's APPLY is testable the same way against real WAL, but the example must produce
+an actual *delta after* the base, since the driver excludes the base record (the
+FPI already includes its change): `initdb`, then `CHECKPOINT; UPDATE ...` (the
+first update after the checkpoint logs the block's FPI), then a *second*
+`UPDATE ...` of the same row -- that second record is the delta.  Feed
+`PUSHBASE`(FPI record's end LSN, FPI page) + `APPLY`(the second update record) and
+compare `GET` to the heap block's on-disk content as-of the second update.
+(Feeding the FPI-carrying record itself to APPLY would re-apply the base and
+exercise the wrong path.)
 
 ### Core-integration prerequisite for the PG module (important)
 
