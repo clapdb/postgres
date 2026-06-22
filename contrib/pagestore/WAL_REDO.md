@@ -422,8 +422,10 @@ patch is absent):
     ninja -C BUILD src/backend/postgres        # just the --wal-redo mode
     meson test -C BUILD --suite setup          # builds all + tmp_install (cluster + tools)
 
-**4a (protocol) is verified** by driving the exact wire format on stdin/stdout
-(little-endian); the helper exits on EOF and replies `BLCKSZ` bytes to `GET`:
+**4a (protocol) is verified** by driving the exact wire format on stdin/stdout.
+Integer fields are in **host/native byte order** -- the helper copies raw bytes
+(`read_u32`/`read_u64`) with no byte-order conversion, since helper and driver run
+on the same host.  The helper exits on EOF and replies `BLCKSZ` bytes to `GET`:
 
     'b' BEGIN     5x uint32: spcOid, dbOid, relNumber, forkNum, blockNum
     'p' PUSHBASE  uint64 base_end_lsn, uint32 len, then len page bytes (len = BLCKSZ or 0)
