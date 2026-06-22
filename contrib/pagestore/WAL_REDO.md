@@ -408,6 +408,40 @@ the WAL (3c-2); assert `redo_page_asof(block, lsn)` equals a direct read of that
 page as-of `lsn`, for several LSNs.  Multi-block (btree split), WILL_INIT, and
 branched-replay cases as in the 3c-4 test plan.  Extends `redo_worker_demo.sh`.
 
+## Building and testing the wal-redo helper
+
+The `postgres --wal-redo` helper (`src/backend/postmaster/walredo.c`) is plain
+backend code: it links into the `postgres` binary and needs no contrib module, so
+it builds and runs from a normal tree:
+
+    meson setup BUILD -Dcassert=true
+    ninja -C BUILD src/backend/postgres        # the --wal-redo mode
+
+4a is verified end-to-end against the built binary by driving the protocol on
+stdin/stdout: `BEGIN` + `PUSHBASE`(8 KB page, base_end_lsn) + `GET` returns the
+page with `pd_lsn` stamped to base_end_lsn and the body intact.  4b's APPLY is
+testable the same way against real WAL: `initdb`, generate WAL with an FPI plus a
+later record (e.g. CHECKPOINT then UPDATE), and feed `PUSHBASE`(FPI) + `APPLY`(the
+record) and compare `GET` to the heap block's on-disk content.
+
+### Core-integration prerequisite for the PG module (important)
+
+The freestanding daemon (`pagestore_core.c`) and the helper (`walredo.c`) build
+anywhere, but the **contrib PG module** (`pagestore.c` -- the smgr shim and the
+`pagestore_*` SQL functions, including the redo driver `redo_page_asof`) requires
+the core "export `f_smgr` / `smgr_register`" patch in `storage/smgr.h`.  That patch
+lives on the per-version integration branch (`branchdb_18`), **not** on the
+`pagestore` line the redo feature branches were stacked on, so on those branches
+`pagestore.c` does not compile (`unknown type name 'f_smgr'`).  CI did not catch
+this because it only builds the freestanding daemon, never the PG module.
+
+Consequence: the redo driver + the SQL-level pieces (#36 `redo_base_lsn`, #38
+`block_live`, and the future `redo_page_asof`) must be built and tested on a base
+that carries the smgr-export patch (i.e. integrated onto `branchdb_18`).  To build
+a runnable cluster from a redo-feature branch without that patch, the pagestore
+contrib can be skipped (`# subdir('pagestore')` in `contrib/meson.build`); the
+`postgres` binary (and thus the wal-redo helper) is unaffected.
+
 ## Known scope boundaries
 
 Until 3c/3d land, branches remain single-compute-at-a-time and WAL/SLRU/control
