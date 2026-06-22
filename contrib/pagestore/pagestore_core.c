@@ -1419,18 +1419,17 @@ forksz_find(uint32_t timeline, const PsKey *key)
  * The length the fork was last *truncated* to as of 'lsn': the nblocks of the
  * newest truncation event at or below 'lsn', walking the timeline ancestry (a
  * branch inherits the parent's floor as of its fork LSN until its own first
- * truncation).  Returns true and sets *nblocks when a truncation is known
- * at/below 'lsn'; false ("never truncated / unknown") otherwise -- kept separate
- * from the count so the full unsigned block range is usable.
+ * truncation).  Returns true and sets *nblocks and *trunc_lsn (the LSN of that
+ * truncation) when one is known at/below 'lsn'; false ("never truncated") else.
  *
  * NB: this is only the truncation floor, not the live fork length -- extensions
  * are not tracked (see fork_size_add).  A block at/above this floor is not
- * necessarily dead: a liveness check must also consult the per-page WAL index to
- * see whether the block was written again after the truncation.
+ * necessarily dead: a liveness check must also consult the per-page WAL index for
+ * a write *after* *trunc_lsn* (hence trunc_lsn is returned, not just the count).
  */
 static bool
 fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
-				uint32_t *nblocks)
+				uint32_t *nblocks, uint64_t *trunc_lsn)
 {
 	const Shard *s = shard_for(key);
 
@@ -1443,6 +1442,7 @@ fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
 				if (e->sz[i].lsn <= lsn)
 				{
 					*nblocks = e->sz[i].nblocks;
+					*trunc_lsn = e->sz[i].lsn;
 					return true;
 				}
 		if (!timeline_has_parent(s, timeline))
@@ -1461,21 +1461,20 @@ fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
  * unlink registers existing buffers WILL_INIT), so it is not evidence the fork
  * grew to that block.  Extensions are therefore left to the per-page WAL index
  * (every block touch is recorded there); this history records only the shrink
- * floor that the index cannot express.  Events store the exact length as of their
- * LSN, so fork_nblocks_at() (latest <= lsn) reads them directly; kept ascending.
+ * floor that the index cannot express.
+ *
+ * Every distinct-LSN truncation is kept, even one to a size already in force: a
+ * later truncation to the same floor still resets the liveness window (a block
+ * written between the two truncations is dead again after the second), so it must
+ * not be pruned.  Events store the exact length as of their LSN; kept ascending.
  */
 void
 fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn, uint32_t nblocks)
 {
-	uint32_t	cur;
-	bool		known = fork_nblocks_at(timeline, key, lsn, &cur);
 	ForkSizeEnt *e;
 	uint32_t	h;
 	Shard	   *s;
 	int			i;
-
-	if (known && cur == nblocks)
-		return;					/* fork already truncated to this floor at 'lsn' */
 
 	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
 	s = shard_for(key);
@@ -2394,9 +2393,15 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_FORK_SIZE_AT:
 		{
 			uint32_t	nb;
+			uint64_t	tlsn;
 
-			ch->result = fork_nblocks_at(tl, &ch->key, ch->req_lsn, &nb)
-				? nb : PS_FORKSIZE_UNKNOWN;
+			if (fork_nblocks_at(tl, &ch->key, ch->req_lsn, &nb, &tlsn))
+			{
+				ch->result = nb;
+				ch->req_lsn = tlsn;	/* output: LSN of the truncation */
+			}
+			else
+				ch->result = PS_FORKSIZE_UNKNOWN;
 			break;
 		}
 

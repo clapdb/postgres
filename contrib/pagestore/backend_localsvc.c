@@ -621,11 +621,13 @@ pagestore_localsvc_forksize_add(const PageStoreRelKey *key, uint64 lsn,
 }
 
 /* The fork's truncation floor (blocks) as of 'lsn'.  Returns true and sets *out
- * when a truncation is known at/below 'lsn'; false otherwise.  Returns the count
- * as a full BlockNumber (no signed cast), so forks above INT_MAX read correctly. */
+ * (and, if non-NULL, *trunc_lsn = the LSN of that truncation, which a liveness
+ * check needs to bound the re-extension window) when a truncation is known
+ * at/below 'lsn'; false otherwise.  Returns the count as a full BlockNumber (no
+ * signed cast), so forks above INT_MAX read correctly. */
 bool
 pagestore_localsvc_forksize_at(const PageStoreRelKey *key, uint64 lsn,
-							   BlockNumber *out)
+							   BlockNumber *out, uint64 *trunc_lsn)
 {
 	PsChannel  *ch = ls_chan(key);
 
@@ -636,6 +638,8 @@ pagestore_localsvc_forksize_at(const PageStoreRelKey *key, uint64 lsn,
 	if (ch->result == PS_FORKSIZE_UNKNOWN)
 		return false;
 	*out = (BlockNumber) ch->result;
+	if (trunc_lsn)
+		*trunc_lsn = ch->req_lsn;	/* daemon wrote the truncation LSN here */
 	return true;
 }
 
