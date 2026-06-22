@@ -694,54 +694,48 @@ pagestore_walidx_count(PG_FUNCTION_ARGS)
  */
 #define PS_REDO_MAX_RECS 4096
 
-PG_FUNCTION_INFO_V1(pagestore_redo_page);
-
-Datum
-pagestore_redo_page(PG_FUNCTION_ARGS)
+/*
+ * Shared base-image step: find the newest full-page image of (key,block) at/below
+ * 'lsn' via the per-page index, restore it into 'page' (BLCKSZ), and report the
+ * end LSN of the record that carried it in *base_end_lsn.  Returns true on
+ * success, false if no usable FPI is indexed at/below lsn (or the chain
+ * overflowed PS_REDO_MAX_RECS, in which case a stale prefix is refused).
+ *
+ * base_end_lsn is what a single-page redo must seed the held page's LSN with
+ * (RestoreBlockImage copies only bytes; PostgreSQL sets pd_lsn to record->EndRecPtr
+ * separately), so the BLK_DONE/BLK_NEEDS_REDO gating of the delta replay is exact.
+ */
+static bool
+redo_base_image(const PageStoreRelKey *key, int forknum, int blocknum,
+				XLogRecPtr lsn, char *page, XLogRecPtr *base_end_lsn)
 {
-	Oid			relid = PG_GETARG_OID(0);
-	int32		forknum = PG_GETARG_INT32(1);
-	int32		blocknum = PG_GETARG_INT32(2);
-	XLogRecPtr	lsn = PG_GETARG_LSN(3);
-	Relation	rel;
-	PageStoreRelKey key;
 	uint64	   *lsns;
 	int			n;
+	bool		overflow = false;
 	ReadLocalXLogPageNoWaitPrivate *pd;
 	XLogReaderState *reader;
-	char	   *page;
-	bytea	   *result = NULL;
-
-	rel = relation_open(relid, AccessShareLock);
-	key.spcOid = rel->rd_locator.spcOid;
-	key.dbOid = rel->rd_locator.dbOid;
-	key.relNumber = rel->rd_locator.relNumber;
-	key.forkNum = forknum;
-	relation_close(rel, AccessShareLock);
+	bool		found = false;
 
 	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	n = pagestore_localsvc_walidx_get(key, (BlockNumber) blocknum, (uint64) lsn,
+									  lsns, NULL, PS_REDO_MAX_RECS, &overflow);
+	if (overflow)
 	{
-		bool		overflow = false;
-
-		n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
-										  (uint64) lsn, lsns, NULL,
-										  PS_REDO_MAX_RECS, &overflow);
-		if (overflow)
-		{
-			/* The chain is longer than we fetched, so the newest full-page image
-			 * may be in the unseen suffix; a base built from the truncated prefix
-			 * could be stale.  Fail (no page) until pagination exists, rather than
-			 * report success with a possibly-wrong image. */
-			ereport(WARNING,
-					(errmsg("pagestore WAL-index chain for block %d exceeds %d records; "
-							"cannot reconstruct base image without pagination",
-							blocknum, PS_REDO_MAX_RECS)));
-			pfree(lsns);
-			PG_RETURN_NULL();
-		}
+		/* The chain is longer than we fetched, so the newest full-page image may
+		 * be in the unseen suffix; a base built from the truncated prefix could be
+		 * stale.  Refuse until pagination exists. */
+		ereport(WARNING,
+				(errmsg("pagestore WAL-index chain for block %d exceeds %d records; "
+						"cannot reconstruct base image without pagination",
+						blocknum, PS_REDO_MAX_RECS)));
+		pfree(lsns);
+		return false;
 	}
 	if (n == 0)
-		PG_RETURN_NULL();
+	{
+		pfree(lsns);
+		return false;
+	}
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -752,12 +746,12 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	if (reader == NULL)
 	{
 		pfree(pd);
-		PG_RETURN_NULL();
+		pfree(lsns);
+		return false;
 	}
-	page = palloc(BLCKSZ);
 
 	/* newest indexed record first: find one carrying a full-page image */
-	for (int i = n - 1; i >= 0 && result == NULL; i--)
+	for (int i = n - 1; i >= 0 && !found; i--)
 	{
 		char	   *errm;
 		XLogRecord *rec;
@@ -765,6 +759,16 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		XLogBeginRead(reader, lsns[i]);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
+			continue;
+
+		/*
+		 * The index is keyed by record start LSN, so a record can start at/below
+		 * 'lsn' yet end after it.  Such a record is in the future relative to the
+		 * target -- using its image (and reporting its end LSN) would seed the page
+		 * with a change from after the requested point -- so skip it; the base must
+		 * be a record whose end LSN is at/below 'lsn'.
+		 */
+		if (reader->EndRecPtr > lsn)
 			continue;
 
 		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
@@ -776,15 +780,14 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 			if (!XLogRecHasBlockImage(reader, b))
 				continue;
 			XLogRecGetBlockTagExtended(reader, b, &rloc, &fk, &blk, NULL);
-			if (rloc.relNumber != key.relNumber || rloc.dbOid != key.dbOid ||
-				rloc.spcOid != key.spcOid || fk != forknum ||
+			if (rloc.relNumber != key->relNumber || rloc.dbOid != key->dbOid ||
+				rloc.spcOid != key->spcOid || fk != forknum ||
 				blk != (BlockNumber) blocknum)
 				continue;
 			if (RestoreBlockImage(reader, b, page))
 			{
-				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
-				SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
-				memcpy(VARDATA(result), page, BLCKSZ);
+				*base_end_lsn = reader->EndRecPtr;
+				found = true;
 			}
 			break;
 		}
@@ -793,11 +796,77 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	XLogReaderFree(reader);
 	pfree(pd);
 	pfree(lsns);
-	pfree(page);
+	return found;
+}
 
-	if (result == NULL)
+static void
+redo_key_from_relid(Oid relid, int forknum, PageStoreRelKey *key)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+
+	key->spcOid = rel->rd_locator.spcOid;
+	key->dbOid = rel->rd_locator.dbOid;
+	key->relNumber = rel->rd_locator.relNumber;
+	key->forkNum = forknum;
+	relation_close(rel, AccessShareLock);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_redo_page);
+
+Datum
+pagestore_redo_page(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	PageStoreRelKey key;
+	char	   *page = palloc(BLCKSZ);
+	XLogRecPtr	base_end_lsn;
+	bytea	   *result;
+
+	redo_key_from_relid(relid, forknum, &key);
+	if (!redo_base_image(&key, forknum, blocknum, lsn, page, &base_end_lsn))
+	{
+		pfree(page);
 		PG_RETURN_NULL();
+	}
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+	pfree(page);
 	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * pagestore_redo_base_lsn(rel regclass, forknum int, blocknum int, lsn pg_lsn)
+ *   -> pg_lsn
+ *
+ * The end LSN of the record carrying the base full-page image that
+ * pagestore_redo_page returns -- the LSN a single-page redo seeds the held page
+ * with before replaying the deltas after it.  NULL when no FPI is indexed at/below
+ * lsn (same condition under which pagestore_redo_page returns NULL).
+ */
+PG_FUNCTION_INFO_V1(pagestore_redo_base_lsn);
+
+Datum
+pagestore_redo_base_lsn(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	PageStoreRelKey key;
+	char	   *page = palloc(BLCKSZ);
+	XLogRecPtr	base_end_lsn;
+	bool		found;
+
+	redo_key_from_relid(relid, forknum, &key);
+	found = redo_base_image(&key, forknum, blocknum, lsn, page, &base_end_lsn);
+	pfree(page);
+	if (!found)
+		PG_RETURN_NULL();
+	PG_RETURN_LSN(base_end_lsn);
 }
 
 void
