@@ -40,8 +40,13 @@
 
 #include <errno.h>
 #include <unistd.h>
+#ifdef WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "postmaster/walredo.h"
+#include "storage/bufpage.h"
 
 /* protocol message tags */
 #define WALREDO_BEGIN		'b'
@@ -135,6 +140,13 @@ WalRedoMain(int argc, char *argv[])
 	(void) argc;
 	(void) argv;
 
+#ifdef WIN32
+	/* the protocol is binary; keep the CRT from translating \n/\r\n/0x1a on the
+	 * inherited stdin/stdout, which would corrupt PUSHBASE/GET page bytes */
+	_setmode(_fileno(stdin), _O_BINARY);
+	_setmode(_fileno(stdout), _O_BINARY);
+#endif
+
 	for (;;)
 	{
 		unsigned char tag;
@@ -168,12 +180,22 @@ WalRedoMain(int argc, char *argv[])
 					{
 						if (!read_fully(held_page, BLCKSZ))
 							_exit(1);
+
+						/*
+						 * RestoreBlockImage (on the driver side) copies only the
+						 * image bytes; PostgreSQL stamps a restored page's LSN
+						 * separately.  Do the same here so a base-only GET, and the
+						 * BLK_DONE/BLK_NEEDS_REDO gating once 4b replays deltas, see
+						 * the correct pd_lsn.  Leave an uninitialized (new) page
+						 * alone, as redo does.
+						 */
+						if (!PageIsNew((Page) held_page))
+							PageSetLSN((Page) held_page, (XLogRecPtr) base_end_lsn);
 					}
 					else if (len == 0)
 						memset(held_page, 0, BLCKSZ);
 					else
 						_exit(1);	/* malformed base length */
-					(void) base_end_lsn;	/* 4b seeds the held page LSN with it */
 					break;
 				}
 
