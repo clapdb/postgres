@@ -1152,6 +1152,8 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 6, 250);		/* block 6 rewritten exactly @ trunc lsn */
 	check(op_block_live(0, REL_A, FORK0, 6, 300) == 1,
 		  "re-extension exactly at the truncation LSN -> live");
+	check(op_block_live(0, REL_A, FORK0, 6, 250) == 0,
+		  "as-of the rewrite's own start LSN (upper bound exclusive) -> not yet live");
 
 	client_detach();
 	stop_daemon(dpid);

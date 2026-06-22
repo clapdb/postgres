@@ -1786,14 +1786,21 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 
 /*
  * Is (key, block) live as of 'lsn'?  The redo driver's step-0: skip materializing
- * a page that was truncated away (and not written again) at the target LSN.
+ * a page that was removed (the fork truncated below it, or dropped) and not
+ * written again at the target LSN.
  *
- * A block is live unless the fork's truncation floor as-of 'lsn' is at/below it
- * AND no WAL record wrote the block after that truncation (i.e. it was not
- * re-extended).  Truncation floor + LSN come from the size history (fork_size_add);
- * the re-extension check scans the per-page index for a write in (trunc_lsn, lsn],
- * across the timeline ancestry, with early exit.  On an unreadable/absent floor
- * the block is treated as live (materialize rather than wrongly drop).
+ * A block is live unless the fork's "floor" as-of 'lsn' is at/below it AND no WAL
+ * record wrote the block in the half-open window [trunc_lsn, lsn) (it was not
+ * re-extended).  The floor and its LSN come from the size history (fork_size_add);
+ * the re-extension check scans the per-page index across the timeline ancestry,
+ * with early exit.  No floor known -> live (materialize rather than wrongly drop).
+ *
+ * A relation *drop* is represented as a truncation to 0 (floor 0), so this same
+ * logic returns dead for a dropped, not-recreated fork.  NB: *populating* drop
+ * events from WAL -- decoding the dropped-relation lists in xact commit/abort
+ * records -- is a follow-up; until it lands a WAL-driven drop is not yet reflected
+ * here, so a background materializer keyed by store identity must not run ahead of
+ * that work for dropped relations.
  */
 static bool
 block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
@@ -1809,10 +1816,13 @@ block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 		return true;			/* within the post-truncation length */
 
 	/*
-	 * Live iff written again at/after the truncation, up to lsn.  The lower bound
-	 * is inclusive (>=): truncations are indexed by the record end LSN, while page
-	 * writes are indexed by the record start LSN, and the next record starts where
-	 * the truncation ended -- so an immediate re-extension has start == trunc_lsn.
+	 * Live iff written again in the half-open window [trunc_lsn, lsn).  Lower bound
+	 * inclusive: truncations are indexed by record end LSN, page writes by record
+	 * start LSN, and the record right after the truncation starts where it ended,
+	 * so an immediate re-extension has start == trunc_lsn.  Upper bound exclusive:
+	 * a write whose start == lsn begins at the target boundary and ends after it,
+	 * so it is not visible as-of lsn (same half-open convention as the delta window
+	 * the redo driver replays).
 	 */
 	for (uint32_t t = tl;;)
 	{
@@ -1823,7 +1833,7 @@ block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 			if (e->timeline == t && e->block == block && key_eq(&e->key, key))
 			{
 				for (int i = 0; i < e->n; i++)
-					if (e->lsns[i] >= trunc_lsn && e->lsns[i] <= lmax)
+					if (e->lsns[i] >= trunc_lsn && e->lsns[i] < lmax)
 						return true;
 				break;
 			}
