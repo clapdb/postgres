@@ -73,12 +73,14 @@ read pages at an LSN.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it
-         (`RestoreBlockImage`) -- rebuilding one page from WAL on demand.  Note a
-         WAL full-page image is the page *before* that record's change (torn-page
-         protection), so this returns the base image, not the page exactly as-of
-         lsn.
-       - **3c-4** The `--wal-redo`-style helper: apply the delta records after
-         the base image with `rm_redo` to get the page exactly as-of lsn.  This
+         (`RestoreBlockImage`) -- rebuilding one page from WAL on demand.  A WAL
+         full-page image is the page *as modified by* its record (it is captured at
+         XLogInsert, after the change; recovery restores it and returns
+         `BLK_RESTORED`, skipping the delta), so this image is the page exactly
+         as-of that record's end LSN -- the base for any later deltas.
+       - **3c-4** The `--wal-redo`-style helper: apply the delta records *after*
+         the base image (not the base record itself, which the image already
+         includes) with `rm_redo` to get the page exactly as-of lsn.  This
          is the one piece that needs PostgreSQL's redo run against a single held
          page (Neon's wal-redo process / a small core mode) -- the last hard
          piece of the read path.  📐 Designed, not yet implemented: see
@@ -328,28 +330,41 @@ Status of the parts built so far: the per-page `(timeline,lsn)` index (#34), the
 truncation floor + LSN (#35), the base-image end LSN (#36), the `postgres
 --wal-redo` process + `BEGIN/PUSHBASE/APPLY/GET` protocol skeleton (#37, APPLY
 stubbed), and the driver's block-liveness step (#38) are all in.  4b is the
-`APPLY` body and the materializing driver that drives it.  **There is no correct
-base-only shortcut**: a WAL full-page image is the page *before* its record's
-change (torn-page protection), so even with zero later deltas the page as-of an
-LSN is `rm_redo(base FPI, base record)` -- APPLY is required for any materialized
-page.
+`APPLY` body and the materializing driver that drives it.
+
+**Base-only is correct; the base record is *not* re-applied.** A WAL full-page
+image is the page *as modified by* its record -- it is captured at XLogInsert,
+after the change, and recovery installs it via `RestoreBlockImage` and returns
+`BLK_RESTORED`, so the delta for that record is skipped.  Therefore the 3c-3 base
+image already includes the base record's change and *is* the page as-of
+`base_end_lsn`.  4b applies only the records strictly after the base
+(`[base_end_lsn, lsn)` by start LSN -- the base record's start is < base_end_lsn,
+so it is excluded); if that set is empty the base image is returned unchanged.
+Re-applying the base record would double-apply it.
 
 ### Helper init (the part that needs a real build/run loop)
 
 `rm_redo` handlers fetch the page they mutate through `XLogReadBufferForRedo` ->
-`XLogReadBufferForRedoExtended` -> `XLogReadBufferExtended`, and call into the
-resource managers, so the wal-redo process needs *some* backend context -- but
-deliberately the minimum:
+`XLogReadBufferForRedoExtended` -> `XLogReadBufferExtended`, and then use the
+returned `Buffer` through the normal buffer API, so the wal-redo process needs
+*some* backend context -- but deliberately the minimum:
 
-- Resource managers: `RmgrTable` is static; no catalog access is needed for redo.
-- A **fake buffer table keyed by block id** instead of the shared buffer pool: the
-  target block id -> the held page; every other block id a record registers -> a
-  scratch slot (see 4a's design).  This avoids initialising shared_buffers / the
-  real `BufferManager` (which would need shared memory + a data directory).  The
-  redirection lives behind an `am_walredo` flag in `XLogReadBufferExtended`
-  (a wal-redo-specific tiny smgr, or a guarded branch), returning the held/scratch
-  buffer; for a non-target block it reports `BLK_DONE` (pd_lsn >= record EndRecPtr)
-  unless the block is `WILL_INIT` (then a zeroed scratch the handler initialises).
+- **Resource managers must be started, not just looked up.** `RmgrTable` is static,
+  but several page rmgrs (btree, GIN, GiST, SP-GiST) set up recovery memory
+  contexts in their `rm_startup` and switch to them in redo, so the helper must run
+  `RmgrStartup()` at init and `RmgrCleanup()` at shutdown, not only index the
+  table.  No catalog access is needed for redo.
+- **A real (tiny) buffer pool, not a bare table.** Redirecting only
+  `XLogReadBufferExtended` is not enough: handlers pass the returned `Buffer` to
+  `BufferGetPage`, `BufferGetPageSize`, `MarkBufferDirty`, `UnlockReleaseBuffer`,
+  etc.  So the held/scratch pages must be backed by genuine buffer descriptors the
+  buffer API accepts.  The cheapest correct route is to initialise a minimal shared
+  buffer pool (a handful of buffers) and, under an `am_walredo` flag, satisfy
+  `XLogReadBufferExtended` from it without going to smgr: the target block id ->
+  the held page's buffer; every other block id a record registers -> a scratch
+  buffer reported `BLK_DONE` (pd_lsn >= record EndRecPtr) unless the block is
+  `WILL_INIT` (a zeroed scratch the handler initialises).  This still avoids a data
+  directory / catalogs, but uses the real `BufferManager` so the buffer API works.
 - VM/FSM side effects (`visibilitymap_pin`/`clear`, `XLogRecordPageWithFreeSpace`)
   are no-ops under `am_walredo` when the target fork is the heap; VM/FSM-fork
   materialization is the deferred 3c-4b follow-up.
@@ -379,8 +394,10 @@ For each `APPLY(start_lsn, end_lsn, bytes)`:
 3. deltas = the per-page index records in `[base_end_lsn, lsn)`, merged ascending
    across the timeline ancestry and tagged with their source timeline (#34); each
    record's bytes fetched from *its* timeline's WAL (`PS_OP_WAL_READ`).
-4. spawn (or reuse a pooled) `postgres --wal-redo`; `BEGIN`; `PUSHBASE(base_end_lsn,
-   base)`; `APPLY` each delta; `GET`.
+4. if there are no deltas, the base image is already the page as-of lsn -- return
+   it directly (no helper round trip).  Otherwise spawn (or reuse a pooled)
+   `postgres --wal-redo`; `BEGIN`; `PUSHBASE(base_end_lsn, base)`; `APPLY` each
+   delta; `GET`.
 5. recompute `pd_checksum` (the backend has cluster context + the block), then
    return / write the page (`WRITEV`/`ADD_LAYER`).
 
