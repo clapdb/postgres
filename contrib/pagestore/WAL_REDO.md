@@ -411,26 +411,42 @@ branched-replay cases as in the 3c-4 test plan.  Extends `redo_worker_demo.sh`.
 ## Building and testing the wal-redo helper
 
 The `postgres --wal-redo` helper (`src/backend/postmaster/walredo.c`) is plain
-backend code: it links into the `postgres` binary and needs no contrib module, so
-it builds and runs from a normal tree:
+backend code: it links into the `postgres` binary and needs no contrib module.
+The `postgres` target alone is enough to exercise the helper; the 4b real-WAL test
+below also needs a runnable cluster + WAL tools, so build those too (a full
+`ninja` + `tmp_install` is simplest -- it provides `initdb`/`pg_ctl`/`psql`/
+`pg_waldump`; the contrib can be skipped per the note below if the smgr-export
+patch is absent):
 
     meson setup BUILD -Dcassert=true
-    ninja -C BUILD src/backend/postgres        # the --wal-redo mode
+    ninja -C BUILD src/backend/postgres        # just the --wal-redo mode
+    meson test -C BUILD --suite setup          # builds all + tmp_install (cluster + tools)
 
-4a is verified end-to-end against the built binary by driving the protocol on
-stdin/stdout (in wire order): `BEGIN` + `PUSHBASE`(base_end_lsn, then the 8 KB
-page) + `GET` returns the page with `pd_lsn` stamped to base_end_lsn and the body
-intact.
+**4a (protocol) is verified** by driving the exact wire format on stdin/stdout
+(little-endian); the helper exits on EOF and replies `BLCKSZ` bytes to `GET`:
 
-4b's APPLY is testable the same way against real WAL, but the example must produce
-an actual *delta after* the base, since the driver excludes the base record (the
-FPI already includes its change): `initdb`, then `CHECKPOINT; UPDATE ...` (the
-first update after the checkpoint logs the block's FPI), then a *second*
-`UPDATE ...` of the same row -- that second record is the delta.  Feed
-`PUSHBASE`(FPI record's end LSN, FPI page) + `APPLY`(the second update record) and
-compare `GET` to the heap block's on-disk content as-of the second update.
-(Feeding the FPI-carrying record itself to APPLY would re-apply the base and
-exercise the wrong path.)
+    'b' BEGIN     5x uint32: spcOid, dbOid, relNumber, forkNum, blockNum
+    'p' PUSHBASE  uint64 base_end_lsn, uint32 len, then len page bytes (len = BLCKSZ or 0)
+    'g' GET       (no payload)  -> replies BLCKSZ bytes
+
+`BEGIN` + `PUSHBASE`(base_end_lsn, BLCKSZ, page) + `GET` returns the page with
+`pd_lsn` stamped to base_end_lsn and the body intact.
+
+**4b (APPLY) is testable the same way against real WAL**, with two requirements:
+the example must produce an actual *delta after* the base (the driver excludes the
+base record -- its FPI already includes that change), and the page compared against
+must be flushed to disk first.  A reliable sequence:
+
+    initdb;  CREATE TABLE t(...);  INSERT ...;   -- create + populate the row first
+    CHECKPOINT;                                  -- so the next change logs an FPI
+    UPDATE t ...;                                -- record A: carries the block's FPI
+    UPDATE t ...;                                -- record B: the delta to apply
+    CHECKPOINT;                                  -- flush the dirty heap buffer to disk
+
+Then `PUSHBASE`(record A's end LSN, record A's FPI page) + `APPLY`(record B) and
+compare `GET` to the heap block read from the relation file (now flushed).
+(Feeding record A itself to APPLY would re-apply the base; reading the file without
+the final CHECKPOINT can compare against stale, not-yet-written bytes.)
 
 ### Core-integration prerequisite for the PG module (important)
 
