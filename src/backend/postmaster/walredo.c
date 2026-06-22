@@ -55,12 +55,12 @@
 #define WALREDO_GET			'g'
 
 /*
- * The single page this process holds.  4b adds the target identity
- * (RelFileLocator/fork/block) and the held page LSN; 4a only needs the page
- * bytes, since it just round-trips them (BEGIN/PUSHBASE/GET) and does not yet
- * redo.
+ * The single page this process holds.  Stored in PGAlignedBlock so it can be
+ * accessed as a Page (PageIsNew/PageSetLSN) without an unaligned access on
+ * strict-alignment platforms.  4b adds the target identity (RelFileLocator/
+ * fork/block); 4a only needs the page bytes.
  */
-static char held_page[BLCKSZ];
+static PGAlignedBlock held_page;
 
 static bool
 read_fully(void *buf, size_t len)
@@ -165,7 +165,7 @@ WalRedoMain(int argc, char *argv[])
 							_exit(1);
 					(void) ident;	/* 4b stores the target identity from here */
 					/* 4a only resets the held page */
-					memset(held_page, 0, BLCKSZ);
+					memset(held_page.data, 0, BLCKSZ);
 					break;
 				}
 
@@ -178,7 +178,7 @@ WalRedoMain(int argc, char *argv[])
 						_exit(1);
 					if (len == BLCKSZ)
 					{
-						if (!read_fully(held_page, BLCKSZ))
+						if (!read_fully(held_page.data, BLCKSZ))
 							_exit(1);
 
 						/*
@@ -188,12 +188,19 @@ WalRedoMain(int argc, char *argv[])
 						 * BLK_DONE/BLK_NEEDS_REDO gating once 4b replays deltas, see
 						 * the correct pd_lsn.  Leave an uninitialized (new) page
 						 * alone, as redo does.
+						 *
+						 * This invalidates pd_checksum, but the helper deliberately
+						 * does not recompute it: without backend initialisation it
+						 * cannot know whether data checksums are enabled.  The caller
+						 * persists/serves the page in a normal backend (with cluster
+						 * context and the block number it issued in BEGIN), and
+						 * recomputes pd_checksum there before storing or serving.
 						 */
-						if (!PageIsNew((Page) held_page))
-							PageSetLSN((Page) held_page, (XLogRecPtr) base_end_lsn);
+						if (!PageIsNew((Page) held_page.data))
+							PageSetLSN((Page) held_page.data, (XLogRecPtr) base_end_lsn);
 					}
 					else if (len == 0)
-						memset(held_page, 0, BLCKSZ);
+						memset(held_page.data, 0, BLCKSZ);
 					else
 						_exit(1);	/* malformed base length */
 					break;
@@ -225,7 +232,7 @@ WalRedoMain(int argc, char *argv[])
 				}
 
 			case WALREDO_GET:
-				write_fully(held_page, BLCKSZ);
+				write_fully(held_page.data, BLCKSZ);
 				break;
 
 			default:
