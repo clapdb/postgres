@@ -761,6 +761,16 @@ redo_base_image(const PageStoreRelKey *key, int forknum, int blocknum,
 		if (rec == NULL)
 			continue;
 
+		/*
+		 * The index is keyed by record start LSN, so a record can start at/below
+		 * 'lsn' yet end after it.  Such a record is in the future relative to the
+		 * target -- using its image (and reporting its end LSN) would seed the page
+		 * with a change from after the requested point -- so skip it; the base must
+		 * be a record whose end LSN is at/below 'lsn'.
+		 */
+		if (reader->EndRecPtr > lsn)
+			continue;
+
 		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
 		{
 			RelFileLocator rloc;
