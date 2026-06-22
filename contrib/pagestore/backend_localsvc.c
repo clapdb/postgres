@@ -571,24 +571,36 @@ pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 	return (int) ch->result;
 }
 
-/* Fetch up to maxn record LSNs (<= lsn_max) for (key, block) into out;
- * returns how many.  Ascending order. */
+/* Fetch up to maxn record LSNs (<= lsn_max) for (key, block) into out, and -- if
+ * out_tl != NULL -- the source timeline of each LSN into out_tl; returns how
+ * many.  Sets *overflow if the full chain did not fit (in the channel or in
+ * maxn), so the caller paginates or fails rather than using a truncated list. */
 int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
-							  uint64 lsn_max, uint64 *out, int maxn)
+							  uint64 lsn_max, uint64 *out, uint32 *out_tl,
+							  int maxn, bool *overflow)
 {
 	PsChannel  *ch = ls_chan(key);
-	int			n;
+	uint32	   *tls;
+	int			total,
+				n;
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
 	ls_exec(ch);
-	n = (int) ch->result;
+	total = (int) ch->result;	/* true match count (may exceed the payload) */
+	tls = (uint32 *) (ch->data + (size_t) PS_WALIDX_CAP * sizeof(uint64));
+	/* the payload holds only the first min(total, PS_WALIDX_CAP) pairs */
+	n = total < PS_WALIDX_CAP ? total : PS_WALIDX_CAP;
 	if (n > maxn)
 		n = maxn;
 	memcpy(out, ch->data, (size_t) n * sizeof(uint64));
+	if (out_tl)
+		memcpy(out_tl, tls, (size_t) n * sizeof(uint32));
+	if (overflow)
+		*overflow = (n < total);	/* caller did not receive the whole chain */
 	return n;
 }
 

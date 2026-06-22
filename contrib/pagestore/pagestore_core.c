@@ -1603,13 +1603,19 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 }
 
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
- * max_out); return how many.  Walks the timeline ancestry. */
+ * max_out), and -- when out_tl != NULL -- the source timeline of each LSN into
+ * out_tl (the ancestry level it came from, which the caller needs to fetch each
+ * record from the right per-timeline WAL).  Writes at most max_out pairs but
+ * returns the TRUE total number of matches, so a caller that only needs the count
+ * (PS_OP_WAL_INDEX_GET with no buffer pressure) gets it uncapped and a caller that
+ * reads the pairs can tell the chain was truncated (total > written).  Walks the
+ * timeline ancestry. */
 static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
-		   uint64_t *out, int max_out)
+		   uint64_t *out, uint32_t *out_tl, int max_out)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
-	int			got = 0;
+	int			total = 0;
 
 	for (;;)
 	{
@@ -1619,9 +1625,17 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
 			{
-				for (int i = 0; i < e->n && got < max_out; i++)
+				for (int i = 0; i < e->n; i++)
 					if (e->lsns[i] <= lsn_max)
-						out[got++] = e->lsns[i];
+					{
+						if (total < max_out)
+						{
+							out[total] = e->lsns[i];
+							if (out_tl)
+								out_tl[total] = tl;	/* source timeline of this LSN */
+						}
+						total++;	/* counts all matches, even past max_out */
+					}
 				break;
 			}
 		if (!timeline_has_parent(s, tl))
@@ -1630,7 +1644,7 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 			lsn_max = s->timelines[tl].branch_lsn;
 		tl = (uint32_t) s->timelines[tl].parent;
 	}
-	return got;
+	return total;
 }
 
 /* ===================== write / read primitives ========================= */
@@ -2285,10 +2299,19 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_INDEX_GET:
-			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
-											   ch->req_lsn, (uint64_t *) ch->data,
-											   (int) (PS_IO_UNIT / sizeof(uint64_t)));
+		{
+			uint64_t   *lsns = (uint64_t *) ch->data;
+			uint32_t   *tls = (uint32_t *) (ch->data +
+											(size_t) PS_WALIDX_CAP * sizeof(uint64_t));
+			int			total = walidx_get(tl, &ch->key, ch->blocknum,
+										   ch->req_lsn, lsns, tls, PS_WALIDX_CAP);
+
+			/* result is the true match count (so the count path is uncapped);
+			 * the payload holds only the first min(total, PS_WALIDX_CAP) pairs */
+			ch->result = (uint32_t) total;
+			ch->result_flags = (total > PS_WALIDX_CAP) ? PS_WALIDX_OVERFLOW : 0;
 			break;
+		}
 
 		case PS_OP_IMMEDSYNC:
 			/* capture-before-sync + commit, serialized against concurrent syncs */

@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		5			/* 5: pad0 -> nshards (shard-pool routing) */
+#define PS_SHM_VERSION		6			/* 6: WAL_INDEX_GET (timeline,lsn) + result_flags */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -41,6 +41,15 @@
  * about, independent of the engine's logical page size.
  */
 #define PS_IO_UNIT			(256 * 1024)
+
+/* result_flags bits.  WAL_INDEX_GET: the (timeline,lsn) chain had more records
+ * than fit in one response -- the returned set is a prefix, not the whole chain;
+ * the caller must paginate or treat it as an error rather than a complete list. */
+#define PS_WALIDX_OVERFLOW	0x1u
+
+/* WAL_INDEX_GET payload: lsns[] (uint64) at data[0], then the parallel source
+ * timelines tls[] (uint32) at data[cap*8]; cap = how many pairs fit. */
+#define PS_WALIDX_CAP		((int) (PS_IO_UNIT / (sizeof(uint64_t) + sizeof(uint32_t))))
 
 /* Geometry */
 #define PS_MAX_CHANNELS		128
@@ -118,13 +127,15 @@ typedef struct PsChannel
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
 	uint32_t	parent_timeline;	/* CREATE_BRANCH: parent timeline */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
-	uint32_t	pad1;
+	uint32_t	pad1;			/* keep req_lsn 8-byte aligned */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
 	PsKey		key;
 
 	/* result */
 	uint32_t	status;
 	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1 */
+	uint32_t	result_flags;	/* WAL_INDEX_GET -> PS_WALIDX_* (was pad1) */
+	uint32_t	result_pad;		/* keep data[] 8-byte aligned for (uint64*)data */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
