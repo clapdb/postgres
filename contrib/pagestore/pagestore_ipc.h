@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		5			/* 5: pad0 -> nshards (shard-pool routing) */
+#define PS_SHM_VERSION		6			/* 6: WAL_INDEX_GET (timeline,lsn) + result_flags */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -135,6 +135,7 @@ typedef struct PsChannel
 	uint32_t	status;
 	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1 */
 	uint32_t	result_flags;	/* WAL_INDEX_GET -> PS_WALIDX_* (was pad1) */
+	uint32_t	result_pad;		/* keep data[] 8-byte aligned for (uint64*)data */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];

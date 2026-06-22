@@ -480,19 +480,21 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			  uint64_t lsn_max, uint64_t *out, uint32_t *out_tl)
 {
 	PsChannel  *ch = cl_route(rel, fork);
-	int			n;
+	int			total,
+				ndata;
 
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
-	n = (int) cl_exec(ch)->result;
-	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
+	total = (int) cl_exec(ch)->result;	/* true match count */
+	ndata = total < PS_WALIDX_CAP ? total : PS_WALIDX_CAP;	/* pairs in payload */
+	memcpy(out, ch->data, (size_t) ndata * sizeof(uint64_t));
 	if (out_tl)
 		memcpy(out_tl, ch->data + (size_t) PS_WALIDX_CAP * sizeof(uint64_t),
-			   (size_t) n * sizeof(uint32_t));
-	return n;
+			   (size_t) ndata * sizeof(uint32_t));
+	return total;
 }
 
 /* ===================== page helpers ==================================== */

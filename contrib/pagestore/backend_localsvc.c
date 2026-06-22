@@ -582,27 +582,25 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 {
 	PsChannel  *ch = ls_chan(key);
 	uint32	   *tls;
-	int			n;
-	bool		ov;
+	int			total,
+				n;
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
 	ls_exec(ch);
-	n = (int) ch->result;
-	ov = (ch->result_flags & PS_WALIDX_OVERFLOW) != 0;
+	total = (int) ch->result;	/* true match count (may exceed the payload) */
 	tls = (uint32 *) (ch->data + (size_t) PS_WALIDX_CAP * sizeof(uint64));
+	/* the payload holds only the first min(total, PS_WALIDX_CAP) pairs */
+	n = total < PS_WALIDX_CAP ? total : PS_WALIDX_CAP;
 	if (n > maxn)
-	{
 		n = maxn;
-		ov = true;				/* caller's buffer can't hold the whole chain */
-	}
 	memcpy(out, ch->data, (size_t) n * sizeof(uint64));
 	if (out_tl)
 		memcpy(out_tl, tls, (size_t) n * sizeof(uint32));
 	if (overflow)
-		*overflow = ov;
+		*overflow = (n < total);	/* caller did not receive the whole chain */
 	return n;
 }
 
