@@ -1147,6 +1147,11 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		  "block 5 rewritten after the truncation -> live again");
 	check(op_block_live(0, REL_A, FORK0, 5, 350) == 0,
 		  "as-of 350, before the @400 rewrite -> still dead");
+	/* a re-extension whose start LSN equals the truncation LSN (the immediate
+	 * next record) must count -- the lower bound is inclusive */
+	op_walidx_add(0, REL_A, FORK0, 6, 250);		/* block 6 rewritten exactly @ trunc lsn */
+	check(op_block_live(0, REL_A, FORK0, 6, 300) == 1,
+		  "re-extension exactly at the truncation LSN -> live");
 
 	client_detach();
 	stop_daemon(dpid);

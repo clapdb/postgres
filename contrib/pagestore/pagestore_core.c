@@ -1808,7 +1808,12 @@ block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	if (block < floor)
 		return true;			/* within the post-truncation length */
 
-	/* truncated away at trunc_lsn: live iff written again in (trunc_lsn, lsn] */
+	/*
+	 * Live iff written again at/after the truncation, up to lsn.  The lower bound
+	 * is inclusive (>=): truncations are indexed by the record end LSN, while page
+	 * writes are indexed by the record start LSN, and the next record starts where
+	 * the truncation ended -- so an immediate re-extension has start == trunc_lsn.
+	 */
 	for (uint32_t t = tl;;)
 	{
 		uint32_t	h = page_hash(t, key, block);
@@ -1818,7 +1823,7 @@ block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 			if (e->timeline == t && e->block == block && key_eq(&e->key, key))
 			{
 				for (int i = 0; i < e->n; i++)
-					if (e->lsns[i] > trunc_lsn && e->lsns[i] <= lmax)
+					if (e->lsns[i] >= trunc_lsn && e->lsns[i] <= lmax)
 						return true;
 				break;
 			}
