@@ -137,6 +137,7 @@ typedef enum DispatchOption
 	DISPATCH_FORKCHILD,
 	DISPATCH_DESCRIBE_CONFIG,
 	DISPATCH_SINGLE,
+	DISPATCH_WALREDO,
 	DISPATCH_POSTMASTER,		/* must be last */
 } DispatchOption;
 
