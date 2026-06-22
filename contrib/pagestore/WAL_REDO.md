@@ -322,6 +322,75 @@ The store can then serve any page as-of any LSN from WAL alone (background or
 on-demand), completing the per-page read path.  With 3d-2/3 (SLRU/clog + branch
 WAL read-through) it removes the single-compute-per-branch boundary.
 
+## 4b implementation design — APPLY (rm_redo against the held page)
+
+Status of the parts built so far: the per-page `(timeline,lsn)` index (#34), the
+truncation floor + LSN (#35), the base-image end LSN (#36), the `postgres
+--wal-redo` process + `BEGIN/PUSHBASE/APPLY/GET` protocol skeleton (#37, APPLY
+stubbed), and the driver's block-liveness step (#38) are all in.  4b is the
+`APPLY` body and the materializing driver that drives it.  **There is no correct
+base-only shortcut**: a WAL full-page image is the page *before* its record's
+change (torn-page protection), so even with zero later deltas the page as-of an
+LSN is `rm_redo(base FPI, base record)` -- APPLY is required for any materialized
+page.
+
+### Helper init (the part that needs a real build/run loop)
+
+`rm_redo` handlers fetch the page they mutate through `XLogReadBufferForRedo` ->
+`XLogReadBufferForRedoExtended` -> `XLogReadBufferExtended`, and call into the
+resource managers, so the wal-redo process needs *some* backend context -- but
+deliberately the minimum:
+
+- Resource managers: `RmgrTable` is static; no catalog access is needed for redo.
+- A **fake buffer table keyed by block id** instead of the shared buffer pool: the
+  target block id -> the held page; every other block id a record registers -> a
+  scratch slot (see 4a's design).  This avoids initialising shared_buffers / the
+  real `BufferManager` (which would need shared memory + a data directory).  The
+  redirection lives behind an `am_walredo` flag in `XLogReadBufferExtended`
+  (a wal-redo-specific tiny smgr, or a guarded branch), returning the held/scratch
+  buffer; for a non-target block it reports `BLK_DONE` (pd_lsn >= record EndRecPtr)
+  unless the block is `WILL_INIT` (then a zeroed scratch the handler initialises).
+- VM/FSM side effects (`visibilitymap_pin`/`clear`, `XLogRecordPageWithFreeSpace`)
+  are no-ops under `am_walredo` when the target fork is the heap; VM/FSM-fork
+  materialization is the deferred 3c-4b follow-up.
+
+This minimal-but-real init is exactly the piece that cannot be developed blind: it
+must be iterated against `initdb` + a running `postgres` generating real WAL.
+
+### APPLY body
+
+For each `APPLY(start_lsn, end_lsn, bytes)`:
+
+1. Wrap the record bytes in an `XLogReaderState` (a memory-backed `page_read`, or
+   `DecodeXLogRecord` directly) with `EndRecPtr = end_lsn` (the gating LSN; the
+   driver supplies it because a record can span a WAL page -- see 3c-4 design).
+2. `RmgrTable[XLogRecGetRmid(reader)].rm_redo(reader)` -- the buffer reads land on
+   the held/scratch buffers via the redirection above; the handler stamps the
+   held page's pd_lsn to `end_lsn`.
+3. `GET` returns the held page bytes (pd_lsn correct, pd_checksum left to the
+   caller, per 4a).
+
+### Materializing driver (slice 5b, contrib backend)
+
+`redo_page_asof(timeline, key, fork, block, lsn) -> page`:
+
+1. liveness (#38) -- dead block -> no page.
+2. base + base_end_lsn (#36) -- or a zero page if the first record `WILL_INIT`s.
+3. deltas = the per-page index records in `[base_end_lsn, lsn)`, merged ascending
+   across the timeline ancestry and tagged with their source timeline (#34); each
+   record's bytes fetched from *its* timeline's WAL (`PS_OP_WAL_READ`).
+4. spawn (or reuse a pooled) `postgres --wal-redo`; `BEGIN`; `PUSHBASE(base_end_lsn,
+   base)`; `APPLY` each delta; `GET`.
+5. recompute `pd_checksum` (the backend has cluster context + the block), then
+   return / write the page (`WRITEV`/`ADD_LAYER`).
+
+### Verification plan (running cluster)
+
+`initdb`; create+modify a table so its block gets an FPI then later deltas; index
+the WAL (3c-2); assert `redo_page_asof(block, lsn)` equals a direct read of that
+page as-of `lsn`, for several LSNs.  Multi-block (btree split), WILL_INIT, and
+branched-replay cases as in the 3c-4 test plan.  Extends `redo_worker_demo.sh`.
+
 ## Known scope boundaries
 
 Until 3c/3d land, branches remain single-compute-at-a-time and WAL/SLRU/control
