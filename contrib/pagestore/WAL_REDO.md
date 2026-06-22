@@ -408,6 +408,66 @@ the WAL (3c-2); assert `redo_page_asof(block, lsn)` equals a direct read of that
 page as-of `lsn`, for several LSNs.  Multi-block (btree split), WILL_INIT, and
 branched-replay cases as in the 3c-4 test plan.  Extends `redo_worker_demo.sh`.
 
+## Building and testing the wal-redo helper
+
+The `postgres --wal-redo` helper (`src/backend/postmaster/walredo.c`) is plain
+backend code: it links into the `postgres` binary and needs no contrib module.
+The `postgres` target alone is enough to exercise the helper; the 4b real-WAL test
+below also needs a runnable cluster + WAL tools, so build those too (a full
+`ninja` + `tmp_install` is simplest -- it provides `initdb`/`pg_ctl`/`psql`/
+`pg_waldump`; the contrib can be skipped per the note below if the smgr-export
+patch is absent):
+
+    meson setup BUILD -Dcassert=true
+    ninja -C BUILD src/backend/postgres        # just the --wal-redo mode
+    meson test -C BUILD --suite setup          # builds all + tmp_install (cluster + tools)
+
+**4a (protocol) is verified** by driving the exact wire format on stdin/stdout.
+Integer fields are in **host/native byte order** -- the helper copies raw bytes
+(`read_u32`/`read_u64`) with no byte-order conversion, since helper and driver run
+on the same host.  The helper exits on EOF and replies `BLCKSZ` bytes to `GET`:
+
+    'b' BEGIN     5x uint32: spcOid, dbOid, relNumber, forkNum, blockNum
+    'p' PUSHBASE  uint64 base_end_lsn, uint32 len, then len page bytes (len = BLCKSZ or 0)
+    'g' GET       (no payload)  -> replies BLCKSZ bytes
+
+`BEGIN` + `PUSHBASE`(base_end_lsn, BLCKSZ, page) + `GET` returns the page with
+`pd_lsn` stamped to base_end_lsn and the body intact.
+
+**4b (APPLY) is testable the same way against real WAL**, with two requirements:
+the example must produce an actual *delta after* the base (the driver excludes the
+base record -- its FPI already includes that change), and the page compared against
+must be flushed to disk first.  A reliable sequence:
+
+    initdb;  CREATE TABLE t(...);  INSERT ...;   -- create + populate the row first
+    CHECKPOINT;                                  -- so the next change logs an FPI
+    UPDATE t ...;                                -- record A: carries the block's FPI
+    UPDATE t ...;                                -- record B: the delta to apply
+    CHECKPOINT;                                  -- flush the dirty heap buffer to disk
+
+Then `PUSHBASE`(record A's end LSN, record A's FPI page) + `APPLY`(record B) and
+compare `GET` to the heap block read from the relation file (now flushed).
+(Feeding record A itself to APPLY would re-apply the base; reading the file without
+the final CHECKPOINT can compare against stale, not-yet-written bytes.)
+
+### Core-integration prerequisite for the PG module (important)
+
+The freestanding daemon (`pagestore_core.c`) and the helper (`walredo.c`) build
+anywhere, but the **contrib PG module** (`pagestore.c` -- the smgr shim and the
+`pagestore_*` SQL functions, including the redo driver `redo_page_asof`) requires
+the core "export `f_smgr` / `smgr_register`" patch in `storage/smgr.h`.  That patch
+lives on the per-version integration branch (`branchdb_18`), **not** on the
+`pagestore` line the redo feature branches were stacked on, so on those branches
+`pagestore.c` does not compile (`unknown type name 'f_smgr'`).  CI did not catch
+this because it only builds the freestanding daemon, never the PG module.
+
+Consequence: the redo driver + the SQL-level pieces (#36 `redo_base_lsn`, #38
+`block_live`, and the future `redo_page_asof`) must be built and tested on a base
+that carries the smgr-export patch (i.e. integrated onto `branchdb_18`).  To build
+a runnable cluster from a redo-feature branch without that patch, the pagestore
+contrib can be skipped (`# subdir('pagestore')` in `contrib/meson.build`); the
+`postgres` binary (and thus the wal-redo helper) is unaffected.
+
 ## Known scope boundaries
 
 Until 3c/3d land, branches remain single-compute-at-a-time and WAL/SLRU/control
