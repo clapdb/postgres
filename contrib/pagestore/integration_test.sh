@@ -160,6 +160,19 @@ else
 	fail=1
 fi
 
+# the base image's end LSN (what a single-page redo seeds the held page with):
+# it must be a real LSN <= the query LSN, and the page is the page as-of that LSN.
+$P -c "CREATE FUNCTION pagestore_redo_base_lsn(regclass,int,int,pg_lsn) RETURNS pg_lsn
+        AS 'pagestore','pagestore_redo_base_lsn' LANGUAGE C STRICT;" >/dev/null
+blsn=$($P -tAc "SELECT pagestore_redo_base_lsn('rp',0,0,'$rlsn1');")
+in_range=$($P -tAc "SELECT '$blsn'::pg_lsn > '0/0'::pg_lsn AND '$blsn'::pg_lsn <= '$rlsn1'::pg_lsn;")
+if [ "$in_range" = "t" ]; then
+	echo "ok   - base image end LSN reported ($blsn) for single-page redo seeding"
+else
+	echo "FAIL - base image end LSN out of range (got '$blsn', query '$rlsn1')"
+	fail=1
+fi
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
