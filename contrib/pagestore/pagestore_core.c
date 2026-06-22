@@ -257,6 +257,7 @@ typedef struct Shard
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
+	struct ForkSizeEnt *forksz_idx[IDX_BUCKETS];	/* (timeline,key) -> size history */
 	PsMemtable *memtable;		/* staging -> image layers */
 	uint32_t	index;			/* this shard's id (0 .. ps_nshards-1) */
 	PsManifest	manifest;		/* per-shard durable layer log + layer map */
@@ -1002,6 +1003,15 @@ typedef struct PageEnt
 	int			cap;
 } PageEnt;
 
+/* Hash entry: the block count of one fork on one timeline. */
+typedef struct ForkEnt
+{
+	struct ForkEnt *next;		/* bucket chain */
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	nblocks;
+} ForkEnt;
+
 /* One LSN-versioned size change of a fork: its block count became 'nblocks' as
  * of WAL record 'lsn' (an extension grows it; a truncation shrinks it). */
 typedef struct ForkSz
@@ -1010,17 +1020,22 @@ typedef struct ForkSz
 	uint32_t	nblocks;
 } ForkSz;
 
-/* Hash entry: the block count of one fork on one timeline. */
-typedef struct ForkEnt
+/*
+ * Per-(timeline,fork) LSN-versioned size history, used only by the redo liveness
+ * check.  Kept in its own index, independent of ForkEnt (the live fork-existence
+ * state that PS_OP_NBLOCKS reports and PS_OP_UNLINK removes): WAL-derived history
+ * must not resurrect a dropped fork as a zero-length live entry, nor be discarded
+ * when a relation is unlinked.
+ */
+typedef struct ForkSizeEnt
 {
-	struct ForkEnt *next;		/* bucket chain */
+	struct ForkSizeEnt *next;	/* bucket chain */
 	uint32_t	timeline;
 	PsKey		key;
-	uint32_t	nblocks;		/* current count (unversioned; used by NBLOCKS) */
-	ForkSz	   *sz;				/* LSN-versioned size history, ascending by lsn */
+	ForkSz	   *sz;				/* ascending by lsn */
 	int			nsz;
 	int			szcap;
-} ForkEnt;
+} ForkSizeEnt;
 
 /*
  * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
@@ -1202,7 +1217,6 @@ fork_remove(uint32_t timeline, const PsKey *key)
 			ForkEnt    *dead = *pp;
 
 			*pp = dead->next;
-			free(dead->sz);
 			free(dead);
 			return;
 		}
@@ -1388,27 +1402,45 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key)
 	}
 }
 
+static ForkSizeEnt *
+forksz_find(uint32_t timeline, const PsKey *key)
+{
+	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
+	ForkSizeEnt *e;
+
+	for (e = s->forksz_idx[h & IDX_MASK]; e; e = e->next)
+		if (e->timeline == timeline && key_eq(&e->key, key))
+			return e;
+	return NULL;
+}
+
 /*
  * The fork's block count as of 'lsn': the nblocks of the newest size event at or
  * below 'lsn', walking the timeline ancestry (a branch inherits the parent's size
- * as of its fork LSN until its own first size event).  Returns -1 if no size
- * event is known at/below 'lsn' (caller decides how to treat "unknown").
+ * as of its fork LSN until its own first size event).  Returns true and sets
+ * *nblocks when a size event is known at/below 'lsn'; false ("unknown") otherwise
+ * -- kept separate from the count so the full unsigned block range is usable.
  */
-static int
-fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn)
+static bool
+fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
+				uint32_t *nblocks)
 {
 	const Shard *s = shard_for(key);
 
 	for (;;)
 	{
-		ForkEnt    *e = fork_find(timeline, key);
+		ForkSizeEnt *e = forksz_find(timeline, key);
 
 		if (e)
 			for (int i = e->nsz - 1; i >= 0; i--)
 				if (e->sz[i].lsn <= lsn)
-					return (int) e->sz[i].nblocks;
+				{
+					*nblocks = e->sz[i].nblocks;
+					return true;
+				}
 		if (!timeline_has_parent(s, timeline))
-			return -1;
+			return false;
 		if (s->timelines[timeline].branch_lsn < lsn)
 			lsn = s->timelines[timeline].branch_lsn;
 		timeline = (uint32_t) s->timelines[timeline].parent;
@@ -1422,7 +1454,9 @@ fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn)
  *     'lsn' already equals it;
  *   - an extension (!is_trunc) only grows the fork, so it is recorded only when
  *     'nblocks' exceeds the size already in effect at 'lsn' -- a WAL reference to a
- *     low block of a larger fork must not look like a shrink.
+ *     low block of a larger fork must not look like a shrink.  (The caller records
+ *     extensions only for newly-initialized pages, so 'nblocks' is the real new
+ *     length, not a lower bound from an arbitrary block reference.)
  * Events store the exact size as of their LSN, so fork_nblocks_at() (latest <= lsn)
  * reads them directly.  Kept ascending by lsn (usually an append).
  */
@@ -1430,14 +1464,27 @@ void
 fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn,
 			  uint32_t nblocks, bool is_trunc)
 {
-	int			cur = fork_nblocks_at(timeline, key, lsn);
-	ForkEnt    *e;
+	uint32_t	cur;
+	bool		known = fork_nblocks_at(timeline, key, lsn, &cur);
+	ForkSizeEnt *e;
+	uint32_t	h;
+	Shard	   *s;
 	int			i;
 
-	if (is_trunc ? (cur == (int) nblocks) : (cur >= (int) nblocks))
+	if (known && (is_trunc ? (cur == nblocks) : (cur >= nblocks)))
 		return;					/* no effect on the size in force at 'lsn' */
 
-	e = fork_get_or_create(timeline, key);
+	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	s = shard_for(key);
+	e = forksz_find(timeline, key);
+	if (!e)
+	{
+		e = calloc(1, sizeof(*e));
+		e->timeline = timeline;
+		e->key = *key;
+		e->next = s->forksz_idx[h & IDX_MASK];
+		s->forksz_idx[h & IDX_MASK] = e;
+	}
 	/* an event already at exactly this lsn: overwrite (same record, corrected) */
 	for (i = e->nsz - 1; i >= 0; i--)
 		if (e->sz[i].lsn == lsn)
@@ -2345,9 +2392,10 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_FORK_SIZE_AT:
 		{
-			int			nb = fork_nblocks_at(tl, &ch->key, ch->req_lsn);
+			uint32_t	nb;
 
-			ch->result = (nb < 0) ? PS_FORKSIZE_UNKNOWN : (uint32_t) nb;
+			ch->result = fork_nblocks_at(tl, &ch->key, ch->req_lsn, &nb)
+				? nb : PS_FORKSIZE_UNKNOWN;
 			break;
 		}
 
