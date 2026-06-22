@@ -1784,6 +1784,53 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	return total;
 }
 
+/*
+ * Is (key, block) live as of 'lsn'?  The redo driver's step-0: skip materializing
+ * a page that was truncated away (and not written again) at the target LSN.
+ *
+ * A block is live unless the fork's truncation floor as-of 'lsn' is at/below it
+ * AND no WAL record wrote the block after that truncation (i.e. it was not
+ * re-extended).  Truncation floor + LSN come from the size history (fork_size_add);
+ * the re-extension check scans the per-page index for a write in (trunc_lsn, lsn],
+ * across the timeline ancestry, with early exit.  On an unreadable/absent floor
+ * the block is treated as live (materialize rather than wrongly drop).
+ */
+static bool
+block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	const Shard *s = shard_for(key);
+	uint32_t	floor;
+	uint64_t	trunc_lsn;
+	uint64_t	lmax = lsn;
+
+	if (!fork_nblocks_at(tl, key, lsn, &floor, &trunc_lsn))
+		return true;			/* never truncated at/below lsn */
+	if (block < floor)
+		return true;			/* within the post-truncation length */
+
+	/* truncated away at trunc_lsn: live iff written again in (trunc_lsn, lsn] */
+	for (uint32_t t = tl;;)
+	{
+		uint32_t	h = page_hash(t, key, block);
+		WalIdxEnt  *e;
+
+		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
+			if (e->timeline == t && e->block == block && key_eq(&e->key, key))
+			{
+				for (int i = 0; i < e->n; i++)
+					if (e->lsns[i] > trunc_lsn && e->lsns[i] <= lmax)
+						return true;
+				break;
+			}
+		if (!timeline_has_parent(s, t))
+			break;
+		if (s->timelines[t].branch_lsn < lmax)
+			lmax = s->timelines[t].branch_lsn;
+		t = (uint32_t) s->timelines[t].parent;
+	}
+	return false;
+}
+
 /* ===================== write / read primitives ========================= */
 
 /* The page's own pd_lsn lives in its first 8 bytes (xlogid, xrecoff). */
@@ -2404,6 +2451,11 @@ ps_handle_meta(PsChannel *ch)
 				ch->result = PS_FORKSIZE_UNKNOWN;
 			break;
 		}
+
+		case PS_OP_BLOCK_LIVE:
+			ch->result = block_live_at(tl, &ch->key, ch->blocknum,
+									   ch->req_lsn) ? 1 : 0;
+			break;
 
 		case PS_OP_TRUNCATE:
 			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;

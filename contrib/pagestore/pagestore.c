@@ -869,6 +869,31 @@ pagestore_redo_base_lsn(PG_FUNCTION_ARGS)
 	PG_RETURN_LSN(base_end_lsn);
 }
 
+/*
+ * pagestore_block_live(rel regclass, forknum int, blocknum int, lsn pg_lsn)
+ *   -> bool
+ *
+ * The redo driver's step-0: is the block live as-of lsn, or was it truncated away
+ * (and not written again)?  A dead block must not be materialized.  Combines the
+ * fork truncation floor with the per-page index (re-extension after the
+ * truncation) in the daemon.
+ */
+PG_FUNCTION_INFO_V1(pagestore_block_live);
+
+Datum
+pagestore_block_live(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	PageStoreRelKey key;
+
+	redo_key_from_relid(relid, forknum, &key);
+	PG_RETURN_BOOL(pagestore_localsvc_block_live(&key, (BlockNumber) blocknum,
+												 (uint64) lsn));
+}
+
 void
 _PG_init(void)
 {
