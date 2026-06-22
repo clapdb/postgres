@@ -34,11 +34,13 @@
 #include <unistd.h>
 
 #include "access/relation.h"
+#include "access/rmgr.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage_xlog.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
@@ -522,6 +524,37 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 			key.relNumber = rloc.relNumber;
 			key.forkNum = fk;
 			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
+			/* Extensions are not derived here: a block reference -- even one flagged
+			 * WILL_INIT, which btree unlink and friends set on *existing* pages --
+			 * is not proof the fork grew to blk+1.  The per-page index above already
+			 * records every block touch, which is what the liveness check uses above
+			 * the truncation floor; only truncations are recorded (below). */
+		}
+
+		/* smgr truncation shrinks a fork to an exact length -- the one fork-size
+		 * signal the per-block index cannot express, and what the redo "is this
+		 * block live?" check needs as its floor.  Only the heap (main) fork's new
+		 * length is carried by the record (xlrec->blkno); the VM/FSM forks shrink to
+		 * derived, smaller lengths (visibilitymap_prepare_truncate /
+		 * FreeSpaceMapPrepareTruncateRel), so recording blkno for them would
+		 * overstate their size.  VM/FSM materialization is deferred (3c-4b), so
+		 * record only the heap fork here. */
+		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
+			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
+		{
+			xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(reader);
+
+			if (xlrec->flags & SMGR_TRUNCATE_HEAP)
+			{
+				PageStoreRelKey key;
+
+				key.spcOid = xlrec->rlocator.spcOid;
+				key.dbOid = xlrec->rlocator.dbOid;
+				key.relNumber = xlrec->rlocator.relNumber;
+				key.forkNum = MAIN_FORKNUM;
+				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
+												xlrec->blkno);
+			}
 		}
 	}
 

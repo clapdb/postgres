@@ -257,6 +257,7 @@ typedef struct Shard
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
+	struct ForkSizeEnt *forksz_idx[IDX_BUCKETS];	/* (timeline,key) -> size history */
 	PsMemtable *memtable;		/* staging -> image layers */
 	uint32_t	index;			/* this shard's id (0 .. ps_nshards-1) */
 	PsManifest	manifest;		/* per-shard durable layer log + layer map */
@@ -1011,6 +1012,31 @@ typedef struct ForkEnt
 	uint32_t	nblocks;
 } ForkEnt;
 
+/* One LSN-versioned size change of a fork: its block count became 'nblocks' as
+ * of WAL record 'lsn' (an extension grows it; a truncation shrinks it). */
+typedef struct ForkSz
+{
+	uint64_t	lsn;
+	uint32_t	nblocks;
+} ForkSz;
+
+/*
+ * Per-(timeline,fork) LSN-versioned size history, used only by the redo liveness
+ * check.  Kept in its own index, independent of ForkEnt (the live fork-existence
+ * state that PS_OP_NBLOCKS reports and PS_OP_UNLINK removes): WAL-derived history
+ * must not resurrect a dropped fork as a zero-length live entry, nor be discarded
+ * when a relation is unlinked.
+ */
+typedef struct ForkSizeEnt
+{
+	struct ForkSizeEnt *next;	/* bucket chain */
+	uint32_t	timeline;
+	PsKey		key;
+	ForkSz	   *sz;				/* ascending by lsn */
+	int			nsz;
+	int			szcap;
+} ForkSizeEnt;
+
 /*
  * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
  * parent and the LSN at which it forked; reads of pages the branch never wrote
@@ -1374,6 +1400,117 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key)
 			return maxnb;
 		timeline = (uint32_t) s->timelines[timeline].parent;
 	}
+}
+
+static ForkSizeEnt *
+forksz_find(uint32_t timeline, const PsKey *key)
+{
+	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
+	ForkSizeEnt *e;
+
+	for (e = s->forksz_idx[h & IDX_MASK]; e; e = e->next)
+		if (e->timeline == timeline && key_eq(&e->key, key))
+			return e;
+	return NULL;
+}
+
+/*
+ * The length the fork was last *truncated* to as of 'lsn': the nblocks of the
+ * newest truncation event at or below 'lsn', walking the timeline ancestry (a
+ * branch inherits the parent's floor as of its fork LSN until its own first
+ * truncation).  Returns true and sets *nblocks and *trunc_lsn (the LSN of that
+ * truncation) when one is known at/below 'lsn'; false ("never truncated") else.
+ *
+ * NB: this is only the truncation floor, not the live fork length -- extensions
+ * are not tracked (see fork_size_add).  A block at/above this floor is not
+ * necessarily dead: a liveness check must also consult the per-page WAL index for
+ * a write *after* *trunc_lsn* (hence trunc_lsn is returned, not just the count).
+ */
+static bool
+fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
+				uint32_t *nblocks, uint64_t *trunc_lsn)
+{
+	const Shard *s = shard_for(key);
+
+	for (;;)
+	{
+		ForkSizeEnt *e = forksz_find(timeline, key);
+
+		if (e)
+			for (int i = e->nsz - 1; i >= 0; i--)
+				if (e->sz[i].lsn <= lsn)
+				{
+					*nblocks = e->sz[i].nblocks;
+					*trunc_lsn = e->sz[i].lsn;
+					return true;
+				}
+		if (!timeline_has_parent(s, timeline))
+			return false;
+		if (s->timelines[timeline].branch_lsn < lsn)
+			lsn = s->timelines[timeline].branch_lsn;
+		timeline = (uint32_t) s->timelines[timeline].parent;
+	}
+}
+
+/*
+ * Record a truncation: as of WAL record 'lsn' this fork was truncated to exactly
+ * 'nblocks' blocks.  Truncation is the only fork-length signal we take from WAL:
+ * relation *extensions* cannot be derived reliably -- a WAL block reference, even
+ * one flagged WILL_INIT, may merely reinitialize an existing page (e.g. btree
+ * unlink registers existing buffers WILL_INIT), so it is not evidence the fork
+ * grew to that block.  Extensions are therefore left to the per-page WAL index
+ * (every block touch is recorded there); this history records only the shrink
+ * floor that the index cannot express.
+ *
+ * Every distinct-LSN truncation is kept, even one to a size already in force: a
+ * later truncation to the same floor still resets the liveness window (a block
+ * written between the two truncations is dead again after the second), so it must
+ * not be pruned.  Events store the exact length as of their LSN; kept ascending.
+ */
+void
+fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn, uint32_t nblocks)
+{
+	ForkSizeEnt *e;
+	uint32_t	h;
+	Shard	   *s;
+	int			i;
+
+	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	s = shard_for(key);
+	e = forksz_find(timeline, key);
+	if (!e)
+	{
+		e = calloc(1, sizeof(*e));
+		e->timeline = timeline;
+		e->key = *key;
+		e->next = s->forksz_idx[h & IDX_MASK];
+		s->forksz_idx[h & IDX_MASK] = e;
+	}
+	/* an event already at exactly this lsn: overwrite (same record, corrected) */
+	for (i = e->nsz - 1; i >= 0; i--)
+		if (e->sz[i].lsn == lsn)
+		{
+			e->sz[i].nblocks = nblocks;
+			return;
+		}
+		else if (e->sz[i].lsn < lsn)
+			break;
+
+	if (e->nsz == e->szcap)
+	{
+		e->szcap = e->szcap ? e->szcap * 2 : 4;
+		e->sz = realloc(e->sz, (size_t) e->szcap * sizeof(ForkSz));
+	}
+	i = e->nsz;
+	while (i > 0 && e->sz[i - 1].lsn > lsn)
+	{
+		e->sz[i] = e->sz[i - 1];
+		i--;
+	}
+	e->sz[i].lsn = lsn;
+	e->sz[i].nblocks = nblocks;
+	e->nsz++;
 }
 
 /* Does the fork exist on 'timeline' or any ancestor? */
@@ -2248,6 +2385,25 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_NBLOCKS:
 			ch->result = fork_nblocks_through(tl, &ch->key);
 			break;
+
+		case PS_OP_FORK_SIZE_ADD:	/* record a truncation to ch->nblocks @ req_lsn */
+			fork_size_add(tl, &ch->key, ch->req_lsn, ch->nblocks);
+			break;
+
+		case PS_OP_FORK_SIZE_AT:
+		{
+			uint32_t	nb;
+			uint64_t	tlsn;
+
+			if (fork_nblocks_at(tl, &ch->key, ch->req_lsn, &nb, &tlsn))
+			{
+				ch->result = nb;
+				ch->req_lsn = tlsn;	/* output: LSN of the truncation */
+			}
+			else
+				ch->result = PS_FORKSIZE_UNKNOWN;
+			break;
+		}
 
 		case PS_OP_TRUNCATE:
 			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;

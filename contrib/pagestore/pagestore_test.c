@@ -473,6 +473,40 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec(ch);
 }
 
+/* Record: this fork was truncated to nblocks as of WAL record 'lsn'. */
+static void
+op_forksize_add(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
+				uint32_t nblocks)
+{
+	PsChannel  *ch = cl_route(rel, fork);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_FORK_SIZE_ADD;
+	ch->req_lsn = lsn;
+	ch->nblocks = nblocks;
+	cl_exec(ch);
+}
+
+/* The fork's truncation floor (blocks) as of 'lsn'; PS_FORKSIZE_UNKNOWN if never
+ * truncated at/below it. */
+static uint32_t
+op_forksize_at(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
+			   uint64_t *trunc_lsn)
+{
+	PsChannel  *ch = cl_route(rel, fork);
+	uint32_t	res;
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_FORK_SIZE_AT;
+	ch->req_lsn = lsn;
+	res = cl_exec(ch)->result;
+	if (trunc_lsn && res != PS_FORKSIZE_UNKNOWN)
+		*trunc_lsn = ch->req_lsn;	/* daemon wrote the truncation LSN here */
+	return res;
+}
+
 /* Returns count; fills out[] with the record LSNs <= lsn_max, and -- when
  * out_tl != NULL -- the parallel source timeline of each LSN. */
 static int
@@ -1048,6 +1082,41 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		}
 		check(from_child == 1 && from_parent == 2,
 			  "branch index tags each LSN with its source timeline (400->tl1, 100/200->tl0)");
+	}
+
+	/* --- LSN-versioned truncation floor (the redo step-0 "is block live?" floor) --- */
+	{
+		uint64_t	tlsn = 0;
+
+		/* REL_B truncated to 3 @200, then to 8 @400 */
+		op_forksize_add(0, REL_B, FORK0, 200, 3);
+		op_forksize_add(0, REL_B, FORK0, 400, 8);
+
+		check(op_forksize_at(0, REL_B, FORK0, 50, NULL) == PS_FORKSIZE_UNKNOWN,
+			  "truncation floor unknown before any truncation");
+		check(op_forksize_at(0, REL_B, FORK0, 250, &tlsn) == 3 && tlsn == 200,
+			  "floor as-of 250 -> 3 @200 (returns the truncation LSN)");
+		check(op_forksize_at(0, REL_B, FORK0, 1000, &tlsn) == 8 && tlsn == 400,
+			  "floor as-of 1000 -> 8 @400");
+
+		/* a later truncation to the SAME floor must be kept (it resets the liveness
+		 * window): its LSN, not the earlier one, is returned */
+		op_forksize_add(0, REL_B, FORK0, 600, 8);	/* same size 8, later LSN */
+		check(op_forksize_at(0, REL_B, FORK0, 650, &tlsn) == 8 && tlsn == 600,
+			  "repeated same-size truncation kept (floor 8 @600, not @400)");
+
+		/* out-of-order ingestion must still resolve the floor by LSN, not arrival */
+		op_forksize_add(0, REL_B, FORK0, 100, 9);	/* earlier LSN, arrives last */
+		check(op_forksize_at(0, REL_B, FORK0, 150, &tlsn) == 9 && tlsn == 100,
+			  "out-of-order: floor as-of 150 -> 9 @100");
+		check(op_forksize_at(0, REL_B, FORK0, 250, NULL) == 3, "out-of-order: floor as-of 250 still 3");
+
+		/* a branch inherits the parent's floor as-of the fork LSN, then overrides */
+		op_create_branch(2, 0, 250);	/* fork REL_B's timeline at lsn 250 (floor 3) */
+		op_forksize_add(2, REL_B, FORK0, 500, 2);
+		check(op_forksize_at(2, REL_B, FORK0, 300, NULL) == 3,
+			  "branch sees parent floor capped at the fork lsn (3, not the parent's later 8)");
+		check(op_forksize_at(2, REL_B, FORK0, 600, NULL) == 2, "branch's own later truncation wins (2)");
 	}
 
 	client_detach();

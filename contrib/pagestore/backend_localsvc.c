@@ -604,6 +604,45 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	return n;
 }
 
+/* Record in the store that the fork's size became nblocks as of WAL record 'lsn'
+ * (is_trunc = a truncation's exact new size; else an extension that only grows). */
+/* Record that the fork was truncated to 'nblocks' as of WAL record 'lsn'. */
+void
+pagestore_localsvc_forksize_add(const PageStoreRelKey *key, uint64 lsn,
+								BlockNumber nblocks)
+{
+	PsChannel  *ch = ls_chan(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_FORK_SIZE_ADD;
+	ch->req_lsn = lsn;
+	ch->nblocks = nblocks;
+	ls_exec(ch);
+}
+
+/* The fork's truncation floor (blocks) as of 'lsn'.  Returns true and sets *out
+ * (and, if non-NULL, *trunc_lsn = the LSN of that truncation, which a liveness
+ * check needs to bound the re-extension window) when a truncation is known
+ * at/below 'lsn'; false otherwise.  Returns the count as a full BlockNumber (no
+ * signed cast), so forks above INT_MAX read correctly. */
+bool
+pagestore_localsvc_forksize_at(const PageStoreRelKey *key, uint64 lsn,
+							   BlockNumber *out, uint64 *trunc_lsn)
+{
+	PsChannel  *ch = ls_chan(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_FORK_SIZE_AT;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	if (ch->result == PS_FORKSIZE_UNKNOWN)
+		return false;
+	*out = (BlockNumber) ch->result;
+	if (trunc_lsn)
+		*trunc_lsn = ch->req_lsn;	/* daemon wrote the truncation LSN here */
+	return true;
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)

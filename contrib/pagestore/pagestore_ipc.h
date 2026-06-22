@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		6			/* 6: WAL_INDEX_GET (timeline,lsn) + result_flags */
+#define PS_SHM_VERSION		7			/* 7: FORK_SIZE_ADD/AT opcodes */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -96,7 +96,12 @@ typedef enum PsOpcode
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
+	PS_OP_FORK_SIZE_ADD,		/* record: fork truncated to nblocks as-of req_lsn */
+	PS_OP_FORK_SIZE_AT,			/* truncation floor (blocks) as-of req_lsn; PS_FORKSIZE_UNKNOWN if never truncated */
 } PsOpcode;
+
+/* PS_OP_FORK_SIZE_AT: no truncation at/below the queried LSN. */
+#define PS_FORKSIZE_UNKNOWN	0xffffffffu
 
 /* Status codes */
 #define PS_STATUS_OK		0
