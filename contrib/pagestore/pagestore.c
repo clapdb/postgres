@@ -694,10 +694,18 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 										  (uint64) lsn, lsns, NULL,
 										  PS_REDO_MAX_RECS, &overflow);
 		if (overflow)
+		{
+			/* The chain is longer than we fetched, so the newest full-page image
+			 * may be in the unseen suffix; a base built from the truncated prefix
+			 * could be stale.  Fail (no page) until pagination exists, rather than
+			 * report success with a possibly-wrong image. */
 			ereport(WARNING,
 					(errmsg("pagestore WAL-index chain for block %d exceeds %d records; "
-							"base-image scan may miss the newest full-page image",
+							"cannot reconstruct base image without pagination",
 							blocknum, PS_REDO_MAX_RECS)));
+			pfree(lsns);
+			PG_RETURN_NULL();
+		}
 	}
 	if (n == 0)
 		PG_RETURN_NULL();
