@@ -1784,6 +1784,68 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	return total;
 }
 
+/*
+ * Is (key, block) live as of 'lsn'?  The redo driver's step-0: skip materializing
+ * a page that was removed (the fork truncated below it, or dropped) and not
+ * written again at the target LSN.
+ *
+ * A block is live unless the fork's "floor" as-of 'lsn' is at/below it AND no WAL
+ * record wrote the block in the half-open window [trunc_lsn, lsn) (it was not
+ * re-extended).  The floor and its LSN come from the size history (fork_size_add);
+ * the re-extension check scans the per-page index across the timeline ancestry,
+ * with early exit.  No floor known -> live (materialize rather than wrongly drop).
+ *
+ * A relation *drop* is represented as a truncation to 0 (floor 0), so this same
+ * logic returns dead for a dropped, not-recreated fork.  NB: *populating* drop
+ * events from WAL -- decoding the dropped-relation lists in xact commit/abort
+ * records -- is a follow-up; until it lands a WAL-driven drop is not yet reflected
+ * here, so a background materializer keyed by store identity must not run ahead of
+ * that work for dropped relations.
+ */
+static bool
+block_live_at(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	const Shard *s = shard_for(key);
+	uint32_t	floor;
+	uint64_t	trunc_lsn;
+	uint64_t	lmax = lsn;
+
+	if (!fork_nblocks_at(tl, key, lsn, &floor, &trunc_lsn))
+		return true;			/* never truncated at/below lsn */
+	if (block < floor)
+		return true;			/* within the post-truncation length */
+
+	/*
+	 * Live iff written again in the half-open window [trunc_lsn, lsn).  Lower bound
+	 * inclusive: truncations are indexed by record end LSN, page writes by record
+	 * start LSN, and the record right after the truncation starts where it ended,
+	 * so an immediate re-extension has start == trunc_lsn.  Upper bound exclusive:
+	 * a write whose start == lsn begins at the target boundary and ends after it,
+	 * so it is not visible as-of lsn (same half-open convention as the delta window
+	 * the redo driver replays).
+	 */
+	for (uint32_t t = tl;;)
+	{
+		uint32_t	h = page_hash(t, key, block);
+		WalIdxEnt  *e;
+
+		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
+			if (e->timeline == t && e->block == block && key_eq(&e->key, key))
+			{
+				for (int i = 0; i < e->n; i++)
+					if (e->lsns[i] >= trunc_lsn && e->lsns[i] < lmax)
+						return true;
+				break;
+			}
+		if (!timeline_has_parent(s, t))
+			break;
+		if (s->timelines[t].branch_lsn < lmax)
+			lmax = s->timelines[t].branch_lsn;
+		t = (uint32_t) s->timelines[t].parent;
+	}
+	return false;
+}
+
 /* ===================== write / read primitives ========================= */
 
 /* The page's own pd_lsn lives in its first 8 bytes (xlogid, xrecoff). */
@@ -2404,6 +2466,11 @@ ps_handle_meta(PsChannel *ch)
 				ch->result = PS_FORKSIZE_UNKNOWN;
 			break;
 		}
+
+		case PS_OP_BLOCK_LIVE:
+			ch->result = block_live_at(tl, &ch->key, ch->blocknum,
+									   ch->req_lsn) ? 1 : 0;
+			break;
 
 		case PS_OP_TRUNCATE:
 			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;

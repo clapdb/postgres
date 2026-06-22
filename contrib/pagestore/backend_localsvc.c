@@ -643,6 +643,22 @@ pagestore_localsvc_forksize_at(const PageStoreRelKey *key, uint64 lsn,
 	return true;
 }
 
+/* Is (key, block) live as of 'lsn'?  The redo driver's step-0 (skip a block that
+ * was truncated away and not written again as-of lsn). */
+bool
+pagestore_localsvc_block_live(const PageStoreRelKey *key, BlockNumber block,
+							  uint64 lsn)
+{
+	PsChannel  *ch = ls_chan(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_BLOCK_LIVE;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result != 0;
+}
+
 /* Called from _PG_init to register the GUCs owned by this backend. */
 void
 pagestore_localsvc_init(void)

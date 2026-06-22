@@ -507,6 +507,20 @@ op_forksize_at(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
 	return res;
 }
 
+/* Is (rel,fork,block) live as-of lsn?  Returns 0/1. */
+static int
+op_block_live(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn)
+{
+	PsChannel  *ch = cl_route(rel, fork);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_BLOCK_LIVE;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	return (int) cl_exec(ch)->result;
+}
+
 /* Returns count; fills out[] with the record LSNs <= lsn_max, and -- when
  * out_tl != NULL -- the parallel source timeline of each LSN. */
 static int
@@ -1118,6 +1132,28 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "branch sees parent floor capped at the fork lsn (3, not the parent's later 8)");
 		check(op_forksize_at(2, REL_B, FORK0, 600, NULL) == 2, "branch's own later truncation wins (2)");
 	}
+
+	/* --- block liveness as-of LSN (the redo driver's step-0) --- */
+	/* truncate REL_A to 1 block @250: block 5 is gone unless written again */
+	op_forksize_add(0, REL_A, FORK0, 250, 1);
+	check(op_block_live(0, REL_A, FORK0, 0, 300) == 1,
+		  "block 0 is within the truncation floor (1) -> live");
+	check(op_block_live(0, REL_A, FORK0, 5, 300) == 0,
+		  "block 5 truncated away and not rewritten -> dead");
+	check(op_block_live(0, REL_A, FORK0, 5, 200) == 1,
+		  "as-of 200, before the truncation -> not dead");
+	op_walidx_add(0, REL_A, FORK0, 5, 400);		/* re-extend block 5 at LSN 400 */
+	check(op_block_live(0, REL_A, FORK0, 5, 450) == 1,
+		  "block 5 rewritten after the truncation -> live again");
+	check(op_block_live(0, REL_A, FORK0, 5, 350) == 0,
+		  "as-of 350, before the @400 rewrite -> still dead");
+	/* a re-extension whose start LSN equals the truncation LSN (the immediate
+	 * next record) must count -- the lower bound is inclusive */
+	op_walidx_add(0, REL_A, FORK0, 6, 250);		/* block 6 rewritten exactly @ trunc lsn */
+	check(op_block_live(0, REL_A, FORK0, 6, 300) == 1,
+		  "re-extension exactly at the truncation LSN -> live");
+	check(op_block_live(0, REL_A, FORK0, 6, 250) == 0,
+		  "as-of the rewrite's own start LSN (upper bound exclusive) -> not yet live");
 
 	client_detach();
 	stop_daemon(dpid);

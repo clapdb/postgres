@@ -160,5 +160,7 @@ extern void pagestore_localsvc_forksize_add(const PageStoreRelKey *key,
 extern bool pagestore_localsvc_forksize_at(const PageStoreRelKey *key,
 										   uint64 lsn, BlockNumber *out,
 										   uint64 *trunc_lsn);
+extern bool pagestore_localsvc_block_live(const PageStoreRelKey *key,
+										  BlockNumber block, uint64 lsn);
 
 #endif							/* PAGESTORE_BACKEND_H */
