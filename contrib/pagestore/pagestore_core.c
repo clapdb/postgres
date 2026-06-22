@@ -1416,11 +1416,17 @@ forksz_find(uint32_t timeline, const PsKey *key)
 }
 
 /*
- * The fork's block count as of 'lsn': the nblocks of the newest size event at or
- * below 'lsn', walking the timeline ancestry (a branch inherits the parent's size
- * as of its fork LSN until its own first size event).  Returns true and sets
- * *nblocks when a size event is known at/below 'lsn'; false ("unknown") otherwise
- * -- kept separate from the count so the full unsigned block range is usable.
+ * The length the fork was last *truncated* to as of 'lsn': the nblocks of the
+ * newest truncation event at or below 'lsn', walking the timeline ancestry (a
+ * branch inherits the parent's floor as of its fork LSN until its own first
+ * truncation).  Returns true and sets *nblocks when a truncation is known
+ * at/below 'lsn'; false ("never truncated / unknown") otherwise -- kept separate
+ * from the count so the full unsigned block range is usable.
+ *
+ * NB: this is only the truncation floor, not the live fork length -- extensions
+ * are not tracked (see fork_size_add).  A block at/above this floor is not
+ * necessarily dead: a liveness check must also consult the per-page WAL index to
+ * see whether the block was written again after the truncation.
  */
 static bool
 fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
@@ -1448,21 +1454,18 @@ fork_nblocks_at(uint32_t timeline, const PsKey *key, uint64_t lsn,
 }
 
 /*
- * Record an LSN-versioned size change for the redo "is this block live as-of LSN?"
- * check.  is_trunc distinguishes the two sources, which prune differently:
- *   - a truncation (is_trunc) sets the exact new size; recorded unless the size at
- *     'lsn' already equals it;
- *   - an extension (!is_trunc) only grows the fork, so it is recorded only when
- *     'nblocks' exceeds the size already in effect at 'lsn' -- a WAL reference to a
- *     low block of a larger fork must not look like a shrink.  (The caller records
- *     extensions only for newly-initialized pages, so 'nblocks' is the real new
- *     length, not a lower bound from an arbitrary block reference.)
- * Events store the exact size as of their LSN, so fork_nblocks_at() (latest <= lsn)
- * reads them directly.  Kept ascending by lsn (usually an append).
+ * Record a truncation: as of WAL record 'lsn' this fork was truncated to exactly
+ * 'nblocks' blocks.  Truncation is the only fork-length signal we take from WAL:
+ * relation *extensions* cannot be derived reliably -- a WAL block reference, even
+ * one flagged WILL_INIT, may merely reinitialize an existing page (e.g. btree
+ * unlink registers existing buffers WILL_INIT), so it is not evidence the fork
+ * grew to that block.  Extensions are therefore left to the per-page WAL index
+ * (every block touch is recorded there); this history records only the shrink
+ * floor that the index cannot express.  Events store the exact length as of their
+ * LSN, so fork_nblocks_at() (latest <= lsn) reads them directly; kept ascending.
  */
 void
-fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn,
-			  uint32_t nblocks, bool is_trunc)
+fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn, uint32_t nblocks)
 {
 	uint32_t	cur;
 	bool		known = fork_nblocks_at(timeline, key, lsn, &cur);
@@ -1471,8 +1474,8 @@ fork_size_add(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	Shard	   *s;
 	int			i;
 
-	if (known && (is_trunc ? (cur == nblocks) : (cur >= nblocks)))
-		return;					/* no effect on the size in force at 'lsn' */
+	if (known && cur == nblocks)
+		return;					/* fork already truncated to this floor at 'lsn' */
 
 	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
 	s = shard_for(key);
@@ -2384,10 +2387,8 @@ ps_handle_meta(PsChannel *ch)
 			ch->result = fork_nblocks_through(tl, &ch->key);
 			break;
 
-		case PS_OP_FORK_SIZE_ADD:
-			/* blocknum carries is_trunc (1 = truncation, 0 = extension) */
-			fork_size_add(tl, &ch->key, ch->req_lsn, ch->nblocks,
-						  ch->blocknum != 0);
+		case PS_OP_FORK_SIZE_ADD:	/* record a truncation to ch->nblocks @ req_lsn */
+			fork_size_add(tl, &ch->key, ch->req_lsn, ch->nblocks);
 			break;
 
 		case PS_OP_FORK_SIZE_AT:

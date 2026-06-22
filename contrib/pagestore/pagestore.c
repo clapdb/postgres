@@ -524,22 +524,21 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 			key.relNumber = rloc.relNumber;
 			key.forkNum = fk;
 			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
-			/* Only a newly-initialized page (WILL_INIT) is a real extension whose
-			 * new length is blk+1; an ordinary reference to a low block of a larger
-			 * fork is just a lower bound and must not be recorded as the size, or a
-			 * record touching block 0 would report the fork as 1 block long. */
-			if (XLogRecGetBlock(reader, b)->flags & BKPBLOCK_WILL_INIT)
-				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
-												blk + 1, false);
+			/* Extensions are not derived here: a block reference -- even one flagged
+			 * WILL_INIT, which btree unlink and friends set on *existing* pages --
+			 * is not proof the fork grew to blk+1.  The per-page index above already
+			 * records every block touch, which is what the liveness check uses above
+			 * the truncation floor; only truncations are recorded (below). */
 		}
 
-		/* smgr truncation shrinks a fork to an exact size -- a size event no
-		 * per-block reference carries, but the redo "is this block live?" check
-		 * needs it.  Only the heap (main) fork's new length is carried by the
-		 * record (xlrec->blkno); the VM/FSM forks are truncated to derived, smaller
-		 * lengths (visibilitymap_prepare_truncate / FreeSpaceMapPrepareTruncateRel),
-		 * so recording blkno for them would overstate their size.  VM/FSM
-		 * materialization is deferred (3c-4b), so record only the heap fork here. */
+		/* smgr truncation shrinks a fork to an exact length -- the one fork-size
+		 * signal the per-block index cannot express, and what the redo "is this
+		 * block live?" check needs as its floor.  Only the heap (main) fork's new
+		 * length is carried by the record (xlrec->blkno); the VM/FSM forks shrink to
+		 * derived, smaller lengths (visibilitymap_prepare_truncate /
+		 * FreeSpaceMapPrepareTruncateRel), so recording blkno for them would
+		 * overstate their size.  VM/FSM materialization is deferred (3c-4b), so
+		 * record only the heap fork here. */
 		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
 			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
 		{
@@ -554,7 +553,7 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 				key.relNumber = xlrec->rlocator.relNumber;
 				key.forkNum = MAIN_FORKNUM;
 				pagestore_localsvc_forksize_add(&key, reader->EndRecPtr,
-												xlrec->blkno, true);
+												xlrec->blkno);
 			}
 		}
 	}

@@ -473,11 +473,10 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec(ch);
 }
 
-/* Record: this fork's size became nblocks as of WAL record 'lsn' (is_trunc=1 for
- * a truncation -- exact shrink; is_trunc=0 for an extension -- grow-only). */
+/* Record: this fork was truncated to nblocks as of WAL record 'lsn'. */
 static void
 op_forksize_add(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
-				uint32_t nblocks, int is_trunc)
+				uint32_t nblocks)
 {
 	PsChannel  *ch = cl_route(rel, fork);
 
@@ -486,11 +485,11 @@ op_forksize_add(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn,
 	ch->opcode = PS_OP_FORK_SIZE_ADD;
 	ch->req_lsn = lsn;
 	ch->nblocks = nblocks;
-	ch->blocknum = (uint32_t) is_trunc;
 	cl_exec(ch);
 }
 
-/* The fork's size (blocks) as of 'lsn'; PS_FORKSIZE_UNKNOWN if none at/below it. */
+/* The fork's truncation floor (blocks) as of 'lsn'; PS_FORKSIZE_UNKNOWN if never
+ * truncated at/below it. */
 static uint32_t
 op_forksize_at(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn)
 {
@@ -1080,30 +1079,28 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "branch index tags each LSN with its source timeline (400->tl1, 100/200->tl0)");
 	}
 
-	/* --- LSN-versioned fork size (the redo step-0 "is block live as-of LSN" check) --- */
+	/* --- LSN-versioned truncation floor (the redo step-0 "is block live?" floor) --- */
 
-	/* REL_B fork grows to 10 blocks @100, truncated to 3 @200, re-extended to 7 @300 */
-	op_forksize_add(0, REL_B, FORK0, 100, 10, 0);
-	op_forksize_add(0, REL_B, FORK0, 200, 3, 1);
-	op_forksize_add(0, REL_B, FORK0, 300, 7, 0);
-	/* an extension to a block below the current size must NOT shrink it */
-	op_forksize_add(0, REL_B, FORK0, 320, 4, 0);
+	/* REL_B truncated to 3 @200, then to 8 @400 */
+	op_forksize_add(0, REL_B, FORK0, 200, 3);
+	op_forksize_add(0, REL_B, FORK0, 400, 8);
 
 	check(op_forksize_at(0, REL_B, FORK0, 50) == PS_FORKSIZE_UNKNOWN,
-		  "fork size unknown before the first size event");
-	check(op_forksize_at(0, REL_B, FORK0, 150) == 10, "fork size as-of 150 -> 10 (after extend)");
-	check(op_forksize_at(0, REL_B, FORK0, 250) == 3, "fork size as-of 250 -> 3 (after truncate)");
-	check(op_forksize_at(0, REL_B, FORK0, 1000) == 7, "fork size as-of 1000 -> 7 (re-extend; low write ignored)");
-	/* block 5 is gone at 250 (size 3) but live again at 1000 (size 7) */
-	check(op_forksize_at(0, REL_B, FORK0, 250) <= 5 && op_forksize_at(0, REL_B, FORK0, 1000) > 5,
-		  "truncate-then-re-extend: block 5 dead as-of 250, live as-of 1000");
+		  "truncation floor unknown before any truncation");
+	check(op_forksize_at(0, REL_B, FORK0, 250) == 3, "floor as-of 250 -> 3 (after first truncate)");
+	check(op_forksize_at(0, REL_B, FORK0, 1000) == 8, "floor as-of 1000 -> 8 (after second truncate)");
 
-	/* a branch inherits the parent's size as-of the fork LSN, then overrides */
-	op_create_branch(2, 0, 250);		/* fork REL_B's timeline at lsn 250 (size 3) */
-	op_forksize_add(2, REL_B, FORK0, 400, 9, 0);
+	/* out-of-order ingestion must still resolve the floor by LSN, not arrival */
+	op_forksize_add(0, REL_B, FORK0, 100, 9);	/* earlier LSN, arrives last */
+	check(op_forksize_at(0, REL_B, FORK0, 150) == 9, "out-of-order: floor as-of 150 -> 9");
+	check(op_forksize_at(0, REL_B, FORK0, 250) == 3, "out-of-order: floor as-of 250 still 3");
+
+	/* a branch inherits the parent's floor as-of the fork LSN, then overrides */
+	op_create_branch(2, 0, 250);		/* fork REL_B's timeline at lsn 250 (floor 3) */
+	op_forksize_add(2, REL_B, FORK0, 500, 2);
 	check(op_forksize_at(2, REL_B, FORK0, 300) == 3,
-		  "branch sees parent size capped at the fork lsn (3, not the parent's later 7)");
-	check(op_forksize_at(2, REL_B, FORK0, 500) == 9, "branch's own later size event wins (9)");
+		  "branch sees parent floor capped at the fork lsn (3, not the parent's later 8)");
+	check(op_forksize_at(2, REL_B, FORK0, 600) == 2, "branch's own later truncation wins (2)");
 
 	client_detach();
 	stop_daemon(dpid);
