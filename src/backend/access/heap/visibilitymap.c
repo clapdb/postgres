@@ -92,6 +92,7 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
+#include "postmaster/walredo.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/inval.h"
@@ -146,6 +147,10 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	char	   *map;
 	bool		cleared = false;
 
+	/* no VM fork in the wal-redo helper; nothing to clear */
+	if (am_walredo)
+		return false;
+
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
 	Assert(flags & VISIBILITYMAP_VALID_BITS);
 	Assert(flags != VISIBILITYMAP_ALL_VISIBLE);
@@ -193,6 +198,19 @@ void
 visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+
+	/*
+	 * The wal-redo helper materializes a single heap page and has no VM fork.
+	 * visibilitymap_clear() is a no-op there, but redo callers still
+	 * ReleaseBuffer() the pin unconditionally, so hand back a valid pinned
+	 * scratch buffer (reusing the one already pinned, if any).
+	 */
+	if (am_walredo)
+	{
+		if (!BufferIsValid(*vmbuf))
+			*vmbuf = WalRedoScratchBuffer();
+		return;
+	}
 
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
