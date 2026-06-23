@@ -45,10 +45,12 @@
 #include <io.h>
 #endif
 
+#include "access/rmgr.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
 #include "storage/bufpage.h"
 
@@ -221,13 +223,34 @@ WalRedoMain(int argc, char *argv[])
 
 					/*
 					 * This path feeds the bytes straight to DecodeXLogRecord,
-					 * bypassing XLogReadRecord's length/CRC checks, so validate
-					 * the header length against the framed length first: a header
-					 * whose xl_tot_len exceeds the bytes we read would let the
-					 * decoder run off the end of recbuf.
+					 * which (unlike XLogReadRecord) does not validate the record,
+					 * so replicate the checks XLogReadRecord would make before
+					 * trusting the record:
+					 *
+					 *  - the header length must equal the framed length, or the
+					 *    decoder could run off the end of recbuf;
+					 *  - the resource manager id must be valid;
+					 *  - the CRC must match, so a damaged chunk that still frames
+					 *    correctly is rejected rather than (once rm_redo is wired)
+					 *    applied as if it were good WAL.
 					 */
-					if (((XLogRecord *) recbuf)->xl_tot_len != len)
-						_exit(1);
+					{
+						XLogRecord *rec = (XLogRecord *) recbuf;
+						pg_crc32c	crc;
+
+						if (rec->xl_tot_len != len)
+							_exit(1);
+						if (!RmgrIdIsValid(rec->xl_rmid))
+							_exit(1);
+
+						INIT_CRC32C(crc);
+						COMP_CRC32C(crc, recbuf + SizeOfXLogRecord,
+									len - SizeOfXLogRecord);
+						COMP_CRC32C(crc, rec, offsetof(XLogRecord, xl_crc));
+						FIN_CRC32C(crc);
+						if (!EQ_CRC32C(crc, rec->xl_crc))
+							_exit(1);
+					}
 
 					if (wr_reader == NULL)
 					{
@@ -245,6 +268,15 @@ WalRedoMain(int argc, char *argv[])
 					if (!DecodeXLogRecord(wr_reader, decoded, (XLogRecord *) recbuf,
 										  (XLogRecPtr) end_lsn, &errm))
 						_exit(1);
+
+					/*
+					 * Populate the reader so the XLogRecGet* accessors and (once
+					 * wired) rm_redo see a consistent record, including the start
+					 * and end LSNs used for page-LSN decisions.
+					 */
+					wr_reader->ReadRecPtr = (XLogRecPtr) start_lsn;
+					wr_reader->EndRecPtr = (XLogRecPtr) end_lsn;
+					wr_reader->record = decoded;
 
 					/*
 					 * 4b step 1 is decode only: the record is validated and
