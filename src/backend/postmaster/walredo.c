@@ -22,12 +22,20 @@
  *
  * EOF on stdin is a clean shutdown.
  *
- * This is increment 4a: the process entry, the held-page state and the protocol
- * framing.  The APPLY step -- running the record's resource-manager redo against
- * the held page with the buffer manager redirected to it (and VM/FSM side
- * effects stubbed per target fork) -- is the next increment (4b); until then
- * APPLY reports that it is unimplemented.  All I/O is raw read()/write() over
- * static buffers, so the mode runs without the usual backend initialisation.
+ * Startup brings up a standalone backend (shared memory + a PGPROC + the buffer
+ * manager) by reusing the single-user init path (InitStandaloneBackend), so it
+ * needs a data directory: `postgres --wal-redo -D <datadir>`.  This must be a
+ * private, throwaway cluster, not the live one -- the helper only ever mutates
+ * pages handed to it over the protocol, so any cluster of the same BLCKSZ works,
+ * and using the live datadir would collide with the postmaster's lock file.  The
+ * full backend context is required because running a record's rm_redo goes
+ * through the normal buffer manager.
+ *
+ * APPLY currently decodes and validates the record (header length, rmid, CRC) but
+ * does not yet mutate the held page: running the record's resource-manager redo
+ * against it with the buffer manager redirected to the held/scratch buffers (and
+ * VM/FSM side effects stubbed per target fork) is the next increment.  Protocol
+ * I/O is raw read()/write() over static buffers.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -50,9 +58,13 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
 #include "storage/bufpage.h"
+#include "storage/ipc.h"
+#include "tcop/tcopprot.h"
+#include "utils/resowner.h"
 
 /* XLogReader reused across APPLY messages (lazily allocated) */
 static XLogReaderState *wr_reader = NULL;
@@ -107,7 +119,7 @@ write_fully(const void *buf, size_t len)
 		{
 			if (errno == EINTR)
 				continue;
-			_exit(1);
+			proc_exit(1);
 		}
 		p += n;
 		len -= (size_t) n;
@@ -129,8 +141,7 @@ read_u64(uint64 *v)
 void
 WalRedoMain(int argc, char *argv[])
 {
-	(void) argc;
-	(void) argv;
+	const char *dbname = NULL;
 
 #ifdef WIN32
 	/* the protocol is binary; keep the CRT from translating \n/\r\n/0x1a on the
@@ -139,7 +150,42 @@ WalRedoMain(int argc, char *argv[])
 	_setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-	/* APPLY decodes records with an XLogReader, which needs a valid segment size */
+	/*
+	 * Drop the leading "--wal-redo" dispatch token so the shared standalone
+	 * bring-up sees a normal argv (process_postgres_switches only special-cases
+	 * "--single").  argv[0] is preserved as the program name.
+	 */
+	if (argc > 1)
+	{
+		argv[1] = argv[0];
+		argv++;
+		argc--;
+	}
+
+	/*
+	 * Bring up a standalone backend: switches (incl. -D), config, control file,
+	 * shared memory and a PGPROC -- everything the buffer manager needs.  This
+	 * runs against a private, throwaway data directory, never the live cluster's
+	 * (whose lock file is held by the postmaster): the helper only ever mutates
+	 * pages handed to it over the protocol, so a generic scratch cluster of the
+	 * same BLCKSZ is sufficient for redo.
+	 */
+	InitStandaloneBackend(argc, argv, NULL, &dbname, false);
+
+	/*
+	 * BaseInit() sets up smgr and the buffer manager (InitBufferManagerAccess),
+	 * which need the shared memory + MyProc that InitStandaloneBackend created.
+	 */
+	BaseInit();
+	SetProcessingMode(NormalProcessing);
+
+	/* index rmgrs (btree/GIN/GiST/SP-GiST) allocate recovery contexts here */
+	RmgrStartup();
+
+	/* buffer pins are tracked against a resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "wal-redo");
+
+	/* the control file supplies the cluster's real WAL segment size */
 	if (wal_segment_size == 0)
 		wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 
@@ -148,7 +194,12 @@ WalRedoMain(int argc, char *argv[])
 		unsigned char tag;
 
 		if (!read_fully(&tag, 1))
-			_exit(0);			/* EOF: clean shutdown */
+		{
+			/* EOF: clean shutdown -- match RmgrStartup() so the index rmgrs'
+			 * recovery contexts are torn down */
+			RmgrCleanup();
+			proc_exit(0);
+		}
 
 		switch (tag)
 		{
@@ -158,7 +209,7 @@ WalRedoMain(int argc, char *argv[])
 
 					for (int i = 0; i < 5; i++)
 						if (!read_u32(&ident[i]))
-							_exit(1);
+							proc_exit(1);
 					(void) ident;	/* 4b stores the target identity from here */
 					/* 4a only resets the held page */
 					memset(held_page.data, 0, BLCKSZ);
@@ -171,11 +222,11 @@ WalRedoMain(int argc, char *argv[])
 					uint32		len;
 
 					if (!read_u64(&base_end_lsn) || !read_u32(&len))
-						_exit(1);
+						proc_exit(1);
 					if (len == BLCKSZ)
 					{
 						if (!read_fully(held_page.data, BLCKSZ))
-							_exit(1);
+							proc_exit(1);
 
 						/*
 						 * RestoreBlockImage (on the driver side) copies only the
@@ -198,7 +249,7 @@ WalRedoMain(int argc, char *argv[])
 					else if (len == 0)
 						memset(held_page.data, 0, BLCKSZ);
 					else
-						_exit(1);	/* malformed base length */
+						proc_exit(1);	/* malformed base length */
 					break;
 				}
 
@@ -214,12 +265,12 @@ WalRedoMain(int argc, char *argv[])
 
 					if (!read_u64(&start_lsn) || !read_u64(&end_lsn) ||
 						!read_u32(&len))
-						_exit(1);
+						proc_exit(1);
 					if (len < SizeOfXLogRecord)
-						_exit(1);
+						proc_exit(1);
 					recbuf = palloc(len);
 					if (!read_fully(recbuf, len))
-						_exit(1);
+						proc_exit(1);
 
 					/*
 					 * This path feeds the bytes straight to DecodeXLogRecord,
@@ -239,9 +290,9 @@ WalRedoMain(int argc, char *argv[])
 						pg_crc32c	crc;
 
 						if (rec->xl_tot_len != len)
-							_exit(1);
+							proc_exit(1);
 						if (!RmgrIdIsValid(rec->xl_rmid))
-							_exit(1);
+							proc_exit(1);
 
 						INIT_CRC32C(crc);
 						COMP_CRC32C(crc, recbuf + SizeOfXLogRecord,
@@ -249,7 +300,7 @@ WalRedoMain(int argc, char *argv[])
 						COMP_CRC32C(crc, rec, offsetof(XLogRecord, xl_crc));
 						FIN_CRC32C(crc);
 						if (!EQ_CRC32C(crc, rec->xl_crc))
-							_exit(1);
+							proc_exit(1);
 					}
 
 					if (wr_reader == NULL)
@@ -260,14 +311,14 @@ WalRedoMain(int argc, char *argv[])
 																  .segment_close = NULL),
 													   NULL);
 						if (wr_reader == NULL)
-							_exit(1);
+							proc_exit(1);
 					}
 
 					decoded = palloc(DecodeXLogRecordRequiredSpace(
 										 ((XLogRecord *) recbuf)->xl_tot_len));
 					if (!DecodeXLogRecord(wr_reader, decoded, (XLogRecord *) recbuf,
 										  (XLogRecPtr) end_lsn, &errm))
-						_exit(1);
+						proc_exit(1);
 
 					/*
 					 * Populate the reader so the XLogRecGet* accessors and (once
@@ -290,7 +341,7 @@ WalRedoMain(int argc, char *argv[])
 					 */
 					msg = "wal-redo: APPLY decoded the record but rm_redo is not implemented yet (4b step 2)\n";
 					write(STDERR_FILENO, msg, strlen(msg));
-					_exit(2);
+					proc_exit(2);
 				}
 
 			case WALREDO_GET:
@@ -298,7 +349,7 @@ WalRedoMain(int argc, char *argv[])
 				break;
 
 			default:
-				_exit(1);		/* protocol error */
+				proc_exit(1);		/* protocol error */
 		}
 	}
 }

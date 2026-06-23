@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Smoke test for the `postgres --wal-redo` helper.
 
-Drives the binary protocol over stdin/stdout without needing a cluster:
+Drives the binary protocol over stdin/stdout:
   - BEGIN + PUSHBASE(page) + GET round-trips the page with pd_lsn stamped (4a);
   - APPLY rejects malformed records (too short / length mismatch / bad CRC),
     exercising the validation that guards the decode path.
 
-Usage: walredo_smoke.py <path-to-postgres-binary>
+The helper brings up a standalone backend, so it needs a (throwaway) data
+directory; pass an initdb'd scratch cluster.
+
+Usage: walredo_smoke.py <path-to-postgres-binary> <datadir>
 Exit status is nonzero if any check fails.
 """
 import struct
@@ -14,6 +17,7 @@ import subprocess
 import sys
 
 PG = sys.argv[1]
+PGDATA = sys.argv[2]
 BLCKSZ = 8192
 SizeOfXLogRecord = 24            # 64-bit layout
 RM_XLOG_ID = 0                   # a valid resource-manager id
@@ -29,9 +33,9 @@ def check(name, ok):
 
 
 def run(payload):
-    return subprocess.run([PG, "--wal-redo"], input=payload,
+    return subprocess.run([PG, "--wal-redo", "-D", PGDATA], input=payload,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          timeout=60)
+                          timeout=120)
 
 
 def begin():
