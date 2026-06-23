@@ -34,7 +34,6 @@
 #include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
-static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
 typedef struct WorkerArgs
 {
@@ -145,17 +144,44 @@ request_is_write(PsOpcode opcode)
 static void
 run_request(PsChannel *ch)
 {
-	int			is_write = request_is_write((PsOpcode) ch->opcode);
+	PsOpcode	op = (PsOpcode) ch->opcode;
 
-	if (is_write)
-		pthread_rwlock_wrlock(&core_rwlock);
+	/*
+	 * Branch creation mutates only the cross-shard timelines[]; take map_lock
+	 * alone (no shard lock), so it serializes against map readers/writers but
+	 * not against per-shard work on unrelated shards.
+	 */
+	if (op == PS_OP_CREATE_BRANCH)
+	{
+		ps_lock_map_wr();
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_map();
+		return;
+	}
+
+	if (request_is_write(op))
+	{
+		/*
+		 * Writes touch only this shard's state; append_page escalates to a brief
+		 * map_wr itself when a flush/compaction mutates the map.  Per-shard locks
+		 * let writes on different shards run concurrently.
+		 */
+		ps_lock_shard_wr(ch->shard);
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_shard(ch->shard);
+	}
 	else
-		pthread_rwlock_rdlock(&core_rwlock);
-
-	handle_request(ch);
-	ps_store_release(&ch->state, PS_STATE_DONE);
-
-	pthread_rwlock_unlock(&core_rwlock);
+	{
+		/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+		ps_lock_shard_rd(ch->shard);
+		ps_lock_map_rd();
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_map();
+		ps_unlock_shard(ch->shard);
+	}
 }
 
 static void *
@@ -184,11 +210,9 @@ shard_worker(void *arg)
 
 		if (!did_work && shard == 0)
 		{
-			int			do_maint = 0;
+			/* maintenance takes the shard + map locks it needs internally */
+			int			do_maint = ps_core_maintenance();
 
-			pthread_rwlock_wrlock(&core_rwlock);
-			do_maint = ps_core_maintenance();
-			pthread_rwlock_unlock(&core_rwlock);
 			if (!do_maint)
 			{
 				struct timespec ts = {0, 20000};	/* 20us */

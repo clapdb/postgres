@@ -82,4 +82,17 @@ extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, unsigned char *out);
 extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
 
+/*
+ * Concurrency locks (defined in pagestore_core.c).  A per-shard rwlock guards
+ * each shard's in-memory state; a single map_lock guards the cross-shard
+ * ps_layer_map + timelines[].  Callers MUST take them in the order shard
+ * (outer) -> map (inner), never the reverse.
+ */
+extern void ps_lock_shard_rd(uint32_t shard);
+extern void ps_lock_shard_wr(uint32_t shard);
+extern void ps_unlock_shard(uint32_t shard);
+extern void ps_lock_map_rd(void);
+extern void ps_lock_map_wr(void);
+extern void ps_unlock_map(void);
+
 #endif							/* PAGESTORE_CORE_H */
