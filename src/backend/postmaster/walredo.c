@@ -45,8 +45,15 @@
 #include <io.h>
 #endif
 
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
+#include "access/xlogrecord.h"
 #include "postmaster/walredo.h"
 #include "storage/bufpage.h"
+
+/* XLogReader reused across APPLY messages (lazily allocated) */
+static XLogReaderState *wr_reader = NULL;
 
 /* protocol message tags */
 #define WALREDO_BEGIN		'b'
@@ -117,23 +124,6 @@ read_u64(uint64 *v)
 	return read_fully(v, sizeof(*v));
 }
 
-/* discard 'len' bytes from stdin so the stream stays framed */
-static bool
-skip_bytes(uint32 len)
-{
-	char		buf[1024];
-
-	while (len > 0)
-	{
-		uint32		chunk = len < sizeof(buf) ? len : (uint32) sizeof(buf);
-
-		if (!read_fully(buf, chunk))
-			return false;
-		len -= chunk;
-	}
-	return true;
-}
-
 void
 WalRedoMain(int argc, char *argv[])
 {
@@ -146,6 +136,10 @@ WalRedoMain(int argc, char *argv[])
 	_setmode(_fileno(stdin), _O_BINARY);
 	_setmode(_fileno(stdout), _O_BINARY);
 #endif
+
+	/* APPLY decodes records with an XLogReader, which needs a valid segment size */
+	if (wal_segment_size == 0)
+		wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 
 	for (;;)
 	{
@@ -211,24 +205,56 @@ WalRedoMain(int argc, char *argv[])
 					uint64		start_lsn,
 								end_lsn;
 					uint32		len;
-					const char *msg = "wal-redo: APPLY not implemented yet (4b)\n";
+					char	   *recbuf;
+					DecodedXLogRecord *decoded;
+					char	   *errm = NULL;
+					char		dbg[80];
+					int			n;
 
 					if (!read_u64(&start_lsn) || !read_u64(&end_lsn) ||
 						!read_u32(&len))
 						_exit(1);
-					if (!skip_bytes(len))
+					if (len < SizeOfXLogRecord)
 						_exit(1);
-					(void) start_lsn;	/* used in 4b */
-					(void) end_lsn;
+					recbuf = palloc(len);
+					if (!read_fully(recbuf, len))
+						_exit(1);
+
+					if (wr_reader == NULL)
+					{
+						wr_reader = XLogReaderAllocate(wal_segment_size, NULL,
+													   XL_ROUTINE(.page_read = NULL,
+																  .segment_open = NULL,
+																  .segment_close = NULL),
+													   NULL);
+						if (wr_reader == NULL)
+							_exit(1);
+					}
+
+					decoded = palloc(DecodeXLogRecordRequiredSpace(
+										 ((XLogRecord *) recbuf)->xl_tot_len));
+					if (!DecodeXLogRecord(wr_reader, decoded, (XLogRecord *) recbuf,
+										  (XLogRecPtr) end_lsn, &errm))
+						_exit(1);
+					wr_reader->ReadRecPtr = (XLogRecPtr) start_lsn;
+					wr_reader->EndRecPtr = (XLogRecPtr) end_lsn;
+					wr_reader->record = decoded;
 
 					/*
-					 * 4b: decode the record and run its rm_redo against held_page,
-					 * with XLogReadBufferExtended redirected to the held (target)
-					 * and scratch (other) buffers, and VM/FSM side effects stubbed
-					 * per the requested fork.  Not yet implemented.
+					 * 4b step 1 (decode): the record is now decodable via the
+					 * XLogRecGet* accessors.  Running its rm_redo against the held
+					 * page (with the buffer manager redirected) is the next step;
+					 * for now report what was decoded.
 					 */
-					write(STDERR_FILENO, msg, strlen(msg));
-					_exit(2);
+					n = snprintf(dbg, sizeof(dbg),
+								 "wal-redo: decoded rmid=%u info=0x%02X maxblk=%d\n",
+								 (unsigned) XLogRecGetRmid(wr_reader),
+								 (unsigned) XLogRecGetInfo(wr_reader),
+								 XLogRecMaxBlockId(wr_reader));
+					write(STDERR_FILENO, dbg, n);
+					pfree(decoded);
+					pfree(recbuf);
+					break;
 				}
 
 			case WALREDO_GET:
