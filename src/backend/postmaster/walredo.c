@@ -59,12 +59,16 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "catalog/pg_class.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
+#include "storage/buf_internals.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/ipc.h"
+#include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/resowner.h"
 
@@ -183,6 +187,126 @@ read_u64(uint64 *v)
 	return read_fully(v, sizeof(*v));
 }
 
+/* ---- 4b: buffer redirect so rm_redo mutates the held page ----------------- */
+
+bool		am_walredo = false;
+
+/* the BEGIN target page identity */
+static RelFileLocator wr_target_rloc;
+static ForkNumber wr_target_fork;
+static BlockNumber wr_target_blk;
+static bool wr_have_target = false;
+
+/*
+ * Real (backend-local) buffers backing the redirect: wr_target_buf holds the
+ * page being materialized; wr_scratch_buf absorbs any other block a record
+ * references (we only ever read wr_target_buf back, so scratch redo is
+ * discarded).  Both are blocks of a private temp relation, so nothing is written
+ * to the cluster.
+ */
+static Buffer wr_target_buf = InvalidBuffer;
+static Buffer wr_scratch_buf = InvalidBuffer;
+static SMgrRelation wr_smgr = NULL;
+
+/* release the long-lived buffer pins at process exit, before the buffer manager's
+ * own leak check (registered with before_shmem_exit so it runs first) */
+static void
+wr_release_buffers(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+	if (wr_target_buf != InvalidBuffer)
+	{
+		ReleaseBuffer(wr_target_buf);
+		wr_target_buf = InvalidBuffer;
+	}
+	if (wr_scratch_buf != InvalidBuffer)
+	{
+		ReleaseBuffer(wr_scratch_buf);
+		wr_scratch_buf = InvalidBuffer;
+	}
+	/* remove the backing temp file so a later helper reusing this datadir does
+	 * not trip over a leftover relation */
+	if (wr_smgr != NULL)
+	{
+		smgrdounlinkall(&wr_smgr, 1, false);
+		wr_smgr = NULL;
+	}
+}
+
+static void
+wr_ensure_buffers(void)
+{
+	RelFileLocator tmp;
+
+	if (wr_target_buf != InvalidBuffer)
+		return;
+
+	tmp.spcOid = 1663;			/* pg_default */
+	tmp.dbOid = 1;				/* template1 (its base dir always exists) */
+	tmp.relNumber = 0x7e000001; /* arbitrary, private to this backend */
+	wr_smgr = smgropen(tmp, MyProcNumber);
+	/* isRedo=true: tolerate a file left behind by a previously crashed helper */
+	smgrcreate(wr_smgr, MAIN_FORKNUM, true);
+	wr_target_buf = ExtendBufferedRel(BMR_SMGR(wr_smgr, RELPERSISTENCE_TEMP),
+									  MAIN_FORKNUM, NULL, EB_SKIP_EXTENSION_LOCK);
+	wr_scratch_buf = ExtendBufferedRel(BMR_SMGR(wr_smgr, RELPERSISTENCE_TEMP),
+									   MAIN_FORKNUM, NULL, EB_SKIP_EXTENSION_LOCK);
+	before_shmem_exit(wr_release_buffers, (Datum) 0);
+}
+
+/*
+ * A pinned scratch buffer for redo code that reads a fork the helper does not
+ * model (e.g. visibilitymap_pin needs a buffer its caller will ReleaseBuffer).
+ * The content is irrelevant and never read back.
+ */
+Buffer
+WalRedoScratchBuffer(void)
+{
+	wr_ensure_buffers();
+	IncrBufferRefCount(wr_scratch_buf);
+	return wr_scratch_buf;
+}
+
+Buffer
+WalRedoReadBuffer(RelFileLocator rlocator, ForkNumber forknum,
+				  BlockNumber blkno, ReadBufferMode mode)
+{
+	Buffer		b;
+
+	if (wr_have_target &&
+		RelFileLocatorEquals(rlocator, wr_target_rloc) &&
+		forknum == wr_target_fork && blkno == wr_target_blk)
+		b = wr_target_buf;
+	else
+	{
+		/*
+		 * Any block other than the BEGIN target only needs to keep the redo
+		 * routine happy; its result is never read back.  For a WILL_INIT block
+		 * (zero mode) hand back a zeroed page for the routine to initialize.
+		 * Otherwise give the scratch page an LSN newer than any record so
+		 * XLogReadBufferForRedo() classifies it as BLK_DONE and skips it -- a
+		 * zero-LSN page would be treated as BLK_NEEDS_REDO and the routine would
+		 * apply the record to bogus contents (e.g. a cross-page heap UPDATE
+		 * panicking on the old tuple's block).
+		 */
+		b = wr_scratch_buf;
+		if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK ||
+			mode == RBM_ZERO_ON_ERROR)
+			memset(BufferGetPage(b), 0, BLCKSZ);
+		else
+			PageSetLSN(BufferGetPage(b), PG_UINT64_MAX);
+	}
+
+	/*
+	 * The redo caller will UnlockReleaseBuffer() this, dropping one pin; add that
+	 * reference so our long-lived buffer survives.  (LockBuffer is a no-op on
+	 * these local buffers.)
+	 */
+	IncrBufferRefCount(b);
+	return b;
+}
+
 void
 WalRedoMain(int argc, char *argv[])
 {
@@ -226,6 +350,13 @@ WalRedoMain(int argc, char *argv[])
 	 */
 	BaseInit();
 	SetProcessingMode(NormalProcessing);
+
+	/*
+	 * We skip InitPostgres (no database is opened), so adopt a regular backend
+	 * type explicitly: the buffer manager's pgstat I/O accounting asserts that
+	 * MyBackendType tracks the I/O ops our scratch buffers perform.
+	 */
+	MyBackendType = B_BACKEND;
 
 	/* index rmgrs (btree/GIN/GiST/SP-GiST) allocate recovery contexts here */
 	RmgrStartup();
@@ -288,8 +419,12 @@ WalRedoMain(int argc, char *argv[])
 					for (int i = 0; i < 5; i++)
 						if (!read_u32(&ident[i]))
 							proc_exit(1);
-					(void) ident;	/* 4b stores the target identity from here */
-					/* 4a only resets the held page */
+					wr_target_rloc.spcOid = ident[0];
+					wr_target_rloc.dbOid = ident[1];
+					wr_target_rloc.relNumber = ident[2];
+					wr_target_fork = (ForkNumber) ident[3];
+					wr_target_blk = (BlockNumber) ident[4];
+					wr_have_target = true;
 					memset(held_page.data, 0, BLCKSZ);
 					break;
 				}
@@ -339,7 +474,6 @@ WalRedoMain(int argc, char *argv[])
 					char	   *recbuf;
 					DecodedXLogRecord *decoded;
 					char	   *errm = NULL;
-					const char *msg;
 
 					if (!read_u64(&start_lsn) || !read_u64(&end_lsn) ||
 						!read_u32(&len))
@@ -408,18 +542,43 @@ WalRedoMain(int argc, char *argv[])
 					wr_reader->record = decoded;
 
 					/*
-					 * 4b step 1 is decode only: the record is validated and
-					 * decodable, but rm_redo is not wired yet (it needs a
-					 * standalone-backend bring-up; see WAL_REDO.md).  Fail
-					 * explicitly rather than continuing -- the protocol has no
-					 * success ack, so a later GET would otherwise hand back the
-					 * unmodified base page, indistinguishable from a real apply.
-					 * The message is emitted once, immediately before exit, so it
-					 * cannot accumulate on a long-lived stderr pipe.
+					 * Run the record's resource-manager redo against the held page.
+					 * Stage the held page into the target buffer (its pd_lsn drives
+					 * the BLK_DONE/BLK_NEEDS_REDO gating), zero the scratch buffer,
+					 * then dispatch rm_redo with the buffer manager redirected
+					 * (am_walredo) so XLogReadBufferExtended resolves to those
+					 * buffers.  Read the materialized page back for GET.
 					 */
-					msg = "wal-redo: APPLY decoded the record but rm_redo is not implemented yet (4b step 2)\n";
-					write(STDERR_FILENO, msg, strlen(msg));
-					proc_exit(2);
+					wr_ensure_buffers();
+
+					/*
+					 * Make the target buffer report the WAL block identity, so redo
+					 * that writes the buffer's block number into the page (e.g.
+					 * heap lock/confirm resetting t_ctid via BufferGetBlockNumber)
+					 * records the real block, not the temp relation's block 0.  We
+					 * never look these buffers up by tag, so retagging the local
+					 * descriptor in place is safe.
+					 */
+					InitBufferTag(&GetLocalBufferDescriptor(-wr_target_buf - 1)->tag,
+								  &wr_target_rloc, wr_target_fork, wr_target_blk);
+
+					memcpy(BufferGetPage(wr_target_buf), held_page.data, BLCKSZ);
+					memset(BufferGetPage(wr_scratch_buf), 0, BLCKSZ);
+
+					am_walredo = true;
+					RmgrTable[XLogRecGetRmid(wr_reader)].rm_redo(wr_reader);
+					am_walredo = false;
+
+					memcpy(held_page.data, BufferGetPage(wr_target_buf), BLCKSZ);
+
+					/*
+					 * Free this record's allocations; a long-lived/pooled helper
+					 * applies many records and would otherwise grow without bound.
+					 */
+					wr_reader->record = NULL;
+					pfree(decoded);
+					pfree(recbuf);
+					break;
 				}
 
 			case WALREDO_GET:
