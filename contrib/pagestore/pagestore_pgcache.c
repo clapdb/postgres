@@ -5,10 +5,20 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "pagestore_pgcache.h"
+
+/*
+ * Reads run concurrently across shard workers (under a shared read lock) and
+ * both lookup and insert mutate the CLOCK state (ref bits, hand, buckets,
+ * counters), so serialize cache access with this lock.  Writers hold the
+ * daemon's exclusive lock and SPDK completions insert here too; all go through
+ * these functions, so a single cache lock covers every mutator.
+ */
+static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct PgKey
 {
@@ -122,15 +132,18 @@ ps_pgcache_lookup(uint32_t tl, const PsKey *key, uint32_t block,
 
 	if (cache_max == 0)
 		return 0;
+	pthread_mutex_lock(&cache_lock);
 	s = find_slot(tl, key, block, version_lsn, NULL);
 	if (s < 0)
 	{
 		st_misses++;
+		pthread_mutex_unlock(&cache_lock);
 		return 0;
 	}
 	slots[s].ref = 1;			/* re-reference: survives the next sweep */
 	memcpy(out, pages + (size_t) s * cache_psz, cache_psz);
 	st_hits++;
+	pthread_mutex_unlock(&cache_lock);
 	return 1;
 }
 
@@ -157,11 +170,13 @@ ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
 
 	if (cache_max == 0)
 		return;
+	pthread_mutex_lock(&cache_lock);
 	s = find_slot(tl, key, block, version_lsn, &b);
 	if (s >= 0)
 	{							/* already present: refresh bytes + reference */
 		memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
 		slots[s].ref = 1;
+		pthread_mutex_unlock(&cache_lock);
 		return;
 	}
 
@@ -190,6 +205,7 @@ ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
 	memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
 	slots[s].hnext = buckets[b];
 	buckets[b] = s;
+	pthread_mutex_unlock(&cache_lock);
 }
 
 void

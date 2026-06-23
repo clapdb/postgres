@@ -16,6 +16,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,52 +29,159 @@
 static char posix_dir[2048];
 
 /*
- * One cached OS fd per segment id (opened lazily, never closed during a run).
- * Only the segment log keeps fds; the WAL and metadata logs open per call,
- * matching the original daemon (they are not on the hot path).
+ * One cached OS fd per segment shard+id (opened lazily, never closed during a
+ * run).  Only the segment log keeps fds; the WAL and metadata logs open per
+ * call, matching the original daemon (they are not on the hot path).
+ *
+ * Reads run concurrently across shard workers (the daemon holds only a shared
+ * read lock), and any of them can open a segment in any storage shard, so the
+ * fd-cache structures below are shared mutable state.  seg_fds_lock serializes
+ * their growth and the lazy open/cache, which happen rarely (once per segment
+ * file) and so are not on the hot path.
  */
-static int *seg_fds;
-static int	segs_cap;
+static int **seg_fds;
+static int *seg_fds_caps;
+static int seg_shards_cap;
+static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
-seg_path(char *buf, size_t buflen, int id)
+seg_path(char *buf, size_t buflen, uint32_t shard, int seg)
 {
-	snprintf(buf, buflen, "%s/seg_%08d", posix_dir, id);
+	/*
+	 * Shard 0 keeps the pre-sharding filename "seg_<id>" so stores written by
+	 * earlier (single-shard) versions are still discovered and read; only the
+	 * additional shards use the "seg_<shard>_<id>" form.
+	 */
+	if (shard == 0)
+		snprintf(buf, buflen, "%s/seg_%08d", posix_dir, seg);
+	else
+		snprintf(buf, buflen, "%s/seg_%u_%08d", posix_dir, shard, seg);
 }
 
-/* Return a cached fd for segment 'id', opening (optionally creating) it once. */
+static void
+free_shard_caches(void)
+{
+	for (int i = 0; i < seg_shards_cap; i++)
+	{
+		int *fds = seg_fds[i];
+		int cap = seg_fds_caps[i];
+
+		if (!fds)
+			continue;
+		for (int id = 0; id < cap; id++)
+			if (fds[id] >= 0)
+				close(fds[id]);
+		free(fds);
+	}
+	free(seg_fds);
+	free(seg_fds_caps);
+	seg_fds = NULL;
+	seg_fds_caps = NULL;
+	seg_shards_cap = 0;
+}
+
 static int
-seg_fd(int id, int create)
+ensure_shard_slot(uint32_t shard)
+{
+	if (shard < (uint32_t) seg_shards_cap)
+		return 0;
+
+	/* expand to exactly shard+1 because shard count is tiny and bounded by config */
+	{
+		int		new_cap = (int) shard + 1;
+		int	**nfds;
+		int	*ncaps;
+
+		nfds = realloc(seg_fds, (size_t) new_cap * sizeof(*nfds));
+		ncaps = realloc(seg_fds_caps, (size_t) new_cap * sizeof(*ncaps));
+		if (!nfds || !ncaps)
+		{
+			free(nfds);
+			free(ncaps);
+			return -1;
+		}
+		for (int i = seg_shards_cap; i < new_cap; i++)
+		{
+			nfds[i] = NULL;
+			ncaps[i] = 0;
+		}
+		seg_fds = nfds;
+		seg_fds_caps = ncaps;
+		seg_shards_cap = new_cap;
+	}
+	return 0;
+}
+
+/* Return a cached fd for shard-local segment 'seg', opening (optionally creating)
+ * it once. */
+static int
+seg_fd(uint32_t shard, int seg, int create)
 {
 	char		path[4096];
-	int			fd;
+	int		fd;
+	int		*fds;
+	int		cap;
+	int		result = -1;
 
-	if (id < segs_cap && seg_fds[id] >= 0)
-		return seg_fds[id];
+	/*
+	 * Serialize the whole lookup/grow/open: concurrent shard workers can hit
+	 * this for any storage shard at once.  The cached fd is returned on
+	 * subsequent calls, so the lock is contended only on the first open of each
+	 * segment file.
+	 */
+	pthread_mutex_lock(&seg_fds_lock);
 
-	if (id >= segs_cap)
+	if (ensure_shard_slot(shard) != 0)
+		goto out;
+
+	fds = seg_fds[shard];
+	cap = seg_fds_caps[shard];
+	if (!fds)
 	{
-		int			newcap = (id + 16) * 2;
+		fds = NULL;
+		cap = 0;
+	}
+	if (seg >= cap)
+	{
+		int		new_cap = (seg + 16) * 2;
+		int		*nfds;
 
-		seg_fds = realloc(seg_fds, (size_t) newcap * sizeof(int));
-		for (int i = segs_cap; i < newcap; i++)
-			seg_fds[i] = -1;
-		segs_cap = newcap;
+		nfds = realloc(fds, (size_t) new_cap * sizeof(int));
+		if (!nfds)
+			goto out;
+		for (int i = cap; i < new_cap; i++)
+			nfds[i] = -1;
+		seg_fds[shard] = nfds;
+		seg_fds_caps[shard] = new_cap;
+		fds = nfds;
+	}
+	if (fds[seg] >= 0)
+	{
+		result = fds[seg];
+		goto out;
 	}
 
-	seg_path(path, sizeof(path), id);
+	seg_path(path, sizeof(path), shard, seg);
 	fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
 	if (fd >= 0)
-		seg_fds[id] = fd;
-	return fd;
+		fds[seg] = fd;
+	result = fd;
+
+out:
+	pthread_mutex_unlock(&seg_fds_lock);
+	return result;
 }
 
 static int
 posix_open(const char *path, uint64_t segment_size)
 {
-	(void) segment_size;		/* the file backend has no fixed-region layout */
+	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
 		return -1;
+
+	seg_fds = NULL;
+	seg_fds_caps = NULL;
+	seg_shards_cap = 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	return 0;
 }
@@ -81,27 +189,31 @@ posix_open(const char *path, uint64_t segment_size)
 static void
 posix_close(void)
 {
-	for (int id = 0; id < segs_cap; id++)
-		if (seg_fds[id] >= 0)
-			close(seg_fds[id]);
-	free(seg_fds);
-	seg_fds = NULL;
-	segs_cap = 0;
+	free_shard_caches();
 }
 
 static int
 posix_sync(void)
 {
-	for (int id = 0; id < segs_cap; id++)
-		if (seg_fds[id] >= 0 && fsync(seg_fds[id]) != 0)
-			return -1;
+	for (int shard = 0; shard < seg_shards_cap; shard++)
+	{
+		int *fds = seg_fds[shard];
+		int cap = seg_fds_caps[shard];
+
+		if (!fds)
+			continue;
+		for (int id = 0; id < cap; id++)
+			if (fds[id] >= 0 && fsync(fds[id]) != 0)
+				return -1;
+	}
 	return 0;
 }
 
 static int
-posix_seg_write(int seg, uint64_t off, const void *buf, uint32_t len)
+posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
+			uint32_t len)
 {
-	int			fd = seg_fd(seg, 1);
+	int		fd = seg_fd(shard, seg, 1);
 
 	if (fd < 0)
 		return -1;
@@ -111,9 +223,9 @@ posix_seg_write(int seg, uint64_t off, const void *buf, uint32_t len)
 }
 
 static int
-posix_seg_read(int seg, uint64_t off, void *buf, uint32_t len)
+posix_seg_read(uint32_t shard, int seg, uint64_t off, void *buf, uint32_t len)
 {
-	int			fd = seg_fd(seg, 0);
+	int		fd = seg_fd(shard, seg, 0);
 
 	if (fd < 0)
 		return -1;
@@ -123,12 +235,12 @@ posix_seg_read(int seg, uint64_t off, void *buf, uint32_t len)
 }
 
 static int64_t
-posix_seg_size(int seg)
+posix_seg_size(uint32_t shard, int seg)
 {
 	char		path[4096];
 	struct stat st;
 
-	seg_path(path, sizeof(path), seg);
+	seg_path(path, sizeof(path), shard, seg);
 	if (stat(path, &st) != 0)
 		return -1;
 	return (int64_t) st.st_size;
@@ -136,10 +248,10 @@ posix_seg_size(int seg)
 
 static int
 posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
-				 const void *b, uint32_t blen)
+			 const void *b, uint32_t blen)
 {
 	char		path[4096];
-	int			fd;
+	int		fd;
 
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
@@ -159,7 +271,7 @@ static int
 posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
 	char		path[4096];
-	int			fd;
+	int		fd;
 	ssize_t		n;
 
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
@@ -175,7 +287,7 @@ static int
 posix_meta_append(const void *buf, uint32_t len)
 {
 	char		path[4096];
-	int			fd;
+	int		fd;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
 	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
@@ -194,7 +306,7 @@ static int
 posix_meta_read(uint64_t off, void *buf, uint32_t len)
 {
 	char		path[4096];
-	int			fd;
+	int		fd;
 	ssize_t		n;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);

@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		4
+#define PS_SHM_VERSION		5
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -86,6 +86,34 @@ typedef struct PsKey
 	int32_t		forkNum;
 } PsKey;
 
+/* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
+ * stable enough for shard selection, and it is reused for client+daemon key->shard.
+ */
+static inline uint32_t
+ps_fnv1a32(const void *data, size_t n)
+{
+	const unsigned char *p = (const unsigned char *) data;
+	uint32_t		h = 2166136261u;
+
+	for (size_t i = 0; i < n; i++)
+	{
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* Shard this key belongs to; timeline/block must not be involved in routing so
+ * READV/WRITEV stay on one shard for a single relation.  nshards=0 means 1.
+ */
+static inline uint32_t
+ps_key_shard(const PsKey *key, uint32_t nshards)
+{
+	if (nshards <= 1)
+		return 0;
+	return ps_fnv1a32(key, sizeof(*key)) % nshards;
+}
+
 /* One channel = one backend's mailbox. */
 typedef struct PsChannel
 {
@@ -109,6 +137,7 @@ typedef struct PsChannel
 	/* result */
 	uint32_t	status;
 	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1 */
+	uint32_t	shard;			/* key-owner shard for this request */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
@@ -121,7 +150,8 @@ typedef struct PsShmHeader
 	uint32_t	page_size;		/* logical page size negotiated with engine */
 	uint32_t	io_unit;		/* == PS_IO_UNIT */
 	uint32_t	nchannels;
-	uint32_t	pad0;
+	uint32_t	nshards;		/* channel pools = channel index mod nshards */
+	uint32_t	pad0;			/* reserved */
 	uint64_t	channel_stride;
 	uint64_t	channels_off;
 } PsShmHeader;

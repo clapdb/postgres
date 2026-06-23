@@ -27,6 +27,7 @@
 /* One stored version of a page: its LSN and where the bytes live in the store. */
 typedef struct PageVer
 {
+	uint32_t	shard;			/* segment shard that stores this version */
 	uint64_t	lsn;			/* the page's pd_lsn when it was written */
 	int			seg;			/* segment id holding the bytes */
 	uint64_t	off;			/* byte offset of the page within that segment */
@@ -40,6 +41,7 @@ extern int	compact_layers;		/* compact a timeline past this many image layers */
 extern int	cache_pages;		/* materialized-page cache size (pages; 0=off) */
 extern int	use_layers;			/* rebuild read state from layers (vs segments) */
 extern const PsStorage *ps_storage;
+extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
 extern int	ps_core_open(const char *store_dir);

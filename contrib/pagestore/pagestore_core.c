@@ -56,17 +56,14 @@ int			use_layers = 1;
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
 
+/* configured logical shards for this daemon (set by frontend main before open()) */
+uint32_t	ps_nshards = 1;
+
 /*
- * Per-shard state (LSM phase 9, sharding step 2).  One thread per shard will own
- * its index / staging / cache lock-free; the shard is chosen from the logical
- * key only (block- and timeline-independent), so a key's blocks and all its
- * timelines live on one shard.  NSHARDS == 1 for now -- behavior identical to
- * the old single global state -- and shard_for() hashes the key once NSHARDS > 1.
- *
- * Each shard's memtable stages recent page versions and flushes them into
- * immutable image layers (writes still also go to the segment log, the source of
- * truth).  (The segment append cursor and layer-id allocator stay global for now;
- * they become per-shard with per-shard segment namespaces / manifests in step 4.)
+ * Per-shard state (step 4 target in practice): one thread per shard owns index
+ * / staging / cache lock-free; the shard is chosen from the logical key only
+ * (block- and timeline-independent), so a key's blocks and all its timelines
+ * stay on one shard.
  */
 #define IDX_BUCKETS		(1 << 16)
 #define IDX_MASK		(IDX_BUCKETS - 1)
@@ -75,28 +72,65 @@ struct PageEnt;
 struct ForkEnt;
 struct WalIdxEnt;
 
+#define MAX_SHARDS		PS_MAX_CHANNELS
+#define LAYER_ID_SHARD_BITS	16
+#define LAYER_ID_LOCAL_BITS	(64 - LAYER_ID_SHARD_BITS)
+#define LAYER_ID_SHARD_MASK	((uint64_t) (((uint64_t) 1 << LAYER_ID_SHARD_BITS) - 1) << LAYER_ID_LOCAL_BITS)
+#define LAYER_ID_LOCAL_MASK	((uint64_t) ((1ULL << LAYER_ID_LOCAL_BITS) - 1))
+
 typedef struct Shard
 {
 	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
 	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
 	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
 	PsMemtable *memtable;		/* staging -> image layers */
+	uint32_t	id;					/* shard id [0..ps_nshards) this state belongs to */
+	int			cur_seg;			/* segment id for append cursor */
+	uint64_t	cur_off;			/* append cursor byte offset within cur_seg */
+	uint64_t	next_layer_id;		/* next layer-local id for this shard */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
 				rr_seg;
 } Shard;
 
-#define NSHARDS 1
-static Shard g_shards[NSHARDS];
+static Shard g_shards[MAX_SHARDS];
+
+static uint32_t
+core_shards(void)
+{
+	if (ps_nshards == 0)
+		return 1;
+	return ps_nshards > PS_MAX_CHANNELS ? PS_MAX_CHANNELS : ps_nshards;
+}
+
+static uint32_t
+layer_shard_from_id(uint64_t layer_id)
+{
+	return (uint32_t) ((layer_id & LAYER_ID_SHARD_MASK) >>
+					   LAYER_ID_LOCAL_BITS);
+}
+
+static uint64_t
+layer_local_id(uint64_t layer_id)
+{
+	return layer_id & LAYER_ID_LOCAL_MASK;
+}
+
+static uint64_t
+layer_id(uint32_t shard, uint64_t local_id)
+{
+	return ((uint64_t) shard << LAYER_ID_LOCAL_BITS) | (local_id & LAYER_ID_LOCAL_MASK);
+}
 
 static Shard *
 shard_for(const PsKey *key)
 {
-	(void) key;					/* NSHARDS == 1: always shard 0 */
-	return &g_shards[0];
-}
+	uint32_t ns = core_shards();
 
-static uint64_t g_next_layer_id = 1;	/* global for now (per-shard in step 4) */
+	if (ns == 1 || !key)
+		return &g_shards[0];
+	return &g_shards[ps_key_shard(key, ns)];
+}
 
 uint32_t
 ps_core_layer_count(void)
@@ -112,8 +146,9 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 	uint64_t	m = 0,
 				l = 0,
 				s = 0;
+	uint32_t	ns = core_shards();
 
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	for (uint32_t i = 0; i < ns; i++)
 	{
 		m += g_shards[i].rr_mem;
 		l += g_shards[i].rr_layer;
@@ -130,8 +165,11 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 static uint64_t
 alloc_layer_id(void *ctx)
 {
-	(void) ctx;
-	return g_next_layer_id++;
+	Shard *s = (Shard *) ctx;
+
+	if (!s)
+		s = &g_shards[0];
+	return layer_id(s->id, s->next_layer_id++);
 }
 
 static int
@@ -146,7 +184,7 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 /* ===================== compaction & GC (LSM phase 3) =================== */
 
 static uint32_t
-count_image_layers(uint32_t timeline)
+count_image_layers(uint32_t timeline, uint32_t shard)
 {
 	uint32_t	c = 0;
 
@@ -154,7 +192,8 @@ count_image_layers(uint32_t timeline)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline &&
+			layer_shard_from_id(d->layer_id) == shard)
 			c++;
 	}
 	return c;
@@ -201,10 +240,10 @@ gc_resume(void)
  * horizon is a later step.
  */
 static int
-compact_timeline(uint32_t timeline)
+compact_timeline(uint32_t timeline, uint32_t shard)
 {
 	PsLayerDesc *old;
-	uint32_t	nold = count_image_layers(timeline);
+	uint32_t	nold = count_image_layers(timeline, shard);
 	PsImgRec   *recs = NULL;
 	unsigned char **pages = NULL;
 	uint32_t	nrec = 0,
@@ -224,7 +263,9 @@ compact_timeline(uint32_t timeline)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline)
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			d->timeline == timeline &&
+			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
 	}
 
@@ -280,7 +321,7 @@ compact_timeline(uint32_t timeline)
 		goto cleanup;
 
 	/* install the new merged layer durably, THEN delete the old ones */
-	nid = alloc_layer_id(NULL);
+	nid = alloc_layer_id(&g_shards[shard]);
 	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
 							 &newdesc) != 0 || record_layer(NULL, &newdesc) != 0)
 		goto cleanup;
@@ -327,8 +368,7 @@ typedef struct SegRecHdr
  * storage backend's business (see pagestore_storage.h).  Here we keep only the
  * append cursor (cur_seg, cur_off) marking where the next record goes.
  */
-static int	cur_seg = -1;		/* segment currently being appended (-1: none yet) */
-static uint64_t cur_off;		/* append cursor within cur_seg */
+/* append cursors are kept per-shard in g_shards[].cur_seg / cur_off */
 
 /* ===================== in-memory indexes =============================== */
 
@@ -437,7 +477,7 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  */
 static void
 page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t lsn, int seg, uint64_t off)
+				 uint64_t lsn, uint32_t shard, int seg, uint64_t off)
 {
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
@@ -457,6 +497,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->cap = e->cap ? e->cap * 2 : 2;
 		e->vers = realloc(e->vers, (size_t) e->cap * sizeof(PageVer));
 	}
+	e->vers[e->nver].shard = shard;
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
@@ -929,10 +970,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
-	if (cur_seg < 0 || cur_off + reclen > segment_size)
+	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
 	{
-		cur_seg = (cur_seg < 0) ? 0 : cur_seg + 1;
-		cur_off = 0;
+		s->cur_seg = (s->cur_seg < 0) ? 0 : s->cur_seg + 1;
+		s->cur_off = 0;
 	}
 
 	hdr.magic = SEG_MAGIC;
@@ -943,15 +984,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
-	if (ps_storage->seg_write(cur_seg, cur_off, &hdr, sizeof(hdr)) != 0)
+	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
-	data_off = cur_off + sizeof(hdr);
-	if (ps_storage->seg_write(cur_seg, data_off, page, page_size) != 0)
+	data_off = s->cur_off + sizeof(hdr);
+	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, hdr.lsn, cur_seg, data_off);
-	cur_off += reclen;
+	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
+	s->cur_off += reclen;
 
 	/* stage the version for the LSM memtable; flush to an image layer when full
 	 * (additive in phase 2 -- the segment write above is still authoritative) */
@@ -960,13 +1001,13 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
 		if (ps_memtable_full(s->memtable))
 		{
-			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, NULL);
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
 			/* backpressure only: normal compaction runs off the write path in
 			 * ps_core_maintenance() when the daemon is idle.  Compact inline
 			 * here only if the layer count is running away far past the
 			 * threshold (writes outpacing background compaction). */
-			if (count_image_layers(timeline) > (uint32_t) compact_layers * 4)
-				compact_timeline(timeline);
+			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
+				compact_timeline(timeline, s->id);
 		}
 	}
 	return 0;
@@ -978,7 +1019,7 @@ read_version(const PageVer *v, unsigned char *out)
 {
 	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
-	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
+	if (ps_storage->seg_read(v->shard, v->seg, v->off, out, page_size) != 0)
 		return -1;
 	return 0;
 }
@@ -1093,13 +1134,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * is simply treated as end-of-log (the magic/len check below stops the scan).
  */
 static void
-recover(void)
+recover(uint32_t shard)
 {
+	Shard	   *s = &g_shards[shard];
+
+	s->cur_seg = -1;
+	s->cur_off = 0;
+
 	for (int id = 0;; id++)
 	{
 		uint64_t	off = 0;
 
-		if (ps_storage->seg_size(id) < 0)
+		if (ps_storage->seg_size(shard, id) < 0)
 			break;				/* no more segments -> done */
 
 		/* replay records until one fails to validate (end of log) */
@@ -1107,23 +1153,23 @@ recover(void)
 		{
 			SegRecHdr	hdr;
 
-			if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
+			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0 ||
 				hdr.magic != SEG_MAGIC || hdr.len != page_size)
 				break;
 
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
+			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, shard, id,
 							 off + sizeof(hdr));
 			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
 
 		/* this segment is the newest seen so far; append continues after it */
-		cur_seg = id;
-		cur_off = off;
+		s->cur_seg = id;
+		s->cur_off = off;
 	}
-	if (cur_seg >= 0)
-		fprintf(stderr, "pagestore_daemon: recovered through segment %d (off %llu)\n",
-				cur_seg, (unsigned long long) cur_off);
+	if (s->cur_seg >= 0)
+		fprintf(stderr, "pagestore_daemon: recovered shard %u through segment %d (off %llu)\n",
+				shard, s->cur_seg, (unsigned long long) s->cur_off);
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -1241,7 +1287,7 @@ rebuild_from_layers(void)
 		for (uint32_t j = 0; j < n; j++)
 		{
 			page_add_version(d->timeline, &idx[j].key, idx[j].block,
-							 idx[j].lsn, -1, 0);
+							 idx[j].lsn, shard_for(&idx[j].key)->id, -1, 0);
 			fork_grow(d->timeline, &idx[j].key, idx[j].block + 1);
 		}
 		free(idx);
@@ -1253,13 +1299,15 @@ rebuild_from_layers(void)
 void
 ps_core_close(void)
 {
-	for (uint32_t i = 0; i < NSHARDS; i++)
+	uint32_t	ns = core_shards();
+
+	for (uint32_t i = 0; i < ns; i++)
 	{
 		Shard	   *s = &g_shards[i];
 
 		if (s->memtable)
 		{
-			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, NULL);
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
 			ps_memtable_destroy(s->memtable);
 			s->memtable = NULL;
 		}
@@ -1278,15 +1326,20 @@ ps_core_close(void)
 int
 ps_core_maintenance(void)
 {
+	uint32_t	ns;
+
 	if (!use_layers)
 		return 0;
+	ns = core_shards();
+
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if ((tl == 0 || timelines[tl].defined) &&
-			count_image_layers(tl) > (uint32_t) compact_layers)
-		{
-			compact_timeline(tl);
-			return 1;
-		}
+		for (uint32_t sh = 0; sh < ns; sh++)
+			if ((tl == 0 || timelines[tl].defined) &&
+				count_image_layers(tl, sh) > (uint32_t) compact_layers)
+			{
+				compact_timeline(tl, sh);
+				return 1;
+			}
 	return 0;
 }
 
@@ -1301,6 +1354,8 @@ ps_core_maintenance(void)
 int
 ps_core_open(const char *store_dir)
 {
+	uint32_t	ns = core_shards();
+
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
@@ -1312,17 +1367,29 @@ ps_core_open(const char *store_dir)
 	if (use_layers)
 		gc_resume();			/* finish any GC interrupted by a crash */
 
-	/* layer ids continue past the highest one the manifest restored */
-	g_next_layer_id = 1;
+	/* initialize per-shard state and layer-id cursors */
+	for (uint32_t i = 0; i < ns; i++)
+	{
+		g_shards[i].id = i;
+		g_shards[i].cur_seg = -1;
+		g_shards[i].cur_off = 0;
+		g_shards[i].next_layer_id = 1;
+	}
+	/* layer ids continue past the highest one restored per shard */
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].layer_id >= g_next_layer_id)
-			g_next_layer_id = ps_layer_map.layers[i].layer_id + 1;
+	{
+		uint32_t	sh = layer_shard_from_id(ps_layer_map.layers[i].layer_id);
+		uint64_t	lid = layer_local_id(ps_layer_map.layers[i].layer_id);
+
+		if (sh < ns && lid + 1 > g_shards[sh].next_layer_id)
+			g_shards[sh].next_layer_id = lid + 1;
+	}
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  One
 	 * memtable per shard. */
 	if (use_layers)
-		for (uint32_t i = 0; i < NSHARDS; i++)
+		for (uint32_t i = 0; i < ns; i++)
 		{
 			g_shards[i].memtable = ps_memtable_create(page_size,
 													  (uint32_t) flush_pages);
@@ -1332,9 +1399,8 @@ ps_core_open(const char *store_dir)
 	/* the materialized-page cache helps both read paths (read_resolve and the
 	 * SPDK async path), so it is not gated on use_layers */
 	ps_pgcache_init((uint32_t) cache_pages, page_size);
-	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest "
-			"replay (next layer id %llu)\n", ps_layer_map.nlayers,
-			(unsigned long long) g_next_layer_id);
+	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest replay\n",
+			ps_layer_map.nlayers);
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
@@ -1344,16 +1410,22 @@ ps_core_open(const char *store_dir)
 		/* layers are the durable read state -- rebuild from their indexes and
 		 * position the append cursor at a fresh segment (a cheap stat loop, no
 		 * per-record scan).  Segments are written but no longer scanned. */
-		int			id = 0;
-
 		rebuild_from_layers();
-		while (ps_storage->seg_size(id) >= 0)
-			id++;
-		cur_seg = id;
-		cur_off = 0;
+		for (uint32_t sh = 0; sh < ns; sh++)
+		{
+			int			id = 0;
+
+			while (ps_storage->seg_size(sh, id) >= 0)
+				id++;
+			g_shards[sh].cur_seg = id;
+			g_shards[sh].cur_off = 0;
+		}
 	}
 	else
-		recover();				/* segment scan (SPDK path, or no layers yet) */
+	{
+		for (uint32_t sh = 0; sh < ns; sh++)	/* segment scan (SPDK path, or no layers yet) */
+			recover(sh);
+	}
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)

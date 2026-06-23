@@ -38,12 +38,19 @@ local_close(void)
 }
 
 static int
+layer_id_shard(uint64_t layer_id)
+{
+	return (int) ((layer_id >> 48) & 0xFFFF);
+}
+
+static int
 local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 {
 	int			n;
 
-	n = snprintf(buf, buflen, "%s/layer_%016llx",
-				 layer_dir, (unsigned long long) layer_id);
+	n = snprintf(buf, buflen, "%s/layer_%d_%016llx",
+				 layer_dir, layer_id_shard(layer_id),
+				 (unsigned long long) layer_id);
 	if (n < 0 || (size_t) n >= buflen)
 		return -1;
 	return 0;

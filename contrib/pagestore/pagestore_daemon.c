@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -33,6 +34,15 @@
 #include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
+static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+typedef struct WorkerArgs
+{
+	uint32_t	shard;
+	void	   *shm;
+	uint32_t	nchannels;
+	uint32_t	nshards;
+} WorkerArgs;
 
 static void
 on_signal(int sig)
@@ -103,6 +113,100 @@ handle_request(PsChannel *ch)
 	}
 }
 
+static int
+request_is_write(PsOpcode opcode)
+{
+	switch (opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_IMMEDSYNC:
+			return 1;
+		case PS_OP_EXISTS:
+		case PS_OP_NBLOCKS:
+		case PS_OP_READV:
+		case PS_OP_READ_AT:
+		case PS_OP_WAL_SIZE:
+		case PS_OP_WAL_READ:
+		case PS_OP_WAL_INDEX_GET:
+			return 0;
+		default:
+			return 1;
+	}
+}
+
+static void
+run_request(PsChannel *ch)
+{
+	int			is_write = request_is_write((PsOpcode) ch->opcode);
+
+	if (is_write)
+		pthread_rwlock_wrlock(&core_rwlock);
+	else
+		pthread_rwlock_rdlock(&core_rwlock);
+
+	handle_request(ch);
+	ps_store_release(&ch->state, PS_STATE_DONE);
+
+	pthread_rwlock_unlock(&core_rwlock);
+}
+
+static void *
+shard_worker(void *arg)
+{
+	WorkerArgs *wa = (WorkerArgs *) arg;
+	uint32_t	shard = wa->shard;
+	void	   *shm = wa->shm;
+	uint32_t	nchannels = wa->nchannels;
+	uint32_t	nshards = wa->nshards;
+
+	while (!stop_requested)
+	{
+		int			did_work = 0;
+
+		for (uint32_t i = shard; i < nchannels; i += nshards)
+		{
+			PsChannel  *ch = ps_channel(shm, i);
+
+			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+
+			run_request(ch);
+			did_work = 1;
+		}
+
+		if (!did_work && shard == 0)
+		{
+			int			do_maint = 0;
+
+			pthread_rwlock_wrlock(&core_rwlock);
+			do_maint = ps_core_maintenance();
+			pthread_rwlock_unlock(&core_rwlock);
+			if (!do_maint)
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		else if (!did_work)
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -112,6 +216,7 @@ main(int argc, char **argv)
 	struct sigaction sa;
 	const char *store_dir = NULL;
 	const char *shm_name = NULL;
+	uint32_t	nshards = 1;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -127,6 +232,8 @@ main(int argc, char **argv)
 			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
 			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
+			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
@@ -148,18 +255,20 @@ main(int argc, char **argv)
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
-					"[--page-size N] [--segment-size N] [--storage NAME]\n",
+					"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
 					argv[0]);
 			return 2;
 		}
 	}
-	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT)
+	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT ||
+		nshards == 0 || nshards > PS_MAX_CHANNELS)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
-				"[--page-size N] [--segment-size N] [--storage NAME]\n",
+				"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
 				argv[0]);
 		return 2;
 	}
+	ps_nshards = nshards;
 
 	if (ps_core_open(store_dir) != 0)
 	{
@@ -200,6 +309,7 @@ main(int argc, char **argv)
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
+	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 
@@ -209,36 +319,44 @@ main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 
 	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-			"io_unit=%u channels=%d ready\n",
+			"io_unit=%u channels=%u nshards=%u ready\n",
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
+			PS_MAX_CHANNELS, hdr->nshards);
 
-	while (!stop_requested)
 	{
-		int			did_work = 0;
+		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
+		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		uint32_t	started = 0;
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers || !threads)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
-				continue;
-
-			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
-			did_work = 1;
+			fprintf(stderr, "pagestore_daemon: cannot allocate worker slots\n");
+			free(workers);
+			free(threads);
+			munmap(shm, PS_SHM_SIZE);
+			return 1;
 		}
 
-		if (!did_work)
+		for (uint32_t shard = 0; shard < hdr->nshards; shard++)
 		{
-			/* idle: do one unit of background compaction before sleeping */
-			if (!ps_core_maintenance())
+			workers[shard].shard = shard;
+			workers[shard].shm = shm;
+			workers[shard].nchannels = hdr->nchannels;
+			workers[shard].nshards = hdr->nshards;
+			if (pthread_create(&threads[shard], NULL, shard_worker, &workers[shard]) != 0)
 			{
-				struct timespec ts = {0, 20000};	/* 20us */
-
-				nanosleep(&ts, NULL);
+				fprintf(stderr, "pagestore_daemon: failed to start worker %u\n", shard);
+				stop_requested = 1;
+				break;
 			}
+			started++;
 		}
+
+		for (uint32_t shard = 0; shard < started; shard++)
+			pthread_join(threads[shard], NULL);
+
+		free(workers);
+		free(threads);
 	}
 
 	{

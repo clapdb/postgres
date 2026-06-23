@@ -45,6 +45,9 @@ static int	localsvc_timeline = 0;
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
 static int	ls_channel = -1;
+static uint32	ls_channel_shard = UINT32_MAX;
+static uint32	ls_nchannels = 0;
+static uint32	ls_nshards = 1;
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -61,6 +64,7 @@ ls_detach(int code, Datum arg)
 			/* release the channel for reuse by a future backend */
 			ps_store_release(&ch->claimed, 0);
 			ls_channel = -1;
+			ls_channel_shard = UINT32_MAX;
 		}
 		munmap(ls_shm, PS_SHM_SIZE);
 		ls_shm = NULL;
@@ -112,41 +116,86 @@ ls_attach(void)
 				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
 						   got_page_size, BLCKSZ, hdr->magic, hdr->version)));
 	}
+	ls_shm = shm;
+	ls_shm_fd = fd;
+	ls_nchannels = hdr->nchannels;
+	ls_nshards = hdr->nshards ? hdr->nshards : 1;
+	on_proc_exit(ls_detach, 0);
+}
 
-	/*
-	 * Claim a free channel with an atomic compare-and-swap on its 'claimed'
-	 * flag.  This is the only contended operation between backends; once a
-	 * channel is claimed it is owned exclusively until ls_detach() releases it,
-	 * so all subsequent mailbox traffic on it is single-producer/single-consumer.
-	 */
-	for (uint32 i = 0; i < hdr->nchannels; i++)
+static uint32
+ls_key_shard(const PageStoreRelKey *key)
+{
+	if (!key)
+		return 0;
 	{
-		PsChannel  *ch = ps_channel(shm, i);
+		PsKey	k;
+
+		k.spcOid = key->spcOid;
+		k.dbOid = key->dbOid;
+		k.relNumber = key->relNumber;
+		k.forkNum = key->forkNum;
+		return ps_key_shard(&k, ls_nshards);
+	}
+}
+
+static void
+ls_claim_channel(uint32_t shard)
+{
+	uint32_t stride;
+	uint32_t target;
+
+	ls_attach();
+
+	if (ls_channel >= 0 && ls_channel_shard == shard)
+		return;
+
+	if (ls_channel >= 0)
+	{
+		PsChannel  *old = ps_channel(ls_shm, ls_channel);
+
+		ps_store_release(&old->claimed, 0);
+		ls_channel = -1;
+		ls_channel_shard = UINT32_MAX;
+	}
+
+	if (ls_nchannels == 0 || ls_nshards == 0)
+	{
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: daemon has zero channels")));
+	}
+
+	target = shard % ls_nshards;
+	stride = ls_nshards;
+
+	for (uint32_t i = target; i < ls_nchannels; i += stride)
+	{
+		PsChannel  *ch = ps_channel(ls_shm, i);
 
 		if (ps_cas(&ch->claimed, 0, 1))
 		{
+			ch->shard = target;
 			ls_channel = (int) i;
-			break;
+			ls_channel_shard = target;
+			return;
 		}
 	}
-	if (ls_channel < 0)
-	{
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc: no free channel (max %d)",
-						PS_MAX_CHANNELS)));
-	}
+	ereport(ERROR,
+			(errmsg("pagestore localsvc: no free channel in shard %u (max %u)",
+					target, ls_nchannels)));
+}
 
-	ls_shm = shm;
-	ls_shm_fd = fd;
-	on_proc_exit(ls_detach, 0);
+static PsChannel *
+ls_chan_for_key(const PageStoreRelKey *key)
+{
+	ls_claim_channel(ls_key_shard(key));
+	return ps_channel(ls_shm, ls_channel);
 }
 
 static PsChannel *
 ls_chan(void)
 {
-	ls_attach();
+	ls_claim_channel(0);
 	return ps_channel(ls_shm, ls_channel);
 }
 
@@ -173,6 +222,7 @@ static void
 ls_exec(PsChannel *ch)
 {
 	uint32		spins = 0;
+	ch->shard = ls_channel_shard;
 
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
@@ -194,6 +244,7 @@ ls_exec(PsChannel *ch)
 static void
 ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 {
+	ch->shard = ls_channel_shard;
 	ch->key.spcOid = key->spcOid;
 	ch->key.dbOid = key->dbOid;
 	ch->key.relNumber = key->relNumber;
@@ -217,7 +268,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
@@ -229,7 +280,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
@@ -241,7 +292,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
@@ -253,7 +304,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
@@ -270,7 +321,7 @@ static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
@@ -288,7 +339,7 @@ static void
 ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -317,7 +368,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void **buffers, BlockNumber nblocks,
 		  bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -345,7 +396,7 @@ static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
@@ -370,7 +421,7 @@ static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -387,7 +438,7 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_IMMEDSYNC;
@@ -398,7 +449,7 @@ static bool
 ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 			   BlockNumber nblocks, int *out_fd, uint64 *out_offset)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	if (nblocks > LS_MAX_PAGES_PER_OP)
 		ereport(ERROR,
@@ -445,7 +496,7 @@ void
 pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 						   uint64 lsn, void *out)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_READ_AT;
@@ -497,7 +548,7 @@ void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
@@ -510,7 +561,7 @@ pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 int
 pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_GET;
@@ -526,7 +577,7 @@ int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn_max, uint64 *out, int maxn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	int			n;
 
 	ls_fill_key(ch, key);

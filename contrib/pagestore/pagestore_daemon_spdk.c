@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,6 +39,15 @@
 #define MAX_BLOCKS	128
 
 static volatile sig_atomic_t stop_requested = 0;
+static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+typedef struct WorkerArgs
+{
+	uint32_t	shard;
+	void	   *shm;
+	uint32_t	nchannels;
+	uint32_t	nshards;
+} WorkerArgs;
 
 static void
 on_signal(int sig)
@@ -83,6 +93,35 @@ read_done(void *arg, int ok)
 	{
 		rs->active = 0;			/* clear before publishing DONE */
 		ps_store_release(&rs->ch->state, PS_STATE_DONE);
+	}
+}
+
+static int
+request_is_write(PsOpcode opcode)
+{
+	switch (opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_IMMEDSYNC:
+			return 1;
+		case PS_OP_EXISTS:
+		case PS_OP_NBLOCKS:
+		case PS_OP_READV:
+		case PS_OP_READ_AT:
+		case PS_OP_WAL_SIZE:
+		case PS_OP_WAL_READ:
+		case PS_OP_WAL_INDEX_GET:
+			return 0;
+		default:
+			return 1;
 	}
 }
 
@@ -169,7 +208,7 @@ begin(uint32_t i, PsChannel *ch)
 					bc->block = blk;
 					bc->lsn = v->lsn;
 					bc->dst = dst;
-					ps_spdk_read_async(v->seg, v->off, dst, page_size,
+					ps_spdk_read_async(v->shard, v->seg, v->off, dst, page_size,
 									   read_done, bc);
 				}
 				if (rs->pending == 0)	/* all cached or unwritten */
@@ -209,7 +248,7 @@ begin(uint32_t i, PsChannel *ch)
 				bc->block = ch->blocknum;
 				bc->lsn = v->lsn;
 				bc->dst = ch->data;
-				ps_spdk_read_async(v->seg, v->off, ch->data, page_size,
+				ps_spdk_read_async(v->shard, v->seg, v->off, ch->data, page_size,
 								   read_done, bc);
 				return;
 			}
@@ -219,6 +258,77 @@ begin(uint32_t i, PsChannel *ch)
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			return;
 	}
+}
+
+static void
+run_request(uint32_t i, PsChannel *ch)
+{
+	int			is_write = request_is_write((PsOpcode) ch->opcode);
+
+	if (is_write)
+		pthread_rwlock_wrlock(&core_rwlock);
+	else
+		pthread_rwlock_rdlock(&core_rwlock);
+	begin(i, ch);
+	pthread_rwlock_unlock(&core_rwlock);
+}
+
+static void *
+shard_worker(void *arg)
+{
+	WorkerArgs *wa = (WorkerArgs *) arg;
+	uint32_t	shard = wa->shard;
+	void	   *shm = wa->shm;
+	uint32_t	nchannels = wa->nchannels;
+	uint32_t	nshards = wa->nshards;
+
+	if (ps_spdk_thread_init(shard) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: failed to initialize shard-%u\n", shard);
+		return NULL;
+	}
+
+	while (!stop_requested)
+	{
+		int			did_work = 0;
+
+		for (uint32_t i = shard; i < nchannels; i += nshards)
+		{
+			PsChannel  *ch = ps_channel(shm, i);
+
+			if (reqstate[i].active || ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+
+			run_request(i, ch);
+			did_work = 1;
+		}
+
+		if (ps_spdk_poll(shard) > 0)
+			did_work = 1;
+
+		if (!did_work && shard == 0)
+		{
+			int			do_maint = 0;
+
+			pthread_rwlock_wrlock(&core_rwlock);
+			do_maint = ps_core_maintenance();
+			pthread_rwlock_unlock(&core_rwlock);
+			if (!do_maint)
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		else if (!did_work)
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	ps_spdk_thread_close(shard);
+	return NULL;
 }
 
 int
@@ -231,6 +341,7 @@ main(int argc, char **argv)
 	const char *store_dir = NULL;
 	const char *shm_name = NULL;
 	const char *pci_addr = NULL;
+	uint32_t	nshards = 1;
 
 	ps_storage = &PsStorageSpdk;
 	use_layers = 0;				/* SPDK reads serve by segment offset for now */
@@ -251,21 +362,25 @@ main(int argc, char **argv)
 			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
 			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
+			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-					"[--page-size N] [--segment-size N]\n", argv[0]);
+					"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
 			return 2;
 		}
 	}
-	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT)
+	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT ||
+		nshards == 0 || nshards > PS_MAX_CHANNELS)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-				"[--page-size N] [--segment-size N]\n", argv[0]);
+				"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
 		return 2;
 	}
+	ps_nshards = nshards;
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
 
@@ -301,6 +416,7 @@ main(int argc, char **argv)
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
+	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 
@@ -310,40 +426,44 @@ main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 
 	fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
-			"page_size=%u io_unit=%u channels=%d ready\n",
+			"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
+			PS_MAX_CHANNELS, hdr->nshards);
 
-	/*
-	 * Cross-channel async loop: start every ready request that is not already in
-	 * flight, then drive NVMe completions.  Read requests stay "active" until
-	 * their completions publish DONE, so many overlap on the queue.
-	 */
-	while (!stop_requested)
 	{
-		int			work = 0;
+		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
+		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		uint32_t	started = 0;
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers || !threads)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
+			fprintf(stderr, "pagestore_daemon_spdk: cannot allocate worker slots\n");
+			free(workers);
+			free(threads);
+			munmap(shm, PS_SHM_SIZE);
+			return 1;
+		}
 
-			if (!reqstate[i].active &&
-				ps_load_acquire(&ch->state) == PS_STATE_REQUEST)
+		for (uint32_t shard = 0; shard < hdr->nshards; shard++)
+		{
+			workers[shard].shard = shard;
+			workers[shard].shm = shm;
+			workers[shard].nchannels = hdr->nchannels;
+			workers[shard].nshards = hdr->nshards;
+			if (pthread_create(&threads[shard], NULL, shard_worker, &workers[shard]) != 0)
 			{
-				begin(i, ch);
-				work = 1;
+				fprintf(stderr, "pagestore_daemon_spdk: failed to start worker %u\n", shard);
+				stop_requested = 1;
+				break;
 			}
+			started++;
 		}
 
-		if (ps_spdk_poll() > 0)
-			work = 1;
+		for (uint32_t shard = 0; shard < started; shard++)
+			pthread_join(threads[shard], NULL);
 
-		if (!work)
-		{
-			struct timespec ts = {0, 20000};	/* 20us */
-
-			nanosleep(&ts, NULL);
-		}
+		free(workers);
+		free(threads);
 	}
 
 	{

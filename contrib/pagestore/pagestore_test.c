@@ -36,6 +36,7 @@
 
 static int	tests_run = 0;
 static int	tests_failed = 0;
+static uint32_t test_nshards = 1;
 
 static void check(int cond, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -75,6 +76,7 @@ static void *cl_shm;
 static int	cl_shm_fd;
 static int	cl_chan;
 static uint32_t cl_page_size;
+static uint32_t cl_nshards = 1;
 
 static void
 client_attach(const char *shm_name, uint32_t expect_page_size)
@@ -98,6 +100,7 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 	check(hdr->magic == PS_SHM_MAGIC, "shm magic");
 	check(hdr->page_size == expect_page_size,
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
+	cl_nshards = hdr->nshards ? hdr->nshards : 1;
 	cl_page_size = hdr->page_size;
 
 	cl_chan = -1;
@@ -480,7 +483,7 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm, const char *store,
-			 uint32_t page_size)
+			 uint32_t page_size, uint32_t nshards)
 {
 	pid_t		pid = fork();
 
@@ -492,13 +495,15 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 	if (pid == 0)
 	{
 		char		psbuf[16];
+		char		shbuf[16];
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
+		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
 		/* small segments exercise rollover; a small flush threshold makes the
 		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
-			  "--page-size", psbuf, "--segment-size", "65536",
-			  "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
+			  "--page-size", psbuf, "--segment-size", "65536", "--nshards",
+			  shbuf, "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}
@@ -572,7 +577,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	pb = malloc(page_size);
 	rb = malloc(page_size);
 
-	dpid = spawn_daemon(daemon_path, shm, store, page_size);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
 
@@ -631,7 +636,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, page_size);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
 
@@ -682,7 +687,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	p = malloc(ps);
 	rb = malloc(ps);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -735,7 +740,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_read_tl(1, REL_B, FORK0, 0, rb);
@@ -792,7 +797,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -823,7 +828,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
@@ -855,7 +860,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -913,7 +918,7 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	wbuf = malloc((size_t) nb * ps);
 	rbuf = malloc((size_t) nb * ps);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -990,7 +995,7 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);		/* parent does not claim a channel */
 
 	for (int i = 0; i < NKIDS; i++)
@@ -1026,10 +1031,16 @@ main(int argc, char **argv)
 
 	if (argc < 2)
 	{
-		fprintf(stderr, "usage: %s <path-to-pagestore_daemon>\n", argv[0]);
+		fprintf(stderr, "usage: %s <path-to-pagestore_daemon> [nshards]\n", argv[0]);
 		return 2;
 	}
 	daemon_path = argv[1];
+	if (argc > 2)
+		test_nshards = (uint32_t) strtoul(argv[2], NULL, 10);
+	if (test_nshards == 0)
+		test_nshards = 1;
+	if (test_nshards > PS_MAX_CHANNELS)
+		test_nshards = PS_MAX_CHANNELS;
 
 	tmpbase = mkdtemp(tmpl);
 	if (!tmpbase)

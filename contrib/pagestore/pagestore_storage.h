@@ -42,9 +42,11 @@ typedef struct PsStorage
 	int			(*sync) (void);
 
 	/* segment log (page-version data); seg_write creates the segment lazily */
-	int			(*seg_write) (int seg, uint64_t off, const void *buf, uint32_t len);
-	int			(*seg_read) (int seg, uint64_t off, void *buf, uint32_t len);
-	int64_t		(*seg_size) (int seg);
+	int			(*seg_write) (uint32_t shard, int seg, uint64_t off,
+						 const void *buf, uint32_t len);
+	int			(*seg_read) (uint32_t shard, int seg, uint64_t off, void *buf,
+						uint32_t len);
+	int64_t		(*seg_size) (uint32_t shard, int seg);
 
 	/*
 	 * Per-timeline shipped-WAL log.  wal_append takes the record header (a) and
