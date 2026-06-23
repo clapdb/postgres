@@ -4,6 +4,7 @@ pagestore_sources = files(
   'backend_localsvc.c',
   'backend_passthrough.c',
   'pagestore.c',
+  'walredo_client.c',
 )
 
 if host_system == 'windows'

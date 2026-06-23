@@ -50,6 +50,7 @@
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
+#include "walredo_client.h"
 
 PG_MODULE_MAGIC;
 
@@ -59,6 +60,7 @@ void		_PG_init(void);
 static bool pagestore_route_all = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
+static char *pagestore_walredo_datadir = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -749,6 +751,46 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * pagestore_walredo_roundtrip(page bytea, base_lsn pg_lsn) returns bytea
+ *
+ * Spawn the wal-redo helper, push 'page' as the base (stamping its page LSN to
+ * base_lsn), and read it back -- a round-trip test of the helper spawn + the
+ * stdin/stdout protocol, independent of any redo.  The returned page matches the
+ * input except pd_lsn (stamped to base_lsn) and pd_checksum (the helper leaves
+ * checksums to the caller).
+ */
+PG_FUNCTION_INFO_V1(pagestore_walredo_roundtrip);
+Datum
+pagestore_walredo_roundtrip(PG_FUNCTION_ARGS)
+{
+	bytea	   *inpage = PG_GETARG_BYTEA_PP(0);
+	XLogRecPtr	base_lsn = PG_GETARG_LSN(1);
+	RelFileLocator rloc = {.spcOid = 1663,.dbOid = 1,.relNumber = 0x7e000000};
+	WalRedoProc *p;
+	char	   *out;
+	bytea	   *result;
+
+	if (VARSIZE_ANY_EXHDR(inpage) != BLCKSZ)
+		ereport(ERROR,
+				(errmsg("page must be exactly %d bytes", BLCKSZ)));
+	if (pagestore_walredo_datadir == NULL || pagestore_walredo_datadir[0] == '\0')
+		ereport(ERROR,
+				(errmsg("pagestore.walredo_datadir is not set")));
+
+	out = palloc(BLCKSZ);
+	p = walredo_start(pagestore_walredo_datadir);
+	walredo_begin(p, rloc, MAIN_FORKNUM, 0);
+	walredo_pushbase(p, base_lsn, VARDATA_ANY(inpage));
+	walredo_get(p, out);
+	walredo_stop(p);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
 void
 _PG_init(void)
 {
@@ -792,6 +834,16 @@ _PG_init(void)
 							   check_backend_name,
 							   assign_backend_name,
 							   NULL);
+
+	DefineCustomStringVariable("pagestore.walredo_datadir",
+							   "Private scratch data directory for the postgres --wal-redo helper.",
+							   "Must be a throwaway initdb'd cluster, never the live one; "
+							   "the helper only ever mutates pages handed to it over the protocol.",
+							   &pagestore_walredo_datadir,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pagestore");
 
