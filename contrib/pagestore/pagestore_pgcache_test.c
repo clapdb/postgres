@@ -36,7 +36,7 @@ fill(unsigned char *p, unsigned char v)
 int
 main(void)
 {
-	PsKey		k = {1, 1, 5, 0};
+	PsKey		k = {1, 1, 5, 0, PS_KLASS_RELATION};
 	unsigned char in[PSZ],
 				out[PSZ];
 	uint64_t	hits,

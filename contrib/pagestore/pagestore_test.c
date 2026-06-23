@@ -156,6 +156,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->key.dbOid = 1;
 	ch->key.relNumber = rel;
 	ch->key.forkNum = fork;
+	ch->key.klass = PS_KLASS_RELATION;
 	ch->timeline = 0;			/* default to the main timeline */
 }
 

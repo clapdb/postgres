@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		5
+#define PS_SHM_VERSION		6	/* 6: PsKey gained the klass discriminator */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -77,13 +77,30 @@ typedef enum PsOpcode
 #define PS_STATUS_OK		0
 #define PS_STATUS_ERROR		1
 
-/* Version-neutral relation-fork identity (mirrors PageStoreRelKey). */
+/*
+ * Object class of a stored key.  Almost everything is a relation fork page
+ * (PS_KLASS_RELATION); the discriminator lets non-relation cluster state -- SLRU
+ * banks (clog/multixact/...), the control file, etc. -- share the same key space,
+ * indexes, segments, layers and cache, distinguished only by klass.  Relation
+ * keys carry PS_KLASS_RELATION (0), so existing behavior is unchanged.  Future
+ * classes reinterpret the spc/db/rel/fork fields as that class needs (e.g. an
+ * SLRU encodes its bank/segment there).
+ */
+typedef enum PsObjClass
+{
+	PS_KLASS_RELATION = 0,		/* a relation fork's page (spc/db/rel/fork) */
+	PS_KLASS_SLRU = 1,			/* an SLRU page (clog, multixact, ...) -- future */
+	PS_KLASS_CONTROL = 2,		/* pg_control / cluster control state -- future */
+} PsObjClass;
+
+/* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */
 typedef struct PsKey
 {
 	uint32_t	spcOid;
 	uint32_t	dbOid;
 	uint32_t	relNumber;
 	int32_t		forkNum;
+	uint32_t	klass;			/* PsObjClass; 0 = relation (default) */
 } PsKey;
 
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and

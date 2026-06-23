@@ -135,6 +135,7 @@ ls_key_shard(const PageStoreRelKey *key)
 		k.dbOid = key->dbOid;
 		k.relNumber = key->relNumber;
 		k.forkNum = key->forkNum;
+		k.klass = PS_KLASS_RELATION;
 		return ps_key_shard(&k, ls_nshards);
 	}
 }
@@ -249,6 +250,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.dbOid = key->dbOid;
 	ch->key.relNumber = key->relNumber;
 	ch->key.forkNum = key->forkNum;
+	ch->key.klass = PS_KLASS_RELATION;	/* the smgr shim only stores relation pages */
 	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
 }
 

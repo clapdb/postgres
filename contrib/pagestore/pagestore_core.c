@@ -444,7 +444,8 @@ static int
 key_eq(const PsKey *a, const PsKey *b)
 {
 	return a->spcOid == b->spcOid && a->dbOid == b->dbOid &&
-		a->relNumber == b->relNumber && a->forkNum == b->forkNum;
+		a->relNumber == b->relNumber && a->forkNum == b->forkNum &&
+		a->klass == b->klass;
 }
 
 /* --- page index (keyed by timeline, key, block) --- */
