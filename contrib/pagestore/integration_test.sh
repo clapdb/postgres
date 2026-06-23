@@ -28,6 +28,7 @@ DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 DATA=$(mktemp -d)/pgdata
 TS=$(mktemp -d)/ts
 STORE=$(mktemp -d)/store
+SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
 SHM=/psint_$$
 PORT=54460
 # connect over TCP: the server's unix-socket directory varies by build/distro,
@@ -47,13 +48,15 @@ assert() {  # $1=actual $2=expected $3=message
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
-	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")"
+	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
+		"$(dirname "$SCRATCH")"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
 
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
+"$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
 DPID=$!
 sleep 0.5
@@ -63,6 +66,7 @@ shared_preload_libraries = 'pagestore'
 pagestore.backend = 'localsvc'
 pagestore.localsvc_shm = '$SHM'
 pagestore.route_user_tablespaces = on
+pagestore.walredo_datadir = '$SCRATCH'
 io_method = sync
 archive_mode = on
 archive_library = 'pagestore'
@@ -159,6 +163,37 @@ else
 	echo "FAIL - could not reconstruct page image from WAL FPI (got '$rebuilt')"
 	fail=1
 fi
+
+# --- 7. full single-page redo: materialize a page as of an LSN (redo_page_asof) -
+# The base full-page image plus every WAL record after it, replayed through the
+# `postgres --wal-redo` helper (rm_redo), must reproduce the live page.
+$P -c "CREATE FUNCTION pagestore_redo_page_asof(regclass,int,int,pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_redo_page_asof' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE EXTENSION IF NOT EXISTS pageinspect;" >/dev/null
+# A fresh insert-only table: checkpoint then two more inserts give block 0 a
+# full-page image (first change after the checkpoint) followed by a pure delta.
+# (Insert-only avoids the hint-bit/pruning divergence that makes an updated
+# heap page's live image differ cosmetically from a WAL reconstruction.)
+a0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE rpa(id int primary key, v text) WITH (autovacuum_enabled=off);
+       INSERT INTO rpa VALUES (1,'asof_one');
+       CHECKPOINT;
+       INSERT INTO rpa VALUES (2,'asof_two');
+       INSERT INTO rpa VALUES (3,'asof_three');" >/dev/null
+alsn=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_index_wal('$a0', '$alsn');" >/dev/null
+# The reconstruction must carry the base full-page image's rows (asof_one,
+# asof_two) AND the delta applied after it (asof_three) -- i.e. it really replayed
+# base + deltas through rm_redo, not just returned the base.  (We assert content
+# rather than a byte-for-byte match: an in-cluster heap page also carries hint
+# bits a WAL reconstruction legitimately does not.)
+asof_all=$($P -c "SELECT position('asof_one'::bytea   in pagestore_redo_page_asof('rpa',0,0,'$alsn')) > 0
+				  AND position('asof_two'::bytea   in pagestore_redo_page_asof('rpa',0,0,'$alsn')) > 0
+				  AND position('asof_three'::bytea in pagestore_redo_page_asof('rpa',0,0,'$alsn')) > 0;")
+assert "$asof_all" "t" "page materialized as of LSN (base FPI + deltas via rm_redo) has all rows"
+# the base image alone would lack the post-FPI delta; confirm it was applied
+asof_base=$($P -c "SELECT position('asof_three'::bytea in pagestore_redo_page('rpa',0,0,'$alsn')) > 0;")
+assert "$asof_base" "f" "the base FPI alone lacks the delta (so the match above came from redo)"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
