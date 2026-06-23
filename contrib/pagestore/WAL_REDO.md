@@ -129,13 +129,17 @@ hack for correctness (isolation from shared buffers / concurrency) and security
 (it only ever sees a base page + record bytes; it can be seccomp-sandboxed, so
 decoding attacker-influenced WAL cannot touch the system).
 
-**Process**: a new `--wal-redo` startup mode (bootstrap-like: no postmaster, no
-catalog access).  Its "buffer pool" is a **small fake buffer table keyed by block
-id**, not a single `BLCKSZ` slot: a record can hold several registered buffers
-live at once (e.g. `btree_xlog_split()` keeps the new right sibling, the original
-page, and possibly the right neighbor pinned until it finishes), so one slot would
-alias releases / overwrite contents.  One entry is the target (kept); the rest are
-scratch (discarded).  Driven by a length-prefixed binary protocol on a pipe pair:
+**Process**: a new `--wal-redo` startup mode (no catalog access; isolated from the
+live cluster).  Note: the build investigation superseded an earlier assumption here
+-- it is **not** bootstrap-like with a fake buffer table.  Running `rm_redo` needs a
+real buffer manager, so the helper is a **standalone backend** (see "Helper init"
+below for the corrected bring-up).  Its buffer pool is a real (small) pool whose
+redirected reads are **keyed by block id**, not a single `BLCKSZ` slot: a record can
+hold several registered buffers live at once (e.g. `btree_xlog_split()` keeps the
+new right sibling, the original page, and possibly the right neighbor pinned until
+it finishes), so one slot would alias releases / overwrite contents.  One entry is
+the target (kept); the rest are scratch (discarded).  Driven by a length-prefixed
+binary protocol on a pipe pair:
 
 | msg | payload | effect |
 |-----|---------|--------|
@@ -360,21 +364,35 @@ investigation pinned down why:
   table" without shared memory is therefore not viable.
 
 So the helper must bring up a **standalone backend**, the way single-user mode
-(`PostgresSingleUserMain`) and Neon's wal-redo process do, against the cluster's
-data directory:
+(`PostgresSingleUserMain`) and Neon's wal-redo process do.  The init must **reuse
+the existing single-user bring-up path, not a hand-rolled sequence** -- the order
+and prerequisites are load-bearing and easy to get wrong:
 
-    postgres --wal-redo -D <datadir>
-
-with roughly this init before the protocol loop:
-
-    InitStandaloneProcess / InitializeGUCOptions / SelectConfigFiles
-    ChangeToDataDir;  CreateDataDirLockFile(false)?  (or attach read-only)
-    BaseInit();                     -- smgr, etc.
-    CreateSharedMemoryAndSemaphores();
-    InitProcess();
-    InitBufferManagerAccess();
-    RmgrStartup();                  -- btree/GIN/GiST/SP-GiST recovery contexts
-    CurrentResourceOwner = ResourceOwnerCreate(NULL, "wal-redo");
+- **Do not invent the order.** `BaseInit()` already calls `InitBufferManagerAccess()`
+  and itself needs `MyProc != NULL`, so shared memory and `InitProcess()` must run
+  *before* `BaseInit()` (and `InitBufferManagerAccess()` must not be called again
+  separately).  The correct order is the one `PostgresSingleUserMain` already uses;
+  the helper should follow/refactor that path rather than reorder it.
+- **The prerequisites before `CreateSharedMemoryAndSemaphores()` are not optional.**
+  The standalone path first runs `LocalProcessControlFile()`,
+  `InitializeMaxBackends()`, the shmem-request hooks and GUC sizing,
+  `RegisterBuiltinShmemCallbacks()`, child-slot/fast-path lock setup, etc.  Skipping
+  them yields an undersized/wrong shared-memory layout and fails later in
+  `InitProcess`/buffer setup.  Again: reuse the path, don't cherry-pick calls.
+- **`-D` must be parsed.** `--wal-redo`'s argv has to go through
+  `process_postgres_switches()` (which records `-D` into `userDoption`) before
+  `SelectConfigFiles`/`ChangeToDataDir`, skipping the leading `--wal-redo`; otherwise
+  the supplied datadir is ignored.
+- **The data directory must not be the live cluster's.** In the materializing path
+  the helper is spawned while the cluster owning the real datadir is *running*, so
+  the single-user `CreateDataDirLockFile()` would FATAL on the postmaster's live
+  `postmaster.pid`.  The helper therefore runs against a **private, throwaway data
+  directory** (a tiny fixed template; it never reads the cluster's relations -- the
+  base page arrives via `PUSHBASE`), not `-D <live datadir>`.  `BLCKSZ` is
+  compile-time, so a generic scratch cluster is parameter-compatible for redo.
+- **Resource managers are started *and* cleaned up.** `RmgrStartup()` at init (for
+  the btree/GIN/GiST/SP-GiST recovery contexts) **and `RmgrCleanup()` at shutdown**;
+  a pooled helper that processes many pages must not leak those contexts.
 
 Then, under an `am_walredo` flag, `XLogReadBufferExtended` is redirected so the
 target block resolves to the held page and other registered blocks to scratch
@@ -385,8 +403,9 @@ blocks unless `WILL_INIT`.  VM/FSM side effects (`visibilitymap_pin`/`clear`,
 (VM/FSM-fork materialization is the deferred 3c-4b follow-up).
 
 This is exactly the piece that cannot be developed blind -- it must be iterated
-against `initdb` + a running cluster -- and it is materially larger than the
-decode step: a standalone-backend bring-up plus the redirect, not a small stub.
+against a real cluster -- and it is materially larger than the decode step: a
+standalone-backend bring-up (reusing the single-user init path, against a private
+data directory) plus the redirect, not a small stub.
 
 ### APPLY body
 
