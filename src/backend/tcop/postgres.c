@@ -4127,14 +4127,25 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
  * process queries. Single user mode specific setup should go here, rather
  * than PostgresMain() or InitPostgres() when reasonably possible.
  */
+/*
+ * Bring up a standalone (no-postmaster) backend's process and shared-memory
+ * environment, in the exact order these prerequisites require: parse switches,
+ * read config + control file, size and create shared memory, and attach a
+ * PGPROC.  This is the load-bearing prefix shared by PostgresSingleUserMain()
+ * and the wal-redo helper (WalRedoMain()); keeping the sequence in one place
+ * avoids the easy-to-get-wrong reordering of these steps.
+ *
+ * On return, shared memory exists and MyProc is set, so the caller may run
+ * BaseInit() (which calls InitBufferManagerAccess()).  The parsed database name
+ * is returned in *dbname; when need_dbname is set and none was given it defaults
+ * to username (FATAL if that is also NULL), matching historical single-user
+ * behaviour.  Callers that open no database (e.g. wal-redo) pass need_dbname =
+ * false.
+ */
 void
-PostgresSingleUserMain(int argc, char *argv[],
-					   const char *username)
+InitStandaloneBackend(int argc, char *argv[], const char *username,
+					  const char **dbname, bool need_dbname, bool require_datadir)
 {
-	const char *dbname = NULL;
-
-	Assert(!IsUnderPostmaster);
-
 	/* Initialize startup process environment. */
 	InitStandaloneProcess(argv[0]);
 
@@ -4146,18 +4157,28 @@ PostgresSingleUserMain(int argc, char *argv[],
 	/*
 	 * Parse command-line options.
 	 */
-	process_postgres_switches(argc, argv, PGC_POSTMASTER, &dbname);
+	process_postgres_switches(argc, argv, PGC_POSTMASTER, dbname);
 
 	/* Must have gotten a database name, or have a default (the username) */
-	if (dbname == NULL)
+	if (need_dbname && *dbname == NULL)
 	{
-		dbname = username;
-		if (dbname == NULL)
+		*dbname = username;
+		if (*dbname == NULL)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("%s: no database nor user name specified",
 							progname)));
 	}
+
+	/*
+	 * Callers that must not silently fall back to PGDATA (e.g. the wal-redo
+	 * helper, which has to run against an explicit private scratch directory and
+	 * never the live cluster) require an explicit -D.
+	 */
+	if (require_datadir && userDoption == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s: -D / --pgdata must be specified", progname)));
 
 	/* Acquire configuration parameters */
 	if (!SelectConfigFiles(userDoption, progname))
@@ -4250,6 +4271,19 @@ PostgresSingleUserMain(int argc, char *argv[],
 	 * before we can use LWLocks.
 	 */
 	InitProcess();
+}
+
+void
+PostgresSingleUserMain(int argc, char *argv[],
+					   const char *username)
+{
+	const char *dbname = NULL;
+
+	Assert(!IsUnderPostmaster);
+
+	/* Shared standalone-backend bring-up: switches, config, shmem, PGPROC.
+	 * Single-user mode keeps the historical PGDATA fallback (require_datadir=false). */
+	InitStandaloneBackend(argc, argv, username, &dbname, true, false);
 
 	/*
 	 * Now that sufficient infrastructure has been initialized, PostgresMain()
