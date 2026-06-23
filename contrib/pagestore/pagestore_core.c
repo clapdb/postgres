@@ -604,6 +604,47 @@ timeline_has_parent(uint32_t timeline)
 }
 
 /*
+ * Ancestry iterator.  A read on a branch resolves against the branch and then
+ * each ancestor, with read_lsn frozen at each branch point so the branch sees a
+ * snapshot of the parent as of the fork.  Several walks (read_through,
+ * read_resolve, walidx_get, the fork-size/exists walks) repeated this loop; this
+ * captures it once.  Usage:
+ *
+ *		TlWalk w = tl_walk_first(timeline, read_lsn);
+ *		do {
+ *			... use w.tl and w.lsn ...
+ *		} while (tl_walk_next(&w));
+ *
+ * Size/existence walks that don't care about LSN pass any read_lsn and ignore
+ * w.lsn; the capping is harmless to them.
+ */
+typedef struct TlWalk
+{
+	uint32_t	tl;				/* current ancestry level */
+	uint64_t	lsn;			/* read_lsn capped to this level's fork point */
+} TlWalk;
+
+static inline TlWalk
+tl_walk_first(uint32_t timeline, uint64_t read_lsn)
+{
+	TlWalk		w = {timeline, read_lsn};
+
+	return w;
+}
+
+/* Advance to the parent, capping lsn at the branch point; 0 at the root. */
+static inline int
+tl_walk_next(TlWalk *w)
+{
+	if (!timeline_has_parent(w->tl))
+		return 0;
+	if (timelines[w->tl].branch_lsn < w->lsn)
+		w->lsn = timelines[w->tl].branch_lsn;
+	w->tl = (uint32_t) timelines[w->tl].parent;
+	return 1;
+}
+
+/*
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
@@ -643,19 +684,17 @@ PageVer *
 read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn)
 {
-	for (;;)
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
+
+	do
 	{
-		PageEnt    *e = page_find(timeline, key, block);
-		PageVer    *v = e ? page_visible(e, read_lsn) : NULL;
+		PageEnt    *e = page_find(w.tl, key, block);
+		PageVer    *v = e ? page_visible(e, w.lsn) : NULL;
 
 		if (v)
 			return v;
-		if (!timeline_has_parent(timeline))
-			return NULL;
-		if (timelines[timeline].branch_lsn < read_lsn)
-			read_lsn = timelines[timeline].branch_lsn;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return NULL;
 }
 
 /*
@@ -674,31 +713,30 @@ static uint32_t
 fork_nblocks_through(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	maxnb = 0;
+	TlWalk		w = tl_walk_first(timeline, 0);	/* size walk: lsn unused */
 
-	for (;;)
+	do
 	{
-		ForkEnt    *e = fork_find(timeline, key);
+		ForkEnt    *e = fork_find(w.tl, key);
 
 		if (e && e->nblocks > maxnb)
 			maxnb = e->nblocks;
-		if (!timeline_has_parent(timeline))
-			return maxnb;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return maxnb;
 }
 
 /* Does the fork exist on 'timeline' or any ancestor? */
 static int
 fork_exists_through(uint32_t timeline, const PsKey *key)
 {
-	for (;;)
+	TlWalk		w = tl_walk_first(timeline, 0);	/* existence walk: lsn unused */
+
+	do
 	{
-		if (fork_find(timeline, key))
+		if (fork_find(w.tl, key))
 			return 1;
-		if (!timeline_has_parent(timeline))
-			return 0;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return 0;
 }
 
 /*
@@ -917,26 +955,22 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 	int			got = 0;
+	TlWalk		w = tl_walk_first(tl, lsn_max);
 
-	for (;;)
+	do
 	{
-		uint32_t	h = page_hash(tl, key, block);
+		uint32_t	h = page_hash(w.tl, key, block);
 		WalIdxEnt  *e;
 
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
-			if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
 				for (int i = 0; i < e->n && got < max_out; i++)
-					if (e->lsns[i] <= lsn_max)
+					if (e->lsns[i] <= w.lsn)
 						out[got++] = e->lsns[i];
 				break;
 			}
-		if (!timeline_has_parent(tl))
-			break;
-		if (timelines[tl].branch_lsn < lsn_max)
-			lsn_max = timelines[tl].branch_lsn;
-		tl = (uint32_t) timelines[tl].parent;
-	}
+	} while (tl_walk_next(&w));
 	return got;
 }
 
@@ -1073,12 +1107,13 @@ int
 read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn, unsigned char *out)
 {
-	uint32_t	tl = timeline;
-	uint64_t	rl = read_lsn;
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
-	for (;;)
+	do
 	{
+		uint32_t	tl = w.tl;
+		uint64_t	rl = w.lsn;
 		PageEnt    *e = page_find(tl, key, block);
 		PageVer    *pv = e ? page_visible(e, rl) : NULL;
 
@@ -1113,12 +1148,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				ps_pgcache_insert(tl, key, block, pv->lsn, out);
 			return served ? 1 : 0;
 		}
-		if (!timeline_has_parent(tl))
-			return 0;
-		if (timelines[tl].branch_lsn < rl)
-			rl = timelines[tl].branch_lsn;
-		tl = (uint32_t) timelines[tl].parent;
-	}
+	} while (tl_walk_next(&w));
+	return 0;
 }
 
 /* ===================== recovery (rebuild index from segments) ========== */
