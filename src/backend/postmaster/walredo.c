@@ -45,8 +45,17 @@
 #include <io.h>
 #endif
 
+#include "access/rmgr.h"
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
+#include "access/xlogrecord.h"
+#include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
 #include "storage/bufpage.h"
+
+/* XLogReader reused across APPLY messages (lazily allocated) */
+static XLogReaderState *wr_reader = NULL;
 
 /* protocol message tags */
 #define WALREDO_BEGIN		'b'
@@ -117,23 +126,6 @@ read_u64(uint64 *v)
 	return read_fully(v, sizeof(*v));
 }
 
-/* discard 'len' bytes from stdin so the stream stays framed */
-static bool
-skip_bytes(uint32 len)
-{
-	char		buf[1024];
-
-	while (len > 0)
-	{
-		uint32		chunk = len < sizeof(buf) ? len : (uint32) sizeof(buf);
-
-		if (!read_fully(buf, chunk))
-			return false;
-		len -= chunk;
-	}
-	return true;
-}
-
 void
 WalRedoMain(int argc, char *argv[])
 {
@@ -146,6 +138,10 @@ WalRedoMain(int argc, char *argv[])
 	_setmode(_fileno(stdin), _O_BINARY);
 	_setmode(_fileno(stdout), _O_BINARY);
 #endif
+
+	/* APPLY decodes records with an XLogReader, which needs a valid segment size */
+	if (wal_segment_size == 0)
+		wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
 
 	for (;;)
 	{
@@ -211,22 +207,88 @@ WalRedoMain(int argc, char *argv[])
 					uint64		start_lsn,
 								end_lsn;
 					uint32		len;
-					const char *msg = "wal-redo: APPLY not implemented yet (4b)\n";
+					char	   *recbuf;
+					DecodedXLogRecord *decoded;
+					char	   *errm = NULL;
+					const char *msg;
 
 					if (!read_u64(&start_lsn) || !read_u64(&end_lsn) ||
 						!read_u32(&len))
 						_exit(1);
-					if (!skip_bytes(len))
+					if (len < SizeOfXLogRecord)
 						_exit(1);
-					(void) start_lsn;	/* used in 4b */
-					(void) end_lsn;
+					recbuf = palloc(len);
+					if (!read_fully(recbuf, len))
+						_exit(1);
 
 					/*
-					 * 4b: decode the record and run its rm_redo against held_page,
-					 * with XLogReadBufferExtended redirected to the held (target)
-					 * and scratch (other) buffers, and VM/FSM side effects stubbed
-					 * per the requested fork.  Not yet implemented.
+					 * This path feeds the bytes straight to DecodeXLogRecord,
+					 * which (unlike XLogReadRecord) does not validate the record,
+					 * so replicate the checks XLogReadRecord would make before
+					 * trusting the record:
+					 *
+					 *  - the header length must equal the framed length, or the
+					 *    decoder could run off the end of recbuf;
+					 *  - the resource manager id must be valid;
+					 *  - the CRC must match, so a damaged chunk that still frames
+					 *    correctly is rejected rather than (once rm_redo is wired)
+					 *    applied as if it were good WAL.
 					 */
+					{
+						XLogRecord *rec = (XLogRecord *) recbuf;
+						pg_crc32c	crc;
+
+						if (rec->xl_tot_len != len)
+							_exit(1);
+						if (!RmgrIdIsValid(rec->xl_rmid))
+							_exit(1);
+
+						INIT_CRC32C(crc);
+						COMP_CRC32C(crc, recbuf + SizeOfXLogRecord,
+									len - SizeOfXLogRecord);
+						COMP_CRC32C(crc, rec, offsetof(XLogRecord, xl_crc));
+						FIN_CRC32C(crc);
+						if (!EQ_CRC32C(crc, rec->xl_crc))
+							_exit(1);
+					}
+
+					if (wr_reader == NULL)
+					{
+						wr_reader = XLogReaderAllocate(wal_segment_size, NULL,
+													   XL_ROUTINE(.page_read = NULL,
+																  .segment_open = NULL,
+																  .segment_close = NULL),
+													   NULL);
+						if (wr_reader == NULL)
+							_exit(1);
+					}
+
+					decoded = palloc(DecodeXLogRecordRequiredSpace(
+										 ((XLogRecord *) recbuf)->xl_tot_len));
+					if (!DecodeXLogRecord(wr_reader, decoded, (XLogRecord *) recbuf,
+										  (XLogRecPtr) end_lsn, &errm))
+						_exit(1);
+
+					/*
+					 * Populate the reader so the XLogRecGet* accessors and (once
+					 * wired) rm_redo see a consistent record, including the start
+					 * and end LSNs used for page-LSN decisions.
+					 */
+					wr_reader->ReadRecPtr = (XLogRecPtr) start_lsn;
+					wr_reader->EndRecPtr = (XLogRecPtr) end_lsn;
+					wr_reader->record = decoded;
+
+					/*
+					 * 4b step 1 is decode only: the record is validated and
+					 * decodable, but rm_redo is not wired yet (it needs a
+					 * standalone-backend bring-up; see WAL_REDO.md).  Fail
+					 * explicitly rather than continuing -- the protocol has no
+					 * success ack, so a later GET would otherwise hand back the
+					 * unmodified base page, indistinguishable from a real apply.
+					 * The message is emitted once, immediately before exit, so it
+					 * cannot accumulate on a long-lived stderr pipe.
+					 */
+					msg = "wal-redo: APPLY decoded the record but rm_redo is not implemented yet (4b step 2)\n";
 					write(STDERR_FILENO, msg, strlen(msg));
 					_exit(2);
 				}
