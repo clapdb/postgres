@@ -208,8 +208,7 @@ WalRedoMain(int argc, char *argv[])
 					char	   *recbuf;
 					DecodedXLogRecord *decoded;
 					char	   *errm = NULL;
-					char		dbg[80];
-					int			n;
+					const char *msg;
 
 					if (!read_u64(&start_lsn) || !read_u64(&end_lsn) ||
 						!read_u32(&len))
@@ -218,6 +217,16 @@ WalRedoMain(int argc, char *argv[])
 						_exit(1);
 					recbuf = palloc(len);
 					if (!read_fully(recbuf, len))
+						_exit(1);
+
+					/*
+					 * This path feeds the bytes straight to DecodeXLogRecord,
+					 * bypassing XLogReadRecord's length/CRC checks, so validate
+					 * the header length against the framed length first: a header
+					 * whose xl_tot_len exceeds the bytes we read would let the
+					 * decoder run off the end of recbuf.
+					 */
+					if (((XLogRecord *) recbuf)->xl_tot_len != len)
 						_exit(1);
 
 					if (wr_reader == NULL)
@@ -236,25 +245,20 @@ WalRedoMain(int argc, char *argv[])
 					if (!DecodeXLogRecord(wr_reader, decoded, (XLogRecord *) recbuf,
 										  (XLogRecPtr) end_lsn, &errm))
 						_exit(1);
-					wr_reader->ReadRecPtr = (XLogRecPtr) start_lsn;
-					wr_reader->EndRecPtr = (XLogRecPtr) end_lsn;
-					wr_reader->record = decoded;
 
 					/*
-					 * 4b step 1 (decode): the record is now decodable via the
-					 * XLogRecGet* accessors.  Running its rm_redo against the held
-					 * page (with the buffer manager redirected) is the next step;
-					 * for now report what was decoded.
+					 * 4b step 1 is decode only: the record is validated and
+					 * decodable, but rm_redo is not wired yet (it needs a
+					 * standalone-backend bring-up; see WAL_REDO.md).  Fail
+					 * explicitly rather than continuing -- the protocol has no
+					 * success ack, so a later GET would otherwise hand back the
+					 * unmodified base page, indistinguishable from a real apply.
+					 * The message is emitted once, immediately before exit, so it
+					 * cannot accumulate on a long-lived stderr pipe.
 					 */
-					n = snprintf(dbg, sizeof(dbg),
-								 "wal-redo: decoded rmid=%u info=0x%02X maxblk=%d\n",
-								 (unsigned) XLogRecGetRmid(wr_reader),
-								 (unsigned) XLogRecGetInfo(wr_reader),
-								 XLogRecMaxBlockId(wr_reader));
-					write(STDERR_FILENO, dbg, n);
-					pfree(decoded);
-					pfree(recbuf);
-					break;
+					msg = "wal-redo: APPLY decoded the record but rm_redo is not implemented yet (4b step 2)\n";
+					write(STDERR_FILENO, msg, strlen(msg));
+					_exit(2);
 				}
 
 			case WALREDO_GET:
