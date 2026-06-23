@@ -4144,7 +4144,7 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
  */
 void
 InitStandaloneBackend(int argc, char *argv[], const char *username,
-					  const char **dbname, bool need_dbname)
+					  const char **dbname, bool need_dbname, bool require_datadir)
 {
 	/* Initialize startup process environment. */
 	InitStandaloneProcess(argv[0]);
@@ -4169,6 +4169,16 @@ InitStandaloneBackend(int argc, char *argv[], const char *username,
 					 errmsg("%s: no database nor user name specified",
 							progname)));
 	}
+
+	/*
+	 * Callers that must not silently fall back to PGDATA (e.g. the wal-redo
+	 * helper, which has to run against an explicit private scratch directory and
+	 * never the live cluster) require an explicit -D.
+	 */
+	if (require_datadir && userDoption == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s: -D / --pgdata must be specified", progname)));
 
 	/* Acquire configuration parameters */
 	if (!SelectConfigFiles(userDoption, progname))
@@ -4271,8 +4281,9 @@ PostgresSingleUserMain(int argc, char *argv[],
 
 	Assert(!IsUnderPostmaster);
 
-	/* Shared standalone-backend bring-up: switches, config, shmem, PGPROC. */
-	InitStandaloneBackend(argc, argv, username, &dbname, true);
+	/* Shared standalone-backend bring-up: switches, config, shmem, PGPROC.
+	 * Single-user mode keeps the historical PGDATA fallback (require_datadir=false). */
+	InitStandaloneBackend(argc, argv, username, &dbname, true, false);
 
 	/*
 	 * Now that sufficient infrastructure has been initialized, PostgresMain()

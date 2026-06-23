@@ -145,12 +145,25 @@ write_fully(const void *buf, size_t len)
 
 	while (len > 0)
 	{
-		ssize_t		n = write(STDOUT_FILENO, p, len);
+		ssize_t		n;
+
+		/* honor a termination signal that arrived between writes (e.g. while the
+		 * controller has stopped draining stdout), as read_fully() does */
+		if (walredo_shutdown_requested)
+			proc_exit(1);
+
+		n = write(STDOUT_FILENO, p, len);
 
 		if (n < 0)
 		{
 			if (errno == EINTR)
+			{
+				/* a termination signal interrupted the write; act on it rather
+				 * than retrying into a full pipe forever */
+				if (walredo_shutdown_requested)
+					proc_exit(1);
 				continue;
+			}
 			proc_exit(1);
 		}
 		p += n;
@@ -205,7 +218,7 @@ WalRedoMain(int argc, char *argv[])
 	 * a database name (e.g. "--wal-redo scratch" silently falling back to PGDATA
 	 * instead of the intended -D directory).
 	 */
-	InitStandaloneBackend(argc, argv, NULL, NULL, false);
+	InitStandaloneBackend(argc, argv, NULL, NULL, false, true);
 
 	/*
 	 * BaseInit() sets up smgr and the buffer manager (InitBufferManagerAccess),
