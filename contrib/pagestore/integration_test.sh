@@ -195,6 +195,24 @@ assert "$asof_all" "t" "page materialized as of LSN (base FPI + deltas via rm_re
 asof_base=$($P -c "SELECT position('asof_three'::bytea in pagestore_redo_page('rpa',0,0,'$alsn')) > 0;")
 assert "$asof_base" "f" "the base FPI alone lacks the delta (so the match above came from redo)"
 
+# --- 8. non-relation object on the store via the PsKey klass discriminator -----
+# A non-relation object (klass != RELATION) rides the same store path as a
+# relation page, distinguished only by klass; objects of different klass with the
+# same id are distinct keys.
+$P -c "CREATE FUNCTION pagestore_object_roundtrip(int,int,bytea) RETURNS bytea
+        AS 'pagestore','pagestore_object_roundtrip' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE FUNCTION pagestore_object_get(int,int) RETURNS bytea
+        AS 'pagestore','pagestore_object_get' LANGUAGE C STRICT;" >/dev/null
+# round-trip an SLRU-class object (klass=1) and a relation-class one (klass=0),
+# both with id 42 but distinct page content
+rt1=$($P -c "SELECT pagestore_object_roundtrip(1, 42, repeat('A',8192)::bytea) = repeat('A',8192)::bytea;")
+assert "$rt1" "t" "non-relation (SLRU-class) object round-trips through the store"
+rt0=$($P -c "SELECT pagestore_object_roundtrip(0, 42, repeat('B',8192)::bytea) = repeat('B',8192)::bytea;")
+assert "$rt0" "t" "relation-class object with the same id round-trips"
+# klass isolation: the klass=0 write to id 42 must not have clobbered klass=1
+iso=$($P -c "SELECT pagestore_object_get(1, 42) = repeat('A',8192)::bytea;")
+assert "$iso" "t" "klass discriminates: same id, different klass = different objects"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

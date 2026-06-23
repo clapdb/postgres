@@ -957,6 +957,80 @@ pagestore_walredo_roundtrip(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * pagestore_object_roundtrip(klass int, objid int, page bytea) returns bytea
+ *
+ * Exercises the PsKey klass discriminator (the seam for non-relation objects):
+ * write 'page' as block 0 of a non-relation object identified by (klass, objid),
+ * then read it back.  Objects of different klass with the same objid are distinct
+ * keys, so this also demonstrates klass isolation from relation pages.
+ */
+PG_FUNCTION_INFO_V1(pagestore_object_roundtrip);
+Datum
+pagestore_object_roundtrip(PG_FUNCTION_ARGS)
+{
+	int32		klass = PG_GETARG_INT32(0);
+	int32		objid = PG_GETARG_INT32(1);
+	bytea	   *inpage = PG_GETARG_BYTEA_PP(2);
+	PageStoreRelKey key;
+	char	   *out;
+	bytea	   *result;
+
+	if (VARSIZE_ANY_EXHDR(inpage) != BLCKSZ)
+		ereport(ERROR,
+				(errmsg("page must be exactly %d bytes", BLCKSZ)));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	/* a non-relation object key: the identity fields are reinterpreted per klass */
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = (RelFileNumber) objid;
+	key.forkNum = 0;
+
+	out = palloc(BLCKSZ);
+	pagestore_localsvc_obj_write((uint32) klass, &key, 0, VARDATA_ANY(inpage));
+	pagestore_localsvc_obj_read((uint32) klass, &key, 0, out);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * pagestore_object_get(klass int, objid int) returns bytea -- read block 0 of a
+ * non-relation object without writing (used to verify klass isolation).
+ */
+PG_FUNCTION_INFO_V1(pagestore_object_get);
+Datum
+pagestore_object_get(PG_FUNCTION_ARGS)
+{
+	int32		klass = PG_GETARG_INT32(0);
+	int32		objid = PG_GETARG_INT32(1);
+	PageStoreRelKey key;
+	char	   *out;
+	bytea	   *result;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = (RelFileNumber) objid;
+	key.forkNum = 0;
+
+	out = palloc(BLCKSZ);
+	pagestore_localsvc_obj_read((uint32) klass, &key, 0, out);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
 void
 _PG_init(void)
 {
