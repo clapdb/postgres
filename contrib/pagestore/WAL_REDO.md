@@ -342,35 +342,51 @@ image already includes the base record's change and *is* the page as-of
 so it is excluded); if that set is empty the base image is returned unchanged.
 Re-applying the base record would double-apply it.
 
-### Helper init (the part that needs a real build/run loop)
+### Helper init (revised: a standalone backend, not a minimal stub)
 
-`rm_redo` handlers fetch the page they mutate through `XLogReadBufferForRedo` ->
-`XLogReadBufferForRedoExtended` -> `XLogReadBufferExtended`, and then use the
-returned `Buffer` through the normal buffer API, so the wal-redo process needs
-*some* backend context -- but deliberately the minimum:
+The decode step (`DecodeXLogRecord`) needs almost nothing -- `main()` runs
+`MemoryContextInit()` before dispatch, so `palloc` + an `XLogReader` work, and the
+decode is verified that way (4b step 1, merged).  But running `rm_redo` is heavier
+than the earlier "minimal init / fake buffer table" idea assumed, and the build
+investigation pinned down why:
 
-- **Resource managers must be started, not just looked up.** `RmgrTable` is static,
-  but several page rmgrs (btree, GIN, GiST, SP-GiST) set up recovery memory
-  contexts in their `rm_startup` and switch to them in redo, so the helper must run
-  `RmgrStartup()` at init and `RmgrCleanup()` at shutdown, not only index the
-  table.  No catalog access is needed for redo.
-- **A real (tiny) buffer pool, not a bare table.** Redirecting only
-  `XLogReadBufferExtended` is not enough: handlers pass the returned `Buffer` to
-  `BufferGetPage`, `BufferGetPageSize`, `MarkBufferDirty`, `UnlockReleaseBuffer`,
-  etc.  So the held/scratch pages must be backed by genuine buffer descriptors the
-  buffer API accepts.  The cheapest correct route is to initialise a minimal shared
-  buffer pool (a handful of buffers) and, under an `am_walredo` flag, satisfy
-  `XLogReadBufferExtended` from it without going to smgr: the target block id ->
-  the held page's buffer; every other block id a record registers -> a scratch
-  buffer reported `BLK_DONE` (pd_lsn >= record EndRecPtr) unless the block is
-  `WILL_INIT` (a zeroed scratch the handler initialises).  This still avoids a data
-  directory / catalogs, but uses the real `BufferManager` so the buffer API works.
-- VM/FSM side effects (`visibilitymap_pin`/`clear`, `XLogRecordPageWithFreeSpace`)
-  are no-ops under `am_walredo` when the target fork is the heap; VM/FSM-fork
-  materialization is the deferred 3c-4b follow-up.
+- `rm_redo` handlers fetch the page they mutate through `XLogReadBufferForRedo` ->
+  `XLogReadBufferForRedoExtended` -> `XLogReadBufferExtended`, then use the
+  returned `Buffer` through the normal buffer API.
+- The buffer API cannot run without backend init: `InitBufferManagerAccess()`
+  itself does `Assert(MyProc != NULL)`, references `NBuffers`/`MaxBackends`, and
+  registers `on_shmem_exit` -- i.e. it requires a `MyProc` (so `InitProcess`) and
+  shared memory.  Even *local* buffers go through this.  A bare "fake buffer
+  table" without shared memory is therefore not viable.
 
-This minimal-but-real init is exactly the piece that cannot be developed blind: it
-must be iterated against `initdb` + a running `postgres` generating real WAL.
+So the helper must bring up a **standalone backend**, the way single-user mode
+(`PostgresSingleUserMain`) and Neon's wal-redo process do, against the cluster's
+data directory:
+
+    postgres --wal-redo -D <datadir>
+
+with roughly this init before the protocol loop:
+
+    InitStandaloneProcess / InitializeGUCOptions / SelectConfigFiles
+    ChangeToDataDir;  CreateDataDirLockFile(false)?  (or attach read-only)
+    BaseInit();                     -- smgr, etc.
+    CreateSharedMemoryAndSemaphores();
+    InitProcess();
+    InitBufferManagerAccess();
+    RmgrStartup();                  -- btree/GIN/GiST/SP-GiST recovery contexts
+    CurrentResourceOwner = ResourceOwnerCreate(NULL, "wal-redo");
+
+Then, under an `am_walredo` flag, `XLogReadBufferExtended` is redirected so the
+target block resolves to the held page and other registered blocks to scratch
+buffers (the buffers are now *real* shared/local buffers, so `BufferGetPage` /
+`MarkBufferDirty` / `UnlockReleaseBuffer` work), with `BLK_DONE` for non-target
+blocks unless `WILL_INIT`.  VM/FSM side effects (`visibilitymap_pin`/`clear`,
+`XLogRecordPageWithFreeSpace`) are no-ops under `am_walredo` for the heap fork
+(VM/FSM-fork materialization is the deferred 3c-4b follow-up).
+
+This is exactly the piece that cannot be developed blind -- it must be iterated
+against `initdb` + a running cluster -- and it is materially larger than the
+decode step: a standalone-backend bring-up plus the redirect, not a small stub.
 
 ### APPLY body
 
