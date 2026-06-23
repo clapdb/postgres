@@ -14,6 +14,8 @@ on:
       - 'src/include/postmaster/walredo.h'
       - 'src/backend/main/main.c'
       - 'src/include/postmaster/postmaster.h'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/tcop/tcopprot.h'
       - '.github/scripts/walredo_smoke.py'
       - '.github/workflows/walredo-test.yml'
   pull_request:
@@ -22,6 +24,8 @@ on:
       - 'src/include/postmaster/walredo.h'
       - 'src/backend/main/main.c'
       - 'src/include/postmaster/postmaster.h'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/tcop/tcopprot.h'
       - '.github/scripts/walredo_smoke.py'
       - '.github/workflows/walredo-test.yml'
   workflow_dispatch:
@@ -40,8 +44,13 @@ jobs:
             meson ninja-build bison flex pkg-config \
             libreadline-dev zlib1g-dev libicu-dev
 
-      - name: Configure, build and install
+      - name: Configure, build and install (core only)
         run: |
+          # contrib/pagestore's PG module (pagestore.c) only builds against the
+          # branchdb_18 core (f_smgr/smgr_register export) and is unrelated to the
+          # wal-redo helper; skip it here so a full install doesn't break on it.
+          # The pagestore daemon has its own CI (the "pagestore" workflow).
+          sed -i "/subdir('pagestore')/d" contrib/meson.build
           meson setup build -Dcassert=true -Dprefix="$PWD/inst"
           ninja -C build install
 

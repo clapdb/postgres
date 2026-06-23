@@ -47,6 +47,7 @@
 #include "postgres.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #ifdef WIN32
 #include <fcntl.h>
@@ -58,6 +59,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
@@ -83,6 +85,20 @@ static XLogReaderState *wr_reader = NULL;
  */
 static PGAlignedBlock held_page;
 
+/*
+ * Set by the termination-signal handler.  The handler does nothing but set this
+ * flag (async-signal-safe); the protocol read loop notices it when the blocking
+ * read returns EINTR and shuts the helper down cleanly via proc_exit().
+ */
+static volatile sig_atomic_t walredo_shutdown_requested = 0;
+
+static void
+walredo_term_handler(int signo)
+{
+	(void) signo;
+	walredo_shutdown_requested = 1;
+}
+
 static bool
 read_fully(void *buf, size_t len)
 {
@@ -95,7 +111,13 @@ read_fully(void *buf, size_t len)
 		if (n < 0)
 		{
 			if (errno == EINTR)
+			{
+				/* a termination signal delivered while we block here interrupts
+				 * the read; honor it instead of silently retrying */
+				if (walredo_shutdown_requested)
+					proc_exit(1);
 				continue;
+			}
 			return false;
 		}
 		if (n == 0)
@@ -184,6 +206,36 @@ WalRedoMain(int argc, char *argv[])
 
 	/* buffer pins are tracked against a resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "wal-redo");
+
+	/*
+	 * InitStandaloneProcess() leaves the signal mask blocked (BlockSig).  Install
+	 * handlers and unblock so a long-lived/pooled helper can be stopped with
+	 * SIGINT/SIGTERM rather than getting stuck until stdin closes; die() sets a
+	 * pending interrupt that read_fully() acts on via CHECK_FOR_INTERRUPTS() when
+	 * the blocking read returns EINTR, giving a clean proc_exit().
+	 */
+	{
+		struct sigaction act;
+		int			diesigs[] = {SIGINT, SIGTERM, SIGQUIT};
+
+		/*
+		 * Install the termination handler deliberately *without* SA_RESTART (so
+		 * not via pqsignal): the helper blocks in read(), and we need that read to
+		 * return EINTR on a termination signal so the loop can shut down.  With
+		 * SA_RESTART the read would silently resume and the process would stay
+		 * stuck until stdin closed.  The handler only sets a flag, so it is
+		 * async-signal-safe; proc_exit() runs later from read_fully().
+		 */
+		memset(&act, 0, sizeof(act));
+		act.sa_handler = walredo_term_handler;
+		sigemptyset(&act.sa_mask);
+		act.sa_flags = 0;
+		for (int i = 0; i < (int) lengthof(diesigs); i++)
+			sigaction(diesigs[i], &act, NULL);
+	}
+	pqsignal(SIGHUP, PG_SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/* the control file supplies the cluster's real WAL segment size */
 	if (wal_segment_size == 0)
