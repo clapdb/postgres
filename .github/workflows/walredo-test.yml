@@ -40,10 +40,13 @@ jobs:
             meson ninja-build bison flex pkg-config \
             libreadline-dev zlib1g-dev libicu-dev
 
-      - name: Configure and build the postgres binary
+      - name: Configure, build and install
         run: |
-          meson setup build -Dcassert=true
-          ninja -C build src/backend/postgres
+          meson setup build -Dcassert=true -Dprefix="$PWD/inst"
+          ninja -C build install
+
+      - name: initdb a throwaway scratch cluster
+        run: inst/bin/initdb -D scratch --no-locale -U postgres
 
       - name: wal-redo protocol smoke test
-        run: python3 .github/scripts/walredo_smoke.py build/src/backend/postgres
+        run: python3 .github/scripts/walredo_smoke.py inst/bin/postgres scratch
