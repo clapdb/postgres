@@ -401,7 +401,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		 * force the on-disk state of init forks to always be in sync with the
 		 * state in shared buffers.
 		 */
-		if (forknum == INIT_FORKNUM)
+		if (forknum == INIT_FORKNUM && !am_walredo)
 			FlushOneBuffer(*buf);
 
 		return BLK_RESTORED;

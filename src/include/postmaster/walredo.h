@@ -35,4 +35,10 @@ extern PGDLLIMPORT bool am_walredo;
 extern Buffer WalRedoReadBuffer(RelFileLocator rlocator, ForkNumber forknum,
 								BlockNumber blkno, ReadBufferMode mode);
 
+/*
+ * A pinned scratch buffer for redo paths that read a fork the helper does not
+ * model (e.g. visibilitymap_pin, whose caller will ReleaseBuffer it).
+ */
+extern Buffer WalRedoScratchBuffer(void);
+
 #endif							/* WALREDO_H */

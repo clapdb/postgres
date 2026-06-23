@@ -211,13 +211,15 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 
 	/*
-	 * The wal-redo helper materializes a single heap page and has no VM fork to
-	 * read; leave the VM buffer invalid so the matching visibilitymap_clear()
-	 * becomes a no-op.
+	 * The wal-redo helper materializes a single heap page and has no VM fork.
+	 * visibilitymap_clear() is a no-op there, but redo callers still
+	 * ReleaseBuffer() the pin unconditionally, so hand back a valid pinned
+	 * scratch buffer (reusing the one already pinned, if any).
 	 */
 	if (am_walredo)
 	{
-		*vmbuf = InvalidBuffer;
+		if (!BufferIsValid(*vmbuf))
+			*vmbuf = WalRedoScratchBuffer();
 		return;
 	}
 

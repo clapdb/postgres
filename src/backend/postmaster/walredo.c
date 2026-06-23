@@ -64,6 +64,7 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "postmaster/walredo.h"
+#include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/ipc.h"
@@ -205,6 +206,7 @@ static bool wr_have_target = false;
  */
 static Buffer wr_target_buf = InvalidBuffer;
 static Buffer wr_scratch_buf = InvalidBuffer;
+static SMgrRelation wr_smgr = NULL;
 
 /* release the long-lived buffer pins at process exit, before the buffer manager's
  * own leak check (registered with before_shmem_exit so it runs first) */
@@ -223,13 +225,19 @@ wr_release_buffers(int code, Datum arg)
 		ReleaseBuffer(wr_scratch_buf);
 		wr_scratch_buf = InvalidBuffer;
 	}
+	/* remove the backing temp file so a later helper reusing this datadir does
+	 * not trip over a leftover relation */
+	if (wr_smgr != NULL)
+	{
+		smgrdounlinkall(&wr_smgr, 1, false);
+		wr_smgr = NULL;
+	}
 }
 
 static void
 wr_ensure_buffers(void)
 {
 	RelFileLocator tmp;
-	SMgrRelation reln;
 
 	if (wr_target_buf != InvalidBuffer)
 		return;
@@ -237,13 +245,27 @@ wr_ensure_buffers(void)
 	tmp.spcOid = 1663;			/* pg_default */
 	tmp.dbOid = 1;				/* template1 (its base dir always exists) */
 	tmp.relNumber = 0x7e000001; /* arbitrary, private to this backend */
-	reln = smgropen(tmp, MyProcNumber);
-	smgrcreate(reln, MAIN_FORKNUM, false);
-	wr_target_buf = ExtendBufferedRel(BMR_SMGR(reln, RELPERSISTENCE_TEMP),
+	wr_smgr = smgropen(tmp, MyProcNumber);
+	/* isRedo=true: tolerate a file left behind by a previously crashed helper */
+	smgrcreate(wr_smgr, MAIN_FORKNUM, true);
+	wr_target_buf = ExtendBufferedRel(BMR_SMGR(wr_smgr, RELPERSISTENCE_TEMP),
 									  MAIN_FORKNUM, NULL, EB_SKIP_EXTENSION_LOCK);
-	wr_scratch_buf = ExtendBufferedRel(BMR_SMGR(reln, RELPERSISTENCE_TEMP),
+	wr_scratch_buf = ExtendBufferedRel(BMR_SMGR(wr_smgr, RELPERSISTENCE_TEMP),
 									   MAIN_FORKNUM, NULL, EB_SKIP_EXTENSION_LOCK);
 	before_shmem_exit(wr_release_buffers, (Datum) 0);
+}
+
+/*
+ * A pinned scratch buffer for redo code that reads a fork the helper does not
+ * model (e.g. visibilitymap_pin needs a buffer its caller will ReleaseBuffer).
+ * The content is irrelevant and never read back.
+ */
+Buffer
+WalRedoScratchBuffer(void)
+{
+	wr_ensure_buffers();
+	IncrBufferRefCount(wr_scratch_buf);
+	return wr_scratch_buf;
 }
 
 Buffer
@@ -258,10 +280,22 @@ WalRedoReadBuffer(RelFileLocator rlocator, ForkNumber forknum,
 		b = wr_target_buf;
 	else
 	{
+		/*
+		 * Any block other than the BEGIN target only needs to keep the redo
+		 * routine happy; its result is never read back.  For a WILL_INIT block
+		 * (zero mode) hand back a zeroed page for the routine to initialize.
+		 * Otherwise give the scratch page an LSN newer than any record so
+		 * XLogReadBufferForRedo() classifies it as BLK_DONE and skips it -- a
+		 * zero-LSN page would be treated as BLK_NEEDS_REDO and the routine would
+		 * apply the record to bogus contents (e.g. a cross-page heap UPDATE
+		 * panicking on the old tuple's block).
+		 */
 		b = wr_scratch_buf;
 		if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK ||
 			mode == RBM_ZERO_ON_ERROR)
 			memset(BufferGetPage(b), 0, BLCKSZ);
+		else
+			PageSetLSN(BufferGetPage(b), PG_UINT64_MAX);
 	}
 
 	/*
@@ -516,6 +550,18 @@ WalRedoMain(int argc, char *argv[])
 					 * buffers.  Read the materialized page back for GET.
 					 */
 					wr_ensure_buffers();
+
+					/*
+					 * Make the target buffer report the WAL block identity, so redo
+					 * that writes the buffer's block number into the page (e.g.
+					 * heap lock/confirm resetting t_ctid via BufferGetBlockNumber)
+					 * records the real block, not the temp relation's block 0.  We
+					 * never look these buffers up by tag, so retagging the local
+					 * descriptor in place is safe.
+					 */
+					InitBufferTag(&GetLocalBufferDescriptor(-wr_target_buf - 1)->tag,
+								  &wr_target_rloc, wr_target_fork, wr_target_blk);
+
 					memcpy(BufferGetPage(wr_target_buf), held_page.data, BLCKSZ);
 					memset(BufferGetPage(wr_scratch_buf), 0, BLCKSZ);
 
@@ -524,6 +570,14 @@ WalRedoMain(int argc, char *argv[])
 					am_walredo = false;
 
 					memcpy(held_page.data, BufferGetPage(wr_target_buf), BLCKSZ);
+
+					/*
+					 * Free this record's allocations; a long-lived/pooled helper
+					 * applies many records and would otherwise grow without bound.
+					 */
+					wr_reader->record = NULL;
+					pfree(decoded);
+					pfree(recbuf);
 					break;
 				}
 
