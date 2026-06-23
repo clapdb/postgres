@@ -45,6 +45,7 @@
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
+#include "storage/bufpage.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
@@ -748,6 +749,171 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 
 	if (result == NULL)
 		PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * pagestore_redo_page_asof(relid, forknum, blocknum, lsn) returns bytea
+ *
+ * Materialize a page as of 'lsn' (the 5b driver): find the newest full-page
+ * image at/below lsn as the base, then apply every WAL record that touched the
+ * block after it, through the wal-redo helper.  Returns the materialized page
+ * (pd_checksum recomputed), or NULL if no base image is indexed for the block.
+ *
+ * Single-branch: the records are read from this compute's local WAL by LSN.
+ * (Serving deltas across branches from the store -- using the per-record source
+ * timeline -- is a later step.)
+ */
+PG_FUNCTION_INFO_V1(pagestore_redo_page_asof);
+Datum
+pagestore_redo_page_asof(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	Relation	rel;
+	PageStoreRelKey key;
+	RelFileLocator rloc;
+	uint64	   *lsns;
+	int			n;
+	int			base_idx = -1;
+	XLogRecPtr	base_end_lsn = InvalidXLogRecPtr;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char	   *base;
+	char	   *page;
+	WalRedoProc *p;
+	bytea	   *result;
+
+	if (pagestore_walredo_datadir == NULL || pagestore_walredo_datadir[0] == '\0')
+		ereport(ERROR,
+				(errmsg("pagestore.walredo_datadir is not set")));
+
+	rel = relation_open(relid, AccessShareLock);
+	rloc = rel->rd_locator;
+	relation_close(rel, AccessShareLock);
+	key.spcOid = rloc.spcOid;
+	key.dbOid = rloc.dbOid;
+	key.relNumber = rloc.relNumber;
+	key.forkNum = forknum;
+
+	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
+									  lsns, PS_REDO_MAX_RECS);
+	if (n == 0)
+		PG_RETURN_NULL();
+
+	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+	{
+		pfree(pd);
+		pfree(lsns);
+		PG_RETURN_NULL();
+	}
+	base = palloc(BLCKSZ);
+	page = palloc(BLCKSZ);
+
+	/* base = newest record at/below lsn carrying an FPI for the block */
+	for (int i = n - 1; i >= 0 && base_idx < 0; i--)
+	{
+		char	   *errm;
+		XLogRecord *rec;
+
+		XLogBeginRead(reader, lsns[i]);
+		rec = XLogReadRecord(reader, &errm);
+		if (rec == NULL)
+			continue;
+		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		{
+			RelFileLocator brloc;
+			ForkNumber	fk;
+			BlockNumber blk;
+
+			if (!XLogRecHasBlockImage(reader, b))
+				continue;
+			XLogRecGetBlockTagExtended(reader, b, &brloc, &fk, &blk, NULL);
+			if (!RelFileLocatorEquals(brloc, rloc) || fk != forknum ||
+				blk != (BlockNumber) blocknum)
+				continue;
+			if (RestoreBlockImage(reader, b, base))
+			{
+				base_idx = i;
+				base_end_lsn = reader->EndRecPtr;
+			}
+			break;
+		}
+	}
+
+	if (base_idx < 0)
+	{
+		/* no base image indexed for this block; cannot materialize yet */
+		XLogReaderFree(reader);
+		pfree(pd);
+		pfree(lsns);
+		pfree(base);
+		pfree(page);
+		PG_RETURN_NULL();
+	}
+
+	/* replay: base image, then every record after it, through the helper */
+	p = walredo_start(pagestore_walredo_datadir);
+	walredo_begin(p, rloc, forknum, (BlockNumber) blocknum);
+	walredo_pushbase(p, base_end_lsn, base);
+	for (int i = base_idx + 1; i < n; i++)
+	{
+		char	   *errm;
+		XLogRecord *rec;
+
+		uint32		tot;
+		uint32		firstpage;
+		char	   *raw;
+
+		XLogBeginRead(reader, lsns[i]);
+		rec = XLogReadRecord(reader, &errm);
+		if (rec == NULL)
+		{
+			walredo_stop(p);
+			ereport(ERROR,
+					(errmsg("could not read WAL record at %X/%08X for redo: %s",
+							LSN_FORMAT_ARGS(lsns[i]), errm ? errm : "(unknown)")));
+		}
+
+		/*
+		 * XLogReadRecord returns the decoded header, not the contiguous raw
+		 * record the helper needs.  Recover the raw bytes the way the decoder
+		 * laid them out: a record that fit on its page is still in the page
+		 * buffer at its offset; one that spanned pages was reassembled into
+		 * readRecordBuf.
+		 */
+		tot = rec->xl_tot_len;
+		firstpage = XLOG_BLCKSZ - (uint32) (reader->ReadRecPtr % XLOG_BLCKSZ);
+		if (tot > firstpage)
+			raw = reader->readRecordBuf;
+		else
+			raw = reader->readBuf + (reader->ReadRecPtr % XLOG_BLCKSZ);
+		walredo_apply(p, reader->ReadRecPtr, reader->EndRecPtr, raw, tot);
+	}
+	walredo_get(p, page);
+	walredo_stop(p);
+
+	/* the helper leaves pd_checksum to the caller; recompute it here */
+	PageSetChecksumInplace((Page) page, (BlockNumber) blocknum);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(lsns);
+	pfree(base);
+	pfree(page);
 	PG_RETURN_BYTEA_P(result);
 }
 
