@@ -24,6 +24,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
+#include "postmaster/walredo.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -464,6 +465,14 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	BlockNumber lastblock;
 	Buffer		buffer;
 	SMgrRelation smgr;
+
+	/*
+	 * In the wal-redo helper there is no on-disk relation to read: redo runs
+	 * against a single held page (plus a scratch page for other blocks), so
+	 * resolve the buffer from those instead of smgr.
+	 */
+	if (am_walredo)
+		return WalRedoReadBuffer(rlocator, forknum, blkno, mode);
 
 	Assert(blkno != P_NEW);
 

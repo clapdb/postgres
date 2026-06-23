@@ -16,7 +16,10 @@ on:
       - 'src/include/postmaster/postmaster.h'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/tcop/tcopprot.h'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
       - '.github/scripts/walredo_smoke.py'
+      - '.github/scripts/walredo_redo_test.py'
       - '.github/workflows/walredo-test.yml'
   pull_request:
     paths:
@@ -26,7 +29,10 @@ on:
       - 'src/include/postmaster/postmaster.h'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/tcop/tcopprot.h'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
       - '.github/scripts/walredo_smoke.py'
+      - '.github/scripts/walredo_redo_test.py'
       - '.github/workflows/walredo-test.yml'
   workflow_dispatch:
 
@@ -59,3 +65,6 @@ jobs:
 
       - name: wal-redo protocol smoke test
         run: python3 .github/scripts/walredo_smoke.py inst/bin/postgres scratch
+
+      - name: wal-redo redo end-to-end test
+        run: python3 .github/scripts/walredo_redo_test.py inst/bin scratch 5499
