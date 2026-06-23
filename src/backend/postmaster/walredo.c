@@ -106,7 +106,17 @@ read_fully(void *buf, size_t len)
 
 	while (len > 0)
 	{
-		ssize_t		n = read(STDIN_FILENO, p, len);
+		ssize_t		n;
+
+		/*
+		 * Honor a termination signal that arrived between reads: at that point no
+		 * EINTR is pending to interrupt the upcoming blocking read, so check the
+		 * flag here as well as in the EINTR branch below.
+		 */
+		if (walredo_shutdown_requested)
+			proc_exit(1);
+
+		n = read(STDIN_FILENO, p, len);
 
 		if (n < 0)
 		{
@@ -163,8 +173,6 @@ read_u64(uint64 *v)
 void
 WalRedoMain(int argc, char *argv[])
 {
-	const char *dbname = NULL;
-
 #ifdef WIN32
 	/* the protocol is binary; keep the CRT from translating \n/\r\n/0x1a on the
 	 * inherited stdin/stdout, which would corrupt PUSHBASE/GET page bytes */
@@ -191,8 +199,13 @@ WalRedoMain(int argc, char *argv[])
 	 * (whose lock file is held by the postmaster): the helper only ever mutates
 	 * pages handed to it over the protocol, so a generic scratch cluster of the
 	 * same BLCKSZ is sufficient for redo.
+	 *
+	 * Pass a NULL dbname: this mode opens no database, and a non-NULL pointer
+	 * would let process_postgres_switches() consume a stray positional argument as
+	 * a database name (e.g. "--wal-redo scratch" silently falling back to PGDATA
+	 * instead of the intended -D directory).
 	 */
-	InitStandaloneBackend(argc, argv, NULL, &dbname, false);
+	InitStandaloneBackend(argc, argv, NULL, NULL, false);
 
 	/*
 	 * BaseInit() sets up smgr and the buffer manager (InitBufferManagerAccess),
