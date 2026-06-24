@@ -904,6 +904,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		XLogRecord *rec;
 
 		ps_redo_cur_timeline = recs[i].timeline;
+		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
+		 * same-offset page on another timeline would be a false hit; invalidate it
+		 * whenever the source timeline may change (cross-branch redo). */
+		reader->readLen = 0;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -947,16 +951,22 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * at/below lsn.
 	 */
 	{
-		bool		from_store = pagestore_redo_wal_from_store;
 		bool		dead;
 
-		/* the truncate scan walks this compute's own recent WAL (local) */
-		pagestore_redo_wal_from_store = false;
-		ps_redo_cur_timeline = ps_redo_local_timeline;
+		/*
+		 * The truncate scan walks the WAL after the block's last write.  Read it
+		 * from that record's source timeline (an ancestor in cross-branch redo)
+		 * and from the store when store-backed -- so DON'T force local/off here, or
+		 * a no-local-WAL (store-backed) compute would skip the truncate check.
+		 * Invalidate the reader's page cache first since the timeline may differ
+		 * from the record loop above.  (A scan range that itself crosses a branch
+		 * point spans timelines and is a known limitation.)
+		 */
+		ps_redo_cur_timeline = recs[n - 1].timeline;
+		reader->readLen = 0;
 		dead = redo_block_truncated_away(reader, rloc, forknum,
 										 (BlockNumber) blocknum,
 										 (XLogRecPtr) recs[n - 1].lsn, lsn);
-		pagestore_redo_wal_from_store = from_store;
 		if (dead)
 		{
 			XLogReaderFree(reader);
@@ -982,6 +992,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		char	   *raw;
 
 		ps_redo_cur_timeline = recs[i].timeline;
+		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
+		 * same-offset page on another timeline would be a false hit; invalidate it
+		 * whenever the source timeline may change (cross-branch redo). */
+		reader->readLen = 0;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
