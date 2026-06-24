@@ -170,6 +170,7 @@ manifest_decode_key(PsKey *dst, const PsManifestKeyDisk *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;
 }
 
 static int

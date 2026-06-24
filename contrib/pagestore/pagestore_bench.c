@@ -143,7 +143,7 @@ attach(const char *shm)
 
 			close(fd);
 			if (h != MAP_FAILED && h->magic == PS_SHM_MAGIC &&
-				h->page_size == PAGE)
+				h->version == PS_SHM_VERSION && h->page_size == PAGE)
 			{
 				g_shm = h;
 				for (uint32_t c = 0; c < h->nchannels; c++)
