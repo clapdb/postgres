@@ -101,9 +101,17 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READ_AT:
-			/* as-of read on this timeline, honoring branch ancestry */
-			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+			/* as-of read on this timeline, honoring branch ancestry.  Report
+			 * found-ness in ch->result so callers can distinguish "this block has
+			 * a stored version" from "zero-filled because it is unwritten" (a block
+			 * below the fork length but never written must not look present). */
+			if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+				ch->result = 1;
+			else
+			{
 				memset(ch->data, 0, page_size);
+				ch->result = 0;
+			}
 			break;
 
 		default:
