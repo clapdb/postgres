@@ -52,6 +52,7 @@
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
+#include "utils/errcodes.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
@@ -1124,6 +1125,7 @@ static void
 pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 {
 	PageStoreRelKey key;
+	MemoryContext oldcontext;
 
 	/* only meaningful when relations are served by the localsvc backend */
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
@@ -1131,18 +1133,39 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	if (pageno < 0 || pageno > (int64) UINT32_MAX)
 		return;					/* page number outside our block space */
 
+	/*
+	 * The mirror does fallible shm I/O and busy-waits with CHECK_FOR_INTERRUPTS.
+	 * An SLRU buffer can be evicted/written from inside a transaction commit/abort
+	 * critical section (e.g. via SlruSelectLRUPage), where any ERROR would PANIC --
+	 * so never mirror there; the page is mirrored by a later write/checkpoint.
+	 */
+	if (CritSectionCount > 0)
+		return;
+
 	key.spcOid = 0;
 	key.dbOid = 0;
 	key.relNumber = slru_klass_id(ctl->Dir);
 	key.forkNum = 0;
 
+	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
 		pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, (BlockNumber) pageno, page);
 	}
 	PG_CATCH();
 	{
-		/* never let a mirroring failure break the SLRU write itself */
+		int			sqlerrcode = geterrcode();
+
+		/*
+		 * Restore the context (PG_CATCH left it at ErrorContext), then swallow a
+		 * genuine mirror I/O failure so it cannot break the SLRU write -- but never
+		 * swallow a query-cancel / shutdown interrupt; re-throw those so cancellation
+		 * and fast shutdown still work.
+		 */
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
 		FlushErrorState();
 	}
 	PG_END_TRY();
@@ -1163,6 +1186,7 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 {
 	PageStoreRelKey key;
 	bool		served = false;
+	MemoryContext oldcontext;
 
 	if (!pagestore_slru_read_from_store)
 		return false;
@@ -1170,12 +1194,16 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 		return false;
 	if (pageno < 0 || pageno > (int64) UINT32_MAX)
 		return false;
+	/* don't do fallible store I/O in a critical section; fall back to local */
+	if (CritSectionCount > 0)
+		return false;
 
 	key.spcOid = 0;
 	key.dbOid = 0;
 	key.relNumber = slru_klass_id(ctl->Dir);
 	key.forkNum = 0;
 
+	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
 		served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
@@ -1183,7 +1211,14 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	}
 	PG_CATCH();
 	{
-		FlushErrorState();		/* on any error, fall back to the local read */
+		int			sqlerrcode = geterrcode();
+
+		/* restore context; re-throw cancel/shutdown, else fall back to local read */
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
 		served = false;
 	}
 	PG_END_TRY();
