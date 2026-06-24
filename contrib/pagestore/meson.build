@@ -46,6 +46,15 @@ pagestore_walrestore = executable('pagestore_walrestore',
 )
 contrib_targets += pagestore_walrestore
 
+# Restore $PGDATA/global/pg_control from the store before postgres starts, so a
+# compute can bootstrap cluster metadata from the shared store (pg_control is read
+# before shared_preload_libraries, so the module's read hook can't serve it).
+pagestore_control_restore = executable('pagestore_control_restore',
+  files('pagestore_control_restore.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_control_restore
+
 # Throughput probe: forks a daemon, writes a dataset, times reading it back.
 # Indicative only (see pagestore_bench.c); freestanding like the daemon.
 pagestore_bench = executable('pagestore_bench',

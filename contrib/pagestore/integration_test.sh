@@ -265,6 +265,22 @@ $P -c "CHECKPOINT;" >/dev/null
 ctl_match=$($P -c "SELECT pagestore_control_checkpoint_lsn() = (SELECT checkpoint_lsn FROM pg_control_checkpoint());")
 assert "$ctl_match" "t" "pg_control mirrored to the store carries the current checkpoint LSN (control on store)"
 
+# --- 12. pg_control read side: bootstrap it from the store before startup --------
+# pg_control is read (and CRC-checked) before shared_preload_libraries load, so the
+# module's read hook cannot serve it.  A compute with no local pg_control restores
+# it from the store with the freestanding pagestore_control_restore tool, then
+# starts normally -- proving cluster metadata can be bootstrapped from the store.
+rows_before=$($P -c "SELECT count(*) FROM t;")
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1     # shutdown checkpoint mirrors pg_control
+rm -f "$DATA/global/pg_control"                       # a compute with no local control
+"$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
+assert "$?" "0" "pagestore_control_restore fetched pg_control from the store"
+test ! -s "$DATA/global/pg_control" && rc=missing || rc=present
+assert "$rc" "present" "pg_control written back to the data directory"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+rows_after=$($P -c "SELECT count(*) FROM t;")
+assert "$rows_after" "$rows_before" "cluster boots from store-restored pg_control (compute bootstraps cluster metadata from the store)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

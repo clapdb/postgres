@@ -1,0 +1,179 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_control_restore.c
+ *	  Restore $PGDATA/global/pg_control from the page store, before postgres
+ *	  starts.
+ *
+ * The postmaster reads (and CRC-checks) pg_control very early -- before
+ * shared_preload_libraries are loaded -- so the pagestore module's in-process
+ * read hook cannot serve that read.  A compute bootstrapping cluster metadata
+ * from the shared store therefore fetches pg_control with this freestanding
+ * tool first, then starts postgres normally.  Symmetric to pagestore_walrestore
+ * (which restores shipped WAL) and pagestore_import (which loads relations); it
+ * speaks the same shared-memory protocol to the daemon and links no PostgreSQL
+ * libraries.
+ *
+ *	  Usage: pagestore_control_restore --shm <name> --pgdata <dir> [--page-size N]
+ *
+ *-------------------------------------------------------------------------
+ */
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "pagestore_ipc.h"
+
+/* Fixed on-disk size of pg_control (independent of BLCKSZ). */
+#define PG_CONTROL_FILE_SIZE	8192
+
+static uint32_t page_size = PS_DEFAULT_PAGE_SIZE;
+static void *shm;
+static int	chan;
+
+static void
+client_attach(const char *shm_name)
+{
+	int			fd = shm_open(shm_name, O_RDWR, 0600);
+	PsShmHeader *hdr;
+
+	if (fd < 0)
+	{
+		perror("shm_open (is the daemon running?)");
+		exit(2);
+	}
+	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (shm == MAP_FAILED)
+	{
+		perror("mmap");
+		exit(2);
+	}
+	close(fd);
+	hdr = (PsShmHeader *) shm;
+	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		hdr->page_size != page_size)
+	{
+		fprintf(stderr, "shm header mismatch (daemon magic=0x%x version=%u "
+				"page_size=%u; expected version=%u page_size=%u)\n",
+				hdr->magic, hdr->version, hdr->page_size,
+				PS_SHM_VERSION, page_size);
+		exit(2);
+	}
+	for (uint32_t i = 0; i < hdr->nchannels; i++)
+		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+		{
+			chan = (int) i;
+			return;
+		}
+	fprintf(stderr, "no free channel\n");
+	exit(2);
+}
+
+static void
+cl_exec(PsChannel *ch)
+{
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+		;
+	if (ch->status != PS_STATUS_OK)
+	{
+		fprintf(stderr, "daemon error on op %u\n", ch->opcode);
+		exit(1);
+	}
+}
+
+/* The single control object: klass=CONTROL on the main timeline, block 0. */
+static void
+fill_control_key(PsChannel *ch)
+{
+	ch->timeline = 0;
+	ch->key.spcOid = 0;
+	ch->key.dbOid = 0;
+	ch->key.relNumber = 0;
+	ch->key.forkNum = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+}
+
+int
+main(int argc, char **argv)
+{
+	const char *shm_name = NULL;
+	const char *pgdata = NULL;
+	PsChannel  *ch;
+	char		path[1024];
+	char		buf[PG_CONTROL_FILE_SIZE];
+	size_t		n;
+	int			fd;
+
+	for (int i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--shm") == 0 && i + 1 < argc)
+			shm_name = argv[++i];
+		else if (strcmp(argv[i], "--pgdata") == 0 && i + 1 < argc)
+			pgdata = argv[++i];
+		else if (strcmp(argv[i], "--page-size") == 0 && i + 1 < argc)
+			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else
+		{
+			fprintf(stderr, "usage: %s --shm <name> --pgdata <dir> "
+					"[--page-size N]\n", argv[0]);
+			return 2;
+		}
+	}
+	if (shm_name == NULL || pgdata == NULL)
+	{
+		fprintf(stderr, "usage: %s --shm <name> --pgdata <dir> "
+				"[--page-size N]\n", argv[0]);
+		return 2;
+	}
+
+	client_attach(shm_name);
+	ch = ps_channel(shm, chan);
+
+	/* is pg_control present on the store? */
+	fill_control_key(ch);
+	ch->opcode = PS_OP_NBLOCKS;
+	cl_exec(ch);
+	if (ch->result == 0)
+	{
+		fprintf(stderr, "pg_control is not present on the store\n");
+		return 1;
+	}
+
+	/* read control page 0 */
+	fill_control_key(ch);
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = 0;
+	ch->nblocks = 1;
+	cl_exec(ch);
+
+	/* assemble the fixed-size control file (page + zero pad) and write it */
+	memset(buf, 0, sizeof(buf));
+	n = page_size < PG_CONTROL_FILE_SIZE ? page_size : PG_CONTROL_FILE_SIZE;
+	memcpy(buf, ch->data, n);
+
+	snprintf(path, sizeof(path), "%s/global/pg_control", pgdata);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+	{
+		perror("open pg_control");
+		return 1;
+	}
+	if (write(fd, buf, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
+	{
+		perror("write pg_control");
+		close(fd);
+		return 1;
+	}
+	if (fsync(fd) != 0 || close(fd) != 0)
+	{
+		perror("fsync/close pg_control");
+		return 1;
+	}
+	fprintf(stderr, "restored %s from the store\n", path);
+	return 0;
+}
