@@ -34,11 +34,13 @@
 #include <unistd.h>
 
 #include "access/relation.h"
+#include "access/rmgr.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
+#include "catalog/storage_xlog.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
@@ -753,6 +755,50 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Liveness: scan local WAL in (from_lsn, to_lsn] for an smgr truncate of
+ * (rloc, forknum) down to <= block.  If found, the block was truncated away after
+ * its last write and not re-extended, so it is not live as of to_lsn and must not
+ * be materialized.  Only the main fork is checked -- the truncate record carries
+ * only the main-fork size; other forks are conservatively treated as live.
+ *
+ * Cost: a linear pass over (from_lsn, to_lsn].  redo_page_asof is off the read hot
+ * path; a daemon-side fork-size-at-lsn index would make this O(1) -- a later step.
+ */
+static bool
+redo_block_truncated_away(XLogReaderState *reader, RelFileLocator rloc,
+						  ForkNumber forknum, BlockNumber block,
+						  XLogRecPtr from_lsn, XLogRecPtr to_lsn)
+{
+	if (forknum != MAIN_FORKNUM || from_lsn >= to_lsn)
+		return false;
+
+	XLogBeginRead(reader, from_lsn);
+	for (;;)
+	{
+		char	   *errm;
+		XLogRecord *rec = XLogReadRecord(reader, &errm);
+
+		if (rec == NULL)
+			break;
+		if (reader->ReadRecPtr <= from_lsn)
+			continue;			/* skip the block's own last-write record */
+		if (reader->ReadRecPtr > to_lsn)
+			break;
+		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
+			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
+		{
+			xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(reader);
+
+			if (RelFileLocatorEquals(xlrec->rlocator, rloc) &&
+				(xlrec->flags & SMGR_TRUNCATE_HEAP) &&
+				xlrec->blkno <= block)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * pagestore_redo_page_asof(relid, forknum, blocknum, lsn) returns bytea
  *
  * Materialize a page as of 'lsn' (the 5b driver): find the newest full-page
@@ -853,6 +899,23 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	if (base_idx < 0)
 	{
 		/* no base image indexed for this block; cannot materialize yet */
+		XLogReaderFree(reader);
+		pfree(pd);
+		pfree(lsns);
+		pfree(base);
+		pfree(page);
+		PG_RETURN_NULL();
+	}
+
+	/*
+	 * Liveness: if the block was truncated away after its last write and at or
+	 * before lsn (and not re-extended), it is not live as of lsn -- do not
+	 * materialize a stale page for it.  lsns[n - 1] is the block's newest record
+	 * at/below lsn.
+	 */
+	if (redo_block_truncated_away(reader, rloc, forknum, (BlockNumber) blocknum,
+								  (XLogRecPtr) lsns[n - 1], lsn))
+	{
 		XLogReaderFree(reader);
 		pfree(pd);
 		pfree(lsns);

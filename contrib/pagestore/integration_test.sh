@@ -213,6 +213,24 @@ assert "$rt0" "t" "relation-class object with the same id round-trips"
 iso=$($P -c "SELECT pagestore_object_get(1, 42) = repeat('A',8192)::bytea;")
 assert "$iso" "t" "klass discriminates: same id, different klass = different objects"
 
+# --- 9. liveness: redo_page_asof must not materialize a truncated-away block -----
+# A block truncated away (VACUUM truncation -> XLOG_SMGR_TRUNCATE) at/below the
+# requested LSN is not live and must not be reconstructed from its stale FPI.
+$P -c "CREATE TABLE trunc(id int, v text) WITH (autovacuum_enabled=off);
+       INSERT INTO trunc SELECT g, 'row'||g FROM generate_series(1,50) g;
+       CHECKPOINT;" >/dev/null
+tl0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "UPDATE trunc SET v=v||'!' WHERE id=1;" >/dev/null  # first change after checkpoint -> FPI of block 0
+tl_before=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "DELETE FROM trunc;" >/dev/null
+$P -c "VACUUM trunc;" >/dev/null                     # empties block 0 -> truncates it away
+tl_after=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_index_wal('$tl0', '$tl_after');" >/dev/null
+live_before=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_before') IS NOT NULL;")
+assert "$live_before" "t" "redo_page_asof materializes the block while it is live (before truncation)"
+live_after=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_after') IS NULL;")
+assert "$live_after" "t" "redo_page_asof returns NULL for a block truncated away as of the LSN (liveness)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
