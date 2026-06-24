@@ -48,7 +48,6 @@
 #include "storage/bufpage.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
-#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
@@ -665,10 +664,6 @@ pagestore_walidx_count(PG_FUNCTION_ARGS)
  */
 #define PS_REDO_MAX_RECS 4096
 
-/* Advisory-lock key serializing wal-redo helper spawns across backends (see
- * pagestore_redo_page_asof). */
-#define PS_WALREDO_ADVLOCK_KEY	INT64CONST(0x70616773746f7265)	/* "pagstore" */
-
 PG_FUNCTION_INFO_V1(pagestore_redo_page);
 
 Datum
@@ -848,6 +843,12 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
 			continue;
+		/*
+		 * walidx entries are record *start* LSNs, so a record may begin at/below
+		 * lsn yet end after it; such a record is not part of the page as of lsn.
+		 */
+		if (reader->EndRecPtr > lsn)
+			continue;
 		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
 		{
 			RelFileLocator brloc;
@@ -880,56 +881,60 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 
-	/* replay: base image, then every record after it, through the helper */
 	/*
-	 * The helper holds the data-directory lock (postmaster.pid) on the shared
-	 * pagestore.walredo_datadir for its whole lifetime, so two backends running
-	 * redo concurrently would collide and the second helper would fail to start.
-	 * Serialize spawns with a transaction-level advisory lock (auto-released at
-	 * xact end, including on error).  A per-backend scratch datadir would instead
-	 * allow concurrency; serialization is the phase-1 choice.
+	 * Replay base image, then every record after it, through the helper.
+	 * walredo_start takes a cluster-wide flock on the shared walredo_datadir, so
+	 * concurrent helpers serialize.  Wrap the helper lifetime in PG_TRY/PG_FINALLY
+	 * so any error or cancellation still reaps the child, closes the pipes and
+	 * releases that lock instead of leaking a wedged helper.
 	 */
-	(void) DirectFunctionCall1(pg_advisory_xact_lock_int8,
-							   Int64GetDatum(PS_WALREDO_ADVLOCK_KEY));
 	p = walredo_start(pagestore_walredo_datadir);
-	walredo_begin(p, rloc, forknum, (BlockNumber) blocknum);
-	walredo_pushbase(p, base_end_lsn, base);
-	for (int i = base_idx + 1; i < n; i++)
+	PG_TRY();
 	{
-		char	   *errm;
-		XLogRecord *rec;
-
-		uint32		tot;
-		uint32		firstpage;
-		char	   *raw;
-
-		XLogBeginRead(reader, lsns[i]);
-		rec = XLogReadRecord(reader, &errm);
-		if (rec == NULL)
+		walredo_begin(p, rloc, forknum, (BlockNumber) blocknum);
+		walredo_pushbase(p, base_end_lsn, base);
+		for (int i = base_idx + 1; i < n; i++)
 		{
-			walredo_stop(p);
-			ereport(ERROR,
-					(errmsg("could not read WAL record at %X/%08X for redo: %s",
-							LSN_FORMAT_ARGS(lsns[i]), errm ? errm : "(unknown)")));
-		}
+			char	   *errm;
+			XLogRecord *rec;
+			uint32		tot;
+			uint32		firstpage;
+			char	   *raw;
 
-		/*
-		 * XLogReadRecord returns the decoded header, not the contiguous raw
-		 * record the helper needs.  Recover the raw bytes the way the decoder
-		 * laid them out: a record that fit on its page is still in the page
-		 * buffer at its offset; one that spanned pages was reassembled into
-		 * readRecordBuf.
-		 */
-		tot = rec->xl_tot_len;
-		firstpage = XLOG_BLCKSZ - (uint32) (reader->ReadRecPtr % XLOG_BLCKSZ);
-		if (tot > firstpage)
-			raw = reader->readRecordBuf;
-		else
-			raw = reader->readBuf + (reader->ReadRecPtr % XLOG_BLCKSZ);
-		walredo_apply(p, reader->ReadRecPtr, reader->EndRecPtr, raw, tot);
+			XLogBeginRead(reader, lsns[i]);
+			rec = XLogReadRecord(reader, &errm);
+			if (rec == NULL)
+				ereport(ERROR,
+						(errmsg("could not read WAL record at %X/%08X for redo: %s",
+								LSN_FORMAT_ARGS(lsns[i]), errm ? errm : "(unknown)")));
+
+			/* a record starting at/below lsn but ending after it is not yet in the
+			 * page as of lsn; the rest start later still, so we are done applying */
+			if (reader->EndRecPtr > lsn)
+				break;
+
+			/*
+			 * XLogReadRecord returns the decoded header, not the contiguous raw
+			 * record the helper needs.  Recover the raw bytes the way the decoder
+			 * laid them out: a record that fit on its page is still in the page
+			 * buffer at its offset; one that spanned pages was reassembled into
+			 * readRecordBuf.
+			 */
+			tot = rec->xl_tot_len;
+			firstpage = XLOG_BLCKSZ - (uint32) (reader->ReadRecPtr % XLOG_BLCKSZ);
+			if (tot > firstpage)
+				raw = reader->readRecordBuf;
+			else
+				raw = reader->readBuf + (reader->ReadRecPtr % XLOG_BLCKSZ);
+			walredo_apply(p, reader->ReadRecPtr, reader->EndRecPtr, raw, tot);
+		}
+		walredo_get(p, page);
 	}
-	walredo_get(p, page);
-	walredo_stop(p);
+	PG_FINALLY();
+	{
+		walredo_stop(p);
+	}
+	PG_END_TRY();
 
 	/* the helper leaves pd_checksum to the caller; recompute it here */
 	PageSetChecksumInplace((Page) page, (BlockNumber) blocknum);
@@ -974,21 +979,20 @@ pagestore_walredo_roundtrip(PG_FUNCTION_ARGS)
 				(errmsg("pagestore.walredo_datadir is not set")));
 
 	out = palloc(BLCKSZ);
-	/*
-	 * The helper holds the data-directory lock (postmaster.pid) on the shared
-	 * pagestore.walredo_datadir for its whole lifetime, so two backends running
-	 * redo concurrently would collide and the second helper would fail to start.
-	 * Serialize spawns with a transaction-level advisory lock (auto-released at
-	 * xact end, including on error).  A per-backend scratch datadir would instead
-	 * allow concurrency; serialization is the phase-1 choice.
-	 */
-	(void) DirectFunctionCall1(pg_advisory_xact_lock_int8,
-							   Int64GetDatum(PS_WALREDO_ADVLOCK_KEY));
+	/* walredo_start takes the cluster-wide flock; PG_FINALLY guarantees the helper
+	 * is reaped and the lock released even on error/cancellation. */
 	p = walredo_start(pagestore_walredo_datadir);
-	walredo_begin(p, rloc, MAIN_FORKNUM, 0);
-	walredo_pushbase(p, base_lsn, VARDATA_ANY(inpage));
-	walredo_get(p, out);
-	walredo_stop(p);
+	PG_TRY();
+	{
+		walredo_begin(p, rloc, MAIN_FORKNUM, 0);
+		walredo_pushbase(p, base_lsn, VARDATA_ANY(inpage));
+		walredo_get(p, out);
+	}
+	PG_FINALLY();
+	{
+		walredo_stop(p);
+	}
+	PG_END_TRY();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);

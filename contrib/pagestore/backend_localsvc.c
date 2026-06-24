@@ -587,12 +587,16 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	ls_exec(ch);
 	n = (int) ch->result;		/* TRUE total matches (may exceed maxn) */
 	{
+		/* the daemon can only populate this many LSNs in the mailbox per request */
+		int			cap = (int) (PS_IO_UNIT / sizeof(uint64));
 		int			copied = n < maxn ? n : maxn;
 
+		if (copied > cap)
+			copied = cap;
 		memcpy(out, ch->data, (size_t) copied * sizeof(uint64));
 	}
 	/* Return the true total so the caller can detect saturation; only the first
-	 * min(n, maxn) LSNs were actually copied into out. */
+	 * min(n, maxn, mailbox capacity) LSNs were actually copied into out. */
 	return n;
 }
 

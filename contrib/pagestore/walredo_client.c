@@ -13,7 +13,9 @@
 #include "postgres.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -25,6 +27,7 @@ struct WalRedoProc
 	pid_t		pid;
 	int			wfd;			/* write end -> helper stdin */
 	int			rfd;			/* read end  <- helper stdout */
+	int			lock_fd;		/* flock on the datadir lock file (cluster-wide) */
 };
 
 /* Kill+reap the child, close fds, and raise an error.  Used on any I/O failure
@@ -44,6 +47,11 @@ wc_die(WalRedoProc *p, const char *what)
 	if (p->rfd >= 0)
 		close(p->rfd);
 	p->wfd = p->rfd = -1;
+	if (p->lock_fd >= 0)
+	{
+		close(p->lock_fd);		/* releases the flock */
+		p->lock_fd = -1;
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_INTERNAL_ERROR),
 			 errmsg("wal-redo helper: %s", what)));
@@ -97,20 +105,82 @@ walredo_start(const char *datadir)
 	WalRedoProc *p = palloc(sizeof(WalRedoProc));
 	int			in[2];
 	int			out[2];
+	char		lockpath[MAXPGPATH];
 
 	p->pid = 0;
 	p->wfd = p->rfd = -1;
+	p->lock_fd = -1;
 
-	if (pipe(in) != 0 || pipe(out) != 0)
+	/*
+	 * The helper takes the data-directory lock (postmaster.pid) on the shared
+	 * pagestore.walredo_datadir for its whole lifetime, so two helpers against it
+	 * collide -- including helpers from different databases, which a per-database
+	 * advisory lock would not serialize.  Take an exclusive flock on a lock file
+	 * in that directory first: it is OS-level, hence cluster-wide, and is released
+	 * when lock_fd is closed (walredo_stop / wc_die / process exit).  Spin with
+	 * LOCK_NB + CHECK_FOR_INTERRUPTS so the wait stays cancelable.
+	 */
+	snprintf(lockpath, sizeof(lockpath), "%s/pagestore_walredo.lock", datadir);
+	p->lock_fd = open(lockpath, O_RDWR | O_CREAT, 0600);
+	if (p->lock_fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open wal-redo lock file \"%s\": %m", lockpath)));
+	while (flock(p->lock_fd, LOCK_EX | LOCK_NB) != 0)
+	{
+		if (errno != EWOULDBLOCK && errno != EINTR)
+		{
+			int			save = errno;
+
+			close(p->lock_fd);
+			p->lock_fd = -1;
+			errno = save;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not lock wal-redo datadir \"%s\": %m", datadir)));
+		}
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(10000);		/* 10 ms */
+	}
+
+	if (pipe(in) != 0)
+	{
+		close(p->lock_fd);
+		p->lock_fd = -1;
 		ereport(ERROR,
 				(errcode_for_socket_access(),
 				 errmsg("could not create pipe for wal-redo helper: %m")));
+	}
+	if (pipe(out) != 0)
+	{
+		int			save = errno;
+
+		close(in[0]);			/* don't leak the first pipe's descriptors */
+		close(in[1]);
+		close(p->lock_fd);
+		p->lock_fd = -1;
+		errno = save;
+		ereport(ERROR,
+				(errcode_for_socket_access(),
+				 errmsg("could not create pipe for wal-redo helper: %m")));
+	}
 
 	p->pid = fork();
 	if (p->pid < 0)
+	{
+		int			save = errno;
+
+		close(in[0]);
+		close(in[1]);
+		close(out[0]);
+		close(out[1]);
+		close(p->lock_fd);
+		p->lock_fd = -1;
+		errno = save;
 		ereport(ERROR,
 				(errcode_for_socket_access(),
 				 errmsg("could not fork wal-redo helper: %m")));
+	}
 
 	if (p->pid == 0)
 	{
@@ -121,6 +191,7 @@ walredo_start(const char *datadir)
 		close(in[1]);
 		close(out[0]);
 		close(out[1]);
+		close(p->lock_fd);		/* the parent holds the flock; child must not */
 		/* argv[0] must be the full path so the helper can locate its own
 		 * executable (InitStandaloneProcess -> find_my_exec) */
 		execl(my_exec_path, my_exec_path, "--wal-redo", "-D", datadir, (char *) NULL);
@@ -205,6 +276,11 @@ walredo_stop(WalRedoProc *p)
 		while (waitpid(p->pid, &status, 0) < 0 && errno == EINTR)
 			;
 		p->pid = 0;
+	}
+	if (p->lock_fd >= 0)
+	{
+		close(p->lock_fd);		/* releases the cluster-wide flock */
+		p->lock_fd = -1;
 	}
 	pfree(p);
 }
