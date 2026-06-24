@@ -231,6 +231,25 @@ assert "$live_before" "t" "redo_page_asof materializes the block while it is liv
 live_after=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_after') IS NULL;")
 assert "$live_after" "t" "redo_page_asof returns NULL for a block truncated away as of the LSN (liveness)"
 
+# --- 14. store-backed redo: replay base+deltas from the store's shipped WAL ------
+# With pagestore.redo_wal_from_store on, redo_page_asof reads its WAL records from
+# the daemon's shipped per-timeline log instead of local files -- so a compute with
+# no local WAL (a fresh branch) can materialize a page.  Ship the segment first.
+sw0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE swal(id int, v text) WITH (autovacuum_enabled=off);
+       INSERT INTO swal VALUES (1,'sw_base');
+       CHECKPOINT;" >/dev/null
+$P -c "UPDATE swal SET v='sw_fpi' WHERE id=1;" >/dev/null   # FPI of block 0 after the checkpoint
+$P -c "INSERT INTO swal VALUES (2,'sw_delta');" >/dev/null  # a delta on block 0
+sw1=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pg_switch_wal();" >/dev/null                  # complete the segment -> shipped to the store
+sleep 2
+$P -c "SELECT pagestore_index_wal('$sw0', '$sw1');" >/dev/null
+sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
+  SELECT position('sw_fpi'::bytea   in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0
+     AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
+assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's shipped WAL (store-backed reader)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

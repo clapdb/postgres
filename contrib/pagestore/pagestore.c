@@ -64,6 +64,7 @@ static bool pagestore_route_all = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
+static bool pagestore_redo_wal_from_store = false;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -755,6 +756,35 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Store-backed WAL page reader for redo.  The records that materialize a page
+ * can live on ancestor timelines (a branch's deltas predate the branch point);
+ * a branch compute may not have that ancestor WAL locally.  This page_read
+ * callback serves a WAL page from the store's shipped per-timeline log when the
+ * record's source timeline (ps_redo_cur_timeline, set per record from the walidx
+ * tag) is not this compute's own, or when pagestore.redo_wal_from_store forces it
+ * (a compute with no local WAL at all); otherwise it reads the local WAL.
+ */
+static uint32 ps_redo_cur_timeline;		/* timeline of the record being read */
+static uint32 ps_redo_local_timeline;	/* this compute's own timeline */
+
+static int
+ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+				  XLogRecPtr targetRecPtr, char *readBuf)
+{
+	if (pagestore_redo_wal_from_store ||
+		ps_redo_cur_timeline != ps_redo_local_timeline)
+	{
+		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
+													(uint64) targetPagePtr,
+													(uint32) reqLen, readBuf);
+
+		return (n >= reqLen) ? reqLen : -1;
+	}
+	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
+										targetRecPtr, readBuf);
+}
+
+/*
  * Liveness: scan local WAL in (from_lsn, to_lsn] for an smgr truncate of
  * (rloc, forknum) down to <= block.  If found, the block was truncated away after
  * its last write and not re-extended, so it is not live as of to_lsn and must not
@@ -852,7 +882,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_redo_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -862,6 +892,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		pfree(recs);
 		PG_RETURN_NULL();
 	}
+	/* records on ancestor timelines are served from the store's shipped WAL */
+	ps_redo_local_timeline = pagestore_localsvc_timeline();
 	base = palloc(BLCKSZ);
 	page = palloc(BLCKSZ);
 
@@ -871,6 +903,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
+		ps_redo_cur_timeline = recs[i].timeline;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -913,15 +946,26 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * materialize a stale page for it.  recs[n - 1].lsn is the block's newest record
 	 * at/below lsn.
 	 */
-	if (redo_block_truncated_away(reader, rloc, forknum, (BlockNumber) blocknum,
-								  (XLogRecPtr) recs[n - 1].lsn, lsn))
 	{
-		XLogReaderFree(reader);
-		pfree(pd);
-		pfree(recs);
-		pfree(base);
-		pfree(page);
-		PG_RETURN_NULL();
+		bool		from_store = pagestore_redo_wal_from_store;
+		bool		dead;
+
+		/* the truncate scan walks this compute's own recent WAL (local) */
+		pagestore_redo_wal_from_store = false;
+		ps_redo_cur_timeline = ps_redo_local_timeline;
+		dead = redo_block_truncated_away(reader, rloc, forknum,
+										 (BlockNumber) blocknum,
+										 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		pagestore_redo_wal_from_store = from_store;
+		if (dead)
+		{
+			XLogReaderFree(reader);
+			pfree(pd);
+			pfree(recs);
+			pfree(base);
+			pfree(page);
+			PG_RETURN_NULL();
+		}
 	}
 
 	/* replay: base image, then every record after it, through the helper */
@@ -937,6 +981,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		uint32		firstpage;
 		char	   *raw;
 
+		ps_redo_cur_timeline = recs[i].timeline;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -1147,6 +1192,16 @@ _PG_init(void)
 							   PGC_SUSET,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pagestore.redo_wal_from_store",
+							 "Read redo_page_asof's WAL records from the store's shipped WAL, not local files.",
+							 "Ancestor-timeline records always come from the store; this forces it for "
+							 "all records, so a compute with no local WAL (a fresh branch) can replay deltas.",
+							 &pagestore_redo_wal_from_store,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pagestore");
 
