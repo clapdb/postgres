@@ -1270,9 +1270,18 @@ pagestore_control_write_hook(const ControlFileData *cf)
 {
 	PageStoreRelKey key;
 	char		buf[BLCKSZ];
+	MemoryContext oldcontext;
 
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return;
+	/*
+	 * NB: unlike the SLRU hook we do NOT skip critical sections here -- pg_control
+	 * is updated almost exclusively from inside the checkpoint/shutdown critical
+	 * section (e.g. xlog.c CreateCheckPoint), so skipping would never mirror it.
+	 * The mirror's fallible shm I/O is therefore a known prototype risk in a
+	 * critical section (a daemon error would PANIC); a production build would defer
+	 * the mirror to a checkpoint-completion callback / async shipper instead.
+	 */
 
 	/* pg_control fits in a single block (PG_CONTROL_FILE_SIZE <= BLCKSZ) */
 	memset(buf, 0, sizeof(buf));
@@ -1283,13 +1292,21 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	key.relNumber = 0;
 	key.forkNum = 0;
 
+	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
 		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, buf);
 	}
 	PG_CATCH();
 	{
-		FlushErrorState();		/* never let a mirroring failure break a control write */
+		int			sqlerrcode = geterrcode();
+
+		/* restore context; re-throw cancel/shutdown, swallow only mirror I/O errors */
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
 	}
 	PG_END_TRY();
 }

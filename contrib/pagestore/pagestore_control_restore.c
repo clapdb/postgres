@@ -86,11 +86,15 @@ cl_exec(PsChannel *ch)
 	}
 }
 
-/* The single control object: klass=CONTROL on the main timeline, block 0. */
+/* Timeline pg_control was written to (the writer's localsvc_timeline; 0 = main,
+ * >0 for a branch compute).  Set with --timeline. */
+static uint32_t restore_timeline = 0;
+
+/* The single control object: klass=CONTROL, block 0, on the chosen timeline. */
 static void
 fill_control_key(PsChannel *ch)
 {
-	ch->timeline = 0;
+	ch->timeline = restore_timeline;
 	ch->key.spcOid = 0;
 	ch->key.dbOid = 0;
 	ch->key.relNumber = 0;
@@ -117,17 +121,19 @@ main(int argc, char **argv)
 			pgdata = argv[++i];
 		else if (strcmp(argv[i], "--page-size") == 0 && i + 1 < argc)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--timeline") == 0 && i + 1 < argc)
+			restore_timeline = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else
 		{
 			fprintf(stderr, "usage: %s --shm <name> --pgdata <dir> "
-					"[--page-size N]\n", argv[0]);
+					"[--page-size N] [--timeline N]\n", argv[0]);
 			return 2;
 		}
 	}
 	if (shm_name == NULL || pgdata == NULL)
 	{
 		fprintf(stderr, "usage: %s --shm <name> --pgdata <dir> "
-				"[--page-size N]\n", argv[0]);
+				"[--page-size N] [--timeline N]\n", argv[0]);
 		return 2;
 	}
 
@@ -141,6 +147,7 @@ main(int argc, char **argv)
 	if (ch->result == 0)
 	{
 		fprintf(stderr, "pg_control is not present on the store\n");
+		ps_store_release(&ps_channel(shm, chan)->claimed, 0);
 		return 1;
 	}
 
@@ -155,6 +162,9 @@ main(int argc, char **argv)
 	memset(buf, 0, sizeof(buf));
 	n = page_size < PG_CONTROL_FILE_SIZE ? page_size : PG_CONTROL_FILE_SIZE;
 	memcpy(buf, ch->data, n);
+
+	/* daemon work is done; release the channel for reuse before file I/O */
+	ps_store_release(&ps_channel(shm, chan)->claimed, 0);
 
 	snprintf(path, sizeof(path), "%s/global/pg_control", pgdata);
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
