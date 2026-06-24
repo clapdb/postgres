@@ -48,6 +48,7 @@
 #include "storage/bufpage.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
@@ -664,6 +665,10 @@ pagestore_walidx_count(PG_FUNCTION_ARGS)
  */
 #define PS_REDO_MAX_RECS 4096
 
+/* Advisory-lock key serializing wal-redo helper spawns across backends (see
+ * pagestore_redo_page_asof). */
+#define PS_WALREDO_ADVLOCK_KEY	INT64CONST(0x70616773746f7265)	/* "pagstore" */
+
 PG_FUNCTION_INFO_V1(pagestore_redo_page);
 
 Datum
@@ -694,6 +699,13 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 									  lsns, PS_REDO_MAX_RECS);
 	if (n == 0)
 		PG_RETURN_NULL();
+	if (n > PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: too many WAL records (%d) at/below %X/%08X for relation %u fork %d block %d; exceeds the redo cap of %d, cannot materialize an as-of page",
+						n, LSN_FORMAT_ARGS(lsn), relid, forknum, blocknum,
+						PS_REDO_MAX_RECS),
+				 errhint("Only the first %d indexed records were fetched; the result would omit later deltas.",
+						 PS_REDO_MAX_RECS)));
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -803,6 +815,13 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 									  lsns, PS_REDO_MAX_RECS);
 	if (n == 0)
 		PG_RETURN_NULL();
+	if (n > PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: too many WAL records (%d) at/below %X/%08X for relation %u fork %d block %d; exceeds the redo cap of %d, cannot materialize an as-of page",
+						n, LSN_FORMAT_ARGS(lsn), relid, forknum, blocknum,
+						PS_REDO_MAX_RECS),
+				 errhint("Only the first %d indexed records were fetched; the result would omit later deltas.",
+						 PS_REDO_MAX_RECS)));
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -862,6 +881,16 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	}
 
 	/* replay: base image, then every record after it, through the helper */
+	/*
+	 * The helper holds the data-directory lock (postmaster.pid) on the shared
+	 * pagestore.walredo_datadir for its whole lifetime, so two backends running
+	 * redo concurrently would collide and the second helper would fail to start.
+	 * Serialize spawns with a transaction-level advisory lock (auto-released at
+	 * xact end, including on error).  A per-backend scratch datadir would instead
+	 * allow concurrency; serialization is the phase-1 choice.
+	 */
+	(void) DirectFunctionCall1(pg_advisory_xact_lock_int8,
+							   Int64GetDatum(PS_WALREDO_ADVLOCK_KEY));
 	p = walredo_start(pagestore_walredo_datadir);
 	walredo_begin(p, rloc, forknum, (BlockNumber) blocknum);
 	walredo_pushbase(p, base_end_lsn, base);
@@ -945,6 +974,16 @@ pagestore_walredo_roundtrip(PG_FUNCTION_ARGS)
 				(errmsg("pagestore.walredo_datadir is not set")));
 
 	out = palloc(BLCKSZ);
+	/*
+	 * The helper holds the data-directory lock (postmaster.pid) on the shared
+	 * pagestore.walredo_datadir for its whole lifetime, so two backends running
+	 * redo concurrently would collide and the second helper would fail to start.
+	 * Serialize spawns with a transaction-level advisory lock (auto-released at
+	 * xact end, including on error).  A per-backend scratch datadir would instead
+	 * allow concurrency; serialization is the phase-1 choice.
+	 */
+	(void) DirectFunctionCall1(pg_advisory_xact_lock_int8,
+							   Int64GetDatum(PS_WALREDO_ADVLOCK_KEY));
 	p = walredo_start(pagestore_walredo_datadir);
 	walredo_begin(p, rloc, MAIN_FORKNUM, 0);
 	walredo_pushbase(p, base_lsn, VARDATA_ANY(inpage));

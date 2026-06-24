@@ -947,14 +947,17 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	}
 }
 
-/* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
- * max_out); return how many.  Walks the timeline ancestry. */
+/* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (copying
+ * at most max_out), and return the TRUE total number that match -- which may
+ * exceed max_out.  Returning the true total (not the clamped copy count) lets the
+ * caller detect a saturated/truncated result instead of silently replaying only a
+ * prefix.  Walks the timeline ancestry. */
 static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		   uint64_t *out, int max_out)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
-	int			got = 0;
+	int			total = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
 
 	do
@@ -965,13 +968,17 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
-				for (int i = 0; i < e->n && got < max_out; i++)
+				for (int i = 0; i < e->n; i++)
 					if (e->lsns[i] <= w.lsn)
-						out[got++] = e->lsns[i];
+					{
+						if (total < max_out)
+							out[total] = e->lsns[i];
+						total++;	/* count all matches; copy only up to max_out */
+					}
 				break;
 			}
 	} while (tl_walk_next(&w));
-	return got;
+	return total;
 }
 
 /* ===================== write / read primitives ========================= */
