@@ -160,27 +160,55 @@ run_request(PsChannel *ch)
 		return;
 	}
 
-	if (request_is_write(op))
+	/*
+	 * IMMEDSYNC fsyncs the shared segment-fd cache; the POSIX backend serializes
+	 * that internally (seg_fds_lock), so no per-shard lock is needed (and a single
+	 * shard lock would not have excluded the other shards' fd-cache mutations).
+	 */
+	if (op == PS_OP_IMMEDSYNC)
 	{
-		/*
-		 * Writes touch only this shard's state; append_page escalates to a brief
-		 * map_wr itself when a flush/compaction mutates the map.  Per-shard locks
-		 * let writes on different shards run concurrently.
-		 */
-		ps_lock_shard_wr(ch->shard);
 		handle_request(ch);
 		ps_store_release(&ch->state, PS_STATE_DONE);
-		ps_unlock_shard(ch->shard);
+		return;
 	}
-	else
+
 	{
-		/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
-		ps_lock_shard_rd(ch->shard);
-		ps_lock_map_rd();
-		handle_request(ch);
-		ps_store_release(&ch->state, PS_STATE_DONE);
-		ps_unlock_map();
-		ps_unlock_shard(ch->shard);
+		uint32_t	shard;
+
+		/*
+		 * Derive the shard from the FINAL request key (klass-aware), not a
+		 * client-supplied ch->shard: object I/O claims its channel before setting
+		 * ch->key.klass, and freestanding IPC clients don't populate ch->shard at
+		 * all -- trusting it would lock one shard while handle_request() mutates
+		 * shard_for(&ch->key).  The shipped-WAL byte ops (append/size/read) are not
+		 * keyed (they touch the per-timeline WAL log), so serialize them on shard 0.
+		 */
+		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+			shard = 0;
+		else
+			shard = ps_shard_of(&ch->key);
+
+		if (request_is_write(op))
+		{
+			/*
+			 * Writes touch only this shard's state; append_page escalates to a
+			 * brief map_wr itself when a flush/compaction mutates the map.
+			 */
+			ps_lock_shard_wr(shard);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_shard(shard);
+		}
+		else
+		{
+			/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+			ps_lock_shard_rd(shard);
+			ps_lock_map_rd();
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_map();
+			ps_unlock_shard(shard);
+		}
 	}
 }
 

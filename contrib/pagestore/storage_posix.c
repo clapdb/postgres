@@ -195,6 +195,15 @@ posix_close(void)
 static int
 posix_sync(void)
 {
+	int			rc = 0;
+
+	/*
+	 * Walk the shared seg-fd cache under seg_fds_lock so a concurrent shard
+	 * worker cannot lazily open a segment and realloc seg_fds[]/seg_fds_caps[]
+	 * while we iterate (with per-shard locking the caller no longer holds a
+	 * global write lock that would have excluded that).
+	 */
+	pthread_mutex_lock(&seg_fds_lock);
 	for (int shard = 0; shard < seg_shards_cap; shard++)
 	{
 		int *fds = seg_fds[shard];
@@ -204,9 +213,14 @@ posix_sync(void)
 			continue;
 		for (int id = 0; id < cap; id++)
 			if (fds[id] >= 0 && fsync(fds[id]) != 0)
-				return -1;
+			{
+				rc = -1;
+				goto out;
+			}
 	}
-	return 0;
+out:
+	pthread_mutex_unlock(&seg_fds_lock);
+	return rc;
 }
 
 static int

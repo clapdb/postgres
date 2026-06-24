@@ -186,6 +186,21 @@ shard_for(const PsKey *key)
 	return &g_shards[ps_key_shard(key, ns)];
 }
 
+/*
+ * Shard index that will actually be touched for 'key' (klass-aware), so the
+ * frontend can take the matching per-shard lock from the FINAL request key
+ * rather than trusting a client-supplied channel shard.
+ */
+uint32_t
+ps_shard_of(const PsKey *key)
+{
+	uint32_t	ns = core_shards();
+
+	if (ns == 1 || !key)
+		return 0;
+	return ps_key_shard(key, ns);
+}
+
 uint32_t
 ps_core_layer_count(void)
 {
@@ -204,9 +219,9 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 
 	for (uint32_t i = 0; i < ns; i++)
 	{
-		m += g_shards[i].rr_mem;
-		l += g_shards[i].rr_layer;
-		s += g_shards[i].rr_seg;
+		m += __atomic_load_n(&g_shards[i].rr_mem, __ATOMIC_RELAXED);
+		l += __atomic_load_n(&g_shards[i].rr_layer, __ATOMIC_RELAXED);
+		s += __atomic_load_n(&g_shards[i].rr_seg, __ATOMIC_RELAXED);
 	}
 	if (mem)
 		*mem = m;
@@ -1206,18 +1221,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
-				s->rr_mem++;
+				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
 			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
-				s->rr_layer++;
+				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from an image layer */
 			}
 			else
 			{
-				s->rr_seg++;
+				__atomic_fetch_add(&s->rr_seg, 1, __ATOMIC_RELAXED);
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
 			if (served)

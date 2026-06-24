@@ -95,4 +95,8 @@ extern void ps_lock_map_rd(void);
 extern void ps_lock_map_wr(void);
 extern void ps_unlock_map(void);
 
+/* Shard index that will be touched for 'key' (klass-aware); the frontend takes
+ * the per-shard lock from the final request key, not a client-supplied shard. */
+extern uint32_t ps_shard_of(const PsKey *key);
+
 #endif							/* PAGESTORE_CORE_H */
