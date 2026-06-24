@@ -344,7 +344,7 @@ cleanup:
 
 /* ===================== segment storage (log-structured) ================= */
 
-#define SEG_MAGIC	0x53454752	/* "SEGR" */
+#define SEG_MAGIC	0x53454732	/* "SEG2": segment record format v2 (PsKey gained klass) */
 
 /*
  * On-disk layout of one appended page version: this header immediately

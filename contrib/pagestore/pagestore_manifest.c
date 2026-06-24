@@ -19,7 +19,7 @@
 #include "pagestore_manifest.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
-#define PS_MANIFEST_VERSION 1
+#define PS_MANIFEST_VERSION 2	/* 2: layer descriptors embed PsKey with the klass field */
 
 typedef enum PsManifestEventType
 {

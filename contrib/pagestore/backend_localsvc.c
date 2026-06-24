@@ -124,7 +124,7 @@ ls_attach(void)
 }
 
 static uint32
-ls_key_shard(const PageStoreRelKey *key)
+ls_key_shard_klass(const PageStoreRelKey *key, uint32 klass)
 {
 	if (!key)
 		return 0;
@@ -135,9 +135,15 @@ ls_key_shard(const PageStoreRelKey *key)
 		k.dbOid = key->dbOid;
 		k.relNumber = key->relNumber;
 		k.forkNum = key->forkNum;
-		k.klass = PS_KLASS_RELATION;
+		k.klass = klass;
 		return ps_key_shard(&k, ls_nshards);
 	}
+}
+
+static uint32
+ls_key_shard(const PageStoreRelKey *key)
+{
+	return ls_key_shard_klass(key, PS_KLASS_RELATION);
 }
 
 static void
@@ -190,6 +196,15 @@ static PsChannel *
 ls_chan_for_key(const PageStoreRelKey *key)
 {
 	ls_claim_channel(ls_key_shard(key));
+	return ps_channel(ls_shm, ls_channel);
+}
+
+/* Like ls_chan_for_key but routes by the object's actual class, so a non-relation
+ * object lands on the shard worker that owns shard_for(key) with that klass. */
+static PsChannel *
+ls_chan_for_key_klass(const PageStoreRelKey *key, uint32 klass)
+{
+	ls_claim_channel(ls_key_shard_klass(key, klass));
 	return ps_channel(ls_shm, ls_channel);
 }
 
@@ -606,7 +621,7 @@ void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 							 BlockNumber block, const void *page)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
 
 	/* ensure the object's fork exists (tolerate an existing one) */
@@ -637,7 +652,7 @@ void
 pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 							BlockNumber block, void *page)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
