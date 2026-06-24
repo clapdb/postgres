@@ -255,6 +255,16 @@ mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
 slru_status=$($P -c "SELECT pg_xact_status('$slru_xid');")
 assert "$slru_status" "committed" "clog served from the store with the local pg_xact segment absent (compute reads SLRU from store)"
 
+# --- 11. pg_control on the store via the klass seam + UpdateControlFile hook -----
+# The control-file write hook mirrors pg_control onto the store as a
+# PS_KLASS_CONTROL object on every write.  After a checkpoint, the store's control
+# image must carry the current checkpoint LSN -- real cluster metadata on the store.
+$P -c "CREATE FUNCTION pagestore_control_checkpoint_lsn() RETURNS pg_lsn
+        AS 'pagestore','pagestore_control_checkpoint_lsn' LANGUAGE C STRICT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+ctl_match=$($P -c "SELECT pagestore_control_checkpoint_lsn() = (SELECT checkpoint_lsn FROM pg_control_checkpoint());")
+assert "$ctl_match" "t" "pg_control mirrored to the store carries the current checkpoint LSN (control on store)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

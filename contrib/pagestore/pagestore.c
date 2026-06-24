@@ -40,6 +40,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "fmgr.h"
@@ -1257,6 +1258,72 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * Control-file write hook (installed into xlog.c): mirror pg_control onto the
+ * store as a PS_KLASS_CONTROL object whenever it is written.  Cluster control
+ * state on the store via the same klass seam -- the foundation for a compute
+ * reading cluster metadata from the store.  Best-effort (PG_TRY); runs in many
+ * contexts (checkpointer, startup, backends), each attaching the shm lazily.
+ */
+static void
+pagestore_control_write_hook(const ControlFileData *cf)
+{
+	PageStoreRelKey key;
+	char		buf[BLCKSZ];
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	/* pg_control fits in a single block (PG_CONTROL_FILE_SIZE <= BLCKSZ) */
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, cf, Min(sizeof(ControlFileData), (size_t) BLCKSZ));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = 0;
+	key.forkNum = 0;
+
+	PG_TRY();
+	{
+		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, buf);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();		/* never let a mirroring failure break a control write */
+	}
+	PG_END_TRY();
+}
+
+/*
+ * pagestore_control_checkpoint_lsn() returns pg_lsn -- the checkpoint LSN from
+ * the pg_control image on the store (verifies the write hook mirrored the
+ * current control file).
+ */
+PG_FUNCTION_INFO_V1(pagestore_control_checkpoint_lsn);
+Datum
+pagestore_control_checkpoint_lsn(PG_FUNCTION_ARGS)
+{
+	PageStoreRelKey key;
+	char	   *buf;
+	ControlFileData *cf;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = 0;
+	key.forkNum = 0;
+
+	buf = palloc(BLCKSZ);
+	if (!pagestore_localsvc_obj_read(PS_KLASS_CONTROL, &key, 0, buf))
+		ereport(ERROR,
+				(errmsg("pg_control is not present on the store")));
+	cf = (ControlFileData *) buf;
+	PG_RETURN_LSN(cf->checkPoint);
+}
+
 void
 _PG_init(void)
 {
@@ -1330,4 +1397,7 @@ _PG_init(void)
 	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
 	slru_page_write_hook = pagestore_slru_write_hook;
 	slru_page_read_hook = pagestore_slru_read_hook;
+
+	/* mirror the control file (pg_control) onto the store as well */
+	control_file_write_hook = pagestore_control_write_hook;
 }

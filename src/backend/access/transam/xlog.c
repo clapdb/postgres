@@ -574,6 +574,9 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  */
 static ControlFileData *ControlFile = NULL;
 
+/* Optional hook to mirror the control file to an external store on each write. */
+ControlFileWriteHook_type control_file_write_hook = NULL;
+
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
  * multiple evaluation!
@@ -4582,6 +4585,10 @@ static void
 UpdateControlFile(void)
 {
 	update_controlfile(DataDir, ControlFile, true);
+
+	/* mirror the just-written control file to an external store, if hooked */
+	if (control_file_write_hook)
+		control_file_write_hook(ControlFile);
 }
 
 /*
