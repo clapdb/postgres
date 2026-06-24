@@ -432,7 +432,7 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
 static int
 op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
-			  uint64_t lsn_max, uint64_t *out)
+			  uint64_t lsn_max, PsWalRec *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	int			n;
@@ -443,7 +443,7 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
 	n = (int) cl_exec()->result;
-	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
+	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
 }
 
@@ -852,7 +852,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	char		store[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
-	uint64_t	out[16];
+	PsWalRec	out[16];
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
@@ -872,13 +872,15 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
 
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
-	check(n == 2 && out[0] == 100 && out[1] == 200,
+	check(n == 2 && out[0].lsn == 100 && out[1].lsn == 200,
 		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
 	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
-	check(n == 3 && out[2] == 300, "index returns all records up to a high lsn");
+	check(n == 3 && out[2].lsn == 300, "index returns all records up to a high lsn");
+	check(out[0].timeline == 0 && out[2].timeline == 0,
+		  "records on the root timeline are tagged timeline 0");
 	check(op_walidx_get(0, REL_A, FORK0, 0, 50, out) == 0, "no records below the first lsn");
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
-	check(n == 1 && out[0] == 150, "per-block separation (block 1 -> [150])");
+	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
@@ -887,6 +889,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
 	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
 	check(n == 3, "branch index reads through to parent capped at the branch lsn");
+	/* merged in ascending LSN order across the ancestry */
+	check(out[0].lsn == 100 && out[1].lsn == 200 && out[2].lsn == 400,
+		  "branch records are merged in ascending LSN order");
+	/* each record is tagged with the timeline it lives on: parent's on 0, branch's on 1 */
+	check(out[0].timeline == 0 && out[1].timeline == 0 && out[2].timeline == 1,
+		  "each record carries its source timeline tag (parent=0, branch=1)");
 
 	client_detach();
 	stop_daemon(dpid);

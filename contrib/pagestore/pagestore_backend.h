@@ -29,6 +29,8 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 
+#include "pagestore_ipc.h"		/* PsWalRec */
+
 /*
  * Version-neutral physical identity of a relation fork.  Deliberately built
  * from plain OIDs / numbers rather than RelFileLocator so the on-the-wire
@@ -153,7 +155,7 @@ extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn_max,
-										  uint64 *out, int maxn);
+										  PsWalRec *out, int maxn);
 extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 										 BlockNumber block, const void *page);
 extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,

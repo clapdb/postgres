@@ -592,7 +592,7 @@ pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
  * returns how many.  Ascending order. */
 int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
-							  uint64 lsn_max, uint64 *out, int maxn)
+							  uint64 lsn_max, PsWalRec *out, int maxn)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 	int			n;
@@ -605,7 +605,7 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	n = (int) ch->result;
 	if (n > maxn)
 		n = maxn;
-	memcpy(out, ch->data, (size_t) n * sizeof(uint64));
+	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
 }
 
