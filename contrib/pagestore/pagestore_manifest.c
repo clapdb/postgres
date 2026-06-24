@@ -50,6 +50,7 @@ typedef struct PsManifestKeyDisk
 	uint32_t	dbOid;
 	uint32_t	relNumber;
 	int32_t		forkNum;
+	uint32_t	klass;			/* PsObjClass; manifest v2 */
 } PsManifestKeyDisk;
 
 typedef struct PsManifestLocationDisk
@@ -159,6 +160,7 @@ manifest_encode_key(PsManifestKeyDisk *dst, const PsKey *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;
 }
 
 static void

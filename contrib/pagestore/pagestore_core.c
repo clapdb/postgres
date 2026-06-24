@@ -1200,9 +1200,27 @@ recover(uint32_t shard)
 		{
 			SegRecHdr	hdr;
 
-			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0 ||
-				hdr.magic != SEG_MAGIC || hdr.len != page_size)
-				break;
+			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0)
+				break;			/* short read -> end of this segment's data */
+			if (hdr.magic == 0)
+				break;			/* zeroed slot -> normal end-of-log sentinel */
+			if (hdr.magic != SEG_MAGIC)
+			{
+				/*
+				 * A non-zero magic that isn't ours is a record written by an
+				 * incompatible (pre-klass) on-disk format.  Fail fast instead of
+				 * treating it as end-of-log and overwriting it -- that would
+				 * silently lose the existing store.  It must be recreated (or
+				 * migrated offline) under the new format.
+				 */
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
+						"record magic %#x (expected %#x) at offset %llu; this store "
+						"predates the current on-disk format and must be recreated\n",
+						shard, id, hdr.magic, SEG_MAGIC, (unsigned long long) off);
+				exit(1);
+			}
+			if (hdr.len != page_size)
+				break;			/* our magic but a torn/short tail record */
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, shard, id,
 							 off + sizeof(hdr));

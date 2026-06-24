@@ -165,7 +165,7 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
  * stores and serves the ordered deltas.
  * ------------------------------------------------------------------------- */
 #define PS_DELTA_MAGIC		0x544c4450	/* "PDLT" */
-#define PS_DELTA_VERSION	1
+#define PS_DELTA_VERSION	2	/* 2: index entries embed PsKey with the klass field */
 
 typedef struct PsDeltaIndexEnt
 {
