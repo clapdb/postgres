@@ -648,11 +648,24 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ls_exec(ch);
 }
 
-void
+bool
 pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 							BlockNumber block, void *page)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	BlockNumber nb;
+
+	/* Is the block present in the store?  (the object's fork must reach it) */
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_NBLOCKS;
+	ls_exec(ch);
+	nb = (BlockNumber) ch->result;
+	if (block >= nb)
+	{
+		memset(page, 0, BLCKSZ);	/* not in the store */
+		return false;
+	}
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -661,6 +674,7 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->nblocks = 1;
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
+	return true;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

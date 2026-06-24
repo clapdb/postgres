@@ -239,10 +239,21 @@ assert "$live_after" "t" "redo_page_asof returns NULL for a block truncated away
 # through the real PG SLRU path, on the store.
 $P -c "CREATE FUNCTION pagestore_slru_get(text,int) RETURNS bytea
         AS 'pagestore','pagestore_slru_get' LANGUAGE C STRICT;" >/dev/null
-$P -c "SELECT pg_current_xact_id();" >/dev/null
+slru_xid=$($P -c "SELECT pg_current_xact_id();")     # a committed xid on clog page 0
 $P -c "CHECKPOINT;" >/dev/null
 slru_match=$($P -c "SELECT pagestore_slru_get('pg_xact', 0) = pg_read_binary_file('pg_xact/0000', 0, 8192);")
 assert "$slru_match" "t" "real clog page mirrored to the store matches the local pg_xact segment (SLRU on store)"
+
+# --- 10. read side: serve clog from the store with the local segment absent -----
+# Turn on read-from-store, stop, hide the local clog segment, restart.  The xid
+# committed above must still read 'committed' -- with pg_xact/0000 gone it can only
+# have come from the store, so a compute is serving SLRU from the shared store.
+echo "pagestore.slru_read_from_store = on" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+slru_status=$($P -c "SELECT pg_xact_status('$slru_xid');")
+assert "$slru_status" "committed" "clog served from the store with the local pg_xact segment absent (compute reads SLRU from store)"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

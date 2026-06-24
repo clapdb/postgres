@@ -189,8 +189,9 @@ static bool SlruScanDirCbDeleteCutoff(SlruCtl ctl, char *filename,
 static void SlruInternalDeleteSegment(SlruCtl ctl, int64 segno);
 static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 
-/* Optional hook to mirror each written SLRU page to an external store. */
+/* Optional hooks to mirror/serve SLRU pages to/from an external store. */
 SlruPageWriteHook_type slru_page_write_hook = NULL;
+SlruPageReadHook_type slru_page_read_hook = NULL;
 
 
 /*
@@ -821,6 +822,15 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+
+	/*
+	 * Serve the page from an external store if a hook is installed and has it
+	 * (e.g. contrib/pagestore lets a compute read SLRU pages from the shared
+	 * store).  On a miss the hook returns false and we read the local segment.
+	 */
+	if (slru_page_read_hook &&
+		slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
+		return true;
 
 	SlruFileName(ctl, path, segno);
 

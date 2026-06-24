@@ -1148,6 +1148,48 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	PG_END_TRY();
 }
 
+/* GUC: when on, the read hook below serves SLRU pages from the store. */
+static bool pagestore_slru_read_from_store = false;
+
+/*
+ * SLRU page-read hook (installed into slru.c): serve an SLRU page from the store
+ * instead of the local segment file.  Returns true (page filled) when enabled and
+ * the store has the page, else false to fall back to the local read.  This lets a
+ * compute read shared cluster state (clog, ...) from the store -- e.g. one whose
+ * local SLRU files are absent or stale.  Best-effort: any error falls back.
+ */
+static bool
+pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
+{
+	PageStoreRelKey key;
+	bool		served = false;
+
+	if (!pagestore_slru_read_from_store)
+		return false;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+	if (pageno < 0 || pageno > (int64) UINT32_MAX)
+		return false;
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = slru_klass_id(ctl->Dir);
+	key.forkNum = 0;
+
+	PG_TRY();
+	{
+		served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
+											 (BlockNumber) pageno, page);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();		/* on any error, fall back to the local read */
+		served = false;
+	}
+	PG_END_TRY();
+	return served;
+}
+
 /*
  * pagestore_slru_get(slru_name text, pageno int) returns bytea -- read an SLRU
  * page back from the store (used to verify the write hook mirrored it).
@@ -1234,6 +1276,16 @@ _PG_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pagestore.slru_read_from_store",
+							 "Serve SLRU pages (clog, ...) from the page store instead of local files.",
+							 "Lets a compute read shared cluster state from the store; falls back "
+							 "to the local segment for pages the store does not have.",
+							 &pagestore_slru_read_from_store,
+							 false,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("pagestore");
 
 	/* register our smgr implementation and claim relations via the hook */
@@ -1242,4 +1294,5 @@ _PG_init(void)
 
 	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
 	slru_page_write_hook = pagestore_slru_write_hook;
+	slru_page_read_hook = pagestore_slru_read_hook;
 }

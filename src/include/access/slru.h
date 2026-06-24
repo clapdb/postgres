@@ -177,6 +177,15 @@ typedef void (*SlruPageWriteHook_type) (SlruCtl ctl, int64 pageno,
 extern PGDLLIMPORT SlruPageWriteHook_type slru_page_write_hook;
 
 /*
+ * Hook consulted before reading an SLRU page from its segment file.  If set and
+ * it returns true, it has filled the BLCKSZ page buffer from an external store
+ * and the local read is skipped; if it returns false, the normal local read
+ * proceeds.  Lets a compute serve SLRU pages (clog, ...) from a shared store.
+ */
+typedef bool (*SlruPageReadHook_type) (SlruCtl ctl, int64 pageno, char *page);
+extern PGDLLIMPORT SlruPageReadHook_type slru_page_read_hook;
+
+/*
  * Get the SLRU bank lock for given SlruCtl and the pageno.
  *
  * This lock needs to be acquired to access the slru buffer slots in the
