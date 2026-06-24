@@ -20,6 +20,8 @@
 #include <unistd.h>
 
 #include "miscadmin.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 #include "walredo_client.h"
 
 struct WalRedoProc
@@ -90,6 +92,23 @@ wc_read_all(WalRedoProc *p, void *buf, size_t len)
 		{
 			if (errno == EINTR)
 				continue;
+			/*
+			 * rfd is non-blocking (set in walredo_start): when the helper has
+			 * not produced output yet, wait on the backend latch so a query
+			 * cancel / statement timeout is honored promptly (a plain blocking
+			 * read() would not be interrupted under SA_RESTART, leaving the
+			 * helper -- and the datadir lock -- stuck until it replies).
+			 */
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				(void) WaitLatchOrSocket(MyLatch,
+										 WL_LATCH_SET | WL_SOCKET_READABLE |
+										 WL_EXIT_ON_PM_DEATH,
+										 p->rfd, -1L, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
 			wc_die(p, "read from helper failed");
 		}
 		if (n == 0)
@@ -126,83 +145,113 @@ walredo_start(const char *datadir)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open wal-redo lock file \"%s\": %m", lockpath)));
-	while (flock(p->lock_fd, LOCK_EX | LOCK_NB) != 0)
+	PG_TRY();
 	{
-		if (errno != EWOULDBLOCK && errno != EINTR)
+		while (flock(p->lock_fd, LOCK_EX | LOCK_NB) != 0)
+		{
+			if (errno != EWOULDBLOCK && errno != EINTR)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not lock wal-redo datadir \"%s\": %m", datadir)));
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(10000);	/* 10 ms */
+		}
+
+		if (pipe(in) != 0)
+			ereport(ERROR,
+					(errcode_for_socket_access(),
+					 errmsg("could not create pipe for wal-redo helper: %m")));
+		if (pipe(out) != 0)
 		{
 			int			save = errno;
 
-			close(p->lock_fd);
-			p->lock_fd = -1;
+			close(in[0]);		/* don't leak the first pipe's descriptors */
+			close(in[1]);
 			errno = save;
 			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not lock wal-redo datadir \"%s\": %m", datadir)));
+					(errcode_for_socket_access(),
+					 errmsg("could not create pipe for wal-redo helper: %m")));
 		}
-		CHECK_FOR_INTERRUPTS();
-		pg_usleep(10000);		/* 10 ms */
-	}
 
-	if (pipe(in) != 0)
-	{
-		close(p->lock_fd);
-		p->lock_fd = -1;
-		ereport(ERROR,
-				(errcode_for_socket_access(),
-				 errmsg("could not create pipe for wal-redo helper: %m")));
-	}
-	if (pipe(out) != 0)
-	{
-		int			save = errno;
+		p->pid = fork();
+		if (p->pid < 0)
+		{
+			int			save = errno;
 
-		close(in[0]);			/* don't leak the first pipe's descriptors */
-		close(in[1]);
-		close(p->lock_fd);
-		p->lock_fd = -1;
-		errno = save;
-		ereport(ERROR,
-				(errcode_for_socket_access(),
-				 errmsg("could not create pipe for wal-redo helper: %m")));
-	}
+			close(in[0]);
+			close(in[1]);
+			close(out[0]);
+			close(out[1]);
+			errno = save;
+			ereport(ERROR,
+					(errcode_for_socket_access(),
+					 errmsg("could not fork wal-redo helper: %m")));
+		}
 
-	p->pid = fork();
-	if (p->pid < 0)
-	{
-		int			save = errno;
+		if (p->pid == 0)
+		{
+			/* child: wire pipes to stdin/stdout and exec the helper */
+			dup2(in[0], STDIN_FILENO);
+			dup2(out[1], STDOUT_FILENO);
+			close(in[0]);
+			close(in[1]);
+			close(out[0]);
+			close(out[1]);
+			close(p->lock_fd);	/* the parent holds the flock; child must not */
+			/* argv[0] must be the full path so the helper can locate its own
+			 * executable (InitStandaloneProcess -> find_my_exec) */
+			execl(my_exec_path, my_exec_path, "--wal-redo", "-D", datadir, (char *) NULL);
+			_exit(127);			/* exec failed */
+		}
 
+		/* parent: keep our ends */
 		close(in[0]);
-		close(in[1]);
-		close(out[0]);
 		close(out[1]);
-		close(p->lock_fd);
-		p->lock_fd = -1;
-		errno = save;
-		ereport(ERROR,
-				(errcode_for_socket_access(),
-				 errmsg("could not fork wal-redo helper: %m")));
-	}
+		p->wfd = in[1];
+		p->rfd = out[0];
 
-	if (p->pid == 0)
+		/*
+		 * Read end non-blocking so wc_read_all() can wait on the backend latch and
+		 * stay cancelable while the helper computes.
+		 */
+		if (fcntl(p->rfd, F_SETFL, O_NONBLOCK) != 0)
+			ereport(ERROR,
+					(errcode_for_socket_access(),
+					 errmsg("could not set wal-redo pipe non-blocking: %m")));
+	}
+	PG_CATCH();
 	{
-		/* child: wire pipes to stdin/stdout and exec the helper */
-		dup2(in[0], STDIN_FILENO);
-		dup2(out[1], STDOUT_FILENO);
-		close(in[0]);
-		close(in[1]);
-		close(out[0]);
-		close(out[1]);
-		close(p->lock_fd);		/* the parent holds the flock; child must not */
-		/* argv[0] must be the full path so the helper can locate its own
-		 * executable (InitStandaloneProcess -> find_my_exec) */
-		execl(my_exec_path, my_exec_path, "--wal-redo", "-D", datadir, (char *) NULL);
-		_exit(127);				/* exec failed */
+		/*
+		 * On any error -- including a cancel/timeout taken at CHECK_FOR_INTERRUPTS
+		 * while queued on the flock -- reap whatever was started and close the raw
+		 * fds; none are resource-owned, so they would otherwise leak across the
+		 * ERROR unwind.
+		 */
+		if (p->pid > 0)
+		{
+			kill(p->pid, SIGKILL);
+			while (waitpid(p->pid, NULL, 0) < 0 && errno == EINTR)
+				;
+			p->pid = 0;
+		}
+		if (p->wfd >= 0)
+		{
+			close(p->wfd);
+			p->wfd = -1;
+		}
+		if (p->rfd >= 0)
+		{
+			close(p->rfd);
+			p->rfd = -1;
+		}
+		if (p->lock_fd >= 0)
+		{
+			close(p->lock_fd);
+			p->lock_fd = -1;
+		}
+		PG_RE_THROW();
 	}
-
-	/* parent: keep our ends */
-	close(in[0]);
-	close(out[1]);
-	p->wfd = in[1];
-	p->rfd = out[0];
+	PG_END_TRY();
 	return p;
 }
 
