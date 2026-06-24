@@ -1015,7 +1015,22 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
-	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
+	/*
+	 * Version key.  A relation page carries a real monotonic pd_lsn; non-relation
+	 * objects (SLRU/control) do not -- their first 8 bytes are payload, not an LSN
+	 * -- so versioning them from page_lsn() can make an overwrite compare lower
+	 * than the prior version and silently lose (and poison the pgcache for that
+	 * pseudo-LSN).  Derive a monotonic version from the existing chain instead
+	 * (newest across ancestry + 1) so the latest object write always wins.
+	 */
+	if (key->klass == PS_KLASS_RELATION)
+		hdr.lsn = page_lsn(page);
+	else
+	{
+		PageVer    *cur = read_through(timeline, key, block, UINT64_MAX);
+
+		hdr.lsn = cur ? cur->lsn + 1 : 1;
+	}
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
