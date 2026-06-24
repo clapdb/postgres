@@ -166,6 +166,17 @@ typedef struct SlruCtlData
 typedef SlruCtlData *SlruCtl;
 
 /*
+ * Hook called after an SLRU page is successfully written to its segment file,
+ * with the SLRU's control struct, the page number, and the just-written BLCKSZ
+ * page bytes.  Lets an extension mirror SLRU pages (clog, multixact, ...) to an
+ * external store; NULL (the default) disables it.  Invoked under the page's SLRU
+ * bank lock, so the callback must not block for long.
+ */
+typedef void (*SlruPageWriteHook_type) (SlruCtl ctl, int64 pageno,
+										const char *page);
+extern PGDLLIMPORT SlruPageWriteHook_type slru_page_write_hook;
+
+/*
  * Get the SLRU bank lock for given SlruCtl and the pageno.
  *
  * This lock needs to be acquired to access the slru buffer slots in the

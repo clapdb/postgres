@@ -35,6 +35,7 @@
 
 #include "access/relation.h"
 #include "access/rmgr.h"
+#include "access/slru.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -50,6 +51,7 @@
 #include "storage/bufpage.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
@@ -1094,6 +1096,90 @@ pagestore_object_get(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/* Stable per-SLRU object id derived from its directory name (e.g. "pg_xact"). */
+static uint32
+slru_klass_id(const char *dir)
+{
+	uint32		h = 2166136261u;	/* FNV-1a over the SLRU subdir name */
+
+	for (const unsigned char *p = (const unsigned char *) dir; *p != '\0'; p++)
+	{
+		h ^= *p;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/*
+ * SLRU page-write hook (installed into slru.c): mirror each just-written SLRU
+ * page (clog, multixact, ...) onto the page store as a PS_KLASS_SLRU object,
+ * keyed by (SLRU id, page number).  This is the first real consumer that puts
+ * non-relation cluster state on the store via the klass seam.
+ *
+ * Best-effort: any failure is swallowed so it can never break an SLRU write.
+ * Runs under the SLRU bank lock, so it stays a single synchronous obj_write --
+ * a production version would copy the page and ship it asynchronously.
+ */
+static void
+pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
+{
+	PageStoreRelKey key;
+
+	/* only meaningful when relations are served by the localsvc backend */
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+	if (pageno < 0 || pageno > (int64) UINT32_MAX)
+		return;					/* page number outside our block space */
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = slru_klass_id(ctl->Dir);
+	key.forkNum = 0;
+
+	PG_TRY();
+	{
+		pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, (BlockNumber) pageno, page);
+	}
+	PG_CATCH();
+	{
+		/* never let a mirroring failure break the SLRU write itself */
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * pagestore_slru_get(slru_name text, pageno int) returns bytea -- read an SLRU
+ * page back from the store (used to verify the write hook mirrored it).
+ */
+PG_FUNCTION_INFO_V1(pagestore_slru_get);
+Datum
+pagestore_slru_get(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		pageno = PG_GETARG_INT32(1);
+	PageStoreRelKey key;
+	char	   *out;
+	bytea	   *result;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = slru_klass_id(name);
+	key.forkNum = 0;
+
+	out = palloc(BLCKSZ);
+	pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, (BlockNumber) pageno, out);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
 void
 _PG_init(void)
 {
@@ -1153,4 +1239,7 @@ _PG_init(void)
 	/* register our smgr implementation and claim relations via the hook */
 	pagestore_smgr_which = smgr_register(&pagestore_smgr);
 	smgr_which_hook = pagestore_which;
+
+	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
+	slru_page_write_hook = pagestore_slru_write_hook;
 }

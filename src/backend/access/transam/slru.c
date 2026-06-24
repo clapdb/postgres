@@ -189,6 +189,9 @@ static bool SlruScanDirCbDeleteCutoff(SlruCtl ctl, char *filename,
 static void SlruInternalDeleteSegment(SlruCtl ctl, int64 segno);
 static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 
+/* Optional hook to mirror each written SLRU page to an external store. */
+SlruPageWriteHook_type slru_page_write_hook = NULL;
+
 
 /*
  * Initialization of shared memory
@@ -715,6 +718,15 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/* Now it's okay to ereport if we failed */
 	if (!ok)
 		SlruReportIOError(ctl, pageno, InvalidTransactionId);
+
+	/*
+	 * Mirror the just-written page to an external store, if a hook is installed
+	 * (e.g. contrib/pagestore places SLRU pages on the disaggregated store).  The
+	 * page bytes are still valid in the buffer here.  NB: this runs under the
+	 * SLRU bank lock, so the hook must be quick and must not error out the write.
+	 */
+	if (slru_page_write_hook)
+		slru_page_write_hook(ctl, pageno, (const char *) shared->page_buffer[slotno]);
 
 	/* If part of a checkpoint, count this as a SLRU buffer written. */
 	if (fdata)
