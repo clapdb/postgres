@@ -39,9 +39,9 @@ main(void)
 	char		dir[] = "/tmp/pslayertestXXXXXX";
 	uint32_t	psz = PSZ;
 	static unsigned char pg[5][PSZ];
-	PsKey		k5 = {1, 1, 5, 0};	/* relation 5, block 0 */
-	PsKey		k6 = {1, 1, 6, 0};	/* relation 6, block 0 */
-	PsKey		k9 = {1, 1, 9, 0};	/* absent */
+	PsKey		k5 = {1, 1, 5, 0, PS_KLASS_RELATION};	/* relation 5, block 0 */
+	PsKey		k6 = {1, 1, 6, 0, PS_KLASS_RELATION};	/* relation 6, block 0 */
+	PsKey		k9 = {1, 1, 9, 0, PS_KLASS_RELATION};	/* absent */
 	PsLayerDesc d;
 	unsigned char out[PSZ];
 	int			r;

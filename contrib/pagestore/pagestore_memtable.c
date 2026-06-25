@@ -116,7 +116,8 @@ ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 		if (e->timeline != timeline || e->block != block)
 			continue;
 		if (e->key.spcOid != key->spcOid || e->key.dbOid != key->dbOid ||
-			e->key.relNumber != key->relNumber || e->key.forkNum != key->forkNum)
+			e->key.relNumber != key->relNumber || e->key.forkNum != key->forkNum ||
+			e->key.klass != key->klass)
 			continue;
 		if (e->lsn <= read_lsn && (!best || e->lsn >= best->lsn))
 			best = e;

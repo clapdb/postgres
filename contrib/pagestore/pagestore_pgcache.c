@@ -72,7 +72,8 @@ key_eq(const PgKey *a, uint32_t tl, const PsKey *key, uint32_t block,
 {
 	return a->timeline == tl && a->block == block && a->lsn == lsn &&
 		a->key.spcOid == key->spcOid && a->key.dbOid == key->dbOid &&
-		a->key.relNumber == key->relNumber && a->key.forkNum == key->forkNum;
+		a->key.relNumber == key->relNumber && a->key.forkNum == key->forkNum &&
+		a->key.klass == key->klass;
 }
 
 void

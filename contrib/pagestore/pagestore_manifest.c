@@ -19,7 +19,7 @@
 #include "pagestore_manifest.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
-#define PS_MANIFEST_VERSION 1
+#define PS_MANIFEST_VERSION 2	/* 2: layer descriptors embed PsKey with the klass field */
 
 typedef enum PsManifestEventType
 {
@@ -50,6 +50,7 @@ typedef struct PsManifestKeyDisk
 	uint32_t	dbOid;
 	uint32_t	relNumber;
 	int32_t		forkNum;
+	uint32_t	klass;			/* PsObjClass; manifest v2 */
 } PsManifestKeyDisk;
 
 typedef struct PsManifestLocationDisk
@@ -159,6 +160,7 @@ manifest_encode_key(PsManifestKeyDisk *dst, const PsKey *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;
 }
 
 static void
@@ -168,6 +170,7 @@ manifest_decode_key(PsKey *dst, const PsManifestKeyDisk *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;
 }
 
 static int

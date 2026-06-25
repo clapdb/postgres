@@ -95,6 +95,7 @@ read_range(const uint32_t *starts, uint32_t from, uint32_t to,
 		c->key.dbOid = 1;
 		c->key.relNumber = REL;
 		c->key.forkNum = 0;
+		c->key.klass = PS_KLASS_RELATION;
 		c->timeline = 0;
 		c->opcode = PS_OP_READV;
 		c->blocknum = b;
@@ -142,7 +143,7 @@ attach(const char *shm)
 
 			close(fd);
 			if (h != MAP_FAILED && h->magic == PS_SHM_MAGIC &&
-				h->page_size == PAGE)
+				h->version == PS_SHM_VERSION && h->page_size == PAGE)
 			{
 				g_shm = h;
 				for (uint32_t c = 0; c < h->nchannels; c++)
@@ -202,6 +203,7 @@ main(int argc, char **argv)
 		c->key.dbOid = 1;
 		c->key.relNumber = REL;
 		c->key.forkNum = 0;
+		c->key.klass = PS_KLASS_RELATION;
 		c->timeline = 0;
 		c->opcode = PS_OP_WRITEV;
 		c->blocknum = b;

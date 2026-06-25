@@ -87,6 +87,8 @@ key_cmp(const PsKey *a, const PsKey *b)
 		return a->relNumber < b->relNumber ? -1 : 1;
 	if (a->forkNum != b->forkNum)
 		return a->forkNum < b->forkNum ? -1 : 1;
+	if (a->klass != b->klass)
+		return a->klass < b->klass ? -1 : 1;
 	return 0;
 }
 

@@ -344,7 +344,7 @@ cleanup:
 
 /* ===================== segment storage (log-structured) ================= */
 
-#define SEG_MAGIC	0x53454752	/* "SEGR" */
+#define SEG_MAGIC	0x53454732	/* "SEG2": segment record format v2 (PsKey gained klass) */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -444,7 +444,8 @@ static int
 key_eq(const PsKey *a, const PsKey *b)
 {
 	return a->spcOid == b->spcOid && a->dbOid == b->dbOid &&
-		a->relNumber == b->relNumber && a->forkNum == b->forkNum;
+		a->relNumber == b->relNumber && a->forkNum == b->forkNum &&
+		a->klass == b->klass;
 }
 
 /* --- page index (keyed by timeline, key, block) --- */
@@ -1021,7 +1022,22 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
-	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
+	/*
+	 * Version key.  A relation page carries a real monotonic pd_lsn; non-relation
+	 * objects (SLRU/control) do not -- their first 8 bytes are payload, not an LSN
+	 * -- so versioning them from page_lsn() can make an overwrite compare lower
+	 * than the prior version and silently lose (and poison the pgcache for that
+	 * pseudo-LSN).  Derive a monotonic version from the existing chain instead
+	 * (newest across ancestry + 1) so the latest object write always wins.
+	 */
+	if (key->klass == PS_KLASS_RELATION)
+		hdr.lsn = page_lsn(page);
+	else
+	{
+		PageVer    *cur = read_through(timeline, key, block, UINT64_MAX);
+
+		hdr.lsn = cur ? cur->lsn + 1 : 1;
+	}
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
@@ -1191,9 +1207,27 @@ recover(uint32_t shard)
 		{
 			SegRecHdr	hdr;
 
-			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0 ||
-				hdr.magic != SEG_MAGIC || hdr.len != page_size)
-				break;
+			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0)
+				break;			/* short read -> end of this segment's data */
+			if (hdr.magic == 0)
+				break;			/* zeroed slot -> normal end-of-log sentinel */
+			if (hdr.magic != SEG_MAGIC)
+			{
+				/*
+				 * A non-zero magic that isn't ours is a record written by an
+				 * incompatible (pre-klass) on-disk format.  Fail fast instead of
+				 * treating it as end-of-log and overwriting it -- that would
+				 * silently lose the existing store.  It must be recreated (or
+				 * migrated offline) under the new format.
+				 */
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
+						"record magic %#x (expected %#x) at offset %llu; this store "
+						"predates the current on-disk format and must be recreated\n",
+						shard, id, hdr.magic, SEG_MAGIC, (unsigned long long) off);
+				exit(1);
+			}
+			if (hdr.len != page_size)
+				break;			/* our magic but a torn/short tail record */
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, shard, id,
 							 off + sizeof(hdr));

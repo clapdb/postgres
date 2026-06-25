@@ -92,7 +92,7 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * checksums.
  * ------------------------------------------------------------------------- */
 #define PS_IMG_MAGIC	0x47494d50	/* "PIMG" */
-#define PS_IMG_VERSION	1
+#define PS_IMG_VERSION	2	/* 2: index entries embed PsKey with the klass field */
 
 typedef struct PsImgIndexEnt
 {
@@ -165,7 +165,7 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
  * stores and serves the ordered deltas.
  * ------------------------------------------------------------------------- */
 #define PS_DELTA_MAGIC		0x544c4450	/* "PDLT" */
-#define PS_DELTA_VERSION	1
+#define PS_DELTA_VERSION	2	/* 2: index entries embed PsKey with the klass field */
 
 typedef struct PsDeltaIndexEnt
 {

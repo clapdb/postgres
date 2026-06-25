@@ -124,7 +124,7 @@ ls_attach(void)
 }
 
 static uint32
-ls_key_shard(const PageStoreRelKey *key)
+ls_key_shard_klass(const PageStoreRelKey *key, uint32 klass)
 {
 	if (!key)
 		return 0;
@@ -135,8 +135,15 @@ ls_key_shard(const PageStoreRelKey *key)
 		k.dbOid = key->dbOid;
 		k.relNumber = key->relNumber;
 		k.forkNum = key->forkNum;
+		k.klass = klass;
 		return ps_key_shard(&k, ls_nshards);
 	}
+}
+
+static uint32
+ls_key_shard(const PageStoreRelKey *key)
+{
+	return ls_key_shard_klass(key, PS_KLASS_RELATION);
 }
 
 static void
@@ -189,6 +196,15 @@ static PsChannel *
 ls_chan_for_key(const PageStoreRelKey *key)
 {
 	ls_claim_channel(ls_key_shard(key));
+	return ps_channel(ls_shm, ls_channel);
+}
+
+/* Like ls_chan_for_key but routes by the object's actual class, so a non-relation
+ * object lands on the shard worker that owns shard_for(key) with that klass. */
+static PsChannel *
+ls_chan_for_key_klass(const PageStoreRelKey *key, uint32 klass)
+{
+	ls_claim_channel(ls_key_shard_klass(key, klass));
 	return ps_channel(ls_shm, ls_channel);
 }
 
@@ -249,6 +265,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.dbOid = key->dbOid;
 	ch->key.relNumber = key->relNumber;
 	ch->key.forkNum = key->forkNum;
+	ch->key.klass = PS_KLASS_RELATION;	/* the smgr shim only stores relation pages */
 	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
 }
 
@@ -598,6 +615,60 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	/* Return the true total so the caller can detect saturation; only the first
 	 * min(n, maxn, mailbox capacity) LSNs were actually copied into out. */
 	return n;
+}
+
+/*
+ * Non-relation object I/O.  The store is keyed by the full PsKey including klass,
+ * so a non-relation object (SLRU page, control state, ...) goes through the same
+ * CREATE/EXTEND/WRITEV/READV path as a relation page -- only key.klass differs.
+ * These take the four identity fields in a PageStoreRelKey (reinterpreted per the
+ * class) plus the class explicitly.  ls_fill_key sets klass = RELATION, so we
+ * override it after.
+ */
+void
+pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
+							 BlockNumber block, const void *page)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	BlockNumber nb;
+
+	/* ensure the object's fork exists (tolerate an existing one) */
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	ls_exec(ch);
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_NBLOCKS;
+	ls_exec(ch);
+	nb = (BlockNumber) ch->result;
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	/* overwrite if the block already exists, else append */
+	ch->opcode = (block < nb) ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->skip_fsync = 0;
+	memcpy(ch->data, page, BLCKSZ);
+	ls_exec(ch);
+}
+
+void
+pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
+							BlockNumber block, void *page)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ls_exec(ch);
+	memcpy(page, ch->data, BLCKSZ);
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */
