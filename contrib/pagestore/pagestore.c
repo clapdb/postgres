@@ -677,7 +677,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	XLogRecPtr	lsn = PG_GETARG_LSN(3);
 	Relation	rel;
 	PageStoreRelKey key;
-	uint64	   *lsns;
+	PsWalRec  *recs;
 	int			n;
 	ReadLocalXLogPageNoWaitPrivate *pd;
 	XLogReaderState *reader;
@@ -691,9 +691,9 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	key.forkNum = forknum;
 	relation_close(rel, AccessShareLock);
 
-	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  lsns, PS_REDO_MAX_RECS);
+									  recs, PS_REDO_MAX_RECS);
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -716,7 +716,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
-		XLogBeginRead(reader, lsns[i]);
+		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
 			continue;
@@ -746,7 +746,7 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 
 	XLogReaderFree(reader);
 	pfree(pd);
-	pfree(lsns);
+	pfree(recs);
 	pfree(page);
 
 	if (result == NULL)
@@ -821,7 +821,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	Relation	rel;
 	PageStoreRelKey key;
 	RelFileLocator rloc;
-	uint64	   *lsns;
+	PsWalRec  *recs;
 	int			n;
 	int			base_idx = -1;
 	XLogRecPtr	base_end_lsn = InvalidXLogRecPtr;
@@ -844,9 +844,9 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	key.relNumber = rloc.relNumber;
 	key.forkNum = forknum;
 
-	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  lsns, PS_REDO_MAX_RECS);
+									  recs, PS_REDO_MAX_RECS);
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -859,7 +859,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	if (reader == NULL)
 	{
 		pfree(pd);
-		pfree(lsns);
+		pfree(recs);
 		PG_RETURN_NULL();
 	}
 	base = palloc(BLCKSZ);
@@ -871,7 +871,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
-		XLogBeginRead(reader, lsns[i]);
+		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
 			continue;
@@ -901,7 +901,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		/* no base image indexed for this block; cannot materialize yet */
 		XLogReaderFree(reader);
 		pfree(pd);
-		pfree(lsns);
+		pfree(recs);
 		pfree(base);
 		pfree(page);
 		PG_RETURN_NULL();
@@ -910,15 +910,15 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	/*
 	 * Liveness: if the block was truncated away after its last write and at or
 	 * before lsn (and not re-extended), it is not live as of lsn -- do not
-	 * materialize a stale page for it.  lsns[n - 1] is the block's newest record
+	 * materialize a stale page for it.  recs[n - 1].lsn is the block's newest record
 	 * at/below lsn.
 	 */
 	if (redo_block_truncated_away(reader, rloc, forknum, (BlockNumber) blocknum,
-								  (XLogRecPtr) lsns[n - 1], lsn))
+								  (XLogRecPtr) recs[n - 1].lsn, lsn))
 	{
 		XLogReaderFree(reader);
 		pfree(pd);
-		pfree(lsns);
+		pfree(recs);
 		pfree(base);
 		pfree(page);
 		PG_RETURN_NULL();
@@ -937,14 +937,14 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		uint32		firstpage;
 		char	   *raw;
 
-		XLogBeginRead(reader, lsns[i]);
+		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
 		{
 			walredo_stop(p);
 			ereport(ERROR,
 					(errmsg("could not read WAL record at %X/%08X for redo: %s",
-							LSN_FORMAT_ARGS(lsns[i]), errm ? errm : "(unknown)")));
+							LSN_FORMAT_ARGS(recs[i].lsn), errm ? errm : "(unknown)")));
 		}
 
 		/*
@@ -974,7 +974,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 
 	XLogReaderFree(reader);
 	pfree(pd);
-	pfree(lsns);
+	pfree(recs);
 	pfree(base);
 	pfree(page);
 	PG_RETURN_BYTEA_P(result);

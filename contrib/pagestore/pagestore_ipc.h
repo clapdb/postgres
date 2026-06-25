@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		6	/* 6: PsKey gained the klass discriminator */
+#define PS_SHM_VERSION		7	/* 7: walidx_get returns timeline-tagged PsWalRec */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -102,6 +102,19 @@ typedef struct PsKey
 	int32_t		forkNum;
 	uint32_t	klass;			/* PsObjClass; 0 = relation (default) */
 } PsKey;
+
+/*
+ * A per-page WAL-index record: one WAL record that touched the page, tagged with
+ * the timeline it lives on.  walidx_get returns these in ascending LSN order,
+ * merging a branch's records with its ancestors' (the timeline tag tells a reader
+ * which timeline's shipped WAL to fetch each record from -- the cross-branch
+ * store-served read path).
+ */
+typedef struct PsWalRec
+{
+	uint64_t	lsn;			/* record start LSN (ReadRecPtr) */
+	uint32_t	timeline;		/* source timeline the record lives on */
+} PsWalRec;
 
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
  * stable enough for shard selection, and it is reused for client+daemon key->shard.

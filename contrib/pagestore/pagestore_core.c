@@ -1020,8 +1020,17 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
  * max_out); return how many.  Walks the timeline ancestry. */
 static int
+walrec_cmp(const void *a, const void *b)
+{
+	uint64_t	la = ((const PsWalRec *) a)->lsn;
+	uint64_t	lb = ((const PsWalRec *) b)->lsn;
+
+	return (la > lb) - (la < lb);
+}
+
+static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
-		   uint64_t *out, int max_out)
+		   PsWalRec *out, int max_out)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 	int			got = 0;
@@ -1035,12 +1044,21 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
+				/* tag each record with the timeline it lives on (w.tl) */
 				for (int i = 0; i < e->n && got < max_out; i++)
 					if (e->lsns[i] <= w.lsn)
-						out[got++] = e->lsns[i];
+					{
+						out[got].lsn = e->lsns[i];
+						out[got].timeline = w.tl;
+						got++;
+					}
 				break;
 			}
 	} while (tl_walk_next(&w));
+
+	/* gathered newest-timeline-first across the ancestry; redo (and the base
+	 * search) need them in ascending LSN order */
+	qsort(out, (size_t) got, sizeof(PsWalRec), walrec_cmp);
 	return got;
 }
 
@@ -1400,8 +1418,8 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_WAL_INDEX_GET:
 			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
-											   ch->req_lsn, (uint64_t *) ch->data,
-											   (int) (PS_IO_UNIT / sizeof(uint64_t)));
+											   ch->req_lsn, (PsWalRec *) ch->data,
+											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
 			break;
 
 		case PS_OP_IMMEDSYNC:
