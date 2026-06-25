@@ -56,11 +56,15 @@ The findings reduce to five invariants the prototype breaks:
   object blocks is possible but deferred -- it buys nothing on real deployments.
   Where it fits, the image is zero-padded to `BLCKSZ`.
 - **Version order (branch-aware).** Like SLRU objects (see SLRU_ON_STORE_DESIGN.md),
-  the control object's version is the **WAL LSN at the time of the control update**
-  supplied by the writer, stored verbatim -- not a daemon `max+1` counter (which
-  would not be comparable to a branch cutoff) and not the control bytes. Using the
-  update's checkpoint redo LSN makes restore-as-of-branch-point (below) well
-  defined.
+  the control object's version is a WAL LSN supplied by the writer and stored
+  verbatim -- not a daemon `max+1` counter (not comparable to a branch cutoff) and
+  not the control bytes. The LSN must be the **checkpoint/control-update record's
+  LSN** (`ProcLastRecPtr`, i.e. `ControlFile->checkPoint`), **not the redo pointer**
+  (`checkPointCopy.redo`). For an online checkpoint that spans a branch point the
+  redo pointer is *before* the branch while the checkpoint completion record is
+  *after* it; versioning by redo would make that just-completed checkpoint visible
+  to an as-of-branch read and restore the branch to post-branch state. Versioning by
+  the checkpoint record's own LSN keeps restore-as-of-branch-point (below) correct.
 - **Timeline.** The control object is written on the writer's timeline; restore
   reads it as of the branch-creation LSN on the branch's ancestry (see restore).
 
@@ -73,14 +77,19 @@ removed.
 ### Checkpoint-completion handoff
 
 - `UpdateControlFile()` (and the hook) under the critical section only **records
-  intent**: it snapshots the just-written `ControlFileData` image (or just the
-  fact that pg_control changed, plus the bytes) into a small in-process slot. This
-  is allocation-free and cannot fail the checkpoint.
+  intent**: it snapshots the just-written `ControlFileData` image plus the
+  checkpoint-record LSN into a small handoff slot (in-process for a same-process
+  shipper, shared memory for a separate one -- see below). This is allocation-free
+  and cannot fail the checkpoint.
 - The actual `obj_write` of the control image runs at a **post-critical-section
-  point**: a checkpoint-completion callback (after `CreateCheckPoint()` leaves its
-  critical section) or a dedicated async shipper. Shutdown's final control update
-  ships from the shutdown path *after* the critical section, before the postmaster
-  exits.
+  point**. The recorded-intent slot is read by whoever ships it, so it must be
+  reachable by that process: either ship from a **same-process completion callback**
+  (after `CreateCheckPoint()` leaves its critical section, in the checkpointer/
+  startup process that recorded it) -- the default -- or, if a **separate** shipper
+  process is used, put the handoff slot in **shared memory**, never a private
+  per-process buffer (a private slot would be invisible to the shipper and the
+  image would be dropped). Shutdown's final control update ships from the shutdown
+  path *after* the critical section, before the postmaster exits.
 - **Durability contract.** The mirrored control object is shipped and the daemon
   `sync`'d before the checkpoint is considered complete-on-store. Restore-after-
   crash therefore sees a control image no newer than the last completed checkpoint
@@ -113,9 +122,13 @@ The restore must be atomic and durable:
 2. **Fetch + verify.** Read the control object via the daemon channel; verify the
    CRC of the restored `ControlFileData` before writing anything. A bad/missing
    image fails closed (the compute does not start on a half-known cluster).
-3. **Write atomically.** Write to `global/pg_control.tmp`, fsync it, then
-   `rename()` over `global/pg_control` -- never truncate the live file in place
-   (fix for finding 4). `rename` within a directory is atomic.
+3. **Write atomically, at the fixed file size.** Write exactly the first
+   `PG_CONTROL_FILE_SIZE` (8192) bytes of the object image -- **not** the
+   `BLCKSZ`-padded object -- to `global/pg_control.tmp`, fsync it, then `rename()`
+   over `global/pg_control` (never truncate the live file in place). On a
+   `BLCKSZ > 8192` build the object carries trailing pad that must be dropped, or
+   tools that check the control-file length (pg_rewind, backup verification) reject
+   the data directory. `rename` within a directory is atomic.
 4. **Directory-durable.** fsync the `global/` directory after the rename so the
    rename survives a crash (fix: "Make restored pg_control durable in its
    directory").
@@ -131,10 +144,12 @@ The restore must be atomic and durable:
    smaller-block builds.
 2. Core: `UpdateControlFile()` records intent only; add the post-critical-section
    ship point (checkpoint-completion callback / shutdown ship) and chain the hook.
-3. Daemon/module: control object LSN version (writer-supplied) + `sync` before
-   checkpoint-complete-on-store.
-4. Tool: atomic temp+rename, dir fsync, **as-of-branch-LSN** read, channel release,
-   CRC-verify, fail-closed.
+3. Daemon/module: control object version = the checkpoint **record** LSN
+   (writer-supplied, not the redo pointer) + `sync` before checkpoint-complete-on-
+   store. Same-process completion callback, or a shared-memory handoff slot if a
+   separate shipper is used.
+4. Tool: atomic temp+rename **at `PG_CONTROL_FILE_SIZE`**, dir fsync,
+   **as-of-branch-LSN** read, channel release, CRC-verify, fail-closed.
 5. Tests: the acceptance scenarios below.
 
 ## Acceptance criteria
@@ -142,9 +157,13 @@ The restore must be atomic and durable:
 - No fallible store I/O runs inside a checkpoint or shutdown critical section; a
   daemon error during mirror cannot PANIC the checkpoint.
 - After a completed checkpoint, the store's control image carries that
-  checkpoint's redo pointer, and is durable (survives daemon restart).
-- Restore produces a CRC-valid `global/pg_control` via temp+rename with a fsync'd
-  directory; a crash mid-restore never leaves a torn control file.
+  checkpoint's redo pointer, is versioned by the checkpoint **record** LSN, and is
+  durable (survives daemon restart).
+- An online checkpoint whose completion record is after a branch point is **not**
+  restored by that branch (versioned by the record LSN, not the redo pointer).
+- Restore produces a CRC-valid `global/pg_control` of exactly
+  `PG_CONTROL_FILE_SIZE` bytes via temp+rename with a fsync'd directory; a crash
+  mid-restore never leaves a torn control file, and length-checking tools accept it.
 - A compute with no local `pg_control` restores the control image **as of its
   branch-creation LSN** -- even if the parent advanced afterward -- and boots into
   recovery from the checkpoint visible at the branch point, never a later one.
