@@ -45,11 +45,13 @@
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
+#include "storage/bufpage.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
+#include "walredo_client.h"
 
 PG_MODULE_MAGIC;
 
@@ -59,6 +61,7 @@ void		_PG_init(void);
 static bool pagestore_route_all = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
+static char *pagestore_walredo_datadir = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -691,6 +694,13 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 									  lsns, PS_REDO_MAX_RECS);
 	if (n == 0)
 		PG_RETURN_NULL();
+	if (n > PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: too many WAL records (%d) at/below %X/%08X for relation %u fork %d block %d; exceeds the redo cap of %d, cannot materialize an as-of page",
+						n, LSN_FORMAT_ARGS(lsn), relid, forknum, blocknum,
+						PS_REDO_MAX_RECS),
+				 errhint("Only the first %d indexed records were fetched; the result would omit later deltas.",
+						 PS_REDO_MAX_RECS)));
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -749,6 +759,247 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/*
+ * pagestore_redo_page_asof(relid, forknum, blocknum, lsn) returns bytea
+ *
+ * Materialize a page as of 'lsn' (the 5b driver): find the newest full-page
+ * image at/below lsn as the base, then apply every WAL record that touched the
+ * block after it, through the wal-redo helper.  Returns the materialized page
+ * (pd_checksum recomputed), or NULL if no base image is indexed for the block.
+ *
+ * Single-branch: the records are read from this compute's local WAL by LSN.
+ * (Serving deltas across branches from the store -- using the per-record source
+ * timeline -- is a later step.)
+ */
+PG_FUNCTION_INFO_V1(pagestore_redo_page_asof);
+Datum
+pagestore_redo_page_asof(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	int32		blocknum = PG_GETARG_INT32(2);
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+	Relation	rel;
+	PageStoreRelKey key;
+	RelFileLocator rloc;
+	uint64	   *lsns;
+	int			n;
+	int			base_idx = -1;
+	XLogRecPtr	base_end_lsn = InvalidXLogRecPtr;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char	   *base;
+	char	   *page;
+	WalRedoProc *p;
+	bytea	   *result;
+
+	if (pagestore_walredo_datadir == NULL || pagestore_walredo_datadir[0] == '\0')
+		ereport(ERROR,
+				(errmsg("pagestore.walredo_datadir is not set")));
+
+	rel = relation_open(relid, AccessShareLock);
+	rloc = rel->rd_locator;
+	relation_close(rel, AccessShareLock);
+	key.spcOid = rloc.spcOid;
+	key.dbOid = rloc.dbOid;
+	key.relNumber = rloc.relNumber;
+	key.forkNum = forknum;
+
+	lsns = palloc(sizeof(uint64) * PS_REDO_MAX_RECS);
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
+									  lsns, PS_REDO_MAX_RECS);
+	if (n == 0)
+		PG_RETURN_NULL();
+	if (n > PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: too many WAL records (%d) at/below %X/%08X for relation %u fork %d block %d; exceeds the redo cap of %d, cannot materialize an as-of page",
+						n, LSN_FORMAT_ARGS(lsn), relid, forknum, blocknum,
+						PS_REDO_MAX_RECS),
+				 errhint("Only the first %d indexed records were fetched; the result would omit later deltas.",
+						 PS_REDO_MAX_RECS)));
+
+	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+	{
+		pfree(pd);
+		pfree(lsns);
+		PG_RETURN_NULL();
+	}
+	base = palloc(BLCKSZ);
+	page = palloc(BLCKSZ);
+
+	/* base = newest record at/below lsn carrying an FPI for the block */
+	for (int i = n - 1; i >= 0 && base_idx < 0; i--)
+	{
+		char	   *errm;
+		XLogRecord *rec;
+
+		XLogBeginRead(reader, lsns[i]);
+		rec = XLogReadRecord(reader, &errm);
+		if (rec == NULL)
+			continue;
+		/*
+		 * walidx entries are record *start* LSNs, so a record may begin at/below
+		 * lsn yet end after it; such a record is not part of the page as of lsn.
+		 */
+		if (reader->EndRecPtr > lsn)
+			continue;
+		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		{
+			RelFileLocator brloc;
+			ForkNumber	fk;
+			BlockNumber blk;
+
+			if (!XLogRecHasBlockImage(reader, b))
+				continue;
+			XLogRecGetBlockTagExtended(reader, b, &brloc, &fk, &blk, NULL);
+			if (!RelFileLocatorEquals(brloc, rloc) || fk != forknum ||
+				blk != (BlockNumber) blocknum)
+				continue;
+			if (RestoreBlockImage(reader, b, base))
+			{
+				base_idx = i;
+				base_end_lsn = reader->EndRecPtr;
+			}
+			break;
+		}
+	}
+
+	if (base_idx < 0)
+	{
+		/* no base image indexed for this block; cannot materialize yet */
+		XLogReaderFree(reader);
+		pfree(pd);
+		pfree(lsns);
+		pfree(base);
+		pfree(page);
+		PG_RETURN_NULL();
+	}
+
+	/*
+	 * Replay base image, then every record after it, through the helper.
+	 * walredo_start takes a cluster-wide flock on the shared walredo_datadir, so
+	 * concurrent helpers serialize.  Wrap the helper lifetime in PG_TRY/PG_FINALLY
+	 * so any error or cancellation still reaps the child, closes the pipes and
+	 * releases that lock instead of leaking a wedged helper.
+	 */
+	p = walredo_start(pagestore_walredo_datadir);
+	PG_TRY();
+	{
+		walredo_begin(p, rloc, forknum, (BlockNumber) blocknum);
+		walredo_pushbase(p, base_end_lsn, base);
+		for (int i = base_idx + 1; i < n; i++)
+		{
+			char	   *errm;
+			XLogRecord *rec;
+			uint32		tot;
+			uint32		firstpage;
+			char	   *raw;
+
+			XLogBeginRead(reader, lsns[i]);
+			rec = XLogReadRecord(reader, &errm);
+			if (rec == NULL)
+				ereport(ERROR,
+						(errmsg("could not read WAL record at %X/%08X for redo: %s",
+								LSN_FORMAT_ARGS(lsns[i]), errm ? errm : "(unknown)")));
+
+			/* a record starting at/below lsn but ending after it is not yet in the
+			 * page as of lsn; the rest start later still, so we are done applying */
+			if (reader->EndRecPtr > lsn)
+				break;
+
+			/*
+			 * XLogReadRecord returns the decoded header, not the contiguous raw
+			 * record the helper needs.  Recover the raw bytes the way the decoder
+			 * laid them out: a record that fit on its page is still in the page
+			 * buffer at its offset; one that spanned pages was reassembled into
+			 * readRecordBuf.
+			 */
+			tot = rec->xl_tot_len;
+			firstpage = XLOG_BLCKSZ - (uint32) (reader->ReadRecPtr % XLOG_BLCKSZ);
+			if (tot > firstpage)
+				raw = reader->readRecordBuf;
+			else
+				raw = reader->readBuf + (reader->ReadRecPtr % XLOG_BLCKSZ);
+			walredo_apply(p, reader->ReadRecPtr, reader->EndRecPtr, raw, tot);
+		}
+		walredo_get(p, page);
+	}
+	PG_FINALLY();
+	{
+		walredo_stop(p);
+	}
+	PG_END_TRY();
+
+	/* the helper leaves pd_checksum to the caller; recompute it here */
+	PageSetChecksumInplace((Page) page, (BlockNumber) blocknum);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(lsns);
+	pfree(base);
+	pfree(page);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * pagestore_walredo_roundtrip(page bytea, base_lsn pg_lsn) returns bytea
+ *
+ * Spawn the wal-redo helper, push 'page' as the base (stamping its page LSN to
+ * base_lsn), and read it back -- a round-trip test of the helper spawn + the
+ * stdin/stdout protocol, independent of any redo.  The returned page matches the
+ * input except pd_lsn (stamped to base_lsn) and pd_checksum (the helper leaves
+ * checksums to the caller).
+ */
+PG_FUNCTION_INFO_V1(pagestore_walredo_roundtrip);
+Datum
+pagestore_walredo_roundtrip(PG_FUNCTION_ARGS)
+{
+	bytea	   *inpage = PG_GETARG_BYTEA_PP(0);
+	XLogRecPtr	base_lsn = PG_GETARG_LSN(1);
+	RelFileLocator rloc = {.spcOid = 1663,.dbOid = 1,.relNumber = 0x7e000000};
+	WalRedoProc *p;
+	char	   *out;
+	bytea	   *result;
+
+	if (VARSIZE_ANY_EXHDR(inpage) != BLCKSZ)
+		ereport(ERROR,
+				(errmsg("page must be exactly %d bytes", BLCKSZ)));
+	if (pagestore_walredo_datadir == NULL || pagestore_walredo_datadir[0] == '\0')
+		ereport(ERROR,
+				(errmsg("pagestore.walredo_datadir is not set")));
+
+	out = palloc(BLCKSZ);
+	/* walredo_start takes the cluster-wide flock; PG_FINALLY guarantees the helper
+	 * is reaped and the lock released even on error/cancellation. */
+	p = walredo_start(pagestore_walredo_datadir);
+	PG_TRY();
+	{
+		walredo_begin(p, rloc, MAIN_FORKNUM, 0);
+		walredo_pushbase(p, base_lsn, VARDATA_ANY(inpage));
+		walredo_get(p, out);
+	}
+	PG_FINALLY();
+	{
+		walredo_stop(p);
+	}
+	PG_END_TRY();
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
 void
 _PG_init(void)
 {
@@ -792,6 +1043,16 @@ _PG_init(void)
 							   check_backend_name,
 							   assign_backend_name,
 							   NULL);
+
+	DefineCustomStringVariable("pagestore.walredo_datadir",
+							   "Private scratch data directory for the postgres --wal-redo helper.",
+							   "Must be a throwaway initdb'd cluster, never the live one; "
+							   "the helper only ever mutates pages handed to it over the protocol.",
+							   &pagestore_walredo_datadir,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("pagestore");
 
