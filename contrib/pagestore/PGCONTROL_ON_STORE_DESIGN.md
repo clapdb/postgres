@@ -46,14 +46,23 @@ The findings reduce to five invariants the prototype breaks:
 ## Control object model
 
 - **Identity.** `PsKey{ klass = PS_KLASS_CONTROL, spcOid = dbOid = relNumber =
-  forkNum = 0, block = 0 }`. `pg_control` fits in one block
-  (`PG_CONTROL_FILE_SIZE <= BLCKSZ`); the image is zero-padded to `BLCKSZ`.
-- **Version order.** Each mirror write gets a daemon-assigned monotonic version
-  (`max across ancestry + 1`), never derived from the control bytes. The control
-  file's own `time`/checkpoint fields are not a reliable version source (fix for
-  finding 2).
+  forkNum = 0, block = 0 }`.
+- **Block-size requirement.** `PG_CONTROL_FILE_SIZE` is fixed at 8192 bytes, but
+  `BLCKSZ` can be 1024/2048/4096 on `--with-blocksize` builds, where a single
+  object block cannot hold the control file. The model therefore **requires
+  `BLCKSZ >= PG_CONTROL_FILE_SIZE`** for control mirroring: the mirror/restore code
+  asserts it and the module refuses to enable control-on-store on a smaller-block
+  build (the default 8192 satisfies it). Splitting `pg_control` across multiple
+  object blocks is possible but deferred -- it buys nothing on real deployments.
+  Where it fits, the image is zero-padded to `BLCKSZ`.
+- **Version order (branch-aware).** Like SLRU objects (see SLRU_ON_STORE_DESIGN.md),
+  the control object's version is the **WAL LSN at the time of the control update**
+  supplied by the writer, stored verbatim -- not a daemon `max+1` counter (which
+  would not be comparable to a branch cutoff) and not the control bytes. Using the
+  update's checkpoint redo LSN makes restore-as-of-branch-point (below) well
+  defined.
 - **Timeline.** The control object is written on the writer's timeline; restore
-  reads it from the timeline the branch was created on (see restore).
+  reads it as of the branch-creation LSN on the branch's ancestry (see restore).
 
 ## Mirror protocol (critical-section-safe)
 
@@ -91,9 +100,16 @@ it with the freestanding `pagestore_control_restore` tool, then starts normally.
 
 The restore must be atomic and durable:
 
-1. **Select the timeline.** Restore reads the control object from the timeline the
-   branch was created on (passed in / derived from branch metadata), not a fixed
-   timeline 0 (fix: "Read the same timeline that pg_control was written to").
+1. **Read as of the branch point, not just the source timeline.** Selecting the
+   source/parent timeline is not enough: if the parent advances after the branch is
+   created, its *latest* control object carries a checkpoint redo pointer **beyond
+   the branch point**, and restoring that would start the branch compute recovering
+   from WAL/state it must not see. Restore must read the control object **as of the
+   branch-creation LSN** -- either through the new branch timeline (whose ancestry
+   walk already caps the parent at the branch LSN) or as an explicit as-of read of
+   the source timeline at that LSN. The LSN-based control version (above) is what
+   makes this cap meaningful (fixes "read pg_control at the branch point"; supersedes
+   the earlier "just pick the source timeline" wording).
 2. **Fetch + verify.** Read the control object via the daemon channel; verify the
    CRC of the restored `ControlFileData` before writing anything. A bad/missing
    image fails closed (the compute does not start on a half-known cluster).
@@ -111,13 +127,15 @@ The restore must be atomic and durable:
 
 ## Sequencing
 
-1. Core: `UpdateControlFile()` records intent only; add the post-critical-section
+1. Module: assert `BLCKSZ >= PG_CONTROL_FILE_SIZE`; refuse control-on-store on
+   smaller-block builds.
+2. Core: `UpdateControlFile()` records intent only; add the post-critical-section
    ship point (checkpoint-completion callback / shutdown ship) and chain the hook.
-2. Daemon/module: control object monotonic version + `sync` before
+3. Daemon/module: control object LSN version (writer-supplied) + `sync` before
    checkpoint-complete-on-store.
-3. Tool: atomic temp+rename, dir fsync, timeline selection, channel release,
+4. Tool: atomic temp+rename, dir fsync, **as-of-branch-LSN** read, channel release,
    CRC-verify, fail-closed.
-4. Tests: the acceptance scenarios below.
+5. Tests: the acceptance scenarios below.
 
 ## Acceptance criteria
 
@@ -127,8 +145,11 @@ The restore must be atomic and durable:
   checkpoint's redo pointer, and is durable (survives daemon restart).
 - Restore produces a CRC-valid `global/pg_control` via temp+rename with a fsync'd
   directory; a crash mid-restore never leaves a torn control file.
-- A compute with no local `pg_control` restores from the correct branch timeline
-  and boots into recovery from the mirrored checkpoint.
+- A compute with no local `pg_control` restores the control image **as of its
+  branch-creation LSN** -- even if the parent advanced afterward -- and boots into
+  recovery from the checkpoint visible at the branch point, never a later one.
+- Control-on-store is refused on a `BLCKSZ < PG_CONTROL_FILE_SIZE` build rather
+  than silently truncating the image.
 - A previously installed control-file write hook still runs after ours.
 - Every restore exit path releases the daemon channel; failure exits non-zero and
   leaves no half-written control file.
