@@ -793,27 +793,49 @@ ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
  *
  * Cost: a linear pass over (from_lsn, to_lsn].  redo_page_asof is off the read hot
  * path; a daemon-side fork-size-at-lsn index would make this O(1) -- a later step.
+ *
+ * Tri-state so an unreadable scan fails closed rather than passing as "live":
  */
-static bool
+typedef enum
+{
+	REDO_BLOCK_LIVE = 0,		/* scanned cleanly through to_lsn, no truncate */
+	REDO_BLOCK_TRUNCATED,		/* truncated away at/below the block, not re-extended */
+	REDO_BLOCK_SCAN_INCOMPLETE, /* WAL unreadable through to_lsn -- fail closed */
+} RedoBlockLiveness;
+
+static RedoBlockLiveness
 redo_block_truncated_away(XLogReaderState *reader, RelFileLocator rloc,
 						  ForkNumber forknum, BlockNumber block,
 						  XLogRecPtr from_lsn, XLogRecPtr to_lsn)
 {
+	XLogRecPtr	scanned_through;
+
 	if (forknum != MAIN_FORKNUM || from_lsn >= to_lsn)
-		return false;
+		return REDO_BLOCK_LIVE;
 
 	XLogBeginRead(reader, from_lsn);
+	scanned_through = from_lsn;
 	for (;;)
 	{
 		char	   *errm;
 		XLogRecord *rec = XLogReadRecord(reader, &errm);
 
+		/*
+		 * End of readable WAL.  If the read cursor already advanced through to_lsn
+		 * the range was fully scanned and no truncate was found -- the block is
+		 * live.  Otherwise the WAL could not be read through to_lsn (e.g. the
+		 * shipped log has not reached this segment; the archive callback ships only
+		 * completed segments), so a truncate in the unread tail would be silently
+		 * missed: report the scan incomplete and let the caller fail closed.
+		 */
 		if (rec == NULL)
-			break;
+			return scanned_through >= to_lsn ? REDO_BLOCK_LIVE
+				: REDO_BLOCK_SCAN_INCOMPLETE;
+		scanned_through = reader->EndRecPtr;
 		if (reader->ReadRecPtr <= from_lsn)
 			continue;			/* skip the block's own last-write record */
 		if (reader->ReadRecPtr > to_lsn)
-			break;
+			return REDO_BLOCK_LIVE;	/* scanned cleanly past to_lsn, no truncate */
 		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
 			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
 		{
@@ -822,10 +844,9 @@ redo_block_truncated_away(XLogReaderState *reader, RelFileLocator rloc,
 			if (RelFileLocatorEquals(xlrec->rlocator, rloc) &&
 				(xlrec->flags & SMGR_TRUNCATE_HEAP) &&
 				xlrec->blkno <= block)
-				return true;
+				return REDO_BLOCK_TRUNCATED;
 		}
 	}
-	return false;
 }
 
 /*
@@ -951,7 +972,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * at/below lsn.
 	 */
 	{
-		bool		dead;
+		RedoBlockLiveness liveness;
 
 		/*
 		 * The truncate scan walks the WAL after the block's last write.  Read it
@@ -964,10 +985,15 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 */
 		ps_redo_cur_timeline = recs[n - 1].timeline;
 		reader->readLen = 0;
-		dead = redo_block_truncated_away(reader, rloc, forknum,
-										 (BlockNumber) blocknum,
-										 (XLogRecPtr) recs[n - 1].lsn, lsn);
-		if (dead)
+		liveness = redo_block_truncated_away(reader, rloc, forknum,
+											 (BlockNumber) blocknum,
+											 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		/*
+		 * Fail closed unless the scan proved the block live: a confirmed truncate
+		 * and an incomplete scan (the WAL could not be read through lsn) both mean
+		 * we must not return a possibly-stale FPI for a block that may be gone.
+		 */
+		if (liveness != REDO_BLOCK_LIVE)
 		{
 			XLogReaderFree(reader);
 			pfree(pd);
