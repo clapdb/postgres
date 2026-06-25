@@ -41,6 +41,15 @@ typedef struct PsStorage
 	void		(*close) (void);
 	int			(*sync) (void);
 
+	/*
+	 * If nonzero, sync() flushes in-memory write buffers shared with seg_write
+	 * (e.g. SPDK's per-shard curbuf) and is NOT internally serialized against
+	 * concurrent writes, so the daemon must hold every shard's write lock around
+	 * IMMEDSYNC.  POSIX leaves this 0: its sync() only fsyncs fds under its own
+	 * lock, so the lock-free IMMEDSYNC path is safe.
+	 */
+	int			sync_needs_write_lock;
+
 	/* segment log (page-version data); seg_write creates the segment lazily */
 	int			(*seg_write) (uint32_t shard, int seg, uint64_t off,
 						 const void *buf, uint32_t len);

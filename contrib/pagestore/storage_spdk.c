@@ -837,6 +837,8 @@ const PsStorage PsStorageSpdk = {
 	.open = spdk_open,
 	.close = spdk_close,
 	.sync = spdk_sync,
+	/* sync flushes per-shard curbufs; serialize IMMEDSYNC against all writes */
+	.sync_needs_write_lock = 1,
 	.seg_write = spdk_seg_write,
 	.seg_read = spdk_seg_read,
 	.seg_size = spdk_seg_size,

@@ -34,7 +34,6 @@
 #include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
-static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 
 typedef struct WorkerArgs
 {
@@ -145,17 +144,89 @@ request_is_write(PsOpcode opcode)
 static void
 run_request(PsChannel *ch)
 {
-	int			is_write = request_is_write((PsOpcode) ch->opcode);
+	PsOpcode	op = (PsOpcode) ch->opcode;
 
-	if (is_write)
-		pthread_rwlock_wrlock(&core_rwlock);
-	else
-		pthread_rwlock_rdlock(&core_rwlock);
+	/*
+	 * Branch creation mutates only the cross-shard timelines[]; take map_lock
+	 * alone (no shard lock), so it serializes against map readers/writers but
+	 * not against per-shard work on unrelated shards.
+	 */
+	if (op == PS_OP_CREATE_BRANCH)
+	{
+		ps_lock_map_wr();
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_map();
+		return;
+	}
 
-	handle_request(ch);
-	ps_store_release(&ch->state, PS_STATE_DONE);
+	/*
+	 * IMMEDSYNC fsyncs the shared segment-fd cache; the POSIX backend serializes
+	 * that internally (seg_fds_lock), so no per-shard lock is needed (and a single
+	 * shard lock would not have excluded the other shards' fd-cache mutations).
+	 *
+	 * SPDK's sync(), however, flushes every shard's in-memory curbuf, which a
+	 * concurrent shard write mutates -- with per-shard locking there is no single
+	 * write lock to exclude that, so for such backends hold every shard's write
+	 * lock (ascending, the established shard order) around the sync.
+	 */
+	if (op == PS_OP_IMMEDSYNC)
+	{
+		if (ps_storage->sync_needs_write_lock)
+		{
+			for (uint32_t s = 0; s < ps_nshards; s++)
+				ps_lock_shard_wr(s);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			for (uint32_t s = ps_nshards; s-- > 0;)
+				ps_unlock_shard(s);
+		}
+		else
+		{
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+		}
+		return;
+	}
 
-	pthread_rwlock_unlock(&core_rwlock);
+	{
+		uint32_t	shard;
+
+		/*
+		 * Derive the shard from the FINAL request key (klass-aware), not a
+		 * client-supplied ch->shard: object I/O claims its channel before setting
+		 * ch->key.klass, and freestanding IPC clients don't populate ch->shard at
+		 * all -- trusting it would lock one shard while handle_request() mutates
+		 * shard_for(&ch->key).  The shipped-WAL byte ops (append/size/read) are not
+		 * keyed (they touch the per-timeline WAL log), so serialize them on shard 0.
+		 */
+		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+			shard = 0;
+		else
+			shard = ps_shard_of(&ch->key);
+
+		if (request_is_write(op))
+		{
+			/*
+			 * Writes touch only this shard's state; append_page escalates to a
+			 * brief map_wr itself when a flush/compaction mutates the map.
+			 */
+			ps_lock_shard_wr(shard);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_shard(shard);
+		}
+		else
+		{
+			/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+			ps_lock_shard_rd(shard);
+			ps_lock_map_rd();
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_map();
+			ps_unlock_shard(shard);
+		}
+	}
 }
 
 static void *
@@ -184,11 +255,9 @@ shard_worker(void *arg)
 
 		if (!did_work && shard == 0)
 		{
-			int			do_maint = 0;
+			/* maintenance takes the shard + map locks it needs internally */
+			int			do_maint = ps_core_maintenance();
 
-			pthread_rwlock_wrlock(&core_rwlock);
-			do_maint = ps_core_maintenance();
-			pthread_rwlock_unlock(&core_rwlock);
 			if (!do_maint)
 			{
 				struct timespec ts = {0, 20000};	/* 20us */

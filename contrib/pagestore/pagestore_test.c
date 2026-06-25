@@ -1022,6 +1022,136 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 #undef NKIDS
 }
 
+/*
+ * Stress the per-shard + map locking.  Writers hammer their own rels (distinct
+ * shards) hard enough to trigger repeated memtable flushes and compactions (each
+ * of which takes map_wr), while readers continuously re-read a write-once shared
+ * dataset (taking shard_rd + map_rd).  The shared dataset is never rewritten, so
+ * a reader must ALWAYS see the correct page; any mismatch means a concurrent map
+ * mutation corrupted a read -- i.e. the map lock is wrong.  Run with nshards>1
+ * (the test's optional argv[2]) to exercise true cross-shard concurrency.
+ */
+static int
+stress_writer_child(const char *shm_name, uint32_t ps, int id)
+{
+	uint32_t	rel = 30000 + (uint32_t) id;
+	unsigned char *p = malloc(ps);
+
+	client_attach(shm_name, ps);
+	/* 3 passes x 200 blocks: flush-pages=8 -> ~75 flushes -> many compactions */
+	for (int pass = 0; pass < 3; pass++)
+		for (uint32_t b = 0; b < 200; b++)
+		{
+			fill_page(p, ps, 7000 + b, (unsigned char) (id * 11 + pass + b + 1));
+			op_write_one(rel, FORK0, b, p);
+		}
+	client_detach();
+	free(p);
+	return 0;
+}
+
+static int
+stress_reader_child(const char *shm_name, uint32_t ps, uint32_t rel,
+					uint32_t nblocks, unsigned char tagbase)
+{
+	unsigned char *r = malloc(ps);
+	int			rc = 0;
+
+	client_attach(shm_name, ps);
+	for (int iter = 0; iter < 150 && rc == 0; iter++)
+		for (uint32_t b = 0; b < nblocks; b++)
+		{
+			op_read_one(rel, FORK0, b, r);
+			if (!page_has_tag(r, ps, (unsigned char) (tagbase + b)))
+				rc = 2;				/* concurrent map mutation corrupted a read */
+		}
+	client_detach();
+	free(r);
+	return rc;
+}
+
+static int
+stress_populate_child(const char *shm_name, uint32_t ps, uint32_t rel,
+					  uint32_t nblocks, unsigned char tagbase)
+{
+	unsigned char *p = malloc(ps);
+
+	client_attach(shm_name, ps);
+	for (uint32_t b = 0; b < nblocks; b++)
+	{
+		fill_page(p, ps, 5000 + b, (unsigned char) (tagbase + b));
+		op_write_one(rel, FORK0, b, p);
+	}
+	client_detach();
+	free(p);
+	return 0;
+}
+
+static void
+run_stress_suite(const char *daemon_path, const char *tmpbase)
+{
+#define NWRITERS 8
+#define NREADERS 8
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	pid_t		pop;
+	pid_t		kids[NWRITERS + NREADERS];
+	int			st = 1;
+	uint32_t	ps = 8192;
+	uint32_t	shared_rel = 29999;
+	uint32_t	shared_n = 64;
+	unsigned char tagbase = 100;
+
+	fprintf(stderr, "== stress (%d writers + %d readers, nshards=%u) ==\n",
+			NWRITERS, NREADERS, test_nshards);
+	snprintf(shm, sizeof(shm), "/pstest_%d_stress", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_stress", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+
+	/* populate the write-once shared dataset before the concurrent phase */
+	pop = fork();
+	if (pop == 0)
+		_exit(stress_populate_child(shm, ps, shared_rel, shared_n, tagbase));
+	waitpid(pop, &st, 0);
+	check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "stress: shared dataset populated");
+
+	for (int i = 0; i < NWRITERS; i++)
+	{
+		pid_t		pid = fork();
+
+		if (pid == 0)
+			_exit(stress_writer_child(shm, ps, i));
+		kids[i] = pid;
+	}
+	for (int i = 0; i < NREADERS; i++)
+	{
+		pid_t		pid = fork();
+
+		if (pid == 0)
+			_exit(stress_reader_child(shm, ps, shared_rel, shared_n, tagbase));
+		kids[NWRITERS + i] = pid;
+	}
+	for (int i = 0; i < NWRITERS + NREADERS; i++)
+	{
+		int			s = 1;
+
+		waitpid(kids[i], &s, 0);
+		check(WIFEXITED(s) && WEXITSTATUS(s) == 0,
+			  "stress: client %d finished clean (no deadlock, no map corruption)", i);
+	}
+
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+#undef NWRITERS
+#undef NREADERS
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1068,6 +1198,9 @@ main(int argc, char **argv)
 
 	/* many concurrent clients */
 	run_concurrency_suite(daemon_path, tmpbase);
+
+	/* stress the per-shard + map locking under sustained flush/compaction load */
+	run_stress_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 

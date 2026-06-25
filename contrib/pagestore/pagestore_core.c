@@ -27,6 +27,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,6 +96,59 @@ typedef struct Shard
 
 static Shard g_shards[MAX_SHARDS];
 
+/*
+ * Concurrency.  A per-shard rwlock guards each shard's in-memory state
+ * (g_shards[i]: the page/fork/walidx indexes, memtable, append cursor and
+ * layer-id cursor).  A single map_lock guards the cross-shard state: the global
+ * ps_layer_map and the timelines[] array.  Lock order is always shard (outer)
+ * then map (inner), never the reverse, so there is no deadlock.
+ *
+ * Each daemon worker owns exactly one shard and only ever touches its own
+ * g_shards[]; the sole cross-worker accessor of another shard is maintenance
+ * (worker 0), which takes the target shard's lock plus map_lock before
+ * compacting it.  Reads take shard-rd + map-rd; ordinary writes take only
+ * shard-wr, escalating to a brief map-wr inside append_page when a flush or
+ * inline compaction mutates the map; branch creation takes map-wr alone.
+ */
+static pthread_rwlock_t shard_locks[MAX_SHARDS];
+static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+void
+ps_lock_shard_rd(uint32_t shard)
+{
+	pthread_rwlock_rdlock(&shard_locks[shard]);
+}
+
+void
+ps_lock_shard_wr(uint32_t shard)
+{
+	pthread_rwlock_wrlock(&shard_locks[shard]);
+}
+
+void
+ps_unlock_shard(uint32_t shard)
+{
+	pthread_rwlock_unlock(&shard_locks[shard]);
+}
+
+void
+ps_lock_map_rd(void)
+{
+	pthread_rwlock_rdlock(&map_lock);
+}
+
+void
+ps_lock_map_wr(void)
+{
+	pthread_rwlock_wrlock(&map_lock);
+}
+
+void
+ps_unlock_map(void)
+{
+	pthread_rwlock_unlock(&map_lock);
+}
+
 static uint32_t
 core_shards(void)
 {
@@ -132,6 +186,21 @@ shard_for(const PsKey *key)
 	return &g_shards[ps_key_shard(key, ns)];
 }
 
+/*
+ * Shard index that will actually be touched for 'key' (klass-aware), so the
+ * frontend can take the matching per-shard lock from the FINAL request key
+ * rather than trusting a client-supplied channel shard.
+ */
+uint32_t
+ps_shard_of(const PsKey *key)
+{
+	uint32_t	ns = core_shards();
+
+	if (ns == 1 || !key)
+		return 0;
+	return ps_key_shard(key, ns);
+}
+
 uint32_t
 ps_core_layer_count(void)
 {
@@ -150,9 +219,9 @@ ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
 
 	for (uint32_t i = 0; i < ns; i++)
 	{
-		m += g_shards[i].rr_mem;
-		l += g_shards[i].rr_layer;
-		s += g_shards[i].rr_seg;
+		m += __atomic_load_n(&g_shards[i].rr_mem, __ATOMIC_RELAXED);
+		l += __atomic_load_n(&g_shards[i].rr_layer, __ATOMIC_RELAXED);
+		s += __atomic_load_n(&g_shards[i].rr_seg, __ATOMIC_RELAXED);
 	}
 	if (mem)
 		*mem = m;
@@ -1027,9 +1096,20 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = page_lsn(page);
 	else
 	{
-		PageVer    *cur = read_through(timeline, key, block, UINT64_MAX);
+		PageVer    *cur;
 
+		/*
+		 * Deriving an object's monotonic version walks the cross-shard timeline
+		 * ancestry (read_through), which PS_OP_CREATE_BRANCH mutates under map_wr.
+		 * The caller holds only this shard's write lock, so take map_rd for the
+		 * walk -- otherwise an object write on a branch can race branch creation
+		 * and read a partially updated parent/branch_lsn chain.  Drop it before
+		 * the flush below re-takes map_wr; shard -> map order is preserved.
+		 */
+		ps_lock_map_rd();
+		cur = read_through(timeline, key, block, UINT64_MAX);
 		hdr.lsn = cur ? cur->lsn + 1 : 1;
+		ps_unlock_map();
 	}
 	hdr.len = page_size;
 
@@ -1051,6 +1131,11 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
 		if (ps_memtable_full(s->memtable))
 		{
+			/* A flush (and any inline compaction) mutates the cross-shard
+			 * ps_layer_map, so take map_lock here -- only on the rare flush, not
+			 * on every write.  The caller already holds this shard's write lock,
+			 * preserving the shard -> map order. */
+			ps_lock_map_wr();
 			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
 			/* backpressure only: normal compaction runs off the write path in
 			 * ps_core_maintenance() when the daemon is idle.  Compact inline
@@ -1058,6 +1143,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * threshold (writes outpacing background compaction). */
 			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
 				compact_timeline(timeline, s->id);
+			ps_unlock_map();
 		}
 	}
 	return 0;
@@ -1146,18 +1232,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
-				s->rr_mem++;
+				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
 			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
-				s->rr_layer++;
+				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from an image layer */
 			}
 			else
 			{
-				s->rr_seg++;
+				__atomic_fetch_add(&s->rr_seg, 1, __ATOMIC_RELAXED);
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
 			if (served)
@@ -1392,20 +1478,46 @@ int
 ps_core_maintenance(void)
 {
 	uint32_t	ns;
+	uint32_t	ftl = 0,
+				fsh = 0;
+	int			found = 0;
 
 	if (!use_layers)
 		return 0;
 	ns = core_shards();
 
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	/*
+	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
+	 * layers are due for compaction.  A shared lock here lets reads proceed.
+	 */
+	ps_lock_map_rd();
+	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
 		for (uint32_t sh = 0; sh < ns; sh++)
 			if ((tl == 0 || timelines[tl].defined) &&
 				count_image_layers(tl, sh) > (uint32_t) compact_layers)
 			{
-				compact_timeline(tl, sh);
-				return 1;
+				ftl = tl;
+				fsh = sh;
+				found = 1;
+				break;
 			}
-	return 0;
+	ps_unlock_map();
+
+	if (!found)
+		return 0;
+
+	/*
+	 * Phase 2: compact the chosen shard under shard-wr + map-wr (the order other
+	 * paths use), which excludes that shard's worker and other map mutators.
+	 * Re-check under the write lock since the count may have changed.
+	 */
+	ps_lock_shard_wr(fsh);
+	ps_lock_map_wr();
+	if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
+		compact_timeline(ftl, fsh);
+	ps_unlock_map();
+	ps_unlock_shard(fsh);
+	return 1;
 }
 
 /*
@@ -1432,13 +1544,14 @@ ps_core_open(const char *store_dir)
 	if (use_layers)
 		gc_resume();			/* finish any GC interrupted by a crash */
 
-	/* initialize per-shard state and layer-id cursors */
+	/* initialize per-shard state, locks and layer-id cursors */
 	for (uint32_t i = 0; i < ns; i++)
 	{
 		g_shards[i].id = i;
 		g_shards[i].cur_seg = -1;
 		g_shards[i].cur_off = 0;
 		g_shards[i].next_layer_id = 1;
+		pthread_rwlock_init(&shard_locks[i], NULL);
 	}
 	/* layer ids continue past the highest one restored per shard */
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
