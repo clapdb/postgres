@@ -164,11 +164,28 @@ run_request(PsChannel *ch)
 	 * IMMEDSYNC fsyncs the shared segment-fd cache; the POSIX backend serializes
 	 * that internally (seg_fds_lock), so no per-shard lock is needed (and a single
 	 * shard lock would not have excluded the other shards' fd-cache mutations).
+	 *
+	 * SPDK's sync(), however, flushes every shard's in-memory curbuf, which a
+	 * concurrent shard write mutates -- with per-shard locking there is no single
+	 * write lock to exclude that, so for such backends hold every shard's write
+	 * lock (ascending, the established shard order) around the sync.
 	 */
 	if (op == PS_OP_IMMEDSYNC)
 	{
-		handle_request(ch);
-		ps_store_release(&ch->state, PS_STATE_DONE);
+		if (ps_storage->sync_needs_write_lock)
+		{
+			for (uint32_t s = 0; s < ps_nshards; s++)
+				ps_lock_shard_wr(s);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			for (uint32_t s = ps_nshards; s-- > 0;)
+				ps_unlock_shard(s);
+		}
+		else
+		{
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+		}
 		return;
 	}
 

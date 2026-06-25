@@ -1096,9 +1096,20 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		hdr.lsn = page_lsn(page);
 	else
 	{
-		PageVer    *cur = read_through(timeline, key, block, UINT64_MAX);
+		PageVer    *cur;
 
+		/*
+		 * Deriving an object's monotonic version walks the cross-shard timeline
+		 * ancestry (read_through), which PS_OP_CREATE_BRANCH mutates under map_wr.
+		 * The caller holds only this shard's write lock, so take map_rd for the
+		 * walk -- otherwise an object write on a branch can race branch creation
+		 * and read a partially updated parent/branch_lsn chain.  Drop it before
+		 * the flush below re-takes map_wr; shard -> map order is preserved.
+		 */
+		ps_lock_map_rd();
+		cur = read_through(timeline, key, block, UINT64_MAX);
 		hdr.lsn = cur ? cur->lsn + 1 : 1;
+		ps_unlock_map();
 	}
 	hdr.len = page_size;
 
