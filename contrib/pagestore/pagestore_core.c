@@ -1340,8 +1340,30 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * effects are not reproduced on restart.  Also a partial/torn trailing record
  * is simply treated as end-of-log (the magic/len check below stops the scan).
  */
+/* Is a version of (timeline, key, block) at exactly 'lsn' already indexed? */
+static int
+page_version_exists(uint32_t timeline, const PsKey *key, uint32_t block,
+					uint64_t lsn)
+{
+	PageEnt    *e = page_find(timeline, key, block);
+
+	if (e)
+		for (int i = 0; i < e->nver; i++)
+			if (e->vers[i].lsn == lsn)
+				return 1;
+	return 0;
+}
+
+/*
+ * Scan a shard's segment log and add its versions.  With dedup != 0 (the tail
+ * scan run after rebuild_from_layers) a version already indexed from a layer is
+ * skipped, so only the un-flushed tail -- pages whose memtable flush never made it
+ * into a recorded layer -- is added.  Either way the append cursor ends just past
+ * the last valid record.  The segment log is append-only and never deleted, so it
+ * is the authoritative source for any version a layer flush did not record.
+ */
 static void
-recover(uint32_t shard)
+recover(uint32_t shard, int dedup)
 {
 	Shard	   *s = &g_shards[shard];
 
@@ -1382,8 +1404,10 @@ recover(uint32_t shard)
 			if (hdr.len != page_size)
 				break;			/* our magic but a torn/short tail record */
 
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, shard, id,
-							 off + sizeof(hdr));
+			if (!dedup ||
+				!page_version_exists(hdr.timeline, &hdr.key, hdr.block, hdr.lsn))
+				page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
+								 shard, id, off + sizeof(hdr));
 			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
@@ -1558,6 +1582,15 @@ ps_core_maintenance(void)
 
 	if (!use_layers)
 		return 0;
+
+	/*
+	 * Back off all maintenance once the manifest is poisoned: compaction cannot
+	 * record its replacement layer, so compact_timeline() returns immediately and
+	 * reporting "did work" would spin the idle worker on the same timeline until
+	 * restart.  Returning 0 lets it sleep until the manifest is recovered.
+	 */
+	if (ps_manifest_poisoned())
+		return 0;
 	ns = core_shards();
 
 	/*
@@ -1659,24 +1692,22 @@ ps_core_open(const char *store_dir)
 	load_timelines();
 	if (use_layers && ps_layer_map.nlayers > 0)
 	{
-		/* layers are the durable read state -- rebuild from their indexes and
-		 * position the append cursor at a fresh segment (a cheap stat loop, no
-		 * per-record scan).  Segments are written but no longer scanned. */
+		/*
+		 * Layers are the durable read state -- rebuild from their (compact)
+		 * indexes -- but the segment log is authoritative and never deleted, so
+		 * still scan it (dedup) for the un-flushed tail: any version whose memtable
+		 * flush never made it into a recorded layer (e.g. a crash, or a poisoned
+		 * manifest) would otherwise be lost despite being acknowledged.  The tail
+		 * scan also leaves the append cursor at the true end of the log.
+		 */
 		rebuild_from_layers();
 		for (uint32_t sh = 0; sh < ns; sh++)
-		{
-			int			id = 0;
-
-			while (ps_storage->seg_size(sh, id) >= 0)
-				id++;
-			g_shards[sh].cur_seg = id;
-			g_shards[sh].cur_off = 0;
-		}
+			recover(sh, 1);
 	}
 	else
 	{
 		for (uint32_t sh = 0; sh < ns; sh++)	/* segment scan (SPDK path, or no layers yet) */
-			recover(sh);
+			recover(sh, 0);
 	}
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */

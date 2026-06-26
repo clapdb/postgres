@@ -250,6 +250,24 @@ sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
      AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
 assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's shipped WAL (store-backed reader)"
 
+# --- 15. daemon crash recovery: un-flushed writes survive a daemon restart ------
+# Write rows that stay in the daemon's memtable + segment log (far below the flush
+# threshold, so no image layer records them), then SIGKILL the daemon (no clean
+# shutdown -> the memtable is lost) and restart it.  Recovery rebuilds the index
+# from image layers AND scans the segment tail, so these acknowledged-but-unflushed
+# rows must still read back -- otherwise layer-only recovery would drop them.
+$P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
+       INSERT INTO crash SELECT g, 'c'||md5(g::text) FROM generate_series(1,500) g;" >/dev/null
+crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1     # detach the engine (daemon zeroes shm on start)
+kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null # crash the daemon: no ps_core_close() flush
+"$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &	# restart -> recovery scans layers + segment tail
+DPID=$!
+sleep 0.5
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
+assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-tail recovery)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
