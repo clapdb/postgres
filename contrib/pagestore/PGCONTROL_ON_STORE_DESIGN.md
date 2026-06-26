@@ -62,17 +62,28 @@ The findings reduce to five invariants the prototype breaks:
   update that caused this control write**, passed in by the caller, **not
   `ControlFile->checkPoint` unconditionally** and **not the redo pointer**
   (`checkPointCopy.redo`):
-  - a checkpoint writes its **checkpoint-record LSN** (`ProcLastRecPtr`). The redo
-    pointer would be wrong -- for an online checkpoint spanning a branch point the
-    redo is *before* the branch but the completion record is *after* it, so an
-    as-of-branch read would restore post-branch state.
+  - a checkpoint writes its **checkpoint-record END LSN** -- the value `XLogInsert()`
+    *returned* for the checkpoint record (`recptr`), not `ProcLastRecPtr`, which is
+    the record's **start**. A branch cutoff that falls between the record's start and
+    end would otherwise restore a control image for a record not fully in the
+    branch's WAL stream. (`ControlFile->checkPoint` itself stays the start pointer;
+    only the object *version* uses the end.) The redo pointer is likewise wrong --
+    it precedes the branch while the completion record follows it.
   - non-checkpoint updates that do **not** advance `ControlFile->checkPoint` --
     `CreateEndOfRecoveryRecord()` (sets `minRecoveryPoint` to its `recptr`),
     promotion (`DB_IN_PRODUCTION`), and `minRecoveryPoint`/backup-state writes --
-    must pass **their own** LSN. Versioning these by the stale `checkPoint` LSN
-    would let an as-of-branch restore pick control bytes written after the branch,
-    or coalesce distinct updates at one version. So the write hook takes an explicit
+    must pass **their own** LSN. Versioning these by the stale `checkPoint` LSN would
+    let an as-of-branch restore pick control bytes written after the branch, or
+    coalesce distinct updates at one version. So the write hook takes an explicit
     `update_lsn` from each `UpdateControlFile()` caller.
+  - **promotion has no inserted record**: reaching `DB_IN_PRODUCTION` sets
+    `ControlFile->state` and calls `UpdateControlFile()` after recovery cleanup with
+    no WAL record at that point. Its `update_lsn` must be a **durable end-of-log LSN
+    captured after promotion cleanup** (the current insert position, which is `>=`
+    all replayed WAL), or an explicit promotion marker record must be emitted to
+    carry the LSN. Falling back to the previous checkpoint/`minRecoveryPoint` LSN is
+    wrong -- it would make the `DB_IN_PRODUCTION` image visible to an as-of-branch
+    cut taken before the state transition, or coalesce it with earlier control bytes.
 - **Timeline.** The control object is written on the writer's timeline; restore
   reads it as of the branch-creation LSN on the branch's ancestry (see restore).
 
@@ -90,9 +101,17 @@ removed.
   updates can occur before the shipper drains (e.g. an end-of-recovery update then a
   `DB_IN_PRODUCTION` update); a single slot would coalesce them to the latest image,
   so a branch point between their LSNs could restore post-branch control bytes. Each
-  LSN-versioned image must survive until shipped -- hence a queue (with backpressure
-  if it fills), or a synchronous drain at each post-critical point. Appending is
-  allocation-free and cannot fail the checkpoint.
+  LSN-versioned image must survive until shipped.
+- **The in-critical enqueue must never block or fail.** It runs inside the
+  checkpoint/shutdown critical section, so it cannot apply backpressure when the
+  store shipper is stalled -- blocking there would hang, and erroring would PANIC,
+  the very critical section this design keeps fallible-free. The queue must
+  therefore **pre-reserve capacity for every control write that can occur between
+  two mandatory drains** (a small, bounded count: checkpoint + the handful of
+  recovery/promotion/backup updates), so the append is always a guaranteed
+  non-blocking slot; alternatively, drain-before-entry guarantees a free slot. All
+  backpressure/draining happens only at the post-critical ship points, never inside
+  the critical section. Appending is allocation-free and cannot fail the checkpoint.
 - The actual `obj_write` of each queued image runs at a **post-critical-section
   point**, in LSN order. The queue is read by whoever ships it, so it must be
   reachable by that process: either ship from a **same-process completion callback**
@@ -170,12 +189,15 @@ The restore must be atomic and durable:
 
 1. Module: assert `BLCKSZ >= PG_CONTROL_FILE_SIZE`; refuse control-on-store on
    smaller-block builds.
-2. Core: `UpdateControlFile()` appends to an **ordered handoff queue** only; add the
-   post-critical-section ship point (checkpoint-completion callback / shutdown ship,
-   draining in LSN order) and chain the hook.
-3. Core: each `UpdateControlFile()` caller passes the **LSN of its own update**
-   (checkpoint-record LSN, end-of-recovery `recptr`, promotion LSN, ...); the hook
-   versions the object by that, never `ControlFile->checkPoint` unconditionally.
+2. Core: `UpdateControlFile()` appends to an **ordered, pre-reserved handoff queue**
+   (capacity for every in-critical control write between drains, so the enqueue never
+   blocks/fails in the critical section); add the post-critical ship point
+   (checkpoint-completion callback / shutdown ship, draining in LSN order) and chain
+   the hook.
+3. Core: each `UpdateControlFile()` caller passes the **LSN of its own update** --
+   checkpoint **record-end** LSN (the `XLogInsert()` return, not `ProcLastRecPtr`),
+   end-of-recovery `recptr`, and for promotion a durable **end-of-log LSN captured
+   after cleanup** (or a marker record); never `ControlFile->checkPoint`.
 4. Daemon/module: store the writer-supplied version + `sync` before
    checkpoint-complete-on-store; same-process completion callback, or a
    shared-memory queue if a separate shipper is used.
@@ -194,12 +216,16 @@ The restore must be atomic and durable:
   checkpoint's redo pointer, is versioned by the checkpoint **record** LSN, and is
   durable (survives daemon restart).
 - An online checkpoint whose completion record is after a branch point is **not**
-  restored by that branch (versioned by the record LSN, not the redo pointer).
+  restored by that branch; the image is versioned by the checkpoint **record-end**
+  LSN, so a branch cut between the record's start and end also excludes it.
 - A non-checkpoint control update (end-of-recovery, promotion) after a branch point
-  is not restored by that branch -- it is versioned by its own update LSN, not the
-  stale `checkPoint` LSN.
+  is not restored by that branch -- it is versioned by its own update LSN (promotion
+  by a durable end-of-log LSN, since it inserts no record), not the stale
+  `checkPoint` LSN.
 - Two control updates between drains are both preserved (ordered queue), so a branch
   point between their LSNs restores the correct pre-branch image, not the later one.
+- A stalled store shipper never blocks or PANICs a checkpoint/shutdown: the
+  in-critical enqueue uses pre-reserved capacity and never applies backpressure.
 - A branch restored from the store never has a control redo pointer whose WAL was
   recycled -- the daemon's **durable** retention horizon holds even across a compute
   crash between local `pg_control` sync and the store mirror.

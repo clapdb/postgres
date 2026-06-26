@@ -75,15 +75,23 @@ first start of the branch compute):
   (`CheckPointCLOG()` / `SimpleLruWriteAll()` only flush pages, `CLOG_TRUNCATE` only
   removes them), so replaying into empty segments would leave its status unset and
   change visibility. The base must carry those already-set statuses.
-  - The base is a **consistent point-in-time image at a checkpoint**, so it has no
-    coalescing problem: everything up to `C` is in the snapshot, everything after
-    `C` is in per-update WAL. This is *not* the per-write flushed-page mirror round 3
-    ruled out -- that tried to answer an as-of query from one coalesced image; here
-    the image answers as-of-`C` exactly and `(C, L]` is WAL.
-  - Source: the parent ships a whole-segment SLRU snapshot to the store at its
-    checkpoints (coarse, periodic, keyed by the checkpoint redo LSN), or its current
-    segments are copied as the base when the parent is reachable at branch time. The
-    base must cover at least the retained status range as of `C`.
+  - The base must be a **clean as-of-`C` image**: all status with LSN `<= C`, none
+    after. Then everything after `C` comes from per-update WAL and there is no
+    coalescing. This is *not* the per-write flushed-page mirror round 3 ruled out.
+  - **`C` is not the checkpoint redo LSN.** An online checkpoint fixes `redo`,
+    releases the WAL insertion locks, and only later flushes SLRUs in
+    `CheckPointGuts()`; `SimpleLruWriteAll(.., allow_redirtied=true)` lets a commit
+    *after* `redo` land in that flush. So the flushed image contains status past
+    `redo`, and keying it by `redo` would let a branch whose `L` falls between
+    `redo` and such a commit seed with post-branch status. `C` must instead be an
+    LSN that truly upper-bounds the snapshot's contents (at or after the checkpoint
+    **completion record**), and the snapshot must provably contain nothing past `C`
+    -- captured at a quiesce/restartpoint, or under a brief SLRU write barrier that
+    stamps the current insert LSN as `C`. A base may seed only branches with
+    `L >= C`; a branch below the nearest snapshot uses an earlier one.
+  - Source: the parent ships such a clean whole-segment SLRU snapshot to the store
+    (coarse, periodic, keyed by its proven cutoff `C`), or its current segments are
+    copied as the base when the parent is reachable at branch time.
 - **Forward replay `(C, L]`.** Apply only the SLRU status effects of the records in
   `(C, L]` onto the base to bring it to exactly `L`, reusing #53's shipped-WAL +
   `XLogReader` path. Use a **narrowly scoped SLRU-status applier**, not full
@@ -91,7 +99,11 @@ first start of the branch compute):
   issues invalidations, none of which may run during branch seeding (they would
   mutate unrelated branch-local state). The applier extracts only the
   xid->status / multixact offset+member / commit-ts effects and writes them to the
-  branch's segments.
+  branch's segments. It must **also** process `XLOG_PARAMETER_CHANGE`
+  (`RM_XLOG_ID`), whose redo (`CommitTsParameterChange()`) activates/deactivates
+  commit-ts and creates/resets its segment state: a parent that toggles
+  `track_commit_timestamp` between `C` and `L` would otherwise seed commit-ts active
+  over the wrong interval or miss the activation page.
 - After materialization the branch has ordinary local SLRU and **writes forward
   itself**; nothing is served from the store on the steady-state path, so none of
   the live-mirror hazards (critical-section mirroring, read-hook interrupt safety,
@@ -176,10 +188,12 @@ This list is the spec for that feature; none of it blocks M4.
 
 ## Sequencing (M4)
 
-1. Parent: ship a consistent whole-segment SLRU snapshot (clog/multixact/commit-ts)
-   to the store at checkpoints, keyed by the checkpoint redo LSN.
+1. Parent: ship a clean whole-segment SLRU snapshot (clog/multixact/commit-ts) to
+   the store, keyed by a **proven cutoff `C`** (at/after the checkpoint completion
+   record, or a barrier-stamped insert LSN) -- never the redo LSN.
 2. A narrowly scoped **SLRU-status applier** that applies only the status effects of
-   xact/multixact/commit-ts records (no relation drops, stats, or invalidations).
+   xact/multixact/commit-ts **and `XLOG_PARAMETER_CHANGE`** records (no relation
+   drops, stats, or invalidations).
 3. Branch-create: load the base snapshot at `C <= L`, replay `(C, L]` through the
    applier into the branch's segments; fail closed if the base or that WAL is
    unavailable.
@@ -196,9 +210,14 @@ This list is the spec for that feature; none of it blocks M4.
 - An xid committed **before the base `C`** but still in the retained clog range is
   committed on the branch -- its status comes from the base snapshot, not from
   `(C, L]` WAL (which does not contain it).
+- A base snapshot is keyed by a cutoff `C` that provably bounds its contents (no
+  status past `C`), so a branch at `L >= C` never inherits a commit that landed in
+  an online checkpoint's flush after `redo` but after `L`.
 - Branch seeding does not drop relation files, touch stats, or fire invalidations
   (narrow applier, not full `xact_redo`).
-- multixact and commit-ts as of `L` match what the parent saw at `L`.
+- multixact and commit-ts as of `L` match what the parent saw at `L`, including when
+  the parent toggled `track_commit_timestamp` in `(C, L]` (the applier replays
+  `XLOG_PARAMETER_CHANGE`).
 - The branch boots from its reconstructed SLRU and then writes its own status
   forward with no store involvement on the steady-state path.
 - If the base snapshot or the parent WAL through `L` is not available on the store,
