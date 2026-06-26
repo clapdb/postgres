@@ -1184,7 +1184,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (s->memtable)
 	{
 		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
-		if (ps_memtable_full(s->memtable))
+		/*
+		 * Flush to an image layer when full -- but not once the manifest is
+		 * poisoned: record_layer() could not record the layer, so flushing would
+		 * seal an unreferenced layer file on every subsequent write.  The page is
+		 * already durable in the segment log (recovery scans it), so it is safe to
+		 * leave it in the memtable until a restart recovers the manifest; the write
+		 * still succeeds.
+		 */
+		if (ps_memtable_full(s->memtable) && !ps_manifest_poisoned())
 		{
 			/* A flush (and any inline compaction) mutates the cross-shard
 			 * ps_layer_map, so take map_lock here -- only on the rare flush, not
@@ -1199,12 +1207,6 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
 				compact_timeline(timeline, s->id);
 			ps_unlock_map();
-			/*
-			 * A flush that could not record its layer (manifest poisoned) is not a
-			 * write failure: the page is already in the segment log, which recovery
-			 * scans, so the write stays durable and acknowledged.  The manifest
-			 * poison only stops further metadata writes and compaction.
-			 */
 		}
 	}
 	return 0;
@@ -1296,9 +1298,16 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
-			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
+			else if (pv->seg < 0 &&
+					 layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
+				/*
+				 * Serve from a layer only for a layer-origin version (no segment
+				 * copy).  A segment-backed version must come from its segment: a
+				 * layer match is keyed by LSN alone, so a same-pd_lsn rewrite in
+				 * the segment would otherwise be masked by the older layer image.
+				 */
 				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from an image layer */
 			}
@@ -1347,11 +1356,14 @@ recover(uint32_t shard)
 	for (int id = 0;; id++)
 	{
 		uint64_t	off = 0;
+		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
 
-		if (ps_storage->seg_size(shard, id) < 0)
+		if (seg_bytes < 0)
 			break;				/* no more segments -> done */
 
-		/* replay records until one fails to validate (end of log) */
+		/* replay records until one fails to validate (end of log).  seg_bytes is
+		 * cached once here: the segment is not being written during recovery, and
+		 * the POSIX backend's seg_size() is a stat() we must not pay per record. */
 		for (;;)
 		{
 			SegRecHdr	hdr;
@@ -1386,8 +1398,7 @@ recover(uint32_t shard)
 			 * never index a version whose bytes cannot be read (which would mask a
 			 * good older version and zero-fill on read).
 			 */
-			if (ps_storage->seg_size(shard, id) <
-				(int64_t) (off + sizeof(hdr) + hdr.len))
+			if (seg_bytes < (int64_t) (off + sizeof(hdr) + hdr.len))
 				break;
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
@@ -1516,6 +1527,16 @@ ps_core_close(void)
 			s->memtable = NULL;
 		}
 	}
+
+	/*
+	 * Recovery rebuilds the index from the segment log, so the segments must be
+	 * durable before we rely on them: fsync them on clean shutdown (writes between
+	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
+	 * power failure after the daemon exits even though the write was acknowledged).
+	 */
+	if (ps_storage->sync)
+		ps_storage->sync();
+
 	ps_pgcache_free();
 	ps_manifest_close();
 }
