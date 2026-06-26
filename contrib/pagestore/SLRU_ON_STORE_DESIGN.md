@@ -64,17 +64,34 @@ These are the WAL-logged, `uint32`-page SLRUs. Out of scope and explicitly exclu
 
 ## M4 design: as-of-fork reconstruction
 
-At branch creation (or first start of the branch compute):
+The seed is a **base snapshot + forward replay** (the same base-image-plus-redo
+pattern relation pages use), not replay into empty segments. At branch creation (or
+first start of the branch compute):
 
-- Replay the parent's WAL from a base up to `L`, applying only the SLRU-relevant
-  records, to **materialize the branch's local clog / multixact / commit-ts
-  segments** as of `L`. This reuses the shipped-WAL + redo machinery from #53 (the
-  store already serves per-timeline WAL byte ranges and the compute already has an
-  `XLogReader` redo path); the SLRU apply is the existing `xact_redo` /
-  `multixact_redo` / `commit_ts_redo` logic pointed at the branch's segment files.
-- The base to start replay from is the parent's last SLRU checkpoint/truncation
-  point at or before `L` (clog/multixact pages are only kept back to their truncate
-  horizon, which is itself WAL-logged for the in-scope SLRUs).
+- **Base snapshot.** Start from a **consistent SLRU segment snapshot at a checkpoint
+  `C <= L`** -- the parent's actual `pg_xact` / `pg_multixact` / commit-ts segment
+  contents as of `C`. WAL alone is not enough: an xid committed *before* `C` but
+  still within the retained clog/multixact range has **no** record in `(C, L]`
+  (`CheckPointCLOG()` / `SimpleLruWriteAll()` only flush pages, `CLOG_TRUNCATE` only
+  removes them), so replaying into empty segments would leave its status unset and
+  change visibility. The base must carry those already-set statuses.
+  - The base is a **consistent point-in-time image at a checkpoint**, so it has no
+    coalescing problem: everything up to `C` is in the snapshot, everything after
+    `C` is in per-update WAL. This is *not* the per-write flushed-page mirror round 3
+    ruled out -- that tried to answer an as-of query from one coalesced image; here
+    the image answers as-of-`C` exactly and `(C, L]` is WAL.
+  - Source: the parent ships a whole-segment SLRU snapshot to the store at its
+    checkpoints (coarse, periodic, keyed by the checkpoint redo LSN), or its current
+    segments are copied as the base when the parent is reachable at branch time. The
+    base must cover at least the retained status range as of `C`.
+- **Forward replay `(C, L]`.** Apply only the SLRU status effects of the records in
+  `(C, L]` onto the base to bring it to exactly `L`, reusing #53's shipped-WAL +
+  `XLogReader` path. Use a **narrowly scoped SLRU-status applier**, not full
+  `xact_redo`: commit/abort redo also drops relation files, updates stats, and
+  issues invalidations, none of which may run during branch seeding (they would
+  mutate unrelated branch-local state). The applier extracts only the
+  xid->status / multixact offset+member / commit-ts effects and writes them to the
+  branch's segments.
 - After materialization the branch has ordinary local SLRU and **writes forward
   itself**; nothing is served from the store on the steady-state path, so none of
   the live-mirror hazards (critical-section mirroring, read-hook interrupt safety,
@@ -82,13 +99,14 @@ At branch creation (or first start of the branch compute):
 
 Why this dissolves the round-1/2/3 findings:
 
-- No flushed-page snapshot, so no coalescing (round-3 finding) and no
-  overflow-snapshot problem.
-- The "version" of a reconstructed page is intrinsic -- it is whatever the WAL says
-  at `L` -- so there is no daemon-counter-vs-branch-LSN mismatch and no need for a
-  per-object version IPC for the seed path.
-- Truncation as of `L` is just the truncate records up to `L`; no store tombstone is
-  needed to seed a branch.
+- The base is a consistent checkpoint image and everything after it is per-update
+  WAL, so there is no flushed-page coalescing and no single-image-answers-as-of-`L`
+  problem.
+- The result's "version" is intrinsic -- base at `C` plus exactly the WAL through
+  `L` -- so there is no daemon-counter-vs-branch-LSN mismatch and no per-object
+  version IPC for the seed path.
+- Truncation as of `L` is the base's truncate horizon plus the truncate records in
+  `(C, L]`; no store tombstone is needed to seed a branch.
 
 ### Reconstruction correctness
 
@@ -97,9 +115,9 @@ Why this dissolves the round-1/2/3 findings:
   `redo_page_asof` already applies for relation pages).
 - multixact needs both `offsets` and `members` replayed together to a consistent
   point; commit-ts only if `track_commit_timestamp` was on in the parent.
-- Fail closed: if the parent WAL needed to reach `L` is not available on the store
-  (not shipped / truncated away), branch creation fails rather than seeding partial
-  status -- a half-known clog must never boot.
+- Fail closed: if either the base snapshot at `C` or the parent WAL across `(C, L]`
+  is unavailable on the store, branch creation fails rather than seeding partial or
+  zeroed status -- a half-known clog must never boot.
 
 ## Identity and versioning (for any persisted SLRU object)
 
@@ -158,11 +176,15 @@ This list is the spec for that feature; none of it blocks M4.
 
 ## Sequencing (M4)
 
-1. Reuse #53's shipped-WAL + `XLogReader` redo to replay SLRU records to `L`.
-2. Branch-create: materialize clog / multixact / commit-ts segments as of `L` from
-   the parent's WAL; fail closed if that WAL is unavailable.
-3. Verify the branch boots on its reconstructed status and writes forward locally.
-4. Tests: the acceptance scenarios below.
+1. Parent: ship a consistent whole-segment SLRU snapshot (clog/multixact/commit-ts)
+   to the store at checkpoints, keyed by the checkpoint redo LSN.
+2. A narrowly scoped **SLRU-status applier** that applies only the status effects of
+   xact/multixact/commit-ts records (no relation drops, stats, or invalidations).
+3. Branch-create: load the base snapshot at `C <= L`, replay `(C, L]` through the
+   applier into the branch's segments; fail closed if the base or that WAL is
+   unavailable.
+4. Verify the branch boots on its reconstructed status and writes forward locally.
+5. Tests: the acceptance scenarios below.
 
 (The deferred live-sharing items above are sequenced separately, after M4.)
 
@@ -171,11 +193,16 @@ This list is the spec for that feature; none of it blocks M4.
 - A branch created at `L` sees a committed xid iff its commit record is at/below `L`;
   an xid committed on the parent after `L` is **not** committed on the branch, even
   when it shares a `pg_xact` page with a pre-`L` commit.
+- An xid committed **before the base `C`** but still in the retained clog range is
+  committed on the branch -- its status comes from the base snapshot, not from
+  `(C, L]` WAL (which does not contain it).
+- Branch seeding does not drop relation files, touch stats, or fire invalidations
+  (narrow applier, not full `xact_redo`).
 - multixact and commit-ts as of `L` match what the parent saw at `L`.
 - The branch boots from its reconstructed SLRU and then writes its own status
   forward with no store involvement on the steady-state path.
-- If the parent WAL through `L` is not available on the store, branch creation fails
-  closed rather than seeding partial/zeroed status.
+- If the base snapshot or the parent WAL through `L` is not available on the store,
+  branch creation fails closed rather than seeding partial/zeroed status.
 - A non-WAL/`int64` SLRU (`pg_subtrans`, `pg_notify`, serializable) is excluded, not
   silently store-backed.
 

@@ -85,19 +85,23 @@ removed.
 ### Checkpoint-completion handoff
 
 - `UpdateControlFile()` (and the hook) under the critical section only **records
-  intent**: it snapshots the just-written `ControlFileData` image plus the
-  checkpoint-record LSN into a small handoff slot (in-process for a same-process
-  shipper, shared memory for a separate one -- see below). This is allocation-free
-  and cannot fail the checkpoint.
-- The actual `obj_write` of the control image runs at a **post-critical-section
-  point**. The recorded-intent slot is read by whoever ships it, so it must be
+  intent**: it appends the just-written `ControlFileData` image plus that update's
+  LSN to an **ordered handoff queue**, not a single replaceable slot. Two control
+  updates can occur before the shipper drains (e.g. an end-of-recovery update then a
+  `DB_IN_PRODUCTION` update); a single slot would coalesce them to the latest image,
+  so a branch point between their LSNs could restore post-branch control bytes. Each
+  LSN-versioned image must survive until shipped -- hence a queue (with backpressure
+  if it fills), or a synchronous drain at each post-critical point. Appending is
+  allocation-free and cannot fail the checkpoint.
+- The actual `obj_write` of each queued image runs at a **post-critical-section
+  point**, in LSN order. The queue is read by whoever ships it, so it must be
   reachable by that process: either ship from a **same-process completion callback**
   (after `CreateCheckPoint()` leaves its critical section, in the checkpointer/
   startup process that recorded it) -- the default -- or, if a **separate** shipper
-  process is used, put the handoff slot in **shared memory**, never a private
-  per-process buffer (a private slot would be invisible to the shipper and the
-  image would be dropped). Shutdown's final control update ships from the shutdown
-  path *after* the critical section, before the postmaster exits.
+  process is used, put the queue in **shared memory**, never a private per-process
+  buffer (a private queue would be invisible to the shipper and the images dropped).
+  Shutdown's final control update ships from the shutdown path *after* the critical
+  section, before the postmaster exits.
 - **Durability contract.** The mirrored control object is shipped and the daemon
   `sync`'d before the checkpoint is considered complete-on-store. Restore-after-
   crash therefore sees a control image no newer than the last completed checkpoint
@@ -105,19 +109,25 @@ removed.
   ordering as: local `update_controlfile(..., do_sync=true)` first (unchanged),
   then store mirror + store sync; a compute that restores from the store replays
   from the mirrored checkpoint's redo pointer.
-- **Gate WAL recycling on mirror durability.** A checkpoint removes old WAL (using
-  the new `RedoRecPtr`) *after* `UpdateControlFile()`. If the store mirror/sync
-  fails or lags after the local control file advanced, the store's control image is
-  older -- its redo pointer needs WAL that the completed local checkpoint is now
-  free to recycle, so a branch restoring that image would have a valid old
-  `pg_control` but **missing WAL**. The store mirror is therefore on the checkpoint
-  durability path for branch purposes: a failed/blocked store sync must **block old
-  WAL removal** (hold the retention horizon), or the pagestore must explicitly
-  retain shipped WAL back to the **last mirrored control redo pointer**, never past
-  it. WAL the store has not caught up to is not recyclable from the branch's view.
+- **Gate WAL recycling on mirror durability, with a durable horizon.** A checkpoint
+  removes old WAL (using the new `RedoRecPtr`) *after* `UpdateControlFile()`. If the
+  store mirror/sync fails or lags after the local control file advanced, the store's
+  control image is older -- its redo pointer needs WAL that the completed local
+  checkpoint is now free to recycle, so a branch restoring that image would have a
+  valid old `pg_control` but **missing WAL**. So shipped-WAL retention must never
+  drop below the redo pointer of the control image **currently on the store**.
+  - **The horizon lives on the store and must be durable.** An in-memory "block WAL
+    removal" flag is lost if the process crashes after the local `pg_control` sync
+    but before the store mirror finishes -- on restart, ordinary checkpoint/
+    restartpoint cleanup would recycle WAL using the newer local redo while the store
+    still holds the older control image. The pagestore daemon (itself durable) is the
+    authority: it retains shipped WAL at/above the redo pointer of the control object
+    it currently holds, and refuses to GC below it, independent of what the
+    transient local compute decided. Branch restore uses the store's WAL + the
+    store's control, both governed by this one durable horizon, so the crash window
+    cannot strand a branch.
 - **Hook chaining.** Installing `control_file_write_hook` must save and call any
-  previously installed hook (fix for finding 5), so the seam composes with other
-  extensions.
+  previously installed hook, so the seam composes with other extensions.
 
 ## Restore protocol (bootstrap before shared_preload)
 
@@ -160,16 +170,18 @@ The restore must be atomic and durable:
 
 1. Module: assert `BLCKSZ >= PG_CONTROL_FILE_SIZE`; refuse control-on-store on
    smaller-block builds.
-2. Core: `UpdateControlFile()` records intent only; add the post-critical-section
-   ship point (checkpoint-completion callback / shutdown ship) and chain the hook.
+2. Core: `UpdateControlFile()` appends to an **ordered handoff queue** only; add the
+   post-critical-section ship point (checkpoint-completion callback / shutdown ship,
+   draining in LSN order) and chain the hook.
 3. Core: each `UpdateControlFile()` caller passes the **LSN of its own update**
    (checkpoint-record LSN, end-of-recovery `recptr`, promotion LSN, ...); the hook
    versions the object by that, never `ControlFile->checkPoint` unconditionally.
 4. Daemon/module: store the writer-supplied version + `sync` before
    checkpoint-complete-on-store; same-process completion callback, or a
-   shared-memory handoff slot if a separate shipper is used.
-5. Core: gate old-WAL removal / retention horizon on the store mirror being durable
-   to the last mirrored control redo (a failed store sync blocks WAL recycling).
+   shared-memory queue if a separate shipper is used.
+5. Daemon: a **durable** retention horizon -- the daemon retains shipped WAL at/above
+   the redo of the control image it currently holds and refuses to GC below it,
+   surviving a compute crash between local sync and store mirror.
 6. Tool: atomic temp+rename **at `PG_CONTROL_FILE_SIZE`**, dir fsync,
    **as-of-branch-LSN** read, channel release, CRC-verify, fail-closed.
 7. Tests: the acceptance scenarios below.
@@ -186,9 +198,11 @@ The restore must be atomic and durable:
 - A non-checkpoint control update (end-of-recovery, promotion) after a branch point
   is not restored by that branch -- it is versioned by its own update LSN, not the
   stale `checkPoint` LSN.
+- Two control updates between drains are both preserved (ordered queue), so a branch
+  point between their LSNs restores the correct pre-branch image, not the later one.
 - A branch restored from the store never has a control redo pointer whose WAL was
-  recycled: store-mirror durability gates old-WAL removal (or WAL is retained back
-  to the last mirrored control redo).
+  recycled -- the daemon's **durable** retention horizon holds even across a compute
+  crash between local `pg_control` sync and the store mirror.
 - Restore produces a CRC-valid `global/pg_control` of exactly
   `PG_CONTROL_FILE_SIZE` bytes via temp+rename with a fsync'd directory; a crash
   mid-restore never leaves a torn control file, and length-checking tools accept it.
