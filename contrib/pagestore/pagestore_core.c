@@ -1179,20 +1179,20 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
 	s->cur_off += reclen;
 
-	/* stage the version for the LSM memtable; flush to an image layer when full
-	 * (additive in phase 2 -- the segment write above is still authoritative) */
-	if (s->memtable)
+	/*
+	 * Stage the version for the LSM memtable and flush to an image layer when full
+	 * (additive in phase 2 -- the segment write above is still authoritative).
+	 *
+	 * Skip all of this once the manifest is poisoned: record_layer() can no longer
+	 * record a layer, so staging pages we can never flush would grow the memtable
+	 * without bound (turning a metadata error into an OOM), and flushing would seal
+	 * unreferenced layer files.  The page is durable in the segment log, which
+	 * recovery scans, so the write still succeeds; reads fall back to the segment.
+	 */
+	if (s->memtable && !ps_manifest_poisoned())
 	{
 		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
-		/*
-		 * Flush to an image layer when full -- but not once the manifest is
-		 * poisoned: record_layer() could not record the layer, so flushing would
-		 * seal an unreferenced layer file on every subsequent write.  The page is
-		 * already durable in the segment log (recovery scans it), so it is safe to
-		 * leave it in the memtable until a restart recovers the manifest; the write
-		 * still succeeds.
-		 */
-		if (ps_memtable_full(s->memtable) && !ps_manifest_poisoned())
+		if (ps_memtable_full(s->memtable))
 		{
 			/* A flush (and any inline compaction) mutates the cross-shard
 			 * ps_layer_map, so take map_lock here -- only on the rare flush, not
@@ -1516,6 +1516,21 @@ ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
 
+	/*
+	 * Recovery rebuilds the index from the segment log, so the segments must be
+	 * durable before we rely on them: fsync them on clean shutdown (writes between
+	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
+	 * power failure after the daemon exits even though the write was acknowledged).
+	 *
+	 * Sync *before* flushing the memtable into image layers below.  Otherwise a
+	 * power loss in the shutdown window could leave a just-committed layer as the
+	 * only durable copy of pages whose segment bytes were still in the page cache,
+	 * which segment-only recovery would miss.  Syncing first makes the recovery
+	 * source durable before any layer is committed on top of it.
+	 */
+	if (ps_storage->sync)
+		ps_storage->sync();
+
 	for (uint32_t i = 0; i < ns; i++)
 	{
 		Shard	   *s = &g_shards[i];
@@ -1527,15 +1542,6 @@ ps_core_close(void)
 			s->memtable = NULL;
 		}
 	}
-
-	/*
-	 * Recovery rebuilds the index from the segment log, so the segments must be
-	 * durable before we rely on them: fsync them on clean shutdown (writes between
-	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
-	 * power failure after the daemon exits even though the write was acknowledged).
-	 */
-	if (ps_storage->sync)
-		ps_storage->sync();
 
 	ps_pgcache_free();
 	ps_manifest_close();
