@@ -170,6 +170,9 @@ manifest_decode_key(PsKey *dst, const PsManifestKeyDisk *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;	/* mirror encode; manifest v2 -- without this a
+								 * replayed non-relation layer key decodes as
+								 * PS_KLASS_RELATION and its lookups are pruned */
 }
 
 static int
