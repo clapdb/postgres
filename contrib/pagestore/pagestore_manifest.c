@@ -299,6 +299,18 @@ ps_manifest_close(void)
 	manifest_path[0] = '\0';
 }
 
+/*
+ * True once an append failed (torn tail).  The metadata is no longer durable, so
+ * callers must stop persisting new layers -- the daemon rejects further writes and
+ * skips compaction rather than accepting data it can never record (and that
+ * layer-based recovery would not see).  Cleared by (re)open after replay recovers.
+ */
+int
+ps_manifest_poisoned(void)
+{
+	return manifest_poisoned;
+}
+
 int
 ps_manifest_replay(PsLayerMap *map)
 {

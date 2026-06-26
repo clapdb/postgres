@@ -335,6 +335,15 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 	if (nold < 2)
 		return 0;				/* nothing worth merging */
 
+	/*
+	 * Never compact a poisoned manifest: the new layer could not be recorded, so
+	 * we would just write an unreferenced file and the old layers would stay live
+	 * -- maintenance would keep retrying and leaking files.  Bail (the daemon is
+	 * already rejecting writes; a restart recovers the manifest).
+	 */
+	if (ps_manifest_poisoned())
+		return -1;
+
 	old = malloc((size_t) nold * sizeof(PsLayerDesc));
 	if (!old)
 		return -1;
@@ -422,11 +431,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
-			break;
+			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
-			break;
+			goto cleanup;		/* incomplete */
 	}
 	rc = 0;
 
@@ -1119,6 +1128,16 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	data_off;
 	Shard	   *s = shard_for(key);
 
+	/*
+	 * Reject writes once the manifest is poisoned.  Recovery rebuilds from
+	 * manifest-recorded layers and does not rescan segments, so a page appended
+	 * now -- whose memtable flush can no longer record a layer -- would be lost on
+	 * restart.  Failing the write (rather than acknowledging un-recoverable data)
+	 * is the safe response; a restart recovers the manifest and clears the poison.
+	 */
+	if (use_layers && ps_manifest_poisoned())
+		return -1;
+
 	/* roll over to a fresh segment when the current one would overflow */
 	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
 	{
@@ -1190,6 +1209,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
 				compact_timeline(timeline, s->id);
 			ps_unlock_map();
+
+			/*
+			 * If this flush could not record its layer (manifest poisoned), the
+			 * page just written is not durable through layer-based recovery -- fail
+			 * the write so it is not acknowledged.  Subsequent writes are rejected
+			 * at the top of append_page.
+			 */
+			if (ps_manifest_poisoned())
+				return -1;
 		}
 	}
 	return 0;
