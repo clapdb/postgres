@@ -620,7 +620,7 @@ ps_manifest_remove_layer(uint64_t layer_id)
 int
 ps_manifest_should_compact(void)
 {
-	if (manifest_poisoned)
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return 0;
 	return manifest_nrecords >= 64 &&
 		manifest_nrecords > 4 * ((uint64_t) ps_layer_map.nlayers + 1);
@@ -643,7 +643,7 @@ ps_manifest_compact(void)
 	uint64_t	nrec = 0;
 	int			n;
 
-	if (manifest_poisoned)
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", manifest_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
@@ -681,9 +681,10 @@ ps_manifest_compact(void)
 		 * The rename is in place but its durability is unconfirmed (the directory
 		 * fsync failed -- the disk is misbehaving).  Poison so no further append
 		 * lands until a restart re-establishes a known-durable manifest, matching
-		 * the fail-stop policy for any other manifest write/fsync error.
+		 * the fail-stop policy for any other manifest write/fsync error.  Atomic:
+		 * a concurrent shard may read the flag without the map lock.
 		 */
-		manifest_poisoned = 1;
+		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
 		return -1;
 	}
 	manifest_nrecords = nrec;
