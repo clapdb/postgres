@@ -55,16 +55,24 @@ The findings reduce to five invariants the prototype breaks:
   build (the default 8192 satisfies it). Splitting `pg_control` across multiple
   object blocks is possible but deferred -- it buys nothing on real deployments.
   Where it fits, the image is zero-padded to `BLCKSZ`.
-- **Version order (branch-aware).** Like SLRU objects (see SLRU_ON_STORE_DESIGN.md),
-  the control object's version is a WAL LSN supplied by the writer and stored
-  verbatim -- not a daemon `max+1` counter (not comparable to a branch cutoff) and
-  not the control bytes. The LSN must be the **checkpoint/control-update record's
-  LSN** (`ProcLastRecPtr`, i.e. `ControlFile->checkPoint`), **not the redo pointer**
-  (`checkPointCopy.redo`). For an online checkpoint that spans a branch point the
-  redo pointer is *before* the branch while the checkpoint completion record is
-  *after* it; versioning by redo would make that just-completed checkpoint visible
-  to an as-of-branch read and restore the branch to post-branch state. Versioning by
-  the checkpoint record's own LSN keeps restore-as-of-branch-point (below) correct.
+- **Version order (branch-aware), per update.** Like SLRU objects (see
+  SLRU_ON_STORE_DESIGN.md), the control object's version is a WAL LSN supplied by the
+  writer and stored verbatim -- not a daemon `max+1` counter (not comparable to a
+  branch cutoff) and not the control bytes. It must be the **LSN of the specific
+  update that caused this control write**, passed in by the caller, **not
+  `ControlFile->checkPoint` unconditionally** and **not the redo pointer**
+  (`checkPointCopy.redo`):
+  - a checkpoint writes its **checkpoint-record LSN** (`ProcLastRecPtr`). The redo
+    pointer would be wrong -- for an online checkpoint spanning a branch point the
+    redo is *before* the branch but the completion record is *after* it, so an
+    as-of-branch read would restore post-branch state.
+  - non-checkpoint updates that do **not** advance `ControlFile->checkPoint` --
+    `CreateEndOfRecoveryRecord()` (sets `minRecoveryPoint` to its `recptr`),
+    promotion (`DB_IN_PRODUCTION`), and `minRecoveryPoint`/backup-state writes --
+    must pass **their own** LSN. Versioning these by the stale `checkPoint` LSN
+    would let an as-of-branch restore pick control bytes written after the branch,
+    or coalesce distinct updates at one version. So the write hook takes an explicit
+    `update_lsn` from each `UpdateControlFile()` caller.
 - **Timeline.** The control object is written on the writer's timeline; restore
   reads it as of the branch-creation LSN on the branch's ancestry (see restore).
 
@@ -97,6 +105,16 @@ removed.
   ordering as: local `update_controlfile(..., do_sync=true)` first (unchanged),
   then store mirror + store sync; a compute that restores from the store replays
   from the mirrored checkpoint's redo pointer.
+- **Gate WAL recycling on mirror durability.** A checkpoint removes old WAL (using
+  the new `RedoRecPtr`) *after* `UpdateControlFile()`. If the store mirror/sync
+  fails or lags after the local control file advanced, the store's control image is
+  older -- its redo pointer needs WAL that the completed local checkpoint is now
+  free to recycle, so a branch restoring that image would have a valid old
+  `pg_control` but **missing WAL**. The store mirror is therefore on the checkpoint
+  durability path for branch purposes: a failed/blocked store sync must **block old
+  WAL removal** (hold the retention horizon), or the pagestore must explicitly
+  retain shipped WAL back to the **last mirrored control redo pointer**, never past
+  it. WAL the store has not caught up to is not recyclable from the branch's view.
 - **Hook chaining.** Installing `control_file_write_hook` must save and call any
   previously installed hook (fix for finding 5), so the seam composes with other
   extensions.
@@ -144,13 +162,17 @@ The restore must be atomic and durable:
    smaller-block builds.
 2. Core: `UpdateControlFile()` records intent only; add the post-critical-section
    ship point (checkpoint-completion callback / shutdown ship) and chain the hook.
-3. Daemon/module: control object version = the checkpoint **record** LSN
-   (writer-supplied, not the redo pointer) + `sync` before checkpoint-complete-on-
-   store. Same-process completion callback, or a shared-memory handoff slot if a
-   separate shipper is used.
-4. Tool: atomic temp+rename **at `PG_CONTROL_FILE_SIZE`**, dir fsync,
+3. Core: each `UpdateControlFile()` caller passes the **LSN of its own update**
+   (checkpoint-record LSN, end-of-recovery `recptr`, promotion LSN, ...); the hook
+   versions the object by that, never `ControlFile->checkPoint` unconditionally.
+4. Daemon/module: store the writer-supplied version + `sync` before
+   checkpoint-complete-on-store; same-process completion callback, or a
+   shared-memory handoff slot if a separate shipper is used.
+5. Core: gate old-WAL removal / retention horizon on the store mirror being durable
+   to the last mirrored control redo (a failed store sync blocks WAL recycling).
+6. Tool: atomic temp+rename **at `PG_CONTROL_FILE_SIZE`**, dir fsync,
    **as-of-branch-LSN** read, channel release, CRC-verify, fail-closed.
-5. Tests: the acceptance scenarios below.
+7. Tests: the acceptance scenarios below.
 
 ## Acceptance criteria
 
@@ -161,6 +183,12 @@ The restore must be atomic and durable:
   durable (survives daemon restart).
 - An online checkpoint whose completion record is after a branch point is **not**
   restored by that branch (versioned by the record LSN, not the redo pointer).
+- A non-checkpoint control update (end-of-recovery, promotion) after a branch point
+  is not restored by that branch -- it is versioned by its own update LSN, not the
+  stale `checkPoint` LSN.
+- A branch restored from the store never has a control redo pointer whose WAL was
+  recycled: store-mirror durability gates old-WAL removal (or WAL is retained back
+  to the last mirrored control redo).
 - Restore produces a CRC-valid `global/pg_control` of exactly
   `PG_CONTROL_FILE_SIZE` bytes via temp+rename with a fsync'd directory; a crash
   mid-restore never leaves a torn control file, and length-checking tools accept it.
