@@ -349,6 +349,78 @@ test_manifest_crc(void)
 	rmdir(dir2);
 }
 
+/*
+ * The len field is not trusted: a corrupted length on an interior record is
+ * detected as corruption (it is not used to size the read, so it cannot consume
+ * the following record), while a corrupted length on the physically last record
+ * is a recoverable torn tail.
+ */
+static void
+test_manifest_len_corruption(void)
+{
+	char		dir[] = "/tmp/pslenintXXXXXX";
+	char		dir2[] = "/tmp/pslentailXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1;
+	struct stat st;
+	off_t		add_size;
+	PsLayerDesc *l1;
+
+	/*
+	 * Interior small record whose len is flipped upward: a length-trusting reader
+	 * would consume the following REMOVE record and hit EOF, mis-recovering the
+	 * MARK_DELETE as a torn tail and resurrecting the removed layer.  Sizing from
+	 * the type instead, this is detected as interior corruption and fails replay.
+	 * Build [ADD, MARK_DELETE, REMOVE]; measure the ADD's size to locate the
+	 * MARK_DELETE header that follows it.
+	 */
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "len test setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d1 = synth_layer(1, dir);
+	check(ps_manifest_add_layer(&d1) == 0, "ADD written");
+	check(stat(mpath, &st) == 0, "measure ADD size");
+	add_size = st.st_size;
+	check(ps_manifest_mark_delete(1) == 0 && ps_manifest_remove_layer(1) == 0,
+		  "MARK_DELETE + REMOVE written");
+	ps_manifest_close();
+	corrupt_byte(mpath, add_size + 12); /* the MARK_DELETE header's len field */
+	check(ps_manifest_open(dir) == 0, "reopen (interior len)");
+	check(ps_manifest_replay(&ps_layer_map) != 0,
+		  "interior len corruption fails replay (not a misread torn tail)");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+
+	/* --- last record's len corrupted -> recoverable torn tail --- */
+	if (!mkdtemp(dir2) || ps_manifest_open(dir2) != 0)
+	{
+		check(0, "len tail setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir2);
+	d1 = synth_layer(1, dir2);
+	check(ps_manifest_add_layer(&d1) == 0, "ADD written");
+	check(ps_manifest_mark_delete(1) == 0, "MARK_DELETE written (last record)");
+	ps_manifest_close();
+	/* the trailing MARK_DELETE is 20-byte header + 16-byte event = 36 bytes; its
+	 * len field sits at file_size - 36 + 12 = file_size - 24 */
+	if (stat(mpath, &st) == 0)
+		corrupt_byte(mpath, st.st_size - 24);
+	check(ps_manifest_open(dir2) == 0, "reopen (last-record len)");
+	check(ps_manifest_replay(&ps_layer_map) == 0,
+		  "last-record len corruption is a recoverable torn tail");
+	l1 = find_layer(1);
+	check(ps_layer_map_count(&ps_layer_map) == 1 && l1 != NULL && !l1->deleting,
+		  "the ADD survives and the truncated MARK_DELETE did not apply");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir2);
+}
+
 int
 main(void)
 {
@@ -431,6 +503,7 @@ main(void)
 	test_torn_tail_poison();
 	test_manifest_compaction();
 	test_manifest_crc();
+	test_manifest_len_corruption();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;

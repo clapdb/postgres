@@ -21,6 +21,7 @@
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
+#define PS_MANIFEST_VERSION_V2 2	/* legacy: no per-record CRC (16-byte header) */
 #define PS_MANIFEST_FNV_INIT	2166136261u
 
 typedef enum PsManifestEventType
@@ -152,6 +153,24 @@ manifest_record_crc(const PsManifestRecord *rec, const void *payload, uint32_t l
 	if (len > 0)
 		crc = manifest_fnv1a(crc, payload, len);
 	return crc;
+}
+
+/* Fixed on-disk payload length for a record type, or -1 if the type is unknown. */
+static int
+manifest_type_payload_len(uint32_t type)
+{
+	switch ((PsManifestEventType) type)
+	{
+		case PS_MANIFEST_ADD_LAYER:
+			return (int) sizeof(PsManifestLayerDisk);
+		case PS_MANIFEST_SET_REMOTE_DURABLE:
+		case PS_MANIFEST_DROP_LOCAL:
+		case PS_MANIFEST_MARK_DELETE:
+		case PS_MANIFEST_REMOVE_LAYER:
+			return (int) sizeof(PsManifestLayerIdEvent);
+		default:
+			return -1;
+	}
 }
 
 /* Write one [header | payload] record to an open fd (no fsync). */
@@ -403,29 +422,23 @@ ps_manifest_replay(PsLayerMap *map)
 		}			payload;
 		ssize_t		n;
 		off_t		rec_off = good_off;
-		int			at_eof;
+		int			has_crc,
+					plen;
+		off_t		hdr_size,
+					rec_total;
 
-		n = read(fd, &rec, sizeof(rec));
-		if (n == 0)
-			break;
-		if (n != (ssize_t) sizeof(rec))
-		{
-			truncate_tail = 1;
-			good_off = rec_off;
-			break;				/* torn tail */
-		}
 		/*
-		 * A malformed header (wrong magic/version, oversize len), a short payload,
-		 * or a bad CRC is a recoverable torn tail when it is the last thing in the
-		 * file; the same fault earlier in the file is interior corruption that must
-		 * fail replay rather than silently load a wrong layer.
+		 * Read the 16-byte common prefix (magic, version, type, len) shared by
+		 * every format version.  A short read or wrong magic at end-of-file is a
+		 * recoverable torn tail; the same fault earlier in the file is corruption.
 		 */
-		at_eof = (rec_off + (off_t) sizeof(rec) >= file_size);
-		if (rec.magic != PS_MANIFEST_MAGIC ||
-			rec.version != PS_MANIFEST_VERSION ||
-			rec.len > sizeof(payload.bytes))
+		n = read(fd, &rec, offsetof(PsManifestRecord, crc));
+		if (n == 0)
+			break;				/* clean end of log */
+		if (n != (ssize_t) offsetof(PsManifestRecord, crc) ||
+			rec.magic != PS_MANIFEST_MAGIC)
 		{
-			if (at_eof)
+			if (rec_off + (off_t) offsetof(PsManifestRecord, crc) >= file_size)
 			{
 				truncate_tail = 1;
 				good_off = rec_off;
@@ -435,25 +448,88 @@ ps_manifest_replay(PsLayerMap *map)
 			return -1;
 		}
 
-		if (rec.len > 0 &&
-			read(fd, payload.bytes, rec.len) != (ssize_t) rec.len)
+		/* accept v3 (per-record CRC) and the legacy v2 (no CRC); reject others */
+		if (rec.version == PS_MANIFEST_VERSION)
 		{
-			truncate_tail = 1;
-			good_off = rec_off;
-			break;				/* torn payload */
+			has_crc = 1;
+			hdr_size = (off_t) sizeof(PsManifestRecord);
 		}
-
-		if (manifest_record_crc(&rec, payload.bytes, rec.len) != rec.crc)
+		else if (rec.version == PS_MANIFEST_VERSION_V2)
 		{
-			at_eof = (rec_off + (off_t) sizeof(rec) + (off_t) rec.len >= file_size);
-			if (at_eof)
+			has_crc = 0;
+			hdr_size = (off_t) offsetof(PsManifestRecord, crc);
+		}
+		else
+		{
+			if (rec_off + (off_t) offsetof(PsManifestRecord, crc) >= file_size)
 			{
 				truncate_tail = 1;
 				good_off = rec_off;
-				break;			/* torn tail (partial write) */
+				break;
 			}
 			close(fd);
-			return -1;			/* interior corruption */
+			return -1;
+		}
+		if (has_crc &&
+			read(fd, &rec.crc, sizeof(rec.crc)) != (ssize_t) sizeof(rec.crc))
+		{
+			truncate_tail = 1;
+			good_off = rec_off;
+			break;				/* torn CRC */
+		}
+
+		/*
+		 * Size the record from its TYPE, never the (untrusted) len field, so a
+		 * corrupted len cannot misalign the read.  An unknown type with data after
+		 * it is interior corruption; at EOF it is a torn tail.
+		 */
+		plen = manifest_type_payload_len(rec.type);
+		if (plen < 0 || (size_t) plen > sizeof(payload.bytes))
+		{
+			if (rec_off + hdr_size >= file_size)
+			{
+				truncate_tail = 1;
+				good_off = rec_off;
+				break;
+			}
+			close(fd);
+			return -1;
+		}
+		rec_total = hdr_size + plen;
+
+		/* a record that does not fully fit in the file is a truncated torn tail */
+		if (rec_off + rec_total > file_size)
+		{
+			truncate_tail = 1;
+			good_off = rec_off;
+			break;
+		}
+		if (plen > 0 &&
+			read(fd, payload.bytes, (size_t) plen) != (ssize_t) plen)
+		{
+			truncate_tail = 1;
+			good_off = rec_off;
+			break;				/* (unreachable given the fit check above) */
+		}
+
+		/*
+		 * Integrity: v3 verifies the CRC; both versions require the len field to
+		 * equal the type's fixed size (this catches a flipped len on v2 and is
+		 * defence-in-depth on v3).  A full-sized record that fails is interior
+		 * corruption unless it is physically the last record (then a torn tail).
+		 */
+		if (rec.len != (uint32_t) plen ||
+			(has_crc &&
+			 manifest_record_crc(&rec, payload.bytes, (uint32_t) plen) != rec.crc))
+		{
+			if (rec_off + rec_total >= file_size)
+			{
+				truncate_tail = 1;
+				good_off = rec_off;
+				break;
+			}
+			close(fd);
+			return -1;
 		}
 
 		switch ((PsManifestEventType) rec.type)
@@ -462,11 +538,6 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc desc;
 
-					if (rec.len != sizeof(payload.layer))
-					{
-						close(fd);
-						return -1;
-					}
 					if (manifest_decode_layer(&desc, &payload.layer) != 0 ||
 						(!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
@@ -479,14 +550,8 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_SET_REMOTE_DURABLE:
 				{
-					PsLayerDesc *layer;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(payload.ev))
-					{
-						close(fd);
-						return -1;
-					}
-					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
 					{
 						layer->remote_durable = true;
@@ -497,49 +562,26 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_MARK_DELETE:
 				{
-					PsLayerDesc *layer;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(payload.ev))
-					{
-						close(fd);
-						return -1;
-					}
-					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
 						layer->deleting = true;
 					break;
 				}
 
 			case PS_MANIFEST_REMOVE_LAYER:
-				{
-					if (rec.len != sizeof(payload.ev))
-					{
-						close(fd);
-						return -1;
-					}
-					manifest_remove_from_map(map, payload.ev.layer_id);
-					break;
-				}
+				manifest_remove_from_map(map, payload.ev.layer_id);
+				break;
 
 			case PS_MANIFEST_DROP_LOCAL:
 				{
-					PsLayerDesc *layer;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(payload.ev))
-					{
-						close(fd);
-						return -1;
-					}
-					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
-					{
 						for (uint32_t i = 0; i < layer->location_count; i++)
-						{
 							if (layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 								layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
 								layer->locations[i].available = false;
-						}
-					}
 					break;
 				}
 
@@ -547,12 +589,7 @@ ps_manifest_replay(PsLayerMap *map)
 				close(fd);
 				return -1;
 		}
-		good_off = lseek(fd, 0, SEEK_CUR);
-		if (good_off < 0)
-		{
-			close(fd);
-			return -1;
-		}
+		good_off = rec_off + rec_total;	/* we read exactly rec_total above */
 		manifest_nrecords++;
 	}
 
