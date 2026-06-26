@@ -27,6 +27,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1291,7 +1292,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
 				return 1;
 
-			if (s->memtable &&
+			/*
+			 * The memtable is a safe read source only while it stays in lock-step
+			 * with the segment log.  Once the manifest is poisoned, append_page()
+			 * stops staging, so a later same-pd_lsn rewrite lands in the segment
+			 * only; the memtable would then return the older bytes under the same
+			 * LSN as the segment-backed pv.  Skip it when poisoned and read the
+			 * authoritative segment instead.
+			 */
+			if (s->memtable && !ps_manifest_poisoned() &&
 				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
@@ -1527,9 +1536,17 @@ ps_core_close(void)
 	 * only durable copy of pages whose segment bytes were still in the page cache,
 	 * which segment-only recovery would miss.  Syncing first makes the recovery
 	 * source durable before any layer is committed on top of it.
+	 *
+	 * If the sync fails (EIO/ENOSPC/...), the segment log -- the sole source
+	 * segment-only recovery reads -- is not durable, so the about-to-be-destroyed
+	 * memtable may be the only good copy of recent writes.  We cannot make it
+	 * durable from here, but we must not let that pass silently: report it loudly
+	 * so the failure is not mistaken for a clean shutdown.
 	 */
-	if (ps_storage->sync)
-		ps_storage->sync();
+	if (ps_storage->sync && ps_storage->sync() != 0)
+		fprintf(stderr, "pagestore_daemon: FATAL: segment sync failed on shutdown "
+				"(%s); recently acknowledged writes may be lost on restart\n",
+				strerror(errno));
 
 	for (uint32_t i = 0; i < ns; i++)
 	{
