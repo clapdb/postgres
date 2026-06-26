@@ -96,6 +96,9 @@ PsLayerMap ps_layer_map;
  * tail and turn it into unrecoverable interior corruption.  Reset on (re)open,
  * where replay truncates the torn tail.  Layer data itself is not lost: the
  * segment log stays authoritative and recover() rebuilds from it.
+ *
+ * Accessed from multiple shard worker threads (one shard can poison while another
+ * reads the flag), so all reads/writes go through __atomic.
  */
 static int	manifest_poisoned = 0;
 
@@ -122,7 +125,7 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	int			created = 0;
 
 	/* once the tail may be torn, never append again (see manifest_poisoned) */
-	if (manifest_poisoned)
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;
 
 	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
@@ -145,7 +148,8 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 		rc = -1;
 	close(fd);
 	if (rc != 0)
-		manifest_poisoned = 1;	/* a partial write/fsync may have torn the tail */
+		/* a partial write/fsync may have torn the tail */
+		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
 	return rc;
 }
 
@@ -287,7 +291,8 @@ ps_manifest_open(const char *store_dir)
 	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(manifest_path))
 		return -1;
-	manifest_poisoned = 0;		/* replay truncates any torn tail; start clean */
+	/* replay truncates any torn tail; start clean */
+	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }
@@ -308,7 +313,7 @@ ps_manifest_close(void)
 int
 ps_manifest_poisoned(void)
 {
-	return manifest_poisoned;
+	return __atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE);
 }
 
 int
