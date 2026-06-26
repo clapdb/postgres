@@ -272,6 +272,83 @@ test_manifest_compaction(void)
 	rmdir(dir);
 }
 
+/* Flip every bit of one byte at 'off' in a file. */
+static void
+corrupt_byte(const char *path, off_t off)
+{
+	int			fd = open(path, O_RDWR);
+	unsigned char b;
+
+	if (fd < 0)
+		return;
+	if (pread(fd, &b, 1, off) == 1)
+	{
+		b ^= 0xFF;
+		if (pwrite(fd, &b, 1, off) != 1)
+			perror("pwrite");
+	}
+	close(fd);
+}
+
+/*
+ * Per-record CRC: a bit-flip inside a record (not the tail) is detected and fails
+ * replay rather than loading a wrong layer; the same flip in the last record is a
+ * torn tail and is recovered.
+ */
+static void
+test_manifest_crc(void)
+{
+	char		dir[] = "/tmp/pscrcintXXXXXX";
+	char		dir2[] = "/tmp/pscrctailXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1,
+				d2;
+	struct stat st;
+
+	/* --- interior corruption must fail replay --- */
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "crc test setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d1 = synth_layer(1, dir);
+	d2 = synth_layer(2, dir);
+	check(ps_manifest_add_layer(&d1) == 0 && ps_manifest_add_layer(&d2) == 0,
+		  "two records written");
+	ps_manifest_close();
+	corrupt_byte(mpath, 24);		/* inside record 1's payload (header is 20 bytes) */
+	check(ps_manifest_open(dir) == 0, "reopen (interior corruption)");
+	check(ps_manifest_replay(&ps_layer_map) != 0,
+		  "interior CRC corruption fails replay (not loaded as a wrong layer)");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+
+	/* --- corruption of the last record is a recoverable torn tail --- */
+	if (!mkdtemp(dir2) || ps_manifest_open(dir2) != 0)
+	{
+		check(0, "crc tail setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir2);
+	d1 = synth_layer(1, dir);
+	d2 = synth_layer(2, dir);
+	check(ps_manifest_add_layer(&d1) == 0 && ps_manifest_add_layer(&d2) == 0,
+		  "two records written (tail case)");
+	ps_manifest_close();
+	if (stat(mpath, &st) == 0)
+		corrupt_byte(mpath, st.st_size - 1);	/* last byte = record 2's payload */
+	check(ps_manifest_open(dir2) == 0, "reopen (tail corruption)");
+	check(ps_manifest_replay(&ps_layer_map) == 0,
+		  "tail CRC corruption is recovered (torn-tail truncate)");
+	check(ps_layer_map_count(&ps_layer_map) == 1,
+		  "record 1 survives, the corrupt last record is dropped");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir2);
+}
+
 int
 main(void)
 {
@@ -353,6 +430,7 @@ main(void)
 
 	test_torn_tail_poison();
 	test_manifest_compaction();
+	test_manifest_crc();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;

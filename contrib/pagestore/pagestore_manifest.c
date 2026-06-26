@@ -11,6 +11,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -19,7 +20,8 @@
 #include "pagestore_manifest.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
-#define PS_MANIFEST_VERSION 2	/* 2: layer descriptors embed PsKey with the klass field */
+#define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
+#define PS_MANIFEST_FNV_INIT	2166136261u
 
 typedef enum PsManifestEventType
 {
@@ -36,6 +38,7 @@ typedef struct PsManifestRecord
 	uint32_t	version;
 	uint32_t	type;
 	uint32_t	len;
+	uint32_t	crc;			/* FNV-1a over the header bytes above + the payload */
 } PsManifestRecord;
 
 typedef struct PsManifestLayerIdEvent
@@ -124,6 +127,33 @@ manifest_fsync_dir(void)
 	return rc;
 }
 
+/* FNV-1a (streaming): not cryptographic, just integrity.  Matches img_crc(). */
+static uint32_t
+manifest_fnv1a(uint32_t h, const void *p, size_t n)
+{
+	const unsigned char *b = p;
+
+	for (size_t i = 0; i < n; i++)
+	{
+		h ^= b[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* CRC over the header fields preceding rec.crc, then the payload. */
+static uint32_t
+manifest_record_crc(const PsManifestRecord *rec, const void *payload, uint32_t len)
+{
+	uint32_t	crc;
+
+	crc = manifest_fnv1a(PS_MANIFEST_FNV_INIT, rec,
+						 offsetof(PsManifestRecord, crc));
+	if (len > 0)
+		crc = manifest_fnv1a(crc, payload, len);
+	return crc;
+}
+
 /* Write one [header | payload] record to an open fd (no fsync). */
 static int
 manifest_write_record(int fd, uint32_t type, const void *payload, uint32_t len)
@@ -134,6 +164,7 @@ manifest_write_record(int fd, uint32_t type, const void *payload, uint32_t len)
 	rec.version = PS_MANIFEST_VERSION;
 	rec.type = type;
 	rec.len = len;
+	rec.crc = manifest_record_crc(&rec, payload, len);
 
 	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
 		(len > 0 && write(fd, payload, len) != (ssize_t) len))
@@ -364,8 +395,15 @@ ps_manifest_replay(PsLayerMap *map)
 	for (;;)
 	{
 		PsManifestRecord rec;
+		union					/* aligned buffer sized for the largest payload */
+		{
+			unsigned char bytes[sizeof(PsManifestLayerDisk)];
+			PsManifestLayerDisk layer;
+			PsManifestLayerIdEvent ev;
+		}			payload;
 		ssize_t		n;
 		off_t		rec_off = good_off;
+		int			at_eof;
 
 		n = read(fd, &rec, sizeof(rec));
 		if (n == 0)
@@ -376,40 +414,60 @@ ps_manifest_replay(PsLayerMap *map)
 			good_off = rec_off;
 			break;				/* torn tail */
 		}
+		/*
+		 * A malformed header (wrong magic/version, oversize len), a short payload,
+		 * or a bad CRC is a recoverable torn tail when it is the last thing in the
+		 * file; the same fault earlier in the file is interior corruption that must
+		 * fail replay rather than silently load a wrong layer.
+		 */
+		at_eof = (rec_off + (off_t) sizeof(rec) >= file_size);
 		if (rec.magic != PS_MANIFEST_MAGIC ||
-			rec.version != PS_MANIFEST_VERSION)
+			rec.version != PS_MANIFEST_VERSION ||
+			rec.len > sizeof(payload.bytes))
 		{
-			if (rec_off + (off_t) sizeof(rec) >= file_size)
+			if (at_eof)
 			{
 				truncate_tail = 1;
 				good_off = rec_off;
-				break;			/* invalid torn tail header */
+				break;
 			}
 			close(fd);
 			return -1;
+		}
+
+		if (rec.len > 0 &&
+			read(fd, payload.bytes, rec.len) != (ssize_t) rec.len)
+		{
+			truncate_tail = 1;
+			good_off = rec_off;
+			break;				/* torn payload */
+		}
+
+		if (manifest_record_crc(&rec, payload.bytes, rec.len) != rec.crc)
+		{
+			at_eof = (rec_off + (off_t) sizeof(rec) + (off_t) rec.len >= file_size);
+			if (at_eof)
+			{
+				truncate_tail = 1;
+				good_off = rec_off;
+				break;			/* torn tail (partial write) */
+			}
+			close(fd);
+			return -1;			/* interior corruption */
 		}
 
 		switch ((PsManifestEventType) rec.type)
 		{
 			case PS_MANIFEST_ADD_LAYER:
 				{
-					PsManifestLayerDisk disk;
 					PsLayerDesc desc;
-					ssize_t		nread;
 
-					if (rec.len != sizeof(disk))
+					if (rec.len != sizeof(payload.layer))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &disk, sizeof(disk));
-					if (nread != (ssize_t) sizeof(disk))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					if (manifest_decode_layer(&desc, &disk) != 0 ||
+					if (manifest_decode_layer(&desc, &payload.layer) != 0 ||
 						(!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
 					{
@@ -421,50 +479,32 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_SET_REMOTE_DURABLE:
 				{
-					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
-					ssize_t		nread;
 
-					if (rec.len != sizeof(ev))
+					if (rec.len != sizeof(payload.ev))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
+					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
 					{
 						layer->remote_durable = true;
-						layer->remote_uploaded_lsn = ev.value;
+						layer->remote_uploaded_lsn = payload.ev.value;
 					}
 					break;
 				}
 
 			case PS_MANIFEST_MARK_DELETE:
 				{
-					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
-					ssize_t		nread;
 
-					if (rec.len != sizeof(ev))
+					if (rec.len != sizeof(payload.ev))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
+					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
 						layer->deleting = true;
 					break;
@@ -472,44 +512,25 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_REMOVE_LAYER:
 				{
-					PsManifestLayerIdEvent ev;
-					ssize_t		nread;
-
-					if (rec.len != sizeof(ev))
+					if (rec.len != sizeof(payload.ev))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					manifest_remove_from_map(map, ev.layer_id);
+					manifest_remove_from_map(map, payload.ev.layer_id);
 					break;
 				}
 
 			case PS_MANIFEST_DROP_LOCAL:
 				{
-					PsManifestLayerIdEvent ev;
 					PsLayerDesc *layer;
-					ssize_t		nread;
 
-					if (rec.len != sizeof(ev))
+					if (rec.len != sizeof(payload.ev))
 					{
 						close(fd);
 						return -1;
 					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
+					layer = manifest_find_layer(map, payload.ev.layer_id);
 					if (layer != NULL)
 					{
 						for (uint32_t i = 0; i < layer->location_count; i++)
@@ -535,7 +556,6 @@ ps_manifest_replay(PsLayerMap *map)
 		manifest_nrecords++;
 	}
 
-done:
 	if (truncate_tail &&
 		(ftruncate(fd, good_off) != 0 || fsync(fd) != 0))
 	{
