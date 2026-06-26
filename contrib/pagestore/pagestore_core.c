@@ -297,11 +297,15 @@ gc_resume(void)
 		 * Drop the manifest entry only after the file is gone (a missing file
 		 * is ENOENT == success in delete_local_layer, so this is idempotent and
 		 * a partially-deleted layer still completes).  A real unlink error keeps
-		 * the layer "deleting" so the next start retries it.
+		 * the layer "deleting" so the next start retries it.  A REMOVE_LAYER
+		 * write error may have torn the manifest tail; stop so that record stays
+		 * the recoverable tail instead of becoming interior corruption, and the
+		 * next start retries from the last valid manifest state.
 		 */
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
-		ps_manifest_remove_layer(dead[k].layer_id);
+		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
+			break;
 	}
 	free(dead);
 }
@@ -406,15 +410,23 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		/*
 		 * Fail safe at every step.  Only delete the file once the layer is
 		 * durably marked deleting, and only drop it from the manifest once the
-		 * file is gone -- so a failed manifest/unlink leaves a readable layer
-		 * (its data is also in the new layer) that gc_resume() retries on the
-		 * next start, never a manifest entry pointing at a deleted file.
+		 * file is gone -- so a failed step leaves a readable layer (its data is
+		 * also in the new layer) that gc_resume() retries on the next start,
+		 * never a manifest entry pointing at a deleted file.
+		 *
+		 * A manifest write error may have left a torn record at the tail; STOP
+		 * before unlinking or appending anything more, so that torn record stays
+		 * the recoverable tail rather than becoming interior corruption that
+		 * fails replay (and so we never unlink a file whose later delete mark is
+		 * not durable).  A failed unlink is not a manifest error: the layer is
+		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
-			continue;
+			break;
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
-		ps_manifest_remove_layer(old[k].layer_id);
+		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
+			break;
 	}
 	rc = 0;
 
