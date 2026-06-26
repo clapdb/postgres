@@ -88,6 +88,17 @@ static char manifest_path[4096];
 static char manifest_dir[2048];
 PsLayerMap ps_layer_map;
 
+/*
+ * Sticky once a record append fails: a short write or failed fsync may have left
+ * a torn record at the tail, which replay can only recover if it stays the *last*
+ * record.  So after any append error we refuse every further append for the life
+ * of this process -- no later flush/compaction/GC record can land after the torn
+ * tail and turn it into unrecoverable interior corruption.  Reset on (re)open,
+ * where replay truncates the torn tail.  Layer data itself is not lost: the
+ * segment log stays authoritative and recover() rebuilds from it.
+ */
+static int	manifest_poisoned = 0;
+
 static int
 manifest_fsync_dir(void)
 {
@@ -110,9 +121,13 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	int			rc = 0;
 	int			created = 0;
 
+	/* once the tail may be torn, never append again (see manifest_poisoned) */
+	if (manifest_poisoned)
+		return -1;
+
 	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
-		return -1;
+		return -1;				/* nothing written; tail not torn */
 	if (lseek(fd, 0, SEEK_END) == 0)
 		created = 1;
 
@@ -129,6 +144,8 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	if (created && manifest_fsync_dir() != 0)
 		rc = -1;
 	close(fd);
+	if (rc != 0)
+		manifest_poisoned = 1;	/* a partial write/fsync may have torn the tail */
 	return rc;
 }
 
@@ -270,6 +287,7 @@ ps_manifest_open(const char *store_dir)
 	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(manifest_path))
 		return -1;
+	manifest_poisoned = 0;		/* replay truncates any torn tail; start clean */
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }

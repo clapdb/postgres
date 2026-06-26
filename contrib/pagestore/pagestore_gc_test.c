@@ -15,9 +15,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -95,6 +97,89 @@ write_layer(uint64_t id, unsigned char fill)
 		exit(2);
 	}
 	return d;
+}
+
+/* A layer descriptor that needs no on-disk file (only a manifest record). */
+static PsLayerDesc
+synth_layer(uint64_t id, const char *dir)
+{
+	PsLayerDesc d;
+
+	memset(&d, 0, sizeof(d));
+	d.layer_id = id;
+	d.kind = PS_LAYER_IMAGE;
+	d.location_count = 1;
+	d.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+	d.locations[0].available = true;
+	snprintf(d.locations[0].uri, sizeof(d.locations[0].uri), "%s/l%llu",
+			 dir, (unsigned long long) id);
+	return d;
+}
+
+/*
+ * Torn-tail poisoning: force a manifest append to fail mid-write (RLIMIT_FSIZE),
+ * then verify every later append is refused (so nothing lands after the torn
+ * tail) and that a restart's replay truncates the torn record, keeping the
+ * pre-failure layer.
+ */
+static void
+test_torn_tail_poison(void)
+{
+	char		dir[] = "/tmp/pspoisontestXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1,
+				d2;
+	struct rlimit save,
+				lim;
+	struct stat st;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "poison test setup");
+		return;
+	}
+	d1 = synth_layer(1, dir);
+	d2 = synth_layer(2, dir);
+	check(ps_manifest_add_layer(&d1) == 0, "add layer 1 before the torn write");
+
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	if (stat(mpath, &st) != 0)
+	{
+		check(0, "stat manifest");
+		return;
+	}
+
+	/* cap the file just past its current size so the next record's write tears */
+	signal(SIGXFSZ, SIG_IGN);	/* exceed -> EFBIG/short write, not a signal */
+	getrlimit(RLIMIT_FSIZE, &save);
+	lim = save;
+	lim.rlim_cur = (rlim_t) (st.st_size + 8);
+	setrlimit(RLIMIT_FSIZE, &lim);
+
+	check(ps_manifest_add_layer(&d2) != 0, "torn manifest write fails");
+
+	/*
+	 * Lift the size cap *before* the next append: writes would now succeed, so
+	 * the only thing that can refuse this is the poison flag.  Without poisoning
+	 * this append would land a MARK_DELETE record *after* the torn tail, turning
+	 * it into interior corruption that fails the replay below.
+	 */
+	setrlimit(RLIMIT_FSIZE, &save);
+	check(ps_manifest_mark_delete(1) != 0,
+		  "manifest is poisoned: later appends refused even though writes would succeed");
+
+	ps_manifest_close();
+
+	/* restart: replay truncates the torn tail; only the pre-failure layer remains */
+	check(ps_manifest_open(dir) == 0, "reopen after poison");
+	check(ps_manifest_replay(&ps_layer_map) == 0, "replay recovers the torn tail");
+	check(ps_layer_map_count(&ps_layer_map) == 1, "only the pre-failure layer survives");
+	check(find_layer(1) != NULL && find_layer(2) == NULL,
+		  "layer 1 durable, the torn layer-2 record is gone");
+	ps_manifest_close();
+
+	unlink(mpath);
+	rmdir(dir);
 }
 
 int
@@ -175,6 +260,8 @@ main(void)
 		unlink(mpath);
 	}
 	rmdir(dir);
+
+	test_torn_tail_poison();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
