@@ -1586,6 +1586,7 @@ ps_core_maintenance(void)
 	uint32_t	ftl = 0,
 				fsh = 0;
 	int			found = 0;
+	int			did = 0;
 
 	if (!use_layers)
 		return 0;
@@ -1617,21 +1618,40 @@ ps_core_maintenance(void)
 			}
 	ps_unlock_map();
 
-	if (!found)
-		return 0;
-
 	/*
 	 * Phase 2: compact the chosen shard under shard-wr + map-wr (the order other
 	 * paths use), which excludes that shard's worker and other map mutators.
 	 * Re-check under the write lock since the count may have changed.
 	 */
-	ps_lock_shard_wr(fsh);
-	ps_lock_map_wr();
-	if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
-		compact_timeline(ftl, fsh);
+	if (found)
+	{
+		ps_lock_shard_wr(fsh);
+		ps_lock_map_wr();
+		if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
+			compact_timeline(ftl, fsh);
+		ps_unlock_map();
+		ps_unlock_shard(fsh);
+		did = 1;
+	}
+
+	/*
+	 * Phase 3: rewrite the manifest log if add/seal/delete churn has grown it
+	 * well past the live layer count, bounding replay time.  Independent of layer
+	 * compaction; map-wr excludes the manifest appends a concurrent flush makes.
+	 */
+	ps_lock_map_rd();
+	found = ps_manifest_should_compact();
 	ps_unlock_map();
-	ps_unlock_shard(fsh);
-	return 1;
+	if (found)
+	{
+		ps_lock_map_wr();
+		if (ps_manifest_should_compact())
+			ps_manifest_compact();
+		ps_unlock_map();
+		did = 1;
+	}
+
+	return did;
 }
 
 /*

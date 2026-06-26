@@ -24,4 +24,8 @@ extern int	ps_manifest_set_remote_durable(uint64_t layer_id,
 extern int	ps_manifest_mark_delete(uint64_t layer_id);
 extern int	ps_manifest_remove_layer(uint64_t layer_id);
 
+/* Bound replay time by rewriting the append-only log to one record per live layer. */
+extern int	ps_manifest_should_compact(void);
+extern int	ps_manifest_compact(void);
+
 #endif							/* PAGESTORE_MANIFEST_H */

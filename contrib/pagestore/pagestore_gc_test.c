@@ -15,6 +15,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +183,95 @@ test_torn_tail_poison(void)
 	rmdir(dir);
 }
 
+/*
+ * Manifest compaction: add/delete churn grows the append-only log past the live
+ * set; ps_manifest_compact() rewrites it to one record per live layer, preserving
+ * every layer's state (including the deleting flag), and a stale .tmp left by a
+ * crashed compaction is never treated as authority.
+ */
+static void
+test_manifest_compaction(void)
+{
+	char		dir[] = "/tmp/psmcomptestXXXXXX";
+	char		mpath[4096],
+				tmppath[4096];
+	struct stat before,
+				after;
+	PsLayerDesc *l39,
+			   *l40;
+	int			fd;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "manifest-compaction setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	snprintf(tmppath, sizeof(tmppath), "%s/layers.manifest.tmp", dir);
+
+	/* churn: add 40 layers, delete 1..38 (mark+remove), mark 39 deleting */
+	for (uint64_t i = 1; i <= 40; i++)
+	{
+		PsLayerDesc d = synth_layer(i, dir);
+
+		if (ps_manifest_add_layer(&d) != 0)
+		{
+			check(0, "add during churn");
+			return;
+		}
+	}
+	for (uint64_t i = 1; i <= 38; i++)
+		if (ps_manifest_mark_delete(i) != 0 || ps_manifest_remove_layer(i) != 0)
+		{
+			check(0, "delete during churn");
+			return;
+		}
+	check(ps_manifest_mark_delete(39) == 0, "mark layer 39 deleting");
+	check(ps_layer_map_count(&ps_layer_map) == 2, "2 layers live after churn (39,40)");
+	check(ps_manifest_should_compact(),
+		  "log is due for compaction after add/delete churn");
+	if (stat(mpath, &before) != 0)
+	{
+		check(0, "stat before");
+		return;
+	}
+
+	check(ps_manifest_compact() == 0, "compact succeeds");
+	check(!ps_manifest_should_compact(), "no longer due right after compaction");
+	check(stat(mpath, &after) == 0 && after.st_size < before.st_size,
+		  "compacted log is smaller than the churned log");
+	check(stat(tmppath, &after) != 0, "no .tmp file left behind");
+
+	/* restart: the compacted log replays to the same live set, flags intact */
+	ps_manifest_close();
+	check(ps_manifest_open(dir) == 0, "reopen after compaction");
+	check(ps_manifest_replay(&ps_layer_map) == 0, "replay the compacted log");
+	check(ps_layer_map_count(&ps_layer_map) == 2, "live set preserved across compaction");
+	l39 = find_layer(39);
+	l40 = find_layer(40);
+	check(l39 != NULL && l39->deleting, "deleting flag preserved through compaction");
+	check(l40 != NULL && !l40->deleting, "live layer preserved through compaction");
+
+	/* crash-safety: a stale .tmp (crash before rename) is not authority */
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0)
+	{
+		ssize_t		w = write(fd, "garbage", 7);
+
+		(void) w;
+		close(fd);
+	}
+	ps_manifest_close();
+	check(ps_manifest_open(dir) == 0, "reopen with a stale .tmp present");
+	check(ps_manifest_replay(&ps_layer_map) == 0, "replay ignores the stale .tmp");
+	check(ps_layer_map_count(&ps_layer_map) == 2, "live set intact despite stale .tmp");
+	ps_manifest_close();
+
+	unlink(mpath);
+	unlink(tmppath);
+	rmdir(dir);
+}
+
 int
 main(void)
 {
@@ -262,6 +352,7 @@ main(void)
 	rmdir(dir);
 
 	test_torn_tail_poison();
+	test_manifest_compaction();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
