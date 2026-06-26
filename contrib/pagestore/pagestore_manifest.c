@@ -676,7 +676,16 @@ ps_manifest_compact(void)
 		return -1;
 	}
 	if (manifest_fsync_dir() != 0)
-		return -1;				/* rename done; the new log is authoritative */
+	{
+		/*
+		 * The rename is in place but its durability is unconfirmed (the directory
+		 * fsync failed -- the disk is misbehaving).  Poison so no further append
+		 * lands until a restart re-establishes a known-durable manifest, matching
+		 * the fail-stop policy for any other manifest write/fsync error.
+		 */
+		manifest_poisoned = 1;
+		return -1;
+	}
 	manifest_nrecords = nrec;
 	return 0;
 }

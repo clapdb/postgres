@@ -1644,11 +1644,23 @@ ps_core_maintenance(void)
 	ps_unlock_map();
 	if (found)
 	{
+		int			compacted = 0;
+
 		ps_lock_map_wr();
 		if (ps_manifest_should_compact())
-			ps_manifest_compact();
+			compacted = (ps_manifest_compact() == 0);
 		ps_unlock_map();
-		did = 1;
+
+		/*
+		 * Only count a *successful* rewrite as work done.  A failed compaction
+		 * leaves should_compact() true, so reporting "did work" would make the
+		 * idle worker re-run maintenance immediately and busy-loop on the failing
+		 * compaction; returning false here lets it sleep and retry on the next
+		 * tick instead.  (An I/O failure also poisons the manifest, after which
+		 * should_compact() returns false and the retries stop entirely.)
+		 */
+		if (compacted)
+			did = 1;
 	}
 
 	return did;
