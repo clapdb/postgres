@@ -68,9 +68,10 @@ The seed is a **base snapshot + forward replay** (the same base-image-plus-redo
 pattern relation pages use), not replay into empty segments. At branch creation (or
 first start of the branch compute):
 
-- **Base snapshot.** Start from a **consistent SLRU segment snapshot at a checkpoint
-  `C <= L`** -- the parent's actual `pg_xact` / `pg_multixact` / commit-ts segment
-  contents as of `C`. WAL alone is not enough: an xid committed *before* `C` but
+- **Base snapshot.** Start from a **consistent SLRU segment snapshot with a proven
+  cutoff `C <= L`** -- the parent's actual `pg_xact` / `pg_multixact` / commit-ts
+  segment contents as of `C` (see "`C` is not the checkpoint redo LSN" below for how
+  `C` is established). WAL alone is not enough: an xid committed *before* `C` but
   still within the retained clog/multixact range has **no** record in `(C, L]`
   (`CheckPointCLOG()` / `SimpleLruWriteAll()` only flush pages, `CLOG_TRUNCATE` only
   removes them), so replaying into empty segments would leave its status unset and
@@ -111,7 +112,7 @@ first start of the branch compute):
 
 Why this dissolves the round-1/2/3 findings:
 
-- The base is a consistent checkpoint image and everything after it is per-update
+- The base is a consistent as-of-`C` image and everything after it is per-update
   WAL, so there is no flushed-page coalescing and no single-image-answers-as-of-`L`
   problem.
 - The result's "version" is intrinsic -- base at `C` plus exactly the WAL through
@@ -126,7 +127,8 @@ Why this dissolves the round-1/2/3 findings:
   before `L` but ends after it is not part of the as-of-`L` state (same rule
   `redo_page_asof` already applies for relation pages).
 - multixact needs both `offsets` and `members` replayed together to a consistent
-  point; commit-ts only if `track_commit_timestamp` was on in the parent.
+  point; commit-ts is reconstructed for whatever intervals `track_commit_timestamp`
+  was on, per the `XLOG_PARAMETER_CHANGE` records the applier replays.
 - Fail closed: if either the base snapshot at `C` or the parent WAL across `(C, L]`
   is unavailable on the store, branch creation fails rather than seeding partial or
   zeroed status -- a half-known clog must never boot.
