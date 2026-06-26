@@ -21,7 +21,6 @@
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
-#define PS_MANIFEST_VERSION_V2 2	/* legacy: no per-record CRC (16-byte header) */
 #define PS_MANIFEST_FNV_INIT	2166136261u
 
 typedef enum PsManifestEventType
@@ -387,6 +386,45 @@ ps_manifest_poisoned(void)
 	return __atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE);
 }
 
+/*
+ * Does a fully-intact record begin at byte offset 'off'?  "Fully intact" means the
+ * header fits, magic and version are exact, the type is known, the len field equals
+ * that type's fixed payload size, the payload fits, and the CRC matches -- so no
+ * byte of the record (header or payload) is corrupted.  Nothing is trusted before
+ * the CRC confirms it, so a flipped version/type/len/magic cannot be reinterpreted
+ * into a "valid" record of a different shape.  On success copies the header into
+ * *rec and the payload into payload_buf, sets *rec_size to the on-disk record size,
+ * and returns 1; otherwise 0.  Uses pread so callers can probe an arbitrary offset
+ * without disturbing the file position.
+ */
+static int
+manifest_record_valid_at(int fd, off_t off, off_t file_size,
+						 PsManifestRecord *rec, void *payload_buf,
+						 size_t payload_cap, off_t *rec_size)
+{
+	int			plen;
+
+	if (off < 0 || off + (off_t) sizeof(*rec) > file_size)
+		return 0;				/* no room for even a header */
+	if (pread(fd, rec, sizeof(*rec), off) != (ssize_t) sizeof(*rec))
+		return 0;
+	if (rec->magic != PS_MANIFEST_MAGIC || rec->version != PS_MANIFEST_VERSION)
+		return 0;
+	plen = manifest_type_payload_len(rec->type);
+	if (plen < 0 || (size_t) plen > payload_cap || rec->len != (uint32_t) plen)
+		return 0;
+	if (off + (off_t) sizeof(*rec) + plen > file_size)
+		return 0;				/* body does not fit */
+	if (plen > 0 &&
+		pread(fd, payload_buf, (size_t) plen, off + (off_t) sizeof(*rec)) !=
+		(ssize_t) plen)
+		return 0;
+	if (manifest_record_crc(rec, payload_buf, (uint32_t) plen) != rec->crc)
+		return 0;
+	*rec_size = (off_t) sizeof(*rec) + plen;
+	return 1;
+}
+
 int
 ps_manifest_replay(PsLayerMap *map)
 {
@@ -395,6 +433,14 @@ ps_manifest_replay(PsLayerMap *map)
 	int			truncate_tail = 0;
 	off_t		file_size;
 	struct stat st;
+
+	/*
+	 * The most bytes one record can occupy on disk (header + the largest payload).
+	 * A record after a corrupt one is contiguous, so it cannot begin farther than
+	 * this past the corrupt record -- which bounds the torn-tail probe below.
+	 */
+	const off_t max_record = (off_t) sizeof(PsManifestRecord) +
+		(off_t) sizeof(PsManifestLayerDisk);
 
 	manifest_nrecords = 0;
 	fd = open(manifest_path, O_RDWR);
@@ -411,7 +457,7 @@ ps_manifest_replay(PsLayerMap *map)
 	}
 	file_size = st.st_size;
 
-	for (;;)
+	while (good_off < file_size)
 	{
 		PsManifestRecord rec;
 		union					/* aligned buffer sized for the largest payload */
@@ -420,116 +466,53 @@ ps_manifest_replay(PsLayerMap *map)
 			PsManifestLayerDisk layer;
 			PsManifestLayerIdEvent ev;
 		}			payload;
-		ssize_t		n;
 		off_t		rec_off = good_off;
-		int			has_crc,
-					plen;
-		off_t		hdr_size,
-					rec_total;
+		off_t		rec_size;
+		off_t		scan;
+		int			interior;
 
-		/*
-		 * Read the 16-byte common prefix (magic, version, type, len) shared by
-		 * every format version.  A short read or wrong magic at end-of-file is a
-		 * recoverable torn tail; the same fault earlier in the file is corruption.
-		 */
-		n = read(fd, &rec, offsetof(PsManifestRecord, crc));
-		if (n == 0)
-			break;				/* clean end of log */
-		if (n != (ssize_t) offsetof(PsManifestRecord, crc) ||
-			rec.magic != PS_MANIFEST_MAGIC)
+		if (!manifest_record_valid_at(fd, rec_off, file_size, &rec, payload.bytes,
+									  sizeof(payload.bytes), &rec_size))
 		{
-			if (rec_off + (off_t) offsetof(PsManifestRecord, crc) >= file_size)
+			/*
+			 * No intact record begins at rec_off: it is corrupt or torn.  Treat it
+			 * as a recoverable torn tail only if no intact record begins after it
+			 * -- then the damage is confined to the final record and the earlier
+			 * entries survive.  If an intact record does follow, this is interior
+			 * corruption and we must fail rather than truncate valid history (or
+			 * resurrect a dropped layer).  A following record is contiguous, so it
+			 * begins within one max_record of rec_off; that bounds the probe and
+			 * keeps a corrupted type/len/magic from being trusted to size anything.
+			 */
+			interior = 0;
+			for (scan = rec_off + 1;
+				 scan <= rec_off + max_record && scan < file_size; scan++)
 			{
-				truncate_tail = 1;
-				good_off = rec_off;
-				break;
-			}
-			close(fd);
-			return -1;
-		}
+				PsManifestRecord prec;
+				union
+				{
+					unsigned char bytes[sizeof(PsManifestLayerDisk)];
+					PsManifestLayerDisk layer;
+					PsManifestLayerIdEvent ev;
+				}			pbuf;
+				off_t		psize;
 
-		/* accept v3 (per-record CRC) and the legacy v2 (no CRC); reject others */
-		if (rec.version == PS_MANIFEST_VERSION)
-		{
-			has_crc = 1;
-			hdr_size = (off_t) sizeof(PsManifestRecord);
-		}
-		else if (rec.version == PS_MANIFEST_VERSION_V2)
-		{
-			has_crc = 0;
-			hdr_size = (off_t) offsetof(PsManifestRecord, crc);
-		}
-		else
-		{
-			if (rec_off + (off_t) offsetof(PsManifestRecord, crc) >= file_size)
+				if (manifest_record_valid_at(fd, scan, file_size, &prec,
+											 pbuf.bytes, sizeof(pbuf.bytes),
+											 &psize))
+				{
+					interior = 1;
+					break;
+				}
+			}
+			if (interior)
 			{
-				truncate_tail = 1;
-				good_off = rec_off;
-				break;
+				close(fd);
+				return -1;
 			}
-			close(fd);
-			return -1;
-		}
-		if (has_crc &&
-			read(fd, &rec.crc, sizeof(rec.crc)) != (ssize_t) sizeof(rec.crc))
-		{
-			truncate_tail = 1;
-			good_off = rec_off;
-			break;				/* torn CRC */
-		}
-
-		/*
-		 * Size the record from its TYPE, never the (untrusted) len field, so a
-		 * corrupted len cannot misalign the read.  An unknown type with data after
-		 * it is interior corruption; at EOF it is a torn tail.
-		 */
-		plen = manifest_type_payload_len(rec.type);
-		if (plen < 0 || (size_t) plen > sizeof(payload.bytes))
-		{
-			if (rec_off + hdr_size >= file_size)
-			{
-				truncate_tail = 1;
-				good_off = rec_off;
-				break;
-			}
-			close(fd);
-			return -1;
-		}
-		rec_total = hdr_size + plen;
-
-		/* a record that does not fully fit in the file is a truncated torn tail */
-		if (rec_off + rec_total > file_size)
-		{
 			truncate_tail = 1;
 			good_off = rec_off;
 			break;
-		}
-		if (plen > 0 &&
-			read(fd, payload.bytes, (size_t) plen) != (ssize_t) plen)
-		{
-			truncate_tail = 1;
-			good_off = rec_off;
-			break;				/* (unreachable given the fit check above) */
-		}
-
-		/*
-		 * Integrity: v3 verifies the CRC; both versions require the len field to
-		 * equal the type's fixed size (this catches a flipped len on v2 and is
-		 * defence-in-depth on v3).  A full-sized record that fails is interior
-		 * corruption unless it is physically the last record (then a torn tail).
-		 */
-		if (rec.len != (uint32_t) plen ||
-			(has_crc &&
-			 manifest_record_crc(&rec, payload.bytes, (uint32_t) plen) != rec.crc))
-		{
-			if (rec_off + rec_total >= file_size)
-			{
-				truncate_tail = 1;
-				good_off = rec_off;
-				break;
-			}
-			close(fd);
-			return -1;
 		}
 
 		switch ((PsManifestEventType) rec.type)
@@ -589,7 +572,7 @@ ps_manifest_replay(PsLayerMap *map)
 				close(fd);
 				return -1;
 		}
-		good_off = rec_off + rec_total;	/* we read exactly rec_total above */
+		good_off = rec_off + rec_size;
 		manifest_nrecords++;
 	}
 

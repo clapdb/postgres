@@ -290,6 +290,136 @@ corrupt_byte(const char *path, off_t off)
 	close(fd);
 }
 
+/* Set one byte at 'off' to an exact value (to corrupt a specific header field). */
+static void
+poke_byte(const char *path, off_t off, unsigned char val)
+{
+	int			fd = open(path, O_RDWR);
+
+	if (fd < 0)
+		return;
+	if (pwrite(fd, &val, 1, off) != 1)
+		perror("pwrite");
+	close(fd);
+}
+
+/* manifest record header field offsets (magic, version, type, len, crc) */
+#define MR_MAGIC_OFF	0
+#define MR_VERSION_OFF	4
+#define MR_TYPE_OFF		8
+#define MT_ADD_LAYER	1		/* PsManifestEventType values (private to manifest.c) */
+#define MT_MARK_DELETE	4
+
+/* Build a fresh manifest with ADD(1) then ADD(2); return the first ADD's on-disk
+ * size (so a caller can locate the second record), or -1 on failure. */
+static off_t
+build_two_adds(char *dir, char *mpath, size_t mpath_cap)
+{
+	PsLayerDesc d1,
+				d2;
+	struct stat st;
+	off_t		add1;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+		return -1;
+	snprintf(mpath, mpath_cap, "%s/layers.manifest", dir);
+	d1 = synth_layer(1, dir);
+	if (ps_manifest_add_layer(&d1) != 0 || stat(mpath, &st) != 0)
+	{
+		ps_manifest_close();
+		return -1;
+	}
+	add1 = st.st_size;
+	d2 = synth_layer(2, dir);
+	if (ps_manifest_add_layer(&d2) != 0)
+	{
+		ps_manifest_close();
+		return -1;
+	}
+	ps_manifest_close();
+	return add1;
+}
+
+/*
+ * Replay must not trust a corrupted header word (version/type/magic) to size a
+ * record: corruption confined to the physically last record is a recoverable torn
+ * tail, but corruption that leaves a valid record after it is interior corruption
+ * and must fail -- never silently truncating later records or bypassing the CRC.
+ */
+static void
+test_manifest_replay_robustness(void)
+{
+	char		dir[] = "/tmp/psrobXXXXXX";
+	char		mpath[4096];
+	off_t		add1;
+
+	/* (a) last record's TYPE corrupted -> torn tail, the earlier ADD survives */
+	add1 = build_two_adds(dir, mpath, sizeof(mpath));
+	check(add1 > 0, "robust: build (last-type)");
+	poke_byte(mpath, add1 + MR_TYPE_OFF, MT_MARK_DELETE);	/* ADD2.type -> a smaller type */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "last-record type corruption recovers as a torn tail");
+	check(ps_layer_map_count(&ps_layer_map) == 1 && find_layer(1) && !find_layer(2),
+		  "  ... the corrupt last record is dropped, the earlier ADD survives");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+
+	/* (b) last record's VERSION flipped 3->2 must NOT bypass the CRC */
+	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
+	add1 = build_two_adds(dir, mpath, sizeof(mpath));
+	check(add1 > 0, "robust: build (version-downgrade)");
+	poke_byte(mpath, add1 + MR_VERSION_OFF, 2);	/* ADD2.version 3 -> 2 */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "version-downgraded last record recovers as a torn tail");
+	check(ps_layer_map_count(&ps_layer_map) == 1 && !find_layer(2),
+		  "  ... the downgraded record is not installed (CRC not bypassed)");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+
+	/* (c) last record's MAGIC corrupted -> torn tail, earlier ADD survives */
+	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
+	add1 = build_two_adds(dir, mpath, sizeof(mpath));
+	check(add1 > 0, "robust: build (magic)");
+	poke_byte(mpath, add1 + MR_MAGIC_OFF, 0x00);	/* ADD2.magic low byte */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0 &&
+		  ps_layer_map_count(&ps_layer_map) == 1,
+		  "last-record magic corruption recovers as a torn tail");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+
+	/* (d) interior record's TYPE corrupted to ADD must FAIL, not truncate the
+	 * following REMOVE (which would resurrect the removed layer) */
+	memcpy(dir, "/tmp/psrobXXXXXX", sizeof(dir));
+	if (mkdtemp(dir) && ps_manifest_open(dir) == 0)
+	{
+		PsLayerDesc d1 = synth_layer(1, dir);
+		struct stat st;
+
+		snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+		check(ps_manifest_add_layer(&d1) == 0 && stat(mpath, &st) == 0,
+			  "robust: build (interior ADD)");
+		add1 = st.st_size;
+		check(ps_manifest_mark_delete(1) == 0 && ps_manifest_remove_layer(1) == 0,
+			  "robust: MARK_DELETE + REMOVE");
+		ps_manifest_close();
+		poke_byte(mpath, add1 + MR_TYPE_OFF, MT_ADD_LAYER);	/* MARK_DELETE.type -> ADD */
+		check(ps_manifest_open(dir) == 0 &&
+			  ps_manifest_replay(&ps_layer_map) != 0,
+			  "interior type corruption fails replay (REMOVE not truncated away)");
+		ps_manifest_close();
+		unlink(mpath);
+		rmdir(dir);
+	}
+	else
+		check(0, "robust: build (interior ADD)");
+}
+
 /*
  * Per-record CRC: a bit-flip inside a record (not the tail) is detected and fails
  * replay rather than loading a wrong layer; the same flip in the last record is a
@@ -504,6 +634,7 @@ main(void)
 	test_manifest_compaction();
 	test_manifest_crc();
 	test_manifest_len_corruption();
+	test_manifest_replay_robustness();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
