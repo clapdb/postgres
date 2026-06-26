@@ -293,7 +293,14 @@ gc_resume(void)
 			dead[m++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < m; k++)
 	{
-		ps_layer_store->delete_local_layer(&dead[k]);
+		/*
+		 * Drop the manifest entry only after the file is gone (a missing file
+		 * is ENOENT == success in delete_local_layer, so this is idempotent and
+		 * a partially-deleted layer still completes).  A real unlink error keeps
+		 * the layer "deleting" so the next start retries it.
+		 */
+		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
+			continue;
 		ps_manifest_remove_layer(dead[k].layer_id);
 	}
 	free(dead);
@@ -396,8 +403,17 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
-		ps_manifest_mark_delete(old[k].layer_id);
-		ps_layer_store->delete_local_layer(&old[k]);
+		/*
+		 * Fail safe at every step.  Only delete the file once the layer is
+		 * durably marked deleting, and only drop it from the manifest once the
+		 * file is gone -- so a failed manifest/unlink leaves a readable layer
+		 * (its data is also in the new layer) that gc_resume() retries on the
+		 * next start, never a manifest entry pointing at a deleted file.
+		 */
+		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
+			continue;
+		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
+			continue;			/* still "deleting"; gc_resume() will retry */
 		ps_manifest_remove_layer(old[k].layer_id);
 	}
 	rc = 0;
