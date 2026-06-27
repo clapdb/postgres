@@ -389,39 +389,43 @@ ps_manifest_poisoned(void)
 /*
  * Does a fully-intact record begin at byte offset 'off'?  "Fully intact" means the
  * header fits, magic and version are exact, the type is known, the len field equals
- * that type's fixed payload size, the payload fits, and the CRC matches -- so no
- * byte of the record (header or payload) is corrupted.  Nothing is trusted before
- * the CRC confirms it, so a flipped version/type/len/magic cannot be reinterpreted
- * into a "valid" record of a different shape.  On success copies the header into
- * *rec and the payload into payload_buf, sets *rec_size to the on-disk record size,
- * and returns 1; otherwise 0.  Uses pread so callers can probe an arbitrary offset
- * without disturbing the file position.
+ * that type's fixed payload size, the payload fits, and (for v3) the CRC matches --
+ * so no byte of the record is corrupted.  Nothing is trusted before the CRC confirms
+ * it, so a flipped version/type/len/magic cannot be reinterpreted into a "valid"
+ * record of a different shape.  'v2' selects the legacy 16-byte header (no CRC) -- a
+ * whole manifest file is one version or the other (decided from its first record),
+ * so this can never be used to read a corrupted v3 record as an unchecked v2 one.
+ * On success copies the header into *rec and the payload into payload_buf, sets
+ * *rec_size to the on-disk record size, and returns 1; otherwise 0.  Uses pread so
+ * callers can probe an arbitrary offset without disturbing the file position.
  */
 static int
-manifest_record_valid_at(int fd, off_t off, off_t file_size,
+manifest_record_valid_at(int fd, off_t off, off_t file_size, int v2,
 						 PsManifestRecord *rec, void *payload_buf,
 						 size_t payload_cap, off_t *rec_size)
 {
+	off_t		hdr = v2 ? (off_t) offsetof(PsManifestRecord, crc)
+		: (off_t) sizeof(*rec);
+	uint32_t	want_ver = v2 ? 2u : (uint32_t) PS_MANIFEST_VERSION;
 	int			plen;
 
-	if (off < 0 || off + (off_t) sizeof(*rec) > file_size)
+	if (off < 0 || off + hdr > file_size)
 		return 0;				/* no room for even a header */
-	if (pread(fd, rec, sizeof(*rec), off) != (ssize_t) sizeof(*rec))
+	if (pread(fd, rec, (size_t) hdr, off) != (ssize_t) hdr)
 		return 0;
-	if (rec->magic != PS_MANIFEST_MAGIC || rec->version != PS_MANIFEST_VERSION)
+	if (rec->magic != PS_MANIFEST_MAGIC || rec->version != want_ver)
 		return 0;
 	plen = manifest_type_payload_len(rec->type);
 	if (plen < 0 || (size_t) plen > payload_cap || rec->len != (uint32_t) plen)
 		return 0;
-	if (off + (off_t) sizeof(*rec) + plen > file_size)
+	if (off + hdr + plen > file_size)
 		return 0;				/* body does not fit */
 	if (plen > 0 &&
-		pread(fd, payload_buf, (size_t) plen, off + (off_t) sizeof(*rec)) !=
-		(ssize_t) plen)
+		pread(fd, payload_buf, (size_t) plen, off + hdr) != (ssize_t) plen)
 		return 0;
-	if (manifest_record_crc(rec, payload_buf, (uint32_t) plen) != rec->crc)
+	if (!v2 && manifest_record_crc(rec, payload_buf, (uint32_t) plen) != rec->crc)
 		return 0;
-	*rec_size = (off_t) sizeof(*rec) + plen;
+	*rec_size = hdr + plen;
 	return 1;
 }
 
@@ -431,6 +435,7 @@ ps_manifest_replay(PsLayerMap *map)
 	int			fd;
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
+	int			file_v2;
 	off_t		file_size;
 	struct stat st;
 
@@ -457,6 +462,34 @@ ps_manifest_replay(PsLayerMap *map)
 	}
 	file_size = st.st_size;
 
+	/*
+	 * Decide the whole file's format from its first record: a manifest is entirely
+	 * v3 (per-record CRC) or entirely legacy v2 (no CRC), never a mix.  Probing the
+	 * first record as v3 first means a v3 record whose version was bit-flipped to 2
+	 * is not reinterpreted as an unchecked v2 record (it just fails the v3 probe and
+	 * is handled as corruption below) -- only a genuine v2 file, whose first record
+	 * is a valid v2 record, is read without CRC.  A v2 file is migrated to v3 after
+	 * replay so this branch is taken at most once per store.
+	 */
+	{
+		PsManifestRecord r0;
+		unsigned char b0[sizeof(PsManifestLayerDisk)];
+		off_t		s0;
+
+		if (file_size == 0)
+			file_v2 = 0;
+		else if (manifest_record_valid_at(fd, 0, file_size, 0, &r0, b0,
+										  sizeof(b0), &s0))
+			file_v2 = 0;
+		else if (manifest_record_valid_at(fd, 0, file_size, 1, &r0, b0,
+										  sizeof(b0), &s0))
+			file_v2 = 1;
+		else
+			file_v2 = 0;		/* not a valid first record either way; the v3 path
+								 * below truncates a torn/garbage start as an empty
+								 * manifest (nothing was committed) */
+	}
+
 	while (good_off < file_size)
 	{
 		PsManifestRecord rec;
@@ -471,8 +504,9 @@ ps_manifest_replay(PsLayerMap *map)
 		off_t		scan;
 		int			interior;
 
-		if (!manifest_record_valid_at(fd, rec_off, file_size, &rec, payload.bytes,
-									  sizeof(payload.bytes), &rec_size))
+		if (!manifest_record_valid_at(fd, rec_off, file_size, file_v2, &rec,
+									  payload.bytes, sizeof(payload.bytes),
+									  &rec_size))
 		{
 			/*
 			 * No intact record begins at rec_off: it is corrupt or torn.  Treat it
@@ -497,7 +531,7 @@ ps_manifest_replay(PsLayerMap *map)
 				}			pbuf;
 				off_t		psize;
 
-				if (manifest_record_valid_at(fd, scan, file_size, &prec,
+				if (manifest_record_valid_at(fd, scan, file_size, file_v2, &prec,
 											 pbuf.bytes, sizeof(pbuf.bytes),
 											 &psize))
 				{
@@ -583,6 +617,17 @@ ps_manifest_replay(PsLayerMap *map)
 		return -1;
 	}
 	close(fd);
+
+	/*
+	 * Upgrade a legacy v2 manifest in place: the replayed state is now in 'map', so
+	 * rewrite the log as v3 (one ADD per live layer) via temp+rename.  This both
+	 * adds CRC protection going forward and -- crucially -- avoids appending v3
+	 * records onto a v2 file (which would defeat the whole-file version check above)
+	 * and avoids discarding the old metadata.  Done once; later opens see v3.
+	 */
+	if (file_v2 && map == &ps_layer_map && ps_manifest_compact() != 0)
+		return -1;
+
 	return 0;
 }
 

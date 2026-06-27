@@ -421,6 +421,82 @@ test_manifest_replay_robustness(void)
 }
 
 /*
+ * A legacy v2 manifest (16-byte header, no CRC) must still replay -- and be upgraded
+ * to v3 in place -- rather than be rejected and truncated to empty.  We can't write
+ * a v2 record through the public API (it only writes v3), so synthesize one by
+ * byte-editing a v3 ADD: drop the 4-byte CRC and set the version word to 2.
+ */
+static void
+test_manifest_v2_migration(void)
+{
+	char		dir[] = "/tmp/psv2XXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1;
+	struct stat st;
+	unsigned char v3[4096],
+				v2[4096];
+	int			fd;
+	ssize_t		sz;
+	unsigned char ver;
+
+	/* 1. write a normal v3 manifest with one ADD(7) */
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "v2: setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d1 = synth_layer(7, dir);
+	check(ps_manifest_add_layer(&d1) == 0 && stat(mpath, &st) == 0 &&
+		  st.st_size > 20 && st.st_size <= (off_t) sizeof(v3),
+		  "v2: built a v3 ADD record");
+	ps_manifest_close();
+
+	/* 2. read the v3 record and rebuild it as a v2 record on disk:
+	 *    v3 = magic[0..3] version[4..7] type[8..11] len[12..15] crc[16..19] payload
+	 *    v2 = magic version type len payload  (no crc; 16-byte header) */
+	fd = open(mpath, O_RDONLY);
+	sz = (fd >= 0) ? read(fd, v3, sizeof(v3)) : -1;
+	if (fd >= 0)
+		close(fd);
+	check(sz > 20, "v2: read v3 bytes");
+	memcpy(v2, v3, 16);				/* magic, version, type, len */
+	v2[4] = 2;						/* version 3 -> 2 (LE low byte; rest already 0) */
+	memcpy(v2 + 16, v3 + 20, (size_t) (sz - 20));	/* payload, sans the 4-byte crc */
+	fd = open(mpath, O_WRONLY | O_TRUNC, 0600);
+	check(fd >= 0 && write(fd, v2, (size_t) (sz - 4)) == (ssize_t) (sz - 4),
+		  "v2: wrote a synthetic v2 manifest");
+	if (fd >= 0)
+		close(fd);
+
+	/* 3. replay must recover the layer (not reject/empty the manifest) */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "v2 manifest replays instead of being truncated to empty");
+	check(ps_layer_map_count(&ps_layer_map) == 1 && find_layer(7),
+		  "  ... the v2 layer is recovered");
+
+	/* 4. and the on-disk file is upgraded to v3 (version word == 3) */
+	fd = open(mpath, O_RDONLY);
+	ver = 0xFF;
+	if (fd >= 0)
+	{
+		(void) pread(fd, &ver, 1, 4);
+		close(fd);
+	}
+	check(ver == 3, "  ... the manifest is migrated to v3 on disk");
+	ps_manifest_close();
+
+	/* 5. the migrated v3 file re-replays cleanly */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0 && find_layer(7),
+		  "the migrated v3 manifest re-replays");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+}
+
+/*
  * Per-record CRC: a bit-flip inside a record (not the tail) is detected and fails
  * replay rather than loading a wrong layer; the same flip in the last record is a
  * torn tail and is recovered.
@@ -635,6 +711,7 @@ main(void)
 	test_manifest_crc();
 	test_manifest_len_corruption();
 	test_manifest_replay_robustness();
+	test_manifest_v2_migration();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
