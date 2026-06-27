@@ -11,6 +11,7 @@
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -19,7 +20,8 @@
 #include "pagestore_manifest.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
-#define PS_MANIFEST_VERSION 2	/* 2: layer descriptors embed PsKey with the klass field */
+#define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
+#define PS_MANIFEST_FNV_INIT	2166136261u
 
 typedef enum PsManifestEventType
 {
@@ -36,6 +38,7 @@ typedef struct PsManifestRecord
 	uint32_t	version;
 	uint32_t	type;
 	uint32_t	len;
+	uint32_t	crc;			/* FNV-1a over the header bytes above + the payload */
 } PsManifestRecord;
 
 typedef struct PsManifestLayerIdEvent
@@ -124,6 +127,51 @@ manifest_fsync_dir(void)
 	return rc;
 }
 
+/* FNV-1a (streaming): not cryptographic, just integrity.  Matches img_crc(). */
+static uint32_t
+manifest_fnv1a(uint32_t h, const void *p, size_t n)
+{
+	const unsigned char *b = p;
+
+	for (size_t i = 0; i < n; i++)
+	{
+		h ^= b[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* CRC over the header fields preceding rec.crc, then the payload. */
+static uint32_t
+manifest_record_crc(const PsManifestRecord *rec, const void *payload, uint32_t len)
+{
+	uint32_t	crc;
+
+	crc = manifest_fnv1a(PS_MANIFEST_FNV_INIT, rec,
+						 offsetof(PsManifestRecord, crc));
+	if (len > 0)
+		crc = manifest_fnv1a(crc, payload, len);
+	return crc;
+}
+
+/* Fixed on-disk payload length for a record type, or -1 if the type is unknown. */
+static int
+manifest_type_payload_len(uint32_t type)
+{
+	switch ((PsManifestEventType) type)
+	{
+		case PS_MANIFEST_ADD_LAYER:
+			return (int) sizeof(PsManifestLayerDisk);
+		case PS_MANIFEST_SET_REMOTE_DURABLE:
+		case PS_MANIFEST_DROP_LOCAL:
+		case PS_MANIFEST_MARK_DELETE:
+		case PS_MANIFEST_REMOVE_LAYER:
+			return (int) sizeof(PsManifestLayerIdEvent);
+		default:
+			return -1;
+	}
+}
+
 /* Write one [header | payload] record to an open fd (no fsync). */
 static int
 manifest_write_record(int fd, uint32_t type, const void *payload, uint32_t len)
@@ -134,6 +182,7 @@ manifest_write_record(int fd, uint32_t type, const void *payload, uint32_t len)
 	rec.version = PS_MANIFEST_VERSION;
 	rec.type = type;
 	rec.len = len;
+	rec.crc = manifest_record_crc(&rec, payload, len);
 
 	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
 		(len > 0 && write(fd, payload, len) != (ssize_t) len))
@@ -337,12 +386,85 @@ ps_manifest_poisoned(void)
 	return __atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE);
 }
 
+/*
+ * Does a fully-intact record begin at byte offset 'off'?  "Fully intact" means the
+ * header fits, magic and version are exact, the type is known, the len field equals
+ * that type's fixed payload size, the payload fits, and (for v3) the CRC matches --
+ * so no byte of the record is corrupted.  Nothing is trusted before the CRC confirms
+ * it, so a flipped version/type/len/magic cannot be reinterpreted into a "valid"
+ * record of a different shape.  'v2' selects the legacy 16-byte header (no CRC) -- a
+ * whole manifest file is one version or the other (decided from its first record),
+ * so this can never be used to read a corrupted v3 record as an unchecked v2 one.
+ * On success copies the header into *rec and the payload into payload_buf, sets
+ * *rec_size to the on-disk record size, and returns 1; otherwise 0.  Uses pread so
+ * callers can probe an arbitrary offset without disturbing the file position.
+ */
+static int
+manifest_record_valid_at(int fd, off_t off, off_t file_size, int v2,
+						 PsManifestRecord *rec, void *payload_buf,
+						 size_t payload_cap, off_t *rec_size)
+{
+	off_t		hdr = v2 ? (off_t) offsetof(PsManifestRecord, crc)
+		: (off_t) sizeof(*rec);
+	uint32_t	want_ver = v2 ? 2u : (uint32_t) PS_MANIFEST_VERSION;
+	int			plen;
+
+	if (off < 0 || off + hdr > file_size)
+		return 0;				/* no room for even a header */
+	if (pread(fd, rec, (size_t) hdr, off) != (ssize_t) hdr)
+		return 0;
+	if (rec->magic != PS_MANIFEST_MAGIC || rec->version != want_ver)
+		return 0;
+	plen = manifest_type_payload_len(rec->type);
+	if (plen < 0 || (size_t) plen > payload_cap || rec->len != (uint32_t) plen)
+		return 0;
+	if (off + hdr + plen > file_size)
+		return 0;				/* body does not fit */
+	if (plen > 0 &&
+		pread(fd, payload_buf, (size_t) plen, off + hdr) != (ssize_t) plen)
+		return 0;
+	if (!v2 && manifest_record_crc(rec, payload_buf, (uint32_t) plen) != rec->crc)
+		return 0;
+	*rec_size = hdr + plen;
+	return 1;
+}
+
+/*
+ * Is the whole file, byte 0 to EOF, an unbroken run of valid legacy v2 records?
+ * v2 has no CRC, so a single v2 record cannot be told apart from a corrupted v3
+ * record by inspection.  We therefore only treat a file as v2 when *every* record
+ * parses cleanly as v2 right up to EOF: any invalid record, gap, or trailing bytes
+ * means it is not an unambiguous v2 manifest (a corrupted v3 file, or a damaged v2
+ * file), and the caller refuses to read it as v2 rather than guess.
+ */
+static int
+manifest_scan_clean_v2(int fd, off_t file_size)
+{
+	off_t		off = 0;
+
+	if (file_size == 0)
+		return 0;
+	while (off < file_size)
+	{
+		PsManifestRecord rec;
+		unsigned char buf[sizeof(PsManifestLayerDisk)];
+		off_t		rec_size;
+
+		if (!manifest_record_valid_at(fd, off, file_size, 1, &rec, buf,
+									  sizeof(buf), &rec_size))
+			return 0;
+		off += rec_size;
+	}
+	return off == file_size;	/* landed exactly on EOF -> clean v2 */
+}
+
 int
 ps_manifest_replay(PsLayerMap *map)
 {
 	int			fd;
 	off_t		good_off = 0;
 	int			truncate_tail = 0;
+	int			file_v2;
 	off_t		file_size;
 	struct stat st;
 
@@ -361,55 +483,104 @@ ps_manifest_replay(PsLayerMap *map)
 	}
 	file_size = st.st_size;
 
-	for (;;)
+	/*
+	 * Decide the whole file's format: a manifest is entirely v3 (per-record CRC) or
+	 * entirely legacy v2 (no CRC), never a mix.  Because v2 has no CRC, a corrupted
+	 * v3 record and a v2 record (or a v2 record followed by a torn tail) are
+	 * indistinguishable by inspection, so we never read an ambiguous record as v2:
+	 *   - a valid v3 first record  -> v3 file (the per-record CRC anchors the rest);
+	 *   - else if the ENTIRE file parses cleanly as v2 -> a genuine v2 file, which we
+	 *     replay and then migrate to v3 in place;
+	 *   - else -> treat it as v3 and let the loop below decide.  Because no ambiguous
+	 *     record can pass the v3 (CRC) check, the loop never installs a bogus layer
+	 *     from it: a torn/corrupt-then-nothing tail truncates to an openable empty
+	 *     manifest, while corruption with valid v3 records after it fails as interior
+	 *     corruption.  A damaged or torn-tailed legacy v2 file therefore comes up
+	 *     empty (its layer files are reclaimable by GC and its pages stay readable
+	 *     from the authoritative segment log) rather than wedging the store or
+	 *     installing unchecked bytes.
+	 */
+	{
+		PsManifestRecord r0;
+		unsigned char b0[sizeof(PsManifestLayerDisk)];
+		off_t		s0;
+
+		if (file_size > 0 &&
+			manifest_record_valid_at(fd, 0, file_size, 0, &r0, b0, sizeof(b0), &s0))
+			file_v2 = 0;		/* a v3 manifest */
+		else if (manifest_scan_clean_v2(fd, file_size))
+			file_v2 = 1;		/* an entirely-clean legacy v2 manifest -> migrate */
+		else
+			file_v2 = 0;		/* ambiguous/torn/corrupt -> the v3 loop drops it */
+	}
+
+	while (good_off < file_size)
 	{
 		PsManifestRecord rec;
-		ssize_t		n;
-		off_t		rec_off = good_off;
-
-		n = read(fd, &rec, sizeof(rec));
-		if (n == 0)
-			break;
-		if (n != (ssize_t) sizeof(rec))
+		union					/* aligned buffer sized for the largest payload */
 		{
+			unsigned char bytes[sizeof(PsManifestLayerDisk)];
+			PsManifestLayerDisk layer;
+			PsManifestLayerIdEvent ev;
+		}			payload;
+		off_t		rec_off = good_off;
+		off_t		rec_size;
+		off_t		scan;
+		int			interior;
+
+		if (!manifest_record_valid_at(fd, rec_off, file_size, file_v2, &rec,
+									  payload.bytes, sizeof(payload.bytes),
+									  &rec_size))
+		{
+			/*
+			 * No intact record begins at rec_off: it is corrupt or torn.  Treat it
+			 * as a recoverable torn tail only if no intact record begins anywhere
+			 * after it -- then the damage is confined to the final record(s) and the
+			 * earlier entries survive.  If an intact record does follow, this is
+			 * interior corruption and we must fail rather than truncate valid history
+			 * (or resurrect a dropped layer).  Scan all the way to EOF, not just one
+			 * record ahead: several adjacent records can be corrupt, so the next
+			 * intact one may be far past rec_off.  This runs only on a corrupt/torn
+			 * replay, and the per-offset probe rejects on the magic word before
+			 * touching a payload, so it stays cheap.
+			 */
+			interior = 0;
+			for (scan = rec_off + 1; scan < file_size; scan++)
+			{
+				PsManifestRecord prec;
+				union
+				{
+					unsigned char bytes[sizeof(PsManifestLayerDisk)];
+					PsManifestLayerDisk layer;
+					PsManifestLayerIdEvent ev;
+				}			pbuf;
+				off_t		psize;
+
+				if (manifest_record_valid_at(fd, scan, file_size, file_v2, &prec,
+											 pbuf.bytes, sizeof(pbuf.bytes),
+											 &psize))
+				{
+					interior = 1;
+					break;
+				}
+			}
+			if (interior)
+			{
+				close(fd);
+				return -1;
+			}
 			truncate_tail = 1;
 			good_off = rec_off;
-			break;				/* torn tail */
-		}
-		if (rec.magic != PS_MANIFEST_MAGIC ||
-			rec.version != PS_MANIFEST_VERSION)
-		{
-			if (rec_off + (off_t) sizeof(rec) >= file_size)
-			{
-				truncate_tail = 1;
-				good_off = rec_off;
-				break;			/* invalid torn tail header */
-			}
-			close(fd);
-			return -1;
+			break;
 		}
 
 		switch ((PsManifestEventType) rec.type)
 		{
 			case PS_MANIFEST_ADD_LAYER:
 				{
-					PsManifestLayerDisk disk;
 					PsLayerDesc desc;
-					ssize_t		nread;
 
-					if (rec.len != sizeof(disk))
-					{
-						close(fd);
-						return -1;
-					}
-					nread = read(fd, &disk, sizeof(disk));
-					if (nread != (ssize_t) sizeof(disk))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					if (manifest_decode_layer(&desc, &disk) != 0 ||
+					if (manifest_decode_layer(&desc, &payload.layer) != 0 ||
 						(!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
 					{
@@ -421,104 +592,38 @@ ps_manifest_replay(PsLayerMap *map)
 
 			case PS_MANIFEST_SET_REMOTE_DURABLE:
 				{
-					PsManifestLayerIdEvent ev;
-					PsLayerDesc *layer;
-					ssize_t		nread;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(ev))
-					{
-						close(fd);
-						return -1;
-					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 					{
 						layer->remote_durable = true;
-						layer->remote_uploaded_lsn = ev.value;
+						layer->remote_uploaded_lsn = payload.ev.value;
 					}
 					break;
 				}
 
 			case PS_MANIFEST_MARK_DELETE:
 				{
-					PsManifestLayerIdEvent ev;
-					PsLayerDesc *layer;
-					ssize_t		nread;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(ev))
-					{
-						close(fd);
-						return -1;
-					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
 						layer->deleting = true;
 					break;
 				}
 
 			case PS_MANIFEST_REMOVE_LAYER:
-				{
-					PsManifestLayerIdEvent ev;
-					ssize_t		nread;
-
-					if (rec.len != sizeof(ev))
-					{
-						close(fd);
-						return -1;
-					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					manifest_remove_from_map(map, ev.layer_id);
-					break;
-				}
+				manifest_remove_from_map(map, payload.ev.layer_id);
+				break;
 
 			case PS_MANIFEST_DROP_LOCAL:
 				{
-					PsManifestLayerIdEvent ev;
-					PsLayerDesc *layer;
-					ssize_t		nread;
+					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (rec.len != sizeof(ev))
-					{
-						close(fd);
-						return -1;
-					}
-					nread = read(fd, &ev, sizeof(ev));
-					if (nread != (ssize_t) sizeof(ev))
-					{
-						truncate_tail = 1;
-						good_off = rec_off;
-						goto done;	/* torn tail */
-					}
-					layer = manifest_find_layer(map, ev.layer_id);
 					if (layer != NULL)
-					{
 						for (uint32_t i = 0; i < layer->location_count; i++)
-						{
 							if (layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 								layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
 								layer->locations[i].available = false;
-						}
-					}
 					break;
 				}
 
@@ -526,16 +631,10 @@ ps_manifest_replay(PsLayerMap *map)
 				close(fd);
 				return -1;
 		}
-		good_off = lseek(fd, 0, SEEK_CUR);
-		if (good_off < 0)
-		{
-			close(fd);
-			return -1;
-		}
+		good_off = rec_off + rec_size;
 		manifest_nrecords++;
 	}
 
-done:
 	if (truncate_tail &&
 		(ftruncate(fd, good_off) != 0 || fsync(fd) != 0))
 	{
@@ -543,6 +642,17 @@ done:
 		return -1;
 	}
 	close(fd);
+
+	/*
+	 * Upgrade a legacy v2 manifest in place: the replayed state is now in 'map', so
+	 * rewrite the log as v3 (one ADD per live layer) via temp+rename.  This both
+	 * adds CRC protection going forward and -- crucially -- avoids appending v3
+	 * records onto a v2 file (which would defeat the whole-file version check above)
+	 * and avoids discarding the old metadata.  Done once; later opens see v3.
+	 */
+	if (file_v2 && map == &ps_layer_map && ps_manifest_compact() != 0)
+		return -1;
+
 	return 0;
 }
 
