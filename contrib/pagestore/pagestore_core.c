@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
@@ -1288,19 +1289,22 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			uint64_t	l;
 			int			served;
 
+			/*
+			 * The materialized-page cache and the memtable are safe read sources
+			 * only while they stay in lock-step with the segment log.  Once the
+			 * manifest is poisoned, append_page() stops staging and a later
+			 * same-pd_lsn rewrite lands in the segment only; both the cache (keyed
+			 * by (tl,key,block,lsn)) and the memtable would then return the older
+			 * bytes under the same LSN as the segment-backed pv.  When poisoned,
+			 * bypass both and read the authoritative segment.
+			 */
+			int			poisoned = ps_manifest_poisoned();
+
 			/* fast path: materialized-page cache, keyed by the resolved version */
-			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
 				return 1;
 
-			/*
-			 * The memtable is a safe read source only while it stays in lock-step
-			 * with the segment log.  Once the manifest is poisoned, append_page()
-			 * stops staging, so a later same-pd_lsn rewrite lands in the segment
-			 * only; the memtable would then return the older bytes under the same
-			 * LSN as the segment-backed pv.  Skip it when poisoned and read the
-			 * authoritative segment instead.
-			 */
-			if (s->memtable && !ps_manifest_poisoned() &&
+			if (s->memtable && !poisoned &&
 				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
@@ -1540,13 +1544,17 @@ ps_core_close(void)
 	 * If the sync fails (EIO/ENOSPC/...), the segment log -- the sole source
 	 * segment-only recovery reads -- is not durable, so the about-to-be-destroyed
 	 * memtable may be the only good copy of recent writes.  We cannot make it
-	 * durable from here, but we must not let that pass silently: report it loudly
-	 * so the failure is not mistaken for a clean shutdown.
+	 * durable from here, so do not proceed to a clean-looking teardown that would
+	 * mask the loss: report it and abort with a failure status before destroying
+	 * the memtables, leaving the operator a clear signal to investigate.
 	 */
 	if (ps_storage->sync && ps_storage->sync() != 0)
+	{
 		fprintf(stderr, "pagestore_daemon: FATAL: segment sync failed on shutdown "
-				"(%s); recently acknowledged writes may be lost on restart\n",
-				strerror(errno));
+				"(%s); aborting before teardown -- recently acknowledged writes "
+				"may not be durable\n", strerror(errno));
+		_exit(EXIT_FAILURE);
+	}
 
 	for (uint32_t i = 0; i < ns; i++)
 	{
