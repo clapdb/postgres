@@ -66,9 +66,15 @@ extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
  */
 extern int	ps_handle_meta(PsChannel *ch);
 
-/* Page byte-I/O helpers used by the frontends' byte-op handlers. */
+/*
+ * Page byte-I/O helpers used by the frontends' byte-op handlers.  'version' is the
+ * caller-supplied version LSN for an SLRU-class write (the dirtying/cutoff WAL LSN,
+ * stored verbatim so it stays comparable to a branch cutoff); it is ignored for
+ * relation pages (versioned by pd_lsn) and other non-relation objects (versioned by
+ * a monotonic latest-wins counter).
+ */
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-						const unsigned char *page);
+						const unsigned char *page, uint64_t version);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);

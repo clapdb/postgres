@@ -149,7 +149,7 @@ begin(uint32_t i, PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_EXTEND:
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
 				ch->status = PS_STATUS_ERROR;
 			else
 				fork_grow(tl, &ch->key, ch->blocknum + 1);
@@ -160,7 +160,8 @@ begin(uint32_t i, PsChannel *ch)
 			for (uint32_t b = 0; b < ch->nblocks; b++)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + b,
-								 ch->data + (size_t) b * page_size) != 0)
+								 ch->data + (size_t) b * page_size,
+								 ch->req_lsn) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;

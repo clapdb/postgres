@@ -1123,7 +1123,7 @@ page_lsn(const unsigned char *page)
  */
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page)
+			const unsigned char *page, uint64_t version)
 {
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
@@ -1142,15 +1142,19 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.key = *key;
 	hdr.block = block;
 	/*
-	 * Version key.  A relation page carries a real monotonic pd_lsn; non-relation
-	 * objects (SLRU/control) do not -- their first 8 bytes are payload, not an LSN
-	 * -- so versioning them from page_lsn() can make an overwrite compare lower
-	 * than the prior version and silently lose (and poison the pgcache for that
-	 * pseudo-LSN).  Derive a monotonic version from the existing chain instead
-	 * (newest across ancestry + 1) so the latest object write always wins.
+	 * Version key.  A relation page carries a real monotonic pd_lsn.  An SLRU object
+	 * is versioned by the caller-supplied 'version' -- the dirtying/cutoff WAL LSN --
+	 * stored verbatim so it stays directly comparable to a branch's as-of cutoff
+	 * (the seed path keys a snapshot by its proven cutoff C and reads it as-of L>=C);
+	 * a daemon counter would not be comparable.  Other non-relation objects (the
+	 * control file) carry no LSN in their bytes, so versioning them from page_lsn()
+	 * could make an overwrite compare lower and silently lose (and poison the pgcache
+	 * for that pseudo-LSN); derive a monotonic latest-wins version from the chain.
 	 */
 	if (key->klass == PS_KLASS_RELATION)
 		hdr.lsn = page_lsn(page);
+	else if (key->klass == PS_KLASS_SLRU)
+		hdr.lsn = version;
 	else
 	{
 		PageVer    *cur;

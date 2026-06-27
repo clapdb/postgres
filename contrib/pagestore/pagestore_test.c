@@ -295,6 +295,42 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/*
+ * SLRU-class write: the version is the caller-supplied LSN (req_lsn), NOT pd_lsn or
+ * a daemon counter -- so a snapshot keyed by its proven cutoff C reads back as-of an
+ * LSN >= C.  'obj' is the SLRU object id (slru_klass_id); 'block' is the segment.
+ */
+static void
+op_write_slru(uint32_t obj, uint32_t block, const unsigned char *page,
+			  uint64_t version)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);			/* fork 0 */
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
+/* SLRU-class as-of read (READ_AT zero-fills on no-version-<=lsn). */
+static void
+op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);			/* fork 0 */
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
 /* --- timeline-aware operations (for branch tests) --- */
 
 /* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
@@ -631,6 +667,30 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(page_has_tag(rb, page_size, 200), "read_at(9000) returns new version");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
+
+	/* --- SLRU-class versioning: version is the caller's LSN, not a daemon counter ---
+	 * Two snapshots of an SLRU segment keyed by cutoffs C1=5000 and C2=9000.  An
+	 * as-of read must resolve by those exact LSNs; a daemon max+1 counter (1,2) would
+	 * make read_at(7000) and read_at(4000) resolve wrongly. */
+	{
+		const uint32_t SLRU_OBJ = 4242;	/* an slru_klass_id stand-in */
+
+		fill_page(pa, page_size, 0, 111);	/* pd_lsn irrelevant for SLRU; tag 111 */
+		op_write_slru(SLRU_OBJ, 0, pa, 5000);
+		fill_page(pb, page_size, 0, 222);
+		op_write_slru(SLRU_OBJ, 0, pb, 9000);
+
+		op_read_at_slru(SLRU_OBJ, 0, 7000, rb);
+		check(page_has_tag(rb, page_size, 111),
+			  "slru read_at(7000) = C1 snapshot (version is the caller LSN 5000)");
+		op_read_at_slru(SLRU_OBJ, 0, 9000, rb);
+		check(page_has_tag(rb, page_size, 222), "slru read_at(9000) = C2 snapshot");
+		op_read_at_slru(SLRU_OBJ, 0, 4000, rb);
+		check(page_all_zero(rb, page_size),
+			  "slru read_at(4000) = none (no snapshot at/below 4000; not a counter)");
+		op_read_at_slru(SLRU_OBJ, 0, ~0ull, rb);
+		check(page_has_tag(rb, page_size, 222), "slru read_at(max) = newest snapshot");
+	}
 
 	client_detach();
 
