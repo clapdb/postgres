@@ -600,6 +600,46 @@ test_manifest_v2_corrupt_first(void)
 }
 
 /*
+ * A manifest whose only record is an incomplete (torn) write -- a crash during the
+ * very first append -- has committed nothing, so replay must truncate it to an
+ * openable empty manifest, not refuse to start (that would wedge the store).
+ */
+static void
+test_manifest_torn_first_record(void)
+{
+	char		dir[] = "/tmp/pstornfXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1;
+	struct stat st;
+	int			fd;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "torn-first: setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d1 = synth_layer(3, dir);
+	check(ps_manifest_add_layer(&d1) == 0 && stat(mpath, &st) == 0 && st.st_size > 30,
+		  "torn-first: one v3 ADD");
+	ps_manifest_close();
+	/* truncate mid-record: full header (20 bytes) + a partial payload */
+	fd = open(mpath, O_WRONLY);
+	check(fd >= 0 && ftruncate(fd, 30) == 0, "torn-first: truncate mid-record");
+	if (fd >= 0)
+		close(fd);
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "torn first record replays (store stays openable)");
+	check(ps_layer_map_count(&ps_layer_map) == 0 && stat(mpath, &st) == 0 &&
+		  st.st_size == 0,
+		  "  ... and is truncated to an empty manifest");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+}
+
+/*
  * Corruption can span several adjacent records, so the torn-tail probe must scan to
  * EOF, not just one record ahead: with two corrupt ADDs followed by an intact one,
  * replay must report interior corruption (fail), not truncate the whole file.
@@ -857,6 +897,7 @@ main(void)
 	test_manifest_v2_migration();
 	test_manifest_v3_first_downgrade();
 	test_manifest_v2_corrupt_first();
+	test_manifest_torn_first_record();
 	test_manifest_spanning_corruption();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);

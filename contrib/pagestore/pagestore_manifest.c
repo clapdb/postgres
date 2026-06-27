@@ -458,6 +458,36 @@ manifest_scan_clean_v2(int fd, off_t file_size)
 	return off == file_size;	/* landed exactly on EOF -> clean v2 */
 }
 
+/*
+ * Is the manifest's first record an incomplete (torn) record -- an append that was
+ * interrupted before the record was fully written?  True only when our magic is at
+ * the start but the record the header describes runs past EOF; a full record (even
+ * one with a bad CRC), foreign bytes, or an unknown type is NOT torn.  A torn first
+ * record means nothing was durably committed, so replay can safely truncate it away
+ * to an openable empty manifest instead of refusing to start.
+ */
+static int
+manifest_first_record_torn(int fd, off_t file_size)
+{
+	PsManifestRecord rec;
+	uint32_t	magic = 0;
+	int			plen;
+
+	if (file_size <= 0)
+		return 0;
+	if (pread(fd, &magic, sizeof(magic), 0) != (ssize_t) sizeof(magic) ||
+		magic != PS_MANIFEST_MAGIC)
+		return 0;				/* no/foreign magic -> not a torn write of ours */
+	if (file_size < (off_t) sizeof(rec))
+		return 1;				/* magic present but the header is truncated */
+	if (pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec))
+		return 0;
+	plen = manifest_type_payload_len(rec.type);
+	if (plen < 0)
+		return 0;				/* unknown type on a full header -> corruption */
+	return file_size < (off_t) sizeof(rec) + plen;	/* payload truncated -> torn */
+}
+
 int
 ps_manifest_replay(PsLayerMap *map)
 {
@@ -491,6 +521,8 @@ ps_manifest_replay(PsLayerMap *map)
 	 *   - a valid v3 first record  -> v3 file (the per-record CRC anchors the rest);
 	 *   - else if the ENTIRE file parses cleanly as v2 -> a genuine v2 file, which we
 	 *     replay and then migrate to v3 in place;
+	 *   - else if the first record is an incomplete (torn) write -> nothing was
+	 *     committed, so let the loop below truncate it to an openable empty manifest;
 	 *   - else (a corrupted v3 file, a damaged v2 file, or garbage) -> fail the
 	 *     replay WITHOUT truncating, so no real metadata is silently emptied and no
 	 *     ambiguous bytes are installed as an unchecked v2 layer; an operator can
@@ -508,6 +540,8 @@ ps_manifest_replay(PsLayerMap *map)
 			file_v2 = 0;
 		else if (manifest_scan_clean_v2(fd, file_size))
 			file_v2 = 1;
+		else if (manifest_first_record_torn(fd, file_size))
+			file_v2 = 0;		/* torn first append: the loop truncates to empty */
 		else
 		{
 			close(fd);
