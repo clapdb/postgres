@@ -1208,6 +1208,28 @@ slru_klass_id(const char *name)
 	return h;
 }
 
+/* The WAL-logged, uint32-page SLRUs M4 may snapshot/reconstruct.  A whitelist: the
+ * SQL helpers take a directory name, so without it a caller could point them at
+ * 'base/<db>' or 'global' and snapshot ordinary relation files (whose numeric names
+ * also parse as hex) under an SLRU key. */
+static const char *const ps_slru_dirs[] = {
+	"pg_xact",
+	"pg_multixact/offsets",
+	"pg_multixact/members",
+	"pg_commit_ts",
+};
+
+static void
+slru_check_dir(const char *slru)
+{
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+		if (strcmp(ps_slru_dirs[i], slru) == 0)
+			return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+}
+
 static void
 slru_obj_key(PageStoreRelKey *key, const char *slru)
 {
@@ -1241,6 +1263,7 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	slru_check_dir(slru);
 
 	dir = AllocateDir(slru);
 	if (dir == NULL)
@@ -1316,10 +1339,14 @@ pagestore_slru_read_at(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	slru_check_dir(slru);
 
 	slru_obj_key(&key, slru);
-	pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key, (BlockNumber) pageno,
-								   (uint64) lsn, out);
+	/* preserve the miss signal: a page with no version <= lsn returns NULL, not a
+	 * zero page that a caller could mistake for real all-zero clog state */
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key, (BlockNumber) pageno,
+										(uint64) lsn, out))
+		PG_RETURN_NULL();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);

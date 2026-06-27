@@ -700,8 +700,12 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	memcpy(page, ch->data, BLCKSZ);
 }
 
-/* As-of read of a non-relation object block (honours branch ancestry). */
-void
+/*
+ * As-of read of a non-relation object block (honours branch ancestry).  Returns
+ * true if a version <= 'version' was found; on a miss returns false and leaves
+ * 'page' zero-filled (so callers can fail closed rather than read a phantom page).
+ */
+bool
 pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 							   BlockNumber block, uint64 version, void *page)
 {
@@ -714,6 +718,7 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 	ch->req_lsn = version;
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
+	return ch->result != 0;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

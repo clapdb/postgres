@@ -164,7 +164,7 @@ extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *ke
 										 uint64 version);
 extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 										BlockNumber block, void *page);
-extern void pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 										   BlockNumber block, uint64 version,
 										   void *page);
 

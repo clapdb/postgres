@@ -102,9 +102,14 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READ_AT:
-			/* as-of read on this timeline, honoring branch ancestry */
-			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
-				memset(ch->data, 0, page_size);
+			/* as-of read on this timeline, honoring branch ancestry.  Report
+			 * found-ness in ch->result so a caller can tell a real all-zero page
+			 * from one that has no version <= req_lsn (e.g. an absent SLRU base
+			 * snapshot), rather than mistaking the zero-fill for committed state. */
+			if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+				ch->result = 1;
+			else
+				memset(ch->data, 0, page_size);		/* not found: result stays 0 */
 			break;
 
 		default:

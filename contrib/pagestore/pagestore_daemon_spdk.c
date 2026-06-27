@@ -229,10 +229,11 @@ begin(uint32_t i, PsChannel *ch)
 
 				if (!v)
 				{
-					memset(ch->data, 0, page_size);
+					memset(ch->data, 0, page_size);		/* not found: result 0 */
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
+				ch->result = 1;			/* found a version <= req_lsn */
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
 									  ch->data))
 				{
