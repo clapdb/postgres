@@ -33,11 +33,15 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "access/clog.h"
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
+#include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
@@ -1370,6 +1374,314 @@ pagestore_slru_read_at(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 	memcpy(VARDATA(result), out, BLCKSZ);
 	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * SLRU-status applier (M4 step 2): clog reconstruction as of an LSN.
+ *
+ * A branch's transaction status as of fork LSN L = the parent's clog snapshot at a
+ * cutoff C (the base, read from the store) PLUS the per-commit/abort effects of the
+ * xact WAL records in (C, L].  Replaying per-update records -- not coalescing a
+ * flushed page image -- is what makes it branch-correct: two xids on the same clog
+ * page that commit on either side of L get the right answer (SLRU_ON_STORE_DESIGN.md).
+ * This applies clog only; multixact/commit-ts are the same shape and follow.  It reads
+ * the parent's local WAL; a store-backed reader for a branch with no local WAL (as in
+ * redo_page_asof) is a follow-up.
+ */
+
+/* clog page/bit math -- mirrors the static macros in clog.c (stable on-disk format) */
+#define PS_CLOG_BITS_PER_XACT	2
+#define PS_CLOG_XACTS_PER_BYTE	4
+#define PS_CLOG_XACTS_PER_PAGE	(BLCKSZ * PS_CLOG_XACTS_PER_BYTE)
+#define PS_CLOG_XACT_BITMASK	((1 << PS_CLOG_BITS_PER_XACT) - 1)
+
+/* Set xid's 2-bit status in clog page 'page' (page number 'pageno'); xids that map
+ * to a different page, and non-normal xids (bootstrap/frozen), are ignored. */
+static void
+ps_clog_set_status(char *page, int64 pageno, TransactionId xid, int status)
+{
+	int			pgidx,
+				byteno,
+				bshift;
+
+	if (!TransactionIdIsNormal(xid) ||
+		(int64) (xid / PS_CLOG_XACTS_PER_PAGE) != pageno)
+		return;
+	pgidx = xid % PS_CLOG_XACTS_PER_PAGE;
+	byteno = pgidx / PS_CLOG_XACTS_PER_BYTE;
+	bshift = (pgidx % PS_CLOG_XACTS_PER_BYTE) * PS_CLOG_BITS_PER_XACT;
+	page[byteno] = (page[byteno] & ~(PS_CLOG_XACT_BITMASK << bshift)) |
+		(status << bshift);
+}
+
+/* What the replay of (base, target] observed for a single clog page. */
+typedef struct PsClogReplay
+{
+	bool		reached_target; /* scan covered the WAL up to target_lsn */
+	bool		page_zeroed;	/* a CLOG_ZEROPAGE (re)created this page in range */
+	bool		page_truncated; /* a CLOG_TRUNCATE removed this page in range */
+} PsClogReplay;
+
+/* Highest LSN the local WAL reader (read_local_xlog_page_no_wait) can serve: the replay
+ * pointer during recovery / on a standby, the flush pointer on a primary.  Used to tell
+ * "target is past the last record but the WAL is fully present" (complete) from "target
+ * is beyond the readable WAL" (a genuine short read). */
+static XLogRecPtr
+ps_local_wal_limit(void)
+{
+	return RecoveryInProgress() ? GetXLogReplayRecPtr(NULL) : GetFlushRecPtr(NULL);
+}
+
+/*
+ * Replay (base_lsn, target_lsn] from the local WAL onto clog page 'pageno' in 'page':
+ *  - XLOG_XACT_{COMMIT,ABORT}[_PREPARED]: set the top xid + subxids' status;
+ *  - RM_CLOG_ID CLOG_ZEROPAGE: zero this page (a page reused after wraparound must not
+ *    keep the base image's stale bits, which clog_redo() would have cleared);
+ *  - RM_CLOG_ID CLOG_TRUNCATE: note that this page was truncated away.
+ * Record-aligned at target: a record ending after target_lsn is not part of as-of-L.
+ * Reports how far the scan reached so the caller can fail closed on a short read.
+ */
+static PsClogReplay
+ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
+					XLogRecPtr target_lsn)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	PsClogReplay r = {false, false, false};
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	/*
+	 * Start from the beginning of base_lsn's WAL segment, not base_lsn itself.  A
+	 * record that straddles the cutoff (starts before base_lsn, ends in (base_lsn,
+	 * target_lsn]) still has its status effect inside the replay window -- the effect
+	 * is record-aligned at EndRecPtr -- so it must be read; seeking to base_lsn would
+	 * skip it.  Records ending at or before base_lsn are already reflected in the base
+	 * snapshot and are filtered out below.  This also makes a base_lsn that does not
+	 * fall on a record boundary harmless.
+	 */
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+		RmgrId		rmid;
+		int			status;
+		TransactionId xid;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;						/* straddles/past L: as-of-L fully covered */
+		if (reader->EndRecPtr <= base_lsn)
+			continue;					/* effect already in the base snapshot */
+		rmid = XLogRecGetRmid(reader);
+
+		if (rmid == RM_CLOG_ID)
+		{
+			uint8		cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+			if (cinfo == CLOG_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp == pageno)
+				{
+					memset(page, 0, BLCKSZ);
+					r.page_zeroed = true;
+					r.page_truncated = false;	/* recreated: undo an earlier truncate */
+				}
+			}
+			else if (cinfo == CLOG_TRUNCATE)
+			{
+				xl_clog_truncate xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				/* SimpleLruTruncate drops whole segments below the cutoff page's
+				 * segment; a fork window is far too short to wrap, so segment order
+				 * suffices (no MaxTransactionId/2 wraparound compare needed). */
+				if (pageno / SLRU_PAGES_PER_SEGMENT <
+					xlrec.pageno / SLRU_PAGES_PER_SEGMENT)
+					r.page_truncated = true;
+			}
+			continue;
+		}
+		if (rmid != RM_XACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED)
+		{
+			xl_xact_parsed_commit parsed;
+
+			status = TRANSACTION_STATUS_COMMITTED;
+			ParseCommitRecord(XLogRecGetInfo(reader),
+							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_clog_set_status(page, pageno, xid, status);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_clog_set_status(page, pageno, parsed.subxacts[i], status);
+		}
+		else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED)
+		{
+			xl_xact_parsed_abort parsed;
+
+			status = TRANSACTION_STATUS_ABORTED;
+			ParseAbortRecord(XLogRecGetInfo(reader),
+							 (xl_xact_abort *) XLogRecGetData(reader), &parsed);
+			xid = (info == XLOG_XACT_ABORT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_clog_set_status(page, pageno, xid, status);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_clog_set_status(page, pageno, parsed.subxacts[i], status);
+		}
+	}
+
+	/*
+	 * "Reached" means the whole (base, target] window was covered.  Normally that is
+	 * the last applied record ending at/after target, but target may be an arbitrary
+	 * LSN past the last record in the window (a branch cutoff between records): if the
+	 * scan actually started (readfrom valid -- base's WAL segment was readable) and
+	 * ended *cleanly* (no decode error) and the readable WAL extends through target,
+	 * there are simply no further effects -- complete, not a short read.  An unreadable
+	 * start (recycled base segment -> readfrom invalid), a decode error (errm set), or a
+	 * target beyond the readable WAL is incomplete and must fail closed, so we never
+	 * seed a clog that skipped the (base, target] records.
+	 */
+	r.reached_target = (scanned >= target_lsn) ||
+		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
+		 ps_local_wal_limit() >= target_lsn);
+	XLogReaderFree(reader);
+	pfree(pd);
+	return r;
+}
+
+/*
+ * Load the base clog page (the store snapshot as-of base_lsn) and replay (base, L].
+ * Returns true with the page filled, or false when the page was truncated away by L
+ * (a normal CLOG_TRUNCATE in the window) -- the caller should then omit it, exactly as
+ * relation redo_page_asof omits a truncated block, rather than fail the whole branch.
+ * Still fails closed (ereport) on a real error rather than return a wrong page:
+ *  - incomplete WAL (scan did not reach L) -- unless L is the "latest readable"
+ *    sentinel PG_UINT64_MAX, which means "replay all WAL on hand";
+ *  - the base page existed at base_lsn but is absent from the store (a miss that was
+ *    not (re)created by an in-range zero-page), which would otherwise read back as an
+ *    all-zero clog and make pre-base commits look IN_PROGRESS.
+ */
+static bool
+ps_clog_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
+					XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	bool		base_found;
+	uint64		resolved = 0;
+	PsClogReplay r;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_xact");
+	/* the base must be the snapshot shipped at exactly this cutoff: an older newest-<=
+	 * image would skip the WAL between it and base_lsn (lost commits / a resurrected
+	 * truncated page), so treat a non-exact resolve as "base absent". */
+	base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												(BlockNumber) pageno,
+												(uint64) base_lsn, page, &resolved) &&
+		resolved == (uint64) base_lsn;
+
+	/* target == base: the empty (base, target] needs no WAL, so don't even open the
+	 * reader -- the snapshot may predate the locally-retained WAL.  The base page is
+	 * the whole answer; it must be present at exactly this cutoff. */
+	if (target_lsn == base_lsn)
+	{
+		if (!base_found)
+			ereport(ERROR,
+					(errmsg("pagestore: base clog snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+		return true;
+	}
+
+	r = ps_clog_apply_range(page, pageno, base_lsn, target_lsn);
+
+	if (!r.reached_target && target_lsn != PG_UINT64_MAX)
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct clog as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+	if (r.page_truncated)
+		return false;			/* removed by a CLOG_TRUNCATE in (base, L]: omit it */
+	if (!base_found && !r.page_zeroed)
+		ereport(ERROR,
+				(errmsg("pagestore: base clog snapshot for page %lld is absent at %X/%08X",
+						(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	return true;
+}
+
+/*
+ * pagestore_clog_page_asof(pageno int, base pg_lsn, target pg_lsn) returns bytea --
+ * the clog page reconstructed as of 'target' from the base snapshot at 'base'.
+ */
+PG_FUNCTION_INFO_V1(pagestore_clog_page_asof);
+Datum
+pagestore_clog_page_asof(PG_FUNCTION_ARGS)
+{
+	int32		pageno = PG_GETARG_INT32(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	char	   *page = palloc(BLCKSZ);
+	bytea	   *result;
+
+	if (!ps_clog_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();		/* page truncated away by the target LSN: omit it */
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * pagestore_clog_status_asof(xid xid, base pg_lsn, target pg_lsn) returns int -- the
+ * 2-bit clog status of 'xid' as of 'target' (0 in-progress, 1 committed, 2 aborted).
+ */
+PG_FUNCTION_INFO_V1(pagestore_clog_status_asof);
+Datum
+pagestore_clog_status_asof(PG_FUNCTION_ARGS)
+{
+	TransactionId xid = PG_GETARG_TRANSACTIONID(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	int64		pageno = xid / PS_CLOG_XACTS_PER_PAGE;
+	int			pgidx = xid % PS_CLOG_XACTS_PER_PAGE;
+	int			byteno = pgidx / PS_CLOG_XACTS_PER_BYTE;
+	int			bshift = (pgidx % PS_CLOG_XACTS_PER_BYTE) * PS_CLOG_BITS_PER_XACT;
+	char	   *page = palloc(BLCKSZ);
+
+	if (!ps_clog_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();		/* xid's clog page truncated away by the target LSN */
+
+	PG_RETURN_INT32((page[byteno] >> bshift) & PS_CLOG_XACT_BITMASK);
 }
 
 void

@@ -302,6 +302,40 @@ assert "$store_md5" "$local_md5" "clog page read from the store as-of C matches 
 before_null=$($P -c "SELECT pagestore_slru_read_at('pg_xact', $pageno, '0/1') IS NULL;")
 assert "$before_null" "t" "clog snapshot is not visible below its cutoff C (read misses -> NULL)"
 
+# --- 17. SLRU-status applier (M4 step 2): clog reconstruction as-of an LSN ----------
+# Snapshot the clog at base C, then commit xidA (<= L) and xidB (> L); both land on the
+# same clog page.  Reconstructing as-of L (base snapshot + replay of xact records in
+# (C,L]) must show xidA committed but xidB still in progress -- per-record replay, not a
+# coalesced page image, is what makes the fork point exact.  At max LSN xidB is committed.
+$P -c "CREATE FUNCTION pagestore_clog_status_asof(xid, pg_lsn, pg_lsn) RETURNS int
+        AS 'pagestore','pagestore_clog_status_asof' LANGUAGE C STRICT;
+       CREATE TABLE clogm(id int);" >/dev/null
+# CLOG_XACTS_PER_PAGE = BLCKSZ*4; derive from the server (correct on non-default BLCKSZ)
+cxpp=$(( $($P -c "SHOW block_size") * 4 ))
+# Make the same-page case deterministic instead of relying on luck: if the next xid is
+# within a few slots of a clog page boundary, burn xids to roll onto a fresh page so
+# xidA..xidB cannot straddle it (the no-coalescing check needs both on one page).
+while [ "$(( $($P -c 'SELECT pg_snapshot_xmax(pg_current_snapshot())') % cxpp ))" -gt "$(( cxpp - 6 ))" ]; do
+	$P -c "SELECT txid_current();" >/dev/null
+done
+# CHECKPOINT *after* burning so those commits are flushed into the on-disk clog the
+# snapshot ships -- the base must equal the as-of-base state, not lag it.
+$P -c "CHECKPOINT;" >/dev/null                               # flush clog: on-disk == as-of base
+base=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$base');" >/dev/null
+# data-writing xacts so the commit is sync-flushed (an xid-only xact commits async and
+# would not yet be on disk for the no-wait WAL reader)
+xidA=$($P -c "WITH w AS (INSERT INTO clogm VALUES (1) RETURNING 1) SELECT pg_current_xact_id();")
+L=$($P -c "SELECT pg_current_wal_lsn();")                     # L: after xidA's commit
+xidB=$($P -c "WITH w AS (INSERT INTO clogm VALUES (2) RETURNING 1) SELECT pg_current_xact_id();")
+assert "$(( xidA / cxpp ))" "$(( xidB / cxpp ))" "applier test setup: xidA and xidB share one clog page"
+sA=$($P -c "SELECT pagestore_clog_status_asof('$xidA'::xid, '$base', '$L');")
+sB=$($P -c "SELECT pagestore_clog_status_asof('$xidB'::xid, '$base', '$L');")
+sBmax=$($P -c "SELECT pagestore_clog_status_asof('$xidB'::xid, '$base', 'FFFFFFFF/FFFFFFFF');")
+assert "$sA" "1" "applier: xid committed at/below L is COMMITTED as-of L"
+assert "$sB" "0" "applier: xid committed after L is IN-PROGRESS as-of L (no page coalescing)"
+assert "$sBmax" "1" "applier: that same xid IS committed when replayed to max LSN"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
