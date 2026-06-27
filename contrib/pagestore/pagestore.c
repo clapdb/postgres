@@ -46,6 +46,7 @@
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
+#include "common/file_perm.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
@@ -1414,6 +1415,22 @@ ps_clog_set_status(char *page, int64 pageno, TransactionId xid, int status)
 		(status << bshift);
 }
 
+/* Set xid's status in a contiguous array of clog pages starting at 'page_lo'
+ * (np pages); xids outside the covered range are ignored.  Used by the seeder's
+ * single multi-page WAL pass. */
+static inline void
+ps_clog_seed_set(char *pages, int64 page_lo, int np, TransactionId xid, int status)
+{
+	int64		pg;
+
+	if (!TransactionIdIsNormal(xid))
+		return;
+	pg = (int64) xid / PS_CLOG_XACTS_PER_PAGE;
+	if (pg < page_lo || pg >= page_lo + np)
+		return;
+	ps_clog_set_status(pages + (pg - page_lo) * BLCKSZ, pg, xid, status);
+}
+
 /* What the replay of (base, target] observed for a single clog page. */
 typedef struct PsClogReplay
 {
@@ -1682,6 +1699,327 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();		/* xid's clog page truncated away by the target LSN */
 
 	PG_RETURN_INT32((page[byteno] >> bshift) & PS_CLOG_XACT_BITMASK);
+}
+
+/*
+ * pagestore_seed_clog(target_dir text, base pg_lsn, target pg_lsn,
+ *					   oldest_xid xid, next_xid xid) returns bigint
+ *
+ * M4 step 3 (branch create): materialize a new branch's clog as of fork LSN 'target'
+ * into <target_dir>/pg_xact, by reconstructing each page (base snapshot at 'base' +
+ * replay of (base, target]) over the fork's clog horizon [oldest_xid, next_xid) and
+ * writing whole segments.  The branch then
+ * boots on this clog and writes its own status forward on its timeline.  Fails closed
+ * (ereport) on any error -- a half-seeded clog must never boot.  Returns the page
+ * count.  clog only; multixact/commit-ts seed the same way (follow-up).
+ */
+PG_FUNCTION_INFO_V1(pagestore_seed_clog);
+Datum
+pagestore_seed_clog(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	char		dstdir[MAXPGPATH];
+	char		stagedir[MAXPGPATH];
+	PageStoreRelKey key;
+	int64		page_lo,
+				page_hi,
+				seg_lo,
+				seg_hi,
+				seg,
+				p;
+	int			np;
+	char	   *pages;
+	bool	   *established;		/* page content known (in base, or zeroed in range) */
+	XLogRecPtr	scanned = base;
+	XLogRecPtr	readfrom;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	int64		seeded = 0;
+
+	/* Writes server-side files under a caller-supplied path: superuser only, like the
+	 * other server-file-access functions, and checked before any filesystem effect. */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed a branch clog")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	/* every path we build is <target_dir>/pg_xact/XXXX[.tmp]; reject if it won't fit */
+	if (strlen(target_dir) + sizeof("/pg_xact/0000.tmp") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	/*
+	 * Derive the seeded segments from the fork's clog horizon as of L, not from the
+	 * parent's current on-disk layout (which may have truncated or extended since L).
+	 * clog truncates whole segments, so round the oldest live xid down to a segment;
+	 * the newest page is the one holding next_xid - 1.  Whole segments are written so
+	 * the branch's pg_xact is the layout SimpleLru expects.
+	 */
+	page_lo = ((int64) oldest_xid / PS_CLOG_XACTS_PER_PAGE);
+	seg_lo = page_lo / SLRU_PAGES_PER_SEGMENT;
+	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
+	page_hi = ((int64) (next_xid - 1)) / PS_CLOG_XACTS_PER_PAGE;
+	seg_hi = page_hi / SLRU_PAGES_PER_SEGMENT;
+	/* The horizon is wraparound-aware (TransactionIdFollows above), but the page
+	 * numbers are not: a horizon straddling the 32-bit wrap makes page_lo land near
+	 * the top and page_hi near zero.  Rather than seed a bogus/negative range, fail
+	 * closed -- clog seeding across the wrap point is out of scope. */
+	if (page_hi < page_lo)
+		ereport(ERROR,
+				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; clog seeding across wrap is not supported",
+						oldest_xid, next_xid)));
+	np = (int) (page_hi - page_lo + 1);
+
+	/* Build every page in [page_lo, page_hi] in memory, then a single WAL pass over
+	 * (base, target] applies statuses/zero-pages/truncations to all of them at once
+	 * -- not a fresh scan per page. */
+	pages = palloc((Size) np * BLCKSZ);
+	established = palloc0(np * sizeof(bool));
+	slru_obj_key(&key, "pg_xact");
+	for (p = 0; p < np; p++)
+	{
+		uint64		resolved = 0;
+
+		/* require the exact-cutoff snapshot version: an older newest-<= image would
+		 * skip WAL between it and base (see ps_clog_reconstruct) */
+		established[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+													   (BlockNumber) (page_lo + p),
+													   (uint64) base,
+													   pages + p * BLCKSZ, &resolved) &&
+			resolved == (uint64) base;
+	}
+	/*
+	 * established[p] means page p's content is known: found in the base snapshot, or
+	 * (re)created by an in-range CLOG_ZEROPAGE below.  After the scan, any page still
+	 * unestablished means the base is missing a page that existed at the cutoff --
+	 * fail closed rather than seed an all-zero (IN_PROGRESS) page.
+	 */
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	/*
+	 * target == base: empty (base, target] -- skip the scan entirely (don't open
+	 * possibly-recycled WAL); the base pages alone are the seed.  Otherwise start at the
+	 * beginning of base's WAL segment so a record that straddles the cutoff (starts
+	 * before base, ends in (base, target]) is still read; records ending at/before base
+	 * are already in the base snapshot and are filtered out below.
+	 */
+	if (target == base)
+		readfrom = InvalidXLogRecPtr;
+	else
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+		readfrom = XLogFindNextRecord(reader, readfrom);
+	}
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+		RmgrId		rmid;
+		int			status;
+		TransactionId xid;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target)
+			break;
+		if (reader->EndRecPtr <= base)
+			continue;				/* effect already in the base snapshot */
+		rmid = XLogRecGetRmid(reader);
+
+		if (rmid == RM_CLOG_ID)
+		{
+			uint8		cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+			if (cinfo == CLOG_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp >= page_lo && zp <= page_hi)
+				{
+					memset(pages + (zp - page_lo) * BLCKSZ, 0, BLCKSZ);
+					established[zp - page_lo] = true;
+				}
+			}
+			else if (cinfo == CLOG_TRUNCATE)
+			{
+				xl_clog_truncate xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				/* truncation drops whole segments below the cutoff page's segment; if
+				 * that reaches the oldest seeded segment the caller's horizon is stale
+				 * (a fork window is far too short to wrap, so segment order suffices) */
+				if (xlrec.pageno / SLRU_PAGES_PER_SEGMENT > seg_lo)
+					ereport(ERROR,
+							(errmsg("pagestore: clog truncation to page %lld occurs within (base, target]; horizon is stale",
+									(long long) xlrec.pageno)));
+			}
+			continue;
+		}
+		if (rmid != RM_XACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED)
+		{
+			xl_xact_parsed_commit parsed;
+
+			status = TRANSACTION_STATUS_COMMITTED;
+			ParseCommitRecord(XLogRecGetInfo(reader),
+							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_clog_seed_set(pages, page_lo, np, xid, status);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_clog_seed_set(pages, page_lo, np, parsed.subxacts[i], status);
+		}
+		else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED)
+		{
+			xl_xact_parsed_abort parsed;
+
+			status = TRANSACTION_STATUS_ABORTED;
+			ParseAbortRecord(XLogRecGetInfo(reader),
+							 (xl_xact_abort *) XLogRecGetData(reader), &parsed);
+			xid = (info == XLOG_XACT_ABORT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_clog_seed_set(pages, page_lo, np, xid, status);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_clog_seed_set(pages, page_lo, np, parsed.subxacts[i], status);
+		}
+	}
+	XLogReaderFree(reader);
+	pfree(pd);
+
+	/* Fail closed unless the window was fully covered: complete only if the scan
+	 * actually started (readfrom valid -- base's WAL segment was readable), ended
+	 * cleanly (no decode error), and the readable WAL extends through target.  An
+	 * unreadable start (recycled base segment), a decode error (errm), or target beyond
+	 * the readable WAL is a short read -- never seed a clog that skipped (base, target].
+	 * (ps_local_wal_limit is replay-aware, so this also holds on a standby.) */
+	if (scanned < target && target != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot seed clog as of %X/%08X",
+						LSN_FORMAT_ARGS(target))));
+	for (p = 0; p < np; p++)
+		if (!established[p])
+			ereport(ERROR,
+					(errmsg("pagestore: base clog snapshot for page %lld is absent at %X/%08X",
+							(long long) (page_lo + p), LSN_FORMAT_ARGS(base))));
+
+	/*
+	 * Publish atomically at directory granularity: stage every segment under a
+	 * sibling pg_xact.tmp, fsync it, then swap the whole directory into place with a
+	 * single rename().  Any failure -- a write, an fsync, a missing base -- leaves
+	 * only the staging directory, never a partly-populated live pg_xact, so a
+	 * multi-segment seed is all-or-nothing even if it aborts between segments.
+	 */
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	snprintf(dstdir, sizeof(dstdir), "%s/pg_xact", target_dir);
+	snprintf(stagedir, sizeof(stagedir), "%s/pg_xact.tmp", target_dir);
+	/* Start from an empty staging dir.  A leftover pg_xact.tmp from an interrupted
+	 * retry could hold hex-named segments outside this seed's [seg_lo, seg_hi]; those
+	 * stale files would survive the rename and pollute the branch's live pg_xact, so
+	 * remove the whole staging dir first rather than reusing it. */
+	if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
+	if (MakePGDirectory(stagedir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+
+	for (seg = seg_lo; seg <= seg_hi; seg++)
+	{
+		char		segpath[MAXPGPATH];
+		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
+		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
+		int			fd;
+
+		if (last > page_hi)
+			last = page_hi;
+		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
+		fd = OpenTransientFilePerm(segpath,
+								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+								   pg_file_create_mode);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch segment \"%s\": %m", segpath)));
+		for (p = first; p <= last; p++)
+		{
+			if (write(fd, pages + (p - page_lo) * BLCKSZ, BLCKSZ) != BLCKSZ)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write branch segment \"%s\": %m", segpath)));
+			}
+			seeded++;
+		}
+		if (pg_fsync(fd) != 0)
+		{
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync branch segment \"%s\": %m", segpath)));
+		}
+		/* a close error can surface a deferred write failure -- fail the seed */
+		if (CloseTransientFile(fd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close branch segment \"%s\": %m", segpath)));
+	}
+	fsync_fname(stagedir, true);	/* segment entries durable inside the staging dir */
+	/*
+	 * A branch datadir is initdb'd, so pg_xact already exists with BootStrapCLOG's
+	 * 0000; rename() onto a non-empty directory fails with ENOTEMPTY.  Remove the
+	 * default first, then swap the staged dir in.  (The branch is not yet running, and
+	 * a crash in the gap is recoverable by re-seeding -- the staging dir is rebuilt.)
+	 */
+	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing clog dir \"%s\"", dstdir)));
+	if (rename(stagedir, dstdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch clog \"%s\": %m", dstdir)));
+	fsync_fname(target_dir, true);	/* the now-live pg_xact directory entry */
+
+	PG_RETURN_INT64(seeded);
 }
 
 void

@@ -336,6 +336,32 @@ assert "$sA" "1" "applier: xid committed at/below L is COMMITTED as-of L"
 assert "$sB" "0" "applier: xid committed after L is IN-PROGRESS as-of L (no page coalescing)"
 assert "$sBmax" "1" "applier: that same xid IS committed when replayed to max LSN"
 
+# --- 18. branch-create clog seeding (M4 step 3) -------------------------------------
+# Materialize a new branch's clog as-of L (base snapshot over the fork's xid horizon +
+# replay) into a branch dir whose pg_xact already exists, as in an initdb'd datadir, and
+# require the published segment to equal the reconstructed as-of-L page.
+$P -c "CREATE FUNCTION pagestore_seed_clog(text, pg_lsn, pg_lsn, xid, xid) RETURNS bigint
+        AS 'pagestore','pagestore_seed_clog' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_clog_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_clog_page_asof' LANGUAGE C STRICT;" >/dev/null
+SEEDDIR=$(mktemp -d)
+mkdir -p "$SEEDDIR/pg_xact"; : > "$SEEDDIR/pg_xact/0000"   # the initdb default clog to replace
+# fork horizon: this cluster never truncates, so oldest is the first normal xid; next_xid
+# bounds the highest seeded page (derived from the fork, not the parent's live pg_xact)
+nxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
+seeded=$($P -c "SELECT pagestore_seed_clog('$SEEDDIR', '$base', '$L', '3'::xid, '$nxid'::xid);")
+if [ "${seeded:-0}" -gt 0 ]; then
+	echo "ok   - seeded $seeded clog page(s) into the branch dir as-of L (replacing existing pg_xact)"
+else
+	echo "FAIL - no clog pages seeded"; fail=1
+fi
+sseg=$($P -c "SELECT name FROM pg_ls_dir('pg_xact') AS name ORDER BY name LIMIT 1;")
+spageno=$(( 16#$sseg * 32 ))
+recon_md5=$($P -c "SELECT md5(pagestore_clog_page_asof($spageno, '$base', '$L'));")
+seed_md5=$($P -c "SELECT md5(pg_read_binary_file('$SEEDDIR/pg_xact/$sseg', 0, 8192));")
+assert "$seed_md5" "$recon_md5" "seeded branch clog page == the reconstructed as-of-L page"
+rm -rf "$SEEDDIR"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
