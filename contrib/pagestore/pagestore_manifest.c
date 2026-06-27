@@ -429,6 +429,40 @@ manifest_record_valid_at(int fd, off_t off, off_t file_size, int v2,
 	return 1;
 }
 
+/*
+ * Is the record at 'off' actually a v3 record whose version word was corrupted away
+ * from 3 (rather than a genuine legacy v2 record)?  A v2 record has no CRC, so it
+ * cannot be told from a version-flipped v3 record by the header alone; but the v3
+ * CRC covers the version field, so recomputing it with the version forced back to 3
+ * confirms the bytes were a v3 record.  Used to reject a downgraded v3 first record
+ * before the whole file is (mis)classified as v2 and read without CRC checks.
+ */
+static int
+manifest_record_is_corrupted_v3(int fd, off_t off, off_t file_size)
+{
+	PsManifestRecord rec,
+				probe;
+	unsigned char buf[sizeof(PsManifestLayerDisk)];
+	int			plen;
+
+	if (off < 0 || off + (off_t) sizeof(rec) > file_size)
+		return 0;				/* a full v3 record does not fit -> not v3 */
+	if (pread(fd, &rec, sizeof(rec), off) != (ssize_t) sizeof(rec) ||
+		rec.magic != PS_MANIFEST_MAGIC)
+		return 0;
+	plen = manifest_type_payload_len(rec.type);
+	if (plen < 0 || (size_t) plen > sizeof(buf) || rec.len != (uint32_t) plen)
+		return 0;
+	if (off + (off_t) sizeof(rec) + plen > file_size)
+		return 0;
+	if (plen > 0 &&
+		pread(fd, buf, (size_t) plen, off + (off_t) sizeof(rec)) != (ssize_t) plen)
+		return 0;
+	probe = rec;
+	probe.version = PS_MANIFEST_VERSION;	/* what it was before the flip */
+	return manifest_record_crc(&probe, buf, (uint32_t) plen) == rec.crc;
+}
+
 int
 ps_manifest_replay(PsLayerMap *map)
 {
@@ -438,14 +472,6 @@ ps_manifest_replay(PsLayerMap *map)
 	int			file_v2;
 	off_t		file_size;
 	struct stat st;
-
-	/*
-	 * The most bytes one record can occupy on disk (header + the largest payload).
-	 * A record after a corrupt one is contiguous, so it cannot begin farther than
-	 * this past the corrupt record -- which bounds the torn-tail probe below.
-	 */
-	const off_t max_record = (off_t) sizeof(PsManifestRecord) +
-		(off_t) sizeof(PsManifestLayerDisk);
 
 	manifest_nrecords = 0;
 	fd = open(manifest_path, O_RDWR);
@@ -464,12 +490,13 @@ ps_manifest_replay(PsLayerMap *map)
 
 	/*
 	 * Decide the whole file's format from its first record: a manifest is entirely
-	 * v3 (per-record CRC) or entirely legacy v2 (no CRC), never a mix.  Probing the
-	 * first record as v3 first means a v3 record whose version was bit-flipped to 2
-	 * is not reinterpreted as an unchecked v2 record (it just fails the v3 probe and
-	 * is handled as corruption below) -- only a genuine v2 file, whose first record
-	 * is a valid v2 record, is read without CRC.  A v2 file is migrated to v3 after
-	 * replay so this branch is taken at most once per store.
+	 * v3 (per-record CRC) or entirely legacy v2 (no CRC), never a mix.  Probe v3
+	 * first; only if that fails AND the record is not a version-corrupted v3 record
+	 * (which has no CRC of its own to catch the flip, so we re-check its CRC with the
+	 * version forced back to 3) do we read the file as legacy v2.  This keeps a v3
+	 * record whose version word was flipped to 2 from being reinterpreted as an
+	 * unchecked v2 record.  A v2 file is migrated to v3 after replay, so this is
+	 * taken at most once per store.
 	 */
 	{
 		PsManifestRecord r0;
@@ -482,12 +509,13 @@ ps_manifest_replay(PsLayerMap *map)
 										  sizeof(b0), &s0))
 			file_v2 = 0;
 		else if (manifest_record_valid_at(fd, 0, file_size, 1, &r0, b0,
-										  sizeof(b0), &s0))
+										  sizeof(b0), &s0) &&
+				 !manifest_record_is_corrupted_v3(fd, 0, file_size))
 			file_v2 = 1;
 		else
-			file_v2 = 0;		/* not a valid first record either way; the v3 path
-								 * below truncates a torn/garbage start as an empty
-								 * manifest (nothing was committed) */
+			file_v2 = 0;		/* a v3 file (possibly with a corrupt/torn first
+								 * record, handled as corruption below) -- never read
+								 * a version-flipped v3 record as unchecked v2 */
 	}
 
 	while (good_off < file_size)
@@ -510,17 +538,18 @@ ps_manifest_replay(PsLayerMap *map)
 		{
 			/*
 			 * No intact record begins at rec_off: it is corrupt or torn.  Treat it
-			 * as a recoverable torn tail only if no intact record begins after it
-			 * -- then the damage is confined to the final record and the earlier
-			 * entries survive.  If an intact record does follow, this is interior
-			 * corruption and we must fail rather than truncate valid history (or
-			 * resurrect a dropped layer).  A following record is contiguous, so it
-			 * begins within one max_record of rec_off; that bounds the probe and
-			 * keeps a corrupted type/len/magic from being trusted to size anything.
+			 * as a recoverable torn tail only if no intact record begins anywhere
+			 * after it -- then the damage is confined to the final record(s) and the
+			 * earlier entries survive.  If an intact record does follow, this is
+			 * interior corruption and we must fail rather than truncate valid history
+			 * (or resurrect a dropped layer).  Scan all the way to EOF, not just one
+			 * record ahead: several adjacent records can be corrupt, so the next
+			 * intact one may be far past rec_off.  This runs only on a corrupt/torn
+			 * replay, and the per-offset probe rejects on the magic word before
+			 * touching a payload, so it stays cheap.
 			 */
 			interior = 0;
-			for (scan = rec_off + 1;
-				 scan <= rec_off + max_record && scan < file_size; scan++)
+			for (scan = rec_off + 1; scan < file_size; scan++)
 			{
 				PsManifestRecord prec;
 				union

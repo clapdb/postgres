@@ -461,7 +461,11 @@ test_manifest_v2_migration(void)
 		close(fd);
 	check(sz > 20, "v2: read v3 bytes");
 	memcpy(v2, v3, 16);				/* magic, version, type, len */
-	v2[4] = 2;						/* version 3 -> 2 (LE low byte; rest already 0) */
+	{
+		uint32_t	two = 2;		/* set the version word in host byte order */
+
+		memcpy(v2 + 4, &two, sizeof(two));
+	}
 	memcpy(v2 + 16, v3 + 20, (size_t) (sz - 20));	/* payload, sans the 4-byte crc */
 	fd = open(mpath, O_WRONLY | O_TRUNC, 0600);
 	check(fd >= 0 && write(fd, v2, (size_t) (sz - 4)) == (ssize_t) (sz - 4),
@@ -491,6 +495,87 @@ test_manifest_v2_migration(void)
 	check(ps_manifest_open(dir) == 0 &&
 		  ps_manifest_replay(&ps_layer_map) == 0 && find_layer(7),
 		  "the migrated v3 manifest re-replays");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+}
+
+/*
+ * A v3 first record whose version word is flipped to 2 must NOT be reinterpreted as
+ * a legacy v2 record (which would skip the CRC and install a shifted bogus layer):
+ * the version-forced CRC re-check recognizes it as a corrupted v3 record, so it is
+ * dropped, not installed.  (The later-record case is covered elsewhere; this is the
+ * first record, which decides the whole file's format.)
+ */
+static void
+test_manifest_v3_first_downgrade(void)
+{
+	char		dir[] = "/tmp/psv3dgXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d1;
+	int			fd;
+	uint32_t	two = 2;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "v3-downgrade: setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d1 = synth_layer(9, dir);
+	check(ps_manifest_add_layer(&d1) == 0, "v3-downgrade: one v3 ADD");
+	ps_manifest_close();
+	/* flip the version word 3 -> 2 in place, keeping the v3 20-byte layout + CRC */
+	fd = open(mpath, O_WRONLY);
+	check(fd >= 0 && pwrite(fd, &two, sizeof(two), 4) == (ssize_t) sizeof(two),
+		  "v3-downgrade: poke version word to 2");
+	if (fd >= 0)
+		close(fd);
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "version-downgraded v3 first record does not error");
+	check(ps_layer_map_count(&ps_layer_map) == 0 && !find_layer(9),
+		  "  ... and is dropped, not installed as a bogus v2 layer");
+	ps_manifest_close();
+	unlink(mpath);
+	rmdir(dir);
+}
+
+/*
+ * Corruption can span several adjacent records, so the torn-tail probe must scan to
+ * EOF, not just one record ahead: with two corrupt ADDs followed by an intact one,
+ * replay must report interior corruption (fail), not truncate the whole file.
+ */
+static void
+test_manifest_spanning_corruption(void)
+{
+	char		dir[] = "/tmp/psspanXXXXXX";
+	char		mpath[4096];
+	PsLayerDesc d;
+	struct stat st;
+	off_t		add1;
+
+	if (!mkdtemp(dir) || ps_manifest_open(dir) != 0)
+	{
+		check(0, "spanning: setup");
+		return;
+	}
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	d = synth_layer(1, dir);
+	check(ps_manifest_add_layer(&d) == 0 && stat(mpath, &st) == 0,
+		  "spanning: first ADD");
+	add1 = st.st_size;			/* every ADD record is this size */
+	d = synth_layer(2, dir);
+	check(ps_manifest_add_layer(&d) == 0, "spanning: second ADD");
+	d = synth_layer(3, dir);
+	check(ps_manifest_add_layer(&d) == 0, "spanning: third ADD");
+	ps_manifest_close();
+	/* corrupt the payload CRC of records 1 and 2; leave record 3 intact */
+	corrupt_byte(mpath, 24);				/* record 1 payload */
+	corrupt_byte(mpath, add1 + 24);			/* record 2 payload */
+	check(ps_manifest_open(dir) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) != 0,
+		  "two corrupt records before an intact one = interior corruption (fail)");
 	ps_manifest_close();
 	unlink(mpath);
 	rmdir(dir);
@@ -712,6 +797,8 @@ main(void)
 	test_manifest_len_corruption();
 	test_manifest_replay_robustness();
 	test_manifest_v2_migration();
+	test_manifest_v3_first_downgrade();
+	test_manifest_spanning_corruption();
 
 	printf("pagestore_gc_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
