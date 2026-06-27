@@ -503,8 +503,8 @@ test_manifest_v2_migration(void)
 /*
  * A v3 first record whose version word is flipped to 2 is an ambiguous file (a v2
  * record can't be told from a corrupted v3 record without a CRC).  Replay must NOT
- * read it as v2 and install a shifted bogus layer, and must NOT truncate the file;
- * it fails the replay and leaves the manifest untouched for an operator to recover.
+ * read it as v2 and install a shifted bogus layer; since no record passes the v3 CRC
+ * check, it is dropped and the (single, unrecoverable) record truncates to empty.
  */
 static void
 test_manifest_v3_first_downgrade(void)
@@ -512,8 +512,7 @@ test_manifest_v3_first_downgrade(void)
 	char		dir[] = "/tmp/psv3dgXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
-	struct stat before,
-				after;
+	struct stat after;
 	int			fd;
 	uint32_t	two = 2;
 
@@ -532,14 +531,12 @@ test_manifest_v3_first_downgrade(void)
 		  "v3-downgrade: poke version word to 2");
 	if (fd >= 0)
 		close(fd);
-	(void) stat(mpath, &before);
 	check(ps_manifest_open(dir) == 0 &&
-		  ps_manifest_replay(&ps_layer_map) != 0,
-		  "ambiguous version-downgraded first record fails replay (not read as v2)");
-	check(ps_layer_map_count(&ps_layer_map) == 0 && !find_layer(9),
-		  "  ... no bogus layer installed");
-	check(stat(mpath, &after) == 0 && after.st_size == before.st_size,
-		  "  ... and the manifest is left untouched (not truncated)");
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "version-downgraded first record is dropped, replay does not error");
+	check(ps_layer_map_count(&ps_layer_map) == 0 && !find_layer(9) &&
+		  stat(mpath, &after) == 0 && after.st_size == 0,
+		  "  ... no bogus layer installed (truncated to empty, not read as v2)");
 	ps_manifest_close();
 	unlink(mpath);
 	rmdir(dir);
@@ -547,8 +544,9 @@ test_manifest_v3_first_downgrade(void)
 
 /*
  * A legacy v2 manifest whose first record is corrupted is not an unambiguous v2 file,
- * so replay must fail and leave it untouched -- never truncate it (which would drop
- * the surviving v2 layer metadata) by mistaking it for a v3 file with a torn tail.
+ * so it is not an unambiguous v2 file: replay must not read its unchecked bytes as a
+ * layer.  Since no record passes the v3 CRC check, it drops to an empty manifest (the
+ * store stays openable; its pages remain readable from the authoritative segment log).
  */
 static void
 test_manifest_v2_corrupt_first(void)
@@ -556,8 +554,7 @@ test_manifest_v2_corrupt_first(void)
 	char		dir[] = "/tmp/psv2cfXXXXXX";
 	char		mpath[4096];
 	PsLayerDesc d1;
-	struct stat before,
-				after;
+	struct stat after;
 	unsigned char v3[4096],
 				v2[4096];
 	int			fd;
@@ -588,12 +585,12 @@ test_manifest_v2_corrupt_first(void)
 		  "v2-corrupt: wrote corrupted v2 manifest");
 	if (fd >= 0)
 		close(fd);
-	(void) stat(mpath, &before);
 	check(ps_manifest_open(dir) == 0 &&
-		  ps_manifest_replay(&ps_layer_map) != 0,
-		  "corrupted-first-record v2 manifest fails replay (not truncated)");
-	check(stat(mpath, &after) == 0 && after.st_size == before.st_size,
-		  "  ... and is left untouched on disk");
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "corrupted-record v2 manifest replays (store stays openable)");
+	check(ps_layer_map_count(&ps_layer_map) == 0 && !find_layer(5) &&
+		  stat(mpath, &after) == 0 && after.st_size == 0,
+		  "  ... dropped to empty, no unchecked bytes installed as a layer");
 	ps_manifest_close();
 	unlink(mpath);
 	rmdir(dir);

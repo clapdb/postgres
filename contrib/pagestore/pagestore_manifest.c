@@ -458,36 +458,6 @@ manifest_scan_clean_v2(int fd, off_t file_size)
 	return off == file_size;	/* landed exactly on EOF -> clean v2 */
 }
 
-/*
- * Is the manifest's first record an incomplete (torn) record -- an append that was
- * interrupted before the record was fully written?  True only when our magic is at
- * the start but the record the header describes runs past EOF; a full record (even
- * one with a bad CRC), foreign bytes, or an unknown type is NOT torn.  A torn first
- * record means nothing was durably committed, so replay can safely truncate it away
- * to an openable empty manifest instead of refusing to start.
- */
-static int
-manifest_first_record_torn(int fd, off_t file_size)
-{
-	PsManifestRecord rec;
-	uint32_t	magic = 0;
-	int			plen;
-
-	if (file_size <= 0)
-		return 0;
-	if (pread(fd, &magic, sizeof(magic), 0) != (ssize_t) sizeof(magic) ||
-		magic != PS_MANIFEST_MAGIC)
-		return 0;				/* no/foreign magic -> not a torn write of ours */
-	if (file_size < (off_t) sizeof(rec))
-		return 1;				/* magic present but the header is truncated */
-	if (pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec))
-		return 0;
-	plen = manifest_type_payload_len(rec.type);
-	if (plen < 0)
-		return 0;				/* unknown type on a full header -> corruption */
-	return file_size < (off_t) sizeof(rec) + plen;	/* payload truncated -> torn */
-}
-
 int
 ps_manifest_replay(PsLayerMap *map)
 {
@@ -516,37 +486,32 @@ ps_manifest_replay(PsLayerMap *map)
 	/*
 	 * Decide the whole file's format: a manifest is entirely v3 (per-record CRC) or
 	 * entirely legacy v2 (no CRC), never a mix.  Because v2 has no CRC, a corrupted
-	 * v3 record and a v2 record are indistinguishable by inspection, so we do not
-	 * guess from the first record alone:
+	 * v3 record and a v2 record (or a v2 record followed by a torn tail) are
+	 * indistinguishable by inspection, so we never read an ambiguous record as v2:
 	 *   - a valid v3 first record  -> v3 file (the per-record CRC anchors the rest);
 	 *   - else if the ENTIRE file parses cleanly as v2 -> a genuine v2 file, which we
 	 *     replay and then migrate to v3 in place;
-	 *   - else if the first record is an incomplete (torn) write -> nothing was
-	 *     committed, so let the loop below truncate it to an openable empty manifest;
-	 *   - else (a corrupted v3 file, a damaged v2 file, or garbage) -> fail the
-	 *     replay WITHOUT truncating, so no real metadata is silently emptied and no
-	 *     ambiguous bytes are installed as an unchecked v2 layer; an operator can
-	 *     migrate offline or recreate the store.
+	 *   - else -> treat it as v3 and let the loop below decide.  Because no ambiguous
+	 *     record can pass the v3 (CRC) check, the loop never installs a bogus layer
+	 *     from it: a torn/corrupt-then-nothing tail truncates to an openable empty
+	 *     manifest, while corruption with valid v3 records after it fails as interior
+	 *     corruption.  A damaged or torn-tailed legacy v2 file therefore comes up
+	 *     empty (its layer files are reclaimable by GC and its pages stay readable
+	 *     from the authoritative segment log) rather than wedging the store or
+	 *     installing unchecked bytes.
 	 */
 	{
 		PsManifestRecord r0;
 		unsigned char b0[sizeof(PsManifestLayerDisk)];
 		off_t		s0;
 
-		if (file_size == 0)
-			file_v2 = 0;		/* empty: the loop below does nothing, returns 0 */
-		else if (manifest_record_valid_at(fd, 0, file_size, 0, &r0, b0,
-										  sizeof(b0), &s0))
-			file_v2 = 0;
+		if (file_size > 0 &&
+			manifest_record_valid_at(fd, 0, file_size, 0, &r0, b0, sizeof(b0), &s0))
+			file_v2 = 0;		/* a v3 manifest */
 		else if (manifest_scan_clean_v2(fd, file_size))
-			file_v2 = 1;
-		else if (manifest_first_record_torn(fd, file_size))
-			file_v2 = 0;		/* torn first append: the loop truncates to empty */
+			file_v2 = 1;		/* an entirely-clean legacy v2 manifest -> migrate */
 		else
-		{
-			close(fd);
-			return -1;
-		}
+			file_v2 = 0;		/* ambiguous/torn/corrupt -> the v3 loop drops it */
 	}
 
 	while (good_off < file_size)
