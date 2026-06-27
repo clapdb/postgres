@@ -430,37 +430,32 @@ manifest_record_valid_at(int fd, off_t off, off_t file_size, int v2,
 }
 
 /*
- * Is the record at 'off' actually a v3 record whose version word was corrupted away
- * from 3 (rather than a genuine legacy v2 record)?  A v2 record has no CRC, so it
- * cannot be told from a version-flipped v3 record by the header alone; but the v3
- * CRC covers the version field, so recomputing it with the version forced back to 3
- * confirms the bytes were a v3 record.  Used to reject a downgraded v3 first record
- * before the whole file is (mis)classified as v2 and read without CRC checks.
+ * Is the whole file, byte 0 to EOF, an unbroken run of valid legacy v2 records?
+ * v2 has no CRC, so a single v2 record cannot be told apart from a corrupted v3
+ * record by inspection.  We therefore only treat a file as v2 when *every* record
+ * parses cleanly as v2 right up to EOF: any invalid record, gap, or trailing bytes
+ * means it is not an unambiguous v2 manifest (a corrupted v3 file, or a damaged v2
+ * file), and the caller refuses to read it as v2 rather than guess.
  */
 static int
-manifest_record_is_corrupted_v3(int fd, off_t off, off_t file_size)
+manifest_scan_clean_v2(int fd, off_t file_size)
 {
-	PsManifestRecord rec,
-				probe;
-	unsigned char buf[sizeof(PsManifestLayerDisk)];
-	int			plen;
+	off_t		off = 0;
 
-	if (off < 0 || off + (off_t) sizeof(rec) > file_size)
-		return 0;				/* a full v3 record does not fit -> not v3 */
-	if (pread(fd, &rec, sizeof(rec), off) != (ssize_t) sizeof(rec) ||
-		rec.magic != PS_MANIFEST_MAGIC)
+	if (file_size == 0)
 		return 0;
-	plen = manifest_type_payload_len(rec.type);
-	if (plen < 0 || (size_t) plen > sizeof(buf) || rec.len != (uint32_t) plen)
-		return 0;
-	if (off + (off_t) sizeof(rec) + plen > file_size)
-		return 0;
-	if (plen > 0 &&
-		pread(fd, buf, (size_t) plen, off + (off_t) sizeof(rec)) != (ssize_t) plen)
-		return 0;
-	probe = rec;
-	probe.version = PS_MANIFEST_VERSION;	/* what it was before the flip */
-	return manifest_record_crc(&probe, buf, (uint32_t) plen) == rec.crc;
+	while (off < file_size)
+	{
+		PsManifestRecord rec;
+		unsigned char buf[sizeof(PsManifestLayerDisk)];
+		off_t		rec_size;
+
+		if (!manifest_record_valid_at(fd, off, file_size, 1, &rec, buf,
+									  sizeof(buf), &rec_size))
+			return 0;
+		off += rec_size;
+	}
+	return off == file_size;	/* landed exactly on EOF -> clean v2 */
 }
 
 int
@@ -489,14 +484,17 @@ ps_manifest_replay(PsLayerMap *map)
 	file_size = st.st_size;
 
 	/*
-	 * Decide the whole file's format from its first record: a manifest is entirely
-	 * v3 (per-record CRC) or entirely legacy v2 (no CRC), never a mix.  Probe v3
-	 * first; only if that fails AND the record is not a version-corrupted v3 record
-	 * (which has no CRC of its own to catch the flip, so we re-check its CRC with the
-	 * version forced back to 3) do we read the file as legacy v2.  This keeps a v3
-	 * record whose version word was flipped to 2 from being reinterpreted as an
-	 * unchecked v2 record.  A v2 file is migrated to v3 after replay, so this is
-	 * taken at most once per store.
+	 * Decide the whole file's format: a manifest is entirely v3 (per-record CRC) or
+	 * entirely legacy v2 (no CRC), never a mix.  Because v2 has no CRC, a corrupted
+	 * v3 record and a v2 record are indistinguishable by inspection, so we do not
+	 * guess from the first record alone:
+	 *   - a valid v3 first record  -> v3 file (the per-record CRC anchors the rest);
+	 *   - else if the ENTIRE file parses cleanly as v2 -> a genuine v2 file, which we
+	 *     replay and then migrate to v3 in place;
+	 *   - else (a corrupted v3 file, a damaged v2 file, or garbage) -> fail the
+	 *     replay WITHOUT truncating, so no real metadata is silently emptied and no
+	 *     ambiguous bytes are installed as an unchecked v2 layer; an operator can
+	 *     migrate offline or recreate the store.
 	 */
 	{
 		PsManifestRecord r0;
@@ -504,18 +502,17 @@ ps_manifest_replay(PsLayerMap *map)
 		off_t		s0;
 
 		if (file_size == 0)
-			file_v2 = 0;
+			file_v2 = 0;		/* empty: the loop below does nothing, returns 0 */
 		else if (manifest_record_valid_at(fd, 0, file_size, 0, &r0, b0,
 										  sizeof(b0), &s0))
 			file_v2 = 0;
-		else if (manifest_record_valid_at(fd, 0, file_size, 1, &r0, b0,
-										  sizeof(b0), &s0) &&
-				 !manifest_record_is_corrupted_v3(fd, 0, file_size))
+		else if (manifest_scan_clean_v2(fd, file_size))
 			file_v2 = 1;
 		else
-			file_v2 = 0;		/* a v3 file (possibly with a corrupt/torn first
-								 * record, handled as corruption below) -- never read
-								 * a version-flipped v3 record as unchecked v2 */
+		{
+			close(fd);
+			return -1;
+		}
 	}
 
 	while (good_off < file_size)
