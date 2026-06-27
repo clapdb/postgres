@@ -102,6 +102,14 @@ PsLayerMap ps_layer_map;
  */
 static int	manifest_poisoned = 0;
 
+/*
+ * Records currently in the on-disk log (set by replay, bumped by append, reset by
+ * compaction).  The log is append-only, so add/delete churn makes it grow without
+ * bound; ps_manifest_should_compact() uses this to decide when to rewrite it down
+ * to one ADD_LAYER per live layer (ps_manifest_compact()), bounding replay time.
+ */
+static uint64_t manifest_nrecords = 0;
+
 static int
 manifest_fsync_dir(void)
 {
@@ -116,10 +124,26 @@ manifest_fsync_dir(void)
 	return rc;
 }
 
+/* Write one [header | payload] record to an open fd (no fsync). */
+static int
+manifest_write_record(int fd, uint32_t type, const void *payload, uint32_t len)
+{
+	PsManifestRecord rec;
+
+	rec.magic = PS_MANIFEST_MAGIC;
+	rec.version = PS_MANIFEST_VERSION;
+	rec.type = type;
+	rec.len = len;
+
+	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
+		(len > 0 && write(fd, payload, len) != (ssize_t) len))
+		return -1;
+	return 0;
+}
+
 static int
 manifest_append(uint32_t type, const void *payload, uint32_t len)
 {
-	PsManifestRecord rec;
 	int			fd;
 	int			rc = 0;
 	int			created = 0;
@@ -134,13 +158,7 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	if (lseek(fd, 0, SEEK_END) == 0)
 		created = 1;
 
-	rec.magic = PS_MANIFEST_MAGIC;
-	rec.version = PS_MANIFEST_VERSION;
-	rec.type = type;
-	rec.len = len;
-
-	if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
-		(len > 0 && write(fd, payload, len) != (ssize_t) len))
+	if (manifest_write_record(fd, type, payload, len) != 0)
 		rc = -1;
 	if (fsync(fd) != 0)
 		rc = -1;
@@ -150,6 +168,8 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	if (rc != 0)
 		/* a partial write/fsync may have torn the tail */
 		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
+	else
+		manifest_nrecords++;
 	return rc;
 }
 
@@ -293,6 +313,7 @@ ps_manifest_open(const char *store_dir)
 		return -1;
 	/* replay truncates any torn tail; start clean */
 	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
+	manifest_nrecords = 0;
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }
@@ -325,6 +346,7 @@ ps_manifest_replay(PsLayerMap *map)
 	off_t		file_size;
 	struct stat st;
 
+	manifest_nrecords = 0;
 	fd = open(manifest_path, O_RDWR);
 	if (fd < 0)
 	{
@@ -510,6 +532,7 @@ ps_manifest_replay(PsLayerMap *map)
 			close(fd);
 			return -1;
 		}
+		manifest_nrecords++;
 	}
 
 done:
@@ -586,5 +609,84 @@ ps_manifest_remove_layer(uint64_t layer_id)
 	if (manifest_append(PS_MANIFEST_REMOVE_LAYER, &ev, sizeof(ev)) != 0)
 		return -1;
 	manifest_remove_from_map(&ps_layer_map, layer_id);
+	return 0;
+}
+
+/*
+ * Should the log be rewritten?  True once it has grown well past the live layer
+ * count (add/seal/delete churn appends records the live set no longer needs), so
+ * replay stays bounded.  Never while poisoned -- a restart recovers that first.
+ */
+int
+ps_manifest_should_compact(void)
+{
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
+		return 0;
+	return manifest_nrecords >= 64 &&
+		manifest_nrecords > 4 * ((uint64_t) ps_layer_map.nlayers + 1);
+}
+
+/*
+ * Rewrite the log to one ADD_LAYER record per current layer (an ADD encodes every
+ * flag -- deleting, remote_durable, ... -- and replay restores them, so one record
+ * fully captures a layer's state).  Atomic via a temp file + rename + dir fsync:
+ * a crash before the rename leaves the old full log intact; after it, the new
+ * compacted log; both replay to the same layer map.  Caller must hold the state
+ * stable (no concurrent map mutation) across this.
+ */
+int
+ps_manifest_compact(void)
+{
+	char		tmp[4096];
+	int			fd;
+	int			rc = 0;
+	uint64_t	nrec = 0;
+	int			n;
+
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
+		return -1;
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", manifest_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		return -1;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers && rc == 0; i++)
+	{
+		PsManifestLayerDisk disk;
+
+		if (manifest_encode_layer(&disk, &ps_layer_map.layers[i]) != 0 ||
+			manifest_write_record(fd, PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
+			rc = -1;
+		else
+			nrec++;
+	}
+	if (rc == 0 && fsync(fd) != 0)
+		rc = -1;
+	close(fd);
+	if (rc != 0)
+	{
+		unlink(tmp);			/* never touched the live manifest */
+		return -1;
+	}
+	if (rename(tmp, manifest_path) != 0)
+	{
+		unlink(tmp);
+		return -1;
+	}
+	if (manifest_fsync_dir() != 0)
+	{
+		/*
+		 * The rename is in place but its durability is unconfirmed (the directory
+		 * fsync failed -- the disk is misbehaving).  Poison so no further append
+		 * lands until a restart re-establishes a known-durable manifest, matching
+		 * the fail-stop policy for any other manifest write/fsync error.  Atomic:
+		 * a concurrent shard may read the flag without the map lock.
+		 */
+		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
+		return -1;
+	}
+	manifest_nrecords = nrec;
 	return 0;
 }
