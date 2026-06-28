@@ -456,6 +456,30 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsB'::xid, '$ctsC', '$ctsL',
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', ('$ctsA'::xid::text::bigint + 1)::text::xid) IS NULL;")" "t" \
 	"commit-ts: a xid below the as-of-L horizon (oldestCommitTsXid) returns NULL despite stale page bytes"
 
+# --- 21. commit-ts seeder: materialize a branch's commit-ts as-of L (atomic publish) ----
+# Same shape as the clog seeder: reconstruct the commit-ts pages over the fork horizon and
+# atomically publish them; the seeded segment must equal the reconstructed as-of-L page.
+$P -c "CREATE FUNCTION pagestore_seed_commit_ts(text, pg_lsn, pg_lsn, xid, xid) RETURNS bigint
+        AS 'pagestore','pagestore_seed_commit_ts' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;" >/dev/null
+CTSDIR=$(mktemp -d)
+mkdir -p "$CTSDIR/pg_commit_ts"; : > "$CTSDIR/pg_commit_ts/0000"   # the initdb default to replace
+ctsNext=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
+# commit-ts only has pages around the activated xid range, so seed the horizon from xidA
+ctsSeeded=$($P -c "SELECT pagestore_seed_commit_ts('$CTSDIR', '$ctsC', '$ctsL', '$ctsA'::xid, '$ctsNext'::xid);")
+if [ "${ctsSeeded:-0}" -gt 0 ]; then
+	echo "ok   - seeded $ctsSeeded commit-ts page(s) into the branch dir as-of L (replacing existing pg_commit_ts)"
+else
+	echo "FAIL - no commit-ts pages seeded"; fail=1
+fi
+ctsSeg=$(ls "$CTSDIR/pg_commit_ts" 2>/dev/null | sort | head -1)
+ctsPageno=$(( 16#$ctsSeg * 32 ))
+ctsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPageno, '$ctsC', '$ctsL'));")
+ctsSeed=$($P -c "SELECT md5(pg_read_binary_file('$CTSDIR/pg_commit_ts/$ctsSeg', 0, 8192));")
+assert "$ctsSeed" "$ctsRecon" "seeded branch commit-ts page == the reconstructed as-of-L page"
+rm -rf "$CTSDIR"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
