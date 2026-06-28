@@ -275,6 +275,33 @@ sleep 0.5
 crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-log recovery)"
 
+# --- 16. SLRU snapshot shipping (M4 step 1): ship clog to the store, keyed by C ----
+# CHECKPOINT flushes pg_xact to a clean on-disk image; the single-client test has no
+# concurrent commits, so the current LSN bounds it (a valid quiescent cutoff C).  Ship
+# it and require: the shipped page reads back as-of C identical to the on-disk page,
+# and is NOT visible below C (i.e. it is versioned by C, not a daemon counter).
+$P -c "CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_slru_read_at(text, int, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_slru_read_at' LANGUAGE C STRICT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+cutoff=$($P -c "SELECT pg_current_wal_lsn();")
+seg=$($P -c "SELECT name FROM pg_ls_dir('pg_xact') AS name ORDER BY name LIMIT 1;")
+pageno=$(( 16#$seg * 32 ))			# first page of the lowest clog segment
+shipped=$($P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$cutoff');")
+if [ "${shipped:-0}" -gt 0 ]; then
+	echo "ok   - shipped $shipped clog page(s) to the store (cutoff $cutoff)"
+else
+	echo "FAIL - no clog pages shipped"; fail=1
+fi
+local_md5=$($P -c "SELECT md5(pg_read_binary_file('pg_xact/$seg', 0, 8192));")
+store_md5=$($P -c "SELECT md5(pagestore_slru_read_at('pg_xact', $pageno, '$cutoff'));")
+assert "$store_md5" "$local_md5" "clog page read from the store as-of C matches the on-disk page"
+# below C the page has no version: the read reports a miss (NULL), not a zero page a
+# caller could mistake for real all-zero clog state
+before_null=$($P -c "SELECT pagestore_slru_read_at('pg_xact', $pageno, '0/1') IS NULL;")
+assert "$before_null" "t" "clog snapshot is not visible below its cutoff C (read misses -> NULL)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

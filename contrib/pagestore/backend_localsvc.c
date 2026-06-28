@@ -650,7 +650,7 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
  */
 void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
-							 BlockNumber block, const void *page)
+							 BlockNumber block, const void *page, uint64 version)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
@@ -675,6 +675,12 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	ch->skip_fsync = 0;
+	/*
+	 * For an SLRU-class object the daemon versions the write by req_lsn (the
+	 * caller's cutoff/dirtying LSN), so a snapshot reads back as-of an LSN >= that
+	 * version; ignored for other classes (relation = pd_lsn, control = counter).
+	 */
+	ch->req_lsn = version;
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec(ch);
 }
@@ -692,6 +698,34 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->nblocks = 1;
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
+}
+
+/*
+ * As-of read of a non-relation object block (honours branch ancestry).  Returns
+ * true if a version <= 'version' was found; on a miss returns false and leaves
+ * 'page' zero-filled (so callers can fail closed rather than read a phantom page).
+ * If 'resolved' is non-NULL, it receives the version actually resolved (the newest
+ * <= 'version'), so a caller wanting an exact-cutoff hit can compare it.
+ */
+bool
+pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+							   BlockNumber block, uint64 version, void *page,
+							   uint64 *resolved)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	bool		found;
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = version;
+	ls_exec(ch);
+	memcpy(page, ch->data, BLCKSZ);
+	found = ch->result != 0;
+	if (resolved)
+		*resolved = found ? ch->req_lsn : 0;		/* daemon wrote the resolved ver */
+	return found;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

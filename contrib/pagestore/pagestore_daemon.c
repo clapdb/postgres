@@ -96,15 +96,29 @@ handle_request(PsChannel *ch)
 			{
 				unsigned char *dst = ch->data + (size_t) i * page_size;
 
-				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst))
+				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst, NULL))
 					memset(dst, 0, page_size);	/* unwritten -> zeros */
 			}
 			break;
 
 		case PS_OP_READ_AT:
-			/* as-of read on this timeline, honoring branch ancestry */
-			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
-				memset(ch->data, 0, page_size);
+			/* as-of read on this timeline, honoring branch ancestry.  Report
+			 * found-ness in ch->result, and the resolved version back in ch->req_lsn,
+			 * so a caller can tell a real all-zero page from one that has no version
+			 * <= req_lsn, and an SLRU snapshot reader can require an exact-cutoff hit
+			 * (resolved == requested) rather than an older newest-<= image. */
+			{
+				uint64_t	resolved = 0;
+
+				if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data,
+								 &resolved))
+				{
+					ch->result = 1;
+					ch->req_lsn = resolved;
+				}
+				else
+					memset(ch->data, 0, page_size);	/* not found: result stays 0 */
+			}
 			break;
 
 		default:

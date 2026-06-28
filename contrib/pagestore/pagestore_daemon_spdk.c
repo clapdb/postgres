@@ -88,7 +88,12 @@ read_done(void *arg, int ok)
 	ReqState   *rs = bc->rs;
 
 	if (ok)						/* the engine delivered the page into bc->dst */
+	{
 		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
+		/* a READ_AT only counts as found once its page has actually landed */
+		if (rs->ch->opcode == PS_OP_READ_AT)
+			rs->ch->result = 1;
+	}
 	if (--rs->pending == 0)
 	{
 		rs->active = 0;			/* clear before publishing DONE */
@@ -229,13 +234,18 @@ begin(uint32_t i, PsChannel *ch)
 
 				if (!v)
 				{
-					memset(ch->data, 0, page_size);
+					memset(ch->data, 0, page_size);		/* not found: result 0 */
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
+				/* report the resolved version for an exact-cutoff SLRU read; defer
+				 * found-ness (ch->result) until the page actually lands, so a failed
+				 * async read does not advertise a zero-filled page as found */
+				ch->req_lsn = v->lsn;
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
 									  ch->data))
 				{
+					ch->result = 1;			/* served from RAM: page is present */
 					ps_store_release(&ch->state, PS_STATE_DONE);	/* RAM hit */
 					return;
 				}

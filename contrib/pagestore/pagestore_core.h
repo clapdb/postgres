@@ -85,7 +85,7 @@ extern int	read_version(const PageVer *v, unsigned char *out);
  * page is unwritten.
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
-						 uint64_t read_lsn, unsigned char *out);
+						 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver);
 extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
 
 /*

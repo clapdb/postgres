@@ -160,8 +160,12 @@ extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);
 extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
-										 BlockNumber block, const void *page);
+										 BlockNumber block, const void *page,
+										 uint64 version);
 extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 										BlockNumber block, void *page);
+extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version,
+										   void *page, uint64 *resolved);
 
 #endif							/* PAGESTORE_BACKEND_H */

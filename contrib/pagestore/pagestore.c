@@ -35,6 +35,7 @@
 
 #include "access/relation.h"
 #include "access/rmgr.h"
+#include "access/slru.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -48,8 +49,10 @@
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
+#include "storage/fd.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
@@ -1138,7 +1141,7 @@ pagestore_object_roundtrip(PG_FUNCTION_ARGS)
 	key.forkNum = 0;
 
 	out = palloc(BLCKSZ);
-	pagestore_localsvc_obj_write((uint32) klass, &key, 0, VARDATA_ANY(inpage));
+	pagestore_localsvc_obj_write((uint32) klass, &key, 0, VARDATA_ANY(inpage), 0);
 	pagestore_localsvc_obj_read((uint32) klass, &key, 0, out);
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -1172,6 +1175,196 @@ pagestore_object_get(PG_FUNCTION_ARGS)
 
 	out = palloc(BLCKSZ);
 	pagestore_localsvc_obj_read((uint32) klass, &key, 0, out);
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), out, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * SLRU snapshot shipping (M4 step 1).
+ *
+ * An SLRU directory's segment files are a clean as-of image once they are flushed
+ * and no longer being written.  We ship every page of an in-scope SLRU (clog,
+ * multixact offsets/members, commit-ts) to the store, versioning each by a cutoff C
+ * so a branch reads the snapshot as-of an LSN >= C (the seed base; per-update WAL in
+ * (C, L] then brings it to exactly L).  The store key is
+ *   PsKey{ klass = PS_KLASS_SLRU, relNumber = slru_klass_id(dir), block = pageno }.
+ */
+
+/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only). */
+static uint32
+slru_klass_id(const char *name)
+{
+	uint32		h = 2166136261u;
+	const unsigned char *p;
+
+	for (p = (const unsigned char *) name; *p != '\0'; p++)
+	{
+		h ^= *p;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* The WAL-logged, uint32-page SLRUs M4 may snapshot/reconstruct.  A whitelist: the
+ * SQL helpers take a directory name, so without it a caller could point them at
+ * 'base/<db>' or 'global' and snapshot ordinary relation files (whose numeric names
+ * also parse as hex) under an SLRU key. */
+static const char *const ps_slru_dirs[] = {
+	"pg_xact",
+	"pg_multixact/offsets",
+	"pg_multixact/members",
+	"pg_commit_ts",
+};
+
+static void
+slru_check_dir(const char *slru)
+{
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+		if (strcmp(ps_slru_dirs[i], slru) == 0)
+			return;
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+}
+
+static void
+slru_obj_key(PageStoreRelKey *key, const char *slru)
+{
+	key->spcOid = 0;
+	key->dbOid = 0;
+	key->relNumber = (RelFileNumber) slru_klass_id(slru);
+	key->forkNum = 0;
+}
+
+/*
+ * pagestore_ship_slru_snapshot(slru text, cutoff pg_lsn) returns bigint
+ *
+ * Ship a clean whole-segment snapshot of SLRU directory 'slru' (e.g. 'pg_xact')
+ * keyed by 'cutoff'.  'cutoff' must provably upper-bound the on-disk segments'
+ * contents -- the caller captures it at a quiescent point (a clean
+ * shutdown/restartpoint, or under a brief SLRU write barrier).  The online,
+ * automatically-triggered, proven-C path is a follow-up.  Returns the page count;
+ * fails closed (ereport) on any read/IPC error rather than shipping a partial snap.
+ */
+PG_FUNCTION_INFO_V1(pagestore_ship_slru_snapshot);
+Datum
+pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
+	DIR		   *dir;
+	struct dirent *de;
+	int64		shipped = 0;
+	char	   *page = palloc(BLCKSZ);
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	slru_check_dir(slru);
+
+	dir = AllocateDir(slru);
+	if (dir == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open SLRU directory \"%s\": %m", slru)));
+
+	while ((de = ReadDir(dir, slru)) != NULL)
+	{
+		int64		segno;
+		char	   *endp;
+		char		segpath[MAXPGPATH];
+		int			fd;
+		int			pageidx;
+		size_t		namelen = strlen(de->d_name);
+
+		/*
+		 * Mirror SlruScanDirectory()'s filename test so we ship only real segment
+		 * files: the in-scope SLRUs all use short names, which SlruCorrectSegment-
+		 * FilenameLength() allows to be 4, 5 or 6 upper-case hex characters (the
+		 * "%04X" width is a minimum, so a segno past 0xFFFF -- e.g. advanced
+		 * commit_ts / multixact members -- yields 5-6 chars).  Anything else in the
+		 * directory (a stray or long-name file) is skipped, not shipped as bogus
+		 * SLRU pages.
+		 */
+		if (namelen < 4 || namelen > 6 ||
+			strspn(de->d_name, "0123456789ABCDEF") != namelen)
+			continue;
+		errno = 0;
+		segno = strtoll(de->d_name, &endp, 16);
+		if (endp == de->d_name || *endp != '\0' || errno != 0 || segno < 0)
+			continue;
+
+		snprintf(segpath, sizeof(segpath), "%s/%s", slru, de->d_name);
+		fd = OpenTransientFile(segpath, O_RDONLY | PG_BINARY);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open SLRU segment \"%s\": %m", segpath)));
+
+		for (pageidx = 0; pageidx < SLRU_PAGES_PER_SEGMENT; pageidx++)
+		{
+			int			n = read(fd, page, BLCKSZ);
+			PageStoreRelKey key;
+
+			if (n == 0)
+				break;			/* fewer than a full segment's pages on disk */
+			if (n != BLCKSZ)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("short read on SLRU segment \"%s\"", segpath)));
+			}
+			slru_obj_key(&key, slru);
+			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key,
+										 (BlockNumber) (segno * SLRU_PAGES_PER_SEGMENT
+														+ pageidx),
+										 page, (uint64) cutoff);
+			shipped++;
+		}
+		CloseTransientFile(fd);
+	}
+	FreeDir(dir);
+
+	PG_RETURN_INT64(shipped);
+}
+
+/*
+ * pagestore_slru_read_at(slru text, pageno int, lsn pg_lsn) returns bytea -- read an
+ * SLRU page back from the store as-of 'lsn' (verifies a shipped snapshot; the branch
+ * seed path reads its base pages this way).
+ */
+PG_FUNCTION_INFO_V1(pagestore_slru_read_at);
+Datum
+pagestore_slru_read_at(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		pageno = PG_GETARG_INT32(1);
+	XLogRecPtr	lsn = PG_GETARG_LSN(2);
+	PageStoreRelKey key;
+	char	   *out = palloc(BLCKSZ);
+	bytea	   *result;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	slru_check_dir(slru);
+
+	slru_obj_key(&key, slru);
+	/*
+	 * As-of read: return the newest snapshot version <= lsn (so a base shipped at
+	 * cutoff C still reads back when requested at a later L >= C), or NULL on a genuine
+	 * miss (no version <= lsn) so a caller never mistakes a zero page for real clog
+	 * state.  Exact-cutoff matching -- the tombstone guard that stops an older image
+	 * resurfacing after a truncation -- lives in the branch reconstruct/seed, which
+	 * read the base at the chosen cutoff itself (resolved == that cutoff).
+	 */
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key, (BlockNumber) pageno,
+										(uint64) lsn, out, NULL))
+		PG_RETURN_NULL();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);

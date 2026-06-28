@@ -1276,7 +1276,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
  */
 int
 read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn, unsigned char *out)
+			 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
@@ -1303,6 +1303,11 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * bypass both and read the authoritative segment.
 			 */
 			int			poisoned = ps_manifest_poisoned();
+
+			/* the resolved version (newest <= read_lsn); a caller that needs an
+			 * exact-cutoff match -- e.g. an SLRU snapshot read -- compares it. */
+			if (out_ver)
+				*out_ver = pv->lsn;
 
 			/* fast path: materialized-page cache, keyed by the resolved version */
 			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
