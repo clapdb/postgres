@@ -380,6 +380,14 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
+# Reconstruct the branch clog as-of L *now*, while the (C, L] WAL is still present (the
+# parent's later stop/restart/checkpoints recycle it).  The base snapshot at C has T1
+# in-progress; the replay of (C, L] must mark it committed, so booting on this clog -- not
+# the parent's copied one -- is what makes row1 visible.
+SEEDOUT=$(mktemp -d)/seedout
+seeded_b=$($P -c "SELECT pagestore_seed_clog('$SEEDOUT', '$bc', '$bL', '3'::xid, '$boxid'::xid);")
+assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"branch clog reconstructed via base snapshot + (C,L] replay ($seeded_b page(s))"
 # clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 BRANCHDATA=$(mktemp -d)/branch
@@ -387,7 +395,10 @@ cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 $P -c "SELECT pagestore_create_branch(1, 0, '$bL');" >/dev/null       # store timeline 1 @ L
-$P -c "SELECT pagestore_seed_clog('$BRANCHDATA', '$bc', '$bL', '3'::xid, '$boxid'::xid);" >/dev/null
+# Install the reconstructed clog into the branch copy, replacing the copied one, so the
+# boot genuinely depends on the seeder's output rather than the parent's as-of-L pg_xact.
+rm -rf "$BRANCHDATA/pg_xact"
+cp -a "$SEEDOUT/pg_xact" "$BRANCHDATA/pg_xact"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
@@ -397,15 +408,24 @@ EOF
 "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1
 PB="$BIN/psql -h 127.0.0.1 -p $PORT2 -U postgres -tA"
 assert "$($PB -c "SELECT count(*) FROM tb WHERE note='before_L';" 2>/dev/null)" "1" \
-	"branch boots and sees the row committed before L (reconstructed clog + as-of-L heap)"
+	"branch boots on the reconstructed clog and sees the row committed before L"
 assert "$($PB -c "SELECT count(*) FROM tb WHERE note='after_L';" 2>/dev/null)" "0" \
 	"branch does NOT see the row committed after L"
-$PB -c "INSERT INTO tb VALUES (3,'branch_local');" >/dev/null 2>&1
+# write forward, then CHECKPOINT so the page is actually shipped to the daemon on timeline 1
+# (not merely dirtied in the branch's buffers), then restart to evict buffers and re-read
+# from the store.  This proves the write went forward on tl=1 AND that row2's post-L heap
+# version is physically absent there -- not just MVCC-hidden (the branch's first commit
+# reuses the same XID the parent used for after_L).
+$PB -c "INSERT INTO tb VALUES (3,'branch_local'); CHECKPOINT;" >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$BRANCHDATA" -w restart >/dev/null 2>&1
 assert "$($PB -c "SELECT count(*) FROM tb WHERE note='branch_local';" 2>/dev/null)" "1" \
-	"branch writes forward on its own timeline"
+	"branch write went forward on its own timeline (survives buffer eviction)"
+assert "$($PB -c "SELECT count(*) FROM tb WHERE note='after_L';" 2>/dev/null)" "0" \
+	"row committed after L is physically absent from the branch timeline (not just MVCC-hidden)"
 assert "$($P -c "SELECT count(*) FROM tb WHERE note='branch_local';")" "0" \
 	"parent is isolated from the branch's local write"
 "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1
+rm -rf "$(dirname "$SEEDOUT")"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
