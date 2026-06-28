@@ -469,6 +469,7 @@ $P -c "CREATE TABLE mx(id int primary key, note text) TABLESPACE ts; INSERT INTO
 $P -c "CHECKPOINT;" >/dev/null
 mxC=$($P -c "SELECT pg_current_wal_lsn();")                       # base cutoff C
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$mxC');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$mxC');" >/dev/null
 # session A holds a FOR SHARE lock across the second locker
 ("$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres -tA \
 	-c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; SELECT pg_sleep(8); COMMIT;" >/dev/null 2>&1) &
@@ -506,6 +507,29 @@ mxRP=$($P -c "SELECT md5(pagestore_multixact_offsets_page_asof($mxPage, '$mxC', 
 mxSeg=$(printf '%04X' $(( mxPage / 32 )))
 mxLP=$($P -c "SELECT md5(pg_read_binary_file('pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
 assert "$mxRP" "$mxLP" "multixact offsets: reconstructed page as-of L == the parent's live offsets file"
+
+# --- 21. multixact members applier: reconstruct the offset->member-list page as-of L ----
+# mA's offset (from step 20) locates its members page; reconstructing that page as-of L must
+# equal the parent's live pg_multixact/members file byte-for-byte.  With the offsets half,
+# this resolves mA's members: the page holds its two FOR SHARE lockers at offset mOff.
+$P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;" >/dev/null
+mOff=$mxRecon                                          # mA's first member offset (step 20)
+# MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
+# the group is 4 flag bytes + 4 TransactionIds = 20 bytes, 4 members each (block-size derived)
+mpp=$(( (bs / 20) * 4 ))
+mPage=$(( mOff / mpp ))
+mbRecon=$($P -c "SELECT md5(pagestore_multixact_members_page_asof($mPage, '$mxC', '$mxL'));")
+mbSeg=$(printf '%04X' $(( mPage / 32 )))
+mbLive=$($P -c "SELECT md5(pg_read_binary_file('pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
+assert "$mbRecon" "$mbLive" "multixact members: reconstructed page as-of L == the parent's live members file"
+# End to end: the parent resolves mA's members from exactly these on-disk pages -- step 20
+# proved the offsets page (mA -> mOff) matches the live file, and the line above proves the
+# members page (mOff -> the two locker xids) matches it too, both byte-for-byte.  So mA
+# resolves to the same members against the reconstruction.  (We compare raw page bytes
+# rather than decoding the TransactionIds, which keeps the check endian-agnostic.)
+mbParent=$($P -c "SELECT count(*) FROM pg_get_multixact_members('$mA');" 2>/dev/null)
+assert "$mbParent" "2" "multixact members: the parent resolves mA to its two members from those pages"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
