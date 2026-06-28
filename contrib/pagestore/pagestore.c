@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "access/clog.h"
+#include "access/commit_ts.h"
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
@@ -1702,8 +1703,253 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
 }
 
 /*
+ * commit-ts reconstruction (M4): the same shape as the clog applier, for pg_commit_ts.
+ *
+ * Each xid's commit timestamp is set as a side effect of its XLOG_XACT_COMMIT record (no
+ * separate WAL record), so reconstruction loads the parent's commit-ts snapshot as of the
+ * base cutoff C and replays the commit records in (C, L], writing each committed xid's
+ * (timestamp, origin) into its commit-ts page entry -- exactly what clog_redo's
+ * TransactionTreeSetCommitTsData() does.  pg_commit_ts entries are fixed-width
+ * (TimestampTz + RepOriginId), packed COMMIT_TS_XACTS_PER_PAGE to a page.
+ *
+ * Scope: assumes track_commit_timestamp is stable across (C, L].  A XLOG_PARAMETER_CHANGE
+ * that turns it off in the window makes a faithful image impossible, so we fail closed;
+ * full toggle replay (re-activating/zeroing segment state) is a follow-up.
+ */
+#define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(RepOriginId))
+#define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
+
+/* Write xid's (ts, nodeid) into commit-ts page 'pageno' in 'page' if it lives there. */
+static void
+ps_commit_ts_set(char *page, int64 pageno, TransactionId xid,
+				 TimestampTz ts, RepOriginId nodeid)
+{
+	int			entryno;
+	char	   *e;
+
+	if (!TransactionIdIsNormal(xid) ||
+		(int64) (xid / PS_CTS_XACTS_PER_PAGE) != pageno)
+		return;
+	entryno = xid % PS_CTS_XACTS_PER_PAGE;
+	e = page + (Size) entryno * PS_CTS_ENTRY_SIZE;
+	memcpy(e, &ts, sizeof(TimestampTz));
+	memcpy(e + sizeof(TimestampTz), &nodeid, sizeof(RepOriginId));
+}
+
+/* Replay (base_lsn, target_lsn] onto commit-ts page 'pageno'.  Mirrors
+ * ps_clog_apply_range: same straddle/zeropage/truncate/completeness handling, but applies
+ * commit timestamps (commits only -- aborts have no commit-ts) and watches for a
+ * commit-ts deactivation.  *deactivated is set if track_commit_timestamp is turned off. */
+static PsClogReplay
+ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
+						 XLogRecPtr target_lsn, bool *deactivated)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	PsClogReplay r = {false, false, false};
+
+	*deactivated = false;
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+		RmgrId		rmid;
+		TransactionId xid;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		rmid = XLogRecGetRmid(reader);
+
+		if (rmid == RM_COMMIT_TS_ID)
+		{
+			uint8		cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+			if (cinfo == COMMIT_TS_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp == pageno)
+				{
+					memset(page, 0, BLCKSZ);
+					r.page_zeroed = true;
+					r.page_truncated = false;
+				}
+			}
+			else if (cinfo == COMMIT_TS_TRUNCATE)
+			{
+				xl_commit_ts_truncate xlrec;
+
+				/* the record carries only SizeOfCommitTsTruncate bytes; sizeof() would
+				 * include trailing struct padding and read past the WAL payload */
+				memcpy(&xlrec, XLogRecGetData(reader), SizeOfCommitTsTruncate);
+				if (pageno / SLRU_PAGES_PER_SEGMENT <
+					xlrec.pageno / SLRU_PAGES_PER_SEGMENT)
+					r.page_truncated = true;
+			}
+			continue;
+		}
+		if (rmid == RM_XLOG_ID)
+		{
+			if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_PARAMETER_CHANGE)
+			{
+				xl_parameter_change xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				if (!xlrec.track_commit_timestamp)
+					*deactivated = true;
+			}
+			continue;
+		}
+		if (rmid != RM_XACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED)
+		{
+			xl_xact_parsed_commit parsed;
+			TimestampTz ts;
+			RepOriginId origin = XLogRecGetOrigin(reader);
+
+			ParseCommitRecord(XLogRecGetInfo(reader),
+							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+			ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
+				: parsed.xact_time;
+			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_commit_ts_set(page, pageno, xid, ts, origin);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_commit_ts_set(page, pageno, parsed.subxacts[i], ts, origin);
+		}
+	}
+
+	r.reached_target = (scanned >= target_lsn) ||
+		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
+		 ps_local_wal_limit() >= target_lsn);
+	XLogReaderFree(reader);
+	pfree(pd);
+	return r;
+}
+
+/* Load the base commit-ts page (snapshot as-of base_lsn) and replay (base, L].  Same
+ * fail-closed contract as ps_clog_reconstruct, plus: fail closed if commit-ts was turned
+ * off in the window (the reconstructed image would not match the parent's). */
+static bool
+ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
+						 XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	bool		base_found;
+	bool		deactivated = false;
+	uint64		resolved = 0;
+	PsClogReplay r;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_commit_ts");
+	base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												(BlockNumber) pageno,
+												(uint64) base_lsn, page, &resolved) &&
+		resolved == (uint64) base_lsn;
+	/* Unlike clog (where an all-zero page reads as IN_PROGRESS and an absent base must fail
+	 * closed), a zero commit-ts entry simply means "no commit timestamp" -- the correct
+	 * as-of answer for a page that does not exist at base_lsn: one first created after the
+	 * cutoff, or below the commit-ts validity window when track_commit_timestamp was turned
+	 * on partway through history or after a commit-ts truncation.  So treat an absent base
+	 * as an empty page and replay (base, L] onto zeros rather than erroring. */
+	if (!base_found)
+		memset(page, 0, BLCKSZ);
+
+	if (target_lsn == base_lsn)
+		return true;
+
+	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn, &deactivated);
+
+	if (!r.reached_target && target_lsn != PG_UINT64_MAX)
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+	if (deactivated)
+		ereport(ERROR,
+				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+	if (r.page_truncated)
+		return false;
+	return true;
+}
+
+/*
+ * pagestore_commit_ts_asof(xid xid, base pg_lsn, target pg_lsn, oldest xid) returns
+ * timestamptz -- the commit timestamp of 'xid' as of 'target', or NULL if it has none.
+ *
+ * 'oldest' is the commit-ts validity horizon as of target (the parent's oldestCommitTsXid
+ * from pg_control), which the booted branch's TransactionIdGetCommitTsData() enforces:
+ * xids below it return NULL even though their bytes may physically remain on a retained
+ * SLRU page (a COMMIT_TS_TRUNCATE only drops whole earlier segments), and xids that
+ * committed while commit-ts was inactive -- e.g. before an off->on activation in the window
+ * -- are below it too.  The page reconstruction stays byte-faithful to the parent's disk
+ * page; this horizon check is what makes the lookup match the parent.  Pass FirstNormal
+ * (or any value <= xid) to disable the check.
+ */
+PG_FUNCTION_INFO_V1(pagestore_commit_ts_asof);
+Datum
+pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
+{
+	TransactionId xid = PG_GETARG_TRANSACTIONID(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest = PG_GETARG_TRANSACTIONID(3);
+	int64		pageno = xid / PS_CTS_XACTS_PER_PAGE;
+	int			entryno = xid % PS_CTS_XACTS_PER_PAGE;
+	char	   *page = palloc(BLCKSZ);
+	TimestampTz ts;
+
+	/* below the commit-ts horizon as of target -> no valid timestamp, exactly as
+	 * TransactionIdGetCommitTsData() rejects xids before oldestCommitTsXid */
+	if (TransactionIdIsNormal(oldest) && TransactionIdPrecedes(xid, oldest))
+		PG_RETURN_NULL();
+
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();		/* page truncated away by the target LSN */
+
+	memcpy(&ts, page + (Size) entryno * PS_CTS_ENTRY_SIZE, sizeof(TimestampTz));
+	if (ts == 0)
+		PG_RETURN_NULL();		/* no commit timestamp recorded for this xid */
+	PG_RETURN_TIMESTAMPTZ(ts);
+}
+
+/*
  * pagestore_seed_clog(target_dir text, base pg_lsn, target pg_lsn,
  *					   oldest_xid xid, next_xid xid) returns bigint
+ *
+ * M4 step 3 (branch create): materialize a new branch's clog as of fork LSN 'target'
  *
  * M4 step 3 (branch create): materialize a new branch's clog as of fork LSN 'target'
  * into <target_dir>/pg_xact, by reconstructing each page (base snapshot at 'base' +
