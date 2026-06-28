@@ -704,12 +704,16 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
  * As-of read of a non-relation object block (honours branch ancestry).  Returns
  * true if a version <= 'version' was found; on a miss returns false and leaves
  * 'page' zero-filled (so callers can fail closed rather than read a phantom page).
+ * If 'resolved' is non-NULL, it receives the version actually resolved (the newest
+ * <= 'version'), so a caller wanting an exact-cutoff hit can compare it.
  */
 bool
 pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
-							   BlockNumber block, uint64 version, void *page)
+							   BlockNumber block, uint64 version, void *page,
+							   uint64 *resolved)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	bool		found;
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -718,7 +722,10 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 	ch->req_lsn = version;
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
-	return ch->result != 0;
+	found = ch->result != 0;
+	if (resolved)
+		*resolved = found ? ch->req_lsn : 0;		/* daemon wrote the resolved ver */
+	return found;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

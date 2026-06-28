@@ -166,6 +166,6 @@ extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key
 										BlockNumber block, void *page);
 extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 										   BlockNumber block, uint64 version,
-										   void *page);
+										   void *page, uint64 *resolved);
 
 #endif							/* PAGESTORE_BACKEND_H */

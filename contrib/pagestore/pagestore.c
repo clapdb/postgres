@@ -1278,8 +1278,20 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		char		segpath[MAXPGPATH];
 		int			fd;
 		int			pageidx;
+		size_t		namelen = strlen(de->d_name);
 
-		/* SLRU segment files are named by hex segno; skip "." / ".." / others */
+		/*
+		 * Mirror SlruScanDirectory()'s filename test so we ship only real segment
+		 * files: the in-scope SLRUs all use short names, which SlruCorrectSegment-
+		 * FilenameLength() allows to be 4, 5 or 6 upper-case hex characters (the
+		 * "%04X" width is a minimum, so a segno past 0xFFFF -- e.g. advanced
+		 * commit_ts / multixact members -- yields 5-6 chars).  Anything else in the
+		 * directory (a stray or long-name file) is skipped, not shipped as bogus
+		 * SLRU pages.
+		 */
+		if (namelen < 4 || namelen > 6 ||
+			strspn(de->d_name, "0123456789ABCDEF") != namelen)
+			continue;
 		errno = 0;
 		segno = strtoll(de->d_name, &endp, 16);
 		if (endp == de->d_name || *endp != '\0' || errno != 0 || segno < 0)
@@ -1342,10 +1354,16 @@ pagestore_slru_read_at(PG_FUNCTION_ARGS)
 	slru_check_dir(slru);
 
 	slru_obj_key(&key, slru);
-	/* preserve the miss signal: a page with no version <= lsn returns NULL, not a
-	 * zero page that a caller could mistake for real all-zero clog state */
+	/*
+	 * As-of read: return the newest snapshot version <= lsn (so a base shipped at
+	 * cutoff C still reads back when requested at a later L >= C), or NULL on a genuine
+	 * miss (no version <= lsn) so a caller never mistakes a zero page for real clog
+	 * state.  Exact-cutoff matching -- the tombstone guard that stops an older image
+	 * resurfacing after a truncation -- lives in the branch reconstruct/seed, which
+	 * read the base at the chosen cutoff itself (resolved == that cutoff).
+	 */
 	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key, (BlockNumber) pageno,
-										(uint64) lsn, out))
+										(uint64) lsn, out, NULL))
 		PG_RETURN_NULL();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
