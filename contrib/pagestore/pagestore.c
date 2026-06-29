@@ -3211,6 +3211,60 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+/*
+ * pagestore_seed_branch_slrus(target_dir text, base pg_lsn, target pg_lsn,
+ *                             oldest_xid xid, next_xid xid,
+ *                             oldest_multi xid, next_multi xid,
+ *                             oldest_member bigint, next_member bigint)
+ * returns bigint
+ *
+ * Branch bootstrap convenience entrypoint: materialize every SLRU class needed
+ * for a branch datadir to boot at target.  This intentionally centralizes the
+ * ordering and fail-closed behavior that tests previously had to spell out as
+ * separate seed_clog/seed_commit_ts/seed_multixact calls.  A later pg_control
+ * bootstrap helper can derive these horizons from the fork manifest and call
+ * this single function.
+ */
+PG_FUNCTION_INFO_V1(pagestore_seed_branch_slrus);
+Datum
+pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(5);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(6);
+	int64		oldest_member = PG_GETARG_INT64(7);
+	int64		next_member = PG_GETARG_INT64(8);
+	Datum		target_dir_datum = CStringGetTextDatum(target_dir);
+	int64		seeded = 0;
+
+	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_clog,
+												target_dir_datum,
+												LSNGetDatum(base),
+												LSNGetDatum(target),
+												TransactionIdGetDatum(oldest_xid),
+												TransactionIdGetDatum(next_xid)));
+	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
+												target_dir_datum,
+												LSNGetDatum(base),
+												LSNGetDatum(target),
+												TransactionIdGetDatum(oldest_xid),
+												TransactionIdGetDatum(next_xid)));
+	seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
+												target_dir_datum,
+												LSNGetDatum(base),
+												LSNGetDatum(target),
+												TransactionIdGetDatum(oldest_multi),
+												TransactionIdGetDatum(next_multi),
+												Int64GetDatum(oldest_member),
+												Int64GetDatum(next_member)));
+
+	PG_RETURN_INT64(seeded);
+}
+
 void
 _PG_init(void)
 {
