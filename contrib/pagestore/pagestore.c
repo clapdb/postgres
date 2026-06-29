@@ -58,6 +58,7 @@
 #include "storage/aio.h"
 #include "storage/bufpage.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
@@ -76,6 +77,7 @@ static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -3557,6 +3559,31 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 											  fork_lsn));
 }
 
+static void
+pagestore_validate_datadir_branch_manifest(void)
+{
+	char	   *manifest;
+	char		buf[64];
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	if (DataDir == NULL)
+		return;
+
+	manifest = pagestore_read_branch_manifest(DataDir);
+	if (manifest == NULL)
+		return;					/* legacy/non-branch datadir */
+	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+		ereport(FATAL,
+				(errmsg("invalid pagestore branch manifest in data directory")));
+	snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
+	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+		ereport(FATAL,
+				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
+				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
+}
+
 /*
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
@@ -3689,4 +3716,7 @@ _PG_init(void)
 	/* register our smgr implementation and claim relations via the hook */
 	pagestore_smgr_which = smgr_register(&pagestore_smgr);
 	smgr_which_hook = pagestore_which;
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;
 }
