@@ -2219,6 +2219,26 @@ ps_mxmemb_set(char *page, int64 pageno, MultiXactOffset offset,
 	memcpy(page + byteoff, &flagsval, sizeof(uint32));
 }
 
+static int64
+ps_mxmemb_segment(MultiXactOffset offset)
+{
+	return ((int64) (offset / PS_MXMEMB_PER_PAGE)) / SLRU_PAGES_PER_SEGMENT;
+}
+
+static bool
+ps_mxmemb_segment_truncated(int64 pageseg, MultiXactOffset start,
+							MultiXactOffset end)
+{
+	int64		startseg = ps_mxmemb_segment(start);
+	int64		endseg = ps_mxmemb_segment(end);
+
+	if (startseg == endseg)
+		return false;
+	if (startseg < endseg)
+		return pageseg >= startseg && pageseg < endseg;
+	return pageseg >= startseg || pageseg < endseg;
+}
+
 /* Replay (base_lsn, target_lsn] onto members page 'pageno'.  Mirrors ps_mxoff_apply_range,
  * applying each create record's member array and handling the members zero-page/truncate. */
 static PsClogReplay
@@ -2290,9 +2310,9 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 			xl_multixact_truncate xlrec;
 
 			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
-			/* members truncation drops whole segments below endTruncMemb's page */
-			if (pageno / SLRU_PAGES_PER_SEGMENT <
-				((int64) xlrec.endTruncMemb / PS_MXMEMB_PER_PAGE) / SLRU_PAGES_PER_SEGMENT)
+			if (ps_mxmemb_segment_truncated(pageno / SLRU_PAGES_PER_SEGMENT,
+											xlrec.startTruncMemb,
+											xlrec.endTruncMemb))
 				r.page_truncated = true;
 		}
 	}
