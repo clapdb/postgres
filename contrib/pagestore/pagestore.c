@@ -2479,7 +2479,7 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
-	if (MakePGDirectory(stagedir) != 0)
+	if (pg_mkdir_p(stagedir, pg_dir_create_mode) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
