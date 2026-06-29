@@ -1259,8 +1259,6 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 }
 
 static ControlFileWriteHook_type prev_control_file_write_hook = NULL;
-static ControlFileData pending_control_file;
-static bool pending_control_file_valid = false;
 
 static void
 pagestore_control_write_one(const ControlFileData *cf)
@@ -1280,35 +1278,6 @@ pagestore_control_write_one(const ControlFileData *cf)
 	pagestore_localsvc_obj_write_lsn(PS_KLASS_CONTROL, &key, 0, buf,
 									 cf->checkPoint);
 	pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
-}
-
-static void
-pagestore_control_flush_pending(void)
-{
-	MemoryContext oldcontext;
-
-	if (!pending_control_file_valid || CritSectionCount > 0)
-		return;
-	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
-		return;
-
-	oldcontext = CurrentMemoryContext;
-	PG_TRY();
-	{
-		pagestore_control_write_one(&pending_control_file);
-		pending_control_file_valid = false;
-	}
-	PG_CATCH();
-	{
-		int			sqlerrcode = geterrcode();
-
-		MemoryContextSwitchTo(oldcontext);
-		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
-			PG_RE_THROW();
-		FlushErrorState();
-	}
-	PG_END_TRY();
 }
 
 /*
@@ -1337,11 +1306,7 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	 * refresh the store copy.
 	 */
 	if (CritSectionCount > 0)
-	{
-		memcpy(&pending_control_file, cf, sizeof(ControlFileData));
-		pending_control_file_valid = true;
 		return;
-	}
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
@@ -1378,8 +1343,6 @@ pagestore_control_checkpoint_lsn(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
-
-	pagestore_control_flush_pending();
 
 	key.spcOid = 0;
 	key.dbOid = 0;

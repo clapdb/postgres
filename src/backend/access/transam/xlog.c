@@ -7326,6 +7326,10 @@ CreateCheckPoint(int flags)
 	 */
 	END_CRIT_SECTION();
 
+	/* mirror the just-written checkpoint control file outside the critical section */
+	if (control_file_write_hook)
+		control_file_write_hook(ControlFile);
+
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
 	 * XLOG_CHECKPOINT_SHUTDOWN record is reached. This is the first point
