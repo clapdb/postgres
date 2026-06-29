@@ -2518,14 +2518,24 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 				memset(zerobuf, 0, sizeof(zerobuf));
 				src = zerobuf;
 			}
-			if (pg_pwrite(fd, src, BLCKSZ,
-						  (off_t) (p - first) * BLCKSZ) != BLCKSZ)
+			for (int done = 0; done < BLCKSZ;)
 			{
-				CloseTransientFile(fd);
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not write branch %s segment \"%s\": %m",
-								label, segpath)));
+				ssize_t		written;
+
+				errno = 0;
+				written = pg_pwrite(fd, src + done, BLCKSZ - done,
+									(off_t) (p - first) * BLCKSZ + done);
+				if (written <= 0)
+				{
+					if (written == 0)
+						errno = ENOSPC;
+					CloseTransientFile(fd);
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write branch %s segment \"%s\": %m",
+									label, segpath)));
+				}
+				done += written;
 			}
 			seeded++;
 		}
