@@ -537,7 +537,9 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
-        AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
 # MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
 # the group is 4 flag bytes + 4 TransactionIds = 20 bytes, 4 members each (block-size derived)
@@ -589,6 +591,28 @@ bootMxMem=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/member
 assert "$bootMxOff" "$mxRP" "branch bootstrap seed multixact offsets page == reconstructed as-of-L page"
 assert "$bootMxMem" "$mbRecon" "branch bootstrap seed multixact members page == reconstructed as-of-L page"
 rm -rf "$BOOTSEED"
+
+# --- 23. branch prepare control-plane entrypoint: seed + fork timeline + manifest -------
+# The next layer up should call one control-plane function, not independently remember to
+# seed SLRUs, create the store timeline, and persist fork metadata.  Preparing a branch
+# must leave a durable manifest next to the seeded SLRUs; that manifest is the handoff
+# artifact for the later pg_control/bootstrap step.
+PREPSEED=$(mktemp -d)
+prepSeeded=$($P -c "SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
+	'3'::xid, '$bootNext'::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
+assert "$([ "${prepSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
+	"branch prepare seeded all bootstrap SLRUs and forked a store timeline ($prepSeeded page(s))"
+manifestHasTimeline=$($P -c "SELECT position('\"new_timeline\": 2' in pg_read_file('$PREPSEED/pagestore_branch.manifest')) > 0;")
+assert "$manifestHasTimeline" "t" "branch prepare manifest records the new timeline"
+manifestHasFork=$($P -c "SELECT position('\"fork_lsn\": ' in pg_read_file('$PREPSEED/pagestore_branch.manifest')) > 0;")
+assert "$manifestHasFork" "t" "branch prepare manifest records the fork LSN"
+prepClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_xact/$bootClogSeg', $(( bootClogPage * bs )), $bs));")
+assert "$prepClogMd5" "$bootClogRecon" "branch prepare pg_xact page == reconstructed as-of-L page"
+prepMxOff=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
+prepMxMem=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
+assert "$prepMxOff" "$mxRP" "branch prepare multixact offsets page == reconstructed as-of-L page"
+assert "$prepMxMem" "$mbRecon" "branch prepare multixact members page == reconstructed as-of-L page"
+rm -rf "$PREPSEED"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

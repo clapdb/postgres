@@ -3265,6 +3265,170 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+static void
+pagestore_write_branch_manifest(const char *target_dir,
+								int32 new_tl, int32 parent_tl,
+								XLogRecPtr base, XLogRecPtr target,
+								TransactionId oldest_xid,
+								TransactionId next_xid,
+								MultiXactId oldest_multi,
+								MultiXactId next_multi,
+								int64 oldest_member,
+								int64 next_member,
+								int64 seeded_pages)
+{
+	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	char		manifest[2048];
+	int			len;
+	int			fd;
+	int			done = 0;
+
+	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest.tmp") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	len = snprintf(manifest, sizeof(manifest),
+				   "{\n"
+				   "  \"format\": 1,\n"
+				   "  \"new_timeline\": %d,\n"
+				   "  \"parent_timeline\": %d,\n"
+				   "  \"base_lsn\": \"%X/%08X\",\n"
+				   "  \"fork_lsn\": \"%X/%08X\",\n"
+				   "  \"oldest_xid\": \"%u\",\n"
+				   "  \"next_xid\": \"%u\",\n"
+				   "  \"oldest_multi\": \"%u\",\n"
+				   "  \"next_multi\": \"%u\",\n"
+				   "  \"oldest_member\": \"%lld\",\n"
+				   "  \"next_member\": \"%lld\",\n"
+				   "  \"seeded_slru_pages\": \"%lld\"\n"
+				   "}\n",
+				   new_tl, parent_tl,
+				   LSN_FORMAT_ARGS(base),
+				   LSN_FORMAT_ARGS(target),
+				   oldest_xid, next_xid,
+				   oldest_multi, next_multi,
+				   (long long) oldest_member,
+				   (long long) next_member,
+				   (long long) seeded_pages);
+	if (len < 0 || len >= (int) sizeof(manifest))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest is too large")));
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+
+	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	snprintf(tmppath, sizeof(tmppath), "%s/pagestore_branch.manifest.tmp", target_dir);
+	fd = OpenTransientFilePerm(tmppath,
+							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+							   pg_file_create_mode);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch manifest \"%s\": %m", tmppath)));
+	while (done < len)
+	{
+		ssize_t		written;
+
+		errno = 0;
+		written = write(fd, manifest + done, len - done);
+		if (written <= 0)
+		{
+			if (written == 0)
+				errno = ENOSPC;
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write branch manifest \"%s\": %m", tmppath)));
+		}
+		done += written;
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync branch manifest \"%s\": %m", tmppath)));
+	}
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
+	if (rename(tmppath, path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch manifest \"%s\": %m", path)));
+	fsync_fname(target_dir, true);
+}
+
+/*
+ * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
+ *                          base pg_lsn, target pg_lsn,
+ *                          oldest_xid xid, next_xid xid,
+ *                          oldest_multi xid, next_multi xid,
+ *                          oldest_member bigint, next_member bigint)
+ * returns bigint
+ *
+ * Control-plane bootstrap entrypoint for a branch-capable compute: materialize
+ * branch SLRUs, fork the store timeline, and durably record the fork metadata in
+ * the target datadir.  This is still intentionally pg_control-adjacent rather
+ * than pg_control-editing: the manifest gives later bootstrap code one durable
+ * protocol artifact to consume.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
+Datum
+pagestore_prepare_branch(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	target = PG_GETARG_LSN(4);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
+	int64		oldest_member = PG_GETARG_INT64(9);
+	int64		next_member = PG_GETARG_INT64(10);
+	int64		seeded;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to prepare a branch")));
+	if (new_tl <= 0)
+		ereport(ERROR,
+				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	seeded = DatumGetInt64(DirectFunctionCall9(pagestore_seed_branch_slrus,
+											   CStringGetTextDatum(target_dir),
+											   LSNGetDatum(base),
+											   LSNGetDatum(target),
+											   TransactionIdGetDatum(oldest_xid),
+											   TransactionIdGetDatum(next_xid),
+											   TransactionIdGetDatum(oldest_multi),
+											   TransactionIdGetDatum(next_multi),
+											   Int64GetDatum(oldest_member),
+											   Int64GetDatum(next_member)));
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
+	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl, base, target,
+									oldest_xid, next_xid,
+									oldest_multi, next_multi,
+									oldest_member, next_member,
+									seeded);
+
+	PG_RETURN_INT64(seeded);
+}
+
 void
 _PG_init(void)
 {
