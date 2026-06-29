@@ -1196,6 +1196,9 @@ slru_klass_id(const char *dir)
 	return h;
 }
 
+static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
+static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
+
 /*
  * SLRU page-write hook (installed into slru.c): mirror each just-written SLRU
  * page (clog, multixact, ...) onto the page store as a PS_KLASS_SLRU object,
@@ -1261,8 +1264,6 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 
 /* GUC: when on, the read hook below serves SLRU pages from the store. */
 static bool pagestore_slru_read_from_store = false;
-static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
-static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
 
 /*
  * SLRU page-read hook (installed into slru.c): serve an SLRU page from the store
