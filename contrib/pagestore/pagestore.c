@@ -2523,8 +2523,7 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 				ssize_t		written;
 
 				errno = 0;
-				written = pg_pwrite(fd, src + done, BLCKSZ - done,
-									(off_t) (p - first) * BLCKSZ + done);
+				written = write(fd, src + done, BLCKSZ - done);
 				if (written <= 0)
 				{
 					if (written == 0)
