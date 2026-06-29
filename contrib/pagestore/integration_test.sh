@@ -371,8 +371,8 @@ rm -rf "$SEEDDIR"
 # (its xid is committed in the reconstructed clog and its heap version is <= L) but not row2
 # (committed after L; that heap version > L is absent from the branch timeline).  And it must
 # write forward on its own timeline without the parent seeing it.
-$P -c "CREATE FUNCTION pagestore_create_branch(int,int,pg_lsn) RETURNS void
-        AS 'pagestore','pagestore_create_branch' LANGUAGE C STRICT;
+$P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE TABLE tb(id int, note text) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 bc=$($P -c "SELECT pg_current_wal_lsn();")                     # base cutoff C (before row1)
@@ -380,25 +380,26 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
-# Reconstruct the branch clog as-of L *now*, while the (C, L] WAL is still present (the
+# Prepare the branch as-of L *now*, while the (C, L] WAL is still present (the
 # parent's later stop/restart/checkpoints recycle it).  The base snapshot at C has T1
-# in-progress; the replay of (C, L] must mark it committed, so booting on this clog -- not
-# the parent's copied one -- is what makes row1 visible.
+# in-progress; the replay of (C, L] must mark it committed, so booting on the prepared
+# pg_xact -- not the parent's copied one -- is what makes row1 visible.
 SEEDOUT=$(mktemp -d)/seedout
-seeded_b=$($P -c "SELECT pagestore_seed_clog('$SEEDOUT', '$bc', '$bL', '3'::xid, '$boxid'::xid);")
+seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
+	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
-	"branch clog reconstructed via base snapshot + (C,L] replay ($seeded_b page(s))"
+	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
 # clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
-$P -c "SELECT pagestore_create_branch(1, 0, '$bL');" >/dev/null       # store timeline 1 @ L
-# Install the reconstructed clog into the branch copy, replacing the copied one, so the
-# boot genuinely depends on the seeder's output rather than the parent's as-of-L pg_xact.
+# Install the prepared branch artifacts into the branch copy, replacing the copied clog,
+# so the boot genuinely depends on prepare_branch output rather than the parent's pg_xact.
 rm -rf "$BRANCHDATA/pg_xact"
 cp -a "$SEEDOUT/pg_xact" "$BRANCHDATA/pg_xact"
+cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
@@ -538,8 +539,6 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
-        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
