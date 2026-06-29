@@ -373,6 +373,8 @@ rm -rf "$SEEDDIR"
 # write forward on its own timeline without the parent seeing it.
 $P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_install_prepared_branch(text, text) RETURNS void
+        AS 'pagestore','pagestore_install_prepared_branch' LANGUAGE C STRICT;
        CREATE TABLE tb(id int, note text) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 bc=$($P -c "SELECT pg_current_wal_lsn();")                     # base cutoff C (before row1)
@@ -395,11 +397,9 @@ BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
-# Install the prepared branch artifacts into the branch copy, replacing the copied clog,
-# so the boot genuinely depends on prepare_branch output rather than the parent's pg_xact.
-rm -rf "$BRANCHDATA/pg_xact"
-cp -a "$SEEDOUT/pg_xact" "$BRANCHDATA/pg_xact"
-cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
+# Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
+# so the boot genuinely depends on prepare_branch output rather than parent state.
+$P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA');" >/dev/null
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1

@@ -57,6 +57,7 @@
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
+#include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
@@ -3586,6 +3587,111 @@ pagestore_validate_datadir_branch_manifest(void)
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
+}
+
+static void
+pagestore_install_prepared_dir(const char *prepared_dir, const char *target_dir,
+							   const char *relpath, bool required)
+{
+	char		src[MAXPGPATH];
+	char		dst[MAXPGPATH];
+	char		stage[MAXPGPATH];
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH ||
+		strlen(target_dir) + strlen(relpath) + sizeof(".install/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch install path is too long")));
+
+	snprintf(src, sizeof(src), "%s/%s", prepared_dir, relpath);
+	snprintf(dst, sizeof(dst), "%s/%s", target_dir, relpath);
+	snprintf(stage, sizeof(stage), "%s/%s.install", target_dir, relpath);
+	if (access(src, F_OK) != 0)
+	{
+		if (required)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
+		return;
+	}
+	if (access(stage, F_OK) == 0 && !rmtree(stage, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch install staging dir \"%s\"", stage)));
+	copydir(src, stage, true);
+	fsync_fname(stage, true);
+	if (access(dst, F_OK) == 0 && !rmtree(dst, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing branch artifact \"%s\"", dst)));
+	if (rename(stage, dst) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not install branch artifact \"%s\": %m", dst)));
+	fsync_fname(target_dir, true);
+}
+
+static void
+pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir,
+								const char *relpath)
+{
+	char		src[MAXPGPATH];
+	char		dst[MAXPGPATH];
+	char		stage[MAXPGPATH];
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH ||
+		strlen(target_dir) + strlen(relpath) + sizeof(".install/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch install path is too long")));
+
+	snprintf(src, sizeof(src), "%s/%s", prepared_dir, relpath);
+	snprintf(dst, sizeof(dst), "%s/%s", target_dir, relpath);
+	snprintf(stage, sizeof(stage), "%s/%s.install", target_dir, relpath);
+	if (access(src, F_OK) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
+	copy_file(src, stage);
+	if (durable_rename(stage, dst, ERROR) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not install branch artifact \"%s\": %m", dst)));
+	fsync_fname(target_dir, true);
+}
+
+/*
+ * pagestore_install_prepared_branch(prepared_dir text, target_dir text)
+ * returns void
+ *
+ * Install the artifacts produced by pagestore_prepare_branch() into an
+ * initdb/copied branch datadir.  The manifest is installed last so its presence
+ * remains the startup-time signal that the datadir has a prepared branch
+ * identity and must pass timeline validation.
+ */
+PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
+Datum
+pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
+{
+	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to install a prepared branch")));
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", false);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", false);
+	pagestore_install_prepared_file(prepared_dir, target_dir,
+									"pagestore_branch.manifest");
+
+	PG_RETURN_VOID();
 }
 
 static void
