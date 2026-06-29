@@ -50,6 +50,7 @@
 #include "catalog/storage_xlog.h"
 #include "common/file_perm.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
@@ -3364,6 +3365,114 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode_for_file_access(),
 				 errmsg("could not publish branch manifest \"%s\": %m", path)));
 	fsync_fname(target_dir, true);
+}
+
+static char *
+pagestore_read_branch_manifest(const char *target_dir)
+{
+	char		path[MAXPGPATH];
+	FILE	   *file;
+	StringInfoData buf;
+	char		tmp[1024];
+	size_t		nread;
+
+	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	file = AllocateFile(path, PG_BINARY_R);
+	if (file == NULL)
+		return NULL;
+
+	initStringInfo(&buf);
+	while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
+		appendBinaryStringInfo(&buf, tmp, nread);
+	if (ferror(file))
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	FreeFile(file);
+	return buf.data;
+}
+
+static bool
+pagestore_manifest_has_token(const char *manifest, const char *key,
+							 const char *value)
+{
+	char		token[256];
+	int			len;
+
+	len = snprintf(token, sizeof(token), "\"%s\": %s", key, value);
+	if (len < 0 || len >= (int) sizeof(token))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	return strstr(manifest, token) != NULL;
+}
+
+static bool
+pagestore_manifest_has_string_token(const char *manifest, const char *key,
+									const char *value)
+{
+	char		quoted[128];
+	int			len;
+
+	len = snprintf(quoted, sizeof(quoted), "\"%s\"", value);
+	if (len < 0 || len >= (int) sizeof(quoted))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	return pagestore_manifest_has_token(manifest, key, quoted);
+}
+
+/*
+ * pagestore_validate_branch_manifest(target_dir text, new_timeline int,
+ *                                    parent_timeline int, fork_lsn pg_lsn)
+ * returns bool
+ *
+ * Bootstrap preflight for a prepared branch datadir.  It verifies that the
+ * durable manifest written by pagestore_prepare_branch() matches the timeline
+ * identity the caller is about to boot.  This intentionally does not mutate the
+ * datadir; it is a guard against pointing a compute at the wrong copied
+ * datadir or store timeline.
+ */
+PG_FUNCTION_INFO_V1(pagestore_validate_branch_manifest);
+Datum
+pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	fork_lsn = PG_GETARG_LSN(3);
+	char	   *manifest;
+	char		buf[64];
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to validate a branch manifest")));
+
+	manifest = pagestore_read_branch_manifest(target_dir);
+	if (manifest == NULL)
+		PG_RETURN_BOOL(false);
+	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+		PG_RETURN_BOOL(false);
+	snprintf(buf, sizeof(buf), "%d", new_tl);
+	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+		PG_RETURN_BOOL(false);
+	snprintf(buf, sizeof(buf), "%d", parent_tl);
+	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+		PG_RETURN_BOOL(false);
+	snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
+	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
+		PG_RETURN_BOOL(false);
+
+	PG_RETURN_BOOL(true);
 }
 
 /*

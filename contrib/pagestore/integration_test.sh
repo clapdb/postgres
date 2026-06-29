@@ -539,7 +539,9 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
        CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
-        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
+        AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
 # MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
 # the group is 4 flag bytes + 4 TransactionIds = 20 bytes, 4 members each (block-size derived)
@@ -606,6 +608,10 @@ manifestHasTimeline=$($P -c "SELECT position('\"new_timeline\": 2' in pg_read_fi
 assert "$manifestHasTimeline" "t" "branch prepare manifest records the new timeline"
 manifestHasFork=$($P -c "SELECT position('\"fork_lsn\": ' in pg_read_file('$PREPSEED/pagestore_branch.manifest')) > 0;")
 assert "$manifestHasFork" "t" "branch prepare manifest records the fork LSN"
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');")" "t" \
+	"branch manifest validator accepts the prepared branch identity"
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 3, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects the wrong branch timeline"
 prepClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_xact/$bootClogSeg', $(( bootClogPage * bs )), $bs));")
 assert "$prepClogMd5" "$bootClogRecon" "branch prepare pg_xact page == reconstructed as-of-L page"
 prepMxOff=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
