@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,10 +109,13 @@ main(int argc, char **argv)
 	const char *shm_name = NULL;
 	const char *pgdata = NULL;
 	PsChannel  *ch;
+	char		dirpath[1024];
 	char		path[1024];
+	char		tmppath[1024];
 	char		buf[PG_CONTROL_FILE_SIZE];
 	size_t		n;
 	int			fd;
+	int			dirfd;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -151,12 +155,19 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	/* read control page 0 */
+	/* read control page 0, requiring a real stored version */
 	fill_control_key(ch);
-	ch->opcode = PS_OP_READV;
+	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 0;
-	ch->nblocks = 1;
+	ch->req_lsn = UINT64_MAX;
 	cl_exec(ch);
+	if (ch->result == 0)
+	{
+		fprintf(stderr, "pg_control block 0 is not resolvable on timeline %u\n",
+				restore_timeline);
+		ps_store_release(&ps_channel(shm, chan)->claimed, 0);
+		return 1;
+	}
 
 	/* assemble the fixed-size control file (page + zero pad) and write it */
 	memset(buf, 0, sizeof(buf));
@@ -166,22 +177,56 @@ main(int argc, char **argv)
 	/* daemon work is done; release the channel for reuse before file I/O */
 	ps_store_release(&ps_channel(shm, chan)->claimed, 0);
 
-	snprintf(path, sizeof(path), "%s/global/pg_control", pgdata);
-	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	snprintf(dirpath, sizeof(dirpath), "%s/global", pgdata);
+	snprintf(path, sizeof(path), "%s/pg_control", dirpath);
+	snprintf(tmppath, sizeof(tmppath), "%s/pg_control.tmp.%ld",
+			 dirpath, (long) getpid());
+
+	if (access(path, F_OK) == 0)
+	{
+		fprintf(stderr, "%s already exists; refusing to overwrite\n", path);
+		return 1;
+	}
+	if (errno != ENOENT)
+	{
+		perror("stat pg_control");
+		return 1;
+	}
+
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 	{
-		perror("open pg_control");
+		perror("open temporary pg_control");
 		return 1;
 	}
 	if (write(fd, buf, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE)
 	{
-		perror("write pg_control");
+		perror("write temporary pg_control");
 		close(fd);
+		unlink(tmppath);
 		return 1;
 	}
 	if (fsync(fd) != 0 || close(fd) != 0)
 	{
-		perror("fsync/close pg_control");
+		perror("fsync/close temporary pg_control");
+		unlink(tmppath);
+		return 1;
+	}
+	if (rename(tmppath, path) != 0)
+	{
+		perror("rename pg_control");
+		unlink(tmppath);
+		return 1;
+	}
+	dirfd = open(dirpath, O_RDONLY | O_DIRECTORY);
+	if (dirfd < 0)
+	{
+		perror("open global directory");
+		return 1;
+	}
+	if (fsync(dirfd) != 0 || close(dirfd) != 0)
+	{
+		perror("fsync/close global directory");
 		return 1;
 	}
 	fprintf(stderr, "restored %s from the store\n", path);

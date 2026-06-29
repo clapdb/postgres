@@ -158,6 +158,7 @@ extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  PsWalRec *out, int maxn);
 extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 										 BlockNumber block, const void *page);
+extern void pagestore_localsvc_obj_sync(uint32 klass, const PageStoreRelKey *key);
 extern bool pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 										BlockNumber block, void *page);
 

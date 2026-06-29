@@ -1258,6 +1258,8 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+static ControlFileWriteHook_type prev_control_file_write_hook = NULL;
+
 /*
  * Control-file write hook (installed into xlog.c): mirror pg_control onto the
  * store as a PS_KLASS_CONTROL object whenever it is written.  Cluster control
@@ -1272,16 +1274,21 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	char		buf[BLCKSZ];
 	MemoryContext oldcontext;
 
+	if (prev_control_file_write_hook)
+		prev_control_file_write_hook(cf);
+
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return;
+
 	/*
-	 * NB: unlike the SLRU hook we do NOT skip critical sections here -- pg_control
-	 * is updated almost exclusively from inside the checkpoint/shutdown critical
-	 * section (e.g. xlog.c CreateCheckPoint), so skipping would never mirror it.
-	 * The mirror's fallible shm I/O is therefore a known prototype risk in a
-	 * critical section (a daemon error would PANIC); a production build would defer
-	 * the mirror to a checkpoint-completion callback / async shipper instead.
+	 * The mirror path performs fallible shared-memory IPC.  Several pg_control
+	 * writers run inside checkpoint/shutdown critical sections, where ERROR would
+	 * become PANIC before this best-effort hook could recover.  Do not risk the
+	 * cluster for an optional mirror; a later non-critical control-file write can
+	 * refresh the store copy.
 	 */
+	if (CritSectionCount > 0)
+		return;
 
 	/* pg_control fits in a single block (PG_CONTROL_FILE_SIZE <= BLCKSZ) */
 	memset(buf, 0, sizeof(buf));
@@ -1296,6 +1303,7 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	PG_TRY();
 	{
 		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, buf);
+		pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
 	}
 	PG_CATCH();
 	{
@@ -1416,5 +1424,6 @@ _PG_init(void)
 	slru_page_read_hook = pagestore_slru_read_hook;
 
 	/* mirror the control file (pg_control) onto the store as well */
+	prev_control_file_write_hook = control_file_write_hook;
 	control_file_write_hook = pagestore_control_write_hook;
 }

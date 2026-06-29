@@ -648,6 +648,17 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ls_exec(ch);
 }
 
+void
+pagestore_localsvc_obj_sync(uint32 klass, const PageStoreRelKey *key)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_IMMEDSYNC;
+	ls_exec(ch);
+}
+
 bool
 pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 							BlockNumber block, void *page)
