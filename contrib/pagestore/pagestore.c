@@ -3600,7 +3600,13 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
-		return;					/* legacy/non-branch datadir */
+	{
+		if (pagestore_localsvc_timeline() != 0)
+			ereport(FATAL,
+					(errmsg("pagestore branch timeline requires pagestore_branch.manifest"),
+					 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
+		return;					/* main timeline / legacy datadir */
+	}
 	if (!pagestore_manifest_has_token(manifest, "format", "1"))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));

@@ -49,9 +49,11 @@ assert() {  # $1=actual $2=expected $3=message
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
+	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
-		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}"
+		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
+		"${UNPREPARED:+$(dirname "$UNPREPARED")}"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
@@ -395,6 +397,8 @@ assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
+UNPREPARED=$(mktemp -d)/branch
+cp -a "$DATA" "$UNPREPARED"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
@@ -406,6 +410,18 @@ cp "$SEEDOUT/pagestore_branch.manifest" "$BADSEED/pagestore_branch.manifest"
 missing_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$BADSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$missing_artifact" "error" "prepared branch install rejects a missing pg_xact artifact"
 rm -rf "$BADSEED"
+cat >> "$UNPREPARED/postgresql.conf" <<EOF
+pagestore.timeline = 1
+port = $PORT2
+archive_mode = off
+EOF
+if "$BIN/pg_ctl" -D "$UNPREPARED" -l "$UNPREPARED/server.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - branch startup accepted nonzero timeline without a manifest"
+	fail=1
+	"$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
+else
+	echo "ok   - branch startup rejects nonzero timeline without a manifest"
+fi
 $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null
 $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null
 echo "ok   - prepared branch install is idempotent for the same branch identity"
