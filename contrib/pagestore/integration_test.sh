@@ -456,6 +456,57 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsB'::xid, '$ctsC', '$ctsL',
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', ('$ctsA'::xid::text::bigint + 1)::text::xid) IS NULL;")" "t" \
 	"commit-ts: a xid below the as-of-L horizon (oldestCommitTsXid) returns NULL despite stale page bytes"
 
+# --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
+# A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
+# while a second session also locks the row, creating multixact mA.  Reconstructing the
+# offsets SLRU as-of L must give mA the same starting member offset the parent recorded on
+# disk (a byte-for-byte check against the live pg_multixact/offsets file).
+$P -c "CREATE FUNCTION pagestore_multixact_offset_asof(xid, pg_lsn, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_multixact_offset_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_multixact_offsets_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_multixact_offsets_page_asof' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE TABLE mx(id int primary key, note text) TABLESPACE ts; INSERT INTO mx VALUES (1,'a');" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+mxC=$($P -c "SELECT pg_current_wal_lsn();")                       # base cutoff C
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$mxC');" >/dev/null
+# session A holds a FOR SHARE lock across the second locker
+("$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres -tA \
+	-c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; SELECT pg_sleep(8); COMMIT;" >/dev/null 2>&1) &
+mxlocker=$!
+# wait until A actually holds the ROW lock -- its xid lands in the tuple's xmax -- rather
+# than a fixed sleep (or a relation-level RowShareLock that is taken before the tuple lock),
+# so a slow host can't let B lock and commit the row alone
+for _ in $(seq 1 100); do
+	[ "$($P -c "SELECT (xmax <> '0'::xid)::int FROM mx WHERE id=1;" 2>/dev/null)" = "1" ] && break
+	sleep 0.1
+done
+# session B locks the same row while A still holds -> a multixact is created
+$P -c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; COMMIT;" >/dev/null
+mA=$($P -c "SELECT xmax FROM mx WHERE id=1;")                     # the row's xmax is the multixact id
+$P -c "CHECKPOINT;" >/dev/null
+mxL=$($P -c "SELECT pg_current_wal_lsn();")                       # fork LSN L (after mA)
+wait "$mxlocker"		# only the locker; a bare wait would also block on the daemon
+# confirm mA really is a multixact (its two FOR SHARE members), not a plain xid
+mxMembers=$($P -c "SELECT count(*) FROM pg_get_multixact_members('$mA');" 2>/dev/null)
+assert "$mxMembers" "2" "a multixact (mA=$mA) was created by two concurrent FOR SHARE lockers"
+mxRecon=$($P -c "SELECT pagestore_multixact_offset_asof('$mA'::xid, '$mxC', '$mxL');")  # offset, for step 21
+# assert the scalar helper itself (a multixact's member offset is always >= 1; offset 0 is
+# skipped), so an error or zero from it fails the test rather than being silently ignored;
+# its exact value is then checked transitively below via mPage = mxRecon/mpp
+assert "$([ "${mxRecon:-x}" -gt 0 ] 2>/dev/null && echo ok || echo "bad:$mxRecon")" "ok" \
+	"multixact offsets: scalar offset_asof(mA) returns a valid (>0) member offset"
+# derive the SLRU page geometry from the server's block_size instead of hardcoding 8192:
+# MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ/4, and SLRU_PAGES_PER_SEGMENT = 32 (block-size independent)
+bs=$($P -c "SELECT current_setting('block_size')::int;")
+opp=$(( bs / 4 ))
+# byte-for-byte: the reconstructed offsets page == the parent's live pg_multixact/offsets
+# file (endian-agnostic, unlike decoding the uint32; also checks the successor slot mA+1)
+mxPage=$(( mA / opp ))
+mxRP=$($P -c "SELECT md5(pagestore_multixact_offsets_page_asof($mxPage, '$mxC', '$mxL'));")
+mxSeg=$(printf '%04X' $(( mxPage / 32 )))
+mxLP=$($P -c "SELECT md5(pg_read_binary_file('pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
+assert "$mxRP" "$mxLP" "multixact offsets: reconstructed page as-of L == the parent's live offsets file"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
