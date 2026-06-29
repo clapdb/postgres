@@ -1277,7 +1277,8 @@ pagestore_control_write_one(const ControlFileData *cf)
 	key.relNumber = 0;
 	key.forkNum = 0;
 
-	pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, buf);
+	pagestore_localsvc_obj_write_lsn(PS_KLASS_CONTROL, &key, 0, buf,
+									 cf->checkPoint);
 	pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
 }
 
