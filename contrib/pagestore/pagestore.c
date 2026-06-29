@@ -35,6 +35,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/multixact.h"
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
@@ -1943,6 +1944,230 @@ pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
 	if (ts == 0)
 		PG_RETURN_NULL();		/* no commit timestamp recorded for this xid */
 	PG_RETURN_TIMESTAMPTZ(ts);
+}
+
+/*
+ * multixact offsets reconstruction (M4): the same shape as the clog applier, for
+ * pg_multixact/offsets -- the multixid -> member-offset map.  Each XLOG_MULTIXACT_CREATE_ID
+ * record assigns one multixid its starting offset into the members file (what
+ * RecordNewMultiXact writes to the offsets SLRU), so reconstruction loads the offsets
+ * snapshot as of the base cutoff C and replays the create records in (C, L], writing each
+ * new multixid's offset into its page.  Offsets are fixed-width MultiXactOffset (uint32),
+ * MULTIXACT_OFFSETS_PER_PAGE to a page.  (The members file -- offset -> member list -- is
+ * the second half, a follow-up; this reconstructs the offsets map only.)
+ */
+#define PS_MXOFF_PER_PAGE	(BLCKSZ / (int) sizeof(MultiXactOffset))
+
+/* Write multixid's member offset into offsets page 'pageno' in 'page' if it lives there. */
+static void
+ps_mxoff_set(char *page, int64 pageno, MultiXactId multi, MultiXactOffset offset)
+{
+	int			entryno;
+
+	if (!MultiXactIdIsValid(multi) ||
+		(int64) (multi / PS_MXOFF_PER_PAGE) != pageno)
+		return;
+	entryno = multi % PS_MXOFF_PER_PAGE;
+	memcpy(page + (Size) entryno * sizeof(MultiXactOffset), &offset,
+		   sizeof(MultiXactOffset));
+}
+
+/* Replay (base_lsn, target_lsn] onto offsets page 'pageno'.  Mirrors ps_clog_apply_range:
+ * same straddle/zeropage/truncate/completeness handling, applying create-id offsets. */
+static PsClogReplay
+ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
+					 XLogRecPtr target_lsn)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	PsClogReplay r = {false, false, false};
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		if (XLogRecGetRmid(reader) != RM_MULTIXACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+
+		if (info == XLOG_MULTIXACT_ZERO_OFF_PAGE)
+		{
+			int64		zp;
+
+			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+			if (zp == pageno)
+			{
+				memset(page, 0, BLCKSZ);
+				r.page_zeroed = true;
+				r.page_truncated = false;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create *xlrec =
+				(xl_multixact_create *) XLogRecGetData(reader);
+			MultiXactOffset next = xlrec->moff + xlrec->nmembers;
+			MultiXactId succ;
+
+			/* RecordNewMultiXact writes this multixid's offset *and* the next
+			 * multixid's slot with the end offset (skipping 0 on wrap, like
+			 * GetNewMultiXactId), so a faithful page carries the successor entry
+			 * too -- and a consumer needs it to size this multixid's member run.
+			 * The successor wraps MaxMultiXactId -> FirstMultiXactId, matching
+			 * GetNewMultiXactId, so a fork across multixid wraparound is exact. */
+			ps_mxoff_set(page, pageno, xlrec->mid, xlrec->moff);
+			if (next == 0)
+				next = 1;
+			succ = (xlrec->mid == MaxMultiXactId) ? FirstMultiXactId : xlrec->mid + 1;
+			ps_mxoff_set(page, pageno, succ, next);
+		}
+		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate xlrec;
+			MultiXactId cutoff;
+
+			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
+			/* PerformOffsetsTruncation truncates to
+			 * MultiXactIdToOffsetPage(PreviousMultiXactId(endTruncOff)), keeping
+			 * that page's segment; a page is dropped only if its segment is below
+			 * it.  The bounded fork window cannot wrap, so segment order suffices. */
+			cutoff = (xlrec.endTruncOff == FirstMultiXactId) ? MaxMultiXactId
+				: xlrec.endTruncOff - 1;
+			if (pageno / SLRU_PAGES_PER_SEGMENT <
+				((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT)
+				r.page_truncated = true;
+		}
+	}
+
+	r.reached_target = (scanned >= target_lsn) ||
+		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
+		 ps_local_wal_limit() >= target_lsn);
+	XLogReaderFree(reader);
+	pfree(pd);
+	return r;
+}
+
+/* Load the base offsets page (snapshot as-of base_lsn) and replay (base, L].  Same
+ * fail-closed contract as ps_clog_reconstruct. */
+static bool
+ps_mxoff_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
+					 XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	bool		base_found;
+	uint64		resolved = 0;
+	PsClogReplay r;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_multixact/offsets");
+	base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												(BlockNumber) pageno,
+												(uint64) base_lsn, page, &resolved) &&
+		resolved == (uint64) base_lsn;
+
+	if (target_lsn == base_lsn)
+	{
+		if (!base_found)
+			ereport(ERROR,
+					(errmsg("pagestore: base offsets snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+		return true;
+	}
+
+	r = ps_mxoff_apply_range(page, pageno, base_lsn, target_lsn);
+
+	if (!r.reached_target && target_lsn != PG_UINT64_MAX)
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+	if (r.page_truncated)
+		return false;
+	if (!base_found && !r.page_zeroed)
+		ereport(ERROR,
+				(errmsg("pagestore: base offsets snapshot for page %lld is absent at %X/%08X",
+						(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	return true;
+}
+
+/*
+ * pagestore_multixact_offset_asof(multi xid, base pg_lsn, target pg_lsn) returns bigint --
+ * multixid 'multi's starting member offset as of 'target', or NULL if its offsets page was
+ * truncated away.
+ */
+PG_FUNCTION_INFO_V1(pagestore_multixact_offset_asof);
+Datum
+pagestore_multixact_offset_asof(PG_FUNCTION_ARGS)
+{
+	MultiXactId multi = PG_GETARG_TRANSACTIONID(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	int64		pageno = multi / PS_MXOFF_PER_PAGE;
+	int			entryno = multi % PS_MXOFF_PER_PAGE;
+	char	   *page = palloc(BLCKSZ);
+	MultiXactOffset offset;
+
+	if (!ps_mxoff_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();		/* multi's offsets page truncated away by the target LSN */
+
+	memcpy(&offset, page + (Size) entryno * sizeof(MultiXactOffset),
+		   sizeof(MultiXactOffset));
+	PG_RETURN_INT64((int64) offset);
+}
+
+/*
+ * pagestore_multixact_offsets_page_asof(pageno int, base pg_lsn, target pg_lsn) returns
+ * bytea -- the offsets page reconstructed as of 'target', or NULL if truncated away.  Lets
+ * a caller compare the reconstructed page to the live file byte-for-byte (endian-agnostic).
+ */
+PG_FUNCTION_INFO_V1(pagestore_multixact_offsets_page_asof);
+Datum
+pagestore_multixact_offsets_page_asof(PG_FUNCTION_ARGS)
+{
+	int32		pageno = PG_GETARG_INT32(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	char	   *page = palloc(BLCKSZ);
+	bytea	   *result;
+
+	if (!ps_mxoff_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
 }
 
 /*
