@@ -432,7 +432,11 @@ rm -rf "$(dirname "$SEEDOUT")"
 # xidB (> L); reconstructing as-of L must give xidA its real commit timestamp (matching the
 # parent's pg_xact_commit_timestamp) and xidB none -- per-record replay, no coalescing.
 $P -c "CREATE FUNCTION pagestore_commit_ts_asof(xid, pg_lsn, pg_lsn, xid) RETURNS timestamptz
-        AS 'pagestore','pagestore_commit_ts_asof' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_commit_ts_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_seed_commit_ts(text, pg_lsn, pg_lsn, xid, xid) RETURNS bigint
+        AS 'pagestore','pagestore_seed_commit_ts' LANGUAGE C STRICT;" >/dev/null
 echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"   # needs a restart to activate
 "$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
 $P -c "CREATE TABLE cts(id int) TABLESPACE ts;" >/dev/null
@@ -455,6 +459,20 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsB'::xid, '$ctsC', '$ctsL',
 # oldestCommitTsXid rejection after a truncation / before an activation)
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', ('$ctsA'::xid::text::bigint + 1)::text::xid) IS NULL;")" "t" \
 	"commit-ts: a xid below the as-of-L horizon (oldestCommitTsXid) returns NULL despite stale page bytes"
+CTSSEED=$(mktemp -d)
+cts_next=$(($ctsB + 1))
+ctsSeeded=$($P -c "SELECT pagestore_seed_commit_ts('$CTSSEED', '$ctsC', '$ctsL', '3'::xid, '$cts_next'::text::xid);")
+assert "$([ "${ctsSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"commit-ts seed materialized branch pg_commit_ts as-of L ($ctsSeeded page(s))"
+bs=$($P -c "SELECT current_setting('block_size')::int;")
+cts_entry_size=10
+cts_per_page=$(( bs / cts_entry_size ))
+ctsPage=$(( ctsA / cts_per_page ))
+ctsSeg=$(printf '%04X' $(( ctsPage / 32 )))
+ctsSeedMd5=$($P -c "SELECT md5(pg_read_binary_file('$CTSSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
+ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL'));")
+assert "$ctsSeedMd5" "$ctsReconMd5" "commit-ts seed page == reconstructed as-of-L page"
+rm -rf "$CTSSEED"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
@@ -513,7 +531,9 @@ assert "$mxRP" "$mxLP" "multixact offsets: reconstructed page as-of L == the par
 # equal the parent's live pg_multixact/members file byte-for-byte.  With the offsets half,
 # this resolves mA's members: the page holds its two FOR SHARE lockers at offset mOff.
 $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
-        AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
 # MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
 # the group is 4 flag bytes + 4 TransactionIds = 20 bytes, 4 members each (block-size derived)
@@ -530,6 +550,16 @@ assert "$mbRecon" "$mbLive" "multixact members: reconstructed page as-of L == th
 # rather than decoding the TransactionIds, which keeps the check endian-agnostic.)
 mbParent=$($P -c "SELECT count(*) FROM pg_get_multixact_members('$mA');" 2>/dev/null)
 assert "$mbParent" "2" "multixact members: the parent resolves mA to its two members from those pages"
+MXSEED=$(mktemp -d)
+mxNext=$(( mA + 1 ))
+mxSeeded=$($P -c "SELECT pagestore_seed_multixact('$MXSEED', '$mxC', '$mxL', '$mA'::xid, '$mxNext'::text::xid, $mOff, $((mOff + mxMembers)));")
+assert "$([ "${mxSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"multixact seed materialized offsets+members SLRUs as-of L ($mxSeeded page(s))"
+mxSeedOff=$($P -c "SELECT md5(pg_read_binary_file('$MXSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
+mxSeedMem=$($P -c "SELECT md5(pg_read_binary_file('$MXSEED/pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
+assert "$mxSeedOff" "$mxRP" "multixact seed offsets page == reconstructed as-of-L page"
+assert "$mxSeedMem" "$mbRecon" "multixact seed members page == reconstructed as-of-L page"
+rm -rf "$MXSEED"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

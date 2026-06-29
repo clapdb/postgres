@@ -1946,6 +1946,25 @@ pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
 	PG_RETURN_TIMESTAMPTZ(ts);
 }
 
+PG_FUNCTION_INFO_V1(pagestore_commit_ts_page_asof);
+Datum
+pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
+{
+	int32		pageno = PG_GETARG_INT32(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	char	   *page = palloc(BLCKSZ);
+	bytea	   *result;
+
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
 /*
  * multixact offsets reconstruction (M4): the same shape as the clog applier, for
  * pg_multixact/offsets -- the multixid -> member-offset map.  Each XLOG_MULTIXACT_CREATE_ID
@@ -2396,6 +2415,149 @@ pagestore_multixact_members_page_asof(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+typedef bool (*SlruPageReconstructFn) (char *page, int64 pageno,
+									   XLogRecPtr base_lsn,
+									   XLogRecPtr target_lsn);
+
+static int64
+pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
+						  int64 page_lo, int64 page_hi,
+						  SlruPageReconstructFn reconstruct,
+						  XLogRecPtr base, XLogRecPtr target,
+						  const char *label)
+{
+	char		dstdir[MAXPGPATH];
+	char		stagedir[MAXPGPATH];
+	char	   *pages;
+	bool	   *present;
+	int64		seg_lo,
+				seg_hi,
+				req_lo,
+				req_hi,
+				seg,
+				p;
+	int			np;
+	int64		seeded = 0;
+
+	if (page_hi < page_lo)
+		return 0;
+	if (strlen(target_dir) + strlen(slru_dir) + sizeof("/.tmp/000000.tmp") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	req_lo = page_lo;
+	req_hi = page_hi;
+	seg_lo = req_lo / SLRU_PAGES_PER_SEGMENT;
+	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
+	seg_hi = req_hi / SLRU_PAGES_PER_SEGMENT;
+	page_hi = req_hi;
+	np = (int) (page_hi - page_lo + 1);
+
+	pages = palloc((Size) np * BLCKSZ);
+	present = palloc0(np * sizeof(bool));
+	for (p = 0; p < np; p++)
+	{
+		int64		pageno = page_lo + p;
+
+		if (pageno < req_lo)
+		{
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+			continue;
+		}
+		present[p] = reconstruct(pages + p * BLCKSZ, pageno, base, target);
+	}
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	snprintf(dstdir, sizeof(dstdir), "%s/%s", target_dir, slru_dir);
+	snprintf(stagedir, sizeof(stagedir), "%s/%s.tmp", target_dir, slru_dir);
+
+	if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
+	if (MakePGDirectory(stagedir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+
+	for (seg = seg_lo; seg <= seg_hi; seg++)
+	{
+		char		segpath[MAXPGPATH];
+		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
+		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
+		int			fd;
+		int64		trim_last = last;
+
+		while (trim_last >= first && !present[trim_last - page_lo])
+			trim_last--;
+		if (trim_last < first)
+			continue;
+
+		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
+		fd = OpenTransientFilePerm(segpath,
+								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+								   pg_file_create_mode);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch %s segment \"%s\": %m",
+							label, segpath)));
+		for (p = first; p <= trim_last; p++)
+		{
+			const char *src;
+			char		zerobuf[BLCKSZ];
+
+			if (present[p - page_lo])
+				src = pages + (p - page_lo) * BLCKSZ;
+			else
+			{
+				memset(zerobuf, 0, sizeof(zerobuf));
+				src = zerobuf;
+			}
+			if (write(fd, src, BLCKSZ) != BLCKSZ)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write branch %s segment \"%s\": %m",
+								label, segpath)));
+			}
+			seeded++;
+		}
+		if (pg_fsync(fd) != 0)
+		{
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync branch %s segment \"%s\": %m",
+							label, segpath)));
+		}
+		if (CloseTransientFile(fd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close branch %s segment \"%s\": %m",
+							label, segpath)));
+	}
+	fsync_fname(stagedir, true);
+	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing %s dir \"%s\"", label, dstdir)));
+	if (rename(stagedir, dstdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch %s dir \"%s\": %m", label, dstdir)));
+	fsync_fname(target_dir, true);
+
+	pfree(present);
+	pfree(pages);
+	return seeded;
+}
+
 /*
  * pagestore_seed_clog(target_dir text, base pg_lsn, target pg_lsn,
  *					   oldest_xid xid, next_xid xid) returns bigint
@@ -2716,6 +2878,133 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 				 errmsg("could not publish branch clog \"%s\": %m", dstdir)));
 	fsync_fname(target_dir, true);	/* the now-live pg_xact directory entry */
 
+	PG_RETURN_INT64(seeded);
+}
+
+/*
+ * pagestore_seed_commit_ts(target_dir text, base pg_lsn, target pg_lsn,
+ *                          oldest_xid xid, next_xid xid) returns bigint
+ *
+ * Materialize pg_commit_ts as of target into a branch data directory.  The xid
+ * horizon is the branch's commit-ts validity window as of target; pages outside
+ * it are intentionally not seeded.
+ */
+PG_FUNCTION_INFO_V1(pagestore_seed_commit_ts);
+Datum
+pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	int64		page_lo,
+				page_hi;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch commit-ts")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
+	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
+	if (page_hi < page_lo)
+		ereport(ERROR,
+				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; commit-ts seeding across wrap is not supported",
+						oldest_xid, next_xid)));
+
+	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
+											 page_lo, page_hi,
+											 ps_commit_ts_reconstruct,
+											 base, target, "commit-ts"));
+}
+
+/*
+ * pagestore_seed_multixact(target_dir text, base pg_lsn, target pg_lsn,
+ *                          oldest_multi xid, next_multi xid,
+ *                          oldest_member bigint, next_member bigint) returns bigint
+ *
+ * Materialize pg_multixact/offsets and pg_multixact/members as of target into a
+ * branch data directory.  The caller supplies the branch horizons from pg_control.
+ */
+PG_FUNCTION_INFO_V1(pagestore_seed_multixact);
+Datum
+pagestore_seed_multixact(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(3);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(4);
+	int64		oldest_member = PG_GETARG_INT64(5);
+	int64		next_member = PG_GETARG_INT64(6);
+	int64		off_page_lo,
+				off_page_hi,
+				mem_page_lo,
+				mem_page_hi;
+	int64		seeded = 0;
+	char		mxdir[MAXPGPATH];
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch multixact")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!MultiXactIdIsValid(oldest_multi) || !MultiXactIdIsValid(next_multi) ||
+		oldest_multi > next_multi)
+		ereport(ERROR,
+				(errmsg("invalid fork multixact horizon [%u, %u)",
+						oldest_multi, next_multi)));
+	if (oldest_member < 0 || next_member < oldest_member ||
+		next_member > UINT32_MAX)
+		ereport(ERROR,
+				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
+						(long long) oldest_member, (long long) next_member)));
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	snprintf(mxdir, sizeof(mxdir), "%s/pg_multixact", target_dir);
+	if (MakePGDirectory(mxdir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch multixact dir \"%s\": %m", mxdir)));
+
+	if (next_multi > oldest_multi)
+	{
+		off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
+		off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+		seeded += pagestore_seed_slru_pages(target_dir, "pg_multixact/offsets",
+											off_page_lo, off_page_hi,
+											ps_mxoff_reconstruct,
+											base, target, "multixact offsets");
+	}
+	if (next_member > oldest_member)
+	{
+		mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+		mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+		seeded += pagestore_seed_slru_pages(target_dir, "pg_multixact/members",
+											mem_page_lo, mem_page_hi,
+											ps_mxmemb_reconstruct,
+											base, target, "multixact members");
+	}
+
+	fsync_fname(mxdir, true);
 	PG_RETURN_INT64(seeded);
 }
 
