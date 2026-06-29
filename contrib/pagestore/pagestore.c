@@ -1946,18 +1946,132 @@ pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pagestore_commit_ts_page_asof(pageno int, base pg_lsn, target pg_lsn) returns bytea --
+ * the commit-ts page reconstructed as of 'target', or NULL if truncated away.
+ */
+PG_FUNCTION_INFO_V1(pagestore_commit_ts_page_asof);
+Datum
+pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
+{
+	int32		pageno = PG_GETARG_INT32(0);
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	char	   *page = palloc(BLCKSZ);
+	bytea	   *result;
+
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+		PG_RETURN_NULL();
+
+	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
+	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
+	memcpy(VARDATA(result), page, BLCKSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * Atomically publish a reconstructed short-name SLRU into <target_dir>/<slru>.  Every
+ * segment is staged under a sibling <slru>.tmp and fsynced, then the whole directory is
+ * swapped into place with a single rename (first removing any existing <slru>, e.g. an
+ * initdb default).  Any failure leaves only the staging directory, never a partly
+ * populated live SLRU, so a multi-segment seed is all-or-nothing.  'pages' holds
+ * [page_lo, page_hi] contiguously; whole segments [seg_lo, seg_hi] are written (the last
+ * trimmed to page_hi).  Returns the page count.  Shared by the clog and commit-ts seeders;
+ * the "%04X" name and single-component <slru> fit every short-name SLRU we seed.
+ */
+static int64
+ps_slru_publish_segments(const char *target_dir, const char *slru,
+						 const char *pages, int64 page_lo, int64 page_hi,
+						 int64 seg_lo, int64 seg_hi)
+{
+	char		dstdir[MAXPGPATH];
+	char		stagedir[MAXPGPATH];
+	int64		seg,
+				p,
+				written = 0;
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	snprintf(dstdir, sizeof(dstdir), "%s/%s", target_dir, slru);
+	snprintf(stagedir, sizeof(stagedir), "%s/%s.tmp", target_dir, slru);
+	/* start from an empty staging dir so a leftover from an interrupted retry can't leak
+	 * stale segments through the rename */
+	if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
+	if (MakePGDirectory(stagedir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+
+	for (seg = seg_lo; seg <= seg_hi; seg++)
+	{
+		char		segpath[MAXPGPATH];
+		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
+		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
+		int			fd;
+
+		if (last > page_hi)
+			last = page_hi;
+		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
+		fd = OpenTransientFilePerm(segpath,
+								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+								   pg_file_create_mode);
+		if (fd < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch segment \"%s\": %m", segpath)));
+		for (p = first; p <= last; p++)
+		{
+			if (write(fd, pages + (p - page_lo) * BLCKSZ, BLCKSZ) != BLCKSZ)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write branch segment \"%s\": %m", segpath)));
+			}
+			written++;
+		}
+		if (pg_fsync(fd) != 0)
+		{
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not fsync branch segment \"%s\": %m", segpath)));
+		}
+		/* a close error can surface a deferred write failure -- fail the seed */
+		if (CloseTransientFile(fd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close branch segment \"%s\": %m", segpath)));
+	}
+	fsync_fname(stagedir, true);	/* segment entries durable inside the staging dir */
+	/* a branch datadir is initdb'd, so <slru> already exists (BootStrap default);
+	 * rename() onto a non-empty dir fails with ENOTEMPTY, so remove it first */
+	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing SLRU dir \"%s\"", dstdir)));
+	if (rename(stagedir, dstdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch SLRU \"%s\": %m", dstdir)));
+	fsync_fname(target_dir, true);	/* the now-live SLRU directory entry */
+	return written;
+}
+
+/*
  * pagestore_seed_clog(target_dir text, base pg_lsn, target pg_lsn,
  *					   oldest_xid xid, next_xid xid) returns bigint
  *
  * M4 step 3 (branch create): materialize a new branch's clog as of fork LSN 'target'
- *
- * M4 step 3 (branch create): materialize a new branch's clog as of fork LSN 'target'
  * into <target_dir>/pg_xact, by reconstructing each page (base snapshot at 'base' +
  * replay of (base, target]) over the fork's clog horizon [oldest_xid, next_xid) and
- * writing whole segments.  The branch then
- * boots on this clog and writes its own status forward on its timeline.  Fails closed
- * (ereport) on any error -- a half-seeded clog must never boot.  Returns the page
- * count.  clog only; multixact/commit-ts seed the same way (follow-up).
+ * writing whole segments.  The branch then boots on this clog and writes its own status
+ * forward on its timeline.  Fails closed (ereport) on any error -- a half-seeded clog
+ * must never boot.  Returns the page count.
  */
 PG_FUNCTION_INFO_V1(pagestore_seed_clog);
 Datum
@@ -1968,14 +2082,11 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	XLogRecPtr	target = PG_GETARG_LSN(2);
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
-	char		dstdir[MAXPGPATH];
-	char		stagedir[MAXPGPATH];
 	PageStoreRelKey key;
 	int64		page_lo,
 				page_hi,
 				seg_lo,
 				seg_hi,
-				seg,
 				p;
 	int			np;
 	char	   *pages;
@@ -2181,90 +2292,240 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 					(errmsg("pagestore: base clog snapshot for page %lld is absent at %X/%08X",
 							(long long) (page_lo + p), LSN_FORMAT_ARGS(base))));
 
-	/*
-	 * Publish atomically at directory granularity: stage every segment under a
-	 * sibling pg_xact.tmp, fsync it, then swap the whole directory into place with a
-	 * single rename().  Any failure -- a write, an fsync, a missing base -- leaves
-	 * only the staging directory, never a partly-populated live pg_xact, so a
-	 * multi-segment seed is all-or-nothing even if it aborts between segments.
-	 */
-	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(dstdir, sizeof(dstdir), "%s/pg_xact", target_dir);
-	snprintf(stagedir, sizeof(stagedir), "%s/pg_xact.tmp", target_dir);
-	/* Start from an empty staging dir.  A leftover pg_xact.tmp from an interrupted
-	 * retry could hold hex-named segments outside this seed's [seg_lo, seg_hi]; those
-	 * stale files would survive the rename and pollute the branch's live pg_xact, so
-	 * remove the whole staging dir first rather than reusing it. */
-	if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
-	if (MakePGDirectory(stagedir) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+	/* atomically publish the reconstructed pages as <target_dir>/pg_xact */
+	seeded = ps_slru_publish_segments(target_dir, "pg_xact", pages,
+									  page_lo, page_hi, seg_lo, seg_hi);
+	PG_RETURN_INT64(seeded);
+}
 
-	for (seg = seg_lo; seg <= seg_hi; seg++)
+/* Set xid's (ts, nodeid) across the multi-page commit-ts seed buffer (mirrors
+ * ps_clog_seed_set for the seeder's single multi-page WAL pass). */
+static inline void
+ps_commit_ts_seed_set(char *pages, int64 page_lo, int np, TransactionId xid,
+					  TimestampTz ts, RepOriginId nodeid)
+{
+	int64		pg;
+
+	if (!TransactionIdIsNormal(xid))
+		return;
+	pg = (int64) xid / PS_CTS_XACTS_PER_PAGE;
+	if (pg < page_lo || pg >= page_lo + np)
+		return;
+	ps_commit_ts_set(pages + (pg - page_lo) * BLCKSZ, pg, xid, ts, nodeid);
+}
+
+/*
+ * pagestore_seed_commit_ts(target_dir text, base pg_lsn, target pg_lsn,
+ *						   oldest_xid xid, next_xid xid) returns bigint
+ *
+ * M4 branch create for pg_commit_ts: the same shape as pagestore_seed_clog, reconstructing
+ * each commit-ts page (base snapshot at C + replay of (C, L]) and atomically publishing
+ * <target_dir>/pg_commit_ts.  Here [oldest_xid, next_xid) is the commit-ts *validity*
+ * window as of L -- the caller passes the parent's oldestCommitTsXid..nextXid from
+ * pg_control, not the full clog horizon (commit-ts has its own oldest, e.g. when
+ * track_commit_timestamp was enabled late or after a commit-ts truncation).  Fails closed
+ * on incomplete WAL, a track_commit_timestamp deactivation in the window, or any absent
+ * base page in the window -- a missing snapshot or an inactive-commit-ts window (off, or an
+ * off->on activation inside it) leaves a page unbacked, and we refuse rather than seed NULL
+ * timestamps for commits the parent recorded.
+ */
+PG_FUNCTION_INFO_V1(pagestore_seed_commit_ts);
+Datum
+pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	PageStoreRelKey key;
+	int64		page_lo,
+				page_hi,
+				seg_lo,
+				seg_hi,
+				p;
+	int			np;
+	char	   *pages;
+	bool	   *established;
+	bool		deactivated = false;
+	XLogRecPtr	scanned = base;
+	XLogRecPtr	readfrom;
+	ReadLocalXLogPageNoWaitPrivate *pd;
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	int64		seeded;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed a branch commit-ts")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	/* commit-ts has ~819 xids/page, so its segment numbers run to 5 hex digits (far more
+	 * than clog's 4); budget for the widest uint32 segment name (8 hex) so ps_slru_publish
+	 * never truncates <target_dir>/pg_commit_ts.tmp/XXXXXXXX */
+	if (strlen(target_dir) + sizeof("/pg_commit_ts.tmp/00000000") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
+	seg_lo = page_lo / SLRU_PAGES_PER_SEGMENT;
+	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
+	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
+	seg_hi = page_hi / SLRU_PAGES_PER_SEGMENT;
+	if (page_hi < page_lo)
+		ereport(ERROR,
+				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; commit-ts seeding across wrap is not supported",
+						oldest_xid, next_xid)));
+	np = (int) (page_hi - page_lo + 1);
+
+	/* [oldest_xid, next_xid) is the commit-ts *validity* window as of L -- the caller passes
+	 * the parent's oldestCommitTsXid..nextXid from pg_control, not the full clog horizon --
+	 * so every page in it must exist in the snapshot.  A page that is absent (and not
+	 * (re)created by an in-range zero-page) means either the base snapshot is missing or
+	 * commit-ts was inactive across this window (no pg_commit_ts to branch, e.g. an off->on
+	 * activation inside it); fail closed below rather than publish NULL timestamps for
+	 * commits the parent actually recorded. */
+	pages = palloc((Size) np * BLCKSZ);
+	established = palloc0(np * sizeof(bool));
+	slru_obj_key(&key, "pg_commit_ts");
+	for (p = 0; p < np; p++)
 	{
-		char		segpath[MAXPGPATH];
-		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
-		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
-		int			fd;
+		uint64		resolved = 0;
 
-		if (last > page_hi)
-			last = page_hi;
-		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
-		fd = OpenTransientFilePerm(segpath,
-								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
-								   pg_file_create_mode);
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create branch segment \"%s\": %m", segpath)));
-		for (p = first; p <= last; p++)
-		{
-			if (write(fd, pages + (p - page_lo) * BLCKSZ, BLCKSZ) != BLCKSZ)
-			{
-				CloseTransientFile(fd);
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not write branch segment \"%s\": %m", segpath)));
-			}
-			seeded++;
-		}
-		if (pg_fsync(fd) != 0)
-		{
-			CloseTransientFile(fd);
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not fsync branch segment \"%s\": %m", segpath)));
-		}
-		/* a close error can surface a deferred write failure -- fail the seed */
-		if (CloseTransientFile(fd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close branch segment \"%s\": %m", segpath)));
+		established[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+													   (BlockNumber) (page_lo + p),
+													   (uint64) base,
+													   pages + p * BLCKSZ, &resolved) &&
+			resolved == (uint64) base;
 	}
-	fsync_fname(stagedir, true);	/* segment entries durable inside the staging dir */
-	/*
-	 * A branch datadir is initdb'd, so pg_xact already exists with BootStrapCLOG's
-	 * 0000; rename() onto a non-empty directory fails with ENOTEMPTY.  Remove the
-	 * default first, then swap the staged dir in.  (The branch is not yet running, and
-	 * a crash in the gap is recoverable by re-seeding -- the staging dir is rebuilt.)
-	 */
-	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove existing clog dir \"%s\"", dstdir)));
-	if (rename(stagedir, dstdir) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not publish branch clog \"%s\": %m", dstdir)));
-	fsync_fname(target_dir, true);	/* the now-live pg_xact directory entry */
 
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	if (target == base)
+		readfrom = InvalidXLogRecPtr;
+	else
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+		readfrom = XLogFindNextRecord(reader, readfrom);
+	}
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+		RmgrId		rmid;
+		TransactionId xid;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target)
+			break;
+		if (reader->EndRecPtr <= base)
+			continue;
+		rmid = XLogRecGetRmid(reader);
+
+		if (rmid == RM_COMMIT_TS_ID)
+		{
+			uint8		cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+			if (cinfo == COMMIT_TS_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp >= page_lo && zp <= page_hi)
+				{
+					memset(pages + (zp - page_lo) * BLCKSZ, 0, BLCKSZ);
+					established[zp - page_lo] = true;
+				}
+			}
+			else if (cinfo == COMMIT_TS_TRUNCATE)
+			{
+				xl_commit_ts_truncate xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), SizeOfCommitTsTruncate);
+				if (xlrec.pageno / SLRU_PAGES_PER_SEGMENT > seg_lo)
+					ereport(ERROR,
+							(errmsg("pagestore: commit-ts truncation to page %lld occurs within (base, target]; horizon is stale",
+									(long long) xlrec.pageno)));
+			}
+			continue;
+		}
+		if (rmid == RM_XLOG_ID)
+		{
+			if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_PARAMETER_CHANGE)
+			{
+				xl_parameter_change xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				if (!xlrec.track_commit_timestamp)
+					deactivated = true;
+			}
+			continue;
+		}
+		if (rmid != RM_XACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED)
+		{
+			xl_xact_parsed_commit parsed;
+			TimestampTz ts;
+			RepOriginId origin = XLogRecGetOrigin(reader);
+
+			ParseCommitRecord(XLogRecGetInfo(reader),
+							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+			ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
+				: parsed.xact_time;
+			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
+				: XLogRecGetXid(reader);
+			ps_commit_ts_seed_set(pages, page_lo, np, xid, ts, origin);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				ps_commit_ts_seed_set(pages, page_lo, np, parsed.subxacts[i], ts, origin);
+		}
+	}
+	XLogReaderFree(reader);
+	pfree(pd);
+
+	if (scanned < target && target != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot seed commit-ts as of %X/%08X",
+						LSN_FORMAT_ARGS(target))));
+	if (deactivated)
+		ereport(ERROR,
+				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts seeding across a toggle is not supported")));
+	/* every page in the commit-ts validity window must be backed by the snapshot (or an
+	 * in-range zero-page); a still-unestablished page means a missing base snapshot or an
+	 * inactive-commit-ts window -- fail closed rather than seed NULL timestamps */
+	for (p = 0; p < np; p++)
+		if (!established[p])
+			ereport(ERROR,
+					(errmsg("pagestore: base commit-ts snapshot for page %lld is absent at %X/%08X (commit-ts inactive across the window, or snapshot not shipped)",
+							(long long) (page_lo + p), LSN_FORMAT_ARGS(base))));
+	seeded = ps_slru_publish_segments(target_dir, "pg_commit_ts", pages,
+									  page_lo, page_hi, seg_lo, seg_hi);
 	PG_RETURN_INT64(seeded);
 }
 
