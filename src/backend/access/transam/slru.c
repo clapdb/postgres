@@ -192,6 +192,8 @@ static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 /* Optional hooks to mirror/serve SLRU pages to/from an external store. */
 SlruPageWriteHook_type slru_page_write_hook = NULL;
 SlruPageReadHook_type slru_page_read_hook = NULL;
+SlruPageExistsHook_type slru_page_exists_hook = NULL;
+SlruPageTruncateHook_type slru_page_truncate_hook = NULL;
 
 
 /*
@@ -786,7 +788,11 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 	{
 		/* expected: file doesn't exist */
 		if (errno == ENOENT)
+		{
+			if (slru_page_exists_hook)
+				return slru_page_exists_hook(ctl, pageno);
 			return false;
+		}
 
 		/* report error normally */
 		slru_errcause = SLRU_OPEN_FAILED;
@@ -809,6 +815,9 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 		slru_errno = errno;
 		return false;
 	}
+
+	if (!result && slru_page_exists_hook)
+		result = slru_page_exists_hook(ctl, pageno);
 
 	return result;
 }
@@ -833,15 +842,6 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	char		path[MAXPGPATH];
 	int			fd;
 
-	/*
-	 * Serve the page from an external store if a hook is installed and has it
-	 * (e.g. contrib/pagestore lets a compute read SLRU pages from the shared
-	 * store).  On a miss the hook returns false and we read the local segment.
-	 */
-	if (slru_page_read_hook &&
-		slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
-		return true;
-
 	SlruFileName(ctl, path, segno);
 
 	/*
@@ -854,6 +854,10 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
+		if (errno == ENOENT && slru_page_read_hook &&
+			slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
+			return true;
+
 		if (errno != ENOENT || !InRecovery)
 		{
 			slru_errcause = SLRU_OPEN_FAILED;
@@ -1522,6 +1526,9 @@ restart:
 
 	LWLockRelease(&shared->bank_locks[prevbank].lock);
 
+	if (slru_page_truncate_hook)
+		slru_page_truncate_hook(ctl, cutoffPage);
+
 	/* Now we can remove the old segment(s) */
 	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
 }
@@ -1536,6 +1543,7 @@ static void
 SlruInternalDeleteSegment(SlruCtl ctl, int64 segno)
 {
 	char		path[MAXPGPATH];
+	int64		cutoffPage = (segno + 1) * SLRU_PAGES_PER_SEGMENT;
 
 	/* Forget any fsync requests queued for this segment. */
 	if (ctl->sync_handler != SYNC_HANDLER_NONE)
@@ -1550,6 +1558,9 @@ SlruInternalDeleteSegment(SlruCtl ctl, int64 segno)
 	SlruFileName(ctl, path, segno);
 	ereport(DEBUG2, (errmsg_internal("removing file \"%s\"", path)));
 	unlink(path);
+
+	if (slru_page_truncate_hook)
+		slru_page_truncate_hook(ctl, cutoffPage);
 }
 
 /*

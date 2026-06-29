@@ -1198,6 +1198,47 @@ slru_klass_id(const char *dir)
 
 static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
 static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
+static SlruPageExistsHook_type prev_slru_page_exists_hook = NULL;
+static SlruPageTruncateHook_type prev_slru_page_truncate_hook = NULL;
+
+static void
+slru_page_key(SlruCtl ctl, PageStoreRelKey *key)
+{
+	key->spcOid = 0;
+	key->dbOid = 0;
+	key->relNumber = slru_klass_id(ctl->Dir);
+	key->forkNum = 0;
+}
+
+static void
+slru_cutoff_key(SlruCtl ctl, PageStoreRelKey *key)
+{
+	slru_page_key(ctl, key);
+	key->forkNum = 1;
+}
+
+static bool
+pagestore_slru_get_cutoff(SlruCtl ctl, BlockNumber *cutoff)
+{
+	PageStoreRelKey key;
+	char		buf[BLCKSZ];
+
+	slru_cutoff_key(ctl, &key);
+	if (!pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, 0, buf))
+		return false;
+	memcpy(cutoff, buf, sizeof(*cutoff));
+	return true;
+}
+
+static bool
+pagestore_slru_page_is_truncated(SlruCtl ctl, int64 pageno)
+{
+	BlockNumber cutoff;
+
+	if (!pagestore_slru_get_cutoff(ctl, &cutoff))
+		return false;
+	return pageno < (int64) cutoff;
+}
 
 /*
  * SLRU page-write hook (installed into slru.c): mirror each just-written SLRU
@@ -1233,10 +1274,7 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	if (CritSectionCount > 0)
 		return;
 
-	key.spcOid = 0;
-	key.dbOid = 0;
-	key.relNumber = slru_klass_id(ctl->Dir);
-	key.forkNum = 0;
+	slru_page_key(ctl, &key);
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
@@ -1293,16 +1331,14 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	if (CritSectionCount > 0)
 		return false;
 
-	key.spcOid = 0;
-	key.dbOid = 0;
-	key.relNumber = slru_klass_id(ctl->Dir);
-	key.forkNum = 0;
+	slru_page_key(ctl, &key);
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
-		served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
-											 (BlockNumber) pageno, page);
+		if (!pagestore_slru_page_is_truncated(ctl, pageno))
+			served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
+												 (BlockNumber) pageno, page);
 	}
 	PG_CATCH();
 	{
@@ -1318,6 +1354,96 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	}
 	PG_END_TRY();
 	return served;
+}
+
+static bool
+pagestore_slru_exists_hook(SlruCtl ctl, int64 pageno)
+{
+	PageStoreRelKey key;
+	bool		exists = false;
+	MemoryContext oldcontext;
+
+	if (prev_slru_page_exists_hook &&
+		prev_slru_page_exists_hook(ctl, pageno))
+		return true;
+	if (!pagestore_slru_read_from_store)
+		return false;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+	if (pageno < 0 || pageno > (int64) UINT32_MAX)
+		return false;
+	if (CritSectionCount > 0)
+		return false;
+
+	slru_page_key(ctl, &key);
+
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		char		buf[BLCKSZ];
+
+		if (!pagestore_slru_page_is_truncated(ctl, pageno))
+			exists = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
+												 (BlockNumber) pageno, buf);
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
+		exists = false;
+	}
+	PG_END_TRY();
+	return exists;
+}
+
+static void
+pagestore_slru_truncate_hook(SlruCtl ctl, int64 cutoffPage)
+{
+	PageStoreRelKey key;
+	MemoryContext oldcontext;
+
+	if (prev_slru_page_truncate_hook)
+		prev_slru_page_truncate_hook(ctl, cutoffPage);
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+	if (cutoffPage < 0 || cutoffPage > (int64) UINT32_MAX)
+		return;
+	if (CritSectionCount > 0)
+		return;
+
+	slru_cutoff_key(ctl, &key);
+
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		BlockNumber oldcutoff = 0;
+		BlockNumber newcutoff = (BlockNumber) cutoffPage;
+		char		buf[BLCKSZ];
+
+		(void) pagestore_slru_get_cutoff(ctl, &oldcutoff);
+		if (newcutoff > oldcutoff)
+		{
+			memset(buf, 0, sizeof(buf));
+			memcpy(buf, &newcutoff, sizeof(newcutoff));
+			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, 0, buf);
+		}
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -1435,6 +1561,10 @@ _PG_init(void)
 	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
 	prev_slru_page_write_hook = slru_page_write_hook;
 	prev_slru_page_read_hook = slru_page_read_hook;
+	prev_slru_page_exists_hook = slru_page_exists_hook;
+	prev_slru_page_truncate_hook = slru_page_truncate_hook;
 	slru_page_write_hook = pagestore_slru_write_hook;
 	slru_page_read_hook = pagestore_slru_read_hook;
+	slru_page_exists_hook = pagestore_slru_exists_hook;
+	slru_page_truncate_hook = pagestore_slru_truncate_hook;
 }
