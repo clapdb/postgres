@@ -1400,11 +1400,10 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 static bool pagestore_slru_read_from_store = false;
 
 /*
- * SLRU page-read hook (installed into slru.c): during recovery, serve a missing
- * local SLRU page from the store.  We intentionally do not use this as an active
- * multi-compute consistency path: normal commit/multixact updates can remain
- * dirty in shared SLRU buffers until checkpoint/eviction, and already-cached SLRU
- * pages have no cross-compute invalidation.  Best-effort: any error falls back.
+ * SLRU page-read hook (installed into slru.c): serve a missing local SLRU page
+ * from the store.  slru.c calls this only after the local segment read misses,
+ * so local files remain authoritative when present.  Best-effort: any error
+ * falls back.
  */
 static bool
 pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
@@ -1418,8 +1417,6 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 		return true;
 
 	if (!pagestore_slru_read_from_store)
-		return false;
-	if (!InRecovery)
 		return false;
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return false;
@@ -1465,8 +1462,6 @@ pagestore_slru_exists_hook(SlruCtl ctl, int64 pageno)
 		prev_slru_page_exists_hook(ctl, pageno))
 		return true;
 	if (!pagestore_slru_read_from_store)
-		return false;
-	if (!InRecovery)
 		return false;
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return false;
@@ -1653,9 +1648,9 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.slru_read_from_store",
-							 "Serve missing SLRU pages (clog, ...) from the page store during recovery.",
-							 "This is a recovery/bootstrap fallback for absent local SLRU files, not "
-							 "an active multi-compute consistency mechanism.",
+							 "Serve missing SLRU pages (clog, ...) from the page store.",
+							 "Local SLRU files remain authoritative when present; the store is used "
+							 "only for local misses.",
 							 &pagestore_slru_read_from_store,
 							 false,
 							 PGC_SIGHUP,
