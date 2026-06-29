@@ -3665,9 +3665,11 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
  * returns void
  *
  * Install the artifacts produced by pagestore_prepare_branch() into an
- * initdb/copied branch datadir.  The manifest is installed last so its presence
- * remains the startup-time signal that the datadir has a prepared branch
- * identity and must pass timeline validation.
+ * initdb/copied branch datadir.  For now, only the boot-critical pg_xact plus
+ * manifest are installed; optional SLRUs stay in the prepared artifact until a
+ * full bootstrap path has pg_control-aware activation for them.  The manifest is
+ * installed last so its presence remains the startup-time signal that the datadir
+ * has a prepared branch identity and must pass timeline validation.
  */
 PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
@@ -3686,8 +3688,6 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", false);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", false);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
 									"pagestore_branch.manifest");
 
