@@ -1167,6 +1167,9 @@ pagestore_object_get(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (pageno < 0)
+		ereport(ERROR,
+				(errmsg("SLRU page number must be non-negative")));
 
 	key.spcOid = 0;
 	key.dbOid = 0;
@@ -1200,6 +1203,19 @@ static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
 static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
 static SlruPageExistsHook_type prev_slru_page_exists_hook = NULL;
 static SlruPageTruncateHook_type prev_slru_page_truncate_hook = NULL;
+
+typedef struct PendingSlruMirror
+{
+	bool		valid;
+	PageStoreRelKey key;
+	BlockNumber block;
+	char		page[BLCKSZ];
+} PendingSlruMirror;
+
+#define PAGESTORE_PENDING_SLRU_MIRRORS 64
+
+static PendingSlruMirror pending_slru_mirrors[PAGESTORE_PENDING_SLRU_MIRRORS];
+static bool flushing_pending_slru_mirrors = false;
 
 static void
 slru_page_key(SlruCtl ctl, PageStoreRelKey *key)
@@ -1240,6 +1256,83 @@ pagestore_slru_page_is_truncated(SlruCtl ctl, int64 pageno)
 	return pageno < (int64) cutoff;
 }
 
+static void
+pagestore_slru_enqueue_mirror(const PageStoreRelKey *key, BlockNumber block,
+							  const char *page)
+{
+	int			free_slot = -1;
+
+	for (int i = 0; i < PAGESTORE_PENDING_SLRU_MIRRORS; i++)
+	{
+		PendingSlruMirror *pending = &pending_slru_mirrors[i];
+
+		if (pending->valid &&
+			pending->key.spcOid == key->spcOid &&
+			pending->key.dbOid == key->dbOid &&
+			pending->key.relNumber == key->relNumber &&
+			pending->key.forkNum == key->forkNum &&
+			pending->block == block)
+		{
+			memcpy(pending->page, page, BLCKSZ);
+			return;
+		}
+		if (!pending->valid && free_slot < 0)
+			free_slot = i;
+	}
+
+	if (free_slot < 0)
+		free_slot = 0;
+
+	pending_slru_mirrors[free_slot].valid = true;
+	pending_slru_mirrors[free_slot].key = *key;
+	pending_slru_mirrors[free_slot].block = block;
+	memcpy(pending_slru_mirrors[free_slot].page, page, BLCKSZ);
+}
+
+static void
+pagestore_slru_flush_pending_mirrors(void)
+{
+	MemoryContext oldcontext;
+
+	if (flushing_pending_slru_mirrors || CritSectionCount > 0)
+		return;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	flushing_pending_slru_mirrors = true;
+	oldcontext = CurrentMemoryContext;
+
+	for (int i = 0; i < PAGESTORE_PENDING_SLRU_MIRRORS; i++)
+	{
+		PendingSlruMirror *pending = &pending_slru_mirrors[i];
+
+		if (!pending->valid)
+			continue;
+
+		PG_TRY();
+		{
+			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &pending->key,
+										 pending->block, pending->page);
+			pending->valid = false;
+		}
+		PG_CATCH();
+		{
+			int			sqlerrcode = geterrcode();
+
+			MemoryContextSwitchTo(oldcontext);
+			flushing_pending_slru_mirrors = false;
+			if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+				sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+				PG_RE_THROW();
+			FlushErrorState();
+			return;
+		}
+		PG_END_TRY();
+	}
+
+	flushing_pending_slru_mirrors = false;
+}
+
 /*
  * SLRU page-write hook (installed into slru.c): mirror each just-written SLRU
  * page (clog, multixact, ...) onto the page store as a PS_KLASS_SLRU object,
@@ -1265,16 +1358,22 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	if (pageno < 0 || pageno > (int64) UINT32_MAX)
 		return;					/* page number outside our block space */
 
+	slru_page_key(ctl, &key);
+
 	/*
 	 * The mirror does fallible shm I/O and busy-waits with CHECK_FOR_INTERRUPTS.
 	 * An SLRU buffer can be evicted/written from inside a transaction commit/abort
 	 * critical section (e.g. via SlruSelectLRUPage), where any ERROR would PANIC --
-	 * so never mirror there; the page is mirrored by a later write/checkpoint.
+	 * so defer the stable page image and retry when this process next reaches a
+	 * non-critical SLRU hook.
 	 */
 	if (CritSectionCount > 0)
+	{
+		pagestore_slru_enqueue_mirror(&key, (BlockNumber) pageno, page);
 		return;
+	}
 
-	slru_page_key(ctl, &key);
+	pagestore_slru_flush_pending_mirrors();
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
@@ -1304,11 +1403,11 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 static bool pagestore_slru_read_from_store = false;
 
 /*
- * SLRU page-read hook (installed into slru.c): serve an SLRU page from the store
- * instead of the local segment file.  Returns true (page filled) when enabled and
- * the store has the page, else false to fall back to the local read.  This lets a
- * compute read shared cluster state (clog, ...) from the store -- e.g. one whose
- * local SLRU files are absent or stale.  Best-effort: any error falls back.
+ * SLRU page-read hook (installed into slru.c): during recovery, serve a missing
+ * local SLRU page from the store.  We intentionally do not use this as an active
+ * multi-compute consistency path: normal commit/multixact updates can remain
+ * dirty in shared SLRU buffers until checkpoint/eviction, and already-cached SLRU
+ * pages have no cross-compute invalidation.  Best-effort: any error falls back.
  */
 static bool
 pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
@@ -1322,6 +1421,8 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 		return true;
 
 	if (!pagestore_slru_read_from_store)
+		return false;
+	if (!InRecovery)
 		return false;
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return false;
@@ -1367,6 +1468,8 @@ pagestore_slru_exists_hook(SlruCtl ctl, int64 pageno)
 		prev_slru_page_exists_hook(ctl, pageno))
 		return true;
 	if (!pagestore_slru_read_from_store)
+		return false;
+	if (!InRecovery)
 		return false;
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return false;
@@ -1415,6 +1518,8 @@ pagestore_slru_truncate_hook(SlruCtl ctl, int64 cutoffPage)
 		return;
 	if (CritSectionCount > 0)
 		return;
+
+	pagestore_slru_flush_pending_mirrors();
 
 	slru_cutoff_key(ctl, &key);
 
@@ -1470,7 +1575,22 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	key.forkNum = 0;
 
 	out = palloc(BLCKSZ);
-	pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, (BlockNumber) pageno, out);
+	{
+		PageStoreRelKey cutoff_key = key;
+		BlockNumber cutoff = 0;
+		char		cutoff_buf[BLCKSZ];
+
+		cutoff_key.forkNum = 1;
+		if (pagestore_localsvc_obj_read(PS_KLASS_SLRU, &cutoff_key, 0,
+										cutoff_buf))
+			memcpy(&cutoff, cutoff_buf, sizeof(cutoff));
+		if (pageno >= 0 && (BlockNumber) pageno < cutoff)
+			ereport(ERROR,
+					(errmsg("SLRU page has been truncated from the store")));
+	}
+	if (!pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, (BlockNumber) pageno, out))
+		ereport(ERROR,
+				(errmsg("SLRU page is not present on the store")));
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -1533,9 +1653,9 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.slru_read_from_store",
-							 "Serve SLRU pages (clog, ...) from the page store instead of local files.",
-							 "Lets a compute read shared cluster state from the store; falls back "
-							 "to the local segment for pages the store does not have.",
+							 "Serve missing SLRU pages (clog, ...) from the page store during recovery.",
+							 "This is a recovery/bootstrap fallback for absent local SLRU files, not "
+							 "an active multi-compute consistency mechanism.",
 							 &pagestore_slru_read_from_store,
 							 false,
 							 PGC_SIGHUP,
