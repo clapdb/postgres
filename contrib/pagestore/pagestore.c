@@ -3685,6 +3685,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	int32		parent_tl = PG_GETARG_INT32(3);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(4);
 	char	   *manifest;
+	char	   *target_manifest;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -3697,6 +3698,11 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, fork_lsn))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
+	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest != NULL &&
+		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+		ereport(ERROR,
+				(errmsg("target branch manifest does not match the requested branch identity")));
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
