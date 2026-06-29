@@ -2492,6 +2492,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		int			fd;
 		int64		trim_last = last;
 
+		if (trim_last > page_hi)
+			trim_last = page_hi;
 		while (trim_last >= first && !present[trim_last - page_lo])
 			trim_last--;
 		if (trim_last < first)
