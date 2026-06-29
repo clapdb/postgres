@@ -427,6 +427,35 @@ assert "$($P -c "SELECT count(*) FROM tb WHERE note='branch_local';")" "0" \
 "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1
 rm -rf "$(dirname "$SEEDOUT")"
 
+# --- 20. commit-ts applier: reconstruct commit timestamps as-of L ---------------------
+# Same shape as the clog applier, for pg_commit_ts: snapshot at C, commit xidA (<= L) and
+# xidB (> L); reconstructing as-of L must give xidA its real commit timestamp (matching the
+# parent's pg_xact_commit_timestamp) and xidB none -- per-record replay, no coalescing.
+$P -c "CREATE FUNCTION pagestore_commit_ts_asof(xid, pg_lsn, pg_lsn, xid) RETURNS timestamptz
+        AS 'pagestore','pagestore_commit_ts_asof' LANGUAGE C STRICT;" >/dev/null
+echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"   # needs a restart to activate
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+$P -c "CREATE TABLE cts(id int) TABLESPACE ts;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+ctsC=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$ctsC');" >/dev/null
+# data-writing xacts so the commit (and its timestamp) is sync-flushed for the WAL reader
+ctsA=$($P -c "WITH w AS (INSERT INTO cts VALUES (1) RETURNING 1) SELECT pg_current_xact_id();")
+ctsL=$($P -c "SELECT pg_current_wal_lsn();")                      # L: after xidA's commit
+ctsB=$($P -c "WITH w AS (INSERT INTO cts VALUES (2) RETURNING 1) SELECT pg_current_xact_id();")
+# oldest='3' (below all our xids) disables the horizon check for these baseline assertions
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', '3'::xid) IS NOT NULL;")" "t" \
+	"commit-ts: xid committed at/below L has a reconstructed timestamp"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', '3'::xid) = pg_xact_commit_timestamp('$ctsA'::xid);")" "t" \
+	"commit-ts: reconstructed timestamp matches the parent's pg_xact_commit_timestamp"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsB'::xid, '$ctsC', '$ctsL', '3'::xid) IS NULL;")" "t" \
+	"commit-ts: xid committed after L has no timestamp as-of L (no coalescing)"
+# the commit-ts horizon masks xidA: with oldest = xidA+1, the lookup returns NULL even
+# though xidA's bytes are physically on the reconstructed page (matches the parent's
+# oldestCommitTsXid rejection after a truncation / before an activation)
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', ('$ctsA'::xid::text::bigint + 1)::text::xid) IS NULL;")" "t" \
+	"commit-ts: a xid below the as-of-L horizon (oldestCommitTsXid) returns NULL despite stale page bytes"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
