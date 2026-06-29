@@ -1167,9 +1167,6 @@ pagestore_object_get(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
-	if (pageno < 0)
-		ereport(ERROR,
-				(errmsg("SLRU page number must be non-negative")));
 
 	key.spcOid = 0;
 	key.dbOid = 0;
@@ -1568,6 +1565,9 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (pageno < 0)
+		ereport(ERROR,
+				(errmsg("SLRU page number must be non-negative")));
 
 	key.spcOid = 0;
 	key.dbOid = 0;
