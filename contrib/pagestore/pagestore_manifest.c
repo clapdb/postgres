@@ -88,6 +88,20 @@ static char manifest_path[4096];
 static char manifest_dir[2048];
 PsLayerMap ps_layer_map;
 
+/*
+ * Sticky once a record append fails: a short write or failed fsync may have left
+ * a torn record at the tail, which replay can only recover if it stays the *last*
+ * record.  So after any append error we refuse every further append for the life
+ * of this process -- no later flush/compaction/GC record can land after the torn
+ * tail and turn it into unrecoverable interior corruption.  Reset on (re)open,
+ * where replay truncates the torn tail.  Layer data itself is not lost: the
+ * segment log stays authoritative and recover() rebuilds from it.
+ *
+ * Accessed from multiple shard worker threads (one shard can poison while another
+ * reads the flag), so all reads/writes go through __atomic.
+ */
+static int	manifest_poisoned = 0;
+
 static int
 manifest_fsync_dir(void)
 {
@@ -110,9 +124,13 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	int			rc = 0;
 	int			created = 0;
 
+	/* once the tail may be torn, never append again (see manifest_poisoned) */
+	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
+		return -1;
+
 	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
-		return -1;
+		return -1;				/* nothing written; tail not torn */
 	if (lseek(fd, 0, SEEK_END) == 0)
 		created = 1;
 
@@ -129,6 +147,9 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	if (created && manifest_fsync_dir() != 0)
 		rc = -1;
 	close(fd);
+	if (rc != 0)
+		/* a partial write/fsync may have torn the tail */
+		__atomic_store_n(&manifest_poisoned, 1, __ATOMIC_RELEASE);
 	return rc;
 }
 
@@ -170,6 +191,9 @@ manifest_decode_key(PsKey *dst, const PsManifestKeyDisk *src)
 	dst->dbOid = src->dbOid;
 	dst->relNumber = src->relNumber;
 	dst->forkNum = src->forkNum;
+	dst->klass = src->klass;	/* mirror encode; manifest v2 -- without this a
+								 * replayed non-relation layer key decodes as
+								 * PS_KLASS_RELATION and its lookups are pruned */
 }
 
 static int
@@ -267,6 +291,8 @@ ps_manifest_open(const char *store_dir)
 	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(manifest_path))
 		return -1;
+	/* replay truncates any torn tail; start clean */
+	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }
@@ -276,6 +302,18 @@ ps_manifest_close(void)
 {
 	ps_layer_map_free(&ps_layer_map);
 	manifest_path[0] = '\0';
+}
+
+/*
+ * True once an append failed (torn tail).  The metadata is no longer durable, so
+ * callers must stop persisting new layers -- the daemon rejects further writes and
+ * skips compaction rather than accepting data it can never record (and that
+ * layer-based recovery would not see).  Cleared by (re)open after replay recovers.
+ */
+int
+ps_manifest_poisoned(void)
+{
+	return __atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE);
 }
 
 int

@@ -281,6 +281,50 @@ assert "$rc" "present" "pg_control written back to the data directory"
 rows_after=$($P -c "SELECT count(*) FROM t;")
 assert "$rows_after" "$rows_before" "cluster boots from store-restored pg_control (compute bootstraps cluster metadata from the store)"
 
+# --- 13. store-backed redo: replay base+deltas from the store's shipped WAL ------
+# With pagestore.redo_wal_from_store on, redo_page_asof reads its WAL records from
+# the daemon's shipped per-timeline log instead of local files -- so a compute with
+# no local WAL (a fresh branch) can materialize a page.  Ship the segment first.
+sw0=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE swal(id int, v text) WITH (autovacuum_enabled=off);
+       INSERT INTO swal VALUES (1,'sw_base');
+       CHECKPOINT;" >/dev/null
+$P -c "UPDATE swal SET v='sw_fpi' WHERE id=1;" >/dev/null   # FPI of block 0 after the checkpoint
+$P -c "INSERT INTO swal VALUES (2,'sw_delta');" >/dev/null  # a delta on block 0
+sw1=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "SELECT pg_switch_wal();" >/dev/null                  # complete the segment -> shipped to the store
+sleep 2
+$P -c "SELECT pagestore_index_wal('$sw0', '$sw1');" >/dev/null
+sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
+  SELECT position('sw_fpi'::bytea   in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0
+     AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
+assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's shipped WAL (store-backed reader)"
+
+# --- 14. daemon crash recovery: segment-log recovery of un-flushed writes -------
+# Restart the daemon with a flush threshold so high the rows below can never be
+# sealed into an image layer -- they live ONLY in the memtable + segment log.  Then
+# SIGKILL it (no clean shutdown, so the memtable is lost), restart, and require the
+# rows to read back.  They can only come from the segment log, so this fails if
+# recovery ever stops scanning segments (e.g. a regression to layer-only rebuild) --
+# unlike a shared-daemon test where prior writes could push these into a layer.
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach the engine before restarting the daemon
+kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
+"$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 >/dev/null 2>&1 &  # never flushes -> no layer
+DPID=$!
+sleep 0.5
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
+       INSERT INTO crash SELECT g, 'c'||md5(g::text) FROM generate_series(1,500) g;" >/dev/null
+crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach before crashing the daemon
+kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null      # crash: no ps_core_close() -> memtable lost
+"$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &  # restart -> rebuild the index from the segment log
+DPID=$!
+sleep 0.5
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
+assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-log recovery)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

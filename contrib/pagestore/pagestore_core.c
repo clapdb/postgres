@@ -27,11 +27,13 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
@@ -293,8 +295,19 @@ gc_resume(void)
 			dead[m++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < m; k++)
 	{
-		ps_layer_store->delete_local_layer(&dead[k]);
-		ps_manifest_remove_layer(dead[k].layer_id);
+		/*
+		 * Drop the manifest entry only after the file is gone (a missing file
+		 * is ENOENT == success in delete_local_layer, so this is idempotent and
+		 * a partially-deleted layer still completes).  A real unlink error keeps
+		 * the layer "deleting" so the next start retries it.  A REMOVE_LAYER
+		 * write error may have torn the manifest tail; stop so that record stays
+		 * the recoverable tail instead of becoming interior corruption, and the
+		 * next start retries from the last valid manifest state.
+		 */
+		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
+			continue;
+		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
+			break;
 	}
 	free(dead);
 }
@@ -323,6 +336,15 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 
 	if (nold < 2)
 		return 0;				/* nothing worth merging */
+
+	/*
+	 * Never compact a poisoned manifest: the new layer could not be recorded, so
+	 * we would just write an unreferenced file and the old layers would stay live
+	 * -- maintenance would keep retrying and leaking files.  Bail (the daemon is
+	 * already rejecting writes; a restart recovers the manifest).
+	 */
+	if (ps_manifest_poisoned())
+		return -1;
 
 	old = malloc((size_t) nold * sizeof(PsLayerDesc));
 	if (!old)
@@ -396,9 +418,26 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
-		ps_manifest_mark_delete(old[k].layer_id);
-		ps_layer_store->delete_local_layer(&old[k]);
-		ps_manifest_remove_layer(old[k].layer_id);
+		/*
+		 * Fail safe at every step.  Only delete the file once the layer is
+		 * durably marked deleting, and only drop it from the manifest once the
+		 * file is gone -- so a failed step leaves a readable layer (its data is
+		 * also in the new layer) that gc_resume() retries on the next start,
+		 * never a manifest entry pointing at a deleted file.
+		 *
+		 * A manifest write error may have left a torn record at the tail; STOP
+		 * before unlinking or appending anything more, so that torn record stays
+		 * the recoverable tail rather than becoming interior corruption that
+		 * fails replay (and so we never unlink a file whose later delete mark is
+		 * not durable).  A failed unlink is not a manifest error: the layer is
+		 * durably deleting, so we can move on and let gc_resume() retry it.
+		 */
+		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
+			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
+			continue;			/* still "deleting"; gc_resume() will retry */
+		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
+			goto cleanup;		/* incomplete */
 	}
 	rc = 0;
 
@@ -1144,9 +1183,17 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
 	s->cur_off += reclen;
 
-	/* stage the version for the LSM memtable; flush to an image layer when full
-	 * (additive in phase 2 -- the segment write above is still authoritative) */
-	if (s->memtable)
+	/*
+	 * Stage the version for the LSM memtable and flush to an image layer when full
+	 * (additive in phase 2 -- the segment write above is still authoritative).
+	 *
+	 * Skip all of this once the manifest is poisoned: record_layer() can no longer
+	 * record a layer, so staging pages we can never flush would grow the memtable
+	 * without bound (turning a metadata error into an OOM), and flushing would seal
+	 * unreferenced layer files.  The page is durable in the segment log, which
+	 * recovery scans, so the write still succeeds; reads fall back to the segment.
+	 */
+	if (s->memtable && !ps_manifest_poisoned())
 	{
 		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
 		if (ps_memtable_full(s->memtable))
@@ -1244,20 +1291,38 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			uint64_t	l;
 			int			served;
 
+			/*
+			 * The materialized-page cache and the memtable are safe read sources
+			 * only while they stay in lock-step with the segment log.  Once the
+			 * manifest is poisoned, append_page() stops staging and a later
+			 * same-pd_lsn rewrite lands in the segment only; both the cache (keyed
+			 * by (tl,key,block,lsn)) and the memtable would then return the older
+			 * bytes under the same LSN as the segment-backed pv.  When poisoned,
+			 * bypass both and read the authoritative segment.
+			 */
+			int			poisoned = ps_manifest_poisoned();
+
 			/* fast path: materialized-page cache, keyed by the resolved version */
-			if (ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
 				return 1;
 
-			if (s->memtable &&
+			if (s->memtable && !poisoned &&
 				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
 				l == pv->lsn)
 			{
 				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
-			else if (layer_map_lookup(tl, key, block, rl, &l, out) &&
+			else if (pv->seg < 0 &&
+					 layer_map_lookup(tl, key, block, rl, &l, out) &&
 					 l == pv->lsn)
 			{
+				/*
+				 * Serve from a layer only for a layer-origin version (no segment
+				 * copy).  A segment-backed version must come from its segment: a
+				 * layer match is keyed by LSN alone, so a same-pd_lsn rewrite in
+				 * the segment would otherwise be masked by the older layer image.
+				 */
 				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from an image layer */
 			}
@@ -1286,6 +1351,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * effects are not reproduced on restart.  Also a partial/torn trailing record
  * is simply treated as end-of-log (the magic/len check below stops the scan).
  */
+/*
+ * Scan a shard's segment log and rebuild its version index, leaving the append
+ * cursor just past the last valid record.  The segment log is append-only and
+ * never deleted, so it is the complete, authoritative store: it holds every
+ * version (including repeated writes at the same pd_lsn, in order) and any write a
+ * layer flush did not record.  Recovery rebuilds the exact chain from it; image
+ * layers are a future fast-recovery optimization that needs a durable flush
+ * watermark before they can replace this scan.
+ */
 static void
 recover(uint32_t shard)
 {
@@ -1297,11 +1371,14 @@ recover(uint32_t shard)
 	for (int id = 0;; id++)
 	{
 		uint64_t	off = 0;
+		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
 
-		if (ps_storage->seg_size(shard, id) < 0)
+		if (seg_bytes < 0)
 			break;				/* no more segments -> done */
 
-		/* replay records until one fails to validate (end of log) */
+		/* replay records until one fails to validate (end of log).  seg_bytes is
+		 * cached once here: the segment is not being written during recovery, and
+		 * the POSIX backend's seg_size() is a stat() we must not pay per record. */
 		for (;;)
 		{
 			SegRecHdr	hdr;
@@ -1328,8 +1405,19 @@ recover(uint32_t shard)
 			if (hdr.len != page_size)
 				break;			/* our magic but a torn/short tail record */
 
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, shard, id,
-							 off + sizeof(hdr));
+			/*
+			 * append_page() writes the header and the page body in separate
+			 * writes, so after a crash a tail record can have a valid header while
+			 * the body is missing or short.  Index a record only once the segment
+			 * is large enough to hold its body; a torn body ends the log here so we
+			 * never index a version whose bytes cannot be read (which would mask a
+			 * good older version and zero-fill on read).
+			 */
+			if (seg_bytes < (int64_t) (off + sizeof(hdr) + hdr.len))
+				break;
+
+			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
+							 shard, id, off + sizeof(hdr));
 			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
@@ -1436,41 +1524,39 @@ ps_handle_meta(PsChannel *ch)
 
 /* ===================== lifecycle ====================================== */
 
-/*
- * Rebuild the page and fork indexes from the image layers' on-disk indexes
- * (the persistent LSM index) instead of scanning every segment record.  The
- * versions are tagged with seg = -1 (no segment copy); read_resolve serves them
- * from the layer they came from.
- */
-static void
-rebuild_from_layers(void)
-{
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
-		PsImgIndexEnt *idx;
-		uint32_t	n;
-
-		if (d->kind != PS_LAYER_IMAGE || d->deleting)
-			continue;
-		if (ps_image_layer_read_index(d, &idx, &n) != 0)
-			continue;			/* skip an unreadable layer */
-		for (uint32_t j = 0; j < n; j++)
-		{
-			page_add_version(d->timeline, &idx[j].key, idx[j].block,
-							 idx[j].lsn, shard_for(&idx[j].key)->id, -1, 0);
-			fork_grow(d->timeline, &idx[j].key, idx[j].block + 1);
-		}
-		free(idx);
-	}
-}
-
-/* Flush the memtable and close the manifest on a clean shutdown, so a restart
- * rebuilds the full state from layers without scanning segments. */
+/* Flush the memtable and close the manifest on a clean shutdown.  (The segment
+ * log is authoritative, so a restart recovers from it regardless.) */
 void
 ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
+
+	/*
+	 * Recovery rebuilds the index from the segment log, so the segments must be
+	 * durable before we rely on them: fsync them on clean shutdown (writes between
+	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
+	 * power failure after the daemon exits even though the write was acknowledged).
+	 *
+	 * Sync *before* flushing the memtable into image layers below.  Otherwise a
+	 * power loss in the shutdown window could leave a just-committed layer as the
+	 * only durable copy of pages whose segment bytes were still in the page cache,
+	 * which segment-only recovery would miss.  Syncing first makes the recovery
+	 * source durable before any layer is committed on top of it.
+	 *
+	 * If the sync fails (EIO/ENOSPC/...), the segment log -- the sole source
+	 * segment-only recovery reads -- is not durable, so the about-to-be-destroyed
+	 * memtable may be the only good copy of recent writes.  We cannot make it
+	 * durable from here, so do not proceed to a clean-looking teardown that would
+	 * mask the loss: report it and abort with a failure status before destroying
+	 * the memtables, leaving the operator a clear signal to investigate.
+	 */
+	if (ps_storage->sync && ps_storage->sync() != 0)
+	{
+		fprintf(stderr, "pagestore_daemon: FATAL: segment sync failed on shutdown "
+				"(%s); aborting before teardown -- recently acknowledged writes "
+				"may not be durable\n", strerror(errno));
+		_exit(EXIT_FAILURE);
+	}
 
 	for (uint32_t i = 0; i < ns; i++)
 	{
@@ -1483,6 +1569,7 @@ ps_core_close(void)
 			s->memtable = NULL;
 		}
 	}
+
 	ps_pgcache_free();
 	ps_manifest_close();
 }
@@ -1503,6 +1590,15 @@ ps_core_maintenance(void)
 	int			found = 0;
 
 	if (!use_layers)
+		return 0;
+
+	/*
+	 * Back off all maintenance once the manifest is poisoned: compaction cannot
+	 * record its replacement layer, so compact_timeline() returns immediately and
+	 * reporting "did work" would spin the idle worker on the same timeline until
+	 * restart.  Returning 0 lets it sleep until the manifest is recovered.
+	 */
+	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
 
@@ -1603,27 +1699,17 @@ ps_core_open(const char *store_dir)
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
 	load_timelines();
-	if (use_layers && ps_layer_map.nlayers > 0)
-	{
-		/* layers are the durable read state -- rebuild from their indexes and
-		 * position the append cursor at a fresh segment (a cheap stat loop, no
-		 * per-record scan).  Segments are written but no longer scanned. */
-		rebuild_from_layers();
-		for (uint32_t sh = 0; sh < ns; sh++)
-		{
-			int			id = 0;
 
-			while (ps_storage->seg_size(sh, id) >= 0)
-				id++;
-			g_shards[sh].cur_seg = id;
-			g_shards[sh].cur_off = 0;
-		}
-	}
-	else
-	{
-		for (uint32_t sh = 0; sh < ns; sh++)	/* segment scan (SPDK path, or no layers yet) */
-			recover(sh);
-	}
+	/*
+	 * Rebuild the version index from the segment log, the complete authoritative
+	 * store (never deleted).  This recovers every acknowledged write -- including
+	 * a tail the memtable flush never recorded in a layer (a crash, or a poisoned
+	 * manifest) -- and repeated same-pd_lsn writes in order, which a layer rebuild
+	 * keyed only by LSN could not.  Image layers are still loaded into the layer
+	 * map (for compaction/GC) but are not used to rebuild the read index here.
+	 */
+	for (uint32_t sh = 0; sh < ns; sh++)
+		recover(sh);
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)

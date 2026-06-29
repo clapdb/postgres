@@ -560,6 +560,37 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 	ls_exec(ch);
 }
 
+/*
+ * Read up to 'len' bytes of shipped WAL starting at 'start_lsn' from a SPECIFIC
+ * timeline's log on the store (not necessarily this backend's).  Used to serve a
+ * branch's ancestor WAL records for cross-branch redo.  Returns the byte count.
+ */
+int
+pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn, uint32 len,
+							void *out)
+{
+	PsChannel  *ch = ls_chan();
+	int			n;
+
+	ch->timeline = timeline;
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	ls_exec(ch);
+	n = (int) ch->result;
+	if (n > (int) len)
+		n = (int) len;
+	memcpy(out, ch->data, (size_t) n);
+	return n;
+}
+
+/* This backend's current timeline (0 = main, >0 = a branch). */
+uint32
+pagestore_localsvc_timeline(void)
+{
+	return (uint32) localsvc_timeline;
+}
+
 /* Record in the store that the WAL record at 'lsn' modifies (key, block). */
 void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,

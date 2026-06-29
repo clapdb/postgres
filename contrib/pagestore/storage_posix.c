@@ -220,6 +220,22 @@ posix_sync(void)
 	}
 out:
 	pthread_mutex_unlock(&seg_fds_lock);
+
+	/*
+	 * Segment files are created lazily with O_CREAT, so a new segment's directory
+	 * entry is not durable until the store directory itself is fsynced.  Recovery
+	 * scans the segment log by name, so persist the directory here too; otherwise a
+	 * power loss after a clean shutdown that created a new segment could drop the
+	 * name and hide acknowledged writes.
+	 */
+	{
+		int			dfd = open(posix_dir, O_RDONLY);
+
+		if (dfd < 0 || fsync(dfd) != 0)
+			rc = -1;
+		if (dfd >= 0)
+			close(dfd);
+	}
 	return rc;
 }
 

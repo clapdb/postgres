@@ -180,7 +180,7 @@ static void SimpleLruWaitIO(SlruCtl ctl, int slotno);
 static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno,
-								  SlruWriteAll fdata);
+								  const char *page, SlruWriteAll fdata);
 static void SlruReportIOError(SlruCtl ctl, int64 pageno, TransactionId xid);
 static int	SlruSelectLRUPage(SlruCtl ctl, int64 pageno);
 
@@ -192,6 +192,8 @@ static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 /* Optional hooks to mirror/serve SLRU pages to/from an external store. */
 SlruPageWriteHook_type slru_page_write_hook = NULL;
 SlruPageReadHook_type slru_page_read_hook = NULL;
+SlruPageExistsHook_type slru_page_exists_hook = NULL;
+SlruPageTruncateHook_type slru_page_truncate_hook = NULL;
 
 
 /*
@@ -659,6 +661,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	int64		pageno = shared->page_number[slotno];
 	int			bankno = SlotGetBankNumber(slotno);
 	bool		ok;
+	char		writebuf[BLCKSZ];
 
 	Assert(shared->page_status[slotno] != SLRU_PAGE_EMPTY);
 	Assert(LWLockHeldByMeInMode(SimpleLruGetBankLock(ctl, pageno), LW_EXCLUSIVE));
@@ -689,11 +692,19 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
 
+	/*
+	 * Take a stable copy while the slot is still locked.  The SLRU code permits
+	 * the slot to be re-dirtied while WRITE_IN_PROGRESS, so both the local write
+	 * and any mirror hook below must use this same image instead of rereading the
+	 * live shared buffer after I/O completes.
+	 */
+	memcpy(writebuf, shared->page_buffer[slotno], BLCKSZ);
+
 	/* Release bank lock while doing I/O */
 	LWLockRelease(&shared->bank_locks[bankno].lock);
 
 	/* Do the write */
-	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata);
+	ok = SlruPhysicalWritePage(ctl, pageno, slotno, writebuf, fdata);
 
 	/* If we failed, and we're in a flush, better close the files */
 	if (!ok && fdata)
@@ -723,11 +734,12 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/*
 	 * Mirror the just-written page to an external store, if a hook is installed
 	 * (e.g. contrib/pagestore places SLRU pages on the disaggregated store).  The
-	 * page bytes are still valid in the buffer here.  NB: this runs under the
-	 * SLRU bank lock, so the hook must be quick and must not error out the write.
+	 * page bytes are the same stable image passed to the local write above.  NB:
+	 * this runs under the SLRU bank lock, so the hook must be quick and must not
+	 * error out the write.
 	 */
 	if (slru_page_write_hook)
-		slru_page_write_hook(ctl, pageno, (const char *) shared->page_buffer[slotno]);
+		slru_page_write_hook(ctl, pageno, writebuf);
 
 	/* If part of a checkpoint, count this as a SLRU buffer written. */
 	if (fdata)
@@ -776,7 +788,11 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 	{
 		/* expected: file doesn't exist */
 		if (errno == ENOENT)
+		{
+			if (slru_page_exists_hook)
+				return slru_page_exists_hook(ctl, pageno);
 			return false;
+		}
 
 		/* report error normally */
 		slru_errcause = SLRU_OPEN_FAILED;
@@ -799,6 +815,9 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 		slru_errno = errno;
 		return false;
 	}
+
+	if (!result && slru_page_exists_hook)
+		result = slru_page_exists_hook(ctl, pageno);
 
 	return result;
 }
@@ -823,15 +842,6 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	char		path[MAXPGPATH];
 	int			fd;
 
-	/*
-	 * Serve the page from an external store if a hook is installed and has it
-	 * (e.g. contrib/pagestore lets a compute read SLRU pages from the shared
-	 * store).  On a miss the hook returns false and we read the local segment.
-	 */
-	if (slru_page_read_hook &&
-		slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
-		return true;
-
 	SlruFileName(ctl, path, segno);
 
 	/*
@@ -844,6 +854,10 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
+		if (errno == ENOENT && slru_page_read_hook &&
+			slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
+			return true;
+
 		if (errno != ENOENT || !InRecovery)
 		{
 			slru_errcause = SLRU_OPEN_FAILED;
@@ -895,7 +909,8 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
  * SimpleLruWriteAll.
  */
 static bool
-SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
+SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, const char *page,
+					  SlruWriteAll fdata)
 {
 	SlruShared	shared = ctl->shared;
 	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
@@ -1012,7 +1027,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
-	if (pg_pwrite(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
+	if (pg_pwrite(fd, page, BLCKSZ, offset) != BLCKSZ)
 	{
 		pgstat_report_wait_end();
 		/* if write didn't set errno, assume problem is no disk space */
@@ -1511,6 +1526,9 @@ restart:
 
 	LWLockRelease(&shared->bank_locks[prevbank].lock);
 
+	if (slru_page_truncate_hook)
+		slru_page_truncate_hook(ctl, cutoffPage);
+
 	/* Now we can remove the old segment(s) */
 	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
 }
@@ -1525,6 +1543,7 @@ static void
 SlruInternalDeleteSegment(SlruCtl ctl, int64 segno)
 {
 	char		path[MAXPGPATH];
+	int64		cutoffPage = (segno + 1) * SLRU_PAGES_PER_SEGMENT;
 
 	/* Forget any fsync requests queued for this segment. */
 	if (ctl->sync_handler != SYNC_HANDLER_NONE)
@@ -1539,6 +1558,9 @@ SlruInternalDeleteSegment(SlruCtl ctl, int64 segno)
 	SlruFileName(ctl, path, segno);
 	ereport(DEBUG2, (errmsg_internal("removing file \"%s\"", path)));
 	unlink(path);
+
+	if (slru_page_truncate_hook)
+		slru_page_truncate_hook(ctl, cutoffPage);
 }
 
 /*

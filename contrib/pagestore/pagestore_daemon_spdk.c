@@ -231,15 +231,18 @@ begin(uint32_t i, PsChannel *ch)
 				if (!v)
 				{
 					memset(ch->data, 0, page_size);
+					ch->result = 0;
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
 									  ch->data))
 				{
+					ch->result = 1;
 					ps_store_release(&ch->state, PS_STATE_DONE);	/* RAM hit */
 					return;
 				}
+				ch->result = 1;
 				rs->ch = ch;
 				rs->pending = 1;
 				rs->active = 1;

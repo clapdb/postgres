@@ -68,6 +68,7 @@ static bool pagestore_route_all = false;
 static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
+static bool pagestore_redo_wal_from_store = false;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -759,6 +760,35 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Store-backed WAL page reader for redo.  The records that materialize a page
+ * can live on ancestor timelines (a branch's deltas predate the branch point);
+ * a branch compute may not have that ancestor WAL locally.  This page_read
+ * callback serves a WAL page from the store's shipped per-timeline log when the
+ * record's source timeline (ps_redo_cur_timeline, set per record from the walidx
+ * tag) is not this compute's own, or when pagestore.redo_wal_from_store forces it
+ * (a compute with no local WAL at all); otherwise it reads the local WAL.
+ */
+static uint32 ps_redo_cur_timeline;		/* timeline of the record being read */
+static uint32 ps_redo_local_timeline;	/* this compute's own timeline */
+
+static int
+ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+				  XLogRecPtr targetRecPtr, char *readBuf)
+{
+	if (pagestore_redo_wal_from_store ||
+		ps_redo_cur_timeline != ps_redo_local_timeline)
+	{
+		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
+													(uint64) targetPagePtr,
+													(uint32) reqLen, readBuf);
+
+		return (n >= reqLen) ? reqLen : -1;
+	}
+	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
+										targetRecPtr, readBuf);
+}
+
+/*
  * Liveness: scan local WAL in (from_lsn, to_lsn] for an smgr truncate of
  * (rloc, forknum) down to <= block.  If found, the block was truncated away after
  * its last write and not re-extended, so it is not live as of to_lsn and must not
@@ -767,27 +797,49 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
  *
  * Cost: a linear pass over (from_lsn, to_lsn].  redo_page_asof is off the read hot
  * path; a daemon-side fork-size-at-lsn index would make this O(1) -- a later step.
+ *
+ * Tri-state so an unreadable scan fails closed rather than passing as "live":
  */
-static bool
+typedef enum
+{
+	REDO_BLOCK_LIVE = 0,		/* scanned cleanly through to_lsn, no truncate */
+	REDO_BLOCK_TRUNCATED,		/* truncated away at/below the block, not re-extended */
+	REDO_BLOCK_SCAN_INCOMPLETE, /* WAL unreadable through to_lsn -- fail closed */
+} RedoBlockLiveness;
+
+static RedoBlockLiveness
 redo_block_truncated_away(XLogReaderState *reader, RelFileLocator rloc,
 						  ForkNumber forknum, BlockNumber block,
 						  XLogRecPtr from_lsn, XLogRecPtr to_lsn)
 {
+	XLogRecPtr	scanned_through;
+
 	if (forknum != MAIN_FORKNUM || from_lsn >= to_lsn)
-		return false;
+		return REDO_BLOCK_LIVE;
 
 	XLogBeginRead(reader, from_lsn);
+	scanned_through = from_lsn;
 	for (;;)
 	{
 		char	   *errm;
 		XLogRecord *rec = XLogReadRecord(reader, &errm);
 
+		/*
+		 * End of readable WAL.  If the read cursor already advanced through to_lsn
+		 * the range was fully scanned and no truncate was found -- the block is
+		 * live.  Otherwise the WAL could not be read through to_lsn (e.g. the
+		 * shipped log has not reached this segment; the archive callback ships only
+		 * completed segments), so a truncate in the unread tail would be silently
+		 * missed: report the scan incomplete and let the caller fail closed.
+		 */
 		if (rec == NULL)
-			break;
+			return scanned_through >= to_lsn ? REDO_BLOCK_LIVE
+				: REDO_BLOCK_SCAN_INCOMPLETE;
+		scanned_through = reader->EndRecPtr;
 		if (reader->ReadRecPtr <= from_lsn)
 			continue;			/* skip the block's own last-write record */
 		if (reader->ReadRecPtr > to_lsn)
-			break;
+			return REDO_BLOCK_LIVE;	/* scanned cleanly past to_lsn, no truncate */
 		if (XLogRecGetRmid(reader) == RM_SMGR_ID &&
 			(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_TRUNCATE)
 		{
@@ -796,10 +848,9 @@ redo_block_truncated_away(XLogReaderState *reader, RelFileLocator rloc,
 			if (RelFileLocatorEquals(xlrec->rlocator, rloc) &&
 				(xlrec->flags & SMGR_TRUNCATE_HEAP) &&
 				xlrec->blkno <= block)
-				return true;
+				return REDO_BLOCK_TRUNCATED;
 		}
 	}
-	return false;
 }
 
 /*
@@ -856,7 +907,7 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_redo_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -866,6 +917,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		pfree(recs);
 		PG_RETURN_NULL();
 	}
+	/* records on ancestor timelines are served from the store's shipped WAL */
+	ps_redo_local_timeline = pagestore_localsvc_timeline();
 	base = palloc(BLCKSZ);
 	page = palloc(BLCKSZ);
 
@@ -875,6 +928,11 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
+		ps_redo_cur_timeline = recs[i].timeline;
+		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
+		 * same-offset page on another timeline would be a false hit; invalidate it
+		 * whenever the source timeline may change (cross-branch redo). */
+		reader->readLen = 0;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -917,15 +975,37 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * materialize a stale page for it.  recs[n - 1].lsn is the block's newest record
 	 * at/below lsn.
 	 */
-	if (redo_block_truncated_away(reader, rloc, forknum, (BlockNumber) blocknum,
-								  (XLogRecPtr) recs[n - 1].lsn, lsn))
 	{
-		XLogReaderFree(reader);
-		pfree(pd);
-		pfree(recs);
-		pfree(base);
-		pfree(page);
-		PG_RETURN_NULL();
+		RedoBlockLiveness liveness;
+
+		/*
+		 * The truncate scan walks the WAL after the block's last write.  Read it
+		 * from that record's source timeline (an ancestor in cross-branch redo)
+		 * and from the store when store-backed -- so DON'T force local/off here, or
+		 * a no-local-WAL (store-backed) compute would skip the truncate check.
+		 * Invalidate the reader's page cache first since the timeline may differ
+		 * from the record loop above.  (A scan range that itself crosses a branch
+		 * point spans timelines and is a known limitation.)
+		 */
+		ps_redo_cur_timeline = recs[n - 1].timeline;
+		reader->readLen = 0;
+		liveness = redo_block_truncated_away(reader, rloc, forknum,
+											 (BlockNumber) blocknum,
+											 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		/*
+		 * Fail closed unless the scan proved the block live: a confirmed truncate
+		 * and an incomplete scan (the WAL could not be read through lsn) both mean
+		 * we must not return a possibly-stale FPI for a block that may be gone.
+		 */
+		if (liveness != REDO_BLOCK_LIVE)
+		{
+			XLogReaderFree(reader);
+			pfree(pd);
+			pfree(recs);
+			pfree(base);
+			pfree(page);
+			PG_RETURN_NULL();
+		}
 	}
 
 	/* replay: base image, then every record after it, through the helper */
@@ -941,6 +1021,11 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		uint32		firstpage;
 		char	   *raw;
 
+		ps_redo_cur_timeline = recs[i].timeline;
+		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
+		 * same-offset page on another timeline would be a false hit; invalidate it
+		 * whenever the source timeline may change (cross-branch redo). */
+		reader->readLen = 0;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -1112,6 +1197,140 @@ slru_klass_id(const char *dir)
 	return h;
 }
 
+static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
+static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
+static SlruPageExistsHook_type prev_slru_page_exists_hook = NULL;
+static SlruPageTruncateHook_type prev_slru_page_truncate_hook = NULL;
+
+typedef struct PendingSlruMirror
+{
+	bool		valid;
+	PageStoreRelKey key;
+	BlockNumber block;
+	char		page[BLCKSZ];
+} PendingSlruMirror;
+
+#define PAGESTORE_PENDING_SLRU_MIRRORS 64
+
+static PendingSlruMirror pending_slru_mirrors[PAGESTORE_PENDING_SLRU_MIRRORS];
+static bool flushing_pending_slru_mirrors = false;
+
+static void
+slru_page_key(SlruCtl ctl, PageStoreRelKey *key)
+{
+	key->spcOid = 0;
+	key->dbOid = 0;
+	key->relNumber = slru_klass_id(ctl->Dir);
+	key->forkNum = 0;
+}
+
+static void
+slru_cutoff_key(SlruCtl ctl, PageStoreRelKey *key)
+{
+	slru_page_key(ctl, key);
+	key->forkNum = 1;
+}
+
+static bool
+pagestore_slru_get_cutoff(SlruCtl ctl, BlockNumber *cutoff)
+{
+	PageStoreRelKey key;
+	char		buf[BLCKSZ];
+
+	slru_cutoff_key(ctl, &key);
+	if (!pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, 0, buf))
+		return false;
+	memcpy(cutoff, buf, sizeof(*cutoff));
+	return true;
+}
+
+static bool
+pagestore_slru_page_is_truncated(SlruCtl ctl, int64 pageno)
+{
+	BlockNumber cutoff;
+
+	if (!pagestore_slru_get_cutoff(ctl, &cutoff))
+		return false;
+	return pageno < (int64) cutoff;
+}
+
+static void
+pagestore_slru_enqueue_mirror(const PageStoreRelKey *key, BlockNumber block,
+							  const char *page)
+{
+	int			free_slot = -1;
+
+	for (int i = 0; i < PAGESTORE_PENDING_SLRU_MIRRORS; i++)
+	{
+		PendingSlruMirror *pending = &pending_slru_mirrors[i];
+
+		if (pending->valid &&
+			pending->key.spcOid == key->spcOid &&
+			pending->key.dbOid == key->dbOid &&
+			pending->key.relNumber == key->relNumber &&
+			pending->key.forkNum == key->forkNum &&
+			pending->block == block)
+		{
+			memcpy(pending->page, page, BLCKSZ);
+			return;
+		}
+		if (!pending->valid && free_slot < 0)
+			free_slot = i;
+	}
+
+	if (free_slot < 0)
+		free_slot = 0;
+
+	pending_slru_mirrors[free_slot].valid = true;
+	pending_slru_mirrors[free_slot].key = *key;
+	pending_slru_mirrors[free_slot].block = block;
+	memcpy(pending_slru_mirrors[free_slot].page, page, BLCKSZ);
+}
+
+static void
+pagestore_slru_flush_pending_mirrors(void)
+{
+	MemoryContext oldcontext;
+
+	if (flushing_pending_slru_mirrors || CritSectionCount > 0)
+		return;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	flushing_pending_slru_mirrors = true;
+	oldcontext = CurrentMemoryContext;
+
+	for (int i = 0; i < PAGESTORE_PENDING_SLRU_MIRRORS; i++)
+	{
+		PendingSlruMirror *pending = &pending_slru_mirrors[i];
+
+		if (!pending->valid)
+			continue;
+
+		PG_TRY();
+		{
+			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &pending->key,
+										 pending->block, pending->page);
+			pending->valid = false;
+		}
+		PG_CATCH();
+		{
+			int			sqlerrcode = geterrcode();
+
+			MemoryContextSwitchTo(oldcontext);
+			flushing_pending_slru_mirrors = false;
+			if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+				sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+				PG_RE_THROW();
+			FlushErrorState();
+			return;
+		}
+		PG_END_TRY();
+	}
+
+	flushing_pending_slru_mirrors = false;
+}
+
 /*
  * SLRU page-write hook (installed into slru.c): mirror each just-written SLRU
  * page (clog, multixact, ...) onto the page store as a PS_KLASS_SLRU object,
@@ -1128,25 +1347,31 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	PageStoreRelKey key;
 	MemoryContext oldcontext;
 
+	if (prev_slru_page_write_hook)
+		prev_slru_page_write_hook(ctl, pageno, page);
+
 	/* only meaningful when relations are served by the localsvc backend */
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return;
 	if (pageno < 0 || pageno > (int64) UINT32_MAX)
 		return;					/* page number outside our block space */
 
+	slru_page_key(ctl, &key);
+
 	/*
 	 * The mirror does fallible shm I/O and busy-waits with CHECK_FOR_INTERRUPTS.
 	 * An SLRU buffer can be evicted/written from inside a transaction commit/abort
 	 * critical section (e.g. via SlruSelectLRUPage), where any ERROR would PANIC --
-	 * so never mirror there; the page is mirrored by a later write/checkpoint.
+	 * so defer the stable page image and retry when this process next reaches a
+	 * non-critical SLRU hook.
 	 */
 	if (CritSectionCount > 0)
+	{
+		pagestore_slru_enqueue_mirror(&key, (BlockNumber) pageno, page);
 		return;
+	}
 
-	key.spcOid = 0;
-	key.dbOid = 0;
-	key.relNumber = slru_klass_id(ctl->Dir);
-	key.forkNum = 0;
+	pagestore_slru_flush_pending_mirrors();
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
@@ -1176,11 +1401,10 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 static bool pagestore_slru_read_from_store = false;
 
 /*
- * SLRU page-read hook (installed into slru.c): serve an SLRU page from the store
- * instead of the local segment file.  Returns true (page filled) when enabled and
- * the store has the page, else false to fall back to the local read.  This lets a
- * compute read shared cluster state (clog, ...) from the store -- e.g. one whose
- * local SLRU files are absent or stale.  Best-effort: any error falls back.
+ * SLRU page-read hook (installed into slru.c): serve a missing local SLRU page
+ * from the store.  slru.c calls this only after the local segment read misses,
+ * so local files remain authoritative when present.  Best-effort: any error
+ * falls back.
  */
 static bool
 pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
@@ -1188,6 +1412,10 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	PageStoreRelKey key;
 	bool		served = false;
 	MemoryContext oldcontext;
+
+	if (prev_slru_page_read_hook &&
+		prev_slru_page_read_hook(ctl, pageno, page))
+		return true;
 
 	if (!pagestore_slru_read_from_store)
 		return false;
@@ -1199,16 +1427,14 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	if (CritSectionCount > 0)
 		return false;
 
-	key.spcOid = 0;
-	key.dbOid = 0;
-	key.relNumber = slru_klass_id(ctl->Dir);
-	key.forkNum = 0;
+	slru_page_key(ctl, &key);
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
-		served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
-											 (BlockNumber) pageno, page);
+		if (!pagestore_slru_page_is_truncated(ctl, pageno))
+			served = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
+												 (BlockNumber) pageno, page);
 	}
 	PG_CATCH();
 	{
@@ -1224,6 +1450,98 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 	}
 	PG_END_TRY();
 	return served;
+}
+
+static bool
+pagestore_slru_exists_hook(SlruCtl ctl, int64 pageno)
+{
+	PageStoreRelKey key;
+	bool		exists = false;
+	MemoryContext oldcontext;
+
+	if (prev_slru_page_exists_hook &&
+		prev_slru_page_exists_hook(ctl, pageno))
+		return true;
+	if (!pagestore_slru_read_from_store)
+		return false;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+	if (pageno < 0 || pageno > (int64) UINT32_MAX)
+		return false;
+	if (CritSectionCount > 0)
+		return false;
+
+	slru_page_key(ctl, &key);
+
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		char		buf[BLCKSZ];
+
+		if (!pagestore_slru_page_is_truncated(ctl, pageno))
+			exists = pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key,
+												 (BlockNumber) pageno, buf);
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
+		exists = false;
+	}
+	PG_END_TRY();
+	return exists;
+}
+
+static void
+pagestore_slru_truncate_hook(SlruCtl ctl, int64 cutoffPage)
+{
+	PageStoreRelKey key;
+	MemoryContext oldcontext;
+
+	if (prev_slru_page_truncate_hook)
+		prev_slru_page_truncate_hook(ctl, cutoffPage);
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+	if (cutoffPage < 0 || cutoffPage > (int64) UINT32_MAX)
+		return;
+	if (CritSectionCount > 0)
+		return;
+
+	pagestore_slru_flush_pending_mirrors();
+
+	slru_cutoff_key(ctl, &key);
+
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		BlockNumber oldcutoff = 0;
+		BlockNumber newcutoff = (BlockNumber) cutoffPage;
+		char		buf[BLCKSZ];
+
+		(void) pagestore_slru_get_cutoff(ctl, &oldcutoff);
+		if (newcutoff > oldcutoff)
+		{
+			memset(buf, 0, sizeof(buf));
+			memcpy(buf, &newcutoff, sizeof(newcutoff));
+			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, 0, buf);
+		}
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -1243,6 +1561,9 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (pageno < 0)
+		ereport(ERROR,
+				(errmsg("SLRU page number must be non-negative")));
 
 	key.spcOid = 0;
 	key.dbOid = 0;
@@ -1250,7 +1571,22 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	key.forkNum = 0;
 
 	out = palloc(BLCKSZ);
-	pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, (BlockNumber) pageno, out);
+	{
+		PageStoreRelKey cutoff_key = key;
+		BlockNumber cutoff = 0;
+		char		cutoff_buf[BLCKSZ];
+
+		cutoff_key.forkNum = 1;
+		if (pagestore_localsvc_obj_read(PS_KLASS_SLRU, &cutoff_key, 0,
+										cutoff_buf))
+			memcpy(&cutoff, cutoff_buf, sizeof(cutoff));
+		if (pageno >= 0 && (BlockNumber) pageno < cutoff)
+			ereport(ERROR,
+					(errmsg("SLRU page has been truncated from the store")));
+	}
+	if (!pagestore_localsvc_obj_read(PS_KLASS_SLRU, &key, (BlockNumber) pageno, out))
+		ereport(ERROR,
+				(errmsg("SLRU page is not present on the store")));
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -1412,12 +1748,22 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pagestore.slru_read_from_store",
-							 "Serve SLRU pages (clog, ...) from the page store instead of local files.",
-							 "Lets a compute read shared cluster state from the store; falls back "
-							 "to the local segment for pages the store does not have.",
+							 "Serve missing SLRU pages (clog, ...) from the page store.",
+							 "Local SLRU files remain authoritative when present; the store is used "
+							 "only for local misses.",
 							 &pagestore_slru_read_from_store,
 							 false,
 							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pagestore.redo_wal_from_store",
+							 "Read redo_page_asof's WAL records from the store's shipped WAL, not local files.",
+							 "Ancestor-timeline records always come from the store; this forces it for "
+							 "all records, so a compute with no local WAL (a fresh branch) can replay deltas.",
+							 &pagestore_redo_wal_from_store,
+							 false,
+							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 
@@ -1428,8 +1774,14 @@ _PG_init(void)
 	smgr_which_hook = pagestore_which;
 
 	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
+	prev_slru_page_write_hook = slru_page_write_hook;
+	prev_slru_page_read_hook = slru_page_read_hook;
+	prev_slru_page_exists_hook = slru_page_exists_hook;
+	prev_slru_page_truncate_hook = slru_page_truncate_hook;
 	slru_page_write_hook = pagestore_slru_write_hook;
 	slru_page_read_hook = pagestore_slru_read_hook;
+	slru_page_exists_hook = pagestore_slru_exists_hook;
+	slru_page_truncate_hook = pagestore_slru_truncate_hook;
 
 	/* mirror the control file (pg_control) onto the store as well */
 	prev_control_file_write_hook = control_file_write_hook;
