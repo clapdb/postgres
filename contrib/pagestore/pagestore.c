@@ -2518,7 +2518,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 				memset(zerobuf, 0, sizeof(zerobuf));
 				src = zerobuf;
 			}
-			if (write(fd, src, BLCKSZ) != BLCKSZ)
+			if (pg_pwrite(fd, src, BLCKSZ,
+						  (off_t) (p - first) * BLCKSZ) != BLCKSZ)
 			{
 				CloseTransientFile(fd);
 				ereport(ERROR,
