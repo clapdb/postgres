@@ -80,6 +80,30 @@ test('pagestore_layer',
   timeout: 60,
 )
 
+# Unit test for the durable layer manifest replay (no daemon, no PG).
+pagestore_manifest_test = executable('pagestore_manifest_test',
+  files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c'),
+  install: false,
+)
+test('pagestore_manifest',
+  pagestore_manifest_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for crash-safe compaction/GC recovery (no daemon, no PG).
+pagestore_gc_test = executable('pagestore_gc_test',
+  files('pagestore_gc_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c'),
+  install: false,
+)
+test('pagestore_gc',
+  pagestore_gc_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),

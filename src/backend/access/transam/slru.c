@@ -180,7 +180,7 @@ static void SimpleLruWaitIO(SlruCtl ctl, int slotno);
 static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno,
-								  SlruWriteAll fdata);
+								  const char *page, SlruWriteAll fdata);
 static void SlruReportIOError(SlruCtl ctl, int64 pageno, TransactionId xid);
 static int	SlruSelectLRUPage(SlruCtl ctl, int64 pageno);
 
@@ -659,6 +659,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	int64		pageno = shared->page_number[slotno];
 	int			bankno = SlotGetBankNumber(slotno);
 	bool		ok;
+	char		writebuf[BLCKSZ];
 
 	Assert(shared->page_status[slotno] != SLRU_PAGE_EMPTY);
 	Assert(LWLockHeldByMeInMode(SimpleLruGetBankLock(ctl, pageno), LW_EXCLUSIVE));
@@ -689,11 +690,19 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
 
+	/*
+	 * Take a stable copy while the slot is still locked.  The SLRU code permits
+	 * the slot to be re-dirtied while WRITE_IN_PROGRESS, so both the local write
+	 * and any mirror hook below must use this same image instead of rereading the
+	 * live shared buffer after I/O completes.
+	 */
+	memcpy(writebuf, shared->page_buffer[slotno], BLCKSZ);
+
 	/* Release bank lock while doing I/O */
 	LWLockRelease(&shared->bank_locks[bankno].lock);
 
 	/* Do the write */
-	ok = SlruPhysicalWritePage(ctl, pageno, slotno, fdata);
+	ok = SlruPhysicalWritePage(ctl, pageno, slotno, writebuf, fdata);
 
 	/* If we failed, and we're in a flush, better close the files */
 	if (!ok && fdata)
@@ -723,11 +732,12 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	/*
 	 * Mirror the just-written page to an external store, if a hook is installed
 	 * (e.g. contrib/pagestore places SLRU pages on the disaggregated store).  The
-	 * page bytes are still valid in the buffer here.  NB: this runs under the
-	 * SLRU bank lock, so the hook must be quick and must not error out the write.
+	 * page bytes are the same stable image passed to the local write above.  NB:
+	 * this runs under the SLRU bank lock, so the hook must be quick and must not
+	 * error out the write.
 	 */
 	if (slru_page_write_hook)
-		slru_page_write_hook(ctl, pageno, (const char *) shared->page_buffer[slotno]);
+		slru_page_write_hook(ctl, pageno, writebuf);
 
 	/* If part of a checkpoint, count this as a SLRU buffer written. */
 	if (fdata)
@@ -895,7 +905,8 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
  * SimpleLruWriteAll.
  */
 static bool
-SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
+SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, const char *page,
+					  SlruWriteAll fdata)
 {
 	SlruShared	shared = ctl->shared;
 	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
@@ -1012,7 +1023,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
-	if (pg_pwrite(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
+	if (pg_pwrite(fd, page, BLCKSZ, offset) != BLCKSZ)
 	{
 		pgstat_report_wait_end();
 		/* if write didn't set errno, assume problem is no disk space */
