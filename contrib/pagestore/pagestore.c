@@ -2427,59 +2427,6 @@ typedef bool (*SlruPageReconstructFn) (char *page, int64 pageno,
 					 errmsg("branch target directory path is too long"))); \
 	} while (0)
 
-static void
-pagestore_write_zero_slru_bootstrap_page(const char *slru_dir, const char *label)
-{
-	char		segpath[MAXPGPATH];
-	char		zerobuf[BLCKSZ];
-	int			pathlen;
-	int			fd;
-
-	pathlen = snprintf(segpath, sizeof(segpath), "%s/%04X", slru_dir, 0);
-	PS_CHECK_PATH_FORMAT(pathlen, segpath);
-	fd = OpenTransientFilePerm(segpath,
-							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
-							   pg_file_create_mode);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch %s bootstrap segment \"%s\": %m",
-						label, segpath)));
-	memset(zerobuf, 0, sizeof(zerobuf));
-	for (int done = 0; done < BLCKSZ;)
-	{
-		ssize_t		written;
-
-		errno = 0;
-		written = write(fd, zerobuf + done, BLCKSZ - done);
-		if (written <= 0)
-		{
-			if (written == 0)
-				errno = ENOSPC;
-			CloseTransientFile(fd);
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write branch %s bootstrap segment \"%s\": %m",
-							label, segpath)));
-		}
-		done += written;
-	}
-	if (pg_fsync(fd) != 0)
-	{
-		CloseTransientFile(fd);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync branch %s bootstrap segment \"%s\": %m",
-						label, segpath)));
-	}
-	if (CloseTransientFile(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close branch %s bootstrap segment \"%s\": %m",
-						label, segpath)));
-	fsync_fname(slru_dir, true);
-}
-
 static int64
 pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 						  int64 page_lo, int64 page_hi,
@@ -3109,7 +3056,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		if (oldest_multi < next_multi)
 		{
 			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
-			off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+			off_page_hi = (int64) next_multi / PS_MXOFF_PER_PAGE;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
 													ps_mxoff_reconstruct,
@@ -3126,20 +3073,36 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			if (next_multi > FirstMultiXactId)
 			{
 				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
-				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+				off_page_hi = (int64) next_multi / PS_MXOFF_PER_PAGE;
 				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 														off_page_lo, off_page_hi,
 														ps_mxoff_reconstruct,
 														base, target, "multixact offsets", false);
 			}
+			else
+			{
+				off_page_lo = (int64) next_multi / PS_MXOFF_PER_PAGE;
+				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+														off_page_lo, off_page_lo,
+														ps_mxoff_reconstruct,
+														base, target, "multixact offsets", false);
+			}
 		}
+	}
+	else
+	{
+		off_page_lo = (int64) next_multi / PS_MXOFF_PER_PAGE;
+		off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+												off_page_lo, off_page_lo,
+												ps_mxoff_reconstruct,
+												base, target, "multixact offsets", false);
 	}
 	if (next_member != oldest_member)
 	{
 		if (oldest_member < next_member)
 		{
 			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+			mem_page_hi = next_member / PS_MXMEMB_PER_PAGE;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
 													ps_mxmemb_reconstruct,
@@ -3156,18 +3119,29 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			if (next_member > 0)
 			{
 				mem_page_lo = 0;
-				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+				mem_page_hi = next_member / PS_MXMEMB_PER_PAGE;
 				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 														mem_page_lo, mem_page_hi,
 														ps_mxmemb_reconstruct,
 														base, target, "multixact members", false);
 			}
+			else
+			{
+				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+														0, 0,
+														ps_mxmemb_reconstruct,
+														base, target, "multixact members", false);
+			}
 		}
 	}
-	if (off_seeded == 0)
-		pagestore_write_zero_slru_bootstrap_page(offdir, "multixact offsets");
-	if (mem_seeded == 0)
-		pagestore_write_zero_slru_bootstrap_page(memdir, "multixact members");
+	else
+	{
+		mem_page_lo = next_member / PS_MXMEMB_PER_PAGE;
+		mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+												mem_page_lo, mem_page_lo,
+												ps_mxmemb_reconstruct,
+												base, target, "multixact members", false);
+	}
 	seeded += off_seeded + mem_seeded;
 
 	fsync_fname(mxstage, true);
