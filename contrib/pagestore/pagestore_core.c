@@ -757,21 +757,26 @@ tl_walk_next(TlWalk *w)
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
- *	- a new id that is out of range, the root (0), or already defined (otherwise
- *	  re-creating an id silently rewrites an existing branch's ancestry);
+ *	- a new id that is out of range, or an already-defined id with mismatched
+ *	  ancestry metadata (unless it exactly matches for idempotent retry);
  *	- a parent that is out of range or not yet defined (the requested parent must
  *	  actually exist, else the branch silently inherits from nothing);
  *	- a parent whose ancestry already reaches the new id, which would turn the
  *	  parent walk into an infinite loop (e.g. new == parent, or A->B->A).
- * Returns 1 if (new_tl, parent) is safe to define.
+ * Returns 1 if (new_tl, parent, branch_lsn) can be used for CREATE_BRANCH.
  */
 static int
-branch_request_ok(uint32_t new_tl, int parent)
+branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 {
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || timelines[new_tl].defined)
+	/* Exact matches to an existing definition are idempotent retries. */
+	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
+		return timelines[new_tl].parent == parent &&
+			timelines[new_tl].branch_lsn == branch_lsn;
+
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
+		parent >= MAX_TIMELINES || !timelines[parent].defined)
 		return 0;
-	if (parent < 0 || parent >= MAX_TIMELINES || !timelines[parent].defined)
-		return 0;
+
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
 	{
 		if ((uint32_t) t == new_tl)
@@ -860,12 +865,12 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
-static void
+static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
+	return ps_storage->meta_append(&rec, sizeof(rec));
 }
 
 static void
@@ -884,7 +889,7 @@ load_timelines(void)
 	 */
 	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		if (branch_request_ok(rec.id, rec.parent))
+		if (branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		else
 			fprintf(stderr, "pagestore: skipping invalid timeline record "
@@ -1485,12 +1490,31 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline))
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
 			{
-				timeline_define(ch->timeline, (int) ch->parent_timeline,
-								ch->req_lsn);
-				timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn);
+				if (timelines[ch->timeline].defined)
+					break;
+				if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn) == 0)
+					timeline_define(ch->timeline, (int) ch->parent_timeline,
+									ch->req_lsn);
+				else
+					ch->status = PS_STATUS_ERROR;
+			}
+			else
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_CHECK_BRANCH:
+			/*
+			 * Validate a branch request without mutating timeline metadata.
+			 * This keeps prepare/retry paths deterministic: invalid requests are
+			 * rejected in-place before any SLRU directory mutation.
+			 */
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
+			{
+				/* valid */
 			}
 			else
 				ch->status = PS_STATUS_ERROR;

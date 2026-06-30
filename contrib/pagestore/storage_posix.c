@@ -328,7 +328,13 @@ posix_meta_append(const void *buf, uint32_t len)
 		close(fd);
 		return -1;
 	}
-	close(fd);
+	if (fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
 	return 0;
 }
 
