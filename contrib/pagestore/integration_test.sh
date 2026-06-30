@@ -401,7 +401,7 @@ cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
-# so the boot genuinely depends on prepare_branch output rather than parent state.
+# so the boot genuinely depends on all prepare_branch output rather than parent state.
 $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA');" >/dev/null
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
