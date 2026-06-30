@@ -3266,6 +3266,8 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+#define PAGESTORE_BRANCH_MANIFEST_MAXLEN 8192
+
 static void
 pagestore_write_branch_manifest(const char *target_dir,
 								int32 new_tl, int32 parent_tl,
@@ -3394,7 +3396,16 @@ pagestore_read_branch_manifest(const char *target_dir)
 
 	initStringInfo(&buf);
 	while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
+	{
+		if (buf.len + nread > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+		{
+			FreeFile(file);
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("branch manifest \"%s\" is too large", path)));
+		}
 		appendBinaryStringInfo(&buf, tmp, nread);
+	}
 	if (ferror(file))
 	{
 		FreeFile(file);
@@ -3406,46 +3417,111 @@ pagestore_read_branch_manifest(const char *target_dir)
 	return buf.data;
 }
 
+static const char *
+pagestore_manifest_skip_ws(const char *p)
+{
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	return p;
+}
+
+static bool
+pagestore_manifest_value_ends(char c)
+{
+	return c == '\0' || c == ',' || c == '}' ||
+		c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static const char *
+pagestore_manifest_find_field(const char *manifest, const char *key)
+{
+	size_t		keylen = strlen(key);
+	const char *p = manifest;
+
+	while ((p = strchr(p, '"')) != NULL)
+	{
+		const char *name = p + 1;
+		const char *end = strchr(name, '"');
+
+		if (end == NULL)
+			return NULL;
+		if ((size_t) (end - name) == keylen &&
+			strncmp(name, key, keylen) == 0)
+		{
+			p = pagestore_manifest_skip_ws(end + 1);
+			if (*p != ':')
+				return NULL;
+			return pagestore_manifest_skip_ws(p + 1);
+		}
+		p = end + 1;
+	}
+	return NULL;
+}
+
 static bool
 pagestore_manifest_has_token(const char *manifest, const char *key,
 							 const char *value)
 {
-	char		token[256];
-	int			len;
-	const char *match;
+	const char *field = pagestore_manifest_find_field(manifest, key);
+	size_t		len = strlen(value);
 
-	len = snprintf(token, sizeof(token), "\"%s\": %s", key, value);
-	if (len < 0 || len >= (int) sizeof(token))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("branch manifest token is too large")));
-	match = manifest;
-	while ((match = strstr(match, token)) != NULL)
-	{
-		char		next = match[len];
-
-		if (next == '\0' || next == ',' || next == '}' ||
-			next == '\n' || next == '\r' ||
-			next == ' ' || next == '\t')
-			return true;
-		match += len;
-	}
-	return false;
+	if (field == NULL)
+		return false;
+	if (*field == '"')
+		return false;
+	if (strncmp(field, value, len) != 0)
+		return false;
+	return pagestore_manifest_value_ends(field[len]);
 }
 
 static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
-	char		quoted[128];
+	const char *field = pagestore_manifest_find_field(manifest, key);
+	size_t		len = strlen(value);
+
+	if (field == NULL)
+		return false;
+	if (*field != '"')
+		return false;
+	field++;
+	if (strncmp(field, value, len) != 0)
+		return false;
+	return field[len] == '"';
+}
+
+static bool
+pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
+						   XLogRecPtr fork_lsn)
+{
+	char		buf[64];
 	int			len;
 
-	len = snprintf(quoted, sizeof(quoted), "\"%s\"", value);
-	if (len < 0 || len >= (int) sizeof(quoted))
+	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%d", new_tl);
+	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	return pagestore_manifest_has_token(manifest, key, quoted);
+	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%d", parent_tl);
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
+		return false;
+	return true;
 }
 
 /*
@@ -3468,7 +3544,6 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 	int32		parent_tl = PG_GETARG_INT32(2);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(3);
 	char	   *manifest;
-	char		buf[64];
 
 	if (!superuser())
 		ereport(ERROR,
@@ -3478,19 +3553,8 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 	manifest = pagestore_read_branch_manifest(target_dir);
 	if (manifest == NULL)
 		PG_RETURN_BOOL(false);
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
-		PG_RETURN_BOOL(false);
-	snprintf(buf, sizeof(buf), "%d", new_tl);
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
-		PG_RETURN_BOOL(false);
-	snprintf(buf, sizeof(buf), "%d", parent_tl);
-	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
-		PG_RETURN_BOOL(false);
-	snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
-	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
-		PG_RETURN_BOOL(false);
-
-	PG_RETURN_BOOL(true);
+	PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
+											  fork_lsn));
 }
 
 /*
