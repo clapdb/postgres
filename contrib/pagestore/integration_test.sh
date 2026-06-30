@@ -377,6 +377,9 @@ $P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, 
 $P -c "CHECKPOINT;" >/dev/null
 bc=$($P -c "SELECT pg_current_wal_lsn();")                     # base cutoff C (before row1)
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
@@ -395,10 +398,18 @@ BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
-# Install the prepared branch artifacts into the branch copy, replacing the copied clog,
-# so the boot genuinely depends on prepare_branch output rather than the parent's pg_xact.
-rm -rf "$BRANCHDATA/pg_xact"
-cp -a "$SEEDOUT/pg_xact" "$BRANCHDATA/pg_xact"
+# Install the prepared branch artifacts into the branch copy, replacing copied SLRU
+# directories so the boot genuinely depends on prepare_branch output, not copied
+# parent snapshots.
+for slru in pg_xact pg_commit_ts pg_multixact; do
+	if [ -d "$SEEDOUT/$slru" ]; then
+		rm -rf "$BRANCHDATA/$slru"
+		cp -a "$SEEDOUT/$slru" "$BRANCHDATA/$slru"
+	else
+		echo "FAIL - prepare_branch did not produce $slru under $SEEDOUT"
+		fail=1
+	fi
+done
 cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
