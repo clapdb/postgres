@@ -3527,6 +3527,21 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	return true;
 }
 
+static bool
+pagestore_manifest_is_new_timeline(const char *manifest, int32 new_timeline)
+{
+	char		buf[64];
+	int			len;
+
+	len = snprintf(buf, sizeof(buf), "%d", new_timeline);
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+
+	return pagestore_manifest_has_token(manifest, "new_timeline", buf);
+}
+
 /*
  * pagestore_validate_branch_manifest(target_dir text, new_timeline int,
  *                                    parent_timeline int, fork_lsn pg_lsn)
@@ -3700,7 +3715,8 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	target_manifest = pagestore_read_branch_manifest(target_dir);
 	if (target_manifest != NULL &&
-		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn) &&
+		!pagestore_manifest_is_new_timeline(target_manifest, parent_tl))
 		ereport(ERROR,
 				(errmsg("target branch manifest does not match the requested branch identity")));
 
