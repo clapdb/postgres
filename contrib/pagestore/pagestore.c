@@ -541,8 +541,10 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 		}
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 }
 
 /*
@@ -755,8 +757,10 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		}
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(recs);
 	pfree(page);
 
@@ -1067,8 +1071,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 	memcpy(VARDATA(result), page, BLCKSZ);
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(recs);
 	pfree(base);
 	pfree(page);
@@ -2420,7 +2426,8 @@ pagestore_multixact_members_page_asof(PG_FUNCTION_ARGS)
  */
 static bool
 ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
-								   int64 page_hi, XLogRecPtr base_lsn,
+								   int64 page_hi, int64 req_lo, int64 req_hi,
+								   XLogRecPtr base_lsn,
 								   XLogRecPtr target_lsn)
 {
 	PageStoreRelKey key;
@@ -2435,30 +2442,35 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	XLogRecPtr	reached_from;
 	TransactionId xid;
 	TransactionId prepared_xid;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
 	slru_obj_key(&key, "pg_commit_ts");
 	for (int64 p = 0; p < np; p++)
 	{
 		uint64		resolved = 0;
-		bool		base_found;
 
-		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
 												   (BlockNumber) (page_lo + p),
 												   (uint64) base_lsn,
 												   pages + p * BLCKSZ,
 												   &resolved) &&
 			resolved == (uint64) base_lsn;
-		present[p] = base_found;
-		if (!base_found)
+		present[p] = base_found[p];
+		if (!base_found[p])
 			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 	}
 
 	if (target_lsn == base_lsn)
-		return true;
+		goto check_required_pages;
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2510,6 +2522,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 					idx = zp - page_lo;
 					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
 					present[idx] = true;
+					zeroed[idx] = true;
+					truncated[idx] = false;
 				}
 			}
 			else if (cinfo == COMMIT_TS_TRUNCATE)
@@ -2526,7 +2540,10 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				{
 					pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
 					if (pageseg < cut_seg)
+					{
 						present[p] = false;
+						truncated[p] = true;
+					}
 				}
 			}
 		}
@@ -2585,8 +2602,26 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		ereport(ERROR,
 				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
 
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base commit-ts snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
 	XLogReaderFree(reader);
 	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
 	return true;
 }
 
@@ -2596,6 +2631,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 static bool
 ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 								int64 page_lo, int64 page_hi,
+								int64 req_lo, int64 req_hi,
 								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
 {
 	PageStoreRelKey key;
@@ -2606,28 +2642,32 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 	XLogRecPtr	readfrom;
 	int64		np = page_hi - page_lo + 1;
 	uint64		resolved = 0;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
 	slru_obj_key(&key, "pg_multixact/offsets");
 	for (int64 p = 0; p < np; p++)
 	{
-		bool		base_found;
-
-		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
 												   (BlockNumber) (page_lo + p),
 												   (uint64) base_lsn,
 												   pages + p * BLCKSZ,
 												   &resolved) &&
 			resolved == (uint64) base_lsn;
-		present[p] = base_found;
-		if (!base_found)
+		present[p] = base_found[p];
+		if (!base_found[p])
 			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 	}
 	if (target_lsn == base_lsn)
-		return true;
+		goto check_required_pages;
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2672,6 +2712,8 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 				idx = zp - page_lo;
 				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
 				present[idx] = true;
+				zeroed[idx] = true;
+				truncated[idx] = false;
 			}
 		}
 		else if (info == XLOG_MULTIXACT_CREATE_ID)
@@ -2718,7 +2760,10 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 				int64		pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
 
 				if (pageseg < cutoff_seg)
+				{
 					present[p] = false;
+					truncated[p] = true;
+				}
 			}
 		}
 	}
@@ -2730,8 +2775,26 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
 
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested multixact offsets page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base offsets snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
 	XLogReaderFree(reader);
 	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
 	return true;
 }
 
@@ -2741,6 +2804,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 static bool
 ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 								int64 page_lo, int64 page_hi,
+								int64 req_lo, int64 req_hi,
 								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
 {
 	PageStoreRelKey key;
@@ -2751,28 +2815,32 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 	XLogRecPtr	readfrom;
 	int64		np = page_hi - page_lo + 1;
 	uint64		resolved = 0;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
 	slru_obj_key(&key, "pg_multixact/members");
 	for (int64 p = 0; p < np; p++)
 	{
-		bool		base_found;
-
-		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
 												   (BlockNumber) (page_lo + p),
 												   (uint64) base_lsn,
 												   pages + p * BLCKSZ,
 												   &resolved) &&
 			resolved == (uint64) base_lsn;
-		present[p] = base_found;
-		if (!base_found)
+		present[p] = base_found[p];
+		if (!base_found[p])
 			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 	}
 	if (target_lsn == base_lsn)
-		return true;
+		goto check_required_pages;
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -2817,6 +2885,8 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 				idx = zp - page_lo;
 				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
 				present[idx] = true;
+				zeroed[idx] = true;
+				truncated[idx] = false;
 			}
 		}
 		else if (info == XLOG_MULTIXACT_CREATE_ID)
@@ -2852,7 +2922,10 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 				if (ps_mxmemb_segment_truncated(segno,
 												xlrec.startTruncMemb,
 												xlrec.endTruncMemb))
+				{
 					present[p] = false;
+					truncated[p] = true;
+				}
 			}
 		}
 	}
@@ -2864,13 +2937,32 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact members as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
 
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested multixact members page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base members snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
 	XLogReaderFree(reader);
 	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
 	return true;
 }
 
 typedef bool (*SlruPageRangeReconstructFn) (char *pages, bool *present,
 										   int64 page_lo, int64 page_hi,
+										   int64 req_lo, int64 req_hi,
 										   XLogRecPtr base_lsn,
 										   XLogRecPtr target_lsn);
 
@@ -2981,7 +3073,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	present = palloc0(np * sizeof(bool));
 	for (p = 0; p < np; p++)
 		memset(pages + p * BLCKSZ, 0, BLCKSZ);
-	if (!reconstruct(pages, present, page_lo, page_hi, base, target))
+	if (!reconstruct(pages, present, page_lo, page_hi, req_lo, req_hi,
+					 base, target))
 	{
 		ereport(ERROR,
 				(errmsg("pagestore: failed to reconstruct %s pages in [%lld, %lld] as of %X/%08X",
