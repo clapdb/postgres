@@ -1429,6 +1429,26 @@ pagestore_slru_dirty_hook(SlruCtl ctl, int64 pageno, const char *page)
 /* GUC: when on, the read hook below serves SLRU pages from the store. */
 static bool pagestore_slru_read_from_store = false;
 
+static bool
+pagestore_slru_store_reads_allowed(void)
+{
+	if (!pagestore_slru_read_from_store)
+		return false;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+
+	/*
+	 * SLRU object versions on this branch are local object write versions, not WAL
+	 * LSNs comparable to timeline branch points.  Do not let a branch timeline walk
+	 * into the parent's later SLRU mirrors; prepared branch bootstraps install local
+	 * SLRUs instead.
+	 */
+	if (pagestore_localsvc_timeline() != 0)
+		return false;
+
+	return true;
+}
+
 /*
  * SLRU page-read hook (installed into slru.c): serve a missing local SLRU page
  * from the store.  slru.c calls this only after the local segment read misses,
@@ -1446,9 +1466,7 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 		prev_slru_page_read_hook(ctl, pageno, page))
 		return true;
 
-	if (!pagestore_slru_read_from_store)
-		return false;
-	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+	if (!pagestore_slru_store_reads_allowed())
 		return false;
 	if (pageno < 0 || pageno > (int64) UINT32_MAX)
 		return false;
