@@ -231,7 +231,31 @@ assert "$live_before" "t" "redo_page_asof materializes the block while it is liv
 live_after=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_after') IS NULL;")
 assert "$live_after" "t" "redo_page_asof returns NULL for a block truncated away as of the LSN (liveness)"
 
-# --- 14. store-backed redo: replay base+deltas from the store's shipped WAL ------
+# --- 10. SLRU (clog) on the store via the klass seam + the slru.c write hook -----
+# The write hook in slru.c mirrors each written SLRU page onto the store as a
+# PS_KLASS_SLRU object.  Commit a real xid (dirties clog page 0), CHECKPOINT (the
+# checkpointer's SimpleLruWriteAll fires the hook), then verify the store's clog
+# page 0 byte-for-byte matches the local pg_xact segment -- real cluster state,
+# through the real PG SLRU path, on the store.
+$P -c "CREATE FUNCTION pagestore_slru_get(text,int) RETURNS bytea
+        AS 'pagestore','pagestore_slru_get' LANGUAGE C STRICT;" >/dev/null
+slru_xid=$($P -c "SELECT pg_current_xact_id();")     # a committed xid on clog page 0
+$P -c "CHECKPOINT;" >/dev/null
+slru_match=$($P -c "SELECT pagestore_slru_get('pg_xact', 0) = pg_read_binary_file('pg_xact/0000', 0, 8192);")
+assert "$slru_match" "t" "real clog page mirrored to the store matches the local pg_xact segment (SLRU on store)"
+
+# --- 10. read side: serve clog from the store with the local segment absent -----
+# Turn on read-from-store, stop, hide the local clog segment, restart.  The xid
+# committed above must still read 'committed' -- with pg_xact/0000 gone it can only
+# have come from the store, so a compute is serving SLRU from the shared store.
+echo "pagestore.slru_read_from_store = on" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+slru_status=$($P -c "SELECT pg_xact_status('$slru_xid');")
+assert "$slru_status" "committed" "clog served from the store with the local pg_xact segment absent (compute reads SLRU from store)"
+
+# --- 12. store-backed redo: replay base+deltas from the store's shipped WAL ------
 # With pagestore.redo_wal_from_store on, redo_page_asof reads its WAL records from
 # the daemon's shipped per-timeline log instead of local files -- so a compute with
 # no local WAL (a fresh branch) can materialize a page.  Ship the segment first.
@@ -250,7 +274,7 @@ sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
      AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
 assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's shipped WAL (store-backed reader)"
 
-# --- 15. daemon crash recovery: segment-log recovery of un-flushed writes -------
+# --- 13. daemon crash recovery: segment-log recovery of un-flushed writes -------
 # Restart the daemon with a flush threshold so high the rows below can never be
 # sealed into an image layer -- they live ONLY in the memtable + segment log.  Then
 # SIGKILL it (no clean shutdown, so the memtable is lost), restart, and require the

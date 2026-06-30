@@ -1082,10 +1082,13 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
 	if (*offptr != offset)
 	{
 		/* should already be set to the correct value, or not at all */
-		Assert(*offptr == 0);
-		*offptr = offset;
-		MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
-	}
+			Assert(*offptr == 0);
+			*offptr = offset;
+			MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(MultiXactOffsetCtl, pageno,
+									 MultiXactOffsetCtl->shared->page_buffer[slotno]);
+		}
 
 	/*
 	 * Set the next multixid's offset to the end of this multixid's members.
@@ -1116,10 +1119,13 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
 	if (*next_offptr != next_offset)
 	{
 		/* should already be set to the correct value, or not at all */
-		Assert(*next_offptr == 0);
-		*next_offptr = next_offset;
-		MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
-	}
+			Assert(*next_offptr == 0);
+			*next_offptr = next_offset;
+			MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(MultiXactOffsetCtl, next_pageno,
+									 MultiXactOffsetCtl->shared->page_buffer[slotno]);
+		}
 
 	/* Release MultiXactOffset SLRU lock. */
 	LWLockRelease(lock);
@@ -1175,8 +1181,11 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset,
 		flagsval |= (members[i].status << bshift);
 		*flagsptr = flagsval;
 
-		MultiXactMemberCtl->shared->page_dirty[slotno] = true;
-	}
+			MultiXactMemberCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(MultiXactMemberCtl, pageno,
+									 MultiXactMemberCtl->shared->page_buffer[slotno]);
+		}
 
 	if (prevlock != NULL)
 		LWLockRelease(prevlock);
@@ -2391,8 +2400,11 @@ TrimMultiXact(void)
 		if (entryno != 0 && (entryno + 1) * sizeof(MultiXactOffset) != BLCKSZ)
 			MemSet(offptr + 1, 0, BLCKSZ - (entryno + 1) * sizeof(MultiXactOffset));
 
-		MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
-		LWLockRelease(lock);
+			MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(MultiXactOffsetCtl, pageno,
+									 MultiXactOffsetCtl->shared->page_buffer[slotno]);
+			LWLockRelease(lock);
 	}
 
 	/*
@@ -2430,8 +2442,11 @@ TrimMultiXact(void)
 		 * writing.
 		 */
 
-		MultiXactMemberCtl->shared->page_dirty[slotno] = true;
-		LWLockRelease(lock);
+			MultiXactMemberCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(MultiXactMemberCtl, pageno,
+									 MultiXactMemberCtl->shared->page_buffer[slotno]);
+			LWLockRelease(lock);
 	}
 
 	/* signal that we're officially up */

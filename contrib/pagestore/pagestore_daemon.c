@@ -68,7 +68,8 @@ handle_request(PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_EXTEND:
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
+							ch->req_lsn) != 0)
 				ch->status = PS_STATUS_ERROR;
 			else
 				fork_grow(tl, &ch->key, ch->blocknum + 1);
@@ -78,7 +79,8 @@ handle_request(PsChannel *ch)
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + i,
-								 ch->data + (size_t) i * page_size) != 0)
+								ch->data + (size_t) i * page_size,
+								ch->req_lsn) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -101,9 +103,17 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READ_AT:
-			/* as-of read on this timeline, honoring branch ancestry */
-			if (!read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+			/* as-of read on this timeline, honoring branch ancestry.  Report
+			 * found-ness in ch->result so callers can distinguish "this block has
+			 * a stored version" from "zero-filled because it is unwritten" (a block
+			 * below the fork length but never written must not look present). */
+			if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data))
+				ch->result = 1;
+			else
+			{
 				memset(ch->data, 0, page_size);
+				ch->result = 0;
+			}
 			break;
 
 		default:

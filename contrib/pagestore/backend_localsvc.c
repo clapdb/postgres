@@ -652,6 +652,14 @@ void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 							 BlockNumber block, const void *page)
 {
+	pagestore_localsvc_obj_write_lsn(klass, key, block, page, 0);
+}
+
+void
+pagestore_localsvc_obj_write_lsn(uint32 klass, const PageStoreRelKey *key,
+								 BlockNumber block, const void *page,
+								 uint64 lsn)
+{
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
 
@@ -675,23 +683,37 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	ch->skip_fsync = 0;
+	ch->req_lsn = lsn;
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec(ch);
 }
 
-void
+bool
 pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 							BlockNumber block, void *page)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
+	/*
+	 * Read the block as-of the latest LSN.  READ_AT reports in ch->result whether
+	 * the block actually has a stored version, which is what we need: NBLOCKS
+	 * alone would treat a sparse object block (below the fork length but never
+	 * written -- e.g. an SLRU mirror that was skipped/swallowed) as present and
+	 * serve a zero page, when the caller must fall back to its local copy instead.
+	 */
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
-	ch->opcode = PS_OP_READV;
+	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
-	ch->nblocks = 1;
+	ch->req_lsn = UINT64_MAX;
 	ls_exec(ch);
+	if (ch->result == 0)
+	{
+		memset(page, 0, BLCKSZ);	/* no stored version -> not in the store */
+		return false;
+	}
 	memcpy(page, ch->data, BLCKSZ);
+	return true;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

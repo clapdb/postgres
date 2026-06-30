@@ -166,6 +166,52 @@ typedef struct SlruCtlData
 typedef SlruCtlData *SlruCtl;
 
 /*
+ * Hook called after an SLRU page is successfully written to its segment file,
+ * with the SLRU's control struct, the page number, and the exact stable BLCKSZ
+ * page image passed to the segment write.  Lets an extension mirror SLRU pages
+ * (clog, multixact, ...) to an external store; NULL (the default) disables it.
+ * Invoked under the page's SLRU bank lock, so the callback must not block for
+ * long.
+ */
+typedef void (*SlruPageWriteHook_type) (SlruCtl ctl, int64 pageno,
+										const char *page);
+extern PGDLLIMPORT SlruPageWriteHook_type slru_page_write_hook;
+
+/*
+ * Hook called after an SLRU page is dirtied in memory, before the dirty image is
+ * necessarily written to its segment file.  This lets an external store mirror
+ * transaction status that is logically visible before checkpoint/eviction flushes
+ * the SLRU buffer locally.
+ */
+typedef void (*SlruPageDirtyHook_type) (SlruCtl ctl, int64 pageno,
+										const char *page);
+extern PGDLLIMPORT SlruPageDirtyHook_type slru_page_dirty_hook;
+
+/*
+ * Hook consulted before reading an SLRU page from its segment file.  If set and
+ * it returns true, it has filled the BLCKSZ page buffer from an external store
+ * and the local read is skipped; if it returns false, the normal local read
+ * proceeds.  Lets a compute serve SLRU pages (clog, ...) from a shared store.
+ */
+typedef bool (*SlruPageReadHook_type) (SlruCtl ctl, int64 pageno, char *page);
+extern PGDLLIMPORT SlruPageReadHook_type slru_page_read_hook;
+
+/*
+ * Hook consulted after the local segment-file existence check misses.  If set
+ * and it returns true, the caller treats the page as existing on an external
+ * store.
+ */
+typedef bool (*SlruPageExistsHook_type) (SlruCtl ctl, int64 pageno);
+extern PGDLLIMPORT SlruPageExistsHook_type slru_page_exists_hook;
+
+/*
+ * Hook called when local SLRU segment files are truncated or deleted, so an
+ * external mirror can drop the same pages and avoid serving stale status.
+ */
+typedef void (*SlruPageTruncateHook_type) (SlruCtl ctl, int64 cutoffPage);
+extern PGDLLIMPORT SlruPageTruncateHook_type slru_page_truncate_hook;
+
+/*
  * Get the SLRU bank lock for given SlruCtl and the pageno.
  *
  * This lock needs to be acquired to access the slru buffer slots in the
