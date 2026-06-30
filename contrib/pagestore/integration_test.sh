@@ -441,7 +441,7 @@ assert "$($PB -c "SELECT count(*) FROM tb WHERE note='after_L';" 2>/dev/null)" "
 assert "$($P -c "SELECT count(*) FROM tb WHERE note='branch_local';")" "0" \
 	"parent is isolated from the branch's local write"
 "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1
-rm -rf "$(dirname "$SEEDOUT")"
+rm -rf "$SEEDOUT"
 
 # --- 20. commit-ts applier: reconstruct commit timestamps as-of L ---------------------
 # Same shape as the clog applier, for pg_commit_ts: snapshot at C, commit xidA (<= L) and
