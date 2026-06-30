@@ -398,22 +398,20 @@ BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
-# Install the prepared branch artifacts into the branch copy, replacing copied SLRU
+# Install every prepared branch SLRU artifact into the branch copy, replacing copied
 # directories so the boot genuinely depends on prepare_branch output, not copied
-# parent snapshots.
-for slru in pg_xact pg_multixact; do
+# parent snapshots.  pg_commit_ts is only prepared when commit timestamps are active.
+for slru in pg_xact pg_commit_ts pg_multixact; do
 	if [ -d "$SEEDOUT/$slru" ]; then
 		rm -rf "$BRANCHDATA/$slru"
 		cp -a "$SEEDOUT/$slru" "$BRANCHDATA/$slru"
+	elif [ "$slru" = "pg_commit_ts" ]; then
+		:
 	else
 		echo "FAIL - prepare_branch did not produce $slru under $SEEDOUT"
 		fail=1
 	fi
 done
-if [ -d "$SEEDOUT/pg_commit_ts" ]; then
-	rm -rf "$BRANCHDATA/pg_commit_ts"
-	cp -a "$SEEDOUT/pg_commit_ts" "$BRANCHDATA/pg_commit_ts"
-fi
 cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
