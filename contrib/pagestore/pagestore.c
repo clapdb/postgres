@@ -2415,9 +2415,464 @@ pagestore_multixact_members_page_asof(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
-typedef bool (*SlruPageReconstructFn) (char *page, int64 pageno,
-									   XLogRecPtr base_lsn,
-									   XLogRecPtr target_lsn);
+/* Load commit-ts pages in [page_lo, page_hi], replay (base, target] once, and mark each
+ * page as present when we have a known byte value for at least one slot.
+ */
+static bool
+ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
+								   int64 page_hi, XLogRecPtr base_lsn,
+								   XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	RmgrId		rmid;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	bool		deactivated = false;
+	XLogRecPtr	reached_from;
+	TransactionId xid;
+	TransactionId prepared_xid;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_commit_ts");
+	for (int64 p = 0; p < np; p++)
+	{
+		uint64		resolved = 0;
+		bool		base_found;
+
+		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found;
+		if (!base_found)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+
+	if (target_lsn == base_lsn)
+		return true;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	reached_from = readfrom;
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		cinfo;
+		uint8		info;
+		int64		pageno;
+		int64		idx;
+		TimestampTz ts;
+		RepOriginId origin;
+		xl_xact_parsed_commit parsed;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+
+		rmid = XLogRecGetRmid(reader);
+		if (rmid == RM_COMMIT_TS_ID)
+		{
+			cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			if (cinfo == COMMIT_TS_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp >= page_lo && zp <= page_hi)
+				{
+					idx = zp - page_lo;
+					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+					present[idx] = true;
+				}
+			}
+			else if (cinfo == COMMIT_TS_TRUNCATE)
+			{
+				xl_commit_ts_truncate xlrec;
+				int64		pageseg;
+				int64		cut_seg;
+
+				/* the record carries only SizeOfCommitTsTruncate bytes; sizeof() would
+				 * include trailing struct padding and read past the WAL payload */
+				memcpy(&xlrec, XLogRecGetData(reader), SizeOfCommitTsTruncate);
+				cut_seg = xlrec.pageno / SLRU_PAGES_PER_SEGMENT;
+				for (int64 p = 0; p < np; p++)
+				{
+					pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+					if (pageseg < cut_seg)
+						present[p] = false;
+				}
+			}
+		}
+		else if (rmid == RM_XLOG_ID)
+		{
+			if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_PARAMETER_CHANGE)
+			{
+				xl_parameter_change xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				if (!xlrec.track_commit_timestamp)
+					deactivated = true;
+			}
+			continue;
+		}
+		else if (rmid != RM_XACT_ID)
+			continue;
+
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+		if (info != XLOG_XACT_COMMIT && info != XLOG_XACT_COMMIT_PREPARED)
+			continue;
+		ParseCommitRecord(XLogRecGetInfo(reader),
+						 (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+		ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
+			: parsed.xact_time;
+		origin = XLogRecGetOrigin(reader);
+		prepared_xid = parsed.twophase_xid;
+		xid = (info == XLOG_XACT_COMMIT_PREPARED) ? prepared_xid : XLogRecGetXid(reader);
+		pageno = (int64) xid / PS_CTS_XACTS_PER_PAGE;
+		if (pageno >= page_lo && pageno <= page_hi)
+		{
+			idx = pageno - page_lo;
+			ps_commit_ts_set(pages + idx * BLCKSZ, pageno, xid, ts, origin);
+			present[idx] = true;
+		}
+		for (int i = 0; i < parsed.nsubxacts; i++)
+		{
+			xid = parsed.subxacts[i];
+			pageno = (int64) xid / PS_CTS_XACTS_PER_PAGE;
+			if (pageno >= page_lo && pageno <= page_hi)
+			{
+				idx = pageno - page_lo;
+				ps_commit_ts_set(pages + idx * BLCKSZ, pageno, xid, ts, origin);
+				present[idx] = true;
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(reached_from) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+	if (deactivated)
+		ereport(ERROR,
+				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	return true;
+}
+
+/* Load and replay multixact offsets for all requested pages in one WAL pass, marking each
+ * requested page as present when any content is known.
+ */
+static bool
+ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
+								int64 page_lo, int64 page_hi,
+								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	uint64		resolved = 0;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_multixact/offsets");
+	for (int64 p = 0; p < np; p++)
+	{
+		bool		base_found;
+
+		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found;
+		if (!base_found)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+	if (target_lsn == base_lsn)
+		return true;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		if (XLogRecGetRmid(reader) != RM_MULTIXACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+
+		if (info == XLOG_MULTIXACT_ZERO_OFF_PAGE)
+		{
+			int64		zp;
+			int64		idx;
+
+			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+			if (zp >= page_lo && zp <= page_hi)
+			{
+				idx = zp - page_lo;
+				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+				present[idx] = true;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create *xlrec =
+				(xl_multixact_create *) XLogRecGetData(reader);
+			MultiXactOffset next = xlrec->moff + xlrec->nmembers;
+			MultiXactId succ;
+			int64		mpageno;
+
+			if (next == 0)
+				next = 1;
+			succ = (xlrec->mid == MaxMultiXactId) ? FirstMultiXactId : xlrec->mid + 1;
+
+			mpageno = (int64) (xlrec->mid / PS_MXOFF_PER_PAGE);
+			if (mpageno >= page_lo && mpageno <= page_hi)
+			{
+				int64	 idx = mpageno - page_lo;
+
+				ps_mxoff_set(pages + idx * BLCKSZ, mpageno, xlrec->mid, xlrec->moff);
+				present[idx] = true;
+			}
+			mpageno = (int64) (succ / PS_MXOFF_PER_PAGE);
+			if (mpageno >= page_lo && mpageno <= page_hi)
+			{
+				int64	 idx = mpageno - page_lo;
+
+				ps_mxoff_set(pages + idx * BLCKSZ, mpageno, succ, next);
+				present[idx] = true;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate xlrec;
+			MultiXactId cutoff;
+			int64		cutoff_seg;
+
+			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
+			cutoff = (xlrec.endTruncOff == FirstMultiXactId) ? MaxMultiXactId
+				: xlrec.endTruncOff - 1;
+			cutoff_seg = ((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT;
+			for (int64 p = 0; p < np; p++)
+			{
+				int64		pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+
+				if (pageseg < cutoff_seg)
+					present[p] = false;
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	return true;
+}
+
+/* Load and replay multixact members for all requested pages in one WAL pass, marking each
+ * requested page as present when any content is known.
+ */
+static bool
+ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
+								int64 page_lo, int64 page_hi,
+								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	uint64		resolved = 0;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	slru_obj_key(&key, "pg_multixact/members");
+	for (int64 p = 0; p < np; p++)
+	{
+		bool		base_found;
+
+		base_found = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found;
+		if (!base_found)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+	if (target_lsn == base_lsn)
+		return true;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		if (XLogRecGetRmid(reader) != RM_MULTIXACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+
+		if (info == XLOG_MULTIXACT_ZERO_MEM_PAGE)
+		{
+			int64		zp;
+			int64		idx;
+
+			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+			if (zp >= page_lo && zp <= page_hi)
+			{
+				idx = zp - page_lo;
+				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+				present[idx] = true;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create *xlrec =
+				(xl_multixact_create *) XLogRecGetData(reader);
+
+			for (int i = 0; i < xlrec->nmembers; i++)
+			{
+				int64		pageno = (xlrec->moff + i) / PS_MXMEMB_PER_PAGE;
+
+				if (pageno >= page_lo && pageno <= page_hi)
+				{
+					int64		idx = pageno - page_lo;
+
+					ps_mxmemb_set(pages + idx * BLCKSZ, pageno,
+								  xlrec->moff + i,
+								  xlrec->members[i].xid,
+								  (uint32) xlrec->members[i].status);
+					present[idx] = true;
+				}
+			}
+		}
+		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate xlrec;
+
+			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
+			for (int64 p = 0; p < np; p++)
+			{
+				int64		segno = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+
+				if (ps_mxmemb_segment_truncated(segno,
+												xlrec.startTruncMemb,
+												xlrec.endTruncMemb))
+					present[p] = false;
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact members as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	return true;
+}
+
+typedef bool (*SlruPageRangeReconstructFn) (char *pages, bool *present,
+										   int64 page_lo, int64 page_hi,
+										   XLogRecPtr base_lsn,
+										   XLogRecPtr target_lsn);
 
 #define PS_CHECK_PATH_FORMAT(ret, buf) \
 	do { \
@@ -2489,7 +2944,7 @@ pagestore_write_zero_slru_page(const char *slru_dir, const char *label,
 static int64
 pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 						  int64 page_lo, int64 page_hi,
-						  SlruPageReconstructFn reconstruct,
+						  SlruPageRangeReconstructFn reconstruct,
 						  XLogRecPtr base, XLogRecPtr target,
 						  const char *label, bool publish_dir)
 {
@@ -2525,20 +2980,17 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	pages = palloc((Size) np * BLCKSZ);
 	present = palloc0(np * sizeof(bool));
 	for (p = 0; p < np; p++)
+		memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	if (!reconstruct(pages, present, page_lo, page_hi, base, target))
 	{
-		int64		pageno = page_lo + p;
-
-		if (pageno < req_lo)
-		{
-			memset(pages + p * BLCKSZ, 0, BLCKSZ);
-			continue;
-		}
-		present[p] = reconstruct(pages + p * BLCKSZ, pageno, base, target);
-		if (!present[p])
-			ereport(ERROR,
-					(errmsg("pagestore: requested %s page %lld was truncated before the target LSN",
-							label, (long long) pageno)));
+		ereport(ERROR,
+				(errmsg("pagestore: failed to reconstruct %s pages in [%lld, %lld] as of %X/%08X",
+						label, (long long) req_lo, (long long) req_hi,
+						LSN_FORMAT_ARGS(target))));
 	}
+	for (p = 0; p < np; p++)
+		if (page_lo + p < req_lo)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -3022,7 +3474,7 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
-											 ps_commit_ts_reconstruct,
+											 ps_commit_ts_seed_reconstruct_range,
 											 base, target, "commit-ts", true));
 }
 
@@ -3126,7 +3578,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				off_page_hi++;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
-													ps_mxoff_reconstruct,
+													ps_mxoff_seed_reconstruct_range,
 													base, target, "multixact offsets", false);
 		}
 		else
@@ -3135,7 +3587,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			off_page_hi = (int64) MaxMultiXactId / PS_MXOFF_PER_PAGE;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
-													ps_mxoff_reconstruct,
+													ps_mxoff_seed_reconstruct_range,
 													base, target, "multixact offsets", false);
 			if (next_multi > FirstMultiXactId)
 			{
@@ -3144,9 +3596,9 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				if (next_multi % PS_MXOFF_PER_PAGE == 0)
 					off_page_hi++;
 				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
-														off_page_lo, off_page_hi,
-														ps_mxoff_reconstruct,
-														base, target, "multixact offsets", false);
+													off_page_lo, off_page_hi,
+													ps_mxoff_seed_reconstruct_range,
+													base, target, "multixact offsets", false);
 			}
 			else
 			{
@@ -3184,7 +3636,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				mem_page_hi++;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
-													ps_mxmemb_reconstruct,
+													ps_mxmemb_seed_reconstruct_range,
 													base, target, "multixact members", false);
 		}
 		else
@@ -3193,7 +3645,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			mem_page_hi = (int64) UINT32_MAX / PS_MXMEMB_PER_PAGE;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
-													ps_mxmemb_reconstruct,
+													ps_mxmemb_seed_reconstruct_range,
 													base, target, "multixact members", false);
 			if (next_member > 0)
 			{
@@ -3202,9 +3654,9 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				if (next_member % PS_MXMEMB_PER_PAGE == 0)
 					mem_page_hi++;
 				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-														mem_page_lo, mem_page_hi,
-														ps_mxmemb_reconstruct,
-														base, target, "multixact members", false);
+													mem_page_lo, mem_page_hi,
+													ps_mxmemb_seed_reconstruct_range,
+													base, target, "multixact members", false);
 			}
 			else
 			{
