@@ -3214,6 +3214,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 /*
  * pagestore_seed_branch_slrus(target_dir text, base pg_lsn, target pg_lsn,
  *                             oldest_xid xid, next_xid xid,
+ *                             oldest_commit_ts_xid xid, next_commit_ts_xid xid,
  *                             oldest_multi xid, next_multi xid,
  *                             oldest_member bigint, next_member bigint)
  * returns bigint
@@ -3234,10 +3235,12 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	XLogRecPtr	target = PG_GETARG_LSN(2);
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(5);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(6);
-	int64		oldest_member = PG_GETARG_INT64(7);
-	int64		next_member = PG_GETARG_INT64(8);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
+	int64		oldest_member = PG_GETARG_INT64(9);
+	int64		next_member = PG_GETARG_INT64(10);
 	Datum		target_dir_datum = CStringGetTextDatum(target_dir);
 	int64		seeded = 0;
 
@@ -3247,12 +3250,19 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 												LSNGetDatum(target),
 												TransactionIdGetDatum(oldest_xid),
 												TransactionIdGetDatum(next_xid)));
-	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_xid),
-												TransactionIdGetDatum(next_xid)));
+	if (TransactionIdIsNormal(oldest_commit_ts_xid) &&
+		TransactionIdIsNormal(next_commit_ts_xid))
+		seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
+													target_dir_datum,
+													LSNGetDatum(base),
+													LSNGetDatum(target),
+													TransactionIdGetDatum(oldest_commit_ts_xid),
+													TransactionIdGetDatum(next_commit_ts_xid)));
+	else if (TransactionIdIsNormal(oldest_commit_ts_xid) ||
+			 TransactionIdIsNormal(next_commit_ts_xid))
+		ereport(ERROR,
+				(errmsg("invalid commit-ts horizon [%u, %u)",
+						oldest_commit_ts_xid, next_commit_ts_xid)));
 	seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
 												target_dir_datum,
 												LSNGetDatum(base),
@@ -3271,6 +3281,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 								XLogRecPtr base, XLogRecPtr target,
 								TransactionId oldest_xid,
 								TransactionId next_xid,
+								TransactionId oldest_commit_ts_xid,
+								TransactionId next_commit_ts_xid,
 								MultiXactId oldest_multi,
 								MultiXactId next_multi,
 								int64 oldest_member,
@@ -3298,6 +3310,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 				   "  \"fork_lsn\": \"%X/%08X\",\n"
 				   "  \"oldest_xid\": \"%u\",\n"
 				   "  \"next_xid\": \"%u\",\n"
+				   "  \"oldest_commit_ts_xid\": \"%u\",\n"
+				   "  \"next_commit_ts_xid\": \"%u\",\n"
 				   "  \"oldest_multi\": \"%u\",\n"
 				   "  \"next_multi\": \"%u\",\n"
 				   "  \"oldest_member\": \"%lld\",\n"
@@ -3308,6 +3322,7 @@ pagestore_write_branch_manifest(const char *target_dir,
 				   LSN_FORMAT_ARGS(base),
 				   LSN_FORMAT_ARGS(target),
 				   oldest_xid, next_xid,
+				   oldest_commit_ts_xid, next_commit_ts_xid,
 				   oldest_multi, next_multi,
 				   (long long) oldest_member,
 				   (long long) next_member,
@@ -3370,6 +3385,7 @@ pagestore_write_branch_manifest(const char *target_dir,
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
  *                          oldest_xid xid, next_xid xid,
+ *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
  *                          oldest_multi xid, next_multi xid,
  *                          oldest_member bigint, next_member bigint)
  * returns bigint
@@ -3391,10 +3407,12 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	XLogRecPtr	target = PG_GETARG_LSN(4);
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
-	int64		oldest_member = PG_GETARG_INT64(9);
-	int64		next_member = PG_GETARG_INT64(10);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(8);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(9);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(10);
+	int64		oldest_member = PG_GETARG_INT64(11);
+	int64		next_member = PG_GETARG_INT64(12);
 	int64		seeded;
 
 	if (!superuser())
@@ -3404,27 +3422,35 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	if (new_tl <= 0)
 		ereport(ERROR,
 				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
+	if (parent_tl < 0)
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline must be >= 0")));
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
-	seeded = DatumGetInt64(DirectFunctionCall9(pagestore_seed_branch_slrus,
-											   CStringGetTextDatum(target_dir),
-											   LSNGetDatum(base),
-											   LSNGetDatum(target),
-											   TransactionIdGetDatum(oldest_xid),
-											   TransactionIdGetDatum(next_xid),
-											   TransactionIdGetDatum(oldest_multi),
-											   TransactionIdGetDatum(next_multi),
-											   Int64GetDatum(oldest_member),
-											   Int64GetDatum(next_member)));
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
+	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
+									(uint64) target);
+	seeded = DatumGetInt64(DirectFunctionCall11(pagestore_seed_branch_slrus,
+												CStringGetTextDatum(target_dir),
+												LSNGetDatum(base),
+												LSNGetDatum(target),
+												TransactionIdGetDatum(oldest_xid),
+												TransactionIdGetDatum(next_xid),
+												TransactionIdGetDatum(oldest_commit_ts_xid),
+												TransactionIdGetDatum(next_commit_ts_xid),
+												TransactionIdGetDatum(oldest_multi),
+												TransactionIdGetDatum(next_multi),
+												Int64GetDatum(oldest_member),
+												Int64GetDatum(next_member)));
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl, base, target,
 									oldest_xid, next_xid,
+									oldest_commit_ts_xid, next_commit_ts_xid,
 									oldest_multi, next_multi,
 									oldest_member, next_member,
 									seeded);
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
 
 	PG_RETURN_INT64(seeded);
 }

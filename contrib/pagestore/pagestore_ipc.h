@@ -66,6 +66,7 @@ typedef enum PsOpcode
 	PS_OP_READV,				/* read nblocks pages at blocknum into data */
 	PS_OP_IMMEDSYNC,
 	PS_OP_READ_AT,				/* read 1 page at blocknum as-of req_lsn (COW) */
+	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */

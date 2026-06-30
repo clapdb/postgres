@@ -536,9 +536,9 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
 # MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
@@ -575,7 +575,7 @@ rm -rf "$MXSEED"
 BOOTSEED=$(mktemp -d)
 bootNext=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 bootSeeded=$($P -c "SELECT pagestore_seed_branch_slrus('$BOOTSEED', '$mxC', '$mxL',
-	'3'::xid, '$bootNext'::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
+	'3'::xid, '$bootNext'::xid, '$ctsA'::xid, '$cts_next'::text::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
 assert "$([ "${bootSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch bootstrap seed materialized pg_xact, pg_commit_ts, and pg_multixact ($bootSeeded page(s))"
 bootClogSeg=$(printf '%04X' $(( (ctsA / cxpp) / 32 )))
@@ -599,7 +599,7 @@ rm -rf "$BOOTSEED"
 # artifact for the later pg_control/bootstrap step.
 PREPSEED=$(mktemp -d)
 prepSeeded=$($P -c "SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
-	'3'::xid, '$bootNext'::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
+	'3'::xid, '$bootNext'::xid, '$ctsA'::xid, '$cts_next'::text::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
 assert "$([ "${prepSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch prepare seeded all bootstrap SLRUs and forked a store timeline ($prepSeeded page(s))"
 manifestHasTimeline=$($P -c "SELECT position('\"new_timeline\": 2' in pg_read_file('$PREPSEED/pagestore_branch.manifest')) > 0;")

@@ -359,6 +359,19 @@ op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn
 	return cl_exec()->status;
 }
 
+/* Like op_create_branch but only validates the request (no metadata mutation). */
+static int
+op_check_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_CHECK_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	return cl_exec()->status;
+}
+
 /* Write one page on a specific timeline. */
 static void
 op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
@@ -811,6 +824,10 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
+	check(op_check_branch_status(1, 0, 1500) == PS_STATUS_OK,
+		  "CHECK_BRANCH accepts idempotent retry metadata");
+	check(op_check_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "CHECK_BRANCH rejects mismatched ancestry for existing timeline");
 	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
 		  "reject re-creating an existing timeline id");
 	check(op_create_branch_status(9, 900, 1500) == PS_STATUS_ERROR,
