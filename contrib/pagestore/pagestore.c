@@ -3564,6 +3564,7 @@ pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
 	char		buf[64];
+	int			len;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -3577,32 +3578,10 @@ pagestore_validate_datadir_branch_manifest(void)
 	if (!pagestore_manifest_has_token(manifest, "format", "1"))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
-	snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	len = snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
+	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(FATAL,
-				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
-				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
-}
-
-static void
-pagestore_validate_datadir_branch_manifest(void)
-{
-	char	   *manifest;
-	char		buf[64];
-
-	if (prev_shmem_startup_hook)
-		prev_shmem_startup_hook();
-
-	if (DataDir == NULL)
-		return;
-
-	manifest = pagestore_read_branch_manifest(DataDir);
-	if (manifest == NULL)
-		return;					/* legacy/non-branch datadir */
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
-		ereport(FATAL,
-				(errmsg("invalid pagestore branch manifest in data directory")));
-	snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
+				(errmsg("pagestore.timeline is too large")));
 	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
