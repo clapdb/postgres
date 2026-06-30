@@ -545,8 +545,10 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 		}
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 }
 
 /*
@@ -759,8 +761,10 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		}
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(recs);
 	pfree(page);
 
@@ -1071,8 +1075,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
 	memcpy(VARDATA(result), page, BLCKSZ);
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(recs);
 	pfree(base);
 	pfree(page);
@@ -2419,9 +2425,550 @@ pagestore_multixact_members_page_asof(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
-typedef bool (*SlruPageReconstructFn) (char *page, int64 pageno,
-									   XLogRecPtr base_lsn,
-									   XLogRecPtr target_lsn);
+/* Load commit-ts pages in [page_lo, page_hi], replay (base, target] once, and mark each
+ * page as present when we have a known byte value for at least one slot.
+ */
+static bool
+ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
+								   int64 page_hi, int64 req_lo, int64 req_hi,
+								   XLogRecPtr base_lsn,
+								   XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	RmgrId		rmid;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	bool		deactivated = false;
+	XLogRecPtr	reached_from;
+	TransactionId xid;
+	TransactionId prepared_xid;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
+	slru_obj_key(&key, "pg_commit_ts");
+	for (int64 p = 0; p < np; p++)
+	{
+		uint64		resolved = 0;
+
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found[p];
+		if (!base_found[p])
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+
+	if (target_lsn == base_lsn)
+		goto check_required_pages;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	reached_from = readfrom;
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		cinfo;
+		uint8		info;
+		int64		pageno;
+		int64		idx;
+		TimestampTz ts;
+		RepOriginId origin;
+		xl_xact_parsed_commit parsed;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+
+		rmid = XLogRecGetRmid(reader);
+		if (rmid == RM_COMMIT_TS_ID)
+		{
+			cinfo = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+			if (cinfo == COMMIT_TS_ZEROPAGE)
+			{
+				int64		zp;
+
+				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+				if (zp >= page_lo && zp <= page_hi)
+				{
+					idx = zp - page_lo;
+					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+					present[idx] = true;
+					zeroed[idx] = true;
+					truncated[idx] = false;
+				}
+			}
+			else if (cinfo == COMMIT_TS_TRUNCATE)
+			{
+				xl_commit_ts_truncate xlrec;
+				int64		pageseg;
+				int64		cut_seg;
+
+				/* the record carries only SizeOfCommitTsTruncate bytes; sizeof() would
+				 * include trailing struct padding and read past the WAL payload */
+				memcpy(&xlrec, XLogRecGetData(reader), SizeOfCommitTsTruncate);
+				cut_seg = xlrec.pageno / SLRU_PAGES_PER_SEGMENT;
+				for (int64 p = 0; p < np; p++)
+				{
+					pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+					if (pageseg < cut_seg)
+					{
+						present[p] = false;
+						truncated[p] = true;
+					}
+				}
+			}
+		}
+		else if (rmid == RM_XLOG_ID)
+		{
+			if ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_PARAMETER_CHANGE)
+			{
+				xl_parameter_change xlrec;
+
+				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+				if (!xlrec.track_commit_timestamp)
+					deactivated = true;
+			}
+			continue;
+		}
+		else if (rmid != RM_XACT_ID)
+			continue;
+
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+		if (info != XLOG_XACT_COMMIT && info != XLOG_XACT_COMMIT_PREPARED)
+			continue;
+		ParseCommitRecord(XLogRecGetInfo(reader),
+						 (xl_xact_commit *) XLogRecGetData(reader), &parsed);
+		ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
+			: parsed.xact_time;
+		origin = XLogRecGetOrigin(reader);
+		prepared_xid = parsed.twophase_xid;
+		xid = (info == XLOG_XACT_COMMIT_PREPARED) ? prepared_xid : XLogRecGetXid(reader);
+		pageno = (int64) xid / PS_CTS_XACTS_PER_PAGE;
+		if (pageno >= page_lo && pageno <= page_hi)
+		{
+			idx = pageno - page_lo;
+			ps_commit_ts_set(pages + idx * BLCKSZ, pageno, xid, ts, origin);
+			present[idx] = true;
+		}
+		for (int i = 0; i < parsed.nsubxacts; i++)
+		{
+			xid = parsed.subxacts[i];
+			pageno = (int64) xid / PS_CTS_XACTS_PER_PAGE;
+			if (pageno >= page_lo && pageno <= page_hi)
+			{
+				idx = pageno - page_lo;
+				ps_commit_ts_set(pages + idx * BLCKSZ, pageno, xid, ts, origin);
+				present[idx] = true;
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(reached_from) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+	if (deactivated)
+		ereport(ERROR,
+				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base commit-ts snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
+	return true;
+}
+
+/* Load and replay multixact offsets for all requested pages in one WAL pass, marking each
+ * requested page as present when any content is known.
+ */
+static bool
+ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
+								int64 page_lo, int64 page_hi,
+								int64 req_lo, int64 req_hi,
+								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	uint64		resolved = 0;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
+	slru_obj_key(&key, "pg_multixact/offsets");
+	for (int64 p = 0; p < np; p++)
+	{
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found[p];
+		if (!base_found[p])
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+	if (target_lsn == base_lsn)
+		goto check_required_pages;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		if (XLogRecGetRmid(reader) != RM_MULTIXACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+
+		if (info == XLOG_MULTIXACT_ZERO_OFF_PAGE)
+		{
+			int64		zp;
+			int64		idx;
+
+			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+			if (zp >= page_lo && zp <= page_hi)
+			{
+				idx = zp - page_lo;
+				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+				present[idx] = true;
+				zeroed[idx] = true;
+				truncated[idx] = false;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create *xlrec =
+				(xl_multixact_create *) XLogRecGetData(reader);
+			MultiXactOffset next = xlrec->moff + xlrec->nmembers;
+			MultiXactId succ;
+			int64		mpageno;
+
+			if (next == 0)
+				next = 1;
+			succ = (xlrec->mid == MaxMultiXactId) ? FirstMultiXactId : xlrec->mid + 1;
+
+			mpageno = (int64) (xlrec->mid / PS_MXOFF_PER_PAGE);
+			if (mpageno >= page_lo && mpageno <= page_hi)
+			{
+				int64	 idx = mpageno - page_lo;
+
+				ps_mxoff_set(pages + idx * BLCKSZ, mpageno, xlrec->mid, xlrec->moff);
+				present[idx] = true;
+			}
+			mpageno = (int64) (succ / PS_MXOFF_PER_PAGE);
+			if (mpageno >= page_lo && mpageno <= page_hi)
+			{
+				int64	 idx = mpageno - page_lo;
+
+				ps_mxoff_set(pages + idx * BLCKSZ, mpageno, succ, next);
+				present[idx] = true;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate xlrec;
+			MultiXactId cutoff;
+			int64		cutoff_seg;
+
+			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
+			cutoff = (xlrec.endTruncOff == FirstMultiXactId) ? MaxMultiXactId
+				: xlrec.endTruncOff - 1;
+			cutoff_seg = ((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT;
+			for (int64 p = 0; p < np; p++)
+			{
+				int64		pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+
+				if (pageseg < cutoff_seg)
+				{
+					present[p] = false;
+					truncated[p] = true;
+				}
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested multixact offsets page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base offsets snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
+	return true;
+}
+
+/* Load and replay multixact members for all requested pages in one WAL pass, marking each
+ * requested page as present when any content is known.
+ */
+static bool
+ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
+								int64 page_lo, int64 page_hi,
+								int64 req_lo, int64 req_hi,
+								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
+{
+	PageStoreRelKey key;
+	ReadLocalXLogPageNoWaitPrivate *pd = NULL;
+	XLogReaderState *reader = NULL;
+	char	   *errm = NULL;
+	XLogRecPtr	scanned = base_lsn;
+	XLogRecPtr	readfrom;
+	int64		np = page_hi - page_lo + 1;
+	uint64		resolved = 0;
+	bool	   *base_found;
+	bool	   *zeroed;
+	bool	   *truncated;
+
+	if (target_lsn < base_lsn)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	base_found = palloc0(np * sizeof(bool));
+	zeroed = palloc0(np * sizeof(bool));
+	truncated = palloc0(np * sizeof(bool));
+	slru_obj_key(&key, "pg_multixact/members");
+	for (int64 p = 0; p < np; p++)
+	{
+		base_found[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
+												   (BlockNumber) (page_lo + p),
+												   (uint64) base_lsn,
+												   pages + p * BLCKSZ,
+												   &resolved) &&
+			resolved == (uint64) base_lsn;
+		present[p] = base_found[p];
+		if (!base_found[p])
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	}
+	if (target_lsn == base_lsn)
+		goto check_required_pages;
+
+	pd = palloc0(sizeof(*pd));
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(base_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) && XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > target_lsn)
+			break;
+		if (reader->EndRecPtr <= base_lsn)
+			continue;
+		if (XLogRecGetRmid(reader) != RM_MULTIXACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLR_RMGR_INFO_MASK;
+
+		if (info == XLOG_MULTIXACT_ZERO_MEM_PAGE)
+		{
+			int64		zp;
+			int64		idx;
+
+			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
+			if (zp >= page_lo && zp <= page_hi)
+			{
+				idx = zp - page_lo;
+				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+				present[idx] = true;
+				zeroed[idx] = true;
+				truncated[idx] = false;
+			}
+		}
+		else if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create *xlrec =
+				(xl_multixact_create *) XLogRecGetData(reader);
+
+			for (int i = 0; i < xlrec->nmembers; i++)
+			{
+				int64		pageno = (xlrec->moff + i) / PS_MXMEMB_PER_PAGE;
+
+				if (pageno >= page_lo && pageno <= page_hi)
+				{
+					int64		idx = pageno - page_lo;
+
+					ps_mxmemb_set(pages + idx * BLCKSZ, pageno,
+								  xlrec->moff + i,
+								  xlrec->members[i].xid,
+								  (uint32) xlrec->members[i].status);
+					present[idx] = true;
+				}
+			}
+		}
+		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate xlrec;
+
+			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
+			for (int64 p = 0; p < np; p++)
+			{
+				int64		segno = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+
+				if (ps_mxmemb_segment_truncated(segno,
+												xlrec.startTruncMemb,
+												xlrec.endTruncMemb))
+				{
+					present[p] = false;
+					truncated[p] = true;
+				}
+			}
+		}
+	}
+
+	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
+		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
+		 ps_local_wal_limit() < target_lsn))
+		ereport(ERROR,
+				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact members as of %X/%08X",
+						LSN_FORMAT_ARGS(target_lsn))));
+
+check_required_pages:
+	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
+	{
+		int64		idx = pageno - page_lo;
+
+		if (truncated[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: requested multixact members page %lld was truncated before the target LSN",
+							(long long) pageno)));
+		if (!base_found[idx] && !zeroed[idx])
+			ereport(ERROR,
+					(errmsg("pagestore: base members snapshot for page %lld is absent at %X/%08X",
+							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	pfree(truncated);
+	pfree(zeroed);
+	pfree(base_found);
+	return true;
+}
+
+typedef bool (*SlruPageRangeReconstructFn) (char *pages, bool *present,
+										   int64 page_lo, int64 page_hi,
+										   int64 req_lo, int64 req_hi,
+										   XLogRecPtr base_lsn,
+										   XLogRecPtr target_lsn);
 
 #define PS_CHECK_PATH_FORMAT(ret, buf) \
 	do { \
@@ -2493,7 +3040,7 @@ pagestore_write_zero_slru_page(const char *slru_dir, const char *label,
 static int64
 pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 						  int64 page_lo, int64 page_hi,
-						  SlruPageReconstructFn reconstruct,
+						  SlruPageRangeReconstructFn reconstruct,
 						  XLogRecPtr base, XLogRecPtr target,
 						  const char *label, bool publish_dir)
 {
@@ -2529,20 +3076,18 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	pages = palloc((Size) np * BLCKSZ);
 	present = palloc0(np * sizeof(bool));
 	for (p = 0; p < np; p++)
+		memset(pages + p * BLCKSZ, 0, BLCKSZ);
+	if (!reconstruct(pages, present, page_lo, page_hi, req_lo, req_hi,
+					 base, target))
 	{
-		int64		pageno = page_lo + p;
-
-		if (pageno < req_lo)
-		{
-			memset(pages + p * BLCKSZ, 0, BLCKSZ);
-			continue;
-		}
-		present[p] = reconstruct(pages + p * BLCKSZ, pageno, base, target);
-		if (!present[p])
-			ereport(ERROR,
-					(errmsg("pagestore: requested %s page %lld was truncated before the target LSN",
-							label, (long long) pageno)));
+		ereport(ERROR,
+				(errmsg("pagestore: failed to reconstruct %s pages in [%lld, %lld] as of %X/%08X",
+						label, (long long) req_lo, (long long) req_hi,
+						LSN_FORMAT_ARGS(target))));
 	}
+	for (p = 0; p < np; p++)
+		if (page_lo + p < req_lo)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -3026,7 +3571,7 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
-											 ps_commit_ts_reconstruct,
+											 ps_commit_ts_seed_reconstruct_range,
 											 base, target, "commit-ts", true));
 }
 
@@ -3072,7 +3617,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
-	if (!MultiXactIdIsValid(oldest_multi) || !MultiXactIdIsValid(next_multi) ||
+	if (!MultiXactIdIsValid(oldest_multi) ||
+		(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
 		(oldest_multi != next_multi &&
 		 !MultiXactIdPrecedes(oldest_multi, next_multi)))
 		ereport(ERROR,
@@ -3119,10 +3665,17 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		if (oldest_multi < next_multi)
 		{
 			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
+			/* include boundary page for next_multi when it is the first entry on a new
+			 * offsets page so next allocation can safely read page_next_multi; this
+			 * page already exists in the parent and must be preserved for the branch.
+			 */
 			off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+			if (next_multi != InvalidMultiXactId &&
+				next_multi % PS_MXOFF_PER_PAGE == 0)
+				off_page_hi++;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
-													ps_mxoff_reconstruct,
+													ps_mxoff_seed_reconstruct_range,
 													base, target, "multixact offsets", false);
 		}
 		else
@@ -3131,16 +3684,18 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			off_page_hi = (int64) MaxMultiXactId / PS_MXOFF_PER_PAGE;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
-													ps_mxoff_reconstruct,
+													ps_mxoff_seed_reconstruct_range,
 													base, target, "multixact offsets", false);
 			if (next_multi > FirstMultiXactId)
 			{
 				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
 				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+				if (next_multi % PS_MXOFF_PER_PAGE == 0)
+					off_page_hi++;
 				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
-														off_page_lo, off_page_hi,
-														ps_mxoff_reconstruct,
-														base, target, "multixact offsets", false);
+													off_page_lo, off_page_hi,
+													ps_mxoff_seed_reconstruct_range,
+													base, target, "multixact offsets", false);
 			}
 			else
 			{
@@ -3154,19 +3709,31 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	else
 	{
 		off_page_lo = (int64) next_multi / PS_MXOFF_PER_PAGE;
+		/*
+		 * Even when the fork has no live multixacts, bootstrap must preserve page 0 so
+		 * simple-lru startup can read the page containing zero or wrap counters, and
+		 * preserve the page that tracks next_multi as the parent bootstrap state.
+		 */
+		pagestore_write_zero_slru_page(offdir, "multixact offsets",
+									   0);
 		pagestore_write_zero_slru_page(offdir, "multixact offsets",
 									   off_page_lo);
-		off_seeded++;
+		off_seeded += (off_page_lo == 0 ? 1 : 2);
 	}
 	if (next_member != oldest_member)
 	{
 		if (oldest_member < next_member)
 		{
 			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+			/* include boundary page for next_member when it is the first slot on a new
+			 * members page so the branch can allocate the next multixact immediately.
+			 */
 			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+			if (next_member % PS_MXMEMB_PER_PAGE == 0)
+				mem_page_hi++;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
-													ps_mxmemb_reconstruct,
+													ps_mxmemb_seed_reconstruct_range,
 													base, target, "multixact members", false);
 		}
 		else
@@ -3175,16 +3742,18 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			mem_page_hi = (int64) UINT32_MAX / PS_MXMEMB_PER_PAGE;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
-													ps_mxmemb_reconstruct,
+													ps_mxmemb_seed_reconstruct_range,
 													base, target, "multixact members", false);
 			if (next_member > 0)
 			{
 				mem_page_lo = 0;
 				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+				if (next_member % PS_MXMEMB_PER_PAGE == 0)
+					mem_page_hi++;
 				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-														mem_page_lo, mem_page_hi,
-														ps_mxmemb_reconstruct,
-														base, target, "multixact members", false);
+													mem_page_lo, mem_page_hi,
+													ps_mxmemb_seed_reconstruct_range,
+													base, target, "multixact members", false);
 			}
 			else
 			{
@@ -3197,8 +3766,10 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	{
 		mem_page_lo = next_member / PS_MXMEMB_PER_PAGE;
 		pagestore_write_zero_slru_page(memdir, "multixact members",
+									   0);
+		pagestore_write_zero_slru_page(memdir, "multixact members",
 									   mem_page_lo);
-		mem_seeded++;
+		mem_seeded += (mem_page_lo == 0 ? 1 : 2);
 	}
 	seeded += off_seeded + mem_seeded;
 
@@ -3215,9 +3786,76 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+/* Publish one staged SLRU directory into the final target branch directory,
+ * replacing any prior target version.  Missing staged directories (for skipped
+ * optional SLRUs) are treated as a no-op.
+ */
+static bool
+publish_seeded_slru_dir(const char *staging_root, const char *target_root,
+						const char *backup_root, const char *slru_name)
+{
+	char		stagedir[MAXPGPATH];
+	char		targetdir[MAXPGPATH];
+	char		backupdir[MAXPGPATH];
+	int			pathlen;
+
+	pathlen = snprintf(stagedir, sizeof(stagedir), "%s/%s", staging_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, stagedir);
+	pathlen = snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, targetdir);
+	pathlen = snprintf(backupdir, sizeof(backupdir), "%s/%s", backup_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, backupdir);
+
+	if (access(stagedir, F_OK) != 0)
+		return false;
+	if (access(targetdir, F_OK) == 0 && rename(targetdir, backupdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not move existing branch %s dir \"%s\" aside: %m",
+						slru_name, targetdir)));
+	if (rename(stagedir, targetdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch %s dir \"%s\"", slru_name, targetdir)));
+	return true;
+}
+
+static void
+rollback_seeded_slru_dir(const char *target_root, const char *backup_root,
+						 const char *slru_name, bool published)
+{
+	char		targetdir[MAXPGPATH];
+	char		backupdir[MAXPGPATH];
+	int			pathlen;
+
+	pathlen = snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, targetdir);
+	pathlen = snprintf(backupdir, sizeof(backupdir), "%s/%s", backup_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, backupdir);
+
+	if (!published && access(backupdir, F_OK) != 0)
+		return;
+	if (published && access(targetdir, F_OK) == 0 && !rmtree(targetdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove partly-published branch %s dir \"%s\"",
+						slru_name, targetdir)));
+	if (access(backupdir, F_OK) == 0 && rename(backupdir, targetdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not restore previous branch %s dir \"%s\": %m",
+						slru_name, targetdir)));
+}
+
 /*
  * pagestore_seed_branch_slrus(target_dir text, base pg_lsn, target pg_lsn,
  *                             oldest_xid xid, next_xid xid,
+ *                             oldest_commit_ts_xid xid, next_commit_ts_xid xid,
  *                             oldest_multi xid, next_multi xid,
  *                             oldest_member bigint, next_member bigint)
  * returns bigint
@@ -3229,44 +3867,191 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
  * bootstrap helper can derive these horizons from the fork manifest and call
  * this single function.
  */
+static int64
+pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
+								 XLogRecPtr target, TransactionId oldest_xid,
+								 TransactionId next_xid,
+								 TransactionId oldest_commit_ts_xid,
+								 TransactionId next_commit_ts_xid,
+								 MultiXactId oldest_multi,
+								 MultiXactId next_multi,
+								 int64 oldest_member, int64 next_member)
+{
+	Datum		staging_dir_datum;
+	char		staging_root[MAXPGPATH];
+	char		backup_root[MAXPGPATH];
+	bool		seed_commit_ts;
+	bool		published_xact = false,
+				published_commit_ts = false,
+				published_multixact = false;
+	int64		seeded = 0;
+	int			pathlen;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch SLRUs")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
+		!TransactionIdIsNormal(next_commit_ts_xid))
+		seed_commit_ts = false;
+	else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
+			 !TransactionIdIsNormal(next_commit_ts_xid) ||
+			 TransactionIdFollows(oldest_commit_ts_xid, next_commit_ts_xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid commit-ts horizon [%u, %u)",
+						oldest_commit_ts_xid, next_commit_ts_xid)));
+	else
+		seed_commit_ts = true;
+	if (!MultiXactIdIsValid(oldest_multi) ||
+		(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
+		(oldest_multi != next_multi &&
+		 !MultiXactIdPrecedes(oldest_multi, next_multi)))
+		ereport(ERROR,
+				(errmsg("invalid fork multixact horizon [%u, %u)",
+						oldest_multi, next_multi)));
+	if (oldest_member < 0 || next_member < 0 ||
+		oldest_member > UINT32_MAX ||
+		next_member > UINT32_MAX)
+		ereport(ERROR,
+				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
+						(long long) oldest_member, (long long) next_member)));
+
+	pathlen = snprintf(staging_root, sizeof(staging_root),
+					   "%s/.pagestore-branch-seed.%ld",
+					   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(pathlen, staging_root);
+	pathlen = snprintf(backup_root, sizeof(backup_root),
+					   "%s/.pagestore-branch-backup.%ld",
+					   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(pathlen, backup_root);
+	staging_dir_datum = CStringGetTextDatum(staging_root);
+
+	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
+	if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear previous branch seeding backup area \"%s\"", backup_root)));
+	if (MakePGDirectory(staging_root) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
+
+	PG_TRY();
+	{
+		seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_clog,
+									  staging_dir_datum,
+									  LSNGetDatum(base),
+									  LSNGetDatum(target),
+									  TransactionIdGetDatum(oldest_xid),
+									  TransactionIdGetDatum(next_xid)));
+
+		if (seed_commit_ts)
+			seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
+										  staging_dir_datum,
+										  LSNGetDatum(base),
+										  LSNGetDatum(target),
+										  TransactionIdGetDatum(oldest_commit_ts_xid),
+										  TransactionIdGetDatum(next_commit_ts_xid)));
+
+		seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
+									  staging_dir_datum,
+									  LSNGetDatum(base),
+									  LSNGetDatum(target),
+									  MultiXactIdGetDatum(oldest_multi),
+									  MultiXactIdGetDatum(next_multi),
+									  Int64GetDatum(oldest_member),
+									  Int64GetDatum(next_member)));
+	}
+	PG_CATCH();
+	{
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area after seed failure \"%s\"", staging_root)));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_TRY();
+	{
+		if (MakePGDirectory(backup_root) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch seeding backup area \"%s\"", backup_root)));
+		published_xact = publish_seeded_slru_dir(staging_root, target_dir,
+												 backup_root, "pg_xact");
+		if (seed_commit_ts)
+			published_commit_ts = publish_seeded_slru_dir(staging_root, target_dir,
+														  backup_root,
+														  "pg_commit_ts");
+		published_multixact = publish_seeded_slru_dir(staging_root, target_dir,
+													  backup_root,
+													  "pg_multixact");
+		fsync_fname(target_dir, true);
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
+		if (!rmtree(backup_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding backup area \"%s\"", backup_root)));
+	}
+	PG_CATCH();
+	{
+		rollback_seeded_slru_dir(target_dir, backup_root, "pg_multixact",
+								 published_multixact);
+		if (seed_commit_ts)
+			rollback_seeded_slru_dir(target_dir, backup_root, "pg_commit_ts",
+									 published_commit_ts);
+		rollback_seeded_slru_dir(target_dir, backup_root, "pg_xact",
+								 published_xact);
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area after publish failure \"%s\"", staging_root)));
+		if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding backup area after publish failure \"%s\"", backup_root)));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return seeded;
+}
+
 PG_FUNCTION_INFO_V1(pagestore_seed_branch_slrus);
 Datum
 pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 {
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	XLogRecPtr	base = PG_GETARG_LSN(1);
-	XLogRecPtr	target = PG_GETARG_LSN(2);
-	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
-	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(5);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(6);
-	int64		oldest_member = PG_GETARG_INT64(7);
-	int64		next_member = PG_GETARG_INT64(8);
-	Datum		target_dir_datum = CStringGetTextDatum(target_dir);
-	int64		seeded = 0;
 
-	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_clog,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_xid),
-												TransactionIdGetDatum(next_xid)));
-	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_xid),
-												TransactionIdGetDatum(next_xid)));
-	seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_multi),
-												TransactionIdGetDatum(next_multi),
-												Int64GetDatum(oldest_member),
-												Int64GetDatum(next_member)));
-
-	PG_RETURN_INT64(seeded);
+	PG_RETURN_INT64(pagestore_seed_branch_slrus_impl(target_dir,
+													 PG_GETARG_LSN(1),
+													 PG_GETARG_LSN(2),
+													 PG_GETARG_TRANSACTIONID(3),
+													 PG_GETARG_TRANSACTIONID(4),
+													 PG_GETARG_TRANSACTIONID(5),
+													 PG_GETARG_TRANSACTIONID(6),
+													 PG_GETARG_TRANSACTIONID(7),
+													 PG_GETARG_TRANSACTIONID(8),
+													 PG_GETARG_INT64(9),
+													 PG_GETARG_INT64(10)));
 }
 
 #define PAGESTORE_BRANCH_MANIFEST_MAXLEN 8192
@@ -3277,6 +4062,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 								XLogRecPtr base, XLogRecPtr target,
 								TransactionId oldest_xid,
 								TransactionId next_xid,
+								TransactionId oldest_commit_ts_xid,
+								TransactionId next_commit_ts_xid,
 								MultiXactId oldest_multi,
 								MultiXactId next_multi,
 								int64 oldest_member,
@@ -3304,6 +4091,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 				   "  \"fork_lsn\": \"%X/%08X\",\n"
 				   "  \"oldest_xid\": \"%u\",\n"
 				   "  \"next_xid\": \"%u\",\n"
+				   "  \"oldest_commit_ts_xid\": \"%u\",\n"
+				   "  \"next_commit_ts_xid\": \"%u\",\n"
 				   "  \"oldest_multi\": \"%u\",\n"
 				   "  \"next_multi\": \"%u\",\n"
 				   "  \"oldest_member\": \"%lld\",\n"
@@ -3314,6 +4103,7 @@ pagestore_write_branch_manifest(const char *target_dir,
 				   LSN_FORMAT_ARGS(base),
 				   LSN_FORMAT_ARGS(target),
 				   oldest_xid, next_xid,
+				   oldest_commit_ts_xid, next_commit_ts_xid,
 				   oldest_multi, next_multi,
 				   (long long) oldest_member,
 				   (long long) next_member,
@@ -3380,6 +4170,7 @@ pagestore_read_branch_manifest(const char *target_dir)
 	StringInfoData buf;
 	char		tmp[1024];
 	size_t		nread;
+	long		manifest_size;
 
 	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest") > MAXPGPATH)
 		ereport(ERROR,
@@ -3391,24 +4182,57 @@ pagestore_read_branch_manifest(const char *target_dir)
 	if (file == NULL)
 	{
 		if (errno == ENOENT)
+		{
+			/* No manifest means this is a legacy/non-branch datadir. */
 			return NULL;
+		}
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open branch manifest \"%s\": %m", path)));
 	}
+	if (fseek(file, 0L, SEEK_END) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	manifest_size = ftell(file);
+	if (manifest_size < 0 || manifest_size > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest \"%s\" is too large", path)));
+	}
+	if (fseek(file, 0L, SEEK_SET) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
 
 	initStringInfo(&buf);
-	while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
-	{
-		if (buf.len + nread > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+		while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
 		{
+			if (buf.len + nread > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+			{
 			FreeFile(file);
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("branch manifest \"%s\" is too large", path)));
+						 errmsg("branch manifest \"%s\" is too large", path)));
+			}
+			if (memchr(tmp, '\0', nread) != NULL)
+			{
+				FreeFile(file);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("branch manifest \"%s\" contains embedded NUL bytes",
+								path)));
+			}
+			appendBinaryStringInfo(&buf, tmp, nread);
 		}
-		appendBinaryStringInfo(&buf, tmp, nread);
-	}
 	if (ferror(file))
 	{
 		FreeFile(file);
@@ -3428,18 +4252,12 @@ pagestore_manifest_skip_ws(const char *p)
 	return p;
 }
 
-static bool
-pagestore_manifest_value_ends(char c)
-{
-	return c == '\0' || c == ',' || c == '}' ||
-		c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
 static const char *
-pagestore_manifest_find_field(const char *manifest, const char *key)
+pagestore_manifest_find_unique_field(const char *manifest, const char *key)
 {
 	size_t		keylen = strlen(key);
 	const char *p = manifest;
+	const char *field = NULL;
 
 	while ((p = strchr(p, '"')) != NULL)
 	{
@@ -3454,34 +4272,48 @@ pagestore_manifest_find_field(const char *manifest, const char *key)
 			p = pagestore_manifest_skip_ws(end + 1);
 			if (*p != ':')
 				return NULL;
-			return pagestore_manifest_skip_ws(p + 1);
+			if (field != NULL)
+				return NULL;
+			field = pagestore_manifest_skip_ws(p + 1);
 		}
 		p = end + 1;
 	}
-	return NULL;
+	return field;
 }
 
 static bool
-pagestore_manifest_has_token(const char *manifest, const char *key,
-							 const char *value)
+pagestore_manifest_value_delimited(const char *p)
 {
-	const char *field = pagestore_manifest_find_field(manifest, key);
-	size_t		len = strlen(value);
+	p = pagestore_manifest_skip_ws(p);
+	return *p == '\0' || *p == ',' || *p == '}';
+}
 
-	if (field == NULL)
+static bool
+pagestore_manifest_has_uint_token(const char *manifest, const char *key,
+								 uint32_t value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field == '"')
 		return false;
-	if (*field == '"')
+	if (*field < '0' || *field > '9')
 		return false;
-	if (strncmp(field, value, len) != 0)
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field)
 		return false;
-	return pagestore_manifest_value_ends(field[len]);
+	if (parsed != (unsigned long long) value)
+		return false;
+	return pagestore_manifest_value_delimited(endptr);
 }
 
 static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
-	const char *field = pagestore_manifest_find_field(manifest, key);
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
 	size_t		len = strlen(value);
 
 	if (field == NULL)
@@ -3491,7 +4323,9 @@ pagestore_manifest_has_string_token(const char *manifest, const char *key,
 	field++;
 	if (strncmp(field, value, len) != 0)
 		return false;
-	return field[len] == '"';
+	if (field[len] != '"')
+		return false;
+	return pagestore_manifest_value_delimited(field + len + 1);
 }
 
 static bool
@@ -3500,22 +4334,33 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 {
 	char		buf[64];
 	int			len;
+	const char *p;
 
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+	p = pagestore_manifest_skip_ws(manifest);
+	if (*p != '{')
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", new_tl);
+	p += strlen(p);
+	while (p > manifest &&
+		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
+		p--;
+	if (p == manifest || p[-1] != '}')
+		return false;
+
+	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%u", new_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "new_timeline", new_tl))
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", parent_tl);
+	len = snprintf(buf, sizeof(buf), "%u", parent_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "parent_timeline", parent_tl))
 		return false;
 	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
 	if (len < 0 || len >= (int) sizeof(buf))
@@ -3525,6 +4370,12 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
 		return false;
 	return true;
+}
+
+static inline bool
+pagestore_branch_backend_active(void)
+{
+	return pagestore_active_backend == &PageStoreBackendLocalSvc;
 }
 
 /*
@@ -3552,6 +4403,9 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to validate a branch manifest")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 
 	manifest = pagestore_read_branch_manifest(target_dir);
 	if (manifest == NULL)
@@ -3564,8 +4418,6 @@ static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
-	char		buf[64];
-	int			len;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -3576,14 +4428,14 @@ pagestore_validate_datadir_branch_manifest(void)
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
 		return;					/* legacy/non-branch datadir */
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+	if (!pagestore_branch_backend_active())
+		ereport(FATAL,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
+	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
-	len = snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
-	if (len < 0 || len >= (int) sizeof(buf))
-		ereport(FATAL,
-				(errmsg("pagestore.timeline is too large")));
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "new_timeline",
+										  pagestore_localsvc_timeline()))
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
@@ -3725,6 +4577,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
  *                          oldest_xid xid, next_xid xid,
+ *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
  *                          oldest_multi xid, next_multi xid,
  *                          oldest_member bigint, next_member bigint)
  * returns bigint
@@ -3746,10 +4599,12 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	XLogRecPtr	target = PG_GETARG_LSN(4);
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
-	int64		oldest_member = PG_GETARG_INT64(9);
-	int64		next_member = PG_GETARG_INT64(10);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(8);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(9);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(10);
+	int64		oldest_member = PG_GETARG_INT64(11);
+	int64		next_member = PG_GETARG_INT64(12);
 	int64		seeded;
 
 	if (!superuser())
@@ -3759,24 +4614,26 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	if (new_tl <= 0)
 		ereport(ERROR,
 				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
+	if (parent_tl < 0)
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline must be >= 0")));
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
-	seeded = DatumGetInt64(DirectFunctionCall9(pagestore_seed_branch_slrus,
-											   CStringGetTextDatum(target_dir),
-											   LSNGetDatum(base),
-											   LSNGetDatum(target),
-											   TransactionIdGetDatum(oldest_xid),
-											   TransactionIdGetDatum(next_xid),
-											   TransactionIdGetDatum(oldest_multi),
-											   TransactionIdGetDatum(next_multi),
-											   Int64GetDatum(oldest_member),
-											   Int64GetDatum(next_member)));
+	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
+									(uint64) target);
+	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
+											  oldest_xid, next_xid,
+											  oldest_commit_ts_xid,
+											  next_commit_ts_xid,
+											  oldest_multi, next_multi,
+											  oldest_member, next_member);
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 									 (uint64) target);
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl, base, target,
 									oldest_xid, next_xid,
+									oldest_commit_ts_xid, next_commit_ts_xid,
 									oldest_multi, next_multi,
 									oldest_member, next_member,
 									seeded);
