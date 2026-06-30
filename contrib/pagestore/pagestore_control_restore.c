@@ -226,6 +226,7 @@ cl_exec(PsChannel *ch)
 	if (ch->status != PS_STATUS_OK)
 	{
 		fprintf(stderr, "daemon error on op %u\n", ch->opcode);
+		release_claimed_channel();
 		exit(1);
 	}
 }

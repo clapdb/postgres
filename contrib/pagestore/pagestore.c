@@ -1690,6 +1690,42 @@ pagestore_control_write_one(const ControlFileData *cf)
 	pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
 }
 
+static void
+pagestore_control_flush_pending(void)
+{
+	if (!pagestore_pending_control_file_valid)
+		return;
+	if (CritSectionCount > 0)
+		return;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	{
+		ControlFileData pending_control_file = pagestore_pending_control_file;
+
+		pagestore_control_write_one(&pending_control_file);
+		pagestore_pending_control_file_valid = false;
+	}
+}
+
+static void
+pagestore_control_flush_pending_on_exit(int code, Datum arg)
+{
+	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	PG_TRY();
+	{
+		pagestore_control_flush_pending();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(oldcontext);
+}
+
 /*
  * Control-file write hook (installed into xlog.c): mirror pg_control onto the
  * store as a PS_KLASS_CONTROL object whenever it is written.  Cluster control
@@ -1725,13 +1761,7 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
-		if (pagestore_pending_control_file_valid)
-		{
-			ControlFileData pending_control_file = pagestore_pending_control_file;
-
-			pagestore_control_write_one(&pending_control_file);
-			pagestore_pending_control_file_valid = false;
-		}
+		pagestore_control_flush_pending();
 		pagestore_control_write_one(cf);
 	}
 	PG_CATCH();
@@ -1875,4 +1905,5 @@ _PG_init(void)
 	control_file_write_hook = pagestore_control_write_hook;
 
 	before_shmem_exit(pagestore_slru_flush_pending_on_exit, 0);
+	before_shmem_exit(pagestore_control_flush_pending_on_exit, 0);
 }
