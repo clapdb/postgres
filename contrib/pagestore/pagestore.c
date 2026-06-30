@@ -3633,7 +3633,7 @@ pagestore_install_prepared_dir(const char *prepared_dir, const char *target_dir,
 
 static void
 pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir,
-								const char *relpath)
+								const char *relpath, bool required)
 {
 	char		src[MAXPGPATH];
 	char		dst[MAXPGPATH];
@@ -3649,9 +3649,17 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
 	snprintf(dst, sizeof(dst), "%s/%s", target_dir, relpath);
 	snprintf(stage, sizeof(stage), "%s/%s.install", target_dir, relpath);
 	if (access(src, F_OK) != 0)
+	{
+		if (required)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
+		return;
+	}
+	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
+				 errmsg("could not clear branch install staging file \"%s\": %m", stage)));
 	copy_file(src, stage);
 	if (durable_rename(stage, dst, ERROR) != 0)
 		ereport(ERROR,
@@ -3665,11 +3673,10 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
  * returns void
  *
  * Install the artifacts produced by pagestore_prepare_branch() into an
- * initdb/copied branch datadir.  For now, only the boot-critical pg_xact plus
- * manifest are installed; optional SLRUs stay in the prepared artifact until a
- * full bootstrap path has pg_control-aware activation for them.  The manifest is
- * installed last so its presence remains the startup-time signal that the datadir
- * has a prepared branch identity and must pass timeline validation.
+ * initdb/copied branch datadir.  pg_xact and any prepared SLRUs are installed
+ * before the manifest, and the manifest is installed last so its presence remains
+ * the startup-time signal that the datadir has a prepared branch identity and must
+ * pass timeline validation.
  */
 PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
@@ -3677,19 +3684,39 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 {
 	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char		manifest[MAXPGPATH];
+	char		stage[MAXPGPATH];
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to install a prepared branch")));
+	snprintf(manifest, sizeof(manifest), "%s/pagestore_branch.manifest",
+			 prepared_dir);
+	if (access(manifest, F_OK) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", manifest)));
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
+	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
+	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
+	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear existing branch artifact staging file \"%s\": %m", stage)));
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", false);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", false);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
-									"pagestore_branch.manifest");
+									"pagestore_branch.manifest", true);
 
 	PG_RETURN_VOID();
 }
