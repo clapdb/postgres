@@ -36,6 +36,7 @@
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -1597,6 +1598,24 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 }
 
 static ControlFileWriteHook_type prev_control_file_write_hook = NULL;
+static ControlFileData pagestore_pending_control_file;
+static bool pagestore_pending_control_file_valid = false;
+
+static XLogRecPtr
+pagestore_control_version_lsn(const ControlFileData *cf)
+{
+	XLogRecPtr	lsn = cf->checkPoint;
+
+	lsn = Max(lsn, cf->checkPointCopy.redo);
+	lsn = Max(lsn, cf->minRecoveryPoint);
+	lsn = Max(lsn, cf->backupStartPoint);
+	lsn = Max(lsn, cf->backupEndPoint);
+
+	if (!RecoveryInProgress())
+		lsn = Max(lsn, GetXLogInsertRecPtr());
+
+	return lsn;
+}
 
 static void
 pagestore_control_write_one(const ControlFileData *cf)
@@ -1614,7 +1633,7 @@ pagestore_control_write_one(const ControlFileData *cf)
 	key.forkNum = 0;
 
 	pagestore_localsvc_obj_write_lsn(PS_KLASS_CONTROL, &key, 0, buf,
-									 cf->checkPoint);
+									 pagestore_control_version_lsn(cf));
 	pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
 }
 
@@ -1644,11 +1663,22 @@ pagestore_control_write_hook(const ControlFileData *cf)
 	 * refresh the store copy.
 	 */
 	if (CritSectionCount > 0)
+	{
+		pagestore_pending_control_file = *cf;
+		pagestore_pending_control_file_valid = true;
 		return;
+	}
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
+		if (pagestore_pending_control_file_valid)
+		{
+			ControlFileData pending_control_file = pagestore_pending_control_file;
+
+			pagestore_control_write_one(&pending_control_file);
+			pagestore_pending_control_file_valid = false;
+		}
 		pagestore_control_write_one(cf);
 	}
 	PG_CATCH();

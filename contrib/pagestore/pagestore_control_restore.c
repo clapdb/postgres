@@ -17,6 +17,8 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
+
 #include <fcntl.h>
 #include <errno.h>
 #include <stdint.h>
@@ -27,20 +29,41 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
-
-/* Fixed on-disk size of pg_control (independent of BLCKSZ). */
-#define PG_CONTROL_FILE_SIZE	8192
 
 static uint32_t page_size = PS_DEFAULT_PAGE_SIZE;
 static void *shm;
-static int	chan;
+static int	chan = -1;
+
+static void
+fill_control_pskey(PsKey *key)
+{
+	key->spcOid = 0;
+	key->dbOid = 0;
+	key->relNumber = 0;
+	key->forkNum = 0;
+	key->klass = PS_KLASS_CONTROL;
+}
+
+static void
+release_claimed_channel(void)
+{
+	if (shm != NULL && chan >= 0)
+	{
+		ps_store_release(&ps_channel(shm, (uint32_t) chan)->claimed, 0);
+		chan = -1;
+	}
+}
 
 static void
 client_attach(const char *shm_name)
 {
 	int			fd = shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
+	PsKey		control_key;
+	uint32_t	target;
+	uint32_t	stride;
 
 	if (fd < 0)
 	{
@@ -64,13 +87,22 @@ client_attach(const char *shm_name)
 				PS_SHM_VERSION, page_size);
 		exit(2);
 	}
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+	fill_control_pskey(&control_key);
+	target = ps_key_shard(&control_key, hdr->nshards);
+	stride = hdr->nshards ? hdr->nshards : 1;
+	for (uint32_t i = target; i < hdr->nchannels; i += stride)
+	{
+		PsChannel  *ch = ps_channel(shm, i);
+
+		if (ps_cas(&ch->claimed, 0, 1))
 		{
+			ch->shard = target;
 			chan = (int) i;
+			atexit(release_claimed_channel);
 			return;
 		}
-	fprintf(stderr, "no free channel\n");
+	}
+	fprintf(stderr, "no free channel for pg_control shard %u\n", target);
 	exit(2);
 }
 
@@ -96,11 +128,23 @@ static void
 fill_control_key(PsChannel *ch)
 {
 	ch->timeline = restore_timeline;
-	ch->key.spcOid = 0;
-	ch->key.dbOid = 0;
-	ch->key.relNumber = 0;
-	ch->key.forkNum = 0;
-	ch->key.klass = PS_KLASS_CONTROL;
+	fill_control_pskey(&ch->key);
+}
+
+static int
+control_file_crc_ok(const char *buf)
+{
+	ControlFileData *cf = (ControlFileData *) buf;
+	pg_crc32c	crc;
+
+	if (cf->pg_control_version != PG_CONTROL_VERSION)
+		return 0;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+
+	return EQ_CRC32C(crc, cf->crc);
 }
 
 int
@@ -151,7 +195,6 @@ main(int argc, char **argv)
 	if (ch->result == 0)
 	{
 		fprintf(stderr, "pg_control is not present on the store\n");
-		ps_store_release(&ps_channel(shm, chan)->claimed, 0);
 		return 1;
 	}
 
@@ -165,7 +208,6 @@ main(int argc, char **argv)
 	{
 		fprintf(stderr, "pg_control block 0 is not resolvable on timeline %u\n",
 				restore_timeline);
-		ps_store_release(&ps_channel(shm, chan)->claimed, 0);
 		return 1;
 	}
 
@@ -174,8 +216,14 @@ main(int argc, char **argv)
 	n = page_size < PG_CONTROL_FILE_SIZE ? page_size : PG_CONTROL_FILE_SIZE;
 	memcpy(buf, ch->data, n);
 
+	if (!control_file_crc_ok(buf))
+	{
+		fprintf(stderr, "restored pg_control image failed CRC/version validation\n");
+		return 1;
+	}
+
 	/* daemon work is done; release the channel for reuse before file I/O */
-	ps_store_release(&ps_channel(shm, chan)->claimed, 0);
+	release_claimed_channel();
 
 	snprintf(dirpath, sizeof(dirpath), "%s/global", pgdata);
 	snprintf(path, sizeof(path), "%s/pg_control", dirpath);

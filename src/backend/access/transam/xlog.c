@@ -6943,6 +6943,7 @@ CreateCheckPoint(int flags)
 	uint32		freespace;
 	XLogRecPtr	PriorRedoPtr;
 	XLogRecPtr	last_important_lsn;
+	ControlFileData controlFileSnapshot;
 	VirtualTransactionId *vxids;
 	int			nvxids;
 	int			oldXLogAllowed = 0;
@@ -7313,6 +7314,7 @@ CreateCheckPoint(int flags)
 	ControlFile->unloggedLSN = pg_atomic_read_membarrier_u64(&XLogCtl->unloggedLSN);
 
 	UpdateControlFile();
+	controlFileSnapshot = *ControlFile;
 	LWLockRelease(ControlFileLock);
 
 	/* Update shared-memory copy of checkpoint XID/epoch */
@@ -7328,7 +7330,7 @@ CreateCheckPoint(int flags)
 
 	/* mirror the just-written checkpoint control file outside the critical section */
 	if (control_file_write_hook)
-		control_file_write_hook(ControlFile);
+		control_file_write_hook(&controlFileSnapshot);
 
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
