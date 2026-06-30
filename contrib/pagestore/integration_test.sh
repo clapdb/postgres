@@ -628,7 +628,7 @@ cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
 EOF
 assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 0, 0, '$mxL');")" "f" \
 	"branch manifest validator rejects timeline zero"
-printf '{ "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "%s" }\\0{ "format": 2 }\\n' "$mxL" > "$PREPSEED/pagestore_branch.manifest"
+printf '{ "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "%s" }\0{ "format": 2 }\n' "$mxL" > "$PREPSEED/pagestore_branch.manifest"
 nulManifest=$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');" 2>/dev/null || echo ERROR)
 assert "$nulManifest" "ERROR" "branch manifest validator rejects embedded NUL bytes"
 mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manifest"
