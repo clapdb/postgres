@@ -30,6 +30,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -4310,6 +4311,56 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 }
 
 static bool
+pagestore_manifest_get_uint_token(const char *manifest, const char *key,
+								  uint32_t *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field == '"')
+		return false;
+	if (*field < '0' || *field > '9')
+		return false;
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field || parsed > UINT32_MAX)
+		return false;
+	if (!pagestore_manifest_value_delimited(endptr))
+		return false;
+	*value = (uint32_t) parsed;
+	return true;
+}
+
+static bool
+pagestore_manifest_has_lsn_token(const char *manifest, const char *key)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	bool		saw_hi = false;
+	bool		saw_lo = false;
+
+	if (field == NULL || *field != '"')
+		return false;
+	field++;
+	while (isxdigit((unsigned char) *field))
+	{
+		saw_hi = true;
+		field++;
+	}
+	if (!saw_hi || *field != '/')
+		return false;
+	field++;
+	while (isxdigit((unsigned char) *field))
+	{
+		saw_lo = true;
+		field++;
+	}
+	if (!saw_lo || *field != '"')
+		return false;
+	return pagestore_manifest_value_delimited(field + 1);
+}
+
+static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
@@ -4326,6 +4377,29 @@ pagestore_manifest_has_string_token(const char *manifest, const char *key,
 	if (field[len] != '"')
 		return false;
 	return pagestore_manifest_value_delimited(field + len + 1);
+}
+
+static bool
+pagestore_manifest_has_branch_identity(const char *manifest, int32 new_tl)
+{
+	const char *p;
+	uint32_t	parent_tl;
+
+	p = pagestore_manifest_skip_ws(manifest);
+	if (*p != '{')
+		return false;
+	p += strlen(p);
+	while (p > manifest &&
+		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
+		p--;
+	if (p == manifest || p[-1] != '}')
+		return false;
+
+	return pagestore_manifest_has_uint_token(manifest, "format", 1) &&
+		pagestore_manifest_has_uint_token(manifest, "new_timeline", new_tl) &&
+		pagestore_manifest_get_uint_token(manifest, "parent_timeline",
+										  &parent_tl) &&
+		pagestore_manifest_has_lsn_token(manifest, "fork_lsn");
 }
 
 static bool
@@ -4573,9 +4647,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn) &&
 		!(parent_tl > 0 &&
-		  pagestore_manifest_has_uint_token(target_manifest, "format", 1) &&
-		  pagestore_manifest_has_uint_token(target_manifest, "new_timeline",
-										   parent_tl)))
+		  pagestore_manifest_has_branch_identity(target_manifest, parent_tl)))
 		ereport(ERROR,
 				(errmsg("target branch manifest does not match the requested branch identity")));
 
