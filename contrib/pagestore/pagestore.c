@@ -4288,30 +4288,16 @@ pagestore_manifest_value_delimited(const char *p)
 }
 
 static bool
-pagestore_manifest_has_token(const char *manifest, const char *key,
-							 const char *value)
+pagestore_manifest_has_uint_token(const char *manifest, const char *key,
+								 uint32_t value)
 {
 	const char *field = pagestore_manifest_find_unique_field(manifest, key);
-	size_t		len = strlen(value);
-
-	if (field == NULL)
-		return false;
-	if (*field == '"')
-		return false;
-	if (strncmp(field, value, len) != 0)
-		return false;
-	return pagestore_manifest_value_delimited(field + len);
-}
-
-static bool
-pagestore_manifest_has_uint_token(const char *manifest, const char *key,
-							 uint32_t value)
-{
-	const char *field = pagestore_manifest_find_field(manifest, key);
 	char	   *endptr;
 	unsigned long long parsed;
 
 	if (field == NULL || *field == '"')
+		return false;
+	if (*field < '0' || *field > '9')
 		return false;
 	errno = 0;
 	parsed = strtoull(field, &endptr, 10);
@@ -4319,7 +4305,7 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 		return false;
 	if (parsed != (unsigned long long) value)
 		return false;
-	return pagestore_manifest_value_ends(*endptr);
+	return pagestore_manifest_value_delimited(endptr);
 }
 
 static bool
@@ -4431,32 +4417,19 @@ static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
-	char		path[MAXPGPATH];
-	char		buf[64];
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
 	if (DataDir == NULL)
 		return;
-	if (!pagestore_branch_backend_active())
-		ereport(FATAL,
-				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
-	{
-		snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", DataDir);
-		if (access(path, R_OK) == 0)
-			ereport(FATAL,
-					(errcode_for_file_access(),
-					 errmsg("could not read branch manifest \"%s\": permission denied", path)));
-		if (errno != ENOENT)
-			ereport(FATAL,
-					(errcode_for_file_access(),
-					 errmsg("could not open branch manifest \"%s\": %m", path)));
 		return;					/* legacy/non-branch datadir */
-	}
+	if (!pagestore_branch_backend_active())
+		ereport(FATAL,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
