@@ -191,6 +191,7 @@ static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
 
 /* Optional hooks to mirror/serve SLRU pages to/from an external store. */
 SlruPageWriteHook_type slru_page_write_hook = NULL;
+SlruPageDirtyHook_type slru_page_dirty_hook = NULL;
 SlruPageReadHook_type slru_page_read_hook = NULL;
 SlruPageExistsHook_type slru_page_exists_hook = NULL;
 SlruPageTruncateHook_type slru_page_truncate_hook = NULL;
@@ -403,6 +404,9 @@ SimpleLruZeroPage(SlruCtl ctl, int64 pageno)
 
 	/* Set the LSNs for this new page to zero */
 	SimpleLruZeroLSNs(ctl, slotno);
+
+	if (slru_page_dirty_hook)
+		slru_page_dirty_hook(ctl, pageno, shared->page_buffer[slotno]);
 
 	/*
 	 * Assume this page is now the latest active page.

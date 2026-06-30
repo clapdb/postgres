@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		8	/* 8: READ_AT reports found-ness in result */
+#define PS_SHM_VERSION		9	/* 9: object writes may carry req_lsn versions */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192

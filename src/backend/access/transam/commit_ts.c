@@ -236,6 +236,9 @@ SetXidCommitTsInPage(TransactionId xid, int nsubxids,
 		TransactionIdSetCommitTs(subxids[i], ts, nodeid, slotno);
 
 	CommitTsCtl->shared->page_dirty[slotno] = true;
+	if (slru_page_dirty_hook)
+		slru_page_dirty_hook(CommitTsCtl, pageno,
+							 CommitTsCtl->shared->page_buffer[slotno]);
 
 	LWLockRelease(lock);
 }

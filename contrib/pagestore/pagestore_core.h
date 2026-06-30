@@ -68,7 +68,7 @@ extern int	ps_handle_meta(PsChannel *ch);
 
 /* Page byte-I/O helpers used by the frontends' byte-op handlers. */
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-							const unsigned char *page, uint64_t lsn_override);
+						const unsigned char *page, uint64_t explicit_lsn);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);
