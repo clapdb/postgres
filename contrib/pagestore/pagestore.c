@@ -1431,7 +1431,9 @@ static bool pagestore_slru_read_from_store = false;
 static bool
 pagestore_slru_store_reads_allowed(void)
 {
-	if (!pagestore_slru_store_reads_allowed())
+	if (!pagestore_slru_read_from_store)
+		return false;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
 		return false;
 
 	/*
