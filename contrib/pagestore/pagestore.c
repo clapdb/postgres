@@ -3526,6 +3526,12 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	return true;
 }
 
+static inline bool
+pagestore_branch_backend_active(void)
+{
+	return pagestore_active_backend == &PageStoreBackendLocalSvc;
+}
+
 /*
  * pagestore_validate_branch_manifest(target_dir text, new_timeline int,
  *                                    parent_timeline int, fork_lsn pg_lsn)
@@ -3551,6 +3557,9 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to validate a branch manifest")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 
 	manifest = pagestore_read_branch_manifest(target_dir);
 	if (manifest == NULL)
@@ -3570,6 +3579,9 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	if (DataDir == NULL)
 		return;
+	if (!pagestore_branch_backend_active())
+		ereport(FATAL,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
