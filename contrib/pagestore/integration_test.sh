@@ -389,7 +389,7 @@ boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # pg_xact -- not the parent's copied one -- is what makes row1 visible.
 SEEDOUT=$(mktemp -d)
 seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
-	'3'::xid, '$boxid'::xid, '3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, 0, 0);")
+	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
 # clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
@@ -401,7 +401,7 @@ $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRU
 # directories so the boot genuinely depends on prepare_branch output, not copied
 # parent snapshots.
-for slru in pg_xact pg_commit_ts pg_multixact; do
+for slru in pg_xact pg_multixact; do
 	if [ -d "$SEEDOUT/$slru" ]; then
 		rm -rf "$BRANCHDATA/$slru"
 		cp -a "$SEEDOUT/$slru" "$BRANCHDATA/$slru"
@@ -410,6 +410,10 @@ for slru in pg_xact pg_commit_ts pg_multixact; do
 		fail=1
 	fi
 done
+if [ -d "$SEEDOUT/pg_commit_ts" ]; then
+	rm -rf "$BRANCHDATA/pg_commit_ts"
+	cp -a "$SEEDOUT/pg_commit_ts" "$BRANCHDATA/pg_commit_ts"
+fi
 cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
