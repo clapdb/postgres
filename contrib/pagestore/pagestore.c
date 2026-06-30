@@ -3390,7 +3390,10 @@ pagestore_read_branch_manifest(const char *target_dir)
 	if (file == NULL)
 	{
 		if (errno == ENOENT)
+		{
+			/* No manifest means this is a legacy/non-branch datadir. */
 			return NULL;
+		}
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open branch manifest \"%s\": %m", path)));
@@ -3477,6 +3480,25 @@ pagestore_manifest_has_token(const char *manifest, const char *key,
 }
 
 static bool
+pagestore_manifest_has_uint_token(const char *manifest, const char *key,
+							 uint32_t value)
+{
+	const char *field = pagestore_manifest_find_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field == '"')
+		return false;
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field)
+		return false;
+	if (parsed != (unsigned long long) value)
+		return false;
+	return pagestore_manifest_value_ends(*endptr);
+}
+
+static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
@@ -3500,21 +3522,21 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	char		buf[64];
 	int			len;
 
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", new_tl);
+	len = snprintf(buf, sizeof(buf), "%u", new_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "new_timeline", new_tl))
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", parent_tl);
+	len = snprintf(buf, sizeof(buf), "%u", parent_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "parent_timeline", parent_tl))
 		return false;
 	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
 	if (len < 0 || len >= (int) sizeof(buf))
@@ -3586,11 +3608,11 @@ pagestore_validate_datadir_branch_manifest(void)
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
 		return;					/* legacy/non-branch datadir */
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
-	snprintf(buf, sizeof(buf), "%u", pagestore_localsvc_timeline());
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "new_timeline",
+										  pagestore_localsvc_timeline()))
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
