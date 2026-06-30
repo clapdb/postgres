@@ -1754,7 +1754,7 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
-		TransactionIdFollows(oldest_xid, next_xid))
+		TransactionIdFollows(oldest_xid, next_xid) || oldest_xid == next_xid)
 		ereport(ERROR,
 				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
 	/* every path we build is <target_dir>/pg_xact/XXXX[.tmp]; reject if it won't fit */
