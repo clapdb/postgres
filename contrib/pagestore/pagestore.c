@@ -2424,7 +2424,7 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 						  int64 page_lo, int64 page_hi,
 						  SlruPageReconstructFn reconstruct,
 						  XLogRecPtr base, XLogRecPtr target,
-						  const char *label)
+						  const char *label, bool publish_dir)
 {
 	char		dstdir[MAXPGPATH];
 	char		stagedir[MAXPGPATH];
@@ -2466,6 +2466,10 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 			continue;
 		}
 		present[p] = reconstruct(pages + p * BLCKSZ, pageno, base, target);
+		if (!present[p])
+			ereport(ERROR,
+					(errmsg("pagestore: requested %s page %lld was truncated before the target LSN",
+							label, (long long) pageno)));
 	}
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
@@ -2475,14 +2479,21 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	snprintf(dstdir, sizeof(dstdir), "%s/%s", target_dir, slru_dir);
 	snprintf(stagedir, sizeof(stagedir), "%s/%s.tmp", target_dir, slru_dir);
 
-	if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+	if (publish_dir)
+	{
+		if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
+		if (pg_mkdir_p(stagedir, pg_dir_create_mode) != 0 && errno != EEXIST)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+	}
+	else if (MakePGDirectory(dstdir) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
-	if (pg_mkdir_p(stagedir, pg_dir_create_mode) != 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
+				 errmsg("could not create branch %s dir \"%s\": %m", label, dstdir)));
 
 	for (seg = seg_lo; seg <= seg_hi; seg++)
 	{
@@ -2499,7 +2510,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		if (trim_last < first)
 			continue;
 
-		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
+		snprintf(segpath, sizeof(segpath), "%s/%04X",
+				 publish_dir ? stagedir : dstdir, (unsigned int) seg);
 		fd = OpenTransientFilePerm(segpath,
 								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
 								   pg_file_create_mode);
@@ -2554,15 +2566,18 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 					 errmsg("could not close branch %s segment \"%s\": %m",
 							label, segpath)));
 	}
-	fsync_fname(stagedir, true);
-	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove existing %s dir \"%s\"", label, dstdir)));
-	if (rename(stagedir, dstdir) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not publish branch %s dir \"%s\": %m", label, dstdir)));
+	fsync_fname(publish_dir ? stagedir : dstdir, true);
+	if (publish_dir)
+	{
+		if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove existing %s dir \"%s\"", label, dstdir)));
+		if (rename(stagedir, dstdir) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not publish branch %s dir \"%s\": %m", label, dstdir)));
+	}
 	fsync_fname(target_dir, true);
 
 	pfree(present);
@@ -2937,7 +2952,7 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
 											 ps_commit_ts_reconstruct,
-											 base, target, "commit-ts"));
+											 base, target, "commit-ts", true));
 }
 
 /*
@@ -2964,7 +2979,10 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				mem_page_lo,
 				mem_page_hi;
 	int64		seeded = 0;
-	char		mxdir[MAXPGPATH];
+	char		mxdir[MAXPGPATH],
+				mxstage[MAXPGPATH],
+				offdir[MAXPGPATH],
+				memdir[MAXPGPATH];
 
 	if (!superuser())
 		ereport(ERROR,
@@ -2977,7 +2995,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 	if (!MultiXactIdIsValid(oldest_multi) || !MultiXactIdIsValid(next_multi) ||
-		oldest_multi > next_multi)
+		(oldest_multi != next_multi &&
+		 !MultiXactIdPrecedes(oldest_multi, next_multi)))
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
@@ -2992,31 +3011,76 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
 	snprintf(mxdir, sizeof(mxdir), "%s/pg_multixact", target_dir);
-	if (MakePGDirectory(mxdir) != 0 && errno != EEXIST)
+	snprintf(mxstage, sizeof(mxstage), "%s/pg_multixact.tmp", target_dir);
+	snprintf(offdir, sizeof(offdir), "%s/offsets", mxstage);
+	snprintf(memdir, sizeof(memdir), "%s/members", mxstage);
+	if (access(mxstage, F_OK) == 0 && !rmtree(mxstage, true))
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not create branch multixact dir \"%s\": %m", mxdir)));
+				 errmsg("could not clear branch multixact staging dir \"%s\"", mxstage)));
+	if (MakePGDirectory(mxstage) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch multixact staging dir \"%s\": %m", mxstage)));
+	if (MakePGDirectory(offdir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch multixact offsets dir \"%s\": %m", offdir)));
+	if (MakePGDirectory(memdir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch multixact members dir \"%s\": %m", memdir)));
 
-	if (next_multi > oldest_multi)
+	if (oldest_multi != next_multi)
 	{
-		off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
-		off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
-		seeded += pagestore_seed_slru_pages(target_dir, "pg_multixact/offsets",
-											off_page_lo, off_page_hi,
-											ps_mxoff_reconstruct,
-											base, target, "multixact offsets");
+		if (oldest_multi < next_multi)
+		{
+			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
+			off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+			seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+												off_page_lo, off_page_hi,
+												ps_mxoff_reconstruct,
+												base, target, "multixact offsets", false);
+		}
+		else
+		{
+			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
+			off_page_hi = (int64) MaxMultiXactId / PS_MXOFF_PER_PAGE;
+			seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+												off_page_lo, off_page_hi,
+												ps_mxoff_reconstruct,
+												base, target, "multixact offsets", false);
+			if (next_multi > FirstMultiXactId)
+			{
+				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
+				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+				seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+													off_page_lo, off_page_hi,
+													ps_mxoff_reconstruct,
+													base, target, "multixact offsets", false);
+			}
+		}
 	}
 	if (next_member > oldest_member)
 	{
 		mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
 		mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-		seeded += pagestore_seed_slru_pages(target_dir, "pg_multixact/members",
+		seeded += pagestore_seed_slru_pages(mxstage, "members",
 											mem_page_lo, mem_page_hi,
 											ps_mxmemb_reconstruct,
-											base, target, "multixact members");
+											base, target, "multixact members", false);
 	}
 
-	fsync_fname(mxdir, true);
+	fsync_fname(mxstage, true);
+	if (access(mxdir, F_OK) == 0 && !rmtree(mxdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing branch multixact dir \"%s\"", mxdir)));
+	if (rename(mxstage, mxdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch multixact dir \"%s\": %m", mxdir)));
+	fsync_fname(target_dir, true);
 	PG_RETURN_INT64(seeded);
 }
 
