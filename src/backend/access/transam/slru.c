@@ -877,6 +877,12 @@ SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno)
 	if (pg_pread(fd, shared->page_buffer[slotno], BLCKSZ, offset) != BLCKSZ)
 	{
 		pgstat_report_wait_end();
+		if (slru_page_read_hook &&
+			slru_page_read_hook(ctl, pageno, (char *) shared->page_buffer[slotno]))
+		{
+			CloseTransientFile(fd);
+			return true;
+		}
 		slru_errcause = SLRU_READ_FAILED;
 		slru_errno = errno;
 		CloseTransientFile(fd);
