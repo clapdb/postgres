@@ -1250,7 +1250,7 @@ pagestore_slru_page_is_truncated(SlruCtl ctl, int64 pageno)
 
 	if (!pagestore_slru_get_cutoff(ctl, &cutoff))
 		return false;
-	return pageno < (int64) cutoff;
+	return ctl->PagePrecedes(pageno, (int64) cutoff);
 }
 
 static void
@@ -1427,6 +1427,7 @@ pagestore_slru_read_hook(SlruCtl ctl, int64 pageno, char *page)
 		return false;
 
 	slru_page_key(ctl, &key);
+	pagestore_slru_flush_pending_mirrors();
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
@@ -1471,6 +1472,7 @@ pagestore_slru_exists_hook(SlruCtl ctl, int64 pageno)
 		return false;
 
 	slru_page_key(ctl, &key);
+	pagestore_slru_flush_pending_mirrors();
 
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
