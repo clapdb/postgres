@@ -255,7 +255,33 @@ mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
 slru_status=$($P -c "SELECT pg_xact_status('$slru_xid');")
 assert "$slru_status" "committed" "clog served from the store with the local pg_xact segment absent (compute reads SLRU from store)"
 
-# --- 12. store-backed redo: replay base+deltas from the store's shipped WAL ------
+# --- 11. pg_control on the store via the klass seam + UpdateControlFile hook -----
+# The control-file write hook mirrors pg_control onto the store as a
+# PS_KLASS_CONTROL object on every write.  After a checkpoint, the store's control
+# image must carry the current checkpoint LSN -- real cluster metadata on the store.
+$P -c "CREATE FUNCTION pagestore_control_checkpoint_lsn() RETURNS pg_lsn
+        AS 'pagestore','pagestore_control_checkpoint_lsn' LANGUAGE C STRICT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+ctl_match=$($P -c "SELECT pagestore_control_checkpoint_lsn() = (SELECT checkpoint_lsn FROM pg_control_checkpoint());")
+assert "$ctl_match" "t" "pg_control mirrored to the store carries the current checkpoint LSN (control on store)"
+
+# --- 12. pg_control read side: bootstrap it from the store before startup --------
+# pg_control is read (and CRC-checked) before shared_preload_libraries load, so the
+# module's read hook cannot serve it.  A compute with no local pg_control restores
+# it from the store with the freestanding pagestore_control_restore tool, then
+# starts normally -- proving cluster metadata can be bootstrapped from the store.
+rows_before=$($P -c "SELECT count(*) FROM t;")
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1     # shutdown checkpoint mirrors pg_control
+rm -f "$DATA/global/pg_control"                       # a compute with no local control
+"$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
+assert "$?" "0" "pagestore_control_restore fetched pg_control from the store"
+test ! -s "$DATA/global/pg_control" && rc=missing || rc=present
+assert "$rc" "present" "pg_control written back to the data directory"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+rows_after=$($P -c "SELECT count(*) FROM t;")
+assert "$rows_after" "$rows_before" "cluster boots from store-restored pg_control (compute bootstraps cluster metadata from the store)"
+
+# --- 13. store-backed redo: replay base+deltas from the store's shipped WAL ------
 # With pagestore.redo_wal_from_store on, redo_page_asof reads its WAL records from
 # the daemon's shipped per-timeline log instead of local files -- so a compute with
 # no local WAL (a fresh branch) can materialize a page.  Ship the segment first.
@@ -274,7 +300,7 @@ sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
      AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
 assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's shipped WAL (store-backed reader)"
 
-# --- 13. daemon crash recovery: segment-log recovery of un-flushed writes -------
+# --- 14. daemon crash recovery: segment-log recovery of un-flushed writes -------
 # Restart the daemon with a flush threshold so high the rows below can never be
 # sealed into an image layer -- they live ONLY in the memtable + segment log.  Then
 # SIGKILL it (no clean shutdown, so the memtable is lost), restart, and require the

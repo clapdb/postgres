@@ -574,6 +574,9 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  */
 static ControlFileData *ControlFile = NULL;
 
+/* Optional hook to mirror the control file to an external store on each write. */
+ControlFileWriteHook_type control_file_write_hook = NULL;
+
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
  * multiple evaluation!
@@ -4582,6 +4585,10 @@ static void
 UpdateControlFile(void)
 {
 	update_controlfile(DataDir, ControlFile, true);
+
+	/* mirror the just-written control file to an external store, if hooked */
+	if (control_file_write_hook)
+		control_file_write_hook(ControlFile);
 }
 
 /*
@@ -6936,6 +6943,7 @@ CreateCheckPoint(int flags)
 	uint32		freespace;
 	XLogRecPtr	PriorRedoPtr;
 	XLogRecPtr	last_important_lsn;
+	ControlFileData controlFileSnapshot;
 	VirtualTransactionId *vxids;
 	int			nvxids;
 	int			oldXLogAllowed = 0;
@@ -7306,6 +7314,7 @@ CreateCheckPoint(int flags)
 	ControlFile->unloggedLSN = pg_atomic_read_membarrier_u64(&XLogCtl->unloggedLSN);
 
 	UpdateControlFile();
+	controlFileSnapshot = *ControlFile;
 	LWLockRelease(ControlFileLock);
 
 	/* Update shared-memory copy of checkpoint XID/epoch */
@@ -7318,6 +7327,10 @@ CreateCheckPoint(int flags)
 	 * have trouble while fooling with old log segments.
 	 */
 	END_CRIT_SECTION();
+
+	/* mirror the just-written checkpoint control file outside the critical section */
+	if (control_file_write_hook)
+		control_file_write_hook(&controlFileSnapshot);
 
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or

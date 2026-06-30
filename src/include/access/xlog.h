@@ -18,6 +18,15 @@
 #include "nodes/pg_list.h"
 
 
+/*
+ * Hook called after the control file is written (UpdateControlFile), with the
+ * just-written control data.  Lets an extension mirror pg_control to an external
+ * store; NULL (the default) disables it.
+ */
+struct ControlFileData;			/* in catalog/pg_control.h */
+typedef void (*ControlFileWriteHook_type) (const struct ControlFileData *cf);
+extern PGDLLIMPORT ControlFileWriteHook_type control_file_write_hook;
+
 /* Sync methods */
 enum WalSyncMethod
 {

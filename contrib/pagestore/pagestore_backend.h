@@ -163,8 +163,9 @@ extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *ke
 										 BlockNumber block, const void *page);
 extern void pagestore_localsvc_obj_write_lsn(uint32 klass,
 											 const PageStoreRelKey *key,
-											 BlockNumber block,
-											 const void *page, uint64 lsn);
+											 BlockNumber block, const void *page,
+											 uint64 lsn);
+extern void pagestore_localsvc_obj_sync(uint32 klass, const PageStoreRelKey *key);
 extern bool pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 										BlockNumber block, void *page);
 

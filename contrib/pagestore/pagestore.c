@@ -41,6 +41,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "fmgr.h"
@@ -1649,6 +1650,164 @@ pagestore_slru_get(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+static ControlFileWriteHook_type prev_control_file_write_hook = NULL;
+static ControlFileData pagestore_pending_control_file;
+static bool pagestore_pending_control_file_valid = false;
+
+static XLogRecPtr
+pagestore_control_version_lsn(const ControlFileData *cf)
+{
+	XLogRecPtr	lsn = cf->checkPoint;
+
+	lsn = Max(lsn, cf->checkPointCopy.redo);
+	lsn = Max(lsn, cf->minRecoveryPoint);
+	lsn = Max(lsn, cf->backupStartPoint);
+	lsn = Max(lsn, cf->backupEndPoint);
+
+	if (!RecoveryInProgress())
+		lsn = Max(lsn, GetXLogInsertRecPtr());
+
+	return lsn;
+}
+
+static void
+pagestore_control_write_one(const ControlFileData *cf)
+{
+	PageStoreRelKey key;
+	char		buf[BLCKSZ];
+
+	/* pg_control fits in a single block (PG_CONTROL_FILE_SIZE <= BLCKSZ) */
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, cf, Min(sizeof(ControlFileData), (size_t) BLCKSZ));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = 0;
+	key.forkNum = 0;
+
+	pagestore_localsvc_obj_write_lsn(PS_KLASS_CONTROL, &key, 0, buf,
+									 pagestore_control_version_lsn(cf));
+	pagestore_localsvc_obj_sync(PS_KLASS_CONTROL, &key);
+}
+
+static void
+pagestore_control_flush_pending(void)
+{
+	if (!pagestore_pending_control_file_valid)
+		return;
+	if (CritSectionCount > 0)
+		return;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	{
+		ControlFileData pending_control_file = pagestore_pending_control_file;
+
+		pagestore_control_write_one(&pending_control_file);
+		pagestore_pending_control_file_valid = false;
+	}
+}
+
+static void
+pagestore_control_flush_pending_on_exit(int code, Datum arg)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		pagestore_control_flush_pending();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(oldcontext);
+}
+
+/*
+ * Control-file write hook (installed into xlog.c): mirror pg_control onto the
+ * store as a PS_KLASS_CONTROL object whenever it is written.  Cluster control
+ * state on the store via the same klass seam -- the foundation for a compute
+ * reading cluster metadata from the store.  Best-effort (PG_TRY); runs in many
+ * contexts (checkpointer, startup, backends), each attaching the shm lazily.
+ */
+static void
+pagestore_control_write_hook(const ControlFileData *cf)
+{
+	MemoryContext oldcontext;
+
+	if (prev_control_file_write_hook)
+		prev_control_file_write_hook(cf);
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return;
+
+	/*
+	 * The mirror path performs fallible shared-memory IPC.  Several pg_control
+	 * writers run inside checkpoint/shutdown critical sections, where ERROR would
+	 * become PANIC before this best-effort hook could recover.  Do not risk the
+	 * cluster for an optional mirror; a later non-critical control-file write can
+	 * refresh the store copy.
+	 */
+	if (CritSectionCount > 0)
+	{
+		pagestore_pending_control_file = *cf;
+		pagestore_pending_control_file_valid = true;
+		return;
+	}
+
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
+	{
+		pagestore_control_flush_pending();
+		pagestore_control_write_one(cf);
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		/* restore context; re-throw cancel/shutdown, swallow only mirror I/O errors */
+		MemoryContextSwitchTo(oldcontext);
+		if (sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			PG_RE_THROW();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * pagestore_control_checkpoint_lsn() returns pg_lsn -- the checkpoint LSN from
+ * the pg_control image on the store (verifies the write hook mirrored the
+ * current control file).
+ */
+PG_FUNCTION_INFO_V1(pagestore_control_checkpoint_lsn);
+Datum
+pagestore_control_checkpoint_lsn(PG_FUNCTION_ARGS)
+{
+	PageStoreRelKey key;
+	char	   *buf;
+	ControlFileData *cf;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	key.spcOid = 0;
+	key.dbOid = 0;
+	key.relNumber = 0;
+	key.forkNum = 0;
+
+	buf = palloc(BLCKSZ);
+	if (!pagestore_localsvc_obj_read(PS_KLASS_CONTROL, &key, 0, buf))
+		ereport(ERROR,
+				(errmsg("pg_control is not present on the store")));
+	cf = (ControlFileData *) buf;
+	PG_RETURN_LSN(cf->checkPoint);
+}
+
 void
 _PG_init(void)
 {
@@ -1741,5 +1900,10 @@ _PG_init(void)
 	slru_page_exists_hook = pagestore_slru_exists_hook;
 	slru_page_truncate_hook = pagestore_slru_truncate_hook;
 
+	/* mirror the control file (pg_control) onto the store as well */
+	prev_control_file_write_hook = control_file_write_hook;
+	control_file_write_hook = pagestore_control_write_hook;
+
 	before_shmem_exit(pagestore_slru_flush_pending_on_exit, 0);
+	before_shmem_exit(pagestore_control_flush_pending_on_exit, 0);
 }
