@@ -178,6 +178,16 @@ typedef void (*SlruPageWriteHook_type) (SlruCtl ctl, int64 pageno,
 extern PGDLLIMPORT SlruPageWriteHook_type slru_page_write_hook;
 
 /*
+ * Hook called after an SLRU page is dirtied in memory, before the dirty image is
+ * necessarily written to its segment file.  This lets an external store mirror
+ * transaction status that is logically visible before checkpoint/eviction flushes
+ * the SLRU buffer locally.
+ */
+typedef void (*SlruPageDirtyHook_type) (SlruCtl ctl, int64 pageno,
+										const char *page);
+extern PGDLLIMPORT SlruPageDirtyHook_type slru_page_dirty_hook;
+
+/*
  * Hook consulted before reading an SLRU page from its segment file.  If set and
  * it returns true, it has filled the BLCKSZ page buffer from an external store
  * and the local read is skipped; if it returns false, the normal local read

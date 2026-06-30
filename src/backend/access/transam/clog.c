@@ -420,6 +420,9 @@ TransactionIdSetPageStatusInternal(TransactionId xid, int nsubxids,
 	}
 
 	XactCtl->shared->page_dirty[slotno] = true;
+	if (slru_page_dirty_hook)
+		slru_page_dirty_hook(XactCtl, pageno,
+							 XactCtl->shared->page_buffer[slotno]);
 }
 
 /*
@@ -924,7 +927,10 @@ TrimCLOG(void)
 		/* Zero the rest of the page */
 		MemSet(byteptr + 1, 0, BLCKSZ - byteno - 1);
 
-		XactCtl->shared->page_dirty[slotno] = true;
+			XactCtl->shared->page_dirty[slotno] = true;
+			if (slru_page_dirty_hook)
+				slru_page_dirty_hook(XactCtl, pageno,
+									 XactCtl->shared->page_buffer[slotno]);
 	}
 
 	LWLockRelease(lock);

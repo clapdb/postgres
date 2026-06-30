@@ -1199,6 +1199,7 @@ slru_klass_id(const char *dir)
 }
 
 static SlruPageWriteHook_type prev_slru_page_write_hook = NULL;
+static SlruPageDirtyHook_type prev_slru_page_dirty_hook = NULL;
 static SlruPageReadHook_type prev_slru_page_read_hook = NULL;
 static SlruPageExistsHook_type prev_slru_page_exists_hook = NULL;
 static SlruPageTruncateHook_type prev_slru_page_truncate_hook = NULL;
@@ -1352,13 +1353,10 @@ pagestore_slru_flush_pending_mirrors(void)
  * a production version would copy the page and ship it asynchronously.
  */
 static void
-pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
+pagestore_slru_mirror_page(SlruCtl ctl, int64 pageno, const char *page)
 {
 	PageStoreRelKey key;
 	MemoryContext oldcontext;
-
-	if (prev_slru_page_write_hook)
-		prev_slru_page_write_hook(ctl, pageno, page);
 
 	/* only meaningful when relations are served by the localsvc backend */
 	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
@@ -1407,6 +1405,24 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+}
+
+static void
+pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
+{
+	if (prev_slru_page_write_hook)
+		prev_slru_page_write_hook(ctl, pageno, page);
+
+	pagestore_slru_mirror_page(ctl, pageno, page);
+}
+
+static void
+pagestore_slru_dirty_hook(SlruCtl ctl, int64 pageno, const char *page)
+{
+	if (prev_slru_page_dirty_hook)
+		prev_slru_page_dirty_hook(ctl, pageno, page);
+
+	pagestore_slru_mirror_page(ctl, pageno, page);
 }
 
 /* GUC: when on, the read hook below serves SLRU pages from the store. */
@@ -1697,10 +1713,12 @@ _PG_init(void)
 
 	/* mirror SLRU pages (clog, multixact, ...) onto the store via the klass seam */
 	prev_slru_page_write_hook = slru_page_write_hook;
+	prev_slru_page_dirty_hook = slru_page_dirty_hook;
 	prev_slru_page_read_hook = slru_page_read_hook;
 	prev_slru_page_exists_hook = slru_page_exists_hook;
 	prev_slru_page_truncate_hook = slru_page_truncate_hook;
 	slru_page_write_hook = pagestore_slru_write_hook;
+	slru_page_dirty_hook = pagestore_slru_dirty_hook;
 	slru_page_read_hook = pagestore_slru_read_hook;
 	slru_page_exists_hook = pagestore_slru_exists_hook;
 	slru_page_truncate_hook = pagestore_slru_truncate_hook;
