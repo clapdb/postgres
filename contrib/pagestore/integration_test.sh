@@ -371,7 +371,7 @@ rm -rf "$SEEDDIR"
 # (its xid is committed in the reconstructed clog and its heap version is <= L) but not row2
 # (committed after L; that heap version > L is absent from the branch timeline).  And it must
 # write forward on its own timeline without the parent seeing it.
-$P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+$P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE TABLE tb(id int, note text) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
@@ -389,7 +389,7 @@ boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # pg_xact -- not the parent's copied one -- is what makes row1 visible.
 SEEDOUT=$(mktemp -d)/seedout
 seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
-	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, 0, 0);")
+	'3'::xid, '$boxid'::xid, '3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
 # clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
@@ -518,6 +518,7 @@ $P -c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; COMMIT;" >/dev/null
 mA=$($P -c "SELECT xmax FROM mx WHERE id=1;")                     # the row's xmax is the multixact id
 $P -c "CHECKPOINT;" >/dev/null
 mxL=$($P -c "SELECT pg_current_wal_lsn();")                       # fork LSN L (after mA)
+bootNext=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 wait "$mxlocker"		# only the locker; a bare wait would also block on the daemon
 # confirm mA really is a multixact (its two FOR SHARE members), not a plain xid
 mxMembers=$($P -c "SELECT count(*) FROM pg_get_multixact_members('$mA');" 2>/dev/null)
@@ -548,8 +549,10 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
@@ -585,9 +588,13 @@ rm -rf "$MXSEED"
 # fork window and one set of horizons, then require each published SLRU page to match its
 # existing per-SLRU reconstruction helper.
 BOOTSEED=$(mktemp -d)
-bootNext=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
+read -r ctsOldest ctsNewest <<< "$($P -c "SELECT oldest_commit_ts_xid::text || ' ' || newest_commit_ts_xid::text FROM pg_control_checkpoint();")"
+ctsNext=$(( (ctsNewest + 1) & 4294967295 ))
 bootSeeded=$($P -c "SELECT pagestore_seed_branch_slrus('$BOOTSEED', '$mxC', '$mxL',
-	'3'::xid, '$bootNext'::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
+	'3'::xid, '$bootNext'::xid,
+	'$ctsOldest'::xid, '$ctsNext'::xid,
+	'$mA'::xid, '$mxNext'::xid,
+	$mOff, $((mOff + mxMembers)));")
 assert "$([ "${bootSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch bootstrap seed materialized pg_xact, pg_commit_ts, and pg_multixact ($bootSeeded page(s))"
 bootClogSeg=$(printf '%04X' $(( (ctsA / cxpp) / 32 )))
@@ -611,7 +618,7 @@ rm -rf "$BOOTSEED"
 # artifact for the later pg_control/bootstrap step.
 PREPSEED=$(mktemp -d)
 prepSeeded=$($P -c "SELECT pagestore_prepare_branch('$PREPSEED', 2, 0, '$mxC', '$mxL',
-	'3'::xid, '$bootNext'::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
+	'3'::xid, '$bootNext'::xid, '$ctsA'::xid, '$cts_next'::text::xid, '$mA'::xid, '$mxNext'::xid, $mOff, $((mOff + mxMembers)));")
 assert "$([ "${prepSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
 	"branch prepare seeded all bootstrap SLRUs and forked a store timeline ($prepSeeded page(s))"
 manifestHasTimeline=$($P -c "SELECT position('\"new_timeline\": 2' in pg_read_file('$PREPSEED/pagestore_branch.manifest')) > 0;")
