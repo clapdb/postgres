@@ -4526,7 +4526,13 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
+	{
+		if (pagestore_localsvc_timeline() != 0)
+			ereport(FATAL,
+					(errmsg("pagestore.timeline requires pagestore_branch.manifest"),
+					 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
 		return;					/* legacy/non-branch datadir */
+	}
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
