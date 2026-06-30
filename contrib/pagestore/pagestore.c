@@ -1711,7 +1711,7 @@ pagestore_control_flush_pending(void)
 static void
 pagestore_control_flush_pending_on_exit(int code, Datum arg)
 {
-	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	MemoryContext oldcontext = CurrentMemoryContext;
 
 	PG_TRY();
 	{
