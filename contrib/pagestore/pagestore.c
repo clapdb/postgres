@@ -3377,6 +3377,7 @@ pagestore_read_branch_manifest(const char *target_dir)
 	StringInfoData buf;
 	char		tmp[1024];
 	size_t		nread;
+	long		manifest_size;
 
 	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest") > MAXPGPATH)
 		ereport(ERROR,
@@ -3392,6 +3393,28 @@ pagestore_read_branch_manifest(const char *target_dir)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open branch manifest \"%s\": %m", path)));
+	}
+	if (fseek(file, 0L, SEEK_END) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	manifest_size = ftell(file);
+	if (manifest_size < 0 || manifest_size > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest \"%s\" is too large", path)));
+	}
+	if (fseek(file, 0L, SEEK_SET) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
 	}
 
 	initStringInfo(&buf);
