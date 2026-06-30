@@ -3679,6 +3679,10 @@ PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
 pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 {
+	if (PG_NARGS() != 5)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore_install_prepared_branch requires 5 arguments (prepared_dir, target_dir, new_timeline, parent_timeline, fork_lsn)")));
 	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	int32		new_tl = PG_GETARG_INT32(2);
