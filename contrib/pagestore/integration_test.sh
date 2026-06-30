@@ -401,7 +401,7 @@ cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
-# so the boot genuinely depends on prepare_branch output rather than parent state.
+# so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
 assert "$bad_install" "error" "prepared branch install rejects the wrong branch identity"
 BADSEED=$(mktemp -d)
