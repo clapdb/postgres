@@ -2419,6 +2419,67 @@ typedef bool (*SlruPageReconstructFn) (char *page, int64 pageno,
 									   XLogRecPtr base_lsn,
 									   XLogRecPtr target_lsn);
 
+#define PS_CHECK_PATH_FORMAT(ret, buf) \
+	do { \
+		if ((ret) < 0 || (ret) >= (int) sizeof(buf)) \
+			ereport(ERROR, \
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE), \
+					 errmsg("branch target directory path is too long"))); \
+	} while (0)
+
+static void
+pagestore_write_zero_slru_bootstrap_page(const char *slru_dir, const char *label)
+{
+	char		segpath[MAXPGPATH];
+	char		zerobuf[BLCKSZ];
+	int			pathlen;
+	int			fd;
+
+	pathlen = snprintf(segpath, sizeof(segpath), "%s/%04X", slru_dir, 0);
+	PS_CHECK_PATH_FORMAT(pathlen, segpath);
+	fd = OpenTransientFilePerm(segpath,
+							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+							   pg_file_create_mode);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch %s bootstrap segment \"%s\": %m",
+						label, segpath)));
+	memset(zerobuf, 0, sizeof(zerobuf));
+	for (int done = 0; done < BLCKSZ;)
+	{
+		ssize_t		written;
+
+		errno = 0;
+		written = write(fd, zerobuf + done, BLCKSZ - done);
+		if (written <= 0)
+		{
+			if (written == 0)
+				errno = ENOSPC;
+			CloseTransientFile(fd);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write branch %s bootstrap segment \"%s\": %m",
+							label, segpath)));
+		}
+		done += written;
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync branch %s bootstrap segment \"%s\": %m",
+						label, segpath)));
+	}
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close branch %s bootstrap segment \"%s\": %m",
+						label, segpath)));
+	fsync_fname(slru_dir, true);
+}
+
 static int64
 pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 						  int64 page_lo, int64 page_hi,
@@ -2438,6 +2499,7 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 				p;
 	int			np;
 	int64		seeded = 0;
+	int			pathlen;
 
 	if (page_hi < page_lo)
 		return 0;
@@ -2476,8 +2538,10 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(dstdir, sizeof(dstdir), "%s/%s", target_dir, slru_dir);
-	snprintf(stagedir, sizeof(stagedir), "%s/%s.tmp", target_dir, slru_dir);
+	pathlen = snprintf(dstdir, sizeof(dstdir), "%s/%s", target_dir, slru_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, dstdir);
+	pathlen = snprintf(stagedir, sizeof(stagedir), "%s/%s.tmp", target_dir, slru_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, stagedir);
 
 	if (publish_dir)
 	{
@@ -2510,8 +2574,9 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		if (trim_last < first)
 			continue;
 
-		snprintf(segpath, sizeof(segpath), "%s/%04X",
-				 publish_dir ? stagedir : dstdir, (unsigned int) seg);
+		pathlen = snprintf(segpath, sizeof(segpath), "%s/%04X",
+							publish_dir ? stagedir : dstdir, (unsigned int) seg);
+		PS_CHECK_PATH_FORMAT(pathlen, segpath);
 		fd = OpenTransientFilePerm(segpath,
 								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
 								   pg_file_create_mode);
@@ -2983,6 +3048,9 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 				mxstage[MAXPGPATH],
 				offdir[MAXPGPATH],
 				memdir[MAXPGPATH];
+	int			pathlen;
+	int64		off_seeded = 0,
+				mem_seeded = 0;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -3000,7 +3068,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
-	if (oldest_member < 0 || next_member < oldest_member ||
+	if (oldest_member < 0 || next_member < 0 ||
+		oldest_member > UINT32_MAX ||
 		next_member > UINT32_MAX)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
@@ -3010,10 +3079,14 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(mxdir, sizeof(mxdir), "%s/pg_multixact", target_dir);
-	snprintf(mxstage, sizeof(mxstage), "%s/pg_multixact.tmp", target_dir);
-	snprintf(offdir, sizeof(offdir), "%s/offsets", mxstage);
-	snprintf(memdir, sizeof(memdir), "%s/members", mxstage);
+	pathlen = snprintf(mxdir, sizeof(mxdir), "%s/pg_multixact", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, mxdir);
+	pathlen = snprintf(mxstage, sizeof(mxstage), "%s/pg_multixact.tmp", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, mxstage);
+	pathlen = snprintf(offdir, sizeof(offdir), "%s/offsets", mxstage);
+	PS_CHECK_PATH_FORMAT(pathlen, offdir);
+	pathlen = snprintf(memdir, sizeof(memdir), "%s/members", mxstage);
+	PS_CHECK_PATH_FORMAT(pathlen, memdir);
 	if (access(mxstage, F_OK) == 0 && !rmtree(mxstage, true))
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -3037,39 +3110,65 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		{
 			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
 			off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
-			seeded += pagestore_seed_slru_pages(mxstage, "offsets",
-												off_page_lo, off_page_hi,
-												ps_mxoff_reconstruct,
-												base, target, "multixact offsets", false);
+			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+													off_page_lo, off_page_hi,
+													ps_mxoff_reconstruct,
+													base, target, "multixact offsets", false);
 		}
 		else
 		{
 			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
 			off_page_hi = (int64) MaxMultiXactId / PS_MXOFF_PER_PAGE;
-			seeded += pagestore_seed_slru_pages(mxstage, "offsets",
-												off_page_lo, off_page_hi,
-												ps_mxoff_reconstruct,
-												base, target, "multixact offsets", false);
+			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+													off_page_lo, off_page_hi,
+													ps_mxoff_reconstruct,
+													base, target, "multixact offsets", false);
 			if (next_multi > FirstMultiXactId)
 			{
 				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
 				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
-				seeded += pagestore_seed_slru_pages(mxstage, "offsets",
-													off_page_lo, off_page_hi,
-													ps_mxoff_reconstruct,
-													base, target, "multixact offsets", false);
+				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
+														off_page_lo, off_page_hi,
+														ps_mxoff_reconstruct,
+														base, target, "multixact offsets", false);
 			}
 		}
 	}
-	if (next_member > oldest_member)
+	if (next_member != oldest_member)
 	{
-		mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-		mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-		seeded += pagestore_seed_slru_pages(mxstage, "members",
-											mem_page_lo, mem_page_hi,
-											ps_mxmemb_reconstruct,
-											base, target, "multixact members", false);
+		if (oldest_member < next_member)
+		{
+			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+													mem_page_lo, mem_page_hi,
+													ps_mxmemb_reconstruct,
+													base, target, "multixact members", false);
+		}
+		else
+		{
+			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+			mem_page_hi = (int64) UINT32_MAX / PS_MXMEMB_PER_PAGE;
+			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+													mem_page_lo, mem_page_hi,
+													ps_mxmemb_reconstruct,
+													base, target, "multixact members", false);
+			if (next_member > 0)
+			{
+				mem_page_lo = 0;
+				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+														mem_page_lo, mem_page_hi,
+														ps_mxmemb_reconstruct,
+														base, target, "multixact members", false);
+			}
+		}
 	}
+	if (off_seeded == 0)
+		pagestore_write_zero_slru_bootstrap_page(offdir, "multixact offsets");
+	if (mem_seeded == 0)
+		pagestore_write_zero_slru_bootstrap_page(memdir, "multixact members");
+	seeded += off_seeded + mem_seeded;
 
 	fsync_fname(mxstage, true);
 	if (access(mxdir, F_OK) == 0 && !rmtree(mxdir, true))
