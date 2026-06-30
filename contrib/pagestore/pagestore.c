@@ -3211,9 +3211,36 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+/* Publish one staged SLRU directory into the final target branch directory,
+ * replacing any prior target version.  Missing staged directories (for skipped
+ * optional SLRUs) are treated as a no-op.
+ */
+static void
+publish_seeded_slru_dir(const char *staging_root, const char *target_root,
+					const char *slru_name)
+{
+	char		stagedir[MAXPGPATH];
+	char		targetdir[MAXPGPATH];
+
+	snprintf(stagedir, sizeof(stagedir), "%s/%s", staging_root, slru_name);
+	snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root, slru_name);
+
+	if (access(stagedir, F_OK) != 0)
+		return;
+	if (access(targetdir, F_OK) == 0 && !rmtree(targetdir, true))
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not remove existing branch %s dir \"%s\"", slru_name, targetdir)));
+	if (rename(stagedir, targetdir) != 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not publish branch %s dir \"%s\"", slru_name, targetdir)));
+}
+
 /*
  * pagestore_seed_branch_slrus(target_dir text, base pg_lsn, target pg_lsn,
  *                             oldest_xid xid, next_xid xid,
+ *                             oldest_commit_ts_xid xid, next_commit_ts_xid xid,
  *                             oldest_multi xid, next_multi xid,
  *                             oldest_member bigint, next_member bigint)
  * returns bigint
@@ -3234,33 +3261,97 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	XLogRecPtr	target = PG_GETARG_LSN(2);
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(5);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(6);
-	int64		oldest_member = PG_GETARG_INT64(7);
-	int64		next_member = PG_GETARG_INT64(8);
-	Datum		target_dir_datum = CStringGetTextDatum(target_dir);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
+	int64		oldest_member = PG_GETARG_INT64(9);
+	int64		next_member = PG_GETARG_INT64(10);
+	Datum		staging_dir_datum;
+	char		staging_root[MAXPGPATH];
+	bool		seed_commit_ts;
 	int64		seeded = 0;
 
-	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_clog,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_xid),
-												TransactionIdGetDatum(next_xid)));
-	seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_xid),
-												TransactionIdGetDatum(next_xid)));
-	seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
-												target_dir_datum,
-												LSNGetDatum(base),
-												LSNGetDatum(target),
-												TransactionIdGetDatum(oldest_multi),
-												TransactionIdGetDatum(next_multi),
-												Int64GetDatum(oldest_member),
-												Int64GetDatum(next_member)));
+	snprintf(staging_root, sizeof(staging_root), "%s/.pagestore-branch-seed.%ld",
+			target_dir, (long) MyProcPid);
+	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
+	if (MakePGDirectory(staging_root) != 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
+	staging_dir_datum = CStringGetTextDatum(staging_root);
+	if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
+		!TransactionIdIsNormal(next_commit_ts_xid))
+		seed_commit_ts = false;
+	else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
+			!TransactionIdIsNormal(next_commit_ts_xid))
+		ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("invalid commit-ts horizon [%u, %u)",
+				 oldest_commit_ts_xid, next_commit_ts_xid)));
+	else
+		seed_commit_ts = true;
+
+	PG_TRY();
+	{
+		seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_clog,
+									  staging_dir_datum,
+									  LSNGetDatum(base),
+									  LSNGetDatum(target),
+									  TransactionIdGetDatum(oldest_xid),
+									  TransactionIdGetDatum(next_xid)));
+
+		if (seed_commit_ts)
+			seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
+											  staging_dir_datum,
+											  LSNGetDatum(base),
+											  LSNGetDatum(target),
+											  TransactionIdGetDatum(oldest_commit_ts_xid),
+											  TransactionIdGetDatum(next_commit_ts_xid)));
+
+		seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
+										  staging_dir_datum,
+										  LSNGetDatum(base),
+										  LSNGetDatum(target),
+										  MultiXactIdGetDatum(oldest_multi),
+										  MultiXactIdGetDatum(next_multi),
+										  Int64GetDatum(oldest_member),
+										  Int64GetDatum(next_member)));
+	}
+	PG_CATCH();
+	{
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove branch seeding staging area after seed failure \"%s\"", staging_root)));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_TRY();
+	{
+		publish_seeded_slru_dir(staging_root, target_dir, "pg_xact");
+		if (seed_commit_ts)
+			publish_seeded_slru_dir(staging_root, target_dir, "pg_commit_ts");
+		publish_seeded_slru_dir(staging_root, target_dir, "pg_multixact");
+		fsync_fname(target_dir, true);
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
+	}
+	PG_CATCH();
+	{
+		if (!rmtree(staging_root, true))
+			ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove branch seeding staging area after publish failure \"%s\"", staging_root)));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	PG_RETURN_INT64(seeded);
 }
