@@ -4252,25 +4252,60 @@ pagestore_manifest_find_unique_field(const char *manifest, const char *key)
 	size_t		keylen = strlen(key);
 	const char *p = manifest;
 	const char *field = NULL;
+	int			depth = 0;
 
-	while ((p = strchr(p, '"')) != NULL)
+	while (*p != '\0')
 	{
-		const char *name = p + 1;
-		const char *end = strchr(name, '"');
-
-		if (end == NULL)
-			return NULL;
-		if ((size_t) (end - name) == keylen &&
-			strncmp(name, key, keylen) == 0)
+		if (*p == '{' || *p == '[')
 		{
-			p = pagestore_manifest_skip_ws(end + 1);
-			if (*p != ':')
-				return NULL;
-			if (field != NULL)
-				return NULL;
-			field = pagestore_manifest_skip_ws(p + 1);
+			depth++;
+			p++;
+			continue;
 		}
-		p = end + 1;
+		if (*p == '}' || *p == ']')
+		{
+			if (depth > 0)
+				depth--;
+			p++;
+			continue;
+		}
+		if (*p == '"')
+		{
+			const char *name = p + 1;
+			const char *end = name;
+
+			while (*end != '\0')
+			{
+				if (*end == '\\' && end[1] != '\0')
+				{
+					end += 2;
+					continue;
+				}
+				if (*end == '"')
+					break;
+				end++;
+			}
+			if (*end == '\0')
+				return NULL;
+
+			if (depth == 1)
+			{
+				const char *value = pagestore_manifest_skip_ws(end + 1);
+
+				if (*value == ':' &&
+					(size_t) (end - name) == keylen &&
+					strncmp(name, key, keylen) == 0)
+				{
+					if (field != NULL)
+						return NULL;
+					field = pagestore_manifest_skip_ws(value + 1);
+				}
+			}
+			p = end + 1;
+			continue;
+		}
+
+		p++;
 	}
 	return field;
 }
@@ -4386,6 +4421,8 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to validate a branch manifest")));
+	if (new_tl <= 0 || parent_tl < 0)
+		PG_RETURN_BOOL(false);
 
 	manifest = pagestore_read_branch_manifest(target_dir);
 	if (manifest == NULL)

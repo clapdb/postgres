@@ -617,6 +617,21 @@ assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$
 	"branch manifest validator accepts the prepared branch identity"
 assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 3, 0, '$mxL');")" "f" \
 	"branch manifest validator rejects the wrong branch timeline"
+cp "$PREPSEED/pagestore_branch.manifest" "$PREPSEED/pagestore_branch.manifest.good"
+cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
+{ "wrapper": { "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "$mxL" } }
+EOF
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects nested manifest fields"
+cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
+{ "format": 1, "new_timeline": 0, "parent_timeline": 0, "fork_lsn": "$mxL" }
+EOF
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 0, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects timeline zero"
+printf '{ "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "%s" }\\0{ "format": 2 }\\n' "$mxL" > "$PREPSEED/pagestore_branch.manifest"
+nulManifest=$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');" 2>/dev/null || echo ERROR)
+assert "$nulManifest" "ERROR" "branch manifest validator rejects embedded NUL bytes"
+mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manifest"
 prepClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_xact/$bootClogSeg', $(( bootClogPage * bs )), $bs));")
 assert "$prepClogMd5" "$bootClogRecon" "branch prepare pg_xact page == reconstructed as-of-L page"
 prepMxOff=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
