@@ -3384,7 +3384,13 @@ pagestore_read_branch_manifest(const char *target_dir)
 	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
 	file = AllocateFile(path, PG_BINARY_R);
 	if (file == NULL)
-		return NULL;
+	{
+		if (errno == ENOENT)
+			return NULL;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open branch manifest \"%s\": %m", path)));
+	}
 
 	initStringInfo(&buf);
 	while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
@@ -3406,13 +3412,25 @@ pagestore_manifest_has_token(const char *manifest, const char *key,
 {
 	char		token[256];
 	int			len;
+	const char *match;
 
 	len = snprintf(token, sizeof(token), "\"%s\": %s", key, value);
 	if (len < 0 || len >= (int) sizeof(token))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	return strstr(manifest, token) != NULL;
+	match = manifest;
+	while ((match = strstr(match, token)) != NULL)
+	{
+		char		next = match[len];
+
+		if (next == '\0' || next == ',' || next == '}' ||
+			next == '\n' || next == '\r' ||
+			next == ' ' || next == '\t')
+			return true;
+		match += len;
+	}
+	return false;
 }
 
 static bool
