@@ -573,7 +573,8 @@ rm -rf "$MXSEED"
 # fork window and one set of horizons, then require each published SLRU page to match its
 # existing per-SLRU reconstruction helper.
 BOOTSEED=$(mktemp -d)
-read -r ctsOldest ctsNext <<< "$($P -c "SELECT oldest_commit_ts_xid::text || ' ' || newest_commit_ts_xid::text FROM pg_control_checkpoint();")"
+read -r ctsOldest ctsNewest <<< "$($P -c "SELECT oldest_commit_ts_xid::text || ' ' || newest_commit_ts_xid::text FROM pg_control_checkpoint();")"
+ctsNext=$(( (ctsNewest + 1) & 4294967295 ))
 bootSeeded=$($P -c "SELECT pagestore_seed_branch_slrus('$BOOTSEED', '$mxC', '$mxL',
 	'3'::xid, '$bootNext'::xid,
 	'$ctsOldest'::xid, '$ctsNext'::xid,

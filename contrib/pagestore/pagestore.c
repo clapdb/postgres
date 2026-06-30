@@ -3786,26 +3786,66 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
  * replacing any prior target version.  Missing staged directories (for skipped
  * optional SLRUs) are treated as a no-op.
  */
-static void
+static bool
 publish_seeded_slru_dir(const char *staging_root, const char *target_root,
-					const char *slru_name)
+						const char *backup_root, const char *slru_name)
 {
 	char		stagedir[MAXPGPATH];
 	char		targetdir[MAXPGPATH];
+	char		backupdir[MAXPGPATH];
+	int			pathlen;
 
-	snprintf(stagedir, sizeof(stagedir), "%s/%s", staging_root, slru_name);
-	snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root, slru_name);
+	pathlen = snprintf(stagedir, sizeof(stagedir), "%s/%s", staging_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, stagedir);
+	pathlen = snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, targetdir);
+	pathlen = snprintf(backupdir, sizeof(backupdir), "%s/%s", backup_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, backupdir);
 
 	if (access(stagedir, F_OK) != 0)
-		return;
-	if (access(targetdir, F_OK) == 0 && !rmtree(targetdir, true))
+		return false;
+	if (access(targetdir, F_OK) == 0 && rename(targetdir, backupdir) != 0)
 		ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("could not remove existing branch %s dir \"%s\"", slru_name, targetdir)));
+				(errcode_for_file_access(),
+				 errmsg("could not move existing branch %s dir \"%s\" aside: %m",
+						slru_name, targetdir)));
 	if (rename(stagedir, targetdir) != 0)
 		ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("could not publish branch %s dir \"%s\"", slru_name, targetdir)));
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch %s dir \"%s\"", slru_name, targetdir)));
+	return true;
+}
+
+static void
+rollback_seeded_slru_dir(const char *target_root, const char *backup_root,
+						 const char *slru_name, bool published)
+{
+	char		targetdir[MAXPGPATH];
+	char		backupdir[MAXPGPATH];
+	int			pathlen;
+
+	pathlen = snprintf(targetdir, sizeof(targetdir), "%s/%s", target_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, targetdir);
+	pathlen = snprintf(backupdir, sizeof(backupdir), "%s/%s", backup_root,
+					   slru_name);
+	PS_CHECK_PATH_FORMAT(pathlen, backupdir);
+
+	if (!published && access(backupdir, F_OK) != 0)
+		return;
+	if (published && access(targetdir, F_OK) == 0 && !rmtree(targetdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove partly-published branch %s dir \"%s\"",
+						slru_name, targetdir)));
+	if (access(backupdir, F_OK) == 0 && rename(backupdir, targetdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not restore previous branch %s dir \"%s\": %m",
+						slru_name, targetdir)));
 }
 
 /*
@@ -3833,38 +3873,83 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
 	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
-	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
-	int64		oldest_member = PG_GETARG_INT64(9);
-	int64		next_member = PG_GETARG_INT64(10);
-	Datum		staging_dir_datum;
-	char		staging_root[MAXPGPATH];
-	bool		seed_commit_ts;
-	int64		seeded = 0;
+		TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+		MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
+		MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
+		int64		oldest_member = PG_GETARG_INT64(9);
+		int64		next_member = PG_GETARG_INT64(10);
+		Datum		staging_dir_datum;
+		char		staging_root[MAXPGPATH];
+		char		backup_root[MAXPGPATH];
+		bool		seed_commit_ts;
+		bool		published_xact = false,
+					published_commit_ts = false,
+					published_multixact = false;
+		int64		seeded = 0;
+		int			pathlen;
 
-	snprintf(staging_root, sizeof(staging_root), "%s/.pagestore-branch-seed.%ld",
-			target_dir, (long) MyProcPid);
-	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
-		ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
-	if (MakePGDirectory(staging_root) != 0)
-		ereport(ERROR,
-			(errcode_for_file_access(),
-			 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
-	staging_dir_datum = CStringGetTextDatum(staging_root);
-	if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
-		!TransactionIdIsNormal(next_commit_ts_xid))
-		seed_commit_ts = false;
-	else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to seed branch SLRUs")));
+		if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+			ereport(ERROR,
+					(errmsg("pagestore.backend must be 'localsvc'")));
+		if (target < base)
+			ereport(ERROR,
+					(errmsg("target LSN precedes the base cutoff")));
+		if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+			TransactionIdFollows(oldest_xid, next_xid))
+			ereport(ERROR,
+					(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+		if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
 			!TransactionIdIsNormal(next_commit_ts_xid))
-		ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("invalid commit-ts horizon [%u, %u)",
-				 oldest_commit_ts_xid, next_commit_ts_xid)));
-	else
-		seed_commit_ts = true;
+			seed_commit_ts = false;
+		else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
+				 !TransactionIdIsNormal(next_commit_ts_xid) ||
+				 TransactionIdFollows(oldest_commit_ts_xid, next_commit_ts_xid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid commit-ts horizon [%u, %u)",
+							oldest_commit_ts_xid, next_commit_ts_xid)));
+		else
+			seed_commit_ts = true;
+		if (!MultiXactIdIsValid(oldest_multi) ||
+			(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
+			(oldest_multi != next_multi &&
+			 !MultiXactIdPrecedes(oldest_multi, next_multi)))
+			ereport(ERROR,
+					(errmsg("invalid fork multixact horizon [%u, %u)",
+							oldest_multi, next_multi)));
+		if (oldest_member < 0 || next_member < 0 ||
+			oldest_member > UINT32_MAX ||
+			next_member > UINT32_MAX)
+			ereport(ERROR,
+					(errmsg("invalid fork multixact member horizon [%lld, %lld)",
+							(long long) oldest_member, (long long) next_member)));
+
+		pathlen = snprintf(staging_root, sizeof(staging_root),
+						   "%s/.pagestore-branch-seed.%ld",
+						   target_dir, (long) MyProcPid);
+		PS_CHECK_PATH_FORMAT(pathlen, staging_root);
+		pathlen = snprintf(backup_root, sizeof(backup_root),
+						   "%s/.pagestore-branch-backup.%ld",
+						   target_dir, (long) MyProcPid);
+		PS_CHECK_PATH_FORMAT(pathlen, backup_root);
+		staging_dir_datum = CStringGetTextDatum(staging_root);
+
+		if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
+		if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear previous branch seeding backup area \"%s\"", backup_root)));
+		if (MakePGDirectory(staging_root) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
 
 	PG_TRY();
 	{
@@ -3904,22 +3989,46 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 
 	PG_TRY();
 	{
-		publish_seeded_slru_dir(staging_root, target_dir, "pg_xact");
+		if (MakePGDirectory(backup_root) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch seeding backup area \"%s\"", backup_root)));
+		published_xact = publish_seeded_slru_dir(staging_root, target_dir,
+												 backup_root, "pg_xact");
 		if (seed_commit_ts)
-			publish_seeded_slru_dir(staging_root, target_dir, "pg_commit_ts");
-		publish_seeded_slru_dir(staging_root, target_dir, "pg_multixact");
+			published_commit_ts = publish_seeded_slru_dir(staging_root, target_dir,
+														  backup_root,
+														  "pg_commit_ts");
+		published_multixact = publish_seeded_slru_dir(staging_root, target_dir,
+													  backup_root,
+													  "pg_multixact");
 		fsync_fname(target_dir, true);
 		if (!rmtree(staging_root, true))
 			ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
+		if (!rmtree(backup_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding backup area \"%s\"", backup_root)));
 	}
 	PG_CATCH();
 	{
+		rollback_seeded_slru_dir(target_dir, backup_root, "pg_multixact",
+								 published_multixact);
+		if (seed_commit_ts)
+			rollback_seeded_slru_dir(target_dir, backup_root, "pg_commit_ts",
+									 published_commit_ts);
+		rollback_seeded_slru_dir(target_dir, backup_root, "pg_xact",
+								 published_xact);
 		if (!rmtree(staging_root, true))
 			ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove branch seeding staging area after publish failure \"%s\"", staging_root)));
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area after publish failure \"%s\"", staging_root)));
+		if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding backup area after publish failure \"%s\"", backup_root)));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
