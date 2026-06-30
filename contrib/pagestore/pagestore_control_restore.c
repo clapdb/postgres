@@ -17,10 +17,9 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "postgres_fe.h"
-
 #include <fcntl.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,8 +28,97 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
+
+/*
+ * Minimal freestanding copy of the pg_control layout and CRC machinery.  This
+ * tool intentionally links no PostgreSQL libraries and is built without the
+ * server/frontend include paths, but it must reject corrupt control images before
+ * installing them as global/pg_control.
+ */
+#define PG_CONTROL_VERSION	1800
+#define PG_CONTROL_FILE_SIZE	8192
+#define MOCK_AUTH_NONCE_LEN	32
+
+typedef uint64_t XLogRecPtr;
+typedef uint32_t TimeLineID;
+typedef uint32_t TransactionId;
+typedef uint32_t Oid;
+typedef uint32_t MultiXactId;
+typedef uint32_t MultiXactOffset;
+typedef int64_t pg_time_t;
+
+typedef struct CheckPoint
+{
+	XLogRecPtr	redo;
+	TimeLineID	ThisTimeLineID;
+	TimeLineID	PrevTimeLineID;
+	bool		fullPageWrites;
+	int			wal_level;
+	uint64_t	nextXid;
+	Oid			nextOid;
+	MultiXactId nextMulti;
+	MultiXactOffset nextMultiOffset;
+	TransactionId oldestXid;
+	Oid			oldestXidDB;
+	MultiXactId oldestMulti;
+	Oid			oldestMultiDB;
+	pg_time_t	time;
+	TransactionId oldestCommitTsXid;
+	TransactionId newestCommitTsXid;
+	TransactionId oldestActiveXid;
+} CheckPoint;
+
+typedef enum DBState
+{
+	DB_STARTUP = 0,
+	DB_SHUTDOWNED,
+	DB_SHUTDOWNED_IN_RECOVERY,
+	DB_SHUTDOWNING,
+	DB_IN_CRASH_RECOVERY,
+	DB_IN_ARCHIVE_RECOVERY,
+	DB_IN_PRODUCTION,
+} DBState;
+
+typedef struct ControlFileData
+{
+	uint64_t	system_identifier;
+	uint32_t	pg_control_version;
+	uint32_t	catalog_version_no;
+	DBState		state;
+	pg_time_t	time;
+	XLogRecPtr	checkPoint;
+	CheckPoint	checkPointCopy;
+	XLogRecPtr	unloggedLSN;
+	XLogRecPtr	minRecoveryPoint;
+	TimeLineID	minRecoveryPointTLI;
+	XLogRecPtr	backupStartPoint;
+	XLogRecPtr	backupEndPoint;
+	bool		backupEndRequired;
+	int			wal_level;
+	bool		wal_log_hints;
+	int			MaxConnections;
+	int			max_worker_processes;
+	int			max_wal_senders;
+	int			max_prepared_xacts;
+	int			max_locks_per_xact;
+	bool		track_commit_timestamp;
+	uint32_t	maxAlign;
+	double		floatFormat;
+	uint32_t	blcksz;
+	uint32_t	relseg_size;
+	uint32_t	xlog_blcksz;
+	uint32_t	xlog_seg_size;
+	uint32_t	nameDataLen;
+	uint32_t	indexMaxKeys;
+	uint32_t	toast_max_chunk_size;
+	uint32_t	loblksize;
+	bool		float8ByVal;
+	uint32_t	data_checksum_version;
+	bool		default_char_signedness;
+	char		mock_authentication_nonce[MOCK_AUTH_NONCE_LEN];
+	uint32_t	crc;
+} ControlFileData;
 
 static uint32_t page_size = PS_DEFAULT_PAGE_SIZE;
 static void *shm;
@@ -54,6 +142,29 @@ release_claimed_channel(void)
 		ps_store_release(&ps_channel(shm, (uint32_t) chan)->claimed, 0);
 		chan = -1;
 	}
+}
+
+static uint32_t
+crc32c_update(uint32_t crc, const void *data, size_t len)
+{
+	const unsigned char *p = (const unsigned char *) data;
+
+	while (len-- > 0)
+	{
+		crc ^= *p++;
+		for (int i = 0; i < 8; i++)
+			crc = (crc >> 1) ^ (0x82F63B78U & (0U - (crc & 1U)));
+	}
+	return crc;
+}
+
+static uint32_t
+crc32c_finalize(const void *data, size_t len)
+{
+	uint32_t	crc = 0xFFFFFFFFU;
+
+	crc = crc32c_update(crc, data, len);
+	return crc ^ 0xFFFFFFFFU;
 }
 
 static void
@@ -135,16 +246,13 @@ static int
 control_file_crc_ok(const char *buf)
 {
 	ControlFileData *cf = (ControlFileData *) buf;
-	pg_crc32c	crc;
+	uint32_t	crc;
 
 	if (cf->pg_control_version != PG_CONTROL_VERSION)
 		return 0;
 
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
-	FIN_CRC32C(crc);
-
-	return EQ_CRC32C(crc, cf->crc);
+	crc = crc32c_finalize(cf, offsetof(ControlFileData, crc));
+	return crc == cf->crc;
 }
 
 int
