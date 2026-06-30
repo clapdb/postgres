@@ -3594,6 +3594,7 @@ static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
+	char		path[MAXPGPATH];
 	char		buf[64];
 
 	if (prev_shmem_startup_hook)
@@ -3607,7 +3608,18 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
+	{
+		snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", DataDir);
+		if (access(path, R_OK) == 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not read branch manifest \"%s\": permission denied", path)));
+		if (errno != ENOENT)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not open branch manifest \"%s\": %m", path)));
 		return;					/* legacy/non-branch datadir */
+	}
 	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
