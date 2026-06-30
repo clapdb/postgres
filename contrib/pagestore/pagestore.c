@@ -36,6 +36,7 @@
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
@@ -49,6 +50,7 @@
 #include "port/pg_iovec.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
+#include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
@@ -1214,6 +1216,14 @@ typedef struct PendingSlruMirror
 static PendingSlruMirror pending_slru_mirrors[PAGESTORE_PENDING_SLRU_MIRRORS];
 static bool flushing_pending_slru_mirrors = false;
 
+static XLogRecPtr
+pagestore_slru_version_lsn(void)
+{
+	if (RecoveryInProgress())
+		return InvalidXLogRecPtr;
+	return GetXLogInsertRecPtr();
+}
+
 static void
 slru_page_key(SlruCtl ctl, PageStoreRelKey *key)
 {
@@ -1308,8 +1318,9 @@ pagestore_slru_flush_pending_mirrors(void)
 
 		PG_TRY();
 		{
-			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &pending->key,
-										 pending->block, pending->page);
+				pagestore_localsvc_obj_write_lsn(PS_KLASS_SLRU, &pending->key,
+												 pending->block, pending->page,
+												 pagestore_slru_version_lsn());
 			pending->valid = false;
 		}
 		PG_CATCH();
@@ -1375,7 +1386,9 @@ pagestore_slru_write_hook(SlruCtl ctl, int64 pageno, const char *page)
 	oldcontext = CurrentMemoryContext;
 	PG_TRY();
 	{
-		pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, (BlockNumber) pageno, page);
+			pagestore_localsvc_obj_write_lsn(PS_KLASS_SLRU, &key,
+											 (BlockNumber) pageno, page,
+											 pagestore_slru_version_lsn());
 	}
 	PG_CATCH();
 	{
@@ -1529,7 +1542,8 @@ pagestore_slru_truncate_hook(SlruCtl ctl, int64 cutoffPage)
 		{
 			memset(buf, 0, sizeof(buf));
 			memcpy(buf, &newcutoff, sizeof(newcutoff));
-			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, 0, buf);
+				pagestore_localsvc_obj_write_lsn(PS_KLASS_SLRU, &key, 0, buf,
+												 pagestore_slru_version_lsn());
 		}
 	}
 	PG_CATCH();
@@ -1543,6 +1557,12 @@ pagestore_slru_truncate_hook(SlruCtl ctl, int64 cutoffPage)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+}
+
+static void
+pagestore_slru_flush_pending_on_exit(int code, Datum arg)
+{
+	pagestore_slru_flush_pending_mirrors();
 }
 
 /*
@@ -1684,4 +1704,6 @@ _PG_init(void)
 	slru_page_read_hook = pagestore_slru_read_hook;
 	slru_page_exists_hook = pagestore_slru_exists_hook;
 	slru_page_truncate_hook = pagestore_slru_truncate_hook;
+
+	before_shmem_exit(pagestore_slru_flush_pending_on_exit, 0);
 }

@@ -1123,7 +1123,7 @@ page_lsn(const unsigned char *page)
  */
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page)
+			const unsigned char *page, uint64_t explicit_lsn)
 {
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
@@ -1149,9 +1149,11 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * pseudo-LSN).  Derive a monotonic version from the existing chain instead
 	 * (newest across ancestry + 1) so the latest object write always wins.
 	 */
-	if (key->klass == PS_KLASS_RELATION)
-		hdr.lsn = page_lsn(page);
-	else
+		if (key->klass == PS_KLASS_RELATION)
+			hdr.lsn = page_lsn(page);
+		else if (explicit_lsn != 0)
+			hdr.lsn = explicit_lsn;
+		else
 	{
 		PageVer    *cur;
 

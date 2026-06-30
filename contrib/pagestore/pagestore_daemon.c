@@ -65,20 +65,22 @@ handle_request(PsChannel *ch)
 	if (ps_handle_meta(ch))
 		return;
 
-	switch ((PsOpcode) ch->opcode)
-	{
-		case PS_OP_EXTEND:
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data) != 0)
-				ch->status = PS_STATUS_ERROR;
-			else
-				fork_grow(tl, &ch->key, ch->blocknum + 1);
+		switch ((PsOpcode) ch->opcode)
+		{
+			case PS_OP_EXTEND:
+				if (append_page(tl, &ch->key, ch->blocknum, ch->data,
+								ch->req_lsn) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					fork_grow(tl, &ch->key, ch->blocknum + 1);
 			break;
 
-		case PS_OP_WRITEV:
-			for (uint32_t i = 0; i < ch->nblocks; i++)
-			{
-				if (append_page(tl, &ch->key, ch->blocknum + i,
-								 ch->data + (size_t) i * page_size) != 0)
+			case PS_OP_WRITEV:
+				for (uint32_t i = 0; i < ch->nblocks; i++)
+				{
+					if (append_page(tl, &ch->key, ch->blocknum + i,
+									ch->data + (size_t) i * page_size,
+									ch->req_lsn) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;

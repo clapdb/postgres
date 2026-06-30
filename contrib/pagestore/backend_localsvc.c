@@ -652,6 +652,14 @@ void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 							 BlockNumber block, const void *page)
 {
+	pagestore_localsvc_obj_write_lsn(klass, key, block, page, 0);
+}
+
+void
+pagestore_localsvc_obj_write_lsn(uint32 klass, const PageStoreRelKey *key,
+								 BlockNumber block, const void *page,
+								 uint64 lsn)
+{
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
 
@@ -675,6 +683,7 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	ch->skip_fsync = 0;
+	ch->req_lsn = lsn;
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec(ch);
 }
