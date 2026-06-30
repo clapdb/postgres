@@ -828,8 +828,10 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "CHECK_BRANCH accepts idempotent retry metadata");
 	check(op_check_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
 		  "CHECK_BRANCH rejects mismatched ancestry for existing timeline");
-	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
-		  "reject re-creating an existing timeline id");
+	check(op_create_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "CREATE_BRANCH rejects re-creating existing timeline with mismatched ancestry");
+	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_OK,
+		  "re-create existing timeline id with identical ancestry is idempotent");
 	check(op_create_branch_status(9, 900, 1500) == PS_STATUS_ERROR,
 		  "reject branch off an undefined parent");
 	check(op_create_branch_status(9, 9, 1500) == PS_STATUS_ERROR,
