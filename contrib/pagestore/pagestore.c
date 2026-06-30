@@ -3068,7 +3068,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
-	if (!MultiXactIdIsValid(oldest_multi) || !MultiXactIdIsValid(next_multi) ||
+	if (!MultiXactIdIsValid(oldest_multi) ||
+		(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
 		(oldest_multi != next_multi &&
 		 !MultiXactIdPrecedes(oldest_multi, next_multi)))
 		ereport(ERROR,
@@ -3115,7 +3116,14 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		if (oldest_multi < next_multi)
 		{
 			off_page_lo = (int64) oldest_multi / PS_MXOFF_PER_PAGE;
+			/* include boundary page for next_multi when it is the first entry on a new
+			 * offsets page so next allocation can safely read page_next_multi; this
+			 * page already exists in the parent and must be preserved for the branch.
+			 */
 			off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+			if (next_multi != InvalidMultiXactId &&
+				next_multi % PS_MXOFF_PER_PAGE == 0)
+				off_page_hi++;
 			off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
 													ps_mxoff_reconstruct,
@@ -3133,6 +3141,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			{
 				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
 				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+				if (next_multi % PS_MXOFF_PER_PAGE == 0)
+					off_page_hi++;
 				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 														off_page_lo, off_page_hi,
 														ps_mxoff_reconstruct,
@@ -3150,16 +3160,28 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	else
 	{
 		off_page_lo = (int64) next_multi / PS_MXOFF_PER_PAGE;
+		/*
+		 * Even when the fork has no live multixacts, bootstrap must preserve page 0 so
+		 * simple-lru startup can read the page containing zero or wrap counters, and
+		 * preserve the page that tracks next_multi as the parent bootstrap state.
+		 */
+		pagestore_write_zero_slru_page(offdir, "multixact offsets",
+									   0);
 		pagestore_write_zero_slru_page(offdir, "multixact offsets",
 									   off_page_lo);
-		off_seeded++;
+		off_seeded += (off_page_lo == 0 ? 1 : 2);
 	}
 	if (next_member != oldest_member)
 	{
 		if (oldest_member < next_member)
 		{
 			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+			/* include boundary page for next_member when it is the first slot on a new
+			 * members page so the branch can allocate the next multixact immediately.
+			 */
 			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+			if (next_member % PS_MXMEMB_PER_PAGE == 0)
+				mem_page_hi++;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
 													ps_mxmemb_reconstruct,
@@ -3177,6 +3199,8 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			{
 				mem_page_lo = 0;
 				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+				if (next_member % PS_MXMEMB_PER_PAGE == 0)
+					mem_page_hi++;
 				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 														mem_page_lo, mem_page_hi,
 														ps_mxmemb_reconstruct,
@@ -3193,8 +3217,10 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	{
 		mem_page_lo = next_member / PS_MXMEMB_PER_PAGE;
 		pagestore_write_zero_slru_page(memdir, "multixact members",
+									   0);
+		pagestore_write_zero_slru_page(memdir, "multixact members",
 									   mem_page_lo);
-		mem_seeded++;
+		mem_seeded += (mem_page_lo == 0 ? 1 : 2);
 	}
 	seeded += off_seeded + mem_seeded;
 
