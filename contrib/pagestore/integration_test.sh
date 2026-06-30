@@ -387,7 +387,7 @@ boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 # parent's later stop/restart/checkpoints recycle it).  The base snapshot at C has T1
 # in-progress; the replay of (C, L] must mark it committed, so booting on the prepared
 # pg_xact -- not the parent's copied one -- is what makes row1 visible.
-SEEDOUT=$(mktemp -d)/seedout
+SEEDOUT=$(mktemp -d)
 seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
 	'3'::xid, '$boxid'::xid, '3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
@@ -551,7 +551,7 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE OR REPLACE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
