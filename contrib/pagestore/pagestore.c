@@ -4410,31 +4410,6 @@ pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
 }
 
 static bool
-pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
-									   uint32_t *parent_tl, XLogRecPtr *fork_lsn)
-{
-	const char *p;
-	uint32_t	format;
-
-	p = pagestore_manifest_skip_ws(manifest);
-	if (*p != '{')
-		return false;
-	p += strlen(p);
-	while (p > manifest &&
-		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
-		p--;
-	if (p == manifest || p[-1] != '}')
-		return false;
-
-	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
-		format == 1 &&
-		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
-		*new_tl != 0 &&
-		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
-		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
-}
-
-static bool
 pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 						   XLogRecPtr fork_lsn)
 {
@@ -4712,6 +4687,9 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest == NULL && parent_tl > 0)
+		ereport(ERROR,
+				(errmsg("target branch manifest is required when installing a branch with a branch parent")));
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
 	{
@@ -4722,8 +4700,8 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 			target_new_tl != (uint32_t) parent_tl)
 			ereport(ERROR,
 					(errmsg("target branch manifest does not match the requested branch identity")));
-		pagestore_localsvc_check_branch(target_new_tl, target_parent_tl,
-										(uint64) target_fork_lsn);
+		pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
+										  (uint64) target_fork_lsn);
 	}
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
