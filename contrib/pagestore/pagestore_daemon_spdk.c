@@ -112,6 +112,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_ZEROEXTEND:
 		case PS_OP_CREATE_BRANCH:
 		case PS_OP_CHECK_BRANCH:
+		case PS_OP_REQUIRE_BRANCH:
 		case PS_OP_EXTEND:
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
@@ -122,6 +123,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:
+		case PS_OP_REQUIRE_BRANCH:
 		case PS_OP_WAL_SIZE:
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
