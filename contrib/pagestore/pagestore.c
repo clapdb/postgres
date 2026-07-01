@@ -457,7 +457,9 @@ pagestore_read_at(PG_FUNCTION_ARGS)
  * parent's pages until it writes.  A compute can then run on the branch by
  * setting pagestore.timeline to new_timeline.
  */
-static void pagestore_write_legacy_branch_marker(int32 new_tl);
+static void pagestore_write_legacy_branch_marker(int32 new_tl,
+												 int32 parent_tl,
+												 XLogRecPtr fork_lsn);
 
 PG_FUNCTION_INFO_V1(pagestore_create_branch);
 
@@ -474,7 +476,7 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 									 (uint64) lsn);
-	pagestore_write_legacy_branch_marker(new_tl);
+	pagestore_write_legacy_branch_marker(new_tl, parent_tl, lsn);
 	PG_RETURN_VOID();
 }
 
@@ -4063,10 +4065,10 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 #define PAGESTORE_LEGACY_BRANCH_MARKER "pagestore_legacy_branch"
 
 static void
-pagestore_write_legacy_branch_marker(int32 new_tl)
+pagestore_write_legacy_branch_marker(int32 new_tl, int32 parent_tl,
+									 XLogRecPtr fork_lsn)
 {
 	char		path[MAXPGPATH];
-	char		tmppath[MAXPGPATH];
 	char		marker[256];
 	struct stat st;
 	int			len;
@@ -4077,7 +4079,7 @@ pagestore_write_legacy_branch_marker(int32 new_tl)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("data directory is not available")));
-	if (strlen(DataDir) + sizeof("/" PAGESTORE_LEGACY_BRANCH_MARKER ".tmp") > MAXPGPATH)
+	if (strlen(DataDir) + sizeof("/" PAGESTORE_LEGACY_BRANCH_MARKER) > MAXPGPATH)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("data directory path is too long")));
@@ -4087,10 +4089,10 @@ pagestore_write_legacy_branch_marker(int32 new_tl)
 				 errmsg("could not stat data directory \"%s\": %m", DataDir)));
 
 	len = snprintf(marker, sizeof(marker),
-				   "timeline=%u\n"
-				   "dev=%llu\n"
-				   "ino=%llu\n",
+				   "timeline=%u parent=%u fork=%X/%08X dev=%llu ino=%llu\n",
 				   (uint32) new_tl,
+				   (uint32) parent_tl,
+				   LSN_FORMAT_ARGS(fork_lsn),
 				   (unsigned long long) st.st_dev,
 				   (unsigned long long) st.st_ino);
 	if (len < 0 || len >= (int) sizeof(marker))
@@ -4099,16 +4101,14 @@ pagestore_write_legacy_branch_marker(int32 new_tl)
 				 errmsg("legacy branch marker is too large")));
 
 	snprintf(path, sizeof(path), "%s/%s", DataDir, PAGESTORE_LEGACY_BRANCH_MARKER);
-	snprintf(tmppath, sizeof(tmppath), "%s/%s.tmp", DataDir,
-			 PAGESTORE_LEGACY_BRANCH_MARKER);
-	fd = OpenTransientFilePerm(tmppath,
-							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+	fd = OpenTransientFilePerm(path,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY,
 							   pg_file_create_mode);
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create legacy branch marker \"%s\": %m",
-						tmppath)));
+						path)));
 	while (done < len)
 	{
 		ssize_t		written;
@@ -4123,7 +4123,7 @@ pagestore_write_legacy_branch_marker(int32 new_tl)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not write legacy branch marker \"%s\": %m",
-							tmppath)));
+							path)));
 		}
 		done += written;
 	}
@@ -4133,32 +4133,27 @@ pagestore_write_legacy_branch_marker(int32 new_tl)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync legacy branch marker \"%s\": %m",
-						tmppath)));
+						path)));
 	}
 	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close legacy branch marker \"%s\": %m",
-						tmppath)));
-	if (rename(tmppath, path) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not publish legacy branch marker \"%s\": %m",
 						path)));
 	fsync_fname(DataDir, true);
 }
 
 static bool
-pagestore_legacy_branch_marker_matches(void)
+pagestore_legacy_branch_marker_matches(uint32_t *parent_tl,
+									   XLogRecPtr *fork_lsn)
 {
 	char		path[MAXPGPATH];
 	FILE	   *file;
-	char		marker[256];
+	char		line[256];
 	uint32_t	timeline;
 	unsigned long long dev;
 	unsigned long long ino;
 	struct stat st;
-	size_t		nread;
 
 	if (DataDir == NULL ||
 		strlen(DataDir) + sizeof("/" PAGESTORE_LEGACY_BRANCH_MARKER) > MAXPGPATH)
@@ -4171,21 +4166,42 @@ pagestore_legacy_branch_marker_matches(void)
 	file = AllocateFile(path, PG_BINARY_R);
 	if (file == NULL)
 		return false;
-	nread = fread(marker, 1, sizeof(marker) - 1, file);
+	while (fgets(line, sizeof(line), file) != NULL)
+	{
+		uint32_t	entry_timeline;
+		uint32_t	entry_parent;
+		uint32_t	fork_hi;
+		uint32_t	fork_lo;
+		unsigned long long entry_dev;
+		unsigned long long entry_ino;
+
+		if (sscanf(line,
+				   "timeline=%u parent=%u fork=%X/%X dev=%llu ino=%llu",
+				   &entry_timeline, &entry_parent, &fork_hi, &fork_lo,
+				   &entry_dev, &entry_ino) != 6)
+			continue;
+		if (entry_timeline == pagestore_localsvc_timeline() &&
+			entry_dev == (unsigned long long) st.st_dev &&
+			entry_ino == (unsigned long long) st.st_ino)
+		{
+			timeline = entry_timeline;
+			dev = entry_dev;
+			ino = entry_ino;
+			*parent_tl = entry_parent;
+			*fork_lsn = ((uint64) fork_hi << 32) | fork_lo;
+			FreeFile(file);
+			return timeline == pagestore_localsvc_timeline() &&
+				dev == (unsigned long long) st.st_dev &&
+				ino == (unsigned long long) st.st_ino;
+		}
+	}
 	if (ferror(file))
 	{
 		FreeFile(file);
 		return false;
 	}
-	marker[nread] = '\0';
 	FreeFile(file);
-
-	if (sscanf(marker, "timeline=%u\ndev=%llu\nino=%llu\n",
-			   &timeline, &dev, &ino) != 3)
-		return false;
-	return timeline == pagestore_localsvc_timeline() &&
-		dev == (unsigned long long) st.st_dev &&
-		ino == (unsigned long long) st.st_ino;
+	return false;
 }
 
 static void
@@ -4684,7 +4700,9 @@ pagestore_validate_datadir_branch_manifest(void)
 	uint32_t	format;
 	uint32_t	new_tl;
 	uint32_t	parent_tl;
+	uint32_t	legacy_parent_tl;
 	XLogRecPtr	fork_lsn;
+	XLogRecPtr	legacy_fork_lsn;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -4695,10 +4713,19 @@ pagestore_validate_datadir_branch_manifest(void)
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
 	{
-		if (pagestore_localsvc_timeline() != 0 &&
-			!pagestore_legacy_branch_marker_matches())
-			ereport(FATAL,
-					(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
+		if (pagestore_localsvc_timeline() != 0)
+		{
+			if (!pagestore_branch_backend_active())
+				ereport(FATAL,
+						(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
+			if (!pagestore_legacy_branch_marker_matches(&legacy_parent_tl,
+														&legacy_fork_lsn))
+				ereport(FATAL,
+						(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
+			pagestore_localsvc_check_branch(pagestore_localsvc_timeline(),
+											legacy_parent_tl,
+											(uint64) legacy_fork_lsn);
+		}
 		return;
 	}
 	if (!pagestore_branch_backend_active())
