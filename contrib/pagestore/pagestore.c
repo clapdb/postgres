@@ -4565,11 +4565,13 @@ pagestore_validate_datadir_branch_manifest(void)
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
 	{
-		if (pagestore_localsvc_timeline() != 0)
-			ereport(FATAL,
-					(errmsg("pagestore.timeline requires pagestore_branch.manifest"),
-					 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
-		return;					/* legacy/non-branch datadir */
+		/*
+		 * Legacy pagestore_create_branch() switches this same datadir between
+		 * timelines and does not install a manifest.  Preserve that documented
+		 * flow; prepared branch datadirs still get fail-closed identity checks
+		 * whenever a pagestore_branch.manifest is present.
+		 */
+		return;
 	}
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
