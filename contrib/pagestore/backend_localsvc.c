@@ -76,6 +76,12 @@ ls_detach(int code, Datum arg)
 	}
 }
 
+void
+pagestore_localsvc_detach(void)
+{
+	ls_detach(0, (Datum) 0);
+}
+
 static void
 ls_attach(void)
 {
@@ -536,6 +542,19 @@ pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_CHECK_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec(ch);
+}
+
+void
+pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
+								  uint64 branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_REQUIRE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;

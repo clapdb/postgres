@@ -4478,6 +4478,32 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	return true;
 }
 
+static bool
+pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
+									   uint32_t *parent_tl,
+									   XLogRecPtr *fork_lsn)
+{
+	uint32_t	format;
+	const char *p;
+
+	p = pagestore_manifest_skip_ws(manifest);
+	if (*p != '{')
+		return false;
+	p += strlen(p);
+	while (p > manifest &&
+		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
+		p--;
+	if (p == manifest || p[-1] != '}')
+		return false;
+
+	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
+		format == 1 &&
+		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
+		*new_tl != 0 &&
+		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
+		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+}
+
 static inline bool
 pagestore_branch_backend_active(void)
 {
@@ -4526,7 +4552,6 @@ static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
-	uint32_t	format;
 	uint32_t	new_tl;
 	uint32_t	parent_tl;
 	XLogRecPtr	fork_lsn;
@@ -4543,19 +4568,16 @@ pagestore_validate_datadir_branch_manifest(void)
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
-	if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-		format != 1 ||
-		!pagestore_manifest_get_uint_token(manifest, "new_timeline", &new_tl) ||
-		new_tl == 0 ||
-		!pagestore_manifest_get_uint_token(manifest, "parent_timeline", &parent_tl) ||
-		!pagestore_manifest_get_lsn_token(manifest, "fork_lsn", &fork_lsn))
+	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
+												&fork_lsn))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
 	if (new_tl != pagestore_localsvc_timeline())
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
-	pagestore_localsvc_check_branch(new_tl, parent_tl, (uint64) fork_lsn);
+	pagestore_localsvc_require_branch(new_tl, parent_tl, (uint64) fork_lsn);
+	pagestore_localsvc_detach();
 }
 
 static void
