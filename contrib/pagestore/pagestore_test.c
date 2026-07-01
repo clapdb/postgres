@@ -372,6 +372,19 @@ op_check_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 	return cl_exec()->status;
 }
 
+static int
+op_require_branch_status(uint32_t new_tl, uint32_t parent_tl,
+						 uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_REQUIRE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	return cl_exec()->status;
+}
+
 /* Write one page on a specific timeline. */
 static void
 op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
@@ -828,6 +841,14 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "CHECK_BRANCH accepts idempotent retry metadata");
 	check(op_check_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
 		  "CHECK_BRANCH rejects mismatched ancestry for existing timeline");
+	check(op_check_branch_status(9, 0, 1500) == PS_STATUS_OK,
+		  "CHECK_BRANCH accepts a valid not-yet-created branch request");
+	check(op_require_branch_status(1, 0, 1500) == PS_STATUS_OK,
+		  "REQUIRE_BRANCH accepts existing matching timeline metadata");
+	check(op_require_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "REQUIRE_BRANCH rejects mismatched existing timeline metadata");
+	check(op_require_branch_status(9, 0, 1500) == PS_STATUS_ERROR,
+		  "REQUIRE_BRANCH rejects not-yet-created branch timelines");
 	check(op_create_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
 		  "CREATE_BRANCH rejects re-creating existing timeline with mismatched ancestry");
 	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_OK,
