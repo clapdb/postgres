@@ -2445,6 +2445,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+	bool		deactivated = false;
 	bool		commit_ts_active = true;
 
 	(void) horizon_hi;
@@ -2562,6 +2563,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 				if (!xlrec.track_commit_timestamp)
 				{
+					deactivated = true;
 					commit_ts_active = false;
 				}
 				else
@@ -2619,6 +2621,9 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
+	if (deactivated)
+		ereport(ERROR,
+				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
 
 check_required_pages:
 	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
