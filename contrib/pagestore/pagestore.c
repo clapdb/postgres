@@ -457,6 +457,19 @@ pagestore_read_at(PG_FUNCTION_ARGS)
  * parent's pages until it writes.  A compute can then run on the branch by
  * setting pagestore.timeline to new_timeline.
  */
+static void pagestore_write_branch_manifest(const char *target_dir,
+								int32 new_tl, int32 parent_tl,
+								XLogRecPtr base, XLogRecPtr target,
+								TransactionId oldest_xid,
+								TransactionId next_xid,
+								TransactionId oldest_commit_ts_xid,
+								TransactionId next_commit_ts_xid,
+								MultiXactId oldest_multi,
+								MultiXactId next_multi,
+								int64 oldest_member,
+								int64 next_member,
+								int64 seeded_pages);
+
 PG_FUNCTION_INFO_V1(pagestore_create_branch);
 
 Datum
@@ -472,6 +485,14 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 									 (uint64) lsn);
+	pagestore_write_branch_manifest(DataDir, new_tl, parent_tl, lsn, lsn,
+									InvalidTransactionId,
+									InvalidTransactionId,
+									InvalidTransactionId,
+									InvalidTransactionId,
+									InvalidMultiXactId,
+									InvalidMultiXactId,
+									0, 0, 0);
 	PG_RETURN_VOID();
 }
 
@@ -4565,12 +4586,9 @@ pagestore_validate_datadir_branch_manifest(void)
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
 	{
-		/*
-		 * Legacy pagestore_create_branch() switches this same datadir between
-		 * timelines and does not install a manifest.  Preserve that documented
-		 * flow; prepared branch datadirs still get fail-closed identity checks
-		 * whenever a pagestore_branch.manifest is present.
-		 */
+		if (pagestore_localsvc_timeline() != 0)
+			ereport(FATAL,
+					(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
 		return;
 	}
 	if (!pagestore_branch_backend_active())
@@ -4584,6 +4602,8 @@ pagestore_validate_datadir_branch_manifest(void)
 		!pagestore_manifest_get_lsn_token(manifest, "fork_lsn", &fork_lsn))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
+	if (pagestore_localsvc_timeline() == 0)
+		return;
 	if (new_tl != pagestore_localsvc_timeline())
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
