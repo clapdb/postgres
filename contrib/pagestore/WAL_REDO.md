@@ -89,6 +89,7 @@ read pages at an LSN.
 
 ## Known scope boundaries
 
-Until 3c/3d land, branches remain single-compute-at-a-time and WAL/SLRU/control
-are not fully branched (see compute_on_branch_demo.sh).  The redo worker is the
-piece that removes those boundaries.
+Branch computes must be booted through the prepared branch manifest/install
+flow so WAL/SLRU/control state matches the fork point.  The older same-PGDATA
+timeline-switch demo has been removed because branch timeline startup now fails
+closed without `pagestore_branch.manifest`.
