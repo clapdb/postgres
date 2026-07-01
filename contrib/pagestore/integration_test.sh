@@ -446,6 +446,7 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$ctsC');" >/dev/null
 # data-writing xacts so the commit (and its timestamp) is sync-flushed for the WAL reader
 ctsA=$($P -c "WITH w AS (INSERT INTO cts VALUES (1) RETURNING 1) SELECT pg_current_xact_id();")
 ctsL=$($P -c "SELECT pg_current_wal_lsn();")                      # L: after xidA's commit
+cts_next=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 ctsB=$($P -c "WITH w AS (INSERT INTO cts VALUES (2) RETURNING 1) SELECT pg_current_xact_id();")
 # oldest='3' (below all our xids) disables the horizon check for these baseline assertions
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', '3'::xid) IS NOT NULL;")" "t" \
@@ -460,7 +461,6 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsB'::xid, '$ctsC', '$ctsL',
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL', ('$ctsA'::xid::text::bigint + 1)::text::xid) IS NULL;")" "t" \
 	"commit-ts: a xid below the as-of-L horizon (oldestCommitTsXid) returns NULL despite stale page bytes"
 CTSSEED=$(mktemp -d)
-cts_next=$(($ctsB + 1))
 ctsSeeded=$($P -c "SELECT pagestore_seed_commit_ts('$CTSSEED', '$ctsC', '$ctsL', '3'::xid, '$cts_next'::text::xid);")
 assert "$([ "${ctsSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"commit-ts seed materialized branch pg_commit_ts as-of L ($ctsSeeded page(s))"
