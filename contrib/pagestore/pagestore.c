@@ -2427,6 +2427,7 @@ pagestore_multixact_members_page_asof(PG_FUNCTION_ARGS)
 static bool
 ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 								   int64 page_hi, int64 req_lo, int64 req_hi,
+								   int64 horizon_lo, int64 horizon_hi,
 								   XLogRecPtr base_lsn,
 								   XLogRecPtr target_lsn)
 {
@@ -2445,6 +2446,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+
+	(void) horizon_hi;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
@@ -2546,6 +2549,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 					}
 				}
 			}
+			continue;
 		}
 		else if (rmid == RM_XLOG_ID)
 		{
@@ -2556,6 +2560,14 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 				if (!xlrec.track_commit_timestamp)
 					deactivated = true;
+				else if (horizon_lo >= page_lo && horizon_lo <= page_hi)
+				{
+					idx = horizon_lo - page_lo;
+					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+					present[idx] = true;
+					zeroed[idx] = true;
+					truncated[idx] = false;
+				}
 			}
 			continue;
 		}
@@ -2617,8 +2629,10 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -2632,6 +2646,7 @@ static bool
 ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 								int64 page_lo, int64 page_hi,
 								int64 req_lo, int64 req_hi,
+								int64 horizon_lo, int64 horizon_hi,
 								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
 {
 	PageStoreRelKey key;
@@ -2645,6 +2660,9 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+
+	(void) horizon_lo;
+	(void) horizon_hi;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
@@ -2790,8 +2808,10 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -2805,6 +2825,7 @@ static bool
 ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 								int64 page_lo, int64 page_hi,
 								int64 req_lo, int64 req_hi,
+								int64 horizon_lo, int64 horizon_hi,
 								XLogRecPtr base_lsn, XLogRecPtr target_lsn)
 {
 	PageStoreRelKey key;
@@ -2818,6 +2839,9 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+
+	(void) horizon_lo;
+	(void) horizon_hi;
 
 	if (target_lsn < base_lsn)
 		ereport(ERROR,
@@ -2952,8 +2976,10 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	if (reader != NULL)
+		XLogReaderFree(reader);
+	if (pd != NULL)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -2963,6 +2989,7 @@ check_required_pages:
 typedef bool (*SlruPageRangeReconstructFn) (char *pages, bool *present,
 										   int64 page_lo, int64 page_hi,
 										   int64 req_lo, int64 req_hi,
+										   int64 horizon_lo, int64 horizon_hi,
 										   XLogRecPtr base_lsn,
 										   XLogRecPtr target_lsn);
 
@@ -3042,15 +3069,12 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 {
 	char		dstdir[MAXPGPATH];
 	char		stagedir[MAXPGPATH];
-	char	   *pages;
-	bool	   *present;
 	int64		seg_lo,
 				seg_hi,
 				req_lo,
 				req_hi,
 				seg,
 				p;
-	int			np;
 	int64		seeded = 0;
 	int			pathlen;
 
@@ -3064,26 +3088,7 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	req_lo = page_lo;
 	req_hi = page_hi;
 	seg_lo = req_lo / SLRU_PAGES_PER_SEGMENT;
-	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
 	seg_hi = req_hi / SLRU_PAGES_PER_SEGMENT;
-	page_hi = req_hi;
-	np = (int) (page_hi - page_lo + 1);
-
-	pages = palloc((Size) np * BLCKSZ);
-	present = palloc0(np * sizeof(bool));
-	for (p = 0; p < np; p++)
-		memset(pages + p * BLCKSZ, 0, BLCKSZ);
-	if (!reconstruct(pages, present, page_lo, page_hi, req_lo, req_hi,
-					 base, target))
-	{
-		ereport(ERROR,
-				(errmsg("pagestore: failed to reconstruct %s pages in [%lld, %lld] as of %X/%08X",
-						label, (long long) req_lo, (long long) req_hi,
-						LSN_FORMAT_ARGS(target))));
-	}
-	for (p = 0; p < np; p++)
-		if (page_lo + p < req_lo)
-			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -3115,15 +3120,47 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 		char		segpath[MAXPGPATH];
 		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
 		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
+		int64		chunk_req_lo;
+		int64		chunk_req_hi;
+		int			np;
+		char	   *pages;
+		bool	   *present;
 		int			fd;
 		int64		trim_last = last;
 
-		if (trim_last > page_hi)
-			trim_last = page_hi;
-		while (trim_last >= first && !present[trim_last - page_lo])
+		if (last > req_hi)
+			last = req_hi;
+		chunk_req_lo = Max(first, req_lo);
+		chunk_req_hi = Min(last, req_hi);
+		np = (int) (last - first + 1);
+
+		pages = palloc((Size) np * BLCKSZ);
+		present = palloc0(np * sizeof(bool));
+		for (p = 0; p < np; p++)
+			memset(pages + p * BLCKSZ, 0, BLCKSZ);
+		if (!reconstruct(pages, present, first, last,
+						 chunk_req_lo, chunk_req_hi,
+						 req_lo, req_hi, base, target))
+		{
+			ereport(ERROR,
+					(errmsg("pagestore: failed to reconstruct %s pages in [%lld, %lld] as of %X/%08X",
+							label, (long long) chunk_req_lo,
+							(long long) chunk_req_hi,
+							LSN_FORMAT_ARGS(target))));
+		}
+		for (p = 0; p < np; p++)
+			if (first + p < req_lo)
+				memset(pages + p * BLCKSZ, 0, BLCKSZ);
+
+		trim_last = last;
+		while (trim_last >= first && !present[trim_last - first])
 			trim_last--;
 		if (trim_last < first)
+		{
+			pfree(present);
+			pfree(pages);
 			continue;
+		}
 
 		pathlen = snprintf(segpath, sizeof(segpath), "%s/%04X",
 							publish_dir ? stagedir : dstdir, (unsigned int) seg);
@@ -3141,8 +3178,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 			const char *src;
 			char		zerobuf[BLCKSZ];
 
-			if (present[p - page_lo])
-				src = pages + (p - page_lo) * BLCKSZ;
+			if (present[p - first])
+				src = pages + (p - first) * BLCKSZ;
 			else
 			{
 				memset(zerobuf, 0, sizeof(zerobuf));
@@ -3181,6 +3218,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 					(errcode_for_file_access(),
 					 errmsg("could not close branch %s segment \"%s\": %m",
 							label, segpath)));
+		pfree(present);
+		pfree(pages);
 	}
 	fsync_fname(publish_dir ? stagedir : dstdir, true);
 	if (publish_dir)
@@ -3196,8 +3235,6 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
 	}
 	fsync_fname(target_dir, true);
 
-	pfree(present);
-	pfree(pages);
 	return seeded;
 }
 
@@ -3721,12 +3758,7 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		if (oldest_member < next_member)
 		{
 			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-			/* include boundary page for next_member when it is the first slot on a new
-			 * members page so the branch can allocate the next multixact immediately.
-			 */
 			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-			if (next_member % PS_MXMEMB_PER_PAGE == 0)
-				mem_page_hi++;
 			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
 													ps_mxmemb_seed_reconstruct_range,
@@ -3744,8 +3776,6 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			{
 				mem_page_lo = 0;
 				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-				if (next_member % PS_MXMEMB_PER_PAGE == 0)
-					mem_page_hi++;
 				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
 													mem_page_lo, mem_page_hi,
 													ps_mxmemb_seed_reconstruct_range,
