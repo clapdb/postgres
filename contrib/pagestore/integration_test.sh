@@ -402,7 +402,12 @@ cp -a "$DATA" "$BRANCHDATA"
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
-$P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA');" >/dev/null
+if $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA');" >/dev/null; then
+	echo "ok   - installed prepared branch artifacts into the branch datadir"
+else
+	echo "FAIL - could not install prepared branch artifacts"
+	fail=1
+fi
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1

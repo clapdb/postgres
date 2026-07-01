@@ -4657,7 +4657,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				 errmsg("could not clear existing branch artifact staging file \"%s\": %m", stage)));
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", false);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", false);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
 									"pagestore_branch.manifest", true);
 
