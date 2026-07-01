@@ -4004,11 +4004,11 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 													  "pg_multixact");
 		fsync_fname(target_dir, true);
 		if (!rmtree(staging_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
 		if (!rmtree(backup_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding backup area \"%s\"", backup_root)));
 	}
