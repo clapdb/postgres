@@ -4360,56 +4360,6 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 }
 
 static bool
-pagestore_manifest_get_uint_token(const char *manifest, const char *key,
-								  uint32_t *value)
-{
-	const char *field = pagestore_manifest_find_unique_field(manifest, key);
-	char	   *endptr;
-	unsigned long long parsed;
-
-	if (field == NULL || *field == '"')
-		return false;
-	if (*field < '0' || *field > '9')
-		return false;
-	errno = 0;
-	parsed = strtoull(field, &endptr, 10);
-	if (errno != 0 || endptr == field || parsed > UINT32_MAX)
-		return false;
-	if (!pagestore_manifest_value_delimited(endptr))
-		return false;
-	*value = (uint32_t) parsed;
-	return true;
-}
-
-static bool
-pagestore_manifest_has_lsn_token(const char *manifest, const char *key)
-{
-	const char *field = pagestore_manifest_find_unique_field(manifest, key);
-	bool		saw_hi = false;
-	bool		saw_lo = false;
-
-	if (field == NULL || *field != '"')
-		return false;
-	field++;
-	while (isxdigit((unsigned char) *field))
-	{
-		saw_hi = true;
-		field++;
-	}
-	if (!saw_hi || *field != '/')
-		return false;
-	field++;
-	while (isxdigit((unsigned char) *field))
-	{
-		saw_lo = true;
-		field++;
-	}
-	if (!saw_lo || *field != '"')
-		return false;
-	return pagestore_manifest_value_delimited(field + 1);
-}
-
-static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
