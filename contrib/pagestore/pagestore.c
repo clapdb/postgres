@@ -2446,6 +2446,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+	bool		commit_ts_active = true;
 
 	(void) horizon_hi;
 
@@ -2471,6 +2472,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		if (!base_found[p])
 			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 	}
+	if (horizon_lo >= page_lo && horizon_lo <= page_hi)
+		commit_ts_active = base_found[horizon_lo - page_lo];
 
 	if (target_lsn == base_lsn)
 		goto check_required_pages;
@@ -2559,14 +2562,23 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 				if (!xlrec.track_commit_timestamp)
-					deactivated = true;
-				else if (horizon_lo >= page_lo && horizon_lo <= page_hi)
 				{
-					idx = horizon_lo - page_lo;
-					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
-					present[idx] = true;
-					zeroed[idx] = true;
-					truncated[idx] = false;
+					deactivated = true;
+					commit_ts_active = false;
+				}
+				else
+				{
+					if (!commit_ts_active &&
+						horizon_lo >= page_lo && horizon_lo <= page_hi)
+					{
+						idx = horizon_lo - page_lo;
+						memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+						present[idx] = true;
+						zeroed[idx] = true;
+						truncated[idx] = false;
+					}
+					commit_ts_active = true;
+					deactivated = false;
 				}
 			}
 			continue;
@@ -3595,8 +3607,13 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 		TransactionIdFollows(oldest_xid, next_xid))
 		ereport(ERROR,
 				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
-	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
-	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
+	if (oldest_xid == next_xid)
+		page_lo = page_hi = ((int64) next_xid / PS_CTS_XACTS_PER_PAGE);
+	else
+	{
+		page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
+		page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
+	}
 	if (page_hi < page_lo)
 		ereport(ERROR,
 				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; commit-ts seeding across wrap is not supported",
