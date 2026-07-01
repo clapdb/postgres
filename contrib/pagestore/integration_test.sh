@@ -404,7 +404,12 @@ $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
 assert "$bad_install" "error" "prepared branch install rejects the wrong branch identity"
-$P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null
+if $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null; then
+	echo "ok   - installed prepared branch artifacts into the branch datadir"
+else
+	echo "FAIL - could not install prepared branch artifacts"
+	fail=1
+fi
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
@@ -623,6 +628,21 @@ assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$
 	"branch manifest validator accepts the prepared branch identity"
 assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 3, 0, '$mxL');")" "f" \
 	"branch manifest validator rejects the wrong branch timeline"
+cp "$PREPSEED/pagestore_branch.manifest" "$PREPSEED/pagestore_branch.manifest.good"
+cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
+{ "wrapper": { "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "$mxL" } }
+EOF
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects nested manifest fields"
+cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
+{ "format": 1, "new_timeline": 0, "parent_timeline": 0, "fork_lsn": "$mxL" }
+EOF
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 0, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects timeline zero"
+printf '{ "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "%s" }\0{ "format": 2 }\n' "$mxL" > "$PREPSEED/pagestore_branch.manifest"
+nulManifest=$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');" 2>/dev/null || echo ERROR)
+assert "$nulManifest" "ERROR" "branch manifest validator rejects embedded NUL bytes"
+mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manifest"
 cp "$PREPSEED/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "FAIL - branch startup rejected a manifest/timeline mismatch"
