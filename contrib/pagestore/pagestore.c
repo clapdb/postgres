@@ -2671,6 +2671,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 	bool	   *base_found;
 	bool	   *zeroed;
 	bool	   *truncated;
+	int64		pre_initialized_offsets_page = -1;
 
 	(void) horizon_lo;
 	(void) horizon_hi;
@@ -2736,7 +2737,9 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 			int64		idx;
 
 			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
-			if (zp >= page_lo && zp <= page_hi)
+			if (zp == pre_initialized_offsets_page)
+				pre_initialized_offsets_page = -1;
+			else if (zp >= page_lo && zp <= page_hi)
 			{
 				idx = zp - page_lo;
 				memset(pages + idx * BLCKSZ, 0, BLCKSZ);
@@ -2756,6 +2759,8 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 			if (next == 0)
 				next = 1;
 			succ = (xlrec->mid == MaxMultiXactId) ? FirstMultiXactId : xlrec->mid + 1;
+			if (pre_initialized_offsets_page != -1)
+				pre_initialized_offsets_page = -1;
 
 			mpageno = (int64) (xlrec->mid / PS_MXOFF_PER_PAGE);
 			if (mpageno >= page_lo && mpageno <= page_hi)
@@ -2773,6 +2778,8 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 				ps_mxoff_set(pages + idx * BLCKSZ, mpageno, succ, next);
 				present[idx] = true;
 			}
+			if ((int64) (xlrec->mid / PS_MXOFF_PER_PAGE) != mpageno)
+				pre_initialized_offsets_page = mpageno;
 		}
 		else if (info == XLOG_MULTIXACT_TRUNCATE_ID)
 		{
