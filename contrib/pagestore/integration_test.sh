@@ -411,6 +411,22 @@ cp "$SEEDOUT/pagestore_branch.manifest" "$BADSEED/pagestore_branch.manifest"
 missing_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$BADSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$missing_artifact" "error" "prepared branch install rejects a missing pg_xact artifact"
 rm -rf "$BADSEED"
+UNPREPARED=$(mktemp -d)/branch
+cp -a "$BRANCHDATA" "$UNPREPARED"
+cat >> "$UNPREPARED/postgresql.conf" <<EOF
+pagestore.timeline = 1
+port = $PORT2
+archive_mode = off
+EOF
+if "$BIN/pg_ctl" -D "$UNPREPARED" -l "$UNPREPARED/server.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - branch startup accepted an unprepared datadir without a manifest"
+	fail=1
+	"$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
+else
+	echo "ok   - branch startup rejects an unprepared datadir without a manifest"
+fi
+rm -rf "$(dirname "$UNPREPARED")"
+UNPREPARED=
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
