@@ -2439,7 +2439,6 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	XLogRecPtr	scanned = base_lsn;
 	XLogRecPtr	readfrom;
 	int64		np = page_hi - page_lo + 1;
-	bool		deactivated = false;
 	XLogRecPtr	reached_from;
 	TransactionId xid;
 	TransactionId prepared_xid;
@@ -2563,7 +2562,6 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 				if (!xlrec.track_commit_timestamp)
 				{
-					deactivated = true;
 					commit_ts_active = false;
 				}
 				else
@@ -2621,9 +2619,6 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
-	if (deactivated)
-		ereport(ERROR,
-				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
 
 check_required_pages:
 	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
@@ -2648,6 +2643,21 @@ check_required_pages:
 	pfree(zeroed);
 	pfree(base_found);
 	return true;
+}
+
+static bool
+ps_mxoff_page_precedes(int64 page1, int64 page2)
+{
+	MultiXactId multi1;
+	MultiXactId multi2;
+
+	multi1 = ((MultiXactId) page1) * PS_MXOFF_PER_PAGE;
+	multi1 += FirstMultiXactId + 1;
+	multi2 = ((MultiXactId) page2) * PS_MXOFF_PER_PAGE;
+	multi2 += FirstMultiXactId + 1;
+
+	return MultiXactIdPrecedes(multi1, multi2) &&
+		MultiXactIdPrecedes(multi1, multi2 + PS_MXOFF_PER_PAGE - 1);
 }
 
 /* Load and replay multixact offsets for all requested pages in one WAL pass, marking each
@@ -2738,7 +2748,16 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 
 			memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
 			if (zp == pre_initialized_offsets_page)
+			{
+				if (zp >= page_lo && zp <= page_hi)
+				{
+					idx = zp - page_lo;
+					present[idx] = true;
+					zeroed[idx] = true;
+					truncated[idx] = false;
+				}
 				pre_initialized_offsets_page = -1;
+			}
 			else if (zp >= page_lo && zp <= page_hi)
 			{
 				idx = zp - page_lo;
@@ -2785,17 +2804,17 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 		{
 			xl_multixact_truncate xlrec;
 			MultiXactId cutoff;
-			int64		cutoff_seg;
+			int64		cutoff_page;
 
 			memcpy(&xlrec, XLogRecGetData(reader), SizeOfMultiXactTruncate);
 			cutoff = (xlrec.endTruncOff == FirstMultiXactId) ? MaxMultiXactId
 				: xlrec.endTruncOff - 1;
-			cutoff_seg = ((int64) cutoff / PS_MXOFF_PER_PAGE) / SLRU_PAGES_PER_SEGMENT;
+			cutoff_page = (int64) cutoff / PS_MXOFF_PER_PAGE;
 			for (int64 p = 0; p < np; p++)
 			{
-				int64		pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
+				int64		page = page_lo + p;
 
-				if (pageseg < cutoff_seg)
+				if (ps_mxoff_page_precedes(page, cutoff_page))
 				{
 					present[p] = false;
 					truncated[p] = true;
