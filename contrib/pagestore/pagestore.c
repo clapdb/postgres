@@ -2578,7 +2578,6 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 						truncated[idx] = false;
 					}
 					commit_ts_active = true;
-					deactivated = false;
 				}
 			}
 			continue;
@@ -3013,7 +3012,7 @@ typedef bool (*SlruPageRangeReconstructFn) (char *pages, bool *present,
 					 errmsg("branch target directory path is too long"))); \
 	} while (0)
 
-static void
+static int64
 pagestore_write_zero_slru_page(const char *slru_dir, const char *label,
 							   int64 pageno)
 {
@@ -3070,6 +3069,7 @@ pagestore_write_zero_slru_page(const char *slru_dir, const char *label,
 				 errmsg("could not close branch %s bootstrap segment \"%s\": %m",
 						label, segpath)));
 	fsync_fname(slru_dir, true);
+	return pageno - first + 1;
 }
 
 static int64
@@ -3736,12 +3736,17 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 													off_page_lo, off_page_hi,
 													ps_mxoff_seed_reconstruct_range,
 													base, target, "multixact offsets", false);
-			if (next_multi > FirstMultiXactId)
+			if (next_multi >= FirstMultiXactId)
 			{
 				off_page_lo = (int64) FirstMultiXactId / PS_MXOFF_PER_PAGE;
-				off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
-				if (next_multi % PS_MXOFF_PER_PAGE == 0)
-					off_page_hi++;
+				if (next_multi == FirstMultiXactId)
+					off_page_hi = off_page_lo;
+				else
+				{
+					off_page_hi = (int64) (next_multi - 1) / PS_MXOFF_PER_PAGE;
+					if (next_multi % PS_MXOFF_PER_PAGE == 0)
+						off_page_hi++;
+				}
 				off_seeded += pagestore_seed_slru_pages(mxstage, "offsets",
 													off_page_lo, off_page_hi,
 													ps_mxoff_seed_reconstruct_range,
@@ -3750,9 +3755,9 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			else
 			{
 				off_page_lo = (int64) next_multi / PS_MXOFF_PER_PAGE;
-				pagestore_write_zero_slru_page(offdir, "multixact offsets",
-											   off_page_lo);
-				off_seeded++;
+				off_seeded += pagestore_write_zero_slru_page(offdir,
+															 "multixact offsets",
+															 off_page_lo);
 			}
 		}
 	}
@@ -3764,11 +3769,12 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		 * simple-lru startup can read the page containing zero or wrap counters, and
 		 * preserve the page that tracks next_multi as the parent bootstrap state.
 		 */
-		pagestore_write_zero_slru_page(offdir, "multixact offsets",
-									   0);
-		pagestore_write_zero_slru_page(offdir, "multixact offsets",
-									   off_page_lo);
-		off_seeded += (off_page_lo == 0 ? 1 : 2);
+		off_seeded += pagestore_write_zero_slru_page(offdir,
+													 "multixact offsets", 0);
+		if (off_page_lo != 0)
+			off_seeded += pagestore_write_zero_slru_page(offdir,
+														 "multixact offsets",
+														 off_page_lo);
 	}
 	if (next_member != oldest_member)
 	{
@@ -3800,19 +3806,21 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 			}
 			else
 			{
-				pagestore_write_zero_slru_page(memdir, "multixact members", 0);
-				mem_seeded++;
+				mem_seeded += pagestore_write_zero_slru_page(memdir,
+															 "multixact members",
+															 0);
 			}
 		}
 	}
 	else
 	{
 		mem_page_lo = next_member / PS_MXMEMB_PER_PAGE;
-		pagestore_write_zero_slru_page(memdir, "multixact members",
-									   0);
-		pagestore_write_zero_slru_page(memdir, "multixact members",
-									   mem_page_lo);
-		mem_seeded += (mem_page_lo == 0 ? 1 : 2);
+		mem_seeded += pagestore_write_zero_slru_page(memdir,
+													 "multixact members", 0);
+		if (mem_page_lo != 0)
+			mem_seeded += pagestore_write_zero_slru_page(memdir,
+														 "multixact members",
+														 mem_page_lo);
 	}
 	seeded += off_seeded + mem_seeded;
 
