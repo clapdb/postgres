@@ -4743,9 +4743,6 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	target_manifest = pagestore_read_branch_manifest(target_dir);
-	if (target_manifest == NULL && parent_tl > 0)
-		ereport(ERROR,
-				(errmsg("target branch manifest is required when installing a branch with a branch parent")));
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
 	{
@@ -4773,11 +4770,6 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
-	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
 	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
 	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
