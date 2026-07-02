@@ -413,6 +413,12 @@ cp "$SEEDOUT/pagestore_branch.manifest" "$BADSEED/pagestore_branch.manifest"
 missing_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$BADSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$missing_artifact" "error" "prepared branch install rejects a missing pg_xact artifact"
 rm -rf "$BADSEED"
+BADTARGET=$(mktemp -d)/branch
+cp -a "$BRANCHDATA" "$BADTARGET"
+sed 's/"new_timeline": 1/"new_timeline": 2/' "$SEEDOUT/pagestore_branch.manifest" > "$BADTARGET/pagestore_branch.manifest"
+target_mismatch=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BADTARGET', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$target_mismatch" "error" "prepared branch install rejects an existing target manifest for another branch"
+rm -rf "$(dirname "$BADTARGET")"
 UNPREPARED=$(mktemp -d)/branch
 cp -a "$BRANCHDATA" "$UNPREPARED"
 cat >> "$UNPREPARED/postgresql.conf" <<EOF
