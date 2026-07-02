@@ -371,34 +371,53 @@ rm -rf "$SEEDDIR"
 # (its xid is committed in the reconstructed clog and its heap version is <= L) but not row2
 # (committed after L; that heap version > L is absent from the branch timeline).  And it must
 # write forward on its own timeline without the parent seeing it.
-$P -c "CREATE FUNCTION pagestore_create_branch(int,int,pg_lsn) RETURNS void
-        AS 'pagestore','pagestore_create_branch' LANGUAGE C STRICT;
+$P -c "CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE TABLE tb(id int, note text) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 bc=$($P -c "SELECT pg_current_wal_lsn();")                     # base cutoff C (before row1)
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$bc');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
+$P -c "CHECKPOINT;" >/dev/null                                # ship the row1 heap version
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
-# Reconstruct the branch clog as-of L *now*, while the (C, L] WAL is still present (the
-# parent's later stop/restart/checkpoints recycle it).  The base snapshot at C has T1
-# in-progress; the replay of (C, L] must mark it committed, so booting on this clog -- not
-# the parent's copied one -- is what makes row1 visible.
-SEEDOUT=$(mktemp -d)/seedout
-seeded_b=$($P -c "SELECT pagestore_seed_clog('$SEEDOUT', '$bc', '$bL', '3'::xid, '$boxid'::xid);")
+$P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
+# Prepare the branch as-of L after the parent has advanced, while the (C, L] WAL is still
+# present (the parent's later stop/restart/checkpoints recycle it).  The base snapshot at C
+# has T1 in-progress; the replay of (C, L] must mark it committed, so booting on the
+# prepared pg_xact -- not the parent's copied one -- is what makes row1 visible.  Creating
+# the branch after T2 also proves the daemon honors the supplied retrospective fork LSN.
+SEEDOUT=$(mktemp -d)
+seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
+	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
-	"branch clog reconstructed via base snapshot + (C,L] replay ($seeded_b page(s))"
-# clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
+	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
+# clean-stop the parent so its datadir is consistent, copy it, then boot the prepared branch
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
-$P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
-$P -c "SELECT pagestore_create_branch(1, 0, '$bL');" >/dev/null       # store timeline 1 @ L
-# Install the reconstructed clog into the branch copy, replacing the copied one, so the
-# boot genuinely depends on the seeder's output rather than the parent's as-of-L pg_xact.
-rm -rf "$BRANCHDATA/pg_xact"
-cp -a "$SEEDOUT/pg_xact" "$BRANCHDATA/pg_xact"
+# Install every prepared branch SLRU artifact into the branch copy, replacing copied
+# directories so the boot genuinely depends on prepare_branch output, not copied
+# parent snapshots.  pg_commit_ts is only prepared when commit timestamps are active.
+for slru in pg_xact pg_commit_ts pg_multixact; do
+	if [ -d "$SEEDOUT/$slru" ]; then
+		rm -rf "$BRANCHDATA/$slru"
+		cp -a "$SEEDOUT/$slru" "$BRANCHDATA/$slru"
+	elif [ "$slru" = "pg_commit_ts" ]; then
+		:
+	else
+		echo "FAIL - prepare_branch did not produce $slru under $SEEDOUT"
+		fail=1
+	fi
+done
+if ! cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"; then
+	echo "FAIL - could not install pagestore_branch.manifest"
+	fail=1
+fi
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
@@ -425,7 +444,7 @@ assert "$($PB -c "SELECT count(*) FROM tb WHERE note='after_L';" 2>/dev/null)" "
 assert "$($P -c "SELECT count(*) FROM tb WHERE note='branch_local';")" "0" \
 	"parent is isolated from the branch's local write"
 "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1
-rm -rf "$(dirname "$SEEDOUT")"
+rm -rf "$SEEDOUT"
 
 # --- 20. commit-ts applier: reconstruct commit timestamps as-of L ---------------------
 # Same shape as the clog applier, for pg_commit_ts: snapshot at C, commit xidA (<= L) and
@@ -539,7 +558,7 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE OR REPLACE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
