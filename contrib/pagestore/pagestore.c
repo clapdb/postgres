@@ -3882,9 +3882,9 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 		char		staging_root[MAXPGPATH];
 		char		backup_root[MAXPGPATH];
 		bool		seed_commit_ts;
-		bool		published_xact = false,
-					published_commit_ts = false,
-					published_multixact = false;
+		volatile bool published_xact = false;
+		volatile bool published_commit_ts = false;
+		volatile bool published_multixact = false;
 		int64		seeded = 0;
 		int			pathlen;
 
