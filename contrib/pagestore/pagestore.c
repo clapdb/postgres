@@ -4859,27 +4859,57 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
 }
 
 /*
- * pagestore_install_prepared_branch(prepared_dir text, target_dir text)
+ * pagestore_install_prepared_branch(prepared_dir text, target_dir text,
+ *                                  new_timeline int, parent_timeline int,
+ *                                  fork_lsn pg_lsn)
  * returns void
  *
  * Install the artifacts produced by pagestore_prepare_branch() into an
  * initdb/copied branch datadir.  pg_xact and any prepared SLRUs are installed
- * before the manifest, and the manifest is installed last so its presence remains
- * the startup-time signal that the datadir has a prepared branch identity and must
+ * before the manifest.  The prepared manifest must match the expected branch
+ * identity before any artifact is installed, and the manifest is installed last
+ * so its presence remains the startup-time signal that the datadir has a
+ * prepared branch identity and must
  * pass timeline validation.
  */
 PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
 pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 {
-	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *prepared_dir;
+	char	   *target_dir;
+	int32		new_tl;
+	int32		parent_tl;
+	XLogRecPtr	fork_lsn;
+	char	   *manifest_data;
 	char		stage[MAXPGPATH];
+
+	if (PG_NARGS() != 5)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore_install_prepared_branch requires 5 arguments (prepared_dir, target_dir, new_timeline, parent_timeline, fork_lsn)")));
+
+	prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	new_tl = PG_GETARG_INT32(2);
+	parent_tl = PG_GETARG_INT32(3);
+	fork_lsn = PG_GETARG_LSN(4);
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to install a prepared branch")));
+	if (new_tl <= 0 || parent_tl < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid branch timeline identity")));
+	manifest_data = pagestore_read_branch_manifest(prepared_dir);
+	if (manifest_data == NULL)
+		ereport(ERROR,
+				(errmsg("prepared branch manifest is missing")));
+	if (!pagestore_manifest_matches(manifest_data, new_tl, parent_tl, fork_lsn))
+		ereport(ERROR,
+				(errmsg("prepared branch manifest does not match the requested branch identity")));
 
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
 										  "pg_xact", true);
