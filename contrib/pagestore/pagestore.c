@@ -4202,6 +4202,8 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	int64		oldest_member = PG_GETARG_INT64(11);
 	int64		next_member = PG_GETARG_INT64(12);
 	int64		seeded;
+	char		manifest_path[MAXPGPATH];
+	int			pathlen;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -4223,6 +4225,27 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+
+	/*
+	 * From here until the new manifest is published the target's SLRUs may
+	 * not match any manifest, so durably invalidate a manifest left by a
+	 * previous prepare before touching them.  The manifest is what marks a
+	 * prepared dir as consumable, so every failure below -- SLRU seeding,
+	 * CREATE_BRANCH being refused after the store raced ahead, the manifest
+	 * write itself -- leaves the dir inert instead of advertising stale or
+	 * half-updated contents.
+	 */
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
 											  oldest_xid, next_xid,
 											  oldest_commit_ts_xid,
