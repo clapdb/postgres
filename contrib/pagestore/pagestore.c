@@ -50,6 +50,7 @@
 #include "catalog/storage_xlog.h"
 #include "common/file_perm.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
@@ -4050,6 +4051,8 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 													 PG_GETARG_INT64(10)));
 }
 
+#define PAGESTORE_BRANCH_MANIFEST_MAXLEN 8192
+
 static void
 pagestore_write_branch_manifest(const char *target_dir,
 								int32 new_tl, int32 parent_tl,
@@ -4154,6 +4157,490 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode_for_file_access(),
 				 errmsg("could not publish branch manifest \"%s\": %m", path)));
 	fsync_fname(target_dir, true);
+}
+
+static char *
+pagestore_read_branch_manifest(const char *target_dir)
+{
+	char		path[MAXPGPATH];
+	FILE	   *file;
+	StringInfoData buf;
+	char		tmp[1024];
+	size_t		nread;
+	long		manifest_size;
+
+	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch target directory path is too long")));
+
+	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	file = AllocateFile(path, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno == ENOENT)
+			return NULL;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open branch manifest \"%s\": %m", path)));
+	}
+	if (fseek(file, 0L, SEEK_END) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	manifest_size = ftell(file);
+	if (manifest_size < 0 || manifest_size > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest \"%s\" is too large", path)));
+	}
+	if (fseek(file, 0L, SEEK_SET) != 0)
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+
+	initStringInfo(&buf);
+		while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
+		{
+			if (buf.len + nread > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+			{
+			FreeFile(file);
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("branch manifest \"%s\" is too large", path)));
+			}
+			if (memchr(tmp, '\0', nread) != NULL)
+			{
+				FreeFile(file);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("branch manifest \"%s\" contains embedded NUL bytes",
+								path)));
+			}
+			appendBinaryStringInfo(&buf, tmp, nread);
+		}
+	if (ferror(file))
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	FreeFile(file);
+	return buf.data;
+}
+
+static const char *
+pagestore_manifest_skip_ws(const char *p)
+{
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	return p;
+}
+
+static const char *
+pagestore_manifest_find_unique_field(const char *manifest, const char *key)
+{
+	size_t		keylen = strlen(key);
+	const char *p = manifest;
+	const char *field = NULL;
+	int			depth = 0;
+
+	while (*p != '\0')
+	{
+		if (*p == '{' || *p == '[')
+		{
+			depth++;
+			p++;
+			continue;
+		}
+		if (*p == '}' || *p == ']')
+		{
+			if (depth > 0)
+				depth--;
+			p++;
+			continue;
+		}
+		if (*p == '"')
+		{
+			const char *name = p + 1;
+			const char *end = name;
+
+			while (*end != '\0')
+			{
+				if (*end == '\\' && end[1] != '\0')
+				{
+					end += 2;
+					continue;
+				}
+				if (*end == '"')
+					break;
+				end++;
+			}
+			if (*end == '\0')
+				return NULL;
+
+			if (depth == 1)
+			{
+				const char *value = pagestore_manifest_skip_ws(end + 1);
+
+				if (*value == ':' &&
+					(size_t) (end - name) == keylen &&
+					strncmp(name, key, keylen) == 0)
+				{
+					if (field != NULL)
+						return NULL;
+					field = pagestore_manifest_skip_ws(value + 1);
+				}
+			}
+			p = end + 1;
+			continue;
+		}
+
+		p++;
+	}
+	return field;
+}
+
+static bool
+pagestore_manifest_value_delimited(const char *p)
+{
+	p = pagestore_manifest_skip_ws(p);
+	return *p == '\0' || *p == ',' || *p == '}';
+}
+
+static bool
+pagestore_manifest_has_token(const char *manifest, const char *key,
+							 const char *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	size_t		len = strlen(value);
+
+	if (field == NULL)
+		return false;
+	if (*field == '"')
+		return false;
+	if (strncmp(field, value, len) != 0)
+		return false;
+	return pagestore_manifest_value_delimited(field + len);
+}
+
+static bool
+pagestore_manifest_has_string_token(const char *manifest, const char *key,
+									const char *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	size_t		len = strlen(value);
+
+	if (field == NULL)
+		return false;
+	if (*field != '"')
+		return false;
+	field++;
+	if (strncmp(field, value, len) != 0)
+		return false;
+	if (field[len] != '"')
+		return false;
+	return pagestore_manifest_value_delimited(field + len + 1);
+}
+
+static bool
+pagestore_manifest_parse_value(const char **pp);
+
+static bool
+pagestore_manifest_parse_string(const char **pp)
+{
+	const char *p = *pp;
+	int			i;
+
+	if (*p != '"')
+		return false;
+	p++;
+	while (*p != '\0')
+	{
+		if ((unsigned char) *p < 0x20)
+			return false;
+		if (*p == '"')
+		{
+			*pp = p + 1;
+			return true;
+		}
+		if (*p == '\\')
+		{
+			p++;
+			if (*p == '"' || *p == '\\' || *p == '/' ||
+				*p == 'b' || *p == 'f' || *p == 'n' ||
+				*p == 'r' || *p == 't')
+			{
+				p++;
+				continue;
+			}
+			if (*p == 'u')
+			{
+				for (i = 0; i < 4; i++)
+				{
+					p++;
+					if (!((*p >= '0' && *p <= '9') ||
+						  (*p >= 'a' && *p <= 'f') ||
+						  (*p >= 'A' && *p <= 'F')))
+						return false;
+				}
+				p++;
+				continue;
+			}
+			return false;
+		}
+		p++;
+	}
+	return false;
+}
+
+static bool
+pagestore_manifest_parse_number(const char **pp)
+{
+	const char *p = *pp;
+
+	if (*p == '-')
+		p++;
+	if (*p == '0')
+		p++;
+	else
+	{
+		if (*p < '1' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	if (*p == '.')
+	{
+		p++;
+		if (*p < '0' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	if (*p == 'e' || *p == 'E')
+	{
+		p++;
+		if (*p == '+' || *p == '-')
+			p++;
+		if (*p < '0' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	*pp = p;
+	return true;
+}
+
+static bool
+pagestore_manifest_parse_literal(const char **pp, const char *literal)
+{
+	size_t		len = strlen(literal);
+
+	if (strncmp(*pp, literal, len) != 0)
+		return false;
+	*pp += len;
+	return true;
+}
+
+static bool
+pagestore_manifest_parse_array(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp + 1);
+
+	if (*p == ']')
+	{
+		*pp = p + 1;
+		return true;
+	}
+	for (;;)
+	{
+		if (!pagestore_manifest_parse_value(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p == ']')
+		{
+			*pp = p + 1;
+			return true;
+		}
+		if (*p != ',')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+	}
+}
+
+static bool
+pagestore_manifest_parse_object(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp + 1);
+
+	if (*p == '}')
+	{
+		*pp = p + 1;
+		return true;
+	}
+	for (;;)
+	{
+		if (!pagestore_manifest_parse_string(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p != ':')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+		if (!pagestore_manifest_parse_value(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p == '}')
+		{
+			*pp = p + 1;
+			return true;
+		}
+		if (*p != ',')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+	}
+}
+
+static bool
+pagestore_manifest_parse_value(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp);
+
+	if (*p == '"')
+	{
+		if (!pagestore_manifest_parse_string(&p))
+			return false;
+	}
+	else if (*p == '{')
+	{
+		if (!pagestore_manifest_parse_object(&p))
+			return false;
+	}
+	else if (*p == '[')
+	{
+		if (!pagestore_manifest_parse_array(&p))
+			return false;
+	}
+	else if (*p == '-' || (*p >= '0' && *p <= '9'))
+	{
+		if (!pagestore_manifest_parse_number(&p))
+			return false;
+	}
+	else if (*p == 't')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "true"))
+			return false;
+	}
+	else if (*p == 'f')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "false"))
+			return false;
+	}
+	else if (*p == 'n')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "null"))
+			return false;
+	}
+	else
+		return false;
+
+	*pp = p;
+	return true;
+}
+
+static bool
+pagestore_manifest_is_single_object(const char *manifest)
+{
+	const char *p = pagestore_manifest_skip_ws(manifest);
+
+	if (*p != '{')
+		return false;
+	if (!pagestore_manifest_parse_object(&p))
+		return false;
+	p = pagestore_manifest_skip_ws(p);
+	return *p == '\0';
+}
+
+static bool
+pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
+						   XLogRecPtr fork_lsn)
+{
+	char		buf[64];
+	int			len;
+
+	if (new_tl <= 0 || parent_tl < 0)
+		return false;
+	if (!pagestore_manifest_is_single_object(manifest))
+		return false;
+
+	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%d", new_tl);
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%d", parent_tl);
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest token is too large")));
+	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
+		return false;
+	return true;
+}
+
+/*
+ * pagestore_validate_branch_manifest(target_dir text, new_timeline int,
+ *                                    parent_timeline int, fork_lsn pg_lsn)
+ * returns bool
+ *
+ * Bootstrap preflight for a prepared branch datadir.  It verifies that the
+ * durable manifest written by pagestore_prepare_branch() matches the timeline
+ * identity the caller is about to boot.  This intentionally does not mutate the
+ * datadir; it is a guard against pointing a compute at the wrong copied
+ * datadir or store timeline.
+ */
+PG_FUNCTION_INFO_V1(pagestore_validate_branch_manifest);
+Datum
+pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	fork_lsn = PG_GETARG_LSN(3);
+	char	   *manifest;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to validate a branch manifest")));
+	if (new_tl <= 0 || parent_tl < 0)
+		PG_RETURN_BOOL(false);
+
+	manifest = pagestore_read_branch_manifest(target_dir);
+	if (manifest == NULL)
+		PG_RETURN_BOOL(false);
+	PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
+											  fork_lsn));
 }
 
 /*
