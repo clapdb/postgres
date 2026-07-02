@@ -4743,6 +4743,9 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest == NULL && parent_tl > 0)
+		ereport(ERROR,
+				(errmsg("target branch manifest is required when installing a branch with a branch parent")));
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
 	{
