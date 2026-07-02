@@ -313,6 +313,20 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 	return (int) n;
 }
 
+/*
+ * Truncate fd back to old_size on an error path.  Best-effort: the caller
+ * is already returning an error and cannot act on a rollback failure; the
+ * torn tail is detected and discarded on the next meta read.
+ */
+static void
+posix_truncate_best_effort(int fd, off_t old_size)
+{
+	if (ftruncate(fd, old_size) != 0)
+	{
+		/* nothing we can do; see above */
+	}
+}
+
 static int
 posix_meta_append(const void *buf, uint32_t len)
 {
@@ -334,13 +348,13 @@ posix_meta_append(const void *buf, uint32_t len)
 	}
 	if (write(fd, buf, len) != (ssize_t) len)
 	{
-		(void) ftruncate(fd, old_size);
+		posix_truncate_best_effort(fd, old_size);
 		close(fd);
 		return -1;
 	}
 	if (fsync(fd) != 0)
 	{
-		(void) ftruncate(fd, old_size);
+		posix_truncate_best_effort(fd, old_size);
 		(void) fsync(fd);
 		close(fd);
 		return -1;
@@ -350,7 +364,7 @@ posix_meta_append(const void *buf, uint32_t len)
 		fd = open(path, O_WRONLY);
 		if (fd >= 0)
 		{
-			(void) ftruncate(fd, old_size);
+			posix_truncate_best_effort(fd, old_size);
 			(void) fsync(fd);
 			close(fd);
 		}
@@ -367,7 +381,7 @@ posix_meta_append(const void *buf, uint32_t len)
 			fd = open(path, O_WRONLY);
 			if (fd >= 0)
 			{
-				(void) ftruncate(fd, old_size);
+				posix_truncate_best_effort(fd, old_size);
 				(void) fsync(fd);
 				close(fd);
 			}
@@ -380,7 +394,7 @@ posix_meta_append(const void *buf, uint32_t len)
 			fd = open(path, O_WRONLY);
 			if (fd >= 0)
 			{
-				(void) ftruncate(fd, old_size);
+				posix_truncate_best_effort(fd, old_size);
 				(void) fsync(fd);
 				close(fd);
 			}
