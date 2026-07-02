@@ -406,6 +406,11 @@ cp -a "$DATA" "$BRANCHDATA"
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
 assert "$bad_install" "error" "prepared branch install rejects the wrong branch identity"
+BADSEED=$(mktemp -d)
+cp "$SEEDOUT/pagestore_branch.manifest" "$BADSEED/pagestore_branch.manifest"
+missing_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$BADSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$missing_artifact" "error" "prepared branch install rejects a missing pg_xact artifact"
+rm -rf "$BADSEED"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
