@@ -327,6 +327,29 @@ posix_truncate_best_effort(int fd, off_t old_size)
 	}
 }
 
+/*
+ * Roll back an append whose record may already be durable in the metadata
+ * log: reopen the log, truncate it back to old_size, and push the truncate
+ * out.  If this append created the file, remove it again -- otherwise a
+ * failed append is reported as an error yet a daemon restart would replay
+ * the record from the log and resurrect it.  Best-effort, like
+ * posix_truncate_best_effort().
+ */
+static void
+posix_meta_rollback(const char *path, off_t old_size, int created)
+{
+	int		fd = open(path, O_WRONLY);
+
+	if (fd >= 0)
+	{
+		posix_truncate_best_effort(fd, old_size);
+		(void) fsync(fd);
+		close(fd);
+	}
+	if (created && old_size == 0)
+		(void) unlink(path);
+}
+
 static int
 posix_meta_append(const void *buf, uint32_t len)
 {
@@ -361,45 +384,26 @@ posix_meta_append(const void *buf, uint32_t len)
 	}
 	if (close(fd) != 0)
 	{
-		fd = open(path, O_WRONLY);
-		if (fd >= 0)
-		{
-			posix_truncate_best_effort(fd, old_size);
-			(void) fsync(fd);
-			close(fd);
-		}
+		posix_meta_rollback(path, old_size, created);
 		return -1;
 	}
 	if (created)
 	{
 		fd = open(posix_dir, O_RDONLY | O_DIRECTORY);
 		if (fd < 0)
+		{
+			posix_meta_rollback(path, old_size, created);
 			return -1;
+		}
 		if (fsync(fd) != 0)
 		{
 			close(fd);
-			fd = open(path, O_WRONLY);
-			if (fd >= 0)
-			{
-				posix_truncate_best_effort(fd, old_size);
-				(void) fsync(fd);
-				close(fd);
-			}
-			if (old_size == 0)
-				(void) unlink(path);
+			posix_meta_rollback(path, old_size, created);
 			return -1;
 		}
 		if (close(fd) != 0)
 		{
-			fd = open(path, O_WRONLY);
-			if (fd >= 0)
-			{
-				posix_truncate_best_effort(fd, old_size);
-				(void) fsync(fd);
-				close(fd);
-			}
-			if (old_size == 0)
-				(void) unlink(path);
+			posix_meta_rollback(path, old_size, created);
 			return -1;
 		}
 	}

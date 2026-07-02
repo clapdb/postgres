@@ -4229,6 +4229,18 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
+
+	/*
+	 * Publish the manifest only after the store-side timeline exists: the
+	 * manifest is the durable handoff artifact for later bootstrap, so it must
+	 * never advertise a branch that CREATE_BRANCH refused (e.g. the same
+	 * timeline raced into existence with different ancestry during seeding).
+	 * The reverse window is retry-safe: if the manifest write fails here, the
+	 * timeline already exists and a retried prepare passes CHECK_BRANCH and
+	 * re-runs CREATE_BRANCH idempotently.
+	 */
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl,
 									base, target,
 									oldest_xid, next_xid,
@@ -4237,8 +4249,6 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 									oldest_multi, next_multi,
 									oldest_member, next_member,
 									seeded);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
 
 	PG_RETURN_INT64(seeded);
 }
