@@ -486,6 +486,8 @@ $P -c "CREATE FUNCTION pagestore_multixact_offset_asof(xid, pg_lsn, pg_lsn) RETU
 $P -c "CREATE TABLE mx(id int primary key, note text) TABLESPACE ts; INSERT INTO mx VALUES (1,'a');" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 mxC=$($P -c "SELECT pg_current_wal_lsn();")                       # base cutoff C
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$mxC');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$mxC');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$mxC');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$mxC');" >/dev/null
 # session A holds a FOR SHARE lock across the second locker
@@ -504,6 +506,7 @@ $P -c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; COMMIT;" >/dev/null
 mA=$($P -c "SELECT xmax FROM mx WHERE id=1;")                     # the row's xmax is the multixact id
 $P -c "CHECKPOINT;" >/dev/null
 mxL=$($P -c "SELECT pg_current_wal_lsn();")                       # fork LSN L (after mA)
+bootNext=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 wait "$mxlocker"		# only the locker; a bare wait would also block on the daemon
 # confirm mA really is a multixact (its two FOR SHARE members), not a plain xid
 mxMembers=$($P -c "SELECT count(*) FROM pg_get_multixact_members('$mA');" 2>/dev/null)
@@ -533,7 +536,10 @@ assert "$mxRP" "$mxLP" "multixact offsets: reconstructed page as-of L == the par
 $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
         AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
-        AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid,
+        xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
 # MULTIXACT_MEMBERS_PER_PAGE = (block_size / MULTIXACT_MEMBERGROUP_SIZE) * members-per-group;
 # the group is 4 flag bytes + 4 TransactionIds = 20 bytes, 4 members each (block-size derived)
@@ -560,6 +566,36 @@ mxSeedMem=$($P -c "SELECT md5(pg_read_binary_file('$MXSEED/pg_multixact/members/
 assert "$mxSeedOff" "$mxRP" "multixact seed offsets page == reconstructed as-of-L page"
 assert "$mxSeedMem" "$mbRecon" "multixact seed members page == reconstructed as-of-L page"
 rm -rf "$MXSEED"
+
+# --- 22. branch bootstrap SLRU seeder: one fail-closed entrypoint for all SLRUs --------
+# A branch-control-plane caller should not hand-roll separate seed calls for pg_xact,
+# pg_commit_ts, and pg_multixact.  Seed them through a single bootstrap helper using one
+# fork window and one set of horizons, then require each published SLRU page to match its
+# existing per-SLRU reconstruction helper.
+BOOTSEED=$(mktemp -d)
+read -r ctsOldest ctsNewest <<< "$($P -c "SELECT oldest_commit_ts_xid::text || ' ' || newest_commit_ts_xid::text FROM pg_control_checkpoint();")"
+ctsNext=$(( (ctsNewest + 1) & 4294967295 ))
+if [ "$ctsNext" -lt 3 ]; then ctsNext=3; fi
+bootSeeded=$($P -c "SELECT pagestore_seed_branch_slrus('$BOOTSEED', '$mxC', '$mxL',
+	'3'::xid, '$bootNext'::xid,
+	'$ctsOldest'::xid, '$ctsNext'::xid,
+	'$mA'::xid, '$mxNext'::xid,
+	$mOff, $((mOff + mxMembers)));")
+assert "$([ "${bootSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
+	"branch bootstrap seed materialized pg_xact, pg_commit_ts, and pg_multixact ($bootSeeded page(s))"
+bootClogSeg=$(printf '%04X' $(( (ctsA / cxpp) / 32 )))
+bootClogPage=$(( (ctsA / cxpp) % 32 ))
+bootClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_xact/$bootClogSeg', $(( bootClogPage * bs )), $bs));")
+bootClogRecon=$($P -c "SELECT md5(pagestore_clog_page_asof($(( ctsA / cxpp )), '$mxC', '$mxL'));")
+assert "$bootClogMd5" "$bootClogRecon" "branch bootstrap seed pg_xact page == reconstructed as-of-L page"
+bootCtsMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
+bootCtsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$mxC', '$mxL'));")
+assert "$bootCtsMd5" "$bootCtsRecon" "branch bootstrap seed pg_commit_ts page == reconstructed as-of-L page"
+bootMxOff=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
+bootMxMem=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
+assert "$bootMxOff" "$mxRP" "branch bootstrap seed multixact offsets page == reconstructed as-of-L page"
+assert "$bootMxMem" "$mbRecon" "branch bootstrap seed multixact members page == reconstructed as-of-L page"
+rm -rf "$BOOTSEED"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
