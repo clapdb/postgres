@@ -26,7 +26,7 @@ WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 D=$(mktemp -d)/pgdata
 S=$(mktemp -d)/store
 SHM=/pswonly_$$
-PORT=$((54000 + ($$ % 1000)))
+PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 
 cleanup() {
@@ -54,6 +54,7 @@ io_method = sync
 recovery_prefetch = off
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = '127.0.0.1'
 port = $PORT
 EOF
 
