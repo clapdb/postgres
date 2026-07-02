@@ -381,6 +381,7 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$bc');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$bc');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
+$P -c "CHECKPOINT;" >/dev/null                                # ship the row1 heap version
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
