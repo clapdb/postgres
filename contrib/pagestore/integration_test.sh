@@ -406,12 +406,10 @@ cp -a "$DATA" "$BRANCHDATA"
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
 assert "$bad_install" "error" "prepared branch install rejects the wrong branch identity"
-if $P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null; then
-	echo "ok   - installed prepared branch artifacts into the branch datadir"
-else
-	echo "FAIL - could not install prepared branch artifacts"
-	fail=1
-fi
+ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
+assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
+ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
+assert "$ok_install" "ok" "prepared branch install is idempotent for the same branch identity"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1

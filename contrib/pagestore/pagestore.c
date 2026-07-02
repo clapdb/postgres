@@ -30,6 +30,7 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -4882,7 +4883,11 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	int32		parent_tl;
 	XLogRecPtr	fork_lsn;
 	char	   *manifest_data;
+	char	   *target_manifest;
 	char		stage[MAXPGPATH];
+	uint32_t	target_new_tl;
+	uint32_t	target_parent_tl;
+	XLogRecPtr	target_fork_lsn;
 
 	if (PG_NARGS() != 5)
 		ereport(ERROR,
@@ -4910,6 +4915,20 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	if (!pagestore_manifest_matches(manifest_data, new_tl, parent_tl, fork_lsn))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
+	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest != NULL &&
+		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+	{
+		if (parent_tl <= 0 ||
+			!pagestore_manifest_get_branch_identity(target_manifest, &target_new_tl,
+													&target_parent_tl,
+													&target_fork_lsn) ||
+			target_new_tl != (uint32_t) parent_tl)
+			ereport(ERROR,
+					(errmsg("target branch manifest does not match the requested branch identity")));
+		pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
+										  (uint64) target_fork_lsn);
+	}
 
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
 										  "pg_xact", true);
@@ -4924,11 +4943,6 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
-	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
 	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
 	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
