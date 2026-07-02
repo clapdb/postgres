@@ -27,6 +27,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "miscadmin.h"
@@ -241,9 +242,14 @@ ls_chan(void)
  * simply alternate; the IDLE state is only the post-zeroing initial value.
  */
 static void
-ls_exec(PsChannel *ch)
+ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
+	time_t		deadline = 0;
+
+	if (timeout_ms > 0)
+		deadline = time(NULL) + (timeout_ms + 999) / 1000;
+
 	ch->shard = ls_channel_shard;
 
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
@@ -251,7 +257,13 @@ ls_exec(PsChannel *ch)
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 	{
 		if (((++spins) & 0xFFF) == 0)
+		{
 			CHECK_FOR_INTERRUPTS();
+			if (deadline != 0 && time(NULL) >= deadline)
+				ereport(ERROR,
+						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+								ch->opcode)));
+		}
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #endif
@@ -261,6 +273,12 @@ ls_exec(PsChannel *ch)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc: daemon reported error for op %u",
 						ch->opcode)));
+}
+
+static void
+ls_exec(PsChannel *ch)
+{
+	ls_exec_timeout(ch, 0);
 }
 
 static void
@@ -552,13 +570,20 @@ void
 pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
 								  uint64 branch_lsn)
 {
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl, branch_lsn, 0);
+}
+
+void
+pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
+										  uint64 branch_lsn, int timeout_ms)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_REQUIRE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 /*
