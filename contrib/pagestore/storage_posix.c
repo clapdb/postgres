@@ -318,8 +318,10 @@ posix_meta_append(const void *buf, uint32_t len)
 {
 	char		path[4096];
 	int		fd;
+	int		created;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	created = access(path, F_OK) != 0;
 	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
 		return -1;
@@ -335,6 +337,19 @@ posix_meta_append(const void *buf, uint32_t len)
 	}
 	if (close(fd) != 0)
 		return -1;
+	if (created)
+	{
+		fd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+		if (fd < 0)
+			return -1;
+		if (fsync(fd) != 0)
+		{
+			close(fd);
+			return -1;
+		}
+		if (close(fd) != 0)
+			return -1;
+	}
 	return 0;
 }
 
