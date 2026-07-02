@@ -4409,48 +4409,221 @@ pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
 }
 
 static bool
-pagestore_manifest_is_single_object(const char *manifest)
-{
-	const char *p = pagestore_manifest_skip_ws(manifest);
-	int			depth = 0;
+pagestore_manifest_parse_value(const char **pp);
 
-	if (*p != '{')
+static bool
+pagestore_manifest_parse_string(const char **pp)
+{
+	const char *p = *pp;
+	int			i;
+
+	if (*p != '"')
 		return false;
+	p++;
 	while (*p != '\0')
 	{
+		if ((unsigned char) *p < 0x20)
+			return false;
 		if (*p == '"')
 		{
-			p++;
-			while (*p != '\0')
-			{
-				if (*p == '\\' && p[1] != '\0')
-				{
-					p += 2;
-					continue;
-				}
-				if (*p == '"')
-					break;
-				p++;
-			}
-			if (*p == '\0')
-				return false;
+			*pp = p + 1;
+			return true;
 		}
-		else if (*p == '{' || *p == '[')
-			depth++;
-		else if (*p == '}' || *p == ']')
+		if (*p == '\\')
 		{
-			depth--;
-			if (depth == 0)
+			p++;
+			if (*p == '"' || *p == '\\' || *p == '/' ||
+				*p == 'b' || *p == 'f' || *p == 'n' ||
+				*p == 'r' || *p == 't')
 			{
-				p = pagestore_manifest_skip_ws(p + 1);
-				return *p == '\0';
+				p++;
+				continue;
 			}
-			if (depth < 0)
-				return false;
+			if (*p == 'u')
+			{
+				for (i = 0; i < 4; i++)
+				{
+					p++;
+					if (!((*p >= '0' && *p <= '9') ||
+						  (*p >= 'a' && *p <= 'f') ||
+						  (*p >= 'A' && *p <= 'F')))
+						return false;
+				}
+				p++;
+				continue;
+			}
+			return false;
 		}
 		p++;
 	}
 	return false;
+}
+
+static bool
+pagestore_manifest_parse_number(const char **pp)
+{
+	const char *p = *pp;
+
+	if (*p == '-')
+		p++;
+	if (*p == '0')
+		p++;
+	else
+	{
+		if (*p < '1' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	if (*p == '.')
+	{
+		p++;
+		if (*p < '0' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	if (*p == 'e' || *p == 'E')
+	{
+		p++;
+		if (*p == '+' || *p == '-')
+			p++;
+		if (*p < '0' || *p > '9')
+			return false;
+		while (*p >= '0' && *p <= '9')
+			p++;
+	}
+	*pp = p;
+	return true;
+}
+
+static bool
+pagestore_manifest_parse_literal(const char **pp, const char *literal)
+{
+	size_t		len = strlen(literal);
+
+	if (strncmp(*pp, literal, len) != 0)
+		return false;
+	*pp += len;
+	return true;
+}
+
+static bool
+pagestore_manifest_parse_array(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp + 1);
+
+	if (*p == ']')
+	{
+		*pp = p + 1;
+		return true;
+	}
+	for (;;)
+	{
+		if (!pagestore_manifest_parse_value(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p == ']')
+		{
+			*pp = p + 1;
+			return true;
+		}
+		if (*p != ',')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+	}
+}
+
+static bool
+pagestore_manifest_parse_object(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp + 1);
+
+	if (*p == '}')
+	{
+		*pp = p + 1;
+		return true;
+	}
+	for (;;)
+	{
+		if (!pagestore_manifest_parse_string(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p != ':')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+		if (!pagestore_manifest_parse_value(&p))
+			return false;
+		p = pagestore_manifest_skip_ws(p);
+		if (*p == '}')
+		{
+			*pp = p + 1;
+			return true;
+		}
+		if (*p != ',')
+			return false;
+		p = pagestore_manifest_skip_ws(p + 1);
+	}
+}
+
+static bool
+pagestore_manifest_parse_value(const char **pp)
+{
+	const char *p = pagestore_manifest_skip_ws(*pp);
+
+	if (*p == '"')
+	{
+		if (!pagestore_manifest_parse_string(&p))
+			return false;
+	}
+	else if (*p == '{')
+	{
+		if (!pagestore_manifest_parse_object(&p))
+			return false;
+	}
+	else if (*p == '[')
+	{
+		if (!pagestore_manifest_parse_array(&p))
+			return false;
+	}
+	else if (*p == '-' || (*p >= '0' && *p <= '9'))
+	{
+		if (!pagestore_manifest_parse_number(&p))
+			return false;
+	}
+	else if (*p == 't')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "true"))
+			return false;
+	}
+	else if (*p == 'f')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "false"))
+			return false;
+	}
+	else if (*p == 'n')
+	{
+		if (!pagestore_manifest_parse_literal(&p, "null"))
+			return false;
+	}
+	else
+		return false;
+
+	*pp = p;
+	return true;
+}
+
+static bool
+pagestore_manifest_is_single_object(const char *manifest)
+{
+	const char *p = pagestore_manifest_skip_ws(manifest);
+
+	if (*p != '{')
+		return false;
+	if (!pagestore_manifest_parse_object(&p))
+		return false;
+	p = pagestore_manifest_skip_ws(p);
+	return *p == '\0';
 }
 
 static bool
