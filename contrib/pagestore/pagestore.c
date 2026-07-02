@@ -4769,6 +4769,8 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
 	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/offsets", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
 	pagestore_require_prepared_artifact(prepared_dir,
 										"pagestore_branch.manifest", false);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
