@@ -385,23 +385,25 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$bc');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$bc');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$bc');" >/dev/null
 $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (C, L]
+$P -c "CHECKPOINT;" >/dev/null                                # ship the row1 heap version
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
-# Prepare the branch as-of L *now*, while the (C, L] WAL is still present (the
-# parent's later stop/restart/checkpoints recycle it).  The base snapshot at C has T1
-# in-progress; the replay of (C, L] must mark it committed, so booting on the prepared
-# pg_xact -- not the parent's copied one -- is what makes row1 visible.
+$P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
+# Prepare the branch as-of L after the parent has advanced, while the (C, L] WAL is still
+# present (the parent's later stop/restart/checkpoints recycle it).  The base snapshot at C
+# has T1 in-progress; the replay of (C, L] must mark it committed, so booting on the
+# prepared pg_xact -- not the parent's copied one -- is what makes row1 visible.  Creating
+# the branch after T2 also proves the daemon honors the supplied retrospective fork LSN.
 SEEDOUT=$(mktemp -d)
 seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL',
 	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
-# clean-stop the parent so its datadir is consistent at L, copy it, restart, then advance
+# clean-stop the parent so its datadir is consistent, copy it, then boot the prepared branch
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 BRANCHDATA=$(mktemp -d)/branch
 cp -a "$DATA" "$BRANCHDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
-$P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Install the prepared branch artifacts into the branch copy, replacing copied SLRUs,
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
@@ -616,6 +618,7 @@ rm -rf "$MXSEED"
 BOOTSEED=$(mktemp -d)
 read -r ctsOldest ctsNewest <<< "$($P -c "SELECT oldest_commit_ts_xid::text || ' ' || newest_commit_ts_xid::text FROM pg_control_checkpoint();")"
 ctsNext=$(( (ctsNewest + 1) & 4294967295 ))
+if [ "$ctsNext" -lt 3 ]; then ctsNext=3; fi
 bootSeeded=$($P -c "SELECT pagestore_seed_branch_slrus('$BOOTSEED', '$mxC', '$mxL',
 	'3'::xid, '$bootNext'::xid,
 	'$ctsOldest'::xid, '$ctsNext'::xid,
