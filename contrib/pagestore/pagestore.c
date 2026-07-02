@@ -3883,9 +3883,9 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 	char		staging_root[MAXPGPATH];
 	char		backup_root[MAXPGPATH];
 	bool		seed_commit_ts;
-	bool		published_xact = false,
-				published_commit_ts = false,
-				published_multixact = false;
+	volatile bool published_xact = false;
+	volatile bool published_commit_ts = false;
+	volatile bool published_multixact = false;
 	int64		seeded = 0;
 	int			pathlen;
 
@@ -4005,11 +4005,11 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 													  "pg_multixact");
 		fsync_fname(target_dir, true);
 		if (!rmtree(staging_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
 		if (!rmtree(backup_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding backup area \"%s\"", backup_root)));
 	}
@@ -4411,28 +4411,48 @@ pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
 }
 
 static bool
-pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
-									   uint32_t *parent_tl, XLogRecPtr *fork_lsn)
+pagestore_manifest_is_single_object(const char *manifest)
 {
-	const char *p;
-	uint32_t	format;
+	const char *p = pagestore_manifest_skip_ws(manifest);
+	int			depth = 0;
 
-	p = pagestore_manifest_skip_ws(manifest);
 	if (*p != '{')
 		return false;
-	p += strlen(p);
-	while (p > manifest &&
-		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
-		p--;
-	if (p == manifest || p[-1] != '}')
-		return false;
-
-	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
-		format == 1 &&
-		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
-		*new_tl != 0 &&
-		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
-		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+	while (*p != '\0')
+	{
+		if (*p == '"')
+		{
+			p++;
+			while (*p != '\0')
+			{
+				if (*p == '\\' && p[1] != '\0')
+				{
+					p += 2;
+					continue;
+				}
+				if (*p == '"')
+					break;
+				p++;
+			}
+			if (*p == '\0')
+				return false;
+		}
+		else if (*p == '{' || *p == '[')
+			depth++;
+		else if (*p == '}' || *p == ']')
+		{
+			depth--;
+			if (depth == 0)
+			{
+				p = pagestore_manifest_skip_ws(p + 1);
+				return *p == '\0';
+			}
+			if (depth < 0)
+				return false;
+		}
+		p++;
+	}
+	return false;
 }
 
 static bool
@@ -4441,16 +4461,10 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 {
 	char		buf[64];
 	int			len;
-	const char *p;
 
-	p = pagestore_manifest_skip_ws(manifest);
-	if (*p != '{')
+	if (new_tl <= 0 || parent_tl < 0)
 		return false;
-	p += strlen(p);
-	while (p > manifest &&
-		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
-		p--;
-	if (p == manifest || p[-1] != '}')
+	if (!pagestore_manifest_is_single_object(manifest))
 		return false;
 
 	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
@@ -4503,6 +4517,24 @@ pagestore_require_prepared_artifact(const char *prepared_dir,
 							path)));
 }
 
+static bool
+pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
+									   uint32_t *parent_tl,
+									   XLogRecPtr *fork_lsn)
+{
+	uint32_t	format;
+
+	if (!pagestore_manifest_is_single_object(manifest))
+		return false;
+
+	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
+		format == 1 &&
+		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
+		*new_tl != 0 &&
+		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
+		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+}
+
 static inline bool
 pagestore_branch_backend_active(void)
 {
@@ -4551,7 +4583,6 @@ static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
-	uint32_t	format;
 	uint32_t	new_tl;
 	uint32_t	parent_tl;
 	XLogRecPtr	fork_lsn;
@@ -4568,19 +4599,37 @@ pagestore_validate_datadir_branch_manifest(void)
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
-	if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
-		format != 1 ||
-		!pagestore_manifest_get_uint_token(manifest, "new_timeline", &new_tl) ||
-		new_tl == 0 ||
-		!pagestore_manifest_get_uint_token(manifest, "parent_timeline", &parent_tl) ||
-		!pagestore_manifest_get_lsn_token(manifest, "fork_lsn", &fork_lsn))
+	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
+												&fork_lsn))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
 	if (new_tl != pagestore_localsvc_timeline())
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
-	pagestore_localsvc_check_branch(new_tl, parent_tl, (uint64) fork_lsn);
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl,
+											  (uint64) fork_lsn, 5000);
+	pagestore_localsvc_detach();
+}
+
+static void
+pagestore_preflight_prepared_artifact(const char *prepared_dir,
+									  const char *target_dir,
+									  const char *relpath, bool required)
+{
+	char		src[MAXPGPATH];
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH ||
+		strlen(target_dir) + strlen(relpath) + sizeof(".install/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch install path is too long")));
+
+	snprintf(src, sizeof(src), "%s/%s", prepared_dir, relpath);
+	if (access(src, F_OK) != 0 && required)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
 }
 
 static void
@@ -4707,6 +4756,10 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to install a prepared branch")));
+	if (new_tl <= 0 || parent_tl < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid branch timeline identity")));
 	manifest_data = pagestore_read_branch_manifest(prepared_dir);
 	if (manifest_data == NULL)
 		ereport(ERROR,
@@ -4715,6 +4768,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
 	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
 	pagestore_require_prepared_artifact(prepared_dir,
 										"pagestore_branch.manifest", false);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
@@ -4728,9 +4782,18 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 			target_new_tl != (uint32_t) parent_tl)
 			ereport(ERROR,
 					(errmsg("target branch manifest does not match the requested branch identity")));
-		pagestore_localsvc_check_branch(target_new_tl, target_parent_tl,
-										(uint64) target_fork_lsn);
+		pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
+										  (uint64) target_fork_lsn);
 	}
+
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_xact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_commit_ts", false);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_multixact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pagestore_branch.manifest", true);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,

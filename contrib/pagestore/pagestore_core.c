@@ -787,6 +787,15 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 	return 1;
 }
 
+static int
+branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
+{
+	return tl < MAX_TIMELINES &&
+		timelines[tl].defined &&
+		timelines[tl].parent == parent &&
+		timelines[tl].branch_lsn == branch_lsn;
+}
+
 /*
  * Resolve a read by walking the timeline ancestry: return the newest version of
  * (key, block) visible at read_lsn on 'timeline'; if the timeline never wrote
@@ -1517,6 +1526,18 @@ ps_handle_meta(PsChannel *ch)
 				/* valid */
 			}
 			else
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_REQUIRE_BRANCH:
+			/*
+			 * Startup-time manifest validation: require the timeline to already
+			 * exist with exactly the manifest ancestry metadata.  This is stricter
+			 * than CHECK_BRANCH, which also accepts a request that would be legal
+			 * to create.
+			 */
+			if (!branch_exists_with_metadata(ch->timeline,
+											 (int) ch->parent_timeline,
+											 ch->req_lsn))
 				ch->status = PS_STATUS_ERROR;
 			break;
 

@@ -147,6 +147,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_NBLOCKS:
 		case PS_OP_READV:
 		case PS_OP_READ_AT:
+		case PS_OP_REQUIRE_BRANCH:
 		case PS_OP_WAL_SIZE:
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
@@ -166,7 +167,8 @@ run_request(PsChannel *ch)
 	 * alone (no shard lock), so it serializes against map readers/writers but
 	 * not against per-shard work on unrelated shards.
 	 */
-	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH)
+	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
+		op == PS_OP_REQUIRE_BRANCH)
 	{
 		ps_lock_map_wr();
 		handle_request(ch);
