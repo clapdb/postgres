@@ -149,6 +149,10 @@ extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 										   uint64 branch_lsn);
 extern void pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
 											 uint64 branch_lsn);
+extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
+													 uint32 parent_tl,
+													 uint64 branch_lsn,
+													 int timeout_ms);
 extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 											 uint64 branch_lsn);
 extern void pagestore_localsvc_detach(void);

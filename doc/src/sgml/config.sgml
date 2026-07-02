@@ -2399,6 +2399,11 @@ include_dir 'conf.d'
          <command>ALTER DATABASE ... SET TABLESPACE ...</command>
         </para>
         </listitem>
+        <listitem>
+        <para>
+         <function>pagestore_install_prepared_branch()</function>
+        </para>
+        </listitem>
        </itemizedlist>
 
        <para>
