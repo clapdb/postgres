@@ -4119,6 +4119,11 @@ pagestore_write_branch_manifest(const char *target_dir,
 				   "%s/pagestore_branch.manifest.tmp.%ld",
 				   target_dir, (long) MyProcPid);
 	PS_CHECK_PATH_FORMAT(len, tmppath);
+	if (access(tmppath, F_OK) == 0 && unlink(tmppath) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear stale branch manifest temp file \"%s\": %m",
+						tmppath)));
 	fd = OpenTransientFilePerm(tmppath,
 							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
 							   pg_file_create_mode);
@@ -4137,6 +4142,7 @@ pagestore_write_branch_manifest(const char *target_dir,
 			if (written == 0)
 				errno = ENOSPC;
 			CloseTransientFile(fd);
+			(void) unlink(tmppath);
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not write branch manifest \"%s\": %m", tmppath)));
@@ -4146,18 +4152,25 @@ pagestore_write_branch_manifest(const char *target_dir,
 	if (pg_fsync(fd) != 0)
 	{
 		CloseTransientFile(fd);
+		(void) unlink(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync branch manifest \"%s\": %m", tmppath)));
 	}
 	if (CloseTransientFile(fd) != 0)
+	{
+		(void) unlink(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
+	}
 	if (rename(tmppath, path) != 0)
+	{
+		(void) unlink(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not publish branch manifest \"%s\": %m", path)));
+	}
 	fsync_fname(target_dir, true);
 }
 
@@ -4758,6 +4771,42 @@ pagestore_validate_datadir_branch_manifest(void)
 	pagestore_localsvc_detach();
 }
 
+static void
+pagestore_cleanup_prepared_branch_output(const char *target_dir)
+{
+	const char *artifacts[] = {
+		"pg_multixact",
+		"pg_commit_ts",
+		"pg_xact",
+		"pagestore_branch.manifest",
+	};
+	char		path[MAXPGPATH];
+
+	for (int i = 0; i < lengthof(artifacts); i++)
+	{
+		int			len;
+
+		len = snprintf(path, sizeof(path), "%s/%s", target_dir,
+					   artifacts[i]);
+		PS_CHECK_PATH_FORMAT(len, path);
+		if (access(path, F_OK) != 0)
+			continue;
+		if (strcmp(artifacts[i], "pagestore_branch.manifest") == 0)
+		{
+			if (unlink(path) != 0)
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not remove branch prepare artifact \"%s\": %m",
+								path)));
+		}
+		else if (!rmtree(path, true))
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch prepare artifact \"%s\"",
+							path)));
+	}
+}
+
 /*
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
@@ -4812,20 +4861,31 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
 											  oldest_xid, next_xid,
 											  oldest_commit_ts_xid,
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
-	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl, base, target,
-									oldest_xid, next_xid,
-									oldest_commit_ts_xid, next_commit_ts_xid,
-									oldest_multi, next_multi,
-									oldest_member, next_member,
-									seeded);
+	PG_TRY();
+	{
+		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+										 (uint64) target);
+		pagestore_write_branch_manifest(target_dir, new_tl, parent_tl,
+										base, target,
+										oldest_xid, next_xid,
+										oldest_commit_ts_xid,
+										next_commit_ts_xid,
+										oldest_multi, next_multi,
+										oldest_member, next_member,
+										seeded);
+	}
+	PG_CATCH();
+	{
+		pagestore_cleanup_prepared_branch_output(target_dir);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	PG_RETURN_INT64(seeded);
 }
