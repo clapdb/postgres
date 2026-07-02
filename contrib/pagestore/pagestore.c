@@ -4071,11 +4071,6 @@ pagestore_write_branch_manifest(const char *target_dir,
 	int			fd;
 	int			done = 0;
 
-	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest.tmp") > MAXPGPATH)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("branch target directory path is too long")));
-
 	len = snprintf(manifest, sizeof(manifest),
 				   "{\n"
 				   "  \"format\": 1,\n"
@@ -4112,10 +4107,14 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
 
-	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
-	snprintf(tmppath, sizeof(tmppath), "%s/pagestore_branch.manifest.tmp", target_dir);
+	len = snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	len = snprintf(tmppath, sizeof(tmppath),
+				   "%s/pagestore_branch.manifest.tmp.%ld",
+				   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(len, tmppath);
 	fd = OpenTransientFilePerm(tmppath,
-							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
 							   pg_file_create_mode);
 	if (fd < 0)
 		ereport(ERROR,
@@ -4200,20 +4199,24 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	if (parent_tl < 0)
 		ereport(ERROR,
 				(errmsg("pagestore parent timeline must be >= 0")));
+	if ((uint32) parent_tl != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
+						parent_tl, pagestore_localsvc_timeline())));
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
 											  oldest_xid, next_xid,
 											  oldest_commit_ts_xid,
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl, base, target,
 									oldest_xid, next_xid,
 									oldest_commit_ts_xid, next_commit_ts_xid,
