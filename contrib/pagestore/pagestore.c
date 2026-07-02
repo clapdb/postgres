@@ -3878,9 +3878,9 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 	char		staging_root[MAXPGPATH];
 	char		backup_root[MAXPGPATH];
 	bool		seed_commit_ts;
-	bool		published_xact = false,
-				published_commit_ts = false,
-				published_multixact = false;
+	volatile bool published_xact = false;
+	volatile bool published_commit_ts = false;
+	volatile bool published_multixact = false;
 	int64		seeded = 0;
 	int			pathlen;
 
@@ -4000,11 +4000,11 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 													  "pg_multixact");
 		fsync_fname(target_dir, true);
 		if (!rmtree(staging_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding staging area \"%s\"", staging_root)));
 		if (!rmtree(backup_root, true))
-			ereport(ERROR,
+			ereport(WARNING,
 					(errcode_for_file_access(),
 					 errmsg("could not remove branch seeding backup area \"%s\"", backup_root)));
 	}
