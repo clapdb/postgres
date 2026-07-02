@@ -367,12 +367,24 @@ posix_meta_append(const void *buf, uint32_t len)
 	if (old_size < 0)
 	{
 		close(fd);
+		if (created)
+			(void) unlink(path);
 		return -1;
 	}
+
+	/*
+	 * Every failure below must also remove a file this append created (not
+	 * just truncate it): if an empty log lingered, the next successful append
+	 * would see the file as pre-existing and skip the directory fsync, so its
+	 * directory entry would never be made durable and a crash could drop an
+	 * acknowledged record with it.
+	 */
 	if (write(fd, buf, len) != (ssize_t) len)
 	{
 		posix_truncate_best_effort(fd, old_size);
 		close(fd);
+		if (created)
+			(void) unlink(path);
 		return -1;
 	}
 	if (fsync(fd) != 0)
@@ -380,6 +392,8 @@ posix_meta_append(const void *buf, uint32_t len)
 		posix_truncate_best_effort(fd, old_size);
 		(void) fsync(fd);
 		close(fd);
+		if (created)
+			(void) unlink(path);
 		return -1;
 	}
 	if (close(fd) != 0)

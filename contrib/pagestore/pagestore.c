@@ -4159,14 +4159,21 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode_for_file_access(),
 				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
 	}
-	if (rename(tmppath, path) != 0)
+	/*
+	 * The manifest is the marker that this dir is consumable, so if any part
+	 * of the durable publish (rename + directory fsync) fails it must not
+	 * stay visible while the caller reports the prepare as failed.  The
+	 * unlinks are best-effort: if the directory fsync itself is failing
+	 * there is no stronger rollback available.
+	 */
+	if (durable_rename(tmppath, path, LOG) != 0)
 	{
 		(void) unlink(tmppath);
+		(void) unlink(path);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not publish branch manifest \"%s\": %m", path)));
+				 errmsg("could not durably publish branch manifest \"%s\"", path)));
 	}
-	fsync_fname(target_dir, true);
 }
 
 /*
