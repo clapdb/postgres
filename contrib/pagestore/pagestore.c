@@ -4071,36 +4071,37 @@ pagestore_write_branch_manifest(const char *target_dir,
 	char		tmppath[MAXPGPATH];
 	char		manifest[2048];
 	int			len;
+	int			manifest_len;
 	int			fd;
 	int			done = 0;
 
-	len = snprintf(manifest, sizeof(manifest),
-				   "{\n"
-				   "  \"format\": 1,\n"
-				   "  \"new_timeline\": %d,\n"
-				   "  \"parent_timeline\": %d,\n"
-				   "  \"base_lsn\": \"%X/%08X\",\n"
-				   "  \"fork_lsn\": \"%X/%08X\",\n"
-				   "  \"oldest_xid\": \"%u\",\n"
-				   "  \"next_xid\": \"%u\",\n"
-				   "  \"oldest_commit_ts_xid\": \"%u\",\n"
-				   "  \"next_commit_ts_xid\": \"%u\",\n"
-				   "  \"oldest_multi\": \"%u\",\n"
-				   "  \"next_multi\": \"%u\",\n"
-				   "  \"oldest_member\": \"%lld\",\n"
-				   "  \"next_member\": \"%lld\",\n"
-				   "  \"seeded_slru_pages\": \"%lld\"\n"
-				   "}\n",
-				   new_tl, parent_tl,
-				   LSN_FORMAT_ARGS(base),
-				   LSN_FORMAT_ARGS(target),
-				   oldest_xid, next_xid,
-				   oldest_commit_ts_xid, next_commit_ts_xid,
-				   oldest_multi, next_multi,
-				   (long long) oldest_member,
-				   (long long) next_member,
-				   (long long) seeded_pages);
-	if (len < 0 || len >= (int) sizeof(manifest))
+	manifest_len = snprintf(manifest, sizeof(manifest),
+							"{\n"
+							"  \"format\": 1,\n"
+							"  \"new_timeline\": %d,\n"
+							"  \"parent_timeline\": %d,\n"
+							"  \"base_lsn\": \"%X/%08X\",\n"
+							"  \"fork_lsn\": \"%X/%08X\",\n"
+							"  \"oldest_xid\": \"%u\",\n"
+							"  \"next_xid\": \"%u\",\n"
+							"  \"oldest_commit_ts_xid\": \"%u\",\n"
+							"  \"next_commit_ts_xid\": \"%u\",\n"
+							"  \"oldest_multi\": \"%u\",\n"
+							"  \"next_multi\": \"%u\",\n"
+							"  \"oldest_member\": \"%lld\",\n"
+							"  \"next_member\": \"%lld\",\n"
+							"  \"seeded_slru_pages\": \"%lld\"\n"
+							"}\n",
+							new_tl, parent_tl,
+							LSN_FORMAT_ARGS(base),
+							LSN_FORMAT_ARGS(target),
+							oldest_xid, next_xid,
+							oldest_commit_ts_xid, next_commit_ts_xid,
+							oldest_multi, next_multi,
+							(long long) oldest_member,
+							(long long) next_member,
+							(long long) seeded_pages);
+	if (manifest_len < 0 || manifest_len >= (int) sizeof(manifest))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest is too large")));
@@ -4123,12 +4124,12 @@ pagestore_write_branch_manifest(const char *target_dir,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch manifest \"%s\": %m", tmppath)));
-	while (done < len)
+	while (done < manifest_len)
 	{
 		ssize_t		written;
 
 		errno = 0;
-		written = write(fd, manifest + done, len - done);
+		written = write(fd, manifest + done, manifest_len - done);
 		if (written <= 0)
 		{
 			if (written == 0)
