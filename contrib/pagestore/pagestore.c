@@ -4353,21 +4353,60 @@ pagestore_manifest_has_string_token(const char *manifest, const char *key,
 }
 
 static bool
+pagestore_manifest_is_single_object(const char *manifest)
+{
+	const char *p = pagestore_manifest_skip_ws(manifest);
+	int			depth = 0;
+
+	if (*p != '{')
+		return false;
+	while (*p != '\0')
+	{
+		if (*p == '"')
+		{
+			p++;
+			while (*p != '\0')
+			{
+				if (*p == '\\' && p[1] != '\0')
+				{
+					p += 2;
+					continue;
+				}
+				if (*p == '"')
+					break;
+				p++;
+			}
+			if (*p == '\0')
+				return false;
+		}
+		else if (*p == '{' || *p == '[')
+			depth++;
+		else if (*p == '}' || *p == ']')
+		{
+			depth--;
+			if (depth == 0)
+			{
+				p = pagestore_manifest_skip_ws(p + 1);
+				return *p == '\0';
+			}
+			if (depth < 0)
+				return false;
+		}
+		p++;
+	}
+	return false;
+}
+
+static bool
 pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 						   XLogRecPtr fork_lsn)
 {
 	char		buf[64];
 	int			len;
-	const char *p;
 
-	p = pagestore_manifest_skip_ws(manifest);
-	if (*p != '{')
+	if (new_tl <= 0 || parent_tl < 0)
 		return false;
-	p += strlen(p);
-	while (p > manifest &&
-		   (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
-		p--;
-	if (p == manifest || p[-1] != '}')
+	if (!pagestore_manifest_is_single_object(manifest))
 		return false;
 
 	if (!pagestore_manifest_has_token(manifest, "format", "1"))
