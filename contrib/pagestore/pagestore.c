@@ -454,8 +454,9 @@ pagestore_read_at(PG_FUNCTION_ARGS)
  *
  * Create a copy-on-write branch: a new timeline forked from parent_timeline at
  * the given LSN.  Instant -- no page data is copied; the branch shares the
- * parent's pages until it writes.  A compute can then run on the branch by
- * setting pagestore.timeline to new_timeline.
+ * parent's pages until it writes.  This only creates the store-side timeline;
+ * booting a compute on a branch timeline must use the prepared branch
+ * manifest/install flow so local SLRUs match the fork point.
  */
 PG_FUNCTION_INFO_V1(pagestore_create_branch);
 
@@ -4768,7 +4769,12 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
-		return;					/* legacy/non-branch datadir */
+	{
+		if (pagestore_localsvc_timeline() != 0)
+			ereport(FATAL,
+					(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
+		return;
+	}
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
