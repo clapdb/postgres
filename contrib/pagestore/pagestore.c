@@ -58,6 +58,7 @@
 #include "storage/aio.h"
 #include "storage/bufpage.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
@@ -76,6 +77,7 @@ static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -4179,7 +4181,10 @@ pagestore_read_branch_manifest(const char *target_dir)
 	if (file == NULL)
 	{
 		if (errno == ENOENT)
+		{
+			/* No manifest means this is a legacy/non-branch datadir. */
 			return NULL;
+		}
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open branch manifest \"%s\": %m", path)));
@@ -4318,19 +4323,38 @@ pagestore_manifest_value_delimited(const char *p)
 }
 
 static bool
-pagestore_manifest_has_token(const char *manifest, const char *key,
-							 const char *value)
+pagestore_manifest_get_uint_token(const char *manifest, const char *key,
+								  uint32_t *value)
 {
 	const char *field = pagestore_manifest_find_unique_field(manifest, key);
-	size_t		len = strlen(value);
+	char	   *endptr;
+	unsigned long long parsed;
 
-	if (field == NULL)
+	if (field == NULL || *field == '"')
 		return false;
-	if (*field == '"')
+	if (*field < '0' || *field > '9')
 		return false;
-	if (strncmp(field, value, len) != 0)
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field)
 		return false;
-	return pagestore_manifest_value_delimited(field + len);
+	if (parsed > UINT32_MAX)
+		return false;
+	if (!pagestore_manifest_value_delimited(endptr))
+		return false;
+	*value = (uint32_t) parsed;
+	return true;
+}
+
+static bool
+pagestore_manifest_has_uint_token(const char *manifest, const char *key,
+								 uint32_t value)
+{
+	uint32_t	parsed;
+
+	if (!pagestore_manifest_get_uint_token(manifest, key, &parsed))
+		return false;
+	return parsed == value;
 }
 
 static bool
@@ -4350,6 +4374,37 @@ pagestore_manifest_has_string_token(const char *manifest, const char *key,
 	if (field[len] != '"')
 		return false;
 	return pagestore_manifest_value_delimited(field + len + 1);
+}
+
+static bool
+pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
+								XLogRecPtr *lsn)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	const char *end;
+	char		buf[64];
+	size_t		len;
+	unsigned int hi,
+				lo;
+	char		extra;
+
+	if (field == NULL || *field != '"')
+		return false;
+	field++;
+	end = strchr(field, '"');
+	if (end == NULL)
+		return false;
+	len = end - field;
+	if (len == 0 || len >= sizeof(buf))
+		return false;
+	memcpy(buf, field, len);
+	buf[len] = '\0';
+	if (sscanf(buf, "%X/%X%c", &hi, &lo, &extra) != 2)
+		return false;
+	if (!pagestore_manifest_value_delimited(end + 1))
+		return false;
+	*lsn = ((uint64) hi << 32) | lo;
+	return true;
 }
 
 static bool
@@ -4582,21 +4637,21 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	if (!pagestore_manifest_is_single_object(manifest))
 		return false;
 
-	if (!pagestore_manifest_has_token(manifest, "format", "1"))
+	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", new_tl);
+	len = snprintf(buf, sizeof(buf), "%u", new_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "new_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "new_timeline", new_tl))
 		return false;
-	len = snprintf(buf, sizeof(buf), "%d", parent_tl);
+	len = snprintf(buf, sizeof(buf), "%u", parent_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest token is too large")));
-	if (!pagestore_manifest_has_token(manifest, "parent_timeline", buf))
+	if (!pagestore_manifest_has_uint_token(manifest, "parent_timeline", parent_tl))
 		return false;
 	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(fork_lsn));
 	if (len < 0 || len >= (int) sizeof(buf))
@@ -4606,6 +4661,30 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	if (!pagestore_manifest_has_string_token(manifest, "fork_lsn", buf))
 		return false;
 	return true;
+}
+
+static bool
+pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
+									   uint32_t *parent_tl,
+									   XLogRecPtr *fork_lsn)
+{
+	uint32_t	format;
+
+	if (!pagestore_manifest_is_single_object(manifest))
+		return false;
+
+	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
+		format == 1 &&
+		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
+		*new_tl != 0 &&
+		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
+		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+}
+
+static inline bool
+pagestore_branch_backend_active(void)
+{
+	return pagestore_active_backend == &PageStoreBackendLocalSvc;
 }
 
 /*
@@ -4633,6 +4712,9 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to validate a branch manifest")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 	if (new_tl <= 0 || parent_tl < 0)
 		PG_RETURN_BOOL(false);
 
@@ -4641,6 +4723,39 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 	PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
 											  fork_lsn));
+}
+
+static void
+pagestore_validate_datadir_branch_manifest(void)
+{
+	char	   *manifest;
+	uint32_t	new_tl;
+	uint32_t	parent_tl;
+	XLogRecPtr	fork_lsn;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	if (DataDir == NULL)
+		return;
+
+	manifest = pagestore_read_branch_manifest(DataDir);
+	if (manifest == NULL)
+		return;					/* legacy/non-branch datadir */
+	if (!pagestore_branch_backend_active())
+		ereport(FATAL,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
+	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
+												&fork_lsn))
+		ereport(FATAL,
+				(errmsg("invalid pagestore branch manifest in data directory")));
+	if (new_tl != pagestore_localsvc_timeline())
+		ereport(FATAL,
+				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
+				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl,
+											  (uint64) fork_lsn, 5000);
+	pagestore_localsvc_detach();
 }
 
 /*
@@ -4780,4 +4895,7 @@ _PG_init(void)
 	/* register our smgr implementation and claim relations via the hook */
 	pagestore_smgr_which = smgr_register(&pagestore_smgr);
 	smgr_which_hook = pagestore_which;
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;
 }

@@ -638,6 +638,24 @@ printf '{ "format": 1, "new_timeline": 2, "parent_timeline": 0, "fork_lsn": "%s"
 nulManifest=$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');" 2>/dev/null || echo ERROR)
 assert "$nulManifest" "ERROR" "branch manifest validator rejects embedded NUL bytes"
 mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manifest"
+cp "$PREPSEED/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
+if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - branch startup rejected a manifest/timeline mismatch"
+	fail=1
+	"$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
+else
+	echo "ok   - branch startup rejects a manifest/timeline mismatch"
+fi
+cat >> "$BRANCHDATA/postgresql.conf" <<EOF
+pagestore.timeline = 2
+EOF
+if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
+	echo "ok   - branch startup accepts a manifest/timeline match"
+	"$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1
+else
+	echo "FAIL - branch startup did not accept a manifest/timeline match"
+	fail=1
+fi
 prepClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_xact/$bootClogSeg', $(( bootClogPage * bs )), $bs));")
 assert "$prepClogMd5" "$bootClogRecon" "branch prepare pg_xact page == reconstructed as-of-L page"
 prepMxOff=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
