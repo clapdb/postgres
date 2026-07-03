@@ -303,7 +303,7 @@ gc_resume(void)
 		 * write error may have torn the manifest tail; stop so that record stays
 		 * the recoverable tail instead of becoming interior corruption, and the
 		 * next start retries from the last valid manifest state.
-		 */
+	 */
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
@@ -532,6 +532,36 @@ typedef struct TimelineMeta
 
 static TimelineMeta timelines[MAX_TIMELINES];
 
+/*
+ * Branch-local usage marker: set once a timeline acquires any local state (a
+ * page version or fork entry here; shipped WAL is tracked by wal_end[]).  An
+ * exact-match duplicate CREATE_BRANCH is accepted only while the timeline is
+ * still unused: that keeps a prepare retry idempotent (retries happen before
+ * a compute ever boots on the branch), while reusing the id of a live branch
+ * is refused -- read_through() resolves timeline-local versions before the
+ * parent snapshot, so a "fresh" branch recreated over a written timeline
+ * would silently serve the previous branch's pages.
+ */
+static int timeline_used[MAX_TIMELINES];
+
+static inline void
+timeline_mark_used(uint32_t timeline)
+{
+	if (timeline < MAX_TIMELINES)
+		__atomic_store_n(&timeline_used[timeline], 1, __ATOMIC_RELEASE);
+}
+
+static inline int
+timeline_is_used(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&timeline_used[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* highest end LSN (start+len) of shipped WAL received per timeline */
+static uint64_t wal_end[MAX_TIMELINES];
+
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
 static uint32_t
@@ -592,6 +622,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -651,6 +682,7 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_find(timeline, key);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -758,7 +790,8 @@ tl_walk_next(TlWalk *w)
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
  *	- a new id that is out of range, or an already-defined id with mismatched
- *	  ancestry metadata (unless it exactly matches for idempotent retry);
+ *	  ancestry metadata (an exact match is an idempotent retry, but only while
+ *	  the timeline is still unused -- see timeline_used[]);
  *	- a parent that is out of range or not yet defined (the requested parent must
  *	  actually exist, else the branch silently inherits from nothing);
  *	- a parent whose ancestry already reaches the new id, which would turn the
@@ -768,10 +801,16 @@ tl_walk_next(TlWalk *w)
 static int
 branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 {
-	/* Exact matches to an existing definition are idempotent retries. */
+	/*
+	 * Exact matches to an existing definition are idempotent retries -- but
+	 * only while the timeline has no branch-local state yet.  Once it has
+	 * pages, forks or shipped WAL, the duplicate is timeline-id reuse, not a
+	 * retry, and accepting it would hand the caller the old branch's data.
+		 */
 	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
 		return timelines[new_tl].parent == parent &&
-			timelines[new_tl].branch_lsn == branch_lsn;
+			timelines[new_tl].branch_lsn == branch_lsn &&
+			!timeline_is_used(new_tl) && wal_end[new_tl] == 0;
 
 	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
 		parent >= MAX_TIMELINES || !timelines[parent].defined)
@@ -916,9 +955,6 @@ typedef struct WalRecHdr
 	uint64_t	start_lsn;		/* LSN of the first byte */
 } WalRecHdr;
 
-/* highest end LSN (start+len) received per timeline */
-static uint64_t wal_end[MAX_TIMELINES];
-
 static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
@@ -1026,6 +1062,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
 	WalIdxEnt  *e;
+
+	timeline_mark_used(tl);
 
 	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
