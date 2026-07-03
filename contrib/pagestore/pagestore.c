@@ -4318,6 +4318,8 @@ pagestore_manifest_find_unique_field(const char *manifest, const char *key)
 			{
 				const char *value = pagestore_manifest_skip_ws(end + 1);
 
+				if (memchr(name, '\\', end - name) != NULL)
+					return NULL;
 				if (*value == ':' &&
 					(size_t) (end - name) == keylen &&
 					strncmp(name, key, keylen) == 0)
@@ -4808,7 +4810,7 @@ pagestore_validate_branch_manifest(PG_FUNCTION_ARGS)
 	manifest = pagestore_read_branch_manifest(target_dir);
 	if (manifest == NULL)
 		PG_RETURN_BOOL(false);
-	PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
+PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
 											  fork_lsn));
 }
 
