@@ -414,12 +414,21 @@ for slru in pg_xact pg_commit_ts pg_multixact; do
 		fail=1
 	fi
 done
+cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
 port = $PORT2
 archive_mode = off
 EOF
+if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - branch startup accepted the prepared manifest without full routing"
+	fail=1
+	"$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
+else
+	echo "ok   - branch startup validates the prepared manifest and rejects missing full routing"
+fi
+rm -f "$BRANCHDATA/pagestore_branch.manifest"
 "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1
 PB="$BIN/psql -h 127.0.0.1 -p $PORT2 -U postgres -tA"
 assert "$($PB -c "SELECT count(*) FROM tb WHERE note='before_L';" 2>/dev/null)" "1" \
