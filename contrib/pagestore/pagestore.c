@@ -4657,6 +4657,7 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 	char	   *seeded_end;
 	long long	seeded;
 	int			len;
+	volatile bool read_failed = false;
 
 #define CHECK_MANIFEST_LINE(...) \
 	do { \
@@ -4666,7 +4667,18 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 			return false; \
 	} while (0)
 
-	manifest = pagestore_read_branch_manifest(target_dir);
+	PG_TRY();
+	{
+		manifest = pagestore_read_branch_manifest(target_dir);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		read_failed = true;
+	}
+	PG_END_TRY();
+	if (read_failed)
+		return false;
 	if (manifest == NULL)
 		return false;
 	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, target))
