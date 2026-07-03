@@ -4164,14 +4164,21 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode_for_file_access(),
 				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
 	}
-	if (rename(tmppath, path) != 0)
+	/*
+	 * The manifest is the marker that this dir is consumable, so if any part
+	 * of the durable publish (rename + directory fsync) fails it must not
+	 * stay visible while the caller reports the prepare as failed.  The
+	 * unlinks are best-effort: if the directory fsync itself is failing
+	 * there is no stronger rollback available.
+	 */
+	if (durable_rename(tmppath, path, LOG) != 0)
 	{
 		(void) unlink(tmppath);
+		(void) unlink(path);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not publish branch manifest \"%s\": %m", path)));
+				 errmsg("could not durably publish branch manifest \"%s\"", path)));
 	}
-	fsync_fname(target_dir, true);
 }
 
 static char *
@@ -4804,6 +4811,8 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	int64		oldest_member = PG_GETARG_INT64(11);
 	int64		next_member = PG_GETARG_INT64(12);
 	int64		seeded;
+	char		manifest_path[MAXPGPATH];
+	int			pathlen;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -4825,12 +4834,45 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+
+	/*
+	 * From here until the new manifest is published the target's SLRUs may
+	 * not match any manifest, so durably invalidate a manifest left by a
+	 * previous prepare before touching them.  The manifest is what marks a
+	 * prepared dir as consumable, so every failure below -- SLRU seeding,
+	 * CREATE_BRANCH being refused after the store raced ahead, the manifest
+	 * write itself -- leaves the dir inert instead of advertising stale or
+	 * half-updated contents.
+	 */
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
 											  oldest_xid, next_xid,
 											  oldest_commit_ts_xid,
 											  next_commit_ts_xid,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
+
+	/*
+	 * Publish the manifest only after the store-side timeline exists: the
+	 * manifest is the durable handoff artifact for later bootstrap, so it must
+	 * never advertise a branch that CREATE_BRANCH refused (e.g. the same
+	 * timeline raced into existence with different ancestry during seeding).
+	 * The reverse window is retry-safe: if the manifest write fails here, the
+	 * timeline already exists and a retried prepare passes CHECK_BRANCH and
+	 * re-runs CREATE_BRANCH idempotently.
+	 */
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl,
 									base, target,
 									oldest_xid, next_xid,
@@ -4839,8 +4881,6 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 									oldest_multi, next_multi,
 									oldest_member, next_member,
 									seeded);
-	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
 
 	PG_RETURN_INT64(seeded);
 }
