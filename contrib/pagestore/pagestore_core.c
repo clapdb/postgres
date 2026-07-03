@@ -303,7 +303,7 @@ gc_resume(void)
 		 * write error may have torn the manifest tail; stop so that record stays
 		 * the recoverable tail instead of becoming interior corruption, and the
 		 * next start retries from the last valid manifest state.
-		 */
+	 */
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
@@ -540,12 +540,24 @@ static TimelineMeta timelines[MAX_TIMELINES];
  * a compute ever boots on the branch), while reusing the id of a live branch
  * is refused -- read_through() resolves timeline-local versions before the
  * parent snapshot, so a "fresh" branch recreated over a written timeline
- * would silently serve the previous branch's pages.  Plain ints, not
- * atomics: every writer stores 1, and a duplicate create racing the
- * timeline's very first write is indistinguishable from that write landing
- * just after an accepted create.
+ * would silently serve the previous branch's pages.
  */
 static int timeline_used[MAX_TIMELINES];
+
+static inline void
+timeline_mark_used(uint32_t timeline)
+{
+	if (timeline < MAX_TIMELINES)
+		__atomic_store_n(&timeline_used[timeline], 1, __ATOMIC_RELEASE);
+}
+
+static inline int
+timeline_is_used(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&timeline_used[timeline], __ATOMIC_ACQUIRE);
+}
 
 /* highest end LSN (start+len) of shipped WAL received per timeline */
 static uint64_t wal_end[MAX_TIMELINES];
@@ -610,8 +622,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
 
-	if (timeline < MAX_TIMELINES)
-		timeline_used[timeline] = 1;
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -671,8 +682,7 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_find(timeline, key);
 
-	if (timeline < MAX_TIMELINES)
-		timeline_used[timeline] = 1;
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -796,11 +806,11 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 	 * only while the timeline has no branch-local state yet.  Once it has
 	 * pages, forks or shipped WAL, the duplicate is timeline-id reuse, not a
 	 * retry, and accepting it would hand the caller the old branch's data.
-	 */
+		 */
 	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
 		return timelines[new_tl].parent == parent &&
 			timelines[new_tl].branch_lsn == branch_lsn &&
-			!timeline_used[new_tl] && wal_end[new_tl] == 0;
+			!timeline_is_used(new_tl) && wal_end[new_tl] == 0;
 
 	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
 		parent >= MAX_TIMELINES || !timelines[parent].defined)
@@ -1052,6 +1062,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
 	WalIdxEnt  *e;
+
+	timeline_mark_used(tl);
 
 	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
