@@ -313,22 +313,133 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 	return (int) n;
 }
 
+/*
+ * Truncate fd back to old_size on an error path.  Best-effort: the caller
+ * is already returning an error and cannot act on a rollback failure; the
+ * torn tail is detected and discarded on the next meta read.
+ */
+static void
+posix_truncate_best_effort(int fd, off_t old_size)
+{
+	if (ftruncate(fd, old_size) != 0)
+	{
+		/* nothing we can do; see above */
+	}
+}
+
+static void
+posix_fsync_dir_best_effort(void)
+{
+	int		fd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+
+	if (fd >= 0)
+	{
+		(void) fsync(fd);
+		close(fd);
+	}
+}
+
+static void
+posix_unlink_created_meta(const char *path)
+{
+	if (unlink(path) == 0)
+		posix_fsync_dir_best_effort();
+}
+
+/*
+ * Roll back an append whose record may already be durable in the metadata
+ * log: reopen the log, truncate it back to old_size, and push the truncate
+ * out.  If this append created the file, remove it again -- otherwise a
+ * failed append is reported as an error yet a daemon restart would replay
+ * the record from the log and resurrect it.  Best-effort, like
+ * posix_truncate_best_effort().
+ */
+static void
+posix_meta_rollback(const char *path, off_t old_size, int created)
+{
+	int		fd = open(path, O_WRONLY);
+
+	if (fd >= 0)
+	{
+		posix_truncate_best_effort(fd, old_size);
+		(void) fsync(fd);
+		close(fd);
+	}
+	if (created && old_size == 0)
+		posix_unlink_created_meta(path);
+}
+
 static int
 posix_meta_append(const void *buf, uint32_t len)
 {
 	char		path[4096];
 	int		fd;
+	int		created;
+	off_t		old_size;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	created = access(path, F_OK) != 0;
 	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
 		return -1;
-	if (write(fd, buf, len) != (ssize_t) len)
+	old_size = lseek(fd, 0, SEEK_END);
+	if (old_size < 0)
 	{
 		close(fd);
+		if (created)
+			posix_unlink_created_meta(path);
 		return -1;
 	}
-	close(fd);
+
+	/*
+	 * Every failure below must also remove a file this append created (not
+	 * just truncate it): if an empty log lingered, the next successful append
+	 * would see the file as pre-existing and skip the directory fsync, so its
+	 * directory entry would never be made durable and a crash could drop an
+	 * acknowledged record with it.
+	 */
+	if (write(fd, buf, len) != (ssize_t) len)
+	{
+		posix_truncate_best_effort(fd, old_size);
+		close(fd);
+		if (created)
+			posix_unlink_created_meta(path);
+		return -1;
+	}
+	if (fsync(fd) != 0)
+	{
+		posix_truncate_best_effort(fd, old_size);
+		(void) fsync(fd);
+		close(fd);
+		if (created)
+			posix_unlink_created_meta(path);
+		return -1;
+	}
+	if (close(fd) != 0)
+	{
+		posix_meta_rollback(path, old_size, created);
+		return -1;
+	}
+	if (created)
+	{
+		fd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+		if (fd < 0)
+		{
+			posix_meta_rollback(path, old_size, created);
+			return -1;
+		}
+		if (fsync(fd) != 0)
+		{
+			close(fd);
+			posix_meta_rollback(path, old_size, created);
+			return -1;
+		}
+		if (close(fd) != 0)
+		{
+			posix_meta_rollback(path, old_size, created);
+			return -1;
+		}
+	}
 	return 0;
 }
 

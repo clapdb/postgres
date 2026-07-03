@@ -530,6 +530,24 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
  * for the pagestore_create_branch() SQL function.
  */
 void
+pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
+								uint64 branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_CHECK_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec(ch);
+}
+
+/*
+ * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
+ * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
+ * for the pagestore_create_branch() SQL function.
+ */
+void
 pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 								 uint64 branch_lsn)
 {

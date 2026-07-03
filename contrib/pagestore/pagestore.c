@@ -31,6 +31,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -3863,93 +3864,88 @@ rollback_seeded_slru_dir(const char *target_root, const char *backup_root,
  * bootstrap helper can derive these horizons from the fork manifest and call
  * this single function.
  */
-PG_FUNCTION_INFO_V1(pagestore_seed_branch_slrus);
-Datum
-pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
+static int64
+pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
+								 XLogRecPtr target, TransactionId oldest_xid,
+								 TransactionId next_xid,
+								 TransactionId oldest_commit_ts_xid,
+								 TransactionId next_commit_ts_xid,
+								 MultiXactId oldest_multi,
+								 MultiXactId next_multi,
+								 int64 oldest_member, int64 next_member)
 {
-	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	XLogRecPtr	base = PG_GETARG_LSN(1);
-	XLogRecPtr	target = PG_GETARG_LSN(2);
-	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
-	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
-	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
-		TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
-		MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(7);
-		MultiXactId next_multi = PG_GETARG_TRANSACTIONID(8);
-		int64		oldest_member = PG_GETARG_INT64(9);
-		int64		next_member = PG_GETARG_INT64(10);
-		Datum		staging_dir_datum;
-		char		staging_root[MAXPGPATH];
-		char		backup_root[MAXPGPATH];
-		bool		seed_commit_ts;
-		volatile bool published_xact = false;
-		volatile bool published_commit_ts = false;
-		volatile bool published_multixact = false;
-		int64		seeded = 0;
-		int			pathlen;
+	Datum		staging_dir_datum;
+	char		staging_root[MAXPGPATH];
+	char		backup_root[MAXPGPATH];
+	bool		seed_commit_ts;
+	volatile bool published_xact = false;
+	volatile bool published_commit_ts = false;
+	volatile bool published_multixact = false;
+	int64		seeded = 0;
+	int			pathlen;
 
-		if (!superuser())
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to seed branch SLRUs")));
-		if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
-			ereport(ERROR,
-					(errmsg("pagestore.backend must be 'localsvc'")));
-		if (target < base)
-			ereport(ERROR,
-					(errmsg("target LSN precedes the base cutoff")));
-		if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
-			TransactionIdFollows(oldest_xid, next_xid))
-			ereport(ERROR,
-					(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
-		if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
-			!TransactionIdIsNormal(next_commit_ts_xid))
-			seed_commit_ts = false;
-		else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
-				 !TransactionIdIsNormal(next_commit_ts_xid) ||
-				 TransactionIdFollows(oldest_commit_ts_xid, next_commit_ts_xid))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid commit-ts horizon [%u, %u)",
-							oldest_commit_ts_xid, next_commit_ts_xid)));
-		else
-			seed_commit_ts = true;
-		if (!MultiXactIdIsValid(oldest_multi) ||
-			(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
-			(oldest_multi != next_multi &&
-			 !MultiXactIdPrecedes(oldest_multi, next_multi)))
-			ereport(ERROR,
-					(errmsg("invalid fork multixact horizon [%u, %u)",
-							oldest_multi, next_multi)));
-		if (oldest_member < 0 || next_member < 0 ||
-			oldest_member > UINT32_MAX ||
-			next_member > UINT32_MAX)
-			ereport(ERROR,
-					(errmsg("invalid fork multixact member horizon [%lld, %lld)",
-							(long long) oldest_member, (long long) next_member)));
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch SLRUs")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
+		!TransactionIdIsNormal(next_commit_ts_xid))
+		seed_commit_ts = false;
+	else if (!TransactionIdIsNormal(oldest_commit_ts_xid) ||
+			 !TransactionIdIsNormal(next_commit_ts_xid) ||
+			 TransactionIdFollows(oldest_commit_ts_xid, next_commit_ts_xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid commit-ts horizon [%u, %u)",
+						oldest_commit_ts_xid, next_commit_ts_xid)));
+	else
+		seed_commit_ts = true;
+	if (!MultiXactIdIsValid(oldest_multi) ||
+		(next_multi != InvalidMultiXactId && !MultiXactIdIsValid(next_multi)) ||
+		(oldest_multi != next_multi &&
+		 !MultiXactIdPrecedes(oldest_multi, next_multi)))
+		ereport(ERROR,
+				(errmsg("invalid fork multixact horizon [%u, %u)",
+						oldest_multi, next_multi)));
+	if (oldest_member < 0 || next_member < 0 ||
+		oldest_member > UINT32_MAX ||
+		next_member > UINT32_MAX)
+		ereport(ERROR,
+				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
+						(long long) oldest_member, (long long) next_member)));
 
-		pathlen = snprintf(staging_root, sizeof(staging_root),
-						   "%s/.pagestore-branch-seed.%ld",
-						   target_dir, (long) MyProcPid);
-		PS_CHECK_PATH_FORMAT(pathlen, staging_root);
-		pathlen = snprintf(backup_root, sizeof(backup_root),
-						   "%s/.pagestore-branch-backup.%ld",
-						   target_dir, (long) MyProcPid);
-		PS_CHECK_PATH_FORMAT(pathlen, backup_root);
-		staging_dir_datum = CStringGetTextDatum(staging_root);
+	pathlen = snprintf(staging_root, sizeof(staging_root),
+					   "%s/.pagestore-branch-seed.%ld",
+					   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(pathlen, staging_root);
+	pathlen = snprintf(backup_root, sizeof(backup_root),
+					   "%s/.pagestore-branch-backup.%ld",
+					   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(pathlen, backup_root);
+	staging_dir_datum = CStringGetTextDatum(staging_root);
 
-		if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
-		if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not clear previous branch seeding backup area \"%s\"", backup_root)));
-		if (MakePGDirectory(staging_root) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
+	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear previous branch seeding staging area \"%s\"", staging_root)));
+	if (access(backup_root, F_OK) == 0 && !rmtree(backup_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear previous branch seeding backup area \"%s\"", backup_root)));
+	if (MakePGDirectory(staging_root) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch seeding staging area \"%s\"", staging_root)));
 
 	PG_TRY();
 	{
@@ -3962,27 +3958,27 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 
 		if (seed_commit_ts)
 			seeded += DatumGetInt64(DirectFunctionCall5(pagestore_seed_commit_ts,
-											  staging_dir_datum,
-											  LSNGetDatum(base),
-											  LSNGetDatum(target),
-											  TransactionIdGetDatum(oldest_commit_ts_xid),
-											  TransactionIdGetDatum(next_commit_ts_xid)));
-
-		seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
 										  staging_dir_datum,
 										  LSNGetDatum(base),
 										  LSNGetDatum(target),
-										  MultiXactIdGetDatum(oldest_multi),
-										  MultiXactIdGetDatum(next_multi),
-										  Int64GetDatum(oldest_member),
-										  Int64GetDatum(next_member)));
+										  TransactionIdGetDatum(oldest_commit_ts_xid),
+										  TransactionIdGetDatum(next_commit_ts_xid)));
+
+		seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
+									  staging_dir_datum,
+									  LSNGetDatum(base),
+									  LSNGetDatum(target),
+									  MultiXactIdGetDatum(oldest_multi),
+									  MultiXactIdGetDatum(next_multi),
+									  Int64GetDatum(oldest_member),
+									  Int64GetDatum(next_member)));
 	}
 	PG_CATCH();
 	{
 		if (!rmtree(staging_root, true))
 			ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove branch seeding staging area after seed failure \"%s\"", staging_root)));
+					(errcode_for_file_access(),
+					 errmsg("could not remove branch seeding staging area after seed failure \"%s\"", staging_root)));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -4032,6 +4028,368 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	return seeded;
+}
+
+PG_FUNCTION_INFO_V1(pagestore_seed_branch_slrus);
+Datum
+pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	PG_RETURN_INT64(pagestore_seed_branch_slrus_impl(target_dir,
+													 PG_GETARG_LSN(1),
+													 PG_GETARG_LSN(2),
+													 PG_GETARG_TRANSACTIONID(3),
+													 PG_GETARG_TRANSACTIONID(4),
+													 PG_GETARG_TRANSACTIONID(5),
+													 PG_GETARG_TRANSACTIONID(6),
+													 PG_GETARG_TRANSACTIONID(7),
+													 PG_GETARG_TRANSACTIONID(8),
+													 PG_GETARG_INT64(9),
+													 PG_GETARG_INT64(10)));
+}
+
+static void
+pagestore_write_branch_manifest(const char *target_dir,
+								int32 new_tl, int32 parent_tl,
+								XLogRecPtr base, XLogRecPtr target,
+								TransactionId oldest_xid,
+								TransactionId next_xid,
+								TransactionId oldest_commit_ts_xid,
+								TransactionId next_commit_ts_xid,
+								MultiXactId oldest_multi,
+								MultiXactId next_multi,
+								int64 oldest_member,
+								int64 next_member,
+								int64 seeded_pages)
+{
+	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	char		manifest[2048];
+	int			len;
+	int			manifest_len;
+	int			fd;
+	int			done = 0;
+
+	manifest_len = snprintf(manifest, sizeof(manifest),
+							"{\n"
+							"  \"format\": 1,\n"
+							"  \"new_timeline\": %d,\n"
+							"  \"parent_timeline\": %d,\n"
+							"  \"base_lsn\": \"%X/%08X\",\n"
+							"  \"fork_lsn\": \"%X/%08X\",\n"
+							"  \"oldest_xid\": \"%u\",\n"
+							"  \"next_xid\": \"%u\",\n"
+							"  \"oldest_commit_ts_xid\": \"%u\",\n"
+							"  \"next_commit_ts_xid\": \"%u\",\n"
+							"  \"oldest_multi\": \"%u\",\n"
+							"  \"next_multi\": \"%u\",\n"
+							"  \"oldest_member\": \"%lld\",\n"
+							"  \"next_member\": \"%lld\",\n"
+							"  \"seeded_slru_pages\": \"%lld\"\n"
+							"}\n",
+							new_tl, parent_tl,
+							LSN_FORMAT_ARGS(base),
+							LSN_FORMAT_ARGS(target),
+							oldest_xid, next_xid,
+							oldest_commit_ts_xid, next_commit_ts_xid,
+							oldest_multi, next_multi,
+							(long long) oldest_member,
+							(long long) next_member,
+							(long long) seeded_pages);
+	if (manifest_len < 0 || manifest_len >= (int) sizeof(manifest))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch manifest is too large")));
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+
+	len = snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	len = snprintf(tmppath, sizeof(tmppath),
+				   "%s/pagestore_branch.manifest.tmp.%ld",
+				   target_dir, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(len, tmppath);
+	if (access(tmppath, F_OK) == 0 && unlink(tmppath) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear stale branch manifest temp file \"%s\": %m",
+						tmppath)));
+	fd = OpenTransientFilePerm(tmppath,
+							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
+							   pg_file_create_mode);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch manifest \"%s\": %m", tmppath)));
+	while (done < manifest_len)
+	{
+		ssize_t		written;
+
+		errno = 0;
+		written = write(fd, manifest + done, manifest_len - done);
+		if (written <= 0)
+		{
+			if (written == 0)
+				errno = ENOSPC;
+			CloseTransientFile(fd);
+			(void) unlink(tmppath);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write branch manifest \"%s\": %m", tmppath)));
+		}
+		done += written;
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		(void) unlink(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync branch manifest \"%s\": %m", tmppath)));
+	}
+	if (CloseTransientFile(fd) != 0)
+	{
+		(void) unlink(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
+	}
+	/*
+	 * The manifest is the marker that this dir is consumable, so if any part
+	 * of the durable publish (rename + directory fsync) fails it must not
+	 * stay visible while the caller reports the prepare as failed.  The
+	 * unlinks are best-effort: if the directory fsync itself is failing
+	 * there is no stronger rollback available.
+	 */
+	if (durable_rename(tmppath, path, LOG) != 0)
+	{
+		(void) unlink(tmppath);
+		(void) unlink(path);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not durably publish branch manifest \"%s\"", path)));
+	}
+}
+
+static bool
+pagestore_manifest_has_line(const char *manifest, const char *line)
+{
+	return strstr(manifest, line) != NULL;
+}
+
+static bool
+pagestore_existing_branch_manifest_matches(const char *target_dir,
+										   int32 new_tl, int32 parent_tl,
+										   XLogRecPtr base, XLogRecPtr target,
+										   TransactionId oldest_xid,
+										   TransactionId next_xid,
+										   TransactionId oldest_commit_ts_xid,
+										   TransactionId next_commit_ts_xid,
+										   MultiXactId oldest_multi,
+										   MultiXactId next_multi,
+										   int64 oldest_member,
+										   int64 next_member,
+										   int64 *seeded_pages)
+{
+	char		path[MAXPGPATH];
+	char		manifest[4096];
+	char		line[128];
+	char	   *seeded_start;
+	char	   *seeded_end;
+	long long	seeded;
+	FILE	   *file;
+	size_t		nread;
+	int			len;
+
+#define CHECK_MANIFEST_LINE(...) \
+	do { \
+		len = snprintf(line, sizeof(line), __VA_ARGS__); \
+		if (len < 0 || len >= (int) sizeof(line) || \
+			!pagestore_manifest_has_line(manifest, line)) \
+			return false; \
+	} while (0)
+
+	len = snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	file = AllocateFile(path, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno == ENOENT)
+			return false;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open branch manifest \"%s\": %m", path)));
+	}
+	nread = fread(manifest, 1, sizeof(manifest) - 1, file);
+	if (ferror(file))
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	if (!feof(file))
+	{
+		FreeFile(file);
+		return false;
+	}
+	FreeFile(file);
+	if (memchr(manifest, '\0', nread) != NULL)
+		return false;
+	manifest[nread] = '\0';
+
+	CHECK_MANIFEST_LINE("  \"format\": 1,\n");
+	CHECK_MANIFEST_LINE("  \"new_timeline\": %d,\n", new_tl);
+	CHECK_MANIFEST_LINE("  \"parent_timeline\": %d,\n", parent_tl);
+	CHECK_MANIFEST_LINE("  \"base_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(base));
+	CHECK_MANIFEST_LINE("  \"fork_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(target));
+	CHECK_MANIFEST_LINE("  \"oldest_xid\": \"%u\",\n", oldest_xid);
+	CHECK_MANIFEST_LINE("  \"next_xid\": \"%u\",\n", next_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_commit_ts_xid\": \"%u\",\n", oldest_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"next_commit_ts_xid\": \"%u\",\n", next_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_multi\": \"%u\",\n", oldest_multi);
+	CHECK_MANIFEST_LINE("  \"next_multi\": \"%u\",\n", next_multi);
+	CHECK_MANIFEST_LINE("  \"oldest_member\": \"%lld\",\n", (long long) oldest_member);
+	CHECK_MANIFEST_LINE("  \"next_member\": \"%lld\",\n", (long long) next_member);
+
+	seeded_start = strstr(manifest, "  \"seeded_slru_pages\": \"");
+	if (seeded_start == NULL)
+		return false;
+	seeded_start += strlen("  \"seeded_slru_pages\": \"");
+	errno = 0;
+	seeded = strtoll(seeded_start, &seeded_end, 10);
+	if (errno != 0 || seeded_end == seeded_start || seeded < 0 ||
+		strncmp(seeded_end, "\"\n", 2) != 0)
+		return false;
+	*seeded_pages = (int64) seeded;
+	return true;
+
+#undef CHECK_MANIFEST_LINE
+}
+
+/*
+ * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
+ *                          base pg_lsn, target pg_lsn,
+ *                          oldest_xid xid, next_xid xid,
+ *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
+ *                          oldest_multi xid, next_multi xid,
+ *                          oldest_member bigint, next_member bigint)
+ * returns bigint
+ *
+ * Control-plane bootstrap entrypoint for a branch-capable compute: materialize
+ * branch SLRUs, fork the store timeline, and durably record the fork metadata in
+ * the target datadir.  This is still intentionally pg_control-adjacent rather
+ * than pg_control-editing: the manifest gives later bootstrap code one durable
+ * protocol artifact to consume.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
+Datum
+pagestore_prepare_branch(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	target = PG_GETARG_LSN(4);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(8);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(9);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(10);
+	int64		oldest_member = PG_GETARG_INT64(11);
+	int64		next_member = PG_GETARG_INT64(12);
+	int64		seeded;
+	char		manifest_path[MAXPGPATH];
+	int			pathlen;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to prepare a branch")));
+	if (new_tl <= 0)
+		ereport(ERROR,
+				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
+	if (parent_tl < 0)
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline must be >= 0")));
+	if ((uint32) parent_tl != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
+						parent_tl, pagestore_localsvc_timeline())));
+	if (target < base)
+		ereport(ERROR,
+				(errmsg("target LSN precedes the base cutoff")));
+
+	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
+									(uint64) target);
+
+	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
+												   base, target,
+												   oldest_xid, next_xid,
+												   oldest_commit_ts_xid,
+												   next_commit_ts_xid,
+												   oldest_multi, next_multi,
+												   oldest_member, next_member,
+												   &seeded))
+	{
+		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+										 (uint64) target);
+		PG_RETURN_INT64(seeded);
+	}
+
+	/*
+	 * From here until the new manifest is published the target's SLRUs may
+	 * not match any manifest, so durably invalidate a manifest left by a
+	 * previous prepare before touching them.  The manifest is what marks a
+	 * prepared dir as consumable, so every failure below -- SLRU seeding,
+	 * CREATE_BRANCH being refused after the store raced ahead, the manifest
+	 * write itself -- leaves the dir inert instead of advertising stale or
+	 * half-updated contents.
+	 */
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
+	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
+											  oldest_xid, next_xid,
+											  oldest_commit_ts_xid,
+											  next_commit_ts_xid,
+											  oldest_multi, next_multi,
+											  oldest_member, next_member);
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) target);
+
+	/*
+	 * Publish the manifest only after the store-side timeline exists: the
+	 * manifest is the durable handoff artifact for later bootstrap, so it must
+	 * never advertise a branch that CREATE_BRANCH refused (e.g. the same
+	 * timeline raced into existence with different ancestry during seeding).
+	 * The reverse window is retry-safe: if the manifest write fails here, the
+	 * timeline already exists and a retried prepare passes CHECK_BRANCH and
+	 * re-runs CREATE_BRANCH idempotently.
+	 */
+	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl,
+									base, target,
+									oldest_xid, next_xid,
+									oldest_commit_ts_xid,
+									next_commit_ts_xid,
+									oldest_multi, next_multi,
+									oldest_member, next_member,
+									seeded);
 
 	PG_RETURN_INT64(seeded);
 }

@@ -111,6 +111,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_TRUNCATE:
 		case PS_OP_ZEROEXTEND:
 		case PS_OP_CREATE_BRANCH:
+		case PS_OP_CHECK_BRANCH:
 		case PS_OP_EXTEND:
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:

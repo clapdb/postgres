@@ -303,7 +303,7 @@ gc_resume(void)
 		 * write error may have torn the manifest tail; stop so that record stays
 		 * the recoverable tail instead of becoming interior corruption, and the
 		 * next start retries from the last valid manifest state.
-		 */
+	 */
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
@@ -532,6 +532,60 @@ typedef struct TimelineMeta
 
 static TimelineMeta timelines[MAX_TIMELINES];
 
+/*
+ * Branch-local usage marker: set once a timeline acquires any local state (a
+ * page version, fork entry, WAL-index entry, or shipped WAL).  An
+ * exact-match duplicate CREATE_BRANCH is accepted only while the timeline is
+ * still unused: that keeps a prepare retry idempotent (retries happen before
+ * a compute ever boots on the branch), while reusing the id of a live branch
+ * is refused -- read_through() resolves timeline-local versions before the
+ * parent snapshot, so a "fresh" branch recreated over a written timeline
+ * would silently serve the previous branch's pages.
+ */
+static int timeline_used[MAX_TIMELINES];
+
+static inline void
+timeline_mark_used(uint32_t timeline)
+{
+	if (timeline < MAX_TIMELINES)
+		__atomic_store_n(&timeline_used[timeline], 1, __ATOMIC_RELEASE);
+}
+
+static inline int
+timeline_is_used(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&timeline_used[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* highest end LSN (start+len) of shipped WAL received per timeline */
+static uint64_t wal_end[MAX_TIMELINES];
+
+static inline uint64_t
+wal_end_read(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&wal_end[timeline], __ATOMIC_ACQUIRE);
+}
+
+static inline void
+wal_end_advance(uint32_t timeline, uint64_t end_lsn)
+{
+	uint64_t	old_end;
+
+	if (timeline >= MAX_TIMELINES)
+		return;
+	old_end = __atomic_load_n(&wal_end[timeline], __ATOMIC_RELAXED);
+	while (end_lsn > old_end &&
+		   !__atomic_compare_exchange_n(&wal_end[timeline], &old_end,
+										end_lsn, false,
+										__ATOMIC_RELEASE,
+										__ATOMIC_RELAXED))
+		;
+}
+
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
 static uint32_t
@@ -592,6 +646,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -651,6 +706,7 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_find(timeline, key);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -757,21 +813,33 @@ tl_walk_next(TlWalk *w)
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
- *	- a new id that is out of range, the root (0), or already defined (otherwise
- *	  re-creating an id silently rewrites an existing branch's ancestry);
+ *	- a new id that is out of range, or an already-defined id with mismatched
+ *	  ancestry metadata (an exact match is an idempotent retry, but only while
+ *	  the timeline is still unused -- see timeline_used[]);
  *	- a parent that is out of range or not yet defined (the requested parent must
  *	  actually exist, else the branch silently inherits from nothing);
  *	- a parent whose ancestry already reaches the new id, which would turn the
  *	  parent walk into an infinite loop (e.g. new == parent, or A->B->A).
- * Returns 1 if (new_tl, parent) is safe to define.
+ * Returns 1 if (new_tl, parent, branch_lsn) can be used for CREATE_BRANCH.
  */
 static int
-branch_request_ok(uint32_t new_tl, int parent)
+branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 {
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || timelines[new_tl].defined)
+	/*
+	 * Exact matches to an existing definition are idempotent retries -- but
+	 * only while the timeline has no branch-local state yet.  Once it has
+	 * pages, forks or shipped WAL, the duplicate is timeline-id reuse, not a
+	 * retry, and accepting it would hand the caller the old branch's data.
+	 */
+	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
+		return timelines[new_tl].parent == parent &&
+			timelines[new_tl].branch_lsn == branch_lsn &&
+			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
+
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
+		parent >= MAX_TIMELINES || !timelines[parent].defined)
 		return 0;
-	if (parent < 0 || parent >= MAX_TIMELINES || !timelines[parent].defined)
-		return 0;
+
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
 	{
 		if ((uint32_t) t == new_tl)
@@ -860,12 +928,12 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
-static void
+static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
+	return ps_storage->meta_append(&rec, sizeof(rec));
 }
 
 static void
@@ -884,7 +952,7 @@ load_timelines(void)
 	 */
 	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		if (branch_request_ok(rec.id, rec.parent))
+		if (branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		else
 			fprintf(stderr, "pagestore: skipping invalid timeline record "
@@ -911,9 +979,6 @@ typedef struct WalRecHdr
 	uint64_t	start_lsn;		/* LSN of the first byte */
 } WalRecHdr;
 
-/* highest end LSN (start+len) received per timeline */
-static uint64_t wal_end[MAX_TIMELINES];
-
 static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
@@ -923,14 +988,14 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	if (tl >= MAX_TIMELINES)
 		return -1;
 
+	timeline_mark_used(tl);
 	h.magic = WAL_MAGIC;
 	h.len = len;
 	h.start_lsn = start_lsn;
 	if (ps_storage->wal_append(tl, &h, sizeof(h), data, len) != 0)
 		return -1;
 
-	if (start_lsn + len > wal_end[tl])
-		wal_end[tl] = start_lsn + len;
+	wal_end_advance(tl, start_lsn + len);
 	return 0;
 }
 
@@ -987,8 +1052,11 @@ wal_recover_one(uint32_t tl)
 	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
-		if (h.start_lsn + h.len > wal_end[tl])
-			wal_end[tl] = h.start_lsn + h.len;
+		if (h.start_lsn + h.len > wal_end_read(tl))
+		{
+			timeline_mark_used(tl);
+			wal_end_advance(tl, h.start_lsn + h.len);
+		}
 		off += sizeof(h) + h.len;
 	}
 }
@@ -1021,6 +1089,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
 	WalIdxEnt  *e;
+
+	timeline_mark_used(tl);
 
 	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
@@ -1485,12 +1555,31 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline))
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
 			{
-				timeline_define(ch->timeline, (int) ch->parent_timeline,
-								ch->req_lsn);
-				timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn);
+				if (timelines[ch->timeline].defined)
+					break;
+				if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn) == 0)
+					timeline_define(ch->timeline, (int) ch->parent_timeline,
+									ch->req_lsn);
+				else
+					ch->status = PS_STATUS_ERROR;
+			}
+			else
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_CHECK_BRANCH:
+			/*
+			 * Validate a branch request without mutating timeline metadata.
+			 * This keeps prepare/retry paths deterministic: invalid requests are
+			 * rejected in-place before any SLRU directory mutation.
+			 */
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
+			{
+				/* valid */
 			}
 			else
 				ch->status = PS_STATUS_ERROR;
@@ -1502,7 +1591,7 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_SIZE:
-			ch->req_lsn = wal_end[tl];	/* output: end LSN of this timeline's WAL */
+			ch->req_lsn = wal_end_read(tl);	/* output: end LSN of this timeline's WAL */
 			break;
 
 		case PS_OP_WAL_READ:
