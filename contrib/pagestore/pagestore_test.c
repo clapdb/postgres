@@ -837,8 +837,8 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
-	check(op_check_branch_status(1, 0, 1500) == PS_STATUS_OK,
-		  "CHECK_BRANCH accepts idempotent retry metadata");
+	check(op_check_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "CHECK_BRANCH rejects retry of a timeline with branch-local writes");
 	check(op_check_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
 		  "CHECK_BRANCH rejects mismatched ancestry for existing timeline");
 	check(op_check_branch_status(9, 0, 1500) == PS_STATUS_OK,
@@ -851,8 +851,8 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "REQUIRE_BRANCH rejects not-yet-created branch timelines");
 	check(op_create_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
 		  "CREATE_BRANCH rejects re-creating existing timeline with mismatched ancestry");
-	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_OK,
-		  "re-create existing timeline id with identical ancestry is idempotent");
+	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "re-create of a written timeline id is rejected (would expose its pages)");
 	check(op_create_branch_status(9, 900, 1500) == PS_STATUS_ERROR,
 		  "reject branch off an undefined parent");
 	check(op_create_branch_status(9, 9, 1500) == PS_STATUS_ERROR,
@@ -863,6 +863,18 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "valid branch off a defined branch still accepted");
 	op_read_tl(7, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "new valid branch reads through to root");
+
+	/* the idempotent-retry window: an unused timeline may be re-created (a
+	 * prepare retry), but the first branch-local write closes it -- reads on
+	 * the timeline do not */
+	check(op_check_branch_status(7, 2, 1500) == PS_STATUS_OK,
+		  "CHECK_BRANCH accepts retry of an unused timeline after reads");
+	check(op_create_branch_status(7, 2, 1500) == PS_STATUS_OK,
+		  "re-create of an unused timeline with identical ancestry is idempotent");
+	fill_page(p, ps, 4000, 77);
+	op_write_tl(7, REL_B, FORK0, 0, p);
+	check(op_create_branch_status(7, 2, 1500) == PS_STATUS_ERROR,
+		  "the timeline's first write closes the idempotent-retry window");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -934,6 +946,8 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_attach(shm, ps);
 	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
 	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
+	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
+		  "shipped WAL also closes the idempotent re-create window (post-restart)");
 
 	client_detach();
 	stop_daemon(dpid);
