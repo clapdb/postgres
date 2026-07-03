@@ -4388,6 +4388,33 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 }
 
 static bool
+pagestore_manifest_get_xid_string_token(const char *manifest, const char *key,
+										TransactionId *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field != '"')
+		return false;
+	field++;
+	if (*field < '0' || *field > '9')
+		return false;
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field)
+		return false;
+	if (parsed > UINT32_MAX)
+		return false;
+	if (*endptr != '"')
+		return false;
+	if (!pagestore_manifest_value_delimited(endptr + 1))
+		return false;
+	*value = (TransactionId) parsed;
+	return true;
+}
+
+static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
@@ -4794,19 +4821,17 @@ pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 static bool
 pagestore_manifest_get_commit_ts_required(const char *manifest, bool *required)
 {
-	uint32_t	oldest_raw;
-	uint32_t	next_raw;
 	TransactionId oldest_xid;
 	TransactionId next_xid;
 
-	if (!pagestore_manifest_get_uint_token(manifest, "oldest_commit_ts_xid",
-										   &oldest_raw) ||
-		!pagestore_manifest_get_uint_token(manifest, "next_commit_ts_xid",
-										   &next_raw))
+	if (!pagestore_manifest_get_xid_string_token(manifest,
+												 "oldest_commit_ts_xid",
+												 &oldest_xid) ||
+		!pagestore_manifest_get_xid_string_token(manifest,
+												 "next_commit_ts_xid",
+												 &next_xid))
 		return false;
 
-	oldest_xid = (TransactionId) oldest_raw;
-	next_xid = (TransactionId) next_raw;
 	if (!TransactionIdIsNormal(oldest_xid) &&
 		!TransactionIdIsNormal(next_xid))
 	{
