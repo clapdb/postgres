@@ -246,6 +246,7 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
 	time_t		deadline = 0;
+	bool		timed_out = false;
 
 	if (timeout_ms > 0)
 		deadline = time(NULL) + (timeout_ms + 999) / 1000;
@@ -258,17 +259,20 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 	{
 		if (((++spins) & 0xFFF) == 0)
 		{
-			CHECK_FOR_INTERRUPTS();
+			if (!timed_out)
+				CHECK_FOR_INTERRUPTS();
 			if (deadline != 0 && time(NULL) >= deadline)
-				ereport(ERROR,
-						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
-								ch->opcode)));
+				timed_out = true;
 		}
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #endif
 	}
 
+	if (timed_out)
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+						ch->opcode)));
 	if (ch->status != PS_STATUS_OK)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc: daemon reported error for op %u",
