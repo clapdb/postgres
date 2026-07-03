@@ -4985,10 +4985,14 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
 	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
-	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
+	if (access(stage, F_OK) == 0)
+	{
+		if (unlink(stage) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
+		fsync_fname(target_dir, true);
+	}
 	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
 	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
