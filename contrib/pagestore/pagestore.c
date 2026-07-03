@@ -31,6 +31,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -4176,6 +4177,102 @@ pagestore_write_branch_manifest(const char *target_dir,
 	}
 }
 
+static bool
+pagestore_manifest_has_line(const char *manifest, const char *line)
+{
+	return strstr(manifest, line) != NULL;
+}
+
+static bool
+pagestore_existing_branch_manifest_matches(const char *target_dir,
+										   int32 new_tl, int32 parent_tl,
+										   XLogRecPtr base, XLogRecPtr target,
+										   TransactionId oldest_xid,
+										   TransactionId next_xid,
+										   TransactionId oldest_commit_ts_xid,
+										   TransactionId next_commit_ts_xid,
+										   MultiXactId oldest_multi,
+										   MultiXactId next_multi,
+										   int64 oldest_member,
+										   int64 next_member,
+										   int64 *seeded_pages)
+{
+	char		path[MAXPGPATH];
+	char		manifest[4096];
+	char		line[128];
+	char	   *seeded_start;
+	char	   *seeded_end;
+	long long	seeded;
+	FILE	   *file;
+	size_t		nread;
+	int			len;
+
+#define CHECK_MANIFEST_LINE(...) \
+	do { \
+		len = snprintf(line, sizeof(line), __VA_ARGS__); \
+		if (len < 0 || len >= (int) sizeof(line) || \
+			!pagestore_manifest_has_line(manifest, line)) \
+			return false; \
+	} while (0)
+
+	len = snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	file = AllocateFile(path, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno == ENOENT)
+			return false;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open branch manifest \"%s\": %m", path)));
+	}
+	nread = fread(manifest, 1, sizeof(manifest) - 1, file);
+	if (ferror(file))
+	{
+		FreeFile(file);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch manifest \"%s\": %m", path)));
+	}
+	if (!feof(file))
+	{
+		FreeFile(file);
+		return false;
+	}
+	FreeFile(file);
+	if (memchr(manifest, '\0', nread) != NULL)
+		return false;
+	manifest[nread] = '\0';
+
+	CHECK_MANIFEST_LINE("  \"format\": 1,\n");
+	CHECK_MANIFEST_LINE("  \"new_timeline\": %d,\n", new_tl);
+	CHECK_MANIFEST_LINE("  \"parent_timeline\": %d,\n", parent_tl);
+	CHECK_MANIFEST_LINE("  \"base_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(base));
+	CHECK_MANIFEST_LINE("  \"fork_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(target));
+	CHECK_MANIFEST_LINE("  \"oldest_xid\": \"%u\",\n", oldest_xid);
+	CHECK_MANIFEST_LINE("  \"next_xid\": \"%u\",\n", next_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_commit_ts_xid\": \"%u\",\n", oldest_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"next_commit_ts_xid\": \"%u\",\n", next_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_multi\": \"%u\",\n", oldest_multi);
+	CHECK_MANIFEST_LINE("  \"next_multi\": \"%u\",\n", next_multi);
+	CHECK_MANIFEST_LINE("  \"oldest_member\": \"%lld\",\n", (long long) oldest_member);
+	CHECK_MANIFEST_LINE("  \"next_member\": \"%lld\",\n", (long long) next_member);
+
+	seeded_start = strstr(manifest, "  \"seeded_slru_pages\": \"");
+	if (seeded_start == NULL)
+		return false;
+	seeded_start += strlen("  \"seeded_slru_pages\": \"");
+	errno = 0;
+	seeded = strtoll(seeded_start, &seeded_end, 10);
+	if (errno != 0 || seeded_end == seeded_start || seeded < 0 ||
+		strncmp(seeded_end, "\"\n", 2) != 0)
+		return false;
+	*seeded_pages = (int64) seeded;
+	return true;
+
+#undef CHECK_MANIFEST_LINE
+}
+
 /*
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
@@ -4232,6 +4329,20 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+
+	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
+												   base, target,
+												   oldest_xid, next_xid,
+												   oldest_commit_ts_xid,
+												   next_commit_ts_xid,
+												   oldest_multi, next_multi,
+												   oldest_member, next_member,
+												   &seeded))
+	{
+		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+										 (uint64) target);
+		PG_RETURN_INT64(seeded);
+	}
 
 	/*
 	 * From here until the new manifest is published the target's SLRUs may
