@@ -31,6 +31,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -4684,6 +4685,72 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 }
 
 static bool
+pagestore_manifest_has_line(const char *manifest, const char *line)
+{
+	return strstr(manifest, line) != NULL;
+}
+
+static bool
+pagestore_existing_branch_manifest_matches(const char *target_dir,
+										   int32 new_tl, int32 parent_tl,
+										   XLogRecPtr base, XLogRecPtr target,
+										   TransactionId oldest_xid,
+										   TransactionId next_xid,
+										   TransactionId oldest_commit_ts_xid,
+										   TransactionId next_commit_ts_xid,
+										   MultiXactId oldest_multi,
+										   MultiXactId next_multi,
+										   int64 oldest_member,
+										   int64 next_member,
+										   int64 *seeded_pages)
+{
+	char	   *manifest;
+	char		line[128];
+	char	   *seeded_start;
+	char	   *seeded_end;
+	long long	seeded;
+	int			len;
+
+#define CHECK_MANIFEST_LINE(...) \
+	do { \
+		len = snprintf(line, sizeof(line), __VA_ARGS__); \
+		if (len < 0 || len >= (int) sizeof(line) || \
+			!pagestore_manifest_has_line(manifest, line)) \
+			return false; \
+	} while (0)
+
+	manifest = pagestore_read_branch_manifest(target_dir);
+	if (manifest == NULL)
+		return false;
+	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, target))
+		return false;
+
+	CHECK_MANIFEST_LINE("  \"base_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(base));
+	CHECK_MANIFEST_LINE("  \"oldest_xid\": \"%u\",\n", oldest_xid);
+	CHECK_MANIFEST_LINE("  \"next_xid\": \"%u\",\n", next_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_commit_ts_xid\": \"%u\",\n", oldest_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"next_commit_ts_xid\": \"%u\",\n", next_commit_ts_xid);
+	CHECK_MANIFEST_LINE("  \"oldest_multi\": \"%u\",\n", oldest_multi);
+	CHECK_MANIFEST_LINE("  \"next_multi\": \"%u\",\n", next_multi);
+	CHECK_MANIFEST_LINE("  \"oldest_member\": \"%lld\",\n", (long long) oldest_member);
+	CHECK_MANIFEST_LINE("  \"next_member\": \"%lld\",\n", (long long) next_member);
+
+	seeded_start = strstr(manifest, "  \"seeded_slru_pages\": \"");
+	if (seeded_start == NULL)
+		return false;
+	seeded_start += strlen("  \"seeded_slru_pages\": \"");
+	errno = 0;
+	seeded = strtoll(seeded_start, &seeded_end, 10);
+	if (errno != 0 || seeded_end == seeded_start || seeded < 0 ||
+		strncmp(seeded_end, "\"\n", 2) != 0)
+		return false;
+	*seeded_pages = (int64) seeded;
+	return true;
+
+#undef CHECK_MANIFEST_LINE
+}
+
+static bool
 pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 									   uint32_t *parent_tl,
 									   XLogRecPtr *fork_lsn)
@@ -4834,6 +4901,20 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+
+	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
+												   base, target,
+												   oldest_xid, next_xid,
+												   oldest_commit_ts_xid,
+												   next_commit_ts_xid,
+												   oldest_multi, next_multi,
+												   oldest_member, next_member,
+												   &seeded))
+	{
+		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+										 (uint64) target);
+		PG_RETURN_INT64(seeded);
+	}
 
 	/*
 	 * From here until the new manifest is published the target's SLRUs may

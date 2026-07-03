@@ -327,6 +327,25 @@ posix_truncate_best_effort(int fd, off_t old_size)
 	}
 }
 
+static void
+posix_fsync_dir_best_effort(void)
+{
+	int		fd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+
+	if (fd >= 0)
+	{
+		(void) fsync(fd);
+		close(fd);
+	}
+}
+
+static void
+posix_unlink_created_meta(const char *path)
+{
+	if (unlink(path) == 0)
+		posix_fsync_dir_best_effort();
+}
+
 /*
  * Roll back an append whose record may already be durable in the metadata
  * log: reopen the log, truncate it back to old_size, and push the truncate
@@ -347,7 +366,7 @@ posix_meta_rollback(const char *path, off_t old_size, int created)
 		close(fd);
 	}
 	if (created && old_size == 0)
-		(void) unlink(path);
+		posix_unlink_created_meta(path);
 }
 
 static int
@@ -368,7 +387,7 @@ posix_meta_append(const void *buf, uint32_t len)
 	{
 		close(fd);
 		if (created)
-			(void) unlink(path);
+			posix_unlink_created_meta(path);
 		return -1;
 	}
 
@@ -384,7 +403,7 @@ posix_meta_append(const void *buf, uint32_t len)
 		posix_truncate_best_effort(fd, old_size);
 		close(fd);
 		if (created)
-			(void) unlink(path);
+			posix_unlink_created_meta(path);
 		return -1;
 	}
 	if (fsync(fd) != 0)
@@ -393,7 +412,7 @@ posix_meta_append(const void *buf, uint32_t len)
 		(void) fsync(fd);
 		close(fd);
 		if (created)
-			(void) unlink(path);
+			posix_unlink_created_meta(path);
 		return -1;
 	}
 	if (close(fd) != 0)

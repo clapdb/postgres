@@ -534,7 +534,7 @@ static TimelineMeta timelines[MAX_TIMELINES];
 
 /*
  * Branch-local usage marker: set once a timeline acquires any local state (a
- * page version or fork entry here; shipped WAL is tracked by wal_end[]).  An
+ * page version, fork entry, WAL-index entry, or shipped WAL).  An
  * exact-match duplicate CREATE_BRANCH is accepted only while the timeline is
  * still unused: that keeps a prepare retry idempotent (retries happen before
  * a compute ever boots on the branch), while reusing the id of a live branch
@@ -561,6 +561,30 @@ timeline_is_used(uint32_t timeline)
 
 /* highest end LSN (start+len) of shipped WAL received per timeline */
 static uint64_t wal_end[MAX_TIMELINES];
+
+static inline uint64_t
+wal_end_read(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&wal_end[timeline], __ATOMIC_ACQUIRE);
+}
+
+static inline void
+wal_end_advance(uint32_t timeline, uint64_t end_lsn)
+{
+	uint64_t	old_end;
+
+	if (timeline >= MAX_TIMELINES)
+		return;
+	old_end = __atomic_load_n(&wal_end[timeline], __ATOMIC_RELAXED);
+	while (end_lsn > old_end &&
+		   !__atomic_compare_exchange_n(&wal_end[timeline], &old_end,
+										end_lsn, false,
+										__ATOMIC_RELEASE,
+										__ATOMIC_RELAXED))
+		;
+}
 
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
@@ -806,11 +830,11 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 	 * only while the timeline has no branch-local state yet.  Once it has
 	 * pages, forks or shipped WAL, the duplicate is timeline-id reuse, not a
 	 * retry, and accepting it would hand the caller the old branch's data.
-		 */
+	 */
 	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
 		return timelines[new_tl].parent == parent &&
 			timelines[new_tl].branch_lsn == branch_lsn &&
-			!timeline_is_used(new_tl) && wal_end[new_tl] == 0;
+			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
 
 	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
 		parent >= MAX_TIMELINES || !timelines[parent].defined)
@@ -973,14 +997,14 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	if (tl >= MAX_TIMELINES)
 		return -1;
 
+	timeline_mark_used(tl);
 	h.magic = WAL_MAGIC;
 	h.len = len;
 	h.start_lsn = start_lsn;
 	if (ps_storage->wal_append(tl, &h, sizeof(h), data, len) != 0)
 		return -1;
 
-	if (start_lsn + len > wal_end[tl])
-		wal_end[tl] = start_lsn + len;
+	wal_end_advance(tl, start_lsn + len);
 	return 0;
 }
 
@@ -1037,8 +1061,11 @@ wal_recover_one(uint32_t tl)
 	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
-		if (h.start_lsn + h.len > wal_end[tl])
-			wal_end[tl] = h.start_lsn + h.len;
+		if (h.start_lsn + h.len > wal_end_read(tl))
+		{
+			timeline_mark_used(tl);
+			wal_end_advance(tl, h.start_lsn + h.len);
+		}
 		off += sizeof(h) + h.len;
 	}
 }
@@ -1585,7 +1612,7 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_SIZE:
-			ch->req_lsn = wal_end[tl];	/* output: end LSN of this timeline's WAL */
+			ch->req_lsn = wal_end_read(tl);	/* output: end LSN of this timeline's WAL */
 			break;
 
 		case PS_OP_WAL_READ:
