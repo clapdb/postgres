@@ -53,6 +53,15 @@ static uint32	ls_nshards = 1;
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
 
+/*
+ * claimed states: 0 = free, 1 = owned by a backend, 2 = abandoned after the
+ * owner timed out.  An abandoned channel may still receive a late DONE from the
+ * daemon, so never hand it to another backend.
+ */
+#define LS_CLAIMED_FREE		0
+#define LS_CLAIMED_OWNED	1
+#define LS_CLAIMED_ABANDONED	2
+
 static void
 ls_detach(int code, Datum arg)
 {
@@ -63,7 +72,7 @@ ls_detach(int code, Datum arg)
 			PsChannel  *ch = ps_channel(ls_shm, ls_channel);
 
 			/* release the channel for reuse by a future backend */
-			ps_store_release(&ch->claimed, 0);
+			ps_store_release(&ch->claimed, LS_CLAIMED_FREE);
 			ls_channel = -1;
 			ls_channel_shard = UINT32_MAX;
 		}
@@ -168,7 +177,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *old = ps_channel(ls_shm, ls_channel);
 
-		ps_store_release(&old->claimed, 0);
+		ps_store_release(&old->claimed, LS_CLAIMED_FREE);
 		ls_channel = -1;
 		ls_channel_shard = UINT32_MAX;
 	}
@@ -186,7 +195,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *ch = ps_channel(ls_shm, i);
 
-		if (ps_cas(&ch->claimed, 0, 1))
+		if (ps_cas(&ch->claimed, LS_CLAIMED_FREE, LS_CLAIMED_OWNED))
 		{
 			ch->shard = target;
 			ls_channel = (int) i;
@@ -246,7 +255,6 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
 	time_t		deadline = 0;
-	bool		timed_out = false;
 
 	if (timeout_ms > 0)
 		deadline = time(NULL) + (timeout_ms + 999) / 1000;
@@ -259,20 +267,22 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 	{
 		if (((++spins) & 0xFFF) == 0)
 		{
-			if (!timed_out)
-				CHECK_FOR_INTERRUPTS();
+			CHECK_FOR_INTERRUPTS();
 			if (deadline != 0 && time(NULL) >= deadline)
-				timed_out = true;
+			{
+				ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+				ls_channel = -1;
+				ls_channel_shard = UINT32_MAX;
+				ereport(ERROR,
+						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+								ch->opcode)));
+			}
 		}
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #endif
 	}
 
-	if (timed_out)
-		ereport(ERROR,
-				(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
-						ch->opcode)));
 	if (ch->status != PS_STATUS_OK)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc: daemon reported error for op %u",
