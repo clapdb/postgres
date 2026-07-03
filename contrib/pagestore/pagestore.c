@@ -378,6 +378,12 @@ pagestore_which(RelFileLocator rlocator, ProcNumber backend)
 	return SMGR_MD;
 }
 
+static bool
+pagestore_branch_routing_active(void)
+{
+	return pagestore_route_all;
+}
+
 /* --- GUC plumbing ------------------------------------------------------- */
 
 static bool
@@ -4407,7 +4413,7 @@ pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
 	const char *end;
 	char		buf[64];
 	size_t		len;
-	unsigned int hi,
+	unsigned long long hi,
 				lo;
 	char		extra;
 
@@ -4422,7 +4428,9 @@ pagestore_manifest_get_lsn_token(const char *manifest, const char *key,
 		return false;
 	memcpy(buf, field, len);
 	buf[len] = '\0';
-	if (sscanf(buf, "%X/%X%c", &hi, &lo, &extra) != 2)
+	if (sscanf(buf, "%llX/%llX%c", &hi, &lo, &extra) != 2)
+		return false;
+	if (hi > UINT32_MAX || lo > UINT32_MAX)
 		return false;
 	if (!pagestore_manifest_value_delimited(end + 1))
 		return false;
@@ -4846,6 +4854,9 @@ pagestore_validate_datadir_branch_manifest(void)
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
+	if (!pagestore_branch_routing_active())
+		ereport(FATAL,
+				(errmsg("pagestore.route_all must be enabled to use a branch manifest")));
 	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
 												&fork_lsn))
 		ereport(FATAL,
