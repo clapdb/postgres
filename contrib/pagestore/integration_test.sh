@@ -384,6 +384,12 @@ $P -c "INSERT INTO tb VALUES (1,'before_L');" >/dev/null       # T1 commits in (
 $P -c "CHECKPOINT;" >/dev/null                                # ship the row1 heap version
 bL=$($P -c "SELECT pg_current_wal_lsn();")                     # fork LSN L (after row1)
 boxid=$($P -c "SELECT pg_snapshot_xmax(pg_current_snapshot());")
+# Copy the branch datadir before the parent advances past L, so the branch's
+# first write reuses the XID that the parent will spend on after_L below.
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+BRANCHDATA=$(mktemp -d)/branch
+cp -a "$DATA" "$BRANCHDATA"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after L (heap ver > L)
 # Prepare the branch as-of L after the parent has advanced, while the (C, L] WAL is still
 # present (the parent's later stop/restart/checkpoints recycle it).  The base snapshot at C
@@ -395,11 +401,6 @@ seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL'
 	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
-# clean-stop the parent so its datadir is consistent, copy it, then boot the prepared branch
-"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
-BRANCHDATA=$(mktemp -d)/branch
-cp -a "$DATA" "$BRANCHDATA"
-"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 # Install every prepared branch SLRU artifact into the branch copy, replacing copied
 # directories so the boot genuinely depends on prepare_branch output, not copied
 # parent snapshots.  pg_commit_ts is only prepared when commit timestamps are active.
@@ -414,10 +415,6 @@ for slru in pg_xact pg_commit_ts pg_multixact; do
 		fail=1
 	fi
 done
-if ! cp "$SEEDOUT/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"; then
-	echo "FAIL - could not install pagestore_branch.manifest"
-	fail=1
-fi
 # point the copied datadir at timeline 1 on a distinct port; it reads relations as-of L
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
