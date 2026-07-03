@@ -663,6 +663,9 @@ nulManifest=$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0
 assert "$nulManifest" "ERROR" "branch manifest validator rejects embedded NUL bytes"
 mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manifest"
 cp "$PREPSEED/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
+cat >> "$BRANCHDATA/postgresql.conf" <<EOF
+pagestore.route_all = on
+EOF
 if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "FAIL - branch startup rejected a manifest/timeline mismatch"
 	fail=1
