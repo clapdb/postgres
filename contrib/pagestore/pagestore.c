@@ -4313,6 +4313,8 @@ pagestore_manifest_find_unique_field(const char *manifest, const char *key)
 			{
 				const char *value = pagestore_manifest_skip_ws(end + 1);
 
+				if (memchr(name, '\\', end - name) != NULL)
+					return NULL;
 				if (*value == ':' &&
 					(size_t) (end - name) == keylen &&
 					strncmp(name, key, keylen) == 0)

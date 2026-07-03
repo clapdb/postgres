@@ -630,6 +630,11 @@ EOF
 assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');")" "f" \
 	"branch manifest validator rejects malformed JSON"
 cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
+{ "format": 1, "new_timeline": 2, "new_\u0074imeline": 3, "parent_timeline": 0, "fork_lsn": "$mxL" }
+EOF
+assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 2, 0, '$mxL');")" "f" \
+	"branch manifest validator rejects escaped duplicate keys"
+cat > "$PREPSEED/pagestore_branch.manifest" <<EOF
 { "format": 1, "new_timeline": 0, "parent_timeline": 0, "fork_lsn": "$mxL" }
 EOF
 assert "$($P -c "SELECT pagestore_validate_branch_manifest('$PREPSEED', 0, 0, '$mxL');")" "f" \
