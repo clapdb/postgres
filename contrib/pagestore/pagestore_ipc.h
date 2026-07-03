@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		9	/* 9: CHECK_BRANCH opcode added;
+#define PS_SHM_VERSION		10	/* 10: REQUIRE_BRANCH opcode added;
+								 * 9: CHECK_BRANCH opcode added;
 								 * 8: READ_AT reports found-ness in ch->result;
 								 * 7: walidx_get returns timeline-tagged PsWalRec */
 
@@ -68,6 +69,7 @@ typedef enum PsOpcode
 	PS_OP_IMMEDSYNC,
 	PS_OP_READ_AT,				/* read 1 page at blocknum as-of req_lsn (COW) */
 	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
+	PS_OP_REQUIRE_BRANCH,		/* require existing timeline ancestry metadata */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */

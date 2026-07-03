@@ -27,6 +27,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "miscadmin.h"
@@ -52,6 +53,15 @@ static uint32	ls_nshards = 1;
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
 
+/*
+ * claimed states: 0 = free, 1 = owned by a backend, 2 = abandoned after the
+ * owner timed out.  An abandoned channel may still receive a late DONE from the
+ * daemon, so never hand it to another backend.
+ */
+#define LS_CLAIMED_FREE		0
+#define LS_CLAIMED_OWNED	1
+#define LS_CLAIMED_ABANDONED	2
+
 static void
 ls_detach(int code, Datum arg)
 {
@@ -62,7 +72,7 @@ ls_detach(int code, Datum arg)
 			PsChannel  *ch = ps_channel(ls_shm, ls_channel);
 
 			/* release the channel for reuse by a future backend */
-			ps_store_release(&ch->claimed, 0);
+			ps_store_release(&ch->claimed, LS_CLAIMED_FREE);
 			ls_channel = -1;
 			ls_channel_shard = UINT32_MAX;
 		}
@@ -74,6 +84,12 @@ ls_detach(int code, Datum arg)
 		close(ls_shm_fd);
 		ls_shm_fd = -1;
 	}
+}
+
+void
+pagestore_localsvc_detach(void)
+{
+	ls_detach(0, (Datum) 0);
 }
 
 static void
@@ -161,7 +177,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *old = ps_channel(ls_shm, ls_channel);
 
-		ps_store_release(&old->claimed, 0);
+		ps_store_release(&old->claimed, LS_CLAIMED_FREE);
 		ls_channel = -1;
 		ls_channel_shard = UINT32_MAX;
 	}
@@ -179,7 +195,7 @@ ls_claim_channel(uint32_t shard)
 	{
 		PsChannel  *ch = ps_channel(ls_shm, i);
 
-		if (ps_cas(&ch->claimed, 0, 1))
+		if (ps_cas(&ch->claimed, LS_CLAIMED_FREE, LS_CLAIMED_OWNED))
 		{
 			ch->shard = target;
 			ls_channel = (int) i;
@@ -235,9 +251,14 @@ ls_chan(void)
  * simply alternate; the IDLE state is only the post-zeroing initial value.
  */
 static void
-ls_exec(PsChannel *ch)
+ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
+	time_t		deadline = 0;
+
+	if (timeout_ms > 0)
+		deadline = time(NULL) + (timeout_ms + 999) / 1000;
+
 	ch->shard = ls_channel_shard;
 
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
@@ -245,7 +266,18 @@ ls_exec(PsChannel *ch)
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 	{
 		if (((++spins) & 0xFFF) == 0)
+		{
 			CHECK_FOR_INTERRUPTS();
+			if (deadline != 0 && time(NULL) >= deadline)
+			{
+				ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+				ls_channel = -1;
+				ls_channel_shard = UINT32_MAX;
+				ereport(ERROR,
+						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+								ch->opcode)));
+			}
+		}
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #endif
@@ -255,6 +287,12 @@ ls_exec(PsChannel *ch)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc: daemon reported error for op %u",
 						ch->opcode)));
+}
+
+static void
+ls_exec(PsChannel *ch)
+{
+	ls_exec_timeout(ch, 0);
 }
 
 static void
@@ -540,6 +578,26 @@ pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
 	ls_exec(ch);
+}
+
+void
+pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
+								  uint64 branch_lsn)
+{
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl, branch_lsn, 0);
+}
+
+void
+pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
+										  uint64 branch_lsn, int timeout_ms)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_REQUIRE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 /*
