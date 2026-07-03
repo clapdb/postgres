@@ -4968,13 +4968,15 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	char		manifest[MAXPGPATH];
 	char		stage[MAXPGPATH];
+	int			pathlen;
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to install a prepared branch")));
-	snprintf(manifest, sizeof(manifest), "%s/pagestore_branch.manifest",
-			 prepared_dir);
+	pathlen = snprintf(manifest, sizeof(manifest),
+					   "%s/pagestore_branch.manifest", prepared_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest);
 	if (access(manifest, F_OK) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -4984,7 +4986,9 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
+	pathlen = snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest",
+					   target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, stage);
 	if (access(stage, F_OK) == 0)
 	{
 		if (unlink(stage) != 0)
@@ -4993,7 +4997,9 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 					 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
 		fsync_fname(target_dir, true);
 	}
-	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
+	pathlen = snprintf(stage, sizeof(stage),
+					   "%s/pagestore_branch.manifest.install", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, stage);
 	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
