@@ -381,7 +381,7 @@ pagestore_which(RelFileLocator rlocator, ProcNumber backend)
 static bool
 pagestore_branch_routing_active(void)
 {
-	return pagestore_route_all;
+	return pagestore_route_all || pagestore_route_user_tablespaces;
 }
 
 /* --- GUC plumbing ------------------------------------------------------- */
@@ -4856,7 +4856,7 @@ pagestore_validate_datadir_branch_manifest(void)
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
 	if (!pagestore_branch_routing_active())
 		ereport(FATAL,
-				(errmsg("pagestore.route_all must be enabled to use a branch manifest")));
+				(errmsg("pagestore relation routing must be enabled to use a branch manifest")));
 	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
 												&fork_lsn))
 		ereport(FATAL,
