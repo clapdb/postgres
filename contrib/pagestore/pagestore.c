@@ -4929,6 +4929,26 @@ pagestore_validate_datadir_branch_manifest(void)
 }
 
 static void
+pagestore_preflight_prepared_artifact(const char *prepared_dir,
+									  const char *target_dir,
+									  const char *relpath, bool required)
+{
+	char		src[MAXPGPATH];
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH ||
+		strlen(target_dir) + strlen(relpath) + sizeof(".install/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch install path is too long")));
+
+	snprintf(src, sizeof(src), "%s/%s", prepared_dir, relpath);
+	if (access(src, F_OK) != 0 && required)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", src)));
+}
+
+static void
 pagestore_install_prepared_dir(const char *prepared_dir, const char *target_dir,
 							   const char *relpath, bool required)
 {
@@ -5018,7 +5038,7 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
  * materialized by prepare (multixact seeds bootstrap pages even for an empty
  * horizon), so both are required; pg_commit_ts is required only when the
  * manifest's commit-ts horizons say it was seeded.  The prepared manifest must
- * match the expected branch identity before any artifact is installed.  The
+ * match the expected branch identity before any artifact is installed, and the
  * manifest is installed last so its presence remains the startup-time signal
  * that the datadir has a prepared branch identity and must pass timeline
  * validation.
@@ -5032,10 +5052,13 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	int32		new_tl;
 	int32		parent_tl;
 	XLogRecPtr	fork_lsn;
-	char	   *manifest;
+	char	   *manifest_data;
+	char	   *target_manifest;
+	char		stage[MAXPGPATH];
+	uint32_t	target_new_tl;
+	uint32_t	target_parent_tl;
+	XLogRecPtr	target_fork_lsn;
 	bool		commit_ts_required;
-	char		manifest_path[MAXPGPATH];
-	int			pathlen;
 
 	if (PG_NARGS() != 5)
 		ereport(ERROR,
@@ -5056,47 +5079,65 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid branch timeline identity")));
-	manifest = pagestore_read_branch_manifest(prepared_dir);
-	if (manifest == NULL)
+	manifest_data = pagestore_read_branch_manifest(prepared_dir);
+	if (manifest_data == NULL)
 		ereport(ERROR,
 				(errmsg("prepared branch manifest is missing")));
-	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, fork_lsn))
+	if (!pagestore_manifest_matches(manifest_data, new_tl, parent_tl, fork_lsn))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest does not match the requested branch identity")));
-	if (!pagestore_manifest_get_commit_ts_required(manifest,
-											   &commit_ts_required))
+	if (!pagestore_manifest_get_commit_ts_required(manifest_data,
+												   &commit_ts_required))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest has invalid commit-ts horizons")));
+	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest != NULL &&
+		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+	{
+		if (parent_tl <= 0 ||
+			!pagestore_manifest_get_branch_identity(target_manifest, &target_new_tl,
+													&target_parent_tl,
+													&target_fork_lsn) ||
+			target_new_tl != (uint32_t) parent_tl)
+			ereport(ERROR,
+					(errmsg("target branch manifest does not match the requested branch identity")));
+		pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
+										  (uint64) target_fork_lsn);
+	}
+
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_xact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_commit_ts", commit_ts_required);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_multixact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pagestore_branch.manifest", true);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-
-	/*
-	 * From here until the prepared manifest is installed the target's SLRUs
-	 * may not match any manifest, so durably invalidate a manifest left by a
-	 * previous install before touching them.  Otherwise a failure between the
-	 * SLRU swaps below would leave the old manifest advertising a branch
-	 * identity over partially updated SLRUs.
-	 */
-	pathlen = snprintf(manifest_path, sizeof(manifest_path),
-					   "%s/pagestore_branch.manifest", target_dir);
-	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
-	if (unlink(manifest_path) == 0)
+	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest", target_dir);
+	if (access(stage, F_OK) == 0)
+	{
+		if (unlink(stage) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
 		fsync_fname(target_dir, true);
-	else if (errno != ENOENT)
+	}
+	snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest.install", target_dir);
+	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not remove stale branch manifest \"%s\": %m",
-						manifest_path)));
-
+				 errmsg("could not clear existing branch artifact staging file \"%s\": %m", stage)));
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts",
-								commit_ts_required);
+								   commit_ts_required);
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
-								 "pagestore_branch.manifest", true);
+									"pagestore_branch.manifest", true);
 
 	PG_RETURN_VOID();
 }
