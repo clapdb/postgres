@@ -4388,6 +4388,33 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 }
 
 static bool
+pagestore_manifest_get_xid_string_token(const char *manifest, const char *key,
+										TransactionId *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field != '"')
+		return false;
+	field++;
+	if (*field < '0' || *field > '9')
+		return false;
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field)
+		return false;
+	if (parsed > UINT32_MAX)
+		return false;
+	if (*endptr != '"')
+		return false;
+	if (!pagestore_manifest_value_delimited(endptr + 1))
+		return false;
+	*value = (TransactionId) parsed;
+	return true;
+}
+
+static bool
 pagestore_manifest_has_string_token(const char *manifest, const char *key,
 									const char *value)
 {
@@ -4791,6 +4818,36 @@ pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
 }
 
+static bool
+pagestore_manifest_get_commit_ts_required(const char *manifest, bool *required)
+{
+	TransactionId oldest_xid;
+	TransactionId next_xid;
+
+	if (!pagestore_manifest_get_xid_string_token(manifest,
+												 "oldest_commit_ts_xid",
+												 &oldest_xid) ||
+		!pagestore_manifest_get_xid_string_token(manifest,
+												 "next_commit_ts_xid",
+												 &next_xid))
+		return false;
+
+	if (!TransactionIdIsNormal(oldest_xid) &&
+		!TransactionIdIsNormal(next_xid))
+	{
+		*required = false;
+		return true;
+	}
+	if (TransactionIdIsNormal(oldest_xid) &&
+		TransactionIdIsNormal(next_xid) &&
+		!TransactionIdFollows(oldest_xid, next_xid))
+	{
+		*required = true;
+		return true;
+	}
+	return false;
+}
+
 static inline bool
 pagestore_branch_backend_active(void)
 {
@@ -4951,64 +5008,95 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
 }
 
 /*
- * pagestore_install_prepared_branch(prepared_dir text, target_dir text)
+ * pagestore_install_prepared_branch(prepared_dir text, target_dir text,
+ *                                  new_timeline int, parent_timeline int,
+ *                                  fork_lsn pg_lsn)
  * returns void
  *
  * Install the artifacts produced by pagestore_prepare_branch() into an
- * initdb/copied branch datadir.  pg_xact and any prepared SLRUs are installed
- * before the manifest, and the manifest is installed last so its presence remains
- * the startup-time signal that the datadir has a prepared branch identity and must
- * pass timeline validation.
+ * initdb/copied branch datadir.  pg_xact and pg_multixact are always
+ * materialized by prepare (multixact seeds bootstrap pages even for an empty
+ * horizon), so both are required; pg_commit_ts is required only when the
+ * manifest's commit-ts horizons say it was seeded.  The prepared manifest must
+ * match the expected branch identity before any artifact is installed.  The
+ * manifest is installed last so its presence remains the startup-time signal
+ * that the datadir has a prepared branch identity and must pass timeline
+ * validation.
  */
 PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
 pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 {
-	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char		manifest[MAXPGPATH];
-	char		stage[MAXPGPATH];
+	char	   *prepared_dir;
+	char	   *target_dir;
+	int32		new_tl;
+	int32		parent_tl;
+	XLogRecPtr	fork_lsn;
+	char	   *manifest;
+	bool		commit_ts_required;
+	char		manifest_path[MAXPGPATH];
 	int			pathlen;
+
+	if (PG_NARGS() != 5)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore_install_prepared_branch requires 5 arguments (prepared_dir, target_dir, new_timeline, parent_timeline, fork_lsn)")));
+
+	prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	new_tl = PG_GETARG_INT32(2);
+	parent_tl = PG_GETARG_INT32(3);
+	fork_lsn = PG_GETARG_LSN(4);
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to install a prepared branch")));
-	pathlen = snprintf(manifest, sizeof(manifest),
-					   "%s/pagestore_branch.manifest", prepared_dir);
-	PS_CHECK_PATH_FORMAT(pathlen, manifest);
-	if (access(manifest, F_OK) != 0)
+	if (new_tl <= 0 || parent_tl < 0)
 		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("prepared branch artifact \"%s\" is missing: %m", manifest)));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid branch timeline identity")));
+	manifest = pagestore_read_branch_manifest(prepared_dir);
+	if (manifest == NULL)
+		ereport(ERROR,
+				(errmsg("prepared branch manifest is missing")));
+	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, fork_lsn))
+		ereport(ERROR,
+				(errmsg("prepared branch manifest does not match the requested branch identity")));
+	if (!pagestore_manifest_get_commit_ts_required(manifest,
+											   &commit_ts_required))
+		ereport(ERROR,
+				(errmsg("prepared branch manifest has invalid commit-ts horizons")));
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
-	pathlen = snprintf(stage, sizeof(stage), "%s/pagestore_branch.manifest",
-					   target_dir);
-	PS_CHECK_PATH_FORMAT(pathlen, stage);
-	if (access(stage, F_OK) == 0)
-	{
-		if (unlink(stage) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not clear existing branch artifact \"%s\": %m", stage)));
+
+	/*
+	 * From here until the prepared manifest is installed the target's SLRUs
+	 * may not match any manifest, so durably invalidate a manifest left by a
+	 * previous install before touching them.  Otherwise a failure between the
+	 * SLRU swaps below would leave the old manifest advertising a branch
+	 * identity over partially updated SLRUs.
+	 */
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
 		fsync_fname(target_dir, true);
-	}
-	pathlen = snprintf(stage, sizeof(stage),
-					   "%s/pagestore_branch.manifest.install", target_dir);
-	PS_CHECK_PATH_FORMAT(pathlen, stage);
-	if (access(stage, F_OK) == 0 && unlink(stage) != 0)
+	else if (errno != ENOENT)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not clear existing branch artifact staging file \"%s\": %m", stage)));
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", false);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts",
+								commit_ts_required);
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
-									"pagestore_branch.manifest", true);
+								 "pagestore_branch.manifest", true);
 
 	PG_RETURN_VOID();
 }
