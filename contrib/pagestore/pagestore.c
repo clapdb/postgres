@@ -5014,12 +5014,14 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
  * returns void
  *
  * Install the artifacts produced by pagestore_prepare_branch() into an
- * initdb/copied branch datadir.  For now, only boot-critical SLRUs plus the
- * manifest are installed; optional SLRUs stay in the prepared artifact unless
- * the manifest says they are required.  The prepared manifest must match the
- * expected branch identity before any artifact is installed.  The manifest is
- * installed last so its presence remains the startup-time signal that the
- * datadir has a prepared branch identity and must pass timeline validation.
+ * initdb/copied branch datadir.  pg_xact and pg_multixact are always
+ * materialized by prepare (multixact seeds bootstrap pages even for an empty
+ * horizon), so both are required; pg_commit_ts is required only when the
+ * manifest's commit-ts horizons say it was seeded.  The prepared manifest must
+ * match the expected branch identity before any artifact is installed.  The
+ * manifest is installed last so its presence remains the startup-time signal
+ * that the datadir has a prepared branch identity and must pass timeline
+ * validation.
  */
 PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch);
 Datum
@@ -5032,6 +5034,8 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	XLogRecPtr	fork_lsn;
 	char	   *manifest;
 	bool		commit_ts_required;
+	char		manifest_path[MAXPGPATH];
+	int			pathlen;
 
 	if (PG_NARGS() != 5)
 		ereport(ERROR,
@@ -5068,10 +5072,29 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+
+	/*
+	 * From here until the prepared manifest is installed the target's SLRUs
+	 * may not match any manifest, so durably invalidate a manifest left by a
+	 * previous install before touching them.  Otherwise a failure between the
+	 * SLRU swaps below would leave the old manifest advertising a branch
+	 * identity over partially updated SLRUs.
+	 */
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_branch.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts",
 								commit_ts_required);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", false);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
 								 "pagestore_branch.manifest", true);
 
