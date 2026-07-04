@@ -32,6 +32,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -4800,6 +4801,30 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 #undef CHECK_MANIFEST_LINE
 }
 
+static void
+pagestore_require_prepared_artifact(const char *prepared_dir,
+									const char *relpath, bool directory)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prepared branch artifact path is too long")));
+
+	snprintf(path, sizeof(path), "%s/%s", prepared_dir, relpath);
+	if (stat(path, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", path)));
+	if (directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))
+		ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("prepared branch artifact \"%s\" has the wrong file type",
+							path)));
+}
+
 static bool
 pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 									   uint32_t *parent_tl,
@@ -5090,6 +5115,14 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 												   &commit_ts_required))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest has invalid commit-ts horizons")));
+	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
+	if (commit_ts_required)
+		pagestore_require_prepared_artifact(prepared_dir, "pg_commit_ts", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/offsets", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
+	pagestore_require_prepared_artifact(prepared_dir,
+										"pagestore_branch.manifest", false);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
