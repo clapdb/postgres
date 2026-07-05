@@ -32,6 +32,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/clog.h"
@@ -3569,6 +3570,52 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 		TransactionIdFollows(oldest_xid, next_xid))
 		ereport(ERROR,
 				(errmsg("invalid fork xid horizon [%u, %u)", oldest_xid, next_xid)));
+	if (oldest_xid == next_xid)
+	{
+		char		dstdir[MAXPGPATH];
+		char		stagedir[MAXPGPATH];
+		int			pathlen;
+
+		/*
+		 * Empty horizon: there is nothing to reconstruct, and the page holding
+		 * next_xid may not exist in the store yet (e.g. commit-ts was just
+		 * activated), so reconstruction would fail closed.  The manifest still
+		 * marks pg_commit_ts as required for a normal horizon, so publish the
+		 * artifact anyway: a zeroed bootstrap page covering next_xid, the same
+		 * shape the multixact seeder uses for its empty horizons.
+		 */
+		if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+		pathlen = snprintf(dstdir, sizeof(dstdir), "%s/pg_commit_ts", target_dir);
+		PS_CHECK_PATH_FORMAT(pathlen, dstdir);
+		pathlen = snprintf(stagedir, sizeof(stagedir), "%s/pg_commit_ts.tmp",
+						   target_dir);
+		PS_CHECK_PATH_FORMAT(pathlen, stagedir);
+		if (access(stagedir, F_OK) == 0 && !rmtree(stagedir, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not clear branch staging dir \"%s\"", stagedir)));
+		if (MakePGDirectory(stagedir) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create branch staging dir \"%s\": %m",
+							stagedir)));
+		pagestore_write_zero_slru_page(stagedir, "commit-ts",
+									   (int64) next_xid / PS_CTS_XACTS_PER_PAGE);
+		if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove existing commit-ts dir \"%s\"", dstdir)));
+		if (rename(stagedir, dstdir) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not publish branch commit-ts dir \"%s\": %m",
+							dstdir)));
+		fsync_fname(target_dir, true);
+		PG_RETURN_INT64(1);
+	}
 	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
 	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
 	if (page_hi < page_lo)
@@ -4800,6 +4847,145 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 #undef CHECK_MANIFEST_LINE
 }
 
+/*
+ * Require every entry under an artifact directory to be a regular file or a
+ * (recursively validated) subdirectory.  copydir() classifies entries without
+ * following symlinks and silently skips anything else, so a symlinked SLRU
+ * segment would survive preflight on its container yet be absent from the
+ * installed tree after the target has already been replaced.
+ */
+static void
+pagestore_require_regular_tree(const char *path)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		char		sub[MAXPGPATH];
+		struct stat st;
+		int			pathlen;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		pathlen = snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+		PS_CHECK_PATH_FORMAT(pathlen, sub);
+		if (lstat(sub, &st) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat prepared branch artifact entry \"%s\": %m",
+							sub)));
+		if (S_ISDIR(st.st_mode))
+			pagestore_require_regular_tree(sub);
+		else if (!S_ISREG(st.st_mode))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("prepared branch artifact entry \"%s\" has the wrong file type",
+							sub)));
+	}
+	FreeDir(dir);
+}
+
+static void
+pagestore_require_prepared_artifact(const char *prepared_dir,
+									const char *relpath, bool directory)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+
+	if (strlen(prepared_dir) + strlen(relpath) + sizeof("/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prepared branch artifact path is too long")));
+
+	snprintf(path, sizeof(path), "%s/%s", prepared_dir, relpath);
+
+	/*
+	 * lstat, not stat: copydir() classifies entries without following
+	 * symlinks and silently skips them, so a symlinked artifact would pass a
+	 * stat-based check here and then be missing from the installed tree.
+	 */
+	if (lstat(path, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("prepared branch artifact \"%s\" is missing: %m", path)));
+	if (directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))
+		ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("prepared branch artifact \"%s\" has the wrong file type",
+							path)));
+	if (directory)
+		pagestore_require_regular_tree(path);
+}
+
+/*
+ * Absolutize (against the backend cwd, i.e. the data directory) and
+ * canonicalize an install path so relative and absolute spellings of the same
+ * tree compare equal.
+ */
+static void
+pagestore_canonical_install_path(const char *path, char *abs, size_t abslen)
+{
+	if (is_absolute_path(path))
+	{
+		if (strlcpy(abs, path, abslen) >= abslen)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("branch install path is too long")));
+	}
+	else
+	{
+		char		cwd[MAXPGPATH];
+
+		if (!getcwd(cwd, sizeof(cwd)))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not determine current directory: %m")));
+		if (snprintf(abs, abslen, "%s/%s", cwd, path) >= (int) abslen)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("branch install path is too long")));
+	}
+	canonicalize_path(abs);
+}
+
+/*
+ * Reject install calls whose prepared and target dirs are the same directory
+ * or nest one inside the other: install mutates the target (manifest unlink,
+ * SLRU rmtree+rename), so an overlapping source would be destroyed or copied
+ * into itself.  Both paths are absolutized so relative and absolute spellings
+ * compare, then checked textually plus by dir inode; this is a guard against
+ * typos, not a defense against adversarial symlink layouts.
+ */
+static void
+pagestore_require_disjoint_install_dirs(const char *prepared_dir,
+										const char *target_dir)
+{
+	char		prep[MAXPGPATH];
+	char		targ[MAXPGPATH];
+	size_t		preplen;
+	size_t		targlen;
+	struct stat prepst;
+	struct stat targst;
+
+	pagestore_canonical_install_path(prepared_dir, prep, sizeof(prep));
+	pagestore_canonical_install_path(target_dir, targ, sizeof(targ));
+	preplen = strlen(prep);
+	targlen = strlen(targ);
+	if (strcmp(prep, targ) == 0 ||
+		(preplen < targlen && strncmp(prep, targ, preplen) == 0 &&
+		 targ[preplen] == '/') ||
+		(targlen < preplen && strncmp(targ, prep, targlen) == 0 &&
+		 prep[targlen] == '/') ||
+		(stat(prep, &prepst) == 0 && stat(targ, &targst) == 0 &&
+		 prepst.st_dev == targst.st_dev && prepst.st_ino == targst.st_ino))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("prepared branch dir \"%s\" and install target dir \"%s\" must not overlap",
+						prepared_dir, target_dir)));
+}
+
 static bool
 pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 									   uint32_t *parent_tl,
@@ -5079,6 +5265,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid branch timeline identity")));
+	pagestore_require_disjoint_install_dirs(prepared_dir, target_dir);
 	manifest_data = pagestore_read_branch_manifest(prepared_dir);
 	if (manifest_data == NULL)
 		ereport(ERROR,
@@ -5090,6 +5277,14 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 												   &commit_ts_required))
 		ereport(ERROR,
 				(errmsg("prepared branch manifest has invalid commit-ts horizons")));
+	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
+	if (commit_ts_required)
+		pagestore_require_prepared_artifact(prepared_dir, "pg_commit_ts", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/offsets", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
+	pagestore_require_prepared_artifact(prepared_dir,
+										"pagestore_branch.manifest", false);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
 	if (target_manifest != NULL &&
 		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))

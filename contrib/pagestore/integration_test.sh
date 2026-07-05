@@ -406,6 +406,46 @@ $P -c "INSERT INTO tb VALUES (2,'after_L'); CHECKPOINT;" >/dev/null   # T2 after
 # so the boot genuinely depends on all prepare_branch output rather than parent state.
 bad_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 2, 0, '$bL');" 2>/dev/null || echo error)
 assert "$bad_install" "error" "prepared branch install rejects the wrong branch identity"
+BADSEED=$(mktemp -d)
+cp "$SEEDOUT/pagestore_branch.manifest" "$BADSEED/pagestore_branch.manifest"
+missing_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$BADSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$missing_artifact" "error" "prepared branch install rejects a missing pg_xact artifact"
+rm -rf "$BADSEED"
+# overlapping source/target must be rejected before any target mutation, so a
+# same-dir typo cannot unlink the prepared manifest it is installing from
+same_dir=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$SEEDOUT', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$same_dir" "error" "prepared branch install rejects identical prepared/target dirs"
+nested_dir=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$SEEDOUT/pg_xact/branch', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$nested_dir" "error" "prepared branch install rejects a target nested in the prepared dir"
+assert "$([ -f "$SEEDOUT/pagestore_branch.manifest" ] && echo present)" "present" \
+	"prepared manifest survives the rejected overlapping installs"
+# a relative prepared path (resolved against the backend cwd, the datadir) must
+# still be recognized as overlapping an absolute target spelled under it
+cp -a "$SEEDOUT" "$DATA/relseed"
+rel_nested=$($P -c "SELECT pagestore_install_prepared_branch('relseed', '$DATA/relseed/pg_xact/branch', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$rel_nested" "error" "prepared branch install rejects relative/absolute spellings of overlapping dirs"
+rm -rf "$DATA/relseed"
+# a symlinked artifact passes a follow-symlink stat but copydir() skips
+# symlinks, so preflight must reject it before the target is touched
+LNKSEED=$(mktemp -d)/lnkseed
+REALOFF=$(mktemp -d)
+cp -a "$SEEDOUT" "$LNKSEED"
+mv "$LNKSEED/pg_multixact/offsets" "$REALOFF/offsets"
+ln -s "$REALOFF/offsets" "$LNKSEED/pg_multixact/offsets"
+symlink_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$symlink_artifact" "error" "prepared branch install rejects a symlinked pg_multixact/offsets artifact"
+rm -rf "$(dirname "$LNKSEED")" "$REALOFF"
+# the same applies one level down: a symlinked segment file inside an artifact
+# dir would be skipped by copydir(), so the recursive preflight must catch it
+LNKSEG=$(mktemp -d)/lnkseg
+REALSEG=$(mktemp -d)
+cp -a "$SEEDOUT" "$LNKSEG"
+seg0=$(ls "$LNKSEG/pg_xact" | head -1)
+mv "$LNKSEG/pg_xact/$seg0" "$REALSEG/$seg0"
+ln -s "$REALSEG/$seg0" "$LNKSEG/pg_xact/$seg0"
+symlink_segment=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEG', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$symlink_segment" "error" "prepared branch install rejects a symlinked pg_xact segment file"
+rm -rf "$(dirname "$LNKSEG")" "$REALSEG"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
@@ -492,6 +532,16 @@ ctsSeedMd5=$($P -c "SELECT md5(pg_read_binary_file('$CTSSEED/pg_commit_ts/$ctsSe
 ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL'));")
 assert "$ctsSeedMd5" "$ctsReconMd5" "commit-ts seed page == reconstructed as-of-L page"
 rm -rf "$CTSSEED"
+# an empty horizon [x, x) has nothing to reconstruct but must still publish the
+# artifact (a zeroed bootstrap page), including at a page boundary, where the
+# naive page math would see page_hi < page_lo and mis-report XID wraparound
+EMPTYCTS=$(mktemp -d)
+empty_xid=$(( 2 * cts_per_page ))
+empty_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$EMPTYCTS', '$ctsC', '$ctsL', '$empty_xid'::text::xid, '$empty_xid'::text::xid);")
+assert "$empty_seeded" "1" "commit-ts seed publishes a bootstrap page for an empty horizon at a page boundary"
+assert "$([ -d "$EMPTYCTS/pg_commit_ts" ] && echo present)" "present" \
+	"empty-horizon commit-ts artifact directory exists"
+rm -rf "$EMPTYCTS"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
