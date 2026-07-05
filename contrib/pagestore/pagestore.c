@@ -460,8 +460,9 @@ pagestore_read_at(PG_FUNCTION_ARGS)
  *
  * Create a copy-on-write branch: a new timeline forked from parent_timeline at
  * the given LSN.  Instant -- no page data is copied; the branch shares the
- * parent's pages until it writes.  A compute can then run on the branch by
- * setting pagestore.timeline to new_timeline.
+ * parent's pages until it writes.  This only creates the store-side timeline;
+ * booting a compute on a branch timeline must use the prepared branch
+ * manifest/install flow so local SLRUs match the fork point.
  */
 PG_FUNCTION_INFO_V1(pagestore_create_branch);
 
@@ -4020,6 +4021,26 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 										  LSNGetDatum(target),
 										  TransactionIdGetDatum(oldest_commit_ts_xid),
 										  TransactionIdGetDatum(next_commit_ts_xid)));
+		else
+		{
+			char		emptycts[MAXPGPATH];
+			int			ctslen;
+
+			/*
+			 * Commit-ts was never active at the fork, so the branch's fork
+			 * state is an empty pg_commit_ts.  Stage one anyway so the
+			 * publish below replaces whatever a reused target dir may still
+			 * carry from an earlier prepare or cluster life.
+			 */
+			ctslen = snprintf(emptycts, sizeof(emptycts), "%s/pg_commit_ts",
+							  staging_root);
+			PS_CHECK_PATH_FORMAT(ctslen, emptycts);
+			if (MakePGDirectory(emptycts) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not create branch commit-ts staging dir \"%s\": %m",
+								emptycts)));
+		}
 
 		seeded += DatumGetInt64(DirectFunctionCall7(pagestore_seed_multixact,
 									  staging_dir_datum,
@@ -4048,10 +4069,9 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 					 errmsg("could not create branch seeding backup area \"%s\"", backup_root)));
 		published_xact = publish_seeded_slru_dir(staging_root, target_dir,
 												 backup_root, "pg_xact");
-		if (seed_commit_ts)
-			published_commit_ts = publish_seeded_slru_dir(staging_root, target_dir,
-														  backup_root,
-														  "pg_commit_ts");
+		published_commit_ts = publish_seeded_slru_dir(staging_root, target_dir,
+													  backup_root,
+													  "pg_commit_ts");
 		published_multixact = publish_seeded_slru_dir(staging_root, target_dir,
 													  backup_root,
 													  "pg_multixact");
@@ -4069,9 +4089,8 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 	{
 		rollback_seeded_slru_dir(target_dir, backup_root, "pg_multixact",
 								 published_multixact);
-		if (seed_commit_ts)
-			rollback_seeded_slru_dir(target_dir, backup_root, "pg_commit_ts",
-									 published_commit_ts);
+		rollback_seeded_slru_dir(target_dir, backup_root, "pg_commit_ts",
+								 published_commit_ts);
 		rollback_seeded_slru_dir(target_dir, backup_root, "pg_xact",
 								 published_xact);
 		if (!rmtree(staging_root, true))
@@ -5094,7 +5113,12 @@ pagestore_validate_datadir_branch_manifest(void)
 
 	manifest = pagestore_read_branch_manifest(DataDir);
 	if (manifest == NULL)
-		return;					/* legacy/non-branch datadir */
+	{
+		if (pagestore_localsvc_timeline() != 0)
+			ereport(FATAL,
+					(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
+		return;
+	}
 	if (!pagestore_branch_backend_active())
 		ereport(FATAL,
 				(errmsg("pagestore.backend must be \"localsvc\" to validate a branch manifest")));
@@ -5176,6 +5200,47 @@ pagestore_install_prepared_dir(const char *prepared_dir, const char *target_dir,
 	fsync_fname(target_dir, true);
 }
 
+/*
+ * Replace <target_dir>/<relpath> with an empty directory, via the same
+ * stage-and-rename shape as pagestore_install_prepared_dir().  Used when the
+ * manifest says an SLRU was never active at the fork: the branch's fork state
+ * for it is empty, and whatever the copied target datadir still carries is
+ * post-fork noise that must not survive the install.
+ */
+static void
+pagestore_install_empty_dir(const char *target_dir, const char *relpath)
+{
+	char		dst[MAXPGPATH];
+	char		stage[MAXPGPATH];
+
+	if (strlen(target_dir) + strlen(relpath) + sizeof(".install/") > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch install path is too long")));
+
+	snprintf(dst, sizeof(dst), "%s/%s", target_dir, relpath);
+	snprintf(stage, sizeof(stage), "%s/%s.install", target_dir, relpath);
+	if (access(stage, F_OK) == 0 && !rmtree(stage, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch install staging dir \"%s\"", stage)));
+	if (MakePGDirectory(stage) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch install staging dir \"%s\": %m",
+						stage)));
+	fsync_fname(stage, true);
+	if (access(dst, F_OK) == 0 && !rmtree(dst, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing branch artifact \"%s\"", dst)));
+	if (rename(stage, dst) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not install branch artifact \"%s\": %m", dst)));
+	fsync_fname(target_dir, true);
+}
+
 static void
 pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir,
 								const char *relpath, bool required)
@@ -5223,7 +5288,8 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
  * initdb/copied branch datadir.  pg_xact and pg_multixact are always
  * materialized by prepare (multixact seeds bootstrap pages even for an empty
  * horizon), so both are required; pg_commit_ts is required only when the
- * manifest's commit-ts horizons say it was seeded.  The prepared manifest must
+ * manifest's commit-ts horizons say it was seeded, and is otherwise reset to
+ * the empty fork state in the target.  The prepared manifest must
  * match the expected branch identity before any artifact is installed, and the
  * manifest is installed last so its presence remains the startup-time signal
  * that the datadir has a prepared branch identity and must pass timeline
@@ -5328,8 +5394,16 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not clear existing branch artifact staging file \"%s\": %m", stage)));
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
-	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts",
-								   commit_ts_required);
+	if (commit_ts_required)
+		pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts",
+									   true);
+	else
+		/*
+		 * The manifest says commit-ts was never active at the fork, so ignore
+		 * any pg_commit_ts a reused prepared dir may still carry and reset
+		 * the target's to the fork state: empty.
+		 */
+		pagestore_install_empty_dir(target_dir, "pg_commit_ts");
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
 									"pagestore_branch.manifest", true);

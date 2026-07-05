@@ -203,6 +203,34 @@ ls_claim_channel(uint32_t shard)
 			return;
 		}
 	}
+
+	/*
+	 * No free channel: try to reclaim an abandoned one whose late completion
+	 * has since arrived.  A channel is abandoned when its owner timed out
+	 * after posting REQUEST; once the daemon store-releases DONE it will not
+	 * touch the channel again until the next REQUEST, so a DONE abandoned
+	 * channel is safe to reuse.  Claim it first (so no other backend races
+	 * the same reclaim), then check the state; if the daemon still owes the
+	 * completion, put it back.  Without this, every timed-out op (e.g. a
+	 * REQUIRE_BRANCH startup check against a slow daemon) leaks a channel
+	 * until the fixed pool is exhausted.
+	 */
+	for (uint32_t i = target; i < ls_nchannels; i += stride)
+	{
+		PsChannel  *ch = ps_channel(ls_shm, i);
+
+		if (ps_cas(&ch->claimed, LS_CLAIMED_ABANDONED, LS_CLAIMED_OWNED))
+		{
+			if (ps_load_acquire(&ch->state) == PS_STATE_DONE)
+			{
+				ch->shard = target;
+				ls_channel = (int) i;
+				ls_channel_shard = target;
+				return;
+			}
+			ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+		}
+	}
 	ereport(ERROR,
 			(errmsg("pagestore localsvc: no free channel in shard %u (max %u)",
 					target, ls_nchannels)));
