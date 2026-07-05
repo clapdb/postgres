@@ -397,6 +397,11 @@ seeded_b=$($P -c "SELECT pagestore_prepare_branch('$SEEDOUT', 1, 0, '$bc', '$bL'
 	'3'::xid, '$boxid'::xid, '1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);")
 assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"branch prepared via base snapshot + (C,L] replay ($seeded_b SLRU page(s))"
+# commit-ts was never active at this fork (non-normal horizon), so prepare must
+# still publish pg_commit_ts -- as the empty fork state -- rather than leaving
+# whatever a reused target dir carried
+assert "$([ -d "$SEEDOUT/pg_commit_ts" ] && echo present)" "present" \
+	"branch prepare publishes an empty pg_commit_ts for an inactive horizon"
 # Copy the branch datadir before the parent advances past L, so the branch's
 # first write reuses the XID that the parent will spend on after_L below.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
@@ -466,8 +471,13 @@ else
 fi
 rm -rf "$(dirname "$UNPREPARED")"
 UNPREPARED=
+# the manifest has no commit-ts horizon, so install must reset the target's
+# pg_commit_ts to the empty fork state instead of keeping post-fork leftovers
+touch "$BRANCHDATA/pg_commit_ts/STALE"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
+assert "$([ -e "$BRANCHDATA/pg_commit_ts/STALE" ] && echo stale || echo clean)" "clean" \
+	"install resets target pg_commit_ts when the manifest has no commit-ts horizon"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install is idempotent for the same branch identity"
 # This copied parent datadir was not prepared under full routing.  With a
