@@ -453,6 +453,14 @@ ln -s "$REALSEG/$seg0" "$LNKSEG/pg_xact/$seg0"
 symlink_segment=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEG', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$symlink_segment" "error" "prepared branch install rejects a symlinked pg_xact segment file"
 rm -rf "$(dirname "$LNKSEG")" "$REALSEG"
+# an existing target manifest naming a different branch identity must be
+# rejected before any artifact is touched
+BADTARGET=$(mktemp -d)/branch
+cp -a "$BRANCHDATA" "$BADTARGET"
+sed 's/"new_timeline": 1/"new_timeline": 2/' "$SEEDOUT/pagestore_branch.manifest" > "$BADTARGET/pagestore_branch.manifest"
+target_mismatch=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BADTARGET', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$target_mismatch" "error" "prepared branch install rejects an existing target manifest for another branch"
+rm -rf "$(dirname "$BADTARGET")"
 # a branch timeline without a manifest must fail closed at startup: an
 # unprepared copy of the parent datadir cannot boot as a branch
 UNPREPARED=$(mktemp -d)/branch
