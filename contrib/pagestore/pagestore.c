@@ -4860,7 +4860,13 @@ pagestore_require_prepared_artifact(const char *prepared_dir,
 				 errmsg("prepared branch artifact path is too long")));
 
 	snprintf(path, sizeof(path), "%s/%s", prepared_dir, relpath);
-	if (stat(path, &st) != 0)
+
+	/*
+	 * lstat, not stat: copydir() classifies entries without following
+	 * symlinks and silently skips them, so a symlinked artifact would pass a
+	 * stat-based check here and then be missing from the installed tree.
+	 */
+	if (lstat(path, &st) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("prepared branch artifact \"%s\" is missing: %m", path)));
@@ -4872,12 +4878,43 @@ pagestore_require_prepared_artifact(const char *prepared_dir,
 }
 
 /*
+ * Absolutize (against the backend cwd, i.e. the data directory) and
+ * canonicalize an install path so relative and absolute spellings of the same
+ * tree compare equal.
+ */
+static void
+pagestore_canonical_install_path(const char *path, char *abs, size_t abslen)
+{
+	if (is_absolute_path(path))
+	{
+		if (strlcpy(abs, path, abslen) >= abslen)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("branch install path is too long")));
+	}
+	else
+	{
+		char		cwd[MAXPGPATH];
+
+		if (!getcwd(cwd, sizeof(cwd)))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not determine current directory: %m")));
+		if (snprintf(abs, abslen, "%s/%s", cwd, path) >= (int) abslen)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("branch install path is too long")));
+	}
+	canonicalize_path(abs);
+}
+
+/*
  * Reject install calls whose prepared and target dirs are the same directory
  * or nest one inside the other: install mutates the target (manifest unlink,
  * SLRU rmtree+rename), so an overlapping source would be destroyed or copied
- * into itself.  Textual comparison after canonicalize_path() plus an inode
- * check on the dirs themselves; this is a guard against typos, not a defense
- * against adversarial symlink layouts.
+ * into itself.  Both paths are absolutized so relative and absolute spellings
+ * compare, then checked textually plus by dir inode; this is a guard against
+ * typos, not a defense against adversarial symlink layouts.
  */
 static void
 pagestore_require_disjoint_install_dirs(const char *prepared_dir,
@@ -4890,13 +4927,8 @@ pagestore_require_disjoint_install_dirs(const char *prepared_dir,
 	struct stat prepst;
 	struct stat targst;
 
-	if (strlcpy(prep, prepared_dir, sizeof(prep)) >= sizeof(prep) ||
-		strlcpy(targ, target_dir, sizeof(targ)) >= sizeof(targ))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("branch install path is too long")));
-	canonicalize_path(prep);
-	canonicalize_path(targ);
+	pagestore_canonical_install_path(prepared_dir, prep, sizeof(prep));
+	pagestore_canonical_install_path(target_dir, targ, sizeof(targ));
 	preplen = strlen(prep);
 	targlen = strlen(targ);
 	if (strcmp(prep, targ) == 0 ||

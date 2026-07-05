@@ -419,6 +419,22 @@ nested_dir=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$SEEDO
 assert "$nested_dir" "error" "prepared branch install rejects a target nested in the prepared dir"
 assert "$([ -f "$SEEDOUT/pagestore_branch.manifest" ] && echo present)" "present" \
 	"prepared manifest survives the rejected overlapping installs"
+# a relative prepared path (resolved against the backend cwd, the datadir) must
+# still be recognized as overlapping an absolute target spelled under it
+cp -a "$SEEDOUT" "$DATA/relseed"
+rel_nested=$($P -c "SELECT pagestore_install_prepared_branch('relseed', '$DATA/relseed/pg_xact/branch', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$rel_nested" "error" "prepared branch install rejects relative/absolute spellings of overlapping dirs"
+rm -rf "$DATA/relseed"
+# a symlinked artifact passes a follow-symlink stat but copydir() skips
+# symlinks, so preflight must reject it before the target is touched
+LNKSEED=$(mktemp -d)/lnkseed
+REALOFF=$(mktemp -d)
+cp -a "$SEEDOUT" "$LNKSEED"
+mv "$LNKSEED/pg_multixact/offsets" "$REALOFF/offsets"
+ln -s "$REALOFF/offsets" "$LNKSEED/pg_multixact/offsets"
+symlink_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$symlink_artifact" "error" "prepared branch install rejects a symlinked pg_multixact/offsets artifact"
+rm -rf "$(dirname "$LNKSEED")" "$REALOFF"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
