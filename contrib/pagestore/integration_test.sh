@@ -435,6 +435,17 @@ ln -s "$REALOFF/offsets" "$LNKSEED/pg_multixact/offsets"
 symlink_artifact=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEED', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$symlink_artifact" "error" "prepared branch install rejects a symlinked pg_multixact/offsets artifact"
 rm -rf "$(dirname "$LNKSEED")" "$REALOFF"
+# the same applies one level down: a symlinked segment file inside an artifact
+# dir would be skipped by copydir(), so the recursive preflight must catch it
+LNKSEG=$(mktemp -d)/lnkseg
+REALSEG=$(mktemp -d)
+cp -a "$SEEDOUT" "$LNKSEG"
+seg0=$(ls "$LNKSEG/pg_xact" | head -1)
+mv "$LNKSEG/pg_xact/$seg0" "$REALSEG/$seg0"
+ln -s "$REALSEG/$seg0" "$LNKSEG/pg_xact/$seg0"
+symlink_segment=$($P -c "SELECT pagestore_install_prepared_branch('$LNKSEG', '$BRANCHDATA', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$symlink_segment" "error" "prepared branch install rejects a symlinked pg_xact segment file"
+rm -rf "$(dirname "$LNKSEG")" "$REALSEG"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ok_install" "ok" "prepared branch install succeeds for the same branch identity"
 ok_install=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BRANCHDATA', 1, 0, '$bL');" >/dev/null 2>&1 && echo ok || echo error)

@@ -4847,6 +4847,46 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 #undef CHECK_MANIFEST_LINE
 }
 
+/*
+ * Require every entry under an artifact directory to be a regular file or a
+ * (recursively validated) subdirectory.  copydir() classifies entries without
+ * following symlinks and silently skips anything else, so a symlinked SLRU
+ * segment would survive preflight on its container yet be absent from the
+ * installed tree after the target has already been replaced.
+ */
+static void
+pagestore_require_regular_tree(const char *path)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir(path);
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		char		sub[MAXPGPATH];
+		struct stat st;
+		int			pathlen;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+		pathlen = snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+		PS_CHECK_PATH_FORMAT(pathlen, sub);
+		if (lstat(sub, &st) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat prepared branch artifact entry \"%s\": %m",
+							sub)));
+		if (S_ISDIR(st.st_mode))
+			pagestore_require_regular_tree(sub);
+		else if (!S_ISREG(st.st_mode))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("prepared branch artifact entry \"%s\" has the wrong file type",
+							sub)));
+	}
+	FreeDir(dir);
+}
+
 static void
 pagestore_require_prepared_artifact(const char *prepared_dir,
 									const char *relpath, bool directory)
@@ -4875,6 +4915,8 @@ pagestore_require_prepared_artifact(const char *prepared_dir,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("prepared branch artifact \"%s\" has the wrong file type",
 							path)));
+	if (directory)
+		pagestore_require_regular_tree(path);
 }
 
 /*
