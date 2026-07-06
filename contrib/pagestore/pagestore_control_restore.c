@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
 
@@ -86,13 +87,31 @@ client_attach(const char *shm_name)
 				hdr->page_size, PG_CONTROL_FILE_SIZE);
 		exit(2);
 	}
-	for (uint32_t i = 0; i < hdr->nchannels; i++)
-		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
-		{
-			chan = (int) i;
-			atexit(release_channel);
-			return;
-		}
+	/*
+	 * Claim a channel that belongs to the control key's owner shard: with a
+	 * sharded daemon (--nshards > 1) the channel index selects the serving
+	 * shard worker, so a channel from the wrong pool would read another
+	 * shard's (empty) index.  Same stride walk as the backend's
+	 * ls_claim_channel().
+	 */
+	{
+		PsKey		key;
+		uint32_t	nshards = hdr->nshards ? hdr->nshards : 1;
+		uint32_t	target;
+
+		memset(&key, 0, sizeof(key));
+		key.klass = PS_KLASS_CONTROL;
+		target = ps_key_shard(&key, nshards);
+
+		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
+			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
+			{
+				chan = (int) i;
+				ps_channel(shm, chan)->shard = target;
+				atexit(release_channel);
+				return;
+			}
+	}
 	fprintf(stderr, "pagestore_control_restore: no free daemon channel\n");
 	exit(2);
 }
@@ -113,8 +132,21 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	ch->req_lsn = read_lsn;
 	ch->opcode = PS_OP_READ_AT;
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
-	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
-		;
+
+	/*
+	 * Bound the wait: a stale shm object whose daemon is gone would spin
+	 * forever, hanging branch bootstrap instead of failing closed.  10s is
+	 * orders of magnitude above a healthy daemon's single-page latency.
+	 */
+	for (int spins = 0; ps_load_acquire(&ch->state) != PS_STATE_DONE; spins++)
+	{
+		if (spins >= 10 * 1000)
+		{
+			fprintf(stderr, "pagestore_control_restore: daemon did not answer within 10s (stale --shm or daemon down?)\n");
+			exit(1);
+		}
+		usleep(1000);
+	}
 	if (ch->result != 1)
 		return false;
 	memcpy(out, (const void *) ch->data, PG_CONTROL_FILE_SIZE);
@@ -143,21 +175,47 @@ main(int argc, char **argv)
 			shm_name = argv[++i];
 		else if (strcmp(argv[i], "--timeline") == 0 && i + 1 < argc)
 		{
-			timeline = (uint32_t) strtoul(argv[++i], NULL, 10);
+			char	   *end;
+			unsigned long v;
+
+			errno = 0;
+			v = strtoul(argv[++i], &end, 10);
+			if (errno != 0 || end == argv[i] || *end != '\0' || v > UINT32_MAX)
+			{
+				fprintf(stderr, "pagestore_control_restore: invalid --timeline \"%s\"\n",
+						argv[i]);
+				return 2;
+			}
+			timeline = (uint32_t) v;
 			have_timeline = true;
 		}
 		else if (strcmp(argv[i], "--lsn") == 0 && i + 1 < argc)
 		{
-			uint32_t	hi,
+			unsigned long long hi,
 						lo;
+			char	   *end;
+			const char *arg = argv[++i];
 
-			if (sscanf(argv[++i], "%X/%X", &hi, &lo) != 2)
+			errno = 0;
+			hi = strtoull(arg, &end, 16);
+			if (errno != 0 || end == arg || *end != '/' || hi > UINT32_MAX)
+				end = NULL;
+			if (end)
 			{
-				fprintf(stderr, "pagestore_control_restore: invalid --lsn \"%s\" (expected X/Y)\n",
-						argv[i]);
+				const char *lostr = end + 1;
+
+				errno = 0;
+				lo = strtoull(lostr, &end, 16);
+				if (errno != 0 || end == lostr || *end != '\0' || lo > UINT32_MAX)
+					end = NULL;
+			}
+			if (!end)
+			{
+				fprintf(stderr, "pagestore_control_restore: invalid --lsn \"%s\" (expected X/Y hex, no trailing junk)\n",
+						arg);
 				return 2;
 			}
-			read_lsn = ((uint64_t) hi << 32) | lo;
+			read_lsn = ((uint64_t) hi << 32) | (uint64_t) lo;
 		}
 		else if (!datadir)
 			datadir = argv[i];
@@ -219,6 +277,32 @@ main(int argc, char **argv)
 	}
 
 	/*
+	 * Run the same compatibility checks startup would: a CRC-valid image
+	 * from an incompatible cluster (different catalog version, block size,
+	 * segment geometry) must fail closed HERE, not after it has replaced
+	 * pg_control.
+	 */
+	if (control.catalog_version_no != CATALOG_VERSION_NO)
+	{
+		fprintf(stderr, "pagestore_control_restore: control image catalog version %u does not match this build (%u)\n",
+				control.catalog_version_no, CATALOG_VERSION_NO);
+		return 1;
+	}
+	/* toast_max_chunk_size is backend-only; it derives from BLCKSZ, which is
+	 * checked, and startup re-validates the full set anyway */
+	if (control.blcksz != BLCKSZ ||
+		control.relseg_size != RELSEG_SIZE ||
+		control.xlog_blcksz != XLOG_BLCKSZ ||
+		control.nameDataLen != NAMEDATALEN ||
+		control.indexMaxKeys != INDEX_MAX_KEYS ||
+		control.loblksize != (BLCKSZ / 4) ||	/* LOBLKSIZE (backend-only header) */
+		control.maxAlign != MAXIMUM_ALIGNOF)
+	{
+		fprintf(stderr, "pagestore_control_restore: control image layout parameters do not match this build\n");
+		return 1;
+	}
+
+	/*
 	 * Atomic install: exactly PG_CONTROL_FILE_SIZE bytes (never the padded
 	 * store object) to a temp file, fsync, rename over the live name, fsync
 	 * the directory.  A crash anywhere in this sequence leaves either the old
@@ -250,6 +334,14 @@ main(int argc, char **argv)
 		fprintf(stderr, "pagestore_control_restore: could not fsync \"%s\": %m\n", dirpath);
 		if (fd >= 0)
 			close(fd);
+
+		/*
+		 * The rename already happened; a nonzero exit that leaves the new
+		 * file installed would break the fail-closed contract (callers
+		 * treat failure as "no restored control file").  Best-effort remove
+		 * it so no half-durable image is trusted.
+		 */
+		unlink(path);
 		return 1;
 	}
 	close(fd);
