@@ -629,6 +629,24 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 }
 
 /*
+ * Make everything the daemon has accepted durable (ps_storage->sync()).
+ * Used by the control mirror after draining queued pg_control images: the
+ * design's durability contract is local file first, then store mirror +
+ * store sync.
+ */
+void
+pagestore_localsvc_store_sync(void)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_IMMEDSYNC;
+	ls_exec(ch);
+}
+
+/*
  * Durable WAL retention floor of this compute's timeline ancestry: the store
  * must keep shipped WAL at/above it for the mirrored pg_control images to
  * stay restorable.  0 = no control image constrains WAL yet.
