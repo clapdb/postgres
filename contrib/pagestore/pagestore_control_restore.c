@@ -120,6 +120,28 @@ client_attach(const char *shm_name)
 				atexit(release_channel);
 				return;
 			}
+
+		/*
+		 * No free channel: reclaim an abandoned one whose late completion
+		 * has landed (claimed==2 with state DONE) -- once the daemon
+		 * publishes DONE it will not touch the mailbox again until the next
+		 * REQUEST.  Without this, a single transient timeout on a
+		 * few-channels-per-shard configuration would make every later
+		 * restore fail with "no free daemon channel".  Claim first, then
+		 * verify; put it back if the completion is still owed.
+		 */
+		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
+			if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
+			{
+				if (ps_load_acquire(&ps_channel(shm, i)->state) == PS_STATE_DONE)
+				{
+					chan = (int) i;
+					ps_channel(shm, chan)->shard = target;
+					atexit(release_channel);
+					return;
+				}
+				ps_store_release(&ps_channel(shm, i)->claimed, 2);
+			}
 	}
 	fprintf(stderr, "pagestore_control_restore: no free daemon channel\n");
 	exit(2);
@@ -351,21 +373,34 @@ main(int argc, char **argv)
 	if (fd < 0 || fsync(fd) != 0)
 	{
 		/*
-		 * The rename already succeeded, so global/pg_control now IS the
-		 * (CRC-valid) restored image -- possibly the only control file this
-		 * cluster has if it replaced an existing one.  Removing it here
-		 * would trade "maybe not yet durable" for "certainly gone", so
-		 * leave it in place, report exactly what is and is not guaranteed,
-		 * and exit nonzero so the caller retries the restore (which
-		 * re-runs the rename + fsync).
+		 * Directories cannot be fsync'd everywhere: mirror frontend
+		 * fsync_fname() (src/common/file_utils.c) and ignore EBADF/EINVAL,
+		 * which just mean this platform/filesystem does not support it --
+		 * retrying forever would brick bootstrap over a non-error.
 		 */
-		fprintf(stderr, "pagestore_control_restore: could not fsync \"%s\": %m\n", dirpath);
-		fprintf(stderr, "pagestore_control_restore: the restored pg_control is installed but its directory entry may not survive a crash; rerun to retry\n");
-		if (fd >= 0)
+		if (fd >= 0 && (errno == EBADF || errno == EINVAL))
+		{
 			close(fd);
-		return 1;
+		}
+		else
+		{
+			/*
+			 * A real failure.  The rename already succeeded, so
+			 * global/pg_control now IS the (CRC-valid) restored image --
+			 * possibly the only control file this cluster has.  Removing it
+			 * would trade "maybe not yet durable" for "certainly gone", so
+			 * leave it, report exactly what is and is not guaranteed, and
+			 * exit nonzero so the caller retries (re-running rename+fsync).
+			 */
+			fprintf(stderr, "pagestore_control_restore: could not fsync \"%s\": %m\n", dirpath);
+			fprintf(stderr, "pagestore_control_restore: the restored pg_control is installed but its directory entry may not survive a crash; rerun to retry\n");
+			if (fd >= 0)
+				close(fd);
+			return 1;
+		}
 	}
-	close(fd);
+	else
+		close(fd);
 
 	printf("restored pg_control as of %X/%08X on timeline %u (checkpoint %X/%08X, redo %X/%08X)\n",
 		   (uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline,
