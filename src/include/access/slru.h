@@ -266,6 +266,17 @@ typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
  * before anything was removed.
  */
 typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage);
+
+/*
+ * Cache revalidation for store-backed SLRUs, called by SimpleLruReadPage()
+ * on a cache hit (bank lock held, so it must be infallible and cheap --
+ * local memory checks only, no I/O, no locks, no error).  Return false to
+ * discard the cached slot and force a physical re-read: a clean VALID slot
+ * served from a mirror can go stale when the mirror's watermark advances
+ * or a truncation tombstone appears, and no physical read would ever
+ * notice.  Dirty slots are local truth and are never offered.
+ */
+typedef bool (*slru_page_revalidate_hook_type) (SlruDesc *ctl, int64 pageno);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
 														int64 pageno,
 														char *page);
@@ -286,6 +297,7 @@ extern PGDLLIMPORT slru_page_write_hook_type slru_page_write_hook;
 extern PGDLLIMPORT slru_page_read_hook_type slru_page_read_hook;
 extern PGDLLIMPORT slru_page_exists_hook_type slru_page_exists_hook;
 extern PGDLLIMPORT slru_truncate_hook_type slru_truncate_hook;
+extern PGDLLIMPORT slru_page_revalidate_hook_type slru_page_revalidate_hook;
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);

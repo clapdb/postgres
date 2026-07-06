@@ -809,7 +809,7 @@ assert "$($P -c "SELECT pagestore_wal_retain_floor() <= (SELECT redo_lsn FROM pg
 # clean-as-of-cutoff that flushed images do not have).
 $P -c "CREATE FUNCTION pagestore_slru_live_read_at(text, int, pg_lsn) RETURNS bytea
         AS 'pagestore','pagestore_slru_live_read_at' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_slru_mirror_stats(OUT staged int, OUT recapture int, OUT lost bigint) RETURNS record
+       CREATE FUNCTION pagestore_slru_mirror_stats(OUT staged int, OUT recapture int, OUT lost bigint, OUT read_served bigint, OUT read_fallback bigint) RETURNS record
         AS 'pagestore','pagestore_slru_mirror_stats' LANGUAGE C STRICT;" >/dev/null
 $P -c "CREATE TABLE slru_live(x int);" >/dev/null
 LIVEXID=$($P -q -c "BEGIN; INSERT INTO slru_live VALUES (1); SELECT (txid_current() % 4294967296)::bigint; COMMIT;")
@@ -843,7 +843,23 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "t" \
 	"watermark advances across a traffic + checkpoint cycle"
 
-# --- 29. SLRU truncation tombstones: durable before local deletion ---
+# --- 29. SLRU live reads: transaction status served from the mirror ---
+# Restart the compute with pagestore.slru_live_reads on and the local
+# pg_xact segment hidden: startup's clog read and the status lookup for our
+# committed xid can then only be answered by the live mirror (gated on the
+# published watermark).  A clean shutdown checkpoint ships + publishes.
+"$BIN/pg_ctl" -D "$DATA" -m fast stop >/dev/null
+echo "pagestore.slru_live_reads = on" >> "$DATA/postgresql.conf"
+mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null
+assert "$($P -c "SELECT txid_status($LIVEXID);")" "committed" \
+	"transaction status answered with the local pg_xact segment gone (live mirror serves the read)"
+# the segment may have been recreated by post-recovery clog writes; restore
+# the original only if it was not
+[ -e "$DATA/pg_xact/0000" ] || mv "$DATA/pg_xact/0000.hidden" "$DATA/pg_xact/0000"
+rm -f "$DATA/pg_xact/0000.hidden"
+
+# --- 30. SLRU truncation tombstones: durable before local deletion ---
 # slru_truncate_hook publishes a durable cutoff tombstone BEFORE any local
 # segment is deleted; a live-mirror reader must treat pages below the newest
 # tombstone at/below its LSN as dead, whatever images exist.

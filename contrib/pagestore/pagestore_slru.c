@@ -80,7 +80,11 @@
 /* GUC: engage the live SLRU mirror (requires the localsvc backend) */
 static bool pagestore_slru_mirror = false;
 
+/* GUC: serve SLRU reads from another compute's live mirror */
+static bool pagestore_slru_live_reads = false;
+
 static bool ps_slru_mirror_enabled = false;
+static bool ps_slru_live_reads_enabled = false;
 
 /* Per-op mailbox timeout and whole-drain budget; see the control mirror. */
 #define PS_SLRU_SHIP_TIMEOUT_MS		10000
@@ -138,6 +142,61 @@ static bool ps_slru_exit_registered = false;
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
+
+/*
+ * Reader-side state (pagestore.slru_live_reads).
+ *
+ * The writer's watermark is published to the store (PS_KLASS_SLRU_WM) so a
+ * reader on another compute can fetch it; the fetch is IPC, so it happens
+ * only at the read/exists hooks (physical-read misses) and at transaction
+ * boundaries, TTL-bounded, never under a bank lock.
+ *
+ * Every page the read path DECIDED at watermark E (served from the mirror
+ * or deliberately left to the local file) is remembered with that epoch;
+ * the revalidate hook (bank lock held, memory-only) declares a cached slot
+ * stale once the fetched watermark has moved past its epoch, forcing one
+ * physical re-read per page per epoch.  An unknown page (table churn) is
+ * treated as stale -- one redundant re-read, never a stale answer.
+ */
+#define PS_SLRU_SERVED_CAPACITY 1024	/* power of two */
+
+typedef struct PsSlruServed
+{
+	bool		used;
+	uint32		obj;
+	uint32		pageno;
+	uint64		epoch;			/* watermark the decision was made at */
+} PsSlruServed;
+
+static PsSlruServed ps_slru_served[PS_SLRU_SERVED_CAPACITY];
+
+static uint64 ps_slru_reader_wm = 0;	/* last fetched watermark */
+static TimestampTz ps_slru_reader_wm_at = 0;	/* when it was fetched */
+
+#define PS_SLRU_READER_WM_TTL_MS	1000
+
+/* stats for tests/observability */
+static uint64 ps_slru_read_served = 0;
+static uint64 ps_slru_read_fallback = 0;
+
+static inline int
+ps_slru_served_slot(uint32 obj, uint32 pageno)
+{
+	uint32		h = obj ^ (pageno * 2654435761u);
+
+	return (int) (h & (PS_SLRU_SERVED_CAPACITY - 1));
+}
+
+static void
+ps_slru_served_note(uint32 obj, uint32 pageno, uint64 epoch)
+{
+	PsSlruServed *e = &ps_slru_served[ps_slru_served_slot(obj, pageno)];
+
+	e->used = true;
+	e->obj = obj;
+	e->pageno = pageno;
+	e->epoch = epoch;
+}
 
 /*
  * The visibility watermark (mirrored_status_lsn): an LSN W such that every
@@ -406,6 +465,253 @@ pagestore_slru_note_checkpoint_redo(XLogRecPtr redo)
 			break;
 	}
 	pg_atomic_write_u64(&ps_slru_wm->candidate_loss, loss);
+}
+
+/*
+ * Publish the watermark to the store so readers on other computes can
+ * fetch it.  Losing this write only leaves readers on an older watermark
+ * (conservative), so no sync and failures are swallowed with a WARNING.
+ * Called after a drain, never in a critical section.
+ */
+static void
+ps_slru_wm_publish(void)
+{
+	static uint64 ps_slru_wm_published = 0;
+	uint64		w;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	if (ps_slru_wm == NULL)
+		return;
+	w = pg_atomic_read_u64(&ps_slru_wm->watermark);
+	if (w == 0 || w <= ps_slru_wm_published)
+		return;
+
+	PG_TRY();
+	{
+		PageStoreRelKey key = {0};
+		char		page[BLCKSZ];
+
+		memset(page, 0, sizeof(page));
+		memcpy(page, &w, sizeof(uint64));
+		ps_slru_obj_key(&key, 0);
+		pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_WM, &key, 0, page,
+											 w, PS_SLRU_SHIP_TIMEOUT_MS);
+		ps_slru_wm_published = w;
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore: could not publish the SLRU mirror watermark; readers stay on the previous one")));
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Fetch the newest published watermark from the store, TTL-bounded.  IPC:
+ * never called under a bank lock.  On any failure keeps the previous value
+ * (readers just stay conservative).
+ */
+static uint64
+ps_slru_reader_fetch_wm(void)
+{
+	TimestampTz now = GetCurrentTimestamp();
+	MemoryContext cxt = CurrentMemoryContext;
+
+	if (ps_slru_reader_wm_at != 0 &&
+		!TimestampDifferenceExceeds(ps_slru_reader_wm_at, now,
+									PS_SLRU_READER_WM_TTL_MS))
+		return ps_slru_reader_wm;
+
+	PG_TRY();
+	{
+		PageStoreRelKey key = {0};
+		char		page[BLCKSZ];
+		uint64		w;
+
+		ps_slru_obj_key(&key, 0);
+		if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_WM, &key, 0,
+										   PG_UINT64_MAX, page, NULL))
+		{
+			memcpy(&w, page, sizeof(uint64));
+			if (w > ps_slru_reader_wm)
+				ps_slru_reader_wm = w;
+		}
+		ps_slru_reader_wm_at = now;
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		ps_slru_reader_wm_at = now; /* back off for a TTL, keep the old value */
+	}
+	PG_END_TRY();
+
+	return ps_slru_reader_wm;
+}
+
+/*
+ * slru_page_read_hook consumer: serve a physical SLRU page read from the
+ * live mirror, gated on the published watermark.  Runs inside the
+ * SLRU_PAGE_READ_IN_PROGRESS window: it must not throw, so every store
+ * error degrades to FALLBACK -- the local file (the reader's own truth)
+ * decides, and a missing local page fails through the ordinary
+ * SlruReportIOError machinery.
+ */
+static SlruReadHookResult
+ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
+{
+	uint32		obj;
+	uint64		w;
+	MemoryContext cxt = CurrentMemoryContext;
+	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
+
+	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+		return SLRU_READ_HOOK_FALLBACK;
+	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+		return SLRU_READ_HOOK_FALLBACK;
+
+	PG_TRY();
+	{
+		/*
+		 * The watermark is the completeness floor, not a cap: any bit in
+		 * any shipped image is a durable commit (the writer ships only
+		 * after XLogFlush(fence)), so the NEWEST image is always served --
+		 * an image's version can exceed W (a checkpoint's flush includes
+		 * commits after its redo), and capping the read at W would hide
+		 * status <= W that only that image carries.  W gates whether the
+		 * mirror has ever completed a cycle at all, and provides the
+		 * revalidation epoch.
+		 */
+		w = ps_slru_reader_fetch_wm();
+		if (w != 0)
+		{
+			PageStoreRelKey key = {0};
+			char		tpage[BLCKSZ];
+			int64		cutoff = -1;
+
+			/* pages below the newest tombstone are dead, whatever exists */
+			ps_slru_obj_key(&key, obj);
+			if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
+											   PG_UINT64_MAX, tpage, NULL))
+				memcpy(&cutoff, tpage, sizeof(int64));
+
+			if (pageno >= cutoff)
+			{
+				ps_slru_obj_key(&key, obj);
+				if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_LIVE, &key,
+												   (BlockNumber) pageno,
+												   PG_UINT64_MAX, page, NULL))
+					res = SLRU_READ_HOOK_SERVED;
+			}
+
+			/* remember the decision epoch either way; see the revalidator */
+			ps_slru_served_note(obj, (uint32) pageno, w);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		res = SLRU_READ_HOOK_FALLBACK;
+	}
+	PG_END_TRY();
+
+	if (res == SLRU_READ_HOOK_SERVED)
+		ps_slru_read_served++;
+	else
+		ps_slru_read_fallback++;
+	return res;
+}
+
+/*
+ * slru_page_exists_hook consumer: same gating as the read hook.  A page the
+ * mirror holds at/below the watermark exists; a tombstoned page does not;
+ * anything else defers to the local file.
+ */
+static SlruReadHookResult
+ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
+{
+	uint32		obj;
+	uint64		w;
+	MemoryContext cxt = CurrentMemoryContext;
+	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
+
+	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+		return SLRU_READ_HOOK_FALLBACK;
+	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+		return SLRU_READ_HOOK_FALLBACK;
+
+	PG_TRY();
+	{
+		/* same newest-wins rule as the read hook; W is only the enable gate */
+		w = ps_slru_reader_fetch_wm();
+		if (w != 0)
+		{
+			PageStoreRelKey key = {0};
+			char		tpage[BLCKSZ];
+			int64		cutoff = -1;
+
+			ps_slru_obj_key(&key, obj);
+			if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
+											   PG_UINT64_MAX, tpage, NULL))
+				memcpy(&cutoff, tpage, sizeof(int64));
+
+			if (pageno < cutoff)
+			{
+				*exists = false;
+				res = SLRU_READ_HOOK_SERVED;
+			}
+			else
+			{
+				ps_slru_obj_key(&key, obj);
+				if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_LIVE, &key,
+												   (BlockNumber) pageno,
+												   PG_UINT64_MAX, tpage, NULL))
+				{
+					*exists = true;
+					res = SLRU_READ_HOOK_SERVED;
+				}
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		FlushErrorState();
+		res = SLRU_READ_HOOK_FALLBACK;
+	}
+	PG_END_TRY();
+
+	return res;
+}
+
+/*
+ * slru_page_revalidate_hook consumer.  Bank lock held: memory checks only.
+ * A cached slot is fresh while the fetched watermark still equals the
+ * epoch its page was last decided at; once the watermark moves, one
+ * physical re-read per page picks up whatever the mirror now has.  Unknown
+ * pages (table churn) count as stale -- a redundant re-read, never a stale
+ * answer.
+ */
+static bool
+ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
+{
+	uint32		obj;
+	PsSlruServed *e;
+
+	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+		return true;
+	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+		return true;
+	if (ps_slru_reader_wm == 0)
+		return true;			/* nothing fetched yet: local truth only */
+
+	e = &ps_slru_served[ps_slru_served_slot(obj, (uint32) pageno)];
+	if (e->used && e->obj == obj && e->pageno == (uint32) pageno)
+		return e->epoch >= ps_slru_reader_wm;
+	return false;
 }
 
 /*
@@ -813,10 +1119,12 @@ ps_slru_drain(void)
 
 	/*
 	 * Whatever happened above, republish this process's pending floor from
-	 * the queue's current contents and try to move the watermark.
+	 * the queue's current contents, try to move the watermark, and let
+	 * readers on other computes see where it now stands.
 	 */
 	ps_slru_wm_republish_pending();
 	ps_slru_wm_advance();
+	ps_slru_wm_publish();
 }
 
 /* Exposed drain point: the control mirror's flush hook chains into this. */
@@ -868,6 +1176,15 @@ ps_slru_xact_drain(XactEvent event, void *arg)
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
 		return;
 	pagestore_slru_mirror_drain();
+
+	/*
+	 * Reader side: refresh the fetched watermark at transaction boundaries
+	 * (TTL-bounded IPC, outside all locks) so the bank-lock revalidator --
+	 * which may only do memory checks -- has a moving epoch to compare
+	 * against even on a pure cache-hit workload.
+	 */
+	if (ps_slru_live_reads_enabled && CritSectionCount == 0)
+		(void) ps_slru_reader_fetch_wm();
 }
 
 /*
@@ -881,8 +1198,8 @@ Datum
 pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[3];
-	bool		nulls[3] = {false, false, false};
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -890,6 +1207,8 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 	values[0] = Int32GetDatum(ps_slru_queue_count);
 	values[1] = Int32GetDatum(ps_slru_recap_count);
 	values[2] = Int64GetDatum((int64) ps_slru_lost);
+	values[3] = Int64GetDatum((int64) ps_slru_read_served);
+	values[4] = Int64GetDatum((int64) ps_slru_read_fallback);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -1035,18 +1354,40 @@ pagestore_slru_mirror_init(bool localsvc_active)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pagestore.slru_live_reads",
+							 "Serve SLRU page reads from the store's live mirror.",
+							 "For a compute consuming another compute's transaction "
+							 "status: physical SLRU reads are answered from the "
+							 "mirror, gated on the published visibility watermark, "
+							 "and cached pages are revalidated when it advances.",
+							 &pagestore_slru_live_reads,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
+
 	for (int i = 0; i < (int) lengthof(ps_slru_dirmap); i++)
 		ps_slru_dirmap[i].obj = pagestore_slru_klass_id(ps_slru_dirmap[i].dir);
 
-	if (!pagestore_slru_mirror)
+	if (!pagestore_slru_mirror && !pagestore_slru_live_reads)
 		return;
 	if (!localsvc_active)
 		ereport(ERROR,
-				(errmsg("pagestore.slru_mirror requires pagestore.backend = 'localsvc'")));
+				(errmsg("pagestore.slru_mirror and pagestore.slru_live_reads require pagestore.backend = 'localsvc'")));
 
-	ps_slru_mirror_enabled = true;
-	slru_page_write_hook = ps_slru_write_hook;
-	slru_truncate_hook = ps_slru_truncate_hook;
+	if (pagestore_slru_mirror)
+	{
+		ps_slru_mirror_enabled = true;
+		slru_page_write_hook = ps_slru_write_hook;
+		slru_truncate_hook = ps_slru_truncate_hook;
+	}
+	if (pagestore_slru_live_reads)
+	{
+		ps_slru_live_reads_enabled = true;
+		slru_page_read_hook = ps_slru_read_hook;
+		slru_page_exists_hook = ps_slru_exists_hook;
+		slru_page_revalidate_hook = ps_slru_revalidate_hook;
+	}
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
 	/* the visibility watermark lives in shared memory */

@@ -189,9 +189,16 @@ in-flight transaction status is a distinct feature, not needed to boot a branch.
 When it is built, the three review rounds established the requirements it must meet
 -- recorded here so they are not lost:
 
-- **Per-update capture, not flushed-page snapshots.** Because pages coalesce
-  updates, live sharing must ship the per-update status changes (or reconstruct via
-  WAL on the reader), not single-LSN page images.
+- **Per-update capture, not flushed-page snapshots.** ADDRESSED without
+  per-update shipping: the coalescing objection is fatal only when a page
+  image must answer an exact as-of question (branch seeding, which stays
+  on WAL reconstruction).  The live mirror never answers as-of: readers
+  take the NEWEST image -- every bit in any shipped image is a durable
+  commit (ship happens only after `XLogFlush(fence)`) -- and the
+  watermark is a completeness floor, not a cap (an image's version can
+  exceed the watermark, since a checkpoint's flush includes commits after
+  its redo; capping the read would hide status below the floor that only
+  that image carries).
 - **No-drop overflow.** A staging queue may not drop an image and "reread later"
   (the as-of bytes are gone); it must block/backpressure or spill durably.
 - **Snapshot under the bank lock.** Any page image staged must be copied under the
@@ -209,11 +216,16 @@ When it is built, the three review rounds established the requirements it must m
   no partial bound is safe.  A lost capture freezes the watermark (the
   candidate carries a loss-count snapshot).  The local commit is never
   held back; only its visibility to *other* computes waits.
-- **Cache-hit revalidation, including tombstones.** `SimpleLruReadPage()` returns a
-  valid cached slot without hitting the physical-read hook, so cached slots must be
-  revalidated against both the status watermark **and** truncation tombstones
-  (tombstones are a separate versioned negative result with their own
-  epoch/invalidation).
+- **Cache-hit revalidation, including tombstones.** DONE:
+  `slru_page_revalidate_hook` runs on every `SimpleLruReadPage()` cache
+  hit (bank lock held, memory checks only); the consumer remembers the
+  watermark epoch each page was last decided at and declares the slot
+  stale once the fetched watermark moves -- one physical re-read per page
+  per epoch, which re-runs the full read-hook gating including the newest
+  truncation tombstone.  The fetched watermark refreshes at read misses
+  and transaction boundaries (TTL-bounded IPC, never under the bank
+  lock); unknown pages count as stale (a redundant re-read, never a stale
+  answer).  Dirty slots are local truth and are never discarded.
 - **Tombstones with a defined version + synchronous truncate barrier.**
   DONE: `slru_truncate_hook` fires before any local segment deletion
   (`SimpleLruTruncate` and `SlruDeleteSegment`, so multixact members'

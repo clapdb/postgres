@@ -194,6 +194,7 @@ static int	slru_errno;
  */
 slru_page_write_hook_type slru_page_write_hook = NULL;
 slru_truncate_hook_type slru_truncate_hook = NULL;
+slru_page_revalidate_hook_type slru_page_revalidate_hook = NULL;
 slru_page_read_hook_type slru_page_read_hook = NULL;
 slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
@@ -600,6 +601,25 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 				/* Now we must recheck state from the top */
 				continue;
 			}
+
+			/*
+			 * A store-backed SLRU may need cached slots revalidated: a
+			 * clean VALID slot served from a mirror can go stale when the
+			 * mirror's watermark advances (or a truncation tombstone
+			 * appears), and no physical read would ever notice.  The hook
+			 * runs under the bank lock (infallible, local checks only); a
+			 * stale slot is discarded and re-read through the ordinary
+			 * miss path below.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+			{
+				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+				continue;
+			}
+
 			/* Otherwise, it's ready to use */
 			SlruRecentlyUsed(shared, slotno);
 
