@@ -242,6 +242,22 @@ extern bool RecoveryInProgress(void);
 extern RecoveryState GetRecoveryState(void);
 extern bool XLogInsertAllowed(void);
 extern XLogRecPtr GetXLogInsertRecPtr(void);
+
+/*
+ * Hook for control-file writes.  UpdateControlFile() calls it right after
+ * update_controlfile() has durably written global/pg_control, passing the
+ * just-written image and the LSN of the update that caused the write (a
+ * checkpoint's completion-record end LSN, a replayed record's end LSN, or
+ * the position that made a recordless state transition visible).  An
+ * external mirror (contrib/pagestore) versions the mirrored image by that
+ * LSN so a branch cut at L can restore pg_control "as of L".  The hook may
+ * run inside a critical section and must not error, block, or allocate
+ * there; implementations chain any previously installed hook.
+ */
+struct ControlFileData;
+typedef void (*control_file_write_hook_type) (const struct ControlFileData *control,
+											  XLogRecPtr update_lsn);
+extern PGDLLIMPORT control_file_write_hook_type control_file_write_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 

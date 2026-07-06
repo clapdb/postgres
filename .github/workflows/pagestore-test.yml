@@ -11,10 +11,40 @@ on:
   push:
     paths:
       - 'contrib/pagestore/**'
+      # core seams the pagestore module depends on: a core-only PR (e.g. the
+      # control-file write hook) must still run the in-engine tests
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/backend/storage/smgr/**'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/access/xlog.h'
+      - 'src/include/access/slru.h'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/include/storage/smgr.h'
       - '.github/workflows/pagestore-test.yml'
   pull_request:
     paths:
       - 'contrib/pagestore/**'
+      # core seams the pagestore module depends on: a core-only PR (e.g. the
+      # control-file write hook) must still run the in-engine tests
+      - 'src/backend/access/transam/xlog.c'
+      - 'src/backend/access/transam/xlogrecovery.c'
+      - 'src/include/access/xlogrecovery.h'
+      - 'src/backend/access/transam/slru.c'
+      - 'src/backend/access/transam/xlogutils.c'
+      - 'src/backend/access/heap/visibilitymap.c'
+      - 'src/backend/postmaster/walredo.c'
+      - 'src/backend/storage/smgr/**'
+      - 'src/backend/tcop/postgres.c'
+      - 'src/include/access/xlog.h'
+      - 'src/include/access/slru.h'
+      - 'src/include/postmaster/walredo.h'
+      - 'src/include/storage/smgr.h'
       - '.github/workflows/pagestore-test.yml'
   workflow_dispatch:
 
