@@ -765,6 +765,31 @@ assert "$($P -c "SELECT octet_length(pagestore_control_image_asof(pg_current_wal
 	"mirrored control image is exactly PG_CONTROL_FILE_SIZE bytes"
 assert "$($P -c "SELECT pagestore_control_image_asof('0/1'::pg_lsn) IS NULL;")" "t" \
 	"no mirrored control image below the first update LSN (as-of read is capped)"
+# the restore tool installs the mirrored image atomically; right after a
+# checkpoint the newest image equals the live pg_control byte-for-byte
+RESTOREDIR=$(mktemp -d)
+mkdir -p "$RESTOREDIR/global"
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 "$RESTOREDIR" >/dev/null; then
+	echo "ok   - pagestore_control_restore installed the mirrored control image"
+else
+	echo "FAIL - pagestore_control_restore failed"; fail=1
+fi
+if cmp -s "$RESTOREDIR/global/pg_control" "$DATA/global/pg_control"; then
+	echo "ok   - restored pg_control equals the live control file byte-for-byte"
+else
+	echo "FAIL - restored pg_control differs from the live control file"; fail=1
+fi
+ctrl_ok=$("$BIN/pg_controldata" -D "$RESTOREDIR" >/dev/null 2>&1 && echo ok || echo error)
+assert "$ctrl_ok" "ok" "pg_controldata accepts the restored control file"
+rm -f "$RESTOREDIR/global/pg_control"
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn 0/1 "$RESTOREDIR" >/dev/null 2>&1; then
+	echo "FAIL - restore below the first update LSN should fail closed"; fail=1
+else
+	echo "ok   - restore below the first update LSN fails closed"
+fi
+assert "$([ -e "$RESTOREDIR/global/pg_control" ] && echo present || echo absent)" "absent" \
+	"failed restore leaves no control file behind"
+rm -rf "$RESTOREDIR"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

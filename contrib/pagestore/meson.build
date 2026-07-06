@@ -47,6 +47,16 @@ pagestore_walrestore = executable('pagestore_walrestore',
 )
 contrib_targets += pagestore_walrestore
 
+# Restore global/pg_control from the store's mirrored control image, as of a
+# branch's fork LSN (PGCONTROL_ON_STORE_DESIGN.md restore protocol).  A
+# frontend program: it CRC-verifies ControlFileData via libpgport.
+pagestore_control_restore = executable('pagestore_control_restore',
+  files('pagestore_control_restore.c'),
+  dependencies: [frontend_code],
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_control_restore
+
 # Throughput probe: forks a daemon, writes a dataset, times reading it back.
 # Indicative only (see pagestore_bench.c); freestanding like the daemon.
 pagestore_bench = executable('pagestore_bench',
