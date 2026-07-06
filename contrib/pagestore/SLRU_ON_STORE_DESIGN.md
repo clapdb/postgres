@@ -8,18 +8,21 @@ seeders, and the prepare/install/manifest bootstrap flow
 (`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
 fail-closed branch startup validation.
 
-Known caveats -- these fail closed rather than silently misbehave, and remain
-open work:
+Known caveats -- each remains open work, with its exact failure mode stated:
 
-- **Commit-ts activation toggles in (C, L] are not replayed.**  The commit-ts
-  applier replays per-record timestamps but not `track_commit_timestamp`
-  activation/deactivation state changes (segment zero/re-activation); a
-  parent that toggled the GUC inside the replay window fails the seed rather
-  than reconstructing the toggle (`pagestore.c`, commit-ts applier).
-- **Snapshot shipping is manual-cutoff.**  `pagestore_ship_slru_snapshot`
-  copies segment files at a caller-supplied cutoff C the caller must prove
-  (checkpoint + no concurrent SLRU writes); the online, automatically
-  triggered proven-C ship is a follow-up.
+- **Commit-ts toggles in (C, L] are not replayed.**  A `track_commit_timestamp`
+  DEACTIVATION inside the window is detected explicitly and fails the seed.
+  An ACTIVATION is not explicitly detected: it generally fails closed anyway
+  via the required-page check (the base snapshot at C has no commit-ts pages
+  to load), and reads below the branch's `oldestCommitTsXid` horizon are
+  masked -- but segments surviving from an EARLIER activation era are not
+  defended against.  Full toggle replay (segment zero/re-activation state) is
+  the follow-up.
+- **Snapshot shipping trusts the caller's cutoff.**  `pagestore_ship_slru_snapshot`
+  copies segment files and keys them by a caller-supplied cutoff C; it errors
+  only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
+  concurrent SLRU writes).  An unproven cutoff silently ships mis-keyed
+  bytes.  The online, automatically triggered proven-C ship is the follow-up.
 - **The appliers read the preparing backend's local WAL.**  A branch with no
   local WAL cannot yet re-run reconstruction store-backed (redo_page_asof has
   a store-backed WAL reader; the SLRU appliers do not).  prepare must run
