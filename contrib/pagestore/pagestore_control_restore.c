@@ -31,7 +31,13 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "postgres_fe.h"
+/*
+ * Like pg_resetwal: use postgres.h with FRONTEND defined, not postgres_fe.h,
+ * because the control/heap headers we validate against (heaptoast.h and
+ * friends) drag in backend-only types.
+ */
+#define FRONTEND 1
+#include "postgres.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -39,13 +45,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/heaptoast.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
 
 static void *shm = NULL;
-static int	chan = -1;
-static bool request_in_flight = false;
+
+/*
+ * Shared with the signal handler: only volatile sig_atomic_t reads/writes
+ * are defined behavior from an async handler.  'shm' is written once before
+ * the handlers are installed and never changes afterwards.
+ */
+static volatile sig_atomic_t chan = -1;
+static volatile sig_atomic_t request_in_flight = 0;
 
 /*
  * Orchestrators cancel bootstrap with SIGTERM/SIGINT, which does NOT run
@@ -224,7 +237,7 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	 * published -- is reclaimable: both this tool's and the backend's claim
 	 * paths reuse abandoned channels whose state is IDLE or DONE.
 	 */
-	request_in_flight = true;
+	request_in_flight = 1;
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
 	/*
@@ -243,7 +256,7 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 		}
 		usleep(1000);
 	}
-	request_in_flight = false;
+	request_in_flight = 0;
 	if (ch->result != 1)
 		return false;
 	memcpy(out, (const void *) ch->data, PG_CONTROL_FILE_SIZE);
@@ -263,7 +276,9 @@ main(int argc, char **argv)
 	pg_crc32c	crc;
 	char		tmppath[MAXPGPATH];
 	char		path[MAXPGPATH];
+	char		bakpath[MAXPGPATH];
 	char		dirpath[MAXPGPATH];
+	bool		had_previous = false;
 	int			fd;
 
 	for (int i = 1; i < argc; i++)
@@ -335,7 +350,8 @@ main(int argc, char **argv)
 		return 2;
 	}
 
-	if (snprintf(path, sizeof(path), "%s/global/pg_control", datadir) >= (int) sizeof(path) ||
+	if (snprintf(bakpath, sizeof(bakpath), "%s/global/pg_control.restorebak", datadir) >= (int) sizeof(bakpath) ||
+		snprintf(path, sizeof(path), "%s/global/pg_control", datadir) >= (int) sizeof(path) ||
 		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp.XXXXXX",
 				 datadir) >= (int) sizeof(tmppath) ||
 		snprintf(dirpath, sizeof(dirpath), "%s/global", datadir) >= (int) sizeof(dirpath))
@@ -386,14 +402,13 @@ main(int argc, char **argv)
 				control.catalog_version_no, CATALOG_VERSION_NO);
 		return 1;
 	}
-	/* toast_max_chunk_size is backend-only; it derives from BLCKSZ, which is
-	 * checked, and startup re-validates the full set anyway */
 	if (control.blcksz != BLCKSZ ||
 		control.relseg_size != RELSEG_SIZE ||
 		control.xlog_blcksz != XLOG_BLCKSZ ||
 		control.slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT ||
 		control.nameDataLen != NAMEDATALEN ||
 		control.indexMaxKeys != INDEX_MAX_KEYS ||
+		control.toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE ||
 		control.loblksize != (BLCKSZ / 4) ||	/* LOBLKSIZE (backend-only header) */
 		control.maxAlign != MAXIMUM_ALIGNOF ||
 		control.floatFormat != FLOATFORMAT_VALUE ||
@@ -433,10 +448,28 @@ main(int argc, char **argv)
 		unlink(tmppath);
 		return 1;
 	}
+	/*
+	 * Keep the pre-existing control file recoverable across the rename: on
+	 * a real post-rename fsync failure the fail-closed contract requires
+	 * the OLD file (or nothing) to be what a failed restore leaves behind.
+	 * A hard link costs nothing and is atomic; stale leftovers from a
+	 * crashed run are replaced.
+	 */
+	unlink(bakpath);
+	if (link(path, bakpath) == 0)
+		had_previous = true;
+	else if (errno != ENOENT)
+	{
+		fprintf(stderr, "pagestore_control_restore: could not back up existing \"%s\": %m\n", path);
+		unlink(tmppath);
+		return 1;
+	}
+
 	if (rename(tmppath, path) != 0)
 	{
 		fprintf(stderr, "pagestore_control_restore: could not rename \"%s\" into place: %m\n", tmppath);
 		unlink(tmppath);
+		unlink(bakpath);
 		return 1;
 	}
 	fd = open(dirpath, O_RDONLY);
@@ -455,22 +488,30 @@ main(int argc, char **argv)
 		else
 		{
 			/*
-			 * A real failure.  The rename already succeeded, so
-			 * global/pg_control now IS the (CRC-valid) restored image --
-			 * possibly the only control file this cluster has.  Removing it
-			 * would trade "maybe not yet durable" for "certainly gone", so
-			 * leave it, report exactly what is and is not guaranteed, and
-			 * exit nonzero so the caller retries (re-running rename+fsync).
+			 * A real failure: honor the fail-closed contract -- a nonzero
+			 * exit leaves the PRE-EXISTING file (restored from the backup
+			 * link) or nothing behind, never a half-durable replacement the
+			 * caller was told to distrust.
 			 */
 			fprintf(stderr, "pagestore_control_restore: could not fsync \"%s\": %m\n", dirpath);
-			fprintf(stderr, "pagestore_control_restore: the restored pg_control is installed but its directory entry may not survive a crash; rerun to retry\n");
 			if (fd >= 0)
 				close(fd);
+			if (had_previous)
+			{
+				if (rename(bakpath, path) != 0)
+					fprintf(stderr, "pagestore_control_restore: could not roll back to the previous pg_control (still at \"%s\"): %m\n", bakpath);
+			}
+			else
+				unlink(path);
 			return 1;
 		}
 	}
 	else
 		close(fd);
+
+	/* success: the backup link of the replaced file is no longer needed */
+	if (had_previous)
+		unlink(bakpath);
 
 	printf("restored pg_control as of %X/%08X on timeline %u (checkpoint %X/%08X, redo %X/%08X)\n",
 		   (uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline,
