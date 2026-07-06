@@ -151,6 +151,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_SIZE:
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
+		case PS_OP_WAL_RETAIN_FLOOR:
 			return 0;
 		default:
 			return 1;

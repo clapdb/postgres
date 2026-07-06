@@ -790,6 +790,14 @@ fi
 assert "$([ -e "$RESTOREDIR/global/pg_control" ] && echo present || echo absent)" "absent" \
 	"failed restore leaves no control file behind"
 rm -rf "$RESTOREDIR"
+# the daemon's durable WAL retention floor: every mirrored control image ships
+# a redo-pointer note, and shipped WAL at/above min(redo) must be retained
+$P -c "CREATE FUNCTION pagestore_wal_retain_floor() RETURNS pg_lsn
+        AS 'pagestore','pagestore_wal_retain_floor' LANGUAGE C;" >/dev/null
+assert "$($P -c "SELECT pagestore_wal_retain_floor() IS NOT NULL;")" "t" \
+	"store reports a WAL retention floor once control images exist"
+assert "$($P -c "SELECT pagestore_wal_retain_floor() <= (SELECT redo_lsn FROM pg_control_checkpoint());")" "t" \
+	"WAL retention floor is at/below the current checkpoint redo pointer"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
