@@ -196,6 +196,24 @@ ps_control_drain(void)
 				continue;
 			}
 
+			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
+				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
+
+			/*
+			 * The preliminary CREATE and NBLOCKS carry no image bytes, so a
+			 * timeout there cannot result in this image being applied late;
+			 * the slot stays rewritable by a later same-LSN update.  Mark
+			 * posted only right before the first WRITE puts slot-derived
+			 * bytes in flight (the daemon can complete a timed-out WRITE
+			 * late) -- from then on the slot's bytes must never change
+			 * again; see the dedup path.  The floor note below is derived
+			 * from the slot too, so it is inside the frozen window.
+			 */
+			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
+															  &key,
+															  PS_CONTROL_SHIP_TIMEOUT_MS);
+			p->posted = true;
+
 			/*
 			 * Ship the retention "floor note" first: block 1 of the control
 			 * object carries this image's checkpoint redo pointer at the
@@ -208,36 +226,26 @@ ps_control_drain(void)
 			 */
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image.checkPointCopy.redo, sizeof(XLogRecPtr));
-			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key, 1, page,
-												 (uint64) p->update_lsn,
-												 PS_CONTROL_SHIP_TIMEOUT_MS);
+			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
+													  1, page,
+													  (uint64) p->update_lsn,
+													  nb,
+													  PS_CONTROL_SHIP_TIMEOUT_MS);
 
 			/*
 			 * The object image is the on-disk pg_control representation:
 			 * the ControlFileData bytes (CRC already computed by
 			 * update_controlfile) zero-padded -- to PG_CONTROL_FILE_SIZE on
 			 * disk, to BLCKSZ here.  The restore tool writes back exactly
-			 * the first PG_CONTROL_FILE_SIZE bytes.
+			 * the first PG_CONTROL_FILE_SIZE bytes.  Re-fetch the block
+			 * count: the note write above may have extended the object.
 			 */
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image, sizeof(ControlFileData));
 
-			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
-				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
-
-			/*
-			 * The preliminary CREATE and NBLOCKS carry no image bytes, so a
-			 * timeout there cannot result in this image being applied late;
-			 * the slot stays rewritable by a later same-LSN update.  Mark
-			 * posted only right before the WRITE itself puts the bytes in
-			 * flight (the daemon can complete a timed-out WRITE late) --
-			 * from then on the slot's bytes must never change again; see
-			 * the dedup path.
-			 */
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
-			p->posted = true;
 			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
 													  0, page,
 													  (uint64) p->update_lsn,
