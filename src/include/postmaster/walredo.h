@@ -40,5 +40,8 @@ extern Buffer WalRedoReadBuffer(RelFileLocator rlocator, ForkNumber forknum,
  * model (e.g. visibilitymap_pin, whose caller will ReleaseBuffer it).
  */
 extern Buffer WalRedoScratchBuffer(void);
+extern bool WalRedoBufferIsScratch(Buffer buf);
+extern Buffer WalRedoVMBufferForHeapBlock(BlockNumber heapBlk,
+										  BlockNumber mapBlk);
 
 #endif							/* WALREDO_H */
