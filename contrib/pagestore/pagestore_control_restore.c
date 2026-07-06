@@ -138,13 +138,12 @@ client_attach(const char *shm_name)
 		PsKey		key;
 		uint32_t	nshards = hdr->nshards ? hdr->nshards : 1;
 		uint32_t	target;
+		sigset_t	claimset,
+					oldset;
 
 		memset(&key, 0, sizeof(key));
 		key.klass = PS_KLASS_CONTROL;
 		target = ps_key_shard(&key, nshards);
-
-		sigset_t	claimset,
-					oldset;
 
 		/*
 		 * Arm the release paths BEFORE owning anything: a cancellation
@@ -157,6 +156,14 @@ client_attach(const char *shm_name)
 		signal(SIGTERM, restore_signal_exit);
 		signal(SIGINT, restore_signal_exit);
 		signal(SIGQUIT, restore_signal_exit);
+
+		/*
+		 * A broken stdout pipe must not kill the tool: after the install is
+		 * durable the final status printf would otherwise raise the default
+		 * SIGPIPE and report failure for a restore that completed.  Writes
+		 * fail with EPIPE instead, which the status output ignores.
+		 */
+		signal(SIGPIPE, SIG_IGN);
 
 		/*
 		 * And block those signals across the claim itself: a handler firing
@@ -361,6 +368,45 @@ main(int argc, char **argv)
 	{
 		fprintf(stderr, "pagestore_control_restore: data directory path too long\n");
 		return 2;
+	}
+
+#ifndef WIN32
+	/*
+	 * Refuse the wrong uid, like the other control-file utilities
+	 * (pg_resetwal): a root-owned replacement written by a privileged
+	 * wrapper would leave global/pg_control unreadable and unwritable for
+	 * the postgres user after the rename.
+	 */
+	if (geteuid() == 0)
+	{
+		fprintf(stderr, "pagestore_control_restore: cannot be executed by \"root\"; run as the user that will own the server process\n");
+		return 2;
+	}
+	{
+		struct stat st;
+
+		if (stat(datadir, &st) == 0 && st.st_uid != geteuid())
+		{
+			fprintf(stderr, "pagestore_control_restore: data directory \"%s\" is owned by another user\n", datadir);
+			return 2;
+		}
+	}
+#endif
+
+	/*
+	 * Bootstrap-only guard: restoring pg_control underneath a running
+	 * postmaster would race its own control-file writes.  The same lock
+	 * file check the server and pg_resetwal use.
+	 */
+	{
+		char		pidpath[MAXPGPATH];
+
+		if (snprintf(pidpath, sizeof(pidpath), "%s/postmaster.pid", datadir) < (int) sizeof(pidpath) &&
+			access(pidpath, F_OK) == 0)
+		{
+			fprintf(stderr, "pagestore_control_restore: lock file \"%s\" exists; is a server running in this data directory?\n", pidpath);
+			return 2;
+		}
 	}
 
 	/*
