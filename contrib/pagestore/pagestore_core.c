@@ -1493,18 +1493,34 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 					goto done;
 				}
 				memcpy(&redo, tmp, sizeof(redo));
-				if (redo != 0 && (floor == 0 || redo < floor))
+
+				/*
+				 * A zero redo means a torn/corrupt note (the mirror never
+				 * ships one: every control image carries a real redo
+				 * pointer).  Its image's requirement is unknowable, so the
+				 * floor collapses to "retain everything" -- returning a
+				 * higher floor because the same-LSN coverage check was
+				 * satisfied by a garbage note would under-retain.
+				 */
+				if (redo == 0)
+				{
+					floor = 1;
+					goto done;
+				}
+				if (floor == 0 || redo < floor)
 					floor = redo;
 			}
 		}
 
 		/*
 		 * Every restorable control image (block 0) must be covered by a
-		 * note at the same version: an image written before the floor-note
-		 * format existed has an unknowable redo pointer, and returning a
-		 * floor derived only from newer notes could sit above it.  Fail
-		 * closed so a GC caller retains everything until such stores are
-		 * re-mirrored (any later control write re-ships note + image).
+		 * note at the same version: an image without one (mirrored before
+		 * the note format existed) has an unknowable redo pointer.  Old
+		 * versions never leave the chain, so failing the query would brick
+		 * the floor FOREVER on upgraded stores; instead collapse to the
+		 * most conservative provable answer -- retain everything (floor =
+		 * the lowest valid LSN) -- until version-level GC (M5) prunes the
+		 * unnoted images away.
 		 */
 		if (images)
 		{
@@ -1524,7 +1540,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 						}
 				if (!covered)
 				{
-					rc = -1;
+					floor = 1;
 					goto done;
 				}
 			}
