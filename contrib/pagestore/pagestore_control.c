@@ -44,7 +44,9 @@
 #include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "utils/memutils.h"
 #include "pagestore_backend.h"
 #include "utils/pg_lsn.h"
 #include "varatt.h"
@@ -93,6 +95,7 @@ static void
 ps_control_drain(void)
 {
 	bool		shipped = false;
+	MemoryContext drain_cxt = CurrentMemoryContext;
 
 	Assert(CritSectionCount == 0);
 
@@ -174,9 +177,30 @@ ps_control_drain(void)
 	}
 	PG_CATCH();
 	{
+		ErrorData  *edata;
+		MemoryContext ecxt = MemoryContextSwitchTo(drain_cxt);
+
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(ecxt);
+
 		/*
-		 * Swallow the error: the queue was not advanced, so every image is
-		 * retried at the next ship point.  No locks are held here and a
+		 * A user cancellation or backend termination raised from inside the
+		 * mailbox wait (CHECK_FOR_INTERRUPTS in ls_exec) is not a mirror
+		 * failure: swallowing it would make CHECKPOINT and the checksum
+		 * state machines ignore interrupts.  Let those propagate; the queue
+		 * was not advanced, so nothing is lost.
+		 */
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FreeErrorData(edata);
+
+		/*
+		 * Swallow store failures: the queue was not advanced, so every image
+		 * is retried at the next ship point.  No locks are held here and a
 		 * timed-out op marked its channel abandoned, so downgrading to a
 		 * WARNING is safe -- and required: ship points live inside
 		 * checkpoints, recovery steps, and the checksum state machines,
@@ -205,6 +229,29 @@ ps_control_write_hook(const struct ControlFileData *control,
 
 	if (!ps_control_mirror_enabled)
 		return;
+
+	/*
+	 * Same-LSN dedup: two control writes can legitimately carry one update
+	 * LSN (end-of-recovery + a recordless promotion).  Keep only the NEWER
+	 * image for a given LSN -- the collapse is correct (see the file
+	 * header), and it makes every shipped append for one LSN byte-identical,
+	 * so a timed-out write completing LATE after a retry cannot reorder
+	 * distinct same-LSN images (latest-append-wins then picks identical
+	 * bytes either way).
+	 */
+	for (int i = 0; i < ps_control_queue_count; i++)
+	{
+		PsControlPending *q = &ps_control_queue[(ps_control_queue_head + i)
+												% PS_CONTROL_QUEUE_CAPACITY];
+
+		if (q->update_lsn == update_lsn)
+		{
+			memcpy(&q->image, control, sizeof(ControlFileData));
+			if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
+				ps_control_drain();
+			return;
+		}
+	}
 
 	if (ps_control_queue_count == PS_CONTROL_QUEUE_CAPACITY)
 	{
@@ -237,6 +284,23 @@ ps_control_write_hook(const struct ControlFileData *control,
 	 * invokes the flush hook right after those locks are released.
 	 */
 	if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
+		ps_control_drain();
+}
+
+/*
+ * Final ship attempt at process exit: control writes made by short-lived
+ * processes (the data-checksum worker, a shutting-down checkpointer) must
+ * not vanish with the process while the queue holds them.  Runs via
+ * before_shmem_exit, so the localsvc channel is still attached; bounded
+ * waits + the swallowing catch make it exit-safe.  A process CRASH can
+ * still lose queued images -- bounded staleness until the next control
+ * write re-mirrors, same class as the documented overflow drop.
+ */
+static void
+ps_control_exit_drain(int code, Datum arg)
+{
+	if (ps_control_mirror_enabled && ps_control_queue_count > 0 &&
+		CritSectionCount == 0)
 		ps_control_drain();
 }
 
@@ -281,6 +345,9 @@ pagestore_control_mirror_init(bool localsvc_active)
 	control_file_write_hook = ps_control_write_hook;
 	prev_control_file_flush_hook = control_file_flush_hook;
 	control_file_flush_hook = ps_control_flush_hook;
+
+	if (ps_control_mirror_enabled)
+		before_shmem_exit(ps_control_exit_drain, (Datum) 0);
 }
 
 /*
