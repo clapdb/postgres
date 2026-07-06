@@ -48,6 +48,7 @@
 #include "access/heaptoast.h"
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
+#include "common/file_perm.h"
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
 
@@ -352,7 +353,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 
-	if (snprintf(bakpath, sizeof(bakpath), "%s/global/pg_control.restorebak", datadir) >= (int) sizeof(bakpath) ||
+	if (snprintf(bakpath, sizeof(bakpath), "%s/global/pg_control.restorebak.XXXXXX", datadir) >= (int) sizeof(bakpath) ||
 		snprintf(path, sizeof(path), "%s/global/pg_control", datadir) >= (int) sizeof(path) ||
 		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp.XXXXXX",
 				 datadir) >= (int) sizeof(tmppath) ||
@@ -361,6 +362,14 @@ main(int argc, char **argv)
 		fprintf(stderr, "pagestore_control_restore: data directory path too long\n");
 		return 2;
 	}
+
+	/*
+	 * Adopt the cluster's file-creation mode (group access or not) so the
+	 * restored pg_control keeps the permissions initdb chose; mkstemp
+	 * creates 0600 regardless.  On stat failure keep the defaults -- the
+	 * datadir will fail harder soon enough.
+	 */
+	(void) GetDataDirectoryCreatePerm(datadir);
 
 	client_attach(shm_name);
 
@@ -455,6 +464,14 @@ main(int argc, char **argv)
 #ifdef WIN32
 	_setmode(fd, _O_BINARY);
 #endif
+	/* mkstemp creates 0600; the rename must not tighten the cluster's mode */
+	if (fchmod(fd, pg_file_create_mode) != 0)
+	{
+		fprintf(stderr, "pagestore_control_restore: could not set permissions on \"%s\": %m\n", tmppath);
+		close(fd);
+		unlink(tmppath);
+		return 1;
+	}
 	if (write(fd, image, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE ||
 		fsync(fd) != 0 || close(fd) != 0)
 	{
@@ -467,10 +484,23 @@ main(int argc, char **argv)
 	 * Keep the pre-existing control file recoverable across the rename: on
 	 * a real post-rename fsync failure the fail-closed contract requires
 	 * the OLD file (or nothing) to be what a failed restore leaves behind.
-	 * A hard link costs nothing and is atomic; stale leftovers from a
-	 * crashed run are replaced.
+	 * A hard link costs nothing and is atomic.  The link name is private to
+	 * this restore (mkstemp-unique, like the temp file): a shared fixed
+	 * name would let two racing restores unlink or replace each other's
+	 * rollback link.  Leftovers from crashed runs are bounded noise.
 	 */
-	unlink(bakpath);
+	{
+		int			bakfd = mkstemp(bakpath);
+
+		if (bakfd < 0)
+		{
+			fprintf(stderr, "pagestore_control_restore: could not reserve backup name \"%s\": %m\n", bakpath);
+			unlink(tmppath);
+			return 1;
+		}
+		close(bakfd);
+		unlink(bakpath);
+	}
 	if (link(path, bakpath) == 0)
 		had_previous = true;
 	else if (errno != ENOENT)
@@ -544,10 +574,21 @@ main(int argc, char **argv)
 	else
 		close(fd);
 
+	/*
+	 * The install is durable: from here this run must report success.  A
+	 * cancellation deferred by the mask above would _exit(128+sig) on
+	 * unmask and tell the orchestrator the restore failed while the new
+	 * pg_control is installed; ignore the termination signals instead
+	 * (which also discards any pending ones) before restoring the mask.
+	 */
+	signal(SIGTERM, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+	sigprocmask(SIG_SETMASK, &installmask, NULL);
+
 	/* success: the backup link of the replaced file is no longer needed */
 	if (had_previous)
 		unlink(bakpath);
-	sigprocmask(SIG_SETMASK, &installmask, NULL);
 
 	printf("restored pg_control as of %X/%08X on timeline %u (checkpoint %X/%08X, redo %X/%08X)\n",
 		   (uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline,
