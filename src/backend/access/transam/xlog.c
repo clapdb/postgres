@@ -4672,6 +4672,16 @@ CallControlFileFlushHook(void)
 static void
 UpdateControlFile(XLogRecPtr update_lsn)
 {
+	/*
+	 * Clamp the version to the image's own WAL requirement: an image whose
+	 * minRecoveryPoint points into the future must not be mirrored below it,
+	 * or a branch cut in between would restore a control file that demands
+	 * WAL past the cut.  (During normal operation minRecoveryPoint is
+	 * invalid and this is a no-op.)
+	 */
+	if (ControlFile->minRecoveryPoint > update_lsn)
+		update_lsn = ControlFile->minRecoveryPoint;
+
 	if (update_lsn > LastControlUpdateLSN)
 		LastControlUpdateLSN = update_lsn;
 
@@ -4819,6 +4829,16 @@ SetDataChecksumsOnInProgress(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	WaitForProcSignalBarrier(barrier);
 
 	/*
@@ -4900,6 +4920,16 @@ SetDataChecksumsOn(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
 
@@ -4971,6 +5001,9 @@ SetDataChecksumsOff(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
+		/* ship now; see the sibling comment below (drain cannot throw) */
+		CallControlFileFlushHook();
+
 		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 		WaitForProcSignalBarrier(barrier);
 
@@ -5008,6 +5041,16 @@ SetDataChecksumsOff(void)
 
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
+
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
 
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
@@ -6748,16 +6791,20 @@ StartupXLOG(void)
 	 * branch cut in between would then miss the promotion image).  The raw
 	 * insert position is wrong in the other direction: it is the NEXT
 	 * record's start, which sits past the page header when the last record
-	 * ended exactly on a page boundary, so a branch cut at the true
-	 * end-of-log would also miss the image.  Build a record-end position
-	 * instead: every record this startup inserted after replay (end-of-
-	 * recovery, shutdown/end checkpoints, parameter changes) performed a
-	 * control write versioned by its own record end, so the max of the
-	 * replayed end, the pre-existing end of log, and the highest prior
-	 * control-update LSN is the end of the last record in the stream.
+	 * ended exactly on a page boundary -- but records CAN be emitted after
+	 * the last control write without one of their own (interrupted-checksum
+	 * cleanup, the logical-decoding status record), and the promotion image
+	 * must be versioned at/after ALL of them: a version below any such
+	 * record lets a branch cut after it restore the pre-promotion control
+	 * file.  So take the insert position into the max as the upper bound of
+	 * everything inserted; the page-header overshoot it can carry is the
+	 * SAFE direction (a branch cut exactly at a page-boundary end-of-log
+	 * restores the previous image -- bounded staleness), whereas any
+	 * undershoot would be a correctness hole.
 	 */
 	promotion_lsn = Max(EndOfLog, GetXLogReplayRecPtr(NULL));
 	promotion_lsn = Max(promotion_lsn, LastControlUpdateLSN);
+	promotion_lsn = Max(promotion_lsn, GetXLogInsertRecPtr());
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
@@ -8869,8 +8916,15 @@ XLogReportParameters(void)
 		}
 		else
 		{
-			/* no record inserted: version by the current insert position */
-			update_lsn = GetXLogInsertRecPtr();
+			/*
+			 * No record inserted (wal_level = minimal, so no archiving and
+			 * no branch reader either).  Prefer the highest record-end
+			 * control version we know; fall back to the insert position for
+			 * a first-ever write.
+			 */
+			update_lsn = LastControlUpdateLSN;
+			if (XLogRecPtrIsInvalid(update_lsn))
+				update_lsn = GetXLogInsertRecPtr();
 		}
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
