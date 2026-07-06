@@ -590,9 +590,19 @@ spdk_open(const char *path, uint64_t segment_size)
 static void
 spdk_close(void)
 {
+	/*
+	 * Persist the superblock BEFORE freeing the thread contexts:
+	 * thread_free() resets each shard's num_segments, so writing the super
+	 * afterwards would record zero segments everywhere and the next open
+	 * would treat the device log as empty.  thread_free() still flushes a
+	 * dirty current segment first, so flush those explicitly up front to
+	 * keep the persisted counts consistent with the flushed data.
+	 */
+	for (uint32_t i = 0; i < g_nshards; i++)
+		flush_curbuf(&g_threads[i]);
+	super_write();
 	for (uint32_t i = 0; i < g_nshards; i++)
 		thread_free(&g_threads[i]);
-	super_write();
 	if (g_ctrlr)
 		spdk_nvme_detach(g_ctrlr);
 	g_ctrlr = NULL;
