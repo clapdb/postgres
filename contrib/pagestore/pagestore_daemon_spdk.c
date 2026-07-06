@@ -101,6 +101,25 @@ read_done(void *arg, int ok)
 	}
 }
 
+/*
+ * Release the submission hold taken before queuing a request's reads.
+ * ps_spdk_read_async() completes reads served from the in-memory append
+ * segment (or absent segments) SYNCHRONOUSLY, so without a hold an early
+ * completion could zero 'pending' and publish DONE while later blocks of the
+ * same request are still being queued -- the client would read a partially
+ * filled channel.  The hold keeps pending >= 1 until every block is queued;
+ * this release publishes DONE itself if all completions already fired.
+ */
+static void
+submit_done(ReqState *rs)
+{
+	if (--rs->pending == 0)
+	{
+		rs->active = 0;
+		ps_store_release(&rs->ch->state, PS_STATE_DONE);
+	}
+}
+
 static int
 request_is_write(PsOpcode opcode)
 {
@@ -191,10 +210,8 @@ begin(uint32_t i, PsChannel *ch)
 					return;
 				}
 				rs->ch = ch;
-				rs->pending = 0;
+				rs->pending = 1;	/* submission hold: see submit_done() */
 				rs->active = 1;
-				/* completions only fire from ps_spdk_poll() (the main loop), not
-				 * during submit, so incrementing pending as we go is safe */
 				for (uint32_t b = 0; b < nb; b++)
 				{
 					unsigned char *dst = ch->data + (size_t) b * page_size;
@@ -209,7 +226,8 @@ begin(uint32_t i, PsChannel *ch)
 					}
 					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */
-					bc = &rs->blk[rs->pending++];
+					bc = &rs->blk[rs->pending - 1];	/* slot 0.. behind the hold */
+					rs->pending++;
 					bc->rs = rs;
 					bc->tl = tl;
 					bc->key = ch->key;
@@ -219,12 +237,8 @@ begin(uint32_t i, PsChannel *ch)
 					ps_spdk_read_async(v->shard, v->seg, v->off, dst, page_size,
 									   read_done, bc);
 				}
-				if (rs->pending == 0)	/* all cached or unwritten */
-				{
-					rs->active = 0;
-					ps_store_release(&ch->state, PS_STATE_DONE);
-				}
-				return;			/* DONE published by read_done otherwise */
+				submit_done(rs);	/* releases the hold; publishes if all landed */
+				return;			/* DONE published by read_done/submit_done */
 			}
 
 		case PS_OP_READ_AT:
