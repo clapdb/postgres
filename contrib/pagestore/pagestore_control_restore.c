@@ -128,15 +128,23 @@ client_attach(const char *shm_name)
 		key.klass = PS_KLASS_CONTROL;
 		target = ps_key_shard(&key, nshards);
 
+		/*
+		 * Arm the release paths BEFORE owning anything: a cancellation
+		 * landing between the CAS and a later handler install would take
+		 * the default signal action, skip atexit, and leave claimed==1
+		 * leaked forever (the reclaim path only recovers abandoned
+		 * channels).
+		 */
+		atexit(release_channel);
+		signal(SIGTERM, restore_signal_exit);
+		signal(SIGINT, restore_signal_exit);
+		signal(SIGQUIT, restore_signal_exit);
+
 		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
 			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 			{
 				chan = (int) i;
 				ps_channel(shm, chan)->shard = target;
-				atexit(release_channel);
-				signal(SIGTERM, restore_signal_exit);
-				signal(SIGINT, restore_signal_exit);
-				signal(SIGQUIT, restore_signal_exit);
 				return;
 			}
 
@@ -152,14 +160,18 @@ client_attach(const char *shm_name)
 		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
 			if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
 			{
-				if (ps_load_acquire(&ps_channel(shm, i)->state) == PS_STATE_DONE)
+				uint32_t	st = ps_load_acquire(&ps_channel(shm, i)->state);
+
+				/*
+				 * DONE: the daemon finished the abandoned op and will not
+				 * touch the mailbox again.  IDLE: the abandoning owner was
+				 * cancelled before ever publishing a request, so the daemon
+				 * never saw one.  Both are safe to reuse.
+				 */
+				if (st == PS_STATE_DONE || st == PS_STATE_IDLE)
 				{
 					chan = (int) i;
 					ps_channel(shm, chan)->shard = target;
-					atexit(release_channel);
-					signal(SIGTERM, restore_signal_exit);
-					signal(SIGINT, restore_signal_exit);
-					signal(SIGQUIT, restore_signal_exit);
 					return;
 				}
 				ps_store_release(&ps_channel(shm, i)->claimed, 2);
@@ -184,6 +196,15 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	ch->blocknum = 0;
 	ch->req_lsn = read_lsn;
 	ch->opcode = PS_OP_READ_AT;
+
+	/*
+	 * Mark in-flight BEFORE publishing the request: a cancellation in the
+	 * gap then abandons the channel conservatively (freeing a mailbox the
+	 * daemon might be writing would be corruption).  The over-abandonment
+	 * this can cause -- state still IDLE because the request was never
+	 * published -- is reclaimable: both this tool's and the backend's claim
+	 * paths reuse abandoned channels whose state is IDLE or DONE.
+	 */
 	request_in_flight = true;
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
@@ -296,8 +317,8 @@ main(int argc, char **argv)
 	}
 
 	if (snprintf(path, sizeof(path), "%s/global/pg_control", datadir) >= (int) sizeof(path) ||
-		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp.%d", datadir,
-				 (int) getpid()) >= (int) sizeof(tmppath) ||
+		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp.XXXXXX",
+				 datadir) >= (int) sizeof(tmppath) ||
 		snprintf(dirpath, sizeof(dirpath), "%s/global", datadir) >= (int) sizeof(dirpath))
 	{
 		fprintf(stderr, "pagestore_control_restore: data directory path too long\n");
@@ -370,20 +391,21 @@ main(int argc, char **argv)
 	 * file or the new one, never a torn mix.
 	 */
 	/*
-	 * pid-unique name + O_EXCL: two concurrent restores (an orchestrator
-	 * retry racing the first attempt) must not write into each other's
-	 * temp.  A leftover from a CRASHED earlier run can carry the same pid
-	 * (container restarts reuse pids), so remove any stale same-name file
-	 * first -- no live process can own it, pids are unique among the
-	 * living -- and keep O_EXCL to catch true races.
+	 * mkstemp: two restores racing on the same datadir can share a pid
+	 * across pid namespaces (both pid 1 in containers), so a pid-based name
+	 * lets one process unlink or rename the other's still-open temp.  A
+	 * kernel-unique random name closes that entirely; leftovers from
+	 * crashed runs are bounded noise under global/.
 	 */
-	unlink(tmppath);
-	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, 0600);
+	fd = mkstemp(tmppath);
 	if (fd < 0)
 	{
-		fprintf(stderr, "pagestore_control_restore: could not create \"%s\": %m\n", tmppath);
+		fprintf(stderr, "pagestore_control_restore: could not create temp file \"%s\": %m\n", tmppath);
 		return 1;
 	}
+#ifdef WIN32
+	_setmode(fd, _O_BINARY);
+#endif
 	if (write(fd, image, PG_CONTROL_FILE_SIZE) != PG_CONTROL_FILE_SIZE ||
 		fsync(fd) != 0 || close(fd) != 0)
 	{
