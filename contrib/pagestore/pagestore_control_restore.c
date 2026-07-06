@@ -159,6 +159,14 @@ client_attach(const char *shm_name)
 		signal(SIGQUIT, restore_signal_exit);
 
 		/*
+		 * A broken stdout pipe must not kill the tool: after the install is
+		 * durable the final status printf would otherwise raise the default
+		 * SIGPIPE and report failure for a restore that completed.  Writes
+		 * fail with EPIPE instead, which the status output ignores.
+		 */
+		signal(SIGPIPE, SIG_IGN);
+
+		/*
 		 * And block those signals across the claim itself: a handler firing
 		 * between a successful CAS and the 'chan' assignment would still
 		 * see chan == -1 and exit without releasing the channel it just
@@ -361,6 +369,45 @@ main(int argc, char **argv)
 	{
 		fprintf(stderr, "pagestore_control_restore: data directory path too long\n");
 		return 2;
+	}
+
+#ifndef WIN32
+	/*
+	 * Refuse the wrong uid, like the other control-file utilities
+	 * (pg_resetwal): a root-owned replacement written by a privileged
+	 * wrapper would leave global/pg_control unreadable and unwritable for
+	 * the postgres user after the rename.
+	 */
+	if (geteuid() == 0)
+	{
+		fprintf(stderr, "pagestore_control_restore: cannot be executed by \"root\"; run as the user that will own the server process\n");
+		return 2;
+	}
+	{
+		struct stat st;
+
+		if (stat(datadir, &st) == 0 && st.st_uid != geteuid())
+		{
+			fprintf(stderr, "pagestore_control_restore: data directory \"%s\" is owned by another user\n", datadir);
+			return 2;
+		}
+	}
+#endif
+
+	/*
+	 * Bootstrap-only guard: restoring pg_control underneath a running
+	 * postmaster would race its own control-file writes.  The same lock
+	 * file check the server and pg_resetwal use.
+	 */
+	{
+		char		pidpath[MAXPGPATH];
+
+		if (snprintf(pidpath, sizeof(pidpath), "%s/postmaster.pid", datadir) < (int) sizeof(pidpath) &&
+			access(pidpath, F_OK) == 0)
+		{
+			fprintf(stderr, "pagestore_control_restore: lock file \"%s\" exists; is a server running in this data directory?\n", pidpath);
+			return 2;
+		}
 	}
 
 	/*
