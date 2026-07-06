@@ -726,6 +726,7 @@ static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
 static void UpdateControlFile(XLogRecPtr update_lsn);
+static inline void CallControlFileFlushHook(void);
 static char *str_time(pg_time_t tnow, char *buf, size_t bufsize);
 
 static int	get_sync_bit(int method);
@@ -2789,6 +2790,10 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		}
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held (no-op in a
+	 * critical section; a later ship point picks it up then) */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4640,8 +4645,8 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 static inline void
 CallControlFileFlushHook(void)
 {
-	Assert(CritSectionCount == 0);
-	if (control_file_flush_hook)
+	/* a ship point is only a ship point outside critical sections */
+	if (CritSectionCount == 0 && control_file_flush_hook)
 		(*control_file_flush_hook) ();
 }
 
@@ -4808,10 +4813,15 @@ SetDataChecksumsOnInProgress(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
-	/* ship the control image queued under the critical section */
-	CallControlFileFlushHook();
-
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4884,11 +4894,16 @@ SetDataChecksumsOn(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
-	/* ship the control image queued under the critical section */
-	CallControlFileFlushHook();
-
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4950,9 +4965,6 @@ SetDataChecksumsOff(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
-		/* ship the control image queued under the critical section */
-		CallControlFileFlushHook();
-
 		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 		WaitForProcSignalBarrier(barrier);
 
@@ -4991,11 +5003,16 @@ SetDataChecksumsOff(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
-	/* ship the control image queued under the critical section */
-	CallControlFileFlushHook();
-
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -5901,6 +5918,7 @@ StartupXLOG(void)
 	bool		haveTblspcMap;
 	bool		haveBackupLabel;
 	XLogRecPtr	EndOfLog;
+	XLogRecPtr	promotion_lsn;
 	TimeLineID	EndOfLogTLI;
 	TimeLineID	newTLI;
 	bool		performedWalRecovery;
@@ -6185,10 +6203,24 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
-		 * The control image is versioned by the checkpoint we start from:
-		 * that location is exactly what this update publishes.
+		 *
+		 * Version the mirrored image by a non-retroactive position: the
+		 * replay start (the end of the checkpoint record we start from, per
+		 * InitWalRecovery), never the checkpoint record's START -- a branch
+		 * cut inside the record must not see an image referencing a record
+		 * its WAL does not fully contain.  Take the max with the checkpoint
+		 * location and minRecoveryPoint for the backup-label case, where the
+		 * replay start (RedoStartLSN) precedes the checkpoint record; a
+		 * too-high version is safe (a branch merely restores an older
+		 * image), a too-low one is not.
 		 */
-		UpdateControlFile(ControlFile->checkPoint);
+		{
+			XLogRecPtr	update_lsn = GetCurrentReplayRecPtr(NULL);
+
+			update_lsn = Max(update_lsn, ControlFile->checkPoint);
+			update_lsn = Max(update_lsn, ControlFile->minRecoveryPoint);
+			UpdateControlFile(update_lsn);
+		}
 
 		/*
 		 * If there was a backup label file, it's done its job and the info
@@ -6701,6 +6733,16 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+	/*
+	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
+	 * so version its control write by the end-of-log insert position --
+	 * captured BEFORE publishing RECOVERY_STATE_DONE: once that state is
+	 * visible, XLogInsertAllowed() lets other backends reserve WAL, and a
+	 * later capture would version the image after post-promotion user WAL
+	 * (a branch cut in between would then miss the promotion image).
+	 */
+	promotion_lsn = GetXLogInsertRecPtr();
+
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -6709,13 +6751,11 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	/*
-	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
-	 * so version this control write by the current insert position, which is
-	 * >= all WAL this startup replayed or wrote.
-	 */
-	UpdateControlFile(GetXLogInsertRecPtr());
+	UpdateControlFile(promotion_lsn);
 	LWLockRelease(ControlFileLock);
+
+	/* ship the promotion image now that ControlFileLock is released */
+	CallControlFileFlushHook();
 
 	/*
 	 * Wake up the checkpointer process as there might be a request to disable
@@ -6795,6 +6835,9 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	SpinLockRelease(&XLogCtl->info_lck);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -6826,6 +6869,9 @@ ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli)
 	UpdateControlFile(EndRecPtr);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -7722,6 +7768,14 @@ CreateCheckPoint(int flags)
 	END_CRIT_SECTION();
 
 	/*
+	 * First safe point after the critical section: ship any control image
+	 * queued inside it (a shutdown checkpoint's DB_SHUTDOWNING write) before
+	 * the long buffer-flush phase, so a crash during that phase does not
+	 * leave the local pg_control ahead of the mirror for its whole duration.
+	 */
+	CallControlFileFlushHook();
+
+	/*
 	 * In some cases there are groups of actions that must all occur on one
 	 * side or the other of a checkpoint record. Before flushing the
 	 * checkpoint record we must explicitly wait for any backend currently
@@ -8359,8 +8413,15 @@ CreateRestartPoint(int flags)
 		/* we shall start with the latest checksum version */
 		ControlFile->data_checksum_version = lastCheckPoint.dataChecksumState;
 
-		/* versioned by the replayed checkpoint record's end LSN */
-		UpdateControlFile(lastCheckPointEndPtr);
+		/*
+		 * Version by the replayed checkpoint record's end, but never below
+		 * minRecoveryPoint: buffer flushes for records replayed after the
+		 * checkpoint may already have advanced it, and this image requires
+		 * WAL up to that point -- a branch cut between the two must not
+		 * restore it.
+		 */
+		UpdateControlFile(Max(lastCheckPointEndPtr,
+							  ControlFile->minRecoveryPoint));
 	}
 	LWLockRelease(ControlFileLock);
 
