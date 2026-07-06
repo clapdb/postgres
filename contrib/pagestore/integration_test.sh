@@ -843,6 +843,27 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "t" \
 	"watermark advances across a traffic + checkpoint cycle"
 
+# --- 29. SLRU truncation tombstones: durable before local deletion ---
+# slru_truncate_hook publishes a durable cutoff tombstone BEFORE any local
+# segment is deleted; a live-mirror reader must treat pages below the newest
+# tombstone at/below its LSN as dead, whatever images exist.
+$P -c "CREATE FUNCTION pagestore_slru_tombstone_asof(text, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_slru_tombstone_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_slru_mirror_truncate(text, bigint) RETURNS void
+        AS 'pagestore','pagestore_slru_mirror_truncate' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn()) IS NULL;")" "t" \
+	"no tombstone before any truncation"
+TOMB_BEFORE=$($P -c "SELECT pg_current_wal_lsn();")
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null	# advance WAL past TOMB_BEFORE
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 1);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "1" \
+	"tombstone publishes the truncation cutoff page"
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', '$TOMB_BEFORE'::pg_lsn) IS NULL;")" "t" \
+	"tombstone is invisible below its truncation LSN (as-of read is capped)"
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 3);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "3" \
+	"a later truncation supersedes the tombstone cutoff"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

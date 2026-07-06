@@ -256,6 +256,16 @@ typedef enum SlruReadHookResult
 typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
 										   const char *page,
 										   XLogRecPtr fence_lsn);
+
+/*
+ * Truncation barrier for store-backed SLRUs, called BEFORE any local
+ * segment is deleted (SimpleLruTruncate and SlruDeleteSegment): pages below
+ * 'cutoffPage' are about to disappear locally, so a mirror serving them to
+ * other computes must durably stop first.  Never called inside a critical
+ * section; the hook may raise an error, which abandons the truncation
+ * before anything was removed.
+ */
+typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
 														int64 pageno,
 														char *page);
@@ -275,6 +285,7 @@ typedef SlruReadHookResult (*slru_page_exists_hook_type) (SlruDesc *ctl,
 extern PGDLLIMPORT slru_page_write_hook_type slru_page_write_hook;
 extern PGDLLIMPORT slru_page_read_hook_type slru_page_read_hook;
 extern PGDLLIMPORT slru_page_exists_hook_type slru_page_exists_hook;
+extern PGDLLIMPORT slru_truncate_hook_type slru_truncate_hook;
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);

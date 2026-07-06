@@ -214,9 +214,18 @@ When it is built, the three review rounds established the requirements it must m
   revalidated against both the status watermark **and** truncation tombstones
   (tombstones are a separate versioned negative result with their own
   epoch/invalidation).
-- **Tombstones with a defined version + synchronous truncate barrier.** A store
-  tombstone must be durable before local segment deletion, versioned by the
-  truncation LSN -- which only the WAL-logged SLRUs have.
+- **Tombstones with a defined version + synchronous truncate barrier.**
+  DONE: `slru_truncate_hook` fires before any local segment deletion
+  (`SimpleLruTruncate` and `SlruDeleteSegment`, so multixact members'
+  direct segment deletes are covered too), never in a critical section;
+  the consumer ships a `PS_KLASS_SLRU_TOMB` cutoff tombstone and syncs it
+  durably before returning, versioned by the current WAL position
+  (at/after the truncation record).  A store failure raises and abandons
+  the truncation before anything was removed -- except during recovery,
+  where wedging replay on a mirror outage is worse: there it degrades to
+  a counted coverage loss, which freezes the visibility watermark.
+  Read-side enforcement (dead below the newest tombstone at/below the
+  read LSN, whatever images exist) is the read-consumer increment's job.
 - **Fail-closed, interrupt-safe hooks.** DONE: `slru_page_read_hook` returns
   `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
   `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing

@@ -193,6 +193,7 @@ static int	slru_errno;
  *   SlruReportIOError machinery.
  */
 slru_page_write_hook_type slru_page_write_hook = NULL;
+slru_truncate_hook_type slru_truncate_hook = NULL;
 slru_page_read_hook_type slru_page_read_hook = NULL;
 slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
@@ -1573,6 +1574,18 @@ SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 	pgstat_count_slru_truncate(shared->slru_stats_idx);
 
 	/*
+	 * Let an external page-store mirror publish a truncation tombstone
+	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
+	 * pages to other computes must be able to stop serving the truncated
+	 * range no later than the local files disappear.  The hook may raise an
+	 * error (we are never in a critical section here), in which case the
+	 * truncation is abandoned before anything was removed -- retried by the
+	 * next vacuum/checkpoint cycle, exactly like any other truncate failure.
+	 */
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (ctl, cutoffPage);
+
+	/*
 	 * Scan shared memory and remove any pages preceding the cutoff page, to
 	 * ensure we won't rewrite them later.  (Since this is normally called in
 	 * or just after a checkpoint, any dirty pages should have been flushed
@@ -1687,6 +1700,14 @@ SlruDeleteSegment(SlruDesc *ctl, int64 segno)
 	SlruShared	shared = ctl->shared;
 	int			prevbank = SlotGetBankNumber(0);
 	bool		did_write;
+
+	/*
+	 * Same pre-deletion tombstone barrier as SimpleLruTruncate(): direct
+	 * segment deletion (multixact members truncation) removes pages up to
+	 * the end of this segment.
+	 */
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (ctl, (segno + 1) * SLRU_PAGES_PER_SEGMENT);
 
 	/* Clean out any possibly existing references to the segment. */
 	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);

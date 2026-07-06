@@ -137,6 +137,7 @@ static bool ps_slru_exit_registered = false;
 
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
+static XLogRecPtr ps_slru_now_lsn(void);
 
 /*
  * The visibility watermark (mirrored_status_lsn): an LSN W such that every
@@ -405,6 +406,71 @@ pagestore_slru_note_checkpoint_redo(XLogRecPtr redo)
 			break;
 	}
 	pg_atomic_write_u64(&ps_slru_wm->candidate_loss, loss);
+}
+
+/*
+ * Ship a truncation tombstone for 'obj' at 'cutoff_page' and make it
+ * durable, versioned by the current WAL position (at/after the truncation
+ * record that caused this).  ERRORs on store failure -- the caller decides
+ * whether that aborts the truncation (the barrier) or degrades.
+ */
+static void
+ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
+{
+	PageStoreRelKey key = {0};
+	char		page[BLCKSZ];
+
+	memset(page, 0, sizeof(page));
+	memcpy(page, &cutoff_page, sizeof(int64));
+
+	ps_slru_obj_key(&key, obj);
+	pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_TOMB, &key, 0, page,
+										 (uint64) version,
+										 PS_SLRU_SHIP_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(PS_SLRU_SHIP_TIMEOUT_MS);
+}
+
+/*
+ * slru_truncate_hook consumer: the synchronous truncate barrier.  Called
+ * before any local segment deletion, never in a critical section.
+ *
+ * Normal running: the tombstone must be durable BEFORE the local files go
+ * away, or the mirror would keep serving pages the SLRU no longer has --
+ * so a store failure raises and abandons the truncation (retried by the
+ * next vacuum/checkpoint cycle, like any other truncate failure).
+ *
+ * Recovery: failing the barrier would wedge replay on a mirror outage, and
+ * replay may not skip the truncation either.  Degrade instead: count the
+ * miss as a coverage loss so the visibility watermark freezes -- readers
+ * then cannot advance into a range whose tombstone may be missing.
+ */
+static void
+ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage)
+{
+	uint32		obj;
+
+	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+		return;					/* out-of-scope SLRU: not mirrored */
+
+	if (!RecoveryInProgress())
+	{
+		ps_slru_ship_tombstone(obj, cutoffPage, ps_slru_now_lsn());
+		return;
+	}
+
+	PG_TRY();
+	{
+		ps_slru_ship_tombstone(obj, cutoffPage, ps_slru_now_lsn());
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		ps_slru_lost++;
+		ps_slru_wm_note_lost();
+		ereport(WARNING,
+				(errmsg("pagestore: could not ship SLRU truncation tombstone during recovery; the live mirror watermark is frozen")));
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -829,6 +895,69 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pagestore_slru_tombstone_asof(slru text, lsn pg_lsn) returns bigint
+ *
+ * The newest truncation cutoff page published at/below 'lsn' for an SLRU,
+ * or NULL if none: pages below the cutoff are dead as of that LSN and a
+ * live-mirror reader must not serve them, whatever images exist.
+ */
+PG_FUNCTION_INFO_V1(pagestore_slru_tombstone_asof);
+Datum
+pagestore_slru_tombstone_asof(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	lsn = PG_GETARG_LSN(1);
+	PageStoreRelKey key;
+	uint32		obj;
+	char		page[BLCKSZ];
+	int64		cutoff;
+
+	if (!ps_slru_dir_obj(slru, &obj))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+
+	ps_slru_obj_key(&key, obj);
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
+										(uint64) lsn, page, NULL))
+		PG_RETURN_NULL();
+	memcpy(&cutoff, page, sizeof(int64));
+	PG_RETURN_INT64(cutoff);
+}
+
+/*
+ * pagestore_slru_mirror_truncate(slru text, cutoff bigint) returns void
+ *
+ * Operations/test entry point: publish a durable truncation tombstone
+ * through the same path the slru_truncate_hook consumer uses.  Superuser
+ * only -- a bogus cutoff makes readers treat live pages as dead.
+ */
+PG_FUNCTION_INFO_V1(pagestore_slru_mirror_truncate);
+Datum
+pagestore_slru_mirror_truncate(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int64		cutoff = PG_GETARG_INT64(1);
+	uint32		obj;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to publish an SLRU tombstone")));
+	if (!ps_slru_dir_obj(slru, &obj))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+	if (cutoff < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cutoff page must be non-negative")));
+
+	ps_slru_ship_tombstone(obj, cutoff, ps_slru_now_lsn());
+	PG_RETURN_VOID();
+}
+
+/*
  * pagestore_slru_mirror_watermark() returns pg_lsn
  *
  * The mirrored_status_lsn: every in-scope SLRU status change at/below it is
@@ -917,6 +1046,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 
 	ps_slru_mirror_enabled = true;
 	slru_page_write_hook = ps_slru_write_hook;
+	slru_truncate_hook = ps_slru_truncate_hook;
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
 	/* the visibility watermark lives in shared memory */
