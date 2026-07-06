@@ -44,14 +44,23 @@
 
 static void *shm = NULL;
 static int	chan = -1;
+static bool request_in_flight = false;
 
-/* release the claimed channel on every exit path (registered with atexit) */
+/*
+ * Release the claimed channel on every exit path (registered with atexit).
+ * If a request may still be executing in the daemon (a timed-out wait),
+ * mark the channel ABANDONED (2) instead of FREE: handing it to another
+ * client while the daemon can still write into the mailbox would corrupt
+ * that client's request.  The daemon-side reclaim recovers abandoned
+ * channels once their late completion lands.
+ */
 static void
 release_channel(void)
 {
 	if (shm != NULL && chan >= 0)
 	{
-		ps_store_release(&ps_channel(shm, chan)->claimed, 0);
+		ps_store_release(&ps_channel(shm, chan)->claimed,
+						 request_in_flight ? 2 : 0);
 		chan = -1;
 	}
 }
@@ -131,12 +140,15 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	ch->blocknum = 0;
 	ch->req_lsn = read_lsn;
 	ch->opcode = PS_OP_READ_AT;
+	request_in_flight = true;
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
 	/*
 	 * Bound the wait: a stale shm object whose daemon is gone would spin
 	 * forever, hanging branch bootstrap instead of failing closed.  10s is
-	 * orders of magnitude above a healthy daemon's single-page latency.
+	 * orders of magnitude above a healthy daemon's single-page latency.  On
+	 * timeout the atexit handler marks the channel ABANDONED, never FREE: a
+	 * slow-but-live daemon may still write into this mailbox.
 	 */
 	for (int spins = 0; ps_load_acquire(&ch->state) != PS_STATE_DONE; spins++)
 	{
@@ -147,6 +159,7 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 		}
 		usleep(1000);
 	}
+	request_in_flight = false;
 	if (ch->result != 1)
 		return false;
 	memcpy(out, (const void *) ch->data, PG_CONTROL_FILE_SIZE);
@@ -239,7 +252,8 @@ main(int argc, char **argv)
 	}
 
 	if (snprintf(path, sizeof(path), "%s/global/pg_control", datadir) >= (int) sizeof(path) ||
-		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp", datadir) >= (int) sizeof(tmppath) ||
+		snprintf(tmppath, sizeof(tmppath), "%s/global/pg_control.tmp.%d", datadir,
+				 (int) getpid()) >= (int) sizeof(tmppath) ||
 		snprintf(dirpath, sizeof(dirpath), "%s/global", datadir) >= (int) sizeof(dirpath))
 	{
 		fprintf(stderr, "pagestore_control_restore: data directory path too long\n");
@@ -293,10 +307,13 @@ main(int argc, char **argv)
 	if (control.blcksz != BLCKSZ ||
 		control.relseg_size != RELSEG_SIZE ||
 		control.xlog_blcksz != XLOG_BLCKSZ ||
+		control.slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT ||
 		control.nameDataLen != NAMEDATALEN ||
 		control.indexMaxKeys != INDEX_MAX_KEYS ||
 		control.loblksize != (BLCKSZ / 4) ||	/* LOBLKSIZE (backend-only header) */
-		control.maxAlign != MAXIMUM_ALIGNOF)
+		control.maxAlign != MAXIMUM_ALIGNOF ||
+		control.floatFormat != FLOATFORMAT_VALUE ||
+		control.float8ByVal != FLOAT8PASSBYVAL)
 	{
 		fprintf(stderr, "pagestore_control_restore: control image layout parameters do not match this build\n");
 		return 1;
@@ -308,7 +325,9 @@ main(int argc, char **argv)
 	 * the directory.  A crash anywhere in this sequence leaves either the old
 	 * file or the new one, never a torn mix.
 	 */
-	fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	/* pid-unique name + O_EXCL: two concurrent restores (an orchestrator
+	 * retry racing the first attempt) must not write into each other's temp */
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 	{
 		fprintf(stderr, "pagestore_control_restore: could not create \"%s\": %m\n", tmppath);
@@ -331,17 +350,19 @@ main(int argc, char **argv)
 	fd = open(dirpath, O_RDONLY);
 	if (fd < 0 || fsync(fd) != 0)
 	{
+		/*
+		 * The rename already succeeded, so global/pg_control now IS the
+		 * (CRC-valid) restored image -- possibly the only control file this
+		 * cluster has if it replaced an existing one.  Removing it here
+		 * would trade "maybe not yet durable" for "certainly gone", so
+		 * leave it in place, report exactly what is and is not guaranteed,
+		 * and exit nonzero so the caller retries the restore (which
+		 * re-runs the rename + fsync).
+		 */
 		fprintf(stderr, "pagestore_control_restore: could not fsync \"%s\": %m\n", dirpath);
+		fprintf(stderr, "pagestore_control_restore: the restored pg_control is installed but its directory entry may not survive a crash; rerun to retry\n");
 		if (fd >= 0)
 			close(fd);
-
-		/*
-		 * The rename already happened; a nonzero exit that leaves the new
-		 * file installed would break the fail-closed contract (callers
-		 * treat failure as "no restored control file").  Best-effort remove
-		 * it so no half-durable image is trusted.
-		 */
-		unlink(path);
 		return 1;
 	}
 	close(fd);
