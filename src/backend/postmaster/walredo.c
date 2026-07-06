@@ -284,11 +284,22 @@ WalRedoBufferIsScratch(Buffer buf)
 Buffer
 WalRedoVMBufferForHeapBlock(BlockNumber heapBlk, BlockNumber mapBlk)
 {
+	Buffer		buf;
+
 	wr_ensure_buffers();
 	if (wr_have_target && wr_target_fork == VISIBILITYMAP_FORKNUM &&
 		wr_target_blk == mapBlk)
-		return wr_target_buf;
-	return wr_scratch_buf;
+		buf = wr_target_buf;
+	else
+		buf = wr_scratch_buf;
+
+	/*
+	 * Redo callers ReleaseBuffer() the vm pin they acquired; hand out an
+	 * extra reference so that release does not consume the helper's
+	 * long-lived pin (wr_release_buffers drops it at exit).
+	 */
+	IncrBufferRefCount(buf);
+	return buf;
 }
 
 Buffer
