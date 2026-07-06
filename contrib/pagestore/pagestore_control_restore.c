@@ -138,13 +138,12 @@ client_attach(const char *shm_name)
 		PsKey		key;
 		uint32_t	nshards = hdr->nshards ? hdr->nshards : 1;
 		uint32_t	target;
+		sigset_t	claimset,
+					oldset;
 
 		memset(&key, 0, sizeof(key));
 		key.klass = PS_KLASS_CONTROL;
 		target = ps_key_shard(&key, nshards);
-
-		sigset_t	claimset,
-					oldset;
 
 		/*
 		 * Arm the release paths BEFORE owning anything: a cancellation
