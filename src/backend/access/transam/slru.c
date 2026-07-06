@@ -194,6 +194,7 @@ static int	slru_errno;
  */
 slru_page_write_hook_type slru_page_write_hook = NULL;
 slru_page_read_hook_type slru_page_read_hook = NULL;
+slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
 
 static void SimpleLruZeroLSNs(SlruDesc *ctl, int slotno);
@@ -758,9 +759,33 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 	 * change the bytes, so a snapshot taken later would not be the state the
 	 * dirty-clear above published.  The hook must be infallible here (see
 	 * slru.h); actual store I/O happens at its own drain points.
+	 *
+	 * The staged image also carries the same WAL fence the local write will
+	 * honor (the page's largest group commit LSN): the local
+	 * SlruPhysicalWritePage() calls XLogFlush(max_lsn) before writing, but a
+	 * mirror drain could otherwise ship first and let another compute
+	 * observe commit bits whose WAL is not yet durable.  The consumer must
+	 * not make the image visible before WAL is flushed past fence_lsn.
 	 */
 	if (slru_page_write_hook)
-		(*slru_page_write_hook) (ctl, pageno, shared->page_buffer[slotno]);
+	{
+		XLogRecPtr	fence_lsn = InvalidXLogRecPtr;
+
+		if (shared->group_lsn != NULL)
+		{
+			int			lsnindex = slotno * shared->lsn_groups_per_page;
+
+			for (int lsnoff = 0; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+			{
+				XLogRecPtr	this_lsn = shared->group_lsn[lsnindex + lsnoff];
+
+				if (fence_lsn < this_lsn)
+					fence_lsn = this_lsn;
+			}
+		}
+		(*slru_page_write_hook) (ctl, pageno, shared->page_buffer[slotno],
+								 fence_lsn);
+	}
 
 	/* Release bank lock while doing I/O */
 	LWLockRelease(&shared->bank_locks[bankno].lock);
@@ -832,6 +857,31 @@ SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
 
 	/* update the stats counter of checked pages */
 	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
+
+	/*
+	 * Store-backed SLRUs must answer existence from the store too: several
+	 * callers probe with this function before ever reading the page
+	 * (ActivateCommitTs's zero-create, find_multixact_start), so a page that
+	 * exists only in the store would otherwise be re-zeroed or reported
+	 * missing.  SLRU_READ_HOOK_FAILED fails closed like a failed read.
+	 */
+	if (slru_page_exists_hook)
+	{
+		bool		exists = false;
+
+		switch ((*slru_page_exists_hook) (ctl, pageno, &exists))
+		{
+			case SLRU_READ_HOOK_SERVED:
+				return exists;
+			case SLRU_READ_HOOK_FAILED:
+				slru_errcause = SLRU_STORE_READ_FAILED;
+				slru_errno = 0;
+				SlruReportIOError(ctl, pageno, NULL);
+				break;			/* not reached */
+			case SLRU_READ_HOOK_FALLBACK:
+				break;
+		}
+	}
 
 	SlruFileName(ctl, path, segno);
 
