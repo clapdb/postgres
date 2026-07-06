@@ -50,15 +50,18 @@
 #include "varatt.h"
 
 /*
- * Queue capacity: control writes between two ship points are a small bounded
- * set (a checkpoint's state flip + completion write, or an end-of-recovery
- * update followed by a promotion update).  Every hook call outside a critical
- * section drains first, so more than a handful can only accumulate inside a
- * single critical section, which performs at most two control writes today.
- * Eight slots leave generous slack; overflow drops the OLDEST image and is
- * counted + reported at the next drain, so it cannot pass silently.
+ * Queue capacity.  In healthy operation, control writes between two ship
+ * points are a small bounded set (a checkpoint's state flip + completion
+ * write, or an end-of-recovery update followed by a promotion update), and
+ * every hook call outside a critical section drains first.  The capacity is
+ * sized far beyond that -- 64 -- for the MIRROR-OUTAGE case: while the
+ * daemon is unavailable every drain fails and images accumulate, and each
+ * dropped image is the only version for branch cuts in its LSN interval.
+ * Sixty-four slots ride out an outage spanning dozens of checkpoints; past
+ * that, overflow drops the OLDEST image (the newest state must survive) and
+ * is counted + reported at the next drain, so it cannot pass silently.
  */
-#define PS_CONTROL_QUEUE_CAPACITY	8
+#define PS_CONTROL_QUEUE_CAPACITY	64
 
 /* bounded wait per mailbox op while shipping; a wedged daemon must not hang
  * the checkpointer/startup at a post-critical ship point */
