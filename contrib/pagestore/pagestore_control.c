@@ -73,6 +73,7 @@ typedef struct PsControlPending
 {
 	ControlFileData image;
 	XLogRecPtr	update_lsn;
+	bool		posted;			/* a drain has posted this image at least once */
 } PsControlPending;
 
 static PsControlPending ps_control_queue[PS_CONTROL_QUEUE_CAPACITY];
@@ -87,6 +88,17 @@ static control_file_flush_hook_type prev_control_file_flush_hook = NULL;
 static bool ps_control_mirror_enabled = false;
 
 /*
+ * Exit-drain registration is PER PROCESS: pagestore loads via
+ * shared_preload_libraries, so anything registered in the postmaster is
+ * wiped in forked children by InitPostmasterChild()'s on_exit_reset().
+ * Register lazily from the first drain (always outside critical sections,
+ * where before_shmem_exit may ereport).
+ */
+static bool ps_control_exit_registered = false;
+
+static void ps_control_exit_drain(int code, Datum arg);
+
+/*
  * Ship every queued control image to the store, in order.  Must only run
  * outside critical sections: obj_write can ERROR (daemon down, no channel),
  * which is recoverable here but would PANIC a critical section.
@@ -98,6 +110,12 @@ ps_control_drain(void)
 	MemoryContext drain_cxt = CurrentMemoryContext;
 
 	Assert(CritSectionCount == 0);
+
+	if (!ps_control_exit_registered)
+	{
+		before_shmem_exit(ps_control_exit_drain, (Datum) 0);
+		ps_control_exit_registered = true;
+	}
 
 	if (ps_control_dropped > 0)
 	{
@@ -158,6 +176,14 @@ ps_control_drain(void)
 
 			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
 				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
+
+			/*
+			 * Mark BEFORE posting: once a write for this LSN may be in
+			 * flight (even a timed-out one the daemon can complete late),
+			 * the slot's bytes must never change again -- see the dedup
+			 * path.
+			 */
+			p->posted = true;
 			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key, 0, page,
 												 (uint64) p->update_lsn,
 												 PS_CONTROL_SHIP_TIMEOUT_MS);
@@ -246,20 +272,41 @@ ps_control_write_hook(const struct ControlFileData *control,
 
 		if (q->update_lsn == update_lsn)
 		{
-			memcpy(&q->image, control, sizeof(ControlFileData));
+			/*
+			 * Replace only while no write for this LSN can be in flight: a
+			 * drain may have posted the older bytes and timed out, and the
+			 * abandoned request can still append LATE -- if a retry had
+			 * shipped different (newer) bytes first, that late older append
+			 * would win latest-append-wins and restore pre-transition
+			 * state.  Keeping the first-posted bytes for an LSN forever
+			 * makes every append for it byte-identical; the dropped newer
+			 * same-LSN image is a valid state at that LSN (the compute
+			 * re-derives the transition on boot).
+			 */
+			if (!q->posted)
+				memcpy(&q->image, control, sizeof(ControlFileData));
 			if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
 				ps_control_drain();
 			return;
 		}
 	}
 
+	if (ps_control_queue_count == PS_CONTROL_QUEUE_CAPACITY &&
+		CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
+	{
+		/*
+		 * Full after a daemon outage, but it is safe to ship right now:
+		 * try that before sacrificing an image -- the daemon may be back.
+		 */
+		ps_control_drain();
+	}
 	if (ps_control_queue_count == PS_CONTROL_QUEUE_CAPACITY)
 	{
 		/*
-		 * Queue full inside a critical section (outside one we would have
-		 * drained below on the previous call).  Drop the oldest image so the
-		 * newest -- the one local pg_control now holds -- survives; the loss
-		 * is counted and reported at the next drain.
+		 * Still full (inside a critical section, or the daemon is still
+		 * down).  Drop the oldest image so the newest -- the one local
+		 * pg_control now holds -- survives; the loss is counted and
+		 * reported at the next drain.
 		 */
 		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
 		ps_control_queue_count--;
@@ -272,6 +319,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 
 		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
 		ps_control_queue[slot].update_lsn = update_lsn;
+		ps_control_queue[slot].posted = false;
 		ps_control_queue_count++;
 	}
 
@@ -346,8 +394,6 @@ pagestore_control_mirror_init(bool localsvc_active)
 	prev_control_file_flush_hook = control_file_flush_hook;
 	control_file_flush_hook = ps_control_flush_hook;
 
-	if (ps_control_mirror_enabled)
-		before_shmem_exit(ps_control_exit_drain, (Datum) 0);
 }
 
 /*
