@@ -4829,6 +4829,16 @@ SetDataChecksumsOnInProgress(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	WaitForProcSignalBarrier(barrier);
 
 	/*
@@ -4910,6 +4920,16 @@ SetDataChecksumsOn(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
 
@@ -4981,6 +5001,9 @@ SetDataChecksumsOff(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
+		/* ship now; see the sibling comment below (drain cannot throw) */
+		CallControlFileFlushHook();
+
 		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 		WaitForProcSignalBarrier(barrier);
 
@@ -5018,6 +5041,16 @@ SetDataChecksumsOff(void)
 
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
+
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
 
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
