@@ -82,9 +82,13 @@ read pages at an LSN.
          `postgres --wal-redo` (src/backend/postmaster/walredo.c) holds a single
          page and runs each record's resource-manager redo against it with the
          buffer manager redirected (`am_walredo`); `pagestore_redo_page_asof()`
-         drives it over the per-page index (base FPI + deltas), reading WAL from
-         the store.  The integration test proves the materialized page contains
-         a change that the base image alone lacks.  Caveats: a page with more
+         drives it over the per-page index (base FPI + deltas).  Records from
+         ancestor timelines are always fetched from the store; SAME-timeline
+         records come from local pg_wal unless `pagestore.redo_wal_from_store`
+         is enabled -- a no-local-WAL compute (a fresh branch) must set that
+         GUC or local-timeline deltas fail to replay.  The integration test
+         proves the materialized page contains a change that the base image
+         alone lacks.  Caveats: a page with more
          than PS_REDO_MAX_RECS (4096) indexed records at/below the target LSN
          fails closed (the capped index result would otherwise be treated as
          complete), and when the last write is inherited from an ancestor
