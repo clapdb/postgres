@@ -148,6 +148,33 @@ ps_pgcache_lookup(uint32_t tl, const PsKey *key, uint32_t block,
 	return 1;
 }
 
+static void bucket_remove(int s);
+
+/*
+ * Drop a cached page, if present.  A same-LSN rewrite (e.g. a hint-bit-only
+ * relation write that does not advance pd_lsn) replaces the authoritative
+ * bytes under an unchanged (tl, key, block, lsn) cache key, so the writer
+ * must invalidate the entry or later reads keep serving the stale image.
+ */
+void
+ps_pgcache_invalidate(uint32_t tl, const PsKey *key, uint32_t block,
+					  uint64_t version_lsn)
+{
+	int			s;
+
+	if (cache_max == 0)
+		return;
+	pthread_mutex_lock(&cache_lock);
+	s = find_slot(tl, key, block, version_lsn, NULL);
+	if (s >= 0)
+	{
+		bucket_remove(s);
+		slots[s].valid = 0;
+		slots[s].ref = 0;
+	}
+	pthread_mutex_unlock(&cache_lock);
+}
+
 /* unlink slot s from its hash bucket chain */
 static void
 bucket_remove(int s)
