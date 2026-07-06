@@ -29,7 +29,12 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		10	/* 10: REQUIRE_BRANCH opcode added;
+#define PS_SHM_VERSION		12	/* 12: WAL_RETAIN_FLOOR opcode added;
+								 * 11: PS_KLASS_CONTROL writes versioned by the
+								 *     caller-supplied update LSN (was a daemon
+								 *     max+1 counter); mixed binaries must fail
+								 *     the shm handshake, not store wrong versions;
+								 * 10: REQUIRE_BRANCH opcode added;
 								 * 9: CHECK_BRANCH opcode added;
 								 * 8: READ_AT reports found-ness in ch->result;
 								 * 7: walidx_get returns timeline-tagged PsWalRec */
@@ -76,6 +81,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
+	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
 } PsOpcode;
 
 /* Status codes */

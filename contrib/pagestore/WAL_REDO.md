@@ -31,7 +31,7 @@ read pages at an LSN.
 2. **WAL serving** — store hands WAL back by LSN range, so a redo worker can pull
    it. ✅ (`PS_OP_WAL_READ`; `wal_read()` assembles bytes across records.)
 3. **Redo worker** — a recovery PostgreSQL that consumes the store's WAL and
-   materializes pages into the store. 🔶 In progress:
+   materializes pages into the store. 🔶 3a-3d-1 and 3c-1..4 done; 3d-2/3 partial:
    - **3a** Reconstruct standard WAL segment files from the `wal_<tl>` log. ✅
      `pagestore_walrestore` does this and works as a `restore_command`
      (`pagestore_walrestore --shm NAME --timeline N --segsize B %f %p`); the
@@ -78,14 +78,34 @@ read pages at an LSN.
          protection), so this returns the base image, not the page exactly as-of
          lsn.
        - **3c-4** The `--wal-redo`-style helper: apply the delta records after
-         the base image with `rm_redo` to get the page exactly as-of lsn.  This
-         is the one piece that needs PostgreSQL's redo run against a single held
-         page (Neon's wal-redo process / a small core mode) -- the last hard
-         piece of the read path.
+         the base image with `rm_redo` to get the page exactly as-of lsn. ✅
+         `postgres --wal-redo` (src/backend/postmaster/walredo.c) holds a single
+         page and runs each record's resource-manager redo against it with the
+         buffer manager redirected (`am_walredo`); `pagestore_redo_page_asof()`
+         drives it over the per-page index (base FPI + deltas).  Records from
+         ancestor timelines are always fetched from the store; SAME-timeline
+         records come from local pg_wal unless `pagestore.redo_wal_from_store`
+         is enabled -- a no-local-WAL compute (a fresh branch) must set that
+         GUC or local-timeline deltas fail to replay.  The integration test
+         proves the materialized page contains a change that the base image
+         alone lacks.  Caveats: a page with
+         PS_REDO_MAX_RECS (4096) or more indexed records at/below the target
+         LSN fails closed (the capped index result would otherwise be treated as
+         complete), and when the last write is inherited from an ancestor
+         timeline the truncate-liveness check fails closed (a truncate on the
+         reading branch after the fork is not visible to the ancestor-WAL
+         scan).
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no
-     shared local state.
+     shared local state.  🔶 Partial: branch SLRU state is solved as-of the fork
+     point by the prepared branch flow (`pagestore_prepare_branch` seeds
+     clog/commit-ts/multixact from base snapshots + WAL replay, and
+     `pagestore_install_prepared_branch` installs them with a durable manifest;
+     see SLRU_ON_STORE_DESIGN.md), and the per-page WAL index serves branch
+     reads capped at the fork LSN.  Still open: `pg_control` on the store
+     (PGCONTROL_ON_STORE_DESIGN.md), live SLRU traffic through the store, and
+     serving a branch compute's own WAL across its fork point.
 
 ## Known scope boundaries
 
