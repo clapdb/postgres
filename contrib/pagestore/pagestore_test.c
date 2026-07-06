@@ -775,19 +775,35 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	/* --- WAL retention floor from mirrored pg_control notes ------------- */
 	{
 		unsigned char *note = calloc(1, page_size);
+		unsigned char *image = calloc(1, page_size);
 		uint64_t	redo1 = 5000,
 					redo2 = 9000;
 
+		memset(image, 0x5c, 64);	/* stand-in pg_control bytes */
+
 		check(op_wal_retain_floor(0) == 0,
 			  "wal retention floor starts unconstrained (no control image)");
-		/* two control images: an older checkpoint (redo 5000) and a newer one
-		 * (redo 9000); the floor must be the MIN over restorable images */
+		/* two mirrored control writes, note first then image at the same
+		 * version -- exactly the shipper's order; the floor must be the MIN
+		 * redo over the restorable images */
 		memcpy(note, &redo1, sizeof(redo1));
-		op_write_control(1, note, 6000);	/* note first, then image */
+		op_write_control(1, note, 6000);
+		op_write_control(0, image, 6000);
 		memcpy(note, &redo2, sizeof(redo2));
 		op_write_control(1, note, 9500);
+		op_write_control(0, image, 9500);
 		check(op_wal_retain_floor(0) == 5000,
-			  "wal retention floor = min redo over all control notes");
+			  "wal retention floor = min redo over noted control images");
+		/* an image with NO covering note (pre-note-format store) collapses
+		 * the floor to retain-everything, not an error and not min(notes) */
+		op_write_control(0, image, 12000);
+		check(op_wal_retain_floor(0) == 1,
+			  "an unnoted control image collapses the floor to retain-all");
+		memcpy(note, &redo2, sizeof(redo2));
+		op_write_control(1, note, 12000);	/* backfill its note */
+		check(op_wal_retain_floor(0) == 5000,
+			  "a backfilled note restores the min-redo floor");
+		free(image);
 		free(note);
 	}
 
