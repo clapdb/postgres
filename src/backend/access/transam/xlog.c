@@ -725,7 +725,7 @@ static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
-static void UpdateControlFile(void);
+static void UpdateControlFile(XLogRecPtr update_lsn);
 static char *str_time(pg_time_t tnow, char *buf, size_t bufsize);
 
 static int	get_sync_bit(int method);
@@ -749,7 +749,7 @@ static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
 static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
 
-static void XLogChecksums(uint32 new_type);
+static XLogRecPtr XLogChecksums(uint32 new_type);
 
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
@@ -2778,7 +2778,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		{
 			ControlFile->minRecoveryPoint = newMinRecoveryPoint;
 			ControlFile->minRecoveryPointTLI = newMinRecoveryPointTLI;
-			UpdateControlFile();
+			UpdateControlFile(newMinRecoveryPoint);
 			LocalMinRecoveryPoint = newMinRecoveryPoint;
 			LocalMinRecoveryPointTLI = newMinRecoveryPointTLI;
 
@@ -4626,14 +4626,32 @@ ReadControlFile(void)
 	CalculateCheckpointSegments();
 }
 
+/* Hook for control-file writes (see UpdateControlFile) */
+control_file_write_hook_type control_file_write_hook = NULL;
+
 /*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
+ *
+ * update_lsn is the LSN of the specific update that caused this control
+ * write -- a checkpoint passes its completion record's end LSN, replay-time
+ * updates pass the replayed record's end LSN, and state transitions with no
+ * record of their own pass the position that makes them visible (see each
+ * caller).  It exists solely for the write hook: an external mirror of
+ * pg_control (contrib/pagestore) versions the mirrored image by it so a
+ * branch cut at LSN L can restore the control image "as of L".  The hook
+ * runs after update_controlfile() has durably written the local file, may be
+ * called inside a critical section, and therefore must not error, block, or
+ * allocate there -- it can only record intent and ship later (see
+ * PGCONTROL_ON_STORE_DESIGN.md).
  */
 static void
-UpdateControlFile(void)
+UpdateControlFile(XLogRecPtr update_lsn)
 {
 	update_controlfile(DataDir, ControlFile, true);
+
+	if (control_file_write_hook)
+		(*control_file_write_hook) (ControlFile, update_lsn);
 }
 
 /*
@@ -4749,6 +4767,7 @@ void
 SetDataChecksumsOnInProgress(void)
 {
 	uint64		barrier;
+	XLogRecPtr	checksum_lsn;
 
 	/*
 	 * The state transition is performed in a critical section with
@@ -4757,7 +4776,7 @@ SetDataChecksumsOnInProgress(void)
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-	XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_ON);
+	checksum_lsn = XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_ON);
 
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_ON;
@@ -4765,7 +4784,7 @@ SetDataChecksumsOnInProgress(void)
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_ON;
-	UpdateControlFile();
+	UpdateControlFile(checksum_lsn);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_ON);
@@ -4802,6 +4821,7 @@ void
 SetDataChecksumsOn(void)
 {
 	uint64		barrier;
+	XLogRecPtr	checksum_lsn;
 
 	SpinLockAcquire(&XLogCtl->info_lck);
 
@@ -4825,7 +4845,7 @@ SetDataChecksumsOn(void)
 	START_CRIT_SECTION();
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-	XLogChecksums(PG_DATA_CHECKSUM_VERSION);
+	checksum_lsn = XLogChecksums(PG_DATA_CHECKSUM_VERSION);
 
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_VERSION;
@@ -4837,7 +4857,7 @@ SetDataChecksumsOn(void)
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_VERSION;
-	UpdateControlFile();
+	UpdateControlFile(checksum_lsn);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_ON);
@@ -4866,6 +4886,7 @@ void
 SetDataChecksumsOff(void)
 {
 	uint64		barrier;
+	XLogRecPtr	checksum_lsn;
 
 	SpinLockAcquire(&XLogCtl->info_lck);
 
@@ -4891,7 +4912,7 @@ SetDataChecksumsOff(void)
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-		XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_OFF);
+		checksum_lsn = XLogChecksums(PG_DATA_CHECKSUM_INPROGRESS_OFF);
 
 		SpinLockAcquire(&XLogCtl->info_lck);
 		XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_OFF;
@@ -4899,7 +4920,7 @@ SetDataChecksumsOff(void)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_OFF;
-		UpdateControlFile();
+		UpdateControlFile(checksum_lsn);
 		LWLockRelease(ControlFileLock);
 
 		barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_OFF);
@@ -4929,7 +4950,7 @@ SetDataChecksumsOff(void)
 	/* Ensure that we don't incur a checkpoint during disabling checksums */
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-	XLogChecksums(PG_DATA_CHECKSUM_OFF);
+	checksum_lsn = XLogChecksums(PG_DATA_CHECKSUM_OFF);
 
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->data_checksum_version = PG_DATA_CHECKSUM_OFF;
@@ -4937,7 +4958,7 @@ SetDataChecksumsOff(void)
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_OFF;
-	UpdateControlFile();
+	UpdateControlFile(checksum_lsn);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_OFF);
@@ -6136,8 +6157,10 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
+		 * The control image is versioned by the checkpoint we start from:
+		 * that location is exactly what this update publishes.
 		 */
-		UpdateControlFile();
+		UpdateControlFile(ControlFile->checkPoint);
 
 		/*
 		 * If there was a backup label file, it's done its job and the info
@@ -6658,7 +6681,12 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile();
+	/*
+	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
+	 * so version this control write by the current insert position, which is
+	 * >= all WAL this startup replayed or wrote.
+	 */
+	UpdateControlFile(GetXLogInsertRecPtr());
 	LWLockRelease(ControlFileLock);
 
 	/*
@@ -6728,7 +6756,7 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	 */
 	updateMinRecoveryPoint = true;
 
-	UpdateControlFile();
+	UpdateControlFile(EndRecPtr);
 
 	/*
 	 * We update SharedRecoveryState while holding the lock on ControlFileLock
@@ -6767,7 +6795,7 @@ ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli)
 	ControlFile->backupStartPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndRequired = false;
-	UpdateControlFile();
+	UpdateControlFile(EndRecPtr);
 
 	LWLockRelease(ControlFileLock);
 }
@@ -7456,7 +7484,8 @@ CreateCheckPoint(int flags)
 	{
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->state = DB_SHUTDOWNING;
-		UpdateControlFile();
+		/* no record of its own: version by the current insert position */
+		UpdateControlFile(GetXLogInsertRecPtr());
 		LWLockRelease(ControlFileLock);
 	}
 
@@ -7802,7 +7831,13 @@ CreateCheckPoint(int flags)
 	 */
 	ControlFile->unloggedLSN = pg_atomic_read_membarrier_u64(&XLogCtl->unloggedLSN);
 
-	UpdateControlFile();
+	/*
+	 * Version this write by the checkpoint record's END LSN (recptr, the
+	 * XLogInsert return), not ProcLastRecPtr (its start): a branch cut
+	 * between the record's start and end must not restore a control image
+	 * whose checkpoint record is not fully in the branch's WAL stream.
+	 */
+	UpdateControlFile(recptr);
 	LWLockRelease(ControlFileLock);
 
 	/*
@@ -7944,7 +7979,7 @@ CreateEndOfRecoveryRecord(void)
 	ControlFile->data_checksum_version = XLogCtl->data_checksum_version;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile();
+	UpdateControlFile(recptr);
 	LWLockRelease(ControlFileLock);
 
 	END_CRIT_SECTION();
@@ -8187,7 +8222,8 @@ CreateRestartPoint(int flags)
 		{
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
-			UpdateControlFile();
+			/* no record of its own: version by the replay position */
+			UpdateControlFile(GetXLogReplayRecPtr(NULL));
 			LWLockRelease(ControlFileLock);
 		}
 		return false;
@@ -8289,7 +8325,8 @@ CreateRestartPoint(int flags)
 		/* we shall start with the latest checksum version */
 		ControlFile->data_checksum_version = lastCheckPoint.dataChecksumState;
 
-		UpdateControlFile();
+		/* versioned by the replayed checkpoint record's end LSN */
+		UpdateControlFile(lastCheckPointEndPtr);
 	}
 	LWLockRelease(ControlFileLock);
 
@@ -8690,6 +8727,8 @@ XLogReportParameters(void)
 		 * values in pg_control either if wal_level=minimal, but seems better
 		 * to keep them up-to-date to avoid confusion.
 		 */
+		XLogRecPtr	update_lsn;
+
 		if (wal_level != ControlFile->wal_level || XLogIsNeeded())
 		{
 			xl_parameter_change xlrec;
@@ -8709,6 +8748,12 @@ XLogReportParameters(void)
 
 			recptr = XLogInsert(RM_XLOG_ID, XLOG_PARAMETER_CHANGE);
 			XLogFlush(recptr);
+			update_lsn = recptr;
+		}
+		else
+		{
+			/* no record inserted: version by the current insert position */
+			update_lsn = GetXLogInsertRecPtr();
 		}
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -8721,7 +8766,7 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
-		UpdateControlFile();
+		UpdateControlFile(update_lsn);
 
 		LWLockRelease(ControlFileLock);
 	}
@@ -8730,7 +8775,7 @@ XLogReportParameters(void)
 /*
  * Log the new state of checksums
  */
-static void
+static XLogRecPtr
 XLogChecksums(uint32 new_type)
 {
 	xl_checksum_state xlrec;
@@ -8743,6 +8788,8 @@ XLogChecksums(uint32 new_type)
 
 	recptr = XLogInsert(RM_XLOG2_ID, XLOG2_CHECKSUMS);
 	XLogFlush(recptr);
+
+	return recptr;
 }
 
 /*
@@ -8932,7 +8979,7 @@ xlog_redo(XLogReaderState *record)
 		ControlFile->checkPointCopy.nextXid = checkPoint.nextXid;
 		ControlFile->data_checksum_version = checkPoint.dataChecksumState;
 
-		UpdateControlFile();
+		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
 		/*
@@ -9139,7 +9186,7 @@ xlog_redo(XLogReaderState *record)
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
 
-		UpdateControlFile();
+		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
 		/* Check to see if any parameter change gives a problem on recovery */
@@ -9252,7 +9299,7 @@ xlog2_redo(XLogReaderState *record)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->data_checksum_version = state.new_checksum_state;
-		UpdateControlFile();
+		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
 		/*
