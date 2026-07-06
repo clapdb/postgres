@@ -780,9 +780,9 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->nblocks = 1;
 	ch->skip_fsync = 0;
 	/*
-	 * For an SLRU-class object the daemon versions the write by req_lsn (the
-	 * caller's cutoff/dirtying LSN), so a snapshot reads back as-of an LSN >= that
-	 * version; ignored for other classes (relation = pd_lsn, control = counter).
+	 * For an SLRU- or control-class object the daemon versions the write by
+	 * req_lsn (the caller's cutoff/dirtying/update LSN), so it reads back
+	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
 	ch->req_lsn = version;
 	memcpy(ch->data, page, BLCKSZ);

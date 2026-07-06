@@ -4630,6 +4630,22 @@ ReadControlFile(void)
 control_file_write_hook_type control_file_write_hook = NULL;
 
 /*
+ * Ship point for control-file mirrors: called at the first point after a
+ * critical section that performed control-file writes, so a mirror that
+ * could only record intent inside the section (see control_file_write_hook)
+ * can ship the queued images without waiting for the next control update.
+ */
+control_file_flush_hook_type control_file_flush_hook = NULL;
+
+static inline void
+CallControlFileFlushHook(void)
+{
+	Assert(CritSectionCount == 0);
+	if (control_file_flush_hook)
+		(*control_file_flush_hook) ();
+}
+
+/*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
  *
@@ -4792,6 +4808,9 @@ SetDataChecksumsOnInProgress(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
+
 	WaitForProcSignalBarrier(barrier);
 }
 
@@ -4865,6 +4884,9 @@ SetDataChecksumsOn(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
+
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
 }
@@ -4928,6 +4950,9 @@ SetDataChecksumsOff(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
+		/* ship the control image queued under the critical section */
+		CallControlFileFlushHook();
+
 		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 		WaitForProcSignalBarrier(barrier);
 
@@ -4965,6 +4990,9 @@ SetDataChecksumsOff(void)
 
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
+
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
 
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
@@ -7846,6 +7874,9 @@ CreateCheckPoint(int flags)
 	 */
 	END_CRIT_SECTION();
 
+	/* ship the control image(s) queued under the critical section */
+	CallControlFileFlushHook();
+
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
 	 * XLOG_CHECKPOINT_SHUTDOWN record is reached. This is the first point
@@ -7983,6 +8014,9 @@ CreateEndOfRecoveryRecord(void)
 	LWLockRelease(ControlFileLock);
 
 	END_CRIT_SECTION();
+
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
 }
 
 /*

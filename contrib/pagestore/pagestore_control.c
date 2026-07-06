@@ -1,0 +1,251 @@
+/*-------------------------------------------------------------------------
+ *
+ * pagestore_control.c
+ *	  Mirror pg_control to the page store (PGCONTROL_ON_STORE_DESIGN.md).
+ *
+ * Consumes the core control_file_write_hook / control_file_flush_hook seams:
+ * every UpdateControlFile() hands us the just-written ControlFileData image
+ * plus the LSN of the update that caused it, and we mirror it to the store as
+ * a PS_KLASS_CONTROL object versioned by that LSN, so a branch cut at LSN L
+ * can later restore the control image "as of L".
+ *
+ * The write hook can run inside a checkpoint/shutdown critical section, where
+ * store I/O must never run: a daemon error there would PANIC the checkpoint.
+ * So the hook only records intent into a small pre-reserved in-process queue
+ * (allocation-free, never blocks, never errors), and the actual obj_write of
+ * each queued image runs at the post-critical ship points -- the flush hook
+ * that core invokes right after the critical sections that write pg_control,
+ * or the next control write that happens outside one.  The queue is ordered
+ * and keeps every image (not a single replaceable slot): two control updates
+ * can occur before a drain, and a branch point between their LSNs must
+ * restore the earlier image, not the coalesced latest.
+ *
+ * The mirror is an ordered follower of the local file: local pg_control is
+ * always written (and fsync'd) first by UpdateControlFile(); the store image
+ * follows at the next ship point.  The daemon's WAL retention horizon for the
+ * mirrored image (never GC WAL under the store control image's redo pointer)
+ * and the bootstrap restore tool are follow-up increments; see the design's
+ * sequencing.
+ *
+ * src/../contrib/pagestore/pagestore_control.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/xlog.h"
+#include "catalog/pg_control.h"
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "pagestore_backend.h"
+#include "utils/pg_lsn.h"
+#include "varatt.h"
+
+/*
+ * Queue capacity: control writes between two ship points are a small bounded
+ * set (a checkpoint's state flip + completion write, or an end-of-recovery
+ * update followed by a promotion update).  Every hook call outside a critical
+ * section drains first, so more than a handful can only accumulate inside a
+ * single critical section, which performs at most two control writes today.
+ * Eight slots leave generous slack; overflow drops the OLDEST image and is
+ * counted + reported at the next drain, so it cannot pass silently.
+ */
+#define PS_CONTROL_QUEUE_CAPACITY	8
+
+typedef struct PsControlPending
+{
+	ControlFileData image;
+	XLogRecPtr	update_lsn;
+} PsControlPending;
+
+static PsControlPending ps_control_queue[PS_CONTROL_QUEUE_CAPACITY];
+static int	ps_control_queue_head = 0;	/* oldest entry */
+static int	ps_control_queue_count = 0;
+static uint64 ps_control_dropped = 0;
+
+static control_file_write_hook_type prev_control_file_write_hook = NULL;
+static control_file_flush_hook_type prev_control_file_flush_hook = NULL;
+
+/* set once at hook install; mirroring requires the localsvc backend */
+static bool ps_control_mirror_enabled = false;
+
+/*
+ * Ship every queued control image to the store, in order.  Must only run
+ * outside critical sections: obj_write can ERROR (daemon down, no channel),
+ * which is recoverable here but would PANIC a critical section.
+ */
+static void
+ps_control_drain(void)
+{
+	Assert(CritSectionCount == 0);
+
+	if (ps_control_dropped > 0)
+	{
+		ereport(WARNING,
+				(errmsg("pagestore: dropped %llu queued pg_control mirror image(s)",
+						(unsigned long long) ps_control_dropped),
+				 errdetail("More control-file writes occurred inside one critical section than the mirror queue holds.")));
+		ps_control_dropped = 0;
+	}
+
+	while (ps_control_queue_count > 0)
+	{
+		PsControlPending *p = &ps_control_queue[ps_control_queue_head];
+		PageStoreRelKey key = {0};
+		char		page[BLCKSZ];
+
+		/*
+		 * The object image is the on-disk pg_control representation: the
+		 * ControlFileData bytes (CRC already computed by update_controlfile)
+		 * zero-padded -- to PG_CONTROL_FILE_SIZE on disk, to BLCKSZ here.
+		 * The restore tool writes back exactly the first
+		 * PG_CONTROL_FILE_SIZE bytes.
+		 */
+		/*
+		 * An image without a valid update LSN cannot be restored "as of" a
+		 * branch point and would shadow every as-of read at version 0; no
+		 * call site passes one today, so treat it as a bug, not data.
+		 */
+		if (XLogRecPtrIsInvalid(p->update_lsn))
+		{
+			ereport(WARNING,
+					(errmsg("pagestore: skipping pg_control mirror image with no update LSN")));
+			ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
+			ps_control_queue_count--;
+			continue;
+		}
+
+		memset(page, 0, sizeof(page));
+		memcpy(page, &p->image, sizeof(ControlFileData));
+
+		elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
+			 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
+		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, page,
+									 (uint64) p->update_lsn);
+
+		/*
+		 * Consume the slot only after the write succeeded: if obj_write
+		 * errors out of the drain, the image stays queued for the next ship
+		 * point instead of being lost.
+		 */
+		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
+		ps_control_queue_count--;
+	}
+}
+
+/*
+ * control_file_write_hook: record the just-written control image.  May run
+ * inside a critical section, so it only copies into a pre-reserved slot --
+ * no allocation, no store I/O, no error.  Outside a critical section it
+ * ships immediately.
+ */
+static void
+ps_control_write_hook(const struct ControlFileData *control,
+					  XLogRecPtr update_lsn)
+{
+	if (prev_control_file_write_hook)
+		(*prev_control_file_write_hook) (control, update_lsn);
+
+	if (!ps_control_mirror_enabled)
+		return;
+
+	if (ps_control_queue_count == PS_CONTROL_QUEUE_CAPACITY)
+	{
+		/*
+		 * Queue full inside a critical section (outside one we would have
+		 * drained below on the previous call).  Drop the oldest image so the
+		 * newest -- the one local pg_control now holds -- survives; the loss
+		 * is counted and reported at the next drain.
+		 */
+		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
+		ps_control_queue_count--;
+		ps_control_dropped++;
+	}
+
+	{
+		int			slot = (ps_control_queue_head + ps_control_queue_count)
+			% PS_CONTROL_QUEUE_CAPACITY;
+
+		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
+		ps_control_queue[slot].update_lsn = update_lsn;
+		ps_control_queue_count++;
+	}
+
+	if (CritSectionCount == 0)
+		ps_control_drain();
+}
+
+/* control_file_flush_hook: the post-critical ship point */
+static void
+ps_control_flush_hook(void)
+{
+	if (prev_control_file_flush_hook)
+		(*prev_control_file_flush_hook) ();
+
+	if (!ps_control_mirror_enabled)
+		return;
+
+	ps_control_drain();
+}
+
+/*
+ * Install the mirror hooks.  Called from the module's _PG_init() once the
+ * backend GUCs exist; mirroring engages only under the localsvc backend.
+ */
+void
+pagestore_control_mirror_init(bool localsvc_active)
+{
+	/*
+	 * The control object holds the full on-disk control image in one block;
+	 * see the design's block-size requirement.  Refuse (skip) rather than
+	 * silently truncate on --with-blocksize builds smaller than the control
+	 * file.
+	 */
+	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
+	{
+		if (localsvc_active)
+			ereport(WARNING,
+					(errmsg("pagestore: pg_control mirroring disabled: BLCKSZ (%d) is smaller than the control file (%d)",
+							BLCKSZ, PG_CONTROL_FILE_SIZE)));
+		ps_control_mirror_enabled = false;
+	}
+	else
+		ps_control_mirror_enabled = localsvc_active;
+
+	prev_control_file_write_hook = control_file_write_hook;
+	control_file_write_hook = ps_control_write_hook;
+	prev_control_file_flush_hook = control_file_flush_hook;
+	control_file_flush_hook = ps_control_flush_hook;
+}
+
+/*
+ * pagestore_control_image_asof(lsn pg_lsn) returns bytea
+ *
+ * Test/inspection helper: read the store's mirrored control image as of the
+ * given LSN (the newest image whose update LSN is <= lsn) on this compute's
+ * timeline.  Returns NULL if no image at/below that LSN exists.
+ */
+PG_FUNCTION_INFO_V1(pagestore_control_image_asof);
+Datum
+pagestore_control_image_asof(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	lsn = PG_GETARG_LSN(0);
+	PageStoreRelKey key = {0};
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	bytea	   *out;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to read the mirrored control image")));
+
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
+										(uint64) lsn, page, &resolved))
+		PG_RETURN_NULL();
+
+	out = (bytea *) palloc(VARHDRSZ + PG_CONTROL_FILE_SIZE);
+	SET_VARSIZE(out, VARHDRSZ + PG_CONTROL_FILE_SIZE);
+	memcpy(VARDATA(out), page, PG_CONTROL_FILE_SIZE);
+	PG_RETURN_BYTEA_P(out);
+}

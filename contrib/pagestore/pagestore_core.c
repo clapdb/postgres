@@ -1221,18 +1221,21 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.key = *key;
 	hdr.block = block;
 	/*
-	 * Version key.  A relation page carries a real monotonic pd_lsn.  An SLRU object
-	 * is versioned by the caller-supplied 'version' -- the dirtying/cutoff WAL LSN --
-	 * stored verbatim so it stays directly comparable to a branch's as-of cutoff
-	 * (the seed path keys a snapshot by its proven cutoff C and reads it as-of L>=C);
-	 * a daemon counter would not be comparable.  Other non-relation objects (the
-	 * control file) carry no LSN in their bytes, so versioning them from page_lsn()
-	 * could make an overwrite compare lower and silently lose (and poison the pgcache
-	 * for that pseudo-LSN); derive a monotonic latest-wins version from the chain.
+	 * Version key.  A relation page carries a real monotonic pd_lsn.  An SLRU or
+	 * control object is versioned by the caller-supplied 'version' -- the
+	 * dirtying/cutoff/update WAL LSN -- stored verbatim so it stays directly
+	 * comparable to a branch's as-of cutoff (the SLRU seed path keys a snapshot
+	 * by its proven cutoff C and reads it as-of L>=C; a control image is keyed
+	 * by the LSN of the update that caused the write, so a branch restores the
+	 * control state as of its fork point -- PGCONTROL_ON_STORE_DESIGN.md); a
+	 * daemon counter would not be comparable.  Any other non-relation object
+	 * carries no LSN in its bytes, so versioning it from page_lsn() could make
+	 * an overwrite compare lower and silently lose (and poison the pgcache for
+	 * that pseudo-LSN); derive a monotonic latest-wins version from the chain.
 	 */
 	if (key->klass == PS_KLASS_RELATION)
 		hdr.lsn = page_lsn(page);
-	else if (key->klass == PS_KLASS_SLRU)
+	else if (key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_CONTROL)
 		hdr.lsn = version;
 	else
 	{
