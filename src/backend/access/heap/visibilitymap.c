@@ -297,6 +297,16 @@ visibilitymap_set(BlockNumber heapBlk,
 	/* Must never set all_frozen bit without also setting all_visible bit */
 	Assert(flags != VISIBILITYMAP_ALL_FROZEN);
 
+	/*
+	 * The wal-redo helper materializes a single page and has no VM fork: a
+	 * record that also sets a VM bit (e.g. an all-frozen insert) resolves the
+	 * VM block to the helper's scratch buffer, whose tag is the temp relation
+	 * -- not mapBlock -- so the check below would reject it.  The VM side
+	 * effect is irrelevant to the held page; skip it.
+	 */
+	if (am_walredo)
+		return;
+
 	/* Check that we have the right VM page pinned */
 	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
