@@ -158,8 +158,13 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	char	   *map;
 	bool		cleared = false;
 
-	/* no VM fork in the wal-redo helper; nothing to clear */
-	if (am_walredo)
+	/*
+	 * In the wal-redo helper, skip only SCRATCH-directed clears: a heap-page
+	 * materialization's VM side effect resolves to the scratch buffer and is
+	 * irrelevant, but when the TARGET being materialized is this VM page the
+	 * clear must apply to it.
+	 */
+	if (am_walredo && WalRedoBufferIsScratch(vmbuf))
 		return false;
 
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
@@ -219,7 +224,8 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	if (am_walredo)
 	{
 		if (!BufferIsValid(*vmbuf))
-			*vmbuf = WalRedoScratchBuffer();
+			*vmbuf = WalRedoVMBufferForHeapBlock(heapBlk,
+												 HEAPBLK_TO_MAPBLOCK(heapBlk));
 		return;
 	}
 
@@ -295,9 +301,11 @@ visibilitymap_set(BlockNumber heapBlk,
 	 * -- not mapBlock -- so the checks below would reject it.  The VM side
 	 * effect is irrelevant to the held page; skip it BEFORE the recovery
 	 * assertion, which the helper (neither InRecovery nor in a critical
-	 * section) would otherwise trip on cassert builds.
+	 * section) would otherwise trip on cassert builds.  A materialization
+	 * whose TARGET is this VM page proceeds: its buffer is the retagged
+	 * target, so the block check below passes.
 	 */
-	if (am_walredo)
+	if (am_walredo && WalRedoBufferIsScratch(vmBuf))
 		return;
 
 	/* Call in same critical section where WAL is emitted. */
