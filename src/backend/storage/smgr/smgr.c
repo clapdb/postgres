@@ -85,47 +85,23 @@
  * would normally be errors should be allowed during bootstrap and/or WAL
  * recovery --- see comments in md.c for details.
  */
-typedef struct f_smgr
-{
-	void		(*smgr_init) (void);	/* may be NULL */
-	void		(*smgr_shutdown) (void);	/* may be NULL */
-	void		(*smgr_open) (SMgrRelation reln);
-	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
-								bool isRedo);
-	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
-								bool isRedo);
-	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum, const void *buffer, bool skipFsync);
-	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum, int nblocks, bool skipFsync);
-	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber blocknum, int nblocks);
-	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum);
-	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber blocknum,
-							   void **buffers, BlockNumber nblocks);
-	void		(*smgr_startreadv) (PgAioHandle *ioh,
-									SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum,
-									void **buffers, BlockNumber nblocks);
-	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum,
-								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
-	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber blocknum, BlockNumber nblocks);
-	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber old_blocks, BlockNumber nblocks);
-	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
-	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
-	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
-} f_smgr;
+/*
+ * Maximum number of storage manager implementations, including the built-in
+ * magnetic disk manager at index SMGR_MD.  Additional implementations are
+ * added at postmaster startup via smgr_register().
+ */
+#define SMGR_MAX_IMPLS		8
 
-static const f_smgr smgrsw[] = {
+/*
+ * Table of storage manager implementations.  Index SMGR_MD (0) is always the
+ * built-in magnetic disk manager (md.c); entries past NSmgr are populated by
+ * smgr_register().  The f_smgr struct itself is defined in smgr.h so that
+ * out-of-core implementations can build a table to register.
+ *
+ * Not "const": registration mutates it.  It is only ever written before
+ * backends are forked, so backends inherit a stable, read-only copy.
+ */
+static f_smgr smgrsw[SMGR_MAX_IMPLS] = {
 	/* magnetic disk */
 	{
 		.smgr_init = mdinit,
@@ -151,7 +127,31 @@ static const f_smgr smgrsw[] = {
 	}
 };
 
-static const int NSmgr = lengthof(smgrsw);
+/* number of slots in smgrsw[] that are populated (md is always present) */
+static int	NSmgr = 1;
+
+/* hook to let a registered storage manager claim relations; see smgr.h */
+smgr_which_hook_type smgr_which_hook = NULL;
+
+/*
+ * smgr_register() -- Register an additional storage manager implementation.
+ *
+ * Returns the "which" index that smgr_which_hook should report for relations
+ * handled by this implementation.  See smgr.h for the calling contract.
+ */
+int
+smgr_register(const f_smgr *smgr)
+{
+	int			which;
+
+	if (NSmgr >= SMGR_MAX_IMPLS)
+		elog(ERROR, "too many storage manager implementations registered (max %d)",
+			 SMGR_MAX_IMPLS);
+
+	which = NSmgr++;
+	smgrsw[which] = *smgr;
+	return which;
+}
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
@@ -273,7 +273,14 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		/*
+		 * Choose the storage manager.  With no hook installed (or none of the
+		 * registered managers claiming the relation) this is SMGR_MD, i.e. the
+		 * built-in magnetic disk manager.
+		 */
+		reln->smgr_which = smgr_which_hook ?
+			(*smgr_which_hook) (rlocator, backend) : SMGR_MD;
+		Assert(reln->smgr_which >= 0 && reln->smgr_which < NSmgr);
 
 		/* it is not pinned yet */
 		reln->pincount = 0;

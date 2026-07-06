@@ -27,6 +27,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "miscadmin.h"
@@ -45,9 +46,21 @@ static int	localsvc_timeline = 0;
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
 static int	ls_channel = -1;
+static uint32	ls_channel_shard = UINT32_MAX;
+static uint32	ls_nchannels = 0;
+static uint32	ls_nshards = 1;
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
+
+/*
+ * claimed states: 0 = free, 1 = owned by a backend, 2 = abandoned after the
+ * owner timed out.  An abandoned channel may still receive a late DONE from the
+ * daemon, so never hand it to another backend.
+ */
+#define LS_CLAIMED_FREE		0
+#define LS_CLAIMED_OWNED	1
+#define LS_CLAIMED_ABANDONED	2
 
 static void
 ls_detach(int code, Datum arg)
@@ -59,8 +72,9 @@ ls_detach(int code, Datum arg)
 			PsChannel  *ch = ps_channel(ls_shm, ls_channel);
 
 			/* release the channel for reuse by a future backend */
-			ps_store_release(&ch->claimed, 0);
+			ps_store_release(&ch->claimed, LS_CLAIMED_FREE);
 			ls_channel = -1;
+			ls_channel_shard = UINT32_MAX;
 		}
 		munmap(ls_shm, PS_SHM_SIZE);
 		ls_shm = NULL;
@@ -70,6 +84,12 @@ ls_detach(int code, Datum arg)
 		close(ls_shm_fd);
 		ls_shm_fd = -1;
 	}
+}
+
+void
+pagestore_localsvc_detach(void)
+{
+	ls_detach(0, (Datum) 0);
 }
 
 static void
@@ -112,41 +132,130 @@ ls_attach(void)
 				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
 						   got_page_size, BLCKSZ, hdr->magic, hdr->version)));
 	}
-
-	/*
-	 * Claim a free channel with an atomic compare-and-swap on its 'claimed'
-	 * flag.  This is the only contended operation between backends; once a
-	 * channel is claimed it is owned exclusively until ls_detach() releases it,
-	 * so all subsequent mailbox traffic on it is single-producer/single-consumer.
-	 */
-	for (uint32 i = 0; i < hdr->nchannels; i++)
-	{
-		PsChannel  *ch = ps_channel(shm, i);
-
-		if (ps_cas(&ch->claimed, 0, 1))
-		{
-			ls_channel = (int) i;
-			break;
-		}
-	}
-	if (ls_channel < 0)
-	{
-		munmap(shm, PS_SHM_SIZE);
-		close(fd);
-		ereport(ERROR,
-				(errmsg("pagestore localsvc: no free channel (max %d)",
-						PS_MAX_CHANNELS)));
-	}
-
 	ls_shm = shm;
 	ls_shm_fd = fd;
+	ls_nchannels = hdr->nchannels;
+	ls_nshards = hdr->nshards ? hdr->nshards : 1;
 	on_proc_exit(ls_detach, 0);
+}
+
+static uint32
+ls_key_shard_klass(const PageStoreRelKey *key, uint32 klass)
+{
+	if (!key)
+		return 0;
+	{
+		PsKey	k;
+
+		k.spcOid = key->spcOid;
+		k.dbOid = key->dbOid;
+		k.relNumber = key->relNumber;
+		k.forkNum = key->forkNum;
+		k.klass = klass;
+		return ps_key_shard(&k, ls_nshards);
+	}
+}
+
+static uint32
+ls_key_shard(const PageStoreRelKey *key)
+{
+	return ls_key_shard_klass(key, PS_KLASS_RELATION);
+}
+
+static void
+ls_claim_channel(uint32_t shard)
+{
+	uint32_t stride;
+	uint32_t target;
+
+	ls_attach();
+
+	if (ls_channel >= 0 && ls_channel_shard == shard)
+		return;
+
+	if (ls_channel >= 0)
+	{
+		PsChannel  *old = ps_channel(ls_shm, ls_channel);
+
+		ps_store_release(&old->claimed, LS_CLAIMED_FREE);
+		ls_channel = -1;
+		ls_channel_shard = UINT32_MAX;
+	}
+
+	if (ls_nchannels == 0 || ls_nshards == 0)
+	{
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: daemon has zero channels")));
+	}
+
+	target = shard % ls_nshards;
+	stride = ls_nshards;
+
+	for (uint32_t i = target; i < ls_nchannels; i += stride)
+	{
+		PsChannel  *ch = ps_channel(ls_shm, i);
+
+		if (ps_cas(&ch->claimed, LS_CLAIMED_FREE, LS_CLAIMED_OWNED))
+		{
+			ch->shard = target;
+			ls_channel = (int) i;
+			ls_channel_shard = target;
+			return;
+		}
+	}
+
+	/*
+	 * No free channel: try to reclaim an abandoned one whose late completion
+	 * has since arrived.  A channel is abandoned when its owner timed out
+	 * after posting REQUEST; once the daemon store-releases DONE it will not
+	 * touch the channel again until the next REQUEST, so a DONE abandoned
+	 * channel is safe to reuse.  Claim it first (so no other backend races
+	 * the same reclaim), then check the state; if the daemon still owes the
+	 * completion, put it back.  Without this, every timed-out op (e.g. a
+	 * REQUIRE_BRANCH startup check against a slow daemon) leaks a channel
+	 * until the fixed pool is exhausted.
+	 */
+	for (uint32_t i = target; i < ls_nchannels; i += stride)
+	{
+		PsChannel  *ch = ps_channel(ls_shm, i);
+
+		if (ps_cas(&ch->claimed, LS_CLAIMED_ABANDONED, LS_CLAIMED_OWNED))
+		{
+			if (ps_load_acquire(&ch->state) == PS_STATE_DONE)
+			{
+				ch->shard = target;
+				ls_channel = (int) i;
+				ls_channel_shard = target;
+				return;
+			}
+			ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+		}
+	}
+	ereport(ERROR,
+			(errmsg("pagestore localsvc: no free channel in shard %u (max %u)",
+					target, ls_nchannels)));
+}
+
+static PsChannel *
+ls_chan_for_key(const PageStoreRelKey *key)
+{
+	ls_claim_channel(ls_key_shard(key));
+	return ps_channel(ls_shm, ls_channel);
+}
+
+/* Like ls_chan_for_key but routes by the object's actual class, so a non-relation
+ * object lands on the shard worker that owns shard_for(key) with that klass. */
+static PsChannel *
+ls_chan_for_key_klass(const PageStoreRelKey *key, uint32 klass)
+{
+	ls_claim_channel(ls_key_shard_klass(key, klass));
+	return ps_channel(ls_shm, ls_channel);
 }
 
 static PsChannel *
 ls_chan(void)
 {
-	ls_attach();
+	ls_claim_channel(0);
 	return ps_channel(ls_shm, ls_channel);
 }
 
@@ -170,16 +279,33 @@ ls_chan(void)
  * simply alternate; the IDLE state is only the post-zeroing initial value.
  */
 static void
-ls_exec(PsChannel *ch)
+ls_exec_timeout(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
+	time_t		deadline = 0;
+
+	if (timeout_ms > 0)
+		deadline = time(NULL) + (timeout_ms + 999) / 1000;
+
+	ch->shard = ls_channel_shard;
 
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 	{
 		if (((++spins) & 0xFFF) == 0)
+		{
 			CHECK_FOR_INTERRUPTS();
+			if (deadline != 0 && time(NULL) >= deadline)
+			{
+				ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+				ls_channel = -1;
+				ls_channel_shard = UINT32_MAX;
+				ereport(ERROR,
+						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+								ch->opcode)));
+			}
+		}
 #if defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #endif
@@ -192,12 +318,20 @@ ls_exec(PsChannel *ch)
 }
 
 static void
+ls_exec(PsChannel *ch)
+{
+	ls_exec_timeout(ch, 0);
+}
+
+static void
 ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 {
+	ch->shard = ls_channel_shard;
 	ch->key.spcOid = key->spcOid;
 	ch->key.dbOid = key->dbOid;
 	ch->key.relNumber = key->relNumber;
 	ch->key.forkNum = key->forkNum;
+	ch->key.klass = PS_KLASS_RELATION;	/* the smgr shim only stores relation pages */
 	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
 }
 
@@ -217,7 +351,7 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
@@ -229,7 +363,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
@@ -241,7 +375,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
@@ -253,7 +387,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
@@ -270,7 +404,7 @@ static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
@@ -288,7 +422,7 @@ static void
 ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -317,7 +451,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void **buffers, BlockNumber nblocks,
 		  bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
@@ -345,7 +479,7 @@ static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
@@ -370,7 +504,7 @@ static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -387,7 +521,7 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_IMMEDSYNC;
@@ -398,7 +532,7 @@ static bool
 ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 			   BlockNumber nblocks, int *out_fd, uint64 *out_offset)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	if (nblocks > LS_MAX_PAGES_PER_OP)
 		ereport(ERROR,
@@ -445,7 +579,7 @@ void
 pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 						   uint64 lsn, void *out)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_READ_AT;
@@ -454,6 +588,44 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->req_lsn = lsn;
 	ls_exec(ch);
 	memcpy(out, ch->data, BLCKSZ);
+}
+
+/*
+ * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
+ * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
+ * for the pagestore_create_branch() SQL function.
+ */
+void
+pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
+								uint64 branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_CHECK_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec(ch);
+}
+
+void
+pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
+								  uint64 branch_lsn)
+{
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl, branch_lsn, 0);
+}
+
+void
+pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
+										  uint64 branch_lsn, int timeout_ms)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_REQUIRE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 /*
@@ -492,12 +664,43 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 	ls_exec(ch);
 }
 
+/*
+ * Read up to 'len' bytes of shipped WAL starting at 'start_lsn' from a SPECIFIC
+ * timeline's log on the store (not necessarily this backend's).  Used to serve a
+ * branch's ancestor WAL records for cross-branch redo.  Returns the byte count.
+ */
+int
+pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn, uint32 len,
+							void *out)
+{
+	PsChannel  *ch = ls_chan();
+	int			n;
+
+	ch->timeline = timeline;
+	ch->opcode = PS_OP_WAL_READ;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	ls_exec(ch);
+	n = (int) ch->result;
+	if (n > (int) len)
+		n = (int) len;
+	memcpy(out, ch->data, (size_t) n);
+	return n;
+}
+
+/* This backend's current timeline (0 = main, >0 = a branch). */
+uint32
+pagestore_localsvc_timeline(void)
+{
+	return (uint32) localsvc_timeline;
+}
+
 /* Record in the store that the WAL record at 'lsn' modifies (key, block). */
 void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
@@ -510,7 +713,7 @@ pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 int
 pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_GET;
@@ -524,9 +727,9 @@ pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
  * returns how many.  Ascending order. */
 int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
-							  uint64 lsn_max, uint64 *out, int maxn)
+							  uint64 lsn_max, PsWalRec *out, int maxn)
 {
-	PsChannel  *ch = ls_chan();
+	PsChannel  *ch = ls_chan_for_key(key);
 	int			n;
 
 	ls_fill_key(ch, key);
@@ -537,8 +740,96 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	n = (int) ch->result;
 	if (n > maxn)
 		n = maxn;
-	memcpy(out, ch->data, (size_t) n * sizeof(uint64));
+	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
+}
+
+/*
+ * Non-relation object I/O.  The store is keyed by the full PsKey including klass,
+ * so a non-relation object (SLRU page, control state, ...) goes through the same
+ * CREATE/EXTEND/WRITEV/READV path as a relation page -- only key.klass differs.
+ * These take the four identity fields in a PageStoreRelKey (reinterpreted per the
+ * class) plus the class explicitly.  ls_fill_key sets klass = RELATION, so we
+ * override it after.
+ */
+void
+pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
+							 BlockNumber block, const void *page, uint64 version)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	BlockNumber nb;
+
+	/* ensure the object's fork exists (tolerate an existing one) */
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	ls_exec(ch);
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_NBLOCKS;
+	ls_exec(ch);
+	nb = (BlockNumber) ch->result;
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	/* overwrite if the block already exists, else append */
+	ch->opcode = (block < nb) ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->skip_fsync = 0;
+	/*
+	 * For an SLRU-class object the daemon versions the write by req_lsn (the
+	 * caller's cutoff/dirtying LSN), so a snapshot reads back as-of an LSN >= that
+	 * version; ignored for other classes (relation = pd_lsn, control = counter).
+	 */
+	ch->req_lsn = version;
+	memcpy(ch->data, page, BLCKSZ);
+	ls_exec(ch);
+}
+
+void
+pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
+							BlockNumber block, void *page)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_READV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ls_exec(ch);
+	memcpy(page, ch->data, BLCKSZ);
+}
+
+/*
+ * As-of read of a non-relation object block (honours branch ancestry).  Returns
+ * true if a version <= 'version' was found; on a miss returns false and leaves
+ * 'page' zero-filled (so callers can fail closed rather than read a phantom page).
+ * If 'resolved' is non-NULL, it receives the version actually resolved (the newest
+ * <= 'version'), so a caller wanting an exact-cutoff hit can compare it.
+ */
+bool
+pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+							   BlockNumber block, uint64 version, void *page,
+							   uint64 *resolved)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	bool		found;
+
+	ls_fill_key(ch, key);
+	ch->key.klass = klass;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = version;
+	ls_exec(ch);
+	memcpy(page, ch->data, BLCKSZ);
+	found = ch->result != 0;
+	if (resolved)
+		*resolved = found ? ch->req_lsn : 0;		/* daemon wrote the resolved ver */
+	return found;
 }
 
 /* Called from _PG_init to register the GUCs owned by this backend. */

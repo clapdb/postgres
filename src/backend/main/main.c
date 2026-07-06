@@ -34,6 +34,7 @@
 #include "common/username.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/walredo.h"
 #include "tcop/tcopprot.h"
 #include "utils/help_config.h"
 #include "utils/memutils.h"
@@ -52,6 +53,7 @@ static const char *const DispatchOptionNames[] =
 	[DISPATCH_FORKCHILD] = "forkchild",
 	[DISPATCH_DESCRIBE_CONFIG] = "describe-config",
 	[DISPATCH_SINGLE] = "single",
+	[DISPATCH_WALREDO] = "wal-redo",
 	/* DISPATCH_POSTMASTER has no name */
 };
 
@@ -226,6 +228,9 @@ main(int argc, char *argv[])
 		case DISPATCH_SINGLE:
 			PostgresSingleUserMain(argc, argv,
 								   strdup(get_user_name_or_exit(progname)));
+			break;
+		case DISPATCH_WALREDO:
+			WalRedoMain(argc, argv);
 			break;
 		case DISPATCH_POSTMASTER:
 			PostmasterMain(argc, argv);
