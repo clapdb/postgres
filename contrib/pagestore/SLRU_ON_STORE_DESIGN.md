@@ -1,11 +1,29 @@
 # SLRU on the store: lifecycle design (M4)
 
-Status: implemented (M4).  The WAL-based as-of reconstruction this document
-specifies has landed: snapshot shipping (`pagestore_ship_slru_snapshot`), the
-as-of appliers for clog / commit-ts / multixact offsets+members, the branch
+Status: implemented (M4), with explicit caveats.  The WAL-based as-of
+reconstruction this document specifies has landed: snapshot shipping
+(`pagestore_ship_slru_snapshot`), the as-of appliers for clog / commit-ts /
+multixact offsets+members (64-bit member offsets included), the branch
 seeders, and the prepare/install/manifest bootstrap flow
 (`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
-fail-closed branch startup validation.  Live SLRU page mirroring through the
+fail-closed branch startup validation.
+
+Known caveats -- these fail closed rather than silently misbehave, and remain
+open work:
+
+- **Commit-ts activation toggles in (C, L] are not replayed.**  The commit-ts
+  applier replays per-record timestamps but not `track_commit_timestamp`
+  activation/deactivation state changes (segment zero/re-activation); a
+  parent that toggled the GUC inside the replay window fails the seed rather
+  than reconstructing the toggle (`pagestore.c`, commit-ts applier).
+- **Snapshot shipping is manual-cutoff.**  `pagestore_ship_slru_snapshot`
+  copies segment files at a caller-supplied cutoff C the caller must prove
+  (checkpoint + no concurrent SLRU writes); the online, automatically
+  triggered proven-C ship is a follow-up.
+- **The appliers read the preparing backend's local WAL.**  A branch with no
+  local WAL cannot yet re-run reconstruction store-backed (redo_page_asof has
+  a store-backed WAL reader; the SLRU appliers do not).  prepare must run
+  where the (C, L] WAL is still locally readable.  Live SLRU page mirroring through the
 real SLRU code path (the PR-#49 direction, rejected as the primitive for
 branch correctness) remains deferred to the post-M4 multi-compute milestone,
 as does `pg_subtrans`/`pg_notify`/`pg_serial` coverage.  History: the PR-#49

@@ -92,21 +92,26 @@ ensure_shard_slot(uint32_t shard)
 		int	**nfds;
 		int	*ncaps;
 
+		/*
+		 * Grow the pair one at a time, publishing each successful realloc
+		 * into its global immediately: realloc may have MOVED (and freed)
+		 * the old block even when the sibling allocation then fails, so
+		 * freeing the survivor here -- or leaving the global pointing at
+		 * the old address -- would dangle later opens/frees.
+		 */
 		nfds = realloc(seg_fds, (size_t) new_cap * sizeof(*nfds));
-		ncaps = realloc(seg_fds_caps, (size_t) new_cap * sizeof(*ncaps));
-		if (!nfds || !ncaps)
-		{
-			free(nfds);
-			free(ncaps);
+		if (!nfds)
 			return -1;
-		}
+		seg_fds = nfds;
+		ncaps = realloc(seg_fds_caps, (size_t) new_cap * sizeof(*ncaps));
+		if (!ncaps)
+			return -1;			/* seg_fds grew; caps/cap count unchanged: consistent */
+		seg_fds_caps = ncaps;
 		for (int i = seg_shards_cap; i < new_cap; i++)
 		{
-			nfds[i] = NULL;
-			ncaps[i] = 0;
+			seg_fds[i] = NULL;
+			seg_fds_caps[i] = 0;
 		}
-		seg_fds = nfds;
-		seg_fds_caps = ncaps;
 		seg_shards_cap = new_cap;
 	}
 	return 0;

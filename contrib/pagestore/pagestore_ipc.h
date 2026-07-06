@@ -29,7 +29,11 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		11	/* 11: WAL_RETAIN_FLOOR opcode added;
+#define PS_SHM_VERSION		12	/* 12: WAL_RETAIN_FLOOR opcode added;
+								 * 11: PS_KLASS_CONTROL writes versioned by the
+								 *     caller-supplied update LSN (was a daemon
+								 *     max+1 counter); mixed binaries must fail
+								 *     the shm handshake, not store wrong versions;
 								 * 10: REQUIRE_BRANCH opcode added;
 								 * 9: CHECK_BRANCH opcode added;
 								 * 8: READ_AT reports found-ness in ch->result;

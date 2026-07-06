@@ -61,7 +61,8 @@ cleanup() {
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
 	rm -rf "$(dirname "$DATA")" "$(dirname "$STORE")" "$(dirname "$SCRATCH")" \
-		"${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}"
+		"${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
+		"${SCRATCH2:+$(dirname "$SCRATCH2")}"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
@@ -134,10 +135,16 @@ $P -c "SELECT pagestore_install_prepared_branch('$PREP', '$BRANCHDATA', 1, 0, '$
 assert "$([ -f "$BRANCHDATA/pagestore_branch.manifest" ] && echo present)" "present" \
 	"prepared branch artifacts installed (manifest published last)"
 
+# the branch is a second live compute: it needs its own wal-redo scratch
+# cluster (the helper is a standalone backend holding its datadir's lock
+# file, so two computes sharing the parent's scratch would collide)
+SCRATCH2=$(mktemp -d)/walredo2
+"$BIN/initdb" -D "$SCRATCH2" -U postgres -A trust >/dev/null 2>&1
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
 port = $PORT2
 archive_mode = off
+pagestore.walredo_datadir = '$SCRATCH2'
 EOF
 if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "ok   - branch compute booted through manifest validation (route_all + timeline 1)"

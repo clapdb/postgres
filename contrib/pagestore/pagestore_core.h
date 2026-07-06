@@ -78,7 +78,7 @@ extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);
-extern uint64_t wal_retain_floor(uint32_t timeline);
+extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
 
 /*
  * Resolve a read into out (page_size bytes), serving from memtable / image
