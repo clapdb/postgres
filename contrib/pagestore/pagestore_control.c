@@ -60,6 +60,10 @@
  */
 #define PS_CONTROL_QUEUE_CAPACITY	8
 
+/* bounded wait per mailbox op while shipping; a wedged daemon must not hang
+ * the checkpointer/startup at a post-critical ship point */
+#define PS_CONTROL_SHIP_TIMEOUT_MS	10000
+
 typedef struct PsControlPending
 {
 	ControlFileData image;
@@ -98,59 +102,89 @@ ps_control_drain(void)
 		ps_control_dropped = 0;
 	}
 
-	while (ps_control_queue_count > 0)
+	/*
+	 * Ship + sync + pop, in that order, and never let a store failure
+	 * escape: images are consumed from the queue only after the daemon has
+	 * SYNCED them (local pg_control is already fsync'd, so an image popped
+	 * on mere pwrite acceptance would be lost to a host crash before the
+	 * next sync -- and a branch restore would miss control state the local
+	 * file advertises).  On any failure -- including a wedged daemon, which
+	 * the bounded waits turn into an error -- everything unpopped stays
+	 * queued for the next ship point and the caller continues: a mirror
+	 * outage must not abort checkpoints, recovery steps, or the checksum
+	 * state machines that host the ship points.  Re-shipping an image the
+	 * daemon already accepted appends a same-version duplicate, which is
+	 * latest-wins and invalidates the page cache, so retry is idempotent.
+	 */
+	PG_TRY();
 	{
-		PsControlPending *p = &ps_control_queue[ps_control_queue_head];
-		PageStoreRelKey key = {0};
-		char		page[BLCKSZ];
+		int			nship = ps_control_queue_count;
+		int			i;
 
-		/*
-		 * The object image is the on-disk pg_control representation: the
-		 * ControlFileData bytes (CRC already computed by update_controlfile)
-		 * zero-padded -- to PG_CONTROL_FILE_SIZE on disk, to BLCKSZ here.
-		 * The restore tool writes back exactly the first
-		 * PG_CONTROL_FILE_SIZE bytes.
-		 */
-		/*
-		 * An image without a valid update LSN cannot be restored "as of" a
-		 * branch point and would shadow every as-of read at version 0; no
-		 * call site passes one today, so treat it as a bug, not data.
-		 */
-		if (XLogRecPtrIsInvalid(p->update_lsn))
+		for (i = 0; i < nship; i++)
 		{
-			ereport(WARNING,
-					(errmsg("pagestore: skipping pg_control mirror image with no update LSN")));
-			ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
-			ps_control_queue_count--;
-			continue;
+			PsControlPending *p = &ps_control_queue[(ps_control_queue_head + i)
+													% PS_CONTROL_QUEUE_CAPACITY];
+			PageStoreRelKey key = {0};
+			char		page[BLCKSZ];
+
+			/*
+			 * An image without a valid update LSN cannot be restored "as of"
+			 * a branch point and would shadow every as-of read at version 0;
+			 * no call site passes one today, so treat it as a bug, not data.
+			 */
+			if (XLogRecPtrIsInvalid(p->update_lsn))
+			{
+				ereport(WARNING,
+						(errmsg("pagestore: skipping pg_control mirror image with no update LSN")));
+				continue;
+			}
+
+			/*
+			 * The object image is the on-disk pg_control representation:
+			 * the ControlFileData bytes (CRC already computed by
+			 * update_controlfile) zero-padded -- to PG_CONTROL_FILE_SIZE on
+			 * disk, to BLCKSZ here.  The restore tool writes back exactly
+			 * the first PG_CONTROL_FILE_SIZE bytes.
+			 */
+			memset(page, 0, sizeof(page));
+			memcpy(page, &p->image, sizeof(ControlFileData));
+
+			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
+				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
+			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key, 0, page,
+												 (uint64) p->update_lsn,
+												 PS_CONTROL_SHIP_TIMEOUT_MS);
+			shipped = true;
 		}
 
-		memset(page, 0, sizeof(page));
-		memcpy(page, &p->image, sizeof(ControlFileData));
-
-		elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
-			 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
-		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 0, page,
-									 (uint64) p->update_lsn);
-
 		/*
-		 * Consume the slot only after the write succeeded: if obj_write
-		 * errors out of the drain, the image stays queued for the next ship
-		 * point instead of being lost.
+		 * Durability contract: the mirrored images only count once the
+		 * daemon has synced them; pop only after that succeeded.
 		 */
-		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
-		ps_control_queue_count--;
-		shipped = true;
-	}
+		if (shipped)
+			pagestore_localsvc_store_sync_timeout(PS_CONTROL_SHIP_TIMEOUT_MS);
 
-	/*
-	 * Durability contract: the mirrored image only counts once the daemon
-	 * has synced it.  The segment write alone is a pwrite() -- a host crash
-	 * after the local pg_control advanced but before a daemon sync would
-	 * lose the image a branch restore needs.
-	 */
-	if (shipped)
-		pagestore_localsvc_store_sync();
+		ps_control_queue_head = (ps_control_queue_head + nship)
+			% PS_CONTROL_QUEUE_CAPACITY;
+		ps_control_queue_count -= nship;
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Swallow the error: the queue was not advanced, so every image is
+		 * retried at the next ship point.  No locks are held here and a
+		 * timed-out op marked its channel abandoned, so downgrading to a
+		 * WARNING is safe -- and required: ship points live inside
+		 * checkpoints, recovery steps, and the checksum state machines,
+		 * none of which a mirror outage may abort.
+		 */
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore: pg_control mirror ship failed; %d image(s) remain queued",
+						ps_control_queue_count)));
+	}
+	PG_END_TRY();
 }
 
 /*
