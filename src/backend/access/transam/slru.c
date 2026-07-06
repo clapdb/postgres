@@ -172,10 +172,28 @@ typedef enum
 	SLRU_WRITE_FAILED,
 	SLRU_FSYNC_FAILED,
 	SLRU_CLOSE_FAILED,
+	SLRU_STORE_READ_FAILED,
 } SlruErrorCause;
 
 static SlruErrorCause slru_errcause;
 static int	slru_errno;
+
+/*
+ * Hooks for serving SLRU pages from an external page store
+ * (contrib/pagestore).  See slru.h for the full contract:
+ *
+ * - the write hook runs in SlruInternalWritePage() while the bank lock (and
+ *   the slot's buffer lock) are still held, so the staged image is the exact
+ *   snapshot the dirty-clear published; it must not error, block, or
+ *   allocate -- it can only copy the page and record intent.
+ * - the read hook runs at the top of SlruPhysicalReadPage(), inside the
+ *   SLRU_PAGE_READ_IN_PROGRESS window: it must not ereport (shared state
+ *   must be cleaned first); it reports failure by returning
+ *   SLRU_READ_HOOK_FAILED, which flows through the existing
+ *   SlruReportIOError machinery.
+ */
+slru_page_write_hook_type slru_page_write_hook = NULL;
+slru_page_read_hook_type slru_page_read_hook = NULL;
 
 
 static void SimpleLruZeroLSNs(SlruDesc *ctl, int slotno);
@@ -734,6 +752,16 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 	/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
 
+	/*
+	 * Let an external page-store mirror stage this image while the bank lock
+	 * is still held: after the release below a concurrent status update may
+	 * change the bytes, so a snapshot taken later would not be the state the
+	 * dirty-clear above published.  The hook must be infallible here (see
+	 * slru.h); actual store I/O happens at its own drain points.
+	 */
+	if (slru_page_write_hook)
+		(*slru_page_write_hook) (ctl, pageno, shared->page_buffer[slotno]);
+
 	/* Release bank lock while doing I/O */
 	LWLockRelease(&shared->bank_locks[bankno].lock);
 
@@ -858,6 +886,30 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+
+	/*
+	 * Give an external page store the first shot at serving this page.  The
+	 * hook may not ereport here -- the caller has already published
+	 * SLRU_PAGE_READ_IN_PROGRESS state that must be cleaned up first -- so it
+	 * reports "store required but unavailable" as SLRU_READ_FAILED, which
+	 * flows through the same fail-closed path as a failed local read (never a
+	 * silently zeroed page).  SLRU_READ_HOOK_FALLBACK continues to the local file.
+	 */
+	if (slru_page_read_hook)
+	{
+		switch ((*slru_page_read_hook) (ctl, pageno,
+										shared->page_buffer[slotno]))
+		{
+			case SLRU_READ_HOOK_SERVED:
+				return true;
+			case SLRU_READ_HOOK_FAILED:
+				slru_errcause = SLRU_STORE_READ_FAILED;
+				slru_errno = 0;
+				return false;
+			case SLRU_READ_HOOK_FALLBACK:
+				break;
+		}
+	}
 
 	SlruFileName(ctl, path, segno);
 
@@ -1109,6 +1161,13 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", path),
+					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
+			break;
+		case SLRU_STORE_READ_FAILED:
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not read page %" PRId64 " of SLRU \"%s\" from the page store",
+							pageno, ctl->options.Dir),
 					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_SEEK_FAILED:

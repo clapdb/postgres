@@ -226,6 +226,40 @@ extern int	SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 extern int	SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno,
 									   const void *opaque_data);
 extern void SimpleLruWritePage(SlruDesc *ctl, int slotno);
+
+/*
+ * Hooks for serving SLRU pages from an external page store
+ * (contrib/pagestore's disaggregated storage).  NULL by default; installing
+ * them changes nothing until they act.
+ *
+ * The write hook is called by SlruInternalWritePage() after the slot is
+ * marked write-busy and its dirtybit cleared, while the bank lock and the
+ * slot's buffer lock are still held -- the page bytes are the exact snapshot
+ * that the local pg_pwrite will persist.  It runs on latency-critical paths
+ * and possibly in critical sections: it must not error, block, or allocate;
+ * it can only copy the image and record intent for a later drain.
+ *
+ * The read hook is called at the top of SlruPhysicalReadPage(), inside the
+ * SLRU_PAGE_READ_IN_PROGRESS window where shared state must be cleaned
+ * before any ereport: it must not throw.  Return SLRU_READ_HOOK_SERVED with the
+ * page filled, SLRU_READ_HOOK_FALLBACK to let the local file read proceed, or
+ * SLRU_READ_HOOK_FAILED for "the store must serve this page but could not" --
+ * which fails closed through SlruReportIOError, never a zeroed page.
+ */
+typedef enum SlruReadHookResult
+{
+	SLRU_READ_HOOK_FALLBACK = 0,
+	SLRU_READ_HOOK_SERVED,
+	SLRU_READ_HOOK_FAILED,
+} SlruReadHookResult;
+
+typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
+										   const char *page);
+typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
+														int64 pageno,
+														char *page);
+extern PGDLLIMPORT slru_page_write_hook_type slru_page_write_hook;
+extern PGDLLIMPORT slru_page_read_hook_type slru_page_read_hook;
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
