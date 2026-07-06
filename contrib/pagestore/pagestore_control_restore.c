@@ -128,6 +128,9 @@ client_attach(const char *shm_name)
 		key.klass = PS_KLASS_CONTROL;
 		target = ps_key_shard(&key, nshards);
 
+		sigset_t	claimset,
+					oldset;
+
 		/*
 		 * Arm the release paths BEFORE owning anything: a cancellation
 		 * landing between the CAS and a later handler install would take
@@ -140,11 +143,25 @@ client_attach(const char *shm_name)
 		signal(SIGINT, restore_signal_exit);
 		signal(SIGQUIT, restore_signal_exit);
 
+		/*
+		 * And block those signals across the claim itself: a handler firing
+		 * between a successful CAS and the 'chan' assignment would still
+		 * see chan == -1 and exit without releasing the channel it just
+		 * marked owned -- an unreclaimable leak (reclaim only recovers
+		 * ABANDONED channels).
+		 */
+		sigemptyset(&claimset);
+		sigaddset(&claimset, SIGTERM);
+		sigaddset(&claimset, SIGINT);
+		sigaddset(&claimset, SIGQUIT);
+		sigprocmask(SIG_BLOCK, &claimset, &oldset);
+
 		for (uint32_t i = target; i < hdr->nchannels; i += nshards)
 			if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 			{
 				chan = (int) i;
 				ps_channel(shm, chan)->shard = target;
+				sigprocmask(SIG_SETMASK, &oldset, NULL);
 				return;
 			}
 
@@ -172,10 +189,12 @@ client_attach(const char *shm_name)
 				{
 					chan = (int) i;
 					ps_channel(shm, chan)->shard = target;
+					sigprocmask(SIG_SETMASK, &oldset, NULL);
 					return;
 				}
 				ps_store_release(&ps_channel(shm, i)->claimed, 2);
 			}
+		sigprocmask(SIG_SETMASK, &oldset, NULL);
 	}
 	fprintf(stderr, "pagestore_control_restore: no free daemon channel\n");
 	exit(2);
