@@ -431,10 +431,11 @@ ps_control_flush_hook(void)
 	if (prev_control_file_flush_hook)
 		(*prev_control_file_flush_hook) ();
 
-	if (!ps_control_mirror_enabled)
-		return;
+	if (ps_control_mirror_enabled)
+		ps_control_drain();
 
-	ps_control_drain();
+	/* the live SLRU mirror shares this post-critical ship point */
+	pagestore_slru_mirror_drain();
 }
 
 /*

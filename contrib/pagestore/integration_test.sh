@@ -71,6 +71,7 @@ pagestore.backend = 'localsvc'
 pagestore.localsvc_shm = '$SHM'
 pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
+pagestore.slru_mirror = on
 io_method = sync
 archive_mode = on
 archive_library = 'pagestore'
@@ -798,6 +799,32 @@ assert "$($P -c "SELECT pagestore_wal_retain_floor() IS NOT NULL;")" "t" \
 	"store reports a WAL retention floor once control images exist"
 assert "$($P -c "SELECT pagestore_wal_retain_floor() <= (SELECT redo_lsn FROM pg_control_checkpoint());")" "t" \
 	"WAL retention floor is at/below the current checkpoint redo pointer"
+
+# --- 27. live SLRU mirror: flushed clog pages publish versioned store images ---
+# With pagestore.slru_mirror on, SlruInternalWritePage() stages every flushed
+# in-scope SLRU page (bank-lock snapshot + WAL fence) and the post-critical
+# drain ships it as PS_KLASS_SLRU_LIVE versioned by the fence -- so another
+# compute can later observe this one's committed status.  The keyspace is
+# distinct from the PS_KLASS_SLRU seed snapshots (which promise a proven
+# clean-as-of-cutoff that flushed images do not have).
+$P -c "CREATE FUNCTION pagestore_slru_live_read_at(text, int, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_slru_live_read_at' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_slru_mirror_stats(OUT staged int, OUT recapture int, OUT lost bigint) RETURNS record
+        AS 'pagestore','pagestore_slru_mirror_stats' LANGUAGE C STRICT;" >/dev/null
+$P -c "CREATE TABLE slru_live(x int);" >/dev/null
+LIVEXID=$($P -q -c "BEGIN; INSERT INTO slru_live VALUES (1); SELECT (txid_current() % 4294967296)::bigint; COMMIT;")
+$P -c "CHECKPOINT;" >/dev/null   # SimpleLruWriteAll stages; the checkpoint's control flush hook drains
+LIVEPAGE=$((LIVEXID / 32768))    # CLOG_XACTS_PER_PAGE with BLCKSZ 8192
+assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, pg_current_wal_lsn()) IS NOT NULL;")" "t" \
+	"store holds a live-mirrored pg_xact page after checkpoint"
+assert "$($P -c "SELECT (get_byte(pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, pg_current_wal_lsn()), $(((LIVEXID % 32768) / 4))) >> $(((LIVEXID % 4) * 2))) & 3;")" "1" \
+	"live-mirrored clog page carries the committed bit for our xid"
+assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, '0/1'::pg_lsn) IS NULL;")" "t" \
+	"no live image below the first fence LSN (as-of read is capped)"
+assert "$($P -c "SELECT lost FROM pagestore_slru_mirror_stats();")" "0" \
+	"this backend never lost an SLRU capture"
+assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_subtrans', 0, pg_current_wal_lsn()) IS NULL;" 2>&1 | grep -c 'not an in-scope')" "1" \
+	"out-of-scope SLRUs are excluded, not silently store-backed"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

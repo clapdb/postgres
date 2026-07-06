@@ -1235,7 +1235,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 */
 	if (key->klass == PS_KLASS_RELATION)
 		hdr.lsn = page_lsn(page);
-	else if (key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_CONTROL)
+	else if (key->klass == PS_KLASS_SLRU || key->klass == PS_KLASS_CONTROL ||
+			 key->klass == PS_KLASS_SLRU_LIVE)
 		hdr.lsn = version;
 	else
 	{
