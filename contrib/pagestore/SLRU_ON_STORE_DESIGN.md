@@ -187,10 +187,16 @@ When it is built, the three review rounds established the requirements it must m
   `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
   `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing
   `SlruReportIOError` machinery (slot cleaned first, never a zero page, no
-  throw inside the `SLRU_PAGE_READ_IN_PROGRESS` window), and
-  `slru_page_write_hook` stages the image in `SlruInternalWritePage()` while
-  the bank lock is still held (the snapshot-under-the-bank-lock requirement),
-  documented infallible.  NULL-default; the module consumer is this feature.
+  throw inside the `SLRU_PAGE_READ_IN_PROGRESS` window);
+  `slru_page_exists_hook` answers `SimpleLruDoesPhysicalPageExist()` probes
+  (ActivateCommitTs's zero-create, find_multixact_start) with the same
+  contract; and `slru_page_write_hook` stages the image in
+  `SlruInternalWritePage()` while the bank lock is still held (the
+  snapshot-under-the-bank-lock requirement), documented infallible, carrying
+  the page's largest group commit LSN as a **WAL fence** the consumer must
+  not publish past before that WAL is flushed (the per-update-capture and
+  visibility-watermark items build on it).  NULL-default; the module
+  consumer is this feature.
 - **Daemon IPC.** DONE: `READ_AT` reports found-ness in `ch->result` and
   returns the resolved version on both the POSIX and SPDK paths (SPDK defers
   found-ness to its read completion, so a failed async read is not advertised

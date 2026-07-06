@@ -254,12 +254,27 @@ typedef enum SlruReadHookResult
 } SlruReadHookResult;
 
 typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
-										   const char *page);
+										   const char *page,
+										   XLogRecPtr fence_lsn);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
 														int64 pageno,
 														char *page);
+
+/*
+ * Existence probe for store-backed SLRUs, called at the top of
+ * SimpleLruDoesPhysicalPageExist(): SERVED answers via *exists, FALLBACK
+ * defers to the local file, FAILED fails closed.  Same no-throw contract as
+ * the read hook.  The write hook's fence_lsn is the page's largest group
+ * commit LSN: a consumer must not make the mirrored image visible to other
+ * computes before WAL is flushed past it (the local write path enforces the
+ * same order via XLogFlush before pg_pwrite).
+ */
+typedef SlruReadHookResult (*slru_page_exists_hook_type) (SlruDesc *ctl,
+														  int64 pageno,
+														  bool *exists);
 extern PGDLLIMPORT slru_page_write_hook_type slru_page_write_hook;
 extern PGDLLIMPORT slru_page_read_hook_type slru_page_read_hook;
+extern PGDLLIMPORT slru_page_exists_hook_type slru_page_exists_hook;
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
