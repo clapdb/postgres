@@ -5901,6 +5901,7 @@ StartupXLOG(void)
 	bool		haveTblspcMap;
 	bool		haveBackupLabel;
 	XLogRecPtr	EndOfLog;
+	XLogRecPtr	promotion_lsn;
 	TimeLineID	EndOfLogTLI;
 	TimeLineID	newTLI;
 	bool		performedWalRecovery;
@@ -6185,10 +6186,24 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
-		 * The control image is versioned by the checkpoint we start from:
-		 * that location is exactly what this update publishes.
+		 *
+		 * Version the mirrored image by a non-retroactive position: the
+		 * replay start (the end of the checkpoint record we start from, per
+		 * InitWalRecovery), never the checkpoint record's START -- a branch
+		 * cut inside the record must not see an image referencing a record
+		 * its WAL does not fully contain.  Take the max with the checkpoint
+		 * location and minRecoveryPoint for the backup-label case, where the
+		 * replay start (RedoStartLSN) precedes the checkpoint record; a
+		 * too-high version is safe (a branch merely restores an older
+		 * image), a too-low one is not.
 		 */
-		UpdateControlFile(ControlFile->checkPoint);
+		{
+			XLogRecPtr	update_lsn = GetCurrentReplayRecPtr(NULL);
+
+			update_lsn = Max(update_lsn, ControlFile->checkPoint);
+			update_lsn = Max(update_lsn, ControlFile->minRecoveryPoint);
+			UpdateControlFile(update_lsn);
+		}
 
 		/*
 		 * If there was a backup label file, it's done its job and the info
@@ -6701,6 +6716,16 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+	/*
+	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
+	 * so version its control write by the end-of-log insert position --
+	 * captured BEFORE publishing RECOVERY_STATE_DONE: once that state is
+	 * visible, XLogInsertAllowed() lets other backends reserve WAL, and a
+	 * later capture would version the image after post-promotion user WAL
+	 * (a branch cut in between would then miss the promotion image).
+	 */
+	promotion_lsn = GetXLogInsertRecPtr();
+
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -6709,12 +6734,7 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	/*
-	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
-	 * so version this control write by the current insert position, which is
-	 * >= all WAL this startup replayed or wrote.
-	 */
-	UpdateControlFile(GetXLogInsertRecPtr());
+	UpdateControlFile(promotion_lsn);
 	LWLockRelease(ControlFileLock);
 
 	/*
@@ -8359,8 +8379,15 @@ CreateRestartPoint(int flags)
 		/* we shall start with the latest checksum version */
 		ControlFile->data_checksum_version = lastCheckPoint.dataChecksumState;
 
-		/* versioned by the replayed checkpoint record's end LSN */
-		UpdateControlFile(lastCheckPointEndPtr);
+		/*
+		 * Version by the replayed checkpoint record's end, but never below
+		 * minRecoveryPoint: buffer flushes for records replayed after the
+		 * checkpoint may already have advanced it, and this image requires
+		 * WAL up to that point -- a branch cut between the two must not
+		 * restore it.
+		 */
+		UpdateControlFile(Max(lastCheckPointEndPtr,
+							  ControlFile->minRecoveryPoint));
 	}
 	LWLockRelease(ControlFileLock);
 
