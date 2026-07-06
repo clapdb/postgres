@@ -4131,7 +4131,8 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
  */
 void
 InitStandaloneBackend(int argc, char *argv[], const char *username,
-					  const char **dbname, bool need_dbname, bool require_datadir)
+					  const char **dbname, bool need_dbname, bool require_datadir,
+					  bool skip_lockfile)
 {
 	/* Initialize startup process environment. */
 	InitStandaloneProcess(argv[0]);
@@ -4179,9 +4180,14 @@ InitStandaloneBackend(int argc, char *argv[], const char *username,
 	ChangeToDataDir();
 
 	/*
-	 * Create lockfile for data directory.
+	 * Create lockfile for data directory.  The wal-redo helper skips it: its
+	 * scratch cluster is deliberately shared by concurrent helpers (each
+	 * backend materializing a page spawns one), which never mutate cluster
+	 * state -- each works on a pid-unique private temp relation -- so the
+	 * exclusivity the lock enforces would serialize them for nothing.
 	 */
-	CreateDataDirLockFile(false);
+	if (!skip_lockfile)
+		CreateDataDirLockFile(false);
 
 	/* read control file (error checking and contains config ) */
 	LocalProcessControlFile(false);
@@ -4281,7 +4287,7 @@ PostgresSingleUserMain(int argc, char *argv[],
 	 * Shared standalone-backend bring-up (switches, config, shmem, PGPROC).
 	 * Single-user keeps the historical PGDATA fallback (require_datadir = false).
 	 */
-	InitStandaloneBackend(argc, argv, username, &dbname, true, false);
+	InitStandaloneBackend(argc, argv, username, &dbname, true, false, false);
 
 	/*
 	 * Now that sufficient infrastructure has been initialized, PostgresMain()
