@@ -663,6 +663,27 @@ pagestore_localsvc_store_sync_timeout(int timeout_ms)
 }
 
 /*
+ * Durable WAL retention floor of this compute's timeline ancestry: the store
+ * must keep shipped WAL at/above it for the mirrored pg_control images to
+ * stay restorable.  0 = no control image constrains WAL yet.
+ */
+uint64
+pagestore_localsvc_wal_retain_floor(void)
+{
+	PsChannel  *ch;
+	PageStoreRelKey key = {0};
+
+	/* route by the control key so the query lands on its owner shard */
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	ch->timeline = (uint32) localsvc_timeline;
+	ls_exec(ch);
+	return ch->req_lsn;
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.

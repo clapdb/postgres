@@ -151,6 +151,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_SIZE:
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
+		case PS_OP_WAL_RETAIN_FLOOR:
 			return 0;
 		default:
 			return 1;
@@ -219,6 +220,19 @@ run_request(PsChannel *ch)
 		 */
 		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
 			shard = 0;
+		else if (op == PS_OP_WAL_RETAIN_FLOOR)
+		{
+			/*
+			 * The floor query always scans the fixed control object; derive
+			 * the shard from that key rather than trusting the caller to
+			 * have pre-filled ch->key (a freestanding client may not).
+			 */
+			PsKey		ctlkey;
+
+			memset(&ctlkey, 0, sizeof(ctlkey));
+			ctlkey.klass = PS_KLASS_CONTROL;
+			shard = ps_shard_of(&ctlkey);
+		}
 		else
 			shard = ps_shard_of(&ch->key);
 

@@ -1435,6 +1435,125 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	return 0;
 }
 
+/*
+ * Durable WAL retention floor for a timeline (PGCONTROL_ON_STORE_DESIGN.md).
+ *
+ * Every mirrored pg_control image is preceded by an 8-byte "floor note" --
+ * the image's checkpoint redo pointer -- written as block 1 of the control
+ * object at the same version LSN.  A control image is only restorable if the
+ * WAL from its redo pointer onward still exists, so the retention floor for a
+ * timeline is the minimum redo over every control image restorable on its
+ * ancestry: all block-1 note versions, capped per ancestry level at the
+ * branch point exactly as an as-of restore would be.  The notes live in the
+ * ordinary segment log, so the floor survives a daemon restart via normal
+ * recovery -- it is the durable authority the design requires, independent of
+ * any transient compute-side state.
+ *
+ * Returns 0 when no control image exists (nothing constrains WAL yet).  Any
+ * future shipped-WAL GC must refuse to drop WAL at or above this floor.
+ */
+int
+wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
+{
+	PsKey		key;
+	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+	uint64_t	floor = 0;
+	unsigned char *tmp = malloc(page_size);
+	int			rc = 0;
+
+	if (!tmp)
+		return -1;				/* cannot prove a floor: fail closed */
+	memset(&key, 0, sizeof(key));
+	key.klass = PS_KLASS_CONTROL;
+
+	do
+	{
+		PageEnt    *notes = page_find(w.tl, &key, 1);
+		PageEnt    *images = page_find(w.tl, &key, 0);
+
+		if (notes)
+		{
+			for (int i = 0; i < notes->nver; i++)
+			{
+				PageVer    *v = &notes->vers[i];
+				uint64_t	redo;
+
+				/* only images restorable at this ancestry level count */
+				if (v->lsn > w.lsn)
+					continue;
+
+				/*
+				 * An unreadable note must fail the query, not be skipped: a
+				 * WAL-GC caller acting on a floor that silently ignored a
+				 * note could drop WAL a restorable image still needs.
+				 */
+				if (read_version(v, tmp) != 0)
+				{
+					rc = -1;
+					goto done;
+				}
+				memcpy(&redo, tmp, sizeof(redo));
+
+				/*
+				 * A zero redo means a torn/corrupt note (the mirror never
+				 * ships one: every control image carries a real redo
+				 * pointer).  Its image's requirement is unknowable, so the
+				 * floor collapses to "retain everything" -- returning a
+				 * higher floor because the same-LSN coverage check was
+				 * satisfied by a garbage note would under-retain.
+				 */
+				if (redo == 0)
+				{
+					floor = 1;
+					goto done;
+				}
+				if (floor == 0 || redo < floor)
+					floor = redo;
+			}
+		}
+
+		/*
+		 * Every restorable control image (block 0) must be covered by a
+		 * note at the same version: an image without one (mirrored before
+		 * the note format existed) has an unknowable redo pointer.  Old
+		 * versions never leave the chain, so failing the query would brick
+		 * the floor FOREVER on upgraded stores; instead collapse to the
+		 * most conservative provable answer -- retain everything (floor =
+		 * the lowest valid LSN) -- until version-level GC (M5) prunes the
+		 * unnoted images away.
+		 */
+		if (images)
+		{
+			for (int i = 0; i < images->nver; i++)
+			{
+				PageVer    *v = &images->vers[i];
+				int			covered = 0;
+
+				if (v->lsn > w.lsn)
+					continue;
+				if (notes)
+					for (int j = 0; j < notes->nver; j++)
+						if (notes->vers[j].lsn == v->lsn)
+						{
+							covered = 1;
+							break;
+						}
+				if (!covered)
+				{
+					floor = 1;
+					goto done;
+				}
+			}
+		}
+	} while (tl_walk_next(&w));
+
+done:
+	free(tmp);
+	if (rc == 0)
+		*floor_out = floor;
+	return rc;
+}
+
 /* ===================== recovery (rebuild index from segments) ========== */
 
 /*
@@ -1637,6 +1756,23 @@ ps_handle_meta(PsChannel *ch)
 			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
 											   ch->req_lsn, (PsWalRec *) ch->data,
 											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
+			break;
+
+		case PS_OP_WAL_RETAIN_FLOOR:
+			/*
+			 * Durable WAL retention floor for this timeline's ancestry.  A
+			 * floor that cannot be PROVEN (unreadable note, or a control
+			 * image predating the note format) is an error, never a lower
+			 * bound: a GC caller must retain everything in that case.
+			 */
+			{
+				uint64_t	floor = 0;
+
+				if (wal_retain_floor(tl, &floor) != 0)
+					ch->status = PS_STATUS_ERROR;
+				ch->req_lsn = floor;
+				ch->result = (floor != 0);
+			}
 			break;
 
 		case PS_OP_IMMEDSYNC:
