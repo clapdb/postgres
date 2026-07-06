@@ -5683,4 +5683,12 @@ _PG_init(void)
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;
+
+	/*
+	 * Mirror pg_control to the store whenever the localsvc backend is
+	 * active: the GUCs above have already absorbed postgresql.conf, so
+	 * pagestore_backend_name is final here.
+	 */
+	pagestore_control_mirror_init(pagestore_backend_name != NULL &&
+								  strcmp(pagestore_backend_name, "localsvc") == 0);
 }

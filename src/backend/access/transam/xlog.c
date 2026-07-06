@@ -726,6 +726,7 @@ static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
 static void UpdateControlFile(XLogRecPtr update_lsn);
+static inline void CallControlFileFlushHook(void);
 static char *str_time(pg_time_t tnow, char *buf, size_t bufsize);
 
 static int	get_sync_bit(int method);
@@ -2789,6 +2790,10 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		}
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held (no-op in a
+	 * critical section; a later ship point picks it up then) */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4633,6 +4638,22 @@ control_file_write_hook_type control_file_write_hook = NULL;
 static XLogRecPtr LastControlUpdateLSN = InvalidXLogRecPtr;
 
 /*
+ * Ship point for control-file mirrors: called at the first point after a
+ * critical section that performed control-file writes, so a mirror that
+ * could only record intent inside the section (see control_file_write_hook)
+ * can ship the queued images without waiting for the next control update.
+ */
+control_file_flush_hook_type control_file_flush_hook = NULL;
+
+static inline void
+CallControlFileFlushHook(void)
+{
+	/* a ship point is only a ship point outside critical sections */
+	if (CritSectionCount == 0 && control_file_flush_hook)
+		(*control_file_flush_hook) ();
+}
+
+/*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
  *
@@ -4808,7 +4829,25 @@ SetDataChecksumsOnInProgress(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4881,8 +4920,26 @@ SetDataChecksumsOn(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -4944,6 +5001,9 @@ SetDataChecksumsOff(void)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 
+		/* ship now; see the sibling comment below (drain cannot throw) */
+		CallControlFileFlushHook();
+
 		RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 		WaitForProcSignalBarrier(barrier);
 
@@ -4982,8 +5042,26 @@ SetDataChecksumsOff(void)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 
+	/*
+	 * Ship the queued image now: local pg_control was fsync'd inside the
+	 * critical section precisely so this state survives an immediate
+	 * shutdown, and the mirror must not lag behind that guarantee across
+	 * the barrier/checkpoint waits below.  The drain cannot throw (a store
+	 * failure downgrades to a WARNING and leaves the image queued), so the
+	 * state machine cannot be aborted here.
+	 */
+	CallControlFileFlushHook();
+
 	RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_WAIT | CHECKPOINT_FAST);
 	WaitForProcSignalBarrier(barrier);
+
+	/*
+	 * Ship the control image(s) queued under the critical sections above
+	 * only now, after the barrier waits and checkpoint requests completed:
+	 * a mirror drain can ERROR (daemon unavailable), and erroring earlier
+	 * would abort the checksum state machine between its required steps.
+	 */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -6739,6 +6817,9 @@ StartupXLOG(void)
 	UpdateControlFile(promotion_lsn);
 	LWLockRelease(ControlFileLock);
 
+	/* ship the promotion image now that ControlFileLock is released */
+	CallControlFileFlushHook();
+
 	/*
 	 * Wake up the checkpointer process as there might be a request to disable
 	 * logical decoding by concurrent slot drop.
@@ -6817,6 +6898,9 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	SpinLockRelease(&XLogCtl->info_lck);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -6848,6 +6932,9 @@ ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli)
 	UpdateControlFile(EndRecPtr);
 
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -7572,6 +7659,14 @@ CreateCheckPoint(int flags)
 			END_CRIT_SECTION();
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
+
+			/*
+			 * A skipped checkpoint is still a ship point: a control image
+			 * left queued by an earlier flush-hook failure would otherwise
+			 * not be retried until WAL activity resumes, even though the
+			 * store may long since have recovered.
+			 */
+			CallControlFileFlushHook();
 			return false;
 		}
 	}
@@ -7744,6 +7839,14 @@ CreateCheckPoint(int flags)
 	END_CRIT_SECTION();
 
 	/*
+	 * First safe point after the critical section: ship any control image
+	 * queued inside it (a shutdown checkpoint's DB_SHUTDOWNING write) before
+	 * the long buffer-flush phase, so a crash during that phase does not
+	 * leave the local pg_control ahead of the mirror for its whole duration.
+	 */
+	CallControlFileFlushHook();
+
+	/*
 	 * In some cases there are groups of actions that must all occur on one
 	 * side or the other of a checkpoint record. Before flushing the
 	 * checkpoint record we must explicitly wait for any backend currently
@@ -7896,6 +7999,9 @@ CreateCheckPoint(int flags)
 	 */
 	END_CRIT_SECTION();
 
+	/* ship the control image(s) queued under the critical section */
+	CallControlFileFlushHook();
+
 	/*
 	 * WAL summaries end when the next XLOG_CHECKPOINT_REDO or
 	 * XLOG_CHECKPOINT_SHUTDOWN record is reached. This is the first point
@@ -8033,6 +8139,9 @@ CreateEndOfRecoveryRecord(void)
 	LWLockRelease(ControlFileLock);
 
 	END_CRIT_SECTION();
+
+	/* ship the control image queued under the critical section */
+	CallControlFileFlushHook();
 }
 
 /*
@@ -8275,6 +8384,9 @@ CreateRestartPoint(int flags)
 			/* no record of its own: version by the replay position */
 			UpdateControlFile(GetXLogReplayRecPtr(NULL));
 			LWLockRelease(ControlFileLock);
+
+			/* ship the image queued while ControlFileLock was held */
+			CallControlFileFlushHook();
 		}
 		return false;
 	}
@@ -8386,6 +8498,9 @@ CreateRestartPoint(int flags)
 							  ControlFile->minRecoveryPoint));
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the
@@ -8833,6 +8948,9 @@ XLogReportParameters(void)
 		UpdateControlFile(update_lsn);
 
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 	}
 }
 
@@ -9046,6 +9164,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/*
 		 * We should've already switched to the new TLI before replaying this
 		 * record.
@@ -9253,6 +9374,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/* Check to see if any parameter change gives a problem on recovery */
 		CheckRequiredParameterValues();
 	}
@@ -9365,6 +9489,9 @@ xlog2_redo(XLogReaderState *record)
 		ControlFile->data_checksum_version = state.new_checksum_state;
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 
 		/*
 		 * Block on a procsignalbarrier to await all processes having seen the

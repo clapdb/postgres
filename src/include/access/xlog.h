@@ -258,6 +258,14 @@ struct ControlFileData;
 typedef void (*control_file_write_hook_type) (const struct ControlFileData *control,
 											  XLogRecPtr update_lsn);
 extern PGDLLIMPORT control_file_write_hook_type control_file_write_hook;
+
+/*
+ * Post-critical ship point paired with control_file_write_hook: invoked at
+ * the first point outside a critical section that wrote pg_control, so a
+ * mirror can ship what it could only queue inside the section.
+ */
+typedef void (*control_file_flush_hook_type) (void);
+extern PGDLLIMPORT control_file_flush_hook_type control_file_flush_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 
