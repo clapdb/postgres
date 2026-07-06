@@ -8329,6 +8329,9 @@ CreateRestartPoint(int flags)
 			/* no record of its own: version by the replay position */
 			UpdateControlFile(GetXLogReplayRecPtr(NULL));
 			LWLockRelease(ControlFileLock);
+
+			/* ship the image queued while ControlFileLock was held */
+			CallControlFileFlushHook();
 		}
 		return false;
 	}
@@ -8440,6 +8443,9 @@ CreateRestartPoint(int flags)
 							  ControlFile->minRecoveryPoint));
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the
@@ -8880,6 +8886,9 @@ XLogReportParameters(void)
 		UpdateControlFile(update_lsn);
 
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 	}
 }
 
@@ -9093,6 +9102,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/*
 		 * We should've already switched to the new TLI before replaying this
 		 * record.
@@ -9300,6 +9312,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/* Check to see if any parameter change gives a problem on recovery */
 		CheckRequiredParameterValues();
 	}
@@ -9412,6 +9427,9 @@ xlog2_redo(XLogReaderState *record)
 		ControlFile->data_checksum_version = state.new_checksum_state;
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 
 		/*
 		 * Block on a procsignalbarrier to await all processes having seen the
