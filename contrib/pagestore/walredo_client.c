@@ -123,7 +123,22 @@ walredo_start(const char *datadir)
 		close(out[1]);
 		/* argv[0] must be the full path so the helper can locate its own
 		 * executable (InitStandaloneProcess -> find_my_exec) */
-		execl(my_exec_path, my_exec_path, "--wal-redo", "-D", datadir, (char *) NULL);
+		{
+			/*
+			 * Give each helper a private shared-memory identity: standalone
+			 * startup derives its SysV shm key from the port, and skipping
+			 * the data-dir lock file (so helpers can run concurrently) means
+			 * two helpers on one scratch datadir would otherwise collide on
+			 * -- or recycle -- each other's segment.  The helper never
+			 * listens, so any valid port value works.
+			 */
+			char		portopt[32];
+
+			snprintf(portopt, sizeof(portopt), "port=%d",
+					 10000 + (int) (getpid() % 50000));
+			execl(my_exec_path, my_exec_path, "--wal-redo", "-D", datadir,
+				  "-c", portopt, (char *) NULL);
+		}
 		_exit(127);				/* exec failed */
 	}
 
