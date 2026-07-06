@@ -1,12 +1,18 @@
 # SLRU on the store: lifecycle design (M4)
 
-Status: implemented (M4), with explicit caveats.  The WAL-based as-of
-reconstruction this document specifies has landed: snapshot shipping
-(`pagestore_ship_slru_snapshot`), the as-of appliers for clog / commit-ts /
-multixact offsets+members (64-bit member offsets included), the branch
+Status: implemented (M4), with explicit caveats -- including one unmet
+acceptance criterion.  The WAL-based as-of reconstruction this document
+specifies has landed: snapshot shipping (`pagestore_ship_slru_snapshot`), the
+as-of appliers for clog / commit-ts / multixact offsets+members, the branch
 seeders, and the prepare/install/manifest bootstrap flow
 (`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
-fail-closed branch startup validation.
+fail-closed branch startup validation.  The "matching parent state across
+`track_commit_timestamp` toggles" acceptance criterion is NOT met for
+branches forked across an off-to-on toggle (first caveat below); commit-ts
+support is complete only for toggle-free replay windows.  64-bit multixact
+member horizons are accepted end to end, but store page addressing uses
+uint32 block numbers, capping members pages at 2^32 (about 2^42 member
+offsets) until the object key grows a 64-bit block field.
 
 Known caveats -- each remains open work, with its exact failure mode stated:
 
