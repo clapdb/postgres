@@ -21,11 +21,17 @@
  * restore the earlier image, not the coalesced latest.
  *
  * Two images CAN legitimately carry the same update LSN (end-of-recovery and
- * a promotion that inserted no WAL in between).  The store keeps both, and
- * as-of reads resolve equal versions latest-append-wins: for any branch cut
- * L both images are valid at L (their WAL requirement is identical), and the
- * later write is the later state at that same position -- exactly what a
- * compute booted at L converges to -- so serving it is correct, not a loss.
+ * a promotion that inserted no WAL in between).  Either image is a valid
+ * control state at that LSN: their WAL requirement is identical, and a
+ * compute booted from the earlier one re-derives the transition the later
+ * one recorded (recovery ends, promotion re-runs) -- the branch picks its
+ * own timeline regardless.  So the mirror never needs to order same-LSN
+ * images, only to never mix their bytes: once a write for an LSN may be in
+ * flight to the daemon (a timed-out request can be completed late), the
+ * queued bytes for that LSN are immutable and later same-LSN updates are
+ * dropped, keeping every append for one version byte-identical whatever
+ * order late completions land in.  Store-side, equal versions resolve
+ * latest-append-wins, which under that invariant is a no-op choice.
  *
  * The mirror is an ordered follower of the local file: local pg_control is
  * always written (and fsync'd) first by UpdateControlFile(); the store image
