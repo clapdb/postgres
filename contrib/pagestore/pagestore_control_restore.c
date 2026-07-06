@@ -46,6 +46,7 @@
 #include <unistd.h>
 
 #include "access/heaptoast.h"
+#include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "pagestore_ipc.h"
@@ -279,6 +280,7 @@ main(int argc, char **argv)
 	char		bakpath[MAXPGPATH];
 	char		dirpath[MAXPGPATH];
 	bool		had_previous = false;
+	sigset_t	installmask;
 	int			fd;
 
 	for (int i = 1; i < argc; i++)
@@ -419,6 +421,19 @@ main(int argc, char **argv)
 	}
 
 	/*
+	 * xlog_seg_size is per-cluster, not per-build, so it cannot be compared
+	 * against a compile-time constant -- but startup rejects anything that
+	 * is not a power-of-two in [1MB, 1GB], so an image carrying one must
+	 * fail closed here, before it has replaced pg_control.
+	 */
+	if (!IsValidWalSegSize(control.xlog_seg_size))
+	{
+		fprintf(stderr, "pagestore_control_restore: control image WAL segment size %u is invalid\n",
+				control.xlog_seg_size);
+		return 1;
+	}
+
+	/*
 	 * Atomic install: exactly PG_CONTROL_FILE_SIZE bytes (never the padded
 	 * store object) to a temp file, fsync, rename over the live name, fsync
 	 * the directory.  A crash anywhere in this sequence leaves either the old
@@ -465,11 +480,30 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * Defer termination signals across rename + directory fsync + rollback:
+	 * the handler _exit()s immediately, and a cancellation landing between
+	 * the rename and the fsync (or its rollback) would leave the NEW file
+	 * installed while the tool exits non-zero -- exactly what fail-closed
+	 * forbids.  The window is a handful of syscalls; pending signals fire
+	 * when the mask is restored.
+	 */
+	{
+		sigset_t	installset;
+
+		sigemptyset(&installset);
+		sigaddset(&installset, SIGTERM);
+		sigaddset(&installset, SIGINT);
+		sigaddset(&installset, SIGQUIT);
+		sigprocmask(SIG_BLOCK, &installset, &installmask);
+	}
+
 	if (rename(tmppath, path) != 0)
 	{
 		fprintf(stderr, "pagestore_control_restore: could not rename \"%s\" into place: %m\n", tmppath);
 		unlink(tmppath);
 		unlink(bakpath);
+		sigprocmask(SIG_SETMASK, &installmask, NULL);
 		return 1;
 	}
 	fd = open(dirpath, O_RDONLY);
@@ -503,6 +537,7 @@ main(int argc, char **argv)
 			}
 			else
 				unlink(path);
+			sigprocmask(SIG_SETMASK, &installmask, NULL);
 			return 1;
 		}
 	}
@@ -512,6 +547,7 @@ main(int argc, char **argv)
 	/* success: the backup link of the replaced file is no longer needed */
 	if (had_previous)
 		unlink(bakpath);
+	sigprocmask(SIG_SETMASK, &installmask, NULL);
 
 	printf("restored pg_control as of %X/%08X on timeline %u (checkpoint %X/%08X, redo %X/%08X)\n",
 		   (uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline,
