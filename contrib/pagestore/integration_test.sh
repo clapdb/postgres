@@ -826,6 +826,23 @@ assert "$($P -c "SELECT lost FROM pagestore_slru_mirror_stats();")" "0" \
 assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_subtrans', 0, pg_current_wal_lsn()) IS NULL;" 2>&1 | grep -c 'not an in-scope')" "1" \
 	"out-of-scope SLRUs are excluded, not silently store-backed"
 
+# --- 28. SLRU mirror visibility watermark: contiguous durable prefix only ---
+# The watermark (mirrored_status_lsn) advances to a completed checkpoint's
+# redo pointer once that checkpoint's control image AND every staged SLRU
+# image have durably shipped; a reader on another compute may trust the live
+# mirror for status at/below it and no further.
+$P -c "CREATE FUNCTION pagestore_slru_mirror_watermark() RETURNS pg_lsn
+        AS 'pagestore','pagestore_slru_mirror_watermark' LANGUAGE C;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
+	"watermark is set after a completed checkpoint's images shipped"
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() <= (SELECT redo_lsn FROM pg_control_checkpoint());")" "t" \
+	"watermark never claims more than the last completed checkpoint's redo"
+WM1=$($P -c "SELECT pagestore_slru_mirror_watermark();")
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (2); COMMIT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "t" \
+	"watermark advances across a traffic + checkpoint cycle"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

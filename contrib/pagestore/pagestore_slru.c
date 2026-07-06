@@ -66,6 +66,9 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
+#include "storage/procnumber.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -93,6 +96,7 @@ static bool ps_slru_mirror_enabled = false;
 typedef struct PsSlruPending
 {
 	bool		used;
+	bool		shipped;		/* posted this drain, awaiting the sync */
 	uint32		obj;			/* slru_klass_id of the SLRU directory */
 	uint32		pageno;
 	XLogRecPtr	fence_lsn;		/* upper bound of the image's contents */
@@ -133,6 +137,49 @@ static bool ps_slru_exit_registered = false;
 
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
+
+/*
+ * The visibility watermark (mirrored_status_lsn): an LSN W such that every
+ * in-scope SLRU status change with WAL position <= W is durably mirrored.
+ * A reader on another compute may trust the live mirror for status up to W
+ * and no further.  W advances only over a contiguous durable prefix:
+ *
+ * - The *candidate* for W is the redo pointer of the last completed
+ *   checkpoint whose pg_control image has durably shipped (the control
+ *   mirror reports it).  A completed checkpoint has flushed every dirty
+ *   SLRU page, and the mirror captures every flush since boot, so all
+ *   status <= redo has been staged by then -- by this instance, or by a
+ *   pre-crash instance whose ship already made it durable.
+ * - Every process publishes whether it holds images staged but not yet
+ *   durably shipped (pending_min, 0 = none).  W advances to the candidate
+ *   only while NOTHING is pending anywhere: a staged image carries every
+ *   status change on its page since that page's previous durable image,
+ *   and that interval's low end is unknown -- so any in-flight image may
+ *   carry status arbitrarily far below its fence, and no partial bound
+ *   (fence-1 or otherwise) is safe.  A high LSN being durable never
+ *   implies lower ones are.
+ * - A lost capture (double overflow) freezes W: the mirror is missing a
+ *   page whose identity is gone, so no later cycle provably re-covers it.
+ *   The candidate carries the loss count observed when it was set and is
+ *   only trusted while the count is unchanged.
+ *
+ * The local commit is never held back -- only its visibility to other
+ * computes waits for the mirror.
+ */
+typedef struct PsSlruWatermarkShm
+{
+	pg_atomic_uint64 watermark;
+	pg_atomic_uint64 candidate;
+	pg_atomic_uint64 candidate_loss;	/* total_lost when candidate was set */
+	pg_atomic_uint64 total_lost;
+	pg_atomic_uint64 pending_min[FLEXIBLE_ARRAY_MEMBER];	/* per ProcNumber */
+} PsSlruWatermarkShm;
+
+static PsSlruWatermarkShm *ps_slru_wm = NULL;
+static int	ps_slru_wm_nprocs = 0;
+
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_slru_shmem_startup_hook = NULL;
 
 /*
  * The in-scope SLRU directories (the WAL-logged, uint32-page ones; see
@@ -192,6 +239,174 @@ ps_slru_obj_key(PageStoreRelKey *key, uint32 obj)
 	key->forkNum = 0;
 }
 
+/* ---- watermark shared memory ---- */
+
+static Size
+ps_slru_wm_size(void)
+{
+	int			nprocs = MaxBackends + NUM_AUXILIARY_PROCS;
+
+	return offsetof(PsSlruWatermarkShm, pending_min) +
+		mul_size(sizeof(pg_atomic_uint64), nprocs);
+}
+
+static void
+ps_slru_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+	RequestAddinShmemSpace(ps_slru_wm_size());
+}
+
+static void
+ps_slru_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_slru_shmem_startup_hook)
+		prev_slru_shmem_startup_hook();
+
+	ps_slru_wm_nprocs = MaxBackends + NUM_AUXILIARY_PROCS;
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	ps_slru_wm = ShmemInitStruct("pagestore slru mirror watermark",
+								 ps_slru_wm_size(), &found);
+	if (!found)
+	{
+		pg_atomic_init_u64(&ps_slru_wm->watermark, 0);
+		pg_atomic_init_u64(&ps_slru_wm->candidate, 0);
+		pg_atomic_init_u64(&ps_slru_wm->candidate_loss, 0);
+		pg_atomic_init_u64(&ps_slru_wm->total_lost, 0);
+		for (int i = 0; i < ps_slru_wm_nprocs; i++)
+			pg_atomic_init_u64(&ps_slru_wm->pending_min[i], 0);
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * Publish that this process holds a staged-but-not-durable image at
+ * 'fence'.  Called under the bank lock: a single atomic store to our own
+ * slot, infallible.  Invalid fences publish as 1 (a floor below any real
+ * LSN) -- the drain re-stamps them, but until it does the watermark must
+ * not move at all.
+ */
+static void
+ps_slru_wm_note_pending(XLogRecPtr fence)
+{
+	uint64		f = XLogRecPtrIsInvalid(fence) ? 1 : (uint64) fence;
+	pg_atomic_uint64 *slot;
+	uint64		cur;
+
+	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
+		MyProcNumber >= ps_slru_wm_nprocs)
+		return;
+	slot = &ps_slru_wm->pending_min[MyProcNumber];
+	cur = pg_atomic_read_u64(slot);
+	if (cur == 0 || f < cur)
+		pg_atomic_write_u64(slot, f);
+}
+
+static void
+ps_slru_wm_note_lost(void)
+{
+	if (ps_slru_wm != NULL)
+		pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, 1);
+}
+
+/*
+ * Republish this process's pending floor after a drain: 0 when everything
+ * staged has durably shipped, else the minimum fence still held.
+ */
+static void
+ps_slru_wm_republish_pending(void)
+{
+	uint64		f = 0;
+
+	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
+		MyProcNumber >= ps_slru_wm_nprocs)
+		return;
+
+	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
+	{
+		PsSlruPending *p = &ps_slru_queue[i];
+		uint64		pf;
+
+		if (!p->used)
+			continue;
+		pf = XLogRecPtrIsInvalid(p->fence_lsn) ? 1 : (uint64) p->fence_lsn;
+		if (f == 0 || pf < f)
+			f = pf;
+	}
+	if (ps_slru_recap_count > 0)
+		f = 1;					/* identities without fences: freeze */
+
+	pg_atomic_write_u64(&ps_slru_wm->pending_min[MyProcNumber], f);
+}
+
+/*
+ * Try to advance the watermark to the candidate.  Only legal while no
+ * process holds a pending image: a staged image carries all status on its
+ * page since the page's previous durable image, so its uncovered low end
+ * is unknown and no partial bound is safe.  Cheap and lock-free; called at
+ * the end of every drain (where the common case is: everything shipped,
+ * nothing pending).
+ */
+static void
+ps_slru_wm_advance(void)
+{
+	uint64		cand;
+
+	if (ps_slru_wm == NULL)
+		return;
+	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
+	if (cand == 0)
+		return;
+	if (pg_atomic_read_u64(&ps_slru_wm->total_lost) !=
+		pg_atomic_read_u64(&ps_slru_wm->candidate_loss))
+		return;					/* mirror provably incomplete: frozen */
+
+	for (int i = 0; i < ps_slru_wm_nprocs; i++)
+		if (pg_atomic_read_u64(&ps_slru_wm->pending_min[i]) != 0)
+			return;
+
+	for (;;)
+	{
+		uint64		cur = pg_atomic_read_u64(&ps_slru_wm->watermark);
+
+		if (cand <= cur)
+			break;
+		if (pg_atomic_compare_exchange_u64(&ps_slru_wm->watermark, &cur, cand))
+			break;
+	}
+}
+
+/*
+ * The control mirror reports the redo pointer of a completed checkpoint
+ * whose pg_control image has durably shipped; that redo is the new
+ * watermark candidate.  The loss snapshot is taken first, so a loss racing
+ * this call can only block the candidate (conservative), never be missed.
+ */
+void
+pagestore_slru_note_checkpoint_redo(XLogRecPtr redo)
+{
+	uint64		loss;
+
+	if (ps_slru_wm == NULL || XLogRecPtrIsInvalid(redo))
+		return;
+
+	loss = pg_atomic_read_u64(&ps_slru_wm->total_lost);
+	for (;;)
+	{
+		uint64		cur = pg_atomic_read_u64(&ps_slru_wm->candidate);
+
+		if ((uint64) redo <= cur)
+			return;
+		if (pg_atomic_compare_exchange_u64(&ps_slru_wm->candidate, &cur,
+										   (uint64) redo))
+			break;
+	}
+	pg_atomic_write_u64(&ps_slru_wm->candidate_loss, loss);
+}
+
 /*
  * slru_page_write_hook consumer.  Bank lock held; must be infallible: fixed
  * pre-reserved storage only, no locks, no allocation, no elog.
@@ -210,6 +425,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	{
 		/* cannot be keyed (store block numbers are uint32); count the loss */
 		ps_slru_lost++;
+		ps_slru_wm_note_lost();
 		return;
 	}
 
@@ -230,6 +446,8 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 				memcpy(p->image, page, BLCKSZ);
 				if (p->fence_lsn < fence_lsn)
 					p->fence_lsn = fence_lsn;
+				p->shipped = false; /* the bytes changed under a posted ship */
+				ps_slru_wm_note_pending(p->fence_lsn);
 				return;
 			}
 		}
@@ -242,11 +460,13 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 		PsSlruPending *p = &ps_slru_queue[free_slot];
 
 		p->used = true;
+		p->shipped = false;
 		p->obj = obj;
 		p->pageno = (uint32) pageno;
 		p->fence_lsn = fence_lsn;
 		memcpy(p->image, page, BLCKSZ);
 		ps_slru_queue_count++;
+		ps_slru_wm_note_pending(fence_lsn);
 		return;
 	}
 
@@ -267,12 +487,14 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 			r->obj = obj;
 			r->pageno = (uint32) pageno;
 			ps_slru_recap_count++;
+			ps_slru_wm_note_pending(InvalidXLogRecPtr);
 			return;
 		}
 	}
 
 	/* Both full: coverage lost; the watermark side must fail conservative. */
 	ps_slru_lost++;
+	ps_slru_wm_note_lost();
 }
 
 /*
@@ -463,22 +685,33 @@ ps_slru_drain(void)
 												 p->image,
 												 (uint64) version,
 												 PS_SLRU_SHIP_TIMEOUT_MS);
+			p->fence_lsn = version; /* what the store now has for this page */
+			p->shipped = true;
 			shipped = true;
-			p->used = false;
-			ps_slru_queue_count--;
 		}
 
 		/*
 		 * Durability: the images only count once the daemon has synced
-		 * them.  Unlike the control mirror the entries were consumed above
-		 * -- on a sync failure the CATCH path recounts nothing, but the
-		 * pages' next flush re-stages them and, until then, the follow-up
-		 * watermark must simply not have advanced (it moves on synced
-		 * prefixes only).  A lost image is therefore a visibility delay,
-		 * never a wrong answer.
+		 * them, so entries are consumed only after the sync succeeded --
+		 * the watermark's per-process pending floor is derived from what
+		 * is still staged, and dropping an entry before its bytes are
+		 * durable would let the watermark advance over a commit the store
+		 * could still lose.
 		 */
 		if (shipped)
 			pagestore_localsvc_store_sync_timeout(PS_SLRU_SHIP_TIMEOUT_MS);
+
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY && ps_slru_queue_count > 0; i++)
+		{
+			PsSlruPending *p = &ps_slru_queue[i];
+
+			if (p->used && p->shipped)
+			{
+				p->used = false;
+				p->shipped = false;
+				ps_slru_queue_count--;
+			}
+		}
 
 		if (budget_out)
 			ereport(WARNING,
@@ -505,8 +738,19 @@ ps_slru_drain(void)
 		FlushErrorState();
 		ereport(WARNING,
 				(errmsg("pagestore: SLRU mirror drain failed; staged images kept for the next ship point")));
+
+		/* nothing was consumed; posted-but-unsynced ships retry next time */
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
+			ps_slru_queue[i].shipped = false;
 	}
 	PG_END_TRY();
+
+	/*
+	 * Whatever happened above, republish this process's pending floor from
+	 * the queue's current contents and try to move the watermark.
+	 */
+	ps_slru_wm_republish_pending();
+	ps_slru_wm_advance();
 }
 
 /* Exposed drain point: the control mirror's flush hook chains into this. */
@@ -524,9 +768,27 @@ pagestore_slru_mirror_drain(void)
 static void
 ps_slru_exit_drain(int code, Datum arg)
 {
-	if (code != 0)
-		return;					/* unclean exit: do not touch the store */
-	pagestore_slru_mirror_drain();
+	if (code == 0)
+		pagestore_slru_mirror_drain();
+
+	/*
+	 * Whatever is still staged dies with this process; the pages are clean
+	 * locally, so no later flush will re-stage them.  That is a coverage
+	 * loss, not a deferral: count it so the watermark freezes rather than
+	 * advancing over status the mirror will never carry, and clear our
+	 * pending slot (a dead process must not hold the floor forever -- the
+	 * loss accounting is what keeps this honest).
+	 */
+	if (ps_slru_queue_count > 0 || ps_slru_recap_count > 0)
+	{
+		ps_slru_lost += ps_slru_queue_count + ps_slru_recap_count;
+		if (ps_slru_wm != NULL)
+			pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost,
+									ps_slru_queue_count + ps_slru_recap_count);
+	}
+	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
+		MyProcNumber < ps_slru_wm_nprocs)
+		pg_atomic_write_u64(&ps_slru_wm->pending_min[MyProcNumber], 0);
 }
 
 /*
@@ -564,6 +826,27 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum((int64) ps_slru_lost);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * pagestore_slru_mirror_watermark() returns pg_lsn
+ *
+ * The mirrored_status_lsn: every in-scope SLRU status change at/below it is
+ * durably mirrored.  NULL while no completed checkpoint's flush cycle has
+ * durably shipped yet (or while a coverage loss keeps it frozen at zero).
+ */
+PG_FUNCTION_INFO_V1(pagestore_slru_mirror_watermark);
+Datum
+pagestore_slru_mirror_watermark(PG_FUNCTION_ARGS)
+{
+	uint64		w;
+
+	if (ps_slru_wm == NULL)
+		PG_RETURN_NULL();
+	w = pg_atomic_read_u64(&ps_slru_wm->watermark);
+	if (w == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_LSN((XLogRecPtr) w);
 }
 
 /*
@@ -635,4 +918,10 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	ps_slru_mirror_enabled = true;
 	slru_page_write_hook = ps_slru_write_hook;
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
+
+	/* the visibility watermark lives in shared memory */
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = ps_slru_shmem_request;
+	prev_slru_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = ps_slru_shmem_startup;
 }

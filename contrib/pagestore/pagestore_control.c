@@ -158,6 +158,7 @@ ps_control_drain(void)
 	 */
 	PG_TRY();
 	{
+		XLogRecPtr	shipped_redo = InvalidXLogRecPtr;
 		int			nqueued = ps_control_queue_count;
 		int			ndone = 0;
 		TimestampTz drain_start = GetCurrentTimestamp();
@@ -259,6 +260,8 @@ ps_control_drain(void)
 													  PS_CONTROL_SHIP_TIMEOUT_MS);
 			shipped = true;
 			ndone++;
+			if (shipped_redo < p->image.checkPointCopy.redo)
+				shipped_redo = p->image.checkPointCopy.redo;
 		}
 
 		/*
@@ -272,6 +275,15 @@ ps_control_drain(void)
 		ps_control_queue_head = (ps_control_queue_head + ndone)
 			% PS_CONTROL_QUEUE_CAPACITY;
 		ps_control_queue_count -= ndone;
+
+		/*
+		 * A durably shipped control image proves the checkpoint that fixed
+		 * its redo pointer completed -- and a completed checkpoint flushed
+		 * (and thus staged) every dirty SLRU page.  Report the newest such
+		 * redo: it is the SLRU mirror's next visibility-watermark candidate.
+		 */
+		if (shipped && XLogRecPtrIsValid(shipped_redo))
+			pagestore_slru_note_checkpoint_redo(shipped_redo);
 	}
 	PG_CATCH();
 	{

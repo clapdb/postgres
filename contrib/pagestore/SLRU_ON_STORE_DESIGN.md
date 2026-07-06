@@ -197,10 +197,17 @@ When it is built, the three review rounds established the requirements it must m
 - **Snapshot under the bank lock.** Any page image staged must be copied under the
   bank lock before `SlruInternalWritePage()` releases it for `pg_pwrite`, or a
   concurrent write-OK caller changes the bytes.
-- **Contiguous-durable-prefix visibility watermark.** A reader gates xid visibility
-  on a `mirrored_status_lsn` watermark that advances only over a **contiguous
-  durable prefix** -- not "highest mirrored", since out-of-order/failed drains mean
-  a high LSN being durable does not imply lower ones are. The local commit is never
+- **Contiguous-durable-prefix visibility watermark.** DONE
+  (`pagestore_slru_mirror_watermark()`): the candidate is the redo pointer
+  of the last completed checkpoint whose pg_control image durably shipped
+  (a completed checkpoint flushed -- and the mirror staged -- every dirty
+  SLRU page), and the watermark advances to it only while **no** process
+  holds a staged-but-unsynced image (per-process pending floors in shared
+  memory; drain consumes entries only after the store sync).  Not "highest
+  mirrored": a staged image carries all status on its page since the
+  page's previous durable image, so its uncovered low end is unknown and
+  no partial bound is safe.  A lost capture freezes the watermark (the
+  candidate carries a loss-count snapshot).  The local commit is never
   held back; only its visibility to *other* computes waits.
 - **Cache-hit revalidation, including tombstones.** `SimpleLruReadPage()` returns a
   valid cached slot without hitting the physical-read hook, so cached slots must be

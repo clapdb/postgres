@@ -175,6 +175,7 @@ extern void pagestore_control_mirror_init(bool localsvc_active);
 /* pagestore_slru.c: live SLRU page mirror (write-side capture + ship) */
 extern void pagestore_slru_mirror_init(bool localsvc_active);
 extern void pagestore_slru_mirror_drain(void);
+extern void pagestore_slru_note_checkpoint_redo(XLogRecPtr redo);
 extern uint32 pagestore_slru_klass_id(const char *name);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
 extern void pagestore_localsvc_store_sync(void);
