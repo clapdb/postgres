@@ -485,7 +485,8 @@ test_manifest_v2_migration(void)
 	ver = 0;
 	if (fd >= 0)
 	{
-		(void) pread(fd, &ver, sizeof(ver), 4);
+		if (pread(fd, &ver, sizeof(ver), 4) != (ssize_t) sizeof(ver))
+			ver = 0;			/* short read: fail the check below */
 		close(fd);
 	}
 	check(ver == 3, "  ... the manifest is migrated to v3 on disk");
