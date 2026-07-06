@@ -34,6 +34,7 @@
 #include "postgres_fe.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -45,6 +46,21 @@
 static void *shm = NULL;
 static int	chan = -1;
 static bool request_in_flight = false;
+
+/*
+ * Orchestrators cancel bootstrap with SIGTERM/SIGINT, which does NOT run
+ * atexit handlers: release the channel from the handler itself (plain
+ * atomic stores, async-signal-safe) or repeated cancelled restores leak the
+ * control shard's channel pool dry.
+ */
+static void
+restore_signal_exit(int signo)
+{
+	if (shm != NULL && chan >= 0)
+		ps_store_release(&ps_channel(shm, chan)->claimed,
+						 request_in_flight ? 2 : 0);
+	_exit(128 + signo);
+}
 
 /*
  * Release the claimed channel on every exit path (registered with atexit).
@@ -118,6 +134,9 @@ client_attach(const char *shm_name)
 				chan = (int) i;
 				ps_channel(shm, chan)->shard = target;
 				atexit(release_channel);
+				signal(SIGTERM, restore_signal_exit);
+				signal(SIGINT, restore_signal_exit);
+				signal(SIGQUIT, restore_signal_exit);
 				return;
 			}
 
@@ -138,6 +157,9 @@ client_attach(const char *shm_name)
 					chan = (int) i;
 					ps_channel(shm, chan)->shard = target;
 					atexit(release_channel);
+					signal(SIGTERM, restore_signal_exit);
+					signal(SIGINT, restore_signal_exit);
+					signal(SIGQUIT, restore_signal_exit);
 					return;
 				}
 				ps_store_release(&ps_channel(shm, i)->claimed, 2);
@@ -347,9 +369,16 @@ main(int argc, char **argv)
 	 * the directory.  A crash anywhere in this sequence leaves either the old
 	 * file or the new one, never a torn mix.
 	 */
-	/* pid-unique name + O_EXCL: two concurrent restores (an orchestrator
-	 * retry racing the first attempt) must not write into each other's temp */
-	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	/*
+	 * pid-unique name + O_EXCL: two concurrent restores (an orchestrator
+	 * retry racing the first attempt) must not write into each other's
+	 * temp.  A leftover from a CRASHED earlier run can carry the same pid
+	 * (container restarts reuse pids), so remove any stale same-name file
+	 * first -- no live process can own it, pids are unique among the
+	 * living -- and keep O_EXCL to catch true races.
+	 */
+	unlink(tmppath);
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, 0600);
 	if (fd < 0)
 	{
 		fprintf(stderr, "pagestore_control_restore: could not create \"%s\": %m\n", tmppath);
