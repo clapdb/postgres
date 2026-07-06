@@ -1036,6 +1036,26 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * from the record loop above.  (A scan range that itself crosses a branch
 		 * point spans timelines and is a known limitation.)
 		 */
+		/*
+		 * Fail closed when the last write is inherited from an ancestor
+		 * timeline: the truncate scan below covers only that ancestor's WAL,
+		 * but a relation truncate on THIS branch after the fork adds no
+		 * per-page index entry, so it would be invisible to the scan and a
+		 * stale ancestor FPI could be returned for a block the branch
+		 * already truncated away.  Proving liveness across the fork needs a
+		 * two-leg scan (ancestor to the fork point, then this timeline);
+		 * until that exists, cross-timeline liveness is unprovable here.
+		 */
+		if (recs[n - 1].timeline != pagestore_localsvc_timeline())
+		{
+			XLogReaderFree(reader);
+			pfree(pd);
+			pfree(recs);
+			pfree(base);
+			pfree(page);
+			PG_RETURN_NULL();
+		}
+
 		ps_redo_cur_timeline = recs[n - 1].timeline;
 		reader->readLen = 0;
 		liveness = redo_block_truncated_away(reader, rloc, forknum,
@@ -2259,8 +2279,8 @@ static void
 ps_mxmemb_set(char *page, int64 pageno, MultiXactOffset offset,
 			  TransactionId xid, uint32 status)
 {
-	int			group,
-				grouponpg,
+	int64		group;
+	int			grouponpg,
 				byteoff,
 				member_in_group,
 				memberoff,
@@ -2269,8 +2289,15 @@ ps_mxmemb_set(char *page, int64 pageno, MultiXactOffset offset,
 
 	if ((int64) (offset / PS_MXMEMB_PER_PAGE) != pageno)
 		return;
-	group = offset / PS_MXMEMB_PER_GROUP;
-	grouponpg = group % PS_MXMEMB_GROUPS_PER_PAGE;
+
+	/*
+	 * Keep the group arithmetic 64-bit: MultiXactOffset can exceed
+	 * INT_MAX * PS_MXMEMB_PER_GROUP members on long-lived clusters, and an
+	 * int intermediate would wrap grouponpg onto the wrong slots.  The
+	 * within-page values all fit in int.
+	 */
+	group = (int64) (offset / PS_MXMEMB_PER_GROUP);
+	grouponpg = (int) (group % PS_MXMEMB_GROUPS_PER_PAGE);
 	byteoff = grouponpg * PS_MXMEMB_GROUP_SIZE;		/* flags word at byteoff */
 	member_in_group = offset % PS_MXMEMB_PER_GROUP;
 	memberoff = byteoff + PS_MXMEMB_FLAGBYTES_PER_GROUP +
