@@ -183,12 +183,18 @@ When it is built, the three review rounds established the requirements it must m
 - **Tombstones with a defined version + synchronous truncate barrier.** A store
   tombstone must be durable before local segment deletion, versioned by the
   truncation LSN -- which only the WAL-logged SLRUs have.
-- **Fail-closed, interrupt-safe hooks.** Read and existence hooks return
-  `SERVED`/`FALLBACK`/`FAILED`; `slru.c` cleans the slot before any error; a
-  store-required page fails closed (never a zero page); no `PG_RE_THROW()` across the
-  `SLRU_PAGE_READ_IN_PROGRESS` window.
-- **Daemon IPC.** `READ_AT` must report found-ness in `ch->result` and return the
-  resolved version on **both** POSIX and SPDK paths (neither does today).
+- **Fail-closed, interrupt-safe hooks.** DONE: `slru_page_read_hook` returns
+  `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
+  `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing
+  `SlruReportIOError` machinery (slot cleaned first, never a zero page, no
+  throw inside the `SLRU_PAGE_READ_IN_PROGRESS` window), and
+  `slru_page_write_hook` stages the image in `SlruInternalWritePage()` while
+  the bank lock is still held (the snapshot-under-the-bank-lock requirement),
+  documented infallible.  NULL-default; the module consumer is this feature.
+- **Daemon IPC.** DONE: `READ_AT` reports found-ness in `ch->result` and
+  returns the resolved version on both the POSIX and SPDK paths (SPDK defers
+  found-ness to its read completion, so a failed async read is not advertised
+  as a found zero page).
 - **Critical-section-safe write path.** Mirroring must never do fallible store I/O
   in a commit/abort critical section; it stages into shared memory and drains
   outside.
