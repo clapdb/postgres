@@ -172,10 +172,29 @@ typedef enum
 	SLRU_WRITE_FAILED,
 	SLRU_FSYNC_FAILED,
 	SLRU_CLOSE_FAILED,
+	SLRU_STORE_READ_FAILED,
 } SlruErrorCause;
 
 static SlruErrorCause slru_errcause;
 static int	slru_errno;
+
+/*
+ * Hooks for serving SLRU pages from an external page store
+ * (contrib/pagestore).  See slru.h for the full contract:
+ *
+ * - the write hook runs in SlruInternalWritePage() while the bank lock (and
+ *   the slot's buffer lock) are still held, so the staged image is the exact
+ *   snapshot the dirty-clear published; it must not error, block, or
+ *   allocate -- it can only copy the page and record intent.
+ * - the read hook runs at the top of SlruPhysicalReadPage(), inside the
+ *   SLRU_PAGE_READ_IN_PROGRESS window: it must not ereport (shared state
+ *   must be cleaned first); it reports failure by returning
+ *   SLRU_READ_HOOK_FAILED, which flows through the existing
+ *   SlruReportIOError machinery.
+ */
+slru_page_write_hook_type slru_page_write_hook = NULL;
+slru_page_read_hook_type slru_page_read_hook = NULL;
+slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
 
 static void SimpleLruZeroLSNs(SlruDesc *ctl, int slotno);
@@ -734,6 +753,40 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 	/* Acquire per-buffer lock (cannot deadlock, see notes at top) */
 	LWLockAcquire(&shared->buffer_locks[slotno].lock, LW_EXCLUSIVE);
 
+	/*
+	 * Let an external page-store mirror stage this image while the bank lock
+	 * is still held: after the release below a concurrent status update may
+	 * change the bytes, so a snapshot taken later would not be the state the
+	 * dirty-clear above published.  The hook must be infallible here (see
+	 * slru.h); actual store I/O happens at its own drain points.
+	 *
+	 * The staged image also carries the same WAL fence the local write will
+	 * honor (the page's largest group commit LSN): the local
+	 * SlruPhysicalWritePage() calls XLogFlush(max_lsn) before writing, but a
+	 * mirror drain could otherwise ship first and let another compute
+	 * observe commit bits whose WAL is not yet durable.  The consumer must
+	 * not make the image visible before WAL is flushed past fence_lsn.
+	 */
+	if (slru_page_write_hook)
+	{
+		XLogRecPtr	fence_lsn = InvalidXLogRecPtr;
+
+		if (shared->group_lsn != NULL)
+		{
+			int			lsnindex = slotno * shared->lsn_groups_per_page;
+
+			for (int lsnoff = 0; lsnoff < shared->lsn_groups_per_page; lsnoff++)
+			{
+				XLogRecPtr	this_lsn = shared->group_lsn[lsnindex + lsnoff];
+
+				if (fence_lsn < this_lsn)
+					fence_lsn = this_lsn;
+			}
+		}
+		(*slru_page_write_hook) (ctl, pageno, shared->page_buffer[slotno],
+								 fence_lsn);
+	}
+
 	/* Release bank lock while doing I/O */
 	LWLockRelease(&shared->bank_locks[bankno].lock);
 
@@ -805,6 +858,31 @@ SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
 	/* update the stats counter of checked pages */
 	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
 
+	/*
+	 * Store-backed SLRUs must answer existence from the store too: several
+	 * callers probe with this function before ever reading the page
+	 * (ActivateCommitTs's zero-create, find_multixact_start), so a page that
+	 * exists only in the store would otherwise be re-zeroed or reported
+	 * missing.  SLRU_READ_HOOK_FAILED fails closed like a failed read.
+	 */
+	if (slru_page_exists_hook)
+	{
+		bool		exists = false;
+
+		switch ((*slru_page_exists_hook) (ctl, pageno, &exists))
+		{
+			case SLRU_READ_HOOK_SERVED:
+				return exists;
+			case SLRU_READ_HOOK_FAILED:
+				slru_errcause = SLRU_STORE_READ_FAILED;
+				slru_errno = 0;
+				SlruReportIOError(ctl, pageno, NULL);
+				break;			/* not reached */
+			case SLRU_READ_HOOK_FALLBACK:
+				break;
+		}
+	}
+
 	SlruFileName(ctl, path, segno);
 
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
@@ -858,6 +936,30 @@ SlruPhysicalReadPage(SlruDesc *ctl, int64 pageno, int slotno)
 	off_t		offset = rpageno * BLCKSZ;
 	char		path[MAXPGPATH];
 	int			fd;
+
+	/*
+	 * Give an external page store the first shot at serving this page.  The
+	 * hook may not ereport here -- the caller has already published
+	 * SLRU_PAGE_READ_IN_PROGRESS state that must be cleaned up first -- so it
+	 * reports "store required but unavailable" as SLRU_READ_FAILED, which
+	 * flows through the same fail-closed path as a failed local read (never a
+	 * silently zeroed page).  SLRU_READ_HOOK_FALLBACK continues to the local file.
+	 */
+	if (slru_page_read_hook)
+	{
+		switch ((*slru_page_read_hook) (ctl, pageno,
+										shared->page_buffer[slotno]))
+		{
+			case SLRU_READ_HOOK_SERVED:
+				return true;
+			case SLRU_READ_HOOK_FAILED:
+				slru_errcause = SLRU_STORE_READ_FAILED;
+				slru_errno = 0;
+				return false;
+			case SLRU_READ_HOOK_FALLBACK:
+				break;
+		}
+	}
 
 	SlruFileName(ctl, path, segno);
 
@@ -1109,6 +1211,13 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", path),
+					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
+			break;
+		case SLRU_STORE_READ_FAILED:
+			ereport(ERROR,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not read page %" PRId64 " of SLRU \"%s\" from the page store",
+							pageno, ctl->options.Dir),
 					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_SEEK_FAILED:

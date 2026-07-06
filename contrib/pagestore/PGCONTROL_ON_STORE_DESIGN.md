@@ -1,11 +1,19 @@
 # pg_control on the store: mirror + bootstrap-restore protocol (M4)
 
-Status: design. The PR-#50 prototype (`feat/pagestore-control`) mirrors
-`pg_control` to the store on every write and restores it before startup with a
-freestanding tool. Review (5 P1 / 11 P2) showed the prototype runs fallible work
-inside recovery-critical sections and restores non-atomically. Per the read-path
-stack plan, store-backed pg_control stays frozen until this protocol is defined.
-This document is the gate; implementation resumes against it.
+Status: implemented.  The protocol below has landed as a PR sequence: the
+core write-hook seam with per-update LSN versioning (`UpdateControlFile()` +
+`control_file_write_hook`/`control_file_flush_hook`), the critical-section-safe
+mirror (`pagestore_control.c`: pre-reserved ordered handoff queue, ship only at
+post-critical points, images versioned by their update LSN verbatim in the
+daemon), the durable WAL retention floor (each image ships a redo-pointer note
+as block 1 of the control object; `PS_OP_WAL_RETAIN_FLOOR` reports min(redo)
+over the restorable images on a timeline's ancestry, rebuilt from the segment
+log across daemon restarts -- any future shipped-WAL GC must refuse to drop WAL
+at/above it), and the atomic bootstrap restore tool
+(`pagestore_control_restore`: as-of-branch-LSN read, CRC verify, temp+rename,
+directory fsync, channel released on every exit path).  History: the original
+PR-#50 prototype mirrored inside recovery-critical sections and restored
+non-atomically; review (5 P1 / 11 P2) froze it until this protocol existed.
 
 ## Scope
 

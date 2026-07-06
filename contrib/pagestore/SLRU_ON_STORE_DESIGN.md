@@ -1,10 +1,44 @@
 # SLRU on the store: lifecycle design (M4)
 
-Status: design. The PR-#49 prototype (`feat/pagestore-slru`) mirrors flushed SLRU
-page images to the store and serves them back through a read hook. Three rounds of
-review showed this model is the wrong primitive for *branch-correct* transaction
-status, so the M4 design pivots to **WAL-based as-of reconstruction** and defers
-live page mirroring. This document is the gate; implementation resumes against it.
+Status: implemented (M4), with explicit caveats -- including one unmet
+acceptance criterion.  The WAL-based as-of reconstruction this document
+specifies has landed: snapshot shipping (`pagestore_ship_slru_snapshot`), the
+as-of appliers for clog / commit-ts / multixact offsets+members, the branch
+seeders, and the prepare/install/manifest bootstrap flow
+(`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
+fail-closed branch startup validation.  The "matching parent state across
+`track_commit_timestamp` toggles" acceptance criterion is NOT met for
+branches forked across an off-to-on toggle (first caveat below); commit-ts
+support is complete only for toggle-free replay windows.  64-bit multixact
+member horizons are accepted end to end, but store page addressing uses
+uint32 block numbers, capping members pages at 2^32 (about 2^42 member
+offsets) until the object key grows a 64-bit block field.
+
+Known caveats -- each remains open work, with its exact failure mode stated:
+
+- **Commit-ts toggles in (C, L] are not replayed.**  A `track_commit_timestamp`
+  DEACTIVATION inside the window is detected explicitly and fails the seed.
+  An ACTIVATION is not explicitly detected: it generally fails closed anyway
+  via the required-page check (the base snapshot at C has no commit-ts pages
+  to load), and reads below the branch's `oldestCommitTsXid` horizon are
+  masked -- but segments surviving from an EARLIER activation era are not
+  defended against.  Full toggle replay (segment zero/re-activation state) is
+  the follow-up.
+- **Snapshot shipping trusts the caller's cutoff.**  `pagestore_ship_slru_snapshot`
+  copies segment files and keys them by a caller-supplied cutoff C; it errors
+  only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
+  concurrent SLRU writes).  An unproven cutoff silently ships mis-keyed
+  bytes.  The online, automatically triggered proven-C ship is the follow-up.
+- **The appliers read the preparing backend's local WAL.**  A branch with no
+  local WAL cannot yet re-run reconstruction store-backed (redo_page_asof has
+  a store-backed WAL reader; the SLRU appliers do not).  prepare must run
+  where the (C, L] WAL is still locally readable.  Live SLRU page mirroring through the
+real SLRU code path (the PR-#49 direction, rejected as the primitive for
+branch correctness) remains deferred to the post-M4 multi-compute milestone,
+as does `pg_subtrans`/`pg_notify`/`pg_serial` coverage.  History: the PR-#49
+prototype mirrored flushed SLRU page images and served them via a read hook;
+three review rounds showed that model cannot give branch-correct status at a
+fork LSN, which is why M4 pivoted to as-of reconstruction.
 
 ## What M4 actually needs
 
@@ -176,12 +210,24 @@ When it is built, the three review rounds established the requirements it must m
 - **Tombstones with a defined version + synchronous truncate barrier.** A store
   tombstone must be durable before local segment deletion, versioned by the
   truncation LSN -- which only the WAL-logged SLRUs have.
-- **Fail-closed, interrupt-safe hooks.** Read and existence hooks return
-  `SERVED`/`FALLBACK`/`FAILED`; `slru.c` cleans the slot before any error; a
-  store-required page fails closed (never a zero page); no `PG_RE_THROW()` across the
-  `SLRU_PAGE_READ_IN_PROGRESS` window.
-- **Daemon IPC.** `READ_AT` must report found-ness in `ch->result` and return the
-  resolved version on **both** POSIX and SPDK paths (neither does today).
+- **Fail-closed, interrupt-safe hooks.** DONE: `slru_page_read_hook` returns
+  `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
+  `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing
+  `SlruReportIOError` machinery (slot cleaned first, never a zero page, no
+  throw inside the `SLRU_PAGE_READ_IN_PROGRESS` window);
+  `slru_page_exists_hook` answers `SimpleLruDoesPhysicalPageExist()` probes
+  (ActivateCommitTs's zero-create, find_multixact_start) with the same
+  contract; and `slru_page_write_hook` stages the image in
+  `SlruInternalWritePage()` while the bank lock is still held (the
+  snapshot-under-the-bank-lock requirement), documented infallible, carrying
+  the page's largest group commit LSN as a **WAL fence** the consumer must
+  not publish past before that WAL is flushed (the per-update-capture and
+  visibility-watermark items build on it).  NULL-default; the module
+  consumer is this feature.
+- **Daemon IPC.** DONE: `READ_AT` reports found-ness in `ch->result` and
+  returns the resolved version on both the POSIX and SPDK paths (SPDK defers
+  found-ness to its read completion, so a failed async read is not advertised
+  as a found zero page).
 - **Critical-section-safe write path.** Mirroring must never do fallible store I/O
   in a commit/abort critical section; it stages into shared memory and drains
   outside.

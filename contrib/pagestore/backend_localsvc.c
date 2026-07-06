@@ -221,7 +221,16 @@ ls_claim_channel(uint32_t shard)
 
 		if (ps_cas(&ch->claimed, LS_CLAIMED_ABANDONED, LS_CLAIMED_OWNED))
 		{
-			if (ps_load_acquire(&ch->state) == PS_STATE_DONE)
+			uint32_t	st = ps_load_acquire(&ch->state);
+
+			/*
+			 * DONE: the daemon finished the abandoned op.  IDLE: the
+			 * abandoning owner was cancelled before ever publishing a
+			 * request (e.g. the restore tool's signal path), so the daemon
+			 * never saw one.  Both mean the daemon will not touch the
+			 * mailbox until the next REQUEST -- safe to reuse.
+			 */
+			if (st == PS_STATE_DONE || st == PS_STATE_IDLE)
 			{
 				ch->shard = target;
 				ls_channel = (int) i;
@@ -629,6 +638,52 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 }
 
 /*
+ * Make everything the daemon has accepted durable (ps_storage->sync()).
+ * Used by the control mirror after draining queued pg_control images: the
+ * design's durability contract is local file first, then store mirror +
+ * store sync.
+ */
+void
+pagestore_localsvc_store_sync(void)
+{
+	pagestore_localsvc_store_sync_timeout(0);
+}
+
+/* Bounded-wait variant; see pagestore_localsvc_obj_write_timeout. */
+void
+pagestore_localsvc_store_sync_timeout(int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_IMMEDSYNC;
+	ls_exec_timeout(ch, timeout_ms);
+}
+
+/*
+ * Durable WAL retention floor of this compute's timeline ancestry: the store
+ * must keep shipped WAL at/above it for the mirrored pg_control images to
+ * stay restorable.  0 = no control image constrains WAL yet.
+ */
+uint64
+pagestore_localsvc_wal_retain_floor(void)
+{
+	PsChannel  *ch;
+	PageStoreRelKey key = {0};
+
+	/* route by the control key so the query lands on its owner shard */
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	ch->timeline = (uint32) localsvc_timeline;
+	ls_exec(ch);
+	return ch->req_lsn;
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
@@ -756,21 +811,65 @@ void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 							 BlockNumber block, const void *page, uint64 version)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	pagestore_localsvc_obj_write_timeout(klass, key, block, page, version, 0);
+}
+
+/*
+ * Like pagestore_localsvc_obj_write, but each mailbox wait is bounded by
+ * timeout_ms (0 = wait forever): callers on paths that must not hang on a
+ * wedged daemon -- the control-mirror ship points -- turn a stall into an
+ * error they can defer and retry.
+ */
+void
+pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
+									 BlockNumber block, const void *page,
+									 uint64 version, int timeout_ms)
+{
 	BlockNumber nb;
+
+	nb = pagestore_localsvc_obj_write_prepare_timeout(klass, key, timeout_ms);
+	pagestore_localsvc_obj_write_post_timeout(klass, key, block, page,
+											  version, nb, timeout_ms);
+}
+
+/*
+ * Split-phase variant of obj_write for callers that must know exactly when
+ * their bytes can be in flight to the daemon: the preliminary CREATE and
+ * NBLOCKS carry no caller data, so a timeout there cannot result in the
+ * image being applied late.  Only the WRITEV/EXTEND issued by _post puts
+ * the page bytes in flight.  The control mirror freezes its queued image
+ * between the two phases.  Returns the object's current block count, to be
+ * passed to _post.
+ */
+BlockNumber
+pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+											 const PageStoreRelKey *key,
+											 int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = 1;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_NBLOCKS;
-	ls_exec(ch);
-	nb = (BlockNumber) ch->result;
+	ls_exec_timeout(ch, timeout_ms);
+	return (BlockNumber) ch->result;
+}
+
+void
+pagestore_localsvc_obj_write_post_timeout(uint32 klass,
+										  const PageStoreRelKey *key,
+										  BlockNumber block, const void *page,
+										  uint64 version, BlockNumber nb,
+										  int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -780,13 +879,13 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->nblocks = 1;
 	ch->skip_fsync = 0;
 	/*
-	 * For an SLRU-class object the daemon versions the write by req_lsn (the
-	 * caller's cutoff/dirtying LSN), so a snapshot reads back as-of an LSN >= that
-	 * version; ignored for other classes (relation = pd_lsn, control = counter).
+	 * For an SLRU- or control-class object the daemon versions the write by
+	 * req_lsn (the caller's cutoff/dirtying/update LSN), so it reads back
+	 * as-of an LSN >= that version; ignored for relations (pd_lsn).
 	 */
 	ch->req_lsn = version;
 	memcpy(ch->data, page, BLCKSZ);
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 void
