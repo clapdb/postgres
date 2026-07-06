@@ -244,7 +244,12 @@ wr_ensure_buffers(void)
 
 	tmp.spcOid = 1663;			/* pg_default */
 	tmp.dbOid = 1;				/* template1 (its base dir always exists) */
-	tmp.relNumber = 0x7e000001; /* arbitrary, private to this backend */
+	/*
+	 * pid-unique: concurrent helpers share the scratch cluster (no lock
+	 * file), so each must own a distinct temp relation or their evicted
+	 * local buffers would collide in the same base/1 relfile.
+	 */
+	tmp.relNumber = 0x7e000000 | (MyProcPid & 0xFFFFFF);
 	wr_smgr = smgropen(tmp, MyProcNumber);
 	/* isRedo=true: tolerate a file left behind by a previously crashed helper */
 	smgrcreate(wr_smgr, MAIN_FORKNUM, true);
@@ -342,7 +347,7 @@ WalRedoMain(int argc, char *argv[])
 	 * a database name (e.g. "--wal-redo scratch" silently falling back to PGDATA
 	 * instead of the intended -D directory).
 	 */
-	InitStandaloneBackend(argc, argv, NULL, NULL, false, true);
+	InitStandaloneBackend(argc, argv, NULL, NULL, false, true, true);
 
 	/*
 	 * BaseInit() sets up smgr and the buffer manager (InitBufferManagerAccess),
