@@ -38,12 +38,19 @@ local_close(void)
 }
 
 static int
+layer_id_shard(uint64_t layer_id)
+{
+	return (int) ((layer_id >> 48) & 0xFFFF);
+}
+
+static int
 local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 {
 	int			n;
 
-	n = snprintf(buf, buflen, "%s/layer_%016llx",
-				 layer_dir, (unsigned long long) layer_id);
+	n = snprintf(buf, buflen, "%s/layer_%d_%016llx",
+				 layer_dir, layer_id_shard(layer_id),
+				 (unsigned long long) layer_id);
 	if (n < 0 || (size_t) n >= buflen)
 		return -1;
 	return 0;
@@ -87,6 +94,34 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 		unlink(path);
 		return -1;
 	}
+	return 0;
+}
+
+static int
+local_write_local_layer(uint64_t layer_id, const void *buf, uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	const char *p = buf;
+	uint64_t	done = 0;
+
+	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	while (done < len)
+	{
+		ssize_t		w = write(fd, p + done, (size_t) (len - done));
+
+		if (w <= 0)
+		{
+			close(fd);
+			return -1;
+		}
+		done += (uint64_t) w;
+	}
+	close(fd);
 	return 0;
 }
 
@@ -190,6 +225,7 @@ const PsLayerStore PsLayerStoreLocal = {
 	.open = local_open,
 	.close = local_close,
 	.create_local_layer = local_create_local_layer,
+	.write_local_layer = local_write_local_layer,
 	.seal_local_layer = local_seal_local_layer,
 	.read_layer_block = local_read_layer_block,
 	.upload_layer = local_unsupported_layer_op,

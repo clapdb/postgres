@@ -29,7 +29,10 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		4
+#define PS_SHM_VERSION		10	/* 10: REQUIRE_BRANCH opcode added;
+								 * 9: CHECK_BRANCH opcode added;
+								 * 8: READ_AT reports found-ness in ch->result;
+								 * 7: walidx_get returns timeline-tagged PsWalRec */
 
 /* Default logical page size (overridable via the daemon's --page-size). */
 #define PS_DEFAULT_PAGE_SIZE	8192
@@ -65,6 +68,8 @@ typedef enum PsOpcode
 	PS_OP_READV,				/* read nblocks pages at blocknum into data */
 	PS_OP_IMMEDSYNC,
 	PS_OP_READ_AT,				/* read 1 page at blocknum as-of req_lsn (COW) */
+	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
+	PS_OP_REQUIRE_BRANCH,		/* require existing timeline ancestry metadata */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
@@ -77,14 +82,72 @@ typedef enum PsOpcode
 #define PS_STATUS_OK		0
 #define PS_STATUS_ERROR		1
 
-/* Version-neutral relation-fork identity (mirrors PageStoreRelKey). */
+/*
+ * Object class of a stored key.  Almost everything is a relation fork page
+ * (PS_KLASS_RELATION); the discriminator lets non-relation cluster state -- SLRU
+ * banks (clog/multixact/...), the control file, etc. -- share the same key space,
+ * indexes, segments, layers and cache, distinguished only by klass.  Relation
+ * keys carry PS_KLASS_RELATION (0), so existing behavior is unchanged.  Future
+ * classes reinterpret the spc/db/rel/fork fields as that class needs (e.g. an
+ * SLRU encodes its bank/segment there).
+ */
+typedef enum PsObjClass
+{
+	PS_KLASS_RELATION = 0,		/* a relation fork's page (spc/db/rel/fork) */
+	PS_KLASS_SLRU = 1,			/* an SLRU page (clog, multixact, ...) -- future */
+	PS_KLASS_CONTROL = 2,		/* pg_control / cluster control state -- future */
+} PsObjClass;
+
+/* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */
 typedef struct PsKey
 {
 	uint32_t	spcOid;
 	uint32_t	dbOid;
 	uint32_t	relNumber;
 	int32_t		forkNum;
+	uint32_t	klass;			/* PsObjClass; 0 = relation (default) */
 } PsKey;
+
+/*
+ * A per-page WAL-index record: one WAL record that touched the page, tagged with
+ * the timeline it lives on.  walidx_get returns these in ascending LSN order,
+ * merging a branch's records with its ancestors' (the timeline tag tells a reader
+ * which timeline's shipped WAL to fetch each record from -- the cross-branch
+ * store-served read path).
+ */
+typedef struct PsWalRec
+{
+	uint64_t	lsn;			/* record start LSN (ReadRecPtr) */
+	uint32_t	timeline;		/* source timeline the record lives on */
+} PsWalRec;
+
+/* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
+ * stable enough for shard selection, and it is reused for client+daemon key->shard.
+ */
+static inline uint32_t
+ps_fnv1a32(const void *data, size_t n)
+{
+	const unsigned char *p = (const unsigned char *) data;
+	uint32_t		h = 2166136261u;
+
+	for (size_t i = 0; i < n; i++)
+	{
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* Shard this key belongs to; timeline/block must not be involved in routing so
+ * READV/WRITEV stay on one shard for a single relation.  nshards=0 means 1.
+ */
+static inline uint32_t
+ps_key_shard(const PsKey *key, uint32_t nshards)
+{
+	if (nshards <= 1)
+		return 0;
+	return ps_fnv1a32(key, sizeof(*key)) % nshards;
+}
 
 /* One channel = one backend's mailbox. */
 typedef struct PsChannel
@@ -109,6 +172,7 @@ typedef struct PsChannel
 	/* result */
 	uint32_t	status;
 	uint32_t	result;			/* NBLOCKS -> count; EXISTS -> 0/1 */
+	uint32_t	shard;			/* key-owner shard for this request */
 
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
@@ -121,7 +185,8 @@ typedef struct PsShmHeader
 	uint32_t	page_size;		/* logical page size negotiated with engine */
 	uint32_t	io_unit;		/* == PS_IO_UNIT */
 	uint32_t	nchannels;
-	uint32_t	pad0;
+	uint32_t	nshards;		/* channel pools = channel index mod nshards */
+	uint32_t	pad0;			/* reserved */
 	uint64_t	channel_stride;
 	uint64_t	channels_off;
 } PsShmHeader;

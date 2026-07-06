@@ -28,23 +28,38 @@ jobs:
       - name: Compile daemon and test harness
         working-directory: contrib/pagestore
         run: |
-          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_daemon pagestore_daemon.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_layer_test pagestore_layer_test.c pagestore_layer.c pagestore_layer_store.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_pgcache_test pagestore_pgcache_test.c pagestore_pgcache.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_manifest_test pagestore_manifest_test.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_gc_test pagestore_gc_test.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c -lrt -lpthread
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
         run: ./pagestore_test ./pagestore_daemon
+
+      - name: Run image-layer unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_layer_test
+
+      - name: Run materialized-page cache unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_pgcache_test
+
+      - name: Run manifest replay unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_manifest_test
+
+      - name: Run GC crash-safety unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_gc_test
 
   # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
   # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --
   # it compiles PostgreSQL -- so it is a separate job.
   integration-test:
     name: in-engine integration test (PostgreSQL + daemon)
-    # The PG extension is a per-version smgr/xlog shim; build it only on the
-    # release branches whose PostgreSQL it matches (branchdb_NN).  The dev branch
-    # (pagestore) tracks upstream master, where the smgr/xlog APIs differ, so this
-    # job is skipped there -- the freestanding daemon is covered by standalone-test.
-    if: ${{ startsWith(github.ref_name, 'branchdb_') || startsWith(github.base_ref, 'branchdb_') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
