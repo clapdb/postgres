@@ -228,9 +228,22 @@ When it is built, the three review rounds established the requirements it must m
   returns the resolved version on both the POSIX and SPDK paths (SPDK defers
   found-ness to its read completion, so a failed async read is not advertised
   as a found zero page).
-- **Critical-section-safe write path.** Mirroring must never do fallible store I/O
-  in a commit/abort critical section; it stages into shared memory and drains
-  outside.
+- **Critical-section-safe write path.** DONE: `pagestore_slru.c`
+  (`pagestore.slru_mirror`) consumes the write hook -- the bank-lock
+  snapshot goes into a pre-reserved in-process queue (infallible at the
+  hook, like the pg_control mirror) and ships at post-critical drain
+  points, `XLogFlush(fence)` before each image so no other compute can see
+  a status bit whose WAL is not durable.  Images are keyed
+  `PS_KLASS_SLRU_LIVE`, versioned by the fence -- deliberately NOT the
+  `PS_KLASS_SLRU` seed keyspace, whose snapshots promise a proven
+  clean-as-of-cutoff that flushed page images do not have; a live image
+  means only "newest flushed bytes, contents bounded by the version".
+  No-drop staging: queue overflow degrades to a recapture-by-identity
+  table (re-snapshot under the bank lock, or from the local segment if
+  evicted, with a fresh conservative fence); only double overflow loses
+  coverage, and that is counted (`pagestore_slru_mirror_stats()`) so the
+  watermark must fail conservative.  The watermark itself, truncation
+  tombstones, and the read-side consumer are the remaining increments.
 
 This list is the spec for that feature; none of it blocks M4.
 

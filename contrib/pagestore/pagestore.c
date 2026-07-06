@@ -1281,19 +1281,12 @@ pagestore_object_get(PG_FUNCTION_ARGS)
  *   PsKey{ klass = PS_KLASS_SLRU, relNumber = slru_klass_id(dir), block = pageno }.
  */
 
-/* Stable per-SLRU object id from its directory name (FNV-1a; libc-only). */
+/* Stable per-SLRU object id; shared with the live mirror (pagestore_slru.c)
+ * so seed snapshots and live images address the same logical SLRU. */
 static uint32
 slru_klass_id(const char *name)
 {
-	uint32		h = 2166136261u;
-	const unsigned char *p;
-
-	for (p = (const unsigned char *) name; *p != '\0'; p++)
-	{
-		h ^= *p;
-		h *= 16777619u;
-	}
-	return h;
+	return pagestore_slru_klass_id(name);
 }
 
 /* The WAL-logged, uint32-page SLRUs M4 may snapshot/reconstruct.  A whitelist: the
@@ -5674,6 +5667,14 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Live SLRU page mirror (write-side capture).  Defines its GUC, so it
+	 * must run before the prefix is reserved; the backend-name GUC it
+	 * checks is final here.
+	 */
+	pagestore_slru_mirror_init(pagestore_backend_name != NULL &&
+							   strcmp(pagestore_backend_name, "localsvc") == 0);
 
 	MarkGUCPrefixReserved("pagestore");
 

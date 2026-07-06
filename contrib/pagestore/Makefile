@@ -7,6 +7,7 @@ OBJS = \
 	backend_passthrough.o \
 	pagestore.o \
 	pagestore_control.o \
+	pagestore_slru.o \
 	walredo_client.o
 PGFILEDESC = "pagestore - pluggable storage backend smgr shim"
 

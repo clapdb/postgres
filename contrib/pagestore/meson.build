@@ -5,6 +5,7 @@ pagestore_sources = files(
   'backend_passthrough.c',
   'pagestore.c',
   'pagestore_control.c',
+  'pagestore_slru.c',
   'walredo_client.c',
 )
 
