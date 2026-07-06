@@ -1262,6 +1262,13 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	/* index points at the page bytes (data_off), so reads skip the header */
 	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
+
+	/*
+	 * A same-LSN rewrite (latest-wins in the version chain) changes the
+	 * authoritative bytes under an unchanged cache key; drop any cached copy
+	 * so reads do not keep serving the pre-rewrite image.
+	 */
+	ps_pgcache_invalidate(timeline, key, block, hdr.lsn);
 	s->cur_off += reclen;
 
 	/*

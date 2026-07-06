@@ -724,6 +724,17 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
 									  recs, PS_REDO_MAX_RECS);
+
+	/*
+	 * A full result set means the daemon may have truncated it: the cap is
+	 * filled with the OLDEST matching records, so treating recs[n-1] as the
+	 * newest state would silently materialize a stale page (and mis-judge
+	 * truncation liveness).  Fail closed instead of returning wrong bytes.
+	 */
+	if (n >= PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
+						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -929,6 +940,17 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
 	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
 									  recs, PS_REDO_MAX_RECS);
+
+	/*
+	 * A full result set means the daemon may have truncated it: the cap is
+	 * filled with the OLDEST matching records, so treating recs[n-1] as the
+	 * newest state would silently materialize a stale page (and mis-judge
+	 * truncation liveness).  Fail closed instead of returning wrong bytes.
+	 */
+	if (n >= PS_REDO_MAX_RECS)
+		ereport(ERROR,
+				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
+						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -2633,8 +2655,11 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	/* reader/pd are never allocated when (base, target] was empty */
+	if (reader)
+		XLogReaderFree(reader);
+	if (pd)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -2806,8 +2831,11 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	/* reader/pd are never allocated when (base, target] was empty */
+	if (reader)
+		XLogReaderFree(reader);
+	if (pd)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -2967,8 +2995,11 @@ check_required_pages:
 							(long long) pageno, LSN_FORMAT_ARGS(base_lsn))));
 	}
 
-	XLogReaderFree(reader);
-	pfree(pd);
+	/* reader/pd are never allocated when (base, target] was empty */
+	if (reader)
+		XLogReaderFree(reader);
+	if (pd)
+		pfree(pd);
 	pfree(truncated);
 	pfree(zeroed);
 	pfree(base_found);
@@ -3700,9 +3731,12 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
-	if (oldest_member < 0 || next_member < 0 ||
-		oldest_member > UINT32_MAX ||
-		next_member > UINT32_MAX)
+	/*
+	 * MultiXactOffset is 64-bit and monotonic (it no longer wraps), so any
+	 * non-negative ordered horizon is valid; a long-lived cluster can exceed
+	 * 2^32 members.  The bigint SQL argument bounds it at INT64_MAX.
+	 */
+	if (oldest_member < 0 || next_member < 0 || oldest_member > next_member)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
@@ -3801,48 +3835,19 @@ pagestore_seed_multixact(PG_FUNCTION_ARGS)
 	}
 	if (next_member != oldest_member)
 	{
-		if (oldest_member < next_member)
-		{
-			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-			/* include boundary page for next_member when it is the first slot on a new
-			 * members page so the branch can allocate the next multixact immediately.
-			 */
-			mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-			if (next_member % PS_MXMEMB_PER_PAGE == 0)
-				mem_page_hi++;
-			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-													mem_page_lo, mem_page_hi,
-													ps_mxmemb_seed_reconstruct_range,
-													base, target, "multixact members", false,
-													true);
-		}
-		else
-		{
-			mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
-			mem_page_hi = (int64) UINT32_MAX / PS_MXMEMB_PER_PAGE;
-			mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-													mem_page_lo, mem_page_hi,
-													ps_mxmemb_seed_reconstruct_range,
-													base, target, "multixact members", false,
-													true);
-			if (next_member > 0)
-			{
-				mem_page_lo = 0;
-				mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
-				if (next_member % PS_MXMEMB_PER_PAGE == 0)
-					mem_page_hi++;
-				mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
-													mem_page_lo, mem_page_hi,
-													ps_mxmemb_seed_reconstruct_range,
-													base, target, "multixact members", false,
-													true);
-			}
-			else
-			{
-				pagestore_write_zero_slru_page(memdir, "multixact members", 0, true);
-				mem_seeded++;
-			}
-		}
+		/* 64-bit member offsets are monotonic: the horizon never wraps */
+		mem_page_lo = oldest_member / PS_MXMEMB_PER_PAGE;
+		/* include boundary page for next_member when it is the first slot on a new
+		 * members page so the branch can allocate the next multixact immediately.
+		 */
+		mem_page_hi = (next_member - 1) / PS_MXMEMB_PER_PAGE;
+		if (next_member % PS_MXMEMB_PER_PAGE == 0)
+			mem_page_hi++;
+		mem_seeded += pagestore_seed_slru_pages(mxstage, "members",
+												mem_page_lo, mem_page_hi,
+												ps_mxmemb_seed_reconstruct_range,
+												base, target, "multixact members", false,
+												true);
 	}
 	else
 	{
@@ -4002,9 +4007,12 @@ pagestore_seed_branch_slrus_impl(const char *target_dir, XLogRecPtr base,
 		ereport(ERROR,
 				(errmsg("invalid fork multixact horizon [%u, %u)",
 						oldest_multi, next_multi)));
-	if (oldest_member < 0 || next_member < 0 ||
-		oldest_member > UINT32_MAX ||
-		next_member > UINT32_MAX)
+	/*
+	 * MultiXactOffset is 64-bit and monotonic (it no longer wraps), so any
+	 * non-negative ordered horizon is valid; a long-lived cluster can exceed
+	 * 2^32 members.  The bigint SQL argument bounds it at INT64_MAX.
+	 */
+	if (oldest_member < 0 || next_member < 0 || oldest_member > next_member)
 		ereport(ERROR,
 				(errmsg("invalid fork multixact member horizon [%lld, %lld)",
 						(long long) oldest_member, (long long) next_member)));
