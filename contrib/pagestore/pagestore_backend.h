@@ -173,6 +173,12 @@ extern uint32 pagestore_localsvc_timeline(void);
 extern void pagestore_control_mirror_init(bool localsvc_active);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
 extern void pagestore_localsvc_store_sync(void);
+extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
+extern void pagestore_localsvc_obj_write_timeout(uint32 klass,
+												 const PageStoreRelKey *key,
+												 BlockNumber block,
+												 const void *page,
+												 uint64 version, int timeout_ms);
 extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 										 BlockNumber block, const void *page,
 										 uint64 version);
