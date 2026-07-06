@@ -1411,7 +1411,7 @@ pagestore_slru_read_at(PG_FUNCTION_ARGS)
  * xact WAL records in (C, L].  Replaying per-update records -- not coalescing a
  * flushed page image -- is what makes it branch-correct: two xids on the same clog
  * page that commit on either side of L get the right answer (SLRU_ON_STORE_DESIGN.md).
- * This applies clog only; multixact/commit-ts are the same shape and follow.  It reads
+ * The same shape is implemented for multixact and commit-ts below.  It reads
  * the parent's local WAL; a store-backed reader for a branch with no local WAL (as in
  * redo_page_asof) is a follow-up.
  */
@@ -1995,9 +1995,9 @@ pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
  * record assigns one multixid its starting offset into the members file (what
  * RecordNewMultiXact writes to the offsets SLRU), so reconstruction loads the offsets
  * snapshot as of the base cutoff C and replays the create records in (C, L], writing each
- * new multixid's offset into its page.  Offsets are fixed-width MultiXactOffset (uint32),
+ * new multixid's offset into its page.  Offsets are fixed-width MultiXactOffset (uint64),
  * MULTIXACT_OFFSETS_PER_PAGE to a page.  (The members file -- offset -> member list -- is
- * the second half, a follow-up; this reconstructs the offsets map only.)
+ * the second half, reconstructed by the members applier below; this is the offsets map.)
  */
 #define PS_MXOFF_PER_PAGE	(BLCKSZ / (int) sizeof(MultiXactOffset))
 
@@ -3245,7 +3245,8 @@ pagestore_seed_slru_pages(const char *target_dir, const char *slru_dir,
  * writing whole segments.  The branch then
  * boots on this clog and writes its own status forward on its timeline.  Fails closed
  * (ereport) on any error -- a half-seeded clog must never boot.  Returns the page
- * count.  clog only; multixact/commit-ts seed the same way (follow-up).
+ * count.  Commit-ts and multixact have matching seeders below, and
+ * pagestore_seed_branch_slrus()/pagestore_prepare_branch() drive all three.
  */
 PG_FUNCTION_INFO_V1(pagestore_seed_clog);
 Datum
