@@ -20,6 +20,13 @@
  * can occur before a drain, and a branch point between their LSNs must
  * restore the earlier image, not the coalesced latest.
  *
+ * Two images CAN legitimately carry the same update LSN (end-of-recovery and
+ * a promotion that inserted no WAL in between).  The store keeps both, and
+ * as-of reads resolve equal versions latest-append-wins: for any branch cut
+ * L both images are valid at L (their WAL requirement is identical), and the
+ * later write is the later state at that same position -- exactly what a
+ * compute booted at L converges to -- so serving it is correct, not a loss.
+ *
  * The mirror is an ordered follower of the local file: local pg_control is
  * always written (and fsync'd) first by UpdateControlFile(); the store image
  * follows at the next ship point.  The daemon's WAL retention horizon for the
@@ -37,6 +44,7 @@
 #include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "pagestore_backend.h"
 #include "utils/pg_lsn.h"
 #include "varatt.h"
@@ -77,6 +85,8 @@ static bool ps_control_mirror_enabled = false;
 static void
 ps_control_drain(void)
 {
+	bool		shipped = false;
+
 	Assert(CritSectionCount == 0);
 
 	if (ps_control_dropped > 0)
@@ -144,7 +154,17 @@ ps_control_drain(void)
 		 */
 		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
 		ps_control_queue_count--;
+		shipped = true;
 	}
+
+	/*
+	 * Durability contract: the mirrored image only counts once the daemon
+	 * has synced it.  The segment write alone is a pwrite() -- a host crash
+	 * after the local pg_control advanced but before a daemon sync would
+	 * lose the image a branch restore needs.
+	 */
+	if (shipped)
+		pagestore_localsvc_store_sync();
 }
 
 /*
@@ -185,7 +205,15 @@ ps_control_write_hook(const struct ControlFileData *control,
 		ps_control_queue_count++;
 	}
 
-	if (CritSectionCount == 0)
+	/*
+	 * Drain only when it is safe to perform (and possibly fail) store IPC:
+	 * outside critical sections AND not holding ControlFileLock -- several
+	 * callers (UpdateMinRecoveryPoint, the recovery/promotion paths) call
+	 * UpdateControlFile() with the lock held, and an IPC wait or ERROR
+	 * there would stall or break every other control-file user.  Core
+	 * invokes the flush hook right after those locks are released.
+	 */
+	if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
 		ps_control_drain();
 }
 
@@ -277,6 +305,16 @@ pagestore_control_image_asof(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to read the mirrored control image")));
+
+	/*
+	 * Same size gate as mirroring: on a BLCKSZ < PG_CONTROL_FILE_SIZE build
+	 * the local page buffer cannot hold a full control image, and copying
+	 * PG_CONTROL_FILE_SIZE below would read past it.
+	 */
+	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
+		ereport(ERROR,
+				(errmsg("pagestore: control images are not mirrored on BLCKSZ (%d) < %d builds",
+						BLCKSZ, PG_CONTROL_FILE_SIZE)));
 
 	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
 										(uint64) lsn, page, &resolved))
