@@ -1776,7 +1776,14 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_IMMEDSYNC:
-			ps_storage->sync();
+			/*
+			 * Surface the failure: callers (the pg_control mirror) pop their
+			 * retry queues only after a successful sync, and an ignored
+			 * ENOSPC/EIO here would let them treat pwrite-only images as
+			 * durable.
+			 */
+			if (ps_storage->sync() != 0)
+				ch->status = PS_STATUS_ERROR;
 			break;
 
 		default:
