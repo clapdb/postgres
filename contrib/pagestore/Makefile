@@ -5,7 +5,8 @@ OBJS = \
 	$(WIN32RES) \
 	backend_localsvc.o \
 	backend_passthrough.o \
-	pagestore.o
+	pagestore.o \
+	walredo_client.o
 PGFILEDESC = "pagestore - pluggable storage backend smgr shim"
 
 # NB: the standalone pagestore_daemon executable is built via meson

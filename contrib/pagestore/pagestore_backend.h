@@ -29,6 +29,8 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 
+#include "pagestore_ipc.h"		/* PsWalRec */
+
 /*
  * Version-neutral physical identity of a relation fork.  Deliberately built
  * from plain OIDs / numbers rather than RelFileLocator so the on-the-wire
@@ -143,8 +145,17 @@ extern const PageStoreBackend PageStoreBackendLocalSvc;
 extern void pagestore_localsvc_init(void);
 extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
+extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
+										   uint64 branch_lsn);
+extern void pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
+											 uint64 branch_lsn);
+extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
+													 uint32 parent_tl,
+													 uint64 branch_lsn,
+													 int timeout_ms);
 extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 											 uint64 branch_lsn);
+extern void pagestore_localsvc_detach(void);
 extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
 extern void pagestore_localsvc_walidx_add(const PageStoreRelKey *key,
@@ -153,6 +164,17 @@ extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn_max,
-										  uint64 *out, int maxn);
+										  PsWalRec *out, int maxn);
+extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
+										uint32 len, void *out);
+extern uint32 pagestore_localsvc_timeline(void);
+extern void pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
+										 BlockNumber block, const void *page,
+										 uint64 version);
+extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
+										BlockNumber block, void *page);
+extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
+										   BlockNumber block, uint64 version,
+										   void *page, uint64 *resolved);
 
 #endif							/* PAGESTORE_BACKEND_H */

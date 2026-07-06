@@ -112,6 +112,7 @@ put_create(uint32_t spc, uint32_t db, uint32_t rel, int32_t fork)
 	ch->key.dbOid = db;
 	ch->key.relNumber = rel;
 	ch->key.forkNum = fork;
+	ch->key.klass = PS_KLASS_RELATION;
 	ch->opcode = PS_OP_CREATE;
 	cl_exec(ch);
 }
@@ -127,6 +128,7 @@ put_block(uint32_t spc, uint32_t db, uint32_t rel, int32_t fork,
 	ch->key.dbOid = db;
 	ch->key.relNumber = rel;
 	ch->key.forkNum = fork;
+	ch->key.klass = PS_KLASS_RELATION;
 	ch->opcode = PS_OP_WRITEV;
 	ch->blocknum = block;
 	ch->nblocks = 1;

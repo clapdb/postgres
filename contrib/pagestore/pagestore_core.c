@@ -27,25 +27,432 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_core.h"
 #include "pagestore_layer_store.h"
 #include "pagestore_manifest.h"
+#include "pagestore_memtable.h"
+#include "pagestore_pgcache.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
+int			flush_pages = 256;	/* memtable flush threshold (pages) */
+int			compact_layers = 8;	/* compact a timeline past this many image layers */
+int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
+/*
+ * Use the LSM read path: rebuild the index from image layers on restart and
+ * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
+ * the SPDK daemon leaves it off for now because its async read path serves pages
+ * by segment offset (async layer reads are a later step), so it must keep the
+ * segment-scan recovery that gives versions real segment locations.
+ */
+int			use_layers = 1;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
 
+/* configured logical shards for this daemon (set by frontend main before open()) */
+uint32_t	ps_nshards = 1;
+
+/*
+ * Per-shard state (step 4 target in practice): one thread per shard owns index
+ * / staging / cache lock-free; the shard is chosen from the logical key only
+ * (block- and timeline-independent), so a key's blocks and all its timelines
+ * stay on one shard.
+ */
+#define IDX_BUCKETS		(1 << 16)
+#define IDX_MASK		(IDX_BUCKETS - 1)
+
+struct PageEnt;
+struct ForkEnt;
+struct WalIdxEnt;
+
+#define MAX_SHARDS		PS_MAX_CHANNELS
+#define LAYER_ID_SHARD_BITS	16
+#define LAYER_ID_LOCAL_BITS	(64 - LAYER_ID_SHARD_BITS)
+#define LAYER_ID_SHARD_MASK	((uint64_t) (((uint64_t) 1 << LAYER_ID_SHARD_BITS) - 1) << LAYER_ID_LOCAL_BITS)
+#define LAYER_ID_LOCAL_MASK	((uint64_t) ((1ULL << LAYER_ID_LOCAL_BITS) - 1))
+
+typedef struct Shard
+{
+	struct PageEnt *page_idx[IDX_BUCKETS];	/* (timeline,key,block) -> versions */
+	struct ForkEnt *fork_idx[IDX_BUCKETS];	/* (timeline,key) -> fork size */
+	struct WalIdxEnt *walidx[IDX_BUCKETS];	/* (timeline,key,block) -> WAL lsns */
+	PsMemtable *memtable;		/* staging -> image layers */
+	uint32_t	id;					/* shard id [0..ps_nshards) this state belongs to */
+	int			cur_seg;			/* segment id for append cursor */
+	uint64_t	cur_off;			/* append cursor byte offset within cur_seg */
+	uint64_t	next_layer_id;		/* next layer-local id for this shard */
+	uint64_t	rr_mem,			/* read-source counters */
+				rr_layer,
+				rr_seg;
+} Shard;
+
+static Shard g_shards[MAX_SHARDS];
+
+/*
+ * Concurrency.  A per-shard rwlock guards each shard's in-memory state
+ * (g_shards[i]: the page/fork/walidx indexes, memtable, append cursor and
+ * layer-id cursor).  A single map_lock guards the cross-shard state: the global
+ * ps_layer_map and the timelines[] array.  Lock order is always shard (outer)
+ * then map (inner), never the reverse, so there is no deadlock.
+ *
+ * Each daemon worker owns exactly one shard and only ever touches its own
+ * g_shards[]; the sole cross-worker accessor of another shard is maintenance
+ * (worker 0), which takes the target shard's lock plus map_lock before
+ * compacting it.  Reads take shard-rd + map-rd; ordinary writes take only
+ * shard-wr, escalating to a brief map-wr inside append_page when a flush or
+ * inline compaction mutates the map; branch creation takes map-wr alone.
+ */
+static pthread_rwlock_t shard_locks[MAX_SHARDS];
+static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+void
+ps_lock_shard_rd(uint32_t shard)
+{
+	pthread_rwlock_rdlock(&shard_locks[shard]);
+}
+
+void
+ps_lock_shard_wr(uint32_t shard)
+{
+	pthread_rwlock_wrlock(&shard_locks[shard]);
+}
+
+void
+ps_unlock_shard(uint32_t shard)
+{
+	pthread_rwlock_unlock(&shard_locks[shard]);
+}
+
+void
+ps_lock_map_rd(void)
+{
+	pthread_rwlock_rdlock(&map_lock);
+}
+
+void
+ps_lock_map_wr(void)
+{
+	pthread_rwlock_wrlock(&map_lock);
+}
+
+void
+ps_unlock_map(void)
+{
+	pthread_rwlock_unlock(&map_lock);
+}
+
+static uint32_t
+core_shards(void)
+{
+	if (ps_nshards == 0)
+		return 1;
+	return ps_nshards > PS_MAX_CHANNELS ? PS_MAX_CHANNELS : ps_nshards;
+}
+
+static uint32_t
+layer_shard_from_id(uint64_t layer_id)
+{
+	return (uint32_t) ((layer_id & LAYER_ID_SHARD_MASK) >>
+					   LAYER_ID_LOCAL_BITS);
+}
+
+static uint64_t
+layer_local_id(uint64_t layer_id)
+{
+	return layer_id & LAYER_ID_LOCAL_MASK;
+}
+
+static uint64_t
+layer_id(uint32_t shard, uint64_t local_id)
+{
+	return ((uint64_t) shard << LAYER_ID_LOCAL_BITS) | (local_id & LAYER_ID_LOCAL_MASK);
+}
+
+static Shard *
+shard_for(const PsKey *key)
+{
+	uint32_t ns = core_shards();
+
+	if (ns == 1 || !key)
+		return &g_shards[0];
+	return &g_shards[ps_key_shard(key, ns)];
+}
+
+/*
+ * Shard index that will actually be touched for 'key' (klass-aware), so the
+ * frontend can take the matching per-shard lock from the FINAL request key
+ * rather than trusting a client-supplied channel shard.
+ */
+uint32_t
+ps_shard_of(const PsKey *key)
+{
+	uint32_t	ns = core_shards();
+
+	if (ns == 1 || !key)
+		return 0;
+	return ps_key_shard(key, ns);
+}
+
+uint32_t
+ps_core_layer_count(void)
+{
+	return ps_layer_map.nlayers;
+}
+
+/* read-path source counters (memtable / image layer / segment fallback),
+ * summed across shards */
+void
+ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg)
+{
+	uint64_t	m = 0,
+				l = 0,
+				s = 0;
+	uint32_t	ns = core_shards();
+
+	for (uint32_t i = 0; i < ns; i++)
+	{
+		m += __atomic_load_n(&g_shards[i].rr_mem, __ATOMIC_RELAXED);
+		l += __atomic_load_n(&g_shards[i].rr_layer, __ATOMIC_RELAXED);
+		s += __atomic_load_n(&g_shards[i].rr_seg, __ATOMIC_RELAXED);
+	}
+	if (mem)
+		*mem = m;
+	if (layer)
+		*layer = l;
+	if (seg)
+		*seg = s;
+}
+
+static uint64_t
+alloc_layer_id(void *ctx)
+{
+	Shard *s = (Shard *) ctx;
+
+	if (!s)
+		s = &g_shards[0];
+	return layer_id(s->id, s->next_layer_id++);
+}
+
+static int
+record_layer(void *ctx, const PsLayerDesc *desc)
+{
+	(void) ctx;
+	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
+	 * map (idempotently); do not add to the map a second time. */
+	return ps_manifest_add_layer(desc);
+}
+
+/* ===================== compaction & GC (LSM phase 3) =================== */
+
+static uint32_t
+count_image_layers(uint32_t timeline, uint32_t shard)
+{
+	uint32_t	c = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting && d->timeline == timeline &&
+			layer_shard_from_id(d->layer_id) == shard)
+			c++;
+	}
+	return c;
+}
+
+/*
+ * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
+ * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
+ * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
+ */
+static void
+gc_resume(void)
+{
+	PsLayerDesc *dead;
+	uint32_t	m = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].deleting)
+			m++;
+	if (m == 0)
+		return;
+	dead = malloc((size_t) m * sizeof(PsLayerDesc));
+	if (!dead)
+		return;
+	m = 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].deleting)
+			dead[m++] = ps_layer_map.layers[i];
+	for (uint32_t k = 0; k < m; k++)
+	{
+		/*
+		 * Drop the manifest entry only after the file is gone (a missing file
+		 * is ENOENT == success in delete_local_layer, so this is idempotent and
+		 * a partially-deleted layer still completes).  A real unlink error keeps
+		 * the layer "deleting" so the next start retries it.  A REMOVE_LAYER
+		 * write error may have torn the manifest tail; stop so that record stays
+		 * the recoverable tail instead of becoming interior corruption, and the
+		 * next start retries from the last valid manifest state.
+	 */
+		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
+			continue;
+		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
+			break;
+	}
+	free(dead);
+}
+
+/*
+ * Merge all of a timeline's image layers into one fresh layer (bounding the
+ * layer count and the per-read layer scan), then GC the merged-away layers.
+ * Install-new-before-delete-old: the new layer is written and recorded durably
+ * before any old layer is marked for deletion, so a crash at any point leaves
+ * the data readable and GC resumable.  Keeps every version (dedup-free: each
+ * version lives in exactly one source layer); version-level GC by retained-LSN
+ * horizon is a later step.
+ */
+static int
+compact_timeline(uint32_t timeline, uint32_t shard)
+{
+	PsLayerDesc *old;
+	uint32_t	nold = count_image_layers(timeline, shard);
+	PsImgRec   *recs = NULL;
+	unsigned char **pages = NULL;
+	uint32_t	nrec = 0,
+				cap = 0;
+	uint64_t	nid;
+	PsLayerDesc newdesc;
+	int			rc = -1;
+
+	if (nold < 2)
+		return 0;				/* nothing worth merging */
+
+	/*
+	 * Never compact a poisoned manifest: the new layer could not be recorded, so
+	 * we would just write an unreferenced file and the old layers would stay live
+	 * -- maintenance would keep retrying and leaking files.  Bail (the daemon is
+	 * already rejecting writes; a restart recovers the manifest).
+	 */
+	if (ps_manifest_poisoned())
+		return -1;
+
+	old = malloc((size_t) nold * sizeof(PsLayerDesc));
+	if (!old)
+		return -1;
+	nold = 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			d->timeline == timeline &&
+			layer_shard_from_id(d->layer_id) == shard)
+			old[nold++] = *d;
+	}
+
+	/* gather every version (page bytes) from the old layers */
+	for (uint32_t k = 0; k < nold; k++)
+	{
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+
+		if (ps_image_layer_read_index(&old[k], &idx, &n) != 0)
+			goto cleanup;
+		for (uint32_t j = 0; j < n; j++)
+		{
+			unsigned char *pg;
+
+			if (nrec == cap)
+			{
+				uint32_t	nc = cap ? cap * 2 : 256;
+				PsImgRec   *nr = realloc(recs, (size_t) nc * sizeof(PsImgRec));
+				unsigned char **np = realloc(pages, (size_t) nc * sizeof(*pages));
+
+				if (!nr || !np)
+				{
+					free(nr ? nr : recs);
+					free(np ? np : pages);
+					recs = NULL;
+					pages = NULL;
+					free(idx);
+					goto cleanup;
+				}
+				recs = nr;
+				pages = np;
+				cap = nc;
+			}
+			pg = malloc(page_size);
+			if (!pg || ps_layer_store->read_layer_block(&old[k], idx[j].data_off,
+														pg, page_size) != 0)
+			{
+				free(pg);
+				free(idx);
+				goto cleanup;
+			}
+			recs[nrec].key = idx[j].key;
+			recs[nrec].block = idx[j].block;
+			recs[nrec].lsn = idx[j].lsn;
+			recs[nrec].page = pg;
+			pages[nrec] = pg;
+			nrec++;
+		}
+		free(idx);
+	}
+	if (nrec == 0)
+		goto cleanup;
+
+	/* install the new merged layer durably, THEN delete the old ones */
+	nid = alloc_layer_id(&g_shards[shard]);
+	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
+							 &newdesc) != 0 || record_layer(NULL, &newdesc) != 0)
+		goto cleanup;
+	for (uint32_t k = 0; k < nold; k++)
+	{
+		/*
+		 * Fail safe at every step.  Only delete the file once the layer is
+		 * durably marked deleting, and only drop it from the manifest once the
+		 * file is gone -- so a failed step leaves a readable layer (its data is
+		 * also in the new layer) that gc_resume() retries on the next start,
+		 * never a manifest entry pointing at a deleted file.
+		 *
+		 * A manifest write error may have left a torn record at the tail; STOP
+		 * before unlinking or appending anything more, so that torn record stays
+		 * the recoverable tail rather than becoming interior corruption that
+		 * fails replay (and so we never unlink a file whose later delete mark is
+		 * not durable).  A failed unlink is not a manifest error: the layer is
+		 * durably deleting, so we can move on and let gc_resume() retry it.
+		 */
+		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
+			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
+			continue;			/* still "deleting"; gc_resume() will retry */
+		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
+			goto cleanup;		/* incomplete */
+	}
+	rc = 0;
+
+cleanup:
+	for (uint32_t j = 0; j < nrec; j++)
+		free(pages[j]);
+	free(recs);
+	free(pages);
+	free(old);
+	return rc;
+}
+
 /* ===================== segment storage (log-structured) ================= */
 
-#define SEG_MAGIC	0x53454752	/* "SEGR" */
+#define SEG_MAGIC	0x53454732	/* "SEG2": segment record format v2 (PsKey gained klass) */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -69,8 +476,7 @@ typedef struct SegRecHdr
  * storage backend's business (see pagestore_storage.h).  Here we keep only the
  * append cursor (cur_seg, cur_off) marking where the next record goes.
  */
-static int	cur_seg = -1;		/* segment currently being appended (-1: none yet) */
-static uint64_t cur_off;		/* append cursor within cur_seg */
+/* append cursors are kept per-shard in g_shards[].cur_seg / cur_off */
 
 /* ===================== in-memory indexes =============================== */
 
@@ -86,8 +492,6 @@ static uint64_t cur_off;		/* append cursor within cur_seg */
  * tables are in-memory state, rebuilt from the segments by recover().
  * (Prototype: no GC/compaction, so the version chain only grows.)
  */
-#define IDX_BUCKETS		(1 << 16)
-#define IDX_MASK		(IDX_BUCKETS - 1)
 
 /* PageVer (one stored version's location) is defined in pagestore_core.h. */
 
@@ -112,9 +516,6 @@ typedef struct ForkEnt
 	uint32_t	nblocks;
 } ForkEnt;
 
-static PageEnt *page_idx[IDX_BUCKETS];
-static ForkEnt *fork_idx[IDX_BUCKETS];
-
 /*
  * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
  * parent and the LSN at which it forked; reads of pages the branch never wrote
@@ -130,6 +531,60 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+
+/*
+ * Branch-local usage marker: set once a timeline acquires any local state (a
+ * page version, fork entry, WAL-index entry, or shipped WAL).  An
+ * exact-match duplicate CREATE_BRANCH is accepted only while the timeline is
+ * still unused: that keeps a prepare retry idempotent (retries happen before
+ * a compute ever boots on the branch), while reusing the id of a live branch
+ * is refused -- read_through() resolves timeline-local versions before the
+ * parent snapshot, so a "fresh" branch recreated over a written timeline
+ * would silently serve the previous branch's pages.
+ */
+static int timeline_used[MAX_TIMELINES];
+
+static inline void
+timeline_mark_used(uint32_t timeline)
+{
+	if (timeline < MAX_TIMELINES)
+		__atomic_store_n(&timeline_used[timeline], 1, __ATOMIC_RELEASE);
+}
+
+static inline int
+timeline_is_used(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&timeline_used[timeline], __ATOMIC_ACQUIRE);
+}
+
+/* highest end LSN (start+len) of shipped WAL received per timeline */
+static uint64_t wal_end[MAX_TIMELINES];
+
+static inline uint64_t
+wal_end_read(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return __atomic_load_n(&wal_end[timeline], __ATOMIC_ACQUIRE);
+}
+
+static inline void
+wal_end_advance(uint32_t timeline, uint64_t end_lsn)
+{
+	uint64_t	old_end;
+
+	if (timeline >= MAX_TIMELINES)
+		return;
+	old_end = __atomic_load_n(&wal_end[timeline], __ATOMIC_RELAXED);
+	while (end_lsn > old_end &&
+		   !__atomic_compare_exchange_n(&wal_end[timeline], &old_end,
+										end_lsn, false,
+										__ATOMIC_RELEASE,
+										__ATOMIC_RELAXED))
+		;
+}
 
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
 
@@ -151,7 +606,8 @@ static int
 key_eq(const PsKey *a, const PsKey *b)
 {
 	return a->spcOid == b->spcOid && a->dbOid == b->dbOid &&
-		a->relNumber == b->relNumber && a->forkNum == b->forkNum;
+		a->relNumber == b->relNumber && a->forkNum == b->forkNum &&
+		a->klass == b->klass;
 }
 
 /* --- page index (keyed by timeline, key, block) --- */
@@ -166,9 +622,10 @@ static PageEnt *
 page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 {
 	uint32_t	h = page_hash(timeline, key, block);
+	Shard	   *s = shard_for(key);
 	PageEnt    *e;
 
-	for (e = page_idx[h & IDX_MASK]; e; e = e->next)
+	for (e = s->page_idx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == timeline && e->block == block && key_eq(&e->key, key))
 			return e;
 	return NULL;
@@ -183,25 +640,28 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  */
 static void
 page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t lsn, int seg, uint64_t off)
+				 uint64_t lsn, uint32_t shard, int seg, uint64_t off)
 {
 	uint32_t	h = page_hash(timeline, key, block);
+	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
 		e->timeline = timeline;
 		e->key = *key;
 		e->block = block;
-		e->next = page_idx[h & IDX_MASK];
-		page_idx[h & IDX_MASK] = e;
+		e->next = s->page_idx[h & IDX_MASK];
+		s->page_idx[h & IDX_MASK] = e;
 	}
 	if (e->nver == e->cap)		/* grow the version array geometrically */
 	{
 		e->cap = e->cap ? e->cap * 2 : 2;
 		e->vers = realloc(e->vers, (size_t) e->cap * sizeof(PageVer));
 	}
+	e->vers[e->nver].shard = shard;
 	e->vers[e->nver].lsn = lsn;
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
@@ -230,9 +690,10 @@ static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
 	ForkEnt    *e;
 
-	for (e = fork_idx[h & IDX_MASK]; e; e = e->next)
+	for (e = s->fork_idx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == timeline && key_eq(&e->key, key))
 			return e;
 	return NULL;
@@ -242,16 +703,18 @@ static ForkEnt *
 fork_get_or_create(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
+	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_find(timeline, key);
 
+	timeline_mark_used(timeline);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
 		e->timeline = timeline;
 		e->key = *key;
 		e->nblocks = 0;
-		e->next = fork_idx[h & IDX_MASK];
-		fork_idx[h & IDX_MASK] = e;
+		e->next = s->fork_idx[h & IDX_MASK];
+		s->fork_idx[h & IDX_MASK] = e;
 	}
 	return e;
 }
@@ -269,7 +732,8 @@ static void
 fork_remove(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
-	ForkEnt   **pp = &fork_idx[h & IDX_MASK];
+	Shard	   *s = shard_for(key);
+	ForkEnt   **pp = &s->fork_idx[h & IDX_MASK];
 
 	while (*pp)
 	{
@@ -305,24 +769,77 @@ timeline_has_parent(uint32_t timeline)
 }
 
 /*
+ * Ancestry iterator.  A read on a branch resolves against the branch and then
+ * each ancestor, with read_lsn frozen at each branch point so the branch sees a
+ * snapshot of the parent as of the fork.  Several walks (read_through,
+ * read_resolve, walidx_get, the fork-size/exists walks) repeated this loop; this
+ * captures it once.  Usage:
+ *
+ *		TlWalk w = tl_walk_first(timeline, read_lsn);
+ *		do {
+ *			... use w.tl and w.lsn ...
+ *		} while (tl_walk_next(&w));
+ *
+ * Size/existence walks that don't care about LSN pass any read_lsn and ignore
+ * w.lsn; the capping is harmless to them.
+ */
+typedef struct TlWalk
+{
+	uint32_t	tl;				/* current ancestry level */
+	uint64_t	lsn;			/* read_lsn capped to this level's fork point */
+} TlWalk;
+
+static inline TlWalk
+tl_walk_first(uint32_t timeline, uint64_t read_lsn)
+{
+	TlWalk		w = {timeline, read_lsn};
+
+	return w;
+}
+
+/* Advance to the parent, capping lsn at the branch point; 0 at the root. */
+static inline int
+tl_walk_next(TlWalk *w)
+{
+	if (!timeline_has_parent(w->tl))
+		return 0;
+	if (timelines[w->tl].branch_lsn < w->lsn)
+		w->lsn = timelines[w->tl].branch_lsn;
+	w->tl = (uint32_t) timelines[w->tl].parent;
+	return 1;
+}
+
+/*
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
  * formed, so a bad CREATE_BRANCH must be rejected rather than persisted.  Refuse:
- *	- a new id that is out of range, the root (0), or already defined (otherwise
- *	  re-creating an id silently rewrites an existing branch's ancestry);
+ *	- a new id that is out of range, or an already-defined id with mismatched
+ *	  ancestry metadata (an exact match is an idempotent retry, but only while
+ *	  the timeline is still unused -- see timeline_used[]);
  *	- a parent that is out of range or not yet defined (the requested parent must
  *	  actually exist, else the branch silently inherits from nothing);
  *	- a parent whose ancestry already reaches the new id, which would turn the
  *	  parent walk into an infinite loop (e.g. new == parent, or A->B->A).
- * Returns 1 if (new_tl, parent) is safe to define.
+ * Returns 1 if (new_tl, parent, branch_lsn) can be used for CREATE_BRANCH.
  */
 static int
-branch_request_ok(uint32_t new_tl, int parent)
+branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 {
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || timelines[new_tl].defined)
+	/*
+	 * Exact matches to an existing definition are idempotent retries -- but
+	 * only while the timeline has no branch-local state yet.  Once it has
+	 * pages, forks or shipped WAL, the duplicate is timeline-id reuse, not a
+	 * retry, and accepting it would hand the caller the old branch's data.
+	 */
+	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
+		return timelines[new_tl].parent == parent &&
+			timelines[new_tl].branch_lsn == branch_lsn &&
+			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
+
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
+		parent >= MAX_TIMELINES || !timelines[parent].defined)
 		return 0;
-	if (parent < 0 || parent >= MAX_TIMELINES || !timelines[parent].defined)
-		return 0;
+
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
 	{
 		if ((uint32_t) t == new_tl)
@@ -331,6 +848,15 @@ branch_request_ok(uint32_t new_tl, int parent)
 			return 0;			/* broken chain: refuse rather than risk a loop */
 	}
 	return 1;
+}
+
+static int
+branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
+{
+	return tl < MAX_TIMELINES &&
+		timelines[tl].defined &&
+		timelines[tl].parent == parent &&
+		timelines[tl].branch_lsn == branch_lsn;
 }
 
 /*
@@ -344,19 +870,17 @@ PageVer *
 read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn)
 {
-	for (;;)
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
+
+	do
 	{
-		PageEnt    *e = page_find(timeline, key, block);
-		PageVer    *v = e ? page_visible(e, read_lsn) : NULL;
+		PageEnt    *e = page_find(w.tl, key, block);
+		PageVer    *v = e ? page_visible(e, w.lsn) : NULL;
 
 		if (v)
 			return v;
-		if (!timeline_has_parent(timeline))
-			return NULL;
-		if (timelines[timeline].branch_lsn < read_lsn)
-			read_lsn = timelines[timeline].branch_lsn;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return NULL;
 }
 
 /*
@@ -375,31 +899,30 @@ static uint32_t
 fork_nblocks_through(uint32_t timeline, const PsKey *key)
 {
 	uint32_t	maxnb = 0;
+	TlWalk		w = tl_walk_first(timeline, 0);	/* size walk: lsn unused */
 
-	for (;;)
+	do
 	{
-		ForkEnt    *e = fork_find(timeline, key);
+		ForkEnt    *e = fork_find(w.tl, key);
 
 		if (e && e->nblocks > maxnb)
 			maxnb = e->nblocks;
-		if (!timeline_has_parent(timeline))
-			return maxnb;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return maxnb;
 }
 
 /* Does the fork exist on 'timeline' or any ancestor? */
 static int
 fork_exists_through(uint32_t timeline, const PsKey *key)
 {
-	for (;;)
+	TlWalk		w = tl_walk_first(timeline, 0);	/* existence walk: lsn unused */
+
+	do
 	{
-		if (fork_find(timeline, key))
+		if (fork_find(w.tl, key))
 			return 1;
-		if (!timeline_has_parent(timeline))
-			return 0;
-		timeline = (uint32_t) timelines[timeline].parent;
-	}
+	} while (tl_walk_next(&w));
+	return 0;
 }
 
 /*
@@ -414,12 +937,12 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
-static void
+static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
-	ps_storage->meta_append(&rec, sizeof(rec));		/* best-effort */
+	return ps_storage->meta_append(&rec, sizeof(rec));
 }
 
 static void
@@ -438,7 +961,7 @@ load_timelines(void)
 	 */
 	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		if (branch_request_ok(rec.id, rec.parent))
+		if (branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		else
 			fprintf(stderr, "pagestore: skipping invalid timeline record "
@@ -465,9 +988,6 @@ typedef struct WalRecHdr
 	uint64_t	start_lsn;		/* LSN of the first byte */
 } WalRecHdr;
 
-/* highest end LSN (start+len) received per timeline */
-static uint64_t wal_end[MAX_TIMELINES];
-
 static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
@@ -477,14 +997,14 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	if (tl >= MAX_TIMELINES)
 		return -1;
 
+	timeline_mark_used(tl);
 	h.magic = WAL_MAGIC;
 	h.len = len;
 	h.start_lsn = start_lsn;
 	if (ps_storage->wal_append(tl, &h, sizeof(h), data, len) != 0)
 		return -1;
 
-	if (start_lsn + len > wal_end[tl])
-		wal_end[tl] = start_lsn + len;
+	wal_end_advance(tl, start_lsn + len);
 	return 0;
 }
 
@@ -541,8 +1061,11 @@ wal_recover_one(uint32_t tl)
 	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
-		if (h.start_lsn + h.len > wal_end[tl])
-			wal_end[tl] = h.start_lsn + h.len;
+		if (h.start_lsn + h.len > wal_end_read(tl))
+		{
+			timeline_mark_used(tl);
+			wal_end_advance(tl, h.start_lsn + h.len);
+		}
 		off += sizeof(h) + h.len;
 	}
 }
@@ -569,15 +1092,16 @@ typedef struct WalIdxEnt
 	int			cap;
 } WalIdxEnt;
 
-static WalIdxEnt *walidx[IDX_BUCKETS];
-
 static void
 walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
 	uint32_t	h = page_hash(tl, key, block);
+	Shard	   *s = shard_for(key);
 	WalIdxEnt  *e;
 
-	for (e = walidx[h & IDX_MASK]; e; e = e->next)
+	timeline_mark_used(tl);
+
+	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
 			break;
 	if (!e)
@@ -586,8 +1110,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 		e->timeline = tl;
 		e->key = *key;
 		e->block = block;
-		e->next = walidx[h & IDX_MASK];
-		walidx[h & IDX_MASK] = e;
+		e->next = s->walidx[h & IDX_MASK];
+		s->walidx[h & IDX_MASK] = e;
 	}
 	if (e->n == e->cap)
 	{
@@ -614,30 +1138,45 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
  * max_out); return how many.  Walks the timeline ancestry. */
 static int
-walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
-		   uint64_t *out, int max_out)
+walrec_cmp(const void *a, const void *b)
 {
-	int			got = 0;
+	uint64_t	la = ((const PsWalRec *) a)->lsn;
+	uint64_t	lb = ((const PsWalRec *) b)->lsn;
 
-	for (;;)
+	return (la > lb) - (la < lb);
+}
+
+static int
+walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
+		   PsWalRec *out, int max_out)
+{
+	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	int			got = 0;
+	TlWalk		w = tl_walk_first(tl, lsn_max);
+
+	do
 	{
-		uint32_t	h = page_hash(tl, key, block);
+		uint32_t	h = page_hash(w.tl, key, block);
 		WalIdxEnt  *e;
 
-		for (e = walidx[h & IDX_MASK]; e; e = e->next)
-			if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
+			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
+				/* tag each record with the timeline it lives on (w.tl) */
 				for (int i = 0; i < e->n && got < max_out; i++)
-					if (e->lsns[i] <= lsn_max)
-						out[got++] = e->lsns[i];
+					if (e->lsns[i] <= w.lsn)
+					{
+						out[got].lsn = e->lsns[i];
+						out[got].timeline = w.tl;
+						got++;
+					}
 				break;
 			}
-		if (!timeline_has_parent(tl))
-			break;
-		if (timelines[tl].branch_lsn < lsn_max)
-			lsn_max = timelines[tl].branch_lsn;
-		tl = (uint32_t) timelines[tl].parent;
-	}
+	} while (tl_walk_next(&w));
+
+	/* gathered newest-timeline-first across the ancestry; redo (and the base
+	 * search) need them in ascending LSN order */
+	qsort(out, (size_t) got, sizeof(PsWalRec), walrec_cmp);
 	return got;
 }
 
@@ -663,36 +1202,98 @@ page_lsn(const unsigned char *page)
  */
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page)
+			const unsigned char *page, uint64_t version)
 {
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
 	uint64_t	data_off;
+	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
-	if (cur_seg < 0 || cur_off + reclen > segment_size)
+	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
 	{
-		cur_seg = (cur_seg < 0) ? 0 : cur_seg + 1;
-		cur_off = 0;
+		s->cur_seg = (s->cur_seg < 0) ? 0 : s->cur_seg + 1;
+		s->cur_off = 0;
 	}
 
 	hdr.magic = SEG_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
-	hdr.lsn = page_lsn(page);	/* version key taken from the page itself */
+	/*
+	 * Version key.  A relation page carries a real monotonic pd_lsn.  An SLRU object
+	 * is versioned by the caller-supplied 'version' -- the dirtying/cutoff WAL LSN --
+	 * stored verbatim so it stays directly comparable to a branch's as-of cutoff
+	 * (the seed path keys a snapshot by its proven cutoff C and reads it as-of L>=C);
+	 * a daemon counter would not be comparable.  Other non-relation objects (the
+	 * control file) carry no LSN in their bytes, so versioning them from page_lsn()
+	 * could make an overwrite compare lower and silently lose (and poison the pgcache
+	 * for that pseudo-LSN); derive a monotonic latest-wins version from the chain.
+	 */
+	if (key->klass == PS_KLASS_RELATION)
+		hdr.lsn = page_lsn(page);
+	else if (key->klass == PS_KLASS_SLRU)
+		hdr.lsn = version;
+	else
+	{
+		PageVer    *cur;
+
+		/*
+		 * Deriving an object's monotonic version walks the cross-shard timeline
+		 * ancestry (read_through), which PS_OP_CREATE_BRANCH mutates under map_wr.
+		 * The caller holds only this shard's write lock, so take map_rd for the
+		 * walk -- otherwise an object write on a branch can race branch creation
+		 * and read a partially updated parent/branch_lsn chain.  Drop it before
+		 * the flush below re-takes map_wr; shard -> map order is preserved.
+		 */
+		ps_lock_map_rd();
+		cur = read_through(timeline, key, block, UINT64_MAX);
+		hdr.lsn = cur ? cur->lsn + 1 : 1;
+		ps_unlock_map();
+	}
 	hdr.len = page_size;
 
 	/* write header then page bytes contiguously at the append cursor */
-	if (ps_storage->seg_write(cur_seg, cur_off, &hdr, sizeof(hdr)) != 0)
+	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
-	data_off = cur_off + sizeof(hdr);
-	if (ps_storage->seg_write(cur_seg, data_off, page, page_size) != 0)
+	data_off = s->cur_off + sizeof(hdr);
+	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, hdr.lsn, cur_seg, data_off);
-	cur_off += reclen;
+	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
+	s->cur_off += reclen;
+
+	/*
+	 * Stage the version for the LSM memtable and flush to an image layer when full
+	 * (additive in phase 2 -- the segment write above is still authoritative).
+	 *
+	 * Skip all of this once the manifest is poisoned: record_layer() can no longer
+	 * record a layer, so staging pages we can never flush would grow the memtable
+	 * without bound (turning a metadata error into an OOM), and flushing would seal
+	 * unreferenced layer files.  The page is durable in the segment log, which
+	 * recovery scans, so the write still succeeds; reads fall back to the segment.
+	 */
+	if (s->memtable && !ps_manifest_poisoned())
+	{
+		ps_memtable_put(s->memtable, timeline, key, block, hdr.lsn, page);
+		if (ps_memtable_full(s->memtable))
+		{
+			/* A flush (and any inline compaction) mutates the cross-shard
+			 * ps_layer_map, so take map_lock here -- only on the rare flush, not
+			 * on every write.  The caller already holds this shard's write lock,
+			 * preserving the shard -> map order. */
+			ps_lock_map_wr();
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
+			/* backpressure only: normal compaction runs off the write path in
+			 * ps_core_maintenance() when the daemon is idle.  Compact inline
+			 * here only if the layer count is running away far past the
+			 * threshold (writes outpacing background compaction). */
+			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
+				compact_timeline(timeline, s->id);
+			ps_unlock_map();
+		}
+	}
 	return 0;
 }
 
@@ -700,8 +1301,127 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 int
 read_version(const PageVer *v, unsigned char *out)
 {
-	if (ps_storage->seg_read(v->seg, v->off, out, page_size) != 0)
+	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
+	if (ps_storage->seg_read(v->shard, v->seg, v->off, out, page_size) != 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * Newest image-layer version of (timeline, key, block) with lsn <= read_lsn on
+ * this exact timeline (ancestry is the caller's job).  Tries every image layer
+ * of that timeline (key-range/bloom pruning is a later optimization).
+ */
+static int
+layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
+				 uint64_t read_lsn, uint64_t *out_lsn, unsigned char *out)
+{
+	unsigned char *tmp = malloc(page_size);
+	int			found = 0;
+	uint64_t	best = 0;
+
+	if (!tmp)
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		uint64_t	l;
+
+		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
+			continue;
+		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
+								  &l) == 1 && (!found || l > best))
+		{
+			best = l;
+			memcpy(out, tmp, page_size);
+			found = 1;
+		}
+	}
+	free(tmp);
+	if (found && out_lsn)
+		*out_lsn = best;
+	return found;
+}
+
+/*
+ * Resolve a read into out (page_size bytes): walk the timeline ancestry as
+ * read_through() does, but serve the bytes from the memtable or an image layer
+ * when they hold the authoritative version, falling back to the segment.  The
+ * page index (page_visible) still selects the authoritative version at each
+ * level, so the result matches the segment-only read; layers/memtable just serve
+ * the bytes without touching the segment.  Returns 1 if a version was found and
+ * out filled, 0 if the page is unwritten (caller zero-fills).
+ */
+int
+read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
+			 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver)
+{
+	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
+
+	do
+	{
+		uint32_t	tl = w.tl;
+		uint64_t	rl = w.lsn;
+		PageEnt    *e = page_find(tl, key, block);
+		PageVer    *pv = e ? page_visible(e, rl) : NULL;
+
+		if (pv)
+		{
+			uint64_t	l;
+			int			served;
+
+			/*
+			 * The materialized-page cache and the memtable are safe read sources
+			 * only while they stay in lock-step with the segment log.  Once the
+			 * manifest is poisoned, append_page() stops staging and a later
+			 * same-pd_lsn rewrite lands in the segment only; both the cache (keyed
+			 * by (tl,key,block,lsn)) and the memtable would then return the older
+			 * bytes under the same LSN as the segment-backed pv.  When poisoned,
+			 * bypass both and read the authoritative segment.
+			 */
+			int			poisoned = ps_manifest_poisoned();
+
+			/* the resolved version (newest <= read_lsn); a caller that needs an
+			 * exact-cutoff match -- e.g. an SLRU snapshot read -- compares it. */
+			if (out_ver)
+				*out_ver = pv->lsn;
+
+			/* fast path: materialized-page cache, keyed by the resolved version */
+			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+				return 1;
+
+			if (s->memtable && !poisoned &&
+				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
+				l == pv->lsn)
+			{
+				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
+				served = 1;		/* served from the memtable */
+			}
+			else if (pv->seg < 0 &&
+					 layer_map_lookup(tl, key, block, rl, &l, out) &&
+					 l == pv->lsn)
+			{
+				/*
+				 * Serve from a layer only for a layer-origin version (no segment
+				 * copy).  A segment-backed version must come from its segment: a
+				 * layer match is keyed by LSN alone, so a same-pd_lsn rewrite in
+				 * the segment would otherwise be masked by the older layer image.
+				 */
+				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
+				served = 1;		/* served from an image layer */
+			}
+			else
+			{
+				__atomic_fetch_add(&s->rr_seg, 1, __ATOMIC_RELAXED);
+				served = (read_version(pv, out) == 0);	/* segment fallback */
+			}
+			if (served)
+				ps_pgcache_insert(tl, key, block, pv->lsn, out);
+			return served ? 1 : 0;
+		}
+	} while (tl_walk_next(&w));
 	return 0;
 }
 
@@ -717,38 +1437,84 @@ read_version(const PageVer *v, unsigned char *out)
  * effects are not reproduced on restart.  Also a partial/torn trailing record
  * is simply treated as end-of-log (the magic/len check below stops the scan).
  */
+/*
+ * Scan a shard's segment log and rebuild its version index, leaving the append
+ * cursor just past the last valid record.  The segment log is append-only and
+ * never deleted, so it is the complete, authoritative store: it holds every
+ * version (including repeated writes at the same pd_lsn, in order) and any write a
+ * layer flush did not record.  Recovery rebuilds the exact chain from it; image
+ * layers are a future fast-recovery optimization that needs a durable flush
+ * watermark before they can replace this scan.
+ */
 static void
-recover(void)
+recover(uint32_t shard)
 {
+	Shard	   *s = &g_shards[shard];
+
+	s->cur_seg = -1;
+	s->cur_off = 0;
+
 	for (int id = 0;; id++)
 	{
 		uint64_t	off = 0;
+		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
 
-		if (ps_storage->seg_size(id) < 0)
+		if (seg_bytes < 0)
 			break;				/* no more segments -> done */
 
-		/* replay records until one fails to validate (end of log) */
+		/* replay records until one fails to validate (end of log).  seg_bytes is
+		 * cached once here: the segment is not being written during recovery, and
+		 * the POSIX backend's seg_size() is a stat() we must not pay per record. */
 		for (;;)
 		{
 			SegRecHdr	hdr;
 
-			if (ps_storage->seg_read(id, off, &hdr, sizeof(hdr)) != 0 ||
-				hdr.magic != SEG_MAGIC || hdr.len != page_size)
+			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0)
+				break;			/* short read -> end of this segment's data */
+			if (hdr.magic == 0)
+				break;			/* zeroed slot -> normal end-of-log sentinel */
+			if (hdr.magic != SEG_MAGIC)
+			{
+				/*
+				 * A non-zero magic that isn't ours is a record written by an
+				 * incompatible (pre-klass) on-disk format.  Fail fast instead of
+				 * treating it as end-of-log and overwriting it -- that would
+				 * silently lose the existing store.  It must be recreated (or
+				 * migrated offline) under the new format.
+				 */
+				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
+						"record magic %#x (expected %#x) at offset %llu; this store "
+						"predates the current on-disk format and must be recreated\n",
+						shard, id, hdr.magic, SEG_MAGIC, (unsigned long long) off);
+				exit(1);
+			}
+			if (hdr.len != page_size)
+				break;			/* our magic but a torn/short tail record */
+
+			/*
+			 * append_page() writes the header and the page body in separate
+			 * writes, so after a crash a tail record can have a valid header while
+			 * the body is missing or short.  Index a record only once the segment
+			 * is large enough to hold its body; a torn body ends the log here so we
+			 * never index a version whose bytes cannot be read (which would mask a
+			 * good older version and zero-fill on read).
+			 */
+			if (seg_bytes < (int64_t) (off + sizeof(hdr) + hdr.len))
 				break;
 
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn, id,
-							 off + sizeof(hdr));
+			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
+							 shard, id, off + sizeof(hdr));
 			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
 			off += sizeof(hdr) + hdr.len;
 		}
 
 		/* this segment is the newest seen so far; append continues after it */
-		cur_seg = id;
-		cur_off = off;
+		s->cur_seg = id;
+		s->cur_off = off;
 	}
-	if (cur_seg >= 0)
-		fprintf(stderr, "pagestore_daemon: recovered through segment %d (off %llu)\n",
-				cur_seg, (unsigned long long) cur_off);
+	if (s->cur_seg >= 0)
+		fprintf(stderr, "pagestore_daemon: recovered shard %u through segment %d (off %llu)\n",
+				shard, s->cur_seg, (unsigned long long) s->cur_off);
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -798,14 +1564,45 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline))
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
 			{
-				timeline_define(ch->timeline, (int) ch->parent_timeline,
-								ch->req_lsn);
-				timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn);
+				if (timelines[ch->timeline].defined)
+					break;
+				if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn) == 0)
+					timeline_define(ch->timeline, (int) ch->parent_timeline,
+									ch->req_lsn);
+				else
+					ch->status = PS_STATUS_ERROR;
 			}
 			else
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_CHECK_BRANCH:
+			/*
+			 * Validate a branch request without mutating timeline metadata.
+			 * This keeps prepare/retry paths deterministic: invalid requests are
+			 * rejected in-place before any SLRU directory mutation.
+			 */
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn))
+			{
+				/* valid */
+			}
+			else
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_REQUIRE_BRANCH:
+			/*
+			 * Startup-time manifest validation: require the timeline to already
+			 * exist with exactly the manifest ancestry metadata.  This is stricter
+			 * than CHECK_BRANCH, which also accepts a request that would be legal
+			 * to create.
+			 */
+			if (!branch_exists_with_metadata(ch->timeline,
+											 (int) ch->parent_timeline,
+											 ch->req_lsn))
 				ch->status = PS_STATUS_ERROR;
 			break;
 
@@ -815,7 +1612,7 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_SIZE:
-			ch->req_lsn = wal_end[tl];	/* output: end LSN of this timeline's WAL */
+			ch->req_lsn = wal_end_read(tl);	/* output: end LSN of this timeline's WAL */
 			break;
 
 		case PS_OP_WAL_READ:
@@ -828,8 +1625,8 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_WAL_INDEX_GET:
 			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
-											   ch->req_lsn, (uint64_t *) ch->data,
-											   (int) (PS_IO_UNIT / sizeof(uint64_t)));
+											   ch->req_lsn, (PsWalRec *) ch->data,
+											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
 			break;
 
 		case PS_OP_IMMEDSYNC:
@@ -844,15 +1641,163 @@ ps_handle_meta(PsChannel *ch)
 
 /* ===================== lifecycle ====================================== */
 
+/* Flush the memtable and close the manifest on a clean shutdown.  (The segment
+ * log is authoritative, so a restart recovers from it regardless.) */
+void
+ps_core_close(void)
+{
+	uint32_t	ns = core_shards();
+
+	/*
+	 * Recovery rebuilds the index from the segment log, so the segments must be
+	 * durable before we rely on them: fsync them on clean shutdown (writes between
+	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
+	 * power failure after the daemon exits even though the write was acknowledged).
+	 *
+	 * Sync *before* flushing the memtable into image layers below.  Otherwise a
+	 * power loss in the shutdown window could leave a just-committed layer as the
+	 * only durable copy of pages whose segment bytes were still in the page cache,
+	 * which segment-only recovery would miss.  Syncing first makes the recovery
+	 * source durable before any layer is committed on top of it.
+	 *
+	 * If the sync fails (EIO/ENOSPC/...), the segment log -- the sole source
+	 * segment-only recovery reads -- is not durable, so the about-to-be-destroyed
+	 * memtable may be the only good copy of recent writes.  We cannot make it
+	 * durable from here, so do not proceed to a clean-looking teardown that would
+	 * mask the loss: report it and abort with a failure status before destroying
+	 * the memtables, leaving the operator a clear signal to investigate.
+	 */
+	if (ps_storage->sync && ps_storage->sync() != 0)
+	{
+		fprintf(stderr, "pagestore_daemon: FATAL: segment sync failed on shutdown "
+				"(%s); aborting before teardown -- recently acknowledged writes "
+				"may not be durable\n", strerror(errno));
+		_exit(EXIT_FAILURE);
+	}
+
+	for (uint32_t i = 0; i < ns; i++)
+	{
+		Shard	   *s = &g_shards[i];
+
+		if (s->memtable)
+		{
+			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
+			ps_memtable_destroy(s->memtable);
+			s->memtable = NULL;
+		}
+	}
+
+	ps_pgcache_free();
+	ps_manifest_close();
+}
+
+/*
+ * Off-the-write-path background maintenance: compact one timeline whose image
+ * layer count exceeds the (low-water) threshold.  The daemon calls this when it
+ * is otherwise idle; doing at most one compaction per call keeps the serve loop
+ * responsive.  Returns 1 if it compacted (the caller should not sleep), 0 if
+ * nothing was due.
+ */
+int
+ps_core_maintenance(void)
+{
+	uint32_t	ns;
+	uint32_t	ftl = 0,
+				fsh = 0;
+	int			found = 0;
+	int			did = 0;
+
+	if (!use_layers)
+		return 0;
+
+	/*
+	 * Back off all maintenance once the manifest is poisoned: compaction cannot
+	 * record its replacement layer, so compact_timeline() returns immediately and
+	 * reporting "did work" would spin the idle worker on the same timeline until
+	 * restart.  Returning 0 lets it sleep until the manifest is recovered.
+	 */
+	if (ps_manifest_poisoned())
+		return 0;
+	ns = core_shards();
+
+	/*
+	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
+	 * layers are due for compaction.  A shared lock here lets reads proceed.
+	 */
+	ps_lock_map_rd();
+	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
+		for (uint32_t sh = 0; sh < ns; sh++)
+			if ((tl == 0 || timelines[tl].defined) &&
+				count_image_layers(tl, sh) > (uint32_t) compact_layers)
+			{
+				ftl = tl;
+				fsh = sh;
+				found = 1;
+				break;
+			}
+	ps_unlock_map();
+
+	/*
+	 * Phase 2: compact the chosen shard under shard-wr + map-wr (the order other
+	 * paths use), which excludes that shard's worker and other map mutators.
+	 * Re-check under the write lock since the count may have changed.
+	 */
+	if (found)
+	{
+		ps_lock_shard_wr(fsh);
+		ps_lock_map_wr();
+		if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
+			compact_timeline(ftl, fsh);
+		ps_unlock_map();
+		ps_unlock_shard(fsh);
+		did = 1;
+	}
+
+	/*
+	 * Phase 3: rewrite the manifest log if add/seal/delete churn has grown it
+	 * well past the live layer count, bounding replay time.  Independent of layer
+	 * compaction; map-wr excludes the manifest appends a concurrent flush makes.
+	 */
+	ps_lock_map_rd();
+	found = ps_manifest_should_compact();
+	ps_unlock_map();
+	if (found)
+	{
+		int			compacted = 0;
+
+		ps_lock_map_wr();
+		if (ps_manifest_should_compact())
+			compacted = (ps_manifest_compact() == 0);
+		ps_unlock_map();
+
+		/*
+		 * Only count a *successful* rewrite as work done.  A failed compaction
+		 * leaves should_compact() true, so reporting "did work" would make the
+		 * idle worker re-run maintenance immediately and busy-loop on the failing
+		 * compaction; returning false here lets it sleep and retry on the next
+		 * tick instead.  (An I/O failure also poisons the manifest, after which
+		 * should_compact() returns false and the retries stop entirely.)
+		 */
+		if (compacted)
+			did = 1;
+	}
+
+	return did;
+}
+
 /*
  * Open the store and rebuild all in-memory state from it: define the root
- * timeline, load persisted branches, replay the segments to rebuild the page
- * and fork indexes, and recompute each timeline's shipped-WAL end LSN.  The
- * frontend must set page_size, segment_size and ps_storage beforehand.
+ * timeline, load persisted branches, rebuild the page/fork indexes from the
+ * image layers (falling back to a segment scan only for a store that has no
+ * layers yet -- e.g. a pre-LSM store being migrated), and recompute each
+ * timeline's shipped-WAL end LSN.  The frontend must set page_size,
+ * segment_size and ps_storage beforehand.
  */
 int
 ps_core_open(const char *store_dir)
 {
+	uint32_t	ns = core_shards();
+
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
 	if (ps_layer_store->open(store_dir) != 0)
@@ -861,11 +1806,59 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
+	if (use_layers)
+		gc_resume();			/* finish any GC interrupted by a crash */
 
-	/* timeline 0 is the root; load any persisted branches, then replay data */
+	/* initialize per-shard state, locks and layer-id cursors */
+	for (uint32_t i = 0; i < ns; i++)
+	{
+		g_shards[i].id = i;
+		g_shards[i].cur_seg = -1;
+		g_shards[i].cur_off = 0;
+		g_shards[i].next_layer_id = 1;
+		pthread_rwlock_init(&shard_locks[i], NULL);
+	}
+	/* layer ids continue past the highest one restored per shard */
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		uint32_t	sh = layer_shard_from_id(ps_layer_map.layers[i].layer_id);
+		uint64_t	lid = layer_local_id(ps_layer_map.layers[i].layer_id);
+
+		if (sh < ns && lid + 1 > g_shards[sh].next_layer_id)
+			g_shards[sh].next_layer_id = lid + 1;
+	}
+
+	/* the LSM write side (memtable/flush/compaction) runs only when layers are
+	 * the read path; the SPDK daemon stays on the segment path for now.  One
+	 * memtable per shard. */
+	if (use_layers)
+		for (uint32_t i = 0; i < ns; i++)
+		{
+			g_shards[i].memtable = ps_memtable_create(page_size,
+													  (uint32_t) flush_pages);
+			if (!g_shards[i].memtable)
+				return -1;
+		}
+	/* the materialized-page cache helps both read paths (read_resolve and the
+	 * SPDK async path), so it is not gated on use_layers */
+	ps_pgcache_init((uint32_t) cache_pages, page_size);
+	fprintf(stderr, "pagestore_core: %u image layer(s) in map after manifest replay\n",
+			ps_layer_map.nlayers);
+
+	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
 	load_timelines();
-	recover();
+
+	/*
+	 * Rebuild the version index from the segment log, the complete authoritative
+	 * store (never deleted).  This recovers every acknowledged write -- including
+	 * a tail the memtable flush never recorded in a layer (a crash, or a poisoned
+	 * manifest) -- and repeated same-pd_lsn writes in order, which a layer rebuild
+	 * keyed only by LSN could not.  Image layers are still loaded into the layer
+	 * map (for compaction/GC) but are not used to rebuild the read index here.
+	 */
+	for (uint32_t sh = 0; sh < ns; sh++)
+		recover(sh);
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
