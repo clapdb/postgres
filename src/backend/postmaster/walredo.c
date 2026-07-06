@@ -265,6 +265,32 @@ wr_ensure_buffers(void)
  * model (e.g. visibilitymap_pin needs a buffer its caller will ReleaseBuffer).
  * The content is irrelevant and never read back.
  */
+/*
+ * True when 'buf' is the helper's scratch buffer (redo results written there
+ * are discarded).  Lets VM side-effect paths skip only scratch-directed
+ * writes while a materialization whose TARGET is a VM page proceeds.
+ */
+bool
+WalRedoBufferIsScratch(Buffer buf)
+{
+	return BufferIsValid(buf) && buf == wr_scratch_buf;
+}
+
+/*
+ * VM buffer for heap block 'heapBlk': the TARGET buffer when this helper is
+ * materializing exactly that VM page (VM fork, matching map block), else the
+ * scratch buffer (side effect discarded).
+ */
+Buffer
+WalRedoVMBufferForHeapBlock(BlockNumber heapBlk, BlockNumber mapBlk)
+{
+	wr_ensure_buffers();
+	if (wr_have_target && wr_target_fork == VISIBILITYMAP_FORKNUM &&
+		wr_target_blk == mapBlk)
+		return wr_target_buf;
+	return wr_scratch_buf;
+}
+
 Buffer
 WalRedoScratchBuffer(void)
 {

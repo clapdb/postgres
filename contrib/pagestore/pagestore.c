@@ -775,7 +775,9 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 				rloc.spcOid != key.spcOid || fk != forknum ||
 				blk != (BlockNumber) blocknum)
 				continue;
-			if (RestoreBlockImage(reader, b, page))
+			/* a record ending after lsn is not in the as-of stream */
+			if (reader->EndRecPtr <= (XLogRecPtr) lsn &&
+				RestoreBlockImage(reader, b, page))
 			{
 				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
 				SET_VARSIZE(result, BLCKSZ + VARHDRSZ);
@@ -998,7 +1000,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 			if (!RelFileLocatorEquals(brloc, rloc) || fk != forknum ||
 				blk != (BlockNumber) blocknum)
 				continue;
-			if (RestoreBlockImage(reader, b, base))
+			/* a record ending after the as-of point is not in the as-of
+			 * stream; its image must not become the base either */
+			if (reader->EndRecPtr <= (XLogRecPtr) lsn &&
+				RestoreBlockImage(reader, b, base))
 			{
 				base_idx = i;
 				base_end_lsn = reader->EndRecPtr;
@@ -1097,6 +1102,17 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		reader->readLen = 0;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
+		if (rec != NULL && reader->EndRecPtr > (XLogRecPtr) lsn)
+		{
+			/*
+			 * The walidx keys records by their START LSN, so an as-of point
+			 * falling inside a record still lists it -- but a record whose
+			 * END is past the as-of point is not part of the WAL stream "as
+			 * of lsn" and must not be applied.  Later records start even
+			 * later, so stop replaying here.
+			 */
+			break;
+		}
 		if (rec == NULL)
 		{
 			walredo_stop(p);
