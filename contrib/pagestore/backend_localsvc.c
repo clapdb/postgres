@@ -221,7 +221,16 @@ ls_claim_channel(uint32_t shard)
 
 		if (ps_cas(&ch->claimed, LS_CLAIMED_ABANDONED, LS_CLAIMED_OWNED))
 		{
-			if (ps_load_acquire(&ch->state) == PS_STATE_DONE)
+			uint32_t	st = ps_load_acquire(&ch->state);
+
+			/*
+			 * DONE: the daemon finished the abandoned op.  IDLE: the
+			 * abandoning owner was cancelled before ever publishing a
+			 * request (e.g. the restore tool's signal path), so the daemon
+			 * never saw one.  Both mean the daemon will not touch the
+			 * mailbox until the next REQUEST -- safe to reuse.
+			 */
+			if (st == PS_STATE_DONE || st == PS_STATE_IDLE)
 			{
 				ch->shard = target;
 				ls_channel = (int) i;
