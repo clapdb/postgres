@@ -752,6 +752,20 @@ assert "$prepMxOff" "$mxRP" "branch prepare multixact offsets page == reconstruc
 assert "$prepMxMem" "$mbRecon" "branch prepare multixact members page == reconstructed as-of-L page"
 rm -rf "$PREPSEED"
 
+# --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
+# Every UpdateControlFile() queues the just-written image (versioned by the LSN
+# of the update that caused it) and ships it at the next post-critical point,
+# so a branch cut at L can restore pg_control as of L.
+$P -c "CREATE FUNCTION pagestore_control_image_asof(pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_control_image_asof' LANGUAGE C STRICT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_control_image_asof(pg_current_wal_lsn()) IS NOT NULL;")" "t" \
+	"store holds a mirrored pg_control image as of now"
+assert "$($P -c "SELECT octet_length(pagestore_control_image_asof(pg_current_wal_lsn()));")" "8192" \
+	"mirrored control image is exactly PG_CONTROL_FILE_SIZE bytes"
+assert "$($P -c "SELECT pagestore_control_image_asof('0/1'::pg_lsn) IS NULL;")" "t" \
+	"no mirrored control image below the first update LSN (as-of read is capped)"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
