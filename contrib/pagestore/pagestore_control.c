@@ -49,6 +49,7 @@
 #include "utils/memutils.h"
 #include "pagestore_backend.h"
 #include "utils/pg_lsn.h"
+#include "utils/timestamp.h"
 #include "varatt.h"
 
 /*
@@ -68,6 +69,15 @@
 /* bounded wait per mailbox op while shipping; a wedged daemon must not hang
  * the checkpointer/startup at a post-critical ship point */
 #define PS_CONTROL_SHIP_TIMEOUT_MS	10000
+
+/*
+ * Wall-clock budget for one drain as a whole.  Each mailbox op is bounded by
+ * the ship timeout, but a deep backlog shipped through a slow-but-responsive
+ * daemon could otherwise hold a ship point (checkpointer, startup) for
+ * queue-depth * ops * timeout.  When the budget runs out the drain syncs and
+ * pops what it shipped and leaves the rest for the next ship point.
+ */
+#define PS_CONTROL_DRAIN_BUDGET_MS	30000
 
 typedef struct PsControlPending
 {
@@ -142,15 +152,36 @@ ps_control_drain(void)
 	 */
 	PG_TRY();
 	{
-		int			nship = ps_control_queue_count;
+		int			nqueued = ps_control_queue_count;
+		int			ndone = 0;
+		TimestampTz drain_start = GetCurrentTimestamp();
 		int			i;
 
-		for (i = 0; i < nship; i++)
+		for (i = 0; i < nqueued; i++)
 		{
 			PsControlPending *p = &ps_control_queue[(ps_control_queue_head + i)
 													% PS_CONTROL_QUEUE_CAPACITY];
 			PageStoreRelKey key = {0};
 			char		page[BLCKSZ];
+			BlockNumber nb;
+
+			/*
+			 * Bound the drain as a whole, not just each mailbox op: a deep
+			 * backlog shipped through a daemon that responds just under the
+			 * per-op timeout could otherwise hold this ship point for
+			 * queue-depth * ops * timeout.  Always attempt the first image
+			 * so every drain makes progress; the rest stays queued for the
+			 * next ship point.
+			 */
+			if (i > 0 &&
+				TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
+										   PS_CONTROL_DRAIN_BUDGET_MS))
+			{
+				ereport(WARNING,
+						(errmsg("pagestore: control mirror drain ran out of time, deferring %d queued image(s) to the next ship point",
+								nqueued - i)));
+				break;
+			}
 
 			/*
 			 * An image without a valid update LSN cannot be restored "as of"
@@ -161,8 +192,27 @@ ps_control_drain(void)
 			{
 				ereport(WARNING,
 						(errmsg("pagestore: skipping pg_control mirror image with no update LSN")));
+				ndone++;
 				continue;
 			}
+
+			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
+				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
+
+			/*
+			 * The preliminary CREATE and NBLOCKS carry no image bytes, so a
+			 * timeout there cannot result in this image being applied late;
+			 * the slot stays rewritable by a later same-LSN update.  Mark
+			 * posted only right before the first WRITE puts slot-derived
+			 * bytes in flight (the daemon can complete a timed-out WRITE
+			 * late) -- from then on the slot's bytes must never change
+			 * again; see the dedup path.  The floor note below is derived
+			 * from the slot too, so it is inside the frozen window.
+			 */
+			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
+															  &key,
+															  PS_CONTROL_SHIP_TIMEOUT_MS);
+			p->posted = true;
 
 			/*
 			 * Ship the retention "floor note" first: block 1 of the control
@@ -176,46 +226,46 @@ ps_control_drain(void)
 			 */
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image.checkPointCopy.redo, sizeof(XLogRecPtr));
-			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key, 1, page,
-												 (uint64) p->update_lsn,
-												 PS_CONTROL_SHIP_TIMEOUT_MS);
+			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
+													  1, page,
+													  (uint64) p->update_lsn,
+													  nb,
+													  PS_CONTROL_SHIP_TIMEOUT_MS);
 
 			/*
 			 * The object image is the on-disk pg_control representation:
 			 * the ControlFileData bytes (CRC already computed by
 			 * update_controlfile) zero-padded -- to PG_CONTROL_FILE_SIZE on
 			 * disk, to BLCKSZ here.  The restore tool writes back exactly
-			 * the first PG_CONTROL_FILE_SIZE bytes.
+			 * the first PG_CONTROL_FILE_SIZE bytes.  Re-fetch the block
+			 * count: the note write above may have extended the object.
 			 */
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image, sizeof(ControlFileData));
 
-			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
-				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
-
-			/*
-			 * Mark BEFORE posting: once a write for this LSN may be in
-			 * flight (even a timed-out one the daemon can complete late),
-			 * the slot's bytes must never change again -- see the dedup
-			 * path.
-			 */
-			p->posted = true;
-			pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key, 0, page,
-												 (uint64) p->update_lsn,
-												 PS_CONTROL_SHIP_TIMEOUT_MS);
+			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
+															  &key,
+															  PS_CONTROL_SHIP_TIMEOUT_MS);
+			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
+													  0, page,
+													  (uint64) p->update_lsn,
+													  nb,
+													  PS_CONTROL_SHIP_TIMEOUT_MS);
 			shipped = true;
+			ndone++;
 		}
 
 		/*
 		 * Durability contract: the mirrored images only count once the
-		 * daemon has synced them; pop only after that succeeded.
+		 * daemon has synced them; pop only after that succeeded, and only
+		 * the entries this drain actually processed.
 		 */
 		if (shipped)
 			pagestore_localsvc_store_sync_timeout(PS_CONTROL_SHIP_TIMEOUT_MS);
 
-		ps_control_queue_head = (ps_control_queue_head + nship)
+		ps_control_queue_head = (ps_control_queue_head + ndone)
 			% PS_CONTROL_QUEUE_CAPACITY;
-		ps_control_queue_count -= nship;
+		ps_control_queue_count -= ndone;
 	}
 	PG_CATCH();
 	{
