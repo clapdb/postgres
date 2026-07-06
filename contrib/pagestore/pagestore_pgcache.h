@@ -34,6 +34,8 @@ extern int	ps_pgcache_lookup(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t version_lsn, void *out);
 
 /* Insert/refresh (timeline, key, block, version_lsn) -> page. */
+extern void ps_pgcache_invalidate(uint32_t timeline, const PsKey *key,
+								  uint32_t block, uint64_t version_lsn);
 extern void ps_pgcache_insert(uint32_t timeline, const PsKey *key,
 							  uint32_t block, uint64_t version_lsn,
 							  const void *page);
