@@ -804,8 +804,28 @@ pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
 									 BlockNumber block, const void *page,
 									 uint64 version, int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
+
+	nb = pagestore_localsvc_obj_write_prepare_timeout(klass, key, timeout_ms);
+	pagestore_localsvc_obj_write_post_timeout(klass, key, block, page,
+											  version, nb, timeout_ms);
+}
+
+/*
+ * Split-phase variant of obj_write for callers that must know exactly when
+ * their bytes can be in flight to the daemon: the preliminary CREATE and
+ * NBLOCKS carry no caller data, so a timeout there cannot result in the
+ * image being applied late.  Only the WRITEV/EXTEND issued by _post puts
+ * the page bytes in flight.  The control mirror freezes its queued image
+ * between the two phases.  Returns the object's current block count, to be
+ * passed to _post.
+ */
+BlockNumber
+pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
+											 const PageStoreRelKey *key,
+											 int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ls_fill_key(ch, key);
@@ -818,7 +838,17 @@ pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_NBLOCKS;
 	ls_exec_timeout(ch, timeout_ms);
-	nb = (BlockNumber) ch->result;
+	return (BlockNumber) ch->result;
+}
+
+void
+pagestore_localsvc_obj_write_post_timeout(uint32 klass,
+										  const PageStoreRelKey *key,
+										  BlockNumber block, const void *page,
+										  uint64 version, BlockNumber nb,
+										  int timeout_ms)
+{
+	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;

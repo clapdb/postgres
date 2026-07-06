@@ -7659,6 +7659,14 @@ CreateCheckPoint(int flags)
 			END_CRIT_SECTION();
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
+
+			/*
+			 * A skipped checkpoint is still a ship point: a control image
+			 * left queued by an earlier flush-hook failure would otherwise
+			 * not be retried until WAL activity resumes, even though the
+			 * store may long since have recovered.
+			 */
+			CallControlFileFlushHook();
 			return false;
 		}
 	}
