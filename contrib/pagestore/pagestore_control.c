@@ -115,6 +115,20 @@ ps_control_drain(void)
 			continue;
 		}
 
+		/*
+		 * Ship the retention "floor note" first: block 1 of the control
+		 * object carries this image's checkpoint redo pointer at the same
+		 * version LSN.  The daemon derives its durable WAL retention floor
+		 * from these notes (wal_retain_floor); writing the note before the
+		 * image keeps the invariant conservative -- every restorable image
+		 * has a note, and a crash between the two leaves only a note, which
+		 * merely retains WAL a little longer.
+		 */
+		memset(page, 0, sizeof(page));
+		memcpy(page, &p->image.checkPointCopy.redo, sizeof(XLogRecPtr));
+		pagestore_localsvc_obj_write(PS_KLASS_CONTROL, &key, 1, page,
+									 (uint64) p->update_lsn);
+
 		memset(page, 0, sizeof(page));
 		memcpy(page, &p->image, sizeof(ControlFileData));
 
@@ -225,6 +239,30 @@ pagestore_control_mirror_init(bool localsvc_active)
  * given LSN (the newest image whose update LSN is <= lsn) on this compute's
  * timeline.  Returns NULL if no image at/below that LSN exists.
  */
+/*
+ * pagestore_wal_retain_floor() returns pg_lsn
+ *
+ * The store's durable WAL retention floor for this compute's timeline
+ * ancestry: shipped WAL at/above it must be kept for the mirrored pg_control
+ * images to stay restorable.  NULL if no control image constrains WAL yet.
+ */
+PG_FUNCTION_INFO_V1(pagestore_wal_retain_floor);
+Datum
+pagestore_wal_retain_floor(PG_FUNCTION_ARGS)
+{
+	uint64		floor;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to read the WAL retention floor")));
+
+	floor = pagestore_localsvc_wal_retain_floor();
+	if (floor == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_LSN((XLogRecPtr) floor);
+}
+
 PG_FUNCTION_INFO_V1(pagestore_control_image_asof);
 Datum
 pagestore_control_image_asof(PG_FUNCTION_ARGS)

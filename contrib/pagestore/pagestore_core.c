@@ -1428,6 +1428,63 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	return 0;
 }
 
+/*
+ * Durable WAL retention floor for a timeline (PGCONTROL_ON_STORE_DESIGN.md).
+ *
+ * Every mirrored pg_control image is preceded by an 8-byte "floor note" --
+ * the image's checkpoint redo pointer -- written as block 1 of the control
+ * object at the same version LSN.  A control image is only restorable if the
+ * WAL from its redo pointer onward still exists, so the retention floor for a
+ * timeline is the minimum redo over every control image restorable on its
+ * ancestry: all block-1 note versions, capped per ancestry level at the
+ * branch point exactly as an as-of restore would be.  The notes live in the
+ * ordinary segment log, so the floor survives a daemon restart via normal
+ * recovery -- it is the durable authority the design requires, independent of
+ * any transient compute-side state.
+ *
+ * Returns 0 when no control image exists (nothing constrains WAL yet).  Any
+ * future shipped-WAL GC must refuse to drop WAL at or above this floor.
+ */
+uint64_t
+wal_retain_floor(uint32_t timeline)
+{
+	PsKey		key;
+	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+	uint64_t	floor = 0;
+	unsigned char *tmp = malloc(page_size);
+
+	if (!tmp)
+		return 0;
+	memset(&key, 0, sizeof(key));
+	key.klass = PS_KLASS_CONTROL;
+
+	do
+	{
+		PageEnt    *e = page_find(w.tl, &key, 1);
+
+		if (e)
+		{
+			for (int i = 0; i < e->nver; i++)
+			{
+				PageVer    *v = &e->vers[i];
+				uint64_t	redo;
+
+				/* only images restorable at this ancestry level count */
+				if (v->lsn > w.lsn)
+					continue;
+				if (read_version(v, tmp) != 0)
+					continue;
+				memcpy(&redo, tmp, sizeof(redo));
+				if (redo != 0 && (floor == 0 || redo < floor))
+					floor = redo;
+			}
+		}
+	} while (tl_walk_next(&w));
+
+	free(tmp);
+	return floor;
+}
+
 /* ===================== recovery (rebuild index from segments) ========== */
 
 /*
@@ -1630,6 +1687,12 @@ ps_handle_meta(PsChannel *ch)
 			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
 											   ch->req_lsn, (PsWalRec *) ch->data,
 											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
+			break;
+
+		case PS_OP_WAL_RETAIN_FLOOR:
+			/* durable WAL retention floor for this timeline's ancestry */
+			ch->req_lsn = wal_retain_floor(tl);
+			ch->result = (ch->req_lsn != 0);
 			break;
 
 		case PS_OP_IMMEDSYNC:

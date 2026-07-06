@@ -331,6 +331,60 @@ op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/*
+ * Control-class write at 'block' (0 = the pg_control image, 1 = the retention
+ * floor note) versioned by the caller-supplied update LSN, mirroring
+ * contrib/pagestore's control shipper.
+ */
+static void
+op_write_control(uint32_t block, const unsigned char *page, uint64_t version)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint32_t	nb;
+
+	/* same shape as the backend's obj_write: create, size, extend-or-overwrite.
+	 * The control key is ALL-zero (spc/db/rel/fork), unlike cl_setkey's 1/1. */
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_CREATE;
+	ch->is_redo = 1;
+	cl_exec();
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_NBLOCKS;
+	cl_exec();
+	nb = ch->result;
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->timeline = 0;
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = (block < nb) ? PS_OP_WRITEV : PS_OP_EXTEND;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
+/* Durable WAL retention floor for a timeline (0 = unconstrained). */
+static uint64_t
+op_wal_retain_floor(uint32_t timeline)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
+	ch->timeline = timeline;
+	ch->blocknum = 0;
+	ch->req_lsn = 0;
+	cl_exec();
+	return ch->req_lsn;
+}
+
 /* --- timeline-aware operations (for branch tests) --- */
 
 /* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
@@ -718,6 +772,25 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		check(page_has_tag(rb, page_size, 222), "slru read_at(max) = newest snapshot");
 	}
 
+	/* --- WAL retention floor from mirrored pg_control notes ------------- */
+	{
+		unsigned char *note = calloc(1, page_size);
+		uint64_t	redo1 = 5000,
+					redo2 = 9000;
+
+		check(op_wal_retain_floor(0) == 0,
+			  "wal retention floor starts unconstrained (no control image)");
+		/* two control images: an older checkpoint (redo 5000) and a newer one
+		 * (redo 9000); the floor must be the MIN over restorable images */
+		memcpy(note, &redo1, sizeof(redo1));
+		op_write_control(1, note, 6000);	/* note first, then image */
+		memcpy(note, &redo2, sizeof(redo2));
+		op_write_control(1, note, 9500);
+		check(op_wal_retain_floor(0) == 5000,
+			  "wal retention floor = min redo over all control notes");
+		free(note);
+	}
+
 	client_detach();
 
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
@@ -733,6 +806,8 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_read_at(REL_A, FORK0, 0, 7000, rb);
 	check(page_has_tag(rb, page_size, 100),
 		  "COW history survives restart (read_at old version)");
+	check(op_wal_retain_floor(0) == 5000,
+		  "wal retention floor survives daemon restart (durable via segment log)");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
