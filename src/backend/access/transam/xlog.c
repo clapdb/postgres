@@ -4634,6 +4634,9 @@ ReadControlFile(void)
 /* Hook for control-file writes (see UpdateControlFile) */
 control_file_write_hook_type control_file_write_hook = NULL;
 
+/* highest update_lsn passed to UpdateControlFile() in this process */
+static XLogRecPtr LastControlUpdateLSN = InvalidXLogRecPtr;
+
 /*
  * Ship point for control-file mirrors: called at the first point after a
  * critical section that performed control-file writes, so a mirror that
@@ -4669,6 +4672,9 @@ CallControlFileFlushHook(void)
 static void
 UpdateControlFile(XLogRecPtr update_lsn)
 {
+	if (update_lsn > LastControlUpdateLSN)
+		LastControlUpdateLSN = update_lsn;
+
 	update_controlfile(DataDir, ControlFile, true);
 
 	if (control_file_write_hook)
@@ -6204,18 +6210,18 @@ StartupXLOG(void)
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
 		 *
-		 * Version the mirrored image by a non-retroactive position: the
-		 * replay start (the end of the checkpoint record we start from, per
-		 * InitWalRecovery), never the checkpoint record's START -- a branch
-		 * cut inside the record must not see an image referencing a record
-		 * its WAL does not fully contain.  Take the max with the checkpoint
-		 * location and minRecoveryPoint for the backup-label case, where the
-		 * replay start (RedoStartLSN) precedes the checkpoint record; a
-		 * too-high version is safe (a branch merely restores an older
-		 * image), a too-low one is not.
+		 * Version the mirrored image by a non-retroactive position: the END
+		 * of the checkpoint record we start from (InitWalRecovery saved it;
+		 * the shared replay pointers are not initialized until
+		 * PerformWalRecovery, so GetCurrentReplayRecPtr() would still be
+		 * zero here).  Never the checkpoint record's START -- a branch cut
+		 * inside the record must not see an image referencing a record its
+		 * WAL does not fully contain.  Take the max with minRecoveryPoint
+		 * for the backup-label case; a too-high version is safe (a branch
+		 * merely restores an older image), a too-low one is not.
 		 */
 		{
-			XLogRecPtr	update_lsn = GetCurrentReplayRecPtr(NULL);
+			XLogRecPtr	update_lsn = GetCheckPointRecordEnd();
 
 			update_lsn = Max(update_lsn, ControlFile->checkPoint);
 			update_lsn = Max(update_lsn, ControlFile->minRecoveryPoint);
@@ -6735,13 +6741,23 @@ StartupXLOG(void)
 	 */
 	/*
 	 * The transition to DB_IN_PRODUCTION inserts no WAL record of its own,
-	 * so version its control write by the end-of-log insert position --
-	 * captured BEFORE publishing RECOVERY_STATE_DONE: once that state is
-	 * visible, XLogInsertAllowed() lets other backends reserve WAL, and a
-	 * later capture would version the image after post-promotion user WAL
-	 * (a branch cut in between would then miss the promotion image).
+	 * so version its control write by the record-end end-of-log -- captured
+	 * BEFORE publishing RECOVERY_STATE_DONE: once that state is visible,
+	 * XLogInsertAllowed() lets other backends reserve WAL, and a later
+	 * capture would version the image after post-promotion user WAL (a
+	 * branch cut in between would then miss the promotion image).  The raw
+	 * insert position is wrong in the other direction: it is the NEXT
+	 * record's start, which sits past the page header when the last record
+	 * ended exactly on a page boundary, so a branch cut at the true
+	 * end-of-log would also miss the image.  Build a record-end position
+	 * instead: every record this startup inserted after replay (end-of-
+	 * recovery, shutdown/end checkpoints, parameter changes) performed a
+	 * control write versioned by its own record end, so the max of the
+	 * replayed end, the pre-existing end of log, and the highest prior
+	 * control-update LSN is the end of the last record in the stream.
 	 */
-	promotion_lsn = GetXLogInsertRecPtr();
+	promotion_lsn = Max(EndOfLog, GetXLogReplayRecPtr(NULL));
+	promotion_lsn = Max(promotion_lsn, LastControlUpdateLSN);
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
@@ -8313,6 +8329,9 @@ CreateRestartPoint(int flags)
 			/* no record of its own: version by the replay position */
 			UpdateControlFile(GetXLogReplayRecPtr(NULL));
 			LWLockRelease(ControlFileLock);
+
+			/* ship the image queued while ControlFileLock was held */
+			CallControlFileFlushHook();
 		}
 		return false;
 	}
@@ -8424,6 +8443,9 @@ CreateRestartPoint(int flags)
 							  ControlFile->minRecoveryPoint));
 	}
 	LWLockRelease(ControlFileLock);
+
+	/* ship the image queued while ControlFileLock was held */
+	CallControlFileFlushHook();
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the
@@ -8864,6 +8886,9 @@ XLogReportParameters(void)
 		UpdateControlFile(update_lsn);
 
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 	}
 }
 
@@ -9077,6 +9102,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/*
 		 * We should've already switched to the new TLI before replaying this
 		 * record.
@@ -9284,6 +9312,9 @@ xlog_redo(XLogReaderState *record)
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
 
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
+
 		/* Check to see if any parameter change gives a problem on recovery */
 		CheckRequiredParameterValues();
 	}
@@ -9396,6 +9427,9 @@ xlog2_redo(XLogReaderState *record)
 		ControlFile->data_checksum_version = state.new_checksum_state;
 		UpdateControlFile(record->EndRecPtr);
 		LWLockRelease(ControlFileLock);
+
+		/* ship the image queued while ControlFileLock was held */
+		CallControlFileFlushHook();
 
 		/*
 		 * Block on a procsignalbarrier to await all processes having seen the

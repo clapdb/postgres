@@ -637,13 +637,20 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 void
 pagestore_localsvc_store_sync(void)
 {
+	pagestore_localsvc_store_sync_timeout(0);
+}
+
+/* Bounded-wait variant; see pagestore_localsvc_obj_write_timeout. */
+void
+pagestore_localsvc_store_sync_timeout(int timeout_ms)
+{
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_IMMEDSYNC;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 /*
@@ -774,6 +781,20 @@ void
 pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 							 BlockNumber block, const void *page, uint64 version)
 {
+	pagestore_localsvc_obj_write_timeout(klass, key, block, page, version, 0);
+}
+
+/*
+ * Like pagestore_localsvc_obj_write, but each mailbox wait is bounded by
+ * timeout_ms (0 = wait forever): callers on paths that must not hang on a
+ * wedged daemon -- the control-mirror ship points -- turn a stall into an
+ * error they can defer and retry.
+ */
+void
+pagestore_localsvc_obj_write_timeout(uint32 klass, const PageStoreRelKey *key,
+									 BlockNumber block, const void *page,
+									 uint64 version, int timeout_ms)
+{
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	BlockNumber nb;
 
@@ -782,12 +803,12 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = 1;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_NBLOCKS;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 	nb = (BlockNumber) ch->result;
 
 	ls_fill_key(ch, key);
@@ -804,7 +825,7 @@ pagestore_localsvc_obj_write(uint32 klass, const PageStoreRelKey *key,
 	 */
 	ch->req_lsn = version;
 	memcpy(ch->data, page, BLCKSZ);
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 }
 
 void
