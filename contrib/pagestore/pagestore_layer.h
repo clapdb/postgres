@@ -64,6 +64,14 @@ typedef struct PsLayerDesc
 	bool		remote_durable;
 	bool		local_pinned;
 	bool		deleting;
+
+	/*
+	 * In-memory only: whether this process has verified the layer's data
+	 * section against foot.data_crc (done lazily before the first page is
+	 * served, so a corrupt data section fails the layer instead of serving
+	 * or compacting bad bytes).  Not persisted.
+	 */
+	bool		data_verified;
 } PsLayerDesc;
 
 typedef struct PsLayerMap

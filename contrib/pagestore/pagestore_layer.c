@@ -607,6 +607,29 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	if (img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
 		goto out;				/* corrupt index */
 
+	/*
+	 * Verify the data section once (per process) before the first page is
+	 * served from this layer: the writer stored foot.data_crc, and a layer
+	 * whose data bytes rotted while footer+index stayed readable must fail
+	 * here rather than serve -- or let compaction propagate -- bad pages.
+	 */
+	if (!((PsLayerDesc *) layer)->data_verified)
+	{
+		void	   *data = malloc((size_t) foot.index_off);
+
+		if (!data)
+			goto out;
+		if (ps_layer_store->read_layer_block(layer, 0, data,
+											 (uint32_t) foot.index_off) != 0 ||
+			img_crc(data, (size_t) foot.index_off) != foot.data_crc)
+		{
+			free(data);
+			goto out;			/* corrupt data section */
+		}
+		free(data);
+		((PsLayerDesc *) layer)->data_verified = true;
+	}
+
 	/* newest version of (key, block) with lsn <= read_lsn */
 	for (uint32_t i = 0; i < foot.nrecs; i++)
 	{
