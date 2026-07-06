@@ -31,11 +31,11 @@
  * full backend context is required because running a record's rm_redo goes
  * through the normal buffer manager.
  *
- * APPLY currently decodes and validates the record (header length, rmid, CRC) but
- * does not yet mutate the held page: running the record's resource-manager redo
- * against it with the buffer manager redirected to the held/scratch buffers (and
- * VM/FSM side effects stubbed per target fork) is the next increment.  Protocol
- * I/O is raw read()/write() over static buffers.
+ * APPLY decodes and validates the record (header length, rmid, CRC), then runs
+ * its resource-manager redo against the held page with the buffer manager
+ * redirected (am_walredo) to the held/scratch buffers, so the page comes back
+ * exactly as-of the applied record.  Protocol I/O is raw read()/write() over
+ * static buffers.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

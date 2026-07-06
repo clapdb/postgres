@@ -1,10 +1,17 @@
 # SLRU on the store: lifecycle design (M4)
 
-Status: design. The PR-#49 prototype (`feat/pagestore-slru`) mirrors flushed SLRU
-page images to the store and serves them back through a read hook. Three rounds of
-review showed this model is the wrong primitive for *branch-correct* transaction
-status, so the M4 design pivots to **WAL-based as-of reconstruction** and defers
-live page mirroring. This document is the gate; implementation resumes against it.
+Status: implemented (M4).  The WAL-based as-of reconstruction this document
+specifies has landed: snapshot shipping (`pagestore_ship_slru_snapshot`), the
+as-of appliers for clog / commit-ts / multixact offsets+members, the branch
+seeders, and the prepare/install/manifest bootstrap flow
+(`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
+fail-closed branch startup validation.  Live SLRU page mirroring through the
+real SLRU code path (the PR-#49 direction, rejected as the primitive for
+branch correctness) remains deferred to the post-M4 multi-compute milestone,
+as does `pg_subtrans`/`pg_notify`/`pg_serial` coverage.  History: the PR-#49
+prototype mirrored flushed SLRU page images and served them via a read hook;
+three review rounds showed that model cannot give branch-correct status at a
+fork LSN, which is why M4 pivoted to as-of reconstruction.
 
 ## What M4 actually needs
 
