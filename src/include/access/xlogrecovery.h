@@ -211,6 +211,7 @@ extern void RemovePromoteSignalFiles(void);
 
 extern bool HotStandbyActive(void);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
+extern XLogRecPtr GetCheckPointRecordEnd(void);
 extern RecoveryPauseState GetRecoveryPauseState(void);
 extern void SetRecoveryPause(bool recoveryPause);
 extern void GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream);

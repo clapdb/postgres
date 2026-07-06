@@ -84,7 +84,13 @@ read pages at an LSN.
          buffer manager redirected (`am_walredo`); `pagestore_redo_page_asof()`
          drives it over the per-page index (base FPI + deltas), reading WAL from
          the store.  The integration test proves the materialized page contains
-         a change that the base image alone lacks.
+         a change that the base image alone lacks.  Caveats: a page with more
+         than PS_REDO_MAX_RECS (4096) indexed records at/below the target LSN
+         fails closed (the capped index result would otherwise be treated as
+         complete), and when the last write is inherited from an ancestor
+         timeline the truncate-liveness check fails closed (a truncate on the
+         reading branch after the fork is not visible to the ancestor-WAL
+         scan).
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no
