@@ -36,6 +36,7 @@
 
 static int	tests_run = 0;
 static int	tests_failed = 0;
+static uint32_t test_nshards = 1;
 
 static void check(int cond, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -75,6 +76,7 @@ static void *cl_shm;
 static int	cl_shm_fd;
 static int	cl_chan;
 static uint32_t cl_page_size;
+static uint32_t cl_nshards = 1;
 
 static void
 client_attach(const char *shm_name, uint32_t expect_page_size)
@@ -98,6 +100,7 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 	check(hdr->magic == PS_SHM_MAGIC, "shm magic");
 	check(hdr->page_size == expect_page_size,
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
+	cl_nshards = hdr->nshards ? hdr->nshards : 1;
 	cl_page_size = hdr->page_size;
 
 	cl_chan = -1;
@@ -153,6 +156,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->key.dbOid = 1;
 	ch->key.relNumber = rel;
 	ch->key.forkNum = fork;
+	ch->key.klass = PS_KLASS_RELATION;
 	ch->timeline = 0;			/* default to the main timeline */
 }
 
@@ -291,6 +295,42 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/*
+ * SLRU-class write: the version is the caller-supplied LSN (req_lsn), NOT pd_lsn or
+ * a daemon counter -- so a snapshot keyed by its proven cutoff C reads back as-of an
+ * LSN >= C.  'obj' is the SLRU object id (slru_klass_id); 'block' is the segment.
+ */
+static void
+op_write_slru(uint32_t obj, uint32_t block, const unsigned char *page,
+			  uint64_t version)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);			/* fork 0 */
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	ch->req_lsn = version;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
+/* SLRU-class as-of read (READ_AT zero-fills on no-version-<=lsn). */
+static void
+op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);			/* fork 0 */
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
 /* --- timeline-aware operations (for branch tests) --- */
 
 /* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
@@ -313,6 +353,32 @@ op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	return cl_exec()->status;
+}
+
+/* Like op_create_branch but only validates the request (no metadata mutation). */
+static int
+op_check_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_CHECK_BRANCH;
+	ch->timeline = new_tl;
+	ch->parent_timeline = parent_tl;
+	ch->req_lsn = branch_lsn;
+	return cl_exec()->status;
+}
+
+static int
+op_require_branch_status(uint32_t new_tl, uint32_t parent_tl,
+						 uint64_t branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_REQUIRE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
@@ -428,7 +494,7 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
 static int
 op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
-			  uint64_t lsn_max, uint64_t *out)
+			  uint64_t lsn_max, PsWalRec *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	int			n;
@@ -439,7 +505,7 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->blocknum = block;
 	ch->req_lsn = lsn_max;
 	n = (int) cl_exec()->result;
-	memcpy(out, ch->data, (size_t) n * sizeof(uint64_t));
+	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
 }
 
@@ -480,7 +546,7 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm, const char *store,
-			 uint32_t page_size)
+			 uint32_t page_size, uint32_t nshards)
 {
 	pid_t		pid = fork();
 
@@ -492,11 +558,15 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 	if (pid == 0)
 	{
 		char		psbuf[16];
+		char		shbuf[16];
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
-		/* small segments so the tests exercise segment rollover */
+		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
+		/* small segments exercise rollover; a small flush threshold makes the
+		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
-			  "--page-size", psbuf, "--segment-size", "65536", (char *) NULL);
+			  "--page-size", psbuf, "--segment-size", "65536", "--nshards",
+			  shbuf, "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}
@@ -570,7 +640,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	pb = malloc(page_size);
 	rb = malloc(page_size);
 
-	dpid = spawn_daemon(daemon_path, shm, store, page_size);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
 
@@ -624,12 +694,36 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
+	/* --- SLRU-class versioning: version is the caller's LSN, not a daemon counter ---
+	 * Two snapshots of an SLRU segment keyed by cutoffs C1=5000 and C2=9000.  An
+	 * as-of read must resolve by those exact LSNs; a daemon max+1 counter (1,2) would
+	 * make read_at(7000) and read_at(4000) resolve wrongly. */
+	{
+		const uint32_t SLRU_OBJ = 4242;	/* an slru_klass_id stand-in */
+
+		fill_page(pa, page_size, 0, 111);	/* pd_lsn irrelevant for SLRU; tag 111 */
+		op_write_slru(SLRU_OBJ, 0, pa, 5000);
+		fill_page(pb, page_size, 0, 222);
+		op_write_slru(SLRU_OBJ, 0, pb, 9000);
+
+		op_read_at_slru(SLRU_OBJ, 0, 7000, rb);
+		check(page_has_tag(rb, page_size, 111),
+			  "slru read_at(7000) = C1 snapshot (version is the caller LSN 5000)");
+		op_read_at_slru(SLRU_OBJ, 0, 9000, rb);
+		check(page_has_tag(rb, page_size, 222), "slru read_at(9000) = C2 snapshot");
+		op_read_at_slru(SLRU_OBJ, 0, 4000, rb);
+		check(page_all_zero(rb, page_size),
+			  "slru read_at(4000) = none (no snapshot at/below 4000; not a counter)");
+		op_read_at_slru(SLRU_OBJ, 0, ~0ull, rb);
+		check(page_has_tag(rb, page_size, 222), "slru read_at(max) = newest snapshot");
+	}
+
 	client_detach();
 
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, page_size);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
 
@@ -680,7 +774,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	p = malloc(ps);
 	rb = malloc(ps);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -733,7 +827,7 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_read_tl(1, REL_B, FORK0, 0, rb);
@@ -743,8 +837,22 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
+	check(op_check_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
+		  "CHECK_BRANCH rejects retry of a timeline with branch-local writes");
+	check(op_check_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "CHECK_BRANCH rejects mismatched ancestry for existing timeline");
+	check(op_check_branch_status(9, 0, 1500) == PS_STATUS_OK,
+		  "CHECK_BRANCH accepts a valid not-yet-created branch request");
+	check(op_require_branch_status(1, 0, 1500) == PS_STATUS_OK,
+		  "REQUIRE_BRANCH accepts existing matching timeline metadata");
+	check(op_require_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "REQUIRE_BRANCH rejects mismatched existing timeline metadata");
+	check(op_require_branch_status(9, 0, 1500) == PS_STATUS_ERROR,
+		  "REQUIRE_BRANCH rejects not-yet-created branch timelines");
+	check(op_create_branch_status(1, 0, 1501) == PS_STATUS_ERROR,
+		  "CREATE_BRANCH rejects re-creating existing timeline with mismatched ancestry");
 	check(op_create_branch_status(1, 0, 1500) == PS_STATUS_ERROR,
-		  "reject re-creating an existing timeline id");
+		  "re-create of a written timeline id is rejected (would expose its pages)");
 	check(op_create_branch_status(9, 900, 1500) == PS_STATUS_ERROR,
 		  "reject branch off an undefined parent");
 	check(op_create_branch_status(9, 9, 1500) == PS_STATUS_ERROR,
@@ -755,6 +863,18 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "valid branch off a defined branch still accepted");
 	op_read_tl(7, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "new valid branch reads through to root");
+
+	/* the idempotent-retry window: an unused timeline may be re-created (a
+	 * prepare retry), but the first branch-local write closes it -- reads on
+	 * the timeline do not */
+	check(op_check_branch_status(7, 2, 1500) == PS_STATUS_OK,
+		  "CHECK_BRANCH accepts retry of an unused timeline after reads");
+	check(op_create_branch_status(7, 2, 1500) == PS_STATUS_OK,
+		  "re-create of an unused timeline with identical ancestry is idempotent");
+	fill_page(p, ps, 4000, 77);
+	op_write_tl(7, REL_B, FORK0, 0, p);
+	check(op_create_branch_status(7, 2, 1500) == PS_STATUS_ERROR,
+		  "the timeline's first write closes the idempotent-retry window");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -790,7 +910,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -821,11 +941,13 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
 	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
+	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
+		  "shipped WAL also closes the idempotent re-create window (post-restart)");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -844,7 +966,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	char		store[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
-	uint64_t	out[16];
+	PsWalRec	out[16];
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
@@ -853,7 +975,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -864,13 +986,15 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
 
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
-	check(n == 2 && out[0] == 100 && out[1] == 200,
+	check(n == 2 && out[0].lsn == 100 && out[1].lsn == 200,
 		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
 	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
-	check(n == 3 && out[2] == 300, "index returns all records up to a high lsn");
+	check(n == 3 && out[2].lsn == 300, "index returns all records up to a high lsn");
+	check(out[0].timeline == 0 && out[2].timeline == 0,
+		  "records on the root timeline are tagged timeline 0");
 	check(op_walidx_get(0, REL_A, FORK0, 0, 50, out) == 0, "no records below the first lsn");
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
-	check(n == 1 && out[0] == 150, "per-block separation (block 1 -> [150])");
+	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
@@ -879,6 +1003,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
 	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
 	check(n == 3, "branch index reads through to parent capped at the branch lsn");
+	/* merged in ascending LSN order across the ancestry */
+	check(out[0].lsn == 100 && out[1].lsn == 200 && out[2].lsn == 400,
+		  "branch records are merged in ascending LSN order");
+	/* each record is tagged with the timeline it lives on: parent's on 0, branch's on 1 */
+	check(out[0].timeline == 0 && out[1].timeline == 0 && out[2].timeline == 1,
+		  "each record carries its source timeline tag (parent=0, branch=1)");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -911,7 +1041,7 @@ run_vectored_suite(const char *daemon_path, const char *tmpbase)
 	wbuf = malloc((size_t) nb * ps);
 	rbuf = malloc((size_t) nb * ps);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 
@@ -988,7 +1118,7 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);		/* parent does not claim a channel */
 
 	for (int i = 0; i < NKIDS; i++)
@@ -1014,6 +1144,136 @@ run_concurrency_suite(const char *daemon_path, const char *tmpbase)
 #undef NKIDS
 }
 
+/*
+ * Stress the per-shard + map locking.  Writers hammer their own rels (distinct
+ * shards) hard enough to trigger repeated memtable flushes and compactions (each
+ * of which takes map_wr), while readers continuously re-read a write-once shared
+ * dataset (taking shard_rd + map_rd).  The shared dataset is never rewritten, so
+ * a reader must ALWAYS see the correct page; any mismatch means a concurrent map
+ * mutation corrupted a read -- i.e. the map lock is wrong.  Run with nshards>1
+ * (the test's optional argv[2]) to exercise true cross-shard concurrency.
+ */
+static int
+stress_writer_child(const char *shm_name, uint32_t ps, int id)
+{
+	uint32_t	rel = 30000 + (uint32_t) id;
+	unsigned char *p = malloc(ps);
+
+	client_attach(shm_name, ps);
+	/* 3 passes x 200 blocks: flush-pages=8 -> ~75 flushes -> many compactions */
+	for (int pass = 0; pass < 3; pass++)
+		for (uint32_t b = 0; b < 200; b++)
+		{
+			fill_page(p, ps, 7000 + b, (unsigned char) (id * 11 + pass + b + 1));
+			op_write_one(rel, FORK0, b, p);
+		}
+	client_detach();
+	free(p);
+	return 0;
+}
+
+static int
+stress_reader_child(const char *shm_name, uint32_t ps, uint32_t rel,
+					uint32_t nblocks, unsigned char tagbase)
+{
+	unsigned char *r = malloc(ps);
+	int			rc = 0;
+
+	client_attach(shm_name, ps);
+	for (int iter = 0; iter < 150 && rc == 0; iter++)
+		for (uint32_t b = 0; b < nblocks; b++)
+		{
+			op_read_one(rel, FORK0, b, r);
+			if (!page_has_tag(r, ps, (unsigned char) (tagbase + b)))
+				rc = 2;				/* concurrent map mutation corrupted a read */
+		}
+	client_detach();
+	free(r);
+	return rc;
+}
+
+static int
+stress_populate_child(const char *shm_name, uint32_t ps, uint32_t rel,
+					  uint32_t nblocks, unsigned char tagbase)
+{
+	unsigned char *p = malloc(ps);
+
+	client_attach(shm_name, ps);
+	for (uint32_t b = 0; b < nblocks; b++)
+	{
+		fill_page(p, ps, 5000 + b, (unsigned char) (tagbase + b));
+		op_write_one(rel, FORK0, b, p);
+	}
+	client_detach();
+	free(p);
+	return 0;
+}
+
+static void
+run_stress_suite(const char *daemon_path, const char *tmpbase)
+{
+#define NWRITERS 8
+#define NREADERS 8
+	char		shm[64];
+	char		store[256];
+	pid_t		dpid;
+	pid_t		pop;
+	pid_t		kids[NWRITERS + NREADERS];
+	int			st = 1;
+	uint32_t	ps = 8192;
+	uint32_t	shared_rel = 29999;
+	uint32_t	shared_n = 64;
+	unsigned char tagbase = 100;
+
+	fprintf(stderr, "== stress (%d writers + %d readers, nshards=%u) ==\n",
+			NWRITERS, NREADERS, test_nshards);
+	snprintf(shm, sizeof(shm), "/pstest_%d_stress", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_stress", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+
+	/* populate the write-once shared dataset before the concurrent phase */
+	pop = fork();
+	if (pop == 0)
+		_exit(stress_populate_child(shm, ps, shared_rel, shared_n, tagbase));
+	waitpid(pop, &st, 0);
+	check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "stress: shared dataset populated");
+
+	for (int i = 0; i < NWRITERS; i++)
+	{
+		pid_t		pid = fork();
+
+		if (pid == 0)
+			_exit(stress_writer_child(shm, ps, i));
+		kids[i] = pid;
+	}
+	for (int i = 0; i < NREADERS; i++)
+	{
+		pid_t		pid = fork();
+
+		if (pid == 0)
+			_exit(stress_reader_child(shm, ps, shared_rel, shared_n, tagbase));
+		kids[NWRITERS + i] = pid;
+	}
+	for (int i = 0; i < NWRITERS + NREADERS; i++)
+	{
+		int			s = 1;
+
+		waitpid(kids[i], &s, 0);
+		check(WIFEXITED(s) && WEXITSTATUS(s) == 0,
+			  "stress: client %d finished clean (no deadlock, no map corruption)", i);
+	}
+
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+#undef NWRITERS
+#undef NREADERS
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1024,10 +1284,16 @@ main(int argc, char **argv)
 
 	if (argc < 2)
 	{
-		fprintf(stderr, "usage: %s <path-to-pagestore_daemon>\n", argv[0]);
+		fprintf(stderr, "usage: %s <path-to-pagestore_daemon> [nshards]\n", argv[0]);
 		return 2;
 	}
 	daemon_path = argv[1];
+	if (argc > 2)
+		test_nshards = (uint32_t) strtoul(argv[2], NULL, 10);
+	if (test_nshards == 0)
+		test_nshards = 1;
+	if (test_nshards > PS_MAX_CHANNELS)
+		test_nshards = PS_MAX_CHANNELS;
 
 	tmpbase = mkdtemp(tmpl);
 	if (!tmpbase)
@@ -1054,6 +1320,9 @@ main(int argc, char **argv)
 
 	/* many concurrent clients */
 	run_concurrency_suite(daemon_path, tmpbase);
+
+	/* stress the per-shard + map locking under sustained flush/compaction load */
+	run_stress_suite(daemon_path, tmpbase);
 
 	rmdir(tmpbase);
 

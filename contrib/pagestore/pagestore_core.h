@@ -27,6 +27,7 @@
 /* One stored version of a page: its LSN and where the bytes live in the store. */
 typedef struct PageVer
 {
+	uint32_t	shard;			/* segment shard that stores this version */
 	uint64_t	lsn;			/* the page's pd_lsn when it was written */
 	int			seg;			/* segment id holding the bytes */
 	uint64_t	off;			/* byte offset of the page within that segment */
@@ -35,10 +36,28 @@ typedef struct PageVer
 /* Configuration shared with the frontend; set by the frontend before open. */
 extern uint32_t page_size;
 extern uint64_t segment_size;
+extern int	flush_pages;		/* memtable flush threshold in pages */
+extern int	compact_layers;		/* compact a timeline past this many image layers */
+extern int	cache_pages;		/* materialized-page cache size (pages; 0=off) */
+extern int	use_layers;			/* rebuild read state from layers (vs segments) */
 extern const PsStorage *ps_storage;
+extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
 /* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
 extern int	ps_core_open(const char *store_dir);
+
+/* Clean-shutdown: flush the memtable into a layer and close the manifest. */
+extern void ps_core_close(void);
+
+/* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
+ * did work (caller should not sleep), 0 if nothing was due. */
+extern int	ps_core_maintenance(void);
+
+/* Number of image layers currently in the layer map (for stats/diagnostics). */
+extern uint32_t ps_core_layer_count(void);
+
+/* Read-path source counts: served from memtable / image layer / segment. */
+extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 
 /*
  * Handle every request that is NOT page byte I/O and return 1.  The four
@@ -47,12 +66,43 @@ extern int	ps_core_open(const char *store_dir);
  */
 extern int	ps_handle_meta(PsChannel *ch);
 
-/* Page byte-I/O helpers used by the frontends' byte-op handlers. */
+/*
+ * Page byte-I/O helpers used by the frontends' byte-op handlers.  'version' is the
+ * caller-supplied version LSN for an SLRU-class write (the dirtying/cutoff WAL LSN,
+ * stored verbatim so it stays comparable to a branch cutoff); it is ignored for
+ * relation pages (versioned by pd_lsn) and other non-relation objects (versioned by
+ * a monotonic latest-wins counter).
+ */
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-						const unsigned char *page);
+						const unsigned char *page, uint64_t version);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 							 uint64_t read_lsn);
 extern int	read_version(const PageVer *v, unsigned char *out);
+
+/*
+ * Resolve a read into out (page_size bytes), serving from memtable / image
+ * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
+ * page is unwritten.
+ */
+extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver);
 extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
+
+/*
+ * Concurrency locks (defined in pagestore_core.c).  A per-shard rwlock guards
+ * each shard's in-memory state; a single map_lock guards the cross-shard
+ * ps_layer_map + timelines[].  Callers MUST take them in the order shard
+ * (outer) -> map (inner), never the reverse.
+ */
+extern void ps_lock_shard_rd(uint32_t shard);
+extern void ps_lock_shard_wr(uint32_t shard);
+extern void ps_unlock_shard(uint32_t shard);
+extern void ps_lock_map_rd(void);
+extern void ps_lock_map_wr(void);
+extern void ps_unlock_map(void);
+
+/* Shard index that will be touched for 'key' (klass-aware); the frontend takes
+ * the per-shard lock from the final request key, not a client-supplied shard. */
+extern uint32_t ps_shard_of(const PsKey *key);
 
 #endif							/* PAGESTORE_CORE_H */

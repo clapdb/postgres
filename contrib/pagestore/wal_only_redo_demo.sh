@@ -26,7 +26,7 @@ WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 D=$(mktemp -d)/pgdata
 S=$(mktemp -d)/store
 SHM=/pswonly_$$
-PORT=54480
+PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 
 cleanup() {
@@ -54,10 +54,16 @@ io_method = sync
 recovery_prefetch = off
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = '127.0.0.1'
 port = $PORT
 EOF
 
 "$BIN/pg_ctl" -D "$D" -l "$D/w.log" -w start >/dev/null 2>&1
+if ! $P -c "SELECT 1;" >/dev/null 2>&1; then
+	echo "FAIL - writer did not accept connections on port $PORT; log:"
+	tail -20 "$D/w.log" 2>/dev/null
+	exit 1
+fi
 # base backup right at the start (recovery start point), before any user table
 "$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres >/dev/null <<SQL
 SELECT pg_backup_start('b', fast => true);

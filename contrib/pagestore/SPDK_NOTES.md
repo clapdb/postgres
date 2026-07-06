@@ -236,7 +236,12 @@ per-core indexes single-owner (still lock-free).  This is #2's design.
     3.6x from cross-channel queue depth; at 16 clients ~2.4 GiB/s, well past the
     single-stream POSIX cold-random 748 MiB/s -- concurrency is the lever the
     one-request-at-a-time loop was missing.
-  - **S1.2d — database-adapted materialization cache (high priority, NOT a
+  - **S1.2d — SPDK env initialization diagnostics (DONE).** `storage_spdk.c`
+    now emits detailed startup diagnostics when `spdk_env_init` fails:
+    runtime path readiness, hugepage availability/size, IOMMU/PA checks,
+    and PCI/DPDK hints. This is currently logs-only and improves first-failure
+    triage without changing normal read/write behavior.
+  - **S1.2e — database-adapted materialization cache (high priority, NOT a
     block cache).**  The benchmark shows the kernel page cache + readahead is why
     POSIX wins sequential reads -- but a userspace block-address LRU is the wrong
     answer: it is filled with the same I/O bandwidth (re-implementing the kernel

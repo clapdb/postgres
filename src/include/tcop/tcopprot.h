@@ -80,6 +80,9 @@ extern void ProcessClientWriteInterrupt(bool blocked);
 
 extern void process_postgres_switches(int argc, char *argv[],
 									  GucContext ctx, const char **dbname);
+extern void InitStandaloneBackend(int argc, char *argv[], const char *username,
+								  const char **dbname, bool need_dbname,
+								  bool require_datadir);
 pg_noreturn extern void PostgresSingleUserMain(int argc, char *argv[],
 											   const char *username);
 pg_noreturn extern void PostgresMain(const char *dbname,

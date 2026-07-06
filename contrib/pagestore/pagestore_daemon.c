@@ -24,14 +24,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
+#include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
+
+typedef struct WorkerArgs
+{
+	uint32_t	shard;
+	void	   *shm;
+	uint32_t	nchannels;
+	uint32_t	nshards;
+} WorkerArgs;
 
 static void
 on_signal(int sig)
@@ -58,7 +68,7 @@ handle_request(PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_EXTEND:
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
 				ch->status = PS_STATUS_ERROR;
 			else
 				fork_grow(tl, &ch->key, ch->blocknum + 1);
@@ -68,7 +78,8 @@ handle_request(PsChannel *ch)
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + i,
-								 ch->data + (size_t) i * page_size) != 0)
+								 ch->data + (size_t) i * page_size,
+								 ch->req_lsn) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -79,33 +90,207 @@ handle_request(PsChannel *ch)
 			break;
 
 		case PS_OP_READV:
-			/* "current" read on this timeline: read-through at max LSN */
+			/* "current" read on this timeline: resolve at max LSN, serving from
+			 * memtable / image layers with a segment fallback */
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				unsigned char *dst = ch->data + (size_t) i * page_size;
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum + i,
-											 UINT64_MAX);
 
-				if (!v || read_version(v, dst) != 0)
+				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst, NULL))
 					memset(dst, 0, page_size);	/* unwritten -> zeros */
 			}
 			break;
 
 		case PS_OP_READ_AT:
+			/* as-of read on this timeline, honoring branch ancestry.  Report
+			 * found-ness in ch->result, and the resolved version back in ch->req_lsn,
+			 * so a caller can tell a real all-zero page from one that has no version
+			 * <= req_lsn, and an SLRU snapshot reader can require an exact-cutoff hit
+			 * (resolved == requested) rather than an older newest-<= image. */
 			{
-				/* as-of read on this timeline, honoring branch ancestry */
-				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 ch->req_lsn);
+				uint64_t	resolved = 0;
 
-				if (!v || read_version(v, ch->data) != 0)
-					memset(ch->data, 0, page_size);
-				break;
+				if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data,
+								 &resolved))
+				{
+					ch->result = 1;
+					ch->req_lsn = resolved;
+				}
+				else
+					memset(ch->data, 0, page_size);	/* not found: result stays 0 */
 			}
+			break;
 
 		default:
 			ch->status = PS_STATUS_ERROR;
 			break;
 	}
+}
+
+static int
+request_is_write(PsOpcode opcode)
+{
+	switch (opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_IMMEDSYNC:
+			return 1;
+		case PS_OP_EXISTS:
+		case PS_OP_NBLOCKS:
+		case PS_OP_READV:
+		case PS_OP_READ_AT:
+		case PS_OP_REQUIRE_BRANCH:
+		case PS_OP_WAL_SIZE:
+		case PS_OP_WAL_READ:
+		case PS_OP_WAL_INDEX_GET:
+			return 0;
+		default:
+			return 1;
+	}
+}
+
+static void
+run_request(PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	/*
+	 * Branch creation mutates only the cross-shard timelines[]; take map_lock
+	 * alone (no shard lock), so it serializes against map readers/writers but
+	 * not against per-shard work on unrelated shards.
+	 */
+	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
+		op == PS_OP_REQUIRE_BRANCH)
+	{
+		ps_lock_map_wr();
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_map();
+		return;
+	}
+
+	/*
+	 * IMMEDSYNC fsyncs the shared segment-fd cache; the POSIX backend serializes
+	 * that internally (seg_fds_lock), so no per-shard lock is needed (and a single
+	 * shard lock would not have excluded the other shards' fd-cache mutations).
+	 *
+	 * SPDK's sync(), however, flushes every shard's in-memory curbuf, which a
+	 * concurrent shard write mutates -- with per-shard locking there is no single
+	 * write lock to exclude that, so for such backends hold every shard's write
+	 * lock (ascending, the established shard order) around the sync.
+	 */
+	if (op == PS_OP_IMMEDSYNC)
+	{
+		if (ps_storage->sync_needs_write_lock)
+		{
+			for (uint32_t s = 0; s < ps_nshards; s++)
+				ps_lock_shard_wr(s);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			for (uint32_t s = ps_nshards; s-- > 0;)
+				ps_unlock_shard(s);
+		}
+		else
+		{
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+		}
+		return;
+	}
+
+	{
+		uint32_t	shard;
+
+		/*
+		 * Derive the shard from the FINAL request key (klass-aware), not a
+		 * client-supplied ch->shard: object I/O claims its channel before setting
+		 * ch->key.klass, and freestanding IPC clients don't populate ch->shard at
+		 * all -- trusting it would lock one shard while handle_request() mutates
+		 * shard_for(&ch->key).  The shipped-WAL byte ops (append/size/read) are not
+		 * keyed (they touch the per-timeline WAL log), so serialize them on shard 0.
+		 */
+		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+			shard = 0;
+		else
+			shard = ps_shard_of(&ch->key);
+
+		if (request_is_write(op))
+		{
+			/*
+			 * Writes touch only this shard's state; append_page escalates to a
+			 * brief map_wr itself when a flush/compaction mutates the map.
+			 */
+			ps_lock_shard_wr(shard);
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_shard(shard);
+		}
+		else
+		{
+			/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+			ps_lock_shard_rd(shard);
+			ps_lock_map_rd();
+			handle_request(ch);
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_unlock_map();
+			ps_unlock_shard(shard);
+		}
+	}
+}
+
+static void *
+shard_worker(void *arg)
+{
+	WorkerArgs *wa = (WorkerArgs *) arg;
+	uint32_t	shard = wa->shard;
+	void	   *shm = wa->shm;
+	uint32_t	nchannels = wa->nchannels;
+	uint32_t	nshards = wa->nshards;
+
+	while (!stop_requested)
+	{
+		int			did_work = 0;
+
+		for (uint32_t i = shard; i < nchannels; i += nshards)
+		{
+			PsChannel  *ch = ps_channel(shm, i);
+
+			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
+				continue;
+
+			run_request(ch);
+			did_work = 1;
+		}
+
+		if (!did_work && shard == 0)
+		{
+			/* maintenance takes the shard + map locks it needs internally */
+			int			do_maint = ps_core_maintenance();
+
+			if (!do_maint)
+			{
+				struct timespec ts = {0, 20000};	/* 20us */
+
+				nanosleep(&ts, NULL);
+			}
+		}
+		else if (!did_work)
+		{
+			struct timespec ts = {0, 20000};	/* 20us */
+
+			nanosleep(&ts, NULL);
+		}
+	}
+
+	return NULL;
 }
 
 int
@@ -117,6 +302,7 @@ main(int argc, char **argv)
 	struct sigaction sa;
 	const char *store_dir = NULL;
 	const char *shm_name = NULL;
+	uint32_t	nshards = 1;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -128,6 +314,14 @@ main(int argc, char **argv)
 			page_size = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--segment-size") == 0 && i + 1 < argc)
 			segment_size = strtoull(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--flush-pages") == 0 && i + 1 < argc)
+			flush_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
+			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
+			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
+			cache_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -147,18 +341,20 @@ main(int argc, char **argv)
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
-					"[--page-size N] [--segment-size N] [--storage NAME]\n",
+					"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
 					argv[0]);
 			return 2;
 		}
 	}
-	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT)
+	if (!shm_name || !store_dir || page_size == 0 || page_size > PS_IO_UNIT ||
+		nshards == 0 || nshards > PS_MAX_CHANNELS)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
-				"[--page-size N] [--segment-size N] [--storage NAME]\n",
+				"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
 				argv[0]);
 		return 2;
 	}
+	ps_nshards = nshards;
 
 	if (ps_core_open(store_dir) != 0)
 	{
@@ -199,6 +395,7 @@ main(int argc, char **argv)
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
 	hdr->nchannels = PS_MAX_CHANNELS;
+	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 
@@ -208,35 +405,64 @@ main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 
 	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-			"io_unit=%u channels=%d ready\n",
+			"io_unit=%u channels=%u nshards=%u ready\n",
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS);
+			PS_MAX_CHANNELS, hdr->nshards);
 
-	while (!stop_requested)
 	{
-		int			did_work = 0;
+		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
+		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		uint32_t	started = 0;
 
-		for (uint32_t i = 0; i < PS_MAX_CHANNELS; i++)
+		if (!workers || !threads)
 		{
-			PsChannel  *ch = ps_channel(shm, i);
-
-			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
-				continue;
-
-			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
-			did_work = 1;
+			fprintf(stderr, "pagestore_daemon: cannot allocate worker slots\n");
+			free(workers);
+			free(threads);
+			munmap(shm, PS_SHM_SIZE);
+			return 1;
 		}
 
-		if (!did_work)
+		for (uint32_t shard = 0; shard < hdr->nshards; shard++)
 		{
-			struct timespec ts = {0, 20000};	/* 20us */
-
-			nanosleep(&ts, NULL);
+			workers[shard].shard = shard;
+			workers[shard].shm = shm;
+			workers[shard].nchannels = hdr->nchannels;
+			workers[shard].nshards = hdr->nshards;
+			if (pthread_create(&threads[shard], NULL, shard_worker, &workers[shard]) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: failed to start worker %u\n", shard);
+				stop_requested = 1;
+				break;
+			}
+			started++;
 		}
+
+		for (uint32_t shard = 0; shard < started; shard++)
+			pthread_join(threads[shard], NULL);
+
+		free(workers);
+		free(threads);
 	}
 
-	fprintf(stderr, "pagestore_daemon: shutting down\n");
+	{
+		uint64_t	rm,
+					rl,
+					rs,
+					ch,
+					cm,
+					ce;
+
+		ps_core_read_stats(&rm, &rl, &rs);
+		ps_pgcache_stats(&ch, &cm, &ce);
+		fprintf(stderr, "pagestore_daemon: shutting down (%u image layers; reads "
+				"mem=%llu layer=%llu seg=%llu; pgcache hit=%llu miss=%llu evict=%llu)\n",
+				ps_core_layer_count(),
+				(unsigned long long) rm, (unsigned long long) rl,
+				(unsigned long long) rs, (unsigned long long) ch,
+				(unsigned long long) cm, (unsigned long long) ce);
+	}
+	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }

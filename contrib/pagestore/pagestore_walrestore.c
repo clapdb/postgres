@@ -53,9 +53,10 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 	}
 	close(fd);
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC)
+	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION)
 	{
-		fprintf(stderr, "bad shm header\n");
+		fprintf(stderr, "bad shm header (magic/version mismatch; daemon and "
+				"walrestore built against different PS_SHM_VERSION?)\n");
 		exit(2);
 	}
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
