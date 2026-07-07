@@ -269,9 +269,13 @@ typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
  * therefore invokes the hook as a fallible pre-barrier before entering it,
  * and the hook must detect CritSectionCount > 0 and be strictly infallible
  * (no error, no I/O) there -- normally a no-op, since the pre-barrier
- * already covered the same or a higher cutoff.
+ * already covered the same cutoff.  'lsn' is the end of the truncation's
+ * WAL record when the caller knows it (the TruncateCLOG/TruncateCommitTs
+ * pre-barriers); InvalidXLogRecPtr tells the hook to sample the current
+ * position itself.
  */
-typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage);
+typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage,
+										 XLogRecPtr lsn);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
 														int64 pageno,
 														char *page);

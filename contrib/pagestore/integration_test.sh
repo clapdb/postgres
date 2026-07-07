@@ -832,9 +832,18 @@ assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_subtrans', 0, pg_current
 # image have durably shipped; a reader on another compute may trust the live
 # mirror for status at/below it and no further.
 $P -c "CREATE FUNCTION pagestore_slru_mirror_watermark() RETURNS pg_lsn
-        AS 'pagestore','pagestore_slru_mirror_watermark' LANGUAGE C;" >/dev/null
+        AS 'pagestore','pagestore_slru_mirror_watermark' LANGUAGE C;
+       CREATE FUNCTION pagestore_slru_mirror_reset_debt() RETURNS bigint
+        AS 'pagestore','pagestore_slru_mirror_reset_debt' LANGUAGE C;" >/dev/null
+# A never-primed mirror starts with boot debt: pre-enable SLRU history was
+# never captured, so the watermark must stay frozen until the operator
+# declares the mirror whole.
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NULL;")" "t" \
+	"watermark stays frozen until the mirror is primed (boot debt)"
+$P -c "SELECT pagestore_slru_mirror_reset_debt();" >/dev/null   # prime it
+$P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
-	"watermark is set after a completed checkpoint's images shipped"
+	"watermark is set after priming + a completed checkpoint's images shipped"
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() <= (SELECT redo_lsn FROM pg_control_checkpoint());")" "t" \
 	"watermark never claims more than the last completed checkpoint's redo"
 WM1=$($P -c "SELECT pagestore_slru_mirror_watermark();")
@@ -851,8 +860,6 @@ assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "
 # operator re-primes the mirror and explicitly resets the debt.
 "$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
-$P -c "CREATE FUNCTION pagestore_slru_mirror_reset_debt() RETURNS bigint
-        AS 'pagestore','pagestore_slru_mirror_reset_debt' LANGUAGE C;" >/dev/null
 $P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NULL;")" "t" \

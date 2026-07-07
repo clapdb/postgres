@@ -122,7 +122,7 @@ static SlruDesc XactSlruDesc;
 #define XactCtl (&XactSlruDesc)
 
 
-static void WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact,
+static XLogRecPtr WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact,
 								 Oid oldestXactDb);
 static void TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 									   TransactionId *subxids, XidStatus status,
@@ -1012,7 +1012,23 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	 * ahead of clog truncation in case we crash, and so a standby finds out
 	 * the new valid xid before the next checkpoint.
 	 */
-	WriteTruncateXlogRec(cutoffPage, oldestXact, oldestxid_datoid);
+	{
+		XLogRecPtr	trunc_lsn;
+
+		trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
+										 oldestxid_datoid);
+
+		/*
+		 * A store-backed SLRU mirror wants its truncation tombstone
+		 * versioned by the exact truncate record, not a later sampled
+		 * position (an as-of reader between the two would have the record
+		 * in its history but see no tombstone).  Run the barrier here with
+		 * that LSN; SimpleLruTruncate()'s own hook call then finds the
+		 * cutoff covered and no-ops.
+		 */
+		if (slru_truncate_hook)
+			(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
+	}
 
 	/* Now we can remove the old CLOG segment(s) */
 	SimpleLruTruncate(XactCtl, cutoffPage);
@@ -1067,7 +1083,7 @@ clog_errdetail_for_io_error(const void *opaque_data)
  * We must flush the xlog record to disk before returning --- see notes
  * in TruncateCLOG().
  */
-static void
+static XLogRecPtr
 WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 {
 	XLogRecPtr	recptr;
@@ -1081,6 +1097,7 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 	XLogRegisterData(&xlrec, sizeof(xl_clog_truncate));
 	recptr = XLogInsert(RM_CLOG_ID, CLOG_TRUNCATE);
 	XLogFlush(recptr);
+	return recptr;
 }
 
 /*

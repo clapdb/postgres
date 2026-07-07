@@ -2767,9 +2767,11 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	if (slru_truncate_hook)
 	{
 		(*slru_truncate_hook) (MultiXactMemberCtl,
-							   MXOffsetToMemberPage(newOldestOffset));
+							   MXOffsetToMemberPage(newOldestOffset),
+							   InvalidXLogRecPtr);
 		(*slru_truncate_hook) (MultiXactOffsetCtl,
-							   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)));
+							   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)),
+							   InvalidXLogRecPtr);
 	}
 
 	/*
