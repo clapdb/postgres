@@ -2755,6 +2755,24 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		 MXOffsetToMemberSegment(newOldestOffset));
 
 	/*
+	 * Give a page-store mirror its truncation barrier BEFORE entering the
+	 * critical section: the hook may perform synchronous store I/O and may
+	 * raise an error, both unacceptable once critical (an ERROR there
+	 * escalates to PANIC).  An error here abandons the truncation with
+	 * nothing removed yet -- retried by a later vacuum, like any other
+	 * truncate failure.  The SimpleLruTruncate() calls below invoke the
+	 * hook again with the same cutoffs, by then inside the critical
+	 * section; the hook sees them already covered and reduces to a no-op.
+	 */
+	if (slru_truncate_hook)
+	{
+		(*slru_truncate_hook) (MultiXactMemberCtl,
+							   MXOffsetToMemberPage(newOldestOffset));
+		(*slru_truncate_hook) (MultiXactOffsetCtl,
+							   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)));
+	}
+
+	/*
 	 * Do truncation, and the WAL logging of the truncation, in a critical
 	 * section. That way offsets/members cannot get out of sync anymore, i.e.
 	 * once consistent the newOldestMulti will always exist in members, even

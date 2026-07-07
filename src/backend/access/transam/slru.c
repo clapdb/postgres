@@ -709,6 +709,22 @@ SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 			shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
+			/*
+			 * Same store-backed revalidation as SimpleLruReadPage(): a
+			 * clean cached slot served from a mirror can go stale when the
+			 * mirror's watermark advances, and this shared-lock hit path
+			 * would otherwise keep returning it forever.  The hook only
+			 * reads memory, so the shared lock suffices for the check; a
+			 * stale slot cannot be discarded here, so fall through to the
+			 * exclusive path, whose SimpleLruReadPage() revalidates again
+			 * and re-reads.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+				break;
+
 			/* See comments for SlruRecentlyUsed() */
 			SlruRecentlyUsed(shared, slotno);
 
@@ -1589,21 +1605,10 @@ SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 {
 	SlruShared	shared = ctl->shared;
 	int			prevbank;
+	bool		tombstoned = false;
 
 	/* update the stats counter of truncates */
 	pgstat_count_slru_truncate(shared->slru_stats_idx);
-
-	/*
-	 * Let an external page-store mirror publish a truncation tombstone
-	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
-	 * pages to other computes must be able to stop serving the truncated
-	 * range no later than the local files disappear.  The hook may raise an
-	 * error (we are never in a critical section here), in which case the
-	 * truncation is abandoned before anything was removed -- retried by the
-	 * next vacuum/checkpoint cycle, exactly like any other truncate failure.
-	 */
-	if (slru_truncate_hook)
-		(*slru_truncate_hook) (ctl, cutoffPage);
 
 	/*
 	 * Scan shared memory and remove any pages preceding the cutoff page, to
@@ -1626,6 +1631,26 @@ restart:
 				(errmsg("could not truncate directory \"%s\": apparent wraparound",
 						ctl->options.Dir)));
 		return;
+	}
+
+	/*
+	 * Let an external page-store mirror publish a truncation tombstone
+	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
+	 * pages to other computes must be able to stop serving the truncated
+	 * range no later than the local files disappear.  This runs after the
+	 * wraparound backstop above (a skipped truncation must not durably
+	 * declare its range dead), and only once (the restart loop may come by
+	 * again).  Unless we are inside a critical section (multixact
+	 * truncation; a pre-barrier covers the hook there -- see
+	 * TruncateMultiXact), the hook may raise an error, in which case the
+	 * truncation is abandoned before anything was removed -- retried by
+	 * the next vacuum/checkpoint cycle, exactly like any other truncate
+	 * failure.
+	 */
+	if (slru_truncate_hook && !tombstoned)
+	{
+		(*slru_truncate_hook) (ctl, cutoffPage);
+		tombstoned = true;
 	}
 
 	prevbank = SlotGetBankNumber(0);

@@ -259,22 +259,30 @@ typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
 
 /*
  * Truncation barrier for store-backed SLRUs, called BEFORE any local
- * segment is deleted (SimpleLruTruncate and SlruDeleteSegment): pages below
+ * segment is deleted (SimpleLruTruncate, SlruDeleteSegment, and the
+ * pg_commit_ts delete-all reset, which passes PG_INT64_MAX): pages below
  * 'cutoffPage' are about to disappear locally, so a mirror serving them to
- * other computes must durably stop first.  Never called inside a critical
- * section; the hook may raise an error, which abandons the truncation
- * before anything was removed.
+ * other computes must durably stop first.  In ordinary (non-critical)
+ * contexts the hook may raise an error, which abandons the truncation
+ * before anything was removed.  Multixact truncation, however, reaches
+ * SimpleLruTruncate() inside a critical section; TruncateMultiXact()
+ * therefore invokes the hook as a fallible pre-barrier before entering it,
+ * and the hook must detect CritSectionCount > 0 and be strictly infallible
+ * (no error, no I/O) there -- normally a no-op, since the pre-barrier
+ * already covered the same or a higher cutoff.
  */
 typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage);
 
 /*
- * Cache revalidation for store-backed SLRUs, called by SimpleLruReadPage()
- * on a cache hit (bank lock held, so it must be infallible and cheap --
- * local memory checks only, no I/O, no locks, no error).  Return false to
- * discard the cached slot and force a physical re-read: a clean VALID slot
- * served from a mirror can go stale when the mirror's watermark advances
- * or a truncation tombstone appears, and no physical read would ever
- * notice.  Dirty slots are local truth and are never offered.
+ * Cache revalidation for store-backed SLRUs, called on a cache hit by
+ * SimpleLruReadPage() (bank lock held exclusive) and by
+ * SimpleLruReadPage_ReadOnly()'s shared-lock fast path, so it must be
+ * infallible and cheap -- memory checks only (shared memory included), no
+ * I/O, no lock acquisition, no error.  Return false to discard the cached
+ * slot and force a physical re-read: a clean VALID slot served from a
+ * mirror can go stale when the mirror's watermark advances or a truncation
+ * tombstone appears, and no physical read would ever notice.  Dirty slots
+ * are local truth and are never offered.
  */
 typedef bool (*slru_page_revalidate_hook_type) (SlruDesc *ctl, int64 pageno);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
