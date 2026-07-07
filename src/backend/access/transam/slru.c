@@ -1649,7 +1649,7 @@ restart:
 	 */
 	if (slru_truncate_hook && !tombstoned)
 	{
-		(*slru_truncate_hook) (ctl, cutoffPage);
+		(*slru_truncate_hook) (ctl, cutoffPage, InvalidXLogRecPtr);
 		tombstoned = true;
 	}
 
@@ -1752,7 +1752,8 @@ SlruDeleteSegment(SlruDesc *ctl, int64 segno)
 	 * the end of this segment.
 	 */
 	if (slru_truncate_hook)
-		(*slru_truncate_hook) (ctl, (segno + 1) * SLRU_PAGES_PER_SEGMENT);
+		(*slru_truncate_hook) (ctl, (segno + 1) * SLRU_PAGES_PER_SEGMENT,
+							   InvalidXLogRecPtr);
 
 	/* Clean out any possibly existing references to the segment. */
 	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);

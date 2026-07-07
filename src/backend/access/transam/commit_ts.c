@@ -128,7 +128,7 @@ static void TransactionIdSetCommitTs(TransactionId xid, TimestampTz ts,
 static void error_commit_ts_disabled(void);
 static void ActivateCommitTs(void);
 static void DeactivateCommitTs(void);
-static void WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid);
+static XLogRecPtr WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid);
 
 /*
  * TransactionTreeSetCommitTsData
@@ -796,7 +796,7 @@ DeactivateCommitTs(void)
 	 * coverage loss instead of erroring here.
 	 */
 	if (slru_truncate_hook)
-		(*slru_truncate_hook) (CommitTsCtl, PG_INT64_MAX);
+		(*slru_truncate_hook) (CommitTsCtl, PG_INT64_MAX, InvalidXLogRecPtr);
 
 	(void) SlruScanDirectory(CommitTsCtl, SlruScanDirCbDeleteAll, NULL);
 
@@ -890,7 +890,15 @@ TruncateCommitTs(TransactionId oldestXact)
 		return;					/* nothing to remove */
 
 	/* Write XLOG record */
-	WriteTruncateXlogRec(cutoffPage, oldestXact);
+	{
+		XLogRecPtr	trunc_lsn;
+
+		trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
+
+		/* Same exact-LSN pre-barrier as TruncateCLOG(). */
+		if (slru_truncate_hook)
+			(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
+	}
 
 	/* Now we can remove the old CommitTs segment(s) */
 	SimpleLruTruncate(CommitTsCtl, cutoffPage);
@@ -986,7 +994,7 @@ commit_ts_errdetail_for_io_error(const void *opaque_data)
 /*
  * Write a TRUNCATE xlog record
  */
-static void
+static XLogRecPtr
 WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid)
 {
 	xl_commit_ts_truncate xlrec;
@@ -996,7 +1004,7 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid)
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfCommitTsTruncate);
-	(void) XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
+	return XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
 }
 
 /*
