@@ -1014,8 +1014,9 @@ ps_slru_reader_fetch_wm(void)
 		uint64		w;
 
 		ps_slru_obj_key(&key, 0);
-		if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_WM, &key, 0,
-										   PG_UINT64_MAX, page, NULL))
+		if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_WM, &key, 0,
+												   PG_UINT64_MAX, page, NULL,
+												   PS_SLRU_SHIP_TIMEOUT_MS))
 		{
 			memcpy(&w, page, sizeof(uint64));
 			for (;;)
@@ -1035,8 +1036,10 @@ ps_slru_reader_fetch_wm(void)
 			int64		cutoff;
 
 			ps_slru_obj_key(&key, ps_slru_dirmap[i].obj);
-			if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
-											   PG_UINT64_MAX, page, &resolved))
+			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB, &key,
+													   0, PG_UINT64_MAX, page,
+													   &resolved,
+													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
 				memcpy(&cutoff, page, sizeof(int64));
 				ps_slru_tomb_note(i, cutoff, resolved);
@@ -1130,8 +1133,10 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 
 			/* pages below the newest tombstone are dead, whatever exists */
 			ps_slru_obj_key(&key, obj);
-			if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
-											   PG_UINT64_MAX, tpage, &tombv))
+			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
+													   &key, 0, PG_UINT64_MAX,
+													   tpage, &tombv,
+													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
@@ -1143,9 +1148,12 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 
 				ps_slru_obj_key(&key, obj);
 				have_image =
-					pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_LIVE, &key,
-												   (BlockNumber) pageno,
-												   PG_UINT64_MAX, page, &iv);
+					pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE,
+														   &key,
+														   (BlockNumber) pageno,
+														   PG_UINT64_MAX, page,
+														   &iv,
+														   PS_SLRU_SHIP_TIMEOUT_MS);
 
 				/*
 				 * A tombstone kills only what predates it: an image shipped
@@ -1173,14 +1181,32 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 				{
 					if (have_image)
 						res = SLRU_READ_HOOK_SERVED;
+					else if (RecoveryInProgress() &&
+							 !ps_slru_local_segment_exists(ctl, pageno))
+					{
+						/*
+						 * No image AND no local segment while in recovery:
+						 * the local fallback would fabricate an all-zero
+						 * page (SlruPhysicalReadPage treats ENOENT as
+						 * zeros under InRecovery), silently erasing
+						 * status.  Fail closed instead.
+						 */
+						res = SLRU_READ_HOOK_FAILED;
+					}
 
 					/*
 					 * Remember the decision epoch either way (a FALLBACK
 					 * page cached from the local file was also judged
-					 * against this watermark and tombstone); see the
-					 * revalidator.
+					 * against this watermark and tombstone).  The
+					 * tombstone's version folds in only when it covers
+					 * this page (or the served image survived it):
+					 * inflating an unrelated page's epoch toward tombv
+					 * would let it skip the re-read it owes a later
+					 * watermark advance.  See the revalidator.
 					 */
-					ps_slru_served_note(obj, (uint32) pageno, Max(w, tombv));
+					if (res != SLRU_READ_HOOK_FAILED)
+						ps_slru_served_note(obj, (uint32) pageno,
+											pageno < cutoff ? Max(w, tombv) : w);
 				}
 			}
 		}
@@ -1238,8 +1264,10 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			uint64		tombv = 0;
 
 			ps_slru_obj_key(&key, obj);
-			if (pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_TOMB, &key, 0,
-											   PG_UINT64_MAX, tpage, &tombv))
+			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
+													   &key, 0, PG_UINT64_MAX,
+													   tpage, &tombv,
+													   PS_SLRU_SHIP_TIMEOUT_MS))
 			{
 				memcpy(&cutoff, tpage, sizeof(int64));
 				ps_slru_tomb_note(idx, cutoff, tombv);
@@ -1251,9 +1279,12 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 
 				ps_slru_obj_key(&key, obj);
 				have_image =
-					pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_LIVE, &key,
-												   (BlockNumber) pageno,
-												   PG_UINT64_MAX, tpage, &iv);
+					pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE,
+														   &key,
+														   (BlockNumber) pageno,
+														   PG_UINT64_MAX, tpage,
+														   &iv,
+														   PS_SLRU_SHIP_TIMEOUT_MS);
 
 				/* same tombstone-vs-newer-image rule as the read hook */
 				if (pageno < cutoff && (!have_image || iv <= tombv))
@@ -2322,10 +2353,10 @@ pagestore_slru_live_read_at(PG_FUNCTION_ARGS)
 	char	   *out = palloc(BLCKSZ);
 	bytea	   *result;
 
-	if (!ps_slru_mirror_enabled)
+	if (!ps_slru_mirror_enabled && !ps_slru_live_reads_enabled)
 		ereport(ERROR,
 				(errmsg("the SLRU live mirror is not active"),
-				 errhint("Set pagestore.slru_mirror = on (with the localsvc backend).")));
+				 errhint("Set pagestore.slru_mirror or pagestore.slru_live_reads = on (with the localsvc backend).")));
 	if (!ps_slru_dir_obj(slru, &obj))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

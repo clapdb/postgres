@@ -300,25 +300,39 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
-	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+	/*
+	 * Any error escaping this wait -- the timeout below, but also a query
+	 * cancel or backend terminate raised by CHECK_FOR_INTERRUPTS() -- must
+	 * abandon the channel first: the REQUEST may still be in the daemon's
+	 * pipeline, and reusing the channel for the next op would collide with
+	 * its late completion.  (An abandoned channel is reclaimed once its
+	 * DONE arrives; see ls_claim_channel.)
+	 */
+	PG_TRY();
 	{
-		if (((++spins) & 0xFFF) == 0)
+		while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		{
-			CHECK_FOR_INTERRUPTS();
-			if (deadline != 0 && time(NULL) >= deadline)
+			if (((++spins) & 0xFFF) == 0)
 			{
-				ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
-				ls_channel = -1;
-				ls_channel_shard = UINT32_MAX;
-				ereport(ERROR,
-						(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
-								ch->opcode)));
+				CHECK_FOR_INTERRUPTS();
+				if (deadline != 0 && time(NULL) >= deadline)
+					ereport(ERROR,
+							(errmsg("pagestore localsvc: timed out waiting for daemon op %u",
+									ch->opcode)));
 			}
-		}
 #if defined(__x86_64__) || defined(__i386__)
-		__builtin_ia32_pause();
+			__builtin_ia32_pause();
 #endif
+		}
 	}
+	PG_CATCH();
+	{
+		ps_store_release(&ch->claimed, LS_CLAIMED_ABANDONED);
+		ls_channel = -1;
+		ls_channel_shard = UINT32_MAX;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if (ch->status != PS_STATUS_OK)
 		ereport(ERROR,
@@ -915,6 +929,17 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 							   BlockNumber block, uint64 version, void *page,
 							   uint64 *resolved)
 {
+	return pagestore_localsvc_obj_read_at_timeout(klass, key, block, version,
+												  page, resolved, 0);
+}
+
+/* Bounded-wait variant; see pagestore_localsvc_obj_write_timeout. */
+bool
+pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
+									   BlockNumber block, uint64 version,
+									   void *page, uint64 *resolved,
+									   int timeout_ms)
+{
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	bool		found;
 
@@ -923,7 +948,7 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = version;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 	memcpy(page, ch->data, BLCKSZ);
 	found = ch->result != 0;
 	if (resolved)
