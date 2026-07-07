@@ -125,8 +125,9 @@ typedef struct PsSlruPending
 								 * at capture time, an upper bound of every
 								 * bit the bytes contain (group fences alone
 								 * understate it -- synchronous commits do
-								 * not update group LSNs); lifted above the
-								 * last-shipped floor at post time */
+								 * not update group LSNs); sampled under the
+								 * bank lock, so version order is capture
+								 * order */
 	XLogRecPtr	posted_fence;	/* version of a post that may have reached
 								 * the daemon; freezes the bytes (see
 								 * ps_slru_write_hook) */
@@ -188,10 +189,6 @@ ps_slru_note_lost(void)
 	ps_slru_wm_note_lost();
 }
 
-#define PS_SLRU_SHIPPED_SLOTS	4096	/* power of two; sized to make hash
-										 * collisions (spurious deferrals)
-										 * negligible */
-
 /*
  * The visibility watermark (mirrored_status_lsn): an LSN W such that every
  * in-scope SLRU status change with WAL position <= W is durably mirrored.
@@ -225,22 +222,18 @@ ps_slru_note_lost(void)
  *   pagestore_slru_mirror_reset_debt()), not something a later checkpoint
  *   can silently declare.
  *
- * Image versions are real WAL positions -- the image's capture-time fence,
- * lifted at ship time above every version the page has ever shipped at
- * (last_shipped, a shared CAS-max table).  Two images of the same page
- * never carry the same version, so the later capture -- whose bytes are a
- * superset, SLRU pages being accretive -- always outranks the earlier one,
- * across processes too.  A group-LSN fence alone cannot promise that
- * (recomputed fences can shrink on eviction/reload, and captures in
- * different processes can race), and a newer image shadowed by an older
- * one at a higher version would un-mirror status the watermark already
- * vouched for.  Lifting never exceeds the current WAL position: when the
- * floor has caught up with the insert pointer, the entry is DEFERRED to a
- * later drain (its pending floor keeps the watermark honest meanwhile, and
- * any WAL insertion -- at latest the next checkpoint record -- unblocks
- * it).  Versions therefore stay comparable to LSNs (as-of reads, tombstone
- * ordering) and stay ordered across restarts without any persistent
- * allocator state: WAL positions only grow.
+ * Image versions are real WAL positions: the capture-time BOUND, the
+ * insert position sampled while the page's bank lock is held.  That lock
+ * serializes all captures of one page, so version order across processes
+ * IS capture order -- a later capture (a byte superset, SLRU pages being
+ * accretive) always carries a bound at least as high, and two captures
+ * with EQUAL bounds had no WAL between them and are therefore
+ * byte-identical, making a same-version store tie harmless.  A group-LSN
+ * fence alone cannot promise any of that (recomputed fences shrink on
+ * eviction/reload, and understate contents anyway), which is why the
+ * fence is only the flush obligation and never the version.  Bounds stay
+ * comparable to LSNs (as-of reads, tombstone ordering) and stay ordered
+ * across restarts without any allocator state: WAL positions only grow.
  *
  * The local commit is never held back -- only its visibility to other
  * computes waits for the mirror.
@@ -254,13 +247,6 @@ typedef struct PsSlruWatermarkShm
 									 * unlike total_lost it is not seeded
 									 * with boot debt and never reset */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
-
-	/*
-	 * Highest version ever shipped, per page-hash slot (conservative on
-	 * collisions: a too-high floor only defers a ship, never a wrong
-	 * version).  CAS-max before every post.
-	 */
-	pg_atomic_uint64 last_shipped[PS_SLRU_SHIPPED_SLOTS];
 
 	/*
 	 * Per-process pending floor + owner pid.  A nonzero floor whose owner
@@ -433,8 +419,6 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->total_lost, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->stats_lost, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
-		for (int i = 0; i < PS_SLRU_SHIPPED_SLOTS; i++)
-			pg_atomic_init_u64(&ps_slru_wm->last_shipped[i], 0);
 		for (int i = 0; i < ps_slru_wm_nprocs; i++)
 		{
 			pg_atomic_init_u64(&ps_slru_wm->pending[i].floor, 0);
@@ -548,65 +532,6 @@ ps_slru_debt_persist(void)
 				(errcode_for_file_access(),
 				 errmsg("pagestore: could not persist SLRU mirror debt marker \"%s\": %m",
 						PS_SLRU_DEBT_FILE)));
-}
-
-/*
- * The shipped-version floor for a page: the highest version any image of
- * any page hashing to its slot was ever posted at.  Conservative on
- * collisions -- a too-high floor only defers a ship, never mis-versions
- * one.
- */
-static inline int
-ps_slru_shipped_slot(uint32 obj, uint32 pageno)
-{
-	uint32		h = obj ^ (pageno * 2654435761u);
-
-	return (int) (h & (PS_SLRU_SHIPPED_SLOTS - 1));
-}
-
-/*
- * Atomically reserve a version for a page: strictly above everything its
- * slot has ever shipped at, at least the capture bound, never past the
- * current WAL position.  The reservation is a CAS -- two backends draining
- * captures of the same page with the same bound must not both keep it, or
- * the store's arrival order would decide which bytes win the tie.  Returns
- * false to defer (the floor has caught up with the insert pointer; any WAL
- * insertion unblocks the entry at a later drain, and its pending floor
- * keeps the watermark honest meanwhile).
- */
-static bool
-ps_slru_shipped_reserve(uint32 obj, uint32 pageno, XLogRecPtr bound,
-						XLogRecPtr *version)
-{
-	pg_atomic_uint64 *slot;
-
-	if (ps_slru_wm == NULL)
-	{
-		*version = bound;
-		return true;
-	}
-	slot = &ps_slru_wm->last_shipped[ps_slru_shipped_slot(obj, pageno)];
-	for (;;)
-	{
-		uint64		cur = pg_atomic_read_u64(slot);
-		uint64		want;
-
-		if ((uint64) bound > cur)
-			want = (uint64) bound;
-		else
-		{
-			XLogRecPtr	now = ps_slru_now_lsn();
-
-			if (cur >= (uint64) now)
-				return false;	/* deferred until the WAL advances */
-			want = cur + 1;
-		}
-		if (pg_atomic_compare_exchange_u64(slot, &cur, want))
-		{
-			*version = (XLogRecPtr) want;
-			return true;
-		}
-	}
 }
 
 /*
@@ -1228,7 +1153,16 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 					if (f < shared->group_lsn[lsnindex + off])
 						f = shared->group_lsn[lsnindex + off];
 			}
-			*fence = f;
+			/*
+			 * The bound must be sampled UNDER the bank lock: version order
+			 * across captures of one page is exactly their bank-lock
+			 * serialization order, and a bound taken after the release
+			 * could inflate past a concurrent (newer) capture's.  The copy
+			 * may race write-OK status setters admitted under LW_SHARED,
+			 * so the group-LSN fence is not trusted as the bound; the
+			 * in-lock "now" covers whatever the copy saw.
+			 */
+			*fence = ps_slru_now_lsn();
 			found = true;
 			break;
 		}
@@ -1236,16 +1170,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 	LWLockRelease(banklock);
 
 	if (found)
-	{
-		/*
-		 * The copy raced concurrent status updates (LW_SHARED admits
-		 * write-OK setters under some SLRUs' protocols), so the group-LSN
-		 * fence read afterwards may not cover the newest bit.  Stamp "now"
-		 * instead of trusting it; visibility is only delayed.
-		 */
-		*fence = ps_slru_now_lsn();
 		return true;
-	}
 
 	/* Evicted: the bytes were flushed locally; read the segment file. */
 	{
@@ -1255,6 +1180,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 		off_t		offset = (off_t) rpageno * BLCKSZ;
 		int			fd;
 		ssize_t		n;
+		bool		resident = false;
 
 		if (ctl->options.long_segment_names)
 			snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
@@ -1269,8 +1195,30 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 		CloseTransientFile(fd);
 		if (n != BLCKSZ)
 			return false;
-		*fence = ps_slru_now_lsn();
-		return true;
+
+		/*
+		 * Sample the bound under the bank lock, after confirming the page
+		 * is STILL not resident: a write in progress keeps its page
+		 * resident (WRITE_IN_PROGRESS), so non-residency here proves the
+		 * file bytes we just read include every capture that could have
+		 * been bank-lock-ordered before this bound.  If the page was
+		 * loaded meanwhile, retry through the resident path next drain.
+		 */
+		LWLockAcquire(banklock, LW_SHARED);
+		for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
+		{
+			if (shared->page_number[slotno] == (int64) r->pageno &&
+				shared->page_status[slotno] != SLRU_PAGE_EMPTY)
+			{
+				resident = true;
+				break;
+			}
+		}
+		if (!resident)
+			*fence = ps_slru_now_lsn();
+		LWLockRelease(banklock);
+
+		return !resident;
 	}
 }
 
@@ -1400,24 +1348,17 @@ ps_slru_drain(void)
 			/*
 			 * A retry of an already-posted entry must reuse the posted
 			 * version verbatim (the bytes are frozen to match).  A fresh
-			 * post is versioned by its capture-time bound, lifted above
-			 * every version its page ever shipped at (last_shipped): two
-			 * images of one page must never carry the same version, or
-			 * the store's arrival order would decide which bytes win.
-			 * The lift must not exceed the current WAL position, though
-			 * -- versions stay LSN-comparable for as-of readers and
-			 * tombstone ordering -- so when the floor has caught up with
-			 * the insert pointer the entry is DEFERRED: its pending floor
-			 * keeps the watermark honest, and any WAL insertion (at
-			 * latest the next checkpoint record) unblocks it.
+			 * post is versioned by its capture-time bound: bounds are
+			 * sampled under the page's bank lock, so version order IS
+			 * capture order across processes, and equal bounds imply
+			 * byte-identical images (no WAL between the captures) -- a
+			 * same-version store tie is harmless.
 			 */
 			version = p->posted_fence;
 			if (XLogRecPtrIsInvalid(version))
 			{
-				Assert(!XLogRecPtrIsInvalid(p->bound));
-				if (!ps_slru_shipped_reserve(p->obj, p->pageno, p->bound,
-											 &version))
-					continue;	/* deferred until the WAL advances */
+				version = p->bound;
+				Assert(!XLogRecPtrIsInvalid(version));
 			}
 
 			/*
@@ -1443,8 +1384,7 @@ ps_slru_drain(void)
 			 * times out or errors mid-flight, the request may still be
 			 * applied later, and only an already-set posted_fence keeps
 			 * the write hook from mutating the entry into a same-version,
-			 * different-bytes retry.  (The last-shipped floor was already
-			 * raised by the atomic reservation above.)
+			 * different-bytes retry.
 			 */
 			p->posted_fence = version;
 
