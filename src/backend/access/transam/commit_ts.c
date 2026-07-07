@@ -787,6 +787,17 @@ DeactivateCommitTs(void)
 	 * it.  Note also that no process should be consulting this SLRU if we
 	 * have just deactivated it.
 	 */
+	/*
+	 * A store-backed SLRU mirror must durably stop serving pg_commit_ts
+	 * before the local files vanish; this reset removes them all, so the
+	 * barrier covers every page (PG_INT64_MAX).  A reset cannot be
+	 * abandoned the way a truncation can, and this also runs during
+	 * parameter-change replay -- the hook degrades store failures to a
+	 * coverage loss instead of erroring here.
+	 */
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (CommitTsCtl, PG_INT64_MAX);
+
 	(void) SlruScanDirectory(CommitTsCtl, SlruScanDirCbDeleteAll, NULL);
 
 	LWLockRelease(CommitTsLock);

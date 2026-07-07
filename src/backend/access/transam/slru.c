@@ -1569,21 +1569,10 @@ SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 {
 	SlruShared	shared = ctl->shared;
 	int			prevbank;
+	bool		tombstoned = false;
 
 	/* update the stats counter of truncates */
 	pgstat_count_slru_truncate(shared->slru_stats_idx);
-
-	/*
-	 * Let an external page-store mirror publish a truncation tombstone
-	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
-	 * pages to other computes must be able to stop serving the truncated
-	 * range no later than the local files disappear.  The hook may raise an
-	 * error (we are never in a critical section here), in which case the
-	 * truncation is abandoned before anything was removed -- retried by the
-	 * next vacuum/checkpoint cycle, exactly like any other truncate failure.
-	 */
-	if (slru_truncate_hook)
-		(*slru_truncate_hook) (ctl, cutoffPage);
 
 	/*
 	 * Scan shared memory and remove any pages preceding the cutoff page, to
@@ -1606,6 +1595,26 @@ restart:
 				(errmsg("could not truncate directory \"%s\": apparent wraparound",
 						ctl->options.Dir)));
 		return;
+	}
+
+	/*
+	 * Let an external page-store mirror publish a truncation tombstone
+	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
+	 * pages to other computes must be able to stop serving the truncated
+	 * range no later than the local files disappear.  This runs after the
+	 * wraparound backstop above (a skipped truncation must not durably
+	 * declare its range dead), and only once (the restart loop may come by
+	 * again).  Unless we are inside a critical section (multixact
+	 * truncation; a pre-barrier covers the hook there -- see
+	 * TruncateMultiXact), the hook may raise an error, in which case the
+	 * truncation is abandoned before anything was removed -- retried by
+	 * the next vacuum/checkpoint cycle, exactly like any other truncate
+	 * failure.
+	 */
+	if (slru_truncate_hook && !tombstoned)
+	{
+		(*slru_truncate_hook) (ctl, cutoffPage);
+		tombstoned = true;
 	}
 
 	prevbank = SlotGetBankNumber(0);

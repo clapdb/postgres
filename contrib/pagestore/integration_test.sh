@@ -843,6 +843,30 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "t" \
 	"watermark advances across a traffic + checkpoint cycle"
 
+# --- 28b. mirror debt: an unclean shutdown freezes the watermark for good ---
+# A crash may kill processes holding staged-but-unsynced images whose pages
+# are clean on local disk and will never be flushed (and thus re-captured)
+# again.  That hole cannot be proven re-covered, so after a crash boot the
+# watermark must stay frozen -- persistently, via the debt marker -- until an
+# operator re-primes the mirror and explicitly resets the debt.
+"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -c "CREATE FUNCTION pagestore_slru_mirror_reset_debt() RETURNS bigint
+        AS 'pagestore','pagestore_slru_mirror_reset_debt' LANGUAGE C;" >/dev/null
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NULL;")" "t" \
+	"watermark stays frozen after a crash boot (boot debt)"
+assert "$(test -f "$DATA/pagestore.slru_mirror_debt" && echo t)" "t" \
+	"the boot debt is persisted as a marker file"
+assert "$($P -c "SELECT pagestore_slru_mirror_reset_debt() >= 1;")" "t" \
+	"reset_debt reports and clears the outstanding losses"
+assert "$(test -f "$DATA/pagestore.slru_mirror_debt" || echo t)" "t" \
+	"reset_debt removes the marker file"
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
+	"watermark advances again once the debt is reset"
+
 # --- 29. SLRU truncation tombstones: durable before local deletion ---
 # slru_truncate_hook publishes a durable cutoff tombstone BEFORE any local
 # segment is deleted; a live-mirror reader must treat pages below the newest
