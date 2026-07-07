@@ -955,7 +955,16 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 					if (f < shared->group_lsn[lsnindex + off])
 						f = shared->group_lsn[lsnindex + off];
 			}
-			*fence = f;
+			/*
+			 * The bound must be sampled UNDER the bank lock: version order
+			 * across captures of one page is exactly their bank-lock
+			 * serialization order, and a bound taken after the release
+			 * could inflate past a concurrent (newer) capture's.  The copy
+			 * may race write-OK status setters admitted under LW_SHARED,
+			 * so the group-LSN fence is not trusted as the bound; the
+			 * in-lock "now" covers whatever the copy saw.
+			 */
+			*fence = ps_slru_now_lsn();
 			found = true;
 			break;
 		}
@@ -963,16 +972,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 	LWLockRelease(banklock);
 
 	if (found)
-	{
-		/*
-		 * The copy raced concurrent status updates (LW_SHARED admits
-		 * write-OK setters under some SLRUs' protocols), so the group-LSN
-		 * fence read afterwards may not cover the newest bit.  Stamp "now"
-		 * instead of trusting it; visibility is only delayed.
-		 */
-		*fence = ps_slru_now_lsn();
 		return true;
-	}
 
 	/* Evicted: the bytes were flushed locally; read the segment file. */
 	{
@@ -982,6 +982,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 		off_t		offset = (off_t) rpageno * BLCKSZ;
 		int			fd;
 		ssize_t		n;
+		bool		resident = false;
 
 		if (ctl->options.long_segment_names)
 			snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
@@ -996,8 +997,30 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 		CloseTransientFile(fd);
 		if (n != BLCKSZ)
 			return false;
-		*fence = ps_slru_now_lsn();
-		return true;
+
+		/*
+		 * Sample the bound under the bank lock, after confirming the page
+		 * is STILL not resident: a write in progress keeps its page
+		 * resident (WRITE_IN_PROGRESS), so non-residency here proves the
+		 * file bytes we just read include every capture that could have
+		 * been bank-lock-ordered before this bound.  If the page was
+		 * loaded meanwhile, retry through the resident path next drain.
+		 */
+		LWLockAcquire(banklock, LW_SHARED);
+		for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
+		{
+			if (shared->page_number[slotno] == (int64) r->pageno &&
+				shared->page_status[slotno] != SLRU_PAGE_EMPTY)
+			{
+				resident = true;
+				break;
+			}
+		}
+		if (!resident)
+			*fence = ps_slru_now_lsn();
+		LWLockRelease(banklock);
+
+		return !resident;
 	}
 }
 
