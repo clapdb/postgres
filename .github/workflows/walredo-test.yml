@@ -79,6 +79,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          sudo find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*microsoft*' -o -name '*azure-cli*' \) -print -delete
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             meson ninja-build bison flex pkg-config \
