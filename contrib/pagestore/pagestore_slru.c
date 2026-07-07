@@ -187,6 +187,7 @@ static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
 static XLogRecPtr ps_slru_flush_pos(XLogRecPtr ptr);
+static void ps_slru_rearm_interrupt(void);
 static void ps_slru_debt_persist(void);
 static void ps_slru_wm_note_lost(void);
 
@@ -948,8 +949,10 @@ ps_slru_wm_publish(void)
 		rethrow = (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
 				   edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN);
 		FreeErrorData(edata);
-		if (rethrow)
+		if (rethrow && !ps_slru_no_rethrow)
 			PG_RE_THROW();
+		if (rethrow)
+			ps_slru_rearm_interrupt();
 
 		FlushErrorState();
 		ereport(WARNING,
@@ -969,10 +972,23 @@ ps_slru_tomb_cached(int idx, int64 *cutoff, uint64 *version)
 	*version = 0;
 	if (ps_slru_wm == NULL)
 		return;
-	c = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
-	v = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
-	if (c == 0 || v == 0 || v == PG_UINT64_MAX)
-		return;					/* none known, or an update in flight */
+	for (;;)
+	{
+		uint64		v2;
+
+		v = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+		if (v == 0 || v == PG_UINT64_MAX)
+			return;				/* none known, or an update in flight */
+		c = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
+		pg_memory_barrier();
+		v2 = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+		if (v == v2)
+			break;
+		if (v2 == 0 || v2 == PG_UINT64_MAX)
+			return;
+	}
+	if (c == 0)
+		return;
 	*cutoff = (int64) (c - 1);
 	*version = v;
 }
@@ -1102,6 +1118,22 @@ ps_slru_local_segment_exists(SlruDesc *ctl, int64 pageno)
 	return stat(path, &st) == 0;
 }
 
+static bool
+ps_slru_local_page_exists(SlruDesc *ctl, int64 pageno)
+{
+	char		path[MAXPGPATH];
+	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
+	int			rpageno = (int) (pageno % SLRU_PAGES_PER_SEGMENT);
+	struct stat st;
+
+	if (ctl->options.long_segment_names)
+		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
+	else
+		snprintf(path, MAXPGPATH, "%s/%04X", ctl->options.Dir,
+				 (unsigned int) segno);
+	return stat(path, &st) == 0 && st.st_size >= (off_t) (rpageno + 1) * BLCKSZ;
+}
+
 /*
  * slru_page_read_hook consumer: serve a physical SLRU page read from the
  * live mirror, gated on the published watermark.  Runs inside the
@@ -1176,8 +1208,8 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 */
 			if (pageno < cached_cut)
 				res = SLRU_READ_HOOK_FAILED;
-			else if (RecoveryInProgress() &&
-					 !ps_slru_local_segment_exists(ctl, pageno))
+			else if (!ps_slru_mirror_enabled &&
+					 !ps_slru_local_page_exists(ctl, pageno))
 				res = SLRU_READ_HOOK_FAILED;
 			else if (cached_cut >= 0)
 				ps_slru_served_note(obj, (uint32) pageno, cached_ver);
@@ -1247,7 +1279,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 					if (have_image)
 						res = SLRU_READ_HOOK_SERVED;
 					else if (RecoveryInProgress() &&
-							 !ps_slru_local_segment_exists(ctl, pageno))
+							 !ps_slru_local_page_exists(ctl, pageno))
 					{
 						/*
 						 * No image AND no local segment while in recovery:
@@ -1288,7 +1320,9 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * a stale local segment.  (The newer-image override needs working
 		 * IPC by definition; without it, dead is dead.)
 		 */
-		if (pageno < cached_cut)
+		if (pageno < cached_cut ||
+			(RecoveryInProgress() &&
+			 !ps_slru_local_page_exists(ctl, pageno)))
 			res = SLRU_READ_HOOK_FAILED;
 		else
 			res = SLRU_READ_HOOK_FALLBACK;
@@ -1351,10 +1385,10 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			{
 				*exists = false;
 				res = SLRU_READ_HOOK_SERVED;
-			}
-			else if (!ps_slru_mirror_enabled &&
-					 !ps_slru_local_segment_exists(ctl, pageno))
-				res = SLRU_READ_HOOK_FAILED;
+		}
+		else if (!ps_slru_mirror_enabled &&
+				 !ps_slru_local_page_exists(ctl, pageno))
+			res = SLRU_READ_HOOK_FAILED;
 		}
 		else
 		{
@@ -1546,6 +1580,8 @@ static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
 static void
 ps_slru_tomb_rederive(void)
 {
+	volatile bool commit_ts_locked = false;
+
 	/*
 	 * Serialize against concurrent truncations, or a scan could observe a
 	 * deletion in progress and publish its (higher) cutoff at a version
@@ -1565,11 +1601,19 @@ ps_slru_tomb_rederive(void)
 			struct dirent *de;
 			int64		minseg = -1;
 			int64		cutoff;
+			bool		commit_ts = strcmp(ps_slru_dirmap[i].dir,
+										   "pg_commit_ts") == 0;
+
+			if (commit_ts)
+			{
+				LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
+				commit_ts_locked = true;
+			}
 
 			/*
-			 * Scan failures must abort the priming (ReadDir raises), not
-			 * read as an empty directory: an empty scan publishes an
-			 * everything-dead cutoff.
+			 * Scan failures must abort the priming (ReadDir raises), not read
+			 * as an empty directory: an empty scan publishes an everything-dead
+			 * cutoff.
 			 */
 			dir = AllocateDir(ps_slru_dirmap[i].dir);
 			while ((de = ReadDir(dir, ps_slru_dirmap[i].dir)) != NULL)
@@ -1588,12 +1632,20 @@ ps_slru_tomb_rederive(void)
 
 			cutoff = (minseg < 0) ? PG_INT64_MAX
 				: minseg * SLRU_PAGES_PER_SEGMENT;
+			ps_slru_tomb_covered_set[i] = false;
 			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
 								   ps_slru_now_lsn());
+			if (commit_ts)
+			{
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+			}
 		}
 	}
 	PG_CATCH();
 	{
+		if (commit_ts_locked)
+			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
 		LWLockRelease(WrapLimitsVacuumLock);
 		PG_RE_THROW();
@@ -1742,69 +1794,65 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 {
 	int			free_slot = -1;
 
+	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
-		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
+		PsSlruPending *p = &ps_slru_queue[i];
+
+		if (p->used)
 		{
-			PsSlruPending *p = &ps_slru_queue[i];
-
-			if (p->used)
+			if (p->obj == obj && p->pageno == pageno)
 			{
-				if (p->obj == obj && p->pageno == pageno)
+				/*
+				 * Same page staged again before a drain.  If a post of this
+				 * entry may have reached the daemon (a previous drain timed
+				 * out or failed after obj_write), the bytes must stay exactly
+				 * what was posted: the store resolves same-version appends by
+				 * arrival order, and an abandoned request can land after our
+				 * retry -- byte-identical duplicates make that order
+				 * irrelevant.  The newer bytes become a recapture instead,
+				 * re-snapshotted at drain time and shipped strictly above the
+				 * posted version (the last-shipped floor guarantees it).
+				 */
+				if (!XLogRecPtrIsInvalid(p->posted_fence))
 				{
-					/*
-					 * Same page staged again before a drain.  If a post of
-					 * this entry may have reached the daemon (a previous
-					 * drain timed out or failed after obj_write), the bytes
-					 * must stay exactly what was posted: the store resolves
-					 * same-version appends by arrival order, and an
-					 * abandoned request can land after our retry --
-					 * byte-identical duplicates make that order irrelevant.
-					 * The newer bytes become a recapture instead,
-					 * re-snapshotted at drain time and shipped strictly
-					 * above the posted version (the last-shipped floor
-					 * guarantees it).
-					 */
-					if (!XLogRecPtrIsInvalid(p->posted_fence))
-					{
-						ps_slru_note_recapture(ctl, obj, pageno);
-						return;
-					}
-
-					/*
-					 * Keep the newest bytes.  The fence and the bound only
-					 * ever need to grow -- a smaller recomputed fence
-					 * (group LSNs reset on eviction/reload) must not
-					 * un-fence bits the older image already carried.
-					 */
-					memcpy(p->image, page, BLCKSZ);
-					if (p->fence_lsn < fence_lsn)
-						p->fence_lsn = fence_lsn;
-					if (p->bound < bound)
-						p->bound = bound;
-					ps_slru_wm_note_pending(p->fence_lsn);
+					ps_slru_note_recapture(ctl, obj, pageno);
 					return;
 				}
+
+				/*
+				 * Keep the newest bytes.  The fence and the bound only ever
+				 * need to grow -- a smaller recomputed fence (group LSNs reset
+				 * on eviction/reload) must not un-fence bits the older image
+				 * already carried.
+				 */
+				memcpy(p->image, page, BLCKSZ);
+				ps_slru_wm_note_pending(fence_lsn);
+				if (p->fence_lsn < fence_lsn)
+					p->fence_lsn = fence_lsn;
+				if (p->bound < bound)
+					p->bound = bound;
+				return;
 			}
-			else if (free_slot < 0)
-				free_slot = i;
 		}
+		else if (free_slot < 0)
+			free_slot = i;
+	}
 
-		if (free_slot >= 0)
-		{
-			PsSlruPending *p = &ps_slru_queue[free_slot];
+	if (free_slot >= 0)
+	{
+		PsSlruPending *p = &ps_slru_queue[free_slot];
 
-			p->used = true;
-			p->shipped = false;
-			p->obj = obj;
-			p->pageno = pageno;
-			p->fence_lsn = fence_lsn;
-			p->bound = bound;
-			p->posted_fence = InvalidXLogRecPtr;
-			memcpy(p->image, page, BLCKSZ);
-			ps_slru_queue_count++;
-			ps_slru_wm_note_pending(fence_lsn);
-			return;
-		}
+		ps_slru_wm_note_pending(fence_lsn);
+		p->used = true;
+		p->shipped = false;
+		p->obj = obj;
+		p->pageno = pageno;
+		p->fence_lsn = fence_lsn;
+		p->bound = bound;
+		p->posted_fence = InvalidXLogRecPtr;
+		memcpy(p->image, page, BLCKSZ);
+		ps_slru_queue_count++;
+		return;
 	}
 
 	/* Queue full: record the page identity for recapture at drain time. */
@@ -2452,7 +2500,20 @@ pagestore_slru_mirror_truncate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cutoff page must be non-negative")));
 
-	ps_slru_ship_tombstone(obj, cutoff, ps_slru_now_lsn());
+	{
+		XLogRecPtr	version = ps_slru_now_lsn();
+
+		ps_slru_wm_note_pending(version);
+		PG_TRY();
+		{
+			ps_slru_ship_tombstone(obj, cutoff, version);
+		}
+		PG_FINALLY();
+		{
+			ps_slru_wm_republish_pending();
+		}
+		PG_END_TRY();
+	}
 	PG_RETURN_VOID();
 }
 
@@ -2539,7 +2600,25 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not remove debt marker \"%s\": %m",
 						PS_SLRU_DEBT_FILE)));
-	fsync_fname(".", true);
+	PG_TRY();
+	{
+		fsync_fname(".", true);
+	}
+	PG_CATCH();
+	{
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ps_slru_debt_persist();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * Discard the standing candidate before unfreezing debt: it may stem from
+	 * a checkpoint that completed while the mirror was frozen and unprimed.
+	 * Clearing after the CAS would give a concurrent drain tail a window to
+	 * publish that stale candidate.
+	 */
+	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
 	/*
 	 * The flag is cleared BEFORE the CAS: a loss that lands after the CAS
@@ -2562,14 +2641,6 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				 errhint("Re-prime the mirror and retry.")));
 	}
 
-	/*
-	 * Discard the standing candidate: it may stem from a checkpoint that
-	 * completed while the mirror was frozen and unprimed, and the operator's
-	 * "whole as of now" claim should only ever be published through a
-	 * checkpoint cycle that completes after it.  The next checkpoint sets a
-	 * fresh candidate.
-	 */
-	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 	PG_RETURN_INT64((int64) lost);
 }
 
