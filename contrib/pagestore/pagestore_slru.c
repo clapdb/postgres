@@ -1159,7 +1159,17 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 
 	/* the writer's own local files outrank its (lagging) mirror */
 	if (ps_slru_mirror_enabled && ps_slru_local_segment_exists(ctl, pageno))
+	{
+		/*
+		 * Local truth is unconditionally fresh: record a maximal epoch so
+		 * the revalidator does not treat the cached page as unknown (=
+		 * stale) and force a physical re-read on every cache hit.  A local
+		 * truncation discards the cached slots itself, so nothing can go
+		 * stale under this epoch on the writer.
+		 */
+		ps_slru_served_note(obj, (uint32) pageno, PG_UINT64_MAX);
 		return SLRU_READ_HOOK_FALLBACK;
+	}
 
 	PG_TRY();
 	{
