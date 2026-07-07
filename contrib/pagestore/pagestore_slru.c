@@ -624,11 +624,26 @@ ps_slru_tomb_note(int idx, int64 cutoff, uint64 version)
 	 * while the update is in flight), write the cutoff, then land the real
 	 * version.  A concurrent updater skips; the next TTL fetch re-notes.
 	 */
-	cur = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
-	if (version <= cur || cur == PG_UINT64_MAX ||
-		!pg_atomic_compare_exchange_u64(&ps_slru_wm->tomb_version[idx], &cur,
-										PG_UINT64_MAX))
-		return;
+	for (;;)
+	{
+		cur = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+		if (cur != PG_UINT64_MAX)
+		{
+			if (version <= cur)
+				return;
+			if (pg_atomic_compare_exchange_u64(&ps_slru_wm->tomb_version[idx],
+											   &cur, PG_UINT64_MAX))
+				break;
+		}
+
+		/*
+		 * Another updater is mid-flight.  Wait it out rather than skip:
+		 * the shared fetch TTL has already been advanced, so a skipped
+		 * newer cutoff would go unnoticed for a whole TTL.  The window is
+		 * two exchanges wide.
+		 */
+		pg_spin_delay();
+	}
 	(void) pg_atomic_exchange_u64(&ps_slru_wm->tomb_cutoff[idx],
 								  (uint64) cutoff + 1);
 	(void) pg_atomic_exchange_u64(&ps_slru_wm->tomb_version[idx], version);
@@ -1185,7 +1200,20 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * revalidation epoch.
 		 */
 		w = ps_slru_reader_fetch_wm();
-		if (w != 0)
+		if (w == 0)
+		{
+			/*
+			 * No watermark -- never published, or the fetch failed.  A
+			 * live-read compute in recovery with no local segment must
+			 * still fail closed: the InRecovery local fallback fabricates
+			 * an all-zero page out of ENOENT, and "the mirror is required
+			 * but unavailable" must not read as empty status.
+			 */
+			if (RecoveryInProgress() &&
+				!ps_slru_local_segment_exists(ctl, pageno))
+				res = SLRU_READ_HOOK_FAILED;
+		}
+		else
 		{
 			PageStoreRelKey key = {0};
 			char		tpage[BLCKSZ];
@@ -1317,7 +1345,19 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	{
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
-		if (w != 0)
+		if (w == 0)
+		{
+			/*
+			 * Same fail-closed rule as the read hook: existence callers
+			 * (ActivateCommitTs's zero-create, find_multixact_start) must
+			 * not mistake "mirror required but unavailable" for "page does
+			 * not exist".
+			 */
+			if (RecoveryInProgress() &&
+				!ps_slru_local_segment_exists(ctl, pageno))
+				res = SLRU_READ_HOOK_FAILED;
+		}
+		else
 		{
 			PageStoreRelKey key = {0};
 			char		tpage[BLCKSZ];
@@ -2394,6 +2434,10 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	if (ps_slru_wm == NULL)
 		ereport(ERROR,
 				(errmsg("the SLRU mirror is not active")));
+	if (!ps_slru_mirror_enabled)
+		ereport(ERROR,
+				(errmsg("priming is the mirror writer's operation"),
+				 errdetail("This compute only consumes the mirror (pagestore.slru_live_reads); its local SLRU state must not be published as truth.")));
 
 	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 
