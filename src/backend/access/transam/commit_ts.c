@@ -895,8 +895,13 @@ TruncateCommitTs(TransactionId oldestXact)
 
 		trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
 
-		/* Same exact-LSN pre-barrier as TruncateCLOG(). */
-		if (slru_truncate_hook)
+		/*
+		 * Same exact-LSN pre-barrier as TruncateCLOG(), with the same
+		 * apparent-wraparound pre-check.
+		 */
+		if (slru_truncate_hook &&
+			!CommitTsCtl->options.PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
+											   cutoffPage))
 			(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
 	}
 

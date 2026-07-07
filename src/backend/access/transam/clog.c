@@ -1024,9 +1024,15 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 		 * position (an as-of reader between the two would have the record
 		 * in its history but see no tombstone).  Run the barrier here with
 		 * that LSN; SimpleLruTruncate()'s own hook call then finds the
-		 * cutoff covered and no-ops.
+		 * cutoff covered and no-ops.  Skip it when SimpleLruTruncate()'s
+		 * apparent-wraparound backstop is going to refuse the truncation
+		 * -- a refused truncation must not durably declare its range dead
+		 * (should the state change in between, the in-truncate hook call
+		 * runs uncovered and ships with a sampled position).
 		 */
-		if (slru_truncate_hook)
+		if (slru_truncate_hook &&
+			!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
+										   cutoffPage))
 			(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
 	}
 

@@ -176,6 +176,7 @@ static bool ps_slru_exit_registered = false;
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
+static XLogRecPtr ps_slru_flush_pos(XLogRecPtr ptr);
 static void ps_slru_debt_persist(void);
 static void ps_slru_wm_note_lost(void);
 
@@ -1442,8 +1443,13 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 	PageStoreRelKey key = {0};
 	char		page[BLCKSZ];
 
-	if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < version)
-		XLogFlush(version);
+	if (!RecoveryInProgress())
+	{
+		XLogRecPtr	flushto = ps_slru_flush_pos(version);
+
+		if (GetFlushRecPtr(NULL) < flushto)
+			XLogFlush(flushto);
+	}
 
 	memset(page, 0, sizeof(page));
 	memcpy(page, &cutoff_page, sizeof(int64));
