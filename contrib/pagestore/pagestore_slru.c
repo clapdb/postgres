@@ -25,8 +25,10 @@
  * order the local SlruPhysicalWritePage() enforces), so a mirrored image
  * never advertises a commit whose WAL is not durable.  When the hook cannot
  * supply a fence (SLRUs without group LSNs, or redo-driven writes), the
- * drain stamps the current insert/replay position instead: a later version
- * only delays visibility, never advances it past the WAL.
+ * capture stamps the current insert/replay position instead -- at capture
+ * time, not at drain time: the page can be dirtied again between the flush
+ * and the drain, and a drain-time position would falsely cover those later
+ * changes.
  *
  * These live images are keyed PS_KLASS_SLRU_LIVE, deliberately NOT
  * PS_KLASS_SLRU: seed snapshots (pagestore_ship_slru_snapshot) carry a
@@ -151,6 +153,7 @@ static bool ps_slru_exit_registered = false;
 
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
+static XLogRecPtr ps_slru_now_lsn(void);
 
 /*
  * The in-scope SLRU directories (the WAL-logged, uint32-page ones; see
@@ -272,6 +275,18 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 		ps_slru_lost++;
 		return;
 	}
+
+	/*
+	 * A write that carries no fence (SLRUs without group LSNs, redo-driven
+	 * writes) is bounded at CAPTURE time: the bytes certainly contain
+	 * nothing past the current WAL position.  Stamping at drain time
+	 * instead would be wrong -- the page can be dirtied again between this
+	 * flush and the drain, and a drain-time position would falsely cover
+	 * those later changes.  (Reading the insert position is atomics/
+	 * spinlock only, fine under the bank lock.)
+	 */
+	if (XLogRecPtrIsInvalid(fence_lsn))
+		fence_lsn = ps_slru_now_lsn();
 
 	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
@@ -544,16 +559,13 @@ ps_slru_drain(void)
 			/*
 			 * A retry of an already-posted entry must reuse the posted
 			 * version verbatim (the bytes are frozen to match); otherwise
-			 * version the image by its fence, or by "now" when it carries
-			 * none.
+			 * version the image by its fence, always materialized at
+			 * capture time.
 			 */
 			version = p->posted_fence;
 			if (XLogRecPtrIsInvalid(version))
-			{
 				version = p->fence_lsn;
-				if (XLogRecPtrIsInvalid(version))
-					version = ps_slru_now_lsn();
-			}
+			Assert(!XLogRecPtrIsInvalid(version));
 
 			/*
 			 * WAL-before-data: never let another compute observe a status
@@ -566,6 +578,15 @@ ps_slru_drain(void)
 			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < version)
 				XLogFlush(version);
 
+			/*
+			 * Freeze BEFORE the bytes can reach the daemon: if obj_write
+			 * times out or errors mid-flight, the request may still be
+			 * applied later, and only an already-set posted_fence keeps
+			 * the write hook from mutating the entry into a same-version,
+			 * different-bytes retry.
+			 */
+			p->posted_fence = version;
+
 			ps_slru_obj_key(&key, p->obj);
 			pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_LIVE, &key,
 												 (BlockNumber) p->pageno,
@@ -573,7 +594,6 @@ ps_slru_drain(void)
 												 (uint64) version,
 												 PS_SLRU_SHIP_TIMEOUT_MS);
 			p->shipped = true;
-			p->posted_fence = version;
 			posted = true;
 		}
 
