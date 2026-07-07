@@ -71,12 +71,14 @@
 #include "access/slru.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -150,11 +152,57 @@ static int	ps_slru_recap_count = 0;
 
 /*
  * Pages whose capture was lost outright (queue AND recapture table full, or
- * an un-keyable page number).  Cumulative; the watermark follow-up reads
- * this to refuse advancing over an incomplete mirror.
+ * an un-keyable page number).  The per-process counter drives this
+ * process's WARNING cadence; the shared counter is what
+ * pagestore_slru_mirror_stats() reports -- most SLRU flushing happens in
+ * the checkpointer, so a private counter would read as zero from any SQL
+ * backend.  The watermark follow-up builds its own (persistent, debt-
+ * seeded) gating counter on top.
  */
 static uint64 ps_slru_lost = 0;
 static uint64 ps_slru_lost_reported = 0;
+
+typedef struct PsSlruStatsShm
+{
+	pg_atomic_uint64 lost;
+} PsSlruStatsShm;
+
+static PsSlruStatsShm *ps_slru_stats = NULL;
+
+static shmem_request_hook_type prev_slru_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_slru_stats_startup_hook = NULL;
+
+static void
+ps_slru_note_lost(void)
+{
+	ps_slru_lost++;
+	if (ps_slru_stats != NULL)
+		pg_atomic_fetch_add_u64(&ps_slru_stats->lost, 1);
+}
+
+static void
+ps_slru_stats_shmem_request(void)
+{
+	if (prev_slru_shmem_request_hook)
+		prev_slru_shmem_request_hook();
+	RequestAddinShmemSpace(sizeof(PsSlruStatsShm));
+}
+
+static void
+ps_slru_stats_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_slru_stats_startup_hook)
+		prev_slru_stats_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	ps_slru_stats = ShmemInitStruct("pagestore slru mirror stats",
+									sizeof(PsSlruStatsShm), &found);
+	if (!found)
+		pg_atomic_init_u64(&ps_slru_stats->lost, 0);
+	LWLockRelease(AddinShmemInitLock);
+}
 
 static bool ps_slru_exit_registered = false;
 
@@ -259,7 +307,7 @@ ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
 	}
 
 	/* Table full: coverage lost; the watermark side must fail conservative. */
-	ps_slru_lost++;
+	ps_slru_note_lost();
 }
 
 /*
@@ -279,7 +327,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
 	{
 		/* cannot be keyed (store block numbers are uint32); count the loss */
-		ps_slru_lost++;
+		ps_slru_note_lost();
 		return;
 	}
 
@@ -365,6 +413,24 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 
 	/* Queue full: record the page identity for recapture at drain time. */
 	ps_slru_note_recapture(ctl, obj, (uint32) pageno, InvalidXLogRecPtr);
+}
+
+/*
+ * Normalize a sampled insert position into something XLogFlush() accepts:
+ * when the last record ended exactly on a WAL page boundary, the reserve
+ * pointer points just past the next page's header, where no record ends,
+ * and flushing there is "past the end of generated WAL".  Only header
+ * bytes separate such a pointer from its boundary, so clamping loses
+ * nothing.
+ */
+static XLogRecPtr
+ps_slru_flush_pos(XLogRecPtr ptr)
+{
+	if (XLogSegmentOffset(ptr, wal_segment_size) == SizeOfXLogLongPHD)
+		ptr -= SizeOfXLogLongPHD;
+	else if (ptr % XLOG_BLCKSZ == SizeOfXLogShortPHD)
+		ptr -= SizeOfXLogShortPHD;
+	return ptr;
 }
 
 /*
@@ -612,8 +678,13 @@ ps_slru_drain(void)
 			 * fence is the durability obligation.  (In recovery the
 			 * replayed WAL is already durable.)
 			 */
-			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < p->fence_lsn)
-				XLogFlush(p->fence_lsn);
+			if (!RecoveryInProgress())
+			{
+				XLogRecPtr	flushto = ps_slru_flush_pos(p->fence_lsn);
+
+				if (GetFlushRecPtr(NULL) < flushto)
+					XLogFlush(flushto);
+			}
 
 			/*
 			 * Freeze BEFORE the bytes can reach the daemon: if obj_write
@@ -736,8 +807,11 @@ ps_slru_exit_drain(int code, Datum arg)
 static void
 ps_slru_xact_drain(XactEvent event, void *arg)
 {
-	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
-		return;
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE)
+		return;					/* PREPARE ends the transaction too; the
+								 * COMMIT/ROLLBACK PREPARED may run in a
+								 * different backend, so ship now */
 	pagestore_slru_mirror_drain();
 }
 
@@ -760,7 +834,9 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 
 	values[0] = Int32GetDatum(ps_slru_queue_count);
 	values[1] = Int32GetDatum(ps_slru_recap_count);
-	values[2] = Int64GetDatum((int64) ps_slru_lost);
+	values[2] = Int64GetDatum(ps_slru_stats != NULL
+							  ? (int64) pg_atomic_read_u64(&ps_slru_stats->lost)
+							  : (int64) ps_slru_lost);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -838,4 +914,10 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	ps_slru_mirror_enabled = true;
 	slru_page_write_hook = ps_slru_write_hook;
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
+
+	/* the loss counter is shared: most SLRU flushing is the checkpointer's */
+	prev_slru_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = ps_slru_stats_shmem_request;
+	prev_slru_stats_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = ps_slru_stats_shmem_startup;
 }
