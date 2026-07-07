@@ -77,6 +77,7 @@
 #include "common/file_perm.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -160,8 +161,12 @@ static int	ps_slru_recap_count = 0;
 
 /*
  * Pages whose capture was lost outright (queue AND recapture table full, or
- * an un-keyable page number).  Cumulative; the watermark follow-up reads
- * this to refuse advancing over an incomplete mirror.
+ * an un-keyable page number).  The per-process counter drives this
+ * process's WARNING cadence; the shared counter is what
+ * pagestore_slru_mirror_stats() reports -- most SLRU flushing happens in
+ * the checkpointer, so a private counter would read as zero from any SQL
+ * backend.  The watermark follow-up builds its own (persistent, debt-
+ * seeded) gating counter on top.
  */
 static uint64 ps_slru_lost = 0;
 static uint64 ps_slru_lost_reported = 0;
@@ -174,7 +179,21 @@ static XLogRecPtr ps_slru_now_lsn(void);
 static void ps_slru_debt_persist(void);
 static void ps_slru_wm_note_lost(void);
 
-#define PS_SLRU_SHIPPED_SLOTS	1024	/* power of two */
+/*
+ * Bump every ledger a loss touches: the per-process counter (WARNING
+ * cadence), the shared stats counter (SQL observability), and the
+ * watermark's gating counter (freeze + persistent debt).  Infallible.
+ */
+static void
+ps_slru_note_lost(void)
+{
+	ps_slru_lost++;
+	ps_slru_wm_note_lost();
+}
+
+#define PS_SLRU_SHIPPED_SLOTS	4096	/* power of two; sized to make hash
+										 * collisions (spurious deferrals)
+										 * negligible */
 
 /*
  * Reader-side state (pagestore.slru_live_reads).
@@ -299,6 +318,9 @@ typedef struct PsSlruWatermarkShm
 	pg_atomic_uint64 watermark;
 	pg_atomic_uint64 candidate;
 	pg_atomic_uint64 total_lost;
+	pg_atomic_uint64 stats_lost;	/* raw loss events, for observability --
+									 * unlike total_lost it is not seeded
+									 * with boot debt and never reset */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
 
 	/*
@@ -501,6 +523,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->watermark, 0);
 		pg_atomic_init_u64(&ps_slru_wm->candidate, 0);
 		pg_atomic_init_u64(&ps_slru_wm->total_lost, debt ? 1 : 0);
+		pg_atomic_init_u64(&ps_slru_wm->stats_lost, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
 		for (int i = 0; i < PS_SLRU_SHIPPED_SLOTS; i++)
 			pg_atomic_init_u64(&ps_slru_wm->last_shipped[i], 0);
@@ -658,6 +681,7 @@ ps_slru_wm_note_lost(void)
 	if (ps_slru_wm != NULL)
 	{
 		pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, 1);
+		pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, 1);
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 	}
 }
@@ -722,28 +746,48 @@ ps_slru_shipped_slot(uint32 obj, uint32 pageno)
 	return (int) (h & (PS_SLRU_SHIPPED_SLOTS - 1));
 }
 
-static uint64
-ps_slru_shipped_floor(uint32 obj, uint32 pageno)
-{
-	if (ps_slru_wm == NULL)
-		return 0;
-	return pg_atomic_read_u64(&ps_slru_wm->last_shipped[ps_slru_shipped_slot(obj, pageno)]);
-}
-
-static void
-ps_slru_shipped_note(uint32 obj, uint32 pageno, uint64 version)
+/*
+ * Atomically reserve a version for a page: strictly above everything its
+ * slot has ever shipped at, at least the capture bound, never past the
+ * current WAL position.  The reservation is a CAS -- two backends draining
+ * captures of the same page with the same bound must not both keep it, or
+ * the store's arrival order would decide which bytes win the tie.  Returns
+ * false to defer (the floor has caught up with the insert pointer; any WAL
+ * insertion unblocks the entry at a later drain, and its pending floor
+ * keeps the watermark honest meanwhile).
+ */
+static bool
+ps_slru_shipped_reserve(uint32 obj, uint32 pageno, XLogRecPtr bound,
+						XLogRecPtr *version)
 {
 	pg_atomic_uint64 *slot;
 
 	if (ps_slru_wm == NULL)
-		return;
+	{
+		*version = bound;
+		return true;
+	}
 	slot = &ps_slru_wm->last_shipped[ps_slru_shipped_slot(obj, pageno)];
 	for (;;)
 	{
 		uint64		cur = pg_atomic_read_u64(slot);
+		uint64		want;
 
-		if (version <= cur || pg_atomic_compare_exchange_u64(slot, &cur, version))
-			break;
+		if ((uint64) bound > cur)
+			want = (uint64) bound;
+		else
+		{
+			XLogRecPtr	now = ps_slru_now_lsn();
+
+			if (cur >= (uint64) now)
+				return false;	/* deferred until the WAL advances */
+			want = cur + 1;
+		}
+		if (pg_atomic_compare_exchange_u64(slot, &cur, want))
+		{
+			*version = (XLogRecPtr) want;
+			return true;
+		}
 	}
 }
 
@@ -830,6 +874,13 @@ ps_slru_wm_advance(void)
 			ps_slru_wm_note_lost();
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
+
+			/*
+			 * This runs after the drain's own persist point; make the
+			 * fresh debt durable now rather than hoping for a later drain
+			 * (we are in a post-critical drain tail, file I/O is fine).
+			 */
+			ps_slru_debt_persist();
 		}
 		return;
 	}
@@ -901,8 +952,7 @@ ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno)
 	}
 
 	/* Table full: coverage lost; the watermark side must fail conservative. */
-	ps_slru_lost++;
-	ps_slru_wm_note_lost();
+	ps_slru_note_lost();
 }
 
 /*
@@ -1427,33 +1477,62 @@ static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
 static void
 ps_slru_tomb_rederive(void)
 {
-	for (int i = 0; i < (int) lengthof(ps_slru_dirmap); i++)
+	/*
+	 * Serialize against concurrent truncations, or a scan could observe a
+	 * deletion in progress and publish its (higher) cutoff at a version
+	 * OLDER than the truncation's own tombstone -- an over-wide cutoff at
+	 * an early LSN.  WrapLimitsVacuumLock serializes the vacuum-side
+	 * clog/commit-ts truncations; MultiXactTruncationLock the multixact
+	 * ones.  Priming is rare and the scans are tiny.
+	 */
+	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
+	LWLockAcquire(MultiXactTruncationLock, LW_EXCLUSIVE);
+
+	PG_TRY();
 	{
-		DIR		   *dir;
-		struct dirent *de;
-		int64		minseg = -1;
-		int64		cutoff;
-
-		dir = AllocateDir(ps_slru_dirmap[i].dir);
-		while ((de = ReadDirExtended(dir, ps_slru_dirmap[i].dir, LOG)) != NULL)
+		for (int i = 0; i < (int) lengthof(ps_slru_dirmap); i++)
 		{
-			size_t		len = strlen(de->d_name);
-			int64		seg;
+			DIR		   *dir;
+			struct dirent *de;
+			int64		minseg = -1;
+			int64		cutoff;
 
-			if (len < 4 || len > 15 ||
-				strspn(de->d_name, "0123456789ABCDEF") != len)
-				continue;
-			seg = (int64) strtoull(de->d_name, NULL, 16);
-			if (minseg < 0 || seg < minseg)
-				minseg = seg;
+			/*
+			 * Scan failures must abort the priming (ReadDir raises), not
+			 * read as an empty directory: an empty scan publishes an
+			 * everything-dead cutoff.
+			 */
+			dir = AllocateDir(ps_slru_dirmap[i].dir);
+			while ((de = ReadDir(dir, ps_slru_dirmap[i].dir)) != NULL)
+			{
+				size_t		len = strlen(de->d_name);
+				int64		seg;
+
+				if (len < 4 || len > 15 ||
+					strspn(de->d_name, "0123456789ABCDEF") != len)
+					continue;
+				seg = (int64) strtoull(de->d_name, NULL, 16);
+				if (minseg < 0 || seg < minseg)
+					minseg = seg;
+			}
+			FreeDir(dir);
+
+			cutoff = (minseg < 0) ? PG_INT64_MAX
+				: minseg * SLRU_PAGES_PER_SEGMENT;
+			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
+								   ps_slru_now_lsn());
 		}
-		FreeDir(dir);
-
-		cutoff = (minseg < 0) ? PG_INT64_MAX
-			: minseg * SLRU_PAGES_PER_SEGMENT;
-		ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
-							   ps_slru_now_lsn());
 	}
+	PG_CATCH();
+	{
+		LWLockRelease(MultiXactTruncationLock);
+		LWLockRelease(WrapLimitsVacuumLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	LWLockRelease(MultiXactTruncationLock);
+	LWLockRelease(WrapLimitsVacuumLock);
 }
 
 /*
@@ -1570,8 +1649,13 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 
 	ps_slru_wm_republish_pending();
 
-	if (shipped)
+	if (shipped && cutoffPage != PG_INT64_MAX)
 	{
+		/*
+		 * Never cache the delete-all cutoff: every commit-ts deactivation
+		 * uses the same PG_INT64_MAX, and skipping a later one would leave
+		 * the images a reactivation shipped in between alive forever.
+		 */
 		ps_slru_tomb_covered[idx] = cutoffPage;
 		ps_slru_tomb_covered_set[idx] = true;
 	}
@@ -1595,8 +1679,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
 	{
 		/* cannot be keyed (store block numbers are uint32); count the loss */
-		ps_slru_lost++;
-		ps_slru_wm_note_lost();
+		ps_slru_note_lost();
 		return;
 	}
 
@@ -1684,6 +1767,24 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 
 	/* Queue full: record the page identity for recapture at drain time. */
 	ps_slru_note_recapture(ctl, obj, (uint32) pageno);
+}
+
+/*
+ * Normalize a sampled insert position into something XLogFlush() accepts:
+ * when the last record ended exactly on a WAL page boundary, the reserve
+ * pointer points just past the next page's header, where no record ends,
+ * and flushing there is "past the end of generated WAL".  Only header
+ * bytes separate such a pointer from its boundary, so clamping loses
+ * nothing.
+ */
+static XLogRecPtr
+ps_slru_flush_pos(XLogRecPtr ptr)
+{
+	if (XLogSegmentOffset(ptr, wal_segment_size) == SizeOfXLogLongPHD)
+		ptr -= SizeOfXLogLongPHD;
+	else if (ptr % XLOG_BLCKSZ == SizeOfXLogShortPHD)
+		ptr -= SizeOfXLogShortPHD;
+	return ptr;
 }
 
 /*
@@ -1949,18 +2050,10 @@ ps_slru_drain(void)
 			version = p->posted_fence;
 			if (XLogRecPtrIsInvalid(version))
 			{
-				uint64		floor = ps_slru_shipped_floor(p->obj, p->pageno);
-
-				version = p->bound;
-				Assert(!XLogRecPtrIsInvalid(version));
-				if ((uint64) version <= floor)
-				{
-					XLogRecPtr	now = ps_slru_now_lsn();
-
-					if (floor >= (uint64) now)
-						continue;	/* deferred until the WAL advances */
-					version = (XLogRecPtr) (floor + 1);
-				}
+				Assert(!XLogRecPtrIsInvalid(p->bound));
+				if (!ps_slru_shipped_reserve(p->obj, p->pageno, p->bound,
+											 &version))
+					continue;	/* deferred until the WAL advances */
 			}
 
 			/*
@@ -1973,19 +2066,23 @@ ps_slru_drain(void)
 			 * fence is the durability obligation.  (In recovery the
 			 * replayed WAL is already durable.)
 			 */
-			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < p->fence_lsn)
-				XLogFlush(p->fence_lsn);
+			if (!RecoveryInProgress())
+			{
+				XLogRecPtr	flushto = ps_slru_flush_pos(p->fence_lsn);
+
+				if (GetFlushRecPtr(NULL) < flushto)
+					XLogFlush(flushto);
+			}
 
 			/*
 			 * Freeze BEFORE the bytes can reach the daemon: if obj_write
 			 * times out or errors mid-flight, the request may still be
 			 * applied later, and only an already-set posted_fence keeps
 			 * the write hook from mutating the entry into a same-version,
-			 * different-bytes retry.  The last-shipped floor is raised at
-			 * the same point, for the same reason.
+			 * different-bytes retry.  (The last-shipped floor was already
+			 * raised by the atomic reservation above.)
 			 */
 			p->posted_fence = version;
-			ps_slru_shipped_note(p->obj, p->pageno, (uint64) version);
 
 			ps_slru_obj_key(&key, p->obj);
 			pagestore_localsvc_obj_write_timeout(PS_KLASS_SLRU_LIVE, &key,
@@ -2104,6 +2201,8 @@ ps_slru_exit_drain(int code, Datum arg)
 		{
 			pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost,
 									ps_slru_queue_count + ps_slru_recap_count);
+			pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost,
+									ps_slru_queue_count + ps_slru_recap_count);
 			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		}
 		ereport(WARNING,
@@ -2124,8 +2223,11 @@ ps_slru_exit_drain(int code, Datum arg)
 static void
 ps_slru_xact_drain(XactEvent event, void *arg)
 {
-	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
-		return;
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE)
+		return;					/* PREPARE ends the transaction too; the
+								 * COMMIT/ROLLBACK PREPARED may run in a
+								 * different backend, so ship now */
 	pagestore_slru_mirror_drain();
 
 	/*
@@ -2157,7 +2259,9 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 
 	values[0] = Int32GetDatum(ps_slru_queue_count);
 	values[1] = Int32GetDatum(ps_slru_recap_count);
-	values[2] = Int64GetDatum((int64) ps_slru_lost);
+	values[2] = Int64GetDatum(ps_slru_wm != NULL
+							  ? (int64) pg_atomic_read_u64(&ps_slru_wm->stats_lost)
+							  : (int64) ps_slru_lost);
 	values[3] = Int64GetDatum((int64) ps_slru_read_served);
 	values[4] = Int64GetDatum((int64) ps_slru_read_fallback);
 
@@ -2317,7 +2421,13 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
 	if (!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
 	{
+		/*
+		 * A loss raced the reset and the debt marker is already unlinked:
+		 * re-create it here and now, not merely re-flag it -- this backend
+		 * may never drain again before a clean shutdown.
+		 */
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ps_slru_debt_persist();
 		ereport(ERROR,
 				(errmsg("a new SLRU mirror loss arrived during the reset"),
 				 errhint("Re-prime the mirror and retry.")));
@@ -2431,7 +2541,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	}
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
-	/* the visibility watermark lives in shared memory */
+	/* watermark, floors, and shared stats all live in shared memory */
 	prev_shmem_request_hook = shmem_request_hook;
 	shmem_request_hook = ps_slru_shmem_request;
 	prev_slru_shmem_startup_hook = shmem_startup_hook;
