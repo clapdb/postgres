@@ -174,6 +174,15 @@ static uint64 ps_slru_lost_reported = 0;
 
 static bool ps_slru_exit_registered = false;
 
+/*
+ * True while draining from a place where an ERROR must not escape: the
+ * transaction-end callback (the transaction is already committed/prepared;
+ * rethrowing a cancel there would report failure for a durable commit) and
+ * the exit callback.  A swallowed interrupt is re-armed instead, so it
+ * fires at the next CHECK_FOR_INTERRUPTS().
+ */
+static bool ps_slru_no_rethrow = false;
+
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
@@ -317,7 +326,6 @@ typedef struct PsSlruWatermarkShm
 									 * with boot debt and never reset */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
 
-	/*
 	/*
 	 * Reader-side shared state (pagestore.slru_live_reads): the last
 	 * watermark fetched from the store and when, the newest known
@@ -950,6 +958,25 @@ ps_slru_wm_publish(void)
 	PG_END_TRY();
 }
 
+/* Read the cached (shared) tombstone pair for a scope slot; 0/0 = none. */
+static void
+ps_slru_tomb_cached(int idx, int64 *cutoff, uint64 *version)
+{
+	uint64		c;
+	uint64		v;
+
+	*cutoff = -1;
+	*version = 0;
+	if (ps_slru_wm == NULL)
+		return;
+	c = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
+	v = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+	if (c == 0 || v == 0 || v == PG_UINT64_MAX)
+		return;					/* none known, or an update in flight */
+	*cutoff = (int64) (c - 1);
+	*version = v;
+}
+
 /*
  * A catch block on the no-throw read path must not rethrow (the SLRU slot
  * is mid-I/O; an escape would leave it READ_IN_PROGRESS), but it must not
@@ -1089,6 +1116,8 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	int			idx;
 	uint32		obj;
 	uint64		w;
+	int64		cached_cut;
+	uint64		cached_ver;
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
@@ -1113,6 +1142,14 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		return SLRU_READ_HOOK_FALLBACK;
 	}
 
+	/*
+	 * The shared tombstone cache applies whatever the store IPC below
+	 * manages to do (memory only): a page a previous fetch already saw
+	 * retired must never fall back to a stale local segment, even when
+	 * this read's own store lookups time out.
+	 */
+	ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+
 	PG_TRY();
 	{
 		/*
@@ -1133,20 +1170,33 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 * live-read compute in recovery with no local segment must
 			 * still fail closed: the InRecovery local fallback fabricates
 			 * an all-zero page out of ENOENT, and "the mirror is required
-			 * but unavailable" must not read as empty status.
+			 * but unavailable" must not read as empty status.  Tombstones
+			 * advance independently of the watermark, so a cached one
+			 * still applies (memory only; no IPC here).
 			 */
-			if (RecoveryInProgress() &&
-				!ps_slru_local_segment_exists(ctl, pageno))
+			if (pageno < cached_cut)
 				res = SLRU_READ_HOOK_FAILED;
+			else if (RecoveryInProgress() &&
+					 !ps_slru_local_segment_exists(ctl, pageno))
+				res = SLRU_READ_HOOK_FAILED;
+			else if (cached_cut >= 0)
+				ps_slru_served_note(obj, (uint32) pageno, cached_ver);
 		}
 		else
 		{
 			PageStoreRelKey key = {0};
 			char		tpage[BLCKSZ];
-			int64		cutoff = -1;
-			uint64		tombv = 0;
+			int64		cutoff;
+			uint64		tombv;
 
-			/* pages below the newest tombstone are dead, whatever exists */
+			/*
+			 * Pages below the newest tombstone are dead, whatever exists.
+			 * The shared cache is the floor; the per-read lookup can only
+			 * improve on it -- if the lookup fails, a tombstone another
+			 * backend already saw must still apply.
+			 */
+			cutoff = cached_cut;
+			tombv = cached_ver;
 			ps_slru_obj_key(&key, obj);
 			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
 													   &key, 0, PG_UINT64_MAX,
@@ -1231,7 +1281,17 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		MemoryContextSwitchTo(cxt);
 		ps_slru_rearm_interrupt();
 		FlushErrorState();
-		res = SLRU_READ_HOOK_FALLBACK;
+
+		/*
+		 * A store failure mid-read must not resurrect a page the cached
+		 * tombstone already retired: fail closed rather than fall back to
+		 * a stale local segment.  (The newer-image override needs working
+		 * IPC by definition; without it, dead is dead.)
+		 */
+		if (pageno < cached_cut)
+			res = SLRU_READ_HOOK_FAILED;
+		else
+			res = SLRU_READ_HOOK_FALLBACK;
 	}
 	PG_END_TRY();
 
@@ -1253,6 +1313,8 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	int			idx;
 	uint32		obj;
 	uint64		w;
+	int64		cached_cut;
+	uint64		cached_ver;
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
@@ -1267,6 +1329,9 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	if (ps_slru_mirror_enabled && ps_slru_local_segment_exists(ctl, pageno))
 		return SLRU_READ_HOOK_FALLBACK;
 
+	/* see the read hook: the cache applies even if the IPC below fails */
+	ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+
 	PG_TRY();
 	{
 		/* same newest-wins rule as the read hook; W is only the enable gate */
@@ -1274,22 +1339,32 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		if (w == 0)
 		{
 			/*
-			 * Same fail-closed rule as the read hook: existence callers
+			 * Same fail-closed rules as the read hook: existence callers
 			 * (ActivateCommitTs's zero-create, find_multixact_start) must
 			 * not mistake "mirror required but unavailable" for "page does
-			 * not exist".
+			 * not exist" -- and on a pure consumer that holds outside
+			 * recovery too, where a false answer would zero-create over
+			 * state the mirror holds.  A cached tombstone answers
+			 * definitively.
 			 */
-			if (RecoveryInProgress() &&
-				!ps_slru_local_segment_exists(ctl, pageno))
+			if (pageno < cached_cut)
+			{
+				*exists = false;
+				res = SLRU_READ_HOOK_SERVED;
+			}
+			else if (!ps_slru_mirror_enabled &&
+					 !ps_slru_local_segment_exists(ctl, pageno))
 				res = SLRU_READ_HOOK_FAILED;
 		}
 		else
 		{
 			PageStoreRelKey key = {0};
 			char		tpage[BLCKSZ];
-			int64		cutoff = -1;
-			uint64		tombv = 0;
+			int64		cutoff;
+			uint64		tombv;
 
+			cutoff = cached_cut;
+			tombv = cached_ver;
 			ps_slru_obj_key(&key, obj);
 			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
 													   &key, 0, PG_UINT64_MAX,
@@ -1335,7 +1410,15 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		MemoryContextSwitchTo(cxt);
 		ps_slru_rearm_interrupt();
 		FlushErrorState();
-		res = SLRU_READ_HOOK_FALLBACK;
+
+		/* see the read hook: a cached tombstone outlives a store failure */
+		if (pageno < cached_cut)
+		{
+			*exists = false;
+			res = SLRU_READ_HOOK_SERVED;
+		}
+		else
+			res = SLRU_READ_HOOK_FALLBACK;
 	}
 	PG_END_TRY();
 
@@ -1372,18 +1455,22 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 		return true;
 	obj = ps_slru_dirmap[idx].obj;
 
+	/*
+	 * Tombstones advance independently of the watermark and apply even
+	 * while it is zero (an unprimed/frozen writer still ships truncation
+	 * tombstones); only when NEITHER has ever been fetched is every
+	 * cached page local truth.
+	 */
 	w = pg_atomic_read_u64(&ps_slru_wm->reader_wm);
-	if (w == 0)
+	tombc = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
+	tombv = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+	if (w == 0 && tombc == 0)
 		return true;			/* no fetch ever: nothing was mirror-served */
 
 	if (!ps_slru_served_epoch(obj, (uint32) pageno, &epoch))
 		return false;			/* unknown: one redundant re-read */
 	if (epoch < w)
 		return false;
-
-	/* tombstones advance independently of the watermark */
-	tombc = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
-	tombv = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
 	if (tombc != 0 && (uint64) pageno + 1 < tombc && epoch < tombv)
 		return false;
 
@@ -1644,52 +1731,25 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 }
 
 /*
- * slru_page_write_hook consumer.  Bank lock held; must be infallible: fixed
- * pre-reserved storage only, no locks, no allocation, no elog (atomics are
- * fine, which is all the fence/stamp computation needs).
+ * Stage an image (fixed pre-reserved storage only; infallible; callable
+ * under a bank lock).  'fence' is the flush obligation, 'bound' the
+ * version -- both must have been taken under the page's bank lock, which
+ * is what makes version order equal capture order.
  */
 static void
-ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
-				   XLogRecPtr fence_lsn)
+ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
+			  XLogRecPtr fence_lsn, XLogRecPtr bound)
 {
-	uint32		obj;
 	int			free_slot = -1;
 
-	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
-		return;					/* out-of-scope SLRU: excluded, not mirrored */
-
-	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
 	{
-		/* cannot be keyed (store block numbers are uint32); count the loss */
-		ps_slru_note_lost();
-		return;
-	}
-
-	/*
-	 * Bound the image at CAPTURE time: the bytes certainly contain nothing
-	 * past the current WAL position, and nothing later can honestly claim
-	 * less -- a group-LSN fence alone understates the contents (synchronous
-	 * commits and aborts do not update group LSNs; only async commits do),
-	 * and a drain-time position would falsely cover changes applied to the
-	 * page between this flush and the drain.  The fence is kept separately
-	 * as the flush obligation: every not-yet-durable bit has a group LSN
-	 * by the SLRU's own WAL-before-data rule, so flushing the fence is
-	 * sufficient and cheaper than flushing to the bound.  (Reading the
-	 * positions is atomics/spinlock only, fine under the bank lock.)
-	 */
-	{
-		XLogRecPtr	now = ps_slru_now_lsn();
-
-		if (XLogRecPtrIsInvalid(fence_lsn))
-			fence_lsn = now;
-
 		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 		{
 			PsSlruPending *p = &ps_slru_queue[i];
 
 			if (p->used)
 			{
-				if (p->obj == obj && p->pageno == (uint32) pageno)
+				if (p->obj == obj && p->pageno == pageno)
 				{
 					/*
 					 * Same page staged again before a drain.  If a post of
@@ -1706,7 +1766,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 					 */
 					if (!XLogRecPtrIsInvalid(p->posted_fence))
 					{
-						ps_slru_note_recapture(ctl, obj, (uint32) pageno);
+						ps_slru_note_recapture(ctl, obj, pageno);
 						return;
 					}
 
@@ -1719,8 +1779,8 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 					memcpy(p->image, page, BLCKSZ);
 					if (p->fence_lsn < fence_lsn)
 						p->fence_lsn = fence_lsn;
-					if (p->bound < now)
-						p->bound = now;
+					if (p->bound < bound)
+						p->bound = bound;
 					ps_slru_wm_note_pending(p->fence_lsn);
 					return;
 				}
@@ -1736,9 +1796,9 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 			p->used = true;
 			p->shipped = false;
 			p->obj = obj;
-			p->pageno = (uint32) pageno;
+			p->pageno = pageno;
 			p->fence_lsn = fence_lsn;
-			p->bound = now;
+			p->bound = bound;
 			p->posted_fence = InvalidXLogRecPtr;
 			memcpy(p->image, page, BLCKSZ);
 			ps_slru_queue_count++;
@@ -1748,7 +1808,47 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	}
 
 	/* Queue full: record the page identity for recapture at drain time. */
-	ps_slru_note_recapture(ctl, obj, (uint32) pageno);
+	ps_slru_note_recapture(ctl, obj, pageno);
+}
+
+/*
+ * slru_page_write_hook consumer.  Bank lock held; must be infallible: fixed
+ * pre-reserved storage only, no locks, no allocation, no elog.
+ */
+static void
+ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
+				   XLogRecPtr fence_lsn)
+{
+	uint32		obj;
+	XLogRecPtr	now;
+
+	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
+		return;					/* out-of-scope SLRU: excluded, not mirrored */
+
+	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+	{
+		/* cannot be keyed (store block numbers are uint32); count the loss */
+		ps_slru_note_lost();
+		return;
+	}
+
+	/*
+	 * Bound the image at CAPTURE time, under the bank lock we are called
+	 * with: the bytes certainly contain nothing past the current WAL
+	 * position, and nothing later can honestly claim less -- a group-LSN
+	 * fence alone understates the contents (synchronous commits and aborts
+	 * do not update group LSNs; only async commits do), and a later
+	 * position would falsely cover changes applied to the page afterwards.
+	 * The fence is kept separately as the flush obligation: every
+	 * not-yet-durable bit has a group LSN by the SLRU's own WAL-before-data
+	 * rule, so flushing the fence is sufficient and cheaper.  (Reading the
+	 * positions is atomics/spinlock only, fine under the bank lock.)
+	 */
+	now = ps_slru_now_lsn();
+	if (XLogRecPtrIsInvalid(fence_lsn))
+		fence_lsn = now;
+
+	ps_slru_stage(ctl, obj, (uint32) pageno, page, fence_lsn, now);
 }
 
 /*
@@ -1864,14 +1964,23 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 	if (found)
 		return true;
 
-	/* Evicted: the bytes were flushed locally; read the segment file. */
+	/*
+	 * Evicted: the bytes were flushed locally; read the segment file --
+	 * with the bank lock HELD across the residency check, the read, and
+	 * the bound sample.  Loading (and thus rewriting) the page requires
+	 * the exclusive bank lock, so non-residency under our shared hold
+	 * pins the file bytes for the duration: no load-modify-flush-evict
+	 * cycle can slip between the check and the read and leave us shipping
+	 * pre-cycle bytes under a post-cycle bound.  The hold spans one 8KB
+	 * pread on a rare overflow path.
+	 */
 	{
 		char		path[MAXPGPATH];
 		int64		segno = (int64) r->pageno / SLRU_PAGES_PER_SEGMENT;
 		int			rpageno = (int) ((int64) r->pageno % SLRU_PAGES_PER_SEGMENT);
 		off_t		offset = (off_t) rpageno * BLCKSZ;
 		int			fd;
-		ssize_t		n;
+		ssize_t		n = -1;
 		bool		resident = false;
 
 		if (ctl->options.long_segment_names)
@@ -1883,19 +1992,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 		if (fd < 0)
 			return false;
-		n = pg_pread(fd, image, BLCKSZ, offset);
-		CloseTransientFile(fd);
-		if (n != BLCKSZ)
-			return false;
 
-		/*
-		 * Sample the bound under the bank lock, after confirming the page
-		 * is STILL not resident: a write in progress keeps its page
-		 * resident (WRITE_IN_PROGRESS), so non-residency here proves the
-		 * file bytes we just read include every capture that could have
-		 * been bank-lock-ordered before this bound.  If the page was
-		 * loaded meanwhile, retry through the resident path next drain.
-		 */
 		LWLockAcquire(banklock, LW_SHARED);
 		for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
 		{
@@ -1907,10 +2004,15 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 			}
 		}
 		if (!resident)
-			*fence = ps_slru_now_lsn();
+		{
+			n = pg_pread(fd, image, BLCKSZ, offset);
+			if (n == BLCKSZ)
+				*fence = ps_slru_now_lsn();
+		}
 		LWLockRelease(banklock);
+		CloseTransientFile(fd);
 
-		return !resident;
+		return !resident && n == BLCKSZ;
 	}
 }
 
@@ -2016,7 +2118,13 @@ ps_slru_drain(void)
 			 * abandoned same-version request still in the daemon's
 			 * pipeline.
 			 */
-			ps_slru_write_hook(r->ctl, (int64) r->pageno, image, fence);
+			/*
+			 * Re-stage with the snapshot's own in-lock bound -- routing
+			 * through the write hook would resample a later position and
+			 * could version these (possibly stale) bytes past a newer
+			 * concurrent capture's.
+			 */
+			ps_slru_stage(r->ctl, r->obj, r->pageno, image, fence, fence);
 			r->used = false;
 			ps_slru_recap_count--;
 		}
@@ -2140,12 +2248,26 @@ ps_slru_drain(void)
 		edata = CopyErrorData();
 		MemoryContextSwitchTo(ecxt);
 
-		/* interrupts are not mirror failures; see the control mirror */
+		/*
+		 * Interrupts are not mirror failures; propagate them -- except in
+		 * post-commit/exit context, where an escaping ERROR would turn an
+		 * already-durable COMMIT (or the exit path) into a reported
+		 * failure.  There the interrupt is re-armed for the next
+		 * CHECK_FOR_INTERRUPTS() instead of being lost with the error.
+		 */
 		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
 			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
 		{
-			FreeErrorData(edata);
-			PG_RE_THROW();
+			if (!ps_slru_no_rethrow)
+			{
+				FreeErrorData(edata);
+				PG_RE_THROW();
+			}
+			if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
+				QueryCancelPending = true;
+			else
+				ProcDiePending = true;
+			InterruptPending = true;
 		}
 		FreeErrorData(edata);
 
@@ -2181,7 +2303,11 @@ static void
 ps_slru_exit_drain(int code, Datum arg)
 {
 	if (code == 0)
+	{
+		ps_slru_no_rethrow = true;
 		pagestore_slru_mirror_drain();
+		ps_slru_no_rethrow = false;
+	}
 
 	/*
 	 * Whatever the drain could not ship dies with this process; the pages
@@ -2193,18 +2319,18 @@ ps_slru_exit_drain(int code, Datum arg)
 	 */
 	if (ps_slru_queue_count > 0 || ps_slru_recap_count > 0)
 	{
-		ps_slru_lost += ps_slru_queue_count + ps_slru_recap_count;
+		int			n = ps_slru_queue_count + ps_slru_recap_count;
+
+		ps_slru_lost += n;
 		if (ps_slru_wm != NULL)
 		{
-			pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost,
-									ps_slru_queue_count + ps_slru_recap_count);
-			pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost,
-									ps_slru_queue_count + ps_slru_recap_count);
+			pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, n);
+			pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, n);
 			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		}
 		ereport(WARNING,
 				(errmsg("pagestore: exiting with %d unshipped SLRU image(s); the live mirror is missing them",
-						ps_slru_queue_count + ps_slru_recap_count)));
+						n)));
 	}
 	ps_slru_debt_persist();
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
@@ -2225,7 +2351,9 @@ ps_slru_xact_drain(XactEvent event, void *arg)
 		return;					/* PREPARE ends the transaction too; the
 								 * COMMIT/ROLLBACK PREPARED may run in a
 								 * different backend, so ship now */
+	ps_slru_no_rethrow = true;
 	pagestore_slru_mirror_drain();
+	ps_slru_no_rethrow = false;
 
 	/*
 	 * Reader side: refresh the fetched watermark at transaction boundaries
