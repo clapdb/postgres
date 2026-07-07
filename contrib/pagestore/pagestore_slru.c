@@ -72,6 +72,7 @@
 
 #include "access/htup_details.h"
 #include "access/commit_ts.h"
+#include "access/multixact_internal.h"
 #include "access/slru.h"
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
@@ -320,6 +321,74 @@ static PsSlruDirMap ps_slru_dirmap[] = {
 	{"pg_multixact/members", 0},
 	{"pg_commit_ts", 0},
 };
+
+#define PS_SLRU_CLOG_XACTS_PER_PAGE	(BLCKSZ * 4)
+
+typedef struct PsSlruCommitTimestampEntry
+{
+	TimestampTz time;
+	ReplOriginId nodeid;
+} PsSlruCommitTimestampEntry;
+
+#define PS_SLRU_COMMIT_TS_XACTS_PER_PAGE \
+	(BLCKSZ / (offsetof(PsSlruCommitTimestampEntry, nodeid) + \
+			   sizeof(ReplOriginId)))
+
+static int64
+ps_slru_xid_page(TransactionId xid)
+{
+	return xid / (int64) PS_SLRU_CLOG_XACTS_PER_PAGE;
+}
+
+static int64
+ps_slru_commit_ts_page(TransactionId xid)
+{
+	return xid / (int64) PS_SLRU_COMMIT_TS_XACTS_PER_PAGE;
+}
+
+static MultiXactId
+ps_slru_previous_multixact_id(MultiXactId multi)
+{
+	return multi == FirstMultiXactId ? MaxMultiXactId : multi - 1;
+}
+
+static bool
+ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
+{
+	const char *dir = ps_slru_dirmap[idx].dir;
+
+	if (strcmp(dir, "pg_xact") == 0)
+	{
+		*cutoff = ps_slru_xid_page(TransamVariables->oldestXid);
+		return true;
+	}
+	if (strcmp(dir, "pg_commit_ts") == 0)
+	{
+		if (!TransactionIdIsValid(TransamVariables->oldestCommitTsXid))
+			*cutoff = PG_INT64_MAX;
+		else
+			*cutoff = ps_slru_commit_ts_page(TransamVariables->oldestCommitTsXid);
+		return true;
+	}
+	if (strcmp(dir, "pg_multixact/offsets") == 0 ||
+		strcmp(dir, "pg_multixact/members") == 0)
+	{
+		uint32		multixacts;
+		MultiXactOffset nextOffset;
+		MultiXactId oldestMulti;
+		MultiXactOffset oldestOffset;
+
+		GetMultiXactInfo(&multixacts, &nextOffset, &oldestMulti,
+						 &oldestOffset);
+		if (strcmp(dir, "pg_multixact/offsets") == 0)
+			*cutoff = MultiXactIdToOffsetPage(
+				ps_slru_previous_multixact_id(oldestMulti));
+		else
+			*cutoff = MXOffsetToMemberPage(oldestOffset);
+		return true;
+	}
+	return false;
+}
 
 /* Stable per-SLRU object id from its directory name (FNV-1a; libc-only). */
 uint32
@@ -828,14 +897,11 @@ static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
  * that window leaves a durable tombstone for a truncation that never
  * happened -- pages that are live locally read as dead in the mirror.
  * Every such crash is boot debt, and priming is its mandated repair: for
- * each in-scope SLRU, publish a tombstone at the lowest locally present
- * segment's first page (everything below it is locally truncated or never
- * existed; an empty directory means nothing local is live at all).  The
- * read side takes the newest-VERSIONED tombstone, so an over-wide stale
- * cutoff is superseded by this narrower, newer one.  Under a wrapped page
- * space the numeric minimum can only under-state the cutoff, which at
- * worst leaves historically-accurate images servable -- never the
- * reverse.
+ * each in-scope SLRU, publish its current horizon page.  That preserves
+ * page-granular cutoffs when the first retained segment is only partially
+ * live.  The directory scan is still useful as an error check (an unreadable
+ * directory must abort priming) and as a fallback for any future in-scope
+ * SLRU without a known horizon.
  */
 static void
 ps_slru_tomb_rederive(void)
@@ -890,8 +956,9 @@ ps_slru_tomb_rederive(void)
 			}
 			FreeDir(dir);
 
-			cutoff = (minseg < 0) ? PG_INT64_MAX
-				: minseg * SLRU_PAGES_PER_SEGMENT;
+			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff))
+				cutoff = (minseg < 0) ? PG_INT64_MAX
+					: minseg * SLRU_PAGES_PER_SEGMENT;
 			ps_slru_tomb_covered_set[i] = false;
 			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
 								   ps_slru_now_lsn());
