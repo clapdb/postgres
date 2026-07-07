@@ -47,6 +47,15 @@
  * overflows is coverage lost, and that is counted (ps_slru_lost) and
  * warned about so the watermark side can fail conservative.
  *
+ * Post-then-sync, frozen once posted: an entry is popped only after the
+ * daemon has durably synced it; until then it stays staged.  And once its
+ * WRITE has been posted at a version, the entry's bytes are frozen at that
+ * version -- a timed-out request may still be sitting in the daemon's
+ * pipeline, and the store resolves same-version appends by arrival order,
+ * so a retry must be byte-identical to be order-independent.  Newer bytes
+ * for a frozen page go through the recapture table and re-ship under a
+ * fence strictly above the posted one.
+ *
  * src/../contrib/pagestore/pagestore_slru.c
  *
  *-------------------------------------------------------------------------
@@ -93,9 +102,14 @@ static bool ps_slru_mirror_enabled = false;
 typedef struct PsSlruPending
 {
 	bool		used;
+	bool		shipped;		/* posted this drain; popped only after the
+								 * store has synced */
 	uint32		obj;			/* slru_klass_id of the SLRU directory */
 	uint32		pageno;
 	XLogRecPtr	fence_lsn;		/* upper bound of the image's contents */
+	XLogRecPtr	posted_fence;	/* version of a post that may have reached
+								 * the daemon; freezes the bytes (see
+								 * ps_slru_write_hook) */
 	char		image[BLCKSZ];
 } PsSlruPending;
 
@@ -116,6 +130,10 @@ typedef struct PsSlruRecapture
 	SlruDesc   *ctl;
 	uint32		obj;
 	uint32		pageno;
+	XLogRecPtr	fence_floor;	/* recaptured image must be versioned
+								 * strictly above this (a same-version post
+								 * with different bytes may still be in
+								 * flight); Invalid = no constraint */
 } PsSlruRecapture;
 
 static PsSlruRecapture ps_slru_recap[PS_SLRU_RECAP_CAPACITY];
@@ -193,6 +211,48 @@ ps_slru_obj_key(PageStoreRelKey *key, uint32 obj)
 }
 
 /*
+ * Schedule a page identity for recapture at drain time.  Infallible (called
+ * under the bank lock from the write hook): fixed storage, counts a loss if
+ * the table is full.  fence_floor, when valid, forbids re-shipping the page
+ * at or below that version (a post with different bytes may still be in
+ * flight there).
+ */
+static void
+ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
+					   XLogRecPtr fence_floor)
+{
+	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY; i++)
+	{
+		PsSlruRecapture *r = &ps_slru_recap[i];
+
+		if (r->used && r->obj == obj && r->pageno == pageno)
+		{
+			if (r->fence_floor < fence_floor)
+				r->fence_floor = fence_floor;
+			return;				/* already scheduled */
+		}
+	}
+	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY; i++)
+	{
+		PsSlruRecapture *r = &ps_slru_recap[i];
+
+		if (!r->used)
+		{
+			r->used = true;
+			r->ctl = ctl;
+			r->obj = obj;
+			r->pageno = pageno;
+			r->fence_floor = fence_floor;
+			ps_slru_recap_count++;
+			return;
+		}
+	}
+
+	/* Table full: coverage lost; the watermark side must fail conservative. */
+	ps_slru_lost++;
+}
+
+/*
  * slru_page_write_hook consumer.  Bank lock held; must be infallible: fixed
  * pre-reserved storage only, no locks, no allocation, no elog.
  */
@@ -222,10 +282,28 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 			if (p->obj == obj && p->pageno == (uint32) pageno)
 			{
 				/*
-				 * Same page staged again before a drain: keep the newest
-				 * bytes.  The fence only ever needs to grow -- a smaller
-				 * recomputed fence (group LSNs reset on eviction/reload)
-				 * must not un-fence bits the older image already carried.
+				 * Same page staged again before a drain.  If a post of this
+				 * entry may have reached the daemon (a previous drain timed
+				 * out or failed after obj_write), the bytes must stay
+				 * exactly what was posted: the store resolves same-version
+				 * appends by arrival order, and an abandoned request can
+				 * land after our retry -- byte-identical duplicates make
+				 * that order irrelevant.  The newer bytes become a
+				 * recapture instead, re-snapshotted at drain time under a
+				 * fence strictly above the posted version.
+				 */
+				if (!XLogRecPtrIsInvalid(p->posted_fence))
+				{
+					ps_slru_note_recapture(ctl, obj, (uint32) pageno,
+										   p->posted_fence);
+					return;
+				}
+
+				/*
+				 * Keep the newest bytes.  The fence only ever needs to grow
+				 * -- a smaller recomputed fence (group LSNs reset on
+				 * eviction/reload) must not un-fence bits the older image
+				 * already carried.
 				 */
 				memcpy(p->image, page, BLCKSZ);
 				if (p->fence_lsn < fence_lsn)
@@ -242,37 +320,18 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 		PsSlruPending *p = &ps_slru_queue[free_slot];
 
 		p->used = true;
+		p->shipped = false;
 		p->obj = obj;
 		p->pageno = (uint32) pageno;
 		p->fence_lsn = fence_lsn;
+		p->posted_fence = InvalidXLogRecPtr;
 		memcpy(p->image, page, BLCKSZ);
 		ps_slru_queue_count++;
 		return;
 	}
 
 	/* Queue full: record the page identity for recapture at drain time. */
-	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY; i++)
-	{
-		PsSlruRecapture *r = &ps_slru_recap[i];
-
-		if (r->used)
-		{
-			if (r->obj == obj && r->pageno == (uint32) pageno)
-				return;			/* already scheduled */
-		}
-		else
-		{
-			r->used = true;
-			r->ctl = ctl;
-			r->obj = obj;
-			r->pageno = (uint32) pageno;
-			ps_slru_recap_count++;
-			return;
-		}
-	}
-
-	/* Both full: coverage lost; the watermark side must fail conservative. */
-	ps_slru_lost++;
+	ps_slru_note_recapture(ctl, obj, (uint32) pageno, InvalidXLogRecPtr);
 }
 
 /*
@@ -369,13 +428,29 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence)
 	}
 }
 
+/* Is this page identity held by a posted-but-unsynced queue entry? */
+static bool
+ps_slru_queue_holds_posted(uint32 obj, uint32 pageno)
+{
+	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
+	{
+		PsSlruPending *p = &ps_slru_queue[i];
+
+		if (p->used && p->obj == obj && p->pageno == pageno &&
+			!XLogRecPtrIsInvalid(p->posted_fence))
+			return true;
+	}
+	return false;
+}
+
 /*
  * Ship every staged image, in any order (entries are independent objects;
  * per-page ordering is by version).  Must only run outside critical
  * sections: obj_write can ERROR, recoverable here but fatal in one.  Same
- * failure policy as the control mirror: nothing is consumed until the
- * daemon has synced, store failures downgrade to WARNING and everything
- * unshipped stays queued for the next drain point.
+ * failure policy as the control mirror: two-phase, post then sync -- an
+ * entry is popped only after the daemon has durably synced it; store
+ * failures downgrade to WARNING and everything unsynced stays queued (bytes
+ * frozen at their posted version) for the next drain point.
  */
 static void
 ps_slru_drain(void)
@@ -405,7 +480,7 @@ ps_slru_drain(void)
 	PG_TRY();
 	{
 		TimestampTz drain_start = GetCurrentTimestamp();
-		bool		shipped = false;
+		bool		posted = false;
 		bool		budget_out = false;
 
 		/*
@@ -422,15 +497,35 @@ ps_slru_drain(void)
 				continue;
 			if (ps_slru_queue_count >= PS_SLRU_QUEUE_CAPACITY)
 				break;			/* queue refilled; retry next drain */
+
+			/*
+			 * While the identity's posted entry is still awaiting its sync,
+			 * the recapture must wait: the write hook would route it right
+			 * back here.  The entry pops this drain (or a later one) and
+			 * the recapture proceeds at the next.
+			 */
+			if (ps_slru_queue_holds_posted(r->obj, r->pageno))
+				continue;
 			if (!ps_slru_recapture_page(r, image, &fence))
 				continue;		/* keep for the next drain */
+
+			/*
+			 * A fence at or below the floor cannot disambiguate the new
+			 * bytes from a same-version post that may still be in flight;
+			 * wait for the WAL to advance (any later insert breaks the
+			 * tie, and until then the watermark side sees this entry as
+			 * pending and stays conservative).
+			 */
+			if (!XLogRecPtrIsInvalid(r->fence_floor) && fence <= r->fence_floor)
+				continue;
 
 			ps_slru_write_hook(r->ctl, (int64) r->pageno, image, fence);
 			r->used = false;
 			ps_slru_recap_count--;
 		}
 
-		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY && ps_slru_queue_count > 0; i++)
+		/* Phase one: post.  Entries stay staged until the store syncs. */
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 		{
 			PsSlruPending *p = &ps_slru_queue[i];
 			PageStoreRelKey key = {0};
@@ -447,14 +542,28 @@ ps_slru_drain(void)
 			}
 
 			/*
+			 * A retry of an already-posted entry must reuse the posted
+			 * version verbatim (the bytes are frozen to match); otherwise
+			 * version the image by its fence, or by "now" when it carries
+			 * none.
+			 */
+			version = p->posted_fence;
+			if (XLogRecPtrIsInvalid(version))
+			{
+				version = p->fence_lsn;
+				if (XLogRecPtrIsInvalid(version))
+					version = ps_slru_now_lsn();
+			}
+
+			/*
 			 * WAL-before-data: never let another compute observe a status
 			 * bit whose WAL is not durable.  Same order the local write
-			 * path enforces (SlruPhysicalWritePage's XLogFlush).
+			 * path enforces (SlruPhysicalWritePage's XLogFlush).  This
+			 * applies to "now"-stamped fences too -- their bytes may carry
+			 * bits up to that position.  (In recovery the replayed WAL is
+			 * already durable.)
 			 */
-			version = p->fence_lsn;
-			if (XLogRecPtrIsInvalid(version))
-				version = ps_slru_now_lsn();
-			else if (GetFlushRecPtr(NULL) < version && !RecoveryInProgress())
+			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < version)
 				XLogFlush(version);
 
 			ps_slru_obj_key(&key, p->obj);
@@ -463,22 +572,33 @@ ps_slru_drain(void)
 												 p->image,
 												 (uint64) version,
 												 PS_SLRU_SHIP_TIMEOUT_MS);
-			shipped = true;
-			p->used = false;
-			ps_slru_queue_count--;
+			p->shipped = true;
+			p->posted_fence = version;
+			posted = true;
 		}
 
 		/*
-		 * Durability: the images only count once the daemon has synced
-		 * them.  Unlike the control mirror the entries were consumed above
-		 * -- on a sync failure the CATCH path recounts nothing, but the
-		 * pages' next flush re-stages them and, until then, the follow-up
-		 * watermark must simply not have advanced (it moves on synced
-		 * prefixes only).  A lost image is therefore a visibility delay,
-		 * never a wrong answer.
+		 * Phase two: durability barrier, then pop.  The images only count
+		 * once the daemon has synced them; nothing was consumed above, so
+		 * any failure (including the sync itself) leaves every entry
+		 * staged -- bytes frozen at their posted version -- for the next
+		 * drain point.  A delayed image is a visibility delay, never a
+		 * wrong answer.
 		 */
-		if (shipped)
+		if (posted)
 			pagestore_localsvc_store_sync_timeout(PS_SLRU_SHIP_TIMEOUT_MS);
+
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY && ps_slru_queue_count > 0; i++)
+		{
+			PsSlruPending *p = &ps_slru_queue[i];
+
+			if (!p->used || !p->shipped)
+				continue;
+			p->used = false;
+			p->shipped = false;
+			p->posted_fence = InvalidXLogRecPtr;
+			ps_slru_queue_count--;
+		}
 
 		if (budget_out)
 			ereport(WARNING,
@@ -489,6 +609,17 @@ ps_slru_drain(void)
 	{
 		ErrorData  *edata;
 		MemoryContext ecxt = MemoryContextSwitchTo(drain_cxt);
+
+		/*
+		 * Whatever failed, entries posted in this drain were not confirmed
+		 * synced: clear the shipped marks (on every exit path, including
+		 * the interrupt rethrow) so no later drain pops them off the back
+		 * of a sync that did not cover a repost.  posted_fence stays --
+		 * the post may have reached the daemon, so the bytes remain
+		 * frozen.
+		 */
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
+			ps_slru_queue[i].shipped = false;
 
 		edata = CopyErrorData();
 		MemoryContextSwitchTo(ecxt);
