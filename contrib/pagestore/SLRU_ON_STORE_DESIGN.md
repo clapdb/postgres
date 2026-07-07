@@ -206,9 +206,20 @@ When it is built, the three review rounds established the requirements it must m
   memory; drain consumes entries only after the store sync).  Not "highest
   mirrored": a staged image carries all status on its page since the
   page's previous durable image, so its uncovered low end is unknown and
-  no partial bound is safe.  A lost capture freezes the watermark (the
-  candidate carries a loss-count snapshot).  The local commit is never
-  held back; only its visibility to *other* computes waits.
+  no partial bound is safe.  A lost capture freezes the watermark **for
+  good**: the lost page is clean locally, so no later checkpoint provably
+  re-flushes (and re-captures) it -- W keeps what it already vouched for
+  and never grows until an operator re-primes the mirror and calls
+  `pagestore_slru_mirror_reset_debt()`.  Losses are persistent: a debt
+  marker file survives clean shutdowns, and any unclean previous life
+  (pg_control not `DB_SHUTDOWNED` at boot) is itself boot debt, since a
+  dying process may have held staged images.  Image versions come from a
+  global monotone **stamp allocator** issued at capture under the bank
+  lock (group-LSN fences can shrink on reload, and drain-time "now"
+  stamps race across processes: a stale capture shipped late at a higher
+  version would shadow a newer superset image); the fence stays what the
+  drain `XLogFlush()`es, the stamp is the version.  The local commit is
+  never held back; only its visibility to *other* computes waits.
 - **Cache-hit revalidation, including tombstones.** `SimpleLruReadPage()` returns a
   valid cached slot without hitting the physical-read hook, so cached slots must be
   revalidated against both the status watermark **and** truncation tombstones
@@ -256,10 +267,16 @@ When it is built, the three review rounds established the requirements it must m
   means only "newest flushed bytes, contents bounded by the version".
   No-drop staging: queue overflow degrades to a recapture-by-identity
   table (re-snapshot under the bank lock, or from the local segment if
-  evicted, with a fresh conservative fence); only double overflow loses
+  evicted, under a freshly issued stamp); only double overflow loses
   coverage, and that is counted (`pagestore_slru_mirror_stats()`) so the
-  watermark must fail conservative.  The watermark itself, truncation
-  tombstones, and the read-side consumer are the remaining increments.
+  watermark fails conservative.  Post-then-sync: entries pop only
+  after the store sync, and once posted their bytes are frozen at the
+  posted version (a timed-out request may still land in the daemon later,
+  and the store resolves same-version appends by arrival order:
+  byte-identical retries make that order irrelevant, while newer bytes
+  re-ship via recapture under a strictly higher stamp).  The
+  watermark itself, truncation tombstones, and the read-side consumer are
+  the remaining increments.
 
 This list is the spec for that feature; none of it blocks M4.
 
