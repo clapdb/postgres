@@ -71,6 +71,7 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "access/commit_ts.h"
 #include "access/slru.h"
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
@@ -750,10 +751,27 @@ static void
 ps_slru_wm_republish_pending(void)
 {
 	uint64		f = 0;
+	uint64		owner;
 
 	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
 		MyProcNumber >= ps_slru_wm_nprocs)
 		return;
+
+	/*
+	 * This can be the first post-drain touch of a ProcNumber slot inherited
+	 * from a dead backend.  Account for the previous owner's outstanding
+	 * floor before overwriting it with this backend's idle state.
+	 */
+	owner = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].pid);
+	if (owner != (uint64) MyProcPid)
+	{
+		if (owner != 0 &&
+			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
+			ps_slru_wm_note_lost();
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
+							(uint64) MyProcPid);
+	}
 
 	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
@@ -1549,13 +1567,13 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 }
 
 /*
- * The last tombstone cutoff this process durably shipped per SLRU, so a
- * barrier that fires again for the SAME cutoff (the multixact
- * in-critical-section calls after their pre-barrier, a vacuum
- * re-truncating to the same page, SimpleLruTruncate after an exact-LSN
- * pre-barrier) reduces to a no-op.  Exact match only: several in-scope
- * page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so "lower
- * than covered" does not mean "already dead" -- a numerically smaller
+ * The last tombstone cutoff this process durably shipped per SLRU.  This is
+ * only a critical-section duplicate shield (the multixact in-critical-section
+ * calls after their pre-barrier, SimpleLruTruncate after an exact-LSN
+ * pre-barrier): outside critical sections, ship equal cutoffs again so their
+ * newer version can supersede stale store state.  Exact match only: several
+ * in-scope page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so
+ * "lower than covered" does not mean "already dead" -- a numerically smaller
  * later cutoff still ships, and its newer version supersedes.
  */
 static int64 ps_slru_tomb_covered[lengthof(ps_slru_dirmap)];
@@ -1695,7 +1713,11 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	obj = ps_slru_dirmap[idx].obj;
 
 	if (ps_slru_tomb_covered_set[idx] && cutoffPage == ps_slru_tomb_covered[idx])
-		return;					/* a durable tombstone already covers this */
+	{
+		if (CritSectionCount > 0)
+			return;				/* pre-barrier already shipped this cutoff */
+		ps_slru_tomb_covered_set[idx] = false;
+	}
 
 	if (CritSectionCount > 0)
 	{
@@ -2606,6 +2628,10 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
+		/*
+		 * The unlink may have reached storage before directory fsync failed.
+		 * Recreate the marker immediately before propagating the error.
+		 */
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		ps_slru_debt_persist();
 		PG_RE_THROW();
@@ -2613,10 +2639,9 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	/*
-	 * Discard the standing candidate before unfreezing debt: it may stem from
-	 * a checkpoint that completed while the mirror was frozen and unprimed.
-	 * Clearing after the CAS would give a concurrent drain tail a window to
-	 * publish that stale candidate.
+	 * Discard the standing candidate before unfreezing debt: it may stem
+	 * from a checkpoint that completed while the mirror was frozen and
+	 * unprimed, and a concurrent drain must not publish it after the CAS.
 	 */
 	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
@@ -2640,7 +2665,6 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				(errmsg("a new SLRU mirror loss arrived during the reset"),
 				 errhint("Re-prime the mirror and retry.")));
 	}
-
 	PG_RETURN_INT64((int64) lost);
 }
 
