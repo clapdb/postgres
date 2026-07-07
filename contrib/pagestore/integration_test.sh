@@ -814,10 +814,11 @@ $P -c "CREATE FUNCTION pagestore_slru_live_read_at(text, int, pg_lsn) RETURNS by
 $P -c "CREATE TABLE slru_live(x int);" >/dev/null
 LIVEXID=$($P -q -c "BEGIN; INSERT INTO slru_live VALUES (1); SELECT (txid_current() % 4294967296)::bigint; COMMIT;")
 $P -c "CHECKPOINT;" >/dev/null   # SimpleLruWriteAll stages; the checkpoint's control flush hook drains
-LIVEPAGE=$((LIVEXID / 32768))    # CLOG_XACTS_PER_PAGE with BLCKSZ 8192
+LIVE_CXPP=$(( $($P -c "SHOW block_size") * 4 ))
+LIVEPAGE=$((LIVEXID / LIVE_CXPP))
 assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, pg_current_wal_lsn()) IS NOT NULL;")" "t" \
 	"store holds a live-mirrored pg_xact page after checkpoint"
-assert "$($P -c "SELECT (get_byte(pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, pg_current_wal_lsn()), $(((LIVEXID % 32768) / 4))) >> $(((LIVEXID % 4) * 2))) & 3;")" "1" \
+assert "$($P -c "SELECT (get_byte(pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, pg_current_wal_lsn()), $(((LIVEXID % LIVE_CXPP) / 4))) >> $(((LIVEXID % 4) * 2))) & 3;")" "1" \
 	"live-mirrored clog page carries the committed bit for our xid"
 assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_xact', $LIVEPAGE, '0/1'::pg_lsn) IS NULL;")" "t" \
 	"no live image below the first fence LSN (as-of read is capped)"

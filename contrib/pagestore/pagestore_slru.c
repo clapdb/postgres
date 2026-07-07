@@ -91,6 +91,7 @@
 static bool pagestore_slru_mirror = false;
 
 static bool ps_slru_mirror_enabled = false;
+static slru_page_write_hook_type prev_slru_page_write_hook = NULL;
 
 /* Per-op mailbox timeout and whole-drain budget; see the control mirror. */
 #define PS_SLRU_SHIP_TIMEOUT_MS		10000
@@ -162,9 +163,17 @@ static int	ps_slru_recap_count = 0;
 static uint64 ps_slru_lost = 0;
 static uint64 ps_slru_lost_reported = 0;
 
+#define PS_SLRU_VERSION_SLOTS	4096
+
+typedef struct PsSlruVersionSlot
+{
+	pg_atomic_uint64 version;
+} PsSlruVersionSlot;
+
 typedef struct PsSlruStatsShm
 {
 	pg_atomic_uint64 lost;
+	PsSlruVersionSlot version_slot[PS_SLRU_VERSION_SLOTS];
 } PsSlruStatsShm;
 
 static PsSlruStatsShm *ps_slru_stats = NULL;
@@ -200,7 +209,11 @@ ps_slru_stats_shmem_startup(void)
 	ps_slru_stats = ShmemInitStruct("pagestore slru mirror stats",
 									sizeof(PsSlruStatsShm), &found);
 	if (!found)
+	{
 		pg_atomic_init_u64(&ps_slru_stats->lost, 0);
+		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
+			pg_atomic_init_u64(&ps_slru_stats->version_slot[i].version, 0);
+	}
 	LWLockRelease(AddinShmemInitLock);
 }
 
@@ -218,6 +231,7 @@ static bool ps_slru_no_rethrow = false;
 static void ps_slru_exit_drain(int code, Datum arg);
 static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
+static bool ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out);
 
 /*
  * The in-scope SLRU directories (the WAL-logged, uint32-page ones; see
@@ -275,6 +289,36 @@ ps_slru_obj_key(PageStoreRelKey *key, uint32 obj)
 	key->dbOid = 0;
 	key->relNumber = (RelFileNumber) obj;
 	key->forkNum = 0;
+}
+
+static uint32
+ps_slru_page_hash(uint32 obj, uint32 pageno)
+{
+	uint32		h = obj;
+
+	h ^= pageno + 0x9e3779b9 + (h << 6) + (h >> 2);
+	return h;
+}
+
+static XLogRecPtr
+ps_slru_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
+{
+	PsSlruVersionSlot *slot;
+	uint64		cur;
+	uint64		next;
+
+	if (ps_slru_stats == NULL || XLogRecPtrIsInvalid(bound))
+		return bound;
+
+	slot = &ps_slru_stats->version_slot[ps_slru_page_hash(obj, pageno) %
+										PS_SLRU_VERSION_SLOTS];
+	cur = pg_atomic_read_u64(&slot->version);
+	for (;;)
+	{
+		next = Max((uint64) bound, cur + 1);
+		if (pg_atomic_compare_exchange_u64(&slot->version, &cur, next))
+			return (XLogRecPtr) next;
+	}
 }
 
 /*
@@ -409,6 +453,9 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	uint32		obj;
 	XLogRecPtr	now;
 
+	if (prev_slru_page_write_hook)
+		prev_slru_page_write_hook(ctl, pageno, page, fence_lsn);
+
 	if (!ps_slru_dir_obj(ctl->options.Dir, &obj))
 		return;					/* out-of-scope SLRU: excluded, not mirrored */
 
@@ -434,6 +481,7 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	now = ps_slru_now_lsn();
 	if (XLogRecPtrIsInvalid(fence_lsn))
 		fence_lsn = now;
+	now = ps_slru_reserve_version(obj, (uint32) pageno, now);
 
 	ps_slru_stage(ctl, obj, (uint32) pageno, page, fence_lsn, now);
 }
@@ -608,6 +656,62 @@ ps_slru_queue_holds_posted(uint32 obj, uint32 pageno)
 	return false;
 }
 
+static bool
+ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
+{
+	bool		staged = false;
+
+	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY && ps_slru_recap_count > 0; i++)
+	{
+		PsSlruRecapture *r = &ps_slru_recap[i];
+		char		image[BLCKSZ];
+		XLogRecPtr	fence;
+		XLogRecPtr	bound;
+
+		if (!r->used)
+			continue;
+		if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
+									   PS_SLRU_DRAIN_BUDGET_MS))
+		{
+			*budget_out = true;
+			break;
+		}
+		if (ps_slru_queue_count >= PS_SLRU_QUEUE_CAPACITY)
+			break;				/* queue refilled; retry next drain */
+
+		/*
+		 * While the identity's posted entry is still awaiting its sync, the
+		 * recapture must wait.  This helper is called again after synced
+		 * entries pop, so exit drains get a same-drain retry before leftovers
+		 * are declared lost.
+		 */
+		if (ps_slru_queue_holds_posted(r->obj, r->pageno))
+			continue;
+		if (!ps_slru_recapture_page(r, image, &fence))
+			continue;			/* keep for the next drain */
+
+		/*
+		 * A fence at or below the floor cannot disambiguate the new bytes
+		 * from a same-version post that may still be in flight; wait for WAL
+		 * to advance.
+		 */
+		if (!XLogRecPtrIsInvalid(r->fence_floor) && fence <= r->fence_floor)
+			continue;
+
+		/*
+		 * Re-stage with the snapshot's own in-lock bound -- routing through
+		 * the write hook would resample a later position and could version
+		 * these (possibly stale) bytes past a newer concurrent capture's.
+		 */
+		bound = ps_slru_reserve_version(r->obj, r->pageno, fence);
+		ps_slru_stage(r->ctl, r->obj, r->pageno, image, fence, bound);
+		r->used = false;
+		ps_slru_recap_count--;
+		staged = true;
+	}
+	return staged;
+}
+
 /*
  * Ship every staged image, in any order (entries are independent objects;
  * per-page ordering is by version).  Must only run outside critical
@@ -645,55 +749,17 @@ ps_slru_drain(void)
 	PG_TRY();
 	{
 		TimestampTz drain_start = GetCurrentTimestamp();
-		bool		posted = false;
+		bool		posted;
 		bool		budget_out = false;
 
 		/*
 		 * Service recaptures first: they re-enter the queue as fresh
 		 * captures so the shipping loop below handles them uniformly.
 		 */
-		for (int i = 0; i < PS_SLRU_RECAP_CAPACITY && ps_slru_recap_count > 0; i++)
-		{
-			PsSlruRecapture *r = &ps_slru_recap[i];
-			char		image[BLCKSZ];
-			XLogRecPtr	fence;
+		(void) ps_slru_service_recaptures(drain_start, &budget_out);
 
-			if (!r->used)
-				continue;
-			if (ps_slru_queue_count >= PS_SLRU_QUEUE_CAPACITY)
-				break;			/* queue refilled; retry next drain */
-
-			/*
-			 * While the identity's posted entry is still awaiting its sync,
-			 * the recapture must wait: the write hook would route it right
-			 * back here.  The entry pops this drain (or a later one) and
-			 * the recapture proceeds at the next.
-			 */
-			if (ps_slru_queue_holds_posted(r->obj, r->pageno))
-				continue;
-			if (!ps_slru_recapture_page(r, image, &fence))
-				continue;		/* keep for the next drain */
-
-			/*
-			 * A fence at or below the floor cannot disambiguate the new
-			 * bytes from a same-version post that may still be in flight;
-			 * wait for the WAL to advance (any later insert breaks the
-			 * tie, and until then the watermark side sees this entry as
-			 * pending and stays conservative).
-			 */
-			if (!XLogRecPtrIsInvalid(r->fence_floor) && fence <= r->fence_floor)
-				continue;
-
-			/*
-			 * Re-stage with the snapshot's own in-lock bound -- routing
-			 * through the write hook would resample a later position and
-			 * could version these (possibly stale) bytes past a newer
-			 * concurrent capture's.
-			 */
-			ps_slru_stage(r->ctl, r->obj, r->pageno, image, fence, fence);
-			r->used = false;
-			ps_slru_recap_count--;
-		}
+post_again:
+		posted = false;
 
 		/* Phase one: post.  Entries stay staged until the store syncs. */
 		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
@@ -780,6 +846,19 @@ ps_slru_drain(void)
 			p->shipped = false;
 			p->posted_fence = InvalidXLogRecPtr;
 			ps_slru_queue_count--;
+		}
+
+		/*
+		 * Recaptures blocked behind posted entries get one same-drain retry
+		 * after those entries sync and pop.  This matters most for exit
+		 * drains: if the daemon is reachable again, do not count a recapture
+		 * as lost merely because it was blocked at the start of the drain.
+		 */
+		if (!budget_out && ps_slru_recap_count > 0 &&
+			ps_slru_queue_count < PS_SLRU_QUEUE_CAPACITY)
+		{
+			if (ps_slru_service_recaptures(drain_start, &budget_out))
+				goto post_again;
 		}
 
 		if (budget_out)
@@ -991,6 +1070,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 				(errmsg("pagestore.slru_mirror requires pagestore.backend = 'localsvc'")));
 
 	ps_slru_mirror_enabled = true;
+	prev_slru_page_write_hook = slru_page_write_hook;
 	slru_page_write_hook = ps_slru_write_hook;
 	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
