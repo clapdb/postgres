@@ -249,8 +249,14 @@ When it is built, the three review rounds established the requirements it must m
   table (re-snapshot under the bank lock, or from the local segment if
   evicted, with a fresh conservative fence); only double overflow loses
   coverage, and that is counted (`pagestore_slru_mirror_stats()`) so the
-  watermark must fail conservative.  The watermark itself, truncation
-  tombstones, and the read-side consumer are the remaining increments.
+  watermark must fail conservative.  Post-then-sync: entries pop only
+  after the store sync, and once posted their bytes are frozen at the
+  posted version (a timed-out request may still land in the daemon later,
+  and the store resolves same-version appends by arrival order:
+  byte-identical retries make that order irrelevant, while newer bytes
+  re-ship via recapture strictly above the posted version).  The
+  watermark itself, truncation tombstones, and the read-side consumer are
+  the remaining increments.
 
 This list is the spec for that feature; none of it blocks M4.
 
