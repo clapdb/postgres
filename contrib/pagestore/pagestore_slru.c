@@ -414,7 +414,15 @@ ps_slru_dir_obj(const char *dir, uint32 *obj)
 static void
 ps_slru_obj_key(PageStoreRelKey *key, uint32 obj)
 {
-	key->spcOid = 0;
+	/*
+	 * Live mirror objects are strictly timeline-local: the store's as-of
+	 * reads walk timeline ancestry, and a branch consuming its parent's
+	 * live SLRU images (or watermark) would inherit status past its fork
+	 * point instead of its reconstructed-at-fork truth.  Branding the key
+	 * with the compute's own timeline makes ancestor objects simply not
+	 * resolve.
+	 */
+	key->spcOid = (Oid) pagestore_localsvc_timeline();
 	key->dbOid = 0;
 	key->relNumber = (RelFileNumber) obj;
 	key->forkNum = 0;
@@ -519,18 +527,27 @@ ps_slru_shmem_startup(void)
 
 /*
  * Remember the epoch a page's last physical-read decision was made at.
- * Tag-last with barriered exchanges: a concurrent reader can only see a
- * mismatched tag (= stale), never a wrong epoch under a matching tag.
+ * The slot is claimed with a sentinel tag (1 -- never a real tag, whose
+ * obj hash occupies the high bits) before the pair is written and the
+ * real tag is stored last, so two colliding writers cannot interleave one
+ * page's tag with the other's epoch; the loser simply skips (its page
+ * reads as unknown = stale, and the next physical read re-notes it).  A
+ * concurrent reader can only see a mismatched tag (= stale), never a
+ * wrong epoch under a matching tag.
  */
 static void
 ps_slru_served_note(uint32 obj, uint32 pageno, uint64 epoch)
 {
 	PsSlruServedShm *e;
+	uint64		old;
 
 	if (ps_slru_wm == NULL)
 		return;
 	e = &ps_slru_wm->served[ps_slru_served_slot(obj, pageno)];
-	(void) pg_atomic_exchange_u64(&e->tag, 0);
+
+	old = pg_atomic_read_u64(&e->tag);
+	if (old == 1 || !pg_atomic_compare_exchange_u64(&e->tag, &old, 1))
+		return;					/* another writer mid-update: skip */
 	(void) pg_atomic_exchange_u64(&e->epoch, epoch);
 	(void) pg_atomic_exchange_u64(&e->tag, ps_slru_served_tag(obj, pageno));
 }
@@ -565,9 +582,21 @@ ps_slru_served_epoch(uint32 obj, uint32 pageno, uint64 *epoch)
 static void
 ps_slru_tomb_note(int idx, int64 cutoff, uint64 version)
 {
+	uint64		cur;
+
 	if (ps_slru_wm == NULL)
 		return;
-	if (version <= pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]))
+
+	/*
+	 * Claim the pair by parking the version at UINT64_MAX (the revalidator
+	 * reads that as "everything below the cutoff is stale" -- conservative
+	 * while the update is in flight), write the cutoff, then land the real
+	 * version.  A concurrent updater skips; the next TTL fetch re-notes.
+	 */
+	cur = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+	if (version <= cur || cur == PG_UINT64_MAX ||
+		!pg_atomic_compare_exchange_u64(&ps_slru_wm->tomb_version[idx], &cur,
+										PG_UINT64_MAX))
 		return;
 	(void) pg_atomic_exchange_u64(&ps_slru_wm->tomb_cutoff[idx],
 								  (uint64) cutoff + 1);
@@ -1019,6 +1048,28 @@ ps_slru_reader_fetch_wm(void)
 }
 
 /*
+ * Does the local segment file holding 'pageno' exist?  On the mirror's own
+ * writer, a present local segment is always at least as new as anything
+ * the mirror holds (the mirror is fed FROM these files), so live reads
+ * must not shadow it with a possibly-lagging store image; the mirror
+ * serves the writer only for segments that are locally gone.
+ */
+static bool
+ps_slru_local_segment_exists(SlruDesc *ctl, int64 pageno)
+{
+	char		path[MAXPGPATH];
+	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
+	struct stat st;
+
+	if (ctl->options.long_segment_names)
+		snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->options.Dir, segno);
+	else
+		snprintf(path, MAXPGPATH, "%s/%04X", ctl->options.Dir,
+				 (unsigned int) segno);
+	return stat(path, &st) == 0;
+}
+
+/*
  * slru_page_read_hook consumer: serve a physical SLRU page read from the
  * live mirror, gated on the published watermark.  Runs inside the
  * SLRU_PAGE_READ_IN_PROGRESS window: it must not throw, so every store
@@ -1040,6 +1091,10 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		return SLRU_READ_HOOK_FALLBACK;
 	obj = ps_slru_dirmap[idx].obj;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+		return SLRU_READ_HOOK_FALLBACK;
+
+	/* the writer's own local files outrank its (lagging) mirror */
+	if (ps_slru_mirror_enabled && ps_slru_local_segment_exists(ctl, pageno))
 		return SLRU_READ_HOOK_FALLBACK;
 
 	PG_TRY();
@@ -1154,6 +1209,10 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		return SLRU_READ_HOOK_FALLBACK;
 	obj = ps_slru_dirmap[idx].obj;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
+		return SLRU_READ_HOOK_FALLBACK;
+
+	/* the writer's own local files outrank its (lagging) mirror */
+	if (ps_slru_mirror_enabled && ps_slru_local_segment_exists(ctl, pageno))
 		return SLRU_READ_HOOK_FALLBACK;
 
 	PG_TRY();
@@ -1705,6 +1764,7 @@ ps_slru_drain(void)
 		 */
 		ps_slru_wm_republish_pending();
 		ps_slru_wm_advance();
+		ps_slru_wm_publish();
 		return;
 	}
 

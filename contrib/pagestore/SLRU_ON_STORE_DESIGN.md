@@ -220,13 +220,19 @@ When it is built, the three review rounds established the requirements it must m
   `pagestore_slru_mirror_reset_debt()`.  Losses are persistent: a debt
   marker file survives clean shutdowns, and any unclean previous life
   (pg_control not `DB_SHUTDOWNED` at boot) is itself boot debt, since a
-  dying process may have held staged images.  Image versions come from a
-  global monotone **stamp allocator** issued at capture under the bank
-  lock (group-LSN fences can shrink on reload, and drain-time "now"
-  stamps race across processes: a stale capture shipped late at a higher
-  version would shadow a newer superset image); the fence stays what the
-  drain `XLogFlush()`es, the stamp is the version.  The local commit is
-  never held back; only its visibility to *other* computes waits.
+  dying process may have held staged images -- and enabling the mirror on
+  a cluster with pre-existing SLRU history starts unprimed, since clean
+  local segments are never flushed (captured) again: the watermark stays
+  frozen until `pagestore_slru_mirror_reset_debt()` both primes and
+  forgives (a persistent primed marker).  Image versions are always real
+  WAL positions: the capture-time fence, lifted at post time above every
+  version the page ever shipped at (a shared CAS-max floor table) but
+  never past the insert pointer -- when the floor catches up, the entry
+  defers to a later drain, its pending floor keeping the watermark honest
+  until WAL insertion unblocks it.  LSN-comparable, restart-ordered (WAL
+  only grows), and two images of one page can never tie, so store arrival
+  order never decides which bytes win.  The local commit is never held
+  back; only its visibility to *other* computes waits.
 - **Cache-hit revalidation, including tombstones.** DONE:
   `slru_page_revalidate_hook` runs on every `SimpleLruReadPage()` cache
   hit AND on `SimpleLruReadPage_ReadOnly()`'s shared-lock fast path (the
@@ -244,7 +250,14 @@ When it is built, the three review rounds established the requirements it must m
   never a stale answer).  Dirty slots are local truth and are never
   discarded.  The live mirror has exactly ONE writer per branch timeline
   (`pagestore.slru_mirror` on the branch primary; live-read computes only
-  consume): newest-image reads depend on that invariant.
+  consume): newest-image reads depend on that invariant.  Mirror objects
+  are timeline-local (the compute's timeline brands the key), so a branch
+  never resolves its ancestor's live images or watermark past the fork
+  point; on the writer itself, a locally present segment always outranks
+  the (lagging) mirror.  Cross-SLRU pairs (multixact offsets/members) are
+  coherent for anything at/below the watermark -- a checkpoint flushes
+  both -- which is exactly the range a reader may trust; consistency
+  beyond W is the multi-compute read-consistency work.
 - **Tombstones with a defined version + synchronous truncate barrier.**
   DONE: `slru_truncate_hook` fires before any local segment deletion --
   `SimpleLruTruncate` (after its wraparound backstop), `SlruDeleteSegment`,
@@ -254,10 +267,16 @@ When it is built, the three review rounds established the requirements it must m
   in-critical calls find their cutoff covered and no-op.  The consumer
   flushes the truncation WAL first (TruncateCommitTs inserts without
   flushing), ships a `PS_KLASS_SLRU_TOMB` cutoff tombstone and syncs it
-  durably before returning, versioned by the current WAL position -- in
+  durably before returning, versioned by the exact truncation record where
+  the caller knows it (TruncateCLOG/TruncateCommitTs run the barrier
+  themselves with the record's end LSN; SimpleLruTruncate's hook call then
+  finds the cutoff covered) and by the current position otherwise -- in
   recovery the END of the record being replayed (`GetCurrentReplayRecPtr`),
   never the last-replayed position, which would make the tombstone visible
-  below the truncation record itself.  A store failure freezes the
+  below the truncation record itself.  The synchronous ship publishes its
+  own pending floor so no concurrent checkpoint advances the watermark past
+  a truncation whose tombstone is still in flight; the covered cache skips
+  exact duplicates only (page spaces wrap).  A store failure freezes the
   watermark (the truncation record is typically already WAL-logged) and
   then raises, abandoning the local truncation -- except in recovery and
   for the delete-all reset, where nothing can be abandoned: there it stays
