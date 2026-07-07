@@ -64,6 +64,7 @@
  */
 #include "postgres.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -120,9 +121,15 @@ typedef struct PsSlruPending
 								 * store has synced */
 	uint32		obj;			/* slru_klass_id of the SLRU directory */
 	uint32		pageno;
-	XLogRecPtr	fence_lsn;		/* upper bound of the image's contents; the
-								 * version floor and what the drain must
-								 * XLogFlush() */
+	XLogRecPtr	fence_lsn;		/* what the drain must XLogFlush(): the
+								 * page's largest group commit LSN (every
+								 * not-yet-durable bit has one) */
+	XLogRecPtr	bound;			/* the image's version base: the WAL position
+								 * at capture time, an upper bound of every
+								 * bit the bytes contain (group fences alone
+								 * understate it -- synchronous commits do
+								 * not update group LSNs); lifted above the
+								 * last-shipped floor at post time */
 	XLogRecPtr	posted_fence;	/* version of a post that may have reached
 								 * the daemon; freezes the bytes (see
 								 * ps_slru_write_hook) */
@@ -802,23 +809,27 @@ ps_slru_wm_advance(void)
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
+		PGPROC	   *proc;
+
 		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
 			continue;
 
 		/*
 		 * A floor whose owner is gone is a coverage loss no exit path
 		 * accounted for (e.g. a backend killed after staging but before
-		 * its first drain registered the exit callback).  Convert it --
-		 * the loss freezes the watermark -- and clear the slot so it does
-		 * not read as pending forever.
+		 * its first drain registered the exit callback).  Ownership is
+		 * checked against the ProcNumber's PGPROC pid, not the OS pid (a
+		 * recycled OS pid would report the dead owner alive).  Convert it
+		 * -- the loss freezes the watermark for good, so stop here rather
+		 * than let this very pass advance over the fresh hole -- and
+		 * clear the slot so it does not read as pending forever.
 		 */
-		if (kill((pid_t) pg_atomic_read_u64(&ps_slru_wm->pending[i].pid), 0) != 0 &&
-			errno == ESRCH)
+		proc = GetPGProcByNumber(i);
+		if ((uint64) proc->pid != pg_atomic_read_u64(&ps_slru_wm->pending[i].pid))
 		{
 			ps_slru_wm_note_lost();
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
-			continue;
 		}
 		return;
 	}
@@ -1367,6 +1378,54 @@ static int64 ps_slru_tomb_covered[lengthof(ps_slru_dirmap)];
 static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
 
 /*
+ * Re-derive tombstones from local truth.  Part of priming
+ * (pagestore_slru_mirror_reset_debt): the multixact pre-barrier ships its
+ * tombstone before the truncation's WAL record can exist, so a crash in
+ * that window leaves a durable tombstone for a truncation that never
+ * happened -- pages that are live locally read as dead in the mirror.
+ * Every such crash is boot debt, and priming is its mandated repair: for
+ * each in-scope SLRU, publish a tombstone at the lowest locally present
+ * segment's first page (everything below it is locally truncated or never
+ * existed; an empty directory means nothing local is live at all).  The
+ * read side takes the newest-VERSIONED tombstone, so an over-wide stale
+ * cutoff is superseded by this narrower, newer one.  Under a wrapped page
+ * space the numeric minimum can only under-state the cutoff, which at
+ * worst leaves historically-accurate images servable -- never the
+ * reverse.
+ */
+static void
+ps_slru_tomb_rederive(void)
+{
+	for (int i = 0; i < (int) lengthof(ps_slru_dirmap); i++)
+	{
+		DIR		   *dir;
+		struct dirent *de;
+		int64		minseg = -1;
+		int64		cutoff;
+
+		dir = AllocateDir(ps_slru_dirmap[i].dir);
+		while ((de = ReadDirExtended(dir, ps_slru_dirmap[i].dir, LOG)) != NULL)
+		{
+			size_t		len = strlen(de->d_name);
+			int64		seg;
+
+			if (len < 4 || len > 15 ||
+				strspn(de->d_name, "0123456789ABCDEF") != len)
+				continue;
+			seg = (int64) strtoull(de->d_name, NULL, 16);
+			if (minseg < 0 || seg < minseg)
+				minseg = seg;
+		}
+		FreeDir(dir);
+
+		cutoff = (minseg < 0) ? PG_INT64_MAX
+			: minseg * SLRU_PAGES_PER_SEGMENT;
+		ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
+							   ps_slru_now_lsn());
+	}
+}
+
+/*
  * slru_truncate_hook consumer: the synchronous truncate barrier.  Called
  * before any local segment deletion.
  *
@@ -1511,74 +1570,85 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	}
 
 	/*
-	 * A write that carries no fence (SLRUs without group LSNs, redo-driven
-	 * writes) is bounded at CAPTURE time: the bytes certainly contain
-	 * nothing past the current WAL position.  Stamping at drain time
-	 * instead would be wrong -- the page can be dirtied again between this
-	 * flush and the drain, and a drain-time position would falsely cover
-	 * those later changes.  (Reading the insert position is atomics/
-	 * spinlock only, fine under the bank lock.)
+	 * Bound the image at CAPTURE time: the bytes certainly contain nothing
+	 * past the current WAL position, and nothing later can honestly claim
+	 * less -- a group-LSN fence alone understates the contents (synchronous
+	 * commits and aborts do not update group LSNs; only async commits do),
+	 * and a drain-time position would falsely cover changes applied to the
+	 * page between this flush and the drain.  The fence is kept separately
+	 * as the flush obligation: every not-yet-durable bit has a group LSN
+	 * by the SLRU's own WAL-before-data rule, so flushing the fence is
+	 * sufficient and cheaper than flushing to the bound.  (Reading the
+	 * positions is atomics/spinlock only, fine under the bank lock.)
 	 */
-	if (XLogRecPtrIsInvalid(fence_lsn))
-		fence_lsn = ps_slru_now_lsn();
-
-	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
-		PsSlruPending *p = &ps_slru_queue[i];
+		XLogRecPtr	now = ps_slru_now_lsn();
 
-		if (p->used)
+		if (XLogRecPtrIsInvalid(fence_lsn))
+			fence_lsn = now;
+
+		for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 		{
-			if (p->obj == obj && p->pageno == (uint32) pageno)
+			PsSlruPending *p = &ps_slru_queue[i];
+
+			if (p->used)
 			{
-				/*
-				 * Same page staged again before a drain.  If a post of this
-				 * entry may have reached the daemon (a previous drain timed
-				 * out or failed after obj_write), the bytes must stay
-				 * exactly what was posted: the store resolves same-version
-				 * appends by arrival order, and an abandoned request can
-				 * land after our retry -- byte-identical duplicates make
-				 * that order irrelevant.  The newer bytes become a
-				 * recapture instead, re-snapshotted at drain time and
-				 * shipped strictly above the posted version (the
-				 * last-shipped floor guarantees it).
-				 */
-				if (!XLogRecPtrIsInvalid(p->posted_fence))
+				if (p->obj == obj && p->pageno == (uint32) pageno)
 				{
-					ps_slru_note_recapture(ctl, obj, (uint32) pageno);
+					/*
+					 * Same page staged again before a drain.  If a post of
+					 * this entry may have reached the daemon (a previous
+					 * drain timed out or failed after obj_write), the bytes
+					 * must stay exactly what was posted: the store resolves
+					 * same-version appends by arrival order, and an
+					 * abandoned request can land after our retry --
+					 * byte-identical duplicates make that order irrelevant.
+					 * The newer bytes become a recapture instead,
+					 * re-snapshotted at drain time and shipped strictly
+					 * above the posted version (the last-shipped floor
+					 * guarantees it).
+					 */
+					if (!XLogRecPtrIsInvalid(p->posted_fence))
+					{
+						ps_slru_note_recapture(ctl, obj, (uint32) pageno);
+						return;
+					}
+
+					/*
+					 * Keep the newest bytes.  The fence and the bound only
+					 * ever need to grow -- a smaller recomputed fence
+					 * (group LSNs reset on eviction/reload) must not
+					 * un-fence bits the older image already carried.
+					 */
+					memcpy(p->image, page, BLCKSZ);
+					if (p->fence_lsn < fence_lsn)
+						p->fence_lsn = fence_lsn;
+					if (p->bound < now)
+						p->bound = now;
+					ps_slru_wm_note_pending(p->fence_lsn);
 					return;
 				}
-
-				/*
-				 * Keep the newest bytes.  The fence only ever needs to
-				 * grow -- a smaller recomputed fence (group LSNs reset on
-				 * eviction/reload) must not un-fence bits the older image
-				 * already carried.
-				 */
-				memcpy(p->image, page, BLCKSZ);
-				if (p->fence_lsn < fence_lsn)
-					p->fence_lsn = fence_lsn;
-				ps_slru_wm_note_pending(p->fence_lsn);
-				return;
 			}
+			else if (free_slot < 0)
+				free_slot = i;
 		}
-		else if (free_slot < 0)
-			free_slot = i;
-	}
 
-	if (free_slot >= 0)
-	{
-		PsSlruPending *p = &ps_slru_queue[free_slot];
+		if (free_slot >= 0)
+		{
+			PsSlruPending *p = &ps_slru_queue[free_slot];
 
-		p->used = true;
-		p->shipped = false;
-		p->obj = obj;
-		p->pageno = (uint32) pageno;
-		p->fence_lsn = fence_lsn;
-		p->posted_fence = InvalidXLogRecPtr;
-		memcpy(p->image, page, BLCKSZ);
-		ps_slru_queue_count++;
-		ps_slru_wm_note_pending(fence_lsn);
-		return;
+			p->used = true;
+			p->shipped = false;
+			p->obj = obj;
+			p->pageno = (uint32) pageno;
+			p->fence_lsn = fence_lsn;
+			p->bound = now;
+			p->posted_fence = InvalidXLogRecPtr;
+			memcpy(p->image, page, BLCKSZ);
+			ps_slru_queue_count++;
+			ps_slru_wm_note_pending(fence_lsn);
+			return;
+		}
 	}
 
 	/* Queue full: record the page identity for recapture at drain time. */
@@ -1605,13 +1675,14 @@ ps_slru_now_lsn(void)
 		XLogRecPtr	p = GetCurrentReplayRecPtr(NULL);
 
 		/*
-		 * Early in recovery (before the first record is applied) the
-		 * replay pointer may not be set yet; fall back down the chain.  A
-		 * too-low bound here is safe: an unclean boot carries boot debt,
-		 * so the watermark is frozen until the mirror is re-primed, and a
-		 * low-versioned image can at worst be outranked by an existing
-		 * store image whose own claims still hold.  (Tombstones are never
-		 * shipped that early; their versions stay at/after their record.)
+		 * The END of the record being replayed: a redo routine's SLRU
+		 * write carries that record's effects, which the last-replayed
+		 * position (still pointing before the record) would understate.
+		 * Early in recovery the replay pointers may not be set yet; fall
+		 * back down the chain -- a too-low bound is safe: an unclean boot
+		 * carries boot debt, so the watermark is frozen until the mirror
+		 * is re-primed.  (Tombstones are never shipped that early; their
+		 * versions stay at/after their record.)
 		 */
 		if (XLogRecPtrIsInvalid(p))
 			p = GetXLogReplayRecPtr(NULL);
@@ -1833,7 +1904,7 @@ ps_slru_drain(void)
 			/*
 			 * A retry of an already-posted entry must reuse the posted
 			 * version verbatim (the bytes are frozen to match).  A fresh
-			 * post is versioned by its capture-time fence, lifted above
+			 * post is versioned by its capture-time bound, lifted above
 			 * every version its page ever shipped at (last_shipped): two
 			 * images of one page must never carry the same version, or
 			 * the store's arrival order would decide which bytes win.
@@ -1849,7 +1920,7 @@ ps_slru_drain(void)
 			{
 				uint64		floor = ps_slru_shipped_floor(p->obj, p->pageno);
 
-				version = p->fence_lsn;
+				version = p->bound;
 				Assert(!XLogRecPtrIsInvalid(version));
 				if ((uint64) version <= floor)
 				{
@@ -1864,14 +1935,15 @@ ps_slru_drain(void)
 			/*
 			 * WAL-before-data: never let another compute observe a status
 			 * bit whose WAL is not durable.  Same order the local write
-			 * path enforces (SlruPhysicalWritePage's XLogFlush).  The
-			 * fence is the content bound; the lifted version never exceeds
-			 * the insert position, so flushing to Max(fence, version) is
-			 * always a real, reachable WAL position.  (In recovery the
+			 * path enforces (SlruPhysicalWritePage's XLogFlush): flushing
+			 * the fence covers every not-yet-durable bit (async commits
+			 * set group LSNs; synchronous ones flushed at commit).  The
+			 * version may exceed the flushed position -- it is a key, the
+			 * fence is the durability obligation.  (In recovery the
 			 * replayed WAL is already durable.)
 			 */
-			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < version)
-				XLogFlush(version);
+			if (!RecoveryInProgress() && GetFlushRecPtr(NULL) < p->fence_lsn)
+				XLogFlush(p->fence_lsn);
 
 			/*
 			 * Freeze BEFORE the bytes can reach the daemon: if obj_write
@@ -1987,12 +2059,12 @@ ps_slru_exit_drain(int code, Datum arg)
 		pagestore_slru_mirror_drain();
 
 	/*
-	 * Whatever is still staged dies with this process; the pages are clean
-	 * locally, so no later flush will re-stage them.  That is a coverage
-	 * loss, not a deferral: count it so the watermark freezes rather than
-	 * advancing over status the mirror will never carry, and clear our
-	 * pending slot (a dead process must not hold the floor forever -- the
-	 * loss accounting is what keeps this honest).
+	 * Whatever the drain could not ship dies with this process; the pages
+	 * are clean locally, so no later flush will re-stage them.  That is a
+	 * coverage loss, not a deferral: count it (durably) so the watermark
+	 * freezes rather than advancing over status the mirror will never
+	 * carry, and clear our pending slot (a dead process must not hold the
+	 * floor forever -- the loss accounting is what keeps this honest).
 	 */
 	if (ps_slru_queue_count > 0 || ps_slru_recap_count > 0)
 	{
@@ -2003,6 +2075,9 @@ ps_slru_exit_drain(int code, Datum arg)
 									ps_slru_queue_count + ps_slru_recap_count);
 			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		}
+		ereport(WARNING,
+				(errmsg("pagestore: exiting with %d unshipped SLRU image(s); the live mirror is missing them",
+						ps_slru_queue_count + ps_slru_recap_count)));
 	}
 	ps_slru_debt_persist();
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
@@ -2187,6 +2262,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 						PS_SLRU_PRIMED_FILE)));
 	CloseTransientFile(fd);
 
+	/*
+	 * Priming repairs tombstone state too: republish each SLRU's cutoff
+	 * from local truth, superseding any tombstone whose truncation never
+	 * reached the WAL (see ps_slru_tomb_rederive).  Failures abort the
+	 * reset before any debt is forgiven.
+	 */
+	ps_slru_tomb_rederive();
+
 	if (unlink(PS_SLRU_DEBT_FILE) != 0 && errno != ENOENT)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -2194,11 +2277,29 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 						PS_SLRU_DEBT_FILE)));
 	fsync_fname(".", true);
 
+	/*
+	 * The flag is cleared BEFORE the CAS: a loss that lands after the CAS
+	 * sets it again (its ordering is add-then-set), whereas clearing after
+	 * the CAS could erase that racing loss's flag and leave its debt
+	 * unpersisted.  If the CAS itself fails the flag is restored.
+	 */
+	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
 	if (!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
+	{
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		ereport(ERROR,
 				(errmsg("a new SLRU mirror loss arrived during the reset"),
 				 errhint("Re-prime the mirror and retry.")));
-	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+	}
+
+	/*
+	 * Discard the standing candidate: it may stem from a checkpoint that
+	 * completed while the mirror was frozen and unprimed, and the operator's
+	 * "whole as of now" claim should only ever be published through a
+	 * checkpoint cycle that completes after it.  The next checkpoint sets a
+	 * fresh candidate.
+	 */
+	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 	PG_RETURN_INT64((int64) lost);
 }
 
@@ -2221,6 +2322,10 @@ pagestore_slru_live_read_at(PG_FUNCTION_ARGS)
 	char	   *out = palloc(BLCKSZ);
 	bytea	   *result;
 
+	if (!ps_slru_mirror_enabled)
+		ereport(ERROR,
+				(errmsg("the SLRU live mirror is not active"),
+				 errhint("Set pagestore.slru_mirror = on (with the localsvc backend).")));
 	if (!ps_slru_dir_obj(slru, &obj))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
