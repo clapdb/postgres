@@ -540,10 +540,27 @@ static void
 ps_slru_wm_republish_pending(void)
 {
 	uint64		f = 0;
+	uint64		owner;
 
 	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
 		MyProcNumber >= ps_slru_wm_nprocs)
 		return;
+
+	/*
+	 * This can be the first post-drain touch of a ProcNumber slot inherited
+	 * from a dead backend.  Account for the previous owner's outstanding
+	 * floor before overwriting it with this backend's idle state.
+	 */
+	owner = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].pid);
+	if (owner != (uint64) MyProcPid)
+	{
+		if (owner != 0 &&
+			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
+			ps_slru_wm_note_lost();
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
+							(uint64) MyProcPid);
+	}
 
 	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
@@ -743,11 +760,11 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 					 * un-fence bits the older image already carried.
 					 */
 					memcpy(p->image, page, BLCKSZ);
+					ps_slru_wm_note_pending(fence_lsn);
 					if (p->fence_lsn < fence_lsn)
 						p->fence_lsn = fence_lsn;
 					if (p->bound < bound)
 						p->bound = bound;
-					ps_slru_wm_note_pending(p->fence_lsn);
 					return;
 				}
 			}
@@ -759,6 +776,7 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 		{
 			PsSlruPending *p = &ps_slru_queue[free_slot];
 
+			ps_slru_wm_note_pending(fence_lsn);
 			p->used = true;
 			p->shipped = false;
 			p->obj = obj;
@@ -768,7 +786,6 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 			p->posted_fence = InvalidXLogRecPtr;
 			memcpy(p->image, page, BLCKSZ);
 			ps_slru_queue_count++;
-			ps_slru_wm_note_pending(fence_lsn);
 			return;
 		}
 	}
@@ -1407,7 +1424,28 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not remove debt marker \"%s\": %m",
 						PS_SLRU_DEBT_FILE)));
-	fsync_fname(".", true);
+	PG_TRY();
+	{
+		fsync_fname(".", true);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * The unlink may have reached storage before directory fsync failed.
+		 * Recreate the marker immediately before propagating the error.
+		 */
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ps_slru_debt_persist();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * Discard the standing candidate before unfreezing debt: it may stem
+	 * from a checkpoint that completed while the mirror was frozen and
+	 * unprimed, and a concurrent drain must not publish it after the CAS.
+	 */
+	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
 	/*
 	 * The flag is cleared BEFORE the CAS: a loss that lands after the CAS
@@ -1429,15 +1467,6 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				(errmsg("a new SLRU mirror loss arrived during the reset"),
 				 errhint("Re-prime the mirror and retry.")));
 	}
-
-	/*
-	 * Discard the standing candidate: it may stem from a checkpoint that
-	 * completed while the mirror was frozen and unprimed, and the operator's
-	 * "whole as of now" claim should only ever be published through a
-	 * checkpoint cycle that completes after it.  The next checkpoint sets a
-	 * fresh candidate.
-	 */
-	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 	PG_RETURN_INT64((int64) lost);
 }
 
