@@ -71,6 +71,7 @@
 #include <unistd.h>
 
 #include "access/htup_details.h"
+#include "access/commit_ts.h"
 #include "access/slru.h"
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
@@ -762,13 +763,13 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 }
 
 /*
- * The last tombstone cutoff this process durably shipped per SLRU, so a
- * barrier that fires again for the SAME cutoff (the multixact
- * in-critical-section calls after their pre-barrier, a vacuum
- * re-truncating to the same page, SimpleLruTruncate after an exact-LSN
- * pre-barrier) reduces to a no-op.  Exact match only: several in-scope
- * page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so "lower
- * than covered" does not mean "already dead" -- a numerically smaller
+ * The last tombstone cutoff this process durably shipped per SLRU.  This is
+ * only a critical-section duplicate shield (the multixact in-critical-section
+ * calls after their pre-barrier, SimpleLruTruncate after an exact-LSN
+ * pre-barrier): outside critical sections, ship equal cutoffs again so their
+ * newer version can supersede stale store state.  Exact match only: several
+ * in-scope page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so
+ * "lower than covered" does not mean "already dead" -- a numerically smaller
  * later cutoff still ships, and its newer version supersedes.
  */
 static int64 ps_slru_tomb_covered[lengthof(ps_slru_dirmap)];
@@ -793,6 +794,8 @@ static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
 static void
 ps_slru_tomb_rederive(void)
 {
+	volatile bool commit_ts_locked = false;
+
 	/*
 	 * Serialize against concurrent truncations, or a scan could observe a
 	 * deletion in progress and publish its (higher) cutoff at a version
@@ -812,6 +815,14 @@ ps_slru_tomb_rederive(void)
 			struct dirent *de;
 			int64		minseg = -1;
 			int64		cutoff;
+			bool		commit_ts = strcmp(ps_slru_dirmap[i].dir,
+										   "pg_commit_ts") == 0;
+
+			if (commit_ts)
+			{
+				LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
+				commit_ts_locked = true;
+			}
 
 			/*
 			 * Scan failures must abort the priming (ReadDir raises), not
@@ -835,12 +846,20 @@ ps_slru_tomb_rederive(void)
 
 			cutoff = (minseg < 0) ? PG_INT64_MAX
 				: minseg * SLRU_PAGES_PER_SEGMENT;
+			ps_slru_tomb_covered_set[i] = false;
 			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
 								   ps_slru_now_lsn());
+			if (commit_ts)
+			{
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+			}
 		}
 	}
 	PG_CATCH();
 	{
+		if (commit_ts_locked)
+			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
 		LWLockRelease(WrapLimitsVacuumLock);
 		PG_RE_THROW();
@@ -890,7 +909,11 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	obj = ps_slru_dirmap[idx].obj;
 
 	if (ps_slru_tomb_covered_set[idx] && cutoffPage == ps_slru_tomb_covered[idx])
-		return;					/* a durable tombstone already covers this */
+	{
+		if (CritSectionCount > 0)
+			return;				/* pre-barrier already shipped this cutoff */
+		ps_slru_tomb_covered_set[idx] = false;
+	}
 
 	if (CritSectionCount > 0)
 	{
@@ -1685,7 +1708,20 @@ pagestore_slru_mirror_truncate(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("cutoff page must be non-negative")));
 
-	ps_slru_ship_tombstone(obj, cutoff, ps_slru_now_lsn());
+	{
+		XLogRecPtr	version = ps_slru_now_lsn();
+
+		ps_slru_wm_note_pending(version);
+		PG_TRY();
+		{
+			ps_slru_ship_tombstone(obj, cutoff, version);
+		}
+		PG_FINALLY();
+		{
+			ps_slru_wm_republish_pending();
+		}
+		PG_END_TRY();
+	}
 	PG_RETURN_VOID();
 }
 

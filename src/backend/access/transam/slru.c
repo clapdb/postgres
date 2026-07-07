@@ -1650,17 +1650,17 @@ restart:
 		}
 
 		/*
-		 * Hmm, we have (or may have) I/O operations acting on the page, so
-		 * we've got to wait for them to finish and then start again. This is
-		 * the same logic as in SlruSelectLRUPage.  (XXX if page is dirty,
-		 * wouldn't it be OK to just discard it without writing it?
-		 * SlruMayDeleteSegment() uses a stricter qualification, so we might
-		 * not delete this page in the end; even if we don't delete it, we
-		 * won't have cause to read its data again.  For now, keep the logic
-		 * the same as it was.)
+		 * A valid dirty page below the cutoff is already logically truncated.
+		 * Discard it instead of writing it: writing after the truncation
+		 * tombstone lets external mirrors capture a newer live image for a page
+		 * that local storage is about to forget.
 		 */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
-			SlruInternalWritePage(ctl, slotno, NULL);
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
 		else
 			SimpleLruWaitIO(ctl, slotno);
 
