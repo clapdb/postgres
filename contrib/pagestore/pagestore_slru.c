@@ -199,6 +199,7 @@ static void ps_slru_rearm_interrupt(void);
 static bool ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out);
 static void ps_slru_debt_persist(void);
 static void ps_slru_wm_note_lost(void);
+static bool ps_slru_wm_claim_pending_slot(void);
 
 /*
  * Bump every ledger a loss touches: the per-process counter (WARNING
@@ -339,6 +340,9 @@ typedef struct PsSlruWatermarkShm
 	pg_atomic_uint64 stats_lost;	/* raw loss events, for observability --
 									 * unlike total_lost it is not seeded
 									 * with boot debt and never reset */
+	pg_atomic_uint64 loss_generation;
+	pg_atomic_uint64 debt_generation;
+	pg_atomic_uint64 pending_owner_next;
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
 	PsSlruVersionSlot version_slot[PS_SLRU_VERSION_SLOTS];
 
@@ -364,6 +368,8 @@ typedef struct PsSlruWatermarkShm
 	{
 		pg_atomic_uint64 floor;
 		pg_atomic_uint64 pid;
+		pg_atomic_uint64 owner_gen;
+		pg_atomic_uint64 live_gen;
 	}			pending[FLEXIBLE_ARRAY_MEMBER];	/* per ProcNumber */
 } PsSlruWatermarkShm;
 
@@ -387,6 +393,7 @@ typedef struct PsSlruWatermarkShm
 
 static PsSlruWatermarkShm *ps_slru_wm = NULL;
 static int	ps_slru_wm_nprocs = 0;
+static uint64 ps_slru_my_pending_gen = 0;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_slru_shmem_startup_hook = NULL;
@@ -676,6 +683,9 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->candidate, 0);
 		pg_atomic_init_u64(&ps_slru_wm->total_lost, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->stats_lost, 0);
+		pg_atomic_init_u64(&ps_slru_wm->loss_generation, debt ? 1 : 0);
+		pg_atomic_init_u64(&ps_slru_wm->debt_generation, 1);
+		pg_atomic_init_u64(&ps_slru_wm->pending_owner_next, 1);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
 		{
@@ -703,6 +713,8 @@ ps_slru_shmem_startup(void)
 		{
 			pg_atomic_init_u64(&ps_slru_wm->pending[i].floor, 0);
 			pg_atomic_init_u64(&ps_slru_wm->pending[i].pid, 0);
+			pg_atomic_init_u64(&ps_slru_wm->pending[i].owner_gen, 0);
+			pg_atomic_init_u64(&ps_slru_wm->pending[i].live_gen, 0);
 		}
 
 		/*
@@ -810,10 +822,10 @@ ps_slru_tomb_note(int idx, int64 cutoff, uint64 version)
 
 /*
  * Publish that this process holds a staged-but-not-durable image at
- * 'fence'.  Called under the bank lock: a single atomic store to our own
- * slot, infallible.  Invalid fences publish as 1 (a floor below any real
- * LSN) -- the drain re-stamps them, but until it does the watermark must
- * not move at all.
+ * 'fence'.  Called under the bank lock: claim the ProcNumber slot with this
+ * process's non-reused owner generation, then lower its pending floor.
+ * Invalid fences publish as 1 (a floor below any real LSN) -- the drain
+ * re-stamps them, but until it does the watermark must not move at all.
  */
 static void
 ps_slru_wm_note_pending(XLogRecPtr fence)
@@ -821,28 +833,9 @@ ps_slru_wm_note_pending(XLogRecPtr fence)
 	uint64		f = XLogRecPtrIsInvalid(fence) ? 1 : (uint64) fence;
 	pg_atomic_uint64 *slot;
 	uint64		cur;
-	uint64		owner;
 
-	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
-		MyProcNumber >= ps_slru_wm_nprocs)
+	if (!ps_slru_wm_claim_pending_slot())
 		return;
-
-	/*
-	 * A leftover floor under a different pid means the slot's previous
-	 * owner died holding staged images and nobody accounted for them:
-	 * convert to a loss before taking the slot over, or reusing the
-	 * ProcNumber would silently erase the hole.
-	 */
-	owner = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].pid);
-	if (owner != (uint64) MyProcPid)
-	{
-		if (owner != 0 &&
-			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
-			ps_slru_wm_note_lost();
-		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
-		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
-							(uint64) MyProcPid);
-	}
 
 	slot = &ps_slru_wm->pending[MyProcNumber].floor;
 	cur = pg_atomic_read_u64(slot);
@@ -855,10 +848,72 @@ ps_slru_wm_note_lost(void)
 {
 	if (ps_slru_wm != NULL)
 	{
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		pg_atomic_fetch_add_u64(&ps_slru_wm->loss_generation, 1);
 		pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, 1);
 		pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, 1);
-		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 	}
+}
+
+static bool
+ps_slru_wm_pending_owner_matches(int procno, uint64 pid, uint64 gen)
+{
+	PGPROC	   *proc;
+
+	if (pid == 0 || gen == 0)
+		return false;
+	proc = GetPGProcByNumber(procno);
+	return (uint64) proc->pid == pid &&
+		pg_atomic_read_u64(&ps_slru_wm->pending[procno].live_gen) == gen;
+}
+
+static bool
+ps_slru_wm_claim_pending_slot(void)
+{
+	uint64		pid;
+	uint64		gen;
+	uint64		owner_pid;
+	uint64		owner_gen;
+	uint64		floor;
+
+	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
+		MyProcNumber >= ps_slru_wm_nprocs)
+		return false;
+
+	if (ps_slru_my_pending_gen == 0)
+	{
+		ps_slru_my_pending_gen =
+			pg_atomic_fetch_add_u64(&ps_slru_wm->pending_owner_next, 1) + 1;
+		if (ps_slru_my_pending_gen == 0)
+			ps_slru_my_pending_gen =
+				pg_atomic_fetch_add_u64(&ps_slru_wm->pending_owner_next, 1) + 1;
+	}
+
+	pid = (uint64) MyProcPid;
+	gen = ps_slru_my_pending_gen;
+	owner_pid = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].pid);
+	owner_gen = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].owner_gen);
+	floor = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor);
+
+	/*
+	 * The slot owner is a process-local generation, not just a PID.  A new
+	 * backend reusing both the ProcNumber and a recycled OS pid gets a new
+	 * generation before it can publish or clear the inherited floor.
+	 */
+	if (owner_pid == pid && owner_gen == gen)
+	{
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].live_gen, gen);
+		return true;
+	}
+
+	if (floor != 0 && owner_pid != 0 && owner_gen != 0)
+		ps_slru_wm_note_lost();
+
+	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid, pid);
+	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].owner_gen, gen);
+	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].live_gen, gen);
+	return true;
 }
 
 /*
@@ -872,11 +927,13 @@ static void
 ps_slru_debt_persist(void)
 {
 	int			fd;
+	uint64		generation;
 
 	if (ps_slru_wm == NULL ||
 		pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) == 0)
 		return;
 
+	generation = pg_atomic_read_u64(&ps_slru_wm->debt_generation);
 	fd = open(PS_SLRU_DEBT_FILE, O_WRONLY | O_CREAT | PG_BINARY, pg_file_create_mode);
 	if (fd >= 0)
 	{
@@ -898,7 +955,24 @@ ps_slru_debt_persist(void)
 				close(dfd);
 		}
 		if (ok)
-			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+		{
+			if (pg_atomic_read_u64(&ps_slru_wm->total_lost) == 0)
+			{
+				if (unlink(PS_SLRU_DEBT_FILE) == 0 || errno == ENOENT)
+				{
+					int			dfd = open(".", O_RDONLY);
+
+					if (dfd >= 0)
+					{
+						(void) fsync(dfd);
+						close(dfd);
+					}
+				}
+				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+			}
+			else if (generation == pg_atomic_read_u64(&ps_slru_wm->debt_generation))
+				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+		}
 	}
 	if (pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0)
 		ereport(WARNING,
@@ -917,18 +991,21 @@ ps_slru_wm_sweep_dead_pending(bool persist)
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
-		PGPROC	   *proc;
+		uint64		pid;
+		uint64		gen;
 
 		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
 			continue;
 
-		proc = GetPGProcByNumber(i);
-		if ((uint64) proc->pid == pg_atomic_read_u64(&ps_slru_wm->pending[i].pid))
+		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
+		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
+		if (ps_slru_wm_pending_owner_matches(i, pid, gen))
 			continue;
 
 		ps_slru_wm_note_lost();
 		pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
 		found = true;
 	}
 
@@ -945,30 +1022,11 @@ static void
 ps_slru_wm_republish_pending(void)
 {
 	uint64		f = 0;
-	uint64		owner;
 
-	if (ps_slru_wm == NULL || MyProcNumber == INVALID_PROC_NUMBER ||
-		MyProcNumber >= ps_slru_wm_nprocs)
+	if (!ps_slru_wm_claim_pending_slot())
 		return;
-
-	/*
-	 * This can be the first post-drain touch of a ProcNumber slot inherited
-	 * from a dead backend.  Account for the previous owner's outstanding
-	 * floor before overwriting it with this backend's idle state.
-	 */
-	owner = pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].pid);
-	if (owner != (uint64) MyProcPid)
-	{
-		if (owner != 0 &&
-			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
-		{
-			ps_slru_wm_note_lost();
-			ps_slru_debt_persist();
-		}
-		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
-		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
-							(uint64) MyProcPid);
-	}
+	if (pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0)
+		ps_slru_debt_persist();
 
 	for (int i = 0; i < PS_SLRU_QUEUE_CAPACITY; i++)
 	{
@@ -1026,7 +1084,8 @@ ps_slru_wm_advance(void)
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
-		PGPROC	   *proc;
+		uint64		pid;
+		uint64		gen;
 
 		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
 			continue;
@@ -1034,19 +1093,21 @@ ps_slru_wm_advance(void)
 		/*
 		 * A floor whose owner is gone is a coverage loss no exit path
 		 * accounted for (e.g. a backend killed after staging but before
-		 * its first drain registered the exit callback).  Ownership is
-		 * checked against the ProcNumber's PGPROC pid, not the OS pid (a
-		 * recycled OS pid would report the dead owner alive).  Convert it
-		 * -- the loss freezes the watermark for good, so stop here rather
-		 * than let this very pass advance over the fresh hole -- and
-		 * clear the slot so it does not read as pending forever.
+		 * its first drain registered the exit callback).  Ownership is a
+		 * per-ProcNumber generation as well as a PID: a recycled OS PID in
+		 * a reused ProcNumber must not make an inherited floor look live.
+		 * Convert it -- the loss freezes the watermark for good, so stop
+		 * here rather than let this very pass advance over the fresh hole
+		 * -- and clear the slot so it does not read as pending forever.
 		 */
-		proc = GetPGProcByNumber(i);
-		if ((uint64) proc->pid != pg_atomic_read_u64(&ps_slru_wm->pending[i].pid))
+		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
+		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
+		if (!ps_slru_wm_pending_owner_matches(i, pid, gen))
 		{
 			ps_slru_wm_note_lost();
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
+			pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
 
 			/*
 			 * This runs after the drain's own persist point; make the
@@ -2691,7 +2752,12 @@ ps_slru_exit_drain(int code, Datum arg)
 	ps_slru_debt_persist();
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
 		MyProcNumber < ps_slru_wm_nprocs)
+	{
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].owner_gen, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].live_gen, 0);
+	}
 }
 
 /*
@@ -2862,6 +2928,7 @@ Datum
 pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 {
 	uint64		lost;
+	uint64		loss_generation;
 
 	int			fd;
 
@@ -2885,13 +2952,15 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 */
 	(void) ps_slru_wm_sweep_dead_pending(false);
 	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
+	loss_generation = pg_atomic_read_u64(&ps_slru_wm->loss_generation);
 
 	/*
 	 * Priming and forgiving are one act: the operator declares the mirror
 	 * whole as of now.  Make the primed marker durable first, then drop
-	 * the debt marker, then retire the counted losses -- with a CAS, so a
-	 * loss racing this reset survives it (the CAS fails and the debt
-	 * marker is re-created by the next drain via debt_unpersisted).
+	 * the debt marker, then retire the counted losses.  The debt generation
+	 * tells any already-running persist that its marker write raced a reset;
+	 * the loss generation catches a new loss that arrived after this reset's
+	 * snapshot even if the final total_lost CAS would otherwise miss it.
 	 */
 	fd = OpenTransientFile(PS_SLRU_PRIMED_FILE,
 						   O_WRONLY | O_CREAT | PG_BINARY);
@@ -2910,6 +2979,7 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 */
 	ps_slru_tomb_rederive();
 
+	pg_atomic_fetch_add_u64(&ps_slru_wm->debt_generation, 1);
 	if (unlink(PS_SLRU_DEBT_FILE) != 0 && errno != ENOENT)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -2939,13 +3009,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
 	/*
-	 * The flag is cleared BEFORE the CAS: a loss that lands after the CAS
-	 * sets it again (its ordering is add-then-set), whereas clearing after
-	 * the CAS could erase that racing loss's flag and leave its debt
-	 * unpersisted.  If the CAS itself fails the flag is restored.
+	 * The flag is cleared before the CAS.  A racing loss sets the flag and
+	 * advances loss_generation before incrementing total_lost, so the
+	 * generation check below catches it even if the total_lost CAS would not.
+	 * If either check fails the flag is restored and persisted immediately.
 	 */
 	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
-	if (!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
+	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
+		!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
 	{
 		/*
 		 * A loss raced the reset and the debt marker is already unlinked:
