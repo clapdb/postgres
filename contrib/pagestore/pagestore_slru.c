@@ -77,6 +77,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -86,6 +87,7 @@
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -99,6 +101,8 @@ static bool pagestore_slru_mirror = false;
 
 static bool ps_slru_mirror_enabled = false;
 static slru_page_write_hook_type prev_slru_page_write_hook = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 /* Per-op mailbox timeout and whole-drain budget; see the control mirror. */
 #define PS_SLRU_SHIP_TIMEOUT_MS		10000
@@ -461,7 +465,7 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 		}
 		SpinLockRelease(&slot->mutex);
 	}
-	return false;
+	return true;
 }
 
 /* ---- watermark shared memory ---- */
@@ -997,6 +1001,11 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 					 * (group LSNs reset on eviction/reload) must not
 					 * un-fence bits the older image already carried.
 					 */
+					if (!ps_slru_try_reserve_version(obj, pageno, bound))
+					{
+						ps_slru_note_recapture(ctl, obj, pageno, bound);
+						return;
+					}
 					memcpy(p->image, page, BLCKSZ);
 					ps_slru_wm_note_pending(fence_lsn);
 					if (p->fence_lsn < fence_lsn)
@@ -1014,6 +1023,11 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 		{
 			PsSlruPending *p = &ps_slru_queue[free_slot];
 
+			if (!ps_slru_try_reserve_version(obj, pageno, bound))
+			{
+				ps_slru_note_recapture(ctl, obj, pageno, bound);
+				return;
+			}
 			ps_slru_wm_note_pending(fence_lsn);
 			p->used = true;
 			p->shipped = false;
@@ -1045,7 +1059,7 @@ static void
 ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 				   XLogRecPtr fence_lsn)
 {
-	uint32		obj;
+	uint32		obj = 0;
 	XLogRecPtr	now;
 
 	if (prev_slru_page_write_hook)
@@ -1076,12 +1090,6 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	now = ps_slru_now_lsn();
 	if (XLogRecPtrIsInvalid(fence_lsn))
 		fence_lsn = now;
-	if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now))
-	{
-		ps_slru_note_recapture(ctl, obj, (uint32) pageno, now);
-		return;
-	}
-
 	ps_slru_stage(ctl, obj, (uint32) pageno, page, fence_lsn, now);
 }
 
@@ -1584,6 +1592,31 @@ pagestore_slru_mirror_drain(void)
 	ps_slru_drain();
 }
 
+static void
+ps_slru_executor_end(QueryDesc *queryDesc)
+{
+	if (prev_ExecutorEnd_hook)
+		prev_ExecutorEnd_hook(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+	pagestore_slru_mirror_drain();
+}
+
+static void
+ps_slru_process_utility(PlannedStmt *pstmt, const char *queryString,
+						bool readOnlyTree, ProcessUtilityContext context,
+						ParamListInfo params, QueryEnvironment *queryEnv,
+						DestReceiver *dest, QueryCompletion *qc)
+{
+	if (prev_ProcessUtility_hook)
+		prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+								 params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+	pagestore_slru_mirror_drain();
+}
+
 /* before_shmem_exit: last chance to ship what this process staged. */
 static void
 ps_slru_exit_drain(int code, Datum arg)
@@ -1801,7 +1834,7 @@ pagestore_slru_live_read_at(PG_FUNCTION_ARGS)
 	int32		pageno = PG_GETARG_INT32(1);
 	XLogRecPtr	lsn = PG_GETARG_LSN(2);
 	PageStoreRelKey key;
-	uint32		obj;
+	uint32		obj = 0;
 	char	   *out = palloc(BLCKSZ);
 	bytea	   *result;
 
@@ -1857,9 +1890,12 @@ pagestore_slru_mirror_init(bool localsvc_active)
 				(errmsg("pagestore.slru_mirror requires pagestore.backend = 'localsvc'")));
 
 	ps_slru_mirror_enabled = true;
-	ps_slru_register_exit_drain();
 	prev_slru_page_write_hook = slru_page_write_hook;
 	slru_page_write_hook = ps_slru_write_hook;
+	prev_ExecutorEnd_hook = ExecutorEnd_hook;
+	ExecutorEnd_hook = ps_slru_executor_end;
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = ps_slru_process_utility;
 
 	/* watermark, floors, and shared stats all live in shared memory */
 	prev_shmem_request_hook = shmem_request_hook;
