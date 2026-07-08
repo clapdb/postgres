@@ -203,5 +203,11 @@ extern void pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key
 extern bool pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 										   BlockNumber block, uint64 version,
 										   void *page, uint64 *resolved);
+extern bool pagestore_localsvc_obj_read_at_timeout(uint32 klass,
+												   const PageStoreRelKey *key,
+												   BlockNumber block,
+												   uint64 version, void *page,
+												   uint64 *resolved,
+												   int timeout_ms);
 
 #endif							/* PAGESTORE_BACKEND_H */

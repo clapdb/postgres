@@ -85,6 +85,7 @@
 #include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -172,7 +173,6 @@ static int	ps_slru_recap_count = 0;
  */
 static uint64 ps_slru_lost = 0;
 static uint64 ps_slru_lost_reported = 0;
-
 static bool ps_slru_exit_registered = false;
 
 /*
@@ -250,7 +250,11 @@ ps_slru_note_lost(void)
 
 typedef struct PsSlruVersionSlot
 {
-	pg_atomic_uint64 version;
+	slock_t		mutex;
+	bool		valid;
+	uint32		obj;
+	uint32		pageno;
+	XLogRecPtr	version;
 } PsSlruVersionSlot;
 
 typedef struct PsSlruWatermarkShm
@@ -299,6 +303,15 @@ static int	ps_slru_wm_nprocs = 0;
 
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_slru_shmem_startup_hook = NULL;
+
+static void
+ps_slru_register_exit_drain(void)
+{
+	if (ps_slru_exit_registered)
+		return;
+	before_shmem_exit(ps_slru_exit_drain, (Datum) 0);
+	ps_slru_exit_registered = true;
+}
 
 /*
  * The in-scope SLRU directories (the WAL-logged, uint32-page ones; see
@@ -371,25 +384,30 @@ static void
 ps_slru_observe_version(uint32 obj, uint32 pageno, XLogRecPtr version)
 {
 	PsSlruVersionSlot *slot;
-	uint64		cur;
 
 	if (ps_slru_wm == NULL || XLogRecPtrIsInvalid(version))
 		return;
 
 	slot = &ps_slru_wm->version_slot[ps_slru_page_hash(obj, pageno) %
 									 PS_SLRU_VERSION_SLOTS];
-	cur = pg_atomic_read_u64(&slot->version);
-	while (cur < (uint64) version &&
-		   !pg_atomic_compare_exchange_u64(&slot->version, &cur,
-										   (uint64) version))
-		;
+	SpinLockAcquire(&slot->mutex);
+	if (!slot->valid || slot->obj != obj || slot->pageno != pageno)
+	{
+		slot->valid = true;
+		slot->obj = obj;
+		slot->pageno = pageno;
+		slot->version = version;
+	}
+	else if (slot->version < version)
+		slot->version = version;
+	SpinLockRelease(&slot->mutex);
 }
 
 static bool
 ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 {
 	PsSlruVersionSlot *slot;
-	uint64		cur;
+	bool		reserved = false;
 
 	if (XLogRecPtrIsInvalid(bound))
 		return false;
@@ -398,15 +416,22 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 
 	slot = &ps_slru_wm->version_slot[ps_slru_page_hash(obj, pageno) %
 									 PS_SLRU_VERSION_SLOTS];
-	cur = pg_atomic_read_u64(&slot->version);
-	for (;;)
+	SpinLockAcquire(&slot->mutex);
+	if (!slot->valid || slot->obj != obj || slot->pageno != pageno)
 	{
-		if ((uint64) bound <= cur)
-			return false;
-		if (pg_atomic_compare_exchange_u64(&slot->version, &cur,
-										   (uint64) bound))
-			return true;
+		slot->valid = true;
+		slot->obj = obj;
+		slot->pageno = pageno;
+		slot->version = bound;
+		reserved = true;
 	}
+	else if (bound > slot->version)
+	{
+		slot->version = bound;
+		reserved = true;
+	}
+	SpinLockRelease(&slot->mutex);
+	return reserved;
 }
 
 /* ---- watermark shared memory ---- */
@@ -480,7 +505,15 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->stats_lost, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
-			pg_atomic_init_u64(&ps_slru_wm->version_slot[i].version, 0);
+		{
+			PsSlruVersionSlot *slot = &ps_slru_wm->version_slot[i];
+
+			SpinLockInit(&slot->mutex);
+			slot->valid = false;
+			slot->obj = 0;
+			slot->pageno = 0;
+			slot->version = InvalidXLogRecPtr;
+		}
 		for (int i = 0; i < ps_slru_wm_nprocs; i++)
 		{
 			pg_atomic_init_u64(&ps_slru_wm->pending[i].floor, 0);
@@ -902,8 +935,12 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 		}
 	}
 
-	/* Queue full: record the page identity for recapture at drain time. */
-	ps_slru_note_recapture(ctl, obj, pageno, bound);
+	/*
+	 * Queue full: record the page identity for recapture at drain time.
+	 * No bytes have been posted for this image, so unlike posted-entry
+	 * recaptures this does not need a strictly-newer version fence.
+	 */
+	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr);
 }
 
 /*
@@ -929,6 +966,8 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 		ps_slru_note_lost();
 		return;
 	}
+
+	ps_slru_register_exit_drain();
 
 	/*
 	 * Bound the image at CAPTURE time, under the bank lock we are called
@@ -1146,9 +1185,10 @@ ps_slru_defer_below_store_high(PsSlruPending *p)
 		return false;			/* retry the byte-identical posted version */
 
 	ps_slru_obj_key(&key, p->obj);
-	if (!pagestore_localsvc_obj_read_at(PS_KLASS_SLRU_LIVE, &key,
-										(BlockNumber) p->pageno,
-										PG_UINT64_MAX, tmp, &resolved))
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE, &key,
+												(BlockNumber) p->pageno,
+												PG_UINT64_MAX, tmp, &resolved,
+												PS_SLRU_SHIP_TIMEOUT_MS))
 		return false;
 
 	ps_slru_observe_version(p->obj, p->pageno, (XLogRecPtr) resolved);
@@ -1226,11 +1266,7 @@ ps_slru_drain(void)
 
 	Assert(CritSectionCount == 0);
 
-	if (!ps_slru_exit_registered)
-	{
-		before_shmem_exit(ps_slru_exit_drain, (Datum) 0);
-		ps_slru_exit_registered = true;
-	}
+	ps_slru_register_exit_drain();
 
 	ps_slru_debt_persist();
 
