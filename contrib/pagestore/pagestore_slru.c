@@ -192,7 +192,6 @@ static bool ps_slru_exit_registered = false;
 static bool ps_slru_no_rethrow = false;
 
 static void ps_slru_exit_drain(int code, Datum arg);
-static void ps_slru_xact_drain(XactEvent event, void *arg);
 static XLogRecPtr ps_slru_now_lsn(void);
 static XLogRecPtr ps_slru_flush_pos(XLogRecPtr ptr);
 static void ps_slru_rearm_interrupt(void);
@@ -322,6 +321,7 @@ typedef struct PsSlruServedShm
 } PsSlruServedShm;
 
 #define PS_SLRU_VERSION_SLOTS	4096
+#define PS_SLRU_VERSION_PROBES	8
 
 typedef struct PsSlruVersionSlot
 {
@@ -564,54 +564,77 @@ static void
 ps_slru_observe_version(uint32 obj, uint32 pageno, XLogRecPtr version)
 {
 	PsSlruVersionSlot *slot;
+	uint32		h;
 
 	if (ps_slru_wm == NULL || XLogRecPtrIsInvalid(version))
 		return;
 
-	slot = &ps_slru_wm->version_slot[ps_slru_page_hash(obj, pageno) %
-									 PS_SLRU_VERSION_SLOTS];
-	SpinLockAcquire(&slot->mutex);
-	if (!slot->valid || slot->obj != obj || slot->pageno != pageno)
+	h = ps_slru_page_hash(obj, pageno);
+	for (int probe = 0; probe < PS_SLRU_VERSION_PROBES; probe++)
 	{
-		slot->valid = true;
-		slot->obj = obj;
-		slot->pageno = pageno;
-		slot->version = version;
+		slot = &ps_slru_wm->version_slot[(h + probe) %
+										 PS_SLRU_VERSION_SLOTS];
+		SpinLockAcquire(&slot->mutex);
+		if (!slot->valid)
+		{
+			slot->valid = true;
+			slot->obj = obj;
+			slot->pageno = pageno;
+			slot->version = version;
+			SpinLockRelease(&slot->mutex);
+			return;
+		}
+		if (slot->obj == obj && slot->pageno == pageno)
+		{
+			if (slot->version < version)
+				slot->version = version;
+			SpinLockRelease(&slot->mutex);
+			return;
+		}
+		SpinLockRelease(&slot->mutex);
 	}
-	else if (slot->version < version)
-		slot->version = version;
-	SpinLockRelease(&slot->mutex);
 }
 
 static bool
 ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 {
 	PsSlruVersionSlot *slot;
-	bool		reserved = false;
+	uint32		h;
 
 	if (XLogRecPtrIsInvalid(bound))
 		return false;
 	if (ps_slru_wm == NULL)
 		return true;
 
-	slot = &ps_slru_wm->version_slot[ps_slru_page_hash(obj, pageno) %
-									 PS_SLRU_VERSION_SLOTS];
-	SpinLockAcquire(&slot->mutex);
-	if (!slot->valid || slot->obj != obj || slot->pageno != pageno)
+	h = ps_slru_page_hash(obj, pageno);
+	for (int probe = 0; probe < PS_SLRU_VERSION_PROBES; probe++)
 	{
-		slot->valid = true;
-		slot->obj = obj;
-		slot->pageno = pageno;
-		slot->version = bound;
-		reserved = true;
+		slot = &ps_slru_wm->version_slot[(h + probe) %
+										 PS_SLRU_VERSION_SLOTS];
+		SpinLockAcquire(&slot->mutex);
+		if (!slot->valid)
+		{
+			slot->valid = true;
+			slot->obj = obj;
+			slot->pageno = pageno;
+			slot->version = bound;
+			SpinLockRelease(&slot->mutex);
+			return true;
+		}
+		if (slot->obj == obj && slot->pageno == pageno)
+		{
+			if (bound > slot->version)
+			{
+				slot->version = bound;
+				SpinLockRelease(&slot->mutex);
+				return true;
+			}
+			SpinLockRelease(&slot->mutex);
+			return false;
+		}
+		SpinLockRelease(&slot->mutex);
 	}
-	else if (bound > slot->version)
-	{
-		slot->version = bound;
-		reserved = true;
-	}
-	SpinLockRelease(&slot->mutex);
-	return reserved;
+	return false;
 }
 
 /* ---- watermark shared memory ---- */
@@ -1193,6 +1216,16 @@ ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
 
 	/* Table full: coverage lost; the watermark side must fail conservative. */
 	ps_slru_note_lost();
+}
+
+static void
+ps_slru_recapture_lost(PsSlruRecapture *r)
+{
+	if (!r->used)
+		return;
+	ps_slru_note_lost();
+	r->used = false;
+	ps_slru_recap_count--;
 }
 
 /*
@@ -2182,8 +2215,6 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 		return;
 	}
 
-	ps_slru_register_exit_drain();
-
 	/*
 	 * Bound the image at CAPTURE time, under the bank lock we are called
 	 * with: the bytes certainly contain nothing past the current WAL
@@ -2353,7 +2384,11 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 
 		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 		if (fd < 0)
+		{
+			if (errno == ENOENT)
+				ps_slru_recapture_lost(r);
 			return false;
+		}
 
 		LWLockAcquire(banklock, LW_SHARED);
 		for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
@@ -2733,6 +2768,8 @@ ps_slru_exit_drain(int code, Datum arg)
 	 * freezes rather than advancing over status the mirror will never
 	 * carry, and clear our pending slot (a dead process must not hold the
 	 * floor forever -- the loss accounting is what keeps this honest).
+	 * On nonzero exit, store I/O is unsafe, but the in-memory/shared loss
+	 * counter is still the only truthful handoff.
 	 */
 	if (ps_slru_queue_count > 0 || ps_slru_recap_count > 0)
 	{
@@ -2761,28 +2798,18 @@ ps_slru_exit_drain(int code, Datum arg)
 }
 
 /*
- * Transaction-end drain: an ordinary backend that evicted (and thus wrote
- * and staged) SLRU pages mid-transaction has no other ship point.  Fires
- * outside critical sections.
+ * Reader side: refresh the fetched watermark at transaction boundaries
+ * (TTL-bounded IPC, outside all locks) so the bank-lock revalidator -- which
+ * may only do memory checks -- has a moving epoch to compare against even on
+ * a pure cache-hit workload.  This deliberately does not drain staged mirror
+ * images: xact callbacks run before PostgreSQL releases user locks.
  */
 static void
-ps_slru_xact_drain(XactEvent event, void *arg)
+ps_slru_xact_refresh(XactEvent event, void *arg)
 {
 	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
 		event != XACT_EVENT_PREPARE)
-		return;					/* PREPARE ends the transaction too; the
-								 * COMMIT/ROLLBACK PREPARED may run in a
-								 * different backend, so ship now */
-	ps_slru_no_rethrow = true;
-	pagestore_slru_mirror_drain();
-	ps_slru_no_rethrow = false;
-
-	/*
-	 * Reader side: refresh the fetched watermark at transaction boundaries
-	 * (TTL-bounded IPC, outside all locks) so the bank-lock revalidator --
-	 * which may only do memory checks -- has a moving epoch to compare
-	 * against even on a pure cache-hit workload.
-	 */
+		return;
 	if (ps_slru_live_reads_enabled && CritSectionCount == 0)
 		(void) ps_slru_reader_fetch_wm();
 }
@@ -3117,6 +3144,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	if (pagestore_slru_mirror)
 	{
 		ps_slru_mirror_enabled = true;
+		ps_slru_register_exit_drain();
 		prev_slru_page_write_hook = slru_page_write_hook;
 		slru_page_write_hook = ps_slru_write_hook;
 		slru_truncate_hook = ps_slru_truncate_hook;
@@ -3127,8 +3155,8 @@ pagestore_slru_mirror_init(bool localsvc_active)
 		slru_page_read_hook = ps_slru_read_hook;
 		slru_page_exists_hook = ps_slru_exists_hook;
 		slru_page_revalidate_hook = ps_slru_revalidate_hook;
+		RegisterXactCallback(ps_slru_xact_refresh, NULL);
 	}
-	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
 	/* watermark, floors, and shared stats all live in shared memory */
 	prev_shmem_request_hook = shmem_request_hook;
