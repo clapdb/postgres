@@ -511,12 +511,12 @@ ps_slru_shmem_request(void)
 
 /*
  * Boot-time debt: was the previous life of this cluster provably clean?
- * Anything but a DB_SHUTDOWNED pg_control is not -- a crash (or a
- * postmaster reinit after a backend crash: state is DB_IN_PRODUCTION
- * then) means processes died that may have held staged-but-unsynced
- * images, of pages that are clean on local disk and will never be flushed
- * (and thus re-captured) again.  A pre-existing debt marker is a loss
- * remembered from a previous life.
+ * Anything but a clean pg_control shutdown is not -- a crash (or a
+ * postmaster reinit after a backend crash: state is DB_IN_PRODUCTION then)
+ * means processes died that may have held staged-but-unsynced images, of
+ * pages that are clean on local disk and will never be flushed (and thus
+ * re-captured) again.  A pre-existing debt marker is a loss remembered from
+ * a previous life.
  */
 static bool
 ps_slru_boot_debt(void)
@@ -532,7 +532,9 @@ ps_slru_boot_debt(void)
 		return true;			/* never primed: pre-enable history unproven */
 
 	cf = get_controlfile(DataDir, &crc_ok);
-	debt = !crc_ok || cf->state != DB_SHUTDOWNED;
+	debt = !crc_ok ||
+		(cf->state != DB_SHUTDOWNED &&
+		 cf->state != DB_SHUTDOWNED_IN_RECOVERY);
 	pfree(cf);
 	return debt;
 }
@@ -675,6 +677,36 @@ ps_slru_debt_persist(void)
 						PS_SLRU_DEBT_FILE)));
 }
 
+static bool
+ps_slru_wm_sweep_dead_pending(bool persist)
+{
+	bool		found = false;
+
+	if (ps_slru_wm == NULL)
+		return false;
+
+	for (int i = 0; i < ps_slru_wm_nprocs; i++)
+	{
+		PGPROC	   *proc;
+
+		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
+			continue;
+
+		proc = GetPGProcByNumber(i);
+		if ((uint64) proc->pid == pg_atomic_read_u64(&ps_slru_wm->pending[i].pid))
+			continue;
+
+		ps_slru_wm_note_lost();
+		pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
+		found = true;
+	}
+
+	if (found && persist)
+		ps_slru_debt_persist();
+	return found;
+}
+
 /*
  * Republish this process's pending floor after a drain: 0 when everything
  * staged has durably shipped, else the minimum fence still held.
@@ -699,7 +731,10 @@ ps_slru_wm_republish_pending(void)
 	{
 		if (owner != 0 &&
 			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
+		{
 			ps_slru_wm_note_lost();
+			ps_slru_debt_persist();
+		}
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
 							(uint64) MyProcPid);
@@ -740,6 +775,13 @@ ps_slru_wm_advance(void)
 	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
 	if (cand == 0)
 		return;
+
+	/*
+	 * Sweep inherited dead-owner floors before honoring existing debt.
+	 * Otherwise an already-frozen mirror can carry a stale pending slot
+	 * through reset_debt() and immediately recreate the debt afterwards.
+	 */
+	ps_slru_wm_sweep_dead_pending(true);
 
 	/*
 	 * Any loss, ever -- including the boot debt of an unclean previous life
@@ -1981,6 +2023,13 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("the SLRU mirror is not active")));
 
+	/*
+	 * Fold any dead-owner pending floors into the loss count before taking
+	 * the reset snapshot.  The operator is declaring the mirror whole as of
+	 * this call, so these inherited stale slots must be forgiven by this
+	 * reset, not rediscovered immediately after it.
+	 */
+	(void) ps_slru_wm_sweep_dead_pending(false);
 	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 
 	/*
