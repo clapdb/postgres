@@ -433,12 +433,6 @@ ps_slru_commit_ts_page(TransactionId xid)
 	return xid / (int64) PS_SLRU_COMMIT_TS_XACTS_PER_PAGE;
 }
 
-static MultiXactId
-ps_slru_previous_multixact_id(MultiXactId multi)
-{
-	return multi == FirstMultiXactId ? MaxMultiXactId : multi - 1;
-}
-
 static bool
 ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 {
@@ -446,7 +440,7 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 
 	if (strcmp(dir, "pg_xact") == 0)
 	{
-		*cutoff = ps_slru_xid_page(TransamVariables->oldestXid);
+		*cutoff = ps_slru_xid_page(TransamVariables->oldestClogXid);
 		return true;
 	}
 	if (strcmp(dir, "pg_commit_ts") == 0)
@@ -468,8 +462,12 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 		GetMultiXactInfo(&multixacts, &nextOffset, &oldestMulti,
 						 &oldestOffset);
 		if (strcmp(dir, "pg_multixact/offsets") == 0)
-			*cutoff = MultiXactIdToOffsetPage(
-				ps_slru_previous_multixact_id(oldestMulti));
+		{
+			if (oldestMulti == FirstMultiXactId)
+				*cutoff = 0;
+			else
+				*cutoff = MultiXactIdToOffsetPage(oldestMulti - 1);
+		}
 		else
 			*cutoff = MXOffsetToMemberPage(oldestOffset);
 		return true;
@@ -605,12 +603,12 @@ ps_slru_shmem_request(void)
 
 /*
  * Boot-time debt: was the previous life of this cluster provably clean?
- * Anything but a DB_SHUTDOWNED pg_control is not -- a crash (or a
- * postmaster reinit after a backend crash: state is DB_IN_PRODUCTION
- * then) means processes died that may have held staged-but-unsynced
- * images, of pages that are clean on local disk and will never be flushed
- * (and thus re-captured) again.  A pre-existing debt marker is a loss
- * remembered from a previous life.
+ * Anything but a clean pg_control shutdown is not -- a crash (or a
+ * postmaster reinit after a backend crash: state is DB_IN_PRODUCTION then)
+ * means processes died that may have held staged-but-unsynced images, of
+ * pages that are clean on local disk and will never be flushed (and thus
+ * re-captured) again.  A pre-existing debt marker is a loss remembered from
+ * a previous life.
  */
 static bool
 ps_slru_boot_debt(void)
@@ -626,7 +624,9 @@ ps_slru_boot_debt(void)
 		return true;			/* never primed: pre-enable history unproven */
 
 	cf = get_controlfile(DataDir, &crc_ok);
-	debt = !crc_ok || cf->state != DB_SHUTDOWNED;
+	debt = !crc_ok ||
+		(cf->state != DB_SHUTDOWNED &&
+		 cf->state != DB_SHUTDOWNED_IN_RECOVERY);
 	pfree(cf);
 	return debt;
 }
@@ -874,6 +874,36 @@ ps_slru_debt_persist(void)
 						PS_SLRU_DEBT_FILE)));
 }
 
+static bool
+ps_slru_wm_sweep_dead_pending(bool persist)
+{
+	bool		found = false;
+
+	if (ps_slru_wm == NULL)
+		return false;
+
+	for (int i = 0; i < ps_slru_wm_nprocs; i++)
+	{
+		PGPROC	   *proc;
+
+		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
+			continue;
+
+		proc = GetPGProcByNumber(i);
+		if ((uint64) proc->pid == pg_atomic_read_u64(&ps_slru_wm->pending[i].pid))
+			continue;
+
+		ps_slru_wm_note_lost();
+		pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
+		pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
+		found = true;
+	}
+
+	if (found && persist)
+		ps_slru_debt_persist();
+	return found;
+}
+
 /*
  * Republish this process's pending floor after a drain: 0 when everything
  * staged has durably shipped, else the minimum fence still held.
@@ -898,7 +928,10 @@ ps_slru_wm_republish_pending(void)
 	{
 		if (owner != 0 &&
 			pg_atomic_read_u64(&ps_slru_wm->pending[MyProcNumber].floor) != 0)
+		{
 			ps_slru_wm_note_lost();
+			ps_slru_debt_persist();
+		}
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid,
 							(uint64) MyProcPid);
@@ -939,6 +972,13 @@ ps_slru_wm_advance(void)
 	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
 	if (cand == 0)
 		return;
+
+	/*
+	 * Sweep inherited dead-owner floors before honoring existing debt.
+	 * Otherwise an already-frozen mirror can carry a stale pending slot
+	 * through reset_debt() and immediately recreate the debt afterwards.
+	 */
+	ps_slru_wm_sweep_dead_pending(true);
 
 	/*
 	 * Any loss, ever -- including the boot debt of an unclean previous life
@@ -1705,13 +1745,12 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 
 /*
  * The last tombstone cutoff this process durably shipped per SLRU.  This is
- * only a critical-section duplicate shield (the multixact in-critical-section
- * calls after their pre-barrier, SimpleLruTruncate after an exact-LSN
- * pre-barrier): outside critical sections, ship equal cutoffs again so their
- * newer version can supersede stale store state.  Exact match only: several
- * in-scope page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so
- * "lower than covered" does not mean "already dead" -- a numerically smaller
- * later cutoff still ships, and its newer version supersedes.
+ * a one-shot duplicate shield (the multixact in-critical-section calls after
+ * their pre-barrier, SimpleLruTruncate after an exact-LSN pre-barrier).  Exact
+ * match only: several in-scope page spaces wrap (and the commit-ts reset uses
+ * PG_INT64_MAX), so "lower than covered" does not mean "already dead" -- a
+ * numerically smaller later cutoff still ships, and its newer version
+ * supersedes.
  */
 static int64 ps_slru_tomb_covered[lengthof(ps_slru_dirmap)];
 static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
@@ -1739,10 +1778,12 @@ ps_slru_tomb_rederive(void)
 	 * deletion in progress and publish its (higher) cutoff at a version
 	 * OLDER than the truncation's own tombstone -- an over-wide cutoff at
 	 * an early LSN.  WrapLimitsVacuumLock serializes the vacuum-side
-	 * clog/commit-ts truncations; MultiXactTruncationLock the multixact
-	 * ones.  Priming is rare and the scans are tiny.
+	 * clog/commit-ts truncations; XactTruncationLock protects
+	 * oldestClogXid; MultiXactTruncationLock the multixact ones.  Priming
+	 * is rare and the scans are tiny.
 	 */
 	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
 	LWLockAcquire(MultiXactTruncationLock, LW_EXCLUSIVE);
 
 	PG_TRY();
@@ -1800,12 +1841,14 @@ ps_slru_tomb_rederive(void)
 		if (commit_ts_locked)
 			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
+		LWLockRelease(XactTruncationLock);
 		LWLockRelease(WrapLimitsVacuumLock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	LWLockRelease(MultiXactTruncationLock);
+	LWLockRelease(XactTruncationLock);
 	LWLockRelease(WrapLimitsVacuumLock);
 }
 
@@ -1849,9 +1892,8 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 
 	if (ps_slru_tomb_covered_set[idx] && cutoffPage == ps_slru_tomb_covered[idx])
 	{
-		if (CritSectionCount > 0)
-			return;				/* pre-barrier already shipped this cutoff */
 		ps_slru_tomb_covered_set[idx] = false;
+		return;					/* pre-barrier already shipped this cutoff */
 	}
 
 	if (CritSectionCount > 0)
@@ -2799,6 +2841,13 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 				(errmsg("priming is the mirror writer's operation"),
 				 errdetail("This compute only consumes the mirror (pagestore.slru_live_reads); its local SLRU state must not be published as truth.")));
 
+	/*
+	 * Fold any dead-owner pending floors into the loss count before taking
+	 * the reset snapshot.  The operator is declaring the mirror whole as of
+	 * this call, so these inherited stale slots must be forgiven by this
+	 * reset, not rediscovered immediately after it.
+	 */
+	(void) ps_slru_wm_sweep_dead_pending(false);
 	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 
 	/*
