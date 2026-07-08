@@ -347,12 +347,6 @@ ps_slru_commit_ts_page(TransactionId xid)
 	return xid / (int64) PS_SLRU_COMMIT_TS_XACTS_PER_PAGE;
 }
 
-static MultiXactId
-ps_slru_previous_multixact_id(MultiXactId multi)
-{
-	return multi == FirstMultiXactId ? MaxMultiXactId : multi - 1;
-}
-
 static bool
 ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 {
@@ -360,7 +354,7 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 
 	if (strcmp(dir, "pg_xact") == 0)
 	{
-		*cutoff = ps_slru_xid_page(TransamVariables->oldestXid);
+		*cutoff = ps_slru_xid_page(TransamVariables->oldestClogXid);
 		return true;
 	}
 	if (strcmp(dir, "pg_commit_ts") == 0)
@@ -382,8 +376,12 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 		GetMultiXactInfo(&multixacts, &nextOffset, &oldestMulti,
 						 &oldestOffset);
 		if (strcmp(dir, "pg_multixact/offsets") == 0)
-			*cutoff = MultiXactIdToOffsetPage(
-				ps_slru_previous_multixact_id(oldestMulti));
+		{
+			if (oldestMulti == FirstMultiXactId)
+				*cutoff = 0;
+			else
+				*cutoff = MultiXactIdToOffsetPage(oldestMulti - 1);
+		}
 		else
 			*cutoff = MXOffsetToMemberPage(oldestOffset);
 		return true;
@@ -943,13 +941,12 @@ ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
 
 /*
  * The last tombstone cutoff this process durably shipped per SLRU.  This is
- * only a critical-section duplicate shield (the multixact in-critical-section
- * calls after their pre-barrier, SimpleLruTruncate after an exact-LSN
- * pre-barrier): outside critical sections, ship equal cutoffs again so their
- * newer version can supersede stale store state.  Exact match only: several
- * in-scope page spaces wrap (and the commit-ts reset uses PG_INT64_MAX), so
- * "lower than covered" does not mean "already dead" -- a numerically smaller
- * later cutoff still ships, and its newer version supersedes.
+ * a one-shot duplicate shield (the multixact in-critical-section calls after
+ * their pre-barrier, SimpleLruTruncate after an exact-LSN pre-barrier).  Exact
+ * match only: several in-scope page spaces wrap (and the commit-ts reset uses
+ * PG_INT64_MAX), so "lower than covered" does not mean "already dead" -- a
+ * numerically smaller later cutoff still ships, and its newer version
+ * supersedes.
  */
 static int64 ps_slru_tomb_covered[lengthof(ps_slru_dirmap)];
 static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
@@ -977,10 +974,12 @@ ps_slru_tomb_rederive(void)
 	 * deletion in progress and publish its (higher) cutoff at a version
 	 * OLDER than the truncation's own tombstone -- an over-wide cutoff at
 	 * an early LSN.  WrapLimitsVacuumLock serializes the vacuum-side
-	 * clog/commit-ts truncations; MultiXactTruncationLock the multixact
-	 * ones.  Priming is rare and the scans are tiny.
+	 * clog/commit-ts truncations; XactTruncationLock protects
+	 * oldestClogXid; MultiXactTruncationLock the multixact ones.  Priming
+	 * is rare and the scans are tiny.
 	 */
 	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
+	LWLockAcquire(XactTruncationLock, LW_EXCLUSIVE);
 	LWLockAcquire(MultiXactTruncationLock, LW_EXCLUSIVE);
 
 	PG_TRY();
@@ -1038,12 +1037,14 @@ ps_slru_tomb_rederive(void)
 		if (commit_ts_locked)
 			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
+		LWLockRelease(XactTruncationLock);
 		LWLockRelease(WrapLimitsVacuumLock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	LWLockRelease(MultiXactTruncationLock);
+	LWLockRelease(XactTruncationLock);
 	LWLockRelease(WrapLimitsVacuumLock);
 }
 
@@ -1087,9 +1088,8 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 
 	if (ps_slru_tomb_covered_set[idx] && cutoffPage == ps_slru_tomb_covered[idx])
 	{
-		if (CritSectionCount > 0)
-			return;				/* pre-barrier already shipped this cutoff */
 		ps_slru_tomb_covered_set[idx] = false;
+		return;					/* pre-barrier already shipped this cutoff */
 	}
 
 	if (CritSectionCount > 0)
