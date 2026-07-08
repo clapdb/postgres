@@ -930,7 +930,7 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 							   uint64 *resolved)
 {
 	return pagestore_localsvc_obj_read_at_timeout(klass, key, block, version,
-												  page, resolved, 0);
+												 page, resolved, 0);
 }
 
 /* Bounded-wait variant; see pagestore_localsvc_obj_write_timeout. */
