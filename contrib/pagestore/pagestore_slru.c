@@ -352,6 +352,10 @@ ps_slru_served_tag(uint32 obj, uint32 pageno)
  */
 typedef struct PsSlruServedShm
 {
+	pg_atomic_uint64 seq;		/* seqlock: even = stable, odd = writer in
+								 * flight; advances on every update, so slot
+								 * reuse (A -> B -> A) can never satisfy a
+								 * reader's before/after check */
 	pg_atomic_uint64 tag;		/* obj<<32 | pageno; 0 = empty */
 	pg_atomic_uint64 epoch;
 } PsSlruServedShm;
@@ -910,6 +914,7 @@ ps_slru_shmem_startup(void)
 		}
 		for (int i = 0; i < PS_SLRU_SERVED_CAPACITY; i++)
 		{
+			pg_atomic_init_u64(&ps_slru_wm->served[i].seq, 0);
 			pg_atomic_init_u64(&ps_slru_wm->served[i].tag, 0);
 			pg_atomic_init_u64(&ps_slru_wm->served[i].epoch, 0);
 		}
@@ -947,29 +952,32 @@ ps_slru_shmem_startup(void)
 
 /*
  * Remember the epoch a page's last physical-read decision was made at.
- * The slot is claimed with a sentinel tag (1 -- never a real tag, whose
- * obj hash occupies the high bits) before the pair is written and the
- * real tag is stored last, so two colliding writers cannot interleave one
- * page's tag with the other's epoch; the loser simply skips (its page
- * reads as unknown = stale, and the next physical read re-notes it).  A
- * concurrent reader can only see a mismatched tag (= stale), never a
- * wrong epoch under a matching tag.
+ * Seqlock discipline: the slot is claimed by advancing seq to odd (losers
+ * skip; their page reads as unknown = stale and the next physical read
+ * re-notes it), the pair is written, and seq lands even.  A reader accepts
+ * the pair only when seq is even and UNCHANGED across the reads -- a plain
+ * tag re-check would be fooled by slot reuse (page A evicted by B and
+ * re-noted as A between the reader's two tag reads pairs B's or a newer
+ * epoch with A's tag); seq advances on every update, so any intervening
+ * write fails the before/after comparison.
  */
 static void
 ps_slru_served_note(uint32 obj, uint32 pageno, uint64 epoch)
 {
 	PsSlruServedShm *e;
-	uint64		old;
+	uint64		seq;
 
 	if (ps_slru_wm == NULL)
 		return;
 	e = &ps_slru_wm->served[ps_slru_served_slot(obj, pageno)];
 
-	old = pg_atomic_read_u64(&e->tag);
-	if (old == 1 || !pg_atomic_compare_exchange_u64(&e->tag, &old, 1))
+	seq = pg_atomic_read_u64(&e->seq);
+	if ((seq & 1) != 0 ||
+		!pg_atomic_compare_exchange_u64(&e->seq, &seq, seq + 1))
 		return;					/* another writer mid-update: skip */
 	(void) pg_atomic_exchange_u64(&e->epoch, epoch);
 	(void) pg_atomic_exchange_u64(&e->tag, ps_slru_served_tag(obj, pageno));
+	(void) pg_atomic_exchange_u64(&e->seq, seq + 2);
 }
 
 /* The remembered epoch for a page, or false if unknown/mid-update. */
@@ -978,15 +986,20 @@ ps_slru_served_epoch(uint32 obj, uint32 pageno, uint64 *epoch)
 {
 	PsSlruServedShm *e;
 	uint64		tag = ps_slru_served_tag(obj, pageno);
+	uint64		seq;
 
 	if (ps_slru_wm == NULL)
 		return false;
 	e = &ps_slru_wm->served[ps_slru_served_slot(obj, pageno)];
+	seq = pg_atomic_read_u64(&e->seq);
+	if ((seq & 1) != 0)
+		return false;
+	pg_read_barrier();
 	if (pg_atomic_read_u64(&e->tag) != tag)
 		return false;
 	*epoch = pg_atomic_read_u64(&e->epoch);
-	pg_memory_barrier();
-	return pg_atomic_read_u64(&e->tag) == tag;
+	pg_read_barrier();
+	return pg_atomic_read_u64(&e->seq) == seq;
 }
 
 /*
@@ -1808,24 +1821,16 @@ ps_slru_reader_fetch_wm(void)
 	{
 		PageStoreRelKey key = {0};
 		char		page[BLCKSZ];
-		uint64		w;
+		uint64		w = 0;
+		bool		have_w;
 
 		ps_slru_obj_key(&key, 0);
-		if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_WM, &key, 0,
+		have_w =
+			pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_WM, &key, 0,
 												   PG_UINT64_MAX, page, NULL,
-												   PS_SLRU_SHIP_TIMEOUT_MS))
-		{
+												   PS_SLRU_SHIP_TIMEOUT_MS);
+		if (have_w)
 			memcpy(&w, page, sizeof(uint64));
-			for (;;)
-			{
-				uint64		cur = pg_atomic_read_u64(&ps_slru_wm->reader_wm);
-
-				if (w <= cur ||
-					pg_atomic_compare_exchange_u64(&ps_slru_wm->reader_wm,
-												   &cur, w))
-					break;
-			}
-		}
 
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
 		{
@@ -1840,6 +1845,27 @@ ps_slru_reader_fetch_wm(void)
 			{
 				memcpy(&cutoff, page, sizeof(int64));
 				ps_slru_tomb_note(i, cutoff, resolved);
+			}
+		}
+
+		/*
+		 * Publish the watermark only after every tombstone fetch above has
+		 * completed: raising it first would let a mid-cycle failure leave
+		 * cache-hit revalidation comparing pages against the NEW watermark
+		 * but the OLD tombstones for a whole backoff TTL, serving pages the
+		 * writer already truncated.  A failed cycle now leaves the pair
+		 * consistently old instead.
+		 */
+		if (have_w)
+		{
+			for (;;)
+			{
+				uint64		cur = pg_atomic_read_u64(&ps_slru_wm->reader_wm);
+
+				if (w <= cur ||
+					pg_atomic_compare_exchange_u64(&ps_slru_wm->reader_wm,
+												   &cur, w))
+					break;
 			}
 		}
 
@@ -2346,8 +2372,15 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 
 		if (ps_slru_tomb_covers(ctl, pageno, cut))
 		{
-			*exists = false;
-			res = SLRU_READ_HOOK_SERVED;
+			/*
+			 * Unlike the no-IPC path above, a definitive "does not exist"
+			 * is NOT safe here: the page may have been recreated after the
+			 * tombstone (a newer image outranks it -- the lookup that just
+			 * failed is exactly what would have told us), and existence
+			 * callers zero-create over false.  Fail closed until the store
+			 * answers.
+			 */
+			res = SLRU_READ_HOOK_FAILED;
 		}
 		else if (!ps_slru_mirror_enabled &&
 				 !ps_slru_local_page_exists(ctl, pageno))
@@ -2429,7 +2462,19 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 			return false;
 	}
 	if (w == 0 && tombc == 0)
-		return true;			/* no fetch ever: nothing was mirror-served */
+	{
+		/*
+		 * Nothing fetched, so nothing was mirror-served -- but on a pure
+		 * consumer that is only trustworthy while fetches keep SUCCEEDING:
+		 * a consumer that once saw "no watermark yet" and cached seed
+		 * pages must not keep serving them through a later store outage
+		 * (the writer may have published status or truncations since).
+		 * Stale fetches force re-reads through the fail-closed read path.
+		 */
+		if (!ps_slru_mirror_enabled && !ps_slru_reader_fetch_fresh())
+			return false;
+		return true;
+	}
 
 	/*
 	 * The watermark and tombstones above are only as fresh as the last
