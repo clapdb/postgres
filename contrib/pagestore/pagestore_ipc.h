@@ -29,7 +29,9 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		12	/* 12: WAL_RETAIN_FLOOR opcode added;
+#define PS_SHM_VERSION		13	/* 13: PS_KLASS_SLRU_LIVE (caller-versioned
+								 *     live SLRU mirror images);
+								 * 12: WAL_RETAIN_FLOOR opcode added;
 								 * 11: PS_KLASS_CONTROL writes versioned by the
 								 *     caller-supplied update LSN (was a daemon
 								 *     max+1 counter); mixed binaries must fail
@@ -100,8 +102,12 @@ typedef enum PsOpcode
 typedef enum PsObjClass
 {
 	PS_KLASS_RELATION = 0,		/* a relation fork's page (spc/db/rel/fork) */
-	PS_KLASS_SLRU = 1,			/* an SLRU page (clog, multixact, ...) -- future */
-	PS_KLASS_CONTROL = 2,		/* pg_control / cluster control state -- future */
+	PS_KLASS_SLRU = 1,			/* an SLRU seed-snapshot page (clean as-of a
+								 * proven cutoff; branch seeding reads these) */
+	PS_KLASS_CONTROL = 2,		/* pg_control / cluster control state */
+	PS_KLASS_SLRU_LIVE = 3,		/* a live-mirrored SLRU page image (newest
+								 * flushed bytes, contents bounded by the
+								 * version LSN; never a seed base) */
 } PsObjClass;
 
 /* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */
