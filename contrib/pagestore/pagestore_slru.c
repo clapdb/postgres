@@ -4108,13 +4108,16 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	loss_generation = pg_atomic_read_u64(&ps_slru_wm->loss_generation);
 
 	/*
-	 * Fold any dead-owner pending floors into the loss count before taking the
-	 * debt snapshot.  The operator is declaring the mirror whole as of this
-	 * call, so these inherited stale slots must be forgiven by this reset, not
-	 * rediscovered immediately after it.  This sweep intentionally does not
-	 * advance loss_generation; any concurrent new loss still does.
+	 * Convert any dead-owner pending floors to losses before taking the debt
+	 * snapshot -- as NEW losses, advancing loss_generation.  A dead floor
+	 * found here cannot be dated: it may be long-stale (safely covered by
+	 * the operator's re-prime snapshot) or from a backend that died AFTER
+	 * that snapshot, whose lost image the snapshot does not cover.  Counting
+	 * it as new makes the generation guard below abort this reset; the
+	 * retry, made after a fresh re-prime, has a snapshot that provably
+	 * postdates the loss and forgives it soundly.
 	 */
-	(void) ps_slru_wm_sweep_dead_pending(false, false);
+	(void) ps_slru_wm_sweep_dead_pending(false, true);
 	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 
 	/*
