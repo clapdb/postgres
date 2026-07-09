@@ -303,6 +303,10 @@ typedef struct PsSlruWatermarkShm
 	pg_atomic_uint64 loss_generation;
 	pg_atomic_uint64 debt_generation;
 	pg_atomic_uint64 pending_owner_next;
+	pg_atomic_uint32 floors_set;	/* count of nonzero pending floors: lets
+									 * the per-query drain tail skip the
+									 * O(MaxBackends) slot scans when nothing
+									 * is pending anywhere */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
 	pg_atomic_uint64 version_evict_floor;	/* all evicted slots' versions
 											 * are at/below this */
@@ -739,6 +743,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->loss_generation, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->debt_generation, 1);
 		pg_atomic_init_u64(&ps_slru_wm->pending_owner_next, 1);
+		pg_atomic_init_u32(&ps_slru_wm->floors_set, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->version_evict_floor, 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
@@ -784,6 +789,25 @@ ps_slru_shmem_startup(void)
 }
 
 /*
+ * Every write of a pending floor goes through here to keep the aggregate
+ * floors_set count exact: it is what lets the drain tail on every query
+ * skip the full per-ProcNumber scans when nothing is pending anywhere.
+ * Owner writes are process-serial; concurrent sweepers clear floors only
+ * through a CAS and decrement on success, so each 0<->nonzero transition is
+ * counted exactly once.
+ */
+static void
+ps_slru_wm_floor_write(pg_atomic_uint64 *slot, uint64 newval)
+{
+	uint64		old = pg_atomic_exchange_u64(slot, newval);
+
+	if (old == 0 && newval != 0)
+		pg_atomic_fetch_add_u32(&ps_slru_wm->floors_set, 1);
+	else if (old != 0 && newval == 0)
+		pg_atomic_fetch_sub_u32(&ps_slru_wm->floors_set, 1);
+}
+
+/*
  * Publish that this process holds a staged-but-not-durable image at
  * 'fence'.  Called under the bank lock: claim the ProcNumber slot with this
  * process's non-reused owner generation, then lower its pending floor.
@@ -803,7 +827,7 @@ ps_slru_wm_note_pending(XLogRecPtr fence)
 	slot = &ps_slru_wm->pending[MyProcNumber].floor;
 	cur = pg_atomic_read_u64(slot);
 	if (cur == 0 || f < cur)
-		pg_atomic_write_u64(slot, f);
+		ps_slru_wm_floor_write(slot, f);
 }
 
 static void
@@ -879,7 +903,7 @@ ps_slru_wm_claim_pending_slot(void)
 	if (floor != 0 && owner_pid != 0 && owner_gen != 0)
 		ps_slru_wm_note_lost();
 
-	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+	ps_slru_wm_floor_write(&ps_slru_wm->pending[MyProcNumber].floor, 0);
 	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid, pid);
 	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].owner_gen, gen);
 	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].live_gen, gen);
@@ -928,19 +952,30 @@ ps_slru_debt_persist(void)
 		{
 			if (pg_atomic_read_u64(&ps_slru_wm->total_lost) == 0)
 			{
+				bool		removed = false;
+
+				/*
+				 * The marker this call just (re)created is stale -- the
+				 * losses were reset concurrently.  Clear the retry flag
+				 * only once the removal is durably done: dropping it after
+				 * a failed unlink/fsync would strand the stale marker with
+				 * no retry scheduled, freezing the next boot despite a
+				 * successful reset.
+				 */
 				if (unlink(PS_SLRU_DEBT_FILE) == 0 || errno == ENOENT)
 				{
 					int			dfd = open(".", O_RDONLY);
 
+					removed = (dfd >= 0 && fsync(dfd) == 0);
 					if (dfd >= 0)
-					{
-						(void) fsync(dfd);
 						close(dfd);
-					}
 				}
-				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
-				if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
-					pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+				if (removed)
+				{
+					pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+					if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+						pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+				}
 			}
 			else if (generation == pg_atomic_read_u64(&ps_slru_wm->debt_generation))
 				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
@@ -1019,6 +1054,7 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 		if (!pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
 											&floor, 0))
 			continue;
+		pg_atomic_fetch_sub_u32(&ps_slru_wm->floors_set, 1);
 		ps_slru_wm_note_lost_count(1, new_loss);
 		(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
 											  &pid, 0);
@@ -1060,7 +1096,7 @@ ps_slru_wm_republish_pending(void)
 	if (ps_slru_recap_count > 0)
 		f = 1;					/* identities without fences: freeze */
 
-	pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, f);
+	ps_slru_wm_floor_write(&ps_slru_wm->pending[MyProcNumber].floor, f);
 }
 
 /*
@@ -1083,9 +1119,12 @@ ps_slru_wm_advance(void)
 	 * Sweep inherited dead-owner floors before any early return.  A dead
 	 * pending floor is a real coverage loss even while no checkpoint candidate
 	 * is available yet, and must become persistent debt before a clean shutdown
-	 * can forget it.
+	 * can forget it.  Gated on the aggregate count: this tail runs at every
+	 * executor/xact-end drain, and an unconditional sweep would charge every
+	 * simple statement O(MaxBackends) atomic reads for nothing.
 	 */
-	ps_slru_wm_sweep_dead_pending(true, true);
+	if (pg_atomic_read_u32(&ps_slru_wm->floors_set) != 0)
+		ps_slru_wm_sweep_dead_pending(true, true);
 
 	/*
 	 * Any loss, ever -- including the boot debt of an unclean previous life
@@ -1113,7 +1152,10 @@ ps_slru_wm_advance(void)
 		cand <= pg_atomic_read_u64(&ps_slru_wm->candidate_floor))
 		return;
 
-	for (int i = 0; i < ps_slru_wm_nprocs; i++)
+	for (int i = 0;
+		 pg_atomic_read_u32(&ps_slru_wm->floors_set) != 0 &&
+		 i < ps_slru_wm_nprocs;
+		 i++)
 	{
 		uint64		floor;
 		uint64		pid;
@@ -1142,6 +1184,7 @@ ps_slru_wm_advance(void)
 			pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
 										   &floor, 0))
 		{
+			pg_atomic_fetch_sub_u32(&ps_slru_wm->floors_set, 1);
 			ps_slru_wm_note_lost_count(1, true);
 			(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
 												  &pid, 0);
@@ -2454,7 +2497,7 @@ ps_slru_exit_drain(int code, Datum arg)
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
 		MyProcNumber < ps_slru_wm_nprocs)
 	{
-		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].floor, 0);
+		ps_slru_wm_floor_write(&ps_slru_wm->pending[MyProcNumber].floor, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].pid, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].owner_gen, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[MyProcNumber].live_gen, 0);
