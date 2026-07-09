@@ -1416,6 +1416,7 @@ ps_slru_tomb_rederive(void)
 			struct dirent *de;
 			int64		minseg = -1;
 			int64		cutoff;
+			XLogRecPtr	version;
 			bool		commit_ts = strcmp(ps_slru_dirmap[i].dir,
 										   "pg_commit_ts") == 0;
 
@@ -1448,9 +1449,19 @@ ps_slru_tomb_rederive(void)
 			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff))
 				cutoff = (minseg < 0) ? PG_INT64_MAX
 					: minseg * SLRU_PAGES_PER_SEGMENT;
+
+			/*
+			 * Same pending-floor discipline as the truncate hook: when the
+			 * reset runs with no outstanding loss (a plain re-prime), the
+			 * watermark is not frozen, and a concurrent checkpoint drain
+			 * must not publish a candidate past a tombstone still in
+			 * flight.  The floor stays pinned across all the ships and is
+			 * republished once below.
+			 */
+			version = ps_slru_now_lsn();
+			ps_slru_wm_note_pending(version);
 			ps_slru_tomb_covered_set[i] = false;
-			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
-								   ps_slru_now_lsn());
+			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff, version);
 			if (commit_ts)
 			{
 				LWLockRelease(CommitTsLock);
@@ -1460,6 +1471,7 @@ ps_slru_tomb_rederive(void)
 	}
 	PG_CATCH();
 	{
+		ps_slru_wm_republish_pending();
 		if (commit_ts_locked)
 			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
@@ -1469,6 +1481,7 @@ ps_slru_tomb_rederive(void)
 	}
 	PG_END_TRY();
 
+	ps_slru_wm_republish_pending();
 	LWLockRelease(MultiXactTruncationLock);
 	LWLockRelease(XactTruncationLock);
 	LWLockRelease(WrapLimitsVacuumLock);
