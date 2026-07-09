@@ -1755,12 +1755,22 @@ restart:
 			continue;
 		}
 
-		/* Same logic as SimpleLruTruncate() */
+		/*
+		 * Same logic as SimpleLruTruncate(): a valid dirty page of a doomed
+		 * segment is already logically truncated -- discard it rather than
+		 * write it.  Writing would run the page-write hook AFTER the
+		 * tombstone barrier above and ship a newer live image for a page
+		 * the deletion below is about to forget, letting a mirror's
+		 * newer-image-outranks-tombstone rule resurrect truncated data.
+		 */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
-			SlruInternalWritePage(ctl, slotno, NULL);
-		else
-			SimpleLruWaitIO(ctl, slotno);
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
 
+		SimpleLruWaitIO(ctl, slotno);
 		did_write = true;
 	}
 
