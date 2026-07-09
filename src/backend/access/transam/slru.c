@@ -1604,19 +1604,9 @@ void
 SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 {
 	SlruShared	shared = ctl->shared;
-	int			prevbank;
-	bool		tombstoned = false;
 
 	/* update the stats counter of truncates */
 	pgstat_count_slru_truncate(shared->slru_stats_idx);
-
-	/*
-	 * Scan shared memory and remove any pages preceding the cutoff page, to
-	 * ensure we won't rewrite them later.  (Since this is normally called in
-	 * or just after a checkpoint, any dirty pages should have been flushed
-	 * already ... we're just being extra careful here.)
-	 */
-restart:
 
 	/*
 	 * An important safety check: the current endpoint page must not be
@@ -1647,12 +1637,43 @@ restart:
 	 * the next vacuum/checkpoint cycle, exactly like any other truncate
 	 * failure.
 	 */
-	if (slru_truncate_hook && !tombstoned)
-	{
+	if (slru_truncate_hook)
 		(*slru_truncate_hook) (ctl, cutoffPage, InvalidXLogRecPtr);
-		tombstoned = true;
-	}
 
+	/*
+	 * Scan shared memory and empty any pages preceding the cutoff page, to
+	 * ensure we won't rewrite them later.  (Since this is normally called in
+	 * or just after a checkpoint, any dirty pages should have been flushed
+	 * already ... we're just being extra careful here.)  Truncation paths
+	 * with a mirror pre-barrier have already done this before WAL-logging.
+	 */
+	SimpleLruDiscardCutoff(ctl, cutoffPage);
+
+	/* Now we can remove the old segment(s) */
+	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
+}
+
+/*
+ * Empty every resident page preceding cutoffPage, discarding dirty ones.
+ *
+ * A valid dirty page below the cutoff is already logically truncated:
+ * discarding it instead of writing it matters to external mirrors, whose
+ * write hook would otherwise capture a newer live image for a page local
+ * storage is about to forget.  Exposed separately from SimpleLruTruncate()
+ * so truncation callers can run it BEFORE WAL-logging the truncation: a
+ * checkpoint already inside SimpleLruWriteAll() when the truncate starts
+ * could otherwise flush a doomed dirty page AFTER the mirror's tombstone
+ * shipped, capturing an image that outranks it.  Emptying the slots first
+ * bounds every possible capture of a doomed page below the truncate
+ * record's LSN.
+ */
+void
+SimpleLruDiscardCutoff(SlruDesc *ctl, int64 cutoffPage)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
 	prevbank = SlotGetBankNumber(0);
 	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
 	for (int slotno = 0; slotno < shared->num_slots; slotno++)
@@ -1685,29 +1706,20 @@ restart:
 			continue;
 		}
 
-		/*
-		 * A valid dirty page below the cutoff is already logically truncated.
-		 * Discard it instead of writing it: writing after the truncation
-		 * tombstone lets external mirrors capture a newer live image for a page
-		 * that local storage is about to forget.
-		 */
+		/* See above: doomed dirty pages are discarded, not written. */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
 		{
 			shared->page_dirty[slotno] = false;
 			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
 			continue;
 		}
-		else
-			SimpleLruWaitIO(ctl, slotno);
 
+		SimpleLruWaitIO(ctl, slotno);
 		LWLockRelease(&shared->bank_locks[prevbank].lock);
 		goto restart;
 	}
 
 	LWLockRelease(&shared->bank_locks[prevbank].lock);
-
-	/* Now we can remove the old segment(s) */
-	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
 }
 
 /*

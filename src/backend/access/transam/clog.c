@@ -1028,6 +1028,18 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 		PG_TRY();
 		{
+			/*
+			 * Empty (and discard) every doomed resident page BEFORE the
+			 * truncate record exists: a checkpoint already inside
+			 * SimpleLruWriteAll() could otherwise flush one after the
+			 * barrier below ships its tombstone, capturing a mirror image
+			 * versioned above it that would resurrect the page.  With the
+			 * slots emptied first, any capture of a doomed page is bounded
+			 * below trunc_lsn.
+			 */
+			if (slru_truncate_hook)
+				SimpleLruDiscardCutoff(XactCtl, cutoffPage);
+
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
 											 oldestxid_datoid);
 
