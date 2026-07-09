@@ -1648,6 +1648,24 @@ ps_slru_reader_fetch_wm(void)
 }
 
 /*
+ * Does a tombstone at 'cutoff' cover 'pageno'?  Coverage is MODULAR, by the
+ * same PagePrecedes relation local truncation deletes with: a numeric
+ * pageno < cutoff test would stop covering pre-wrap high pages the moment a
+ * post-wrap truncation publishes a low cutoff, resurrecting wrapped-away
+ * status on live-read computes.  cutoff < 0 means no tombstone known;
+ * PG_INT64_MAX is the commit-ts delete-all.
+ */
+static bool
+ps_slru_tomb_covers(SlruDesc *ctl, int64 pageno, int64 cutoff)
+{
+	if (cutoff < 0)
+		return false;
+	if (cutoff == PG_INT64_MAX)
+		return true;
+	return ctl->options.PagePrecedes(pageno, cutoff);
+}
+
+/*
  * Does the local segment file holding 'pageno' exist?  On the mirror's own
  * writer, a present local segment is always at least as new as anything
  * the mirror holds (the mirror is fed FROM these files), so live reads
@@ -1778,7 +1796,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 * advance independently of the watermark, so a cached one
 			 * still applies (memory only; no IPC here).
 			 */
-			if (pageno < cut)
+			if (ps_slru_tomb_covers(ctl, pageno, cut))
 				res = SLRU_READ_HOOK_FAILED;
 			else if (!ps_slru_mirror_enabled &&
 					 !ps_slru_local_page_exists(ctl, pageno))
@@ -1830,7 +1848,8 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 				 * pg_commit_ts is reset and re-activated this way) outranks
 				 * it, newest-wins like everything else.
 				 */
-				if (pageno < cutoff && (!have_image || iv <= tombv))
+				if (ps_slru_tomb_covers(ctl, pageno, cutoff) &&
+					(!have_image || iv <= tombv))
 				{
 					/*
 					 * Tombstoned: the store has durably declared this page
@@ -1875,7 +1894,9 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 					 */
 					if (res != SLRU_READ_HOOK_FAILED)
 						ps_slru_served_note(obj, (uint32) pageno,
-											pageno < cutoff ? Max(w, tombv) : w);
+											ps_slru_tomb_covers(ctl, pageno,
+																cutoff)
+											? Max(w, tombv) : w);
 				}
 			}
 		}
@@ -1903,7 +1924,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		if (ver == 0)
 			cut = cached_cut;
 
-		if (pageno < cut ||
+		if (ps_slru_tomb_covers(ctl, pageno, cut) ||
 			(RecoveryInProgress() &&
 			 !ps_slru_local_page_exists(ctl, pageno)))
 			res = SLRU_READ_HOOK_FAILED;
@@ -1981,7 +2002,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			 * state the mirror holds.  A cached tombstone answers
 			 * definitively.
 			 */
-			if (pageno < cut)
+			if (ps_slru_tomb_covers(ctl, pageno, cut))
 			{
 				*exists = false;
 				res = SLRU_READ_HOOK_SERVED;
@@ -2023,7 +2044,8 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 														   PS_SLRU_SHIP_TIMEOUT_MS);
 
 				/* same tombstone-vs-newer-image rule as the read hook */
-				if (pageno < cutoff && (!have_image || iv <= tombv))
+				if (ps_slru_tomb_covers(ctl, pageno, cutoff) &&
+					(!have_image || iv <= tombv))
 				{
 					if (!ps_slru_mirror_enabled)
 					{
@@ -2058,7 +2080,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		if (ver == 0)
 			cut = cached_cut;
 
-		if (pageno < cut)
+		if (ps_slru_tomb_covers(ctl, pageno, cut))
 		{
 			*exists = false;
 			res = SLRU_READ_HOOK_SERVED;
@@ -2166,7 +2188,9 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 		return false;			/* unknown: one redundant re-read */
 	if (epoch < w)
 		return false;
-	if (tombc != 0 && (uint64) pageno + 1 < tombc && epoch < tombv)
+	if (tombc != 0 &&
+		ps_slru_tomb_covers(ctl, pageno, (int64) (tombc - 1)) &&
+		epoch < tombv)
 		return false;
 
 	return true;
