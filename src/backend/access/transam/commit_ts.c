@@ -29,6 +29,7 @@
 #include "access/xlogutils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "utils/fmgrprotos.h"
@@ -893,16 +894,37 @@ TruncateCommitTs(TransactionId oldestXact)
 	{
 		XLogRecPtr	trunc_lsn;
 
-		trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
-
 		/*
-		 * Same exact-LSN pre-barrier as TruncateCLOG(), with the same
-		 * apparent-wraparound pre-check.
+		 * Hold off checkpoint starts from the truncate record until the
+		 * barrier below has either shipped its tombstone (durable, pending
+		 * floor noted) or failed (loss counted, watermark frozen): a
+		 * checkpoint slipping into that window could complete and publish
+		 * a live-SLRU watermark past trunc_lsn while the truncation it
+		 * implies has no tombstone yet.  Same discipline as
+		 * TruncateMultiXact(); the flag must not leak on error.
 		 */
-		if (slru_truncate_hook &&
-			!CommitTsCtl->options.PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
-											   cutoffPage))
-			(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
+
+			/*
+			 * Same exact-LSN pre-barrier as TruncateCLOG(), with the same
+			 * apparent-wraparound pre-check.
+			 */
+			if (slru_truncate_hook &&
+				!CommitTsCtl->options.PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
+												   cutoffPage))
+				(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
+		}
+		PG_CATCH();
+		{
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	}
 
 	/* Now we can remove the old CommitTs segment(s) */
