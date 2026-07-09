@@ -794,10 +794,17 @@ DeactivateCommitTs(void)
 	 * barrier covers every page (PG_INT64_MAX).  A reset cannot be
 	 * abandoned the way a truncation can, and this also runs during
 	 * parameter-change replay -- the hook degrades store failures to a
-	 * coverage loss instead of erroring here.
+	 * coverage loss instead of erroring here.  Resident slots are
+	 * discarded FIRST: a leftover dirty page would later be flushed by
+	 * CheckPointCommitTs()'s unconditional SimpleLruWriteAll(), recreating
+	 * a just-deleted segment and publishing a mirror image that outranks
+	 * the delete-all tombstone, resurrecting stale commit timestamps.
 	 */
 	if (slru_truncate_hook)
+	{
+		SimpleLruDiscardAll(CommitTsCtl);
 		(*slru_truncate_hook) (CommitTsCtl, PG_INT64_MAX, InvalidXLogRecPtr);
+	}
 
 	(void) SlruScanDirectory(CommitTsCtl, SlruScanDirCbDeleteAll, NULL);
 
@@ -915,7 +922,7 @@ TruncateCommitTs(TransactionId oldestXact)
 		{
 			/* see TruncateCLOG: no doomed page may be flushable after this */
 			if (barrier_ok)
-				SimpleLruDiscardCutoff(CommitTsCtl, cutoffPage);
+				SimpleLruFlushCutoff(CommitTsCtl, cutoffPage);
 
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
 
@@ -1070,7 +1077,10 @@ commit_ts_redo(XLogReaderState *record)
 		pg_atomic_write_u64(&CommitTsCtl->shared->latest_page_number,
 							trunc->pageno);
 
+		/* see clog_redo: serialize with the mirror's recapture pass */
+		LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 		SimpleLruTruncate(CommitTsCtl, trunc->pageno);
+		LWLockRelease(WrapLimitsVacuumLock);
 	}
 	else
 		elog(PANIC, "commit_ts_redo: unknown op code %u", info);

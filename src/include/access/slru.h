@@ -304,6 +304,8 @@ extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
 #endif
 extern void SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage);
 extern void SimpleLruDiscardCutoff(SlruDesc *ctl, int64 cutoffPage);
+extern void SimpleLruFlushCutoff(SlruDesc *ctl, int64 cutoffPage);
+extern void SimpleLruDiscardAll(SlruDesc *ctl);
 extern bool SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno);
 
 typedef bool (*SlruScanCallback) (SlruDesc *ctl, char *filename, int64 segpage,

@@ -1042,16 +1042,18 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 		PG_TRY();
 		{
 			/*
-			 * Empty (and discard) every doomed resident page BEFORE the
-			 * truncate record exists: a checkpoint already inside
-			 * SimpleLruWriteAll() could otherwise flush one after the
-			 * barrier below ships its tombstone, capturing a mirror image
-			 * versioned above it that would resurrect the page.  With the
-			 * slots emptied first, any capture of a doomed page is bounded
-			 * below trunc_lsn.
+			 * Flush every doomed dirty page BEFORE the truncate record
+			 * exists: a checkpoint already inside SimpleLruWriteAll() could
+			 * otherwise flush one after the barrier below ships its
+			 * tombstone, capturing a mirror image versioned above it that
+			 * would resurrect the page.  Flushing (not discarding) keeps
+			 * this window abortable -- an error in the record insertion or
+			 * the barrier abandons the truncation with nothing lost -- and
+			 * any capture the flush triggers here is bounded below
+			 * trunc_lsn, so the tombstone outranks it.
 			 */
 			if (barrier_ok)
-				SimpleLruDiscardCutoff(XactCtl, cutoffPage);
+				SimpleLruFlushCutoff(XactCtl, cutoffPage);
 
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
 											 oldestxid_datoid);
@@ -1174,7 +1176,17 @@ clog_redo(XLogReaderState *record)
 
 		AdvanceOldestClogXid(xlrec.oldestXact);
 
+		/*
+		 * Hold the lock the mirror's recapture pass serializes on:
+		 * SimpleLruTruncate() runs the tombstone barrier and slot discard
+		 * here, and a drain re-snapshotting a recaptured page between the
+		 * two could stage an image versioned above the in-flight tombstone,
+		 * resurrecting the truncated range (same interlock the vacuum-side
+		 * truncation gets from vac_truncate_clog).
+		 */
+		LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 		SimpleLruTruncate(XactCtl, xlrec.pageno);
+		LWLockRelease(WrapLimitsVacuumLock);
 	}
 	else
 		elog(PANIC, "clog_redo: unknown op code %u", info);
