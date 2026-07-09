@@ -501,11 +501,10 @@ ps_slru_commit_ts_page(TransactionId xid)
 }
 
 static bool
-ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff, bool *skip)
+ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 {
 	const char *dir = ps_slru_dirmap[idx].dir;
 
-	*skip = false;
 	if (strcmp(dir, "pg_xact") == 0)
 	{
 		*cutoff = ps_slru_xid_page(TransamVariables->oldestClogXid);
@@ -531,20 +530,22 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff, bool *skip)
 						 &oldestOffset);
 		if (strcmp(dir, "pg_multixact/offsets") == 0)
 		{
+			MultiXactId prev = (oldestMulti == FirstMultiXactId)
+				? MaxMultiXactId : oldestMulti - 1;
+
 			/*
-			 * oldestMulti == FirstMultiXactId is ambiguous: a space that has
-			 * never been truncated (cutoff 0 would be right), or a wrapped
-			 * one whose true cutoff is a high page (the truncation path's
-			 * PreviousMultiXactId(oldestMulti) wraps to the top of the id
-			 * space).  A linear cutoff cannot express the wrapped case, and
-			 * publishing 0 at a newer version would supersede the standing
-			 * tombstone and resurrect retired high pages.  Publish nothing;
-			 * whatever tombstone already exists stays authoritative.
+			 * Same expression as the truncation path's
+			 * PreviousMultiXactId(oldestMulti): after multixact wraparound
+			 * the previous id -- and thus the cutoff page -- is at the top
+			 * of the id space.  Tombstone coverage is MODULAR (the reader
+			 * decides death by PagePrecedes; see ps_slru_ship_tombstone),
+			 * so the high cutoff is correct on a fresh cluster too: the low
+			 * pages a fresh cluster uses do not precede it, while a wrapped
+			 * cluster's retired high pages do.  Publishing it here keeps a
+			 * wrapped truncation's tombstone reconstructible by the reset
+			 * repair path instead of being skipped.
 			 */
-			if (oldestMulti == FirstMultiXactId)
-				*skip = true;
-			else
-				*cutoff = MultiXactIdToOffsetPage(oldestMulti - 1);
+			*cutoff = MultiXactIdToOffsetPage(prev);
 		}
 		else
 			*cutoff = MXOffsetToMemberPage(oldestOffset);
@@ -2315,7 +2316,6 @@ ps_slru_tomb_rederive(void)
 			struct dirent *de;
 			int64		minseg = -1;
 			int64		cutoff;
-			bool		skip = false;
 			bool		commit_ts = strcmp(ps_slru_dirmap[i].dir,
 										   "pg_commit_ts") == 0;
 
@@ -2345,15 +2345,12 @@ ps_slru_tomb_rederive(void)
 			}
 			FreeDir(dir);
 
-			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff, &skip))
+			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff))
 				cutoff = (minseg < 0) ? PG_INT64_MAX
 					: minseg * SLRU_PAGES_PER_SEGMENT;
-			if (!skip)
-			{
-				ps_slru_tomb_covered_set[i] = false;
-				ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
-									   ps_slru_now_lsn());
-			}
+			ps_slru_tomb_covered_set[i] = false;
+			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
+								   ps_slru_now_lsn());
 			if (commit_ts)
 			{
 				LWLockRelease(CommitTsLock);
@@ -2515,12 +2512,20 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	}
 	PG_END_TRY();
 
-	if (shipped && cutoffPage != PG_INT64_MAX)
+	if (shipped && cutoffPage != PG_INT64_MAX && !XLogRecPtrIsInvalid(lsn))
 	{
 		/*
-		 * Never cache the delete-all cutoff: every commit-ts deactivation
-		 * uses the same PG_INT64_MAX, and skipping a later one would leave
-		 * the images a reactivation shipped in between alive forever.
+		 * Arm the one-shot duplicate shield only for pre-barrier calls
+		 * (identified by their exact record LSN): only those have an
+		 * in-truncate consumer coming.  A direct SimpleLruTruncate()/
+		 * SlruDeleteSegment() ship (recovery replay, hookless callers) must
+		 * not leave a dangling shield -- a later same-cutoff truncation
+		 * would take the early return above, skip shipping the NEWER
+		 * tombstone, and let images shipped between the two truncations
+		 * outrank the old one.  Never cache the delete-all cutoff either:
+		 * every commit-ts deactivation uses the same PG_INT64_MAX, and
+		 * skipping a later one would leave the images a reactivation
+		 * shipped in between alive forever.
 		 */
 		ps_slru_tomb_covered[idx] = cutoffPage;
 		ps_slru_tomb_covered_set[idx] = true;
@@ -2924,6 +2929,10 @@ static bool
 ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 {
 	bool		staged = false;
+	bool		tomb_known[lengthof(ps_slru_dirmap)] = {false};
+	bool		tomb_valid[lengthof(ps_slru_dirmap)] = {false};
+	int64		tomb_cut[lengthof(ps_slru_dirmap)] = {0};
+	uint64		tomb_ver[lengthof(ps_slru_dirmap)] = {0};
 
 	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY && ps_slru_recap_count > 0; i++)
 	{
@@ -2931,6 +2940,7 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		char		image[BLCKSZ];
 		XLogRecPtr	fence;
 		XLogRecPtr	bound;
+		int			idx;
 
 		if (!r->used)
 			continue;
@@ -2942,6 +2952,50 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		}
 		if (ps_slru_queue_count >= PS_SLRU_QUEUE_CAPACITY)
 			break;				/* queue refilled; retry next drain */
+
+		/*
+		 * A recapture the store has since tombstoned must be RETIRED, not
+		 * re-shipped: when the cutoff falls inside a segment the local file
+		 * survives the truncation, so the re-snapshot below would read the
+		 * pre-truncation bytes and ship them at a fresh position ABOVE the
+		 * tombstone's -- and the newer-image-outranks-tombstone rule would
+		 * resurrect a page the truncation declared dead.  The exception is
+		 * a page recreated after the truncation: its recapture carries a
+		 * fence floor above the tombstone version (the recreating capture
+		 * folded it in) and must still ship.  Retiring is not a loss -- the
+		 * tombstone IS the page's mirrored truth -- and this also spares
+		 * the segment-gone recapture path from counting needless debt.
+		 * One store lookup per SLRU per pass; a failed lookup just defers
+		 * the decision to the next drain.
+		 */
+		idx = ps_slru_dir_index(r->ctl->options.Dir);
+		if (idx >= 0 && !tomb_known[idx])
+		{
+			PageStoreRelKey key = {0};
+			char		tpage[BLCKSZ];
+			uint64		resolved = 0;
+
+			tomb_known[idx] = true;
+			ps_slru_obj_key(&key, r->obj);
+			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
+													   &key, 0, PG_UINT64_MAX,
+													   tpage, &resolved,
+													   PS_SLRU_SHIP_TIMEOUT_MS))
+			{
+				memcpy(&tomb_cut[idx], tpage, sizeof(int64));
+				tomb_ver[idx] = resolved;
+				tomb_valid[idx] = true;
+			}
+		}
+		if (idx >= 0 && tomb_valid[idx] &&
+			ps_slru_tomb_covers(r->ctl, (int64) r->pageno, tomb_cut[idx]) &&
+			(XLogRecPtrIsInvalid(r->fence_floor) ||
+			 (uint64) r->fence_floor <= tomb_ver[idx]))
+		{
+			r->used = false;
+			ps_slru_recap_count--;
+			continue;
+		}
 
 		/*
 		 * While the identity's posted entry is still awaiting its sync, the

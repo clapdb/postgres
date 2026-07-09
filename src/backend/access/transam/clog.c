@@ -1015,25 +1015,47 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	{
 		XLogRecPtr	trunc_lsn;
 
-		trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
-										 oldestxid_datoid);
-
 		/*
-		 * A store-backed SLRU mirror wants its truncation tombstone
-		 * versioned by the exact truncate record, not a later sampled
-		 * position (an as-of reader between the two would have the record
-		 * in its history but see no tombstone).  Run the barrier here with
-		 * that LSN; SimpleLruTruncate()'s own hook call then finds the
-		 * cutoff covered and no-ops.  Skip it when SimpleLruTruncate()'s
-		 * apparent-wraparound backstop is going to refuse the truncation
-		 * -- a refused truncation must not durably declare its range dead
-		 * (should the state change in between, the in-truncate hook call
-		 * runs uncovered and ships with a sampled position).
+		 * Hold off checkpoint starts from the truncate record until the
+		 * barrier below has either shipped its tombstone (durable, pending
+		 * floor noted) or failed (loss counted, watermark frozen): a
+		 * checkpoint slipping into that window could complete and publish
+		 * a live-SLRU watermark past trunc_lsn while the truncation it
+		 * implies has no tombstone yet.  Same discipline as
+		 * TruncateMultiXact(); the flag must not leak on error.
 		 */
-		if (slru_truncate_hook &&
-			!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
-										   cutoffPage))
-			(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
+											 oldestxid_datoid);
+
+			/*
+			 * A store-backed SLRU mirror wants its truncation tombstone
+			 * versioned by the exact truncate record, not a later sampled
+			 * position (an as-of reader between the two would have the
+			 * record in its history but see no tombstone).  Run the barrier
+			 * here with that LSN; SimpleLruTruncate()'s own hook call then
+			 * finds the cutoff covered and no-ops.  Skip it when
+			 * SimpleLruTruncate()'s apparent-wraparound backstop is going
+			 * to refuse the truncation -- a refused truncation must not
+			 * durably declare its range dead (should the state change in
+			 * between, the in-truncate hook call runs uncovered and ships
+			 * with a sampled position).
+			 */
+			if (slru_truncate_hook &&
+				!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
+											   cutoffPage))
+				(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
+		}
+		PG_CATCH();
+		{
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	}
 
 	/* Now we can remove the old CLOG segment(s) */
