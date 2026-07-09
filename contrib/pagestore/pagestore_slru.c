@@ -3019,13 +3019,18 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	now = ps_slru_now_lsn();
 	if (XLogRecPtrIsInvalid(fence_lsn))
 		fence_lsn = now;
-	if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now))
-	{
-		ps_slru_note_recapture(ctl, obj, (uint32) pageno, now, false);
-		return;
-	}
 
-	ps_slru_stage_reserved(ctl, obj, (uint32) pageno, page, fence_lsn, now);
+	/*
+	 * The version is reserved inside the staging helper, at the two points
+	 * that actually consume it -- NOT up front here.  A reservation made
+	 * before the queue-full check would be burned by an overflow: the
+	 * recapture's immediate drain re-snapshot samples the same position on
+	 * an idle system, the burned slot rejects the equal bound, and the
+	 * pending floor sits at 1 (a clean exit even counts a false loss) until
+	 * unrelated WAL happens to advance.
+	 */
+	ps_slru_stage_internal(ctl, obj, (uint32) pageno, page, fence_lsn, now,
+						   false);
 }
 
 /*
