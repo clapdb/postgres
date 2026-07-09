@@ -1745,36 +1745,56 @@ ps_slru_wm_publish(void)
 	PG_END_TRY();
 }
 
-/* Read the cached (shared) tombstone pair for a scope slot; 0/0 = none. */
-static void
+/*
+ * Read the cached (shared) tombstone pair for a scope slot.  Returns true
+ * with a STABLE answer (-1/0 = genuinely none known); an update in flight
+ * is waited out rather than misread as "no tombstone" -- the old cutoff is
+ * still the last known truth, and a w == 0 reader that saw none would fall
+ * back to a stale local seed page the standing tombstone had retired.  The
+ * writer's window is two exchanges wide, so the wait is normally a few
+ * spins; the bound only trips if the updater was killed between them
+ * (shared memory is torn down by the ensuing crash-restart anyway), and
+ * then the answer is UNKNOWN: returns false, and callers must treat the
+ * page as undecidable (fail closed on a consumer), never as tombstone-free.
+ */
+static bool
 ps_slru_tomb_cached(int idx, int64 *cutoff, uint64 *version)
 {
 	uint64		c;
 	uint64		v;
+	int			spins = 0;
 
 	*cutoff = -1;
 	*version = 0;
 	if (ps_slru_wm == NULL)
-		return;
+		return true;
 	for (;;)
 	{
 		uint64		v2;
 
 		v = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
-		if (v == 0 || v == PG_UINT64_MAX)
-			return;				/* none known, or an update in flight */
+		if (v == 0)
+			return true;		/* genuinely none known */
+		if (v == PG_UINT64_MAX)
+		{
+			if (++spins > 10000)
+				return false;	/* updater died mid-window */
+			pg_spin_delay();
+			continue;
+		}
 		c = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
 		pg_memory_barrier();
 		v2 = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
 		if (v == v2)
 			break;
-		if (v2 == 0 || v2 == PG_UINT64_MAX)
-			return;
+		if (++spins > 10000)
+			return false;
 	}
 	if (c == 0)
-		return;
+		return true;
 	*cutoff = (int64) (c - 1);
 	*version = v;
+	return true;
 }
 
 /*
@@ -1999,6 +2019,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	uint64		w;
 	int64		cached_cut;
 	uint64		cached_ver;
+	bool		cached_known;
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
@@ -2029,12 +2050,13 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	 * retired must never fall back to a stale local segment, even when
 	 * this read's own store lookups time out.
 	 */
-	ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+	cached_known = ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
 
 	PG_TRY();
 	{
 		int64		cut;
 		uint64		ver;
+		bool		known;
 
 		/*
 		 * The watermark is the completeness floor, not a cap: any bit in
@@ -2058,14 +2080,23 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * An in-flight concurrent update reads as none; keep the snapshot
 		 * as the floor then.
 		 */
-		ps_slru_tomb_cached(idx, &cut, &ver);
+		known = ps_slru_tomb_cached(idx, &cut, &ver);
 		if (ver == 0)
 		{
 			cut = cached_cut;
 			ver = cached_ver;
 		}
 
-		if (w == 0)
+		if (!known && !cached_known && !ps_slru_mirror_enabled)
+		{
+			/*
+			 * No trustworthy tombstone state at all (both reads found a
+			 * torn update whose writer died): the page is undecidable on a
+			 * consumer -- neither servable nor safely local.
+			 */
+			res = SLRU_READ_HOOK_FAILED;
+		}
+		else if (w == 0)
 		{
 			/*
 			 * No watermark -- never published, or the fetch failed.  A
@@ -2077,7 +2108,39 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 * still applies (memory only; no IPC here).
 			 */
 			if (ps_slru_tomb_covers(ctl, pageno, cut))
-				res = SLRU_READ_HOOK_FAILED;
+			{
+				/*
+				 * Covered -- but possibly recreated after the tombstone
+				 * (commit-ts reset + reactivation under a frozen writer):
+				 * a consumer with a fresh fetch probes for a newer image
+				 * and serves it under the same outranking rule as the
+				 * w != 0 path, else recreated pages stay unreadable until
+				 * a watermark is ever published.
+				 */
+				if (!ps_slru_mirror_enabled && ps_slru_reader_fetch_fresh())
+				{
+					PageStoreRelKey key = {0};
+					uint64		iv = 0;
+
+					ps_slru_obj_key(&key, obj);
+					if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE,
+															   &key,
+															   (BlockNumber) pageno,
+															   PG_UINT64_MAX,
+															   page, &iv,
+															   PS_SLRU_SHIP_TIMEOUT_MS) &&
+						iv > ver)
+					{
+						ps_slru_served_note(obj, (uint32) pageno,
+											Max(w, ver));
+						res = SLRU_READ_HOOK_SERVED;
+					}
+					else
+						res = SLRU_READ_HOOK_FAILED;
+				}
+				else
+					res = SLRU_READ_HOOK_FAILED;
+			}
 			else if (!ps_slru_mirror_enabled &&
 					 (!ps_slru_reader_fetch_fresh() ||
 					  !ps_slru_local_page_exists(ctl, pageno)))
@@ -2218,7 +2281,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * transaction status; only the mirror's own writer may fall back
 		 * (its local files ARE the truth the mirror lags behind).
 		 */
-		ps_slru_tomb_cached(idx, &cut, &ver);
+		(void) ps_slru_tomb_cached(idx, &cut, &ver);
 		if (ver == 0)
 			cut = cached_cut;
 
@@ -2260,6 +2323,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	uint64		w;
 	int64		cached_cut;
 	uint64		cached_ver;
+	bool		cached_known;
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
@@ -2275,12 +2339,13 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		return SLRU_READ_HOOK_FALLBACK;
 
 	/* see the read hook: the cache applies even if the IPC below fails */
-	ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+	cached_known = ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
 
 	PG_TRY();
 	{
 		int64		cut;
 		uint64		ver;
+		bool		known;
 
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
@@ -2291,14 +2356,19 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		 * for the catch path; an in-flight update reads as none, keep the
 		 * snapshot then.
 		 */
-		ps_slru_tomb_cached(idx, &cut, &ver);
+		known = ps_slru_tomb_cached(idx, &cut, &ver);
 		if (ver == 0)
 		{
 			cut = cached_cut;
 			ver = cached_ver;
 		}
 
-		if (w == 0)
+		if (!known && !cached_known && !ps_slru_mirror_enabled)
+		{
+			/* see the read hook: undecidable tombstone state fails closed */
+			res = SLRU_READ_HOOK_FAILED;
+		}
+		else if (w == 0)
 		{
 			/*
 			 * Same fail-closed rules as the read hook: existence callers
@@ -2426,7 +2496,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		 * threw -- re-read the shared cache, falling back to the pre-fetch
 		 * snapshot while an update is in flight.
 		 */
-		ps_slru_tomb_cached(idx, &cut, &ver);
+		(void) ps_slru_tomb_cached(idx, &cut, &ver);
 		if (ver == 0)
 			cut = cached_cut;
 
