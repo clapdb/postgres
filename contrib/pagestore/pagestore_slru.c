@@ -1137,6 +1137,15 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 		if (floor == 0)
 			continue;
 
+		/*
+		 * Order the owner reads after the floor read.  The claiming side
+		 * publishes pid/gen before the floor becomes nonzero (the floor
+		 * write is a full-barrier exchange), but without a read barrier
+		 * here a weakly ordered CPU could pair the fresh floor with stale
+		 * owner fields and misread a LIVE backend as dead.
+		 */
+		pg_read_barrier();
+
 		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
 		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
 		if (ps_slru_wm_pending_owner_matches(i, pid, gen))
@@ -1266,6 +1275,9 @@ ps_slru_wm_advance(void)
 		floor = pg_atomic_read_u64(&ps_slru_wm->pending[i].floor);
 		if (floor == 0)
 			continue;
+
+		pg_read_barrier();		/* owner reads after the floor read; see
+								 * the sweep */
 
 		/*
 		 * A floor whose owner is gone is a coverage loss no exit path
