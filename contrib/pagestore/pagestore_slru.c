@@ -2151,7 +2151,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 						iv > ver)
 					{
 						ps_slru_served_note(obj, (uint32) pageno,
-											Max(w, ver));
+											Max(w, iv));
 						res = SLRU_READ_HOOK_SERVED;
 					}
 					else
@@ -2265,10 +2265,25 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 					 * watermark advance.  See the revalidator.
 					 */
 					if (res != SLRU_READ_HOOK_FAILED)
-						ps_slru_served_note(obj, (uint32) pageno,
-											ps_slru_tomb_covers(ctl, pageno,
-																cutoff)
-											? Max(w, tombv) : w);
+					{
+						uint64		epoch = w;
+
+						if (ps_slru_tomb_covers(ctl, pageno, cutoff))
+						{
+							/*
+							 * A survivor (image outranking the tombstone)
+							 * is noted at its image version -- strictly
+							 * above tombv, so the revalidator's covered
+							 * <= tombv staleness test keeps it fresh
+							 * without a re-read per hit.
+							 */
+							if (have_image && iv > tombv)
+								epoch = Max(w, iv);
+							else
+								epoch = Max(w, tombv);
+						}
+						ps_slru_served_note(obj, (uint32) pageno, epoch);
+					}
 				}
 			}
 		}
@@ -2660,9 +2675,17 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 		return false;			/* unknown: one redundant re-read */
 	if (epoch < w)
 		return false;
+	/*
+	 * Covered pages go stale at epoch <= tombv, not <: an EQUAL-version
+	 * tombstone rewrite (accepted by ps_slru_tomb_note; the store resolves
+	 * same-position writes by arrival order) can widen the cutoff over a
+	 * page cached at exactly that epoch.  Pages that legitimately outrank
+	 * the tombstone are noted at their image's version, which is strictly
+	 * above it, so they stay fresh.
+	 */
 	if (tombc != 0 &&
 		ps_slru_tomb_covers(ctl, pageno, (int64) (tombc - 1)) &&
-		epoch < tombv)
+		epoch <= tombv)
 		return false;
 
 	return true;
