@@ -254,6 +254,16 @@ ps_slru_note_lost(void)
  * bits only the other writer's view carried.
  */
 #define PS_SLRU_READER_WM_TTL_MS	1000
+
+/*
+ * How long cached pages may keep revalidating against the last successfully
+ * fetched watermark/tombstones while fresh fetches keep failing.  Past this,
+ * the revalidator calls every cached page stale, forcing physical re-reads
+ * through the read hook's fail-closed paths -- a reader must not serve
+ * possibly-truncated pages on old metadata indefinitely just because the
+ * store is unreachable.
+ */
+#define PS_SLRU_READER_WM_STALE_MS	(3 * PS_SLRU_READER_WM_TTL_MS)
 #define PS_SLRU_SERVED_CAPACITY 1024	/* power of two */
 
 /* stats for tests/observability */
@@ -386,6 +396,11 @@ typedef struct PsSlruWatermarkShm
 	 */
 	pg_atomic_uint64 reader_wm;
 	pg_atomic_uint64 reader_wm_at;	/* TimestampTz of the last fetch */
+	pg_atomic_uint64 reader_wm_ok_at;	/* ... of the last SUCCESSFUL fetch:
+										 * failures re-arm the TTL (backoff)
+										 * but must not let cached pages
+										 * revalidate against stale
+										 * tombstones forever */
 	pg_atomic_uint64 tomb_cutoff[PS_SLRU_SCOPE_COUNT];	/* int64 cutoff + 1;
 														 * 0 = none known */
 	pg_atomic_uint64 tomb_version[PS_SLRU_SCOPE_COUNT];
@@ -846,6 +861,7 @@ ps_slru_shmem_startup(void)
 		}
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_at, 0);
+		pg_atomic_init_u64(&ps_slru_wm->reader_wm_ok_at, 0);
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
 		{
 			pg_atomic_init_u64(&ps_slru_wm->tomb_cutoff[i], 0);
@@ -1610,13 +1626,20 @@ ps_slru_reader_fetch_wm(void)
 		}
 
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
+		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, (uint64) now);
 	}
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(cxt);
 		ps_slru_rearm_interrupt();
 		FlushErrorState();
-		/* back off for a TTL, keep the old values */
+
+		/*
+		 * Back off for a TTL, keep the old values -- but only reader_wm_at:
+		 * reader_wm_ok_at stays put, so if failures persist past
+		 * PS_SLRU_READER_WM_STALE_MS the revalidator stops trusting cached
+		 * pages instead of serving them against stale tombstones forever.
+		 */
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
 	}
 	PG_END_TRY();
@@ -1712,6 +1735,9 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 
 	PG_TRY();
 	{
+		int64		cut;
+		uint64		ver;
+
 		/*
 		 * The watermark is the completeness floor, not a cap: any bit in
 		 * any shipped image is a durable commit (the writer ships only
@@ -1729,9 +1755,17 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * even when it returns no watermark (the writer can truncate while
 		 * still frozen/unprimed), so re-read the cache: the first read of a
 		 * just-retired page must not slip past the pre-fetch cutoff to a
-		 * stale local segment.
+		 * stale local segment.  Fresh locals, deliberately: cached_cut must
+		 * stay the untouched pre-setjmp snapshot the catch path can trust.
+		 * An in-flight concurrent update reads as none; keep the snapshot
+		 * as the floor then.
 		 */
-		ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+		ps_slru_tomb_cached(idx, &cut, &ver);
+		if (ver == 0)
+		{
+			cut = cached_cut;
+			ver = cached_ver;
+		}
 
 		if (w == 0)
 		{
@@ -1744,12 +1778,12 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 * advance independently of the watermark, so a cached one
 			 * still applies (memory only; no IPC here).
 			 */
-			if (pageno < cached_cut)
+			if (pageno < cut)
 				res = SLRU_READ_HOOK_FAILED;
 			else if (!ps_slru_mirror_enabled &&
 					 !ps_slru_local_page_exists(ctl, pageno))
 				res = SLRU_READ_HOOK_FAILED;
-			else if (cached_cut >= 0)
+			else if (cut >= 0)
 				ps_slru_served_note(obj, (uint32) pageno, 0);
 		}
 		else
@@ -1765,8 +1799,8 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			 * improve on it -- if the lookup fails, a tombstone another
 			 * backend already saw must still apply.
 			 */
-			cutoff = cached_cut;
-			tombv = cached_ver;
+			cutoff = cut;
+			tombv = ver;
 			ps_slru_obj_key(&key, obj);
 			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
 													   &key, 0, PG_UINT64_MAX,
@@ -1848,6 +1882,9 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	}
 	PG_CATCH();
 	{
+		int64		cut;
+		uint64		ver;
+
 		MemoryContextSwitchTo(cxt);
 		ps_slru_rearm_interrupt();
 		FlushErrorState();
@@ -1856,9 +1893,17 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * A store failure mid-read must not resurrect a page the cached
 		 * tombstone already retired: fail closed rather than fall back to
 		 * a stale local segment.  (The newer-image override needs working
-		 * IPC by definition; without it, dead is dead.)
+		 * IPC by definition; without it, dead is dead.)  The failed attempt
+		 * may itself have fetched and published a newer tombstone before
+		 * the lookup that threw, so re-read the shared cache and honor what
+		 * this very read learned; an in-flight concurrent update reads as
+		 * none, and the pre-fetch snapshot is the floor then.
 		 */
-		if (pageno < cached_cut ||
+		ps_slru_tomb_cached(idx, &cut, &ver);
+		if (ver == 0)
+			cut = cached_cut;
+
+		if (pageno < cut ||
 			(RecoveryInProgress() &&
 			 !ps_slru_local_page_exists(ctl, pageno)))
 			res = SLRU_READ_HOOK_FAILED;
@@ -1906,11 +1951,24 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 
 	PG_TRY();
 	{
+		int64		cut;
+		uint64		ver;
+
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
 
-		/* see the read hook: the fetch may have advanced the tombstone cache */
-		ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+		/*
+		 * See the read hook: the fetch may have advanced the tombstone
+		 * cache.  Fresh locals so cached_cut stays the pre-setjmp snapshot
+		 * for the catch path; an in-flight update reads as none, keep the
+		 * snapshot then.
+		 */
+		ps_slru_tomb_cached(idx, &cut, &ver);
+		if (ver == 0)
+		{
+			cut = cached_cut;
+			ver = cached_ver;
+		}
 
 		if (w == 0)
 		{
@@ -1923,7 +1981,7 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			 * state the mirror holds.  A cached tombstone answers
 			 * definitively.
 			 */
-			if (pageno < cached_cut)
+			if (pageno < cut)
 			{
 				*exists = false;
 				res = SLRU_READ_HOOK_SERVED;
@@ -1939,8 +1997,8 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			int64		cutoff;
 			uint64		tombv;
 
-			cutoff = cached_cut;
-			tombv = cached_ver;
+			cutoff = cut;
+			tombv = ver;
 			ps_slru_obj_key(&key, obj);
 			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
 													   &key, 0, PG_UINT64_MAX,
@@ -1983,12 +2041,24 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	}
 	PG_CATCH();
 	{
+		int64		cut;
+		uint64		ver;
+
 		MemoryContextSwitchTo(cxt);
 		ps_slru_rearm_interrupt();
 		FlushErrorState();
 
-		/* see the read hook: a cached tombstone outlives a store failure */
-		if (pageno < cached_cut)
+		/*
+		 * See the read hook: a cached tombstone outlives a store failure,
+		 * including one this very attempt fetched before the lookup that
+		 * threw -- re-read the shared cache, falling back to the pre-fetch
+		 * snapshot while an update is in flight.
+		 */
+		ps_slru_tomb_cached(idx, &cut, &ver);
+		if (ver == 0)
+			cut = cached_cut;
+
+		if (pageno < cut)
 		{
 			*exists = false;
 			res = SLRU_READ_HOOK_SERVED;
@@ -2048,12 +2118,49 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 	 * while it is zero (an unprimed/frozen writer still ships truncation
 	 * tombstones); only when NEITHER has ever been fetched is every
 	 * cached page local truth.
+	 *
+	 * The cutoff/version pair must be read STABLY (same discipline as
+	 * ps_slru_tomb_cached): reading them independently can pair the old
+	 * cutoff with a just-landed newer version, and a page the new cutoff
+	 * retires would keep revalidating -- a cache hit never runs the read
+	 * hook, so nothing else would catch it.  An in-flight update counts as
+	 * stale: one redundant re-read, never a stale answer.
 	 */
 	w = pg_atomic_read_u64(&ps_slru_wm->reader_wm);
-	tombc = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
-	tombv = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+	for (;;)
+	{
+		uint64		v2;
+
+		tombv = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+		if (tombv == PG_UINT64_MAX)
+			return false;		/* update in flight: treat as stale */
+		tombc = pg_atomic_read_u64(&ps_slru_wm->tomb_cutoff[idx]);
+		pg_memory_barrier();
+		v2 = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
+		if (tombv == v2)
+			break;
+		if (v2 == PG_UINT64_MAX)
+			return false;
+	}
 	if (w == 0 && tombc == 0)
 		return true;			/* no fetch ever: nothing was mirror-served */
+
+	/*
+	 * The watermark and tombstones above are only as fresh as the last
+	 * SUCCESSFUL fetch.  If fetches have been failing past the staleness
+	 * bound, stop trusting cached pages: the writer may have truncated
+	 * since, and serving cache hits against old tombstones would resurrect
+	 * retired pages for as long as the store stays unreachable.
+	 */
+	{
+		uint64		ok_at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_ok_at);
+
+		if (ok_at == 0 ||
+			TimestampDifferenceExceeds((TimestampTz) ok_at,
+									   GetCurrentTimestamp(),
+									   PS_SLRU_READER_WM_STALE_MS))
+			return false;
+	}
 
 	if (!ps_slru_served_epoch(obj, (uint32) pageno, &epoch))
 		return false;			/* unknown: one redundant re-read */
