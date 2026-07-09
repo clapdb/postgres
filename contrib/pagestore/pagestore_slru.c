@@ -84,6 +84,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "replication/message.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -3273,6 +3274,18 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	pg_atomic_write_u64(&ps_slru_wm->candidate_floor,
 						(uint64) ps_slru_now_lsn());
 	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
+
+	/*
+	 * Nudge WAL past the floor.  A checkpoint issued right after this reset
+	 * on an otherwise idle system would have its redo exactly AT the floor
+	 * and be rejected -- equality cannot be admitted (a checkpoint already
+	 * in flight during the reset samples the same position, and it may
+	 * vouch for pre-priming losses), so make the very next checkpoint start
+	 * strictly above the floor instead of waiting for organic traffic.
+	 */
+	if (!RecoveryInProgress())
+		(void) LogLogicalMessage("pagestore_slru_mirror_reset_debt", "", 0,
+								 false, false);
 
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
 		!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
