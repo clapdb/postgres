@@ -2318,10 +2318,38 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 				 * image would outrank the tombstone, and the lookup that
 				 * would say so is exactly what keeps failing): a false
 				 * answer would let existence callers zero-create over
-				 * mirror-only state, so fail closed instead.
+				 * mirror-only state, so fail closed instead.  And even a
+				 * FRESH fetch only proves the tombstone current, not the
+				 * absence of a newer image -- a frozen/unprimed writer can
+				 * reset commit-ts (tombstone) and reactivate it (image)
+				 * with the watermark still zero -- so probe for one before
+				 * a definitive negative, same outranking rule as the
+				 * w != 0 path.
 				 */
-				if (!ps_slru_mirror_enabled && !ps_slru_reader_fetch_fresh())
-					res = SLRU_READ_HOOK_FAILED;
+				if (!ps_slru_mirror_enabled)
+				{
+					PageStoreRelKey key = {0};
+					char		tpage[BLCKSZ];
+					uint64		iv = 0;
+
+					if (!ps_slru_reader_fetch_fresh())
+						res = SLRU_READ_HOOK_FAILED;
+					else
+					{
+						ps_slru_obj_key(&key, obj);
+						if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE,
+																   &key,
+																   (BlockNumber) pageno,
+																   PG_UINT64_MAX,
+																   tpage, &iv,
+																   PS_SLRU_SHIP_TIMEOUT_MS) &&
+							iv > ver)
+							*exists = true;
+						else
+							*exists = false;
+						res = SLRU_READ_HOOK_SERVED;
+					}
+				}
 				else
 				{
 					*exists = false;
