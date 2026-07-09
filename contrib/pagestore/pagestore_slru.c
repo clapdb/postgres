@@ -109,6 +109,7 @@ static bool pagestore_slru_live_reads = false;
 static bool ps_slru_mirror_enabled = false;
 static bool ps_slru_live_reads_enabled = false;
 static slru_page_write_hook_type prev_slru_page_write_hook = NULL;
+static slru_truncate_hook_type prev_slru_truncate_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
@@ -485,10 +486,11 @@ ps_slru_commit_ts_page(TransactionId xid)
 }
 
 static bool
-ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
+ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff, bool *skip)
 {
 	const char *dir = ps_slru_dirmap[idx].dir;
 
+	*skip = false;
 	if (strcmp(dir, "pg_xact") == 0)
 	{
 		*cutoff = ps_slru_xid_page(TransamVariables->oldestClogXid);
@@ -514,8 +516,18 @@ ps_slru_tomb_horizon_cutoff(int idx, int64 *cutoff)
 						 &oldestOffset);
 		if (strcmp(dir, "pg_multixact/offsets") == 0)
 		{
+			/*
+			 * oldestMulti == FirstMultiXactId is ambiguous: a space that has
+			 * never been truncated (cutoff 0 would be right), or a wrapped
+			 * one whose true cutoff is a high page (the truncation path's
+			 * PreviousMultiXactId(oldestMulti) wraps to the top of the id
+			 * space).  A linear cutoff cannot express the wrapped case, and
+			 * publishing 0 at a newer version would supersede the standing
+			 * tombstone and resurrect retired high pages.  Publish nothing;
+			 * whatever tombstone already exists stays authoritative.
+			 */
 			if (oldestMulti == FirstMultiXactId)
-				*cutoff = 0;
+				*skip = true;
 			else
 				*cutoff = MultiXactIdToOffsetPage(oldestMulti - 1);
 		}
@@ -2104,16 +2116,16 @@ static bool ps_slru_tomb_covered_set[lengthof(ps_slru_dirmap)];
 
 /*
  * Re-derive tombstones from local truth.  Part of priming
- * (pagestore_slru_mirror_reset_debt): the multixact pre-barrier ships its
- * tombstone before the truncation's WAL record can exist, so a crash in
- * that window leaves a durable tombstone for a truncation that never
- * happened -- pages that are live locally read as dead in the mirror.
- * Every such crash is boot debt, and priming is its mandated repair: for
- * each in-scope SLRU, publish its current horizon page.  That preserves
- * page-granular cutoffs when the first retained segment is only partially
- * live.  The directory scan is still useful as an error check (an unreadable
- * directory must abort priming) and as a fallback for any future in-scope
- * SLRU without a known horizon.
+ * (pagestore_slru_mirror_reset_debt): a coverage loss may include a lost or
+ * stale tombstone (an unclean death between a truncation's WAL record and
+ * its barrier, or a barrier failure eaten as a loss), so pages that are
+ * dead locally could still read as live in the mirror, or vice versa.
+ * Priming is the mandated repair: for each in-scope SLRU, publish its
+ * current horizon page.  That preserves page-granular cutoffs when the
+ * first retained segment is only partially live.  The directory scan is
+ * still useful as an error check (an unreadable directory must abort
+ * priming) and as a fallback for any future in-scope SLRU without a known
+ * horizon.
  */
 static void
 ps_slru_tomb_rederive(void)
@@ -2141,6 +2153,7 @@ ps_slru_tomb_rederive(void)
 			struct dirent *de;
 			int64		minseg = -1;
 			int64		cutoff;
+			bool		skip = false;
 			bool		commit_ts = strcmp(ps_slru_dirmap[i].dir,
 										   "pg_commit_ts") == 0;
 
@@ -2170,12 +2183,15 @@ ps_slru_tomb_rederive(void)
 			}
 			FreeDir(dir);
 
-			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff))
+			if (!ps_slru_tomb_horizon_cutoff(i, &cutoff, &skip))
 				cutoff = (minseg < 0) ? PG_INT64_MAX
 					: minseg * SLRU_PAGES_PER_SEGMENT;
-			ps_slru_tomb_covered_set[i] = false;
-			ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
-								   ps_slru_now_lsn());
+			if (!skip)
+			{
+				ps_slru_tomb_covered_set[i] = false;
+				ps_slru_ship_tombstone(ps_slru_dirmap[i].obj, cutoff,
+									   ps_slru_now_lsn());
+			}
 			if (commit_ts)
 			{
 				LWLockRelease(CommitTsLock);
@@ -2232,6 +2248,9 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	XLogRecPtr	version;
 	volatile bool shipped = false;
 
+	if (prev_slru_truncate_hook)
+		(*prev_slru_truncate_hook) (ctl, cutoffPage, lsn);
+
 	idx = ps_slru_dir_index(ctl->options.Dir);
 	if (idx < 0)
 		return;					/* out-of-scope SLRU: not mirrored */
@@ -2271,7 +2290,14 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 	 * publish its own pending floor: without one, another backend's
 	 * checkpoint could advance the watermark past the truncation record
 	 * while this tombstone is still in flight, and a reader would trust
-	 * the mirror for an LSN whose truncation it cannot see yet.
+	 * the mirror for an LSN whose truncation it cannot see yet.  On
+	 * success the floor is deliberately NOT republished here: one truncate
+	 * record can require several tombstones (multixact covers members and
+	 * offsets with two barrier calls at the same trunc_lsn), and clearing
+	 * the floor after the first would let another backend publish the
+	 * record's redo while the second is still unshipped.  The floor stays
+	 * pinned until this process's next drain recomputes it -- a short
+	 * watermark delay, never a wrong answer.
 	 */
 	ps_slru_wm_note_pending(version);
 
@@ -2314,8 +2340,6 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 				(errmsg("pagestore: could not ship an SLRU truncation tombstone; the live mirror watermark is frozen")));
 	}
 	PG_END_TRY();
-
-	ps_slru_wm_republish_pending();
 
 	if (shipped && cutoffPage != PG_INT64_MAX)
 	{
@@ -3556,6 +3580,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 		ps_slru_register_exit_drain();
 		prev_slru_page_write_hook = slru_page_write_hook;
 		slru_page_write_hook = ps_slru_write_hook;
+		prev_slru_truncate_hook = slru_truncate_hook;
 		slru_truncate_hook = ps_slru_truncate_hook;
 		prev_ExecutorEnd_hook = ExecutorEnd_hook;
 		ExecutorEnd_hook = ps_slru_executor_end;
