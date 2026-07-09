@@ -2241,15 +2241,20 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 				{
 					if (have_image)
 						res = SLRU_READ_HOOK_SERVED;
-					else if (RecoveryInProgress() &&
+					else if (!ps_slru_mirror_enabled &&
+							 RecoveryInProgress() &&
 							 !ps_slru_local_page_exists(ctl, pageno))
 					{
 						/*
-						 * No image AND no local segment while in recovery:
-						 * the local fallback would fabricate an all-zero
-						 * page (SlruPhysicalReadPage treats ENOENT as
-						 * zeros under InRecovery), silently erasing
-						 * status.  Fail closed instead.
+						 * No image AND no local segment while in recovery
+						 * ON A CONSUMER: the local fallback would fabricate
+						 * an all-zero page (SlruPhysicalReadPage treats
+						 * ENOENT as zeros under InRecovery), silently
+						 * erasing status the mirror is the authority for.
+						 * The mirror's own WRITER must keep the fallback:
+						 * its crash recovery legitimately synthesizes
+						 * zeros for pages whose segments it truncated, and
+						 * failing here would block startup.
 						 */
 						res = SLRU_READ_HOOK_FAILED;
 					}
@@ -2320,9 +2325,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			cut = cached_cut;
 
 		if (!ps_slru_mirror_enabled ||
-			ps_slru_tomb_covers(ctl, pageno, cut) ||
-			(RecoveryInProgress() &&
-			 !ps_slru_local_page_exists(ctl, pageno)))
+			ps_slru_tomb_covers(ctl, pageno, cut))
 			res = SLRU_READ_HOOK_FAILED;
 		else
 			res = SLRU_READ_HOOK_FALLBACK;
