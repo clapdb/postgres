@@ -1014,6 +1014,19 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	 */
 	{
 		XLogRecPtr	trunc_lsn;
+		bool		barrier_ok;
+
+		/*
+		 * The pre-barrier (and its slot discard) only run when
+		 * SimpleLruTruncate()'s apparent-wraparound backstop is not going
+		 * to refuse the truncation: a refused truncation must not durably
+		 * declare its range dead, and discarding dirty resident pages --
+		 * potentially the current endpoint -- for a truncation that then
+		 * deletes nothing would simply lose those updates.
+		 */
+		barrier_ok = slru_truncate_hook &&
+			!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
+										   cutoffPage);
 
 		/*
 		 * Hold off checkpoint starts from the truncate record until the
@@ -1037,7 +1050,7 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 			 * slots emptied first, any capture of a doomed page is bounded
 			 * below trunc_lsn.
 			 */
-			if (slru_truncate_hook)
+			if (barrier_ok)
 				SimpleLruDiscardCutoff(XactCtl, cutoffPage);
 
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
@@ -1049,16 +1062,11 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 			 * position (an as-of reader between the two would have the
 			 * record in its history but see no tombstone).  Run the barrier
 			 * here with that LSN; SimpleLruTruncate()'s own hook call then
-			 * finds the cutoff covered and no-ops.  Skip it when
-			 * SimpleLruTruncate()'s apparent-wraparound backstop is going
-			 * to refuse the truncation -- a refused truncation must not
-			 * durably declare its range dead (should the state change in
-			 * between, the in-truncate hook call runs uncovered and ships
-			 * with a sampled position).
+			 * finds the cutoff covered and no-ops.  (Should the wraparound
+			 * state change in between, the in-truncate hook call runs
+			 * uncovered and ships with a sampled position.)
 			 */
-			if (slru_truncate_hook &&
-				!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
-											   cutoffPage))
+			if (barrier_ok)
 				(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
 		}
 		PG_CATCH();
