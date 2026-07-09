@@ -1721,6 +1721,24 @@ ps_slru_reader_fetch_wm(void)
 }
 
 /*
+ * Was the last SUCCESSFUL watermark/tombstone fetch recent enough to trust?
+ * Distinguishes "the store is reachable and simply has no watermark yet"
+ * (a consumer may serve its seed-baseline local files) from "the store is
+ * unreachable" (a consumer must fail closed: the writer may have published
+ * newer status or truncations it cannot see).
+ */
+static bool
+ps_slru_reader_fetch_fresh(void)
+{
+	uint64		ok_at = pg_atomic_read_u64(&ps_slru_wm->reader_wm_ok_at);
+
+	return ok_at != 0 &&
+		!TimestampDifferenceExceeds((TimestampTz) ok_at,
+									GetCurrentTimestamp(),
+									PS_SLRU_READER_WM_STALE_MS);
+}
+
+/*
  * Does a tombstone at 'cutoff' cover 'pageno'?  Coverage is MODULAR, by the
  * same PagePrecedes relation local truncation deletes with: a numeric
  * pageno < cutoff test would stop covering pre-wrap high pages the moment a
@@ -1872,8 +1890,18 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 			if (ps_slru_tomb_covers(ctl, pageno, cut))
 				res = SLRU_READ_HOOK_FAILED;
 			else if (!ps_slru_mirror_enabled &&
-					 !ps_slru_local_page_exists(ctl, pageno))
+					 (!ps_slru_reader_fetch_fresh() ||
+					  !ps_slru_local_page_exists(ctl, pageno)))
+			{
+				/*
+				 * On a pure consumer, w == 0 is only safe to serve from the
+				 * seed-baseline local files when a RECENT successful fetch
+				 * proves the store reachable and genuinely watermark-less;
+				 * a fetch outage read as "no watermark" would otherwise
+				 * quietly downgrade live reads to stale local status.
+				 */
 				res = SLRU_READ_HOOK_FAILED;
+			}
 			else if (cut >= 0)
 				ps_slru_served_note(obj, (uint32) pageno, 0);
 		}
@@ -2098,8 +2126,9 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 				res = SLRU_READ_HOOK_SERVED;
 			}
 			else if (!ps_slru_mirror_enabled &&
-					 !ps_slru_local_page_exists(ctl, pageno))
-				res = SLRU_READ_HOOK_FAILED;
+					 (!ps_slru_reader_fetch_fresh() ||
+					  !ps_slru_local_page_exists(ctl, pageno)))
+				res = SLRU_READ_HOOK_FAILED;	/* see the read hook */
 		}
 		else
 		{
