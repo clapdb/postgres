@@ -1321,7 +1321,8 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 
 	/*
 	 * Version by the exact truncation record when the caller supplied it
-	 * (the TruncateCLOG/TruncateCommitTs pre-barriers); sample otherwise.
+	 * (the TruncateCLOG/TruncateCommitTs/TruncateMultiXact pre-barriers);
+	 * sample otherwise.
 	 */
 	version = XLogRecPtrIsInvalid(lsn) ? ps_slru_now_lsn() : lsn;
 

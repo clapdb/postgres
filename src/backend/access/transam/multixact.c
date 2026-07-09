@@ -340,9 +340,9 @@ static void ExtendMultiXactOffset(MultiXactId multi);
 static void ExtendMultiXactMember(MultiXactOffset offset, int nmembers);
 static void SetOldestOffset(void);
 static bool find_multixact_start(MultiXactId multi, MultiXactOffset *result);
-static void WriteMTruncateXlogRec(Oid oldestMultiDB,
-								  MultiXactId oldestMulti,
-								  MultiXactOffset oldestOffset);
+static XLogRecPtr WriteMTruncateXlogRec(Oid oldestMultiDB,
+										MultiXactId oldestMulti,
+										MultiXactOffset oldestOffset);
 
 
 /*
@@ -2681,6 +2681,7 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	MultiXactId nextMulti;
 	MultiXactOffset newOldestOffset;
 	MultiXactOffset nextOffset;
+	XLogRecPtr	trunc_lsn;
 
 	Assert(!RecoveryInProgress());
 	Assert(MultiXactState->finishedStartup);
@@ -2755,44 +2756,66 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 		 MXOffsetToMemberSegment(newOldestOffset));
 
 	/*
-	 * Give a page-store mirror its truncation barrier BEFORE entering the
-	 * critical section: the hook may perform synchronous store I/O and may
-	 * raise an error, both unacceptable once critical (an ERROR there
-	 * escalates to PANIC).  An error here abandons the truncation with
-	 * nothing removed yet -- retried by a later vacuum, like any other
-	 * truncate failure.  The SimpleLruTruncate() calls below invoke the
-	 * hook again with the same cutoffs, by then inside the critical
-	 * section; the hook sees them already covered and reduces to a no-op.
-	 */
-	if (slru_truncate_hook)
-	{
-		(*slru_truncate_hook) (MultiXactMemberCtl,
-							   MXOffsetToMemberPage(newOldestOffset),
-							   InvalidXLogRecPtr);
-		(*slru_truncate_hook) (MultiXactOffsetCtl,
-							   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)),
-							   InvalidXLogRecPtr);
-	}
-
-	/*
-	 * Do truncation, and the WAL logging of the truncation, in a critical
-	 * section. That way offsets/members cannot get out of sync anymore, i.e.
-	 * once consistent the newOldestMulti will always exist in members, even
-	 * if we crashed in the wrong moment.
-	 */
-	START_CRIT_SECTION();
-
-	/*
 	 * Prevent checkpoints from being scheduled concurrently. This is critical
 	 * because otherwise a truncation record might not be replayed after a
 	 * crash/basebackup, even though the state of the data directory would
-	 * require it.
+	 * require it.  Taken before the WAL record below (rather than inside the
+	 * critical section, as before the page-store barrier existed) because
+	 * the record is now separated from the truncation by the barrier.
 	 */
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
-	/* WAL log truncation */
-	WriteMTruncateXlogRec(newOldestMultiDB, newOldestMulti, newOldestOffset);
+	/*
+	 * WAL-log the truncation before the page-store barrier, so the barrier
+	 * can version its tombstones by the exact truncate record -- a sampled
+	 * pre-record position would let as-of readers between the two see a
+	 * tombstone whose WAL history holds no truncation, and a crash after a
+	 * synced tombstone but before the record would leave a durable tombstone
+	 * ahead of the replayed WAL, killing still-live pages (TruncateCLOG and
+	 * TruncateCommitTs order theirs the same way).
+	 */
+	trunc_lsn = WriteMTruncateXlogRec(newOldestMultiDB, newOldestMulti,
+									  newOldestOffset);
+
+	/*
+	 * Give a page-store mirror its truncation barrier BEFORE entering the
+	 * critical section: the hook may perform synchronous store I/O and may
+	 * raise an error, both unacceptable once critical (an ERROR there
+	 * escalates to PANIC).  An error here abandons the local truncation with
+	 * nothing removed yet -- retried by a later vacuum, like any other
+	 * truncate failure; the truncate record is already out, but replaying it
+	 * re-runs this barrier.  The SimpleLruTruncate() calls below invoke the
+	 * hook again with the same cutoffs, by then inside the critical
+	 * section; the hook sees them already covered and reduces to a no-op.
+	 * The checkpoint-delay flag must not leak if the barrier throws.
+	 */
+	if (slru_truncate_hook)
+	{
+		PG_TRY();
+		{
+			(*slru_truncate_hook) (MultiXactMemberCtl,
+								   MXOffsetToMemberPage(newOldestOffset),
+								   trunc_lsn);
+			(*slru_truncate_hook) (MultiXactOffsetCtl,
+								   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)),
+								   trunc_lsn);
+		}
+		PG_CATCH();
+		{
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+
+	/*
+	 * Do the truncation in a critical section.  That way offsets/members
+	 * cannot get out of sync anymore, i.e. once consistent the
+	 * newOldestMulti will always exist in members, even if we crashed in
+	 * the wrong moment.
+	 */
+	START_CRIT_SECTION();
 
 	/*
 	 * Update in-memory limits before performing the truncation, while inside
@@ -2910,7 +2933,7 @@ MultiXactIdPrecedesOrEquals(MultiXactId multi1, MultiXactId multi2)
  * We must flush the xlog record to disk before returning --- see notes in
  * TruncateCLOG().
  */
-static void
+static XLogRecPtr
 WriteMTruncateXlogRec(Oid oldestMultiDB,
 					  MultiXactId oldestMulti,
 					  MultiXactOffset oldestOffset)
@@ -2926,6 +2949,7 @@ WriteMTruncateXlogRec(Oid oldestMultiDB,
 	XLogRegisterData(&xlrec, SizeOfMultiXactTruncate);
 	recptr = XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID);
 	XLogFlush(recptr);
+	return recptr;
 }
 
 /*
