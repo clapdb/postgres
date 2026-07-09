@@ -2209,6 +2209,7 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 	bool		tomb_valid[lengthof(ps_slru_dirmap)] = {false};
 	int64		tomb_cut[lengthof(ps_slru_dirmap)] = {0};
 	uint64		tomb_ver[lengthof(ps_slru_dirmap)] = {0};
+	volatile bool commit_ts_locked = false;
 
 	if (ps_slru_recap_count <= 0)
 		return false;
@@ -2240,6 +2241,7 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		XLogRecPtr	fence;
 		XLogRecPtr	bound;
 		int			idx;
+		bool		commit_ts_entry;
 
 		if (!r->used)
 			continue;
@@ -2268,22 +2270,53 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * the decision to the next drain.
 		 */
 		idx = ps_slru_dir_index(r->ctl->options.Dir);
-		if (idx >= 0 && !tomb_known[idx])
+
+		/*
+		 * pg_commit_ts recaptures additionally hold CommitTsLock (shared)
+		 * across the probe and re-snapshot: DeactivateCommitTs() runs under
+		 * it exclusively, and without the interlock a recapture could probe
+		 * before its delete-all tombstone lands, then read the not-yet-
+		 * unlinked segment bytes and ship them at a post-tombstone version,
+		 * resurrecting reset timestamps.  The probe under this lock uses a
+		 * SHORT timeout -- commits update xidLastCommit under the same lock,
+		 * and a full ship timeout here would stall them; on a miss the
+		 * entry just waits for the next drain.
+		 */
+		commit_ts_entry = (idx >= 0 &&
+						   strcmp(ps_slru_dirmap[idx].dir,
+								  "pg_commit_ts") == 0);
+		if (commit_ts_entry)
+		{
+			LWLockAcquire(CommitTsLock, LW_SHARED);
+			commit_ts_locked = true;
+		}
+
+		if (idx >= 0 && (!tomb_known[idx] || commit_ts_entry))
 		{
 			PageStoreRelKey key = {0};
 			char		tpage[BLCKSZ];
 			uint64		resolved = 0;
 
 			tomb_known[idx] = true;
+			tomb_valid[idx] = false;
 			ps_slru_obj_key(&key, r->obj);
 			if (pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_TOMB,
 													   &key, 0, PG_UINT64_MAX,
 													   tpage, &resolved,
-													   PS_SLRU_SHIP_TIMEOUT_MS))
+													   commit_ts_entry
+													   ? 2000
+													   : PS_SLRU_SHIP_TIMEOUT_MS))
 			{
 				memcpy(&tomb_cut[idx], tpage, sizeof(int64));
 				tomb_ver[idx] = resolved;
 				tomb_valid[idx] = true;
+			}
+			else if (commit_ts_entry)
+			{
+				/* no fresh in-lock probe: do not ship this entry now */
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+				continue;
 			}
 		}
 		if (idx >= 0 && tomb_valid[idx] &&
@@ -2299,6 +2332,11 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 			 */
 			r->used = false;
 			ps_slru_recap_count--;
+			if (commit_ts_entry)
+			{
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+			}
 			continue;
 		}
 
@@ -2309,9 +2347,23 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * are declared lost.
 		 */
 		if (ps_slru_queue_holds_posted(r->obj, r->pageno))
+		{
+			if (commit_ts_entry)
+			{
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+			}
 			continue;
+		}
 		if (!ps_slru_recapture_page(r, image, &fence, &bound))
+		{
+			if (commit_ts_entry)
+			{
+				LWLockRelease(CommitTsLock);
+				commit_ts_locked = false;
+			}
 			continue;			/* keep for the next drain */
+		}
 
 		/*
 		 * Re-stage with the snapshot's own in-lock bound -- routing through
@@ -2319,6 +2371,11 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * these (possibly stale) bytes past a newer concurrent capture's.
 		 */
 		ps_slru_stage_reserved(r->ctl, r->obj, r->pageno, image, fence, bound);
+		if (commit_ts_entry)
+		{
+			LWLockRelease(CommitTsLock);
+			commit_ts_locked = false;
+		}
 		r->used = false;
 		ps_slru_recap_count--;
 		staged = true;
@@ -2331,6 +2388,8 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * The drain's own catch swallows the error and keeps running, so
 		 * these must be released here rather than left to abort cleanup.
 		 */
+		if (commit_ts_locked)
+			LWLockRelease(CommitTsLock);
 		LWLockRelease(MultiXactTruncationLock);
 		LWLockRelease(WrapLimitsVacuumLock);
 		PG_RE_THROW();
