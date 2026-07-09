@@ -915,6 +915,16 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 							   BlockNumber block, uint64 version, void *page,
 							   uint64 *resolved)
 {
+	return pagestore_localsvc_obj_read_at_timeout(klass, key, block, version,
+												 page, resolved, 0);
+}
+
+bool
+pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
+									   BlockNumber block, uint64 version,
+									   void *page, uint64 *resolved,
+									   int timeout_ms)
+{
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 	bool		found;
 
@@ -923,7 +933,7 @@ pagestore_localsvc_obj_read_at(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = version;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 	memcpy(page, ch->data, BLCKSZ);
 	found = ch->result != 0;
 	if (resolved)
