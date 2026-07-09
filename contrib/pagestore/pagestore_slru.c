@@ -190,6 +190,7 @@ static XLogRecPtr ps_slru_now_lsn(void);
 static bool ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out);
 static void ps_slru_debt_persist(void);
 static void ps_slru_wm_note_lost(void);
+static void ps_slru_wm_note_lost_count(uint64 n, bool new_loss);
 static bool ps_slru_wm_claim_pending_slot(void);
 
 /*
@@ -590,15 +591,22 @@ ps_slru_wm_note_pending(XLogRecPtr fence)
 }
 
 static void
-ps_slru_wm_note_lost(void)
+ps_slru_wm_note_lost_count(uint64 n, bool new_loss)
 {
 	if (ps_slru_wm != NULL)
 	{
+		if (new_loss)
+			pg_atomic_fetch_add_u64(&ps_slru_wm->loss_generation, 1);
+		pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, n);
+		pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, n);
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-		pg_atomic_fetch_add_u64(&ps_slru_wm->loss_generation, 1);
-		pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, 1);
-		pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, 1);
 	}
+}
+
+static void
+ps_slru_wm_note_lost(void)
+{
+	ps_slru_wm_note_lost_count(1, true);
 }
 
 static bool
@@ -715,6 +723,8 @@ ps_slru_debt_persist(void)
 					}
 				}
 				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+				if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+					pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 			}
 			else if (generation == pg_atomic_read_u64(&ps_slru_wm->debt_generation))
 				pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
@@ -728,7 +738,7 @@ ps_slru_debt_persist(void)
 }
 
 static bool
-ps_slru_wm_sweep_dead_pending(bool persist)
+ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 {
 	bool		found = false;
 
@@ -748,7 +758,7 @@ ps_slru_wm_sweep_dead_pending(bool persist)
 		if (ps_slru_wm_pending_owner_matches(i, pid, gen))
 			continue;
 
-		ps_slru_wm_note_lost();
+		ps_slru_wm_note_lost_count(1, new_loss);
 		pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
 		pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
@@ -806,17 +816,18 @@ ps_slru_wm_advance(void)
 
 	if (ps_slru_wm == NULL)
 		return;
+
+	/*
+	 * Sweep inherited dead-owner floors before any early return.  A dead
+	 * pending floor is a real coverage loss even while no checkpoint candidate
+	 * is available yet, and must become persistent debt before a clean shutdown
+	 * can forget it.
+	 */
+	ps_slru_wm_sweep_dead_pending(true, true);
+
 	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
 	if (cand == 0)
 		return;
-
-	/*
-	 * Sweep inherited dead-owner floors before honoring existing debt.
-	 * Otherwise an already-frozen mirror can carry a stale pending slot
-	 * through reset_debt() and immediately recreate the debt afterwards.
-	 */
-	ps_slru_wm_sweep_dead_pending(true);
-
 	/*
 	 * Any loss, ever -- including the boot debt of an unclean previous life
 	 * -- freezes the watermark for good: the missing image's page is clean
@@ -850,7 +861,7 @@ ps_slru_wm_advance(void)
 		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
 		if (!ps_slru_wm_pending_owner_matches(i, pid, gen))
 		{
-			ps_slru_wm_note_lost();
+			ps_slru_wm_note_lost_count(1, true);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
 			pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
@@ -1640,11 +1651,7 @@ ps_slru_exit_drain(int code, Datum arg)
 
 		ps_slru_lost += n;
 		if (ps_slru_wm != NULL)
-		{
-			pg_atomic_fetch_add_u64(&ps_slru_wm->total_lost, n);
-			pg_atomic_fetch_add_u64(&ps_slru_wm->stats_lost, n);
-			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-		}
+			ps_slru_wm_note_lost_count(n, true);
 		ereport(WARNING,
 				(errmsg("pagestore: exiting with %d unshipped SLRU image(s); the live mirror is missing them",
 						n)));
@@ -1735,15 +1742,17 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("the SLRU mirror is not active")));
 
-	/*
-	 * Fold any dead-owner pending floors into the loss count before taking
-	 * the reset snapshot.  The operator is declaring the mirror whole as of
-	 * this call, so these inherited stale slots must be forgiven by this
-	 * reset, not rediscovered immediately after it.
-	 */
-	(void) ps_slru_wm_sweep_dead_pending(false);
-	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 	loss_generation = pg_atomic_read_u64(&ps_slru_wm->loss_generation);
+
+	/*
+	 * Fold any dead-owner pending floors into the loss count before taking the
+	 * debt snapshot.  The operator is declaring the mirror whole as of this
+	 * call, so these inherited stale slots must be forgiven by this reset, not
+	 * rediscovered immediately after it.  This sweep intentionally does not
+	 * advance loss_generation; any concurrent new loss still does.
+	 */
+	(void) ps_slru_wm_sweep_dead_pending(false, false);
+	lost = pg_atomic_read_u64(&ps_slru_wm->total_lost);
 
 	/*
 	 * Priming and forgiving are one act: the operator declares the mirror
@@ -1791,13 +1800,6 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 */
 	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
-	/*
-	 * The flag is cleared before the CAS.  A racing loss sets the flag and
-	 * advances loss_generation before incrementing total_lost, so the
-	 * generation check below catches it even if the total_lost CAS would not.
-	 * If either check fails the flag is restored and persisted immediately.
-	 */
-	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
 		!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
 	{
@@ -1806,6 +1808,49 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 		 * re-create it here and now, not merely re-flag it -- this backend
 		 * may never drain again before a clean shutdown.
 		 */
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ps_slru_debt_persist();
+		ereport(ERROR,
+				(errmsg("a new SLRU mirror loss arrived during the reset"),
+				 errhint("Re-prime the mirror and retry.")));
+	}
+
+	/*
+	 * An old ps_slru_debt_persist() may have sampled the previous
+	 * debt_generation and recreated the marker after the first unlink, while
+	 * total_lost was still nonzero.  Remove it once more after the debt CAS;
+	 * any persister that runs after this point will see total_lost == 0 and
+	 * clean up its own marker write.
+	 */
+	if (unlink(PS_SLRU_DEBT_FILE) != 0 && errno != ENOENT)
+	{
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove debt marker \"%s\": %m",
+						PS_SLRU_DEBT_FILE)));
+	}
+	PG_TRY();
+	{
+		fsync_fname(".", true);
+	}
+	PG_CATCH();
+	{
+		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+		ps_slru_debt_persist();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/*
+	 * Clear the retry flag only after the final unlink.  If a new loss raced
+	 * the reset and set the flag just before this store, the generation/total
+	 * check below restores and persists it before returning.
+	 */
+	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
+	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
+		pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+	{
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
 		ps_slru_debt_persist();
 		ereport(ERROR,
