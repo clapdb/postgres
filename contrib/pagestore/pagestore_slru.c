@@ -110,6 +110,9 @@ static bool ps_slru_mirror_enabled = false;
 static bool ps_slru_live_reads_enabled = false;
 static slru_page_write_hook_type prev_slru_page_write_hook = NULL;
 static slru_truncate_hook_type prev_slru_truncate_hook = NULL;
+static slru_page_read_hook_type prev_slru_page_read_hook = NULL;
+static slru_page_exists_hook_type prev_slru_page_exists_hook = NULL;
+static slru_page_revalidate_hook_type prev_slru_page_revalidate_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
@@ -1035,7 +1038,14 @@ ps_slru_tomb_note(int idx, int64 cutoff, uint64 version)
 		cur = pg_atomic_read_u64(&ps_slru_wm->tomb_version[idx]);
 		if (cur != PG_UINT64_MAX)
 		{
-			if (version <= cur)
+			/*
+			 * EQUAL versions must be re-noted, not dropped: the store
+			 * resolves same-position writes by arrival order, so a same-LSN
+			 * rewrite (pagestore_slru_mirror_truncate() on an idle system
+			 * samples the insert position without emitting WAL) is
+			 * authoritative there and its cutoff must reach cached readers.
+			 */
+			if (version < cur)
 				return;
 			if (pg_atomic_compare_exchange_u64(&ps_slru_wm->tomb_version[idx],
 											   &cur, PG_UINT64_MAX))
@@ -2023,6 +2033,15 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
+	/* chain: a previously installed hook's definitive answer wins */
+	if (prev_slru_page_read_hook)
+	{
+		res = (*prev_slru_page_read_hook) (ctl, pageno, page);
+		if (res != SLRU_READ_HOOK_FALLBACK)
+			return res;
+		res = SLRU_READ_HOOK_FALLBACK;
+	}
+
 	idx = ps_slru_dir_index(ctl->options.Dir);
 	if (idx < 0)
 		return SLRU_READ_HOOK_FALLBACK;
@@ -2327,6 +2346,15 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	MemoryContext cxt = CurrentMemoryContext;
 	SlruReadHookResult res = SLRU_READ_HOOK_FALLBACK;
 
+	/* chain: a previously installed hook's definitive answer wins */
+	if (prev_slru_page_exists_hook)
+	{
+		res = (*prev_slru_page_exists_hook) (ctl, pageno, exists);
+		if (res != SLRU_READ_HOOK_FALLBACK)
+			return res;
+		res = SLRU_READ_HOOK_FALLBACK;
+	}
+
 	idx = ps_slru_dir_index(ctl->options.Dir);
 	if (idx < 0)
 		return SLRU_READ_HOOK_FALLBACK;
@@ -2552,6 +2580,11 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 	uint64		epoch;
 	uint64		tombc;
 	uint64		tombv;
+
+	/* chain: a previously installed hook calling the slot stale wins */
+	if (prev_slru_page_revalidate_hook &&
+		!(*prev_slru_page_revalidate_hook) (ctl, pageno))
+		return false;
 
 	idx = ps_slru_dir_index(ctl->options.Dir);
 	if (idx < 0)
@@ -4307,8 +4340,11 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	if (pagestore_slru_live_reads)
 	{
 		ps_slru_live_reads_enabled = true;
+		prev_slru_page_read_hook = slru_page_read_hook;
 		slru_page_read_hook = ps_slru_read_hook;
+		prev_slru_page_exists_hook = slru_page_exists_hook;
 		slru_page_exists_hook = ps_slru_exists_hook;
+		prev_slru_page_revalidate_hook = slru_page_revalidate_hook;
 		slru_page_revalidate_hook = ps_slru_revalidate_hook;
 		RegisterXactCallback(ps_slru_xact_refresh, NULL);
 	}
