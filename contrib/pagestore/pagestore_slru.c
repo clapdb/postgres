@@ -2184,6 +2184,14 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
  * durable in the store while the record that justifies it can still be
  * lost to a crash.  ERRORs on store failure -- the caller decides whether
  * that aborts the truncation (the barrier) or degrades.
+ *
+ * A tombstone is a single cutoff page, newest version wins.  Coverage is
+ * MODULAR, exactly like local truncation: readers decide death with the
+ * SLRU's PagePrecedes relation (cutoff PG_INT64_MAX = everything), not a
+ * numeric pageno < cutoff.  That is what keeps a single cutoff correct
+ * across page-space wraparound -- a post-wrap low cutoff still covers the
+ * pre-wrap high pages, because they precede it modularly, the same
+ * relation SimpleLruTruncate() used to delete them locally.
  */
 static void
 ps_slru_ship_tombstone(uint32 obj, int64 cutoff_page, XLogRecPtr version)
@@ -2428,6 +2436,18 @@ ps_slru_truncate_hook(SlruDesc *ctl, int64 cutoffPage, XLogRecPtr lsn)
 		ps_slru_wm_note_lost();
 		ps_slru_wm_republish_pending();
 		ps_slru_debt_persist();
+
+		/*
+		 * A failed barrier aborts the caller's whole pre-barrier sequence
+		 * (TruncateMultiXact ships members, then offsets): a cutoff an
+		 * EARLIER call in the sequence armed will never meet its
+		 * in-critical consumer now, and a retried sequence would consume
+		 * that stale flag pre-critically, leaving the retry's in-critical
+		 * call to read as an uncovered loss.  Drop every one-shot shield;
+		 * the retry re-ships those tombstones byte-identically at a newer
+		 * version, which newest-wins absorbs.
+		 */
+		memset(ps_slru_tomb_covered_set, 0, sizeof(ps_slru_tomb_covered_set));
 
 		if (may_abandon)
 			PG_RE_THROW();
