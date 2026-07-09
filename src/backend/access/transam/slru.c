@@ -1646,17 +1646,25 @@ SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 	 * the next vacuum/checkpoint cycle, exactly like any other truncate
 	 * failure.
 	 */
-	if (slru_truncate_hook)
-		(*slru_truncate_hook) (ctl, cutoffPage, InvalidXLogRecPtr);
-
 	/*
 	 * Scan shared memory and empty any pages preceding the cutoff page, to
 	 * ensure we won't rewrite them later.  (Since this is normally called in
 	 * or just after a checkpoint, any dirty pages should have been flushed
 	 * already ... we're just being extra careful here.)  Truncation paths
 	 * with a mirror pre-barrier have already done this before WAL-logging.
+	 *
+	 * This runs BEFORE the tombstone barrier below, and must: direct
+	 * callers with no pre-barrier -- notably the redo paths -- would
+	 * otherwise ship the tombstone while doomed dirty pages are still
+	 * flushable, and a restartpoint's SimpleLruWriteAll() could capture one
+	 * at a version at/after the tombstone's, resurrecting it in the mirror.
+	 * With the slots emptied first, every capture of a doomed page is
+	 * bounded below the version the barrier samples.
 	 */
 	SimpleLruDiscardCutoff(ctl, cutoffPage);
+
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (ctl, cutoffPage, InvalidXLogRecPtr);
 
 	/* Now we can remove the old segment(s) */
 	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);

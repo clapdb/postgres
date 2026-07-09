@@ -893,6 +893,12 @@ TruncateCommitTs(TransactionId oldestXact)
 	/* Write XLOG record */
 	{
 		XLogRecPtr	trunc_lsn;
+		bool		barrier_ok;
+
+		/* see TruncateCLOG: no discard/barrier for a refused truncation */
+		barrier_ok = slru_truncate_hook &&
+			!CommitTsCtl->options.PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
+											   cutoffPage);
 
 		/*
 		 * Hold off checkpoint starts from the truncate record until the
@@ -908,18 +914,13 @@ TruncateCommitTs(TransactionId oldestXact)
 		PG_TRY();
 		{
 			/* see TruncateCLOG: no doomed page may be flushable after this */
-			if (slru_truncate_hook)
+			if (barrier_ok)
 				SimpleLruDiscardCutoff(CommitTsCtl, cutoffPage);
 
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
 
-			/*
-			 * Same exact-LSN pre-barrier as TruncateCLOG(), with the same
-			 * apparent-wraparound pre-check.
-			 */
-			if (slru_truncate_hook &&
-				!CommitTsCtl->options.PagePrecedes(pg_atomic_read_u64(&CommitTsCtl->shared->latest_page_number),
-												   cutoffPage))
+			/* same exact-LSN pre-barrier as TruncateCLOG() */
+			if (barrier_ok)
 				(*slru_truncate_hook) (CommitTsCtl, cutoffPage, trunc_lsn);
 		}
 		PG_CATCH();

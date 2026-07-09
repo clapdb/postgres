@@ -2789,27 +2789,40 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	 */
 	PG_TRY();
 	{
-		/* see TruncateCLOG: no doomed page may be flushable after this */
+		int64		memberCutoff = MXOffsetToMemberPage(newOldestOffset);
+		int64		offsetCutoff = MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti));
+		bool		member_ok = false;
+		bool		offset_ok = false;
+
+		/*
+		 * See TruncateCLOG: no doomed page may be flushable after this, and
+		 * neither the discard nor the barrier may run for a cutoff whose
+		 * truncation SimpleLruTruncate()'s wraparound backstop is going to
+		 * refuse -- discarding dirty endpoint pages for a refused truncation
+		 * would lose them, and its tombstone must not durably declare the
+		 * range dead.
+		 */
 		if (slru_truncate_hook)
 		{
-			SimpleLruDiscardCutoff(MultiXactMemberCtl,
-								   MXOffsetToMemberPage(newOldestOffset));
-			SimpleLruDiscardCutoff(MultiXactOffsetCtl,
-								   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)));
+			member_ok = !MultiXactMemberCtl->options.PagePrecedes(pg_atomic_read_u64(&MultiXactMemberCtl->shared->latest_page_number),
+																  memberCutoff);
+			offset_ok = !MultiXactOffsetCtl->options.PagePrecedes(pg_atomic_read_u64(&MultiXactOffsetCtl->shared->latest_page_number),
+																  offsetCutoff);
+			if (member_ok)
+				SimpleLruDiscardCutoff(MultiXactMemberCtl, memberCutoff);
+			if (offset_ok)
+				SimpleLruDiscardCutoff(MultiXactOffsetCtl, offsetCutoff);
 		}
 
 		trunc_lsn = WriteMTruncateXlogRec(newOldestMultiDB, newOldestMulti,
 										  newOldestOffset);
 
-		if (slru_truncate_hook)
-		{
-			(*slru_truncate_hook) (MultiXactMemberCtl,
-								   MXOffsetToMemberPage(newOldestOffset),
+		if (member_ok)
+			(*slru_truncate_hook) (MultiXactMemberCtl, memberCutoff,
 								   trunc_lsn);
-			(*slru_truncate_hook) (MultiXactOffsetCtl,
-								   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)),
+		if (offset_ok)
+			(*slru_truncate_hook) (MultiXactOffsetCtl, offsetCutoff,
 								   trunc_lsn);
-		}
 	}
 	PG_CATCH();
 	{
