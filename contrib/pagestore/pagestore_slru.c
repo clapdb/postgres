@@ -405,6 +405,10 @@ typedef struct PsSlruWatermarkShm
 										 * but must not let cached pages
 										 * revalidate against stale
 										 * tombstones forever */
+	pg_atomic_uint64 read_served;	/* live reads served from the mirror --
+									 * shared, so stats read from any backend
+									 * see the whole cluster's counts */
+	pg_atomic_uint64 read_fallback; /* live reads deferred to local files */
 	pg_atomic_uint64 tomb_cutoff[PS_SLRU_SCOPE_COUNT];	/* int64 cutoff + 1;
 														 * 0 = none known */
 	pg_atomic_uint64 tomb_version[PS_SLRU_SCOPE_COUNT];
@@ -868,6 +872,8 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_at, 0);
 		pg_atomic_init_u64(&ps_slru_wm->reader_wm_ok_at, 0);
+		pg_atomic_init_u64(&ps_slru_wm->read_served, 0);
+		pg_atomic_init_u64(&ps_slru_wm->read_fallback, 0);
 		for (int i = 0; i < PS_SLRU_SCOPE_COUNT; i++)
 		{
 			pg_atomic_init_u64(&ps_slru_wm->tomb_cutoff[i], 0);
@@ -1986,12 +1992,21 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * the lookup that threw, so re-read the shared cache and honor what
 		 * this very read learned; an in-flight concurrent update reads as
 		 * none, and the pre-fetch snapshot is the floor then.
+		 *
+		 * On a pure live-read consumer the failure is terminal either way:
+		 * its local segments are only the seed baseline, superseded by
+		 * whatever the writer has mirrored since, and with the store
+		 * unreachable there is no way to tell whether a newer image or
+		 * truncation exists.  Serving the local bytes would hand out stale
+		 * transaction status; only the mirror's own writer may fall back
+		 * (its local files ARE the truth the mirror lags behind).
 		 */
 		ps_slru_tomb_cached(idx, &cut, &ver);
 		if (ver == 0)
 			cut = cached_cut;
 
-		if (ps_slru_tomb_covers(ctl, pageno, cut) ||
+		if (!ps_slru_mirror_enabled ||
+			ps_slru_tomb_covers(ctl, pageno, cut) ||
 			(RecoveryInProgress() &&
 			 !ps_slru_local_page_exists(ctl, pageno)))
 			res = SLRU_READ_HOOK_FAILED;
@@ -2001,9 +2016,17 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	PG_END_TRY();
 
 	if (res == SLRU_READ_HOOK_SERVED)
+	{
 		ps_slru_read_served++;
+		if (ps_slru_wm != NULL)
+			pg_atomic_fetch_add_u64(&ps_slru_wm->read_served, 1);
+	}
 	else if (res == SLRU_READ_HOOK_FALLBACK)
+	{
 		ps_slru_read_fallback++;
+		if (ps_slru_wm != NULL)
+			pg_atomic_fetch_add_u64(&ps_slru_wm->read_fallback, 1);
+	}
 	return res;
 }
 
@@ -3489,8 +3512,12 @@ pagestore_slru_mirror_stats(PG_FUNCTION_ARGS)
 	values[2] = Int64GetDatum(ps_slru_wm != NULL
 							  ? (int64) pg_atomic_read_u64(&ps_slru_wm->stats_lost)
 							  : (int64) ps_slru_lost);
-	values[3] = Int64GetDatum((int64) ps_slru_read_served);
-	values[4] = Int64GetDatum((int64) ps_slru_read_fallback);
+	values[3] = Int64GetDatum(ps_slru_wm != NULL
+							  ? (int64) pg_atomic_read_u64(&ps_slru_wm->read_served)
+							  : (int64) ps_slru_read_served);
+	values[4] = Int64GetDatum(ps_slru_wm != NULL
+							  ? (int64) pg_atomic_read_u64(&ps_slru_wm->read_fallback)
+							  : (int64) ps_slru_read_fallback);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
