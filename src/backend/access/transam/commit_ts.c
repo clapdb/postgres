@@ -907,6 +907,10 @@ TruncateCommitTs(TransactionId oldestXact)
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 		PG_TRY();
 		{
+			/* see TruncateCLOG: no doomed page may be flushable after this */
+			if (slru_truncate_hook)
+				SimpleLruDiscardCutoff(CommitTsCtl, cutoffPage);
+
 			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact);
 
 			/*

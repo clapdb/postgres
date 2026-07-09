@@ -1891,9 +1891,13 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 	 * the watermark cannot advance over the gap; a loss is counted only if
 	 * the recapture table also overflows (inside the helper) or the
 	 * recapture later fails for good (ps_slru_recapture_lost, exit drain,
-	 * dead-owner sweep).
+	 * dead-owner sweep).  The capture-time bound rides along as the fence
+	 * floor: it both keeps the re-ship strictly above this capture's
+	 * version and marks a post-tombstone recreation as newer than the
+	 * tombstone, so the drain's retirement pass cannot drop the only image
+	 * of a recreated page.
 	 */
-	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr, false);
+	ps_slru_note_recapture(ctl, obj, pageno, bound, false);
 }
 
 static void
@@ -2192,6 +2196,29 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 	int64		tomb_cut[lengthof(ps_slru_dirmap)] = {0};
 	uint64		tomb_ver[lengthof(ps_slru_dirmap)] = {0};
 
+	if (ps_slru_recap_count <= 0)
+		return false;
+
+	/*
+	 * Serialize the whole pass against truncation barriers.  A re-snapshot
+	 * samples its version at 'now', so an image staged while a truncation
+	 * is between its WAL record and its tombstone sync would outrank that
+	 * tombstone and resurrect the truncated page -- and no LSN comparison
+	 * can catch it, because the retirement probe above simply has not seen
+	 * the in-flight tombstone yet.  Under these locks (shared; the vacuum
+	 * truncation paths hold them exclusive across record + barrier), every
+	 * truncation either completed -- its tombstone is durable and the probe
+	 * retires the entry -- or starts after our samples, versioning its
+	 * tombstone above every image we stage here.  CommitTsLock is left
+	 * alone (holding it stalls commits); the commit-ts delete-all reset
+	 * runs under it only, but deactivation also deletes every segment, so
+	 * a racing recapture degrades to retire-as-lost, never resurrection.
+	 */
+	LWLockAcquire(WrapLimitsVacuumLock, LW_SHARED);
+	LWLockAcquire(MultiXactTruncationLock, LW_SHARED);
+	PG_TRY();
+	{
+
 	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY && ps_slru_recap_count > 0; i++)
 	{
 		PsSlruRecapture *r = &ps_slru_recap[i];
@@ -2247,9 +2274,15 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		}
 		if (idx >= 0 && tomb_valid[idx] &&
 			ps_slru_tomb_covers(r->ctl, (int64) r->pageno, tomb_cut[idx]) &&
-			(XLogRecPtrIsInvalid(r->fence_floor) ||
-			 (uint64) r->fence_floor <= tomb_ver[idx]))
+			!XLogRecPtrIsInvalid(r->fence_floor) &&
+			(uint64) r->fence_floor <= tomb_ver[idx])
 		{
+			/*
+			 * An unknown floor is NOT retired: every creation path stamps a
+			 * real capture-time floor now, and an entry we cannot order
+			 * against the tombstone might be the only image of a page
+			 * recreated after it.
+			 */
 			r->used = false;
 			ps_slru_recap_count--;
 			continue;
@@ -2276,6 +2309,22 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		ps_slru_recap_count--;
 		staged = true;
 	}
+
+	}
+	PG_CATCH();
+	{
+		/*
+		 * The drain's own catch swallows the error and keeps running, so
+		 * these must be released here rather than left to abort cleanup.
+		 */
+		LWLockRelease(MultiXactTruncationLock);
+		LWLockRelease(WrapLimitsVacuumLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	LWLockRelease(MultiXactTruncationLock);
+	LWLockRelease(WrapLimitsVacuumLock);
+
 	return staged;
 }
 

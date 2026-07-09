@@ -2789,6 +2789,15 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	 */
 	PG_TRY();
 	{
+		/* see TruncateCLOG: no doomed page may be flushable after this */
+		if (slru_truncate_hook)
+		{
+			SimpleLruDiscardCutoff(MultiXactMemberCtl,
+								   MXOffsetToMemberPage(newOldestOffset));
+			SimpleLruDiscardCutoff(MultiXactOffsetCtl,
+								   MultiXactIdToOffsetPage(PreviousMultiXactId(newOldestMulti)));
+		}
+
 		trunc_lsn = WriteMTruncateXlogRec(newOldestMultiDB, newOldestMulti,
 										  newOldestOffset);
 
