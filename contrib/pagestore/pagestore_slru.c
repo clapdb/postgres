@@ -1878,6 +1878,13 @@ ps_slru_reader_fetch_wm(void)
 			}
 		}
 
+		/*
+		 * Stamp with a POST-wait timestamp: the IPC above can take multiples
+		 * of the 1s TTL (each wait is bounded by a 10s ship timeout), and
+		 * stamping the pre-wait time would leave the TTL already expired,
+		 * turning the intended backoff into an immediate retry storm.
+		 */
+		now = GetCurrentTimestamp();
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
 		pg_atomic_write_u64(&ps_slru_wm->reader_wm_ok_at, (uint64) now);
 	}
@@ -1892,8 +1899,10 @@ ps_slru_reader_fetch_wm(void)
 		 * reader_wm_ok_at stays put, so if failures persist past
 		 * PS_SLRU_READER_WM_STALE_MS the revalidator stops trusting cached
 		 * pages instead of serving them against stale tombstones forever.
+		 * Post-wait timestamp for the same reason as the success path.
 		 */
-		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at, (uint64) now);
+		pg_atomic_write_u64(&ps_slru_wm->reader_wm_at,
+							(uint64) GetCurrentTimestamp());
 	}
 	PG_END_TRY();
 
@@ -2302,8 +2311,22 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 			 */
 			if (ps_slru_tomb_covers(ctl, pageno, cut))
 			{
-				*exists = false;
-				res = SLRU_READ_HOOK_SERVED;
+				/*
+				 * The cached tombstone answers definitively only while a
+				 * recent successful fetch proves it current.  On a stale
+				 * fetch the page may have been recreated since (a newer
+				 * image would outrank the tombstone, and the lookup that
+				 * would say so is exactly what keeps failing): a false
+				 * answer would let existence callers zero-create over
+				 * mirror-only state, so fail closed instead.
+				 */
+				if (!ps_slru_mirror_enabled && !ps_slru_reader_fetch_fresh())
+					res = SLRU_READ_HOOK_FAILED;
+				else
+				{
+					*exists = false;
+					res = SLRU_READ_HOOK_SERVED;
+				}
 			}
 			else if (!ps_slru_mirror_enabled &&
 					 (!ps_slru_reader_fetch_fresh() ||

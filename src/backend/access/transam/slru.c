@@ -1251,6 +1251,15 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_STORE_READ_FAILED:
+
+			/*
+			 * The store hooks run in a no-throw window and re-arm rather
+			 * than propagate interrupts; a query cancel during a store wait
+			 * therefore surfaces as this generic I/O failure.  Give the
+			 * re-armed interrupt the first word -- it is the true cause --
+			 * and fall through to the I/O error only when none is pending.
+			 */
+			CHECK_FOR_INTERRUPTS();
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not read page %" PRId64 " of SLRU \"%s\" from the page store",
