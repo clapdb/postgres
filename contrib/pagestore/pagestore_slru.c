@@ -308,6 +308,9 @@ typedef struct PsSlruWatermarkShm
 									 * advance path must not publish while
 									 * one is between the two */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
+	pg_atomic_uint32 primed_revoked;	/* the primed marker's removal (or
+										 * absence) is DURABLE: the clean-exit
+										 * backstop may stand down */
 	pg_atomic_uint64 version_evict_floor;	/* all evicted slots' versions
 											 * are at/below this */
 	PsSlruVersionSlot version_slot[PS_SLRU_VERSION_SLOTS];
@@ -682,6 +685,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u32(&ps_slru_wm->floors_set, 0);
 		pg_atomic_init_u32(&ps_slru_wm->sweeps_active, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
+		pg_atomic_init_u32(&ps_slru_wm->primed_revoked, 0);
 		pg_atomic_init_u64(&ps_slru_wm->version_evict_floor, 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
 		{
@@ -941,11 +945,16 @@ ps_slru_debt_persist(void)
 			{
 				int			dfd = open(".", O_RDONLY);
 
+				/*
+				 * Only a DURABLY fsynced removal (or durable absence) stands
+				 * the clean-exit backstop down: an unlink that never reached
+				 * the directory can resurrect the primed marker after a host
+				 * crash, exactly the boot state that forgets the loss.
+				 */
+				if (dfd >= 0 && fsync(dfd) == 0)
+					pg_atomic_write_u32(&ps_slru_wm->primed_revoked, 1);
 				if (dfd >= 0)
-				{
-					(void) fsync(dfd);
 					close(dfd);
-				}
 			}
 		}
 		errno = saved_errno;
@@ -2148,16 +2157,21 @@ ps_slru_exit_drain(int code, Datum arg)
 	 */
 	if (code == 0 && ps_slru_wm != NULL &&
 		pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0 &&
-		pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+		pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0 &&
+		pg_atomic_read_u32(&ps_slru_wm->primed_revoked) == 0)
 	{
-		struct stat st;
-
-		if (stat(PS_SLRU_PRIMED_FILE, &st) == 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("pagestore: could not make the SLRU mirror coverage loss durable"),
-					 errdetail("Neither the debt marker \"%s\" could be created nor the primed marker \"%s\" removed; a clean shutdown would forget the loss.",
-							   PS_SLRU_DEBT_FILE, PS_SLRU_PRIMED_FILE)));
+		/*
+		 * The flag (set only after a durably fsynced revocation, including
+		 * durable absence) is the arbiter here, NOT a stat(): a primed
+		 * marker unlinked but never fsynced is invisible to stat yet can
+		 * resurrect after a host crash -- the exact boot state that would
+		 * forget the loss.
+		 */
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("pagestore: could not make the SLRU mirror coverage loss durable"),
+				 errdetail("Neither the debt marker \"%s\" could be created nor the primed marker \"%s\" durably removed; a clean shutdown would forget the loss.",
+						   PS_SLRU_DEBT_FILE, PS_SLRU_PRIMED_FILE)));
 	}
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
 		MyProcNumber < ps_slru_wm_nprocs)
@@ -2258,11 +2272,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 
 	/*
 	 * Priming and forgiving are one act: the operator declares the mirror
-	 * whole as of now.  Make the primed marker durable first, then drop
-	 * the debt marker, then retire the counted losses.  The debt generation
-	 * tells any already-running persist that its marker write raced a reset;
-	 * the loss generation catches a new loss that arrived after this reset's
-	 * snapshot even if the final total_lost CAS would otherwise miss it.
+	 * whole as of now.  Make the primed marker durable first, retire the
+	 * counted losses, and only THEN drop the debt marker: the marker must
+	 * outlive every window in which total_lost is still nonzero, or a
+	 * cancel/kill landing mid-reset (after an early unlink, before the CAS)
+	 * would leave a clean shutdown free to forget an outstanding loss.  The
+	 * debt generation tells any already-running persist that it raced a
+	 * reset; the loss generation catches a new loss that arrived after this
+	 * reset's snapshot even if the final total_lost CAS would miss it.
 	 */
 	{
 		uint64		stamp = (uint64) GetRedoRecPtr();
@@ -2278,28 +2295,9 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 							PS_SLRU_PRIMED_FILE)));
 		CloseTransientFile(fd);
 	}
+	pg_atomic_write_u32(&ps_slru_wm->primed_revoked, 0);
 
 	pg_atomic_fetch_add_u64(&ps_slru_wm->debt_generation, 1);
-	if (unlink(PS_SLRU_DEBT_FILE) != 0 && errno != ENOENT)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove debt marker \"%s\": %m",
-						PS_SLRU_DEBT_FILE)));
-	PG_TRY();
-	{
-		fsync_fname(".", true);
-	}
-	PG_CATCH();
-	{
-		/*
-		 * The unlink may have reached storage before directory fsync failed.
-		 * Recreate the marker immediately before propagating the error.
-		 */
-		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-		ps_slru_debt_persist();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 
 	/*
 	 * Discard the standing candidate before unfreezing debt: it may stem
@@ -2321,48 +2319,27 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 * and be rejected -- equality cannot be admitted (a checkpoint already
 	 * in flight during the reset samples the same position, and it may
 	 * vouch for pre-priming losses), so make the very next checkpoint start
-	 * strictly above the floor instead of waiting for organic traffic.
-	 * The debt marker is already unlinked: an ERROR (or cancel) escaping
-	 * from the WAL insertion must recreate it, like the fsync paths above,
-	 * or a clean shutdown would forget the still-counted loss.
+	 * strictly above the floor instead of waiting for organic traffic.  An
+	 * ERROR or cancel escaping here simply aborts the reset; the debt
+	 * marker is still on disk, so nothing can be forgotten.
 	 */
 	if (!RecoveryInProgress())
-	{
-		PG_TRY();
-		{
-			(void) LogLogicalMessage("pagestore_slru_mirror_reset_debt", "", 0,
-									 false, false);
-		}
-		PG_CATCH();
-		{
-			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-			ps_slru_debt_persist();
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-	}
+		(void) LogLogicalMessage("pagestore_slru_mirror_reset_debt", "", 0,
+								 false, false);
 
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
 		!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
-	{
-		/*
-		 * A loss raced the reset and the debt marker is already unlinked:
-		 * re-create it here and now, not merely re-flag it -- this backend
-		 * may never drain again before a clean shutdown.
-		 */
-		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-		ps_slru_debt_persist();
 		ereport(ERROR,
 				(errmsg("a new SLRU mirror loss arrived during the reset"),
 				 errhint("Re-prime the mirror and retry.")));
-	}
 
 	/*
-	 * An old ps_slru_debt_persist() may have sampled the previous
-	 * debt_generation and recreated the marker after the first unlink, while
-	 * total_lost was still nonzero.  Remove it once more after the debt CAS;
-	 * any persister that runs after this point will see total_lost == 0 and
-	 * clean up its own marker write.
+	 * The losses are retired; only now may the marker go.  If anything
+	 * below fails, the flag re-arms and ps_slru_debt_persist()'s
+	 * total_lost == 0 cleanup keeps retrying the removal at every drain
+	 * until it is durable, so a failure here never freezes a healed mirror
+	 * for good -- and never forgets anything either, since a loss racing
+	 * in after the CAS bumps the loss generation and is caught below.
 	 */
 	if (unlink(PS_SLRU_DEBT_FILE) != 0 && errno != ENOENT)
 	{
@@ -2379,15 +2356,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	PG_CATCH();
 	{
 		pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
-		ps_slru_debt_persist();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	/*
-	 * Clear the retry flag only after the final unlink.  If a new loss raced
-	 * the reset and set the flag just before this store, the generation/total
-	 * check below restores and persists it before returning.
+	 * Clear the retry flag only after the unlink is durable.  If a new loss
+	 * raced the reset and set the flag just before this store, the
+	 * generation/total check below restores and persists it.
 	 */
 	pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 0);
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
