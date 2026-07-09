@@ -902,10 +902,12 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
+		uint64		floor;
 		uint64		pid;
 		uint64		gen;
 
-		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
+		floor = pg_atomic_read_u64(&ps_slru_wm->pending[i].floor);
+		if (floor == 0)
 			continue;
 
 		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
@@ -913,10 +915,23 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 		if (ps_slru_wm_pending_owner_matches(i, pid, gen))
 			continue;
 
+		/*
+		 * Claim the stale floor with a CAS before counting it: between the
+		 * reads above and here, a new backend can reuse this ProcNumber,
+		 * zero the inherited floor (accounting for it itself -- see
+		 * ps_slru_wm_claim_pending_slot), and publish a fresh floor for its
+		 * own staged image.  An unconditional clear would wipe that LIVE
+		 * floor and let the watermark advance over an unsynced image.  The
+		 * owner fields are cleared only if still the observed dead pair.
+		 */
+		if (!pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
+											&floor, 0))
+			continue;
 		ps_slru_wm_note_lost_count(1, new_loss);
-		pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
-		pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
-		pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
+		(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
+											  &pid, 0);
+		(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].owner_gen,
+											  &gen, 0);
 		found = true;
 	}
 
@@ -1008,10 +1023,12 @@ ps_slru_wm_advance(void)
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
+		uint64		floor;
 		uint64		pid;
 		uint64		gen;
 
-		if (pg_atomic_read_u64(&ps_slru_wm->pending[i].floor) == 0)
+		floor = pg_atomic_read_u64(&ps_slru_wm->pending[i].floor);
+		if (floor == 0)
 			continue;
 
 		/*
@@ -1023,15 +1040,21 @@ ps_slru_wm_advance(void)
 		 * Convert it -- the loss freezes the watermark for good, so stop
 		 * here rather than let this very pass advance over the fresh hole
 		 * -- and clear the slot so it does not read as pending forever.
+		 * The clears are CAS-guarded like the sweep's: a new owner reusing
+		 * this ProcNumber may have published a live floor since our reads,
+		 * and wiping that would advance the watermark over its image.
 		 */
 		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
 		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
-		if (!ps_slru_wm_pending_owner_matches(i, pid, gen))
+		if (!ps_slru_wm_pending_owner_matches(i, pid, gen) &&
+			pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
+										   &floor, 0))
 		{
 			ps_slru_wm_note_lost_count(1, true);
-			pg_atomic_write_u64(&ps_slru_wm->pending[i].floor, 0);
-			pg_atomic_write_u64(&ps_slru_wm->pending[i].pid, 0);
-			pg_atomic_write_u64(&ps_slru_wm->pending[i].owner_gen, 0);
+			(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
+												  &pid, 0);
+			(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].owner_gen,
+												  &gen, 0);
 
 			/*
 			 * This runs after the drain's own persist point; make the
@@ -1657,6 +1680,20 @@ post_again:
 				continue;
 
 			/*
+			 * The probe above may have eaten what was left of the budget (a
+			 * miss can take its whole capped timeout): re-check before
+			 * posting, or the write+sync below would overshoot the budget
+			 * by another full ship timeout.
+			 */
+			elapsed_ms = TimestampDifferenceMilliseconds(drain_start,
+														 GetCurrentTimestamp());
+			if (elapsed_ms >= PS_SLRU_DRAIN_BUDGET_MS)
+			{
+				budget_out = true;
+				break;
+			}
+
+			/*
 			 * A retry of an already-posted entry must reuse the posted
 			 * version verbatim (the bytes are frozen to match).  A fresh
 			 * post is versioned by its capture-time bound after shared
@@ -2091,10 +2128,25 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 * in flight during the reset samples the same position, and it may
 	 * vouch for pre-priming losses), so make the very next checkpoint start
 	 * strictly above the floor instead of waiting for organic traffic.
+	 * The debt marker is already unlinked: an ERROR (or cancel) escaping
+	 * from the WAL insertion must recreate it, like the fsync paths above,
+	 * or a clean shutdown would forget the still-counted loss.
 	 */
 	if (!RecoveryInProgress())
-		(void) LogLogicalMessage("pagestore_slru_mirror_reset_debt", "", 0,
-								 false, false);
+	{
+		PG_TRY();
+		{
+			(void) LogLogicalMessage("pagestore_slru_mirror_reset_debt", "", 0,
+									 false, false);
+		}
+		PG_CATCH();
+		{
+			pg_atomic_write_u32(&ps_slru_wm->debt_unpersisted, 1);
+			ps_slru_debt_persist();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
 		!pg_atomic_compare_exchange_u64(&ps_slru_wm->total_lost, &lost, 0))
