@@ -387,6 +387,11 @@ typedef struct PsSlruWatermarkShm
 									 * the per-query drain tail skip the
 									 * O(MaxBackends) slot scans when nothing
 									 * is pending anywhere */
+	pg_atomic_uint32 sweeps_active; /* dead-floor sweeps in flight: a sweep
+									 * clears the floor BEFORE counting the
+									 * loss (single-count CAS claim), so the
+									 * advance path must not publish while
+									 * one is between the two */
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
 	pg_atomic_uint64 version_evict_floor;	/* all evicted slots' versions
 											 * are at/below this */
@@ -818,16 +823,39 @@ ps_slru_boot_debt(void)
 	ControlFileData *cf;
 	bool		crc_ok;
 	bool		debt;
+	int			fd;
+	uint64		stamped = 0;
+	ssize_t		n = -1;
 
 	if (stat(PS_SLRU_DEBT_FILE, &st) == 0)
 		return true;
 	if (stat(PS_SLRU_PRIMED_FILE, &st) != 0)
 		return true;			/* never primed: pre-enable history unproven */
 
+	/*
+	 * The primed marker is stamped with the redo pointer of the newest
+	 * checkpoint the mirror durably shipped (ps_slru_primed_refresh); a
+	 * clean shutdown with the mirror active leaves it at the shutdown
+	 * checkpoint's redo.  A marker stamped BELOW pg_control's checkpoint
+	 * proves discontinuity: the cluster ran (and checkpointed) with the
+	 * mirror off, so that run's SLRU writes were never captured, and
+	 * "primed + clean shutdown" must not read as debt-free.  An old
+	 * stampless marker reads as 0 = always discontinuous, which only
+	 * costs one operator re-prime.
+	 */
+	fd = open(PS_SLRU_PRIMED_FILE, O_RDONLY | PG_BINARY);
+	if (fd >= 0)
+	{
+		n = read(fd, &stamped, sizeof(stamped));
+		close(fd);
+	}
+
 	cf = get_controlfile(DataDir, &crc_ok);
 	debt = !crc_ok ||
 		(cf->state != DB_SHUTDOWNED &&
-		 cf->state != DB_SHUTDOWNED_IN_RECOVERY);
+		 cf->state != DB_SHUTDOWNED_IN_RECOVERY) ||
+		n != (ssize_t) sizeof(stamped) ||
+		stamped < (uint64) cf->checkPointCopy.redo;
 	pfree(cf);
 	return debt;
 }
@@ -857,6 +885,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->debt_generation, 1);
 		pg_atomic_init_u64(&ps_slru_wm->pending_owner_next, 1);
 		pg_atomic_init_u32(&ps_slru_wm->floors_set, 0);
+		pg_atomic_init_u32(&ps_slru_wm->sweeps_active, 0);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->version_evict_floor, 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
@@ -1240,6 +1269,67 @@ ps_slru_debt_persist(void)
 	}
 }
 
+/*
+ * Stamp the primed marker with the redo pointer of the newest checkpoint
+ * whose control image durably shipped.  The stamp is the mirror's proof of
+ * CONTINUITY: a cluster that runs with the mirror disabled still writes
+ * checkpoints, so its shutdown leaves pg_control ahead of the stamp, and
+ * the next mirror-enabled boot reads the gap as debt (ps_slru_boot_debt)
+ * instead of trusting "primed + clean shutdown" over uncaptured status.
+ * Best-effort (a stale stamp only costs a conservative re-prime); written
+ * via rename so a crash never leaves a torn stamp; skipped while any debt
+ * is outstanding so it cannot resurrect a marker the debt-persist fallback
+ * just revoked.
+ */
+static void
+ps_slru_primed_refresh(XLogRecPtr redo)
+{
+	static uint64 last_stamp = 0;
+	char		tmppath[MAXPGPATH];
+	struct stat st;
+	uint64		stamp = (uint64) redo;
+	int			fd;
+	bool		ok;
+
+	if (ps_slru_wm == NULL || stamp == 0 || stamp == last_stamp)
+		return;
+	if (CritSectionCount > 0)
+		return;
+	if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0 ||
+		pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0)
+		return;
+	if (stat(PS_SLRU_PRIMED_FILE, &st) != 0)
+		return;					/* not primed: nothing to keep alive */
+
+	snprintf(tmppath, sizeof(tmppath), "%s.tmp", PS_SLRU_PRIMED_FILE);
+	fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+			  pg_file_create_mode);
+	if (fd < 0)
+		goto fail;
+	ok = (write(fd, &stamp, sizeof(stamp)) == (ssize_t) sizeof(stamp) &&
+		  fsync(fd) == 0);
+	close(fd);
+	if (!ok || rename(tmppath, PS_SLRU_PRIMED_FILE) != 0)
+		goto fail;
+	{
+		int			dfd = open(".", O_RDONLY);
+
+		if (dfd >= 0)
+		{
+			(void) fsync(dfd);
+			close(dfd);
+		}
+	}
+	last_stamp = stamp;
+	return;
+
+fail:
+	ereport(WARNING,
+			(errcode_for_file_access(),
+			 errmsg("pagestore: could not refresh the SLRU mirror primed marker \"%s\": %m",
+					PS_SLRU_PRIMED_FILE)));
+}
+
 static bool
 ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 {
@@ -1247,6 +1337,16 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 
 	if (ps_slru_wm == NULL)
 		return false;
+
+	/*
+	 * Announce the sweep before the first clear: the CAS claim removes a
+	 * floor BEFORE its loss is counted (single-count discipline), and an
+	 * advance pass scanning in that gap would see neither the floor nor
+	 * the loss.  ps_slru_wm_advance() refuses to publish while any sweep
+	 * is in flight and re-checks total_lost afterwards, which closes the
+	 * window from both sides.
+	 */
+	pg_atomic_fetch_add_u32(&ps_slru_wm->sweeps_active, 1);
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
 	{
@@ -1283,6 +1383,8 @@ ps_slru_wm_sweep_dead_pending(bool persist, bool new_loss)
 											  &gen, 0);
 		found = true;
 	}
+
+	pg_atomic_fetch_sub_u32(&ps_slru_wm->sweeps_active, 1);
 
 	if (found && persist)
 		ps_slru_debt_persist();
@@ -1401,26 +1503,47 @@ ps_slru_wm_advance(void)
 		 */
 		pid = pg_atomic_read_u64(&ps_slru_wm->pending[i].pid);
 		gen = pg_atomic_read_u64(&ps_slru_wm->pending[i].owner_gen);
-		if (!ps_slru_wm_pending_owner_matches(i, pid, gen) &&
-			pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
-										   &floor, 0))
+		if (!ps_slru_wm_pending_owner_matches(i, pid, gen))
 		{
-			pg_atomic_fetch_sub_u32(&ps_slru_wm->floors_set, 1);
-			ps_slru_wm_note_lost_count(1, true);
-			(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
-												  &pid, 0);
-			(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].owner_gen,
-												  &gen, 0);
+			/* announce like the sweep: the CAS clears before the count */
+			pg_atomic_fetch_add_u32(&ps_slru_wm->sweeps_active, 1);
+			if (pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].floor,
+											   &floor, 0))
+			{
+				pg_atomic_fetch_sub_u32(&ps_slru_wm->floors_set, 1);
+				ps_slru_wm_note_lost_count(1, true);
+				(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].pid,
+													  &pid, 0);
+				(void) pg_atomic_compare_exchange_u64(&ps_slru_wm->pending[i].owner_gen,
+													  &gen, 0);
+				pg_atomic_fetch_sub_u32(&ps_slru_wm->sweeps_active, 1);
 
-			/*
-			 * This runs after the drain's own persist point; make the
-			 * fresh debt durable now rather than hoping for a later drain
-			 * (we are in a post-critical drain tail, file I/O is fine).
-			 */
-			ps_slru_debt_persist();
+				/*
+				 * This runs after the drain's own persist point; make the
+				 * fresh debt durable now rather than hoping for a later drain
+				 * (we are in a post-critical drain tail, file I/O is fine).
+				 */
+				ps_slru_debt_persist();
+			}
+			else
+				pg_atomic_fetch_sub_u32(&ps_slru_wm->sweeps_active, 1);
 		}
 		return;
 	}
+
+	/*
+	 * Final gate before publishing.  Every loss path makes the loss visible
+	 * before -- or announces itself across -- the removal of its pending
+	 * floor: exit drains and slot reclaims count first and clear after,
+	 * while the CAS-claiming sweeps bracket their clear-then-count with
+	 * sweeps_active.  So a scan that saw no floors either ran before the
+	 * floor vanished, or the loss is already in total_lost, or the sweep is
+	 * still announced; re-checking both here means a candidate can never
+	 * publish over an image that was lost mid-scan.
+	 */
+	if (pg_atomic_read_u32(&ps_slru_wm->sweeps_active) != 0 ||
+		pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+		return;
 
 	for (;;)
 	{
@@ -1461,11 +1584,21 @@ pagestore_slru_note_checkpoint_redo(XLogRecPtr redo)
 		uint64		cur = pg_atomic_read_u64(&ps_slru_wm->candidate);
 
 		if ((uint64) redo <= cur)
+		{
+			ps_slru_primed_refresh(redo);
 			return;
+		}
 		if (pg_atomic_compare_exchange_u64(&ps_slru_wm->candidate, &cur,
 										   (uint64) redo))
 			break;
 	}
+
+	/*
+	 * Every durably mirrored checkpoint also renews the primed marker's
+	 * continuity stamp; the shutdown checkpoint's renewal is what lets the
+	 * next boot trust a clean shutdown (see ps_slru_boot_debt).
+	 */
+	ps_slru_primed_refresh(redo);
 }
 
 /*
@@ -3713,14 +3846,20 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 * the loss generation catches a new loss that arrived after this reset's
 	 * snapshot even if the final total_lost CAS would otherwise miss it.
 	 */
-	fd = OpenTransientFile(PS_SLRU_PRIMED_FILE,
-						   O_WRONLY | O_CREAT | PG_BINARY);
-	if (fd < 0 || pg_fsync(fd) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create primed marker \"%s\": %m",
-						PS_SLRU_PRIMED_FILE)));
-	CloseTransientFile(fd);
+	{
+		uint64		stamp = (uint64) GetRedoRecPtr();
+
+		fd = OpenTransientFile(PS_SLRU_PRIMED_FILE,
+							   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+		if (fd < 0 ||
+			write(fd, &stamp, sizeof(stamp)) != (ssize_t) sizeof(stamp) ||
+			pg_fsync(fd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create primed marker \"%s\": %m",
+							PS_SLRU_PRIMED_FILE)));
+		CloseTransientFile(fd);
+	}
 
 	/*
 	 * Priming repairs tombstone state too: republish each SLRU's cutoff
