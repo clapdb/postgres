@@ -1601,6 +1601,16 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 		 * revalidation epoch.
 		 */
 		w = ps_slru_reader_fetch_wm();
+
+		/*
+		 * The fetch may have loaded a newer tombstone into the shared cache
+		 * even when it returns no watermark (the writer can truncate while
+		 * still frozen/unprimed), so re-read the cache: the first read of a
+		 * just-retired page must not slip past the pre-fetch cutoff to a
+		 * stale local segment.
+		 */
+		ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+
 		if (w == 0)
 		{
 			/*
@@ -1776,6 +1786,10 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 	{
 		/* same newest-wins rule as the read hook; W is only the enable gate */
 		w = ps_slru_reader_fetch_wm();
+
+		/* see the read hook: the fetch may have advanced the tombstone cache */
+		ps_slru_tomb_cached(idx, &cached_cut, &cached_ver);
+
 		if (w == 0)
 		{
 			/*
@@ -1856,6 +1870,18 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		{
 			*exists = false;
 			res = SLRU_READ_HOOK_SERVED;
+		}
+		else if (!ps_slru_mirror_enabled &&
+				 !ps_slru_local_page_exists(ctl, pageno))
+		{
+			/*
+			 * Same fail-closed rule as the no-watermark path above: on a
+			 * pure consumer with no local page, a store failure must not
+			 * degrade into "does not exist" -- the false answer would let
+			 * existence callers zero-create over state that lives only in
+			 * the mirror.
+			 */
+			res = SLRU_READ_HOOK_FAILED;
 		}
 		else
 			res = SLRU_READ_HOOK_FALLBACK;
