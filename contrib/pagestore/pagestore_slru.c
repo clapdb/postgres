@@ -4,13 +4,14 @@
  *	  Live SLRU page mirror: write-side capture and ship.
  *
  * Consumes the core SLRU seams (slru_page_write_hook) to mirror the
- * WAL-logged SLRUs' flushed page images to the page store, so that other
- * computes on the same timeline can later observe this compute's
- * transaction status (SLRU_ON_STORE_DESIGN.md, "Deferred: live
- * multi-compute SLRU read-sharing").  This file is the write side only:
- * capture, staging, WAL-fence gating, and the drain that ships.  The
- * visibility watermark, truncation tombstones, and the read-side consumer
- * are follow-up increments and build on what is staged here.
+ * WAL-logged SLRUs' flushed page images to the page store.  Whole-page
+ * images are safe only under the live mirror's single-writer invariant:
+ * pagestore.slru_mirror runs on the branch primary for this timeline, and
+ * other computes consume via pagestore.slru_live_reads without shipping their
+ * local SLRU pages.  Concurrent same-timeline writers would need per-update
+ * merge/WAL reconstruction semantics, not newest whole-page images.  This
+ * file is the write side only: capture, staging, WAL-fence gating, and the
+ * drain that ships.
  *
  * Contract inherited from the hook (slru.h): it fires inside
  * SlruInternalWritePage() while the bank lock is still held, so the page
@@ -38,15 +39,11 @@
  * newest flushed bytes, contents bounded by the version"; readers take the
  * newest image, never an exact as-of.
  *
- * No-drop overflow: a staged image may not be silently dropped -- a reader
- * gating on the (follow-up) watermark would then trust a mirror that is
- * missing status.  If the image queue is full, the page's identity goes to
- * a recapture table instead, and the drain re-snapshots the page's current
- * bytes under its bank lock (or from the local segment file if evicted)
- * with a freshly computed fence -- a later capture event, not the lost
- * bytes served under their old version.  Only if the recapture table also
- * overflows is coverage lost, and that is counted (ps_slru_lost) and
- * warned about so the watermark side can fail conservative.
+ * Overflow is coverage loss: if the image queue is full, the exact flushed
+ * bytes and their version cannot be kept.  The page identity may still go to
+ * a best-effort recapture table so future live reads can catch up, but the
+ * original coverage is already lost and is counted immediately so the
+ * watermark side fails conservative.
  *
  * Post-then-sync, frozen once posted: an entry is popped only after the
  * daemon has durably synced it; until then it stays staged.  And once its
@@ -152,6 +149,7 @@ typedef struct PsSlruRecapture
 								 * this (a same-version post with different
 								 * bytes may still be in flight); Invalid =
 								 * no constraint */
+	bool		loss_counted;
 } PsSlruRecapture;
 
 static PsSlruRecapture ps_slru_recap[PS_SLRU_RECAP_CAPACITY];
@@ -250,6 +248,9 @@ static bool ps_slru_no_rethrow = false;
 static void ps_slru_exit_drain(int code, Datum arg);
 static XLogRecPtr ps_slru_now_lsn(void);
 static bool ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out);
+static void ps_slru_stage_reserved(SlruDesc *ctl, uint32 obj, uint32 pageno,
+								   const char *page, XLogRecPtr fence_lsn,
+								   XLogRecPtr bound);
 
 static void
 ps_slru_register_exit_drain(void)
@@ -413,7 +414,7 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
  */
 static void
 ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
-					   XLogRecPtr fence_floor)
+					   XLogRecPtr fence_floor, bool loss_counted)
 {
 	for (int i = 0; i < PS_SLRU_RECAP_CAPACITY; i++)
 	{
@@ -423,6 +424,7 @@ ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
 		{
 			if (r->fence_floor < fence_floor)
 				r->fence_floor = fence_floor;
+			r->loss_counted |= loss_counted;
 			return;				/* already scheduled */
 		}
 	}
@@ -437,13 +439,15 @@ ps_slru_note_recapture(SlruDesc *ctl, uint32 obj, uint32 pageno,
 			r->obj = obj;
 			r->pageno = pageno;
 			r->fence_floor = fence_floor;
+			r->loss_counted = loss_counted;
 			ps_slru_recap_count++;
 			return;
 		}
 	}
 
 	/* Table full: coverage lost; the watermark side must fail conservative. */
-	ps_slru_note_lost();
+	if (!loss_counted)
+		ps_slru_note_lost();
 }
 
 static void
@@ -451,7 +455,8 @@ ps_slru_recapture_lost(PsSlruRecapture *r)
 {
 	if (!r->used)
 		return;
-	ps_slru_note_lost();
+	if (!r->loss_counted)
+		ps_slru_note_lost();
 	r->used = false;
 	ps_slru_recap_count--;
 }
@@ -463,8 +468,9 @@ ps_slru_recapture_lost(PsSlruRecapture *r)
  * is what makes version order equal capture order.
  */
 static void
-ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
-			  XLogRecPtr fence_lsn, XLogRecPtr bound)
+ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
+					   const char *page, XLogRecPtr fence_lsn,
+					   XLogRecPtr bound, bool version_reserved)
 {
 	int			free_slot = -1;
 
@@ -492,7 +498,7 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 					if (!XLogRecPtrIsInvalid(p->posted_fence))
 					{
 						ps_slru_note_recapture(ctl, obj, pageno,
-											   p->posted_fence);
+											   p->posted_fence, false);
 						return;
 					}
 
@@ -502,9 +508,10 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 					 * (group LSNs reset on eviction/reload) must not
 					 * un-fence bits the older image already carried.
 					 */
-					if (!ps_slru_try_reserve_version(obj, pageno, bound))
+					if (!version_reserved &&
+						!ps_slru_try_reserve_version(obj, pageno, bound))
 					{
-						ps_slru_note_recapture(ctl, obj, pageno, bound);
+						ps_slru_note_recapture(ctl, obj, pageno, bound, false);
 						return;
 					}
 					memcpy(p->image, page, BLCKSZ);
@@ -523,9 +530,10 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 		{
 			PsSlruPending *p = &ps_slru_queue[free_slot];
 
-			if (!ps_slru_try_reserve_version(obj, pageno, bound))
+			if (!version_reserved &&
+				!ps_slru_try_reserve_version(obj, pageno, bound))
 			{
-				ps_slru_note_recapture(ctl, obj, pageno, bound);
+				ps_slru_note_recapture(ctl, obj, pageno, bound, false);
 				return;
 			}
 			p->used = true;
@@ -543,11 +551,28 @@ ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
 	}
 
 	/*
-	 * Queue full: record the page identity for recapture at drain time.
-	 * No bytes have been posted for this image, so unlike posted-entry
-	 * recaptures this does not need a strictly-newer version fence.
+	 * Queue full: exact coverage for this flushed image is already lost.
+	 * Count that immediately, then keep a best-effort identity for a later
+	 * recapture so readers can eventually catch up without letting the
+	 * watermark claim continuous coverage over the hole.
 	 */
-	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr);
+	ps_slru_note_lost();
+	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr, true);
+}
+
+static void
+ps_slru_stage(SlruDesc *ctl, uint32 obj, uint32 pageno, const char *page,
+			  XLogRecPtr fence_lsn, XLogRecPtr bound)
+{
+	ps_slru_stage_internal(ctl, obj, pageno, page, fence_lsn, bound, false);
+}
+
+static void
+ps_slru_stage_reserved(SlruDesc *ctl, uint32 obj, uint32 pageno,
+					   const char *page, XLogRecPtr fence_lsn,
+					   XLogRecPtr bound)
+{
+	ps_slru_stage_internal(ctl, obj, pageno, page, fence_lsn, bound, true);
 }
 
 /*
@@ -777,31 +802,58 @@ ps_slru_queue_holds_posted(uint32 obj, uint32 pageno)
 }
 
 static bool
-ps_slru_defer_below_store_high(PsSlruPending *p)
+ps_slru_defer_below_store_high(PsSlruPending *p, TimestampTz drain_start,
+							   bool *budget_out)
 {
 	PageStoreRelKey key;
 	char		tmp[BLCKSZ];
 	uint64		resolved;
+	long		elapsed;
+	int			timeout_ms;
 
 	if (!XLogRecPtrIsInvalid(p->posted_fence))
 		return false;			/* retry the byte-identical posted version */
+
+	elapsed = TimestampDifferenceMilliseconds(drain_start,
+											  GetCurrentTimestamp());
+	if (elapsed >= PS_SLRU_DRAIN_BUDGET_MS)
+	{
+		*budget_out = true;
+		return false;
+	}
+	timeout_ms = Min(PS_SLRU_SHIP_TIMEOUT_MS,
+					 (int) (PS_SLRU_DRAIN_BUDGET_MS - elapsed));
 
 	ps_slru_obj_key(&key, p->obj);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE, &key,
 												(BlockNumber) p->pageno,
 												PG_UINT64_MAX, tmp, &resolved,
-												PS_SLRU_SHIP_TIMEOUT_MS))
+												timeout_ms))
+	{
+		if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
+									   PS_SLRU_DRAIN_BUDGET_MS))
+			*budget_out = true;
 		return false;
+	}
 
 	ps_slru_observe_version(p->obj, p->pageno, (XLogRecPtr) resolved);
 	if (resolved < (uint64) p->bound)
+	{
+		if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
+									   PS_SLRU_DRAIN_BUDGET_MS))
+			*budget_out = true;
 		return false;
+	}
 
-	ps_slru_note_recapture(p->ctl, p->obj, p->pageno, (XLogRecPtr) resolved);
+	ps_slru_note_recapture(p->ctl, p->obj, p->pageno, (XLogRecPtr) resolved,
+						   false);
 	p->used = false;
 	p->shipped = false;
 	p->posted_fence = InvalidXLogRecPtr;
 	ps_slru_queue_count--;
+	if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
+								   PS_SLRU_DRAIN_BUDGET_MS))
+		*budget_out = true;
 	return true;
 }
 
@@ -844,7 +896,7 @@ ps_slru_service_recaptures(TimestampTz drain_start, bool *budget_out)
 		 * the write hook would resample a later position and could version
 		 * these (possibly stale) bytes past a newer concurrent capture's.
 		 */
-		ps_slru_stage(r->ctl, r->obj, r->pageno, image, fence, bound);
+		ps_slru_stage_reserved(r->ctl, r->obj, r->pageno, image, fence, bound);
 		r->used = false;
 		ps_slru_recap_count--;
 		staged = true;
@@ -907,8 +959,14 @@ post_again:
 			if (!p->used)
 				continue;
 
-			if (ps_slru_defer_below_store_high(p))
+			if (ps_slru_defer_below_store_high(p, drain_start, &budget_out))
+			{
+				if (budget_out)
+					break;
 				continue;
+			}
+			if (budget_out)
+				break;
 
 			if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
 										   PS_SLRU_DRAIN_BUDGET_MS))
@@ -1090,6 +1148,38 @@ ps_slru_process_utility(PlannedStmt *pstmt, const char *queryString,
 	pagestore_slru_mirror_drain();
 }
 
+/*
+ * Transaction-end ship point.  ExecutorEnd has already run before
+ * CommitTransactionCommand() updates pg_xact/commit_ts, so DML commit can
+ * stage SLRU bytes after the executor drain.  PREPARE also ends the
+ * originating transaction; COMMIT PREPARED may run elsewhere.
+ */
+static void
+ps_slru_xact_drain(XactEvent event, void *arg)
+{
+	bool		old_no_rethrow;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE)
+		return;
+	if (CritSectionCount > 0)
+		return;
+
+	old_no_rethrow = ps_slru_no_rethrow;
+	ps_slru_no_rethrow = true;
+	PG_TRY();
+	{
+		pagestore_slru_mirror_drain();
+	}
+	PG_CATCH();
+	{
+		ps_slru_no_rethrow = old_no_rethrow;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ps_slru_no_rethrow = old_no_rethrow;
+}
+
 /* before_shmem_exit: last chance to ship what this process staged. */
 static void
 ps_slru_exit_drain(int code, Datum arg)
@@ -1225,6 +1315,7 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	ExecutorEnd_hook = ps_slru_executor_end;
 	prev_ProcessUtility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = ps_slru_process_utility;
+	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
 	/* the loss counter is shared: most SLRU flushing is the checkpointer's */
 	prev_slru_shmem_request_hook = shmem_request_hook;
