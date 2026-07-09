@@ -77,6 +77,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -86,6 +87,7 @@
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -99,6 +101,8 @@ static bool pagestore_slru_mirror = false;
 
 static bool ps_slru_mirror_enabled = false;
 static slru_page_write_hook_type prev_slru_page_write_hook = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 /* Per-op mailbox timeout and whole-drain budget; see the control mirror. */
 #define PS_SLRU_SHIP_TIMEOUT_MS		10000
@@ -174,7 +178,14 @@ static int	ps_slru_recap_count = 0;
  */
 static uint64 ps_slru_lost = 0;
 static uint64 ps_slru_lost_reported = 0;
-static bool ps_slru_exit_registered = false;
+
+/*
+ * PID that registered this process's exit drain.  Keyed by PID, not a bool:
+ * _PG_init runs in the postmaster, whose forked children inherit the static
+ * but get their before_shmem_exit list cleared, so a bool would make every
+ * child skip registration forever.
+ */
+static int	ps_slru_exit_registered_pid = 0;
 
 /*
  * True while draining from a place where an ERROR must not escape: the
@@ -264,6 +275,10 @@ typedef struct PsSlruWatermarkShm
 {
 	pg_atomic_uint64 watermark;
 	pg_atomic_uint64 candidate;
+	pg_atomic_uint64 candidate_floor;	/* reject candidates at/below this:
+										 * set by reset_debt so only
+										 * checkpoints started after the
+										 * reset can seed the watermark */
 	pg_atomic_uint64 total_lost;
 	pg_atomic_uint64 stats_lost;	/* raw loss events, for observability --
 									 * unlike total_lost it is not seeded
@@ -316,10 +331,10 @@ static shmem_startup_hook_type prev_slru_shmem_startup_hook = NULL;
 static void
 ps_slru_register_exit_drain(void)
 {
-	if (ps_slru_exit_registered)
+	if (ps_slru_exit_registered_pid == MyProcPid)
 		return;
 	before_shmem_exit(ps_slru_exit_drain, (Datum) 0);
-	ps_slru_exit_registered = true;
+	ps_slru_exit_registered_pid = MyProcPid;
 }
 
 /*
@@ -424,12 +439,25 @@ ps_slru_observe_version(uint32 obj, uint32 pageno, XLogRecPtr version)
 	}
 }
 
+/*
+ * Reserve 'bound' as the version of the next ship of (obj, pageno): succeeds
+ * only if it is strictly above every version already reserved for the page,
+ * so equal capture-time samples are lifted into strict capture order.  On
+ * failure, *exhausted distinguishes a version conflict (a retry with a later
+ * bound can succeed) from probe exhaustion: every probed slot is held by
+ * some other page.  Slots are never evicted -- eviction would forget the
+ * page's version floor and re-admit a same-version, different-bytes ship --
+ * so exhaustion is permanent for this page and the caller must count a
+ * conservative loss instead of retrying forever.
+ */
 static bool
-ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
+ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound,
+							bool *exhausted)
 {
 	PsSlruVersionSlot *slot;
 	uint32		h;
 
+	*exhausted = false;
 	if (XLogRecPtrIsInvalid(bound))
 		return false;
 	if (ps_slru_wm == NULL)
@@ -463,6 +491,7 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 		}
 		SpinLockRelease(&slot->mutex);
 	}
+	*exhausted = true;
 	return false;
 }
 
@@ -533,6 +562,7 @@ ps_slru_shmem_startup(void)
 
 		pg_atomic_init_u64(&ps_slru_wm->watermark, 0);
 		pg_atomic_init_u64(&ps_slru_wm->candidate, 0);
+		pg_atomic_init_u64(&ps_slru_wm->candidate_floor, 0);
 		pg_atomic_init_u64(&ps_slru_wm->total_lost, debt ? 1 : 0);
 		pg_atomic_init_u64(&ps_slru_wm->stats_lost, 0);
 		pg_atomic_init_u64(&ps_slru_wm->loss_generation, debt ? 1 : 0);
@@ -559,10 +589,24 @@ ps_slru_shmem_startup(void)
 
 		/*
 		 * Boot debt must not wait for a drain to be persisted: a clean
-		 * shutdown before any drain would otherwise forget it.
+		 * shutdown before any drain would otherwise forget it.  And it must
+		 * not start up unpersisted at all -- if the marker cannot be made
+		 * durable now, later attempts will likely keep failing too, and a
+		 * clean shutdown would then boot the next life with a DB_SHUTDOWNED
+		 * pg_control, no debt marker, and an existing primed marker: the
+		 * loss forgotten and the watermark free to advance over it.  Fail
+		 * closed instead.
 		 */
 		if (debt)
+		{
 			ps_slru_debt_persist();
+			if (pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0)
+				ereport(ERROR,
+						(errmsg("pagestore: could not persist SLRU mirror debt marker \"%s\"",
+								PS_SLRU_DEBT_FILE),
+						 errdetail("Boot-time mirror debt must be durable before startup can continue, or a clean shutdown could forget it."),
+						 errhint("Fix data directory permissions or disable pagestore.slru_mirror.")));
+		}
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -825,9 +869,6 @@ ps_slru_wm_advance(void)
 	 */
 	ps_slru_wm_sweep_dead_pending(true, true);
 
-	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
-	if (cand == 0)
-		return;
 	/*
 	 * Any loss, ever -- including the boot debt of an unclean previous life
 	 * -- freezes the watermark for good: the missing image's page is clean
@@ -837,6 +878,21 @@ ps_slru_wm_advance(void)
 	 * the debt.
 	 */
 	if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+		return;
+
+	/*
+	 * Read the candidate and its floor only after observing zero losses:
+	 * reset_debt orders floor-raise, candidate-clear, then the total_lost
+	 * CAS (a full barrier), so a zero read above means both writes are
+	 * visible below.  A candidate at or below the floor stems from a
+	 * checkpoint that started before the last reset (its redo predates the
+	 * reset's WAL sample) and must never seed the watermark -- the reset's
+	 * clear can race a control-mirror drain re-posting exactly such a redo.
+	 */
+	pg_read_barrier();
+	cand = pg_atomic_read_u64(&ps_slru_wm->candidate);
+	if (cand == 0 ||
+		cand <= pg_atomic_read_u64(&ps_slru_wm->candidate_floor))
 		return;
 
 	for (int i = 0; i < ps_slru_wm_nprocs; i++)
@@ -897,6 +953,17 @@ void
 pagestore_slru_note_checkpoint_redo(XLogRecPtr redo)
 {
 	if (ps_slru_wm == NULL || XLogRecPtrIsInvalid(redo))
+		return;
+
+	/*
+	 * A redo at or below the candidate floor is from a checkpoint that
+	 * started before the last debt reset; it may vouch for flush cycles
+	 * that ran while the mirror was frozen and unprimed.  Only checkpoints
+	 * started after the reset produce candidates above the floor.  (This
+	 * check can race the reset's floor-raise; ps_slru_wm_advance() enforces
+	 * the floor again before every publish, which closes that window.)
+	 */
+	if ((uint64) redo <= pg_atomic_read_u64(&ps_slru_wm->candidate_floor))
 		return;
 
 	for (;;)
@@ -1014,11 +1081,27 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 					 * (group LSNs reset on eviction/reload) must not
 					 * un-fence bits the older image already carried.
 					 */
-					if (!version_reserved &&
-						!ps_slru_try_reserve_version(obj, pageno, bound))
+					if (!version_reserved)
 					{
-						ps_slru_note_recapture(ctl, obj, pageno, bound, false);
-						return;
+						bool		exhausted;
+
+						if (!ps_slru_try_reserve_version(obj, pageno, bound,
+														 &exhausted))
+						{
+							/*
+							 * Probe exhaustion never heals (see the
+							 * reservation helper): recapture would retry
+							 * forever with the pending floor stuck at 1.
+							 * Count the loss so the watermark freezes with
+							 * operator-visible debt instead.
+							 */
+							if (exhausted)
+								ps_slru_note_lost();
+							else
+								ps_slru_note_recapture(ctl, obj, pageno,
+													   bound, false);
+							return;
+						}
 					}
 					memcpy(p->image, page, BLCKSZ);
 					ps_slru_wm_note_pending(fence_lsn);
@@ -1037,11 +1120,19 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 		{
 			PsSlruPending *p = &ps_slru_queue[free_slot];
 
-			if (!version_reserved &&
-				!ps_slru_try_reserve_version(obj, pageno, bound))
+			if (!version_reserved)
 			{
-				ps_slru_note_recapture(ctl, obj, pageno, bound, false);
-				return;
+				bool		exhausted;
+
+				if (!ps_slru_try_reserve_version(obj, pageno, bound,
+												 &exhausted))
+				{
+					if (exhausted)
+						ps_slru_note_lost();
+					else
+						ps_slru_note_recapture(ctl, obj, pageno, bound, false);
+					return;
+				}
 			}
 			ps_slru_wm_note_pending(fence_lsn);
 			p->used = true;
@@ -1115,10 +1206,19 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	now = ps_slru_now_lsn();
 	if (XLogRecPtrIsInvalid(fence_lsn))
 		fence_lsn = now;
-	if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now))
 	{
-		ps_slru_note_recapture(ctl, obj, (uint32) pageno, now, false);
-		return;
+		bool		exhausted;
+
+		if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now,
+										 &exhausted))
+		{
+			/* exhaustion is permanent: fail conservative, not recapture */
+			if (exhausted)
+				ps_slru_note_lost();
+			else
+				ps_slru_note_recapture(ctl, obj, (uint32) pageno, now, false);
+			return;
+		}
 	}
 
 	ps_slru_stage_reserved(ctl, obj, (uint32) pageno, page, fence_lsn, now);
@@ -1192,6 +1292,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 	int			bankstart = ((int) (r->pageno % ctl->nbanks)) * slots_per_bank;
 	bool		found = false;
 	bool		reserved = false;
+	bool		exhausted = false;
 
 	LWLockAcquire(banklock, LW_SHARED);
 	for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
@@ -1223,7 +1324,8 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 			*fence = *bound = ps_slru_now_lsn();
 			reserved = (XLogRecPtrIsInvalid(r->fence_floor) ||
 						*bound > r->fence_floor) &&
-				ps_slru_try_reserve_version(r->obj, r->pageno, *bound);
+				ps_slru_try_reserve_version(r->obj, r->pageno, *bound,
+											&exhausted);
 			found = true;
 			break;
 		}
@@ -1231,7 +1333,16 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 	LWLockRelease(banklock);
 
 	if (found)
+	{
+		/*
+		 * Version-table exhaustion never heals; retrying this recapture
+		 * every drain would pin the pending floor at 1 forever without any
+		 * operator-visible debt.  Convert it to a counted loss instead.
+		 */
+		if (!reserved && exhausted)
+			ps_slru_recapture_lost(r);
 		return reserved;
+	}
 
 	/*
 	 * Evicted: the bytes were flushed locally; read the segment file --
@@ -1284,12 +1395,16 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 				*fence = *bound = ps_slru_now_lsn();
 				reserved = (XLogRecPtrIsInvalid(r->fence_floor) ||
 							*bound > r->fence_floor) &&
-					ps_slru_try_reserve_version(r->obj, r->pageno, *bound);
+					ps_slru_try_reserve_version(r->obj, r->pageno, *bound,
+												&exhausted);
 			}
 		}
 		LWLockRelease(banklock);
 		CloseTransientFile(fd);
 
+		/* same as the resident path: exhaustion is permanent, count it */
+		if (!resident && n == BLCKSZ && !reserved && exhausted)
+			ps_slru_recapture_lost(r);
 		return !resident && n == BLCKSZ && reserved;
 	}
 }
@@ -1310,7 +1425,7 @@ ps_slru_queue_holds_posted(uint32 obj, uint32 pageno)
 }
 
 static bool
-ps_slru_defer_below_store_high(PsSlruPending *p)
+ps_slru_defer_below_store_high(PsSlruPending *p, int timeout_ms)
 {
 	PageStoreRelKey key;
 	char		tmp[BLCKSZ];
@@ -1319,11 +1434,18 @@ ps_slru_defer_below_store_high(PsSlruPending *p)
 	if (!XLogRecPtrIsInvalid(p->posted_fence))
 		return false;			/* retry the byte-identical posted version */
 
+	/*
+	 * The probe timeout is capped by the caller to the drain budget's
+	 * remainder: with a slow or unreachable daemon, a full per-page
+	 * PS_SLRU_SHIP_TIMEOUT_MS here would multiply by queue depth and blow
+	 * far past PS_SLRU_DRAIN_BUDGET_MS before the caller's budget check
+	 * runs.
+	 */
 	ps_slru_obj_key(&key, p->obj);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_SLRU_LIVE, &key,
 												(BlockNumber) p->pageno,
 												PG_UINT64_MAX, tmp, &resolved,
-												PS_SLRU_SHIP_TIMEOUT_MS))
+												timeout_ms))
 		return false;
 
 	ps_slru_observe_version(p->obj, p->pageno, (XLogRecPtr) resolved);
@@ -1449,19 +1571,23 @@ post_again:
 			PsSlruPending *p = &ps_slru_queue[i];
 			PageStoreRelKey key = {0};
 			XLogRecPtr	version;
+			long		elapsed_ms;
 
 			if (!p->used)
 				continue;
 
-			if (ps_slru_defer_below_store_high(p))
-				continue;
-
-			if (TimestampDifferenceExceeds(drain_start, GetCurrentTimestamp(),
-										   PS_SLRU_DRAIN_BUDGET_MS))
+			elapsed_ms = TimestampDifferenceMilliseconds(drain_start,
+														 GetCurrentTimestamp());
+			if (elapsed_ms >= PS_SLRU_DRAIN_BUDGET_MS)
 			{
 				budget_out = true;
 				break;
 			}
+
+			if (ps_slru_defer_below_store_high(p,
+											   (int) Min(PS_SLRU_SHIP_TIMEOUT_MS,
+														 PS_SLRU_DRAIN_BUDGET_MS - elapsed_ms)))
+				continue;
 
 			/*
 			 * A retry of an already-posted entry must reuse the posted
@@ -1622,6 +1748,70 @@ pagestore_slru_mirror_drain(void)
 	if (CritSectionCount > 0)
 		return;
 	ps_slru_drain();
+}
+
+/*
+ * Backend drain points.  Regular backends stage images too (any dirty-slot
+ * eviction in SlruSelectLRUPage() runs the write hook), and only the
+ * checkpointer reliably reaches the control mirror's flush hook -- without
+ * these a long-lived session would sit on its pending floor until
+ * disconnect and stall the watermark across otherwise complete checkpoints.
+ */
+static void
+ps_slru_executor_end(QueryDesc *queryDesc)
+{
+	if (prev_ExecutorEnd_hook)
+		prev_ExecutorEnd_hook(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+	pagestore_slru_mirror_drain();
+}
+
+static void
+ps_slru_process_utility(PlannedStmt *pstmt, const char *queryString,
+						bool readOnlyTree, ProcessUtilityContext context,
+						ParamListInfo params, QueryEnvironment *queryEnv,
+						DestReceiver *dest, QueryCompletion *qc)
+{
+	if (prev_ProcessUtility_hook)
+		prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context,
+								 params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+	pagestore_slru_mirror_drain();
+}
+
+/*
+ * Transaction-end ship point.  ExecutorEnd has already run before
+ * CommitTransactionCommand() updates pg_xact/commit_ts, so DML commit can
+ * stage SLRU bytes after the executor drain.  PREPARE also ends the
+ * originating transaction; COMMIT PREPARED may run elsewhere.
+ */
+static void
+ps_slru_xact_drain(XactEvent event, void *arg)
+{
+	bool		old_no_rethrow;
+
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE)
+		return;
+	if (CritSectionCount > 0)
+		return;
+
+	old_no_rethrow = ps_slru_no_rethrow;
+	ps_slru_no_rethrow = true;
+	PG_TRY();
+	{
+		pagestore_slru_mirror_drain();
+	}
+	PG_CATCH();
+	{
+		ps_slru_no_rethrow = old_no_rethrow;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ps_slru_no_rethrow = old_no_rethrow;
 }
 
 /* before_shmem_exit: last chance to ship what this process staged. */
@@ -1797,7 +1987,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
 	 * Discard the standing candidate before unfreezing debt: it may stem
 	 * from a checkpoint that completed while the mirror was frozen and
 	 * unprimed, and a concurrent drain must not publish it after the CAS.
+	 * Clearing alone is racy -- a control-mirror drain can re-post such a
+	 * redo right after the clear -- so first raise the candidate floor to
+	 * the current WAL position: any checkpoint that started before this
+	 * reset has its redo at or below the sample, and both the noter and
+	 * the advance path reject candidates at or below the floor.
 	 */
+	pg_atomic_write_u64(&ps_slru_wm->candidate_floor,
+						(uint64) ps_slru_now_lsn());
 	pg_atomic_write_u64(&ps_slru_wm->candidate, 0);
 
 	if (pg_atomic_read_u64(&ps_slru_wm->loss_generation) != loss_generation ||
@@ -1934,6 +2131,11 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	ps_slru_register_exit_drain();
 	prev_slru_page_write_hook = slru_page_write_hook;
 	slru_page_write_hook = ps_slru_write_hook;
+	prev_ExecutorEnd_hook = ExecutorEnd_hook;
+	ExecutorEnd_hook = ps_slru_executor_end;
+	prev_ProcessUtility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = ps_slru_process_utility;
+	RegisterXactCallback(ps_slru_xact_drain, NULL);
 
 	/* watermark, floors, and shared stats all live in shared memory */
 	prev_shmem_request_hook = shmem_request_hook;
