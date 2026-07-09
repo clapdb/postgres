@@ -1671,6 +1671,103 @@ SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 }
 
 /*
+ * Write out every dirty resident page preceding cutoffPage and wait out
+ * in-flight I/O, WITHOUT emptying the slots.
+ *
+ * The abortable pre-record window of a mirrored truncation uses this
+ * instead of SimpleLruDiscardCutoff(): flushed-not-discarded pages lose
+ * nothing if the truncation is then abandoned (WAL insertion or barrier
+ * failure), while still guaranteeing no doomed page remains flushable
+ * after the truncate record exists -- a flush here runs the write hook
+ * BEFORE the record, so any captured image is versioned below trunc_lsn
+ * and the tombstone outranks it.
+ */
+void
+SimpleLruFlushCutoff(SlruDesc *ctl, int64 cutoffPage)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
+	prevbank = SlotGetBankNumber(0);
+	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
+	for (int slotno = 0; slotno < shared->num_slots; slotno++)
+	{
+		int			curbank = SlotGetBankNumber(slotno);
+
+		if (curbank != prevbank)
+		{
+			LWLockRelease(&shared->bank_locks[prevbank].lock);
+			LWLockAcquire(&shared->bank_locks[curbank].lock, LW_EXCLUSIVE);
+			prevbank = curbank;
+		}
+
+		if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)
+			continue;
+		if (!ctl->options.PagePrecedes(shared->page_number[slotno], cutoffPage))
+			continue;
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
+			!shared->page_dirty[slotno])
+			continue;
+
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
+			SlruInternalWritePage(ctl, slotno, NULL);
+		else
+			SimpleLruWaitIO(ctl, slotno);
+
+		LWLockRelease(&shared->bank_locks[prevbank].lock);
+		goto restart;
+	}
+
+	LWLockRelease(&shared->bank_locks[prevbank].lock);
+}
+
+/*
+ * Empty every resident page, discarding dirty ones.  For delete-all resets
+ * (commit-ts deactivation): leftover dirty slots would otherwise be flushed
+ * by a later SimpleLruWriteAll(), recreating just-deleted segments and --
+ * with a mirror write hook installed -- publishing images that outrank the
+ * reset's delete-all tombstone.
+ */
+void
+SimpleLruDiscardAll(SlruDesc *ctl)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
+	prevbank = SlotGetBankNumber(0);
+	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
+	for (int slotno = 0; slotno < shared->num_slots; slotno++)
+	{
+		int			curbank = SlotGetBankNumber(slotno);
+
+		if (curbank != prevbank)
+		{
+			LWLockRelease(&shared->bank_locks[prevbank].lock);
+			LWLockAcquire(&shared->bank_locks[curbank].lock, LW_EXCLUSIVE);
+			prevbank = curbank;
+		}
+
+		if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)
+			continue;
+
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
+
+		SimpleLruWaitIO(ctl, slotno);
+		LWLockRelease(&shared->bank_locks[prevbank].lock);
+		goto restart;
+	}
+
+	LWLockRelease(&shared->bank_locks[prevbank].lock);
+}
+
+/*
  * Empty every resident page preceding cutoffPage, discarding dirty ones.
  *
  * A valid dirty page below the cutoff is already logically truncated:

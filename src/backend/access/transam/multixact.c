@@ -2809,9 +2809,9 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 			offset_ok = !MultiXactOffsetCtl->options.PagePrecedes(pg_atomic_read_u64(&MultiXactOffsetCtl->shared->latest_page_number),
 																  offsetCutoff);
 			if (member_ok)
-				SimpleLruDiscardCutoff(MultiXactMemberCtl, memberCutoff);
+				SimpleLruFlushCutoff(MultiXactMemberCtl, memberCutoff);
 			if (offset_ok)
-				SimpleLruDiscardCutoff(MultiXactOffsetCtl, offsetCutoff);
+				SimpleLruFlushCutoff(MultiXactOffsetCtl, offsetCutoff);
 		}
 
 		trunc_lsn = WriteMTruncateXlogRec(newOldestMultiDB, newOldestMulti,
