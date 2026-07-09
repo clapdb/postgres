@@ -277,7 +277,18 @@ ps_slru_served_tag(uint32 obj, uint32 pageno)
  * The visibility watermark (mirrored_status_lsn): an LSN W such that every
  * in-scope SLRU status change with WAL position <= W is durably mirrored.
  * A reader on another compute may trust the live mirror for status up to W
- * and no further.  W advances only over a contiguous durable prefix:
+ * and no further.
+ *
+ * W is a completeness floor, NOT a read position: a status change <= W may
+ * live only in an image whose version exceeds W (the image's version is its
+ * capture-time WAL bound, and a checkpoint's flush cycle captures pages
+ * while WAL keeps advancing past its redo).  A reader gates on W and then
+ * takes the page's NEWEST image (read at max) -- SLRU page bytes are
+ * cumulative, so the newest image carries every bit any older image had.
+ * Reading AT W would silently miss bits carried only by a higher-versioned
+ * image.
+ *
+ * W advances only over a contiguous durable prefix:
  *
  * - The *candidate* for W is the redo pointer of the last completed
  *   checkpoint whose pg_control image has durably shipped (the control
@@ -362,6 +373,8 @@ typedef struct PsSlruWatermarkShm
 	pg_atomic_uint64 debt_generation;
 	pg_atomic_uint64 pending_owner_next;
 	pg_atomic_uint32 debt_unpersisted;	/* a loss awaits the marker file */
+	pg_atomic_uint64 version_evict_floor;	/* all evicted slots' versions
+											 * are at/below this */
 	PsSlruVersionSlot version_slot[PS_SLRU_VERSION_SLOTS];
 
 	/*
@@ -614,24 +627,48 @@ ps_slru_observe_version(uint32 obj, uint32 pageno, XLogRecPtr version)
 }
 
 /*
+ * Fold 'version' into the global eviction floor (monotonic max).  Any page
+ * whose slot was evicted had its versions at/below the floor, so requiring
+ * every slotless reservation to be strictly above it preserves the
+ * strict-order guarantee across evictions.
+ */
+static void
+ps_slru_version_floor_raise(XLogRecPtr version)
+{
+	for (;;)
+	{
+		uint64		cur = pg_atomic_read_u64(&ps_slru_wm->version_evict_floor);
+
+		if ((uint64) version <= cur ||
+			pg_atomic_compare_exchange_u64(&ps_slru_wm->version_evict_floor,
+										   &cur, (uint64) version))
+			break;
+	}
+}
+
+/*
  * Reserve 'bound' as the version of the next ship of (obj, pageno): succeeds
  * only if it is strictly above every version already reserved for the page,
- * so equal capture-time samples are lifted into strict capture order.  On
- * failure, *exhausted distinguishes a version conflict (a retry with a later
- * bound can succeed) from probe exhaustion: every probed slot is held by
- * some other page.  Slots are never evicted -- eviction would forget the
- * page's version floor and re-admit a same-version, different-bytes ship --
- * so exhaustion is permanent for this page and the caller must count a
- * conservative loss instead of retrying forever.
+ * so equal capture-time samples are lifted into strict capture order.  A
+ * failure is always retryable: either the page's slot holds an equal/higher
+ * version (a later capture samples a higher bound), or the bound is not
+ * provably above the eviction floor (and WAL advances past any floor).
+ *
+ * A page with no slot must reserve strictly above the eviction floor: its
+ * slot may have been evicted, and the forgotten per-page floor is at or
+ * below the global one by construction.  When every probed slot belongs to
+ * some other page, the smallest-version one is evicted (its version folded
+ * into the floor first), so a saturated table degrades to transient
+ * deferrals instead of permanent failure.
  */
 static bool
-ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound,
-							bool *exhausted)
+ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound)
 {
 	PsSlruVersionSlot *slot;
+	PsSlruVersionSlot *victim = NULL;
+	XLogRecPtr	victim_version = InvalidXLogRecPtr;
 	uint32		h;
 
-	*exhausted = false;
 	if (XLogRecPtrIsInvalid(bound))
 		return false;
 	if (ps_slru_wm == NULL)
@@ -645,6 +682,12 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound,
 		SpinLockAcquire(&slot->mutex);
 		if (!slot->valid)
 		{
+			if ((uint64) bound <=
+				pg_atomic_read_u64(&ps_slru_wm->version_evict_floor))
+			{
+				SpinLockRelease(&slot->mutex);
+				return false;	/* possibly-evicted page: floor applies */
+			}
 			slot->valid = true;
 			slot->obj = obj;
 			slot->pageno = pageno;
@@ -663,10 +706,45 @@ ps_slru_try_reserve_version(uint32 obj, uint32 pageno, XLogRecPtr bound,
 			SpinLockRelease(&slot->mutex);
 			return false;
 		}
+		if (victim == NULL || slot->version < victim_version)
+		{
+			victim = slot;
+			victim_version = slot->version;
+		}
 		SpinLockRelease(&slot->mutex);
 	}
-	*exhausted = true;
-	return false;
+
+	/*
+	 * Every probed slot belongs to another page: evict the smallest-version
+	 * one.  Re-check under the lock -- the slot may have been re-pointed at
+	 * our page (or refilled) since the probe pass.
+	 */
+	SpinLockAcquire(&victim->mutex);
+	if (victim->valid && victim->obj == obj && victim->pageno == pageno)
+	{
+		if (bound > victim->version)
+		{
+			victim->version = bound;
+			SpinLockRelease(&victim->mutex);
+			return true;
+		}
+		SpinLockRelease(&victim->mutex);
+		return false;
+	}
+	if (victim->valid)
+		ps_slru_version_floor_raise(victim->version);
+	if ((uint64) bound <=
+		pg_atomic_read_u64(&ps_slru_wm->version_evict_floor))
+	{
+		SpinLockRelease(&victim->mutex);
+		return false;			/* the fold covers this bound too: defer */
+	}
+	victim->valid = true;
+	victim->obj = obj;
+	victim->pageno = pageno;
+	victim->version = bound;
+	SpinLockRelease(&victim->mutex);
+	return true;
 }
 
 /* ---- watermark shared memory ---- */
@@ -743,6 +821,7 @@ ps_slru_shmem_startup(void)
 		pg_atomic_init_u64(&ps_slru_wm->debt_generation, 1);
 		pg_atomic_init_u64(&ps_slru_wm->pending_owner_next, 1);
 		pg_atomic_init_u32(&ps_slru_wm->debt_unpersisted, debt ? 1 : 0);
+		pg_atomic_init_u64(&ps_slru_wm->version_evict_floor, 0);
 		for (int i = 0; i < PS_SLRU_VERSION_SLOTS; i++)
 		{
 			PsSlruVersionSlot *slot = &ps_slru_wm->version_slot[i];
@@ -1054,10 +1133,41 @@ ps_slru_debt_persist(void)
 		}
 	}
 	if (pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0)
+	{
+		int			saved_errno = errno;
+
+		/*
+		 * Marker creation failed.  A clean shutdown must not forget the
+		 * loss (next boot would see DB_SHUTDOWNED + primed + no debt marker
+		 * = clean), so fail closed the other way: revoke the primed marker.
+		 * With neither marker present every future boot carries boot debt,
+		 * whatever the shutdown looked like; the operator reset that heals
+		 * the mirror re-creates the primed marker anyway.  Skip the
+		 * revocation if a reset ran concurrently (it owns the marker state
+		 * now; its own generation guards re-persist any racing loss).  The
+		 * retry flag stays set either way -- the debt marker remains the
+		 * first choice.
+		 */
+		if (pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0 &&
+			generation == pg_atomic_read_u64(&ps_slru_wm->debt_generation))
+		{
+			if (unlink(PS_SLRU_PRIMED_FILE) == 0 || errno == ENOENT)
+			{
+				int			dfd = open(".", O_RDONLY);
+
+				if (dfd >= 0)
+				{
+					(void) fsync(dfd);
+					close(dfd);
+				}
+			}
+		}
+		errno = saved_errno;
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("pagestore: could not persist SLRU mirror debt marker \"%s\": %m",
 						PS_SLRU_DEBT_FILE)));
+	}
 }
 
 static bool
@@ -2267,27 +2377,11 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 					 * (group LSNs reset on eviction/reload) must not
 					 * un-fence bits the older image already carried.
 					 */
-					if (!version_reserved)
+					if (!version_reserved &&
+						!ps_slru_try_reserve_version(obj, pageno, bound))
 					{
-						bool		exhausted;
-
-						if (!ps_slru_try_reserve_version(obj, pageno, bound,
-														 &exhausted))
-						{
-							/*
-							 * Probe exhaustion never heals (see the
-							 * reservation helper): recapture would retry
-							 * forever with the pending floor stuck at 1.
-							 * Count the loss so the watermark freezes with
-							 * operator-visible debt instead.
-							 */
-							if (exhausted)
-								ps_slru_note_lost();
-							else
-								ps_slru_note_recapture(ctl, obj, pageno,
-													   bound, false);
-							return;
-						}
+						ps_slru_note_recapture(ctl, obj, pageno, bound, false);
+						return;
 					}
 					memcpy(p->image, page, BLCKSZ);
 					ps_slru_wm_note_pending(fence_lsn);
@@ -2306,19 +2400,11 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 		{
 			PsSlruPending *p = &ps_slru_queue[free_slot];
 
-			if (!version_reserved)
+			if (!version_reserved &&
+				!ps_slru_try_reserve_version(obj, pageno, bound))
 			{
-				bool		exhausted;
-
-				if (!ps_slru_try_reserve_version(obj, pageno, bound,
-												 &exhausted))
-				{
-					if (exhausted)
-						ps_slru_note_lost();
-					else
-						ps_slru_note_recapture(ctl, obj, pageno, bound, false);
-					return;
-				}
+				ps_slru_note_recapture(ctl, obj, pageno, bound, false);
+				return;
 			}
 			ps_slru_wm_note_pending(fence_lsn);
 			p->used = true;
@@ -2336,13 +2422,17 @@ ps_slru_stage_internal(SlruDesc *ctl, uint32 obj, uint32 pageno,
 	}
 
 	/*
-	 * Queue full: exact coverage for this flushed image is already lost.
-	 * Count that immediately, then keep a best-effort identity for a later
-	 * recapture so readers can eventually catch up without letting the
-	 * watermark claim continuous coverage over the hole.
+	 * Queue full: this image cannot be staged, but the page's identity goes
+	 * to the recapture table and the drain re-snapshots its current bytes --
+	 * which carry every status bit this image had (SLRU page bytes are
+	 * cumulative), so a successful recapture restores coverage without any
+	 * debt.  Until it ships, the recapture pins the pending floor at 1, so
+	 * the watermark cannot advance over the gap; a loss is counted only if
+	 * the recapture table also overflows (inside the helper) or the
+	 * recapture later fails for good (ps_slru_recapture_lost, exit drain,
+	 * dead-owner sweep).
 	 */
-	ps_slru_note_lost();
-	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr, true);
+	ps_slru_note_recapture(ctl, obj, pageno, InvalidXLogRecPtr, false);
 }
 
 static void
@@ -2392,19 +2482,10 @@ ps_slru_write_hook(SlruDesc *ctl, int64 pageno, const char *page,
 	now = ps_slru_now_lsn();
 	if (XLogRecPtrIsInvalid(fence_lsn))
 		fence_lsn = now;
+	if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now))
 	{
-		bool		exhausted;
-
-		if (!ps_slru_try_reserve_version(obj, (uint32) pageno, now,
-										 &exhausted))
-		{
-			/* exhaustion is permanent: fail conservative, not recapture */
-			if (exhausted)
-				ps_slru_note_lost();
-			else
-				ps_slru_note_recapture(ctl, obj, (uint32) pageno, now, false);
-			return;
-		}
+		ps_slru_note_recapture(ctl, obj, (uint32) pageno, now, false);
+		return;
 	}
 
 	ps_slru_stage_reserved(ctl, obj, (uint32) pageno, page, fence_lsn, now);
@@ -2487,7 +2568,6 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 	int			bankstart = ((int) (r->pageno % ctl->nbanks)) * slots_per_bank;
 	bool		found = false;
 	bool		reserved = false;
-	bool		exhausted = false;
 
 	LWLockAcquire(banklock, LW_SHARED);
 	for (int slotno = bankstart; slotno < bankstart + slots_per_bank; slotno++)
@@ -2519,8 +2599,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 			*fence = *bound = ps_slru_now_lsn();
 			reserved = (XLogRecPtrIsInvalid(r->fence_floor) ||
 						*bound > r->fence_floor) &&
-				ps_slru_try_reserve_version(r->obj, r->pageno, *bound,
-											&exhausted);
+				ps_slru_try_reserve_version(r->obj, r->pageno, *bound);
 			found = true;
 			break;
 		}
@@ -2528,16 +2607,7 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 	LWLockRelease(banklock);
 
 	if (found)
-	{
-		/*
-		 * Version-table exhaustion never heals; retrying this recapture
-		 * every drain would pin the pending floor at 1 forever without any
-		 * operator-visible debt.  Convert it to a counted loss instead.
-		 */
-		if (!reserved && exhausted)
-			ps_slru_recapture_lost(r);
 		return reserved;
-	}
 
 	/*
 	 * Evicted: the bytes were flushed locally; read the segment file --
@@ -2590,16 +2660,12 @@ ps_slru_recapture_page(PsSlruRecapture *r, char *image, XLogRecPtr *fence,
 				*fence = *bound = ps_slru_now_lsn();
 				reserved = (XLogRecPtrIsInvalid(r->fence_floor) ||
 							*bound > r->fence_floor) &&
-					ps_slru_try_reserve_version(r->obj, r->pageno, *bound,
-												&exhausted);
+					ps_slru_try_reserve_version(r->obj, r->pageno, *bound);
 			}
 		}
 		LWLockRelease(banklock);
 		CloseTransientFile(fd);
 
-		/* same as the resident path: exhaustion is permanent, count it */
-		if (!resident && n == BLCKSZ && !reserved && exhausted)
-			ps_slru_recapture_lost(r);
 		return !resident && n == BLCKSZ && reserved;
 	}
 }
@@ -3045,6 +3111,26 @@ ps_slru_exit_drain(int code, Datum arg)
 						n)));
 	}
 	ps_slru_debt_persist();
+
+	/*
+	 * Last resort: exiting cleanly while a loss is neither marked on disk
+	 * nor protected by a revoked primed marker would let a clean shutdown
+	 * forget the debt (see ps_slru_debt_persist).  Force crash recovery
+	 * instead -- an unclean boot re-derives the debt from pg_control.
+	 */
+	if (code == 0 && ps_slru_wm != NULL &&
+		pg_atomic_read_u32(&ps_slru_wm->debt_unpersisted) != 0 &&
+		pg_atomic_read_u64(&ps_slru_wm->total_lost) != 0)
+	{
+		struct stat st;
+
+		if (stat(PS_SLRU_PRIMED_FILE, &st) == 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("pagestore: could not make the SLRU mirror coverage loss durable"),
+					 errdetail("Neither the debt marker \"%s\" could be created nor the primed marker \"%s\" removed; a clean shutdown would forget the loss.",
+							   PS_SLRU_DEBT_FILE, PS_SLRU_PRIMED_FILE)));
+	}
 	if (ps_slru_wm != NULL && MyProcNumber != INVALID_PROC_NUMBER &&
 		MyProcNumber < ps_slru_wm_nprocs)
 	{
@@ -3380,6 +3466,14 @@ pagestore_slru_mirror_reset_debt(PG_FUNCTION_ARGS)
  * Read the newest live-mirrored image of an SLRU page with version <= lsn,
  * or NULL if none.  Distinct from pagestore_slru_read_at, which reads the
  * PS_KLASS_SLRU seed-snapshot keyspace.
+ *
+ * Raw store inspection, not the consumer read path.  In particular, passing
+ * the watermark as 'lsn' does NOT return everything the watermark vouches
+ * for: W is a completeness floor, and a status change <= W may be carried
+ * only by an image versioned above W.  A consumer gates on the watermark
+ * and reads the newest image (lsn = FF/FFFFFFFF), as the live-read hooks
+ * do; an explicit lower 'lsn' is only meaningful for debugging what an
+ * as-of-capture prefix of the mirror contained.
  */
 PG_FUNCTION_INFO_V1(pagestore_slru_live_read_at);
 Datum
