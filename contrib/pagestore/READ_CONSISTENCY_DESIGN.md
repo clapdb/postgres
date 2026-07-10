@@ -112,29 +112,28 @@ reconstruction.
    on`, disables the SLRU/control mirrors (nothing legitimate to
    publish),
    refuses to start at all if the localsvc backend is not active (the pin
-   would force the server read-only while capping nothing), and pauses
-   WAL archiving (segments stay `.ready` and ship after
-   unpinning, keeping the store's WAL history gapless).  What pinned-era
-   WAL remains is meta-only -- the shutdown checkpoint record (periodic
-   checkpoints self-skip with no WAL activity).  The archiver splits
-   segments by a pinned-era floor (the WAL insert position when the
-   pinned archiver first ran): segments wholly at/above it are the
-   reader's own divergent WAL and are DISCARDED (reported archived
-   without shipping, so no later unpinned start can replay the backlog
-   over the writer's history -- the store's overlap semantics would let
-   later chunks win); a segment below the floor still holds writer-era
-   bytes and is deferred instead of shipped or swallowed.  Behind the
-   archiver sits a STORE-side invariant: wal_append refuses a chunk
-   whose bytes differ from already-shipped coverage of the same LSN
-   range (identical re-ships stay idempotent and add no duplicate
-   chunk), so even a deferred mixed segment shipped by a later unpinned
-   start -- or any divergent compute, including an accidental second
-   writer -- cannot rewrite the recorded history that later-chunks-win
-   reads would otherwise adopt.  A SECOND compute pinned against a
-   writer's timeline should still never run with archiving configured
-   once unpinned (its refused segments pile up as archive failures);
-   at most one compute per timeline may archive.  The store-write
-   refusals above remain as the fail-closed backstop.  This is the
+   would force the server read-only while capping nothing) or if
+   `archive_mode` is on: a pinned reader must never archive.  No
+   archiver-side heuristic can tell, after the pin is lifted, which
+   retained bytes were the reader's own (a floor recorded at the
+   archiver's first call starts too late after archiver lag; a mixed
+   segment's private suffix would ship as gap-fill the store has no
+   coverage to refuse), so the combination is refused up front and the
+   operator disables archiving for the pinned run.  What pinned-era WAL
+   remains is meta-only -- the shutdown checkpoint record (periodic
+   checkpoints self-skip with no WAL activity) -- and on an unpinned
+   restart of the SAME cluster the completed segments ship as one true
+   chain, gapless.  Behind that sits a STORE-side invariant: wal_append
+   refuses a chunk whose bytes differ from already-shipped coverage of
+   the same LSN range (identical re-ships stay idempotent and add no
+   duplicate chunk), so a divergent compute -- a clone unpinned into a
+   would-be writer, or an accidental second writer -- cannot rewrite
+   recorded history that later-chunks-win reads would otherwise adopt.
+   Reads of WAL-less content fail closed too: a stored relation-page
+   version with LSN 0 (unlogged relations, skip-WAL builds) is not
+   LSN-ordered, so a capped read refuses it rather than serve whatever
+   the writer last flushed.  The store-write refusals above remain as
+   the fail-closed backstop.  This is the
    MECHANISM increment: on its own it freezes page bytes, not the whole
    compute.
 
