@@ -513,7 +513,7 @@ rm -rf "$SEEDOUT"
 # parent's pg_xact_commit_timestamp) and xidB none -- per-record replay, no coalescing.
 $P -c "CREATE FUNCTION pagestore_commit_ts_asof(xid, pg_lsn, pg_lsn, xid) RETURNS timestamptz
         AS 'pagestore','pagestore_commit_ts_asof' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn, xid) RETURNS bytea
         AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_commit_ts(text, pg_lsn, pg_lsn, xid, xid) RETURNS bigint
         AS 'pagestore','pagestore_seed_commit_ts' LANGUAGE C STRICT;" >/dev/null
@@ -550,7 +550,7 @@ cts_per_page=$(( bs / cts_entry_size ))
 ctsPage=$(( ctsA / cts_per_page ))
 ctsSeg=$(printf '%04X' $(( ctsPage / 32 )))
 ctsSeedMd5=$($P -c "SELECT md5(pg_read_binary_file('$CTSSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
-ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL'));")
+ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL', '3'::xid));")
 assert "$ctsSeedMd5" "$ctsReconMd5" "commit-ts seed page == reconstructed as-of-L page"
 rm -rf "$CTSSEED"
 # an empty horizon [x, x) has nothing to reconstruct but must still publish the
@@ -578,6 +578,7 @@ echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
 $P -c "CHECKPOINT;" >/dev/null                                # publish the era horizon
 ctsXA=$($P -c "SELECT oldest_commit_ts_xid FROM pg_control_checkpoint();")
+ctsLmid=$($P -c "SELECT pg_current_wal_lsn();")               # after activation, before any era commit
 ctsE2=$($P -c "WITH w AS (INSERT INTO cts VALUES (3) RETURNING 1) SELECT pg_current_xact_id();")
 ctsL2=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL2', '3'::xid) IS NULL;")" "t" \
@@ -586,6 +587,11 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL2
 	"commit-ts toggle: an era-2 commit reconstructs across the unlogged activation zero"
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
 	"commit-ts toggle: a target inside the off window fails closed"
+# the activation page exists (all-zero) on the parent BEFORE any era commit touches it:
+# ActivateCommitTs created it without WAL, so the applier materializes it from the horizon
+ctsXApage=$(( ctsXA / cts_per_page ))
+assert "$($P -c "SELECT pagestore_commit_ts_page_asof($ctsXApage, '$ctsC', '$ctsLmid', '$ctsXA'::xid) = decode(repeat('00', $bs), 'hex');")" "t" \
+	"commit-ts toggle: the silently-zeroed activation page is served before any era commit"
 TOGSEED=$(mktemp -d)
 tog_next=$(( ctsE2 + 1 ))
 tog_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$TOGSEED', '$ctsC', '$ctsL2', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
@@ -729,7 +735,7 @@ bootClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_xact/$bootClog
 bootClogRecon=$($P -c "SELECT md5(pagestore_clog_page_asof($(( ctsA / cxpp )), '$mxC', '$mxL'));")
 assert "$bootClogMd5" "$bootClogRecon" "branch bootstrap seed pg_xact page == reconstructed as-of-L page"
 bootCtsMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
-bootCtsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$mxC', '$mxL'));")
+bootCtsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$mxC', '$mxL', '3'::xid));")
 assert "$bootCtsMd5" "$bootCtsRecon" "branch bootstrap seed pg_commit_ts page == reconstructed as-of-L page"
 bootMxOff=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
 bootMxMem=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")

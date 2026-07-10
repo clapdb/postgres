@@ -1794,6 +1794,41 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * accumulated state; see the era comments in the scan loops.  A window that ENDS
  * deactivated fails closed (an inactive fork has no commit-ts state to reconstruct).
  */
+#include "catalog/pg_control.h"
+#include "port/pg_crc32c.h"
+
+/*
+ * Read track_commit_timestamp from the mirrored control image as of 'lsn'.
+ * Returns true (with *track set) only for a CRC-valid image at/below lsn;
+ * false means "unknown" and callers must stay conservative.  The control
+ * mirror ships a fresh image at the toggle itself (XLogReportParameters ->
+ * UpdateControlFile), so the flag as of any LSN is faithful whenever an
+ * image exists.
+ */
+static bool
+ps_track_commit_ts_asof(XLogRecPtr lsn, bool *track)
+{
+	PageStoreRelKey key = {0};
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	ControlFileData cf;
+	pg_crc32c	crc;
+
+	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
+		return false;
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
+										(uint64) lsn, page, &resolved))
+		return false;
+	memcpy(&cf, page, sizeof(cf));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, cf.crc))
+		return false;
+	*track = cf.track_commit_timestamp;
+	return true;
+}
+
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
 
@@ -1820,7 +1855,8 @@ ps_commit_ts_set(char *page, int64 pageno, TransactionId xid,
  * commit-ts deactivation.  *deactivated is set if track_commit_timestamp is turned off. */
 static PsClogReplay
 ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
-						 XLogRecPtr target_lsn, bool *deactivated)
+						 XLogRecPtr target_lsn, TransactionId horizon_xid,
+						 bool *deactivated)
 {
 	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
 	XLogReaderState *reader;
@@ -1828,7 +1864,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	XLogRecPtr	scanned = base_lsn;
 	XLogRecPtr	readfrom;
 	PsClogReplay r = {false, false, false};
-	bool		era_active = false;
+	int			off_at_base = -1;	/* lazy: -1 unknown, 0 on, 1 off */
 
 	*deactivated = false;
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -1933,18 +1969,55 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 					r.page_zeroed = false;
 					r.page_truncated = true;	/* absent until touched */
 					*deactivated = true;
-					era_active = false;
-				}
-				else if (*deactivated)
-				{
-					memset(page, 0, BLCKSZ);
-					r.page_zeroed = false;
-					r.page_truncated = true;
-					*deactivated = false;
-					era_active = true;
 				}
 				else
-					era_active = true;	/* weak: no wipe; inference only */
+				{
+					bool		proven = *deactivated;
+
+					/*
+					 * With no in-window false, the record is a real
+					 * activation only if commit-ts was OFF at the base --
+					 * proven by the mirrored control image as of base_lsn
+					 * (unknown = stay conservative and treat it as an
+					 * unrelated restart: never wipe valid state).
+					 */
+					if (!proven)
+					{
+						if (off_at_base < 0)
+						{
+							bool		track;
+
+							off_at_base = (ps_track_commit_ts_asof(base_lsn,
+																   &track) &&
+										   !track) ? 1 : 0;
+						}
+						proven = (off_at_base == 1);
+					}
+					if (proven)
+					{
+						/*
+						 * A proven activation starts the era from nothing.
+						 * Its one silently-zeroed page (ActivateCommitTs
+						 * zeroes the nextXid page WITHOUT WAL; later pages
+						 * have logged ZEROPAGEs) is the caller's horizon
+						 * page; every other page is absent until a logged
+						 * event creates it.
+						 */
+						memset(page, 0, BLCKSZ);
+						if (TransactionIdIsNormal(horizon_xid) &&
+							(int64) (horizon_xid / PS_CTS_XACTS_PER_PAGE) == pageno)
+						{
+							r.page_zeroed = true;
+							r.page_truncated = false;
+						}
+						else
+						{
+							r.page_zeroed = false;
+							r.page_truncated = true;
+						}
+						*deactivated = false;
+					}
+				}
 			}
 			continue;
 		}
@@ -1957,7 +2030,6 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 			xl_xact_parsed_commit parsed;
 			TimestampTz ts;
 			ReplOriginId origin = XLogRecGetOrigin(reader);
-			bool		touches = false;
 
 			ParseCommitRecord(XLogRecGetInfo(reader),
 							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
@@ -1965,25 +2037,6 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 				: parsed.xact_time;
 			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
 				: XLogRecGetXid(reader);
-			touches = TransactionIdIsNormal(xid) &&
-				(int64) (xid / PS_CTS_XACTS_PER_PAGE) == pageno;
-			for (int i = 0; !touches && i < parsed.nsubxacts; i++)
-				touches = TransactionIdIsNormal(parsed.subxacts[i]) &&
-					(int64) (parsed.subxacts[i] / PS_CTS_XACTS_PER_PAGE) == pageno;
-
-			/*
-			 * First commit landing on this page after an in-window
-			 * activation, with no era ZEROPAGE seen: this page is the
-			 * activation's silently-zeroed nextXid page (extensions are
-			 * always WAL-logged), so its era base is all-zero.
-			 */
-			if (touches && era_active && r.page_truncated)
-			{
-				memset(page, 0, BLCKSZ);
-				r.page_zeroed = true;
-				r.page_truncated = false;
-			}
-
 			ps_commit_ts_set(page, pageno, xid, ts, origin);
 			for (int i = 0; i < parsed.nsubxacts; i++)
 				ps_commit_ts_set(page, pageno, parsed.subxacts[i], ts, origin);
@@ -2003,7 +2056,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
  * off in the window (the reconstructed image would not match the parent's). */
 static bool
 ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
-						 XLogRecPtr target_lsn)
+						 XLogRecPtr target_lsn, TransactionId horizon_xid)
 {
 	PageStoreRelKey key;
 	bool		base_found;
@@ -2035,7 +2088,8 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
 	if (target_lsn == base_lsn)
 		return true;
 
-	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn, &deactivated);
+	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn,
+								 horizon_xid, &deactivated);
 
 	if (!r.reached_target && target_lsn != PG_UINT64_MAX)
 		ereport(ERROR,
@@ -2080,7 +2134,7 @@ pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
 	if (TransactionIdIsNormal(oldest) && TransactionIdPrecedes(xid, oldest))
 		PG_RETURN_NULL();
 
-	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target, oldest))
 		PG_RETURN_NULL();		/* page truncated away by the target LSN */
 
 	memcpy(&ts, page + (Size) entryno * PS_CTS_ENTRY_SIZE, sizeof(TimestampTz));
@@ -2096,10 +2150,11 @@ pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
 	int32		pageno = PG_GETARG_INT32(0);
 	XLogRecPtr	base = PG_GETARG_LSN(1);
 	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest = PG_GETARG_TRANSACTIONID(3);
 	char	   *page = palloc(BLCKSZ);
 	bytea	   *result;
 
-	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target, oldest))
 		PG_RETURN_NULL();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2755,14 +2810,34 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 						truncated[idx] = false;
 					}
 				}
-				else if (req_lo >= page_lo && req_lo <= page_hi)
+				else
 				{
-					/* weak activation: zero-base the horizon page only
-					 * where no base snapshot covers it */
-					idx = req_lo - page_lo;
-					if (!base_found[idx] && !zeroed[idx])
+					bool		track;
+
+					/*
+					 * No in-window false: a real activation only if
+					 * commit-ts was OFF at the base, proven by the
+					 * mirrored control image as of base_lsn (the mirror
+					 * ships at the toggle itself, so the flag is faithful
+					 * whenever an image exists; unknown = conservative,
+					 * treat as an unrelated restart and keep everything --
+					 * a genuinely absent base then fails the required-page
+					 * check rather than seeding zeroes over timestamps
+					 * that predate the base).
+					 */
+					if (ps_track_commit_ts_asof(base_lsn, &track) && !track &&
+						req_lo >= page_lo && req_lo <= page_hi)
 					{
-						memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+						memset(pages, 0, np * BLCKSZ);
+						for (int64 p = 0; p < np; p++)
+						{
+							present[p] = false;
+							base_found[p] = false;
+							zeroed[p] = false;
+							truncated[p] = true;
+						}
+						era_reset = true;
+						idx = req_lo - page_lo;
 						present[idx] = true;
 						zeroed[idx] = true;
 						truncated[idx] = false;
