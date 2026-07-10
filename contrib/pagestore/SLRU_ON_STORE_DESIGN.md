@@ -225,9 +225,25 @@ When it is built, the three review rounds established the requirements it must m
   revalidated against both the status watermark **and** truncation tombstones
   (tombstones are a separate versioned negative result with their own
   epoch/invalidation).
-- **Tombstones with a defined version + synchronous truncate barrier.** A store
-  tombstone must be durable before local segment deletion, versioned by the
-  truncation LSN -- which only the WAL-logged SLRUs have.
+- **Tombstones with a defined version + synchronous truncate barrier.**
+  DONE: `slru_truncate_hook` fires before any local segment deletion --
+  `SimpleLruTruncate` (after its wraparound backstop), `SlruDeleteSegment`,
+  and `DeactivateCommitTs()`'s delete-all reset (`PG_INT64_MAX` cutoff).
+  Multixact truncation runs critical, so `TruncateMultiXact()` invokes the
+  hook as a fallible pre-barrier before `START_CRIT_SECTION()`; the
+  in-critical calls find their cutoff covered and no-op.  The consumer
+  flushes the truncation WAL first (TruncateCommitTs inserts without
+  flushing), ships a `PS_KLASS_SLRU_TOMB` cutoff tombstone and syncs it
+  durably before returning, versioned by the current WAL position -- in
+  recovery the END of the record being replayed (`GetCurrentReplayRecPtr`),
+  never the last-replayed position, which would make the tombstone visible
+  below the truncation record itself.  A store failure freezes the
+  watermark (the truncation record is typically already WAL-logged) and
+  then raises, abandoning the local truncation -- except in recovery and
+  for the delete-all reset, where nothing can be abandoned: there it stays
+  a counted loss (interrupts still propagate).  Read-side enforcement
+  (dead below the newest tombstone unless a newer image outranks it) is
+  the read-consumer increment's job.
 - **Fail-closed, interrupt-safe hooks.** DONE: `slru_page_read_hook` returns
   `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
   `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing

@@ -875,6 +875,30 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
 	"watermark advances again once the debt is reset"
 
+# --- 29. SLRU truncation tombstones: durable before local deletion ---
+# slru_truncate_hook publishes a durable cutoff tombstone BEFORE any local
+# segment is deleted; a live-mirror reader must treat pages below the newest
+# tombstone at/below its LSN as dead, whatever images exist.
+$P -c "CREATE FUNCTION pagestore_slru_tombstone_asof(text, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_slru_tombstone_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_slru_mirror_truncate(text, bigint) RETURNS void
+        AS 'pagestore','pagestore_slru_mirror_truncate' LANGUAGE C STRICT;" >/dev/null
+# priming (28/28b's reset_debt) re-derives tombstones from local truth: with
+# segment 0000 present the published cutoff is 0 -- "nothing dead" -- which
+# supersedes nothing but proves the re-derivation ran
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "0" \
+	"priming re-derived a nothing-dead tombstone from the local segments"
+TOMB_BEFORE=$($P -c "SELECT pg_current_wal_lsn();")
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null	# advance WAL past TOMB_BEFORE
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 1);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "1" \
+	"tombstone publishes the truncation cutoff page"
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', '$TOMB_BEFORE'::pg_lsn);")" "0" \
+	"the pre-truncation as-of still sees only the priming cutoff (as-of read is capped)"
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 3);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "3" \
+	"a later truncation supersedes the tombstone cutoff"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
