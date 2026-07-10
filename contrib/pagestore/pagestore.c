@@ -820,9 +820,11 @@ ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	{
 		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
 													(uint64) targetPagePtr,
-													(uint32) reqLen, readBuf);
+													XLOG_BLCKSZ, readBuf);
 
-		return (n >= reqLen) ? reqLen : -1;
+		/* whole page, not reqLen: header validation reads past reqLen on
+		 * segment-start pages (see ps_slru_wal_page_read) */
+		return (n >= reqLen) ? n : -1;
 	}
 	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
 										targetRecPtr, readBuf);
@@ -1527,6 +1529,72 @@ ps_local_wal_limit(void)
 }
 
 /*
+ * SLRU appliers/seeders: WAL access that honours pagestore.redo_wal_from_store.
+ *
+ * The appliers replay (C, L] with a linear scan.  On a compute whose local
+ * pg_wal does not hold that window (a fresh utility compute preparing a
+ * branch; pagestore.timeline names the timeline it acts for), the same GUC
+ * that redirects redo_page_asof redirects these scans to the store's shipped
+ * per-timeline WAL log.  The store holds completed segments only (the
+ * archive callback ships on segment completion), so a window ending in the
+ * current partial segment fails the coverage probe and the caller fails
+ * closed, exactly as it does when local WAL ends early.
+ *
+ * Single-timeline for now: the scan reads the acting timeline's OWN log
+ * only.  A window whose base predates that timeline's fork point needs the
+ * ancestor's log; wal_read() does not walk ancestry yet (the branch WAL
+ * read-through refinement), so such a scan fails the first page read and
+ * the caller fails closed -- never a wrong answer, just a narrower window
+ * contract until read-through lands.
+ */
+static int
+ps_slru_wal_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr,
+					  int reqLen, XLogRecPtr targetRecPtr, char *readBuf)
+{
+	if (pagestore_redo_wal_from_store)
+	{
+		int			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+													(uint64) targetPagePtr,
+													XLOG_BLCKSZ, readBuf);
+
+		/*
+		 * The page_read contract wants ALL available bytes of the page,
+		 * not just reqLen: the reader validates page headers from the
+		 * returned buffer beyond reqLen (a segment-start page's LONG
+		 * header is checked with fields past the 24-byte short header the
+		 * first probe requests), so a reqLen-sized fill leaves garbage
+		 * where validation looks.  Read the whole page; succeed only when
+		 * at least reqLen of it is shipped.
+		 */
+		return (n >= reqLen) ? n : -1;
+	}
+	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
+										targetRecPtr, readBuf);
+}
+
+/*
+ * Does readable WAL extend through 'target'?  The completeness escape for a
+ * window whose records all ended before the target: the scan proved nothing
+ * past its last record, so the caller must know WAL itself reaches the
+ * target.  Local mode asks the replay/insert position; store mode probes the
+ * shipped log for the byte just below the target.
+ */
+static bool
+ps_wal_reaches(XLogRecPtr target)
+{
+	if (pagestore_redo_wal_from_store)
+	{
+		char		b;
+
+		if (target == 0)
+			return false;
+		return pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+										   (uint64) (target - 1), 1, &b) == 1;
+	}
+	return ps_local_wal_limit() >= target;
+}
+
+/*
  * Replay (base_lsn, target_lsn] from the local WAL onto clog page 'pageno' in 'page':
  *  - XLOG_XACT_{COMMIT,ABORT}[_PREPARED]: set the top xid + subxids' status;
  *  - RM_CLOG_ID CLOG_ZEROPAGE: zero this page (a page reused after wraparound must not
@@ -1547,7 +1615,7 @@ ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -1662,7 +1730,7 @@ ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	 */
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -1788,10 +1856,117 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * TransactionTreeSetCommitTsData() does.  pg_commit_ts entries are fixed-width
  * (TimestampTz + ReplOriginId), packed COMMIT_TS_XACTS_PER_PAGE to a page.
  *
- * Scope: assumes track_commit_timestamp is stable across (C, L].  A XLOG_PARAMETER_CHANGE
- * that turns it off in the window makes a faithful image impossible, so we fail closed;
- * full toggle replay (re-activating/zeroing segment state) is a follow-up.
+ * Toggles: track_commit_timestamp flips only across a restart (PGC_POSTMASTER), landing a
+ * XLOG_PARAMETER_CHANGE in the window.  Each toggle is an era boundary -- DEACTIVATION
+ * deletes every segment, ACTIVATION restarts from nothing -- replayed by wiping the
+ * accumulated state; see the era comments in the scan loops.  A window that ENDS
+ * deactivated fails closed (an inactive fork has no commit-ts state to reconstruct).
  */
+#include "catalog/pg_control.h"
+#include "port/pg_crc32c.h"
+
+/*
+ * Read the mirrored control image as of 'lsn' into *cf.  Returns true only
+ * for a CRC-valid image at/below lsn; false means "unknown" and callers
+ * must stay conservative.  The control mirror ships a fresh image at every
+ * UpdateControlFile -- including the one XLogReportParameters issues at a
+ * track_commit_timestamp toggle -- so the flag as of any LSN is faithful
+ * whenever an image exists.
+ */
+static bool
+ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
+{
+	PageStoreRelKey key = {0};
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	pg_crc32c	crc;
+
+	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
+		return false;
+	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
+										(uint64) lsn, page, &resolved))
+		return false;
+	memcpy(cf, page, sizeof(*cf));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	return EQ_CRC32C(crc, cf->crc);
+}
+
+static bool
+ps_track_commit_ts_asof(XLogRecPtr lsn, bool *track)
+{
+	ControlFileData cf;
+
+	if (!ps_control_asof(lsn, &cf))
+		return false;
+	*track = cf.track_commit_timestamp;
+	return true;
+}
+
+/*
+ * The commit-ts horizon (oldestCommitTsXid) as of 'lsn', derived from the
+ * mirrored control image.  Returns false when commit-ts is off at lsn or no
+ * image exists.  Between an activation and the next checkpoint the
+ * checkpoint copy's oldestCommitTsXid is still the OFF era's Invalid; the
+ * activation horizon is then the checkpoint copy's nextXid -- the toggle
+ * crossed a restart, so the shutdown checkpoint's nextXid IS the nextXid
+ * ActivateCommitTs read at startup.  (After a crash restart with a changed
+ * GUC the pre-crash checkpoint understates it; the seeder's required-page
+ * check fails closed on the gap rather than fabricating state.)
+ */
+static bool
+ps_commit_ts_horizon_asof(XLogRecPtr lsn, TransactionId *oldest)
+{
+	ControlFileData cf;
+
+	if (!ps_control_asof(lsn, &cf) || !cf.track_commit_timestamp)
+		return false;
+	if (TransactionIdIsNormal(cf.checkPointCopy.oldestCommitTsXid))
+		*oldest = cf.checkPointCopy.oldestCommitTsXid;
+	else
+		*oldest = XidFromFullTransactionId(cf.checkPointCopy.nextXid);
+	return true;
+}
+
+/*
+ * Normalize a caller-supplied commit-ts horizon pair for a fork at
+ * 'target'.  pg_control cannot express "active but not yet
+ * checkpointed": between an activation and its first checkpoint BOTH
+ * oldestCommitTsXid and newestCommitTsXid are still Invalid while the
+ * mirrored control flag is already on.  So:
+ *
+ * - (Invalid, normal): derive oldest from the toggle-time control image.
+ * - (Invalid, Invalid) with the control flag ON as of target: an active
+ *   pre-checkpoint fork -- derive oldest the same way and bound next by
+ *   the fork's nextXid (commit-ts entries exist only for assigned xids,
+ *   exactly clog's bound); treating the pair as "inactive" would install
+ *   an empty pg_commit_ts and silently lose the era's timestamps.
+ * - (Invalid, Invalid) with the flag off/unknown: genuinely inactive.
+ */
+static void
+ps_commit_ts_normalize_horizons(XLogRecPtr target, TransactionId next_xid,
+								TransactionId *oldest, TransactionId *next)
+{
+	bool		track;
+
+	if (TransactionIdIsNormal(*oldest))
+		return;
+	if (!TransactionIdIsNormal(*next))
+	{
+		if (!ps_track_commit_ts_asof(target, &track))
+			ereport(ERROR,
+					(errmsg("pagestore: commit-ts state as of the target LSN is unknown (no readable control image)"),
+					 errhint("An active pre-checkpoint fork is indistinguishable from an inactive one without the control mirror; refusing to guess.")));
+		if (!track)
+			return;				/* known inactive: leave the pair non-normal */
+		*next = next_xid;
+	}
+	if (!ps_commit_ts_horizon_asof(target, oldest))
+		ereport(ERROR,
+				(errmsg("pagestore: no commit-ts horizon supplied and none derivable from the control image as of the target LSN")));
+}
+
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
 
@@ -1818,7 +1993,8 @@ ps_commit_ts_set(char *page, int64 pageno, TransactionId xid,
  * commit-ts deactivation.  *deactivated is set if track_commit_timestamp is turned off. */
 static PsClogReplay
 ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
-						 XLogRecPtr target_lsn, bool *deactivated)
+						 XLogRecPtr target_lsn, TransactionId horizon_xid,
+						 bool *deactivated)
 {
 	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
 	XLogReaderState *reader;
@@ -1826,10 +2002,32 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	XLogRecPtr	scanned = base_lsn;
 	XLogRecPtr	readfrom;
 	PsClogReplay r = {false, false, false};
+	int			era = -1;		/* -1 unknown-assume-on, 0 off, 1 on */
 
 	*deactivated = false;
+
+	/*
+	 * Initialize the era state from the base's control image: a window that
+	 * BEGINS in an off era must not replay commit records into pages (the
+	 * parent's TransactionTreeSetCommitTsData no-ops while inactive; commit
+	 * WAL still carries xact_time), and its first track=true record is a
+	 * real activation even with no in-window false.  Unknown (no image)
+	 * keeps the historical assume-on behavior.
+	 */
+	{
+		bool		track;
+
+		if (ps_track_commit_ts_asof(base_lsn, &track))
+			era = track ? 1 : 0;
+	}
+	if (era == 0)
+	{
+		memset(page, 0, BLCKSZ);
+		r.page_truncated = true;	/* nothing exists in an off era */
+		*deactivated = true;
+	}
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -1895,8 +2093,96 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 				xl_parameter_change xlrec;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+
+				/*
+				 * XLOG_PARAMETER_CHANGE fires for ANY changed parameter
+				 * and carries the CURRENT track_commit_timestamp value,
+				 * not a transition flag -- a restart that changed only,
+				 * say, max_connections emits one with track=true while
+				 * commit-ts stayed active throughout.  Only real
+				 * transitions are era boundaries:
+				 *
+				 * - track=false: as of this record the state is off,
+				 *   whatever it was before.  DeactivateCommitTs deleted
+				 *   every local segment, so wipe (an off->off repeat
+				 *   wipes an already-empty state -- harmless).
+				 *
+				 * - track=true after an in-window false: a real
+				 *   activation; the era starts from nothing.  Within it,
+				 *   ActivateCommitTs zeroes the page holding
+				 *   nextXid-at-activation WITHOUT WAL; every later page
+				 *   has a WAL-logged ZEROPAGE (ExtendCommitTs), so
+				 *   exactly one era page may be touched by commits with
+				 *   no ZEROPAGE seen -- known to start zero (see below).
+				 *
+				 * - track=true with no in-window false: either an
+				 *   unrelated restart while active (do NOTHING -- the
+				 *   accumulated state is valid), or an activation whose
+				 *   deactivation predates the window (the base is empty
+				 *   then, so there is nothing to wipe anyway; the
+				 *   silent-zero inference below still applies).
+				 */
 				if (!xlrec.track_commit_timestamp)
+				{
+					memset(page, 0, BLCKSZ);
+					r.page_zeroed = false;
+					r.page_truncated = true;	/* absent until touched */
 					*deactivated = true;
+					era = 0;
+				}
+				else if (era == 0)
+				{
+					/*
+					 * A real off->on transition (the era state says off --
+					 * from an in-window false, or from the base's control
+					 * image).  The new era starts from nothing; its one
+					 * silently-zeroed page (ActivateCommitTs zeroes the
+					 * nextXid page WITHOUT WAL; later pages have logged
+					 * ZEROPAGEs) is the horizon page -- the caller's, or
+					 * derived from the toggle-time control image when the
+					 * caller has none (a fork before the first
+					 * post-activation checkpoint).  Once consumed, the era
+					 * is ON: a later true record with no intervening false
+					 * is an unrelated restart and must not wipe again.
+					 */
+					TransactionId hx = InvalidTransactionId;
+
+					/*
+					 * Derive the activation horizon from the toggle-time
+					 * control image FIRST: the caller's 'oldest' argument
+					 * doubles as the lookup filter, and callers disable
+					 * that filter with FirstNormal-ish values that would
+					 * mis-mark page 0 as the unlogged zero page.  The
+					 * caller value is only the fallback when no control
+					 * image exists.
+					 */
+					if (!ps_commit_ts_horizon_asof(reader->EndRecPtr, &hx))
+						hx = horizon_xid;
+					memset(page, 0, BLCKSZ);
+					if (TransactionIdIsNormal(hx) &&
+						(int64) (hx / PS_CTS_XACTS_PER_PAGE) == pageno)
+					{
+						r.page_zeroed = true;
+						r.page_truncated = false;
+					}
+					else
+					{
+						r.page_zeroed = false;
+						r.page_truncated = true;
+					}
+					*deactivated = false;
+					era = 1;
+				}
+				else if (era == -1)
+					/*
+					 * Unknown base era: this record is an activation or an
+					 * unrelated restart, and the two demand opposite
+					 * handling (wipe vs keep).  Guessing either way can
+					 * fabricate or destroy timestamps -- refuse.
+					 */
+					ereport(ERROR,
+							(errmsg("pagestore: cannot replay a track_commit_timestamp record: the commit-ts era at the base is unknown (no readable control image)")));
+				/* else: era on -- an unrelated restart, keep everything */
 			}
 			continue;
 		}
@@ -1910,6 +2196,9 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 			TimestampTz ts;
 			ReplOriginId origin = XLogRecGetOrigin(reader);
 
+			if (era == 0)
+				continue;		/* commit-ts is off: the parent recorded
+								 * nothing for this commit */
 			ParseCommitRecord(XLogRecGetInfo(reader),
 							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
 			ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
@@ -1924,7 +2213,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -1935,7 +2224,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
  * off in the window (the reconstructed image would not match the parent's). */
 static bool
 ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
-						 XLogRecPtr target_lsn)
+						 XLogRecPtr target_lsn, TransactionId horizon_xid)
 {
 	PageStoreRelKey key;
 	bool		base_found;
@@ -1965,9 +2254,22 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
 		memset(page, 0, BLCKSZ);
 
 	if (target_lsn == base_lsn)
-		return true;
+	{
+		bool		track;
 
-	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn, &deactivated);
+		/*
+		 * No window to scan, but the base era still decides existence: a
+		 * read exactly at an off-era LSN must fail like any other
+		 * off-as-of-target read, not serve an all-zero page.
+		 */
+		if (ps_track_commit_ts_asof(base_lsn, &track) && !track)
+			ereport(ERROR,
+					(errmsg("pagestore: track_commit_timestamp is off as of the target LSN; the fork has no commit-ts state")));
+		return true;
+	}
+
+	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn,
+								 horizon_xid, &deactivated);
 
 	if (!r.reached_target && target_lsn != PG_UINT64_MAX)
 		ereport(ERROR,
@@ -1975,7 +2277,7 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
 						LSN_FORMAT_ARGS(target_lsn))));
 	if (deactivated)
 		ereport(ERROR,
-				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+				(errmsg("pagestore: track_commit_timestamp is off as of the target LSN; the fork has no commit-ts state")));
 	if (r.page_truncated)
 		return false;
 	return true;
@@ -1985,7 +2287,7 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
  * pagestore_commit_ts_asof(xid xid, base pg_lsn, target pg_lsn, oldest xid) returns
  * timestamptz -- the commit timestamp of 'xid' as of 'target', or NULL if it has none.
  *
- * 'oldest' is the commit-ts validity horizon as of target (the parent's oldestCommitTsXid
+ * 'oldest' is the LOOKUP horizon as of target (the parent's oldestCommitTsXid
  * from pg_control), which the booted branch's TransactionIdGetCommitTsData() enforces:
  * xids below it return NULL even though their bytes may physically remain on a retained
  * SLRU page (a COMMIT_TS_TRUNCATE only drops whole earlier segments), and xids that
@@ -2012,7 +2314,7 @@ pagestore_commit_ts_asof(PG_FUNCTION_ARGS)
 	if (TransactionIdIsNormal(oldest) && TransactionIdPrecedes(xid, oldest))
 		PG_RETURN_NULL();
 
-	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target, oldest))
 		PG_RETURN_NULL();		/* page truncated away by the target LSN */
 
 	memcpy(&ts, page + (Size) entryno * PS_CTS_ENTRY_SIZE, sizeof(TimestampTz));
@@ -2028,10 +2330,21 @@ pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
 	int32		pageno = PG_GETARG_INT32(0);
 	XLogRecPtr	base = PG_GETARG_LSN(1);
 	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest;
 	char	   *page = palloc(BLCKSZ);
 	bytea	   *result;
 
-	if (!ps_commit_ts_reconstruct(page, pageno, base, target))
+	/*
+	 * The horizon argument was added later; SQL wrappers created against
+	 * the 3-argument signature still call this symbol.  Reading a fourth
+	 * argument that was never supplied would be garbage (or a crash), so
+	 * default it -- the applier derives the activation horizon from the
+	 * control image anyway; the argument is only its fallback.
+	 */
+	oldest = (PG_NARGS() >= 4) ? PG_GETARG_TRANSACTIONID(3)
+		: InvalidTransactionId;
+
+	if (!ps_commit_ts_reconstruct(page, pageno, base, target, oldest))
 		PG_RETURN_NULL();
 
 	result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2080,7 +2393,7 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2161,7 +2474,7 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -2353,7 +2666,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2418,7 +2731,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -2513,6 +2826,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	XLogRecPtr	readfrom;
 	int64		np = page_hi - page_lo + 1;
 	bool		deactivated = false;
+	bool		era_reset = false;
+	int			era = -1;		/* -1 unknown-assume-on, 0 off, 1 on */
 	XLogRecPtr	reached_from;
 	TransactionId xid;
 	TransactionId prepared_xid;
@@ -2543,12 +2858,33 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 			memset(pages + p * BLCKSZ, 0, BLCKSZ);
 	}
 
+	/* era state from the base's control image; see the single-page applier */
+	{
+		bool		track;
+
+		if (ps_track_commit_ts_asof(base_lsn, &track))
+			era = track ? 1 : 0;
+	}
+	if (era == 0)
+	{
+		memset(pages, 0, np * BLCKSZ);
+		for (int64 p = 0; p < np; p++)
+		{
+			present[p] = false;
+			base_found[p] = false;
+			zeroed[p] = false;
+			truncated[p] = true;
+		}
+		era_reset = true;
+		deactivated = true;
+	}
+
 	if (target_lsn == base_lsn)
 		goto check_required_pages;
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2628,8 +2964,79 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				xl_parameter_change xlrec;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
+
+				/*
+				 * XLOG_PARAMETER_CHANGE fires for ANY changed parameter
+				 * and carries the CURRENT track_commit_timestamp value,
+				 * not a transition flag.  Only real transitions are era
+				 * boundaries (see the single-page applier for the full
+				 * case analysis):
+				 *
+				 * - track=false: state is off from here; wipe (matches
+				 *   DeactivateCommitTs deleting every segment; an
+				 *   off->off repeat wipes an empty state, harmless).
+				 *
+				 * - track=true after an in-window false: real activation;
+				 *   wipe (defends against era-crossing bytes the base
+				 *   snapshot carried) and mark the caller's horizon page
+				 *   zero-present -- ActivateCommitTs zeroes the
+				 *   nextXid-at-activation page WITHOUT WAL, and a correct
+				 *   caller passes oldest_xid = that nextXid.
+				 *
+				 * - track=true with no in-window false: an unrelated
+				 *   restart while active (keep everything), or an
+				 *   activation whose deactivation predates the window
+				 *   (the base is empty; only the silent-zero horizon-page
+				 *   marking is needed, and only where no base exists).
+				 */
 				if (!xlrec.track_commit_timestamp)
+				{
+					memset(pages, 0, np * BLCKSZ);
+					for (int64 p = 0; p < np; p++)
+					{
+						present[p] = false;
+						base_found[p] = false;
+						zeroed[p] = false;
+						truncated[p] = true;
+					}
+					era_reset = true;
 					deactivated = true;
+					era = 0;
+				}
+				else if (era == 0)
+				{
+					/*
+					 * A real off->on transition (an in-window false, or
+					 * the base's control image said off).  Wipe, mark the
+					 * activation's silently-zeroed horizon page (req_lo;
+					 * the seed entry point resolves its xid, deriving it
+					 * from the toggle-time control image when the caller
+					 * has none), and remember the era is ON: a later true
+					 * record with no intervening false is an unrelated
+					 * restart and must not wipe again.
+					 */
+					memset(pages, 0, np * BLCKSZ);
+					for (int64 p = 0; p < np; p++)
+					{
+						present[p] = false;
+						base_found[p] = false;
+						zeroed[p] = false;
+						truncated[p] = true;
+					}
+					era_reset = true;
+					deactivated = false;
+					era = 1;
+					if (req_lo >= page_lo && req_lo <= page_hi)
+					{
+						idx = req_lo - page_lo;
+						present[idx] = true;
+						zeroed[idx] = true;
+						truncated[idx] = false;
+					}
+								}
+				else if (era == -1)
+					ereport(ERROR,
+							(errmsg("pagestore: cannot replay a track_commit_timestamp record: the commit-ts era at the base is unknown (no readable control image)")));
 			}
 			continue;
 		}
@@ -2639,6 +3046,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
 		if (info != XLOG_XACT_COMMIT && info != XLOG_XACT_COMMIT_PREPARED)
 			continue;
+		if (era == 0)
+			continue;			/* commit-ts is off: nothing was recorded */
 		ParseCommitRecord(XLogRecGetInfo(reader),
 						 (xl_xact_commit *) XLogRecGetData(reader), &parsed);
 		ts = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) ? parsed.origin_timestamp
@@ -2668,13 +3077,14 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(reached_from) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
 	if (deactivated)
 		ereport(ERROR,
-				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+				(errmsg("pagestore: track_commit_timestamp is off as of the target LSN"),
+				 errhint("An inactive fork inherits an empty pg_commit_ts; seed it with a non-normal horizon.")));
 
 check_required_pages:
 	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
@@ -2683,8 +3093,11 @@ check_required_pages:
 
 		if (truncated[idx])
 			ereport(ERROR,
-					(errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
-							(long long) pageno)));
+					era_reset
+					? errmsg("pagestore: commit-ts page %lld does not exist in the era active as of the target LSN (horizon inconsistent with the WAL's activation)",
+							 (long long) pageno)
+					: errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
+							 (long long) pageno));
 		if (!base_found[idx] && !zeroed[idx])
 			ereport(ERROR,
 					(errmsg("pagestore: base commit-ts snapshot for page %lld is absent at %X/%08X",
@@ -2748,7 +3161,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2847,7 +3260,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
@@ -2924,7 +3337,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -3011,7 +3424,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact members as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
@@ -3414,7 +3827,7 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -3524,10 +3937,11 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	 * cleanly (no decode error), and the readable WAL extends through target.  An
 	 * unreadable start (recycled base segment), a decode error (errm), or target beyond
 	 * the readable WAL is a short read -- never seed a clog that skipped (base, target].
-	 * (ps_local_wal_limit is replay-aware, so this also holds on a standby.) */
+	 * (ps_wal_reaches is replay-aware locally and probes the shipped log in
+	 * store mode, so this also holds on a standby / a no-local-WAL compute.) */
 	if (scanned < target && target != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target))
+		 !ps_wal_reaches(target)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot seed clog as of %X/%08X",
 						LSN_FORMAT_ARGS(target))));
@@ -3654,6 +4068,20 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
+	if (!TransactionIdIsNormal(oldest_xid) && TransactionIdIsNormal(next_xid))
+	{
+		/*
+		 * The caller has no horizon: the fork sits between an activation
+		 * and the first checkpoint that would publish oldestCommitTsXid
+		 * into pg_control.  Derive it from the mirrored control image as
+		 * of the target -- the image the toggle shipped carries the
+		 * shutdown checkpoint's nextXid, which IS the activation horizon
+		 * (the toggle crossed a restart).
+		 */
+		if (!ps_commit_ts_horizon_asof(target, &oldest_xid))
+			ereport(ERROR,
+					(errmsg("pagestore: no commit-ts horizon supplied and none derivable from the control image as of the target LSN")));
+	}
 	if (!TransactionIdIsNormal(oldest_xid) || !TransactionIdIsNormal(next_xid) ||
 		TransactionIdFollows(oldest_xid, next_xid))
 		ereport(ERROR,
@@ -4185,14 +4613,36 @@ Datum
 pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 {
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+
+	/*
+	 * The normalizer may read the mirrored control image (daemon IPC), so
+	 * the privilege and backend gates must run first -- the impl repeats
+	 * them, but by then a non-superuser would already have touched the
+	 * daemon.
+	 */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch SLRUs")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+
+	ps_commit_ts_normalize_horizons(target, next_xid,
+									&oldest_commit_ts_xid,
+									&next_commit_ts_xid);
 
 	PG_RETURN_INT64(pagestore_seed_branch_slrus_impl(target_dir,
-													 PG_GETARG_LSN(1),
-													 PG_GETARG_LSN(2),
-													 PG_GETARG_TRANSACTIONID(3),
-													 PG_GETARG_TRANSACTIONID(4),
-													 PG_GETARG_TRANSACTIONID(5),
-													 PG_GETARG_TRANSACTIONID(6),
+													 base, target,
+													 oldest_xid, next_xid,
+													 oldest_commit_ts_xid,
+													 next_commit_ts_xid,
 													 PG_GETARG_TRANSACTIONID(7),
 													 PG_GETARG_TRANSACTIONID(8),
 													 PG_GETARG_INT64(9),
@@ -5539,6 +5989,17 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
+
+	/*
+	 * Normalize the commit-ts horizons BEFORE the idempotency check and
+	 * the manifest unlink: derivation must yield the same values a
+	 * previous successful prepare wrote into its manifest, or a retry
+	 * would never match, delete a valid prepared manifest, and leave the
+	 * branch inert if the reseed then fails.
+	 */
+	ps_commit_ts_normalize_horizons(target, next_xid,
+									&oldest_commit_ts_xid,
+									&next_commit_ts_xid);
 
 	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
 												   base, target,
