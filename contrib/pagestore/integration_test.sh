@@ -1082,6 +1082,12 @@ assert "$($P -c "SELECT nextval('reader_seq');" 2>&1 | grep -c 'read-only')" "1"
 	"pinned reader refuses nextval() (side-effecting SELECT)"
 assert "$($P -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "1" \
 	"pinned reader refuses DDL"
+# XID assignment is refused at the source (else the commit record would PANIC)
+assert "$($P -c "SELECT pg_current_xact_id();" 2>&1 | grep -c 'cannot assign TransactionIds')" "1" \
+	"pinned reader refuses XID assignment (pg_current_xact_id)"
+# NOTIFY is read-only-legal but XID-assigning and SLRU-writing
+assert "$($P -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses NOTIFY"
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($P -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"

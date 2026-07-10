@@ -67,9 +67,14 @@ ls_check_read_lsn(char **newval, void **extra, GucSource source)
 	uint32		hi,
 				lo;
 
+	int			consumed = 0;
+
 	if (*newval == NULL || **newval == '\0')
 		return true;
-	if (sscanf(*newval, "%X/%X", &hi, &lo) != 2)
+	/* require the whole string to parse: a trailing typo must not silently
+	 * pin the reader at a different horizon than configured */
+	if (sscanf(*newval, "%X/%X%n", &hi, &lo, &consumed) != 2 ||
+		(*newval)[consumed] != '\0')
 	{
 		GUC_check_errdetail("Expected a WAL LSN like \"0/1A2B3C4D\".");
 		return false;
@@ -82,8 +87,11 @@ ls_assign_read_lsn(const char *newval, void *extra)
 {
 	uint32		hi = 0,
 				lo = 0;
+	int			consumed = 0;
 
-	if (newval && *newval && sscanf(newval, "%X/%X", &hi, &lo) == 2)
+	if (newval && *newval &&
+		sscanf(newval, "%X/%X%n", &hi, &lo, &consumed) == 2 &&
+		newval[consumed] == '\0')
 		localsvc_read_lsn = ((uint64) hi << 32) | lo;
 	else
 		localsvc_read_lsn = 0;
@@ -1162,6 +1170,14 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 		case T_CopyStmt:
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";
+			break;
+		case T_NotifyStmt:
+			/*
+			 * Read-only-legal but XID-assigning and pg_notify-SLRU-writing;
+			 * the GetNewTransactionId refusal would catch it at pre-commit,
+			 * but refuse it up front with the clearer error.
+			 */
+			deny = "NOTIFY";
 			break;
 		default:
 			break;

@@ -505,6 +505,10 @@ Datum
 disable_data_checksums(PG_FUNCTION_ARGS)
 {
 	PreventCommandDuringRecovery("pg_disable_data_checksums()");
+	if (transaction_read_only_forced)
+		ereport(ERROR,
+				errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				errmsg("cannot change data checksum state on a read-only instance"));
 
 	if (!superuser())
 		ereport(ERROR,
@@ -527,6 +531,10 @@ enable_data_checksums(PG_FUNCTION_ARGS)
 	int			cost_limit = PG_GETARG_INT32(1);
 
 	PreventCommandDuringRecovery("pg_enable_data_checksums()");
+	if (transaction_read_only_forced)
+		ereport(ERROR,
+				errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				errmsg("cannot change data checksum state on a read-only instance"));
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1046,6 +1054,14 @@ WaitForAllTransactionsToFinish(void)
 void
 DataChecksumsWorkerLauncherMain(Datum arg)
 {
+	/*
+	 * A maintenance-suppressed instance (a pinned pagestore reader) must not
+	 * rewrite pages; a checksum transition resumed from a restored control
+	 * state would do exactly that.
+	 */
+	if (page_maintenance_suppressed)
+		proc_exit(0);
+
 
 	ereport(DEBUG1,
 			errmsg("background worker \"datachecksums launcher\" started"));
@@ -1511,6 +1527,10 @@ DataChecksumsWorkerMain(Datum arg)
 #ifdef USE_INJECTION_POINTS
 	bool		retried = false;
 #endif
+
+	/* See DataChecksumsWorkerLauncherMain. */
+	if (page_maintenance_suppressed)
+		proc_exit(0);
 
 	operation = ENABLE_DATACHECKSUMS;
 
