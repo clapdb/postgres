@@ -256,6 +256,39 @@ typedef enum SlruReadHookResult
 typedef void (*slru_page_write_hook_type) (SlruDesc *ctl, int64 pageno,
 										   const char *page,
 										   XLogRecPtr fence_lsn);
+
+/*
+ * Truncation barrier for store-backed SLRUs, called BEFORE any local
+ * segment is deleted (SimpleLruTruncate, SlruDeleteSegment, and the
+ * pg_commit_ts delete-all reset, which passes PG_INT64_MAX): pages below
+ * 'cutoffPage' are about to disappear locally, so a mirror serving them to
+ * other computes must durably stop first.  In ordinary (non-critical)
+ * contexts the hook may raise an error, which abandons the truncation
+ * before anything was removed.  Multixact truncation, however, reaches
+ * SimpleLruTruncate() inside a critical section; TruncateMultiXact()
+ * therefore invokes the hook as a fallible pre-barrier before entering it,
+ * and the hook must detect CritSectionCount > 0 and be strictly infallible
+ * (no error, no I/O) there -- normally a no-op, since the pre-barrier
+ * already covered the same cutoff.  'lsn' is the end of the truncation's
+ * WAL record when the caller knows it (the TruncateCLOG/TruncateCommitTs
+ * pre-barriers); InvalidXLogRecPtr tells the hook to sample the current
+ * position itself.
+ */
+typedef void (*slru_truncate_hook_type) (SlruDesc *ctl, int64 cutoffPage,
+										 XLogRecPtr lsn);
+
+/*
+ * Cache revalidation for store-backed SLRUs, called on a cache hit by
+ * SimpleLruReadPage() (bank lock held exclusive) and by
+ * SimpleLruReadPage_ReadOnly()'s shared-lock fast path, so it must be
+ * infallible and cheap -- memory checks only (shared memory included), no
+ * I/O, no lock acquisition, no error.  Return false to discard the cached
+ * slot and force a physical re-read: a clean VALID slot served from a
+ * mirror can go stale when the mirror's watermark advances or a truncation
+ * tombstone appears, and no physical read would ever notice.  Dirty slots
+ * are local truth and are never offered.
+ */
+typedef bool (*slru_page_revalidate_hook_type) (SlruDesc *ctl, int64 pageno);
 typedef SlruReadHookResult (*slru_page_read_hook_type) (SlruDesc *ctl,
 														int64 pageno,
 														char *page);
@@ -275,6 +308,8 @@ typedef SlruReadHookResult (*slru_page_exists_hook_type) (SlruDesc *ctl,
 extern PGDLLIMPORT slru_page_write_hook_type slru_page_write_hook;
 extern PGDLLIMPORT slru_page_read_hook_type slru_page_read_hook;
 extern PGDLLIMPORT slru_page_exists_hook_type slru_page_exists_hook;
+extern PGDLLIMPORT slru_truncate_hook_type slru_truncate_hook;
+extern PGDLLIMPORT slru_page_revalidate_hook_type slru_page_revalidate_hook;
 extern void SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING
 extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
@@ -282,6 +317,9 @@ extern void SlruPagePrecedesUnitTests(SlruDesc *ctl, int per_page);
 #define SlruPagePrecedesUnitTests(ctl, per_page) do {} while (0)
 #endif
 extern void SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage);
+extern void SimpleLruDiscardCutoff(SlruDesc *ctl, int64 cutoffPage);
+extern void SimpleLruFlushCutoff(SlruDesc *ctl, int64 cutoffPage);
+extern void SimpleLruDiscardAll(SlruDesc *ctl);
 extern bool SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno);
 
 typedef bool (*SlruScanCallback) (SlruDesc *ctl, char *filename, int64 segpage,
