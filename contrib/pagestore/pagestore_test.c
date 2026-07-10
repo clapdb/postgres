@@ -989,7 +989,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	uint32_t	ps = 8192;
 	unsigned char bufa[500];
 	unsigned char bufb[500];
-	unsigned char rback[512];
+	unsigned char rback[1024];
 	int			ok;
 
 	fprintf(stderr, "== shipped WAL ==\n");
@@ -1027,6 +1027,50 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	op_wal_append(1, 2000, bufa, 300);
 	check(op_wal_size(1) == 2300, "branch WAL advances independently");
 	check(op_wal_size(0) == 2000, "parent WAL unaffected by branch WAL");
+
+	/* read-through: the branch's history below its fork point is the
+	 * parent's, and a read spanning the fork stitches the two logs */
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(1, 1400, 200, rback) == 200,
+		  "branch read below the fork serves the parent's bytes");
+	ok = 1;
+	for (int i = 0; i < 100; i++)
+		if (rback[i] != 0xAA)
+			ok = 0;
+	for (int i = 100; i < 200; i++)
+		if (rback[i] != 0xBB)
+			ok = 0;
+	check(ok, "branch read below the fork carries the parent's contents");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(1, 1900, 200, rback) == 200,
+		  "branch read across the fork stitches parent and own bytes");
+	ok = 1;
+	for (int i = 0; i < 100; i++)	/* [1900,2000): parent's 0xBB record */
+		if (rback[i] != 0xBB)
+			ok = 0;
+	for (int i = 100; i < 200; i++) /* [2000,2100): the branch's own 0xAA */
+		if (rback[i] != 0xAA)
+			ok = 0;
+	check(ok, "fork-spanning read assembles parent then branch bytes");
+	check(op_wal_read(1, 1400, 700, rback) == 700,
+		  "fork-spanning read counts every distinct byte exactly once");
+
+	/* a branch whose OWN first shipped segment spans its fork carries a
+	 * valid pre-fork prefix the parent may never ship (the parent's copy
+	 * of that segment can still be partial): the prefix must serve from
+	 * the branch's own log, and holes below it must not be miscounted */
+	op_create_branch(2, 0, 2500);
+	op_wal_append(2, 2400, bufb, 200);	/* spans the fork at 2500 */
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(2, 2400, 200, rback) == 200,
+		  "the branch's own pre-fork prefix serves when the parent lacks those bytes");
+	ok = 1;
+	for (int i = 0; i < 200; i++)
+		if (rback[i] != 0xBB)
+			ok = 0;
+	check(ok, "own-prefix bytes come from the branch's log");
+	check(op_wal_read(2, 2300, 300, rback) == 200,
+		  "a hole below the branch's own coverage is not double-counted");
 
 	/* WAL end LSNs survive a daemon restart (recovered from the logs) */
 	client_detach();
