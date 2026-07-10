@@ -988,6 +988,82 @@ typedef struct WalRecHdr
 	uint64_t	start_lsn;		/* LSN of the first byte */
 } WalRecHdr;
 
+/*
+ * Overlap policy for shipped WAL: identical bytes are an idempotent re-ship
+ * (an archiver retry after a partial failure) -- accepted, and skipped
+ * entirely when the range is already fully covered, so no duplicate chunk
+ * inflates the log or the distinct-byte accounting.  DIFFERING bytes for an
+ * already-covered position are two histories claiming the same LSN range --
+ * a divergent compute (a pinned reader's private WAL shipped after
+ * unpinning, or a second writer on the timeline) trying to overwrite the
+ * recorded one -- and are refused: later-chunks-win read semantics would
+ * otherwise let the divergent copy silently rewrite history.  Returns -1 on
+ * divergence or read failure, 0 with *fully_covered set otherwise.
+ */
+static int
+wal_overlap_check(uint32_t tl, uint64_t start_lsn,
+				  const unsigned char *data, uint32_t len,
+				  int *fully_covered)
+{
+	uint64_t	off = 0;
+	WalRecHdr	h;
+	uint64_t	we = start_lsn + len;
+	unsigned char *tmp = NULL;
+	unsigned char *mask = NULL;
+	uint32_t	covered = 0;
+
+	*fully_covered = 0;
+	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
+		   h.magic == WAL_MAGIC)
+	{
+		uint64_t	rs = h.start_lsn;
+		uint64_t	re = rs + h.len;
+		uint64_t	os = rs > start_lsn ? rs : start_lsn;
+		uint64_t	oe = re < we ? re : we;
+
+		if (os < oe)
+		{
+			uint64_t	src = off + sizeof(h) + (os - rs);
+			uint32_t	n = (uint32_t) (oe - os);
+			uint32_t	base = (uint32_t) (os - start_lsn);
+
+			if (!tmp)
+			{
+				tmp = malloc(len);
+				mask = calloc(1, len);
+				if (!tmp || !mask)
+				{
+					free(tmp);
+					free(mask);
+					return -1;
+				}
+			}
+			if (ps_storage->wal_read(tl, src, tmp, n) != (int) n ||
+				memcmp(tmp, data + base, n) != 0)
+			{
+				fprintf(stderr, "pagestore: refusing divergent WAL overlap on "
+						"timeline %u at %llu (+%u): bytes differ from the "
+						"already-shipped history\n",
+						tl, (unsigned long long) os, n);
+				free(tmp);
+				free(mask);
+				return -1;
+			}
+			for (uint32_t i = 0; i < n; i++)
+				if (!mask[base + i])
+				{
+					mask[base + i] = 1;
+					covered++;
+				}
+		}
+		off += sizeof(h) + h.len;
+	}
+	free(tmp);
+	free(mask);
+	*fully_covered = (covered == len);
+	return 0;
+}
+
 static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
@@ -996,6 +1072,22 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 
 	if (tl >= MAX_TIMELINES)
 		return -1;
+
+	/*
+	 * Appends normally land strictly at/after the shipped end; only a
+	 * re-ship (or a divergent history) reaches back below it, so the
+	 * byte-compare scan runs only then.  A fully covered identical re-ship
+	 * succeeds without appending a duplicate chunk.
+	 */
+	if (len > 0 && start_lsn < wal_end_read(tl))
+	{
+		int			fully_covered;
+
+		if (wal_overlap_check(tl, start_lsn, data, len, &fully_covered) != 0)
+			return -1;
+		if (fully_covered)
+			return 0;
+	}
 
 	timeline_mark_used(tl);
 	h.magic = WAL_MAGIC;

@@ -506,6 +506,21 @@ op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
 	cl_exec();
 }
 
+/* Like op_wal_append but reports the daemon's status (for negative tests). */
+static int
+op_wal_append_status(uint32_t tl, uint64_t start_lsn, const void *data,
+					 uint32_t len)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	memcpy(ch->data, data, len);
+	return cl_exec()->status;
+}
+
 /* Return the end LSN of a timeline's shipped WAL. */
 static uint64_t
 op_wal_size(uint32_t tl)
@@ -1024,6 +1039,18 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 		if (rback[i] != 0xBB)
 			ok = 0;
 	check(ok, "WAL read assembles the right bytes across records (at their LSNs)");
+
+	/* overlap policy: identical bytes re-ship idempotently; divergent
+	 * bytes for a covered range are two histories claiming the same LSNs
+	 * (a divergent compute) and are refused */
+	check(op_wal_append_status(0, 1000, bufa, 500) == PS_STATUS_OK,
+		  "an identical re-ship of covered WAL is accepted (idempotent retry)");
+	check(op_wal_size(0) == 2000, "the re-ship does not move the end LSN");
+	check(op_wal_append_status(0, 1200, bufb, 100) != PS_STATUS_OK,
+		  "divergent bytes for an already-covered WAL range are refused");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(0, 1200, 100, rback) == 100 && rback[0] == 0xAA,
+		  "the recorded history is intact after the refused overwrite");
 
 	/* a branch keeps its own WAL log */
 	op_create_branch(1, 0, 2000);

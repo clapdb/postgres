@@ -123,11 +123,18 @@ reconstruction.
    without shipping, so no later unpinned start can replay the backlog
    over the writer's history -- the store's overlap semantics would let
    later chunks win); a segment below the floor still holds writer-era
-   bytes and is deferred instead of shipped or swallowed.  A SECOND
-   compute pinned against a writer's timeline must still never run with
-   archiving configured once unpinned: from that point its WAL chain
-   diverges wholesale; at most one compute per timeline may archive.
-   The store-write refusals above remain as the fail-closed backstop.  This is the
+   bytes and is deferred instead of shipped or swallowed.  Behind the
+   archiver sits a STORE-side invariant: wal_append refuses a chunk
+   whose bytes differ from already-shipped coverage of the same LSN
+   range (identical re-ships stay idempotent and add no duplicate
+   chunk), so even a deferred mixed segment shipped by a later unpinned
+   start -- or any divergent compute, including an accidental second
+   writer -- cannot rewrite the recorded history that later-chunks-win
+   reads would otherwise adopt.  A SECOND compute pinned against a
+   writer's timeline should still never run with archiving configured
+   once unpinned (its refused segments pile up as archive failures);
+   at most one compute per timeline may archive.  The store-write
+   refusals above remain as the fail-closed backstop.  This is the
    MECHANISM increment: on its own it freezes page bytes, not the whole
    compute.
 
