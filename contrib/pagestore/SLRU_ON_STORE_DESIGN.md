@@ -39,10 +39,14 @@ Known caveats -- each remains open work, with its exact failure mode stated:
   only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
   concurrent SLRU writes).  An unproven cutoff silently ships mis-keyed
   bytes.  The online, automatically triggered proven-C ship is the follow-up.
-- **The appliers read the preparing backend's local WAL.**  A branch with no
-  local WAL cannot yet re-run reconstruction store-backed (redo_page_asof has
-  a store-backed WAL reader; the SLRU appliers do not).  prepare must run
-  where the (C, L] WAL is still locally readable.  Live SLRU page mirroring through the
+- **The appliers can read the (C, L] WAL from the store.**  DONE:
+  `pagestore.redo_wal_from_store` redirects the SLRU appliers' and seeders'
+  linear scans to the store's shipped per-timeline WAL log, exactly as it
+  does for `redo_page_asof` -- so prepare can run on a compute with no
+  local WAL (a utility compute sets `pagestore.timeline` to the timeline it
+  acts for).  The store holds completed segments only, so a window ending
+  in the current partial segment fails the coverage probe and the caller
+  fails closed, as with locally-truncated WAL.  Live SLRU page mirroring through the
 real SLRU code path (the PR-#49 direction, rejected as the primitive for
 branch correctness) remains deferred to the post-M4 multi-compute milestone,
 as does `pg_subtrans`/`pg_notify`/`pg_serial` coverage.  History: the PR-#49
