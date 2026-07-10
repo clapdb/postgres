@@ -591,6 +591,8 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsOff
 	"commit-ts toggle: a target inside the off window fails closed"
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsOffL0', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
 	"commit-ts toggle: an entirely-off window fails closed (no toggle record needed)"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsOffL', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: a read exactly at an off-era LSN fails closed (empty window)"
 # the activation page exists (all-zero) on the parent BEFORE any era commit touches it:
 # ActivateCommitTs created it without WAL, so the applier materializes it from the horizon
 ctsXApage=$(( ctsXA / cts_per_page ))

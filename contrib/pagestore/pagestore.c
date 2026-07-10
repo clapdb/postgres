@@ -2173,7 +2173,16 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 					*deactivated = false;
 					era = 1;
 				}
-				/* else: already on (or assumed on): an unrelated restart */
+				else if (era == -1)
+					/*
+					 * Unknown base era: this record is an activation or an
+					 * unrelated restart, and the two demand opposite
+					 * handling (wipe vs keep).  Guessing either way can
+					 * fabricate or destroy timestamps -- refuse.
+					 */
+					ereport(ERROR,
+							(errmsg("pagestore: cannot replay a track_commit_timestamp record: the commit-ts era at the base is unknown (no readable control image)")));
+				/* else: era on -- an unrelated restart, keep everything */
 			}
 			continue;
 		}
@@ -2245,7 +2254,19 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
 		memset(page, 0, BLCKSZ);
 
 	if (target_lsn == base_lsn)
+	{
+		bool		track;
+
+		/*
+		 * No window to scan, but the base era still decides existence: a
+		 * read exactly at an off-era LSN must fail like any other
+		 * off-as-of-target read, not serve an all-zero page.
+		 */
+		if (ps_track_commit_ts_asof(base_lsn, &track) && !track)
+			ereport(ERROR,
+					(errmsg("pagestore: track_commit_timestamp is off as of the target LSN; the fork has no commit-ts state")));
 		return true;
+	}
 
 	r = ps_commit_ts_apply_range(page, pageno, base_lsn, target_lsn,
 								 horizon_xid, &deactivated);
@@ -3013,6 +3034,9 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 						truncated[idx] = false;
 					}
 								}
+				else if (era == -1)
+					ereport(ERROR,
+							(errmsg("pagestore: cannot replay a track_commit_timestamp record: the commit-ts era at the base is unknown (no readable control image)")));
 			}
 			continue;
 		}
