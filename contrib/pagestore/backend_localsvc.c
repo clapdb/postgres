@@ -32,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
@@ -1200,9 +1201,16 @@ pagestore_localsvc_pinned_init(bool localsvc_active)
 	 * as-of-R page images above the writer's shipped versions.  The layers,
 	 * outermost first:
 	 *
-	 * - executor/utility gates refuse DML, row locking, VACUUM/ANALYZE,
-	 *   REINDEX, CLUSTER and COPY FROM outright -- these are reachable in
-	 *   read-only transactions or by escaping the read-only default;
+	 * - transaction_read_only_forced makes XactReadOnly non-overridable
+	 *   (SET TRANSACTION READ WRITE is refused the way it is during
+	 *   recovery), so every PreventCommandIfReadOnly-guarded path -- DML,
+	 *   DDL, TRUNCATE, nextval(), COPY FROM -- holds, exactly the hot
+	 *   standby enforcement model;
+	 * - executor/utility gates additionally refuse DML, row locking,
+	 *   VACUUM/ANALYZE, REINDEX, REPACK and COPY FROM at the entry points
+	 *   -- VACUUM and REINDEX are legal in read-only transactions, and the
+	 *   rest get a clearer pinned-reader error before the generic
+	 *   read-only one;
 	 * - page-maintenance suppression stops the WAL a plain SELECT emits
 	 *   (hint-bit FPIs, on-access pruning) and shuts down autovacuum
 	 *   entirely, including the wraparound-defense launcher that ignores
@@ -1213,6 +1221,7 @@ pagestore_localsvc_pinned_init(bool localsvc_active)
 	 * - the localsvc store-write refusals remain underneath as the final
 	 *   fail-closed backstop.
 	 */
+	transaction_read_only_forced = true;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = ls_pinned_executor_start;
 	prev_ProcessUtility = ProcessUtility_hook;
