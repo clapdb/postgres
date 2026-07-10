@@ -73,6 +73,7 @@ pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
 io_method = sync
+wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
 port = $PORT
@@ -562,6 +563,43 @@ assert "$empty_seeded" "1" "commit-ts seed publishes a bootstrap page for an emp
 assert "$([ -d "$EMPTYCTS/pg_commit_ts" ] && echo present)" "present" \
 	"empty-horizon commit-ts artifact directory exists"
 rm -rf "$EMPTYCTS"
+
+# --- 20b. commit-ts toggle replay: eras across track_commit_timestamp restarts ----------
+# The GUC is PGC_POSTMASTER, so a toggle always crosses a restart: OFF fires
+# DeactivateCommitTs (every local segment deleted; a XLOG_PARAMETER_CHANGE lands in
+# WAL), ON starts a new era whose nextXid page ActivateCommitTs zeroes WITHOUT WAL.
+# The appliers must (a) wipe pre-toggle state -- xidA's timestamp from the era-1 base
+# snapshot must not leak into an era-2 reconstruction, (b) reconstruct era-2 commits
+# across the unlogged activation zero, and (c) refuse a target inside an off window.
+echo "track_commit_timestamp = off" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+ctsOffL=$($P -c "SELECT pg_current_wal_lsn();")               # a target inside the off era
+echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+$P -c "CHECKPOINT;" >/dev/null                                # publish the era horizon
+ctsXA=$($P -c "SELECT oldest_commit_ts_xid FROM pg_control_checkpoint();")
+ctsE2=$($P -c "WITH w AS (INSERT INTO cts VALUES (3) RETURNING 1) SELECT pg_current_xact_id();")
+ctsL2=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL2', '3'::xid) IS NULL;")" "t" \
+	"commit-ts toggle: an era-1 timestamp does not survive the era wipe (horizon disabled)"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL2', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an era-2 commit reconstructs across the unlogged activation zero"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: a target inside the off window fails closed"
+TOGSEED=$(mktemp -d)
+tog_next=$(( ctsE2 + 1 ))
+tog_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$TOGSEED', '$ctsC', '$ctsL2', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
+assert "$([ "${tog_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"commit-ts toggle: seeding with the era horizon succeeds ($tog_seeded page(s))"
+# byte check: if xidA shares the seeded era page, its entry must be all-zero there
+togPage=$(( ctsXA / cts_per_page ))
+if [ "$(( ctsA / cts_per_page ))" = "$togPage" ]; then
+	togSeg=$(printf '%04X' $(( togPage / 32 )))
+	togEntryOff=$(( (togPage % 32) * bs + (ctsA % cts_per_page) * cts_entry_size ))
+	zeros=$($P -c "SELECT pg_read_binary_file('$TOGSEED/pg_commit_ts/$togSeg', $togEntryOff, $cts_entry_size) = decode(repeat('00', $cts_entry_size), 'hex');")
+	assert "$zeros" "t" "commit-ts toggle: the seeded era page holds a zero entry where era-1 bytes were"
+fi
+rm -rf "$TOGSEED"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session

@@ -1788,9 +1788,11 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * TransactionTreeSetCommitTsData() does.  pg_commit_ts entries are fixed-width
  * (TimestampTz + ReplOriginId), packed COMMIT_TS_XACTS_PER_PAGE to a page.
  *
- * Scope: assumes track_commit_timestamp is stable across (C, L].  A XLOG_PARAMETER_CHANGE
- * that turns it off in the window makes a faithful image impossible, so we fail closed;
- * full toggle replay (re-activating/zeroing segment state) is a follow-up.
+ * Toggles: track_commit_timestamp flips only across a restart (PGC_POSTMASTER), landing a
+ * XLOG_PARAMETER_CHANGE in the window.  Each toggle is an era boundary -- DEACTIVATION
+ * deletes every segment, ACTIVATION restarts from nothing -- replayed by wiping the
+ * accumulated state; see the era comments in the scan loops.  A window that ENDS
+ * deactivated fails closed (an inactive fork has no commit-ts state to reconstruct).
  */
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
@@ -1826,6 +1828,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	XLogRecPtr	scanned = base_lsn;
 	XLogRecPtr	readfrom;
 	PsClogReplay r = {false, false, false};
+	bool		era_active = false;
 
 	*deactivated = false;
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -1895,8 +1898,29 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 				xl_parameter_change xlrec;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
-				if (!xlrec.track_commit_timestamp)
-					*deactivated = true;
+
+				/*
+				 * A track_commit_timestamp toggle starts a new commit-ts
+				 * era (the GUC is PGC_POSTMASTER, so this only happens
+				 * across a parent restart).  DEACTIVATION deletes every
+				 * local segment, so all bytes accumulated so far -- base
+				 * snapshot included -- cease to exist.  ACTIVATION starts
+				 * from nothing as well (a deactivation always precedes it,
+				 * at the restart that turned the GUC off), so wiping there
+				 * too defends against era-crossing state a base snapshot
+				 * may have carried.  Within the new era, ActivateCommitTs
+				 * zeroes the page holding nextXid-at-activation WITHOUT
+				 * WAL; every later page comes from a WAL-logged ZEROPAGE
+				 * (ExtendCommitTs).  So exactly one era page may be
+				 * touched by commits with no ZEROPAGE seen -- that one is
+				 * known to start zero (see below).
+				 */
+				memset(page, 0, BLCKSZ);
+				r.page_zeroed = false;
+				r.page_truncated = true;	/* absent until the era touches it */
+				*deactivated = !xlrec.track_commit_timestamp;
+				if (xlrec.track_commit_timestamp)
+					era_active = true;
 			}
 			continue;
 		}
@@ -1909,6 +1933,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 			xl_xact_parsed_commit parsed;
 			TimestampTz ts;
 			ReplOriginId origin = XLogRecGetOrigin(reader);
+			bool		touches = false;
 
 			ParseCommitRecord(XLogRecGetInfo(reader),
 							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
@@ -1916,6 +1941,25 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 				: parsed.xact_time;
 			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
 				: XLogRecGetXid(reader);
+			touches = TransactionIdIsNormal(xid) &&
+				(int64) (xid / PS_CTS_XACTS_PER_PAGE) == pageno;
+			for (int i = 0; !touches && i < parsed.nsubxacts; i++)
+				touches = TransactionIdIsNormal(parsed.subxacts[i]) &&
+					(int64) (parsed.subxacts[i] / PS_CTS_XACTS_PER_PAGE) == pageno;
+
+			/*
+			 * First commit landing on this page after an in-window
+			 * activation, with no era ZEROPAGE seen: this page is the
+			 * activation's silently-zeroed nextXid page (extensions are
+			 * always WAL-logged), so its era base is all-zero.
+			 */
+			if (touches && era_active && r.page_truncated)
+			{
+				memset(page, 0, BLCKSZ);
+				r.page_zeroed = true;
+				r.page_truncated = false;
+			}
+
 			ps_commit_ts_set(page, pageno, xid, ts, origin);
 			for (int i = 0; i < parsed.nsubxacts; i++)
 				ps_commit_ts_set(page, pageno, parsed.subxacts[i], ts, origin);
@@ -1975,7 +2019,7 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
 						LSN_FORMAT_ARGS(target_lsn))));
 	if (deactivated)
 		ereport(ERROR,
-				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+				(errmsg("pagestore: track_commit_timestamp is off as of the target LSN; the fork has no commit-ts state")));
 	if (r.page_truncated)
 		return false;
 	return true;
@@ -2513,6 +2557,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 	XLogRecPtr	readfrom;
 	int64		np = page_hi - page_lo + 1;
 	bool		deactivated = false;
+	bool		era_reset = false;
 	XLogRecPtr	reached_from;
 	TransactionId xid;
 	TransactionId prepared_xid;
@@ -2628,8 +2673,43 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				xl_parameter_change xlrec;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
-				if (!xlrec.track_commit_timestamp)
-					deactivated = true;
+
+				/*
+				 * A track_commit_timestamp toggle starts a new commit-ts
+				 * era (PGC_POSTMASTER: it only flips across a parent
+				 * restart).  DEACTIVATION deletes every local segment, so
+				 * everything accumulated so far -- the base snapshot
+				 * included -- ceases to exist; ACTIVATION also starts from
+				 * nothing (a deactivation always preceded it), so the wipe
+				 * there defends against era-crossing bytes a base snapshot
+				 * carried.  Within a new era ActivateCommitTs zeroes the
+				 * page holding nextXid-at-activation WITHOUT WAL; every
+				 * later page gets a WAL-logged ZEROPAGE (ExtendCommitTs).
+				 * A correct caller passes oldest_xid = that activation
+				 * nextXid, so req_lo's page is exactly the silently-zeroed
+				 * one: mark it zero-present.  (Earlier activations in a
+				 * multi-toggle window get the same marking; the following
+				 * deactivation wipes it again, so only the final era's
+				 * marking survives.)
+				 */
+				memset(pages, 0, np * BLCKSZ);
+				for (int64 p = 0; p < np; p++)
+				{
+					present[p] = false;
+					base_found[p] = false;
+					zeroed[p] = false;
+					truncated[p] = true;
+				}
+				era_reset = true;
+				deactivated = !xlrec.track_commit_timestamp;
+				if (xlrec.track_commit_timestamp &&
+					req_lo >= page_lo && req_lo <= page_hi)
+				{
+					idx = req_lo - page_lo;
+					present[idx] = true;
+					zeroed[idx] = true;
+					truncated[idx] = false;
+				}
 			}
 			continue;
 		}
@@ -2674,7 +2754,8 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 						LSN_FORMAT_ARGS(target_lsn))));
 	if (deactivated)
 		ereport(ERROR,
-				(errmsg("pagestore: track_commit_timestamp was turned off in (base, target]; commit-ts reconstruction across a toggle is not supported")));
+				(errmsg("pagestore: track_commit_timestamp is off as of the target LSN"),
+				 errhint("An inactive fork inherits an empty pg_commit_ts; seed it with a non-normal horizon.")));
 
 check_required_pages:
 	for (int64 pageno = req_lo; pageno <= req_hi; pageno++)
@@ -2683,8 +2764,11 @@ check_required_pages:
 
 		if (truncated[idx])
 			ereport(ERROR,
-					(errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
-							(long long) pageno)));
+					era_reset
+					? errmsg("pagestore: commit-ts page %lld does not exist in the era active as of the target LSN (horizon inconsistent with the WAL's activation)",
+							 (long long) pageno)
+					: errmsg("pagestore: requested commit-ts page %lld was truncated before the target LSN",
+							 (long long) pageno));
 		if (!base_found[idx] && !zeroed[idx])
 			ereport(ERROR,
 					(errmsg("pagestore: base commit-ts snapshot for page %lld is absent at %X/%08X",

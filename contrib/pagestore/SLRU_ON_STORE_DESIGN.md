@@ -1,29 +1,39 @@
 # SLRU on the store: lifecycle design (M4)
 
-Status: implemented (M4), with explicit caveats -- including one unmet
-acceptance criterion.  The WAL-based as-of reconstruction this document
-specifies has landed: snapshot shipping (`pagestore_ship_slru_snapshot`), the
-as-of appliers for clog / commit-ts / multixact offsets+members, the branch
-seeders, and the prepare/install/manifest bootstrap flow
-(`pagestore_prepare_branch` / `pagestore_install_prepared_branch`) with
-fail-closed branch startup validation.  The "matching parent state across
-`track_commit_timestamp` toggles" acceptance criterion is NOT met for
-branches forked across an off-to-on toggle (first caveat below); commit-ts
-support is complete only for toggle-free replay windows.  64-bit multixact
+Status: implemented (M4), with explicit caveats.  The WAL-based as-of
+reconstruction this document specifies has landed: snapshot shipping
+(`pagestore_ship_slru_snapshot`), the as-of appliers for clog / commit-ts /
+multixact offsets+members, the branch seeders, and the
+prepare/install/manifest bootstrap flow (`pagestore_prepare_branch` /
+`pagestore_install_prepared_branch`) with fail-closed branch startup
+validation.  The "matching parent state across `track_commit_timestamp`
+toggles" acceptance criterion is met: the commit-ts appliers replay toggle
+eras (first item below).  64-bit multixact
 member horizons are accepted end to end, but store page addressing uses
 uint32 block numbers, capping members pages at 2^32 (about 2^42 member
 offsets) until the object key grows a 64-bit block field.
 
 Known caveats -- each remains open work, with its exact failure mode stated:
 
-- **Commit-ts toggles in (C, L] are not replayed.**  A `track_commit_timestamp`
-  DEACTIVATION inside the window is detected explicitly and fails the seed.
-  An ACTIVATION is not explicitly detected: it generally fails closed anyway
-  via the required-page check (the base snapshot at C has no commit-ts pages
-  to load), and reads below the branch's `oldestCommitTsXid` horizon are
-  masked -- but segments surviving from an EARLIER activation era are not
-  defended against.  Full toggle replay (segment zero/re-activation state) is
-  the follow-up.
+- **Commit-ts toggles in (C, L] are replayed as eras.**  DONE: the GUC is
+  PGC_POSTMASTER, so a toggle always crosses a parent restart and lands a
+  `XLOG_PARAMETER_CHANGE` in the window.  The appliers treat each toggle as
+  an era boundary: DEACTIVATION wipes everything accumulated (the parent
+  deleted every segment), ACTIVATION wipes as well (defending against
+  era-crossing bytes a base snapshot carried) and starts the new era, whose
+  one silently-zeroed page -- `ActivateCommitTs` zeroes the page holding
+  nextXid-at-activation WITHOUT WAL; every later page has a WAL-logged
+  ZEROPAGE -- is recovered two ways: the seeder marks the horizon page
+  (`oldest_xid`, which a correct caller sets to the activation nextXid) as
+  zero-present, and the single-page applier infers it as the only era page
+  commits touch with no prior ZEROPAGE.  A target inside an off window
+  fails closed with a distinct error; an inactive fork is seeded with a
+  non-normal horizon (the pre-existing empty-`pg_commit_ts` path).  The
+  caller's horizon still comes from the fork's pg_control (the control
+  mirror ships a fresh image at the toggle itself, via
+  XLogReportParameters' UpdateControlFile, so `track_commit_timestamp`
+  as-of-L is reliable); deriving it automatically remains the pg_control
+  bootstrap helper follow-up.
 - **Snapshot shipping trusts the caller's cutoff.**  `pagestore_ship_slru_snapshot`
   copies segment files and keys them by a caller-supplied cutoff C; it errors
   only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
