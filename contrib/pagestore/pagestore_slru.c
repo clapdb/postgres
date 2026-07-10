@@ -4438,6 +4438,20 @@ pagestore_slru_mirror_init(bool localsvc_active)
 		ereport(ERROR,
 				(errmsg("pagestore.slru_mirror and pagestore.slru_live_reads require pagestore.backend = 'localsvc'")));
 
+	/*
+	 * A pinned reader (pagestore.read_lsn) publishes nothing: its SLRU
+	 * pages are the writer's, and the mirror's ship paths would only run
+	 * into the pinned-write refusals -- ERRORs raised inside drains that
+	 * are not built to see them.  Disable the mirror wholesale rather than
+	 * letting it thrash.
+	 */
+	if (pagestore_localsvc_read_lsn() != 0)
+	{
+		ereport(LOG,
+				(errmsg("pagestore: SLRU mirroring/live reads disabled on a pinned reader (pagestore.read_lsn)")));
+		return;
+	}
+
 	if (pagestore_slru_mirror)
 	{
 		ps_slru_mirror_enabled = true;

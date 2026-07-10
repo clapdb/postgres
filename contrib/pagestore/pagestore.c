@@ -495,7 +495,15 @@ static bool
 pagestore_archive_configured(ArchiveModuleState *state)
 {
 	/* only meaningful when relations are served by the localsvc backend */
-	return strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") == 0;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+
+	/*
+	 * A pinned reader ships nothing.  Reporting "not configured" (rather
+	 * than swallowing segments) leaves them .ready, so a later unpinned
+	 * start ships them and the store's WAL history stays gapless.
+	 */
+	return pagestore_localsvc_read_lsn() == 0;
 }
 
 /*
