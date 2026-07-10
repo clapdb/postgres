@@ -375,14 +375,14 @@ posix_meta_rollback(const char *path, off_t old_size, int created)
 }
 
 static int
-posix_meta_append(const void *buf, uint32_t len)
+posix_log_append(const char *name, const void *buf, uint32_t len)
 {
 	char		path[4096];
 	int		fd;
 	int		created;
 	off_t		old_size;
 
-	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
 	created = access(path, F_OK) != 0;
 	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 	if (fd < 0)
@@ -449,19 +449,43 @@ posix_meta_append(const void *buf, uint32_t len)
 }
 
 static int
-posix_meta_read(uint64_t off, void *buf, uint32_t len)
+posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len)
 {
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
 
-	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -1;
 	n = pread(fd, buf, len, (off_t) off);
 	close(fd);
 	return (int) n;
+}
+
+static int
+posix_meta_append(const void *buf, uint32_t len)
+{
+	return posix_log_append("timelines", buf, len);
+}
+
+static int
+posix_meta_read(uint64_t off, void *buf, uint32_t len)
+{
+	return posix_log_read("timelines", off, buf, len);
+}
+
+static int
+posix_fork_meta_append(const void *buf, uint32_t len)
+{
+	return posix_log_append("forkmeta", buf, len);
+}
+
+static int
+posix_fork_meta_read(uint64_t off, void *buf, uint32_t len)
+{
+	return posix_log_read("forkmeta", off, buf, len);
 }
 
 const PsStorage PsStoragePosix = {
@@ -476,4 +500,6 @@ const PsStorage PsStoragePosix = {
 	.wal_read = posix_wal_read,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
+	.fork_meta_append = posix_fork_meta_append,
+	.fork_meta_read = posix_fork_meta_read,
 };

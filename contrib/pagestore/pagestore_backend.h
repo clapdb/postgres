@@ -168,6 +168,10 @@ extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);
+extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
+											  uint64 lsn);
+extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
+										   uint64 lsn);
 extern uint64 pagestore_localsvc_read_lsn(void);
 extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
