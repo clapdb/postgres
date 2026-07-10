@@ -1947,8 +1947,12 @@ ps_commit_ts_normalize_horizons(XLogRecPtr target, TransactionId next_xid,
 		return;
 	if (!TransactionIdIsNormal(*next))
 	{
-		if (!ps_track_commit_ts_asof(target, &track) || !track)
-			return;				/* inactive (or unknowable): leave as-is */
+		if (!ps_track_commit_ts_asof(target, &track))
+			ereport(ERROR,
+					(errmsg("pagestore: commit-ts state as of the target LSN is unknown (no readable control image)"),
+					 errhint("An active pre-checkpoint fork is indistinguishable from an inactive one without the control mirror; refusing to guess.")));
+		if (!track)
+			return;				/* known inactive: leave the pair non-normal */
 		*next = next_xid;
 	}
 	if (!ps_commit_ts_horizon_asof(target, oldest))
@@ -2298,9 +2302,19 @@ pagestore_commit_ts_page_asof(PG_FUNCTION_ARGS)
 	int32		pageno = PG_GETARG_INT32(0);
 	XLogRecPtr	base = PG_GETARG_LSN(1);
 	XLogRecPtr	target = PG_GETARG_LSN(2);
-	TransactionId oldest = PG_GETARG_TRANSACTIONID(3);
+	TransactionId oldest;
 	char	   *page = palloc(BLCKSZ);
 	bytea	   *result;
+
+	/*
+	 * The horizon argument was added later; SQL wrappers created against
+	 * the 3-argument signature still call this symbol.  Reading a fourth
+	 * argument that was never supplied would be garbage (or a crash), so
+	 * default it -- the applier derives the activation horizon from the
+	 * control image anyway; the argument is only its fallback.
+	 */
+	oldest = (PG_NARGS() >= 4) ? PG_GETARG_TRANSACTIONID(3)
+		: InvalidTransactionId;
 
 	if (!ps_commit_ts_reconstruct(page, pageno, base, target, oldest))
 		PG_RETURN_NULL();
@@ -4574,6 +4588,20 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
 	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
 	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+
+	/*
+	 * The normalizer may read the mirrored control image (daemon IPC), so
+	 * the privilege and backend gates must run first -- the impl repeats
+	 * them, but by then a non-superuser would already have touched the
+	 * daemon.
+	 */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to seed branch SLRUs")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
 
 	ps_commit_ts_normalize_horizons(target, next_xid,
 									&oldest_commit_ts_xid,

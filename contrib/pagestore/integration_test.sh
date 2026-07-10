@@ -600,6 +600,12 @@ assert "$($P -c "SELECT pagestore_commit_ts_page_asof($ctsXApage, '$ctsC', '$cts
 # the appliers derive it from the toggle-time control image (Invalid oldest = derive)
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '0'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
 	"commit-ts toggle: a pre-checkpoint fork derives the activation horizon from the control image"
+# a 3-argument SQL wrapper created before the horizon argument existed still calls
+# the same C symbol; it must default the horizon instead of reading garbage
+$P -c "CREATE FUNCTION pagestore_commit_ts_page_asof3(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT pagestore_commit_ts_page_asof3($ctsXApage, '$ctsC', '$ctsLmid') = decode(repeat('00', $bs), 'hex');")" "t" \
+	"commit-ts toggle: the legacy 3-argument page-asof ABI still works (horizon defaulted)"
 # the 'oldest' argument is only the LOOKUP filter: disabling it with a tiny xid must
 # not poison the activation zero-page derivation (which comes from the control image)
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '3'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
