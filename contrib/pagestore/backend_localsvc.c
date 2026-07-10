@@ -42,6 +42,54 @@ static char *localsvc_shm_name = NULL;
 /* GUC: timeline this backend reads/writes on (0 = main; >0 = a branch) */
 static int	localsvc_timeline = 0;
 
+/*
+ * GUC: pin every store relation read at this LSN and refuse store writes --
+ * the compute becomes a PINNED READER of its timeline's history
+ * (READ_CONSISTENCY_DESIGN.md increment 1).  Empty/unset = a normal writer.
+ * The horizon of choice is the redo pointer of a durably mirrored
+ * checkpoint: as-of reads there are complete (the checkpoint flushed and
+ * synced everything it covers).
+ */
+static char *localsvc_read_lsn_str = NULL;
+static uint64 localsvc_read_lsn = 0;
+
+static bool
+ls_check_read_lsn(char **newval, void **extra, GucSource source)
+{
+	uint32		hi,
+				lo;
+
+	if (*newval == NULL || **newval == '\0')
+		return true;
+	if (sscanf(*newval, "%X/%X", &hi, &lo) != 2)
+	{
+		GUC_check_errdetail("Expected a WAL LSN like \"0/1A2B3C4D\".");
+		return false;
+	}
+	return true;
+}
+
+static void
+ls_assign_read_lsn(const char *newval, void *extra)
+{
+	uint32		hi = 0,
+				lo = 0;
+
+	if (newval && *newval && sscanf(newval, "%X/%X", &hi, &lo) == 2)
+		localsvc_read_lsn = ((uint64) hi << 32) | lo;
+	else
+		localsvc_read_lsn = 0;
+}
+
+/* Refuse a store mutation on a pinned reader. */
+static void
+ls_reject_pinned_write(const char *op)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+			 errmsg("pagestore: %s refused: this compute is a pinned reader (pagestore.read_lsn)", op)));
+}
+
 /* per-backend attachment state */
 static void *ls_shm = NULL;
 static int	ls_shm_fd = -1;
@@ -376,6 +424,10 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation create");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedo ? 1 : 0;
@@ -399,6 +451,10 @@ static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation unlink");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
@@ -429,6 +485,10 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation truncate");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
@@ -456,6 +516,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
+		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 		ls_exec(ch);
 
 		for (BlockNumber i = 0; i < chunk; i++)
@@ -476,6 +537,17 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
+
+
+	/*
+	 * A pinned reader drops page writes silently: on a read-only workload
+	 * the only dirt is hint bits, which the store must not receive (they
+	 * would fork the frozen history) and which re-derive on any later
+	 * read.  Real mutations are refused earlier (extend/create/truncate
+	 * error out) and by the read-only mode the reader runs under.
+	 */
+	if (localsvc_read_lsn != 0)
+		return;
 
 	while (done < nblocks)
 	{
@@ -504,6 +576,10 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation extend");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
 	ch->blocknum = blocknum;
@@ -528,6 +604,10 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation extend");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -567,6 +647,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 
 	/* the pages now live in the channel data buffer, readable via the shm fd */
@@ -968,6 +1049,17 @@ pagestore_localsvc_init(void)
 							   PGC_POSTMASTER,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pagestore.read_lsn",
+							   "Pin every store relation read at this LSN and refuse store writes.",
+							   "Makes this compute a pinned reader of its timeline's history "
+							   "(READ_CONSISTENCY_DESIGN.md).  Use the redo pointer of a durably "
+							   "mirrored checkpoint.  Empty = a normal writer compute.",
+							   &localsvc_read_lsn_str,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   ls_check_read_lsn, ls_assign_read_lsn, NULL);
 
 	DefineCustomIntVariable("pagestore.timeline",
 							"Timeline (branch) this backend reads and writes on; 0 is the main timeline.",

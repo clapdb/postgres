@@ -245,6 +245,7 @@ op_read_one(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out)
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	cl_exec();
@@ -275,6 +276,7 @@ op_readv(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out,
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = n;
 	cl_exec();
@@ -465,6 +467,7 @@ op_read_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	cl_exec();
