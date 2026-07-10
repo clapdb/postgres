@@ -189,9 +189,16 @@ in-flight transaction status is a distinct feature, not needed to boot a branch.
 When it is built, the three review rounds established the requirements it must meet
 -- recorded here so they are not lost:
 
-- **Per-update capture, not flushed-page snapshots.** Because pages coalesce
-  updates, live sharing must ship the per-update status changes (or reconstruct via
-  WAL on the reader), not single-LSN page images.
+- **Per-update capture, not flushed-page snapshots.** ADDRESSED without
+  per-update shipping: the coalescing objection is fatal only when a page
+  image must answer an exact as-of question (branch seeding, which stays
+  on WAL reconstruction).  The live mirror never answers as-of: readers
+  take the NEWEST image -- every bit in any shipped image is a durable
+  commit (ship happens only after `XLogFlush(fence)`) -- and the
+  watermark is a completeness floor, not a cap (an image's version can
+  exceed the watermark, since a checkpoint's flush includes commits after
+  its redo; capping the read would hide status below the floor that only
+  that image carries).
 - **No-drop overflow.** A staging queue may not drop an image and "reread later"
   (the as-of bytes are gone); it must block/backpressure or spill durably.
 - **Snapshot under the bank lock.** Any page image staged must be copied under the
@@ -213,18 +220,44 @@ When it is built, the three review rounds established the requirements it must m
   `pagestore_slru_mirror_reset_debt()`.  Losses are persistent: a debt
   marker file survives clean shutdowns, and any unclean previous life
   (pg_control not `DB_SHUTDOWNED` at boot) is itself boot debt, since a
-  dying process may have held staged images.  Image versions come from a
-  global monotone **stamp allocator** issued at capture under the bank
-  lock (group-LSN fences can shrink on reload, and drain-time "now"
-  stamps race across processes: a stale capture shipped late at a higher
-  version would shadow a newer superset image); the fence stays what the
-  drain `XLogFlush()`es, the stamp is the version.  The local commit is
-  never held back; only its visibility to *other* computes waits.
-- **Cache-hit revalidation, including tombstones.** `SimpleLruReadPage()` returns a
-  valid cached slot without hitting the physical-read hook, so cached slots must be
-  revalidated against both the status watermark **and** truncation tombstones
-  (tombstones are a separate versioned negative result with their own
-  epoch/invalidation).
+  dying process may have held staged images -- and enabling the mirror on
+  a cluster with pre-existing SLRU history starts unprimed, since clean
+  local segments are never flushed (captured) again: the watermark stays
+  frozen until `pagestore_slru_mirror_reset_debt()` both primes and
+  forgives (a persistent primed marker).  Image versions are always real
+  WAL positions: the capture-time fence, lifted at post time above every
+  version the page ever shipped at (a shared CAS-max floor table) but
+  never past the insert pointer -- when the floor catches up, the entry
+  defers to a later drain, its pending floor keeping the watermark honest
+  until WAL insertion unblocks it.  LSN-comparable, restart-ordered (WAL
+  only grows), and two images of one page can never tie, so store arrival
+  order never decides which bytes win.  The local commit is never held
+  back; only its visibility to *other* computes waits.
+- **Cache-hit revalidation, including tombstones.** DONE:
+  `slru_page_revalidate_hook` runs on every `SimpleLruReadPage()` cache
+  hit AND on `SimpleLruReadPage_ReadOnly()`'s shared-lock fast path (the
+  normal status lookups all use it); bank lock held, shared-memory checks
+  only.  The revalidation state is **shared**: SLRU buffers are shared,
+  so a page one backend served from the mirror is every backend's cache
+  hit -- the fetched watermark, the served-page decision epochs, and the
+  newest known tombstone per SLRU (which can advance independently of
+  the watermark) all live in the mirror's shared segment, on a shared
+  fetch TTL.  A slot is stale once the watermark or the page's tombstone
+  coverage moves past its epoch -- one physical re-read per page per
+  epoch, re-running the full read-hook gating.  The fetch refreshes at
+  read misses and transaction boundaries (TTL-bounded IPC, never under
+  the bank lock); unknown pages count as stale (a redundant re-read,
+  never a stale answer).  Dirty slots are local truth and are never
+  discarded.  The live mirror has exactly ONE writer per branch timeline
+  (`pagestore.slru_mirror` on the branch primary; live-read computes only
+  consume): newest-image reads depend on that invariant.  Mirror objects
+  are timeline-local (the compute's timeline brands the key), so a branch
+  never resolves its ancestor's live images or watermark past the fork
+  point; on the writer itself, a locally present segment always outranks
+  the (lagging) mirror.  Cross-SLRU pairs (multixact offsets/members) are
+  coherent for anything at/below the watermark -- a checkpoint flushes
+  both -- which is exactly the range a reader may trust; consistency
+  beyond W is the multi-compute read-consistency work.
 - **Tombstones with a defined version + synchronous truncate barrier.**
   DONE: `slru_truncate_hook` fires before any local segment deletion --
   `SimpleLruTruncate` (after its wraparound backstop), `SlruDeleteSegment`,
@@ -234,16 +267,24 @@ When it is built, the three review rounds established the requirements it must m
   in-critical calls find their cutoff covered and no-op.  The consumer
   flushes the truncation WAL first (TruncateCommitTs inserts without
   flushing), ships a `PS_KLASS_SLRU_TOMB` cutoff tombstone and syncs it
-  durably before returning, versioned by the current WAL position -- in
+  durably before returning, versioned by the exact truncation record where
+  the caller knows it (TruncateCLOG/TruncateCommitTs run the barrier
+  themselves with the record's end LSN; SimpleLruTruncate's hook call then
+  finds the cutoff covered) and by the current position otherwise -- in
   recovery the END of the record being replayed (`GetCurrentReplayRecPtr`),
   never the last-replayed position, which would make the tombstone visible
-  below the truncation record itself.  A store failure freezes the
+  below the truncation record itself.  The synchronous ship publishes its
+  own pending floor so no concurrent checkpoint advances the watermark past
+  a truncation whose tombstone is still in flight; the covered cache skips
+  exact duplicates only (page spaces wrap).  A store failure freezes the
   watermark (the truncation record is typically already WAL-logged) and
   then raises, abandoning the local truncation -- except in recovery and
   for the delete-all reset, where nothing can be abandoned: there it stays
-  a counted loss (interrupts still propagate).  Read-side enforcement
-  (dead below the newest tombstone unless a newer image outranks it) is
-  the read-consumer increment's job.
+  a counted loss (interrupts still propagate).  Read-side enforcement is
+  DONE too: a tombstoned page fails closed on a live-read compute, but an
+  image shipped after the tombstone outranks it (legitimate re-creation,
+  e.g. commit-ts re-activation), and on the mirror's own writer the local
+  files win.
 - **Fail-closed, interrupt-safe hooks.** DONE: `slru_page_read_hook` returns
   `SLRU_READ_HOOK_{SERVED,FALLBACK,FAILED}` at the top of
   `SlruPhysicalReadPage()`; a `FAILED` result flows through the existing
@@ -276,14 +317,11 @@ When it is built, the three review rounds established the requirements it must m
   table (re-snapshot under the bank lock, or from the local segment if
   evicted, under a freshly issued stamp); only double overflow loses
   coverage, and that is counted (`pagestore_slru_mirror_stats()`) so the
-  watermark fails conservative.  Post-then-sync: entries pop only
-  after the store sync, and once posted their bytes are frozen at the
-  posted version (a timed-out request may still land in the daemon later,
-  and the store resolves same-version appends by arrival order:
-  byte-identical retries make that order irrelevant, while newer bytes
-  re-ship via recapture under a strictly higher stamp).  The
-  watermark itself, truncation tombstones, and the read-side consumer are
-  the remaining increments.
+  watermark fails conservative.  Post-then-sync: entries pop only after
+  the store sync, and once posted their bytes are frozen at the posted
+  version (a timed-out request may still land later; byte-identical
+  retries make same-version arrival order irrelevant, and newer bytes
+  re-ship via recapture under a strictly higher stamp).
 
 This list is the spec for that feature; none of it blocks M4.
 
