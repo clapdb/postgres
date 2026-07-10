@@ -1900,27 +1900,51 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 
 				/*
-				 * A track_commit_timestamp toggle starts a new commit-ts
-				 * era (the GUC is PGC_POSTMASTER, so this only happens
-				 * across a parent restart).  DEACTIVATION deletes every
-				 * local segment, so all bytes accumulated so far -- base
-				 * snapshot included -- cease to exist.  ACTIVATION starts
-				 * from nothing as well (a deactivation always precedes it,
-				 * at the restart that turned the GUC off), so wiping there
-				 * too defends against era-crossing state a base snapshot
-				 * may have carried.  Within the new era, ActivateCommitTs
-				 * zeroes the page holding nextXid-at-activation WITHOUT
-				 * WAL; every later page comes from a WAL-logged ZEROPAGE
-				 * (ExtendCommitTs).  So exactly one era page may be
-				 * touched by commits with no ZEROPAGE seen -- that one is
-				 * known to start zero (see below).
+				 * XLOG_PARAMETER_CHANGE fires for ANY changed parameter
+				 * and carries the CURRENT track_commit_timestamp value,
+				 * not a transition flag -- a restart that changed only,
+				 * say, max_connections emits one with track=true while
+				 * commit-ts stayed active throughout.  Only real
+				 * transitions are era boundaries:
+				 *
+				 * - track=false: as of this record the state is off,
+				 *   whatever it was before.  DeactivateCommitTs deleted
+				 *   every local segment, so wipe (an off->off repeat
+				 *   wipes an already-empty state -- harmless).
+				 *
+				 * - track=true after an in-window false: a real
+				 *   activation; the era starts from nothing.  Within it,
+				 *   ActivateCommitTs zeroes the page holding
+				 *   nextXid-at-activation WITHOUT WAL; every later page
+				 *   has a WAL-logged ZEROPAGE (ExtendCommitTs), so
+				 *   exactly one era page may be touched by commits with
+				 *   no ZEROPAGE seen -- known to start zero (see below).
+				 *
+				 * - track=true with no in-window false: either an
+				 *   unrelated restart while active (do NOTHING -- the
+				 *   accumulated state is valid), or an activation whose
+				 *   deactivation predates the window (the base is empty
+				 *   then, so there is nothing to wipe anyway; the
+				 *   silent-zero inference below still applies).
 				 */
-				memset(page, 0, BLCKSZ);
-				r.page_zeroed = false;
-				r.page_truncated = true;	/* absent until the era touches it */
-				*deactivated = !xlrec.track_commit_timestamp;
-				if (xlrec.track_commit_timestamp)
+				if (!xlrec.track_commit_timestamp)
+				{
+					memset(page, 0, BLCKSZ);
+					r.page_zeroed = false;
+					r.page_truncated = true;	/* absent until touched */
+					*deactivated = true;
+					era_active = false;
+				}
+				else if (*deactivated)
+				{
+					memset(page, 0, BLCKSZ);
+					r.page_zeroed = false;
+					r.page_truncated = true;
+					*deactivated = false;
 					era_active = true;
+				}
+				else
+					era_active = true;	/* weak: no wipe; inference only */
 			}
 			continue;
 		}
@@ -2675,40 +2699,74 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
 
 				/*
-				 * A track_commit_timestamp toggle starts a new commit-ts
-				 * era (PGC_POSTMASTER: it only flips across a parent
-				 * restart).  DEACTIVATION deletes every local segment, so
-				 * everything accumulated so far -- the base snapshot
-				 * included -- ceases to exist; ACTIVATION also starts from
-				 * nothing (a deactivation always preceded it), so the wipe
-				 * there defends against era-crossing bytes a base snapshot
-				 * carried.  Within a new era ActivateCommitTs zeroes the
-				 * page holding nextXid-at-activation WITHOUT WAL; every
-				 * later page gets a WAL-logged ZEROPAGE (ExtendCommitTs).
-				 * A correct caller passes oldest_xid = that activation
-				 * nextXid, so req_lo's page is exactly the silently-zeroed
-				 * one: mark it zero-present.  (Earlier activations in a
-				 * multi-toggle window get the same marking; the following
-				 * deactivation wipes it again, so only the final era's
-				 * marking survives.)
+				 * XLOG_PARAMETER_CHANGE fires for ANY changed parameter
+				 * and carries the CURRENT track_commit_timestamp value,
+				 * not a transition flag.  Only real transitions are era
+				 * boundaries (see the single-page applier for the full
+				 * case analysis):
+				 *
+				 * - track=false: state is off from here; wipe (matches
+				 *   DeactivateCommitTs deleting every segment; an
+				 *   off->off repeat wipes an empty state, harmless).
+				 *
+				 * - track=true after an in-window false: real activation;
+				 *   wipe (defends against era-crossing bytes the base
+				 *   snapshot carried) and mark the caller's horizon page
+				 *   zero-present -- ActivateCommitTs zeroes the
+				 *   nextXid-at-activation page WITHOUT WAL, and a correct
+				 *   caller passes oldest_xid = that nextXid.
+				 *
+				 * - track=true with no in-window false: an unrelated
+				 *   restart while active (keep everything), or an
+				 *   activation whose deactivation predates the window
+				 *   (the base is empty; only the silent-zero horizon-page
+				 *   marking is needed, and only where no base exists).
 				 */
-				memset(pages, 0, np * BLCKSZ);
-				for (int64 p = 0; p < np; p++)
+				if (!xlrec.track_commit_timestamp)
 				{
-					present[p] = false;
-					base_found[p] = false;
-					zeroed[p] = false;
-					truncated[p] = true;
+					memset(pages, 0, np * BLCKSZ);
+					for (int64 p = 0; p < np; p++)
+					{
+						present[p] = false;
+						base_found[p] = false;
+						zeroed[p] = false;
+						truncated[p] = true;
+					}
+					era_reset = true;
+					deactivated = true;
 				}
-				era_reset = true;
-				deactivated = !xlrec.track_commit_timestamp;
-				if (xlrec.track_commit_timestamp &&
-					req_lo >= page_lo && req_lo <= page_hi)
+				else if (deactivated)
 				{
+					memset(pages, 0, np * BLCKSZ);
+					for (int64 p = 0; p < np; p++)
+					{
+						present[p] = false;
+						base_found[p] = false;
+						zeroed[p] = false;
+						truncated[p] = true;
+					}
+					era_reset = true;
+					deactivated = false;
+					if (req_lo >= page_lo && req_lo <= page_hi)
+					{
+						idx = req_lo - page_lo;
+						present[idx] = true;
+						zeroed[idx] = true;
+						truncated[idx] = false;
+					}
+				}
+				else if (req_lo >= page_lo && req_lo <= page_hi)
+				{
+					/* weak activation: zero-base the horizon page only
+					 * where no base snapshot covers it */
 					idx = req_lo - page_lo;
-					present[idx] = true;
-					zeroed[idx] = true;
-					truncated[idx] = false;
+					if (!base_found[idx] && !zeroed[idx])
+					{
+						memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+						present[idx] = true;
+						zeroed[idx] = true;
+						truncated[idx] = false;
+					}
 				}
 			}
 			continue;

@@ -600,6 +600,14 @@ if [ "$(( ctsA / cts_per_page ))" = "$togPage" ]; then
 	assert "$zeros" "t" "commit-ts toggle: the seeded era page holds a zero entry where era-1 bytes were"
 fi
 rm -rf "$TOGSEED"
+# an unrelated restart (another PGC_POSTMASTER parameter changed) emits a
+# XLOG_PARAMETER_CHANGE that still carries track_commit_timestamp = true; that
+# is NOT a transition, and the appliers must not wipe the era for it
+echo "max_connections = 120" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+ctsL3=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an unrelated parameter-change restart does not wipe the era"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
