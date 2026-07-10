@@ -148,10 +148,17 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	}
 
 	srel = smgropen(rlocator, procNumber);
-	smgrcreate(srel, MAIN_FORKNUM, false);
 
+	/*
+	 * WAL-log the creation before creating the storage: replay recreates the
+	 * fork idempotently, and storage managers that version fork existence by
+	 * WAL position (pagestore) can then stamp the creation at/after its
+	 * record instead of before it.
+	 */
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	/*
 	 * Add the relation to the list of stuff to delete at abort, if we are

@@ -374,8 +374,17 @@ posix_meta_rollback(const char *path, off_t old_size, int created)
 		posix_unlink_created_meta(path);
 }
 
+/*
+ * Metadata logs are appended from per-shard workers (fork-meta events) as
+ * well as the request path (timelines).  The append itself could rely on
+ * O_APPEND, but the ERROR ROLLBACK below truncates to a size sampled before
+ * the write -- racing appenders would let one failure chop another's
+ * acknowledged record.  One lock serializes append+rollback per process.
+ */
+static pthread_mutex_t posix_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int
-posix_log_append(const char *name, const void *buf, uint32_t len)
+posix_log_append_locked(const char *name, const void *buf, uint32_t len)
 {
 	char		path[4096];
 	int		fd;
@@ -462,6 +471,17 @@ posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len)
 	n = pread(fd, buf, len, (off_t) off);
 	close(fd);
 	return (int) n;
+}
+
+static int
+posix_log_append(const char *name, const void *buf, uint32_t len)
+{
+	int			rc;
+
+	pthread_mutex_lock(&posix_log_lock);
+	rc = posix_log_append_locked(name, buf, len);
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
 }
 
 static int

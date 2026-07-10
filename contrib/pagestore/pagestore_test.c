@@ -774,6 +774,7 @@ stop_daemon(pid_t pid)
 #define REL_A	16000
 #define REL_B	17000
 #define REL_C	18000
+#define REL_D	19000
 #define FORK0	0
 
 static void
@@ -888,6 +889,22 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_exists(REL_C, FORK0), "recreate after unlink");
 	check(op_nblocks(REL_C, FORK0) == 0, "recreated fork is empty");
 	check(!op_exists_asof(REL_C, FORK0, 9500), "between unlink and recreate: not exists");
+
+	/* WAL-less growth (pd_lsn 0, unlogged relations): ordered at the
+	 * definitive floor instead of sorting below it and being covered */
+	op_create_at(REL_D, FORK0, 1000);
+	fill_page(pa, page_size, 0, 41);
+	op_write_one(REL_D, FORK0, 0, pa);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "pd_lsn-0 growth raises the newest size past the create SET");
+	op_truncate_at(REL_D, FORK0, 0, 2000);
+	check(op_nblocks(REL_D, FORK0) == 0, "truncate resets the WAL-less fork");
+	fill_page(pa, page_size, 0, 42);
+	op_write_one(REL_D, FORK0, 0, pa);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "pd_lsn-0 regrow is ordered at the truncate floor, not under it");
+	check(op_nblocks_asof(REL_D, FORK0, 1999) == 1,
+		  "the pre-truncate WAL-less block stays visible below the truncate");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 

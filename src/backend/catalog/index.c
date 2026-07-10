@@ -3110,8 +3110,9 @@ index_build(Relation heapRelation,
 	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
 		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
 	{
-		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
+		/* WAL before action; see RelationCreateStorage */
 		log_smgrcreate(&indexRelation->rd_locator, INIT_FORKNUM);
+		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
 		indexRelation->rd_indam->ambuildempty(indexRelation);
 	}
 
