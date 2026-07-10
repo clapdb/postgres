@@ -74,12 +74,14 @@ reconstruction.
    (POSTMASTER): every store relation page read is capped at R --
    `PS_OP_READV` gains an honoured `req_lsn` (0 keeps the newest
    semantics, so the writer path is untouched) -- and store mutations are
-   refused: relation extend/create/unlink/truncate, WAL append, WAL-index
-   append, and object writes all error; page writes are dropped when
-   hint-bit-only (pd_lsn <= R; they must not fork the frozen history and
-   re-derive on later reads) and refused loudly when the page LSN
-   advanced past R (a real local mutation that escaped read-only mode).
-   Because R never moves, shared-buffer staleness is a non-issue.
+   refused: relation extend/create/unlink/truncate, page writes, branch
+   creation, WAL append, WAL-index append, and object writes all error.
+   Page writes fail closed wholesale -- with hint-bit dirtying suppressed
+   at the source (below) nothing hint-only can reach the write path, so
+   anything arriving is a real mutation that escaped read-only mode,
+   including WAL-less writes (unlogged relations, fake-LSN index pages)
+   whose pd_lsn never advances past the pin.  Because R never moves,
+   shared-buffer staleness is a non-issue.
 
    A pinned compute must also generate NO page-content WAL of its own:
    with checksums on, a plain SELECT sets hint bits and emits an
@@ -90,7 +92,9 @@ reconstruction.
    on-access pruning (the `page_maintenance_suppressed` seam in core),
    forces `autovacuum = off` and `default_transaction_read_only = on`,
    disables the SLRU/control mirrors (nothing legitimate to publish),
-   and pauses WAL archiving (segments stay `.ready` and ship after
+   refuses to start at all if the localsvc backend is not active (the pin
+   would force the server read-only while capping nothing), and pauses
+   WAL archiving (segments stay `.ready` and ship after
    unpinning, keeping the store's WAL history gapless).  The store-write
    refusals above remain as the fail-closed backstop.  This is the
    MECHANISM increment: on its own it freezes page bytes, not the whole

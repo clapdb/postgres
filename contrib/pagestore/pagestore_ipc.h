@@ -29,7 +29,9 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		15	/* 15: PS_KLASS_SLRU_WM watermark object;
+#define PS_SHM_VERSION		16	/* 16: PS_OP_READV honours req_lsn as a
+								 *     read cap (pinned readers);
+								 * 15: PS_KLASS_SLRU_WM watermark object;
 								 * 14: PS_KLASS_SLRU_TOMB truncation
 								 *     tombstones;
 								 * 13: PS_KLASS_SLRU_LIVE (caller-versioned
