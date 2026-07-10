@@ -537,6 +537,7 @@ typedef struct ForkEnt
 	ForkEvent  *ev;				/* lsn-ordered size history */
 	uint32_t	nev;
 	uint32_t	evcap;
+	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 } ForkEnt;
 
 /*
@@ -815,8 +816,26 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 {
 	uint32_t	i;
 
+	/*
+	 * WAL-less growth (unlogged relations: pd_lsn 0) would sort below a
+	 * later create/truncate SET and be treated as covered, leaving the
+	 * newest size stuck at the SET's value however far the fork actually
+	 * grew.  Such content is not LSN-ordered to begin with: order it at
+	 * the definitive floor, where it is visible from that event onward.
+	 * The clamp applies ONLY to pd_lsn 0 -- a nonzero LSN below the floor
+	 * is, on the recovery path, real pre-truncate history replayed from
+	 * the segment log behind the pre-loaded fork-meta events, and must
+	 * keep its place.  (Unlogged indexes using fake LSNs remain a known
+	 * limitation; unlogged relations on the store have crash-reset
+	 * semantics that LSN-versioning cannot express either way.)
+	 */
+	if (kind == FEV_GROW && lsn == 0)
+		lsn = e->last_def_lsn;
+
 	if (kind == FEV_GROW && fork_size_asof_hop(e, lsn) >= nblocks)
 		return;
+	if (kind != FEV_GROW && lsn > e->last_def_lsn)
+		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
 	{
 		e->evcap = e->evcap ? e->evcap * 2 : 4;

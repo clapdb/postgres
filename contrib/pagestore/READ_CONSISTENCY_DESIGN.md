@@ -152,9 +152,11 @@ reconstruction.
    events persist in a fork-meta log (loaded before the segment scan,
    so recovery re-derives growth from the segment records' LSNs against
    the same definitive backdrop the live path saw); growth needs no
-   extra persistence.  Note: WAL-less pages (unlogged relations) grow
-   at pd_lsn 0 and are visible at every horizon -- their content is not
-   LSN-ordered to begin with.
+   extra persistence.  Note: WAL-less pages (unlogged relations) carry
+   pd_lsn 0; their growth is ordered at the fork's newest definitive
+   event (create/truncate) so the newest size stays right -- their
+   content is not LSN-ordered to begin with, and unlogged crash-reset
+   semantics are outside what LSN-versioning can express.
 
 1c. **The as-of compute (boot + snapshot).**  A consistent QUERY compute
    at R needs its LOCAL state as-of R too: catalogs, pg_control, and

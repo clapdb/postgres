@@ -1151,6 +1151,13 @@ assert "$($P -c "SELECT count(*) FROM asof_t;")" "10" \
 	"the truncated table still serves its surviving rows"
 assert "$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn);")" "$szR" \
 	"the pre-truncate horizon still sees the pre-truncate size (frozen view)"
+# WAL-less (unlogged) pages carry pd_lsn 0; their growth must order at the
+# create event's floor, not sort under it and leave the fork looking empty
+$P -c "CREATE UNLOGGED TABLE unlogged_t(i int) TABLESPACE ts;" >/dev/null
+$P -q -c "INSERT INTO unlogged_t SELECT generate_series(1, 100);" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \
+	"an unlogged table's WAL-less growth raises the store's newest size"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"

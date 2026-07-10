@@ -421,6 +421,14 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.forkNum = key->forkNum;
 	ch->key.klass = PS_KLASS_RELATION;	/* the smgr shim only stores relation pages */
 	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
+
+	/*
+	 * Channels are reused across op kinds and req_lsn now has meaning for
+	 * every metadata op (an event LSN for mutations, an as-of horizon for
+	 * queries).  Clear it here so no sender inherits a stale value; ops
+	 * that need one assign it after this call.
+	 */
+	ch->req_lsn = 0;
 }
 
 /*
@@ -433,20 +441,31 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  */
 
 /*
- * WAL-position stamp for a fork-mutating op (create/truncate/unlink/
- * zero-extend).  The daemon keys the fork's size history by it, so as-of
- * NBLOCKS/EXISTS answers resolve against these events like page reads
- * resolve against pd_lsns.  During replay the honest position is the replay
- * pointer (insert position is not maintained then); otherwise the current
- * insert position -- at/after the WAL record that caused the mutation (e.g.
- * RelationTruncate inserts SMGR_TRUNCATE just before smgr_truncate runs).
+ * WAL-position stamp for a fork-mutating op (create/truncate/unlink).  The
+ * daemon keys the fork's size history by it, so as-of NBLOCKS/EXISTS answers
+ * resolve against these events like page reads resolve against pd_lsns.
+ *
+ * Normal operation stamps XactLastRecEnd: the end of the WAL record THIS
+ * backend just inserted, which for every caller is the record of the
+ * mutation itself -- log_smgrcreate before smgrcreate (core orders WAL
+ * before action), SMGR_TRUNCATE just before smgr_truncate, the commit
+ * record just before post-commit unlinks.  The global insert pointer would
+ * over-stamp: unrelated concurrent inserts push it past the mutation
+ * record, and a horizon between the two would miss the mutation.  During
+ * replay the honest position is the END of the record being replayed
+ * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
+ * rm_redo returns, i.e. it names the PREVIOUS record).
+ *
+ * WAL-less mutations (unlogged relations) leave XactLastRecEnd at some
+ * older record or 0; their content is not LSN-ordered to begin with, and a
+ * 0 falls back to the daemon's after-known-history ordering.
  */
 static uint64
 ls_op_lsn(void)
 {
 	if (RecoveryInProgress())
-		return (uint64) GetXLogReplayRecPtr(NULL);
-	return (uint64) GetXLogInsertRecPtr();
+		return (uint64) GetCurrentReplayRecPtr(NULL);
+	return (uint64) XactLastRecEnd;
 }
 
 /*
@@ -655,7 +674,13 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->skip_fsync = skipFsync ? 1 : 0;
-	ch->req_lsn = ls_op_lsn();	/* zero pages carry no pd_lsn of their own */
+	/*
+	 * Zero-extends have no WAL record of their own (the extension is
+	 * implied by later content); the insert position is the best honest
+	 * upper bound, and never-written blocks read as zeros either way.
+	 */
+	ch->req_lsn = RecoveryInProgress() ?
+		(uint64) GetCurrentReplayRecPtr(NULL) : (uint64) GetXLogInsertRecPtr();
 	ls_exec(ch);
 }
 
