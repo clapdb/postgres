@@ -1058,7 +1058,8 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # construction) and refuses store mutations.  History stays frozen: an update
 # checkpointed after R must not be visible to the pinned compute.
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
-       INSERT INTO reader_t VALUES (1, 'v1');" >/dev/null
+       INSERT INTO reader_t VALUES (1, 'v1');
+       CREATE SEQUENCE reader_seq;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 readerR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
@@ -1071,10 +1072,16 @@ assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
 assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
-# the read-only default is advisory; the executor gate must hold when a session escapes it
+# the read-only default is advisory on a normal server; on a pinned reader the
+# escape itself is refused (transaction_read_only_forced, the recovery model)
 assert "$($P -c "BEGIN; SET TRANSACTION READ WRITE; UPDATE reader_t SET v = 'v3' WHERE id = 1; COMMIT;" 2>&1 \
-		| grep -c 'not allowed on a pinned reader')" "1" \
-	"pinned reader refuses writes even after SET TRANSACTION READ WRITE"
+		| grep -c 'cannot set transaction read-write mode on a read-only instance')" "1" \
+	"pinned reader refuses SET TRANSACTION READ WRITE outright"
+# write-capable SELECTs and DDL hold against the forced read-only state
+assert "$($P -c "SELECT nextval('reader_seq');" 2>&1 | grep -c 'read-only')" "1" \
+	"pinned reader refuses nextval() (side-effecting SELECT)"
+assert "$($P -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "1" \
+	"pinned reader refuses DDL"
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($P -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"

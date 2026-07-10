@@ -88,11 +88,15 @@ reconstruction.
    `FPI_FOR_HINT` carrying the as-of-R page image; replaying that WAL
    after the pin is lifted would republish the stale image ABOVE the
    writer's shipped versions and rewind history for every later reader.
-   So a pinned start layers its defenses, outermost first: executor and
-   utility gates refuse DML, row locking, VACUUM/ANALYZE, REINDEX, REPACK
-   and COPY FROM (all reachable inside read-only transactions or by
-   escaping the advisory read-only default with SET TRANSACTION READ
-   WRITE); hint-bit dirtying and on-access pruning are suppressed (the
+   So a pinned start layers its defenses, outermost first: the read-only
+   state is FORCED (`transaction_read_only_forced` in core: every
+   transaction starts read-only and SET TRANSACTION READ WRITE is refused
+   exactly as during recovery -- the hot-standby enforcement model), which
+   holds every PreventCommandIfReadOnly path: DML, DDL, TRUNCATE,
+   nextval(), COPY FROM; executor and utility gates additionally refuse
+   DML, row locking, VACUUM/ANALYZE, REINDEX, REPACK and COPY FROM at the
+   entry points (VACUUM and REINDEX are legal in read-only transactions,
+   the rest get the clearer pinned-reader error); hint-bit dirtying and on-access pruning are suppressed (the
    `page_maintenance_suppressed` seam in core, which also shuts down the
    autovacuum launcher/workers -- including the wraparound-defense
    launcher that ignores `autovacuum = off` -- and bgwriter standby
