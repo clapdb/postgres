@@ -1040,13 +1040,16 @@ ps_slru_tomb_note(int idx, int64 cutoff, uint64 version)
 		if (cur != PG_UINT64_MAX)
 		{
 			/*
-			 * EQUAL versions must be re-noted, not dropped: the store
-			 * resolves same-position writes by arrival order, so a same-LSN
-			 * rewrite (pagestore_slru_mirror_truncate() on an idle system
-			 * samples the insert position without emitting WAL) is
-			 * authoritative there and its cutoff must reach cached readers.
+			 * STRICTLY newer only.  Tombstone versions are strictly
+			 * monotone at the source (the natural truncate paths carry
+			 * their own WAL records between truncations, and the ops
+			 * helper inserts a no-op record for the same guarantee), so
+			 * two fetch responses at one version saw the same store state
+			 * and re-noting adds nothing -- while allowing equality would
+			 * let a DELAYED stale response overwrite a newer same-version
+			 * cutoff and regress the cache until the next fetch.
 			 */
-			if (version < cur)
+			if (version <= cur)
 				return;
 			if (pg_atomic_compare_exchange_u64(&ps_slru_wm->tomb_version[idx],
 											   &cur, PG_UINT64_MAX))
