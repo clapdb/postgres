@@ -425,6 +425,15 @@ AutoVacLauncherMain(const void *startup_data, size_t startup_data_len)
 
 	init_ps_display(NULL);
 
+	/*
+	 * A maintenance-suppressed instance (a pinned pagestore reader) must
+	 * not vacuum: even with autovacuum = off the postmaster starts this
+	 * launcher for wraparound defense, and a forced worker would generate
+	 * exactly the page-content WAL that mode forbids.
+	 */
+	if (page_maintenance_suppressed)
+		proc_exit(0);
+
 	ereport(DEBUG1,
 			(errmsg_internal("autovacuum launcher started")));
 
@@ -1436,6 +1445,10 @@ AutoVacWorkerMain(const void *startup_data, size_t startup_data_len)
 	}
 
 	init_ps_display(NULL);
+
+	/* See AutoVacLauncherMain: no vacuum work on a suppressed instance. */
+	if (page_maintenance_suppressed)
+		proc_exit(0);
 
 	Assert(GetProcessingMode() == InitProcessing);
 

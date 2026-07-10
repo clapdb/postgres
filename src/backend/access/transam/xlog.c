@@ -814,7 +814,7 @@ XLogInsertRecord(XLogRecData *rdata,
 
 	/* cross-check on whether we should be here or not */
 	if (!XLogInsertAllowed())
-		elog(ERROR, "cannot make new WAL entries during recovery");
+		elog(ERROR, "cannot make new WAL entries during recovery or on a WAL-restricted instance");
 
 	/*
 	 * Given that we're not in recovery, InsertTimeLineID is set and can't
@@ -4634,6 +4634,9 @@ ReadControlFile(void)
 /* Hook for control-file writes (see UpdateControlFile) */
 control_file_write_hook_type control_file_write_hook = NULL;
 
+/* see XLogInsertAllowed() */
+bool		wal_insert_restricted = false;
+
 /* highest update_lsn passed to UpdateControlFile() in this process */
 static XLogRecPtr LastControlUpdateLSN = InvalidXLogRecPtr;
 
@@ -7055,6 +7058,22 @@ GetRecoveryState(void)
 bool
 XLogInsertAllowed(void)
 {
+	/*
+	 * A WAL-restricted instance (extension-set; a pinned pagestore reader)
+	 * permits inserts only from the processes WAL housekeeping cannot run
+	 * without -- checkpointer, startup, bgwriter, walwriter.  Everything
+	 * else (regular backends, autovacuum, background workers) is refused
+	 * here as the fail-closed backstop behind the executor/utility gates.
+	 * This must precede the LocalXLogInsertAllowed fast path: backends
+	 * latch that to "unconditionally true" once out of recovery.
+	 */
+	if (wal_insert_restricted &&
+		MyBackendType != B_CHECKPOINTER &&
+		MyBackendType != B_STARTUP &&
+		MyBackendType != B_BG_WRITER &&
+		MyBackendType != B_WAL_WRITER)
+		return false;
+
 	/*
 	 * If value is "unconditionally true" or "unconditionally false", just
 	 * return it.  This provides the normal fast path once recovery is known

@@ -1069,8 +1069,15 @@ echo "pagestore.read_lsn = '$readerR'" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
-assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'read-only')" "1" \
+assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
+# the read-only default is advisory; the executor gate must hold when a session escapes it
+assert "$($P -c "BEGIN; SET TRANSACTION READ WRITE; UPDATE reader_t SET v = 'v3' WHERE id = 1; COMMIT;" 2>&1 \
+		| grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses writes even after SET TRANSACTION READ WRITE"
+# VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
+assert "$($P -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses VACUUM"
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 echo "pagestore.read_lsn = ''" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1

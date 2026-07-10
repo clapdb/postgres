@@ -88,15 +88,34 @@ reconstruction.
    `FPI_FOR_HINT` carrying the as-of-R page image; replaying that WAL
    after the pin is lifted would republish the stale image ABOVE the
    writer's shipped versions and rewind history for every later reader.
-   So a pinned start suppresses hint-bit dirtying of shared buffers and
-   on-access pruning (the `page_maintenance_suppressed` seam in core),
-   forces `autovacuum = off` and `default_transaction_read_only = on`,
-   disables the SLRU/control mirrors (nothing legitimate to publish),
+   So a pinned start layers its defenses, outermost first: executor and
+   utility gates refuse DML, row locking, VACUUM/ANALYZE, REINDEX, REPACK
+   and COPY FROM (all reachable inside read-only transactions or by
+   escaping the advisory read-only default with SET TRANSACTION READ
+   WRITE); hint-bit dirtying and on-access pruning are suppressed (the
+   `page_maintenance_suppressed` seam in core, which also shuts down the
+   autovacuum launcher/workers -- including the wraparound-defense
+   launcher that ignores `autovacuum = off` -- and bgwriter standby
+   snapshots); `wal_insert_restricted` (core) refuses WAL insertion from
+   anything but the WAL-essential auxiliary processes, so even a direct
+   C-level bypass of the gates cannot plant replayable page-content WAL;
+   it also forces `autovacuum = off` and `default_transaction_read_only =
+   on`, disables the SLRU/control mirrors (nothing legitimate to
+   publish),
    refuses to start at all if the localsvc backend is not active (the pin
    would force the server read-only while capping nothing), and pauses
    WAL archiving (segments stay `.ready` and ship after
-   unpinning, keeping the store's WAL history gapless).  The store-write
-   refusals above remain as the fail-closed backstop.  This is the
+   unpinning, keeping the store's WAL history gapless).  What pinned-era
+   WAL remains is meta-only -- the shutdown checkpoint record (periodic
+   checkpoints self-skip with no WAL activity) -- and belongs to this
+   cluster's own WAL lineage, so shipping it after unpinning is correct
+   for the single-compute pin/unpin round trip.  A SECOND compute pinned
+   against a writer's timeline must never archive at all: its local WAL
+   chain diverges from the writer's from the moment it starts, so
+   shipping any of it (pinned-era or not) would clobber the writer's
+   shipped segments; at most one compute per timeline may run with
+   archiving configured.  The store-write refusals above remain as the
+   fail-closed backstop.  This is the
    MECHANISM increment: on its own it freezes page bytes, not the whole
    compute.
 
