@@ -122,7 +122,7 @@ static SlruDesc XactSlruDesc;
 #define XactCtl (&XactSlruDesc)
 
 
-static void WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact,
+static XLogRecPtr WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact,
 								 Oid oldestXactDb);
 static void TransactionIdSetPageStatus(TransactionId xid, int nsubxids,
 									   TransactionId *subxids, XidStatus status,
@@ -1012,7 +1012,73 @@ TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 	 * ahead of clog truncation in case we crash, and so a standby finds out
 	 * the new valid xid before the next checkpoint.
 	 */
-	WriteTruncateXlogRec(cutoffPage, oldestXact, oldestxid_datoid);
+	{
+		XLogRecPtr	trunc_lsn;
+		bool		barrier_ok;
+
+		/*
+		 * The pre-barrier (and its slot discard) only run when
+		 * SimpleLruTruncate()'s apparent-wraparound backstop is not going
+		 * to refuse the truncation: a refused truncation must not durably
+		 * declare its range dead, and discarding dirty resident pages --
+		 * potentially the current endpoint -- for a truncation that then
+		 * deletes nothing would simply lose those updates.
+		 */
+		barrier_ok = slru_truncate_hook &&
+			!XactCtl->options.PagePrecedes(pg_atomic_read_u64(&XactCtl->shared->latest_page_number),
+										   cutoffPage);
+
+		/*
+		 * Hold off checkpoint starts from the truncate record until the
+		 * barrier below has either shipped its tombstone (durable, pending
+		 * floor noted) or failed (loss counted, watermark frozen): a
+		 * checkpoint slipping into that window could complete and publish
+		 * a live-SLRU watermark past trunc_lsn while the truncation it
+		 * implies has no tombstone yet.  Same discipline as
+		 * TruncateMultiXact(); the flag must not leak on error.
+		 */
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		PG_TRY();
+		{
+			/*
+			 * Flush every doomed dirty page BEFORE the truncate record
+			 * exists: a checkpoint already inside SimpleLruWriteAll() could
+			 * otherwise flush one after the barrier below ships its
+			 * tombstone, capturing a mirror image versioned above it that
+			 * would resurrect the page.  Flushing (not discarding) keeps
+			 * this window abortable -- an error in the record insertion or
+			 * the barrier abandons the truncation with nothing lost -- and
+			 * any capture the flush triggers here is bounded below
+			 * trunc_lsn, so the tombstone outranks it.
+			 */
+			if (barrier_ok)
+				SimpleLruFlushCutoff(XactCtl, cutoffPage);
+
+			trunc_lsn = WriteTruncateXlogRec(cutoffPage, oldestXact,
+											 oldestxid_datoid);
+
+			/*
+			 * A store-backed SLRU mirror wants its truncation tombstone
+			 * versioned by the exact truncate record, not a later sampled
+			 * position (an as-of reader between the two would have the
+			 * record in its history but see no tombstone).  Run the barrier
+			 * here with that LSN; SimpleLruTruncate()'s own hook call then
+			 * finds the cutoff covered and no-ops.  (Should the wraparound
+			 * state change in between, the in-truncate hook call runs
+			 * uncovered and ships with a sampled position.)
+			 */
+			if (barrier_ok)
+				(*slru_truncate_hook) (XactCtl, cutoffPage, trunc_lsn);
+		}
+		PG_CATCH();
+		{
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
 
 	/* Now we can remove the old CLOG segment(s) */
 	SimpleLruTruncate(XactCtl, cutoffPage);
@@ -1067,7 +1133,7 @@ clog_errdetail_for_io_error(const void *opaque_data)
  * We must flush the xlog record to disk before returning --- see notes
  * in TruncateCLOG().
  */
-static void
+static XLogRecPtr
 WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 {
 	XLogRecPtr	recptr;
@@ -1081,6 +1147,7 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 	XLogRegisterData(&xlrec, sizeof(xl_clog_truncate));
 	recptr = XLogInsert(RM_CLOG_ID, CLOG_TRUNCATE);
 	XLogFlush(recptr);
+	return recptr;
 }
 
 /*
@@ -1109,7 +1176,17 @@ clog_redo(XLogReaderState *record)
 
 		AdvanceOldestClogXid(xlrec.oldestXact);
 
+		/*
+		 * Hold the lock the mirror's recapture pass serializes on:
+		 * SimpleLruTruncate() runs the tombstone barrier and slot discard
+		 * here, and a drain re-snapshotting a recaptured page between the
+		 * two could stage an image versioned above the in-flight tombstone,
+		 * resurrecting the truncated range (same interlock the vacuum-side
+		 * truncation gets from vac_truncate_clog).
+		 */
+		LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
 		SimpleLruTruncate(XactCtl, xlrec.pageno);
+		LWLockRelease(WrapLimitsVacuumLock);
 	}
 	else
 		elog(PANIC, "clog_redo: unknown op code %u", info);

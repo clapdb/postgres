@@ -193,6 +193,8 @@ static int	slru_errno;
  *   SlruReportIOError machinery.
  */
 slru_page_write_hook_type slru_page_write_hook = NULL;
+slru_truncate_hook_type slru_truncate_hook = NULL;
+slru_page_revalidate_hook_type slru_page_revalidate_hook = NULL;
 slru_page_read_hook_type slru_page_read_hook = NULL;
 slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
@@ -599,6 +601,25 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 				/* Now we must recheck state from the top */
 				continue;
 			}
+
+			/*
+			 * A store-backed SLRU may need cached slots revalidated: a
+			 * clean VALID slot served from a mirror can go stale when the
+			 * mirror's watermark advances (or a truncation tombstone
+			 * appears), and no physical read would ever notice.  The hook
+			 * runs under the bank lock (infallible, local checks only); a
+			 * stale slot is discarded and re-read through the ordinary
+			 * miss path below.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+			{
+				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+				continue;
+			}
+
 			/* Otherwise, it's ready to use */
 			SlruRecentlyUsed(shared, slotno);
 
@@ -688,6 +709,22 @@ SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 			shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
+			/*
+			 * Same store-backed revalidation as SimpleLruReadPage(): a
+			 * clean cached slot served from a mirror can go stale when the
+			 * mirror's watermark advances, and this shared-lock hit path
+			 * would otherwise keep returning it forever.  The hook only
+			 * reads memory, so the shared lock suffices for the check; a
+			 * stale slot cannot be discarded here, so fall through to the
+			 * exclusive path, whose SimpleLruReadPage() revalidates again
+			 * and re-reads.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+				break;
+
 			/* See comments for SlruRecentlyUsed() */
 			SlruRecentlyUsed(shared, slotno);
 
@@ -1214,6 +1251,15 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_STORE_READ_FAILED:
+
+			/*
+			 * The store hooks run in a no-throw window and re-arm rather
+			 * than propagate interrupts; a query cancel during a store wait
+			 * therefore surfaces as this generic I/O failure.  Give the
+			 * re-armed interrupt the first word -- it is the true cause --
+			 * and fall through to the I/O error only when none is pending.
+			 */
+			CHECK_FOR_INTERRUPTS();
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not read page %" PRId64 " of SLRU \"%s\" from the page store",
@@ -1567,18 +1613,9 @@ void
 SimpleLruTruncate(SlruDesc *ctl, int64 cutoffPage)
 {
 	SlruShared	shared = ctl->shared;
-	int			prevbank;
 
 	/* update the stats counter of truncates */
 	pgstat_count_slru_truncate(shared->slru_stats_idx);
-
-	/*
-	 * Scan shared memory and remove any pages preceding the cutoff page, to
-	 * ensure we won't rewrite them later.  (Since this is normally called in
-	 * or just after a checkpoint, any dirty pages should have been flushed
-	 * already ... we're just being extra careful here.)
-	 */
-restart:
 
 	/*
 	 * An important safety check: the current endpoint page must not be
@@ -1595,6 +1632,162 @@ restart:
 		return;
 	}
 
+	/*
+	 * Let an external page-store mirror publish a truncation tombstone
+	 * BEFORE any local segment is deleted: a mirror serving this SLRU's
+	 * pages to other computes must be able to stop serving the truncated
+	 * range no later than the local files disappear.  This runs after the
+	 * wraparound backstop above (a skipped truncation must not durably
+	 * declare its range dead), and only once (the restart loop may come by
+	 * again).  Unless we are inside a critical section (multixact
+	 * truncation; a pre-barrier covers the hook there -- see
+	 * TruncateMultiXact), the hook may raise an error, in which case the
+	 * truncation is abandoned before anything was removed -- retried by
+	 * the next vacuum/checkpoint cycle, exactly like any other truncate
+	 * failure.
+	 */
+	/*
+	 * Scan shared memory and empty any pages preceding the cutoff page, to
+	 * ensure we won't rewrite them later.  (Since this is normally called in
+	 * or just after a checkpoint, any dirty pages should have been flushed
+	 * already ... we're just being extra careful here.)  Truncation paths
+	 * with a mirror pre-barrier have already done this before WAL-logging.
+	 *
+	 * This runs BEFORE the tombstone barrier below, and must: direct
+	 * callers with no pre-barrier -- notably the redo paths -- would
+	 * otherwise ship the tombstone while doomed dirty pages are still
+	 * flushable, and a restartpoint's SimpleLruWriteAll() could capture one
+	 * at a version at/after the tombstone's, resurrecting it in the mirror.
+	 * With the slots emptied first, every capture of a doomed page is
+	 * bounded below the version the barrier samples.
+	 */
+	SimpleLruDiscardCutoff(ctl, cutoffPage);
+
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (ctl, cutoffPage, InvalidXLogRecPtr);
+
+	/* Now we can remove the old segment(s) */
+	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
+}
+
+/*
+ * Write out every dirty resident page preceding cutoffPage and wait out
+ * in-flight I/O, WITHOUT emptying the slots.
+ *
+ * The abortable pre-record window of a mirrored truncation uses this
+ * instead of SimpleLruDiscardCutoff(): flushed-not-discarded pages lose
+ * nothing if the truncation is then abandoned (WAL insertion or barrier
+ * failure), while still guaranteeing no doomed page remains flushable
+ * after the truncate record exists -- a flush here runs the write hook
+ * BEFORE the record, so any captured image is versioned below trunc_lsn
+ * and the tombstone outranks it.
+ */
+void
+SimpleLruFlushCutoff(SlruDesc *ctl, int64 cutoffPage)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
+	prevbank = SlotGetBankNumber(0);
+	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
+	for (int slotno = 0; slotno < shared->num_slots; slotno++)
+	{
+		int			curbank = SlotGetBankNumber(slotno);
+
+		if (curbank != prevbank)
+		{
+			LWLockRelease(&shared->bank_locks[prevbank].lock);
+			LWLockAcquire(&shared->bank_locks[curbank].lock, LW_EXCLUSIVE);
+			prevbank = curbank;
+		}
+
+		if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)
+			continue;
+		if (!ctl->options.PagePrecedes(shared->page_number[slotno], cutoffPage))
+			continue;
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID &&
+			!shared->page_dirty[slotno])
+			continue;
+
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
+			SlruInternalWritePage(ctl, slotno, NULL);
+		else
+			SimpleLruWaitIO(ctl, slotno);
+
+		LWLockRelease(&shared->bank_locks[prevbank].lock);
+		goto restart;
+	}
+
+	LWLockRelease(&shared->bank_locks[prevbank].lock);
+}
+
+/*
+ * Empty every resident page, discarding dirty ones.  For delete-all resets
+ * (commit-ts deactivation): leftover dirty slots would otherwise be flushed
+ * by a later SimpleLruWriteAll(), recreating just-deleted segments and --
+ * with a mirror write hook installed -- publishing images that outrank the
+ * reset's delete-all tombstone.
+ */
+void
+SimpleLruDiscardAll(SlruDesc *ctl)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
+	prevbank = SlotGetBankNumber(0);
+	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
+	for (int slotno = 0; slotno < shared->num_slots; slotno++)
+	{
+		int			curbank = SlotGetBankNumber(slotno);
+
+		if (curbank != prevbank)
+		{
+			LWLockRelease(&shared->bank_locks[prevbank].lock);
+			LWLockAcquire(&shared->bank_locks[curbank].lock, LW_EXCLUSIVE);
+			prevbank = curbank;
+		}
+
+		if (shared->page_status[slotno] == SLRU_PAGE_EMPTY)
+			continue;
+
+		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
+
+		SimpleLruWaitIO(ctl, slotno);
+		LWLockRelease(&shared->bank_locks[prevbank].lock);
+		goto restart;
+	}
+
+	LWLockRelease(&shared->bank_locks[prevbank].lock);
+}
+
+/*
+ * Empty every resident page preceding cutoffPage, discarding dirty ones.
+ *
+ * A valid dirty page below the cutoff is already logically truncated:
+ * discarding it instead of writing it matters to external mirrors, whose
+ * write hook would otherwise capture a newer live image for a page local
+ * storage is about to forget.  Exposed separately from SimpleLruTruncate()
+ * so truncation callers can run it BEFORE WAL-logging the truncation: a
+ * checkpoint already inside SimpleLruWriteAll() when the truncate starts
+ * could otherwise flush a doomed dirty page AFTER the mirror's tombstone
+ * shipped, capturing an image that outranks it.  Emptying the slots first
+ * bounds every possible capture of a doomed page below the truncate
+ * record's LSN.
+ */
+void
+SimpleLruDiscardCutoff(SlruDesc *ctl, int64 cutoffPage)
+{
+	SlruShared	shared = ctl->shared;
+	int			prevbank;
+
+restart:
 	prevbank = SlotGetBankNumber(0);
 	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
 	for (int slotno = 0; slotno < shared->num_slots; slotno++)
@@ -1627,29 +1820,20 @@ restart:
 			continue;
 		}
 
-		/*
-		 * Hmm, we have (or may have) I/O operations acting on the page, so
-		 * we've got to wait for them to finish and then start again. This is
-		 * the same logic as in SlruSelectLRUPage.  (XXX if page is dirty,
-		 * wouldn't it be OK to just discard it without writing it?
-		 * SlruMayDeleteSegment() uses a stricter qualification, so we might
-		 * not delete this page in the end; even if we don't delete it, we
-		 * won't have cause to read its data again.  For now, keep the logic
-		 * the same as it was.)
-		 */
+		/* See above: doomed dirty pages are discarded, not written. */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
-			SlruInternalWritePage(ctl, slotno, NULL);
-		else
-			SimpleLruWaitIO(ctl, slotno);
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
 
+		SimpleLruWaitIO(ctl, slotno);
 		LWLockRelease(&shared->bank_locks[prevbank].lock);
 		goto restart;
 	}
 
 	LWLockRelease(&shared->bank_locks[prevbank].lock);
-
-	/* Now we can remove the old segment(s) */
-	(void) SlruScanDirectory(ctl, SlruScanDirCbDeleteCutoff, &cutoffPage);
 }
 
 /*
@@ -1688,6 +1872,15 @@ SlruDeleteSegment(SlruDesc *ctl, int64 segno)
 	int			prevbank = SlotGetBankNumber(0);
 	bool		did_write;
 
+	/*
+	 * Same pre-deletion tombstone barrier as SimpleLruTruncate(): direct
+	 * segment deletion (multixact members truncation) removes pages up to
+	 * the end of this segment.
+	 */
+	if (slru_truncate_hook)
+		(*slru_truncate_hook) (ctl, (segno + 1) * SLRU_PAGES_PER_SEGMENT,
+							   InvalidXLogRecPtr);
+
 	/* Clean out any possibly existing references to the segment. */
 	LWLockAcquire(&shared->bank_locks[prevbank].lock, LW_EXCLUSIVE);
 restart:
@@ -1724,12 +1917,22 @@ restart:
 			continue;
 		}
 
-		/* Same logic as SimpleLruTruncate() */
+		/*
+		 * Same logic as SimpleLruTruncate(): a valid dirty page of a doomed
+		 * segment is already logically truncated -- discard it rather than
+		 * write it.  Writing would run the page-write hook AFTER the
+		 * tombstone barrier above and ship a newer live image for a page
+		 * the deletion below is about to forget, letting a mirror's
+		 * newer-image-outranks-tombstone rule resurrect truncated data.
+		 */
 		if (shared->page_status[slotno] == SLRU_PAGE_VALID)
-			SlruInternalWritePage(ctl, slotno, NULL);
-		else
-			SimpleLruWaitIO(ctl, slotno);
+		{
+			shared->page_dirty[slotno] = false;
+			shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+			continue;
+		}
 
+		SimpleLruWaitIO(ctl, slotno);
 		did_write = true;
 	}
 
