@@ -543,20 +543,16 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 
 
 	/*
-	 * A pinned reader must not mutate the store.  Hint-bit-only dirt is
-	 * dropped silently -- it carries no WAL, keeps the page's pd_lsn at or
-	 * below the pin, must not fork the frozen history, and re-derives on
-	 * any later read.  A page whose pd_lsn advanced past the pin is a REAL
-	 * local mutation (someone escaped the read-only default): refuse it
-	 * loudly rather than acknowledge a write that will never persist.
+	 * A pinned reader has no legitimate page writes at all: hint-bit
+	 * dirtying and on-access pruning are suppressed at the source
+	 * (page_maintenance_suppressed), so nothing hint-only can reach this
+	 * path.  Anything that does arrive is a real mutation that escaped the
+	 * read-only default -- including WAL-less writes (unlogged relations,
+	 * fake-LSN index pages) whose pd_lsn never advances past the pin.
+	 * Fail closed instead of inferring intent from pd_lsn.
 	 */
 	if (localsvc_read_lsn != 0)
-	{
-		for (BlockNumber i = 0; i < nblocks; i++)
-			if (PageGetLSN((Page) buffers[i]) > (XLogRecPtr) localsvc_read_lsn)
-				ls_reject_pinned_write("page write above the pinned LSN");
-		return;
-	}
+		ls_reject_pinned_write("page write");
 
 	while (done < nblocks)
 	{
@@ -797,6 +793,9 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 								 uint64 branch_lsn)
 {
 	PsChannel  *ch = ls_chan();
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("branch creation");
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
@@ -1094,23 +1093,6 @@ pagestore_localsvc_init(void)
 							   0,
 							   ls_check_read_lsn, ls_assign_read_lsn, NULL);
 
-	/*
-	 * A pinned reader serves history and must not generate page-content
-	 * WAL: replaying that WAL after the pin is lifted would republish stale
-	 * as-of-R page images above the writer's shipped versions.  Suppress
-	 * hint-bit dirtying and on-access pruning (the only page-content WAL a
-	 * read-only workload emits), keep autovacuum from vacuuming store-backed
-	 * relations, and default every transaction to read-only.  Store-write
-	 * refusals below remain as the fail-closed backstop.
-	 */
-	if (localsvc_read_lsn != 0)
-	{
-		page_maintenance_suppressed = true;
-		SetConfigOption("autovacuum", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);
-		SetConfigOption("default_transaction_read_only", "on",
-						PGC_POSTMASTER, PGC_S_OVERRIDE);
-	}
-
 	DefineCustomIntVariable("pagestore.timeline",
 							"Timeline (branch) this backend reads and writes on; 0 is the main timeline.",
 							NULL,
@@ -1120,4 +1102,35 @@ pagestore_localsvc_init(void)
 							PGC_POSTMASTER,
 							0,
 							NULL, NULL, NULL);
+}
+
+/*
+ * Apply the pinned-reader (pagestore.read_lsn) instance-wide side effects.
+ * Called from _PG_init AFTER pagestore.backend is final: a pin without the
+ * localsvc backend would force the server read-only while capping nothing
+ * (passthrough/md reads ignore the horizon), so that combination is refused
+ * outright.
+ */
+void
+pagestore_localsvc_pinned_init(bool localsvc_active)
+{
+	if (localsvc_read_lsn == 0)
+		return;
+	if (!localsvc_active)
+		ereport(ERROR,
+				(errmsg("pagestore.read_lsn requires pagestore.backend = 'localsvc'")));
+
+	/*
+	 * A pinned reader serves history and must not generate page-content
+	 * WAL: replaying that WAL after the pin is lifted would republish stale
+	 * as-of-R page images above the writer's shipped versions.  Suppress
+	 * hint-bit dirtying and on-access pruning (the only page-content WAL a
+	 * read-only workload emits), keep autovacuum from vacuuming store-backed
+	 * relations, and default every transaction to read-only.  Store-write
+	 * refusals remain as the fail-closed backstop.
+	 */
+	page_maintenance_suppressed = true;
+	SetConfigOption("autovacuum", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);
+	SetConfigOption("default_transaction_read_only", "on",
+					PGC_POSTMASTER, PGC_S_OVERRIDE);
 }

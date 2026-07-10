@@ -6135,6 +6135,14 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs
+	 * the final backend name, so it cannot run inside
+	 * pagestore_localsvc_init() above.
+	 */
+	pagestore_localsvc_pinned_init(pagestore_backend_name != NULL &&
+								   strcmp(pagestore_backend_name, "localsvc") == 0);
+
+	/*
 	 * Live SLRU page mirror (write-side capture).  Defines its GUC, so it
 	 * must run before the prefix is reserved; the backend-name GUC it
 	 * checks is final here.
