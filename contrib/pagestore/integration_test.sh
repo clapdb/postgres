@@ -568,18 +568,19 @@ rm -rf "$EMPTYCTS"
 # The GUC is PGC_POSTMASTER, so a toggle always crosses a restart: OFF fires
 # DeactivateCommitTs (every local segment deleted; a XLOG_PARAMETER_CHANGE lands in
 # WAL), ON starts a new era whose nextXid page ActivateCommitTs zeroes WITHOUT WAL.
-# The appliers must (a) wipe pre-toggle state -- xidA's timestamp from the era-1 base
-# snapshot must not leak into an era-2 reconstruction, (b) reconstruct era-2 commits
-# across the unlogged activation zero, and (c) refuse a target inside an off window.
+# The appliers track the era from the base's control image through the toggles.
 echo "track_commit_timestamp = off" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
-ctsOffL=$($P -c "SELECT pg_current_wal_lsn();")               # a target inside the off era
+ctsOffL0=$($P -c "SELECT pg_current_wal_lsn();")              # early in the off era
+$P -q -c "BEGIN; INSERT INTO cts VALUES (9); COMMIT;" >/dev/null
+ctsOffL=$($P -c "SELECT pg_current_wal_lsn();")               # later in the off era
 echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
-$P -c "CHECKPOINT;" >/dev/null                                # publish the era horizon
-ctsXA=$($P -c "SELECT oldest_commit_ts_xid FROM pg_control_checkpoint();")
 ctsLmid=$($P -c "SELECT pg_current_wal_lsn();")               # after activation, before any era commit
 ctsE2=$($P -c "WITH w AS (INSERT INTO cts VALUES (3) RETURNING 1) SELECT pg_current_xact_id();")
+ctsLpre=$($P -c "SELECT pg_current_wal_lsn();")               # era commit done, still pre-checkpoint
+$P -c "CHECKPOINT;" >/dev/null                                # publish the era horizon
+ctsXA=$($P -c "SELECT oldest_commit_ts_xid FROM pg_control_checkpoint();")
 ctsL2=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL2', '3'::xid) IS NULL;")" "t" \
 	"commit-ts toggle: an era-1 timestamp does not survive the era wipe (horizon disabled)"
@@ -587,13 +588,24 @@ assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL2
 	"commit-ts toggle: an era-2 commit reconstructs across the unlogged activation zero"
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
 	"commit-ts toggle: a target inside the off window fails closed"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsOffL0', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: an entirely-off window fails closed (no toggle record needed)"
 # the activation page exists (all-zero) on the parent BEFORE any era commit touches it:
 # ActivateCommitTs created it without WAL, so the applier materializes it from the horizon
 ctsXApage=$(( ctsXA / cts_per_page ))
 assert "$($P -c "SELECT pagestore_commit_ts_page_asof($ctsXApage, '$ctsC', '$ctsLmid', '$ctsXA'::xid) = decode(repeat('00', $bs), 'hex');")" "t" \
 	"commit-ts toggle: the silently-zeroed activation page is served before any era commit"
-TOGSEED=$(mktemp -d)
+# a fork BEFORE the first post-activation checkpoint has no pg_control horizon yet;
+# the appliers derive it from the toggle-time control image (Invalid oldest = derive)
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '0'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: a pre-checkpoint fork derives the activation horizon from the control image"
+PRESEED=$(mktemp -d)
 tog_next=$(( ctsE2 + 1 ))
+pre_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$PRESEED', '$ctsC', '$ctsLpre', '0'::xid, '$tog_next'::text::xid);")
+assert "$([ "${pre_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"commit-ts toggle: seeding a pre-checkpoint fork with no horizon derives one ($pre_seeded page(s))"
+rm -rf "$PRESEED"
+TOGSEED=$(mktemp -d)
 tog_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$TOGSEED', '$ctsC', '$ctsL2', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
 assert "$([ "${tog_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"commit-ts toggle: seeding with the era horizon succeeds ($tog_seeded page(s))"
@@ -614,6 +626,10 @@ echo "max_connections = 120" >> "$DATA/postgresql.conf"
 ctsL3=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
 	"commit-ts toggle: an unrelated parameter-change restart does not wipe the era"
+# an off-era BASE: era state initializes from the base's control image; the in-window
+# activation resets once, and the unrelated restart after it must not reset again
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsOffL', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an off-era base replays the activation once and survives later restarts"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
