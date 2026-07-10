@@ -1539,6 +1539,13 @@ ps_local_wal_limit(void)
  * archive callback ships on segment completion), so a window ending in the
  * current partial segment fails the coverage probe and the caller fails
  * closed, exactly as it does when local WAL ends early.
+ *
+ * Single-timeline for now: the scan reads the acting timeline's OWN log
+ * only.  A window whose base predates that timeline's fork point needs the
+ * ancestor's log; wal_read() does not walk ancestry yet (the branch WAL
+ * read-through refinement), so such a scan fails the first page read and
+ * the caller fails closed -- never a wrong answer, just a narrower window
+ * contract until read-through lands.
  */
 static int
 ps_slru_wal_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr,
