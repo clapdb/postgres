@@ -32,8 +32,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access/xlog.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "pagestore_backend.h"
+#include "tcop/utility.h"
 #include "pagestore_ipc.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -1105,6 +1109,76 @@ pagestore_localsvc_init(void)
 }
 
 /*
+ * Pinned-reader command gates.  The read-only transaction default is
+ * advisory (any session can SET TRANSACTION READ WRITE), and read-only
+ * transactions legitimately admit VACUUM and REINDEX -- both of which
+ * generate page-content WAL from paths the page-maintenance suppression
+ * does not cover.  Refuse at the executor and utility entry points, before
+ * any buffer is dirtied or WAL inserted.
+ */
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+static void
+ls_pinned_executor_start(QueryDesc *queryDesc, int eflags)
+{
+	PlannedStmt *ps = queryDesc->plannedstmt;
+
+	if (queryDesc->operation != CMD_SELECT || ps->hasModifyingCTE)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("data modification is not allowed on a pinned reader (pagestore.read_lsn)")));
+	if (ps->rowMarks != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("row locking is not allowed on a pinned reader (pagestore.read_lsn)")));
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
+						  bool readOnlyTree, ProcessUtilityContext context,
+						  ParamListInfo params, QueryEnvironment *queryEnv,
+						  DestReceiver *dest, QueryCompletion *qc)
+{
+	const char *deny = NULL;
+
+	switch (nodeTag(pstmt->utilityStmt))
+	{
+		case T_VacuumStmt:		/* VACUUM and ANALYZE */
+			deny = "VACUUM/ANALYZE";
+			break;
+		case T_ReindexStmt:
+			deny = "REINDEX";
+			break;
+		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
+			deny = "REPACK";
+			break;
+		case T_CopyStmt:
+			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
+				deny = "COPY FROM";
+			break;
+		default:
+			break;
+	}
+	if (deny)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("%s is not allowed on a pinned reader (pagestore.read_lsn)", deny)));
+
+	if (prev_ProcessUtility)
+		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+							params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+}
+
+/*
  * Apply the pinned-reader (pagestore.read_lsn) instance-wide side effects.
  * Called from _PG_init AFTER pagestore.backend is final: a pin without the
  * localsvc backend would force the server read-only while capping nothing
@@ -1123,13 +1197,28 @@ pagestore_localsvc_pinned_init(bool localsvc_active)
 	/*
 	 * A pinned reader serves history and must not generate page-content
 	 * WAL: replaying that WAL after the pin is lifted would republish stale
-	 * as-of-R page images above the writer's shipped versions.  Suppress
-	 * hint-bit dirtying and on-access pruning (the only page-content WAL a
-	 * read-only workload emits), keep autovacuum from vacuuming store-backed
-	 * relations, and default every transaction to read-only.  Store-write
-	 * refusals remain as the fail-closed backstop.
+	 * as-of-R page images above the writer's shipped versions.  The layers,
+	 * outermost first:
+	 *
+	 * - executor/utility gates refuse DML, row locking, VACUUM/ANALYZE,
+	 *   REINDEX, CLUSTER and COPY FROM outright -- these are reachable in
+	 *   read-only transactions or by escaping the read-only default;
+	 * - page-maintenance suppression stops the WAL a plain SELECT emits
+	 *   (hint-bit FPIs, on-access pruning) and shuts down autovacuum
+	 *   entirely, including the wraparound-defense launcher that ignores
+	 *   autovacuum = off;
+	 * - wal_insert_restricted refuses WAL insertion from anything but the
+	 *   WAL-essential auxiliary processes, so even a direct C-level bypass
+	 *   of the gates above cannot plant replayable page-content WAL;
+	 * - the localsvc store-write refusals remain underneath as the final
+	 *   fail-closed backstop.
 	 */
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = ls_pinned_executor_start;
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = ls_pinned_process_utility;
 	page_maintenance_suppressed = true;
+	wal_insert_restricted = true;
 	SetConfigOption("autovacuum", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);
 	SetConfigOption("default_transaction_read_only", "on",
 					PGC_POSTMASTER, PGC_S_OVERRIDE);
