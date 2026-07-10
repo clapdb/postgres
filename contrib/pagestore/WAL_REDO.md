@@ -103,9 +103,15 @@ read pages at an LSN.
      clog/commit-ts/multixact from base snapshots + WAL replay, and
      `pagestore_install_prepared_branch` installs them with a durable manifest;
      see SLRU_ON_STORE_DESIGN.md), and the per-page WAL index serves branch
-     reads capped at the fork LSN.  Still open: `pg_control` on the store
-     (PGCONTROL_ON_STORE_DESIGN.md), live SLRU traffic through the store, and
-     serving a branch compute's own WAL across its fork point.
+     reads capped at the fork LSN.  ✅ Serving a branch compute's WAL across
+     its fork point is DONE: the store's `wal_read` walks the branch
+     ancestry (each hop capped at the child's fork LSN, since an ancestor's
+     log continues past the fork with records that are not the branch's
+     history), so `PS_OP_WAL_READ` -- and everything built on it: the
+     walrestore tool, `redo_page_asof`'s store reader, the store-backed
+     SLRU applier scans -- serves a timeline's full history.  `pg_control`
+     on the store and live SLRU traffic through the store are done as well
+     (PGCONTROL_ON_STORE_DESIGN.md, SLRU_ON_STORE_DESIGN.md).
 
 ## Known scope boundaries
 

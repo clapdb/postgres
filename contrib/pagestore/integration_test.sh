@@ -404,6 +404,20 @@ assert "$([ "${seeded_b:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 # whatever a reused target dir carried
 assert "$([ -d "$SEEDOUT/pg_commit_ts" ] && echo present)" "present" \
 	"branch prepare publishes an empty pg_commit_ts for an inactive horizon"
+# --- branch WAL read-through: the branch serves its pre-fork WAL history ------
+# wal_read walks the ancestry: a segment completed before the fork lives only in
+# the parent's shipped log, and reading it through the branch timeline must give
+# the same bytes the parent's own log serves.
+rt_seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)" .done)
+rt0=$(mktemp); rt1=$(mktemp)
+if "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --segsize 16777216 "$rt_seg" "$rt0" >/dev/null 2>&1 \
+   && "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 1 --segsize 16777216 "$rt_seg" "$rt1" >/dev/null 2>&1; then
+	assert "$(md5sum < "$rt1" | cut -d' ' -f1)" "$(md5sum < "$rt0" | cut -d' ' -f1)" \
+		"branch timeline serves a pre-fork WAL segment identical to the parent's"
+else
+	echo "FAIL - walrestore could not reconstruct pre-fork segment '$rt_seg' through the branch"; fail=1
+fi
+rm -f "$rt0" "$rt1"
 # Copy the branch datadir before the parent advances past L, so the branch's
 # first write reuses the XID that the parent will spend on after_L below.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
