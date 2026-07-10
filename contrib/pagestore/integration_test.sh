@@ -523,6 +523,7 @@ $P -c "CREATE TABLE cts(id int) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 ctsC=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$ctsC');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$ctsC');" >/dev/null   # the all-SLRU seeder (20b) needs a clog base too
 # data-writing xacts so the commit (and its timestamp) is sync-flushed for the WAL reader
 ctsA=$($P -c "WITH w AS (INSERT INTO cts VALUES (1) RETURNING 1) SELECT pg_current_xact_id();")
 ctsL=$($P -c "SELECT pg_current_wal_lsn();")                      # L: after xidA's commit
@@ -599,6 +600,21 @@ assert "$($P -c "SELECT pagestore_commit_ts_page_asof($ctsXApage, '$ctsC', '$cts
 # the appliers derive it from the toggle-time control image (Invalid oldest = derive)
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '0'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
 	"commit-ts toggle: a pre-checkpoint fork derives the activation horizon from the control image"
+# the 'oldest' argument is only the LOOKUP filter: disabling it with a tiny xid must
+# not poison the activation zero-page derivation (which comes from the control image)
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '3'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: a disabled lookup horizon does not poison the activation page"
+# the all-SLRU convenience seeder normalizes the same way: both-Invalid commit-ts
+# horizons on an ACTIVE pre-checkpoint fork must seed, not install an empty dir
+$P -c "CREATE OR REPLACE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;" >/dev/null
+ALLSEED=$(mktemp -d)
+all_next=$(( ctsE2 + 1 ))
+read -r allOldMx allNextMx allNextMOff <<< "$($P -c "SELECT oldest_multi_xid::text || ' ' || next_multixact_id::text || ' ' || next_multi_offset FROM pg_control_checkpoint();")"
+all_seeded=$($P -c "SELECT pagestore_seed_branch_slrus('$ALLSEED', '$ctsC', '$ctsLpre', '3'::xid, '$all_next'::text::xid, '0'::xid, '0'::xid, '$allOldMx'::xid, '$allNextMx'::xid, $allNextMOff, $allNextMOff);")
+assert "$([ -f "$ALLSEED/pg_commit_ts/$(printf '%04X' $(( (ctsXA / cts_per_page) / 32 )))" ] && echo present || echo absent)" "present" \
+	"commit-ts toggle: the all-SLRU seeder treats an active pre-checkpoint fork as seedable"
+rm -rf "$ALLSEED"
 PRESEED=$(mktemp -d)
 tog_next=$(( ctsE2 + 1 ))
 pre_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$PRESEED', '$ctsC', '$ctsLpre', '0'::xid, '$tog_next'::text::xid);")
@@ -723,7 +739,7 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE OR REPLACE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
        CREATE OR REPLACE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;

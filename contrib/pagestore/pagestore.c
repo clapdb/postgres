@@ -1922,6 +1922,40 @@ ps_commit_ts_horizon_asof(XLogRecPtr lsn, TransactionId *oldest)
 	return true;
 }
 
+/*
+ * Normalize a caller-supplied commit-ts horizon pair for a fork at
+ * 'target'.  pg_control cannot express "active but not yet
+ * checkpointed": between an activation and its first checkpoint BOTH
+ * oldestCommitTsXid and newestCommitTsXid are still Invalid while the
+ * mirrored control flag is already on.  So:
+ *
+ * - (Invalid, normal): derive oldest from the toggle-time control image.
+ * - (Invalid, Invalid) with the control flag ON as of target: an active
+ *   pre-checkpoint fork -- derive oldest the same way and bound next by
+ *   the fork's nextXid (commit-ts entries exist only for assigned xids,
+ *   exactly clog's bound); treating the pair as "inactive" would install
+ *   an empty pg_commit_ts and silently lose the era's timestamps.
+ * - (Invalid, Invalid) with the flag off/unknown: genuinely inactive.
+ */
+static void
+ps_commit_ts_normalize_horizons(XLogRecPtr target, TransactionId next_xid,
+								TransactionId *oldest, TransactionId *next)
+{
+	bool		track;
+
+	if (TransactionIdIsNormal(*oldest))
+		return;
+	if (!TransactionIdIsNormal(*next))
+	{
+		if (!ps_track_commit_ts_asof(target, &track) || !track)
+			return;				/* inactive (or unknowable): leave as-is */
+		*next = next_xid;
+	}
+	if (!ps_commit_ts_horizon_asof(target, oldest))
+		ereport(ERROR,
+				(errmsg("pagestore: no commit-ts horizon supplied and none derivable from the control image as of the target LSN")));
+}
+
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
 
@@ -2100,10 +2134,19 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 					 * is ON: a later true record with no intervening false
 					 * is an unrelated restart and must not wipe again.
 					 */
-					TransactionId hx = horizon_xid;
+					TransactionId hx = InvalidTransactionId;
 
-					if (!TransactionIdIsNormal(hx))
-						(void) ps_commit_ts_horizon_asof(reader->EndRecPtr, &hx);
+					/*
+					 * Derive the activation horizon from the toggle-time
+					 * control image FIRST: the caller's 'oldest' argument
+					 * doubles as the lookup filter, and callers disable
+					 * that filter with FirstNormal-ish values that would
+					 * mis-mark page 0 as the unlogged zero page.  The
+					 * caller value is only the fallback when no control
+					 * image exists.
+					 */
+					if (!ps_commit_ts_horizon_asof(reader->EndRecPtr, &hx))
+						hx = horizon_xid;
 					memset(page, 0, BLCKSZ);
 					if (TransactionIdIsNormal(hx) &&
 						(int64) (hx / PS_CTS_XACTS_PER_PAGE) == pageno)
@@ -2212,7 +2255,7 @@ ps_commit_ts_reconstruct(char *page, int64 pageno, XLogRecPtr base_lsn,
  * pagestore_commit_ts_asof(xid xid, base pg_lsn, target pg_lsn, oldest xid) returns
  * timestamptz -- the commit timestamp of 'xid' as of 'target', or NULL if it has none.
  *
- * 'oldest' is the commit-ts validity horizon as of target (the parent's oldestCommitTsXid
+ * 'oldest' is the LOOKUP horizon as of target (the parent's oldestCommitTsXid
  * from pg_control), which the booted branch's TransactionIdGetCommitTsData() enforces:
  * xids below it return NULL even though their bytes may physically remain on a retained
  * SLRU page (a COMMIT_TS_TRUNCATE only drops whole earlier segments), and xids that
@@ -4525,14 +4568,22 @@ Datum
 pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 {
 	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	base = PG_GETARG_LSN(1);
+	XLogRecPtr	target = PG_GETARG_LSN(2);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(3);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(4);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+
+	ps_commit_ts_normalize_horizons(target, next_xid,
+									&oldest_commit_ts_xid,
+									&next_commit_ts_xid);
 
 	PG_RETURN_INT64(pagestore_seed_branch_slrus_impl(target_dir,
-													 PG_GETARG_LSN(1),
-													 PG_GETARG_LSN(2),
-													 PG_GETARG_TRANSACTIONID(3),
-													 PG_GETARG_TRANSACTIONID(4),
-													 PG_GETARG_TRANSACTIONID(5),
-													 PG_GETARG_TRANSACTIONID(6),
+													 base, target,
+													 oldest_xid, next_xid,
+													 oldest_commit_ts_xid,
+													 next_commit_ts_xid,
 													 PG_GETARG_TRANSACTIONID(7),
 													 PG_GETARG_TRANSACTIONID(8),
 													 PG_GETARG_INT64(9),
@@ -5880,6 +5931,17 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
 									(uint64) target);
 
+	/*
+	 * Normalize the commit-ts horizons BEFORE the idempotency check and
+	 * the manifest unlink: derivation must yield the same values a
+	 * previous successful prepare wrote into its manifest, or a retry
+	 * would never match, delete a valid prepared manifest, and leave the
+	 * branch inert if the reseed then fails.
+	 */
+	ps_commit_ts_normalize_horizons(target, next_xid,
+									&oldest_commit_ts_xid,
+									&next_commit_ts_xid);
+
 	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
 												   base, target,
 												   oldest_xid, next_xid,
@@ -5913,23 +5975,6 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not remove stale branch manifest \"%s\": %m",
 						manifest_path)));
-
-	if (!TransactionIdIsNormal(oldest_commit_ts_xid) &&
-		TransactionIdIsNormal(next_commit_ts_xid))
-	{
-		/*
-		 * No commit-ts horizon yet: the fork sits between an activation
-		 * and the first checkpoint that would publish oldestCommitTsXid
-		 * into pg_control.  Derive it from the mirrored control image as
-		 * of the target (the image the toggle shipped carries the
-		 * shutdown checkpoint's nextXid = the activation horizon), so the
-		 * seeder gets a real horizon and the manifest records it (install
-		 * rejects mixed pairs).
-		 */
-		if (!ps_commit_ts_horizon_asof(target, &oldest_commit_ts_xid))
-			ereport(ERROR,
-					(errmsg("pagestore: no commit-ts horizon supplied and none derivable from the control image as of the target LSN")));
-	}
 
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, target,
 											  oldest_xid, next_xid,
