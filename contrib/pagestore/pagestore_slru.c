@@ -79,6 +79,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "executor/executor.h"
 #include "fmgr.h"
@@ -2875,7 +2876,30 @@ pagestore_slru_mirror_truncate(PG_FUNCTION_ARGS)
 				 errmsg("cutoff page must be non-negative")));
 
 	{
-		XLogRecPtr	version = ps_slru_now_lsn();
+		XLogRecPtr	version;
+
+		/*
+		 * The version must be STRICTLY above every tombstone ever shipped
+		 * for this SLRU: the reader-side shared cache orders by version
+		 * alone, and a same-version rewrite would let a delayed stale
+		 * fetch response overwrite the newer cutoff (the natural truncate
+		 * paths always have their own WAL records between successive
+		 * truncations; this helper on an idle system would not).  A no-op
+		 * WAL record makes the sampled position strictly advance -- and
+		 * doubles as the record the tombstone answers to, like everywhere
+		 * else.
+		 */
+		if (RecoveryInProgress())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot publish an SLRU tombstone during recovery")));
+		{
+			char		dummy = 0;
+
+			XLogBeginInsert();
+			XLogRegisterData(&dummy, 1);
+			version = XLogInsert(RM_XLOG_ID, XLOG_NOOP);
+		}
 
 		ps_slru_wm_note_pending(version);
 		PG_TRY();
