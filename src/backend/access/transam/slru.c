@@ -194,6 +194,7 @@ static int	slru_errno;
  */
 slru_page_write_hook_type slru_page_write_hook = NULL;
 slru_truncate_hook_type slru_truncate_hook = NULL;
+slru_page_revalidate_hook_type slru_page_revalidate_hook = NULL;
 slru_page_read_hook_type slru_page_read_hook = NULL;
 slru_page_exists_hook_type slru_page_exists_hook = NULL;
 
@@ -600,6 +601,25 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 				/* Now we must recheck state from the top */
 				continue;
 			}
+
+			/*
+			 * A store-backed SLRU may need cached slots revalidated: a
+			 * clean VALID slot served from a mirror can go stale when the
+			 * mirror's watermark advances (or a truncation tombstone
+			 * appears), and no physical read would ever notice.  The hook
+			 * runs under the bank lock (infallible, local checks only); a
+			 * stale slot is discarded and re-read through the ordinary
+			 * miss path below.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+			{
+				shared->page_status[slotno] = SLRU_PAGE_EMPTY;
+				continue;
+			}
+
 			/* Otherwise, it's ready to use */
 			SlruRecentlyUsed(shared, slotno);
 
@@ -689,6 +709,22 @@ SimpleLruReadPage_ReadOnly(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 			shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
+			/*
+			 * Same store-backed revalidation as SimpleLruReadPage(): a
+			 * clean cached slot served from a mirror can go stale when the
+			 * mirror's watermark advances, and this shared-lock hit path
+			 * would otherwise keep returning it forever.  The hook only
+			 * reads memory, so the shared lock suffices for the check; a
+			 * stale slot cannot be discarded here, so fall through to the
+			 * exclusive path, whose SimpleLruReadPage() revalidates again
+			 * and re-reads.  Dirty slots are local truth and stay.
+			 */
+			if (slru_page_revalidate_hook &&
+				shared->page_status[slotno] == SLRU_PAGE_VALID &&
+				!shared->page_dirty[slotno] &&
+				!(*slru_page_revalidate_hook) (ctl, pageno))
+				break;
+
 			/* See comments for SlruRecentlyUsed() */
 			SlruRecentlyUsed(shared, slotno);
 
@@ -1215,6 +1251,15 @@ SlruReportIOError(SlruDesc *ctl, int64 pageno, const void *opaque_data)
 					 opaque_data ? ctl->options.errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_STORE_READ_FAILED:
+
+			/*
+			 * The store hooks run in a no-throw window and re-arm rather
+			 * than propagate interrupts; a query cancel during a store wait
+			 * therefore surfaces as this generic I/O failure.  Give the
+			 * re-armed interrupt the first word -- it is the true cause --
+			 * and fall through to the I/O error only when none is pending.
+			 */
+			CHECK_FOR_INTERRUPTS();
 			ereport(ERROR,
 					(errcode(ERRCODE_IO_ERROR),
 					 errmsg("could not read page %" PRId64 " of SLRU \"%s\" from the page store",
