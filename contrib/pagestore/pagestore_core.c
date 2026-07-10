@@ -1046,19 +1046,39 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 	return filled;
 }
 
+/* The LSN where a timeline's shipped log begins (its first chunk's start),
+ * or UINT64_MAX for an empty log.  The log is contiguous from there: the
+ * archiver ships completed segments strictly in order. */
+static uint64_t
+wal_log_start(uint32_t tl)
+{
+	WalRecHdr	h;
+
+	if (ps_storage->wal_read(tl, 0, &h, sizeof(h)) == (int) sizeof(h) &&
+		h.magic == WAL_MAGIC)
+		return h.start_lsn;
+	return UINT64_MAX;
+}
+
 /*
  * Read up to 'len' WAL bytes starting at WAL position 'start' from a
- * timeline's HISTORY into 'out'; returns the number of bytes filled.  Bytes
- * not covered by any shipped record are left as-is.  This is what a redo
- * worker (and the store-backed SLRU appliers) use to pull WAL for replay.
+ * timeline's HISTORY into 'out'; returns the number of DISTINCT bytes
+ * filled.  Bytes not covered by any shipped record are left as-is.  This is
+ * what a redo worker (and the store-backed SLRU appliers) use to pull WAL
+ * for replay.
  *
  * Read-through: a branch's history below its fork point lives in its
- * ancestors' logs.  Each timeline serves only the portion of the window
- * below the PREVIOUS hop's fork LSN and at/above its own -- an ancestor's
- * log continues past the fork with records that belong to the ancestor's
- * future, never to this branch's history, so the child's fork LSN caps what
- * the parent may serve.  Timeline metadata is write-once after definition
- * (see timeline_define), so the walk needs no lock, matching tl_walk.
+ * ancestors' logs -- but a branch's OWN first shipped segment can span the
+ * fork (PostgreSQL copies the partial segment at the switch, and archiving
+ * ships whole segments), so its log legitimately carries a pre-fork prefix
+ * the parent may not have shipped yet.  Each hop therefore serves from its
+ * own contiguous log coverage [log_start, ...) up to 'cap', and the next
+ * (ancestor) hop's cap becomes min(cap, fork LSN, this hop's log_start):
+ * the fork bound keeps ancestor-future records out of the branch's history,
+ * and the log_start bound keeps the byte count exact -- whatever the child
+ * already served below the fork, the parent must not serve again.  Timeline
+ * metadata is write-once after definition (see timeline_define), so the
+ * walk needs no lock, matching tl_walk.
  */
 static uint32_t
 wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
@@ -1067,30 +1087,32 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 	uint64_t	cap = UINT64_MAX;
 	int			hops = 0;
 
-	if (tl >= MAX_TIMELINES || !timelines[tl].defined)
-		return (tl < MAX_TIMELINES) ? wal_read_one(tl, start, len, UINT64_MAX, out)
-			: 0;
+	if (tl >= MAX_TIMELINES)
+		return 0;
 
 	for (;;)
 	{
-		uint64_t	lo;
+		uint64_t	ls = wal_log_start(tl);
 
-		/* this timeline's own records: [its fork point, cap) */
-		lo = timeline_has_parent(tl) ? timelines[tl].branch_lsn : 0;
-		if (start + len > lo)
+		if (ls != UINT64_MAX && start + len > ls && start < cap)
 		{
-			uint64_t	ws = start > lo ? start : lo;
+			uint64_t	ws = start > ls ? start : ls;
 
 			filled += wal_read_one(tl, ws, (uint32_t) (start + len - ws),
 								   cap, out + (ws - start));
 		}
 
-		if (!timeline_has_parent(tl) || start >= lo)
+		/* everything below min(cap, fork, own coverage) is the parent's */
+		if (!timeline_has_parent(tl))
 			break;
-		if (++hops > MAX_TIMELINES)
-			break;				/* defensive: malformed chain */
 		if (timelines[tl].branch_lsn < cap)
 			cap = timelines[tl].branch_lsn;
+		if (ls < cap)
+			cap = ls;
+		if (start >= cap)
+			break;				/* window fully served at/above the bound */
+		if (++hops > MAX_TIMELINES)
+			break;				/* defensive: malformed chain */
 		tl = (uint32_t) timelines[tl].parent;
 	}
 	return filled;
