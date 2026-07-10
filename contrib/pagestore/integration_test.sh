@@ -46,11 +46,14 @@ assert() {  # $1=actual $2=expected $3=message
 	fi
 }
 
+# KEEPTMP=1 keeps the data/store directories for post-mortem debugging
+# (servers and daemon are still stopped).
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	[ -n "${KEEPTMP:-}" ] && { echo "KEEPTMP: DATA=$DATA STORE=$STORE"; return 0; }
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}"
@@ -1062,20 +1065,14 @@ $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
-{
-	echo "pagestore.read_lsn = '$readerR'"
-	echo "default_transaction_read_only = on"
-} >> "$DATA/postgresql.conf"
+echo "pagestore.read_lsn = '$readerR'" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
 assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'read-only')" "1" \
 	"pinned reader refuses writes"
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
-{
-	echo "pagestore.read_lsn = ''"
-	echo "default_transaction_read_only = off"
-} >> "$DATA/postgresql.conf"
+echo "pagestore.read_lsn = ''" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 

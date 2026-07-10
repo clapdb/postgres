@@ -25,6 +25,8 @@
  */
 #include "postgres.h"
 
+#include "storage/bufpage.h"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -33,6 +35,7 @@
 #include "miscadmin.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
 
@@ -540,14 +543,20 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 
 
 	/*
-	 * A pinned reader drops page writes silently: on a read-only workload
-	 * the only dirt is hint bits, which the store must not receive (they
-	 * would fork the frozen history) and which re-derive on any later
-	 * read.  Real mutations are refused earlier (extend/create/truncate
-	 * error out) and by the read-only mode the reader runs under.
+	 * A pinned reader must not mutate the store.  Hint-bit-only dirt is
+	 * dropped silently -- it carries no WAL, keeps the page's pd_lsn at or
+	 * below the pin, must not fork the frozen history, and re-derives on
+	 * any later read.  A page whose pd_lsn advanced past the pin is a REAL
+	 * local mutation (someone escaped the read-only default): refuse it
+	 * loudly rather than acknowledge a write that will never persist.
 	 */
 	if (localsvc_read_lsn != 0)
+	{
+		for (BlockNumber i = 0; i < nblocks; i++)
+			if (PageGetLSN((Page) buffers[i]) > (XLogRecPtr) localsvc_read_lsn)
+				ls_reject_pinned_write("page write above the pinned LSN");
 		return;
+	}
 
 	while (done < nblocks)
 	{
@@ -806,6 +815,9 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 {
 	PsChannel  *ch = ls_chan();
 
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL append");
+
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_APPEND;
 	ch->req_lsn = start_lsn;
@@ -845,12 +857,22 @@ pagestore_localsvc_timeline(void)
 	return (uint32) localsvc_timeline;
 }
 
+/* The pinned read horizon (pagestore.read_lsn), 0 when this is a writer. */
+uint64
+pagestore_localsvc_read_lsn(void)
+{
+	return localsvc_read_lsn;
+}
+
 /* Record in the store that the WAL record at 'lsn' modifies (key, block). */
 void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL index append");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
@@ -943,6 +965,9 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
+
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -965,6 +990,9 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  int timeout_ms)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -994,6 +1022,7 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
+	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
 }
@@ -1051,15 +1080,36 @@ pagestore_localsvc_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomStringVariable("pagestore.read_lsn",
-							   "Pin every store relation read at this LSN and refuse store writes.",
-							   "Makes this compute a pinned reader of its timeline's history "
-							   "(READ_CONSISTENCY_DESIGN.md).  Use the redo pointer of a durably "
-							   "mirrored checkpoint.  Empty = a normal writer compute.",
+							   "Cap every store relation page read at this LSN and refuse store writes.",
+							   "The pinned-reader MECHANISM increment (READ_CONSISTENCY_DESIGN.md): "
+							   "page reads freeze at R, mutations are refused.  A fully R-consistent "
+							   "query compute additionally needs as-of local artifacts (catalogs, "
+							   "control, SLRUs -- the prepared-branch flow), as-of size/existence "
+							   "metadata, and the running-xacts snapshot; see the design doc's "
+							   "increments.  Use the redo pointer of a durably mirrored checkpoint.  "
+							   "Empty = a normal writer compute.",
 							   &localsvc_read_lsn_str,
 							   "",
 							   PGC_POSTMASTER,
 							   0,
 							   ls_check_read_lsn, ls_assign_read_lsn, NULL);
+
+	/*
+	 * A pinned reader serves history and must not generate page-content
+	 * WAL: replaying that WAL after the pin is lifted would republish stale
+	 * as-of-R page images above the writer's shipped versions.  Suppress
+	 * hint-bit dirtying and on-access pruning (the only page-content WAL a
+	 * read-only workload emits), keep autovacuum from vacuuming store-backed
+	 * relations, and default every transaction to read-only.  Store-write
+	 * refusals below remain as the fail-closed backstop.
+	 */
+	if (localsvc_read_lsn != 0)
+	{
+		page_maintenance_suppressed = true;
+		SetConfigOption("autovacuum", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);
+		SetConfigOption("default_transaction_read_only", "on",
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
+	}
 
 	DefineCustomIntVariable("pagestore.timeline",
 							"Timeline (branch) this backend reads and writes on; 0 is the main timeline.",

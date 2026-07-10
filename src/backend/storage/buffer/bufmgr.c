@@ -187,6 +187,7 @@ typedef struct SMgrSortArray
 
 /* GUC variables */
 bool		zero_damaged_pages = false;
+bool		page_maintenance_suppressed = false;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
@@ -5706,6 +5707,13 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 						  bool buffer_std)
 {
 	Page		page = BufferGetPage(buffer);
+
+	/*
+	 * A compute that must not generate page-content WAL leaves the hint in
+	 * memory only: the buffer stays clean and no FPI_FOR_HINT is emitted.
+	 */
+	if (page_maintenance_suppressed)
+		return;
 
 	Assert(GetPrivateRefCount(buffer) > 0);
 

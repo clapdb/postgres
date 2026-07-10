@@ -1,6 +1,6 @@
 # Multi-compute read consistency: design
 
-Status: increment 1 implemented (the pinned reader); increments 2-3 are
+Status: increment 1a implemented (the page-read pin); increments 1b-3 are
 specified here and not yet built.
 
 ## Problem
@@ -70,19 +70,56 @@ reconstruction.
 
 ## Increments
 
-1. **The pinned reader (implemented).**  `pagestore.read_lsn` (POSTMASTER):
-   the compute pins every store relation read at R -- `PS_OP_READV` gains
-   an honoured `req_lsn` (0 keeps the newest semantics, so the writer path
-   is untouched) -- and refuses store writes (`smgrwrite`/`extend` error
-   out; the reader runs `default_transaction_read_only`-style workloads at
-   a frozen point).  Because R never moves, shared-buffer staleness is a
-   non-issue: what was true at boot stays true.  A pinned reader boots from
-   prepared-branch-style artifacts restored as of R (control image + SLRU
-   seeds); it does NOT create a store timeline -- it reads the writer's
-   timeline as-of R, which the store already serves (`tl_walk` +
-   `page_visible`).  Fail-closed: a missing page version at R (page created
-   after R resolves absent; page GC'd below R is an M5 concern gated by the
-   retained-LSN horizon) surfaces as an SMGR read error, never zeros.
+1a. **The page-read pin (implemented).**  `pagestore.read_lsn`
+   (POSTMASTER): every store relation page read is capped at R --
+   `PS_OP_READV` gains an honoured `req_lsn` (0 keeps the newest
+   semantics, so the writer path is untouched) -- and store mutations are
+   refused: relation extend/create/unlink/truncate, WAL append, WAL-index
+   append, and object writes all error; page writes are dropped when
+   hint-bit-only (pd_lsn <= R; they must not fork the frozen history and
+   re-derive on later reads) and refused loudly when the page LSN
+   advanced past R (a real local mutation that escaped read-only mode).
+   Because R never moves, shared-buffer staleness is a non-issue.
+
+   A pinned compute must also generate NO page-content WAL of its own:
+   with checksums on, a plain SELECT sets hint bits and emits an
+   `FPI_FOR_HINT` carrying the as-of-R page image; replaying that WAL
+   after the pin is lifted would republish the stale image ABOVE the
+   writer's shipped versions and rewind history for every later reader.
+   So a pinned start suppresses hint-bit dirtying of shared buffers and
+   on-access pruning (the `page_maintenance_suppressed` seam in core),
+   forces `autovacuum = off` and `default_transaction_read_only = on`,
+   disables the SLRU/control mirrors (nothing legitimate to publish),
+   and pauses WAL archiving (segments stay `.ready` and ship after
+   unpinning, keeping the store's WAL history gapless).  The store-write
+   refusals above remain as the fail-closed backstop.  This is the
+   MECHANISM increment: on its own it freezes page bytes, not the whole
+   compute.
+
+1b. **As-of metadata (next).**  `NBLOCKS`/`EXISTS` still answer newest, so
+   a writer-side truncate/drop after R shrinks the frozen view.  Needs
+   fork-size versioning in the store (a per-fork (lsn, nblocks) history
+   fed by the extend path's page LSNs plus an LSN-stamped truncate op,
+   made recoverable) so size and existence resolve as-of R.
+
+1c. **The as-of compute (boot + snapshot).**  A consistent QUERY compute
+   at R needs its LOCAL state as-of R too: catalogs, pg_control, and
+   SLRUs come from the prepared-branch-style artifacts restored at R (a
+   pinned reader does NOT create a store timeline -- it reads the
+   writer's timeline as-of R, which `tl_walk`/`page_visible` already
+   serve).  Transaction visibility must not consult newest status: wire
+   the running-xacts snapshot (above) so tuples of xacts in flight at R
+   stay invisible whatever newest clog says.
+
+1d. **The same-LSN admission fence.**  Relation versions are keyed by
+   pd_lsn, and the writer's hint-bit-only page writes re-ship a page
+   under an UNCHANGED pd_lsn: a version written after R can win a
+   newest-<=-R resolve because it ties at the same LSN.  The bytes differ
+   only in hint bits -- but those assert commit status decided possibly
+   after R.  The store needs an admission-order fence for capped reads
+   (e.g. versions carry a monotone store sequence, and R pairs with the
+   sequence the control image shipped at), or same-pd_lsn re-admissions
+   must be rejected below the pin.
 
 2. **The advancing reader.**  R advances by re-deriving from the control
    mirror (the SLRU reader's TTL/epoch protocol, generalized): adopting a
