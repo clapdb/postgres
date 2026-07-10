@@ -91,13 +91,24 @@ handle_request(PsChannel *ch)
 
 		case PS_OP_READV:
 			/* "current" read on this timeline: resolve at max LSN, serving from
-			 * memtable / image layers with a segment fallback */
-			for (uint32_t i = 0; i < ch->nblocks; i++)
+			 * memtable / image layers with a segment fallback.  A pinned
+			 * reader (pagestore.read_lsn) stamps req_lsn to cap the resolve
+			 * at its horizon; 0 keeps the newest semantics, so writer
+			 * computes are untouched.  Blocks with no version at/below the
+			 * cap read as zeros: they were created after the horizon, and
+			 * an as-of traversal never reaches them (PageIsNew for heap;
+			 * index pointers as-of the horizon only reference as-of
+			 * structure). */
 			{
-				unsigned char *dst = ch->data + (size_t) i * page_size;
+				uint64_t	rl = ch->req_lsn ? ch->req_lsn : UINT64_MAX;
 
-				if (!read_resolve(tl, &ch->key, ch->blocknum + i, UINT64_MAX, dst, NULL))
-					memset(dst, 0, page_size);	/* unwritten -> zeros */
+				for (uint32_t i = 0; i < ch->nblocks; i++)
+				{
+					unsigned char *dst = ch->data + (size_t) i * page_size;
+
+					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl, dst, NULL))
+						memset(dst, 0, page_size);	/* unwritten -> zeros */
+				}
 			}
 			break;
 

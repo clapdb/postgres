@@ -1049,6 +1049,36 @@ $P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 3);" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "3" \
 	"a later truncation supersedes the tombstone cutoff"
 
+# --- 31. pinned reader: a compute serves its timeline history at a frozen LSN --------
+# READ_CONSISTENCY_DESIGN.md increment 1: pagestore.read_lsn caps every store
+# relation read at R (the redo of a durably mirrored checkpoint -- complete by
+# construction) and refuses store mutations.  History stays frozen: an update
+# checkpointed after R must not be visible to the pinned compute.
+$P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
+       INSERT INTO reader_t VALUES (1, 'v1');" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+readerR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+$P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+{
+	echo "pagestore.read_lsn = '$readerR'"
+	echo "default_transaction_read_only = on"
+} >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
+	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
+assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'read-only')" "1" \
+	"pinned reader refuses writes"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+{
+	echo "pagestore.read_lsn = ''"
+	echo "default_transaction_read_only = off"
+} >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail
