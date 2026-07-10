@@ -29,7 +29,10 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		13	/* 13: PS_KLASS_SLRU_LIVE (caller-versioned
+#define PS_SHM_VERSION		15	/* 15: PS_KLASS_SLRU_WM watermark object;
+								 * 14: PS_KLASS_SLRU_TOMB truncation
+								 *     tombstones;
+								 * 13: PS_KLASS_SLRU_LIVE (caller-versioned
 								 *     live SLRU mirror images);
 								 * 12: WAL_RETAIN_FLOOR opcode added;
 								 * 11: PS_KLASS_CONTROL writes versioned by the
@@ -108,6 +111,15 @@ typedef enum PsObjClass
 	PS_KLASS_SLRU_LIVE = 3,		/* a live-mirrored SLRU page image (newest
 								 * flushed bytes, contents bounded by the
 								 * version LSN; never a seed base) */
+	PS_KLASS_SLRU_TOMB = 4,		/* an SLRU truncation tombstone: block 0
+								 * carries the cutoff page number (int64),
+								 * versioned by the truncation LSN; pages
+								 * below the cutoff are dead at/after it */
+	PS_KLASS_SLRU_WM = 5,		/* the SLRU mirror visibility watermark:
+								 * block 0 of object 0, versioned by (and
+								 * carrying) the watermark LSN; readers on
+								 * other computes trust the live mirror up
+								 * to the newest one and no further */
 } PsObjClass;
 
 /* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */

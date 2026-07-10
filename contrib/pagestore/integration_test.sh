@@ -809,7 +809,7 @@ assert "$($P -c "SELECT pagestore_wal_retain_floor() <= (SELECT redo_lsn FROM pg
 # clean-as-of-cutoff that flushed images do not have).
 $P -c "CREATE FUNCTION pagestore_slru_live_read_at(text, int, pg_lsn) RETURNS bytea
         AS 'pagestore','pagestore_slru_live_read_at' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_slru_mirror_stats(OUT staged int, OUT recapture int, OUT lost bigint) RETURNS record
+       CREATE FUNCTION pagestore_slru_mirror_stats(OUT staged int, OUT recapture int, OUT lost bigint, OUT read_served bigint, OUT read_fallback bigint) RETURNS record
         AS 'pagestore','pagestore_slru_mirror_stats' LANGUAGE C STRICT;" >/dev/null
 $P -c "CREATE TABLE slru_live(x int);" >/dev/null
 LIVEXID=$($P -q -c "BEGIN; INSERT INTO slru_live VALUES (1); SELECT (txid_current() % 4294967296)::bigint; COMMIT;")
@@ -826,6 +826,94 @@ assert "$($P -c "SELECT lost FROM pagestore_slru_mirror_stats();")" "0" \
 	"this backend never lost an SLRU capture"
 assert "$($P -c "SELECT pagestore_slru_live_read_at('pg_subtrans', 0, pg_current_wal_lsn()) IS NULL;" 2>&1 | grep -c 'not an in-scope')" "1" \
 	"out-of-scope SLRUs are excluded, not silently store-backed"
+
+# --- 28. SLRU mirror visibility watermark: contiguous durable prefix only ---
+# The watermark (mirrored_status_lsn) advances to a completed checkpoint's
+# redo pointer once that checkpoint's control image AND every staged SLRU
+# image have durably shipped; a reader on another compute may trust the live
+# mirror for status at/below it and no further.
+$P -c "CREATE FUNCTION pagestore_slru_mirror_watermark() RETURNS pg_lsn
+        AS 'pagestore','pagestore_slru_mirror_watermark' LANGUAGE C;
+       CREATE FUNCTION pagestore_slru_mirror_reset_debt() RETURNS bigint
+        AS 'pagestore','pagestore_slru_mirror_reset_debt' LANGUAGE C;" >/dev/null
+# A never-primed mirror starts with boot debt: pre-enable SLRU history was
+# never captured, so the watermark must stay frozen until the operator
+# declares the mirror whole.
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NULL;")" "t" \
+	"watermark stays frozen until the mirror is primed (boot debt)"
+$P -c "SELECT pagestore_slru_mirror_reset_debt();" >/dev/null   # prime it
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
+	"watermark is set after priming + a completed checkpoint's images shipped"
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() <= (SELECT redo_lsn FROM pg_control_checkpoint());")" "t" \
+	"watermark never claims more than the last completed checkpoint's redo"
+WM1=$($P -c "SELECT pagestore_slru_mirror_watermark();")
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (2); COMMIT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() > '$WM1'::pg_lsn;")" "t" \
+	"watermark advances across a traffic + checkpoint cycle"
+
+# --- 28b. mirror debt: an unclean shutdown freezes the watermark for good ---
+# A crash may kill processes holding staged-but-unsynced images whose pages
+# are clean on local disk and will never be flushed (and thus re-captured)
+# again.  That hole cannot be proven re-covered, so after a crash boot the
+# watermark must stay frozen -- persistently, via the debt marker -- until an
+# operator re-primes the mirror and explicitly resets the debt.
+"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NULL;")" "t" \
+	"watermark stays frozen after a crash boot (boot debt)"
+assert "$(test -f "$DATA/pagestore.slru_mirror_debt" && echo t)" "t" \
+	"the boot debt is persisted as a marker file"
+assert "$($P -c "SELECT pagestore_slru_mirror_reset_debt() >= 1;")" "t" \
+	"reset_debt reports and clears the outstanding losses"
+assert "$(test -f "$DATA/pagestore.slru_mirror_debt" || echo t)" "t" \
+	"reset_debt removes the marker file"
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_mirror_watermark() IS NOT NULL;")" "t" \
+	"watermark advances again once the debt is reset"
+
+# --- 29. SLRU live reads: transaction status served from the mirror ---
+# Restart the compute with pagestore.slru_live_reads on and the local
+# pg_xact segment hidden: startup's clog read and the status lookup for our
+# committed xid can then only be answered by the live mirror (gated on the
+# published watermark).  A clean shutdown checkpoint ships + publishes.
+"$BIN/pg_ctl" -D "$DATA" -m fast stop >/dev/null
+echo "pagestore.slru_live_reads = on" >> "$DATA/postgresql.conf"
+mv "$DATA/pg_xact/0000" "$DATA/pg_xact/0000.hidden"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null
+assert "$($P -c "SELECT txid_status($LIVEXID);")" "committed" \
+	"transaction status answered with the local pg_xact segment gone (live mirror serves the read)"
+# the segment may have been recreated by post-recovery clog writes; restore
+# the original only if it was not
+[ -e "$DATA/pg_xact/0000" ] || mv "$DATA/pg_xact/0000.hidden" "$DATA/pg_xact/0000"
+rm -f "$DATA/pg_xact/0000.hidden"
+
+# --- 30. SLRU truncation tombstones: durable before local deletion ---
+# slru_truncate_hook publishes a durable cutoff tombstone BEFORE any local
+# segment is deleted; a live-mirror reader must treat pages below the newest
+# tombstone at/below its LSN as dead, whatever images exist.
+$P -c "CREATE FUNCTION pagestore_slru_tombstone_asof(text, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_slru_tombstone_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_slru_mirror_truncate(text, bigint) RETURNS void
+        AS 'pagestore','pagestore_slru_mirror_truncate' LANGUAGE C STRICT;" >/dev/null
+# priming (28/28b's reset_debt) re-derives tombstones from local truth: with
+# segment 0000 present the published cutoff is 0 -- "nothing dead" -- which
+# supersedes nothing but proves the re-derivation ran
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "0" \
+	"priming re-derived a nothing-dead tombstone from the local segments"
+TOMB_BEFORE=$($P -c "SELECT pg_current_wal_lsn();")
+$P -q -c "BEGIN; INSERT INTO slru_live VALUES (3); COMMIT;" >/dev/null	# advance WAL past TOMB_BEFORE
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 1);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "1" \
+	"tombstone publishes the truncation cutoff page"
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', '$TOMB_BEFORE'::pg_lsn);")" "0" \
+	"the pre-truncation as-of still sees only the priming cutoff (as-of read is capped)"
+$P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 3);" >/dev/null
+assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "3" \
+	"a later truncation supersedes the tombstone cutoff"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
