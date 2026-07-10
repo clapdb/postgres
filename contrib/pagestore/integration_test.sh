@@ -73,6 +73,7 @@ pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
 io_method = sync
+wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
 port = $PORT
@@ -512,7 +513,7 @@ rm -rf "$SEEDOUT"
 # parent's pg_xact_commit_timestamp) and xidB none -- per-record replay, no coalescing.
 $P -c "CREATE FUNCTION pagestore_commit_ts_asof(xid, pg_lsn, pg_lsn, xid) RETURNS timestamptz
         AS 'pagestore','pagestore_commit_ts_asof' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn) RETURNS bytea
+       CREATE FUNCTION pagestore_commit_ts_page_asof(int, pg_lsn, pg_lsn, xid) RETURNS bytea
         AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_commit_ts(text, pg_lsn, pg_lsn, xid, xid) RETURNS bigint
         AS 'pagestore','pagestore_seed_commit_ts' LANGUAGE C STRICT;" >/dev/null
@@ -522,6 +523,7 @@ $P -c "CREATE TABLE cts(id int) TABLESPACE ts;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 ctsC=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$ctsC');" >/dev/null
+$P -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$ctsC');" >/dev/null   # the all-SLRU seeder (20b) needs a clog base too
 # data-writing xacts so the commit (and its timestamp) is sync-flushed for the WAL reader
 ctsA=$($P -c "WITH w AS (INSERT INTO cts VALUES (1) RETURNING 1) SELECT pg_current_xact_id();")
 ctsL=$($P -c "SELECT pg_current_wal_lsn();")                      # L: after xidA's commit
@@ -549,7 +551,7 @@ cts_per_page=$(( bs / cts_entry_size ))
 ctsPage=$(( ctsA / cts_per_page ))
 ctsSeg=$(printf '%04X' $(( ctsPage / 32 )))
 ctsSeedMd5=$($P -c "SELECT md5(pg_read_binary_file('$CTSSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
-ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL'));")
+ctsReconMd5=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$ctsC', '$ctsL', '3'::xid));")
 assert "$ctsSeedMd5" "$ctsReconMd5" "commit-ts seed page == reconstructed as-of-L page"
 rm -rf "$CTSSEED"
 # an empty horizon [x, x) has nothing to reconstruct but must still publish the
@@ -562,6 +564,124 @@ assert "$empty_seeded" "1" "commit-ts seed publishes a bootstrap page for an emp
 assert "$([ -d "$EMPTYCTS/pg_commit_ts" ] && echo present)" "present" \
 	"empty-horizon commit-ts artifact directory exists"
 rm -rf "$EMPTYCTS"
+
+# --- 20b. commit-ts toggle replay: eras across track_commit_timestamp restarts ----------
+# The GUC is PGC_POSTMASTER, so a toggle always crosses a restart: OFF fires
+# DeactivateCommitTs (every local segment deleted; a XLOG_PARAMETER_CHANGE lands in
+# WAL), ON starts a new era whose nextXid page ActivateCommitTs zeroes WITHOUT WAL.
+# The appliers track the era from the base's control image through the toggles.
+echo "track_commit_timestamp = off" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+ctsOffL0=$($P -c "SELECT pg_current_wal_lsn();")              # early in the off era
+$P -q -c "BEGIN; INSERT INTO cts VALUES (9); COMMIT;" >/dev/null
+ctsOffL=$($P -c "SELECT pg_current_wal_lsn();")               # later in the off era
+echo "track_commit_timestamp = on" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+ctsLmid=$($P -c "SELECT pg_current_wal_lsn();")               # after activation, before any era commit
+ctsE2=$($P -c "WITH w AS (INSERT INTO cts VALUES (3) RETURNING 1) SELECT pg_current_xact_id();")
+ctsLpre=$($P -c "SELECT pg_current_wal_lsn();")               # era commit done, still pre-checkpoint
+$P -c "CHECKPOINT;" >/dev/null                                # publish the era horizon
+ctsXA=$($P -c "SELECT oldest_commit_ts_xid FROM pg_control_checkpoint();")
+ctsL2=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsL2', '3'::xid) IS NULL;")" "t" \
+	"commit-ts toggle: an era-1 timestamp does not survive the era wipe (horizon disabled)"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL2', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an era-2 commit reconstructs across the unlogged activation zero"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsC', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: a target inside the off window fails closed"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsOffL0', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: an entirely-off window fails closed (no toggle record needed)"
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsA'::xid, '$ctsOffL', '$ctsOffL', '3'::xid);" 2>&1 | grep -c 'off as of the target')" "1" \
+	"commit-ts toggle: a read exactly at an off-era LSN fails closed (empty window)"
+# the activation page exists (all-zero) on the parent BEFORE any era commit touches it:
+# ActivateCommitTs created it without WAL, so the applier materializes it from the horizon
+ctsXApage=$(( ctsXA / cts_per_page ))
+assert "$($P -c "SELECT pagestore_commit_ts_page_asof($ctsXApage, '$ctsC', '$ctsLmid', '$ctsXA'::xid) = decode(repeat('00', $bs), 'hex');")" "t" \
+	"commit-ts toggle: the silently-zeroed activation page is served before any era commit"
+# a fork BEFORE the first post-activation checkpoint has no pg_control horizon yet;
+# the appliers derive it from the toggle-time control image (Invalid oldest = derive)
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '0'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: a pre-checkpoint fork derives the activation horizon from the control image"
+# a 3-argument SQL wrapper created before the horizon argument existed still calls
+# the same C symbol; it must default the horizon instead of reading garbage
+$P -c "CREATE FUNCTION pagestore_commit_ts_page_asof3(int, pg_lsn, pg_lsn) RETURNS bytea
+        AS 'pagestore','pagestore_commit_ts_page_asof' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT pagestore_commit_ts_page_asof3($ctsXApage, '$ctsC', '$ctsLmid') = decode(repeat('00', $bs), 'hex');")" "t" \
+	"commit-ts toggle: the legacy 3-argument page-asof ABI still works (horizon defaulted)"
+# the 'oldest' argument is only the LOOKUP filter: disabling it with a tiny xid must
+# not poison the activation zero-page derivation (which comes from the control image)
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpre', '3'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: a disabled lookup horizon does not poison the activation page"
+# the all-SLRU convenience seeder normalizes the same way: both-Invalid commit-ts
+# horizons on an ACTIVE pre-checkpoint fork must seed, not install an empty dir
+$P -c "CREATE OR REPLACE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+        AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;" >/dev/null
+ALLSEED=$(mktemp -d)
+all_next=$(( ctsE2 + 1 ))
+read -r allOldMx allNextMx allNextMOff <<< "$($P -c "SELECT oldest_multi_xid::text || ' ' || next_multixact_id::text || ' ' || next_multi_offset FROM pg_control_checkpoint();")"
+all_seeded=$($P -c "SELECT pagestore_seed_branch_slrus('$ALLSEED', '$ctsC', '$ctsLpre', '3'::xid, '$all_next'::text::xid, '0'::xid, '0'::xid, '$allOldMx'::xid, '$allNextMx'::xid, $allNextMOff, $allNextMOff);")
+assert "$([ -f "$ALLSEED/pg_commit_ts/$(printf '%04X' $(( (ctsXA / cts_per_page) / 32 )))" ] && echo present || echo absent)" "present" \
+	"commit-ts toggle: the all-SLRU seeder treats an active pre-checkpoint fork as seedable"
+rm -rf "$ALLSEED"
+PRESEED=$(mktemp -d)
+tog_next=$(( ctsE2 + 1 ))
+pre_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$PRESEED', '$ctsC', '$ctsLpre', '0'::xid, '$tog_next'::text::xid);")
+assert "$([ "${pre_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"commit-ts toggle: seeding a pre-checkpoint fork with no horizon derives one ($pre_seeded page(s))"
+rm -rf "$PRESEED"
+TOGSEED=$(mktemp -d)
+tog_seeded=$($P -c "SELECT pagestore_seed_commit_ts('$TOGSEED', '$ctsC', '$ctsL2', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
+assert "$([ "${tog_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"commit-ts toggle: seeding with the era horizon succeeds ($tog_seeded page(s))"
+# byte check: if xidA shares the seeded era page, its entry must be all-zero there
+togPage=$(( ctsXA / cts_per_page ))
+if [ "$(( ctsA / cts_per_page ))" = "$togPage" ]; then
+	togSeg=$(printf '%04X' $(( togPage / 32 )))
+	togEntryOff=$(( (togPage % 32) * bs + (ctsA % cts_per_page) * cts_entry_size ))
+	zeros=$($P -c "SELECT pg_read_binary_file('$TOGSEED/pg_commit_ts/$togSeg', $togEntryOff, $cts_entry_size) = decode(repeat('00', $cts_entry_size), 'hex');")
+	assert "$zeros" "t" "commit-ts toggle: the seeded era page holds a zero entry where era-1 bytes were"
+fi
+rm -rf "$TOGSEED"
+# an unrelated restart (another PGC_POSTMASTER parameter changed) emits a
+# XLOG_PARAMETER_CHANGE that still carries track_commit_timestamp = true; that
+# is NOT a transition, and the appliers must not wipe the era for it
+echo "max_connections = 120" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+ctsL3=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an unrelated parameter-change restart does not wipe the era"
+# an off-era BASE: era state initializes from the base's control image; the in-window
+# activation resets once, and the unrelated restart after it must not reset again
+assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsOffL', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
+	"commit-ts toggle: an off-era base replays the activation once and survives later restarts"
+
+# --- 20c. store-backed WAL for the SLRU appliers -----------------------------------------
+# pagestore.redo_wal_from_store redirects the appliers' (C, L] scans to the store's
+# shipped WAL log, so prepare can run on a compute with no local WAL.  Ship the
+# segments containing the toggle window, then reconstruct with the GUC on and match
+# the local-mode answers; a window ending in the current partial segment must fail
+# the coverage probe (the store holds completed segments only).
+$P -c "SELECT pg_switch_wal();" >/dev/null              # complete the window's segment
+$P -q -c "BEGIN; INSERT INTO cts VALUES (4); COMMIT;" >/dev/null   # land in the new one
+store_cts=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	store_cts=$($P -q -c "SET pagestore.redo_wal_from_store = on;
+	                   SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);" 2>/dev/null)
+	[ "$store_cts" = "t" ] && break
+	sleep 0.5                                            # archiver ships asynchronously
+done
+assert "$store_cts" "t" \
+	"store-backed WAL: the commit-ts applier reconstructs the toggle window from shipped segments"
+STORESEED=$(mktemp -d)
+store_seeded=$($P -q -c "SET pagestore.redo_wal_from_store = on;
+                      SELECT pagestore_seed_commit_ts('$STORESEED', '$ctsC', '$ctsL3', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
+assert "$([ "${store_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"store-backed WAL: the commit-ts seeder materializes from shipped segments ($store_seeded page(s))"
+rm -rf "$STORESEED"
+ctsLpartial=$($P -c "SELECT pg_current_wal_lsn();")     # inside the current partial segment
+assert "$($P -c "SET pagestore.redo_wal_from_store = on;
+                 SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpartial', '$ctsXA'::xid);" 2>&1 | grep -c 'WAL ends before the target')" "1" \
+	"store-backed WAL: a window ending in the current partial segment fails closed"
 
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
@@ -627,7 +747,7 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_multixact_members_page_asof' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_seed_multixact(text, pg_lsn, pg_lsn, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_multixact' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
+       CREATE OR REPLACE FUNCTION pagestore_seed_branch_slrus(text, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
        CREATE OR REPLACE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
@@ -683,7 +803,7 @@ bootClogMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_xact/$bootClog
 bootClogRecon=$($P -c "SELECT md5(pagestore_clog_page_asof($(( ctsA / cxpp )), '$mxC', '$mxL'));")
 assert "$bootClogMd5" "$bootClogRecon" "branch bootstrap seed pg_xact page == reconstructed as-of-L page"
 bootCtsMd5=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_commit_ts/$ctsSeg', $(( (ctsPage % 32) * bs )), $bs));")
-bootCtsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$mxC', '$mxL'));")
+bootCtsRecon=$($P -c "SELECT md5(pagestore_commit_ts_page_asof($ctsPage, '$mxC', '$mxL', '3'::xid));")
 assert "$bootCtsMd5" "$bootCtsRecon" "branch bootstrap seed pg_commit_ts page == reconstructed as-of-L page"
 bootMxOff=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/offsets/$mxSeg', $(( (mxPage % 32) * bs )), $bs));")
 bootMxMem=$($P -c "SELECT md5(pg_read_binary_file('$BOOTSEED/pg_multixact/members/$mbSeg', $(( (mPage % 32) * bs )), $bs));")
