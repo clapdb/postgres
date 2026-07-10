@@ -615,6 +615,34 @@ ctsL3=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);")" "t" \
 	"commit-ts toggle: an unrelated parameter-change restart does not wipe the era"
 
+# --- 20c. store-backed WAL for the SLRU appliers -----------------------------------------
+# pagestore.redo_wal_from_store redirects the appliers' (C, L] scans to the store's
+# shipped WAL log, so prepare can run on a compute with no local WAL.  Ship the
+# segments containing the toggle window, then reconstruct with the GUC on and match
+# the local-mode answers; a window ending in the current partial segment must fail
+# the coverage probe (the store holds completed segments only).
+$P -c "SELECT pg_switch_wal();" >/dev/null              # complete the window's segment
+$P -q -c "BEGIN; INSERT INTO cts VALUES (4); COMMIT;" >/dev/null   # land in the new one
+store_cts=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+	store_cts=$($P -q -c "SET pagestore.redo_wal_from_store = on;
+	                   SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsL3', '$ctsXA'::xid) = pg_xact_commit_timestamp('$ctsE2'::xid);" 2>/dev/null)
+	[ "$store_cts" = "t" ] && break
+	sleep 0.5                                            # archiver ships asynchronously
+done
+assert "$store_cts" "t" \
+	"store-backed WAL: the commit-ts applier reconstructs the toggle window from shipped segments"
+STORESEED=$(mktemp -d)
+store_seeded=$($P -q -c "SET pagestore.redo_wal_from_store = on;
+                      SELECT pagestore_seed_commit_ts('$STORESEED', '$ctsC', '$ctsL3', '$ctsXA'::text::xid, '$tog_next'::text::xid);")
+assert "$([ "${store_seeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"store-backed WAL: the commit-ts seeder materializes from shipped segments ($store_seeded page(s))"
+rm -rf "$STORESEED"
+ctsLpartial=$($P -c "SELECT pg_current_wal_lsn();")     # inside the current partial segment
+assert "$($P -c "SET pagestore.redo_wal_from_store = on;
+                 SELECT pagestore_commit_ts_asof('$ctsE2'::xid, '$ctsC', '$ctsLpartial', '$ctsXA'::xid);" 2>&1 | grep -c 'WAL ends before the target')" "1" \
+	"store-backed WAL: a window ending in the current partial segment fails closed"
+
 # --- 21. multixact offsets applier: reconstruct the multixid->offset map as-of L --------
 # A multixact needs two concurrent lockers, so hold a FOR SHARE lock in a background session
 # while a second session also locks the row, creating multixact mA.  Reconstructing the

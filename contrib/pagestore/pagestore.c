@@ -820,9 +820,11 @@ ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	{
 		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
 													(uint64) targetPagePtr,
-													(uint32) reqLen, readBuf);
+													XLOG_BLCKSZ, readBuf);
 
-		return (n >= reqLen) ? reqLen : -1;
+		/* whole page, not reqLen: header validation reads past reqLen on
+		 * segment-start pages (see ps_slru_wal_page_read) */
+		return (n >= reqLen) ? n : -1;
 	}
 	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
 										targetRecPtr, readBuf);
@@ -1527,6 +1529,65 @@ ps_local_wal_limit(void)
 }
 
 /*
+ * SLRU appliers/seeders: WAL access that honours pagestore.redo_wal_from_store.
+ *
+ * The appliers replay (C, L] with a linear scan.  On a compute whose local
+ * pg_wal does not hold that window (a fresh utility compute preparing a
+ * branch; pagestore.timeline names the timeline it acts for), the same GUC
+ * that redirects redo_page_asof redirects these scans to the store's shipped
+ * per-timeline WAL log.  The store holds completed segments only (the
+ * archive callback ships on segment completion), so a window ending in the
+ * current partial segment fails the coverage probe and the caller fails
+ * closed, exactly as it does when local WAL ends early.
+ */
+static int
+ps_slru_wal_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr,
+					  int reqLen, XLogRecPtr targetRecPtr, char *readBuf)
+{
+	if (pagestore_redo_wal_from_store)
+	{
+		int			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+													(uint64) targetPagePtr,
+													XLOG_BLCKSZ, readBuf);
+
+		/*
+		 * The page_read contract wants ALL available bytes of the page,
+		 * not just reqLen: the reader validates page headers from the
+		 * returned buffer beyond reqLen (a segment-start page's LONG
+		 * header is checked with fields past the 24-byte short header the
+		 * first probe requests), so a reqLen-sized fill leaves garbage
+		 * where validation looks.  Read the whole page; succeed only when
+		 * at least reqLen of it is shipped.
+		 */
+		return (n >= reqLen) ? n : -1;
+	}
+	return read_local_xlog_page_no_wait(state, targetPagePtr, reqLen,
+										targetRecPtr, readBuf);
+}
+
+/*
+ * Does readable WAL extend through 'target'?  The completeness escape for a
+ * window whose records all ended before the target: the scan proved nothing
+ * past its last record, so the caller must know WAL itself reaches the
+ * target.  Local mode asks the replay/insert position; store mode probes the
+ * shipped log for the byte just below the target.
+ */
+static bool
+ps_wal_reaches(XLogRecPtr target)
+{
+	if (pagestore_redo_wal_from_store)
+	{
+		char		b;
+
+		if (target == 0)
+			return false;
+		return pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+										   (uint64) (target - 1), 1, &b) == 1;
+	}
+	return ps_local_wal_limit() >= target;
+}
+
+/*
  * Replay (base_lsn, target_lsn] from the local WAL onto clog page 'pageno' in 'page':
  *  - XLOG_XACT_{COMMIT,ABORT}[_PREPARED]: set the top xid + subxids' status;
  *  - RM_CLOG_ID CLOG_ZEROPAGE: zero this page (a page reused after wraparound must not
@@ -1547,7 +1608,7 @@ ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -1662,7 +1723,7 @@ ps_clog_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	 */
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -1868,7 +1929,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	*deactivated = false;
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2045,7 +2106,7 @@ ps_commit_ts_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -2203,7 +2264,7 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2284,7 +2345,7 @@ ps_mxoff_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -2476,7 +2537,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 	PsClogReplay r = {false, false, false};
 
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2541,7 +2602,7 @@ ps_mxmemb_apply_range(char *page, int64 pageno, XLogRecPtr base_lsn,
 
 	r.reached_target = (scanned >= target_lsn) ||
 		(!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
-		 ps_local_wal_limit() >= target_lsn);
+		 ps_wal_reaches(target_lsn));
 	XLogReaderFree(reader);
 	pfree(pd);
 	return r;
@@ -2672,7 +2733,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -2881,7 +2942,7 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(reached_from) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct commit-ts as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
@@ -2965,7 +3026,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -3064,7 +3125,7 @@ ps_mxoff_seed_reconstruct_range(char *pages, bool *present,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact offsets as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
@@ -3141,7 +3202,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -3228,7 +3289,7 @@ ps_mxmemb_seed_reconstruct_range(char *pages, bool *present,
 
 	if (scanned < target_lsn && target_lsn != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target_lsn))
+		 !ps_wal_reaches(target_lsn)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot reconstruct multixact members as of %X/%08X",
 						LSN_FORMAT_ARGS(target_lsn))));
@@ -3631,7 +3692,7 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 
 	pd = palloc0(sizeof(*pd));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
 										   .segment_open = &wal_segment_open,
 										   .segment_close = &wal_segment_close),
 								pd);
@@ -3741,10 +3802,11 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	 * cleanly (no decode error), and the readable WAL extends through target.  An
 	 * unreadable start (recycled base segment), a decode error (errm), or target beyond
 	 * the readable WAL is a short read -- never seed a clog that skipped (base, target].
-	 * (ps_local_wal_limit is replay-aware, so this also holds on a standby.) */
+	 * (ps_wal_reaches is replay-aware locally and probes the shipped log in
+	 * store mode, so this also holds on a standby / a no-local-WAL compute.) */
 	if (scanned < target && target != PG_UINT64_MAX &&
 		(XLogRecPtrIsInvalid(readfrom) || errm != NULL ||
-		 ps_local_wal_limit() < target))
+		 !ps_wal_reaches(target)))
 		ereport(ERROR,
 				(errmsg("pagestore: WAL ends before the target LSN; cannot seed clog as of %X/%08X",
 						LSN_FORMAT_ARGS(target))));
