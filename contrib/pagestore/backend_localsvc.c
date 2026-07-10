@@ -1171,6 +1171,28 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
 				deny = "COPY FROM";
 			break;
+		case T_TransactionStmt:
+			/*
+			 * PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED are
+			 * read-only-legal but write XACT WAL inside critical sections
+			 * (twophase.c); refuse them before that becomes a PANIC at the
+			 * wal_insert_restricted backstop.  Plain BEGIN/COMMIT/etc. pass.
+			 */
+			switch (((TransactionStmt *) pstmt->utilityStmt)->kind)
+			{
+				case TRANS_STMT_PREPARE:
+					deny = "PREPARE TRANSACTION";
+					break;
+				case TRANS_STMT_COMMIT_PREPARED:
+					deny = "COMMIT PREPARED";
+					break;
+				case TRANS_STMT_ROLLBACK_PREPARED:
+					deny = "ROLLBACK PREPARED";
+					break;
+				default:
+					break;
+			}
+			break;
 		case T_NotifyStmt:
 			/*
 			 * Read-only-legal but XID-assigning and pg_notify-SLRU-writing;
@@ -1210,6 +1232,21 @@ pagestore_localsvc_pinned_init(bool localsvc_active)
 	if (!localsvc_active)
 		ereport(ERROR,
 				(errmsg("pagestore.read_lsn requires pagestore.backend = 'localsvc'")));
+
+	/*
+	 * A pinned reader must not archive WAL, full stop.  Its local WAL
+	 * diverges from the timeline writer's, and no archiver-side heuristic
+	 * can tell, after the pin is lifted, which retained bytes were private
+	 * (a floor recorded at first archive call starts too late after
+	 * archiver lag; a mixed segment's private suffix ships as gap-fill
+	 * that the store's overlap check has no coverage to refuse).  Refuse
+	 * the combination at startup: the operator disables archive_mode for
+	 * the pinned run, and on an unpinned restart of the SAME cluster the
+	 * completed segments ship as one true chain, gapless.
+	 */
+	if (XLogArchiveMode != ARCHIVE_MODE_OFF)
+		ereport(ERROR,
+				(errmsg("a pinned reader (pagestore.read_lsn) must not archive WAL; set archive_mode = off")));
 
 	/*
 	 * A pinned reader serves history and must not generate page-content

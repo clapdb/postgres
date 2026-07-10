@@ -105,9 +105,24 @@ handle_request(PsChannel *ch)
 				for (uint32_t i = 0; i < ch->nblocks; i++)
 				{
 					unsigned char *dst = ch->data + (size_t) i * page_size;
+					uint64_t	resolved = 0;
 
-					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl, dst, NULL))
+					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl, dst,
+									  &resolved))
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
+					else if (rl != UINT64_MAX && resolved == 0)
+					{
+						/*
+						 * A stored version with LSN 0 is WAL-less content
+						 * (an unlogged relation, or a skip-WAL build): it
+						 * is not LSN-ordered, so no capped read can honestly
+						 * serve it "as of" anything.  Fail closed rather
+						 * than hand a pinned reader whatever bytes the
+						 * writer most recently flushed.
+						 */
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 				}
 			}
 			break;

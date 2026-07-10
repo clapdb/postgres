@@ -499,20 +499,12 @@ pagestore_archive_configured(ArchiveModuleState *state)
 		return false;
 
 	/*
-	 * A pinned reader ships nothing, but it must still answer (see
-	 * pagestore_archive_file): segments born of its own divergent WAL are
-	 * discarded, segments holding writer-era bytes are deferred.
+	 * A pinned reader never ships WAL.  The supported configuration is
+	 * archive_mode = off (enforced at startup); this is the belt for the
+	 * unreachable case.
 	 */
-	return true;
+	return pagestore_localsvc_read_lsn() == 0;
 }
-
-/*
- * The WAL insert position when this (pinned) archiver first ran: WAL at or
- * above it was generated under the pin and is not the timeline writer's
- * history.  Stable for the life of the archiver process, and it only grows
- * across pinned restarts, so a discard decision never flips.
- */
-static XLogRecPtr ps_pinned_wal_floor = InvalidXLogRecPtr;
 
 /*
  * Decode the WAL in [start, end) and record, for each block a record modifies,
@@ -621,35 +613,9 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	XLogFromFileName(file, &tli, &segno, wal_segment_size);
 	XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, seg_start);
 
-	/*
-	 * A pinned reader must not ship WAL: its local WAL diverges from the
-	 * timeline writer's, and the store's overlap semantics (later chunks
-	 * win) would let a reader's private checkpoint records overwrite the
-	 * writer's history for the same LSN range.  Segments that start at or
-	 * above the pinned-era floor contain only WAL generated under the pin:
-	 * report them archived WITHOUT shipping, so no later unpinned start can
-	 * replay the divergent backlog into the store.  A segment starting
-	 * below the floor still holds writer-era bytes (the writer's final
-	 * partial segment, completed by a forced switch while pinned): defer it
-	 * (fail the archive attempt) rather than either shipping reader bytes
-	 * or swallowing writer history.
-	 */
+	/* unreachable when pinned: archive_mode = off is enforced at startup */
 	if (pagestore_localsvc_read_lsn() != 0)
-	{
-		if (XLogRecPtrIsInvalid(ps_pinned_wal_floor))
-			ps_pinned_wal_floor = GetXLogInsertRecPtr();
-		if (seg_start >= ps_pinned_wal_floor)
-		{
-			ereport(LOG,
-					(errmsg("pagestore archive: discarding pinned-era WAL segment \"%s\" (not the timeline writer's history)",
-							file)));
-			return true;
-		}
-		ereport(WARNING,
-				(errmsg("pagestore archive: deferring WAL segment \"%s\" on a pinned reader: it holds pre-pin (writer-era) bytes",
-						file)));
 		return false;
-	}
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)

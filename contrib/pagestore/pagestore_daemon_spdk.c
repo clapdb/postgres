@@ -229,6 +229,13 @@ begin(uint32_t i, PsChannel *ch)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 						continue;
 					}
+					if (ch->req_lsn != 0 && v->lsn == 0)
+					{
+						/* WAL-less content is not as-of-resolvable; see the
+						 * POSIX daemon's capped-read refusal */
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
 					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */
 					bc = &rs->blk[rs->pending - 1];	/* slot 0.. behind the hold */
