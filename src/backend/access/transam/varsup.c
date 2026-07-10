@@ -93,6 +93,16 @@ GetNewTransactionId(bool isSubXact)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign TransactionIds during recovery");
 
+	/*
+	 * A read-only-forced instance (a pinned pagestore reader) never assigns
+	 * XIDs either: an assigned XID forces a WAL'd commit record, which such
+	 * an instance must not produce.  Refusing here -- outside any critical
+	 * section -- fails the XID-hungry statement (pg_current_xact_id(),
+	 * NOTIFY, ...) cleanly instead of PANICking at commit.
+	 */
+	if (transaction_read_only_forced)
+		elog(ERROR, "cannot assign TransactionIds on a read-only instance");
+
 	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 
 	full_xid = TransamVariables->nextXid;

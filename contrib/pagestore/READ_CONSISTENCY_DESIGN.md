@@ -93,10 +93,15 @@ reconstruction.
    transaction starts read-only and SET TRANSACTION READ WRITE is refused
    exactly as during recovery -- the hot-standby enforcement model), which
    holds every PreventCommandIfReadOnly path: DML, DDL, TRUNCATE,
-   nextval(), COPY FROM; executor and utility gates additionally refuse
-   DML, row locking, VACUUM/ANALYZE, REINDEX, REPACK and COPY FROM at the
-   entry points (VACUUM and REINDEX are legal in read-only transactions,
-   the rest get the clearer pinned-reader error); hint-bit dirtying and on-access pruning are suppressed (the
+   nextval(), COPY FROM; XID assignment itself is refused at
+   GetNewTransactionId (an assigned XID forces a WAL'd commit record, so
+   pg_current_xact_id() and friends fail cleanly instead of PANICking at
+   commit), and the data-checksum control functions and their
+   page-rewriting workers are refused/exited too; executor and utility
+   gates additionally refuse DML, row locking, VACUUM/ANALYZE, REINDEX,
+   REPACK, COPY FROM and NOTIFY at the entry points (all legal in
+   read-only transactions or XID-assigning, and they get the clearer
+   pinned-reader error); hint-bit dirtying and on-access pruning are suppressed (the
    `page_maintenance_suppressed` seam in core, which also shuts down the
    autovacuum launcher/workers -- including the wraparound-defense
    launcher that ignores `autovacuum = off` -- and bgwriter standby
@@ -111,15 +116,18 @@ reconstruction.
    WAL archiving (segments stay `.ready` and ship after
    unpinning, keeping the store's WAL history gapless).  What pinned-era
    WAL remains is meta-only -- the shutdown checkpoint record (periodic
-   checkpoints self-skip with no WAL activity) -- and belongs to this
-   cluster's own WAL lineage, so shipping it after unpinning is correct
-   for the single-compute pin/unpin round trip.  A SECOND compute pinned
-   against a writer's timeline must never archive at all: its local WAL
-   chain diverges from the writer's from the moment it starts, so
-   shipping any of it (pinned-era or not) would clobber the writer's
-   shipped segments; at most one compute per timeline may run with
-   archiving configured.  The store-write refusals above remain as the
-   fail-closed backstop.  This is the
+   checkpoints self-skip with no WAL activity).  The archiver splits
+   segments by a pinned-era floor (the WAL insert position when the
+   pinned archiver first ran): segments wholly at/above it are the
+   reader's own divergent WAL and are DISCARDED (reported archived
+   without shipping, so no later unpinned start can replay the backlog
+   over the writer's history -- the store's overlap semantics would let
+   later chunks win); a segment below the floor still holds writer-era
+   bytes and is deferred instead of shipped or swallowed.  A SECOND
+   compute pinned against a writer's timeline must still never run with
+   archiving configured once unpinned: from that point its WAL chain
+   diverges wholesale; at most one compute per timeline may archive.
+   The store-write refusals above remain as the fail-closed backstop.  This is the
    MECHANISM increment: on its own it freezes page bytes, not the whole
    compute.
 
