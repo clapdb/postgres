@@ -68,10 +68,9 @@ handle_request(PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_EXTEND:
+			/* append_page grows the fork with the page's exact LSN */
 			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
 				ch->status = PS_STATUS_ERROR;
-			else
-				fork_grow(tl, &ch->key, ch->blocknum + 1);
 			break;
 
 		case PS_OP_WRITEV:
@@ -85,8 +84,6 @@ handle_request(PsChannel *ch)
 					break;
 				}
 			}
-			if (ch->status == PS_STATUS_OK)
-				fork_grow(tl, &ch->key, ch->blocknum + ch->nblocks);
 			break;
 
 		case PS_OP_READV:

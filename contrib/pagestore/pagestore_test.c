@@ -158,6 +158,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->key.forkNum = fork;
 	ch->key.klass = PS_KLASS_RELATION;
 	ch->timeline = 0;			/* default to the main timeline */
+	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
 }
 
 /* --- typed operations --- */
@@ -211,6 +212,78 @@ op_truncate(uint32_t rel, int32_t fork, uint32_t nblocks)
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->nblocks = nblocks;
 	cl_exec();
+}
+
+/* --- lsn-stamped fork mutations + as-of queries (fork-size history) --- */
+
+static void
+op_create_at(uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_CREATE;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
+static void
+op_truncate_at(uint32_t rel, int32_t fork, uint32_t nblocks, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_TRUNCATE;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
+static void
+op_unlink_at(uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_UNLINK;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
+static void
+op_zeroextend_at(uint32_t rel, int32_t fork, uint32_t block, uint32_t nblocks,
+				 uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_ZEROEXTEND;
+	ch->blocknum = block;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
+static uint32_t
+op_nblocks_asof(uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	return cl_exec()->result;
+}
+
+static int
+op_exists_asof(uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_EXISTS;
+	ch->req_lsn = lsn;
+	return cl_exec()->result != 0;
 }
 
 static void
@@ -442,6 +515,17 @@ op_require_branch_status(uint32_t new_tl, uint32_t parent_tl,
 }
 
 /* Write one page on a specific timeline. */
+static uint32_t
+op_nblocks_tl(uint32_t tl, uint32_t rel, int32_t fork)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_NBLOCKS;
+	return cl_exec()->result;
+}
+
 static void
 op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			const unsigned char *page)
@@ -689,6 +773,7 @@ stop_daemon(pid_t pid)
 
 #define REL_A	16000
 #define REL_B	17000
+#define REL_C	18000
 #define FORK0	0
 
 static void
@@ -763,6 +848,46 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(page_has_tag(rb, page_size, 100), "read_at(7000) returns old version (COW)");
 	op_read_at(REL_A, FORK0, 0, 9000, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(9000) returns new version");
+
+	/* --- fork-size history: as-of NBLOCKS/EXISTS ---------------------- */
+	check(!op_exists_asof(REL_C, FORK0, UINT64_MAX), "no history: fork not found at any horizon");
+	op_create_at(REL_C, FORK0, 1000);
+	check(!op_exists_asof(REL_C, FORK0, 999), "created@1000: invisible at 999");
+	check(op_exists_asof(REL_C, FORK0, 1000), "created@1000: visible at 1000");
+	check(op_nblocks_asof(REL_C, FORK0, 1000) == 0, "created empty");
+	fill_page(pa, page_size, 2000, 1);
+	op_write_one(REL_C, FORK0, 0, pa);
+	fill_page(pa, page_size, 3000, 2);
+	op_write_one(REL_C, FORK0, 1, pa);
+	fill_page(pa, page_size, 4000, 3);
+	op_write_one(REL_C, FORK0, 2, pa);
+	check(op_nblocks_asof(REL_C, FORK0, 1500) == 0, "no blocks below the first write's LSN");
+	check(op_nblocks_asof(REL_C, FORK0, 2000) == 1, "one block as of its pd_lsn");
+	check(op_nblocks_asof(REL_C, FORK0, 3500) == 2, "two blocks between the 2nd and 3rd writes");
+	check(op_nblocks(REL_C, FORK0) == 3, "newest size after three writes");
+	fill_page(pa, page_size, 5000, 9);
+	op_write_one(REL_C, FORK0, 0, pa);	/* rewrite: no size change */
+	check(op_nblocks_asof(REL_C, FORK0, 4999) == 3, "a rewrite adds no size event");
+	op_zeroextend_at(REL_C, FORK0, 3, 2, 6000);
+	check(op_nblocks_asof(REL_C, FORK0, 5999) == 3, "zero-extend invisible below its LSN");
+	check(op_nblocks_asof(REL_C, FORK0, 6000) == 5, "zero-extend visible at its LSN");
+	op_truncate_at(REL_C, FORK0, 1, 7000);
+	check(op_nblocks_asof(REL_C, FORK0, 6999) == 5, "pre-truncate horizon keeps the old size");
+	check(op_nblocks_asof(REL_C, FORK0, 7000) == 1, "truncate visible at its LSN");
+	check(op_nblocks(REL_C, FORK0) == 1, "newest size after truncate");
+	fill_page(pa, page_size, 8000, 7);
+	op_write_one(REL_C, FORK0, 1, pa);	/* regrow past the truncate */
+	check(op_nblocks_asof(REL_C, FORK0, 7500) == 1, "between truncate and regrow: truncated size");
+	check(op_nblocks_asof(REL_C, FORK0, 8000) == 2, "regrow after truncate counts from the truncated size");
+	op_unlink_at(REL_C, FORK0, 9000);
+	check(!op_exists(REL_C, FORK0), "unlinked: gone at newest");
+	check(op_nblocks(REL_C, FORK0) == 0, "unlinked: zero blocks at newest");
+	check(op_exists_asof(REL_C, FORK0, 8999), "as-of below the unlink still exists");
+	check(op_nblocks_asof(REL_C, FORK0, 8500) == 2, "as-of size below the unlink");
+	op_create_at(REL_C, FORK0, 10000);
+	check(op_exists(REL_C, FORK0), "recreate after unlink");
+	check(op_nblocks(REL_C, FORK0) == 0, "recreated fork is empty");
+	check(!op_exists_asof(REL_C, FORK0, 9500), "between unlink and recreate: not exists");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -842,6 +967,15 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "COW history survives restart (read_at old version)");
 	check(op_wal_retain_floor(0) == 5000,
 		  "wal retention floor survives daemon restart (durable via segment log)");
+
+	/* fork-size history survives: definitive events from the fork-meta log,
+	 * growth re-derived from the segment records' own LSNs */
+	check(op_nblocks_asof(REL_C, FORK0, 6999) == 5, "as-of size history survives restart");
+	check(op_nblocks_asof(REL_C, FORK0, 7000) == 1, "truncate event survives restart");
+	check(op_nblocks_asof(REL_C, FORK0, 8000) == 2, "post-truncate regrow survives restart");
+	check(op_exists_asof(REL_C, FORK0, 8999), "pre-unlink existence survives restart");
+	check(!op_exists_asof(REL_C, FORK0, 9500), "unlink event survives restart");
+	check(op_nblocks(REL_C, FORK0) == 0, "recreated-empty newest size survives restart");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
@@ -931,6 +1065,13 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "branch sees parent as-of branch LSN, not later writes (snapshot)");
 	op_read_tl(0, REL_B, FORK0, 5, rb);
 	check(page_has_tag(rb, ps, 52), "main sees its latest write to block5");
+
+	/* fork size is versioned too: growth after the branch point stays the
+	 * parent's own -- the branch's size walk caps at its fork LSN */
+	fill_page(p, ps, 3000, 53);
+	op_write_tl(0, REL_B, FORK0, 7, p);		/* block7 @ lsn 3000 (> branch) */
+	check(op_nblocks_tl(0, REL_B, FORK0) == 8, "parent size includes post-branch growth");
+	check(op_nblocks_tl(1, REL_B, FORK0) == 6, "branch size capped at its fork point");
 
 	/* branches survive a daemon restart (timeline metadata is persisted) */
 	client_detach();

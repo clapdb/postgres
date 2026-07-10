@@ -34,6 +34,7 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -432,6 +433,23 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  */
 
 /*
+ * WAL-position stamp for a fork-mutating op (create/truncate/unlink/
+ * zero-extend).  The daemon keys the fork's size history by it, so as-of
+ * NBLOCKS/EXISTS answers resolve against these events like page reads
+ * resolve against pd_lsns.  During replay the honest position is the replay
+ * pointer (insert position is not maintained then); otherwise the current
+ * insert position -- at/after the WAL record that caused the mutation (e.g.
+ * RelationTruncate inserts SMGR_TRUNCATE just before smgr_truncate runs).
+ */
+static uint64
+ls_op_lsn(void)
+{
+	if (RecoveryInProgress())
+		return (uint64) GetXLogReplayRecPtr(NULL);
+	return (uint64) GetXLogInsertRecPtr();
+}
+
+/*
  * Make the fork exist in the store (with zero blocks).  isRedo is set during
  * WAL replay, where re-creating an existing fork must be tolerated.
  */
@@ -447,6 +465,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedo ? 1 : 0;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -458,6 +477,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 	return ch->result != 0;
 }
@@ -475,6 +495,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -486,6 +507,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
 }
@@ -509,6 +531,7 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -632,6 +655,7 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->skip_fsync = skipFsync ? 1 : 0;
+	ch->req_lsn = ls_op_lsn();	/* zero pages carry no pd_lsn of their own */
 	ls_exec(ch);
 }
 
@@ -870,6 +894,34 @@ pagestore_localsvc_timeline(void)
 }
 
 /* The pinned read horizon (pagestore.read_lsn), 0 when this is a writer. */
+/*
+ * As-of size/existence queries for SQL-level tests: NBLOCKS/EXISTS with an
+ * explicit horizon instead of this backend's own pin.
+ */
+uint64
+pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan_for_key(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result;
+}
+
+int
+pagestore_localsvc_exists_asof(const PageStoreRelKey *key, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan_for_key(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_EXISTS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result != 0;
+}
+
 uint64
 pagestore_localsvc_read_lsn(void)
 {
