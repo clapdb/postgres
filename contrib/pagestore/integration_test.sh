@@ -1094,6 +1094,13 @@ assert "$($P -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "
 # pinned reader whatever the writer last flushed
 assert "$($P -c "SELECT count(*) FROM reader_unlogged;" 2>&1 | grep -c 'daemon reported error')" "1" \
 	"pinned reader refuses WAL-less (unlogged) relation reads"
+# CHECKPOINT would make the (exempt) checkpointer insert private WAL
+assert "$($P -c "CHECKPOINT;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses manual CHECKPOINT"
+# EXPLAIN ANALYZE CTAS executes the table creation behind the utility gate
+assert "$($P -c "EXPLAIN (ANALYZE) CREATE TABLE reader_ctas AS SELECT 1;" 2>&1 \
+		| grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses EXPLAIN ANALYZE CREATE TABLE AS"
 # prepared-transaction commands are read-only-legal but write XACT WAL in
 # critical sections; the utility gate must refuse them cleanly
 assert "$($P -c "COMMIT PREPARED 'nope';" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
