@@ -1133,14 +1133,30 @@ ls_pinned_executor_start(QueryDesc *queryDesc, int eflags)
 {
 	PlannedStmt *ps = queryDesc->plannedstmt;
 
-	if (queryDesc->operation != CMD_SELECT || ps->hasModifyingCTE)
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("data modification is not allowed on a pinned reader (pagestore.read_lsn)")));
-	if (ps->rowMarks != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("row locking is not allowed on a pinned reader (pagestore.read_lsn)")));
+	/* plan-only runs (plain EXPLAIN) execute nothing; upstream skips its
+	 * read-only checks for them too */
+	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+	{
+		if (queryDesc->operation != CMD_SELECT || ps->hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("data modification is not allowed on a pinned reader (pagestore.read_lsn)")));
+		if (ps->rowMarks != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("row locking is not allowed on a pinned reader (pagestore.read_lsn)")));
+
+		/*
+		 * A CMD_SELECT feeding an into-rel receiver is CREATE TABLE AS /
+		 * SELECT INTO in disguise (e.g. under EXPLAIN ANALYZE, where the
+		 * utility gate sees only T_ExplainStmt): it creates and fills a
+		 * table.  Refuse by destination, whatever the wrapping.
+		 */
+		if (queryDesc->dest && queryDesc->dest->mydest == DestIntoRel)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("CREATE TABLE AS is not allowed on a pinned reader (pagestore.read_lsn)")));
+	}
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -1191,6 +1207,30 @@ ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
 					break;
 				default:
 					break;
+			}
+			break;
+		case T_CheckPointStmt:
+			/*
+			 * ExecCheckpoint would wake the checkpointer with
+			 * CHECKPOINT_FORCE -- and the checkpointer is exactly the
+			 * process wal_insert_restricted must exempt, so a manual
+			 * CHECKPOINT would insert private WAL the pin exists to avoid.
+			 */
+			deny = "CHECKPOINT";
+			break;
+		case T_ExplainStmt:
+			/*
+			 * EXPLAIN ANALYZE of CREATE TABLE AS / SELECT INTO executes the
+			 * creation; the executor gate also refuses the into-rel
+			 * destination, but refuse the statement up front too.
+			 */
+			{
+				Query	   *q = castNode(Query,
+										 ((ExplainStmt *) pstmt->utilityStmt)->query);
+
+				if (q->commandType == CMD_UTILITY && q->utilityStmt &&
+					IsA(q->utilityStmt, CreateTableAsStmt))
+					deny = "EXPLAIN of CREATE TABLE AS / SELECT INTO";
 			}
 			break;
 		case T_NotifyStmt:

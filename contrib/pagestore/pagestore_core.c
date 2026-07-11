@@ -998,12 +998,16 @@ typedef struct WalRecHdr
  * unpinning, or a second writer on the timeline) trying to overwrite the
  * recorded one -- and are refused: later-chunks-win read semantics would
  * otherwise let the divergent copy silently rewrite history.  Returns -1 on
- * divergence or read failure, 0 with *fully_covered set otherwise.
+ * divergence or read failure; otherwise 0 with *covered_prefix set to the
+ * length of the already-covered prefix, and *prefix_only set when the
+ * coverage is exactly that prefix (no covered bytes beyond it) -- the shape
+ * a retry of a partially shipped chunk has, and the only shape the caller
+ * can trim to a clean uncovered suffix.
  */
 static int
 wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 				  const unsigned char *data, uint32_t len,
-				  int *fully_covered)
+				  uint32_t *covered_prefix, int *prefix_only)
 {
 	uint64_t	off = 0;
 	WalRecHdr	h;
@@ -1012,7 +1016,8 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 	unsigned char *mask = NULL;
 	uint32_t	covered = 0;
 
-	*fully_covered = 0;
+	*covered_prefix = 0;
+	*prefix_only = 1;
 	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
 		   h.magic == WAL_MAGIC)
 	{
@@ -1058,9 +1063,17 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 		}
 		off += sizeof(h) + h.len;
 	}
+	if (mask)
+	{
+		uint32_t	i = 0;
+
+		while (i < len && mask[i])
+			i++;
+		*covered_prefix = i;
+		*prefix_only = (covered == i);
+	}
 	free(tmp);
 	free(mask);
-	*fully_covered = (covered == len);
 	return 0;
 }
 
@@ -1076,17 +1089,33 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	/*
 	 * Appends normally land strictly at/after the shipped end; only a
 	 * re-ship (or a divergent history) reaches back below it, so the
-	 * byte-compare scan runs only then.  A fully covered identical re-ship
-	 * succeeds without appending a duplicate chunk.
+	 * byte-compare scan runs only then.  An identical re-ship is trimmed
+	 * to its uncovered suffix (fully covered = nothing to do), so no
+	 * duplicate chunk ever lands and the distinct-byte accounting the read
+	 * paths rely on stays exact.  Coverage that is not a clean prefix has
+	 * no trimmable shape; the contiguous log never produces it, so refuse
+	 * rather than distort the counts.
 	 */
 	if (len > 0 && start_lsn < wal_end_read(tl))
 	{
-		int			fully_covered;
+		uint32_t	covered_prefix;
+		int			prefix_only;
 
-		if (wal_overlap_check(tl, start_lsn, data, len, &fully_covered) != 0)
+		if (wal_overlap_check(tl, start_lsn, data, len,
+							  &covered_prefix, &prefix_only) != 0)
 			return -1;
-		if (fully_covered)
+		if (covered_prefix == len)
 			return 0;
+		if (!prefix_only)
+		{
+			fprintf(stderr, "pagestore: refusing WAL re-ship with non-prefix "
+					"overlap on timeline %u at %llu (+%u)\n",
+					tl, (unsigned long long) start_lsn, len);
+			return -1;
+		}
+		start_lsn += covered_prefix;
+		data += covered_prefix;
+		len -= covered_prefix;
 	}
 
 	timeline_mark_used(tl);

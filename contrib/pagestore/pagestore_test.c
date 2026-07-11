@@ -1102,6 +1102,32 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_wal_read(2, 2300, 300, rback) == 200,
 		  "a hole below the branch's own coverage is not double-counted");
 
+	/* a retry that carries an already-accepted prefix plus new bytes (a
+	 * partially shipped chunk re-sent whole) appends only the uncovered
+	 * suffix -- no duplicate chunk, exact distinct-byte counts */
+	{
+		unsigned char bufc[200];
+
+		memset(bufc, 0xCC, 100);
+		op_wal_append(0, 3000, bufc, 100);	/* fresh chunk [3000,3100) */
+		memset(bufc + 100, 0xDD, 100);		/* retry whole: CC prefix + DD tail */
+		check(op_wal_append_status(0, 3000, bufc, 200) == PS_STATUS_OK,
+			  "a partial re-ship with new suffix bytes is accepted");
+		check(op_wal_size(0) == 3200,
+			  "the suffix advances the end LSN");
+		memset(rback, 0, sizeof(rback));
+		check(op_wal_read(0, 3000, 200, rback) == 200,
+			  "the trimmed re-ship leaves exact distinct-byte counts");
+		ok = 1;
+		for (int i = 0; i < 100; i++)
+			if (rback[i] != 0xCC)
+				ok = 0;
+		for (int i = 100; i < 200; i++)
+			if (rback[i] != 0xDD)
+				ok = 0;
+		check(ok, "prefix bytes stay the originals; suffix bytes are the new ones");
+	}
+
 	/* WAL end LSNs survive a daemon restart (recovered from the logs) */
 	client_detach();
 	stop_daemon(dpid);
@@ -1109,7 +1135,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
-	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
+	check(op_wal_size(0) == 3200, "main WAL end LSN survives daemon restart");
 	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
 	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
 		  "shipped WAL also closes the idempotent re-create window (post-restart)");
