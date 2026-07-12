@@ -869,35 +869,61 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
 }
 
-void
+int
 fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		  uint64_t lsn)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 
 	/*
-	 * WAL-less growth (unlogged relations: pd_lsn 0) would sort below a
-	 * later create/truncate SET and be treated as covered, leaving the
-	 * newest size stuck at the SET's value however far the fork actually
-	 * grew.  Such content is not LSN-ordered to begin with: order it at
-	 * the definitive floor, where it is visible from that event onward.
-	 * The clamped position exists only here -- the segment record keeps
-	 * LSN 0 -- so it must be persisted like a zero-extend: at recovery
+	 * Growth below the fork's definitive floor cannot be ordered by its
+	 * page LSN: WAL-less pages (unlogged relations: pd_lsn 0) and copied
+	 * pages that keep an old source pd_lsn (skip-WAL relation rewrites
+	 * under wal_level = minimal) would sort below a later create/truncate
+	 * SET and be treated as covered, leaving the newest size stuck at the
+	 * SET's value however far the fork actually grew.  Order such growth
+	 * at the floor, where it is visible from that event onward.  The
+	 * clamped position exists only here -- the segment record keeps its
+	 * raw LSN -- so it must be persisted like a zero-extend: at recovery
 	 * the fully preloaded fork-meta log would otherwise supply a FUTURE
 	 * floor (a truncate/unlink that happened after this growth in live
 	 * order) and resurrect pre-truncate pages as post-truncate regrowth;
-	 * recover() therefore skips lsn-0 segment records outright and
-	 * relies on these persisted events for their placement.
+	 * recover() therefore never re-derives below-floor growth from raw
+	 * segment records and relies on these persisted events instead.
+	 * (Replayed nonzero pre-truncate history enters through
+	 * fork_grow_replay, not here.)
+	 *
+	 * The persist failure must reach the caller: append_page has already
+	 * durably written the page record, and acknowledging the write while
+	 * the size event is neither in memory nor recoverable would strand
+	 * the new blocks beyond NBLOCKS forever.
 	 */
-	if (lsn == 0)
+	if (lsn < e->last_def_lsn || lsn == 0)
 	{
 		lsn = e->last_def_lsn;
 		if (fork_size_asof_hop(e, lsn) < to_nblocks &&
 			fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
-			return;				/* not durable: do not apply in memory */
+			return -1;			/* not durable: do not apply in memory */
 	}
 
 	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
+	return 0;
+}
+
+/*
+ * Segment-log replay variant: insert the record's growth verbatim.  Raw
+ * nonzero LSNs below a definitive event are REAL pre-truncate history here
+ * (the meta log is fully preloaded, so the floor visible now can postdate
+ * the record's live order); they stay in place, covered by the later SET.
+ * LSN-0 records are skipped by the caller in the normal case -- their live
+ * clamped position was persisted -- except in legacy mode (see recover).
+ */
+static void
+fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+				 uint64_t lsn)
+{
+	fork_event_add(fork_get_or_create(timeline, key), lsn, to_nblocks,
+				   FEV_GROW);
 }
 
 /* --- timeline metadata + read-through --- */
@@ -1153,6 +1179,8 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
  * whatever is known at insert time, so at worst a subsumed GROW is kept, not
  * dropped).  Invalid records are skipped, mirroring load_timelines().
  */
+static int fork_meta_legacy = 0;	/* absent/empty fork-meta log at startup */
+
 static void
 load_fork_meta(void)
 {
@@ -1171,6 +1199,7 @@ load_fork_meta(void)
 					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
 		off += sizeof(rec);
 	}
+	fork_meta_legacy = (off == 0);
 }
 
 static void
@@ -1730,9 +1759,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * block is readable as of a horizon iff it has a version at/below it,
 	 * so keying the GROW event by hdr.lsn makes as-of NBLOCKS agree with
 	 * as-of page reads block for block.  (This replaces the callers'
-	 * former one-shot fork_grow after a batch.)
+	 * former one-shot fork_grow after a batch.)  A failure here is a
+	 * failed durable size event for below-floor growth: the page record
+	 * is already in the segment log (a retry lands an identical
+	 * later-wins version -- harmless), but the write must not be
+	 * acknowledged without its size metadata.
 	 */
-	fork_grow(timeline, key, block + 1, hdr.lsn);
+	if (fork_grow(timeline, key, block + 1, hdr.lsn) != 0)
+		return -1;
 	return 0;
 }
 
@@ -2064,9 +2098,14 @@ recover(uint32_t shard)
 							 shard, id, off + sizeof(hdr));
 			/* lsn-0 (WAL-less) growth replays from the fork-meta log,
 			 * where its live clamped position was persisted; the raw
-			 * record cannot be ordered against definitive events here */
-			if (hdr.lsn != 0)
-				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1, hdr.lsn);
+			 * record cannot be ordered against definitive events here.
+			 * Legacy stores (an absent/empty fork-meta log, from before
+			 * events were persisted) have no definitive events to
+			 * misorder against, so their lsn-0 growth applies verbatim --
+			 * otherwise their unlogged forks would come back empty. */
+			if (hdr.lsn != 0 || fork_meta_legacy)
+				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+								 hdr.lsn);
 			off += sizeof(hdr) + hdr.len;
 		}
 
@@ -2195,8 +2234,8 @@ ps_handle_meta(PsChannel *ch)
 				if (fork_size_asof_hop(e, lsn) < to &&
 					fork_meta_persist(tl, &ch->key, lsn, to, FEV_GROW) != 0)
 					ch->status = PS_STATUS_ERROR;
-				else
-					fork_grow(tl, &ch->key, to, lsn);
+				else if (fork_grow(tl, &ch->key, to, lsn) != 0)
+					ch->status = PS_STATUS_ERROR;
 			}
 			break;
 
