@@ -34,6 +34,7 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
@@ -420,6 +421,14 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	ch->key.forkNum = key->forkNum;
 	ch->key.klass = PS_KLASS_RELATION;	/* the smgr shim only stores relation pages */
 	ch->timeline = (uint32) localsvc_timeline;	/* this backend's timeline */
+
+	/*
+	 * Channels are reused across op kinds and req_lsn now has meaning for
+	 * every metadata op (an event LSN for mutations, an as-of horizon for
+	 * queries).  Clear it here so no sender inherits a stale value; ops
+	 * that need one assign it after this call.
+	 */
+	ch->req_lsn = 0;
 }
 
 /*
@@ -430,6 +439,39 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * PageStoreBackend interface in pagestore_backend.h for the exact contract of
  * each operation.
  */
+
+/*
+ * WAL-position stamp for a fork-mutating op (create/truncate/unlink).  The
+ * daemon keys the fork's size history by it, so as-of NBLOCKS/EXISTS answers
+ * resolve against these events like page reads resolve against pd_lsns.
+ *
+ * Normal operation stamps XactLastRecEnd: the end of the WAL record THIS
+ * backend just inserted, which for every caller is the record of the
+ * mutation itself -- log_smgrcreate before smgrcreate (core orders WAL
+ * before action), SMGR_TRUNCATE just before smgr_truncate, the commit
+ * record just before post-commit unlinks.  The global insert pointer would
+ * over-stamp: unrelated concurrent inserts push it past the mutation
+ * record, and a horizon between the two would miss the mutation.  During
+ * replay the honest position is the END of the record being replayed
+ * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
+ * rm_redo returns, i.e. it names the PREVIOUS record).
+ *
+ * Post-commit unlinks are the subtle case: smgrDoPendingDeletes(true) runs
+ * after RecordTransactionCommit(), which RESETS XactLastRecEnd -- but it
+ * leaves the commit record's end in XactLastCommitEnd, and that commit
+ * record IS the drop's mutation record (a horizon below it must still see
+ * the fork).  WAL-less mutations (unlogged relations) can leave both at
+ * older records; their content is not LSN-ordered to begin with.
+ */
+static uint64
+ls_op_lsn(void)
+{
+	if (RecoveryInProgress())
+		return (uint64) GetCurrentReplayRecPtr(NULL);
+	if (XactLastRecEnd != 0)
+		return (uint64) XactLastRecEnd;
+	return (uint64) XactLastCommitEnd;
+}
 
 /*
  * Make the fork exist in the store (with zero blocks).  isRedo is set during
@@ -447,6 +489,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedo ? 1 : 0;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -458,6 +501,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 	return ch->result != 0;
 }
@@ -475,6 +519,7 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -486,6 +531,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
 }
@@ -509,6 +555,7 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
+	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
 
@@ -632,6 +679,13 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->skip_fsync = skipFsync ? 1 : 0;
+	/*
+	 * Zero-extends have no WAL record of their own (the extension is
+	 * implied by later content); the insert position is the best honest
+	 * upper bound, and never-written blocks read as zeros either way.
+	 */
+	ch->req_lsn = RecoveryInProgress() ?
+		(uint64) GetCurrentReplayRecPtr(NULL) : (uint64) GetXLogInsertRecPtr();
 	ls_exec(ch);
 }
 
@@ -870,6 +924,34 @@ pagestore_localsvc_timeline(void)
 }
 
 /* The pinned read horizon (pagestore.read_lsn), 0 when this is a writer. */
+/*
+ * As-of size/existence queries for SQL-level tests: NBLOCKS/EXISTS with an
+ * explicit horizon instead of this backend's own pin.
+ */
+uint64
+pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan_for_key(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result;
+}
+
+int
+pagestore_localsvc_exists_asof(const PageStoreRelKey *key, uint64 lsn)
+{
+	PsChannel  *ch = ls_chan_for_key(key);
+
+	ls_fill_key(ch, key);
+	ch->opcode = PS_OP_EXISTS;
+	ch->req_lsn = lsn;
+	ls_exec(ch);
+	return ch->result != 0;
+}
+
 uint64
 pagestore_localsvc_read_lsn(void)
 {

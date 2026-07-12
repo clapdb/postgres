@@ -508,12 +508,36 @@ typedef struct PageEnt
 } PageEnt;
 
 /* Hash entry: the block count of one fork on one timeline. */
+/*
+ * Fork-size history event.  GROW events come from page appends (the block's
+ * pd_lsn -- exact: a block is readable as of a horizon iff it has a version
+ * at/below it) and zero-extends (the backend's stamped WAL position); SET
+ * events from create (0) and truncate (the new size); DEAD from unlink.
+ * SET/DEAD are definitive: they end an as-of resolution at their timeline
+ * hop, where plain growth still combines with ancestor sizes (a branch that
+ * wrote only some blocks inherits the rest by read-through).
+ */
+typedef struct ForkEvent
+{
+	uint64_t	lsn;
+	uint32_t	nblocks;
+	uint8_t		kind;
+} ForkEvent;
+
+#define FEV_GROW	0
+#define FEV_SET		1
+#define FEV_DEAD	2
+
 typedef struct ForkEnt
 {
 	struct ForkEnt *next;		/* bucket chain */
 	uint32_t	timeline;
 	PsKey		key;
-	uint32_t	nblocks;
+	uint32_t	nblocks;		/* newest size (cache of the event history) */
+	ForkEvent  *ev;				/* lsn-ordered size history */
+	uint32_t	nev;
+	uint32_t	evcap;
+	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 } ForkEnt;
 
 /*
@@ -686,6 +710,9 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 
 /* --- fork size index (keyed by timeline, key) --- */
 
+static int fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
+							 uint32_t nblocks, uint8_t kind);
+
 static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
 {
@@ -719,34 +746,158 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 	return e;
 }
 
+/*
+ * Resolve one timeline hop's contribution to an as-of size/existence query.
+ * Scans the event history newest-first below the cap: the newest SET/DEAD is
+ * definitive for this hop (with any GROW above it still counted -- writes to
+ * a dead or truncated fork re-extend it); bare GROWs are a lower bound that
+ * still combines with ancestor hops.
+ */
+#define FORK_HOP_NONE	0		/* no events at/below the cap */
+#define FORK_HOP_GROW	1		/* growth only: combine with ancestors */
+#define FORK_HOP_DEF	2		/* definitive size (SET, or DEAD then regrown) */
+#define FORK_HOP_DEAD	3		/* definitively unlinked at the cap */
+
+static int
+fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
+{
+	uint32_t	grow = 0;
+	int			have_grow = 0;
+
+	*nb_out = 0;
+	for (int i = (int) e->nev - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[i];
+
+		if (v->lsn > cap)
+			continue;
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > grow)
+				grow = v->nblocks;
+			have_grow = 1;
+			continue;
+		}
+		if (v->kind == FEV_DEAD)
+		{
+			if (!have_grow)
+				return FORK_HOP_DEAD;
+			*nb_out = grow;
+			return FORK_HOP_DEF;
+		}
+		/* FEV_SET */
+		*nb_out = v->nblocks > grow ? v->nblocks : grow;
+		return FORK_HOP_DEF;
+	}
+	if (have_grow)
+	{
+		*nb_out = grow;
+		return FORK_HOP_GROW;
+	}
+	return FORK_HOP_NONE;
+}
+
+/* Size of e as of cap, hop-local (for the GROW-dedup below). */
+static uint32_t
+fork_size_asof_hop(const ForkEnt *e, uint64_t cap)
+{
+	uint32_t	nb;
+
+	(void) fork_asof_hop(e, cap, &nb);
+	return nb;
+}
+
+/*
+ * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
+ * arrival order, so a later definitive event at the same LSN wins a
+ * newest-first scan).  GROW events that do not raise the size visible at
+ * their own LSN are dropped: steady-state rewrites of existing blocks at ever
+ * newer pd_lsns add nothing, so the history stays O(distinct sizes).
+ */
+static void
+fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
+{
+	uint32_t	i;
+
+	if (kind == FEV_GROW && fork_size_asof_hop(e, lsn) >= nblocks)
+		return;
+	if (kind != FEV_GROW && lsn > e->last_def_lsn)
+		e->last_def_lsn = lsn;
+	if (e->nev == e->evcap)
+	{
+		e->evcap = e->evcap ? e->evcap * 2 : 4;
+		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
+	}
+	i = e->nev;
+	while (i > 0 && e->ev[i - 1].lsn > lsn)
+	{
+		e->ev[i] = e->ev[i - 1];
+		i--;
+	}
+	e->ev[i].lsn = lsn;
+	e->ev[i].nblocks = nblocks;
+	e->ev[i].kind = kind;
+	e->nev++;
+
+	/*
+	 * Maintain the newest-size scalar.  A tail insert governs directly.  A
+	 * non-tail insert (an out-of-order page flush, or segment replay behind
+	 * the pre-loaded fork-meta log) only matters if no definitive event lies
+	 * above it: a GROW then raises the newest size; a non-tail SET/DEAD is
+	 * not produced by any live path (mutations stamp at/after the newest
+	 * event), so just recompute -- rare, correctness first.
+	 */
+	if (i == e->nev - 1)
+	{
+		if (kind == FEV_GROW)
+		{
+			if (nblocks > e->nblocks)
+				e->nblocks = nblocks;
+		}
+		else
+			e->nblocks = (kind == FEV_SET) ? nblocks : 0;
+	}
+	else if (kind == FEV_GROW)
+	{
+		for (uint32_t j = e->nev - 1; j > i; j--)
+			if (e->ev[j].kind != FEV_GROW)
+				return;			/* covered by a newer definitive event */
+		if (nblocks > e->nblocks)
+			e->nblocks = nblocks;
+	}
+	else
+		e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+}
+
 void
-fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks)
+fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+		  uint64_t lsn)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 
-	if (to_nblocks > e->nblocks)
-		e->nblocks = to_nblocks;
-}
-
-static void
-fork_remove(uint32_t timeline, const PsKey *key)
-{
-	uint32_t	h = fnv(key, sizeof(*key)) ^ (timeline * 40503u);
-	Shard	   *s = shard_for(key);
-	ForkEnt   **pp = &s->fork_idx[h & IDX_MASK];
-
-	while (*pp)
+	/*
+	 * WAL-less growth (unlogged relations: pd_lsn 0) would sort below a
+	 * later create/truncate SET and be treated as covered, leaving the
+	 * newest size stuck at the SET's value however far the fork actually
+	 * grew.  Such content is not LSN-ordered to begin with: order it at
+	 * the definitive floor, where it is visible from that event onward.
+	 * The clamped position exists only here -- the segment record keeps
+	 * LSN 0 -- so it must be persisted like a zero-extend: at recovery
+	 * the fully preloaded fork-meta log would otherwise supply a FUTURE
+	 * floor (a truncate/unlink that happened after this growth in live
+	 * order) and resurrect pre-truncate pages as post-truncate regrowth;
+	 * recover() therefore skips lsn-0 segment records outright and
+	 * relies on these persisted events for their placement.
+	 */
+	if (lsn == 0)
 	{
-		if ((*pp)->timeline == timeline && key_eq(&(*pp)->key, key))
-		{
-			ForkEnt    *dead = *pp;
-
-			*pp = dead->next;
-			free(dead);
-			return;
-		}
-		pp = &(*pp)->next;
+		lsn = e->last_def_lsn;
+		if (fork_size_asof_hop(e, lsn) < to_nblocks &&
+			fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
+			return;				/* not durable: do not apply in memory */
 	}
+
+	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
 }
 
 /* --- timeline metadata + read-through --- */
@@ -884,43 +1035,62 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 }
 
 /*
- * Fork size visible on 'timeline': the maximum block count across the timeline
- * and all its ancestors.  A branch that has written only some blocks of a fork
- * still inherits the parent's full size (the unwritten blocks are served by
- * read_through), so we must take the max rather than the first entry found --
- * otherwise the branch would under-report the size and reads of inherited
- * blocks would look out of range.
- *
- * (Prototype limitation: nblocks is not itself versioned, so if the parent
- * *grows* a fork after the branch point the branch sees the larger size; for a
- * quiescent parent -- the usual branch case -- this is correct.)
+ * Fork size visible on 'timeline' as of read_lsn (UINT64_MAX = newest): walk
+ * the ancestry, capping the horizon at each branch point exactly like page
+ * reads do, and resolve each hop against its size history.  A definitive hop
+ * (truncate/create/unlink) ends the walk -- a branch that truncated must not
+ * re-inherit the parent's larger size; bare growth combines by max, because a
+ * branch that wrote only some blocks inherits the rest by read-through.  The
+ * per-hop horizon capping also fixes the old unversioned behavior where a
+ * parent growing a fork after the branch point leaked the larger size into
+ * the branch.
  */
 static uint32_t
-fork_nblocks_through(uint32_t timeline, const PsKey *key)
+fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 {
 	uint32_t	maxnb = 0;
-	TlWalk		w = tl_walk_first(timeline, 0);	/* size walk: lsn unused */
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
 	do
 	{
 		ForkEnt    *e = fork_find(w.tl, key);
 
-		if (e && e->nblocks > maxnb)
-			maxnb = e->nblocks;
+		if (e)
+		{
+			uint32_t	nb;
+			int			r = fork_asof_hop(e, w.lsn, &nb);
+
+			if (r == FORK_HOP_DEAD)
+				return maxnb;
+			if (r == FORK_HOP_DEF)
+				return nb > maxnb ? nb : maxnb;
+			if (r == FORK_HOP_GROW && nb > maxnb)
+				maxnb = nb;
+		}
 	} while (tl_walk_next(&w));
 	return maxnb;
 }
 
-/* Does the fork exist on 'timeline' or any ancestor? */
+/* Does the fork exist on 'timeline' or any ancestor, as of read_lsn? */
 static int
-fork_exists_through(uint32_t timeline, const PsKey *key)
+fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 {
-	TlWalk		w = tl_walk_first(timeline, 0);	/* existence walk: lsn unused */
+	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
 	do
 	{
-		if (fork_find(w.tl, key))
-			return 1;
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e)
+		{
+			uint32_t	nb;
+			int			r = fork_asof_hop(e, w.lsn, &nb);
+
+			if (r == FORK_HOP_DEAD)
+				return 0;
+			if (r != FORK_HOP_NONE)
+				return 1;
+		}
 	} while (tl_walk_next(&w));
 	return 0;
 }
@@ -943,6 +1113,64 @@ timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
 
 	return ps_storage->meta_append(&rec, sizeof(rec));
+}
+
+/*
+ * Fork-size events the segment log cannot reproduce -- create, truncate,
+ * unlink, zero-extend -- are persisted here (the segment records themselves
+ * re-derive every page-append GROW on recovery).  Same fixed-record
+ * append-only discipline as the timeline log.
+ */
+typedef struct ForkMetaRec
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint32_t	nblocks;
+	uint8_t		kind;
+	uint8_t		pad[3];
+} ForkMetaRec;
+
+static int
+fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
+				  uint32_t nblocks, uint8_t kind)
+{
+	ForkMetaRec rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.timeline = timeline;
+	rec.key = *key;
+	rec.lsn = lsn;
+	rec.nblocks = nblocks;
+	rec.kind = kind;
+	return ps_storage->fork_meta_append(&rec, sizeof(rec));
+}
+
+/*
+ * Replay the fork-meta log.  Runs after the segment scan, so page-append
+ * growth is already in each fork's history; event insertion is
+ * order-independent (lsn-sorted insert, and the GROW dedup compares against
+ * whatever is known at insert time, so at worst a subsumed GROW is kept, not
+ * dropped).  Invalid records are skipped, mirroring load_timelines().
+ */
+static void
+load_fork_meta(void)
+{
+	ForkMetaRec rec;
+	uint64_t	off = 0;
+
+	while (ps_storage->fork_meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
+	{
+		if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
+		{
+			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
+						   rec.lsn, rec.nblocks, rec.kind);
+		}
+		else
+			fprintf(stderr, "pagestore: skipping invalid fork-meta record "
+					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
+		off += sizeof(rec);
+	}
 }
 
 static void
@@ -1496,6 +1724,15 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			ps_unlock_map();
 		}
 	}
+
+	/*
+	 * Grow the fork's size history with this page's exact version LSN: a
+	 * block is readable as of a horizon iff it has a version at/below it,
+	 * so keying the GROW event by hdr.lsn makes as-of NBLOCKS agree with
+	 * as-of page reads block for block.  (This replaces the callers'
+	 * former one-shot fork_grow after a batch.)
+	 */
+	fork_grow(timeline, key, block + 1, hdr.lsn);
 	return 0;
 }
 
@@ -1753,10 +1990,10 @@ done:
  * order.  Each record is self-describing, so replaying append_page's effect
  * (page_add_version + fork_grow) for every record reconstructs both indexes and
  * leaves the append cursor positioned just past the last valid record.
- *
- * Caveat (prototype): TRUNCATE and UNLINK are not logged as records, so their
- * effects are not reproduced on restart.  Also a partial/torn trailing record
- * is simply treated as end-of-log (the magic/len check below stops the scan).
+ * CREATE/TRUNCATE/UNLINK and zero-extends leave no segment records; their
+ * size events replay from the fork-meta log afterwards (load_fork_meta).
+ * A partial/torn trailing record is simply treated as end-of-log (the
+ * magic/len check below stops the scan).
  */
 /*
  * Scan a shard's segment log and rebuild its version index, leaving the append
@@ -1825,7 +2062,11 @@ recover(uint32_t shard)
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
 							 shard, id, off + sizeof(hdr));
-			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1);
+			/* lsn-0 (WAL-less) growth replays from the fork-meta log,
+			 * where its live clamped position was persisted; the raw
+			 * record cannot be ordered against definitive events here */
+			if (hdr.lsn != 0)
+				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1, hdr.lsn);
 			off += sizeof(hdr) + hdr.len;
 		}
 
@@ -1846,6 +2087,21 @@ recover(uint32_t shard)
  * for the frontend to handle (synchronously for POSIX, async for SPDK).  The
  * frontend sets ch->status = OK and ch->result = 0 before calling.
  */
+/*
+ * Event LSN for a fork-mutating op.  The backend stamps req_lsn with its WAL
+ * position; a legacy/test caller sending 0 gets the fork's newest known event
+ * LSN, so the mutation orders after everything already recorded (visible to
+ * newest reads, invisible to strictly older horizons -- fail-safe for
+ * unstamped callers).
+ */
+static uint64_t
+fork_op_lsn(const ForkEnt *e, uint64_t req_lsn)
+{
+	if (req_lsn != 0)
+		return req_lsn;
+	return e->nev ? e->ev[e->nev - 1].lsn + 1 : 1;
+}
+
 int
 ps_handle_meta(PsChannel *ch)
 {
@@ -1854,28 +2110,94 @@ ps_handle_meta(PsChannel *ch)
 	switch ((PsOpcode) ch->opcode)
 	{
 		case PS_OP_CREATE:
-			fork_get_or_create(tl, &ch->key);
+			/*
+			 * Definitive existence from ch->req_lsn on (the backend stamps
+			 * its WAL position; see fork_op_lsn for a legacy 0).  Re-creating
+			 * a fork that already exists at that horizon is an idempotent
+			 * retry or a redo replay: record nothing, so the event history
+			 * is not polluted and no walk gets cut short by a stray SET 0.
+			 */
+			{
+				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
+				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint32_t	nb;
+				int			r = fork_asof_hop(e, lsn, &nb);
+
+				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
+				{
+					if (fork_meta_persist(tl, &ch->key, lsn, 0, FEV_SET) != 0)
+						ch->status = PS_STATUS_ERROR;
+					else
+						fork_event_add(e, lsn, 0, FEV_SET);
+				}
+			}
 			break;
 
 		case PS_OP_EXISTS:
-			ch->result = fork_exists_through(tl, &ch->key) ? 1 : 0;
+			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			ch->result = fork_exists_through(tl, &ch->key,
+											 ch->req_lsn ? ch->req_lsn : UINT64_MAX) ? 1 : 0;
 			break;
 
 		case PS_OP_UNLINK:
-			fork_remove(tl, &ch->key);
+			/*
+			 * COW unlink: a durable DEAD event.  The entry and its history
+			 * stay -- an as-of read below the unlink LSN must still see the
+			 * fork -- so nothing is freed here.
+			 */
+			{
+				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
+				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+
+				if (fork_meta_persist(tl, &ch->key, lsn, 0, FEV_DEAD) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					fork_event_add(e, lsn, 0, FEV_DEAD);
+			}
 			break;
 
 		case PS_OP_NBLOCKS:
-			ch->result = fork_nblocks_through(tl, &ch->key);
+			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			ch->result = fork_nblocks_through(tl, &ch->key,
+											  ch->req_lsn ? ch->req_lsn : UINT64_MAX);
 			break;
 
 		case PS_OP_TRUNCATE:
-			fork_get_or_create(tl, &ch->key)->nblocks = ch->nblocks;
+			/*
+			 * COW truncate: a durable SET event at the backend's stamped WAL
+			 * position.  Historical versions of the trimmed blocks stay in
+			 * the log; as-of reads below the truncate LSN still see the old
+			 * size, at/above it the new one.
+			 */
+			{
+				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
+				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+
+				if (fork_meta_persist(tl, &ch->key, lsn, ch->nblocks, FEV_SET) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					fork_event_add(e, lsn, ch->nblocks, FEV_SET);
+			}
 			break;
 
 		case PS_OP_ZEROEXTEND:
-			/* allocation only: grow size, no page data stored (reads -> 0) */
-			fork_grow(tl, &ch->key, ch->blocknum + ch->nblocks);
+			/*
+			 * Allocation only: grow size, no page data stored (reads -> 0).
+			 * The segment log has no record of it, so the GROW event must be
+			 * persisted -- but only when it actually raises the size at its
+			 * horizon, keeping the log as sparse as the in-memory dedup.
+			 */
+			{
+				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
+				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint32_t	to = ch->blocknum + ch->nblocks;
+
+				if (fork_size_asof_hop(e, lsn) < to &&
+					fork_meta_persist(tl, &ch->key, lsn, to, FEV_GROW) != 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					fork_grow(tl, &ch->key, to, lsn);
+			}
 			break;
 
 		case PS_OP_CREATE_BRANCH:
@@ -2202,6 +2524,16 @@ ps_core_open(const char *store_dir)
 	 * keyed only by LSN could not.  Image layers are still loaded into the layer
 	 * map (for compaction/GC) but are not used to rebuild the read index here.
 	 */
+	/*
+	 * Definitive fork-size events (create/truncate/unlink/zero-extend) load
+	 * BEFORE the segment scan: the GROW dedup in fork_event_add compares a
+	 * grow against the size visible at its own LSN, and with the definitive
+	 * events already in place the segment replay makes exactly the decisions
+	 * the live path made (a regrow after a truncate must be kept even when
+	 * it does not exceed the pre-truncate envelope).
+	 */
+	load_fork_meta();
+
 	for (uint32_t sh = 0; sh < ns; sh++)
 		recover(sh);
 

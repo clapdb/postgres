@@ -1122,6 +1122,43 @@ assert "$($P -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reade
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 
+# --- 32. as-of fork metadata: NBLOCKS/EXISTS resolve at a horizon ------------
+# The store versions fork sizes (page-append growth at each block's pd_lsn,
+# LSN-stamped truncate/create/unlink events), so a pinned reader's smgr
+# NBLOCKS/EXISTS answer as of R instead of leaking writer-side truncates and
+# drops into the frozen view.
+$P -c "CREATE FUNCTION pagestore_rel_nblocks_asof(regclass, int, pg_lsn) RETURNS int8
+        AS 'pagestore','pagestore_rel_nblocks_asof' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_rel_exists_asof(regclass, int, pg_lsn) RETURNS bool
+        AS 'pagestore','pagestore_rel_exists_asof' LANGUAGE C STRICT;" >/dev/null
+preCREATE=$($P -c "SELECT pg_current_wal_lsn();")
+$P -c "CREATE TABLE asof_t(id int, filler text) TABLESPACE ts;" >/dev/null
+$P -q -c "INSERT INTO asof_t SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+asofR=$($P -c "SELECT pg_current_wal_lsn();")
+szR=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn);")
+assert "$($P -c "SELECT pagestore_rel_exists_asof('asof_t', 0, '$preCREATE'::pg_lsn);")" "f" \
+	"the fork does not exist at a horizon below its creation"
+assert "$($P -c "SELECT $szR > 10;")" "t" "the shipped table has a real page count at R"
+$P -q -c "DELETE FROM asof_t WHERE id > 10;" >/dev/null
+$P -c "VACUUM asof_t;" >/dev/null	# trims trailing pages: an LSN-stamped store truncate
+$P -c "CHECKPOINT;" >/dev/null
+szNow=$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, pg_current_wal_lsn());")
+assert "$($P -c "SELECT $szNow < $szR;")" "t" "the newest horizon sees the vacuum-truncated size"
+assert "$szNow" "1" \
+	"the newest as-of size is the vacuum-truncated one page (rows 1-10 live in block 0)"
+assert "$($P -c "SELECT count(*) FROM asof_t;")" "10" \
+	"the truncated table still serves its surviving rows"
+assert "$($P -c "SELECT pagestore_rel_nblocks_asof('asof_t', 0, '$asofR'::pg_lsn);")" "$szR" \
+	"the pre-truncate horizon still sees the pre-truncate size (frozen view)"
+# WAL-less (unlogged) pages carry pd_lsn 0; their growth must order at the
+# create event's floor, not sort under it and leave the fork looking empty
+$P -c "CREATE UNLOGGED TABLE unlogged_t(i int) TABLESPACE ts;" >/dev/null
+$P -q -c "INSERT INTO unlogged_t SELECT generate_series(1, 100);" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT pagestore_rel_nblocks_asof('unlogged_t', 0, pg_current_wal_lsn()) > 0;")" "t" \
+	"an unlogged table's WAL-less growth raises the store's newest size"
+
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
 exit $fail

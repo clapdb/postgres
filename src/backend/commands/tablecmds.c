@@ -17432,16 +17432,16 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 	{
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
-			smgrcreate(dstrel, forkNum, false);
-
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
-			 * init fork of an unlogged relation.
+			 * init fork of an unlogged relation -- before creating the
+			 * storage; see RelationCreateStorage.
 			 */
 			if (RelationIsPermanent(rel) ||
 				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
 				 forkNum == INIT_FORKNUM))
 				log_smgrcreate(&newrlocator, forkNum);
+			smgrcreate(dstrel, forkNum, false);
 			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
 								rel->rd_rel->relpersistence);
 		}

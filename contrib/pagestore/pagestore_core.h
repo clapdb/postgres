@@ -87,7 +87,8 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver);
-extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks);
+extern void fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+					  uint64_t lsn);
 
 /*
  * Concurrency locks (defined in pagestore_core.c).  A per-shard rwlock guards
