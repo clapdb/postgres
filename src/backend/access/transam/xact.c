@@ -81,6 +81,13 @@ int			DefaultXactIsoLevel = XACT_READ_COMMITTED;
 int			XactIsoLevel = XACT_READ_COMMITTED;
 
 bool		DefaultXactReadOnly = false;
+
+/*
+ * When set (by extension code in the postmaster, before backends fork),
+ * every transaction is read-only and no session can lift it -- the GUC
+ * check hooks refuse read-write mode the same way they do during recovery.
+ */
+bool		transaction_read_only_forced = false;
 bool		XactReadOnly;
 
 bool		DefaultXactDeferrable = false;
@@ -2169,7 +2176,7 @@ StartTransaction(void)
 	else
 	{
 		s->startedInRecovery = false;
-		XactReadOnly = DefaultXactReadOnly;
+		XactReadOnly = DefaultXactReadOnly || transaction_read_only_forced;
 	}
 	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;

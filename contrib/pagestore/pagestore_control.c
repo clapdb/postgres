@@ -474,6 +474,19 @@ pagestore_control_mirror_init(bool localsvc_active)
 	else
 		ps_control_mirror_enabled = localsvc_active;
 
+	/*
+	 * A pinned reader's control state is a restored copy of the writer's;
+	 * publishing it back (or anything else) is refused at the localsvc
+	 * layer, and the mirror's drains are not built to see those ERRORs.
+	 * Disable mirroring wholesale in this mode.
+	 */
+	if (localsvc_active && pagestore_localsvc_read_lsn() != 0)
+	{
+		ereport(LOG,
+				(errmsg("pagestore: pg_control mirroring disabled on a pinned reader (pagestore.read_lsn)")));
+		ps_control_mirror_enabled = false;
+	}
+
 	prev_control_file_write_hook = control_file_write_hook;
 	control_file_write_hook = ps_control_write_hook;
 	prev_control_file_flush_hook = control_file_flush_hook;

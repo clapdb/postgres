@@ -284,6 +284,10 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 	if (RecoveryInProgress())
 		return;
 
+	/* Same for a compute that must not generate page-content WAL. */
+	if (page_maintenance_suppressed)
+		return;
+
 	/*
 	 * First check whether there's any chance there's something to prune,
 	 * determining the appropriate horizon is a waste if there's no prune_xid

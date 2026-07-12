@@ -217,13 +217,24 @@ begin(uint32_t i, PsChannel *ch)
 				{
 					unsigned char *dst = ch->data + (size_t) b * page_size;
 					uint32_t	blk = ch->blocknum + b;
-					PageVer    *v = read_through(tl, &ch->key, blk, UINT64_MAX);
+					/* req_lsn nonzero = a pinned reader's horizon cap;
+					 * 0 keeps the newest (writer) semantics */
+					PageVer    *v = read_through(tl, &ch->key, blk,
+												 ch->req_lsn ? ch->req_lsn
+												 : UINT64_MAX);
 					BlkCtx	   *bc;
 
 					if (!v)
 					{
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 						continue;
+					}
+					if (ch->req_lsn != 0 && v->lsn == 0)
+					{
+						/* WAL-less content is not as-of-resolvable; see the
+						 * POSIX daemon's capped-read refusal */
+						ch->status = PS_STATUS_ERROR;
+						break;
 					}
 					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
 						continue;	/* RAM hit -> no device read */

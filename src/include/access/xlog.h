@@ -260,6 +260,13 @@ typedef void (*control_file_write_hook_type) (const struct ControlFileData *cont
 extern PGDLLIMPORT control_file_write_hook_type control_file_write_hook;
 
 /*
+ * When set (by extension code in the postmaster, before backends fork),
+ * only WAL-essential auxiliary processes may insert WAL records; see
+ * XLogInsertAllowed().
+ */
+extern PGDLLIMPORT bool wal_insert_restricted;
+
+/*
  * Post-critical ship point paired with control_file_write_hook: invoked at
  * the first point outside a critical section that wrote pg_control, so a
  * mirror can ship what it could only queue inside the section.

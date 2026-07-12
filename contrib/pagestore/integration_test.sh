@@ -46,11 +46,14 @@ assert() {  # $1=actual $2=expected $3=message
 	fi
 }
 
+# KEEPTMP=1 keeps the data/store directories for post-mortem debugging
+# (servers and daemon are still stopped).
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	[ -n "${KEEPTMP:-}" ] && { echo "KEEPTMP: DATA=$DATA STORE=$STORE"; return 0; }
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}"
@@ -1048,6 +1051,76 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', '$TOMB_BEFORE':
 $P -c "SELECT pagestore_slru_mirror_truncate('pg_xact', 3);" >/dev/null
 assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_lsn());")" "3" \
 	"a later truncation supersedes the tombstone cutoff"
+
+# --- 31. pinned reader: a compute serves its timeline history at a frozen LSN --------
+# READ_CONSISTENCY_DESIGN.md increment 1: pagestore.read_lsn caps every store
+# relation read at R (the redo of a durably mirrored checkpoint -- complete by
+# construction) and refuses store mutations.  History stays frozen: an update
+# checkpointed after R must not be visible to the pinned compute.
+$P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
+       INSERT INTO reader_t VALUES (1, 'v1');
+       CREATE SEQUENCE reader_seq;
+       CREATE UNLOGGED TABLE reader_unlogged(i int) TABLESPACE ts;
+       INSERT INTO reader_unlogged VALUES (1), (2);" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+readerR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();")
+$P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+echo "pagestore.read_lsn = '$readerR'" >> "$DATA/postgresql.conf"
+# a pinned reader refuses to start with archiving configured: its WAL must
+# never become shippable
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
+assert "$pin_arch_started" "0" "pinned start with archive_mode = on is refused"
+echo "archive_mode = off" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
+	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
+assert "$($P -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses writes"
+# the read-only default is advisory on a normal server; on a pinned reader the
+# escape itself is refused (transaction_read_only_forced, the recovery model)
+assert "$($P -c "BEGIN; SET TRANSACTION READ WRITE; UPDATE reader_t SET v = 'v3' WHERE id = 1; COMMIT;" 2>&1 \
+		| grep -c 'cannot set transaction read-write mode on a read-only instance')" "1" \
+	"pinned reader refuses SET TRANSACTION READ WRITE outright"
+# write-capable SELECTs and DDL hold against the forced read-only state
+assert "$($P -c "SELECT nextval('reader_seq');" 2>&1 | grep -c 'read-only')" "1" \
+	"pinned reader refuses nextval() (side-effecting SELECT)"
+assert "$($P -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "1" \
+	"pinned reader refuses DDL"
+# WAL-less (unlogged) pages carry version LSN 0: a capped read cannot honestly
+# serve them as-of anything, so the daemon fails closed instead of handing the
+# pinned reader whatever the writer last flushed
+assert "$($P -c "SELECT count(*) FROM reader_unlogged;" 2>&1 | grep -c 'daemon reported error')" "1" \
+	"pinned reader refuses WAL-less (unlogged) relation reads"
+# CHECKPOINT would make the (exempt) checkpointer insert private WAL
+assert "$($P -c "CHECKPOINT;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses manual CHECKPOINT"
+# EXPLAIN ANALYZE CTAS executes the table creation behind the utility gate
+assert "$($P -c "EXPLAIN (ANALYZE) CREATE TABLE reader_ctas AS SELECT 1;" 2>&1 \
+		| grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses EXPLAIN ANALYZE CREATE TABLE AS"
+# prepared-transaction commands are read-only-legal but write XACT WAL in
+# critical sections; the utility gate must refuse them cleanly
+assert "$($P -c "COMMIT PREPARED 'nope';" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses COMMIT PREPARED"
+# XID assignment is refused at the source (else the commit record would PANIC)
+assert "$($P -c "SELECT pg_current_xact_id();" 2>&1 | grep -c 'cannot assign TransactionIds')" "1" \
+	"pinned reader refuses XID assignment (pg_current_xact_id)"
+# NOTIFY is read-only-legal but XID-assigning and SLRU-writing
+assert "$($P -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses NOTIFY"
+# VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
+assert "$($P -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
+	"pinned reader refuses VACUUM"
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+{
+	echo "pagestore.read_lsn = ''"
+	echo "archive_mode = on"
+} >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 
 echo "----"
 [ "$fail" = 0 ] && echo "integration test: PASS" || echo "integration test: FAIL"
