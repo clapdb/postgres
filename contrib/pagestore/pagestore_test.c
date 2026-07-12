@@ -776,6 +776,7 @@ stop_daemon(pid_t pid)
 #define REL_C	18000
 #define REL_D	19000
 #define REL_E	20000
+#define REL_F	21000
 #define FORK0	0
 
 static void
@@ -913,6 +914,16 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_write_one(REL_E, FORK0, 0, pa);
 	op_truncate_at(REL_E, FORK0, 0, 2000);
 	check(op_nblocks(REL_E, FORK0) == 0, "WAL-less fork truncated to empty");
+	/* copied pages keep their SOURCE pd_lsn, which can sit below the new
+	 * fork's create SET (skip-WAL relation rewrites): growth clamps to the
+	 * definitive floor instead of vanishing under it */
+	op_create_at(REL_F, FORK0, 5000);
+	fill_page(pa, page_size, 3000, 44);	/* pd_lsn below the create */
+	op_write_one(REL_F, FORK0, 0, pa);
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "below-floor copied-page growth clamps to the create, not under it");
+	check(op_nblocks_asof(REL_F, FORK0, 4999) == 0,
+		  "the copied page is not visible below the fork's creation");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -1012,10 +1023,40 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
 		  "post-truncate WAL-less regrow survives restart at its floor");
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "clamped below-floor growth survives restart (persisted event)");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
 	check(!op_exists(REL_A, FORK0), "fork gone after unlink");
+
+	/* --- legacy stores: an absent fork-meta log --- */
+	/* a pre-events store has lsn-0 segment records and no fork-meta log at
+	 * all; recovery must fall back to applying that growth verbatim (there
+	 * are no definitive events to misorder against) or every unlogged fork
+	 * would come back empty */
+	client_detach();
+	stop_daemon(dpid);
+	{
+		char		fmpath[512];
+
+		snprintf(fmpath, sizeof(fmpath), "%s/forkmeta", store);
+		unlink(fmpath);
+	}
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "legacy mode restores WAL-less fork sizes from raw lsn-0 records");
+	check(op_exists(REL_D, FORK0),
+		  "legacy mode existence follows the raw growth");
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "legacy mode restores below-floor growth at its raw LSN");
+	/* with the meta log gone the truncate is gone too: REL_E's growth
+	 * reappears -- exactly the documented pre-events behavior */
+	check(op_nblocks(REL_E, FORK0) == 1,
+		  "legacy mode has no truncate events to order against (documented)");
 
 	client_detach();
 	stop_daemon(dpid);

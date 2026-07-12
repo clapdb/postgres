@@ -351,9 +351,13 @@ ls_chan(void)
  *
  * There is exactly one outstanding request per channel, so REQUEST and DONE
  * simply alternate; the IDLE state is only the post-zeroing initial value.
+ *
+ * ls_exec_wait returns the daemon's status; ls_exec_timeout wraps it and
+ * raises ERROR on anything but OK.  End-of-transaction paths that must not
+ * throw (post-commit/post-abort unlinks) use the wait variant and downgrade.
  */
-static void
-ls_exec_timeout(PsChannel *ch, int timeout_ms)
+static uint8
+ls_exec_wait(PsChannel *ch, int timeout_ms)
 {
 	uint32		spins = 0;
 	time_t		deadline = 0;
@@ -399,7 +403,13 @@ ls_exec_timeout(PsChannel *ch, int timeout_ms)
 	}
 	PG_END_TRY();
 
-	if (ch->status != PS_STATUS_OK)
+	return ch->status;
+}
+
+static void
+ls_exec_timeout(PsChannel *ch, int timeout_ms)
+{
+	if (ls_exec_wait(ch, timeout_ms) != PS_STATUS_OK)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc: daemon reported error for op %u",
 						ch->opcode)));
@@ -456,12 +466,16 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
  * rm_redo returns, i.e. it names the PREVIOUS record).
  *
- * Post-commit unlinks are the subtle case: smgrDoPendingDeletes(true) runs
- * after RecordTransactionCommit(), which RESETS XactLastRecEnd -- but it
- * leaves the commit record's end in XactLastCommitEnd, and that commit
- * record IS the drop's mutation record (a horizon below it must still see
- * the fork).  WAL-less mutations (unlogged relations) can leave both at
- * older records; their content is not LSN-ordered to begin with.
+ * End-of-transaction unlinks are the subtle case: smgrDoPendingDeletes()
+ * runs after RecordTransactionCommit()/RecordTransactionAbort(), both of
+ * which RESET XactLastRecEnd -- but the commit record's end survives in
+ * XactLastCommitEnd and the abort record's in XactLastAbortEnd, and
+ * whichever this backend produced LAST is the record that decided the
+ * cleanup (a commit for a DROP, an abort for a created-then-rolled-back
+ * relation; stamping the older one would sort the unlink below the
+ * relation's own CREATE and resurrect it).  WAL-less mutations (unlogged
+ * relations) can leave all of these at older records; their content is
+ * not LSN-ordered to begin with.
  */
 static uint64
 ls_op_lsn(void)
@@ -470,7 +484,7 @@ ls_op_lsn(void)
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
-	return (uint64) XactLastCommitEnd;
+	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
 }
 
 /*
@@ -520,7 +534,17 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
 	ch->req_lsn = ls_op_lsn();
-	ls_exec(ch);
+
+	/*
+	 * Unlinks run from end-of-transaction cleanup (smgrdounlinkall), after
+	 * the transaction's outcome is decided and its buffers are dropped --
+	 * core requires storage unlink failures to be warnings there, not
+	 * errors.  A failed durable DEAD event means the fork history was not
+	 * updated (the fork lingers at newest); warn and move on.
+	 */
+	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
+		ereport(WARNING,
+				(errmsg("pagestore: store unlink failed; the fork remains recorded in the store")));
 }
 
 /* Current size of the fork, in blocks. */

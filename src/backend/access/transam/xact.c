@@ -1913,6 +1913,15 @@ RecordTransactionAbort(bool isSubXact)
 	if (isSubXact)
 		XidCacheRemoveRunningXids(xid, nchildren, children, latestXid);
 
+	/*
+	 * Remember the abort record's end (mirroring XactLastCommitEnd): the
+	 * post-abort storage cleanup runs after the reset below, and storage
+	 * managers that version fork existence by WAL position stamp their
+	 * abort-path unlinks with it.
+	 */
+	if (!isSubXact)
+		XactLastAbortEnd = XactLastRecEnd;
+
 	/* Reset XactLastRecEnd until the next transaction writes something */
 	if (!isSubXact)
 		XactLastRecEnd = 0;
