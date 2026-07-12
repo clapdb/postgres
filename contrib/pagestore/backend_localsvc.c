@@ -25,14 +25,22 @@
  */
 #include "postgres.h"
 
+#include "storage/bufpage.h"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "pagestore_backend.h"
+#include "tcop/utility.h"
 #include "pagestore_ipc.h"
+#include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
 
@@ -41,6 +49,62 @@ static char *localsvc_shm_name = NULL;
 
 /* GUC: timeline this backend reads/writes on (0 = main; >0 = a branch) */
 static int	localsvc_timeline = 0;
+
+/*
+ * GUC: pin every store relation read at this LSN and refuse store writes --
+ * the compute becomes a PINNED READER of its timeline's history
+ * (READ_CONSISTENCY_DESIGN.md increment 1).  Empty/unset = a normal writer.
+ * The horizon of choice is the redo pointer of a durably mirrored
+ * checkpoint: as-of reads there are complete (the checkpoint flushed and
+ * synced everything it covers).
+ */
+static char *localsvc_read_lsn_str = NULL;
+static uint64 localsvc_read_lsn = 0;
+
+static bool
+ls_check_read_lsn(char **newval, void **extra, GucSource source)
+{
+	uint32		hi,
+				lo;
+
+	int			consumed = 0;
+
+	if (*newval == NULL || **newval == '\0')
+		return true;
+	/* require the whole string to parse: a trailing typo must not silently
+	 * pin the reader at a different horizon than configured */
+	if (sscanf(*newval, "%X/%X%n", &hi, &lo, &consumed) != 2 ||
+		(*newval)[consumed] != '\0')
+	{
+		GUC_check_errdetail("Expected a WAL LSN like \"0/1A2B3C4D\".");
+		return false;
+	}
+	return true;
+}
+
+static void
+ls_assign_read_lsn(const char *newval, void *extra)
+{
+	uint32		hi = 0,
+				lo = 0;
+	int			consumed = 0;
+
+	if (newval && *newval &&
+		sscanf(newval, "%X/%X%n", &hi, &lo, &consumed) == 2 &&
+		newval[consumed] == '\0')
+		localsvc_read_lsn = ((uint64) hi << 32) | lo;
+	else
+		localsvc_read_lsn = 0;
+}
+
+/* Refuse a store mutation on a pinned reader. */
+static void
+ls_reject_pinned_write(const char *op)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+			 errmsg("pagestore: %s refused: this compute is a pinned reader (pagestore.read_lsn)", op)));
+}
 
 /* per-backend attachment state */
 static void *ls_shm = NULL;
@@ -376,6 +440,10 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation create");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedo ? 1 : 0;
@@ -399,6 +467,10 @@ static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation unlink");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
@@ -429,6 +501,10 @@ ls_truncate(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation truncate");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
@@ -456,6 +532,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
+		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 		ls_exec(ch);
 
 		for (BlockNumber i = 0; i < chunk; i++)
@@ -476,6 +553,19 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
+
+
+	/*
+	 * A pinned reader has no legitimate page writes at all: hint-bit
+	 * dirtying and on-access pruning are suppressed at the source
+	 * (page_maintenance_suppressed), so nothing hint-only can reach this
+	 * path.  Anything that does arrive is a real mutation that escaped the
+	 * read-only default -- including WAL-less writes (unlogged relations,
+	 * fake-LSN index pages) whose pd_lsn never advances past the pin.
+	 * Fail closed instead of inferring intent from pd_lsn.
+	 */
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("page write");
 
 	while (done < nblocks)
 	{
@@ -504,6 +594,10 @@ ls_extend(const PageStoreRelKey *key, void *localreln,
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation extend");
+
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
 	ch->blocknum = blocknum;
@@ -528,6 +622,10 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("relation extend");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
@@ -567,6 +665,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
+	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
 	ls_exec(ch);
 
 	/* the pages now live in the channel data buffer, readable via the shm fd */
@@ -708,6 +807,9 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 {
 	PsChannel  *ch = ls_chan();
 
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("branch creation");
+
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
@@ -724,6 +826,9 @@ void
 pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 {
 	PsChannel  *ch = ls_chan();
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL append");
 
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_APPEND;
@@ -764,12 +869,22 @@ pagestore_localsvc_timeline(void)
 	return (uint32) localsvc_timeline;
 }
 
+/* The pinned read horizon (pagestore.read_lsn), 0 when this is a writer. */
+uint64
+pagestore_localsvc_read_lsn(void)
+{
+	return localsvc_read_lsn;
+}
+
 /* Record in the store that the WAL record at 'lsn' modifies (key, block). */
 void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL index append");
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
@@ -862,6 +977,9 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
 
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
+
 	/* ensure the object's fork exists (tolerate an existing one) */
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -884,6 +1002,9 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  int timeout_ms)
 {
 	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("object write");
 
 	ls_fill_key(ch, key);
 	ch->key.klass = klass;
@@ -913,6 +1034,7 @@ pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
 	ch->nblocks = 1;
+	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
 	ls_exec(ch);
 	memcpy(page, ch->data, BLCKSZ);
 }
@@ -969,6 +1091,21 @@ pagestore_localsvc_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomStringVariable("pagestore.read_lsn",
+							   "Cap every store relation page read at this LSN and refuse store writes.",
+							   "The pinned-reader MECHANISM increment (READ_CONSISTENCY_DESIGN.md): "
+							   "page reads freeze at R, mutations are refused.  A fully R-consistent "
+							   "query compute additionally needs as-of local artifacts (catalogs, "
+							   "control, SLRUs -- the prepared-branch flow), as-of size/existence "
+							   "metadata, and the running-xacts snapshot; see the design doc's "
+							   "increments.  Use the redo pointer of a durably mirrored checkpoint.  "
+							   "Empty = a normal writer compute.",
+							   &localsvc_read_lsn_str,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   ls_check_read_lsn, ls_assign_read_lsn, NULL);
+
 	DefineCustomIntVariable("pagestore.timeline",
 							"Timeline (branch) this backend reads and writes on; 0 is the main timeline.",
 							NULL,
@@ -978,4 +1115,213 @@ pagestore_localsvc_init(void)
 							PGC_POSTMASTER,
 							0,
 							NULL, NULL, NULL);
+}
+
+/*
+ * Pinned-reader command gates.  The read-only transaction default is
+ * advisory (any session can SET TRANSACTION READ WRITE), and read-only
+ * transactions legitimately admit VACUUM and REINDEX -- both of which
+ * generate page-content WAL from paths the page-maintenance suppression
+ * does not cover.  Refuse at the executor and utility entry points, before
+ * any buffer is dirtied or WAL inserted.
+ */
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+static void
+ls_pinned_executor_start(QueryDesc *queryDesc, int eflags)
+{
+	PlannedStmt *ps = queryDesc->plannedstmt;
+
+	/* plan-only runs (plain EXPLAIN) execute nothing; upstream skips its
+	 * read-only checks for them too */
+	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+	{
+		if (queryDesc->operation != CMD_SELECT || ps->hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("data modification is not allowed on a pinned reader (pagestore.read_lsn)")));
+		if (ps->rowMarks != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("row locking is not allowed on a pinned reader (pagestore.read_lsn)")));
+
+		/*
+		 * A CMD_SELECT feeding an into-rel receiver is CREATE TABLE AS /
+		 * SELECT INTO in disguise (e.g. under EXPLAIN ANALYZE, where the
+		 * utility gate sees only T_ExplainStmt): it creates and fills a
+		 * table.  Refuse by destination, whatever the wrapping.
+		 */
+		if (queryDesc->dest && queryDesc->dest->mydest == DestIntoRel)
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("CREATE TABLE AS is not allowed on a pinned reader (pagestore.read_lsn)")));
+	}
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+ls_pinned_process_utility(PlannedStmt *pstmt, const char *queryString,
+						  bool readOnlyTree, ProcessUtilityContext context,
+						  ParamListInfo params, QueryEnvironment *queryEnv,
+						  DestReceiver *dest, QueryCompletion *qc)
+{
+	const char *deny = NULL;
+
+	switch (nodeTag(pstmt->utilityStmt))
+	{
+		case T_VacuumStmt:		/* VACUUM and ANALYZE */
+			deny = "VACUUM/ANALYZE";
+			break;
+		case T_ReindexStmt:
+			deny = "REINDEX";
+			break;
+		case T_RepackStmt:		/* REPACK (and its CLUSTER/VACUUM FULL legacy forms) */
+			deny = "REPACK";
+			break;
+		case T_CopyStmt:
+			if (((CopyStmt *) pstmt->utilityStmt)->is_from)
+				deny = "COPY FROM";
+			break;
+		case T_TransactionStmt:
+			/*
+			 * PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED are
+			 * read-only-legal but write XACT WAL inside critical sections
+			 * (twophase.c); refuse them before that becomes a PANIC at the
+			 * wal_insert_restricted backstop.  Plain BEGIN/COMMIT/etc. pass.
+			 */
+			switch (((TransactionStmt *) pstmt->utilityStmt)->kind)
+			{
+				case TRANS_STMT_PREPARE:
+					deny = "PREPARE TRANSACTION";
+					break;
+				case TRANS_STMT_COMMIT_PREPARED:
+					deny = "COMMIT PREPARED";
+					break;
+				case TRANS_STMT_ROLLBACK_PREPARED:
+					deny = "ROLLBACK PREPARED";
+					break;
+				default:
+					break;
+			}
+			break;
+		case T_CheckPointStmt:
+			/*
+			 * ExecCheckpoint would wake the checkpointer with
+			 * CHECKPOINT_FORCE -- and the checkpointer is exactly the
+			 * process wal_insert_restricted must exempt, so a manual
+			 * CHECKPOINT would insert private WAL the pin exists to avoid.
+			 */
+			deny = "CHECKPOINT";
+			break;
+		case T_ExplainStmt:
+			/*
+			 * EXPLAIN ANALYZE of CREATE TABLE AS / SELECT INTO executes the
+			 * creation; the executor gate also refuses the into-rel
+			 * destination, but refuse the statement up front too.
+			 */
+			{
+				Query	   *q = castNode(Query,
+										 ((ExplainStmt *) pstmt->utilityStmt)->query);
+
+				if (q->commandType == CMD_UTILITY && q->utilityStmt &&
+					IsA(q->utilityStmt, CreateTableAsStmt))
+					deny = "EXPLAIN of CREATE TABLE AS / SELECT INTO";
+			}
+			break;
+		case T_NotifyStmt:
+			/*
+			 * Read-only-legal but XID-assigning and pg_notify-SLRU-writing;
+			 * the GetNewTransactionId refusal would catch it at pre-commit,
+			 * but refuse it up front with the clearer error.
+			 */
+			deny = "NOTIFY";
+			break;
+		default:
+			break;
+	}
+	if (deny)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("%s is not allowed on a pinned reader (pagestore.read_lsn)", deny)));
+
+	if (prev_ProcessUtility)
+		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+							params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+}
+
+/*
+ * Apply the pinned-reader (pagestore.read_lsn) instance-wide side effects.
+ * Called from _PG_init AFTER pagestore.backend is final: a pin without the
+ * localsvc backend would force the server read-only while capping nothing
+ * (passthrough/md reads ignore the horizon), so that combination is refused
+ * outright.
+ */
+void
+pagestore_localsvc_pinned_init(bool localsvc_active)
+{
+	if (localsvc_read_lsn == 0)
+		return;
+	if (!localsvc_active)
+		ereport(ERROR,
+				(errmsg("pagestore.read_lsn requires pagestore.backend = 'localsvc'")));
+
+	/*
+	 * A pinned reader must not archive WAL, full stop.  Its local WAL
+	 * diverges from the timeline writer's, and no archiver-side heuristic
+	 * can tell, after the pin is lifted, which retained bytes were private
+	 * (a floor recorded at first archive call starts too late after
+	 * archiver lag; a mixed segment's private suffix ships as gap-fill
+	 * that the store's overlap check has no coverage to refuse).  Refuse
+	 * the combination at startup: the operator disables archive_mode for
+	 * the pinned run, and on an unpinned restart of the SAME cluster the
+	 * completed segments ship as one true chain, gapless.
+	 */
+	if (XLogArchiveMode != ARCHIVE_MODE_OFF)
+		ereport(ERROR,
+				(errmsg("a pinned reader (pagestore.read_lsn) must not archive WAL; set archive_mode = off")));
+
+	/*
+	 * A pinned reader serves history and must not generate page-content
+	 * WAL: replaying that WAL after the pin is lifted would republish stale
+	 * as-of-R page images above the writer's shipped versions.  The layers,
+	 * outermost first:
+	 *
+	 * - transaction_read_only_forced makes XactReadOnly non-overridable
+	 *   (SET TRANSACTION READ WRITE is refused the way it is during
+	 *   recovery), so every PreventCommandIfReadOnly-guarded path -- DML,
+	 *   DDL, TRUNCATE, nextval(), COPY FROM -- holds, exactly the hot
+	 *   standby enforcement model;
+	 * - executor/utility gates additionally refuse DML, row locking,
+	 *   VACUUM/ANALYZE, REINDEX, REPACK and COPY FROM at the entry points
+	 *   -- VACUUM and REINDEX are legal in read-only transactions, and the
+	 *   rest get a clearer pinned-reader error before the generic
+	 *   read-only one;
+	 * - page-maintenance suppression stops the WAL a plain SELECT emits
+	 *   (hint-bit FPIs, on-access pruning) and shuts down autovacuum
+	 *   entirely, including the wraparound-defense launcher that ignores
+	 *   autovacuum = off;
+	 * - wal_insert_restricted refuses WAL insertion from anything but the
+	 *   WAL-essential auxiliary processes, so even a direct C-level bypass
+	 *   of the gates above cannot plant replayable page-content WAL;
+	 * - the localsvc store-write refusals remain underneath as the final
+	 *   fail-closed backstop.
+	 */
+	transaction_read_only_forced = true;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = ls_pinned_executor_start;
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = ls_pinned_process_utility;
+	page_maintenance_suppressed = true;
+	wal_insert_restricted = true;
+	SetConfigOption("autovacuum", "off", PGC_POSTMASTER, PGC_S_OVERRIDE);
+	SetConfigOption("default_transaction_read_only", "on",
+					PGC_POSTMASTER, PGC_S_OVERRIDE);
 }

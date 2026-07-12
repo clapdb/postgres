@@ -168,6 +168,8 @@ extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);
+extern uint64 pagestore_localsvc_read_lsn(void);
+extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
 /* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */
 extern void pagestore_control_mirror_init(bool localsvc_active);

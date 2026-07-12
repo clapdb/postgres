@@ -495,7 +495,15 @@ static bool
 pagestore_archive_configured(ArchiveModuleState *state)
 {
 	/* only meaningful when relations are served by the localsvc backend */
-	return strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") == 0;
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		return false;
+
+	/*
+	 * A pinned reader never ships WAL.  The supported configuration is
+	 * archive_mode = off (enforced at startup); this is the belt for the
+	 * unreachable case.
+	 */
+	return pagestore_localsvc_read_lsn() == 0;
 }
 
 /*
@@ -604,6 +612,10 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 
 	XLogFromFileName(file, &tli, &segno, wal_segment_size);
 	XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, seg_start);
+
+	/* unreachable when pinned: archive_mode = off is enforced at startup */
+	if (pagestore_localsvc_read_lsn() != 0)
+		return false;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
@@ -6125,6 +6137,14 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs
+	 * the final backend name, so it cannot run inside
+	 * pagestore_localsvc_init() above.
+	 */
+	pagestore_localsvc_pinned_init(pagestore_backend_name != NULL &&
+								   strcmp(pagestore_backend_name, "localsvc") == 0);
 
 	/*
 	 * Live SLRU page mirror (write-side capture).  Defines its GUC, so it

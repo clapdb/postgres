@@ -245,6 +245,7 @@ op_read_one(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out)
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	cl_exec();
@@ -275,6 +276,7 @@ op_readv(uint32_t rel, int32_t fork, uint32_t block, unsigned char *out,
 
 	cl_setkey(ch, rel, fork);
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = n;
 	cl_exec();
@@ -465,6 +467,7 @@ op_read_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	cl_setkey(ch, rel, fork);
 	ch->timeline = tl;
 	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	cl_exec();
@@ -501,6 +504,21 @@ op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
 	ch->datalen = len;
 	memcpy(ch->data, data, len);
 	cl_exec();
+}
+
+/* Like op_wal_append but reports the daemon's status (for negative tests). */
+static int
+op_wal_append_status(uint32_t tl, uint64_t start_lsn, const void *data,
+					 uint32_t len)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_APPEND;
+	ch->req_lsn = start_lsn;
+	ch->datalen = len;
+	memcpy(ch->data, data, len);
+	return cl_exec()->status;
 }
 
 /* Return the end LSN of a timeline's shipped WAL. */
@@ -1022,6 +1040,18 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 			ok = 0;
 	check(ok, "WAL read assembles the right bytes across records (at their LSNs)");
 
+	/* overlap policy: identical bytes re-ship idempotently; divergent
+	 * bytes for a covered range are two histories claiming the same LSNs
+	 * (a divergent compute) and are refused */
+	check(op_wal_append_status(0, 1000, bufa, 500) == PS_STATUS_OK,
+		  "an identical re-ship of covered WAL is accepted (idempotent retry)");
+	check(op_wal_size(0) == 2000, "the re-ship does not move the end LSN");
+	check(op_wal_append_status(0, 1200, bufb, 100) != PS_STATUS_OK,
+		  "divergent bytes for an already-covered WAL range are refused");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(0, 1200, 100, rback) == 100 && rback[0] == 0xAA,
+		  "the recorded history is intact after the refused overwrite");
+
 	/* a branch keeps its own WAL log */
 	op_create_branch(1, 0, 2000);
 	op_wal_append(1, 2000, bufa, 300);
@@ -1072,6 +1102,32 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_wal_read(2, 2300, 300, rback) == 200,
 		  "a hole below the branch's own coverage is not double-counted");
 
+	/* a retry that carries an already-accepted prefix plus new bytes (a
+	 * partially shipped chunk re-sent whole) appends only the uncovered
+	 * suffix -- no duplicate chunk, exact distinct-byte counts */
+	{
+		unsigned char bufc[200];
+
+		memset(bufc, 0xCC, 100);
+		op_wal_append(0, 3000, bufc, 100);	/* fresh chunk [3000,3100) */
+		memset(bufc + 100, 0xDD, 100);		/* retry whole: CC prefix + DD tail */
+		check(op_wal_append_status(0, 3000, bufc, 200) == PS_STATUS_OK,
+			  "a partial re-ship with new suffix bytes is accepted");
+		check(op_wal_size(0) == 3200,
+			  "the suffix advances the end LSN");
+		memset(rback, 0, sizeof(rback));
+		check(op_wal_read(0, 3000, 200, rback) == 200,
+			  "the trimmed re-ship leaves exact distinct-byte counts");
+		ok = 1;
+		for (int i = 0; i < 100; i++)
+			if (rback[i] != 0xCC)
+				ok = 0;
+		for (int i = 100; i < 200; i++)
+			if (rback[i] != 0xDD)
+				ok = 0;
+		check(ok, "prefix bytes stay the originals; suffix bytes are the new ones");
+	}
+
 	/* WAL end LSNs survive a daemon restart (recovered from the logs) */
 	client_detach();
 	stop_daemon(dpid);
@@ -1079,7 +1135,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
-	check(op_wal_size(0) == 2000, "main WAL end LSN survives daemon restart");
+	check(op_wal_size(0) == 3200, "main WAL end LSN survives daemon restart");
 	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
 	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
 		  "shipped WAL also closes the idempotent re-create window (post-restart)");

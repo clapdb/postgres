@@ -98,6 +98,7 @@ read_range(const uint32_t *starts, uint32_t from, uint32_t to,
 		c->key.klass = PS_KLASS_RELATION;
 		c->timeline = 0;
 		c->opcode = PS_OP_READV;
+	c->req_lsn = 0;	/* explicit: channels are reused across op kinds */
 		c->blocknum = b;
 		c->nblocks = k;
 		exec_on(chan);
