@@ -710,6 +710,9 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 
 /* --- fork size index (keyed by timeline, key) --- */
 
+static int fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
+							 uint32_t nblocks, uint8_t kind);
+
 static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
 {
@@ -816,22 +819,6 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 {
 	uint32_t	i;
 
-	/*
-	 * WAL-less growth (unlogged relations: pd_lsn 0) would sort below a
-	 * later create/truncate SET and be treated as covered, leaving the
-	 * newest size stuck at the SET's value however far the fork actually
-	 * grew.  Such content is not LSN-ordered to begin with: order it at
-	 * the definitive floor, where it is visible from that event onward.
-	 * The clamp applies ONLY to pd_lsn 0 -- a nonzero LSN below the floor
-	 * is, on the recovery path, real pre-truncate history replayed from
-	 * the segment log behind the pre-loaded fork-meta events, and must
-	 * keep its place.  (Unlogged indexes using fake LSNs remain a known
-	 * limitation; unlogged relations on the store have crash-reset
-	 * semantics that LSN-versioning cannot express either way.)
-	 */
-	if (kind == FEV_GROW && lsn == 0)
-		lsn = e->last_def_lsn;
-
 	if (kind == FEV_GROW && fork_size_asof_hop(e, lsn) >= nblocks)
 		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
@@ -886,8 +873,31 @@ void
 fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		  uint64_t lsn)
 {
-	fork_event_add(fork_get_or_create(timeline, key), lsn, to_nblocks,
-				   FEV_GROW);
+	ForkEnt    *e = fork_get_or_create(timeline, key);
+
+	/*
+	 * WAL-less growth (unlogged relations: pd_lsn 0) would sort below a
+	 * later create/truncate SET and be treated as covered, leaving the
+	 * newest size stuck at the SET's value however far the fork actually
+	 * grew.  Such content is not LSN-ordered to begin with: order it at
+	 * the definitive floor, where it is visible from that event onward.
+	 * The clamped position exists only here -- the segment record keeps
+	 * LSN 0 -- so it must be persisted like a zero-extend: at recovery
+	 * the fully preloaded fork-meta log would otherwise supply a FUTURE
+	 * floor (a truncate/unlink that happened after this growth in live
+	 * order) and resurrect pre-truncate pages as post-truncate regrowth;
+	 * recover() therefore skips lsn-0 segment records outright and
+	 * relies on these persisted events for their placement.
+	 */
+	if (lsn == 0)
+	{
+		lsn = e->last_def_lsn;
+		if (fork_size_asof_hop(e, lsn) < to_nblocks &&
+			fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
+			return;				/* not durable: do not apply in memory */
+	}
+
+	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
 }
 
 /* --- timeline metadata + read-through --- */
@@ -2052,7 +2062,11 @@ recover(uint32_t shard)
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
 							 shard, id, off + sizeof(hdr));
-			fork_grow(hdr.timeline, &hdr.key, hdr.block + 1, hdr.lsn);
+			/* lsn-0 (WAL-less) growth replays from the fork-meta log,
+			 * where its live clamped position was persisted; the raw
+			 * record cannot be ordered against definitive events here */
+			if (hdr.lsn != 0)
+				fork_grow(hdr.timeline, &hdr.key, hdr.block + 1, hdr.lsn);
 			off += sizeof(hdr) + hdr.len;
 		}
 

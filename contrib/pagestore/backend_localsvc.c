@@ -456,16 +456,21 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * (GetCurrentReplayRecPtr; the last-REPLAYED pointer only advances after
  * rm_redo returns, i.e. it names the PREVIOUS record).
  *
- * WAL-less mutations (unlogged relations) leave XactLastRecEnd at some
- * older record or 0; their content is not LSN-ordered to begin with, and a
- * 0 falls back to the daemon's after-known-history ordering.
+ * Post-commit unlinks are the subtle case: smgrDoPendingDeletes(true) runs
+ * after RecordTransactionCommit(), which RESETS XactLastRecEnd -- but it
+ * leaves the commit record's end in XactLastCommitEnd, and that commit
+ * record IS the drop's mutation record (a horizon below it must still see
+ * the fork).  WAL-less mutations (unlogged relations) can leave both at
+ * older records; their content is not LSN-ordered to begin with.
  */
 static uint64
 ls_op_lsn(void)
 {
 	if (RecoveryInProgress())
 		return (uint64) GetCurrentReplayRecPtr(NULL);
-	return (uint64) XactLastRecEnd;
+	if (XactLastRecEnd != 0)
+		return (uint64) XactLastRecEnd;
+	return (uint64) XactLastCommitEnd;
 }
 
 /*

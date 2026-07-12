@@ -775,6 +775,7 @@ stop_daemon(pid_t pid)
 #define REL_B	17000
 #define REL_C	18000
 #define REL_D	19000
+#define REL_E	20000
 #define FORK0	0
 
 static void
@@ -905,6 +906,13 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "pd_lsn-0 regrow is ordered at the truncate floor, not under it");
 	check(op_nblocks_asof(REL_D, FORK0, 1999) == 1,
 		  "the pre-truncate WAL-less block stays visible below the truncate");
+	/* the resurrection case: WAL-less growth then truncate, NO regrow --
+	 * recovery must not reorder the growth above the truncate */
+	op_create_at(REL_E, FORK0, 1000);
+	fill_page(pa, page_size, 0, 43);
+	op_write_one(REL_E, FORK0, 0, pa);
+	op_truncate_at(REL_E, FORK0, 0, 2000);
+	check(op_nblocks(REL_E, FORK0) == 0, "WAL-less fork truncated to empty");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -993,6 +1001,17 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_exists_asof(REL_C, FORK0, 8999), "pre-unlink existence survives restart");
 	check(!op_exists_asof(REL_C, FORK0, 9500), "unlink event survives restart");
 	check(op_nblocks(REL_C, FORK0) == 0, "recreated-empty newest size survives restart");
+
+	/* WAL-less growth replays from its persisted clamped position, so a
+	 * pre-truncate lsn-0 page cannot resurrect the fork size (the raw
+	 * segment record is skipped; the fully preloaded meta log would have
+	 * supplied a FUTURE floor) */
+	check(op_nblocks(REL_E, FORK0) == 0,
+		  "truncated WAL-less fork stays empty after restart (no resurrection)");
+	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
+		  "pre-truncate WAL-less growth keeps its floor position after restart");
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "post-truncate WAL-less regrow survives restart at its floor");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
