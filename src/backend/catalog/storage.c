@@ -150,19 +150,11 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	srel = smgropen(rlocator, procNumber);
 
 	/*
-	 * WAL-log the creation before creating the storage: replay recreates the
-	 * fork idempotently, and storage managers that version fork existence by
-	 * WAL position (pagestore) can then stamp the creation at/after its
-	 * record instead of before it.
-	 */
-	if (needs_wal)
-		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
-
-	smgrcreate(srel, MAIN_FORKNUM, false);
-
-	/*
 	 * Add the relation to the list of stuff to delete at abort, if we are
-	 * asked to do so.
+	 * asked to do so -- BEFORE logging or creating anything: once the
+	 * creation is WAL-logged, an error from the storage create below must
+	 * already have the abort cleanup registered, or replay would recreate a
+	 * fork nothing ever deletes.
 	 */
 	if (register_delete)
 	{
@@ -177,6 +169,17 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pending->next = pendingDeletes;
 		pendingDeletes = pending;
 	}
+
+	/*
+	 * WAL-log the creation before creating the storage: replay recreates the
+	 * fork idempotently, and storage managers that version fork existence by
+	 * WAL position (pagestore) can then stamp the creation at/after its
+	 * record instead of before it.
+	 */
+	if (needs_wal)
+		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
+
+	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (relpersistence == RELPERSISTENCE_PERMANENT && !XLogIsNeeded())
 	{
