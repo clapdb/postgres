@@ -1,7 +1,8 @@
 # Multi-compute read consistency: design
 
-Status: increment 1a implemented (the page-read pin); increments 1b-3 are
-specified here and not yet built.
+Status: increments 1a (the page-read pin) and 1b (as-of size/existence
+metadata) implemented; increments 1c-3 are specified here and not yet
+built.
 
 ## Problem
 
@@ -137,11 +138,25 @@ reconstruction.
    MECHANISM increment: on its own it freezes page bytes, not the whole
    compute.
 
-1b. **As-of metadata (next).**  `NBLOCKS`/`EXISTS` still answer newest, so
-   a writer-side truncate/drop after R shrinks the frozen view.  Needs
-   fork-size versioning in the store (a per-fork (lsn, nblocks) history
-   fed by the extend path's page LSNs plus an LSN-stamped truncate op,
-   made recoverable) so size and existence resolve as-of R.
+1b. **As-of metadata (implemented).**  Without it, `NBLOCKS`/`EXISTS`
+   answer newest, so a writer-side truncate/drop after R shrinks the
+   frozen view.  The store now versions fork sizes: every page append
+   records growth at the block's own pd_lsn (so as-of NBLOCKS agrees
+   with as-of page reads block for block), and create/truncate/unlink/
+   zero-extend carry the backend's WAL position and land as definitive
+   events -- create and truncate SET the size, unlink marks the fork
+   DEAD, all COW (history below the event still resolves).  A pinned
+   reader's smgr NBLOCKS/EXISTS pass its pin as the horizon; a branch's
+   size walk caps at each fork point exactly like page reads, which
+   also fixes the old leak of parent growth into a branch.  Definitive
+   events persist in a fork-meta log (loaded before the segment scan,
+   so recovery re-derives growth from the segment records' LSNs against
+   the same definitive backdrop the live path saw); growth needs no
+   extra persistence.  Note: WAL-less pages (unlogged relations) carry
+   pd_lsn 0; their growth is ordered at the fork's newest definitive
+   event (create/truncate) so the newest size stays right -- their
+   content is not LSN-ordered to begin with, and unlogged crash-reset
+   semantics are outside what LSN-versioning can express.
 
 1c. **The as-of compute (boot + snapshot).**  A consistent QUERY compute
    at R needs its LOCAL state as-of R too: catalogs, pg_control, and

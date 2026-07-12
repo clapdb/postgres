@@ -692,6 +692,59 @@ pagestore_walidx_count(PG_FUNCTION_ARGS)
 }
 
 /*
+ * pagestore_rel_nblocks_asof(rel regclass, forknum int, lsn pg_lsn) -> int8
+ * pagestore_rel_exists_asof(rel regclass, forknum int, lsn pg_lsn) -> bool
+ *
+ * The store's fork size/existence as of an LSN horizon (the same resolution a
+ * pinned reader's smgr NBLOCKS/EXISTS uses).  Test/inspection helpers.
+ */
+PG_FUNCTION_INFO_V1(pagestore_rel_nblocks_asof);
+
+Datum
+pagestore_rel_nblocks_asof(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	uint64		lsn = (uint64) PG_GETARG_LSN(2);
+	Relation	rel;
+	PageStoreRelKey key;
+	uint64		n;
+
+	rel = relation_open(relid, AccessShareLock);
+	key.spcOid = rel->rd_locator.spcOid;
+	key.dbOid = rel->rd_locator.dbOid;
+	key.relNumber = rel->rd_locator.relNumber;
+	key.forkNum = forknum;
+	n = pagestore_localsvc_nblocks_asof(&key, lsn);
+	relation_close(rel, AccessShareLock);
+
+	PG_RETURN_INT64((int64) n);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_rel_exists_asof);
+
+Datum
+pagestore_rel_exists_asof(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		forknum = PG_GETARG_INT32(1);
+	uint64		lsn = (uint64) PG_GETARG_LSN(2);
+	Relation	rel;
+	PageStoreRelKey key;
+	int			r;
+
+	rel = relation_open(relid, AccessShareLock);
+	key.spcOid = rel->rd_locator.spcOid;
+	key.dbOid = rel->rd_locator.dbOid;
+	key.relNumber = rel->rd_locator.relNumber;
+	key.forkNum = forknum;
+	r = pagestore_localsvc_exists_asof(&key, lsn);
+	relation_close(rel, AccessShareLock);
+
+	PG_RETURN_BOOL(r != 0);
+}
+
+/*
  * pagestore_redo_page(rel regclass, forknum int, blocknum int, lsn pg_lsn)
  *   -> bytea
  *

@@ -5501,14 +5501,14 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	{
 		if (smgrexists(src_rel, forkNum))
 		{
-			smgrcreate(dst_rel, forkNum, false);
-
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
-			 * init fork of an unlogged relation.
+			 * init fork of an unlogged relation -- before creating the
+			 * storage; see RelationCreateStorage.
 			 */
 			if (permanent || forkNum == INIT_FORKNUM)
 				log_smgrcreate(&dst_rlocator, forkNum);
+			smgrcreate(dst_rel, forkNum, false);
 
 			/* Copy a fork's data, block by block. */
 			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
