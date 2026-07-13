@@ -958,9 +958,11 @@ fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 }
 
 /*
- * Older builds kept a copied page's raw source LSN in the segment while
- * persisting its growth at a later definitive floor.  Recognize exactly that
- * shape during recovery: a covering GROW at the same LSN as a SET/DEAD.  A
+ * The markerless fork-meta format kept a copied page's raw source LSN in the
+ * segment while persisting its growth at a later definitive floor.  Recognize
+ * exactly that shape during recovery: a covering GROW at the same LSN as a
+ * SET/DEAD.  Current-format segment records are already stamped at the floor,
+ * so callers use this compatibility heuristic only for markerless logs.  A
  * merely later definitive event is not enough -- branch-local growth before
  * its first truncate/unlink is legitimate history and must be replayed.
  */
@@ -1237,6 +1239,7 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 static int fork_meta_migrating = 0;	/* the log carries the migration-start marker */
 static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
 static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migration */
+static int fork_meta_markerless = 0;	/* compatibility with the preceding format */
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 
 static void
@@ -1263,6 +1266,8 @@ load_fork_meta(void)
 					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
 		off += sizeof(rec);
 	}
+	fork_meta_markerless = have_records && !fork_meta_migrating &&
+		!fork_meta_migrated;
 
 	/*
 	 * Only an absent/empty log is unambiguously a pre-fork-events store.  A
@@ -2305,8 +2310,8 @@ recover(uint32_t shard)
 			{
 				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
 
-				if (!(fe && fork_has_persisted_clamp(fe, hdr.lsn,
-												 hdr.block + 1)))
+				if (!(fork_meta_markerless && fe &&
+					  fork_has_persisted_clamp(fe, hdr.lsn, hdr.block + 1)))
 					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
 									 hdr.lsn);
 			}
