@@ -1025,6 +1025,10 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "post-truncate WAL-less regrow survives restart at its floor");
 	check(op_nblocks(REL_F, FORK0) == 1,
 		  "clamped below-floor growth survives restart (persisted event)");
+	check(op_nblocks_asof(REL_F, FORK0, 4000) == 0,
+		  "the raw below-create record is not re-derived: the gap stays invisible after restart");
+	check(op_nblocks_asof(REL_F, FORK0, 5000) == 1,
+		  "the clamped position (the create floor) serves after restart");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
@@ -1057,6 +1061,22 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	 * reappears -- exactly the documented pre-events behavior */
 	check(op_nblocks(REL_E, FORK0) == 1,
 		  "legacy mode has no truncate events to order against (documented)");
+
+	/* the legacy replay write-through-migrates lsn-0 growth into the meta
+	 * log, so the mode is sticky: new metadata appends (which end legacy
+	 * detection) must not make the old unlogged forks come back empty on
+	 * the NEXT restart */
+	op_create_at(REL_F, FORK0, 20000);	/* any fresh meta append ends legacy mode */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "migrated legacy sizes survive a post-legacy restart");
+	check(op_exists(REL_D, FORK0),
+		  "migrated legacy existence survives a post-legacy restart");
 
 	client_detach();
 	stop_daemon(dpid);
