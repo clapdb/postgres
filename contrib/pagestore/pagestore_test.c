@@ -370,6 +370,23 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* Like op_read_at but reports found-ness (ch->result). */
+static int
+op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
+				 unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
 /*
  * SLRU-class write: the version is the caller-supplied LSN (req_lsn), NOT pd_lsn or
  * a daemon counter -- so a snapshot keyed by its proven cutoff C reads back as-of an
@@ -924,6 +941,13 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "below-floor copied-page growth clamps to the create, not under it");
 	check(op_nblocks_asof(REL_F, FORK0, 4999) == 0,
 		  "the copied page is not visible below the fork's creation");
+	/* the record itself is stamped at the floor, so the BYTES agree with
+	 * the size: an as-of read in the pre-create gap finds nothing */
+	check(!op_read_at_found(REL_F, FORK0, 0, 4000, rb),
+		  "as-of page bytes agree with the size below the create (not found)");
+	check(op_read_at_found(REL_F, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 44),
+		  "the copied page serves at the fork's creation floor");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 

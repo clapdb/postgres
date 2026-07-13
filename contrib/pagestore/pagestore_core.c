@@ -527,6 +527,7 @@ typedef struct ForkEvent
 #define FEV_GROW	0
 #define FEV_SET		1
 #define FEV_DEAD	2
+#define FEV_MIGRATED 3			/* log marker: legacy lsn-0 migration completed */
 
 typedef struct ForkEnt
 {
@@ -1208,7 +1209,9 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
  * whatever is known at insert time, so at worst a subsumed GROW is kept, not
  * dropped).  Invalid records are skipped, mirroring load_timelines().
  */
-static int fork_meta_legacy = 0;	/* absent/empty fork-meta log at startup */
+static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
+static int fork_meta_legacy = 0;	/* replay lsn-0 records (until migration completes) */
+static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 
 static void
 load_fork_meta(void)
@@ -1218,7 +1221,9 @@ load_fork_meta(void)
 
 	while (ps_storage->fork_meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
-		if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
+		if (rec.kind == FEV_MIGRATED)
+			fork_meta_migrated = 1;
+		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
 						   rec.lsn, rec.nblocks, rec.kind);
@@ -1228,7 +1233,16 @@ load_fork_meta(void)
 					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
 		off += sizeof(rec);
 	}
-	fork_meta_legacy = (off == 0);
+
+	/*
+	 * Legacy replay stays on until the migration-done marker is durable:
+	 * a partially migrated log (the daemon killed mid-scan) must not flip
+	 * the mode and skip the remaining raw lsn-0 records.  Replay is
+	 * idempotent against partial migrations -- already-persisted GROWs
+	 * dedup their raw twins.  A fresh store simply earns its marker on
+	 * the first (empty) scan.
+	 */
+	fork_meta_legacy = !fork_meta_migrated;
 }
 
 static void
@@ -1671,6 +1685,28 @@ page_lsn(const unsigned char *page)
 }
 
 /*
+ * Failure tail for append_page: when a durable GROW event was persisted for
+ * the (WAL-less) page whose segment write then failed, undo it with a
+ * compensating SET of the previous size at the same position, so a restart
+ * does not replay a size that has no content behind it.  Best effort: if the
+ * compensation cannot be made durable either (the disk is failing), the
+ * residue is a benign zero-filled tail -- log it loudly and move on.  The
+ * write path is single-threaded per shard, so no concurrent growth can have
+ * interleaved between the event and this undo.
+ */
+static int
+append_page_fail(uint32_t timeline, const PsKey *key, int comp_needed,
+				 uint32_t comp_prev, uint64_t comp_lsn)
+{
+	if (comp_needed &&
+		fork_meta_persist(timeline, key, comp_lsn, comp_prev, FEV_SET) != 0)
+		fprintf(stderr, "pagestore: could not compensate a persisted grow "
+				"event after a failed segment write; a restart may show "
+				"zero-filled blocks beyond the fork's real content\n");
+	return -1;
+}
+
+/*
  * Append one page version at the log head and record it in the index.  Because
  * every write lands at the moving append cursor, physical writes are large and
  * sequential even though each logical page is small -- the property we want for
@@ -1683,7 +1719,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
 	uint64_t	data_off;
-	uint64_t	hdr_grow_lsn;
+	uint64_t	hdr_grow_lsn = 0;
+	int			comp_needed;
+	uint32_t	comp_prev;
+	uint64_t	comp_lsn;
 	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
@@ -1736,26 +1775,59 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	hdr.len = page_size;
 
 	/*
-	 * Below-floor growth needs a durable fork-meta event; secure it BEFORE
-	 * publishing anything.  If the persist fails, nothing -- not the
-	 * segment log, the version index, the memtable, nor the caches -- has
-	 * seen this page, so the refused write is truly invisible.  grow_lsn
-	 * comes back clamped when the event applies at the floor.
+	 * Below-floor growth cannot be ordered by the page's raw LSN.  Two
+	 * shapes, two treatments:
+	 *
+	 * - A copied relation page with a NONZERO source pd_lsn below the
+	 *   fork's definitive floor (skip-WAL rewrites) has its RECORD stamped
+	 *   at the floor: version visibility, the growth event and recovery
+	 *   (which re-derives from the record) then all agree -- an as-of read
+	 *   below the fork's creation sees neither the size nor the bytes, and
+	 *   nothing needs a separate durable event.
+	 *
+	 * - A WAL-less page (pd_lsn 0) must KEEP version 0 -- capped reads
+	 *   refuse LSN-0 versions by design -- so its clamped growth needs a
+	 *   durable fork-meta event, secured BEFORE publishing anything.  If a
+	 *   later segment write fails, the already-durable event is undone
+	 *   with a best-effort compensating SET of the previous size (see
+	 *   below); the write path is single-threaded per shard, so no
+	 *   concurrent growth can interleave.
 	 */
+	comp_needed = 0;
+	comp_prev = 0;
+	comp_lsn = 0;
+	if (key->klass == PS_KLASS_RELATION)
 	{
-		uint64_t	grow_lsn = hdr.lsn;
+		ForkEnt    *fe = fork_get_or_create(timeline, key);
 
-		if (fork_grow_prepare(timeline, key, block + 1, &grow_lsn) != 0)
-			return -1;
-		hdr_grow_lsn = grow_lsn;
+		if (hdr.lsn != 0 && hdr.lsn < fe->last_def_lsn)
+			hdr.lsn = fe->last_def_lsn;
+		else if (hdr.lsn == 0)
+		{
+			uint64_t	floor_lsn = fe->last_def_lsn;
+			uint32_t	prev = fork_size_asof_hop(fe, floor_lsn);
+
+			if (prev < block + 1)
+			{
+				if (fork_meta_persist(timeline, key, floor_lsn, block + 1,
+									  FEV_GROW) != 0)
+					return -1;	/* nothing published yet */
+				comp_needed = 1;
+				comp_prev = prev;
+				comp_lsn = floor_lsn;
+			}
+			hdr_grow_lsn = floor_lsn;
+		}
 	}
+	if (hdr.lsn != 0)
+		hdr_grow_lsn = hdr.lsn;
 
 	/* write header then page bytes contiguously at the append cursor */
 	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
-		return -1;
+		return append_page_fail(timeline, key, comp_needed, comp_prev, comp_lsn);
 	data_off = s->cur_off + sizeof(hdr);
 	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
-		return -1;
+		return append_page_fail(timeline, key, comp_needed, comp_prev, comp_lsn);
 
 	/* index points at the page bytes (data_off), so reads skip the header */
 	page_add_version(timeline, key, block, hdr.lsn, s->id, s->cur_seg, data_off);
@@ -2156,8 +2228,21 @@ recover(uint32_t shard)
 			 * append and the second restart would bring every unlogged
 			 * fork back empty. */
 			if (fork_meta_legacy)
-				(void) fork_grow(hdr.timeline, &hdr.key, hdr.block + 1,
-								 hdr.lsn);
+			{
+				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
+				uint64_t	l = hdr.lsn ? hdr.lsn : fe->last_def_lsn;
+
+				/* migrate (write-through) but NEVER drop the in-memory
+				 * growth: a failed persist degrades to retry-next-boot
+				 * (no marker), not to invisible blocks this run */
+				if (fork_size_asof_hop(fe, l) < hdr.block + 1)
+				{
+					if (fork_meta_persist(hdr.timeline, &hdr.key, l,
+										  hdr.block + 1, FEV_GROW) != 0)
+						fork_meta_migrate_failed = 1;
+					fork_event_add(fe, l, hdr.block + 1, FEV_GROW);
+				}
+			}
 			else if (hdr.lsn != 0)
 			{
 				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
@@ -2636,6 +2721,25 @@ ps_core_open(const char *store_dir)
 
 	for (uint32_t sh = 0; sh < ns; sh++)
 		recover(sh);
+
+	/*
+	 * Seal the legacy migration once the whole scan persisted cleanly; the
+	 * marker is what ends legacy replay on later boots.  On any persist
+	 * failure the marker is withheld and the next boot retries -- replay
+	 * is idempotent against the partial migration.
+	 */
+	if (fork_meta_legacy && !fork_meta_migrate_failed)
+	{
+		PsKey		zk;
+
+		memset(&zk, 0, sizeof(zk));
+		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATED) != 0)
+			fprintf(stderr, "pagestore: could not seal the fork-meta migration; "
+					"legacy replay will run again next start\n");
+	}
+	else if (fork_meta_legacy)
+		fprintf(stderr, "pagestore: fork-meta migration incomplete; "
+				"legacy replay will run again next start\n");
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
