@@ -43,6 +43,7 @@ static int **seg_fds;
 static int *seg_fds_caps;
 static int seg_shards_cap;
 static int test_fail_seg_writes;
+static int test_crash_after_seg_writes;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -182,6 +183,7 @@ static int
 posix_open(const char *path, uint64_t segment_size)
 {
 	const char *fail_writes;
+	const char *crash_after_writes;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
@@ -193,6 +195,9 @@ posix_open(const char *path, uint64_t segment_size)
 	/* Standalone-test fault injection; ordinary deployments never set it. */
 	fail_writes = getenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
 	test_fail_seg_writes = fail_writes ? atoi(fail_writes) : 0;
+	crash_after_writes = getenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+	test_crash_after_seg_writes = crash_after_writes ?
+		atoi(crash_after_writes) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	return 0;
 }
@@ -265,6 +270,10 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 	}
 	if (pwrite(fd, buf, len, (off_t) off) != (ssize_t) len)
 		return -1;
+	/* Standalone-test crash point: after N successful segment writes. */
+	if (test_crash_after_seg_writes > 0 &&
+		--test_crash_after_seg_writes == 0)
+		_exit(86);
 	return 0;
 }
 

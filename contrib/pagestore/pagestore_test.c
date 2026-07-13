@@ -759,8 +759,9 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 /* ===================== daemon lifecycle ================================ */
 
 static pid_t
-spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *store,
-					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
+spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
+				   uint32_t page_size, uint32_t nshards, int fail_seg_writes,
+				   int crash_after_seg_writes)
 {
 	pid_t		pid = fork();
 
@@ -774,6 +775,8 @@ spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *stor
 		char		psbuf[16];
 		char		shbuf[16];
 
+		unsetenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
+		unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
 		if (fail_seg_writes > 0)
 		{
 			char		failbuf[16];
@@ -782,6 +785,17 @@ spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *stor
 			if (setenv("PAGESTORE_TEST_FAIL_SEG_WRITES", failbuf, 1) != 0)
 			{
 				perror("setenv PAGESTORE_TEST_FAIL_SEG_WRITES");
+				_exit(127);
+			}
+		}
+		if (crash_after_seg_writes > 0)
+		{
+			char		crashbuf[16];
+
+			snprintf(crashbuf, sizeof(crashbuf), "%d", crash_after_seg_writes);
+			if (setenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES", crashbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
 				_exit(127);
 			}
 		}
@@ -800,10 +814,27 @@ spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *stor
 }
 
 static pid_t
+spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *store,
+					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
+							  fail_seg_writes, 0);
+}
+
+static pid_t
+spawn_daemon_crash_after_seg(const char *daemon_path, const char *shm,
+							 const char *store, uint32_t page_size,
+							 uint32_t nshards, int crash_after_seg_writes)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0,
+							  crash_after_seg_writes);
+}
+
+static pid_t
 spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 			 uint32_t page_size, uint32_t nshards)
 {
-	return spawn_daemon_fail_seg(daemon_path, shm, store, page_size, nshards, 0);
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0);
 }
 
 /* Wait until the daemon has published a valid header. */
@@ -896,6 +927,9 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 #define REL_D	19000
 #define REL_E	20000
 #define REL_F	21000
+#define REL_G	22000
+#define REL_H	23000
+#define REL_I	24000
 #define FORK0	0
 
 static void
@@ -1050,6 +1084,32 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_read_at_found(REL_F, FORK0, 0, 5000, rb) &&
 		  page_has_tag(rb, page_size, 44),
 		  "the copied page serves at the fork's creation floor");
+
+	/* A retained dirty buffer can flush after truncate with an older pd_lsn.
+	 * It is not growth at the truncate floor, so preserve its raw version. */
+	op_create_at(REL_G, FORK0, 1000);
+	fill_page(pa, page_size, 1500, 60);
+	op_write_one(REL_G, FORK0, 0, pa);
+	fill_page(pa, page_size, 1600, 61);
+	op_write_one(REL_G, FORK0, 1, pa);
+	op_truncate_at(REL_G, FORK0, 1, 3000);
+	fill_page(pa, page_size, 2000, 62);
+	op_write_one(REL_G, FORK0, 0, pa);
+	check(op_read_at_found(REL_G, FORK0, 0, 2500, rb) &&
+		  page_has_tag(rb, page_size, 62),
+		  "retained-block flush keeps its pre-truncate page LSN");
+
+	/* A real pre-truncate growth can have the same target size as a later
+	 * WAL-less regrow at the truncate floor.  Markerless recovery must not
+	 * mistake that later GROW for proof that the raw record was clamped. */
+	op_create_at(REL_H, FORK0, 1000);
+	fill_page(pa, page_size, 2000, 63);
+	op_write_one(REL_H, FORK0, 2, pa);
+	op_truncate_at(REL_H, FORK0, 1, 3000);
+	fill_page(pa, page_size, 0, 64);
+	op_write_one(REL_H, FORK0, 2, pa);
+	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
+		  "real growth remains visible before same-size WAL-less regrow");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -1112,6 +1172,49 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		free(note);
 	}
 
+	/* Crash exactly after a growing WAL-less page body reaches the segment.
+	 * SEG0 carries its growth floor in that same complete record, so recovery
+	 * must expose the page and size together.  The request process waits on the
+	 * dead daemon, so run it in a disposable child. */
+	op_create_at(REL_I, FORK0, 11000);
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_crash_after_seg(daemon_path, shm, store, page_size,
+									 test_nshards, 2);
+	wait_ready(shm, page_size);
+	{
+		pid_t		writer = fork();
+		int			status;
+
+		if (writer == 0)
+		{
+			client_attach(shm, page_size);
+			fill_page(pa, page_size, 0, 65);
+			op_write_one(REL_I, FORK0, 0, pa);
+			_exit(0);
+		}
+		if (writer < 0)
+		{
+			perror("fork crash-window writer");
+			exit(2);
+		}
+		waitpid(dpid, &status, 0);
+		check(WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "injected crash landed after the WAL-less segment body");
+		kill(writer, SIGKILL);
+		waitpid(writer, NULL, 0);
+	}
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_I, FORK0) == 1,
+		  "complete WAL-less record recovers its size after a crash");
+	op_read_one(REL_I, FORK0, 0, rb);
+	check(page_has_tag(rb, page_size, 65),
+		  "complete WAL-less record recovers its page with the size");
+
 	client_detach();
 
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
@@ -1160,6 +1263,14 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "the raw below-create record is not re-derived: the gap stays invisible after restart");
 	check(op_nblocks_asof(REL_F, FORK0, 5000) == 1,
 		  "the clamped position (the create floor) serves after restart");
+	check(op_read_at_found(REL_G, FORK0, 0, 2500, rb) &&
+		  page_has_tag(rb, page_size, 62),
+		  "retained-block raw LSN survives markerless recovery");
+	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
+		  "markerless recovery preserves real pre-truncate growth");
+	op_read_one(REL_I, FORK0, 0, rb);
+	check(page_has_tag(rb, page_size, 65),
+		  "self-describing WAL-less record survives another restart");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
