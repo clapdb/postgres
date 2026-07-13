@@ -537,12 +537,18 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 	ch->is_redo = isRedo ? 1 : 0;
 	ch->req_lsn = ls_op_lsn();
 
+	/* WAL redo must fail if its durable DEAD event cannot be recorded. */
+	if (isRedo)
+	{
+		ls_exec(ch);
+		return;
+	}
+
 	/*
-	 * Unlinks run from end-of-transaction cleanup (smgrdounlinkall), after
-	 * the transaction's outcome is decided and its buffers are dropped --
-	 * core requires storage unlink failures to be warnings there, not
-	 * errors.  A failed durable DEAD event means the fork history was not
-	 * updated (the fork lingers at newest); warn and move on.
+	 * Non-redo unlinks run from end-of-transaction cleanup, after the
+	 * transaction's outcome is decided and its buffers are dropped.  A failed
+	 * durable DEAD event means the fork lingers; warn rather than throwing from
+	 * cleanup after commit/abort.
 	 */
 	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
 		ereport(WARNING,

@@ -930,6 +930,8 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 #define REL_G	22000
 #define REL_H	23000
 #define REL_I	24000
+#define REL_J	25000
+#define REL_K	26000
 #define FORK0	0
 
 static void
@@ -1110,6 +1112,27 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_write_one(REL_H, FORK0, 2, pa);
 	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
 		  "real growth remains visible before same-size WAL-less regrow");
+
+	/* Zeroextend at CREATE's LSN can already cover the copied block at the
+	 * floor, but the bytes still must not be visible before CREATE. */
+	op_create_at(REL_J, FORK0, 5000);
+	op_zeroextend_at(REL_J, FORK0, 0, 2, 5000);
+	fill_page(pa, page_size, 3000, 67);
+	op_write_one(REL_J, FORK0, 0, pa);
+	check(!op_read_at_found(REL_J, FORK0, 0, 4000, rb),
+		  "same-LSN pre-extension does not expose copied bytes before CREATE");
+	check(op_read_at_found(REL_J, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 67),
+		  "copied bytes serve at the pre-extended CREATE floor");
+
+	/* A replayed/retried zeroextend can carry an LSN below the definitive
+	 * floor.  Persist only its clamped position, never the raw request LSN. */
+	op_create_at(REL_K, FORK0, 5000);
+	op_zeroextend_at(REL_K, FORK0, 0, 3, 3000);
+	check(op_nblocks_asof(REL_K, FORK0, 4000) == 0,
+		  "below-floor zeroextend is invisible before CREATE");
+	check(op_nblocks_asof(REL_K, FORK0, 5000) == 3,
+		  "below-floor zeroextend appears at its clamped floor");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -1268,6 +1291,13 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "retained-block raw LSN survives markerless recovery");
 	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
 		  "markerless recovery preserves real pre-truncate growth");
+	check(!op_read_at_found(REL_J, FORK0, 0, 4000, rb) &&
+		  op_read_at_found(REL_J, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 67),
+		  "pre-extended CREATE keeps copied bytes clamped after recovery");
+	check(op_nblocks_asof(REL_K, FORK0, 4000) == 0 &&
+		  op_nblocks_asof(REL_K, FORK0, 5000) == 3,
+		  "zeroextend persists only its clamped floor across recovery");
 	op_read_one(REL_I, FORK0, 0, rb);
 	check(page_has_tag(rb, page_size, 65),
 		  "self-describing WAL-less record survives another restart");
