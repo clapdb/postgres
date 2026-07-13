@@ -188,6 +188,8 @@ ls_attach(void)
 	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
 		hdr->page_size != BLCKSZ)
 	{
+		uint32		got_magic = hdr->magic;
+		uint32		got_version = hdr->version;
 		uint32		got_page_size = hdr->page_size;
 
 		munmap(shm, PS_SHM_SIZE);
@@ -195,7 +197,7 @@ ls_attach(void)
 		ereport(ERROR,
 				(errmsg("pagestore localsvc shared memory incompatible"),
 				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
-						   got_page_size, BLCKSZ, hdr->magic, hdr->version)));
+						   got_page_size, BLCKSZ, got_magic, got_version)));
 	}
 	ls_shm = shm;
 	ls_shm_fd = fd;
