@@ -528,6 +528,7 @@ typedef struct ForkEvent
 #define FEV_SET		1
 #define FEV_DEAD	2
 #define FEV_MIGRATED 3			/* log marker: legacy lsn-0 migration completed */
+#define FEV_MIGRATING 4			/* log marker: legacy migration started */
 
 typedef struct ForkEnt
 {
@@ -956,6 +957,31 @@ fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				   FEV_GROW);
 }
 
+/*
+ * Older builds kept a copied page's raw source LSN in the segment while
+ * persisting its growth at a later definitive floor.  Recognize exactly that
+ * shape during recovery: a covering GROW at the same LSN as a SET/DEAD.  A
+ * merely later definitive event is not enough -- branch-local growth before
+ * its first truncate/unlink is legitimate history and must be replayed.
+ */
+static int
+fork_has_persisted_clamp(const ForkEnt *e, uint64_t raw_lsn,
+					 uint32_t to_nblocks)
+{
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		const ForkEvent *grow = &e->ev[i];
+
+		if (grow->kind != FEV_GROW || grow->lsn <= raw_lsn ||
+			grow->nblocks < to_nblocks)
+			continue;
+		for (uint32_t j = 0; j < e->nev; j++)
+			if (e->ev[j].lsn == grow->lsn && e->ev[j].kind != FEV_GROW)
+				return 1;
+	}
+	return 0;
+}
+
 /* --- timeline metadata + read-through --- */
 
 static void
@@ -1203,14 +1229,14 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 }
 
 /*
- * Replay the fork-meta log.  Runs after the segment scan, so page-append
- * growth is already in each fork's history; event insertion is
- * order-independent (lsn-sorted insert, and the GROW dedup compares against
- * whatever is known at insert time, so at worst a subsumed GROW is kept, not
- * dropped).  Invalid records are skipped, mirroring load_timelines().
+ * Replay the fork-meta log before the segment scan.  Preloading definitive
+ * events lets segment growth dedup and clamp detection see the complete size
+ * history; event insertion itself remains order-independent.  Invalid records
+ * are skipped, mirroring load_timelines().
  */
+static int fork_meta_migrating = 0;	/* the log carries the migration-start marker */
 static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
-static int fork_meta_legacy = 0;	/* replay lsn-0 records (until migration completes) */
+static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migration */
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 
 static void
@@ -1218,11 +1244,15 @@ load_fork_meta(void)
 {
 	ForkMetaRec rec;
 	uint64_t	off = 0;
+	int			have_records = 0;
 
 	while (ps_storage->fork_meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
 	{
+		have_records = 1;
 		if (rec.kind == FEV_MIGRATED)
 			fork_meta_migrated = 1;
+		else if (rec.kind == FEV_MIGRATING)
+			fork_meta_migrating = 1;
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
@@ -1235,14 +1265,31 @@ load_fork_meta(void)
 	}
 
 	/*
-	 * Legacy replay stays on until the migration-done marker is durable:
-	 * a partially migrated log (the daemon killed mid-scan) must not flip
-	 * the mode and skip the remaining raw lsn-0 records.  Replay is
-	 * idempotent against partial migrations -- already-persisted GROWs
-	 * dedup their raw twins.  A fresh store simply earns its marker on
-	 * the first (empty) scan.
+	 * Only an absent/empty log is unambiguously a pre-fork-events store.  A
+	 * nonempty log without either marker was written by the immediately
+	 * preceding format: its definitive SET/DEAD history is authoritative and
+	 * replaying raw lsn-0 pages against it could resurrect a truncated fork.
+	 *
+	 * Stamp an empty log before scanning segments.  The start marker lets a
+	 * later boot distinguish an interrupted migration (continue legacy replay)
+	 * from that older, already-event-aware format (normal replay).  If the
+	 * marker cannot be made durable, recover legacy sizes in memory this run
+	 * but persist no partial migration records; the next boot will still see
+	 * an empty log and retry from the beginning.
 	 */
-	fork_meta_legacy = !fork_meta_migrated;
+	if (!have_records)
+	{
+		PsKey		zk;
+
+		memset(&zk, 0, sizeof(zk));
+		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATING) != 0)
+			fork_meta_migrate_failed = 1;
+		else
+			fork_meta_migrating = 1;
+		fork_meta_legacy = 1;
+	}
+	else
+		fork_meta_legacy = fork_meta_migrating && !fork_meta_migrated;
 }
 
 static void
@@ -1687,10 +1734,11 @@ page_lsn(const unsigned char *page)
 /*
  * Failure tail for append_page: when a durable GROW event was persisted for
  * the (WAL-less) page whose segment write then failed, undo it with a
- * compensating SET of the previous size at the same position, so a restart
- * does not replay a size that has no content behind it.  Best effort: if the
- * compensation cannot be made durable either (the disk is failing), the
- * residue is a benign zero-filled tail -- log it loudly and move on.  The
+ * compensating SET of the previously visible (ancestry-aware) size at the same
+ * position, so a restart does not replay a size that has no content behind it.
+ * Best effort: if the compensation cannot be made durable either (the disk is
+ * failing), the residue is a benign zero-filled tail -- log it loudly and move
+ * on.  The
  * write path is single-threaded per shard, so no concurrent growth can have
  * interleaved between the event and this undo.
  */
@@ -1805,7 +1853,17 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		else if (hdr.lsn == 0)
 		{
 			uint64_t	floor_lsn = fe->last_def_lsn;
-			uint32_t	prev = fork_size_asof_hop(fe, floor_lsn);
+			uint32_t	prev;
+
+			/*
+			 * Compensation must restore the size visible through the whole
+			 * timeline ancestry.  A branch with no local events has a hop-local
+			 * size of zero but may inherit a nonempty parent fork; persisting SET 0
+			 * after a failed segment write would stop the ancestry walk and hide it.
+			 */
+			ps_lock_map_rd();
+			prev = fork_nblocks_through(timeline, key, UINT64_MAX);
+			ps_unlock_map();
 
 			if (prev < block + 1)
 			{
@@ -2211,14 +2269,13 @@ recover(uint32_t shard)
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
 							 shard, id, off + sizeof(hdr));
-			/* Growth that the live path clamped-and-persisted must not
-			 * ALSO re-derive from the raw record: lsn-0 records are skipped
-			 * outright, and a nonzero record BELOW the fork's first
-			 * definitive event (its creation -- no legit history can
-			 * precede that) is a clamped copied page whose floor event is
-			 * already in the meta log.  Raw records at/above the first
-			 * definitive event are real history (e.g. pre-truncate pages)
-			 * and keep their place.
+			/* Growth that an older live path clamped-and-persisted must not
+			 * ALSO re-derive from its raw record: lsn-0 records are skipped
+			 * outright, while a nonzero raw record is skipped only when the
+			 * meta history proves a covering GROW at a definitive floor.
+			 * Merely preceding the first local definitive event proves
+			 * nothing: on a branch that event may be a truncate/unlink after
+			 * legitimate branch-local growth.
 			 *
 			 * Legacy stores (an absent/empty fork-meta log, from before
 			 * events were persisted) have no definitive events to misorder
@@ -2237,8 +2294,9 @@ recover(uint32_t shard)
 				 * (no marker), not to invisible blocks this run */
 				if (fork_size_asof_hop(fe, l) < hdr.block + 1)
 				{
-					if (fork_meta_persist(hdr.timeline, &hdr.key, l,
-										  hdr.block + 1, FEV_GROW) != 0)
+					if (!fork_meta_migrate_failed &&
+						fork_meta_persist(hdr.timeline, &hdr.key, l,
+										   hdr.block + 1, FEV_GROW) != 0)
 						fork_meta_migrate_failed = 1;
 					fork_event_add(fe, l, hdr.block + 1, FEV_GROW);
 				}
@@ -2247,8 +2305,8 @@ recover(uint32_t shard)
 			{
 				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
 
-				if (!(fe && fe->nev && fe->ev[0].kind != FEV_GROW &&
-					  hdr.lsn < fe->ev[0].lsn))
+				if (!(fe && fork_has_persisted_clamp(fe, hdr.lsn,
+												 hdr.block + 1)))
 					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
 									 hdr.lsn);
 			}
