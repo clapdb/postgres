@@ -715,8 +715,6 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 
 static int fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 							 uint32_t nblocks, uint8_t kind);
-static int fork_grow_prepare(uint32_t timeline, const PsKey *key,
-							 uint32_t to_nblocks, uint64_t *lsn_io);
 
 static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
@@ -881,53 +879,19 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 
 	/*
-	 * Growth below the fork's definitive floor cannot be ordered by its
-	 * page LSN: WAL-less pages (unlogged relations: pd_lsn 0) and copied
-	 * pages that keep an old source pd_lsn (skip-WAL relation rewrites
-	 * under wal_level = minimal) would sort below a later create/truncate
-	 * SET and be treated as covered, leaving the newest size stuck at the
-	 * SET's value however far the fork actually grew.  Order such growth
-	 * at the floor, where it is visible from that event onward.  The
-	 * clamped position exists only here -- the segment record keeps its
-	 * raw LSN -- so it must be persisted like a zero-extend: at recovery
-	 * the fully preloaded fork-meta log would otherwise supply a FUTURE
-	 * floor (a truncate/unlink that happened after this growth in live
-	 * order) and resurrect pre-truncate pages as post-truncate regrowth;
-	 * recover() therefore never re-derives below-floor growth from raw
-	 * segment records and relies on these persisted events instead.
-	 * (Replayed nonzero pre-truncate history enters through
-	 * fork_grow_replay, not here.)
-	 *
-	 * The persist failure must reach the caller: append_page has already
-	 * durably written the page record, and acknowledging the write while
-	 * the size event is neither in memory nor recoverable would strand
-	 * the new blocks beyond NBLOCKS forever.
+	 * Zeroextend has no page record from which recovery can reconstruct its
+	 * size.  Clamp first, then persist exactly the event applied in memory.
 	 */
-	if (fork_grow_prepare(timeline, key, to_nblocks, &lsn) != 0)
-		return -1;
+	if (lsn < e->last_def_lsn || lsn == 0)
+		lsn = e->last_def_lsn;
+	if (fork_size_asof_hop(e, lsn) < to_nblocks &&
+		fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
+		return -1;			/* not durable: do not apply in memory */
 	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
 	return 0;
 }
 
-/* Persist growth that cannot be reconstructed from a page record. */
-static int
-fork_grow_prepare(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-				  uint64_t *lsn_io)
-{
-	ForkEnt    *e = fork_get_or_create(timeline, key);
-
-	if (*lsn_io < e->last_def_lsn || *lsn_io == 0)
-	{
-		*lsn_io = e->last_def_lsn;
-		if (fork_size_asof_hop(e, *lsn_io) < to_nblocks &&
-			fork_meta_persist(timeline, key, *lsn_io, to_nblocks, FEV_GROW) != 0)
-			return -1;			/* not durable: do not apply in memory */
-	}
-	return 0;
-}
-
-/* The in-memory half: apply a growth event whose durability (if any) was
- * already handled by fork_grow_prepare. */
+/* Apply growth whose durability is already represented by metadata or SEG0. */
 static void
 fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				uint64_t lsn)
@@ -1789,11 +1753,14 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (hdr.lsn != 0 && hdr.lsn < fe->last_def_lsn)
 		{
 			uint32_t	visible;
+			int			existed_before;
 
 			ps_lock_map_rd();
 			visible = fork_nblocks_through(timeline, key, fe->last_def_lsn);
+			existed_before = fe->last_def_lsn > 0 &&
+				fork_exists_through(timeline, key, fe->last_def_lsn - 1);
 			ps_unlock_map();
-			if (visible < block + 1)
+			if (visible < block + 1 || !existed_before)
 				hdr.lsn = fe->last_def_lsn;
 		}
 		else if (hdr.lsn == 0)
@@ -2359,10 +2326,7 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint32_t	to = ch->blocknum + ch->nblocks;
 
-				if (fork_size_asof_hop(e, lsn) < to &&
-					fork_meta_persist(tl, &ch->key, lsn, to, FEV_GROW) != 0)
-					ch->status = PS_STATUS_ERROR;
-				else if (fork_grow(tl, &ch->key, to, lsn) != 0)
+				if (fork_grow(tl, &ch->key, to, lsn) != 0)
 					ch->status = PS_STATUS_ERROR;
 			}
 			break;
