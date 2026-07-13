@@ -712,6 +712,8 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 
 static int fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 							 uint32_t nblocks, uint8_t kind);
+static int fork_grow_prepare(uint32_t timeline, const PsKey *key,
+							 uint32_t to_nblocks, uint64_t *lsn_io);
 
 static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
@@ -898,16 +900,43 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 * the size event is neither in memory nor recoverable would strand
 	 * the new blocks beyond NBLOCKS forever.
 	 */
-	if (lsn < e->last_def_lsn || lsn == 0)
-	{
-		lsn = e->last_def_lsn;
-		if (fork_size_asof_hop(e, lsn) < to_nblocks &&
-			fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
-			return -1;			/* not durable: do not apply in memory */
-	}
-
+	if (fork_grow_prepare(timeline, key, to_nblocks, &lsn) != 0)
+		return -1;
 	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
 	return 0;
+}
+
+/*
+ * The durability half of fork_grow, split out so append_page can run it
+ * BEFORE publishing anything: on a fork-meta I/O failure nothing -- not the
+ * version index, not the memtable, not the caches -- may already be serving
+ * the page whose write is about to be refused.  Clamps *lsn_io in place;
+ * makes no in-memory change.
+ */
+static int
+fork_grow_prepare(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+				  uint64_t *lsn_io)
+{
+	ForkEnt    *e = fork_get_or_create(timeline, key);
+
+	if (*lsn_io < e->last_def_lsn || *lsn_io == 0)
+	{
+		*lsn_io = e->last_def_lsn;
+		if (fork_size_asof_hop(e, *lsn_io) < to_nblocks &&
+			fork_meta_persist(timeline, key, *lsn_io, to_nblocks, FEV_GROW) != 0)
+			return -1;			/* not durable: do not apply in memory */
+	}
+	return 0;
+}
+
+/* The in-memory half: apply a growth event whose durability (if any) was
+ * already handled by fork_grow_prepare. */
+static void
+fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+				uint64_t lsn)
+{
+	fork_event_add(fork_get_or_create(timeline, key), lsn, to_nblocks,
+				   FEV_GROW);
 }
 
 /*
@@ -1654,6 +1683,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	SegRecHdr	hdr;
 	uint64_t	reclen = sizeof(SegRecHdr) + page_size;
 	uint64_t	data_off;
+	uint64_t	hdr_grow_lsn;
 	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
@@ -1704,6 +1734,21 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		ps_unlock_map();
 	}
 	hdr.len = page_size;
+
+	/*
+	 * Below-floor growth needs a durable fork-meta event; secure it BEFORE
+	 * publishing anything.  If the persist fails, nothing -- not the
+	 * segment log, the version index, the memtable, nor the caches -- has
+	 * seen this page, so the refused write is truly invisible.  grow_lsn
+	 * comes back clamped when the event applies at the floor.
+	 */
+	{
+		uint64_t	grow_lsn = hdr.lsn;
+
+		if (fork_grow_prepare(timeline, key, block + 1, &grow_lsn) != 0)
+			return -1;
+		hdr_grow_lsn = grow_lsn;
+	}
 
 	/* write header then page bytes contiguously at the append cursor */
 	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
@@ -1759,14 +1804,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * block is readable as of a horizon iff it has a version at/below it,
 	 * so keying the GROW event by hdr.lsn makes as-of NBLOCKS agree with
 	 * as-of page reads block for block.  (This replaces the callers'
-	 * former one-shot fork_grow after a batch.)  A failure here is a
-	 * failed durable size event for below-floor growth: the page record
-	 * is already in the segment log (a retry lands an identical
-	 * later-wins version -- harmless), but the write must not be
-	 * acknowledged without its size metadata.
+	 * former one-shot fork_grow after a batch.)  Durability for
+	 * below-floor growth was secured up top, before anything published;
+	 * this is only the in-memory application at the (possibly clamped)
+	 * position.
 	 */
-	if (fork_grow(timeline, key, block + 1, hdr.lsn) != 0)
-		return -1;
+	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn);
 	return 0;
 }
 
@@ -2096,16 +2139,34 @@ recover(uint32_t shard)
 
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, hdr.lsn,
 							 shard, id, off + sizeof(hdr));
-			/* lsn-0 (WAL-less) growth replays from the fork-meta log,
-			 * where its live clamped position was persisted; the raw
-			 * record cannot be ordered against definitive events here.
+			/* Growth that the live path clamped-and-persisted must not
+			 * ALSO re-derive from the raw record: lsn-0 records are skipped
+			 * outright, and a nonzero record BELOW the fork's first
+			 * definitive event (its creation -- no legit history can
+			 * precede that) is a clamped copied page whose floor event is
+			 * already in the meta log.  Raw records at/above the first
+			 * definitive event are real history (e.g. pre-truncate pages)
+			 * and keep their place.
+			 *
 			 * Legacy stores (an absent/empty fork-meta log, from before
-			 * events were persisted) have no definitive events to
-			 * misorder against, so their lsn-0 growth applies verbatim --
-			 * otherwise their unlogged forks would come back empty. */
-			if (hdr.lsn != 0 || fork_meta_legacy)
-				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+			 * events were persisted) have no definitive events to misorder
+			 * against; their lsn-0 growth replays through the PERSISTING
+			 * path, which write-through-migrates it into the meta log --
+			 * otherwise the flag would flip on the first new metadata
+			 * append and the second restart would bring every unlogged
+			 * fork back empty. */
+			if (fork_meta_legacy)
+				(void) fork_grow(hdr.timeline, &hdr.key, hdr.block + 1,
 								 hdr.lsn);
+			else if (hdr.lsn != 0)
+			{
+				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
+
+				if (!(fe && fe->nev && fe->ev[0].kind != FEV_GROW &&
+					  hdr.lsn < fe->ev[0].lsn))
+					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+									 hdr.lsn);
+			}
 			off += sizeof(hdr) + hdr.len;
 		}
 
