@@ -558,6 +558,47 @@ op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	cl_exec();
 }
 
+static int
+op_write_tl_status(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+				   const unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, cl_page_size);
+	return cl_exec()->status;
+}
+
+static uint32_t
+op_nblocks_asof_tl(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	return cl_exec()->result;
+}
+
+static void
+op_truncate_at_tl(uint32_t tl, uint32_t rel, int32_t fork,
+				  uint32_t nblocks, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_TRUNCATE;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn;
+	cl_exec();
+}
+
 /* Read one page (current) on a specific timeline. */
 static void
 op_read_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
@@ -718,8 +759,8 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 /* ===================== daemon lifecycle ================================ */
 
 static pid_t
-spawn_daemon(const char *daemon_path, const char *shm, const char *store,
-			 uint32_t page_size, uint32_t nshards)
+spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *store,
+					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
 {
 	pid_t		pid = fork();
 
@@ -733,6 +774,18 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		char		psbuf[16];
 		char		shbuf[16];
 
+		if (fail_seg_writes > 0)
+		{
+			char		failbuf[16];
+
+			snprintf(failbuf, sizeof(failbuf), "%d", fail_seg_writes);
+			if (setenv("PAGESTORE_TEST_FAIL_SEG_WRITES", failbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_FAIL_SEG_WRITES");
+				_exit(127);
+			}
+		}
+
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
 		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
 		/* small segments exercise rollover; a small flush threshold makes the
@@ -744,6 +797,13 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		_exit(127);
 	}
 	return pid;
+}
+
+static pid_t
+spawn_daemon(const char *daemon_path, const char *shm, const char *store,
+			 uint32_t page_size, uint32_t nshards)
+{
+	return spawn_daemon_fail_seg(daemon_path, shm, store, page_size, nshards, 0);
 }
 
 /* Wait until the daemon has published a valid header. */
@@ -784,6 +844,48 @@ stop_daemon(pid_t pid)
 {
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
+}
+
+/* On-disk fork-meta record mirror, used only to synthesize a pre-marker store. */
+typedef struct TestForkMetaRec
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint32_t	nblocks;
+	uint8_t		kind;
+	uint8_t		pad[3];
+} TestForkMetaRec;
+
+static int
+strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
+{
+	char		path[512];
+	TestForkMetaRec rec;
+	off_t		in = 0;
+	off_t		out = 0;
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", store);
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	{
+		in += sizeof(rec);
+		if ((strip_done && rec.kind == 3) ||	/* FEV_MIGRATED */
+			(strip_start && rec.kind == 4))	/* FEV_MIGRATING */
+			continue;
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			close(fd);
+			return -1;
+		}
+		out += sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return 0;
 }
 
 /* ===================== the test suite ================================== */
@@ -1014,6 +1116,11 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
 	stop_daemon(dpid);
+	/* Simulate the immediately preceding fork-event format: definitive records
+	 * exist, but migration markers do not.  This must use normal replay, not
+	 * legacy lsn-0 replay against the already-loaded truncate/unlink history. */
+	check(strip_forkmeta_markers(store, 1, 1) == 0,
+		  "synthesized a nonempty pre-marker fork-meta log");
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -1042,7 +1149,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	 * segment record is skipped; the fully preloaded meta log would have
 	 * supplied a FUTURE floor) */
 	check(op_nblocks(REL_E, FORK0) == 0,
-		  "truncated WAL-less fork stays empty after restart (no resurrection)");
+		  "pre-marker forkmeta uses normal replay: truncated WAL-less fork stays empty");
 	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
@@ -1086,13 +1193,14 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_nblocks(REL_E, FORK0) == 1,
 		  "legacy mode has no truncate events to order against (documented)");
 
-	/* the legacy replay write-through-migrates lsn-0 growth into the meta
-	 * log, so the mode is sticky: new metadata appends (which end legacy
-	 * detection) must not make the old unlogged forks come back empty on
-	 * the NEXT restart */
-	op_create_at(REL_F, FORK0, 20000);	/* any fresh meta append ends legacy mode */
+	/* The start/done markers make an interrupted migration distinguishable
+	 * from the pre-marker event format above.  Once sealed, migrated lsn-0
+	 * growth must survive every later normal restart. */
+	op_create_at(REL_F, FORK0, 20000);
 	client_detach();
 	stop_daemon(dpid);
+	check(strip_forkmeta_markers(store, 0, 1) == 0,
+		  "synthesized an interrupted migration with its start marker intact");
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -1100,7 +1208,17 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_nblocks(REL_D, FORK0) == 1,
 		  "migrated legacy sizes survive a post-legacy restart");
 	check(op_exists(REL_D, FORK0),
-		  "migrated legacy existence survives a post-legacy restart");
+		  "interrupted legacy migration resumes without losing existence");
+
+	/* The resumed scan seals the migration; the following boot is normal. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "resumed migration seals and survives a normal restart");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -1194,6 +1312,22 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(0, REL_B, FORK0) == 8, "parent size includes post-branch growth");
 	check(op_nblocks_tl(1, REL_B, FORK0) == 6, "branch size capped at its fork point");
 
+	/* A branch has no local CREATE event.  Its first definitive event may be a
+	 * later truncate; recovery must retain real branch-local growth before it. */
+	op_create_branch(3, 0, 5000);
+	fill_page(p, ps, 6000, 54);
+	op_write_tl(3, REL_B, FORK0, 9, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 2, 7000);
+	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
+		  "branch-local growth is visible before its first truncate");
+	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
+		  "branch truncate remains definitive at newest");
+
+	/* Kept event-free locally for the failed WAL-less write test below. */
+	op_create_branch(4, 0, 5000);
+	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
+		  "event-free branch inherits the parent fork size");
+
 	/* branches survive a daemon restart (timeline metadata is persisted) */
 	client_detach();
 	stop_daemon(dpid);
@@ -1205,6 +1339,34 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 22), "branch write survives daemon restart");
 	op_read_tl(1, REL_B, FORK0, 5, rb);
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
+	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
+		  "pre-truncate branch-local growth survives restart");
+	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
+		  "branch truncate survives restart");
+
+	/* Force the segment body write to fail after the small fork-meta GROW
+	 * append succeeds.  Compensation must restore the inherited size (8), not
+	 * write a hop-local SET 0 that masks the parent on the next recovery. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_fail_seg(daemon_path, shm, store, ps, test_nshards, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	fill_page(p, ps, 0, 55);
+	check(op_write_tl_status(4, REL_B, FORK0, 8, p) == PS_STATUS_ERROR,
+		  "injected segment failure rejects the WAL-less branch write");
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
+		  "failed-write compensation preserves the inherited fork size");
+	op_read_tl(4, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "failed-write compensation does not mask inherited parent pages");
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
