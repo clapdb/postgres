@@ -1173,7 +1173,7 @@ static int fork_meta_migrated = 0;	/* the log carries the migration-done marker 
 static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migration */
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 
-static void
+static int
 load_fork_meta(void)
 {
 	ForkMetaRec rec;
@@ -1205,10 +1205,8 @@ load_fork_meta(void)
 	 *
 	 * Stamp an empty log before scanning segments.  The start marker lets a
 	 * later boot distinguish an interrupted migration (continue legacy replay)
-	 * from that older, already-event-aware format (normal replay).  If the
-	 * marker cannot be made durable, recover legacy sizes in memory this run
-	 * but persist no partial migration records; the next boot will still see
-	 * an empty log and retry from the beginning.
+	 * from that older, already-event-aware format (normal replay).  The daemon
+	 * must not become writable until this marker and the final seal are durable.
 	 */
 	if (!have_records)
 	{
@@ -1216,13 +1214,17 @@ load_fork_meta(void)
 
 		memset(&zk, 0, sizeof(zk));
 		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATING) != 0)
-			fork_meta_migrate_failed = 1;
+		{
+			fprintf(stderr, "pagestore: could not start the fork-meta migration\n");
+			return -1;
+		}
 		else
 			fork_meta_migrating = 1;
 		fork_meta_legacy = 1;
 	}
 	else
 		fork_meta_legacy = fork_meta_migrating && !fork_meta_migrated;
+	return 0;
 }
 
 static void
@@ -2663,29 +2665,35 @@ ps_core_open(const char *store_dir)
 	 * the live path made (a regrow after a truncate must be kept even when
 	 * it does not exceed the pre-truncate envelope).
 	 */
-	load_fork_meta();
+	if (load_fork_meta() != 0)
+		return -1;
 
 	for (uint32_t sh = 0; sh < ns; sh++)
 		recover(sh);
 
 	/*
-	 * Seal the legacy migration once the whole scan persisted cleanly; the
-	 * marker is what ends legacy replay on later boots.  On any persist
-	 * failure the marker is withheld and the next boot retries -- replay
-	 * is idempotent against the partial migration.
+	 * Seal the legacy migration before the daemon becomes writable.  Starting
+	 * with a missing marker, or accepting writes after a partial/unsealed scan,
+	 * could create a markerless log or replay old LSN-0 pages above a newly
+	 * persisted truncate/unlink on the next boot.  Fail startup instead; replay
+	 * is idempotent and the next process retries the migration.
 	 */
-	if (fork_meta_legacy && !fork_meta_migrate_failed)
+	if (fork_meta_legacy)
 	{
 		PsKey		zk;
 
+		if (fork_meta_migrate_failed)
+		{
+			fprintf(stderr, "pagestore: fork-meta migration incomplete\n");
+			return -1;
+		}
 		memset(&zk, 0, sizeof(zk));
 		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATED) != 0)
-			fprintf(stderr, "pagestore: could not seal the fork-meta migration; "
-					"legacy replay will run again next start\n");
+		{
+			fprintf(stderr, "pagestore: could not seal the fork-meta migration\n");
+			return -1;
+		}
 	}
-	else if (fork_meta_legacy)
-		fprintf(stderr, "pagestore: fork-meta migration incomplete; "
-				"legacy replay will run again next start\n");
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
