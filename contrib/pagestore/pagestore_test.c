@@ -408,6 +408,33 @@ op_write_slru(uint32_t obj, uint32_t block, const unsigned char *page,
 	cl_exec();
 }
 
+static uint32_t
+op_nblocks_slru(uint32_t obj)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = 0;
+	return cl_exec()->result;
+}
+
+static void
+op_read_slru(uint32_t obj, uint32_t block, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
 /* SLRU-class as-of read (READ_AT zero-fills on no-version-<=lsn). */
 static void
 op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
@@ -1021,6 +1048,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 #define REL_J	25000
 #define REL_K	26000
 #define FORK0	0
+#define SLRU_ZERO_OBJ	4243
 
 static void
 run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
@@ -1248,6 +1276,16 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		check(page_has_tag(rb, page_size, 222), "slru read_at(max) = newest snapshot");
 	}
 
+	/* Version zero is a legitimate newest-only object image.  It uses SEG0 so
+	 * the complete segment record recovers both the bytes and block growth. */
+	fill_page(pa, page_size, 0, 110);
+	op_write_slru(SLRU_ZERO_OBJ, 2, pa, 0);
+	check(op_nblocks_slru(SLRU_ZERO_OBJ) == 3,
+		  "zero-version SLRU write grows its object fork");
+	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "zero-version SLRU object serves before restart");
+
 	/* --- WAL retention floor from mirrored pg_control notes ------------- */
 	{
 		unsigned char *note = calloc(1, page_size);
@@ -1348,6 +1386,11 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "COW history survives restart (read_at old version)");
 	check(op_wal_retain_floor(0) == 5000,
 		  "wal retention floor survives daemon restart (durable via segment log)");
+	check(op_nblocks_slru(SLRU_ZERO_OBJ) == 3,
+		  "zero-version SLRU growth survives daemon restart");
+	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "zero-version SLRU object survives daemon restart");
 
 	/* fork-size history survives: definitive events from the fork-meta log,
 	 * growth re-derived from the segment records' own LSNs */
