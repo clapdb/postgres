@@ -454,6 +454,8 @@ cleanup:
 
 #define SEG_MAGIC		 0x53454732 /* "SEG2": v2 record (PsKey gained klass) */
 #define SEG_WALLESS_MAGIC 0x53454730 /* "SEG0": zero-version record + growth floor */
+#define SEG_WALLESS_ORDERED_MAGIC 0x53454731 /* "SEG1": SEG0 + required order marker */
+#define SEG_CLAMPED_ORDERED_MAGIC 0x53454733 /* "SEG3": clamped version + marker */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -464,7 +466,7 @@ cleanup:
  */
 typedef struct SegRecHdr
 {
-	uint32_t	magic;			/* SEG_MAGIC or SEG_WALLESS_MAGIC */
+	uint32_t	magic;			/* one of the SEG*_MAGIC values above */
 	uint32_t	timeline;		/* timeline the version belongs to */
 	PsKey		key;
 	uint32_t	block;
@@ -530,7 +532,7 @@ typedef struct ForkEvent
 #define FEV_DEAD	2
 #define FEV_MIGRATED 3			/* log marker: legacy lsn-0 migration completed */
 #define FEV_MIGRATING 4			/* log marker: legacy migration started */
-#define FEV_SEG0_GROW 5			/* ordering placeholder, activated by SEG0 replay */
+#define FEV_SEG_GROW 5			/* ordering placeholder, activated by segment replay */
 
 typedef struct ForkEnt
 {
@@ -775,7 +777,7 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
 
 		if (v->lsn > cap)
 			continue;
-		if (v->kind == FEV_SEG0_GROW)
+		if (v->kind == FEV_SEG_GROW)
 			continue;			/* marker alone never changes fork size */
 		if (v->kind == FEV_GROW)
 		{
@@ -876,12 +878,12 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 }
 
 /*
- * Preserve a SEG0 growth's position among equal-LSN fork-meta events without
+ * Preserve a segment growth's position among equal-LSN fork-meta events without
  * making the marker itself a size event.  Recovery activates the placeholder
  * only after validating the matching segment header and complete page body.
  */
 static void
-fork_event_add_seg0_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 {
 	uint32_t	i;
 
@@ -898,18 +900,18 @@ fork_event_add_seg0_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	}
 	e->ev[i].lsn = lsn;
 	e->ev[i].nblocks = nblocks;
-	e->ev[i].kind = FEV_SEG0_GROW;
+	e->ev[i].kind = FEV_SEG_GROW;
 	e->nev++;
 }
 
 static int
-fork_event_activate_seg0(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 {
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
 		ForkEvent  *v = &e->ev[i];
 
-		if (v->kind == FEV_SEG0_GROW && v->lsn == lsn &&
+		if (v->kind == FEV_SEG_GROW && v->lsn == lsn &&
 			v->nblocks == nblocks)
 		{
 			v->kind = FEV_GROW;
@@ -939,7 +941,7 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	return 0;
 }
 
-/* Apply growth whose durability is already represented by metadata or SEG0. */
+/* Apply growth whose durability is already represented by metadata/segment. */
 static void
 fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 				uint64_t lsn)
@@ -1213,9 +1215,10 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 /*
  * Replay the fork-meta log before the segment scan.  Preloading definitive
  * events lets segment growth dedup and clamp detection see the complete size
- * history.  SEG0 ordering placeholders retain their exact position among
- * equal-LSN metadata events and are activated only by a matching complete
- * segment record.  Invalid records are skipped, mirroring load_timelines().
+ * history.  Segment-growth ordering placeholders retain their exact position
+ * among equal-LSN metadata events and are activated only by a matching
+ * complete segment record.  Invalid records are skipped, mirroring
+ * load_timelines().
  */
 static int fork_meta_migrating = 0;	/* the log carries the migration-start marker */
 static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
@@ -1236,8 +1239,8 @@ load_fork_meta(void)
 			fork_meta_migrated = 1;
 		else if (rec.kind == FEV_MIGRATING)
 			fork_meta_migrating = 1;
-		else if (rec.kind == FEV_SEG0_GROW && rec.timeline < MAX_TIMELINES)
-			fork_event_add_seg0_marker(
+		else if (rec.kind == FEV_SEG_GROW && rec.timeline < MAX_TIMELINES)
+			fork_event_add_seg_marker(
 				fork_get_or_create(rec.timeline, &rec.key),
 				rec.lsn, rec.nblocks);
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
@@ -1734,8 +1737,25 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	data_off;
 	uint64_t	hdr_grow_lsn = 0;
 	uint64_t	page_version;
-	int			seg0_grows = 0;
+	int			clamped = 0;
+	int			ordered_growth = 0;
+	int			zero_version = 0;
 	Shard	   *s = shard_for(key);
+	ForkEnt    *fe = fork_get_or_create(timeline, key);
+	uint64_t	branch_floor = 0;
+	uint64_t	growth_floor = fe->last_def_lsn;
+
+	/* A branch-local version written after the branch snapshot must not become
+	 * visible AT that snapshot merely because copied bytes retain an older
+	 * source LSN.  The first representable local position is branch_lsn + 1. */
+	if (timeline_has_parent(timeline))
+	{
+		branch_floor = timelines[timeline].branch_lsn;
+		if (branch_floor < UINT64_MAX)
+			branch_floor++;
+		if (branch_floor > growth_floor)
+			growth_floor = branch_floor;
+	}
 
 	/* roll over to a fresh segment when the current one would overflow */
 	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
@@ -1791,47 +1811,57 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * shapes, two treatments:
 	 *
 	 * - A copied relation page with a NONZERO source pd_lsn below the
-	 *   fork's definitive floor (skip-WAL rewrites) has its RECORD stamped
+	 *   fork/branch floor (skip-WAL rewrites) has its RECORD stamped
 	 *   at the floor: version visibility, the growth event and recovery
 	 *   (which re-derives from the record) then all agree -- an as-of read
 	 *   below the fork's creation sees neither the size nor the bytes, and
 	 *   nothing needs a separate durable event.
 	 *
 	 * - A zero-version record must KEEP version 0 -- capped reads refuse
-	 *   LSN-0 versions by design.  Its SEG0 header stores the growth floor
-	 *   while the in-memory page/object version remains zero, so one complete
-	 *   segment record recovers both bytes and size with no cross-log window.
+	 *   LSN-0 versions by design.  Its header stores the growth floor while
+	 *   the in-memory page/object version remains zero.  A size-raising record
+	 *   uses SEG1 and requires its inert fork-meta ordering marker at recovery;
+	 *   a zero-version rewrite that does not grow remains compatible SEG0.
 	 */
 	if (key->klass == PS_KLASS_RELATION)
 	{
-		ForkEnt    *fe = fork_get_or_create(timeline, key);
-
-		if (hdr.lsn != 0 && hdr.lsn < fe->last_def_lsn)
+		if (hdr.lsn != 0 && hdr.lsn < growth_floor)
 		{
-			uint32_t	visible;
-			int			existed_before;
+			/* Every below-branch-point local copy is later than the snapshot,
+			 * even when it rewrites an inherited block.  Definitive-event clamps
+			 * retain the narrower grow/nonexistence test so old retained-block
+			 * flushes keep their real pre-truncate LSN. */
+			if (branch_floor != 0 && hdr.lsn < branch_floor)
+				clamped = 1;
+			else
+			{
+				uint32_t	visible;
+				int			existed_before;
 
-			ps_lock_map_rd();
-			visible = fork_nblocks_through(timeline, key, fe->last_def_lsn);
-			existed_before = fe->last_def_lsn > 0 &&
-				fork_exists_through(timeline, key, fe->last_def_lsn - 1);
-			ps_unlock_map();
-			if (visible < block + 1 || !existed_before)
-				hdr.lsn = fe->last_def_lsn;
+				ps_lock_map_rd();
+				visible = fork_nblocks_through(timeline, key, growth_floor);
+				existed_before = growth_floor > 0 &&
+					fork_exists_through(timeline, key, growth_floor - 1);
+				ps_unlock_map();
+				clamped = visible < block + 1 || !existed_before;
+			}
+			if (clamped)
+				hdr.lsn = growth_floor;
 		}
 	}
 	if (hdr.lsn == 0)
 	{
-		ForkEnt    *fe = fork_get_or_create(timeline, key);
-
 		hdr.magic = SEG_WALLESS_MAGIC;
-		hdr.lsn = fe->last_def_lsn;
+		hdr.lsn = growth_floor;
+		zero_version = 1;
 	}
 	hdr_grow_lsn = hdr.lsn;
-	page_version = hdr.magic == SEG_WALLESS_MAGIC ? 0 : hdr.lsn;
-	if (hdr.magic == SEG_WALLESS_MAGIC)
-		seg0_grows = fork_size_asof_hop(
-			fork_get_or_create(timeline, key), hdr_grow_lsn) < block + 1;
+	page_version = zero_version ? 0 : hdr.lsn;
+	ordered_growth = (zero_version || clamped) &&
+		fork_size_asof_hop(fe, hdr_grow_lsn) < block + 1;
+	if (ordered_growth)
+		hdr.magic = zero_version ? SEG_WALLESS_ORDERED_MAGIC :
+			SEG_CLAMPED_ORDERED_MAGIC;
 
 	/* write header then page bytes contiguously at the append cursor */
 	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
@@ -1845,9 +1875,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * records its position among equal-LSN definitive events.  Recovery ignores
 	 * an unmatched marker, so a torn/missing segment cannot manufacture size.
 	 */
-	if (seg0_grows &&
+	if (ordered_growth &&
 		fork_meta_persist(timeline, key, hdr_grow_lsn, block + 1,
-						  FEV_SEG0_GROW) != 0)
+						  FEV_SEG_GROW) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
@@ -2195,6 +2225,8 @@ recover(uint32_t shard)
 		for (;;)
 		{
 			SegRecHdr	hdr;
+			int			ordered;
+			int			order_activated = 0;
 			int			wal_less;
 			uint64_t	page_version;
 
@@ -2202,8 +2234,11 @@ recover(uint32_t shard)
 				break;			/* short read -> end of this segment's data */
 			if (hdr.magic == 0)
 				break;			/* zeroed slot -> normal end-of-log sentinel */
-			wal_less = hdr.magic == SEG_WALLESS_MAGIC;
-			if (hdr.magic != SEG_MAGIC && !wal_less)
+			wal_less = hdr.magic == SEG_WALLESS_MAGIC ||
+				hdr.magic == SEG_WALLESS_ORDERED_MAGIC;
+			ordered = hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
+				hdr.magic == SEG_CLAMPED_ORDERED_MAGIC;
+			if (hdr.magic != SEG_MAGIC && !wal_less && !ordered)
 			{
 				/*
 				 * A non-zero magic that isn't ours is a record written by an
@@ -2213,9 +2248,9 @@ recover(uint32_t shard)
 				 * migrated offline) under the new format.
 				 */
 				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
-						"record magic %#x (expected %#x or %#x) at offset %llu; this store "
+						"record magic %#x at offset %llu; this store "
 						"predates the current on-disk format and must be recreated\n",
-						shard, id, hdr.magic, SEG_MAGIC, SEG_WALLESS_MAGIC,
+						shard, id, hdr.magic,
 						(unsigned long long) off);
 				exit(1);
 			}
@@ -2233,11 +2268,29 @@ recover(uint32_t shard)
 			if (seg_bytes < (int64_t) (off + sizeof(hdr) + hdr.len))
 				break;
 
+			/* Ordered records are committed by their matching inert fork-meta
+			 * placeholder.  A complete body without that marker is the tail of a
+			 * failed/unacknowledged append: leave the cursor here so it is
+			 * overwritten, and publish neither its bytes nor its growth. */
+			if (ordered)
+			{
+				order_activated = fork_event_activate_seg(
+					fork_get_or_create(hdr.timeline, &hdr.key),
+					hdr.lsn, hdr.block + 1);
+				/* A deliberately synthesized/real pre-events store has no
+				 * definitive metadata to misorder against.  Its segment records
+				 * are the migration source even if their newer magic normally
+				 * requires a marker that disappeared with the old metadata log. */
+				if (!order_activated && !fork_meta_legacy)
+					break;
+			}
+
 			page_version = wal_less ? 0 : hdr.lsn;
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, page_version,
 							 shard, id, off + sizeof(hdr));
-			/* SEG0 carries zero-version growth at its stored floor, while every
-			 * ordinary nonzero record re-derives growth at its stored LSN.
+			/* Ordered SEG1/SEG3 growth was activated at its fork-meta position
+			 * above.  Legacy SEG0 carries zero-version growth at its stored floor,
+			 * while ordinary SEG2 re-derives growth at its stored LSN.
 			 * Markerless formats carry no reliable per-record correlation for
 			 * deciding that a later GROW was a clamp rather than a real regrow,
 			 * so guessing here would discard legitimate pre-truncate history.
@@ -2249,18 +2302,7 @@ recover(uint32_t shard)
 			 * otherwise the flag would flip on the first new metadata
 			 * append and the second restart would bring every unlogged
 			 * fork back empty. */
-			if (wal_less)
-			{
-				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
-
-				/* New records activate their fork-meta ordering placeholder.
-				 * Markerless SEG0 records predate that format (or reached disk just
-				 * before a crash) and retain the compatible arrival-order replay. */
-				if (!fork_event_activate_seg0(fe, hdr.lsn, hdr.block + 1))
-					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
-									 hdr.lsn);
-			}
-			else if (fork_meta_legacy)
+			if (fork_meta_legacy)
 			{
 				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
 				uint64_t	l = hdr.lsn ? hdr.lsn : fe->last_def_lsn;
@@ -2277,7 +2319,13 @@ recover(uint32_t shard)
 					fork_event_add(fe, l, hdr.block + 1, FEV_GROW);
 				}
 			}
-			else if (hdr.lsn != 0)
+			else if (!ordered && wal_less)
+			{
+				/* Markerless SEG0 predates ordered segment records. */
+				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+								 hdr.lsn);
+			}
+			else if (!ordered && hdr.lsn != 0)
 				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
 								 hdr.lsn);
 			off += sizeof(hdr) + hdr.len;
