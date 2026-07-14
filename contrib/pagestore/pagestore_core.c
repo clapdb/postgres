@@ -530,6 +530,7 @@ typedef struct ForkEvent
 #define FEV_DEAD	2
 #define FEV_MIGRATED 3			/* log marker: legacy lsn-0 migration completed */
 #define FEV_MIGRATING 4			/* log marker: legacy migration started */
+#define FEV_SEG0_GROW 5			/* ordering placeholder, activated by SEG0 replay */
 
 typedef struct ForkEnt
 {
@@ -774,6 +775,8 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
 
 		if (v->lsn > cap)
 			continue;
+		if (v->kind == FEV_SEG0_GROW)
+			continue;			/* marker alone never changes fork size */
 		if (v->kind == FEV_GROW)
 		{
 			if (v->nblocks > grow)
@@ -863,13 +866,58 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 	else if (kind == FEV_GROW)
 	{
 		for (uint32_t j = e->nev - 1; j > i; j--)
-			if (e->ev[j].kind != FEV_GROW)
+			if (e->ev[j].kind == FEV_SET || e->ev[j].kind == FEV_DEAD)
 				return;			/* covered by a newer definitive event */
 		if (nblocks > e->nblocks)
 			e->nblocks = nblocks;
 	}
 	else
 		e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+}
+
+/*
+ * Preserve a SEG0 growth's position among equal-LSN fork-meta events without
+ * making the marker itself a size event.  Recovery activates the placeholder
+ * only after validating the matching segment header and complete page body.
+ */
+static void
+fork_event_add_seg0_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+{
+	uint32_t	i;
+
+	if (e->nev == e->evcap)
+	{
+		e->evcap = e->evcap ? e->evcap * 2 : 4;
+		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
+	}
+	i = e->nev;
+	while (i > 0 && e->ev[i - 1].lsn > lsn)
+	{
+		e->ev[i] = e->ev[i - 1];
+		i--;
+	}
+	e->ev[i].lsn = lsn;
+	e->ev[i].nblocks = nblocks;
+	e->ev[i].kind = FEV_SEG0_GROW;
+	e->nev++;
+}
+
+static int
+fork_event_activate_seg0(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+{
+	for (uint32_t i = 0; i < e->nev; i++)
+	{
+		ForkEvent  *v = &e->ev[i];
+
+		if (v->kind == FEV_SEG0_GROW && v->lsn == lsn &&
+			v->nblocks == nblocks)
+		{
+			v->kind = FEV_GROW;
+			e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+			return 1;
+		}
+	}
+	return 0;
 }
 
 int
@@ -1165,8 +1213,9 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 /*
  * Replay the fork-meta log before the segment scan.  Preloading definitive
  * events lets segment growth dedup and clamp detection see the complete size
- * history; event insertion itself remains order-independent.  Invalid records
- * are skipped, mirroring load_timelines().
+ * history.  SEG0 ordering placeholders retain their exact position among
+ * equal-LSN metadata events and are activated only by a matching complete
+ * segment record.  Invalid records are skipped, mirroring load_timelines().
  */
 static int fork_meta_migrating = 0;	/* the log carries the migration-start marker */
 static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
@@ -1187,6 +1236,10 @@ load_fork_meta(void)
 			fork_meta_migrated = 1;
 		else if (rec.kind == FEV_MIGRATING)
 			fork_meta_migrating = 1;
+		else if (rec.kind == FEV_SEG0_GROW && rec.timeline < MAX_TIMELINES)
+			fork_event_add_seg0_marker(
+				fork_get_or_create(rec.timeline, &rec.key),
+				rec.lsn, rec.nblocks);
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
@@ -1681,6 +1734,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	data_off;
 	uint64_t	hdr_grow_lsn = 0;
 	uint64_t	page_version;
+	int			seg0_grows = 0;
 	Shard	   *s = shard_for(key);
 
 	/* roll over to a fresh segment when the current one would overflow */
@@ -1775,12 +1829,25 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = hdr.magic == SEG_WALLESS_MAGIC ? 0 : hdr.lsn;
+	if (hdr.magic == SEG_WALLESS_MAGIC)
+		seg0_grows = fork_size_asof_hop(
+			fork_get_or_create(timeline, key), hdr_grow_lsn) < block + 1;
 
 	/* write header then page bytes contiguously at the append cursor */
 	if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off, &hdr, sizeof(hdr)) != 0)
 		return -1;
 	data_off = s->cur_off + sizeof(hdr);
 	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
+		return -1;
+
+	/*
+	 * The segment record is the growth's durability; this metadata marker only
+	 * records its position among equal-LSN definitive events.  Recovery ignores
+	 * an unmatched marker, so a torn/missing segment cannot manufacture size.
+	 */
+	if (seg0_grows &&
+		fork_meta_persist(timeline, key, hdr_grow_lsn, block + 1,
+						  FEV_SEG0_GROW) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
@@ -2183,8 +2250,16 @@ recover(uint32_t shard)
 			 * append and the second restart would bring every unlogged
 			 * fork back empty. */
 			if (wal_less)
-				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
-								 hdr.lsn);
+			{
+				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
+
+				/* New records activate their fork-meta ordering placeholder.
+				 * Markerless SEG0 records predate that format (or reached disk just
+				 * before a crash) and retain the compatible arrival-order replay. */
+				if (!fork_event_activate_seg0(fe, hdr.lsn, hdr.block + 1))
+					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+									 hdr.lsn);
+			}
 			else if (fork_meta_legacy)
 			{
 				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
