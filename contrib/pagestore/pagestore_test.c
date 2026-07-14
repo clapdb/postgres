@@ -1034,6 +1034,54 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 	}
 }
 
+static void
+run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29000;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== segment order-marker failure ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_order_fail", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_order_fail", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	/* Fresh startup writes migration start/done (#1/#2), CREATE is #3, and
+	 * the ordered segment-growth marker is #4. */
+	pid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
+								  test_nshards, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 0, 70);
+	check(op_write_tl_status(0, rel, 0, 0, page) == PS_STATUS_ERROR,
+		  "order-marker failure rejects the growing segment write");
+	client_detach();
+	stop_daemon(pid);
+
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 0,
+		  "markerless ordered record does not grow after restart");
+	op_read_one(rel, 0, 0, readback);
+	check(page_all_zero(readback, ps),
+		  "markerless ordered record does not publish bytes after restart");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
 /* ===================== the test suite ================================== */
 
 #define REL_A	16000
@@ -1049,6 +1097,8 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 #define REL_K	26000
 #define REL_L	27000
 #define REL_M	28000
+#define REL_N	29000
+#define REL_O	30000
 #define FORK0	0
 #define SLRU_ZERO_OBJ	4243
 
@@ -1201,6 +1251,20 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_unlink_at(REL_M, FORK0, 4000);
 	check(!op_exists(REL_M, FORK0),
 		  "same-LSN unlink wins over earlier WAL-less growth");
+	/* The same ordering rule applies when a copied nonzero page is clamped
+	 * from its source pd_lsn to the fork's definitive floor. */
+	op_create_at(REL_N, FORK0, 5000);
+	fill_page(pa, page_size, 3000, 71);
+	op_write_one(REL_N, FORK0, 0, pa);
+	op_truncate_at(REL_N, FORK0, 0, 5000);
+	check(op_nblocks(REL_N, FORK0) == 0,
+		  "same-LSN truncate wins over earlier clamped copied growth");
+	op_create_at(REL_O, FORK0, 6000);
+	fill_page(pa, page_size, 4000, 72);
+	op_write_one(REL_O, FORK0, 0, pa);
+	op_unlink_at(REL_O, FORK0, 6000);
+	check(!op_exists(REL_O, FORK0),
+		  "same-LSN unlink wins over earlier clamped copied growth");
 	/* copied pages keep their SOURCE pd_lsn, which can sit below the new
 	 * fork's create SET (skip-WAL relation rewrites): growth clamps to the
 	 * definitive floor instead of vanishing under it */
@@ -1337,10 +1401,10 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		free(note);
 	}
 
-	/* Crash exactly after a growing WAL-less page body reaches the segment.
-	 * SEG0 carries its growth floor in that same complete record, so recovery
-	 * must expose the page and size together.  The request process waits on the
-	 * dead daemon, so run it in a disposable child. */
+	/* Crash exactly after a growing WAL-less page body reaches the segment but
+	 * before its ordering marker commits the new SEG1 record.  Recovery must
+	 * reject both bytes and growth.  The request process waits on the dead
+	 * daemon, so run it in a disposable child. */
 	op_create_at(REL_I, FORK0, 11000);
 	client_detach();
 	stop_daemon(dpid);
@@ -1374,11 +1438,11 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
 	client_attach(shm, page_size);
-	check(op_nblocks(REL_I, FORK0) == 1,
-		  "complete WAL-less record recovers its size after a crash");
+	check(op_nblocks(REL_I, FORK0) == 0,
+		  "uncommitted ordered record does not recover size after a crash");
 	op_read_one(REL_I, FORK0, 0, rb);
-	check(page_has_tag(rb, page_size, 65),
-		  "complete WAL-less record recovers its page with the size");
+	check(page_all_zero(rb, page_size),
+		  "uncommitted ordered record does not recover page bytes");
 
 	client_detach();
 
@@ -1427,6 +1491,10 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "same-LSN truncate remains after SEG0 growth on recovery");
 	check(!op_exists(REL_M, FORK0),
 		  "same-LSN unlink remains after SEG0 growth on recovery");
+	check(op_nblocks(REL_N, FORK0) == 0,
+		  "same-LSN truncate remains after clamped copied growth on recovery");
+	check(!op_exists(REL_O, FORK0),
+		  "same-LSN unlink remains after clamped copied growth on recovery");
 	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
@@ -1450,8 +1518,8 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  op_nblocks_asof(REL_K, FORK0, 5000) == 3,
 		  "zeroextend persists only its clamped floor across recovery");
 	op_read_one(REL_I, FORK0, 0, rb);
-	check(page_has_tag(rb, page_size, 65),
-		  "self-describing WAL-less record survives another restart");
+	check(page_all_zero(rb, page_size),
+		  "uncommitted ordered record stays absent after another restart");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
@@ -1620,6 +1688,19 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
 		  "event-free branch inherits the parent fork size");
 
+	/* A copied branch-local page keeps the parent's old source pd_lsn, but the
+	 * write happened after the branch snapshot.  Stamp it just above the branch
+	 * point so an as-of read AT the fork still inherits the parent image. */
+	op_create_branch(5, 0, 5000);
+	fill_page(p, ps, 1000, 56);
+	op_write_tl(5, REL_B, FORK0, 0, p);
+	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "branch-point read hides a later copied-page rewrite");
+	op_read_tl(5, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 56),
+		  "newest branch read sees its copied-page rewrite");
+
 	/* branches survive a daemon restart (timeline metadata is persisted) */
 	client_detach();
 	stop_daemon(dpid);
@@ -1635,10 +1716,15 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 		  "pre-truncate branch-local growth survives restart");
 	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
 		  "branch truncate survives restart");
+	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "branch-point copied-page floor survives restart");
+	op_read_tl(5, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 56),
+		  "branch copied-page rewrite survives restart above its floor");
 
-	/* Force the segment body write to fail after the small fork-meta GROW
-	 * append succeeds.  Compensation must restore the inherited size (8), not
-	 * write a hop-local SET 0 that masks the parent on the next recovery. */
+	/* Force the segment write to fail before its ordering marker.  No local
+	 * growth may appear or mask the inherited size (8) on the next recovery. */
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
@@ -1655,10 +1741,10 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
-		  "failed-write compensation preserves the inherited fork size");
+		  "failed segment write preserves the inherited fork size");
 	op_read_tl(4, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11),
-		  "failed-write compensation does not mask inherited parent pages");
+		  "failed segment write does not mask inherited parent pages");
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
@@ -2211,6 +2297,8 @@ main(int argc, char **argv)
 
 	/* Legacy migration must seal before the daemon publishes readiness. */
 	run_migration_failure_suite(daemon_path, tmpbase);
+	/* A failed ordering-marker append must not commit segment bytes. */
+	run_order_marker_failure_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
