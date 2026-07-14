@@ -453,7 +453,7 @@ cleanup:
 /* ===================== segment storage (log-structured) ================= */
 
 #define SEG_MAGIC		 0x53454732 /* "SEG2": v2 record (PsKey gained klass) */
-#define SEG_WALLESS_MAGIC 0x53454730 /* "SEG0": LSN-0 page with growth floor */
+#define SEG_WALLESS_MAGIC 0x53454730 /* "SEG0": zero-version record + growth floor */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -468,7 +468,7 @@ typedef struct SegRecHdr
 	uint32_t	timeline;		/* timeline the version belongs to */
 	PsKey		key;
 	uint32_t	block;
-	uint64_t	lsn;			/* pd_lsn, or SEG0's fork-growth floor */
+	uint64_t	lsn;			/* version LSN, or SEG0's fork-growth floor */
 	uint32_t	len;			/* page bytes following the header */
 } SegRecHdr;
 
@@ -1743,9 +1743,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 *   below the fork's creation sees neither the size nor the bytes, and
 	 *   nothing needs a separate durable event.
 	 *
-	 * - A WAL-less page (pd_lsn 0) must KEEP version 0 -- capped reads
-	 *   refuse LSN-0 versions by design.  Its SEG0 header stores the growth
-	 *   floor while the in-memory page version remains zero, so one complete
+	 * - A zero-version record must KEEP version 0 -- capped reads refuse
+	 *   LSN-0 versions by design.  Its SEG0 header stores the growth floor
+	 *   while the in-memory page/object version remains zero, so one complete
 	 *   segment record recovers both bytes and size with no cross-log window.
 	 */
 	if (key->klass == PS_KLASS_RELATION)
@@ -1765,11 +1765,13 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			if (visible < block + 1 || !existed_before)
 				hdr.lsn = fe->last_def_lsn;
 		}
-		else if (hdr.lsn == 0)
-		{
-			hdr.magic = SEG_WALLESS_MAGIC;
-			hdr.lsn = fe->last_def_lsn;
-		}
+	}
+	if (hdr.lsn == 0)
+	{
+		ForkEnt    *fe = fork_get_or_create(timeline, key);
+
+		hdr.magic = SEG_WALLESS_MAGIC;
+		hdr.lsn = fe->last_def_lsn;
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = hdr.magic == SEG_WALLESS_MAGIC ? 0 : hdr.lsn;
@@ -1829,8 +1831,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * block is readable as of a horizon iff it has a version at/below it,
 	 * so keying the GROW event by hdr.lsn makes as-of NBLOCKS agree with
 	 * as-of page reads block for block.  (This replaces the callers'
-	 * former one-shot fork_grow after a batch.)  SEG0 stores a WAL-less
-	 * page's growth floor in the same record while its page version stays 0.
+	 * former one-shot fork_grow after a batch.)  SEG0 stores a zero-version
+	 * page/object's growth floor in the same record while its version stays 0.
 	 */
 	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn);
 	return 0;
@@ -2167,7 +2169,7 @@ recover(uint32_t shard)
 			page_version = wal_less ? 0 : hdr.lsn;
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, page_version,
 							 shard, id, off + sizeof(hdr));
-			/* SEG0 carries WAL-less growth at its stored floor, while every
+			/* SEG0 carries zero-version growth at its stored floor, while every
 			 * ordinary nonzero record re-derives growth at its stored LSN.
 			 * Markerless formats carry no reliable per-record correlation for
 			 * deciding that a later GROW was a clamp rather than a real regrow,
