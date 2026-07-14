@@ -44,6 +44,7 @@ static int *seg_fds_caps;
 static int seg_shards_cap;
 static int test_fail_seg_writes;
 static int test_crash_after_seg_writes;
+static int test_fail_fork_meta_append_at;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -184,6 +185,7 @@ posix_open(const char *path, uint64_t segment_size)
 {
 	const char *fail_writes;
 	const char *crash_after_writes;
+	const char *fail_fork_meta_at;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
@@ -198,6 +200,9 @@ posix_open(const char *path, uint64_t segment_size)
 	crash_after_writes = getenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
 	test_crash_after_seg_writes = crash_after_writes ?
 		atoi(crash_after_writes) : 0;
+	fail_fork_meta_at = getenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
+	test_fail_fork_meta_append_at = fail_fork_meta_at ?
+		atoi(fail_fork_meta_at) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	return 0;
 }
@@ -519,6 +524,13 @@ posix_meta_read(uint64_t off, void *buf, uint32_t len)
 static int
 posix_fork_meta_append(const void *buf, uint32_t len)
 {
+	/* Standalone-test fault injection; ordinary deployments leave this zero. */
+	if (test_fail_fork_meta_append_at > 0 &&
+		--test_fail_fork_meta_append_at == 0)
+	{
+		errno = EIO;
+		return -1;
+	}
 	return posix_log_append("forkmeta", buf, len);
 }
 

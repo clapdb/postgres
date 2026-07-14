@@ -761,7 +761,7 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 static pid_t
 spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
 				   uint32_t page_size, uint32_t nshards, int fail_seg_writes,
-				   int crash_after_seg_writes)
+				   int crash_after_seg_writes, int fail_fork_meta_append_at)
 {
 	pid_t		pid = fork();
 
@@ -777,6 +777,7 @@ spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
 
 		unsetenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
 		unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+		unsetenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
 		if (fail_seg_writes > 0)
 		{
 			char		failbuf[16];
@@ -799,6 +800,17 @@ spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
 				_exit(127);
 			}
 		}
+		if (fail_fork_meta_append_at > 0)
+		{
+			char		failbuf[16];
+
+			snprintf(failbuf, sizeof(failbuf), "%d", fail_fork_meta_append_at);
+			if (setenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT", failbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
+				_exit(127);
+			}
+		}
 
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
 		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
@@ -818,7 +830,7 @@ spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *stor
 					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
 {
 	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
-							  fail_seg_writes, 0);
+							  fail_seg_writes, 0, 0);
 }
 
 static pid_t
@@ -827,14 +839,23 @@ spawn_daemon_crash_after_seg(const char *daemon_path, const char *shm,
 							 uint32_t nshards, int crash_after_seg_writes)
 {
 	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0,
-							  crash_after_seg_writes);
+							  crash_after_seg_writes, 0);
+}
+
+static pid_t
+spawn_daemon_fail_fork_meta(const char *daemon_path, const char *shm,
+							const char *store, uint32_t page_size,
+							uint32_t nshards, int fail_append_at)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0,
+							  fail_append_at);
 }
 
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 			 uint32_t page_size, uint32_t nshards)
 {
-	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0);
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0, 0);
 }
 
 /* Wait until the daemon has published a valid header. */
@@ -868,6 +889,39 @@ wait_ready(const char *shm, uint32_t page_size)
 	}
 	fprintf(stderr, "daemon did not become ready\n");
 	exit(2);
+}
+
+static void
+expect_daemon_open_failure(pid_t pid, const char *shm, const char *message)
+{
+	int			status = 0;
+	int			exited = 0;
+
+	for (int i = 0; i < 500; i++)
+	{
+		pid_t		r = waitpid(pid, &status, WNOHANG);
+
+		if (r == pid)
+		{
+			exited = 1;
+			break;
+		}
+		usleep(10000);
+	}
+	if (!exited)
+	{
+		kill(pid, SIGKILL);
+		waitpid(pid, &status, 0);
+	}
+	check(exited && WIFEXITED(status) && WEXITSTATUS(status) != 0,
+		  "%s", message);
+	{
+		int			fd = shm_open(shm, O_RDWR, 0600);
+
+		check(fd < 0, "%s does not publish shared-memory readiness", message);
+		if (fd >= 0)
+			close(fd);
+	}
 }
 
 static void
@@ -917,6 +971,40 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
 		return -1;
 	return 0;
+}
+
+static void
+run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+
+	fprintf(stderr, "== legacy migration failures ==\n");
+	for (int fail_at = 1; fail_at <= 2; fail_at++)
+	{
+		pid_t		pid;
+		char		message[96];
+
+		snprintf(shm, sizeof(shm), "/pstest_%d_migrate_%d",
+				 (int) getpid(), fail_at);
+		snprintf(store, sizeof(store), "%s/store_migrate_%d", tmpbase, fail_at);
+		rm_rf(store);
+		shm_unlink(shm);
+		pid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
+									  test_nshards, fail_at);
+		snprintf(message, sizeof(message),
+				 "migration append %d failure aborts daemon startup", fail_at);
+		expect_daemon_open_failure(pid, shm, message);
+
+		/* The failed process published no writes; a normal restart retries and
+		 * seals either the absent start marker or the surviving start marker. */
+		pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+		wait_ready(shm, ps);
+		stop_daemon(pid);
+		rm_rf(store);
+		shm_unlink(shm);
+	}
 }
 
 /* ===================== the test suite ================================== */
@@ -2057,6 +2145,9 @@ main(int argc, char **argv)
 		perror("mkdtemp");
 		return 2;
 	}
+
+	/* Legacy migration must seal before the daemon publishes readiness. */
+	run_migration_failure_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
