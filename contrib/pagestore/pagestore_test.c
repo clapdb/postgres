@@ -1047,6 +1047,8 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 #define REL_I	24000
 #define REL_J	25000
 #define REL_K	26000
+#define REL_L	27000
+#define REL_M	28000
 #define FORK0	0
 #define SLRU_ZERO_OBJ	4243
 
@@ -1185,6 +1187,20 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_write_one(REL_E, FORK0, 0, pa);
 	op_truncate_at(REL_E, FORK0, 0, 2000);
 	check(op_nblocks(REL_E, FORK0) == 0, "WAL-less fork truncated to empty");
+	/* Equal LSNs still have an operation order.  SEG0's fork-meta ordering
+	 * marker must keep the later definitive event after the earlier growth. */
+	op_create_at(REL_L, FORK0, 3000);
+	fill_page(pa, page_size, 0, 68);
+	op_write_one(REL_L, FORK0, 0, pa);
+	op_truncate_at(REL_L, FORK0, 0, 3000);
+	check(op_nblocks(REL_L, FORK0) == 0,
+		  "same-LSN truncate wins over earlier WAL-less growth");
+	op_create_at(REL_M, FORK0, 4000);
+	fill_page(pa, page_size, 0, 69);
+	op_write_one(REL_M, FORK0, 0, pa);
+	op_unlink_at(REL_M, FORK0, 4000);
+	check(!op_exists(REL_M, FORK0),
+		  "same-LSN unlink wins over earlier WAL-less growth");
 	/* copied pages keep their SOURCE pd_lsn, which can sit below the new
 	 * fork's create SET (skip-WAL relation rewrites): growth clamps to the
 	 * definitive floor instead of vanishing under it */
@@ -1407,6 +1423,10 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	 * supplied a FUTURE floor) */
 	check(op_nblocks(REL_E, FORK0) == 0,
 		  "pre-marker forkmeta uses normal replay: truncated WAL-less fork stays empty");
+	check(op_nblocks(REL_L, FORK0) == 0,
+		  "same-LSN truncate remains after SEG0 growth on recovery");
+	check(!op_exists(REL_M, FORK0),
+		  "same-LSN unlink remains after SEG0 growth on recovery");
 	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
