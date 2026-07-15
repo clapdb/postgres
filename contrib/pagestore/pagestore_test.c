@@ -1099,6 +1099,8 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 #define REL_M	28000
 #define REL_N	29000
 #define REL_O	30000
+#define REL_P	31000
+#define REL_Q	32000
 #define FORK0	0
 #define SLRU_ZERO_OBJ	4243
 
@@ -1265,6 +1267,23 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_unlink_at(REL_O, FORK0, 6000);
 	check(!op_exists(REL_O, FORK0),
 		  "same-LSN unlink wins over earlier clamped copied growth");
+	/* Ordered records need a commit marker even when an earlier growth already
+	 * covers their block.  Otherwise recovery would re-derive markerless growth
+	 * after the same-LSN definitive event and resurrect the fork. */
+	op_create_at(REL_P, FORK0, 7000);
+	op_zeroextend_at(REL_P, FORK0, 0, 1, 7000);
+	fill_page(pa, page_size, 0, 73);
+	op_write_one(REL_P, FORK0, 0, pa);
+	op_truncate_at(REL_P, FORK0, 0, 7000);
+	check(op_nblocks(REL_P, FORK0) == 0,
+		  "same-LSN truncate wins over non-growing WAL-less write");
+	op_create_at(REL_Q, FORK0, 8000);
+	op_zeroextend_at(REL_Q, FORK0, 0, 1, 8000);
+	fill_page(pa, page_size, 6000, 74);
+	op_write_one(REL_Q, FORK0, 0, pa);
+	op_unlink_at(REL_Q, FORK0, 8000);
+	check(!op_exists(REL_Q, FORK0),
+		  "same-LSN unlink wins over non-growing clamped write");
 	/* copied pages keep their SOURCE pd_lsn, which can sit below the new
 	 * fork's create SET (skip-WAL relation rewrites): growth clamps to the
 	 * definitive floor instead of vanishing under it */
@@ -1495,6 +1514,10 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "same-LSN truncate remains after clamped copied growth on recovery");
 	check(!op_exists(REL_O, FORK0),
 		  "same-LSN unlink remains after clamped copied growth on recovery");
+	check(op_nblocks(REL_P, FORK0) == 0,
+		  "same-LSN truncate remains after non-growing WAL-less recovery");
+	check(!op_exists(REL_Q, FORK0),
+		  "same-LSN unlink remains after non-growing clamped recovery");
 	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
@@ -1734,6 +1757,8 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	fill_page(p, ps, 0, 55);
 	check(op_write_tl_status(4, REL_B, FORK0, 8, p) == PS_STATUS_ERROR,
 		  "injected segment failure rejects the WAL-less branch write");
+	check(op_create_branch_status(4, 0, 5000) == PS_STATUS_OK,
+		  "failed first branch write leaves CREATE_BRANCH retry idempotent");
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);

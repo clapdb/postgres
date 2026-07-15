@@ -49,7 +49,12 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local magic
+	local expected_version=17
+	local expected_page_size=8192
+	local expected_io_unit=$((256 * 1024))
+	local expected_channels=128
+	local expected_shards=1
+	local magic version page_size io_unit nchannels nshards
 	local i
 
 	for ((i = 0; i < 400; i++)); do
@@ -59,8 +64,15 @@ wait_daemon_ready() {
 			exit 1
 		fi
 		if [ -r "$shm_path" ]; then
-			magic=$(od -An -tu4 -N4 "$shm_path" 2>/dev/null | tr -d '[:space:]')
-			[ "$magic" = "$expected_magic" ] && return 0
+			read -r magic version page_size io_unit nchannels nshards < <(
+				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
+			)
+			[ "$magic" = "$expected_magic" ] &&
+				[ "$version" = "$expected_version" ] &&
+				[ "$page_size" = "$expected_page_size" ] &&
+				[ "$io_unit" = "$expected_io_unit" ] &&
+				[ "$nchannels" = "$expected_channels" ] &&
+				[ "$nshards" = "$expected_shards" ] && return 0
 		fi
 		sleep 0.05
 	done
