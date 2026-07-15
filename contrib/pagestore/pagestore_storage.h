@@ -79,6 +79,7 @@ typedef struct PsStorage
 	 */
 	int			(*fork_meta_append) (const void *buf, uint32_t len);
 	int			(*fork_meta_read) (uint64_t off, void *buf, uint32_t len);
+	int			(*fork_meta_truncate) (uint64_t len);
 } PsStorage;
 
 /* the active backend, selected at startup */

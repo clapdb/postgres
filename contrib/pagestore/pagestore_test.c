@@ -1032,6 +1032,44 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		rm_rf(store);
 		shm_unlink(shm);
 	}
+
+	/* A crash can leave a prefix shorter than one ForkMetaRec.  Startup must
+	 * remove it before appending the migration-start marker. */
+	{
+		char		path[512];
+		TestForkMetaRec rec;
+		pid_t		pid;
+		int			fd;
+		struct stat st;
+
+		snprintf(shm, sizeof(shm), "/pstest_%d_migrate_torn", (int) getpid());
+		snprintf(store, sizeof(store), "%s/store_migrate_torn", tmpbase);
+		rm_rf(store);
+		shm_unlink(shm);
+		check(mkdir(store, 0700) == 0, "created torn forkmeta test store");
+		snprintf(path, sizeof(path), "%s/forkmeta", store);
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		memset(&rec, 0xa5, sizeof(rec));
+		check(fd >= 0 && write(fd, &rec, sizeof(rec) / 2) ==
+			  (ssize_t) (sizeof(rec) / 2) && fsync(fd) == 0 && close(fd) == 0,
+			  "created a torn first forkmeta record");
+
+		pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+		wait_ready(shm, ps);
+		stop_daemon(pid);
+		fd = open(path, O_RDONLY);
+		memset(&rec, 0, sizeof(rec));
+		check(fd >= 0 && pread(fd, &rec, sizeof(rec), 0) ==
+			  (ssize_t) sizeof(rec) && rec.kind == 4,
+			  "migration marker replaces the torn forkmeta prefix");
+		check(fd >= 0 && fstat(fd, &st) == 0 &&
+			  st.st_size % (off_t) sizeof(rec) == 0,
+			  "repaired forkmeta contains only complete records");
+		if (fd >= 0)
+			close(fd);
+		rm_rf(store);
+		shm_unlink(shm);
+	}
 }
 
 static void
@@ -1100,6 +1138,22 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	op_read_one(rel, 0, 0, readback);
 	check(page_all_zero(readback, ps),
 		  "markerless ordered record does not publish bytes after restart");
+
+	/* Retry the exact WAL-less write at the same key/block/growth LSN.  Its
+	 * bound marker must commit this new record, never the older failed one. */
+	fill_page(page, ps, 0, 72);
+	op_write_one(rel, 0, 0, page);
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 1,
+		  "successful same-LSN retry recovers its committed growth");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 72),
+		  "bound marker recovers retry bytes, not failed bytes");
 	client_detach();
 	stop_daemon(pid);
 
