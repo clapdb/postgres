@@ -969,6 +969,22 @@ typedef struct TestForkMetaRec
 	uint8_t		pad[3];
 } TestForkMetaRec;
 
+#define TEST_FEV_SEG_GROW_BOUND		7
+#define TEST_FEV_SEG_COMMIT_BOUND	8
+#define TEST_FEV_SEG_ID				9
+#define TEST_SEG_WALLESS_MAGIC		0x53454730
+#define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734
+
+typedef struct TestSegRecHdr
+{
+	uint32_t	magic;
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint32_t	len;
+} TestSegRecHdr;
+
 static int
 strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 {
@@ -998,6 +1014,75 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
 		return -1;
 	return 0;
+}
+
+static int
+strip_bound_forkmeta_markers(const char *store)
+{
+	char		path[512];
+	TestForkMetaRec rec;
+	off_t		in = 0;
+	off_t		out = 0;
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", store);
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	{
+		in += sizeof(rec);
+		if (rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+			rec.kind == TEST_FEV_SEG_COMMIT_BOUND ||
+			rec.kind == TEST_FEV_SEG_ID)
+			continue;
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			close(fd);
+			return -1;
+		}
+		out += sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+downgrade_bound_record_to_seg0(const char *store, uint32_t rel,
+								 uint32_t page_size)
+{
+	char		path[512];
+	TestSegRecHdr hdr;
+	PsKey		key = {1, 1, rel, 0, PS_KLASS_RELATION};
+	unsigned char *page = malloc(page_size);
+	uint32_t	shard = ps_key_shard(&key, test_nshards);
+	int			fd = -1;
+	int			rc = -1;
+
+	if (shard == 0)
+		snprintf(path, sizeof(path), "%s/seg_%08d", store, 0);
+	else
+		snprintf(path, sizeof(path), "%s/seg_%u_%08d", store, shard, 0);
+	fd = open(path, O_RDWR);
+	if (fd < 0 || page == NULL)
+		goto out;
+	if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t) sizeof(hdr) ||
+		hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC || hdr.len != page_size ||
+		pread(fd, page, page_size, sizeof(hdr) + sizeof(uint64_t)) !=
+		(ssize_t) page_size)
+		goto out;
+	hdr.magic = TEST_SEG_WALLESS_MAGIC;
+	if (pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t) sizeof(hdr) ||
+		pwrite(fd, page, page_size, sizeof(hdr)) != (ssize_t) page_size ||
+		ftruncate(fd, sizeof(hdr) + page_size) != 0 || fsync(fd) != 0)
+		goto out;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	free(page);
+	return rc;
 }
 
 static void
@@ -1161,6 +1246,55 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 	free(page);
 	free(readback);
+}
+
+static void
+run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29100;
+	unsigned char *page = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== markerless SEG0 growth dedup ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_seg0_dedup", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_seg0_dedup", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	op_zeroextend_at(rel, 0, 0, 1, 1000);
+	fill_page(page, ps, 0, 73);
+	op_write_one(rel, 0, 0, page);
+	op_truncate_at(rel, 0, 0, 1000);
+	client_detach();
+	stop_daemon(pid);
+
+	/* Model the transition store that persisted SEG0 growth in forkmeta before
+	 * SEG0 became self-describing.  Its existing growth precedes the same-LSN
+	 * truncate and must not be derived again after that definitive event. */
+	check(downgrade_bound_record_to_seg0(store, rel, ps) == 0,
+		  "converted bound zero-version record to markerless SEG0");
+	check(strip_bound_forkmeta_markers(store) == 0,
+		  "removed bound marker while preserving definitive fork history");
+
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 0,
+		  "pre-persisted SEG0 growth is not replayed after same-LSN truncate");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
 }
 
 /* ===================== the test suite ================================== */
@@ -2405,6 +2539,8 @@ main(int argc, char **argv)
 	run_migration_failure_suite(daemon_path, tmpbase);
 	/* A failed ordering-marker append must not commit segment bytes. */
 	run_order_marker_failure_suite(daemon_path, tmpbase);
+	/* Transitional SEG0 records may duplicate already-persisted growth. */
+	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)

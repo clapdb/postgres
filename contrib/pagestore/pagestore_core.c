@@ -852,6 +852,19 @@ fork_size_asof_hop(const ForkEnt *e, uint64_t cap)
 	return nb;
 }
 
+/* Markerless SEG0 spans an intermediate format transition: some stores already
+ * persisted the same growth in forkmeta, while later ones relied on SEG0 alone.
+ * Detect the former without re-evaluating equal-LSN definitive-event order. */
+static int
+fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+{
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].kind == FEV_GROW && e->ev[i].lsn == lsn &&
+			e->ev[i].nblocks >= nblocks)
+			return 1;
+	return 0;
+}
+
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
@@ -2488,9 +2501,15 @@ recover(uint32_t shard)
 			}
 			else if (!ordered && wal_less)
 			{
-				/* Markerless SEG0 predates ordered segment records. */
-				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
-								 hdr.lsn);
+				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
+
+				/* Markerless SEG0 predates ordered records.  During the format
+				 * transition, an earlier writer may already have persisted this
+				 * exact growth in forkmeta; do not replay it after a same-LSN
+				 * definitive event.  SEG0-only growth still reconstructs here. */
+				if (!fork_has_growth_at(fe, hdr.lsn, hdr.block + 1))
+					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
+									 hdr.lsn);
 			}
 			else if (!ordered && hdr.lsn != 0)
 				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
