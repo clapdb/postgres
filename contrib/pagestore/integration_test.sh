@@ -46,6 +46,42 @@ assert() {  # $1=actual $2=expected $3=message
 	fi
 }
 
+wait_daemon_ready() {
+	local shm_path="/dev/shm$SHM"
+	local expected_magic=$((0x50414753))
+	local expected_version=17
+	local expected_page_size=8192
+	local expected_io_unit=$((256 * 1024))
+	local expected_channels=128
+	local expected_shards=1
+	local magic version page_size io_unit nchannels nshards
+	local i
+
+	for ((i = 0; i < 400; i++)); do
+		if ! kill -0 "$DPID" 2>/dev/null; then
+			echo "FAIL - pagestore daemon exited before publishing shared memory"
+			tail -100 "$DATA/daemon.log" 2>/dev/null || true
+			exit 1
+		fi
+		if [ -r "$shm_path" ]; then
+			read -r magic version page_size io_unit nchannels nshards < <(
+				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
+			)
+			[ "$magic" = "$expected_magic" ] &&
+				[ "$version" = "$expected_version" ] &&
+				[ "$page_size" = "$expected_page_size" ] &&
+				[ "$io_unit" = "$expected_io_unit" ] &&
+				[ "$nchannels" = "$expected_channels" ] &&
+				[ "$nshards" = "$expected_shards" ] && return 0
+		fi
+		sleep 0.05
+	done
+
+	echo "FAIL - pagestore daemon did not publish a ready shared-memory header"
+	tail -100 "$DATA/daemon.log" 2>/dev/null || true
+	exit 1
+}
+
 # KEEPTMP=1 keeps the data/store directories for post-mortem debugging
 # (servers and daemon are still stopped).
 cleanup() {
@@ -64,9 +100,10 @@ trap cleanup EXIT
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
-"$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
+rm -f "/dev/shm$SHM"
+"$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
-sleep 0.5
+wait_daemon_ready
 
 cat >> "$DATA/postgresql.conf" <<EOF
 shared_preload_libraries = 'pagestore'
@@ -268,18 +305,23 @@ assert "$sw_store" "t" "redo_page_asof replays base+deltas read from the store's
 # unlike a shared-daemon test where prior writes could push these into a layer.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach the engine before restarting the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
-"$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 >/dev/null 2>&1 &  # never flushes -> no layer
+rm -f "/dev/shm$SHM"
+# Never flush: the crash-recovery rows must remain segment-log-only.
+"$DAEMON" --shm "$SHM" --store "$STORE" --flush-pages 100000000 \
+	>>"$DATA/daemon.log" 2>&1 &
 DPID=$!
-sleep 0.5
+wait_daemon_ready
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "CREATE TABLE crash(id int, v text) TABLESPACE ts;
        INSERT INTO crash SELECT g, 'c'||md5(g::text) FROM generate_series(1,500) g;" >/dev/null
 crash_ck=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1          # detach before crashing the daemon
 kill -9 "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null      # crash: no ps_core_close() -> memtable lost
-"$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &  # restart -> rebuild the index from the segment log
+rm -f "/dev/shm$SHM"
+# Restart and rebuild the index from the segment log.
+"$DAEMON" --shm "$SHM" --store "$STORE" >>"$DATA/daemon.log" 2>&1 &
 DPID=$!
-sleep 0.5
+wait_daemon_ready
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-log recovery)"

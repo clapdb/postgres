@@ -42,6 +42,9 @@ static char posix_dir[2048];
 static int **seg_fds;
 static int *seg_fds_caps;
 static int seg_shards_cap;
+static int test_fail_seg_writes;
+static int test_crash_after_seg_writes;
+static int test_fail_fork_meta_append_at;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
@@ -180,6 +183,10 @@ out:
 static int
 posix_open(const char *path, uint64_t segment_size)
 {
+	const char *fail_writes;
+	const char *crash_after_writes;
+	const char *fail_fork_meta_at;
+
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
 		return -1;
@@ -187,6 +194,15 @@ posix_open(const char *path, uint64_t segment_size)
 	seg_fds = NULL;
 	seg_fds_caps = NULL;
 	seg_shards_cap = 0;
+	/* Standalone-test fault injection; ordinary deployments never set it. */
+	fail_writes = getenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
+	test_fail_seg_writes = fail_writes ? atoi(fail_writes) : 0;
+	crash_after_writes = getenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+	test_crash_after_seg_writes = crash_after_writes ?
+		atoi(crash_after_writes) : 0;
+	fail_fork_meta_at = getenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
+	test_fail_fork_meta_append_at = fail_fork_meta_at ?
+		atoi(fail_fork_meta_at) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	return 0;
 }
@@ -252,8 +268,17 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 
 	if (fd < 0)
 		return -1;
+	if (test_fail_seg_writes > 0)
+	{
+		test_fail_seg_writes--;
+		return -1;
+	}
 	if (pwrite(fd, buf, len, (off_t) off) != (ssize_t) len)
 		return -1;
+	/* Standalone-test crash point: after N successful segment writes. */
+	if (test_crash_after_seg_writes > 0 &&
+		--test_crash_after_seg_writes == 0)
+		_exit(86);
 	return 0;
 }
 
@@ -499,6 +524,13 @@ posix_meta_read(uint64_t off, void *buf, uint32_t len)
 static int
 posix_fork_meta_append(const void *buf, uint32_t len)
 {
+	/* Standalone-test fault injection; ordinary deployments leave this zero. */
+	if (test_fail_fork_meta_append_at > 0 &&
+		--test_fail_fork_meta_append_at == 0)
+	{
+		errno = EIO;
+		return -1;
+	}
 	return posix_log_append("forkmeta", buf, len);
 }
 
@@ -506,6 +538,29 @@ static int
 posix_fork_meta_read(uint64_t off, void *buf, uint32_t len)
 {
 	return posix_log_read("forkmeta", off, buf, len);
+}
+
+static int
+posix_fork_meta_truncate(uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	int			rc = 0;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", posix_dir);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		rc = (errno == ENOENT && len == 0) ? 0 : -1;
+	else
+	{
+		if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
+			rc = -1;
+		if (close(fd) != 0)
+			rc = -1;
+	}
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
 }
 
 const PsStorage PsStoragePosix = {
@@ -522,4 +577,5 @@ const PsStorage PsStoragePosix = {
 	.meta_read = posix_meta_read,
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
+	.fork_meta_truncate = posix_fork_meta_truncate,
 };
