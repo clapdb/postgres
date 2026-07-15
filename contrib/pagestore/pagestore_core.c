@@ -2450,9 +2450,10 @@ recover(uint32_t shard)
 			 * growth. */
 			if (ordered)
 			{
-				order_activated = fork_event_activate_seg(
-					fork_get_or_create(hdr.timeline, &hdr.key),
-					hdr.lsn, hdr.block + 1, order_id);
+				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
+
+				order_activated = fe && fork_event_activate_seg(
+					fe, hdr.lsn, hdr.block + 1, order_id);
 				/* A deliberately synthesized/real pre-events store has no
 				 * definitive metadata to misorder against.  Its segment records
 				 * are the migration source even if their newer magic normally

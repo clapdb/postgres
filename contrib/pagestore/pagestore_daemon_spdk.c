@@ -252,14 +252,22 @@ begin(uint32_t i, PsChannel *ch)
 
 		case PS_OP_READ_AT:
 			{
+				uint64_t	read_lsn = ch->req_lsn;
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 ch->req_lsn);
+											 read_lsn);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
 				if (!v)
 				{
 					memset(ch->data, 0, page_size);		/* not found: result 0 */
+					ps_store_release(&ch->state, PS_STATE_DONE);
+					return;
+				}
+				if (read_lsn != UINT64_MAX && v->lsn == 0)
+				{
+					memset(ch->data, 0, page_size);
+					ch->status = PS_STATUS_ERROR;
 					ps_store_release(&ch->state, PS_STATE_DONE);
 					return;
 				}
