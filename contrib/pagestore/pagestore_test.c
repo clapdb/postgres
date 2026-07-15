@@ -370,6 +370,23 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* Like op_read_at but reports found-ness (ch->result). */
+static int
+op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
+				 unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
 /*
  * SLRU-class write: the version is the caller-supplied LSN (req_lsn), NOT pd_lsn or
  * a daemon counter -- so a snapshot keyed by its proven cutoff C reads back as-of an
@@ -391,6 +408,33 @@ op_write_slru(uint32_t obj, uint32_t block, const unsigned char *page,
 	cl_exec();
 }
 
+static uint32_t
+op_nblocks_slru(uint32_t obj)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = 0;
+	return cl_exec()->result;
+}
+
+static void
+op_read_slru(uint32_t obj, uint32_t block, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READV;
+	ch->req_lsn = 0;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
 /* SLRU-class as-of read (READ_AT zero-fills on no-version-<=lsn). */
 static void
 op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
@@ -404,6 +448,22 @@ op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
 	ch->req_lsn = lsn;
 	cl_exec();
 	memcpy(out, ch->data, cl_page_size);
+}
+
+static int
+op_read_at_slru_status(uint32_t obj, uint32_t block, uint64_t lsn,
+						unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+	return ch->status;
 }
 
 /*
@@ -538,6 +598,47 @@ op_write_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->blocknum = block;
 	ch->nblocks = 1;
 	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+}
+
+static int
+op_write_tl_status(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+				   const unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, cl_page_size);
+	return cl_exec()->status;
+}
+
+static uint32_t
+op_nblocks_asof_tl(uint32_t tl, uint32_t rel, int32_t fork, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	return cl_exec()->result;
+}
+
+static void
+op_truncate_at_tl(uint32_t tl, uint32_t rel, int32_t fork,
+				  uint32_t nblocks, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_TRUNCATE;
+	ch->nblocks = nblocks;
+	ch->req_lsn = lsn;
 	cl_exec();
 }
 
@@ -701,8 +802,9 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 /* ===================== daemon lifecycle ================================ */
 
 static pid_t
-spawn_daemon(const char *daemon_path, const char *shm, const char *store,
-			 uint32_t page_size, uint32_t nshards)
+spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
+				   uint32_t page_size, uint32_t nshards, int fail_seg_writes,
+				   int crash_after_seg_writes, int fail_fork_meta_append_at)
 {
 	pid_t		pid = fork();
 
@@ -716,6 +818,43 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		char		psbuf[16];
 		char		shbuf[16];
 
+		unsetenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
+		unsetenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+		unsetenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
+		if (fail_seg_writes > 0)
+		{
+			char		failbuf[16];
+
+			snprintf(failbuf, sizeof(failbuf), "%d", fail_seg_writes);
+			if (setenv("PAGESTORE_TEST_FAIL_SEG_WRITES", failbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_FAIL_SEG_WRITES");
+				_exit(127);
+			}
+		}
+		if (crash_after_seg_writes > 0)
+		{
+			char		crashbuf[16];
+
+			snprintf(crashbuf, sizeof(crashbuf), "%d", crash_after_seg_writes);
+			if (setenv("PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES", crashbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_CRASH_AFTER_SEG_WRITES");
+				_exit(127);
+			}
+		}
+		if (fail_fork_meta_append_at > 0)
+		{
+			char		failbuf[16];
+
+			snprintf(failbuf, sizeof(failbuf), "%d", fail_fork_meta_append_at);
+			if (setenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT", failbuf, 1) != 0)
+			{
+				perror("setenv PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
+				_exit(127);
+			}
+		}
+
 		snprintf(psbuf, sizeof(psbuf), "%u", page_size);
 		snprintf(shbuf, sizeof(shbuf), "%u", nshards);
 		/* small segments exercise rollover; a small flush threshold makes the
@@ -727,6 +866,39 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 		_exit(127);
 	}
 	return pid;
+}
+
+static pid_t
+spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *store,
+					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
+							  fail_seg_writes, 0, 0);
+}
+
+static pid_t
+spawn_daemon_crash_after_seg(const char *daemon_path, const char *shm,
+							 const char *store, uint32_t page_size,
+							 uint32_t nshards, int crash_after_seg_writes)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0,
+							  crash_after_seg_writes, 0);
+}
+
+static pid_t
+spawn_daemon_fail_fork_meta(const char *daemon_path, const char *shm,
+							const char *store, uint32_t page_size,
+							uint32_t nshards, int fail_append_at)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0,
+							  fail_append_at);
+}
+
+static pid_t
+spawn_daemon(const char *daemon_path, const char *shm, const char *store,
+			 uint32_t page_size, uint32_t nshards)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0, 0);
 }
 
 /* Wait until the daemon has published a valid header. */
@@ -763,10 +935,382 @@ wait_ready(const char *shm, uint32_t page_size)
 }
 
 static void
+expect_daemon_open_failure(pid_t pid, const char *shm, const char *message)
+{
+	int			status = 0;
+	int			exited = 0;
+
+	for (int i = 0; i < 500; i++)
+	{
+		pid_t		r = waitpid(pid, &status, WNOHANG);
+
+		if (r == pid)
+		{
+			exited = 1;
+			break;
+		}
+		usleep(10000);
+	}
+	if (!exited)
+	{
+		kill(pid, SIGKILL);
+		waitpid(pid, &status, 0);
+	}
+	check(exited && WIFEXITED(status) && WEXITSTATUS(status) != 0,
+		  "%s", message);
+	{
+		int			fd = shm_open(shm, O_RDWR, 0600);
+
+		check(fd < 0, "%s does not publish shared-memory readiness", message);
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
+static void
 stop_daemon(pid_t pid)
 {
 	kill(pid, SIGTERM);
 	waitpid(pid, NULL, 0);
+}
+
+/* On-disk fork-meta record mirror, used only to synthesize a pre-marker store. */
+typedef struct TestForkMetaRec
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint32_t	nblocks;
+	uint8_t		kind;
+	uint8_t		pad[3];
+} TestForkMetaRec;
+
+#define TEST_FEV_SEG_GROW_BOUND		7
+#define TEST_FEV_SEG_COMMIT_BOUND	8
+#define TEST_FEV_SEG_ID				9
+#define TEST_SEG_WALLESS_MAGIC		0x53454730
+#define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734
+
+typedef struct TestSegRecHdr
+{
+	uint32_t	magic;
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint32_t	len;
+} TestSegRecHdr;
+
+static int
+strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
+{
+	char		path[512];
+	TestForkMetaRec rec;
+	off_t		in = 0;
+	off_t		out = 0;
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", store);
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	{
+		in += sizeof(rec);
+		if ((strip_done && rec.kind == 3) ||	/* FEV_MIGRATED */
+			(strip_start && rec.kind == 4))	/* FEV_MIGRATING */
+			continue;
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			close(fd);
+			return -1;
+		}
+		out += sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+strip_bound_forkmeta_markers(const char *store)
+{
+	char		path[512];
+	TestForkMetaRec rec;
+	off_t		in = 0;
+	off_t		out = 0;
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", store);
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	{
+		in += sizeof(rec);
+		if (rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+			rec.kind == TEST_FEV_SEG_COMMIT_BOUND ||
+			rec.kind == TEST_FEV_SEG_ID)
+			continue;
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			close(fd);
+			return -1;
+		}
+		out += sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+downgrade_bound_record_to_seg0(const char *store, uint32_t rel,
+								 uint32_t page_size)
+{
+	char		path[512];
+	TestSegRecHdr hdr;
+	PsKey		key = {1, 1, rel, 0, PS_KLASS_RELATION};
+	unsigned char *page = malloc(page_size);
+	uint32_t	shard = ps_key_shard(&key, test_nshards);
+	int			fd = -1;
+	int			rc = -1;
+
+	if (shard == 0)
+		snprintf(path, sizeof(path), "%s/seg_%08d", store, 0);
+	else
+		snprintf(path, sizeof(path), "%s/seg_%u_%08d", store, shard, 0);
+	fd = open(path, O_RDWR);
+	if (fd < 0 || page == NULL)
+		goto out;
+	if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t) sizeof(hdr) ||
+		hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC || hdr.len != page_size ||
+		pread(fd, page, page_size, sizeof(hdr) + sizeof(uint64_t)) !=
+		(ssize_t) page_size)
+		goto out;
+	hdr.magic = TEST_SEG_WALLESS_MAGIC;
+	if (pwrite(fd, &hdr, sizeof(hdr), 0) != (ssize_t) sizeof(hdr) ||
+		pwrite(fd, page, page_size, sizeof(hdr)) != (ssize_t) page_size ||
+		ftruncate(fd, sizeof(hdr) + page_size) != 0 || fsync(fd) != 0)
+		goto out;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	free(page);
+	return rc;
+}
+
+static void
+run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+
+	fprintf(stderr, "== legacy migration failures ==\n");
+	for (int fail_at = 1; fail_at <= 2; fail_at++)
+	{
+		pid_t		pid;
+		char		message[96];
+
+		snprintf(shm, sizeof(shm), "/pstest_%d_migrate_%d",
+				 (int) getpid(), fail_at);
+		snprintf(store, sizeof(store), "%s/store_migrate_%d", tmpbase, fail_at);
+		rm_rf(store);
+		shm_unlink(shm);
+		pid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
+									  test_nshards, fail_at);
+		snprintf(message, sizeof(message),
+				 "migration append %d failure aborts daemon startup", fail_at);
+		expect_daemon_open_failure(pid, shm, message);
+
+		/* The failed process published no writes; a normal restart retries and
+		 * seals either the absent start marker or the surviving start marker. */
+		pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+		wait_ready(shm, ps);
+		stop_daemon(pid);
+		rm_rf(store);
+		shm_unlink(shm);
+	}
+
+	/* A crash can leave a prefix shorter than one ForkMetaRec.  Startup must
+	 * remove it before appending the migration-start marker. */
+	{
+		char		path[512];
+		TestForkMetaRec rec;
+		pid_t		pid;
+		int			fd;
+		struct stat st;
+
+		snprintf(shm, sizeof(shm), "/pstest_%d_migrate_torn", (int) getpid());
+		snprintf(store, sizeof(store), "%s/store_migrate_torn", tmpbase);
+		rm_rf(store);
+		shm_unlink(shm);
+		check(mkdir(store, 0700) == 0, "created torn forkmeta test store");
+		snprintf(path, sizeof(path), "%s/forkmeta", store);
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		memset(&rec, 0xa5, sizeof(rec));
+		check(fd >= 0 && write(fd, &rec, sizeof(rec) / 2) ==
+			  (ssize_t) (sizeof(rec) / 2) && fsync(fd) == 0 && close(fd) == 0,
+			  "created a torn first forkmeta record");
+
+		pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+		wait_ready(shm, ps);
+		stop_daemon(pid);
+		fd = open(path, O_RDONLY);
+		memset(&rec, 0, sizeof(rec));
+		check(fd >= 0 && pread(fd, &rec, sizeof(rec), 0) ==
+			  (ssize_t) sizeof(rec) && rec.kind == 4,
+			  "migration marker replaces the torn forkmeta prefix");
+		check(fd >= 0 && fstat(fd, &st) == 0 &&
+			  st.st_size % (off_t) sizeof(rec) == 0,
+			  "repaired forkmeta contains only complete records");
+		if (fd >= 0)
+			close(fd);
+		rm_rf(store);
+		shm_unlink(shm);
+	}
+}
+
+static void
+run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29000;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== segment order-marker failure ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_order_fail", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_order_fail", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	/* Fresh startup writes migration start/done (#1/#2), CREATE is #3, and
+	 * the ordered segment-growth marker is #4. */
+	/* After the ordered record's two segment writes and failed marker, crash
+	 * on the next record's header (successful segment write #3). */
+	pid = spawn_daemon_fault(daemon_path, shm, store, ps, test_nshards,
+							 0, 3, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 0, 70);
+	check(op_write_tl_status(0, rel, 0, 0, page) == PS_STATUS_ERROR,
+		  "order-marker failure rejects the growing segment write");
+
+	/* A normal SEG2 header at the same offset must not borrow the failed
+	 * ordered record's complete body if the daemon dies before writing its own
+	 * body.  Run the request in a child because it waits on the dead daemon. */
+	fill_page(page, ps, 3000, 71);
+	client_detach();
+	{
+		pid_t		writer = fork();
+		int			status;
+
+		if (writer == 0)
+		{
+			client_attach(shm, ps);
+			op_write_one(rel, 0, 0, page);
+			_exit(0);
+		}
+		if (writer < 0)
+		{
+			perror("fork stale-body writer");
+			exit(2);
+		}
+		waitpid(pid, &status, 0);
+		check(WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "injected crash landed after the replacement header");
+		kill(writer, SIGKILL);
+		waitpid(writer, NULL, 0);
+	}
+
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 0,
+		  "markerless ordered record does not grow after restart");
+	op_read_one(rel, 0, 0, readback);
+	check(page_all_zero(readback, ps),
+		  "markerless ordered record does not publish bytes after restart");
+
+	/* Retry the exact WAL-less write at the same key/block/growth LSN.  Its
+	 * bound marker must commit this new record, never the older failed one. */
+	fill_page(page, ps, 0, 72);
+	op_write_one(rel, 0, 0, page);
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 1,
+		  "successful same-LSN retry recovers its committed growth");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 72),
+		  "bound marker recovers retry bytes, not failed bytes");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29100;
+	unsigned char *page = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== markerless SEG0 growth dedup ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_seg0_dedup", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_seg0_dedup", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	op_zeroextend_at(rel, 0, 0, 1, 1000);
+	fill_page(page, ps, 0, 73);
+	op_write_one(rel, 0, 0, page);
+	op_truncate_at(rel, 0, 0, 1000);
+	client_detach();
+	stop_daemon(pid);
+
+	/* Model the transition store that persisted SEG0 growth in forkmeta before
+	 * SEG0 became self-describing.  Its existing growth precedes the same-LSN
+	 * truncate and must not be derived again after that definitive event. */
+	check(downgrade_bound_record_to_seg0(store, rel, ps) == 0,
+		  "converted bound zero-version record to markerless SEG0");
+	check(strip_bound_forkmeta_markers(store) == 0,
+		  "removed bound marker while preserving definitive fork history");
+
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks(rel, 0) == 0,
+		  "pre-persisted SEG0 growth is not replayed after same-LSN truncate");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
 }
 
 /* ===================== the test suite ================================== */
@@ -776,7 +1320,20 @@ stop_daemon(pid_t pid)
 #define REL_C	18000
 #define REL_D	19000
 #define REL_E	20000
+#define REL_F	21000
+#define REL_G	22000
+#define REL_H	23000
+#define REL_I	24000
+#define REL_J	25000
+#define REL_K	26000
+#define REL_L	27000
+#define REL_M	28000
+#define REL_N	29000
+#define REL_O	30000
+#define REL_P	31000
+#define REL_Q	32000
 #define FORK0	0
+#define SLRU_ZERO_OBJ	4243
 
 static void
 run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
@@ -913,6 +1470,115 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_write_one(REL_E, FORK0, 0, pa);
 	op_truncate_at(REL_E, FORK0, 0, 2000);
 	check(op_nblocks(REL_E, FORK0) == 0, "WAL-less fork truncated to empty");
+	/* Equal LSNs still have an operation order.  SEG0's fork-meta ordering
+	 * marker must keep the later definitive event after the earlier growth. */
+	op_create_at(REL_L, FORK0, 3000);
+	fill_page(pa, page_size, 0, 68);
+	op_write_one(REL_L, FORK0, 0, pa);
+	op_truncate_at(REL_L, FORK0, 0, 3000);
+	check(op_nblocks(REL_L, FORK0) == 0,
+		  "same-LSN truncate wins over earlier WAL-less growth");
+	op_create_at(REL_M, FORK0, 4000);
+	fill_page(pa, page_size, 0, 69);
+	op_write_one(REL_M, FORK0, 0, pa);
+	op_unlink_at(REL_M, FORK0, 4000);
+	check(!op_exists(REL_M, FORK0),
+		  "same-LSN unlink wins over earlier WAL-less growth");
+	/* The same ordering rule applies when a copied nonzero page is clamped
+	 * from its source pd_lsn to the fork's definitive floor. */
+	op_create_at(REL_N, FORK0, 5000);
+	fill_page(pa, page_size, 3000, 71);
+	op_write_one(REL_N, FORK0, 0, pa);
+	op_truncate_at(REL_N, FORK0, 0, 5000);
+	check(op_nblocks(REL_N, FORK0) == 0,
+		  "same-LSN truncate wins over earlier clamped copied growth");
+	op_create_at(REL_O, FORK0, 6000);
+	fill_page(pa, page_size, 4000, 72);
+	op_write_one(REL_O, FORK0, 0, pa);
+	op_unlink_at(REL_O, FORK0, 6000);
+	check(!op_exists(REL_O, FORK0),
+		  "same-LSN unlink wins over earlier clamped copied growth");
+	/* Ordered records need a commit marker even when an earlier growth already
+	 * covers their block.  Otherwise recovery would re-derive markerless growth
+	 * after the same-LSN definitive event and resurrect the fork. */
+	op_create_at(REL_P, FORK0, 7000);
+	op_zeroextend_at(REL_P, FORK0, 0, 1, 7000);
+	fill_page(pa, page_size, 0, 73);
+	op_write_one(REL_P, FORK0, 0, pa);
+	op_truncate_at(REL_P, FORK0, 0, 7000);
+	check(op_nblocks(REL_P, FORK0) == 0,
+		  "same-LSN truncate wins over non-growing WAL-less write");
+	op_create_at(REL_Q, FORK0, 8000);
+	op_zeroextend_at(REL_Q, FORK0, 0, 1, 8000);
+	fill_page(pa, page_size, 6000, 74);
+	op_write_one(REL_Q, FORK0, 0, pa);
+	op_unlink_at(REL_Q, FORK0, 8000);
+	check(!op_exists(REL_Q, FORK0),
+		  "same-LSN unlink wins over non-growing clamped write");
+	/* copied pages keep their SOURCE pd_lsn, which can sit below the new
+	 * fork's create SET (skip-WAL relation rewrites): growth clamps to the
+	 * definitive floor instead of vanishing under it */
+	op_create_at(REL_F, FORK0, 5000);
+	fill_page(pa, page_size, 3000, 44);	/* pd_lsn below the create */
+	op_write_one(REL_F, FORK0, 0, pa);
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "below-floor copied-page growth clamps to the create, not under it");
+	check(op_nblocks_asof(REL_F, FORK0, 4999) == 0,
+		  "the copied page is not visible below the fork's creation");
+	/* the record itself is stamped at the floor, so the BYTES agree with
+	 * the size: an as-of read in the pre-create gap finds nothing */
+	check(!op_read_at_found(REL_F, FORK0, 0, 4000, rb),
+		  "as-of page bytes agree with the size below the create (not found)");
+	check(op_read_at_found(REL_F, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 44),
+		  "the copied page serves at the fork's creation floor");
+
+	/* A retained dirty buffer can flush after truncate with an older pd_lsn.
+	 * It is not growth at the truncate floor, so preserve its raw version. */
+	op_create_at(REL_G, FORK0, 1000);
+	fill_page(pa, page_size, 1500, 60);
+	op_write_one(REL_G, FORK0, 0, pa);
+	fill_page(pa, page_size, 1600, 61);
+	op_write_one(REL_G, FORK0, 1, pa);
+	op_truncate_at(REL_G, FORK0, 1, 3000);
+	fill_page(pa, page_size, 2000, 62);
+	op_write_one(REL_G, FORK0, 0, pa);
+	check(op_read_at_found(REL_G, FORK0, 0, 2500, rb) &&
+		  page_has_tag(rb, page_size, 62),
+		  "retained-block flush keeps its pre-truncate page LSN");
+
+	/* A real pre-truncate growth can have the same target size as a later
+	 * WAL-less regrow at the truncate floor.  Markerless recovery must not
+	 * mistake that later GROW for proof that the raw record was clamped. */
+	op_create_at(REL_H, FORK0, 1000);
+	fill_page(pa, page_size, 2000, 63);
+	op_write_one(REL_H, FORK0, 2, pa);
+	op_truncate_at(REL_H, FORK0, 1, 3000);
+	fill_page(pa, page_size, 0, 64);
+	op_write_one(REL_H, FORK0, 2, pa);
+	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
+		  "real growth remains visible before same-size WAL-less regrow");
+
+	/* Zeroextend at CREATE's LSN can already cover the copied block at the
+	 * floor, but the bytes still must not be visible before CREATE. */
+	op_create_at(REL_J, FORK0, 5000);
+	op_zeroextend_at(REL_J, FORK0, 0, 2, 5000);
+	fill_page(pa, page_size, 3000, 67);
+	op_write_one(REL_J, FORK0, 0, pa);
+	check(!op_read_at_found(REL_J, FORK0, 0, 4000, rb),
+		  "same-LSN pre-extension does not expose copied bytes before CREATE");
+	check(op_read_at_found(REL_J, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 67),
+		  "copied bytes serve at the pre-extended CREATE floor");
+
+	/* A replayed/retried zeroextend can carry an LSN below the definitive
+	 * floor.  Persist only its clamped position, never the raw request LSN. */
+	op_create_at(REL_K, FORK0, 5000);
+	op_zeroextend_at(REL_K, FORK0, 0, 3, 3000);
+	check(op_nblocks_asof(REL_K, FORK0, 4000) == 0,
+		  "below-floor zeroextend is invisible before CREATE");
+	check(op_nblocks_asof(REL_K, FORK0, 5000) == 3,
+		  "below-floor zeroextend appears at its clamped floor");
 	op_read_at(REL_A, FORK0, 0, ~0ull, rb);
 	check(page_has_tag(rb, page_size, 200), "read_at(max) returns newest");
 
@@ -939,6 +1605,22 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		op_read_at_slru(SLRU_OBJ, 0, ~0ull, rb);
 		check(page_has_tag(rb, page_size, 222), "slru read_at(max) = newest snapshot");
 	}
+
+	/* Version zero is a legitimate newest-only object image.  It uses SEG0 so
+	 * the complete segment record recovers both the bytes and block growth. */
+	fill_page(pa, page_size, 0, 110);
+	op_write_slru(SLRU_ZERO_OBJ, 2, pa, 0);
+	check(op_nblocks_slru(SLRU_ZERO_OBJ) == 3,
+		  "zero-version SLRU write grows its object fork");
+	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "zero-version SLRU object serves before restart");
+	check(op_read_at_slru_status(SLRU_ZERO_OBJ, 2, 1, rb) == PS_STATUS_ERROR &&
+		  page_all_zero(rb, page_size),
+		  "finite as-of read rejects newest-only zero-version SLRU image");
+	op_read_at_slru(SLRU_ZERO_OBJ, 2, UINT64_MAX, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "max-horizon read accepts newest-only zero-version SLRU image");
 
 	/* --- WAL retention floor from mirrored pg_control notes ------------- */
 	{
@@ -975,10 +1657,58 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		free(note);
 	}
 
+	/* Crash exactly after a growing WAL-less page body reaches the segment but
+	 * before its ordering marker commits the new SEG1 record.  Recovery must
+	 * reject both bytes and growth.  The request process waits on the dead
+	 * daemon, so run it in a disposable child. */
+	op_create_at(REL_I, FORK0, 11000);
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_crash_after_seg(daemon_path, shm, store, page_size,
+									 test_nshards, 2);
+	wait_ready(shm, page_size);
+	{
+		pid_t		writer = fork();
+		int			status;
+
+		if (writer == 0)
+		{
+			client_attach(shm, page_size);
+			fill_page(pa, page_size, 0, 65);
+			op_write_one(REL_I, FORK0, 0, pa);
+			_exit(0);
+		}
+		if (writer < 0)
+		{
+			perror("fork crash-window writer");
+			exit(2);
+		}
+		waitpid(dpid, &status, 0);
+		check(WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "injected crash landed after the WAL-less segment body");
+		kill(writer, SIGKILL);
+		waitpid(writer, NULL, 0);
+	}
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_I, FORK0) == 0,
+		  "uncommitted ordered record does not recover size after a crash");
+	op_read_one(REL_I, FORK0, 0, rb);
+	check(page_all_zero(rb, page_size),
+		  "uncommitted ordered record does not recover page bytes");
+
 	client_detach();
 
 	/* --- crash recovery: restart daemon, rebuild index from segments --- */
 	stop_daemon(dpid);
+	/* Simulate the immediately preceding fork-event format: definitive records
+	 * exist, but migration markers do not.  This must use normal replay, not
+	 * legacy lsn-0 replay against the already-loaded truncate/unlink history. */
+	check(strip_forkmeta_markers(store, 1, 1) == 0,
+		  "synthesized a nonempty pre-marker fork-meta log");
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -992,6 +1722,14 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		  "COW history survives restart (read_at old version)");
 	check(op_wal_retain_floor(0) == 5000,
 		  "wal retention floor survives daemon restart (durable via segment log)");
+	check(op_nblocks_slru(SLRU_ZERO_OBJ) == 3,
+		  "zero-version SLRU growth survives daemon restart");
+	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "zero-version SLRU object survives daemon restart");
+	check(op_read_at_slru_status(SLRU_ZERO_OBJ, 2, 1, rb) == PS_STATUS_ERROR &&
+		  page_all_zero(rb, page_size),
+		  "finite as-of read rejects recovered zero-version SLRU image");
 
 	/* fork-size history survives: definitive events from the fork-meta log,
 	 * growth re-derived from the segment records' own LSNs */
@@ -1007,15 +1745,103 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	 * segment record is skipped; the fully preloaded meta log would have
 	 * supplied a FUTURE floor) */
 	check(op_nblocks(REL_E, FORK0) == 0,
-		  "truncated WAL-less fork stays empty after restart (no resurrection)");
+		  "pre-marker forkmeta uses normal replay: truncated WAL-less fork stays empty");
+	check(op_nblocks(REL_L, FORK0) == 0,
+		  "same-LSN truncate remains after SEG0 growth on recovery");
+	check(!op_exists(REL_M, FORK0),
+		  "same-LSN unlink remains after SEG0 growth on recovery");
+	check(op_nblocks(REL_N, FORK0) == 0,
+		  "same-LSN truncate remains after clamped copied growth on recovery");
+	check(!op_exists(REL_O, FORK0),
+		  "same-LSN unlink remains after clamped copied growth on recovery");
+	check(op_nblocks(REL_P, FORK0) == 0,
+		  "same-LSN truncate remains after non-growing WAL-less recovery");
+	check(!op_exists(REL_Q, FORK0),
+		  "same-LSN unlink remains after non-growing clamped recovery");
 	check(op_nblocks_asof(REL_E, FORK0, 1999) == 1,
 		  "pre-truncate WAL-less growth keeps its floor position after restart");
 	check(op_nblocks(REL_D, FORK0) == 1,
 		  "post-truncate WAL-less regrow survives restart at its floor");
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "clamped below-floor growth survives restart (persisted event)");
+	check(op_nblocks_asof(REL_F, FORK0, 4000) == 0,
+		  "the raw below-create record is not re-derived: the gap stays invisible after restart");
+	check(op_nblocks_asof(REL_F, FORK0, 5000) == 1,
+		  "the clamped position (the create floor) serves after restart");
+	check(op_read_at_found(REL_G, FORK0, 0, 2500, rb) &&
+		  page_has_tag(rb, page_size, 62),
+		  "retained-block raw LSN survives markerless recovery");
+	check(op_nblocks_asof(REL_H, FORK0, 2500) == 3,
+		  "markerless recovery preserves real pre-truncate growth");
+	check(!op_read_at_found(REL_J, FORK0, 0, 4000, rb) &&
+		  op_read_at_found(REL_J, FORK0, 0, 5000, rb) &&
+		  page_has_tag(rb, page_size, 67),
+		  "pre-extended CREATE keeps copied bytes clamped after recovery");
+	check(op_nblocks_asof(REL_K, FORK0, 4000) == 0 &&
+		  op_nblocks_asof(REL_K, FORK0, 5000) == 3,
+		  "zeroextend persists only its clamped floor across recovery");
+	op_read_one(REL_I, FORK0, 0, rb);
+	check(page_all_zero(rb, page_size),
+		  "uncommitted ordered record stays absent after another restart");
 
 	/* --- unlink --- */
 	op_unlink(REL_A, FORK0);
 	check(!op_exists(REL_A, FORK0), "fork gone after unlink");
+
+	/* --- legacy stores: an absent fork-meta log --- */
+	/* a pre-events store has lsn-0 segment records and no fork-meta log at
+	 * all; recovery must fall back to applying that growth verbatim (there
+	 * are no definitive events to misorder against) or every unlogged fork
+	 * would come back empty */
+	client_detach();
+	stop_daemon(dpid);
+	{
+		char		fmpath[512];
+
+		snprintf(fmpath, sizeof(fmpath), "%s/forkmeta", store);
+		unlink(fmpath);
+	}
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "legacy mode restores WAL-less fork sizes from raw lsn-0 records");
+	check(op_exists(REL_D, FORK0),
+		  "legacy mode existence follows the raw growth");
+	check(op_nblocks(REL_F, FORK0) == 1,
+		  "legacy mode restores below-floor growth at its raw LSN");
+	/* with the meta log gone the truncate is gone too: REL_E's growth
+	 * reappears -- exactly the documented pre-events behavior */
+	check(op_nblocks(REL_E, FORK0) == 1,
+		  "legacy mode has no truncate events to order against (documented)");
+
+	/* The start/done markers make an interrupted migration distinguishable
+	 * from the pre-marker event format above.  Once sealed, migrated lsn-0
+	 * growth must survive every later normal restart. */
+	op_create_at(REL_F, FORK0, 20000);
+	client_detach();
+	stop_daemon(dpid);
+	check(strip_forkmeta_markers(store, 0, 1) == 0,
+		  "synthesized an interrupted migration with its start marker intact");
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "migrated legacy sizes survive a post-legacy restart");
+	check(op_exists(REL_D, FORK0),
+		  "interrupted legacy migration resumes without losing existence");
+
+	/* The resumed scan seals the migration; the following boot is normal. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
+	wait_ready(shm, page_size);
+	client_attach(shm, page_size);
+	check(op_nblocks(REL_D, FORK0) == 1,
+		  "resumed migration seals and survives a normal restart");
 
 	client_detach();
 	stop_daemon(dpid);
@@ -1109,6 +1935,38 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(0, REL_B, FORK0) == 8, "parent size includes post-branch growth");
 	check(op_nblocks_tl(1, REL_B, FORK0) == 6, "branch size capped at its fork point");
 
+	/* A branch has no local CREATE event.  Its first definitive event may be a
+	 * later truncate; recovery must retain real branch-local growth before it. */
+	op_create_branch(3, 0, 5000);
+	fill_page(p, ps, 6000, 54);
+	op_write_tl(3, REL_B, FORK0, 9, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 2, 7000);
+	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
+		  "branch-local growth is visible before its first truncate");
+	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
+		  "branch truncate remains definitive at newest");
+
+	/* Kept event-free locally for the failed WAL-less write test below. */
+	op_create_branch(4, 0, 5000);
+	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
+		  "event-free branch inherits the parent fork size");
+	op_create_branch(6, 0, 5000);
+	check(op_nblocks_tl(6, REL_B, FORK0) == 8,
+		  "second event-free branch inherits the parent fork size");
+
+	/* A copied branch-local page keeps the parent's old source pd_lsn, but the
+	 * write happened after the branch snapshot.  Stamp it just above the branch
+	 * point so an as-of read AT the fork still inherits the parent image. */
+	op_create_branch(5, 0, 5000);
+	fill_page(p, ps, 1000, 56);
+	op_write_tl(5, REL_B, FORK0, 0, p);
+	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "branch-point read hides a later copied-page rewrite");
+	op_read_tl(5, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 56),
+		  "newest branch read sees its copied-page rewrite");
+
 	/* branches survive a daemon restart (timeline metadata is persisted) */
 	client_detach();
 	stop_daemon(dpid);
@@ -1120,6 +1978,65 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 22), "branch write survives daemon restart");
 	op_read_tl(1, REL_B, FORK0, 5, rb);
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
+	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
+		  "pre-truncate branch-local growth survives restart");
+	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
+		  "branch truncate survives restart");
+	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "branch-point copied-page floor survives restart");
+	op_read_tl(5, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 56),
+		  "branch copied-page rewrite survives restart above its floor");
+
+	/* Force the segment write to fail before its ordering marker.  No local
+	 * growth may appear or mask the inherited size (8) on the next recovery. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_fail_seg(daemon_path, shm, store, ps, test_nshards, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	fill_page(p, ps, 0, 55);
+	check(op_write_tl_status(4, REL_B, FORK0, 8, p) == PS_STATUS_ERROR,
+		  "injected segment failure rejects the WAL-less branch write");
+	check(op_create_branch_status(4, 0, 5000) == PS_STATUS_OK,
+		  "failed first branch write leaves CREATE_BRANCH retry idempotent");
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
+		  "failed segment write preserves the inherited fork size");
+	op_read_tl(4, REL_B, FORK0, 0, rb);
+	check(page_has_tag(rb, ps, 11),
+		  "failed segment write does not mask inherited parent pages");
+
+	/* Leave a complete first branch-local record without its commit marker.
+	 * Recovery must discard it without marking the timeline used, so an exact
+	 * retry of the still-event-free branch definition remains idempotent. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
+								   test_nshards, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	fill_page(p, ps, 0, 57);
+	check(op_write_tl_status(6, REL_B, FORK0, 8, p) == PS_STATUS_ERROR,
+		  "missing marker rejects the first branch-local ordered record");
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_create_branch_status(6, 0, 5000) == PS_STATUS_OK,
+		  "discarded ordered record leaves CREATE_BRANCH retry idempotent");
+	check(op_nblocks_tl(6, REL_B, FORK0) == 8,
+		  "discarded ordered record preserves inherited branch size");
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */
@@ -1669,6 +2586,13 @@ main(int argc, char **argv)
 		perror("mkdtemp");
 		return 2;
 	}
+
+	/* Legacy migration must seal before the daemon publishes readiness. */
+	run_migration_failure_suite(daemon_path, tmpbase);
+	/* A failed ordering-marker append must not commit segment bytes. */
+	run_order_marker_failure_suite(daemon_path, tmpbase);
+	/* Transitional SEG0 records may duplicate already-persisted growth. */
+	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)

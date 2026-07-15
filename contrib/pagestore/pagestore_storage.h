@@ -73,11 +73,13 @@ typedef struct PsStorage
 	/*
 	 * Fork metadata log: the durable record of fork-size events the segment
 	 * log cannot reproduce (create/truncate/unlink and zero-extends, which
-	 * write no page records).  Same append-only fixed-record discipline as
-	 * the timeline log.
+	 * write no page records), plus inert segment-growth ordering markers correlated
+	 * during recovery.  Same append-only fixed-record discipline as the
+	 * timeline log.
 	 */
 	int			(*fork_meta_append) (const void *buf, uint32_t len);
 	int			(*fork_meta_read) (uint64_t off, void *buf, uint32_t len);
+	int			(*fork_meta_truncate) (uint64_t len);
 } PsStorage;
 
 /* the active backend, selected at startup */
