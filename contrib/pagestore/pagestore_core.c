@@ -1895,7 +1895,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (ordered_record &&
 		fork_meta_persist(timeline, key, hdr_grow_lsn, block + 1,
 						  segment_grows ? FEV_SEG_GROW : FEV_SEG_COMMIT) != 0)
+	{
+		/* The complete body is not committed without its marker.  Retire this
+		 * segment so a later torn header cannot reuse that stale body. */
+		s->cur_off = segment_size;
 		return -1;
+	}
 
 	/* index points at the page bytes (data_off), so reads skip the header */
 	page_add_version(timeline, key, block, page_version,
@@ -2232,6 +2237,7 @@ recover(uint32_t shard)
 	{
 		uint64_t	off = 0;
 		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
+		int			retire_segment = 0;
 
 		if (seg_bytes < 0)
 			break;				/* no more segments -> done */
@@ -2287,8 +2293,9 @@ recover(uint32_t shard)
 
 			/* Ordered records are committed by their matching inert fork-meta
 			 * placeholder.  A complete body without that marker is the tail of a
-			 * failed/unacknowledged append: leave the cursor here so it is
-			 * overwritten, and publish neither its bytes nor its growth. */
+			 * failed/unacknowledged append: retire the segment so its stale body
+			 * can never satisfy a later torn header, and publish neither bytes nor
+			 * growth. */
 			if (ordered)
 			{
 				order_activated = fork_event_activate_seg(
@@ -2299,7 +2306,10 @@ recover(uint32_t shard)
 				 * are the migration source even if their newer magic normally
 				 * requires a marker that disappeared with the old metadata log. */
 				if (!order_activated && !fork_meta_legacy)
+				{
+					retire_segment = 1;
 					break;
+				}
 			}
 
 			page_version = wal_less ? 0 : hdr.lsn;
@@ -2351,7 +2361,7 @@ recover(uint32_t shard)
 
 		/* this segment is the newest seen so far; append continues after it */
 		s->cur_seg = id;
-		s->cur_off = off;
+		s->cur_off = retire_segment ? segment_size : off;
 	}
 	if (s->cur_seg >= 0)
 		fprintf(stderr, "pagestore_daemon: recovered shard %u through segment %d (off %llu)\n",

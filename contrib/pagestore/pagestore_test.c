@@ -1053,16 +1053,43 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 
 	/* Fresh startup writes migration start/done (#1/#2), CREATE is #3, and
 	 * the ordered segment-growth marker is #4. */
-	pid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
-								  test_nshards, 4);
+	/* After the ordered record's two segment writes and failed marker, crash
+	 * on the next record's header (successful segment write #3). */
+	pid = spawn_daemon_fault(daemon_path, shm, store, ps, test_nshards,
+							 0, 3, 4);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 0, 70);
 	check(op_write_tl_status(0, rel, 0, 0, page) == PS_STATUS_ERROR,
 		  "order-marker failure rejects the growing segment write");
+
+	/* A normal SEG2 header at the same offset must not borrow the failed
+	 * ordered record's complete body if the daemon dies before writing its own
+	 * body.  Run the request in a child because it waits on the dead daemon. */
+	fill_page(page, ps, 3000, 71);
 	client_detach();
-	stop_daemon(pid);
+	{
+		pid_t		writer = fork();
+		int			status;
+
+		if (writer == 0)
+		{
+			client_attach(shm, ps);
+			op_write_one(rel, 0, 0, page);
+			_exit(0);
+		}
+		if (writer < 0)
+		{
+			perror("fork stale-body writer");
+			exit(2);
+		}
+		waitpid(pid, &status, 0);
+		check(WIFEXITED(status) && WEXITSTATUS(status) == 86,
+			  "injected crash landed after the replacement header");
+		kill(writer, SIGKILL);
+		waitpid(writer, NULL, 0);
+	}
 
 	shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
