@@ -450,6 +450,22 @@ op_read_at_slru(uint32_t obj, uint32_t block, uint64_t lsn, unsigned char *out)
 	memcpy(out, ch->data, cl_page_size);
 }
 
+static int
+op_read_at_slru_status(uint32_t obj, uint32_t block, uint64_t lsn,
+						unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, obj, 0);
+	ch->key.klass = PS_KLASS_SLRU;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+	return ch->status;
+}
+
 /*
  * Control-class write at 'block' (0 = the pg_control image, 1 = the retention
  * floor note) versioned by the caller-supplied update LSN, mirroring
@@ -1599,6 +1615,12 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
 	check(page_has_tag(rb, page_size, 110),
 		  "zero-version SLRU object serves before restart");
+	check(op_read_at_slru_status(SLRU_ZERO_OBJ, 2, 1, rb) == PS_STATUS_ERROR &&
+		  page_all_zero(rb, page_size),
+		  "finite as-of read rejects newest-only zero-version SLRU image");
+	op_read_at_slru(SLRU_ZERO_OBJ, 2, UINT64_MAX, rb);
+	check(page_has_tag(rb, page_size, 110),
+		  "max-horizon read accepts newest-only zero-version SLRU image");
 
 	/* --- WAL retention floor from mirrored pg_control notes ------------- */
 	{
@@ -1705,6 +1727,9 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_read_slru(SLRU_ZERO_OBJ, 2, rb);
 	check(page_has_tag(rb, page_size, 110),
 		  "zero-version SLRU object survives daemon restart");
+	check(op_read_at_slru_status(SLRU_ZERO_OBJ, 2, 1, rb) == PS_STATUS_ERROR &&
+		  page_all_zero(rb, page_size),
+		  "finite as-of read rejects recovered zero-version SLRU image");
 
 	/* fork-size history survives: definitive events from the fork-meta log,
 	 * growth re-derived from the segment records' own LSNs */
@@ -1925,6 +1950,9 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	op_create_branch(4, 0, 5000);
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
 		  "event-free branch inherits the parent fork size");
+	op_create_branch(6, 0, 5000);
+	check(op_nblocks_tl(6, REL_B, FORK0) == 8,
+		  "second event-free branch inherits the parent fork size");
 
 	/* A copied branch-local page keeps the parent's old source pd_lsn, but the
 	 * write happened after the branch snapshot.  Stamp it just above the branch
@@ -1985,6 +2013,30 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	op_read_tl(4, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11),
 		  "failed segment write does not mask inherited parent pages");
+
+	/* Leave a complete first branch-local record without its commit marker.
+	 * Recovery must discard it without marking the timeline used, so an exact
+	 * retry of the still-event-free branch definition remains idempotent. */
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon_fail_fork_meta(daemon_path, shm, store, ps,
+								   test_nshards, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	fill_page(p, ps, 0, 57);
+	check(op_write_tl_status(6, REL_B, FORK0, 8, p) == PS_STATUS_ERROR,
+		  "missing marker rejects the first branch-local ordered record");
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_create_branch_status(6, 0, 5000) == PS_STATUS_OK,
+		  "discarded ordered record leaves CREATE_BRANCH retry idempotent");
+	check(op_nblocks_tl(6, REL_B, FORK0) == 8,
+		  "discarded ordered record preserves inherited branch size");
 
 	/* CREATE_BRANCH validation: reject requests that would corrupt the parent
 	 * walk (timelines 0,1,2 are defined here) */

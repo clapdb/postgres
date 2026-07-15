@@ -131,13 +131,22 @@ handle_request(PsChannel *ch)
 			 * <= req_lsn, and an SLRU snapshot reader can require an exact-cutoff hit
 			 * (resolved == requested) rather than an older newest-<= image. */
 			{
+				uint64_t	read_lsn = ch->req_lsn;
 				uint64_t	resolved = 0;
 
-				if (read_resolve(tl, &ch->key, ch->blocknum, ch->req_lsn, ch->data,
+				if (read_resolve(tl, &ch->key, ch->blocknum, read_lsn, ch->data,
 								 &resolved))
 				{
-					ch->result = 1;
-					ch->req_lsn = resolved;
+					if (read_lsn != UINT64_MAX && resolved == 0)
+					{
+						memset(ch->data, 0, page_size);
+						ch->status = PS_STATUS_ERROR;
+					}
+					else
+					{
+						ch->result = 1;
+						ch->req_lsn = resolved;
+					}
 				}
 				else
 					memset(ch->data, 0, page_size);	/* not found: result stays 0 */
