@@ -533,6 +533,7 @@ typedef struct ForkEvent
 #define FEV_MIGRATED 3			/* log marker: legacy lsn-0 migration completed */
 #define FEV_MIGRATING 4			/* log marker: legacy migration started */
 #define FEV_SEG_GROW 5			/* ordering placeholder, activated by segment replay */
+#define FEV_SEG_COMMIT 6		/* ordered segment commit that does not change size */
 
 typedef struct ForkEnt
 {
@@ -777,7 +778,7 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
 
 		if (v->lsn > cap)
 			continue;
-		if (v->kind == FEV_SEG_GROW)
+		if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT)
 			continue;			/* marker alone never changes fork size */
 		if (v->kind == FEV_GROW)
 		{
@@ -883,7 +884,8 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
  * only after validating the matching segment header and complete page body.
  */
 static void
-fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
+fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
+						  uint8_t kind)
 {
 	uint32_t	i;
 
@@ -900,7 +902,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	}
 	e->ev[i].lsn = lsn;
 	e->ev[i].nblocks = nblocks;
-	e->ev[i].kind = FEV_SEG_GROW;
+	e->ev[i].kind = kind;
 	e->nev++;
 }
 
@@ -911,11 +913,20 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	{
 		ForkEvent  *v = &e->ev[i];
 
-		if (v->kind == FEV_SEG_GROW && v->lsn == lsn &&
+		if ((v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT) &&
+			v->lsn == lsn &&
 			v->nblocks == nblocks)
 		{
-			v->kind = FEV_GROW;
-			e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+			if (v->kind == FEV_SEG_GROW)
+			{
+				v->kind = FEV_GROW;
+				e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+			}
+			else
+			{
+				memmove(v, v + 1, (e->nev - i - 1) * sizeof(*v));
+				e->nev--;
+			}
 			return 1;
 		}
 	}
@@ -1239,10 +1250,11 @@ load_fork_meta(void)
 			fork_meta_migrated = 1;
 		else if (rec.kind == FEV_MIGRATING)
 			fork_meta_migrating = 1;
-		else if (rec.kind == FEV_SEG_GROW && rec.timeline < MAX_TIMELINES)
+		else if ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT) &&
+				 rec.timeline < MAX_TIMELINES)
 			fork_event_add_seg_marker(
 				fork_get_or_create(rec.timeline, &rec.key),
-				rec.lsn, rec.nblocks);
+				rec.lsn, rec.nblocks, rec.kind);
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
@@ -1738,16 +1750,18 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	hdr_grow_lsn = 0;
 	uint64_t	page_version;
 	int			clamped = 0;
-	int			ordered_growth = 0;
+	int			ordered_record = 0;
+	int			segment_grows = 0;
 	int			zero_version = 0;
 	Shard	   *s = shard_for(key);
-	ForkEnt    *fe = fork_get_or_create(timeline, key);
+	ForkEnt    *fe = fork_find(timeline, key);
 	uint64_t	branch_floor = 0;
-	uint64_t	growth_floor = fe->last_def_lsn;
+	uint64_t	growth_floor = fe ? fe->last_def_lsn : 0;
 
 	/* A branch-local version written after the branch snapshot must not become
 	 * visible AT that snapshot merely because copied bytes retain an older
 	 * source LSN.  The first representable local position is branch_lsn + 1. */
+	ps_lock_map_rd();
 	if (timeline_has_parent(timeline))
 	{
 		branch_floor = timelines[timeline].branch_lsn;
@@ -1756,6 +1770,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (branch_floor > growth_floor)
 			growth_floor = branch_floor;
 	}
+	ps_unlock_map();
 
 	/* roll over to a fresh segment when the current one would overflow */
 	if (s->cur_seg < 0 || s->cur_off + reclen > segment_size)
@@ -1819,9 +1834,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 *
 	 * - A zero-version record must KEEP version 0 -- capped reads refuse
 	 *   LSN-0 versions by design.  Its header stores the growth floor while
-	 *   the in-memory page/object version remains zero.  A size-raising record
-	 *   uses SEG1 and requires its inert fork-meta ordering marker at recovery;
-	 *   a zero-version rewrite that does not grow remains compatible SEG0.
+	 *   the in-memory page/object version remains zero.  Every below-floor or
+	 *   zero-version record uses an ordered format and requires its inert
+	 *   fork-meta commit marker at recovery, even when it rewrites an existing
+	 *   block: a later same-LSN truncate/unlink must stay ordered after it.
 	 */
 	if (key->klass == PS_KLASS_RELATION)
 	{
@@ -1857,9 +1873,10 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	hdr_grow_lsn = hdr.lsn;
 	page_version = zero_version ? 0 : hdr.lsn;
-	ordered_growth = (zero_version || clamped) &&
-		fork_size_asof_hop(fe, hdr_grow_lsn) < block + 1;
-	if (ordered_growth)
+	ordered_record = zero_version || clamped;
+	segment_grows = (!fe ||
+		fork_size_asof_hop(fe, hdr_grow_lsn) < block + 1);
+	if (ordered_record)
 		hdr.magic = zero_version ? SEG_WALLESS_ORDERED_MAGIC :
 			SEG_CLAMPED_ORDERED_MAGIC;
 
@@ -1875,9 +1892,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * records its position among equal-LSN definitive events.  Recovery ignores
 	 * an unmatched marker, so a torn/missing segment cannot manufacture size.
 	 */
-	if (ordered_growth &&
+	if (ordered_record &&
 		fork_meta_persist(timeline, key, hdr_grow_lsn, block + 1,
-						  FEV_SEG_GROW) != 0)
+						  segment_grows ? FEV_SEG_GROW : FEV_SEG_COMMIT) != 0)
 		return -1;
 
 	/* index points at the page bytes (data_off), so reads skip the header */
@@ -2288,8 +2305,9 @@ recover(uint32_t shard)
 			page_version = wal_less ? 0 : hdr.lsn;
 			page_add_version(hdr.timeline, &hdr.key, hdr.block, page_version,
 							 shard, id, off + sizeof(hdr));
-			/* Ordered SEG1/SEG3 growth was activated at its fork-meta position
-			 * above.  Legacy SEG0 carries zero-version growth at its stored floor,
+			/* Ordered SEG1/SEG3 growth was activated at its fork-meta position,
+			 * while a non-growing commit marker was consumed without changing size.
+			 * Legacy SEG0 carries zero-version growth at its stored floor,
 			 * while ordinary SEG2 re-derives growth at its stored LSN.
 			 * Markerless formats carry no reliable per-record correlation for
 			 * deciding that a later GROW was a clamp rather than a real regrow,
