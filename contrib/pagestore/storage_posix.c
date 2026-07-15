@@ -540,6 +540,29 @@ posix_fork_meta_read(uint64_t off, void *buf, uint32_t len)
 	return posix_log_read("forkmeta", off, buf, len);
 }
 
+static int
+posix_fork_meta_truncate(uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	int			rc = 0;
+
+	snprintf(path, sizeof(path), "%s/forkmeta", posix_dir);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		rc = (errno == ENOENT && len == 0) ? 0 : -1;
+	else
+	{
+		if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
+			rc = -1;
+		if (close(fd) != 0)
+			rc = -1;
+	}
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
 const PsStorage PsStoragePosix = {
 	.name = "posix",
 	.open = posix_open,
@@ -554,4 +577,5 @@ const PsStorage PsStoragePosix = {
 	.meta_read = posix_meta_read,
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
+	.fork_meta_truncate = posix_fork_meta_truncate,
 };

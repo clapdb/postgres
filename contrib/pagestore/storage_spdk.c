@@ -854,6 +854,12 @@ spdk_fork_meta_read(uint64_t off, void *buf, uint32_t len)
 	return PsStoragePosix.fork_meta_read(off, buf, len);
 }
 
+static int
+spdk_fork_meta_truncate(uint64_t len)
+{
+	return PsStoragePosix.fork_meta_truncate(len);
+}
+
 const PsStorage PsStorageSpdk = {
 	.name = "spdk",
 	.open = spdk_open,
@@ -870,4 +876,5 @@ const PsStorage PsStorageSpdk = {
 	.meta_read = spdk_meta_read,
 	.fork_meta_append = spdk_fork_meta_append,
 	.fork_meta_read = spdk_fork_meta_read,
+	.fork_meta_truncate = spdk_fork_meta_truncate,
 };
