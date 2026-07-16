@@ -68,6 +68,25 @@ uint32_t	ps_nshards = 1;
  * every persisted identity before the daemon accepts writes, so allocation
  * continues above both committed and uncommitted records after a restart. */
 static uint64_t next_segment_order_id = 1;
+static uint64_t next_admission_seq = 1;
+
+static uint64_t
+admission_seq_alloc(void)
+{
+	return __atomic_fetch_add(&next_admission_seq, 1, __ATOMIC_RELAXED);
+}
+
+static void
+admission_seq_observe(uint64_t seq)
+{
+	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
+
+	while (next <= seq &&
+		   !__atomic_compare_exchange_n(&next_admission_seq, &next, seq + 1,
+									 false, __ATOMIC_RELAXED,
+									 __ATOMIC_RELAXED))
+		;
+}
 
 static uint64_t
 segment_order_id_alloc(void)
@@ -467,6 +486,7 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			recs[nrec].key = idx[j].key;
 			recs[nrec].block = idx[j].block;
 			recs[nrec].lsn = idx[j].lsn;
+			recs[nrec].admission_seq = idx[j].admission_seq;
 			recs[nrec].page = pg;
 			recs[nrec].growth_lsn = idx[j].growth_lsn;
 			recs[nrec].order_id = idx[j].order_id;
@@ -528,6 +548,9 @@ cleanup:
 #define SEG_CLAMPED_ORDERED_MAGIC 0x53454733 /* "SEG3": clamped version + marker */
 #define SEG_WALLESS_BOUND_MAGIC 0x53454734 /* "SEG4": SEG1 + marker identity */
 #define SEG_CLAMPED_BOUND_MAGIC 0x53454735 /* "SEG5": SEG3 + marker identity */
+#define SEG_ADMISSION_MAGIC 0x53454736 /* "SEG6": SEG2 + admission sequence */
+#define SEG_WALLESS_ADMISSION_MAGIC 0x53454737 /* "SEG7": SEG4 + admission */
+#define SEG_CLAMPED_ADMISSION_MAGIC 0x53454738 /* "SEG8": SEG5 + admission */
 
 /*
  * On-disk layout of one appended page version: this header immediately
@@ -542,7 +565,7 @@ typedef struct SegRecHdr
 	uint32_t	timeline;		/* timeline the version belongs to */
 	PsKey		key;
 	uint32_t	block;
-	uint64_t	lsn;			/* version LSN, or SEG0's fork-growth floor */
+	uint64_t	lsn;			/* version LSN, or WAL-less fork-growth floor */
 	uint32_t	len;			/* page bytes following the header */
 } SegRecHdr;
 
@@ -551,6 +574,19 @@ typedef struct SegRecHdrBound
 	SegRecHdr	hdr;
 	uint64_t	order_id;
 } SegRecHdrBound;
+
+typedef struct SegRecHdrAdmission
+{
+	SegRecHdr	hdr;
+	uint64_t	admission_seq;
+} SegRecHdrAdmission;
+
+typedef struct SegRecHdrBoundAdmission
+{
+	SegRecHdr	hdr;
+	uint64_t	order_id;
+	uint64_t	admission_seq;
+} SegRecHdrBoundAdmission;
 
 /*
  * Segments are addressed by (id, byte offset); how they are stored is the
@@ -601,6 +637,7 @@ typedef struct PageEnt
 typedef struct ForkEvent
 {
 	uint64_t	lsn;
+	uint64_t	admission_seq;	/* global mutation order; 0 = legacy */
 	uint64_t	order_id;		/* bound segment marker identity, else zero */
 	uint32_t	nblocks;
 	uint8_t		kind;
@@ -627,6 +664,7 @@ typedef struct ForkEnt
 	uint32_t	nev;
 	uint32_t	evcap;
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
+	int			has_wal_less;	/* at least one page version has lsn 0 */
 } ForkEnt;
 
 /*
@@ -731,6 +769,8 @@ page_hash(uint32_t timeline, const PsKey *key, uint32_t block)
 	return fnv(key, sizeof(*key)) ^ (block * 2654435761u) ^ (timeline * 40503u);
 }
 
+static ForkEnt *fork_get_or_create(uint32_t timeline, const PsKey *key);
+
 static PageEnt *
 page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 {
@@ -753,7 +793,8 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
  */
 static void
 page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t lsn, uint32_t shard, int seg, uint64_t off)
+				 uint64_t lsn, uint64_t admission_seq, uint32_t shard,
+				 int seg, uint64_t off)
 {
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
@@ -776,14 +817,17 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	e->vers[e->nver].shard = shard;
 	e->vers[e->nver].lsn = lsn;
+	e->vers[e->nver].admission_seq = admission_seq;
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
 	e->nver++;
+	if (lsn == 0)
+		fork_get_or_create(timeline, key)->has_wal_less = 1;
 }
 
 /* Newest version on this entry with lsn <= read_lsn, or NULL if none. */
 static PageVer *
-page_visible(PageEnt *e, uint64_t read_lsn)
+page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
 {
 	PageVer    *best = NULL;
 
@@ -791,7 +835,12 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 	{
 		PageVer    *v = &e->vers[i];
 
-		if (v->lsn <= read_lsn && (!best || v->lsn >= best->lsn))
+		if (v->lsn <= read_lsn &&
+			(read_seq == 0 || v->admission_seq == 0 ||
+			 v->admission_seq <= read_seq) &&
+			(!best || v->lsn > best->lsn ||
+			 (v->lsn == best->lsn &&
+			  v->admission_seq >= best->admission_seq)))
 			best = v;
 	}
 	return best;
@@ -800,7 +849,8 @@ page_visible(PageEnt *e, uint64_t read_lsn)
 /* --- fork size index (keyed by timeline, key) --- */
 
 static int fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
-							 uint32_t nblocks, uint8_t kind);
+							 uint64_t admission_seq, uint32_t nblocks,
+							 uint8_t kind);
 
 static ForkEnt *
 fork_find(uint32_t timeline, const PsKey *key)
@@ -848,7 +898,8 @@ fork_get_or_create(uint32_t timeline, const PsKey *key)
 #define FORK_HOP_DEAD	3		/* definitively unlinked at the cap */
 
 static int
-fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
+fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
+			  uint32_t *nb_out)
 {
 	uint32_t	grow = 0;
 	int			have_grow = 0;
@@ -859,6 +910,9 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
 		const ForkEvent *v = &e->ev[i];
 
 		if (v->lsn > cap)
+			continue;
+		if (seq_cap != 0 && v->admission_seq != 0 &&
+			v->admission_seq > seq_cap)
 			continue;
 		if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT ||
 			v->kind == FEV_SEG_GROW_BOUND || v->kind == FEV_SEG_COMMIT_BOUND)
@@ -891,11 +945,11 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint32_t *nb_out)
 
 /* Size of e as of cap, hop-local (for the GROW-dedup below). */
 static uint32_t
-fork_size_asof_hop(const ForkEnt *e, uint64_t cap)
+fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
 {
 	uint32_t	nb;
 
-	(void) fork_asof_hop(e, cap, &nb);
+	(void) fork_asof_hop(e, cap, seq_cap, &nb);
 	return nb;
 }
 
@@ -920,11 +974,13 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
  * newer pd_lsns add nothing, so the history stays O(distinct sizes).
  */
 static void
-fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
+fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
+			   uint32_t nblocks, uint8_t kind)
 {
 	uint32_t	i;
 
-	if (kind == FEV_GROW && fork_size_asof_hop(e, lsn) >= nblocks)
+	if (kind == FEV_GROW &&
+		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
 		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
@@ -934,12 +990,17 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
 	i = e->nev;
-	while (i > 0 && e->ev[i - 1].lsn > lsn)
+	while (i > 0 &&
+		   (e->ev[i - 1].lsn > lsn ||
+			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq > admission_seq)))
 	{
 		e->ev[i] = e->ev[i - 1];
 		i--;
 	}
 	e->ev[i].lsn = lsn;
+	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = 0;
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
@@ -972,7 +1033,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
 			e->nblocks = nblocks;
 	}
 	else
-		e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 }
 
 /*
@@ -982,7 +1043,8 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint32_t nblocks, uint8_t kind)
  */
 static void
 fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
-						  uint8_t kind, uint64_t order_id)
+						  uint8_t kind, uint64_t order_id,
+						  uint64_t admission_seq)
 {
 	uint32_t	i;
 
@@ -992,12 +1054,17 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 		e->ev = realloc(e->ev, e->evcap * sizeof(ForkEvent));
 	}
 	i = e->nev;
-	while (i > 0 && e->ev[i - 1].lsn > lsn)
+	while (i > 0 &&
+		   (e->ev[i - 1].lsn > lsn ||
+			(e->ev[i - 1].lsn == lsn && admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq != 0 &&
+			 e->ev[i - 1].admission_seq > admission_seq)))
 	{
 		e->ev[i] = e->ev[i - 1];
 		i--;
 	}
 	e->ev[i].lsn = lsn;
+	e->ev[i].admission_seq = admission_seq;
 	e->ev[i].order_id = order_id;
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
@@ -1006,7 +1073,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 
 static int
 fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
-						uint64_t order_id)
+						uint64_t order_id, uint64_t admission_seq)
 {
 	for (uint32_t i = 0; i < e->nev; i++)
 	{
@@ -1016,12 +1083,13 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			 v->kind == FEV_SEG_GROW_BOUND ||
 			 v->kind == FEV_SEG_COMMIT_BOUND) &&
 			v->lsn == lsn &&
-			v->nblocks == nblocks && v->order_id == order_id)
+			v->nblocks == nblocks && v->order_id == order_id &&
+			v->admission_seq == admission_seq)
 		{
 			if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_GROW_BOUND)
 			{
 				v->kind = FEV_GROW;
-				e->nblocks = fork_size_asof_hop(e, UINT64_MAX);
+				e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 			}
 			else
 			{
@@ -1039,6 +1107,7 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		  uint64_t lsn)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
+	uint64_t	admission_seq = admission_seq_alloc();
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -1046,19 +1115,20 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 */
 	if (lsn < e->last_def_lsn || lsn == 0)
 		lsn = e->last_def_lsn;
-	if (fork_size_asof_hop(e, lsn) < to_nblocks &&
-		fork_meta_persist(timeline, key, lsn, to_nblocks, FEV_GROW) != 0)
+	if (fork_size_asof_hop(e, lsn, admission_seq) < to_nblocks &&
+		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
+						  FEV_GROW) != 0)
 		return -1;			/* not durable: do not apply in memory */
-	fork_event_add(e, lsn, to_nblocks, FEV_GROW);
+	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW);
 	return 0;
 }
 
 /* Apply growth whose durability is already represented by metadata/segment. */
 static void
 fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-				uint64_t lsn)
+				uint64_t lsn, uint64_t admission_seq)
 {
-	fork_event_add(fork_get_or_create(timeline, key), lsn, to_nblocks,
+	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
 				   FEV_GROW);
 }
 
@@ -1072,9 +1142,9 @@ fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
  */
 static void
 fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-				 uint64_t lsn)
+				 uint64_t lsn, uint64_t admission_seq)
 {
-	fork_event_add(fork_get_or_create(timeline, key), lsn, to_nblocks,
+	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
 				   FEV_GROW);
 }
 
@@ -1138,6 +1208,24 @@ tl_walk_next(TlWalk *w)
 	return 1;
 }
 
+/* A capped relation read cannot prove completeness for WAL-less pages.  Check
+ * the whole ancestry before EXISTS/NBLOCKS can turn a hidden LSN-0 version
+ * into an apparently valid empty relation. */
+static int
+fork_has_wal_less_page(uint32_t timeline, const PsKey *key)
+{
+	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+
+	do
+	{
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e && e->has_wal_less)
+			return 1;
+	} while (tl_walk_next(&w));
+	return 0;
+}
+
 /*
  * Validate a branch-creation request before it is recorded.  read_through() and
  * the fork-size walks follow the parent chain assuming it is finite and well
@@ -1197,14 +1285,14 @@ branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
  */
 PageVer *
 read_through(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn)
+			 uint64_t read_lsn, uint64_t read_seq)
 {
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
 	do
 	{
 		PageEnt    *e = page_find(w.tl, key, block);
-		PageVer    *v = e ? page_visible(e, w.lsn) : NULL;
+		PageVer    *v = e ? page_visible(e, w.lsn, read_seq) : NULL;
 
 		if (v)
 			return v;
@@ -1224,7 +1312,8 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
  * the branch.
  */
 static uint32_t
-fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
+fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
+					 uint64_t read_seq)
 {
 	uint32_t	maxnb = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
@@ -1236,7 +1325,7 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, &nb);
+			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return maxnb;
@@ -1251,7 +1340,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 
 /* Does the fork exist on 'timeline' or any ancestor, as of read_lsn? */
 static int
-fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
+fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
+					uint64_t read_seq)
 {
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
@@ -1262,7 +1352,7 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, &nb);
+			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return 0;
@@ -1296,10 +1386,10 @@ timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 /*
  * Fork-size events the segment log cannot reproduce -- create, truncate,
  * unlink, zero-extend -- are persisted here (the segment records themselves
- * re-derive every page-append GROW on recovery).  Same fixed-record
- * append-only discipline as the timeline log.
+ * re-derive every page-append GROW on recovery).  V2 records are self-sized so
+ * they can coexist with the legacy fixed records in one append-only log.
  */
-typedef struct ForkMetaRec
+typedef struct ForkMetaRecV1
 {
 	uint32_t	timeline;
 	PsKey		key;
@@ -1307,45 +1397,63 @@ typedef struct ForkMetaRec
 	uint32_t	nblocks;
 	uint8_t		kind;
 	uint8_t		pad[3];
-} ForkMetaRec;
+} ForkMetaRecV1;
+
+#define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2" */
+
+typedef struct ForkMetaRecV2
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	order_id;
+	uint32_t	nblocks;
+	uint8_t		kind;
+	uint8_t		pad[3];
+} ForkMetaRecV2;
 
 static int
 fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
-				  uint32_t nblocks, uint8_t kind)
+				  uint64_t admission_seq, uint32_t nblocks, uint8_t kind)
 {
-	ForkMetaRec rec;
+	ForkMetaRecV2 rec;
 
 	memset(&rec, 0, sizeof(rec));
+	rec.magic = FORK_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
 	rec.timeline = timeline;
 	rec.key = *key;
 	rec.lsn = lsn;
+	rec.admission_seq = admission_seq;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
 	return ps_storage->fork_meta_append(&rec, sizeof(rec));
 }
 
-/* Persist a bound segment marker and its 64-bit identity in one append.  The
- * log keeps its fixed record size, so stores containing older records remain
- * readable; a torn pair is discarded as one incomplete logical marker. */
+/* Persist a bound segment marker and its 64-bit identity in one self-sized
+ * append.  The loader also accepts the legacy two-record representation. */
 static int
 fork_meta_persist_segment(uint32_t timeline, const PsKey *key, uint64_t lsn,
-						  uint32_t nblocks, uint8_t kind, uint64_t order_id)
+							  uint32_t nblocks, uint8_t kind, uint64_t order_id,
+							  uint64_t admission_seq)
 {
-	ForkMetaRec pair[2];
+	ForkMetaRecV2 rec;
 
-	memset(pair, 0, sizeof(pair));
-	pair[0].timeline = timeline;
-	pair[0].key = *key;
-	pair[0].lsn = lsn;
-	pair[0].nblocks = nblocks;
-	pair[0].kind = kind == FEV_SEG_GROW ? FEV_SEG_GROW_BOUND :
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = FORK_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.timeline = timeline;
+	rec.key = *key;
+	rec.lsn = lsn;
+	rec.admission_seq = admission_seq;
+	rec.order_id = order_id;
+	rec.nblocks = nblocks;
+	rec.kind = kind == FEV_SEG_GROW ? FEV_SEG_GROW_BOUND :
 		FEV_SEG_COMMIT_BOUND;
-	pair[1].timeline = timeline;
-	pair[1].key = *key;
-	pair[1].lsn = order_id;
-	pair[1].nblocks = nblocks;
-	pair[1].kind = FEV_SEG_ID;
-	return ps_storage->fork_meta_append(pair, sizeof(pair));
+	return ps_storage->fork_meta_append(&rec, sizeof(rec));
 }
 
 /*
@@ -1364,66 +1472,84 @@ static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run 
 static int
 load_fork_meta(void)
 {
-	ForkMetaRec rec;
 	uint64_t	off = 0;
 	int			have_records = 0;
-	int			nread;
+	int			nread = 0;
 
 	for (;;)
 	{
-		nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
-		if (nread != (int) sizeof(rec))
-			break;
-		if (rec.kind == FEV_SEG_GROW_BOUND ||
-			rec.kind == FEV_SEG_COMMIT_BOUND)
-		{
-			ForkMetaRec idrec;
-			int			idread;
+		ForkMetaRecV2 rec;
+		uint32_t	first;
+		uint64_t	rec_size;
 
-			idread = ps_storage->fork_meta_read(off + sizeof(rec), &idrec,
-										   sizeof(idrec));
-			if (idread != (int) sizeof(idrec))
-			{
-				if (idread < 0 || ps_storage->fork_meta_truncate(off) != 0)
-					return -1;
-				nread = 0;
+		nread = ps_storage->fork_meta_read(off, &first, sizeof(first));
+		if (nread != (int) sizeof(first))
+			break;
+		memset(&rec, 0, sizeof(rec));
+		if (first == FORK_META_V2_MAGIC)
+		{
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
 				break;
-			}
-			have_records = 1;
-			if (rec.timeline < MAX_TIMELINES && idrec.kind == FEV_SEG_ID &&
-				idrec.timeline == rec.timeline && key_eq(&idrec.key, &rec.key) &&
-				idrec.nblocks == rec.nblocks && idrec.lsn != 0)
+			rec_size = sizeof(rec);
+		}
+		else
+		{
+			ForkMetaRecV1 old;
+
+			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
+			if (nread != (int) sizeof(old))
+				break;
+			rec.timeline = old.timeline;
+			rec.key = old.key;
+			rec.lsn = old.lsn;
+			rec.nblocks = old.nblocks;
+			rec.kind = old.kind;
+			rec_size = sizeof(old);
+			if (old.kind == FEV_SEG_GROW_BOUND ||
+				old.kind == FEV_SEG_COMMIT_BOUND)
 			{
-				fork_event_add_seg_marker(
-					fork_get_or_create(rec.timeline, &rec.key),
-					rec.lsn, rec.nblocks, rec.kind, idrec.lsn);
-				segment_order_id_observe(idrec.lsn);
+				ForkMetaRecV1 idrec;
+				int			idread;
+
+				idread = ps_storage->fork_meta_read(off + sizeof(old), &idrec,
+										   sizeof(idrec));
+				if (idread != (int) sizeof(idrec))
+					break;
+				rec_size += sizeof(idrec);
+				if (idrec.kind == FEV_SEG_ID && idrec.timeline == old.timeline &&
+					key_eq(&idrec.key, &old.key) && idrec.nblocks == old.nblocks)
+					rec.order_id = idrec.lsn;
 			}
-			else
-				fprintf(stderr, "pagestore: skipping invalid bound fork-meta marker "
-						"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
-			off += sizeof(rec) + sizeof(idrec);
-			continue;
 		}
 		have_records = 1;
+		if (rec.admission_seq != 0)
+			admission_seq_observe(rec.admission_seq);
+		if (rec.order_id != 0)
+			segment_order_id_observe(rec.order_id);
 		if (rec.kind == FEV_MIGRATED)
 			fork_meta_migrated = 1;
 		else if (rec.kind == FEV_MIGRATING)
 			fork_meta_migrating = 1;
-		else if ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT) &&
-				 rec.timeline < MAX_TIMELINES)
+		else if ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT ||
+				  rec.kind == FEV_SEG_GROW_BOUND ||
+				  rec.kind == FEV_SEG_COMMIT_BOUND) &&
+				 rec.timeline < MAX_TIMELINES &&
+				 ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT) ||
+				  rec.order_id != 0))
 			fork_event_add_seg_marker(
 				fork_get_or_create(rec.timeline, &rec.key),
-				rec.lsn, rec.nblocks, rec.kind, 0);
+				rec.lsn, rec.nblocks, rec.kind, rec.order_id,
+				rec.admission_seq);
 		else if (rec.kind <= FEV_DEAD && rec.timeline < MAX_TIMELINES)
 		{
 			fork_event_add(fork_get_or_create(rec.timeline, &rec.key),
-						   rec.lsn, rec.nblocks, rec.kind);
+						   rec.lsn, rec.admission_seq, rec.nblocks, rec.kind);
 		}
 		else
 			fprintf(stderr, "pagestore: skipping invalid fork-meta record "
 					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
-		off += sizeof(rec);
+		off += rec_size;
 	}
 	/* A short tail is not a record and must not become a prefix of the first
 	 * migration marker (or any later append). */
@@ -1447,7 +1573,7 @@ load_fork_meta(void)
 		PsKey		zk;
 
 		memset(&zk, 0, sizeof(zk));
-		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATING) != 0)
+		if (fork_meta_persist(0, &zk, 0, 0, 0, FEV_MIGRATING) != 0)
 		{
 			fprintf(stderr, "pagestore: could not start the fork-meta migration\n");
 			return -1;
@@ -1908,16 +2034,19 @@ page_lsn(const unsigned char *page)
  */
 int
 append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-			const unsigned char *page, uint64_t version)
+			const unsigned char *page, uint64_t version,
+			uint64_t *out_admission_seq)
 {
 	SegRecHdr	hdr;
-	SegRecHdrBound bound_hdr;
-	uint64_t	header_size = sizeof(SegRecHdr);
+	SegRecHdrAdmission admission_hdr;
+	SegRecHdrBoundAdmission bound_hdr;
+	uint64_t	header_size = sizeof(SegRecHdrAdmission);
 	uint64_t	reclen;
 	uint64_t	data_off;
 	uint64_t	hdr_grow_lsn = 0;
 	uint64_t	order_id = 0;
 	uint64_t	page_version;
+	uint64_t	admission_seq = admission_seq_alloc();
 	int			clamped = 0;
 	int			ordered_record = 0;
 	int			segment_grows = 0;
@@ -1941,7 +2070,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	ps_unlock_map();
 
-	hdr.magic = SEG_MAGIC;
+	hdr.magic = SEG_ADMISSION_MAGIC;
 	hdr.timeline = timeline;
 	hdr.key = *key;
 	hdr.block = block;
@@ -1977,7 +2106,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		 * the flush below re-takes map_wr; shard -> map order is preserved.
 		 */
 		ps_lock_map_rd();
-		cur = read_through(timeline, key, block, UINT64_MAX);
+		cur = read_through(timeline, key, block, UINT64_MAX, 0);
 		hdr.lsn = cur ? cur->lsn + 1 : 1;
 		ps_unlock_map();
 	}
@@ -2017,9 +2146,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 				int			existed_before;
 
 				ps_lock_map_rd();
-				visible = fork_nblocks_through(timeline, key, growth_floor);
+				visible = fork_nblocks_through(timeline, key, growth_floor, 0);
 				existed_before = growth_floor > 0 &&
-					fork_exists_through(timeline, key, growth_floor - 1);
+					fork_exists_through(timeline, key, growth_floor - 1, 0);
 				ps_unlock_map();
 				clamped = visible < block + 1 || !existed_before;
 			}
@@ -2029,7 +2158,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 	if (hdr.lsn == 0)
 	{
-		hdr.magic = SEG_WALLESS_MAGIC;
+		hdr.magic = SEG_WALLESS_ADMISSION_MAGIC;
 		hdr.lsn = growth_floor;
 		zero_version = 1;
 	}
@@ -2037,13 +2166,13 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	page_version = zero_version ? 0 : hdr.lsn;
 	ordered_record = zero_version || clamped;
 	segment_grows = (!fe ||
-		fork_size_asof_hop(fe, hdr_grow_lsn) < block + 1);
+		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
 	if (ordered_record)
 	{
 		order_id = segment_order_id_alloc();
-		header_size = sizeof(SegRecHdrBound);
-		hdr.magic = zero_version ? SEG_WALLESS_BOUND_MAGIC :
-			SEG_CLAMPED_BOUND_MAGIC;
+		header_size = sizeof(SegRecHdrBoundAdmission);
+		hdr.magic = zero_version ? SEG_WALLESS_ADMISSION_MAGIC :
+			SEG_CLAMPED_ADMISSION_MAGIC;
 	}
 	reclen = header_size + page_size;
 
@@ -2059,13 +2188,19 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		bound_hdr.hdr = hdr;
 		bound_hdr.order_id = order_id;
+		bound_hdr.admission_seq = admission_seq;
 		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
 								  &bound_hdr, sizeof(bound_hdr)) != 0)
 			return -1;
 	}
-	else if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
-								 &hdr, sizeof(hdr)) != 0)
-		return -1;
+	else
+	{
+		admission_hdr.hdr = hdr;
+		admission_hdr.admission_seq = admission_seq;
+		if (ps_storage->seg_write(s->id, s->cur_seg, s->cur_off,
+								  &admission_hdr, sizeof(admission_hdr)) != 0)
+			return -1;
+	}
 	data_off = s->cur_off + header_size;
 	if (ps_storage->seg_write(s->id, s->cur_seg, data_off, page, page_size) != 0)
 		return -1;
@@ -2078,7 +2213,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (ordered_record &&
 		fork_meta_persist_segment(timeline, key, hdr_grow_lsn, block + 1,
 								  segment_grows ? FEV_SEG_GROW : FEV_SEG_COMMIT,
-								  order_id) != 0)
+								  order_id, admission_seq) != 0)
 	{
 		/* The complete body is not committed without its marker.  Retire this
 		 * segment so a later torn header cannot reuse that stale body. */
@@ -2087,15 +2222,11 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	}
 
 	/* index points at the page bytes (data_off), so reads skip the header */
-	page_add_version(timeline, key, block, page_version,
+	page_add_version(timeline, key, block, page_version, admission_seq,
 					 s->id, s->cur_seg, data_off);
 
-	/*
-	 * A same-LSN rewrite (latest-wins in the version chain) changes the
-	 * authoritative bytes under an unchanged cache key; drop any cached copy
-	 * so reads do not keep serving the pre-rewrite image.
-	 */
-	ps_pgcache_invalidate(timeline, key, block, page_version);
+	/* Drop a partial cache insertion for this exact durable version, if any. */
+	ps_pgcache_invalidate(timeline, key, block, page_version, admission_seq);
 	s->cur_off += reclen;
 
 	/*
@@ -2117,7 +2248,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (zero_version)
 			flags |= PS_IMG_REC_WALLESS;
 		if (ps_memtable_put(s->memtable, timeline, key, block, page_version,
-							page, hdr_grow_lsn, order_id, (uint32_t) s->cur_seg,
+							page, admission_seq, hdr_grow_lsn, order_id,
+							(uint32_t) s->cur_seg,
 							data_off, flags) != 0)
 			s->coverage_broken = 1;
 		if (ps_memtable_full(s->memtable))
@@ -2145,10 +2277,13 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * block is readable as of a horizon iff it has a version at/below it,
 	 * so keying the GROW event by hdr.lsn makes as-of NBLOCKS agree with
 	 * as-of page reads block for block.  (This replaces the callers'
-	 * former one-shot fork_grow after a batch.)  SEG0 stores a zero-version
-	 * page/object's growth floor in the same record while its version stays 0.
+	 * former one-shot fork_grow after a batch.)  The WAL-less format stores a
+	 * zero-version page/object's growth floor in the same record while its
+	 * version stays 0.
 	 */
-	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn);
+	fork_grow_apply(timeline, key, block + 1, hdr_grow_lsn, admission_seq);
+	if (out_admission_seq)
+		*out_admission_seq = admission_seq;
 	return 0;
 }
 
@@ -2170,11 +2305,13 @@ read_version(const PageVer *v, unsigned char *out)
  */
 static int
 layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t read_lsn, uint64_t *out_lsn, unsigned char *out)
+				 uint64_t read_lsn, uint64_t read_seq, uint64_t *out_lsn,
+				 uint64_t *out_seq, unsigned char *out)
 {
 	unsigned char *tmp = malloc(page_size);
 	int			found = 0;
 	uint64_t	best = 0;
+	uint64_t	best_seq = 0;
 	uint64_t	best_layer = 0;
 
 	if (!tmp)
@@ -2182,15 +2319,18 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
-		uint64_t	l;
+		uint64_t	l,
+					a;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
-		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l) == 1 &&
-			(!found || l > best || (l == best && d->layer_id > best_layer)))
+		if (ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+								  page_size, &l, &a) == 1 &&
+			(!found || l > best || (l == best && a > best_seq) ||
+			 (l == best && a == best_seq && d->layer_id > best_layer)))
 		{
 			best = l;
+			best_seq = a;
 			best_layer = d->layer_id;
 			memcpy(out, tmp, page_size);
 			found = 1;
@@ -2199,6 +2339,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	free(tmp);
 	if (found && out_lsn)
 		*out_lsn = best;
+	if (found && out_seq)
+		*out_seq = best_seq;
 	return found;
 }
 
@@ -2213,7 +2355,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
  */
 int
 read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
-			 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver)
+			 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
+			 uint64_t *out_ver)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
@@ -2223,21 +2366,20 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		uint32_t	tl = w.tl;
 		uint64_t	rl = w.lsn;
 		PageEnt    *e = page_find(tl, key, block);
-		PageVer    *pv = e ? page_visible(e, rl) : NULL;
+		PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
 
 		if (pv)
 		{
-			uint64_t	l;
+			uint64_t	l,
+						a;
 			int			served;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
 			 * only while they stay in lock-step with the segment log.  Once the
-			 * manifest is poisoned, append_page() stops staging and a later
-			 * same-pd_lsn rewrite lands in the segment only; both the cache (keyed
-			 * by (tl,key,block,lsn)) and the memtable would then return the older
-			 * bytes under the same LSN as the segment-backed pv.  When poisoned,
-			 * bypass both; reclaimed versions still use their durable layer.
+			 * manifest is poisoned, append_page() stops staging and the memtable
+			 * can lag the segment-backed page index.  Bypass transient sources in
+			 * that state; reclaimed versions still use their durable layer.
 			 */
 			int			poisoned = ps_manifest_poisoned();
 
@@ -2247,25 +2389,27 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				*out_ver = pv->lsn;
 
 			/* fast path: materialized-page cache, keyed by the resolved version */
-			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn, out))
+			if (!poisoned && ps_pgcache_lookup(tl, key, block, pv->lsn,
+											pv->admission_seq, out))
 				return 1;
 
 			if (s->memtable && !poisoned &&
-				ps_memtable_lookup(s->memtable, tl, key, block, rl, &l, out) &&
-				l == pv->lsn)
+				ps_memtable_lookup(s->memtable, tl, key, block, rl, read_seq,
+								   &l, &a, out) &&
+				l == pv->lsn && a == pv->admission_seq)
 			{
 				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
 			else if (pv->seg < 0 &&
-					 layer_map_lookup(tl, key, block, rl, &l, out) &&
-					 l == pv->lsn)
+					 layer_map_lookup(tl, key, block, rl, read_seq, &l, &a, out) &&
+					 l == pv->lsn && a == pv->admission_seq)
 			{
 				/*
 				 * Serve from a layer only for a layer-origin version (no segment
-				 * copy).  A segment-backed version must come from its segment: a
-				 * layer match is keyed by LSN alone, so a same-pd_lsn rewrite in
-				 * the segment would otherwise be masked by the older layer image.
+				 * copy).  A segment-backed version must come from its segment; layers
+				 * are only authoritative after recovery or segment reclamation changes
+				 * the page index entry to a layer origin.
 				 */
 				__atomic_fetch_add(&s->rr_layer, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from an image layer */
@@ -2276,7 +2420,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				served = (read_version(pv, out) == 0);	/* segment fallback */
 			}
 			if (served)
-				ps_pgcache_insert(tl, key, block, pv->lsn, out);
+				ps_pgcache_insert(tl, key, block, pv->lsn,
+								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
 	} while (tl_walk_next(&w));
@@ -2347,8 +2492,9 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, &layer_lsn,
-									  tmp) || layer_lsn != v->lsn)
+					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, 0,
+									  &layer_lsn, NULL, tmp) ||
+						layer_lsn != v->lsn)
 					{
 						rc = -1;
 						goto done;
@@ -2442,7 +2588,8 @@ layer_recover_cmp(const void *pa, const void *pb)
 /* Replay the index and fork-growth effects shared by layer and segment input. */
 static int
 replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
-				   uint64_t page_lsn, uint64_t growth_lsn, uint64_t order_id,
+				   uint64_t page_lsn, uint64_t admission_seq,
+				   uint64_t growth_lsn, uint64_t order_id,
 				   uint32_t flags, uint32_t shard, int seg, uint64_t off)
 {
 	int			ordered = (flags & PS_IMG_REC_ORDERED) != 0;
@@ -2450,27 +2597,32 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	if (order_id != 0)
 		segment_order_id_observe(order_id);
+	if (admission_seq != 0)
+		admission_seq_observe(admission_seq);
 	if (ordered)
 	{
 		ForkEnt    *fe = fork_find(timeline, key);
 
 		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
-											order_id)) && !fork_meta_legacy)
+										order_id, admission_seq)) &&
+			!fork_meta_legacy)
 			return 0;
 	}
 
-	page_add_version(timeline, key, block, page_lsn, shard, seg, off);
+	page_add_version(timeline, key, block, page_lsn, admission_seq,
+					 shard, seg, off);
 	if (fork_meta_legacy)
 	{
 		ForkEnt    *fe = fork_get_or_create(timeline, key);
 		uint64_t	l = growth_lsn ? growth_lsn : fe->last_def_lsn;
 
-		if (fork_size_asof_hop(fe, l) < block + 1)
+		if (fork_size_asof_hop(fe, l, admission_seq) < block + 1)
 		{
 			if (!fork_meta_migrate_failed &&
-				fork_meta_persist(timeline, key, l, block + 1, FEV_GROW) != 0)
+				fork_meta_persist(timeline, key, l, admission_seq,
+							  block + 1, FEV_GROW) != 0)
 				fork_meta_migrate_failed = 1;
-			fork_event_add(fe, l, block + 1, FEV_GROW);
+			fork_event_add(fe, l, admission_seq, block + 1, FEV_GROW);
 		}
 	}
 	else if (!ordered && wal_less)
@@ -2478,10 +2630,12 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 		ForkEnt    *fe = fork_get_or_create(timeline, key);
 
 		if (!fork_has_growth_at(fe, growth_lsn, block + 1))
-			fork_grow_replay(timeline, key, block + 1, growth_lsn);
+			fork_grow_replay(timeline, key, block + 1, growth_lsn,
+							 admission_seq);
 	}
 	else if (!ordered && growth_lsn != 0)
-		fork_grow_replay(timeline, key, block + 1, growth_lsn);
+		fork_grow_replay(timeline, key, block + 1, growth_lsn,
+						 admission_seq);
 	return 1;
 }
 
@@ -2547,8 +2701,8 @@ recover_layer_prefix(uint32_t shard)
 			if (!verify ||
 				ps_image_layer_lookup(d, &idx[first_covered].key,
 								  idx[first_covered].block,
-								  idx[first_covered].lsn, verify, page_size,
-								  &verified_lsn) != 1)
+								  idx[first_covered].lsn, 0, verify, page_size,
+								  &verified_lsn, NULL) != 1)
 			{
 				free(verify);
 				free(idx);
@@ -2571,7 +2725,8 @@ recover_layer_prefix(uint32_t shard)
 			e->seg_off == recs[i + 1].ent.seg_off)
 			continue;
 		if (!replay_page_record(recs[i].timeline, &e->key, e->block, e->lsn,
-								e->growth_lsn, e->order_id, e->flags,
+								e->admission_seq, e->growth_lsn, e->order_id,
+								e->flags,
 								shard, -1, 0))
 			goto fail;
 	}
@@ -2617,10 +2772,12 @@ recover(uint32_t shard)
 			SegRecHdr	hdr;
 			uint64_t	header_size = sizeof(SegRecHdr);
 			uint64_t	order_id = 0;
+			uint64_t	admission_seq = 0;
 			uint64_t	data_off;
 			uint64_t	page_version;
 			uint32_t	flags = PS_IMG_REC_SEG_VALID;
 			int			bound;
+			int			has_admission;
 			int			ordered;
 			int			wal_less;
 
@@ -2629,12 +2786,19 @@ recover(uint32_t shard)
 				break;
 			wal_less = hdr.magic == SEG_WALLESS_MAGIC ||
 				hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
-				hdr.magic == SEG_WALLESS_BOUND_MAGIC;
+				hdr.magic == SEG_WALLESS_BOUND_MAGIC ||
+				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC;
 			bound = hdr.magic == SEG_WALLESS_BOUND_MAGIC ||
-				hdr.magic == SEG_CLAMPED_BOUND_MAGIC;
+				hdr.magic == SEG_CLAMPED_BOUND_MAGIC ||
+				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC;
+			has_admission = hdr.magic == SEG_ADMISSION_MAGIC ||
+				hdr.magic == SEG_WALLESS_ADMISSION_MAGIC ||
+				hdr.magic == SEG_CLAMPED_ADMISSION_MAGIC;
 			ordered = hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
 				hdr.magic == SEG_CLAMPED_ORDERED_MAGIC || bound;
-			if (hdr.magic != SEG_MAGIC && !wal_less && !ordered)
+			if (hdr.magic != SEG_MAGIC && hdr.magic != SEG_ADMISSION_MAGIC &&
+				!wal_less && !ordered)
 			{
 				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
 						"record magic %#x at offset %llu\n", shard, id, hdr.magic,
@@ -2645,12 +2809,23 @@ recover(uint32_t shard)
 				break;
 			if (bound)
 			{
-				header_size = sizeof(SegRecHdrBound);
+				header_size = has_admission ? sizeof(SegRecHdrBoundAdmission) :
+					sizeof(SegRecHdrBound);
 				if (ps_storage->seg_read(shard, id, off + sizeof(hdr),
 										 &order_id, sizeof(order_id)) != 0 ||
 					order_id == 0)
 					break;
 			}
+			else if (has_admission)
+				header_size = sizeof(SegRecHdrAdmission);
+			if (has_admission &&
+				ps_storage->seg_read(shard, id,
+									 off + header_size - sizeof(admission_seq),
+									 &admission_seq,
+									 sizeof(admission_seq)) != 0)
+				break;
+			if (has_admission && admission_seq == 0)
+				break;
 			if (seg_bytes < (int64_t) (off + header_size + hdr.len))
 				break;
 			data_off = off + header_size;
@@ -2664,7 +2839,8 @@ recover(uint32_t shard)
 				flags &= ~PS_IMG_REC_ORDERED;
 			page_version = wal_less ? 0 : hdr.lsn;
 			if (!replay_page_record(hdr.timeline, &hdr.key, hdr.block,
-								page_version, hdr.lsn, order_id, flags,
+								page_version, admission_seq, hdr.lsn, order_id,
+								flags,
 								shard, id, data_off))
 			{
 				retire_segment = 1;
@@ -2674,7 +2850,8 @@ recover(uint32_t shard)
 			{
 				if (ps_storage->seg_read(shard, id, data_off, page, page_size) != 0 ||
 					ps_memtable_put(s->memtable, hdr.timeline, &hdr.key, hdr.block,
-								page_version, page, hdr.lsn, order_id,
+								page_version, page, admission_seq, hdr.lsn,
+								order_id,
 								(uint32_t) id, data_off, flags) != 0)
 					goto fail;
 			}
@@ -2741,23 +2918,34 @@ ps_handle_meta(PsChannel *ch)
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	seq = admission_seq_alloc();
 				uint32_t	nb;
-				int			r = fork_asof_hop(e, lsn, &nb);
+				int			r = fork_asof_hop(e, lsn, 0, &nb);
 
 				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
 				{
-					if (fork_meta_persist(tl, &ch->key, lsn, 0, FEV_SET) != 0)
+					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
 					else
-						fork_event_add(e, lsn, 0, FEV_SET);
+					{
+						fork_event_add(e, lsn, seq, 0, FEV_SET);
+						ch->req_seq = seq;
+					}
 				}
 			}
 			break;
 
 		case PS_OP_EXISTS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			if (ch->req_seq != 0 && ch->key.klass == PS_KLASS_RELATION &&
+				fork_has_wal_less_page(tl, &ch->key))
+			{
+				ch->status = PS_STATUS_ERROR;
+				break;
+			}
 			ch->result = fork_exists_through(tl, &ch->key,
-											 ch->req_lsn ? ch->req_lsn : UINT64_MAX) ? 1 : 0;
+										 ch->req_lsn ? ch->req_lsn : UINT64_MAX,
+										 ch->req_seq) ? 1 : 0;
 			break;
 
 		case PS_OP_UNLINK:
@@ -2769,18 +2957,29 @@ ps_handle_meta(PsChannel *ch)
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	seq = admission_seq_alloc();
 
-				if (fork_meta_persist(tl, &ch->key, lsn, 0, FEV_DEAD) != 0)
+				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
-					fork_event_add(e, lsn, 0, FEV_DEAD);
+				{
+					fork_event_add(e, lsn, seq, 0, FEV_DEAD);
+					ch->req_seq = seq;
+				}
 			}
 			break;
 
 		case PS_OP_NBLOCKS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			if (ch->req_seq != 0 && ch->key.klass == PS_KLASS_RELATION &&
+				fork_has_wal_less_page(tl, &ch->key))
+			{
+				ch->status = PS_STATUS_ERROR;
+				break;
+			}
 			ch->result = fork_nblocks_through(tl, &ch->key,
-											  ch->req_lsn ? ch->req_lsn : UINT64_MAX);
+										  ch->req_lsn ? ch->req_lsn : UINT64_MAX,
+										  ch->req_seq);
 			break;
 
 		case PS_OP_TRUNCATE:
@@ -2793,11 +2992,16 @@ ps_handle_meta(PsChannel *ch)
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	seq = admission_seq_alloc();
 
-				if (fork_meta_persist(tl, &ch->key, lsn, ch->nblocks, FEV_SET) != 0)
+				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
+								  FEV_SET) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
-					fork_event_add(e, lsn, ch->nblocks, FEV_SET);
+				{
+					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET);
+					ch->req_seq = seq;
+				}
 			}
 			break;
 
@@ -3273,7 +3477,7 @@ ps_core_open(const char *store_dir)
 			return -1;
 		}
 		memset(&zk, 0, sizeof(zk));
-		if (fork_meta_persist(0, &zk, 0, 0, FEV_MIGRATED) != 0)
+		if (fork_meta_persist(0, &zk, 0, 0, 0, FEV_MIGRATED) != 0)
 		{
 			fprintf(stderr, "pagestore: could not seal the fork-meta migration\n");
 			return -1;

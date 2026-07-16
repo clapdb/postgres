@@ -29,7 +29,9 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		17	/* 17: NBLOCKS/EXISTS honour req_lsn as an
+#define PS_SHM_VERSION		18	/* 18: req_seq caps same-LSN admission order;
+								 *     writes return their admission sequence
+								 * 17: NBLOCKS/EXISTS honour req_lsn as an
 								 *     as-of horizon; fork-mutating ops carry
 								 *     their WAL position in req_lsn;
 								 * 16: PS_OP_READV honours req_lsn as a
@@ -196,6 +198,7 @@ typedef struct PsChannel
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
 	uint32_t	pad1;
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
+	uint64_t	req_seq;		/* read admission cap; write result sequence */
 	PsKey		key;
 
 	/* result */
@@ -206,6 +209,19 @@ typedef struct PsChannel
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
 } PsChannel;
+
+/* Block 2 of the mirrored control object maps checkpoint redo to the global
+ * store-admission sequence that freezes same-LSN page/fork history. */
+#define PS_ADMISSION_FENCE_MAGIC	0x434e4641 /* "AFNC" */
+#define PS_ADMISSION_FENCE_VERSION	1
+
+typedef struct PsAdmissionFence
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint64_t	redo_lsn;
+	uint64_t	admission_seq;
+} PsAdmissionFence;
 
 typedef struct PsShmHeader
 {

@@ -1,8 +1,8 @@
 # Multi-compute read consistency: design
 
-Status: increments 1a (the page-read pin) and 1b (as-of size/existence
-metadata) implemented; increments 1c-3 are specified here and not yet
-built.
+Status: increments 1a (the page-read pin), 1b (as-of size/existence
+metadata), and 1d (the same-LSN admission fence) implemented; increments
+1c, 2, and 3 are specified here and not yet built.
 
 ## Problem
 
@@ -167,15 +167,24 @@ reconstruction.
    the running-xacts snapshot (above) so tuples of xacts in flight at R
    stay invisible whatever newest clog says.
 
-1d. **The same-LSN admission fence.**  Relation versions are keyed by
+1d. **The same-LSN admission fence (implemented).**  Relation versions are keyed by
    pd_lsn, and the writer's hint-bit-only page writes re-ship a page
    under an UNCHANGED pd_lsn: a version written after R can win a
    newest-<=-R resolve because it ties at the same LSN.  The bytes differ
    only in hint bits -- but those assert commit status decided possibly
-   after R.  The store needs an admission-order fence for capped reads
-   (e.g. versions carry a monotone store sequence, and R pairs with the
-   sequence the control image shipped at), or same-pd_lsn re-admissions
-   must be rejected below the pin.
+   after R.  Every page append and fork event now carries a daemon-global,
+   monotone admission sequence.  The sequence is durable in segment records,
+   image-layer v4 indexes, and forkmeta v2 records, and is preserved through
+   flush, compaction, segment reclamation, and recovery.  The control mirror
+   writes block 2 at version R with the sequence of R's control image; a pinned
+   compute resolves that exact marker at first access and sends `(R, sequence)`
+   on relation page, EXISTS, and NBLOCKS reads.  Selection orders by
+   `(lsn, admission_sequence)` and rejects versions/events above the fence.
+   Stores with legacy records can be upgraded in place (legacy sequence zero
+   predates a newly published fence), but a pinned read fails closed until an
+   exact block-2 marker for R exists.  WAL-less relation content remains
+   fail-closed: checkpoint R does not prove those pages complete even though
+   their store admission order is known.
 
 2. **The advancing reader.**  R advances by re-deriving from the control
    mirror (the SLRU reader's TTL/epoch protocol, generalized): adopting a

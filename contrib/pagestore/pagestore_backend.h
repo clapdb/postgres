@@ -189,8 +189,8 @@ extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern BlockNumber pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 																 const PageStoreRelKey *key,
 																 int timeout_ms);
-extern void pagestore_localsvc_obj_write_post_timeout(uint32 klass,
-													   const PageStoreRelKey *key,
+extern uint64 pagestore_localsvc_obj_write_post_timeout(uint32 klass,
+												  const PageStoreRelKey *key,
 													   BlockNumber block,
 													   const void *page,
 													   uint64 version,

@@ -17,11 +17,12 @@ typedef struct MemEnt
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 	unsigned char *page;		/* owned copy, page_size bytes */
 	uint64_t	growth_lsn;
 	uint64_t	order_id;
 	uint64_t	seg_off;
-	uint64_t	seq;
+	uint64_t	append_seq;
 	uint32_t	seg_id;
 	uint32_t	flags;
 } MemEnt;
@@ -33,7 +34,7 @@ struct PsMemtable
 	MemEnt	   *ents;
 	uint32_t	n;
 	uint32_t	cap;
-	uint64_t	next_seq;
+	uint64_t	next_append_seq;
 };
 
 PsMemtable *
@@ -69,6 +70,7 @@ ps_memtable_destroy(PsMemtable *mt)
 int
 ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
 				uint32_t block, uint64_t lsn, const void *page,
+				uint64_t admission_seq,
 				uint64_t growth_lsn, uint64_t order_id,
 				uint32_t seg_id, uint64_t seg_off, uint32_t flags)
 {
@@ -95,11 +97,12 @@ ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
 	e->key = *key;
 	e->block = block;
 	e->lsn = lsn;
+	e->admission_seq = admission_seq;
 	e->page = copy;
 	e->growth_lsn = growth_lsn;
 	e->order_id = order_id;
 	e->seg_off = seg_off;
-	e->seq = mt->next_seq++;
+	e->append_seq = mt->next_append_seq++;
 	e->seg_id = seg_id;
 	e->flags = flags;
 	return 0;
@@ -119,8 +122,8 @@ ps_memtable_full(const PsMemtable *mt)
 
 int
 ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
-				   uint32_t block, uint64_t read_lsn, uint64_t *out_lsn,
-				   void *out)
+				   uint32_t block, uint64_t read_lsn, uint64_t read_seq,
+				   uint64_t *out_lsn, uint64_t *out_seq, void *out)
 {
 	const MemEnt *best = NULL;
 
@@ -134,7 +137,11 @@ ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 			e->key.relNumber != key->relNumber || e->key.forkNum != key->forkNum ||
 			e->key.klass != key->klass)
 			continue;
-		if (e->lsn <= read_lsn && (!best || e->lsn >= best->lsn))
+		if (e->lsn <= read_lsn &&
+			(read_seq == 0 || e->admission_seq == 0 ||
+			 e->admission_seq <= read_seq) &&
+			(!best || e->lsn > best->lsn ||
+			 (e->lsn == best->lsn && e->admission_seq >= best->admission_seq)))
 			best = e;
 	}
 	if (!best)
@@ -142,6 +149,8 @@ ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 	memcpy(out, best->page, mt->page_size);
 	if (out_lsn)
 		*out_lsn = best->lsn;
+	if (out_seq)
+		*out_seq = best->admission_seq;
 	return 1;
 }
 
@@ -153,8 +162,8 @@ ent_timeline_cmp(const void *pa, const void *pb)
 
 	if (a != b)
 		return a < b ? -1 : 1;
-	return ((const MemEnt *) pa)->seq < ((const MemEnt *) pb)->seq ? -1 :
-		(((const MemEnt *) pa)->seq > ((const MemEnt *) pb)->seq ? 1 : 0);
+	return ((const MemEnt *) pa)->append_seq < ((const MemEnt *) pb)->append_seq ? -1 :
+		(((const MemEnt *) pa)->append_seq > ((const MemEnt *) pb)->append_seq ? 1 : 0);
 }
 
 int
@@ -190,6 +199,7 @@ ps_memtable_flush(PsMemtable *mt, PsAllocLayerId alloc, PsOnLayer on_layer,
 			recs[r].key = mt->ents[i + r].key;
 			recs[r].block = mt->ents[i + r].block;
 			recs[r].lsn = mt->ents[i + r].lsn;
+			recs[r].admission_seq = mt->ents[i + r].admission_seq;
 			recs[r].page = mt->ents[i + r].page;
 			recs[r].growth_lsn = mt->ents[i + r].growth_lsn;
 			recs[r].order_id = mt->ents[i + r].order_id;

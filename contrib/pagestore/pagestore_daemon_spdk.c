@@ -65,6 +65,7 @@ typedef struct BlkCtx
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 	unsigned char *dst;
 } BlkCtx;
 
@@ -89,7 +90,8 @@ read_done(void *arg, int ok)
 
 	if (ok)						/* the engine delivered the page into bc->dst */
 	{
-		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
+		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn,
+						  bc->admission_seq, bc->dst);
 		/* a READ_AT only counts as found once its page has actually landed */
 		if (rs->ch->opcode == PS_OP_READ_AT)
 			rs->ch->result = 1;
@@ -177,7 +179,8 @@ begin(uint32_t i, PsChannel *ch)
 	{
 		case PS_OP_EXTEND:
 			/* append_page grows the fork with the page's exact LSN */
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
+							ch->req_lsn, &ch->req_seq) != 0)
 				ch->status = PS_STATUS_ERROR;
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			return;
@@ -187,7 +190,7 @@ begin(uint32_t i, PsChannel *ch)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + b,
 								 ch->data + (size_t) b * page_size,
-								 ch->req_lsn) != 0)
+								 ch->req_lsn, &ch->req_seq) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -217,8 +220,9 @@ begin(uint32_t i, PsChannel *ch)
 					/* req_lsn nonzero = a pinned reader's horizon cap;
 					 * 0 keeps the newest (writer) semantics */
 					PageVer    *v = read_through(tl, &ch->key, blk,
-												 ch->req_lsn ? ch->req_lsn
-												 : UINT64_MAX);
+											 ch->req_lsn ? ch->req_lsn
+											 : UINT64_MAX,
+											 ch->req_seq);
 					BlkCtx	   *bc;
 
 					if (!v)
@@ -226,14 +230,15 @@ begin(uint32_t i, PsChannel *ch)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 						continue;
 					}
-					if (ch->req_lsn != 0 && v->lsn == 0)
+					if (ch->req_seq != 0 && v->lsn == 0)
 					{
 						/* WAL-less content is not as-of-resolvable; see the
 						 * POSIX daemon's capped-read refusal */
 						ch->status = PS_STATUS_ERROR;
 						break;
 					}
-					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
+					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn,
+										  v->admission_seq, dst))
 						continue;	/* RAM hit -> no device read */
 					bc = &rs->blk[rs->pending - 1];	/* slot 0.. behind the hold */
 					rs->pending++;
@@ -242,6 +247,7 @@ begin(uint32_t i, PsChannel *ch)
 					bc->key = ch->key;
 					bc->block = blk;
 					bc->lsn = v->lsn;
+					bc->admission_seq = v->admission_seq;
 					bc->dst = dst;
 					ps_spdk_read_async(v->shard, v->seg, v->off, dst, page_size,
 									   read_done, bc);
@@ -254,7 +260,7 @@ begin(uint32_t i, PsChannel *ch)
 			{
 				uint64_t	read_lsn = ch->req_lsn;
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 read_lsn);
+										 read_lsn, ch->req_seq);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
@@ -276,6 +282,7 @@ begin(uint32_t i, PsChannel *ch)
 				 * async read does not advertise a zero-filled page as found */
 				ch->req_lsn = v->lsn;
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
+									  v->admission_seq,
 									  ch->data))
 				{
 					ch->result = 1;			/* served from RAM: page is present */
@@ -291,6 +298,7 @@ begin(uint32_t i, PsChannel *ch)
 				bc->key = ch->key;
 				bc->block = ch->blocknum;
 				bc->lsn = v->lsn;
+				bc->admission_seq = v->admission_seq;
 				bc->dst = ch->data;
 				ps_spdk_read_async(v->shard, v->seg, v->off, ch->data, page_size,
 								   read_done, bc);

@@ -100,7 +100,7 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * checksums.
  * ------------------------------------------------------------------------- */
 #define PS_IMG_MAGIC	0x47494d50	/* "PIMG" */
-#define PS_IMG_VERSION	3	/* 3: index entries carry segment recovery metadata */
+#define PS_IMG_VERSION	4	/* 4: index entries carry global admission sequence */
 
 #define PS_IMG_REC_ORDERED	0x01
 #define PS_IMG_REC_WALLESS	0x02
@@ -111,6 +111,7 @@ typedef struct PsImgIndexEnt
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;			/* page_lsn of this version */
+	uint64_t	admission_seq;	/* global append order; 0 = legacy */
 	uint64_t	data_off;		/* byte offset of the page within the file */
 	uint64_t	growth_lsn;		/* segment header's fork-growth/order LSN */
 	uint64_t	order_id;		/* bound ordered-record identity, else zero */
@@ -136,6 +137,7 @@ typedef struct PsImgRec
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 	const void *page;
 	uint64_t	growth_lsn;
 	uint64_t	order_id;
@@ -161,8 +163,9 @@ extern int	ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
  */
 extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 								  uint32_t block, uint64_t read_lsn,
+								  uint64_t read_seq,
 								  void *out, uint32_t page_size,
-								  uint64_t *out_lsn);
+								  uint64_t *out_lsn, uint64_t *out_seq);
 
 /*
  * Read an image layer's full index (every (key, block, lsn) entry), for

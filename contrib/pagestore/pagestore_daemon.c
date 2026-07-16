@@ -69,7 +69,8 @@ handle_request(PsChannel *ch)
 	{
 		case PS_OP_EXTEND:
 			/* append_page grows the fork with the page's exact LSN */
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
+							ch->req_lsn, &ch->req_seq) != 0)
 				ch->status = PS_STATUS_ERROR;
 			break;
 
@@ -77,8 +78,8 @@ handle_request(PsChannel *ch)
 			for (uint32_t i = 0; i < ch->nblocks; i++)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + i,
-								 ch->data + (size_t) i * page_size,
-								 ch->req_lsn) != 0)
+								ch->data + (size_t) i * page_size,
+								 ch->req_lsn, &ch->req_seq) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -104,16 +105,18 @@ handle_request(PsChannel *ch)
 					unsigned char *dst = ch->data + (size_t) i * page_size;
 					uint64_t	resolved = 0;
 
-					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl, dst,
+					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl,
+									  ch->req_seq, dst,
 									  &resolved))
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
-					else if (rl != UINT64_MAX && resolved == 0)
+					else if (ch->req_seq != 0 && resolved == 0)
 					{
 						/*
 						 * A stored version with LSN 0 is WAL-less content
 						 * (an unlogged relation, or a skip-WAL build): it
-						 * is not LSN-ordered, so no capped read can honestly
-						 * serve it "as of" anything.  Fail closed rather
+						 * is not LSN-ordered, so a checkpoint read with
+						 * a durable admission cap cannot
+						 * honestly serve it "as of" anything.  Fail closed rather
 						 * than hand a pinned reader whatever bytes the
 						 * writer most recently flushed.
 						 */
@@ -134,7 +137,8 @@ handle_request(PsChannel *ch)
 				uint64_t	read_lsn = ch->req_lsn;
 				uint64_t	resolved = 0;
 
-				if (read_resolve(tl, &ch->key, ch->blocknum, read_lsn, ch->data,
+				if (read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
+								 ch->req_seq, ch->data,
 								 &resolved))
 				{
 					if (read_lsn != UINT64_MAX && resolved == 0)

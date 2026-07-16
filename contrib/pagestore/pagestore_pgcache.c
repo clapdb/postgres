@@ -25,6 +25,7 @@ typedef struct PgKey
 	uint32_t	timeline;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 	PsKey		key;
 } PgKey;
 
@@ -49,11 +50,12 @@ static uint64_t st_hits,
 			st_evict;
 
 static uint32_t
-key_hash(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+key_hash(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
+		 uint64_t admission_seq)
 {
 	uint64_t	h = 1469598103934665603ULL;	/* FNV-1a over the fields */
 	const uint64_t pr = 1099511628211ULL;
-	uint64_t	parts[6];
+	uint64_t	parts[7];
 
 	parts[0] = tl;
 	parts[1] = key->spcOid;
@@ -61,16 +63,18 @@ key_hash(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	parts[3] = key->forkNum;
 	parts[4] = block;
 	parts[5] = lsn;
-	for (int i = 0; i < 6; i++)
+	parts[6] = admission_seq;
+	for (int i = 0; i < 7; i++)
 		h = (h ^ parts[i]) * pr;
 	return (uint32_t) (h ^ (h >> 32));
 }
 
 static int
 key_eq(const PgKey *a, uint32_t tl, const PsKey *key, uint32_t block,
-	   uint64_t lsn)
+	   uint64_t lsn, uint64_t admission_seq)
 {
 	return a->timeline == tl && a->block == block && a->lsn == lsn &&
+		a->admission_seq == admission_seq &&
 		a->key.spcOid == key->spcOid && a->key.dbOid == key->dbOid &&
 		a->key.relNumber == key->relNumber && a->key.forkNum == key->forkNum &&
 		a->key.klass == key->klass;
@@ -113,28 +117,29 @@ ps_pgcache_free(void)
 
 static int
 find_slot(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
-		  uint32_t *out_bucket)
+		  uint64_t admission_seq, uint32_t *out_bucket)
 {
-	uint32_t	b = key_hash(tl, key, block, lsn) % nbuckets;
+	uint32_t	b = key_hash(tl, key, block, lsn, admission_seq) % nbuckets;
 
 	if (out_bucket)
 		*out_bucket = b;
 	for (int i = buckets[b]; i >= 0; i = slots[i].hnext)
-		if (slots[i].valid && key_eq(&slots[i].k, tl, key, block, lsn))
+		if (slots[i].valid && key_eq(&slots[i].k, tl, key, block, lsn,
+								 admission_seq))
 			return i;
 	return -1;
 }
 
 int
 ps_pgcache_lookup(uint32_t tl, const PsKey *key, uint32_t block,
-				  uint64_t version_lsn, void *out)
+				  uint64_t version_lsn, uint64_t admission_seq, void *out)
 {
 	int			s;
 
 	if (cache_max == 0)
 		return 0;
 	pthread_mutex_lock(&cache_lock);
-	s = find_slot(tl, key, block, version_lsn, NULL);
+	s = find_slot(tl, key, block, version_lsn, admission_seq, NULL);
 	if (s < 0)
 	{
 		st_misses++;
@@ -158,14 +163,14 @@ static void bucket_remove(int s);
  */
 void
 ps_pgcache_invalidate(uint32_t tl, const PsKey *key, uint32_t block,
-					  uint64_t version_lsn)
+					  uint64_t version_lsn, uint64_t admission_seq)
 {
 	int			s;
 
 	if (cache_max == 0)
 		return;
 	pthread_mutex_lock(&cache_lock);
-	s = find_slot(tl, key, block, version_lsn, NULL);
+	s = find_slot(tl, key, block, version_lsn, admission_seq, NULL);
 	if (s >= 0)
 	{
 		bucket_remove(s);
@@ -180,7 +185,8 @@ static void
 bucket_remove(int s)
 {
 	uint32_t	b = key_hash(slots[s].k.timeline, &slots[s].k.key,
-							 slots[s].k.block, slots[s].k.lsn) % nbuckets;
+							 slots[s].k.block, slots[s].k.lsn,
+							 slots[s].k.admission_seq) % nbuckets;
 	int		   *pp = &buckets[b];
 
 	while (*pp >= 0 && *pp != s)
@@ -191,7 +197,8 @@ bucket_remove(int s)
 
 void
 ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
-				  uint64_t version_lsn, const void *page)
+				  uint64_t version_lsn, uint64_t admission_seq,
+				  const void *page)
 {
 	uint32_t	b;
 	int			s;
@@ -199,7 +206,7 @@ ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
 	if (cache_max == 0)
 		return;
 	pthread_mutex_lock(&cache_lock);
-	s = find_slot(tl, key, block, version_lsn, &b);
+	s = find_slot(tl, key, block, version_lsn, admission_seq, &b);
 	if (s >= 0)
 	{							/* already present: refresh bytes + reference */
 		memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
@@ -230,6 +237,7 @@ ps_pgcache_insert(uint32_t tl, const PsKey *key, uint32_t block,
 	slots[s].k.key = *key;
 	slots[s].k.block = block;
 	slots[s].k.lsn = version_lsn;
+	slots[s].k.admission_seq = admission_seq;
 	memcpy(pages + (size_t) s * cache_psz, page, cache_psz);
 	slots[s].hnext = buckets[b];
 	buckets[b] = s;

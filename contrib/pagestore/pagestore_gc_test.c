@@ -855,7 +855,7 @@ main(void)
 	check(file_exists(a_uri),
 		  "A's file is still present (install-before-delete kept the data safe)");
 	check(file_exists(b_uri) && pb != NULL &&
-		  ps_image_layer_lookup(pb, &k, 0, 1000, out, PSZ, NULL) == 1 &&
+		  ps_image_layer_lookup(pb, &k, 0, 1000, 0, out, PSZ, NULL, NULL) == 1 &&
 		  out[0] == 0xB2,
 		  "merged layer B is readable through the entire crash window");
 
