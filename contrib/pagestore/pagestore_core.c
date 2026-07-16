@@ -131,15 +131,16 @@ static Shard g_shards[MAX_SHARDS];
  * Concurrency.  A per-shard rwlock guards each shard's in-memory state
  * (g_shards[i]: the page/fork/walidx indexes, memtable, append cursor and
  * layer-id cursor).  A single map_lock guards the cross-shard state: the global
- * ps_layer_map and the timelines[] array.  Lock order is always shard (outer)
- * then map (inner), never the reverse, so there is no deadlock.
+ * ps_layer_map and the timelines[] array.  Lock order is always shard (outer,
+ * ascending shard id when taking more than one) then map (inner), never the
+ * reverse, so there is no deadlock.
  *
  * Each daemon worker owns exactly one shard and only ever touches its own
- * g_shards[]; the sole cross-worker accessor of another shard is maintenance
- * (worker 0), which takes the target shard's lock plus map_lock before
- * compacting it.  Reads take shard-rd + map-rd; ordinary writes take only
- * shard-wr, escalating to a brief map-wr inside append_page when a flush or
- * inline compaction mutates the map; branch creation takes map-wr alone.
+ * g_shards[]; maintenance (worker 0) takes one shard for compaction or all
+ * shards for physical-segment rebinding, then map_lock.  Reads take shard-rd +
+ * map-rd; ordinary writes take only shard-wr, escalating to a brief map-wr
+ * inside append_page when a flush or inline compaction mutates the map; branch
+ * creation takes map-wr alone.
  */
 static pthread_rwlock_t shard_locks[MAX_SHARDS];
 static pthread_rwlock_t map_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -266,10 +267,18 @@ static uint64_t
 alloc_layer_id(void *ctx)
 {
 	Shard *s = (Shard *) ctx;
+	uint64_t	id;
+	int			exists;
 
 	if (!s)
 		s = &g_shards[0];
-	return layer_id(s->id, s->next_layer_id++);
+	do
+	{
+		id = layer_id(s->id, s->next_layer_id++);
+		exists = ps_layer_store->layer_exists_local ?
+			ps_layer_store->layer_exists_local(id) : 0;
+	} while (exists > 0);
+	return id;
 }
 
 static int
@@ -2957,22 +2966,80 @@ ps_core_close(void)
 }
 
 static int
+segment_has_references(uint32_t source_shard, uint32_t victim)
+{
+	uint32_t	ns = core_shards();
+
+	for (uint32_t sh = 0; sh < ns; sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
+				for (int i = 0; i < e->nver; i++)
+					if (e->vers[i].shard == source_shard &&
+						e->vers[i].seg == (int) victim)
+						return 1;
+	return 0;
+}
+
+static int
+verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
+{
+	int			found = 0;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+		int			covers = 0;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+			layer_shard_from_id(d->layer_id) != source_shard)
+			continue;
+		if (ps_image_layer_read_index(d, &idx, &n) != 0)
+			return -1;
+		for (uint32_t j = 0; j < n; j++)
+			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) &&
+				idx[j].seg_id == victim)
+			{
+				covers = 1;
+				break;
+			}
+		free(idx);
+		if (!covers)
+			continue;
+		found = 1;
+		/* Always re-read and checksum now: a prior read's cached verification
+		 * may predate corruption that occurred before this unlink. */
+		if (ps_image_layer_verify_data(d, page_size) != 0)
+			return -1;
+	}
+	return need_layer && !found ? -1 : 0;
+}
+
+static int
 reclaim_one_segment(Shard *s)
 {
 	uint32_t	victim;
+	uint32_t	ns = core_shards();
+	int			refs;
 
 	if (!s->flush_watermark_valid || !ps_storage->seg_remove ||
 		s->gc_next_seg >= s->flush_watermark.seg_id)
 		return 0;
 	victim = s->gc_next_seg;
-	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-		for (PageEnt *e = s->page_idx[bucket]; e; e = e->next)
-			for (int i = 0; i < e->nver; i++)
-				if (e->vers[i].seg == (int) victim)
-				{
-					e->vers[i].seg = -1;
-					e->vers[i].off = 0;
-				}
+	refs = segment_has_references(s->id, victim);
+	if (verify_segment_layers(s->id, victim, refs) != 0)
+		return 0;
+	for (uint32_t sh = 0; sh < ns; sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
+				for (int i = 0; i < e->nver; i++)
+					if (e->vers[i].shard == s->id &&
+						e->vers[i].seg == (int) victim)
+					{
+						e->vers[i].seg = -1;
+						e->vers[i].off = 0;
+					}
 	if (ps_storage->seg_remove(s->id, (int) victim) != 0)
 		return 0;
 	s->gc_next_seg++;
@@ -3011,16 +3078,18 @@ ps_core_maintenance(void)
 	/* Reclaim at most one complete segment.  The boundary segment containing
 	 * the watermark stays present because its suffix may not be in a layer. */
 	if (segment_gc_enabled && ps_storage->seg_remove)
+	{
 		for (uint32_t sh = 0; sh < ns; sh++)
-		{
 			ps_lock_shard_wr(sh);
-			ps_lock_map_rd();
+		ps_lock_map_rd();
+		for (uint32_t sh = 0; sh < ns && !found; sh++)
 			found = reclaim_one_segment(&g_shards[sh]);
-			ps_unlock_map();
-			ps_unlock_shard(sh);
-			if (found)
-				return 1;
-		}
+		ps_unlock_map();
+		for (uint32_t sh = ns; sh > 0; sh--)
+			ps_unlock_shard(sh - 1);
+		if (found)
+			return 1;
+	}
 
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image

@@ -10,9 +10,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
@@ -115,6 +117,23 @@ main(void)
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
 	check(r == 0, "absent key -> no version");
+
+	/* GC must force a fresh checksum even if an earlier lookup cached success. */
+	{
+		unsigned char bad = 0,
+					  good = 0xA1;
+		int			fd = open(d.locations[0].uri, O_WRONLY);
+
+		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1 && close(fd) == 0,
+			  "corrupt image bytes after cached verification");
+		check(ps_image_layer_verify_data(&d, psz) != 0,
+			  "forced data verification detects post-read corruption");
+		check(!d.data_verified, "failed forced verification clears cached success");
+		fd = open(d.locations[0].uri, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0 &&
+			  ps_image_layer_verify_data(&d, psz) == 0,
+			  "restored image bytes pass forced verification");
+	}
 
 	/* --- delta layer: ordered collect in an LSN range --- */
 	{

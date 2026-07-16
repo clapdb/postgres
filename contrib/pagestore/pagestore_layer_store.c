@@ -98,6 +98,18 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 }
 
 static int
+local_layer_exists(uint64_t layer_id)
+{
+	char		path[4096];
+
+	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
+		return -1;
+	if (access(path, F_OK) == 0)
+		return 1;
+	return errno == ENOENT ? 0 : -1;
+}
+
+static int
 local_write_local_layer(uint64_t layer_id, const void *buf, uint64_t len)
 {
 	char		path[4096];
@@ -225,6 +237,7 @@ const PsLayerStore PsLayerStoreLocal = {
 	.open = local_open,
 	.close = local_close,
 	.create_local_layer = local_create_local_layer,
+	.layer_exists_local = local_layer_exists,
 	.write_local_layer = local_write_local_layer,
 	.seal_local_layer = local_seal_local_layer,
 	.read_layer_block = local_read_layer_block,
