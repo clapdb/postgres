@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@
 #include "pagestore_pgcache.h"
 
 static volatile sig_atomic_t stop_requested = 0;
+static PsShmHeader *daemon_hdr = NULL;
 
 typedef struct WorkerArgs
 {
@@ -188,6 +190,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
+		case PS_OP_ADMISSION_BARRIER:
 			return 0;
 		default:
 			return 1;
@@ -195,7 +198,7 @@ request_is_write(PsOpcode opcode)
 }
 
 static void
-run_request(PsChannel *ch)
+run_request_admitted(PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
 
@@ -296,6 +299,100 @@ run_request(PsChannel *ch)
 	}
 }
 
+static uint64_t
+relation_request_lsn(const PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (ch->key.klass != PS_KLASS_RELATION)
+		return UINT64_MAX;
+	if (op == PS_OP_EXTEND || op == PS_OP_WRITEV)
+	{
+		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
+		uint64_t	lowest = UINT64_MAX;
+
+		for (uint32_t i = 0; i < npages; i++)
+		{
+			uint32_t	hi,
+						lo;
+			uint64_t	lsn;
+
+			memcpy(&hi, ch->data + (size_t) i * page_size, sizeof(hi));
+			memcpy(&lo, ch->data + (size_t) i * page_size + sizeof(hi), sizeof(lo));
+			lsn = ((uint64_t) hi << 32) | lo;
+			if (lsn < lowest)
+				lowest = lsn;
+		}
+		return lowest;
+	}
+	if (op == PS_OP_CREATE || op == PS_OP_UNLINK || op == PS_OP_TRUNCATE ||
+		op == PS_OP_ZEROEXTEND)
+		return ch->req_lsn;
+	return UINT64_MAX;
+}
+
+static uint64_t
+active_fence_epoch(void)
+{
+	uint64_t	epoch = ps_load_acquire_u64(&daemon_hdr->admission_pending_epoch);
+	uint32_t	owner;
+
+	if (epoch == 0)
+		return 0;
+	owner = ps_load_acquire(&daemon_hdr->admission_fence_owner);
+	if (owner != 0 && kill((pid_t) owner, 0) != 0 && errno == ESRCH &&
+		ps_cas_u64(&daemon_hdr->admission_pending_epoch, epoch, 0))
+	{
+		ps_store_release_u64(&daemon_hdr->admission_pending_lsn, 0);
+		ps_store_release(&daemon_hdr->admission_fence_owner, 0);
+		return 0;
+	}
+	return epoch;
+}
+
+/* Returns zero when a relation mutation is intentionally left in REQUEST
+ * until the checkpoint owner publishes and syncs its admission fence. */
+static int
+run_request(PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (op == PS_OP_ADMISSION_BARRIER)
+	{
+		ch->status = PS_STATUS_OK;
+		ch->result = 0;
+		ch->req_seq = ps_admission_barrier();
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return 1;
+	}
+	if (!request_is_write(op))
+	{
+		run_request_admitted(ch);
+		return 1;
+	}
+
+	for (;;)
+	{
+		uint64_t	epoch = active_fence_epoch();
+
+		ps_admission_read_lock();
+		if (epoch != active_fence_epoch())
+		{
+			ps_admission_read_unlock();
+			continue;
+		}
+		if (epoch != 0 && relation_request_lsn(ch) <=
+			ps_load_acquire_u64(&daemon_hdr->admission_pending_lsn))
+		{
+			ps_admission_read_unlock();
+			return 0;
+		}
+		run_request_admitted(ch);
+		ps_admission_read_unlock();
+		return 1;
+	}
+}
+
 static void *
 shard_worker(void *arg)
 {
@@ -316,8 +413,8 @@ shard_worker(void *arg)
 			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
 				continue;
 
-			run_request(ch);
-			did_work = 1;
+			if (run_request(ch))
+				did_work = 1;
 		}
 
 		if (!did_work && shard == 0)
@@ -452,6 +549,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	daemon_hdr = hdr;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

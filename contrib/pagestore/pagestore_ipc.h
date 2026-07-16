@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		18	/* 18: req_seq caps same-LSN admission order;
+#define PS_SHM_VERSION		19	/* 19: checkpoint admission gate + barrier;
+								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
 								 * 17: NBLOCKS/EXISTS honour req_lsn as an
 								 *     as-of horizon; fork-mutating ops carry
@@ -94,6 +95,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
+	PS_OP_ADMISSION_BARRIER,	/* out req_seq: sequence after prior mutations */
 } PsOpcode;
 
 /* Status codes */
@@ -231,9 +233,12 @@ typedef struct PsShmHeader
 	uint32_t	io_unit;		/* == PS_IO_UNIT */
 	uint32_t	nchannels;
 	uint32_t	nshards;		/* channel pools = channel index mod nshards */
-	uint32_t	pad0;			/* reserved */
+	uint32_t	admission_fence_owner; /* PID owning the pending checkpoint gate */
 	uint64_t	channel_stride;
 	uint64_t	channels_off;
+	uint64_t	admission_fence_epoch; /* monotonically identifies gate attempts */
+	uint64_t	admission_pending_epoch; /* 0, or the currently active gate */
+	uint64_t	admission_pending_lsn; /* relation mutations <= this LSN defer */
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)
@@ -272,6 +277,31 @@ ps_store_release(volatile uint32_t *p, uint32_t v)
 
 static inline int
 ps_cas(volatile uint32_t *p, uint32_t expected, uint32_t desired)
+{
+	return __atomic_compare_exchange_n(p, &expected, desired, 0,
+									   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static inline uint64_t
+ps_load_acquire_u64(volatile uint64_t *p)
+{
+	return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+ps_store_release_u64(volatile uint64_t *p, uint64_t v)
+{
+	__atomic_store_n(p, v, __ATOMIC_RELEASE);
+}
+
+static inline uint64_t
+ps_fetch_add_u64(volatile uint64_t *p, uint64_t v)
+{
+	return __atomic_fetch_add(p, v, __ATOMIC_ACQ_REL);
+}
+
+static inline int
+ps_cas_u64(volatile uint64_t *p, uint64_t expected, uint64_t desired)
 {
 	return __atomic_compare_exchange_n(p, &expected, desired, 0,
 									   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);

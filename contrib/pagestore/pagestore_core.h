@@ -58,6 +58,11 @@ extern int	ps_core_maintenance(void);
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 
+/* Assign a fence sequence only after all prior mutation bodies have left. */
+extern void ps_admission_read_lock(void);
+extern void ps_admission_read_unlock(void);
+extern uint64_t ps_admission_barrier(void);
+
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 

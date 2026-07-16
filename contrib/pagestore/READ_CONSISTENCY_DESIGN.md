@@ -175,10 +175,15 @@ reconstruction.
    after R.  Every page append and fork event now carries a daemon-global,
    monotone admission sequence.  The sequence is durable in segment records,
    image-layer v4 indexes, and forkmeta v2 records, and is preserved through
-   flush, compaction, segment reclamation, and recovery.  The control mirror
-   writes block 2 at version R with the sequence of R's control image; a pinned
-   compute resolves that exact marker at first access and sends `(R, sequence)`
-   on relation page, EXISTS, and NBLOCKS reads.  Selection orders by
+   flush, compaction, segment reclamation, and recovery.  At the checkpoint
+   boundary the control hook publishes a shared admission gate for R without
+   doing store I/O.  Daemon workers defer new relation mutations at or below R;
+   the later control drain takes an exclusive admission barrier, which waits for
+   every mutation already admitted on every shard and assigns the fence
+   sequence.  Only after block 2 carries `(R, sequence)` and all control writes
+   are synced does the drain release the gate.  A pinned compute resolves that
+   exact marker at first access and sends `(R, sequence)` on relation page,
+   EXISTS, and NBLOCKS reads.  Selection orders by
    `(lsn, admission_sequence)` and rejects versions/events above the fence.
    Stores with legacy records can be upgraded in place (legacy sequence zero
    predates a newly published fence), but a pinned read fails closed until an

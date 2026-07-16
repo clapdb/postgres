@@ -160,6 +160,15 @@ cl_exec(void)
 	return ch;
 }
 
+static PsChannel *
+exec_channel(PsChannel *ch)
+{
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+		;
+	return ch;
+}
+
 static void
 cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 {
@@ -1520,6 +1529,83 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		  "uncapped same-LSN fork metadata serves the later truncate");
 	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
 		  "admission fence excludes a later same-LSN truncate");
+
+	/* Reproduce the deferred-control-drain race.  A relation write posted after
+	 * the hook's shared gate must remain pending even when it shares a worker
+	 * with the barrier request; the worker skips it and serves the barrier/read
+	 * channel, then completes it only after the gate is released. */
+	{
+		PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+		PsChannel  *write_ch = ps_channel(cl_shm, cl_chan);
+		PsChannel  *barrier_ch = NULL;
+		uint64_t	epoch;
+		uint64_t	barrier_seq = 0;
+
+		op_create_at(rel + 2, 0, 12000);
+		fill_page(page, ps, 12000, 101);
+		op_write_one(rel + 2, 0, 0, page);
+		check(ps_cas(&hdr->admission_fence_owner, 0, (uint32_t) getpid()),
+			  "test checkpoint gate claims its shared owner slot");
+		epoch = ps_fetch_add_u64(&hdr->admission_fence_epoch, 1) + 1;
+		ps_store_release_u64(&hdr->admission_pending_lsn, 12000);
+		ps_store_release_u64(&hdr->admission_pending_epoch, epoch);
+
+		cl_setkey(write_ch, rel + 2, 0);
+		write_ch->opcode = PS_OP_WRITEV;
+		write_ch->blocknum = 0;
+		write_ch->nblocks = 1;
+		fill_page(write_ch->data, ps, 12000, 102);
+		ps_store_release(&write_ch->state, PS_STATE_REQUEST);
+
+		for (uint32_t i = (uint32_t) cl_chan + hdr->nshards;
+			 i < hdr->nchannels; i += hdr->nshards)
+		{
+			PsChannel  *candidate = ps_channel(cl_shm, i);
+
+			if (ps_cas(&candidate->claimed, 0, 1))
+			{
+				barrier_ch = candidate;
+				break;
+			}
+		}
+		check(barrier_ch != NULL,
+			  "admission race test claims a second channel on the same worker");
+		if (barrier_ch)
+		{
+			memset((void *) &barrier_ch->key, 0, sizeof(barrier_ch->key));
+			barrier_ch->opcode = PS_OP_ADMISSION_BARRIER;
+			barrier_ch->req_lsn = 0;
+			barrier_ch->req_seq = 0;
+			exec_channel(barrier_ch);
+			barrier_seq = barrier_ch->req_seq;
+			check(barrier_seq != 0,
+				  "admission barrier returns a durable sequence");
+			check(ps_load_acquire(&write_ch->state) == PS_STATE_REQUEST,
+				  "post-boundary same-LSN write remains gated");
+
+			cl_setkey(barrier_ch, rel + 2, 0);
+			barrier_ch->opcode = PS_OP_READ_AT;
+			barrier_ch->blocknum = 0;
+			barrier_ch->req_lsn = 12000;
+			barrier_ch->req_seq = barrier_seq;
+			exec_channel(barrier_ch);
+			check(page_has_tag(barrier_ch->data, ps, 101),
+				  "barrier-capped read excludes the gated same-LSN write");
+
+		}
+		check(ps_cas_u64(&hdr->admission_pending_epoch, epoch, 0),
+			  "test checkpoint gate releases its epoch");
+		ps_store_release_u64(&hdr->admission_pending_lsn, 0);
+		ps_store_release(&hdr->admission_fence_owner, 0);
+		while (ps_load_acquire(&write_ch->state) != PS_STATE_DONE)
+			;
+		if (barrier_ch)
+		{
+			check(write_ch->req_seq > barrier_seq,
+				  "released same-LSN write is admitted after the barrier");
+			ps_store_release(&barrier_ch->claimed, 0);
+		}
+	}
 	/* Leave a sub-threshold tail outside the committed watermark and crash. */
 	for (uint32_t block = 40; block < 42; block++)
 	{

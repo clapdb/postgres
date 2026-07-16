@@ -236,6 +236,7 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	ch->timeline = timeline;
 	ch->blocknum = 0;
 	ch->req_lsn = read_lsn;
+	ch->req_seq = 0;
 	ch->opcode = PS_OP_READ_AT;
 
 	/*
