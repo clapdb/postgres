@@ -62,8 +62,11 @@ main(void)
 	memset(pg[4], 0xC1, psz);
 	{
 		PsImgRec	recs[5] = {
-			{k5, 0, 100, pg[0]}, {k5, 0, 300, pg[2]}, {k5, 0, 200, pg[1]},
-			{k5, 1, 150, pg[3]}, {k6, 0, 250, pg[4]},
+			{.key = k5, .block = 0, .lsn = 100, .page = pg[0]},
+			{.key = k5, .block = 0, .lsn = 300, .page = pg[2]},
+			{.key = k5, .block = 0, .lsn = 200, .page = pg[1]},
+			{.key = k5, .block = 1, .lsn = 150, .page = pg[3]},
+			{.key = k6, .block = 0, .lsn = 250, .page = pg[4]},
 		};
 		PsImgIndexEnt *idx = NULL;
 		uint32_t	nidx = 0;
@@ -151,7 +154,10 @@ main(void)
 					dl;
 		PsLayerMap	map;
 		PsReadPlan	plan;
-		PsImgRec	irecs[2] = {{k5, 0, 100, pg[0]}, {k5, 0, 200, pg[1]}};
+		PsImgRec	irecs[2] = {
+			{.key = k5, .block = 0, .lsn = 100, .page = pg[0]},
+			{.key = k5, .block = 0, .lsn = 200, .page = pg[1]},
+		};
 		PsDeltaRec	drecs[3] = {
 			{k5, 0, 150, "x150", 4}, {k5, 0, 250, "x250", 4}, {k5, 0, 300, "x300", 4},
 		};
