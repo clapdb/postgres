@@ -14,6 +14,13 @@
 
 extern PsLayerMap ps_layer_map;
 
+typedef struct PsFlushWatermark
+{
+	uint32_t	shard;
+	uint32_t	seg_id;
+	uint64_t	seg_off;
+} PsFlushWatermark;
+
 extern int	ps_manifest_open(const char *store_dir);
 extern void ps_manifest_close(void);
 extern int	ps_manifest_poisoned(void);
@@ -23,6 +30,10 @@ extern int	ps_manifest_set_remote_durable(uint64_t layer_id,
 										   uint64_t uploaded_lsn);
 extern int	ps_manifest_mark_delete(uint64_t layer_id);
 extern int	ps_manifest_remove_layer(uint64_t layer_id);
+extern int	ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
+										 uint64_t seg_off);
+extern int	ps_manifest_get_flush_watermark(uint32_t shard,
+										 PsFlushWatermark *out);
 
 /* Bound replay time by rewriting the append-only log to one record per live layer. */
 extern int	ps_manifest_should_compact(void);

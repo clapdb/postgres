@@ -90,7 +90,7 @@ write_layer(uint64_t id, unsigned char fill)
 	PsLayerDesc d;
 
 	memset(pg, fill, PSZ);
-	rec = (PsImgRec) {k, 0, 100, pg};
+	rec = (PsImgRec) {.key = k, .block = 0, .lsn = 100, .page = pg};
 	memset(&d, 0, sizeof(d));
 	if (ps_image_layer_write(id, 0, &rec, 1, PSZ, &d) != 0)
 	{

@@ -10,9 +10,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "pagestore_layer.h"
 #include "pagestore_layer_store.h"
@@ -62,12 +64,38 @@ main(void)
 	memset(pg[4], 0xC1, psz);
 	{
 		PsImgRec	recs[5] = {
-			{k5, 0, 100, pg[0]}, {k5, 0, 300, pg[2]}, {k5, 0, 200, pg[1]},
-			{k5, 1, 150, pg[3]}, {k6, 0, 250, pg[4]},
+			{.key = k5, .block = 0, .lsn = 100, .page = pg[0]},
+			{.key = k5, .block = 0, .lsn = 300, .page = pg[2]},
+			{.key = k5, .block = 0, .lsn = 200, .page = pg[1]},
+			{.key = k5, .block = 1, .lsn = 150, .page = pg[3]},
+			{.key = k6, .block = 0, .lsn = 250, .page = pg[4]},
 		};
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+
+		recs[1].growth_lsn = 275;
+		recs[1].order_id = 44;
+		recs[1].seg_id = 3;
+		recs[1].seg_off = 1234;
+		recs[1].flags = PS_IMG_REC_SEG_VALID | PS_IMG_REC_ORDERED;
 
 		check(ps_image_layer_write(7, 0, recs, 5, psz, &d) == 0,
 			  "write image layer");
+		check(ps_image_layer_read_index(&d, &idx, &nidx) == 0 && nidx == 5,
+			  "read image v3 index");
+		if (idx && nidx == 5)
+		{
+			PsImgIndexEnt *e = NULL;
+
+			for (uint32_t i = 0; i < nidx; i++)
+				if (idx[i].lsn == 300)
+					e = &idx[i];
+			check(e && e->growth_lsn == 275 && e->order_id == 44 &&
+				  e->seg_id == 3 && e->seg_off == 1234 &&
+				  e->flags == (PS_IMG_REC_SEG_VALID | PS_IMG_REC_ORDERED),
+				  "image v3 recovery metadata round-trips");
+		}
+		free(idx);
 	}
 
 	check(d.start_key.relNumber == 5 && d.end_key.relNumber == 6,
@@ -89,6 +117,23 @@ main(void)
 	check(r == 1 && out[0] == 0xC1, "(6,0) -> version 250");
 	r = ps_image_layer_lookup(&d, &k9, 0, 1000, out, psz, NULL);
 	check(r == 0, "absent key -> no version");
+
+	/* GC must force a fresh checksum even if an earlier lookup cached success. */
+	{
+		unsigned char bad = 0,
+					  good = 0xA1;
+		int			fd = open(d.locations[0].uri, O_WRONLY);
+
+		check(fd >= 0 && pwrite(fd, &bad, 1, 0) == 1 && close(fd) == 0,
+			  "corrupt image bytes after cached verification");
+		check(ps_image_layer_verify_data(&d, psz) != 0,
+			  "forced data verification detects post-read corruption");
+		check(!d.data_verified, "failed forced verification clears cached success");
+		fd = open(d.locations[0].uri, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &good, 1, 0) == 1 && close(fd) == 0 &&
+			  ps_image_layer_verify_data(&d, psz) == 0,
+			  "restored image bytes pass forced verification");
+	}
 
 	/* --- delta layer: ordered collect in an LSN range --- */
 	{
@@ -128,7 +173,10 @@ main(void)
 					dl;
 		PsLayerMap	map;
 		PsReadPlan	plan;
-		PsImgRec	irecs[2] = {{k5, 0, 100, pg[0]}, {k5, 0, 200, pg[1]}};
+		PsImgRec	irecs[2] = {
+			{.key = k5, .block = 0, .lsn = 100, .page = pg[0]},
+			{.key = k5, .block = 0, .lsn = 200, .page = pg[1]},
+		};
 		PsDeltaRec	drecs[3] = {
 			{k5, 0, 150, "x150", 4}, {k5, 0, 250, "x250", 4}, {k5, 0, 300, "x300", 4},
 		};

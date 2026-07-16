@@ -70,6 +70,17 @@ rm_rf(const char *path)
 	}
 }
 
+/* An offline segment-format migration must invalidate derived LSM metadata. */
+static void
+remove_lsm_metadata(const char *store)
+{
+	char		cmd[768];
+
+	snprintf(cmd, sizeof(cmd), "rm -f '%s'/layer_* '%s'/layers.manifest",
+			 store, store);
+	check(system(cmd) == 0, "removed derived LSM metadata for offline migration");
+}
+
 /* ===================== client side of the IPC protocol ================= */
 
 static void *cl_shm;
@@ -804,7 +815,8 @@ page_all_zero(const unsigned char *buf, uint32_t ps)
 static pid_t
 spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
 				   uint32_t page_size, uint32_t nshards, int fail_seg_writes,
-				   int crash_after_seg_writes, int fail_fork_meta_append_at)
+				   int crash_after_seg_writes, int fail_fork_meta_append_at,
+				   int segment_gc)
 {
 	pid_t		pid = fork();
 
@@ -861,7 +873,8 @@ spawn_daemon_fault(const char *daemon_path, const char *shm, const char *store,
 		 * tests flush into image layers so the layer read path is exercised */
 		execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
 			  "--page-size", psbuf, "--segment-size", "65536", "--nshards",
-			  shbuf, "--flush-pages", "8", "--compact-layers", "3", (char *) NULL);
+			  shbuf, "--flush-pages", "8", "--compact-layers", "3",
+			  "--segment-gc", segment_gc ? "1" : "0", (char *) NULL);
 		perror("execl daemon");
 		_exit(127);
 	}
@@ -873,7 +886,7 @@ spawn_daemon_fail_seg(const char *daemon_path, const char *shm, const char *stor
 					 uint32_t page_size, uint32_t nshards, int fail_seg_writes)
 {
 	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
-							  fail_seg_writes, 0, 0);
+							  fail_seg_writes, 0, 0, 0);
 }
 
 static pid_t
@@ -882,7 +895,7 @@ spawn_daemon_crash_after_seg(const char *daemon_path, const char *shm,
 							 uint32_t nshards, int crash_after_seg_writes)
 {
 	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0,
-							  crash_after_seg_writes, 0);
+							  crash_after_seg_writes, 0, 0);
 }
 
 static pid_t
@@ -891,14 +904,23 @@ spawn_daemon_fail_fork_meta(const char *daemon_path, const char *shm,
 							uint32_t nshards, int fail_append_at)
 {
 	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0,
-							  fail_append_at);
+							  fail_append_at, 0);
 }
 
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 			 uint32_t page_size, uint32_t nshards)
 {
-	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards, 0, 0, 0);
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
+							  0, 0, 0, 0);
+}
+
+static pid_t
+spawn_daemon_gc(const char *daemon_path, const char *shm, const char *store,
+				uint32_t page_size, uint32_t nshards)
+{
+	return spawn_daemon_fault(daemon_path, shm, store, page_size, nshards,
+							  0, 0, 0, 1);
 }
 
 /* Wait until the daemon has published a valid header. */
@@ -1195,7 +1217,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	/* After the ordered record's two segment writes and failed marker, crash
 	 * on the next record's header (successful segment write #3). */
 	pid = spawn_daemon_fault(daemon_path, shm, store, ps, test_nshards,
-							 0, 3, 4);
+							 0, 3, 4, 0);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 1000);
@@ -1298,6 +1320,7 @@ run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
 		  "converted bound zero-version record to markerless SEG0");
 	check(strip_bound_forkmeta_markers(store) == 0,
 		  "removed bound marker while preserving definitive fork history");
+	remove_lsm_metadata(store);
 
 	shm_unlink(shm);
 	pid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
@@ -1311,6 +1334,204 @@ run_markerless_seg0_dedup_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 	free(page);
+}
+
+static int
+segment_exists(const char *store, uint32_t shard, int seg)
+{
+	char		path[512];
+
+	if (shard == 0)
+		snprintf(path, sizeof(path), "%s/seg_%08d", store, seg);
+	else
+		snprintf(path, sizeof(path), "%s/seg_%u_%08d", store, shard, seg);
+	return access(path, F_OK) == 0;
+}
+
+static void
+run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29200;
+	PsKey		key = {1, 1, rel, 0, PS_KLASS_RELATION};
+	uint32_t	shard = ps_key_shard(&key, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== segment GC ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_segment_gc", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_segment_gc", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 5000, 80);
+	op_write_one(rel, 0, 0, page);
+	for (uint32_t block = 1; block < 16; block++)
+	{
+		fill_page(page, ps, 6000 + block, (unsigned char) block);
+		op_write_one(rel, 0, block, page);
+	}
+	/* Same-LSN latest-wins must survive after both source segments disappear. */
+	fill_page(page, ps, 5000, 99);
+	op_write_one(rel, 0, 0, page);
+	for (uint32_t block = 16; block < 40; block++)
+	{
+		fill_page(page, ps, 6000 + block, (unsigned char) block);
+		op_write_one(rel, 0, block, page);
+	}
+	for (int i = 0; i < 500 && segment_exists(store, shard, 0); i++)
+		usleep(10000);
+	check(!segment_exists(store, shard, 0),
+		  "layer-covered segment 0 is physically reclaimed");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 99),
+		  "same-LSN rewrite serves newest layer bytes after segment reclamation");
+	/* Leave a sub-threshold tail outside the committed watermark and crash. */
+	for (uint32_t block = 40; block < 42; block++)
+	{
+		fill_page(page, ps, 6000 + block, (unsigned char) block);
+		op_write_one(rel, 0, block, page);
+	}
+	client_detach();
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 99),
+		  "same-LSN rewrite survives layer-prefix recovery after GC");
+	op_read_one(rel, 0, 41, readback);
+	check(page_has_tag(readback, ps, 41),
+		  "unflushed segment tail survives watermark-boundary crash recovery");
+	check(op_nblocks(rel, 0) == 42,
+		  "fork growth survives layer-prefix recovery after GC");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	char		orphan[512];
+	char		layer2[512];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29300;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+	int			fd;
+
+	fprintf(stderr, "== orphan layer ID recovery ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_orphan_layer", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_orphan_layer", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 5000, 74);
+	op_write_one(rel, 0, 0, page);
+	client_detach();
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+
+	snprintf(orphan, sizeof(orphan), "%s/layer_0_%016llx", store, 1ULL);
+	fd = open(orphan, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	check(fd >= 0 && close(fd) == 0, "created orphan layer ID 1");
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 74),
+		  "recovery skips orphan layer ID and preserves tail bytes");
+	client_detach();
+	stop_daemon(pid);
+	snprintf(layer2, sizeof(layer2), "%s/layer_0_%016llx", store, 2ULL);
+	check(access(layer2, F_OK) == 0, "recovery flush used the next free layer ID");
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = 29400;
+	PsKey		key;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	memset(&key, 0, sizeof(key));
+	key.spcOid = 1;
+	key.dbOid = 1;
+	key.forkNum = 0;
+	key.klass = PS_KLASS_RELATION;
+	while ((key.relNumber = rel, ps_key_shard(&key, 4)) == 0)
+		rel++;
+	fprintf(stderr, "== 1-to-4 shard segment GC ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_reshard_gc", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_reshard_gc", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	for (uint32_t block = 0; block < 40; block++)
+	{
+		fill_page(page, ps, 5000 + block, (unsigned char) (90 + block));
+		op_write_one(rel, 0, block, page);
+	}
+	client_detach();
+	stop_daemon(pid);
+	check(segment_exists(store, 0, 0),
+		  "single-shard source segment remains while GC is disabled");
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (int i = 0; i < 500 && segment_exists(store, 0, 0); i++)
+		usleep(10000);
+	check(!segment_exists(store, 0, 0),
+		  "legacy shard-0 segment is reclaimed after opening with four shards");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 90),
+		  "resharded page remains layer-readable after source segment deletion");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
 }
 
 /* ===================== the test suite ================================== */
@@ -1709,6 +1930,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	 * legacy lsn-0 replay against the already-loaded truncate/unlink history. */
 	check(strip_forkmeta_markers(store, 1, 1) == 0,
 		  "synthesized a nonempty pre-marker fork-meta log");
+	remove_lsm_metadata(store);
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -1801,6 +2023,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		snprintf(fmpath, sizeof(fmpath), "%s/forkmeta", store);
 		unlink(fmpath);
 	}
+	remove_lsm_metadata(store);
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -1824,6 +2047,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	stop_daemon(dpid);
 	check(strip_forkmeta_markers(store, 0, 1) == 0,
 		  "synthesized an interrupted migration with its start marker intact");
+	remove_lsm_metadata(store);
 	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
@@ -2593,6 +2817,12 @@ main(int argc, char **argv)
 	run_order_marker_failure_suite(daemon_path, tmpbase);
 	/* Transitional SEG0 records may duplicate already-persisted growth. */
 	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
+	/* Layer watermarks permit complete, covered POSIX segments to be removed. */
+	run_segment_gc_suite(daemon_path, tmpbase);
+	/* Recovery must not reuse a sealed layer file absent from the manifest. */
+	run_orphan_layer_suite(daemon_path, tmpbase);
+	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */
+	run_reshard_segment_gc_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
