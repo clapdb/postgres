@@ -20,6 +20,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +41,7 @@
 
 static volatile sig_atomic_t stop_requested = 0;
 static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *daemon_hdr = NULL;
 
 typedef struct WorkerArgs
 {
@@ -65,6 +67,7 @@ typedef struct BlkCtx
 	PsKey		key;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 	unsigned char *dst;
 } BlkCtx;
 
@@ -89,7 +92,8 @@ read_done(void *arg, int ok)
 
 	if (ok)						/* the engine delivered the page into bc->dst */
 	{
-		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn, bc->dst);
+		ps_pgcache_insert(bc->tl, &bc->key, bc->block, bc->lsn,
+						  bc->admission_seq, bc->dst);
 		/* a READ_AT only counts as found once its page has actually landed */
 		if (rs->ch->opcode == PS_OP_READ_AT)
 			rs->ch->result = 1;
@@ -146,6 +150,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
+		case PS_OP_ADMISSION_BARRIER:
 			return 0;
 		default:
 			return 1;
@@ -177,7 +182,8 @@ begin(uint32_t i, PsChannel *ch)
 	{
 		case PS_OP_EXTEND:
 			/* append_page grows the fork with the page's exact LSN */
-			if (append_page(tl, &ch->key, ch->blocknum, ch->data, ch->req_lsn) != 0)
+			if (append_page(tl, &ch->key, ch->blocknum, ch->data,
+							ch->req_lsn, &ch->req_seq) != 0)
 				ch->status = PS_STATUS_ERROR;
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			return;
@@ -187,7 +193,7 @@ begin(uint32_t i, PsChannel *ch)
 			{
 				if (append_page(tl, &ch->key, ch->blocknum + b,
 								 ch->data + (size_t) b * page_size,
-								 ch->req_lsn) != 0)
+								 ch->req_lsn, &ch->req_seq) != 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
@@ -217,8 +223,9 @@ begin(uint32_t i, PsChannel *ch)
 					/* req_lsn nonzero = a pinned reader's horizon cap;
 					 * 0 keeps the newest (writer) semantics */
 					PageVer    *v = read_through(tl, &ch->key, blk,
-												 ch->req_lsn ? ch->req_lsn
-												 : UINT64_MAX);
+											 ch->req_lsn ? ch->req_lsn
+											 : UINT64_MAX,
+											 ch->req_seq);
 					BlkCtx	   *bc;
 
 					if (!v)
@@ -226,14 +233,15 @@ begin(uint32_t i, PsChannel *ch)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 						continue;
 					}
-					if (ch->req_lsn != 0 && v->lsn == 0)
+					if (ch->req_seq != 0 && v->lsn == 0)
 					{
 						/* WAL-less content is not as-of-resolvable; see the
 						 * POSIX daemon's capped-read refusal */
 						ch->status = PS_STATUS_ERROR;
 						break;
 					}
-					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn, dst))
+					if (ps_pgcache_lookup(tl, &ch->key, blk, v->lsn,
+										  v->admission_seq, dst))
 						continue;	/* RAM hit -> no device read */
 					bc = &rs->blk[rs->pending - 1];	/* slot 0.. behind the hold */
 					rs->pending++;
@@ -242,6 +250,7 @@ begin(uint32_t i, PsChannel *ch)
 					bc->key = ch->key;
 					bc->block = blk;
 					bc->lsn = v->lsn;
+					bc->admission_seq = v->admission_seq;
 					bc->dst = dst;
 					ps_spdk_read_async(v->shard, v->seg, v->off, dst, page_size,
 									   read_done, bc);
@@ -254,7 +263,7 @@ begin(uint32_t i, PsChannel *ch)
 			{
 				uint64_t	read_lsn = ch->req_lsn;
 				PageVer    *v = read_through(tl, &ch->key, ch->blocknum,
-											 read_lsn);
+										 read_lsn, ch->req_seq);
 				ReqState   *rs = &reqstate[i];
 				BlkCtx	   *bc;
 
@@ -276,6 +285,7 @@ begin(uint32_t i, PsChannel *ch)
 				 * async read does not advertise a zero-filled page as found */
 				ch->req_lsn = v->lsn;
 				if (ps_pgcache_lookup(tl, &ch->key, ch->blocknum, v->lsn,
+									  v->admission_seq,
 									  ch->data))
 				{
 					ch->result = 1;			/* served from RAM: page is present */
@@ -291,6 +301,7 @@ begin(uint32_t i, PsChannel *ch)
 				bc->key = ch->key;
 				bc->block = ch->blocknum;
 				bc->lsn = v->lsn;
+				bc->admission_seq = v->admission_seq;
 				bc->dst = ch->data;
 				ps_spdk_read_async(v->shard, v->seg, v->off, ch->data, page_size,
 								   read_done, bc);
@@ -304,17 +315,96 @@ begin(uint32_t i, PsChannel *ch)
 	}
 }
 
-static void
+static uint64_t
+relation_request_lsn(const PsChannel *ch)
+{
+	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (ch->key.klass != PS_KLASS_RELATION)
+		return UINT64_MAX;
+	if (op == PS_OP_EXTEND || op == PS_OP_WRITEV)
+	{
+		uint32_t	npages = op == PS_OP_EXTEND ? 1 : ch->nblocks;
+		uint64_t	lowest = UINT64_MAX;
+
+		for (uint32_t i = 0; i < npages; i++)
+		{
+			uint32_t	hi,
+						lo;
+			uint64_t	lsn;
+
+			memcpy(&hi, ch->data + (size_t) i * page_size, sizeof(hi));
+			memcpy(&lo, ch->data + (size_t) i * page_size + sizeof(hi), sizeof(lo));
+			lsn = ((uint64_t) hi << 32) | lo;
+			if (lsn < lowest)
+				lowest = lsn;
+		}
+		return lowest;
+	}
+	if (op == PS_OP_CREATE || op == PS_OP_UNLINK || op == PS_OP_TRUNCATE ||
+		op == PS_OP_ZEROEXTEND)
+		return ch->req_lsn;
+	return UINT64_MAX;
+}
+
+static uint64_t
+active_fence_epoch(void)
+{
+	uint64_t	epoch = ps_load_acquire_u64(&daemon_hdr->admission_pending_epoch);
+	uint32_t	owner;
+
+	if (epoch == 0)
+		return 0;
+	owner = ps_load_acquire(&daemon_hdr->admission_fence_owner);
+	if (owner != 0 && kill((pid_t) owner, 0) != 0 && errno == ESRCH &&
+		ps_cas_u64(&daemon_hdr->admission_pending_epoch, epoch, 0))
+	{
+		ps_store_release_u64(&daemon_hdr->admission_pending_lsn, 0);
+		ps_store_release(&daemon_hdr->admission_fence_owner, 0);
+		return 0;
+	}
+	return epoch;
+}
+
+static int
 run_request(uint32_t i, PsChannel *ch)
 {
-	int			is_write = request_is_write((PsOpcode) ch->opcode);
+	PsOpcode	op = (PsOpcode) ch->opcode;
+	int			is_write = request_is_write(op);
+	uint64_t	epoch;
+
+	if (op == PS_OP_ADMISSION_BARRIER)
+	{
+		pthread_rwlock_wrlock(&core_rwlock);
+		ch->status = PS_STATUS_OK;
+		ch->result = 0;
+		ch->req_seq = ps_admission_barrier();
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		pthread_rwlock_unlock(&core_rwlock);
+		return 1;
+	}
 
 	if (is_write)
+	{
+		epoch = active_fence_epoch();
 		pthread_rwlock_wrlock(&core_rwlock);
+		ps_admission_read_lock();
+		if (epoch != active_fence_epoch() ||
+			(epoch != 0 && relation_request_lsn(ch) <=
+			 ps_load_acquire_u64(&daemon_hdr->admission_pending_lsn)))
+		{
+			ps_admission_read_unlock();
+			pthread_rwlock_unlock(&core_rwlock);
+			return 0;
+		}
+	}
 	else
 		pthread_rwlock_rdlock(&core_rwlock);
 	begin(i, ch);
+	if (is_write)
+		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);
+	return 1;
 }
 
 static void *
@@ -343,8 +433,8 @@ shard_worker(void *arg)
 			if (reqstate[i].active || ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
 				continue;
 
-			run_request(i, ch);
-			did_work = 1;
+			if (run_request(i, ch))
+				did_work = 1;
 		}
 
 		if (ps_spdk_poll(shard) > 0)
@@ -463,6 +553,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	daemon_hdr = hdr;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

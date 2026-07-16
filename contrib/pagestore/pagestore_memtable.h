@@ -34,6 +34,7 @@ extern void ps_memtable_destroy(PsMemtable *mt);
 /* Stage one page version (copies the page bytes).  Returns 0 on success. */
 extern int	ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
 							uint32_t block, uint64_t lsn, const void *page,
+							uint64_t admission_seq,
 							uint64_t growth_lsn, uint64_t order_id,
 							uint32_t seg_id, uint64_t seg_off, uint32_t flags);
 
@@ -47,7 +48,8 @@ extern int	ps_memtable_full(const PsMemtable *mt);	/* count >= threshold */
  */
 extern int	ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline,
 							   const PsKey *key, uint32_t block,
-							   uint64_t read_lsn, uint64_t *out_lsn, void *out);
+							   uint64_t read_lsn, uint64_t read_seq,
+							   uint64_t *out_lsn, uint64_t *out_seq, void *out);
 
 /*
  * Flush all staged versions: group by timeline, write one image layer per

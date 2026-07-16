@@ -20,6 +20,14 @@
  * can occur before a drain, and a branch point between their LSNs must
  * restore the earlier image, not the coalesced latest.
  *
+ * Checkpoint admission fencing is split at the same safety boundary.  The
+ * write hook atomically publishes a shared gate but never waits; daemon workers
+ * then defer new relation mutations at or below that checkpoint's redo.  The
+ * post-critical drain takes an exclusive daemon admission barrier, writes the
+ * exact redo-to-sequence marker, syncs it, and only then releases the gate.
+ * Thus deferred control I/O cannot admit a later same-LSN relation version into
+ * the checkpoint view.
+ *
  * Two images CAN legitimately carry the same update LSN (end-of-recovery and
  * a promotion that inserted no WAL in between).  Either image is a valid
  * control state at that LSN: their WAL requirement is identical, and a
@@ -89,6 +97,7 @@ typedef struct PsControlPending
 {
 	ControlFileData image;
 	XLogRecPtr	update_lsn;
+	uint64		fence_token;	/* pending shared admission gate, or zero */
 	bool		posted;			/* a drain has posted this image at least once */
 } PsControlPending;
 
@@ -161,6 +170,7 @@ ps_control_drain(void)
 		XLogRecPtr	shipped_redo = InvalidXLogRecPtr;
 		int			nqueued = ps_control_queue_count;
 		int			ndone = 0;
+		uint64		done_tokens[PS_CONTROL_QUEUE_CAPACITY] = {0};
 		TimestampTz drain_start = GetCurrentTimestamp();
 		int			i;
 
@@ -171,6 +181,7 @@ ps_control_drain(void)
 			PageStoreRelKey key = {0};
 			char		page[BLCKSZ];
 			BlockNumber nb;
+			uint64		fence_seq = 0;
 
 			/*
 			 * Bound the drain as a whole, not just each mailbox op: a deep
@@ -199,9 +210,14 @@ ps_control_drain(void)
 			{
 				ereport(WARNING,
 						(errmsg("pagestore: skipping pg_control mirror image with no update LSN")));
-				ndone++;
+				done_tokens[ndone++] = p->fence_token;
 				continue;
 			}
+
+			if (p->fence_token != 0 &&
+				pagestore_localsvc_admission_fence_active(p->fence_token))
+				fence_seq = pagestore_localsvc_admission_barrier_timeout(
+					PS_CONTROL_SHIP_TIMEOUT_MS);
 
 			elog(DEBUG1, "pagestore: shipping pg_control mirror image, update_lsn=%X/%08X state=%d",
 				 LSN_FORMAT_ARGS(p->update_lsn), (int) p->image.state);
@@ -253,13 +269,42 @@ ps_control_drain(void)
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
-			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
-													  0, page,
-													  (uint64) p->update_lsn,
-													  nb,
-													  PS_CONTROL_SHIP_TIMEOUT_MS);
+			(void) pagestore_localsvc_obj_write_post_timeout(
+				PS_KLASS_CONTROL, &key, 0, page, (uint64) p->update_lsn,
+				nb, PS_CONTROL_SHIP_TIMEOUT_MS);
+
+			/* Publish only when the hook established a gate at this checkpoint
+			 * boundary.  The barrier sequence follows every mutation admitted
+			 * before the gate, while the gate defers later relation writes <= R. */
+			if (fence_seq != 0)
+			{
+				PsAdmissionFence fence;
+
+				memset(&fence, 0, sizeof(fence));
+				fence.magic = PS_ADMISSION_FENCE_MAGIC;
+				fence.version = PS_ADMISSION_FENCE_VERSION;
+				fence.redo_lsn = (uint64) p->image.checkPointCopy.redo;
+				fence.admission_seq = fence_seq;
+				memset(page, 0, sizeof(page));
+				memcpy(page, &fence, sizeof(fence));
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 2, page, fence.redo_lsn, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+
+				/* The exact-R version above can sort below the control object's
+				 * existing growth history because redo precedes update_lsn.  Publish
+				 * the same bytes at update_lsn too, so block 2 is part of the newest
+				 * object size while the exact-R lookup remains available. */
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 2, page, (uint64) p->update_lsn, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+			}
 			shipped = true;
-			ndone++;
+			done_tokens[ndone++] = p->fence_token;
 			if (shipped_redo < p->image.checkPointCopy.redo)
 				shipped_redo = p->image.checkPointCopy.redo;
 		}
@@ -271,6 +316,8 @@ ps_control_drain(void)
 		 */
 		if (shipped)
 			pagestore_localsvc_store_sync_timeout(PS_CONTROL_SHIP_TIMEOUT_MS);
+		for (i = 0; i < ndone; i++)
+			pagestore_localsvc_admission_fence_end(done_tokens[i]);
 
 		ps_control_queue_head = (ps_control_queue_head + ndone)
 			% PS_CONTROL_QUEUE_CAPACITY;
@@ -368,7 +415,14 @@ ps_control_write_hook(const struct ControlFileData *control,
 			 * re-derives the transition on boot).
 			 */
 			if (!q->posted)
+			{
+				pagestore_localsvc_admission_fence_end(q->fence_token);
 				memcpy(&q->image, control, sizeof(ControlFileData));
+				q->fence_token = 0;
+				if (!XLogRecPtrIsInvalid(control->checkPointCopy.redo))
+					(void) pagestore_localsvc_admission_fence_begin(
+						(uint64) control->checkPointCopy.redo, &q->fence_token);
+			}
 			if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
 				ps_control_drain();
 			return;
@@ -392,6 +446,9 @@ ps_control_write_hook(const struct ControlFileData *control,
 		 * pg_control now holds -- survives; the loss is counted and
 		 * reported at the next drain.
 		 */
+		PsControlPending *dropped = &ps_control_queue[ps_control_queue_head];
+
+		pagestore_localsvc_admission_fence_end(dropped->fence_token);
 		ps_control_queue_head = (ps_control_queue_head + 1) % PS_CONTROL_QUEUE_CAPACITY;
 		ps_control_queue_count--;
 		ps_control_dropped++;
@@ -403,6 +460,11 @@ ps_control_write_hook(const struct ControlFileData *control,
 
 		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
 		ps_control_queue[slot].update_lsn = update_lsn;
+		ps_control_queue[slot].fence_token = 0;
+		if (!XLogRecPtrIsInvalid(control->checkPointCopy.redo))
+			(void) pagestore_localsvc_admission_fence_begin(
+				(uint64) control->checkPointCopy.redo,
+				&ps_control_queue[slot].fence_token);
 		ps_control_queue[slot].posted = false;
 		ps_control_queue_count++;
 	}
