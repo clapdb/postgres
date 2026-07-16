@@ -364,6 +364,8 @@ main(int argc, char **argv)
 			flush_pages = atoi(argv[++i]);
 		else if (strcmp(argv[i], "--compact-layers") == 0 && i + 1 < argc)
 			compact_layers = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--segment-gc") == 0 && i + 1 < argc)
+			segment_gc_enabled = atoi(argv[++i]) != 0;
 		else if (strcmp(argv[i], "--nshards") == 0 && i + 1 < argc)
 			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
@@ -387,7 +389,8 @@ main(int argc, char **argv)
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
-					"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
+					"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
+					"[--nshards N] [--storage NAME]\n",
 					argv[0]);
 			return 2;
 		}
@@ -396,7 +399,8 @@ main(int argc, char **argv)
 		nshards == 0 || nshards > PS_MAX_CHANNELS)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
-				"[--page-size N] [--segment-size N] [--nshards N] [--storage NAME]\n",
+				"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
+				"[--nshards N] [--storage NAME]\n",
 				argv[0]);
 		return 2;
 	}

@@ -100,7 +100,11 @@ extern uint32_t ps_layer_map_count(const PsLayerMap *map);
  * checksums.
  * ------------------------------------------------------------------------- */
 #define PS_IMG_MAGIC	0x47494d50	/* "PIMG" */
-#define PS_IMG_VERSION	2	/* 2: index entries embed PsKey with the klass field */
+#define PS_IMG_VERSION	3	/* 3: index entries carry segment recovery metadata */
+
+#define PS_IMG_REC_ORDERED	0x01
+#define PS_IMG_REC_WALLESS	0x02
+#define PS_IMG_REC_SEG_VALID	0x04
 
 typedef struct PsImgIndexEnt
 {
@@ -108,6 +112,11 @@ typedef struct PsImgIndexEnt
 	uint32_t	block;
 	uint64_t	lsn;			/* page_lsn of this version */
 	uint64_t	data_off;		/* byte offset of the page within the file */
+	uint64_t	growth_lsn;		/* segment header's fork-growth/order LSN */
+	uint64_t	order_id;		/* bound ordered-record identity, else zero */
+	uint64_t	seg_off;		/* page byte offset in the source segment */
+	uint32_t	seg_id;
+	uint32_t	flags;			/* PS_IMG_REC_* */
 } PsImgIndexEnt;
 
 typedef struct PsImgFooter
@@ -128,6 +137,11 @@ typedef struct PsImgRec
 	uint32_t	block;
 	uint64_t	lsn;
 	const void *page;
+	uint64_t	growth_lsn;
+	uint64_t	order_id;
+	uint64_t	seg_off;
+	uint32_t	seg_id;
+	uint32_t	flags;
 } PsImgRec;
 
 /*
@@ -158,6 +172,9 @@ extern int	ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
  */
 extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
+/* Force a fresh data-section checksum verification (ignores cached state). */
+extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
+									  uint32_t page_size);
 
 /* ---------------------------------------------------------------------------
  * Delta layer file format (phase 7).
