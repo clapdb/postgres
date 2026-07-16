@@ -55,12 +55,14 @@ static int	localsvc_timeline = 0;
  * GUC: pin every store relation read at this LSN and refuse store writes --
  * the compute becomes a PINNED READER of its timeline's history
  * (READ_CONSISTENCY_DESIGN.md increment 1).  Empty/unset = a normal writer.
- * The horizon of choice is the redo pointer of a durably mirrored
- * checkpoint: as-of reads there are complete (the checkpoint flushed and
- * synced everything it covers).
+ * The horizon of choice is the redo pointer of a durably mirrored checkpoint;
+ * its control fence supplies the matching admission sequence that excludes
+ * writes accepted later at the same LSN.
  */
 static char *localsvc_read_lsn_str = NULL;
 static uint64 localsvc_read_lsn = 0;
+static uint64 localsvc_read_seq = 0;
+static bool localsvc_read_seq_loaded = false;
 
 static bool
 ls_check_read_lsn(char **newval, void **extra, GucSource source)
@@ -96,6 +98,8 @@ ls_assign_read_lsn(const char *newval, void *extra)
 		localsvc_read_lsn = ((uint64) hi << 32) | lo;
 	else
 		localsvc_read_lsn = 0;
+	localsvc_read_seq = 0;
+	localsvc_read_seq_loaded = false;
 }
 
 /* Refuse a store mutation on a pinned reader. */
@@ -441,6 +445,47 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	 * that need one assign it after this call.
 	 */
 	ch->req_lsn = 0;
+	ch->req_seq = 0;
+}
+
+/* Resolve the configured checkpoint redo to the control mirror's durable
+ * admission fence.  Block 2 is versioned by redo itself, so requiring an exact
+ * hit prevents an older checkpoint's fence from being used for a newer R. */
+static uint64
+ls_pinned_read_seq(void)
+{
+	PageStoreRelKey key = {0};
+	PsAdmissionFence fence;
+	PsChannel  *ch;
+
+	if (localsvc_read_lsn == 0)
+		return 0;
+	if (localsvc_read_seq_loaded)
+		return localsvc_read_seq;
+
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = 2;
+	ch->req_lsn = localsvc_read_lsn;
+	ls_exec(ch);
+	if (ch->result == 0 || ch->req_lsn != localsvc_read_lsn)
+		ereport(ERROR,
+				(errmsg("pagestore: no admission fence for pinned read LSN %X/%08X",
+						(uint32) (localsvc_read_lsn >> 32),
+						(uint32) localsvc_read_lsn)));
+	memcpy(&fence, ch->data, sizeof(fence));
+	if (fence.magic != PS_ADMISSION_FENCE_MAGIC ||
+		fence.version != PS_ADMISSION_FENCE_VERSION ||
+		fence.redo_lsn != localsvc_read_lsn || fence.admission_seq == 0)
+		ereport(ERROR,
+				(errmsg("pagestore: invalid admission fence for pinned read LSN %X/%08X",
+						(uint32) (localsvc_read_lsn >> 32),
+						(uint32) localsvc_read_lsn)));
+	localsvc_read_seq = fence.admission_seq;
+	localsvc_read_seq_loaded = true;
+	return localsvc_read_seq;
 }
 
 /*
@@ -513,11 +558,13 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
+	uint64		read_seq = ls_pinned_read_seq();
 	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
 	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return ch->result != 0;
 }
@@ -559,11 +606,13 @@ ls_unlink(const PageStoreRelKey *key, bool isRedo)
 static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
+	uint64		read_seq = ls_pinned_read_seq();
 	PsChannel  *ch = ls_chan_for_key(key);
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
 }
@@ -600,6 +649,7 @@ static void
 ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
+	uint64		read_seq = ls_pinned_read_seq();
 	PsChannel  *ch = ls_chan_for_key(key);
 	BlockNumber done = 0;
 
@@ -612,6 +662,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
 		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+		ch->req_seq = read_seq;
 		ls_exec(ch);
 
 		for (BlockNumber i = 0; i < chunk; i++)
@@ -739,6 +790,7 @@ static bool
 ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 			   BlockNumber nblocks, int *out_fd, uint64 *out_offset)
 {
+	uint64		read_seq = ls_pinned_read_seq();
 	PsChannel  *ch = ls_chan_for_key(key);
 
 	if (nblocks > LS_MAX_PAGES_PER_OP)
@@ -752,6 +804,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
 	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_seq = read_seq;
 	ls_exec(ch);
 
 	/* the pages now live in the channel data buffer, readable via the shm fd */
@@ -1108,7 +1161,7 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 	return (BlockNumber) ch->result;
 }
 
-void
+uint64
 pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  const PageStoreRelKey *key,
 										  BlockNumber block, const void *page,
@@ -1135,6 +1188,7 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 	ch->req_lsn = version;
 	memcpy(ch->data, page, BLCKSZ);
 	ls_exec_timeout(ch, timeout_ms);
+	return ch->req_seq;
 }
 
 void

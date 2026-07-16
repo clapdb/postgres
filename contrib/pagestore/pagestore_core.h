@@ -8,7 +8,7 @@
  * the POSIX daemon and the (optional) SPDK daemon, so the store's core logic is
  * single-sourced.  Each frontend supplies only its request loop and the page
  * byte I/O -- synchronous for POSIX, callback-driven for SPDK -- which goes
- * through the PsStorage interface.  The IPC ABI is unaffected by any of this.
+ * through the PsStorage interface.
  *
  * Seam: ps_handle_meta() handles every request that is not page byte I/O; the
  * four byte-I/O ops are done by each frontend using read_through()/read_version()
@@ -29,6 +29,7 @@ typedef struct PageVer
 {
 	uint32_t	shard;			/* segment shard that stores this version */
 	uint64_t	lsn;			/* the page's pd_lsn when it was written */
+	uint64_t	admission_seq;	/* global append order; 0 = legacy pre-fence */
 	int			seg;			/* segment id holding the bytes */
 	uint64_t	off;			/* byte offset of the page within that segment */
 } PageVer;
@@ -75,9 +76,10 @@ extern int	ps_handle_meta(PsChannel *ch);
  * a monotonic latest-wins counter).
  */
 extern int	append_page(uint32_t timeline, const PsKey *key, uint32_t block,
-						const unsigned char *page, uint64_t version);
+						const unsigned char *page, uint64_t version,
+						uint64_t *out_admission_seq);
 extern PageVer *read_through(uint32_t timeline, const PsKey *key, uint32_t block,
-							 uint64_t read_lsn);
+							 uint64_t read_lsn, uint64_t read_seq);
 extern int	read_version(const PageVer *v, unsigned char *out);
 extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
 
@@ -87,7 +89,8 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
  * page is unwritten.
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
-						 uint64_t read_lsn, unsigned char *out, uint64_t *out_ver);
+						 uint64_t read_lsn, uint64_t read_seq,
+						 unsigned char *out, uint64_t *out_ver);
 extern int	fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 					  uint64_t lsn);
 

@@ -171,6 +171,7 @@ ps_control_drain(void)
 			PageStoreRelKey key = {0};
 			char		page[BLCKSZ];
 			BlockNumber nb;
+			uint64		image_seq;
 
 			/*
 			 * Bound the drain as a whole, not just each mailbox op: a deep
@@ -253,11 +254,39 @@ ps_control_drain(void)
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
-			pagestore_localsvc_obj_write_post_timeout(PS_KLASS_CONTROL, &key,
-													  0, page,
-													  (uint64) p->update_lsn,
-													  nb,
-													  PS_CONTROL_SHIP_TIMEOUT_MS);
+			image_seq = pagestore_localsvc_obj_write_post_timeout(
+				PS_KLASS_CONTROL, &key, 0, page, (uint64) p->update_lsn,
+				nb, PS_CONTROL_SHIP_TIMEOUT_MS);
+
+			/* Publish the same-LSN admission fence under the checkpoint redo R
+			 * that operators configure as pagestore.read_lsn.  The payload names
+			 * the control image's sequence, not this marker's later sequence. */
+			{
+				PsAdmissionFence fence;
+
+				memset(&fence, 0, sizeof(fence));
+				fence.magic = PS_ADMISSION_FENCE_MAGIC;
+				fence.version = PS_ADMISSION_FENCE_VERSION;
+				fence.redo_lsn = (uint64) p->image.checkPointCopy.redo;
+				fence.admission_seq = image_seq;
+				memset(page, 0, sizeof(page));
+				memcpy(page, &fence, sizeof(fence));
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 2, page, fence.redo_lsn, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+
+				/* The exact-R version above can sort below the control object's
+				 * existing growth history because redo precedes update_lsn.  Publish
+				 * the same bytes at update_lsn too, so block 2 is part of the newest
+				 * object size while the exact-R lookup remains available. */
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 2, page, (uint64) p->update_lsn, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+			}
 			shipped = true;
 			ndone++;
 			if (shipped_redo < p->image.checkPointCopy.redo)

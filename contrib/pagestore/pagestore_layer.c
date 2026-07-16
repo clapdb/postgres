@@ -107,6 +107,19 @@ typedef struct PsImgIndexEntV2
 	uint64_t	data_off;
 } PsImgIndexEntV2;
 
+typedef struct PsImgIndexEntV3
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	data_off;
+	uint64_t	growth_lsn;
+	uint64_t	order_id;
+	uint64_t	seg_off;
+	uint32_t	seg_id;
+	uint32_t	flags;
+} PsImgIndexEntV3;
+
 static int
 img_sort_cmp(const void *pa, const void *pb)
 {
@@ -120,6 +133,8 @@ img_sort_cmp(const void *pa, const void *pb)
 		return a->ent.block < b->ent.block ? -1 : 1;
 	if (a->ent.lsn != b->ent.lsn)
 		return a->ent.lsn < b->ent.lsn ? -1 : 1;
+	if (a->ent.admission_seq != b->ent.admission_seq)
+		return a->ent.admission_seq < b->ent.admission_seq ? -1 : 1;
 	/* qsort is not stable.  Preserve append order for same-pd_lsn rewrites so
 	 * the last index entry remains the latest bytes after segment reclamation. */
 	return a->src < b->src ? -1 : (a->src > b->src ? 1 : 0);
@@ -184,6 +199,7 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 		sorted[i].ent.key = recs[i].key;
 		sorted[i].ent.block = recs[i].block;
 		sorted[i].ent.lsn = recs[i].lsn;
+		sorted[i].ent.admission_seq = recs[i].admission_seq;
 		sorted[i].ent.data_off = 0;
 		sorted[i].ent.growth_lsn = recs[i].growth_lsn;
 		sorted[i].ent.order_id = recs[i].order_id;
@@ -482,8 +498,9 @@ ps_read_plan_build(const PsLayerMap *map, uint32_t timeline, const PsKey *key,
 
 		if (d->kind != PS_LAYER_IMAGE || d->deleting || d->timeline != timeline)
 			continue;
-		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l) == 1 && (!plan->has_base || l > plan->base_lsn))
+		if (ps_image_layer_lookup(d, key, block, read_lsn, 0, tmp, page_size,
+								  &l, NULL) == 1 &&
+			(!plan->has_base || l > plan->base_lsn))
 		{
 			if (!plan->base)
 				plan->base = malloc(page_size);
@@ -569,9 +586,11 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 										 &foot, sizeof(foot)) != 0)
 		return -1;
 	if (foot.magic != PS_IMG_MAGIC ||
-		(foot.version != 2 && foot.version != PS_IMG_VERSION) || foot.nrecs == 0)
+		(foot.version != 2 && foot.version != 3 &&
+		 foot.version != PS_IMG_VERSION) || foot.nrecs == 0)
 		return -1;
-	ent_size = foot.version == 2 ? sizeof(PsImgIndexEntV2) : sizeof(PsImgIndexEnt);
+	ent_size = foot.version == 2 ? sizeof(PsImgIndexEntV2) :
+		foot.version == 3 ? sizeof(PsImgIndexEntV3) : sizeof(PsImgIndexEnt);
 	idx_bytes = (uint64_t) foot.nrecs * ent_size;
 	if (loc->size < sizeof(foot) || foot.index_off > loc->size - sizeof(foot) ||
 		idx_bytes != loc->size - sizeof(foot) - foot.index_off ||
@@ -606,6 +625,24 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 			idx[i].data_off = old[i].data_off;
 		}
 	}
+	else if (foot.version == 3)
+	{
+		PsImgIndexEntV3 *old = disk;
+
+		for (uint32_t i = 0; i < foot.nrecs; i++)
+		{
+			memset(&idx[i], 0, sizeof(idx[i]));
+			idx[i].key = old[i].key;
+			idx[i].block = old[i].block;
+			idx[i].lsn = old[i].lsn;
+			idx[i].data_off = old[i].data_off;
+			idx[i].growth_lsn = old[i].growth_lsn;
+			idx[i].order_id = old[i].order_id;
+			idx[i].seg_off = old[i].seg_off;
+			idx[i].seg_id = old[i].seg_id;
+			idx[i].flags = old[i].flags;
+		}
+	}
 	else
 		memcpy(idx, disk, (size_t) idx_bytes);
 	free(disk);
@@ -627,7 +664,8 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 									 &foot, sizeof(foot)) != 0 ||
 		foot.magic != PS_IMG_MAGIC ||
-		(foot.version != 2 && foot.version != PS_IMG_VERSION) ||
+		(foot.version != 2 && foot.version != 3 &&
+		 foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size ||
 		foot.index_off > UINT32_MAX || foot.index_off > loc->size - sizeof(foot))
 		return -1;
@@ -647,8 +685,9 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 
 int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
-					  uint32_t block, uint64_t read_lsn,
-					  void *out, uint32_t page_size, uint64_t *out_lsn)
+					  uint32_t block, uint64_t read_lsn, uint64_t read_seq,
+					  void *out, uint32_t page_size, uint64_t *out_lsn,
+					  uint64_t *out_seq)
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
@@ -656,6 +695,7 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	uint32_t	nidx = 0;
 	uint64_t	best_off = 0;
 	uint64_t	best_lsn = 0;
+	uint64_t	best_seq = 0;
 	int			found = 0;
 	int			rc = -1;
 
@@ -669,7 +709,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 										 &foot, sizeof(foot)) != 0)
 		return -1;
 	if (foot.magic != PS_IMG_MAGIC ||
-		(foot.version != 2 && foot.version != PS_IMG_VERSION) ||
+		(foot.version != 2 && foot.version != 3 &&
+		 foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size || foot.nrecs == 0)
 		return -1;
 	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0 || nidx != foot.nrecs)
@@ -692,9 +733,14 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	{
 		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
 			continue;
-		if (idx[i].lsn <= read_lsn && (!found || idx[i].lsn >= best_lsn))
+		if (idx[i].lsn <= read_lsn &&
+			(read_seq == 0 || idx[i].admission_seq == 0 ||
+			 idx[i].admission_seq <= read_seq) &&
+			(!found || idx[i].lsn > best_lsn ||
+			 (idx[i].lsn == best_lsn && idx[i].admission_seq >= best_seq)))
 		{
 			best_lsn = idx[i].lsn;
+			best_seq = idx[i].admission_seq;
 			best_off = idx[i].data_off;
 			found = 1;
 		}
@@ -708,6 +754,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		goto out;
 	if (out_lsn)
 		*out_lsn = best_lsn;
+	if (out_seq)
+		*out_seq = best_seq;
 	rc = 1;
 
 out:
