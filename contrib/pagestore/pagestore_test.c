@@ -1424,6 +1424,116 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	free(readback);
 }
 
+static void
+run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	char		orphan[512];
+	char		layer2[512];
+	const uint32_t ps = 8192;
+	const uint32_t rel = 29300;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+	int			fd;
+
+	fprintf(stderr, "== orphan layer ID recovery ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_orphan_layer", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_orphan_layer", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 5000, 74);
+	op_write_one(rel, 0, 0, page);
+	client_detach();
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+
+	snprintf(orphan, sizeof(orphan), "%s/layer_0_%016llx", store, 1ULL);
+	fd = open(orphan, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	check(fd >= 0 && close(fd) == 0, "created orphan layer ID 1");
+	shm_unlink(shm);
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 74),
+		  "recovery skips orphan layer ID and preserves tail bytes");
+	client_detach();
+	stop_daemon(pid);
+	snprintf(layer2, sizeof(layer2), "%s/layer_0_%016llx", store, 2ULL);
+	check(access(layer2, F_OK) == 0, "recovery flush used the next free layer ID");
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = 29400;
+	PsKey		key;
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	memset(&key, 0, sizeof(key));
+	key.spcOid = 1;
+	key.dbOid = 1;
+	key.forkNum = 0;
+	key.klass = PS_KLASS_RELATION;
+	while ((key.relNumber = rel, ps_key_shard(&key, 4)) == 0)
+		rel++;
+	fprintf(stderr, "== 1-to-4 shard segment GC ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_reshard_gc", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_reshard_gc", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	for (uint32_t block = 0; block < 40; block++)
+	{
+		fill_page(page, ps, 5000 + block, (unsigned char) (90 + block));
+		op_write_one(rel, 0, block, page);
+	}
+	client_detach();
+	stop_daemon(pid);
+	check(segment_exists(store, 0, 0),
+		  "single-shard source segment remains while GC is disabled");
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (int i = 0; i < 500 && segment_exists(store, 0, 0); i++)
+		usleep(10000);
+	check(!segment_exists(store, 0, 0),
+		  "legacy shard-0 segment is reclaimed after opening with four shards");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 90),
+		  "resharded page remains layer-readable after source segment deletion");
+	client_detach();
+	stop_daemon(pid);
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
 /* ===================== the test suite ================================== */
 
 #define REL_A	16000
@@ -2709,6 +2819,10 @@ main(int argc, char **argv)
 	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
 	/* Layer watermarks permit complete, covered POSIX segments to be removed. */
 	run_segment_gc_suite(daemon_path, tmpbase);
+	/* Recovery must not reuse a sealed layer file absent from the manifest. */
+	run_orphan_layer_suite(daemon_path, tmpbase);
+	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */
+	run_reshard_segment_gc_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
