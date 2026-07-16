@@ -49,7 +49,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=17
+	local expected_version=19
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128
@@ -1131,9 +1131,8 @@ assert "$($P -c "SELECT nextval('reader_seq');" 2>&1 | grep -c 'read-only')" "1"
 	"pinned reader refuses nextval() (side-effecting SELECT)"
 assert "$($P -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "1" \
 	"pinned reader refuses DDL"
-# WAL-less (unlogged) pages carry version LSN 0: a capped read cannot honestly
-# serve them as-of anything, so the daemon fails closed instead of handing the
-# pinned reader whatever the writer last flushed
+# WAL-less (unlogged) pages carry version LSN 0: checkpoint R does not prove
+# them complete, so even an admission fence must fail closed.
 assert "$($P -c "SELECT count(*) FROM reader_unlogged;" 2>&1 | grep -c 'daemon reported error')" "1" \
 	"pinned reader refuses WAL-less (unlogged) relation reads"
 # CHECKPOINT would make the (exempt) checkpointer insert private WAL

@@ -160,6 +160,15 @@ cl_exec(void)
 	return ch;
 }
 
+static PsChannel *
+exec_channel(PsChannel *ch)
+{
+	ps_store_release(&ch->state, PS_STATE_REQUEST);
+	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
+		;
+	return ch;
+}
+
 static void
 cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 {
@@ -170,6 +179,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->key.klass = PS_KLASS_RELATION;
 	ch->timeline = 0;			/* default to the main timeline */
 	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
+	ch->req_seq = 0;
 }
 
 /* --- typed operations --- */
@@ -286,6 +296,18 @@ op_nblocks_asof(uint32_t rel, int32_t fork, uint64_t lsn)
 	return cl_exec()->result;
 }
 
+static uint32_t
+op_nblocks_asof_seq(uint32_t rel, int32_t fork, uint64_t lsn, uint64_t seq)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_NBLOCKS;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	return cl_exec()->result;
+}
+
 static int
 op_exists_asof(uint32_t rel, int32_t fork, uint64_t lsn)
 {
@@ -320,6 +342,21 @@ op_write_one(uint32_t rel, int32_t fork, uint32_t block, const unsigned char *pa
 	ch->nblocks = 1;
 	memcpy(ch->data, page, cl_page_size);
 	cl_exec();
+}
+
+static uint64_t
+op_write_one_seq(uint32_t rel, int32_t fork, uint32_t block,
+				 const unsigned char *page)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_WRITEV;
+	ch->blocknum = block;
+	ch->nblocks = 1;
+	memcpy(ch->data, page, cl_page_size);
+	cl_exec();
+	return ch->req_seq;
 }
 
 static void
@@ -377,6 +414,21 @@ op_read_at(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
+	cl_exec();
+	memcpy(out, ch->data, cl_page_size);
+}
+
+static void
+op_read_at_seq(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
+			   uint64_t seq, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
 	cl_exec();
 	memcpy(out, ch->data, cl_page_size);
 }
@@ -1007,11 +1059,27 @@ typedef struct TestForkMetaRec
 	uint8_t		pad[3];
 } TestForkMetaRec;
 
+#define TEST_FORK_META_V2_MAGIC 0x324d4b46
+typedef struct TestForkMetaRecV2
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	order_id;
+	uint32_t	nblocks;
+	uint8_t		kind;
+	uint8_t		pad[3];
+} TestForkMetaRecV2;
+
 #define TEST_FEV_SEG_GROW_BOUND		7
 #define TEST_FEV_SEG_COMMIT_BOUND	8
 #define TEST_FEV_SEG_ID				9
 #define TEST_SEG_WALLESS_MAGIC		0x53454730
 #define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734
+#define TEST_SEG_WALLESS_ADMISSION_MAGIC 0x53454737
 
 typedef struct TestSegRecHdr
 {
@@ -1028,6 +1096,7 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 {
 	char		path[512];
 	TestForkMetaRec rec;
+	TestForkMetaRecV2 rec2;
 	off_t		in = 0;
 	off_t		out = 0;
 	int			fd;
@@ -1036,18 +1105,41 @@ strip_forkmeta_markers(const char *store, int strip_start, int strip_done)
 	fd = open(path, O_RDWR);
 	if (fd < 0)
 		return -1;
-	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	for (;;)
 	{
-		in += sizeof(rec);
-		if ((strip_done && rec.kind == 3) ||	/* FEV_MIGRATED */
-			(strip_start && rec.kind == 4))	/* FEV_MIGRATING */
+		uint32_t	first;
+		void	   *buf;
+		size_t		sz;
+		uint8_t		kind;
+
+		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
+			break;
+		if (first == TEST_FORK_META_V2_MAGIC)
+		{
+			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
+				break;
+			buf = &rec2;
+			sz = sizeof(rec2);
+			kind = rec2.kind;
+		}
+		else
+		{
+			if (pread(fd, &rec, sizeof(rec), in) != (ssize_t) sizeof(rec))
+				break;
+			buf = &rec;
+			sz = sizeof(rec);
+			kind = rec.kind;
+		}
+		in += (off_t) sz;
+		if ((strip_done && kind == 3) ||	/* FEV_MIGRATED */
+			(strip_start && kind == 4))	/* FEV_MIGRATING */
 			continue;
-		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		if (pwrite(fd, buf, sz, out) != (ssize_t) sz)
 		{
 			close(fd);
 			return -1;
 		}
-		out += sizeof(rec);
+		out += (off_t) sz;
 	}
 	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
 		return -1;
@@ -1059,6 +1151,7 @@ strip_bound_forkmeta_markers(const char *store)
 {
 	char		path[512];
 	TestForkMetaRec rec;
+	TestForkMetaRecV2 rec2;
 	off_t		in = 0;
 	off_t		out = 0;
 	int			fd;
@@ -1067,19 +1160,41 @@ strip_bound_forkmeta_markers(const char *store)
 	fd = open(path, O_RDWR);
 	if (fd < 0)
 		return -1;
-	while (pread(fd, &rec, sizeof(rec), in) == (ssize_t) sizeof(rec))
+	for (;;)
 	{
-		in += sizeof(rec);
-		if (rec.kind == TEST_FEV_SEG_GROW_BOUND ||
-			rec.kind == TEST_FEV_SEG_COMMIT_BOUND ||
-			rec.kind == TEST_FEV_SEG_ID)
+		uint32_t	first;
+		void	   *buf;
+		size_t		sz;
+		uint8_t		kind;
+
+		if (pread(fd, &first, sizeof(first), in) != (ssize_t) sizeof(first))
+			break;
+		if (first == TEST_FORK_META_V2_MAGIC)
+		{
+			if (pread(fd, &rec2, sizeof(rec2), in) != (ssize_t) sizeof(rec2))
+				break;
+			buf = &rec2;
+			sz = sizeof(rec2);
+			kind = rec2.kind;
+		}
+		else
+		{
+			if (pread(fd, &rec, sizeof(rec), in) != (ssize_t) sizeof(rec))
+				break;
+			buf = &rec;
+			sz = sizeof(rec);
+			kind = rec.kind;
+		}
+		in += (off_t) sz;
+		if (kind == TEST_FEV_SEG_GROW_BOUND ||
+			kind == TEST_FEV_SEG_COMMIT_BOUND || kind == TEST_FEV_SEG_ID)
 			continue;
-		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		if (pwrite(fd, buf, sz, out) != (ssize_t) sz)
 		{
 			close(fd);
 			return -1;
 		}
-		out += sizeof(rec);
+		out += (off_t) sz;
 	}
 	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
 		return -1;
@@ -1106,8 +1221,11 @@ downgrade_bound_record_to_seg0(const char *store, uint32_t rel,
 	if (fd < 0 || page == NULL)
 		goto out;
 	if (pread(fd, &hdr, sizeof(hdr), 0) != (ssize_t) sizeof(hdr) ||
-		hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC || hdr.len != page_size ||
-		pread(fd, page, page_size, sizeof(hdr) + sizeof(uint64_t)) !=
+		(hdr.magic != TEST_SEG_WALLESS_BOUND_MAGIC &&
+		 hdr.magic != TEST_SEG_WALLESS_ADMISSION_MAGIC) || hdr.len != page_size ||
+		pread(fd, page, page_size, sizeof(hdr) +
+			  (hdr.magic == TEST_SEG_WALLESS_ADMISSION_MAGIC ?
+			   2 * sizeof(uint64_t) : sizeof(uint64_t))) !=
 		(ssize_t) page_size)
 		goto out;
 	hdr.magic = TEST_SEG_WALLESS_MAGIC;
@@ -1161,6 +1279,7 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 	{
 		char		path[512];
 		TestForkMetaRec rec;
+		TestForkMetaRecV2 rec2;
 		pid_t		pid;
 		int			fd;
 		struct stat st;
@@ -1181,12 +1300,13 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		wait_ready(shm, ps);
 		stop_daemon(pid);
 		fd = open(path, O_RDONLY);
-		memset(&rec, 0, sizeof(rec));
-		check(fd >= 0 && pread(fd, &rec, sizeof(rec), 0) ==
-			  (ssize_t) sizeof(rec) && rec.kind == 4,
+		memset(&rec2, 0, sizeof(rec2));
+		check(fd >= 0 && pread(fd, &rec2, sizeof(rec2), 0) ==
+			  (ssize_t) sizeof(rec2) && rec2.magic == TEST_FORK_META_V2_MAGIC &&
+			  rec2.kind == 4,
 			  "migration marker replaces the torn forkmeta prefix");
 		check(fd >= 0 && fstat(fd, &st) == 0 &&
-			  st.st_size % (off_t) sizeof(rec) == 0,
+			  st.st_size % (off_t) sizeof(rec2) == 0,
 			  "repaired forkmeta contains only complete records");
 		if (fd >= 0)
 			close(fd);
@@ -1225,7 +1345,7 @@ run_order_marker_failure_suite(const char *daemon_path, const char *tmpbase)
 	check(op_write_tl_status(0, rel, 0, 0, page) == PS_STATUS_ERROR,
 		  "order-marker failure rejects the growing segment write");
 
-	/* A normal SEG2 header at the same offset must not borrow the failed
+	/* A normal SEG6 header at the same offset must not borrow the failed
 	 * ordered record's complete body if the daemon dies before writing its own
 	 * body.  Run the request in a child because it waits on the dead daemon. */
 	fill_page(page, ps, 3000, 71);
@@ -1359,6 +1479,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	uint32_t	shard = ps_key_shard(&key, test_nshards);
 	unsigned char *page = malloc(ps);
 	unsigned char *readback = malloc(ps);
+	uint64_t	fence_seq;
+	uint64_t	fork_fence_seq;
 	pid_t		pid;
 
 	fprintf(stderr, "== segment GC ==\n");
@@ -1372,7 +1494,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
-	op_write_one(rel, 0, 0, page);
+	fence_seq = op_write_one_seq(rel, 0, 0, page);
 	for (uint32_t block = 1; block < 16; block++)
 	{
 		fill_page(page, ps, 6000 + block, (unsigned char) block);
@@ -1393,6 +1515,97 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 99),
 		  "same-LSN rewrite serves newest layer bytes after segment reclamation");
+	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 80),
+		  "admission fence excludes a later same-LSN layer rewrite");
+
+	/* Fork metadata uses the same fence: a same-LSN truncate admitted later
+	 * must not shrink the pinned view. */
+	op_create_at(rel + 1, 0, 9000);
+	fill_page(page, ps, 9000, 100);
+	fork_fence_seq = op_write_one_seq(rel + 1, 0, 0, page);
+	op_truncate_at(rel + 1, 0, 0, 9000);
+	check(op_nblocks_asof(rel + 1, 0, 9000) == 0,
+		  "uncapped same-LSN fork metadata serves the later truncate");
+	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
+		  "admission fence excludes a later same-LSN truncate");
+
+	/* Reproduce the deferred-control-drain race.  A relation write posted after
+	 * the hook's shared gate must remain pending even when it shares a worker
+	 * with the barrier request; the worker skips it and serves the barrier/read
+	 * channel, then completes it only after the gate is released. */
+	{
+		PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+		PsChannel  *write_ch = ps_channel(cl_shm, cl_chan);
+		PsChannel  *barrier_ch = NULL;
+		uint64_t	epoch;
+		uint64_t	barrier_seq = 0;
+
+		op_create_at(rel + 2, 0, 12000);
+		fill_page(page, ps, 12000, 101);
+		op_write_one(rel + 2, 0, 0, page);
+		check(ps_cas(&hdr->admission_fence_owner, 0, (uint32_t) getpid()),
+			  "test checkpoint gate claims its shared owner slot");
+		epoch = ps_fetch_add_u64(&hdr->admission_fence_epoch, 1) + 1;
+		ps_store_release_u64(&hdr->admission_pending_lsn, 12000);
+		ps_store_release_u64(&hdr->admission_pending_epoch, epoch);
+
+		cl_setkey(write_ch, rel + 2, 0);
+		write_ch->opcode = PS_OP_WRITEV;
+		write_ch->blocknum = 0;
+		write_ch->nblocks = 1;
+		fill_page(write_ch->data, ps, 12000, 102);
+		ps_store_release(&write_ch->state, PS_STATE_REQUEST);
+
+		for (uint32_t i = (uint32_t) cl_chan + hdr->nshards;
+			 i < hdr->nchannels; i += hdr->nshards)
+		{
+			PsChannel  *candidate = ps_channel(cl_shm, i);
+
+			if (ps_cas(&candidate->claimed, 0, 1))
+			{
+				barrier_ch = candidate;
+				break;
+			}
+		}
+		check(barrier_ch != NULL,
+			  "admission race test claims a second channel on the same worker");
+		if (barrier_ch)
+		{
+			memset((void *) &barrier_ch->key, 0, sizeof(barrier_ch->key));
+			barrier_ch->opcode = PS_OP_ADMISSION_BARRIER;
+			barrier_ch->req_lsn = 0;
+			barrier_ch->req_seq = 0;
+			exec_channel(barrier_ch);
+			barrier_seq = barrier_ch->req_seq;
+			check(barrier_seq != 0,
+				  "admission barrier returns a durable sequence");
+			check(ps_load_acquire(&write_ch->state) == PS_STATE_REQUEST,
+				  "post-boundary same-LSN write remains gated");
+
+			cl_setkey(barrier_ch, rel + 2, 0);
+			barrier_ch->opcode = PS_OP_READ_AT;
+			barrier_ch->blocknum = 0;
+			barrier_ch->req_lsn = 12000;
+			barrier_ch->req_seq = barrier_seq;
+			exec_channel(barrier_ch);
+			check(page_has_tag(barrier_ch->data, ps, 101),
+				  "barrier-capped read excludes the gated same-LSN write");
+
+		}
+		check(ps_cas_u64(&hdr->admission_pending_epoch, epoch, 0),
+			  "test checkpoint gate releases its epoch");
+		ps_store_release_u64(&hdr->admission_pending_lsn, 0);
+		ps_store_release(&hdr->admission_fence_owner, 0);
+		while (ps_load_acquire(&write_ch->state) != PS_STATE_DONE)
+			;
+		if (barrier_ch)
+		{
+			check(write_ch->req_seq > barrier_seq,
+				  "released same-LSN write is admitted after the barrier");
+			ps_store_release(&barrier_ch->claimed, 0);
+		}
+	}
 	/* Leave a sub-threshold tail outside the committed watermark and crash. */
 	for (uint32_t block = 40; block < 42; block++)
 	{
@@ -1410,6 +1623,11 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 99),
 		  "same-LSN rewrite survives layer-prefix recovery after GC");
+	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 80),
+		  "admission-fenced same-LSN page survives compaction, GC, and restart");
+	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
+		  "admission-fenced fork metadata survives restart");
 	op_read_one(rel, 0, 41, readback);
 	check(page_has_tag(readback, ps, 41),
 		  "unflushed segment tail survives watermark-boundary crash recovery");
