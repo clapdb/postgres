@@ -30,6 +30,7 @@ typedef enum PsManifestEventType
 	PS_MANIFEST_DROP_LOCAL = 3,
 	PS_MANIFEST_MARK_DELETE = 4,
 	PS_MANIFEST_REMOVE_LAYER = 5,
+	PS_MANIFEST_SET_FLUSH_WATERMARK = 6,
 } PsManifestEventType;
 
 typedef struct PsManifestRecord
@@ -90,6 +91,8 @@ typedef struct PsManifestLayerDisk
 static char manifest_path[4096];
 static char manifest_dir[2048];
 PsLayerMap ps_layer_map;
+static PsFlushWatermark flush_watermarks[PS_MAX_CHANNELS];
+static uint8_t flush_watermark_valid[PS_MAX_CHANNELS];
 
 /*
  * Sticky once a record append fails: a short write or failed fsync may have left
@@ -97,8 +100,8 @@ PsLayerMap ps_layer_map;
  * record.  So after any append error we refuse every further append for the life
  * of this process -- no later flush/compaction/GC record can land after the torn
  * tail and turn it into unrecoverable interior corruption.  Reset on (re)open,
- * where replay truncates the torn tail.  Layer data itself is not lost: the
- * segment log stays authoritative and recover() rebuilds from it.
+ * where replay truncates the torn tail.  The last committed watermark remains
+ * authoritative, so recovery replays the uncovered segment suffix.
  *
  * Accessed from multiple shard worker threads (one shard can poison while another
  * reads the flag), so all reads/writes go through __atomic.
@@ -167,6 +170,8 @@ manifest_type_payload_len(uint32_t type)
 		case PS_MANIFEST_MARK_DELETE:
 		case PS_MANIFEST_REMOVE_LAYER:
 			return (int) sizeof(PsManifestLayerIdEvent);
+		case PS_MANIFEST_SET_FLUSH_WATERMARK:
+			return (int) sizeof(PsFlushWatermark);
 		default:
 			return -1;
 	}
@@ -363,6 +368,8 @@ ps_manifest_open(const char *store_dir)
 	/* replay truncates any torn tail; start clean */
 	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
 	manifest_nrecords = 0;
+	memset(flush_watermarks, 0, sizeof(flush_watermarks));
+	memset(flush_watermark_valid, 0, sizeof(flush_watermark_valid));
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
 }
@@ -496,9 +503,8 @@ ps_manifest_replay(PsLayerMap *map)
 	 *     from it: a torn/corrupt-then-nothing tail truncates to an openable empty
 	 *     manifest, while corruption with valid v3 records after it fails as interior
 	 *     corruption.  A damaged or torn-tailed legacy v2 file therefore comes up
-	 *     empty (its layer files are reclaimable by GC and its pages stay readable
-	 *     from the authoritative segment log) rather than wedging the store or
-	 *     installing unchecked bytes.
+	 *     empty; because v2 has no flush watermark, its pages are rebuilt from the
+	 *     segment log rather than from unchecked layer metadata.
 	 */
 	{
 		PsManifestRecord r0;
@@ -522,6 +528,7 @@ ps_manifest_replay(PsLayerMap *map)
 			unsigned char bytes[sizeof(PsManifestLayerDisk)];
 			PsManifestLayerDisk layer;
 			PsManifestLayerIdEvent ev;
+			PsFlushWatermark watermark;
 		}			payload;
 		off_t		rec_off = good_off;
 		off_t		rec_size;
@@ -553,6 +560,7 @@ ps_manifest_replay(PsLayerMap *map)
 					unsigned char bytes[sizeof(PsManifestLayerDisk)];
 					PsManifestLayerDisk layer;
 					PsManifestLayerIdEvent ev;
+					PsFlushWatermark watermark;
 				}			pbuf;
 				off_t		psize;
 
@@ -626,6 +634,23 @@ ps_manifest_replay(PsLayerMap *map)
 								layer->locations[i].available = false;
 					break;
 				}
+
+			case PS_MANIFEST_SET_FLUSH_WATERMARK:
+				if (payload.watermark.shard >= PS_MAX_CHANNELS ||
+					(flush_watermark_valid[payload.watermark.shard] &&
+					 (payload.watermark.seg_id <
+					  flush_watermarks[payload.watermark.shard].seg_id ||
+					  (payload.watermark.seg_id ==
+					   flush_watermarks[payload.watermark.shard].seg_id &&
+					   payload.watermark.seg_off <
+					   flush_watermarks[payload.watermark.shard].seg_off))))
+				{
+					close(fd);
+					return -1;
+				}
+				flush_watermarks[payload.watermark.shard] = payload.watermark;
+				flush_watermark_valid[payload.watermark.shard] = 1;
+				break;
 
 			default:
 				close(fd);
@@ -722,6 +747,44 @@ ps_manifest_remove_layer(uint64_t layer_id)
 	return 0;
 }
 
+int
+ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
+								uint64_t seg_off)
+{
+	PsFlushWatermark watermark;
+
+	if (shard >= PS_MAX_CHANNELS)
+		return -1;
+	if (flush_watermark_valid[shard] &&
+		(seg_id < flush_watermarks[shard].seg_id ||
+		 (seg_id == flush_watermarks[shard].seg_id &&
+		  seg_off < flush_watermarks[shard].seg_off)))
+		return -1;
+	if (flush_watermark_valid[shard] &&
+		seg_id == flush_watermarks[shard].seg_id &&
+		seg_off == flush_watermarks[shard].seg_off)
+		return 0;
+	watermark.shard = shard;
+	watermark.seg_id = seg_id;
+	watermark.seg_off = seg_off;
+	if (manifest_append(PS_MANIFEST_SET_FLUSH_WATERMARK, &watermark,
+						sizeof(watermark)) != 0)
+		return -1;
+	flush_watermarks[shard] = watermark;
+	flush_watermark_valid[shard] = 1;
+	return 0;
+}
+
+int
+ps_manifest_get_flush_watermark(uint32_t shard, PsFlushWatermark *out)
+{
+	if (shard >= PS_MAX_CHANNELS || !flush_watermark_valid[shard])
+		return 0;
+	if (out)
+		*out = flush_watermarks[shard];
+	return 1;
+}
+
 /*
  * Should the log be rewritten?  True once it has grown well past the live layer
  * count (add/seal/delete churn appends records the live set no longer needs), so
@@ -730,10 +793,16 @@ ps_manifest_remove_layer(uint64_t layer_id)
 int
 ps_manifest_should_compact(void)
 {
+	uint32_t	nwatermarks = 0;
+
 	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return 0;
+	for (uint32_t shard = 0; shard < PS_MAX_CHANNELS; shard++)
+		if (flush_watermark_valid[shard])
+			nwatermarks++;
 	return manifest_nrecords >= 64 &&
-		manifest_nrecords > 4 * ((uint64_t) ps_layer_map.nlayers + 1);
+		manifest_nrecords > 4 * ((uint64_t) ps_layer_map.nlayers +
+								   nwatermarks + 1);
 }
 
 /*
@@ -768,6 +837,17 @@ ps_manifest_compact(void)
 
 		if (manifest_encode_layer(&disk, &ps_layer_map.layers[i]) != 0 ||
 			manifest_write_record(fd, PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
+			rc = -1;
+		else
+			nrec++;
+	}
+	for (uint32_t shard = 0; shard < PS_MAX_CHANNELS && rc == 0; shard++)
+	{
+		if (!flush_watermark_valid[shard])
+			continue;
+		if (manifest_write_record(fd, PS_MANIFEST_SET_FLUSH_WATERMARK,
+								  &flush_watermarks[shard],
+								  sizeof(PsFlushWatermark)) != 0)
 			rc = -1;
 		else
 			nrec++;

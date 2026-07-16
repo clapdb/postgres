@@ -65,9 +65,32 @@ main(void)
 			{k5, 0, 100, pg[0]}, {k5, 0, 300, pg[2]}, {k5, 0, 200, pg[1]},
 			{k5, 1, 150, pg[3]}, {k6, 0, 250, pg[4]},
 		};
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+
+		recs[1].growth_lsn = 275;
+		recs[1].order_id = 44;
+		recs[1].seg_id = 3;
+		recs[1].seg_off = 1234;
+		recs[1].flags = PS_IMG_REC_SEG_VALID | PS_IMG_REC_ORDERED;
 
 		check(ps_image_layer_write(7, 0, recs, 5, psz, &d) == 0,
 			  "write image layer");
+		check(ps_image_layer_read_index(&d, &idx, &nidx) == 0 && nidx == 5,
+			  "read image v3 index");
+		if (idx && nidx == 5)
+		{
+			PsImgIndexEnt *e = NULL;
+
+			for (uint32_t i = 0; i < nidx; i++)
+				if (idx[i].lsn == 300)
+					e = &idx[i];
+			check(e && e->growth_lsn == 275 && e->order_id == 44 &&
+				  e->seg_id == 3 && e->seg_off == 1234 &&
+				  e->flags == (PS_IMG_REC_SEG_VALID | PS_IMG_REC_ORDERED),
+				  "image v3 recovery metadata round-trips");
+		}
+		free(idx);
 	}
 
 	check(d.start_key.relNumber == 5 && d.end_key.relNumber == 6,

@@ -19,7 +19,8 @@
  *	- Indirection map.  An in-memory index maps (timeline, key, block) -> a
  *	  chain of versions {lsn, segment, offset}.  This lets a single small
  *	  logical page be addressed inside a large physical segment (ranged read).
- *	  The index is rebuilt by scanning segments at startup (recover()).
+ *	  Startup rebuilds it from the durable image-layer prefix plus the uncovered
+ *	  segment tail; SPDK, which does not yet use layers, scans all segments.
  *
  * This file holds everything backend- and loop-agnostic; each frontend (the
  * POSIX daemon, the SPDK daemon) supplies its own request loop and page byte
@@ -46,6 +47,7 @@ uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
 uint64_t	segment_size = 8 * 1024 * 1024;
 int			flush_pages = 256;	/* memtable flush threshold (pages) */
 int			compact_layers = 8;	/* compact a timeline past this many image layers */
+int			segment_gc_enabled = 1;
 int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
@@ -113,6 +115,10 @@ typedef struct Shard
 	uint32_t	id;					/* shard id [0..ps_nshards) this state belongs to */
 	int			cur_seg;			/* segment id for append cursor */
 	uint64_t	cur_off;			/* append cursor byte offset within cur_seg */
+	PsFlushWatermark flush_watermark;
+	uint32_t	gc_next_seg;		/* oldest segment not yet reclaimed */
+	int			flush_watermark_valid;
+	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
 	uint64_t	rr_mem,			/* read-source counters */
 				rr_layer,
@@ -275,6 +281,33 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 	return ps_manifest_add_layer(desc);
 }
 
+static int
+flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
+{
+	int			rc;
+
+	if (!s->memtable || ps_memtable_count(s->memtable) == 0)
+		return 0;
+	rc = ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
+	if (rc != 0)
+	{
+		s->coverage_broken = 1;
+		return -1;
+	}
+	if (s->coverage_broken)
+		return 0;
+	if (ps_manifest_set_flush_watermark(s->id, seg_id, seg_off) != 0)
+	{
+		s->coverage_broken = 1;
+		return -1;
+	}
+	s->flush_watermark.shard = s->id;
+	s->flush_watermark.seg_id = seg_id;
+	s->flush_watermark.seg_off = seg_off;
+	s->flush_watermark_valid = 1;
+	return 0;
+}
+
 /* ===================== compaction & GC (LSM phase 3) =================== */
 
 static uint32_t
@@ -426,6 +459,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			recs[nrec].block = idx[j].block;
 			recs[nrec].lsn = idx[j].lsn;
 			recs[nrec].page = pg;
+			recs[nrec].growth_lsn = idx[j].growth_lsn;
+			recs[nrec].order_id = idx[j].order_id;
+			recs[nrec].seg_off = idx[j].seg_off;
+			recs[nrec].seg_id = idx[j].seg_id;
+			recs[nrec].flags = idx[j].flags;
 			pages[nrec] = pg;
 			nrec++;
 		}
@@ -2063,7 +2101,16 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	 */
 	if (s->memtable && !ps_manifest_poisoned())
 	{
-		ps_memtable_put(s->memtable, timeline, key, block, page_version, page);
+		uint32_t	flags = PS_IMG_REC_SEG_VALID;
+
+		if (ordered_record)
+			flags |= PS_IMG_REC_ORDERED;
+		if (zero_version)
+			flags |= PS_IMG_REC_WALLESS;
+		if (ps_memtable_put(s->memtable, timeline, key, block, page_version,
+							page, hdr_grow_lsn, order_id, (uint32_t) s->cur_seg,
+							data_off, flags) != 0)
+			s->coverage_broken = 1;
 		if (ps_memtable_full(s->memtable))
 		{
 			/* A flush (and any inline compaction) mutates the cross-shard
@@ -2071,7 +2118,7 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * on every write.  The caller already holds this shard's write lock,
 			 * preserving the shard -> map order. */
 			ps_lock_map_wr();
-			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
+			flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off);
 			/* backpressure only: normal compaction runs off the write path in
 			 * ps_core_maintenance() when the daemon is idle.  Compact inline
 			 * here only if the layer count is running away far past the
@@ -2081,6 +2128,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			ps_unlock_map();
 		}
 	}
+	else if (s->memtable)
+		s->coverage_broken = 1;
 
 	/*
 	 * Grow the fork's size history with this page's exact version LSN: a
@@ -2117,6 +2166,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	unsigned char *tmp = malloc(page_size);
 	int			found = 0;
 	uint64_t	best = 0;
+	uint64_t	best_layer = 0;
 
 	if (!tmp)
 		return 0;
@@ -2128,9 +2178,11 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
 		if (ps_image_layer_lookup(d, key, block, read_lsn, tmp, page_size,
-								  &l) == 1 && (!found || l > best))
+								  &l) == 1 &&
+			(!found || l > best || (l == best && d->layer_id > best_layer)))
 		{
 			best = l;
+			best_layer = d->layer_id;
 			memcpy(out, tmp, page_size);
 			found = 1;
 		}
@@ -2176,7 +2228,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * same-pd_lsn rewrite lands in the segment only; both the cache (keyed
 			 * by (tl,key,block,lsn)) and the memtable would then return the older
 			 * bytes under the same LSN as the segment-backed pv.  When poisoned,
-			 * bypass both and read the authoritative segment.
+			 * bypass both; reclaimed versions still use their durable layer.
 			 */
 			int			poisoned = ps_manifest_poisoned();
 
@@ -2274,10 +2326,24 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				 * WAL-GC caller acting on a floor that silently ignored a
 				 * note could drop WAL a restorable image still needs.
 				 */
-				if (read_version(v, tmp) != 0)
+				if (v->seg >= 0)
 				{
-					rc = -1;
-					goto done;
+					if (read_version(v, tmp) != 0)
+					{
+						rc = -1;
+						goto done;
+					}
+				}
+				else
+				{
+					uint64_t	layer_lsn;
+
+					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, &layer_lsn,
+									  tmp) || layer_lsn != v->lsn)
+					{
+						rc = -1;
+						goto done;
+					}
 				}
 				memcpy(&redo, tmp, sizeof(redo));
 
@@ -2341,62 +2407,217 @@ done:
 	return rc;
 }
 
-/* ===================== recovery (rebuild index from segments) ========== */
+/* ===================== recovery (layers + segment tail) =============== */
 
-/*
- * Rebuild the entire in-memory index at startup by replaying the segments in
- * order.  Each record is self-describing, so replaying append_page's effect
- * (page_add_version + fork_grow) for every record reconstructs both indexes and
- * leaves the append cursor positioned just past the last valid record.
- * CREATE/TRUNCATE/UNLINK and zero-extends leave no segment records; their
- * size events replay from the fork-meta log afterwards (load_fork_meta).
- * A partial/torn trailing record is simply treated as end-of-log (the
- * magic/len check below stops the scan).
- */
-/*
- * Scan a shard's segment log and rebuild its version index, leaving the append
- * cursor just past the last valid record.  The segment log is append-only and
- * never deleted, so it is the complete, authoritative store: it holds every
- * version (including repeated writes at the same pd_lsn, in order) and any write a
- * layer flush did not record.  Recovery rebuilds the exact chain from it; image
- * layers are a future fast-recovery optimization that needs a durable flush
- * watermark before they can replace this scan.
- */
-static void
+typedef struct LayerRecoverRec
+{
+	uint32_t	timeline;
+	uint64_t	layer_id;
+	PsImgIndexEnt ent;
+} LayerRecoverRec;
+
+static int
+layer_recover_cmp(const void *pa, const void *pb)
+{
+	const LayerRecoverRec *a = pa;
+	const LayerRecoverRec *b = pb;
+
+	if (a->ent.seg_id != b->ent.seg_id)
+		return a->ent.seg_id < b->ent.seg_id ? -1 : 1;
+	if (a->ent.seg_off != b->ent.seg_off)
+		return a->ent.seg_off < b->ent.seg_off ? -1 : 1;
+	return a->layer_id < b->layer_id ? -1 :
+		(a->layer_id > b->layer_id ? 1 : 0);
+}
+
+/* Replay the index and fork-growth effects shared by layer and segment input. */
+static int
+replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
+				   uint64_t page_lsn, uint64_t growth_lsn, uint64_t order_id,
+				   uint32_t flags, uint32_t shard, int seg, uint64_t off)
+{
+	int			ordered = (flags & PS_IMG_REC_ORDERED) != 0;
+	int			wal_less = (flags & PS_IMG_REC_WALLESS) != 0;
+
+	if (order_id != 0)
+		segment_order_id_observe(order_id);
+	if (ordered)
+	{
+		ForkEnt    *fe = fork_find(timeline, key);
+
+		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
+											order_id)) && !fork_meta_legacy)
+			return 0;
+	}
+
+	page_add_version(timeline, key, block, page_lsn, shard, seg, off);
+	if (fork_meta_legacy)
+	{
+		ForkEnt    *fe = fork_get_or_create(timeline, key);
+		uint64_t	l = growth_lsn ? growth_lsn : fe->last_def_lsn;
+
+		if (fork_size_asof_hop(fe, l) < block + 1)
+		{
+			if (!fork_meta_migrate_failed &&
+				fork_meta_persist(timeline, key, l, block + 1, FEV_GROW) != 0)
+				fork_meta_migrate_failed = 1;
+			fork_event_add(fe, l, block + 1, FEV_GROW);
+		}
+	}
+	else if (!ordered && wal_less)
+	{
+		ForkEnt    *fe = fork_get_or_create(timeline, key);
+
+		if (!fork_has_growth_at(fe, growth_lsn, block + 1))
+			fork_grow_replay(timeline, key, block + 1, growth_lsn);
+	}
+	else if (!ordered && growth_lsn != 0)
+		fork_grow_replay(timeline, key, block + 1, growth_lsn);
+	return 1;
+}
+
+static int
+recover_layer_prefix(uint32_t shard)
+{
+	Shard	   *s = &g_shards[shard];
+	LayerRecoverRec *recs = NULL;
+	uint32_t	nrec = 0,
+				cap = 0;
+
+	if (!s->flush_watermark_valid)
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+		int			first_covered = -1;
+
+		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+			layer_shard_from_id(d->layer_id) != shard)
+			continue;
+		if (ps_image_layer_read_index(d, &idx, &n) != 0)
+			goto fail;
+		for (uint32_t j = 0; j < n; j++)
+		{
+			int			covered;
+
+			if (!(idx[j].flags & PS_IMG_REC_SEG_VALID))
+				continue;
+			covered = idx[j].seg_id < s->flush_watermark.seg_id ||
+				(idx[j].seg_id == s->flush_watermark.seg_id &&
+				 idx[j].seg_off <= s->flush_watermark.seg_off &&
+				 page_size <= s->flush_watermark.seg_off - idx[j].seg_off);
+			if (!covered)
+				continue;
+			if (first_covered < 0)
+				first_covered = (int) j;
+			if (nrec == cap)
+			{
+				uint32_t	nc = cap ? cap * 2 : 256;
+				LayerRecoverRec *nr = realloc(recs, (size_t) nc * sizeof(*nr));
+
+				if (!nr)
+				{
+					free(idx);
+					goto fail;
+				}
+				recs = nr;
+				cap = nc;
+			}
+			recs[nrec].timeline = d->timeline;
+			recs[nrec].layer_id = d->layer_id;
+			recs[nrec].ent = idx[j];
+			nrec++;
+		}
+		if (first_covered >= 0 && !d->data_verified)
+		{
+			unsigned char *verify = malloc(page_size);
+			uint64_t	verified_lsn;
+
+			if (!verify ||
+				ps_image_layer_lookup(d, &idx[first_covered].key,
+								  idx[first_covered].block,
+								  idx[first_covered].lsn, verify, page_size,
+								  &verified_lsn) != 1)
+			{
+				free(verify);
+				free(idx);
+				goto fail;
+			}
+			free(verify);
+		}
+		free(idx);
+	}
+
+	if (nrec == 0)
+		goto fail;
+	qsort(recs, nrec, sizeof(*recs), layer_recover_cmp);
+	for (uint32_t i = 0; i < nrec; i++)
+	{
+		PsImgIndexEnt *e = &recs[i].ent;
+
+		/* Partial flush retries and compaction can duplicate a source record. */
+		if (i + 1 < nrec && e->seg_id == recs[i + 1].ent.seg_id &&
+			e->seg_off == recs[i + 1].ent.seg_off)
+			continue;
+		if (!replay_page_record(recs[i].timeline, &e->key, e->block, e->lsn,
+								e->growth_lsn, e->order_id, e->flags,
+								shard, -1, 0))
+			goto fail;
+	}
+	free(recs);
+	return 0;
+
+fail:
+	free(recs);
+	return -1;
+}
+
+/* Scan only the segment suffix not covered by the durable layer watermark. */
+static int
 recover(uint32_t shard)
 {
 	Shard	   *s = &g_shards[shard];
+	int			first = s->flush_watermark_valid ?
+		(int) s->flush_watermark.seg_id : 0;
+	unsigned char *page = NULL;
 
-	s->cur_seg = -1;
-	s->cur_off = 0;
-
-	for (int id = 0;; id++)
+	s->cur_seg = s->flush_watermark_valid ? first : -1;
+	s->cur_off = s->flush_watermark_valid ? s->flush_watermark.seg_off : 0;
+	if (s->memtable)
 	{
-		uint64_t	off = 0;
+		page = malloc(page_size);
+		if (!page)
+			return -1;
+	}
+
+	for (int id = first;; id++)
+	{
+		uint64_t	off = (id == first && s->flush_watermark_valid) ?
+			s->flush_watermark.seg_off : 0;
 		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
 		int			retire_segment = 0;
 
 		if (seg_bytes < 0)
-			break;				/* no more segments -> done */
-
-		/* replay records until one fails to validate (end of log).  seg_bytes is
-		 * cached once here: the segment is not being written during recovery, and
-		 * the POSIX backend's seg_size() is a stat() we must not pay per record. */
+			break;
+		if ((uint64_t) seg_bytes < off)
+			goto fail;
 		for (;;)
 		{
 			SegRecHdr	hdr;
 			uint64_t	header_size = sizeof(SegRecHdr);
 			uint64_t	order_id = 0;
+			uint64_t	data_off;
+			uint64_t	page_version;
+			uint32_t	flags = PS_IMG_REC_SEG_VALID;
 			int			bound;
 			int			ordered;
-			int			order_activated = 0;
 			int			wal_less;
-			uint64_t	page_version;
 
-			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0)
-				break;			/* short read -> end of this segment's data */
-			if (hdr.magic == 0)
-				break;			/* zeroed slot -> normal end-of-log sentinel */
+			if (ps_storage->seg_read(shard, id, off, &hdr, sizeof(hdr)) != 0 ||
+				hdr.magic == 0)
+				break;
 			wal_less = hdr.magic == SEG_WALLESS_MAGIC ||
 				hdr.magic == SEG_WALLESS_ORDERED_MAGIC ||
 				hdr.magic == SEG_WALLESS_BOUND_MAGIC;
@@ -2406,22 +2627,13 @@ recover(uint32_t shard)
 				hdr.magic == SEG_CLAMPED_ORDERED_MAGIC || bound;
 			if (hdr.magic != SEG_MAGIC && !wal_less && !ordered)
 			{
-				/*
-				 * A non-zero magic that isn't ours is a record written by an
-				 * incompatible (pre-klass) on-disk format.  Fail fast instead of
-				 * treating it as end-of-log and overwriting it -- that would
-				 * silently lose the existing store.  It must be recreated (or
-				 * migrated offline) under the new format.
-				 */
 				fprintf(stderr, "pagestore_daemon: shard %u segment %d: incompatible "
-						"record magic %#x at offset %llu; this store "
-						"predates the current on-disk format and must be recreated\n",
-						shard, id, hdr.magic,
+						"record magic %#x at offset %llu\n", shard, id, hdr.magic,
 						(unsigned long long) off);
-				exit(1);
+				goto fail;
 			}
 			if (hdr.len != page_size)
-				break;			/* our magic but a torn/short tail record */
+				break;
 			if (bound)
 			{
 				header_size = sizeof(SegRecHdrBound);
@@ -2429,102 +2641,54 @@ recover(uint32_t shard)
 										 &order_id, sizeof(order_id)) != 0 ||
 					order_id == 0)
 					break;
-				segment_order_id_observe(order_id);
 			}
-
-			/*
-			 * append_page() writes the header and the page body in separate
-			 * writes, so after a crash a tail record can have a valid header while
-			 * the body is missing or short.  Index a record only once the segment
-			 * is large enough to hold its body; a torn body ends the log here so we
-			 * never index a version whose bytes cannot be read (which would mask a
-			 * good older version and zero-fill on read).
-			 */
 			if (seg_bytes < (int64_t) (off + header_size + hdr.len))
 				break;
-
-			/* Ordered records are committed by their matching inert fork-meta
-			 * placeholder.  A complete body without that marker is the tail of a
-			 * failed/unacknowledged append: retire the segment so its stale body
-			 * can never satisfy a later torn header, and publish neither bytes nor
-			 * growth. */
+			data_off = off + header_size;
 			if (ordered)
-			{
-				ForkEnt    *fe = fork_find(hdr.timeline, &hdr.key);
-
-				order_activated = fe && fork_event_activate_seg(
-					fe, hdr.lsn, hdr.block + 1, order_id);
-				/* A deliberately synthesized/real pre-events store has no
-				 * definitive metadata to misorder against.  Its segment records
-				 * are the migration source even if their newer magic normally
-				 * requires a marker that disappeared with the old metadata log. */
-				if (!order_activated && !fork_meta_legacy)
-				{
-					retire_segment = 1;
-					break;
-				}
-			}
-
-			page_version = wal_less ? 0 : hdr.lsn;
-			page_add_version(hdr.timeline, &hdr.key, hdr.block, page_version,
-							 shard, id, off + header_size);
-			/* Ordered SEG1/SEG3 growth was activated at its fork-meta position,
-			 * while a non-growing commit marker was consumed without changing size.
-			 * Legacy SEG0 carries zero-version growth at its stored floor,
-			 * while ordinary SEG2 re-derives growth at its stored LSN.
-			 * Markerless formats carry no reliable per-record correlation for
-			 * deciding that a later GROW was a clamp rather than a real regrow,
-			 * so guessing here would discard legitimate pre-truncate history.
-			 *
-			 * Legacy stores (an absent/empty fork-meta log, from before
-			 * events were persisted) have no definitive events to misorder
-			 * against; their lsn-0 growth replays through the PERSISTING
-			 * path, which write-through-migrates it into the meta log --
-			 * otherwise the flag would flip on the first new metadata
-			 * append and the second restart would bring every unlogged
-			 * fork back empty. */
+				flags |= PS_IMG_REC_ORDERED;
+			if (wal_less)
+				flags |= PS_IMG_REC_WALLESS;
+			/* A legacy scan durably converts missing marker semantics into
+			 * ordinary fork-growth events before sealing the migration. */
 			if (fork_meta_legacy)
+				flags &= ~PS_IMG_REC_ORDERED;
+			page_version = wal_less ? 0 : hdr.lsn;
+			if (!replay_page_record(hdr.timeline, &hdr.key, hdr.block,
+								page_version, hdr.lsn, order_id, flags,
+								shard, id, data_off))
 			{
-				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
-				uint64_t	l = hdr.lsn ? hdr.lsn : fe->last_def_lsn;
-
-				/* migrate (write-through) but NEVER drop the in-memory
-				 * growth: a failed persist degrades to retry-next-boot
-				 * (no marker), not to invisible blocks this run */
-				if (fork_size_asof_hop(fe, l) < hdr.block + 1)
-				{
-					if (!fork_meta_migrate_failed &&
-						fork_meta_persist(hdr.timeline, &hdr.key, l,
-										   hdr.block + 1, FEV_GROW) != 0)
-						fork_meta_migrate_failed = 1;
-					fork_event_add(fe, l, hdr.block + 1, FEV_GROW);
-				}
+				retire_segment = 1;
+				break;
 			}
-			else if (!ordered && wal_less)
+			if (s->memtable)
 			{
-				ForkEnt    *fe = fork_get_or_create(hdr.timeline, &hdr.key);
-
-				/* Markerless SEG0 predates ordered records.  During the format
-				 * transition, an earlier writer may already have persisted this
-				 * exact growth in forkmeta; do not replay it after a same-LSN
-				 * definitive event.  SEG0-only growth still reconstructs here. */
-				if (!fork_has_growth_at(fe, hdr.lsn, hdr.block + 1))
-					fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
-									 hdr.lsn);
+				if (ps_storage->seg_read(shard, id, data_off, page, page_size) != 0 ||
+					ps_memtable_put(s->memtable, hdr.timeline, &hdr.key, hdr.block,
+								page_version, page, hdr.lsn, order_id,
+								(uint32_t) id, data_off, flags) != 0)
+					goto fail;
 			}
-			else if (!ordered && hdr.lsn != 0)
-				fork_grow_replay(hdr.timeline, &hdr.key, hdr.block + 1,
-								 hdr.lsn);
 			off += header_size + hdr.len;
+			if (s->memtable && ps_memtable_full(s->memtable) &&
+				flush_memtable(s, (uint32_t) id, off) != 0)
+				goto fail;
 		}
-
-		/* this segment is the newest seen so far; append continues after it */
 		s->cur_seg = id;
 		s->cur_off = retire_segment ? segment_size : off;
 	}
+	if (s->memtable && ps_memtable_count(s->memtable) > 0 &&
+		flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off) != 0)
+		goto fail;
+	free(page);
 	if (s->cur_seg >= 0)
 		fprintf(stderr, "pagestore_daemon: recovered shard %u through segment %d (off %llu)\n",
 				shard, s->cur_seg, (unsigned long long) s->cur_off);
+	return 0;
+
+fail:
+	free(page);
+	return -1;
 }
 
 /* ===================== request handling (non-I/O ops) ================== */
@@ -2753,31 +2917,20 @@ ps_handle_meta(PsChannel *ch)
 
 /* ===================== lifecycle ====================================== */
 
-/* Flush the memtable and close the manifest on a clean shutdown.  (The segment
- * log is authoritative, so a restart recovers from it regardless.) */
+/* Flush the memtable, commit its coverage watermark, and close the manifest. */
 void
 ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
 
 	/*
-	 * Recovery rebuilds the index from the segment log, so the segments must be
-	 * durable before we rely on them: fsync them on clean shutdown (writes between
+	 * The uncovered segment tail must be durable before shutdown (writes between
 	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
 	 * power failure after the daemon exits even though the write was acknowledged).
 	 *
-	 * Sync *before* flushing the memtable into image layers below.  Otherwise a
-	 * power loss in the shutdown window could leave a just-committed layer as the
-	 * only durable copy of pages whose segment bytes were still in the page cache,
-	 * which segment-only recovery would miss.  Syncing first makes the recovery
-	 * source durable before any layer is committed on top of it.
-	 *
-	 * If the sync fails (EIO/ENOSPC/...), the segment log -- the sole source
-	 * segment-only recovery reads -- is not durable, so the about-to-be-destroyed
-	 * memtable may be the only good copy of recent writes.  We cannot make it
-	 * durable from here, so do not proceed to a clean-looking teardown that would
-	 * mask the loss: report it and abort with a failure status before destroying
-	 * the memtables, leaving the operator a clear signal to investigate.
+	 * Sync before flushing below so a failed layer/manifest commit still leaves a
+	 * durable segment fallback.  A sync error means acknowledged tail writes may
+	 * not be durable, so abort before destroying the memtables.
 	 */
 	if (ps_storage->sync && ps_storage->sync() != 0)
 	{
@@ -2793,7 +2946,7 @@ ps_core_close(void)
 
 		if (s->memtable)
 		{
-			ps_memtable_flush(s->memtable, alloc_layer_id, record_layer, s);
+			flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off);
 			ps_memtable_destroy(s->memtable);
 			s->memtable = NULL;
 		}
@@ -2801,6 +2954,29 @@ ps_core_close(void)
 
 	ps_pgcache_free();
 	ps_manifest_close();
+}
+
+static int
+reclaim_one_segment(Shard *s)
+{
+	uint32_t	victim;
+
+	if (!s->flush_watermark_valid || !ps_storage->seg_remove ||
+		s->gc_next_seg >= s->flush_watermark.seg_id)
+		return 0;
+	victim = s->gc_next_seg;
+	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		for (PageEnt *e = s->page_idx[bucket]; e; e = e->next)
+			for (int i = 0; i < e->nver; i++)
+				if (e->vers[i].seg == (int) victim)
+				{
+					e->vers[i].seg = -1;
+					e->vers[i].off = 0;
+				}
+	if (ps_storage->seg_remove(s->id, (int) victim) != 0)
+		return 0;
+	s->gc_next_seg++;
+	return 1;
 }
 
 /*
@@ -2831,6 +3007,20 @@ ps_core_maintenance(void)
 	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
+
+	/* Reclaim at most one complete segment.  The boundary segment containing
+	 * the watermark stays present because its suffix may not be in a layer. */
+	if (segment_gc_enabled && ps_storage->seg_remove)
+		for (uint32_t sh = 0; sh < ns; sh++)
+		{
+			ps_lock_shard_wr(sh);
+			ps_lock_map_rd();
+			found = reclaim_one_segment(&g_shards[sh]);
+			ps_unlock_map();
+			ps_unlock_shard(sh);
+			if (found)
+				return 1;
+		}
 
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
@@ -2926,9 +3116,19 @@ ps_core_open(const char *store_dir)
 	/* initialize per-shard state, locks and layer-id cursors */
 	for (uint32_t i = 0; i < ns; i++)
 	{
+		PsFlushWatermark watermark;
+
 		g_shards[i].id = i;
 		g_shards[i].cur_seg = -1;
 		g_shards[i].cur_off = 0;
+		g_shards[i].gc_next_seg = 0;
+		g_shards[i].coverage_broken = 0;
+		g_shards[i].flush_watermark_valid = 0;
+		if (use_layers && ps_manifest_get_flush_watermark(i, &watermark))
+		{
+			g_shards[i].flush_watermark = watermark;
+			g_shards[i].flush_watermark_valid = 1;
+		}
 		g_shards[i].next_layer_id = 1;
 		pthread_rwlock_init(&shard_locks[i], NULL);
 	}
@@ -2964,26 +3164,28 @@ ps_core_open(const char *store_dir)
 	load_timelines();
 
 	/*
-	 * Rebuild the version index from the segment log, the complete authoritative
-	 * store (never deleted).  This recovers every acknowledged write -- including
-	 * a tail the memtable flush never recorded in a layer (a crash, or a poisoned
-	 * manifest) -- and repeated same-pd_lsn writes in order, which a layer rebuild
-	 * keyed only by LSN could not.  Image layers are still loaded into the layer
-	 * map (for compaction/GC) but are not used to rebuild the read index here.
-	 */
-	/*
 	 * Definitive fork-size events (create/truncate/unlink/zero-extend) load
-	 * BEFORE the segment scan: the GROW dedup in fork_event_add compares a
+	 * before page recovery: the GROW dedup in fork_event_add compares a
 	 * grow against the size visible at its own LSN, and with the definitive
-	 * events already in place the segment replay makes exactly the decisions
+	 * events already in place layer/segment replay makes exactly the decisions
 	 * the live path made (a regrow after a truncate must be kept even when
 	 * it does not exceed the pre-truncate envelope).
+	 *
+	 * A durable per-shard watermark divides recovery: v3 image-layer metadata
+	 * reconstructs the covered prefix in source-segment order, then recover()
+	 * scans and materializes only the segment suffix.  Without a watermark (an
+	 * old store or SPDK), recover() starts at segment zero.
 	 */
 	if (load_fork_meta() != 0)
 		return -1;
 
 	for (uint32_t sh = 0; sh < ns; sh++)
-		recover(sh);
+	{
+		if (use_layers && recover_layer_prefix(sh) != 0)
+			return -1;
+		if (recover(sh) != 0)
+			return -1;
+	}
 
 	/*
 	 * Seal the legacy migration before the daemon becomes writable.  Starting
