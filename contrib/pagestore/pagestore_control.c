@@ -266,6 +266,24 @@ ps_control_drain(void)
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image, sizeof(ControlFileData));
 
+			/*
+			 * A pinned reader is named by checkpoint redo R, while the normal
+			 * control history is ordered by the checkpoint record end.  Publish
+			 * the image at exact R as well, so bootstrap can restore the control
+			 * state corresponding to its read horizon even after later
+			 * checkpoints have advanced the writer.  The record-end copy below
+			 * remains the newest-wins control history used by writers.
+			 */
+			if (p->fence_token != 0)
+			{
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 0, page,
+					(uint64) p->image.checkPointCopy.redo, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+			}
+
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
