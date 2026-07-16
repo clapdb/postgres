@@ -870,6 +870,7 @@ const PsStorage PsStorageSpdk = {
 	.seg_write = spdk_seg_write,
 	.seg_read = spdk_seg_read,
 	.seg_size = spdk_seg_size,
+	.seg_remove = NULL,
 	.wal_append = spdk_wal_append,
 	.wal_read = spdk_wal_read,
 	.meta_append = spdk_meta_append,

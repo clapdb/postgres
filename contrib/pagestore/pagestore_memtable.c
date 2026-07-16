@@ -18,6 +18,12 @@ typedef struct MemEnt
 	uint32_t	block;
 	uint64_t	lsn;
 	unsigned char *page;		/* owned copy, page_size bytes */
+	uint64_t	growth_lsn;
+	uint64_t	order_id;
+	uint64_t	seg_off;
+	uint64_t	seq;
+	uint32_t	seg_id;
+	uint32_t	flags;
 } MemEnt;
 
 struct PsMemtable
@@ -27,6 +33,7 @@ struct PsMemtable
 	MemEnt	   *ents;
 	uint32_t	n;
 	uint32_t	cap;
+	uint64_t	next_seq;
 };
 
 PsMemtable *
@@ -61,7 +68,9 @@ ps_memtable_destroy(PsMemtable *mt)
 
 int
 ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
-				uint32_t block, uint64_t lsn, const void *page)
+				uint32_t block, uint64_t lsn, const void *page,
+				uint64_t growth_lsn, uint64_t order_id,
+				uint32_t seg_id, uint64_t seg_off, uint32_t flags)
 {
 	MemEnt	   *e;
 	unsigned char *copy;
@@ -87,6 +96,12 @@ ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
 	e->block = block;
 	e->lsn = lsn;
 	e->page = copy;
+	e->growth_lsn = growth_lsn;
+	e->order_id = order_id;
+	e->seg_off = seg_off;
+	e->seq = mt->next_seq++;
+	e->seg_id = seg_id;
+	e->flags = flags;
 	return 0;
 }
 
@@ -136,7 +151,10 @@ ent_timeline_cmp(const void *pa, const void *pb)
 	uint32_t	a = ((const MemEnt *) pa)->timeline;
 	uint32_t	b = ((const MemEnt *) pb)->timeline;
 
-	return a < b ? -1 : (a > b ? 1 : 0);
+	if (a != b)
+		return a < b ? -1 : 1;
+	return ((const MemEnt *) pa)->seq < ((const MemEnt *) pb)->seq ? -1 :
+		(((const MemEnt *) pa)->seq > ((const MemEnt *) pb)->seq ? 1 : 0);
 }
 
 int
@@ -173,6 +191,11 @@ ps_memtable_flush(PsMemtable *mt, PsAllocLayerId alloc, PsOnLayer on_layer,
 			recs[r].block = mt->ents[i + r].block;
 			recs[r].lsn = mt->ents[i + r].lsn;
 			recs[r].page = mt->ents[i + r].page;
+			recs[r].growth_lsn = mt->ents[i + r].growth_lsn;
+			recs[r].order_id = mt->ents[i + r].order_id;
+			recs[r].seg_off = mt->ents[i + r].seg_off;
+			recs[r].seg_id = mt->ents[i + r].seg_id;
+			recs[r].flags = mt->ents[i + r].flags;
 		}
 
 		layer_id = alloc(ctx);

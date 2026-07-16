@@ -11,17 +11,20 @@ change.
 
 ## Current state
 
-The current pagestore stores page versions in append-only segment files:
+The POSIX pagestore now uses the append-only segment log as its write-ahead
+staging path and immutable image layers as its durable searchable history:
 
-- page writes append `[SegRecHdr | page bytes]` to `seg_NNNNNNNN`;
-- an in-memory hash table maps `(timeline, key, block)` to page versions;
-- reads locate a version in memory and read page bytes from the segment;
-- restart rebuilds the in-memory indexes by scanning all segment records;
-- there is no compaction, garbage collection, or persistent layer index.
-
-This is already log-structured, but it is not yet LSM-like: historical state is
-not organized into immutable searchable layers, and metadata is not persistent
-except by replaying the full data log.
+- page writes append `[SegRecHdr | page bytes]` and enter a per-shard memtable;
+- a flush installs one image layer per timeline, then commits a per-shard
+  `(segment, offset)` coverage watermark in the manifest;
+- restart rebuilds the covered prefix from image-layer recovery metadata and
+  scans only the segment suffix at/after the watermark;
+- local compaction preserves that recovery metadata, and background Segment GC
+  removes complete POSIX segments strictly below the watermark;
+- the watermark boundary segment is retained, so an unflushed crash tail remains
+  recoverable;
+- SPDK still uses segment-only recovery and does not reclaim fixed raw-device
+  segment slots.
 
 ## Target model
 
@@ -475,4 +478,3 @@ Minimal first-milestone deliverables:
 - read path through memtable plus image layers;
 - restart without full segment scan;
 - no-op placeholders for tiering and remote locations.
-

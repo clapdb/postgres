@@ -72,6 +72,7 @@ main(void)
 	PsLayerDesc rel,
 				slru;
 	PsLayerDesc *got;
+	PsFlushWatermark watermark;
 
 	if (!mkdtemp(dir))
 	{
@@ -91,6 +92,10 @@ main(void)
 	slru = make_slru_layer(2);
 	check(ps_manifest_add_layer(&rel) == 0, "add relation layer");
 	check(ps_manifest_add_layer(&slru) == 0, "add SLRU layer");
+	check(ps_manifest_set_flush_watermark(3, 7, 12345) == 0,
+		  "persist flush watermark");
+	check(ps_manifest_set_flush_watermark(3, 7, 12344) != 0,
+		  "reject regressing flush watermark");
 	ps_manifest_close();
 
 	/* --- restart: re-open and replay the manifest into a fresh map --------- */
@@ -102,6 +107,9 @@ main(void)
 	}
 	check(ps_manifest_replay(&ps_layer_map) == 0, "replay succeeds");
 	check(ps_layer_map_count(&ps_layer_map) == 2, "both layers replayed");
+	check(ps_manifest_get_flush_watermark(3, &watermark) == 1 &&
+		  watermark.seg_id == 7 && watermark.seg_off == 12345,
+		  "flush watermark replays");
 
 	/* layer 1: relation class survives */
 	got = NULL;
@@ -136,6 +144,14 @@ main(void)
 			  "lsn range round-trips");
 		check(got->location_count == 1, "location round-trips");
 	}
+
+	check(ps_manifest_compact() == 0, "manifest compaction succeeds");
+	ps_manifest_close();
+	check(ps_manifest_open(dir) == 0, "open compacted manifest");
+	check(ps_manifest_replay(&ps_layer_map) == 0, "replay compacted manifest");
+	check(ps_manifest_get_flush_watermark(3, &watermark) == 1 &&
+		  watermark.seg_id == 7 && watermark.seg_off == 12345,
+		  "manifest compaction preserves flush watermark");
 
 	ps_manifest_close();		/* frees the in-memory map */
 

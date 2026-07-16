@@ -261,6 +261,36 @@ out:
 }
 
 static int
+posix_seg_remove(uint32_t shard, int seg)
+{
+	char		path[4096];
+	int			dfd;
+	int			rc = 0;
+
+	seg_path(path, sizeof(path), shard, seg);
+	pthread_mutex_lock(&seg_fds_lock);
+	if (shard < (uint32_t) seg_shards_cap && seg >= 0 &&
+		seg < seg_fds_caps[shard] && seg_fds[shard] &&
+		seg_fds[shard][seg] >= 0)
+	{
+		close(seg_fds[shard][seg]);
+		seg_fds[shard][seg] = -1;
+	}
+	if (unlink(path) != 0 && errno != ENOENT)
+		rc = -1;
+	if (rc == 0)
+	{
+		dfd = open(posix_dir, O_RDONLY);
+		if (dfd < 0 || fsync(dfd) != 0)
+			rc = -1;
+		if (dfd >= 0)
+			close(dfd);
+	}
+	pthread_mutex_unlock(&seg_fds_lock);
+	return rc;
+}
+
+static int
 posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 			uint32_t len)
 {
@@ -571,6 +601,7 @@ const PsStorage PsStoragePosix = {
 	.seg_write = posix_seg_write,
 	.seg_read = posix_seg_read,
 	.seg_size = posix_seg_size,
+	.seg_remove = posix_seg_remove,
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
 	.meta_append = posix_meta_append,

@@ -99,6 +99,14 @@ typedef struct ImgSort
 	uint32_t	src;
 } ImgSort;
 
+typedef struct PsImgIndexEntV2
+{
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	data_off;
+} PsImgIndexEntV2;
+
 static int
 img_sort_cmp(const void *pa, const void *pb)
 {
@@ -112,7 +120,9 @@ img_sort_cmp(const void *pa, const void *pb)
 		return a->ent.block < b->ent.block ? -1 : 1;
 	if (a->ent.lsn != b->ent.lsn)
 		return a->ent.lsn < b->ent.lsn ? -1 : 1;
-	return 0;
+	/* qsort is not stable.  Preserve append order for same-pd_lsn rewrites so
+	 * the last index entry remains the latest bytes after segment reclamation. */
+	return a->src < b->src ? -1 : (a->src > b->src ? 1 : 0);
 }
 
 /*
@@ -175,6 +185,11 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 		sorted[i].ent.block = recs[i].block;
 		sorted[i].ent.lsn = recs[i].lsn;
 		sorted[i].ent.data_off = 0;
+		sorted[i].ent.growth_lsn = recs[i].growth_lsn;
+		sorted[i].ent.order_id = recs[i].order_id;
+		sorted[i].ent.seg_off = recs[i].seg_off;
+		sorted[i].ent.seg_id = recs[i].seg_id;
+		sorted[i].ent.flags = recs[i].flags;
 		sorted[i].src = i;
 	}
 	qsort(sorted, n, sizeof(ImgSort), img_sort_cmp);
@@ -541,7 +556,9 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
-	PsImgIndexEnt *idx;
+	PsImgIndexEnt *idx = NULL;
+	void	   *disk = NULL;
+	size_t		ent_size;
 	uint64_t	idx_bytes;
 
 	*out = NULL;
@@ -551,20 +568,47 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 										 &foot, sizeof(foot)) != 0)
 		return -1;
-	if (foot.magic != PS_IMG_MAGIC || foot.version != PS_IMG_VERSION ||
-		foot.nrecs == 0)
+	if (foot.magic != PS_IMG_MAGIC ||
+		(foot.version != 2 && foot.version != PS_IMG_VERSION) || foot.nrecs == 0)
 		return -1;
-	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsImgIndexEnt);
-	idx = malloc((size_t) idx_bytes);
-	if (!idx)
+	ent_size = foot.version == 2 ? sizeof(PsImgIndexEntV2) : sizeof(PsImgIndexEnt);
+	idx_bytes = (uint64_t) foot.nrecs * ent_size;
+	if (loc->size < sizeof(foot) || foot.index_off > loc->size - sizeof(foot) ||
+		idx_bytes != loc->size - sizeof(foot) - foot.index_off ||
+		idx_bytes > UINT32_MAX)
 		return -1;
-	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
-										 (uint32_t) idx_bytes) != 0 ||
-		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
+	disk = malloc((size_t) idx_bytes);
+	idx = malloc((size_t) foot.nrecs * sizeof(PsImgIndexEnt));
+	if (!disk || !idx)
 	{
+		free(disk);
 		free(idx);
 		return -1;
 	}
+	if (ps_layer_store->read_layer_block(layer, foot.index_off, disk,
+										 (uint32_t) idx_bytes) != 0 ||
+		img_crc(disk, (size_t) idx_bytes) != foot.index_crc)
+	{
+		free(disk);
+		free(idx);
+		return -1;
+	}
+	if (foot.version == 2)
+	{
+		PsImgIndexEntV2 *old = disk;
+
+		for (uint32_t i = 0; i < foot.nrecs; i++)
+		{
+			memset(&idx[i], 0, sizeof(idx[i]));
+			idx[i].key = old[i].key;
+			idx[i].block = old[i].block;
+			idx[i].lsn = old[i].lsn;
+			idx[i].data_off = old[i].data_off;
+		}
+	}
+	else
+		memcpy(idx, disk, (size_t) idx_bytes);
+	free(disk);
 	*out = idx;
 	*n = foot.nrecs;
 	return 0;
@@ -577,8 +621,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsImgFooter foot;
-	PsImgIndexEnt *idx;
-	uint64_t	idx_bytes;
+	PsImgIndexEnt *idx = NULL;
+	uint32_t	nidx = 0;
 	uint64_t	best_off = 0;
 	uint64_t	best_lsn = 0;
 	int			found = 0;
@@ -593,19 +637,12 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 										 &foot, sizeof(foot)) != 0)
 		return -1;
-	if (foot.magic != PS_IMG_MAGIC || foot.version != PS_IMG_VERSION ||
+	if (foot.magic != PS_IMG_MAGIC ||
+		(foot.version != 2 && foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size || foot.nrecs == 0)
 		return -1;
-
-	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsImgIndexEnt);
-	idx = malloc((size_t) idx_bytes);
-	if (!idx)
-		return -1;
-	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
-										 (uint32_t) idx_bytes) != 0)
+	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0 || nidx != foot.nrecs)
 		goto out;
-	if (img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
-		goto out;				/* corrupt index */
 
 	/*
 	 * Verify the data section once (per process) before the first page is
