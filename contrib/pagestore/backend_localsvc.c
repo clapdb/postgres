@@ -914,6 +914,68 @@ pagestore_localsvc_store_sync_timeout(int timeout_ms)
 	ls_exec_timeout(ch, timeout_ms);
 }
 
+/* Publish the nonblocking side of a checkpoint admission gate.  The control
+ * hook calls this in a critical section, so attachment must already exist and
+ * failure merely means that this control image cannot publish a fence. */
+bool
+pagestore_localsvc_admission_fence_begin(uint64 redo_lsn, uint64 *token)
+{
+	PsShmHeader *hdr;
+	uint64		epoch;
+
+	*token = 0;
+	if (ls_shm == NULL)
+		return false;
+	hdr = (PsShmHeader *) ls_shm;
+	if (!ps_cas(&hdr->admission_fence_owner, 0, (uint32) MyProcPid))
+		return false;
+	epoch = ps_fetch_add_u64(&hdr->admission_fence_epoch, 1) + 1;
+	ps_store_release_u64(&hdr->admission_pending_lsn, redo_lsn);
+	ps_store_release_u64(&hdr->admission_pending_epoch, epoch);
+	*token = epoch;
+	return true;
+}
+
+bool
+pagestore_localsvc_admission_fence_active(uint64 token)
+{
+	PsShmHeader *hdr;
+
+	if (token == 0 || ls_shm == NULL)
+		return false;
+	hdr = (PsShmHeader *) ls_shm;
+	return ps_load_acquire_u64(&hdr->admission_pending_epoch) == token &&
+		ps_load_acquire(&hdr->admission_fence_owner) == (uint32) MyProcPid;
+}
+
+uint64
+pagestore_localsvc_admission_barrier_timeout(int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	ls_exec_timeout(ch, timeout_ms);
+	return ch->req_seq;
+}
+
+void
+pagestore_localsvc_admission_fence_end(uint64 token)
+{
+	PsShmHeader *hdr;
+
+	if (token == 0 || ls_shm == NULL)
+		return;
+	hdr = (PsShmHeader *) ls_shm;
+	if (ps_load_acquire(&hdr->admission_fence_owner) != (uint32) MyProcPid ||
+		!ps_cas_u64(&hdr->admission_pending_epoch, token, 0))
+		return;
+	ps_store_release_u64(&hdr->admission_pending_lsn, 0);
+	ps_store_release(&hdr->admission_fence_owner, 0);
+}
+
 /*
  * Durable WAL retention floor of this compute's timeline ancestry: the store
  * must keep shipped WAL at/above it for the mirrored pg_control images to

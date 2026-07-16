@@ -69,6 +69,7 @@ uint32_t	ps_nshards = 1;
  * continues above both committed and uncommitted records after a restart. */
 static uint64_t next_segment_order_id = 1;
 static uint64_t next_admission_seq = 1;
+static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static uint64_t
 admission_seq_alloc(void)
@@ -86,6 +87,29 @@ admission_seq_observe(uint64_t seq)
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
+}
+
+void
+ps_admission_read_lock(void)
+{
+	pthread_rwlock_rdlock(&admission_lock);
+}
+
+void
+ps_admission_read_unlock(void)
+{
+	pthread_rwlock_unlock(&admission_lock);
+}
+
+uint64_t
+ps_admission_barrier(void)
+{
+	uint64_t	seq;
+
+	pthread_rwlock_wrlock(&admission_lock);
+	seq = admission_seq_alloc();
+	pthread_rwlock_unlock(&admission_lock);
+	return seq;
 }
 
 static uint64_t
