@@ -1,8 +1,9 @@
 # Multi-compute read consistency: design
 
 Status: increments 1a (the page-read pin), 1b (as-of size/existence
-metadata), and 1d (the same-LSN admission fence) implemented; increments
-1c, 2, and 3 are specified here and not yet built.
+metadata), the 1c SLRU/control boot artifacts, and 1d (the same-LSN admission
+fence) are implemented.  Exact catalog provenance, the 1c running-xacts
+snapshot, and increments 2 and 3 are specified here and not yet built.
 
 ## Problem
 
@@ -158,12 +159,27 @@ reconstruction.
    content is not LSN-ordered to begin with, and unlogged crash-reset
    semantics are outside what LSN-versioning can express.
 
-1c. **The as-of compute (boot + snapshot).**  A consistent QUERY compute
+1c. **The as-of compute (boot artifacts partial; snapshot pending).**  A consistent QUERY compute
    at R needs its LOCAL state as-of R too: catalogs, pg_control, and
    SLRUs come from the prepared-branch-style artifacts restored at R (a
    pinned reader does NOT create a store timeline -- it reads the
    writer's timeline as-of R, which `tl_walk`/`page_visible` already
-   serve).  Transaction visibility must not consult newest status: wire
+   serve).  The boot half uses `pagestore_prepare_reader` to materialize
+   the SLRUs without creating a timeline, then
+   `pagestore_install_prepared_reader` installs them and publishes a durable
+   `pagestore_reader.manifest` last.  `pagestore_control_restore --lsn R`
+   installs the exact-R control image before startup.  A configured pin fails
+   startup unless the manifest's timeline/read LSN and `pg_control` redo all
+   agree.
+
+   The control plane still has to supply catalogs proven to be at R.  A
+   quiesced datadir copy is sufficient only when no catalog-changing work can
+   run between fixing redo and taking the copy; otherwise catalogs must be
+   routed through the versioned store or restored from a recovery artifact at
+   R.  The reader manifest does not yet carry or validate that provenance, so
+   this increment is not the complete 1c boot contract.
+
+   The remaining snapshot half must not consult newest status: wire
    the running-xacts snapshot (above) so tuples of xacts in flight at R
    stay invisible whatever newest clog says.
 

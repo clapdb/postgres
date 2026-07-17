@@ -50,6 +50,7 @@
 #include "archive/archive_module.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -4711,7 +4712,88 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 													 PG_GETARG_INT64(10)));
 }
 
-#define PAGESTORE_BRANCH_MANIFEST_MAXLEN 8192
+#define PAGESTORE_MANIFEST_MAXLEN 8192
+
+static void
+pagestore_publish_manifest(const char *target_dir, const char *filename,
+						   const char *kind, const char *manifest,
+						   int manifest_len)
+{
+	char		path[MAXPGPATH];
+	char		tmppath[MAXPGPATH];
+	int			len;
+	int			fd;
+	int			done = 0;
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create %s artifact dir \"%s\": %m", kind,
+						target_dir)));
+	len = snprintf(path, sizeof(path), "%s/%s", target_dir, filename);
+	PS_CHECK_PATH_FORMAT(len, path);
+	len = snprintf(tmppath, sizeof(tmppath), "%s/%s.tmp.%ld", target_dir,
+				   filename, (long) MyProcPid);
+	PS_CHECK_PATH_FORMAT(len, tmppath);
+	if (access(tmppath, F_OK) == 0 && unlink(tmppath) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear stale %s manifest temp file \"%s\": %m",
+						kind, tmppath)));
+	fd = OpenTransientFilePerm(tmppath,
+						   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
+						   pg_file_create_mode);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create %s manifest \"%s\": %m", kind,
+						tmppath)));
+	while (done < manifest_len)
+	{
+		ssize_t		written;
+
+		errno = 0;
+		written = write(fd, manifest + done, manifest_len - done);
+		if (written <= 0)
+		{
+			if (written == 0)
+				errno = ENOSPC;
+			CloseTransientFile(fd);
+			(void) unlink(tmppath);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write %s manifest \"%s\": %m", kind,
+							tmppath)));
+		}
+		done += written;
+	}
+	if (pg_fsync(fd) != 0)
+	{
+		CloseTransientFile(fd);
+		(void) unlink(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync %s manifest \"%s\": %m", kind,
+						tmppath)));
+	}
+	if (CloseTransientFile(fd) != 0)
+	{
+		(void) unlink(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close %s manifest \"%s\": %m", kind,
+						tmppath)));
+	}
+	if (durable_rename(tmppath, path, LOG) != 0)
+	{
+		(void) unlink(tmppath);
+		(void) unlink(path);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not durably publish %s manifest \"%s\"", kind,
+						path)));
+	}
+}
 
 static void
 pagestore_write_branch_manifest(const char *target_dir,
@@ -4727,13 +4809,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 								int64 next_member,
 								int64 seeded_pages)
 {
-	char		path[MAXPGPATH];
-	char		tmppath[MAXPGPATH];
 	char		manifest[2048];
-	int			len;
 	int			manifest_len;
-	int			fd;
-	int			done = 0;
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
@@ -4766,81 +4843,59 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest is too large")));
 
-	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	pagestore_publish_manifest(target_dir, "pagestore_branch.manifest", "branch",
+						   manifest, manifest_len);
+}
 
-	len = snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
-	PS_CHECK_PATH_FORMAT(len, path);
-	len = snprintf(tmppath, sizeof(tmppath),
-				   "%s/pagestore_branch.manifest.tmp.%ld",
-				   target_dir, (long) MyProcPid);
-	PS_CHECK_PATH_FORMAT(len, tmppath);
-	if (access(tmppath, F_OK) == 0 && unlink(tmppath) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not clear stale branch manifest temp file \"%s\": %m",
-						tmppath)));
-	fd = OpenTransientFilePerm(tmppath,
-							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
-							   pg_file_create_mode);
-	if (fd < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create branch manifest \"%s\": %m", tmppath)));
-	while (done < manifest_len)
-	{
-		ssize_t		written;
+static void
+pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
+								XLogRecPtr base, XLogRecPtr read_lsn,
+								TransactionId oldest_xid,
+								TransactionId next_xid,
+								TransactionId oldest_commit_ts_xid,
+								TransactionId next_commit_ts_xid,
+								MultiXactId oldest_multi,
+								MultiXactId next_multi,
+								int64 oldest_member, int64 next_member,
+								int64 seeded_pages)
+{
+	char		manifest[2048];
+	int			manifest_len;
 
-		errno = 0;
-		written = write(fd, manifest + done, manifest_len - done);
-		if (written <= 0)
-		{
-			if (written == 0)
-				errno = ENOSPC;
-			CloseTransientFile(fd);
-			(void) unlink(tmppath);
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write branch manifest \"%s\": %m", tmppath)));
-		}
-		done += written;
-	}
-	if (pg_fsync(fd) != 0)
-	{
-		CloseTransientFile(fd);
-		(void) unlink(tmppath);
+	manifest_len = snprintf(manifest, sizeof(manifest),
+							"{\n"
+							"  \"format\": 1,\n"
+							"  \"kind\": \"pinned_reader\",\n"
+							"  \"timeline\": %d,\n"
+							"  \"base_lsn\": \"%X/%08X\",\n"
+							"  \"read_lsn\": \"%X/%08X\",\n"
+							"  \"oldest_xid\": \"%u\",\n"
+							"  \"next_xid\": \"%u\",\n"
+							"  \"oldest_commit_ts_xid\": \"%u\",\n"
+							"  \"next_commit_ts_xid\": \"%u\",\n"
+							"  \"oldest_multi\": \"%u\",\n"
+							"  \"next_multi\": \"%u\",\n"
+							"  \"oldest_member\": \"%lld\",\n"
+							"  \"next_member\": \"%lld\",\n"
+							"  \"seeded_slru_pages\": \"%lld\"\n"
+							"}\n",
+							timeline, LSN_FORMAT_ARGS(base),
+							LSN_FORMAT_ARGS(read_lsn), oldest_xid, next_xid,
+							oldest_commit_ts_xid, next_commit_ts_xid,
+							oldest_multi, next_multi,
+							(long long) oldest_member, (long long) next_member,
+							(long long) seeded_pages);
+	if (manifest_len < 0 || manifest_len >= (int) sizeof(manifest))
 		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync branch manifest \"%s\": %m", tmppath)));
-	}
-	if (CloseTransientFile(fd) != 0)
-	{
-		(void) unlink(tmppath);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not close branch manifest \"%s\": %m", tmppath)));
-	}
-	/*
-	 * The manifest is the marker that this dir is consumable, so if any part
-	 * of the durable publish (rename + directory fsync) fails it must not
-	 * stay visible while the caller reports the prepare as failed.  The
-	 * unlinks are best-effort: if the directory fsync itself is failing
-	 * there is no stronger rollback available.
-	 */
-	if (durable_rename(tmppath, path, LOG) != 0)
-	{
-		(void) unlink(tmppath);
-		(void) unlink(path);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not durably publish branch manifest \"%s\"", path)));
-	}
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("reader manifest is too large")));
+	pagestore_publish_manifest(target_dir, "pagestore_reader.manifest", "reader",
+						   manifest, manifest_len);
 }
 
 static char *
-pagestore_read_branch_manifest(const char *target_dir)
+pagestore_read_manifest(const char *target_dir, const char *filename,
+						const char *kind)
 {
 	char		path[MAXPGPATH];
 	FILE	   *file;
@@ -4849,12 +4904,12 @@ pagestore_read_branch_manifest(const char *target_dir)
 	size_t		nread;
 	long		manifest_size;
 
-	if (strlen(target_dir) + sizeof("/pagestore_branch.manifest") > MAXPGPATH)
+	if (strlen(target_dir) + strlen(filename) + sizeof("/") > MAXPGPATH)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("branch target directory path is too long")));
+				 errmsg("%s target directory path is too long", kind)));
 
-	snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir);
+	snprintf(path, sizeof(path), "%s/%s", target_dir, filename);
 	file = AllocateFile(path, PG_BINARY_R);
 	if (file == NULL)
 	{
@@ -4865,48 +4920,48 @@ pagestore_read_branch_manifest(const char *target_dir)
 		}
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not open branch manifest \"%s\": %m", path)));
+				 errmsg("could not open %s manifest \"%s\": %m", kind, path)));
 	}
 	if (fseek(file, 0L, SEEK_END) != 0)
 	{
 		FreeFile(file);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read branch manifest \"%s\": %m", path)));
+				 errmsg("could not read %s manifest \"%s\": %m", kind, path)));
 	}
 	manifest_size = ftell(file);
-	if (manifest_size < 0 || manifest_size > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+	if (manifest_size < 0 || manifest_size > PAGESTORE_MANIFEST_MAXLEN)
 	{
 		FreeFile(file);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("branch manifest \"%s\" is too large", path)));
+				 errmsg("%s manifest \"%s\" is too large", kind, path)));
 	}
 	if (fseek(file, 0L, SEEK_SET) != 0)
 	{
 		FreeFile(file);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read branch manifest \"%s\": %m", path)));
+				 errmsg("could not read %s manifest \"%s\": %m", kind, path)));
 	}
 
 	initStringInfo(&buf);
 		while ((nread = fread(tmp, 1, sizeof(tmp), file)) > 0)
 		{
-			if (buf.len + nread > PAGESTORE_BRANCH_MANIFEST_MAXLEN)
+			if (buf.len + nread > PAGESTORE_MANIFEST_MAXLEN)
 			{
 			FreeFile(file);
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("branch manifest \"%s\" is too large", path)));
+					 errmsg("%s manifest \"%s\" is too large", kind, path)));
 			}
 			if (memchr(tmp, '\0', nread) != NULL)
 			{
 				FreeFile(file);
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						 errmsg("branch manifest \"%s\" contains embedded NUL bytes",
-								path)));
+					 errmsg("%s manifest \"%s\" contains embedded NUL bytes",
+							kind, path)));
 			}
 			appendBinaryStringInfo(&buf, tmp, nread);
 		}
@@ -4915,10 +4970,24 @@ pagestore_read_branch_manifest(const char *target_dir)
 		FreeFile(file);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read branch manifest \"%s\": %m", path)));
+				 errmsg("could not read %s manifest \"%s\": %m", kind, path)));
 	}
 	FreeFile(file);
 	return buf.data;
+}
+
+static char *
+pagestore_read_branch_manifest(const char *target_dir)
+{
+	return pagestore_read_manifest(target_dir, "pagestore_branch.manifest",
+							   "branch");
+}
+
+static char *
+pagestore_read_reader_manifest(const char *target_dir)
+{
+	return pagestore_read_manifest(target_dir, "pagestore_reader.manifest",
+							   "reader");
 }
 
 static const char *
@@ -5373,6 +5442,27 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 }
 
 static bool
+pagestore_reader_manifest_matches(const char *manifest, int32 timeline,
+								 XLogRecPtr read_lsn)
+{
+	char		buf[64];
+	int			len;
+
+	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
+		!pagestore_manifest_is_single_object(manifest) ||
+		!pagestore_manifest_has_uint_token(manifest, "format", 1) ||
+		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
+		!pagestore_manifest_has_uint_token(manifest, "timeline", timeline))
+		return false;
+	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(read_lsn));
+	if (len < 0 || len >= (int) sizeof(buf))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("reader manifest LSN token is too large")));
+	return pagestore_manifest_has_string_token(manifest, "read_lsn", buf);
+}
+
+static bool
 pagestore_manifest_has_line(const char *manifest, const char *line)
 {
 	return strstr(manifest, line) != NULL;
@@ -5681,13 +5771,36 @@ PG_RETURN_BOOL(pagestore_manifest_matches(manifest, new_tl, parent_tl,
 											  fork_lsn));
 }
 
+PG_FUNCTION_INFO_V1(pagestore_validate_reader_manifest);
+Datum
+pagestore_validate_reader_manifest(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		timeline = PG_GETARG_INT32(1);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(2);
+	char	   *manifest;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to validate a reader manifest")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to validate a reader manifest")));
+	manifest = pagestore_read_reader_manifest(target_dir);
+	PG_RETURN_BOOL(manifest != NULL &&
+				   pagestore_reader_manifest_matches(manifest, timeline, read_lsn));
+}
+
 static void
 pagestore_validate_datadir_branch_manifest(void)
 {
 	char	   *manifest;
+	char	   *reader_manifest;
 	uint32_t	new_tl;
 	uint32_t	parent_tl;
 	XLogRecPtr	fork_lsn;
+	uint64		read_lsn;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -5696,6 +5809,39 @@ pagestore_validate_datadir_branch_manifest(void)
 		return;
 
 	manifest = pagestore_read_branch_manifest(DataDir);
+	reader_manifest = pagestore_read_reader_manifest(DataDir);
+	read_lsn = pagestore_localsvc_read_lsn();
+	if (manifest != NULL && reader_manifest != NULL)
+		ereport(FATAL,
+				(errmsg("a data directory cannot contain both pagestore branch and reader manifests")));
+	if (reader_manifest != NULL)
+	{
+		ControlFileData *control;
+		bool		crc_ok;
+
+		if (!pagestore_branch_backend_active())
+			ereport(FATAL,
+					(errmsg("pagestore.backend must be \"localsvc\" to validate a reader manifest")));
+		if (read_lsn == 0)
+			ereport(FATAL,
+					(errmsg("pagestore_reader.manifest requires pagestore.read_lsn")));
+		if (!pagestore_reader_manifest_matches(reader_manifest,
+										 (int32) pagestore_localsvc_timeline(),
+										 (XLogRecPtr) read_lsn))
+			ereport(FATAL,
+					(errmsg("pagestore.read_lsn or timeline does not match pagestore_reader.manifest")));
+		control = get_controlfile(DataDir, &crc_ok);
+		if (!crc_ok || control->checkPointCopy.redo != (XLogRecPtr) read_lsn)
+			ereport(FATAL,
+					(errmsg("pg_control does not match pagestore_reader.manifest"),
+					 errdetail("The reader requires checkpoint redo %X/%08X.",
+							   LSN_FORMAT_ARGS((XLogRecPtr) read_lsn))));
+		pfree(control);
+		return;
+	}
+	if (read_lsn != 0)
+		ereport(FATAL,
+				(errmsg("pagestore.read_lsn requires pagestore_reader.manifest")));
 	if (manifest == NULL)
 	{
 		if (pagestore_localsvc_timeline() != 0)
@@ -5995,6 +6141,110 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/* Install an as-of local-state bundle without creating a store timeline. */
+PG_FUNCTION_INFO_V1(pagestore_install_prepared_reader);
+Datum
+pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
+{
+	char	   *prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int32		timeline = PG_GETARG_INT32(2);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(3);
+	char	   *manifest;
+	char	   *target_manifest;
+	char	   *branch_manifest;
+	char		path[MAXPGPATH];
+	uint32_t	branch_tl;
+	uint32_t	branch_parent;
+	XLogRecPtr	branch_lsn;
+	bool		commit_ts_required;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to install a prepared reader")));
+	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid reader timeline or read LSN")));
+	pagestore_require_disjoint_install_dirs(prepared_dir, target_dir);
+	manifest = pagestore_read_reader_manifest(prepared_dir);
+	if (manifest == NULL ||
+		!pagestore_reader_manifest_matches(manifest, timeline, read_lsn))
+		ereport(ERROR,
+				(errmsg("prepared reader manifest does not match the requested reader identity")));
+	if (!pagestore_manifest_get_commit_ts_required(manifest,
+											   &commit_ts_required))
+		ereport(ERROR,
+				(errmsg("prepared reader manifest has invalid commit-ts horizons")));
+	target_manifest = pagestore_read_reader_manifest(target_dir);
+	if (target_manifest != NULL &&
+		!pagestore_reader_manifest_matches(target_manifest, timeline, read_lsn))
+		ereport(ERROR,
+				(errmsg("target reader manifest does not match the requested reader identity")));
+	branch_manifest = pagestore_read_branch_manifest(target_dir);
+	if (branch_manifest != NULL)
+	{
+		if (!pagestore_manifest_get_branch_identity(branch_manifest, &branch_tl,
+												&branch_parent, &branch_lsn) ||
+			branch_tl != (uint32) timeline)
+			ereport(ERROR,
+					(errmsg("target branch manifest does not match the reader timeline")));
+		pagestore_localsvc_require_branch(branch_tl, branch_parent,
+									  (uint64) branch_lsn);
+	}
+
+	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
+	if (commit_ts_required)
+		pagestore_require_prepared_artifact(prepared_dir, "pg_commit_ts", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/offsets", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
+	pagestore_require_prepared_artifact(prepared_dir,
+									"pagestore_reader.manifest", false);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_xact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_commit_ts", commit_ts_required);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_multixact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pagestore_reader.manifest", true);
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create reader dir \"%s\": %m", target_dir)));
+	if (snprintf(path, sizeof(path), "%s/pagestore_reader.manifest", target_dir) >=
+		(int) sizeof(path))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader install path is too long")));
+	if (access(path, F_OK) == 0 && unlink(path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear existing reader manifest \"%s\": %m", path)));
+	if (snprintf(path, sizeof(path), "%s/pagestore_branch.manifest", target_dir) >=
+		(int) sizeof(path))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader install path is too long")));
+	if (access(path, F_OK) == 0 && unlink(path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove target branch manifest \"%s\": %m", path)));
+	fsync_fname(target_dir, true);
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_xact", true);
+	if (commit_ts_required)
+		pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_commit_ts", true);
+	else
+		pagestore_install_empty_dir(target_dir, "pg_commit_ts");
+	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
+	pagestore_install_prepared_file(prepared_dir, target_dir,
+								   "pagestore_reader.manifest", true);
+	PG_RETURN_VOID();
+}
+
 /*
  * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
  *                          base pg_lsn, target pg_lsn,
@@ -6124,6 +6374,79 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 									oldest_member, next_member,
 									seeded);
 
+	PG_RETURN_INT64(seeded);
+}
+
+/*
+ * Materialize local SLRUs for a pinned compute at a checkpoint redo without
+ * forking the store timeline.  pg_control is restored separately, before
+ * server startup, by pagestore_control_restore -- shared_preload_libraries is
+ * too late to replace it safely.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_reader);
+Datum
+pagestore_prepare_reader(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		timeline = PG_GETARG_INT32(1);
+	XLogRecPtr	base = PG_GETARG_LSN(2);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(3);
+	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(4);
+	TransactionId next_xid = PG_GETARG_TRANSACTIONID(5);
+	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(6);
+	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
+	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(8);
+	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(9);
+	int64		oldest_member = PG_GETARG_INT64(10);
+	int64		next_member = PG_GETARG_INT64(11);
+	ControlFileData control;
+	char		manifest_path[MAXPGPATH];
+	int			pathlen;
+	int64		seeded;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to prepare a reader")));
+	if (timeline < 0 || (uint32) timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("reader timeline %d is not the active localsvc timeline %u",
+						timeline, pagestore_localsvc_timeline())));
+	if (read_lsn < base || XLogRecPtrIsInvalid(read_lsn))
+		ereport(ERROR,
+				(errmsg("reader LSN is invalid or precedes the base cutoff")));
+	if (!ps_control_asof(read_lsn, &control) ||
+		control.checkPointCopy.redo != read_lsn)
+		ereport(ERROR,
+				(errmsg("reader LSN is not a durably mirrored checkpoint redo"),
+				 errdetail("Requested reader LSN is %X/%08X.",
+						   LSN_FORMAT_ARGS(read_lsn))));
+
+	ps_commit_ts_normalize_horizons(read_lsn, next_xid,
+								&oldest_commit_ts_xid,
+								&next_commit_ts_xid);
+	pathlen = snprintf(manifest_path, sizeof(manifest_path),
+					   "%s/pagestore_reader.manifest", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale reader manifest \"%s\": %m",
+						manifest_path)));
+	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, read_lsn,
+										  oldest_xid, next_xid,
+										  oldest_commit_ts_xid,
+										  next_commit_ts_xid,
+										  oldest_multi, next_multi,
+										  oldest_member, next_member);
+	pagestore_write_reader_manifest(target_dir, timeline, base, read_lsn,
+								oldest_xid, next_xid,
+								oldest_commit_ts_xid,
+								next_commit_ts_xid,
+								oldest_multi, next_multi,
+								oldest_member, next_member, seeded);
 	PG_RETURN_INT64(seeded);
 }
 
