@@ -254,10 +254,13 @@ extern XLogRecPtr GetXLogInsertRecPtr(void);
  * LSN so a branch cut at L can restore pg_control "as of L".  The hook may
  * run inside a critical section and must not error, block, or allocate
  * there; implementations chain any previously installed hook.
+ * checkpoint_completion is true only for the control write that publishes a
+ * locally completed checkpoint's new checkPoint/checkPointCopy.
  */
 struct ControlFileData;
 typedef void (*control_file_write_hook_type) (const struct ControlFileData *control,
-											  XLogRecPtr update_lsn);
+											  XLogRecPtr update_lsn,
+											  bool checkpoint_completion);
 extern PGDLLIMPORT control_file_write_hook_type control_file_write_hook;
 
 /*

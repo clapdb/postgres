@@ -726,7 +726,7 @@ static bool PerformRecoveryXLogAction(void);
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
-static void UpdateControlFile(XLogRecPtr update_lsn);
+static void UpdateControlFile(XLogRecPtr update_lsn, bool checkpoint_completion);
 static inline void CallControlFileFlushHook(void);
 static char *str_time(pg_time_t tnow, char *buf, size_t bufsize);
 
@@ -2780,7 +2780,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 		{
 			ControlFile->minRecoveryPoint = newMinRecoveryPoint;
 			ControlFile->minRecoveryPointTLI = newMinRecoveryPointTLI;
-			UpdateControlFile(newMinRecoveryPoint);
+			UpdateControlFile(newMinRecoveryPoint, false);
 			LocalMinRecoveryPoint = newMinRecoveryPoint;
 			LocalMinRecoveryPointTLI = newMinRecoveryPointTLI;
 
@@ -4665,16 +4665,19 @@ CallControlFileFlushHook(void)
  * write -- a checkpoint passes its completion record's end LSN, replay-time
  * updates pass the replayed record's end LSN, and state transitions with no
  * record of their own pass the position that makes them visible (see each
- * caller).  It exists solely for the write hook: an external mirror of
- * pg_control (contrib/pagestore) versions the mirrored image by it so a
- * branch cut at LSN L can restore the control image "as of L".  The hook
+ * caller).  checkpoint_completion distinguishes the one write that publishes
+ * a locally completed checkpoint from later writes that merely retain its
+ * checkPointCopy.  These arguments exist solely for the write hook: an
+ * external mirror of pg_control (contrib/pagestore) versions the mirrored
+ * image by update_lsn so a branch cut at LSN L can restore the control image
+ * "as of L".  The hook
  * runs after update_controlfile() has durably written the local file, may be
  * called inside a critical section, and therefore must not error, block, or
  * allocate there -- it can only record intent and ship later (see
  * PGCONTROL_ON_STORE_DESIGN.md).
  */
 static void
-UpdateControlFile(XLogRecPtr update_lsn)
+UpdateControlFile(XLogRecPtr update_lsn, bool checkpoint_completion)
 {
 	/*
 	 * Clamp the version to the image's own WAL requirement: an image whose
@@ -4692,7 +4695,8 @@ UpdateControlFile(XLogRecPtr update_lsn)
 	update_controlfile(DataDir, ControlFile, true);
 
 	if (control_file_write_hook)
-		(*control_file_write_hook) (ControlFile, update_lsn);
+		(*control_file_write_hook) (ControlFile, update_lsn,
+									checkpoint_completion);
 }
 
 /*
@@ -4825,7 +4829,7 @@ SetDataChecksumsOnInProgress(void)
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_ON;
-	UpdateControlFile(checksum_lsn);
+	UpdateControlFile(checksum_lsn, false);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_ON);
@@ -4916,7 +4920,7 @@ SetDataChecksumsOn(void)
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_VERSION;
-	UpdateControlFile(checksum_lsn);
+	UpdateControlFile(checksum_lsn, false);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_ON);
@@ -4997,7 +5001,7 @@ SetDataChecksumsOff(void)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->data_checksum_version = PG_DATA_CHECKSUM_INPROGRESS_OFF;
-		UpdateControlFile(checksum_lsn);
+		UpdateControlFile(checksum_lsn, false);
 		LWLockRelease(ControlFileLock);
 
 		barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_INPROGRESS_OFF);
@@ -5038,7 +5042,7 @@ SetDataChecksumsOff(void)
 
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->data_checksum_version = PG_DATA_CHECKSUM_OFF;
-	UpdateControlFile(checksum_lsn);
+	UpdateControlFile(checksum_lsn, false);
 	LWLockRelease(ControlFileLock);
 
 	barrier = EmitProcSignalBarrier(PROCSIGNAL_BARRIER_CHECKSUM_OFF);
@@ -6272,7 +6276,7 @@ StartupXLOG(void)
 
 			update_lsn = Max(update_lsn, ControlFile->checkPoint);
 			update_lsn = Max(update_lsn, ControlFile->minRecoveryPoint);
-			UpdateControlFile(update_lsn);
+			UpdateControlFile(update_lsn, false);
 		}
 
 		/*
@@ -6818,7 +6822,7 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile(promotion_lsn);
+	UpdateControlFile(promotion_lsn, false);
 	LWLockRelease(ControlFileLock);
 
 	/* ship the promotion image now that ControlFileLock is released */
@@ -6891,7 +6895,7 @@ SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI)
 	 */
 	updateMinRecoveryPoint = true;
 
-	UpdateControlFile(EndRecPtr);
+	UpdateControlFile(EndRecPtr, false);
 
 	/*
 	 * We update SharedRecoveryState while holding the lock on ControlFileLock
@@ -6933,7 +6937,7 @@ ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli)
 	ControlFile->backupStartPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndPoint = InvalidXLogRecPtr;
 	ControlFile->backupEndRequired = false;
-	UpdateControlFile(EndRecPtr);
+	UpdateControlFile(EndRecPtr, false);
 
 	LWLockRelease(ControlFileLock);
 
@@ -7642,7 +7646,7 @@ CreateCheckPoint(int flags)
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->state = DB_SHUTDOWNING;
 		/* no record of its own: version by the current insert position */
-		UpdateControlFile(GetXLogInsertRecPtr());
+		UpdateControlFile(GetXLogInsertRecPtr(), false);
 		LWLockRelease(ControlFileLock);
 	}
 
@@ -8010,7 +8014,7 @@ CreateCheckPoint(int flags)
 	 * between the record's start and end must not restore a control image
 	 * whose checkpoint record is not fully in the branch's WAL stream.
 	 */
-	UpdateControlFile(recptr);
+	UpdateControlFile(recptr, true);
 	LWLockRelease(ControlFileLock);
 
 	/*
@@ -8155,7 +8159,7 @@ CreateEndOfRecoveryRecord(void)
 	ControlFile->data_checksum_version = XLogCtl->data_checksum_version;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile(recptr);
+	UpdateControlFile(recptr, false);
 	LWLockRelease(ControlFileLock);
 
 	END_CRIT_SECTION();
@@ -8402,7 +8406,7 @@ CreateRestartPoint(int flags)
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 			ControlFile->state = DB_SHUTDOWNED_IN_RECOVERY;
 			/* no record of its own: version by the replay position */
-			UpdateControlFile(GetXLogReplayRecPtr(NULL));
+			UpdateControlFile(GetXLogReplayRecPtr(NULL), false);
 			LWLockRelease(ControlFileLock);
 
 			/* ship the image queued while ControlFileLock was held */
@@ -8515,7 +8519,7 @@ CreateRestartPoint(int flags)
 		 * restore it.
 		 */
 		UpdateControlFile(Max(lastCheckPointEndPtr,
-							  ControlFile->minRecoveryPoint));
+							  ControlFile->minRecoveryPoint), false);
 	}
 	LWLockRelease(ControlFileLock);
 
@@ -8965,7 +8969,7 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
-		UpdateControlFile(update_lsn);
+		UpdateControlFile(update_lsn, false);
 
 		LWLockRelease(ControlFileLock);
 
@@ -9181,7 +9185,7 @@ xlog_redo(XLogReaderState *record)
 		ControlFile->checkPointCopy.nextXid = checkPoint.nextXid;
 		ControlFile->data_checksum_version = checkPoint.dataChecksumState;
 
-		UpdateControlFile(record->EndRecPtr);
+		UpdateControlFile(record->EndRecPtr, false);
 		LWLockRelease(ControlFileLock);
 
 		/* ship the image queued while ControlFileLock was held */
@@ -9391,7 +9395,7 @@ xlog_redo(XLogReaderState *record)
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
 
-		UpdateControlFile(record->EndRecPtr);
+		UpdateControlFile(record->EndRecPtr, false);
 		LWLockRelease(ControlFileLock);
 
 		/* ship the image queued while ControlFileLock was held */
@@ -9507,7 +9511,7 @@ xlog2_redo(XLogReaderState *record)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->data_checksum_version = state.new_checksum_state;
-		UpdateControlFile(record->EndRecPtr);
+		UpdateControlFile(record->EndRecPtr, false);
 		LWLockRelease(ControlFileLock);
 
 		/* ship the image queued while ControlFileLock was held */

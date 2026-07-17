@@ -154,7 +154,10 @@ removed.
     store's control, both governed by this one durable horizon, so the crash window
     cannot strand a branch.
 - **Hook chaining.** Installing `control_file_write_hook` must save and call any
-  previously installed hook, so the seam composes with other extensions.
+  previously installed hook, so the seam composes with other extensions.  The
+  hook's `checkpoint_completion` flag is true only for the control write that
+  publishes a locally completed checkpoint; later control writes retaining the
+  same `checkPointCopy.redo` must not republish that redo's admission fence.
 
 ## Restore protocol (bootstrap before shared_preload)
 
