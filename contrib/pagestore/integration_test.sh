@@ -88,12 +88,14 @@ cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
+	[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
 	[ -n "${KEEPTMP:-}" ] && { echo "KEEPTMP: DATA=$DATA STORE=$STORE"; return 0; }
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${READERDATA:+$(dirname "$READERDATA")}" \
+		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}"
 	rm -f "/dev/shm$SHM"
 }
@@ -1153,11 +1155,18 @@ archive_mode = off
 port = $PORT2
 EOF
 # A pin without its matching artifact must fail closed at startup.
-mv "$READERDATA/pagestore_reader.manifest" "$READERDATA/pagestore_reader.manifest.saved"
-"$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+rm "$BADREADER/pagestore_reader.manifest"
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
-mv "$READERDATA/pagestore_reader.manifest.saved" "$READERDATA/pagestore_reader.manifest"
-"$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - prepared reader did not start"
+	tail -100 "$READERDATA/server.log" 2>/dev/null || true
+	exit 1
+fi
 PR="$BIN/psql -X -At -p $PORT2 -U postgres postgres"
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
