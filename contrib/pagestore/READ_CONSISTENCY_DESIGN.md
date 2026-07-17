@@ -170,14 +170,22 @@ reconstruction.
    `pagestore_reader.manifest` last.  `pagestore_control_restore --lsn R`
    installs the exact-R control image before startup.  A configured pin fails
    startup unless the manifest's timeline/read LSN and `pg_control` redo all
-   agree.
+   agree.  Prepared readers require `pagestore.route_all`: every non-temporary
+   relation must use the versioned store, including default/global tablespace
+   relations that would otherwise bypass the pin through local `md` files.  A
+   reader on a nonzero timeline also records that timeline's parent and fork
+   LSN in its manifest.  Prepare and install verify the ancestry against the
+   daemon, and startup re-verifies it after the target branch manifest has been
+   removed, so an undefined or reused timeline cannot silently lose its parent
+   history.
 
    The control plane still has to supply catalogs proven to be at R.  A
    quiesced datadir copy is sufficient only when no catalog-changing work can
    run between fixing redo and taking the copy; otherwise catalogs must be
    routed through the versioned store or restored from a recovery artifact at
-   R.  The reader manifest does not yet carry or validate that provenance, so
-   this increment is not the complete 1c boot contract.
+   R.  The reader manifest carries branch ancestry provenance, but does not yet
+   carry or validate this catalog-snapshot provenance, so this increment is not
+   the complete 1c boot contract.
 
    The remaining snapshot half must not consult newest status: wire
    the running-xacts snapshot (above) so tuples of xacts in flight at R
