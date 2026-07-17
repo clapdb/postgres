@@ -1170,7 +1170,7 @@ if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/n
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
-PR="$BIN/psql -X -At -p $PORT2 -U postgres postgres"
+PR="$BIN/psql -X -h 127.0.0.1 -At -p $PORT2 -U postgres postgres"
 if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	echo "FAIL - prepared reader did not accept connections"
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
