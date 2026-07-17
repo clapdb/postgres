@@ -4850,6 +4850,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 static void
 pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 								XLogRecPtr base, XLogRecPtr read_lsn,
+								uint32 parent_timeline,
+								XLogRecPtr fork_lsn,
 								TransactionId oldest_xid,
 								TransactionId next_xid,
 								TransactionId oldest_commit_ts_xid,
@@ -4860,13 +4862,28 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 								int64 seeded_pages)
 {
 	char		manifest[2048];
+	char		ancestry[128] = "";
 	int			manifest_len;
+	int			ancestry_len;
+
+	if (timeline > 0)
+	{
+		ancestry_len = snprintf(ancestry, sizeof(ancestry),
+								"  \"parent_timeline\": %u,\n"
+								"  \"fork_lsn\": \"%X/%08X\",\n",
+								parent_timeline, LSN_FORMAT_ARGS(fork_lsn));
+		if (ancestry_len < 0 || ancestry_len >= (int) sizeof(ancestry))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("reader ancestry is too large")));
+	}
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
 							"  \"format\": 1,\n"
 							"  \"kind\": \"pinned_reader\",\n"
 							"  \"timeline\": %d,\n"
+							"%s"
 							"  \"base_lsn\": \"%X/%08X\",\n"
 							"  \"read_lsn\": \"%X/%08X\",\n"
 							"  \"oldest_xid\": \"%u\",\n"
@@ -4879,7 +4896,7 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 							"  \"next_member\": \"%lld\",\n"
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
-							timeline, LSN_FORMAT_ARGS(base),
+							timeline, ancestry, LSN_FORMAT_ARGS(base),
 							LSN_FORMAT_ARGS(read_lsn), oldest_xid, next_xid,
 							oldest_commit_ts_xid, next_commit_ts_xid,
 							oldest_multi, next_multi,
@@ -5442,17 +5459,46 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 }
 
 static bool
+pagestore_reader_manifest_get_branch_identity(const char *manifest,
+											  uint32 *timeline,
+											  uint32 *parent_timeline,
+											  XLogRecPtr *fork_lsn)
+{
+	uint32		format;
+
+	return pagestore_manifest_is_single_object(manifest) &&
+		pagestore_manifest_get_uint_token(manifest, "format", &format) &&
+		format == 1 &&
+		pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") &&
+		pagestore_manifest_get_uint_token(manifest, "timeline", timeline) &&
+		*timeline != 0 &&
+		pagestore_manifest_get_uint_token(manifest, "parent_timeline",
+										 parent_timeline) &&
+		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+}
+
+static bool
 pagestore_reader_manifest_matches(const char *manifest, int32 timeline,
 								 XLogRecPtr read_lsn)
 {
 	char		buf[64];
 	int			len;
+	uint32		manifest_timeline;
+	uint32		parent_timeline;
+	XLogRecPtr	fork_lsn;
 
 	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
 		!pagestore_manifest_is_single_object(manifest) ||
 		!pagestore_manifest_has_uint_token(manifest, "format", 1) ||
 		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
 		!pagestore_manifest_has_uint_token(manifest, "timeline", timeline))
+		return false;
+	if (timeline > 0 &&
+		(!pagestore_reader_manifest_get_branch_identity(manifest,
+												  &manifest_timeline,
+												  &parent_timeline,
+												  &fork_lsn) ||
+		 manifest_timeline != (uint32) timeline))
 		return false;
 	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(read_lsn));
 	if (len < 0 || len >= (int) sizeof(buf))
@@ -5799,7 +5845,10 @@ pagestore_validate_datadir_branch_manifest(void)
 	char	   *reader_manifest;
 	uint32_t	new_tl;
 	uint32_t	parent_tl;
+	uint32		reader_tl;
+	uint32		reader_parent_tl;
 	XLogRecPtr	fork_lsn;
+	XLogRecPtr	reader_fork_lsn;
 	uint64		read_lsn;
 
 	if (prev_shmem_startup_hook)
@@ -5825,6 +5874,9 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (read_lsn == 0)
 			ereport(FATAL,
 					(errmsg("pagestore_reader.manifest requires pagestore.read_lsn")));
+		if (!pagestore_branch_routing_active())
+			ereport(FATAL,
+					(errmsg("pagestore.route_all must be enabled to use a reader manifest")));
 		if (!pagestore_reader_manifest_matches(reader_manifest,
 										 (int32) pagestore_localsvc_timeline(),
 										 (XLogRecPtr) read_lsn))
@@ -5837,6 +5889,19 @@ pagestore_validate_datadir_branch_manifest(void)
 					 errdetail("The reader requires checkpoint redo %X/%08X.",
 							   LSN_FORMAT_ARGS((XLogRecPtr) read_lsn))));
 		pfree(control);
+		if (pagestore_localsvc_timeline() != 0)
+		{
+			if (!pagestore_reader_manifest_get_branch_identity(reader_manifest,
+													  &reader_tl,
+													  &reader_parent_tl,
+													  &reader_fork_lsn))
+				ereport(FATAL,
+						(errmsg("invalid branch identity in pagestore reader manifest")));
+			pagestore_localsvc_require_branch_timeout(reader_tl,
+											  reader_parent_tl,
+											  (uint64) reader_fork_lsn, 5000);
+			pagestore_localsvc_detach();
+		}
 		return;
 	}
 	if (read_lsn != 0)
@@ -6156,7 +6221,13 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	char		path[MAXPGPATH];
 	uint32_t	branch_tl;
 	uint32_t	branch_parent;
+	uint32		reader_tl = 0;
+	uint32		reader_parent = 0;
+	uint32		target_reader_tl = 0;
+	uint32		target_reader_parent = 0;
 	XLogRecPtr	branch_lsn;
+	XLogRecPtr	reader_fork_lsn = InvalidXLogRecPtr;
+	XLogRecPtr	target_reader_fork_lsn = InvalidXLogRecPtr;
 	bool		commit_ts_required;
 
 	if (!superuser())
@@ -6173,6 +6244,12 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 		!pagestore_reader_manifest_matches(manifest, timeline, read_lsn))
 		ereport(ERROR,
 				(errmsg("prepared reader manifest does not match the requested reader identity")));
+	if (timeline > 0 &&
+		!pagestore_reader_manifest_get_branch_identity(manifest, &reader_tl,
+													 &reader_parent,
+													 &reader_fork_lsn))
+		ereport(ERROR,
+				(errmsg("prepared reader manifest has invalid branch identity")));
 	if (!pagestore_manifest_get_commit_ts_required(manifest,
 											   &commit_ts_required))
 		ereport(ERROR,
@@ -6182,17 +6259,30 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 		!pagestore_reader_manifest_matches(target_manifest, timeline, read_lsn))
 		ereport(ERROR,
 				(errmsg("target reader manifest does not match the requested reader identity")));
+	if (target_manifest != NULL && timeline > 0 &&
+		(!pagestore_reader_manifest_get_branch_identity(target_manifest,
+													   &target_reader_tl,
+													   &target_reader_parent,
+													   &target_reader_fork_lsn) ||
+		 target_reader_tl != reader_tl ||
+		 target_reader_parent != reader_parent ||
+		 target_reader_fork_lsn != reader_fork_lsn))
+		ereport(ERROR,
+				(errmsg("target reader manifest has a different branch identity")));
 	branch_manifest = pagestore_read_branch_manifest(target_dir);
 	if (branch_manifest != NULL)
 	{
 		if (!pagestore_manifest_get_branch_identity(branch_manifest, &branch_tl,
 												&branch_parent, &branch_lsn) ||
-			branch_tl != (uint32) timeline)
+			branch_tl != (uint32) timeline ||
+			(timeline > 0 &&
+			 (branch_parent != reader_parent || branch_lsn != reader_fork_lsn)))
 			ereport(ERROR,
-					(errmsg("target branch manifest does not match the reader timeline")));
-		pagestore_localsvc_require_branch(branch_tl, branch_parent,
-									  (uint64) branch_lsn);
+					(errmsg("target branch manifest does not match the reader branch identity")));
 	}
+	if (timeline > 0)
+		pagestore_localsvc_require_branch(reader_tl, reader_parent,
+									  (uint64) reader_fork_lsn);
 
 	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
 	if (commit_ts_required)
@@ -6400,7 +6490,11 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 	int64		oldest_member = PG_GETARG_INT64(10);
 	int64		next_member = PG_GETARG_INT64(11);
 	ControlFileData control;
+	char	   *branch_manifest = NULL;
 	char		manifest_path[MAXPGPATH];
+	uint32		branch_timeline = 0;
+	uint32		parent_timeline = 0;
+	XLogRecPtr	fork_lsn = InvalidXLogRecPtr;
 	int			pathlen;
 	int64		seeded;
 
@@ -6415,6 +6509,20 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 	if (read_lsn < base || XLogRecPtrIsInvalid(read_lsn))
 		ereport(ERROR,
 				(errmsg("reader LSN is invalid or precedes the base cutoff")));
+	if (timeline > 0)
+	{
+		branch_manifest = pagestore_read_branch_manifest(DataDir);
+		if (branch_manifest == NULL ||
+			!pagestore_manifest_get_branch_identity(branch_manifest,
+													   &branch_timeline,
+													   &parent_timeline,
+													   &fork_lsn) ||
+			branch_timeline != (uint32) timeline)
+			ereport(ERROR,
+					(errmsg("active branch manifest does not match the reader timeline")));
+		pagestore_localsvc_require_branch(branch_timeline, parent_timeline,
+										  (uint64) fork_lsn);
+	}
 	if (!ps_control_asof(read_lsn, &control) ||
 		control.checkPointCopy.redo != read_lsn)
 		ereport(ERROR,
@@ -6442,6 +6550,7 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 										  oldest_multi, next_multi,
 										  oldest_member, next_member);
 	pagestore_write_reader_manifest(target_dir, timeline, base, read_lsn,
+								parent_timeline, fork_lsn,
 								oldest_xid, next_xid,
 								oldest_commit_ts_xid,
 								next_commit_ts_xid,
