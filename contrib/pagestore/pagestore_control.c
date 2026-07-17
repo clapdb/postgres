@@ -21,8 +21,10 @@
  * restore the earlier image, not the coalesced latest.
  *
  * Checkpoint admission fencing is split at the same safety boundary.  The
- * write hook atomically publishes a shared gate but never waits; daemon workers
- * then defer new relation mutations at or below that checkpoint's redo.  The
+ * checkpoint-completion write hook atomically publishes a shared gate but
+ * never waits; later control writes that merely retain the same checkpoint do
+ * not.  Daemon workers then defer new relation mutations at or below that
+ * checkpoint's redo.  The
  * post-critical drain takes an exclusive daemon admission barrier, writes the
  * exact redo-to-sequence marker, syncs it, and only then releases the gate.
  * Thus deferred control I/O cannot admit a later same-LSN relation version into
@@ -266,6 +268,24 @@ ps_control_drain(void)
 			memset(page, 0, sizeof(page));
 			memcpy(page, &p->image, sizeof(ControlFileData));
 
+			/*
+			 * A pinned reader is named by checkpoint redo R, while the normal
+			 * control history is ordered by the checkpoint record end.  Publish
+			 * the image at exact R as well, so bootstrap can restore the control
+			 * state corresponding to its read horizon even after later
+			 * checkpoints have advanced the writer.  The record-end copy below
+			 * remains the newest-wins control history used by writers.
+			 */
+			if (p->fence_token != 0)
+			{
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 0, page,
+					(uint64) p->image.checkPointCopy.redo, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+			}
+
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
@@ -379,10 +399,11 @@ ps_control_drain(void)
  */
 static void
 ps_control_write_hook(const struct ControlFileData *control,
-					  XLogRecPtr update_lsn)
+					  XLogRecPtr update_lsn, bool checkpoint_completion)
 {
 	if (prev_control_file_write_hook)
-		(*prev_control_file_write_hook) (control, update_lsn);
+		(*prev_control_file_write_hook) (control, update_lsn,
+									 checkpoint_completion);
 
 	if (!ps_control_mirror_enabled)
 		return;
@@ -419,7 +440,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 				pagestore_localsvc_admission_fence_end(q->fence_token);
 				memcpy(&q->image, control, sizeof(ControlFileData));
 				q->fence_token = 0;
-				if (!XLogRecPtrIsInvalid(control->checkPointCopy.redo))
+				if (checkpoint_completion)
 					(void) pagestore_localsvc_admission_fence_begin(
 						(uint64) control->checkPointCopy.redo, &q->fence_token);
 			}
@@ -461,7 +482,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
 		ps_control_queue[slot].update_lsn = update_lsn;
 		ps_control_queue[slot].fence_token = 0;
-		if (!XLogRecPtrIsInvalid(control->checkPointCopy.redo))
+		if (checkpoint_completion)
 			(void) pagestore_localsvc_admission_fence_begin(
 				(uint64) control->checkPointCopy.redo,
 				&ps_control_queue[slot].fence_token);
