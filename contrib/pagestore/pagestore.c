@@ -64,9 +64,11 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "walredo_client.h"
@@ -82,6 +84,7 @@ static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -4715,9 +4718,9 @@ pagestore_seed_branch_slrus(PG_FUNCTION_ARGS)
 #define PAGESTORE_MANIFEST_MAXLEN 8192
 
 static void
-pagestore_publish_manifest(const char *target_dir, const char *filename,
-						   const char *kind, const char *manifest,
-						   int manifest_len)
+pagestore_publish_artifact(const char *target_dir, const char *filename,
+						   const char *kind, const char *contents,
+						   int contents_len)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -4738,7 +4741,7 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 	if (access(tmppath, F_OK) == 0 && unlink(tmppath) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not clear stale %s manifest temp file \"%s\": %m",
+				 errmsg("could not clear stale %s temp file \"%s\": %m",
 						kind, tmppath)));
 	fd = OpenTransientFilePerm(tmppath,
 						   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
@@ -4746,14 +4749,14 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not create %s manifest \"%s\": %m", kind,
+				 errmsg("could not create %s \"%s\": %m", kind,
 						tmppath)));
-	while (done < manifest_len)
+	while (done < contents_len)
 	{
 		ssize_t		written;
 
 		errno = 0;
-		written = write(fd, manifest + done, manifest_len - done);
+		written = write(fd, contents + done, contents_len - done);
 		if (written <= 0)
 		{
 			if (written == 0)
@@ -4762,7 +4765,7 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 			(void) unlink(tmppath);
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not write %s manifest \"%s\": %m", kind,
+					 errmsg("could not write %s \"%s\": %m", kind,
 							tmppath)));
 		}
 		done += written;
@@ -4773,7 +4776,7 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 		(void) unlink(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not fsync %s manifest \"%s\": %m", kind,
+				 errmsg("could not fsync %s \"%s\": %m", kind,
 						tmppath)));
 	}
 	if (CloseTransientFile(fd) != 0)
@@ -4781,7 +4784,7 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 		(void) unlink(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not close %s manifest \"%s\": %m", kind,
+				 errmsg("could not close %s \"%s\": %m", kind,
 						tmppath)));
 	}
 	if (durable_rename(tmppath, path, LOG) != 0)
@@ -4790,9 +4793,286 @@ pagestore_publish_manifest(const char *target_dir, const char *filename,
 		(void) unlink(path);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not durably publish %s manifest \"%s\"", kind,
+				 errmsg("could not durably publish %s \"%s\"", kind,
 						path)));
 	}
+}
+
+#define PAGESTORE_READER_SNAPSHOT_MAGIC UINT32_C(0x50535253)
+#define PAGESTORE_READER_SNAPSHOT_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
+
+typedef struct PagestoreReaderSnapshotHeader
+{
+	uint64		read_lsn;
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		count;
+	TransactionId xmin;
+	TransactionId xmax;
+	pg_crc32c	crc;
+	uint32		reserved;
+} PagestoreReaderSnapshotHeader;
+
+typedef struct PagestoreReaderSnapshot
+{
+	PagestoreReaderSnapshotHeader header;
+	TransactionId *xids;
+} PagestoreReaderSnapshot;
+
+static bool
+pagestore_pread_exact(int fd, void *buf, Size size, off_t offset)
+{
+	Size		done = 0;
+
+	while (done < size)
+	{
+		ssize_t		got;
+
+		errno = 0;
+		got = pread(fd, (char *) buf + done, size - done, offset + done);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			return false;
+		done += got;
+	}
+	return true;
+}
+
+static void
+pagestore_reader_snapshot_crc(PagestoreReaderSnapshotHeader *header,
+							  const TransactionId *xids)
+{
+	INIT_CRC32C(header->crc);
+	COMP_CRC32C(header->crc, header,
+				offsetof(PagestoreReaderSnapshotHeader, crc));
+	if (header->count > 0)
+		COMP_CRC32C(header->crc, xids,
+					header->count * sizeof(TransactionId));
+	FIN_CRC32C(header->crc);
+}
+
+static void
+pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
+								XLogRecPtr read_lsn,
+								TransactionId oldest_xid,
+								TransactionId next_xid)
+{
+	PagestoreReaderSnapshotHeader header;
+	TransactionId *xids;
+	char		slru_dir[MAXPGPATH];
+	char		segpath[MAXPGPATH];
+	char		page[BLCKSZ];
+	char	   *artifact;
+	int			max_count = GetMaxSnapshotSubxidCount();
+	int			count = 0;
+	int			fd = -1;
+	int64		loaded_page = -1;
+	int64		loaded_seg = -1;
+	int			len;
+
+	if (TransactionIdFollows(oldest_xid, next_xid))
+		ereport(ERROR,
+				(errmsg("reader XID horizon spans wraparound")));
+	xids = palloc_array(TransactionId, max_count);
+	len = snprintf(slru_dir, sizeof(slru_dir), "%s/pg_xact", target_dir);
+	PS_CHECK_PATH_FORMAT(len, slru_dir);
+
+	for (uint64 xid64 = oldest_xid; xid64 < (uint64) next_xid; xid64++)
+	{
+		TransactionId xid = (TransactionId) xid64;
+		int64		pageno = xid64 / PS_CLOG_XACTS_PER_PAGE;
+		int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
+		int			pgidx;
+		int			status;
+
+		if (pageno != loaded_page)
+		{
+			if (segno != loaded_seg)
+			{
+				if (fd >= 0)
+					CloseTransientFile(fd);
+				len = ps_slru_seg_path(segpath, sizeof(segpath), slru_dir,
+									segno, false);
+				PS_CHECK_PATH_FORMAT(len, segpath);
+				fd = OpenTransientFile(segpath, O_RDONLY | PG_BINARY);
+				if (fd < 0)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not open reader pg_xact segment \"%s\": %m",
+									segpath)));
+				loaded_seg = segno;
+			}
+			if (!pagestore_pread_exact(fd, page, BLCKSZ,
+									 (pageno % SLRU_PAGES_PER_SEGMENT) * BLCKSZ))
+			{
+				if (errno == 0)
+					errno = EIO;
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read reader pg_xact page from \"%s\": %m",
+								segpath)));
+			}
+			loaded_page = pageno;
+		}
+
+		pgidx = xid % PS_CLOG_XACTS_PER_PAGE;
+		status = (((unsigned char *) page)[pgidx / PS_CLOG_XACTS_PER_BYTE] >>
+				  ((pgidx % PS_CLOG_XACTS_PER_BYTE) * PS_CLOG_BITS_PER_XACT)) &
+			PS_CLOG_XACT_BITMASK;
+		if (status == TRANSACTION_STATUS_IN_PROGRESS ||
+			status == TRANSACTION_STATUS_SUB_COMMITTED)
+		{
+			if (count >= max_count)
+			{
+				if (fd >= 0)
+					CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("reader snapshot has too many running transactions"),
+						 errdetail("The limit is %d transaction IDs.", max_count)));
+			}
+			xids[count++] = xid;
+		}
+	}
+	if (fd >= 0)
+		CloseTransientFile(fd);
+
+	memset(&header, 0, sizeof(header));
+	header.read_lsn = read_lsn;
+	header.magic = PAGESTORE_READER_SNAPSHOT_MAGIC;
+	header.format = PAGESTORE_READER_SNAPSHOT_FORMAT;
+	header.timeline = timeline;
+	header.count = count;
+	header.xmin = count > 0 ? xids[0] : next_xid;
+	header.xmax = next_xid;
+	pagestore_reader_snapshot_crc(&header, xids);
+
+	artifact = palloc(sizeof(header) + count * sizeof(TransactionId));
+	memcpy(artifact, &header, sizeof(header));
+	if (count > 0)
+		memcpy(artifact + sizeof(header), xids,
+			   count * sizeof(TransactionId));
+	pagestore_publish_artifact(target_dir, PAGESTORE_READER_SNAPSHOT_FILE,
+						   "reader snapshot", artifact,
+						   sizeof(header) + count * sizeof(TransactionId));
+	pfree(artifact);
+	pfree(xids);
+}
+
+static PagestoreReaderSnapshot *
+pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
+							   XLogRecPtr read_lsn, MemoryContext context,
+							   int elevel)
+{
+	PagestoreReaderSnapshotHeader header;
+	PagestoreReaderSnapshotHeader checked;
+	PagestoreReaderSnapshot *snapshot;
+	char		path[MAXPGPATH];
+	struct stat st;
+	int			fd;
+	int			len;
+	Size		xids_size;
+
+	len = snprintf(path, sizeof(path), "%s/%s", dir,
+				   PAGESTORE_READER_SNAPSHOT_FILE);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not open reader snapshot \"%s\": %m", path)));
+	if (fstat(fd, &st) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not stat reader snapshot \"%s\": %m", path)));
+	}
+	if (!pagestore_pread_exact(fd, &header, sizeof(header), 0) ||
+		header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		header.reserved != 0 ||
+		header.timeline != timeline || header.read_lsn != read_lsn ||
+		header.count > (uint32) GetMaxSnapshotSubxidCount() ||
+		!TransactionIdIsNormal(header.xmin) ||
+		!TransactionIdIsNormal(header.xmax) ||
+		TransactionIdPrecedes(header.xmax, header.xmin))
+	{
+		CloseTransientFile(fd);
+		ereport(elevel,
+				(errmsg("reader snapshot \"%s\" has an invalid identity or header",
+						path)));
+	}
+	xids_size = header.count * sizeof(TransactionId);
+	if (st.st_size != (off_t) (sizeof(header) + xids_size))
+	{
+		CloseTransientFile(fd);
+		ereport(elevel,
+				(errmsg("reader snapshot \"%s\" has an invalid size", path)));
+	}
+	snapshot = MemoryContextAlloc(context, sizeof(*snapshot));
+	snapshot->header = header;
+	snapshot->xids = header.count > 0 ?
+		MemoryContextAlloc(context, xids_size) : NULL;
+	if (xids_size > 0)
+	{
+		if (!pagestore_pread_exact(fd, snapshot->xids, xids_size,
+								   sizeof(header)))
+		{
+			CloseTransientFile(fd);
+			ereport(elevel,
+					(errmsg("could not read reader snapshot \"%s\"", path)));
+		}
+	}
+	CloseTransientFile(fd);
+	checked = header;
+	pagestore_reader_snapshot_crc(&checked, snapshot->xids);
+	if (!EQ_CRC32C(checked.crc, header.crc))
+		ereport(elevel,
+				(errmsg("reader snapshot \"%s\" has an invalid checksum", path)));
+	for (uint32 i = 0; i < header.count; i++)
+	{
+		if (!TransactionIdIsNormal(snapshot->xids[i]) ||
+			TransactionIdPrecedes(snapshot->xids[i], header.xmin) ||
+			!TransactionIdPrecedes(snapshot->xids[i], header.xmax) ||
+			(i > 0 && !TransactionIdPrecedes(snapshot->xids[i - 1],
+										 snapshot->xids[i])))
+			ereport(elevel,
+					(errmsg("reader snapshot \"%s\" has invalid transaction IDs",
+							path)));
+	}
+	return snapshot;
+}
+
+static PagestoreReaderSnapshot *pagestore_fixed_snapshot = NULL;
+
+static bool
+pagestore_get_snapshot_data(Snapshot snapshot)
+{
+	uint64		read_lsn = pagestore_localsvc_read_lsn();
+
+	if (read_lsn == 0)
+		return prev_get_snapshot_data_hook != NULL &&
+			prev_get_snapshot_data_hook(snapshot);
+	if (pagestore_fixed_snapshot == NULL)
+		pagestore_fixed_snapshot = pagestore_load_reader_snapshot(DataDir,
+			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
+			TopMemoryContext, ERROR);
+
+	snapshot->xmin = pagestore_fixed_snapshot->header.xmin;
+	snapshot->xmax = pagestore_fixed_snapshot->header.xmax;
+	snapshot->xcnt = 0;
+	snapshot->subxcnt = pagestore_fixed_snapshot->header.count;
+	snapshot->suboverflowed = false;
+	snapshot->takenDuringRecovery = true;
+	if (snapshot->subxcnt > 0)
+		memcpy(snapshot->subxip, pagestore_fixed_snapshot->xids,
+			   snapshot->subxcnt * sizeof(TransactionId));
+	return true;
 }
 
 static void
@@ -4843,8 +5123,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("branch manifest is too large")));
 
-	pagestore_publish_manifest(target_dir, "pagestore_branch.manifest", "branch",
-						   manifest, manifest_len);
+	pagestore_publish_artifact(target_dir, "pagestore_branch.manifest",
+						   "branch manifest", manifest, manifest_len);
 }
 
 static void
@@ -4906,8 +5186,8 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("reader manifest is too large")));
-	pagestore_publish_manifest(target_dir, "pagestore_reader.manifest", "reader",
-						   manifest, manifest_len);
+	pagestore_publish_artifact(target_dir, "pagestore_reader.manifest",
+						   "reader manifest", manifest, manifest_len);
 }
 
 static char *
@@ -5866,6 +6146,7 @@ pagestore_validate_datadir_branch_manifest(void)
 	if (reader_manifest != NULL)
 	{
 		ControlFileData *control;
+		PagestoreReaderSnapshot *reader_snapshot;
 		bool		crc_ok;
 
 		if (!pagestore_branch_backend_active())
@@ -5902,6 +6183,12 @@ pagestore_validate_datadir_branch_manifest(void)
 											  (uint64) reader_fork_lsn, 5000);
 			pagestore_localsvc_detach();
 		}
+		reader_snapshot = pagestore_load_reader_snapshot(DataDir,
+			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
+			TopMemoryContext, FATAL);
+		if (reader_snapshot->xids != NULL)
+			pfree(reader_snapshot->xids);
+		pfree(reader_snapshot);
 		return;
 	}
 	if (read_lsn != 0)
@@ -6228,6 +6515,7 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	XLogRecPtr	branch_lsn;
 	XLogRecPtr	reader_fork_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	target_reader_fork_lsn = InvalidXLogRecPtr;
+	PagestoreReaderSnapshot *prepared_snapshot;
 	bool		commit_ts_required;
 
 	if (!superuser())
@@ -6244,6 +6532,8 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 		!pagestore_reader_manifest_matches(manifest, timeline, read_lsn))
 		ereport(ERROR,
 				(errmsg("prepared reader manifest does not match the requested reader identity")));
+	prepared_snapshot = pagestore_load_reader_snapshot(prepared_dir,
+		(uint32) timeline, read_lsn, CurrentMemoryContext, ERROR);
 	if (timeline > 0 &&
 		!pagestore_reader_manifest_get_branch_identity(manifest, &reader_tl,
 													 &reader_parent,
@@ -6292,6 +6582,8 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
 	pagestore_require_prepared_artifact(prepared_dir,
 									"pagestore_reader.manifest", false);
+	pagestore_require_prepared_artifact(prepared_dir,
+									PAGESTORE_READER_SNAPSHOT_FILE, false);
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
 										  "pg_xact", true);
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
@@ -6300,6 +6592,8 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 										  "pg_multixact", true);
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
 										  "pagestore_reader.manifest", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  PAGESTORE_READER_SNAPSHOT_FILE, true);
 
 	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
 		ereport(ERROR,
@@ -6331,7 +6625,12 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 		pagestore_install_empty_dir(target_dir, "pg_commit_ts");
 	pagestore_install_prepared_dir(prepared_dir, target_dir, "pg_multixact", true);
 	pagestore_install_prepared_file(prepared_dir, target_dir,
+								   PAGESTORE_READER_SNAPSHOT_FILE, true);
+	pagestore_install_prepared_file(prepared_dir, target_dir,
 								   "pagestore_reader.manifest", true);
+	if (prepared_snapshot->xids != NULL)
+		pfree(prepared_snapshot->xids);
+	pfree(prepared_snapshot);
 	PG_RETURN_VOID();
 }
 
@@ -6541,14 +6840,26 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 	else if (errno != ENOENT)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not remove stale reader manifest \"%s\": %m",
-						manifest_path)));
+					 errmsg("could not remove stale reader manifest \"%s\": %m",
+							manifest_path)));
+	pathlen = snprintf(manifest_path, sizeof(manifest_path), "%s/%s",
+					   target_dir, PAGESTORE_READER_SNAPSHOT_FILE);
+	PS_CHECK_PATH_FORMAT(pathlen, manifest_path);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale reader snapshot \"%s\": %m",
+							manifest_path)));
 	seeded = pagestore_seed_branch_slrus_impl(target_dir, base, read_lsn,
 										  oldest_xid, next_xid,
 										  oldest_commit_ts_xid,
 										  next_commit_ts_xid,
 										  oldest_multi, next_multi,
 										  oldest_member, next_member);
+	pagestore_write_reader_snapshot(target_dir, (uint32) timeline, read_lsn,
+								oldest_xid, next_xid);
 	pagestore_write_reader_manifest(target_dir, timeline, base, read_lsn,
 								parent_timeline, fork_lsn,
 								oldest_xid, next_xid,
@@ -6644,6 +6955,8 @@ _PG_init(void)
 	/* register our smgr implementation and claim relations via the hook */
 	pagestore_smgr_which = smgr_register(&pagestore_smgr);
 	smgr_which_hook = pagestore_which;
+	prev_get_snapshot_data_hook = get_snapshot_data_hook;
+	get_snapshot_data_hook = pagestore_get_snapshot_data;
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;
