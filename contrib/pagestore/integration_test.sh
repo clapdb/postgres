@@ -1116,6 +1116,7 @@ echo "max_prepared_transactions = 10" >> "$DATA/postgresql.conf"
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
        INSERT INTO reader_t VALUES (1, 'v1');
 	   CREATE TABLE reader_running(id int primary key) TABLESPACE ts;
+	   CREATE TABLE reader_subxid(i int) TABLESPACE ts;
        CREATE SEQUENCE reader_seq;
        CREATE UNLOGGED TABLE reader_unlogged(i int) TABLESPACE ts;
        INSERT INTO reader_unlogged VALUES (1), (2);" >/dev/null
@@ -1125,10 +1126,20 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn) RETURNS bool
          AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;" >/dev/null
-# A prepared XID remains in progress across the stopped copy at R.  The writer
-# commits it only after the copy, so the reader has no post-R relation WAL to
-# replay during startup.
-$P -c "BEGIN; INSERT INTO reader_running VALUES (1); PREPARE TRANSACTION 'reader_running_at_r';" >/dev/null
+# A prepared XID remains in progress across the stopped copy at R.  Its 10000
+# released subtransactions exceed the normal snapshot subxid capacity; the
+# writer commits it only after the copy, so the reader has no post-R relation
+# WAL to replay during startup.
+READER_SUBXID_SQL=$(mktemp)
+{
+	printf 'BEGIN; INSERT INTO reader_running VALUES (1);\n'
+	for _ in $(seq 1 10000); do
+		printf 'SAVEPOINT s; INSERT INTO reader_subxid VALUES (1); RELEASE SAVEPOINT s;\n'
+	done
+	printf "PREPARE TRANSACTION 'reader_running_at_r';\n"
+} > "$READER_SUBXID_SQL"
+$P -f "$READER_SUBXID_SQL" >/dev/null
+rm -f "$READER_SUBXID_SQL"
 $P -c "CHECKPOINT;" >/dev/null
 read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerOldestMulti readerCtsOldest readerCtsNext <<< "$($P -c "
 	SELECT redo_lsn || ' ' || split_part(next_xid, ':', 2) || ' ' || oldest_xid || ' ' ||
@@ -1149,6 +1160,15 @@ $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
 	"writer sees the prepared transaction committed after R"
 READERPREP=$(mktemp -d)
+BADREADERPREP=$(mktemp -d)
+bad_reader_horizon=$($P -c "SELECT pagestore_prepare_reader('$BADREADERPREP', 0, '$bc', '$readerR',
+	'$((readerOldest + 1))'::xid, '$readerNext'::xid,
+	'$readerCtsOldest'::xid, '$readerCtsNext'::xid,
+	'$readerOldestMulti'::xid, '$readerNextMulti'::xid,
+	0, $readerNextMember);" >/dev/null 2>&1 && echo ok || echo error)
+assert "$bad_reader_horizon" "error" \
+	"reader prepare rejects XID horizons that do not match checkpoint R"
+rm -rf "$BADREADERPREP"
 readerSeeded=$($P -c "SELECT pagestore_prepare_reader('$READERPREP', 0, '$bc', '$readerR',
 	'$readerOldest'::xid, '$readerNext'::xid,
 	'$readerCtsOldest'::xid, '$readerCtsNext'::xid,
@@ -1272,6 +1292,8 @@ assert "$reader_v" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
 assert "$($PR -c "SELECT count(*) FROM reader_running;")" "0" \
 	"pinned reader keeps a transaction that was running at R invisible after its commit"
+assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
+	"pinned reader keeps subtransactions beyond normal snapshot capacity invisible"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the

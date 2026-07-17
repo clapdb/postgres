@@ -43,8 +43,8 @@ extern int	GetMaxSnapshotSubxidCount(void);
 
 /*
  * Optional provider for a process-local fixed MVCC snapshot.  The xip and
- * subxip arrays are allocated before the hook is called; return true after
- * filling the snapshot fields and at most their advertised maximum sizes.
+ * subxip arrays are allocated before the hook is called.  A provider needing
+ * more storage is responsible for extending the arrays before returning true.
  */
 typedef bool (*get_snapshot_data_hook_type) (Snapshot snapshot);
 extern PGDLLIMPORT get_snapshot_data_hook_type get_snapshot_data_hook;
