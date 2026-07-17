@@ -1111,9 +1111,11 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
 echo "pagestore.route_all = on" >> "$DATA/postgresql.conf"
+echo "max_prepared_transactions = 10" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
        INSERT INTO reader_t VALUES (1, 'v1');
+	   CREATE TABLE reader_running(id int primary key) TABLESPACE ts;
        CREATE SEQUENCE reader_seq;
        CREATE UNLOGGED TABLE reader_unlogged(i int) TABLESPACE ts;
        INSERT INTO reader_unlogged VALUES (1), (2);" >/dev/null
@@ -1123,6 +1125,10 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn) RETURNS bool
          AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;" >/dev/null
+# A prepared XID remains in progress across the stopped copy at R.  The writer
+# commits it only after the copy, so the reader has no post-R relation WAL to
+# replay during startup.
+$P -c "BEGIN; INSERT INTO reader_running VALUES (1); PREPARE TRANSACTION 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerOldestMulti readerCtsOldest readerCtsNext <<< "$($P -c "
 	SELECT redo_lsn || ' ' || split_part(next_xid, ':', 2) || ' ' || oldest_xid || ' ' ||
@@ -1138,6 +1144,10 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 READERDATA=$(mktemp -d)/reader
 cp -a "$DATA" "$READERDATA"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
+$P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
+$P -c "CHECKPOINT;" >/dev/null
+assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
+	"writer sees the prepared transaction committed after R"
 READERPREP=$(mktemp -d)
 readerSeeded=$($P -c "SELECT pagestore_prepare_reader('$READERPREP', 0, '$bc', '$readerR',
 	'$readerOldest'::xid, '$readerNext'::xid,
@@ -1148,9 +1158,8 @@ assert "$([ "${readerSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"reader prepare materializes local SLRUs as of checkpoint R"
 assert "$($P -c "SELECT pagestore_validate_reader_manifest('$READERPREP', 0, '$readerR');")" "t" \
 	"reader manifest records the source timeline and read horizon"
-# A nonzero reader timeline must carry its branch ancestry after the target's
-# branch manifest is removed.  Installation verifies that identity against the
-# daemon, persists it in the reader manifest, and rejects a forged fork point.
+# A prepared snapshot is inseparable from its timeline and R identity.  A
+# rewritten manifest cannot reuse another timeline's running-XID snapshot.
 BRANCHREADERPREP=$(mktemp -d)
 cp -a "$READERPREP/." "$BRANCHREADERPREP"
 sed -i 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
@@ -1159,22 +1168,14 @@ sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$bL\"
 BRANCHREADERTARGET=$(mktemp -d)
 branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCHREADERPREP', '$BRANCHREADERTARGET', 1, '$readerR');" \
 	>/dev/null 2>&1 && echo ok || echo error)
-assert "$branch_reader_install" "ok" \
-	"reader install verifies and preserves a branch timeline's ancestry"
-assert "$(grep -Fxc "  \"fork_lsn\": \"$bL\"," "$BRANCHREADERTARGET/pagestore_reader.manifest")" "1" \
-	"installed reader manifest retains the branch fork identity"
-BADBRANCHREADERPREP=$(mktemp -d)
-cp -a "$BRANCHREADERPREP/." "$BADBRANCHREADERPREP"
-sed -i "s|\"fork_lsn\": \"$bL\"|\"fork_lsn\": \"$readerR\"|" \
-	"$BADBRANCHREADERPREP/pagestore_reader.manifest"
-BADBRANCHREADERTARGET=$(mktemp -d)
-bad_branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BADBRANCHREADERPREP', '$BADBRANCHREADERTARGET', 1, '$readerR');" \
-	>/dev/null 2>&1 && echo ok || echo error)
-assert "$bad_branch_reader_install" "error" \
-	"reader install rejects ancestry that disagrees with the daemon"
-rm -rf "$BRANCHREADERPREP" "$BRANCHREADERTARGET" "$BADBRANCHREADERPREP" \
-	"$BADBRANCHREADERTARGET"
+assert "$branch_reader_install" "error" \
+	"reader install rejects a snapshot from a different timeline"
+rm -rf "$BRANCHREADERPREP" "$BRANCHREADERTARGET"
 $P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0, '$readerR');" >/dev/null
+# Emulate local recovery having replayed the later commit: newest pg_xact says
+# committed, but the fixed running-XID snapshot must retain R's visibility.
+cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
+rm -f "$READERDATA/pg_twophase/"*
 if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn "$readerR" "$READERDATA" >/dev/null; then
 	echo "ok   - reader bootstrap restored pg_control at exact R"
 else
@@ -1196,6 +1197,26 @@ rm "$BADREADER/pagestore_reader.manifest"
 echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+# A manifest without its CRC-protected running-XID snapshot is incomplete.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+rm "$BADREADER/pagestore_reader.snapshot"
+echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_snapshot_started=1 || pin_snapshot_started=0
+assert "$pin_snapshot_started" "0" "pinned start without a running-XID snapshot is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+# Corruption is detected independently of the manifest identity checks.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+printf '\001' | dd of="$BADREADER/pagestore_reader.snapshot" bs=1 seek=0 conv=notrunc status=none
+echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_snapshot_crc_started=1 || pin_snapshot_crc_started=0
+assert "$pin_snapshot_crc_started" "0" "pinned start with a corrupt running-XID snapshot is refused"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
@@ -1243,8 +1264,14 @@ if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
-assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
+reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
+if [ "$reader_v" != "v1" ]; then
+	tail -100 "$READERDATA/server.log" 2>/dev/null || true
+fi
+assert "$reader_v" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
+assert "$($PR -c "SELECT count(*) FROM reader_running;")" "0" \
+	"pinned reader keeps a transaction that was running at R invisible after its commit"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the

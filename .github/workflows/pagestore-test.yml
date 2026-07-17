@@ -21,11 +21,13 @@ on:
       - 'src/backend/access/heap/visibilitymap.c'
       - 'src/backend/postmaster/walredo.c'
       - 'src/backend/storage/smgr/**'
+      - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
+      - 'src/include/storage/procarray.h'
       - '.github/workflows/pagestore-test.yml'
   pull_request:
     paths:
@@ -40,11 +42,13 @@ on:
       - 'src/backend/access/heap/visibilitymap.c'
       - 'src/backend/postmaster/walredo.c'
       - 'src/backend/storage/smgr/**'
+      - 'src/backend/storage/ipc/procarray.c'
       - 'src/backend/tcop/postgres.c'
       - 'src/include/access/xlog.h'
       - 'src/include/access/slru.h'
       - 'src/include/postmaster/walredo.h'
       - 'src/include/storage/smgr.h'
+      - 'src/include/storage/procarray.h'
       - '.github/workflows/pagestore-test.yml'
   workflow_dispatch:
 
