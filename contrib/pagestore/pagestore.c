@@ -4867,6 +4867,7 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 	char		page[BLCKSZ];
 	char	   *artifact;
 	int			max_count = GetMaxSnapshotSubxidCount();
+	int			capacity;
 	int			count = 0;
 	int			fd = -1;
 	int64		loaded_page = -1;
@@ -4876,7 +4877,12 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 	if (TransactionIdFollows(oldest_xid, next_xid))
 		ereport(ERROR,
 				(errmsg("reader XID horizon spans wraparound")));
-	xids = palloc_array(TransactionId, max_count);
+	capacity = Min(1024, max_count);
+	if (capacity > MaxAllocSize / sizeof(TransactionId))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("reader snapshot transaction ID capacity is too large")));
+	xids = palloc_array(TransactionId, capacity);
 	len = snprintf(slru_dir, sizeof(slru_dir), "%s/pg_xact", target_dir);
 	PS_CHECK_PATH_FORMAT(len, slru_dir);
 
@@ -4926,14 +4932,18 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 		if (status == TRANSACTION_STATUS_IN_PROGRESS ||
 			status == TRANSACTION_STATUS_SUB_COMMITTED)
 		{
-			if (count >= max_count)
+			if (count == capacity)
 			{
-				if (fd >= 0)
-					CloseTransientFile(fd);
-				ereport(ERROR,
-						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("reader snapshot has too many running transactions"),
-						 errdetail("The limit is %d transaction IDs.", max_count)));
+				if (capacity > MaxAllocSize / (2 * sizeof(TransactionId)))
+				{
+					if (fd >= 0)
+						CloseTransientFile(fd);
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("reader snapshot is too large to materialize")));
+				}
+				capacity *= 2;
+				xids = repalloc_array(xids, TransactionId, capacity);
 			}
 			xids[count++] = xid;
 		}
@@ -4997,7 +5007,7 @@ pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
 		header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
 		header.reserved != 0 ||
 		header.timeline != timeline || header.read_lsn != read_lsn ||
-		header.count > (uint32) GetMaxSnapshotSubxidCount() ||
+		header.count > MaxAllocSize / sizeof(TransactionId) ||
 		!TransactionIdIsNormal(header.xmin) ||
 		!TransactionIdIsNormal(header.xmax) ||
 		TransactionIdPrecedes(header.xmax, header.xmin))
@@ -5069,6 +5079,18 @@ pagestore_get_snapshot_data(Snapshot snapshot)
 	snapshot->subxcnt = pagestore_fixed_snapshot->header.count;
 	snapshot->suboverflowed = false;
 	snapshot->takenDuringRecovery = true;
+	if (snapshot->subxcnt > GetMaxSnapshotSubxidCount())
+	{
+		TransactionId *subxip;
+
+		subxip = realloc(snapshot->subxip,
+						 snapshot->subxcnt * sizeof(TransactionId));
+		if (subxip == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
+		snapshot->subxip = subxip;
+	}
 	if (snapshot->subxcnt > 0)
 		memcpy(snapshot->subxip, pagestore_fixed_snapshot->xids,
 			   snapshot->subxcnt * sizeof(TransactionId));
@@ -6826,8 +6848,16 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 		control.checkPointCopy.redo != read_lsn)
 		ereport(ERROR,
 				(errmsg("reader LSN is not a durably mirrored checkpoint redo"),
-				 errdetail("Requested reader LSN is %X/%08X.",
-						   LSN_FORMAT_ARGS(read_lsn))));
+					 errdetail("Requested reader LSN is %X/%08X.",
+							LSN_FORMAT_ARGS(read_lsn))));
+	if (oldest_xid != control.checkPointCopy.oldestXid ||
+		next_xid != XidFromFullTransactionId(control.checkPointCopy.nextXid))
+		ereport(ERROR,
+				(errmsg("reader XID horizons do not match the checkpoint at the requested reader LSN"),
+				 errdetail("Expected [%u, %u), got [%u, %u).",
+						control.checkPointCopy.oldestXid,
+						XidFromFullTransactionId(control.checkPointCopy.nextXid),
+						oldest_xid, next_xid)));
 
 	ps_commit_ts_normalize_horizons(read_lsn, next_xid,
 								&oldest_commit_ts_xid,

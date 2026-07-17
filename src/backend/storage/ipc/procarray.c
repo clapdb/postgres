@@ -2186,10 +2186,7 @@ GetSnapshotData(Snapshot snapshot)
 		if (!TransactionIdIsNormal(snapshot->xmin) ||
 			!TransactionIdIsNormal(snapshot->xmax) ||
 			TransactionIdPrecedes(snapshot->xmax, snapshot->xmin) ||
-			snapshot->xcnt < 0 ||
-			snapshot->xcnt > GetMaxSnapshotXidCount() ||
-			snapshot->subxcnt < 0 ||
-			snapshot->subxcnt > GetMaxSnapshotSubxidCount())
+			snapshot->xcnt < 0 || snapshot->subxcnt < 0)
 			ereport(ERROR,
 					(errmsg("snapshot data hook returned an invalid snapshot")));
 
