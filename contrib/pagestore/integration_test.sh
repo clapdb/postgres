@@ -32,6 +32,7 @@ SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
 SHM=/psint_$$
 PORT=54460
 PORT2=54461		# a second compute (a branch) booted on the same daemon (step 19)
+PORT3=54462		# isolated port for startup-refusal tests
 # connect over TCP: the server's unix-socket directory varies by build/distro,
 # but -A trust allows 127.0.0.1, so TCP is portable across environments (CI).
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
@@ -1158,8 +1159,10 @@ EOF
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
 rm "$BADREADER/pagestore_reader.manifest"
+echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
@@ -1168,6 +1171,11 @@ if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/n
 	exit 1
 fi
 PR="$BIN/psql -X -At -p $PORT2 -U postgres postgres"
+if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
+	echo "FAIL - prepared reader did not accept connections"
+	tail -100 "$READERDATA/server.log" 2>/dev/null || true
+	exit 1
+fi
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v1" \
 	"pinned reader serves the row as of R (an update checkpointed after R is invisible)"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
