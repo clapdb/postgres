@@ -1104,6 +1104,14 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # relation read at R (the redo of a durably mirrored checkpoint -- complete by
 # construction) and refuses store mutations.  History stays frozen: an update
 # checkpointed after R must not be visible to the pinned compute.
+# Move the writer to full routing before choosing R.  Import the quiesced local
+# default/global catalogs first; the following checkpoint puts both those
+# imported pages and the already-routed user-tablespace pages behind R's
+# admission fence.
+"$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
+"$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
+echo "pagestore.route_all = on" >> "$DATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
        INSERT INTO reader_t VALUES (1, 'v1');
        CREATE SEQUENCE reader_seq;
@@ -1140,6 +1148,32 @@ assert "$([ "${readerSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"reader prepare materializes local SLRUs as of checkpoint R"
 assert "$($P -c "SELECT pagestore_validate_reader_manifest('$READERPREP', 0, '$readerR');")" "t" \
 	"reader manifest records the source timeline and read horizon"
+# A nonzero reader timeline must carry its branch ancestry after the target's
+# branch manifest is removed.  Installation verifies that identity against the
+# daemon, persists it in the reader manifest, and rejects a forged fork point.
+BRANCHREADERPREP=$(mktemp -d)
+cp -a "$READERPREP/." "$BRANCHREADERPREP"
+sed -i 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
+sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$bL\"," \
+	"$BRANCHREADERPREP/pagestore_reader.manifest"
+BRANCHREADERTARGET=$(mktemp -d)
+branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCHREADERPREP', '$BRANCHREADERTARGET', 1, '$readerR');" \
+	>/dev/null 2>&1 && echo ok || echo error)
+assert "$branch_reader_install" "ok" \
+	"reader install verifies and preserves a branch timeline's ancestry"
+assert "$(grep -Fxc "  \"fork_lsn\": \"$bL\"," "$BRANCHREADERTARGET/pagestore_reader.manifest")" "1" \
+	"installed reader manifest retains the branch fork identity"
+BADBRANCHREADERPREP=$(mktemp -d)
+cp -a "$BRANCHREADERPREP/." "$BADBRANCHREADERPREP"
+sed -i "s|\"fork_lsn\": \"$bL\"|\"fork_lsn\": \"$readerR\"|" \
+	"$BADBRANCHREADERPREP/pagestore_reader.manifest"
+BADBRANCHREADERTARGET=$(mktemp -d)
+bad_branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BADBRANCHREADERPREP', '$BADBRANCHREADERTARGET', 1, '$readerR');" \
+	>/dev/null 2>&1 && echo ok || echo error)
+assert "$bad_branch_reader_install" "error" \
+	"reader install rejects ancestry that disagrees with the daemon"
+rm -rf "$BRANCHREADERPREP" "$BRANCHREADERTARGET" "$BADBRANCHREADERPREP" \
+	"$BADBRANCHREADERTARGET"
 $P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0, '$readerR');" >/dev/null
 if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn "$readerR" "$READERDATA" >/dev/null; then
 	echo "ok   - reader bootstrap restored pg_control at exact R"
@@ -1162,6 +1196,39 @@ rm "$BADREADER/pagestore_reader.manifest"
 echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+# A prepared reader must route default/global relations through the store too;
+# otherwise local md pages could expose state newer than the pin.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+pagestore.route_all = off
+port = $PORT3
+EOF
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_route_started=1 || pin_route_started=0
+assert "$pin_route_started" "0" "pinned start without full store routing is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+echo "pagestore.route_all = on" >> "$READERDATA/postgresql.conf"
+# Startup must revalidate persisted branch ancestry even though reader install
+# removed the target's branch manifest.  Timeline 1 exists, but not at this
+# forged fork point.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
+sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$readerR\"," \
+	"$BADREADER/pagestore_reader.manifest"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+pagestore.timeline = 1
+port = $PORT3
+EOF
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_branch_started=1 || pin_branch_started=0
+assert "$pin_branch_started" "0" "pinned branch reader rejects forged ancestry at startup"
+assert "$(grep -c 'daemon reported error' "$BADREADER/server.log" || true)" "1" \
+	"pinned branch startup checks ancestry with the daemon"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
