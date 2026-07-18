@@ -14,7 +14,7 @@
 {"op":"sql","id":"commit-inflight-xid","target":"writer","sql":"COMMIT PREPARED 'harness-inflight-xid'"}
 {"op":"assert","id":"writer-sees-after-r","target":"writer","oracle":"sql_scalar","sql":"SELECT v FROM writer_t WHERE id = 1","expect":"after-r"}
 {"op":"assert","id":"writer-sees-committed-xid","target":"writer","oracle":"sql_scalar","sql":"SELECT count(*) FROM writer_t WHERE id = 2","expect":"1"}
-{"op":"sql","id":"reader-write-rejected","target":"reader-R","sql":"UPDATE writer_t SET v = 'must-not-write' WHERE id = 1","expect_error":"not allowed on a pinned reader"}
-{"op":"sql","id":"reader-ddl-rejected","target":"reader-R","sql":"CREATE TABLE reader_must_not_exist(id int)","expect_error":"read-only"}
-{"op":"sql","id":"reader-nextval-rejected","target":"reader-R","sql":"SELECT nextval('writer_seq')","expect_error":"read-only"}
-{"op":"sql","id":"reader-checkpoint-rejected","target":"reader-R","sql":"CHECKPOINT","expect_error":"not allowed on a pinned reader"}
+{"op":"sql","id":"reader-write-rejected","target":"reader-R","sql":"UPDATE writer_t SET v = 'must-not-write' WHERE id = 1","expect_error":"not allowed on a pinned reader","expect_sqlstate":"25006"}
+{"op":"sql","id":"reader-ddl-rejected","target":"reader-R","sql":"CREATE TABLE reader_must_not_exist(id int)","expect_error":"read-only","expect_sqlstate":"25006"}
+{"op":"sql","id":"reader-nextval-rejected","target":"reader-R","sql":"SELECT nextval('writer_seq')","expect_error":"read-only","expect_sqlstate":"25006"}
+{"op":"sql","id":"reader-checkpoint-rejected","target":"reader-R","sql":"CHECKPOINT","expect_error":"not allowed on a pinned reader","expect_sqlstate":"25006"}
