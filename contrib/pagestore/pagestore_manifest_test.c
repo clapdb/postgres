@@ -73,6 +73,7 @@ main(void)
 				slru;
 	PsLayerDesc *got;
 	PsFlushWatermark watermark;
+	PsLayerLocation remote;
 
 	if (!mkdtemp(dir))
 	{
@@ -92,6 +93,21 @@ main(void)
 	slru = make_slru_layer(2);
 	check(ps_manifest_add_layer(&rel) == 0, "add relation layer");
 	check(ps_manifest_add_layer(&slru) == 0, "add SLRU layer");
+	memset(&remote, 0, sizeof(remote));
+	remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
+	snprintf(remote.uri, sizeof(remote.uri), "objects/layer-%llu",
+			 (unsigned long long) slru.layer_id);
+	remote.size = slru.locations[0].size;
+	remote.generation = 1;
+	remote.available = true;
+	check(ps_manifest_set_remote_durable(slru.layer_id, 0x2000) != 0,
+		  "remote durability requires a persisted remote location");
+	check(ps_manifest_set_remote_location(slru.layer_id, &remote) == 0,
+		  "persist remote location");
+	check(ps_manifest_set_remote_location(slru.layer_id, &remote) != 0,
+		  "reject a second remote location for an immutable layer");
+	check(ps_manifest_set_remote_durable(slru.layer_id, 0x2000) == 0,
+		  "mark uploaded remote location durable");
 	check(ps_manifest_set_flush_watermark(3, 7, 12345) == 0,
 		  "persist flush watermark");
 	check(ps_manifest_set_flush_watermark(3, 7, 12344) != 0,
@@ -142,7 +158,16 @@ main(void)
 		check(got->timeline == 1, "timeline round-trips");
 		check(got->lsn_start == 0x1000 && got->lsn_end == 0x2000,
 			  "lsn range round-trips");
-		check(got->location_count == 1, "location round-trips");
+		check(got->location_count == 2 &&
+			  got->locations[0].tier == PS_LAYER_TIER_LOCAL_HOT,
+			  "local location round-trips");
+		check(got->remote_durable && got->remote_uploaded_lsn == 0x2000,
+			  "remote durability round-trips");
+		check(got->location_count == 2 &&
+			  got->locations[1].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+			  strcmp(got->locations[1].uri, remote.uri) == 0 &&
+			  got->locations[1].available,
+			  "remote location round-trips");
 	}
 
 	check(ps_manifest_compact() == 0, "manifest compaction succeeds");
@@ -152,6 +177,13 @@ main(void)
 	check(ps_manifest_get_flush_watermark(3, &watermark) == 1 &&
 		  watermark.seg_id == 7 && watermark.seg_off == 12345,
 		  "manifest compaction preserves flush watermark");
+	got = NULL;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == slru.layer_id)
+			got = &ps_layer_map.layers[i];
+	check(got != NULL && got->remote_durable && got->location_count == 2 &&
+		  got->locations[1].tier == PS_LAYER_TIER_REMOTE_OBJECT,
+		  "manifest compaction preserves remote location and durability");
 
 	ps_manifest_close();		/* frees the in-memory map */
 
