@@ -1126,14 +1126,14 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn) RETURNS bool
          AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;" >/dev/null
-# A prepared XID remains in progress across the stopped copy at R.  Its 10000
+# A prepared XID remains in progress across the stopped copy at R.  Its 20000
 # released subtransactions exceed the normal snapshot subxid capacity; the
 # writer commits it only after the copy, so the reader has no post-R relation
 # WAL to replay during startup.
 READER_SUBXID_SQL=$(mktemp)
 {
 	printf 'BEGIN; INSERT INTO reader_running VALUES (1);\n'
-	for _ in $(seq 1 10000); do
+	for _ in $(seq 1 20000); do
 		printf 'SAVEPOINT s; INSERT INTO reader_subxid VALUES (1); RELEASE SAVEPOINT s;\n'
 	done
 	printf "PREPARE TRANSACTION 'reader_running_at_r';\n"
@@ -1159,6 +1159,7 @@ $P -c "COMMIT PREPARED 'reader_running_at_r';" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null
 assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
 	"writer sees the prepared transaction committed after R"
+readerRunningXid=$($P -c "SELECT xmin::text FROM reader_running;")
 READERPREP=$(mktemp -d)
 BADREADERPREP=$(mktemp -d)
 bad_reader_horizon=$($P -c "SELECT pagestore_prepare_reader('$BADREADERPREP', 0, '$bc', '$readerR',
@@ -1294,6 +1295,11 @@ assert "$($PR -c "SELECT count(*) FROM reader_running;")" "0" \
 	"pinned reader keeps a transaction that was running at R invisible after its commit"
 assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 	"pinned reader keeps subtransactions beyond normal snapshot capacity invisible"
+assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
+	"pg_current_snapshot preserves the pinned reader running-XID set"
+reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
+assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export an oversized recovery snapshot')" "1" \
+	"pinned reader rejects exporting an oversized running-XID snapshot"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the
