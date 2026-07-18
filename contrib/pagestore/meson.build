@@ -100,6 +100,17 @@ test('pagestore_layer',
   timeout: 60,
 )
 
+# Unit test for the filesystem-backed remote object provider (no daemon, no PG).
+pagestore_layer_store_test = executable('pagestore_layer_store_test',
+  files('pagestore_layer_store_test.c', 'pagestore_layer_store.c'),
+  install: false,
+)
+test('pagestore_layer_store',
+  pagestore_layer_store_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
