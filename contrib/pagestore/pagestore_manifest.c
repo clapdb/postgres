@@ -825,6 +825,37 @@ ps_manifest_set_remote_durable(uint64_t layer_id, uint64_t uploaded_lsn)
 }
 
 int
+ps_manifest_drop_local(uint64_t layer_id)
+{
+	PsManifestLayerIdEvent ev;
+	PsLayerDesc *layer;
+	int			has_local = 0;
+
+	layer = manifest_find_layer(&ps_layer_map, layer_id);
+	if (layer == NULL || !layer->remote_durable)
+		return -1;
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+			layer->locations[i].available)
+		{
+			has_local = 1;
+			break;
+		}
+	if (!has_local)
+		return 0;
+	ev.layer_id = layer_id;
+	ev.value = 0;
+	if (manifest_append(PS_MANIFEST_DROP_LOCAL, &ev, sizeof(ev)) != 0)
+		return -1;
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if (layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD)
+			layer->locations[i].available = false;
+	return 0;
+}
+
+int
 ps_manifest_mark_delete(uint64_t layer_id)
 {
 	PsManifestLayerIdEvent ev;

@@ -3599,6 +3599,49 @@ finish_upload:
 	return 1;
 }
 
+/* Evict at most one remote-durable local cache file. */
+static int
+evict_one_layer(void)
+{
+	PsLayerDesc candidate;
+	int			found = 0;
+
+	if (ps_layer_store->layer_exists_local == NULL ||
+		ps_layer_store->delete_local_layer == NULL)
+		return 0;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
+			tier_local_location(layer) != NULL &&
+			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
+		{
+			candidate = *layer;
+			found = 1;
+			break;
+		}
+	}
+	ps_unlock_map();
+	if (!found)
+		return 0;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+		{
+			if (ps_manifest_drop_local(candidate.layer_id) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			break;
+		}
+	ps_unlock_map();
+	return ps_layer_store->delete_local_layer(&candidate) == 0;
+}
+
 /*
  * Off-the-write-path background maintenance: compact one timeline whose image
  * layer count exceeds the (low-water) threshold.  The daemon calls this when it
@@ -3628,6 +3671,8 @@ ps_core_maintenance(void)
 		return 0;
 	ns = core_shards();
 	if (tier_one_layer())
+		return 1;
+	if (evict_one_layer())
 		return 1;
 	if (gc_resume())
 		return 1;

@@ -27,6 +27,8 @@ static char object_dir[2048];
 static int layer_id_shard(uint64_t layer_id);
 static int fsync_dir(const char *dir);
 static int cleanup_stale_copy_temps(const char *dir);
+static const PsLayerLocation *remote_location(const PsLayerDesc *layer);
+static int local_download_layer(const PsLayerDesc *layer);
 
 /*
  * Object directories are deliberately single-store resources.  Layer IDs are
@@ -488,7 +490,15 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	}
 
 	if (path == NULL)
-		return -1;
+	{
+		char		cached[4096];
+
+		if (remote_location(layer) == NULL ||
+			local_download_layer(layer) != 0 ||
+			local_layer_path(layer->layer_id, cached, sizeof(cached)) != 0)
+			return -1;
+		path = cached;
+	}
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
