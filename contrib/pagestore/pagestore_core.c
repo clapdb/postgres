@@ -398,8 +398,9 @@ static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
- * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
- * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
+ * the manifest has its local and remote files removed (idempotently) and a
+ * REMOVE_LAYER event recorded.  Reads already skip 'deleting' layers, so this
+ * only reclaims space.
  */
 static int
 gc_resume(void)
@@ -469,9 +470,7 @@ gc_resume(void)
 		if (tier_remote_location(&remote) != NULL &&
 			ps_layer_store->delete_remote_layer(&remote) != 0)
 			remote_failed = 1;
-		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
-			continue;
-		if (remote_failed)
+		if (ps_layer_store->delete_local_layer(&dead[k]) != 0 || remote_failed)
 			continue;
 		if (map_locks_ready)
 			ps_lock_map_wr();
