@@ -63,8 +63,8 @@ find_layer(uint64_t id)
 
 /*
  * Replica of pagestore_core.c's gc_resume() (static there): for each layer the
- * manifest still marks "deleting", delete the local file, then drop the manifest
- * entry only once the file is gone.  Snapshot the deleting set first since
+ * manifest still marks "deleting", delete local and remote files, then drop the
+ * manifest entry only once both are gone.  Snapshot the deleting set first since
  * ps_manifest_remove_layer() mutates the map.
  */
 static void
@@ -77,7 +77,9 @@ gc_resume_like(void)
 		if (ps_layer_map.layers[i].deleting)
 			dead[n++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < n; k++)
-		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
+		if (ps_layer_store->delete_local_layer(&dead[k]) == 0 &&
+			(!dead[k].remote_durable ||
+			 ps_layer_store->delete_remote_layer(&dead[k]) == 0))
 			ps_manifest_remove_layer(dead[k].layer_id);
 }
 
