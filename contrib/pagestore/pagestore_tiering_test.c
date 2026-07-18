@@ -106,6 +106,7 @@ main(void)
 		  ps_layer_store->layer_exists_local(layer->layer_id) == 0,
 		  "next idle pass evicts the remote-durable local layer");
 	ps_core_close();
+	ps_storage->close();
 	ps_layer_store->close();
 	check(ps_layer_store->open(store) == 0 && ps_manifest_open(store) == 0 &&
 		  ps_manifest_replay(&ps_layer_map) == 0,
