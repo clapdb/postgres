@@ -4886,10 +4886,11 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 	len = snprintf(slru_dir, sizeof(slru_dir), "%s/pg_xact", target_dir);
 	PS_CHECK_PATH_FORMAT(len, slru_dir);
 
-	for (uint64 xid64 = oldest_xid; xid64 < (uint64) next_xid; xid64++)
+	/* CLOG page numbers and transaction IDs both wrap at 2^32. */
+	for (TransactionId xid = oldest_xid;
+		 !TransactionIdEquals(xid, next_xid);)
 	{
-		TransactionId xid = (TransactionId) xid64;
-		int64		pageno = xid64 / PS_CLOG_XACTS_PER_PAGE;
+		int64		pageno = xid / PS_CLOG_XACTS_PER_PAGE;
 		int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
 		int			pgidx;
 		int			status;
@@ -4947,6 +4948,7 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 			}
 			xids[count++] = xid;
 		}
+		TransactionIdAdvance(xid);
 	}
 	if (fd >= 0)
 		CloseTransientFile(fd);
