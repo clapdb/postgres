@@ -3274,6 +3274,116 @@ reclaim_one_segment(Shard *s)
 	return 1;
 }
 
+static const PsLayerLocation *
+tier_local_location(const PsLayerDesc *layer)
+{
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+			layer->locations[i].available)
+			return &layer->locations[i];
+	return NULL;
+}
+
+static const PsLayerLocation *
+tier_remote_location(const PsLayerDesc *layer)
+{
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+			layer->locations[i].available)
+			return &layer->locations[i];
+	return NULL;
+}
+
+/* Upload at most one immutable layer, outside map_lock. */
+static int
+tier_one_layer(void)
+{
+	PsLayerDesc candidate;
+	PsLayerDesc *current = NULL;
+	PsLayerLocation remote;
+	const PsLayerLocation *local;
+	int			exists;
+	int			found = 0;
+
+	if (ps_layer_store->remote_uri == NULL || ps_layer_store->upload_layer == NULL)
+		return 0;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+		if (!layer->deleting && !layer->remote_durable &&
+			tier_local_location(layer) != NULL)
+		{
+			candidate = *layer;
+			found = 1;
+			break;
+		}
+	}
+	ps_unlock_map();
+	if (!found)
+		return 0;
+
+	/* An interrupted earlier pass may have recorded the URI before durability. */
+	exists = tier_remote_location(&candidate) != NULL &&
+		ps_layer_store->layer_exists_remote != NULL ?
+		ps_layer_store->layer_exists_remote(&candidate) : 0;
+	if (exists < 0)
+		return 0;
+	if (exists == 0 && ps_layer_store->upload_layer(&candidate) != 0)
+		return 0;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+		{
+			current = &ps_layer_map.layers[i];
+			break;
+		}
+	if (current == NULL || current->deleting)
+	{
+		ps_unlock_map();
+		if (ps_layer_store->remote_uri != NULL &&
+			ps_layer_store->remote_uri(candidate.layer_id, remote.uri,
+										 sizeof(remote.uri)) == 0)
+		{
+			remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
+			remote.available = true;
+			candidate.locations[candidate.location_count++] = remote;
+			ps_layer_store->delete_remote_layer(&candidate);
+		}
+		return 1;
+	}
+	if (current->remote_durable)
+	{
+		ps_unlock_map();
+		return 1;
+	}
+	if (tier_remote_location(current) == NULL)
+	{
+		local = tier_local_location(current);
+		memset(&remote, 0, sizeof(remote));
+		remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
+		remote.size = local->size;
+		remote.available = true;
+		if (ps_layer_store->remote_uri(current->layer_id, remote.uri,
+										 sizeof(remote.uri)) != 0 ||
+			ps_manifest_set_remote_location(current->layer_id, &remote) != 0)
+		{
+			ps_unlock_map();
+			return 0;
+		}
+	}
+	if (ps_manifest_set_remote_durable(current->layer_id, current->lsn_end) != 0)
+	{
+		ps_unlock_map();
+		return 0;
+	}
+	ps_unlock_map();
+	return 1;
+}
+
 /*
  * Off-the-write-path background maintenance: compact one timeline whose image
  * layer count exceeds the (low-water) threshold.  The daemon calls this when it
@@ -3302,6 +3412,8 @@ ps_core_maintenance(void)
 	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
+	if (tier_one_layer())
+		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
 	 * the watermark stays present because its suffix may not be in a layer. */

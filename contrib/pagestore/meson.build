@@ -111,6 +111,20 @@ test('pagestore_layer_store',
   timeout: 60,
 )
 
+# Integration test for idle layer upload and durable remote manifest state.
+pagestore_tiering_test = executable('pagestore_tiering_test',
+  files('pagestore_tiering_test.c', 'pagestore_core.c', 'storage_posix.c',
+        'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_tiering',
+  pagestore_tiering_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
