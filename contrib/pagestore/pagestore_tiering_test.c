@@ -37,6 +37,7 @@ main(void)
 	char		store[] = "/tmp/pstieringstoreXXXXXX";
 	char		objects[] = "/tmp/pstieringobjectsXXXXXX";
 	unsigned char page[PSZ];
+	unsigned char out[PSZ];
 	PsKey		key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint32_t	lsn_hi = 0, lsn_lo = 100;
 	PsLayerDesc *layer;
@@ -89,6 +90,14 @@ main(void)
 	check(layer != NULL && layer->remote_durable &&
 		  ps_layer_store->layer_exists_remote(layer) == 1,
 		  "uploaded layer is durably recorded and present remotely");
+	check(ps_core_maintenance() == 1 &&
+		  !layer->locations[0].available &&
+		  ps_layer_store->layer_exists_local(layer->layer_id) == 0,
+		  "next idle pass evicts the remote-durable local layer");
+	check(ps_image_layer_lookup(layer, &key, 0, 100, 0, out, PSZ, NULL, NULL) == 1 &&
+		  memcmp(out, page, PSZ) == 0 &&
+		  ps_layer_store->layer_exists_local(layer->layer_id) == 1,
+		  "remote-only layer downloads into the local cache on read");
 	ps_core_close();
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");

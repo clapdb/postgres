@@ -161,15 +161,25 @@ static const PsLayerLocation *
 img_local_loc(const PsLayerDesc *layer)
 {
 	uint32_t	nlocs = layer->location_count;
+	const PsLayerLocation *local = NULL;
+	int			remote = 0;
 
 	if (nlocs > PS_LAYER_MAX_LOCATIONS)
 		nlocs = PS_LAYER_MAX_LOCATIONS;
 	for (uint32_t i = 0; i < nlocs; i++)
-		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
-			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+	{
+		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
 			layer->locations[i].available)
-			return &layer->locations[i];
-	return NULL;
+			remote = 1;
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
+		{
+			if (layer->locations[i].available)
+				return &layer->locations[i];
+			local = &layer->locations[i];
+		}
+	}
+	return remote ? local : NULL;
 }
 
 int
