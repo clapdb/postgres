@@ -686,8 +686,7 @@ local_delete_local_layer(const PsLayerDesc *layer)
 	for (uint32_t i = 0; i < nlocs; i++)
 	{
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
-			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
-			layer->locations[i].available)
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
 		{
 			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
 				rc = -1;

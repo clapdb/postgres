@@ -137,6 +137,10 @@ main(void)
 	check(ps_layer_store->download_layer(&layer) == 0 &&
 		  file_matches(local_uri, contents),
 		  "download restores the complete local layer");
+	layer.locations[0].available = false;
+	check(ps_layer_store->delete_local_layer(&layer) == 0 &&
+		  ps_layer_store->layer_exists_local(layer.layer_id) == 0,
+		  "GC removes a downloaded local cache after manifest eviction");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0,
 		  "delete remote object");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0 &&
