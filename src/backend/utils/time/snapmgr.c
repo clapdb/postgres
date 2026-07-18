@@ -1163,6 +1163,17 @@ ExportSnapshot(Snapshot snapshot)
 	nchildren = xactGetCommittedChildren(&children);
 
 	/*
+	 * Recovery-shaped snapshots keep every running XID in subxip.  The
+	 * exported-snapshot format cannot represent more than the normal subxid
+	 * capacity; emitting sof:1 here would silently lose those top-level XIDs.
+	 */
+	if (snapshot->takenDuringRecovery &&
+		snapshot->subxcnt + nchildren > GetMaxSnapshotSubxidCount())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export an oversized recovery snapshot")));
+
+	/*
 	 * Generate file path for the snapshot.  We start numbering of snapshots
 	 * inside the transaction from 1.
 	 */
