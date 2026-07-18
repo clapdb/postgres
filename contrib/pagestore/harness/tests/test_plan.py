@@ -1,0 +1,199 @@
+import contextlib
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("pagestore_harness", ROOT / "pagestore_harness.py")
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+CAPABILITIES = {
+    "schema": 1,
+    "storage": ["posix"],
+    "shards": [1],
+    "compute": ["writer", "reader"],
+    "crash_models": ["power_loss"],
+    "operations": ["sql", "checkpoint", "prepare_reader", "assert", "crash"],
+}
+
+
+class PlanValidationTests(unittest.TestCase):
+    def write_plan(self, records):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "scenario.jsonl"
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+        return path
+
+    def header(self):
+        return {
+            "schema": 1,
+            "scenario": "reader",
+            "seed": 7,
+            "contracts": ["snapshot_visibility"],
+            "case": {"storage": "posix", "shards": 1, "compute": ["writer", "reader"]},
+        }
+
+    def test_accepts_declared_horizon(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R"},
+            {"op": "prepare_reader", "id": "reader", "target": "writer", "base": "$R", "read_lsn": "$R"},
+            {"op": "assert", "id": "visible", "target": "reader-R", "oracle": "sql_scalar", "sql": "SELECT 1", "expect": "$R"},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_rejects_horizon_before_checkpoint(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "prepare_reader", "id": "reader", "target": "writer", "base": "$R", "read_lsn": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "no completed boundary"):
+            MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_rejects_unsupported_crash_model(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "crash", "id": "crash", "target": "store", "model": "network_partition"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "unsupported crash model"):
+            MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_rejects_unknown_action_field(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "r0", "target": "writer", "name": "R", "typo": True},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "unknown field"):
+            MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_accepts_expected_sql_failure(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "sql", "id": "write-rejected", "target": "reader-R",
+             "sql": "UPDATE t SET v = 1", "expect_error": "read-only"},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_inspection_schema_is_read_only_and_versioned(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        self.assertEqual(schema["schema"], 1)
+        self.assertEqual(schema["transport"], "private-test-ipc")
+        self.assertEqual(schema["mutating_operations"], [])
+        self.assertEqual(
+            set(schema["operations"]),
+            {"health", "timeline", "relation", "manifest", "gc", "backpressure"},
+        )
+
+    def test_inspector_response_must_match_schema(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        inspector = Path(directory.name) / "inspect"
+        inspector.write_text(
+            "#!/bin/sh\nprintf '%s\\n' "
+            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}'\n",
+            encoding="utf-8",
+        )
+        inspector.chmod(0o755)
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        value = MODULE.inspect_store(inspector, "/unused", "health", schema)
+        self.assertEqual(value["page_size"], 8192)
+
+    def test_daemon_smoke_retains_a_replayable_run_root(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        daemon = base / "daemon"
+        inspector = base / "inspect"
+        daemon.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        inspector.write_text(
+            "#!/bin/sh\ncase \"$3\" in\n"
+            "health) printf '%s\\n' "
+            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "backpressure) printf '%s\\n' "
+            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        daemon.chmod(0o755)
+        inspector.chmod(0o755)
+        root = base / "run"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = MODULE.main([
+                "--capabilities", str(ROOT / "capabilities.json"),
+                "--daemon-smoke", str(ROOT / "scenarios" / "reader_visibility.jsonl"),
+                "--daemon-binary", str(daemon),
+                "--inspect-binary", str(inspector),
+                "--run-root", str(root),
+                "--keep",
+            ])
+        self.assertEqual(status, 0)
+        self.assertTrue((root / "plan.jsonl").is_file())
+        self.assertTrue((root / "case.json").is_file())
+        events = [json.loads(line) for line in (root / "trace" / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["event"] for event in events], [
+            "run_start", "process_start", "ready", "capture", "run_pass", "process_stop",
+        ])
+        self.assertFalse((root / "failure.json").exists())
+
+    def test_daemon_smoke_retains_failure_bundle(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        daemon = base / "daemon"
+        inspector = base / "inspect"
+        daemon.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        inspector.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        daemon.chmod(0o755)
+        inspector.chmod(0o755)
+        root = base / "failure"
+        with contextlib.redirect_stderr(io.StringIO()):
+            status = MODULE.main([
+                "--capabilities", str(ROOT / "capabilities.json"),
+                "--daemon-smoke", str(ROOT / "scenarios" / "reader_visibility.jsonl"),
+                "--daemon-binary", str(daemon),
+                "--inspect-binary", str(inspector),
+                "--run-root", str(root),
+            ])
+        self.assertEqual(status, 1)
+        self.assertTrue((root / "failure.json").is_file())
+        events = [json.loads(line) for line in (root / "trace" / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(events[-2]["event"], "run_fail")
+        self.assertEqual(events[-1]["event"], "process_stop")
+
+    def test_legacy_integration_is_captured_in_a_bundle(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        script = base / "integration"
+        script.write_text("#!/bin/sh\necho reader-coverage\n", encoding="utf-8")
+        script.chmod(0o755)
+        root = base / "run"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = MODULE.main([
+                "--capabilities", str(ROOT / "capabilities.json"),
+                "--legacy-integration", "--build-dir", str(base),
+                "--integration-script", str(script), "--run-root", str(root),
+            ])
+        self.assertEqual(status, 0)
+        self.assertEqual((root / "trace" / "integration.log").read_text(), "reader-coverage\n")
+
+
+if __name__ == "__main__":
+    unittest.main()

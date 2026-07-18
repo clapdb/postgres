@@ -1,0 +1,9 @@
+{"schema":1,"scenario":"reader-visibility","seed":184467,"contracts":["snapshot_visibility","timeline_isolation"],"case":{"storage":"posix","shards":1,"compute":["writer","reader"]}}
+{"op":"sql","id":"create","target":"writer","sql":"CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts"}
+{"op":"advance","id":"before-r","target":"writer","profile":"reader_visibility","steps":1}
+{"op":"checkpoint","id":"r0","target":"writer","name":"R"}
+{"op":"reader_base","id":"base-r0","target":"writer","checkpoint":"$R","name":"C"}
+{"op":"prepare_reader","id":"prepare-r0","target":"writer","base":"$C","read_lsn":"$R"}
+{"op":"advance","id":"after-r","target":"writer","profile":"reader_visibility","steps":1}
+{"op":"install_reader","id":"install-r0","target":"reader-R","prepared":"prepare-r0","read_lsn":"$R"}
+{"op":"assert","id":"reader-old","target":"reader-R","oracle":"sql_scalar","sql":"SELECT 1","expect":"1"}
