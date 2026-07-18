@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "transport": "private-test-ipc",
+  "mutating_operations": [],
+  "implemented_operations": ["health", "backpressure"],
+  "operations": {
+    "health": {
+      "response": ["protocol_version", "page_size", "io_unit", "nchannels", "nshards", "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn"]
+    },
+    "timeline": {
+      "request": ["timeline"],
+      "response": ["parent_timeline", "fork_lsn", "retained_horizon"]
+    },
+    "relation": {
+      "request": ["timeline", "key", "lsn"],
+      "response": ["exists", "forks", "nblocks", "selected_lsn"]
+    },
+    "manifest": {
+      "response": ["generation", "checksum", "live_layers", "pending_delete_layers"]
+    },
+    "gc": {
+      "response": ["retained_horizons", "queue_length", "completed_phase"]
+    },
+    "backpressure": {
+      "response": ["idle", "claimed", "request", "done", "shards"]
+    }
+  }
+}

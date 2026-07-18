@@ -1,0 +1,20 @@
+{"schema":1,"scenario":"writer-lifecycle","seed":1,"contracts":["write_read","durability","routing"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"op":"sql","id":"tablespace","target":"writer","sql":"CREATE TABLESPACE harness_ts LOCATION '${tablespace}'"}
+{"op":"sql","id":"write","target":"writer","sql":"CREATE TABLE writer_t(id int primary key, v text) TABLESPACE harness_ts; CREATE SEQUENCE writer_seq; INSERT INTO writer_t VALUES (1, 'before-checkpoint')"}
+{"op":"bootstrap","id":"route-all","target":"writer"}
+{"op":"sql","id":"prepare-inflight-xid","target":"writer","sql":"BEGIN; INSERT INTO writer_t VALUES (2, 'prepared-at-r'); SAVEPOINT subxid; UPDATE writer_t SET v = 'prepared-at-r' WHERE id = 2; RELEASE SAVEPOINT subxid; PREPARE TRANSACTION 'harness-inflight-xid'"}
+{"op":"checkpoint","id":"r0","target":"writer","name":"R"}
+{"op":"capture","id":"copy-r0","target":"writer","kind":"reader_datadir","name":"reader-R","horizon":"$R"}
+{"op":"reader_base","id":"base-r0","target":"writer","checkpoint":"$R","name":"C"}
+{"op":"prepare_reader","id":"prepare-r0","target":"writer","base":"$C","read_lsn":"$R"}
+{"op":"sql","id":"writer-after-r","target":"writer","sql":"UPDATE writer_t SET v = 'after-r' WHERE id = 1; CHECKPOINT"}
+{"op":"install_reader","id":"install-r0","target":"reader-R","prepared":"prepare-r0","read_lsn":"$R"}
+{"op":"assert","id":"reader-at-r","target":"reader-R","oracle":"sql_scalar","sql":"SELECT v FROM writer_t ORDER BY id","expect":"before-checkpoint"}
+{"op":"assert","id":"reader-hides-prepared-xid","target":"reader-R","oracle":"sql_scalar","sql":"SELECT count(*) FROM writer_t WHERE id = 2","expect":"0"}
+{"op":"sql","id":"commit-inflight-xid","target":"writer","sql":"COMMIT PREPARED 'harness-inflight-xid'"}
+{"op":"assert","id":"writer-sees-after-r","target":"writer","oracle":"sql_scalar","sql":"SELECT v FROM writer_t WHERE id = 1","expect":"after-r"}
+{"op":"assert","id":"writer-sees-committed-xid","target":"writer","oracle":"sql_scalar","sql":"SELECT count(*) FROM writer_t WHERE id = 2","expect":"1"}
+{"op":"sql","id":"reader-write-rejected","target":"reader-R","sql":"UPDATE writer_t SET v = 'must-not-write' WHERE id = 1","expect_error":"not allowed on a pinned reader"}
+{"op":"sql","id":"reader-ddl-rejected","target":"reader-R","sql":"CREATE TABLE reader_must_not_exist(id int)","expect_error":"read-only"}
+{"op":"sql","id":"reader-nextval-rejected","target":"reader-R","sql":"SELECT nextval('writer_seq')","expect_error":"read-only"}
+{"op":"sql","id":"reader-checkpoint-rejected","target":"reader-R","sql":"CHECKPOINT","expect_error":"not allowed on a pinned reader"}

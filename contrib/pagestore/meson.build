@@ -66,6 +66,14 @@ pagestore_bench = executable('pagestore_bench',
 )
 contrib_targets += pagestore_bench
 
+# Private, read-only shared-memory inspector for the pagestore harness.  It
+# deliberately does not link PostgreSQL libraries or expose mutation commands.
+pagestore_inspect = executable('pagestore_inspect',
+  files('pagestore_inspect.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_inspect
+
 # Standalone test harness: drives the daemon over the shared-memory protocol
 # with no PostgreSQL instance.  Run independently of the PG test suites with:
 #   meson test -C <build> --suite pagestore
@@ -75,8 +83,8 @@ pagestore_test = executable('pagestore_test',
 )
 test('pagestore_standalone',
   pagestore_test,
-  args: [pagestore_daemon],
-  depends: [pagestore_daemon],
+  args: [pagestore_daemon, pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
   suite: ['pagestore'],
   timeout: 120,
 )
@@ -125,4 +133,42 @@ test('pagestore_pgcache',
   pagestore_pgcache_test,
   suite: ['pagestore'],
   timeout: 60,
+)
+
+# The harness input contract is stdlib-only and intentionally fast.  Keep it in
+# the regular pagestore suite so scenario/capability changes fail before the
+# slower PostgreSQL integration coverage runs.
+pagestore_harness_python = find_program('python3')
+test('pagestore_harness_plan',
+  pagestore_harness_python,
+  args: [files('harness/tests/test_plan.py')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_reader_visibility_plan',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--validate', files('harness/scenarios/reader_visibility.jsonl')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_writer_lifecycle_plan',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--validate', files('harness/scenarios/writer_lifecycle.jsonl')],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_daemon_smoke',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--daemon-smoke', files('harness/scenarios/reader_visibility.jsonl'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
 )
