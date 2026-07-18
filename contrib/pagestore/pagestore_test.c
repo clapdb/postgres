@@ -11,7 +11,7 @@
  * the storage logic, COW versioning, segment rollover, crash recovery and
  * page-size independence with no PostgreSQL instance involved.
  *
- * Usage: pagestore_test <path-to-pagestore_daemon>
+ * Usage: pagestore_test <path-to-pagestore_daemon> <path-to-pagestore_inspect>
  * Exit status: 0 = all tests passed, 1 = one or more failed.
  *
  * src/../contrib/pagestore/pagestore_test.c
@@ -37,6 +37,7 @@
 static int	tests_run = 0;
 static int	tests_failed = 0;
 static uint32_t test_nshards = 1;
+static const char *inspect_path;
 
 static void check(int cond, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -68,6 +69,69 @@ rm_rf(const char *path)
 	{
 		/* ignore: cleanup is best-effort */
 	}
+}
+
+/* The inspector must observe a live daemon without claiming an I/O channel. */
+static int
+run_inspector(const char *shm, const char *operation, char *output, size_t output_size)
+{
+	int		pipefd[2];
+	pid_t		pid;
+	int		status;
+	ssize_t		nread;
+
+	if (pipe(pipefd) != 0)
+	{
+		perror("pipe inspector");
+		exit(2);
+	}
+	pid = fork();
+	if (pid < 0)
+	{
+		perror("fork inspector");
+		exit(2);
+	}
+	if (pid == 0)
+	{
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		execl(inspect_path, inspect_path, "--shm", shm, operation, (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	nread = read(pipefd[0], output, output_size - 1);
+	close(pipefd[0]);
+	if (nread < 0)
+	{
+		perror("read inspector");
+		exit(2);
+	}
+	output[nread] = '\0';
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void
+check_inspector(const char *shm, uint32_t page_size)
+{
+	char		output[1024];
+	char		page_size_json[64];
+
+	check(run_inspector(shm, "health", output, sizeof(output)),
+		  "read-only inspector health exits cleanly");
+	snprintf(page_size_json, sizeof(page_size_json), "\"page_size\":%u", page_size);
+	check(strstr(output, "\"protocol_version\":") != NULL &&
+		  strstr(output, page_size_json) != NULL &&
+		  strstr(output, "\"nchannels\":128") != NULL,
+		  "read-only inspector reports the live shared-memory health");
+	check(run_inspector(shm, "backpressure", output, sizeof(output)),
+		  "read-only inspector backpressure exits cleanly");
+	check(strstr(output, "\"idle\":128") != NULL &&
+		  strstr(output, "\"claimed\":0") != NULL &&
+		  strstr(output, "\"request\":0") != NULL &&
+		  strstr(output, "\"done\":0") != NULL,
+		  "read-only inspector reports idle mailbox backpressure state");
 }
 
 /* An offline segment-format migration must invalidate derived LSM metadata. */
@@ -1797,6 +1861,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
 	wait_ready(shm, page_size);
+	check_inspector(shm, page_size);
 	client_attach(shm, page_size);
 
 	/* --- lifecycle / metadata --- */
@@ -3009,14 +3074,16 @@ main(int argc, char **argv)
 	char	   *tmpbase;
 	uint32_t	sizes[] = {4096, 8192, 16384};
 
-	if (argc < 2)
+	if (argc < 3)
 	{
-		fprintf(stderr, "usage: %s <path-to-pagestore_daemon> [nshards]\n", argv[0]);
+		fprintf(stderr, "usage: %s <path-to-pagestore_daemon> "
+				"<path-to-pagestore_inspect> [nshards]\n", argv[0]);
 		return 2;
 	}
 	daemon_path = argv[1];
-	if (argc > 2)
-		test_nshards = (uint32_t) strtoul(argv[2], NULL, 10);
+	inspect_path = argv[2];
+	if (argc > 3)
+		test_nshards = (uint32_t) strtoul(argv[3], NULL, 10);
 	if (test_nshards == 0)
 		test_nshards = 1;
 	if (test_nshards > PS_MAX_CHANNELS)

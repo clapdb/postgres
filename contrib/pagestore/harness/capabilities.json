@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "inspection_schema": 1,
+  "inspection_operations": ["health", "backpressure"],
+  "storage": ["posix"],
+  "shards": [1],
+  "compute": ["writer", "reader", "branch"],
+  "crash_models": ["power_loss", "compute", "process_abort"],
+  "operations": [
+    "sql",
+    "checkpoint",
+    "prepare_branch",
+    "install_branch",
+    "prepare_reader",
+    "reader_base",
+    "bootstrap",
+    "install_reader",
+    "restart",
+    "crash",
+    "advance",
+    "assert",
+    "parallel",
+    "wait",
+    "sync",
+    "set_fault",
+    "release_fault",
+    "capture",
+    "compare",
+    "expect_failure",
+    "cleanup"
+  ]
+}
