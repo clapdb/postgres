@@ -123,10 +123,14 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         inspector = Path(directory.name) / "inspect"
         inspector.write_text(
-            "#!/bin/sh\nprintf '%s\\n' "
+            "#!/bin/sh\ncase \"$3\" in\n"
+            "health) printf '%s\\n' "
             "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
-            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}'\n",
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "backpressure) printf '%s\\n' "
+            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         inspector.chmod(0o755)
@@ -200,6 +204,46 @@ class PlanValidationTests(unittest.TestCase):
         events = [json.loads(line) for line in (root / "trace" / "events.jsonl").read_text().splitlines()]
         self.assertEqual(events[-2]["event"], "run_fail")
         self.assertEqual(events[-1]["event"], "process_stop")
+
+    def test_daemon_smoke_recovers_from_power_loss(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        daemon = base / "daemon"
+        inspector = base / "inspect"
+        daemon.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        inspector.write_text(
+            "#!/bin/sh\ncase \"$3\" in\n"
+            "health) printf '%s\\n' "
+            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "backpressure) printf '%s\\n' "
+            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        daemon.chmod(0o755)
+        inspector.chmod(0o755)
+        root = base / "run"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = MODULE.main([
+                "--capabilities", str(ROOT / "capabilities.json"),
+                "--daemon-smoke", str(ROOT / "scenarios" / "daemon_recovery.jsonl"),
+                "--daemon-binary", str(daemon),
+                "--inspect-binary", str(inspector),
+                "--run-root", str(root), "--keep",
+            ])
+        self.assertEqual(status, 0)
+        events = [json.loads(line) for line in (root / "trace" / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["event"] for event in events], [
+            "run_start", "process_start", "ready", "capture", "crash", "process_start",
+            "ready", "recovered", "run_pass", "process_stop",
+        ])
+        self.assertEqual(events[4]["returncode"], -9)
 
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()

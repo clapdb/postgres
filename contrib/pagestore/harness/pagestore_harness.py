@@ -355,16 +355,20 @@ def run_daemon_smoke(
     process: subprocess.Popen[str] | None = None
     failure: Exception | None = None
 
-    try:
-        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
-        with daemon_log.open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       text=True, env=private_environment())
-        events.emit("process_start", target="store", pid=process.pid, argv=command)
+    def start_daemon(action_id: str | None = None) -> subprocess.Popen[str]:
+        nonlocal process
+        with daemon_log.open("a", encoding="utf-8") as log:
+            daemon_process = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, text=True,
+                env=private_environment())
+        process = daemon_process
+        events.emit("process_start", target="store", pid=daemon_process.pid,
+                    argv=command, action_id=action_id)
         deadline = time.monotonic() + 10.0
         while True:
-            if process.poll() is not None:
-                raise PlanError(f"daemon exited before readiness with status {process.returncode}")
+            if daemon_process.poll() is not None:
+                raise PlanError(
+                    f"daemon exited before readiness with status {daemon_process.returncode}")
             try:
                 health = inspect_store(inspector, shm, "health", inspection_schema)
                 break
@@ -372,9 +376,31 @@ def run_daemon_smoke(
                 if time.monotonic() >= deadline:
                     raise PlanError(f"daemon did not become ready: {error}") from error
                 time.sleep(0.05)
-        events.emit("ready", target="store", health=health)
+        events.emit("ready", target="store", health=health, action_id=action_id)
+        return daemon_process
+
+    try:
+        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
+        daemon_log.touch()
+        process = start_daemon()
         backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
         events.emit("capture", target="store", kind="backpressure", value=backpressure)
+        for action in plan.actions:
+            if action["op"] != "crash":
+                continue
+            if action["target"] != "store" or action["model"] != "power_loss":
+                raise PlanError(f"daemon smoke does not execute crash on {action['target']!r}")
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise PlanError(f"crash action {action['id']} did not stop the daemon") from error
+            events.emit("crash", id=action["id"], target="store", model="power_loss",
+                        pid=process.pid, returncode=process.returncode)
+            remove_shm(shm)
+            process = start_daemon(action["id"])
+            backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+            events.emit("recovered", id=action["id"], target="store", value=backpressure)
         events.emit("run_pass")
     except Exception as error:
         failure = error
