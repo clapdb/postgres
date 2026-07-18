@@ -31,6 +31,15 @@ check(int cond, const char *msg)
 	}
 }
 
+static PsLayerDesc *
+find_layer(uint64_t id)
+{
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == id)
+			return &ps_layer_map.layers[i];
+	return NULL;
+}
+
 int
 main(void)
 {
@@ -40,6 +49,7 @@ main(void)
 	unsigned char out[PSZ];
 	PsKey		key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint32_t	lsn_hi = 0, lsn_lo = 100;
+	uint64_t	layer_id;
 	PsLayerDesc *layer;
 	struct timespec deadline;
 
@@ -87,6 +97,7 @@ main(void)
 		usleep(1000);
 	}
 	layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
+	layer_id = layer ? layer->layer_id : 0;
 	check(layer != NULL && layer->remote_durable &&
 		  ps_layer_store->layer_exists_remote(layer) == 1,
 		  "uploaded layer is durably recorded and present remotely");
@@ -94,11 +105,18 @@ main(void)
 		  !layer->locations[0].available &&
 		  ps_layer_store->layer_exists_local(layer->layer_id) == 0,
 		  "next idle pass evicts the remote-durable local layer");
-	check(ps_image_layer_lookup(layer, &key, 0, 100, 0, out, PSZ, NULL, NULL) == 1 &&
+	ps_core_close();
+	ps_layer_store->close();
+	check(ps_layer_store->open(store) == 0 && ps_manifest_open(store) == 0 &&
+		  ps_manifest_replay(&ps_layer_map) == 0,
+		  "replay a remote-only layer after restart");
+	layer = find_layer(layer_id);
+	check(layer != NULL && !layer->locations[0].available &&
+		  ps_image_layer_lookup(layer, &key, 0, 100, 0, out, PSZ, NULL, NULL) == 1 &&
 		  memcmp(out, page, PSZ) == 0 &&
 		  ps_layer_store->layer_exists_local(layer->layer_id) == 1,
-		  "remote-only layer downloads into the local cache on read");
-	ps_core_close();
+		  "remote-only layer downloads into the local cache after restart");
+	ps_manifest_close();
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");
 	printf("pagestore_tiering_test: %d checks, %d failed\n", run, failed);
