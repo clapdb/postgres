@@ -5,6 +5,8 @@ for PostgreSQL.  Several pieces are deliberately simplified to get the end-to-en
 architecture working and tested; this file records the directions they must take
 to become production-grade.
 
+The test direction and rollout plan are in [HARNESS_DESIGN.md](HARNESS_DESIGN.md).
+
 ## 1. Storage & indexes should become LSM-like
 
 **Current.**  The daemon keeps its metadata as plain in-memory chained hash

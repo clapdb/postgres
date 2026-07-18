@@ -1,9 +1,9 @@
 # Multi-compute read consistency: design
 
 Status: increments 1a (the page-read pin), 1b (as-of size/existence
-metadata), the 1c SLRU/control boot artifacts, and 1d (the same-LSN admission
-fence) are implemented.  Exact catalog provenance, the 1c running-xacts
-snapshot, and increments 2 and 3 are specified here and not yet built.
+metadata), the 1c SLRU/control/running-xacts boot artifacts, and 1d (the
+same-LSN admission fence) are implemented.  Exact catalog provenance and
+increments 2 and 3 are specified here and not yet built.
 
 ## Problem
 
@@ -57,8 +57,10 @@ later tuples are missing from as-of-R pages).  Status must be judged AS OF
 R.  Reconstructing clog-as-of-R per lookup is the appliers' job and far
 too heavy for the read path; the standby trick is not:
 
-- The checkpoint whose redo defines R logged the set of xids running at
-  it (`oldestActiveXid`, and the `XLOG_RUNNING_XACTS` record near redo).
+- The exact-R `pg_xact` artifact identifies every assigned xid that was still
+  `IN_PROGRESS` or `SUB_COMMITTED` at R.  Deriving the set from this artifact
+  avoids treating a nearby `XLOG_RUNNING_XACTS` record as if it occurred at
+  the checkpoint redo pointer.
 - An xact NOT in that running set with newest-clog = committed must have
   committed at/before R (had it committed later, it would still have been
   running at R).  An xact IN the set was uncommitted at R -- invisible,
@@ -159,7 +161,7 @@ reconstruction.
    content is not LSN-ordered to begin with, and unlogged crash-reset
    semantics are outside what LSN-versioning can express.
 
-1c. **The as-of compute (boot artifacts partial; snapshot pending).**  A consistent QUERY compute
+1c. **The as-of compute (boot artifacts and fixed snapshot implemented).**  A consistent QUERY compute
    at R needs its LOCAL state as-of R too: catalogs, pg_control, and
    SLRUs come from the prepared-branch-style artifacts restored at R (a
    pinned reader does NOT create a store timeline -- it reads the
@@ -177,7 +179,13 @@ reconstruction.
    LSN in its manifest.  Prepare and install verify the ancestry against the
    daemon, and startup re-verifies it after the target branch manifest has been
    removed, so an undefined or reused timeline cannot silently lose its parent
-   history.
+   history.  Prepare also scans the reconstructed exact-R `pg_xact` horizon
+   and durably writes every in-progress/subcommitted xid to
+   `pagestore_reader.snapshot`, with its timeline, R, xmin/xmax, and CRC32C.
+   Install and startup require and validate that artifact.  A pinned backend's
+   snapshot hook uses its fixed xmax and running set for every MVCC snapshot,
+   so a transaction in flight at R remains invisible even if local recovery
+   later replays its commit.
 
    The control plane still has to supply catalogs proven to be at R.  A
    quiesced datadir copy is sufficient only when no catalog-changing work can
@@ -186,11 +194,6 @@ reconstruction.
    R.  The reader manifest carries branch ancestry provenance, but does not yet
    carry or validate this catalog-snapshot provenance, so this increment is not
    the complete 1c boot contract.
-
-   The remaining snapshot half must not consult newest status: wire
-   the running-xacts snapshot (above) so tuples of xacts in flight at R
-   stay invisible whatever newest clog says.
-
 1d. **The same-LSN admission fence (implemented).**  Relation versions are keyed by
    pd_lsn, and the writer's hint-bit-only page writes re-ship a page
    under an UNCHANGED pd_lsn: a version written after R can win a
