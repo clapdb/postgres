@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -83,6 +84,29 @@ class PlanValidationTests(unittest.TestCase):
              "sql": "UPDATE t SET v = 1", "expect_error": "read-only"},
         ])
         MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_accepts_expected_sqlstate(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "sql", "id": "write-rejected", "target": "reader-R",
+             "sql": "UPDATE t SET v = 1", "expect_sqlstate": "25006"},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_sqlstate_is_extracted_from_verbose_psql_error(self):
+        output = "ERROR:  25006: cannot execute UPDATE in a read-only transaction\n"
+        self.assertEqual(MODULE.sqlstate_from_output(output), "25006")
+
+    def test_private_environment_removes_all_postgres_variables(self):
+        with mock.patch.dict(MODULE.os.environ, {
+            "PGDATABASE": "outside", "PGOPTIONS": "-c work_mem=1MB",
+            "PGSERVICE": "external", "PAGESTORE_TEST_FAULT": "crash",
+        }, clear=False):
+            environment = MODULE.private_environment()
+        self.assertNotIn("PGDATABASE", environment)
+        self.assertNotIn("PGOPTIONS", environment)
+        self.assertNotIn("PGSERVICE", environment)
+        self.assertNotIn("PAGESTORE_TEST_FAULT", environment)
 
     def test_inspection_schema_is_read_only_and_versioned(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")

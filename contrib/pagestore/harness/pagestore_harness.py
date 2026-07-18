@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -51,8 +52,14 @@ def private_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if key not in {"PGDATA", "PGHOST", "PGPORT"} and not key.startswith("PAGESTORE_")
+        if not key.startswith("PG") and not key.startswith("PAGESTORE_")
     }
+
+
+def sqlstate_from_output(output: str) -> str | None:
+    """Extract PostgreSQL's SQLSTATE from psql verbose error output."""
+    match = re.search(r"(?:ERROR|FATAL):\s+([0-9A-Z]{5}):", output)
+    return match.group(1) if match else None
 
 
 HEADER_FIELDS = {"schema", "scenario", "seed", "contracts", "case", "extra"}
@@ -458,6 +465,7 @@ def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector
         prepared_readers: dict[str, Path] = {}
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
+        reader_data_dirs: dict[str, Path] = {}
         for action in plan.actions:
             if action["op"] == "sql":
                 sql = action["sql"].replace("${tablespace}", str(tablespace).replace("'", "''"))
@@ -530,6 +538,7 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(f"pagestore.read_lsn = '{lsn}'\npagestore.route_all = on\narchive_mode = off\nlisten_addresses = ''\nunix_socket_directories = '{reader_socket}'\nport = {reader_port}\n")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 reader_clients[action["target"]] = (reader_socket, reader_port)
+                reader_data_dirs[action["target"]] = reader_data
                 events.emit("install_reader", id=action["id"], target=action["target"], lsn=lsn, data=str(reader_data), port=reader_port)
                 continue
             elif action["op"] == "capture":
@@ -546,18 +555,29 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 continue
             else:
                 raise PlanError(f"writer smoke does not execute {action['op']}")
-            client_socket, client_port = reader_clients.get(action.get("target", "writer"), (sockdir, port))
-            result = subprocess.run([str(pg_bin / "psql"), "-h", str(client_socket), "-p", str(client_port), "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql],
+            target = action["target"]
+            if target == "writer":
+                client_socket, client_port = sockdir, port
+            elif target in reader_clients:
+                client_socket, client_port = reader_clients[target]
+            else:
+                raise PlanError(f"action {action['id']} targets unavailable compute {target!r}")
+            result = subprocess.run([str(pg_bin / "psql"), "-h", str(client_socket), "-p", str(client_port), "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-c", sql],
                                     check=False, capture_output=True, encoding="utf-8", env=env)
             expected_error = action.get("expect_error")
-            if expected_error is not None:
+            expected_sqlstate = action.get("expect_sqlstate")
+            if expected_error is not None or expected_sqlstate is not None:
                 combined = result.stdout + result.stderr
-                if result.returncode == 0 or expected_error not in combined:
+                actual_sqlstate = sqlstate_from_output(combined)
+                if (result.returncode == 0 or
+                        (expected_error is not None and expected_error not in combined) or
+                        (expected_sqlstate is not None and expected_sqlstate != actual_sqlstate)):
                     raise PlanError(
-                        f"sql {action['id']} expected failure containing {expected_error!r}, "
-                        f"got status {result.returncode}: {combined.strip()!r}")
+                        f"sql {action['id']} expected failure with error {expected_error!r} and "
+                        f"SQLSTATE {expected_sqlstate!r}, got status {result.returncode}, "
+                        f"SQLSTATE {actual_sqlstate!r}: {combined.strip()!r}")
                 events.emit("expected_failure", id=action["id"], target=action["target"],
-                            error=expected_error)
+                            error=expected_error, sqlstate=actual_sqlstate)
                 continue
             result.check_returncode()
             output = result.stdout.strip()
@@ -586,6 +606,10 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
         (root / "failure.json").write_text(json.dumps({"classification": "setup", "error": str(error)}, indent=2) + "\n", encoding="utf-8")
         raise PlanError(f"writer smoke failed; failure bundle: {root}: {error}") from error
     finally:
+        for reader_data in reader_data_dirs.values():
+            if (reader_data / "postmaster.pid").exists():
+                subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-m", "immediate", "-w", "stop"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         if (data / "postmaster.pid").exists():
             subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "immediate", "-w", "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         if dproc is not None and dproc.poll() is None:
