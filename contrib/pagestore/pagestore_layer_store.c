@@ -586,7 +586,7 @@ local_download_layer(const PsLayerDesc *layer)
 		return -1;
 	if (copy_file_atomic(source->uri, local, layer_dir) != 0)
 		return -1;
-	if (stat(local, &st) != 0 || st.st_size < (off_t) sizeof(PsImgFooter) ||
+	if (stat(local, &st) != 0 || st.st_size < 0 ||
 		(uint64_t) st.st_size != source->size)
 	{
 		unlink(local);
@@ -597,7 +597,8 @@ local_download_layer(const PsLayerDesc *layer)
 		PsImgFooter foot;
 		int fd = open(local, O_RDONLY);
 
-		if (fd < 0 || pread(fd, &foot, sizeof(foot),
+		if (st.st_size < (off_t) sizeof(foot) || fd < 0 ||
+			pread(fd, &foot, sizeof(foot),
 						  st.st_size - sizeof(foot)) != sizeof(foot))
 		{
 			if (fd >= 0)

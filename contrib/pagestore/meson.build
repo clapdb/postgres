@@ -102,7 +102,7 @@ test('pagestore_layer',
 
 # Unit test for the filesystem-backed remote object provider (no daemon, no PG).
 pagestore_layer_store_test = executable('pagestore_layer_store_test',
-  files('pagestore_layer_store_test.c', 'pagestore_layer_store.c'),
+  files('pagestore_layer_store_test.c', 'pagestore_layer_store.c', 'pagestore_layer.c'),
   install: false,
 )
 test('pagestore_layer_store',
