@@ -594,8 +594,8 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
-		return -1;
+									 &foot, sizeof(foot)) != 0)
+		goto refresh;
 	if (foot.magic != PS_IMG_MAGIC ||
 		(foot.version != 2 && foot.version != 3 &&
 		 foot.version != PS_IMG_VERSION) || foot.nrecs == 0)
@@ -764,9 +764,9 @@ retry:
 		(foot.version != 2 && foot.version != 3 &&
 		 foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size || foot.nrecs == 0)
-		return -1;
+		goto refresh;
 	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0 || nidx != foot.nrecs)
-		goto out;
+		goto refresh;
 
 	/*
 	 * Verify the data section once (per process) before the first page is
@@ -778,15 +778,7 @@ retry:
 	{
 		if (ps_image_layer_verify_data(layer, page_size) != 0)
 		{
-			free(idx);
-			idx = NULL;
-			if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
-				ps_layer_store->refresh_layer_cache(layer) == 0)
-			{
-				retried = 1;
-				goto retry;
-			}
-			goto out;
+			goto refresh;
 		}
 	}
 
@@ -813,12 +805,23 @@ retry:
 		goto out;
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
-		goto out;
+		goto refresh;
 	if (out_lsn)
 		*out_lsn = best_lsn;
 	if (out_seq)
 		*out_seq = best_seq;
 	rc = 1;
+	goto out;
+
+refresh:
+	free(idx);
+	idx = NULL;
+	if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
+		ps_layer_store->refresh_layer_cache(layer) == 0)
+	{
+		retried = 1;
+		goto retry;
+	}
 
 out:
 	free(idx);
