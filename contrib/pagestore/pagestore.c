@@ -1580,6 +1580,19 @@ ps_clog_seed_page_index(int64 pageno, int64 page_lo, int64 page_hi,
 	return -1;
 }
 
+/* Match clog.c's wraparound-aware page ordering for truncation decisions. */
+static bool
+ps_clog_page_precedes(int64 page1, int64 page2)
+{
+	TransactionId xid1 = (TransactionId) page1 * PS_CLOG_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+	TransactionId xid2 = (TransactionId) page2 * PS_CLOG_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+
+	return TransactionIdPrecedes(xid1, xid2) &&
+		TransactionIdPrecedes(xid1, xid2 + PS_CLOG_XACTS_PER_PAGE - 1);
+}
+
 /* Set xid's status in a CLOG page array that can cross the XID wrap point. */
 static inline void
 ps_clog_seed_set(char *pages, int64 page_lo, int64 page_hi, bool wraps,
@@ -3973,16 +3986,20 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 			else if (cinfo == CLOG_TRUNCATE)
 			{
 				xl_clog_truncate xlrec;
+				int64		cut_seg;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
-				/* truncation drops whole segments below the cutoff page's segment; if
-				 * that reaches the oldest seeded segment the caller's horizon is stale
-				 * (a fork window is far too short to wrap, so segment order suffices) */
-				if (ps_clog_seed_page_index(xlrec.pageno,
-											page_lo, page_hi, wraps) > 0)
+				/* Truncation removes whole segments *before* the cutoff segment.
+				 * page_lo is segment-aligned, so a cutoff later within that same
+				 * segment leaves the oldest seeded segment intact.  Compare segment
+				 * starts with CLOG's modular page ordering for wrapped horizons. */
+				cut_seg = xlrec.pageno / SLRU_PAGES_PER_SEGMENT;
+				if (cut_seg != seg_lo &&
+					ps_clog_page_precedes(seg_lo * SLRU_PAGES_PER_SEGMENT,
+									  cut_seg * SLRU_PAGES_PER_SEGMENT))
 					ereport(ERROR,
 							(errmsg("pagestore: clog truncation to page %lld occurs within (base, target]; horizon is stale",
-									(long long) xlrec.pageno)));
+										(long long) xlrec.pageno)));
 			}
 			continue;
 		}
@@ -4137,6 +4154,68 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Seed a commit-ts horizon which crosses the 32-bit XID/page boundary.  The
+ * generic SLRU seeder operates on one physical interval, so materialize the
+ * high and low intervals into one private directory and publish it only after
+ * both have succeeded.  This preserves the normal all-or-nothing directory
+ * swap while keeping each reconstruction WAL pass and page array bounded.
+ */
+static int64
+pagestore_seed_commit_ts_wrapped(const char *target_dir, int64 page_lo,
+							 int64 page_hi, XLogRecPtr base, XLogRecPtr target)
+{
+	char		staging_root[MAXPGPATH];
+	char		dstdir[MAXPGPATH];
+	char		stagedir[MAXPGPATH];
+	int			pathlen;
+	int64		seeded;
+	int64		max_page = PG_UINT32_MAX / PS_CTS_XACTS_PER_PAGE;
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	pathlen = snprintf(staging_root, sizeof(staging_root),
+					   "%s/pg_commit_ts.seed.tmp", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, staging_root);
+	pathlen = snprintf(dstdir, sizeof(dstdir), "%s/pg_commit_ts", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, dstdir);
+	pathlen = snprintf(stagedir, sizeof(stagedir), "%s/pg_commit_ts", staging_root);
+	PS_CHECK_PATH_FORMAT(pathlen, stagedir);
+	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch commit-ts staging dir \"%s\": %m",
+						staging_root)));
+	if (MakePGDirectory(staging_root) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch commit-ts staging dir \"%s\": %m",
+						staging_root)));
+
+	seeded = pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
+								 page_lo, max_page,
+								 ps_commit_ts_seed_reconstruct_range,
+								 base, target, "commit-ts", false, false);
+	seeded += pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
+								  0, page_hi,
+								  ps_commit_ts_seed_reconstruct_range,
+								  base, target, "commit-ts", false, false);
+	fsync_fname(stagedir, true);
+	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing commit-ts dir \"%s\": %m", dstdir)));
+	if (rename(stagedir, dstdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch commit-ts dir \"%s\": %m", dstdir)));
+	(void) rmdir(staging_root);
+	fsync_fname(target_dir, true);
+	return seeded;
+}
+
+/*
  * pagestore_seed_commit_ts(target_dir text, base pg_lsn, target pg_lsn,
  *                          oldest_xid xid, next_xid xid) returns bigint
  *
@@ -4233,10 +4312,9 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 	}
 	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
 	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
-	if (page_hi < page_lo)
-		ereport(ERROR,
-				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; commit-ts seeding across wrap is not supported",
-						oldest_xid, next_xid)));
+	if (next_xid < oldest_xid)
+		PG_RETURN_INT64(pagestore_seed_commit_ts_wrapped(target_dir, page_lo,
+													 page_hi, base, target));
 
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
