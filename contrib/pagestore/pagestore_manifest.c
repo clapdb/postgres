@@ -31,6 +31,7 @@ typedef enum PsManifestEventType
 	PS_MANIFEST_MARK_DELETE = 4,
 	PS_MANIFEST_REMOVE_LAYER = 5,
 	PS_MANIFEST_SET_FLUSH_WATERMARK = 6,
+	PS_MANIFEST_SET_REMOTE_LOCATION = 7,
 } PsManifestEventType;
 
 typedef struct PsManifestRecord
@@ -66,6 +67,12 @@ typedef struct PsManifestLocationDisk
 	uint8_t		available;
 	uint8_t		pad[3];
 } PsManifestLocationDisk;
+
+typedef struct PsManifestRemoteLocationEvent
+{
+	uint64_t	layer_id;
+	PsManifestLocationDisk location;
+} PsManifestRemoteLocationEvent;
 
 typedef struct PsManifestLayerDisk
 {
@@ -170,6 +177,8 @@ manifest_type_payload_len(uint32_t type)
 		case PS_MANIFEST_MARK_DELETE:
 		case PS_MANIFEST_REMOVE_LAYER:
 			return (int) sizeof(PsManifestLayerIdEvent);
+		case PS_MANIFEST_SET_REMOTE_LOCATION:
+			return (int) sizeof(PsManifestRemoteLocationEvent);
 		case PS_MANIFEST_SET_FLUSH_WATERMARK:
 			return (int) sizeof(PsFlushWatermark);
 		default:
@@ -246,6 +255,24 @@ static int
 manifest_layer_desc_valid(const PsLayerDesc *desc)
 {
 	return desc->location_count <= PS_LAYER_MAX_LOCATIONS;
+}
+
+static int
+manifest_remote_location_valid(const PsLayerLocation *location)
+{
+	return location != NULL &&
+		location->tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+		location->uri[0] != '\0' && location->size > 0 && location->available;
+}
+
+static int
+manifest_has_remote_location(const PsLayerDesc *layer)
+{
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+			layer->locations[i].available)
+			return 1;
+	return 0;
 }
 
 static void
@@ -528,6 +555,7 @@ ps_manifest_replay(PsLayerMap *map)
 			unsigned char bytes[sizeof(PsManifestLayerDisk)];
 			PsManifestLayerDisk layer;
 			PsManifestLayerIdEvent ev;
+			PsManifestRemoteLocationEvent remote_location;
 			PsFlushWatermark watermark;
 		}			payload;
 		off_t		rec_off = good_off;
@@ -560,6 +588,7 @@ ps_manifest_replay(PsLayerMap *map)
 					unsigned char bytes[sizeof(PsManifestLayerDisk)];
 					PsManifestLayerDisk layer;
 					PsManifestLayerIdEvent ev;
+					PsManifestRemoteLocationEvent remote_location;
 					PsFlushWatermark watermark;
 				}			pbuf;
 				off_t		psize;
@@ -588,8 +617,19 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc desc;
 
-					if (manifest_decode_layer(&desc, &payload.layer) != 0 ||
-						(!manifest_layer_exists(map, desc.layer_id) &&
+					if (manifest_decode_layer(&desc, &payload.layer) != 0)
+					{
+						close(fd);
+						return -1;
+					}
+					/* A compacted pre-location manifest can encode durability only in
+					 * ADD_LAYER.  Do not claim an unlocatable remote copy is safe. */
+					if (desc.remote_durable && !manifest_has_remote_location(&desc))
+					{
+						desc.remote_durable = false;
+						desc.remote_uploaded_lsn = 0;
+					}
+					if ((!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
 					{
 						close(fd);
@@ -602,11 +642,24 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (layer != NULL)
+					/* Old writers could append this record before discovering that
+					 * its layer no longer existed; their replay ignored it. */
+					if (layer == NULL)
+						break;
+					/* Manifests written before remote locations were persisted can
+					 * legitimately mark a local-only layer remote-durable.  The old
+					 * object cannot be located after restart, so conservatively make
+					 * this layer require upload again instead of refusing to open the
+					 * whole store.  A later SET_REMOTE_LOCATION + durable event repairs
+					 * it durably. */
+					if (!manifest_has_remote_location(layer))
 					{
-						layer->remote_durable = true;
-						layer->remote_uploaded_lsn = payload.ev.value;
+						layer->remote_durable = false;
+						layer->remote_uploaded_lsn = 0;
+						break;
 					}
+					layer->remote_durable = true;
+					layer->remote_uploaded_lsn = payload.ev.value;
 					break;
 				}
 
@@ -622,6 +675,34 @@ ps_manifest_replay(PsLayerMap *map)
 			case PS_MANIFEST_REMOVE_LAYER:
 				manifest_remove_from_map(map, payload.ev.layer_id);
 				break;
+
+			case PS_MANIFEST_SET_REMOTE_LOCATION:
+				{
+					PsLayerDesc *layer = manifest_find_layer(map,
+													payload.remote_location.layer_id);
+					PsLayerLocation location;
+
+					memset(&location, 0, sizeof(location));
+					location.tier = (PsLayerTier) payload.remote_location.location.tier;
+					memcpy(location.uri, payload.remote_location.location.uri,
+						   sizeof(location.uri));
+					location.uri[PS_LAYER_URI_MAX - 1] = '\0';
+					location.size = payload.remote_location.location.size;
+					location.generation = payload.remote_location.location.generation;
+					location.available =
+						payload.remote_location.location.available != 0;
+
+					if (layer == NULL ||
+						!manifest_remote_location_valid(&location) ||
+						layer->location_count >= PS_LAYER_MAX_LOCATIONS ||
+						manifest_has_remote_location(layer))
+					{
+						close(fd);
+						return -1;
+					}
+					layer->locations[layer->location_count++] = location;
+					break;
+				}
 
 			case PS_MANIFEST_DROP_LOCAL:
 				{
@@ -700,21 +781,46 @@ ps_manifest_add_layer(const PsLayerDesc *desc)
 }
 
 int
+ps_manifest_set_remote_location(uint64_t layer_id,
+								const PsLayerLocation *location)
+{
+	PsManifestRemoteLocationEvent ev;
+	PsLayerDesc *layer;
+
+	layer = manifest_find_layer(&ps_layer_map, layer_id);
+	if (layer == NULL || !manifest_remote_location_valid(location) ||
+		layer->location_count >= PS_LAYER_MAX_LOCATIONS ||
+		manifest_has_remote_location(layer))
+		return -1;
+	memset(&ev, 0, sizeof(ev));
+	ev.layer_id = layer_id;
+	ev.location.tier = (uint32_t) location->tier;
+	memcpy(ev.location.uri, location->uri, sizeof(ev.location.uri));
+	ev.location.uri[PS_LAYER_URI_MAX - 1] = '\0';
+	ev.location.size = location->size;
+	ev.location.generation = location->generation;
+	ev.location.available = 1;
+	if (manifest_append(PS_MANIFEST_SET_REMOTE_LOCATION, &ev, sizeof(ev)) != 0)
+		return -1;
+	layer->locations[layer->location_count++] = *location;
+	return 0;
+}
+
+int
 ps_manifest_set_remote_durable(uint64_t layer_id, uint64_t uploaded_lsn)
 {
 	PsManifestLayerIdEvent ev;
 	PsLayerDesc *layer;
 
+	layer = manifest_find_layer(&ps_layer_map, layer_id);
+	if (layer == NULL || !manifest_has_remote_location(layer))
+		return -1;
 	ev.layer_id = layer_id;
 	ev.value = uploaded_lsn;
 	if (manifest_append(PS_MANIFEST_SET_REMOTE_DURABLE, &ev, sizeof(ev)) != 0)
 		return -1;
-	layer = manifest_find_layer(&ps_layer_map, layer_id);
-	if (layer != NULL)
-	{
-		layer->remote_durable = true;
-		layer->remote_uploaded_lsn = uploaded_lsn;
-	}
+	layer->remote_durable = true;
+	layer->remote_uploaded_lsn = uploaded_lsn;
 	return 0;
 }
 
