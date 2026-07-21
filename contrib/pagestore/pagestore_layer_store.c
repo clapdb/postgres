@@ -493,9 +493,10 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	{
 		char		cached[4096];
 
-		if (remote_location(layer) == NULL ||
-			local_download_layer(layer) != 0 ||
-			local_layer_path(layer->layer_id, cached, sizeof(cached)) != 0)
+		if (local_layer_path(layer->layer_id, cached, sizeof(cached)) != 0)
+			return -1;
+		if (access(cached, R_OK) != 0 &&
+			(remote_location(layer) == NULL || local_download_layer(layer) != 0))
 			return -1;
 		path = cached;
 	}
