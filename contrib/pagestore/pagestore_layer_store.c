@@ -566,13 +566,15 @@ local_upload_layer(const PsLayerDesc *layer)
 	const PsLayerLocation *source;
 	const PsLayerLocation *published;
 	char		remote[4096];
+	char		expected[4096];
 
 	source = local_location(layer);
 	published = remote_location(layer);
 	if (source == NULL ||
-		(published == NULL && object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0) ||
+		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||
+		(published == NULL && snprintf(remote, sizeof(remote), "%s", expected) >= (int) sizeof(remote)) ||
 		(published != NULL &&
-		 ((published->size != source->size) ||
+		 ((published->size != source->size) || strcmp(published->uri, expected) != 0 ||
 		  snprintf(remote, sizeof(remote), "%s", published->uri) >= (int) sizeof(remote))))
 		return -1;
 	/* The manifest's declared length is the minimum identity available here. */
