@@ -77,10 +77,17 @@ gc_resume_like(void)
 		if (ps_layer_map.layers[i].deleting)
 			dead[n++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < n; k++)
+	{
+		int has_remote = 0;
+
+		for (uint32_t i = 0; i < dead[k].location_count; i++)
+			if (dead[k].locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+				dead[k].locations[i].available)
+				has_remote = 1;
 		if (ps_layer_store->delete_local_layer(&dead[k]) == 0 &&
-			(!dead[k].remote_durable ||
-			 ps_layer_store->delete_remote_layer(&dead[k]) == 0))
+			(!has_remote || ps_layer_store->delete_remote_layer(&dead[k]) == 0))
 			ps_manifest_remove_layer(dead[k].layer_id);
+	}
 }
 
 static PsLayerDesc
