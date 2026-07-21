@@ -10,7 +10,9 @@
  *-------------------------------------------------------------------------
  */
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -264,6 +266,41 @@ done:
 }
 
 static int
+cleanup_stale_copy_temps(const char *destination, const char *dir)
+{
+	const char *base = strrchr(destination, '/');
+	DIR			*d;
+	struct dirent *ent;
+	char		prefix[4096];
+	char		path[4096];
+	char		*end;
+	long		pid;
+	int			n;
+
+	base = base ? base + 1 : destination;
+	n = snprintf(prefix, sizeof(prefix), "%s.tmp.", base);
+	if (n < 0 || (size_t) n >= sizeof(prefix))
+		return -1;
+	d = opendir(dir);
+	if (d == NULL)
+		return -1;
+	while ((ent = readdir(d)) != NULL)
+	{
+		if (strncmp(ent->d_name, prefix, (size_t) n) != 0)
+			continue;
+		errno = 0;
+		pid = strtol(ent->d_name + n, &end, 10);
+		if (errno != 0 || end == ent->d_name + n || *end != '.' || pid <= 0 ||
+			(kill((pid_t) pid, 0) != -1 || errno != ESRCH))
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) < (int) sizeof(path))
+			unlink(path);
+	}
+	closedir(d);
+	return 0;
+}
+
+static int
 copy_file_atomic(const char *source, const char *destination, const char *dir)
 {
 	char		tmp[4096] = "";
@@ -275,6 +312,8 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 
 	if (access(destination, F_OK) == 0)
 		return files_equal(source, destination) == 1 && fsync_dir(dir) == 0 ? 0 : -1;
+	if (cleanup_stale_copy_temps(destination, dir) != 0)
+		return -1;
 	sfd = open(source, O_RDONLY);
 	if (sfd < 0)
 		goto done;
