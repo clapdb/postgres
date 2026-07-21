@@ -126,6 +126,10 @@ main(void)
 	unsetenv("PAGESTORE_OBJECT_DIR");
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-owner", object_dir);
 	unlink(owner_path);
+	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", local_dir);
+	unlink(owner_path);
+	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", other_local_dir);
+	unlink(owner_path);
 	unlink(local_uri);
 	rmdir(local_dir);
 	rmdir(other_local_dir);

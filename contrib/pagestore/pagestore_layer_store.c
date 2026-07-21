@@ -35,10 +35,12 @@ claim_object_dir(void)
 {
 	char		path[4096];
 	char		idpath[4096];
+	char		idtmp[4096];
 	char		owner[128];
 	char		got[sizeof(owner)];
 	int		fd;
 	int		n;
+	int		owner_len;
 	ssize_t		len;
 
 	n = snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", layer_dir);
@@ -65,20 +67,27 @@ claim_object_dir(void)
 			return -1;
 		}
 		close(rfd);
-		n = 0;
+		owner_len = 0;
 		for (int i = 0; i < (int) sizeof(random); i++)
-			n += snprintf(owner + n, sizeof(owner) - (size_t) n, "%02x", random[i]);
-		if (n < 0 || (size_t) n >= sizeof(owner))
+			owner_len += snprintf(owner + owner_len, sizeof(owner) - (size_t) owner_len, "%02x", random[i]);
+		if (owner_len < 0 || (size_t) owner_len >= sizeof(owner))
 			return -1;
-		fd = open(idpath, O_WRONLY | O_CREAT | O_EXCL, 0600);
-		if (fd < 0 || write(fd, owner, (size_t) n) != n || fsync(fd) != 0)
+		n = snprintf(idtmp, sizeof(idtmp), "%s.tmp.%ld", idpath, (long) getpid());
+		if (n < 0 || (size_t) n >= sizeof(idtmp))
+			return -1;
+		fd = open(idtmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0 || write(fd, owner, (size_t) owner_len) != owner_len || fsync(fd) != 0)
 		{
 			if (fd >= 0)
 				close(fd);
+			unlink(idtmp);
 			return -1;
 		}
-		if (close(fd) != 0 || fsync_dir(layer_dir) != 0)
+		if (close(fd) != 0 || rename(idtmp, idpath) != 0 || fsync_dir(layer_dir) != 0)
+		{
+			unlink(idtmp);
 			return -1;
+		}
 	}
 	else
 		return -1;
@@ -88,7 +97,8 @@ claim_object_dir(void)
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd >= 0)
 	{
-		if (write(fd, owner, (size_t) n) != n || fsync(fd) != 0)
+		owner_len = (int) strlen(owner);
+		if (write(fd, owner, (size_t) owner_len) != owner_len || fsync(fd) != 0)
 		{
 			close(fd);
 			unlink(path);
