@@ -49,6 +49,9 @@ main(void)
 	char		other_local_dir[] = "/tmp/pslayerstoreotherXXXXXX";
 	char		object_dir[] = "/tmp/pslayerstoreobjectXXXXXX";
 	char		owner_path[sizeof(object_dir) + 32];
+	char		stale_path[sizeof(object_dir) + 64];
+	char		configured_object_dir[sizeof(object_dir) + 2];
+	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
 	const char *contents = "sealed layer object bytes";
@@ -67,6 +70,20 @@ main(void)
 	check(setenv("PAGESTORE_OBJECT_DIR", object_dir, 1) == 0 &&
 		  ps_layer_store->open(local_dir) == 0,
 		  "open exclusive object directory");
+	ps_layer_store->close();
+	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0000000000000011.tmp.999999.0",
+			 object_dir);
+	{
+		int fd = open(stale_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+		if (fd >= 0)
+			close(fd);
+		check(fd >= 0, "create interrupted-copy temporary");
+	}
+	snprintf(configured_object_dir, sizeof(configured_object_dir), "%s/", object_dir);
+	check(setenv("PAGESTORE_OBJECT_DIR", configured_object_dir, 1) == 0 &&
+		  ps_layer_store->open(local_dir) == 0 && access(stale_path, F_OK) != 0,
+		  "canonicalize object directory and reap interrupted copies at startup");
 	ps_layer_store->close();
 	check(ps_layer_store->open(other_local_dir) != 0,
 		  "reject object directory owned by another store");
@@ -93,8 +110,12 @@ main(void)
 	layer.locations[0].size = strlen(contents);
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
-											 sizeof(remote_uri)) == 0,
+												 sizeof(remote_uri)) == 0,
 		  "derive remote object URI");
+	snprintf(expected_remote_uri, sizeof(expected_remote_uri),
+			 "%s/layer_3_0003000000000011", object_dir);
+	check(strcmp(remote_uri, expected_remote_uri) == 0,
+		  "derive canonical remote object URI");
 	layer.locations[0].size++;
 	check(ps_layer_store->upload_layer(&layer) != 0,
 		  "reject upload whose source size differs from layer metadata");
