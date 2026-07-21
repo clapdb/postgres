@@ -288,12 +288,12 @@ run_request_admitted(PsChannel *ch)
 		}
 		else
 		{
-			/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+			/* Core read helpers take short map snapshots themselves.  Do not hold
+			 * map_rd around the whole request: remote cache materialization may
+			 * block, and recursive rdlock acquisition can deadlock behind a writer. */
 			ps_lock_shard_rd(shard);
-			ps_lock_map_rd();
 			handle_request(ch);
 			ps_store_release(&ch->state, PS_STATE_DONE);
-			ps_unlock_map();
 			ps_unlock_shard(shard);
 		}
 	}
