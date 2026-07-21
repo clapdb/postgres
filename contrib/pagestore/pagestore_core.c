@@ -3467,6 +3467,10 @@ tier_one_layer(void)
 			if (!layer->deleting && !layer->remote_durable &&
 				tier_local_location(layer) != NULL &&
 				layer_shard_from_id(layer->layer_id) == shard &&
+				(tier_remote_location(layer) == NULL ||
+				 (ps_layer_store->remote_uri(layer->layer_id, remote.uri,
+										 sizeof(remote.uri)) == 0 &&
+				  strcmp(tier_remote_location(layer)->uri, remote.uri) == 0)) &&
 				((phase == 0 && layer->layer_id > tier_upload_layer_cursor[shard]) ||
 				 (phase == 1 && layer->layer_id <= tier_upload_layer_cursor[shard])))
 			{
