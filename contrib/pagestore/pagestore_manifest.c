@@ -617,8 +617,19 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc desc;
 
-					if (manifest_decode_layer(&desc, &payload.layer) != 0 ||
-						(!manifest_layer_exists(map, desc.layer_id) &&
+					if (manifest_decode_layer(&desc, &payload.layer) != 0)
+					{
+						close(fd);
+						return -1;
+					}
+					/* A compacted pre-location manifest can encode durability only in
+					 * ADD_LAYER.  Do not claim an unlocatable remote copy is safe. */
+					if (desc.remote_durable && !manifest_has_remote_location(&desc))
+					{
+						desc.remote_durable = false;
+						desc.remote_uploaded_lsn = 0;
+					}
+					if ((!manifest_layer_exists(map, desc.layer_id) &&
 						 ps_layer_map_add(map, &desc) != 0))
 					{
 						close(fd);
@@ -631,11 +642,10 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
+					/* Old writers could append this record before discovering that
+					 * its layer no longer existed; their replay ignored it. */
 					if (layer == NULL)
-					{
-						close(fd);
-						return -1;
-					}
+						break;
 					/* Manifests written before remote locations were persisted can
 					 * legitimately mark a local-only layer remote-durable.  The old
 					 * object cannot be located after restart, so conservatively make
