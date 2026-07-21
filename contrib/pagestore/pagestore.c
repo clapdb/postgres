@@ -1563,20 +1563,51 @@ ps_clog_set_status(char *page, int64 pageno, TransactionId xid, int status)
 		(status << bshift);
 }
 
-/* Set xid's status in a contiguous array of clog pages starting at 'page_lo'
- * (np pages); xids outside the covered range are ignored.  Used by the seeder's
- * single multi-page WAL pass. */
+/* Return the logical-array index for a physical CLOG page, or -1 if absent. */
+static int
+ps_clog_seed_page_index(int64 pageno, int64 page_lo, int64 page_hi,
+						bool wraps)
+{
+	int64		max_page = PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE;
+
+	if (!wraps)
+		return pageno >= page_lo && pageno <= page_hi ?
+			(int) (pageno - page_lo) : -1;
+	if (pageno >= page_lo && pageno <= max_page)
+		return (int) (pageno - page_lo);
+	if (pageno >= 0 && pageno <= page_hi)
+		return (int) (max_page - page_lo + 1 + pageno);
+	return -1;
+}
+
+/* Match clog.c's wraparound-aware page ordering for truncation decisions. */
+static bool
+ps_clog_page_precedes(int64 page1, int64 page2)
+{
+	TransactionId xid1 = (TransactionId) page1 * PS_CLOG_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+	TransactionId xid2 = (TransactionId) page2 * PS_CLOG_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+
+	return TransactionIdPrecedes(xid1, xid2) &&
+		TransactionIdPrecedes(xid1, xid2 + PS_CLOG_XACTS_PER_PAGE - 1);
+}
+
+/* Set xid's status in a CLOG page array that can cross the XID wrap point. */
 static inline void
-ps_clog_seed_set(char *pages, int64 page_lo, int np, TransactionId xid, int status)
+ps_clog_seed_set(char *pages, int64 page_lo, int64 page_hi, bool wraps,
+				 TransactionId xid, int status)
 {
 	int64		pg;
+	int			idx;
 
 	if (!TransactionIdIsNormal(xid))
 		return;
 	pg = (int64) xid / PS_CLOG_XACTS_PER_PAGE;
-	if (pg < page_lo || pg >= page_lo + np)
+	idx = ps_clog_seed_page_index(pg, page_lo, page_hi, wraps);
+	if (idx < 0)
 		return;
-	ps_clog_set_status(pages + (pg - page_lo) * BLCKSZ, pg, xid, status);
+	ps_clog_set_status(pages + idx * BLCKSZ, pg, xid, status);
 }
 
 /* What the replay of (base, target] observed for a single clog page. */
@@ -2035,6 +2066,19 @@ ps_commit_ts_normalize_horizons(XLogRecPtr target, TransactionId next_xid,
 
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
+
+/* Match commit_ts.c's wraparound-aware page ordering for truncation. */
+static bool
+ps_commit_ts_page_precedes(int64 page1, int64 page2)
+{
+	TransactionId xid1 = (TransactionId) page1 * PS_CTS_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+	TransactionId xid2 = (TransactionId) page2 * PS_CTS_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+
+	return TransactionIdPrecedes(xid1, xid2) &&
+		TransactionIdPrecedes(xid1, xid2 + PS_CTS_XACTS_PER_PAGE - 1);
+}
 
 /* Write xid's (ts, nodeid) into commit-ts page 'pageno' in 'page' if it lives there. */
 static void
@@ -3015,7 +3059,9 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				for (int64 p = 0; p < np; p++)
 				{
 					pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
-					if (pageseg < cut_seg)
+					if (pageseg != cut_seg &&
+						ps_commit_ts_page_precedes(pageseg * SLRU_PAGES_PER_SEGMENT,
+										cut_seg * SLRU_PAGES_PER_SEGMENT))
 					{
 						present[p] = false;
 						truncated[p] = true;
@@ -3809,9 +3855,9 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	int64		page_lo,
 				page_hi,
 				seg_lo,
-				seg_hi,
 				seg,
 				p;
+	bool		wraps;
 	int			np;
 	char	   *pages;
 	bool	   *established;		/* page content known (in base, or zeroed in range) */
@@ -3855,16 +3901,16 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	seg_lo = page_lo / SLRU_PAGES_PER_SEGMENT;
 	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
 	page_hi = ((int64) (next_xid - 1)) / PS_CLOG_XACTS_PER_PAGE;
-	seg_hi = page_hi / SLRU_PAGES_PER_SEGMENT;
-	/* The horizon is wraparound-aware (TransactionIdFollows above), but the page
-	 * numbers are not: a horizon straddling the 32-bit wrap makes page_lo land near
-	 * the top and page_hi near zero.  Rather than seed a bogus/negative range, fail
-	 * closed -- clog seeding across the wrap point is out of scope. */
-	if (page_hi < page_lo)
-		ereport(ERROR,
-				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; clog seeding across wrap is not supported",
-						oldest_xid, next_xid)));
-	np = (int) (page_hi - page_lo + 1);
+	wraps = next_xid < oldest_xid;
+	/* XID 3 has not extended page zero yet.  A horizon ending at 3 includes
+	 * the pre-wrap run only; requiring a page-zero base image would be wrong. */
+	if (wraps && next_xid == FirstNormalTransactionId)
+		page_hi = -1;
+	if (wraps)
+		np = (int) ((PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) +
+					page_hi + 1);
+	else
+		np = (int) (page_hi - page_lo + 1);
 
 	/* Build every page in [page_lo, page_hi] in memory, then a single WAL pass over
 	 * (base, target] applies statuses/zero-pages/truncations to all of them at once
@@ -3878,8 +3924,12 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 
 		/* require the exact-cutoff snapshot version: an older newest-<= image would
 		 * skip WAL between it and base (see ps_clog_reconstruct) */
+		int64			physical_page = wraps && page_lo + p >
+			PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE ?
+			p - (PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) : page_lo + p;
+
 		established[p] = pagestore_localsvc_obj_read_at(PS_KLASS_SLRU, &key,
-													   (BlockNumber) (page_lo + p),
+													   (BlockNumber) physical_page,
 													   (uint64) base,
 													   pages + p * BLCKSZ, &resolved) &&
 			resolved == (uint64) base;
@@ -3941,26 +3991,34 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 			if (cinfo == CLOG_ZEROPAGE)
 			{
 				int64		zp;
+				int			idx;
 
 				memcpy(&zp, XLogRecGetData(reader), sizeof(zp));
-				if (zp >= page_lo && zp <= page_hi)
+				idx = ps_clog_seed_page_index(zp, page_lo, page_hi, wraps);
+
+				if (idx >= 0)
 				{
-					memset(pages + (zp - page_lo) * BLCKSZ, 0, BLCKSZ);
-					established[zp - page_lo] = true;
+					memset(pages + idx * BLCKSZ, 0, BLCKSZ);
+					established[idx] = true;
 				}
 			}
 			else if (cinfo == CLOG_TRUNCATE)
 			{
 				xl_clog_truncate xlrec;
+				int64		cut_seg;
 
 				memcpy(&xlrec, XLogRecGetData(reader), sizeof(xlrec));
-				/* truncation drops whole segments below the cutoff page's segment; if
-				 * that reaches the oldest seeded segment the caller's horizon is stale
-				 * (a fork window is far too short to wrap, so segment order suffices) */
-				if (xlrec.pageno / SLRU_PAGES_PER_SEGMENT > seg_lo)
+				/* Truncation removes whole segments *before* the cutoff segment.
+				 * page_lo is segment-aligned, so a cutoff later within that same
+				 * segment leaves the oldest seeded segment intact.  Compare segment
+				 * starts with CLOG's modular page ordering for wrapped horizons. */
+				cut_seg = xlrec.pageno / SLRU_PAGES_PER_SEGMENT;
+				if (cut_seg != seg_lo &&
+					ps_clog_page_precedes(seg_lo * SLRU_PAGES_PER_SEGMENT,
+									  cut_seg * SLRU_PAGES_PER_SEGMENT))
 					ereport(ERROR,
 							(errmsg("pagestore: clog truncation to page %lld occurs within (base, target]; horizon is stale",
-									(long long) xlrec.pageno)));
+										(long long) xlrec.pageno)));
 			}
 			continue;
 		}
@@ -3977,9 +4035,9 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 							  (xl_xact_commit *) XLogRecGetData(reader), &parsed);
 			xid = (info == XLOG_XACT_COMMIT_PREPARED) ? parsed.twophase_xid
 				: XLogRecGetXid(reader);
-			ps_clog_seed_set(pages, page_lo, np, xid, status);
+			ps_clog_seed_set(pages, page_lo, page_hi, wraps, xid, status);
 			for (int i = 0; i < parsed.nsubxacts; i++)
-				ps_clog_seed_set(pages, page_lo, np, parsed.subxacts[i], status);
+				ps_clog_seed_set(pages, page_lo, page_hi, wraps, parsed.subxacts[i], status);
 		}
 		else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED)
 		{
@@ -3990,9 +4048,9 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 							 (xl_xact_abort *) XLogRecGetData(reader), &parsed);
 			xid = (info == XLOG_XACT_ABORT_PREPARED) ? parsed.twophase_xid
 				: XLogRecGetXid(reader);
-			ps_clog_seed_set(pages, page_lo, np, xid, status);
+			ps_clog_seed_set(pages, page_lo, page_hi, wraps, xid, status);
 			for (int i = 0; i < parsed.nsubxacts; i++)
-				ps_clog_seed_set(pages, page_lo, np, parsed.subxacts[i], status);
+				ps_clog_seed_set(pages, page_lo, page_hi, wraps, parsed.subxacts[i], status);
 		}
 	}
 	XLogReaderFree(reader);
@@ -4015,7 +4073,10 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 		if (!established[p])
 			ereport(ERROR,
 					(errmsg("pagestore: base clog snapshot for page %lld is absent at %X/%08X",
-							(long long) (page_lo + p), LSN_FORMAT_ARGS(base))));
+					(long long) (wraps && page_lo + p >
+					PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE ?
+					p - (PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) : page_lo + p),
+					LSN_FORMAT_ARGS(base))));
 
 	/*
 	 * Publish atomically at directory granularity: stage every segment under a
@@ -4043,46 +4104,53 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not create branch staging dir \"%s\": %m", stagedir)));
 
-	for (seg = seg_lo; seg <= seg_hi; seg++)
+	seg = -1;
+	for (p = 0; p < np; p++)
 	{
 		char		segpath[MAXPGPATH];
-		int64		first = seg * SLRU_PAGES_PER_SEGMENT;
-		int64		last = first + SLRU_PAGES_PER_SEGMENT - 1;
 		int			fd;
+		int64		physical_page = wraps && page_lo + p >
+			PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE ?
+			p - (PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) : page_lo + p;
+		int64		physical_seg = physical_page / SLRU_PAGES_PER_SEGMENT;
 
-		if (last > page_hi)
-			last = page_hi;
-		snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir, (unsigned int) seg);
-		fd = OpenTransientFilePerm(segpath,
-								   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
-								   pg_file_create_mode);
-		if (fd < 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create branch segment \"%s\": %m", segpath)));
-		for (p = first; p <= last; p++)
+		if (physical_seg != seg)
 		{
-			if (write(fd, pages + (p - page_lo) * BLCKSZ, BLCKSZ) != BLCKSZ)
-			{
-				CloseTransientFile(fd);
+			seg = physical_seg;
+			snprintf(segpath, sizeof(segpath), "%s/%04X", stagedir,
+					 (unsigned int) seg);
+			fd = OpenTransientFilePerm(segpath,
+									   O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY,
+									   pg_file_create_mode);
+			if (fd < 0)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not write branch segment \"%s\": %m", segpath)));
+						 errmsg("could not create branch segment \"%s\": %m", segpath)));
+			for (;;)
+			{
+				if (write(fd, pages + p * BLCKSZ, BLCKSZ) != BLCKSZ)
+				{
+					CloseTransientFile(fd);
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not write branch segment \"%s\": %m", segpath)));
+				}
+				seeded++;
+				p++;
+				if (p == np)
+					break;
+				physical_page = wraps && page_lo + p >
+					PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE ?
+					p - (PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) : page_lo + p;
+				if (physical_page / SLRU_PAGES_PER_SEGMENT != seg)
+					break;
 			}
-			seeded++;
+			if (pg_fsync(fd) != 0 || CloseTransientFile(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not finish branch segment \"%s\": %m", segpath)));
+			p--;
 		}
-		if (pg_fsync(fd) != 0)
-		{
-			CloseTransientFile(fd);
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not fsync branch segment \"%s\": %m", segpath)));
-		}
-		/* a close error can surface a deferred write failure -- fail the seed */
-		if (CloseTransientFile(fd) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not close branch segment \"%s\": %m", segpath)));
 	}
 	fsync_fname(stagedir, true);	/* segment entries durable inside the staging dir */
 	/*
@@ -4102,6 +4170,70 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	fsync_fname(target_dir, true);	/* the now-live pg_xact directory entry */
 
 	PG_RETURN_INT64(seeded);
+}
+
+/*
+ * Seed a commit-ts horizon which crosses the 32-bit XID/page boundary.  The
+ * generic SLRU seeder operates on one physical interval, so materialize the
+ * high and low intervals into one private directory and publish it only after
+ * both have succeeded.  This preserves the normal all-or-nothing directory
+ * swap while keeping each reconstruction WAL pass and page array bounded.
+ */
+static int64
+pagestore_seed_commit_ts_wrapped(const char *target_dir, int64 page_lo,
+							 int64 page_hi, bool seed_low,
+							 XLogRecPtr base, XLogRecPtr target)
+{
+	char		staging_root[MAXPGPATH];
+	char		dstdir[MAXPGPATH];
+	char		stagedir[MAXPGPATH];
+	int			pathlen;
+	int64		seeded;
+	int64		max_page = PG_UINT32_MAX / PS_CTS_XACTS_PER_PAGE;
+
+	if (MakePGDirectory(target_dir) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch dir \"%s\": %m", target_dir)));
+	pathlen = snprintf(staging_root, sizeof(staging_root),
+					   "%s/pg_commit_ts.seed.tmp", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, staging_root);
+	pathlen = snprintf(dstdir, sizeof(dstdir), "%s/pg_commit_ts", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, dstdir);
+	pathlen = snprintf(stagedir, sizeof(stagedir), "%s/pg_commit_ts", staging_root);
+	PS_CHECK_PATH_FORMAT(pathlen, stagedir);
+	if (access(staging_root, F_OK) == 0 && !rmtree(staging_root, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not clear branch commit-ts staging dir \"%s\": %m",
+						staging_root)));
+	if (MakePGDirectory(staging_root) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create branch commit-ts staging dir \"%s\": %m",
+						staging_root)));
+
+	seeded = pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
+								 page_lo, max_page,
+								 ps_commit_ts_seed_reconstruct_range,
+								 base, target, "commit-ts", false, false);
+	if (seed_low)
+		seeded += pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
+								  0, page_hi,
+								  ps_commit_ts_seed_reconstruct_range,
+								  base, target, "commit-ts", false, false);
+	fsync_fname(stagedir, true);
+	if (access(dstdir, F_OK) == 0 && !rmtree(dstdir, true))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove existing commit-ts dir \"%s\": %m", dstdir)));
+	if (rename(stagedir, dstdir) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not publish branch commit-ts dir \"%s\": %m", dstdir)));
+	(void) rmdir(staging_root);
+	fsync_fname(target_dir, true);
+	return seeded;
 }
 
 /*
@@ -4201,10 +4333,11 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 	}
 	page_lo = ((int64) oldest_xid / PS_CTS_XACTS_PER_PAGE);
 	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
-	if (page_hi < page_lo)
-		ereport(ERROR,
-				(errmsg("fork xid horizon [%u, %u) spans XID wraparound; commit-ts seeding across wrap is not supported",
-						oldest_xid, next_xid)));
+	if (next_xid < oldest_xid)
+		PG_RETURN_INT64(pagestore_seed_commit_ts_wrapped(target_dir, page_lo,
+													 page_hi,
+													 next_xid != FirstNormalTransactionId,
+													 base, target));
 
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
@@ -4886,10 +5019,11 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 	len = snprintf(slru_dir, sizeof(slru_dir), "%s/pg_xact", target_dir);
 	PS_CHECK_PATH_FORMAT(len, slru_dir);
 
-	for (uint64 xid64 = oldest_xid; xid64 < (uint64) next_xid; xid64++)
+	/* CLOG page numbers and transaction IDs both wrap at 2^32. */
+	for (TransactionId xid = oldest_xid;
+		 !TransactionIdEquals(xid, next_xid);)
 	{
-		TransactionId xid = (TransactionId) xid64;
-		int64		pageno = xid64 / PS_CLOG_XACTS_PER_PAGE;
+		int64		pageno = xid / PS_CLOG_XACTS_PER_PAGE;
 		int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
 		int			pgidx;
 		int			status;
@@ -4947,6 +5081,7 @@ pagestore_write_reader_snapshot(const char *target_dir, uint32 timeline,
 			}
 			xids[count++] = xid;
 		}
+		TransactionIdAdvance(xid);
 	}
 	if (fd >= 0)
 		CloseTransientFile(fd);
