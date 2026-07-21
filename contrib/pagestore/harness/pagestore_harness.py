@@ -358,9 +358,11 @@ def run_daemon_smoke(
         json.dumps(plan.header["case"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     events = EventLog(trace / "events.jsonl")
-    shm = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
+    shm_base = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
+    shm = ""
+    shm_names: list[str] = []
+    generation = 0
     daemon_log = trace / "daemon.log"
-    command = [str(daemon), "--shm", shm, "--store", str(store), "--nshards", str(plan.header["case"]["shards"])]
     process: subprocess.Popen[str] | None = None
     failure: Exception | None = None
 
@@ -370,7 +372,12 @@ def run_daemon_smoke(
                 f"daemon exited {context} with status {daemon_process.returncode}")
 
     def start_daemon(action_id: str | None = None) -> subprocess.Popen[str]:
-        nonlocal process
+        nonlocal generation, process, shm
+        shm = f"{shm_base}_{generation}"
+        generation += 1
+        shm_names.append(shm)
+        command = [str(daemon), "--shm", shm, "--store", str(store),
+                   "--nshards", str(plan.header["case"]["shards"])]
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
@@ -395,7 +402,8 @@ def run_daemon_smoke(
         return daemon_process
 
     try:
-        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
+        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
+                    shm_base=shm_base)
         daemon_log.touch()
         process = start_daemon()
         backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
@@ -408,14 +416,18 @@ def run_daemon_smoke(
             if "fault" in action:
                 raise PlanError(
                     f"daemon smoke does not implement named fault {action['fault']!r}")
+            require_daemon_alive(process, "before power loss")
             signal_process_group(process, signal.SIGKILL)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as error:
                 raise PlanError(f"crash action {action['id']} did not stop the daemon") from error
+            if process.returncode != -signal.SIGKILL:
+                raise PlanError(
+                    f"crash action {action['id']} did not deliver SIGKILL "
+                    f"(status {process.returncode})")
             events.emit("crash", id=action["id"], target="store", model="power_loss",
                         pid=process.pid, returncode=process.returncode)
-            remove_shm(shm)
             process = start_daemon(action["id"])
             backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
             require_daemon_alive(process, "after recovery")
@@ -438,7 +450,8 @@ def run_daemon_smoke(
                     signal_process_group(process, signal.SIGKILL)
                     process.wait(timeout=5)
             events.emit("process_stop", target="store", pid=process.pid, returncode=process.returncode)
-        remove_shm(shm)
+        for name in shm_names:
+            remove_shm(name)
 
     if failure is not None:
         raise PlanError(f"daemon smoke failed; failure bundle: {root}: {failure}") from failure
