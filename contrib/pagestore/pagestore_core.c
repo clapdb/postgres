@@ -572,7 +572,9 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 * durable deleting record and let the idle maintenance path run
 		 * gc_resume() after releasing the shard/map write locks.
 		 */
-		if (tier_remote_location(&old[k]) != NULL)
+		if (tier_remote_location(&old[k]) != NULL ||
+			(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 &&
+			 tier_upload_candidate.layer_id == old[k].layer_id))
 			continue;
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete */
@@ -3420,6 +3422,9 @@ finish_upload:
 		}
 	if (current == NULL || current->deleting)
 	{
+		int		deleting = current != NULL;
+		int		remote_cleaned = 0;
+
 		ps_unlock_map();
 		if (ps_layer_store->remote_uri != NULL &&
 			ps_layer_store->remote_uri(candidate.layer_id, remote.uri,
@@ -3430,8 +3435,22 @@ finish_upload:
 			if (candidate.location_count < PS_LAYER_MAX_LOCATIONS)
 			{
 				candidate.locations[candidate.location_count++] = remote;
-				ps_layer_store->delete_remote_layer(&candidate);
+				if (ps_layer_store->delete_remote_layer(&candidate) != 0)
+					return 0;
+				remote_cleaned = 1;
 			}
+		}
+		if (deleting)
+		{
+			if (!remote_cleaned)
+				return 0;
+			ps_lock_map_wr();
+			if (ps_manifest_remove_layer(candidate.layer_id) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			ps_unlock_map();
 		}
 		return 1;
 	}
