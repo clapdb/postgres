@@ -904,9 +904,12 @@ main(void)
 	unlink(b_uri);
 	{
 		char		mpath[4096];
+		char		idpath[4096];
 
 		snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
 		unlink(mpath);
+		snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", dir);
+		unlink(idpath);
 	}
 	rmdir(dir);
 	unsetenv("PAGESTORE_OBJECT_DIR");
@@ -914,8 +917,6 @@ main(void)
 		char owner[4096];
 
 		snprintf(owner, sizeof(owner), "%s/.pagestore-owner", objects);
-		unlink(owner);
-		snprintf(owner, sizeof(owner), "%s/.pagestore-store-id", dir);
 		unlink(owner);
 		rmdir(objects);
 	}

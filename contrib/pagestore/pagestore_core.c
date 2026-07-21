@@ -509,7 +509,10 @@ static void *
 gc_remote_worker(void *arg)
 {
 	PsLayerDesc *layer = arg;
-	int rc = ps_layer_store->delete_remote_layer(layer);
+	int rc;
+
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	rc = ps_layer_store->delete_remote_layer(layer);
 
 	__atomic_store_n(&gc_remote_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
 	return NULL;
@@ -521,6 +524,8 @@ gc_remote_one(void)
 {
 	int state = __atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE);
 
+	if (state == 1)
+		return 0;
 	if (state != 0)
 	{
 		pthread_join(gc_remote_thread, NULL);
@@ -535,11 +540,18 @@ gc_remote_one(void)
 	}
 	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting &&
-			tier_remote_location(&ps_layer_map.layers[i]) != NULL)
+		if (ps_layer_map.layers[i].deleting)
 		{
 			gc_remote_candidate = ps_layer_map.layers[i];
 			ps_unlock_map();
+			if (tier_remote_location(&gc_remote_candidate) == NULL)
+			{
+				ps_lock_map_wr();
+				if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
+					ps_manifest_remove_layer(gc_remote_candidate.layer_id);
+				ps_unlock_map();
+				return 1;
+			}
 			__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 			if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
 						   &gc_remote_candidate) != 0)
@@ -3909,6 +3921,8 @@ ps_core_maintenance(void)
 	ns = core_shards();
 	if (tier_one_layer())
 		return 1;
+	if (gc_remote_one())
+		return 1;
 	if (gc_resume())
 		return 1;
 
@@ -3957,9 +3971,6 @@ ps_core_maintenance(void)
 			did = compact_timeline(ftl, fsh) > 0;
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
-		/* Remote GC runs in a worker, never on the shard maintenance path. */
-		gc_remote_one();
-		did = 1;
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
 	 * first turns routine compaction into remote I/O under map/shard write
