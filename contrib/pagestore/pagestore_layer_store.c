@@ -579,17 +579,34 @@ local_download_layer(const PsLayerDesc *layer)
 {
 	const PsLayerLocation *source;
 	char		local[4096];
+	struct stat st;
 
 	source = remote_location(layer);
 	if (source == NULL || local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
 	if (copy_file_atomic(source->uri, local, layer_dir) != 0)
 		return -1;
+	if (stat(local, &st) != 0 || st.st_size < (off_t) sizeof(PsImgFooter) ||
+		(uint64_t) st.st_size != source->size)
 	{
-		struct stat st;
+		unlink(local);
+		return -1;
+	}
+	if (layer->kind == PS_LAYER_IMAGE)
+	{
+		PsImgFooter foot;
+		int fd = open(local, O_RDONLY);
 
-		if (stat(local, &st) != 0 || st.st_size < 0 ||
-			(uint64_t) st.st_size != source->size)
+		if (fd < 0 || pread(fd, &foot, sizeof(foot),
+						  st.st_size - sizeof(foot)) != sizeof(foot))
+		{
+			if (fd >= 0)
+				close(fd);
+			unlink(local);
+			return -1;
+		}
+		if (close(fd) != 0 ||
+			ps_image_layer_verify_data(layer, foot.page_size) != 0)
 		{
 			unlink(local);
 			return -1;

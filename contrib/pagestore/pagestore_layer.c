@@ -162,7 +162,7 @@ img_local_loc(const PsLayerDesc *layer)
 {
 	uint32_t	nlocs = layer->location_count;
 	const PsLayerLocation *local = NULL;
-	int			remote = 0;
+	const PsLayerLocation *remote = NULL;
 
 	if (nlocs > PS_LAYER_MAX_LOCATIONS)
 		nlocs = PS_LAYER_MAX_LOCATIONS;
@@ -170,7 +170,7 @@ img_local_loc(const PsLayerDesc *layer)
 	{
 		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
 			layer->locations[i].available)
-			remote = 1;
+			remote = &layer->locations[i];
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
 		{
@@ -179,7 +179,7 @@ img_local_loc(const PsLayerDesc *layer)
 			local = &layer->locations[i];
 		}
 	}
-	return remote ? local : NULL;
+	return local ? local : remote;
 }
 
 int
