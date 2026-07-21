@@ -62,6 +62,7 @@ int			use_layers = 1;
 static pthread_t tier_upload_thread;
 static PsLayerDesc tier_upload_candidate;
 static volatile int tier_upload_state; /* 0 idle, 1 running, 2 success, 3 failed */
+static int tier_upload_joined;
 static uint32_t tier_upload_shard_cursor;
 static time_t tier_upload_retry_at;
 static int tier_one_layer(void);
@@ -3186,7 +3187,9 @@ ps_core_close(void)
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
 		pthread_join(tier_upload_thread, NULL);
-		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		tier_upload_joined = 1;
+		/* Persist a completed upload before closing its manifest. */
+		tier_one_layer();
 	}
 
 	/*
@@ -3359,7 +3362,9 @@ tier_one_layer(void)
 		return 0;
 	if (state != 0)
 	{
-		pthread_join(tier_upload_thread, NULL);
+		if (!tier_upload_joined)
+			pthread_join(tier_upload_thread, NULL);
+		tier_upload_joined = 0;
 		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
 		{
@@ -3587,6 +3592,8 @@ ps_core_open(const char *store_dir)
 	uint32_t	ns = core_shards();
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	tier_upload_joined = 0;
+	tier_upload_retry_at = 0;
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
