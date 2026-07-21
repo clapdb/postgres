@@ -64,7 +64,8 @@ static PsLayerDesc tier_upload_candidate;
 static volatile int tier_upload_state; /* 0 idle, 1 running, 2 success, 3 failed */
 static int tier_upload_joined;
 static uint32_t tier_upload_shard_cursor;
-static time_t tier_upload_retry_at;
+static struct timespec tier_upload_retry_at;
+static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
 
@@ -395,39 +396,45 @@ static const PsLayerLocation *tier_remote_location(const PsLayerDesc *layer);
  * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
  * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
  */
-static void
+static int
 gc_resume(void)
 {
 	PsLayerDesc *dead;
 	uint32_t	m = 0;
+	int		did = 0;
 
 	if (map_locks_ready)
 		ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting)
+		if (ps_layer_map.layers[i].deleting &&
+			!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
+			  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			m++;
 	if (m == 0)
 	{
 		if (map_locks_ready)
 			ps_unlock_map();
-		return;
+		return 0;
 	}
 	dead = malloc((size_t) m * sizeof(PsLayerDesc));
 	if (!dead)
 	{
 		if (map_locks_ready)
 			ps_unlock_map();
-		return;
+		return 0;
 	}
 	m = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting)
+		if (ps_layer_map.layers[i].deleting &&
+			!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
+			  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			dead[m++] = ps_layer_map.layers[i];
 	if (map_locks_ready)
 		ps_unlock_map();
 	for (uint32_t k = 0; k < m; k++)
 	{
 		int		remote_failed = 0;
+		PsLayerDesc remote = dead[k];
 		/*
 		 * Drop the manifest entry only after the file is gone (a missing file
 		 * is ENOENT == success in delete_local_layer, so this is idempotent and
@@ -437,8 +444,19 @@ gc_resume(void)
 		 * the recoverable tail instead of becoming interior corruption, and the
 		 * next start retries from the last valid manifest state.
 	 */
-		if (tier_remote_location(&dead[k]) != NULL &&
-			ps_layer_store->delete_remote_layer(&dead[k]) != 0)
+		if (tier_remote_location(&remote) == NULL &&
+			ps_layer_store->remote_uri != NULL &&
+			remote.location_count < PS_LAYER_MAX_LOCATIONS &&
+			ps_layer_store->remote_uri(remote.layer_id,
+				remote.locations[remote.location_count].uri,
+				sizeof(remote.locations[remote.location_count].uri)) == 0)
+		{
+			remote.locations[remote.location_count].tier = PS_LAYER_TIER_REMOTE_OBJECT;
+			remote.locations[remote.location_count].available = true;
+			remote.location_count++;
+		}
+		if (tier_remote_location(&remote) != NULL &&
+			ps_layer_store->delete_remote_layer(&remote) != 0)
 			remote_failed = 1;
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
@@ -468,8 +486,10 @@ gc_resume(void)
 		}
 		if (map_locks_ready)
 			ps_unlock_map();
+		did = 1;
 	}
 	free(dead);
+	return did;
 }
 
 /*
@@ -3396,6 +3416,7 @@ tier_one_layer(void)
 	PsLayerDesc *current = NULL;
 	PsLayerLocation remote;
 	const PsLayerLocation *local;
+	struct timespec now;
 	int			state;
 	int			found = 0;
 
@@ -3406,7 +3427,11 @@ tier_one_layer(void)
 	 * scheduling a worker so local-only stores do not spin on ENOTSUP uploads. */
 	if (ps_layer_store->remote_uri(0, remote.uri, sizeof(remote.uri)) != 0)
 		return 0;
-	if (tier_upload_retry_at != 0 && time(NULL) < tier_upload_retry_at)
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (tier_upload_retry_at.tv_sec != 0 &&
+		(now.tv_sec < tier_upload_retry_at.tv_sec ||
+		 (now.tv_sec == tier_upload_retry_at.tv_sec &&
+		  now.tv_nsec < tier_upload_retry_at.tv_nsec)))
 		return 0;
 	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
 	if (state == 1)
@@ -3419,10 +3444,11 @@ tier_one_layer(void)
 		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
 		{
-			tier_upload_retry_at = time(NULL) + 1;
+			clock_gettime(CLOCK_MONOTONIC, &tier_upload_retry_at);
+			tier_upload_retry_at.tv_sec++;
 			return 0;
 		}
-		tier_upload_retry_at = 0;
+		memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
 		candidate = tier_upload_candidate;
 		goto finish_upload;
 	}
@@ -3431,13 +3457,16 @@ tier_one_layer(void)
 	{
 		uint32_t shard = (tier_upload_shard_cursor + pass) % core_shards();
 
+		for (uint32_t phase = 0; phase < 2 && !found; phase++)
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		{
 			PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 			if (!layer->deleting && !layer->remote_durable &&
 				tier_local_location(layer) != NULL &&
-				layer_shard_from_id(layer->layer_id) == shard)
+				layer_shard_from_id(layer->layer_id) == shard &&
+				((phase == 0 && layer->layer_id > tier_upload_layer_cursor[shard]) ||
+				 (phase == 1 && layer->layer_id <= tier_upload_layer_cursor[shard])))
 			{
 				candidate = *layer;
 				found = 1;
@@ -3450,6 +3479,7 @@ tier_one_layer(void)
 		return 0;
 
 	tier_upload_shard_cursor = (layer_shard_from_id(candidate.layer_id) + 1) % core_shards();
+	tier_upload_layer_cursor[layer_shard_from_id(candidate.layer_id)] = candidate.layer_id;
 	tier_upload_candidate = candidate;
 	__atomic_store_n(&tier_upload_state, 1, __ATOMIC_RELEASE);
 	if (pthread_create(&tier_upload_thread, NULL, tier_upload_worker,
@@ -3493,7 +3523,18 @@ finish_upload:
 		{
 			if (!remote_cleaned)
 				return 0;
+			if (ps_layer_store->delete_local_layer(&candidate) != 0)
+				return 0;
 			ps_lock_map_wr();
+			current = NULL;
+			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+				if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+					current = &ps_layer_map.layers[i];
+			if (current == NULL || !current->deleting)
+			{
+				ps_unlock_map();
+				return 0;
+			}
 			if (ps_manifest_remove_layer(candidate.layer_id) != 0)
 			{
 				ps_unlock_map();
@@ -3561,6 +3602,8 @@ ps_core_maintenance(void)
 		return 0;
 	ns = core_shards();
 	if (tier_one_layer())
+		return 1;
+	if (gc_resume())
 		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
@@ -3662,7 +3705,8 @@ ps_core_open(const char *store_dir)
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
-	tier_upload_retry_at = 0;
+	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
+	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
