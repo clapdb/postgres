@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -61,7 +62,9 @@ int			use_layers = 1;
 static pthread_t tier_upload_thread;
 static PsLayerDesc tier_upload_candidate;
 static volatile int tier_upload_state; /* 0 idle, 1 running, 2 success, 3 failed */
-static uint64_t tier_upload_cursor;
+static uint32_t tier_upload_shard_cursor;
+static time_t tier_upload_retry_at;
+static int tier_one_layer(void);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -3348,6 +3351,8 @@ tier_one_layer(void)
 	 * scheduling a worker so local-only stores do not spin on ENOTSUP uploads. */
 	if (ps_layer_store->remote_uri(0, remote.uri, sizeof(remote.uri)) != 0)
 		return 0;
+	if (tier_upload_retry_at != 0 && time(NULL) < tier_upload_retry_at)
+		return 0;
 	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
 	if (state == 1)
 		return 0;
@@ -3356,30 +3361,38 @@ tier_one_layer(void)
 		pthread_join(tier_upload_thread, NULL);
 		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
+		{
+			tier_upload_retry_at = time(NULL) + 1;
 			return 0;
+		}
+		tier_upload_retry_at = 0;
 		candidate = tier_upload_candidate;
 		goto finish_upload;
 	}
 	ps_lock_map_rd();
-	for (int pass = 0; pass < 2 && !found; pass++)
+	for (uint32_t pass = 0; pass < core_shards() && !found; pass++)
+	{
+		uint32_t shard = (tier_upload_shard_cursor + pass) % core_shards();
+
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		{
 			PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 			if (!layer->deleting && !layer->remote_durable &&
 				tier_local_location(layer) != NULL &&
-				(pass != 0 || layer->layer_id > tier_upload_cursor))
+				layer_shard_from_id(layer->layer_id) == shard)
 			{
 				candidate = *layer;
 				found = 1;
 				break;
 			}
 		}
+	}
 	ps_unlock_map();
 	if (!found)
 		return 0;
 
-	tier_upload_cursor = candidate.layer_id;
+	tier_upload_shard_cursor = (layer_shard_from_id(candidate.layer_id) + 1) % core_shards();
 	tier_upload_candidate = candidate;
 	__atomic_store_n(&tier_upload_state, 1, __ATOMIC_RELEASE);
 	if (pthread_create(&tier_upload_thread, NULL, tier_upload_worker,
