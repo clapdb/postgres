@@ -78,10 +78,17 @@ read_id:
 			owner_len += snprintf(owner + owner_len, sizeof(owner) - (size_t) owner_len, "%02x", random[i]);
 		if (owner_len < 0 || (size_t) owner_len >= sizeof(owner))
 			return -1;
-		n = snprintf(idtmp, sizeof(idtmp), "%s.tmp.%ld", idpath, (long) getpid());
-		if (n < 0 || (size_t) n >= sizeof(idtmp))
-			return -1;
-		fd = open(idtmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		fd = -1;
+		for (int attempt = 0; attempt < 100; attempt++)
+		{
+			n = snprintf(idtmp, sizeof(idtmp), "%s.tmp.%ld.%d", idpath,
+						 (long) getpid(), attempt);
+			if (n < 0 || (size_t) n >= sizeof(idtmp))
+				return -1;
+			fd = open(idtmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			if (fd >= 0 || errno != EEXIST)
+				break;
+		}
 		if (fd < 0 || write(fd, owner, (size_t) owner_len) != owner_len || fsync(fd) != 0)
 		{
 			if (fd >= 0)
@@ -116,10 +123,17 @@ read_id:
 		goto owner_exists;
 	if (errno != ENOENT)
 		return -1;
-	n = snprintf(owner_tmp, sizeof(owner_tmp), "%s.tmp.%ld", path, (long) getpid());
-	if (n < 0 || (size_t) n >= sizeof(owner_tmp))
-		return -1;
-	fd = open(owner_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	fd = -1;
+	for (int attempt = 0; attempt < 100; attempt++)
+	{
+		n = snprintf(owner_tmp, sizeof(owner_tmp), "%s.tmp.%ld.%d", path,
+					 (long) getpid(), attempt);
+		if (n < 0 || (size_t) n >= sizeof(owner_tmp))
+			return -1;
+		fd = open(owner_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0 || errno != EEXIST)
+			break;
+	}
 	if (fd >= 0)
 	{
 		owner_len = (int) strlen(owner);
