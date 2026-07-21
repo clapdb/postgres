@@ -29,6 +29,7 @@ static int fsync_dir(const char *dir);
 static int cleanup_stale_copy_temps(const char *dir);
 static const PsLayerLocation *remote_location(const PsLayerDesc *layer);
 static int local_download_layer(const PsLayerDesc *layer);
+static int local_refresh_layer_cache(const PsLayerDesc *layer);
 
 /*
  * Object directories are deliberately single-store resources.  Layer IDs are
@@ -529,6 +530,21 @@ local_location(const PsLayerDesc *layer)
 }
 
 static int
+local_refresh_layer_cache(const PsLayerDesc *layer)
+{
+	char		local[4096];
+
+	/* Never replace an original manifest-owned local layer: only a remote-only
+	 * descriptor may have the disposable canonical read cache. */
+	if (local_location(layer) != NULL || remote_location(layer) == NULL ||
+		local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
+		return -1;
+	if (unlink(local) != 0 && errno != ENOENT)
+		return -1;
+	return local_download_layer(layer);
+}
+
+static int
 local_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
 {
 	char		path[4096];
@@ -715,6 +731,7 @@ const PsLayerStore PsLayerStoreLocal = {
 	.read_layer_block = local_read_layer_block,
 	.upload_layer = local_upload_layer,
 	.download_layer = local_download_layer,
+	.refresh_layer_cache = local_refresh_layer_cache,
 	.delete_local_layer = local_delete_local_layer,
 	.delete_remote_layer = local_delete_remote_layer,
 	.layer_exists_remote = local_layer_exists_remote,

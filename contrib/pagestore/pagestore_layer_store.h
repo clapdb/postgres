@@ -33,6 +33,8 @@ typedef struct PsLayerStore
 									 void *buf, uint32_t len);
 	int			(*upload_layer) (const PsLayerDesc *layer);
 	int			(*download_layer) (const PsLayerDesc *layer);
+	/* Replace a read-refilled canonical cache after integrity failure. */
+	int			(*refresh_layer_cache) (const PsLayerDesc *layer);
 	int			(*delete_local_layer) (const PsLayerDesc *layer);
 	int			(*delete_remote_layer) (const PsLayerDesc *layer);
 	int			(*layer_exists_remote) (const PsLayerDesc *layer);

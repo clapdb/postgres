@@ -196,6 +196,7 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 	uint64_t	total = data_bytes + idx_bytes + sizeof(PsImgFooter);
 	char		uri[PS_LAYER_URI_MAX];
 	int			rc = -1;
+	int			retried = 0;
 
 	if (n == 0)
 		return -1;
@@ -752,6 +753,8 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	 * version at/below read_lsn */
 	if (!layer_covers(layer, key, block) || read_lsn < layer->lsn_start)
 		return 0;
+
+retry:
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
@@ -774,7 +777,17 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	if (!((PsLayerDesc *) layer)->data_verified)
 	{
 		if (ps_image_layer_verify_data(layer, page_size) != 0)
+		{
+			free(idx);
+			idx = NULL;
+			if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
+				ps_layer_store->refresh_layer_cache(layer) == 0)
+			{
+				retried = 1;
+				goto retry;
+			}
 			goto out;
+		}
 	}
 
 	/* newest version of (key, block) with lsn <= read_lsn */
