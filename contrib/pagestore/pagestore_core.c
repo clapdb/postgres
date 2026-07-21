@@ -3188,6 +3188,15 @@ ps_core_close(void)
 
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
+		/* Remote tiering is optional: do not let a stalled object store delay
+		 * shutdown of the locally durable store.  The interrupted copy is
+		 * crash-safe and a later open reclaims its temporary file. */
+		pthread_cancel(tier_upload_thread);
+		pthread_join(tier_upload_thread, NULL);
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+	}
+	else if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 2)
+	{
 		pthread_join(tier_upload_thread, NULL);
 		tier_upload_joined = 1;
 		/* Persist a completed upload before closing its manifest. */
@@ -3333,7 +3342,12 @@ static void *
 tier_upload_worker(void *arg)
 {
 	PsLayerDesc *layer = arg;
-	int			rc = ps_layer_store->upload_layer(layer);
+	int			rc;
+
+	/* Shutdown cancels optional object copies rather than waiting for a slow
+	 * object mount.  This worker owns no locks or shared allocations. */
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	rc = ps_layer_store->upload_layer(layer);
 
 	__atomic_store_n(&tier_upload_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
 	return NULL;
