@@ -8,10 +8,13 @@ capabilities are made strict before lifecycle/fault execution is introduced.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -321,12 +324,31 @@ def run_root(path: Path | None) -> tuple[Path, bool]:
 
 
 def remove_shm(shm: str) -> None:
-    # The portable daemon currently uses POSIX shm, which Linux exposes here.
-    # Failure is harmless: the daemon may already have removed it on a platform
-    # with a different POSIX shm namespace implementation.
+    """Release a POSIX shm object without relying on Linux's /dev/shm view."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        unlink = libc.shm_unlink
+        unlink.argtypes = [ctypes.c_char_p]
+        unlink.restype = ctypes.c_int
+        if unlink(shm.encode()) == 0:
+            return
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+    except (AttributeError, OSError):
+        pass
+
+    # Fallback for platforms that expose POSIX shm only as filesystem entries.
     try:
         (Path("/dev/shm") / shm.removeprefix("/")).unlink()
     except FileNotFoundError:
+        pass
+
+
+def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+    """Signal the daemon and every helper it started in its private session."""
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
         pass
 
 
@@ -349,32 +371,81 @@ def run_daemon_smoke(
         json.dumps(plan.header["case"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     events = EventLog(trace / "events.jsonl")
-    shm = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
+    shm_base = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
+    shm = ""
+    shm_names: list[str] = []
+    generation = 0
     daemon_log = trace / "daemon.log"
-    command = [str(daemon), "--shm", shm, "--store", str(store), "--nshards", str(plan.header["case"]["shards"])]
     process: subprocess.Popen[str] | None = None
     failure: Exception | None = None
 
-    try:
-        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
-        with daemon_log.open("w", encoding="utf-8") as log:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       text=True, env=private_environment())
-        events.emit("process_start", target="store", pid=process.pid, argv=command)
+    def require_daemon_alive(daemon_process: subprocess.Popen[str], context: str) -> None:
+        if daemon_process.poll() is not None:
+            raise PlanError(
+                f"daemon exited {context} with status {daemon_process.returncode}")
+
+    def start_daemon(action_id: str | None = None) -> subprocess.Popen[str]:
+        nonlocal generation, process, shm
+        shm = f"{shm_base}_{generation}"
+        generation += 1
+        shm_names.append(shm)
+        command = [str(daemon), "--shm", shm, "--store", str(store),
+                   "--nshards", str(plan.header["case"]["shards"])]
+        with daemon_log.open("a", encoding="utf-8") as log:
+            daemon_process = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, text=True,
+                env=private_environment(), start_new_session=True)
+        process = daemon_process
+        events.emit("process_start", target="store", pid=daemon_process.pid,
+                    argv=command, action_id=action_id)
         deadline = time.monotonic() + 10.0
         while True:
-            if process.poll() is not None:
-                raise PlanError(f"daemon exited before readiness with status {process.returncode}")
+            if daemon_process.poll() is not None:
+                raise PlanError(
+                    f"daemon exited before readiness with status {daemon_process.returncode}")
             try:
                 health = inspect_store(inspector, shm, "health", inspection_schema)
+                require_daemon_alive(daemon_process, "during readiness")
                 break
             except PlanError as error:
                 if time.monotonic() >= deadline:
                     raise PlanError(f"daemon did not become ready: {error}") from error
                 time.sleep(0.05)
-        events.emit("ready", target="store", health=health)
+        events.emit("ready", target="store", health=health, action_id=action_id)
+        return daemon_process
+
+    try:
+        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
+                    shm_base=shm_base)
+        daemon_log.touch()
+        process = start_daemon()
         backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
         events.emit("capture", target="store", kind="backpressure", value=backpressure)
+        for action in plan.actions:
+            if action["op"] != "crash":
+                continue
+            if action["target"] != "store" or action["model"] != "power_loss":
+                raise PlanError(f"daemon smoke does not execute crash on {action['target']!r}")
+            if "fault" in action:
+                raise PlanError(
+                    f"daemon smoke does not implement named fault {action['fault']!r}")
+            require_daemon_alive(process, "before power loss")
+            signal_process_group(process, signal.SIGKILL)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise PlanError(f"crash action {action['id']} did not stop the daemon") from error
+            if process.returncode != -signal.SIGKILL:
+                raise PlanError(
+                    f"crash action {action['id']} did not deliver SIGKILL "
+                    f"(status {process.returncode})")
+            events.emit("crash", id=action["id"], target="store", model="power_loss",
+                        pid=process.pid, returncode=process.returncode)
+            remove_shm(shm)
+            process = start_daemon(action["id"])
+            backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+            require_daemon_alive(process, "after recovery")
+            events.emit("recovered", id=action["id"], target="store", value=backpressure)
         events.emit("run_pass")
     except Exception as error:
         failure = error
@@ -386,14 +457,15 @@ def run_daemon_smoke(
     finally:
         if process is not None:
             if process.poll() is None:
-                process.terminate()
+                signal_process_group(process, signal.SIGTERM)
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    signal_process_group(process, signal.SIGKILL)
                     process.wait(timeout=5)
             events.emit("process_stop", target="store", pid=process.pid, returncode=process.returncode)
-        remove_shm(shm)
+        for name in shm_names:
+            remove_shm(name)
 
     if failure is not None:
         raise PlanError(f"daemon smoke failed; failure bundle: {root}: {failure}") from failure
