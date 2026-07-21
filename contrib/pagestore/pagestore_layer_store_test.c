@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_layer_store.h"
@@ -54,6 +55,7 @@ main(void)
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
+	pid_t		dead_pid;
 	const char *contents = "sealed layer object bytes";
 	PsLayerDesc layer;
 
@@ -71,8 +73,14 @@ main(void)
 		  ps_layer_store->open(local_dir) == 0,
 		  "open exclusive object directory");
 	ps_layer_store->close();
-	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0000000000000011.tmp.999999.0",
-			 object_dir);
+	dead_pid = fork();
+	if (dead_pid == 0)
+		_exit(0);
+	if (dead_pid > 0)
+		waitpid(dead_pid, NULL, 0);
+	check(dead_pid > 0, "create a known-dead temporary owner PID");
+	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0000000000000011.tmp.%ld.0",
+			 object_dir, (long) dead_pid);
 	{
 		int fd = open(stale_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 
