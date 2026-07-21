@@ -614,9 +614,13 @@ local_download_layer(const PsLayerDesc *layer)
 {
 	const PsLayerLocation *source;
 	char		local[4096];
+	char		expected[4096];
 
 	source = remote_location(layer);
-	if (source == NULL || local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
+	if (source == NULL ||
+		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||
+		strcmp(source->uri, expected) != 0 ||
+		local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
 	if (copy_file_atomic(source->uri, local, layer_dir) != 0)
 		return -1;
