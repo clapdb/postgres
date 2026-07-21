@@ -3337,6 +3337,11 @@ tier_one_layer(void)
 
 	if (ps_layer_store->remote_uri == NULL || ps_layer_store->upload_layer == NULL)
 		return 0;
+	/* The local provider is always installed, but exposes remote callbacks even
+	 * when PAGESTORE_OBJECT_DIR is disabled.  Probe configuration before
+	 * scheduling a worker so local-only stores do not spin on ENOTSUP uploads. */
+	if (ps_layer_store->remote_uri(0, remote.uri, sizeof(remote.uri)) != 0)
+		return 0;
 	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
 	if (state == 1)
 		return 0;
