@@ -402,13 +402,16 @@ gc_resume(void)
 	PsLayerDesc *dead;
 	uint32_t	m = 0;
 	int		did = 0;
+	int		uploading;
+	uint64_t	uploading_id;
 
+	uploading = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1;
+	uploading_id = tier_upload_candidate.layer_id;
 	if (map_locks_ready)
 		ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
-			  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
 			m++;
 	if (m == 0)
 	{
@@ -426,8 +429,7 @@ gc_resume(void)
 	m = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
-			  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
 			dead[m++] = ps_layer_map.layers[i];
 	if (map_locks_ready)
 		ps_unlock_map();
@@ -3401,7 +3403,7 @@ tier_upload_worker(void *arg)
 
 	/* Shutdown cancels optional object copies rather than waiting for a slow
 	 * object mount.  This worker owns no locks or shared allocations. */
-	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 	rc = ps_layer_store->upload_layer(layer);
 
 	__atomic_store_n(&tier_upload_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
