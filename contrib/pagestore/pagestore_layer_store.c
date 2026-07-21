@@ -25,6 +25,7 @@ static char layer_dir[2048];
 static char object_dir[2048];
 
 static int layer_id_shard(uint64_t layer_id);
+static int object_layer_path(uint64_t layer_id, char *buf, size_t buflen);
 static int fsync_dir(const char *dir);
 static int cleanup_stale_copy_temps(const char *dir);
 
@@ -191,6 +192,15 @@ local_open(const char *store_dir)
 		}
 		memcpy(object_dir, resolved, strlen(resolved) + 1);
 		free(resolved);
+	}
+	/* A remote URI is persisted in PsLayerLocation.uri.  Reject a configured
+	 * directory that cannot represent the longest shard/id-derived object name
+	 * before claiming it for this store. */
+	{
+		char probe[PS_LAYER_URI_MAX];
+
+		if (object_layer_path(UINT64_MAX, probe, sizeof(probe)) != 0)
+			return -1;
 	}
 	if (
 		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
