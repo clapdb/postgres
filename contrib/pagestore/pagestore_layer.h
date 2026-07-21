@@ -64,6 +64,8 @@ typedef struct PsLayerDesc
 	bool		remote_durable;
 	bool		local_pinned;
 	bool		deleting;
+	/* In-memory only: canonical local cache was materialized from remote. */
+	bool		cache_resident;
 
 	/*
 	 * In-memory only: whether this process has verified the layer's data

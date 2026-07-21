@@ -71,6 +71,7 @@ static struct timespec tier_upload_retry_at;
 static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
+static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -393,6 +394,7 @@ count_image_layers(uint32_t timeline, uint32_t shard)
 }
 
 static const PsLayerLocation *tier_remote_location(const PsLayerDesc *layer);
+static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
@@ -2470,6 +2472,18 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		*out_lsn = best;
 	if (found && out_seq)
 		*out_seq = best_seq;
+	if (found)
+	{
+		ps_lock_map_wr();
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == best_layer &&
+				tier_local_location(&ps_layer_map.layers[i]) == NULL)
+			{
+				ps_layer_map.layers[i].cache_resident = true;
+				break;
+			}
+		ps_unlock_map();
+	}
 	return found;
 }
 
@@ -2840,6 +2854,12 @@ recover_layer_prefix(uint32_t shard)
 			free(verify);
 		}
 		free(idx);
+		/* Recovery needs only the index entries already copied above.  Do not
+		 * retain every remote-only layer's materialized cache until all shards
+		 * replay, which can exceed local capacity on restart. */
+		if (tier_local_location(d) == NULL &&
+			ps_layer_store->delete_local_layer(d) != 0)
+			goto fail;
 	}
 
 	if (nrec == 0)
@@ -3634,7 +3654,7 @@ evict_one_layer(void)
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
-			tier_local_location(layer) != NULL &&
+			(tier_local_location(layer) != NULL || layer->cache_resident) &&
 			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
 		{
 			candidate = *layer;
@@ -3650,7 +3670,8 @@ evict_one_layer(void)
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
 		{
-			if (ps_manifest_drop_local(candidate.layer_id) != 0)
+			if (tier_local_location(&ps_layer_map.layers[i]) != NULL &&
+				ps_manifest_drop_local(candidate.layer_id) != 0)
 			{
 				ps_unlock_map();
 				return 0;
@@ -3658,6 +3679,7 @@ evict_one_layer(void)
 			/* A later cache refill installs different physical bytes; require
 			 * the image data checksum to be verified again before serving it. */
 			ps_layer_map.layers[i].data_verified = false;
+			ps_layer_map.layers[i].cache_resident = false;
 			break;
 		}
 	/* Keep the write lock through unlink: layer reads hold the matching read

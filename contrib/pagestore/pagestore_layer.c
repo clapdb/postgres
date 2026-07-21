@@ -196,7 +196,6 @@ ps_image_layer_write(uint64_t layer_id, uint32_t timeline,
 	uint64_t	total = data_bytes + idx_bytes + sizeof(PsImgFooter);
 	char		uri[PS_LAYER_URI_MAX];
 	int			rc = -1;
-	int			retried = 0;
 
 	if (n == 0)
 		return -1;
@@ -595,7 +594,7 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 									 &foot, sizeof(foot)) != 0)
-		goto refresh;
+		return -1;
 	if (foot.magic != PS_IMG_MAGIC ||
 		(foot.version != 2 && foot.version != 3 &&
 		 foot.version != PS_IMG_VERSION) || foot.nrecs == 0)
@@ -748,6 +747,7 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	uint64_t	best_seq = 0;
 	int			found = 0;
 	int			rc = -1;
+	int			retried = 0;
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or has no
 	 * version at/below read_lsn */
@@ -758,8 +758,8 @@ retry:
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
-		return -1;
+									 &foot, sizeof(foot)) != 0)
+		goto refresh;
 	if (foot.magic != PS_IMG_MAGIC ||
 		(foot.version != 2 && foot.version != 3 &&
 		 foot.version != PS_IMG_VERSION) ||
