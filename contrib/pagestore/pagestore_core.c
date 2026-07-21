@@ -410,6 +410,7 @@ gc_resume(void)
 			dead[m++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < m; k++)
 	{
+		int		remote_failed = 0;
 		/*
 		 * Drop the manifest entry only after the file is gone (a missing file
 		 * is ENOENT == success in delete_local_layer, so this is idempotent and
@@ -421,8 +422,10 @@ gc_resume(void)
 	 */
 		if (tier_remote_location(&dead[k]) != NULL &&
 			ps_layer_store->delete_remote_layer(&dead[k]) != 0)
-			continue;
+			remote_failed = 1;
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
+			continue;
+		if (remote_failed)
 			continue;
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
 			break;
@@ -542,6 +545,7 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
+		int		remote_failed = 0;
 		/*
 		 * Fail safe at every step.  Only delete the file once the layer is
 		 * durably marked deleting, and only drop it from the manifest once the
@@ -560,9 +564,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		if (tier_remote_location(&old[k]) != NULL &&
 			ps_layer_store->delete_remote_layer(&old[k]) != 0)
-			continue; /* keep deleting metadata so gc_resume retries remote GC */
+			remote_failed = 1;
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
+		if (remote_failed)
+			continue; /* retain tombstone so gc_resume retries remote GC */
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete */
 	}
