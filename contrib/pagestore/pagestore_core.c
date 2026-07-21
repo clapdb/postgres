@@ -72,6 +72,9 @@ static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
+static pthread_t gc_remote_thread;
+static PsLayerDesc gc_remote_candidate;
+static volatile int gc_remote_state; /* 0 idle, 1 running, 2 success, 3 failed */
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -500,6 +503,51 @@ gc_resume(void)
 	}
 	free(dead);
 	return did;
+}
+
+static void *
+gc_remote_worker(void *arg)
+{
+	PsLayerDesc *layer = arg;
+	int rc = ps_layer_store->delete_remote_layer(layer);
+
+	__atomic_store_n(&gc_remote_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+/* Run at most one remote-GC operation without blocking the maintenance loop. */
+static int
+gc_remote_one(void)
+{
+	int state = __atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE);
+
+	if (state != 0)
+	{
+		pthread_join(gc_remote_thread, NULL);
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+		if (state != 2)
+			return 0;
+		ps_lock_map_wr();
+		if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
+			ps_manifest_remove_layer(gc_remote_candidate.layer_id);
+		ps_unlock_map();
+		return 1;
+	}
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].deleting &&
+			tier_remote_location(&ps_layer_map.layers[i]) != NULL)
+		{
+			gc_remote_candidate = ps_layer_map.layers[i];
+			ps_unlock_map();
+			__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
+			if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
+						   &gc_remote_candidate) != 0)
+				__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+			return 1;
+		}
+	ps_unlock_map();
+	return 0;
 }
 
 /*
@@ -3400,6 +3448,12 @@ ps_core_close(void)
 	struct timespec deadline;
 	int		join_rc;
 
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
+	{
+		pthread_cancel(gc_remote_thread);
+		pthread_join(gc_remote_thread, NULL);
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+	}
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
 		/* Remote tiering is optional: do not let a stalled object store delay
@@ -3903,8 +3957,9 @@ ps_core_maintenance(void)
 			did = compact_timeline(ftl, fsh) > 0;
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
-		/* Remote GC is deliberately outside compaction's write locks. */
-		gc_resume();
+		/* Remote GC runs in a worker, never on the shard maintenance path. */
+		gc_remote_one();
+		did = 1;
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
 	 * first turns routine compaction into remote I/O under map/shard write
