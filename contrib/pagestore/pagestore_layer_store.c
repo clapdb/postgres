@@ -50,6 +50,7 @@ claim_object_dir(void)
 	n = snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", layer_dir);
 	if (n < 0 || (size_t) n >= sizeof(idpath))
 		return -1;
+read_id:
 	fd = open(idpath, O_RDONLY);
 	if (fd >= 0)
 	{
@@ -87,11 +88,23 @@ claim_object_dir(void)
 			unlink(idtmp);
 			return -1;
 		}
-		if (close(fd) != 0 || rename(idtmp, idpath) != 0 || fsync_dir(layer_dir) != 0)
+		if (close(fd) != 0)
 		{
 			unlink(idtmp);
 			return -1;
 		}
+		if (link(idtmp, idpath) != 0)
+		{
+			if (errno == EEXIST)
+			{
+				unlink(idtmp);
+				goto read_id;
+			}
+			unlink(idtmp);
+			return -1;
+		}
+		if (unlink(idtmp) != 0 || fsync_dir(layer_dir) != 0)
+			return -1;
 	}
 	else
 		return -1;
