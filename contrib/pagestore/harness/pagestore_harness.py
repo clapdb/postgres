@@ -8,6 +8,8 @@ capabilities are made strict before lifecycle/fault execution is introduced.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import re
@@ -322,9 +324,20 @@ def run_root(path: Path | None) -> tuple[Path, bool]:
 
 
 def remove_shm(shm: str) -> None:
-    # The portable daemon currently uses POSIX shm, which Linux exposes here.
-    # Failure is harmless: the daemon may already have removed it on a platform
-    # with a different POSIX shm namespace implementation.
+    """Release a POSIX shm object without relying on Linux's /dev/shm view."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        unlink = libc.shm_unlink
+        unlink.argtypes = [ctypes.c_char_p]
+        unlink.restype = ctypes.c_int
+        if unlink(shm.encode()) == 0:
+            return
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+    except (AttributeError, OSError):
+        pass
+
+    # Fallback for platforms that expose POSIX shm only as filesystem entries.
     try:
         (Path("/dev/shm") / shm.removeprefix("/")).unlink()
     except FileNotFoundError:
@@ -428,6 +441,7 @@ def run_daemon_smoke(
                     f"(status {process.returncode})")
             events.emit("crash", id=action["id"], target="store", model="power_loss",
                         pid=process.pid, returncode=process.returncode)
+            remove_shm(shm)
             process = start_daemon(action["id"])
             backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
             require_daemon_alive(process, "after recovery")
