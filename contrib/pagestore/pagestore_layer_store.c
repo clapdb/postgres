@@ -502,6 +502,14 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	}
 
 	fd = open(path, O_RDONLY);
+	if (fd < 0 && remote_location(layer) != NULL)
+	{
+		char cached[4096];
+
+		if (local_layer_path(layer->layer_id, cached, sizeof(cached)) == 0 &&
+			local_download_layer(layer) == 0)
+			fd = open(cached, O_RDONLY);
+	}
 	if (fd < 0)
 		return -1;
 	n = pread(fd, buf, len, (off_t) off);
