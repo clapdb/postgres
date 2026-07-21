@@ -546,11 +546,13 @@ gc_remote_one(void)
 			ps_unlock_map();
 			if (tier_remote_location(&gc_remote_candidate) == NULL)
 			{
+				int removed = 0;
+
 				ps_lock_map_wr();
 				if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
-					ps_manifest_remove_layer(gc_remote_candidate.layer_id);
+					removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
 				ps_unlock_map();
-				return 1;
+				return removed;
 			}
 			__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 			if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
