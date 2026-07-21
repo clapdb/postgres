@@ -84,8 +84,8 @@ gc_resume_like(void)
 			if (dead[k].locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
 				dead[k].locations[i].available)
 				has_remote = 1;
-		if (ps_layer_store->delete_local_layer(&dead[k]) == 0 &&
-			(!has_remote || ps_layer_store->delete_remote_layer(&dead[k]) == 0))
+		if ((!has_remote || ps_layer_store->delete_remote_layer(&dead[k]) == 0) &&
+			ps_layer_store->delete_local_layer(&dead[k]) == 0)
 			ps_manifest_remove_layer(dead[k].layer_id);
 	}
 }
@@ -914,6 +914,8 @@ main(void)
 		char owner[4096];
 
 		snprintf(owner, sizeof(owner), "%s/.pagestore-owner", objects);
+		unlink(owner);
+		snprintf(owner, sizeof(owner), "%s/.pagestore-store-id", dir);
 		unlink(owner);
 		rmdir(objects);
 	}
