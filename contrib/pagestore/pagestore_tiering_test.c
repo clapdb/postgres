@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -39,6 +40,7 @@ main(void)
 	PsKey		key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint32_t	lsn_hi = 0, lsn_lo = 100;
 	PsLayerDesc *layer;
+	struct timespec deadline;
 
 	if (mkdtemp(store) == NULL || mkdtemp(objects) == NULL ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0)
@@ -67,10 +69,18 @@ main(void)
 	ps_unlock_shard(ps_shard_of(&key));
 	check(ps_layer_map.nlayers == 1, "flush created one layer");
 	check(ps_core_maintenance() == 1, "idle maintenance starts one layer upload");
-	for (int i = 0; i < 100; i++)
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += 5;
+	for (;;)
 	{
+		struct timespec now;
+
 		layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
 		if (layer != NULL && layer->remote_durable)
+			break;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec > deadline.tv_sec ||
+			(now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
 			break;
 		ps_core_maintenance();
 		usleep(1000);
