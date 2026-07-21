@@ -621,6 +621,12 @@ local_download_layer(const PsLayerDesc *layer)
 			return -1;
 		}
 	}
+	else if (layer->kind == PS_LAYER_DELTA &&
+		ps_delta_layer_verify_data(layer) != 0)
+	{
+		unlink(local);
+		return -1;
+	}
 	return 0;
 }
 

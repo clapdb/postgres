@@ -177,7 +177,8 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
-									  uint32_t page_size);
+								 uint32_t page_size);
+extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);
 
 /* ---------------------------------------------------------------------------
  * Delta layer file format (phase 7).

@@ -694,6 +694,45 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 }
 
 int
+ps_delta_layer_verify_data(const PsLayerDesc *layer)
+{
+	const PsLayerLocation *loc = img_local_loc(layer);
+	PsDeltaFooter foot;
+	void *data;
+	void *idx;
+	uint64_t idx_bytes;
+	int rc = -1;
+
+	if (!loc || loc->size < sizeof(foot) ||
+		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
+								 &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
+		foot.index_off > loc->size - sizeof(foot))
+		return -1;
+	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
+	if (idx_bytes > loc->size - sizeof(foot) - foot.index_off)
+		return -1;
+	idx = malloc((size_t) idx_bytes);
+	if (!idx || ps_layer_store->read_layer_block(layer, foot.index_off, idx,
+								(uint32_t) idx_bytes) != 0 ||
+		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
+	{
+		free(idx);
+		return -1;
+	}
+	free(idx);
+	data = malloc((size_t) foot.index_off);
+	if (!data)
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, 0, data,
+								(uint32_t) foot.index_off) == 0 &&
+		img_crc(data, (size_t) foot.index_off) == foot.data_crc)
+		rc = 0;
+	free(data);
+	return rc;
+}
+
+int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn, uint64_t read_seq,
 					  void *out, uint32_t page_size, uint64_t *out_lsn,
