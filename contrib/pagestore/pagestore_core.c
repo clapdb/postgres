@@ -3636,6 +3636,9 @@ evict_one_layer(void)
 				ps_unlock_map();
 				return 0;
 			}
+			/* A later cache refill installs different physical bytes; require
+			 * the image data checksum to be verified again before serving it. */
+			ps_layer_map.layers[i].data_verified = false;
 			break;
 		}
 	ps_unlock_map();
