@@ -631,10 +631,22 @@ ps_manifest_replay(PsLayerMap *map)
 				{
 					PsLayerDesc *layer = manifest_find_layer(map, payload.ev.layer_id);
 
-					if (layer == NULL || !manifest_has_remote_location(layer))
+					if (layer == NULL)
 					{
 						close(fd);
 						return -1;
+					}
+					/* Manifests written before remote locations were persisted can
+					 * legitimately mark a local-only layer remote-durable.  The old
+					 * object cannot be located after restart, so conservatively make
+					 * this layer require upload again instead of refusing to open the
+					 * whole store.  A later SET_REMOTE_LOCATION + durable event repairs
+					 * it durably. */
+					if (!manifest_has_remote_location(layer))
+					{
+						layer->remote_durable = false;
+						layer->remote_uploaded_lsn = 0;
+						break;
 					}
 					layer->remote_durable = true;
 					layer->remote_uploaded_lsn = payload.ev.value;
