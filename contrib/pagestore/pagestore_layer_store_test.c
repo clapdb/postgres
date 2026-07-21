@@ -46,17 +46,34 @@ int
 main(void)
 {
 	char		local_dir[] = "/tmp/pslayerstorelocalXXXXXX";
+	char		other_local_dir[] = "/tmp/pslayerstoreotherXXXXXX";
 	char		object_dir[] = "/tmp/pslayerstoreobjectXXXXXX";
+	char		owner_path[sizeof(object_dir) + 32];
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
 	const char *contents = "sealed layer object bytes";
 	PsLayerDesc layer;
 
-	if (mkdtemp(local_dir) == NULL || mkdtemp(object_dir) == NULL ||
-		setenv("PAGESTORE_OBJECT_DIR", object_dir, 1) != 0 ||
-		ps_layer_store->open(local_dir) != 0)
+	if (mkdtemp(local_dir) == NULL || mkdtemp(other_local_dir) == NULL ||
+		mkdtemp(object_dir) == NULL)
 	{
 		fprintf(stderr, "setup failed\n");
+		return 2;
+	}
+	check(setenv("PAGESTORE_OBJECT_DIR", local_dir, 1) == 0 &&
+		  ps_layer_store->open(local_dir) != 0,
+		  "reject an object directory that aliases the local store");
+	ps_layer_store->close();
+	check(setenv("PAGESTORE_OBJECT_DIR", object_dir, 1) == 0 &&
+		  ps_layer_store->open(local_dir) == 0,
+		  "open exclusive object directory");
+	ps_layer_store->close();
+	check(ps_layer_store->open(other_local_dir) != 0,
+		  "reject object directory owned by another store");
+	ps_layer_store->close();
+	if (ps_layer_store->open(local_dir) != 0)
+	{
+		fprintf(stderr, "could not reopen object directory\n");
 		return 2;
 	}
 
@@ -76,8 +93,12 @@ main(void)
 	layer.locations[0].size = strlen(contents);
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
-												 sizeof(remote_uri)) == 0,
+											 sizeof(remote_uri)) == 0,
 		  "derive remote object URI");
+	layer.locations[0].size++;
+	check(ps_layer_store->upload_layer(&layer) != 0,
+		  "reject upload whose source size differs from layer metadata");
+	layer.locations[0].size--;
 	check(ps_layer_store->upload_layer(&layer) == 0,
 		  "upload local layer atomically");
 	check(ps_layer_store->upload_layer(&layer) == 0,
@@ -103,8 +124,11 @@ main(void)
 
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-owner", object_dir);
+	unlink(owner_path);
 	unlink(local_uri);
 	rmdir(local_dir);
+	rmdir(other_local_dir);
 	rmdir(object_dir);
 	printf("pagestore_layer_store_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;

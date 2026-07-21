@@ -23,6 +23,59 @@ static char layer_dir[2048];
 static char object_dir[2048];
 
 static int layer_id_shard(uint64_t layer_id);
+static int fsync_dir(const char *dir);
+
+/*
+ * Object directories are deliberately single-store resources.  Layer IDs are
+ * allocated by each store, so sharing a directory would otherwise make two
+ * stores publish (and later delete) the same object names.
+ */
+static int
+claim_object_dir(const struct stat *store_st)
+{
+	char		path[4096];
+	char		owner[128];
+	char		got[sizeof(owner)];
+	int		fd;
+	int		n;
+	ssize_t		len;
+
+	n = snprintf(path, sizeof(path), "%s/.pagestore-owner", object_dir);
+	if (n < 0 || (size_t) n >= sizeof(path))
+		return -1;
+	n = snprintf(owner, sizeof(owner), "%llu:%llu\n",
+				 (unsigned long long) store_st->st_dev,
+				 (unsigned long long) store_st->st_ino);
+	if (n < 0 || (size_t) n >= sizeof(owner))
+		return -1;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd >= 0)
+	{
+		if (write(fd, owner, (size_t) n) != n || fsync(fd) != 0)
+		{
+			close(fd);
+			unlink(path);
+			return -1;
+		}
+		if (close(fd) != 0 || fsync_dir(object_dir) != 0)
+		{
+			unlink(path);
+			return -1;
+		}
+		return 0;
+	}
+	if (errno != EEXIST)
+		return -1;
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	len = read(fd, got, sizeof(got) - 1);
+	close(fd);
+	if (len < 0)
+		return -1;
+	got[len] = '\0';
+	return strcmp(got, owner) == 0 ? 0 : -1;
+}
 
 const PsLayerStore *ps_layer_store = &PsLayerStoreLocal;
 
@@ -30,11 +83,14 @@ static int
 local_open(const char *store_dir)
 {
 	const char *configured_object_dir;
-	struct stat st;
+	struct stat store_st;
+	struct stat object_st;
 	int			n;
 
 	n = snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(layer_dir))
+		return -1;
+	if (stat(layer_dir, &store_st) != 0 || !S_ISDIR(store_st.st_mode))
 		return -1;
 	object_dir[0] = '\0';
 	configured_object_dir = getenv("PAGESTORE_OBJECT_DIR");
@@ -42,7 +98,10 @@ local_open(const char *store_dir)
 		return 0;
 	n = snprintf(object_dir, sizeof(object_dir), "%s", configured_object_dir);
 	if (n < 0 || (size_t) n >= sizeof(object_dir) ||
-		stat(object_dir, &st) != 0 || !S_ISDIR(st.st_mode))
+		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
+		(store_st.st_dev == object_st.st_dev &&
+		 store_st.st_ino == object_st.st_ino) ||
+		claim_object_dir(&store_st) != 0)
 		return -1;
 	return 0;
 }
@@ -168,7 +227,7 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 	int			rc = -1;
 
 	if (access(destination, F_OK) == 0)
-		return files_equal(source, destination) == 1 ? 0 : -1;
+		return files_equal(source, destination) == 1 && fsync_dir(dir) == 0 ? 0 : -1;
 	sfd = open(source, O_RDONLY);
 	if (sfd < 0)
 		goto done;
@@ -210,7 +269,7 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 		if (errno != EEXIST || files_equal(source, destination) != 1)
 			goto done;
 	}
-	else if (fsync_dir(dir) != 0)
+	if (fsync_dir(dir) != 0)
 		goto done;
 	if (unlink(tmp) != 0)
 		goto done;
@@ -387,7 +446,23 @@ local_upload_layer(const PsLayerDesc *layer)
 	source = local_location(layer);
 	if (source == NULL || object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0)
 		return -1;
-	return copy_file_atomic(source->uri, remote, object_dir);
+	/* The manifest's declared length is the minimum identity available here. */
+	{
+		struct stat st;
+
+		if (stat(source->uri, &st) != 0 || st.st_size < 0 ||
+			(uint64_t) st.st_size != source->size)
+			return -1;
+	}
+	if (copy_file_atomic(source->uri, remote, object_dir) != 0)
+		return -1;
+	{
+		struct stat st;
+
+		return stat(remote, &st) == 0 && st.st_size >= 0 &&
+			(uint64_t) st.st_size == source->size &&
+			files_equal(source->uri, remote) == 1 ? 0 : -1;
+	}
 }
 
 static int
