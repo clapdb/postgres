@@ -36,6 +36,7 @@ static int
 claim_object_dir(void)
 {
 	char		path[4096];
+	char		owner_tmp[4096];
 	char		idpath[4096];
 	char		idtmp[4096];
 	char		owner[128];
@@ -96,25 +97,32 @@ claim_object_dir(void)
 	n = snprintf(path, sizeof(path), "%s/.pagestore-owner", object_dir);
 	if (n < 0 || (size_t) n >= sizeof(path))
 		return -1;
-	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (access(path, F_OK) == 0)
+		goto owner_exists;
+	if (errno != ENOENT)
+		return -1;
+	n = snprintf(owner_tmp, sizeof(owner_tmp), "%s.tmp.%ld", path, (long) getpid());
+	if (n < 0 || (size_t) n >= sizeof(owner_tmp))
+		return -1;
+	fd = open(owner_tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd >= 0)
 	{
 		owner_len = (int) strlen(owner);
 		if (write(fd, owner, (size_t) owner_len) != owner_len || fsync(fd) != 0)
 		{
 			close(fd);
-			unlink(path);
+			unlink(owner_tmp);
 			return -1;
 		}
-		if (close(fd) != 0 || fsync_dir(object_dir) != 0)
+		if (close(fd) != 0 || rename(owner_tmp, path) != 0 ||
+			fsync_dir(object_dir) != 0)
 		{
-			unlink(path);
+			unlink(owner_tmp);
 			return -1;
 		}
 		return 0;
 	}
-	if (errno != EEXIST)
-		return -1;
+owner_exists:
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -1;
@@ -358,6 +366,8 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 	if (fsync_dir(dir) != 0)
 		goto done;
 	if (unlink(tmp) != 0)
+		goto done;
+	if (fsync_dir(dir) != 0)
 		goto done;
 	rc = 0;
 
