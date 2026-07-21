@@ -26,6 +26,7 @@ static char object_dir[2048];
 
 static int layer_id_shard(uint64_t layer_id);
 static int fsync_dir(const char *dir);
+static int cleanup_stale_copy_temps(const char *dir);
 
 /*
  * Object directories are deliberately single-store resources.  Layer IDs are
@@ -149,16 +150,18 @@ local_open(const char *store_dir)
 		return -1;
 	if (stat(layer_dir, &store_st) != 0 || !S_ISDIR(store_st.st_mode))
 		return -1;
+	/* Reap interrupted copies once at provider startup, not on every copy. */
+	if (cleanup_stale_copy_temps(layer_dir) != 0)
+		return -1;
 	object_dir[0] = '\0';
 	configured_object_dir = getenv("PAGESTORE_OBJECT_DIR");
 	if (configured_object_dir == NULL || configured_object_dir[0] == '\0')
 		return 0;
-	n = snprintf(object_dir, sizeof(object_dir), "%s", configured_object_dir);
-	if (n < 0 || (size_t) n >= sizeof(object_dir) ||
+	if (realpath(configured_object_dir, object_dir) == NULL ||
 		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
 		(store_st.st_dev == object_st.st_dev &&
 		 store_st.st_ino == object_st.st_ino) ||
-		claim_object_dir() != 0)
+		claim_object_dir() != 0 || cleanup_stale_copy_temps(object_dir) != 0)
 		return -1;
 	return 0;
 }
@@ -274,34 +277,31 @@ done:
 }
 
 static int
-cleanup_stale_copy_temps(const char *destination, const char *dir)
+cleanup_stale_copy_temps(const char *dir)
 {
-	const char *base = strrchr(destination, '/');
 	DIR			*d;
 	struct dirent *ent;
-	char		prefix[4096];
 	char		path[4096];
+	char		*tmp;
 	char		*end;
 	long		pid;
 	int			n;
 
-	base = base ? base + 1 : destination;
-	n = snprintf(prefix, sizeof(prefix), "%s.tmp.", base);
-	if (n < 0 || (size_t) n >= sizeof(prefix))
-		return -1;
 	d = opendir(dir);
 	if (d == NULL)
 		return -1;
 	while ((ent = readdir(d)) != NULL)
 	{
-		if (strncmp(ent->d_name, prefix, (size_t) n) != 0)
+		if (strncmp(ent->d_name, "layer_", strlen("layer_")) != 0 ||
+			(tmp = strstr(ent->d_name, ".tmp.")) == NULL)
 			continue;
 		errno = 0;
-		pid = strtol(ent->d_name + n, &end, 10);
-		if (errno != 0 || end == ent->d_name + n || *end != '.' || pid <= 0 ||
+		pid = strtol(tmp + strlen(".tmp."), &end, 10);
+		if (errno != 0 || end == tmp + strlen(".tmp.") || *end != '.' || pid <= 0 ||
 			(kill((pid_t) pid, 0) != -1 || errno != ESRCH))
 			continue;
-		if (snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name) < (int) sizeof(path))
+		n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+		if (n >= 0 && (size_t) n < sizeof(path))
 			unlink(path);
 	}
 	closedir(d);
@@ -320,8 +320,6 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 
 	if (access(destination, F_OK) == 0)
 		return files_equal(source, destination) == 1 && fsync_dir(dir) == 0 ? 0 : -1;
-	if (cleanup_stale_copy_temps(destination, dir) != 0)
-		return -1;
 	sfd = open(source, O_RDONLY);
 	if (sfd < 0)
 		goto done;
