@@ -3615,7 +3615,6 @@ evict_one_layer(void)
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
-			tier_local_location(layer) != NULL &&
 			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
 		{
 			candidate = *layer;
