@@ -636,6 +636,19 @@ local_delete_local_layer(const PsLayerDesc *layer)
 				unlinked = 1;
 		}
 	}
+	/* DROP_LOCAL is durable before unlink.  Retry the canonical physical file
+	 * even when the manifest has already marked its local location unavailable. */
+	if (!unlinked)
+	{
+		char	path[4096];
+
+		if (local_layer_path(layer->layer_id, path, sizeof(path)) != 0)
+			return -1;
+		if (unlink(path) == 0 || errno == ENOENT)
+			unlinked = 1;
+		else
+			rc = -1;
+	}
 	if (unlinked && local_fsync_dir() != 0)
 		rc = -1;
 	return rc;
