@@ -2419,6 +2419,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 				 uint64_t *out_seq, unsigned char *out)
 {
 	unsigned char *tmp = malloc(page_size);
+	PsLayerDesc *layers;
+	uint32_t nlayers;
 	int			found = 0;
 	uint64_t	best = 0;
 	uint64_t	best_seq = 0;
@@ -2427,9 +2429,24 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	if (!tmp)
 		return 0;
 	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	nlayers = ps_layer_map.nlayers;
+	layers = nlayers ? malloc((size_t) nlayers * sizeof(*layers)) : NULL;
+	if (layers != NULL)
+		memcpy(layers, ps_layer_map.layers, (size_t) nlayers * sizeof(*layers));
+	ps_unlock_map();
+	if (nlayers == 0)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		free(tmp);
+		return 0;
+	}
+	if (layers == NULL)
+	{
+		free(tmp);
+		return 0;
+	}
+	for (uint32_t i = 0; i < nlayers; i++)
+	{
+		const PsLayerDesc *d = &layers[i];
 		uint64_t	l,
 					a;
 
@@ -2447,7 +2464,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 			found = 1;
 		}
 	}
-	ps_unlock_map();
+	free(layers);
 	free(tmp);
 	if (found && out_lsn)
 		*out_lsn = best;
