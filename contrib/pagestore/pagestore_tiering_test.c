@@ -66,7 +66,15 @@ main(void)
 		  "write and flush an image layer");
 	ps_unlock_shard(ps_shard_of(&key));
 	check(ps_layer_map.nlayers == 1, "flush created one layer");
-	check(ps_core_maintenance() == 1, "idle maintenance uploads one layer");
+	check(ps_core_maintenance() == 1, "idle maintenance starts one layer upload");
+	for (int i = 0; i < 100; i++)
+	{
+		layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
+		if (layer != NULL && layer->remote_durable)
+			break;
+		ps_core_maintenance();
+		usleep(1000);
+	}
 	layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
 	check(layer != NULL && layer->remote_durable &&
 		  ps_layer_store->layer_exists_remote(layer) == 1,

@@ -58,6 +58,11 @@ int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
  */
 int			use_layers = 1;
 
+static pthread_t tier_upload_thread;
+static PsLayerDesc tier_upload_candidate;
+static volatile int tier_upload_state; /* 0 idle, 1 running, 2 success, 3 failed */
+static uint64_t tier_upload_cursor;
+
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
 
@@ -378,6 +383,8 @@ count_image_layers(uint32_t timeline, uint32_t shard)
 	return c;
 }
 
+static const PsLayerLocation *tier_remote_location(const PsLayerDesc *layer);
+
 /*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
  * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
@@ -412,6 +419,9 @@ gc_resume(void)
 		 * the recoverable tail instead of becoming interior corruption, and the
 		 * next start retries from the last valid manifest state.
 	 */
+		if (tier_remote_location(&dead[k]) != NULL &&
+			ps_layer_store->delete_remote_layer(&dead[k]) != 0)
+			continue;
 		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
 			continue;
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
@@ -548,6 +558,9 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 */
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		if (tier_remote_location(&old[k]) != NULL &&
+			ps_layer_store->delete_remote_layer(&old[k]) != 0)
+			continue; /* keep deleting metadata so gc_resume retries remote GC */
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
@@ -3160,6 +3173,12 @@ ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
 
+	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
+	{
+		pthread_join(tier_upload_thread, NULL);
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+	}
+
 	/*
 	 * The uncovered segment tail must be durable before shutdown (writes between
 	 * checkpoints are otherwise only in the OS page cache, and would be lost to a
@@ -3295,7 +3314,17 @@ tier_remote_location(const PsLayerDesc *layer)
 	return NULL;
 }
 
-/* Upload at most one immutable layer, outside map_lock. */
+static void *
+tier_upload_worker(void *arg)
+{
+	PsLayerDesc *layer = arg;
+	int			rc = ps_layer_store->upload_layer(layer);
+
+	__atomic_store_n(&tier_upload_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+/* Start or finish one immutable-layer upload without blocking a shard worker. */
 static int
 tier_one_layer(void)
 {
@@ -3303,37 +3332,55 @@ tier_one_layer(void)
 	PsLayerDesc *current = NULL;
 	PsLayerLocation remote;
 	const PsLayerLocation *local;
-	int			exists;
+	int			state;
 	int			found = 0;
 
 	if (ps_layer_store->remote_uri == NULL || ps_layer_store->upload_layer == NULL)
 		return 0;
-	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
+	if (state == 1)
+		return 0;
+	if (state != 0)
 	{
-		PsLayerDesc *layer = &ps_layer_map.layers[i];
-
-		if (!layer->deleting && !layer->remote_durable &&
-			tier_local_location(layer) != NULL)
-		{
-			candidate = *layer;
-			found = 1;
-			break;
-		}
+		pthread_join(tier_upload_thread, NULL);
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		if (state != 2)
+			return 0;
+		candidate = tier_upload_candidate;
+		goto finish_upload;
 	}
+	ps_lock_map_rd();
+	for (int pass = 0; pass < 2 && !found; pass++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			if (!layer->deleting && !layer->remote_durable &&
+				tier_local_location(layer) != NULL &&
+				(pass != 0 || layer->layer_id > tier_upload_cursor))
+			{
+				candidate = *layer;
+				found = 1;
+				break;
+			}
+		}
 	ps_unlock_map();
 	if (!found)
 		return 0;
 
-	/* An interrupted earlier pass may have recorded the URI before durability. */
-	exists = tier_remote_location(&candidate) != NULL &&
-		ps_layer_store->layer_exists_remote != NULL ?
-		ps_layer_store->layer_exists_remote(&candidate) : 0;
-	if (exists < 0)
+	tier_upload_cursor = candidate.layer_id;
+	tier_upload_candidate = candidate;
+	__atomic_store_n(&tier_upload_state, 1, __ATOMIC_RELEASE);
+	if (pthread_create(&tier_upload_thread, NULL, tier_upload_worker,
+					   &tier_upload_candidate) != 0)
+	{
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
 		return 0;
-	if (exists == 0 && ps_layer_store->upload_layer(&candidate) != 0)
-		return 0;
+	}
+	return 1;
 
+
+finish_upload:
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
@@ -3350,8 +3397,11 @@ tier_one_layer(void)
 		{
 			remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
 			remote.available = true;
-			candidate.locations[candidate.location_count++] = remote;
-			ps_layer_store->delete_remote_layer(&candidate);
+			if (candidate.location_count < PS_LAYER_MAX_LOCATIONS)
+			{
+				candidate.locations[candidate.location_count++] = remote;
+				ps_layer_store->delete_remote_layer(&candidate);
+			}
 		}
 		return 1;
 	}
