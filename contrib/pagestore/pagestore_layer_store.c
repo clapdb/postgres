@@ -31,22 +31,59 @@ static int fsync_dir(const char *dir);
  * stores publish (and later delete) the same object names.
  */
 static int
-claim_object_dir(const struct stat *store_st)
+claim_object_dir(void)
 {
 	char		path[4096];
+	char		idpath[4096];
 	char		owner[128];
 	char		got[sizeof(owner)];
 	int		fd;
 	int		n;
 	ssize_t		len;
 
+	n = snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", layer_dir);
+	if (n < 0 || (size_t) n >= sizeof(idpath))
+		return -1;
+	fd = open(idpath, O_RDONLY);
+	if (fd >= 0)
+	{
+		len = read(fd, owner, sizeof(owner) - 1);
+		close(fd);
+		if (len <= 0)
+			return -1;
+		owner[len] = '\0';
+	}
+	else if (errno == ENOENT)
+	{
+		unsigned char random[16];
+		int			rfd = open("/dev/urandom", O_RDONLY);
+
+		if (rfd < 0 || read(rfd, random, sizeof(random)) != sizeof(random))
+		{
+			if (rfd >= 0)
+				close(rfd);
+			return -1;
+		}
+		close(rfd);
+		n = 0;
+		for (int i = 0; i < (int) sizeof(random); i++)
+			n += snprintf(owner + n, sizeof(owner) - (size_t) n, "%02x", random[i]);
+		if (n < 0 || (size_t) n >= sizeof(owner))
+			return -1;
+		fd = open(idpath, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd < 0 || write(fd, owner, (size_t) n) != n || fsync(fd) != 0)
+		{
+			if (fd >= 0)
+				close(fd);
+			return -1;
+		}
+		if (close(fd) != 0 || fsync_dir(layer_dir) != 0)
+			return -1;
+	}
+	else
+		return -1;
 	n = snprintf(path, sizeof(path), "%s/.pagestore-owner", object_dir);
 	if (n < 0 || (size_t) n >= sizeof(path))
-		return -1;
-	n = snprintf(owner, sizeof(owner), "%llu:%llu\n",
-				 (unsigned long long) store_st->st_dev,
-				 (unsigned long long) store_st->st_ino);
-	if (n < 0 || (size_t) n >= sizeof(owner))
 		return -1;
 	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd >= 0)
@@ -101,7 +138,7 @@ local_open(const char *store_dir)
 		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
 		(store_st.st_dev == object_st.st_dev &&
 		 store_st.st_ino == object_st.st_ino) ||
-		claim_object_dir(&store_st) != 0)
+		claim_object_dir() != 0)
 		return -1;
 	return 0;
 }
@@ -441,10 +478,14 @@ static int
 local_upload_layer(const PsLayerDesc *layer)
 {
 	const PsLayerLocation *source;
+	const PsLayerLocation *published;
 	char		remote[4096];
 
 	source = local_location(layer);
-	if (source == NULL || object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0)
+	published = remote_location(layer);
+	if (source == NULL ||
+		(published == NULL && object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0) ||
+		(published != NULL && snprintf(remote, sizeof(remote), "%s", published->uri) >= (int) sizeof(remote)))
 		return -1;
 	/* The manifest's declared length is the minimum identity available here. */
 	{
@@ -474,7 +515,19 @@ local_download_layer(const PsLayerDesc *layer)
 	source = remote_location(layer);
 	if (source == NULL || local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
-	return copy_file_atomic(source->uri, local, layer_dir);
+	if (copy_file_atomic(source->uri, local, layer_dir) != 0)
+		return -1;
+	{
+		struct stat st;
+
+		if (stat(local, &st) != 0 || st.st_size < 0 ||
+			(uint64_t) st.st_size != source->size)
+		{
+			unlink(local);
+			return -1;
+		}
+	}
+	return 0;
 }
 
 static int
