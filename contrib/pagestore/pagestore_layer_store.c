@@ -688,10 +688,10 @@ local_delete_local_layer(const PsLayerDesc *layer)
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
 			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
 		{
-			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
-				rc = -1;
-			else
+			if (unlink(layer->locations[i].uri) == 0)
 				unlinked = 1;
+			else if (errno != ENOENT)
+				rc = -1;
 		}
 	}
 	/* DROP_LOCAL is durable before unlink.  Retry the canonical physical file
