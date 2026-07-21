@@ -245,6 +245,52 @@ class PlanValidationTests(unittest.TestCase):
         ])
         self.assertEqual(events[4]["returncode"], -9)
 
+    def test_daemon_smoke_rejects_unimplemented_named_fault(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        daemon = base / "daemon"
+        inspector = base / "inspect"
+        daemon.write_text(
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        inspector.write_text(
+            "#!/bin/sh\ncase \"$3\" in\n"
+            "health) printf '%s\\n' "
+            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "backpressure) printf '%s\\n' "
+            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        daemon.chmod(0o755)
+        inspector.chmod(0o755)
+        plan = self.write_plan([
+            {"schema": 1, "scenario": "fault", "seed": 1, "contracts": ["lifecycle"],
+             "case": {"storage": "posix", "shards": 1, "compute": ["writer"]}},
+            {"op": "crash", "id": "fault", "target": "store", "model": "power_loss",
+             "fault": "manifest.after_rename"},
+        ])
+        root = base / "run"
+        with contextlib.redirect_stderr(io.StringIO()):
+            status = MODULE.main([
+                "--capabilities", str(ROOT / "capabilities.json"),
+                "--daemon-smoke", str(plan), "--daemon-binary", str(daemon),
+                "--inspect-binary", str(inspector), "--run-root", str(root),
+            ])
+        self.assertEqual(status, 1)
+        failure = json.loads((root / "failure.json").read_text())
+        self.assertIn("does not implement named fault", failure["error"])
+
+    def test_daemon_signal_targets_its_process_group(self):
+        process = mock.Mock(pid=4321)
+        with mock.patch.object(MODULE.os, "killpg") as killpg:
+            MODULE.signal_process_group(process, MODULE.signal.SIGKILL)
+        killpg.assert_called_once_with(4321, MODULE.signal.SIGKILL)
+
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
