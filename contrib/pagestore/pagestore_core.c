@@ -66,6 +66,7 @@ static int tier_upload_joined;
 static uint32_t tier_upload_shard_cursor;
 static time_t tier_upload_retry_at;
 static int tier_one_layer(void);
+static int map_locks_ready;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -400,18 +401,30 @@ gc_resume(void)
 	PsLayerDesc *dead;
 	uint32_t	m = 0;
 
+	if (map_locks_ready)
+		ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting)
 			m++;
 	if (m == 0)
+	{
+		if (map_locks_ready)
+			ps_unlock_map();
 		return;
+	}
 	dead = malloc((size_t) m * sizeof(PsLayerDesc));
 	if (!dead)
+	{
+		if (map_locks_ready)
+			ps_unlock_map();
 		return;
+	}
 	m = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting)
 			dead[m++] = ps_layer_map.layers[i];
+	if (map_locks_ready)
+		ps_unlock_map();
 	for (uint32_t k = 0; k < m; k++)
 	{
 		int		remote_failed = 0;
@@ -431,8 +444,30 @@ gc_resume(void)
 			continue;
 		if (remote_failed)
 			continue;
+		if (map_locks_ready)
+			ps_lock_map_wr();
+	if (map_locks_ready)
+		{
+		int still_deleting = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == dead[k].layer_id &&
+				ps_layer_map.layers[i].deleting)
+				still_deleting = 1;
+		if (!still_deleting)
+		{
+			ps_unlock_map();
+			continue;
+		}
+		}
 		if (ps_manifest_remove_layer(dead[k].layer_id) != 0)
+		{
+			if (map_locks_ready)
+				ps_unlock_map();
 			break;
+		}
+		if (map_locks_ready)
+			ps_unlock_map();
 	}
 	free(dead);
 }
@@ -3625,6 +3660,7 @@ ps_core_open(const char *store_dir)
 	uint32_t	ns = core_shards();
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	tier_upload_retry_at = 0;
 
@@ -3658,6 +3694,7 @@ ps_core_open(const char *store_dir)
 		g_shards[i].next_layer_id = 1;
 		pthread_rwlock_init(&shard_locks[i], NULL);
 	}
+	map_locks_ready = 1;
 	/* layer ids continue past the highest one restored per shard */
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
