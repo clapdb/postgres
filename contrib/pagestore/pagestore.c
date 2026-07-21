@@ -2067,6 +2067,19 @@ ps_commit_ts_normalize_horizons(XLogRecPtr target, TransactionId next_xid,
 #define PS_CTS_ENTRY_SIZE	(sizeof(TimestampTz) + sizeof(ReplOriginId))
 #define PS_CTS_XACTS_PER_PAGE	(BLCKSZ / PS_CTS_ENTRY_SIZE)
 
+/* Match commit_ts.c's wraparound-aware page ordering for truncation. */
+static bool
+ps_commit_ts_page_precedes(int64 page1, int64 page2)
+{
+	TransactionId xid1 = (TransactionId) page1 * PS_CTS_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+	TransactionId xid2 = (TransactionId) page2 * PS_CTS_XACTS_PER_PAGE +
+		FirstNormalTransactionId + 1;
+
+	return TransactionIdPrecedes(xid1, xid2) &&
+		TransactionIdPrecedes(xid1, xid2 + PS_CTS_XACTS_PER_PAGE - 1);
+}
+
 /* Write xid's (ts, nodeid) into commit-ts page 'pageno' in 'page' if it lives there. */
 static void
 ps_commit_ts_set(char *page, int64 pageno, TransactionId xid,
@@ -3046,7 +3059,9 @@ ps_commit_ts_seed_reconstruct_range(char *pages, bool *present, int64 page_lo,
 				for (int64 p = 0; p < np; p++)
 				{
 					pageseg = (page_lo + p) / SLRU_PAGES_PER_SEGMENT;
-					if (pageseg < cut_seg)
+					if (pageseg != cut_seg &&
+						ps_commit_ts_page_precedes(pageseg * SLRU_PAGES_PER_SEGMENT,
+										cut_seg * SLRU_PAGES_PER_SEGMENT))
 					{
 						present[p] = false;
 						truncated[p] = true;
@@ -3887,6 +3902,10 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
 	page_lo = seg_lo * SLRU_PAGES_PER_SEGMENT;
 	page_hi = ((int64) (next_xid - 1)) / PS_CLOG_XACTS_PER_PAGE;
 	wraps = next_xid < oldest_xid;
+	/* XID 3 has not extended page zero yet.  A horizon ending at 3 includes
+	 * the pre-wrap run only; requiring a page-zero base image would be wrong. */
+	if (wraps && next_xid == FirstNormalTransactionId)
+		page_hi = -1;
 	if (wraps)
 		np = (int) ((PG_UINT32_MAX / PS_CLOG_XACTS_PER_PAGE - page_lo + 1) +
 					page_hi + 1);
@@ -4162,7 +4181,8 @@ pagestore_seed_clog(PG_FUNCTION_ARGS)
  */
 static int64
 pagestore_seed_commit_ts_wrapped(const char *target_dir, int64 page_lo,
-							 int64 page_hi, XLogRecPtr base, XLogRecPtr target)
+							 int64 page_hi, bool seed_low,
+							 XLogRecPtr base, XLogRecPtr target)
 {
 	char		staging_root[MAXPGPATH];
 	char		dstdir[MAXPGPATH];
@@ -4197,7 +4217,8 @@ pagestore_seed_commit_ts_wrapped(const char *target_dir, int64 page_lo,
 								 page_lo, max_page,
 								 ps_commit_ts_seed_reconstruct_range,
 								 base, target, "commit-ts", false, false);
-	seeded += pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
+	if (seed_low)
+		seeded += pagestore_seed_slru_pages(staging_root, "pg_commit_ts",
 								  0, page_hi,
 								  ps_commit_ts_seed_reconstruct_range,
 								  base, target, "commit-ts", false, false);
@@ -4314,7 +4335,9 @@ pagestore_seed_commit_ts(PG_FUNCTION_ARGS)
 	page_hi = ((int64) (next_xid - 1)) / PS_CTS_XACTS_PER_PAGE;
 	if (next_xid < oldest_xid)
 		PG_RETURN_INT64(pagestore_seed_commit_ts_wrapped(target_dir, page_lo,
-													 page_hi, base, target));
+													 page_hi,
+													 next_xid != FirstNormalTransactionId,
+													 base, target));
 
 	PG_RETURN_INT64(pagestore_seed_slru_pages(target_dir, "pg_commit_ts",
 											 page_lo, page_hi,
