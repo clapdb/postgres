@@ -137,6 +137,8 @@ main(void)
 	check(ps_layer_store->download_layer(&layer) == 0 &&
 		  file_matches(local_uri, contents),
 		  "download restores the complete local layer");
+	check(access(local_uri, F_OK) == 0,
+		  "seed a downloaded local cache before testing GC reclamation");
 	layer.locations[0].available = false;
 	check(ps_layer_store->delete_local_layer(&layer) == 0 &&
 		  ps_layer_store->layer_exists_local(layer.layer_id) == 0,
