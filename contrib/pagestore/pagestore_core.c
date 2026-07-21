@@ -548,7 +548,6 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
-		int		remote_failed = 0;
 		/*
 		 * Fail safe at every step.  Only delete the file once the layer is
 		 * durably marked deleting, and only drop it from the manifest once the
@@ -565,13 +564,15 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 */
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
-		if (tier_remote_location(&old[k]) != NULL &&
-			ps_layer_store->delete_remote_layer(&old[k]) != 0)
-			remote_failed = 1;
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
-		if (remote_failed)
-			continue; /* retain tombstone so gc_resume retries remote GC */
+		/*
+		 * Remote object deletion may block on an object mount.  Keep the
+		 * durable deleting record and let the idle maintenance path run
+		 * gc_resume() after releasing the shard/map write locks.
+		 */
+		if (tier_remote_location(&old[k]) != NULL)
+			continue;
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete */
 	}
@@ -3535,6 +3536,8 @@ ps_core_maintenance(void)
 			compact_timeline(ftl, fsh);
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
+		/* Remote GC is deliberately outside compaction's write locks. */
+		gc_resume();
 		did = 1;
 	}
 
