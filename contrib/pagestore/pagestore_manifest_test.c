@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "pagestore_manifest.h"
@@ -25,6 +26,52 @@
 
 static int	run = 0,
 			failed = 0;
+
+#define TEST_MANIFEST_SET_REMOTE_LOCATION 7
+
+typedef struct TestManifestRecord
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	type;
+	uint32_t	len;
+	uint32_t	crc;
+} TestManifestRecord;
+
+/* Write a legacy-shaped manifest by removing only the new location event. */
+static int
+copy_without_remote_location(const char *src, const char *dst)
+{
+	int		in = open(src, O_RDONLY);
+	int		out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	TestManifestRecord rec;
+	char	   *payload = NULL;
+	int		ok = 0;
+
+	if (in < 0 || out < 0)
+		goto done;
+	while (read(in, &rec, sizeof(rec)) == (ssize_t) sizeof(rec))
+	{
+		payload = malloc(rec.len);
+		if ((rec.len > 0 && payload == NULL) ||
+			(rec.len > 0 && read(in, payload, rec.len) != (ssize_t) rec.len))
+			goto done;
+		if (rec.type != TEST_MANIFEST_SET_REMOTE_LOCATION &&
+			(write(out, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
+			 (rec.len > 0 && write(out, payload, rec.len) != (ssize_t) rec.len)))
+			goto done;
+		free(payload);
+		payload = NULL;
+	}
+	ok = fsync(out) == 0;
+done:
+	free(payload);
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	return ok ? 0 : -1;
+}
 
 static void
 check(int cond, const char *msg)
@@ -68,7 +115,9 @@ int
 main(void)
 {
 	char		dir[] = "/tmp/psmanifesttestXXXXXX";
+	char		legacy_dir[] = "/tmp/psmanifestlegacyXXXXXX";
 	char		mpath[4096];
+	char		legacy_path[4096];
 	PsLayerDesc rel,
 				slru;
 	PsLayerDesc *got;
@@ -113,6 +162,15 @@ main(void)
 	check(ps_manifest_set_flush_watermark(3, 7, 12344) != 0,
 		  "reject regressing flush watermark");
 	ps_manifest_close();
+	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
+	if (!mkdtemp(legacy_dir))
+	{
+		fprintf(stderr, "legacy setup failed\n");
+		return 2;
+	}
+	snprintf(legacy_path, sizeof(legacy_path), "%s/layers.manifest", legacy_dir);
+	check(copy_without_remote_location(mpath, legacy_path) == 0,
+		  "construct legacy remote-durable manifest without URI");
 
 	/* --- restart: re-open and replay the manifest into a fresh map --------- */
 	/* ps_manifest_close() already freed the in-memory map; reopen re-inits it. */
@@ -186,11 +244,25 @@ main(void)
 		  "manifest compaction preserves remote location and durability");
 
 	ps_manifest_close();		/* frees the in-memory map */
+	check(ps_manifest_open(legacy_dir) == 0, "open legacy remote-durable manifest");
+	check(ps_manifest_replay(&ps_layer_map) == 0,
+		  "legacy remote-durable manifest replays without a URI");
+	got = NULL;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == slru.layer_id)
+			got = &ps_layer_map.layers[i];
+	check(got != NULL && !got->remote_durable && got->location_count == 1,
+		  "legacy remote durability is downgraded for re-upload");
+	check(ps_manifest_set_remote_location(slru.layer_id, &remote) == 0 &&
+		  ps_manifest_set_remote_durable(slru.layer_id, 0x3000) == 0,
+		  "legacy layer accepts a new location and re-upload");
+	ps_manifest_close();
 
 	/* best-effort cleanup */
-	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
 	unlink(mpath);
 	rmdir(dir);
+	unlink(legacy_path);
+	rmdir(legacy_dir);
 
 	printf("pagestore_manifest_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
