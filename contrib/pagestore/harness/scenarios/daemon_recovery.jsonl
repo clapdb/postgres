@@ -1,2 +1,2 @@
-{"schema":1,"scenario":"daemon-recovery","seed":287454020,"contracts":["durability","atomic_metadata"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"schema":1,"scenario":"daemon-recovery","seed":287454020,"contracts":["lifecycle"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
 {"op":"crash","id":"store-power-loss","target":"store","model":"power_loss"}

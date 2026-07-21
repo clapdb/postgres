@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -330,6 +331,14 @@ def remove_shm(shm: str) -> None:
         pass
 
 
+def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+    """Signal the daemon and every helper it started in its private session."""
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def run_daemon_smoke(
     plan: Plan,
     inspection_schema: dict[str, Any],
@@ -355,12 +364,17 @@ def run_daemon_smoke(
     process: subprocess.Popen[str] | None = None
     failure: Exception | None = None
 
+    def require_daemon_alive(daemon_process: subprocess.Popen[str], context: str) -> None:
+        if daemon_process.poll() is not None:
+            raise PlanError(
+                f"daemon exited {context} with status {daemon_process.returncode}")
+
     def start_daemon(action_id: str | None = None) -> subprocess.Popen[str]:
         nonlocal process
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
-                env=private_environment())
+                env=private_environment(), start_new_session=True)
         process = daemon_process
         events.emit("process_start", target="store", pid=daemon_process.pid,
                     argv=command, action_id=action_id)
@@ -371,6 +385,7 @@ def run_daemon_smoke(
                     f"daemon exited before readiness with status {daemon_process.returncode}")
             try:
                 health = inspect_store(inspector, shm, "health", inspection_schema)
+                require_daemon_alive(daemon_process, "during readiness")
                 break
             except PlanError as error:
                 if time.monotonic() >= deadline:
@@ -390,7 +405,10 @@ def run_daemon_smoke(
                 continue
             if action["target"] != "store" or action["model"] != "power_loss":
                 raise PlanError(f"daemon smoke does not execute crash on {action['target']!r}")
-            process.kill()
+            if "fault" in action:
+                raise PlanError(
+                    f"daemon smoke does not implement named fault {action['fault']!r}")
+            signal_process_group(process, signal.SIGKILL)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired as error:
@@ -400,6 +418,7 @@ def run_daemon_smoke(
             remove_shm(shm)
             process = start_daemon(action["id"])
             backpressure = inspect_store(inspector, shm, "backpressure", inspection_schema)
+            require_daemon_alive(process, "after recovery")
             events.emit("recovered", id=action["id"], target="store", value=backpressure)
         events.emit("run_pass")
     except Exception as error:
@@ -412,11 +431,11 @@ def run_daemon_smoke(
     finally:
         if process is not None:
             if process.poll() is None:
-                process.terminate()
+                signal_process_group(process, signal.SIGTERM)
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    signal_process_group(process, signal.SIGKILL)
                     process.wait(timeout=5)
             events.emit("process_stop", target="store", pid=process.pid, returncode=process.returncode)
         remove_shm(shm)
