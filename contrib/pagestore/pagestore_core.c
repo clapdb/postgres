@@ -2426,6 +2426,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	if (!tmp)
 		return 0;
+	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
@@ -2446,6 +2447,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 			found = 1;
 		}
 	}
+	ps_unlock_map();
 	free(tmp);
 	if (found && out_lsn)
 		*out_lsn = best;
@@ -3640,8 +3642,11 @@ evict_one_layer(void)
 			ps_layer_map.layers[i].data_verified = false;
 			break;
 		}
+	/* Keep the write lock through unlink: layer reads hold the matching read
+	 * lock while downloading/opening their cache file. */
+	found = (ps_layer_store->delete_local_layer(&candidate) == 0);
 	ps_unlock_map();
-	return ps_layer_store->delete_local_layer(&candidate) == 0;
+	return found;
 }
 
 /*
