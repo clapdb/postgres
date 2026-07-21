@@ -115,12 +115,23 @@ claim_object_dir(void)
 			unlink(owner_tmp);
 			return -1;
 		}
-		if (close(fd) != 0 || rename(owner_tmp, path) != 0 ||
-			fsync_dir(object_dir) != 0)
+		if (close(fd) != 0)
 		{
 			unlink(owner_tmp);
 			return -1;
 		}
+		if (link(owner_tmp, path) != 0)
+		{
+			if (errno == EEXIST)
+			{
+				unlink(owner_tmp);
+				goto owner_exists;
+			}
+			unlink(owner_tmp);
+			return -1;
+		}
+		if (unlink(owner_tmp) != 0 || fsync_dir(object_dir) != 0)
+			return -1;
 		return 0;
 	}
 owner_exists:
@@ -157,7 +168,18 @@ local_open(const char *store_dir)
 	configured_object_dir = getenv("PAGESTORE_OBJECT_DIR");
 	if (configured_object_dir == NULL || configured_object_dir[0] == '\0')
 		return 0;
-	if (realpath(configured_object_dir, object_dir) == NULL ||
+	{
+		char *resolved = realpath(configured_object_dir, NULL);
+
+		if (resolved == NULL || strlen(resolved) >= sizeof(object_dir))
+		{
+			free(resolved);
+			return -1;
+		}
+		memcpy(object_dir, resolved, strlen(resolved) + 1);
+		free(resolved);
+	}
+	if (
 		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
 		(store_st.st_dev == object_st.st_dev &&
 		 store_st.st_ino == object_st.st_ino) ||
@@ -245,7 +267,8 @@ files_equal(const char *left, const char *right)
 	int			lfd = -1, rfd = -1;
 	int			rc = -1;
 
-	if (stat(left, &lst) != 0 || stat(right, &rst) != 0 ||
+	if (lstat(left, &lst) != 0 || lstat(right, &rst) != 0 ||
+		!S_ISREG(lst.st_mode) || !S_ISREG(rst.st_mode) ||
 		lst.st_size != rst.st_size)
 		return 0;
 	lfd = open(left, O_RDONLY);
@@ -353,9 +376,15 @@ copy_file_atomic(const char *source, const char *destination, const char *dir)
 			done_bytes += (size_t) nw;
 		}
 	}
-	if (fsync(dfd) != 0 || close(dfd) != 0)
+	if (fsync(dfd) != 0)
 		goto done;
-	dfd = -1;
+	{
+		int close_rc = close(dfd);
+
+		dfd = -1;
+		if (close_rc != 0)
+			goto done;
+	}
 	if (link(tmp, destination) != 0)
 	{
 		if (errno != EEXIST || files_equal(source, destination) != 1)
@@ -542,7 +571,9 @@ local_upload_layer(const PsLayerDesc *layer)
 	published = remote_location(layer);
 	if (source == NULL ||
 		(published == NULL && object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0) ||
-		(published != NULL && snprintf(remote, sizeof(remote), "%s", published->uri) >= (int) sizeof(remote)))
+		(published != NULL &&
+		 ((published->size != source->size) ||
+		  snprintf(remote, sizeof(remote), "%s", published->uri) >= (int) sizeof(remote))))
 		return -1;
 	/* The manifest's declared length is the minimum identity available here. */
 	{
