@@ -244,6 +244,7 @@ class PlanValidationTests(unittest.TestCase):
             "ready", "recovered", "run_pass", "process_stop",
         ])
         self.assertEqual(events[4]["returncode"], -9)
+        self.assertNotEqual(events[1]["argv"][2], events[5]["argv"][2])
 
     def test_daemon_smoke_rejects_unimplemented_named_fault(self):
         directory = tempfile.TemporaryDirectory()
