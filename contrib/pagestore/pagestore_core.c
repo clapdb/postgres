@@ -2484,6 +2484,12 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 				{
 					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
 								   __ATOMIC_ACQ_REL);
+					if (layers[i].data_verified)
+						ps_layer_map.layers[j].data_verified = true;
+					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
+						ps_layer_store->layer_exists_local != NULL &&
+						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
+						ps_layer_map.layers[j].cache_resident = true;
 					break;
 				}
 	free(layers);
