@@ -3709,6 +3709,16 @@ evict_one_layer(void)
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
 		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
+				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
+				!(tier_local_location(layer) != NULL || layer->cache_resident ||
+				  layer->local_cleanup_pending))
+			{
+				ps_unlock_map();
+				return 0;
+			}
 			if (tier_local_location(&ps_layer_map.layers[i]) != NULL &&
 				ps_manifest_drop_local(candidate.layer_id) != 0)
 			{
