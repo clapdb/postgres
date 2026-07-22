@@ -3245,27 +3245,17 @@ void
 ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
+	int		cancel_upload = 0;
+	struct timespec deadline;
+	int		join_rc;
 
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
 		/* Remote tiering is optional: do not let a stalled object store delay
 		 * shutdown of the locally durable store.  The interrupted copy is
 		 * crash-safe and a later open reclaims its temporary file. */
-		struct timespec deadline;
-		int join_rc;
-
 		pthread_cancel(tier_upload_thread);
-		clock_gettime(CLOCK_REALTIME, &deadline);
-		deadline.tv_sec++;
-		join_rc = pthread_timedjoin_np(tier_upload_thread, NULL, &deadline);
-		if (join_rc == 0)
-			__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
-		else if (join_rc == ETIMEDOUT)
-		{
-			/* The process may still finish local durability and exit; do not
-			 * block it on an optional unresponsive object-store operation. */
-			pthread_detach(tier_upload_thread);
-		}
+		cancel_upload = 1;
 	}
 	else if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 2)
 	{
@@ -3305,6 +3295,21 @@ ps_core_close(void)
 	}
 
 	ps_pgcache_free();
+	if (cancel_upload)
+	{
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		join_rc = pthread_timedjoin_np(tier_upload_thread, NULL, &deadline);
+		if (join_rc != 0)
+		{
+			/* Do not detach an upload that still owns core/provider state.  The
+			 * local store is synced above; terminate the process so the kernel
+			 * reclaims the stuck worker rather than permitting a concurrent reopen. */
+			fprintf(stderr, "pagestore_daemon: FATAL: tier upload did not stop during shutdown\n");
+			_exit(EXIT_FAILURE);
+		}
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+	}
 	ps_manifest_close();
 }
 
