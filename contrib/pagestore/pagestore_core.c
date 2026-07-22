@@ -2507,8 +2507,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 				ps_layer_map.layers[i].cache_resident = true;
 				break;
 			}
-		ps_unlock_map();
 	}
+	ps_unlock_map();
 	return found;
 }
 
@@ -3692,7 +3692,8 @@ evict_one_layer(void)
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
-			(tier_local_location(layer) != NULL || layer->cache_resident) &&
+			(tier_local_location(layer) != NULL || layer->cache_resident ||
+			 layer->local_cleanup_pending) &&
 			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
 		{
 			candidate = *layer;
@@ -3718,11 +3719,19 @@ evict_one_layer(void)
 			 * the image data checksum to be verified again before serving it. */
 			ps_layer_map.layers[i].data_verified = false;
 			ps_layer_map.layers[i].cache_resident = false;
+			ps_layer_map.layers[i].local_cleanup_pending = true;
 			break;
 		}
 	/* Keep the write lock through unlink: layer reads hold the matching read
 	 * lock while downloading/opening their cache file. */
 	found = (ps_layer_store->delete_local_layer(&candidate) == 0);
+	if (found)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+			{
+				ps_layer_map.layers[i].local_cleanup_pending = false;
+				break;
+			}
 	ps_unlock_map();
 	return found;
 }
