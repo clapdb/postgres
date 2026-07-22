@@ -399,7 +399,8 @@ The initial provider uses a filesystem object directory selected by
 `PAGESTORE_OBJECT_DIR`.  It publishes an object with temp-file + `fsync` +
 atomic link, verifies a pre-existing retry target byte-for-byte, and derives a
 stable URI from the layer id.  It is intentionally only a provider here;
-maintenance scheduling owns the upload and manifest transitions.
+idle maintenance owns the upload and manifest transitions, processing one
+sealed layer at a time outside the layer-map lock.
 
 Acceptance criteria:
 
