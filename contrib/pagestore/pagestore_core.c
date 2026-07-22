@@ -3248,9 +3248,21 @@ ps_core_close(void)
 		/* Remote tiering is optional: do not let a stalled object store delay
 		 * shutdown of the locally durable store.  The interrupted copy is
 		 * crash-safe and a later open reclaims its temporary file. */
+		struct timespec deadline;
+		int join_rc;
+
 		pthread_cancel(tier_upload_thread);
-		pthread_join(tier_upload_thread, NULL);
-		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		join_rc = pthread_timedjoin_np(tier_upload_thread, NULL, &deadline);
+		if (join_rc == 0)
+			__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		else if (join_rc == ETIMEDOUT)
+		{
+			/* The process may still finish local durability and exit; do not
+			 * block it on an optional unresponsive object-store operation. */
+			pthread_detach(tier_upload_thread);
+		}
 	}
 	else if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 2)
 	{
