@@ -2434,7 +2434,15 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	nlayers = ps_layer_map.nlayers;
 	layers = nlayers ? malloc((size_t) nlayers * sizeof(*layers)) : NULL;
 	if (layers != NULL)
+	{
 		memcpy(layers, ps_layer_map.layers, (size_t) nlayers * sizeof(*layers));
+		for (uint32_t i = 0; i < nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				ps_layer_map.layers[i].timeline == timeline &&
+				!ps_layer_map.layers[i].deleting)
+				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
+							   __ATOMIC_ACQ_REL);
+	}
 	ps_unlock_map();
 	if (nlayers == 0)
 	{
@@ -2466,6 +2474,18 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 			found = 1;
 		}
 	}
+	/* Release the snapshot pins only after all cache I/O has completed. */
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < nlayers; i++)
+		if (layers[i].kind == PS_LAYER_IMAGE && layers[i].timeline == timeline &&
+			!layers[i].deleting)
+			for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
+				if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
+				{
+					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
+								   __ATOMIC_ACQ_REL);
+					break;
+				}
 	free(layers);
 	free(tmp);
 	if (found && out_lsn)
@@ -2474,7 +2494,6 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		*out_seq = best_seq;
 	if (found)
 	{
-		ps_lock_map_wr();
 		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 			if (ps_layer_map.layers[i].layer_id == best_layer &&
 				tier_local_location(&ps_layer_map.layers[i]) == NULL)
@@ -3392,12 +3411,18 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 				break;
 			}
 		free(idx);
-		if (!covers)
-			continue;
-		found = 1;
-		/* Always re-read and checksum now: a prior read's cached verification
-		 * may predate corruption that occurred before this unlink. */
-		if (ps_image_layer_verify_data(d, page_size) != 0)
+		if (covers)
+		{
+			found = 1;
+			/* Always re-read and checksum now: a prior read's cached verification
+			 * may predate corruption that occurred before this unlink. */
+			if (ps_image_layer_verify_data(d, page_size) != 0)
+				return -1;
+		}
+		/* Segment-GC only needed the index/data verification above.  Do not
+		 * retain a remote-only layer's temporary cache for every scanned input. */
+		if (tier_local_location(d) == NULL &&
+			ps_layer_store->delete_local_layer(d) != 0)
 			return -1;
 	}
 	return need_layer && !found ? -1 : 0;
@@ -3654,6 +3679,7 @@ evict_one_layer(void)
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
+			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
 			(tier_local_location(layer) != NULL || layer->cache_resident) &&
 			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
 		{

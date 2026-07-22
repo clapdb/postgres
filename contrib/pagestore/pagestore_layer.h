@@ -66,6 +66,8 @@ typedef struct PsLayerDesc
 	bool		deleting;
 	/* In-memory only: canonical local cache was materialized from remote. */
 	bool		cache_resident;
+	/* Number of snapshot readers that may materialize/read the canonical cache. */
+	uint32_t	cache_readers;
 
 	/*
 	 * In-memory only: whether this process has verified the layer's data
