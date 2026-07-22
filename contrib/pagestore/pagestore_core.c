@@ -2828,7 +2828,13 @@ recover_layer_prefix(uint32_t shard)
 			layer_shard_from_id(d->layer_id) != shard)
 			continue;
 		if (ps_image_layer_read_index(d, &idx, &n) != 0)
-			goto fail;
+		{
+			if (tier_local_location(d) != NULL ||
+				ps_layer_store->refresh_layer_cache == NULL ||
+				ps_layer_store->refresh_layer_cache(d) != 0 ||
+				ps_image_layer_read_index(d, &idx, &n) != 0)
+				goto fail;
+		}
 		for (uint32_t j = 0; j < n; j++)
 		{
 			int			covered;
