@@ -2423,6 +2423,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	unsigned char *tmp = malloc(page_size);
 	PsLayerDesc *layers;
 	uint32_t nlayers;
+	int			error = 0;
 	int			found = 0;
 	uint64_t	best = 0;
 	uint64_t	best_seq = 0;
@@ -2459,11 +2460,19 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		const PsLayerDesc *d = &layers[i];
 		uint64_t	l,
 					a;
+		int			lookup;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
-		if (ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
-								  page_size, &l, &a) == 1 &&
+		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+									   page_size, &l, &a);
+
+		if (lookup < 0)
+		{
+			error = 1;
+			break;
+		}
+		if (lookup == 1 &&
 			(!found || l > best || (l == best && a > best_seq) ||
 			 (l == best && a == best_seq && d->layer_id > best_layer)))
 		{
@@ -2509,7 +2518,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 			}
 	}
 	ps_unlock_map();
-	return found;
+	return error ? -1 : found;
 }
 
 /*
@@ -2519,7 +2528,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
  * page index (page_visible) still selects the authoritative version at each
  * level, so the result matches the segment-only read; layers/memtable just serve
  * the bytes without touching the segment.  Returns 1 if a version was found and
- * out filled, 0 if the page is unwritten (caller zero-fills).
+ * out filled, 0 if the page is unwritten (caller zero-fills), and -1 if an
+ * authoritative stored version cannot be read.
  */
 int
 read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
@@ -2569,10 +2579,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
-			else if (pv->seg < 0 &&
-					 layer_map_lookup(tl, key, block, rl, read_seq, &l, &a, out) &&
-					 l == pv->lsn && a == pv->admission_seq)
+			else if (pv->seg < 0)
 			{
+				int		layer_result = layer_map_lookup(tl, key, block, rl,
+																	read_seq, &l, &a, out);
+
+				if (layer_result < 0)
+					return -1;
+				if (layer_result == 0 || l != pv->lsn || a != pv->admission_seq)
+					return -1;
 				/*
 				 * Serve from a layer only for a layer-origin version (no segment
 				 * copy).  A segment-backed version must come from its segment; layers
@@ -3885,6 +3900,7 @@ ps_core_open(const char *store_dir)
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
+	ps_layer_store_set_page_size(page_size);
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
 	if (ps_manifest_open(store_dir) != 0)

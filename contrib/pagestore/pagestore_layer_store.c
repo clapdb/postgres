@@ -21,7 +21,13 @@
 
 #include "pagestore_layer_store.h"
 
-extern uint32_t page_size;
+static uint32_t layer_page_size = PS_DEFAULT_PAGE_SIZE;
+
+void
+ps_layer_store_set_page_size(uint32_t value)
+{
+	layer_page_size = value;
+}
 
 static char layer_dir[2048];
 static char object_dir[2048];
@@ -633,7 +639,7 @@ local_download_layer(const PsLayerDesc *layer)
 			return -1;
 		}
 		if (close(fd) != 0 ||
-			ps_image_layer_verify_data(layer, page_size) != 0)
+			ps_image_layer_verify_data(layer, layer_page_size) != 0)
 		{
 			unlink(local);
 			return -1;
