@@ -2417,7 +2417,8 @@ read_version(const PageVer *v, unsigned char *out)
  */
 static int
 layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t read_lsn, uint64_t read_seq, uint64_t *out_lsn,
+				 uint64_t read_lsn, uint64_t read_seq, uint64_t expected_lsn,
+				 uint64_t *out_lsn,
 				 uint64_t *out_seq, unsigned char *out)
 {
 	unsigned char *tmp = malloc(page_size);
@@ -2463,6 +2464,9 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		int			lookup;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
+			continue;
+		if (expected_lsn != 0 &&
+			(expected_lsn < d->lsn_start || expected_lsn > d->lsn_end))
 			continue;
 		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
 									   page_size, &l, &a);
@@ -2537,10 +2541,22 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t *out_ver)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	TlWalk		walk[MAX_TIMELINES];
+	uint32_t	levels = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
+	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
+	 * before a remote layer read can block. */
+	ps_lock_map_rd();
 	do
+		walk[levels++] = w;
+	while (levels < MAX_TIMELINES && tl_walk_next(&w));
+	ps_unlock_map();
+
+	for (uint32_t level = 0; level < levels; level++)
 	{
+		w = walk[level];
+		{
 		uint32_t	tl = w.tl;
 		uint64_t	rl = w.lsn;
 		PageEnt    *e = page_find(tl, key, block);
@@ -2582,7 +2598,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			else if (pv->seg < 0)
 			{
 				int		layer_result = layer_map_lookup(tl, key, block, rl,
-																	read_seq, &l, &a, out);
+																	read_seq, pv->lsn, &l, &a, out);
 
 				if (layer_result < 0)
 					return -1;
@@ -2607,7 +2623,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
-	} while (tl_walk_next(&w));
+		}
+	}
 	return 0;
 }
 
@@ -2675,7 +2692,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, 0,
+					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
 									  &layer_lsn, NULL, tmp) ||
 						layer_lsn != v->lsn)
 					{
@@ -3707,8 +3724,6 @@ evict_one_layer(void)
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
-			(tier_local_location(layer) != NULL || layer->cache_resident ||
-			 layer->local_cleanup_pending) &&
 			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
 		{
 			candidate = *layer;
@@ -3728,8 +3743,7 @@ evict_one_layer(void)
 
 			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
 				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
-				!(tier_local_location(layer) != NULL || layer->cache_resident ||
-				  layer->local_cleanup_pending))
+				ps_layer_store->layer_exists_local(layer->layer_id) != 1)
 			{
 				ps_unlock_map();
 				return 0;

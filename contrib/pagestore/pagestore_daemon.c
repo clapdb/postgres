@@ -297,11 +297,18 @@ run_request_admitted(PsChannel *ch)
 		}
 		else
 		{
-			/* Core read helpers take short map snapshots themselves.  Do not hold
-			 * map_rd around the whole request: remote cache materialization may
-			 * block, and recursive rdlock acquisition can deadlock behind a writer. */
+			/* READV/READ_AT snapshot ancestry internally before potentially blocking
+			 * remote-layer I/O.  Other timeline readers complete under map_rd. */
 			ps_lock_shard_rd(shard);
-			handle_request(ch);
+			if (op == PS_OP_READV || op == PS_OP_READ_AT ||
+				op == PS_OP_WAL_RETAIN_FLOOR)
+				handle_request(ch);
+			else
+			{
+				ps_lock_map_rd();
+				handle_request(ch);
+				ps_unlock_map();
+			}
 			ps_store_release(&ch->state, PS_STATE_DONE);
 			ps_unlock_shard(shard);
 		}
