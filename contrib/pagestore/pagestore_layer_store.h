@@ -42,5 +42,6 @@ typedef struct PsLayerStore
 
 extern const PsLayerStore PsLayerStoreLocal;
 extern const PsLayerStore *ps_layer_store;
+extern void ps_layer_store_set_page_size(uint32_t value);
 
 #endif							/* PAGESTORE_LAYER_STORE_H */

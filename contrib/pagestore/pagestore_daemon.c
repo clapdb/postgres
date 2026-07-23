@@ -106,10 +106,16 @@ handle_request(PsChannel *ch)
 				{
 					unsigned char *dst = ch->data + (size_t) i * page_size;
 					uint64_t	resolved = 0;
+					int			read_result;
 
-					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl,
-									  ch->req_seq, dst,
-									  &resolved))
+					read_result = read_resolve(tl, &ch->key, ch->blocknum + i, rl,
+												   ch->req_seq, dst, &resolved);
+					if (read_result < 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
+					if (read_result == 0)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 					else if (ch->req_seq != 0 && resolved == 0)
 					{
@@ -138,10 +144,13 @@ handle_request(PsChannel *ch)
 			{
 				uint64_t	read_lsn = ch->req_lsn;
 				uint64_t	resolved = 0;
+				int			read_result;
 
-				if (read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
-								 ch->req_seq, ch->data,
-								 &resolved))
+				read_result = read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
+												  ch->req_seq, ch->data, &resolved);
+				if (read_result < 0)
+					ch->status = PS_STATUS_ERROR;
+				else if (read_result > 0)
 				{
 					if (read_lsn != UINT64_MAX && resolved == 0)
 					{
