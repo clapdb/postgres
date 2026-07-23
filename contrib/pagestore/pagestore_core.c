@@ -75,6 +75,7 @@ static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static pthread_t gc_remote_thread;
 static PsLayerDesc gc_remote_candidate;
 static volatile int gc_remote_state; /* 0 idle, 1 running, 2 success, 3 failed */
+static uint64_t gc_remote_layer_cursor;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -405,7 +406,7 @@ static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
  * REMOVE_LAYER event recorded.  Reads already skip 'deleting' layers, so this
  * only reclaims space.
  */
-static int
+static int __attribute__((unused))
 gc_resume(void)
 {
 	PsLayerDesc *dead;
@@ -531,35 +532,56 @@ gc_remote_one(void)
 		pthread_join(gc_remote_thread, NULL);
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
+		{
+			gc_remote_layer_cursor = gc_remote_candidate.layer_id;
 			return 0;
+		}
 		ps_lock_map_wr();
-		if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
-			ps_manifest_remove_layer(gc_remote_candidate.layer_id);
+		if (ps_layer_store->delete_local_layer(&gc_remote_candidate) != 0 ||
+			ps_manifest_remove_layer(gc_remote_candidate.layer_id) != 0)
+		{
+			ps_unlock_map();
+			gc_remote_layer_cursor = gc_remote_candidate.layer_id;
+			return 0;
+		}
 		ps_unlock_map();
 		return 1;
 	}
 	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].deleting)
+	for (uint32_t pass = 0; pass < 2; pass++)
+	{
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		{
-			gc_remote_candidate = ps_layer_map.layers[i];
-			ps_unlock_map();
-			if (tier_remote_location(&gc_remote_candidate) == NULL)
+			if (ps_layer_map.layers[i].deleting &&
+				((pass == 0 && ps_layer_map.layers[i].layer_id > gc_remote_layer_cursor) ||
+				 (pass == 1 && ps_layer_map.layers[i].layer_id <= gc_remote_layer_cursor)) &&
+				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
+				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			{
-				int removed = 0;
-
-				ps_lock_map_wr();
-				if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
-					removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
+				gc_remote_candidate = ps_layer_map.layers[i];
+				gc_remote_layer_cursor = gc_remote_candidate.layer_id;
 				ps_unlock_map();
-				return removed;
+				if (tier_remote_location(&gc_remote_candidate) == NULL)
+				{
+					int removed = 0;
+
+					ps_lock_map_wr();
+					if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
+						removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
+					ps_unlock_map();
+					return removed;
+				}
+				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
+				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
+								   &gc_remote_candidate) != 0)
+				{
+					__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+					return 0;
+				}
+				return 1;
 			}
-			__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
-			if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
-						   &gc_remote_candidate) != 0)
-				__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
-			return 1;
 		}
+	}
 	ps_unlock_map();
 	return 0;
 }
@@ -3921,9 +3943,9 @@ ps_core_maintenance(void)
 	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
-	if (tier_one_layer())
-		return 1;
 	if (gc_remote_one())
+		return 1;
+	if (tier_one_layer())
 		return 1;
 	if (gc_resume())
 		return 1;
@@ -4030,6 +4052,8 @@ ps_core_open(const char *store_dir)
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
+	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+	gc_remote_layer_cursor = 0;
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
@@ -4040,8 +4064,8 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
-	if (use_layers)
-		gc_resume();			/* finish any GC interrupted by a crash */
+	/* Leave deleting layers for asynchronous maintenance: recovery must not
+	 * block on an unavailable remote object that is already excluded from reads. */
 
 	/* initialize per-shard state, locks and layer-id cursors */
 	for (uint32_t i = 0; i < ns; i++)
