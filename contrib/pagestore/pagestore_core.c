@@ -3500,11 +3500,10 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 			if (ps_image_layer_verify_data(d, page_size) != 0)
 				return -1;
 		}
-		/* Segment-GC only needed the index/data verification above.  Do not
-		 * retain a remote-only layer's temporary cache for every scanned input. */
-		if (tier_local_location(d) == NULL &&
-			ps_layer_store->delete_local_layer(d) != 0)
-			return -1;
+		/* Keep any remote-only cache materialized while examining this segment.
+		 * Segment GC advances one victim at a time, and dropping it here makes
+		 * every later victim download the same verified layer again while all
+		 * shard write locks are held.  Idle eviction owns eventual cache cleanup. */
 	}
 	return need_layer && !found ? -1 : 0;
 }
