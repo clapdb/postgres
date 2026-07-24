@@ -550,6 +550,19 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
 	}
+	/* A read snapshots and pins the complete timeline layer set before doing
+	 * remote I/O.  Do not publish a partial compaction while any source is
+	 * pinned: that leaves the source count above the threshold and makes idle
+	 * maintenance repeatedly create larger overlapping replacements. */
+	for (uint32_t k = 0; k < nold; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+			{
+				free(old);
+				return 0;
+			}
 
 	/* gather every version (page bytes) from the old layers */
 	for (uint32_t k = 0; k < nold; k++)
@@ -652,7 +665,7 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 	next_old:
 		;
 	}
-	rc = 0;
+	rc = 1;
 
 cleanup:
 	for (uint32_t j = 0; j < nrec; j++)
@@ -3841,8 +3854,6 @@ ps_core_maintenance(void)
 	ns = core_shards();
 	if (tier_one_layer())
 		return 1;
-	if (evict_one_layer())
-		return 1;
 	if (gc_resume())
 		return 1;
 
@@ -3861,6 +3872,11 @@ ps_core_maintenance(void)
 		if (found)
 			return 1;
 	}
+	/* Keep layer caches resident while pending segment reclamation consumes
+	 * them.  Otherwise a layer spanning several victims is redownloaded on
+	 * every maintenance pass while GC holds all shard write locks. */
+	if (evict_one_layer())
+		return 1;
 
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
@@ -3889,12 +3905,11 @@ ps_core_maintenance(void)
 		ps_lock_shard_wr(fsh);
 		ps_lock_map_wr();
 		if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
-			compact_timeline(ftl, fsh);
+			did = compact_timeline(ftl, fsh) > 0;
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
 		/* Remote GC is deliberately outside compaction's write locks. */
 		gc_resume();
-		did = 1;
 	}
 
 	/*
