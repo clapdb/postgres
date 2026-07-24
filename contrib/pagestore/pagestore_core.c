@@ -2660,18 +2660,44 @@ int
 wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 {
 	PsKey		key;
-	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+	TlWalk		ancestry[MAX_TIMELINES];
+	uint32_t	ancestry_n = 0;
+	uint32_t	tl = timeline;
+	uint64_t	lsn = UINT64_MAX;
 	uint64_t	floor = 0;
 	unsigned char *tmp = malloc(page_size);
 	int			rc = 0;
+	bool		complete = false;
 
 	if (!tmp)
 		return -1;				/* cannot prove a floor: fail closed */
+	ps_lock_map_rd();
+	for (; ancestry_n < MAX_TIMELINES; ancestry_n++)
+	{
+		ancestry[ancestry_n].tl = tl;
+		ancestry[ancestry_n].lsn = lsn;
+		if (!timeline_has_parent(tl))
+		{
+			complete = true;
+			break;
+		}
+		if (timelines[tl].branch_lsn < lsn)
+			lsn = timelines[tl].branch_lsn;
+		tl = (uint32_t) timelines[tl].parent;
+	}
+	ps_unlock_map();
+	if (!complete)
+	{
+		free(tmp);
+		return -1;				/* malformed ancestry: fail closed */
+	}
+	ancestry_n++;
 	memset(&key, 0, sizeof(key));
 	key.klass = PS_KLASS_CONTROL;
 
-	do
+	for (uint32_t level = 0; level < ancestry_n; level++)
 	{
+		TlWalk		w = ancestry[level];
 		PageEnt    *notes = page_find(w.tl, &key, 1);
 		PageEnt    *images = page_find(w.tl, &key, 0);
 
@@ -2764,7 +2790,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				}
 			}
 		}
-	} while (tl_walk_next(&w));
+	}
 
 done:
 	free(tmp);
