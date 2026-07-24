@@ -416,7 +416,9 @@ gc_resume(void)
 		ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id) &&
+			__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+						__ATOMIC_ACQUIRE) == 0)
 			m++;
 	if (m == 0)
 	{
@@ -434,7 +436,9 @@ gc_resume(void)
 	m = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id) &&
+			__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+						__ATOMIC_ACQUIRE) == 0)
 			dead[m++] = ps_layer_map.layers[i];
 	if (map_locks_ready)
 		ps_unlock_map();
@@ -625,6 +629,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 * not durable).  A failed unlink is not a manifest error: the layer is
 		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+							 __ATOMIC_ACQUIRE) != 0)
+				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
@@ -640,6 +649,8 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			continue;
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete */
+	next_old:
+		;
 	}
 	rc = 0;
 
@@ -2692,8 +2703,8 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
-									  &layer_lsn, NULL, tmp) ||
+				if (layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
+									 &layer_lsn, NULL, tmp) != 1 ||
 						layer_lsn != v->lsn)
 					{
 						rc = -1;
