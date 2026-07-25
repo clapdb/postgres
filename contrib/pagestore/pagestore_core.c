@@ -3872,12 +3872,6 @@ ps_core_maintenance(void)
 		if (found)
 			return 1;
 	}
-	/* Keep layer caches resident while pending segment reclamation consumes
-	 * them.  Otherwise a layer spanning several victims is redownloaded on
-	 * every maintenance pass while GC holds all shard write locks. */
-	if (evict_one_layer())
-		return 1;
-
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
 	 * layers are due for compaction.  A shared lock here lets reads proceed.
@@ -3911,6 +3905,11 @@ ps_core_maintenance(void)
 		/* Remote GC is deliberately outside compaction's write locks. */
 		gc_resume();
 	}
+	/* Keep compaction inputs resident until due compaction has run.  Evicting
+	 * first turns routine compaction into remote I/O under map/shard write
+	 * locks; segment GC above likewise consumes its caches before this point. */
+	if (!did && evict_one_layer())
+		return 1;
 
 	/*
 	 * Phase 3: rewrite the manifest log if add/seal/delete churn has grown it

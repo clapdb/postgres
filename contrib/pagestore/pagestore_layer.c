@@ -412,31 +412,34 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsDeltaFooter foot;
-	PsDeltaIndexEnt *idx;
+	PsDeltaIndexEnt *idx = NULL;
 	uint64_t	idx_bytes;
 	int			rc = -1;
+	int			retried = 0;
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or its
 	 * LSN range does not overlap the requested (lo_lsn, hi_lsn] */
 	if (!layer_covers(layer, key, block) ||
 		layer->lsn_end <= lo_lsn || layer->lsn_start > hi_lsn)
 		return 0;
+
+retry:
 	if (!loc || loc->size < sizeof(PsDeltaFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
-		return -1;
+									 &foot, sizeof(foot)) != 0)
+		goto refresh;
 	if (foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
 		foot.nrecs == 0)
-		return -1;
+		goto refresh;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
 	idx = malloc((size_t) idx_bytes);
 	if (!idx)
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
-										 (uint32_t) idx_bytes) != 0 ||
+									 (uint32_t) idx_bytes) != 0 ||
 		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
-		goto out;
+		goto refresh;
 
 	/* index is sorted by (key, block, lsn): matches are contiguous + ascending */
 	for (uint32_t i = 0; i < foot.nrecs && *n < cap; i++)
@@ -451,6 +454,17 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 		(*n)++;
 	}
 	rc = 0;
+	goto out;
+
+refresh:
+	free(idx);
+	idx = NULL;
+	if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
+		ps_layer_store->refresh_layer_cache(layer) == 0)
+	{
+		retried = 1;
+		goto retry;
+	}
 
 out:
 	free(idx);
