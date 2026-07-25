@@ -3773,7 +3773,8 @@ evict_one_layer(void)
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
-			ps_layer_store->layer_exists_local(layer->layer_id) == 1)
+			(layer->local_cleanup_pending ||
+			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
 		{
 			candidate = *layer;
 			found = 1;
@@ -3792,7 +3793,8 @@ evict_one_layer(void)
 
 			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
 				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
-				ps_layer_store->layer_exists_local(layer->layer_id) != 1)
+				(!layer->local_cleanup_pending &&
+				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
 			{
 				ps_unlock_map();
 				return 0;
@@ -3908,7 +3910,7 @@ ps_core_maintenance(void)
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
 	 * first turns routine compaction into remote I/O under map/shard write
 	 * locks; segment GC above likewise consumes its caches before this point. */
-	if (!did && evict_one_layer())
+	if (!found && !did && evict_one_layer())
 		return 1;
 
 	/*
