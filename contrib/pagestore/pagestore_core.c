@@ -590,15 +590,7 @@ gc_remote_one(void)
 						remote->available = true;
 					}
 					else
-					{
-						int removed = 0;
-
-						ps_lock_map_wr();
-						if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
-							removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
-						ps_unlock_map();
-						return removed;
-					}
+						return 0; /* retain tombstone until URI can be derived */
 				}
 				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
@@ -3513,7 +3505,8 @@ ps_core_close(void)
 	struct timespec deadline;
 	int		join_rc;
 
-	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0 &&
+		__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 4)
 	{
 		pthread_cancel(gc_remote_thread);
 		clock_gettime(CLOCK_REALTIME, &deadline);
