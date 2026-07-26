@@ -21,12 +21,23 @@
 
 #include "pagestore_layer_store.h"
 
+static uint32_t layer_page_size = PS_DEFAULT_PAGE_SIZE;
+
+void
+ps_layer_store_set_page_size(uint32_t value)
+{
+	layer_page_size = value;
+}
+
 static char layer_dir[2048];
 static char object_dir[2048];
 
 static int layer_id_shard(uint64_t layer_id);
 static int fsync_dir(const char *dir);
 static int cleanup_stale_copy_temps(const char *dir);
+static const PsLayerLocation *remote_location(const PsLayerDesc *layer);
+static int local_download_layer(const PsLayerDesc *layer);
+static int local_refresh_layer_cache(const PsLayerDesc *layer);
 
 /*
  * Object directories are deliberately single-store resources.  Layer IDs are
@@ -488,9 +499,26 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	}
 
 	if (path == NULL)
-		return -1;
+	{
+		char		cached[4096];
+
+		if (local_layer_path(layer->layer_id, cached, sizeof(cached)) != 0)
+			return -1;
+		if (access(cached, R_OK) != 0 &&
+			(remote_location(layer) == NULL || local_download_layer(layer) != 0))
+			return -1;
+		path = cached;
+	}
 
 	fd = open(path, O_RDONLY);
+	if (fd < 0 && remote_location(layer) != NULL)
+	{
+		char cached[4096];
+
+		if (local_layer_path(layer->layer_id, cached, sizeof(cached)) == 0 &&
+			local_download_layer(layer) == 0)
+			fd = open(cached, O_RDONLY);
+	}
 	if (fd < 0)
 		return -1;
 	n = pread(fd, buf, len, (off_t) off);
@@ -507,6 +535,21 @@ local_location(const PsLayerDesc *layer)
 			layer->locations[i].available)
 			return &layer->locations[i];
 	return NULL;
+}
+
+static int
+local_refresh_layer_cache(const PsLayerDesc *layer)
+{
+	char		local[4096];
+
+	/* Never replace an original manifest-owned local layer: only a remote-only
+	 * descriptor may have the disposable canonical read cache. */
+	if (local_location(layer) != NULL || remote_location(layer) == NULL ||
+		local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
+		return -1;
+	if (unlink(local) != 0 && errno != ENOENT)
+		return -1;
+	return local_download_layer(layer);
 }
 
 static int
@@ -568,21 +611,45 @@ local_download_layer(const PsLayerDesc *layer)
 {
 	const PsLayerLocation *source;
 	char		local[4096];
+	struct stat st;
 
 	source = remote_location(layer);
 	if (source == NULL || local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
 	if (copy_file_atomic(source->uri, local, layer_dir) != 0)
 		return -1;
+	if (stat(local, &st) != 0 || st.st_size < 0 ||
+		(uint64_t) st.st_size != source->size)
 	{
-		struct stat st;
+		unlink(local);
+		return -1;
+	}
+	if (layer->kind == PS_LAYER_IMAGE)
+	{
+		PsImgFooter foot;
+		int fd = open(local, O_RDONLY);
 
-		if (stat(local, &st) != 0 || st.st_size < 0 ||
-			(uint64_t) st.st_size != source->size)
+		if (st.st_size < (off_t) sizeof(foot) || fd < 0 ||
+			pread(fd, &foot, sizeof(foot),
+						  st.st_size - sizeof(foot)) != sizeof(foot))
+		{
+			if (fd >= 0)
+				close(fd);
+			unlink(local);
+			return -1;
+		}
+		if (close(fd) != 0 ||
+			ps_image_layer_verify_data(layer, layer_page_size) != 0)
 		{
 			unlink(local);
 			return -1;
 		}
+	}
+	else if (layer->kind == PS_LAYER_DELTA &&
+		ps_delta_layer_verify_data(layer) != 0)
+	{
+		unlink(local);
+		return -1;
 	}
 	return 0;
 }
@@ -626,6 +693,19 @@ local_delete_local_layer(const PsLayerDesc *layer)
 				unlinked = 1;
 		}
 	}
+	/* DROP_LOCAL is durable before unlink.  Retry the canonical physical file
+	 * even when the manifest has already marked its local location unavailable. */
+	if (!unlinked)
+	{
+		char	path[4096];
+
+		if (local_layer_path(layer->layer_id, path, sizeof(path)) != 0)
+			return -1;
+		if (unlink(path) == 0 || errno == ENOENT)
+			unlinked = 1;
+		else
+			rc = -1;
+	}
 	if (unlinked && local_fsync_dir() != 0)
 		rc = -1;
 	return rc;
@@ -659,6 +739,7 @@ const PsLayerStore PsLayerStoreLocal = {
 	.read_layer_block = local_read_layer_block,
 	.upload_layer = local_upload_layer,
 	.download_layer = local_download_layer,
+	.refresh_layer_cache = local_refresh_layer_cache,
 	.delete_local_layer = local_delete_local_layer,
 	.delete_remote_layer = local_delete_remote_layer,
 	.layer_exists_remote = local_layer_exists_remote,

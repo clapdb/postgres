@@ -71,6 +71,7 @@ static struct timespec tier_upload_retry_at;
 static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
+static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -393,6 +394,7 @@ count_image_layers(uint32_t timeline, uint32_t shard)
 }
 
 static const PsLayerLocation *tier_remote_location(const PsLayerDesc *layer);
+static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
@@ -414,7 +416,9 @@ gc_resume(void)
 		ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id) &&
+			__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+						__ATOMIC_ACQUIRE) == 0)
 			m++;
 	if (m == 0)
 	{
@@ -432,7 +436,9 @@ gc_resume(void)
 	m = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].deleting &&
-			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id))
+			!(uploading && ps_layer_map.layers[i].layer_id == uploading_id) &&
+			__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+						__ATOMIC_ACQUIRE) == 0)
 			dead[m++] = ps_layer_map.layers[i];
 	if (map_locks_ready)
 		ps_unlock_map();
@@ -544,6 +550,19 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
 	}
+	/* A read snapshots and pins the complete timeline layer set before doing
+	 * remote I/O.  Do not publish a partial compaction while any source is
+	 * pinned: that leaves the source count above the threshold and makes idle
+	 * maintenance repeatedly create larger overlapping replacements. */
+	for (uint32_t k = 0; k < nold; k++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+								__ATOMIC_ACQUIRE) != 0)
+			{
+				free(old);
+				return 0;
+			}
 
 	/* gather every version (page bytes) from the old layers */
 	for (uint32_t k = 0; k < nold; k++)
@@ -623,6 +642,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		 * not durable).  A failed unlink is not a manifest error: the layer is
 		 * durably deleting, so we can move on and let gc_resume() retry it.
 		 */
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == old[k].layer_id &&
+				__atomic_load_n(&ps_layer_map.layers[i].cache_readers,
+							 __ATOMIC_ACQUIRE) != 0)
+				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
@@ -638,8 +662,10 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			continue;
 		if (ps_manifest_remove_layer(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete */
+	next_old:
+		;
 	}
-	rc = 0;
+	rc = 1;
 
 cleanup:
 	for (uint32_t j = 0; j < nrec; j++)
@@ -2415,10 +2441,14 @@ read_version(const PageVer *v, unsigned char *out)
  */
 static int
 layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
-				 uint64_t read_lsn, uint64_t read_seq, uint64_t *out_lsn,
+				 uint64_t read_lsn, uint64_t read_seq, uint64_t expected_lsn,
+				 uint64_t *out_lsn,
 				 uint64_t *out_seq, unsigned char *out)
 {
 	unsigned char *tmp = malloc(page_size);
+	PsLayerDesc *layers;
+	uint32_t nlayers;
+	int			error = 0;
 	int			found = 0;
 	uint64_t	best = 0;
 	uint64_t	best_seq = 0;
@@ -2426,16 +2456,51 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	if (!tmp)
 		return 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	ps_lock_map_rd();
+	nlayers = ps_layer_map.nlayers;
+	layers = nlayers ? malloc((size_t) nlayers * sizeof(*layers)) : NULL;
+	if (layers != NULL)
 	{
-		const PsLayerDesc *d = &ps_layer_map.layers[i];
+		memcpy(layers, ps_layer_map.layers, (size_t) nlayers * sizeof(*layers));
+		for (uint32_t i = 0; i < nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				ps_layer_map.layers[i].timeline == timeline &&
+				!ps_layer_map.layers[i].deleting)
+				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
+							   __ATOMIC_ACQ_REL);
+	}
+	ps_unlock_map();
+	if (nlayers == 0)
+	{
+		free(tmp);
+		return 0;
+	}
+	if (layers == NULL)
+	{
+		free(tmp);
+		return 0;
+	}
+	for (uint32_t i = 0; i < nlayers; i++)
+	{
+		const PsLayerDesc *d = &layers[i];
 		uint64_t	l,
 					a;
+		int			lookup;
 
 		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
 			continue;
-		if (ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
-								  page_size, &l, &a) == 1 &&
+		if (expected_lsn != 0 &&
+			(expected_lsn < d->lsn_start || expected_lsn > d->lsn_end))
+			continue;
+		lookup = ps_image_layer_lookup(d, key, block, read_lsn, read_seq, tmp,
+									   page_size, &l, &a);
+
+		if (lookup < 0)
+		{
+			error = 1;
+			break;
+		}
+		if (lookup == 1 &&
 			(!found || l > best || (l == best && a > best_seq) ||
 			 (l == best && a == best_seq && d->layer_id > best_layer)))
 		{
@@ -2446,12 +2511,42 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 			found = 1;
 		}
 	}
+	/* Release the snapshot pins only after all cache I/O has completed. */
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < nlayers; i++)
+		if (layers[i].kind == PS_LAYER_IMAGE && layers[i].timeline == timeline &&
+			!layers[i].deleting)
+			for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
+				if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
+				{
+					__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
+								   __ATOMIC_ACQ_REL);
+					if (layers[i].data_verified)
+						ps_layer_map.layers[j].data_verified = true;
+					if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
+						ps_layer_store->layer_exists_local != NULL &&
+						ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
+						ps_layer_map.layers[j].cache_resident = true;
+					break;
+				}
+	free(layers);
 	free(tmp);
 	if (found && out_lsn)
 		*out_lsn = best;
 	if (found && out_seq)
 		*out_seq = best_seq;
-	return found;
+	if (found)
+	{
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == best_layer &&
+				tier_local_location(&ps_layer_map.layers[i]) == NULL)
+			{
+				ps_layer_map.layers[i].cache_resident = true;
+				break;
+			}
+	}
+	ps_unlock_map();
+	return error ? -1 : found;
 }
 
 /*
@@ -2461,7 +2556,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
  * page index (page_visible) still selects the authoritative version at each
  * level, so the result matches the segment-only read; layers/memtable just serve
  * the bytes without touching the segment.  Returns 1 if a version was found and
- * out filled, 0 if the page is unwritten (caller zero-fills).
+ * out filled, 0 if the page is unwritten (caller zero-fills), and -1 if an
+ * authoritative stored version cannot be read.
  */
 int
 read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
@@ -2469,10 +2565,22 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t *out_ver)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	TlWalk		walk[MAX_TIMELINES];
+	uint32_t	levels = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
+	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
+	 * before a remote layer read can block. */
+	ps_lock_map_rd();
 	do
+		walk[levels++] = w;
+	while (levels < MAX_TIMELINES && tl_walk_next(&w));
+	ps_unlock_map();
+
+	for (uint32_t level = 0; level < levels; level++)
 	{
+		w = walk[level];
+		{
 		uint32_t	tl = w.tl;
 		uint64_t	rl = w.lsn;
 		PageEnt    *e = page_find(tl, key, block);
@@ -2511,10 +2619,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				__atomic_fetch_add(&s->rr_mem, 1, __ATOMIC_RELAXED);
 				served = 1;		/* served from the memtable */
 			}
-			else if (pv->seg < 0 &&
-					 layer_map_lookup(tl, key, block, rl, read_seq, &l, &a, out) &&
-					 l == pv->lsn && a == pv->admission_seq)
+			else if (pv->seg < 0)
 			{
+				int		layer_result = layer_map_lookup(tl, key, block, rl,
+																	read_seq, pv->lsn, &l, &a, out);
+
+				if (layer_result < 0)
+					return -1;
+				if (layer_result == 0 || l != pv->lsn || a != pv->admission_seq)
+					return -1;
 				/*
 				 * Serve from a layer only for a layer-origin version (no segment
 				 * copy).  A segment-backed version must come from its segment; layers
@@ -2534,7 +2647,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
-	} while (tl_walk_next(&w));
+		}
+	}
 	return 0;
 }
 
@@ -2559,18 +2673,44 @@ int
 wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 {
 	PsKey		key;
-	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+	TlWalk		ancestry[MAX_TIMELINES];
+	uint32_t	ancestry_n = 0;
+	uint32_t	tl = timeline;
+	uint64_t	lsn = UINT64_MAX;
 	uint64_t	floor = 0;
 	unsigned char *tmp = malloc(page_size);
 	int			rc = 0;
+	bool		complete = false;
 
 	if (!tmp)
 		return -1;				/* cannot prove a floor: fail closed */
+	ps_lock_map_rd();
+	for (; ancestry_n < MAX_TIMELINES; ancestry_n++)
+	{
+		ancestry[ancestry_n].tl = tl;
+		ancestry[ancestry_n].lsn = lsn;
+		if (!timeline_has_parent(tl))
+		{
+			complete = true;
+			break;
+		}
+		if (timelines[tl].branch_lsn < lsn)
+			lsn = timelines[tl].branch_lsn;
+		tl = (uint32_t) timelines[tl].parent;
+	}
+	ps_unlock_map();
+	if (!complete)
+	{
+		free(tmp);
+		return -1;				/* malformed ancestry: fail closed */
+	}
+	ancestry_n++;
 	memset(&key, 0, sizeof(key));
 	key.klass = PS_KLASS_CONTROL;
 
-	do
+	for (uint32_t level = 0; level < ancestry_n; level++)
 	{
+		TlWalk		w = ancestry[level];
 		PageEnt    *notes = page_find(w.tl, &key, 1);
 		PageEnt    *images = page_find(w.tl, &key, 0);
 
@@ -2602,8 +2742,8 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				{
 					uint64_t	layer_lsn;
 
-					if (!layer_map_lookup(w.tl, &key, 1, v->lsn, 0,
-									  &layer_lsn, NULL, tmp) ||
+				if (layer_map_lookup(w.tl, &key, 1, v->lsn, 0, v->lsn,
+									 &layer_lsn, NULL, tmp) != 1 ||
 						layer_lsn != v->lsn)
 					{
 						rc = -1;
@@ -2663,7 +2803,7 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 				}
 			}
 		}
-	} while (tl_walk_next(&w));
+	}
 
 done:
 	free(tmp);
@@ -2770,7 +2910,13 @@ recover_layer_prefix(uint32_t shard)
 			layer_shard_from_id(d->layer_id) != shard)
 			continue;
 		if (ps_image_layer_read_index(d, &idx, &n) != 0)
-			goto fail;
+		{
+			if (tier_local_location(d) != NULL ||
+				ps_layer_store->refresh_layer_cache == NULL ||
+				ps_layer_store->refresh_layer_cache(d) != 0 ||
+				ps_image_layer_read_index(d, &idx, &n) != 0)
+				goto fail;
+		}
 		for (uint32_t j = 0; j < n; j++)
 		{
 			int			covered;
@@ -2821,6 +2967,12 @@ recover_layer_prefix(uint32_t shard)
 			free(verify);
 		}
 		free(idx);
+		/* Recovery needs only the index entries already copied above.  Do not
+		 * retain every remote-only layer's materialized cache until all shards
+		 * replay, which can exceed local capacity on restart. */
+		if (tier_local_location(d) == NULL &&
+			ps_layer_store->delete_local_layer(d) != 0)
+			goto fail;
 	}
 
 	if (nrec == 0)
@@ -3353,13 +3505,18 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 				break;
 			}
 		free(idx);
-		if (!covers)
-			continue;
-		found = 1;
-		/* Always re-read and checksum now: a prior read's cached verification
-		 * may predate corruption that occurred before this unlink. */
-		if (ps_image_layer_verify_data(d, page_size) != 0)
-			return -1;
+		if (covers)
+		{
+			found = 1;
+			/* Always re-read and checksum now: a prior read's cached verification
+			 * may predate corruption that occurred before this unlink. */
+			if (ps_image_layer_verify_data(d, page_size) != 0)
+				return -1;
+		}
+		/* Keep any remote-only cache materialized while examining this segment.
+		 * Segment GC advances one victim at a time, and dropping it here makes
+		 * every later victim download the same verified layer again while all
+		 * shard write locks are held.  Idle eviction owns eventual cache cleanup. */
 	}
 	return need_layer && !found ? -1 : 0;
 }
@@ -3599,6 +3756,76 @@ finish_upload:
 	return 1;
 }
 
+/* Evict at most one remote-durable local cache file. */
+static int
+evict_one_layer(void)
+{
+	PsLayerDesc candidate;
+	int			found = 0;
+
+	if (ps_layer_store->layer_exists_local == NULL ||
+		ps_layer_store->delete_local_layer == NULL)
+		return 0;
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
+			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
+			(layer->local_cleanup_pending ||
+			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
+		{
+			candidate = *layer;
+			found = 1;
+			break;
+		}
+	}
+	ps_unlock_map();
+	if (!found)
+		return 0;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
+				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
+				(!layer->local_cleanup_pending &&
+				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			if (tier_local_location(&ps_layer_map.layers[i]) != NULL &&
+				ps_manifest_drop_local(candidate.layer_id) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			/* A later cache refill installs different physical bytes; require
+			 * the image data checksum to be verified again before serving it. */
+			ps_layer_map.layers[i].data_verified = false;
+			ps_layer_map.layers[i].cache_resident = false;
+			ps_layer_map.layers[i].local_cleanup_pending = true;
+			break;
+		}
+	/* Keep the write lock through unlink: layer reads hold the matching read
+	 * lock while downloading/opening their cache file. */
+	found = (ps_layer_store->delete_local_layer(&candidate) == 0);
+	if (found)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+			{
+				ps_layer_map.layers[i].local_cleanup_pending = false;
+				break;
+			}
+	ps_unlock_map();
+	return found;
+}
+
 /*
  * Off-the-write-path background maintenance: compact one timeline whose image
  * layer count exceeds the (low-water) threshold.  The daemon calls this when it
@@ -3647,7 +3874,6 @@ ps_core_maintenance(void)
 		if (found)
 			return 1;
 	}
-
 	/*
 	 * Phase 1: scan under map read-lock to pick a timeline+shard whose image
 	 * layers are due for compaction.  A shared lock here lets reads proceed.
@@ -3675,13 +3901,17 @@ ps_core_maintenance(void)
 		ps_lock_shard_wr(fsh);
 		ps_lock_map_wr();
 		if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
-			compact_timeline(ftl, fsh);
+			did = compact_timeline(ftl, fsh) > 0;
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
 		/* Remote GC is deliberately outside compaction's write locks. */
 		gc_resume();
-		did = 1;
 	}
+	/* Keep compaction inputs resident until due compaction has run.  Evicting
+	 * first turns routine compaction into remote I/O under map/shard write
+	 * locks; segment GC above likewise consumes its caches before this point. */
+	if (!found && !did && evict_one_layer())
+		return 1;
 
 	/*
 	 * Phase 3: rewrite the manifest log if add/seal/delete churn has grown it
@@ -3736,6 +3966,7 @@ ps_core_open(const char *store_dir)
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
+	ps_layer_store_set_page_size(page_size);
 	if (ps_layer_store->open(store_dir) != 0)
 		return -1;
 	if (ps_manifest_open(store_dir) != 0)

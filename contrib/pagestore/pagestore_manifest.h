@@ -30,6 +30,7 @@ extern int	ps_manifest_set_remote_location(uint64_t layer_id,
 											const PsLayerLocation *location);
 extern int	ps_manifest_set_remote_durable(uint64_t layer_id,
 										   uint64_t uploaded_lsn);
+extern int	ps_manifest_drop_local(uint64_t layer_id);
 extern int	ps_manifest_mark_delete(uint64_t layer_id);
 extern int	ps_manifest_remove_layer(uint64_t layer_id);
 extern int	ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
