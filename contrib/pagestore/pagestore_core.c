@@ -571,13 +571,28 @@ gc_remote_one(void)
 				ps_unlock_map();
 				if (tier_remote_location(&gc_remote_candidate) == NULL)
 				{
-					int removed = 0;
+					PsLayerLocation *remote;
 
-					ps_lock_map_wr();
-					if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
-						removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
-					ps_unlock_map();
-					return removed;
+					if (ps_layer_store->remote_uri != NULL &&
+						gc_remote_candidate.location_count < PS_LAYER_MAX_LOCATIONS &&
+						ps_layer_store->remote_uri(gc_remote_candidate.layer_id,
+							gc_remote_candidate.locations[gc_remote_candidate.location_count].uri,
+							sizeof(gc_remote_candidate.locations[gc_remote_candidate.location_count].uri)) == 0)
+					{
+						remote = &gc_remote_candidate.locations[gc_remote_candidate.location_count++];
+						remote->tier = PS_LAYER_TIER_REMOTE_OBJECT;
+						remote->available = true;
+					}
+					else
+					{
+						int removed = 0;
+
+						ps_lock_map_wr();
+						if (ps_layer_store->delete_local_layer(&gc_remote_candidate) == 0)
+							removed = ps_manifest_remove_layer(gc_remote_candidate.layer_id) == 0;
+						ps_unlock_map();
+						return removed;
+					}
 				}
 				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
