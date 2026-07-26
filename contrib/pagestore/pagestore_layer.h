@@ -70,6 +70,8 @@ typedef struct PsLayerDesc
 	uint32_t	cache_readers;
 	/* DROP_LOCAL is durable but its physical unlink still needs retrying. */
 	bool		local_cleanup_pending;
+	/* In-memory only: remote GC succeeded; retry only local cleanup. */
+	bool		remote_cleanup_done;
 
 	/*
 	 * In-memory only: whether this process has verified the layer's data

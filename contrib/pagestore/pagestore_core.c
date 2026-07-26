@@ -74,7 +74,7 @@ static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static pthread_t gc_remote_thread;
 static PsLayerDesc gc_remote_candidate;
-static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 failed, 4 local retry */
+static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 failed */
 static uint64_t gc_remote_layer_cursor;
 static uint32_t gc_remote_map_cursor;
 static struct timespec gc_remote_retry_at;
@@ -521,6 +521,42 @@ gc_remote_worker(void *arg)
 	return NULL;
 }
 
+/*
+ * Finish the local half of GC while holding the map lock that serializes the
+ * descriptor lookup and REMOVE_LAYER append.  remote_done is process-local:
+ * after a crash, retrying the provider delete is required and must remain
+ * idempotent, but during this process a failed unlink must not issue it twice.
+ */
+static int
+gc_finish_local(uint64_t layer_id, int remote_done)
+{
+	PsLayerDesc *layer = NULL;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == layer_id &&
+			ps_layer_map.layers[i].deleting)
+		{
+			layer = &ps_layer_map.layers[i];
+			break;
+		}
+	if (layer == NULL)
+	{
+		ps_unlock_map();
+		return 1;
+	}
+	if (remote_done)
+		layer->remote_cleanup_done = true;
+	if (ps_layer_store->delete_local_layer(layer) != 0 ||
+		ps_manifest_remove_layer(layer_id) != 0)
+	{
+		ps_unlock_map();
+		return 0;
+	}
+	ps_unlock_map();
+	return 1;
+}
+
 /* Run at most one remote-GC operation without blocking the maintenance loop. */
 static int
 gc_remote_one(void)
@@ -545,21 +581,13 @@ gc_remote_one(void)
 			gc_remote_retry_at.tv_sec++;
 			return 0;
 		}
-	}
-	if (state == 2 || state == 4)
-	{
-		ps_lock_map_wr();
-		if (ps_layer_store->delete_local_layer(&gc_remote_candidate) != 0 ||
-			ps_manifest_remove_layer(gc_remote_candidate.layer_id) != 0)
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+		if (!gc_finish_local(gc_remote_candidate.layer_id, 1))
 		{
-			ps_unlock_map();
-			__atomic_store_n(&gc_remote_state, 4, __ATOMIC_RELEASE);
 			gc_remote_retry_at = now;
 			gc_remote_retry_at.tv_sec++;
 			return 0;
 		}
-		ps_unlock_map();
-		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 		return 1;
 	}
 	ps_lock_map_rd();
@@ -575,10 +603,14 @@ gc_remote_one(void)
 				gc_remote_layer_cursor = gc_remote_candidate.layer_id;
 				gc_remote_map_cursor = (i + 1) % ps_layer_map.nlayers;
 				ps_unlock_map();
+				if (gc_remote_candidate.remote_cleanup_done)
+					return gc_finish_local(gc_remote_candidate.layer_id, 0);
 				if (tier_remote_location(&gc_remote_candidate) == NULL)
 				{
 					PsLayerLocation *remote;
+					int		uri_errno = 0;
 
+					errno = 0;
 					if (ps_layer_store->remote_uri != NULL &&
 						gc_remote_candidate.location_count < PS_LAYER_MAX_LOCATIONS &&
 						ps_layer_store->remote_uri(gc_remote_candidate.layer_id,
@@ -590,7 +622,17 @@ gc_remote_one(void)
 						remote->available = true;
 					}
 					else
-						return 0; /* retain tombstone until URI can be derived */
+					{
+						uri_errno = errno;
+						/* ENOTSUP means this provider has no object tier.  A
+						 * local-only layer can finish immediately; a layer whose
+						 * upload was durably recorded must retain its tombstone
+						 * until the remote URI is available again. */
+						if (!gc_remote_candidate.remote_durable &&
+							(ps_layer_store->remote_uri == NULL || uri_errno == ENOTSUP))
+							return gc_finish_local(gc_remote_candidate.layer_id, 0);
+						return 0;
+					}
 				}
 				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
@@ -3501,19 +3543,16 @@ void
 ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
+	int		join_gc = 0;
 	int		cancel_upload = 0;
 	struct timespec deadline;
 	int		join_rc;
 
-	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0 &&
-		__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 4)
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
 	{
-		pthread_cancel(gc_remote_thread);
-		clock_gettime(CLOCK_REALTIME, &deadline);
-		deadline.tv_sec++;
-		if (pthread_timedjoin_np(gc_remote_thread, NULL, &deadline) != 0)
-			_exit(EXIT_FAILURE);
-		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+		if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) == 1)
+			pthread_cancel(gc_remote_thread);
+		join_gc = 1;
 	}
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
@@ -3546,6 +3585,17 @@ ps_core_close(void)
 				"(%s); aborting before teardown -- recently acknowledged writes "
 				"may not be durable\n", strerror(errno));
 		_exit(EXIT_FAILURE);
+	}
+	if (join_gc)
+	{
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		if (pthread_timedjoin_np(gc_remote_thread, NULL, &deadline) != 0)
+		{
+			fprintf(stderr, "pagestore_daemon: FATAL: remote GC did not stop during shutdown\n");
+			_exit(EXIT_FAILURE);
+		}
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	}
 
 	for (uint32_t i = 0; i < ns; i++)
