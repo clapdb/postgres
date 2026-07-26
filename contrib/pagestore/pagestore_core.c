@@ -76,6 +76,8 @@ static pthread_t gc_remote_thread;
 static PsLayerDesc gc_remote_candidate;
 static volatile int gc_remote_state; /* 0 idle, 1 running, 2 success, 3 failed */
 static uint64_t gc_remote_layer_cursor;
+static uint32_t gc_remote_map_cursor;
+static struct timespec gc_remote_retry_at;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -524,6 +526,12 @@ static int
 gc_remote_one(void)
 {
 	int state = __atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE);
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (now.tv_sec < gc_remote_retry_at.tv_sec ||
+		(now.tv_sec == gc_remote_retry_at.tv_sec && now.tv_nsec < gc_remote_retry_at.tv_nsec))
+		return 0;
 
 	if (state == 1)
 		return 0;
@@ -533,7 +541,8 @@ gc_remote_one(void)
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
 		{
-			gc_remote_layer_cursor = gc_remote_candidate.layer_id;
+			gc_remote_retry_at = now;
+			gc_remote_retry_at.tv_sec++;
 			return 0;
 		}
 		ps_lock_map_wr();
@@ -548,18 +557,17 @@ gc_remote_one(void)
 		return 1;
 	}
 	ps_lock_map_rd();
-	for (uint32_t pass = 0; pass < 2; pass++)
+	for (uint32_t pass = 0; pass < ps_layer_map.nlayers; pass++)
 	{
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		uint32_t i = (gc_remote_map_cursor + pass) % ps_layer_map.nlayers;
 		{
 			if (ps_layer_map.layers[i].deleting &&
-				((pass == 0 && ps_layer_map.layers[i].layer_id > gc_remote_layer_cursor) ||
-				 (pass == 1 && ps_layer_map.layers[i].layer_id <= gc_remote_layer_cursor)) &&
 				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
 				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			{
 				gc_remote_candidate = ps_layer_map.layers[i];
 				gc_remote_layer_cursor = gc_remote_candidate.layer_id;
+				gc_remote_map_cursor = (i + 1) % ps_layer_map.nlayers;
 				ps_unlock_map();
 				if (tier_remote_location(&gc_remote_candidate) == NULL)
 				{
@@ -3487,7 +3495,10 @@ ps_core_close(void)
 	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
 	{
 		pthread_cancel(gc_remote_thread);
-		pthread_join(gc_remote_thread, NULL);
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		if (pthread_timedjoin_np(gc_remote_thread, NULL, &deadline) != 0)
+			_exit(EXIT_FAILURE);
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	}
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
@@ -3946,8 +3957,6 @@ ps_core_maintenance(void)
 	if (gc_remote_one())
 		return 1;
 	if (tier_one_layer())
-		return 1;
-	if (gc_resume())
 		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
