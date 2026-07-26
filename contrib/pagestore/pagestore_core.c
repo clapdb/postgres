@@ -74,7 +74,7 @@ static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static pthread_t gc_remote_thread;
 static PsLayerDesc gc_remote_candidate;
-static volatile int gc_remote_state; /* 0 idle, 1 running, 2 success, 3 failed */
+static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 failed, 4 local retry */
 static uint64_t gc_remote_layer_cursor;
 static uint32_t gc_remote_map_cursor;
 static struct timespec gc_remote_retry_at;
@@ -535,25 +535,31 @@ gc_remote_one(void)
 
 	if (state == 1)
 		return 0;
-	if (state != 0)
+	if (state == 2 || state == 3)
 	{
 		pthread_join(gc_remote_thread, NULL);
-		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 		if (state != 2)
 		{
+			__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 			gc_remote_retry_at = now;
 			gc_remote_retry_at.tv_sec++;
 			return 0;
 		}
+	}
+	if (state == 2 || state == 4)
+	{
 		ps_lock_map_wr();
 		if (ps_layer_store->delete_local_layer(&gc_remote_candidate) != 0 ||
 			ps_manifest_remove_layer(gc_remote_candidate.layer_id) != 0)
 		{
 			ps_unlock_map();
-			gc_remote_layer_cursor = gc_remote_candidate.layer_id;
+			__atomic_store_n(&gc_remote_state, 4, __ATOMIC_RELEASE);
+			gc_remote_retry_at = now;
+			gc_remote_retry_at.tv_sec++;
 			return 0;
 		}
 		ps_unlock_map();
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 		return 1;
 	}
 	ps_lock_map_rd();
