@@ -17,7 +17,7 @@
 set -uo pipefail
 
 BUILD=${1:?usage: redo_worker_demo.sh <meson-build-dir>}
-BUILD=$(cd "$BUILD" && pwd) || {
+BUILD=$(CDPATH= cd -- "$BUILD" && pwd) || {
 	echo "FAIL - cannot resolve build directory: $BUILD"
 	exit 1
 }
