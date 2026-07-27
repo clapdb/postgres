@@ -175,6 +175,22 @@ else
 fi
 rm -f "$out"
 
+# A restore command is also asked for timeline-history files.  The pagestore
+# archive intentionally does not retain those auxiliary files, so walrestore
+# must report them unavailable (not a hard command error that aborts recovery).
+history_out=$(mktemp)
+rm -f "$history_out"
+"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --segsize 16777216 \
+	00000002.history "$history_out" >/dev/null 2>&1
+history_rc=$?
+if [ "$history_rc" -eq 1 ] && [ ! -e "$history_out" ]; then
+	echo "ok   - walrestore treats an unavailable timeline history file as archive miss"
+else
+	echo "FAIL - walrestore history-file handling returned $history_rc (output exists: $([ -e "$history_out" ] && echo yes || echo no))"
+	fail=1
+fi
+rm -f "$history_out"
+
 # --- 5. per-page WAL index: decode WAL (reusing PG's reader) and query it ---
 $P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
         AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null
