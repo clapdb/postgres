@@ -54,6 +54,7 @@ main(void)
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
+	char		stale_local_uri[PS_LAYER_URI_MAX];
 	const char *contents = "sealed layer object bytes";
 	PsLayerDesc layer;
 
@@ -139,10 +140,31 @@ main(void)
 		  "download restores the complete local layer");
 	check(access(local_uri, F_OK) == 0,
 		  "seed a downloaded local cache before testing GC reclamation");
+	snprintf(stale_local_uri, sizeof(stale_local_uri), "%s/stale-layer",
+			 other_local_dir);
+	{
+		int fd = open(stale_local_uri, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+		if (fd >= 0)
+			close(fd);
+		check(fd >= 0, "create stale unavailable local cache");
+	}
 	layer.locations[0].available = false;
+	snprintf(layer.locations[0].uri, sizeof(layer.locations[0].uri), "%s",
+			 stale_local_uri);
 	check(ps_layer_store->delete_local_layer(&layer) == 0 &&
-		  ps_layer_store->layer_exists_local(layer.layer_id) == 0,
-		  "GC removes a downloaded local cache after manifest eviction");
+		  ps_layer_store->layer_exists_local(layer.layer_id) == 0 &&
+		  access(stale_local_uri, F_OK) != 0,
+		  "GC removes canonical cache after deleting a stale unavailable URI");
+	check(ps_layer_store->download_layer(&layer) == 0 &&
+		  file_matches(local_uri, contents),
+		  "restore canonical cache before stale-URI failure test");
+	snprintf(layer.locations[0].uri, sizeof(layer.locations[0].uri), "%s",
+			 other_local_dir);
+	check(ps_layer_store->delete_local_layer(&layer) == 0 &&
+		  ps_layer_store->layer_exists_local(layer.layer_id) == 0 &&
+		  access(other_local_dir, F_OK) == 0,
+		  "GC ignores stale unavailable URI errors after canonical cleanup");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0,
 		  "delete remote object");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0 &&
