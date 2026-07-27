@@ -80,12 +80,20 @@ $P -c "UPDATE t SET v='changed' WHERE id=1;" >/dev/null
 # only for the backup-start segment races: the UPDATE is in a later segment that
 # may not be shipped yet (this is what intermittently failed in CI).
 updseg=$($P -c "SELECT pg_walfile_name(pg_current_wal_lsn());")
+archived=0
 for _ in $(seq 1 150); do
 	$P -c "SELECT pg_switch_wal();" >/dev/null 2>&1
 	last=$($P -c "SELECT last_archived_wal FROM pg_stat_archiver;" 2>/dev/null)
-	[[ -n "$last" && ! "$last" < "$updseg" ]] && break	# archived through updseg
+	if [[ -n "$last" && ! "$last" < "$updseg" ]]; then
+		archived=1
+		break	# archived through updseg
+	fi
 	sleep 0.2
 done
+[ "$archived" -eq 1 ] || {
+	echo "FAIL - WAL segment $updseg was not archived to the store (last: ${last:-none})"
+	exit 1
+}
 "$BIN/pg_ctl" -D "$D" -m fast -w stop >/dev/null 2>&1
 
 # 2) turn the instance into a redo worker: recover from the store's WAL only
