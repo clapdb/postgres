@@ -29,8 +29,10 @@ ps_layer_store_set_page_size(uint32_t value)
 	layer_page_size = value;
 }
 
-static char layer_dir[2048];
-static char object_dir[2048];
+/* realpath(3) requires a PATH_MAX-sized destination when a caller supplies
+ * one; keep provider roots large enough for canonicalized object directories. */
+static char layer_dir[4096];
+static char object_dir[4096];
 
 static int layer_id_shard(uint64_t layer_id);
 static int fsync_dir(const char *dir);

@@ -63,8 +63,8 @@ find_layer(uint64_t id)
 
 /*
  * Replica of pagestore_core.c's gc_resume() (static there): for each layer the
- * manifest still marks "deleting", delete the local file, then drop the manifest
- * entry only once the file is gone.  Snapshot the deleting set first since
+ * manifest still marks "deleting", delete local and remote files, then drop the
+ * manifest entry only once both are gone.  Snapshot the deleting set first since
  * ps_manifest_remove_layer() mutates the map.
  */
 static void
@@ -77,8 +77,17 @@ gc_resume_like(void)
 		if (ps_layer_map.layers[i].deleting)
 			dead[n++] = ps_layer_map.layers[i];
 	for (uint32_t k = 0; k < n; k++)
-		if (ps_layer_store->delete_local_layer(&dead[k]) == 0)
+	{
+		int has_remote = 0;
+
+		for (uint32_t i = 0; i < dead[k].location_count; i++)
+			if (dead[k].locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+				dead[k].locations[i].available)
+				has_remote = 1;
+		if ((!has_remote || ps_layer_store->delete_remote_layer(&dead[k]) == 0) &&
+			ps_layer_store->delete_local_layer(&dead[k]) == 0)
 			ps_manifest_remove_layer(dead[k].layer_id);
+	}
 }
 
 static PsLayerDesc
@@ -812,16 +821,20 @@ int
 main(void)
 {
 	char		dir[] = "/tmp/psgctestXXXXXX";
+	char		objects[] = "/tmp/psgcobjectsXXXXXX";
 	PsLayerDesc a,
 				b;
 	char		a_uri[PS_LAYER_URI_MAX],
-				b_uri[PS_LAYER_URI_MAX];
+				b_uri[PS_LAYER_URI_MAX],
+				remote_uri[PS_LAYER_URI_MAX];
 	PsKey		k = {1, 1, 5, 0, PS_KLASS_RELATION};
 	unsigned char out[PSZ];
 	PsLayerDesc *pa,
 			   *pb;
 
-	if (!mkdtemp(dir) || ps_layer_store->open(dir) != 0 ||
+	if (!mkdtemp(dir) || !mkdtemp(objects) ||
+		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0 ||
+		ps_layer_store->open(dir) != 0 ||
 		ps_manifest_open(dir) != 0)
 	{
 		fprintf(stderr, "setup failed\n");
@@ -834,6 +847,15 @@ main(void)
 	 * after A is marked deleting but before it is removed.
 	 */
 	a = write_layer(1, 0xA1);
+	check(ps_layer_store->upload_layer(&a) == 0 &&
+		  ps_layer_store->remote_uri(a.layer_id, remote_uri, sizeof(remote_uri)) == 0,
+		  "upload old layer A to remote storage");
+	a.locations[a.location_count].tier = PS_LAYER_TIER_REMOTE_OBJECT;
+	a.locations[a.location_count].available = true;
+	a.locations[a.location_count].size = a.locations[0].size;
+	snprintf(a.locations[a.location_count].uri,
+			 sizeof(a.locations[a.location_count].uri), "%s", remote_uri);
+	a.location_count++;
 	check(ps_manifest_add_layer(&a) == 0, "manifest add old layer A");
 	b = write_layer(2, 0xB2);
 	check(ps_manifest_add_layer(&b) == 0, "manifest add merged layer B");
@@ -862,6 +884,7 @@ main(void)
 	/* --- gc_resume finishes the interrupted deletion --- */
 	gc_resume_like();
 	check(!file_exists(a_uri), "resume removed A's local file");
+	check(!file_exists(remote_uri), "resume removed A's remote object");
 	check(ps_layer_map_count(&ps_layer_map) == 1, "resume removed A from the map");
 
 	/* --- restart again: the removal is durable --- */
@@ -881,11 +904,22 @@ main(void)
 	unlink(b_uri);
 	{
 		char		mpath[4096];
+		char		idpath[4096];
 
 		snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
 		unlink(mpath);
+		snprintf(idpath, sizeof(idpath), "%s/.pagestore-store-id", dir);
+		unlink(idpath);
 	}
 	rmdir(dir);
+	unsetenv("PAGESTORE_OBJECT_DIR");
+	{
+		char owner[4096];
+
+		snprintf(owner, sizeof(owner), "%s/.pagestore-owner", objects);
+		unlink(owner);
+		rmdir(objects);
+	}
 
 	test_torn_tail_poison();
 	test_manifest_compaction();
