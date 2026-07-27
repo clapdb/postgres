@@ -72,6 +72,12 @@ static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
+static pthread_t gc_remote_thread;
+static PsLayerDesc gc_remote_candidate;
+static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 failed */
+static uint64_t gc_remote_layer_cursor;
+static uint32_t gc_remote_map_cursor;
+static struct timespec gc_remote_retry_at;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -398,10 +404,11 @@ static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 
 /*
  * Finish any GC that a crash interrupted: every layer still marked 'deleting' in
- * the manifest has its local file removed (idempotent) and a REMOVE_LAYER event
- * recorded.  Reads already skip 'deleting' layers, so this only reclaims space.
+ * the manifest has its local and remote files removed (idempotently) and a
+ * REMOVE_LAYER event recorded.  Reads already skip 'deleting' layers, so this
+ * only reclaims space.
  */
-static int
+static int __attribute__((unused))
 gc_resume(void)
 {
 	PsLayerDesc *dead;
@@ -469,9 +476,7 @@ gc_resume(void)
 		if (tier_remote_location(&remote) != NULL &&
 			ps_layer_store->delete_remote_layer(&remote) != 0)
 			remote_failed = 1;
-		if (ps_layer_store->delete_local_layer(&dead[k]) != 0)
-			continue;
-		if (remote_failed)
+		if (ps_layer_store->delete_local_layer(&dead[k]) != 0 || remote_failed)
 			continue;
 		if (map_locks_ready)
 			ps_lock_map_wr();
@@ -501,6 +506,147 @@ gc_resume(void)
 	}
 	free(dead);
 	return did;
+}
+
+static void *
+gc_remote_worker(void *arg)
+{
+	PsLayerDesc *layer = arg;
+	int rc;
+
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	rc = ps_layer_store->delete_remote_layer(layer);
+
+	__atomic_store_n(&gc_remote_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+/*
+ * Finish the local half of GC while holding the map lock that serializes the
+ * descriptor lookup and REMOVE_LAYER append.  remote_done is process-local:
+ * after a crash, retrying the provider delete is required and must remain
+ * idempotent, but during this process a failed unlink must not issue it twice.
+ */
+static int
+gc_finish_local(uint64_t layer_id, int remote_done)
+{
+	PsLayerDesc *layer = NULL;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == layer_id &&
+			ps_layer_map.layers[i].deleting)
+		{
+			layer = &ps_layer_map.layers[i];
+			break;
+		}
+	if (layer == NULL)
+	{
+		ps_unlock_map();
+		return 1;
+	}
+	if (remote_done)
+		layer->remote_cleanup_done = true;
+	if (ps_layer_store->delete_local_layer(layer) != 0 ||
+		ps_manifest_remove_layer(layer_id) != 0)
+	{
+		ps_unlock_map();
+		return 0;
+	}
+	ps_unlock_map();
+	return 1;
+}
+
+/* Run at most one remote-GC operation without blocking the maintenance loop. */
+static int
+gc_remote_one(void)
+{
+	int state = __atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE);
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (now.tv_sec < gc_remote_retry_at.tv_sec ||
+		(now.tv_sec == gc_remote_retry_at.tv_sec && now.tv_nsec < gc_remote_retry_at.tv_nsec))
+		return 0;
+
+	if (state == 1)
+		return 0;
+	if (state == 2 || state == 3)
+	{
+		pthread_join(gc_remote_thread, NULL);
+		if (state != 2)
+		{
+			__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+			gc_remote_retry_at = now;
+			gc_remote_retry_at.tv_sec++;
+			return 0;
+		}
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+		if (!gc_finish_local(gc_remote_candidate.layer_id, 1))
+		{
+			gc_remote_retry_at = now;
+			gc_remote_retry_at.tv_sec++;
+			return 0;
+		}
+		return 1;
+	}
+	ps_lock_map_rd();
+	for (uint32_t pass = 0; pass < ps_layer_map.nlayers; pass++)
+	{
+		uint32_t i = (gc_remote_map_cursor + pass) % ps_layer_map.nlayers;
+		{
+			if (ps_layer_map.layers[i].deleting &&
+				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
+				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
+			{
+				gc_remote_candidate = ps_layer_map.layers[i];
+				gc_remote_layer_cursor = gc_remote_candidate.layer_id;
+				gc_remote_map_cursor = (i + 1) % ps_layer_map.nlayers;
+				ps_unlock_map();
+				if (gc_remote_candidate.remote_cleanup_done)
+					return gc_finish_local(gc_remote_candidate.layer_id, 0);
+				if (tier_remote_location(&gc_remote_candidate) == NULL)
+				{
+					PsLayerLocation *remote;
+					int		uri_errno = 0;
+
+					errno = 0;
+					if (ps_layer_store->remote_uri != NULL &&
+						gc_remote_candidate.location_count < PS_LAYER_MAX_LOCATIONS &&
+						ps_layer_store->remote_uri(gc_remote_candidate.layer_id,
+							gc_remote_candidate.locations[gc_remote_candidate.location_count].uri,
+							sizeof(gc_remote_candidate.locations[gc_remote_candidate.location_count].uri)) == 0)
+					{
+						remote = &gc_remote_candidate.locations[gc_remote_candidate.location_count++];
+						remote->tier = PS_LAYER_TIER_REMOTE_OBJECT;
+						remote->available = true;
+					}
+					else
+					{
+						uri_errno = errno;
+						/* ENOTSUP means this provider has no object tier.  A
+						 * local-only layer can finish immediately; a layer whose
+						 * upload was durably recorded must retain its tombstone
+						 * until the remote URI is available again. */
+						if (!gc_remote_candidate.remote_durable &&
+							(ps_layer_store->remote_uri == NULL || uri_errno == ENOTSUP))
+							return gc_finish_local(gc_remote_candidate.layer_id, 0);
+						return 0;
+					}
+				}
+				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
+				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
+								   &gc_remote_candidate) != 0)
+				{
+					__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+					return 0;
+				}
+				return 1;
+			}
+		}
+	}
+	ps_unlock_map();
+	return 0;
 }
 
 /*
@@ -3397,10 +3543,17 @@ void
 ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
+	int		join_gc = 0;
 	int		cancel_upload = 0;
 	struct timespec deadline;
 	int		join_rc;
 
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
+	{
+		if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) == 1)
+			pthread_cancel(gc_remote_thread);
+		join_gc = 1;
+	}
 	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
 	{
 		/* Remote tiering is optional: do not let a stalled object store delay
@@ -3432,6 +3585,17 @@ ps_core_close(void)
 				"(%s); aborting before teardown -- recently acknowledged writes "
 				"may not be durable\n", strerror(errno));
 		_exit(EXIT_FAILURE);
+	}
+	if (join_gc)
+	{
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		if (pthread_timedjoin_np(gc_remote_thread, NULL, &deadline) != 0)
+		{
+			fprintf(stderr, "pagestore_daemon: FATAL: remote GC did not stop during shutdown\n");
+			_exit(EXIT_FAILURE);
+		}
+		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	}
 
 	for (uint32_t i = 0; i < ns; i++)
@@ -3854,9 +4018,9 @@ ps_core_maintenance(void)
 	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
-	if (tier_one_layer())
+	if (gc_remote_one())
 		return 1;
-	if (gc_resume())
+	if (tier_one_layer())
 		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
@@ -3904,8 +4068,6 @@ ps_core_maintenance(void)
 			did = compact_timeline(ftl, fsh) > 0;
 		ps_unlock_map();
 		ps_unlock_shard(fsh);
-		/* Remote GC is deliberately outside compaction's write locks. */
-		gc_resume();
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
 	 * first turns routine compaction into remote I/O under map/shard write
@@ -3963,6 +4125,8 @@ ps_core_open(const char *store_dir)
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
+	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+	gc_remote_layer_cursor = 0;
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
@@ -3973,8 +4137,8 @@ ps_core_open(const char *store_dir)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
-	if (use_layers)
-		gc_resume();			/* finish any GC interrupted by a crash */
+	/* Leave deleting layers for asynchronous maintenance: recovery must not
+	 * block on an unavailable remote object that is already excluded from reads. */
 
 	/* initialize per-shard state, locks and layer-id cursors */
 	for (uint32_t i = 0; i < ns; i++)
