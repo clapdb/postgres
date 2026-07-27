@@ -17,6 +17,10 @@
 set -uo pipefail
 
 BUILD=${1:?usage: redo_worker_demo.sh <meson-build-dir>}
+BUILD=$(cd "$BUILD" && pwd) || {
+	echo "FAIL - cannot resolve build directory: $BUILD"
+	exit 1
+}
 PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' -type f 2>/dev/null | head -1)
 [ -z "$PGCTL" ] && { echo "FAIL - no tmp_install (run: meson test -C $BUILD --suite setup)"; exit 1; }
 BIN=$(dirname "$PGCTL")
