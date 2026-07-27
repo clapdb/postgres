@@ -676,7 +676,7 @@ static int
 local_delete_local_layer(const PsLayerDesc *layer)
 {
 	int			rc = 0;
-	int			unlinked = 0;
+	int			canonical_unlinked = 0;
 	uint32_t	nlocs;
 
 	nlocs = layer->location_count;
@@ -691,24 +691,26 @@ local_delete_local_layer(const PsLayerDesc *layer)
 		{
 			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
 				rc = -1;
-			else
-				unlinked = 1;
 		}
 	}
-	/* DROP_LOCAL is durable before unlink.  Retry the canonical physical file
-	 * even when the manifest has already marked its local location unavailable. */
-	if (!unlinked)
+
+	/*
+	 * DROP_LOCAL is durable before unlink, and an unavailable manifest URI can
+	 * name a previous spelling of the store path.  Always remove the cache path
+	 * belonging to the currently open store; stale unavailable URIs are never
+	 * authoritative and must not be unlinked.
+	 */
 	{
 		char	path[4096];
 
 		if (local_layer_path(layer->layer_id, path, sizeof(path)) != 0)
 			return -1;
 		if (unlink(path) == 0 || errno == ENOENT)
-			unlinked = 1;
+			canonical_unlinked = 1;
 		else
 			rc = -1;
 	}
-	if (unlinked && local_fsync_dir() != 0)
+	if (canonical_unlinked && local_fsync_dir() != 0)
 		rc = -1;
 	return rc;
 }
