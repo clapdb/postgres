@@ -686,10 +686,10 @@ local_delete_local_layer(const PsLayerDesc *layer)
 	for (uint32_t i = 0; i < nlocs; i++)
 	{
 		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
-			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+			layer->locations[i].available)
 		{
-			if (unlink(layer->locations[i].uri) != 0 &&
-				errno != ENOENT && layer->locations[i].available)
+			if (unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
 				rc = -1;
 		}
 	}
@@ -697,8 +697,8 @@ local_delete_local_layer(const PsLayerDesc *layer)
 	/*
 	 * DROP_LOCAL is durable before unlink, and an unavailable manifest URI can
 	 * name a previous spelling of the store path.  Always remove the cache path
-	 * belonging to the currently open store; stale unavailable URIs above are
-	 * only best-effort cleanup and cannot determine this operation's result.
+	 * belonging to the currently open store; stale unavailable URIs are never
+	 * authoritative and must not be unlinked.
 	 */
 	{
 		char	path[4096];

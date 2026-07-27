@@ -154,8 +154,8 @@ main(void)
 			 stale_local_uri);
 	check(ps_layer_store->delete_local_layer(&layer) == 0 &&
 		  ps_layer_store->layer_exists_local(layer.layer_id) == 0 &&
-		  access(stale_local_uri, F_OK) != 0,
-		  "GC removes canonical cache after deleting a stale unavailable URI");
+		  access(stale_local_uri, F_OK) == 0,
+		  "GC removes only the canonical cache, not a stale unavailable URI");
 	check(ps_layer_store->download_layer(&layer) == 0 &&
 		  file_matches(local_uri, contents),
 		  "restore canonical cache before stale-URI failure test");
@@ -173,6 +173,7 @@ main(void)
 
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	unlink(stale_local_uri);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-owner", object_dir);
 	unlink(owner_path);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", local_dir);
