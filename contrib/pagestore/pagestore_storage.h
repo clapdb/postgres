@@ -68,6 +68,10 @@ typedef struct PsStorage
 							   const void *b, uint32_t blen);
 	int			(*wal_read) (uint32_t tl, uint64_t off, void *buf, uint32_t len);
 
+	/* Per-timeline durable per-page WAL index records. */
+	int			(*walidx_append) (uint32_t tl, const void *buf, uint32_t len);
+	int			(*walidx_read) (uint32_t tl, uint64_t off, void *buf, uint32_t len);
+
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);
 	int			(*meta_read) (uint64_t off, void *buf, uint32_t len);

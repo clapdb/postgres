@@ -47,6 +47,9 @@ static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
+static int posix_log_append(const char *name, const void *buf, uint32_t len);
+
 static void
 seg_path(char *buf, size_t buflen, uint32_t shard, int seg)
 {
@@ -373,6 +376,24 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 	return (int) n;
 }
 
+static int
+posix_walidx_append(uint32_t tl, const void *buf, uint32_t len)
+{
+	char		name[64];
+
+	snprintf(name, sizeof(name), "walidx_%u", tl);
+	return posix_log_append(name, buf, len);
+}
+
+static int
+posix_walidx_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
+{
+	char		name[64];
+
+	snprintf(name, sizeof(name), "walidx_%u", tl);
+	return posix_log_read(name, off, buf, len);
+}
+
 /*
  * Truncate fd back to old_size on an error path.  Best-effort: the caller
  * is already returning an error and cannot act on a rollback failure; the
@@ -604,6 +625,8 @@ const PsStorage PsStoragePosix = {
 	.seg_remove = posix_seg_remove,
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
+	.walidx_append = posix_walidx_append,
+	.walidx_read = posix_walidx_read,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
 	.fork_meta_append = posix_fork_meta_append,
