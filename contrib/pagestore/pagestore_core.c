@@ -2368,8 +2368,12 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				 hdr.rec_len == sizeof(WalIdxProgressRec))
 		{
 			WalIdxProgressRec rec;
+			uint64_t	first;
 
 			n = ps_storage->walidx_read(tl, shard, off, &rec, sizeof(rec));
+			first = wal_log_start(tl);
+			if (walidx_progress[tl] == 0 && first != UINT64_MAX)
+				walidx_progress[tl] = first;
 			if (n != (int) sizeof(rec) || rec.timeline != tl ||
 				rec.start_lsn != walidx_progress[tl] ||
 				rec.end_lsn < rec.start_lsn ||
