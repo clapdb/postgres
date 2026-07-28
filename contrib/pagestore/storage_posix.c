@@ -395,8 +395,8 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		(blen > 0 && write(fd, b, blen) != (ssize_t) blen) ||
 		fsync(fd) != 0)
 	{
-		(void) ftruncate(fd, oldsz);
-		(void) fsync(fd);
+		if (ftruncate(fd, oldsz) == 0)
+			(void) fsync(fd);
 		close(fd);
 		return -1;
 	}
@@ -407,8 +407,8 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		{
 			if (dfd >= 0)
 				close(dfd);
-			(void) ftruncate(fd, oldsz);
-			(void) fsync(fd);
+			if (ftruncate(fd, oldsz) == 0)
+				(void) fsync(fd);
 			close(fd);
 			return -1;
 		}
