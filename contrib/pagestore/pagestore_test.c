@@ -2792,6 +2792,8 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();
 	stop_daemon(dpid);
+	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
+	shm_unlink(shm);
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
