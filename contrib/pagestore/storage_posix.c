@@ -385,6 +385,8 @@ posix_walidx_append(uint32_t tl, const void *buf, uint32_t len)
 	return posix_log_append(name, buf, len);
 }
 
+static pthread_mutex_t posix_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int
 posix_walidx_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
@@ -480,7 +482,6 @@ posix_meta_rollback(const char *path, off_t old_size, int created)
  * the write -- racing appenders would let one failure chop another's
  * acknowledged record.  One lock serializes append+rollback per process.
  */
-static pthread_mutex_t posix_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int
 posix_log_append_locked(const char *name, const void *buf, uint32_t len)
