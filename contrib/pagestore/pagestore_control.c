@@ -303,6 +303,9 @@ ps_control_drain(void)
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 			}
 
+			/* The exact-redo floor note reused page; restore the normal image. */
+			memset(page, 0, sizeof(page));
+			memcpy(page, &p->image, sizeof(ControlFileData));
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);
