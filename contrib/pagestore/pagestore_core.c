@@ -2198,6 +2198,13 @@ wal_recover_one(uint32_t tl)
  * durable boundary instead of treating a daemon restart as an empty index.
  */
 #define WALIDX_MAGIC	0x57494458	/* "WIDX" */
+#define WALIDX_PROGRESS_MAGIC	0x57495047	/* "WIPG" */
+
+typedef struct WalIdxLogHdr
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+} WalIdxLogHdr;
 
 typedef struct WalIdxRec
 {
@@ -2208,6 +2215,18 @@ typedef struct WalIdxRec
 	uint64_t	lsn;
 	PsKey		key;
 } WalIdxRec;
+
+typedef struct WalIdxProgressRec
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	timeline;
+	uint32_t	pad;
+	uint64_t	start_lsn;
+	uint64_t	end_lsn;
+} WalIdxProgressRec;
+
+static uint64_t walidx_progress[MAX_TIMELINES];
 
 typedef struct WalIdxEnt
 {
@@ -2321,39 +2340,81 @@ static int
 walidx_recover_one(uint32_t tl, uint32_t shard)
 {
 	uint64_t	off = 0;
-	WalIdxRec	recs[64];
+	WalIdxLogHdr hdr;
 	int			n;
-	int			i;
-	int			torn = 0;
 
 	for (;;)
 	{
-		n = ps_storage->walidx_read(tl, shard, off, recs, sizeof(recs));
+		n = ps_storage->walidx_read(tl, shard, off, &hdr, sizeof(hdr));
 		if (n == 0)
 			break;
 		/* A missing per-timeline log is an empty index; other I/O errors are
 		 * not safe to mask, including at offset zero. */
 		if (n < 0)
 			return errno == ENOENT ? 0 : -1;
-		if (n % (int) sizeof(WalIdxRec) != 0)
-			torn = 1;
-		for (i = 0; i < n / (int) sizeof(WalIdxRec); i++)
+		if (n != (int) sizeof(hdr))
+			break;
+		if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
 		{
-			WalIdxRec *rec = &recs[i];
+			WalIdxRec rec;
 
-			/* A complete malformed record is corruption, not a torn suffix. */
-			if (rec->magic != WALIDX_MAGIC ||
-				rec->rec_len != sizeof(*rec) || rec->timeline != tl)
-				return -1;
-			walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+			n = ps_storage->walidx_read(tl, shard, off, &rec, sizeof(rec));
+			if (n != (int) sizeof(rec) || rec.timeline != tl)
+				break;
+			walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
+			off += sizeof(rec);
 		}
-		off += (uint64_t) (n / (int) sizeof(WalIdxRec)) * sizeof(WalIdxRec);
-		if (torn || n < (int) sizeof(recs))
+		else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
+				 hdr.rec_len == sizeof(WalIdxProgressRec))
+		{
+			WalIdxProgressRec rec;
+
+			n = ps_storage->walidx_read(tl, shard, off, &rec, sizeof(rec));
+			if (n != (int) sizeof(rec) || rec.timeline != tl ||
+				rec.start_lsn != walidx_progress[tl] ||
+				rec.end_lsn < rec.start_lsn ||
+				rec.end_lsn > wal_end_read(tl))
+				break;
+			walidx_progress[tl] = rec.end_lsn;
+			off += sizeof(rec);
+		}
+		else
 			break;
 	}
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
-	if (torn && ps_storage->walidx_truncate(tl, shard, off) != 0)
+	if (n > 0 && ps_storage->walidx_truncate(tl, shard, off) != 0)
 		return -1;
+	return 0;
+}
+
+static int
+walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+{
+	WalIdxProgressRec rec;
+	uint64_t	current;
+	uint64_t	first;
+
+	if (tl >= MAX_TIMELINES)
+		return -1;
+	current = walidx_progress[tl];
+	if (current == 0)
+	{
+		first = wal_log_start(tl);
+		if (first != UINT64_MAX)
+			current = first;
+	}
+	if (start_lsn != current || end_lsn < start_lsn ||
+		end_lsn > wal_end_read(tl))
+		return -1;
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = WALIDX_PROGRESS_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.timeline = tl;
+	rec.start_lsn = current;
+	rec.end_lsn = end_lsn;
+	if (ps_storage->walidx_append(tl, 0, &rec, sizeof(rec)) != 0)
+		return -1;
+	walidx_progress[tl] = end_lsn;
 	return 0;
 }
 
@@ -3609,6 +3670,20 @@ ps_handle_meta(PsChannel *ch)
 			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
 											   ch->req_lsn, (PsWalRec *) ch->data,
 											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
+			break;
+
+		case PS_OP_WAL_INDEX_PROGRESS:
+			if (tl >= MAX_TIMELINES)
+				ch->status = PS_STATUS_ERROR;
+			else if (ch->req_lsn == 0 && ch->req_seq == 0)
+			{
+				uint64_t first = walidx_progress[tl] == 0 ?
+					wal_log_start(tl) : walidx_progress[tl];
+
+				ch->req_lsn = first == UINT64_MAX ? 0 : first;
+			}
+			else if (walidx_commit(tl, ch->req_lsn, ch->req_seq) != 0)
+				ch->status = PS_STATUS_ERROR;
 			break;
 
 		case PS_OP_WAL_RETAIN_FLOOR:
