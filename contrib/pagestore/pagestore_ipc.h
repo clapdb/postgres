@@ -94,6 +94,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
+	PS_OP_WAL_INDEX_PROGRESS,	/* req_lsn=start, req_seq=end; 0/0 reads end */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
 	PS_OP_ADMISSION_BARRIER,	/* out req_seq: sequence after prior mutations */
 } PsOpcode;

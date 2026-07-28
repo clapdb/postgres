@@ -893,6 +893,18 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	return n;
 }
 
+static uint32_t
+op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = start;
+	ch->req_seq = end;
+	return cl_exec()->status == PS_STATUS_OK ? (uint32_t) ch->req_lsn : UINT32_MAX;
+}
+
 /* ===================== page helpers ==================================== */
 
 /* Encode lsn into the page's first 8 bytes (xlogid, xrecoff), tag the rest. */
@@ -2759,6 +2771,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	pid_t		dpid;
 	uint32_t	ps = 8192;
 	PsWalRec	out[16];
+	unsigned char wal[512] = {0};
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
@@ -2770,6 +2783,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	op_wal_append(0, 0, wal, sizeof(wal));
 
 	/* block 0 changed by records at LSN 100, 200, 300; block 1 at 150 */
 	op_walidx_add(0, REL_A, FORK0, 0, 100);
@@ -2788,6 +2802,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	check(op_walidx_progress(0, 0, 350) != UINT32_MAX,
+		  "contiguous indexed WAL interval commits a durable progress marker");
+	check(op_walidx_progress(0, 0, 0) == 350,
+		  "WAL index progress reports the committed end");
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();
@@ -2806,6 +2824,8 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
 	check(n == 1 && out[0].lsn == 150,
 		  "restart replays WAL index records without duplicating them");
+	check(op_walidx_progress(0, 0, 0) == 350,
+		  "WAL index progress survives daemon restart");
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);
