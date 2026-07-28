@@ -2324,6 +2324,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 	WalIdxRec	recs[64];
 	int			n;
 	int			i;
+	int			torn = 0;
 
 	for (;;)
 	{
@@ -2335,7 +2336,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 		if (n < 0)
 			return errno == ENOENT ? 0 : -1;
 		if (n % (int) sizeof(WalIdxRec) != 0)
-			break;
+			torn = 1;
 		for (i = 0; i < n / (int) sizeof(WalIdxRec); i++)
 		{
 			WalIdxRec *rec = &recs[i];
@@ -2346,12 +2347,12 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				return -1;
 			walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
 		}
-		off += (uint64_t) n;
-		if (n < (int) sizeof(recs))
+		off += (uint64_t) (n / (int) sizeof(WalIdxRec)) * sizeof(WalIdxRec);
+		if (torn || n < (int) sizeof(recs))
 			break;
 	}
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
-	if (n > 0 && ps_storage->walidx_truncate(tl, shard, off) != 0)
+	if (torn && ps_storage->walidx_truncate(tl, shard, off) != 0)
 		return -1;
 	return 0;
 }
