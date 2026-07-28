@@ -74,6 +74,12 @@ on:
       - '.github/workflows/walredo-test.yml'
   workflow_dispatch:
 
+# Do not let obsolete full PostgreSQL builds from push+pull_request events
+# saturate the hosted-runner quota while a stacked PageStore PR is rebased.
+concurrency:
+  group: walredo-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   build-and-smoke:
     name: build postgres + PG module + wal-redo tests
