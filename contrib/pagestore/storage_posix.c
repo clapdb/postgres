@@ -47,8 +47,30 @@ static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * WAL-index records are independent per (timeline, shard).  The metadata
+ * append lock below intentionally remains global because its rollback path
+ * samples a shared file length; using it for index logs would serialize
+ * unrelated shard workers through write+fsync.
+ */
+typedef struct PosixWalIdxLock
+{
+	uint32_t	tl;
+	uint32_t	shard;
+	pthread_mutex_t lock;
+	struct PosixWalIdxLock *next;
+} PosixWalIdxLock;
+
+static PosixWalIdxLock *posix_walidx_locks;
+static pthread_mutex_t posix_walidx_locks_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void posix_walidx_locks_clear(void);
+
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
+static int posix_log_append_locked(const char *name, const void *buf,
+							 uint32_t len);
+static PosixWalIdxLock *posix_walidx_lock_for(uint32_t tl, uint32_t shard);
 
 static void
 seg_path(char *buf, size_t buflen, uint32_t shard, int seg)
@@ -214,6 +236,7 @@ static void
 posix_close(void)
 {
 	free_shard_caches();
+	posix_walidx_locks_clear();
 }
 
 static int
@@ -380,12 +403,64 @@ static int
 posix_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
 {
 	char		name[64];
+	PosixWalIdxLock *lock;
+	int			rc;
 
 	snprintf(name, sizeof(name), "walidx_%u_%u", tl, shard);
-	return posix_log_append(name, buf, len);
+	lock = posix_walidx_lock_for(tl, shard);
+	if (!lock)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	rc = posix_log_append_locked(name, buf, len);
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
 }
 
 static pthread_mutex_t posix_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static PosixWalIdxLock *
+posix_walidx_lock_for(uint32_t tl, uint32_t shard)
+{
+	PosixWalIdxLock *entry;
+
+	pthread_mutex_lock(&posix_walidx_locks_lock);
+	for (entry = posix_walidx_locks; entry; entry = entry->next)
+		if (entry->tl == tl && entry->shard == shard)
+			break;
+	if (!entry)
+	{
+		entry = calloc(1, sizeof(*entry));
+		if (entry)
+		{
+			entry->tl = tl;
+			entry->shard = shard;
+			pthread_mutex_init(&entry->lock, NULL);
+			entry->next = posix_walidx_locks;
+			posix_walidx_locks = entry;
+		}
+	}
+	pthread_mutex_unlock(&posix_walidx_locks_lock);
+	return entry;
+}
+
+static void
+posix_walidx_locks_clear(void)
+{
+	PosixWalIdxLock *entry;
+
+	pthread_mutex_lock(&posix_walidx_locks_lock);
+	entry = posix_walidx_locks;
+	posix_walidx_locks = NULL;
+	pthread_mutex_unlock(&posix_walidx_locks_lock);
+	while (entry)
+	{
+		PosixWalIdxLock *next = entry->next;
+
+		pthread_mutex_destroy(&entry->lock);
+		free(entry);
+		entry = next;
+	}
+}
 
 static int
 posix_walidx_read(uint32_t tl, uint32_t shard, uint64_t off, void *buf,
@@ -403,9 +478,13 @@ posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
 	char		path[4096];
 	int			fd;
 	int			rc = 0;
+	PosixWalIdxLock *lock;
 
 	snprintf(path, sizeof(path), "%s/walidx_%u_%u", posix_dir, tl, shard);
-	pthread_mutex_lock(&posix_log_lock);
+	lock = posix_walidx_lock_for(tl, shard);
+	if (!lock)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
 	fd = open(path, O_WRONLY);
 	if (fd < 0)
 		rc = (errno == ENOENT && len == 0) ? 0 : -1;
@@ -416,7 +495,7 @@ posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
 		if (close(fd) != 0)
 			rc = -1;
 	}
-	pthread_mutex_unlock(&posix_log_lock);
+	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
 
