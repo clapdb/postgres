@@ -2176,7 +2176,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		unsigned char *image = calloc(1, page_size);
 		uint64_t	redo1 = 5000,
 					redo2 = 9000,
-					exact_redo = 4000;
+					exact_redo = 5000;
 
 		memset(image, 0x5c, 64);	/* stand-in pg_control bytes */
 
