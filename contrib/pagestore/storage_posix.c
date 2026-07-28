@@ -45,6 +45,7 @@ static int seg_shards_cap;
 static int test_fail_seg_writes;
 static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
+static int test_max_log_read;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
@@ -211,6 +212,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_writes;
 	const char *crash_after_writes;
 	const char *fail_fork_meta_at;
+	const char *max_log_read;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
@@ -228,6 +230,8 @@ posix_open(const char *path, uint64_t segment_size)
 	fail_fork_meta_at = getenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT");
 	test_fail_fork_meta_append_at = fail_fork_meta_at ?
 		atoi(fail_fork_meta_at) : 0;
+	max_log_read = getenv("PAGESTORE_TEST_MAX_LOG_READ");
+	test_max_log_read = max_log_read ? atoi(max_log_read) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	return 0;
 }
@@ -657,14 +661,34 @@ posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len)
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
+	uint32_t	done = 0;
 
 	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -1;
-	n = pread(fd, buf, len, (off_t) off);
+	while (done < len)
+	{
+		uint32_t	read_len = len - done;
+
+		/* Standalone-test fault injection; ordinary deployments leave this zero. */
+		if (test_max_log_read > 0 &&
+			read_len > (uint32_t) test_max_log_read)
+			read_len = (uint32_t) test_max_log_read;
+		n = pread(fd, (char *) buf + done, read_len, (off_t) off + done);
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			return -1;
+		}
+		if (n == 0)
+			break;
+		done += (uint32_t) n;
+	}
 	close(fd);
-	return (int) n;
+	return (int) done;
 }
 
 static int
