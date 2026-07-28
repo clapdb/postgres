@@ -14,7 +14,7 @@
 # Limitation: the redo instance runs with recovery_prefetch=off (the backend's
 # recovery-prefetch/AIO path is not wired yet).  See WAL_REDO.md.
 #
-set -uo pipefail
+set -euo pipefail
 
 BUILD=${1:?usage: redo_worker_demo.sh <meson-build-dir>}
 BUILD=$(CDPATH= cd -- "$BUILD" && pwd) || {
@@ -36,6 +36,46 @@ SHM=/psredo_$$
 PORT=54470
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 
+wait_daemon_ready() {
+	local shm_path="/dev/shm$SHM"
+	local magic version page_size io_unit nchannels nshards
+	local i
+
+	for ((i = 0; i < 400; i++)); do
+		if ! kill -0 "$DPID" 2>/dev/null; then
+			echo "FAIL - pagestore daemon exited before publishing shared memory"
+			tail -100 "$D/daemon.log" 2>/dev/null || true
+			exit 1
+		fi
+		if [ -r "$shm_path" ]; then
+			read -r magic version page_size io_unit nchannels nshards < <(
+				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
+			)
+			[ "$magic" = "$((0x50414753))" ] &&
+				[ "$version" = 19 ] && [ "$page_size" = 8192 ] &&
+				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&
+				[ "$nshards" = 1 ] && return 0
+		fi
+		sleep 0.05
+	done
+
+	echo "FAIL - pagestore daemon did not publish a ready shared-memory header"
+	tail -100 "$D/daemon.log" 2>/dev/null || true
+	exit 1
+}
+
+wait_postgres_ready() {
+	local i
+
+	for ((i = 0; i < 100; i++)); do
+		$P -c 'SELECT 1' >/dev/null 2>&1 && return 0
+		sleep 0.1
+	done
+	echo "FAIL - writer PostgreSQL did not stay ready"
+	tail -100 "$D/w.log" 2>/dev/null || true
+	exit 1
+}
+
 cleanup() {
 	"$BIN/pg_ctl" -D "$D" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
@@ -46,10 +86,10 @@ trap cleanup EXIT
 
 mkdir -p "$S"
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null 2>&1
-"$DAEMON" --shm "$SHM" --store "$S" >/dev/null 2>&1 &
+"$DAEMON" --shm "$SHM" --store "$S" >>"$D/daemon.log" 2>&1 &
 DPID=$!
-sleep 0.5
-"$IMPORT" --shm "$SHM" --pgdata "$D" >/dev/null 2>&1
+wait_daemon_ready
+"$IMPORT" --shm "$SHM" --pgdata "$D" >/dev/null
 
 cat >> "$D/postgresql.conf" <<EOF
 shared_preload_libraries = 'pagestore'
@@ -64,7 +104,12 @@ port = $PORT
 EOF
 
 # 1) writer: a row, a base backup (recovery start point), then a change shipped
-"$BIN/pg_ctl" -D "$D" -l "$D/w.log" -w start >/dev/null 2>&1
+if ! "$BIN/pg_ctl" -D "$D" -l "$D/w.log" -w start >/dev/null 2>&1; then
+	echo "FAIL - writer PostgreSQL did not start"
+	tail -100 "$D/w.log" 2>/dev/null || true
+	exit 1
+fi
+wait_postgres_ready
 $P -c "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (1,'base');" >/dev/null
 # write the backup label straight into PGDATA (unquoted heredoc expands $D)
 "$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres >/dev/null <<SQL
