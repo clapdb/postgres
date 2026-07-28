@@ -13,6 +13,9 @@ name: walredo
 
 on:
   push:
+    branches:
+      - master
+      - pagestore
     paths:
       - 'src/backend/postmaster/walredo.c'
       - 'src/include/postmaster/walredo.h'
