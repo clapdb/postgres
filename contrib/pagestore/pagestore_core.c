@@ -2321,23 +2321,34 @@ static int
 walidx_recover_one(uint32_t tl, uint32_t shard)
 {
 	uint64_t	off = 0;
-	WalIdxRec	rec;
+	WalIdxRec	recs[64];
 	int			n;
+	int			i;
 
 	for (;;)
 	{
-		n = ps_storage->walidx_read(tl, shard, off, &rec, sizeof(rec));
+		n = ps_storage->walidx_read(tl, shard, off, recs, sizeof(recs));
 		if (n == 0)
 			break;
 		/* A missing per-timeline log is an empty index; other I/O errors are
 		 * not safe to mask, including at offset zero. */
 		if (n < 0)
 			return errno == ENOENT ? 0 : -1;
-		if (n != (int) sizeof(rec) || rec.magic != WALIDX_MAGIC ||
-			rec.rec_len != sizeof(rec) || rec.timeline != tl)
+		if (n % (int) sizeof(WalIdxRec) != 0)
 			break;
-		walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
-		off += sizeof(rec);
+		for (i = 0; i < n / (int) sizeof(WalIdxRec); i++)
+		{
+			WalIdxRec *rec = &recs[i];
+
+			/* A complete malformed record is corruption, not a torn suffix. */
+			if (rec->magic != WALIDX_MAGIC ||
+				rec->rec_len != sizeof(*rec) || rec->timeline != tl)
+				return -1;
+			walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+		}
+		off += (uint64_t) n;
+		if (n < (int) sizeof(recs))
+			break;
 	}
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
 	if (n > 0 && ps_storage->walidx_truncate(tl, shard, off) != 0)
