@@ -2394,6 +2394,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	uint64_t	current;
 	uint64_t	first;
 
+	/* A durable marker must name a contiguous prefix of shipped WAL. */
 	if (tl >= MAX_TIMELINES)
 		return -1;
 	current = walidx_progress[tl];

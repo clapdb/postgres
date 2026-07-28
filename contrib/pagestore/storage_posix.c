@@ -378,7 +378,8 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 	if (fd < 0)
 		return -1;
 	if (write(fd, a, alen) != (ssize_t) alen ||
-		(blen > 0 && write(fd, b, blen) != (ssize_t) blen))
+		(blen > 0 && write(fd, b, blen) != (ssize_t) blen) ||
+		fsync(fd) != 0)
 	{
 		close(fd);
 		return -1;
