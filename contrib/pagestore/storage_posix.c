@@ -377,33 +377,34 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 }
 
 static int
-posix_walidx_append(uint32_t tl, const void *buf, uint32_t len)
+posix_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
 {
 	char		name[64];
 
-	snprintf(name, sizeof(name), "walidx_%u", tl);
+	snprintf(name, sizeof(name), "walidx_%u_%u", tl, shard);
 	return posix_log_append(name, buf, len);
 }
 
 static pthread_mutex_t posix_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int
-posix_walidx_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
+posix_walidx_read(uint32_t tl, uint32_t shard, uint64_t off, void *buf,
+			  uint32_t len)
 {
 	char		name[64];
 
-	snprintf(name, sizeof(name), "walidx_%u", tl);
+	snprintf(name, sizeof(name), "walidx_%u_%u", tl, shard);
 	return posix_log_read(name, off, buf, len);
 }
 
 static int
-posix_walidx_truncate(uint32_t tl, uint64_t len)
+posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
 {
 	char		path[4096];
 	int			fd;
 	int			rc = 0;
 
-	snprintf(path, sizeof(path), "%s/walidx_%u", posix_dir, tl);
+	snprintf(path, sizeof(path), "%s/walidx_%u_%u", posix_dir, tl, shard);
 	pthread_mutex_lock(&posix_log_lock);
 	fd = open(path, O_WRONLY);
 	if (fd < 0)
