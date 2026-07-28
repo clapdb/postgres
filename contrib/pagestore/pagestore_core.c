@@ -2318,8 +2318,10 @@ walidx_recover_one(uint32_t tl)
 		n = ps_storage->walidx_read(tl, off, &rec, sizeof(rec));
 		if (n == 0)
 			break;
+		/* A missing per-timeline log is an empty index; other I/O errors are
+		 * not safe to mask, including at offset zero. */
 		if (n < 0)
-			return -1;
+			return errno == ENOENT ? 0 : -1;
 		if (n != (int) sizeof(rec) || rec.magic != WALIDX_MAGIC ||
 			rec.rec_len != sizeof(rec) || rec.timeline != tl)
 			break;
