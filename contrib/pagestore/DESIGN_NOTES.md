@@ -101,8 +101,9 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
 
 ## Other known simplifications (smaller)
 
-- Indexes are in-memory and rebuilt on restart; the per-page WAL index is not
-  yet persisted at all.
+- Relation and fork indexes are rebuilt on restart.  The per-page WAL index is
+  durably appended in per-(timeline, shard) logs and replayed at startup;
+  compaction of that history is still a future maintenance task.
 - The IPC channel uses busy-polling (no eventfd) and one copy via the channel
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon
