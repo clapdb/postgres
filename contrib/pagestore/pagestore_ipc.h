@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		19	/* 19: checkpoint admission gate + barrier;
+#define PS_SHM_VERSION		20	/* 20: WAL_INDEX_PROGRESS opcode added;
+							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
 								 * 17: NBLOCKS/EXISTS honour req_lsn as an

@@ -2806,6 +2806,8 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		  "contiguous indexed WAL interval commits a durable progress marker");
 	check(op_walidx_progress(0, 0, 0) == 350,
 		  "WAL index progress reports the committed end");
+	check(op_walidx_progress(UINT32_MAX, 0, 0) == UINT32_MAX,
+		  "WAL index progress rejects an out-of-range timeline");
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();

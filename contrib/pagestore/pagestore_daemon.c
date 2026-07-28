@@ -266,7 +266,8 @@ run_request_admitted(PsChannel *ch)
 		 * shard_for(&ch->key).  The shipped-WAL byte ops (append/size/read) are not
 		 * keyed (they touch the per-timeline WAL log), so serialize them on shard 0.
 		 */
-		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
+			op == PS_OP_WAL_INDEX_PROGRESS)
 			shard = 0;
 		else if (op == PS_OP_WAL_RETAIN_FLOOR)
 		{
