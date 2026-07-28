@@ -2220,6 +2220,21 @@ typedef struct WalIdxEnt
 	int			cap;
 } WalIdxEnt;
 
+static bool
+walidx_contains(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	uint32_t	h = page_hash(tl, key, block);
+	Shard	   *s = shard_for(key);
+	WalIdxEnt  *e;
+
+	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
+		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+			for (int i = 0; i < e->n; i++)
+				if (e->lsns[i] == lsn)
+					return true;
+	return false;
+}
+
 static void
 walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
@@ -2277,6 +2292,8 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 
 	if (tl >= MAX_TIMELINES)
 		return -1;
+	if (walidx_contains(tl, key, block, lsn))
+		return 0;
 	rec.magic = WALIDX_MAGIC;
 	rec.rec_len = sizeof(rec);
 	rec.timeline = tl;
@@ -2299,15 +2316,20 @@ walidx_recover_one(uint32_t tl)
 	for (;;)
 	{
 		n = ps_storage->walidx_read(tl, off, &rec, sizeof(rec));
-		if (n == 0 || n == -1)
+		if (n == 0)
 			break;
+		if (n < 0)
+			return -1;
 		if (n != (int) sizeof(rec) || rec.magic != WALIDX_MAGIC ||
 			rec.rec_len != sizeof(rec) || rec.timeline != tl)
 			break;
 		walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
 		off += sizeof(rec);
 	}
-	return n < 0 && off != 0 ? -1 : 0;
+	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
+	if (n > 0 && ps_storage->walidx_truncate(tl, off) != 0)
+		return -1;
+	return 0;
 }
 
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap

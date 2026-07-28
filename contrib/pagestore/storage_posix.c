@@ -394,6 +394,29 @@ posix_walidx_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 	return posix_log_read(name, off, buf, len);
 }
 
+static int
+posix_walidx_truncate(uint32_t tl, uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	int			rc = 0;
+
+	snprintf(path, sizeof(path), "%s/walidx_%u", posix_dir, tl);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		rc = (errno == ENOENT && len == 0) ? 0 : -1;
+	else
+	{
+		if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
+			rc = -1;
+		if (close(fd) != 0)
+			rc = -1;
+	}
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
 /*
  * Truncate fd back to old_size on an error path.  Best-effort: the caller
  * is already returning an error and cannot act on a rollback failure; the
@@ -627,6 +650,7 @@ const PsStorage PsStoragePosix = {
 	.wal_read = posix_wal_read,
 	.walidx_append = posix_walidx_append,
 	.walidx_read = posix_walidx_read,
+	.walidx_truncate = posix_walidx_truncate,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
 	.fork_meta_append = posix_fork_meta_append,
