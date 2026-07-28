@@ -389,14 +389,28 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
+	uint32_t	done = 0;
 
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -1;
-	n = pread(fd, buf, len, (off_t) off);
+	while (done < len)
+	{
+		n = pread(fd, (char *) buf + done, len - done, (off_t) off + done);
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			close(fd);
+			return -1;
+		}
+		if (n == 0)
+			break;
+		done += (uint32_t) n;
+	}
 	close(fd);
-	return (int) n;
+	return (int) done;
 }
 
 static int
