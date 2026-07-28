@@ -9,6 +9,9 @@ name: pagestore
 
 on:
   push:
+    branches:
+      - master
+      - pagestore
     paths:
       - 'contrib/pagestore/**'
       # core seams the pagestore module depends on: a core-only PR (e.g. the
