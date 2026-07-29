@@ -405,7 +405,9 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		return -1;
 	if (fstat(fd, &st) != 0)
 	{
-		posix_wal_rollback(path, fd, 0, created);
+		close(fd);
+		if (created)
+			unlink(path);
 		return -1;
 	}
 	oldsz = st.st_size;

@@ -804,6 +804,34 @@ op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 
 /* --- shipped-WAL operations --- */
 
+#define TEST_WAL_MAGIC	0x57414c52
+
+static void
+write_torn_wal_header(const char *store, uint32_t tl, uint64_t start_lsn,
+					  uint32_t len)
+{
+	struct
+	{
+		uint32_t	magic;
+		uint32_t	len;
+		uint64_t	start_lsn;
+	}			h;
+	char		path[512];
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/wal_%u", store, tl);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	check(fd >= 0, "test creates a torn WAL log");
+	if (fd < 0)
+		return;
+	h.magic = TEST_WAL_MAGIC;
+	h.len = len;
+	h.start_lsn = start_lsn;
+	check(write(fd, &h, sizeof(h)) == (ssize_t) sizeof(h) && fsync(fd) == 0,
+		  "test writes a WAL header without its payload");
+	check(close(fd) == 0, "test closes the torn WAL log");
+}
+
 /* Append len WAL bytes at start_lsn on a timeline. */
 static void
 op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
@@ -2828,11 +2856,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "WAL index progress reports a 64-bit committed end");
+		op_create_branch(3, 0, 0);
 	}
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();
 	stop_daemon(dpid);
+	write_torn_wal_header(store, 3, 0x100000000ULL, 16);
 	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
 	shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
@@ -2856,6 +2886,8 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "64-bit WAL index progress survives daemon restart");
+		check(op_walidx_progress(3, high, high + 16, &progress) != 0,
+			  "WAL index progress rejects WAL with a missing payload");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
