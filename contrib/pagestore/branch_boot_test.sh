@@ -37,11 +37,16 @@ export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 
+SOCKROOT=$(mktemp -d /tmp/psbboot-sock.XXXXXX)
+new_sockdir() {
+	mktemp -d "$SOCKROOT/$1.XXXXXX"
+}
+
 DATA=$(mktemp -d)/pgdata
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo
-SOCKDIR=$(dirname "$DATA")/socket
-BRANCHSOCK=$(mktemp -d)
+SOCKDIR=$(new_sockdir main)
+BRANCHSOCK=$(new_sockdir branch)
 SHM=/psbboot_$$
 
 PORT=5432
@@ -67,12 +72,11 @@ cleanup() {
 	fi
 	rm -rf "$(dirname "$DATA")" "$(dirname "$STORE")" "$(dirname "$SCRATCH")" \
 		"$BRANCHSOCK" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
-		"${SCRATCH2:+$(dirname "$SCRATCH2")}"
+		"${SCRATCH2:+$(dirname "$SCRATCH2")}" "$SOCKROOT"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
 
-mkdir -p "$SOCKDIR"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
