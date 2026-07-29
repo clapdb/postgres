@@ -9,6 +9,9 @@ name: pagestore
 
 on:
   push:
+    branches:
+      - master
+      - pagestore
     paths:
       - 'contrib/pagestore/**'
       # core seams the pagestore module depends on: a core-only PR (e.g. the
@@ -51,6 +54,13 @@ on:
       - 'src/include/storage/procarray.h'
       - '.github/workflows/pagestore-test.yml'
   workflow_dispatch:
+
+# A branch update fires both push and pull_request.  Keep only the newest run
+# for that branch so stacked-PR rebases do not consume the runner quota with
+# obsolete standalone/integration jobs.
+concurrency:
+  group: pagestore-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   standalone-test:

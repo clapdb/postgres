@@ -2175,12 +2175,21 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		unsigned char *note = calloc(1, page_size);
 		unsigned char *image = calloc(1, page_size);
 		uint64_t	redo1 = 5000,
-					redo2 = 9000;
+					redo2 = 9000,
+					exact_redo = 5000;
 
 		memset(image, 0x5c, 64);	/* stand-in pg_control bytes */
 
 		check(op_wal_retain_floor(0) == 0,
 			  "wal retention floor starts unconstrained (no control image)");
+		/* A checkpoint fence also publishes an exact-redo control copy.  It
+		 * is separately restorable, so it must carry a note at that exact
+		 * version rather than relying on the later record-end copy's note. */
+		memcpy(note, &exact_redo, sizeof(exact_redo));
+		op_write_control(1, note, exact_redo);
+		op_write_control(0, image, exact_redo);
+		check(op_wal_retain_floor(0) == exact_redo,
+			  "exact-redo control image has a same-version floor note");
 		/* two mirrored control writes, note first then image at the same
 		 * version -- exactly the shipper's order; the floor must be the MIN
 		 * redo over the restorable images */
