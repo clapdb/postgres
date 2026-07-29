@@ -124,6 +124,15 @@ jobs:
       - name: Prepare temporary install tree
         run: meson test -C build --suite setup
 
+      - name: Run pagestore harness writer smoke
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_lifecycle.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 
