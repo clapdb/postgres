@@ -3,9 +3,9 @@
 # branch_boot_test.sh -- end-to-end branch compute boot through the prepared
 # branch manifest/install flow, under full routing.
 #
-# This is the successor to the old compute_on_branch_demo.sh (which switched a
-# single compute between timelines by editing pagestore.timeline in the same
-# PGDATA -- a shortcut that branch startup now fails closed on).  Here the
+# This is the successor to the old single-compute timeline-switch demo.  That
+# shortcut edited pagestore.timeline in the same PGDATA, a path that branch
+# startup now fails closed on.  Here the
 # branch is a real second compute booted the supported way:
 #
 #   - a parent runs with route_all=on over an imported store (timeline 0),
