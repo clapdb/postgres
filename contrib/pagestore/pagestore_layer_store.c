@@ -128,13 +128,28 @@ claim_object_dir(void)
 			unlink(owner_tmp);
 			return -1;
 		}
-		if (close(fd) != 0 || rename(owner_tmp, path) != 0 ||
-			fsync_dir(object_dir) != 0)
+		if (close(fd) != 0)
 		{
 			unlink(owner_tmp);
 			return -1;
 		}
-		return 0;
+		fd = -1;
+		if (link(owner_tmp, path) != 0)
+		{
+			if (errno != EEXIST)
+			{
+				unlink(owner_tmp);
+				return -1;
+			}
+		}
+		else if (fsync_dir(object_dir) != 0)
+		{
+			unlink(path);
+			unlink(owner_tmp);
+			return -1;
+		}
+		if (unlink(owner_tmp) != 0 || fsync_dir(object_dir) != 0)
+			return -1;
 	}
 owner_exists:
 	fd = open(path, O_RDONLY);

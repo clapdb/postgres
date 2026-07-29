@@ -55,7 +55,9 @@ main(void)
 	char		local_uri[PS_LAYER_URI_MAX];
 	char		remote_uri[PS_LAYER_URI_MAX];
 	const char *contents = "sealed layer object bytes";
+	const char *corrupt = "bad";
 	PsLayerDesc layer;
+	PsLayerDesc remote_only;
 
 	if (mkdtemp(local_dir) == NULL || mkdtemp(other_local_dir) == NULL ||
 		mkdtemp(object_dir) == NULL)
@@ -137,6 +139,15 @@ main(void)
 	check(ps_layer_store->download_layer(&layer) == 0 &&
 		  file_matches(local_uri, contents),
 		  "download restores the complete local layer");
+	remote_only = layer;
+	remote_only.location_count = 1;
+	remote_only.locations[0] = layer.locations[1];
+	check(ps_layer_store->write_local_layer(layer.layer_id, corrupt,
+											strlen(corrupt)) == 0,
+		  "simulate corrupt remote-only cache");
+	check(ps_layer_store->refresh_layer_cache(&remote_only) == 0 &&
+		  file_matches(local_uri, contents),
+		  "refresh replaces corrupt remote-only cache");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0,
 		  "delete remote object");
 	check(ps_layer_store->delete_remote_layer(&layer) == 0 &&

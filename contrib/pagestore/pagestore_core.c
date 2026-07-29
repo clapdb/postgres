@@ -72,6 +72,12 @@ static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
+static int refresh_remote_only_layer(const PsLayerDesc *layer);
+static int read_image_index_refreshing(const PsLayerDesc *layer,
+									   PsImgIndexEnt **idx, uint32_t *n);
+static int read_layer_block_refreshing(const PsLayerDesc *layer, uint64_t off,
+									   void *buf, uint32_t len);
+static int verify_image_layer_refreshing(const PsLayerDesc *layer);
 static pthread_t gc_remote_thread;
 static PsLayerDesc gc_remote_candidate;
 static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 failed */
@@ -716,7 +722,7 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 		PsImgIndexEnt *idx;
 		uint32_t	n;
 
-		if (ps_image_layer_read_index(&old[k], &idx, &n) != 0)
+		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
 			goto cleanup;
 		for (uint32_t j = 0; j < n; j++)
 		{
@@ -742,8 +748,8 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 				cap = nc;
 			}
 			pg = malloc(page_size);
-			if (!pg || ps_layer_store->read_layer_block(&old[k], idx[j].data_off,
-														pg, page_size) != 0)
+			if (!pg || read_layer_block_refreshing(&old[k], idx[j].data_off,
+												   pg, page_size) != 0)
 			{
 				free(pg);
 				free(idx);
@@ -3359,14 +3365,8 @@ recover_layer_prefix(uint32_t shard)
 		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
 			layer_shard_from_id(d->layer_id) != shard)
 			continue;
-		if (ps_image_layer_read_index(d, &idx, &n) != 0)
-		{
-			if (tier_local_location(d) != NULL ||
-				ps_layer_store->refresh_layer_cache == NULL ||
-				ps_layer_store->refresh_layer_cache(d) != 0 ||
-				ps_image_layer_read_index(d, &idx, &n) != 0)
-				goto fail;
-		}
+		if (read_image_index_refreshing(d, &idx, &n) != 0)
+			goto fail;
 		for (uint32_t j = 0; j < n; j++)
 		{
 			int			covered;
@@ -3978,7 +3978,7 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
 			layer_shard_from_id(d->layer_id) != source_shard)
 			continue;
-		if (ps_image_layer_read_index(d, &idx, &n) != 0)
+		if (read_image_index_refreshing(d, &idx, &n) != 0)
 			return -1;
 		for (uint32_t j = 0; j < n; j++)
 			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) &&
@@ -3993,7 +3993,7 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 			found = 1;
 			/* Always re-read and checksum now: a prior read's cached verification
 			 * may predate corruption that occurred before this unlink. */
-			if (ps_image_layer_verify_data(d, page_size) != 0)
+			if (verify_image_layer_refreshing(d) != 0)
 				return -1;
 		}
 		/* Keep any remote-only cache materialized while examining this segment.
@@ -4053,6 +4053,48 @@ tier_remote_location(const PsLayerDesc *layer)
 			layer->locations[i].available)
 			return &layer->locations[i];
 	return NULL;
+}
+
+static int
+refresh_remote_only_layer(const PsLayerDesc *layer)
+{
+	if (tier_local_location(layer) != NULL ||
+		tier_remote_location(layer) == NULL ||
+		ps_layer_store->refresh_layer_cache == NULL)
+		return -1;
+	return ps_layer_store->refresh_layer_cache(layer);
+}
+
+static int
+read_image_index_refreshing(const PsLayerDesc *layer, PsImgIndexEnt **idx,
+							uint32_t *n)
+{
+	if (ps_image_layer_read_index(layer, idx, n) == 0)
+		return 0;
+	if (refresh_remote_only_layer(layer) != 0)
+		return -1;
+	return ps_image_layer_read_index(layer, idx, n);
+}
+
+static int
+read_layer_block_refreshing(const PsLayerDesc *layer, uint64_t off,
+							void *buf, uint32_t len)
+{
+	if (ps_layer_store->read_layer_block(layer, off, buf, len) == 0)
+		return 0;
+	if (refresh_remote_only_layer(layer) != 0)
+		return -1;
+	return ps_layer_store->read_layer_block(layer, off, buf, len);
+}
+
+static int
+verify_image_layer_refreshing(const PsLayerDesc *layer)
+{
+	if (ps_image_layer_verify_data(layer, page_size) == 0)
+		return 0;
+	if (refresh_remote_only_layer(layer) != 0)
+		return -1;
+	return ps_image_layer_verify_data(layer, page_size);
 }
 
 static void *
