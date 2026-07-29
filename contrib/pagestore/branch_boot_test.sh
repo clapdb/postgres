@@ -41,8 +41,10 @@ DATA=$(mktemp -d)/pgdata
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo
 SHM=/psbboot_$$
-PORT=54470
-PORT2=54471
+
+read -r PORT PORT2 <<EOF
+$(python3 -c 'import socket; s1=socket.socket(); s2=socket.socket(); s1.bind(("127.0.0.1", 0)); s2.bind(("127.0.0.1", 0)); print(s1.getsockname()[1], s2.getsockname()[1]); s1.close(); s2.close()')
+EOF
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
 PB="$BIN/psql -h 127.0.0.1 -p $PORT2 -U postgres -tA"
 fail=0
@@ -87,6 +89,7 @@ pagestore.timeline = 0
 io_method = sync
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = '127.0.0.1'
 port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
@@ -142,6 +145,7 @@ SCRATCH2=$(mktemp -d)/walredo2
 "$BIN/initdb" -D "$SCRATCH2" -U postgres -A trust >/dev/null 2>&1
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
+listen_addresses = '127.0.0.1'
 port = $PORT2
 archive_mode = off
 pagestore.walredo_datadir = '$SCRATCH2'
