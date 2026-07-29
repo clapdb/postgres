@@ -40,13 +40,13 @@ IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 DATA=$(mktemp -d)/pgdata
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo
+SOCKDIR=$(dirname "$DATA")/socket
+BRANCHSOCK=$(mktemp -d)
 SHM=/psbboot_$$
 
-read -r PORT PORT2 <<EOF
-$(python3 -c 'import socket; s1=socket.socket(); s2=socket.socket(); s1.bind(("127.0.0.1", 0)); s2.bind(("127.0.0.1", 0)); print(s1.getsockname()[1], s2.getsockname()[1]); s1.close(); s2.close()')
-EOF
-P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
-PB="$BIN/psql -h 127.0.0.1 -p $PORT2 -U postgres -tA"
+PORT=5432
+P="$BIN/psql -h $SOCKDIR -p $PORT -U postgres -tA"
+PB="$BIN/psql -h $BRANCHSOCK -p $PORT -U postgres -tA"
 fail=0
 
 assert() {  # $1=actual $2=expected $3=message
@@ -61,14 +61,18 @@ assert() {  # $1=actual $2=expected $3=message
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
-	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	if [ -n "${DPID:-}" ]; then
+		kill "$DPID" 2>/dev/null || true
+		wait "$DPID" 2>/dev/null || true
+	fi
 	rm -rf "$(dirname "$DATA")" "$(dirname "$STORE")" "$(dirname "$SCRATCH")" \
-		"${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
+		"$BRANCHSOCK" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
 		"${SCRATCH2:+$(dirname "$SCRATCH2")}"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
 
+mkdir -p "$SOCKDIR"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$STORE" >/dev/null 2>&1 &
@@ -89,7 +93,8 @@ pagestore.timeline = 0
 io_method = sync
 archive_mode = on
 archive_library = 'pagestore'
-listen_addresses = '127.0.0.1'
+listen_addresses = ''
+unix_socket_directories = '$SOCKDIR'
 port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
@@ -145,8 +150,9 @@ SCRATCH2=$(mktemp -d)/walredo2
 "$BIN/initdb" -D "$SCRATCH2" -U postgres -A trust >/dev/null 2>&1
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
-listen_addresses = '127.0.0.1'
-port = $PORT2
+listen_addresses = ''
+unix_socket_directories = '$BRANCHSOCK'
+port = $PORT
 archive_mode = off
 pagestore.walredo_datadir = '$SCRATCH2'
 EOF
