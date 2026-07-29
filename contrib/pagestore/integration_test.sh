@@ -30,9 +30,11 @@ TS=$(mktemp -d)/ts
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
 SHM=/psint_$$
-PORT=54460
-PORT2=54461		# a second compute (a branch) booted on the same daemon (step 19)
-PORT3=54462		# isolated port for startup-refusal tests
+read -r PORT PORT2 PORT3 <<EOF
+$(python3 -c 'import socket; sockets=[socket.socket() for _ in range(3)]; [s.bind(("127.0.0.1", 0)) for s in sockets]; print(*(s.getsockname()[1] for s in sockets)); [s.close() for s in sockets]')
+EOF
+# PORT2 is a second compute (a branch/reader) booted on the same daemon.
+# PORT3 is isolated for startup-refusal tests.
 # connect over TCP: the server's unix-socket directory varies by build/distro,
 # but -A trust allows 127.0.0.1, so TCP is portable across environments (CI).
 P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
@@ -121,6 +123,7 @@ io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = '127.0.0.1'
 port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
@@ -549,6 +552,7 @@ UNPREPARED=$(mktemp -d)/branch
 cp -a "$BRANCHDATA" "$UNPREPARED"
 cat >> "$UNPREPARED/postgresql.conf" <<EOF
 pagestore.timeline = 1
+listen_addresses = '127.0.0.1'
 port = $PORT2
 archive_mode = off
 EOF
@@ -575,6 +579,7 @@ assert "$ok_install" "ok" "prepared branch install is idempotent for the same br
 # that would leave default/global tablespaces on local md storage.
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
+listen_addresses = '127.0.0.1'
 port = $PORT2
 archive_mode = off
 EOF
@@ -1225,6 +1230,7 @@ assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the n
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
 archive_mode = off
+listen_addresses = '127.0.0.1'
 port = $PORT2
 EOF
 # A pin without its matching artifact must fail closed at startup.
