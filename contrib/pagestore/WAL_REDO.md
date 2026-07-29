@@ -58,9 +58,9 @@ read pages at an LSN.
        - **3c-1** Per-page WAL index. ✅ The store maps (timeline, key, block) ->
          the LSNs of WAL records that modify that page (`PS_OP_WAL_INDEX_ADD` /
          `PS_OP_WAL_INDEX_GET`, with branch read-through capped at the fork LSN).
-         This is the lookup the single-page redo needs.  (Populating it by
-         decoding shipped WAL via PostgreSQL's XLogReader / pg_walinspect is next;
-         reimplementing the WAL format in the daemon is deliberately avoided.)
+         This is the lookup the single-page redo needs.  The index and its
+         progress marker are durable and replayed at daemon startup; reimplementing
+         the WAL format in the daemon is deliberately avoided.
        - **3c-2** Populate the index by decoding shipped WAL. ✅ Reuses
          PostgreSQL's own WAL reader (`read_local_xlog_page`), exposed as
          `pagestore_index_wal(start, end)`.  Note: decoding **must run in a
