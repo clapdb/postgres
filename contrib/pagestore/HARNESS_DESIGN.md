@@ -45,12 +45,13 @@ to observe state newer than its horizon.
 ## Shape
 
 The host-side executable is `contrib/pagestore/harness/pagestore_harness.py`,
-with only the Python standard library.  It receives capability metadata and a
-scenario plan for `--validate`, `--list`, `--daemon-smoke`, and
-`--writer-smoke`.  Runtime modes then add the inputs they actually need:
-`--daemon-smoke` takes daemon and inspector binaries, `--writer-smoke` also
-takes the Meson build directory, and `--legacy-integration` takes the Meson
-build directory plus the legacy script path.  It owns temporary directories,
+with only the Python standard library.  It receives capability metadata plus a
+scenario plan for `--validate`, `--daemon-smoke`, and `--writer-smoke`;
+`--list` instead receives a scenario directory and inventories the plans below
+it.  Runtime modes then add the inputs they actually need: `--daemon-smoke`
+takes daemon and inspector binaries, `--writer-smoke` also takes the Meson
+build directory, and `--legacy-integration` takes the Meson build directory
+plus the legacy script path.  It owns temporary directories,
 daemon/PostgreSQL lifecycle, and capture of diagnostic artifacts.  Full
 per-action timeout enforcement, complete replay metadata, and deterministic
 scheduling are still future generated-scenario work.
