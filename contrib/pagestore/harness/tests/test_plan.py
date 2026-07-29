@@ -201,6 +201,18 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(events[-2]["event"], "run_fail")
         self.assertEqual(events[-1]["event"], "process_stop")
 
+    def test_writer_smoke_requires_runtime_binaries_and_build_dir(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                MODULE.parse_args([
+                    "--capabilities", str(ROOT / "capabilities.json"),
+                    "--writer-smoke", str(ROOT / "scenarios" / "writer_lifecycle.jsonl"),
+                ])
+
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertIn("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary",
+                      stderr.getvalue())
+
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
