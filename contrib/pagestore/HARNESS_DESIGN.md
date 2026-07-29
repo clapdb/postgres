@@ -4,10 +4,14 @@
 
 `pagestore_test.c` checks the freestanding daemon protocol and storage core.
 The focused C unit tests check layer, manifest, cache, and GC invariants.
-`integration_test.sh` proves several PostgreSQL-facing paths end to end.  They
-do not yet form a reusable harness that can run one workload across controlled
-checkpoints, crashes, branches, readers, and restart recovery while retaining a
-small reproducer when it fails.
+`integration_test.sh` proves several PostgreSQL-facing paths end to end.
+`harness/pagestore_harness.py` now provides the first reusable runner: it
+validates JSONL plans, owns private test environments, captures replayable
+run roots, runs daemon-smoke and writer-smoke scenarios, and can wrap the
+legacy integration script in a failure bundle.  It is not yet the full semantic
+harness described below: generated workloads, controlled faults, branch plans,
+redo/materialization comparisons, shrinking, and compatibility fixtures remain
+future work.
 
 This document specifies that harness.  Its job is to find semantic regressions
 in the page-store contract, not to replace PostgreSQL's regression suite or to
@@ -39,10 +43,12 @@ to observe state newer than its horizon.
 
 ## Shape
 
-Add a host-side executable, `contrib/pagestore/pagestore_harness.py`, with only
-the Python standard library.  It receives the Meson build directory and a
-scenario plan.  It owns temporary directories, daemon/PostgreSQL lifecycle,
-timeouts, capture of diagnostic artifacts, and deterministic scheduling.
+The host-side executable is `contrib/pagestore/harness/pagestore_harness.py`,
+with only the Python standard library.  It receives capability metadata and a
+scenario plan; runtime smoke modes also receive the Meson build directory and
+the daemon/inspector binaries.  It owns temporary directories,
+daemon/PostgreSQL lifecycle, timeouts, capture of diagnostic artifacts, and,
+for future generated scenarios, deterministic scheduling.
 
 Use JSON Lines for plans rather than YAML.  It is dependency-free, easy to
 generate or shrink, and each action is independently visible in failure logs.
@@ -517,11 +523,12 @@ advancing durable horizon.
 
 ## Implementation sequence
 
-0. Define the read-only test IPC schema and capability manifest; validate both
-   with daemon and pure runner tests.
-1. Add the Python coordinator with private environments, lifecycle management,
-   JSONL validation/event logging, timeouts, and failure bundles.  Run one
-   existing pinned-reader scenario unchanged through it.
+0. [done] Define the read-only test IPC schema and capability manifest; validate
+   both with daemon and pure runner tests.
+1. [done] Add the Python coordinator with private environments, lifecycle
+   management, JSONL validation/event logging, timeouts, and failure bundles.
+   Current smoke coverage includes daemon readiness, writer lifecycle/readers,
+   and the legacy integration bundle bridge.
 2. Add checkpoint records and SQL/metadata/visibility oracles.  Port the
    current reader R test, including running-XID and oversized-subxid cases, and
    add the local-control differential trace.
