@@ -994,6 +994,9 @@ timeline_is_used(uint32_t timeline)
 
 /* highest end LSN (start+len) of shipped WAL received per timeline */
 static uint64_t wal_end[MAX_TIMELINES];
+static uint64_t wal_covered[MAX_TIMELINES];
+static uint64_t wal_covered_off[MAX_TIMELINES];
+static int		wal_covered_valid[MAX_TIMELINES];
 
 static inline uint64_t
 wal_end_read(uint32_t timeline)
@@ -2106,15 +2109,44 @@ wal_log_start(uint32_t tl)
 }
 
 static int
-wal_range_covered(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+wal_payload_readable(uint32_t tl, uint64_t payload_off, uint32_t len)
 {
-	uint64_t	covered = start_lsn;
+	unsigned char byte;
+	uint64_t	last;
+
+	if (len == 0)
+		return 1;
+	last = payload_off + len - 1;
+	if (last < payload_off)
+		return 0;
+	return ps_storage->wal_read(tl, last, &byte, 1) == 1;
+}
+
+static int
+wal_coverage_advance(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+{
+	uint64_t	covered;
+	uint64_t	off;
 
 	if (tl >= MAX_TIMELINES)
 		return 0;
+	if (!wal_covered_valid[tl])
+	{
+		WalRecHdr	h;
+
+		if (ps_storage->wal_read(tl, 0, &h, sizeof(h)) != (int) sizeof(h) ||
+			h.magic != WAL_MAGIC)
+			return start_lsn == end_lsn;
+		wal_covered[tl] = h.start_lsn;
+		wal_covered_off[tl] = 0;
+		wal_covered_valid[tl] = 1;
+	}
+	covered = wal_covered[tl];
+	off = wal_covered_off[tl];
+	if (start_lsn > covered)
+		return 0;
 	while (covered < end_lsn)
 	{
-		uint64_t	off = 0;
 		WalRecHdr	h;
 		int			n;
 		int			advanced = 0;
@@ -2122,21 +2154,38 @@ wal_range_covered(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 		while ((n = ps_storage->wal_read(tl, off, &h, sizeof(h))) ==
 			   (int) sizeof(h))
 		{
+			uint64_t	payload_off;
 			uint64_t	rec_end;
+			uint64_t	next_off;
 
 			if (h.magic != WAL_MAGIC)
+				return 0;
+			payload_off = off + sizeof(h);
+			next_off = payload_off + h.len;
+			if (payload_off < off || next_off < payload_off)
 				return 0;
 			rec_end = h.start_lsn + h.len;
 			if (rec_end < h.start_lsn)
 				return 0;
-			if (h.start_lsn <= covered && rec_end > covered)
+			if (!wal_payload_readable(tl, payload_off, h.len))
+				return 0;
+			off = next_off;
+			if (h.start_lsn <= covered)
 			{
-				covered = rec_end;
+				if (rec_end > covered)
+					covered = rec_end;
 				advanced = 1;
+				wal_covered[tl] = covered;
+				wal_covered_off[tl] = off;
 				if (covered >= end_lsn)
 					return 1;
 			}
-			off += sizeof(h) + h.len;
+			else
+			{
+				wal_covered[tl] = covered;
+				wal_covered_off[tl] = off - sizeof(h) - h.len;
+				return 0;
+			}
 		}
 		if (n < 0 || !advanced)
 			return 0;
@@ -2378,78 +2427,95 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 static int
 walidx_recover_one(uint32_t tl, uint32_t shard)
 {
-	uint64_t	off = 0;
-	int			n;
+	uint64_t	read_off = 0;
+	uint64_t	good_off = 0;
+	unsigned char buf[PS_IO_UNIT];
+	int			used = 0;
 	int			torn = 0;
 
 	for (;;)
 	{
-		WalIdxLogHdr hdr;
-		uint32_t	rec_len;
-		unsigned char recbuf[sizeof(WalIdxRec) > sizeof(WalIdxProgressRec) ?
-							 sizeof(WalIdxRec) : sizeof(WalIdxProgressRec)];
+		int			n;
+		int			want = (int) sizeof(buf) - used;
+		int			pos = 0;
 
-		n = ps_storage->walidx_read(tl, shard, off, &hdr, sizeof(hdr));
+		n = ps_storage->walidx_read(tl, shard, read_off, buf + used,
+									(uint32_t) want);
 		if (n == 0)
+		{
+			if (used != 0)
+				torn = 1;
 			break;
+		}
 		/* A missing per-timeline log is an empty index; other I/O errors are
 		 * not safe to mask, including at offset zero. */
 		if (n < 0)
 			return errno == ENOENT ? 0 : -1;
-		if (n != (int) sizeof(hdr))
+		read_off += (uint64_t) n;
+		used += n;
+
+		while (used - pos >= (int) sizeof(WalIdxLogHdr))
 		{
-			torn = 1;
+			WalIdxLogHdr hdr;
+			uint32_t	rec_len;
+
+			memcpy(&hdr, buf + pos, sizeof(hdr));
+			if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
+				rec_len = sizeof(WalIdxRec);
+			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
+					 hdr.rec_len == sizeof(WalIdxProgressRec))
+				rec_len = sizeof(WalIdxProgressRec);
+			else
+				return -1;
+			if (used - pos < (int) rec_len)
+				break;
+
+			if (hdr.magic == WALIDX_MAGIC)
+			{
+				WalIdxRec rec;
+
+				memcpy(&rec, buf + pos, sizeof(rec));
+				if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+					rec.timeline != tl)
+					return -1;
+				walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
+			}
+			else
+			{
+				WalIdxProgressRec rec;
+				uint64_t	first;
+
+				memcpy(&rec, buf + pos, sizeof(rec));
+				first = wal_log_start(tl);
+				if (walidx_progress[tl] == 0 && first != UINT64_MAX)
+					walidx_progress[tl] = first;
+				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
+					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
+					rec.start_lsn != walidx_progress[tl] ||
+					rec.end_lsn < rec.start_lsn ||
+					rec.end_lsn > wal_end_read(tl) ||
+					!wal_coverage_advance(tl, rec.start_lsn, rec.end_lsn))
+					return -1;
+				walidx_progress[tl] = rec.end_lsn;
+			}
+			pos += (int) rec_len;
+			good_off += rec_len;
+		}
+		if (pos != 0)
+		{
+			used -= pos;
+			if (used != 0)
+				memmove(buf, buf + pos, (size_t) used);
+		}
+		if (n < want)
+		{
+			if (used != 0)
+				torn = 1;
 			break;
 		}
-
-		if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
-			rec_len = sizeof(WalIdxRec);
-		else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
-				 hdr.rec_len == sizeof(WalIdxProgressRec))
-			rec_len = sizeof(WalIdxProgressRec);
-		else
-			return -1;
-
-		n = ps_storage->walidx_read(tl, shard, off, recbuf, rec_len);
-		if (n < 0)
-			return -1;
-		if (n != (int) rec_len)
-		{
-			torn = 1;
-			break;
-		}
-
-		if (hdr.magic == WALIDX_MAGIC)
-		{
-			WalIdxRec rec;
-
-			memcpy(&rec, recbuf, sizeof(rec));
-			if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
-				rec.timeline != tl)
-				return -1;
-			walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
-		}
-		else
-		{
-			WalIdxProgressRec rec;
-			uint64_t	first;
-
-			memcpy(&rec, recbuf, sizeof(rec));
-			first = wal_log_start(tl);
-			if (walidx_progress[tl] == 0 && first != UINT64_MAX)
-				walidx_progress[tl] = first;
-			if (rec.magic != WALIDX_PROGRESS_MAGIC ||
-				rec.rec_len != sizeof(rec) || rec.timeline != tl ||
-				rec.start_lsn != walidx_progress[tl] ||
-				rec.end_lsn < rec.start_lsn || rec.end_lsn > wal_end_read(tl) ||
-				!wal_range_covered(tl, rec.start_lsn, rec.end_lsn))
-				return -1;
-			walidx_progress[tl] = rec.end_lsn;
-		}
-		off += rec_len;
 	}
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
-	if (torn && ps_storage->walidx_truncate(tl, shard, off) != 0)
+	if (torn && ps_storage->walidx_truncate(tl, shard, good_off) != 0)
 		return -1;
 	return 0;
 }
@@ -2473,7 +2539,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	}
 	if (start_lsn != current || end_lsn < start_lsn ||
 		end_lsn > wal_end_read(tl) ||
-		!wal_range_covered(tl, start_lsn, end_lsn))
+		!wal_coverage_advance(tl, start_lsn, end_lsn))
 		return -1;
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = WALIDX_PROGRESS_MAGIC;
