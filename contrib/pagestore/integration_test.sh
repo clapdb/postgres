@@ -25,11 +25,16 @@ ROOT=$(dirname "$BIN")
 export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 
+SOCKROOT=$(mktemp -d /tmp/psint-sock.XXXXXX)
+new_sockdir() {
+	mktemp -d "$SOCKROOT/$1.XXXXXX"
+}
+
 DATA=$(mktemp -d)/pgdata
 TS=$(mktemp -d)/ts
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
-MAIN_SOCK=$(dirname "$DATA")/socket
+MAIN_SOCK=$(new_sockdir main)
 SHM=/psint_$$
 PORT=5432
 P="$BIN/psql -h $MAIN_SOCK -p $PORT -U postgres -tA"
@@ -89,17 +94,16 @@ cleanup() {
 	[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
-	[ -n "${KEEPTMP:-}" ] && { echo "KEEPTMP: DATA=$DATA STORE=$STORE"; return 0; }
+	[ -n "${KEEPTMP:-}" ] && { echo "KEEPTMP: DATA=$DATA STORE=$STORE SOCKROOT=$SOCKROOT"; return 0; }
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${READERDATA:+$(dirname "$READERDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
-		"${UNPREPARED:+$(dirname "$UNPREPARED")}"
+		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
 
-mkdir -p "$MAIN_SOCK"
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
@@ -547,8 +551,7 @@ rm -rf "$(dirname "$BADTARGET")"
 # unprepared copy of the parent datadir cannot boot as a branch
 UNPREPARED=$(mktemp -d)/branch
 cp -a "$BRANCHDATA" "$UNPREPARED"
-UNPREPARED_SOCK=$(dirname "$UNPREPARED")/socket
-mkdir -p "$UNPREPARED_SOCK"
+UNPREPARED_SOCK=$(new_sockdir unprepared)
 cat >> "$UNPREPARED/postgresql.conf" <<EOF
 pagestore.timeline = 1
 listen_addresses = ''
@@ -577,8 +580,7 @@ assert "$ok_install" "ok" "prepared branch install is idempotent for the same br
 # This copied parent datadir was not prepared under full routing.  With a
 # manifest installed, startup must fail closed instead of accepting a branch
 # that would leave default/global tablespaces on local md storage.
-BRANCH_SOCK=$(dirname "$BRANCHDATA")/socket
-mkdir -p "$BRANCH_SOCK"
+BRANCH_SOCK=$(new_sockdir branch)
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
 listen_addresses = ''
@@ -1233,8 +1235,7 @@ rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
-READER_SOCK=$(dirname "$READERDATA")/socket
-mkdir -p "$READER_SOCK"
+READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
 archive_mode = off
@@ -1245,8 +1246,7 @@ EOF
 # A pin without its matching artifact must fail closed at startup.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
-BADREADER_SOCK=$(dirname "$BADREADER")/socket
-mkdir -p "$BADREADER_SOCK"
+BADREADER_SOCK=$(new_sockdir badreader)
 rm "$BADREADER/pagestore_reader.manifest"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 unix_socket_directories = '$BADREADER_SOCK'
@@ -1259,8 +1259,7 @@ BADREADER=
 # A manifest without its CRC-protected running-XID snapshot is incomplete.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
-BADREADER_SOCK=$(dirname "$BADREADER")/socket
-mkdir -p "$BADREADER_SOCK"
+BADREADER_SOCK=$(new_sockdir badreader)
 rm "$BADREADER/pagestore_reader.snapshot"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 unix_socket_directories = '$BADREADER_SOCK'
@@ -1273,8 +1272,7 @@ BADREADER=
 # Corruption is detected independently of the manifest identity checks.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
-BADREADER_SOCK=$(dirname "$BADREADER")/socket
-mkdir -p "$BADREADER_SOCK"
+BADREADER_SOCK=$(new_sockdir badreader)
 printf '\001' | dd of="$BADREADER/pagestore_reader.snapshot" bs=1 seek=0 conv=notrunc status=none
 cat >> "$BADREADER/postgresql.conf" <<EOF
 unix_socket_directories = '$BADREADER_SOCK'
@@ -1288,8 +1286,7 @@ BADREADER=
 # otherwise local md pages could expose state newer than the pin.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
-BADREADER_SOCK=$(dirname "$BADREADER")/socket
-mkdir -p "$BADREADER_SOCK"
+BADREADER_SOCK=$(new_sockdir badreader)
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.route_all = off
 unix_socket_directories = '$BADREADER_SOCK'
@@ -1305,8 +1302,7 @@ echo "pagestore.route_all = on" >> "$READERDATA/postgresql.conf"
 # forged fork point.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
-BADREADER_SOCK=$(dirname "$BADREADER")/socket
-mkdir -p "$BADREADER_SOCK"
+BADREADER_SOCK=$(new_sockdir badreader)
 sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
 sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$readerR\"," \
 	"$BADREADER/pagestore_reader.manifest"
