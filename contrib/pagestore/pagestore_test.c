@@ -2817,9 +2817,15 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
 			  "WAL index progress rejects an out-of-range timeline");
 		op_wal_append(0, high, wal, 16);
-		check(op_walidx_progress(0, 350, high + 16, &progress) == 0,
-			  "WAL index progress accepts a 64-bit committed end");
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 &&
+		check(op_walidx_progress(0, 350, high + 16, &progress) != 0,
+			  "WAL index progress rejects a marker crossing unshipped WAL");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "rejected WAL index progress leaves the committed end unchanged");
+		op_create_branch(2, 0, 0);
+		op_wal_append(2, high, wal, 16);
+		check(op_walidx_progress(2, high, high + 16, &progress) == 0,
+			  "WAL index progress accepts a 64-bit LSN start");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "WAL index progress reports a 64-bit committed end");
 	}
@@ -2845,7 +2851,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 &&
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress survives daemon restart");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "64-bit WAL index progress survives daemon restart");
 	}

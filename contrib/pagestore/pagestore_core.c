@@ -2105,6 +2105,45 @@ wal_log_start(uint32_t tl)
 	return UINT64_MAX;
 }
 
+static int
+wal_range_covered(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
+{
+	uint64_t	covered = start_lsn;
+
+	if (tl >= MAX_TIMELINES)
+		return 0;
+	while (covered < end_lsn)
+	{
+		uint64_t	off = 0;
+		WalRecHdr	h;
+		int			n;
+		int			advanced = 0;
+
+		while ((n = ps_storage->wal_read(tl, off, &h, sizeof(h))) ==
+			   (int) sizeof(h))
+		{
+			uint64_t	rec_end;
+
+			if (h.magic != WAL_MAGIC)
+				return 0;
+			rec_end = h.start_lsn + h.len;
+			if (rec_end < h.start_lsn)
+				return 0;
+			if (h.start_lsn <= covered && rec_end > covered)
+			{
+				covered = rec_end;
+				advanced = 1;
+				if (covered >= end_lsn)
+					return 1;
+			}
+			off += sizeof(h) + h.len;
+		}
+		if (n < 0 || !advanced)
+			return 0;
+	}
+	return 1;
+}
+
 /*
  * Read up to 'len' WAL bytes starting at WAL position 'start' from a
  * timeline's HISTORY into 'out'; returns the number of DISTINCT bytes
@@ -2402,7 +2441,8 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 			if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 				rec.rec_len != sizeof(rec) || rec.timeline != tl ||
 				rec.start_lsn != walidx_progress[tl] ||
-				rec.end_lsn < rec.start_lsn || rec.end_lsn > wal_end_read(tl))
+				rec.end_lsn < rec.start_lsn || rec.end_lsn > wal_end_read(tl) ||
+				!wal_range_covered(tl, rec.start_lsn, rec.end_lsn))
 				return -1;
 			walidx_progress[tl] = rec.end_lsn;
 		}
@@ -2432,7 +2472,8 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 			current = first;
 	}
 	if (start_lsn != current || end_lsn < start_lsn ||
-		end_lsn > wal_end_read(tl))
+		end_lsn > wal_end_read(tl) ||
+		!wal_range_covered(tl, start_lsn, end_lsn))
 		return -1;
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = WALIDX_PROGRESS_MAGIC;
