@@ -831,6 +831,25 @@ spdk_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+spdk_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
+{
+	return PsStoragePosix.walidx_append(tl, shard, buf, len);
+}
+
+static int
+spdk_walidx_read(uint32_t tl, uint32_t shard, uint64_t off, void *buf,
+				 uint32_t len)
+{
+	return PsStoragePosix.walidx_read(tl, shard, off, buf, len);
+}
+
+static int
+spdk_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
+{
+	return PsStoragePosix.walidx_truncate(tl, shard, len);
+}
+
+static int
 spdk_meta_append(const void *buf, uint32_t len)
 {
 	return PsStoragePosix.meta_append(buf, len);
@@ -873,6 +892,9 @@ const PsStorage PsStorageSpdk = {
 	.seg_remove = NULL,
 	.wal_append = spdk_wal_append,
 	.wal_read = spdk_wal_read,
+	.walidx_append = spdk_walidx_append,
+	.walidx_read = spdk_walidx_read,
+	.walidx_truncate = spdk_walidx_truncate,
 	.meta_append = spdk_meta_append,
 	.meta_read = spdk_meta_read,
 	.fork_meta_append = spdk_fork_meta_append,

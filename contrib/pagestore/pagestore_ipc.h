@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		19	/* 19: checkpoint admission gate + barrier;
+#define PS_SHM_VERSION		20	/* 20: WAL_INDEX_PROGRESS opcode added;
+							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
 								 * 17: NBLOCKS/EXISTS honour req_lsn as an
@@ -94,6 +95,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
+	PS_OP_WAL_INDEX_PROGRESS,	/* req_lsn=start, req_seq=end; 0/0 reads end */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
 	PS_OP_ADMISSION_BARRIER,	/* out req_seq: sequence after prior mutations */
 } PsOpcode;

@@ -3,9 +3,9 @@
 # branch_boot_test.sh -- end-to-end branch compute boot through the prepared
 # branch manifest/install flow, under full routing.
 #
-# This is the successor to the old compute_on_branch_demo.sh (which switched a
-# single compute between timelines by editing pagestore.timeline in the same
-# PGDATA -- a shortcut that branch startup now fails closed on).  Here the
+# This is the successor to the old single-compute timeline-switch demo.  That
+# shortcut edited pagestore.timeline in the same PGDATA, a path that branch
+# startup now fails closed on.  Here the
 # branch is a real second compute booted the supported way:
 #
 #   - a parent runs with route_all=on over an imported store (timeline 0),
@@ -37,14 +37,21 @@ export LD_LIBRARY_PATH="$ROOT/lib:$ROOT/lib64"
 DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 
+SOCKROOT=$(mktemp -d /tmp/psbboot-sock.XXXXXX)
+new_sockdir() {
+	mktemp -d "$SOCKROOT/$1.XXXXXX"
+}
+
 DATA=$(mktemp -d)/pgdata
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo
+SOCKDIR=$(new_sockdir main)
+BRANCHSOCK=$(new_sockdir branch)
 SHM=/psbboot_$$
-PORT=54470
-PORT2=54471
-P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
-PB="$BIN/psql -h 127.0.0.1 -p $PORT2 -U postgres -tA"
+
+PORT=5432
+P="$BIN/psql -h $SOCKDIR -p $PORT -U postgres -tA"
+PB="$BIN/psql -h $BRANCHSOCK -p $PORT -U postgres -tA"
 fail=0
 
 assert() {  # $1=actual $2=expected $3=message
@@ -59,10 +66,13 @@ assert() {  # $1=actual $2=expected $3=message
 cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
-	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
+	if [ -n "${DPID:-}" ]; then
+		kill "$DPID" 2>/dev/null || true
+		wait "$DPID" 2>/dev/null || true
+	fi
 	rm -rf "$(dirname "$DATA")" "$(dirname "$STORE")" "$(dirname "$SCRATCH")" \
-		"${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
-		"${SCRATCH2:+$(dirname "$SCRATCH2")}"
+		"$BRANCHSOCK" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" "${PREP:+$(dirname "$PREP")}" \
+		"${SCRATCH2:+$(dirname "$SCRATCH2")}" "$SOCKROOT"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
@@ -87,6 +97,8 @@ pagestore.timeline = 0
 io_method = sync
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = ''
+unix_socket_directories = '$SOCKDIR'
 port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
@@ -142,7 +154,9 @@ SCRATCH2=$(mktemp -d)/walredo2
 "$BIN/initdb" -D "$SCRATCH2" -U postgres -A trust >/dev/null 2>&1
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
-port = $PORT2
+listen_addresses = ''
+unix_socket_directories = '$BRANCHSOCK'
+port = $PORT
 archive_mode = off
 pagestore.walredo_datadir = '$SCRATCH2'
 EOF

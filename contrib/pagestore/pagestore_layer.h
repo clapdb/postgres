@@ -64,6 +64,14 @@ typedef struct PsLayerDesc
 	bool		remote_durable;
 	bool		local_pinned;
 	bool		deleting;
+	/* In-memory only: canonical local cache was materialized from remote. */
+	bool		cache_resident;
+	/* Number of snapshot readers that may materialize/read the canonical cache. */
+	uint32_t	cache_readers;
+	/* DROP_LOCAL is durable but its physical unlink still needs retrying. */
+	bool		local_cleanup_pending;
+	/* In-memory only: remote GC succeeded; retry only local cleanup. */
+	bool		remote_cleanup_done;
 
 	/*
 	 * In-memory only: whether this process has verified the layer's data
@@ -177,7 +185,8 @@ extern int	ps_image_layer_read_index(const PsLayerDesc *layer,
 									  PsImgIndexEnt **out, uint32_t *n);
 /* Force a fresh data-section checksum verification (ignores cached state). */
 extern int	ps_image_layer_verify_data(const PsLayerDesc *layer,
-									  uint32_t page_size);
+								 uint32_t page_size);
+extern int	ps_delta_layer_verify_data(const PsLayerDesc *layer);
 
 /* ---------------------------------------------------------------------------
  * Delta layer file format (phase 7).
