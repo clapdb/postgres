@@ -16,11 +16,14 @@ chained hash tables:
 - fork sizes:    `(timeline, key) -> nblocks`
 - per-page WAL index: `(timeline, key, block) -> ascending list of record LSNs`
 
-Page data first lands in flat segment files (`seg_NNNNNNNN`) and is flushed into
-immutable image layers, with local compaction and segment/layer GC.  Shipped WAL
-goes to flat per-timeline logs (`wal_<tl>`).  The per-page WAL index is durably
-appended in per-(timeline, shard) logs and replayed at startup, including durable
-progress markers, but it is not yet a compacted LSM delta-layer index.
+On the POSIX daemon path, page data first lands in flat segment files
+(`seg_NNNNNNNN`) and is flushed into immutable image layers, with local
+compaction and segment/layer GC.  The SPDK daemon still serves page data from
+segment offsets (`use_layers = 0`) and has not moved onto the layer path yet.
+Shipped WAL goes to flat per-timeline logs (`wal_<tl>`).  The per-page WAL index
+is durably appended in per-(timeline, shard) logs and replayed at startup,
+including durable progress markers, but it is not yet integrated with compacted
+LSM delta layers.
 
 **Target.**  An LSM-like layered store, along the lines of Neon's pageserver:
 
@@ -103,8 +106,8 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
 ## Other known simplifications (smaller)
 
 - Relation and fork hot indexes are rebuilt on restart from durable layer,
-  segment, and fork metadata.  WAL-index records and progress are durable, but
-  compacting that history into delta layers is still future work.
+  segment, and fork metadata.  WAL-index records and progress are durable;
+  feeding that history into compacted delta layers is still future work.
 - The IPC channel uses busy-polling (no eventfd) and one copy via the channel
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon

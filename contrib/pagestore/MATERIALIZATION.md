@@ -128,8 +128,10 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
   restart-from-layers) — **done** (LSM phases 2–3).
 - `ship` wal-ingest: WAL shipping (`archive_library`) + durable per-page WAL
-  index/progress are **partial** building blocks.  Delta-layer format/read
-  planning and the continuous scanner/applicator are still future work.
+  index/progress are **partial** building blocks.  Delta-layer file primitives
+  and image-plus-delta read planning exist and are covered by
+  `pagestore_layer_test`; wiring WAL-indexed records into continuous delta-layer
+  ingest/materialization is still future work.
 - `materialize`:
   - inline-none (page-ingest) — **done** (the page is the image-layer version).
   - local-worker — **prototype exists**: `wal_only_redo_demo.sh` runs a
