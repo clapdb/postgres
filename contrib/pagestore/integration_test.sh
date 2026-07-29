@@ -29,15 +29,10 @@ DATA=$(mktemp -d)/pgdata
 TS=$(mktemp -d)/ts
 STORE=$(mktemp -d)/store
 SCRATCH=$(mktemp -d)/walredo	# private throwaway cluster for the wal-redo helper
+MAIN_SOCK=$(dirname "$DATA")/socket
 SHM=/psint_$$
-read -r PORT PORT2 PORT3 <<EOF
-$(python3 -c 'import socket; sockets=[socket.socket() for _ in range(3)]; [s.bind(("127.0.0.1", 0)) for s in sockets]; print(*(s.getsockname()[1] for s in sockets)); [s.close() for s in sockets]')
-EOF
-# PORT2 is a second compute (a branch/reader) booted on the same daemon.
-# PORT3 is isolated for startup-refusal tests.
-# connect over TCP: the server's unix-socket directory varies by build/distro,
-# but -A trust allows 127.0.0.1, so TCP is portable across environments (CI).
-P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
+PORT=5432
+P="$BIN/psql -h $MAIN_SOCK -p $PORT -U postgres -tA"
 fail=0
 
 assert() {  # $1=actual $2=expected $3=message
@@ -104,6 +99,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$MAIN_SOCK"
 mkdir -p "$TS"
 "$BIN/initdb" -D "$DATA" -U postgres -A trust >/dev/null 2>&1
 "$BIN/initdb" -D "$SCRATCH" -U postgres -A trust >/dev/null 2>&1
@@ -123,7 +119,8 @@ io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
 archive_library = 'pagestore'
-listen_addresses = '127.0.0.1'
+listen_addresses = ''
+unix_socket_directories = '$MAIN_SOCK'
 port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
@@ -550,10 +547,13 @@ rm -rf "$(dirname "$BADTARGET")"
 # unprepared copy of the parent datadir cannot boot as a branch
 UNPREPARED=$(mktemp -d)/branch
 cp -a "$BRANCHDATA" "$UNPREPARED"
+UNPREPARED_SOCK=$(dirname "$UNPREPARED")/socket
+mkdir -p "$UNPREPARED_SOCK"
 cat >> "$UNPREPARED/postgresql.conf" <<EOF
 pagestore.timeline = 1
-listen_addresses = '127.0.0.1'
-port = $PORT2
+listen_addresses = ''
+unix_socket_directories = '$UNPREPARED_SOCK'
+port = $PORT
 archive_mode = off
 EOF
 if "$BIN/pg_ctl" -D "$UNPREPARED" -l "$UNPREPARED/server.log" -w start >/dev/null 2>&1; then
@@ -577,10 +577,13 @@ assert "$ok_install" "ok" "prepared branch install is idempotent for the same br
 # This copied parent datadir was not prepared under full routing.  With a
 # manifest installed, startup must fail closed instead of accepting a branch
 # that would leave default/global tablespaces on local md storage.
+BRANCH_SOCK=$(dirname "$BRANCHDATA")/socket
+mkdir -p "$BRANCH_SOCK"
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 1
-listen_addresses = '127.0.0.1'
-port = $PORT2
+listen_addresses = ''
+unix_socket_directories = '$BRANCH_SOCK'
+port = $PORT
 archive_mode = off
 EOF
 if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
@@ -785,7 +788,7 @@ $P -c "SELECT pagestore_ship_slru_snapshot('pg_commit_ts', '$mxC');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$mxC');" >/dev/null
 $P -c "SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$mxC');" >/dev/null
 # session A holds a FOR SHARE lock across the second locker
-("$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres -tA \
+("$BIN/psql" -h "$MAIN_SOCK" -p $PORT -U postgres -tA \
 	-c "BEGIN; SELECT id FROM mx WHERE id=1 FOR SHARE; SELECT pg_sleep(8); COMMIT;" >/dev/null 2>&1) &
 mxlocker=$!
 # wait until A actually holds the ROW lock -- its xid lands in the tuple's xmax -- rather
@@ -942,6 +945,9 @@ mv "$PREPSEED/pagestore_branch.manifest.good" "$PREPSEED/pagestore_branch.manife
 cp "$PREPSEED/pagestore_branch.manifest" "$BRANCHDATA/pagestore_branch.manifest"
 cat >> "$BRANCHDATA/postgresql.conf" <<EOF
 pagestore.timeline = 2
+listen_addresses = ''
+unix_socket_directories = '$BRANCH_SOCK'
+port = $PORT
 EOF
 if "$BIN/pg_ctl" -D "$BRANCHDATA" -l "$BRANCHDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "FAIL - branch startup accepted a manifest without full routing"
@@ -1227,17 +1233,24 @@ rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
+READER_SOCK=$(dirname "$READERDATA")/socket
+mkdir -p "$READER_SOCK"
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
 archive_mode = off
-listen_addresses = '127.0.0.1'
-port = $PORT2
+listen_addresses = ''
+unix_socket_directories = '$READER_SOCK'
+port = $PORT
 EOF
 # A pin without its matching artifact must fail closed at startup.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(dirname "$BADREADER")/socket
+mkdir -p "$BADREADER_SOCK"
 rm "$BADREADER/pagestore_reader.manifest"
-echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
@@ -1246,8 +1259,12 @@ BADREADER=
 # A manifest without its CRC-protected running-XID snapshot is incomplete.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(dirname "$BADREADER")/socket
+mkdir -p "$BADREADER_SOCK"
 rm "$BADREADER/pagestore_reader.snapshot"
-echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_snapshot_started=1 || pin_snapshot_started=0
 assert "$pin_snapshot_started" "0" "pinned start without a running-XID snapshot is refused"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
@@ -1256,8 +1273,12 @@ BADREADER=
 # Corruption is detected independently of the manifest identity checks.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(dirname "$BADREADER")/socket
+mkdir -p "$BADREADER_SOCK"
 printf '\001' | dd of="$BADREADER/pagestore_reader.snapshot" bs=1 seek=0 conv=notrunc status=none
-echo "port = $PORT3" >> "$BADREADER/postgresql.conf"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_snapshot_crc_started=1 || pin_snapshot_crc_started=0
 assert "$pin_snapshot_crc_started" "0" "pinned start with a corrupt running-XID snapshot is refused"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
@@ -1267,9 +1288,11 @@ BADREADER=
 # otherwise local md pages could expose state newer than the pin.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(dirname "$BADREADER")/socket
+mkdir -p "$BADREADER_SOCK"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.route_all = off
-port = $PORT3
+unix_socket_directories = '$BADREADER_SOCK'
 EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_route_started=1 || pin_route_started=0
 assert "$pin_route_started" "0" "pinned start without full store routing is refused"
@@ -1282,12 +1305,14 @@ echo "pagestore.route_all = on" >> "$READERDATA/postgresql.conf"
 # forged fork point.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(dirname "$BADREADER")/socket
+mkdir -p "$BADREADER_SOCK"
 sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
 sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$readerR\"," \
 	"$BADREADER/pagestore_reader.manifest"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.timeline = 1
-port = $PORT3
+unix_socket_directories = '$BADREADER_SOCK'
 EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_branch_started=1 || pin_branch_started=0
 assert "$pin_branch_started" "0" "pinned branch reader rejects forged ancestry at startup"
@@ -1301,7 +1326,7 @@ if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/n
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
-PR="$BIN/psql -X -h 127.0.0.1 -At -p $PORT2 -U postgres postgres"
+PR="$BIN/psql -X -h $READER_SOCK -At -p $PORT -U postgres postgres"
 if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	echo "FAIL - prepared reader did not accept connections"
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
