@@ -366,6 +366,24 @@ posix_seg_size(uint32_t shard, int seg)
 	return (int64_t) st.st_size;
 }
 
+static void
+posix_wal_rollback(const char *path, int fd, off_t oldsz, int created)
+{
+	if (ftruncate(fd, oldsz) == 0)
+		(void) fsync(fd);
+	close(fd);
+	if (created && oldsz == 0 && unlink(path) == 0)
+	{
+		int		dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+
+		if (dfd >= 0)
+		{
+			(void) fsync(dfd);
+			close(dfd);
+		}
+	}
+}
+
 static int
 posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 			 const void *b, uint32_t blen)
@@ -387,7 +405,7 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		return -1;
 	if (fstat(fd, &st) != 0)
 	{
-		close(fd);
+		posix_wal_rollback(path, fd, 0, created);
 		return -1;
 	}
 	oldsz = st.st_size;
@@ -395,9 +413,7 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		(blen > 0 && write(fd, b, blen) != (ssize_t) blen) ||
 		fsync(fd) != 0)
 	{
-		if (ftruncate(fd, oldsz) == 0)
-			(void) fsync(fd);
-		close(fd);
+		posix_wal_rollback(path, fd, oldsz, created);
 		return -1;
 	}
 	if (created)
@@ -407,9 +423,7 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 		{
 			if (dfd >= 0)
 				close(dfd);
-			if (ftruncate(fd, oldsz) == 0)
-				(void) fsync(fd);
-			close(fd);
+			posix_wal_rollback(path, fd, oldsz, created);
 			return -1;
 		}
 		close(dfd);
