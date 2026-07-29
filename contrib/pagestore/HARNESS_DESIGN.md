@@ -6,12 +6,13 @@
 The focused C unit tests check layer, manifest, cache, and GC invariants.
 `integration_test.sh` proves several PostgreSQL-facing paths end to end.
 `harness/pagestore_harness.py` now provides the first reusable runner: it
-validates JSONL plans, owns private test environments, captures replayable
-run roots, runs daemon-smoke and writer-smoke scenarios, and can wrap the
-legacy integration script in a failure bundle.  It is not yet the full semantic
-harness described below: generated workloads, controlled faults, branch plans,
-redo/materialization comparisons, shrinking, and compatibility fixtures remain
-future work.
+validates the basic JSONL schema and some boundary references, owns private
+test environments, captures diagnostic run roots, runs daemon-smoke and
+writer-smoke modes, and can wrap the legacy integration script in a failure
+bundle.  It is not yet the full semantic harness described below: full
+mode-specific plan validation, per-action timeouts, replay commands, generated
+workloads, controlled faults, branch plans, redo/materialization comparisons,
+shrinking, and compatibility fixtures remain future work.
 
 This document specifies that harness.  Its job is to find semantic regressions
 in the page-store contract, not to replace PostgreSQL's regression suite or to
@@ -45,16 +46,22 @@ to observe state newer than its horizon.
 
 The host-side executable is `contrib/pagestore/harness/pagestore_harness.py`,
 with only the Python standard library.  It receives capability metadata and a
-scenario plan; runtime smoke modes also receive the Meson build directory and
-the daemon/inspector binaries.  It owns temporary directories,
-daemon/PostgreSQL lifecycle, timeouts, capture of diagnostic artifacts, and,
-for future generated scenarios, deterministic scheduling.
+scenario plan for `--validate`, `--list`, `--daemon-smoke`, and
+`--writer-smoke`.  Runtime modes then add the inputs they actually need:
+`--daemon-smoke` takes daemon and inspector binaries, `--writer-smoke` also
+takes the Meson build directory, and `--legacy-integration` takes the Meson
+build directory plus the legacy script path.  It owns temporary directories,
+daemon/PostgreSQL lifecycle, and capture of diagnostic artifacts.  Full
+per-action timeout enforcement, complete replay metadata, and deterministic
+scheduling are still future generated-scenario work.
 
 Use JSON Lines for plans rather than YAML.  It is dependency-free, easy to
 generate or shrink, and each action is independently visible in failure logs.
 A scenario is a sequence of operations plus assertions, with one explicit
-integer seed.  The runner prints every operation as JSON Lines and copies the
-plan into the failure bundle, so a failing seed is replayable with one command.
+integer seed.  The runner emits operation events as JSON Lines and copies the
+plan into diagnostic run roots.  A future replay mode must also record the
+exact invocation, build revision, runtime paths, and environment needed to
+recreate a failing run with one command.
 
 ```text
 scenario JSONL + seed
@@ -523,12 +530,15 @@ advancing durable horizon.
 
 ## Implementation sequence
 
-0. [done] Define the read-only test IPC schema and capability manifest; validate
-   both with daemon and pure runner tests.
-1. [done] Add the Python coordinator with private environments, lifecycle
-   management, JSONL validation/event logging, timeouts, and failure bundles.
-   Current smoke coverage includes daemon readiness, writer lifecycle/readers,
-   and the legacy integration bundle bridge.
+0. [partial] Define the read-only test IPC schema and capability manifest.
+   The schema is versioned and pure runner tests cover basic parsing; validating
+   advertised executable capabilities against each runtime is still future work.
+1. [partial] Add the Python coordinator with private environments, lifecycle
+   management, JSONL validation/event logging, and diagnostic failure bundles.
+   Current automated smoke coverage includes daemon readiness and the writer
+   lifecycle/reader scenario; the legacy integration bridge is available as a
+   manual bundle wrapper.  Full mode-specific validation, per-action/run
+   timeouts, and replay-command metadata are still future work.
 2. Add checkpoint records and SQL/metadata/visibility oracles.  Port the
    current reader R test, including running-XID and oversized-subxid cases, and
    add the local-control differential trace.
