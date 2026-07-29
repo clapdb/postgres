@@ -804,6 +804,34 @@ op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 
 /* --- shipped-WAL operations --- */
 
+#define TEST_WAL_MAGIC	0x57414c52
+
+static void
+write_torn_wal_header(const char *store, uint32_t tl, uint64_t start_lsn,
+					  uint32_t len)
+{
+	struct
+	{
+		uint32_t	magic;
+		uint32_t	len;
+		uint64_t	start_lsn;
+	}			h;
+	char		path[512];
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/wal_%u", store, tl);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	check(fd >= 0, "test creates a torn WAL log");
+	if (fd < 0)
+		return;
+	h.magic = TEST_WAL_MAGIC;
+	h.len = len;
+	h.start_lsn = start_lsn;
+	check(write(fd, &h, sizeof(h)) == (ssize_t) sizeof(h) && fsync(fd) == 0,
+		  "test writes a WAL header without its payload");
+	check(close(fd) == 0, "test closes the torn WAL log");
+}
+
 /* Append len WAL bytes at start_lsn on a timeline. */
 static void
 op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
@@ -891,6 +919,22 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	n = (int) cl_exec()->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
+}
+
+static int
+op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end, uint64_t *progress)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int			ok;
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = start;
+	ch->req_seq = end;
+	ok = cl_exec()->status == PS_STATUS_OK;
+	if (ok && progress)
+		*progress = ch->req_lsn;
+	return ok ? 0 : -1;
 }
 
 /* ===================== page helpers ==================================== */
@@ -2759,6 +2803,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	pid_t		dpid;
 	uint32_t	ps = 8192;
 	PsWalRec	out[16];
+	unsigned char wal[512] = {0};
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
@@ -2770,6 +2815,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	op_wal_append(0, 0, wal, sizeof(wal));
 
 	/* block 0 changed by records at LSN 100, 200, 300; block 1 at 150 */
 	op_walidx_add(0, REL_A, FORK0, 0, 100);
@@ -2788,10 +2834,35 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 350, &progress) == 0,
+			  "contiguous indexed WAL interval commits a durable progress marker");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress reports the committed end");
+		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
+			  "WAL index progress rejects an out-of-range timeline");
+		op_wal_append(0, high, wal, 16);
+		check(op_walidx_progress(0, 350, high + 16, &progress) != 0,
+			  "WAL index progress rejects a marker crossing unshipped WAL");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "rejected WAL index progress leaves the committed end unchanged");
+		op_create_branch(2, 0, 0);
+		op_wal_append(2, high, wal, 16);
+		check(op_walidx_progress(2, high, high + 16, &progress) == 0,
+			  "WAL index progress accepts a 64-bit LSN start");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "WAL index progress reports a 64-bit committed end");
+		op_create_branch(3, 0, 0);
+	}
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();
 	stop_daemon(dpid);
+	write_torn_wal_header(store, 3, 0x100000000ULL, 16);
 	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
 	shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
@@ -2806,6 +2877,18 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
 	check(n == 1 && out[0].lsn == 150,
 		  "restart replays WAL index records without duplicating them");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress survives daemon restart");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "64-bit WAL index progress survives daemon restart");
+		check(op_walidx_progress(3, high, high + 16, &progress) != 0,
+			  "WAL index progress rejects WAL with a missing payload");
+	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);

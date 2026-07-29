@@ -366,22 +366,69 @@ posix_seg_size(uint32_t shard, int seg)
 	return (int64_t) st.st_size;
 }
 
+static void
+posix_wal_rollback(const char *path, int fd, off_t oldsz, int created)
+{
+	if (ftruncate(fd, oldsz) == 0)
+		(void) fsync(fd);
+	close(fd);
+	if (created && oldsz == 0 && unlink(path) == 0)
+	{
+		int		dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+
+		if (dfd >= 0)
+		{
+			(void) fsync(dfd);
+			close(dfd);
+		}
+	}
+}
+
 static int
 posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 			 const void *b, uint32_t blen)
 {
 	char		path[4096];
 	int		fd;
+	int		dfd;
+	int		created = 0;
+	struct stat st;
+	off_t		oldsz;
 
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
-	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_EXCL, 0600);
+	if (fd >= 0)
+		created = 1;
+	else if (errno == EEXIST)
+		fd = open(path, O_WRONLY | O_APPEND);
 	if (fd < 0)
 		return -1;
-	if (write(fd, a, alen) != (ssize_t) alen ||
-		(blen > 0 && write(fd, b, blen) != (ssize_t) blen))
+	if (fstat(fd, &st) != 0)
 	{
 		close(fd);
+		if (created)
+			unlink(path);
 		return -1;
+	}
+	oldsz = st.st_size;
+	if (write(fd, a, alen) != (ssize_t) alen ||
+		(blen > 0 && write(fd, b, blen) != (ssize_t) blen) ||
+		fsync(fd) != 0)
+	{
+		posix_wal_rollback(path, fd, oldsz, created);
+		return -1;
+	}
+	if (created)
+	{
+		dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+		if (dfd < 0 || fsync(dfd) != 0)
+		{
+			if (dfd >= 0)
+				close(dfd);
+			posix_wal_rollback(path, fd, oldsz, created);
+			return -1;
+		}
+		close(dfd);
 	}
 	close(fd);
 	return 0;
