@@ -2789,6 +2789,24 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
 
+	/* The index is durable independently of the daemon's in-memory hash tables. */
+	client_detach();
+	stop_daemon(dpid);
+	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
+		  "enable short log reads during WAL index recovery");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	unsetenv("PAGESTORE_TEST_MAX_LOG_READ");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
+	check(n == 3 && out[0].lsn == 100 && out[2].lsn == 300,
+		  "WAL index survives daemon restart");
+	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
+	check(n == 1 && out[0].lsn == 150,
+		  "restart replays WAL index records without duplicating them");
+
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);
 	op_walidx_add(1, REL_A, FORK0, 0, 400);

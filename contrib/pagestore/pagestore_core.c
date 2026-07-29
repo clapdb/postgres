@@ -2193,8 +2193,22 @@ wal_recover_one(uint32_t tl)
  * records whose LSNs fall after it and <= L.  Populated by decoding shipped WAL
  * (next milestone); queried via PS_OP_WAL_INDEX_GET.
  *
- * In-memory only for now (rebuilt by re-decoding WAL after a restart).
+ * Each successful index addition is also appended to a per-timeline durable
+ * log.  Restart replays that log; a later indexer can therefore resume from a
+ * durable boundary instead of treating a daemon restart as an empty index.
  */
+#define WALIDX_MAGIC	0x57494458	/* "WIDX" */
+
+typedef struct WalIdxRec
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	timeline;
+	uint32_t	block;
+	uint64_t	lsn;
+	PsKey		key;
+} WalIdxRec;
+
 typedef struct WalIdxEnt
 {
 	struct WalIdxEnt *next;
@@ -2206,8 +2220,39 @@ typedef struct WalIdxEnt
 	int			cap;
 } WalIdxEnt;
 
+static WalIdxEnt *
+walidx_find(uint32_t tl, const PsKey *key, uint32_t block)
+{
+	uint32_t	h = page_hash(tl, key, block);
+	Shard	   *s = shard_for(key);
+	WalIdxEnt  *e;
+
+	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
+		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
+			return e;
+	return NULL;
+}
+
+static int
+walidx_lower_bound(const WalIdxEnt *e, uint64_t lsn)
+{
+	int		lo = 0;
+	int		hi = e ? e->n : 0;
+
+	while (lo < hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+
+		if (e->lsns[mid] < lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static void
-walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
@@ -2215,9 +2260,7 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 
 	timeline_mark_used(tl);
 
-	for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
-		if (e->timeline == tl && e->block == block && key_eq(&e->key, key))
-			break;
+	e = walidx_find(tl, key, block);
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
@@ -2232,21 +2275,86 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 		e->cap = e->cap ? e->cap * 2 : 4;
 		e->lsns = realloc(e->lsns, (size_t) e->cap * sizeof(uint64_t));
 	}
-	/* keep ascending; WAL is appended in LSN order, so usually just append */
-	if (e->n == 0 || lsn >= e->lsns[e->n - 1])
-		e->lsns[e->n++] = lsn;
-	else
 	{
-		int			i = e->n;
+		int i = walidx_lower_bound(e, lsn);
 
-		while (i > 0 && e->lsns[i - 1] > lsn)
-		{
-			e->lsns[i] = e->lsns[i - 1];
-			i--;
-		}
+		if (i < e->n && e->lsns[i] == lsn)
+			return;
+		memmove(&e->lsns[i + 1], &e->lsns[i],
+				(size_t) (e->n - i) * sizeof(uint64_t));
 		e->lsns[i] = lsn;
 		e->n++;
 	}
+}
+
+static int
+walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	WalIdxRec	rec;
+	WalIdxEnt  *e;
+	uint32_t	shard;
+	int			pos;
+
+	if (tl >= MAX_TIMELINES)
+		return -1;
+	e = walidx_find(tl, key, block);
+	if (e)
+	{
+		pos = walidx_lower_bound(e, lsn);
+		if (pos < e->n && e->lsns[pos] == lsn)
+			return 0;
+	}
+	shard = ps_shard_of(key);
+	rec.magic = WALIDX_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.timeline = tl;
+	rec.block = block;
+	rec.lsn = lsn;
+	rec.key = *key;
+	if (ps_storage->walidx_append(tl, shard, &rec, sizeof(rec)) != 0)
+		return -1;
+	walidx_add_memory(tl, key, block, lsn);
+	return 0;
+}
+
+static int
+walidx_recover_one(uint32_t tl, uint32_t shard)
+{
+	uint64_t	off = 0;
+	WalIdxRec	recs[64];
+	int			n;
+	int			i;
+	int			torn = 0;
+
+	for (;;)
+	{
+		n = ps_storage->walidx_read(tl, shard, off, recs, sizeof(recs));
+		if (n == 0)
+			break;
+		/* A missing per-timeline log is an empty index; other I/O errors are
+		 * not safe to mask, including at offset zero. */
+		if (n < 0)
+			return errno == ENOENT ? 0 : -1;
+		if (n % (int) sizeof(WalIdxRec) != 0)
+			torn = 1;
+		for (i = 0; i < n / (int) sizeof(WalIdxRec); i++)
+		{
+			WalIdxRec *rec = &recs[i];
+
+			/* A complete malformed record is corruption, not a torn suffix. */
+			if (rec->magic != WALIDX_MAGIC ||
+				rec->rec_len != sizeof(*rec) || rec->timeline != tl)
+				return -1;
+			walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+		}
+		off += (uint64_t) (n / (int) sizeof(WalIdxRec)) * sizeof(WalIdxRec);
+		if (torn || n < (int) sizeof(recs))
+			break;
+	}
+	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
+	if (torn && ps_storage->walidx_truncate(tl, shard, off) != 0)
+		return -1;
+	return 0;
 }
 
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
@@ -3493,7 +3601,8 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_INDEX_ADD:
-			walidx_add(tl, &ch->key, ch->blocknum, ch->req_lsn);
+			if (walidx_add(tl, &ch->key, ch->blocknum, ch->req_lsn) != 0)
+				ch->status = PS_STATUS_ERROR;
 			break;
 
 		case PS_OP_WAL_INDEX_GET:
@@ -4242,7 +4351,12 @@ ps_core_open(const char *store_dir)
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (tl == 0 || timelines[tl].defined)
+		{
 			wal_recover_one(tl);
+			for (uint32_t shard = 0; shard < core_shards(); shard++)
+				if (walidx_recover_one(tl, shard) != 0)
+					return -1;
+		}
 
 	return 0;
 }
