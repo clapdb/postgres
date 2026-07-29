@@ -32,9 +32,10 @@ WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 
 D=$(mktemp -d)/pgdata
 S=$(mktemp -d)/store
+SOCKDIR=$(mktemp -d /tmp/psredo-sock.XXXXXX)
 SHM=/psredo_$$
-PORT=54470
-P="$BIN/psql -h 127.0.0.1 -p $PORT -U postgres -tA"
+PORT=5432
+P="$BIN/psql -h $SOCKDIR -p $PORT -U postgres -tA"
 
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
@@ -78,8 +79,11 @@ wait_postgres_ready() {
 
 cleanup() {
 	"$BIN/pg_ctl" -D "$D" -m immediate -w stop >/dev/null 2>&1 || true
-	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
-	rm -rf "$(dirname "$D")" "$(dirname "$S")"
+	if [ -n "${DPID:-}" ]; then
+		kill "$DPID" 2>/dev/null || true
+		wait "$DPID" 2>/dev/null || true
+	fi
+	rm -rf "$(dirname "$D")" "$(dirname "$S")" "$SOCKDIR"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
@@ -100,6 +104,8 @@ io_method = sync
 recovery_prefetch = off
 archive_mode = on
 archive_library = 'pagestore'
+listen_addresses = ''
+unix_socket_directories = '$SOCKDIR'
 port = $PORT
 EOF
 
@@ -112,7 +118,7 @@ fi
 wait_postgres_ready
 $P -c "CREATE TABLE t(id int primary key, v text); INSERT INTO t VALUES (1,'base');" >/dev/null
 # write the backup label straight into PGDATA (unquoted heredoc expands $D)
-"$BIN/psql" -h 127.0.0.1 -p $PORT -U postgres >/dev/null <<SQL
+"$BIN/psql" -h "$SOCKDIR" -p $PORT -U postgres >/dev/null <<SQL
 SELECT pg_backup_start('b', fast => true);
 \a
 \t on
