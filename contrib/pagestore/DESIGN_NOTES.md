@@ -9,17 +9,18 @@ The test direction and rollout plan are in [HARNESS_DESIGN.md](HARNESS_DESIGN.md
 
 ## 1. Storage & indexes should become LSM-like
 
-**Current.**  The daemon keeps its metadata as plain in-memory chained hash
-tables:
+**Current.**  The daemon still keeps hot lookup state in plain in-memory
+chained hash tables:
 
 - page versions: `(timeline, key, block) -> list of {lsn, segment, offset}`
 - fork sizes:    `(timeline, key) -> nblocks`
 - per-page WAL index: `(timeline, key, block) -> ascending list of record LSNs`
 
-Page data is appended to flat segment files (`seg_NNNNNNNN`); shipped WAL goes to
-flat per-timeline logs (`wal_<tl>`).  There is **no compaction and no GC**: the
-version lists and the per-page LSN lists grow without bound, and the indexes are
-rebuilt by scanning everything on restart.
+Page data first lands in flat segment files (`seg_NNNNNNNN`) and is flushed into
+immutable image layers, with local compaction and segment/layer GC.  Shipped WAL
+goes to flat per-timeline logs (`wal_<tl>`).  The per-page WAL index is durably
+appended in per-(timeline, shard) logs and replayed at startup, including durable
+progress markers, but it is not yet a compacted LSM delta-layer index.
 
 **Target.**  An LSM-like layered store, along the lines of Neon's pageserver:
 
@@ -101,9 +102,9 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
 
 ## Other known simplifications (smaller)
 
-- Relation and fork indexes are rebuilt on restart.  The per-page WAL index is
-  durably appended in per-(timeline, shard) logs and replayed at startup;
-  compaction of that history is still a future maintenance task.
+- Relation and fork hot indexes are rebuilt on restart from durable layer,
+  segment, and fork metadata.  WAL-index records and progress are durable, but
+  compacting that history into delta layers is still future work.
 - The IPC channel uses busy-polling (no eventfd) and one copy via the channel
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon

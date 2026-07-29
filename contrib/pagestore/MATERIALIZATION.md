@@ -127,9 +127,9 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
   `LSM_OBJECT_STORAGE_PLAN.md` phases 4–6).
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
   restart-from-layers) — **done** (LSM phases 2–3).
-- `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +
-  delta-layer format + read plan — **partial** (7a/7b done; continuous WAL ship
-  + auto-index still a worker).
+- `ship` wal-ingest: WAL shipping (`archive_library`) + durable per-page WAL
+  index/progress are **partial** building blocks.  Delta-layer format/read
+  planning and the continuous scanner/applicator are still future work.
 - `materialize`:
   - inline-none (page-ingest) — **done** (the page is the image-layer version).
   - local-worker — **prototype exists**: `wal_only_redo_demo.sh` runs a
