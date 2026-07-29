@@ -893,16 +893,20 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	return n;
 }
 
-static uint32_t
-op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end)
+static int
+op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end, uint64_t *progress)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int			ok;
 
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->req_lsn = start;
 	ch->req_seq = end;
-	return cl_exec()->status == PS_STATUS_OK ? (uint32_t) ch->req_lsn : UINT32_MAX;
+	ok = cl_exec()->status == PS_STATUS_OK;
+	if (ok && progress)
+		*progress = ch->req_lsn;
+	return ok ? 0 : -1;
 }
 
 /* ===================== page helpers ==================================== */
@@ -2802,12 +2806,23 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
-	check(op_walidx_progress(0, 0, 350) != UINT32_MAX,
-		  "contiguous indexed WAL interval commits a durable progress marker");
-	check(op_walidx_progress(0, 0, 0) == 350,
-		  "WAL index progress reports the committed end");
-	check(op_walidx_progress(UINT32_MAX, 0, 0) == UINT32_MAX,
-		  "WAL index progress rejects an out-of-range timeline");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 350, &progress) == 0,
+			  "contiguous indexed WAL interval commits a durable progress marker");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress reports the committed end");
+		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
+			  "WAL index progress rejects an out-of-range timeline");
+		op_wal_append(0, high, wal, 16);
+		check(op_walidx_progress(0, 350, high + 16, &progress) == 0,
+			  "WAL index progress accepts a 64-bit committed end");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "WAL index progress reports a 64-bit committed end");
+	}
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
 	client_detach();
@@ -2826,8 +2841,14 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
 	check(n == 1 && out[0].lsn == 150,
 		  "restart replays WAL index records without duplicating them");
-	check(op_walidx_progress(0, 0, 0) == 350,
-		  "WAL index progress survives daemon restart");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "64-bit WAL index progress survives daemon restart");
+	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);

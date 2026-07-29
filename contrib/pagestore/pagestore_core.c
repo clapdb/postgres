@@ -2340,74 +2340,73 @@ static int
 walidx_recover_one(uint32_t tl, uint32_t shard)
 {
 	uint64_t	off = 0;
-	/* 10240 is a multiple of both current fixed record sizes (40 and 32). */
-	unsigned char	buf[10240];
 	int			n;
-	int			pos;
 	int			torn = 0;
 
 	for (;;)
 	{
-		n = ps_storage->walidx_read(tl, shard, off, buf, sizeof(buf));
+		WalIdxLogHdr hdr;
+		uint32_t	rec_len;
+		unsigned char recbuf[sizeof(WalIdxRec) > sizeof(WalIdxProgressRec) ?
+							 sizeof(WalIdxRec) : sizeof(WalIdxProgressRec)];
+
+		n = ps_storage->walidx_read(tl, shard, off, &hdr, sizeof(hdr));
 		if (n == 0)
 			break;
 		/* A missing per-timeline log is an empty index; other I/O errors are
 		 * not safe to mask, including at offset zero. */
 		if (n < 0)
 			return errno == ENOENT ? 0 : -1;
-		pos = 0;
-		while (pos < n)
+		if (n != (int) sizeof(hdr))
 		{
-			WalIdxLogHdr hdr;
-
-			if (n - pos < (int) sizeof(hdr))
-			{
-				torn = 1;
-				break;
-			}
-			memcpy(&hdr, buf + pos, sizeof(hdr));
-			if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
-			{
-				WalIdxRec rec;
-
-				if (n - pos < (int) sizeof(rec))
-				{
-					torn = 1;
-					break;
-				}
-				memcpy(&rec, buf + pos, sizeof(rec));
-				if (rec.timeline != tl)
-					return -1;
-				walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
-				pos += sizeof(rec);
-			}
-			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
-					 hdr.rec_len == sizeof(WalIdxProgressRec))
-			{
-				WalIdxProgressRec rec;
-				uint64_t	first;
-
-				if (n - pos < (int) sizeof(rec))
-				{
-					torn = 1;
-					break;
-				}
-				memcpy(&rec, buf + pos, sizeof(rec));
-				first = wal_log_start(tl);
-				if (walidx_progress[tl] == 0 && first != UINT64_MAX)
-					walidx_progress[tl] = first;
-				if (rec.timeline != tl || rec.start_lsn != walidx_progress[tl] ||
-					rec.end_lsn < rec.start_lsn || rec.end_lsn > wal_end_read(tl))
-					return -1;
-				walidx_progress[tl] = rec.end_lsn;
-				pos += sizeof(rec);
-			}
-			else
-				return -1;
-		}
-		off += (uint64_t) pos;
-		if (torn || n < (int) sizeof(buf))
+			torn = 1;
 			break;
+		}
+
+		if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
+			rec_len = sizeof(WalIdxRec);
+		else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
+				 hdr.rec_len == sizeof(WalIdxProgressRec))
+			rec_len = sizeof(WalIdxProgressRec);
+		else
+			return -1;
+
+		n = ps_storage->walidx_read(tl, shard, off, recbuf, rec_len);
+		if (n < 0)
+			return -1;
+		if (n != (int) rec_len)
+		{
+			torn = 1;
+			break;
+		}
+
+		if (hdr.magic == WALIDX_MAGIC)
+		{
+			WalIdxRec rec;
+
+			memcpy(&rec, recbuf, sizeof(rec));
+			if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+				rec.timeline != tl)
+				return -1;
+			walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
+		}
+		else
+		{
+			WalIdxProgressRec rec;
+			uint64_t	first;
+
+			memcpy(&rec, recbuf, sizeof(rec));
+			first = wal_log_start(tl);
+			if (walidx_progress[tl] == 0 && first != UINT64_MAX)
+				walidx_progress[tl] = first;
+			if (rec.magic != WALIDX_PROGRESS_MAGIC ||
+				rec.rec_len != sizeof(rec) || rec.timeline != tl ||
+				rec.start_lsn != walidx_progress[tl] ||
+				rec.end_lsn < rec.start_lsn || rec.end_lsn > wal_end_read(tl))
+				return -1;
+			walidx_progress[tl] = rec.end_lsn;
+		}
+		off += rec_len;
 	}
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
 	if (torn && ps_storage->walidx_truncate(tl, shard, off) != 0)
