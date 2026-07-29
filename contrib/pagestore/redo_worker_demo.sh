@@ -52,7 +52,7 @@ wait_daemon_ready() {
 				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
 			)
 			[ "$magic" = "$((0x50414753))" ] &&
-				[ "$version" = 19 ] && [ "$page_size" = 8192 ] &&
+				[ "$version" = 20 ] && [ "$page_size" = 8192 ] &&
 				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&
 				[ "$nshards" = 1 ] && return 0
 		fi
