@@ -202,16 +202,30 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "process_stop")
 
     def test_writer_smoke_requires_runtime_binaries_and_build_dir(self):
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            with self.assertRaises(SystemExit) as raised:
-                MODULE.parse_args([
-                    "--capabilities", str(ROOT / "capabilities.json"),
-                    "--writer-smoke", str(ROOT / "scenarios" / "writer_lifecycle.jsonl"),
-                ])
+        prerequisites = [
+            ("--build-dir", "build"),
+            ("--daemon-binary", "daemon"),
+            ("--inspect-binary", "inspect"),
+        ]
+        base_args = [
+            "--capabilities", str(ROOT / "capabilities.json"),
+            "--writer-smoke", str(ROOT / "scenarios" / "writer_lifecycle.jsonl"),
+        ]
 
-        self.assertNotEqual(raised.exception.code, 0)
-        self.assertIn("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary",
-                      stderr.getvalue())
+        for missing, _ in prerequisites:
+            with self.subTest(missing=missing):
+                args = list(base_args)
+                for option, value in prerequisites:
+                    if option != missing:
+                        args.extend([option, value])
+
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        MODULE.parse_args(args)
+
+                self.assertNotEqual(raised.exception.code, 0)
+                self.assertIn("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary",
+                              stderr.getvalue())
 
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()
