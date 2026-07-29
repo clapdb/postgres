@@ -32,7 +32,7 @@ WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 
 D=$(mktemp -d)/pgdata
 S=$(mktemp -d)/store
-SOCKDIR=$(dirname "$D")/socket
+SOCKDIR=$(mktemp -d /tmp/psredo-sock.XXXXXX)
 SHM=/psredo_$$
 PORT=5432
 P="$BIN/psql -h $SOCKDIR -p $PORT -U postgres -tA"
@@ -83,12 +83,12 @@ cleanup() {
 		kill "$DPID" 2>/dev/null || true
 		wait "$DPID" 2>/dev/null || true
 	fi
-	rm -rf "$(dirname "$D")" "$(dirname "$S")"
+	rm -rf "$(dirname "$D")" "$(dirname "$S")" "$SOCKDIR"
 	rm -f "/dev/shm$SHM"
 }
 trap cleanup EXIT
 
-mkdir -p "$S" "$SOCKDIR"
+mkdir -p "$S"
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null 2>&1
 "$DAEMON" --shm "$SHM" --store "$S" >>"$D/daemon.log" 2>&1 &
 DPID=$!
