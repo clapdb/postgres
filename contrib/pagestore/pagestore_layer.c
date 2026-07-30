@@ -721,10 +721,12 @@ ps_delta_layer_verify_data(const PsLayerDesc *layer)
 		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
 								 &foot, sizeof(foot)) != 0 ||
 		foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
+		foot.index_off > UINT32_MAX ||
 		foot.index_off > loc->size - sizeof(foot))
 		return -1;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
-	if (idx_bytes > loc->size - sizeof(foot) - foot.index_off)
+	if (idx_bytes > UINT32_MAX ||
+		idx_bytes > loc->size - sizeof(foot) - foot.index_off)
 		return -1;
 	idx = malloc((size_t) idx_bytes);
 	if (!idx || ps_layer_store->read_layer_block(layer, foot.index_off, idx,

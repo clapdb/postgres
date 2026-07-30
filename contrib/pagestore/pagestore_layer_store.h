@@ -38,6 +38,7 @@ typedef struct PsLayerStore
 	int			(*delete_local_layer) (const PsLayerDesc *layer);
 	int			(*delete_remote_layer) (const PsLayerDesc *layer);
 	int			(*layer_exists_remote) (const PsLayerDesc *layer);
+	int			(*verify_remote_layer) (const PsLayerDesc *layer);
 } PsLayerStore;
 
 extern const PsLayerStore PsLayerStoreLocal;

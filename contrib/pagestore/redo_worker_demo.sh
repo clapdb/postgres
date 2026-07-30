@@ -49,9 +49,12 @@ wait_daemon_ready() {
 			exit 1
 		fi
 		if [ -r "$shm_path" ]; then
-			read -r magic version page_size io_unit nchannels nshards < <(
+			if ! read -r magic version page_size io_unit nchannels nshards < <(
 				od -An -tu4 -N24 -w24 "$shm_path" 2>/dev/null
-			)
+			); then
+				sleep 0.05
+				continue
+			fi
 			[ "$magic" = "$((0x50414753))" ] &&
 				[ "$version" = 20 ] && [ "$page_size" = 8192 ] &&
 				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&

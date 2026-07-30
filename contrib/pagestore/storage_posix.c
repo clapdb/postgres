@@ -465,6 +465,24 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+posix_wal_truncate(uint32_t tl, uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	int			rc = 0;
+
+	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return errno == ENOENT && len == 0 ? 0 : -1;
+	if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
+		rc = -1;
+	if (close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
 posix_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
 {
 	char		name[64];
@@ -814,6 +832,7 @@ const PsStorage PsStoragePosix = {
 	.seg_remove = posix_seg_remove,
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
+	.wal_truncate = posix_wal_truncate,
 	.walidx_append = posix_walidx_append,
 	.walidx_read = posix_walidx_read,
 	.walidx_truncate = posix_walidx_truncate,

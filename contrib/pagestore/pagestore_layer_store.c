@@ -100,11 +100,30 @@ claim_object_dir(void)
 			unlink(idtmp);
 			return -1;
 		}
-		if (close(fd) != 0 || rename(idtmp, idpath) != 0 || fsync_dir(layer_dir) != 0)
+		if (close(fd) != 0)
 		{
 			unlink(idtmp);
 			return -1;
 		}
+		if (link(idtmp, idpath) != 0)
+		{
+			if (errno != EEXIST)
+			{
+				unlink(idtmp);
+				return -1;
+			}
+			unlink(idtmp);
+			fd = open(idpath, O_RDONLY);
+			if (fd < 0)
+				return -1;
+			len = read(fd, owner, sizeof(owner) - 1);
+			close(fd);
+			if (len <= 0)
+				return -1;
+			owner[len] = '\0';
+		}
+		else if (unlink(idtmp) != 0 || fsync_dir(layer_dir) != 0)
+			return -1;
 	}
 	else
 		return -1;
@@ -172,6 +191,7 @@ local_open(const char *store_dir)
 	struct stat store_st;
 	struct stat object_st;
 	int			n;
+	char		probe[PS_LAYER_URI_MAX];
 
 	n = snprintf(layer_dir, sizeof(layer_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(layer_dir))
@@ -189,6 +209,9 @@ local_open(const char *store_dir)
 		stat(object_dir, &object_st) != 0 || !S_ISDIR(object_st.st_mode) ||
 		(store_st.st_dev == object_st.st_dev &&
 		 store_st.st_ino == object_st.st_ino) ||
+		snprintf(probe, sizeof(probe), "%s/layer_%d_%016llx", object_dir,
+				 PS_MAX_CHANNELS - 1, (unsigned long long) UINT64_MAX) >=
+		(int) sizeof(probe) ||
 		claim_object_dir() != 0 || cleanup_stale_copy_temps(object_dir) != 0)
 		return -1;
 	return 0;
@@ -557,13 +580,19 @@ local_location(const PsLayerDesc *layer)
 static int
 local_refresh_layer_cache(const PsLayerDesc *layer)
 {
+	const PsLayerLocation *local_loc;
 	char		local[4096];
 
-	/* Never replace an original manifest-owned local layer: only a remote-only
-	 * descriptor may have the disposable canonical read cache. */
-	if (local_location(layer) != NULL || remote_location(layer) == NULL ||
+	local_loc = local_location(layer);
+	/* Before upload durability, a manifest-owned local layer is the only source
+	 * of truth.  After remote durability, the verified remote object may repair
+	 * the still-present local copy. */
+	if ((local_loc != NULL && !layer->remote_durable) ||
+		remote_location(layer) == NULL ||
 		local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
 		return -1;
+	if (local_loc != NULL)
+		snprintf(local, sizeof(local), "%s", local_loc->uri);
 	if (unlink(local) != 0 && errno != ENOENT)
 		return -1;
 	return local_download_layer(layer);
@@ -604,7 +633,6 @@ local_upload_layer(const PsLayerDesc *layer)
 		(published == NULL && object_layer_path(layer->layer_id, remote, sizeof(remote)) != 0) ||
 		(published != NULL && snprintf(remote, sizeof(remote), "%s", published->uri) >= (int) sizeof(remote)))
 		return -1;
-	/* The manifest's declared length is the minimum identity available here. */
 	{
 		struct stat st;
 
@@ -612,6 +640,20 @@ local_upload_layer(const PsLayerDesc *layer)
 			(uint64_t) st.st_size != source->size)
 			return -1;
 	}
+	if (layer->kind == PS_LAYER_IMAGE)
+	{
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+		int			rc;
+
+		rc = ps_image_layer_read_index(layer, &idx, &nidx);
+		free(idx);
+		if (rc != 0 || ps_image_layer_verify_data(layer, layer_page_size) != 0)
+			return -1;
+	}
+	else if (layer->kind == PS_LAYER_DELTA &&
+			 ps_delta_layer_verify_data(layer) != 0)
+		return -1;
 	if (copy_file_atomic(source->uri, remote, object_dir) != 0)
 		return -1;
 	{
@@ -744,6 +786,42 @@ local_layer_exists_remote(const PsLayerDesc *layer)
 	return errno == ENOENT ? 0 : -1;
 }
 
+static int
+local_verify_remote_layer(const PsLayerDesc *layer)
+{
+	const PsLayerLocation *location;
+	PsLayerDesc remote_only;
+	char		expected[4096];
+	struct stat st;
+
+	location = remote_location(layer);
+	if (location == NULL ||
+		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||
+		strcmp(location->uri, expected) != 0 ||
+		stat(expected, &st) != 0 || st.st_size < 0 ||
+		(uint64_t) st.st_size != location->size)
+		return -1;
+	remote_only = *layer;
+	remote_only.location_count = 1;
+	remote_only.locations[0] = *location;
+	remote_only.locations[0].tier = PS_LAYER_TIER_LOCAL_COLD;
+	if (layer->kind == PS_LAYER_IMAGE)
+	{
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+		int			rc;
+
+		rc = ps_image_layer_read_index(&remote_only, &idx, &nidx);
+		free(idx);
+		if (rc != 0)
+			return -1;
+		return ps_image_layer_verify_data(&remote_only, layer_page_size);
+	}
+	if (layer->kind == PS_LAYER_DELTA)
+		return ps_delta_layer_verify_data(&remote_only);
+	return -1;
+}
+
 const PsLayerStore PsLayerStoreLocal = {
 	.name = "local",
 	.open = local_open,
@@ -760,4 +838,5 @@ const PsLayerStore PsLayerStoreLocal = {
 	.delete_local_layer = local_delete_local_layer,
 	.delete_remote_layer = local_delete_remote_layer,
 	.layer_exists_remote = local_layer_exists_remote,
+	.verify_remote_layer = local_verify_remote_layer,
 };

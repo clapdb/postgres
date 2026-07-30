@@ -434,12 +434,12 @@ shard_worker(void *arg)
 				did_work = 1;
 		}
 
-		if (!did_work && shard == 0)
+		if (shard == 0)
 		{
 			/* maintenance takes the shard + map locks it needs internally */
 			int			do_maint = ps_core_maintenance();
 
-			if (!do_maint)
+			if (!did_work && !do_maint)
 			{
 				struct timespec ts = {0, 20000};	/* 20us */
 

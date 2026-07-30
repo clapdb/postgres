@@ -67,6 +67,7 @@ typedef struct PsStorage
 	int			(*wal_append) (uint32_t tl, const void *a, uint32_t alen,
 							   const void *b, uint32_t blen);
 	int			(*wal_read) (uint32_t tl, uint64_t off, void *buf, uint32_t len);
+	int			(*wal_truncate) (uint32_t tl, uint64_t len);
 
 	/* Per-(timeline, shard) durable per-page WAL index records. */
 	int			(*walidx_append) (uint32_t tl, uint32_t shard,

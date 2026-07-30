@@ -167,6 +167,38 @@ main(void)
 		check(r == 0 && dn == 1 && outs[0].lsn == 150, "delta collect other block");
 	}
 
+	{
+		PsLayerDesc huge;
+		PsDeltaFooter foot;
+		char		uri[PS_LAYER_URI_MAX];
+		uint64_t	size = (uint64_t) UINT32_MAX + 1 + sizeof(foot);
+		int			fd;
+
+		memset(&huge, 0, sizeof(huge));
+		memset(&foot, 0, sizeof(foot));
+		foot.magic = PS_DELTA_MAGIC;
+		foot.version = PS_DELTA_VERSION;
+		foot.index_off = (uint64_t) UINT32_MAX + 1;
+		check(ps_layer_store->create_local_layer(11, uri, sizeof(uri)) == 0,
+			  "create oversized delta layer shell");
+		fd = open(uri, O_WRONLY);
+		check(fd >= 0 &&
+			  pwrite(fd, &foot, sizeof(foot),
+					 (off_t) (size - sizeof(foot))) == (ssize_t) sizeof(foot) &&
+			  close(fd) == 0,
+			  "write sparse oversized delta footer");
+		huge.layer_id = 11;
+		huge.kind = PS_LAYER_DELTA;
+		huge.location_count = 1;
+		huge.locations[0].tier = PS_LAYER_TIER_LOCAL_HOT;
+		huge.locations[0].available = true;
+		huge.locations[0].size = size;
+		snprintf(huge.locations[0].uri, sizeof(huge.locations[0].uri), "%s", uri);
+		check(ps_delta_layer_verify_data(&huge) != 0,
+			  "delta verifier rejects sections above the 32-bit read limit");
+		unlink(uri);
+	}
+
 	/* --- read plan: base image + ordered delta chain --- */
 	{
 		PsLayerDesc img,

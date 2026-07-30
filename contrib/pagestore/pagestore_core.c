@@ -31,7 +31,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -84,6 +86,10 @@ static volatile int gc_remote_state; /* 0 idle, 1 running, 2 remote success, 3 f
 static uint64_t gc_remote_layer_cursor;
 static uint32_t gc_remote_map_cursor;
 static struct timespec gc_remote_retry_at;
+static pthread_t evict_local_thread;
+static PsLayerDesc evict_local_candidate;
+static volatile int evict_local_state; /* 0 idle, 1 verifying, 2 verified, 3 failed */
+static uint32_t evict_local_map_cursor;
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -272,6 +278,188 @@ layer_local_id(uint64_t layer_id)
 	return layer_id & LAYER_ID_LOCAL_MASK;
 }
 
+static int
+layer_matches_read_shard(const PsLayerDesc *layer, uint32_t shard)
+{
+	uint32_t	layer_shard = layer_shard_from_id(layer->layer_id);
+
+	return layer_shard == shard ||
+		(layer->legacy_shard_zero && layer_shard == 0 && shard != 0);
+}
+
+static int
+store_shard_count_path(const char *store_dir, char *path, size_t path_len)
+{
+	int			n;
+
+	n = snprintf(path, path_len, "%s/.pagestore-nshards", store_dir);
+	return n < 0 || (size_t) n >= path_len ? -1 : 0;
+}
+
+static int
+fsync_dir_path(const char *path)
+{
+	int			fd = open(path, O_RDONLY | O_DIRECTORY);
+	int			rc = 0;
+
+	if (fd < 0)
+		return -1;
+	if (fsync(fd) != 0)
+		rc = -1;
+	if (close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
+publish_store_shard_count(const char *store_dir)
+{
+	char		path[4096];
+	char		tmp[4096];
+	FILE	   *f;
+	uint32_t	current = core_shards();
+	int			n;
+
+	if (store_shard_count_path(store_dir, path, sizeof(path)) != 0)
+		return -1;
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long) getpid());
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+	f = fopen(tmp, "w");
+	if (f == NULL)
+		return -1;
+	if (fprintf(f, "%u\n", current) < 0 || fflush(f) != 0 ||
+		fsync(fileno(f)) != 0)
+	{
+		fclose(f);
+		unlink(tmp);
+		return -1;
+	}
+	if (fclose(f) != 0)
+	{
+		unlink(tmp);
+		return -1;
+	}
+	if (rename(tmp, path) != 0)
+	{
+		unlink(tmp);
+		return -1;
+	}
+	if (fsync_dir_path(store_dir) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+parse_segment_file_shard(const char *name, uint32_t *shard)
+{
+	const char *p;
+	char	   *end;
+	unsigned long first;
+
+	if (strncmp(name, "seg_", 4) != 0)
+		return 0;
+	p = name + 4;
+	errno = 0;
+	first = strtoul(p, &end, 10);
+	if (end == p || errno != 0 || first > UINT32_MAX)
+		return 0;
+	if (*end == '\0')
+	{
+		*shard = 0;
+		return 1;
+	}
+	if (*end != '_')
+		return 0;
+	p = end + 1;
+	errno = 0;
+	(void) strtoul(p, &end, 10);
+	if (end == p || errno != 0 || *end != '\0')
+		return 0;
+	*shard = (uint32_t) first;
+	return 1;
+}
+
+static int
+infer_segment_shard_count(const char *store_dir, uint32_t *inferred)
+{
+	DIR		   *dir;
+	struct dirent *ent;
+	uint32_t	found = *inferred;
+
+	dir = opendir(store_dir);
+	if (dir == NULL)
+		return -1;
+	while ((ent = readdir(dir)) != NULL)
+	{
+		uint32_t	shard;
+
+		if (parse_segment_file_shard(ent->d_name, &shard))
+		{
+			if (shard >= PS_MAX_CHANNELS)
+				found = PS_MAX_CHANNELS + 1;
+			else if (shard + 1 > found)
+				found = shard + 1;
+		}
+	}
+	if (closedir(dir) != 0)
+		return -1;
+	*inferred = found;
+	return 0;
+}
+
+static int
+validate_store_shard_count(const char *store_dir, int *publish_needed)
+{
+	char		path[4096];
+	FILE	   *f;
+	uint32_t	current = core_shards();
+	uint32_t	persisted = 0;
+	uint32_t	inferred = 1;
+	int			have_persisted = 0;
+
+	*publish_needed = 0;
+	if (store_shard_count_path(store_dir, path, sizeof(path)) != 0)
+		return -1;
+	f = fopen(path, "r");
+	if (f != NULL)
+	{
+		if (fscanf(f, "%u", &persisted) == 1 && persisted > 0 &&
+			persisted <= PS_MAX_CHANNELS)
+			have_persisted = 1;
+		fclose(f);
+		if (!have_persisted)
+			return -1;
+	}
+	else if (errno != ENOENT)
+		return -1;
+
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		uint32_t	shard = layer_shard_from_id(ps_layer_map.layers[i].layer_id);
+
+		if (shard + 1 > inferred)
+			inferred = shard + 1;
+	}
+	for (uint32_t shard = 0; shard < PS_MAX_CHANNELS; shard++)
+	{
+		PsFlushWatermark watermark;
+
+		if (ps_manifest_get_flush_watermark(shard, &watermark) &&
+			shard + 1 > inferred)
+			inferred = shard + 1;
+	}
+	if (!have_persisted && infer_segment_shard_count(store_dir, &inferred) != 0)
+		return -1;
+	if (have_persisted && persisted != 1 && persisted != current)
+		return -1;
+	if (!have_persisted && inferred != 1 && inferred != current)
+		return -1;
+	if (!have_persisted || persisted != current)
+		*publish_needed = 1;
+	return 0;
+}
+
 static uint64_t
 layer_id(uint32_t shard, uint64_t local_id)
 {
@@ -358,6 +546,35 @@ record_layer(void *ctx, const PsLayerDesc *desc)
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
 	return ps_manifest_add_layer(desc);
+}
+
+static int
+mark_legacy_shard_zero_layers(void)
+{
+	if (core_shards() <= 1)
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+		int			legacy = 0;
+
+		if (layer->kind != PS_LAYER_IMAGE || layer->deleting ||
+			layer_shard_from_id(layer->layer_id) != 0)
+			continue;
+		if (read_image_index_refreshing(layer, &idx, &nidx) != 0)
+			return -1;
+		for (uint32_t j = 0; j < nidx; j++)
+			if (ps_key_shard(&idx[j].key, core_shards()) != 0)
+			{
+				legacy = 1;
+				break;
+			}
+		free(idx);
+		layer->legacy_shard_zero = legacy != 0;
+	}
+	return 0;
 }
 
 static int
@@ -518,10 +735,14 @@ static void *
 gc_remote_worker(void *arg)
 {
 	PsLayerDesc *layer = arg;
+	int old_state;
 	int rc;
 
-	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
 	rc = ps_layer_store->delete_remote_layer(layer);
+	pthread_setcancelstate(old_state, NULL);
+	pthread_testcancel();
 
 	__atomic_store_n(&gc_remote_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
 	return NULL;
@@ -724,6 +945,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 
 		if (read_image_index_refreshing(&old[k], &idx, &n) != 0)
 			goto cleanup;
+		if (verify_image_layer_refreshing(&old[k]) != 0)
+		{
+			free(idx);
+			goto cleanup;
+		}
 		for (uint32_t j = 0; j < n; j++)
 		{
 			unsigned char *pg;
@@ -776,7 +1002,12 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 	/* install the new merged layer durably, THEN delete the old ones */
 	nid = alloc_layer_id(&g_shards[shard]);
 	if (ps_image_layer_write(nid, timeline, recs, nrec, page_size,
-							 &newdesc) != 0 || record_layer(NULL, &newdesc) != 0)
+							 &newdesc) != 0)
+		goto cleanup;
+	for (uint32_t k = 0; k < nold; k++)
+		if (old[k].legacy_shard_zero)
+			newdesc.legacy_shard_zero = true;
+	if (record_layer(NULL, &newdesc) != 0)
 		goto cleanup;
 	for (uint32_t k = 0; k < nold; k++)
 	{
@@ -825,6 +1056,77 @@ cleanup:
 	free(recs);
 	free(pages);
 	free(old);
+	return rc;
+}
+
+static int
+materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
+{
+	PsLayerDesc *layers = NULL;
+	uint32_t	nlayers = 0;
+	int			rc = -1;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			d->timeline == timeline && layer_shard_from_id(d->layer_id) == shard)
+		{
+			PsLayerDesc *nlayers_ptr;
+
+			nlayers_ptr = realloc(layers, (size_t) (nlayers + 1) * sizeof(*layers));
+			if (nlayers_ptr == NULL)
+			{
+				ps_unlock_map();
+				goto out;
+			}
+			layers = nlayers_ptr;
+			layers[nlayers++] = *d;
+			__atomic_add_fetch(&d->cache_readers, 1, __ATOMIC_ACQ_REL);
+		}
+	}
+	ps_unlock_map();
+	if (nlayers == 0)
+	{
+		free(layers);
+		return 0;
+	}
+
+	for (uint32_t i = 0; i < nlayers; i++)
+	{
+		PsImgIndexEnt *idx = NULL;
+		uint32_t	nidx = 0;
+
+		if (read_image_index_refreshing(&layers[i], &idx, &nidx) != 0 ||
+			verify_image_layer_refreshing(&layers[i]) != 0)
+		{
+			free(idx);
+			goto out;
+		}
+		free(idx);
+	}
+	rc = 0;
+
+out:
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < nlayers; i++)
+		for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
+			if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
+			{
+				__atomic_sub_fetch(&ps_layer_map.layers[j].cache_readers, 1,
+								   __ATOMIC_ACQ_REL);
+				if (layers[i].data_verified)
+					ps_layer_map.layers[j].data_verified = true;
+				if (tier_local_location(&ps_layer_map.layers[j]) == NULL &&
+					ps_layer_store->layer_exists_local != NULL &&
+					ps_layer_store->layer_exists_local(layers[i].layer_id) == 1)
+					ps_layer_map.layers[j].cache_resident = true;
+				break;
+			}
+	ps_unlock_map();
+	free(layers);
 	return rc;
 }
 
@@ -2262,20 +2564,38 @@ static void
 wal_recover_one(uint32_t tl)
 {
 	uint64_t	off = 0;
+	uint64_t	good_off = 0;
 	WalRecHdr	h;
+	unsigned char byte;
+	int			truncate_needed = 0;
+	int			nread;
 
 	if (tl >= MAX_TIMELINES)
 		return;
-	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
-		   h.magic == WAL_MAGIC)
+	while ((nread = ps_storage->wal_read(tl, off, &h, sizeof(h))) ==
+		   (int) sizeof(h))
 	{
+		if (h.magic != WAL_MAGIC)
+			break;
+		if (h.len > 0 &&
+			ps_storage->wal_read(tl, off + sizeof(h) + h.len - 1,
+								 &byte, 1) != 1)
+		{
+			truncate_needed = 1;
+			break;
+		}
 		if (h.start_lsn + h.len > wal_end_read(tl))
 		{
 			timeline_mark_used(tl);
 			wal_end_advance(tl, h.start_lsn + h.len);
 		}
 		off += sizeof(h) + h.len;
+		good_off = off;
 	}
+	if (nread > 0 && nread < (int) sizeof(h))
+		truncate_needed = 1;
+	if (truncate_needed && ps_storage->wal_truncate)
+		(void) ps_storage->wal_truncate(tl, good_off);
 }
 
 /* ===================== per-page WAL index ============================== */
@@ -2304,6 +2624,8 @@ typedef struct WalIdxRec
 {
 	uint32_t	magic;
 	uint32_t	rec_len;
+	uint32_t	crc;
+	uint32_t	pad;
 	uint32_t	timeline;
 	uint32_t	block;
 	uint64_t	lsn;
@@ -2314,13 +2636,83 @@ typedef struct WalIdxProgressRec
 {
 	uint32_t	magic;
 	uint32_t	rec_len;
-	uint32_t	timeline;
+	uint32_t	crc;
 	uint32_t	pad;
+	uint32_t	timeline;
+	uint32_t	pad2;
 	uint64_t	start_lsn;
 	uint64_t	end_lsn;
+	uint64_t	shard_mask[2];
+	uint64_t	shard_offsets[PS_MAX_CHANNELS];
 } WalIdxProgressRec;
 
 static uint64_t walidx_progress[MAX_TIMELINES];
+static uint64_t walidx_shards_seen[MAX_TIMELINES][2];
+static uint64_t walidx_shards_required[MAX_TIMELINES][2];
+static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
+static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
+static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static uint32_t
+walidx_rec_crc(WalIdxRec *rec)
+{
+	uint32_t	save = rec->crc;
+	uint32_t	crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+static uint32_t
+walidx_progress_crc(WalIdxProgressRec *rec)
+{
+	uint32_t	save = rec->crc;
+	uint32_t	crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+static void
+walidx_mark_shard(uint64_t mask[2], uint32_t shard)
+{
+	if (shard < PS_MAX_CHANNELS)
+		mask[shard / 64] |= UINT64_C(1) << (shard % 64);
+}
+
+static int
+walidx_shard_marked(const uint64_t mask[2], uint32_t shard)
+{
+	return shard < PS_MAX_CHANNELS &&
+		(mask[shard / 64] & (UINT64_C(1) << (shard % 64))) != 0;
+}
+
+static int
+walidx_mask_valid_for_shards(const uint64_t mask[2])
+{
+	uint32_t	ns = core_shards();
+
+	for (uint32_t shard = ns; shard < PS_MAX_CHANNELS; shard++)
+		if (walidx_shard_marked(mask, shard))
+			return 0;
+	return 1;
+}
+
+static int
+walidx_offsets_valid_for_shards(const uint64_t offsets[PS_MAX_CHANNELS])
+{
+	uint32_t	ns = core_shards();
+
+	for (uint32_t shard = ns; shard < PS_MAX_CHANNELS; shard++)
+		if (offsets[shard] != 0)
+			return 0;
+	return 1;
+}
 
 typedef struct WalIdxEnt
 {
@@ -2407,6 +2799,7 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	WalIdxEnt  *e;
 	uint32_t	shard;
 	int			pos;
+	int			rc = -1;
 
 	if (tl >= MAX_TIMELINES)
 		return -1;
@@ -2420,14 +2813,28 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	shard = ps_shard_of(key);
 	rec.magic = WALIDX_MAGIC;
 	rec.rec_len = sizeof(rec);
+	rec.crc = 0;
+	rec.pad = 0;
 	rec.timeline = tl;
 	rec.block = block;
 	rec.lsn = lsn;
 	rec.key = *key;
+	rec.crc = walidx_rec_crc(&rec);
+	pthread_rwlock_rdlock(&walidx_publish_lock);
 	if (ps_storage->walidx_append(tl, shard, &rec, sizeof(rec)) != 0)
+	{
+		pthread_rwlock_unlock(&walidx_publish_lock);
 		return -1;
-	walidx_add_memory(tl, key, block, lsn);
-	return 0;
+	}
+	pthread_mutex_lock(&walidx_meta_lock);
+	walidx_shard_offsets_seen[tl][shard] += sizeof(rec);
+	walidx_mark_shard(walidx_shards_seen[tl], shard);
+	rc = 0;
+	pthread_mutex_unlock(&walidx_meta_lock);
+	pthread_rwlock_unlock(&walidx_publish_lock);
+	if (rc == 0)
+		walidx_add_memory(tl, key, block, lsn);
+	return rc;
 }
 
 static int
@@ -2453,10 +2860,13 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				torn = 1;
 			break;
 		}
-		/* A missing per-timeline log is an empty index; other I/O errors are
-		 * not safe to mask, including at offset zero. */
 		if (n < 0)
-			return errno == ENOENT ? 0 : -1;
+		{
+			if (errno == ENOENT &&
+				!walidx_shard_marked(walidx_shards_required[tl], shard))
+				return 0;
+			return -1;
+		}
 		read_off += (uint64_t) n;
 		used += n;
 
@@ -2482,8 +2892,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 
 				memcpy(&rec, buf + pos, sizeof(rec));
 				if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
-					rec.timeline != tl)
+					rec.timeline != tl || rec.crc != walidx_rec_crc(&rec))
 					return -1;
+				walidx_mark_shard(walidx_shards_seen[tl], shard);
 				walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
 			}
 			else
@@ -2497,11 +2908,21 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 					walidx_progress[tl] = first;
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
+					rec.crc != walidx_progress_crc(&rec) ||
 					rec.start_lsn != walidx_progress[tl] ||
 					rec.end_lsn < rec.start_lsn ||
 					rec.end_lsn > wal_end_read(tl) ||
+					!walidx_mask_valid_for_shards(rec.shard_mask) ||
+					!walidx_offsets_valid_for_shards(rec.shard_offsets) ||
 					!wal_coverage_advance(tl, rec.start_lsn, rec.end_lsn))
 					return -1;
+				walidx_shards_required[tl][0] |= rec.shard_mask[0];
+				walidx_shards_required[tl][1] |= rec.shard_mask[1];
+				for (uint32_t i = 0; i < core_shards(); i++)
+					if (rec.shard_offsets[i] >
+						walidx_shard_offsets_required[tl][i])
+						walidx_shard_offsets_required[tl][i] =
+							rec.shard_offsets[i];
 				walidx_progress[tl] = rec.end_lsn;
 			}
 			pos += (int) rec_len;
@@ -2520,6 +2941,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 			break;
 		}
 	}
+	if (good_off < walidx_shard_offsets_required[tl][shard])
+		return -1;
+	walidx_shard_offsets_seen[tl][shard] = good_off;
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
 	if (torn && ps_storage->walidx_truncate(tl, shard, good_off) != 0)
 		return -1;
@@ -2532,10 +2956,14 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	WalIdxProgressRec rec;
 	uint64_t	current;
 	uint64_t	first;
+	int			rc = -1;
+	int			append_progress = 0;
 
 	/* A durable marker must name a contiguous prefix of shipped WAL. */
 	if (tl >= MAX_TIMELINES)
 		return -1;
+	pthread_rwlock_wrlock(&walidx_publish_lock);
+	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
 	if (current == 0)
 	{
@@ -2546,17 +2974,65 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	if (start_lsn != current || end_lsn < start_lsn ||
 		end_lsn > wal_end_read(tl) ||
 		!wal_coverage_advance(tl, start_lsn, end_lsn))
-		return -1;
+		goto out;
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = WALIDX_PROGRESS_MAGIC;
 	rec.rec_len = sizeof(rec);
+	rec.crc = 0;
 	rec.timeline = tl;
 	rec.start_lsn = current;
 	rec.end_lsn = end_lsn;
-	if (ps_storage->walidx_append(tl, 0, &rec, sizeof(rec)) != 0)
+	rec.shard_mask[0] = walidx_shards_seen[tl][0];
+	rec.shard_mask[1] = walidx_shards_seen[tl][1];
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+		rec.shard_offsets[shard] = walidx_shard_offsets_seen[tl][shard];
+	rec.crc = walidx_progress_crc(&rec);
+	append_progress = 1;
+out:
+	pthread_mutex_unlock(&walidx_meta_lock);
+	if (!append_progress)
+	{
+		pthread_rwlock_unlock(&walidx_publish_lock);
 		return -1;
-	walidx_progress[tl] = end_lsn;
-	return 0;
+	}
+	if (ps_storage->walidx_append(tl, 0, &rec, sizeof(rec)) != 0)
+	{
+		pthread_rwlock_unlock(&walidx_publish_lock);
+		return -1;
+	}
+	pthread_mutex_lock(&walidx_meta_lock);
+	current = walidx_progress[tl];
+	if (current == 0)
+	{
+		first = wal_log_start(tl);
+		if (first != UINT64_MAX)
+			current = first;
+	}
+	if (current != rec.start_lsn)
+		goto out_update;
+	walidx_shard_offsets_seen[tl][0] += sizeof(rec);
+	walidx_shards_required[tl][0] |= rec.shard_mask[0];
+	walidx_shards_required[tl][1] |= rec.shard_mask[1];
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+		if (rec.shard_offsets[shard] > walidx_shard_offsets_required[tl][shard])
+			walidx_shard_offsets_required[tl][shard] = rec.shard_offsets[shard];
+	walidx_progress[tl] = rec.end_lsn;
+	rc = 0;
+out_update:
+	pthread_mutex_unlock(&walidx_meta_lock);
+	pthread_rwlock_unlock(&walidx_publish_lock);
+	return rc;
+}
+
+static uint64_t
+walidx_progress_read(uint32_t tl)
+{
+	uint64_t	progress;
+
+	pthread_mutex_lock(&walidx_meta_lock);
+	progress = walidx_progress[tl];
+	pthread_mutex_unlock(&walidx_meta_lock);
+	return progress;
 }
 
 /* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
@@ -2909,6 +3385,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	best = 0;
 	uint64_t	best_seq = 0;
 	uint64_t	best_layer = 0;
+	uint32_t	shard = ps_shard_of(key);
 
 	if (!tmp)
 		return 0;
@@ -2921,6 +3398,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 		for (uint32_t i = 0; i < nlayers; i++)
 			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
 				ps_layer_map.layers[i].timeline == timeline &&
+				layer_matches_read_shard(&ps_layer_map.layers[i], shard) &&
 				!ps_layer_map.layers[i].deleting)
 				__atomic_add_fetch(&ps_layer_map.layers[i].cache_readers, 1,
 							   __ATOMIC_ACQ_REL);
@@ -2943,7 +3421,8 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 					a;
 		int			lookup;
 
-		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline || d->deleting)
+		if (d->kind != PS_LAYER_IMAGE || d->timeline != timeline ||
+			!layer_matches_read_shard(d, shard) || d->deleting)
 			continue;
 		if (expected_lsn != 0 &&
 			(expected_lsn < d->lsn_start || expected_lsn > d->lsn_end))
@@ -2971,7 +3450,7 @@ layer_map_lookup(uint32_t timeline, const PsKey *key, uint32_t block,
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < nlayers; i++)
 		if (layers[i].kind == PS_LAYER_IMAGE && layers[i].timeline == timeline &&
-			!layers[i].deleting)
+			layer_matches_read_shard(&layers[i], shard) && !layers[i].deleting)
 			for (uint32_t j = 0; j < ps_layer_map.nlayers; j++)
 				if (ps_layer_map.layers[j].layer_id == layers[i].layer_id)
 				{
@@ -3417,10 +3896,15 @@ recover_layer_prefix(uint32_t shard)
 			free(verify);
 		}
 		free(idx);
-		/* Recovery needs only the index entries already copied above.  Do not
-		 * retain every remote-only layer's materialized cache until all shards
-		 * replay, which can exceed local capacity on restart. */
+		/*
+		 * Recovery needs only the index entries already copied above.  Reclaim a
+		 * remote-only layer's materialized cache only after revalidating the
+		 * object: if the object disappeared or rotted while the daemon was down,
+		 * the canonical cache may be the only readable copy left.
+		 */
 		if (tier_local_location(d) == NULL &&
+			ps_layer_store->verify_remote_layer != NULL &&
+			ps_layer_store->verify_remote_layer(d) == 0 &&
 			ps_layer_store->delete_local_layer(d) != 0)
 			goto fail;
 	}
@@ -3812,8 +4296,8 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 			else if (ch->req_lsn == 0 && ch->req_seq == 0)
 			{
-				uint64_t first = walidx_progress[tl] == 0 ?
-					wal_log_start(tl) : walidx_progress[tl];
+				uint64_t progress = walidx_progress_read(tl);
+				uint64_t first = progress == 0 ? wal_log_start(tl) : progress;
 
 				ch->req_lsn = first == UINT64_MAX ? 0 : first;
 			}
@@ -3864,6 +4348,8 @@ ps_core_close(void)
 	uint32_t	ns = core_shards();
 	int		join_gc = 0;
 	int		cancel_upload = 0;
+	int		join_evict = 0;
+	int		evict_state;
 	struct timespec deadline;
 	int		join_rc;
 
@@ -3887,6 +4373,13 @@ ps_core_close(void)
 		tier_upload_joined = 1;
 		/* Persist a completed upload before closing its manifest. */
 		tier_one_layer();
+	}
+	evict_state = __atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE);
+	if (evict_state != 0)
+	{
+		if (evict_state == 1)
+			pthread_cancel(evict_local_thread);
+		join_evict = 1;
 	}
 
 	/*
@@ -3945,6 +4438,18 @@ ps_core_close(void)
 		}
 		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
 	}
+	if (join_evict)
+	{
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec++;
+		join_rc = pthread_timedjoin_np(evict_local_thread, NULL, &deadline);
+		if (join_rc != 0)
+		{
+			fprintf(stderr, "pagestore_daemon: FATAL: local eviction verifier did not stop during shutdown\n");
+			_exit(EXIT_FAILURE);
+		}
+	}
+	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	ps_manifest_close();
 }
 
@@ -3964,7 +4469,72 @@ segment_has_references(uint32_t source_shard, uint32_t victim)
 }
 
 static int
-verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
+prepare_segment_layers(uint32_t source_shard, uint32_t victim)
+{
+	PsLayerDesc *layers = NULL;
+	uint32_t	nlayers = 0;
+	int			rc = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *d = &ps_layer_map.layers[i];
+
+		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			layer_shard_from_id(d->layer_id) == source_shard)
+			nlayers++;
+	}
+	if (nlayers != 0)
+	{
+		layers = malloc((size_t) nlayers * sizeof(*layers));
+		if (layers == NULL)
+		{
+			ps_unlock_map();
+			return -1;
+		}
+		nlayers = 0;
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsLayerDesc *d = &ps_layer_map.layers[i];
+
+			if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+				layer_shard_from_id(d->layer_id) == source_shard)
+				layers[nlayers++] = *d;
+		}
+	}
+	ps_unlock_map();
+
+	for (uint32_t i = 0; i < nlayers; i++)
+	{
+		PsImgIndexEnt *idx;
+		uint32_t	n;
+		int			covers = 0;
+
+		if (read_image_index_refreshing(&layers[i], &idx, &n) != 0)
+		{
+			rc = -1;
+			break;
+		}
+		for (uint32_t j = 0; j < n; j++)
+			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) &&
+				idx[j].seg_id == victim)
+			{
+				covers = 1;
+				break;
+			}
+		free(idx);
+		if (covers && verify_image_layer_refreshing(&layers[i]) != 0)
+		{
+			rc = -1;
+			break;
+		}
+	}
+	free(layers);
+	return rc;
+}
+
+static int
+verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_layer)
 {
 	int			found = 0;
 
@@ -3978,7 +4548,7 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
 			layer_shard_from_id(d->layer_id) != source_shard)
 			continue;
-		if (read_image_index_refreshing(d, &idx, &n) != 0)
+		if (ps_image_layer_read_index(d, &idx, &n) != 0)
 			return -1;
 		for (uint32_t j = 0; j < n; j++)
 			if ((idx[j].flags & PS_IMG_REC_SEG_VALID) &&
@@ -3993,7 +4563,7 @@ verify_segment_layers(uint32_t source_shard, uint32_t victim, int need_layer)
 			found = 1;
 			/* Always re-read and checksum now: a prior read's cached verification
 			 * may predate corruption that occurred before this unlink. */
-			if (verify_image_layer_refreshing(d) != 0)
+			if (ps_image_layer_verify_data(d, page_size) != 0)
 				return -1;
 		}
 		/* Keep any remote-only cache materialized while examining this segment.
@@ -4016,7 +4586,7 @@ reclaim_one_segment(Shard *s)
 		return 0;
 	victim = s->gc_next_seg;
 	refs = segment_has_references(s->id, victim);
-	if (verify_segment_layers(s->id, victim, refs) != 0)
+	if (verify_segment_layers_locked(s->id, victim, refs) != 0)
 		return 0;
 	for (uint32_t sh = 0; sh < ns; sh++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
@@ -4209,47 +4779,7 @@ finish_upload:
 		}
 	if (current == NULL || current->deleting)
 	{
-		int		deleting = current != NULL;
-		int		remote_cleaned = 0;
-
 		ps_unlock_map();
-		if (ps_layer_store->remote_uri != NULL &&
-			ps_layer_store->remote_uri(candidate.layer_id, remote.uri,
-										 sizeof(remote.uri)) == 0)
-		{
-			remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
-			remote.available = true;
-			if (candidate.location_count < PS_LAYER_MAX_LOCATIONS)
-			{
-				candidate.locations[candidate.location_count++] = remote;
-				if (ps_layer_store->delete_remote_layer(&candidate) != 0)
-					return 0;
-				remote_cleaned = 1;
-			}
-		}
-		if (deleting)
-		{
-			if (!remote_cleaned)
-				return 0;
-			if (ps_layer_store->delete_local_layer(&candidate) != 0)
-				return 0;
-			ps_lock_map_wr();
-			current = NULL;
-			for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-				if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
-					current = &ps_layer_map.layers[i];
-			if (current == NULL || !current->deleting)
-			{
-				ps_unlock_map();
-				return 0;
-			}
-			if (ps_manifest_remove_layer(candidate.layer_id) != 0)
-			{
-				ps_unlock_map();
-				return 0;
-			}
-			ps_unlock_map();
-		}
 		return 1;
 	}
 	if (current->remote_durable)
@@ -4281,19 +4811,55 @@ finish_upload:
 	return 1;
 }
 
+static void *
+evict_local_worker(void *arg)
+{
+	PsLayerDesc *layer = arg;
+	int			rc = -1;
+
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	if (ps_layer_store->verify_remote_layer != NULL)
+		rc = ps_layer_store->verify_remote_layer(layer);
+	else if (ps_layer_store->layer_exists_remote != NULL &&
+			 ps_layer_store->layer_exists_remote(layer) == 1)
+		rc = 0;
+	__atomic_store_n(&evict_local_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	return NULL;
+}
+
 /* Evict at most one remote-durable local cache file. */
 static int
 evict_one_layer(void)
 {
 	PsLayerDesc candidate;
+	int			state;
 	int			found = 0;
+	uint32_t	found_idx = 0;
+	uint32_t	map_nlayers = 0;
 
 	if (ps_layer_store->layer_exists_local == NULL ||
-		ps_layer_store->delete_local_layer == NULL)
+		ps_layer_store->delete_local_layer == NULL ||
+		(ps_layer_store->verify_remote_layer == NULL &&
+		 ps_layer_store->layer_exists_remote == NULL))
 		return 0;
-	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	state = __atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE);
+	if (state == 1)
+		return 0;
+	if (state != 0)
 	{
+		pthread_join(evict_local_thread, NULL);
+		__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+		if (state != 2)
+			return 1;
+		candidate = evict_local_candidate;
+		goto finish_evict;
+	}
+
+	ps_lock_map_rd();
+	map_nlayers = ps_layer_map.nlayers;
+	for (uint32_t pass = 0; pass < map_nlayers; pass++)
+	{
+		uint32_t	i = (evict_local_map_cursor + pass) % map_nlayers;
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
 		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
@@ -4302,6 +4868,7 @@ evict_one_layer(void)
 			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
 		{
 			candidate = *layer;
+			found_idx = i;
 			found = 1;
 			break;
 		}
@@ -4309,8 +4876,20 @@ evict_one_layer(void)
 	ps_unlock_map();
 	if (!found)
 		return 0;
+	evict_local_map_cursor = (found_idx + 1) % map_nlayers;
+	evict_local_candidate = candidate;
+	__atomic_store_n(&evict_local_state, 1, __ATOMIC_RELEASE);
+	if (pthread_create(&evict_local_thread, NULL, evict_local_worker,
+					   &evict_local_candidate) != 0)
+	{
+		__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+		return 0;
+	}
+	return 1;
 
+finish_evict:
 	ps_lock_map_wr();
+	found = 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
 		{
@@ -4335,8 +4914,14 @@ evict_one_layer(void)
 			ps_layer_map.layers[i].data_verified = false;
 			ps_layer_map.layers[i].cache_resident = false;
 			ps_layer_map.layers[i].local_cleanup_pending = true;
+			found = 1;
 			break;
 		}
+	if (!found)
+	{
+		ps_unlock_map();
+		return 0;
+	}
 	/* Keep the write lock through unlink: layer reads hold the matching read
 	 * lock while downloading/opening their cache file. */
 	found = (ps_layer_store->delete_local_layer(&candidate) == 0);
@@ -4389,6 +4974,14 @@ ps_core_maintenance(void)
 	if (segment_gc_enabled && ps_storage->seg_remove)
 	{
 		for (uint32_t sh = 0; sh < ns; sh++)
+		{
+			Shard	   *s = &g_shards[sh];
+
+			if (s->flush_watermark_valid &&
+				s->gc_next_seg < s->flush_watermark.seg_id)
+				prepare_segment_layers(s->id, s->gc_next_seg);
+		}
+		for (uint32_t sh = 0; sh < ns; sh++)
 			ps_lock_shard_wr(sh);
 		ps_lock_map_rd();
 		for (uint32_t sh = 0; sh < ns && !found; sh++)
@@ -4423,12 +5016,15 @@ ps_core_maintenance(void)
 	 */
 	if (found)
 	{
-		ps_lock_shard_wr(fsh);
-		ps_lock_map_wr();
-		if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
-			did = compact_timeline(ftl, fsh) > 0;
-		ps_unlock_map();
-		ps_unlock_shard(fsh);
+		if (materialize_compaction_inputs(ftl, fsh) == 0)
+		{
+			ps_lock_shard_wr(fsh);
+			ps_lock_map_wr();
+			if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
+				did = compact_timeline(ftl, fsh) > 0;
+			ps_unlock_map();
+			ps_unlock_shard(fsh);
+		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
 	 * first turns routine compaction into remote I/O under map/shard write
@@ -4480,6 +5076,7 @@ int
 ps_core_open(const char *store_dir)
 {
 	uint32_t	ns = core_shards();
+	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	map_locks_ready = 0;
@@ -4488,6 +5085,8 @@ ps_core_open(const char *store_dir)
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
 	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	gc_remote_layer_cursor = 0;
+	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+	evict_local_map_cursor = 0;
 
 	if (ps_storage->open(store_dir, segment_size) != 0)
 		return -1;
@@ -4497,6 +5096,8 @@ ps_core_open(const char *store_dir)
 	if (ps_manifest_open(store_dir) != 0)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
+		return -1;
+	if (validate_store_shard_count(store_dir, &publish_shard_count) != 0)
 		return -1;
 	/* Leave deleting layers for asynchronous maintenance: recovery must not
 	 * block on an unavailable remote object that is already excluded from reads. */
@@ -4530,6 +5131,8 @@ ps_core_open(const char *store_dir)
 		if (sh < ns && lid + 1 > g_shards[sh].next_layer_id)
 			g_shards[sh].next_layer_id = lid + 1;
 	}
+	if (use_layers && mark_legacy_shard_zero_layers() != 0)
+		return -1;
 
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  One
@@ -4575,6 +5178,8 @@ ps_core_open(const char *store_dir)
 		if (recover(sh) != 0)
 			return -1;
 	}
+	if (use_layers && mark_legacy_shard_zero_layers() != 0)
+		return -1;
 
 	/*
 	 * Seal the legacy migration before the daemon becomes writable.  Starting
@@ -4609,6 +5214,9 @@ ps_core_open(const char *store_dir)
 				if (walidx_recover_one(tl, shard) != 0)
 					return -1;
 		}
+
+	if (publish_shard_count && publish_store_shard_count(store_dir) != 0)
+		return -1;
 
 	return 0;
 }

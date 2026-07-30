@@ -126,6 +126,30 @@ main(void)
 		  "upload local layer atomically");
 	check(ps_layer_store->upload_layer(&layer) == 0,
 		  "re-upload matching object is idempotent");
+	{
+		static unsigned char image_page[PS_DEFAULT_PAGE_SIZE];
+		PsKey		key = {1, 1, 16000, 0, PS_KLASS_RELATION};
+		PsImgRec	rec = {.key = key, .block = 0, .lsn = 1,
+						   .page = image_page};
+		PsLayerDesc image;
+		char		image_remote_uri[PS_LAYER_URI_MAX];
+		int			fd;
+
+		memset(image_page, 0x5a, sizeof(image_page));
+		check(ps_image_layer_write((3ULL << 48) | 18, 0, &rec, 1,
+								   PS_DEFAULT_PAGE_SIZE, &image) == 0,
+			  "write image layer for upload verification");
+		check(ps_layer_store->remote_uri(image.layer_id, image_remote_uri,
+										 sizeof(image_remote_uri)) == 0,
+			  "derive image upload verification remote URI");
+		fd = open(image.locations[0].uri, O_RDWR);
+		check(fd >= 0 && pwrite(fd, "x", 1, 0) == 1 && close(fd) == 0,
+			  "simulate same-size local image layer corruption");
+		check(ps_layer_store->upload_layer(&image) != 0,
+			  "reject upload whose image checksum differs from metadata");
+		unlink(image.locations[0].uri);
+		unlink(image_remote_uri);
+	}
 	layer.locations[1].tier = PS_LAYER_TIER_REMOTE_OBJECT;
 	layer.locations[1].available = true;
 	layer.locations[1].size = layer.locations[0].size;
@@ -134,6 +158,15 @@ main(void)
 	check(ps_layer_store->layer_exists_remote(&layer) == 1 &&
 		  file_matches(remote_uri, contents),
 		  "uploaded object is present and complete");
+	check(ps_layer_store->write_local_layer(layer.layer_id, corrupt,
+											strlen(corrupt)) == 0,
+		  "simulate corrupt manifest-owned local layer");
+	check(ps_layer_store->refresh_layer_cache(&layer) != 0,
+		  "do not replace local layer before remote durability is recorded");
+	layer.remote_durable = true;
+	check(ps_layer_store->refresh_layer_cache(&layer) == 0 &&
+		  file_matches(local_uri, contents),
+		  "refresh repairs remote-durable local layer");
 
 	check(unlink(local_uri) == 0, "simulate local layer eviction");
 	check(ps_layer_store->download_layer(&layer) == 0 &&

@@ -16,6 +16,7 @@ on:
     branches:
       - master
       - pagestore
+      - 'branchdb_*'
     paths:
       - 'src/backend/postmaster/walredo.c'
       - 'src/include/postmaster/walredo.h'
@@ -80,7 +81,7 @@ on:
 # Do not let obsolete full PostgreSQL builds from push+pull_request events
 # saturate the hosted-runner quota while a stacked PageStore PR is rebased.
 concurrency:
-  group: walredo-${{ github.event.pull_request.number || github.ref_name }}
+  group: walredo-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:

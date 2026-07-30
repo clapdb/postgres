@@ -66,6 +66,8 @@ typedef struct PsLayerDesc
 	bool		deleting;
 	/* In-memory only: canonical local cache was materialized from remote. */
 	bool		cache_resident;
+	/* In-memory only: shard-0 layer created before a 1-to-N reshard. */
+	bool		legacy_shard_zero;
 	/* Number of snapshot readers that may materialize/read the canonical cache. */
 	uint32_t	cache_readers;
 	/* DROP_LOCAL is durable but its physical unlink still needs retrying. */
