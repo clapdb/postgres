@@ -220,12 +220,14 @@ reconstruction.
    fail-closed: checkpoint R does not prove those pages complete even though
    their store admission order is known.
 
-2. **The advancing reader.**  R advances by re-deriving from the control
-   mirror (the SLRU reader's TTL/epoch protocol, generalized): adopting a
-   new R invalidates relation buffers read under the old R.  Needs a
-   buffer-tag epoch (the SLRU served-table pattern applied to shared
-   buffers via an smgr read-through revalidation) or a bulk drop on adopt.
-   The snapshot (running set) re-derives with each R.
+2. **The advancing reader (2a implemented).**  R advances by re-deriving from
+   the control mirror (the SLRU reader's TTL/epoch protocol, generalized).
+   Increment 2a adds an out-of-core storage-manager read generation to
+   shared-buffer tags; pagestore uses generation 1 for a pinned reader, so its
+   buffers cannot alias the writer's generation-0 buffers.  Future generations
+   allow old and new horizons to coexist while transactions drain.
+   The remaining increments publish the shared horizon, adopt it only at
+   transaction boundaries, and re-derive the running-XID snapshot with each R.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the
