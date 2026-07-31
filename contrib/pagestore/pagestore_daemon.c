@@ -106,10 +106,16 @@ handle_request(PsChannel *ch)
 				{
 					unsigned char *dst = ch->data + (size_t) i * page_size;
 					uint64_t	resolved = 0;
+					int			read_result;
 
-					if (!read_resolve(tl, &ch->key, ch->blocknum + i, rl,
-									  ch->req_seq, dst,
-									  &resolved))
+					read_result = read_resolve(tl, &ch->key, ch->blocknum + i, rl,
+												   ch->req_seq, dst, &resolved);
+					if (read_result < 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
+					if (read_result == 0)
 						memset(dst, 0, page_size);	/* unwritten -> zeros */
 					else if (ch->req_seq != 0 && resolved == 0)
 					{
@@ -138,10 +144,13 @@ handle_request(PsChannel *ch)
 			{
 				uint64_t	read_lsn = ch->req_lsn;
 				uint64_t	resolved = 0;
+				int			read_result;
 
-				if (read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
-								 ch->req_seq, ch->data,
-								 &resolved))
+				read_result = read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
+												  ch->req_seq, ch->data, &resolved);
+				if (read_result < 0)
+					ch->status = PS_STATUS_ERROR;
+				else if (read_result > 0)
 				{
 					if (read_lsn != UINT64_MAX && resolved == 0)
 					{
@@ -257,7 +266,8 @@ run_request_admitted(PsChannel *ch)
 		 * shard_for(&ch->key).  The shipped-WAL byte ops (append/size/read) are not
 		 * keyed (they touch the per-timeline WAL log), so serialize them on shard 0.
 		 */
-		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ)
+		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
+			op == PS_OP_WAL_INDEX_PROGRESS)
 			shard = 0;
 		else if (op == PS_OP_WAL_RETAIN_FLOOR)
 		{
@@ -288,12 +298,19 @@ run_request_admitted(PsChannel *ch)
 		}
 		else
 		{
-			/* Reads consult this shard's indexes plus the cross-shard map/timelines. */
+			/* READV/READ_AT snapshot ancestry internally before potentially blocking
+			 * remote-layer I/O.  Other timeline readers complete under map_rd. */
 			ps_lock_shard_rd(shard);
-			ps_lock_map_rd();
-			handle_request(ch);
+			if (op == PS_OP_READV || op == PS_OP_READ_AT ||
+				op == PS_OP_WAL_RETAIN_FLOOR)
+				handle_request(ch);
+			else
+			{
+				ps_lock_map_rd();
+				handle_request(ch);
+				ps_unlock_map();
+			}
 			ps_store_release(&ch->state, PS_STATE_DONE);
-			ps_unlock_map();
 			ps_unlock_shard(shard);
 		}
 	}
@@ -417,12 +434,12 @@ shard_worker(void *arg)
 				did_work = 1;
 		}
 
-		if (!did_work && shard == 0)
+		if (shard == 0)
 		{
 			/* maintenance takes the shard + map locks it needs internally */
 			int			do_maint = ps_core_maintenance();
 
-			if (!do_maint)
+			if (!did_work && !do_maint)
 			{
 				struct timespec ts = {0, 20000};	/* 20us */
 

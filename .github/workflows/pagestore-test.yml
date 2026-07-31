@@ -9,6 +9,10 @@ name: pagestore
 
 on:
   push:
+    branches:
+      - master
+      - pagestore
+      - 'branchdb_*'
     paths:
       - 'contrib/pagestore/**'
       # core seams the pagestore module depends on: a core-only PR (e.g. the
@@ -52,6 +56,13 @@ on:
       - '.github/workflows/pagestore-test.yml'
   workflow_dispatch:
 
+# A branch update fires both push and pull_request.  Keep only the newest run
+# for that branch so stacked-PR rebases do not consume the runner quota with
+# obsolete standalone/integration jobs.
+concurrency:
+  group: pagestore-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   standalone-test:
     name: standalone daemon test (no PostgreSQL)
@@ -66,6 +77,8 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_inspect pagestore_inspect.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_test   pagestore_test.c   -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_test pagestore_layer_test.c pagestore_layer.c pagestore_layer_store.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_pgcache_test pagestore_pgcache_test.c pagestore_pgcache.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_manifest_test pagestore_manifest_test.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_gc_test pagestore_gc_test.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c -lrt -lpthread
@@ -77,6 +90,14 @@ jobs:
       - name: Run image-layer unit test
         working-directory: contrib/pagestore
         run: ./pagestore_layer_test
+
+      - name: Run layer-store provider unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_layer_store_test
+
+      - name: Run tiering integration test
+        working-directory: contrib/pagestore
+        run: ./pagestore_tiering_test
 
       - name: Run materialized-page cache unit test
         working-directory: contrib/pagestore
@@ -113,6 +134,15 @@ jobs:
 
       - name: Prepare temporary install tree
         run: meson test -C build --suite setup
+
+      - name: Run pagestore harness writer smoke
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --writer-smoke contrib/pagestore/harness/scenarios/writer_lifecycle.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"

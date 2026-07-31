@@ -518,12 +518,13 @@ pagestore_archive_configured(ArchiveModuleState *state)
  * asserts on).  In production a background worker would call this as WAL is
  * shipped; the SQL wrapper below lets a test drive it.
  */
-static void
+static XLogRecPtr
 pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 {
 	ReadLocalXLogPageNoWaitPrivate *pd;
 	XLogReaderState *reader;
 	XLogRecPtr	first;
+	XLogRecPtr	indexed_end = start;
 
 	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -534,7 +535,7 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 	if (reader == NULL)
 	{
 		pfree(pd);
-		return;
+		return start;
 	}
 
 	{
@@ -568,12 +569,14 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
 			key.forkNum = fk;
 			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
 		}
+		indexed_end = reader->EndRecPtr;
 	}
 
 	if (reader != NULL)
 		XLogReaderFree(reader);
 	if (pd != NULL)
 		pfree(pd);
+	return indexed_end;
 }
 
 /*
@@ -589,8 +592,11 @@ pagestore_index_wal(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	start = PG_GETARG_LSN(0);
 	XLogRecPtr	end = PG_GETARG_LSN(1);
+	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end);
 
-	pagestore_index_wal_range(start, end);
+	/* Only a contiguous scan may advance the durable resume boundary. */
+	if (pagestore_localsvc_walidx_progress() == start && indexed_end > start)
+		pagestore_localsvc_walidx_commit(start, indexed_end);
 	PG_RETURN_VOID();
 }
 

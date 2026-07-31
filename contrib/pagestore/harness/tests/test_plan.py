@@ -292,6 +292,32 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.signal_process_group(process, MODULE.signal.SIGKILL)
         killpg.assert_called_once_with(4321, MODULE.signal.SIGKILL)
 
+    def test_writer_smoke_requires_runtime_binaries_and_build_dir(self):
+        prerequisites = [
+            ("--build-dir", "build"),
+            ("--daemon-binary", "daemon"),
+            ("--inspect-binary", "inspect"),
+        ]
+        base_args = [
+            "--capabilities", str(ROOT / "capabilities.json"),
+            "--writer-smoke", str(ROOT / "scenarios" / "writer_lifecycle.jsonl"),
+        ]
+
+        for missing, _ in prerequisites:
+            with self.subTest(missing=missing):
+                args = list(base_args)
+                for option, value in prerequisites:
+                    if option != missing:
+                        args.extend([option, value])
+
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        MODULE.parse_args(args)
+
+                self.assertNotEqual(raised.exception.code, 0)
+                self.assertIn("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary",
+                              stderr.getvalue())
+
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

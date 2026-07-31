@@ -13,6 +13,10 @@ name: walredo
 
 on:
   push:
+    branches:
+      - master
+      - pagestore
+      - 'branchdb_*'
     paths:
       - 'src/backend/postmaster/walredo.c'
       - 'src/include/postmaster/walredo.h'
@@ -73,6 +77,12 @@ on:
       - '.github/scripts/walredo_redo_test.py'
       - '.github/workflows/walredo-test.yml'
   workflow_dispatch:
+
+# Do not let obsolete full PostgreSQL builds from push+pull_request events
+# saturate the hosted-runner quota while a stacked PageStore PR is rebased.
+concurrency:
+  group: walredo-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build-and-smoke:

@@ -246,6 +246,25 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->req_seq = 0;
 }
 
+static uint32_t
+find_relation_on_shard(uint32_t shard, uint32_t nshards)
+{
+	PsKey		key;
+
+	memset(&key, 0, sizeof(key));
+	key.spcOid = 1;
+	key.dbOid = 1;
+	key.forkNum = 0;
+	key.klass = PS_KLASS_RELATION;
+	for (uint32_t rel = 16001; rel < 116000; rel++)
+	{
+		key.relNumber = rel;
+		if (ps_key_shard(&key, nshards) == shard)
+			return rel;
+	}
+	return 0;
+}
+
 /* --- typed operations --- */
 
 static void
@@ -804,6 +823,61 @@ op_read_at_tl(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 
 /* --- shipped-WAL operations --- */
 
+#define TEST_WAL_MAGIC	0x57414c52
+
+static void
+write_torn_wal_header(const char *store, uint32_t tl, uint64_t start_lsn,
+					  uint32_t len)
+{
+	struct
+	{
+		uint32_t	magic;
+		uint32_t	len;
+		uint64_t	start_lsn;
+	}			h;
+	char		path[512];
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/wal_%u", store, tl);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	check(fd >= 0, "test creates a torn WAL log");
+	if (fd < 0)
+		return;
+	h.magic = TEST_WAL_MAGIC;
+	h.len = len;
+	h.start_lsn = start_lsn;
+	check(write(fd, &h, sizeof(h)) == (ssize_t) sizeof(h) && fsync(fd) == 0,
+		  "test writes a WAL header without its payload");
+	check(close(fd) == 0, "test closes the torn WAL log");
+}
+
+static void
+write_short_wal_payload(const char *store, uint32_t tl, uint64_t start_lsn,
+						const void *data, uint32_t len, uint32_t written)
+{
+	struct
+	{
+		uint32_t	magic;
+		uint32_t	len;
+		uint64_t	start_lsn;
+	}			h;
+	char		path[512];
+	int			fd;
+
+	snprintf(path, sizeof(path), "%s/wal_%u", store, tl);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	check(fd >= 0, "test creates a short WAL log");
+	if (fd < 0)
+		return;
+	h.magic = TEST_WAL_MAGIC;
+	h.len = len;
+	h.start_lsn = start_lsn;
+	check(write(fd, &h, sizeof(h)) == (ssize_t) sizeof(h) &&
+		  write(fd, data, written) == (ssize_t) written && fsync(fd) == 0,
+		  "test writes a WAL record with a short payload");
+	check(close(fd) == 0, "test closes the short WAL log");
+}
+
 /* Append len WAL bytes at start_lsn on a timeline. */
 static void
 op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
@@ -891,6 +965,22 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	n = (int) cl_exec()->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
+}
+
+static int
+op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end, uint64_t *progress)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int			ok;
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->req_lsn = start;
+	ch->req_seq = end;
+	ok = cl_exec()->status == PS_STATUS_OK;
+	if (ok && progress)
+		*progress = ch->req_lsn;
+	return ok ? 0 : -1;
 }
 
 /* ===================== page helpers ==================================== */
@@ -1816,6 +1906,101 @@ run_reshard_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	free(readback);
 }
 
+static void
+run_shard_count_change_rejection_suite(const char *daemon_path,
+									   const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	char		marker[512];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(1, 2);
+	unsigned char *page = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== reject unsupported shard-count changes ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_shard_count", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_shard_count", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	check(rel != 0 && page != NULL, "prepare a two-shard relation");
+	pid = spawn_daemon(daemon_path, shm, store, ps, 2);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 5000, 88);
+	op_write_one(rel, 0, 0, page);
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+
+	check(snprintf(marker, sizeof(marker), "%s/.pagestore-nshards", store) > 0,
+		  "build shard-count marker path");
+	check(unlink(marker) == 0, "simulate a pre-marker multi-shard store");
+	pid = spawn_daemon(daemon_path, shm, store, ps, 4);
+	expect_daemon_open_failure(pid, shm,
+							   "markerless multi-shard segment store rejects unsupported shard-count changes");
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+}
+
+static void
+run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(1, 4);
+	unsigned char wal[512] = {0};
+	PsWalRec	out[4];
+	uint64_t	progress;
+	pid_t		pid;
+	int			n;
+
+	fprintf(stderr, "== legacy WAL-index reshard replay ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_legacy_widx", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_legacy_widx", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	check(rel != 0, "test harness can find a relation that moves to shard 1");
+	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_wal_append(0, 0, wal, sizeof(wal));
+	op_walidx_add(0, rel, 0, 0, 320);
+	check(op_walidx_progress(0, 0, 350, &progress) == 0,
+		  "single-shard WAL-index progress commits before reshard");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	n = op_walidx_get(0, rel, 0, 0, 1000000, out);
+	check(n == 1 && out[0].lsn == 320,
+		  "reshard replays legacy physical shard-zero WAL-index record");
+	check(op_walidx_progress(0, 350, 400, &progress) == 0,
+		  "post-reshard progress keeps legacy WAL-index ownership physical");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+
+	pid = spawn_daemon(daemon_path, shm, store, ps, 4);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	n = op_walidx_get(0, rel, 0, 0, 1000000, out);
+	check(n == 1 && out[0].lsn == 320,
+		  "post-reshard WAL-index progress survives a second restart");
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+}
+
 /* ===================== the test suite ================================== */
 
 #define REL_A	16000
@@ -2131,12 +2316,21 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 		unsigned char *note = calloc(1, page_size);
 		unsigned char *image = calloc(1, page_size);
 		uint64_t	redo1 = 5000,
-					redo2 = 9000;
+					redo2 = 9000,
+					exact_redo = 5000;
 
 		memset(image, 0x5c, 64);	/* stand-in pg_control bytes */
 
 		check(op_wal_retain_floor(0) == 0,
 			  "wal retention floor starts unconstrained (no control image)");
+		/* A checkpoint fence also publishes an exact-redo control copy.  It
+		 * is separately restorable, so it must carry a note at that exact
+		 * version rather than relying on the later record-end copy's note. */
+		memcpy(note, &exact_redo, sizeof(exact_redo));
+		op_write_control(1, note, exact_redo);
+		op_write_control(0, image, exact_redo);
+		check(op_wal_retain_floor(0) == exact_redo,
+			  "exact-redo control image has a same-version floor note");
 		/* two mirrored control writes, note first then image at the same
 		 * version -- exactly the shipper's order; the floor must be the MIN
 		 * redo over the restorable images */
@@ -2743,6 +2937,19 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 
 	client_detach();
 	stop_daemon(dpid);
+	write_short_wal_payload(store, 4, 4000, bufa, 500, 100);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_wal_size(4) == 0,
+		  "WAL recovery ignores and truncates a short-payload suffix");
+	check(op_wal_append_status(4, 4000, bufa, 500) == PS_STATUS_OK &&
+		  op_wal_size(4) == 4500,
+		  "archiver retry succeeds after short-payload WAL recovery");
+
+	client_detach();
+	stop_daemon(dpid);
 	rm_rf(store);
 	shm_unlink(shm);
 }
@@ -2758,7 +2965,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	char		store[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
+	uint32_t	walidx_nshards = test_nshards < 2 ? 4 : test_nshards;
+	uint32_t	nonzero_shard = walidx_nshards > 1 ? 1 : 0;
+	uint32_t	nonzero_rel = walidx_nshards > 1 ?
+		find_relation_on_shard(nonzero_shard, walidx_nshards) : 0;
 	PsWalRec	out[16];
+	unsigned char wal[512] = {0};
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
@@ -2767,15 +2979,22 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
-	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	op_wal_append(0, 0, wal, sizeof(wal));
 
 	/* block 0 changed by records at LSN 100, 200, 300; block 1 at 150 */
 	op_walidx_add(0, REL_A, FORK0, 0, 100);
 	op_walidx_add(0, REL_A, FORK0, 0, 200);
 	op_walidx_add(0, REL_A, FORK0, 0, 300);
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
+	check(nonzero_rel != 0, "test harness can find a nonzero WAL-index shard relation");
+	if (nonzero_rel != 0)
+	{
+		op_walidx_add(0, nonzero_rel, FORK0, 0, 320);
+		op_walidx_add(0, nonzero_rel, FORK0, 0, 330);
+	}
 
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
 	check(n == 2 && out[0].lsn == 100 && out[1].lsn == 200,
@@ -2788,6 +3007,61 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 350, &progress) == 0,
+			  "contiguous indexed WAL interval commits a durable progress marker");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress reports the committed end");
+		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
+			  "WAL index progress rejects an out-of-range timeline");
+		op_wal_append(0, high, wal, 16);
+		check(op_walidx_progress(0, 350, high + 16, &progress) != 0,
+			  "WAL index progress rejects a marker crossing unshipped WAL");
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "rejected WAL index progress leaves the committed end unchanged");
+		op_create_branch(2, 0, 0);
+		op_wal_append(2, high, wal, 16);
+		check(op_walidx_progress(2, high, high + 16, &progress) == 0,
+			  "WAL index progress accepts a 64-bit LSN start");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "WAL index progress reports a 64-bit committed end");
+		op_create_branch(3, 0, 0);
+	}
+
+	/* The index is durable independently of the daemon's in-memory hash tables. */
+	client_detach();
+	stop_daemon(dpid);
+	write_torn_wal_header(store, 3, 0x100000000ULL, 16);
+	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
+		  "enable short log reads during WAL index recovery");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_MAX_LOG_READ");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
+	check(n == 3 && out[0].lsn == 100 && out[2].lsn == 300,
+		  "WAL index survives daemon restart");
+	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
+	check(n == 1 && out[0].lsn == 150,
+		  "restart replays WAL index records without duplicating them");
+	{
+		uint64_t	progress;
+		uint64_t	high = 0x100000000ULL;
+
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+			  "WAL index progress survives daemon restart");
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high + 16,
+			  "64-bit WAL index progress survives daemon restart");
+		check(op_walidx_progress(3, high, high + 16, &progress) != 0,
+			  "WAL index progress rejects WAL with a missing payload");
+	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);
@@ -2804,6 +3078,20 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 
 	client_detach();
 	stop_daemon(dpid);
+	shm_unlink(shm);
+	if (nonzero_rel != 0)
+	{
+		char		path[512];
+		struct stat st;
+
+		snprintf(path, sizeof(path), "%s/walidx_0_%u", store, nonzero_shard);
+		check(stat(path, &st) == 0 && st.st_size > 1 &&
+			  truncate(path, st.st_size / 2) == 0,
+			  "truncate a committed nonzero WAL-index shard");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+								   "truncated committed nonzero WAL-index shard fails closed");
+	}
 	rm_rf(store);
 	shm_unlink(shm);
 }
@@ -3108,6 +3396,9 @@ main(int argc, char **argv)
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */
 	run_reshard_segment_gc_suite(daemon_path, tmpbase);
+	/* Stores already using more than one shard must keep their shard count. */
+	run_shard_count_change_rejection_suite(daemon_path, tmpbase);
+	run_legacy_walidx_reshard_suite(daemon_path, tmpbase);
 
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)

@@ -28,16 +28,21 @@ typedef struct PsLayerStore
 	int			(*write_local_layer) (uint64_t layer_id, const void *buf,
 									  uint64_t len);
 	int			(*seal_local_layer) (uint64_t layer_id);
+	int			(*remote_uri) (uint64_t layer_id, char *uri, uint32_t uri_len);
 	int			(*read_layer_block) (const PsLayerDesc *layer, uint64_t off,
 									 void *buf, uint32_t len);
 	int			(*upload_layer) (const PsLayerDesc *layer);
 	int			(*download_layer) (const PsLayerDesc *layer);
+	/* Replace a read-refilled canonical cache after integrity failure. */
+	int			(*refresh_layer_cache) (const PsLayerDesc *layer);
 	int			(*delete_local_layer) (const PsLayerDesc *layer);
 	int			(*delete_remote_layer) (const PsLayerDesc *layer);
 	int			(*layer_exists_remote) (const PsLayerDesc *layer);
+	int			(*verify_remote_layer) (const PsLayerDesc *layer);
 } PsLayerStore;
 
 extern const PsLayerStore PsLayerStoreLocal;
 extern const PsLayerStore *ps_layer_store;
+extern void ps_layer_store_set_page_size(uint32_t value);
 
 #endif							/* PAGESTORE_LAYER_STORE_H */

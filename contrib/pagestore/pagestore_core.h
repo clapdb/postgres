@@ -51,8 +51,8 @@ extern int	ps_core_open(const char *store_dir);
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */
 extern void ps_core_close(void);
 
-/* Off-the-write-path maintenance (compaction).  Call when idle; returns 1 if it
- * did work (caller should not sleep), 0 if nothing was due. */
+/* Off-the-write-path tiering, GC, and compaction.  Call when idle; returns 1 if
+ * it did work (caller should not sleep), 0 if nothing was due. */
 extern int	ps_core_maintenance(void);
 
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
@@ -91,7 +91,7 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
 /*
  * Resolve a read into out (page_size bytes), serving from memtable / image
  * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
- * page is unwritten.
+ * page is unwritten, and -1 if an authoritative stored version cannot be read.
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,

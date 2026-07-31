@@ -1157,6 +1157,33 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	return n;
 }
 
+uint64
+pagestore_localsvc_walidx_progress(void)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->timeline = (uint32) localsvc_timeline;
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	ls_exec(ch);
+	return ch->req_lsn;
+}
+
+void
+pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL index progress");
+	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch->timeline = (uint32) localsvc_timeline;
+	ch->req_lsn = start_lsn;
+	ch->req_seq = end_lsn;
+	ls_exec(ch);
+}
+
 /*
  * Non-relation object I/O.  The store is keyed by the full PsKey including klass,
  * so a non-relation object (SLRU page, control state, ...) goes through the same

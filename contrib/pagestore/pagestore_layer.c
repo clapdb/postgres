@@ -161,15 +161,25 @@ static const PsLayerLocation *
 img_local_loc(const PsLayerDesc *layer)
 {
 	uint32_t	nlocs = layer->location_count;
+	const PsLayerLocation *local = NULL;
+	const PsLayerLocation *remote = NULL;
 
 	if (nlocs > PS_LAYER_MAX_LOCATIONS)
 		nlocs = PS_LAYER_MAX_LOCATIONS;
 	for (uint32_t i = 0; i < nlocs; i++)
-		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
-			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD) &&
+	{
+		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
 			layer->locations[i].available)
-			return &layer->locations[i];
-	return NULL;
+			remote = &layer->locations[i];
+		if ((layer->locations[i].tier == PS_LAYER_TIER_LOCAL_HOT ||
+			 layer->locations[i].tier == PS_LAYER_TIER_LOCAL_COLD))
+		{
+			if (layer->locations[i].available)
+				return &layer->locations[i];
+			local = &layer->locations[i];
+		}
+	}
+	return local ? local : remote;
 }
 
 int
@@ -402,31 +412,34 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 {
 	const PsLayerLocation *loc = img_local_loc(layer);
 	PsDeltaFooter foot;
-	PsDeltaIndexEnt *idx;
+	PsDeltaIndexEnt *idx = NULL;
 	uint64_t	idx_bytes;
 	int			rc = -1;
+	int			retried = 0;
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or its
 	 * LSN range does not overlap the requested (lo_lsn, hi_lsn] */
 	if (!layer_covers(layer, key, block) ||
 		layer->lsn_end <= lo_lsn || layer->lsn_start > hi_lsn)
 		return 0;
+
+retry:
 	if (!loc || loc->size < sizeof(PsDeltaFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
-		return -1;
+									 &foot, sizeof(foot)) != 0)
+		goto refresh;
 	if (foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
 		foot.nrecs == 0)
-		return -1;
+		goto refresh;
 	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
 	idx = malloc((size_t) idx_bytes);
 	if (!idx)
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, foot.index_off, idx,
-										 (uint32_t) idx_bytes) != 0 ||
+									 (uint32_t) idx_bytes) != 0 ||
 		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
-		goto out;
+		goto refresh;
 
 	/* index is sorted by (key, block, lsn): matches are contiguous + ascending */
 	for (uint32_t i = 0; i < foot.nrecs && *n < cap; i++)
@@ -441,6 +454,17 @@ ps_delta_layer_collect(const PsLayerDesc *layer, const PsKey *key,
 		(*n)++;
 	}
 	rc = 0;
+	goto out;
+
+refresh:
+	free(idx);
+	idx = NULL;
+	if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
+		ps_layer_store->refresh_layer_cache(layer) == 0)
+	{
+		retried = 1;
+		goto retry;
+	}
 
 out:
 	free(idx);
@@ -583,7 +607,7 @@ ps_image_layer_read_index(const PsLayerDesc *layer, PsImgIndexEnt **out,
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
+									 &foot, sizeof(foot)) != 0)
 		return -1;
 	if (foot.magic != PS_IMG_MAGIC ||
 		(foot.version != 2 && foot.version != 3 &&
@@ -684,6 +708,47 @@ ps_image_layer_verify_data(const PsLayerDesc *layer, uint32_t page_size)
 }
 
 int
+ps_delta_layer_verify_data(const PsLayerDesc *layer)
+{
+	const PsLayerLocation *loc = img_local_loc(layer);
+	PsDeltaFooter foot;
+	void *data;
+	void *idx;
+	uint64_t idx_bytes;
+	int rc = -1;
+
+	if (!loc || loc->size < sizeof(foot) ||
+		ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
+								 &foot, sizeof(foot)) != 0 ||
+		foot.magic != PS_DELTA_MAGIC || foot.version != PS_DELTA_VERSION ||
+		foot.index_off > UINT32_MAX ||
+		foot.index_off > loc->size - sizeof(foot))
+		return -1;
+	idx_bytes = (uint64_t) foot.nrecs * sizeof(PsDeltaIndexEnt);
+	if (idx_bytes > UINT32_MAX ||
+		idx_bytes > loc->size - sizeof(foot) - foot.index_off)
+		return -1;
+	idx = malloc((size_t) idx_bytes);
+	if (!idx || ps_layer_store->read_layer_block(layer, foot.index_off, idx,
+								(uint32_t) idx_bytes) != 0 ||
+		img_crc(idx, (size_t) idx_bytes) != foot.index_crc)
+	{
+		free(idx);
+		return -1;
+	}
+	free(idx);
+	data = malloc((size_t) foot.index_off);
+	if (!data)
+		return -1;
+	if (ps_layer_store->read_layer_block(layer, 0, data,
+								(uint32_t) foot.index_off) == 0 &&
+		img_crc(data, (size_t) foot.index_off) == foot.data_crc)
+		rc = 0;
+	free(data);
+	return rc;
+}
+
+int
 ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 					  uint32_t block, uint64_t read_lsn, uint64_t read_seq,
 					  void *out, uint32_t page_size, uint64_t *out_lsn,
@@ -698,23 +763,26 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	uint64_t	best_seq = 0;
 	int			found = 0;
 	int			rc = -1;
+	int			retried = 0;
 
 	/* prune: skip without any IO if this layer cannot hold (key,block) or has no
 	 * version at/below read_lsn */
 	if (!layer_covers(layer, key, block) || read_lsn < layer->lsn_start)
 		return 0;
+
+retry:
 	if (!loc || loc->size < sizeof(PsImgFooter))
 		return -1;
 	if (ps_layer_store->read_layer_block(layer, loc->size - sizeof(foot),
-										 &foot, sizeof(foot)) != 0)
-		return -1;
+									 &foot, sizeof(foot)) != 0)
+		goto refresh;
 	if (foot.magic != PS_IMG_MAGIC ||
 		(foot.version != 2 && foot.version != 3 &&
 		 foot.version != PS_IMG_VERSION) ||
 		foot.page_size != page_size || foot.nrecs == 0)
-		return -1;
+		goto refresh;
 	if (ps_image_layer_read_index(layer, &idx, &nidx) != 0 || nidx != foot.nrecs)
-		goto out;
+		goto refresh;
 
 	/*
 	 * Verify the data section once (per process) before the first page is
@@ -725,7 +793,9 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 	if (!((PsLayerDesc *) layer)->data_verified)
 	{
 		if (ps_image_layer_verify_data(layer, page_size) != 0)
-			goto out;
+		{
+			goto refresh;
+		}
 	}
 
 	/* newest version of (key, block) with lsn <= read_lsn */
@@ -751,12 +821,23 @@ ps_image_layer_lookup(const PsLayerDesc *layer, const PsKey *key,
 		goto out;
 	}
 	if (ps_layer_store->read_layer_block(layer, best_off, out, page_size) != 0)
-		goto out;
+		goto refresh;
 	if (out_lsn)
 		*out_lsn = best_lsn;
 	if (out_seq)
 		*out_seq = best_seq;
 	rc = 1;
+	goto out;
+
+refresh:
+	free(idx);
+	idx = NULL;
+	if (!retried && ps_layer_store->refresh_layer_cache != NULL &&
+		ps_layer_store->refresh_layer_cache(layer) == 0)
+	{
+		retried = 1;
+		goto retry;
+	}
 
 out:
 	free(idx);

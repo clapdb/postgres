@@ -278,14 +278,34 @@ ps_control_drain(void)
 			 */
 			if (p->fence_token != 0)
 			{
+				/*
+				 * The exact-redo image is independently restorable, so it needs
+				 * its own same-version floor note.  Publish the image first: a
+				 * note must never cover a legacy image at the same version.
+				 */
+				memset(page, 0, sizeof(page));
+				memcpy(page, &p->image, sizeof(ControlFileData));
 				nb = pagestore_localsvc_obj_write_prepare_timeout(
 					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
 				(void) pagestore_localsvc_obj_write_post_timeout(
 					PS_KLASS_CONTROL, &key, 0, page,
 					(uint64) p->image.checkPointCopy.redo, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
+
+				memset(page, 0, sizeof(page));
+				memcpy(page, &p->image.checkPointCopy.redo,
+					   sizeof(XLogRecPtr));
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, 1, page,
+					(uint64) p->image.checkPointCopy.redo, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
 			}
 
+			/* The exact-redo floor note reused page; restore the normal image. */
+			memset(page, 0, sizeof(page));
+			memcpy(page, &p->image, sizeof(ControlFileData));
 			nb = pagestore_localsvc_obj_write_prepare_timeout(PS_KLASS_CONTROL,
 															  &key,
 															  PS_CONTROL_SHIP_TIMEOUT_MS);

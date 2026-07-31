@@ -33,6 +33,22 @@
 static void *shm;
 static int	chan;
 
+/* A restore_command also receives .history and .backup archive objects. */
+static int
+is_wal_segment_name(const char *name)
+{
+	size_t		len = strlen(name);
+
+	if (len != 24)
+		return 0;
+	for (size_t i = 0; i < len; i++)
+		if (!((name[i] >= '0' && name[i] <= '9') ||
+			  (name[i] >= 'A' && name[i] <= 'F') ||
+			  (name[i] >= 'a' && name[i] <= 'f')))
+			return 0;
+	return 1;
+}
+
 static void
 client_attach(const char *shm_name, uint32_t page_size_unused)
 {
@@ -137,6 +153,15 @@ main(int argc, char **argv)
 				"1MB..1GB)\n", (unsigned long long) segsize);
 		return 2;
 	}
+
+	/*
+	 * PostgreSQL invokes restore_command for history and backup files as well
+	 * as WAL segments.  The archive module intentionally does not store those
+	 * auxiliary files, so report them unavailable (exit 1), rather than a hard
+	 * command error (exit 2) that would abort recovery.
+	 */
+	if (!is_wal_segment_name(segname))
+		return 1;
 
 	/* segment file name is TLI(8 hex) + xlogid(8 hex) + segment-in-id(8 hex) */
 	if (sscanf(segname, "%8X%8X%8X", &tli, &hi, &lo) != 3)
