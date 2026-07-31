@@ -451,39 +451,47 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 /* Resolve the configured checkpoint redo to the control mirror's durable
  * admission fence.  Block 2 is versioned by redo itself, so requiring an exact
  * hit prevents an older checkpoint's fence from being used for a newer R. */
-static uint64
-ls_pinned_read_seq(void)
+bool
+pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
+									 int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsAdmissionFence fence;
 	PsChannel  *ch;
 
-	if (localsvc_read_lsn == 0)
-		return 0;
-	if (localsvc_read_seq_loaded)
-		return localsvc_read_seq;
+	Assert(read_lsn != 0);
 
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 2;
-	ch->req_lsn = localsvc_read_lsn;
-	ls_exec(ch);
-	if (ch->result == 0 || ch->req_lsn != localsvc_read_lsn)
-		ereport(ERROR,
-				(errmsg("pagestore: no admission fence for pinned read LSN %X/%08X",
-						(uint32) (localsvc_read_lsn >> 32),
-						(uint32) localsvc_read_lsn)));
+	ch->req_lsn = read_lsn;
+	ls_exec_timeout(ch, timeout_ms);
+	if (ch->result == 0 || ch->req_lsn != read_lsn)
+		return false;
 	memcpy(&fence, ch->data, sizeof(fence));
 	if (fence.magic != PS_ADMISSION_FENCE_MAGIC ||
 		fence.version != PS_ADMISSION_FENCE_VERSION ||
-		fence.redo_lsn != localsvc_read_lsn || fence.admission_seq == 0)
+		fence.redo_lsn != read_lsn || fence.admission_seq == 0)
+		return false;
+	*read_seq = fence.admission_seq;
+	return true;
+}
+
+static uint64
+ls_pinned_read_seq(void)
+{
+	if (localsvc_read_lsn == 0)
+		return 0;
+	if (localsvc_read_seq_loaded)
+		return localsvc_read_seq;
+	if (!pagestore_localsvc_read_fence_timeout(localsvc_read_lsn,
+											  &localsvc_read_seq, 0))
 		ereport(ERROR,
-				(errmsg("pagestore: invalid admission fence for pinned read LSN %X/%08X",
+				(errmsg("pagestore: no valid admission fence for pinned read LSN %X/%08X",
 						(uint32) (localsvc_read_lsn >> 32),
 						(uint32) localsvc_read_lsn)));
-	localsvc_read_seq = fence.admission_seq;
 	localsvc_read_seq_loaded = true;
 	return localsvc_read_seq;
 }
