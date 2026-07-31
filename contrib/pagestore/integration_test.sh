@@ -1156,7 +1156,11 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
        CREATE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn) RETURNS bool
          AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void
-         AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;" >/dev/null
+         AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_reader_candidate_lsn() RETURNS pg_lsn
+         AS 'pagestore','pagestore_reader_candidate_lsn' LANGUAGE C;
+       CREATE FUNCTION pagestore_reader_candidate_generation() RETURNS bigint
+         AS 'pagestore','pagestore_reader_candidate_generation' LANGUAGE C;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
 # released subtransactions exceed the normal snapshot subxid capacity; the
 # writer commits it only after the copy, so the reader has no post-R relation
@@ -1243,6 +1247,7 @@ assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the n
 READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
+pagestore.advance_read_lsn = on
 archive_mode = off
 listen_addresses = ''
 unix_socket_directories = '$READER_SOCK'
@@ -1359,6 +1364,12 @@ if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
+assert "$($PR -c "SELECT pagestore_reader_candidate_lsn() > '$readerR'::pg_lsn;")" "t" \
+	"advancing reader discovers a newer durable checkpoint horizon"
+assert "$($PR -c "SELECT pagestore_reader_candidate_generation() >= 2;")" "t" \
+	"a newer candidate receives a new shared read generation"
+assert "$($PR -c "SELECT current_setting('pagestore.read_lsn')::pg_lsn = '$readerR'::pg_lsn;")" "t" \
+	"candidate discovery does not move the effective view without its snapshot"
 reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
 if [ "$reader_v" != "v1" ]; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true

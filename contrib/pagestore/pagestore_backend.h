@@ -175,6 +175,8 @@ extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
 extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
 										   uint64 lsn);
 extern uint64 pagestore_localsvc_read_lsn(void);
+extern bool pagestore_localsvc_read_fence_timeout(uint64 read_lsn,
+											  uint64 *read_seq, int timeout_ms);
 extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
 /* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */

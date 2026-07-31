@@ -65,7 +65,9 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
+#include "storage/shmem.h"
 #include "storage/smgr.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -83,6 +85,8 @@ static bool pagestore_route_user_tablespaces = false;
 static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
+static bool pagestore_advance_read_lsn = false;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
@@ -90,6 +94,32 @@ static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
 static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
+static void pagestore_refresh_reader_horizon(void);
+
+#define PAGESTORE_READER_HORIZON_TTL_MS 1000
+#define PAGESTORE_READER_HORIZON_TIMEOUT_MS 10000
+#define PAGESTORE_READER_HORIZON_LEASE_MS \
+	(3 * PAGESTORE_READER_HORIZON_TIMEOUT_MS)
+
+typedef struct PagestoreReaderHorizonShmem
+{
+	slock_t		mutex;
+	XLogRecPtr	candidate_lsn;
+	uint32		candidate_generation;
+	TimestampTz refreshed_at;
+	int			refresh_owner_pid;
+	TimestampTz refresh_started_at;
+} PagestoreReaderHorizonShmem;
+
+static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
+
+static void
+pagestore_shmem_request(void)
+{
+	if (prev_shmem_request_hook != NULL)
+		prev_shmem_request_hook();
+	RequestAddinShmemSpace(MAXALIGN(sizeof(PagestoreReaderHorizonShmem)));
+}
 
 static bool
 pagestore_buffer_tag_read_epoch(RelFileLocatorBackend rlocator,
@@ -1993,7 +2023,7 @@ pagestore_clog_status_asof(PG_FUNCTION_ARGS)
  * whenever an image exists.
  */
 static bool
-ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
+ps_control_asof_timeout(XLogRecPtr lsn, ControlFileData *cf, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	char		page[BLCKSZ];
@@ -2002,14 +2032,125 @@ ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
 
 	if (BLCKSZ < PG_CONTROL_FILE_SIZE)
 		return false;
-	if (!pagestore_localsvc_obj_read_at(PS_KLASS_CONTROL, &key, 0,
-										(uint64) lsn, page, &resolved))
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key, 0,
+												(uint64) lsn, page, &resolved,
+												timeout_ms))
 		return false;
 	memcpy(cf, page, sizeof(*cf));
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, cf, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
 	return EQ_CRC32C(crc, cf->crc);
+}
+
+static bool
+ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
+{
+	return ps_control_asof_timeout(lsn, cf, 0);
+}
+
+/*
+ * Discover a newer durable checkpoint view.  This only publishes a candidate:
+ * adopting it also requires the exact-R running-XID snapshot, which is a
+ * separate artifact.  Keeping discovery shared avoids one control-store read
+ * per backend while preserving the fixed reader's current semantics.
+ */
+static void
+pagestore_refresh_reader_horizon(void)
+{
+	ControlFileData control;
+	TimestampTz now;
+	TimestampTz refreshed_at;
+	XLogRecPtr candidate;
+	uint64		read_seq;
+	MemoryContext cxt = CurrentMemoryContext;
+	bool		valid = false;
+	bool		owns_lease;
+	ErrorData  *edata = NULL;
+
+	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
+		pagestore_localsvc_read_lsn() == 0)
+		return;
+
+	now = GetCurrentTimestamp();
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	refreshed_at = pagestore_reader_horizon->refreshed_at;
+	if (refreshed_at != 0 &&
+		!TimestampDifferenceExceeds(refreshed_at, now,
+								PAGESTORE_READER_HORIZON_TTL_MS))
+	{
+		SpinLockRelease(&pagestore_reader_horizon->mutex);
+		return;
+	}
+	if (pagestore_reader_horizon->refresh_owner_pid != 0 &&
+		!TimestampDifferenceExceeds(
+			pagestore_reader_horizon->refresh_started_at, now,
+			PAGESTORE_READER_HORIZON_LEASE_MS))
+	{
+		SpinLockRelease(&pagestore_reader_horizon->mutex);
+		return;
+	}
+	pagestore_reader_horizon->refresh_owner_pid = MyProcPid;
+	pagestore_reader_horizon->refresh_started_at = now;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+
+	PG_TRY();
+	{
+		if (ps_control_asof_timeout((XLogRecPtr) UINT64_MAX, &control,
+									PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		{
+			candidate = control.checkPointCopy.redo;
+			valid = !XLogRecPtrIsInvalid(candidate) &&
+				pagestore_localsvc_read_fence_timeout((uint64) candidate,
+													&read_seq,
+													PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+			/*
+			 * READ_AT can see a writer's posted control batch before its drain
+			 * reaches sync.  Sync after both reads makes the exact control/fence
+			 * pair durable before the shared candidate becomes visible.
+			 */
+			if (valid)
+				pagestore_localsvc_store_sync_timeout(
+					PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+	}
+	PG_END_TRY();
+
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	owns_lease = pagestore_reader_horizon->refresh_owner_pid == MyProcPid;
+	if (owns_lease)
+	{
+		if (edata == NULL && valid &&
+			candidate > pagestore_reader_horizon->candidate_lsn)
+		{
+			pagestore_reader_horizon->candidate_lsn = candidate;
+			pagestore_reader_horizon->candidate_generation++;
+			if (pagestore_reader_horizon->candidate_generation == 0)
+				pagestore_reader_horizon->candidate_generation = 1;
+		}
+		pagestore_reader_horizon->refreshed_at = GetCurrentTimestamp();
+		pagestore_reader_horizon->refresh_owner_pid = 0;
+		pagestore_reader_horizon->refresh_started_at = 0;
+	}
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+
+	if (edata != NULL)
+	{
+		if (edata->elevel >= FATAL)
+			ReThrowError(edata);
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			ReThrowError(edata);
+		}
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
 }
 
 static bool
@@ -5314,6 +5455,7 @@ pagestore_get_snapshot_data(Snapshot snapshot)
 	if (read_lsn == 0)
 		return prev_get_snapshot_data_hook != NULL &&
 			prev_get_snapshot_data_hook(snapshot);
+	pagestore_refresh_reader_horizon();
 	if (pagestore_fixed_snapshot == NULL)
 		pagestore_fixed_snapshot = pagestore_load_reader_snapshot(DataDir,
 			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
@@ -5341,6 +5483,36 @@ pagestore_get_snapshot_data(Snapshot snapshot)
 		memcpy(snapshot->subxip, pagestore_fixed_snapshot->xids,
 			   snapshot->subxcnt * sizeof(TransactionId));
 	return true;
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_candidate_lsn);
+Datum
+pagestore_reader_candidate_lsn(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	candidate;
+
+	if (pagestore_reader_horizon == NULL)
+		PG_RETURN_NULL();
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	candidate = pagestore_reader_horizon->candidate_lsn;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (XLogRecPtrIsInvalid(candidate))
+		PG_RETURN_NULL();
+	PG_RETURN_LSN(candidate);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_candidate_generation);
+Datum
+pagestore_reader_candidate_generation(PG_FUNCTION_ARGS)
+{
+	uint32		generation;
+
+	if (pagestore_reader_horizon == NULL)
+		PG_RETURN_INT64(0);
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	generation = pagestore_reader_horizon->candidate_generation;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	PG_RETURN_INT64((int64) generation);
 }
 
 static void
@@ -6453,9 +6625,27 @@ pagestore_validate_datadir_branch_manifest(void)
 	XLogRecPtr	fork_lsn;
 	XLogRecPtr	reader_fork_lsn;
 	uint64		read_lsn;
+	bool		found;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	pagestore_reader_horizon = ShmemInitStruct("pagestore reader horizon",
+											 sizeof(PagestoreReaderHorizonShmem),
+											 &found);
+	if (!found)
+	{
+		SpinLockInit(&pagestore_reader_horizon->mutex);
+		pagestore_reader_horizon->candidate_lsn =
+			(XLogRecPtr) pagestore_localsvc_read_lsn();
+		pagestore_reader_horizon->candidate_generation =
+			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		pagestore_reader_horizon->refreshed_at = 0;
+		pagestore_reader_horizon->refresh_owner_pid = 0;
+		pagestore_reader_horizon->refresh_started_at = 0;
+	}
+	LWLockRelease(AddinShmemInitLock);
 
 	if (DataDir == NULL)
 		return;
@@ -7279,7 +7469,21 @@ _PG_init(void)
 							 false,
 							 PGC_USERSET,
 							 0,
+								 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pagestore.advance_read_lsn",
+							 "Discover newer durable read horizons for a pinned reader.",
+							 "New horizons are published as candidates at snapshot boundaries; "
+							 "they are not adopted until their exact running-XID snapshot is available.",
+							 &pagestore_advance_read_lsn,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
 							 NULL, NULL, NULL);
+
+	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
+		ereport(ERROR,
+				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
 
 	/*
 	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs
@@ -7294,6 +7498,8 @@ _PG_init(void)
 	 * must run before the prefix is reserved; the backend-name GUC it
 	 * checks is final here.
 	 */
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pagestore_shmem_request;
 	pagestore_slru_mirror_init(pagestore_backend_name != NULL &&
 							   strcmp(pagestore_backend_name, "localsvc") == 0);
 
