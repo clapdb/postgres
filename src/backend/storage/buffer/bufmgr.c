@@ -188,6 +188,7 @@ typedef struct SMgrSortArray
 /* GUC variables */
 bool		zero_damaged_pages = false;
 bool		page_maintenance_suppressed = false;
+buffer_tag_read_epoch_hook_type buffer_tag_read_epoch_hook = NULL;
 int			bgwriter_lru_maxpages = 100;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
@@ -690,6 +691,25 @@ static void BufferLockWakeup(BufferDesc *buf_hdr, bool wake_exclusive);
 static void BufferLockProcessRelease(BufferDesc *buf_hdr, BufferLockMode mode, uint64 lockstate);
 static inline uint64 BufferLockReleaseSub(BufferLockMode mode);
 
+static inline void
+InitBufferTagForSMgr(BufferTag *tag, SMgrRelation smgr, ForkNumber forkNum,
+					 BlockNumber blockNum)
+{
+	InitBufferTag(tag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
+	if (buffer_tag_read_epoch_hook != NULL)
+		(void) buffer_tag_read_epoch_hook(smgr->smgr_rlocator,
+										  &tag->read_epoch);
+}
+
+static inline bool
+BufferTagUsesReadEpoch(SMgrRelation smgr)
+{
+	uint32		read_epoch;
+
+	return buffer_tag_read_epoch_hook != NULL &&
+		buffer_tag_read_epoch_hook(smgr->smgr_rlocator, &read_epoch);
+}
+
 
 /*
  * Implementation of PrefetchBuffer() for shared buffers.
@@ -708,8 +728,7 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
 	Assert(BlockNumberIsValid(blockNum));
 
 	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr_reln->smgr_rlocator.locator,
-				  forkNum, blockNum);
+	InitBufferTagForSMgr(&newTag, smgr_reln, forkNum, blockNum);
 
 	/* determine its hash code and partition lock ID */
 	newHash = BufTableHashCode(&newTag);
@@ -848,6 +867,15 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 	}
 	else
 	{
+		RelFileLocatorBackend rlocator_backend = {
+			.locator = rlocator,
+			.backend = INVALID_PROC_NUMBER
+		};
+
+		if (buffer_tag_read_epoch_hook != NULL)
+			(void) buffer_tag_read_epoch_hook(rlocator_backend,
+											  &tag.read_epoch);
+
 		bufHdr = GetBufferDescriptor(recent_buffer - 1);
 
 		/*
@@ -2214,7 +2242,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	ReservePrivateRefCountEntry();
 
 	/* create a tag so we can lookup the buffer */
-	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
+	InitBufferTagForSMgr(&newTag, smgr, forkNum, blockNum);
 
 	/* determine its hash code and partition lock ID */
 	newHash = BufTableHashCode(&newTag);
@@ -2909,8 +2937,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 		ReservePrivateRefCountEntry();
 
-		InitBufferTag(&tag, &BMR_GET_SMGR(bmr)->smgr_rlocator.locator, fork,
-					  first_block + i);
+		InitBufferTagForSMgr(&tag, BMR_GET_SMGR(bmr), fork,
+							 first_block + i);
 		hash = BufTableHashCode(&tag);
 		partition_lock = BufMappingPartitionLock(hash);
 
@@ -4834,7 +4862,8 @@ DropRelationBuffers(SMgrRelation smgr_reln, ForkNumber *forkNum,
 	 * We apply the optimization iff the total number of blocks to invalidate
 	 * is below the BUF_DROP_FULL_SCAN_THRESHOLD.
 	 */
-	if (BlockNumberIsValid(nBlocksToInvalidate) &&
+	if (!BufferTagUsesReadEpoch(smgr_reln) &&
+		BlockNumberIsValid(nBlocksToInvalidate) &&
 		nBlocksToInvalidate < BUF_DROP_FULL_SCAN_THRESHOLD)
 	{
 		for (j = 0; j < nforks; j++)
@@ -4943,6 +4972,12 @@ DropRelationsAllBuffers(SMgrRelation *smgr_reln, int nlocators)
 	 */
 	for (i = 0; i < n && cached; i++)
 	{
+		if (BufferTagUsesReadEpoch(rels[i]))
+		{
+			cached = false;
+			break;
+		}
+
 		for (int j = 0; j <= MAX_FORKNUM; j++)
 		{
 			/* Get the number of blocks for a relation's fork. */

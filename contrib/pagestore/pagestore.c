@@ -85,9 +85,25 @@ static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
+static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
+static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
+
+static bool
+pagestore_buffer_tag_read_epoch(RelFileLocatorBackend rlocator,
+								uint32 *read_epoch)
+{
+	if (pagestore_which(rlocator.locator, rlocator.backend) ==
+		pagestore_smgr_which)
+	{
+		*read_epoch = pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		return true;
+	}
+	return prev_buffer_tag_read_epoch_hook != NULL ?
+		prev_buffer_tag_read_epoch_hook(rlocator, read_epoch) : false;
+}
 
 /* the active backend (selected by pagestore.backend) */
 static const PageStoreBackend *pagestore_active_backend = &PageStoreBackendPassthrough;
@@ -7286,6 +7302,8 @@ _PG_init(void)
 	/* register our smgr implementation and claim relations via the hook */
 	pagestore_smgr_which = smgr_register(&pagestore_smgr);
 	smgr_which_hook = pagestore_which;
+	prev_buffer_tag_read_epoch_hook = buffer_tag_read_epoch_hook;
+	buffer_tag_read_epoch_hook = pagestore_buffer_tag_read_epoch;
 	prev_get_snapshot_data_hook = get_snapshot_data_hook;
 	get_snapshot_data_hook = pagestore_get_snapshot_data;
 

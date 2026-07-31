@@ -171,6 +171,11 @@ extern PGDLLIMPORT bool zero_damaged_pages;
  * page-content WAL.
  */
 extern PGDLLIMPORT bool page_maintenance_suppressed;
+
+/* Let an out-of-core storage manager distinguish shared-buffer read views. */
+typedef bool (*buffer_tag_read_epoch_hook_type) (RelFileLocatorBackend rlocator,
+												 uint32 *read_epoch);
+extern PGDLLIMPORT buffer_tag_read_epoch_hook_type buffer_tag_read_epoch_hook;
 extern PGDLLIMPORT int bgwriter_lru_maxpages;
 extern PGDLLIMPORT double bgwriter_lru_multiplier;
 extern PGDLLIMPORT bool track_io_timing;

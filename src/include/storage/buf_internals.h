@@ -165,6 +165,7 @@ typedef struct buftag
 	RelFileNumber relNumber;	/* relation file number */
 	ForkNumber	forkNum;		/* fork number */
 	BlockNumber blockNum;		/* blknum relative to begin of reln */
+	uint32		read_epoch;		/* storage-manager read-view generation */
 } BufferTag;
 
 static inline RelFileNumber
@@ -206,6 +207,7 @@ ClearBufferTag(BufferTag *tag)
 	tag->dbOid = InvalidOid;
 	BufTagSetRelForkDetails(tag, InvalidRelFileNumber, InvalidForkNumber);
 	tag->blockNum = InvalidBlockNumber;
+	tag->read_epoch = 0;
 }
 
 static inline void
@@ -216,6 +218,7 @@ InitBufferTag(BufferTag *tag, const RelFileLocator *rlocator,
 	tag->dbOid = rlocator->dbOid;
 	BufTagSetRelForkDetails(tag, rlocator->relNumber, forkNum);
 	tag->blockNum = blockNum;
+	tag->read_epoch = 0;
 }
 
 static inline bool
@@ -223,6 +226,7 @@ BufferTagsEqual(const BufferTag *tag1, const BufferTag *tag2)
 {
 	return (tag1->spcOid == tag2->spcOid) &&
 		(tag1->dbOid == tag2->dbOid) &&
+		(tag1->read_epoch == tag2->read_epoch) &&
 		(tag1->relNumber == tag2->relNumber) &&
 		(tag1->blockNum == tag2->blockNum) &&
 		(tag1->forkNum == tag2->forkNum);
@@ -385,6 +389,10 @@ typedef union BufferDescPadded
 	BufferDesc	bufferdesc;
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
+
+StaticAssertDecl(SIZEOF_VOID_P != 8 ||
+				 sizeof(BufferDesc) <= BUFFERDESC_PAD_TO_SIZE,
+				 "BufferDesc exceeds its cache-line stride");
 
 /*
  * The PendingWriteback & WritebackContext structure are used to keep
