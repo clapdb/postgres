@@ -1,9 +1,9 @@
 # Multi-compute read consistency: design
 
 Status: increments 1a (the page-read pin), 1b (as-of size/existence
-metadata), the 1c SLRU/control/running-xacts boot artifacts, and 1d (the
-same-LSN admission fence) are implemented.  Exact catalog provenance and
-increments 2 and 3 are specified here and not yet built.
+metadata), 1c (the complete fixed-reader boot contract, including catalog
+provenance), and 1d (the same-LSN admission fence) are implemented.
+Increments 2 and 3 are specified here and not yet built.
 
 ## Problem
 
@@ -187,13 +187,15 @@ reconstruction.
    so a transaction in flight at R remains invisible even if local recovery
    later replays its commit.
 
-   The control plane still has to supply catalogs proven to be at R.  A
-   quiesced datadir copy is sufficient only when no catalog-changing work can
-   run between fixing redo and taking the copy; otherwise catalogs must be
-   routed through the versioned store or restored from a recovery artifact at
-   R.  The reader manifest carries branch ancestry provenance, but does not yet
-   carry or validate this catalog-snapshot provenance, so this increment is not
-   the complete 1c boot contract.
+   Catalog provenance is part of the boot contract too.  The control plane
+   restores the target copy's pg_control to exact R and calls
+   `pagestore_mark_reader_catalog_snapshot`; that publishes a CRC-protected
+   artifact bound to the system identifier, timeline, and R.  Reader manifest
+   format 2 declares that artifact, and install plus every startup validate it
+   before accepting the local catalog snapshot.  The control plane is still
+   responsible for producing the snapshot under quiescence, or from recovery
+   at R; the protocol no longer permits an unstamped or differently stamped
+   catalog directory to boot as the reader.
 1d. **The same-LSN admission fence (implemented).**  Relation versions are keyed by
    pd_lsn, and the writer's hint-bit-only page writes re-ship a page
    under an UNCHANGED pd_lsn: a version written after R can win a

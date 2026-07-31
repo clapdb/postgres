@@ -4940,6 +4940,9 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 #define PAGESTORE_READER_SNAPSHOT_MAGIC UINT32_C(0x50535253)
 #define PAGESTORE_READER_SNAPSHOT_FORMAT 1
 #define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
+#define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
+#define PAGESTORE_READER_CATALOG_FORMAT 1
+#define PAGESTORE_READER_CATALOG_FILE "pagestore_reader.catalog"
 
 typedef struct PagestoreReaderSnapshotHeader
 {
@@ -4959,6 +4962,92 @@ typedef struct PagestoreReaderSnapshot
 	PagestoreReaderSnapshotHeader header;
 	TransactionId *xids;
 } PagestoreReaderSnapshot;
+
+typedef struct PagestoreReaderCatalogProvenance
+{
+	uint64		read_lsn;
+	uint64		system_identifier;
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		reserved;
+	pg_crc32c	crc;
+	uint32		padding;
+} PagestoreReaderCatalogProvenance;
+
+static bool pagestore_pread_exact(int fd, void *buf, Size size, off_t offset);
+
+static void
+pagestore_reader_catalog_crc(PagestoreReaderCatalogProvenance *provenance)
+{
+	INIT_CRC32C(provenance->crc);
+	COMP_CRC32C(provenance->crc, provenance,
+				offsetof(PagestoreReaderCatalogProvenance, crc));
+	FIN_CRC32C(provenance->crc);
+}
+
+static void
+pagestore_load_reader_catalog_provenance(const char *dir, uint32 timeline,
+										 XLogRecPtr read_lsn,
+										 uint64 system_identifier, int elevel)
+{
+	PagestoreReaderCatalogProvenance provenance;
+	PagestoreReaderCatalogProvenance checked;
+	char		path[MAXPGPATH];
+	struct stat st;
+	int			fd;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/%s", dir,
+				   PAGESTORE_READER_CATALOG_FILE);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(elevel,
+				(errcode_for_file_access(),
+				 errmsg("could not open reader catalog provenance \"%s\": %m", path)));
+	if (fstat(fd, &st) != 0 ||
+		st.st_size != (off_t) sizeof(provenance) ||
+		!pagestore_pread_exact(fd, &provenance, sizeof(provenance), 0))
+	{
+		CloseTransientFile(fd);
+		ereport(elevel,
+				(errmsg("reader catalog provenance \"%s\" has an invalid size", path)));
+	}
+	CloseTransientFile(fd);
+	if (provenance.magic != PAGESTORE_READER_CATALOG_MAGIC ||
+		provenance.format != PAGESTORE_READER_CATALOG_FORMAT ||
+		provenance.reserved != 0 || provenance.padding != 0 ||
+		provenance.timeline != timeline || provenance.read_lsn != read_lsn ||
+		provenance.system_identifier != system_identifier)
+		ereport(elevel,
+				(errmsg("reader catalog provenance \"%s\" has an invalid identity", path)));
+	checked = provenance;
+	pagestore_reader_catalog_crc(&checked);
+	if (!EQ_CRC32C(checked.crc, provenance.crc))
+		ereport(elevel,
+				(errmsg("reader catalog provenance \"%s\" has an invalid checksum", path)));
+}
+
+static void
+pagestore_write_reader_catalog_provenance(const char *target_dir,
+										  uint32 timeline,
+										  XLogRecPtr read_lsn,
+										  uint64 system_identifier)
+{
+	PagestoreReaderCatalogProvenance provenance;
+
+	memset(&provenance, 0, sizeof(provenance));
+	provenance.read_lsn = read_lsn;
+	provenance.system_identifier = system_identifier;
+	provenance.magic = PAGESTORE_READER_CATALOG_MAGIC;
+	provenance.format = PAGESTORE_READER_CATALOG_FORMAT;
+	provenance.timeline = timeline;
+	pagestore_reader_catalog_crc(&provenance);
+	pagestore_publish_artifact(target_dir, PAGESTORE_READER_CATALOG_FILE,
+							   "reader catalog provenance",
+							   (char *) &provenance, sizeof(provenance));
+}
 
 static bool
 pagestore_pread_exact(int fd, void *buf, Size size, off_t offset)
@@ -5323,8 +5412,9 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
-							"  \"format\": 1,\n"
+							"  \"format\": 2,\n"
 							"  \"kind\": \"pinned_reader\",\n"
+							"  \"catalog_provenance\": \"%s\",\n"
 							"  \"timeline\": %d,\n"
 							"%s"
 							"  \"base_lsn\": \"%X/%08X\",\n"
@@ -5339,6 +5429,7 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 							"  \"next_member\": \"%lld\",\n"
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
+							PAGESTORE_READER_CATALOG_FILE,
 							timeline, ancestry, LSN_FORMAT_ARGS(base),
 							LSN_FORMAT_ARGS(read_lsn), oldest_xid, next_xid,
 							oldest_commit_ts_xid, next_commit_ts_xid,
@@ -5911,8 +6002,10 @@ pagestore_reader_manifest_get_branch_identity(const char *manifest,
 
 	return pagestore_manifest_is_single_object(manifest) &&
 		pagestore_manifest_get_uint_token(manifest, "format", &format) &&
-		format == 1 &&
+		format == 2 &&
 		pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") &&
+		pagestore_manifest_has_string_token(manifest, "catalog_provenance",
+										PAGESTORE_READER_CATALOG_FILE) &&
 		pagestore_manifest_get_uint_token(manifest, "timeline", timeline) &&
 		*timeline != 0 &&
 		pagestore_manifest_get_uint_token(manifest, "parent_timeline",
@@ -5932,8 +6025,10 @@ pagestore_reader_manifest_matches(const char *manifest, int32 timeline,
 
 	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
 		!pagestore_manifest_is_single_object(manifest) ||
-		!pagestore_manifest_has_uint_token(manifest, "format", 1) ||
+		!pagestore_manifest_has_uint_token(manifest, "format", 2) ||
 		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
+		!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
+										 PAGESTORE_READER_CATALOG_FILE) ||
 		!pagestore_manifest_has_uint_token(manifest, "timeline", timeline))
 		return false;
 	if (timeline > 0 &&
@@ -6281,6 +6376,55 @@ pagestore_validate_reader_manifest(PG_FUNCTION_ARGS)
 				   pagestore_reader_manifest_matches(manifest, timeline, read_lsn));
 }
 
+/*
+ * Attest that target_dir is the control plane's catalog snapshot for R.  The
+ * exact-R pg_control must already be installed, so the durable artifact cannot
+ * be minted for an arbitrary running or copied data directory.
+ */
+PG_FUNCTION_INFO_V1(pagestore_mark_reader_catalog_snapshot);
+Datum
+pagestore_mark_reader_catalog_snapshot(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		timeline = PG_GETARG_INT32(1);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(2);
+	ControlFileData *control;
+	ControlFileData mirrored;
+	bool		crc_ok;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to mark a reader catalog snapshot")));
+	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid reader timeline or read LSN")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to mark a reader catalog snapshot")));
+	if ((uint32) timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("reader timeline %d is not the active localsvc timeline %u",
+						timeline, pagestore_localsvc_timeline())));
+	if (!ps_control_asof(read_lsn, &mirrored) ||
+		mirrored.checkPointCopy.redo != read_lsn)
+		ereport(ERROR,
+				(errmsg("reader LSN is not a durably mirrored checkpoint redo")));
+	control = get_controlfile(target_dir, &crc_ok);
+	if (!crc_ok || control->checkPointCopy.redo != read_lsn ||
+		control->system_identifier != mirrored.system_identifier)
+		ereport(ERROR,
+				(errmsg("catalog snapshot pg_control does not match the requested reader checkpoint"),
+				 errdetail("The catalog snapshot requires checkpoint redo %X/%08X.",
+						   LSN_FORMAT_ARGS(read_lsn))));
+	pagestore_write_reader_catalog_provenance(target_dir, (uint32) timeline,
+										 read_lsn,
+										 control->system_identifier);
+	pfree(control);
+	PG_RETURN_VOID();
+}
+
 static void
 pagestore_validate_datadir_branch_manifest(void)
 {
@@ -6332,6 +6476,9 @@ pagestore_validate_datadir_branch_manifest(void)
 					(errmsg("pg_control does not match pagestore_reader.manifest"),
 					 errdetail("The reader requires checkpoint redo %X/%08X.",
 							   LSN_FORMAT_ARGS((XLogRecPtr) read_lsn))));
+		pagestore_load_reader_catalog_provenance(DataDir,
+			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
+			control->system_identifier, FATAL);
 		pfree(control);
 		if (pagestore_localsvc_timeline() != 0)
 		{
@@ -6679,6 +6826,8 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	XLogRecPtr	reader_fork_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	target_reader_fork_lsn = InvalidXLogRecPtr;
 	PagestoreReaderSnapshot *prepared_snapshot;
+	ControlFileData *target_control;
+	bool		target_control_crc_ok;
 	bool		commit_ts_required;
 
 	if (!superuser())
@@ -6736,6 +6885,17 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	if (timeline > 0)
 		pagestore_localsvc_require_branch(reader_tl, reader_parent,
 									  (uint64) reader_fork_lsn);
+	target_control = get_controlfile(target_dir, &target_control_crc_ok);
+	if (!target_control_crc_ok || target_control->checkPointCopy.redo != read_lsn)
+		ereport(ERROR,
+				(errmsg("target catalog snapshot pg_control does not match the reader LSN"),
+				 errdetail("The reader requires checkpoint redo %X/%08X.",
+						   LSN_FORMAT_ARGS(read_lsn))));
+	pagestore_load_reader_catalog_provenance(target_dir, (uint32) timeline,
+										 read_lsn,
+										 target_control->system_identifier,
+										 ERROR);
+	pfree(target_control);
 
 	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
 	if (commit_ts_required)

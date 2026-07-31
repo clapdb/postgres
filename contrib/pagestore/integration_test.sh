@@ -1154,7 +1154,9 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
        CREATE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void
          AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn) RETURNS bool
-         AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;" >/dev/null
+         AS 'pagestore','pagestore_validate_reader_manifest' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void
+         AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
 # released subtransactions exceed the normal snapshot subxid capacity; the
 # writer commits it only after the copy, so the reader has no post-R relation
@@ -1221,16 +1223,19 @@ branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCH
 assert "$branch_reader_install" "error" \
 	"reader install rejects a snapshot from a different timeline"
 rm -rf "$BRANCHREADERPREP" "$BRANCHREADERTARGET"
-$P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0, '$readerR');" >/dev/null
 # Emulate local recovery having replayed the later commit: newest pg_xact says
 # committed, but the fixed running-XID snapshot must retain R's visibility.
-cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
-rm -f "$READERDATA/pg_twophase/"*
 if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn "$readerR" "$READERDATA" >/dev/null; then
 	echo "ok   - reader bootstrap restored pg_control at exact R"
 else
 	echo "FAIL - reader bootstrap could not restore pg_control at exact R"; fail=1
 fi
+$P -c "SELECT pagestore_mark_reader_catalog_snapshot('$READERDATA', 0, '$readerR');" >/dev/null
+$P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0, '$readerR');" >/dev/null
+# Emulate local recovery having replayed the later commit: newest pg_xact says
+# committed, but the fixed running-XID snapshot must retain R's visibility.
+cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
+rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
@@ -1253,6 +1258,32 @@ unix_socket_directories = '$BADREADER_SOCK'
 EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_arch_started=1 || pin_arch_started=0
 assert "$pin_arch_started" "0" "pinned start without a reader manifest is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+# A catalog snapshot is part of the reader identity, not an optional control-plane note.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(new_sockdir badreader)
+rm "$BADREADER/pagestore_reader.catalog"
+cat >> "$BADREADER/postgresql.conf" <<EOF
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_catalog_started=1 || pin_catalog_started=0
+assert "$pin_catalog_started" "0" "pinned start without catalog provenance is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
+# Catalog provenance corruption is detected independently of its manifest token.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(new_sockdir badreader)
+printf '\001' | dd of="$BADREADER/pagestore_reader.catalog" bs=1 seek=0 conv=notrunc status=none
+cat >> "$BADREADER/postgresql.conf" <<EOF
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_catalog_crc_started=1 || pin_catalog_crc_started=0
+assert "$pin_catalog_crc_started" "0" "pinned start with corrupt catalog provenance is refused"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
@@ -1297,9 +1328,9 @@ assert "$pin_route_started" "0" "pinned start without full store routing is refu
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
 echo "pagestore.route_all = on" >> "$READERDATA/postgresql.conf"
-# Startup must revalidate persisted branch ancestry even though reader install
-# removed the target's branch manifest.  Timeline 1 exists, but not at this
-# forged fork point.
+# Startup must reject a reader whose manifest was moved to another timeline.
+# Catalog provenance is checked before daemon ancestry, so the copied timeline-0
+# artifact prevents the forged timeline-1 manifest from reaching that lookup.
 BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
 BADREADER_SOCK=$(new_sockdir badreader)
@@ -1312,8 +1343,8 @@ unix_socket_directories = '$BADREADER_SOCK'
 EOF
 "$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_branch_started=1 || pin_branch_started=0
 assert "$pin_branch_started" "0" "pinned branch reader rejects forged ancestry at startup"
-assert "$(grep -c 'daemon reported error' "$BADREADER/server.log" || true)" "1" \
-	"pinned branch startup checks ancestry with the daemon"
+assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/server.log" || true)" "1" \
+	"pinned branch startup binds catalog provenance to its timeline"
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
