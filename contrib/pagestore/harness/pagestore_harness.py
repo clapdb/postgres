@@ -599,13 +599,15 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 reader_socket = root / "socket" / action["target"]
                 reader_socket.mkdir(parents=True)
                 shutil.copytree(seed, reader_data)
-                setup = "CREATE OR REPLACE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;"
-                subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
                 lsn = checkpoints[ref[1:]]["redo_lsn"]
-                sql = f"SELECT pagestore_install_prepared_reader('{str(prepared).replace(chr(39), chr(39) * 2)}', '{str(reader_data).replace(chr(39), chr(39) * 2)}', 0, '{lsn}')"
-                result = subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql], check=True, capture_output=True, encoding="utf-8", env=env)
                 restore = daemon.parent / "pagestore_control_restore"
                 subprocess.run([str(restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                setup = """CREATE OR REPLACE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;"""
+                subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
+                reader_data_sql = str(reader_data).replace(chr(39), chr(39) * 2)
+                sql = f"SELECT pagestore_mark_reader_catalog_snapshot('{reader_data_sql}', 0, '{lsn}'); SELECT pagestore_install_prepared_reader('{str(prepared).replace(chr(39), chr(39) * 2)}', '{reader_data_sql}', 0, '{lsn}')"
+                result = subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql], check=True, capture_output=True, encoding="utf-8", env=env)
                 reader_port = free_port()
                 (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(f"pagestore.read_lsn = '{lsn}'\npagestore.route_all = on\narchive_mode = off\nlisten_addresses = ''\nunix_socket_directories = '{reader_socket}'\nport = {reader_port}\n")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
