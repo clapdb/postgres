@@ -98,6 +98,8 @@ static void pagestore_refresh_reader_horizon(void);
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
 #define PAGESTORE_READER_HORIZON_TIMEOUT_MS 10000
+#define PAGESTORE_READER_HORIZON_LEASE_MS \
+	(3 * PAGESTORE_READER_HORIZON_TIMEOUT_MS)
 
 typedef struct PagestoreReaderHorizonShmem
 {
@@ -105,6 +107,8 @@ typedef struct PagestoreReaderHorizonShmem
 	XLogRecPtr	candidate_lsn;
 	uint32		candidate_generation;
 	TimestampTz refreshed_at;
+	int			refresh_owner_pid;
+	TimestampTz refresh_started_at;
 } PagestoreReaderHorizonShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -2045,24 +2049,6 @@ ps_control_asof(XLogRecPtr lsn, ControlFileData *cf)
 	return ps_control_asof_timeout(lsn, cf, 0);
 }
 
-static void
-pagestore_rearm_interrupt(void)
-{
-	ErrorData  *edata = CopyErrorData();
-
-	if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
-	{
-		QueryCancelPending = true;
-		InterruptPending = true;
-	}
-	else if (edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
-	{
-		ProcDiePending = true;
-		InterruptPending = true;
-	}
-	FreeErrorData(edata);
-}
-
 /*
  * Discover a newer durable checkpoint view.  This only publishes a candidate:
  * adopting it also requires the exact-R running-XID snapshot, which is a
@@ -2079,6 +2065,8 @@ pagestore_refresh_reader_horizon(void)
 	uint64		read_seq;
 	MemoryContext cxt = CurrentMemoryContext;
 	bool		valid = false;
+	bool		owns_lease;
+	ErrorData  *edata = NULL;
 
 	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
 		pagestore_localsvc_read_lsn() == 0)
@@ -2087,11 +2075,24 @@ pagestore_refresh_reader_horizon(void)
 	now = GetCurrentTimestamp();
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
 	refreshed_at = pagestore_reader_horizon->refreshed_at;
-	SpinLockRelease(&pagestore_reader_horizon->mutex);
 	if (refreshed_at != 0 &&
 		!TimestampDifferenceExceeds(refreshed_at, now,
 								PAGESTORE_READER_HORIZON_TTL_MS))
+	{
+		SpinLockRelease(&pagestore_reader_horizon->mutex);
 		return;
+	}
+	if (pagestore_reader_horizon->refresh_owner_pid != 0 &&
+		!TimestampDifferenceExceeds(
+			pagestore_reader_horizon->refresh_started_at, now,
+			PAGESTORE_READER_HORIZON_LEASE_MS))
+	{
+		SpinLockRelease(&pagestore_reader_horizon->mutex);
+		return;
+	}
+	pagestore_reader_horizon->refresh_owner_pid = MyProcPid;
+	pagestore_reader_horizon->refresh_started_at = now;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
 
 	PG_TRY();
 	{
@@ -2103,33 +2104,53 @@ pagestore_refresh_reader_horizon(void)
 				pagestore_localsvc_read_fence_timeout((uint64) candidate,
 													&read_seq,
 													PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+			/*
+			 * READ_AT can see a writer's posted control batch before its drain
+			 * reaches sync.  Sync after both reads makes the exact control/fence
+			 * pair durable before the shared candidate becomes visible.
+			 */
+			if (valid)
+				pagestore_localsvc_store_sync_timeout(
+					PAGESTORE_READER_HORIZON_TIMEOUT_MS);
 		}
 	}
 	PG_CATCH();
 	{
 		MemoryContextSwitchTo(cxt);
-		pagestore_rearm_interrupt();
-		FlushErrorState();
+		edata = CopyErrorData();
 	}
 	PG_END_TRY();
-	if (!valid)
-	{
-		SpinLockAcquire(&pagestore_reader_horizon->mutex);
-		pagestore_reader_horizon->refreshed_at = GetCurrentTimestamp();
-		SpinLockRelease(&pagestore_reader_horizon->mutex);
-		return;
-	}
 
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
-	if (candidate > pagestore_reader_horizon->candidate_lsn)
+	owns_lease = pagestore_reader_horizon->refresh_owner_pid == MyProcPid;
+	if (owns_lease)
 	{
-		pagestore_reader_horizon->candidate_lsn = candidate;
-		pagestore_reader_horizon->candidate_generation++;
-		if (pagestore_reader_horizon->candidate_generation == 0)
-			pagestore_reader_horizon->candidate_generation = 1;
+		if (edata == NULL && valid &&
+			candidate > pagestore_reader_horizon->candidate_lsn)
+		{
+			pagestore_reader_horizon->candidate_lsn = candidate;
+			pagestore_reader_horizon->candidate_generation++;
+			if (pagestore_reader_horizon->candidate_generation == 0)
+				pagestore_reader_horizon->candidate_generation = 1;
+		}
+		pagestore_reader_horizon->refreshed_at = GetCurrentTimestamp();
+		pagestore_reader_horizon->refresh_owner_pid = 0;
+		pagestore_reader_horizon->refresh_started_at = 0;
 	}
-	pagestore_reader_horizon->refreshed_at = GetCurrentTimestamp();
 	SpinLockRelease(&pagestore_reader_horizon->mutex);
+
+	if (edata != NULL)
+	{
+		if (edata->elevel >= FATAL)
+			ReThrowError(edata);
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			ReThrowError(edata);
+		}
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
 }
 
 static bool
@@ -6621,6 +6642,8 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_horizon->candidate_generation =
 			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
 		pagestore_reader_horizon->refreshed_at = 0;
+		pagestore_reader_horizon->refresh_owner_pid = 0;
+		pagestore_reader_horizon->refresh_started_at = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
 
