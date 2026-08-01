@@ -238,15 +238,19 @@ reconstruction.
    as versioned `PS_KLASS_READER_SNAPSHOT` data blocks followed by its manifest.
    Both identities bind timeline and R; readers require exact-R versions of the
    manifest and every block, validate both CRC layers, and sync the observed
-   objects before accepting them.  Increment 2d loads an available candidate
-   snapshot at top-level transaction start, resolves its exact admission fence,
-   and then atomically swaps the backend's `(R, generation, snapshot)`.  Buffer
+   objects before accepting them.  Increment 2d resolves the newest published
+   snapshot at or below the discovered candidate at top-level transaction
+   start, so a publisher that trails checkpoint discovery remains adoptable.
+   It resolves the exact admission fence and checkpoint control state, advances
+   the local XID and multixact interpretation horizons, and then atomically
+   swaps the backend's `(R, generation, snapshot)`.  Buffer
    tags use the effective generation, so pages from the old and new views cannot
    alias.  A missing, corrupt, or temporarily unavailable candidate artifact
    leaves the old view intact.  Adoption also invalidates catalog, relation,
    and plan caches before the transaction can use the new view.  Transaction
-   status is read from the writer's newest live SLRU mirror; the exact-R running
-   set filters commits that occurred after R.  Advancing readers force
+   status after the boot generation is read from versioned live SLRU images and
+   tombstones as of R; the exact boot generation continues to use its prepared
+   local SLRU artifacts.  Advancing readers force
    non-parallel planning because worker transaction state does not yet carry
    this extension's view identity.  Snapshot and catalog-artifact
    derivation/publication remain control-plane actions; automating those actions

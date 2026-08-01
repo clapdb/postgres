@@ -143,6 +143,8 @@ typedef struct PagestoreReaderHorizonShmem
 	slock_t		mutex;
 	XLogRecPtr	candidate_lsn;
 	uint32		candidate_generation;
+	XLogRecPtr	adoptable_lsn;
+	uint32		adoptable_generation;
 	TimestampTz refreshed_at;
 	int			refresh_owner_pid;
 	TimestampTz refresh_started_at;
@@ -5687,6 +5689,22 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 	return snapshot;
 }
 
+static XLogRecPtr
+pagestore_resolve_published_reader_snapshot(XLogRecPtr upper_lsn)
+{
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) upper_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		return InvalidXLogRecPtr;
+	return (XLogRecPtr) resolved;
+}
+
 PG_FUNCTION_INFO_V1(pagestore_publish_reader_snapshot_artifact);
 Datum
 pagestore_publish_reader_snapshot_artifact(PG_FUNCTION_ARGS)
@@ -5755,7 +5773,10 @@ pagestore_adopt_reader_view_at_xact_start(void)
 	MemoryContext cxt = CurrentMemoryContext;
 	ErrorData  *edata = NULL;
 	XLogRecPtr	candidate;
-	uint32		generation;
+	XLogRecPtr	published;
+	XLogRecPtr	newest_adoptable;
+	ControlFileData control;
+	uint32		adoption_generation;
 	uint64		read_seq = 0;
 	bool		valid = false;
 
@@ -5768,20 +5789,27 @@ pagestore_adopt_reader_view_at_xact_start(void)
 	pagestore_refresh_reader_horizon();
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
 	candidate = pagestore_reader_horizon->candidate_lsn;
-	generation = pagestore_reader_horizon->candidate_generation;
 	SpinLockRelease(&pagestore_reader_horizon->mutex);
-	if (candidate <= (XLogRecPtr) pagestore_localsvc_read_lsn() ||
-		generation <= pagestore_localsvc_read_epoch())
+	if (candidate <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 		return;
 	snapshot_context = AllocSetContextCreate(TopMemoryContext,
 		"pagestore advancing reader snapshot", ALLOCSET_DEFAULT_SIZES);
 
 	PG_TRY();
 	{
+		published = pagestore_resolve_published_reader_snapshot(candidate);
+		if (XLogRecPtrIsInvalid(published) ||
+			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
+			goto adoption_done;
 		snapshot = pagestore_load_published_reader_snapshot(
-			pagestore_localsvc_timeline(), candidate, snapshot_context, ERROR);
-		valid = pagestore_localsvc_read_fence_timeout((uint64) candidate,
-			&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+			pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
+		valid = ps_control_asof_timeout(published, &control,
+			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
+			control.checkPointCopy.redo == published &&
+			pagestore_localsvc_read_fence_timeout((uint64) published,
+				&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+adoption_done:
+		;
 	}
 	PG_CATCH();
 	{
@@ -5807,14 +5835,35 @@ pagestore_adopt_reader_view_at_xact_start(void)
 			MemoryContextDelete(snapshot_context);
 		return;
 	}
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	if (published > pagestore_reader_horizon->adoptable_lsn)
+	{
+		pagestore_reader_horizon->adoptable_lsn = published;
+		pagestore_reader_horizon->candidate_generation++;
+		if (pagestore_reader_horizon->candidate_generation == 0)
+			pagestore_reader_horizon->candidate_generation = 1;
+		pagestore_reader_horizon->adoptable_generation =
+			pagestore_reader_horizon->candidate_generation;
+	}
+	adoption_generation = pagestore_reader_horizon->adoptable_generation;
+	newest_adoptable = pagestore_reader_horizon->adoptable_lsn;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (published < newest_adoptable ||
+		adoption_generation <= pagestore_localsvc_read_epoch())
+	{
+		MemoryContextDelete(snapshot_context);
+		return;
+	}
 	AdvanceNextFullTransactionIdToReadOnlyHorizon(snapshot->header.xmax);
+	MultiXactAdvanceNextMXact(control.checkPointCopy.nextMulti,
+							 control.checkPointCopy.nextMultiOffset);
 
 	old_snapshot = pagestore_fixed_snapshot;
 	old_snapshot_context = pagestore_fixed_snapshot_context;
 	pagestore_fixed_snapshot = snapshot;
 	pagestore_fixed_snapshot_context = snapshot_context;
-	pagestore_localsvc_adopt_read_view((uint64) candidate, read_seq,
-									 generation);
+	pagestore_localsvc_adopt_read_view((uint64) published, read_seq,
+									 adoption_generation);
 	InvalidateSystemCachesExtended(true);
 	ResetPlanCache();
 	if (old_snapshot_context != NULL)
@@ -7038,6 +7087,10 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_horizon->candidate_lsn =
 			(XLogRecPtr) pagestore_localsvc_read_lsn();
 		pagestore_reader_horizon->candidate_generation =
+			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		pagestore_reader_horizon->adoptable_lsn =
+			(XLogRecPtr) pagestore_localsvc_read_lsn();
+		pagestore_reader_horizon->adoptable_generation =
 			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
 		pagestore_reader_horizon->refreshed_at = 0;
 		pagestore_reader_horizon->refresh_owner_pid = 0;
