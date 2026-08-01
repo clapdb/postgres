@@ -1466,6 +1466,12 @@ assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"the adopted reader view serves pages from the newer horizon"
 assert "$($PR -c "SELECT count(*) FROM reader_running;")" "1" \
 	"the adopted exact-R snapshot exposes transactions committed before the newer horizon"
+assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
+	SET min_parallel_table_scan_size = 0;
+	SET parallel_setup_cost = 0;
+	SET parallel_tuple_cost = 0;
+	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
+	"advancing readers cannot re-enable parallel plans with session settings"
 rm -rf "$READERPREP2"
 "$BIN/pg_ctl" -D "$READERDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"

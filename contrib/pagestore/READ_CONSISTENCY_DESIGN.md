@@ -243,11 +243,14 @@ reconstruction.
    and then atomically swaps the backend's `(R, generation, snapshot)`.  Buffer
    tags use the effective generation, so pages from the old and new views cannot
    alias.  A missing, corrupt, or temporarily unavailable candidate artifact
-   leaves the old view intact.  Advancing readers currently disable parallel
-   query because worker transaction state does not yet carry this extension's
-   view identity.  Snapshot derivation/publication remains a control-plane
-   action; automating that action is the remaining part of the advancing-reader
-   workflow.
+   leaves the old view intact.  Adoption also invalidates catalog, relation,
+   and plan caches before the transaction can use the new view.  Transaction
+   status is read from the writer's newest live SLRU mirror; the exact-R running
+   set filters commits that occurred after R.  Advancing readers force
+   non-parallel planning because worker transaction state does not yet carry
+   this extension's view identity.  Snapshot and catalog-artifact
+   derivation/publication remain control-plane actions; automating those actions
+   is the remaining part of the advancing-reader workflow.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the

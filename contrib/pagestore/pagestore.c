@@ -56,6 +56,8 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
+#include "optimizer/planner.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
@@ -71,8 +73,10 @@
 #include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/plancache.h"
 #include "utils/rel.h"
 #include "walredo_client.h"
 
@@ -92,12 +96,42 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
 static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
 static void pagestore_refresh_reader_horizon(void);
 static bool pagestore_branch_backend_active(void);
+
+static PlannedStmt *
+pagestore_planner(Query *parse, const char *query_string, int cursor_options,
+				  ParamListInfo bound_params, ExplainState *es)
+{
+	PlannedStmt *result;
+	int			saved_max_parallel_workers_per_gather;
+
+	if (!pagestore_advance_read_lsn)
+		return prev_planner_hook != NULL ?
+			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
+			standard_planner(parse, query_string, cursor_options, bound_params, es);
+
+	saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
+	max_parallel_workers_per_gather = 0;
+	PG_TRY();
+	{
+		result = prev_planner_hook != NULL ?
+			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
+			standard_planner(parse, query_string, cursor_options, bound_params, es);
+	}
+	PG_FINALLY();
+	{
+		max_parallel_workers_per_gather =
+			saved_max_parallel_workers_per_gather;
+	}
+	PG_END_TRY();
+	return result;
+}
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
 #define PAGESTORE_READER_HORIZON_TIMEOUT_MS 10000
@@ -5781,6 +5815,8 @@ pagestore_adopt_reader_view_at_xact_start(void)
 	pagestore_fixed_snapshot_context = snapshot_context;
 	pagestore_localsvc_adopt_read_view((uint64) candidate, read_seq,
 									 generation);
+	InvalidateSystemCachesExtended(true);
+	ResetPlanCache();
 	if (old_snapshot_context != NULL)
 		MemoryContextDelete(old_snapshot_context);
 	else if (old_snapshot != NULL)
@@ -7846,9 +7882,8 @@ _PG_init(void)
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
-	if (pagestore_advance_read_lsn)
-		SetConfigOption("max_parallel_workers_per_gather", "0",
-						PGC_POSTMASTER, PGC_S_OVERRIDE);
+	prev_planner_hook = planner_hook;
+	planner_hook = pagestore_planner;
 
 	/*
 	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs

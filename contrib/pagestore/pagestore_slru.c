@@ -4432,25 +4432,29 @@ pagestore_slru_mirror_init(bool localsvc_active)
 	for (int i = 0; i < (int) lengthof(ps_slru_dirmap); i++)
 		ps_slru_dirmap[i].obj = pagestore_slru_klass_id(ps_slru_dirmap[i].dir);
 
-	if (!pagestore_slru_mirror && !pagestore_slru_live_reads)
+	if (!pagestore_slru_mirror && !pagestore_slru_live_reads &&
+		pagestore_localsvc_read_lsn() == 0)
 		return;
 	if (!localsvc_active)
 		ereport(ERROR,
 				(errmsg("pagestore.slru_mirror and pagestore.slru_live_reads require pagestore.backend = 'localsvc'")));
 
 	/*
-	 * A pinned reader (pagestore.read_lsn) publishes nothing: its SLRU
-	 * pages are the writer's, and the mirror's ship paths would only run
-	 * into the pinned-write refusals -- ERRORs raised inside drains that
-	 * are not built to see them.  Disable the mirror wholesale rather than
-	 * letting it thrash.
+	 * A pinned reader publishes nothing: its SLRU pages are the writer's, and
+	 * the mirror's ship paths would only run into pinned-write refusals.  It
+	 * does consume the writer's newest status mirror.  The exact-R running-XID
+	 * snapshot keeps transactions that committed after R invisible, while
+	 * committed transactions outside that set need the newest status bits.
 	 */
 	if (pagestore_localsvc_read_lsn() != 0)
 	{
+		pagestore_slru_mirror = false;
+		pagestore_slru_live_reads = true;
 		ereport(LOG,
-				(errmsg("pagestore: SLRU mirroring/live reads disabled on a pinned reader (pagestore.read_lsn)")));
-		return;
+				(errmsg("pagestore: SLRU mirroring disabled and live reads enabled on a pinned reader (pagestore.read_lsn)")));
 	}
+	if (!pagestore_slru_mirror && !pagestore_slru_live_reads)
+		return;
 
 	if (pagestore_slru_mirror)
 	{
