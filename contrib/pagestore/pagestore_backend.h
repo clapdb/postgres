@@ -175,6 +175,9 @@ extern uint64 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key,
 extern int	pagestore_localsvc_exists_asof(const PageStoreRelKey *key,
 										   uint64 lsn);
 extern uint64 pagestore_localsvc_read_lsn(void);
+extern uint32 pagestore_localsvc_read_epoch(void);
+extern void pagestore_localsvc_adopt_read_view(uint64 read_lsn,
+										   uint64 read_seq, uint32 read_epoch);
 extern bool pagestore_localsvc_read_fence_timeout(uint64 read_lsn,
 											  uint64 *read_seq, int timeout_ms);
 extern void pagestore_localsvc_pinned_init(bool localsvc_active);

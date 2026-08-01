@@ -38,6 +38,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/parallel.h"
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
@@ -90,6 +91,7 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
+static xact_start_hook_type prev_xact_start_hook = NULL;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
@@ -129,7 +131,7 @@ pagestore_buffer_tag_read_epoch(RelFileLocatorBackend rlocator,
 	if (pagestore_which(rlocator.locator, rlocator.backend) ==
 		pagestore_smgr_which)
 	{
-		*read_epoch = pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		*read_epoch = pagestore_localsvc_read_epoch();
 		return true;
 	}
 	return prev_buffer_tag_read_epoch_hook != NULL ?
@@ -5707,6 +5709,87 @@ pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
 }
 
 static PagestoreReaderSnapshot *pagestore_fixed_snapshot = NULL;
+static MemoryContext pagestore_fixed_snapshot_context = NULL;
+
+static void
+pagestore_adopt_reader_view_at_xact_start(void)
+{
+	PagestoreReaderSnapshot *snapshot = NULL;
+	PagestoreReaderSnapshot *old_snapshot;
+	MemoryContext snapshot_context;
+	MemoryContext old_snapshot_context;
+	MemoryContext cxt = CurrentMemoryContext;
+	ErrorData  *edata = NULL;
+	XLogRecPtr	candidate;
+	uint32		generation;
+	uint64		read_seq = 0;
+	bool		valid = false;
+
+	if (prev_xact_start_hook != NULL)
+		prev_xact_start_hook();
+	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
+		pagestore_localsvc_read_lsn() == 0 || IsParallelWorker())
+		return;
+
+	pagestore_refresh_reader_horizon();
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	candidate = pagestore_reader_horizon->candidate_lsn;
+	generation = pagestore_reader_horizon->candidate_generation;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (candidate <= (XLogRecPtr) pagestore_localsvc_read_lsn() ||
+		generation <= pagestore_localsvc_read_epoch())
+		return;
+	snapshot_context = AllocSetContextCreate(TopMemoryContext,
+		"pagestore advancing reader snapshot", ALLOCSET_DEFAULT_SIZES);
+
+	PG_TRY();
+	{
+		snapshot = pagestore_load_published_reader_snapshot(
+			pagestore_localsvc_timeline(), candidate, snapshot_context, ERROR);
+		valid = pagestore_localsvc_read_fence_timeout((uint64) candidate,
+			&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+	}
+	PG_END_TRY();
+
+	if (edata != NULL)
+	{
+		MemoryContextDelete(snapshot_context);
+		snapshot_context = NULL;
+		if (edata->elevel >= FATAL ||
+			edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			ReThrowError(edata);
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
+	if (!valid)
+	{
+		if (snapshot_context != NULL)
+			MemoryContextDelete(snapshot_context);
+		return;
+	}
+	AdvanceNextFullTransactionIdToReadOnlyHorizon(snapshot->header.xmax);
+
+	old_snapshot = pagestore_fixed_snapshot;
+	old_snapshot_context = pagestore_fixed_snapshot_context;
+	pagestore_fixed_snapshot = snapshot;
+	pagestore_fixed_snapshot_context = snapshot_context;
+	pagestore_localsvc_adopt_read_view((uint64) candidate, read_seq,
+									 generation);
+	if (old_snapshot_context != NULL)
+		MemoryContextDelete(old_snapshot_context);
+	else if (old_snapshot != NULL)
+	{
+		if (old_snapshot->xids != NULL)
+			pfree(old_snapshot->xids);
+		pfree(old_snapshot);
+	}
+}
 
 static bool
 pagestore_get_snapshot_data(Snapshot snapshot)
@@ -5774,6 +5857,24 @@ pagestore_reader_candidate_generation(PG_FUNCTION_ARGS)
 	generation = pagestore_reader_horizon->candidate_generation;
 	SpinLockRelease(&pagestore_reader_horizon->mutex);
 	PG_RETURN_INT64((int64) generation);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_effective_lsn);
+Datum
+pagestore_reader_effective_lsn(PG_FUNCTION_ARGS)
+{
+	uint64		read_lsn = pagestore_localsvc_read_lsn();
+
+	if (read_lsn == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_LSN((XLogRecPtr) read_lsn);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_effective_generation);
+Datum
+pagestore_reader_effective_generation(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) pagestore_localsvc_read_epoch());
 }
 
 static void
@@ -7745,6 +7846,9 @@ _PG_init(void)
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
+	if (pagestore_advance_read_lsn)
+		SetConfigOption("max_parallel_workers_per_gather", "0",
+						PGC_POSTMASTER, PGC_S_OVERRIDE);
 
 	/*
 	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs
@@ -7773,6 +7877,8 @@ _PG_init(void)
 	buffer_tag_read_epoch_hook = pagestore_buffer_tag_read_epoch;
 	prev_get_snapshot_data_hook = get_snapshot_data_hook;
 	get_snapshot_data_hook = pagestore_get_snapshot_data;
+	prev_xact_start_hook = xact_start_hook;
+	xact_start_hook = pagestore_adopt_reader_view_at_xact_start;
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;

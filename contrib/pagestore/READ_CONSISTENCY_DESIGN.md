@@ -3,8 +3,9 @@
 Status: increments 1a (the page-read pin), 1b (as-of size/existence
 metadata), 1c (the complete fixed-reader boot contract, including catalog
 provenance), 1d (the same-LSN admission fence), 2a (buffer generations),
-2b (candidate publication), and 2c (running-XID artifact transport) are
-implemented.  Advancing-view adoption and increment 3 are not yet built.
+2b (candidate publication), 2c (running-XID artifact transport), and 2d
+(transaction-boundary view adoption) are implemented.  Automatic snapshot
+derivation/publication and increment 3 are not yet built.
 
 ## Problem
 
@@ -221,7 +222,7 @@ reconstruction.
    fail-closed: checkpoint R does not prove those pages complete even though
    their store admission order is known.
 
-2. **The advancing reader (2a-2c implemented through artifact transport).**
+2. **The advancing reader (2a-2d implemented through view adoption).**
    R advances by re-deriving from
    the control mirror (the SLRU reader's TTL/epoch protocol, generalized).
    Increment 2a adds an out-of-core storage-manager read generation to
@@ -237,9 +238,16 @@ reconstruction.
    as versioned `PS_KLASS_READER_SNAPSHOT` data blocks followed by its manifest.
    Both identities bind timeline and R; readers require exact-R versions of the
    manifest and every block, validate both CRC layers, and sync the observed
-   objects before accepting them.  Snapshot derivation/publication is still a
-   control-plane action.  The remaining increment automates that action and
-   atomically adopts `(R, generation, snapshot)` only at transaction boundaries.
+   objects before accepting them.  Increment 2d loads an available candidate
+   snapshot at top-level transaction start, resolves its exact admission fence,
+   and then atomically swaps the backend's `(R, generation, snapshot)`.  Buffer
+   tags use the effective generation, so pages from the old and new views cannot
+   alias.  A missing, corrupt, or temporarily unavailable candidate artifact
+   leaves the old view intact.  Advancing readers currently disable parallel
+   query because worker transaction state does not yet carry this extension's
+   view identity.  Snapshot derivation/publication remains a control-plane
+   action; automating that action is the remaining part of the advancing-reader
+   workflow.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the
