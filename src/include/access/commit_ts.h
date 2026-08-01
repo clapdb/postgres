@@ -36,6 +36,8 @@ extern void ExtendCommitTs(TransactionId newestXact);
 extern void TruncateCommitTs(TransactionId oldestXact);
 extern void SetCommitTsLimit(TransactionId oldestXact,
 							 TransactionId newestXact);
+extern void SetCommitTsReadOnlyHorizon(TransactionId oldestXact,
+									 TransactionId newestXact);
 extern void AdvanceOldestCommitTsXid(TransactionId oldestXact);
 
 extern int	committssyncfiletag(const FileTag *ftag, char *path);

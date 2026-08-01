@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "access/commit_ts.h"
+#include "access/xact.h"
 #include "access/htup_details.h"
 #include "access/slru.h"
 #include "access/transam.h"
@@ -967,6 +968,20 @@ SetCommitTsLimit(TransactionId oldestXact, TransactionId newestXact)
 		TransamVariables->oldestCommitTsXid = oldestXact;
 		TransamVariables->newestCommitTsXid = newestXact;
 	}
+	LWLockRelease(CommitTsLock);
+}
+
+void
+SetCommitTsReadOnlyHorizon(TransactionId oldestXact,
+						   TransactionId newestXact)
+{
+	Assert(transaction_read_only_forced);
+	Assert(TransactionIdIsValid(oldestXact) ==
+		   TransactionIdIsValid(newestXact));
+
+	LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
+	TransamVariables->oldestCommitTsXid = oldestXact;
+	TransamVariables->newestCommitTsXid = newestXact;
 	LWLockRelease(CommitTsLock);
 }
 

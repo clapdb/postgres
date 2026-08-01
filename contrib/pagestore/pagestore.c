@@ -5854,9 +5854,12 @@ adoption_done:
 		MemoryContextDelete(snapshot_context);
 		return;
 	}
-	AdvanceNextFullTransactionIdToReadOnlyHorizon(snapshot->header.xmax);
+	AdvanceNextFullTransactionIdToReadOnlyHorizon(
+		control.checkPointCopy.nextXid);
 	MultiXactAdvanceNextMXact(control.checkPointCopy.nextMulti,
 							 control.checkPointCopy.nextMultiOffset);
+	SetCommitTsReadOnlyHorizon(control.checkPointCopy.oldestCommitTsXid,
+							   control.checkPointCopy.newestCommitTsXid);
 
 	old_snapshot = pagestore_fixed_snapshot;
 	old_snapshot_context = pagestore_fixed_snapshot_context;

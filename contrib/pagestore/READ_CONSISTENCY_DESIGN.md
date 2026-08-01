@@ -242,15 +242,17 @@ reconstruction.
    snapshot at or below the discovered candidate at top-level transaction
    start, so a publisher that trails checkpoint discovery remains adoptable.
    It resolves the exact admission fence and checkpoint control state, advances
-   the local XID and multixact interpretation horizons, and then atomically
+   the local full-XID, multixact, and commit-timestamp interpretation horizons,
+   and then atomically
    swaps the backend's `(R, generation, snapshot)`.  Buffer
    tags use the effective generation, so pages from the old and new views cannot
    alias.  A missing, corrupt, or temporarily unavailable candidate artifact
    leaves the old view intact.  Adoption also invalidates catalog, relation,
    and plan caches before the transaction can use the new view.  Transaction
-   status after the boot generation is read from versioned live SLRU images and
-   tombstones as of R; the exact boot generation continues to use its prepared
-   local SLRU artifacts.  Advancing readers force
+   status is read from the newest complete live SLRU image; the exact-R running
+   set masks commits after R.  If the writer has since tombstoned a status page,
+   the reader retains its prepared local seed instead of letting newest
+   truncation erase history needed by old relation pages.  Advancing readers force
    non-parallel planning because worker transaction state does not yet carry
    this extension's view identity.  Snapshot and catalog-artifact
    derivation/publication remain control-plane actions; automating those actions

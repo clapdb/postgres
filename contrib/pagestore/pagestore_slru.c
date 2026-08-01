@@ -2052,70 +2052,6 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 	obj = ps_slru_dirmap[idx].obj;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
 		return SLRU_READ_HOOK_FALLBACK;
-	if (pagestore_localsvc_read_lsn() != 0 &&
-		pagestore_localsvc_read_epoch() == 1)
-		return SLRU_READ_HOOK_FALLBACK;
-
-	/*
-	 * A pinned reader needs transaction status as of its effective relation
-	 * horizon, not the writer's newest tombstone.  Live images and tombstones
-	 * are versioned, so resolve both at R; a seeded local page is the baseline
-	 * when no live image had yet been published.
-	 */
-	if (pagestore_localsvc_read_lsn() != 0)
-	{
-		PageStoreRelKey key = {0};
-		char		tomb_page[BLCKSZ];
-		uint64		horizon = pagestore_localsvc_read_lsn();
-		uint64		image_version = 0;
-		uint64		tomb_version = 0;
-		int64		cutoff = -1;
-		bool		have_image;
-		bool		have_tomb;
-
-		PG_TRY();
-		{
-			ps_slru_obj_key(&key, obj);
-			have_tomb = pagestore_localsvc_obj_read_at_timeout(
-				PS_KLASS_SLRU_TOMB, &key, 0, horizon, tomb_page,
-				&tomb_version, PS_SLRU_SHIP_TIMEOUT_MS);
-			if (have_tomb)
-				memcpy(&cutoff, tomb_page, sizeof(cutoff));
-			have_image = pagestore_localsvc_obj_read_at_timeout(
-				PS_KLASS_SLRU_LIVE, &key, (BlockNumber) pageno, horizon,
-				page, &image_version, PS_SLRU_SHIP_TIMEOUT_MS);
-			if (have_tomb && ps_slru_tomb_covers(ctl, pageno, cutoff) &&
-				(!have_image || image_version <= tomb_version))
-				res = SLRU_READ_HOOK_FAILED;
-			else if (have_image)
-				res = SLRU_READ_HOOK_SERVED;
-			else if (!ps_slru_local_page_exists(ctl, pageno))
-				res = SLRU_READ_HOOK_FAILED;
-		}
-		PG_CATCH();
-		{
-			MemoryContextSwitchTo(cxt);
-			ps_slru_rearm_interrupt();
-			FlushErrorState();
-			res = SLRU_READ_HOOK_FAILED;
-		}
-		PG_END_TRY();
-
-		if (res == SLRU_READ_HOOK_SERVED)
-		{
-			ps_slru_read_served++;
-			if (ps_slru_wm != NULL)
-				pg_atomic_fetch_add_u64(&ps_slru_wm->read_served, 1);
-		}
-		else if (res == SLRU_READ_HOOK_FALLBACK)
-		{
-			ps_slru_read_fallback++;
-			if (ps_slru_wm != NULL)
-				pg_atomic_fetch_add_u64(&ps_slru_wm->read_fallback, 1);
-		}
-		return res;
-	}
-
 	/* the writer's own local files outrank its (lagging) mirror */
 	if (ps_slru_mirror_enabled && ps_slru_local_segment_exists(ctl, pageno))
 	{
@@ -2302,7 +2238,14 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 					 * behind, so defer to them.
 					 */
 					if (!ps_slru_mirror_enabled)
-						res = SLRU_READ_HOOK_FAILED;
+					{
+						if (pagestore_localsvc_read_lsn() == 0 ||
+							!ps_slru_local_page_exists(ctl, pageno))
+							res = SLRU_READ_HOOK_FAILED;
+						else
+							ps_slru_served_note(obj, (uint32) pageno,
+											PG_UINT64_MAX);
+					}
 				}
 				else
 				{
@@ -2445,9 +2388,6 @@ ps_slru_exists_hook(SlruDesc *ctl, int64 pageno, bool *exists)
 		return SLRU_READ_HOOK_FALLBACK;
 	obj = ps_slru_dirmap[idx].obj;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
-		return SLRU_READ_HOOK_FALLBACK;
-	if (pagestore_localsvc_read_lsn() != 0 &&
-		pagestore_localsvc_read_epoch() == 1)
 		return SLRU_READ_HOOK_FALLBACK;
 
 	/* the writer's own local files outrank its (lagging) mirror */
@@ -2678,9 +2618,6 @@ ps_slru_revalidate_hook(SlruDesc *ctl, int64 pageno)
 	if (idx < 0)
 		return true;
 	if (pageno < 0 || pageno > (int64) PG_UINT32_MAX)
-		return true;
-	if (pagestore_localsvc_read_lsn() != 0 &&
-		pagestore_localsvc_read_epoch() == 1)
 		return true;
 	if (ps_slru_wm == NULL)
 		return true;

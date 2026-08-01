@@ -354,27 +354,14 @@ AdvanceNextFullTransactionIdPastXid(TransactionId xid)
  * this compute's boot horizon.
  */
 void
-AdvanceNextFullTransactionIdToReadOnlyHorizon(TransactionId xid)
+AdvanceNextFullTransactionIdToReadOnlyHorizon(FullTransactionId xid)
 {
-	FullTransactionId next_full_xid;
-	FullTransactionId new_next_full_xid;
-	TransactionId next_xid;
-	uint32		epoch;
-
 	Assert(transaction_read_only_forced);
-	Assert(TransactionIdIsNormal(xid));
+	Assert(FullTransactionIdIsNormal(xid));
 
 	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
-	next_full_xid = TransamVariables->nextXid;
-	next_xid = XidFromFullTransactionId(next_full_xid);
-	if (TransactionIdFollows(xid, next_xid))
-	{
-		epoch = EpochFromFullTransactionId(next_full_xid);
-		if (unlikely(xid < next_xid))
-			++epoch;
-		new_next_full_xid = FullTransactionIdFromEpochAndXid(epoch, xid);
-		TransamVariables->nextXid = new_next_full_xid;
-	}
+	if (FullTransactionIdFollows(xid, TransamVariables->nextXid))
+		TransamVariables->nextXid = xid;
 	LWLockRelease(XidGenLock);
 }
 
