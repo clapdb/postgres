@@ -2,8 +2,9 @@
 
 Status: increments 1a (the page-read pin), 1b (as-of size/existence
 metadata), 1c (the complete fixed-reader boot contract, including catalog
-provenance), and 1d (the same-LSN admission fence) are implemented.
-Increments 2 and 3 are specified here and not yet built.
+provenance), 1d (the same-LSN admission fence), 2a (buffer generations),
+2b (candidate publication), and 2c (running-XID artifact transport) are
+implemented.  Advancing-view adoption and increment 3 are not yet built.
 
 ## Problem
 
@@ -220,8 +221,8 @@ reconstruction.
    fail-closed: checkpoint R does not prove those pages complete even though
    their store admission order is known.
 
-2. **The advancing reader (2a implemented; 2b candidate publication
-   implemented).**  R advances by re-deriving from
+2. **The advancing reader (2a-2c implemented through artifact transport).**
+   R advances by re-deriving from
    the control mirror (the SLRU reader's TTL/epoch protocol, generalized).
    Increment 2a adds an out-of-core storage-manager read generation to
    shared-buffer tags; pagestore uses generation 1 for a pinned reader, so its
@@ -231,9 +232,14 @@ reconstruction.
    checkpoint at snapshot boundaries, validates its exact admission fence, and
    publishes the candidate plus a monotone shared generation.  Discovery does
    not change the effective view: adoption remains gated on publishing and
-   loading the exact-R running-XID snapshot.  The remaining increment provides
-   that artifact and atomically adopts `(R, generation, snapshot)` only at
-   transaction boundaries.
+   loading the exact-R running-XID snapshot.  Increment 2c provides that
+   transport: the control plane can publish an existing CRC-protected snapshot
+   as versioned `PS_KLASS_READER_SNAPSHOT` data blocks followed by its manifest.
+   Both identities bind timeline and R; readers require exact-R versions of the
+   manifest and every block, validate both CRC layers, and sync the observed
+   objects before accepting them.  Snapshot derivation/publication is still a
+   control-plane action.  The remaining increment automates that action and
+   atomically adopts `(R, generation, snapshot)` only at transaction boundaries.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the

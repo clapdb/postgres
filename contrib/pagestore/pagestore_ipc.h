@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		20	/* 20: WAL_INDEX_PROGRESS opcode added;
+#define PS_SHM_VERSION		21	/* 21: READER_SNAPSHOT object class added;
+								 * 20: WAL_INDEX_PROGRESS opcode added;
 							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
 								 *     writes return their admission sequence
@@ -131,6 +132,7 @@ typedef enum PsObjClass
 								 * carrying) the watermark LSN; readers on
 								 * other computes trust the live mirror up
 								 * to the newest one and no further */
+	PS_KLASS_READER_SNAPSHOT = 6, /* exact-R running-XID snapshot artifacts */
 } PsObjClass;
 
 /* Version-neutral object identity (relation forks: mirrors PageStoreRelKey). */

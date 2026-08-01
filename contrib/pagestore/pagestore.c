@@ -95,6 +95,7 @@ static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static int	pagestore_smgr_which = -1;
 static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
 static void pagestore_refresh_reader_horizon(void);
+static bool pagestore_branch_backend_active(void);
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
 #define PAGESTORE_READER_HORIZON_TIMEOUT_MS 10000
@@ -5120,6 +5121,24 @@ typedef struct PagestoreReaderSnapshot
 	TransactionId *xids;
 } PagestoreReaderSnapshot;
 
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC UINT32_C(0x5053524D)
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
+#define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
+#define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
+
+typedef struct PagestoreReaderSnapshotManifest
+{
+	uint64		read_lsn;
+	uint64		artifact_size;
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		block_count;
+	pg_crc32c	artifact_crc;
+	pg_crc32c	crc;
+} PagestoreReaderSnapshotManifest;
+
 typedef struct PagestoreReaderCatalogProvenance
 {
 	uint64		read_lsn;
@@ -5237,6 +5256,60 @@ pagestore_reader_snapshot_crc(PagestoreReaderSnapshotHeader *header,
 		COMP_CRC32C(header->crc, xids,
 					header->count * sizeof(TransactionId));
 	FIN_CRC32C(header->crc);
+}
+
+static void
+pagestore_reader_snapshot_manifest_crc(PagestoreReaderSnapshotManifest *manifest)
+{
+	INIT_CRC32C(manifest->crc);
+	COMP_CRC32C(manifest->crc, manifest,
+				offsetof(PagestoreReaderSnapshotManifest, crc));
+	FIN_CRC32C(manifest->crc);
+}
+
+static PageStoreRelKey
+pagestore_reader_snapshot_key(uint32 object)
+{
+	PageStoreRelKey key = {0};
+
+	key.relNumber = object;
+	return key;
+}
+
+static void
+pagestore_validate_reader_snapshot(PagestoreReaderSnapshot *snapshot,
+								   uint32 timeline, XLogRecPtr read_lsn,
+								   const char *source, int elevel)
+{
+	PagestoreReaderSnapshotHeader checked = snapshot->header;
+	PagestoreReaderSnapshotHeader *header = &snapshot->header;
+
+	if (header->magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		header->format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		header->reserved != 0 || header->timeline != timeline ||
+		header->read_lsn != read_lsn ||
+		header->count > MaxAllocSize / sizeof(TransactionId) ||
+		!TransactionIdIsNormal(header->xmin) ||
+		!TransactionIdIsNormal(header->xmax) ||
+		TransactionIdPrecedes(header->xmax, header->xmin))
+		ereport(elevel,
+				(errmsg("reader snapshot %s has an invalid identity or header",
+						source)));
+	pagestore_reader_snapshot_crc(&checked, snapshot->xids);
+	if (!EQ_CRC32C(checked.crc, header->crc))
+		ereport(elevel,
+				(errmsg("reader snapshot %s has an invalid checksum", source)));
+	for (uint32 i = 0; i < header->count; i++)
+	{
+		if (!TransactionIdIsNormal(snapshot->xids[i]) ||
+			TransactionIdPrecedes(snapshot->xids[i], header->xmin) ||
+			!TransactionIdPrecedes(snapshot->xids[i], header->xmax) ||
+			(i > 0 && !TransactionIdPrecedes(snapshot->xids[i - 1],
+										 snapshot->xids[i])))
+			ereport(elevel,
+					(errmsg("reader snapshot %s has invalid transaction IDs",
+							source)));
+	}
 }
 
 static void
@@ -5366,7 +5439,6 @@ pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
 							   int elevel)
 {
 	PagestoreReaderSnapshotHeader header;
-	PagestoreReaderSnapshotHeader checked;
 	PagestoreReaderSnapshot *snapshot;
 	char		path[MAXPGPATH];
 	struct stat st;
@@ -5426,23 +5498,212 @@ pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
 		}
 	}
 	CloseTransientFile(fd);
-	checked = header;
-	pagestore_reader_snapshot_crc(&checked, snapshot->xids);
-	if (!EQ_CRC32C(checked.crc, header.crc))
-		ereport(elevel,
-				(errmsg("reader snapshot \"%s\" has an invalid checksum", path)));
-	for (uint32 i = 0; i < header.count; i++)
-	{
-		if (!TransactionIdIsNormal(snapshot->xids[i]) ||
-			TransactionIdPrecedes(snapshot->xids[i], header.xmin) ||
-			!TransactionIdPrecedes(snapshot->xids[i], header.xmax) ||
-			(i > 0 && !TransactionIdPrecedes(snapshot->xids[i - 1],
-										 snapshot->xids[i])))
-			ereport(elevel,
-					(errmsg("reader snapshot \"%s\" has invalid transaction IDs",
-							path)));
-	}
+	pagestore_validate_reader_snapshot(snapshot, timeline, read_lsn, path,
+									 elevel);
 	return snapshot;
+}
+
+static BlockNumber
+pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
+								  XLogRecPtr read_lsn)
+{
+	PagestoreReaderSnapshot *snapshot;
+	PagestoreReaderSnapshotManifest manifest;
+	PageStoreRelKey data_key;
+	PageStoreRelKey manifest_key;
+	char	   *artifact;
+	char		page[BLCKSZ];
+	Size		xids_size;
+	Size		artifact_size;
+	BlockNumber block_count;
+	BlockNumber nblocks;
+
+	snapshot = pagestore_load_reader_snapshot(dir, timeline, read_lsn,
+										 CurrentMemoryContext, ERROR);
+	xids_size = snapshot->header.count * sizeof(TransactionId);
+	artifact_size = sizeof(snapshot->header) + xids_size;
+	block_count = (BlockNumber) ((artifact_size + BLCKSZ - 1) / BLCKSZ);
+	artifact = palloc(artifact_size);
+	memcpy(artifact, &snapshot->header, sizeof(snapshot->header));
+	if (xids_size > 0)
+		memcpy(artifact + sizeof(snapshot->header), snapshot->xids, xids_size);
+
+	data_key = pagestore_reader_snapshot_key(PAGESTORE_READER_SNAPSHOT_DATA_OBJECT);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &data_key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	for (BlockNumber block = 0; block < block_count; block++)
+	{
+		Size		offset = (Size) block * BLCKSZ;
+		Size		chunk = Min((Size) BLCKSZ, artifact_size - offset);
+
+		memset(page, 0, sizeof(page));
+		memcpy(page, artifact + offset, chunk);
+		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+			&data_key, block, page,
+			(uint64) read_lsn, nblocks,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		if (block >= nblocks)
+			nblocks = block + 1;
+	}
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+
+	memset(&manifest, 0, sizeof(manifest));
+	manifest.read_lsn = read_lsn;
+	manifest.artifact_size = artifact_size;
+	manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
+	manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
+	manifest.timeline = timeline;
+	manifest.block_count = block_count;
+	manifest.artifact_crc = snapshot->header.crc;
+	pagestore_reader_snapshot_manifest_crc(&manifest);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &manifest, sizeof(manifest));
+	manifest_key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &manifest_key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&manifest_key, 0, page, (uint64) read_lsn, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+
+	pfree(artifact);
+	if (snapshot->xids != NULL)
+		pfree(snapshot->xids);
+	pfree(snapshot);
+	return block_count;
+}
+
+static PagestoreReaderSnapshot *
+pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
+										MemoryContext context, int elevel)
+{
+	PagestoreReaderSnapshotManifest manifest;
+	PagestoreReaderSnapshotManifest checked_manifest;
+	PagestoreReaderSnapshot *snapshot;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	char	   *artifact;
+	uint64		resolved;
+	Size		xids_size;
+
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		ereport(elevel,
+				(errmsg("no published reader snapshot manifest for timeline %u at %X/%08X",
+						timeline, LSN_FORMAT_ARGS(read_lsn))));
+	memcpy(&manifest, page, sizeof(manifest));
+	checked_manifest = manifest;
+	pagestore_reader_snapshot_manifest_crc(&checked_manifest);
+	if (manifest.magic != PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC ||
+		manifest.format != PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT ||
+		manifest.timeline != timeline || manifest.read_lsn != read_lsn ||
+		manifest.artifact_size < sizeof(PagestoreReaderSnapshotHeader) ||
+		manifest.artifact_size > MaxAllocSize || manifest.block_count == 0 ||
+		manifest.block_count !=
+		(BlockNumber) ((manifest.artifact_size + BLCKSZ - 1) / BLCKSZ) ||
+		!EQ_CRC32C(checked_manifest.crc, manifest.crc))
+		ereport(elevel,
+				(errmsg("published reader snapshot manifest has an invalid identity or header")));
+
+	artifact = MemoryContextAlloc(context, (Size) manifest.artifact_size);
+	key = pagestore_reader_snapshot_key(PAGESTORE_READER_SNAPSHOT_DATA_OBJECT);
+	for (BlockNumber block = 0; block < manifest.block_count; block++)
+	{
+		Size		offset = (Size) block * BLCKSZ;
+		Size		chunk = Min((Size) BLCKSZ,
+							(Size) manifest.artifact_size - offset);
+
+		if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+				&key, block, (uint64) read_lsn, page, &resolved,
+				PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+			ereport(elevel,
+					(errmsg("published reader snapshot is missing data block %u",
+							block)));
+		memcpy(artifact + offset, page, chunk);
+	}
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+
+	snapshot = MemoryContextAlloc(context, sizeof(*snapshot));
+	memcpy(&snapshot->header, artifact, sizeof(snapshot->header));
+	if (snapshot->header.count > MaxAllocSize / sizeof(TransactionId))
+		ereport(elevel,
+				(errmsg("published reader snapshot has an invalid size or checksum identity")));
+	xids_size = snapshot->header.count * sizeof(TransactionId);
+	if (manifest.artifact_size != sizeof(snapshot->header) + xids_size ||
+		!EQ_CRC32C(snapshot->header.crc, manifest.artifact_crc))
+		ereport(elevel,
+				(errmsg("published reader snapshot has an invalid size or checksum identity")));
+	snapshot->xids = xids_size > 0 ? MemoryContextAlloc(context, xids_size) : NULL;
+	if (xids_size > 0)
+		memcpy(snapshot->xids, artifact + sizeof(snapshot->header), xids_size);
+	pagestore_validate_reader_snapshot(snapshot, timeline, read_lsn,
+									 "from the page store", elevel);
+	pfree(artifact);
+	return snapshot;
+}
+
+PG_FUNCTION_INFO_V1(pagestore_publish_reader_snapshot_artifact);
+Datum
+pagestore_publish_reader_snapshot_artifact(PG_FUNCTION_ARGS)
+{
+	char	   *dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		timeline = PG_GETARG_INT32(1);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(2);
+	BlockNumber blocks;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to publish a reader snapshot")));
+	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid reader timeline or read LSN")));
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to publish a reader snapshot")));
+	if ((uint32) timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("reader timeline %d is not the active localsvc timeline %u",
+						timeline, pagestore_localsvc_timeline())));
+	blocks = pagestore_publish_reader_snapshot(dir, (uint32) timeline,
+										 read_lsn);
+	PG_RETURN_INT64((int64) blocks);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_validate_published_reader_snapshot);
+Datum
+pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(1);
+	PagestoreReaderSnapshot *snapshot;
+	uint32		count;
+
+	if (!pagestore_branch_backend_active())
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be \"localsvc\" to load a published reader snapshot")));
+	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
+		(uint32) timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid reader timeline or read LSN")));
+	snapshot = pagestore_load_published_reader_snapshot((uint32) timeline,
+		read_lsn, CurrentMemoryContext, ERROR);
+	count = snapshot->header.count;
+	if (snapshot->xids != NULL)
+		pfree(snapshot->xids);
+	pfree(snapshot);
+	PG_RETURN_INT64((int64) count);
 }
 
 static PagestoreReaderSnapshot *pagestore_fixed_snapshot = NULL;
