@@ -52,7 +52,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=20
+	local expected_version=21
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128
@@ -1160,7 +1160,11 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
        CREATE FUNCTION pagestore_reader_candidate_lsn() RETURNS pg_lsn
          AS 'pagestore','pagestore_reader_candidate_lsn' LANGUAGE C;
        CREATE FUNCTION pagestore_reader_candidate_generation() RETURNS bigint
-         AS 'pagestore','pagestore_reader_candidate_generation' LANGUAGE C;" >/dev/null
+         AS 'pagestore','pagestore_reader_candidate_generation' LANGUAGE C;
+       CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
+         AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
+         AS 'pagestore','pagestore_validate_published_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
 # released subtransactions exceed the normal snapshot subxid capacity; the
 # writer commits it only after the copy, so the reader has no post-R relation
@@ -1214,6 +1218,9 @@ assert "$([ "${readerSeeded:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
 	"reader prepare materializes local SLRUs as of checkpoint R"
 assert "$($P -c "SELECT pagestore_validate_reader_manifest('$READERPREP', 0, '$readerR');")" "t" \
 	"reader manifest records the source timeline and read horizon"
+readerSnapshotBlocks=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP', 0, '$readerR');")
+assert "$([ "${readerSnapshotBlocks:-0}" -gt 1 ] && echo ok || echo no)" "ok" \
+	"reader snapshot publishes as a multi-block page-store artifact"
 # A prepared snapshot is inseparable from its timeline and R identity.  A
 # rewritten manifest cannot reuse another timeline's running-XID snapshot.
 BRANCHREADERPREP=$(mktemp -d)
@@ -1370,6 +1377,12 @@ assert "$($PR -c "SELECT pagestore_reader_candidate_generation() >= 2;")" "t" \
 	"a newer candidate receives a new shared read generation"
 assert "$($PR -c "SELECT current_setting('pagestore.read_lsn')::pg_lsn = '$readerR'::pg_lsn;")" "t" \
 	"candidate discovery does not move the effective view without its snapshot"
+assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
+	"reader loads and validates the exact-R multi-block snapshot from the page store"
+missingPublishedSnapshot=$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, pagestore_reader_candidate_lsn());" \
+	>/dev/null 2>&1 && echo ok || echo error)
+assert "$missingPublishedSnapshot" "error" \
+	"reader rejects a candidate horizon whose snapshot has not been published"
 reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
 if [ "$reader_v" != "v1" ]; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
