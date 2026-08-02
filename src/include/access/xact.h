@@ -139,6 +139,10 @@ typedef enum
 
 typedef void (*XactCallback) (XactEvent event, void *arg);
 
+/* Called after top-level transaction state is initialized, before use. */
+typedef void (*xact_start_hook_type) (void);
+extern PGDLLIMPORT xact_start_hook_type xact_start_hook;
+
 typedef enum
 {
 	SUBXACT_EVENT_START_SUB,

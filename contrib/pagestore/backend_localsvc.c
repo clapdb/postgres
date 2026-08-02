@@ -63,6 +63,7 @@ static char *localsvc_read_lsn_str = NULL;
 static uint64 localsvc_read_lsn = 0;
 static uint64 localsvc_read_seq = 0;
 static bool localsvc_read_seq_loaded = false;
+static uint32 localsvc_read_epoch = 0;
 
 static bool
 ls_check_read_lsn(char **newval, void **extra, GucSource source)
@@ -100,6 +101,7 @@ ls_assign_read_lsn(const char *newval, void *extra)
 		localsvc_read_lsn = 0;
 	localsvc_read_seq = 0;
 	localsvc_read_seq_loaded = false;
+	localsvc_read_epoch = localsvc_read_lsn != 0 ? 1 : 0;
 }
 
 /* Refuse a store mutation on a pinned reader. */
@@ -1111,6 +1113,27 @@ uint64
 pagestore_localsvc_read_lsn(void)
 {
 	return localsvc_read_lsn;
+}
+
+uint32
+pagestore_localsvc_read_epoch(void)
+{
+	return localsvc_read_epoch;
+}
+
+void
+pagestore_localsvc_adopt_read_view(uint64 read_lsn, uint64 read_seq,
+								   uint32 read_epoch)
+{
+	Assert(localsvc_read_lsn != 0);
+	Assert(read_lsn >= localsvc_read_lsn);
+	Assert(read_seq != 0);
+	Assert(read_epoch != 0);
+
+	localsvc_read_lsn = read_lsn;
+	localsvc_read_seq = read_seq;
+	localsvc_read_seq_loaded = true;
+	localsvc_read_epoch = read_epoch;
 }
 
 /* Record in the store that the WAL record at 'lsn' modifies (key, block). */

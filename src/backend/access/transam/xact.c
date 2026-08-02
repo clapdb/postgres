@@ -301,6 +301,8 @@ static char *prepareGID;
  */
 static bool forceSyncCommit = false;
 
+xact_start_hook_type xact_start_hook = NULL;
+
 /* Flag for logging statements in a transaction. */
 bool		xact_is_sampled = false;
 
@@ -2272,6 +2274,9 @@ StartTransaction(void)
 	/* Schedule transaction timeout */
 	if (TransactionTimeout > 0)
 		enable_timeout_after(TRANSACTION_TIMEOUT, TransactionTimeout);
+
+	if (xact_start_hook != NULL)
+		xact_start_hook();
 
 	ShowTransactionState("StartTransaction");
 }

@@ -95,6 +95,8 @@ const ShmemCallbacks CommitTsShmemCallbacks = {
 static SlruDesc CommitTsSlruDesc;
 
 #define CommitTsCtl (&CommitTsSlruDesc)
+commit_ts_bounds_hook_type commit_ts_bounds_hook = NULL;
+commit_ts_latest_hook_type commit_ts_latest_hook = NULL;
 
 /*
  * We keep a cache of the last value set in shared memory.
@@ -290,6 +292,10 @@ TransactionIdGetCommitTsData(TransactionId xid, TimestampTz *ts,
 	CommitTimestampEntry entry;
 	TransactionId oldestCommitTsXid;
 	TransactionId newestCommitTsXid;
+	CommitTimestampEntry cachedEntry;
+	bool		commitTsActive;
+	bool		useCachedEntry;
+	bool		boundsOverridden = false;
 
 	if (!TransactionIdIsValid(xid))
 		ereport(ERROR,
@@ -306,29 +312,27 @@ TransactionIdGetCommitTsData(TransactionId xid, TimestampTz *ts,
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
 
-	/* Error if module not enabled */
-	if (!commitTsShared->commitTsActive)
-		error_commit_ts_disabled();
-
-	/*
-	 * If we're asked for the cached value, return that.  Otherwise, fall
-	 * through to read from SLRU.
-	 */
-	if (commitTsShared->xidLastCommit == xid)
-	{
-		*ts = commitTsShared->dataLastCommit.time;
-		if (nodeid)
-			*nodeid = commitTsShared->dataLastCommit.nodeid;
-
-		LWLockRelease(CommitTsLock);
-		return *ts != 0;
-	}
-
+	commitTsActive = commitTsShared->commitTsActive;
+	useCachedEntry = commitTsShared->xidLastCommit == xid;
+	cachedEntry = commitTsShared->dataLastCommit;
 	oldestCommitTsXid = TransamVariables->oldestCommitTsXid;
 	newestCommitTsXid = TransamVariables->newestCommitTsXid;
 	/* neither is invalid, or both are */
 	Assert(TransactionIdIsValid(oldestCommitTsXid) == TransactionIdIsValid(newestCommitTsXid));
 	LWLockRelease(CommitTsLock);
+	if (commit_ts_bounds_hook != NULL)
+		boundsOverridden = commit_ts_bounds_hook(&commitTsActive,
+											 &oldestCommitTsXid,
+											 &newestCommitTsXid);
+	if (!commitTsActive)
+		error_commit_ts_disabled();
+	if (!boundsOverridden && useCachedEntry)
+	{
+		*ts = cachedEntry.time;
+		if (nodeid)
+			*nodeid = cachedEntry.nodeid;
+		return *ts != 0;
+	}
 
 	/*
 	 * Return empty if the requested value is outside our valid range.
@@ -370,6 +374,18 @@ TransactionId
 GetLatestCommitTsData(TimestampTz *ts, ReplOriginId *nodeid)
 {
 	TransactionId xid;
+	TimestampTz latest_ts;
+	ReplOriginId latest_nodeid;
+
+	if (commit_ts_latest_hook != NULL &&
+		commit_ts_latest_hook(&xid, &latest_ts, &latest_nodeid))
+	{
+		if (ts)
+			*ts = latest_ts;
+		if (nodeid)
+			*nodeid = latest_nodeid;
+		return xid;
+	}
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
 

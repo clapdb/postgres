@@ -348,6 +348,24 @@ AdvanceNextFullTransactionIdPastXid(TransactionId xid)
 }
 
 /*
+ * Advance nextXid to a read-only snapshot's exclusive upper bound.  Pinned
+ * readers never allocate XIDs, but an advancing view still needs the local
+ * epoch machinery to interpret XIDs that were assigned by the writer after
+ * this compute's boot horizon.
+ */
+void
+AdvanceNextFullTransactionIdToReadOnlyHorizon(FullTransactionId xid)
+{
+	Assert(transaction_read_only_forced);
+	Assert(FullTransactionIdIsNormal(xid));
+
+	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
+	if (FullTransactionIdFollows(xid, TransamVariables->nextXid))
+		TransamVariables->nextXid = xid;
+	LWLockRelease(XidGenLock);
+}
+
+/*
  * Advance the cluster-wide value for the oldest valid clog entry.
  *
  * We must acquire XactTruncationLock to advance the oldestClogXid. It's not

@@ -1161,6 +1161,10 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_reader_candidate_lsn' LANGUAGE C;
        CREATE FUNCTION pagestore_reader_candidate_generation() RETURNS bigint
          AS 'pagestore','pagestore_reader_candidate_generation' LANGUAGE C;
+       CREATE FUNCTION pagestore_reader_effective_lsn() RETURNS pg_lsn
+         AS 'pagestore','pagestore_reader_effective_lsn' LANGUAGE C;
+       CREATE FUNCTION pagestore_reader_effective_generation() RETURNS bigint
+         AS 'pagestore','pagestore_reader_effective_generation' LANGUAGE C;
        CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
@@ -1201,6 +1205,10 @@ assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
 readerRunningXid=$($P -c "SELECT xmin::text FROM reader_running;")
 READERPREP=$(mktemp -d)
 BADREADERPREP=$(mktemp -d)
+readerDbOid=$($P -c "SELECT oid FROM pg_database WHERE datname = current_database();")
+mkdir -p "$READERPREP/relmaps/global" "$READERPREP/relmaps/$readerDbOid"
+cp "$READERDATA/global/pg_filenode.map" "$READERPREP/relmaps/global/"
+cp "$READERDATA/base/$readerDbOid/pg_filenode.map" "$READERPREP/relmaps/$readerDbOid/"
 bad_reader_horizon=$($P -c "SELECT pagestore_prepare_reader('$BADREADERPREP', 0, '$bc', '$readerR',
 	'$((readerOldest + 1))'::xid, '$readerNext'::xid,
 	'$readerCtsOldest'::xid, '$readerCtsNext'::xid,
@@ -1249,8 +1257,26 @@ cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
 rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
+readerV2Xid=$($P -c "SELECT xmin::text FROM reader_t WHERE id = 1;")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
+read -r readerR2 readerNext2 readerOldest2 readerNextMulti2 readerNextMember2 readerOldestMulti2 readerCtsOldest2 readerCtsNext2 <<< "$($P -c "
+	SELECT redo_lsn || ' ' || split_part(next_xid, ':', 2) || ' ' || oldest_xid || ' ' ||
+	       next_multixact_id || ' ' || next_multi_offset || ' ' || oldest_multi_xid || ' ' ||
+	       CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END || ' ' ||
+	       CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END
+	FROM pg_control_checkpoint();")"
+READERPREP2=$(mktemp -d)
+mkdir -p "$READERPREP2/relmaps/global" "$READERPREP2/relmaps/$readerDbOid"
+cp "$DATA/global/pg_filenode.map" "$READERPREP2/relmaps/global/"
+cp "$DATA/base/$readerDbOid/pg_filenode.map" "$READERPREP2/relmaps/$readerDbOid/"
+assert "$($P -c "SELECT pagestore_clog_status_asof('$readerV2Xid'::xid, '$bc', '$readerR2');")" "1" \
+	"the newer reader horizon reconstructs the v2 transaction as committed"
+$P -c "SELECT pagestore_prepare_reader('$READERPREP2', 0, '$bc', '$readerR2',
+	'$readerOldest2'::xid, '$readerNext2'::xid,
+	'$readerCtsOldest2'::xid, '$readerCtsNext2'::xid,
+	'$readerOldestMulti2'::xid, '$readerNextMulti2'::xid,
+	0, $readerNextMember2);" >/dev/null
 READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
@@ -1377,6 +1403,8 @@ assert "$($PR -c "SELECT pagestore_reader_candidate_generation() >= 2;")" "t" \
 	"a newer candidate receives a new shared read generation"
 assert "$($PR -c "SELECT current_setting('pagestore.read_lsn')::pg_lsn = '$readerR'::pg_lsn;")" "t" \
 	"candidate discovery does not move the effective view without its snapshot"
+assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR'::pg_lsn AND pagestore_reader_effective_generation() = 1;")" "t" \
+	"the backend keeps its initial effective view generation while the candidate snapshot is absent"
 assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
 	"reader loads and validates the exact-R multi-block snapshot from the page store"
 missingPublishedSnapshot=$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, pagestore_reader_candidate_lsn());" \
@@ -1396,8 +1424,8 @@ assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
 	"pg_current_snapshot preserves the pinned reader running-XID set"
 reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
-assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export an oversized recovery snapshot')" "1" \
-	"pinned reader rejects exporting an oversized running-XID snapshot"
+assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
+	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the
@@ -1434,6 +1462,27 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
+readerSnapshotBlocks2=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP2', 0, '$readerR2');")
+assert "$([ "${readerSnapshotBlocks2:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
+	"control plane publishes the exact snapshot for the newer reader horizon"
+assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
+	"the next transaction atomically adopts the published reader view"
+assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
+	"the adopted exact-R snapshot treats the v2 transaction as committed"
+assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
+	"the adopted reader view serves pages from the newer horizon"
+assert "$($PR -c "SELECT count(*) FROM reader_running;")" "1" \
+	"the adopted exact-R snapshot exposes transactions committed before the newer horizon"
+assert "$($PR -c "SELECT pg_last_committed_xact();" 2>&1 | grep -c 'not supported on an advancing pagestore reader')" "1" \
+	"the adopted reader does not expose a last-commit cache from another horizon"
+assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
+	SET debug_parallel_query = on;
+	SET min_parallel_table_scan_size = 0;
+	SET parallel_setup_cost = 0;
+	SET parallel_tuple_cost = 0;
+	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
+	"advancing readers cannot re-enable parallel plans with session settings"
+rm -rf "$READERPREP2"
 "$BIN/pg_ctl" -D "$READERDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 rm -rf "$(dirname "$READERDATA")"

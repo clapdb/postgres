@@ -125,6 +125,8 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+snapshot_transfer_hook_type snapshot_transfer_hook = NULL;
+
 
 /*
  * CurrentSnapshot points to the only snapshot taken in transaction-snapshot
@@ -1126,6 +1128,9 @@ ExportSnapshot(Snapshot snapshot)
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
 
+	if (snapshot_transfer_hook != NULL)
+		snapshot_transfer_hook(true);
+
 	/*
 	 * It's tempting to call RequireTransactionBlock here, since it's not very
 	 * useful to export a snapshot that will disappear immediately afterwards.
@@ -1409,6 +1414,9 @@ ImportSnapshot(const char *idstr)
 	int			src_isolevel;
 	bool		src_readonly;
 	SnapshotData snapshot;
+
+	if (snapshot_transfer_hook != NULL)
+		snapshot_transfer_hook(false);
 
 	/*
 	 * Must be at top level of a fresh transaction.  Note in particular that

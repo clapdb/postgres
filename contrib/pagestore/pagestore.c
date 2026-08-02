@@ -38,6 +38,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/parallel.h"
 #include "access/relation.h"
 #include "access/rmgr.h"
 #include "access/slru.h"
@@ -55,6 +56,9 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
+#include "optimizer/planner.h"
+#include "optimizer/optimizer.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
@@ -70,8 +74,10 @@
 #include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
+#include "utils/plancache.h"
 #include "utils/rel.h"
 #include "walredo_client.h"
 
@@ -89,13 +95,96 @@ static bool pagestore_advance_read_lsn = false;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
+static transaction_id_is_in_progress_hook_type prev_xid_in_progress_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
+static xact_start_hook_type prev_xact_start_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
+static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
+static commit_ts_latest_hook_type prev_commit_ts_latest_hook = NULL;
+static snapshot_transfer_hook_type prev_snapshot_transfer_hook = NULL;
+static post_database_path_hook_type prev_post_database_path_hook = NULL;
+static bool pagestore_commit_ts_bounds_valid = false;
+static bool pagestore_commit_ts_active = false;
+static TransactionId pagestore_oldest_commit_ts_xid = InvalidTransactionId;
+static TransactionId pagestore_newest_commit_ts_xid = InvalidTransactionId;
+
+static bool
+pagestore_commit_ts_latest(TransactionId *xid, TimestampTz *ts,
+						   ReplOriginId *nodeid)
+{
+	if (pagestore_commit_ts_bounds_valid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_last_committed_xact() is not supported on an advancing pagestore reader")));
+	return prev_commit_ts_latest_hook != NULL &&
+		prev_commit_ts_latest_hook(xid, ts, nodeid);
+}
+
+static void
+pagestore_snapshot_transfer(bool is_export)
+{
+	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot %s a snapshot on an advancing pagestore reader",
+						is_export ? "export" : "import")));
+	if (prev_snapshot_transfer_hook != NULL)
+		prev_snapshot_transfer_hook(is_export);
+}
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
 static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
 static void pagestore_refresh_reader_horizon(void);
 static bool pagestore_branch_backend_active(void);
+
+static bool
+pagestore_commit_ts_bounds(bool *active, TransactionId *oldest_xid,
+						   TransactionId *newest_xid)
+{
+	if (pagestore_commit_ts_bounds_valid)
+	{
+		*active = pagestore_commit_ts_active;
+		*oldest_xid = pagestore_oldest_commit_ts_xid;
+		*newest_xid = pagestore_newest_commit_ts_xid;
+		return true;
+	}
+	return prev_commit_ts_bounds_hook != NULL &&
+		prev_commit_ts_bounds_hook(active, oldest_xid, newest_xid);
+}
+
+static PlannedStmt *
+pagestore_planner(Query *parse, const char *query_string, int cursor_options,
+				  ParamListInfo bound_params, ExplainState *es)
+{
+	PlannedStmt *result;
+	int			saved_max_parallel_workers_per_gather;
+	int			saved_debug_parallel_query;
+
+	if (!pagestore_advance_read_lsn)
+		return prev_planner_hook != NULL ?
+			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
+			standard_planner(parse, query_string, cursor_options, bound_params, es);
+
+	saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
+	saved_debug_parallel_query = debug_parallel_query;
+	max_parallel_workers_per_gather = 0;
+	debug_parallel_query = DEBUG_PARALLEL_OFF;
+	PG_TRY();
+	{
+		result = prev_planner_hook != NULL ?
+			prev_planner_hook(parse, query_string, cursor_options, bound_params, es) :
+			standard_planner(parse, query_string, cursor_options, bound_params, es);
+	}
+	PG_FINALLY();
+	{
+		max_parallel_workers_per_gather =
+			saved_max_parallel_workers_per_gather;
+		debug_parallel_query = saved_debug_parallel_query;
+	}
+	PG_END_TRY();
+	return result;
+}
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
 #define PAGESTORE_READER_HORIZON_TIMEOUT_MS 10000
@@ -107,6 +196,8 @@ typedef struct PagestoreReaderHorizonShmem
 	slock_t		mutex;
 	XLogRecPtr	candidate_lsn;
 	uint32		candidate_generation;
+	XLogRecPtr	adoptable_lsn;
+	uint32		adoptable_generation;
 	TimestampTz refreshed_at;
 	int			refresh_owner_pid;
 	TimestampTz refresh_started_at;
@@ -129,7 +220,7 @@ pagestore_buffer_tag_read_epoch(RelFileLocatorBackend rlocator,
 	if (pagestore_which(rlocator.locator, rlocator.backend) ==
 		pagestore_smgr_which)
 	{
-		*read_epoch = pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		*read_epoch = pagestore_localsvc_read_epoch();
 		return true;
 	}
 	return prev_buffer_tag_read_epoch_hook != NULL ?
@@ -5122,7 +5213,7 @@ typedef struct PagestoreReaderSnapshot
 } PagestoreReaderSnapshot;
 
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC UINT32_C(0x5053524D)
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 2
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
@@ -5136,6 +5227,8 @@ typedef struct PagestoreReaderSnapshotManifest
 	uint32		timeline;
 	uint32		block_count;
 	pg_crc32c	artifact_crc;
+	pg_crc32c	global_relmap_crc;
+	pg_crc32c	local_relmap_crc;
 	pg_crc32c	crc;
 } PagestoreReaderSnapshotManifest;
 
@@ -5152,6 +5245,53 @@ typedef struct PagestoreReaderCatalogProvenance
 } PagestoreReaderCatalogProvenance;
 
 static bool pagestore_pread_exact(int fd, void *buf, Size size, off_t offset);
+
+static pg_crc32c
+pagestore_reader_relmap_crc(const char *dir)
+{
+	char		path[MAXPGPATH];
+	char		buf[1024];
+	pg_crc32c	crc;
+	int			fd;
+	ssize_t		nread;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/pg_filenode.map", dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open relation map \"%s\": %m", path)));
+	INIT_CRC32C(crc);
+	while ((nread = read(fd, buf, sizeof(buf))) > 0)
+		COMP_CRC32C(crc, buf, nread);
+	if (nread < 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read relation map \"%s\": %m", path)));
+	}
+	CloseTransientFile(fd);
+	FIN_CRC32C(crc);
+	return crc;
+}
+
+static pg_crc32c
+pagestore_prepared_reader_relmap_crc(const char *dir, bool shared)
+{
+	char		mapdir[MAXPGPATH];
+	int			len;
+
+	if (shared)
+		len = snprintf(mapdir, sizeof(mapdir), "%s/relmaps/global", dir);
+	else
+		len = snprintf(mapdir, sizeof(mapdir), "%s/relmaps/%u", dir,
+					   MyDatabaseId);
+	PS_CHECK_PATH_FORMAT(len, mapdir);
+	return pagestore_reader_relmap_crc(mapdir);
+}
 
 static void
 pagestore_reader_catalog_crc(PagestoreReaderCatalogProvenance *provenance)
@@ -5268,10 +5408,11 @@ pagestore_reader_snapshot_manifest_crc(PagestoreReaderSnapshotManifest *manifest
 }
 
 static PageStoreRelKey
-pagestore_reader_snapshot_key(uint32 object)
+pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 {
 	PageStoreRelKey key = {0};
 
+	key.dbOid = dbid;
 	key.relNumber = object;
 	return key;
 }
@@ -5528,7 +5669,8 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	if (xids_size > 0)
 		memcpy(artifact + sizeof(snapshot->header), snapshot->xids, xids_size);
 
-	data_key = pagestore_reader_snapshot_key(PAGESTORE_READER_SNAPSHOT_DATA_OBJECT);
+	data_key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, InvalidOid);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
 		PS_KLASS_READER_SNAPSHOT, &data_key,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
@@ -5557,11 +5699,23 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	manifest.timeline = timeline;
 	manifest.block_count = block_count;
 	manifest.artifact_crc = snapshot->header.crc;
+	manifest.global_relmap_crc =
+		pagestore_prepared_reader_relmap_crc(dir, true);
+	manifest.local_relmap_crc =
+		pagestore_prepared_reader_relmap_crc(dir, false);
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
 	manifest_key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT);
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &manifest_key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&manifest_key, 0, page, (uint64) read_lsn, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	manifest_key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
 		PS_KLASS_READER_SNAPSHOT, &manifest_key,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
@@ -5592,7 +5746,9 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 	Size		xids_size;
 
 	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT);
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT,
+		OidIsValid(MyDatabaseId) && DatabasePath != NULL ?
+		MyDatabaseId : InvalidOid);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, (uint64) read_lsn, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
@@ -5609,12 +5765,15 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 		manifest.artifact_size > MaxAllocSize || manifest.block_count == 0 ||
 		manifest.block_count !=
 		(BlockNumber) ((manifest.artifact_size + BLCKSZ - 1) / BLCKSZ) ||
+		!EQ_CRC32C(manifest.global_relmap_crc,
+					 pagestore_reader_relmap_crc("global")) ||
 		!EQ_CRC32C(checked_manifest.crc, manifest.crc))
 		ereport(elevel,
-				(errmsg("published reader snapshot manifest has an invalid identity or header")));
+				(errmsg("published reader snapshot manifest has an invalid identity, relation map, or header")));
 
 	artifact = MemoryContextAlloc(context, (Size) manifest.artifact_size);
-	key = pagestore_reader_snapshot_key(PAGESTORE_READER_SNAPSHOT_DATA_OBJECT);
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_DATA_OBJECT, InvalidOid);
 	for (BlockNumber block = 0; block < manifest.block_count; block++)
 	{
 		Size		offset = (Size) block * BLCKSZ;
@@ -5649,6 +5808,66 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 									 "from the page store", elevel);
 	pfree(artifact);
 	return snapshot;
+}
+
+static XLogRecPtr
+pagestore_resolve_published_reader_snapshot(XLogRecPtr upper_lsn)
+{
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) upper_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		return InvalidXLogRecPtr;
+	return (XLogRecPtr) resolved;
+}
+
+static void
+pagestore_validate_database_reader_manifest(XLogRecPtr read_lsn)
+{
+	PagestoreReaderSnapshotManifest manifest;
+	PagestoreReaderSnapshotManifest checked;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved;
+
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		ereport(ERROR,
+				(errmsg("no database reader manifest for database %u at %X/%08X",
+						MyDatabaseId, LSN_FORMAT_ARGS((XLogRecPtr) read_lsn))));
+	memcpy(&manifest, page, sizeof(manifest));
+	checked = manifest;
+	pagestore_reader_snapshot_manifest_crc(&checked);
+	if (manifest.magic != PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC ||
+		manifest.format != PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT ||
+		manifest.timeline != pagestore_localsvc_timeline() ||
+		manifest.read_lsn != read_lsn ||
+		!EQ_CRC32C(manifest.local_relmap_crc,
+					 pagestore_reader_relmap_crc(DatabasePath)) ||
+		!EQ_CRC32C(checked.crc, manifest.crc))
+		ereport(ERROR,
+				(errmsg("database reader manifest does not match database %u",
+						MyDatabaseId)));
+}
+
+static void
+pagestore_validate_database_reader_view(void)
+{
+	if (prev_post_database_path_hook != NULL)
+		prev_post_database_path_hook();
+	if (!pagestore_advance_read_lsn || !OidIsValid(MyDatabaseId) ||
+		DatabasePath == NULL || pagestore_localsvc_read_epoch() <= 1)
+		return;
+	pagestore_validate_database_reader_manifest(
+		(XLogRecPtr) pagestore_localsvc_read_lsn());
 }
 
 PG_FUNCTION_INFO_V1(pagestore_publish_reader_snapshot_artifact);
@@ -5707,6 +5926,166 @@ pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
 }
 
 static PagestoreReaderSnapshot *pagestore_fixed_snapshot = NULL;
+static MemoryContext pagestore_fixed_snapshot_context = NULL;
+
+static bool
+pagestore_transaction_id_is_in_progress(TransactionId xid, bool *result)
+{
+	uint32		lo;
+	uint32		hi;
+
+	if (!pagestore_advance_read_lsn || pagestore_fixed_snapshot == NULL)
+		return prev_xid_in_progress_hook != NULL &&
+			prev_xid_in_progress_hook(xid, result);
+	if (!TransactionIdIsNormal(xid) ||
+		TransactionIdPrecedes(xid, pagestore_fixed_snapshot->header.xmin))
+	{
+		*result = false;
+		return true;
+	}
+	if (!TransactionIdPrecedes(xid, pagestore_fixed_snapshot->header.xmax))
+	{
+		*result = true;
+		return true;
+	}
+	lo = 0;
+	hi = pagestore_fixed_snapshot->header.count;
+	while (lo < hi)
+	{
+		uint32		mid = lo + (hi - lo) / 2;
+		TransactionId candidate = pagestore_fixed_snapshot->xids[mid];
+
+		if (TransactionIdPrecedes(candidate, xid))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	*result = lo < pagestore_fixed_snapshot->header.count &&
+		TransactionIdEquals(pagestore_fixed_snapshot->xids[lo], xid);
+	return true;
+}
+
+static void
+pagestore_adopt_reader_view_at_xact_start(void)
+{
+	PagestoreReaderSnapshot *snapshot = NULL;
+	PagestoreReaderSnapshot *old_snapshot;
+	MemoryContext snapshot_context;
+	MemoryContext old_snapshot_context;
+	MemoryContext cxt = CurrentMemoryContext;
+	ErrorData  *edata = NULL;
+	XLogRecPtr	candidate;
+	XLogRecPtr	published;
+	XLogRecPtr	newest_adoptable;
+	ControlFileData control;
+	uint32		adoption_generation;
+	uint64		read_seq = 0;
+	bool		valid = false;
+
+	if (prev_xact_start_hook != NULL)
+		prev_xact_start_hook();
+	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
+		pagestore_localsvc_read_lsn() == 0 || IsParallelWorker())
+		return;
+
+	pagestore_refresh_reader_horizon();
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	candidate = pagestore_reader_horizon->candidate_lsn;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (candidate <= (XLogRecPtr) pagestore_localsvc_read_lsn())
+		return;
+	snapshot_context = AllocSetContextCreate(TopMemoryContext,
+		"pagestore advancing reader snapshot", ALLOCSET_DEFAULT_SIZES);
+
+	PG_TRY();
+	{
+		published = pagestore_resolve_published_reader_snapshot(candidate);
+		if (XLogRecPtrIsInvalid(published) ||
+			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
+			goto adoption_done;
+		snapshot = pagestore_load_published_reader_snapshot(
+			pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
+		if (OidIsValid(MyDatabaseId) && DatabasePath != NULL)
+			pagestore_validate_database_reader_manifest(published);
+		valid = ps_control_asof_timeout(published, &control,
+			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
+			control.checkPointCopy.redo == published &&
+			pagestore_localsvc_read_fence_timeout((uint64) published,
+				&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+adoption_done:
+		;
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+	}
+	PG_END_TRY();
+
+	if (edata != NULL)
+	{
+		MemoryContextDelete(snapshot_context);
+		snapshot_context = NULL;
+		if (edata->elevel >= FATAL ||
+			edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			ReThrowError(edata);
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
+	if (!valid)
+	{
+		if (snapshot_context != NULL)
+			MemoryContextDelete(snapshot_context);
+		return;
+	}
+	SpinLockAcquire(&pagestore_reader_horizon->mutex);
+	if (published > pagestore_reader_horizon->adoptable_lsn)
+	{
+		pagestore_reader_horizon->adoptable_lsn = published;
+		pagestore_reader_horizon->candidate_generation++;
+		if (pagestore_reader_horizon->candidate_generation == 0)
+			pagestore_reader_horizon->candidate_generation = 1;
+		pagestore_reader_horizon->adoptable_generation =
+			pagestore_reader_horizon->candidate_generation;
+	}
+	adoption_generation = pagestore_reader_horizon->adoptable_generation;
+	newest_adoptable = pagestore_reader_horizon->adoptable_lsn;
+	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (published < newest_adoptable ||
+		adoption_generation <= pagestore_localsvc_read_epoch())
+	{
+		MemoryContextDelete(snapshot_context);
+		return;
+	}
+	AdvanceNextFullTransactionIdToReadOnlyHorizon(
+		control.checkPointCopy.nextXid);
+	MultiXactAdvanceNextMXact(control.checkPointCopy.nextMulti,
+							 control.checkPointCopy.nextMultiOffset);
+	pagestore_oldest_commit_ts_xid =
+		control.checkPointCopy.oldestCommitTsXid;
+	pagestore_newest_commit_ts_xid =
+		control.checkPointCopy.newestCommitTsXid;
+	pagestore_commit_ts_active = control.track_commit_timestamp;
+	pagestore_commit_ts_bounds_valid = true;
+
+	old_snapshot = pagestore_fixed_snapshot;
+	old_snapshot_context = pagestore_fixed_snapshot_context;
+	pagestore_fixed_snapshot = snapshot;
+	pagestore_fixed_snapshot_context = snapshot_context;
+	pagestore_localsvc_adopt_read_view((uint64) published, read_seq,
+									 adoption_generation);
+	InvalidateSystemCachesExtended(true);
+	ResetPlanCache();
+	if (old_snapshot_context != NULL)
+		MemoryContextDelete(old_snapshot_context);
+	else if (old_snapshot != NULL)
+	{
+		if (old_snapshot->xids != NULL)
+			pfree(old_snapshot->xids);
+		pfree(old_snapshot);
+	}
+}
 
 static bool
 pagestore_get_snapshot_data(Snapshot snapshot)
@@ -5774,6 +6153,24 @@ pagestore_reader_candidate_generation(PG_FUNCTION_ARGS)
 	generation = pagestore_reader_horizon->candidate_generation;
 	SpinLockRelease(&pagestore_reader_horizon->mutex);
 	PG_RETURN_INT64((int64) generation);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_effective_lsn);
+Datum
+pagestore_reader_effective_lsn(PG_FUNCTION_ARGS)
+{
+	uint64		read_lsn = pagestore_localsvc_read_lsn();
+
+	if (read_lsn == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_LSN((XLogRecPtr) read_lsn);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_effective_generation);
+Datum
+pagestore_reader_effective_generation(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) pagestore_localsvc_read_epoch());
 }
 
 static void
@@ -6902,6 +7299,10 @@ pagestore_validate_datadir_branch_manifest(void)
 			(XLogRecPtr) pagestore_localsvc_read_lsn();
 		pagestore_reader_horizon->candidate_generation =
 			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
+		pagestore_reader_horizon->adoptable_lsn =
+			(XLogRecPtr) pagestore_localsvc_read_lsn();
+		pagestore_reader_horizon->adoptable_generation =
+			pagestore_localsvc_read_lsn() != 0 ? 1 : 0;
 		pagestore_reader_horizon->refreshed_at = 0;
 		pagestore_reader_horizon->refresh_owner_pid = 0;
 		pagestore_reader_horizon->refresh_started_at = 0;
@@ -7745,6 +8146,16 @@ _PG_init(void)
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
+	prev_planner_hook = planner_hook;
+	planner_hook = pagestore_planner;
+	prev_commit_ts_bounds_hook = commit_ts_bounds_hook;
+	commit_ts_bounds_hook = pagestore_commit_ts_bounds;
+	prev_commit_ts_latest_hook = commit_ts_latest_hook;
+	commit_ts_latest_hook = pagestore_commit_ts_latest;
+	prev_snapshot_transfer_hook = snapshot_transfer_hook;
+	snapshot_transfer_hook = pagestore_snapshot_transfer;
+	prev_post_database_path_hook = post_database_path_hook;
+	post_database_path_hook = pagestore_validate_database_reader_view;
 
 	/*
 	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs
@@ -7773,6 +8184,11 @@ _PG_init(void)
 	buffer_tag_read_epoch_hook = pagestore_buffer_tag_read_epoch;
 	prev_get_snapshot_data_hook = get_snapshot_data_hook;
 	get_snapshot_data_hook = pagestore_get_snapshot_data;
+	prev_xid_in_progress_hook = transaction_id_is_in_progress_hook;
+	transaction_id_is_in_progress_hook =
+		pagestore_transaction_id_is_in_progress;
+	prev_xact_start_hook = xact_start_hook;
+	xact_start_hook = pagestore_adopt_reader_view_at_xact_start;
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;

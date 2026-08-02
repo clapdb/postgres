@@ -111,6 +111,7 @@ static void ProcArrayShmemAttach(void *arg);
 static ProcArrayStruct *procArray;
 
 get_snapshot_data_hook_type get_snapshot_data_hook = NULL;
+transaction_id_is_in_progress_hook_type transaction_id_is_in_progress_hook = NULL;
 
 const struct ShmemCallbacks ProcArrayShmemCallbacks = {
 	.request_fn = ProcArrayShmemRequest,
@@ -1404,6 +1405,11 @@ TransactionIdIsInProgress(TransactionId xid)
 	int			mypgxactoff;
 	int			numProcs;
 	int			j;
+	bool		hook_result;
+
+	if (transaction_id_is_in_progress_hook != NULL &&
+		transaction_id_is_in_progress_hook(xid, &hook_result))
+		return hook_result;
 
 	/*
 	 * Don't bother checking a transaction older than RecentXmin; it could not

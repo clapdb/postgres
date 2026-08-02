@@ -73,6 +73,7 @@
 
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
+post_database_path_hook_type post_database_path_hook = NULL;
 
 typedef struct ConnectionWarning
 {
@@ -1217,6 +1218,8 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	SetDatabasePath(fullpath);
 	pfree(fullpath);
+	if (post_database_path_hook != NULL)
+		post_database_path_hook();
 
 	/*
 	 * It's now possible to do real access to the system catalogs.
