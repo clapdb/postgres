@@ -252,7 +252,12 @@ reconstruction.
    status is read from the newest complete live SLRU image; the exact-R running
    set masks commits after R.  If the writer has since tombstoned a status page,
    the reader retains its prepared local seed instead of letting newest
-   truncation erase history needed by old relation pages.  Advancing readers force
+   truncation erase history needed by old relation pages.  Commit-timestamp
+   validity bounds are backend-local, so transactions on different adopted
+   views do not overwrite one another's range.  The published snapshot manifest
+   also binds the writer's global and database relation-map checksums; adoption
+   fails closed when the reader's prepared maps differ, rather than combining a
+   boot-time mapped relfilenumber with newer catalog pages.  Advancing readers force
    non-parallel planning because worker transaction state does not yet carry
    this extension's view identity.  Snapshot and catalog-artifact
    derivation/publication remain control-plane actions; automating those actions

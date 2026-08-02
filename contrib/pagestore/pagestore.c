@@ -97,12 +97,30 @@ static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
+static bool pagestore_commit_ts_bounds_valid = false;
+static TransactionId pagestore_oldest_commit_ts_xid = InvalidTransactionId;
+static TransactionId pagestore_newest_commit_ts_xid = InvalidTransactionId;
 
 /* "which" index assigned to our smgr implementation by smgr_register() */
 static int	pagestore_smgr_which = -1;
 static int pagestore_which(RelFileLocator rlocator, ProcNumber backend);
 static void pagestore_refresh_reader_horizon(void);
 static bool pagestore_branch_backend_active(void);
+
+static bool
+pagestore_commit_ts_bounds(TransactionId *oldest_xid,
+						   TransactionId *newest_xid)
+{
+	if (pagestore_commit_ts_bounds_valid)
+	{
+		*oldest_xid = pagestore_oldest_commit_ts_xid;
+		*newest_xid = pagestore_newest_commit_ts_xid;
+		return true;
+	}
+	return prev_commit_ts_bounds_hook != NULL &&
+		prev_commit_ts_bounds_hook(oldest_xid, newest_xid);
+}
 
 static PlannedStmt *
 pagestore_planner(Query *parse, const char *query_string, int cursor_options,
@@ -5160,7 +5178,7 @@ typedef struct PagestoreReaderSnapshot
 } PagestoreReaderSnapshot;
 
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC UINT32_C(0x5053524D)
-#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 1
+#define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 2
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
@@ -5174,6 +5192,8 @@ typedef struct PagestoreReaderSnapshotManifest
 	uint32		timeline;
 	uint32		block_count;
 	pg_crc32c	artifact_crc;
+	pg_crc32c	global_relmap_crc;
+	pg_crc32c	local_relmap_crc;
 	pg_crc32c	crc;
 } PagestoreReaderSnapshotManifest;
 
@@ -5190,6 +5210,38 @@ typedef struct PagestoreReaderCatalogProvenance
 } PagestoreReaderCatalogProvenance;
 
 static bool pagestore_pread_exact(int fd, void *buf, Size size, off_t offset);
+
+static pg_crc32c
+pagestore_reader_relmap_crc(const char *dir)
+{
+	char		path[MAXPGPATH];
+	char		buf[1024];
+	pg_crc32c	crc;
+	int			fd;
+	ssize_t		nread;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/pg_filenode.map", dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open relation map \"%s\": %m", path)));
+	INIT_CRC32C(crc);
+	while ((nread = read(fd, buf, sizeof(buf))) > 0)
+		COMP_CRC32C(crc, buf, nread);
+	if (nread < 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read relation map \"%s\": %m", path)));
+	}
+	CloseTransientFile(fd);
+	FIN_CRC32C(crc);
+	return crc;
+}
 
 static void
 pagestore_reader_catalog_crc(PagestoreReaderCatalogProvenance *provenance)
@@ -5595,6 +5647,8 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	manifest.timeline = timeline;
 	manifest.block_count = block_count;
 	manifest.artifact_crc = snapshot->header.crc;
+	manifest.global_relmap_crc = pagestore_reader_relmap_crc("global");
+	manifest.local_relmap_crc = pagestore_reader_relmap_crc(DatabasePath);
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
@@ -5647,9 +5701,13 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 		manifest.artifact_size > MaxAllocSize || manifest.block_count == 0 ||
 		manifest.block_count !=
 		(BlockNumber) ((manifest.artifact_size + BLCKSZ - 1) / BLCKSZ) ||
+		!EQ_CRC32C(manifest.global_relmap_crc,
+					 pagestore_reader_relmap_crc("global")) ||
+		!EQ_CRC32C(manifest.local_relmap_crc,
+					 pagestore_reader_relmap_crc(DatabasePath)) ||
 		!EQ_CRC32C(checked_manifest.crc, manifest.crc))
 		ereport(elevel,
-				(errmsg("published reader snapshot manifest has an invalid identity or header")));
+				(errmsg("published reader snapshot manifest has an invalid identity, relation map, or header")));
 
 	artifact = MemoryContextAlloc(context, (Size) manifest.artifact_size);
 	key = pagestore_reader_snapshot_key(PAGESTORE_READER_SNAPSHOT_DATA_OBJECT);
@@ -5858,8 +5916,11 @@ adoption_done:
 		control.checkPointCopy.nextXid);
 	MultiXactAdvanceNextMXact(control.checkPointCopy.nextMulti,
 							 control.checkPointCopy.nextMultiOffset);
-	SetCommitTsReadOnlyHorizon(control.checkPointCopy.oldestCommitTsXid,
-							   control.checkPointCopy.newestCommitTsXid);
+	pagestore_oldest_commit_ts_xid =
+		control.checkPointCopy.oldestCommitTsXid;
+	pagestore_newest_commit_ts_xid =
+		control.checkPointCopy.newestCommitTsXid;
+	pagestore_commit_ts_bounds_valid = true;
 
 	old_snapshot = pagestore_fixed_snapshot;
 	old_snapshot_context = pagestore_fixed_snapshot_context;
@@ -7940,6 +8001,8 @@ _PG_init(void)
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
+	prev_commit_ts_bounds_hook = commit_ts_bounds_hook;
+	commit_ts_bounds_hook = pagestore_commit_ts_bounds;
 
 	/*
 	 * Pinned-reader (pagestore.read_lsn) instance-wide side effects: needs

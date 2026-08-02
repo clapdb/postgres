@@ -22,7 +22,6 @@
 #include "postgres.h"
 
 #include "access/commit_ts.h"
-#include "access/xact.h"
 #include "access/htup_details.h"
 #include "access/slru.h"
 #include "access/transam.h"
@@ -96,6 +95,7 @@ const ShmemCallbacks CommitTsShmemCallbacks = {
 static SlruDesc CommitTsSlruDesc;
 
 #define CommitTsCtl (&CommitTsSlruDesc)
+commit_ts_bounds_hook_type commit_ts_bounds_hook = NULL;
 
 /*
  * We keep a cache of the last value set in shared memory.
@@ -330,6 +330,9 @@ TransactionIdGetCommitTsData(TransactionId xid, TimestampTz *ts,
 	/* neither is invalid, or both are */
 	Assert(TransactionIdIsValid(oldestCommitTsXid) == TransactionIdIsValid(newestCommitTsXid));
 	LWLockRelease(CommitTsLock);
+	if (commit_ts_bounds_hook != NULL)
+		(void) commit_ts_bounds_hook(&oldestCommitTsXid,
+									&newestCommitTsXid);
 
 	/*
 	 * Return empty if the requested value is outside our valid range.
@@ -968,20 +971,6 @@ SetCommitTsLimit(TransactionId oldestXact, TransactionId newestXact)
 		TransamVariables->oldestCommitTsXid = oldestXact;
 		TransamVariables->newestCommitTsXid = newestXact;
 	}
-	LWLockRelease(CommitTsLock);
-}
-
-void
-SetCommitTsReadOnlyHorizon(TransactionId oldestXact,
-						   TransactionId newestXact)
-{
-	Assert(transaction_read_only_forced);
-	Assert(TransactionIdIsValid(oldestXact) ==
-		   TransactionIdIsValid(newestXact));
-
-	LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
-	TransamVariables->oldestCommitTsXid = oldestXact;
-	TransamVariables->newestCommitTsXid = newestXact;
 	LWLockRelease(CommitTsLock);
 }
 

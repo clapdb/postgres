@@ -36,8 +36,9 @@ extern void ExtendCommitTs(TransactionId newestXact);
 extern void TruncateCommitTs(TransactionId oldestXact);
 extern void SetCommitTsLimit(TransactionId oldestXact,
 							 TransactionId newestXact);
-extern void SetCommitTsReadOnlyHorizon(TransactionId oldestXact,
-									 TransactionId newestXact);
+typedef bool (*commit_ts_bounds_hook_type) (TransactionId *oldestXact,
+										TransactionId *newestXact);
+extern PGDLLIMPORT commit_ts_bounds_hook_type commit_ts_bounds_hook;
 extern void AdvanceOldestCommitTsXid(TransactionId oldestXact);
 
 extern int	committssyncfiletag(const FileTag *ftag, char *path);

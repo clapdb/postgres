@@ -2244,7 +2244,7 @@ ps_slru_read_hook(SlruDesc *ctl, int64 pageno, char *page)
 							res = SLRU_READ_HOOK_FAILED;
 						else
 							ps_slru_served_note(obj, (uint32) pageno,
-											PG_UINT64_MAX);
+											Max(w, tombv) + 1);
 					}
 				}
 				else
