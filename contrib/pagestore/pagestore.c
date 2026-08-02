@@ -102,6 +102,7 @@ static commit_ts_latest_hook_type prev_commit_ts_latest_hook = NULL;
 static snapshot_transfer_hook_type prev_snapshot_transfer_hook = NULL;
 static post_database_path_hook_type prev_post_database_path_hook = NULL;
 static bool pagestore_commit_ts_bounds_valid = false;
+static bool pagestore_commit_ts_active = false;
 static TransactionId pagestore_oldest_commit_ts_xid = InvalidTransactionId;
 static TransactionId pagestore_newest_commit_ts_xid = InvalidTransactionId;
 
@@ -136,17 +137,18 @@ static void pagestore_refresh_reader_horizon(void);
 static bool pagestore_branch_backend_active(void);
 
 static bool
-pagestore_commit_ts_bounds(TransactionId *oldest_xid,
+pagestore_commit_ts_bounds(bool *active, TransactionId *oldest_xid,
 						   TransactionId *newest_xid)
 {
 	if (pagestore_commit_ts_bounds_valid)
 	{
+		*active = pagestore_commit_ts_active;
 		*oldest_xid = pagestore_oldest_commit_ts_xid;
 		*newest_xid = pagestore_newest_commit_ts_xid;
 		return true;
 	}
 	return prev_commit_ts_bounds_hook != NULL &&
-		prev_commit_ts_bounds_hook(oldest_xid, newest_xid);
+		prev_commit_ts_bounds_hook(active, oldest_xid, newest_xid);
 }
 
 static PlannedStmt *
@@ -6002,6 +6004,7 @@ adoption_done:
 		control.checkPointCopy.oldestCommitTsXid;
 	pagestore_newest_commit_ts_xid =
 		control.checkPointCopy.newestCommitTsXid;
+	pagestore_commit_ts_active = control.track_commit_timestamp;
 	pagestore_commit_ts_bounds_valid = true;
 
 	old_snapshot = pagestore_fixed_snapshot;

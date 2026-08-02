@@ -36,7 +36,8 @@ extern void ExtendCommitTs(TransactionId newestXact);
 extern void TruncateCommitTs(TransactionId oldestXact);
 extern void SetCommitTsLimit(TransactionId oldestXact,
 							 TransactionId newestXact);
-typedef bool (*commit_ts_bounds_hook_type) (TransactionId *oldestXact,
+typedef bool (*commit_ts_bounds_hook_type) (bool *active,
+										TransactionId *oldestXact,
 										TransactionId *newestXact);
 extern PGDLLIMPORT commit_ts_bounds_hook_type commit_ts_bounds_hook;
 typedef bool (*commit_ts_latest_hook_type) (TransactionId *xid,
