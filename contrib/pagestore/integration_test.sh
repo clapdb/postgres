@@ -91,6 +91,7 @@ cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
+	[ -n "${ADVANCINGDATA:-}" ] && "$BIN/pg_ctl" -D "$ADVANCINGDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
@@ -98,6 +99,7 @@ cleanup() {
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${READERDATA:+$(dirname "$READERDATA")}" \
+		"${ADVANCINGDATA:+$(dirname "$ADVANCINGDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
 	rm -f "/dev/shm$SHM"
@@ -119,6 +121,7 @@ pagestore.localsvc_shm = '$SHM'
 pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
+pagestore.auto_reader_artifacts = on
 io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
@@ -1169,10 +1172,6 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;
-       CREATE FUNCTION pagestore_prime_reader_relmaps() RETURNS pg_lsn
-         AS 'pagestore','pagestore_prime_reader_relmaps' LANGUAGE C;
-       CREATE FUNCTION pagestore_publish_database_reader_manifest() RETURNS pg_lsn
-         AS 'pagestore','pagestore_publish_database_reader_manifest' LANGUAGE C;
        CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_published_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
@@ -1262,7 +1261,6 @@ $P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0,
 cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
 rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
-$P -c "SELECT pagestore_prime_reader_relmaps();" >/dev/null
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 readerV2Xid=$($P -c "SELECT xmin::text FROM reader_t WHERE id = 1;")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
@@ -1288,7 +1286,7 @@ assert "$($P -c "SELECT pagestore_clog_status_asof('$readerV2Xid'::xid, '$bc', '
 READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
-pagestore.advance_read_lsn = on
+pagestore.advance_read_lsn = off
 archive_mode = off
 listen_addresses = ''
 unix_socket_directories = '$READER_SOCK'
@@ -1394,6 +1392,8 @@ assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/serv
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
+ADVANCINGDATA=$(mktemp -d)/reader
+cp -a "$READERDATA" "$ADVANCINGDATA"
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "FAIL - prepared reader did not start"
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
@@ -1405,20 +1405,8 @@ if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
-assert "$($PR -c "SELECT pagestore_reader_candidate_lsn() > '$readerR'::pg_lsn;")" "t" \
-	"advancing reader discovers a newer durable checkpoint horizon"
-assert "$($PR -c "SELECT pagestore_reader_candidate_generation() >= 2;")" "t" \
-	"a newer candidate receives a new shared read generation"
-assert "$($PR -c "SELECT current_setting('pagestore.read_lsn')::pg_lsn = '$readerR'::pg_lsn;")" "t" \
-	"candidate discovery does not move the effective view without its snapshot"
-assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR'::pg_lsn AND pagestore_reader_effective_generation() = 1;")" "t" \
-	"the backend keeps its initial effective view generation while the candidate snapshot is absent"
 assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
 	"reader loads and validates the exact-R multi-block snapshot from the page store"
-missingPublishedSnapshot=$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, pagestore_reader_candidate_lsn());" \
-	>/dev/null 2>&1 && echo ok || echo error)
-assert "$missingPublishedSnapshot" "error" \
-	"reader rejects a candidate horizon whose snapshot has not been published"
 reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
 if [ "$reader_v" != "v1" ]; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
@@ -1431,9 +1419,6 @@ assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 	"pinned reader keeps subtransactions beyond normal snapshot capacity invisible"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
 	"pg_current_snapshot preserves the pinned reader running-XID set"
-reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
-assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
-	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the
@@ -1470,8 +1455,23 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
-assert "$($P -c "SELECT pagestore_publish_database_reader_manifest();")" "$readerR2" \
-	"database publisher binds exact-R relation maps to the automatic snapshot"
+"$BIN/pg_ctl" -D "$READERDATA" -m fast -w stop >/dev/null
+sed -i 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
+	"$ADVANCINGDATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null
+readerAutoPublished=no
+for ((i = 0; i < 100; i++)); do
+	if [ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR2');" 2>/dev/null)" = "0" ]; then
+		readerAutoPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$readerAutoPublished" "yes" \
+	"database worker binds exact-R relation maps to the automatic snapshot"
+reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
+assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
+	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
@@ -1489,10 +1489,11 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	SET parallel_tuple_cost = 0;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
-"$BIN/pg_ctl" -D "$READERDATA" -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
-rm -rf "$(dirname "$READERDATA")"
+rm -rf "$(dirname "$READERDATA")" "$(dirname "$ADVANCINGDATA")"
 READERDATA=
+ADVANCINGDATA=
 
 # --- 32. as-of fork metadata: NBLOCKS/EXISTS resolve at a horizon ------------
 # The store versions fork sizes (page-append growth at each block's pd_lsn,
