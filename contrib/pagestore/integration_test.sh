@@ -1205,6 +1205,10 @@ assert "$($P -c "SELECT count(*) FROM reader_running;")" "1" \
 readerRunningXid=$($P -c "SELECT xmin::text FROM reader_running;")
 READERPREP=$(mktemp -d)
 BADREADERPREP=$(mktemp -d)
+readerDbOid=$($P -c "SELECT oid FROM pg_database WHERE datname = current_database();")
+mkdir -p "$READERPREP/relmaps/global" "$READERPREP/relmaps/$readerDbOid"
+cp "$READERDATA/global/pg_filenode.map" "$READERPREP/relmaps/global/"
+cp "$READERDATA/base/$readerDbOid/pg_filenode.map" "$READERPREP/relmaps/$readerDbOid/"
 bad_reader_horizon=$($P -c "SELECT pagestore_prepare_reader('$BADREADERPREP', 0, '$bc', '$readerR',
 	'$((readerOldest + 1))'::xid, '$readerNext'::xid,
 	'$readerCtsOldest'::xid, '$readerCtsNext'::xid,
@@ -1263,6 +1267,9 @@ read -r readerR2 readerNext2 readerOldest2 readerNextMulti2 readerNextMember2 re
 	       CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END
 	FROM pg_control_checkpoint();")"
 READERPREP2=$(mktemp -d)
+mkdir -p "$READERPREP2/relmaps/global" "$READERPREP2/relmaps/$readerDbOid"
+cp "$DATA/global/pg_filenode.map" "$READERPREP2/relmaps/global/"
+cp "$DATA/base/$readerDbOid/pg_filenode.map" "$READERPREP2/relmaps/$readerDbOid/"
 assert "$($P -c "SELECT pagestore_clog_status_asof('$readerV2Xid'::xid, '$bc', '$readerR2');")" "1" \
 	"the newer reader horizon reconstructs the v2 transaction as committed"
 $P -c "SELECT pagestore_prepare_reader('$READERPREP2', 0, '$bc', '$readerR2',
@@ -1469,6 +1476,7 @@ assert "$($PR -c "SELECT count(*) FROM reader_running;")" "1" \
 assert "$($PR -c "SELECT pg_last_committed_xact();" 2>&1 | grep -c 'not supported on an advancing pagestore reader')" "1" \
 	"the adopted reader does not expose a last-commit cache from another horizon"
 assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
+	SET debug_parallel_query = on;
 	SET min_parallel_table_scan_size = 0;
 	SET parallel_setup_cost = 0;
 	SET parallel_tuple_cost = 0;

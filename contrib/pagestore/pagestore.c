@@ -58,6 +58,7 @@
 #include "miscadmin.h"
 #include "optimizer/cost.h"
 #include "optimizer/planner.h"
+#include "optimizer/optimizer.h"
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
@@ -94,6 +95,7 @@ static bool pagestore_advance_read_lsn = false;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
+static transaction_id_is_in_progress_hook_type prev_xid_in_progress_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
@@ -157,6 +159,7 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 {
 	PlannedStmt *result;
 	int			saved_max_parallel_workers_per_gather;
+	int			saved_debug_parallel_query;
 
 	if (!pagestore_advance_read_lsn)
 		return prev_planner_hook != NULL ?
@@ -164,7 +167,9 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 			standard_planner(parse, query_string, cursor_options, bound_params, es);
 
 	saved_max_parallel_workers_per_gather = max_parallel_workers_per_gather;
+	saved_debug_parallel_query = debug_parallel_query;
 	max_parallel_workers_per_gather = 0;
+	debug_parallel_query = DEBUG_PARALLEL_OFF;
 	PG_TRY();
 	{
 		result = prev_planner_hook != NULL ?
@@ -175,6 +180,7 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 	{
 		max_parallel_workers_per_gather =
 			saved_max_parallel_workers_per_gather;
+		debug_parallel_query = saved_debug_parallel_query;
 	}
 	PG_END_TRY();
 	return result;
@@ -5272,6 +5278,21 @@ pagestore_reader_relmap_crc(const char *dir)
 	return crc;
 }
 
+static pg_crc32c
+pagestore_prepared_reader_relmap_crc(const char *dir, bool shared)
+{
+	char		mapdir[MAXPGPATH];
+	int			len;
+
+	if (shared)
+		len = snprintf(mapdir, sizeof(mapdir), "%s/relmaps/global", dir);
+	else
+		len = snprintf(mapdir, sizeof(mapdir), "%s/relmaps/%u", dir,
+					   MyDatabaseId);
+	PS_CHECK_PATH_FORMAT(len, mapdir);
+	return pagestore_reader_relmap_crc(mapdir);
+}
+
 static void
 pagestore_reader_catalog_crc(PagestoreReaderCatalogProvenance *provenance)
 {
@@ -5678,8 +5699,10 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	manifest.timeline = timeline;
 	manifest.block_count = block_count;
 	manifest.artifact_crc = snapshot->header.crc;
-	manifest.global_relmap_crc = pagestore_reader_relmap_crc("global");
-	manifest.local_relmap_crc = pagestore_reader_relmap_crc(DatabasePath);
+	manifest.global_relmap_crc =
+		pagestore_prepared_reader_relmap_crc(dir, true);
+	manifest.local_relmap_crc =
+		pagestore_prepared_reader_relmap_crc(dir, false);
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
@@ -5723,7 +5746,9 @@ pagestore_load_published_reader_snapshot(uint32 timeline, XLogRecPtr read_lsn,
 	Size		xids_size;
 
 	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT,
+		OidIsValid(MyDatabaseId) && DatabasePath != NULL ?
+		MyDatabaseId : InvalidOid);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, (uint64) read_lsn, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
@@ -5902,6 +5927,43 @@ pagestore_validate_published_reader_snapshot(PG_FUNCTION_ARGS)
 
 static PagestoreReaderSnapshot *pagestore_fixed_snapshot = NULL;
 static MemoryContext pagestore_fixed_snapshot_context = NULL;
+
+static bool
+pagestore_transaction_id_is_in_progress(TransactionId xid, bool *result)
+{
+	uint32		lo;
+	uint32		hi;
+
+	if (!pagestore_advance_read_lsn || pagestore_fixed_snapshot == NULL)
+		return prev_xid_in_progress_hook != NULL &&
+			prev_xid_in_progress_hook(xid, result);
+	if (!TransactionIdIsNormal(xid) ||
+		TransactionIdPrecedes(xid, pagestore_fixed_snapshot->header.xmin))
+	{
+		*result = false;
+		return true;
+	}
+	if (!TransactionIdPrecedes(xid, pagestore_fixed_snapshot->header.xmax))
+	{
+		*result = true;
+		return true;
+	}
+	lo = 0;
+	hi = pagestore_fixed_snapshot->header.count;
+	while (lo < hi)
+	{
+		uint32		mid = lo + (hi - lo) / 2;
+		TransactionId candidate = pagestore_fixed_snapshot->xids[mid];
+
+		if (TransactionIdPrecedes(candidate, xid))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	*result = lo < pagestore_fixed_snapshot->header.count &&
+		TransactionIdEquals(pagestore_fixed_snapshot->xids[lo], xid);
+	return true;
+}
 
 static void
 pagestore_adopt_reader_view_at_xact_start(void)
@@ -8122,6 +8184,9 @@ _PG_init(void)
 	buffer_tag_read_epoch_hook = pagestore_buffer_tag_read_epoch;
 	prev_get_snapshot_data_hook = get_snapshot_data_hook;
 	get_snapshot_data_hook = pagestore_get_snapshot_data;
+	prev_xid_in_progress_hook = transaction_id_is_in_progress_hook;
+	transaction_id_is_in_progress_hook =
+		pagestore_transaction_id_is_in_progress;
 	prev_xact_start_hook = xact_start_hook;
 	xact_start_hook = pagestore_adopt_reader_view_at_xact_start;
 

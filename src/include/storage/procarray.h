@@ -58,6 +58,9 @@ extern bool ProcArrayInstallRestoredXmin(TransactionId xmin, PGPROC *proc);
 extern RunningTransactions GetRunningTransactionData(void);
 
 extern bool TransactionIdIsInProgress(TransactionId xid);
+typedef bool (*transaction_id_is_in_progress_hook_type) (TransactionId xid,
+													 bool *result);
+extern PGDLLIMPORT transaction_id_is_in_progress_hook_type transaction_id_is_in_progress_hook;
 extern TransactionId GetOldestNonRemovableTransactionId(Relation rel);
 extern TransactionId GetOldestTransactionIdConsideredRunning(void);
 extern TransactionId GetOldestActiveTransactionId(bool inCommitOnly,
