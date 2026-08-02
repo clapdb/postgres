@@ -5214,6 +5214,17 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 #define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
 #define PAGESTORE_READER_CATALOG_FORMAT 1
 #define PAGESTORE_READER_CATALOG_FILE "pagestore_reader.catalog"
+#define PAGESTORE_READER_HANDOFF_MAGIC UINT32_C(0x50534854)
+#define PAGESTORE_READER_HANDOFF_FORMAT 1
+
+typedef struct PagestoreReaderHandoffToken
+{
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		reserved;
+	uint64		lsn;
+} PagestoreReaderHandoffToken;
 
 typedef struct PagestoreReaderSnapshotHeader
 {
@@ -6817,6 +6828,71 @@ Datum
 pagestore_reader_effective_generation(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64((int64) pagestore_localsvc_read_epoch());
+}
+
+PG_FUNCTION_INFO_V1(pagestore_writer_handoff_token);
+Datum
+pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
+{
+	bytea	   *result;
+	PagestoreReaderHandoffToken token;
+
+	if (RecoveryInProgress() || !pagestore_branch_backend_active() ||
+		!pagestore_branch_routing_active() ||
+		pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a reader handoff token requires a writable pagestore compute")));
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token cannot be issued by a write transaction"),
+				 errhint("Issue the token in a new transaction after committing the writes.")));
+	if (IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token cannot be issued inside a transaction block"),
+				 errhint("Issue the token as a standalone autocommit statement.")));
+	XactReadOnly = true;
+	memset(&token, 0, sizeof(token));
+	token.magic = PAGESTORE_READER_HANDOFF_MAGIC;
+	token.format = PAGESTORE_READER_HANDOFF_FORMAT;
+	token.timeline = pagestore_localsvc_timeline();
+	token.lsn = GetXLogInsertRecPtr();
+	result = palloc(VARHDRSZ + sizeof(token));
+	SET_VARSIZE(result, VARHDRSZ + sizeof(token));
+	memcpy(VARDATA(result), &token, sizeof(token));
+	PG_RETURN_BYTEA_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_handoff_ready);
+Datum
+pagestore_reader_handoff_ready(PG_FUNCTION_ARGS)
+{
+	bytea	   *value = PG_GETARG_BYTEA_PP(0);
+	PagestoreReaderHandoffToken token;
+	uint64		read_lsn = pagestore_localsvc_read_lsn();
+
+	if (VARSIZE_ANY_EXHDR(value) != sizeof(token))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader handoff token has an invalid size")));
+	memcpy(&token, VARDATA_ANY(value), sizeof(token));
+	if (token.magic != PAGESTORE_READER_HANDOFF_MAGIC ||
+		token.format != PAGESTORE_READER_HANDOFF_FORMAT ||
+		token.reserved != 0 || XLogRecPtrIsInvalid(token.lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader handoff token has an invalid identity")));
+	if (!pagestore_branch_backend_active() || read_lsn == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader handoff readiness requires a pinned pagestore reader")));
+	if (token.timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader handoff token belongs to a different pagestore timeline")));
+	PG_RETURN_BOOL((XLogRecPtr) read_lsn >= (XLogRecPtr) token.lsn);
 }
 
 static void
