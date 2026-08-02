@@ -1466,6 +1466,8 @@ assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"the adopted reader view serves pages from the newer horizon"
 assert "$($PR -c "SELECT count(*) FROM reader_running;")" "1" \
 	"the adopted exact-R snapshot exposes transactions committed before the newer horizon"
+assert "$($PR -c "SELECT pg_last_committed_xact();" 2>&1 | grep -c 'not supported on an advancing pagestore reader')" "1" \
+	"the adopted reader does not expose a last-commit cache from another horizon"
 assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	SET min_parallel_table_scan_size = 0;
 	SET parallel_setup_cost = 0;

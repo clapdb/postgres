@@ -104,24 +104,15 @@ static post_database_path_hook_type prev_post_database_path_hook = NULL;
 static bool pagestore_commit_ts_bounds_valid = false;
 static TransactionId pagestore_oldest_commit_ts_xid = InvalidTransactionId;
 static TransactionId pagestore_newest_commit_ts_xid = InvalidTransactionId;
-static TransactionId pagestore_latest_commit_ts_xid = InvalidTransactionId;
-static TimestampTz pagestore_latest_commit_ts = 0;
-static ReplOriginId pagestore_latest_commit_ts_nodeid = InvalidReplOriginId;
 
 static bool
 pagestore_commit_ts_latest(TransactionId *xid, TimestampTz *ts,
 						   ReplOriginId *nodeid)
 {
-	if (pagestore_commit_ts_bounds_valid &&
-		TransactionIdIsValid(pagestore_latest_commit_ts_xid))
-	{
-		*xid = pagestore_latest_commit_ts_xid;
-		if (ts != NULL)
-			*ts = pagestore_latest_commit_ts;
-		if (nodeid != NULL)
-			*nodeid = pagestore_latest_commit_ts_nodeid;
-		return true;
-	}
+	if (pagestore_commit_ts_bounds_valid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_last_committed_xact() is not supported on an advancing pagestore reader")));
 	return prev_commit_ts_latest_hook != NULL &&
 		prev_commit_ts_latest_hook(xid, ts, nodeid);
 }
@@ -6011,11 +6002,6 @@ adoption_done:
 		control.checkPointCopy.oldestCommitTsXid;
 	pagestore_newest_commit_ts_xid =
 		control.checkPointCopy.newestCommitTsXid;
-	pagestore_latest_commit_ts_xid =
-		control.checkPointCopy.latestCommitTsXid;
-	pagestore_latest_commit_ts = control.checkPointCopy.latestCommitTs;
-	pagestore_latest_commit_ts_nodeid =
-		control.checkPointCopy.latestCommitTsNodeId;
 	pagestore_commit_ts_bounds_valid = true;
 
 	old_snapshot = pagestore_fixed_snapshot;
