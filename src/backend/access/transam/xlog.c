@@ -7837,6 +7837,14 @@ CreateCheckPoint(int flags)
 	checkPoint.oldestCommitTsXid = TransamVariables->oldestCommitTsXid;
 	checkPoint.newestCommitTsXid = TransamVariables->newestCommitTsXid;
 	LWLockRelease(CommitTsLock);
+	checkPoint.latestCommitTsXid = InvalidTransactionId;
+	checkPoint.latestCommitTs = 0;
+	checkPoint.latestCommitTsNodeId = InvalidReplOriginId;
+	checkPoint.latestCommitTsPadding = 0;
+	if (TransactionIdIsValid(checkPoint.oldestCommitTsXid))
+		checkPoint.latestCommitTsXid = GetLatestCommitTsData(
+			&checkPoint.latestCommitTs,
+			&checkPoint.latestCommitTsNodeId);
 
 	LWLockAcquire(OidGenLock, LW_SHARED);
 	checkPoint.nextOid = TransamVariables->nextOid;

@@ -104,23 +104,22 @@ static post_database_path_hook_type prev_post_database_path_hook = NULL;
 static bool pagestore_commit_ts_bounds_valid = false;
 static TransactionId pagestore_oldest_commit_ts_xid = InvalidTransactionId;
 static TransactionId pagestore_newest_commit_ts_xid = InvalidTransactionId;
+static TransactionId pagestore_latest_commit_ts_xid = InvalidTransactionId;
+static TimestampTz pagestore_latest_commit_ts = 0;
+static ReplOriginId pagestore_latest_commit_ts_nodeid = InvalidReplOriginId;
 
 static bool
 pagestore_commit_ts_latest(TransactionId *xid, TimestampTz *ts,
 						   ReplOriginId *nodeid)
 {
 	if (pagestore_commit_ts_bounds_valid &&
-		TransactionIdIsValid(pagestore_newest_commit_ts_xid))
+		TransactionIdIsValid(pagestore_latest_commit_ts_xid))
 	{
-		TimestampTz latest_ts;
-		ReplOriginId latest_nodeid;
-
-		*xid = pagestore_newest_commit_ts_xid;
-		(void) TransactionIdGetCommitTsData(*xid, &latest_ts, &latest_nodeid);
+		*xid = pagestore_latest_commit_ts_xid;
 		if (ts != NULL)
-			*ts = latest_ts;
+			*ts = pagestore_latest_commit_ts;
 		if (nodeid != NULL)
-			*nodeid = latest_nodeid;
+			*nodeid = pagestore_latest_commit_ts_nodeid;
 		return true;
 	}
 	return prev_commit_ts_latest_hook != NULL &&
@@ -5810,21 +5809,14 @@ pagestore_resolve_published_reader_snapshot(XLogRecPtr upper_lsn)
 }
 
 static void
-pagestore_validate_database_reader_view(void)
+pagestore_validate_database_reader_manifest(XLogRecPtr read_lsn)
 {
 	PagestoreReaderSnapshotManifest manifest;
 	PagestoreReaderSnapshotManifest checked;
 	PageStoreRelKey key;
 	char		page[BLCKSZ];
-	uint64		read_lsn;
 	uint64		resolved;
 
-	if (prev_post_database_path_hook != NULL)
-		prev_post_database_path_hook();
-	if (!pagestore_advance_read_lsn || !OidIsValid(MyDatabaseId) ||
-		DatabasePath == NULL || pagestore_localsvc_read_epoch() <= 1)
-		return;
-	read_lsn = pagestore_localsvc_read_lsn();
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
@@ -5846,6 +5838,18 @@ pagestore_validate_database_reader_view(void)
 		ereport(ERROR,
 				(errmsg("database reader manifest does not match database %u",
 						MyDatabaseId)));
+}
+
+static void
+pagestore_validate_database_reader_view(void)
+{
+	if (prev_post_database_path_hook != NULL)
+		prev_post_database_path_hook();
+	if (!pagestore_advance_read_lsn || !OidIsValid(MyDatabaseId) ||
+		DatabasePath == NULL || pagestore_localsvc_read_epoch() <= 1)
+		return;
+	pagestore_validate_database_reader_manifest(
+		(XLogRecPtr) pagestore_localsvc_read_lsn());
 }
 
 PG_FUNCTION_INFO_V1(pagestore_publish_reader_snapshot_artifact);
@@ -5946,6 +5950,8 @@ pagestore_adopt_reader_view_at_xact_start(void)
 			goto adoption_done;
 		snapshot = pagestore_load_published_reader_snapshot(
 			pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
+		if (OidIsValid(MyDatabaseId) && DatabasePath != NULL)
+			pagestore_validate_database_reader_manifest(published);
 		valid = ps_control_asof_timeout(published, &control,
 			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
 			control.checkPointCopy.redo == published &&
@@ -6005,6 +6011,11 @@ adoption_done:
 		control.checkPointCopy.oldestCommitTsXid;
 	pagestore_newest_commit_ts_xid =
 		control.checkPointCopy.newestCommitTsXid;
+	pagestore_latest_commit_ts_xid =
+		control.checkPointCopy.latestCommitTsXid;
+	pagestore_latest_commit_ts = control.checkPointCopy.latestCommitTs;
+	pagestore_latest_commit_ts_nodeid =
+		control.checkPointCopy.latestCommitTsNodeId;
 	pagestore_commit_ts_bounds_valid = true;
 
 	old_snapshot = pagestore_fixed_snapshot;

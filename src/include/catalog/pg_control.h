@@ -22,7 +22,7 @@
 
 
 /* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1902
+#define PG_CONTROL_VERSION	1903
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -55,6 +55,10 @@ typedef struct CheckPoint
 										 * timestamp */
 	TransactionId newestCommitTsXid;	/* newest Xid with valid commit
 										 * timestamp */
+	TransactionId latestCommitTsXid;	/* Xid in the commit timestamp cache */
+	int64		latestCommitTs;
+	uint16		latestCommitTsNodeId;
+	uint16		latestCommitTsPadding;
 
 	/*
 	 * Oldest XID still running. This is only needed to initialize hot standby
