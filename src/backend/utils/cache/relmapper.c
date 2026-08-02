@@ -134,7 +134,6 @@ static RelMapFile active_local_updates;
 static RelMapFile pending_shared_updates;
 static RelMapFile pending_local_updates;
 
-
 /* non-export function prototypes */
 static void apply_map_update(RelMapFile *map, Oid relationId,
 							 RelFileNumber fileNumber, bool add_okay);

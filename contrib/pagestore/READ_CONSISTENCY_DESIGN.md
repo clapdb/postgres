@@ -267,9 +267,16 @@ reconstruction.
    add transactions that finished after R.  This needs no manually seeded CLOG
    base, does not rescan WAL per CLOG page, and keeps horizon work and store I/O
    out of the checkpoint drain.  Database-specific catalog and relation-map
-   provenance remains a control-plane action.  The staging marker is distinct
-   from the adoption manifest, so an incomplete per-database artifact cannot
-   become a reader candidate.
+   provenance remains a control-plane action.  A database publisher reads both
+   maps while holding `RelationMappingLock`, samples the WAL position after the
+   reads, and durably publishes changed bytes at that position.  It can bind
+   those maps only to a staged checkpoint whose R covers the sampled position;
+   recovery or a failed publication simply causes the current durable maps to
+   be sampled again.  Unchanged maps retain their prior sampled position.  The
+   publisher then emits the adoption manifest.
+   The staging marker is distinct from that manifest, so an incomplete
+   per-database artifact cannot become a reader candidate.  Scheduling this
+   per-database publication across every database remains control-plane work.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the
