@@ -189,6 +189,9 @@ extern void pagestore_control_mirror_init(bool localsvc_active);
 extern void pagestore_slru_mirror_init(bool localsvc_active);
 extern void pagestore_slru_mirror_drain(void);
 extern void pagestore_slru_note_checkpoint_redo(XLogRecPtr redo);
+struct ControlFileData;
+extern void pagestore_publish_checkpoint_reader_snapshot(
+	const struct ControlFileData *control);
 extern uint32 pagestore_slru_klass_id(const char *name);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
 extern void pagestore_localsvc_store_sync(void);

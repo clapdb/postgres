@@ -358,6 +358,18 @@ ps_control_drain(void)
 			pagestore_localsvc_store_sync_timeout(PS_CONTROL_SHIP_TIMEOUT_MS);
 		for (i = 0; i < ndone; i++)
 			pagestore_localsvc_admission_fence_end(done_tokens[i]);
+		if (shipped && XLogRecPtrIsValid(shipped_redo))
+		{
+			pagestore_slru_note_checkpoint_redo(shipped_redo);
+			for (i = 0; i < ndone; i++)
+			{
+				PsControlPending *p = &ps_control_queue[
+					(ps_control_queue_head + i) % PS_CONTROL_QUEUE_CAPACITY];
+
+				if (p->fence_token != 0)
+					pagestore_publish_checkpoint_reader_snapshot(&p->image);
+			}
+		}
 
 		ps_control_queue_head = (ps_control_queue_head + ndone)
 			% PS_CONTROL_QUEUE_CAPACITY;
@@ -369,8 +381,6 @@ ps_control_drain(void)
 		 * (and thus staged) every dirty SLRU page.  Report the newest such
 		 * redo: it is the SLRU mirror's next visibility-watermark candidate.
 		 */
-		if (shipped && XLogRecPtrIsValid(shipped_redo))
-			pagestore_slru_note_checkpoint_redo(shipped_redo);
 	}
 	PG_CATCH();
 	{

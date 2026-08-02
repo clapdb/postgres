@@ -1167,6 +1167,8 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_reader_effective_generation' LANGUAGE C;
        CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
+         AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_published_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
@@ -1266,6 +1268,16 @@ read -r readerR2 readerNext2 readerOldest2 readerNextMulti2 readerNextMember2 re
 	       CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END || ' ' ||
 	       CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END
 	FROM pg_control_checkpoint();")"
+readerSnapshotPublished=no
+for ((i = 0; i < 100; i++)); do
+	if [ "$($P -c "SELECT pagestore_validate_checkpoint_reader_snapshot('$readerR2');" 2>/dev/null)" = "0" ]; then
+		readerSnapshotPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$readerSnapshotPublished" "yes" \
+	"checkpoint completion schedules the exact-R running-XID snapshot"
 READERPREP2=$(mktemp -d)
 mkdir -p "$READERPREP2/relmaps/global" "$READERPREP2/relmaps/$readerDbOid"
 cp "$DATA/global/pg_filenode.map" "$READERPREP2/relmaps/global/"

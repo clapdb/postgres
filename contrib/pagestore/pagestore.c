@@ -54,6 +54,7 @@
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "fmgr.h"
+#include "libpq/pqsignal.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "optimizer/cost.h"
@@ -62,6 +63,8 @@
 #include "pagestore_backend.h"
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
 #include "storage/copydir.h"
@@ -79,11 +82,13 @@
 #include "utils/pg_lsn.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/wait_classes.h"
 #include "walredo_client.h"
 
 PG_MODULE_MAGIC;
 
 void		_PG_init(void);
+PGDLLEXPORT void pagestore_reader_snapshot_worker_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
@@ -203,7 +208,15 @@ typedef struct PagestoreReaderHorizonShmem
 	TimestampTz refresh_started_at;
 } PagestoreReaderHorizonShmem;
 
+typedef struct PagestoreReaderSnapshotJobShmem
+{
+	slock_t		mutex;
+	ControlFileData control;
+	uint64		generation;
+} PagestoreReaderSnapshotJobShmem;
+
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
+static PagestoreReaderSnapshotJobShmem *pagestore_reader_snapshot_job = NULL;
 
 static void
 pagestore_shmem_request(void)
@@ -211,6 +224,7 @@ pagestore_shmem_request(void)
 	if (prev_shmem_request_hook != NULL)
 		prev_shmem_request_hook();
 	RequestAddinShmemSpace(MAXALIGN(sizeof(PagestoreReaderHorizonShmem)));
+	RequestAddinShmemSpace(MAXALIGN(sizeof(PagestoreReaderSnapshotJobShmem)));
 }
 
 static bool
@@ -5216,7 +5230,25 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT 2
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
+#define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
+
+typedef struct PagestoreReaderSnapshotReady
+{
+	PagestoreReaderSnapshotHeader header;
+	uint32		block_count;
+	uint32		reserved;
+	pg_crc32c	crc;
+} PagestoreReaderSnapshotReady;
+
+static void
+pagestore_reader_snapshot_ready_crc(PagestoreReaderSnapshotReady *ready)
+{
+	INIT_CRC32C(ready->crc);
+	COMP_CRC32C(ready->crc, ready,
+				offsetof(PagestoreReaderSnapshotReady, crc));
+	FIN_CRC32C(ready->crc);
+}
 
 typedef struct PagestoreReaderSnapshotManifest
 {
@@ -5645,13 +5677,9 @@ pagestore_load_reader_snapshot(const char *dir, uint32 timeline,
 }
 
 static BlockNumber
-pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
-								  XLogRecPtr read_lsn)
+pagestore_publish_reader_snapshot_data(PagestoreReaderSnapshot *snapshot)
 {
-	PagestoreReaderSnapshot *snapshot;
-	PagestoreReaderSnapshotManifest manifest;
 	PageStoreRelKey data_key;
-	PageStoreRelKey manifest_key;
 	char	   *artifact;
 	char		page[BLCKSZ];
 	Size		xids_size;
@@ -5659,8 +5687,6 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	BlockNumber block_count;
 	BlockNumber nblocks;
 
-	snapshot = pagestore_load_reader_snapshot(dir, timeline, read_lsn,
-										 CurrentMemoryContext, ERROR);
 	xids_size = snapshot->header.count * sizeof(TransactionId);
 	artifact_size = sizeof(snapshot->header) + xids_size;
 	block_count = (BlockNumber) ((artifact_size + BLCKSZ - 1) / BLCKSZ);
@@ -5683,13 +5709,345 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 		memcpy(page, artifact + offset, chunk);
 		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
 			&data_key, block, page,
-			(uint64) read_lsn, nblocks,
+			(uint64) snapshot->header.read_lsn, nblocks,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 		if (block >= nblocks)
 			nblocks = block + 1;
 	}
 	pagestore_localsvc_store_sync_timeout(
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pfree(artifact);
+	return block_count;
+}
+
+static void
+pagestore_reader_mark_completed(TransactionId xid, TransactionId oldest_xid,
+								TransactionId next_xid, uint8 *running)
+{
+	if (!TransactionIdPrecedes(xid, oldest_xid) &&
+		TransactionIdPrecedes(xid, next_xid))
+		running[(uint32) (xid - oldest_xid) / 8] |=
+			1U << ((uint32) (xid - oldest_xid) % 8);
+}
+
+static void
+pagestore_reader_mark_completions(XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+								  TransactionId oldest_xid,
+								  TransactionId next_xid, uint8 *running)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	XLogRecPtr	readfrom;
+	XLogRecPtr	scanned = start_lsn;
+	char	   *errm = NULL;
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+		XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
+				   .segment_open = &wal_segment_open,
+				   .segment_close = &wal_segment_close), pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("could not allocate a reader snapshot WAL reader")));
+	{
+		XLogSegNo	segno;
+
+		XLByteToSeg(start_lsn, segno, wal_segment_size);
+		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, readfrom);
+	}
+	readfrom = XLogFindNextRecord(reader, readfrom, &errm);
+	if (!XLogRecPtrIsInvalid(readfrom))
+		XLogBeginRead(reader, readfrom);
+	while (!XLogRecPtrIsInvalid(readfrom) &&
+		   XLogReadRecord(reader, &errm) != NULL)
+	{
+		uint8		info;
+		TransactionId xid;
+
+		if (reader->EndRecPtr > scanned)
+			scanned = reader->EndRecPtr;
+		if (reader->EndRecPtr > end_lsn)
+			break;
+		if (reader->EndRecPtr <= start_lsn ||
+			XLogRecGetRmid(reader) != RM_XACT_ID)
+			continue;
+		info = XLogRecGetInfo(reader) & XLOG_XACT_OPMASK;
+		if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED)
+		{
+			xl_xact_parsed_commit parsed;
+
+			ParseCommitRecord(XLogRecGetInfo(reader),
+				(xl_xact_commit *) XLogRecGetData(reader), &parsed);
+			xid = info == XLOG_XACT_COMMIT_PREPARED ? parsed.twophase_xid :
+				XLogRecGetXid(reader);
+			pagestore_reader_mark_completed(xid, oldest_xid, next_xid, running);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				pagestore_reader_mark_completed(parsed.subxacts[i], oldest_xid,
+										 next_xid, running);
+		}
+		else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED)
+		{
+			xl_xact_parsed_abort parsed;
+
+			ParseAbortRecord(XLogRecGetInfo(reader),
+				(xl_xact_abort *) XLogRecGetData(reader), &parsed);
+			xid = info == XLOG_XACT_ABORT_PREPARED ? parsed.twophase_xid :
+				XLogRecGetXid(reader);
+			pagestore_reader_mark_completed(xid, oldest_xid, next_xid, running);
+			for (int i = 0; i < parsed.nsubxacts; i++)
+				pagestore_reader_mark_completed(parsed.subxacts[i], oldest_xid,
+										 next_xid, running);
+		}
+	}
+	if (!((scanned >= end_lsn) ||
+		  (!XLogRecPtrIsInvalid(readfrom) && errm == NULL &&
+		   ps_wal_reaches(end_lsn))))
+		ereport(ERROR,
+				(errmsg("WAL does not cover reader snapshot completion window (%X/%08X, %X/%08X]",
+						LSN_FORMAT_ARGS(start_lsn), LSN_FORMAT_ARGS(end_lsn))));
+	XLogReaderFree(reader);
+	pfree(pd);
+}
+
+/* Build the database-independent half of a reader artifact off-checkpoint. */
+static bool
+pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	MemoryContext work = NULL;
+	bool		succeeded = false;
+	XLogRecPtr	read_lsn = control->checkPointCopy.redo;
+	TransactionId oldest_xid = control->checkPointCopy.oldestXid;
+	TransactionId next_xid = XidFromFullTransactionId(control->checkPointCopy.nextXid);
+
+	if (!pagestore_branch_backend_active() || XLogRecPtrIsInvalid(read_lsn) ||
+		!TransactionIdIsNormal(oldest_xid) ||
+		!TransactionIdIsNormal(next_xid) ||
+		TransactionIdFollows(oldest_xid, next_xid))
+		return false;
+
+	PG_TRY();
+	{
+		PagestoreReaderSnapshot snapshot;
+		PagestoreReaderSnapshotReady ready;
+		PageStoreRelKey key;
+		char		page[BLCKSZ];
+		TransactionId *xids;
+		TransactionId xid;
+		uint8	   *running;
+		uint32		horizon;
+		Size		bitmap_size;
+		uint32		count = 0;
+		XLogRecPtr	scan_end;
+		BlockNumber blocks;
+		BlockNumber nblocks;
+
+		work = AllocSetContextCreate(CurrentMemoryContext,
+			"pagestore checkpoint reader snapshot", ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(work);
+		horizon = (uint32) (next_xid - oldest_xid);
+		bitmap_size = ((Size) horizon + 7) / 8;
+		running = palloc0(bitmap_size);
+
+		/*
+		 * Read current status first, then sample scan_end.  A transaction that
+		 * finishes concurrently is either observed still running here or has
+		 * its completion record included by the subsequent WAL pass.
+		 */
+		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
+		{
+			XLogRecPtr	status_lsn;
+			XidStatus	status = TransactionIdGetStatus(xid, &status_lsn);
+
+			if (status == TRANSACTION_STATUS_IN_PROGRESS ||
+				status == TRANSACTION_STATUS_SUB_COMMITTED)
+				pagestore_reader_mark_completed(xid, oldest_xid, next_xid, running);
+			TransactionIdAdvance(xid);
+		}
+		scan_end = GetXLogInsertRecPtr();
+		XLogFlush(scan_end);
+		pagestore_reader_mark_completions(read_lsn, scan_end, oldest_xid,
+										 next_xid, running);
+		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
+		{
+			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
+				count++;
+			TransactionIdAdvance(xid);
+		}
+		if (count > MaxAllocSize / sizeof(TransactionId))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("automatic reader snapshot is too large")));
+		xids = count > 0 ? palloc_array(TransactionId, count) : NULL;
+		count = 0;
+		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
+		{
+			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
+				xids[count++] = xid;
+			TransactionIdAdvance(xid);
+		}
+
+		memset(&snapshot, 0, sizeof(snapshot));
+		snapshot.header.read_lsn = read_lsn;
+		snapshot.header.magic = PAGESTORE_READER_SNAPSHOT_MAGIC;
+		snapshot.header.format = PAGESTORE_READER_SNAPSHOT_FORMAT;
+		snapshot.header.timeline = pagestore_localsvc_timeline();
+		snapshot.header.count = count;
+		snapshot.header.xmin = count > 0 ? xids[0] : next_xid;
+		snapshot.header.xmax = next_xid;
+		snapshot.xids = xids;
+		pagestore_reader_snapshot_crc(&snapshot.header, xids);
+		blocks = pagestore_publish_reader_snapshot_data(&snapshot);
+
+		memset(&ready, 0, sizeof(ready));
+		ready.header = snapshot.header;
+		ready.block_count = blocks;
+		pagestore_reader_snapshot_ready_crc(&ready);
+		memset(page, 0, sizeof(page));
+		memcpy(page, &ready, sizeof(ready));
+		key = pagestore_reader_snapshot_key(
+			PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+		nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+			PS_KLASS_READER_SNAPSHOT, &key,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, page, (uint64) read_lsn, nblocks,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		pagestore_localsvc_store_sync_timeout(
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(work);
+		work = NULL;
+		succeeded = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		MemoryContext error_context;
+
+		error_context = MemoryContextSwitchTo(TopMemoryContext);
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(error_context);
+		MemoryContextSwitchTo(oldcontext);
+		if (work != NULL)
+			MemoryContextDelete(work);
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore: automatic reader snapshot publication failed at %X/%08X: %s",
+						LSN_FORMAT_ARGS(read_lsn), edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return succeeded;
+}
+
+/* Checkpoint completion only replaces the pending job; the worker does I/O. */
+void
+pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
+{
+	if (pagestore_reader_snapshot_job == NULL ||
+		!pagestore_branch_backend_active())
+		return;
+	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+	pagestore_reader_snapshot_job->control = *control;
+	pagestore_reader_snapshot_job->generation++;
+	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+}
+
+void
+pagestore_reader_snapshot_worker_main(Datum main_arg)
+{
+	uint64		processed = 0;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+
+	while (!ShutdownRequestPending)
+	{
+		ControlFileData control;
+		uint64		generation;
+
+		SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+		control = pagestore_reader_snapshot_job->control;
+		generation = pagestore_reader_snapshot_job->generation;
+		SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+		if (generation > processed)
+		{
+			if (pagestore_build_checkpoint_reader_snapshot(&control))
+			{
+				processed = generation;
+				continue;
+			}
+		}
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1000L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	proc_exit(0);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_validate_checkpoint_reader_snapshot);
+Datum
+pagestore_validate_checkpoint_reader_snapshot(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	read_lsn = PG_GETARG_LSN(0);
+	PagestoreReaderSnapshotReady ready;
+	PagestoreReaderSnapshotReady checked;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		ereport(ERROR,
+				(errmsg("no automatic reader snapshot at %X/%08X",
+						LSN_FORMAT_ARGS(read_lsn))));
+	memcpy(&ready, page, sizeof(ready));
+	checked = ready;
+	pagestore_reader_snapshot_ready_crc(&checked);
+	if (ready.header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		ready.header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		ready.header.timeline != pagestore_localsvc_timeline() ||
+		ready.header.read_lsn != read_lsn || ready.block_count == 0 ||
+		ready.reserved != 0 || !EQ_CRC32C(ready.crc, checked.crc))
+		ereport(ERROR,
+				(errmsg("automatic reader snapshot at %X/%08X is invalid",
+						LSN_FORMAT_ARGS(read_lsn))));
+	PG_RETURN_INT64((int64) ready.header.count);
+}
+
+static BlockNumber
+pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
+								  XLogRecPtr read_lsn)
+{
+	PagestoreReaderSnapshot *snapshot;
+	PagestoreReaderSnapshotManifest manifest;
+	PageStoreRelKey manifest_key;
+	char		page[BLCKSZ];
+	BlockNumber block_count;
+	BlockNumber nblocks;
+	Size		xids_size;
+	Size		artifact_size;
+
+	snapshot = pagestore_load_reader_snapshot(dir, timeline, read_lsn,
+										 CurrentMemoryContext, ERROR);
+	xids_size = snapshot->header.count * sizeof(TransactionId);
+	artifact_size = sizeof(snapshot->header) + xids_size;
+	block_count = pagestore_publish_reader_snapshot_data(snapshot);
 
 	memset(&manifest, 0, sizeof(manifest));
 	manifest.read_lsn = read_lsn;
@@ -5725,7 +6083,6 @@ pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 	pagestore_localsvc_store_sync_timeout(
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 
-	pfree(artifact);
 	if (snapshot->xids != NULL)
 		pfree(snapshot->xids);
 	pfree(snapshot);
@@ -7307,6 +7664,16 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_horizon->refresh_owner_pid = 0;
 		pagestore_reader_horizon->refresh_started_at = 0;
 	}
+	pagestore_reader_snapshot_job = ShmemInitStruct(
+		"pagestore reader snapshot job",
+		sizeof(PagestoreReaderSnapshotJobShmem), &found);
+	if (!found)
+	{
+		SpinLockInit(&pagestore_reader_snapshot_job->mutex);
+		memset(&pagestore_reader_snapshot_job->control, 0,
+			   sizeof(ControlFileData));
+		pagestore_reader_snapshot_job->generation = 0;
+	}
 	LWLockRelease(AddinShmemInitLock);
 
 	if (DataDir == NULL)
@@ -8200,4 +8567,23 @@ _PG_init(void)
 	 */
 	pagestore_control_mirror_init(pagestore_backend_name != NULL &&
 								  strcmp(pagestore_backend_name, "localsvc") == 0);
+	if (pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0 &&
+		pagestore_localsvc_read_lsn() == 0)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 10;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pagestore");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN,
+				 "pagestore_reader_snapshot_worker_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN,
+				 "pagestore reader snapshot worker");
+		snprintf(worker.bgw_type, BGW_MAXLEN,
+				 "pagestore reader snapshot worker");
+		RegisterBackgroundWorker(&worker);
+	}
 }

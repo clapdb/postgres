@@ -259,9 +259,17 @@ reconstruction.
    fails closed when the reader's prepared maps differ, rather than combining a
    boot-time mapped relfilenumber with newer catalog pages.  Advancing readers force
    non-parallel planning because worker transaction state does not yet carry
-   this extension's view identity.  Snapshot and catalog-artifact
-   derivation/publication remain control-plane actions; automating those actions
-   is the remaining part of the advancing-reader workflow.
+   this extension's view identity.  Checkpoint completion only replaces a
+   shared latest-job slot; a dedicated worker reconstructs and publishes the
+   database-independent exact-R running-XID snapshot as a staging artifact.
+   The worker scans current CLOG once for transactions still running, samples
+   and flushes its WAL endpoint, then makes one pass over `(R, endpoint]` to
+   add transactions that finished after R.  This needs no manually seeded CLOG
+   base, does not rescan WAL per CLOG page, and keeps horizon work and store I/O
+   out of the checkpoint drain.  Database-specific catalog and relation-map
+   provenance remains a control-plane action.  The staging marker is distinct
+   from the adoption manifest, so an incomplete per-database artifact cannot
+   become a reader candidate.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the
