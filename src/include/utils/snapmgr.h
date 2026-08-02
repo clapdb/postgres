@@ -108,6 +108,8 @@ extern bool ThereAreNoPriorRegisteredSnapshots(void);
 extern bool HaveRegisteredOrActiveSnapshot(void);
 
 extern char *ExportSnapshot(Snapshot snapshot);
+typedef void (*snapshot_transfer_hook_type) (bool is_export);
+extern PGDLLIMPORT snapshot_transfer_hook_type snapshot_transfer_hook;
 
 /*
  * These live in procarray.c because they're intimately linked to the

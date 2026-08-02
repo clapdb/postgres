@@ -1417,8 +1417,8 @@ assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
 	"pg_current_snapshot preserves the pinned reader running-XID set"
 reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
-assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export an oversized recovery snapshot')" "1" \
-	"pinned reader rejects exporting an oversized running-XID snapshot"
+assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
+	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the

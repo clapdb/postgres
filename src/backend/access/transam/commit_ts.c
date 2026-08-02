@@ -96,6 +96,7 @@ static SlruDesc CommitTsSlruDesc;
 
 #define CommitTsCtl (&CommitTsSlruDesc)
 commit_ts_bounds_hook_type commit_ts_bounds_hook = NULL;
+commit_ts_latest_hook_type commit_ts_latest_hook = NULL;
 
 /*
  * We keep a cache of the last value set in shared memory.
@@ -374,6 +375,18 @@ TransactionId
 GetLatestCommitTsData(TimestampTz *ts, ReplOriginId *nodeid)
 {
 	TransactionId xid;
+	TimestampTz latest_ts;
+	ReplOriginId latest_nodeid;
+
+	if (commit_ts_latest_hook != NULL &&
+		commit_ts_latest_hook(&xid, &latest_ts, &latest_nodeid))
+	{
+		if (ts)
+			*ts = latest_ts;
+		if (nodeid)
+			*nodeid = latest_nodeid;
+		return xid;
+	}
 
 	LWLockAcquire(CommitTsLock, LW_SHARED);
 
