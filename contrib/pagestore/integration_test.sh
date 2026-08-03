@@ -1169,6 +1169,10 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_checkpoint_reader_snapshot' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prime_reader_relmaps() RETURNS pg_lsn
+         AS 'pagestore','pagestore_prime_reader_relmaps' LANGUAGE C;
+       CREATE FUNCTION pagestore_publish_database_reader_manifest() RETURNS pg_lsn
+         AS 'pagestore','pagestore_publish_database_reader_manifest' LANGUAGE C;
        CREATE FUNCTION pagestore_validate_published_reader_snapshot(int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_validate_published_reader_snapshot' LANGUAGE C STRICT;" >/dev/null
 # A prepared XID remains in progress across the stopped copy at R.  Its 20000
@@ -1258,6 +1262,7 @@ $P -c "SELECT pagestore_install_prepared_reader('$READERPREP', '$READERDATA', 0,
 cp "$DATA/pg_xact/"* "$READERDATA/pg_xact/"
 rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
+$P -c "SELECT pagestore_prime_reader_relmaps();" >/dev/null
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 readerV2Xid=$($P -c "SELECT xmin::text FROM reader_t WHERE id = 1;")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
@@ -1278,17 +1283,8 @@ for ((i = 0; i < 100; i++)); do
 done
 assert "$readerSnapshotPublished" "yes" \
 	"checkpoint completion schedules the exact-R running-XID snapshot"
-READERPREP2=$(mktemp -d)
-mkdir -p "$READERPREP2/relmaps/global" "$READERPREP2/relmaps/$readerDbOid"
-cp "$DATA/global/pg_filenode.map" "$READERPREP2/relmaps/global/"
-cp "$DATA/base/$readerDbOid/pg_filenode.map" "$READERPREP2/relmaps/$readerDbOid/"
 assert "$($P -c "SELECT pagestore_clog_status_asof('$readerV2Xid'::xid, '$bc', '$readerR2');")" "1" \
 	"the newer reader horizon reconstructs the v2 transaction as committed"
-$P -c "SELECT pagestore_prepare_reader('$READERPREP2', 0, '$bc', '$readerR2',
-	'$readerOldest2'::xid, '$readerNext2'::xid,
-	'$readerCtsOldest2'::xid, '$readerCtsNext2'::xid,
-	'$readerOldestMulti2'::xid, '$readerNextMulti2'::xid,
-	0, $readerNextMember2);" >/dev/null
 READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
@@ -1474,9 +1470,8 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
-readerSnapshotBlocks2=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP2', 0, '$readerR2');")
-assert "$([ "${readerSnapshotBlocks2:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
-	"control plane publishes the exact snapshot for the newer reader horizon"
+assert "$($P -c "SELECT pagestore_publish_database_reader_manifest();")" "$readerR2" \
+	"database publisher binds exact-R relation maps to the automatic snapshot"
 assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
@@ -1494,7 +1489,6 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	SET parallel_tuple_cost = 0;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
-rm -rf "$READERPREP2"
 "$BIN/pg_ctl" -D "$READERDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 rm -rf "$(dirname "$READERDATA")"

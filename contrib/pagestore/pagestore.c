@@ -83,6 +83,7 @@
 #include "utils/plancache.h"
 #include "utils/rel.h"
 #include "utils/wait_classes.h"
+#include "utils/relmapper.h"
 #include "walredo_client.h"
 
 PG_MODULE_MAGIC;
@@ -5231,7 +5232,31 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
+#define PAGESTORE_READER_RELMAP_OBJECT 3
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
+
+#define PAGESTORE_READER_RELMAP_MAGIC UINT32_C(0x5053524C)
+#define PAGESTORE_READER_RELMAP_FORMAT 1
+#define PAGESTORE_READER_RELMAP_MAX_SIZE \
+	(BLCKSZ - MAXALIGN(sizeof(PagestoreReaderRelmap)))
+
+typedef struct PagestoreReaderRelmap
+{
+	uint32		magic;
+	uint32		format;
+	Oid			dbid;
+	Oid			tsid;
+	uint32		size;
+	pg_crc32c	data_crc;
+	pg_crc32c	crc;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} PagestoreReaderRelmap;
+
+static XLogRecPtr pagestore_primed_relmap_lsn = InvalidXLogRecPtr;
+static Size pagestore_primed_global_relmap_size = 0;
+static Size pagestore_primed_local_relmap_size = 0;
+static char pagestore_primed_global_relmap[PAGESTORE_READER_RELMAP_MAX_SIZE];
+static char pagestore_primed_local_relmap[PAGESTORE_READER_RELMAP_MAX_SIZE];
 
 typedef struct PagestoreReaderSnapshotReady
 {
@@ -5447,6 +5472,146 @@ pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 	key.dbOid = dbid;
 	key.relNumber = object;
 	return key;
+}
+
+static Size
+pagestore_read_reader_relmap(const char *dir, char *data, Size capacity)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+	int			fd;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/pg_filenode.map", dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0 ||
+		st.st_size > (off_t) capacity ||
+		!pagestore_pread_exact(fd, data, (Size) st.st_size, 0))
+	{
+		if (fd >= 0)
+			CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read relation map \"%s\": %m", path)));
+	}
+	CloseTransientFile(fd);
+	return (Size) st.st_size;
+}
+
+static void
+pagestore_publish_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr lsn,
+								const char *data, Size size)
+{
+	PagestoreReaderRelmap *artifact;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	BlockNumber nblocks;
+
+	memset(page, 0, sizeof(page));
+	artifact = (PagestoreReaderRelmap *) page;
+	artifact->magic = PAGESTORE_READER_RELMAP_MAGIC;
+	artifact->format = PAGESTORE_READER_RELMAP_FORMAT;
+	artifact->dbid = dbid;
+	artifact->tsid = tsid;
+	artifact->size = size;
+	INIT_CRC32C(artifact->data_crc);
+	COMP_CRC32C(artifact->data_crc, data, size);
+	FIN_CRC32C(artifact->data_crc);
+	memcpy(artifact->data, data, size);
+	INIT_CRC32C(artifact->crc);
+	COMP_CRC32C(artifact->crc, artifact,
+				  offsetof(PagestoreReaderRelmap, crc));
+	FIN_CRC32C(artifact->crc);
+	key = pagestore_reader_snapshot_key(PAGESTORE_READER_RELMAP_OBJECT, dbid);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, (uint64) lsn, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_prime_reader_relmaps);
+Datum
+pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	lsn;
+	char		global_map[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	char		local_map[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	Size		global_size;
+	Size		local_size;
+	bool		changed;
+
+	if (!superuser() || !OidIsValid(MyDatabaseId) || DatabasePath == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("reader relation-map priming requires a database superuser backend")));
+	LWLockAcquire(RelationMappingLock, LW_SHARED);
+	global_size = pagestore_read_reader_relmap("global", global_map,
+										 sizeof(global_map));
+	local_size = pagestore_read_reader_relmap(DatabasePath, local_map,
+									  sizeof(local_map));
+	lsn = GetXLogInsertRecPtr();
+	LWLockRelease(RelationMappingLock);
+	changed = global_size != pagestore_primed_global_relmap_size ||
+		local_size != pagestore_primed_local_relmap_size ||
+		memcmp(global_map, pagestore_primed_global_relmap, global_size) != 0 ||
+		memcmp(local_map, pagestore_primed_local_relmap, local_size) != 0;
+	if (!changed)
+		PG_RETURN_LSN(pagestore_primed_relmap_lsn);
+	pagestore_publish_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID, lsn,
+								 global_map, global_size);
+	pagestore_publish_reader_relmap(MyDatabaseId, MyDatabaseTableSpace, lsn,
+								 local_map, local_size);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	memcpy(pagestore_primed_global_relmap, global_map, global_size);
+	memcpy(pagestore_primed_local_relmap, local_map, local_size);
+	pagestore_primed_global_relmap_size = global_size;
+	pagestore_primed_local_relmap_size = local_size;
+	pagestore_primed_relmap_lsn = lsn;
+	PG_RETURN_LSN(lsn);
+}
+
+static bool
+pagestore_load_reader_relmap(Oid dbid, XLogRecPtr read_lsn,
+							 pg_crc32c *data_crc)
+{
+	PagestoreReaderRelmap artifact;
+	PagestoreReaderRelmap checked;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	pg_crc32c	crc;
+
+	key = pagestore_reader_snapshot_key(PAGESTORE_READER_RELMAP_OBJECT, dbid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		return false;
+	memcpy(&artifact, page, offsetof(PagestoreReaderRelmap, data));
+	checked = artifact;
+	INIT_CRC32C(checked.crc);
+	COMP_CRC32C(checked.crc, &checked,
+				offsetof(PagestoreReaderRelmap, crc));
+	FIN_CRC32C(checked.crc);
+	if (artifact.magic != PAGESTORE_READER_RELMAP_MAGIC ||
+		artifact.format != PAGESTORE_READER_RELMAP_FORMAT ||
+		artifact.dbid != dbid || artifact.size == 0 ||
+		(OidIsValid(dbid) ? !OidIsValid(artifact.tsid) :
+		 artifact.tsid != GLOBALTABLESPACE_OID) ||
+		artifact.size > BLCKSZ - offsetof(PagestoreReaderRelmap, data) ||
+		!EQ_CRC32C(artifact.crc, checked.crc))
+		return false;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, page + offsetof(PagestoreReaderRelmap, data),
+				artifact.size);
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, artifact.data_crc))
+		return false;
+	*data_crc = artifact.data_crc;
+	return true;
 }
 
 static void
@@ -6028,6 +6193,90 @@ pagestore_validate_checkpoint_reader_snapshot(PG_FUNCTION_ARGS)
 				(errmsg("automatic reader snapshot at %X/%08X is invalid",
 						LSN_FORMAT_ARGS(read_lsn))));
 	PG_RETURN_INT64((int64) ready.header.count);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_publish_database_reader_manifest);
+Datum
+pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
+{
+	PagestoreReaderSnapshotReady ready;
+	PagestoreReaderSnapshotReady checked_ready;
+	PagestoreReaderSnapshotManifest manifest;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	BlockNumber nblocks;
+	pg_crc32c	current_global_crc;
+	pg_crc32c	current_local_crc;
+
+	if (!superuser() || !OidIsValid(MyDatabaseId) || DatabasePath == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("reader manifest publication requires a database superuser backend")));
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, PG_UINT64_MAX, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		PG_RETURN_NULL();
+	memcpy(&ready, page, sizeof(ready));
+	checked_ready = ready;
+	pagestore_reader_snapshot_ready_crc(&checked_ready);
+	if (ready.header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		ready.header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		ready.header.timeline != pagestore_localsvc_timeline() ||
+		ready.header.read_lsn != (XLogRecPtr) resolved ||
+		ready.header.count > MaxAllocSize / sizeof(TransactionId) ||
+		ready.block_count == 0 ||
+		ready.block_count != (BlockNumber)
+		((sizeof(ready.header) +
+		  (Size) ready.header.count * sizeof(TransactionId) + BLCKSZ - 1) /
+		 BLCKSZ) || ready.reserved != 0 ||
+		!EQ_CRC32C(ready.crc, checked_ready.crc))
+		ereport(ERROR, (errmsg("latest automatic reader snapshot is invalid")));
+	memset(&manifest, 0, sizeof(manifest));
+	manifest.read_lsn = resolved;
+	manifest.artifact_size = sizeof(ready.header) +
+		(Size) ready.header.count * sizeof(TransactionId);
+	manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
+	manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
+	manifest.timeline = ready.header.timeline;
+	manifest.block_count = ready.block_count;
+	manifest.artifact_crc = ready.header.crc;
+	if (!pagestore_load_reader_relmap(InvalidOid, (XLogRecPtr) resolved,
+			&manifest.global_relmap_crc) ||
+		!pagestore_load_reader_relmap(MyDatabaseId, (XLogRecPtr) resolved,
+			&manifest.local_relmap_crc))
+		PG_RETURN_NULL();
+	LWLockAcquire(RelationMappingLock, LW_SHARED);
+	current_global_crc = pagestore_reader_relmap_crc("global");
+	current_local_crc = pagestore_reader_relmap_crc(DatabasePath);
+	LWLockRelease(RelationMappingLock);
+	if (!EQ_CRC32C(current_global_crc, manifest.global_relmap_crc) ||
+		!EQ_CRC32C(current_local_crc, manifest.local_relmap_crc))
+		PG_RETURN_NULL();
+	pagestore_reader_snapshot_manifest_crc(&manifest);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &manifest, sizeof(manifest));
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, resolved, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, resolved, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	PG_RETURN_LSN((XLogRecPtr) resolved);
 }
 
 static BlockNumber
