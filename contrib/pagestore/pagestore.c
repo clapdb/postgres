@@ -54,6 +54,7 @@
 #include "catalog/storage_xlog.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "libpq/pqsignal.h"
@@ -78,6 +79,7 @@
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -112,6 +114,11 @@ static transaction_id_is_in_progress_hook_type prev_xid_in_progress_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ExecutorRun_hook_type prev_executor_run_hook = NULL;
+static ProcessUtility_hook_type prev_process_utility_hook = NULL;
+static CmdType pagestore_current_command_type = CMD_UNKNOWN;
+static bool pagestore_current_has_modifying_cte = false;
+static bool pagestore_handoff_issued = false;
 static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
 static commit_ts_latest_hook_type prev_commit_ts_latest_hook = NULL;
 static snapshot_transfer_hook_type prev_snapshot_transfer_hook = NULL;
@@ -197,6 +204,56 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 	}
 	PG_END_TRY();
 	return result;
+}
+
+static void
+pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
+					   uint64 count)
+{
+	CmdType		saved_command_type = pagestore_current_command_type;
+	bool		saved_has_modifying_cte = pagestore_current_has_modifying_cte;
+
+	if (pagestore_handoff_issued &&
+		(query_desc->plannedstmt->commandType != CMD_SELECT ||
+		 query_desc->plannedstmt->hasModifyingCTE))
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("a writer backend cannot modify data after issuing a reader handoff token")));
+	pagestore_current_command_type = query_desc->plannedstmt->commandType;
+	pagestore_current_has_modifying_cte =
+		query_desc->plannedstmt->hasModifyingCTE;
+	PG_TRY();
+	{
+		if (prev_executor_run_hook != NULL)
+			prev_executor_run_hook(query_desc, direction, count);
+		else
+			standard_ExecutorRun(query_desc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		pagestore_current_command_type = saved_command_type;
+		pagestore_current_has_modifying_cte = saved_has_modifying_cte;
+	}
+	PG_END_TRY();
+}
+
+static void
+pagestore_process_utility(PlannedStmt *pstmt, const char *query_string,
+					  bool read_only_tree, ProcessUtilityContext context,
+					  ParamListInfo params, QueryEnvironment *query_env,
+					  DestReceiver *dest, QueryCompletion *qc)
+{
+	if (pagestore_handoff_issued &&
+		!IsA(pstmt->utilityStmt, TransactionStmt))
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("a writer backend cannot run utility commands after issuing a reader handoff token")));
+	if (prev_process_utility_hook != NULL)
+		prev_process_utility_hook(pstmt, query_string, read_only_tree, context,
+							  params, query_env, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, query_string, read_only_tree, context,
+							params, query_env, dest, qc);
 }
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
@@ -6853,6 +6910,12 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a reader handoff token cannot be issued inside a transaction block"),
 				 errhint("Issue the token as a standalone autocommit statement.")));
+	if (pagestore_current_command_type != CMD_SELECT ||
+		pagestore_current_has_modifying_cte)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token must be called by a standalone SELECT")));
+	pagestore_handoff_issued = true;
 	XactReadOnly = true;
 	memset(&token, 0, sizeof(token));
 	token.magic = PAGESTORE_READER_HANDOFF_MAGIC;
@@ -9073,6 +9136,10 @@ _PG_init(void)
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
+	prev_executor_run_hook = ExecutorRun_hook;
+	ExecutorRun_hook = pagestore_executor_run;
+	prev_process_utility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = pagestore_process_utility;
 	prev_commit_ts_bounds_hook = commit_ts_bounds_hook;
 	commit_ts_bounds_hook = pagestore_commit_ts_bounds;
 	prev_commit_ts_latest_hook = commit_ts_latest_hook;

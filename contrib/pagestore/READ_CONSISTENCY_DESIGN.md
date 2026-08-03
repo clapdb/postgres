@@ -291,9 +291,12 @@ reconstruction.
    request it in a new transaction after committing its writes; token generation
    rejects transaction blocks and transactions that have assigned an XID.  This
    ensures the commit record precedes the token.  Its implicit transaction is
-   made read-only so an extended-query pipeline cannot append a write before
-   Sync, and token issuance requires full relation routing.  Readiness rejects a
-   token from another timeline.  At the
+   required to run a pure SELECT and is made read-only, so neither a containing
+   modifying statement nor an extended-query pipeline can append a write before
+   Sync.  Issuance permanently seals that writer backend against later DML and
+   utility commands, while allowing transaction control to finish; the router
+   must close or transfer the source connection.  Token issuance also requires
+   full relation routing.  Readiness rejects a token from another timeline.  At the
    start of a subsequent transaction the reader first performs normal view adoption, then
    `pagestore_reader_handoff_ready(token)` reports whether its effective
    R covers the token.  A false result tells the session router to retry in a

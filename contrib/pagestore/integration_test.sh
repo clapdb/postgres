@@ -1277,6 +1277,12 @@ handoffBeforeWrite=$($P -v ON_ERROR_STOP=1 -c "BEGIN;
 	UPDATE reader_t SET v = v WHERE id = 1;" 2>&1 || true)
 assert "$(printf '%s\n' "$handoffBeforeWrite" | grep -c 'cannot be issued inside a transaction block')" "1" \
 	"writer cannot issue a handoff token before a later explicit-transaction write"
+handoffInInsert=$($P -v ON_ERROR_STOP=1 -c "INSERT INTO reader_t(id, v)
+	SELECT 999999, encode(pagestore_writer_handoff_token(), 'hex');" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInInsert" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"writer cannot issue a handoff token from a modifying statement"
+assert "$($P -c "SELECT count(*) FROM reader_t WHERE id = 999999;")" "0" \
+	"rejected modifying-statement handoff leaves no row"
 handoffPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
 \startpipeline
 SELECT pagestore_writer_handoff_token();
@@ -1286,6 +1292,16 @@ SQL
 )
 assert "$(printf '%s\n' "$handoffPipeline" | grep -c 'cannot execute UPDATE in a read-only transaction')" "1" \
 	"handoff token prevents a later pipelined write"
+handoffCommitPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+UPDATE reader_t SET v = v WHERE id = 1;
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'cannot modify data after issuing a reader handoff token')" "1" \
+	"handoff fence survives pipelined transaction control"
 readerHandoffToken=$($P -c "SELECT pagestore_writer_handoff_token();")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
