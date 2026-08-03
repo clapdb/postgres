@@ -4,8 +4,8 @@ Status: increments 1a (the page-read pin), 1b (as-of size/existence
 metadata), 1c (the complete fixed-reader boot contract, including catalog
 provenance), 1d (the same-LSN admission fence), 2a (buffer generations),
 2b (candidate publication), 2c (running-XID artifact transport), and 2d
-(transaction-boundary view adoption) are implemented.  Automatic snapshot
-derivation/publication and increment 3 are not yet built.
+(transaction-boundary view adoption), including automatic snapshot derivation
+and per-database publication, are implemented.  Increment 3 is not yet built.
 
 ## Problem
 
@@ -275,8 +275,14 @@ reconstruction.
    be sampled again.  Unchanged maps retain their prior sampled position.  The
    publisher then emits the adoption manifest.
    The staging marker is distinct from that manifest, so an incomplete
-   per-database artifact cannot become a reader candidate.  Scheduling this
-   per-database publication across every database remains control-plane work.
+   per-database artifact cannot become a reader candidate.  When
+   `pagestore.auto_reader_artifacts` is enabled on a writer, a controller
+   enumerates connectable databases and runs one short-lived database worker
+   at a time.  This bounds the scheduler to two worker slots regardless of the
+   database count.  Each worker primes its relation maps and binds the newest
+   complete staged snapshot to a database manifest; unchanged artifacts are
+   not rewritten, so publication no longer requires control-plane scheduling
+   or generates idle store traffic.
 
 3. **Read-your-writes handoff.**  A writer hands a session over to a reader
    with a token (the writer's current insert LSN); the reader serves the
