@@ -5,7 +5,8 @@ metadata), 1c (the complete fixed-reader boot contract, including catalog
 provenance), 1d (the same-LSN admission fence), 2a (buffer generations),
 2b (candidate publication), 2c (running-XID artifact transport), and 2d
 (transaction-boundary view adoption), including automatic snapshot derivation
-and per-database publication, are implemented.  Increment 3 is not yet built.
+and per-database publication, are implemented.  Increment 3's transaction-boundary
+read-your-writes handoff policy is also implemented.
 
 ## Problem
 
@@ -284,9 +285,20 @@ reconstruction.
    not rewritten, so publication no longer requires control-plane scheduling
    or generates idle store traffic.
 
-3. **Read-your-writes handoff.**  A writer hands a session over to a reader
-   with a token (the writer's current insert LSN); the reader serves the
-   session only once R >= token.  Pure policy on top of increment 2.
+3. **Read-your-writes handoff (implemented).**  A writer hands a session over
+   to a reader with `pagestore_writer_handoff_token()`, which returns the
+   writer's timeline and current insert LSN in an opaque token.  The writer must
+   request it in a new transaction after committing its writes; token generation
+   rejects transaction blocks and transactions that have assigned an XID.  This
+   ensures the commit record precedes the token.  Its implicit transaction is
+   made read-only so an extended-query pipeline cannot append a write before
+   Sync, and token issuance requires full relation routing.  Readiness rejects a
+   token from another timeline.  At the
+   start of a subsequent transaction the reader first performs normal view adoption, then
+   `pagestore_reader_handoff_ready(token)` reports whether its effective
+   R covers the token.  A false result tells the session router to retry in a
+   new transaction; the API never changes snapshots in the middle of a
+   transaction.
 
 ## Non-goals
 

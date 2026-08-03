@@ -1168,6 +1168,10 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_reader_effective_lsn' LANGUAGE C;
        CREATE FUNCTION pagestore_reader_effective_generation() RETURNS bigint
          AS 'pagestore','pagestore_reader_effective_generation' LANGUAGE C;
+       CREATE FUNCTION pagestore_writer_handoff_token() RETURNS bytea
+         AS 'pagestore','pagestore_writer_handoff_token' LANGUAGE C;
+       CREATE FUNCTION pagestore_reader_handoff_ready(bytea) RETURNS boolean
+         AS 'pagestore','pagestore_reader_handoff_ready' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
@@ -1263,6 +1267,26 @@ rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 readerV2Xid=$($P -c "SELECT xmin::text FROM reader_t WHERE id = 1;")
+handoffInWriteXact=$($P -v ON_ERROR_STOP=1 -c "BEGIN;
+	UPDATE reader_t SET v = v WHERE id = 1;
+	SELECT pagestore_writer_handoff_token();" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInWriteXact" | grep -c 'cannot be issued by a write transaction')" "1" \
+	"writer cannot issue a handoff token before its commit record"
+handoffBeforeWrite=$($P -v ON_ERROR_STOP=1 -c "BEGIN;
+	SELECT pagestore_writer_handoff_token();
+	UPDATE reader_t SET v = v WHERE id = 1;" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffBeforeWrite" | grep -c 'cannot be issued inside a transaction block')" "1" \
+	"writer cannot issue a handoff token before a later explicit-transaction write"
+handoffPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+UPDATE reader_t SET v = v WHERE id = 1;
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffPipeline" | grep -c 'cannot execute UPDATE in a read-only transaction')" "1" \
+	"handoff token prevents a later pipelined write"
+readerHandoffToken=$($P -c "SELECT pagestore_writer_handoff_token();")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
 read -r readerR2 readerNext2 readerOldest2 readerNextMulti2 readerNextMember2 readerOldestMulti2 readerCtsOldest2 readerCtsNext2 <<< "$($P -c "
@@ -1419,6 +1443,12 @@ assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 	"pinned reader keeps subtransactions beyond normal snapshot capacity invisible"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
 	"pg_current_snapshot preserves the pinned reader running-XID set"
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "f" \
+	"fixed reader refuses a handoff token newer than its horizon"
+wrongTimelineToken=$($P -c "SELECT set_byte('$readerHandoffToken'::bytea, 8,
+	(get_byte('$readerHandoffToken'::bytea, 8) + 1) % 256);")
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$wrongTimelineToken');" 2>&1 | grep -c 'belongs to a different pagestore timeline')" "1" \
+	"reader rejects a handoff token from another timeline"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the
@@ -1474,6 +1504,8 @@ assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on 
 	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "t" \
+	"advancing reader accepts the writer handoff after reaching its token"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
 	"the adopted exact-R snapshot treats the v2 transaction as committed"
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
