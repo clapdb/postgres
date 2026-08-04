@@ -19,6 +19,7 @@
         "prepare_reader": {"target": ["writer"]},
         "reader_base": {"target": ["writer"]},
         "bootstrap": {"target": ["writer"]},
+        "install_reader": {"forbidden_values": {"target": ["writer"]}},
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
       },

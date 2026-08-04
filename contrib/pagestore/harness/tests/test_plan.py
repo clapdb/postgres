@@ -182,6 +182,20 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), CAPABILITIES, "daemon_smoke"
             )
 
+    def test_runtime_rejects_forbidden_field_values(self):
+        capabilities = json.loads(json.dumps(CAPABILITIES))
+        capabilities["runtimes"]["daemon_smoke"]["constraints"]["crash"] = {
+            "forbidden_values": {"target": ["writer"]},
+        }
+        path = self.write_plan([
+            self.header(),
+            {"op": "crash", "id": "crash", "target": "writer", "model": "power_loss"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "forbids target='writer'"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "daemon_smoke"
+            )
+
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
         health = {
@@ -248,6 +262,26 @@ class PlanValidationTests(unittest.TestCase):
     def test_postgres_runtime_settings_respect_guc_version(self):
         self.assertNotIn("io_method", MODULE.postgres_runtime_settings(17))
         self.assertEqual(MODULE.postgres_runtime_settings(18), "io_method = sync\n")
+
+    def test_postgres_block_size_must_match_runtime_page_size(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        pg_config = Path(directory.name) / "pg_config"
+        pg_config.write_text(
+            "#!/bin/sh\necho \"'--with-blocksize=16' '--with-debug'\"\n",
+            encoding="utf-8",
+        )
+        pg_config.chmod(0o755)
+        with self.assertRaisesRegex(MODULE.PlanError, "block size 16384.*page size 8192"):
+            MODULE.validate_postgres_block_size(pg_config, 8192)
+
+    def test_postgres_block_size_defaults_to_eight_kilobytes(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        pg_config = Path(directory.name) / "pg_config"
+        pg_config.write_text("#!/bin/sh\necho \"'--with-debug'\"\n", encoding="utf-8")
+        pg_config.chmod(0o755)
+        self.assertEqual(MODULE.validate_postgres_block_size(pg_config, 8192), 8192)
 
     def test_postgres_preflight_runs_before_creating_the_run_root(self):
         directory = tempfile.TemporaryDirectory()

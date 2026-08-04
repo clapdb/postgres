@@ -197,8 +197,24 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 f"runtime {runtime!r} operation {action['op']!r} does not support "
                 f"field(s): {', '.join(present)}"
             )
+        forbidden_values = operation_constraints.get("forbidden_values", {})
+        if not isinstance(forbidden_values, dict):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid forbidden_values"
+            )
+        for field, values in forbidden_values.items():
+            if not isinstance(values, list) or not values:
+                raise PlanError(
+                    f"capabilities: runtime {runtime!r} has invalid forbidden values "
+                    f"for {field!r}"
+                )
+            if action.get(field) in values:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} forbids "
+                    f"{field}={action.get(field)!r}"
+                )
         for field, allowed in operation_constraints.items():
-            if field == "forbidden_fields":
+            if field in ("forbidden_fields", "forbidden_values"):
                 continue
             if not isinstance(allowed, list) or not allowed:
                 raise PlanError(
@@ -267,6 +283,29 @@ def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> i
 def postgres_runtime_settings(major: int) -> str:
     """Settings whose availability differs across supported PostgreSQL releases."""
     return "io_method = sync\n" if major >= 18 else ""
+
+
+def validate_postgres_block_size(pg_config: Path, expected: int) -> int:
+    try:
+        result = subprocess.run(
+            [str(pg_config), "--configure"], capture_output=True, check=False,
+            encoding="utf-8", env=private_environment(),
+        )
+    except OSError as error:
+        raise PlanError(f"cannot run PostgreSQL pg_config {pg_config}: {error}") from error
+    if result.returncode != 0:
+        raise PlanError(
+            f"cannot inspect PostgreSQL block size with {pg_config}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    match = re.search(r"--with-blocksize=(\d+)", result.stdout)
+    block_size = (int(match.group(1)) if match else 8) * 1024
+    if block_size != expected:
+        raise PlanError(
+            f"PostgreSQL block size {block_size} does not match advertised runtime "
+            f"page size {expected}"
+        )
+    return block_size
 
 
 def probe_runtime_inspection(
@@ -622,6 +661,10 @@ def run_writer_smoke(
     """Start a real localsvc writer and execute SQL/checkpoint plan actions."""
     pg_bin = find_pg_bin(build)
     postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
+    validate_postgres_block_size(
+        pg_bin / "pg_config",
+        runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+    )
     root, temporary = run_root(requested_root)
     trace, store, data, tablespace, sockdir = (root / "trace", root / "store", root / "computes" / "writer",
                                                 root / "tablespace", root / "socket")
