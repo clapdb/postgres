@@ -169,6 +169,10 @@ def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str
 
 def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
     profile = runtime_capabilities(capabilities, runtime)
+    for field in ("protocol_version", "page_size", "io_unit"):
+        value = profile.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise PlanError(f"capabilities: runtime {runtime!r} has invalid {field}")
     operations = profile.get("operations")
     if not isinstance(operations, list) or not all(isinstance(op, str) for op in operations):
         raise PlanError(f"capabilities: runtime {runtime!r} has an invalid operations list")
@@ -225,6 +229,21 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"runtime {runtime!r} operation {action['op']!r} does not support "
                     f"{field}={action.get(field)!r}"
                 )
+    if runtime == "writer_smoke":
+        available_clients = {"writer"}
+        for action in plan.actions:
+            if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} target "
+                    f"{action['target']!r} is not an available compute"
+                )
+            if action["op"] == "install_reader":
+                if action["target"] in available_clients:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        "is already installed"
+                    )
+                available_clients.add(action["target"])
 
 
 def validate_runtime_health(

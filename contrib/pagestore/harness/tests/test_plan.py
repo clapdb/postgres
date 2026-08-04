@@ -196,6 +196,40 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), capabilities, "daemon_smoke"
             )
 
+    def test_writer_runtime_rejects_unavailable_sql_target(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "sql", "id": "read", "target": "reader-R", "sql": "SELECT 1"},
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "0/1"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "target 'reader-R'.*not an available compute"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_writer_runtime_accepts_sql_target_after_reader_install(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "0/1"},
+            {"op": "sql", "id": "read", "target": "reader-R", "sql": "SELECT 1"},
+        ])
+        MODULE.validate_runtime_plan(
+            MODULE.read_plan(path), capabilities, "writer_smoke"
+        )
+
+    def test_runtime_requires_page_size_capability(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        del capabilities["runtimes"]["writer_smoke"]["page_size"]
+        path = self.write_plan([self.header()])
+        with self.assertRaisesRegex(MODULE.PlanError, "invalid page_size"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
         health = {
