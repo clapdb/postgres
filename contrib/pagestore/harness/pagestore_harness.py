@@ -153,6 +153,13 @@ def read_plan(path: Path) -> Plan:
     return Plan(path=path, header=records[0], actions=tuple(records[1:]))
 
 
+def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str, Any]:
+    schema = read_json(path)
+    if schema.get("schema") != capabilities.get("inspection_schema"):
+        raise PlanError(f"{path}: inspection schema version does not match capabilities")
+    return schema
+
+
 def capability_values(capabilities: dict[str, Any], name: str) -> set[Any]:
     values = capabilities.get(name)
     if not isinstance(values, list) or not values:
@@ -231,6 +238,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 )
     if runtime == "writer_smoke":
         available_clients = {"writer"}
+        prepared_readers: set[str] = set()
+        reader_seeds: set[str] = set()
         for action in plan.actions:
             if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
                 raise PlanError(
@@ -243,7 +252,21 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         "is already installed"
                     )
+                if action["prepared"] not in prepared_readers:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        f"requires prepared artifact {action['prepared']!r}"
+                    )
+                if action["target"] not in reader_seeds:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        "requires an earlier reader_datadir capture"
+                    )
                 available_clients.add(action["target"])
+            elif action["op"] == "prepare_reader":
+                prepared_readers.add(action["id"])
+            elif action["op"] == "capture" and action["kind"] == "reader_datadir":
+                reader_seeds.add(action["name"])
 
 
 def validate_runtime_health(
@@ -406,6 +429,8 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
+        if "target" in REQUIRED_FIELDS[operation]:
+            require_string(action, "target", action_context)
         for value in action.values():
             if isinstance(value, str) and value.startswith("$"):
                 boundary = value[1:]
@@ -948,9 +973,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.inspect not in capability_values(capabilities, "inspection_operations"):
                 raise PlanError(f"capabilities: inspection operation {args.inspect!r} is unavailable")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
-            schema = read_json(schema_path)
-            if schema.get("schema") != capabilities.get("inspection_schema"):
-                raise PlanError(f"{schema_path}: inspection schema version does not match capabilities")
+            schema = read_inspection_schema(schema_path, capabilities)
             print(json.dumps(inspect_store(args.inspect_binary, args.shm, args.inspect, schema), sort_keys=True))
             return 0
         if args.daemon_smoke:
@@ -958,9 +981,7 @@ def main(argv: list[str] | None = None) -> int:
             validate_plan(plan, capabilities)
             validate_runtime_plan(plan, capabilities, "daemon_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
-            schema = read_json(schema_path)
-            if schema.get("schema") != capabilities.get("inspection_schema"):
-                raise PlanError(f"{schema_path}: inspection schema version does not match capabilities")
+            schema = read_inspection_schema(schema_path, capabilities)
             root = run_daemon_smoke(plan, capabilities, schema, args.daemon_binary,
                                     args.inspect_binary, args.run_root, args.keep)
             if args.keep or args.run_root:
@@ -969,7 +990,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.writer_smoke:
             plan = read_plan(args.writer_smoke); validate_plan(plan, capabilities)
             validate_runtime_plan(plan, capabilities, "writer_smoke")
-            schema = read_json(args.inspection_schema or args.capabilities.with_name("inspection_schema.json"))
+            schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
+            schema = read_inspection_schema(schema_path, capabilities)
             root = run_writer_smoke(plan, capabilities, schema, args.daemon_binary, args.inspect_binary,
                                     args.build_dir, args.run_root, args.keep)
             if args.keep or args.run_root: print(root)

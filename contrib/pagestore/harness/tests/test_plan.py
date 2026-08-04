@@ -213,6 +213,10 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "0/1"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "0/1", "read_lsn": "0/1"},
             {"op": "install_reader", "id": "install", "target": "reader-R",
              "prepared": "prepare", "read_lsn": "0/1"},
             {"op": "sql", "id": "read", "target": "reader-R", "sql": "SELECT 1"},
@@ -229,6 +233,34 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
+
+    def test_writer_runtime_requires_reader_artifacts_before_install(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "0/1"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "requires prepared artifact 'prepare'"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_plan_rejects_non_string_target(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "sql", "id": "read", "target": ["writer"], "sql": "SELECT 1"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "target must be a non-empty string"):
+            MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_inspection_schema_version_must_match_capabilities(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        schema = Path(directory.name) / "inspection_schema.json"
+        schema.write_text('{"schema": 999}\n', encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.PlanError, "version does not match capabilities"):
+            MODULE.read_inspection_schema(schema, MODULE.read_json(ROOT / "capabilities.json"))
 
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
