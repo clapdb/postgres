@@ -266,22 +266,21 @@ class PlanValidationTests(unittest.TestCase):
     def test_postgres_block_size_must_match_runtime_page_size(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        pg_config = Path(directory.name) / "pg_config"
-        pg_config.write_text(
-            "#!/bin/sh\necho \"'--with-blocksize=16' '--with-debug'\"\n",
-            encoding="utf-8",
-        )
-        pg_config.chmod(0o755)
+        build = Path(directory.name)
+        config_header = build / "src" / "include" / "pg_config.h"
+        config_header.parent.mkdir(parents=True)
+        config_header.write_text("#define BLCKSZ 16384\n", encoding="utf-8")
         with self.assertRaisesRegex(MODULE.PlanError, "block size 16384.*page size 8192"):
-            MODULE.validate_postgres_block_size(pg_config, 8192)
+            MODULE.validate_postgres_block_size(build, 8192)
 
-    def test_postgres_block_size_defaults_to_eight_kilobytes(self):
+    def test_postgres_block_size_reads_generated_build_configuration(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        pg_config = Path(directory.name) / "pg_config"
-        pg_config.write_text("#!/bin/sh\necho \"'--with-debug'\"\n", encoding="utf-8")
-        pg_config.chmod(0o755)
-        self.assertEqual(MODULE.validate_postgres_block_size(pg_config, 8192), 8192)
+        build = Path(directory.name)
+        config_header = build / "src" / "include" / "pg_config.h"
+        config_header.parent.mkdir(parents=True)
+        config_header.write_text("#define BLCKSZ 8192\n", encoding="utf-8")
+        self.assertEqual(MODULE.validate_postgres_block_size(build, 8192), 8192)
 
     def test_postgres_preflight_runs_before_creating_the_run_root(self):
         directory = tempfile.TemporaryDirectory()

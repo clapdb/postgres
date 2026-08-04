@@ -285,21 +285,16 @@ def postgres_runtime_settings(major: int) -> str:
     return "io_method = sync\n" if major >= 18 else ""
 
 
-def validate_postgres_block_size(pg_config: Path, expected: int) -> int:
+def validate_postgres_block_size(build: Path, expected: int) -> int:
+    config_header = build / "src" / "include" / "pg_config.h"
     try:
-        result = subprocess.run(
-            [str(pg_config), "--configure"], capture_output=True, check=False,
-            encoding="utf-8", env=private_environment(),
-        )
+        config = config_header.read_text(encoding="utf-8")
     except OSError as error:
-        raise PlanError(f"cannot run PostgreSQL pg_config {pg_config}: {error}") from error
-    if result.returncode != 0:
-        raise PlanError(
-            f"cannot inspect PostgreSQL block size with {pg_config}: "
-            f"{(result.stderr or result.stdout).strip()}"
-        )
-    match = re.search(r"--with-blocksize=(\d+)", result.stdout)
-    block_size = (int(match.group(1)) if match else 8) * 1024
+        raise PlanError(f"cannot read PostgreSQL configuration {config_header}: {error}") from error
+    match = re.search(r"^#define\s+BLCKSZ\s+(\d+)\s*$", config, re.MULTILINE)
+    if match is None:
+        raise PlanError(f"cannot identify PostgreSQL block size in {config_header}")
+    block_size = int(match.group(1))
     if block_size != expected:
         raise PlanError(
             f"PostgreSQL block size {block_size} does not match advertised runtime "
@@ -662,7 +657,7 @@ def run_writer_smoke(
     pg_bin = find_pg_bin(build)
     postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
     validate_postgres_block_size(
-        pg_bin / "pg_config",
+        build,
         runtime_capabilities(capabilities, "writer_smoke")["page_size"],
     )
     root, temporary = run_root(requested_root)
