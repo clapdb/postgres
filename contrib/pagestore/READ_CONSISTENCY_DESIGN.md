@@ -293,9 +293,10 @@ reconstruction.
    ensures the commit record precedes the token.  Its implicit transaction is
    required to run a pure SELECT and is made read-only, so neither a containing
    modifying statement nor an extended-query pipeline can append a write before
-   Sync.  Issuance permanently seals that writer backend against later DML and
-   utility commands, while allowing transaction control to finish; the router
-   must close or transfer the source connection.  Token issuance also requires
+   Sync.  Issuance permanently seals that writer backend against later query
+   execution and utility commands, while allowing only non-writing transaction
+   control to finish; the router must close or transfer the source connection.
+   Token issuance also requires
    full relation routing.  Readiness rejects a token from another timeline.  At the
    start of a subsequent transaction the reader first performs normal view adoption, then
    `pagestore_reader_handoff_ready(token)` reports whether its effective

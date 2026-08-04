@@ -1300,8 +1300,36 @@ UPDATE reader_t SET v = v WHERE id = 1;
 \endpipeline
 SQL
 )
-assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'cannot modify data after issuing a reader handoff token')" "1" \
+assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'cannot execute queries after issuing a reader handoff token')" "1" \
 	"handoff fence survives pipelined transaction control"
+$P -c "CREATE SEQUENCE reader_handoff_seq;" >/dev/null
+handoffSelectPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+SELECT nextval('reader_handoff_seq');
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffSelectPipeline" | grep -c 'cannot execute queries after issuing a reader handoff token')" "1" \
+	"handoff fence rejects side-effecting SELECTs after transaction control"
+handoffPreparePipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+BEGIN;
+PREPARE TRANSACTION 'handoff_must_not_prepare';
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffPreparePipeline" | grep -c 'cannot run utility commands after issuing a reader handoff token')" "1" \
+	"handoff fence rejects WAL-writing transaction statements"
+handoffInCtas=$($P -v ON_ERROR_STOP=1 -c "CREATE TABLE handoff_ctas AS
+	SELECT pagestore_writer_handoff_token();" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInCtas" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"writer cannot issue a handoff token below CREATE TABLE AS"
+assert "$($P -tAc "SELECT to_regclass('handoff_ctas') IS NULL;")" "t" \
+	"rejected CREATE TABLE AS handoff leaves no table"
 readerHandoffToken=$($P -c "SELECT pagestore_writer_handoff_token();")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"

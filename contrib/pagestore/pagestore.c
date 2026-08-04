@@ -119,6 +119,7 @@ static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
 static bool pagestore_handoff_issued = false;
+static int pagestore_utility_nesting_level = 0;
 static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
 static commit_ts_latest_hook_type prev_commit_ts_latest_hook = NULL;
 static snapshot_transfer_hook_type prev_snapshot_transfer_hook = NULL;
@@ -213,12 +214,10 @@ pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
 	CmdType		saved_command_type = pagestore_current_command_type;
 	bool		saved_has_modifying_cte = pagestore_current_has_modifying_cte;
 
-	if (pagestore_handoff_issued &&
-		(query_desc->plannedstmt->commandType != CMD_SELECT ||
-		 query_desc->plannedstmt->hasModifyingCTE))
+	if (pagestore_handoff_issued)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("a writer backend cannot modify data after issuing a reader handoff token")));
+				 errmsg("a writer backend cannot execute queries after issuing a reader handoff token")));
 	pagestore_current_command_type = query_desc->plannedstmt->commandType;
 	pagestore_current_has_modifying_cte =
 		query_desc->plannedstmt->hasModifyingCTE;
@@ -243,17 +242,46 @@ pagestore_process_utility(PlannedStmt *pstmt, const char *query_string,
 					  ParamListInfo params, QueryEnvironment *query_env,
 					  DestReceiver *dest, QueryCompletion *qc)
 {
-	if (pagestore_handoff_issued &&
-		!IsA(pstmt->utilityStmt, TransactionStmt))
+	bool		allow_after_handoff = false;
+
+	if (IsA(pstmt->utilityStmt, TransactionStmt))
+	{
+		TransactionStmt *stmt = (TransactionStmt *) pstmt->utilityStmt;
+
+		switch (stmt->kind)
+		{
+			case TRANS_STMT_BEGIN:
+			case TRANS_STMT_START:
+			case TRANS_STMT_COMMIT:
+			case TRANS_STMT_ROLLBACK:
+			case TRANS_STMT_SAVEPOINT:
+			case TRANS_STMT_RELEASE:
+			case TRANS_STMT_ROLLBACK_TO:
+				allow_after_handoff = true;
+				break;
+			default:
+				break;
+		}
+	}
+	if (pagestore_handoff_issued && !allow_after_handoff)
 		ereport(ERROR,
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("a writer backend cannot run utility commands after issuing a reader handoff token")));
-	if (prev_process_utility_hook != NULL)
-		prev_process_utility_hook(pstmt, query_string, read_only_tree, context,
-							  params, query_env, dest, qc);
-	else
-		standard_ProcessUtility(pstmt, query_string, read_only_tree, context,
-							params, query_env, dest, qc);
+	pagestore_utility_nesting_level++;
+	PG_TRY();
+	{
+		if (prev_process_utility_hook != NULL)
+			prev_process_utility_hook(pstmt, query_string, read_only_tree, context,
+								  params, query_env, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, query_string, read_only_tree, context,
+								params, query_env, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		pagestore_utility_nesting_level--;
+	}
+	PG_END_TRY();
 }
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
@@ -5607,7 +5635,8 @@ pagestore_publish_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr lsn,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 }
 
-static bool pagestore_load_reader_relmap(Oid dbid, XLogRecPtr read_lsn,
+static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
+										 XLogRecPtr read_lsn,
 										 pg_crc32c *data_crc);
 
 PG_FUNCTION_INFO_V1(pagestore_prime_reader_relmaps);
@@ -5648,9 +5677,11 @@ pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
 	INIT_CRC32C(local_crc);
 	COMP_CRC32C(local_crc, local_map, local_size);
 	FIN_CRC32C(local_crc);
-	if (pagestore_load_reader_relmap(InvalidOid, PG_UINT64_MAX,
+	if (pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+			PG_UINT64_MAX,
 			&stored_global_crc) &&
-		pagestore_load_reader_relmap(MyDatabaseId, PG_UINT64_MAX,
+		pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
+			PG_UINT64_MAX,
 			&stored_local_crc) &&
 		EQ_CRC32C(global_crc, stored_global_crc) &&
 		EQ_CRC32C(local_crc, stored_local_crc))
@@ -5677,7 +5708,7 @@ pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
 }
 
 static bool
-pagestore_load_reader_relmap(Oid dbid, XLogRecPtr read_lsn,
+pagestore_load_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr read_lsn,
 							 pg_crc32c *data_crc)
 {
 	PagestoreReaderRelmap artifact;
@@ -5700,9 +5731,7 @@ pagestore_load_reader_relmap(Oid dbid, XLogRecPtr read_lsn,
 	FIN_CRC32C(checked.crc);
 	if (artifact.magic != PAGESTORE_READER_RELMAP_MAGIC ||
 		artifact.format != PAGESTORE_READER_RELMAP_FORMAT ||
-		artifact.dbid != dbid || artifact.size == 0 ||
-		(OidIsValid(dbid) ? !OidIsValid(artifact.tsid) :
-		 artifact.tsid != GLOBALTABLESPACE_OID) ||
+		artifact.dbid != dbid || artifact.tsid != tsid || artifact.size == 0 ||
 		artifact.size > BLCKSZ - offsetof(PagestoreReaderRelmap, data) ||
 		!EQ_CRC32C(artifact.crc, checked.crc))
 		return false;
@@ -6345,9 +6374,11 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	manifest.timeline = ready.header.timeline;
 	manifest.block_count = ready.block_count;
 	manifest.artifact_crc = ready.header.crc;
-	if (!pagestore_load_reader_relmap(InvalidOid, (XLogRecPtr) resolved,
+	if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+			(XLogRecPtr) resolved,
 			&manifest.global_relmap_crc) ||
-		!pagestore_load_reader_relmap(MyDatabaseId, (XLogRecPtr) resolved,
+		!pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
+			(XLogRecPtr) resolved,
 			&manifest.local_relmap_crc))
 		PG_RETURN_NULL();
 	LWLockAcquire(RelationMappingLock, LW_SHARED);
@@ -6900,6 +6931,12 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("a reader handoff token requires a writable pagestore compute")));
+	if (pagestore_current_command_type != CMD_SELECT ||
+		pagestore_current_has_modifying_cte ||
+		pagestore_utility_nesting_level != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token must be called by a standalone SELECT")));
 	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
@@ -6910,11 +6947,6 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a reader handoff token cannot be issued inside a transaction block"),
 				 errhint("Issue the token as a standalone autocommit statement.")));
-	if (pagestore_current_command_type != CMD_SELECT ||
-		pagestore_current_has_modifying_cte)
-		ereport(ERROR,
-				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-				 errmsg("a reader handoff token must be called by a standalone SELECT")));
 	pagestore_handoff_issued = true;
 	XactReadOnly = true;
 	memset(&token, 0, sizeof(token));
