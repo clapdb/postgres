@@ -91,6 +91,7 @@ cleanup() {
 	"$BIN/pg_ctl" -D "$DATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BRANCHDATA:-}" ] && "$BIN/pg_ctl" -D "$BRANCHDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${READERDATA:-}" ] && "$BIN/pg_ctl" -D "$READERDATA" -m immediate -w stop >/dev/null 2>&1 || true
+	[ -n "${ADVANCINGDATA:-}" ] && "$BIN/pg_ctl" -D "$ADVANCINGDATA" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${BADREADER:-}" ] && "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${UNPREPARED:-}" ] && "$BIN/pg_ctl" -D "$UNPREPARED" -m immediate -w stop >/dev/null 2>&1 || true
 	[ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null || true
@@ -98,6 +99,7 @@ cleanup() {
 	rm -rf "$(dirname "$DATA")" "$(dirname "$TS")" "$(dirname "$STORE")" \
 		"$(dirname "$SCRATCH")" "${BRANCHDATA:+$(dirname "$BRANCHDATA")}" \
 		"${READERDATA:+$(dirname "$READERDATA")}" \
+		"${ADVANCINGDATA:+$(dirname "$ADVANCINGDATA")}" \
 		"${BADREADER:+$(dirname "$BADREADER")}" \
 		"${UNPREPARED:+$(dirname "$UNPREPARED")}" "$SOCKROOT"
 	rm -f "/dev/shm$SHM"
@@ -1139,7 +1141,10 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # admission fence.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
-echo "pagestore.route_all = on" >> "$DATA/postgresql.conf"
+cat >> "$DATA/postgresql.conf" <<EOF
+pagestore.route_all = on
+pagestore.auto_reader_artifacts = on
+EOF
 echo "max_prepared_transactions = 10" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
@@ -1165,6 +1170,10 @@ $P -c "CREATE FUNCTION pagestore_prepare_reader(text, int, pg_lsn, pg_lsn, xid, 
          AS 'pagestore','pagestore_reader_effective_lsn' LANGUAGE C;
        CREATE FUNCTION pagestore_reader_effective_generation() RETURNS bigint
          AS 'pagestore','pagestore_reader_effective_generation' LANGUAGE C;
+       CREATE FUNCTION pagestore_writer_handoff_token() RETURNS bytea
+         AS 'pagestore','pagestore_writer_handoff_token' LANGUAGE C;
+       CREATE FUNCTION pagestore_reader_handoff_ready(bytea) RETURNS boolean
+         AS 'pagestore','pagestore_reader_handoff_ready' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_publish_reader_snapshot_artifact(text, int, pg_lsn) RETURNS bigint
          AS 'pagestore','pagestore_publish_reader_snapshot_artifact' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_checkpoint_reader_snapshot(pg_lsn) RETURNS bigint
@@ -1260,6 +1269,85 @@ rm -f "$READERDATA/pg_twophase/"*
 rm -rf "$READERPREP"
 $P -c "UPDATE reader_t SET v = 'v2' WHERE id = 1;" >/dev/null
 readerV2Xid=$($P -c "SELECT xmin::text FROM reader_t WHERE id = 1;")
+handoffInWriteXact=$($P -v ON_ERROR_STOP=1 -c "BEGIN;
+	UPDATE reader_t SET v = v WHERE id = 1;
+	SELECT pagestore_writer_handoff_token();" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInWriteXact" | grep -c 'cannot be issued by a write transaction')" "1" \
+	"writer cannot issue a handoff token before its commit record"
+handoffBeforeWrite=$($P -v ON_ERROR_STOP=1 -c "BEGIN;
+	SELECT pagestore_writer_handoff_token();
+	UPDATE reader_t SET v = v WHERE id = 1;" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffBeforeWrite" | grep -c 'cannot be issued inside a transaction block')" "1" \
+	"writer cannot issue a handoff token before a later explicit-transaction write"
+handoffInInsert=$($P -v ON_ERROR_STOP=1 -c "INSERT INTO reader_t(id, v)
+	SELECT 999999, encode(pagestore_writer_handoff_token(), 'hex');" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInInsert" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"writer cannot issue a handoff token from a modifying statement"
+assert "$($P -c "SELECT count(*) FROM reader_t WHERE id = 999999;")" "0" \
+	"rejected modifying-statement handoff leaves no row"
+handoffPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+UPDATE reader_t SET v = v WHERE id = 1;
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffPipeline" | grep -c 'cannot execute UPDATE in a read-only transaction')" "1" \
+	"handoff token prevents a later pipelined write"
+handoffCommitPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+UPDATE reader_t SET v = v WHERE id = 1;
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'read-only transaction')" "1" \
+	"handoff fence survives pipelined transaction control"
+$P -c "CREATE SEQUENCE reader_handoff_seq;" >/dev/null
+handoffSelectPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+SELECT nextval('reader_handoff_seq');
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffSelectPipeline" | grep -c 'cannot execute queries after issuing a reader handoff token')" "1" \
+	"handoff fence rejects side-effecting SELECTs after transaction control"
+handoffPreparePipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\startpipeline
+SELECT pagestore_writer_handoff_token();
+COMMIT;
+BEGIN;
+PREPARE TRANSACTION 'handoff_must_not_prepare';
+\endpipeline
+SQL
+)
+assert "$(printf '%s\n' "$handoffPreparePipeline" | grep -c 'cannot run utility commands after issuing a reader handoff token')" "1" \
+	"handoff fence rejects WAL-writing transaction statements"
+handoffInCtas=$($P -v ON_ERROR_STOP=1 -c "CREATE TABLE handoff_ctas AS
+	SELECT pagestore_writer_handoff_token();" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffInCtas" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"writer cannot issue a handoff token below CREATE TABLE AS"
+assert "$($P -tAc "SELECT to_regclass('handoff_ctas') IS NULL;")" "t" \
+	"rejected CREATE TABLE AS handoff leaves no table"
+handoffSameSelect=$($P -v ON_ERROR_STOP=1 -c "SELECT pagestore_writer_handoff_token(),
+	pg_replication_origin_create('handoff_must_not_create_origin');" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffSameSelect" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"handoff token seals the remainder of its SELECT"
+assert "$($P -tAc "SELECT count(*) = 0 FROM pg_replication_origin
+	WHERE roname = 'handoff_must_not_create_origin';")" "t" \
+	"rejected same-SELECT handoff leaves no replication origin"
+handoffFastpath=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\lo_import /dev/null
+SELECT pagestore_writer_handoff_token();
+\lo_import /dev/null
+SQL
+)
+assert "$(printf '%s\n' "$handoffFastpath" | grep -c 'read-only')" "1" \
+	"handoff fence rejects libpq fast-path function calls"
+readerHandoffToken=$($P -c "SELECT pagestore_writer_handoff_token();")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"
 read -r readerR2 readerNext2 readerOldest2 readerNextMulti2 readerNextMember2 readerOldestMulti2 readerCtsOldest2 readerCtsNext2 <<< "$($P -c "
@@ -1278,21 +1366,12 @@ for ((i = 0; i < 100; i++)); do
 done
 assert "$readerSnapshotPublished" "yes" \
 	"checkpoint completion schedules the exact-R running-XID snapshot"
-READERPREP2=$(mktemp -d)
-mkdir -p "$READERPREP2/relmaps/global" "$READERPREP2/relmaps/$readerDbOid"
-cp "$DATA/global/pg_filenode.map" "$READERPREP2/relmaps/global/"
-cp "$DATA/base/$readerDbOid/pg_filenode.map" "$READERPREP2/relmaps/$readerDbOid/"
 assert "$($P -c "SELECT pagestore_clog_status_asof('$readerV2Xid'::xid, '$bc', '$readerR2');")" "1" \
 	"the newer reader horizon reconstructs the v2 transaction as committed"
-$P -c "SELECT pagestore_prepare_reader('$READERPREP2', 0, '$bc', '$readerR2',
-	'$readerOldest2'::xid, '$readerNext2'::xid,
-	'$readerCtsOldest2'::xid, '$readerCtsNext2'::xid,
-	'$readerOldestMulti2'::xid, '$readerNextMulti2'::xid,
-	0, $readerNextMember2);" >/dev/null
 READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
-pagestore.advance_read_lsn = on
+pagestore.advance_read_lsn = off
 archive_mode = off
 listen_addresses = ''
 unix_socket_directories = '$READER_SOCK'
@@ -1398,6 +1477,8 @@ assert "$(grep -c 'reader catalog provenance.*invalid identity' "$BADREADER/serv
 "$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
+ADVANCINGDATA=$(mktemp -d)/reader
+cp -a "$READERDATA" "$ADVANCINGDATA"
 if ! "$BIN/pg_ctl" -D "$READERDATA" -l "$READERDATA/server.log" -w start >/dev/null 2>&1; then
 	echo "FAIL - prepared reader did not start"
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
@@ -1409,20 +1490,8 @@ if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
 fi
-assert "$($PR -c "SELECT pagestore_reader_candidate_lsn() > '$readerR'::pg_lsn;")" "t" \
-	"advancing reader discovers a newer durable checkpoint horizon"
-assert "$($PR -c "SELECT pagestore_reader_candidate_generation() >= 2;")" "t" \
-	"a newer candidate receives a new shared read generation"
-assert "$($PR -c "SELECT current_setting('pagestore.read_lsn')::pg_lsn = '$readerR'::pg_lsn;")" "t" \
-	"candidate discovery does not move the effective view without its snapshot"
-assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR'::pg_lsn AND pagestore_reader_effective_generation() = 1;")" "t" \
-	"the backend keeps its initial effective view generation while the candidate snapshot is absent"
 assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
 	"reader loads and validates the exact-R multi-block snapshot from the page store"
-missingPublishedSnapshot=$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, pagestore_reader_candidate_lsn());" \
-	>/dev/null 2>&1 && echo ok || echo error)
-assert "$missingPublishedSnapshot" "error" \
-	"reader rejects a candidate horizon whose snapshot has not been published"
 reader_v=$($PR -c "SELECT v FROM reader_t WHERE id = 1;")
 if [ "$reader_v" != "v1" ]; then
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
@@ -1435,9 +1504,12 @@ assert "$($PR -c "SELECT count(*) FROM reader_subxid;")" "0" \
 	"pinned reader keeps subtransactions beyond normal snapshot capacity invisible"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerRunningXid'::xid8, pg_current_snapshot());")" "f" \
 	"pg_current_snapshot preserves the pinned reader running-XID set"
-reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
-assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
-	"advancing reader rejects exporting a snapshot without its read view"
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "f" \
+	"fixed reader refuses a handoff token newer than its horizon"
+wrongTimelineToken=$($P -c "SELECT set_byte('$readerHandoffToken'::bytea, 8,
+	(get_byte('$readerHandoffToken'::bytea, 8) + 1) % 256);")
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$wrongTimelineToken');" 2>&1 | grep -c 'belongs to a different pagestore timeline')" "1" \
+	"reader rejects a handoff token from another timeline"
 assert "$($PR -c "UPDATE reader_t SET v = 'v3' WHERE id = 1;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses writes"
 # the read-only default is advisory on a normal server; on a pinned reader the
@@ -1474,11 +1546,27 @@ assert "$($PR -c "NOTIFY pinned_chan;" 2>&1 | grep -c 'not allowed on a pinned r
 # VACUUM is legal in read-only transactions and reaches prune/freeze WAL paths: the utility gate must refuse it
 assert "$($PR -c "VACUUM reader_t;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses VACUUM"
-readerSnapshotBlocks2=$($P -c "SELECT pagestore_publish_reader_snapshot_artifact('$READERPREP2', 0, '$readerR2');")
-assert "$([ "${readerSnapshotBlocks2:-0}" -gt 0 ] && echo ok || echo no)" "ok" \
-	"control plane publishes the exact snapshot for the newer reader horizon"
+"$BIN/pg_ctl" -D "$READERDATA" -m fast -w stop >/dev/null
+sed -i 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
+	"$ADVANCINGDATA/postgresql.conf"
+"$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null
+readerAutoPublished=no
+for ((i = 0; i < 100; i++)); do
+	if [ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR2');" 2>/dev/null)" = "0" ]; then
+		readerAutoPublished=yes
+		break
+	fi
+	sleep 0.1
+done
+assert "$readerAutoPublished" "yes" \
+	"database worker binds exact-R relation maps to the automatic snapshot"
+reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
+assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
+	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
+assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "t" \
+	"advancing reader accepts the writer handoff after reaching its token"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
 	"the adopted exact-R snapshot treats the v2 transaction as committed"
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
@@ -1494,11 +1582,11 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	SET parallel_tuple_cost = 0;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
-rm -rf "$READERPREP2"
-"$BIN/pg_ctl" -D "$READERDATA" -w stop >/dev/null 2>&1
+"$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
-rm -rf "$(dirname "$READERDATA")"
+rm -rf "$(dirname "$READERDATA")" "$(dirname "$ADVANCINGDATA")"
 READERDATA=
+ADVANCINGDATA=
 
 # --- 32. as-of fork metadata: NBLOCKS/EXISTS resolve at a horizon ------------
 # The store versions fork sizes (page-append growth at each block's pd_lsn,

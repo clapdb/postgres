@@ -34,7 +34,6 @@ typedef struct xl_relmap_update
 
 #define MinSizeOfRelmapUpdate offsetof(xl_relmap_update, data)
 
-
 extern RelFileNumber RelationMapOidToFilenumber(Oid relationId, bool shared);
 
 extern Oid	RelationMapFilenumberToOid(RelFileNumber filenumber, bool shared);

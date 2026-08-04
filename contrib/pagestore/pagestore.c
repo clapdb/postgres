@@ -49,10 +49,13 @@
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "archive/archive_module.h"
+#include "catalog/pg_database_d.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "libpq/pqsignal.h"
 #include "lib/stringinfo.h"
@@ -75,6 +78,8 @@
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
+#include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -82,6 +87,8 @@
 #include "utils/pg_lsn.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/relmapper.h"
+#include "utils/snapmgr.h"
 #include "utils/wait_classes.h"
 #include "walredo_client.h"
 
@@ -89,6 +96,8 @@ PG_MODULE_MAGIC;
 
 void		_PG_init(void);
 PGDLLEXPORT void pagestore_reader_snapshot_worker_main(Datum main_arg);
+PGDLLEXPORT void pagestore_reader_artifact_launcher_main(Datum main_arg);
+PGDLLEXPORT void pagestore_reader_artifact_database_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
@@ -97,6 +106,7 @@ static char *pagestore_backend_name = NULL;
 static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
+static bool pagestore_auto_reader_artifacts = false;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -104,6 +114,13 @@ static transaction_id_is_in_progress_hook_type prev_xid_in_progress_hook = NULL;
 static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ExecutorRun_hook_type prev_executor_run_hook = NULL;
+static ProcessUtility_hook_type prev_process_utility_hook = NULL;
+static CmdType pagestore_current_command_type = CMD_UNKNOWN;
+static bool pagestore_current_has_modifying_cte = false;
+static PlannedStmt *pagestore_current_planned_stmt = NULL;
+static bool pagestore_handoff_issued = false;
+static int pagestore_utility_nesting_level = 0;
 static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
 static commit_ts_latest_hook_type prev_commit_ts_latest_hook = NULL;
 static snapshot_transfer_hook_type prev_snapshot_transfer_hook = NULL;
@@ -189,6 +206,86 @@ pagestore_planner(Query *parse, const char *query_string, int cursor_options,
 	}
 	PG_END_TRY();
 	return result;
+}
+
+static void
+pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
+					   uint64 count)
+{
+	CmdType		saved_command_type = pagestore_current_command_type;
+	bool		saved_has_modifying_cte = pagestore_current_has_modifying_cte;
+	PlannedStmt *saved_planned_stmt = pagestore_current_planned_stmt;
+
+	if (pagestore_handoff_issued)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("a writer backend cannot execute queries after issuing a reader handoff token")));
+	pagestore_current_command_type = query_desc->plannedstmt->commandType;
+	pagestore_current_has_modifying_cte =
+		query_desc->plannedstmt->hasModifyingCTE;
+	pagestore_current_planned_stmt = query_desc->plannedstmt;
+	PG_TRY();
+	{
+		if (prev_executor_run_hook != NULL)
+			prev_executor_run_hook(query_desc, direction, count);
+		else
+			standard_ExecutorRun(query_desc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		pagestore_current_command_type = saved_command_type;
+		pagestore_current_has_modifying_cte = saved_has_modifying_cte;
+		pagestore_current_planned_stmt = saved_planned_stmt;
+	}
+	PG_END_TRY();
+}
+
+static void
+pagestore_process_utility(PlannedStmt *pstmt, const char *query_string,
+					  bool read_only_tree, ProcessUtilityContext context,
+					  ParamListInfo params, QueryEnvironment *query_env,
+					  DestReceiver *dest, QueryCompletion *qc)
+{
+	bool		allow_after_handoff = false;
+
+	if (IsA(pstmt->utilityStmt, TransactionStmt))
+	{
+		TransactionStmt *stmt = (TransactionStmt *) pstmt->utilityStmt;
+
+		switch (stmt->kind)
+		{
+			case TRANS_STMT_BEGIN:
+			case TRANS_STMT_START:
+			case TRANS_STMT_COMMIT:
+			case TRANS_STMT_ROLLBACK:
+			case TRANS_STMT_SAVEPOINT:
+			case TRANS_STMT_RELEASE:
+			case TRANS_STMT_ROLLBACK_TO:
+				allow_after_handoff = true;
+				break;
+			default:
+				break;
+		}
+	}
+	if (pagestore_handoff_issued && !allow_after_handoff)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("a writer backend cannot run utility commands after issuing a reader handoff token")));
+	pagestore_utility_nesting_level++;
+	PG_TRY();
+	{
+		if (prev_process_utility_hook != NULL)
+			prev_process_utility_hook(pstmt, query_string, read_only_tree, context,
+								  params, query_env, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, query_string, read_only_tree, context,
+								params, query_env, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		pagestore_utility_nesting_level--;
+	}
+	PG_END_TRY();
 }
 
 #define PAGESTORE_READER_HORIZON_TTL_MS 1000
@@ -5206,6 +5303,17 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 #define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
 #define PAGESTORE_READER_CATALOG_FORMAT 1
 #define PAGESTORE_READER_CATALOG_FILE "pagestore_reader.catalog"
+#define PAGESTORE_READER_HANDOFF_MAGIC UINT32_C(0x50534854)
+#define PAGESTORE_READER_HANDOFF_FORMAT 1
+
+typedef struct PagestoreReaderHandoffToken
+{
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		reserved;
+	uint64		lsn;
+} PagestoreReaderHandoffToken;
 
 typedef struct PagestoreReaderSnapshotHeader
 {
@@ -5231,7 +5339,31 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT 0
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
+#define PAGESTORE_READER_RELMAP_OBJECT 3
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
+
+#define PAGESTORE_READER_RELMAP_MAGIC UINT32_C(0x5053524C)
+#define PAGESTORE_READER_RELMAP_FORMAT 1
+#define PAGESTORE_READER_RELMAP_MAX_SIZE \
+	(BLCKSZ - MAXALIGN(sizeof(PagestoreReaderRelmap)))
+
+typedef struct PagestoreReaderRelmap
+{
+	uint32		magic;
+	uint32		format;
+	Oid			dbid;
+	Oid			tsid;
+	uint32		size;
+	pg_crc32c	data_crc;
+	pg_crc32c	crc;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
+} PagestoreReaderRelmap;
+
+static XLogRecPtr pagestore_primed_relmap_lsn = InvalidXLogRecPtr;
+static Size pagestore_primed_global_relmap_size = 0;
+static Size pagestore_primed_local_relmap_size = 0;
+static char pagestore_primed_global_relmap[PAGESTORE_READER_RELMAP_MAX_SIZE];
+static char pagestore_primed_local_relmap[PAGESTORE_READER_RELMAP_MAX_SIZE];
 
 typedef struct PagestoreReaderSnapshotReady
 {
@@ -5447,6 +5579,174 @@ pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 	key.dbOid = dbid;
 	key.relNumber = object;
 	return key;
+}
+
+static Size
+pagestore_read_reader_relmap(const char *dir, char *data, Size capacity)
+{
+	char		path[MAXPGPATH];
+	struct stat st;
+	int			fd;
+	int			len;
+
+	len = snprintf(path, sizeof(path), "%s/pg_filenode.map", dir);
+	PS_CHECK_PATH_FORMAT(len, path);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 0 ||
+		st.st_size > (off_t) capacity ||
+		!pagestore_pread_exact(fd, data, (Size) st.st_size, 0))
+	{
+		if (fd >= 0)
+			CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read relation map \"%s\": %m", path)));
+	}
+	CloseTransientFile(fd);
+	return (Size) st.st_size;
+}
+
+static void
+pagestore_publish_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr lsn,
+								const char *data, Size size)
+{
+	PagestoreReaderRelmap *artifact;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	BlockNumber nblocks;
+
+	memset(page, 0, sizeof(page));
+	artifact = (PagestoreReaderRelmap *) page;
+	artifact->magic = PAGESTORE_READER_RELMAP_MAGIC;
+	artifact->format = PAGESTORE_READER_RELMAP_FORMAT;
+	artifact->dbid = dbid;
+	artifact->tsid = tsid;
+	artifact->size = size;
+	INIT_CRC32C(artifact->data_crc);
+	COMP_CRC32C(artifact->data_crc, data, size);
+	FIN_CRC32C(artifact->data_crc);
+	memcpy(artifact->data, data, size);
+	INIT_CRC32C(artifact->crc);
+	COMP_CRC32C(artifact->crc, artifact,
+				  offsetof(PagestoreReaderRelmap, crc));
+	FIN_CRC32C(artifact->crc);
+	key = pagestore_reader_snapshot_key(PAGESTORE_READER_RELMAP_OBJECT, dbid);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, (uint64) lsn, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+}
+
+static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
+										 XLogRecPtr read_lsn,
+										 pg_crc32c *data_crc);
+
+PG_FUNCTION_INFO_V1(pagestore_prime_reader_relmaps);
+Datum
+pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	lsn;
+	char		global_map[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	char		local_map[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	Size		global_size;
+	Size		local_size;
+	bool		changed;
+	pg_crc32c	global_crc;
+	pg_crc32c	local_crc;
+	pg_crc32c	stored_global_crc;
+	pg_crc32c	stored_local_crc;
+
+	if (!superuser() || !OidIsValid(MyDatabaseId) || DatabasePath == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("reader relation-map priming requires a database superuser backend")));
+	LWLockAcquire(RelationMappingLock, LW_SHARED);
+	global_size = pagestore_read_reader_relmap("global", global_map,
+										 sizeof(global_map));
+	local_size = pagestore_read_reader_relmap(DatabasePath, local_map,
+									  sizeof(local_map));
+	lsn = GetXLogInsertRecPtr();
+	LWLockRelease(RelationMappingLock);
+	changed = global_size != pagestore_primed_global_relmap_size ||
+		local_size != pagestore_primed_local_relmap_size ||
+		memcmp(global_map, pagestore_primed_global_relmap, global_size) != 0 ||
+		memcmp(local_map, pagestore_primed_local_relmap, local_size) != 0;
+	if (!changed)
+		PG_RETURN_LSN(pagestore_primed_relmap_lsn);
+	INIT_CRC32C(global_crc);
+	COMP_CRC32C(global_crc, global_map, global_size);
+	FIN_CRC32C(global_crc);
+	INIT_CRC32C(local_crc);
+	COMP_CRC32C(local_crc, local_map, local_size);
+	FIN_CRC32C(local_crc);
+	if (pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+			PG_UINT64_MAX,
+			&stored_global_crc) &&
+		pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
+			PG_UINT64_MAX,
+			&stored_local_crc) &&
+		EQ_CRC32C(global_crc, stored_global_crc) &&
+		EQ_CRC32C(local_crc, stored_local_crc))
+	{
+		memcpy(pagestore_primed_global_relmap, global_map, global_size);
+		memcpy(pagestore_primed_local_relmap, local_map, local_size);
+		pagestore_primed_global_relmap_size = global_size;
+		pagestore_primed_local_relmap_size = local_size;
+		pagestore_primed_relmap_lsn = lsn;
+		PG_RETURN_LSN(lsn);
+	}
+	pagestore_publish_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID, lsn,
+								 global_map, global_size);
+	pagestore_publish_reader_relmap(MyDatabaseId, MyDatabaseTableSpace, lsn,
+								 local_map, local_size);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	memcpy(pagestore_primed_global_relmap, global_map, global_size);
+	memcpy(pagestore_primed_local_relmap, local_map, local_size);
+	pagestore_primed_global_relmap_size = global_size;
+	pagestore_primed_local_relmap_size = local_size;
+	pagestore_primed_relmap_lsn = lsn;
+	PG_RETURN_LSN(lsn);
+}
+
+static bool
+pagestore_load_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr read_lsn,
+							 pg_crc32c *data_crc)
+{
+	PagestoreReaderRelmap artifact;
+	PagestoreReaderRelmap checked;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	pg_crc32c	crc;
+
+	key = pagestore_reader_snapshot_key(PAGESTORE_READER_RELMAP_OBJECT, dbid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		return false;
+	memcpy(&artifact, page, offsetof(PagestoreReaderRelmap, data));
+	checked = artifact;
+	INIT_CRC32C(checked.crc);
+	COMP_CRC32C(checked.crc, &checked,
+				offsetof(PagestoreReaderRelmap, crc));
+	FIN_CRC32C(checked.crc);
+	if (artifact.magic != PAGESTORE_READER_RELMAP_MAGIC ||
+		artifact.format != PAGESTORE_READER_RELMAP_FORMAT ||
+		artifact.dbid != dbid || artifact.tsid != tsid || artifact.size == 0 ||
+		artifact.size > BLCKSZ - offsetof(PagestoreReaderRelmap, data) ||
+		!EQ_CRC32C(artifact.crc, checked.crc))
+		return false;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, page + offsetof(PagestoreReaderRelmap, data),
+				artifact.size);
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, artifact.data_crc))
+		return false;
+	*data_crc = artifact.data_crc;
+	return true;
 }
 
 static void
@@ -5836,6 +6136,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		uint32		horizon;
 		Size		bitmap_size;
 		uint32		count = 0;
+		uint32		scan_iterations = 0;
 		XLogRecPtr	scan_end;
 		BlockNumber blocks;
 		BlockNumber nblocks;
@@ -5857,6 +6158,11 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 			XLogRecPtr	status_lsn;
 			XidStatus	status = TransactionIdGetStatus(xid, &status_lsn);
 
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
+
 			if (status == TRANSACTION_STATUS_IN_PROGRESS ||
 				status == TRANSACTION_STATUS_SUB_COMMITTED)
 				pagestore_reader_mark_completed(xid, oldest_xid, next_xid, running);
@@ -5866,9 +6172,15 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		XLogFlush(scan_end);
 		pagestore_reader_mark_completions(read_lsn, scan_end, oldest_xid,
 										 next_xid, running);
+		scan_iterations = 0;
 		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
 		{
 			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
 
 			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
 				count++;
@@ -5880,9 +6192,15 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 					 errmsg("automatic reader snapshot is too large")));
 		xids = count > 0 ? palloc_array(TransactionId, count) : NULL;
 		count = 0;
+		scan_iterations = 0;
 		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
 		{
 			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
 
 			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
 				xids[count++] = xid;
@@ -6030,6 +6348,108 @@ pagestore_validate_checkpoint_reader_snapshot(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) ready.header.count);
 }
 
+PG_FUNCTION_INFO_V1(pagestore_publish_database_reader_manifest);
+Datum
+pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
+{
+	PagestoreReaderSnapshotReady ready;
+	PagestoreReaderSnapshotReady checked_ready;
+	PagestoreReaderSnapshotManifest manifest;
+	PageStoreRelKey key;
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+	BlockNumber nblocks;
+	pg_crc32c	current_global_crc;
+	pg_crc32c	current_local_crc;
+
+	if (!superuser() || !OidIsValid(MyDatabaseId) || DatabasePath == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("reader manifest publication requires a database superuser backend")));
+	if (!pagestore_branch_backend_active() ||
+		!pagestore_branch_routing_active() ||
+		pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader manifest publication requires a fully routed writable pagestore compute")));
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, PG_UINT64_MAX, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		PG_RETURN_NULL();
+	memcpy(&ready, page, sizeof(ready));
+	checked_ready = ready;
+	pagestore_reader_snapshot_ready_crc(&checked_ready);
+	if (ready.header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		ready.header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		ready.header.timeline != pagestore_localsvc_timeline() ||
+		ready.header.read_lsn != (XLogRecPtr) resolved ||
+		ready.header.count > MaxAllocSize / sizeof(TransactionId) ||
+		ready.block_count == 0 ||
+		ready.block_count != (BlockNumber)
+		((sizeof(ready.header) +
+		  (Size) ready.header.count * sizeof(TransactionId) + BLCKSZ - 1) /
+		 BLCKSZ) || ready.reserved != 0 ||
+		!EQ_CRC32C(ready.crc, checked_ready.crc))
+		ereport(ERROR, (errmsg("latest automatic reader snapshot is invalid")));
+	memset(&manifest, 0, sizeof(manifest));
+	manifest.read_lsn = resolved;
+	manifest.artifact_size = sizeof(ready.header) +
+		(Size) ready.header.count * sizeof(TransactionId);
+	manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
+	manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
+	manifest.timeline = ready.header.timeline;
+	manifest.block_count = ready.block_count;
+	manifest.artifact_crc = ready.header.crc;
+	if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+			(XLogRecPtr) resolved,
+			&manifest.global_relmap_crc) ||
+		!pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
+			(XLogRecPtr) resolved,
+			&manifest.local_relmap_crc))
+		PG_RETURN_NULL();
+	LWLockAcquire(RelationMappingLock, LW_SHARED);
+	current_global_crc = pagestore_reader_relmap_crc("global");
+	current_local_crc = pagestore_reader_relmap_crc(DatabasePath);
+	LWLockRelease(RelationMappingLock);
+	if (!EQ_CRC32C(current_global_crc, manifest.global_relmap_crc) ||
+		!EQ_CRC32C(current_local_crc, manifest.local_relmap_crc))
+		PG_RETURN_NULL();
+	pagestore_reader_snapshot_manifest_crc(&manifest);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &manifest, sizeof(manifest));
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
+	{
+		char		existing[BLCKSZ];
+		uint64		existing_resolved = 0;
+
+		if (pagestore_localsvc_obj_read_at_timeout(
+				PS_KLASS_READER_SNAPSHOT, &key, 0, resolved, existing,
+				&existing_resolved,
+				PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) &&
+			existing_resolved == resolved &&
+			memcmp(existing, page, BLCKSZ) == 0)
+		{
+			pagestore_localsvc_store_sync_timeout(
+				PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+			PG_RETURN_LSN((XLogRecPtr) resolved);
+		}
+	}
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, resolved, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	PG_RETURN_LSN((XLogRecPtr) resolved);
+}
+
 static BlockNumber
 pagestore_publish_reader_snapshot(const char *dir, uint32 timeline,
 								  XLogRecPtr read_lsn)
@@ -6175,7 +6595,7 @@ pagestore_resolve_published_reader_snapshot(XLogRecPtr upper_lsn)
 	uint64		resolved = 0;
 
 	key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, (uint64) upper_lsn, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
@@ -6528,6 +6948,87 @@ Datum
 pagestore_reader_effective_generation(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64((int64) pagestore_localsvc_read_epoch());
+}
+
+PG_FUNCTION_INFO_V1(pagestore_writer_handoff_token);
+Datum
+pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
+{
+	bytea	   *result;
+	PagestoreReaderHandoffToken token;
+	Plan	   *plan = pagestore_current_planned_stmt != NULL ?
+		pagestore_current_planned_stmt->planTree : NULL;
+	TargetEntry *tle = plan != NULL && list_length(plan->targetlist) == 1 ?
+		linitial_node(TargetEntry, plan->targetlist) : NULL;
+
+	if (RecoveryInProgress() || !pagestore_branch_backend_active() ||
+		!pagestore_branch_routing_active() ||
+		pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("a reader handoff token requires a writable pagestore compute")));
+	if (pagestore_current_command_type != CMD_SELECT ||
+		pagestore_current_has_modifying_cte ||
+		pagestore_utility_nesting_level != 0 || !IsA(plan, Result) ||
+		outerPlan(plan) != NULL || innerPlan(plan) != NULL ||
+		((Result *) plan)->resconstantqual != NULL || tle == NULL ||
+		!IsA(tle->expr, FuncExpr) ||
+		((FuncExpr *) tle->expr)->funcid != fcinfo->flinfo->fn_oid)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token must be called by a standalone SELECT")));
+	if (TransactionIdIsValid(GetTopTransactionIdIfAny()))
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token cannot be issued by a write transaction"),
+				 errhint("Issue the token in a new transaction after committing the writes.")));
+	if (IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("a reader handoff token cannot be issued inside a transaction block"),
+				 errhint("Issue the token as a standalone autocommit statement.")));
+	pagestore_handoff_issued = true;
+	transaction_read_only_forced = true;
+	XactReadOnly = true;
+	memset(&token, 0, sizeof(token));
+	token.magic = PAGESTORE_READER_HANDOFF_MAGIC;
+	token.format = PAGESTORE_READER_HANDOFF_FORMAT;
+	token.timeline = pagestore_localsvc_timeline();
+	token.lsn = GetXLogInsertRecPtr();
+	result = palloc(VARHDRSZ + sizeof(token));
+	SET_VARSIZE(result, VARHDRSZ + sizeof(token));
+	memcpy(VARDATA(result), &token, sizeof(token));
+	PG_RETURN_BYTEA_P(result);
+}
+
+PG_FUNCTION_INFO_V1(pagestore_reader_handoff_ready);
+Datum
+pagestore_reader_handoff_ready(PG_FUNCTION_ARGS)
+{
+	bytea	   *value = PG_GETARG_BYTEA_PP(0);
+	PagestoreReaderHandoffToken token;
+	uint64		read_lsn = pagestore_localsvc_read_lsn();
+
+	if (VARSIZE_ANY_EXHDR(value) != sizeof(token))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader handoff token has an invalid size")));
+	memcpy(&token, VARDATA_ANY(value), sizeof(token));
+	if (token.magic != PAGESTORE_READER_HANDOFF_MAGIC ||
+		token.format != PAGESTORE_READER_HANDOFF_FORMAT ||
+		token.reserved != 0 || XLogRecPtrIsInvalid(token.lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("reader handoff token has an invalid identity")));
+	if (!pagestore_branch_backend_active() || read_lsn == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader handoff readiness requires a pinned pagestore reader")));
+	if (token.timeline != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader handoff token belongs to a different pagestore timeline")));
+	PG_RETURN_BOOL((XLogRecPtr) read_lsn >= (XLogRecPtr) token.lsn);
 }
 
 static void
@@ -8436,6 +8937,191 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(seeded);
 }
 
+static bool
+pagestore_reader_artifact_worker_cycle(bool prime)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	bool		succeeded = false;
+
+	InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
+	PG_TRY();
+	{
+		StartTransactionCommand();
+		if (prime)
+			(void) pagestore_prime_reader_relmaps(fcinfo);
+		fcinfo->isnull = false;
+		(void) pagestore_publish_database_reader_manifest(fcinfo);
+		CommitTransactionCommand();
+		succeeded = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(oldcontext);
+		if (edata->elevel >= FATAL ||
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		FlushErrorState();
+		AbortCurrentTransaction();
+		MemoryContextSwitchTo(TopMemoryContext);
+		ereport(WARNING,
+				(errmsg("pagestore reader artifact worker cycle failed: %s",
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return succeeded;
+}
+
+void
+pagestore_reader_artifact_database_main(Datum main_arg)
+{
+	Oid			dboid = DatumGetObjectId(main_arg);
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+	if (ConfigReloadPending)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+	}
+	if (!ShutdownRequestPending)
+		(void) pagestore_reader_artifact_worker_cycle(true);
+	proc_exit(0);
+}
+
+static List *
+pagestore_reader_artifact_databases(void)
+{
+	List	   *databases = NIL;
+	MemoryContext oldcontext;
+
+	StartTransactionCommand();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_execute("SELECT oid FROM pg_database "
+					"WHERE datallowconn",
+					true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not enumerate databases");
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Oid			dboid = DatumGetObjectId(SPI_getbinval(
+			SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+
+		if (!isnull)
+			databases = lappend_oid(databases, dboid);
+	}
+	MemoryContextSwitchTo(oldcontext);
+	PopActiveSnapshot();
+	SPI_finish();
+	CommitTransactionCommand();
+	return databases;
+}
+
+static void
+pagestore_run_reader_artifact_worker(Oid dboid)
+{
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle;
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_INTERRUPTIBLE;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pagestore");
+	snprintf(worker.bgw_function_name, BGW_MAXLEN,
+			 "pagestore_reader_artifact_database_main");
+	snprintf(worker.bgw_name, BGW_MAXLEN,
+			 "pagestore reader artifacts %u", dboid);
+	snprintf(worker.bgw_type, BGW_MAXLEN, "pagestore reader artifacts");
+	worker.bgw_main_arg = ObjectIdGetDatum(dboid);
+	worker.bgw_notify_pid = MyProcPid;
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+	{
+		ereport(WARNING,
+				(errmsg("could not start reader artifact worker for database %u",
+						dboid)));
+		return;
+	}
+	(void) WaitForBackgroundWorkerShutdown(handle);
+	pfree(handle);
+}
+
+void
+pagestore_reader_artifact_launcher_main(Datum main_arg)
+{
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnectionByOid(Template1DbOid, InvalidOid,
+										  BGWORKER_BYPASS_ALLOWCONN);
+
+	while (!ShutdownRequestPending)
+	{
+		List	   *databases = NIL;
+
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		PG_TRY();
+		{
+			databases = pagestore_reader_artifact_databases();
+			foreach_oid(dboid, databases)
+			{
+				if (ShutdownRequestPending)
+					break;
+				pagestore_run_reader_artifact_worker(dboid);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(oldcontext);
+			if (edata->elevel >= FATAL ||
+				edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			{
+				FreeErrorData(edata);
+				PG_RE_THROW();
+			}
+			FlushErrorState();
+			AbortCurrentTransaction();
+			MemoryContextSwitchTo(TopMemoryContext);
+			ereport(WARNING,
+					(errmsg("pagestore reader artifact launcher cycle failed: %s",
+							edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+		list_free(databases);
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10000L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	proc_exit(0);
+}
+
 void
 _PG_init(void)
 {
@@ -8509,12 +9195,28 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pagestore.auto_reader_artifacts",
+							 "Automatically publish per-database reader artifacts.",
+							 "A launcher maintains one artifact worker for every connectable database.",
+							 &pagestore_auto_reader_artifacts,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
 
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
+	if (pagestore_auto_reader_artifacts &&
+		!pagestore_branch_routing_active())
+		ereport(ERROR,
+				(errmsg("pagestore.auto_reader_artifacts requires full pagestore relation routing")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
+	prev_executor_run_hook = ExecutorRun_hook;
+	ExecutorRun_hook = pagestore_executor_run;
+	prev_process_utility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = pagestore_process_utility;
 	prev_commit_ts_bounds_hook = commit_ts_bounds_hook;
 	commit_ts_bounds_hook = pagestore_commit_ts_bounds;
 	prev_commit_ts_latest_hook = commit_ts_latest_hook;
@@ -8584,6 +9286,27 @@ _PG_init(void)
 				 "pagestore reader snapshot worker");
 		snprintf(worker.bgw_type, BGW_MAXLEN,
 				 "pagestore reader snapshot worker");
+		RegisterBackgroundWorker(&worker);
+	}
+	if (pagestore_auto_reader_artifacts &&
+		pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0 &&
+		pagestore_localsvc_read_lsn() == 0)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+			BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_INTERRUPTIBLE;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 10;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pagestore");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN,
+				 "pagestore_reader_artifact_launcher_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN,
+				 "pagestore reader artifact launcher");
+		snprintf(worker.bgw_type, BGW_MAXLEN,
+				 "pagestore reader artifact launcher");
 		RegisterBackgroundWorker(&worker);
 	}
 }

@@ -4,8 +4,9 @@ Status: increments 1a (the page-read pin), 1b (as-of size/existence
 metadata), 1c (the complete fixed-reader boot contract, including catalog
 provenance), 1d (the same-LSN admission fence), 2a (buffer generations),
 2b (candidate publication), 2c (running-XID artifact transport), and 2d
-(transaction-boundary view adoption) are implemented.  Automatic snapshot
-derivation/publication and increment 3 are not yet built.
+(transaction-boundary view adoption), including automatic snapshot derivation
+and per-database publication, are implemented.  Increment 3's transaction-boundary
+read-your-writes handoff policy is also implemented.
 
 ## Problem
 
@@ -267,13 +268,44 @@ reconstruction.
    add transactions that finished after R.  This needs no manually seeded CLOG
    base, does not rescan WAL per CLOG page, and keeps horizon work and store I/O
    out of the checkpoint drain.  Database-specific catalog and relation-map
-   provenance remains a control-plane action.  The staging marker is distinct
-   from the adoption manifest, so an incomplete per-database artifact cannot
-   become a reader candidate.
+   provenance remains a control-plane action.  A database publisher reads both
+   maps while holding `RelationMappingLock`, samples the WAL position after the
+   reads, and durably publishes changed bytes at that position.  It can bind
+   those maps only to a staged checkpoint whose R covers the sampled position;
+   recovery or a failed publication simply causes the current durable maps to
+   be sampled again.  Unchanged maps retain their prior sampled position.  The
+   publisher then emits the adoption manifest.
+   The staging marker is distinct from that manifest, so an incomplete
+   per-database artifact cannot become a reader candidate.  When
+   `pagestore.auto_reader_artifacts` is enabled on a fully routed writer (the
+   server rejects the option without `pagestore.route_all`), a controller
+   enumerates connectable databases and runs one short-lived database worker
+   at a time.  This bounds the scheduler to two worker slots regardless of the
+   database count.  Each worker primes its relation maps and binds the newest
+   complete staged snapshot to a database manifest; unchanged artifacts are
+   not rewritten, so publication no longer requires control-plane scheduling
+   or generates idle store traffic.
 
-3. **Read-your-writes handoff.**  A writer hands a session over to a reader
-   with a token (the writer's current insert LSN); the reader serves the
-   session only once R >= token.  Pure policy on top of increment 2.
+3. **Read-your-writes handoff (implemented).**  A writer hands a session over
+   to a reader with `pagestore_writer_handoff_token()`, which returns the
+   writer's timeline and current insert LSN in an opaque token.  The writer must
+   request it in a new transaction after committing its writes; token generation
+   rejects transaction blocks and transactions that have assigned an XID.  This
+   ensures the commit record precedes the token.  Its implicit transaction is
+   required to be the sole expression of a FROM-less SELECT and permanently
+   forces the backend read-only, so neither the remainder of the current
+   statement, a libpq fast-path function call, nor an extended-query pipeline
+   can append a write after the sampled LSN.  Issuance permanently seals that
+   writer backend against later query execution and utility commands, while
+   allowing only non-writing transaction
+   control to finish; the router must close or transfer the source connection.
+   Token issuance also requires
+   full relation routing.  Readiness rejects a token from another timeline.  At the
+   start of a subsequent transaction the reader first performs normal view adoption, then
+   `pagestore_reader_handoff_ready(token)` reports whether its effective
+   R covers the token.  A false result tells the session router to retry in a
+   new transaction; the API never changes snapshots in the middle of a
+   transaction.
 
 ## Non-goals
 
