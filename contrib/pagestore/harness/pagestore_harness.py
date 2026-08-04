@@ -177,6 +177,38 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         raise PlanError(
             f"runtime {runtime!r} cannot execute operation(s): {', '.join(unsupported)}"
         )
+    constraints = profile.get("constraints", {})
+    if not isinstance(constraints, dict):
+        raise PlanError(f"capabilities: runtime {runtime!r} has invalid constraints")
+    for action in plan.actions:
+        operation_constraints = constraints.get(action["op"], {})
+        if not isinstance(operation_constraints, dict):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid {action['op']!r} constraints"
+            )
+        forbidden = operation_constraints.get("forbidden_fields", [])
+        if not isinstance(forbidden, list) or not all(isinstance(field, str) for field in forbidden):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid forbidden_fields"
+            )
+        present = sorted(set(action) & set(forbidden))
+        if present:
+            raise PlanError(
+                f"runtime {runtime!r} operation {action['op']!r} does not support "
+                f"field(s): {', '.join(present)}"
+            )
+        for field, allowed in operation_constraints.items():
+            if field == "forbidden_fields":
+                continue
+            if not isinstance(allowed, list) or not allowed:
+                raise PlanError(
+                    f"capabilities: runtime {runtime!r} has invalid constraint {field!r}"
+                )
+            if action.get(field) not in allowed:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} does not support "
+                    f"{field}={action.get(field)!r}"
+                )
 
 
 def validate_runtime_health(
@@ -230,6 +262,18 @@ def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> i
     if major not in capability_values(capabilities, "postgres_major"):
         raise PlanError(f"PostgreSQL runtime major {major} is not advertised as supported")
     return major
+
+
+def probe_runtime_inspection(
+    inspector: Path, shm: str, capabilities: dict[str, Any],
+    inspection_schema: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    observations = {}
+    for operation in sorted(capability_values(capabilities, "inspection_operations")):
+        observations[operation] = inspect_store(
+            inspector, shm, operation, inspection_schema
+        )
+    return observations
 
 
 def require_string(record: dict[str, Any], field: str, context: str) -> str:
@@ -488,6 +532,7 @@ def run_daemon_smoke(
         validate_runtime_health(
             plan, capabilities, "daemon_smoke", health, inspection_schema
         )
+        probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         events.emit("ready", target="store", health=health, action_id=action_id)
         return daemon_process
 
@@ -570,6 +615,8 @@ def run_writer_smoke(
     keep: bool,
 ) -> Path:
     """Start a real localsvc writer and execute SQL/checkpoint plan actions."""
+    pg_bin = find_pg_bin(build)
+    postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
     root, temporary = run_root(requested_root)
     trace, store, data, tablespace, sockdir = (root / "trace", root / "store", root / "computes" / "writer",
                                                 root / "tablespace", root / "socket")
@@ -579,8 +626,7 @@ def run_writer_smoke(
     shutil.copy2(plan.path, root / "plan.jsonl")
     (root / "case.json").write_text(json.dumps(plan.header["case"], indent=2) + "\n", encoding="utf-8")
     events, shm = EventLog(trace / "events.jsonl"), f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
-    pg_bin, port = find_pg_bin(build), free_port()
-    postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
+    port = free_port()
     env = private_environment()
     install = pg_bin.parent
     env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
@@ -605,6 +651,7 @@ def run_writer_smoke(
                     raise
                 time.sleep(.05)
         validate_runtime_health(plan, capabilities, "writer_smoke", health, schema)
+        probe_runtime_inspection(inspector, shm, capabilities, schema)
         subprocess.run([str(pg_bin / "initdb"), "-D", str(data), "-U", "postgres", "-A", "trust"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         (data / "postgresql.conf").open("a", encoding="utf-8").write(

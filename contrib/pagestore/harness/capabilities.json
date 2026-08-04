@@ -5,12 +5,23 @@
   "runtimes": {
     "daemon_smoke": {
       "operations": ["crash"],
+      "constraints": {
+        "crash": {"target": ["store"], "model": ["power_loss"], "forbidden_fields": ["fault"]}
+      },
       "protocol_version": 21,
       "page_size": 8192,
       "io_unit": 262144
     },
     "writer_smoke": {
       "operations": ["sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap", "install_reader", "assert", "capture"],
+      "constraints": {
+        "checkpoint": {"target": ["writer"]},
+        "prepare_reader": {"target": ["writer"]},
+        "reader_base": {"target": ["writer"]},
+        "bootstrap": {"target": ["writer"]},
+        "assert": {"oracle": ["sql_scalar"]},
+        "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
+      },
       "protocol_version": 21,
       "page_size": 8192,
       "io_unit": 262144

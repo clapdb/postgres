@@ -30,6 +30,12 @@ CAPABILITIES = {
         "daemon_smoke": {
             "operations": ["crash"], "protocol_version": 21,
             "page_size": 8192, "io_unit": 262144,
+            "constraints": {
+                "crash": {
+                    "target": ["store"], "model": ["power_loss"],
+                    "forbidden_fields": ["fault"],
+                },
+            },
         },
     },
 }
@@ -155,6 +161,27 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "cannot execute operation.*sql"):
             MODULE.validate_runtime_plan(plan, CAPABILITIES, "daemon_smoke")
 
+    def test_runtime_rejects_unsupported_operation_parameters(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "crash", "id": "crash", "target": "writer", "model": "power_loss"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not support target='writer'"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), CAPABILITIES, "daemon_smoke"
+            )
+
+    def test_runtime_rejects_unsupported_optional_fields(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "crash", "id": "crash", "target": "store", "model": "power_loss",
+             "fault": "manifest.after_rename"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not support field.*fault"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), CAPABILITIES, "daemon_smoke"
+            )
+
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
         health = {
@@ -179,6 +206,28 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), CAPABILITIES, "daemon_smoke", health, schema
             )
 
+    def test_runtime_probes_every_advertised_inspection_operation(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        inspector = Path(directory.name) / "inspect"
+        inspector.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$3\" = health ]; then\n"
+            "  echo '{\"protocol_version\":21,\"page_size\":8192,\"io_unit\":262144,"
+            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}'\n"
+            "else\n"
+            "  echo 'unsupported operation' >&2; exit 1\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        inspector.chmod(0o755)
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "inspector backpressure failed"):
+            MODULE.probe_runtime_inspection(
+                inspector, "/unused", CAPABILITIES, schema
+            )
+
     def test_postgres_runtime_major_must_be_advertised(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -195,6 +244,25 @@ class PlanValidationTests(unittest.TestCase):
         postgres.write_text("#!/bin/sh\necho 'postgres (PostgreSQL) 19beta1'\n", encoding="utf-8")
         postgres.chmod(0o755)
         self.assertEqual(MODULE.validate_postgres_runtime(postgres, CAPABILITIES), 19)
+
+    def test_postgres_preflight_runs_before_creating_the_run_root(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        build = Path(directory.name) / "build"
+        pg_bin = build / "tmp_install" / "install" / "bin"
+        pg_bin.mkdir(parents=True)
+        postgres = pg_bin / "postgres"
+        (pg_bin / "pg_ctl").touch()
+        postgres.write_text("#!/bin/sh\necho 'not postgres'\n", encoding="utf-8")
+        postgres.chmod(0o755)
+        plan = MODULE.read_plan(self.write_plan([self.header()]))
+        with mock.patch.object(MODULE, "run_root") as create_root:
+            with self.assertRaisesRegex(MODULE.PlanError, "cannot identify PostgreSQL"):
+                MODULE.run_writer_smoke(
+                    plan, CAPABILITIES, {}, Path("daemon"), Path("inspect"),
+                    build, None, False,
+                )
+        create_root.assert_not_called()
 
     def test_daemon_smoke_retains_a_replayable_run_root(self):
         directory = tempfile.TemporaryDirectory()
@@ -306,7 +374,7 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(events[4]["returncode"], -9)
         self.assertNotEqual(events[1]["argv"][2], events[5]["argv"][2])
 
-    def test_daemon_smoke_rejects_unimplemented_named_fault(self):
+    def test_daemon_smoke_rejects_named_fault_before_launch(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         base = Path(directory.name)
@@ -336,15 +404,15 @@ class PlanValidationTests(unittest.TestCase):
              "fault": "manifest.after_rename"},
         ])
         root = base / "run"
-        with contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
             status = MODULE.main([
                 "--capabilities", str(ROOT / "capabilities.json"),
                 "--daemon-smoke", str(plan), "--daemon-binary", str(daemon),
                 "--inspect-binary", str(inspector), "--run-root", str(root),
             ])
         self.assertEqual(status, 1)
-        failure = json.loads((root / "failure.json").read_text())
-        self.assertIn("does not implement named fault", failure["error"])
+        self.assertIn("does not support field(s): fault", stderr.getvalue())
+        self.assertFalse(root.exists())
 
     def test_daemon_signal_targets_its_process_group(self):
         process = mock.Mock(pid=4321)
