@@ -245,6 +245,10 @@ class PlanValidationTests(unittest.TestCase):
         postgres.chmod(0o755)
         self.assertEqual(MODULE.validate_postgres_runtime(postgres, CAPABILITIES), 19)
 
+    def test_postgres_runtime_settings_respect_guc_version(self):
+        self.assertNotIn("io_method", MODULE.postgres_runtime_settings(17))
+        self.assertEqual(MODULE.postgres_runtime_settings(18), "io_method = sync\n")
+
     def test_postgres_preflight_runs_before_creating_the_run_root(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

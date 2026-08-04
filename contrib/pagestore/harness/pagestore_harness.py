@@ -264,6 +264,11 @@ def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> i
     return major
 
 
+def postgres_runtime_settings(major: int) -> str:
+    """Settings whose availability differs across supported PostgreSQL releases."""
+    return "io_method = sync\n" if major >= 18 else ""
+
+
 def probe_runtime_inspection(
     inspector: Path, shm: str, capabilities: dict[str, Any],
     inspection_schema: dict[str, Any],
@@ -658,7 +663,7 @@ def run_writer_smoke(
             f"shared_preload_libraries = 'pagestore'\npagestore.backend = 'localsvc'\n"
             f"pagestore.localsvc_shm = '{shm}'\npagestore.route_user_tablespaces = on\n"
             "pagestore.slru_mirror = on\n"
-            "io_method = sync\n"
+            f"{postgres_runtime_settings(postgres_major)}"
             "max_prepared_transactions = 10\n"
             f"listen_addresses = ''\nunix_socket_directories = '{sockdir}'\nport = {port}\n")
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"],
