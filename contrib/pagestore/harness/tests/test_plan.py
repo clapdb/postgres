@@ -24,6 +24,14 @@ CAPABILITIES = {
     "compute": ["writer", "reader"],
     "crash_models": ["power_loss"],
     "operations": ["sql", "checkpoint", "prepare_reader", "assert", "crash"],
+    "inspection_operations": ["health", "backpressure"],
+    "postgres_major": [13, 14, 15, 16, 17, 18, 19],
+    "runtimes": {
+        "daemon_smoke": {
+            "operations": ["crash"], "protocol_version": 21,
+            "page_size": 8192, "io_unit": 262144,
+        },
+    },
 }
 
 
@@ -125,7 +133,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":21,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -137,6 +145,56 @@ class PlanValidationTests(unittest.TestCase):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         value = MODULE.inspect_store(inspector, "/unused", "health", schema)
         self.assertEqual(value["page_size"], 8192)
+
+    def test_runtime_rejects_an_operation_the_runner_cannot_execute(self):
+        path = self.write_plan([
+            self.header(),
+            {"op": "sql", "id": "write", "target": "writer", "sql": "SELECT 1"},
+        ])
+        plan = MODULE.read_plan(path)
+        with self.assertRaisesRegex(MODULE.PlanError, "cannot execute operation.*sql"):
+            MODULE.validate_runtime_plan(plan, CAPABILITIES, "daemon_smoke")
+
+    def test_runtime_health_must_match_advertised_protocol(self):
+        path = self.write_plan([self.header()])
+        health = {
+            "protocol_version": 20, "page_size": 8192, "io_unit": 262144,
+            "nshards": 1,
+        }
+        schema = {"implemented_operations": ["health", "backpressure"]}
+        with self.assertRaisesRegex(MODULE.PlanError, "protocol_version mismatch"):
+            MODULE.validate_runtime_health(
+                MODULE.read_plan(path), CAPABILITIES, "daemon_smoke", health, schema
+            )
+
+    def test_runtime_requires_advertised_inspection_operations(self):
+        path = self.write_plan([self.header()])
+        health = {
+            "protocol_version": 21, "page_size": 8192, "io_unit": 262144,
+            "nshards": 1,
+        }
+        schema = {"implemented_operations": ["health"]}
+        with self.assertRaisesRegex(MODULE.PlanError, "lacks advertised.*backpressure"):
+            MODULE.validate_runtime_health(
+                MODULE.read_plan(path), CAPABILITIES, "daemon_smoke", health, schema
+            )
+
+    def test_postgres_runtime_major_must_be_advertised(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        postgres = Path(directory.name) / "postgres"
+        postgres.write_text("#!/bin/sh\necho 'postgres (PostgreSQL) 20devel'\n", encoding="utf-8")
+        postgres.chmod(0o755)
+        with self.assertRaisesRegex(MODULE.PlanError, "major 20.*not advertised"):
+            MODULE.validate_postgres_runtime(postgres, CAPABILITIES)
+
+    def test_postgres_runtime_accepts_supported_major(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        postgres = Path(directory.name) / "postgres"
+        postgres.write_text("#!/bin/sh\necho 'postgres (PostgreSQL) 19beta1'\n", encoding="utf-8")
+        postgres.chmod(0o755)
+        self.assertEqual(MODULE.validate_postgres_runtime(postgres, CAPABILITIES), 19)
 
     def test_daemon_smoke_retains_a_replayable_run_root(self):
         directory = tempfile.TemporaryDirectory()
@@ -151,7 +209,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":21,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -161,11 +219,12 @@ class PlanValidationTests(unittest.TestCase):
         )
         daemon.chmod(0o755)
         inspector.chmod(0o755)
+        plan = self.write_plan([self.header()])
         root = base / "run"
         with contextlib.redirect_stdout(io.StringIO()):
             status = MODULE.main([
                 "--capabilities", str(ROOT / "capabilities.json"),
-                "--daemon-smoke", str(ROOT / "scenarios" / "reader_visibility.jsonl"),
+                "--daemon-smoke", str(plan),
                 "--daemon-binary", str(daemon),
                 "--inspect-binary", str(inspector),
                 "--run-root", str(root),
@@ -190,11 +249,12 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         daemon.chmod(0o755)
         inspector.chmod(0o755)
+        plan = self.write_plan([self.header()])
         root = base / "failure"
         with contextlib.redirect_stderr(io.StringIO()):
             status = MODULE.main([
                 "--capabilities", str(ROOT / "capabilities.json"),
-                "--daemon-smoke", str(ROOT / "scenarios" / "reader_visibility.jsonl"),
+                "--daemon-smoke", str(plan),
                 "--daemon-binary", str(daemon),
                 "--inspect-binary", str(inspector),
                 "--run-root", str(root),
@@ -218,7 +278,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":21,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -259,7 +319,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":1,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":21,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "

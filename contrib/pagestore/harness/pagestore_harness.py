@@ -160,6 +160,78 @@ def capability_values(capabilities: dict[str, Any], name: str) -> set[Any]:
     return set(values)
 
 
+def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str, Any]:
+    runtimes = capabilities.get("runtimes")
+    if not isinstance(runtimes, dict) or not isinstance(runtimes.get(runtime), dict):
+        raise PlanError(f"capabilities: missing runtime profile {runtime!r}")
+    return runtimes[runtime]
+
+
+def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
+    profile = runtime_capabilities(capabilities, runtime)
+    operations = profile.get("operations")
+    if not isinstance(operations, list) or not all(isinstance(op, str) for op in operations):
+        raise PlanError(f"capabilities: runtime {runtime!r} has an invalid operations list")
+    unsupported = sorted({action["op"] for action in plan.actions} - set(operations))
+    if unsupported:
+        raise PlanError(
+            f"runtime {runtime!r} cannot execute operation(s): {', '.join(unsupported)}"
+        )
+
+
+def validate_runtime_health(
+    plan: Plan,
+    capabilities: dict[str, Any],
+    runtime: str,
+    health: dict[str, Any],
+    inspection_schema: dict[str, Any],
+) -> None:
+    profile = runtime_capabilities(capabilities, runtime)
+    for field in ("protocol_version", "page_size", "io_unit"):
+        expected = profile.get(field)
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+            raise PlanError(f"capabilities: runtime {runtime!r} has invalid {field}")
+        if health.get(field) != expected:
+            raise PlanError(
+                f"runtime {runtime!r} {field} mismatch: advertised {expected}, "
+                f"observed {health.get(field)!r}"
+            )
+    expected_shards = plan.header["case"]["shards"]
+    if health.get("nshards") != expected_shards:
+        raise PlanError(
+            f"runtime {runtime!r} shard mismatch: plan requires {expected_shards}, "
+            f"observed {health.get('nshards')!r}"
+        )
+    implemented = inspection_schema.get("implemented_operations")
+    if not isinstance(implemented, list):
+        raise PlanError("inspection schema: implemented_operations must be a list")
+    missing = sorted(capability_values(capabilities, "inspection_operations") - set(implemented))
+    if missing:
+        raise PlanError(
+            f"runtime {runtime!r} lacks advertised inspection operation(s): {', '.join(missing)}"
+        )
+
+
+def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> int:
+    try:
+        result = subprocess.run(
+            [str(postgres), "--version"], capture_output=True, check=False,
+            encoding="utf-8", env=private_environment(),
+        )
+    except OSError as error:
+        raise PlanError(f"cannot run PostgreSQL binary {postgres}: {error}") from error
+    match = re.search(r"PostgreSQL\)?\s+(\d+)", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise PlanError(
+            f"cannot identify PostgreSQL runtime {postgres}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    major = int(match.group(1))
+    if major not in capability_values(capabilities, "postgres_major"):
+        raise PlanError(f"PostgreSQL runtime major {major} is not advertised as supported")
+    return major
+
+
 def require_string(record: dict[str, Any], field: str, context: str) -> str:
     value = record.get(field)
     if not isinstance(value, str) or not value:
@@ -354,6 +426,7 @@ def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) ->
 
 def run_daemon_smoke(
     plan: Plan,
+    capabilities: dict[str, Any],
     inspection_schema: dict[str, Any],
     daemon: Path,
     inspector: Path,
@@ -390,7 +463,8 @@ def run_daemon_smoke(
         generation += 1
         shm_names.append(shm)
         command = [str(daemon), "--shm", shm, "--store", str(store),
-                   "--nshards", str(plan.header["case"]["shards"])]
+                   "--nshards", str(plan.header["case"]["shards"]),
+                   "--storage", plan.header["case"]["storage"]]
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
@@ -411,6 +485,9 @@ def run_daemon_smoke(
                 if time.monotonic() >= deadline:
                     raise PlanError(f"daemon did not become ready: {error}") from error
                 time.sleep(0.05)
+        validate_runtime_health(
+            plan, capabilities, "daemon_smoke", health, inspection_schema
+        )
         events.emit("ready", target="store", health=health, action_id=action_id)
         return daemon_process
 
@@ -487,8 +564,11 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector: Path,
-                     build: Path, requested_root: Path | None, keep: bool) -> Path:
+def run_writer_smoke(
+    plan: Plan, capabilities: dict[str, Any], schema: dict[str, Any],
+    daemon: Path, inspector: Path, build: Path, requested_root: Path | None,
+    keep: bool,
+) -> Path:
     """Start a real localsvc writer and execute SQL/checkpoint plan actions."""
     root, temporary = run_root(requested_root)
     trace, store, data, tablespace, sockdir = (root / "trace", root / "store", root / "computes" / "writer",
@@ -500,14 +580,18 @@ def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector
     (root / "case.json").write_text(json.dumps(plan.header["case"], indent=2) + "\n", encoding="utf-8")
     events, shm = EventLog(trace / "events.jsonl"), f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
     pg_bin, port = find_pg_bin(build), free_port()
+    postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
     env = private_environment()
     install = pg_bin.parent
     env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
     dproc = None
     try:
-        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
+        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
+                    shm=shm, postgres_major=postgres_major)
         with (trace / "daemon.log").open("w", encoding="utf-8") as log:
-            dproc = subprocess.Popen([str(daemon), "--shm", shm, "--store", str(store)], stdout=log,
+            dproc = subprocess.Popen([str(daemon), "--shm", shm, "--store", str(store),
+                                     "--nshards", str(plan.header["case"]["shards"]),
+                                     "--storage", plan.header["case"]["storage"]], stdout=log,
                                      stderr=subprocess.STDOUT, text=True, env=env)
         deadline = time.monotonic() + 10
         while True:
@@ -520,6 +604,7 @@ def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(.05)
+        validate_runtime_health(plan, capabilities, "writer_smoke", health, schema)
         subprocess.run([str(pg_bin / "initdb"), "-D", str(data), "-U", "postgres", "-A", "trust"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         (data / "postgresql.conf").open("a", encoding="utf-8").write(
@@ -762,19 +847,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.daemon_smoke:
             plan = read_plan(args.daemon_smoke)
             validate_plan(plan, capabilities)
+            validate_runtime_plan(plan, capabilities, "daemon_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
             schema = read_json(schema_path)
             if schema.get("schema") != capabilities.get("inspection_schema"):
                 raise PlanError(f"{schema_path}: inspection schema version does not match capabilities")
-            root = run_daemon_smoke(plan, schema, args.daemon_binary,
+            root = run_daemon_smoke(plan, capabilities, schema, args.daemon_binary,
                                     args.inspect_binary, args.run_root, args.keep)
             if args.keep or args.run_root:
                 print(root)
             return 0
         if args.writer_smoke:
             plan = read_plan(args.writer_smoke); validate_plan(plan, capabilities)
+            validate_runtime_plan(plan, capabilities, "writer_smoke")
             schema = read_json(args.inspection_schema or args.capabilities.with_name("inspection_schema.json"))
-            root = run_writer_smoke(plan, schema, args.daemon_binary, args.inspect_binary,
+            root = run_writer_smoke(plan, capabilities, schema, args.daemon_binary, args.inspect_binary,
                                     args.build_dir, args.run_root, args.keep)
             if args.keep or args.run_root: print(root)
             return 0

@@ -1,0 +1,1 @@
+{"schema":1,"scenario":"daemon-readiness","seed":1,"contracts":["lifecycle"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
