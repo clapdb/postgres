@@ -121,7 +121,6 @@ pagestore.localsvc_shm = '$SHM'
 pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
-pagestore.auto_reader_artifacts = on
 io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
@@ -1142,7 +1141,10 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # admission fence.
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
-echo "pagestore.route_all = on" >> "$DATA/postgresql.conf"
+cat >> "$DATA/postgresql.conf" <<EOF
+pagestore.route_all = on
+pagestore.auto_reader_artifacts = on
+EOF
 echo "max_prepared_transactions = 10" >> "$DATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 $P -c "CREATE TABLE reader_t(id int primary key, v text) TABLESPACE ts;
@@ -1300,7 +1302,7 @@ UPDATE reader_t SET v = v WHERE id = 1;
 \endpipeline
 SQL
 )
-assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'cannot execute queries after issuing a reader handoff token')" "1" \
+assert "$(printf '%s\n' "$handoffCommitPipeline" | grep -c 'read-only transaction')" "1" \
 	"handoff fence survives pipelined transaction control"
 $P -c "CREATE SEQUENCE reader_handoff_seq;" >/dev/null
 handoffSelectPipeline=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
@@ -1330,6 +1332,21 @@ assert "$(printf '%s\n' "$handoffInCtas" | grep -c 'must be called by a standalo
 	"writer cannot issue a handoff token below CREATE TABLE AS"
 assert "$($P -tAc "SELECT to_regclass('handoff_ctas') IS NULL;")" "t" \
 	"rejected CREATE TABLE AS handoff leaves no table"
+handoffSameSelect=$($P -v ON_ERROR_STOP=1 -c "SELECT pagestore_writer_handoff_token(),
+	pg_replication_origin_create('handoff_must_not_create_origin');" 2>&1 || true)
+assert "$(printf '%s\n' "$handoffSameSelect" | grep -c 'must be called by a standalone SELECT')" "1" \
+	"handoff token seals the remainder of its SELECT"
+assert "$($P -tAc "SELECT count(*) = 0 FROM pg_replication_origin
+	WHERE roname = 'handoff_must_not_create_origin';")" "t" \
+	"rejected same-SELECT handoff leaves no replication origin"
+handoffFastpath=$("$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -tA 2>&1 <<'SQL'
+\lo_import /dev/null
+SELECT pagestore_writer_handoff_token();
+\lo_import /dev/null
+SQL
+)
+assert "$(printf '%s\n' "$handoffFastpath" | grep -c 'read-only')" "1" \
+	"handoff fence rejects libpq fast-path function calls"
 readerHandoffToken=$($P -c "SELECT pagestore_writer_handoff_token();")
 $P -c "CHECKPOINT;" >/dev/null                     # v2 page version ships above R
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "writer sees the newest row version"

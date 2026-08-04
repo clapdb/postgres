@@ -277,7 +277,8 @@ reconstruction.
    publisher then emits the adoption manifest.
    The staging marker is distinct from that manifest, so an incomplete
    per-database artifact cannot become a reader candidate.  When
-   `pagestore.auto_reader_artifacts` is enabled on a writer, a controller
+   `pagestore.auto_reader_artifacts` is enabled on a fully routed writer (the
+   server rejects the option without `pagestore.route_all`), a controller
    enumerates connectable databases and runs one short-lived database worker
    at a time.  This bounds the scheduler to two worker slots regardless of the
    database count.  Each worker primes its relation maps and binds the newest
@@ -291,10 +292,12 @@ reconstruction.
    request it in a new transaction after committing its writes; token generation
    rejects transaction blocks and transactions that have assigned an XID.  This
    ensures the commit record precedes the token.  Its implicit transaction is
-   required to run a pure SELECT and is made read-only, so neither a containing
-   modifying statement nor an extended-query pipeline can append a write before
-   Sync.  Issuance permanently seals that writer backend against later query
-   execution and utility commands, while allowing only non-writing transaction
+   required to be the sole expression of a FROM-less SELECT and permanently
+   forces the backend read-only, so neither the remainder of the current
+   statement, a libpq fast-path function call, nor an extended-query pipeline
+   can append a write after the sampled LSN.  Issuance permanently seals that
+   writer backend against later query execution and utility commands, while
+   allowing only non-writing transaction
    control to finish; the router must close or transfer the source connection.
    Token issuance also requires
    full relation routing.  Readiness rejects a token from another timeline.  At the

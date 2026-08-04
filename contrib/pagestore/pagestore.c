@@ -118,6 +118,7 @@ static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
+static PlannedStmt *pagestore_current_planned_stmt = NULL;
 static bool pagestore_handoff_issued = false;
 static int pagestore_utility_nesting_level = 0;
 static commit_ts_bounds_hook_type prev_commit_ts_bounds_hook = NULL;
@@ -213,6 +214,7 @@ pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
 {
 	CmdType		saved_command_type = pagestore_current_command_type;
 	bool		saved_has_modifying_cte = pagestore_current_has_modifying_cte;
+	PlannedStmt *saved_planned_stmt = pagestore_current_planned_stmt;
 
 	if (pagestore_handoff_issued)
 		ereport(ERROR,
@@ -221,6 +223,7 @@ pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
 	pagestore_current_command_type = query_desc->plannedstmt->commandType;
 	pagestore_current_has_modifying_cte =
 		query_desc->plannedstmt->hasModifyingCTE;
+	pagestore_current_planned_stmt = query_desc->plannedstmt;
 	PG_TRY();
 	{
 		if (prev_executor_run_hook != NULL)
@@ -232,6 +235,7 @@ pagestore_executor_run(QueryDesc *query_desc, ScanDirection direction,
 	{
 		pagestore_current_command_type = saved_command_type;
 		pagestore_current_has_modifying_cte = saved_has_modifying_cte;
+		pagestore_current_planned_stmt = saved_planned_stmt;
 	}
 	PG_END_TRY();
 }
@@ -6924,6 +6928,10 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 {
 	bytea	   *result;
 	PagestoreReaderHandoffToken token;
+	Plan	   *plan = pagestore_current_planned_stmt != NULL ?
+		pagestore_current_planned_stmt->planTree : NULL;
+	TargetEntry *tle = plan != NULL && list_length(plan->targetlist) == 1 ?
+		linitial_node(TargetEntry, plan->targetlist) : NULL;
 
 	if (RecoveryInProgress() || !pagestore_branch_backend_active() ||
 		!pagestore_branch_routing_active() ||
@@ -6933,7 +6941,11 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 				 errmsg("a reader handoff token requires a writable pagestore compute")));
 	if (pagestore_current_command_type != CMD_SELECT ||
 		pagestore_current_has_modifying_cte ||
-		pagestore_utility_nesting_level != 0)
+		pagestore_utility_nesting_level != 0 || !IsA(plan, Result) ||
+		outerPlan(plan) != NULL || innerPlan(plan) != NULL ||
+		((Result *) plan)->resconstantqual != NULL || tle == NULL ||
+		!IsA(tle->expr, FuncExpr) ||
+		((FuncExpr *) tle->expr)->funcid != fcinfo->flinfo->fn_oid)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("a reader handoff token must be called by a standalone SELECT")));
@@ -6948,6 +6960,7 @@ pagestore_writer_handoff_token(PG_FUNCTION_ARGS)
 				 errmsg("a reader handoff token cannot be issued inside a transaction block"),
 				 errhint("Issue the token as a standalone autocommit statement.")));
 	pagestore_handoff_issued = true;
+	transaction_read_only_forced = true;
 	XactReadOnly = true;
 	memset(&token, 0, sizeof(token));
 	token.magic = PAGESTORE_READER_HANDOFF_MAGIC;
@@ -9166,6 +9179,10 @@ _PG_init(void)
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
 				(errmsg("pagestore.advance_read_lsn requires pagestore.read_lsn")));
+	if (pagestore_auto_reader_artifacts &&
+		!pagestore_branch_routing_active())
+		ereport(ERROR,
+				(errmsg("pagestore.auto_reader_artifacts requires full pagestore relation routing")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
 	prev_executor_run_hook = ExecutorRun_hook;
