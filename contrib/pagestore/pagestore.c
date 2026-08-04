@@ -6136,6 +6136,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		uint32		horizon;
 		Size		bitmap_size;
 		uint32		count = 0;
+		uint32		scan_iterations = 0;
 		XLogRecPtr	scan_end;
 		BlockNumber blocks;
 		BlockNumber nblocks;
@@ -6157,6 +6158,11 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 			XLogRecPtr	status_lsn;
 			XidStatus	status = TransactionIdGetStatus(xid, &status_lsn);
 
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
+
 			if (status == TRANSACTION_STATUS_IN_PROGRESS ||
 				status == TRANSACTION_STATUS_SUB_COMMITTED)
 				pagestore_reader_mark_completed(xid, oldest_xid, next_xid, running);
@@ -6166,9 +6172,15 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		XLogFlush(scan_end);
 		pagestore_reader_mark_completions(read_lsn, scan_end, oldest_xid,
 										 next_xid, running);
+		scan_iterations = 0;
 		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
 		{
 			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
 
 			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
 				count++;
@@ -6180,9 +6192,15 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 					 errmsg("automatic reader snapshot is too large")));
 		xids = count > 0 ? palloc_array(TransactionId, count) : NULL;
 		count = 0;
+		scan_iterations = 0;
 		for (xid = oldest_xid; !TransactionIdEquals(xid, next_xid);)
 		{
 			uint32		offset = (uint32) (xid - oldest_xid);
+
+			if ((++scan_iterations & 0xfff) == 0 && ShutdownRequestPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_ADMIN_SHUTDOWN),
+						 errmsg("terminating automatic reader snapshot scan due to administrator command")));
 
 			if ((running[offset / 8] & (1U << (offset % 8))) != 0)
 				xids[count++] = xid;
@@ -6348,6 +6366,12 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("reader manifest publication requires a database superuser backend")));
+	if (!pagestore_branch_backend_active() ||
+		!pagestore_branch_routing_active() ||
+		pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reader manifest publication requires a fully routed writable pagestore compute")));
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
@@ -6407,7 +6431,11 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 				PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) &&
 			existing_resolved == resolved &&
 			memcmp(existing, page, BLCKSZ) == 0)
+		{
+			pagestore_localsvc_store_sync_timeout(
+				PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 			PG_RETURN_LSN((XLogRecPtr) resolved);
+		}
 	}
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
