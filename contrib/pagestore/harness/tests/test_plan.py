@@ -214,10 +214,10 @@ class PlanValidationTests(unittest.TestCase):
         path = self.write_plan([
             self.header(),
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
-            {"op": "reader_base", "id": "base", "target": "writer",
-             "checkpoint": "$R", "name": "C"},
             {"op": "capture", "id": "capture", "target": "writer",
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
             {"op": "prepare_reader", "id": "prepare", "target": "writer",
              "base": "$C", "read_lsn": "$R"},
             {"op": "install_reader", "id": "install", "target": "reader-R",
@@ -267,6 +267,29 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "prepared must be a non-empty string"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+    def test_plan_rejects_artifact_path_escape(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "../R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "name must be a safe path component"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_plan_validates_optional_sql_failure_expectations(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        invalid_actions = [
+            {"op": "sql", "id": "error", "target": "writer", "sql": "SELECT 1",
+             "expect_error": ["bad"]},
+            {"op": "sql", "id": "state", "target": "writer", "sql": "SELECT 1",
+             "expect_sqlstate": "bad"},
+        ]
+        for action in invalid_actions:
+            with self.subTest(action=action["id"]):
+                path = self.write_plan([self.header(), action])
+                with self.assertRaises(MODULE.PlanError):
+                    MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
     def test_writer_runtime_rejects_wrong_boundary_kind(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
@@ -287,10 +310,10 @@ class PlanValidationTests(unittest.TestCase):
         path = self.write_plan([
             self.header(),
             {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
-            {"op": "reader_base", "id": "base", "target": "writer",
-             "checkpoint": "$R1", "name": "C"},
             {"op": "capture", "id": "capture", "target": "writer",
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R1"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R1", "name": "C"},
             {"op": "prepare_reader", "id": "prepare", "target": "writer",
              "base": "$C", "read_lsn": "$R1"},
             {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
@@ -298,6 +321,36 @@ class PlanValidationTests(unittest.TestCase):
              "prepared": "prepare", "read_lsn": "$R2"},
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "does not match prepared artifact horizon"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_writer_runtime_rejects_reader_base_newer_than_horizon(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
+            {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R2", "name": "C"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R1"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "base '\\$C' is newer"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_writer_runtime_rejects_capture_after_writer_mutation(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "sql", "id": "mutate", "target": "writer", "sql": "CREATE TABLE late()"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not describe the current writer"):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
@@ -492,6 +545,8 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual([event["event"] for event in events], [
             "run_start", "process_start", "ready", "capture", "run_pass", "process_stop",
         ])
+        self.assertIn("--page-size", events[1]["argv"])
+        self.assertEqual(events[1]["argv"][events[1]["argv"].index("--page-size") + 1], "8192")
         self.assertFalse((root / "failure.json").exists())
 
     def test_daemon_smoke_retains_failure_bundle(self):

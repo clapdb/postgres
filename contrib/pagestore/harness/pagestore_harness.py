@@ -114,6 +114,13 @@ REQUIRED_FIELDS = {
     "cleanup": {"target"},
 }
 
+SAFE_COMPONENT_FIELDS = {
+    "checkpoint": {"name"},
+    "reader_base": {"name"},
+    "capture": {"name"},
+    "install_reader": {"prepared"},
+}
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -238,10 +245,12 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 )
     if runtime == "writer_smoke":
         available_clients = {"writer"}
-        checkpoints: set[str] = set()
-        reader_bases: set[str] = set()
+        checkpoints: dict[str, int] = {}
+        reader_bases: dict[str, str] = {}
         prepared_readers: dict[str, str] = {}
         reader_seeds: set[str] = set()
+        latest_checkpoint: str | None = None
+        writer_mutated_since_checkpoint = True
         for action in plan.actions:
             if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
                 raise PlanError(
@@ -249,18 +258,22 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"{action['target']!r} is not an available compute"
                 )
             if action["op"] == "checkpoint":
-                checkpoints.add(action["name"])
+                checkpoints[action["name"]] = len(checkpoints)
+                latest_checkpoint = action["name"]
+                writer_mutated_since_checkpoint = False
             elif action["op"] == "reader_base":
                 checkpoint = action["checkpoint"]
                 if not checkpoint.startswith("$") or checkpoint[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} reader_base requires an earlier checkpoint"
                     )
-                reader_bases.add(action["name"])
+                reader_bases[action["name"]] = checkpoint[1:]
+                writer_mutated_since_checkpoint = True
             elif action["op"] == "prepare_reader":
                 base = action["base"]
                 read_lsn = action["read_lsn"]
-                if not base.startswith("$") or base[1:] not in reader_bases:
+                base_checkpoint = reader_bases.get(base[1:]) if base.startswith("$") else None
+                if base_checkpoint is None:
                     raise PlanError(
                         f"runtime {runtime!r} prepare_reader requires an earlier reader_base"
                     )
@@ -268,12 +281,23 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     raise PlanError(
                         f"runtime {runtime!r} prepare_reader requires an earlier checkpoint read_lsn"
                     )
+                if checkpoints[base_checkpoint] > checkpoints[read_lsn[1:]]:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader base {base!r} is newer "
+                        f"than read_lsn {read_lsn!r}"
+                    )
                 prepared_readers[action["id"]] = read_lsn
+                writer_mutated_since_checkpoint = True
             elif action["op"] == "capture":
                 horizon = action["horizon"]
                 if not horizon.startswith("$") or horizon[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} capture requires an earlier checkpoint horizon"
+                    )
+                if horizon != f"${latest_checkpoint}" or writer_mutated_since_checkpoint:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture horizon {horizon!r} does not "
+                        "describe the current writer data directory"
                     )
                 if action["name"] in reader_seeds:
                     raise PlanError(
@@ -309,6 +333,9 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"does not match prepared artifact horizon {prepared_horizon!r}"
                     )
                 available_clients.add(action["target"])
+                writer_mutated_since_checkpoint = True
+            elif action["op"] in ("bootstrap", "sql"):
+                writer_mutated_since_checkpoint = True
 
 
 def validate_runtime_health(
@@ -425,6 +452,13 @@ def require_string(record: dict[str, Any], field: str, context: str) -> str:
     return value
 
 
+def require_safe_component(record: dict[str, Any], field: str, context: str) -> str:
+    value = require_string(record, field, context)
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+        raise PlanError(f"{context}: {field} must be a safe path component")
+    return value
+
+
 def reject_unknown_fields(record: dict[str, Any], allowed: set[str], context: str) -> None:
     unknown = sorted(set(record) - allowed)
     if unknown:
@@ -484,6 +518,7 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
             raise PlanError(f"{action_context}: no schema for operation {operation!r}")
         reject_unknown_fields(action, allowed_fields, action_context)
         action_id = require_string(action, "id", action_context)
+        require_safe_component(action, "id", action_context)
         if action_id in action_ids:
             raise PlanError(f"{action_context}: duplicate action id {action_id!r}")
         action_ids.add(action_id)
@@ -492,6 +527,19 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
         for field in REQUIRED_FIELDS[operation] - {"lanes", "steps"}:
             require_string(action, field, action_context)
+        if "target" in action:
+            require_safe_component(action, "target", action_context)
+        for field in SAFE_COMPONENT_FIELDS.get(operation, set()):
+            require_safe_component(action, field, action_context)
+        if operation == "sql":
+            if "expect_error" in action:
+                require_string(action, "expect_error", action_context)
+            if "expect_sqlstate" in action:
+                sqlstate = require_string(action, "expect_sqlstate", action_context)
+                if re.fullmatch(r"[0-9A-Z]{5}", sqlstate) is None:
+                    raise PlanError(
+                        f"{action_context}: expect_sqlstate must be five characters"
+                    )
         for value in action.values():
             if isinstance(value, str) and value.startswith("$"):
                 boundary = value[1:]
@@ -651,6 +699,8 @@ def run_daemon_smoke(
         generation += 1
         shm_names.append(shm)
         command = [str(daemon), "--shm", shm, "--store", str(store),
+                   "--page-size", str(runtime_capabilities(
+                       capabilities, "daemon_smoke")["page_size"]),
                    "--nshards", str(plan.header["case"]["shards"]),
                    "--storage", plan.header["case"]["storage"]]
         with daemon_log.open("a", encoding="utf-8") as log:
@@ -788,6 +838,8 @@ def run_writer_smoke(
                     shm=shm, postgres_major=postgres_major)
         with (trace / "daemon.log").open("w", encoding="utf-8") as log:
             dproc = subprocess.Popen([str(daemon), "--shm", shm, "--store", str(store),
+                                     "--page-size", str(runtime_capabilities(
+                                         capabilities, "writer_smoke")["page_size"]),
                                      "--nshards", str(plan.header["case"]["shards"]),
                                      "--storage", plan.header["case"]["storage"]], stdout=log,
                                      stderr=subprocess.STDOUT, text=True, env=env)
