@@ -238,6 +238,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 )
     if runtime == "writer_smoke":
         available_clients = {"writer"}
+        checkpoints: set[str] = set()
+        reader_bases: set[str] = set()
         prepared_readers: set[str] = set()
         reader_seeds: set[str] = set()
         for action in plan.actions:
@@ -246,7 +248,35 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"runtime {runtime!r} operation {action['op']!r} target "
                     f"{action['target']!r} is not an available compute"
                 )
-            if action["op"] == "install_reader":
+            if action["op"] == "checkpoint":
+                checkpoints.add(action["name"])
+            elif action["op"] == "reader_base":
+                checkpoint = action["checkpoint"]
+                if not checkpoint.startswith("$") or checkpoint[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base requires an earlier checkpoint"
+                    )
+                reader_bases.add(action["name"])
+            elif action["op"] == "prepare_reader":
+                base = action["base"]
+                read_lsn = action["read_lsn"]
+                if not base.startswith("$") or base[1:] not in reader_bases:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires an earlier reader_base"
+                    )
+                if not read_lsn.startswith("$") or read_lsn[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires an earlier checkpoint read_lsn"
+                    )
+                prepared_readers.add(action["id"])
+            elif action["op"] == "capture":
+                horizon = action["horizon"]
+                if not horizon.startswith("$") or horizon[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture requires an earlier checkpoint horizon"
+                    )
+                reader_seeds.add(action["name"])
+            elif action["op"] == "install_reader":
                 if action["target"] in available_clients:
                     raise PlanError(
                         f"runtime {runtime!r} reader target {action['target']!r} "
@@ -262,11 +292,12 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         "requires an earlier reader_datadir capture"
                     )
+                read_lsn = action["read_lsn"]
+                if not read_lsn.startswith("$") or read_lsn[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader requires an earlier checkpoint read_lsn"
+                    )
                 available_clients.add(action["target"])
-            elif action["op"] == "prepare_reader":
-                prepared_readers.add(action["id"])
-            elif action["op"] == "capture" and action["kind"] == "reader_datadir":
-                reader_seeds.add(action["name"])
 
 
 def validate_runtime_health(
@@ -429,8 +460,8 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
-        if "target" in REQUIRED_FIELDS[operation]:
-            require_string(action, "target", action_context)
+        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps"}:
+            require_string(action, field, action_context)
         for value in action.values():
             if isinstance(value, str) and value.startswith("$"):
                 boundary = value[1:]

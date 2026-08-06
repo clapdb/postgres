@@ -213,12 +213,15 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
             {"op": "capture", "id": "capture", "target": "writer",
-             "kind": "reader_datadir", "name": "reader-R", "horizon": "0/1"},
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
             {"op": "prepare_reader", "id": "prepare", "target": "writer",
-             "base": "0/1", "read_lsn": "0/1"},
+             "base": "$C", "read_lsn": "$R"},
             {"op": "install_reader", "id": "install", "target": "reader-R",
-             "prepared": "prepare", "read_lsn": "0/1"},
+             "prepared": "prepare", "read_lsn": "$R"},
             {"op": "sql", "id": "read", "target": "reader-R", "sql": "SELECT 1"},
         ])
         MODULE.validate_runtime_plan(
@@ -253,6 +256,31 @@ class PlanValidationTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "target must be a non-empty string"):
             MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_plan_rejects_non_string_artifact_identifier(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": ["prepare"], "read_lsn": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "prepared must be a non-empty string"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_writer_runtime_rejects_wrong_boundary_kind(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$C"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "capture requires an earlier checkpoint horizon"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
 
     def test_inspection_schema_version_must_match_capabilities(self):
         directory = tempfile.TemporaryDirectory()
