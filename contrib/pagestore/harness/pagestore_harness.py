@@ -240,7 +240,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         available_clients = {"writer"}
         checkpoints: set[str] = set()
         reader_bases: set[str] = set()
-        prepared_readers: set[str] = set()
+        prepared_readers: dict[str, str] = {}
         reader_seeds: set[str] = set()
         for action in plan.actions:
             if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
@@ -268,12 +268,17 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     raise PlanError(
                         f"runtime {runtime!r} prepare_reader requires an earlier checkpoint read_lsn"
                     )
-                prepared_readers.add(action["id"])
+                prepared_readers[action["id"]] = read_lsn
             elif action["op"] == "capture":
                 horizon = action["horizon"]
                 if not horizon.startswith("$") or horizon[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} capture requires an earlier checkpoint horizon"
+                    )
+                if action["name"] in reader_seeds:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_datadir capture name "
+                        f"{action['name']!r} is already used"
                     )
                 reader_seeds.add(action["name"])
             elif action["op"] == "install_reader":
@@ -282,7 +287,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         "is already installed"
                     )
-                if action["prepared"] not in prepared_readers:
+                prepared_horizon = prepared_readers.get(action["prepared"])
+                if prepared_horizon is None:
                     raise PlanError(
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         f"requires prepared artifact {action['prepared']!r}"
@@ -296,6 +302,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 if not read_lsn.startswith("$") or read_lsn[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} install_reader requires an earlier checkpoint read_lsn"
+                    )
+                if read_lsn != prepared_horizon:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader read_lsn {read_lsn!r} "
+                        f"does not match prepared artifact horizon {prepared_horizon!r}"
                     )
                 available_clients.add(action["target"])
 
@@ -374,6 +385,25 @@ def validate_postgres_block_size(build: Path, expected: int) -> int:
             f"page size {expected}"
         )
     return block_size
+
+
+def validate_postgres_relation_segment_size(build: Path, page_size: int) -> int:
+    config_header = build / "src" / "include" / "pg_config.h"
+    try:
+        config = config_header.read_text(encoding="utf-8")
+    except OSError as error:
+        raise PlanError(f"cannot read PostgreSQL configuration {config_header}: {error}") from error
+    match = re.search(r"^#define\s+RELSEG_SIZE\s+(\d+)\s*$", config, re.MULTILINE)
+    if match is None:
+        raise PlanError(f"cannot identify PostgreSQL relation segment size in {config_header}")
+    segment_blocks = int(match.group(1))
+    expected_blocks = (1024 * 1024 * 1024) // page_size
+    if segment_blocks != expected_blocks:
+        raise PlanError(
+            f"PostgreSQL relation segment size {segment_blocks} blocks does not match "
+            f"pagestore importer assumption {expected_blocks} blocks"
+        )
+    return segment_blocks
 
 
 def probe_runtime_inspection(
@@ -732,6 +762,10 @@ def run_writer_smoke(
     pg_bin = find_pg_bin(build)
     postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
     validate_postgres_block_size(
+        build,
+        runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+    )
+    validate_postgres_relation_segment_size(
         build,
         runtime_capabilities(capabilities, "writer_smoke")["page_size"],
     )

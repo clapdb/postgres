@@ -282,6 +282,41 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
 
+    def test_writer_runtime_requires_install_horizon_to_match_prepared_reader(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R1", "name": "C"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R1"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R1"},
+            {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "$R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not match prepared artifact horizon"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_writer_runtime_rejects_duplicate_reader_capture_name(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "capture", "id": "capture-1", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+            {"op": "capture", "id": "capture-2", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "capture name 'reader-R' is already used"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
     def test_inspection_schema_version_must_match_capabilities(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -375,6 +410,27 @@ class PlanValidationTests(unittest.TestCase):
         config_header.parent.mkdir(parents=True)
         config_header.write_text("#define BLCKSZ 8192\n", encoding="utf-8")
         self.assertEqual(MODULE.validate_postgres_block_size(build, 8192), 8192)
+
+    def test_postgres_relation_segment_size_must_match_importer(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        build = Path(directory.name)
+        config_header = build / "src" / "include" / "pg_config.h"
+        config_header.parent.mkdir(parents=True)
+        config_header.write_text("#define RELSEG_SIZE 65536\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.PlanError, "65536 blocks.*131072 blocks"):
+            MODULE.validate_postgres_relation_segment_size(build, 8192)
+
+    def test_postgres_relation_segment_size_accepts_one_gibibyte(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        build = Path(directory.name)
+        config_header = build / "src" / "include" / "pg_config.h"
+        config_header.parent.mkdir(parents=True)
+        config_header.write_text("#define RELSEG_SIZE 131072\n", encoding="utf-8")
+        self.assertEqual(
+            MODULE.validate_postgres_relation_segment_size(build, 8192), 131072
+        )
 
     def test_postgres_preflight_runs_before_creating_the_run_root(self):
         directory = tempfile.TemporaryDirectory()
