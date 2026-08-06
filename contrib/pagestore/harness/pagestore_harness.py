@@ -189,6 +189,24 @@ RUNTIME_OPERATIONS = {
     },
 }
 
+RUNTIME_CONSTRAINTS = {
+    "daemon_smoke": {
+        "crash": {
+            "target": ["store"], "model": ["power_loss"],
+            "forbidden_fields": ["fault"],
+        },
+    },
+    "writer_smoke": {
+        "checkpoint": {"target": ["writer"]},
+        "prepare_reader": {"target": ["writer"]},
+        "reader_base": {"target": ["writer"]},
+        "bootstrap": {"target": ["writer"]},
+        "install_reader": {"forbidden_values": {"target": ["writer"]}},
+        "assert": {"oracle": ["sql_scalar"]},
+        "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+    },
+}
+
 
 def pagestore_import_command(
     importer: Path, shm: str, data: Path, page_size: int,
@@ -218,9 +236,13 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         raise PlanError(
             f"runtime {runtime!r} cannot execute operation(s): {', '.join(unsupported)}"
         )
-    constraints = profile.get("constraints", {})
-    if not isinstance(constraints, dict):
-        raise PlanError(f"capabilities: runtime {runtime!r} has invalid constraints")
+    constraints = profile.get("constraints")
+    expected_constraints = RUNTIME_CONSTRAINTS.get(runtime)
+    if not isinstance(constraints, dict) or constraints != expected_constraints:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} constraints do not match "
+            "runner implementation"
+        )
     for action in plan.actions:
         operation_constraints = constraints.get(action["op"], {})
         if not isinstance(operation_constraints, dict):
@@ -268,7 +290,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 )
     if runtime == "writer_smoke":
         available_clients = {"writer"}
-        checkpoints: dict[str, int] = {}
+        checkpoints: dict[str, tuple[int, bool]] = {}
         reader_bases: dict[str, str] = {}
         prepared_readers: dict[str, str] = {}
         reader_seeds: dict[str, str] = {}
@@ -282,7 +304,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"{action['target']!r} is not an available compute"
                 )
             if action["op"] == "checkpoint":
-                checkpoints[action["name"]] = len(checkpoints)
+                checkpoints[action["name"]] = (len(checkpoints), bootstrapped)
                 latest_checkpoint = action["name"]
                 writer_mutated_since_checkpoint = False
             elif action["op"] == "reader_base":
@@ -290,6 +312,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 if not checkpoint.startswith("$") or checkpoint[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} reader_base requires an earlier checkpoint"
+                    )
+                if not checkpoints[checkpoint[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base requires bootstrap before "
+                        f"checkpoint {checkpoint!r}"
                     )
                 reader_bases[action["name"]] = checkpoint[1:]
                 writer_mutated_since_checkpoint = True
@@ -305,7 +332,12 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     raise PlanError(
                         f"runtime {runtime!r} prepare_reader requires an earlier checkpoint read_lsn"
                     )
-                if checkpoints[base_checkpoint] > checkpoints[read_lsn[1:]]:
+                if not checkpoints[read_lsn[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires bootstrap before "
+                        f"checkpoint {read_lsn!r}"
+                    )
+                if checkpoints[base_checkpoint][0] > checkpoints[read_lsn[1:]][0]:
                     raise PlanError(
                         f"runtime {runtime!r} prepare_reader base {base!r} is newer "
                         f"than read_lsn {read_lsn!r}"
@@ -317,6 +349,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 if not horizon.startswith("$") or horizon[1:] not in checkpoints:
                     raise PlanError(
                         f"runtime {runtime!r} capture requires an earlier checkpoint horizon"
+                    )
+                if not checkpoints[horizon[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture requires bootstrap before "
+                        f"checkpoint {horizon!r}"
                     )
                 if horizon != f"${latest_checkpoint}" or writer_mutated_since_checkpoint:
                     raise PlanError(
@@ -426,6 +463,15 @@ def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> i
     if major not in capability_values(capabilities, "postgres_major"):
         raise PlanError(f"PostgreSQL runtime major {major} is not advertised as supported")
     return major
+
+
+def pagestore_build_program(build: Path, name: str) -> Path:
+    program = build / "contrib" / "pagestore" / name
+    if not program.is_file() or not os.access(program, os.X_OK):
+        raise PlanError(
+            f"PostgreSQL build {build} does not provide executable {name!r}"
+        )
+    return program
 
 
 def postgres_runtime_settings(major: int) -> str:
@@ -856,6 +902,9 @@ def run_writer_smoke(
         build,
         runtime_capabilities(capabilities, "writer_smoke")["page_size"],
     )
+    control_restore = None
+    if any(action["op"] == "install_reader" for action in plan.actions):
+        control_restore = pagestore_build_program(build, "pagestore_control_restore")
     root, temporary = run_root(requested_root)
     trace, store, data, tablespace, sockdir = (root / "trace", root / "store", root / "computes" / "writer",
                                                 root / "tablespace", root / "socket")
@@ -976,8 +1025,8 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 reader_socket.mkdir(parents=True)
                 shutil.copytree(seed, reader_data)
                 lsn = checkpoints[ref[1:]]["redo_lsn"]
-                restore = daemon.parent / "pagestore_control_restore"
-                subprocess.run([str(restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                assert control_restore is not None
+                subprocess.run([str(control_restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
                 setup = """CREATE OR REPLACE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;"""
                 subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)

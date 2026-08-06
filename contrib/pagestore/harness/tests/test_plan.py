@@ -200,7 +200,16 @@ class PlanValidationTests(unittest.TestCase):
             self.header(),
             {"op": "crash", "id": "crash", "target": "writer", "model": "power_loss"},
         ])
-        with self.assertRaisesRegex(MODULE.PlanError, "forbids target='writer'"):
+        with self.assertRaisesRegex(MODULE.PlanError, "constraints do not match"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "daemon_smoke"
+            )
+
+    def test_runtime_rejects_missing_code_owned_constraints(self):
+        capabilities = json.loads(json.dumps(CAPABILITIES))
+        capabilities["runtimes"]["daemon_smoke"]["constraints"] = {}
+        path = self.write_plan([self.header()])
+        with self.assertRaisesRegex(MODULE.PlanError, "constraints do not match"):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "daemon_smoke"
             )
@@ -265,6 +274,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
             {"op": "assert", "id": "side-effect", "target": "writer",
              "oracle": "sql_scalar", "sql": "SELECT nextval('s')", "expect": "1"},
@@ -342,6 +352,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
             {"op": "reader_base", "id": "base", "target": "writer",
              "checkpoint": "$R", "name": "C"},
@@ -357,6 +368,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
             {"op": "capture", "id": "capture", "target": "writer",
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R1"},
@@ -408,10 +420,49 @@ class PlanValidationTests(unittest.TestCase):
             {"op": "install_reader", "id": "install", "target": "reader-R",
              "prepared": "prepare", "read_lsn": "$R"},
         ])
-        with self.assertRaisesRegex(MODULE.PlanError, "requires an earlier bootstrap"):
+        with self.assertRaisesRegex(MODULE.PlanError, "bootstrap before checkpoint"):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
+
+    def test_writer_runtime_requires_bootstrap_before_reader_checkpoint(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R"},
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "bootstrap before checkpoint"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_control_restore_is_selected_from_postgres_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            program = build / "contrib" / "pagestore" / "pagestore_control_restore"
+            program.parent.mkdir(parents=True)
+            program.write_text("#!/bin/sh\n", encoding="utf-8")
+            program.chmod(0o755)
+            self.assertEqual(
+                MODULE.pagestore_build_program(build, "pagestore_control_restore"),
+                program,
+            )
+
+    def test_missing_build_control_restore_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(MODULE.PlanError, "does not provide executable"):
+                MODULE.pagestore_build_program(
+                    Path(temporary), "pagestore_control_restore"
+                )
 
     def test_importer_command_passes_runtime_page_size(self):
         command = MODULE.pagestore_import_command(
@@ -423,6 +474,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
             {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
             {"op": "reader_base", "id": "base", "target": "writer",
@@ -439,6 +491,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
             {"op": "sql", "id": "mutate", "target": "writer", "sql": "CREATE TABLE late()"},
             {"op": "capture", "id": "capture", "target": "writer",
@@ -453,6 +506,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
             {"op": "capture", "id": "capture-1", "target": "writer",
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
