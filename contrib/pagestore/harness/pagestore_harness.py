@@ -181,6 +181,24 @@ def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str
     return runtimes[runtime]
 
 
+RUNTIME_OPERATIONS = {
+    "daemon_smoke": {"crash"},
+    "writer_smoke": {
+        "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
+        "install_reader", "assert", "capture",
+    },
+}
+
+
+def pagestore_import_command(
+    importer: Path, shm: str, data: Path, page_size: int,
+) -> list[str]:
+    return [
+        str(importer), "--shm", shm, "--pgdata", str(data),
+        "--page-size", str(page_size),
+    ]
+
+
 def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
     profile = runtime_capabilities(capabilities, runtime)
     for field in ("protocol_version", "page_size", "io_unit"):
@@ -190,6 +208,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
     operations = profile.get("operations")
     if not isinstance(operations, list) or not all(isinstance(op, str) for op in operations):
         raise PlanError(f"capabilities: runtime {runtime!r} has an invalid operations list")
+    implemented = RUNTIME_OPERATIONS.get(runtime)
+    if implemented is None or set(operations) != implemented:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} operations do not match runner implementation"
+        )
     unsupported = sorted({action["op"] for action in plan.actions} - set(operations))
     if unsupported:
         raise PlanError(
@@ -248,9 +271,10 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         checkpoints: dict[str, int] = {}
         reader_bases: dict[str, str] = {}
         prepared_readers: dict[str, str] = {}
-        reader_seeds: set[str] = set()
+        reader_seeds: dict[str, str] = {}
         latest_checkpoint: str | None = None
         writer_mutated_since_checkpoint = True
+        bootstrapped = False
         for action in plan.actions:
             if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
                 raise PlanError(
@@ -304,7 +328,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader_datadir capture name "
                         f"{action['name']!r} is already used"
                     )
-                reader_seeds.add(action["name"])
+                reader_seeds[action["name"]] = horizon
             elif action["op"] == "install_reader":
                 if action["target"] in available_clients:
                     raise PlanError(
@@ -317,7 +341,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         f"requires prepared artifact {action['prepared']!r}"
                     )
-                if action["target"] not in reader_seeds:
+                seed_horizon = reader_seeds.get(action["target"])
+                if seed_horizon is None:
                     raise PlanError(
                         f"runtime {runtime!r} reader target {action['target']!r} "
                         "requires an earlier reader_datadir capture"
@@ -332,9 +357,21 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} install_reader read_lsn {read_lsn!r} "
                         f"does not match prepared artifact horizon {prepared_horizon!r}"
                     )
+                if read_lsn != seed_horizon:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader read_lsn {read_lsn!r} "
+                        f"does not match reader seed horizon {seed_horizon!r}"
+                    )
+                if not bootstrapped:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader requires an earlier bootstrap"
+                    )
                 available_clients.add(action["target"])
                 writer_mutated_since_checkpoint = True
-            elif action["op"] in ("bootstrap", "sql"):
+            elif action["op"] == "bootstrap":
+                bootstrapped = True
+                writer_mutated_since_checkpoint = True
+            elif action["op"] in ("sql", "assert") and action["target"] == "writer":
                 writer_mutated_since_checkpoint = True
 
 
@@ -918,7 +955,10 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
             elif action["op"] == "bootstrap":
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 importer = daemon.parent / "pagestore_import"
-                subprocess.run([str(importer), "--shm", shm, "--pgdata", str(data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                subprocess.run(pagestore_import_command(
+                    importer, shm, data,
+                    runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+                ), check=True, capture_output=True, encoding="utf-8", env=env)
                 (data / "postgresql.conf").open("a", encoding="utf-8").write("pagestore.route_all = on\n")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 events.emit("bootstrap", id=action["id"], target="writer", route_all=True)

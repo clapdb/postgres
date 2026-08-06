@@ -161,6 +161,15 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "cannot execute operation.*sql"):
             MODULE.validate_runtime_plan(plan, CAPABILITIES, "daemon_smoke")
 
+    def test_runtime_rejects_profile_operation_not_implemented_by_runner(self):
+        capabilities = json.loads(json.dumps(CAPABILITIES))
+        capabilities["runtimes"]["daemon_smoke"]["operations"].append("sql")
+        path = self.write_plan([self.header()])
+        with self.assertRaisesRegex(MODULE.PlanError, "do not match runner implementation"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "daemon_smoke"
+            )
+
     def test_runtime_rejects_unsupported_operation_parameters(self):
         path = self.write_plan([
             self.header(),
@@ -213,6 +222,7 @@ class PlanValidationTests(unittest.TestCase):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
             self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
             {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
             {"op": "capture", "id": "capture", "target": "writer",
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
@@ -227,6 +237,44 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_runtime_plan(
             MODULE.read_plan(path), capabilities, "writer_smoke"
         )
+
+    def test_reader_sql_does_not_dirty_writer_capture(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
+            {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
+            {"op": "capture", "id": "capture-1", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R1", "horizon": "$R1"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R1", "name": "C"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R1"},
+            {"op": "install_reader", "id": "install", "target": "reader-R1",
+             "prepared": "prepare", "read_lsn": "$R1"},
+            {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
+            {"op": "sql", "id": "reader-sql", "target": "reader-R1", "sql": "SELECT 1"},
+            {"op": "capture", "id": "capture-2", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R2", "horizon": "$R2"},
+        ])
+        MODULE.validate_runtime_plan(
+            MODULE.read_plan(path), capabilities, "writer_smoke"
+        )
+
+    def test_writer_assert_dirties_checkpoint_capture(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "assert", "id": "side-effect", "target": "writer",
+             "oracle": "sql_scalar", "sql": "SELECT nextval('s')", "expect": "1"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not describe the current writer"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
 
     def test_runtime_requires_page_size_capability(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
@@ -324,6 +372,52 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
+
+    def test_writer_runtime_requires_install_horizon_to_match_reader_seed(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
+            {"op": "checkpoint", "id": "checkpoint-1", "target": "writer", "name": "R1"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R1"},
+            {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R1", "name": "C"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R2"},
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "$R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "does not match reader seed horizon"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_writer_runtime_requires_bootstrap_before_reader_install(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            self.header(),
+            {"op": "checkpoint", "id": "checkpoint", "target": "writer", "name": "R"},
+            {"op": "capture", "id": "capture", "target": "writer",
+             "kind": "reader_datadir", "name": "reader-R", "horizon": "$R"},
+            {"op": "reader_base", "id": "base", "target": "writer",
+             "checkpoint": "$R", "name": "C"},
+            {"op": "prepare_reader", "id": "prepare", "target": "writer",
+             "base": "$C", "read_lsn": "$R"},
+            {"op": "install_reader", "id": "install", "target": "reader-R",
+             "prepared": "prepare", "read_lsn": "$R"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "requires an earlier bootstrap"):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "writer_smoke"
+            )
+
+    def test_importer_command_passes_runtime_page_size(self):
+        command = MODULE.pagestore_import_command(
+            Path("/build/pagestore_import"), "/harness", Path("/data"), 16384,
+        )
+        self.assertEqual(command[-2:], ["--page-size", "16384"])
 
     def test_writer_runtime_rejects_reader_base_newer_than_horizon(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
