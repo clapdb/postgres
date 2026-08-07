@@ -531,9 +531,10 @@ advancing durable horizon.
 
 ## Implementation sequence
 
-0. [partial] Define the read-only test IPC schema and capability manifest.
-   The schema is versioned and pure runner tests cover basic parsing; validating
-   advertised executable capabilities against each runtime is still future work.
+0. [implemented] Define the read-only test IPC schema and capability manifest.
+   The schema is versioned, pure runner tests cover parsing, and each executable
+   runner validates its supported operations and observed daemon protocol,
+   page/I/O dimensions, shard count, and inspection operations before execution.
 1. [partial] Add the Python coordinator with private environments, lifecycle
    management, JSONL validation/event logging, and diagnostic failure bundles.
    Current automated smoke coverage includes daemon readiness and the writer

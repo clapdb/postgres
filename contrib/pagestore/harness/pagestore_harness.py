@@ -114,6 +114,13 @@ REQUIRED_FIELDS = {
     "cleanup": {"target"},
 }
 
+SAFE_COMPONENT_FIELDS = {
+    "checkpoint": {"name"},
+    "reader_base": {"name"},
+    "capture": {"name"},
+    "install_reader": {"prepared"},
+}
+
 
 @dataclass(frozen=True)
 class Plan:
@@ -153,6 +160,44 @@ def read_plan(path: Path) -> Plan:
     return Plan(path=path, header=records[0], actions=tuple(records[1:]))
 
 
+def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str, Any]:
+    schema = read_json(path)
+    if schema.get("schema") != capabilities.get("inspection_schema"):
+        raise PlanError(f"{path}: inspection schema version does not match capabilities")
+    advertised = capability_values(capabilities, "inspection_operations")
+    if advertised != INSPECTION_OPERATIONS:
+        raise PlanError(
+            "capabilities: inspection operations do not match runner implementation"
+        )
+    implemented = schema.get("implemented_operations")
+    if (
+        not isinstance(implemented, list)
+        or not all(isinstance(operation, str) for operation in implemented)
+        or len(implemented) != len(set(implemented))
+        or set(implemented) != INSPECTION_OPERATIONS
+    ):
+        raise PlanError(
+            f"{path}: implemented inspection operations do not match runner implementation"
+        )
+    operations = schema.get("operations")
+    if not isinstance(operations, dict):
+        raise PlanError(f"{path}: inspection operations must be an object")
+    for operation, expected_response in sorted(INSPECTION_RESPONSES.items()):
+        definition = operations.get(operation)
+        response = definition.get("response") if isinstance(definition, dict) else None
+        if (
+            not isinstance(response, list)
+            or not all(isinstance(field, str) and field for field in response)
+            or len(response) != len(set(response))
+            or set(response) != expected_response
+        ):
+            raise PlanError(
+                f"{path}: inspection operation {operation!r} response fields "
+                "do not match runner implementation"
+            )
+    return schema
+
+
 def capability_values(capabilities: dict[str, Any], name: str) -> set[Any]:
     values = capabilities.get(name)
     if not isinstance(values, list) or not values:
@@ -160,10 +205,394 @@ def capability_values(capabilities: dict[str, Any], name: str) -> set[Any]:
     return set(values)
 
 
+def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str, Any]:
+    runtimes = capabilities.get("runtimes")
+    if not isinstance(runtimes, dict) or not isinstance(runtimes.get(runtime), dict):
+        raise PlanError(f"capabilities: missing runtime profile {runtime!r}")
+    return runtimes[runtime]
+
+
+INSPECTION_RESPONSES = {
+    "health": {
+        "protocol_version", "page_size", "io_unit", "nchannels", "nshards",
+        "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn",
+    },
+    "backpressure": {"idle", "claimed", "request", "done", "shards"},
+}
+INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
+PG_CONTROL_FILE_SIZE = 8192
+
+
+RUNTIME_OPERATIONS = {
+    "daemon_smoke": {"crash"},
+    "writer_smoke": {
+        "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
+        "install_reader", "assert", "capture",
+    },
+}
+
+RUNTIME_CONSTRAINTS = {
+    "daemon_smoke": {
+        "crash": {
+            "target": ["store"], "model": ["power_loss"],
+            "forbidden_fields": ["fault"],
+        },
+    },
+    "writer_smoke": {
+        "checkpoint": {"target": ["writer"]},
+        "prepare_reader": {"target": ["writer"]},
+        "reader_base": {"target": ["writer"]},
+        "bootstrap": {"target": ["writer"]},
+        "install_reader": {"forbidden_values": {"target": ["writer"]}},
+        "assert": {"oracle": ["sql_scalar"]},
+        "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+    },
+}
+
+
+def pagestore_import_command(
+    importer: Path, shm: str, data: Path, page_size: int,
+) -> list[str]:
+    return [
+        str(importer), "--shm", shm, "--pgdata", str(data),
+        "--page-size", str(page_size),
+    ]
+
+
+def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
+    profile = runtime_capabilities(capabilities, runtime)
+    for field in ("protocol_version", "page_size", "io_unit"):
+        value = profile.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise PlanError(f"capabilities: runtime {runtime!r} has invalid {field}")
+    if profile["page_size"] > profile["io_unit"]:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} page_size exceeds io_unit"
+        )
+    operations = profile.get("operations")
+    if not isinstance(operations, list) or not all(isinstance(op, str) for op in operations):
+        raise PlanError(f"capabilities: runtime {runtime!r} has an invalid operations list")
+    implemented = RUNTIME_OPERATIONS.get(runtime)
+    if implemented is None or set(operations) != implemented:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} operations do not match runner implementation"
+        )
+    unsupported = sorted({action["op"] for action in plan.actions} - set(operations))
+    if unsupported:
+        raise PlanError(
+            f"runtime {runtime!r} cannot execute operation(s): {', '.join(unsupported)}"
+        )
+    constraints = profile.get("constraints")
+    expected_constraints = RUNTIME_CONSTRAINTS.get(runtime)
+    if not isinstance(constraints, dict) or constraints != expected_constraints:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} constraints do not match "
+            "runner implementation"
+        )
+    for action in plan.actions:
+        operation_constraints = constraints.get(action["op"], {})
+        if not isinstance(operation_constraints, dict):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid {action['op']!r} constraints"
+            )
+        forbidden = operation_constraints.get("forbidden_fields", [])
+        if not isinstance(forbidden, list) or not all(isinstance(field, str) for field in forbidden):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid forbidden_fields"
+            )
+        present = sorted(set(action) & set(forbidden))
+        if present:
+            raise PlanError(
+                f"runtime {runtime!r} operation {action['op']!r} does not support "
+                f"field(s): {', '.join(present)}"
+            )
+        forbidden_values = operation_constraints.get("forbidden_values", {})
+        if not isinstance(forbidden_values, dict):
+            raise PlanError(
+                f"capabilities: runtime {runtime!r} has invalid forbidden_values"
+            )
+        for field, values in forbidden_values.items():
+            if not isinstance(values, list) or not values:
+                raise PlanError(
+                    f"capabilities: runtime {runtime!r} has invalid forbidden values "
+                    f"for {field!r}"
+                )
+            if action.get(field) in values:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} forbids "
+                    f"{field}={action.get(field)!r}"
+                )
+        for field, allowed in operation_constraints.items():
+            if field in ("forbidden_fields", "forbidden_values"):
+                continue
+            if not isinstance(allowed, list) or not allowed:
+                raise PlanError(
+                    f"capabilities: runtime {runtime!r} has invalid constraint {field!r}"
+                )
+            if action.get(field) not in allowed:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} does not support "
+                    f"{field}={action.get(field)!r}"
+                )
+    if runtime == "writer_smoke":
+        available_clients = {"writer"}
+        checkpoints: dict[str, tuple[int, bool]] = {}
+        reader_bases: dict[str, str] = {}
+        prepared_readers: dict[str, str] = {}
+        reader_seeds: dict[str, str] = {}
+        latest_checkpoint: str | None = None
+        writer_mutated_since_checkpoint = True
+        bootstrapped = False
+        for action in plan.actions:
+            if action["op"] in ("sql", "assert") and action["target"] not in available_clients:
+                raise PlanError(
+                    f"runtime {runtime!r} operation {action['op']!r} target "
+                    f"{action['target']!r} is not an available compute"
+                )
+            if action["op"] == "checkpoint":
+                checkpoints[action["name"]] = (len(checkpoints), bootstrapped)
+                latest_checkpoint = action["name"]
+                writer_mutated_since_checkpoint = False
+            elif action["op"] == "reader_base":
+                checkpoint = action["checkpoint"]
+                if not checkpoint.startswith("$") or checkpoint[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base requires an earlier checkpoint"
+                    )
+                if not checkpoints[checkpoint[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base requires bootstrap before "
+                        f"checkpoint {checkpoint!r}"
+                    )
+                if (
+                    checkpoint != f"${latest_checkpoint}"
+                    or writer_mutated_since_checkpoint
+                ):
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base checkpoint {checkpoint!r} "
+                        "does not describe the current unmodified writer"
+                    )
+                reader_bases[action["name"]] = checkpoint[1:]
+                writer_mutated_since_checkpoint = True
+            elif action["op"] == "prepare_reader":
+                base = action["base"]
+                read_lsn = action["read_lsn"]
+                base_checkpoint = reader_bases.get(base[1:]) if base.startswith("$") else None
+                if base_checkpoint is None:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires an earlier reader_base"
+                    )
+                if not read_lsn.startswith("$") or read_lsn[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires an earlier checkpoint read_lsn"
+                    )
+                if not checkpoints[read_lsn[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader requires bootstrap before "
+                        f"checkpoint {read_lsn!r}"
+                    )
+                if checkpoints[base_checkpoint][0] > checkpoints[read_lsn[1:]][0]:
+                    raise PlanError(
+                        f"runtime {runtime!r} prepare_reader base {base!r} is newer "
+                        f"than read_lsn {read_lsn!r}"
+                    )
+                prepared_readers[action["id"]] = read_lsn
+                writer_mutated_since_checkpoint = True
+            elif action["op"] == "capture":
+                horizon = action["horizon"]
+                if not horizon.startswith("$") or horizon[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture requires an earlier checkpoint horizon"
+                    )
+                if not checkpoints[horizon[1:]][1]:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture requires bootstrap before "
+                        f"checkpoint {horizon!r}"
+                    )
+                if horizon != f"${latest_checkpoint}" or writer_mutated_since_checkpoint:
+                    raise PlanError(
+                        f"runtime {runtime!r} capture horizon {horizon!r} does not "
+                        "describe the current writer data directory"
+                    )
+                if action["name"] in reader_seeds:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_datadir capture name "
+                        f"{action['name']!r} is already used"
+                    )
+                reader_seeds[action["name"]] = horizon
+            elif action["op"] == "install_reader":
+                if action["target"] in available_clients:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        "is already installed"
+                    )
+                prepared_horizon = prepared_readers.get(action["prepared"])
+                if prepared_horizon is None:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        f"requires prepared artifact {action['prepared']!r}"
+                    )
+                seed_horizon = reader_seeds.get(action["target"])
+                if seed_horizon is None:
+                    raise PlanError(
+                        f"runtime {runtime!r} reader target {action['target']!r} "
+                        "requires an earlier reader_datadir capture"
+                    )
+                read_lsn = action["read_lsn"]
+                if not read_lsn.startswith("$") or read_lsn[1:] not in checkpoints:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader requires an earlier checkpoint read_lsn"
+                    )
+                if read_lsn != prepared_horizon:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader read_lsn {read_lsn!r} "
+                        f"does not match prepared artifact horizon {prepared_horizon!r}"
+                    )
+                if read_lsn != seed_horizon:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader read_lsn {read_lsn!r} "
+                        f"does not match reader seed horizon {seed_horizon!r}"
+                    )
+                if not bootstrapped:
+                    raise PlanError(
+                        f"runtime {runtime!r} install_reader requires an earlier bootstrap"
+                    )
+                available_clients.add(action["target"])
+                writer_mutated_since_checkpoint = True
+            elif action["op"] == "bootstrap":
+                bootstrapped = True
+                writer_mutated_since_checkpoint = True
+            elif action["op"] in ("sql", "assert") and action["target"] == "writer":
+                writer_mutated_since_checkpoint = True
+
+
+def validate_runtime_health(
+    plan: Plan,
+    capabilities: dict[str, Any],
+    runtime: str,
+    health: dict[str, Any],
+    inspection_schema: dict[str, Any],
+) -> None:
+    profile = runtime_capabilities(capabilities, runtime)
+    for field in ("protocol_version", "page_size", "io_unit"):
+        expected = profile.get(field)
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+            raise PlanError(f"capabilities: runtime {runtime!r} has invalid {field}")
+        if health.get(field) != expected:
+            raise PlanError(
+                f"runtime {runtime!r} {field} mismatch: advertised {expected}, "
+                f"observed {health.get(field)!r}"
+            )
+    expected_shards = plan.header["case"]["shards"]
+    if health.get("nshards") != expected_shards:
+        raise PlanError(
+            f"runtime {runtime!r} shard mismatch: plan requires {expected_shards}, "
+            f"observed {health.get('nshards')!r}"
+        )
+    implemented = inspection_schema.get("implemented_operations")
+    if not isinstance(implemented, list):
+        raise PlanError("inspection schema: implemented_operations must be a list")
+    missing = sorted(capability_values(capabilities, "inspection_operations") - set(implemented))
+    if missing:
+        raise PlanError(
+            f"runtime {runtime!r} lacks advertised inspection operation(s): {', '.join(missing)}"
+        )
+
+
+def validate_postgres_runtime(postgres: Path, capabilities: dict[str, Any]) -> int:
+    try:
+        result = subprocess.run(
+            [str(postgres), "--version"], capture_output=True, check=False,
+            encoding="utf-8", env=private_environment(),
+        )
+    except OSError as error:
+        raise PlanError(f"cannot run PostgreSQL binary {postgres}: {error}") from error
+    match = re.search(r"PostgreSQL\)?\s+(\d+)", result.stdout)
+    if result.returncode != 0 or match is None:
+        raise PlanError(
+            f"cannot identify PostgreSQL runtime {postgres}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    major = int(match.group(1))
+    if major not in capability_values(capabilities, "postgres_major"):
+        raise PlanError(f"PostgreSQL runtime major {major} is not advertised as supported")
+    return major
+
+
+def pagestore_build_program(build: Path, name: str) -> Path:
+    program = build / "contrib" / "pagestore" / name
+    if not program.is_file() or not os.access(program, os.X_OK):
+        raise PlanError(
+            f"PostgreSQL build {build} does not provide executable {name!r}"
+        )
+    return program
+
+
+def postgres_runtime_settings(major: int) -> str:
+    """Settings whose availability differs across supported PostgreSQL releases."""
+    return "io_method = sync\n" if major >= 18 else ""
+
+
+def validate_postgres_block_size(build: Path, expected: int) -> int:
+    config_header = build / "src" / "include" / "pg_config.h"
+    try:
+        config = config_header.read_text(encoding="utf-8")
+    except OSError as error:
+        raise PlanError(f"cannot read PostgreSQL configuration {config_header}: {error}") from error
+    match = re.search(r"^#define\s+BLCKSZ\s+(\d+)\s*$", config, re.MULTILINE)
+    if match is None:
+        raise PlanError(f"cannot identify PostgreSQL block size in {config_header}")
+    block_size = int(match.group(1))
+    if block_size != expected:
+        raise PlanError(
+            f"PostgreSQL block size {block_size} does not match advertised runtime "
+            f"page size {expected}"
+        )
+    return block_size
+
+
+def validate_postgres_relation_segment_size(build: Path, page_size: int) -> int:
+    config_header = build / "src" / "include" / "pg_config.h"
+    try:
+        config = config_header.read_text(encoding="utf-8")
+    except OSError as error:
+        raise PlanError(f"cannot read PostgreSQL configuration {config_header}: {error}") from error
+    match = re.search(r"^#define\s+RELSEG_SIZE\s+(\d+)\s*$", config, re.MULTILINE)
+    if match is None:
+        raise PlanError(f"cannot identify PostgreSQL relation segment size in {config_header}")
+    segment_blocks = int(match.group(1))
+    expected_blocks = (1024 * 1024 * 1024) // page_size
+    if segment_blocks != expected_blocks:
+        raise PlanError(
+            f"PostgreSQL relation segment size {segment_blocks} blocks does not match "
+            f"pagestore importer assumption {expected_blocks} blocks"
+        )
+    return segment_blocks
+
+
+def probe_runtime_inspection(
+    inspector: Path, shm: str, capabilities: dict[str, Any],
+    inspection_schema: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    observations = {}
+    for operation in sorted(capability_values(capabilities, "inspection_operations")):
+        observations[operation] = inspect_store(
+            inspector, shm, operation, inspection_schema
+        )
+    return observations
+
+
 def require_string(record: dict[str, Any], field: str, context: str) -> str:
     value = record.get(field)
     if not isinstance(value, str) or not value:
         raise PlanError(f"{context}: {field} must be a non-empty string")
+    return value
+
+
+def require_safe_component(record: dict[str, Any], field: str, context: str) -> str:
+    value = require_string(record, field, context)
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
+        raise PlanError(f"{context}: {field} must be a safe path component")
     return value
 
 
@@ -226,12 +655,30 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
             raise PlanError(f"{action_context}: no schema for operation {operation!r}")
         reject_unknown_fields(action, allowed_fields, action_context)
         action_id = require_string(action, "id", action_context)
+        require_safe_component(action, "id", action_context)
         if action_id in action_ids:
             raise PlanError(f"{action_context}: duplicate action id {action_id!r}")
         action_ids.add(action_id)
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
+        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect"}:
+            require_string(action, field, action_context)
+        if operation == "assert" and not isinstance(action["expect"], str):
+            raise PlanError(f"{action_context}: expect must be a string")
+        if "target" in action:
+            require_safe_component(action, "target", action_context)
+        for field in SAFE_COMPONENT_FIELDS.get(operation, set()):
+            require_safe_component(action, field, action_context)
+        if operation == "sql":
+            if "expect_error" in action:
+                require_string(action, "expect_error", action_context)
+            if "expect_sqlstate" in action:
+                sqlstate = require_string(action, "expect_sqlstate", action_context)
+                if re.fullmatch(r"[0-9A-Z]{5}", sqlstate) is None:
+                    raise PlanError(
+                        f"{action_context}: expect_sqlstate must be five characters"
+                    )
         for value in action.values():
             if isinstance(value, str) and value.startswith("$"):
                 boundary = value[1:]
@@ -354,6 +801,7 @@ def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) ->
 
 def run_daemon_smoke(
     plan: Plan,
+    capabilities: dict[str, Any],
     inspection_schema: dict[str, Any],
     daemon: Path,
     inspector: Path,
@@ -390,7 +838,10 @@ def run_daemon_smoke(
         generation += 1
         shm_names.append(shm)
         command = [str(daemon), "--shm", shm, "--store", str(store),
-                   "--nshards", str(plan.header["case"]["shards"])]
+                   "--page-size", str(runtime_capabilities(
+                       capabilities, "daemon_smoke")["page_size"]),
+                   "--nshards", str(plan.header["case"]["shards"]),
+                   "--storage", plan.header["case"]["storage"]]
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
@@ -411,6 +862,10 @@ def run_daemon_smoke(
                 if time.monotonic() >= deadline:
                     raise PlanError(f"daemon did not become ready: {error}") from error
                 time.sleep(0.05)
+        validate_runtime_health(
+            plan, capabilities, "daemon_smoke", health, inspection_schema
+        )
+        probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         events.emit("ready", target="store", health=health, action_id=action_id)
         return daemon_process
 
@@ -487,9 +942,35 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector: Path,
-                     build: Path, requested_root: Path | None, keep: bool) -> Path:
+def run_writer_smoke(
+    plan: Plan, capabilities: dict[str, Any], schema: dict[str, Any],
+    daemon: Path, inspector: Path, build: Path, requested_root: Path | None,
+    keep: bool,
+) -> Path:
     """Start a real localsvc writer and execute SQL/checkpoint plan actions."""
+    pg_bin = find_pg_bin(build)
+    postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
+    validate_postgres_block_size(
+        build,
+        runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+    )
+    if any(action["op"] == "bootstrap" for action in plan.actions):
+        validate_postgres_relation_segment_size(
+            build,
+            runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+        )
+    if (
+        any(action["op"] == "install_reader" for action in plan.actions)
+        and runtime_capabilities(capabilities, "writer_smoke")["page_size"]
+        < PG_CONTROL_FILE_SIZE
+    ):
+        raise PlanError(
+            "writer runtime page size cannot hold a PostgreSQL control file "
+            "required for reader installation"
+        )
+    control_restore = None
+    if any(action["op"] == "install_reader" for action in plan.actions):
+        control_restore = pagestore_build_program(build, "pagestore_control_restore")
     root, temporary = run_root(requested_root)
     trace, store, data, tablespace, sockdir = (root / "trace", root / "store", root / "computes" / "writer",
                                                 root / "tablespace", root / "socket")
@@ -499,15 +980,20 @@ def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector
     shutil.copy2(plan.path, root / "plan.jsonl")
     (root / "case.json").write_text(json.dumps(plan.header["case"], indent=2) + "\n", encoding="utf-8")
     events, shm = EventLog(trace / "events.jsonl"), f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
-    pg_bin, port = find_pg_bin(build), free_port()
+    port = free_port()
     env = private_environment()
     install = pg_bin.parent
     env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
     dproc = None
     try:
-        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"], shm=shm)
+        events.emit("run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
+                    shm=shm, postgres_major=postgres_major)
         with (trace / "daemon.log").open("w", encoding="utf-8") as log:
-            dproc = subprocess.Popen([str(daemon), "--shm", shm, "--store", str(store)], stdout=log,
+            dproc = subprocess.Popen([str(daemon), "--shm", shm, "--store", str(store),
+                                     "--page-size", str(runtime_capabilities(
+                                         capabilities, "writer_smoke")["page_size"]),
+                                     "--nshards", str(plan.header["case"]["shards"]),
+                                     "--storage", plan.header["case"]["storage"]], stdout=log,
                                      stderr=subprocess.STDOUT, text=True, env=env)
         deadline = time.monotonic() + 10
         while True:
@@ -520,18 +1006,31 @@ def run_writer_smoke(plan: Plan, schema: dict[str, Any], daemon: Path, inspector
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(.05)
+        validate_runtime_health(plan, capabilities, "writer_smoke", health, schema)
+        probe_runtime_inspection(inspector, shm, capabilities, schema)
         subprocess.run([str(pg_bin / "initdb"), "-D", str(data), "-U", "postgres", "-A", "trust"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         (data / "postgresql.conf").open("a", encoding="utf-8").write(
             f"shared_preload_libraries = 'pagestore'\npagestore.backend = 'localsvc'\n"
             f"pagestore.localsvc_shm = '{shm}'\npagestore.route_user_tablespaces = on\n"
             "pagestore.slru_mirror = on\n"
-            "io_method = sync\n"
+            f"{postgres_runtime_settings(postgres_major)}"
             "max_prepared_transactions = 10\n"
             f"listen_addresses = ''\nunix_socket_directories = '{sockdir}'\nport = {port}\n")
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         events.emit("ready", target="writer", health=health, port=port)
+        if any(action["op"] == "reader_base" for action in plan.actions):
+            setup = (
+                "CREATE OR REPLACE FUNCTION "
+                "pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void "
+                "AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
+            )
+            subprocess.run(
+                [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
+                 "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup],
+                check=True, capture_output=True, encoding="utf-8", env=env,
+            )
         checkpoints: dict[str, dict[str, str]] = {}
         reader_bases: dict[str, str] = {}
         prepared_readers: dict[str, Path] = {}
@@ -576,13 +1075,14 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 if not isinstance(ref, str) or not ref.startswith("$") or ref[1:] not in checkpoints:
                     raise PlanError(f"reader_base {action['id']} requires a completed checkpoint reference")
                 base = checkpoints[ref[1:]]["redo_lsn"]
-                setup = "CREATE OR REPLACE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
-                subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
                 sql = "; ".join(f"SELECT pagestore_ship_slru_snapshot('{name}', '{base}')" for name in ("pg_xact", "pg_commit_ts", "pg_multixact/offsets", "pg_multixact/members"))
             elif action["op"] == "bootstrap":
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 importer = daemon.parent / "pagestore_import"
-                subprocess.run([str(importer), "--shm", shm, "--pgdata", str(data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                subprocess.run(pagestore_import_command(
+                    importer, shm, data,
+                    runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+                ), check=True, capture_output=True, encoding="utf-8", env=env)
                 (data / "postgresql.conf").open("a", encoding="utf-8").write("pagestore.route_all = on\n")
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 events.emit("bootstrap", id=action["id"], target="writer", route_all=True)
@@ -600,8 +1100,8 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 reader_socket.mkdir(parents=True)
                 shutil.copytree(seed, reader_data)
                 lsn = checkpoints[ref[1:]]["redo_lsn"]
-                restore = daemon.parent / "pagestore_control_restore"
-                subprocess.run([str(restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                assert control_restore is not None
+                subprocess.run([str(control_restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
                 setup = """CREATE OR REPLACE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;"""
                 subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
@@ -754,27 +1254,26 @@ def main(argv: list[str] | None = None) -> int:
             if args.inspect not in capability_values(capabilities, "inspection_operations"):
                 raise PlanError(f"capabilities: inspection operation {args.inspect!r} is unavailable")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
-            schema = read_json(schema_path)
-            if schema.get("schema") != capabilities.get("inspection_schema"):
-                raise PlanError(f"{schema_path}: inspection schema version does not match capabilities")
+            schema = read_inspection_schema(schema_path, capabilities)
             print(json.dumps(inspect_store(args.inspect_binary, args.shm, args.inspect, schema), sort_keys=True))
             return 0
         if args.daemon_smoke:
             plan = read_plan(args.daemon_smoke)
             validate_plan(plan, capabilities)
+            validate_runtime_plan(plan, capabilities, "daemon_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
-            schema = read_json(schema_path)
-            if schema.get("schema") != capabilities.get("inspection_schema"):
-                raise PlanError(f"{schema_path}: inspection schema version does not match capabilities")
-            root = run_daemon_smoke(plan, schema, args.daemon_binary,
+            schema = read_inspection_schema(schema_path, capabilities)
+            root = run_daemon_smoke(plan, capabilities, schema, args.daemon_binary,
                                     args.inspect_binary, args.run_root, args.keep)
             if args.keep or args.run_root:
                 print(root)
             return 0
         if args.writer_smoke:
             plan = read_plan(args.writer_smoke); validate_plan(plan, capabilities)
-            schema = read_json(args.inspection_schema or args.capabilities.with_name("inspection_schema.json"))
-            root = run_writer_smoke(plan, schema, args.daemon_binary, args.inspect_binary,
+            validate_runtime_plan(plan, capabilities, "writer_smoke")
+            schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
+            schema = read_inspection_schema(schema_path, capabilities)
+            root = run_writer_smoke(plan, capabilities, schema, args.daemon_binary, args.inspect_binary,
                                     args.build_dir, args.run_root, args.keep)
             if args.keep or args.run_root: print(root)
             return 0
