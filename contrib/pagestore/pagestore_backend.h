@@ -160,6 +160,7 @@ extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
 extern void pagestore_localsvc_walidx_add(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn);
+extern uint64 pagestore_localsvc_wal_end(void);
 extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,

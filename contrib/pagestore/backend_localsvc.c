@@ -1049,6 +1049,18 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 	ls_exec(ch);
 }
 
+/* End of the WAL prefix durably shipped for this compute's timeline. */
+uint64
+pagestore_localsvc_wal_end(void)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->timeline = (uint32) localsvc_timeline;
+	ch->opcode = PS_OP_WAL_SIZE;
+	ls_exec(ch);
+	return ch->req_lsn;
+}
+
 /*
  * Read up to 'len' bytes of shipped WAL starting at 'start_lsn' from a SPECIFIC
  * timeline's log on the store (not necessarily this backend's).  Used to serve a

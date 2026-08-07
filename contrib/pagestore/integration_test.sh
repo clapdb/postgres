@@ -121,6 +121,7 @@ pagestore.localsvc_shm = '$SHM'
 pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
+pagestore.auto_wal_index = on
 io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
@@ -202,16 +203,39 @@ $P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
         AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null
 $P -c "CREATE FUNCTION pagestore_walidx_count(regclass,int,int) RETURNS int
         AS 'pagestore','pagestore_walidx_count' LANGUAGE C STRICT;" >/dev/null
-# write a fresh table and decode just-written WAL (still present in pg_wal)
-lsn0=$($P -c "SELECT pg_current_wal_lsn();")
+# Write a fresh table and complete its WAL segment.  The background worker must
+# advance from the store's durable index boundary without an SQL trigger.
 $P -c "CREATE TABLE widx(id int) TABLESPACE ts; INSERT INTO widx SELECT generate_series(1,1000);" >/dev/null
-lsn1=$($P -c "SELECT pg_current_wal_lsn();")
-$P -c "SELECT pagestore_index_wal('$lsn0', '$lsn1');" >/dev/null
-widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
+$P -c "SELECT pg_switch_wal();" >/dev/null
+widx=0
+for i in $(seq 1 200); do
+	widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
+	[ "${widx:-0}" -gt 0 ] && break
+	sleep 0.1
+done
 if [ "${widx:-0}" -gt 0 ]; then
-	echo "ok   - per-page WAL index built by decoding WAL (widx block 0 has $widx records)"
+	echo "ok   - background worker indexed shipped WAL (widx block 0 has $widx records)"
 else
-	echo "FAIL - per-page WAL index empty for widx block 0 (got '$widx')"
+	echo "FAIL - background WAL index remained empty for widx block 0 (got '$widx')"
+	fail=1
+fi
+
+# Restart PostgreSQL while retaining daemon state, then require the worker to
+# resume after the durable progress marker and index a newly shipped segment.
+"$BIN/pg_ctl" -D "$DATA" -w restart >/dev/null 2>&1
+$P -c "CREATE TABLE widx_resume(id int) TABLESPACE ts;
+       INSERT INTO widx_resume SELECT generate_series(1,1000);
+       SELECT pg_switch_wal();" >/dev/null
+widx_resume=0
+for i in $(seq 1 200); do
+	widx_resume=$($P -c "SELECT pagestore_walidx_count('widx_resume', 0, 0);")
+	[ "${widx_resume:-0}" -gt 0 ] && break
+	sleep 0.1
+done
+if [ "${widx_resume:-0}" -gt 0 ]; then
+	echo "ok   - background WAL index resumed from durable progress after restart"
+else
+	echo "FAIL - background WAL index did not resume after restart"
 	fail=1
 fi
 
