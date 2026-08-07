@@ -568,6 +568,7 @@ main(int argc, char **argv)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	daemon_hdr = hdr;
+	ps_core_set_metrics_header(hdr);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

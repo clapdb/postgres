@@ -22,7 +22,7 @@
       "response": ["retained_horizons", "queue_length", "completed_phase"]
     },
     "backpressure": {
-      "response": ["idle", "claimed", "request", "done", "shards"]
+      "response": ["idle", "claimed", "request", "done", "shards", "wal_index_pending_bytes", "wal_index_lagging_timelines"]
     }
   }
 }

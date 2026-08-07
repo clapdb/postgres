@@ -52,7 +52,7 @@ print_health(PsShmHeader *hdr)
 }
 
 static void
-print_backpressure(void *shm, const PsShmHeader *hdr)
+print_backpressure(void *shm, PsShmHeader *hdr)
 {
 	uint32_t idle = 0;
 	uint32_t claimed = 0;
@@ -82,8 +82,11 @@ print_backpressure(void *shm, const PsShmHeader *hdr)
 		}
 	}
 	printf("{\"idle\":%u,\"claimed\":%u,\"request\":%u,"
-		   "\"done\":%u,\"shards\":%u}\n",
-		   idle, claimed, request, done, hdr->nshards);
+		   "\"done\":%u,\"shards\":%u,\"wal_index_pending_bytes\":%llu,"
+		   "\"wal_index_lagging_timelines\":%u}\n",
+		   idle, claimed, request, done, hdr->nshards,
+		   (unsigned long long) ps_load_acquire_u64(&hdr->wal_index_pending_bytes),
+		   ps_load_acquire(&hdr->wal_index_lagging_timelines));
 }
 
 int

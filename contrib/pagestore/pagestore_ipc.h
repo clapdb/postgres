@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		23	/* 23: WAL_INDEX_ADD_BATCH opcode added;
+#define PS_SHM_VERSION		24	/* 24: WAL-index lag metrics added;
+								 * 23: WAL_INDEX_ADD_BATCH opcode added;
 								 * 22: TIMELINE_INFO opcode added;
 								 * 21: READER_SNAPSHOT object class added;
 								 * 20: WAL_INDEX_PROGRESS opcode added;
@@ -255,6 +256,9 @@ typedef struct PsShmHeader
 	uint64_t	admission_fence_epoch; /* monotonically identifies gate attempts */
 	uint64_t	admission_pending_epoch; /* 0, or the currently active gate */
 	uint64_t	admission_pending_lsn; /* relation mutations <= this LSN defer */
+	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
+	uint32_t	wal_index_lagging_timelines;
+	uint32_t	pad2;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

@@ -72,6 +72,11 @@ read pages at an LSN.
          in shard-local batches so backlog replay does not pay one IPC round trip
          per touched block.  The SQL function remains available for targeted
          tests.  No daemon-side WAL parser is written.
+         The read-only `backpressure` inspection reports aggregate
+         `wal_index_pending_bytes` and `wal_index_lagging_timelines`.  Pending
+         bytes are the shipped-end minus the durable record-aligned scan
+         boundary; after a segment switch this can include zero padding until a
+         later segment supplies the next valid record.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it
