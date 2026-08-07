@@ -182,17 +182,18 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
     operations = schema.get("operations")
     if not isinstance(operations, dict):
         raise PlanError(f"{path}: inspection operations must be an object")
-    for operation in sorted(INSPECTION_OPERATIONS):
+    for operation, expected_response in sorted(INSPECTION_RESPONSES.items()):
         definition = operations.get(operation)
         response = definition.get("response") if isinstance(definition, dict) else None
         if (
             not isinstance(response, list)
-            or not response
             or not all(isinstance(field, str) and field for field in response)
             or len(response) != len(set(response))
+            or set(response) != expected_response
         ):
             raise PlanError(
-                f"{path}: inspection operation {operation!r} has an invalid response"
+                f"{path}: inspection operation {operation!r} response fields "
+                "do not match runner implementation"
             )
     return schema
 
@@ -211,7 +212,15 @@ def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str
     return runtimes[runtime]
 
 
-INSPECTION_OPERATIONS = {"health", "backpressure"}
+INSPECTION_RESPONSES = {
+    "health": {
+        "protocol_version", "page_size", "io_unit", "nchannels", "nshards",
+        "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn",
+    },
+    "backpressure": {"idle", "claimed", "request", "done", "shards"},
+}
+INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
+PG_CONTROL_FILE_SIZE = 8192
 
 
 RUNTIME_OPERATIONS = {
@@ -256,6 +265,10 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         value = profile.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise PlanError(f"capabilities: runtime {runtime!r} has invalid {field}")
+    if profile["page_size"] > profile["io_unit"]:
+        raise PlanError(
+            f"capabilities: runtime {runtime!r} page_size exceeds io_unit"
+        )
     operations = profile.get("operations")
     if not isinstance(operations, list) or not all(isinstance(op, str) for op in operations):
         raise PlanError(f"capabilities: runtime {runtime!r} has an invalid operations list")
@@ -641,8 +654,10 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
-        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps"}:
+        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect"}:
             require_string(action, field, action_context)
+        if operation == "assert" and not isinstance(action["expect"], str):
+            raise PlanError(f"{action_context}: expect must be a string")
         if "target" in action:
             require_safe_component(action, "target", action_context)
         for field in SAFE_COMPONENT_FIELDS.get(operation, set()):
@@ -935,6 +950,15 @@ def run_writer_smoke(
         validate_postgres_relation_segment_size(
             build,
             runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+        )
+    if (
+        any(action["op"] == "install_reader" for action in plan.actions)
+        and runtime_capabilities(capabilities, "writer_smoke")["page_size"]
+        < PG_CONTROL_FILE_SIZE
+    ):
+        raise PlanError(
+            "writer runtime page size cannot hold a PostgreSQL control file "
+            "required for reader installation"
         )
     control_restore = None
     if any(action["op"] == "install_reader" for action in plan.actions):

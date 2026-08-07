@@ -552,8 +552,37 @@ class PlanValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "schema.json"
             path.write_text(json.dumps(schema), encoding="utf-8")
-            with self.assertRaisesRegex(MODULE.PlanError, "backpressure.*invalid response"):
+            with self.assertRaisesRegex(MODULE.PlanError, "backpressure.*do not match runner"):
                 MODULE.read_inspection_schema(path, capabilities)
+
+    def test_inspection_response_fields_must_match_runner(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        schema["operations"]["health"]["response"] = ["protocol_version"]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schema.json"
+            path.write_text(json.dumps(schema), encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.PlanError, "health.*do not match runner"):
+                MODULE.read_inspection_schema(path, capabilities)
+
+    def test_runtime_rejects_page_size_larger_than_io_unit(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        capabilities["runtimes"]["daemon_smoke"]["page_size"] = 524288
+        plan = MODULE.read_plan(self.write_plan([self.header()]))
+        with self.assertRaisesRegex(MODULE.PlanError, "page_size exceeds io_unit"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_smoke")
+
+    def test_sql_scalar_assert_accepts_an_empty_expected_value(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        plan = MODULE.read_plan(self.write_plan([
+            self.header(),
+            {
+                "op": "assert", "id": "empty", "target": "writer",
+                "oracle": "sql_scalar", "sql": "SELECT NULL", "expect": "",
+            },
+        ]))
+        MODULE.validate_plan(plan, capabilities)
+        MODULE.validate_runtime_plan(plan, capabilities, "writer_smoke")
 
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
@@ -710,6 +739,32 @@ class PlanValidationTests(unittest.TestCase):
                         )
                 self.assertEqual(relation_geometry.call_count, expected_calls)
                 create_root.assert_called_once()
+
+    def test_small_page_reader_is_rejected_before_creating_run_root(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        capabilities["runtimes"]["writer_smoke"]["page_size"] = 4096
+        plan = MODULE.read_plan(self.write_plan([
+            self.header(),
+            {
+                "op": "install_reader", "id": "install", "target": "reader-R",
+                "prepared": "prepare", "read_lsn": "0/1",
+            },
+        ]))
+        with (
+            mock.patch.object(MODULE, "find_pg_bin", return_value=Path("/pg/bin")),
+            mock.patch.object(MODULE, "validate_postgres_runtime", return_value=19),
+            mock.patch.object(MODULE, "validate_postgres_block_size", return_value=4096),
+            mock.patch.object(MODULE, "run_root") as create_root,
+            mock.patch.object(MODULE, "pagestore_build_program") as build_program,
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "cannot hold.*control file"):
+                MODULE.run_writer_smoke(
+                    plan, capabilities,
+                    MODULE.read_json(ROOT / "inspection_schema.json"),
+                    Path("daemon"), Path("inspect"), Path("build"), None, False,
+                )
+        create_root.assert_not_called()
+        build_program.assert_not_called()
 
     def test_daemon_smoke_retains_a_replayable_run_root(self):
         directory = tempfile.TemporaryDirectory()
