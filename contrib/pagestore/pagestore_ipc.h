@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		24	/* 24: WAL-index lag metrics added;
+#define PS_SHM_VERSION		25	/* 25: WAL_INDEX_GET cursor pagination;
+								 * 24: WAL-index lag metrics added;
 								 * 23: WAL_INDEX_ADD_BATCH opcode added;
 								 * 22: TIMELINE_INFO opcode added;
 								 * 21: READER_SNAPSHOT object class added;
@@ -210,14 +211,14 @@ typedef struct PsChannel
 	uint32_t	is_redo;
 	uint32_t	skip_fsync;
 	uint32_t	blocknum;
-	uint32_t	nblocks;
+	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
 	uint32_t	old_nblocks;
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
-	uint32_t	parent_timeline;	/* CREATE_BRANCH: parent timeline */
+	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor timeline */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
-	uint32_t	pad1;
+	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
-	uint64_t	req_seq;		/* read admission cap; write result sequence */
+	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
 	PsKey		key;
 
 	/* result */

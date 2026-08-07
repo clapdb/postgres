@@ -989,8 +989,9 @@ op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
 static int
-op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
-			  uint64_t lsn_max, PsWalRec *out)
+op_walidx_get_after(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					uint64_t lsn_max, int have_cursor, uint64_t cursor_lsn,
+					uint32_t cursor_timeline, uint32_t max_out, PsWalRec *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	int			n;
@@ -999,10 +1000,21 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
+	ch->nblocks = max_out;
 	ch->req_lsn = lsn_max;
+	ch->pad1 = have_cursor;
+	ch->req_seq = cursor_lsn;
+	ch->parent_timeline = cursor_timeline;
 	n = (int) cl_exec()->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
+}
+
+static int
+op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+			  uint64_t lsn_max, PsWalRec *out)
+{
+	return op_walidx_get_after(tl, rel, fork, block, lsn_max, 0, 0, 0, 0, out);
 }
 
 static int
@@ -3051,6 +3063,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
 	check(n == 2 && out[0].lsn == 100 && out[1].lsn == 200,
 		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
+	n = op_walidx_get_after(0, REL_A, FORK0, 0, 1000000, 0, 0, 0, 1, out);
+	check(n == 1 && out[0].lsn == 100,
+		  "index query honors a caller-requested page size");
+	n = op_walidx_get_after(0, REL_A, FORK0, 0, 1000000, 1, 100, 0, 0, out);
+	check(n == 2 && out[0].lsn == 200 && out[1].lsn == 300,
+		  "index cursor returns only records after the (LSN,timeline) boundary");
 	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
 	check(n == 3 && out[2].lsn == 300, "index returns all records up to a high lsn");
 	check(out[0].timeline == 0 && out[2].timeline == 0,

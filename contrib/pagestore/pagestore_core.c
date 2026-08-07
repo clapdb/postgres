@@ -3211,18 +3211,23 @@ walidx_progress_read(uint32_t tl)
 static int
 walrec_cmp(const void *a, const void *b)
 {
-	uint64_t	la = ((const PsWalRec *) a)->lsn;
-	uint64_t	lb = ((const PsWalRec *) b)->lsn;
+	const PsWalRec *ra = (const PsWalRec *) a;
+	const PsWalRec *rb = (const PsWalRec *) b;
 
-	return (la > lb) - (la < lb);
+	if (ra->lsn != rb->lsn)
+		return (ra->lsn > rb->lsn) - (ra->lsn < rb->lsn);
+	return (ra->timeline > rb->timeline) - (ra->timeline < rb->timeline);
 }
 
 static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
+		   int have_cursor, uint64_t cursor_lsn, uint32_t cursor_timeline,
 		   PsWalRec *out, int max_out)
 {
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
-	int			got = 0;
+	PsWalRec  *all = NULL;
+	int			nall = 0;
+	int			cap = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
 
 	do
@@ -3237,13 +3242,30 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
-				/* tag each record with the timeline it lives on (w.tl) */
-				for (int i = 0; i < e->n && got < max_out; i++)
+				/* tag each durably published record with its source timeline */
+				for (int i = 0; i < e->n; i++)
 					if (e->lsns[i] <= w.lsn && e->lsns[i] < visible_end)
 					{
-						out[got].lsn = e->lsns[i];
-						out[got].timeline = w.tl;
-						got++;
+						if (have_cursor &&
+							(e->lsns[i] < cursor_lsn ||
+							 (e->lsns[i] == cursor_lsn && w.tl <= cursor_timeline)))
+							continue;
+						if (nall == cap)
+						{
+							PsWalRec   *grown;
+
+							cap = cap ? cap * 2 : 64;
+							grown = realloc(all, (size_t) cap * sizeof(*all));
+							if (grown == NULL)
+							{
+								free(all);
+								return -1;
+							}
+							all = grown;
+						}
+						all[nall].lsn = e->lsns[i];
+						all[nall].timeline = w.tl;
+						nall++;
 					}
 				break;
 			}
@@ -3251,8 +3273,13 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 
 	/* gathered newest-timeline-first across the ancestry; redo (and the base
 	 * search) need them in ascending LSN order */
-	qsort(out, (size_t) got, sizeof(PsWalRec), walrec_cmp);
-	return got;
+	qsort(all, (size_t) nall, sizeof(PsWalRec), walrec_cmp);
+	if (nall > max_out)
+		nall = max_out;
+	if (nall > 0)
+		memcpy(out, all, (size_t) nall * sizeof(*out));
+	free(all);
+	return nall;
 }
 
 /* ===================== write / read primitives ========================= */
@@ -4491,9 +4518,21 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_INDEX_GET:
-			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
-											   ch->req_lsn, (PsWalRec *) ch->data,
-											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
+			{
+				int max_out = (int) (PS_IO_UNIT / sizeof(PsWalRec));
+				int n;
+
+				if (ch->nblocks > 0 && ch->nblocks < (uint32_t) max_out)
+					max_out = (int) ch->nblocks;
+				n = walidx_get(tl, &ch->key, ch->blocknum, ch->req_lsn,
+								   ch->pad1 != 0, ch->req_seq, ch->parent_timeline,
+								   (PsWalRec *) ch->data, max_out);
+
+				if (n < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = (uint32_t) n;
+			}
 			break;
 
 		case PS_OP_WAL_INDEX_PROGRESS:

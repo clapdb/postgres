@@ -1222,35 +1222,54 @@ pagestore_localsvc_walidx_add_batch(const PageStoreWalIndexEntry *entries,
 int
 pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsWalRec  *recs;
+	int			n = pagestore_localsvc_walidx_get(key, block, PG_UINT64_MAX, &recs);
 
-	ls_fill_key(ch, key);
-	ch->opcode = PS_OP_WAL_INDEX_GET;
-	ch->blocknum = block;
-	ch->req_lsn = PG_UINT64_MAX;	/* all records */
-	ls_exec(ch);
-	return (int) ch->result;
+	pfree(recs);
+	return n;
 }
 
-/* Fetch up to maxn record LSNs (<= lsn_max) for (key, block) into out;
- * returns how many.  Ascending order. */
+/* Fetch every record LSN <= lsn_max in ascending (LSN,timeline) order. */
 int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
-							  uint64 lsn_max, PsWalRec *out, int maxn)
+							  uint64 lsn_max, PsWalRec **out)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
-	int			n;
+	const int	batch_max = PS_IO_UNIT / sizeof(PsWalRec);
+	PsWalRec  *result = palloc(sizeof(*result));
+	int			nresult = 0;
 
-	ls_fill_key(ch, key);
-	ch->opcode = PS_OP_WAL_INDEX_GET;
-	ch->blocknum = block;
-	ch->req_lsn = lsn_max;
-	ls_exec(ch);
-	n = (int) ch->result;
-	if (n > maxn)
-		n = maxn;
-	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
-	return n;
+	for (;;)
+	{
+		PsChannel  *ch = ls_chan_for_key(key);
+		int			n;
+
+		ls_fill_key(ch, key);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = block;
+		ch->nblocks = batch_max;
+		ch->req_lsn = lsn_max;
+		ch->pad1 = 0;
+		ch->req_seq = 0;
+		ch->parent_timeline = 0;
+		if (nresult > 0)
+		{
+			ch->pad1 = 1;
+			ch->req_seq = result[nresult - 1].lsn;
+			ch->parent_timeline = result[nresult - 1].timeline;
+		}
+		ls_exec(ch);
+		n = (int) ch->result;
+		if (n > 0)
+		{
+			result = repalloc(result, (size_t) (nresult + n) * sizeof(*result));
+			memcpy(&result[nresult], ch->data, (size_t) n * sizeof(*result));
+			nresult += n;
+		}
+		if (n < batch_max)
+			break;
+	}
+	*out = result;
+	return nresult;
 }
 
 uint64

@@ -101,10 +101,9 @@ read pages at an LSN.
          is enabled -- a no-local-WAL compute (a fresh branch) must set that
          GUC or local-timeline deltas fail to replay.  The integration test
          proves the materialized page contains a change that the base image
-         alone lacks.  Caveats: a page with
-         PS_REDO_MAX_RECS (4096) or more indexed records at/below the target
-         LSN fails closed (the capped index result would otherwise be treated as
-         complete), and when the last write is inherited from an ancestor
+         alone lacks.  WAL-index reads use cursor pagination, so redo is not
+         capped by the shared-memory mailbox payload.  When the last write is
+         inherited from an ancestor
          timeline the truncate-liveness check fails closed (a truncate on the
          reading branch after the fork is not visible to the ancestor-WAL
          scan).
