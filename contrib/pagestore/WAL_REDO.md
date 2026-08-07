@@ -103,10 +103,9 @@ read pages at an LSN.
          proves the materialized page contains a change that the base image
          alone lacks.  WAL-index reads use cursor pagination, so redo is not
          capped by the shared-memory mailbox payload.  When the last write is
-         inherited from an ancestor
-         timeline the truncate-liveness check fails closed (a truncate on the
-         reading branch after the fork is not visible to the ancestor-WAL
-         scan).
+         inherited from an ancestor timeline is checked against the current
+         branch's store-backed WAL stream, whose read-through includes both
+         the ancestor history and branch-local truncates.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no

@@ -1307,12 +1307,13 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
  */
 static uint32 ps_redo_cur_timeline;		/* timeline of the record being read */
 static uint32 ps_redo_local_timeline;	/* this compute's own timeline */
+static bool ps_redo_liveness_from_store;	/* branch-aware truncate scan */
 
 static int
 ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 				  XLogRecPtr targetRecPtr, char *readBuf)
 {
-	if (pagestore_redo_wal_from_store ||
+	if (pagestore_redo_wal_from_store || ps_redo_liveness_from_store ||
 		ps_redo_cur_timeline != ps_redo_local_timeline)
 	{
 		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
@@ -1328,7 +1329,7 @@ ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 }
 
 /*
- * Liveness: scan local WAL in (from_lsn, to_lsn] for an smgr truncate of
+ * Liveness: scan the branch WAL stream in (from_lsn, to_lsn] for an smgr truncate of
  * (rloc, forknum) down to <= block.  If found, the block was truncated away after
  * its last write and not re-extended, so it is not live as of to_lsn and must not
  * be materialized.  Only the main fork is checked -- the truncate record carries
@@ -1520,39 +1521,25 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		RedoBlockLiveness liveness;
 
 		/*
-		 * The truncate scan walks the WAL after the block's last write.  Read it
-		 * from that record's source timeline (an ancestor in cross-branch redo)
-		 * and from the store when store-backed -- so DON'T force local/off here, or
-		 * a no-local-WAL (store-backed) compute would skip the truncate check.
-		 * Invalidate the reader's page cache first since the timeline may differ
-		 * from the record loop above.  (A scan range that itself crosses a branch
-		 * point spans timelines and is a known limitation.)
+		 * The truncate scan walks the WAL after the block's last write.  Force the
+		 * current branch's store-backed stream: it performs the ancestry walk when
+		 * the range crosses a fork, and also works on a compute with no local WAL.
+		 * Invalidate the reader's page cache first since the source timeline may
+		 * differ from the record loop above.
 		 */
 		/*
-		 * Fail closed when the last write is inherited from an ancestor
-		 * timeline: the truncate scan below covers only that ancestor's WAL,
-		 * but a relation truncate on THIS branch after the fork adds no
-		 * per-page index entry, so it would be invisible to the scan and a
-		 * stale ancestor FPI could be returned for a block the branch
-		 * already truncated away.  Proving liveness across the fork needs a
-		 * two-leg scan (ancestor to the fork point, then this timeline);
-		 * until that exists, cross-timeline liveness is unprovable here.
+		 * Read the current branch's WAL from the store.  Its WAL read-through
+		 * walks ancestors below each fork point, so this single scan covers an
+		 * ancestor last-write and a branch-local truncate in the same history.
 		 */
-		if (recs[n - 1].timeline != pagestore_localsvc_timeline())
-		{
-			XLogReaderFree(reader);
-			pfree(pd);
-			pfree(recs);
-			pfree(base);
-			pfree(page);
-			PG_RETURN_NULL();
-		}
-
-		ps_redo_cur_timeline = recs[n - 1].timeline;
+		ps_redo_liveness_from_store =
+			recs[n - 1].timeline != pagestore_localsvc_timeline();
+		ps_redo_cur_timeline = pagestore_localsvc_timeline();
 		reader->readLen = 0;
 		liveness = redo_block_truncated_away(reader, rloc, forknum,
 											 (BlockNumber) blocknum,
 											 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		ps_redo_liveness_from_store = false;
 		/*
 		 * Fail closed unless the scan proved the block live: a confirmed truncate
 		 * and an incomplete scan (the WAL could not be read through lsn) both mean
