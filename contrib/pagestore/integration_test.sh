@@ -208,7 +208,10 @@ $P -c "CREATE FUNCTION pagestore_walidx_count(regclass,int,int) RETURNS int
 $P -c "CREATE TABLE widx(id int) TABLESPACE ts; INSERT INTO widx SELECT generate_series(1,1000);" >/dev/null
 $P -c "SELECT pg_switch_wal();" >/dev/null
 widx=0
-for i in $(seq 1 200); do
+# Earlier sections intentionally leave about 50 MB of shipped WAL ahead of
+# this table.  Keep the wait bounded, but allow a slow CI runner to decode that
+# backlog through the current per-block index IPC path.
+for i in $(seq 1 600); do
 	widx=$($P -c "SELECT pagestore_walidx_count('widx', 0, 0);")
 	[ "${widx:-0}" -gt 0 ] && break
 	sleep 0.1
@@ -227,7 +230,7 @@ $P -c "CREATE TABLE widx_resume(id int) TABLESPACE ts;
        INSERT INTO widx_resume SELECT generate_series(1,1000);
        SELECT pg_switch_wal();" >/dev/null
 widx_resume=0
-for i in $(seq 1 200); do
+for i in $(seq 1 600); do
 	widx_resume=$($P -c "SELECT pagestore_walidx_count('widx_resume', 0, 0);")
 	[ "${widx_resume:-0}" -gt 0 ] && break
 	sleep 0.1
