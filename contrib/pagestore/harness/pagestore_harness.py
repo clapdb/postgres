@@ -164,6 +164,36 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
     schema = read_json(path)
     if schema.get("schema") != capabilities.get("inspection_schema"):
         raise PlanError(f"{path}: inspection schema version does not match capabilities")
+    advertised = capability_values(capabilities, "inspection_operations")
+    if advertised != INSPECTION_OPERATIONS:
+        raise PlanError(
+            "capabilities: inspection operations do not match runner implementation"
+        )
+    implemented = schema.get("implemented_operations")
+    if (
+        not isinstance(implemented, list)
+        or not all(isinstance(operation, str) for operation in implemented)
+        or len(implemented) != len(set(implemented))
+        or set(implemented) != INSPECTION_OPERATIONS
+    ):
+        raise PlanError(
+            f"{path}: implemented inspection operations do not match runner implementation"
+        )
+    operations = schema.get("operations")
+    if not isinstance(operations, dict):
+        raise PlanError(f"{path}: inspection operations must be an object")
+    for operation in sorted(INSPECTION_OPERATIONS):
+        definition = operations.get(operation)
+        response = definition.get("response") if isinstance(definition, dict) else None
+        if (
+            not isinstance(response, list)
+            or not response
+            or not all(isinstance(field, str) and field for field in response)
+            or len(response) != len(set(response))
+        ):
+            raise PlanError(
+                f"{path}: inspection operation {operation!r} has an invalid response"
+            )
     return schema
 
 
@@ -179,6 +209,9 @@ def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str
     if not isinstance(runtimes, dict) or not isinstance(runtimes.get(runtime), dict):
         raise PlanError(f"capabilities: missing runtime profile {runtime!r}")
     return runtimes[runtime]
+
+
+INSPECTION_OPERATIONS = {"health", "backpressure"}
 
 
 RUNTIME_OPERATIONS = {
@@ -898,10 +931,11 @@ def run_writer_smoke(
         build,
         runtime_capabilities(capabilities, "writer_smoke")["page_size"],
     )
-    validate_postgres_relation_segment_size(
-        build,
-        runtime_capabilities(capabilities, "writer_smoke")["page_size"],
-    )
+    if any(action["op"] == "bootstrap" for action in plan.actions):
+        validate_postgres_relation_segment_size(
+            build,
+            runtime_capabilities(capabilities, "writer_smoke")["page_size"],
+        )
     control_restore = None
     if any(action["op"] == "install_reader" for action in plan.actions):
         control_restore = pagestore_build_program(build, "pagestore_control_restore")

@@ -526,6 +526,35 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "version does not match capabilities"):
             MODULE.read_inspection_schema(schema, MODULE.read_json(ROOT / "capabilities.json"))
 
+    def test_inspection_operations_must_match_runner_before_launch(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        cases = []
+        missing = json.loads(json.dumps(schema))
+        missing["implemented_operations"].remove("backpressure")
+        cases.append((capabilities, missing))
+        extra_capability = json.loads(json.dumps(capabilities))
+        extra_capability["inspection_operations"].append("timeline")
+        extra_schema = json.loads(json.dumps(schema))
+        extra_schema["implemented_operations"].append("timeline")
+        cases.append((extra_capability, extra_schema))
+        for number, (candidate_capabilities, candidate_schema) in enumerate(cases):
+            with self.subTest(number=number), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "schema.json"
+                path.write_text(json.dumps(candidate_schema), encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.PlanError, "do not match runner"):
+                    MODULE.read_inspection_schema(path, candidate_capabilities)
+
+    def test_inspection_response_definition_is_validated_before_launch(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        schema["operations"]["backpressure"]["response"] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schema.json"
+            path.write_text(json.dumps(schema), encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.PlanError, "backpressure.*invalid response"):
+                MODULE.read_inspection_schema(path, capabilities)
+
     def test_runtime_health_must_match_advertised_protocol(self):
         path = self.write_plan([self.header()])
         health = {
@@ -651,6 +680,36 @@ class PlanValidationTests(unittest.TestCase):
                     build, None, False,
                 )
         create_root.assert_not_called()
+
+    def test_relation_segment_geometry_is_required_only_for_bootstrap(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for bootstrap, expected_calls in ((False, 0), (True, 1)):
+            with self.subTest(bootstrap=bootstrap):
+                records = [self.header()]
+                if bootstrap:
+                    records.append({
+                        "op": "bootstrap", "id": "bootstrap", "target": "writer",
+                    })
+                plan = MODULE.read_plan(self.write_plan(records))
+                with (
+                    mock.patch.object(MODULE, "find_pg_bin", return_value=Path("/pg/bin")),
+                    mock.patch.object(MODULE, "validate_postgres_runtime", return_value=19),
+                    mock.patch.object(MODULE, "validate_postgres_block_size"),
+                    mock.patch.object(
+                        MODULE, "validate_postgres_relation_segment_size"
+                    ) as relation_geometry,
+                    mock.patch.object(
+                        MODULE, "run_root", side_effect=MODULE.PlanError("stop before launch")
+                    ) as create_root,
+                ):
+                    with self.assertRaisesRegex(MODULE.PlanError, "stop before launch"):
+                        MODULE.run_writer_smoke(
+                            plan, capabilities,
+                            MODULE.read_json(ROOT / "inspection_schema.json"),
+                            Path("daemon"), Path("inspect"), Path("build"), None, False,
+                        )
+                self.assertEqual(relation_geometry.call_count, expected_calls)
+                create_root.assert_called_once()
 
     def test_daemon_smoke_retains_a_replayable_run_root(self):
         directory = tempfile.TemporaryDirectory()
