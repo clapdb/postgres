@@ -109,6 +109,7 @@ static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
 static bool pagestore_auto_wal_index = false;
+static int pagestore_wal_index_max_lag_mb = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -992,6 +993,9 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	int			fd;
 	char	   *buf;
 	uint64		off = 0;
+	uint64		shipped_end;
+	uint64		indexed_end = 0;
+	uint64		max_lag = 0;
 
 	/*
 	 * Only ship real WAL segment files.  The archiver also offers backup
@@ -1009,6 +1013,18 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	if (pagestore_localsvc_read_lsn() != 0)
 		return false;
 
+	/* Resume a partially shipped segment without replaying its durable prefix. */
+	shipped_end = pagestore_localsvc_wal_end();
+	if (pagestore_wal_index_max_lag_mb > 0)
+	{
+		indexed_end = pagestore_localsvc_walidx_progress();
+		max_lag = (uint64) pagestore_wal_index_max_lag_mb * 1024 * 1024;
+	}
+	if (shipped_end >= seg_start + wal_segment_size)
+		return true;
+	if (shipped_end > seg_start)
+		off = shipped_end - seg_start;
+
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 	{
@@ -1018,11 +1034,46 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 						path)));
 		return false;
 	}
+	if (off > 0 && lseek(fd, (off_t) off, SEEK_SET) < 0)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("pagestore archive: could not seek WAL segment \"%s\": %m",
+						path)));
+		close(fd);
+		return false;
+	}
 
 	buf = palloc(PS_IO_UNIT);
 	for (;;)
 	{
-		ssize_t		n = read(fd, buf, PS_IO_UNIT);
+		ssize_t		n;
+
+		if (pagestore_wal_index_max_lag_mb > 0)
+		{
+			/*
+			 * A decoder can need bytes from the next segment to step over zero
+			 * padding.  Reserve one segment beyond the configured lag so archive
+			 * backpressure cannot prevent the bytes needed to advance the index.
+			 */
+			if (seg_start + off > indexed_end &&
+				seg_start + off - indexed_end >= max_lag + wal_segment_size)
+			{
+				indexed_end = pagestore_localsvc_walidx_progress();
+				if (seg_start + off > indexed_end &&
+					seg_start + off - indexed_end >= max_lag + wal_segment_size)
+				{
+					pfree(buf);
+					close(fd);
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: WAL index is %llu bytes behind",
+									(unsigned long long) (seg_start + off - indexed_end)),
+							 errhint("Increase pagestore.wal_index_max_lag_mb or restore WAL indexing progress.")));
+					return false;
+				}
+			}
+		}
+		n = read(fd, buf, PS_IO_UNIT);
 
 		if (n < 0)
 		{
@@ -9344,6 +9395,15 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
+							"Pause WAL archiving when durable WAL indexing falls too far behind.",
+							"Zero disables the limit. One WAL segment of headroom is always reserved "
+							"so the indexer can cross segment padding.",
+							&pagestore_wal_index_max_lag_mb,
+							0, 0, INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
 
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
