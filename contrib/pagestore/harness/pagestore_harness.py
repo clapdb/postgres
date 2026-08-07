@@ -364,6 +364,14 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                         f"runtime {runtime!r} reader_base requires bootstrap before "
                         f"checkpoint {checkpoint!r}"
                     )
+                if (
+                    checkpoint != f"${latest_checkpoint}"
+                    or writer_mutated_since_checkpoint
+                ):
+                    raise PlanError(
+                        f"runtime {runtime!r} reader_base checkpoint {checkpoint!r} "
+                        "does not describe the current unmodified writer"
+                    )
                 reader_bases[action["name"]] = checkpoint[1:]
                 writer_mutated_since_checkpoint = True
             elif action["op"] == "prepare_reader":
@@ -1012,6 +1020,17 @@ def run_writer_smoke(
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-l", str(trace / "writer.log"), "-w", "start"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         events.emit("ready", target="writer", health=health, port=port)
+        if any(action["op"] == "reader_base" for action in plan.actions):
+            setup = (
+                "CREATE OR REPLACE FUNCTION "
+                "pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void "
+                "AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
+            )
+            subprocess.run(
+                [str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port),
+                 "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup],
+                check=True, capture_output=True, encoding="utf-8", env=env,
+            )
         checkpoints: dict[str, dict[str, str]] = {}
         reader_bases: dict[str, str] = {}
         prepared_readers: dict[str, Path] = {}
@@ -1056,8 +1075,6 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 if not isinstance(ref, str) or not ref.startswith("$") or ref[1:] not in checkpoints:
                     raise PlanError(f"reader_base {action['id']} requires a completed checkpoint reference")
                 base = checkpoints[ref[1:]]["redo_lsn"]
-                setup = "CREATE OR REPLACE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS void AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;"
-                subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
                 sql = "; ".join(f"SELECT pagestore_ship_slru_snapshot('{name}', '{base}')" for name in ("pg_xact", "pg_commit_ts", "pg_multixact/offsets", "pg_multixact/members"))
             elif action["op"] == "bootstrap":
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)

@@ -395,7 +395,7 @@ class PlanValidationTests(unittest.TestCase):
              "kind": "reader_datadir", "name": "reader-R", "horizon": "$R1"},
             {"op": "checkpoint", "id": "checkpoint-2", "target": "writer", "name": "R2"},
             {"op": "reader_base", "id": "base", "target": "writer",
-             "checkpoint": "$R1", "name": "C"},
+             "checkpoint": "$R2", "name": "C"},
             {"op": "prepare_reader", "id": "prepare", "target": "writer",
              "base": "$C", "read_lsn": "$R2"},
             {"op": "install_reader", "id": "install", "target": "reader-R",
@@ -517,6 +517,29 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.validate_runtime_plan(
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
+
+    def test_writer_runtime_requires_current_unmodified_reader_base(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for mutation in (
+            {"op": "sql", "id": "mutate", "target": "writer", "sql": "SELECT 1"},
+            {"op": "checkpoint", "id": "new-checkpoint", "target": "writer", "name": "R2"},
+        ):
+            with self.subTest(operation=mutation["op"]):
+                path = self.write_plan([
+                    self.header(),
+                    {"op": "bootstrap", "id": "bootstrap", "target": "writer"},
+                    {"op": "checkpoint", "id": "checkpoint", "target": "writer",
+                     "name": "R"},
+                    mutation,
+                    {"op": "reader_base", "id": "base", "target": "writer",
+                     "checkpoint": "$R", "name": "C"},
+                ])
+                with self.assertRaisesRegex(
+                    MODULE.PlanError, "does not describe the current unmodified writer"
+                ):
+                    MODULE.validate_runtime_plan(
+                        MODULE.read_plan(path), capabilities, "writer_smoke"
+                    )
 
     def test_inspection_schema_version_must_match_capabilities(self):
         directory = tempfile.TemporaryDirectory()
