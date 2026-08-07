@@ -2877,7 +2877,7 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 }
 
 static int
-walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+walidx_add_locked(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
 	WalIdxRec	rec;
 	WalIdxEnt  *e;
@@ -2904,20 +2904,26 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	rec.lsn = lsn;
 	rec.key = *key;
 	rec.crc = walidx_rec_crc(&rec);
-	pthread_rwlock_rdlock(&walidx_publish_lock);
 	if (ps_storage->walidx_append(tl, shard, &rec, sizeof(rec)) != 0)
-	{
-		pthread_rwlock_unlock(&walidx_publish_lock);
 		return -1;
-	}
 	pthread_mutex_lock(&walidx_meta_lock);
 	walidx_shard_offsets_seen[tl][shard] += sizeof(rec);
 	walidx_mark_shard(walidx_shards_seen[tl], shard);
 	rc = 0;
 	pthread_mutex_unlock(&walidx_meta_lock);
-	pthread_rwlock_unlock(&walidx_publish_lock);
 	if (rc == 0)
 		walidx_add_memory(tl, key, block, lsn);
+	return rc;
+}
+
+static int
+walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	int			rc;
+
+	pthread_rwlock_rdlock(&walidx_publish_lock);
+	rc = walidx_add_locked(tl, key, block, lsn);
+	pthread_rwlock_unlock(&walidx_publish_lock);
 	return rc;
 }
 
@@ -4385,6 +4391,30 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_WAL_INDEX_ADD:
 			if (walidx_add(tl, &ch->key, ch->blocknum, ch->req_lsn) != 0)
 				ch->status = PS_STATUS_ERROR;
+			break;
+
+		case PS_OP_WAL_INDEX_ADD_BATCH:
+			if (ch->nblocks == 0 ||
+				ch->datalen % sizeof(PsWalIndexEntry) != 0 ||
+				ch->nblocks != ch->datalen / sizeof(PsWalIndexEntry) ||
+				ch->datalen > PS_IO_UNIT)
+				ch->status = PS_STATUS_ERROR;
+			else
+			{
+				PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+				uint32_t shard = ps_shard_of(&ch->key);
+
+				pthread_rwlock_rdlock(&walidx_publish_lock);
+				for (uint32_t i = 0; i < ch->nblocks; i++)
+					if (ps_shard_of(&entries[i].key) != shard ||
+						walidx_add_locked(tl, &entries[i].key,
+									  entries[i].block, entries[i].lsn) != 0)
+					{
+						ch->status = PS_STATUS_ERROR;
+						break;
+					}
+				pthread_rwlock_unlock(&walidx_publish_lock);
+			}
 			break;
 
 		case PS_OP_WAL_INDEX_GET:
