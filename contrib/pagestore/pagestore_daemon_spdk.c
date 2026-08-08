@@ -554,6 +554,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	ps_core_set_metrics_header(hdr);
 	daemon_hdr = hdr;
 
 	memset(&sa, 0, sizeof(sa));

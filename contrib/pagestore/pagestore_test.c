@@ -130,7 +130,9 @@ check_inspector(const char *shm, uint32_t page_size)
 	check(strstr(output, "\"idle\":128") != NULL &&
 		  strstr(output, "\"claimed\":0") != NULL &&
 		  strstr(output, "\"request\":0") != NULL &&
-		  strstr(output, "\"done\":0") != NULL,
+		  strstr(output, "\"done\":0") != NULL &&
+		  strstr(output, "\"wal_index_pending_bytes\":0") != NULL &&
+		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
 }
 

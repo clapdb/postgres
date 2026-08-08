@@ -217,7 +217,10 @@ INSPECTION_RESPONSES = {
         "protocol_version", "page_size", "io_unit", "nchannels", "nshards",
         "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn",
     },
-    "backpressure": {"idle", "claimed", "request", "done", "shards"},
+    "backpressure": {
+        "idle", "claimed", "request", "done", "shards",
+        "wal_index_pending_bytes", "wal_index_lagging_timelines",
+    },
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
 PG_CONTROL_FILE_SIZE = 8192

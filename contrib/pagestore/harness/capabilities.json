@@ -8,7 +8,7 @@
       "constraints": {
         "crash": {"target": ["store"], "model": ["power_loss"], "forbidden_fields": ["fault"]}
       },
-      "protocol_version": 23,
+      "protocol_version": 24,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -23,7 +23,7 @@
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
       },
-      "protocol_version": 23,
+      "protocol_version": 24,
       "page_size": 8192,
       "io_unit": 262144
     }

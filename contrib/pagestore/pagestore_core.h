@@ -57,6 +57,7 @@ extern int	ps_core_maintenance(void);
 
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
+extern void ps_core_set_metrics_header(PsShmHeader *hdr);
 
 /* Assign a fence sequence only after all prior mutation bodies have left. */
 extern void ps_admission_read_lock(void);

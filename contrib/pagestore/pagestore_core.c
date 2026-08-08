@@ -2207,6 +2207,8 @@ load_timelines(void)
 
 /* ===================== shipped WAL log (per timeline) ================== */
 
+static void publish_wal_index_metrics(void);
+
 /*
  * Each timeline has an append-only WAL log "wal_<tl>" of self-describing
  * records [WalRecHdr | bytes].  This is the durability/transport half of WAL
@@ -2425,6 +2427,7 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	wal_end_advance(tl, start_lsn + len);
 	if (len > 0)
 		walidx_progress_init(tl, start_lsn);
+	publish_wal_index_metrics();
 	return 0;
 }
 
@@ -2726,6 +2729,50 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *metrics_header;
+
+static void
+publish_wal_index_metrics(void)
+{
+	uint64_t	pending = 0;
+	uint32_t	lagging = 0;
+
+	if (metrics_header == NULL)
+		return;
+	pthread_mutex_lock(&walidx_meta_lock);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		uint64_t shipped = wal_end_read(tl);
+		uint64_t indexed = walidx_progress[tl];
+
+		/* Unused timelines have neither lag nor a WAL log to probe. */
+		if (shipped == 0)
+			continue;
+		if (indexed == 0)
+		{
+			uint64_t first = wal_log_start(tl);
+
+			indexed = first == UINT64_MAX ? shipped : first;
+		}
+		if (shipped > indexed)
+		{
+			uint64_t delta = shipped - indexed;
+
+			pending = UINT64_MAX - pending < delta ? UINT64_MAX : pending + delta;
+			lagging++;
+		}
+	}
+	pthread_mutex_unlock(&walidx_meta_lock);
+	ps_store_release_u64(&metrics_header->wal_index_pending_bytes, pending);
+	ps_store_release(&metrics_header->wal_index_lagging_timelines, lagging);
+}
+
+void
+ps_core_set_metrics_header(PsShmHeader *hdr)
+{
+	metrics_header = hdr;
+	publish_wal_index_metrics();
+}
 
 static void
 walidx_progress_init(uint32_t tl, uint64_t first_lsn)
@@ -3144,6 +3191,7 @@ out:
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
 	pthread_rwlock_unlock(&walidx_publish_lock);
+	publish_wal_index_metrics();
 	return rc;
 }
 
