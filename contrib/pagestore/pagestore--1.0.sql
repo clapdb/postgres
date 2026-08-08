@@ -19,7 +19,7 @@ COMMENT ON FUNCTION pagestore_shipped_wal_lsn() IS
 'end of the durable WAL prefix available to this pagestore timeline';
 
 COMMENT ON FUNCTION pagestore_materializer_lag_bytes() IS
-'bytes from this pagestore materializer flushed watermark to its durable WAL end';
+'bytes from this declared pagestore materializer flushed watermark to its durable WAL end';
 
 COMMENT ON FUNCTION pagestore_materialized_wal_lsn() IS
-'last restartpoint boundary whose relation pages are durable in pagestore';
+'last restartpoint boundary made durable by this declared pagestore materializer role';
