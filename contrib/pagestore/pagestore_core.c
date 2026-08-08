@@ -2745,6 +2745,9 @@ publish_wal_index_metrics(void)
 		uint64_t shipped = wal_end_read(tl);
 		uint64_t indexed = walidx_progress[tl];
 
+		/* Unused timelines have neither lag nor a WAL log to probe. */
+		if (shipped == 0)
+			continue;
 		if (indexed == 0)
 		{
 			uint64_t first = wal_log_start(tl);
