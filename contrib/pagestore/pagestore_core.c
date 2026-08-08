@@ -2877,52 +2877,82 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 }
 
 static int
-walidx_add_locked(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
+						uint32_t nentries)
 {
-	WalIdxRec	rec;
-	WalIdxEnt  *e;
+	WalIdxRec  *records;
+	uint32_t	nrecords = 0;
 	uint32_t	shard;
-	int			pos;
-	int			rc = -1;
 
-	if (tl >= MAX_TIMELINES)
+	if (tl >= MAX_TIMELINES || nentries == 0)
 		return -1;
-	e = walidx_find(tl, key, block);
-	if (e)
+	shard = ps_shard_of(&entries[0].key);
+	records = malloc((size_t) nentries * sizeof(*records));
+	if (!records)
+		return -1;
+	for (uint32_t i = 0; i < nentries; i++)
 	{
-		pos = walidx_lower_bound(e, lsn);
-		if (pos < e->n && e->lsns[pos] == lsn)
-			return 0;
+		WalIdxEnt  *e;
+		WalIdxRec  *rec;
+		int			pos;
+
+		if (ps_shard_of(&entries[i].key) != shard)
+		{
+			free(records);
+			return -1;
+		}
+		e = walidx_find(tl, &entries[i].key, entries[i].block);
+		if (e)
+		{
+			pos = walidx_lower_bound(e, entries[i].lsn);
+			if (pos < e->n && e->lsns[pos] == entries[i].lsn)
+				continue;
+		}
+		rec = &records[nrecords++];
+		rec->magic = WALIDX_MAGIC;
+		rec->rec_len = sizeof(*rec);
+		rec->crc = 0;
+		rec->pad = 0;
+		rec->timeline = tl;
+		rec->block = entries[i].block;
+		rec->lsn = entries[i].lsn;
+		rec->key = entries[i].key;
+		rec->crc = walidx_rec_crc(rec);
 	}
-	shard = ps_shard_of(key);
-	rec.magic = WALIDX_MAGIC;
-	rec.rec_len = sizeof(rec);
-	rec.crc = 0;
-	rec.pad = 0;
-	rec.timeline = tl;
-	rec.block = block;
-	rec.lsn = lsn;
-	rec.key = *key;
-	rec.crc = walidx_rec_crc(&rec);
-	if (ps_storage->walidx_append(tl, shard, &rec, sizeof(rec)) != 0)
+	if (nrecords == 0)
+	{
+		free(records);
+		return 0;
+	}
+	if (ps_storage->walidx_append(tl, shard, records,
+								(uint32_t) (nrecords * sizeof(*records))) != 0)
+	{
+		free(records);
 		return -1;
+	}
 	pthread_mutex_lock(&walidx_meta_lock);
-	walidx_shard_offsets_seen[tl][shard] += sizeof(rec);
+	walidx_shard_offsets_seen[tl][shard] += nrecords * sizeof(*records);
 	walidx_mark_shard(walidx_shards_seen[tl], shard);
-	rc = 0;
 	pthread_mutex_unlock(&walidx_meta_lock);
-	if (rc == 0)
-		walidx_add_memory(tl, key, block, lsn);
-	return rc;
+	for (uint32_t i = 0; i < nrecords; i++)
+		walidx_add_memory(tl, &records[i].key, records[i].block,
+						  records[i].lsn);
+	free(records);
+	return 0;
 }
 
 static int
 walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 {
+	PsWalIndexEntry entry;
 	int			rc;
 
+	entry.key = *key;
+	entry.block = block;
+	entry.pad = 0;
+	entry.lsn = lsn;
 	pthread_rwlock_rdlock(&walidx_publish_lock);
-	rc = walidx_add_locked(tl, key, block, lsn);
+	rc = walidx_add_batch_locked(tl, &entry, 1);
 	pthread_rwlock_unlock(&walidx_publish_lock);
 	return rc;
 }
@@ -4405,14 +4435,9 @@ ps_handle_meta(PsChannel *ch)
 				uint32_t shard = ps_shard_of(&ch->key);
 
 				pthread_rwlock_rdlock(&walidx_publish_lock);
-				for (uint32_t i = 0; i < ch->nblocks; i++)
-					if (ps_shard_of(&entries[i].key) != shard ||
-						walidx_add_locked(tl, &entries[i].key,
-									  entries[i].block, entries[i].lsn) != 0)
-					{
-						ch->status = PS_STATUS_ERROR;
-						break;
-					}
+				if (ps_shard_of(&entries[0].key) != shard ||
+					walidx_add_batch_locked(tl, entries, ch->nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
 				pthread_rwlock_unlock(&walidx_publish_lock);
 			}
 			break;
