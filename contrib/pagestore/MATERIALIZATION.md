@@ -142,7 +142,11 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     with `pagestore_shipped_wal_lsn()`, or read
     `pagestore_materializer_lag_bytes()` directly; the lag API fails closed
     outside recovery so a writer cannot masquerade as a
-    caught-up materializer.  A worker must explicitly set
+    caught-up materializer.  Writer-side control planes use the read-only
+    `pagestore_materializer_status()` row instead: it reports the store-observed
+    marker, lag, and latched release checkpoint without asserting that the
+    caller is the worker, and returns NULL progress fields until a valid
+    timeline-local marker exists.  A worker must explicitly set
     `pagestore.materializer = on`; startup then requires the localsvc backend,
     full relation routing, and an unpinned read horizon.  Installing the
     `pagestore` extension provisions these declarations persistently in each

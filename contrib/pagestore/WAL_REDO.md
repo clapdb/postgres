@@ -66,7 +66,10 @@ read pages at an LSN.
      store boundary and recovery-only `pagestore_materializer_lag_bytes()`
      compares it with the worker's flushed materialization watermark, giving
      supervision a fail-closed caught-up signal.  `CREATE EXTENSION pagestore`
-     provisions the SQL API.  Lag is measured from a store-resident watermark
+     provisions the SQL API.  A writer-side control plane can read the
+     store-observed marker, lag, and release checkpoint in one row through
+     `pagestore_materializer_status()`; missing marker state is NULL rather
+     than a false zero.  Lag is measured from a store-resident watermark
      published only after a restartpoint flush, rather than from the in-memory
      replay LSN; it requires recovery and an explicit
      `pagestore.materializer = on` role.

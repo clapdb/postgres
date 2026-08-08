@@ -37,6 +37,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/relation.h"
@@ -58,6 +59,7 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "libpq/pqsignal.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -1121,22 +1123,15 @@ pagestore_materialized_wal_lsn_internal(void)
 	return (XLogRecPtr) marker.materialized_lsn;
 }
 
-/*
- * Pin the first completed checkpoint observed for one materialized watermark.
- * Persisting the choice prevents repeated archive retries (or an archiver
- * restart) from chasing newer checkpoints forever while the materializer is
- * stalled.  A newer marker invalidates the old choice naturally.
- */
+/* Read the durable release checkpoint only when it matches this marker. */
 static XLogRecPtr
-pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
+pagestore_materializer_release_checkpoint_read(XLogRecPtr materialized)
 {
 	PageStoreRelKey key = {0};
 	PsMaterializerRelease release;
-	XLogRecPtr	checkpoint;
 	uint64		marker;
 	char		page[BLCKSZ];
 
-	/* Provisioning establishes the first marker before enabling the limiter. */
 	if (XLogRecPtrIsInvalid(materialized))
 		return InvalidXLogRecPtr;
 	marker = (uint64) materialized;
@@ -1156,6 +1151,32 @@ pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
 			release.checkpoint_lsn > marker)
 			return (XLogRecPtr) release.checkpoint_lsn;
 	}
+	return InvalidXLogRecPtr;
+}
+
+/*
+ * Pin the first completed checkpoint observed for one materialized watermark.
+ * Persisting the choice prevents repeated archive retries (or an archiver
+ * restart) from chasing newer checkpoints forever while the materializer is
+ * stalled.  A newer marker invalidates the old choice naturally.
+ */
+static XLogRecPtr
+pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerRelease release;
+	XLogRecPtr	checkpoint;
+	XLogRecPtr	latched;
+	uint64		marker;
+	char		page[BLCKSZ];
+
+	/* Provisioning establishes the first marker before enabling the limiter. */
+	if (XLogRecPtrIsInvalid(materialized))
+		return InvalidXLogRecPtr;
+	marker = (uint64) materialized;
+	latched = pagestore_materializer_release_checkpoint_read(materialized);
+	if (XLogRecPtrIsValid(latched))
+		return latched;
 
 	checkpoint = pagestore_control_writer_checkpoint_lsn_timeout(
 		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
@@ -1331,6 +1352,64 @@ pagestore_materializer_lag_bytes(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("pagestore materializer lag exceeds bigint range")));
 	PG_RETURN_INT64((int64) lag);
+}
+
+/*
+ * Store-observed materializer state for writer-side control-plane monitoring.
+ * Unlike pagestore_materializer_lag_bytes(), this does not claim that the
+ * caller is the materializer.  A missing durable marker is represented by
+ * NULL marker/lag/release fields rather than a false zero-lag result.
+ */
+PG_FUNCTION_INFO_V1(pagestore_materializer_status);
+
+Datum
+pagestore_materializer_status(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		values[4] = {0};
+	bool		nulls[4] = {false, false, false, false};
+	XLogRecPtr	shipped;
+	XLogRecPtr	materialized;
+	XLogRecPtr	release;
+	uint64		lag;
+
+	pagestore_require_localsvc_monitoring();
+
+	/* Sample marker first so concurrent progress can only overstate the lag. */
+	materialized = pagestore_materialized_wal_lsn_internal();
+	release = pagestore_materializer_release_checkpoint_read(materialized);
+	shipped = pagestore_materializer_shipped_lsn(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	values[0] = LSNGetDatum(shipped);
+
+	if (XLogRecPtrIsInvalid(materialized))
+	{
+		nulls[1] = true;
+		nulls[2] = true;
+		nulls[3] = true;
+	}
+	else
+	{
+		values[1] = LSNGetDatum(materialized);
+		lag = shipped > materialized ? shipped - materialized : 0;
+		if (lag > PG_INT64_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("pagestore materializer lag exceeds bigint range")));
+		values[2] = Int64GetDatum((int64) lag);
+		if (XLogRecPtrIsInvalid(release))
+			nulls[3] = true;
+		else
+			values[3] = LSNGetDatum(release);
+	}
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
 }
 
 static bool
