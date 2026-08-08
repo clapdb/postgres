@@ -1518,7 +1518,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * at/below lsn.
 	 */
 	{
-		RedoBlockLiveness liveness;
+		volatile RedoBlockLiveness liveness = REDO_BLOCK_SCAN_INCOMPLETE;
+		bool		saved_liveness_from_store = ps_redo_liveness_from_store;
 
 		/*
 		 * The truncate scan walks the WAL after the block's last write.  Force the
@@ -1532,20 +1533,27 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		 * walks ancestors below each fork point, so this single scan covers an
 		 * ancestor last-write and a branch-local truncate in the same history.
 		 */
-		ps_redo_liveness_from_store =
-			recs[n - 1].timeline != pagestore_localsvc_timeline();
-		ps_redo_cur_timeline = pagestore_localsvc_timeline();
-		reader->readLen = 0;
-		liveness = redo_block_truncated_away(reader, rloc, forknum,
-											 (BlockNumber) blocknum,
-											 (XLogRecPtr) recs[n - 1].lsn, lsn);
-		ps_redo_liveness_from_store = false;
+		PG_TRY();
+		{
+			ps_redo_liveness_from_store =
+				recs[n - 1].timeline != pagestore_localsvc_timeline();
+			ps_redo_cur_timeline = pagestore_localsvc_timeline();
+			reader->readLen = 0;
+			liveness = redo_block_truncated_away(reader, rloc, forknum,
+												 (BlockNumber) blocknum,
+												 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		}
+		PG_FINALLY();
+		{
+			ps_redo_liveness_from_store = saved_liveness_from_store;
+		}
+		PG_END_TRY();
 		/*
 		 * Fail closed unless the scan proved the block live: a confirmed truncate
 		 * and an incomplete scan (the WAL could not be read through lsn) both mean
 		 * we must not return a possibly-stale FPI for a block that may be gone.
 		 */
-		if (liveness != REDO_BLOCK_LIVE)
+		if ((RedoBlockLiveness) liveness != REDO_BLOCK_LIVE)
 		{
 			XLogReaderFree(reader);
 			pfree(pd);
