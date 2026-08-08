@@ -2223,6 +2223,65 @@ typedef struct WalRecHdr
 	uint64_t	start_lsn;		/* LSN of the first byte */
 } WalRecHdr;
 
+typedef struct WalChunkRef
+{
+	uint64_t	start_lsn;
+	uint64_t	end_lsn;
+	uint64_t	payload_off;
+} WalChunkRef;
+
+static WalChunkRef *wal_chunks[MAX_TIMELINES];
+static uint32_t wal_chunks_n[MAX_TIMELINES];
+static uint32_t wal_chunks_cap[MAX_TIMELINES];
+static uint64_t wal_log_bytes[MAX_TIMELINES];
+
+static int
+wal_chunk_reserve(uint32_t tl)
+{
+	WalChunkRef *grown;
+	uint32_t	newcap;
+
+	if (wal_chunks_n[tl] < wal_chunks_cap[tl])
+		return 0;
+	newcap = wal_chunks_cap[tl] ? wal_chunks_cap[tl] * 2 : 64;
+	grown = realloc(wal_chunks[tl], (size_t) newcap * sizeof(*grown));
+	if (!grown)
+		return -1;
+	wal_chunks[tl] = grown;
+	wal_chunks_cap[tl] = newcap;
+	return 0;
+}
+
+static void
+wal_chunk_add(uint32_t tl, uint64_t record_off, const WalRecHdr *h)
+{
+	WalChunkRef *ref = &wal_chunks[tl][wal_chunks_n[tl]++];
+
+	ref->start_lsn = h->start_lsn;
+	ref->end_lsn = h->start_lsn + h->len;
+	ref->payload_off = record_off + sizeof(*h);
+	wal_log_bytes[tl] = ref->payload_off + h->len;
+}
+
+static uint32_t
+wal_chunk_lower_bound(uint32_t tl, uint64_t lsn)
+{
+	uint32_t	lo = 0;
+	uint32_t	hi = wal_chunks_n[tl];
+
+	/* First chunk whose end is after lsn. */
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (wal_chunks[tl][mid].end_lsn <= lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 /*
  * Overlap policy for shipped WAL: identical bytes are an idempotent re-ship
  * (an archiver retry after a partial failure) -- accepted, and skipped
@@ -2244,8 +2303,6 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 				  const unsigned char *data, uint32_t len,
 				  uint32_t *covered_prefix, int *prefix_only)
 {
-	uint64_t	off = 0;
-	WalRecHdr	h;
 	uint64_t	we = start_lsn + len;
 	unsigned char *tmp = NULL;
 	unsigned char *mask = NULL;
@@ -2253,17 +2310,18 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 
 	*covered_prefix = 0;
 	*prefix_only = 1;
-	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
-		   h.magic == WAL_MAGIC)
+	for (uint32_t i = wal_chunk_lower_bound(tl, start_lsn);
+		 i < wal_chunks_n[tl] && wal_chunks[tl][i].start_lsn < we; i++)
 	{
-		uint64_t	rs = h.start_lsn;
-		uint64_t	re = rs + h.len;
+		WalChunkRef *ref = &wal_chunks[tl][i];
+		uint64_t	rs = ref->start_lsn;
+		uint64_t	re = ref->end_lsn;
 		uint64_t	os = rs > start_lsn ? rs : start_lsn;
 		uint64_t	oe = re < we ? re : we;
 
 		if (os < oe)
 		{
-			uint64_t	src = off + sizeof(h) + (os - rs);
+			uint64_t	src = ref->payload_off + (os - rs);
 			uint32_t	n = (uint32_t) (oe - os);
 			uint32_t	base = (uint32_t) (os - start_lsn);
 
@@ -2289,14 +2347,13 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 				free(mask);
 				return -1;
 			}
-			for (uint32_t i = 0; i < n; i++)
-				if (!mask[base + i])
+			for (uint32_t j = 0; j < n; j++)
+				if (!mask[base + j])
 				{
-					mask[base + i] = 1;
+					mask[base + j] = 1;
 					covered++;
 				}
 		}
-		off += sizeof(h) + h.len;
 	}
 	if (mask)
 	{
@@ -2357,9 +2414,12 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	h.magic = WAL_MAGIC;
 	h.len = len;
 	h.start_lsn = start_lsn;
+	if (wal_chunk_reserve(tl) != 0)
+		return -1;
 	if (ps_storage->wal_append(tl, &h, sizeof(h), data, len) != 0)
 		return -1;
 
+	wal_chunk_add(tl, wal_log_bytes[tl], &h);
 	wal_end_advance(tl, start_lsn + len);
 	return 0;
 }
@@ -2370,8 +2430,6 @@ static uint32_t
 wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			 unsigned char *out)
 {
-	uint64_t	off = 0;
-	WalRecHdr	h;
 	uint32_t	filled = 0;
 	uint64_t	we = start + len;
 
@@ -2380,24 +2438,24 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 	if (we <= start)
 		return 0;
 
-	while (ps_storage->wal_read(tl, off, &h, sizeof(h)) == (int) sizeof(h) &&
-		   h.magic == WAL_MAGIC)
+	for (uint32_t i = wal_chunk_lower_bound(tl, start);
+		 i < wal_chunks_n[tl] && wal_chunks[tl][i].start_lsn < we; i++)
 	{
-		uint64_t	rs = h.start_lsn;
-		uint64_t	re = rs + h.len;
+		WalChunkRef *ref = &wal_chunks[tl][i];
+		uint64_t	rs = ref->start_lsn;
+		uint64_t	re = ref->end_lsn;
 		uint64_t	os = rs > start ? rs : start;	/* overlap start */
 		uint64_t	oe = re < we ? re : we; /* overlap end */
 
 		if (os < oe)
 		{
-			uint64_t	src = off + sizeof(h) + (os - rs);
+			uint64_t	src = ref->payload_off + (os - rs);
 			int			n = ps_storage->wal_read(tl, src, out + (os - start),
 												 (uint32_t) (oe - os));
 
 			if (n > 0)
 				filled += (uint32_t) n;
 		}
-		off += sizeof(h) + h.len;
 	}
 	return filled;
 }
@@ -2408,11 +2466,8 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 static uint64_t
 wal_log_start(uint32_t tl)
 {
-	WalRecHdr	h;
-
-	if (ps_storage->wal_read(tl, 0, &h, sizeof(h)) == (int) sizeof(h) &&
-		h.magic == WAL_MAGIC)
-		return h.start_lsn;
+	if (tl < MAX_TIMELINES && wal_chunks_n[tl] != 0)
+		return wal_chunks[tl][0].start_lsn;
 	return UINT64_MAX;
 }
 
@@ -2560,7 +2615,7 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 }
 
 /* Rebuild wal_end[tl] by scanning the timeline's WAL log at startup. */
-static void
+static int
 wal_recover_one(uint32_t tl)
 {
 	uint64_t	off = 0;
@@ -2571,12 +2626,22 @@ wal_recover_one(uint32_t tl)
 	int			nread;
 
 	if (tl >= MAX_TIMELINES)
-		return;
+		return -1;
+	free(wal_chunks[tl]);
+	wal_chunks[tl] = NULL;
+	wal_chunks_n[tl] = 0;
+	wal_chunks_cap[tl] = 0;
+	wal_log_bytes[tl] = 0;
 	while ((nread = ps_storage->wal_read(tl, off, &h, sizeof(h))) ==
 		   (int) sizeof(h))
 	{
 		if (h.magic != WAL_MAGIC)
 			break;
+		if (h.start_lsn + h.len < h.start_lsn)
+		{
+			truncate_needed = 1;
+			break;
+		}
 		if (h.len > 0 &&
 			ps_storage->wal_read(tl, off + sizeof(h) + h.len - 1,
 								 &byte, 1) != 1)
@@ -2584,6 +2649,9 @@ wal_recover_one(uint32_t tl)
 			truncate_needed = 1;
 			break;
 		}
+		if (wal_chunk_reserve(tl) != 0)
+			return -1;
+		wal_chunk_add(tl, off, &h);
 		if (h.start_lsn + h.len > wal_end_read(tl))
 		{
 			timeline_mark_used(tl);
@@ -2596,6 +2664,7 @@ wal_recover_one(uint32_t tl)
 		truncate_needed = 1;
 	if (truncate_needed && ps_storage->wal_truncate)
 		(void) ps_storage->wal_truncate(tl, good_off);
+	return 0;
 }
 
 /* ===================== per-page WAL index ============================== */
@@ -5220,7 +5289,8 @@ ps_core_open(const char *store_dir)
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (tl == 0 || timelines[tl].defined)
 		{
-			wal_recover_one(tl);
+			if (wal_recover_one(tl) != 0)
+				return -1;
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
 				if (walidx_recover_one(tl, shard) != 0)
 					return -1;
