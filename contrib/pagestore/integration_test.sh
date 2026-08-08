@@ -122,6 +122,7 @@ pagestore.route_user_tablespaces = on
 pagestore.walredo_datadir = '$SCRATCH'
 pagestore.slru_mirror = on
 pagestore.auto_wal_index = on
+pagestore.wal_index_max_lag_mb = 1
 io_method = sync
 wal_keep_size = 512MB	# appliers replay (C, L] from local pg_wal across restarts
 archive_mode = on
