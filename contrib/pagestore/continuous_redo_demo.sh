@@ -164,6 +164,7 @@ archive_current_wal || fail "base-backup WAL did not reach pagestore"
 
 cat >> "$REDO/postgresql.conf" <<EOF
 pagestore.route_all = on
+pagestore.materializer = on
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $RPORT
@@ -223,6 +224,20 @@ wait_materializer_caught_up || fail "materializer lag did not return to zero"
 shipped_lsn=$($RP -c "SELECT pagestore_shipped_wal_lsn();")
 materialized_lsn=$($RP -c "SELECT pagestore_materialized_wal_lsn();")
 echo "ok   - materializer reports zero lag (shipped $shipped_lsn, materialized $materialized_lsn)"
+
+# Recovery alone is not a materializer identity.  Restart with the explicit
+# role disabled and prove that a stale marker cannot make this worker pass the
+# supervision contract.
+echo "pagestore.materializer = off" >> "$REDO/postgresql.conf"
+"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
+	fail "redo worker role-disabled restart failed"
+if $RP -c "SELECT pagestore_materializer_lag_bytes();" \
+		>"$TMPROOT/role-lag.out" 2>"$TMPROOT/role-lag.err"; then
+	fail "materializer monitoring accepted an undeclared recovery worker"
+fi
+grep -q "requires pagestore.materializer = on" "$TMPROOT/role-lag.err" ||
+	fail "undeclared worker rejection did not explain the materializer role"
+echo "ok   - monitoring rejects a recovery worker without the materializer role"
 
 [ ! -f "$REDO/$relfile" ] ||
 	fail "redo worker created a local heap instead of materializing into pagestore"

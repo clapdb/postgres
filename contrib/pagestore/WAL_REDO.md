@@ -64,10 +64,11 @@ read pages at an LSN.
      supervision a fail-closed caught-up signal.  `CREATE EXTENSION pagestore`
      provisions the SQL API.  Lag is measured from a store-resident watermark
      published only after a restartpoint flush, rather than from the in-memory
-     replay LSN; it
-     requires recovery, localsvc, and full relation routing.  An empty child
-     timeline inherits its fork LSN as the available WAL boundary.  Production
-     worker provisioning, restart
+     replay LSN; it requires recovery and an explicit
+     `pagestore.materializer = on` role.
+     Startup rejects that role unless it uses localsvc, full relation routing,
+     and an unpinned read horizon.  An empty child timeline inherits its fork
+     LSN as the available WAL boundary.  Production worker provisioning, restart
      policy, and lag backpressure remain control-plane work.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying

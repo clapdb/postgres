@@ -142,10 +142,13 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     with `pagestore_shipped_wal_lsn()`, or read
     `pagestore_materializer_lag_bytes()` directly; the lag API fails closed
     outside recovery so a writer cannot masquerade as a
-    caught-up materializer, and also requires the localsvc backend with full
-    relation routing.  `CREATE EXTENSION pagestore` installs these declarations
-    persistently in each monitored database.  A production control-plane lifecycle
-    (provisioning, restart, and backpressure for that worker) is the next step.
+    caught-up materializer.  A worker must explicitly set
+    `pagestore.materializer = on`; startup then requires the localsvc backend,
+    full relation routing, and an unpinned read horizon.  Installing the
+    `pagestore` extension provisions these declarations persistently in each
+    monitored database.  A production control-plane lifecycle
+    (provisioning, restart, and backpressure for that declared worker) is the
+    next step.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is
