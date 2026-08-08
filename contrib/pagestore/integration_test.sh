@@ -203,6 +203,19 @@ $P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
         AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null
 $P -c "CREATE FUNCTION pagestore_walidx_count(regclass,int,int) RETURNS int
         AS 'pagestore','pagestore_walidx_count' LANGUAGE C STRICT;" >/dev/null
+wait_walidx_visible() {
+	local rel=$1
+	local count=0
+
+	for i in $(seq 1 200); do
+		count=$($P -c "SELECT pagestore_walidx_count('$rel', 0, 0);")
+		[ "${count:-0}" -gt 0 ] && return 0
+		sleep 0.1
+	done
+	echo "FAIL - WAL index progress did not publish $rel block 0"
+	fail=1
+	return 1
+}
 # Write a fresh table and complete its WAL segment.  The background worker must
 # advance from the store's durable index boundary without an SQL trigger.
 $P -c "CREATE TABLE widx(id int) TABLESPACE ts; INSERT INTO widx SELECT generate_series(1,1000);" >/dev/null
@@ -254,7 +267,8 @@ $P -c "CREATE TABLE rp(id int primary key, v text) TABLESPACE ts;
 # first modify after the checkpoint logs a full-page image of rp's block 0
 $P -c "UPDATE rp SET v='rp_later' WHERE id=1;" >/dev/null
 rlsn1=$($P -c "SELECT pg_current_wal_lsn();")
-$P -c "SELECT pagestore_index_wal('$rlsn0', '$rlsn1');" >/dev/null
+$P -c "SELECT pg_switch_wal();" >/dev/null
+wait_walidx_visible rp || true
 # reconstruct rp's block 0 image from WAL alone; it carries the committed row
 rebuilt=$($P -c "SELECT position('rp_committed'::bytea in pagestore_redo_page('rp',0,0,'$rlsn1')) > 0;")
 if [ "$rebuilt" = "t" ]; then
@@ -281,7 +295,8 @@ $P -c "CREATE TABLE rpa(id int primary key, v text) WITH (autovacuum_enabled=off
        INSERT INTO rpa VALUES (2,'asof_two');
        INSERT INTO rpa VALUES (3,'asof_three');" >/dev/null
 alsn=$($P -c "SELECT pg_current_wal_lsn();")
-$P -c "SELECT pagestore_index_wal('$a0', '$alsn');" >/dev/null
+$P -c "SELECT pg_switch_wal();" >/dev/null
+wait_walidx_visible rpa || true
 # The reconstruction must carry the base full-page image's rows (asof_one,
 # asof_two) AND the delta applied after it (asof_three) -- i.e. it really replayed
 # base + deltas through rm_redo, not just returned the base.  (We assert content
@@ -325,7 +340,8 @@ tl_before=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "DELETE FROM trunc;" >/dev/null
 $P -c "VACUUM trunc;" >/dev/null                     # empties block 0 -> truncates it away
 tl_after=$($P -c "SELECT pg_current_wal_lsn();")
-$P -c "SELECT pagestore_index_wal('$tl0', '$tl_after');" >/dev/null
+$P -c "SELECT pg_switch_wal();" >/dev/null
+wait_walidx_visible trunc || true
 live_before=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_before') IS NOT NULL;")
 assert "$live_before" "t" "redo_page_asof materializes the block while it is live (before truncation)"
 live_after=$($P -c "SELECT pagestore_redo_page_asof('trunc',0,0,'$tl_after') IS NULL;")
@@ -343,8 +359,7 @@ $P -c "UPDATE swal SET v='sw_fpi' WHERE id=1;" >/dev/null   # FPI of block 0 aft
 $P -c "INSERT INTO swal VALUES (2,'sw_delta');" >/dev/null  # a delta on block 0
 sw1=$($P -c "SELECT pg_current_wal_lsn();")
 $P -c "SELECT pg_switch_wal();" >/dev/null                  # complete the segment -> shipped to the store
-sleep 2
-$P -c "SELECT pagestore_index_wal('$sw0', '$sw1');" >/dev/null
+wait_walidx_visible swal || true
 sw_store=$($P -c "SET pagestore.redo_wal_from_store = on;
   SELECT position('sw_fpi'::bytea   in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0
      AND position('sw_delta'::bytea in pagestore_redo_page_asof('swal',0,0,'$sw1')) > 0;" | tail -1)
