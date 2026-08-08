@@ -224,6 +224,16 @@ wait_materializer_caught_up || fail "materializer lag did not return to zero"
 shipped_lsn=$($RP -c "SELECT pagestore_shipped_wal_lsn();")
 materialized_lsn=$($RP -c "SELECT pagestore_materialized_wal_lsn();")
 echo "ok   - materializer reports zero lag (shipped $shipped_lsn, materialized $materialized_lsn)"
+writer_status=$($WP -F '|' -c "SELECT * FROM pagestore_materializer_status();") ||
+	fail "writer could not inspect store-observed materializer status"
+IFS='|' read -r status_shipped status_materialized status_lag status_release <<EOF
+$writer_status
+EOF
+[ "$status_shipped" = "$shipped_lsn" ] &&
+	[ "$status_materialized" = "$materialized_lsn" ] &&
+	[ "$status_lag" = 0 ] && [ -z "$status_release" ] ||
+	fail "writer materializer status did not report caught-up, unlatch state: $writer_status"
+echo "ok   - writer observes caught-up materializer state without claiming the worker role"
 
 # Stop recovery, establish a checkpoint, then advance several segments without
 # another checkpoint.  The aligned limiter must finish usable input segments
@@ -264,6 +274,14 @@ done
 	fail "archiver did not pause for a stalled materializer"
 [ -f "$WRITER/pg_wal/archive_status/$blocked_target.ready" ] ||
 	fail "materializer backpressure left no WAL segment pending"
+writer_status=$($WP -F '|' -c "SELECT * FROM pagestore_materializer_status();") ||
+	fail "writer could not inspect stalled materializer status"
+IFS='|' read -r status_shipped status_materialized status_lag status_release <<EOF
+$writer_status
+EOF
+[ -n "$status_materialized" ] && [ "${status_lag:-0}" -gt 0 ] &&
+	[ -n "$status_release" ] ||
+	fail "writer materializer status did not expose stalled release state: $writer_status"
 echo "ok   - stalled materializer applies bounded WAL archive backpressure"
 
 # Publish a newer completed checkpoint while archiving is paused.  The limiter
