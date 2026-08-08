@@ -1205,8 +1205,6 @@ pagestore_rel_exists_asof(PG_FUNCTION_ARGS)
  * image with rm_redo (the `--wal-redo`-style helper -- the remaining step).
  * Returns NULL if no full-page image for the page is indexed at/below lsn.
  */
-#define PS_REDO_MAX_RECS 4096
-
 PG_FUNCTION_INFO_V1(pagestore_redo_page);
 
 Datum
@@ -1232,20 +1230,8 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	key.forkNum = forknum;
 	relation_close(rel, AccessShareLock);
 
-	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
-	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  recs, PS_REDO_MAX_RECS);
-
-	/*
-	 * A full result set means the daemon may have truncated it: the cap is
-	 * filled with the OLDEST matching records, so treating recs[n-1] as the
-	 * newest state would silently materialize a stale page (and mis-judge
-	 * truncation liveness).  Fail closed instead of returning wrong bytes.
-	 */
-	if (n >= PS_REDO_MAX_RECS)
-		ereport(ERROR,
-				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
-						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
+									  (uint64) lsn, &recs);
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -1452,20 +1438,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	key.relNumber = rloc.relNumber;
 	key.forkNum = forknum;
 
-	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
-	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  recs, PS_REDO_MAX_RECS);
-
-	/*
-	 * A full result set means the daemon may have truncated it: the cap is
-	 * filled with the OLDEST matching records, so treating recs[n-1] as the
-	 * newest state would silently materialize a stale page (and mis-judge
-	 * truncation liveness).  Fail closed instead of returning wrong bytes.
-	 */
-	if (n >= PS_REDO_MAX_RECS)
-		ereport(ERROR,
-				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
-						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
+									  (uint64) lsn, &recs);
 	if (n == 0)
 		PG_RETURN_NULL();
 

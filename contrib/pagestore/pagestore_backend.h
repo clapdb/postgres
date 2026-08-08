@@ -174,7 +174,7 @@ extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn_max,
-										  PsWalRec *out, int maxn);
+										  PsWalRec **out);
 extern uint64 pagestore_localsvc_walidx_progress(void);
 extern void pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn);
 extern bool pagestore_localsvc_timeline_parent(uint32 timeline,
