@@ -110,6 +110,7 @@ static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
 static bool pagestore_auto_wal_index = false;
+static bool pagestore_materializer = false;
 static int pagestore_wal_index_max_lag_mb = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -1111,6 +1112,10 @@ pagestore_require_materializer(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pagestore materializer monitoring requires recovery mode")));
+	if (!pagestore_materializer)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore materializer monitoring requires pagestore.materializer = on")));
 	if (!pagestore_route_all)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -9562,6 +9567,16 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pagestore.materializer",
+							 "Declare this recovery instance as the pagestore materializer.",
+							 "The role publishes durable restartpoint progress and enables "
+							 "materializer supervision. It requires localsvc, full relation "
+							 "routing, and an unpinned read horizon.",
+							 &pagestore_materializer,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
 							"Pause WAL archiving when durable WAL indexing falls too far behind.",
 							"Zero disables the limit. Headroom for one maximum-size WAL record "
@@ -9579,6 +9594,17 @@ _PG_init(void)
 		!pagestore_branch_routing_active())
 		ereport(ERROR,
 				(errmsg("pagestore.auto_reader_artifacts requires full pagestore relation routing")));
+	if (pagestore_materializer &&
+		(pagestore_backend_name == NULL ||
+		 strcmp(pagestore_backend_name, "localsvc") != 0))
+		ereport(ERROR,
+				(errmsg("pagestore.materializer requires pagestore.backend = 'localsvc'")));
+	if (pagestore_materializer && !pagestore_route_all)
+		ereport(ERROR,
+				(errmsg("pagestore.materializer requires pagestore.route_all = on")));
+	if (pagestore_materializer && pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.materializer cannot use pagestore.read_lsn")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
 	prev_executor_run_hook = ExecutorRun_hook;
@@ -9637,7 +9663,7 @@ _PG_init(void)
 	 */
 	pagestore_control_mirror_init(pagestore_backend_name != NULL &&
 								  strcmp(pagestore_backend_name, "localsvc") == 0);
-	if (pagestore_backend_name != NULL &&
+	if (pagestore_materializer && pagestore_backend_name != NULL &&
 		strcmp(pagestore_backend_name, "localsvc") == 0 &&
 		pagestore_route_all && pagestore_localsvc_read_lsn() == 0)
 	{
