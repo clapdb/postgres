@@ -79,9 +79,10 @@ read pages at an LSN.
          later segment supplies the next valid record.  Operators can set
          `pagestore.wal_index_max_lag_mb` to pause WAL archiving when this
          durable indexing boundary falls behind.  The limit retains enough
-         headroom for a maximum-size WAL record plus segment padding, so the
-         decoder cannot be stranded inside a record.  Archive retries resend
-         and validate durable overlap before appending any missing suffix.
+         WAL-address headroom for a maximum-size record, its page headers, and
+         segment padding, so the decoder cannot be stranded inside a record.
+         Archive retries resend and validate durable overlap before appending
+         any missing suffix.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it

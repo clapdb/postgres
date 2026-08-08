@@ -997,6 +997,7 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	uint64		indexed_end = 0;
 	uint64		max_lag = 0;
 	uint64		headroom = 0;
+	uint64		max_record_wal_span;
 
 	/*
 	 * Only ship real WAL segment files.  The archiver also offers backup
@@ -1021,7 +1022,16 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 		indexed_end = shipped_end == 0 ? seg_start :
 			pagestore_localsvc_walidx_progress();
 		max_lag = (uint64) pagestore_wal_index_max_lag_mb * 1024 * 1024;
-		headroom = max_lag + XLogRecordMaxSize + wal_segment_size;
+		/*
+		 * XLogRecordMaxSize counts record bytes, not their WAL-address span.
+		 * Conservatively charge every page the larger long-header size, plus
+		 * one initial partial page for a record that starts at page end.
+		 */
+		max_record_wal_span =
+			((uint64) XLogRecordMaxSize +
+			 (XLOG_BLCKSZ - SizeOfXLogLongPHD) - 1) /
+			(XLOG_BLCKSZ - SizeOfXLogLongPHD) * XLOG_BLCKSZ + XLOG_BLCKSZ;
+		headroom = max_lag + max_record_wal_span + wal_segment_size;
 	}
 
 	fd = open(path, O_RDONLY);
