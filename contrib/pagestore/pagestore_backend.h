@@ -160,6 +160,7 @@ extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
 extern void pagestore_localsvc_walidx_add(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn);
+extern uint64 pagestore_localsvc_wal_end(void);
 extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
@@ -167,6 +168,9 @@ extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  PsWalRec *out, int maxn);
 extern uint64 pagestore_localsvc_walidx_progress(void);
 extern void pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn);
+extern bool pagestore_localsvc_timeline_parent(uint32 timeline,
+											 uint32 *parent_timeline,
+											 uint64 *branch_lsn);
 extern int	pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn,
 										uint32 len, void *out);
 extern uint32 pagestore_localsvc_timeline(void);

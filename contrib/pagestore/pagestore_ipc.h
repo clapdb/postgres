@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		21	/* 21: READER_SNAPSHOT object class added;
+#define PS_SHM_VERSION		22	/* 22: TIMELINE_INFO opcode added;
+								 * 21: READER_SNAPSHOT object class added;
 								 * 20: WAL_INDEX_PROGRESS opcode added;
 							 * 19: checkpoint admission gate + barrier;
 								 * 18: req_seq caps same-LSN admission order;
@@ -91,6 +92,7 @@ typedef enum PsOpcode
 	PS_OP_CHECK_BRANCH,			/* validate timeline creation request, no mutation */
 	PS_OP_REQUIRE_BRANCH,		/* require existing timeline ancestry metadata */
 	PS_OP_CREATE_BRANCH,		/* create timeline from parent_timeline @ req_lsn */
+	PS_OP_TIMELINE_INFO,		/* return parent/fork metadata; result says has-parent */
 	PS_OP_WAL_APPEND,			/* append datalen WAL bytes at LSN req_lsn (timeline) */
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */

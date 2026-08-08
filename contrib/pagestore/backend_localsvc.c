@@ -1049,6 +1049,18 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 	ls_exec(ch);
 }
 
+/* End of the WAL prefix durably shipped for this compute's timeline. */
+uint64
+pagestore_localsvc_wal_end(void)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->timeline = (uint32) localsvc_timeline;
+	ch->opcode = PS_OP_WAL_SIZE;
+	ls_exec(ch);
+	return ch->req_lsn;
+}
+
 /*
  * Read up to 'len' bytes of shipped WAL starting at 'start_lsn' from a SPECIFIC
  * timeline's log on the store (not necessarily this backend's).  Used to serve a
@@ -1213,6 +1225,23 @@ pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
 	ch->req_lsn = start_lsn;
 	ch->req_seq = end_lsn;
 	ls_exec(ch);
+}
+
+/* Return this timeline's parent and fork point, or false for the root. */
+bool
+pagestore_localsvc_timeline_parent(uint32 timeline, uint32 *parent_timeline,
+								   uint64 *branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	ch->timeline = timeline;
+	ls_exec(ch);
+	if (ch->result == 0)
+		return false;
+	*parent_timeline = ch->parent_timeline;
+	*branch_lsn = ch->req_lsn;
+	return true;
 }
 
 /*

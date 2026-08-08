@@ -919,6 +919,20 @@ op_wal_size(uint32_t tl)
 	return ch->req_lsn;
 }
 
+/* Read a timeline's ancestry metadata; return whether it has a parent. */
+static int
+op_timeline_info(uint32_t tl, uint32_t *parent_tl, uint64_t *branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	cl_exec();
+	*parent_tl = ch->parent_timeline;
+	*branch_lsn = ch->req_lsn;
+	return ch->result != 0;
+}
+
 /* Read len WAL bytes from start_lsn into out; returns bytes filled. */
 static uint32_t
 op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
@@ -2993,7 +3007,15 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	if (nonzero_rel != 0)
 	{
 		op_walidx_add(0, nonzero_rel, FORK0, 0, 320);
-		op_walidx_add(0, nonzero_rel, FORK0, 0, 330);
+		 op_walidx_add(0, nonzero_rel, FORK0, 0, 330);
+	}
+	check(op_walidx_get(0, REL_A, FORK0, 0, 1000000, out) == 0,
+		  "WAL index entries stay hidden before their progress commit");
+	{
+		uint64_t	progress;
+
+		check(op_walidx_progress(0, 0, 350, &progress) == 0,
+			  "contiguous indexed WAL interval commits a durable progress marker");
 	}
 
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
@@ -3011,8 +3033,6 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 350, &progress) == 0,
-			  "contiguous indexed WAL interval commits a durable progress marker");
 		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
 			  "WAL index progress reports the committed end");
 		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
@@ -3024,12 +3044,17 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "rejected WAL index progress leaves the committed end unchanged");
 		op_create_branch(2, 0, 0);
 		op_wal_append(2, high, wal, 16);
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high,
+			  "first WAL append publishes the initial indexing boundary");
 		check(op_walidx_progress(2, high, high + 16, &progress) == 0,
 			  "WAL index progress accepts a 64-bit LSN start");
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "WAL index progress reports a 64-bit committed end");
 		op_create_branch(3, 0, 0);
+		op_create_branch(4, 0, 0);
+		op_wal_append(4, high + 32, wal, 16);
 	}
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
@@ -3061,11 +3086,27 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "64-bit WAL index progress survives daemon restart");
 		check(op_walidx_progress(3, high, high + 16, &progress) != 0,
 			  "WAL index progress rejects WAL with a missing payload");
+		check(op_walidx_progress(4, 0, 0, &progress) == 0 &&
+			  progress == high + 32,
+			  "initial indexing boundary is recovered from durable WAL");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);
+	{
+		uint32_t	parent_tl = UINT32_MAX;
+		uint64_t	branch_lsn = 0;
+
+		check(!op_timeline_info(0, &parent_tl, &branch_lsn),
+			  "root timeline reports no parent");
+		check(op_timeline_info(1, &parent_tl, &branch_lsn) &&
+			  parent_tl == 0 && branch_lsn == 250,
+			  "branch timeline reports its parent and fork LSN");
+	}
+	op_wal_append(1, 400, wal, 16);
 	op_walidx_add(1, REL_A, FORK0, 0, 400);
+	check(op_walidx_progress(1, 400, 416, NULL) == 0,
+		  "branch WAL index entries become visible with branch progress");
 	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
 	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
 	check(n == 3, "branch index reads through to parent capped at the branch lsn");

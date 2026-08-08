@@ -66,10 +66,10 @@ read pages at an LSN.
          `pagestore_index_wal(start, end)`.  Note: decoding **must run in a
          normal backend** -- the archiver process lacks the recovery/timeline
          context the reader asserts on (both `read_local_xlog_page` and `WALRead`
-         abort there).  In production a background worker would call it as WAL is
-         shipped; the SQL function lets a test drive it (integration test indexes
-         a fresh table and confirms its block has records).  No daemon-side WAL
-         parser is written.
+         abort there).  With `pagestore.auto_wal_index`, a background worker
+         continuously decodes the durable shipped prefix and resumes from the
+         store's durable progress marker after restart.  The SQL function remains
+         available for targeted tests.  No daemon-side WAL parser is written.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it

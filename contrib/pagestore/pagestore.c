@@ -98,6 +98,7 @@ void		_PG_init(void);
 PGDLLEXPORT void pagestore_reader_snapshot_worker_main(Datum main_arg);
 PGDLLEXPORT void pagestore_reader_artifact_launcher_main(Datum main_arg);
 PGDLLEXPORT void pagestore_reader_artifact_database_main(Datum main_arg);
+PGDLLEXPORT void pagestore_wal_index_worker_main(Datum main_arg);
 
 /* GUC state */
 static bool pagestore_route_all = false;
@@ -107,6 +108,7 @@ static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
+static bool pagestore_auto_wal_index = false;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -759,73 +761,186 @@ pagestore_archive_configured(ArchiveModuleState *state)
 	return pagestore_localsvc_read_lsn() == 0;
 }
 
+/* Index only WAL that the daemon has durably accepted. */
+static int
+pagestore_index_wal_page_read(XLogReaderState *state,
+							 XLogRecPtr targetPagePtr, int reqLen,
+							 XLogRecPtr targetRecPtr, char *readBuf)
+{
+	int			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+											(uint64) targetPagePtr,
+											XLOG_BLCKSZ, readBuf);
+
+	(void) state;
+	(void) targetRecPtr;
+	return n >= reqLen ? n : -1;
+}
+
 /*
- * Decode the WAL in [start, end) and record, for each block a record modifies,
- * an entry in the store's per-page WAL index.  Reuses PostgreSQL's WAL reader
- * (read_local_xlog_page) -- which is why this must run in a normal backend, not
- * the archiver (the archiver lacks the recovery/timeline context the reader
- * asserts on).  In production a background worker would call this as WAL is
- * shipped; the SQL wrapper below lets a test drive it.
+ * Decode WAL in [start, end) and record, for each block a record modifies, an
+ * entry in the store's per-page WAL index.  The worker reads the durable store;
+ * the test-only SQL wrapper can still inspect the current local WAL tail.
  */
 static XLogRecPtr
-pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
+pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 {
-	ReadLocalXLogPageNoWaitPrivate *pd;
-	XLogReaderState *reader;
+	XLogReaderState *volatile reader = NULL;
+	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
 	XLogRecPtr	first;
 	XLogRecPtr	indexed_end = start;
 
-	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
-	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
-										   .segment_open = &wal_segment_open,
-										   .segment_close = &wal_segment_close),
-								pd);
-	if (reader == NULL)
+	PG_TRY();
 	{
-		pfree(pd);
-		return start;
-	}
-
-	{
-		char	   *ferrm;
-
-		first = XLogFindNextRecord(reader, start, &ferrm);
-	}
-	while (!XLogRecPtrIsInvalid(first))
-	{
-		char	   *errm;
-		XLogRecord *rec = XLogReadRecord(reader, &errm);
-
-		if (rec == NULL)
-			break;				/* end of flushed WAL / torn tail */
-		if (reader->ReadRecPtr >= end)
-			break;
-
-		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		if (from_store)
+			reader = XLogReaderAllocate(wal_segment_size, NULL,
+									 XL_ROUTINE(.page_read = &pagestore_index_wal_page_read),
+									 NULL);
+		else
 		{
-			RelFileLocator rloc;
-			ForkNumber	fk;
-			BlockNumber blk;
-			PageStoreRelKey key;
-
-			if (!XLogRecHasBlockRef(reader, b))
-				continue;
-			XLogRecGetBlockTagExtended(reader, b, &rloc, &fk, &blk, NULL);
-			key.spcOid = rloc.spcOid;
-			key.dbOid = rloc.dbOid;
-			key.relNumber = rloc.relNumber;
-			key.forkNum = fk;
-			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
+			pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+			reader = XLogReaderAllocate(wal_segment_size, NULL,
+									 XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+												.segment_open = &wal_segment_open,
+												.segment_close = &wal_segment_close),
+									 (void *) pd);
 		}
-		indexed_end = reader->EndRecPtr;
-	}
+		if (reader != NULL)
+		{
+			{
+				char	   *ferrm;
 
-	if (reader != NULL)
-		XLogReaderFree(reader);
-	if (pd != NULL)
-		pfree(pd);
+				first = XLogFindNextRecord((XLogReaderState *) reader, start, &ferrm);
+			}
+			while (!XLogRecPtrIsInvalid(first))
+			{
+				char	   *errm;
+				XLogRecord *rec = XLogReadRecord((XLogReaderState *) reader, &errm);
+
+				if (rec == NULL)
+					break;				/* end of shipped WAL / torn tail */
+				if (reader->ReadRecPtr >= end)
+					break;
+				if (reader->EndRecPtr > end)
+					break;				/* record crosses shipped boundary */
+
+				for (int b = 0;
+					 b <= XLogRecMaxBlockId((XLogReaderState *) reader); b++)
+				{
+					RelFileLocator rloc;
+					ForkNumber	fk;
+					BlockNumber blk;
+					PageStoreRelKey key;
+
+					if (!XLogRecHasBlockRef((XLogReaderState *) reader, b))
+						continue;
+					XLogRecGetBlockTagExtended((XLogReaderState *) reader, b,
+										   &rloc, &fk, &blk, NULL);
+					key.spcOid = rloc.spcOid;
+					key.dbOid = rloc.dbOid;
+					key.relNumber = rloc.relNumber;
+					key.forkNum = fk;
+					pagestore_localsvc_walidx_add(&key, blk,
+										   reader->ReadRecPtr);
+				}
+				indexed_end = reader->EndRecPtr;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (reader != NULL)
+			XLogReaderFree((XLogReaderState *) reader);
+		if (pd != NULL)
+			pfree((ReadLocalXLogPageNoWaitPrivate *) pd);
+	}
+	PG_END_TRY();
 	return indexed_end;
+}
+
+void
+pagestore_wal_index_worker_main(Datum main_arg)
+{
+	MemoryContext work_context;
+
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	BackgroundWorkerUnblockSignals();
+	work_context = AllocSetContextCreate(TopMemoryContext,
+									  "pagestore WAL index worker",
+									  ALLOCSET_DEFAULT_SIZES);
+
+	while (!ShutdownRequestPending)
+	{
+		bool		advanced = false;
+		MemoryContext old_context;
+
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		old_context = MemoryContextSwitchTo(work_context);
+		PG_TRY();
+		{
+			XLogRecPtr start = pagestore_localsvc_walidx_progress();
+			XLogRecPtr shipped_end = pagestore_localsvc_wal_end();
+			XLogRecPtr scan_start = start;
+			uint32		parent_timeline;
+			uint64		branch_lsn;
+
+			if (!XLogRecPtrIsInvalid(start) && shipped_end > start)
+			{
+				XLogRecPtr indexed_end;
+
+				/* A branch's first segment contains a copied parent prefix. */
+				if (pagestore_localsvc_timeline_parent(
+						pagestore_localsvc_timeline(), &parent_timeline,
+						&branch_lsn) && scan_start < (XLogRecPtr) branch_lsn)
+					scan_start = (XLogRecPtr) branch_lsn;
+				if (scan_start >= shipped_end)
+					indexed_end = shipped_end;
+				else
+					indexed_end = pagestore_index_wal_range(scan_start,
+														 shipped_end, true);
+
+				if (indexed_end > start)
+				{
+					pagestore_localsvc_walidx_commit(start, indexed_end);
+					advanced = true;
+				}
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			MemoryContext error_context = MemoryContextSwitchTo(TopMemoryContext);
+
+			edata = CopyErrorData();
+			MemoryContextSwitchTo(error_context);
+			if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
+				edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			{
+				FreeErrorData(edata);
+				PG_RE_THROW();
+			}
+			FlushErrorState();
+			ereport(WARNING,
+					(errmsg("pagestore WAL index worker failed: %s",
+							edata->message)));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+		MemoryContextSwitchTo(old_context);
+		MemoryContextReset(work_context);
+		if (advanced)
+			continue;
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1000L, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	proc_exit(0);
 }
 
 /*
@@ -841,7 +956,7 @@ pagestore_index_wal(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	start = PG_GETARG_LSN(0);
 	XLogRecPtr	end = PG_GETARG_LSN(1);
-	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end);
+	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end, false);
 
 	/* Only a contiguous scan may advance the durable resume boundary. */
 	if (pagestore_localsvc_walidx_progress() == start && indexed_end > start)
@@ -9203,6 +9318,14 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pagestore.auto_wal_index",
+							 "Continuously index WAL after it is shipped to pagestore.",
+							 "The worker advances only across a record-aligned, durable shipped-WAL prefix.",
+							 &pagestore_auto_wal_index,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL, NULL, NULL);
 
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,
@@ -9307,6 +9430,24 @@ _PG_init(void)
 				 "pagestore reader artifact launcher");
 		snprintf(worker.bgw_type, BGW_MAXLEN,
 				 "pagestore reader artifact launcher");
+		RegisterBackgroundWorker(&worker);
+	}
+	if (pagestore_auto_wal_index &&
+		pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0 &&
+		pagestore_localsvc_read_lsn() == 0)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 10;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pagestore");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN,
+				 "pagestore_wal_index_worker_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN, "pagestore WAL index worker");
+		snprintf(worker.bgw_type, BGW_MAXLEN, "pagestore WAL index worker");
 		RegisterBackgroundWorker(&worker);
 	}
 }
