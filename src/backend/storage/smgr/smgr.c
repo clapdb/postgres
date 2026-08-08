@@ -114,6 +114,7 @@ static f_smgr smgrsw[SMGR_MAX_IMPLS] = {
 		.smgr_extend = mdextend,
 		.smgr_zeroextend = mdzeroextend,
 		.smgr_prefetch = mdprefetch,
+		.smgr_prefetch_supported = NULL,
 		.smgr_maxcombine = mdmaxcombine,
 		.smgr_readv = mdreadv,
 		.smgr_startreadv = mdstartreadv,
@@ -675,11 +676,27 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 }
 
 /*
+ * smgrprefetchsupported() -- Does this implementation provide advisory
+ * prefetch?
+ *
+ * Registered storage managers that omit the callback are assumed to support
+ * advisory prefetch.
+ */
+bool
+smgrprefetchsupported(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_prefetch_supported == NULL)
+		return true;
+	return smgrsw[reln->smgr_which].smgr_prefetch_supported(reln);
+}
+
+/*
  * smgrprefetch() -- Initiate asynchronous read of the specified block of a relation.
  *
- * In recovery only, this can return false to indicate that a file
- * doesn't exist (presumably it has been dropped by a later WAL
- * record).
+ * Returns false when no advisory prefetch could be issued.  For md.c during
+ * recovery, that can indicate that the file doesn't exist (presumably it was
+ * dropped by a later WAL record).  Other storage managers may not have an
+ * advisory-prefetch primitive at all.
  */
 bool
 smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,

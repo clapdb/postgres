@@ -101,6 +101,7 @@ typedef struct f_smgr
 									BlockNumber blocknum, int nblocks, bool skipFsync);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
+	bool		(*smgr_prefetch_supported) (SMgrRelation reln); /* may be NULL */
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
 									BlockNumber blocknum);
 	void		(*smgr_readv) (SMgrRelation reln, ForkNumber forknum,
@@ -165,6 +166,7 @@ extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, int nblocks, bool skipFsync);
 extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks);
+extern bool smgrprefetchsupported(SMgrRelation reln);
 extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum);
 extern void smgrreadv(SMgrRelation reln, ForkNumber forknum,

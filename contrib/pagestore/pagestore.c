@@ -493,6 +493,12 @@ ps_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	return false;
 }
 
+static bool
+ps_prefetch_supported(SMgrRelation reln)
+{
+	return ACTIVE()->uses_local_files;
+}
+
 static uint32
 ps_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
@@ -632,6 +638,7 @@ static const f_smgr pagestore_smgr = {
 	.smgr_extend = ps_extend,
 	.smgr_zeroextend = ps_zeroextend,
 	.smgr_prefetch = ps_prefetch,
+	.smgr_prefetch_supported = ps_prefetch_supported,
 	.smgr_maxcombine = ps_maxcombine,
 	.smgr_readv = ps_readv,
 	.smgr_startreadv = ps_startreadv,

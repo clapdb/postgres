@@ -11,9 +11,6 @@
 # Self-asserting; needs a full PostgreSQL build.  Pass the meson build dir as $1.
 #   contrib/pagestore/redo_worker_demo.sh /path/to/build
 #
-# Limitation: the redo instance runs with recovery_prefetch=off (the backend's
-# recovery-prefetch/AIO path is not wired yet).  See WAL_REDO.md.
-#
 set -euo pipefail
 
 BUILD=${1:?usage: redo_worker_demo.sh <meson-build-dir>}
@@ -104,7 +101,7 @@ pagestore.route_all = on
 pagestore.backend = 'localsvc'
 pagestore.localsvc_shm = '$SHM'
 io_method = sync
-recovery_prefetch = off
+recovery_prefetch = try
 archive_mode = on
 archive_library = 'pagestore'
 listen_addresses = ''

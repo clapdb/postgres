@@ -724,6 +724,16 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
 			/*
+			 * A remote storage manager can legitimately lack an advisory
+			 * prefetch primitive.  In "try" mode, check its stable capability
+			 * before paying synchronous existence and size probes.  Keep "on"
+			 * strict by attempting the requested operation below.
+			 */
+			if (recovery_prefetch == RECOVERY_PREFETCH_TRY &&
+				!smgrprefetchsupported(reln))
+				return LRQ_NEXT_NO_IO;
+
+			/*
 			 * If the relation file doesn't exist on disk, for example because
 			 * we're replaying after a crash and the file will be created and
 			 * then unlinked by WAL that hasn't been replayed yet, suppress
@@ -787,11 +797,18 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			else if ((io_direct_flags & IO_DIRECT_DATA) == 0)
 			{
 				/*
-				 * This shouldn't be possible, because we already determined
-				 * that the relation exists on disk and is big enough.
-				 * Something is wrong with the cache invalidation for
-				 * smgrexists(), smgrnblocks(), or the file was unlinked or
-				 * truncated beneath our feet?
+				 * An individual advisory operation can also fail transiently.
+				 * "try" treats that as best-effort; implementations that lack the
+				 * capability entirely were filtered before the metadata probes.
+				 */
+				if (recovery_prefetch == RECOVERY_PREFETCH_TRY)
+					return LRQ_NEXT_NO_IO;
+
+				/*
+				 * For local storage this normally indicates a cache-invalidation
+				 * race or a concurrent unlink/truncate.  It also reports an
+				 * unsupported advisory-prefetch operation when recovery_prefetch
+				 * was explicitly forced on.
 				 */
 				elog(ERROR,
 					 "could not prefetch relation %u/%u/%u block %u",

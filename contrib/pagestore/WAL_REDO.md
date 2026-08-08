@@ -43,8 +43,12 @@ read pages at an LSN.
      `restore_command = pagestore_walrestore` and empty local pg_wal, so all WAL
      comes from the store; recovery's rm_redo replays it into the store and the
      post-backup change is recovered.  Reuses PostgreSQL's redo wholesale.
-     Caveat: the redo instance runs with `recovery_prefetch = off` (the
-     backend's recovery-prefetch/AIO path is not wired yet).
+     The redo instance can retain PostgreSQL's default
+     `recovery_prefetch = try`: localsvc does not provide kernel readahead, so
+     advisory prefetch safely degrades while normal reads continue through the
+     pagestore smgr.  Its `smgr_startreadv` path remains available separately
+     for PostgreSQL AIO reads.  Explicit `recovery_prefetch = on` stays strict
+     and reports that advisory prefetch is unavailable.
    - **3d-1** WAL-only compute -> non-redundant redo. ✅ `wal_only_redo_demo.sh`:
      the writer runs with `route_all = off`, so its relation pages stay local
      and only its WAL is shipped; the redo worker (`route_all = on`) then
