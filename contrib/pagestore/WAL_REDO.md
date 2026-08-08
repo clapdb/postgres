@@ -52,6 +52,14 @@ read pages at an LSN.
      Verified the table never reached the store from the compute (its file is
      local) yet exists in the store after redo, and the store grew.  This is the
      point of redo: the store's pages come from WAL, not from the compute.
+   - **3d-1b** Continuous local materializer topology. ✅
+     `continuous_redo_demo.sh` keeps the WAL-only writer and a separate archive-
+     recovery worker online concurrently.  The worker starts from a physical
+     base backup with no local WAL, consumes store-served segments, and exposes
+     two successive writer values while retaining no local heap file.  This
+     proves the stock recovery process can continuously follow and materialize
+     newly archived WAL; production worker provisioning, supervision, lag
+     control, and restart policy remain control-plane work.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
      everything.

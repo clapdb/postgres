@@ -129,12 +129,16 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
   restart-from-layers) — **done** (LSM phases 2–3).
 - `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +
   delta-layer format + read plan — **partial** (7a/7b and continuous auto-index
-  done; the continuous page applicator is still a worker).
+  done; the continuous recovery-worker topology is proven, while its managed
+  production lifecycle remains).
 - `materialize`:
   - inline-none (page-ingest) — **done** (the page is the image-layer version).
-  - local-worker — **prototype exists**: `wal_only_redo_demo.sh` runs a
-    recovery-worker that replays shipped WAL into image layers via smgr; making
-    it a *continuous* applicator is the next step.
+  - local-worker — **continuous topology proven**: `wal_only_redo_demo.sh` runs
+    a recovery worker that replays shipped WAL into image layers via smgr, and
+    `continuous_redo_demo.sh` keeps a WAL-only writer and a distinct recovery
+    worker online together while later archived segments are materialized.  A
+    production control-plane lifecycle (provisioning, health, restart, and
+    backpressure for that worker) is the next step.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is
