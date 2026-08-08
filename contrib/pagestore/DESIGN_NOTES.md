@@ -108,5 +108,7 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon
   (see WAL_REDO.md); the per-page WAL index population follows that rule.
-- `recovery_prefetch=off` is required by the redo worker (the backend's
-  recovery-prefetch/AIO path is not wired).
+- A redo worker may use the default `recovery_prefetch=try`.  The localsvc
+  backend has no kernel-readahead primitive, so advisory prefetch degrades to
+  ordinary reads; forcing `recovery_prefetch=on` remains an error.  Its
+  `smgr_startreadv` path is available independently for PostgreSQL AIO reads.

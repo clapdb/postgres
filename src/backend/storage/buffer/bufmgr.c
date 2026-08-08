@@ -799,9 +799,10 @@ PrefetchSharedBuffer(SMgrRelation smgr_reln,
  *
  * 3.  Otherwise, the buffer wasn't already cached by PostgreSQL, and
  * USE_PREFETCH is not defined (this build doesn't support prefetching due to
- * lack of a kernel facility), direct I/O is enabled, or the underlying
- * relation file wasn't found and we are in recovery.  (If the relation file
- * wasn't found and we are not in recovery, an error is raised).
+ * lack of a kernel facility), direct I/O is enabled, the storage manager
+ * doesn't provide advisory prefetch, or the underlying relation file wasn't
+ * found and we are in recovery.  (If the relation file wasn't found and we
+ * are not in recovery, an error is raised).
  */
 PrefetchBufferResult
 PrefetchBuffer(Relation reln, ForkNumber forkNum, BlockNumber blockNum)
