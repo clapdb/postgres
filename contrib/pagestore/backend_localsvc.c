@@ -1053,11 +1053,17 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 uint64
 pagestore_localsvc_wal_end(void)
 {
+	return pagestore_localsvc_wal_end_timeout(0);
+}
+
+uint64
+pagestore_localsvc_wal_end_timeout(int timeout_ms)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_SIZE;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_lsn;
 }
 
@@ -1322,11 +1328,21 @@ bool
 pagestore_localsvc_timeline_parent(uint32 timeline, uint32 *parent_timeline,
 								   uint64 *branch_lsn)
 {
+	return pagestore_localsvc_timeline_parent_timeout(timeline,
+													 parent_timeline, branch_lsn, 0);
+}
+
+bool
+pagestore_localsvc_timeline_parent_timeout(uint32 timeline,
+										  uint32 *parent_timeline,
+										  uint64 *branch_lsn,
+										  int timeout_ms)
+{
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_TIMELINE_INFO;
 	ch->timeline = timeline;
-	ls_exec(ch);
+	ls_exec_timeout(ch, timeout_ms);
 	if (ch->result == 0)
 		return false;
 	*parent_timeline = ch->parent_timeline;

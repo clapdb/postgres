@@ -21,6 +21,12 @@ pagestore = shared_module('pagestore',
 )
 contrib_targets += pagestore
 
+install_data(
+  'pagestore.control',
+  'pagestore--1.0.sql',
+  kwargs: contrib_data_args,
+)
+
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
