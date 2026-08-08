@@ -22,6 +22,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +32,40 @@
 #include "pagestore_ipc.h"
 
 static void *shm;
-static int	chan;
+static volatile sig_atomic_t chan = -1;
+static volatile sig_atomic_t request_in_flight;
+
+static void
+restore_signal_exit(int signo)
+{
+	if (shm != NULL && chan >= 0)
+		ps_store_release(&ps_channel(shm, chan)->claimed,
+						 request_in_flight ? 2 : 0);
+	_exit(128 + signo);
+}
+
+static void
+release_channel(void)
+{
+	sigset_t	blockset,
+				oldset;
+
+	sigemptyset(&blockset);
+	sigaddset(&blockset, SIGTERM);
+	sigaddset(&blockset, SIGINT);
+	sigaddset(&blockset, SIGQUIT);
+	sigprocmask(SIG_BLOCK, &blockset, &oldset);
+	if (shm != NULL && chan >= 0)
+	{
+		int			release_chan = (int) chan;
+
+		/* Disarm the signal handler before making the mailbox claimable. */
+		chan = -1;
+		ps_store_release(&ps_channel(shm, release_chan)->claimed,
+						 request_in_flight ? 2 : 0);
+	}
+	sigprocmask(SIG_SETMASK, &oldset, NULL);
+}
 
 /* A restore_command also receives .history and .backup archive objects. */
 static int
@@ -54,6 +88,8 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 {
 	int			fd = shm_open(shm_name, O_RDWR, 0600);
 	PsShmHeader *hdr;
+	sigset_t	claimset,
+				oldset;
 
 	(void) page_size_unused;
 	if (fd < 0)
@@ -75,12 +111,45 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 				"walrestore built against different PS_SHM_VERSION?)\n");
 		exit(2);
 	}
+
+	/*
+	 * Arm cleanup before claiming, then block terminating signals across the
+	 * CAS-to-chan assignment gap.  A signal during an active request marks the
+	 * mailbox abandoned so it cannot be reused while the daemon may write it.
+	 */
+	atexit(release_channel);
+	signal(SIGTERM, restore_signal_exit);
+	signal(SIGINT, restore_signal_exit);
+	signal(SIGQUIT, restore_signal_exit);
+	sigemptyset(&claimset);
+	sigaddset(&claimset, SIGTERM);
+	sigaddset(&claimset, SIGINT);
+	sigaddset(&claimset, SIGQUIT);
+	sigprocmask(SIG_BLOCK, &claimset, &oldset);
+
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
 		if (ps_cas(&ps_channel(shm, i)->claimed, 0, 1))
 		{
 			chan = (int) i;
+			sigprocmask(SIG_SETMASK, &oldset, NULL);
 			return;
 		}
+
+	/* Reuse abandoned mailboxes only after no daemon write can still arrive. */
+	for (uint32_t i = 0; i < hdr->nchannels; i++)
+		if (ps_cas(&ps_channel(shm, i)->claimed, 2, 1))
+		{
+			uint32_t	state = ps_load_acquire(&ps_channel(shm, i)->state);
+
+			if (state == PS_STATE_DONE || state == PS_STATE_IDLE)
+			{
+				chan = (int) i;
+				sigprocmask(SIG_SETMASK, &oldset, NULL);
+				return;
+			}
+			ps_store_release(&ps_channel(shm, i)->claimed, 2);
+		}
+	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	fprintf(stderr, "no free channel\n");
 	exit(2);
 }
@@ -95,9 +164,11 @@ wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 	ch->opcode = PS_OP_WAL_READ;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
+	request_in_flight = 1;
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;
+	request_in_flight = 0;
 	memcpy(out, ch->data, len);
 	return ch->result;
 }
@@ -176,6 +247,11 @@ main(int argc, char **argv)
 	client_attach(shm_name, 0);
 
 	buf = malloc(PS_IO_UNIT);
+	if (buf == NULL)
+	{
+		fprintf(stderr, "out of memory\n");
+		return 2;
+	}
 	outfd = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (outfd < 0)
 	{

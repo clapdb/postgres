@@ -199,6 +199,26 @@ else
 fi
 rm -f "$history_out"
 
+# restore_command is a short-lived process and may be invoked indefinitely at
+# the current archive end.  More invocations than the channel count must not
+# exhaust the daemon's shared-memory mailboxes.
+missing_out=$(mktemp)
+walrestore_reuse_ok=1
+for _ in $(seq 1 160); do
+	rm -f "$missing_out"
+	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
+		--timeline 0 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
+		"$missing_out" >/dev/null 2>&1
+	[ "$?" -eq 1 ] || { walrestore_reuse_ok=0; break; }
+done
+if [ "$walrestore_reuse_ok" -eq 1 ]; then
+	echo "ok   - repeated walrestore archive misses release their daemon channel"
+else
+	echo "FAIL - repeated walrestore calls leaked/exhausted daemon channels"
+	fail=1
+fi
+rm -f "$missing_out"
+
 # --- 5. per-page WAL index: decode WAL (reusing PG's reader) and query it ---
 $P -c "CREATE FUNCTION pagestore_index_wal(pg_lsn,pg_lsn) RETURNS void
         AS 'pagestore','pagestore_index_wal' LANGUAGE C STRICT;" >/dev/null

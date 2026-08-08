@@ -153,5 +153,8 @@ jobs:
       - name: Run WAL-only (non-redundant) redo demo
         run: contrib/pagestore/wal_only_redo_demo.sh "$(pwd)/build"
 
+      - name: Run continuous WAL redo materializer demo
+        run: contrib/pagestore/continuous_redo_demo.sh "$(pwd)/build"
+
       - name: Run end-to-end branch boot test
         run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
