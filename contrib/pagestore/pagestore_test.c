@@ -3044,12 +3044,17 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "rejected WAL index progress leaves the committed end unchanged");
 		op_create_branch(2, 0, 0);
 		op_wal_append(2, high, wal, 16);
+		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
+			  progress == high,
+			  "first WAL append publishes the initial indexing boundary");
 		check(op_walidx_progress(2, high, high + 16, &progress) == 0,
 			  "WAL index progress accepts a 64-bit LSN start");
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
 			  "WAL index progress reports a 64-bit committed end");
 		op_create_branch(3, 0, 0);
+		op_create_branch(4, 0, 0);
+		op_wal_append(4, high + 32, wal, 16);
 	}
 
 	/* The index is durable independently of the daemon's in-memory hash tables. */
@@ -3081,6 +3086,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  "64-bit WAL index progress survives daemon restart");
 		check(op_walidx_progress(3, high, high + 16, &progress) != 0,
 			  "WAL index progress rejects WAL with a missing payload");
+		check(op_walidx_progress(4, 0, 0, &progress) == 0 &&
+			  progress == high + 32,
+			  "initial indexing boundary is recovered from durable WAL");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */

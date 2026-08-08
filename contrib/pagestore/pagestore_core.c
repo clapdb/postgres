@@ -2235,6 +2235,8 @@ static uint32_t wal_chunks_n[MAX_TIMELINES];
 static uint32_t wal_chunks_cap[MAX_TIMELINES];
 static uint64_t wal_log_bytes[MAX_TIMELINES];
 
+static void walidx_progress_init(uint32_t tl, uint64_t first_lsn);
+
 static int
 wal_chunk_reserve(uint32_t tl)
 {
@@ -2421,6 +2423,8 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 
 	wal_chunk_add(tl, wal_log_bytes[tl], &h);
 	wal_end_advance(tl, start_lsn + len);
+	if (len > 0)
+		walidx_progress_init(tl, start_lsn);
 	return 0;
 }
 
@@ -2722,6 +2726,17 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static void
+walidx_progress_init(uint32_t tl, uint64_t first_lsn)
+{
+	if (tl >= MAX_TIMELINES || first_lsn == UINT64_MAX)
+		return;
+	pthread_mutex_lock(&walidx_meta_lock);
+	if (walidx_progress[tl] == 0)
+		walidx_progress[tl] = first_lsn;
+	pthread_mutex_unlock(&walidx_meta_lock);
+}
 
 static uint32_t
 walidx_rec_crc(WalIdxRec *rec)
@@ -5298,6 +5313,7 @@ ps_core_open(const char *store_dir)
 		{
 			if (wal_recover_one(tl) != 0)
 				return -1;
+			walidx_progress_init(tl, wal_log_start(tl));
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
 				if (walidx_recover_one(tl, shard) != 0)
 					return -1;
