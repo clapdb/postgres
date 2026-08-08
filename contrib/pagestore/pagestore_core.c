@@ -5245,11 +5245,22 @@ ps_core_maintenance(void)
 	{
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{
-			Shard	   *s = &g_shards[sh];
+			uint32_t	victim = 0;
+			int			due;
 
-			if (s->flush_watermark_valid &&
-				s->gc_next_seg < s->flush_watermark.seg_id)
-				prepare_segment_layers(s->id, s->gc_next_seg);
+			/* flush_memtable() publishes the coverage watermark while its
+			 * foreground worker holds shard-wr.  Snapshot the candidate under
+			 * shard-rd, then release it before layer materialization can perform
+			 * remote I/O.  A newer watermark only makes this victim safer. */
+			ps_lock_shard_rd(sh);
+			due = g_shards[sh].flush_watermark_valid &&
+				g_shards[sh].gc_next_seg <
+				g_shards[sh].flush_watermark.seg_id;
+			if (due)
+				victim = g_shards[sh].gc_next_seg;
+			ps_unlock_shard(sh);
+			if (due)
+				prepare_segment_layers(sh, victim);
 		}
 		for (uint32_t sh = 0; sh < ns; sh++)
 			ps_lock_shard_wr(sh);
