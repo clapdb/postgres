@@ -140,6 +140,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_WAL_INDEX_ADD_BATCH:
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:

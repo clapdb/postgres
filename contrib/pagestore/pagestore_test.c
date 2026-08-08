@@ -963,6 +963,28 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec();
 }
 
+static void
+op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
+					const uint32_t *blocks, const uint64_t *lsns, uint32_t nentries)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+	cl_setkey(ch, rel, fork);
+	for (uint32_t i = 0; i < nentries; i++)
+	{
+		entries[i].key = ch->key;
+		entries[i].block = blocks[i];
+		entries[i].pad = 0;
+		entries[i].lsn = lsns[i];
+	}
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = nentries;
+	ch->datalen = nentries * sizeof(*entries);
+	cl_exec();
+}
+
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
 static int
 op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
@@ -3003,6 +3025,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 0, 200);
 	op_walidx_add(0, REL_A, FORK0, 0, 300);
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
+	{
+		const uint32_t blocks[] = {7, 8, 7};
+		const uint64_t lsns[] = {175, 225, 275};
+
+		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, 3);
+	}
 	check(nonzero_rel != 0, "test harness can find a nonzero WAL-index shard relation");
 	if (nonzero_rel != 0)
 	{
@@ -3029,6 +3057,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
+	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
+		  "batched WAL-index entries are queryable in LSN order");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
@@ -3075,6 +3106,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
 	check(n == 1 && out[0].lsn == 150,
 		  "restart replays WAL index records without duplicating them");
+	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
+	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
+		  "batched WAL-index entries survive daemon restart");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;

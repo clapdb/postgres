@@ -776,6 +776,8 @@ pagestore_index_wal_page_read(XLogReaderState *state,
 	return n >= reqLen ? n : -1;
 }
 
+#define PAGESTORE_WAL_INDEX_BATCH_MAX 4096
+
 /*
  * Decode WAL in [start, end) and record, for each block a record modifies, an
  * entry in the store's per-page WAL index.  The worker reads the durable store;
@@ -788,9 +790,12 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
 	XLogRecPtr	first;
 	XLogRecPtr	indexed_end = start;
+	PageStoreWalIndexEntry *volatile batch = NULL;
+	int			nbatch = 0;
 
 	PG_TRY();
 	{
+		batch = palloc(sizeof(*batch) * PAGESTORE_WAL_INDEX_BATCH_MAX);
 		if (from_store)
 			reader = XLogReaderAllocate(wal_segment_size, NULL,
 									 XL_ROUTINE(.page_read = &pagestore_index_wal_page_read),
@@ -839,11 +844,22 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 					key.dbOid = rloc.dbOid;
 					key.relNumber = rloc.relNumber;
 					key.forkNum = fk;
-					pagestore_localsvc_walidx_add(&key, blk,
-										   reader->ReadRecPtr);
+					batch[nbatch].key = key;
+					batch[nbatch].block = blk;
+					batch[nbatch].lsn = reader->ReadRecPtr;
+					nbatch++;
+					if (nbatch == PAGESTORE_WAL_INDEX_BATCH_MAX)
+					{
+						pagestore_localsvc_walidx_add_batch(
+							(PageStoreWalIndexEntry *) batch, nbatch);
+						nbatch = 0;
+					}
 				}
 				indexed_end = reader->EndRecPtr;
 			}
+			if (nbatch > 0)
+				pagestore_localsvc_walidx_add_batch(
+					(PageStoreWalIndexEntry *) batch, nbatch);
 		}
 	}
 	PG_FINALLY();
@@ -852,6 +868,8 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 			XLogReaderFree((XLogReaderState *) reader);
 		if (pd != NULL)
 			pfree((ReadLocalXLogPageNoWaitPrivate *) pd);
+		if (batch != NULL)
+			pfree((PageStoreWalIndexEntry *) batch);
 	}
 	PG_END_TRY();
 	return indexed_end;

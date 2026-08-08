@@ -68,8 +68,10 @@ read pages at an LSN.
          context the reader asserts on (both `read_local_xlog_page` and `WALRead`
          abort there).  With `pagestore.auto_wal_index`, a background worker
          continuously decodes the durable shipped prefix and resumes from the
-         store's durable progress marker after restart.  The SQL function remains
-         available for targeted tests.  No daemon-side WAL parser is written.
+         store's durable progress marker after restart.  Index entries are sent
+         in shard-local batches so backlog replay does not pay one IPC round trip
+         per touched block.  The SQL function remains available for targeted
+         tests.  No daemon-side WAL parser is written.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it
