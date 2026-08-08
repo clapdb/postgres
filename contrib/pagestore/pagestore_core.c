@@ -3206,28 +3206,45 @@ walidx_progress_read(uint32_t tl)
 	return progress;
 }
 
-/* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
- * max_out); return how many.  Walks the timeline ancestry. */
 static int
-walrec_cmp(const void *a, const void *b)
+walidx_upper_bound(WalIdxEnt *e, uint64_t lsn)
 {
-	const PsWalRec *ra = (const PsWalRec *) a;
-	const PsWalRec *rb = (const PsWalRec *) b;
+	int			lo = 0;
+	int			hi = e->n;
 
-	if (ra->lsn != rb->lsn)
-		return (ra->lsn > rb->lsn) - (ra->lsn < rb->lsn);
-	return (ra->timeline > rb->timeline) - (ra->timeline < rb->timeline);
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (e->lsns[mid] <= lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
 }
 
+/*
+ * Merge the already-sorted per-timeline arrays directly into one bounded
+ * response page.  A cursor request neither allocates nor scans the remaining
+ * history beyond the next max_out records.
+ */
 static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		   int have_cursor, uint64_t cursor_lsn, uint32_t cursor_timeline,
 		   PsWalRec *out, int max_out)
 {
+	typedef struct WalIdxSource
+	{
+		WalIdxEnt  *entry;
+		uint32_t	timeline;
+		int			pos;
+		int			end;
+	} WalIdxSource;
+	WalIdxSource sources[MAX_TIMELINES];
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
-	PsWalRec  *all = NULL;
-	int			nall = 0;
-	int			cap = 0;
+	int			nsources = 0;
+	int			nout = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
 
 	do
@@ -3242,44 +3259,59 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
-				/* tag each durably published record with its source timeline */
-				for (int i = 0; i < e->n; i++)
-					if (e->lsns[i] <= w.lsn && e->lsns[i] < visible_end)
-					{
-						if (have_cursor &&
-							(e->lsns[i] < cursor_lsn ||
-							 (e->lsns[i] == cursor_lsn && w.tl <= cursor_timeline)))
-							continue;
-						if (nall == cap)
-						{
-							PsWalRec   *grown;
+				int			pos = have_cursor ?
+					walidx_lower_bound(e, cursor_lsn) : 0;
+				uint64_t	cap_lsn = w.lsn < visible_end - 1 ?
+					w.lsn : visible_end - 1;
+				int			end = walidx_upper_bound(e, cap_lsn);
 
-							cap = cap ? cap * 2 : 64;
-							grown = realloc(all, (size_t) cap * sizeof(*all));
-							if (grown == NULL)
-							{
-								free(all);
-								return -1;
-							}
-							all = grown;
-						}
-						all[nall].lsn = e->lsns[i];
-						all[nall].timeline = w.tl;
-						nall++;
-					}
+				if (have_cursor && pos < end && e->lsns[pos] == cursor_lsn &&
+					w.tl <= cursor_timeline)
+					pos++;
+				if (pos < end)
+				{
+					sources[nsources].entry = e;
+					sources[nsources].timeline = w.tl;
+					sources[nsources].pos = pos;
+					sources[nsources].end = end;
+					nsources++;
+				}
 				break;
 			}
 	} while (tl_walk_next(&w));
 
-	/* gathered newest-timeline-first across the ancestry; redo (and the base
-	 * search) need them in ascending LSN order */
-	qsort(all, (size_t) nall, sizeof(PsWalRec), walrec_cmp);
-	if (nall > max_out)
-		nall = max_out;
-	if (nall > 0)
-		memcpy(out, all, (size_t) nall * sizeof(*out));
-	free(all);
-	return nall;
+	while (nout < max_out)
+	{
+		int			best = -1;
+
+		for (int i = 0; i < nsources; i++)
+		{
+			uint64_t	lsn;
+			uint64_t	best_lsn;
+
+			if (sources[i].pos >= sources[i].end)
+				continue;
+			lsn = sources[i].entry->lsns[sources[i].pos];
+			if (best < 0)
+			{
+				best = i;
+				continue;
+			}
+			best_lsn = sources[best].entry->lsns[sources[best].pos];
+			if (lsn < best_lsn ||
+				(lsn == best_lsn &&
+				 sources[i].timeline < sources[best].timeline))
+				best = i;
+		}
+		if (best < 0)
+			break;
+		out[nout] = (PsWalRec) {
+			.lsn = sources[best].entry->lsns[sources[best].pos++],
+			.timeline = sources[best].timeline
+		};
+		nout++;
+	}
+	return nout;
 }
 
 /* ===================== write / read primitives ========================= */
