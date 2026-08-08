@@ -1165,39 +1165,129 @@ pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 	ls_exec(ch);
 }
 
+void
+pagestore_localsvc_walidx_add_batch(const PageStoreWalIndexEntry *entries,
+									int nentries)
+{
+	PsWalIndexEntry *wire;
+	uint32		nshards;
+
+	if (nentries <= 0)
+		return;
+	if (localsvc_read_lsn != 0)
+		ls_reject_pinned_write("WAL index append");
+	ls_attach();
+	nshards = ls_nshards;
+	wire = palloc(PS_IO_UNIT);
+	for (uint32 shard = 0; shard < nshards; shard++)
+	{
+		int			count = 0;
+		PsChannel  *ch;
+
+		for (int i = 0; i < nentries; i++)
+		{
+			PsKey		key;
+
+			key.spcOid = entries[i].key.spcOid;
+			key.dbOid = entries[i].key.dbOid;
+			key.relNumber = entries[i].key.relNumber;
+			key.forkNum = entries[i].key.forkNum;
+			key.klass = PS_KLASS_RELATION;
+			if (ps_key_shard(&key, nshards) != shard)
+				continue;
+			if ((count + 1) * sizeof(PsWalIndexEntry) > PS_IO_UNIT)
+				elog(ERROR, "pagestore WAL index batch is too large");
+			wire[count].key = key;
+			wire[count].block = entries[i].block;
+			wire[count].pad = 0;
+			wire[count].lsn = entries[i].lsn;
+			count++;
+		}
+		if (count == 0)
+			continue;
+		ls_claim_channel(shard);
+		ch = ps_channel(ls_shm, ls_channel);
+		ch->key = wire[0].key;
+		ch->timeline = (uint32) localsvc_timeline;
+		ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+		ch->nblocks = count;
+		ch->datalen = count * sizeof(PsWalIndexEntry);
+		memcpy(ch->data, wire, ch->datalen);
+		ls_exec(ch);
+	}
+	pfree(wire);
+}
+
 /* Number of indexed WAL records that modify (key, block) on this timeline. */
 int
 pagestore_localsvc_walidx_count(const PageStoreRelKey *key, BlockNumber block)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsWalRec  *recs;
+	int			n = pagestore_localsvc_walidx_get(key, block, PG_UINT64_MAX, &recs);
 
-	ls_fill_key(ch, key);
-	ch->opcode = PS_OP_WAL_INDEX_GET;
-	ch->blocknum = block;
-	ch->req_lsn = PG_UINT64_MAX;	/* all records */
-	ls_exec(ch);
-	return (int) ch->result;
+	pfree(recs);
+	return n;
 }
 
-/* Fetch up to maxn record LSNs (<= lsn_max) for (key, block) into out;
- * returns how many.  Ascending order. */
+/* Fetch every record LSN <= lsn_max in ascending (LSN,timeline) order. */
 int
 pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
-							  uint64 lsn_max, PsWalRec *out, int maxn)
+							  uint64 lsn_max, PsWalRec **out)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
-	int			n;
+	const int	batch_max = PS_IO_UNIT / sizeof(PsWalRec);
+	PsWalRec  *result = palloc(sizeof(*result));
+	int			nresult = 0;
+	int			capacity = 1;
 
-	ls_fill_key(ch, key);
-	ch->opcode = PS_OP_WAL_INDEX_GET;
-	ch->blocknum = block;
-	ch->req_lsn = lsn_max;
-	ls_exec(ch);
-	n = (int) ch->result;
-	if (n > maxn)
-		n = maxn;
-	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
-	return n;
+	for (;;)
+	{
+		PsChannel  *ch = ls_chan_for_key(key);
+		int			n;
+
+		ls_fill_key(ch, key);
+		ch->opcode = PS_OP_WAL_INDEX_GET;
+		ch->blocknum = block;
+		ch->nblocks = batch_max;
+		ch->req_lsn = lsn_max;
+		ch->pad1 = 0;
+		ch->req_seq = 0;
+		ch->parent_timeline = 0;
+		if (nresult > 0)
+		{
+			ch->pad1 = 1;
+			ch->req_seq = result[nresult - 1].lsn;
+			ch->parent_timeline = result[nresult - 1].timeline;
+		}
+		ls_exec(ch);
+		n = (int) ch->result;
+		if (n > 0)
+		{
+			int			required;
+
+			if (nresult > PG_INT32_MAX - n)
+				elog(ERROR, "pagestore WAL index result is too large");
+			required = nresult + n;
+			if (required > capacity)
+			{
+				while (capacity < required)
+				{
+					if (capacity > PG_INT32_MAX / 2)
+					{
+						capacity = required;
+						break;
+					}
+					capacity *= 2;
+				}
+				result = repalloc_array(result, PsWalRec, capacity);
+			}
+			memcpy(&result[nresult], ch->data, (size_t) n * sizeof(*result));
+			nresult = required;
+		}
+		if (n < batch_max)
+			break;
+	}
+	*out = result;
+	return nresult;
 }
 
 uint64

@@ -188,6 +188,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_WAL_INDEX_ADD_BATCH:
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
@@ -567,6 +568,7 @@ main(int argc, char **argv)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	daemon_hdr = hdr;
+	ps_core_set_metrics_header(hdr);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;

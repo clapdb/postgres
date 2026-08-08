@@ -29,7 +29,10 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		22	/* 22: TIMELINE_INFO opcode added;
+#define PS_SHM_VERSION		25	/* 25: WAL_INDEX_GET cursor pagination;
+								 * 24: WAL-index lag metrics added;
+								 * 23: WAL_INDEX_ADD_BATCH opcode added;
+								 * 22: TIMELINE_INFO opcode added;
 								 * 21: READER_SNAPSHOT object class added;
 								 * 20: WAL_INDEX_PROGRESS opcode added;
 							 * 19: checkpoint admission gate + barrier;
@@ -97,6 +100,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_SIZE,				/* return end LSN of the timeline's WAL in req_lsn */
 	PS_OP_WAL_READ,				/* read datalen WAL bytes from LSN req_lsn into data */
 	PS_OP_WAL_INDEX_ADD,		/* record: WAL at req_lsn modifies (key, blocknum) */
+	PS_OP_WAL_INDEX_ADD_BATCH,	/* nblocks PsWalIndexEntry records in data[] */
 	PS_OP_WAL_INDEX_GET,		/* list record LSNs <= req_lsn for (key, blocknum) */
 	PS_OP_WAL_INDEX_PROGRESS,	/* req_lsn=start, req_seq=end; 0/0 reads end */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
@@ -160,6 +164,14 @@ typedef struct PsWalRec
 	uint32_t	timeline;		/* source timeline the record lives on */
 } PsWalRec;
 
+typedef struct PsWalIndexEntry
+{
+	PsKey		key;
+	uint32_t	block;
+	uint32_t	pad;
+	uint64_t	lsn;
+} PsWalIndexEntry;
+
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
  * stable enough for shard selection, and it is reused for client+daemon key->shard.
  */
@@ -199,14 +211,14 @@ typedef struct PsChannel
 	uint32_t	is_redo;
 	uint32_t	skip_fsync;
 	uint32_t	blocknum;
-	uint32_t	nblocks;
+	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
 	uint32_t	old_nblocks;
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
-	uint32_t	parent_timeline;	/* CREATE_BRANCH: parent timeline */
+	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor timeline */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
-	uint32_t	pad1;
+	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
-	uint64_t	req_seq;		/* read admission cap; write result sequence */
+	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
 	PsKey		key;
 
 	/* result */
@@ -245,6 +257,9 @@ typedef struct PsShmHeader
 	uint64_t	admission_fence_epoch; /* monotonically identifies gate attempts */
 	uint64_t	admission_pending_epoch; /* 0, or the currently active gate */
 	uint64_t	admission_pending_lsn; /* relation mutations <= this LSN defer */
+	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
+	uint32_t	wal_index_lagging_timelines;
+	uint32_t	pad2;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

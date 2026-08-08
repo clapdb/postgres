@@ -109,6 +109,7 @@ static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
 static bool pagestore_auto_wal_index = false;
+static int pagestore_wal_index_max_lag_mb = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static get_snapshot_data_hook_type prev_get_snapshot_data_hook = NULL;
@@ -776,6 +777,8 @@ pagestore_index_wal_page_read(XLogReaderState *state,
 	return n >= reqLen ? n : -1;
 }
 
+#define PAGESTORE_WAL_INDEX_BATCH_MAX 4096
+
 /*
  * Decode WAL in [start, end) and record, for each block a record modifies, an
  * entry in the store's per-page WAL index.  The worker reads the durable store;
@@ -788,9 +791,12 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
 	XLogRecPtr	first;
 	XLogRecPtr	indexed_end = start;
+	PageStoreWalIndexEntry *volatile batch = NULL;
+	int			nbatch = 0;
 
 	PG_TRY();
 	{
+		batch = palloc(sizeof(*batch) * PAGESTORE_WAL_INDEX_BATCH_MAX);
 		if (from_store)
 			reader = XLogReaderAllocate(wal_segment_size, NULL,
 									 XL_ROUTINE(.page_read = &pagestore_index_wal_page_read),
@@ -839,11 +845,22 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 					key.dbOid = rloc.dbOid;
 					key.relNumber = rloc.relNumber;
 					key.forkNum = fk;
-					pagestore_localsvc_walidx_add(&key, blk,
-										   reader->ReadRecPtr);
+					batch[nbatch].key = key;
+					batch[nbatch].block = blk;
+					batch[nbatch].lsn = reader->ReadRecPtr;
+					nbatch++;
+					if (nbatch == PAGESTORE_WAL_INDEX_BATCH_MAX)
+					{
+						pagestore_localsvc_walidx_add_batch(
+							(PageStoreWalIndexEntry *) batch, nbatch);
+						nbatch = 0;
+					}
 				}
 				indexed_end = reader->EndRecPtr;
 			}
+			if (nbatch > 0)
+				pagestore_localsvc_walidx_add_batch(
+					(PageStoreWalIndexEntry *) batch, nbatch);
 		}
 	}
 	PG_FINALLY();
@@ -852,6 +869,8 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 			XLogReaderFree((XLogReaderState *) reader);
 		if (pd != NULL)
 			pfree((ReadLocalXLogPageNoWaitPrivate *) pd);
+		if (batch != NULL)
+			pfree((PageStoreWalIndexEntry *) batch);
 	}
 	PG_END_TRY();
 	return indexed_end;
@@ -974,6 +993,11 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	int			fd;
 	char	   *buf;
 	uint64		off = 0;
+	uint64		shipped_end;
+	uint64		indexed_end = 0;
+	uint64		max_lag = 0;
+	uint64		headroom = 0;
+	uint64		max_record_wal_span;
 
 	/*
 	 * Only ship real WAL segment files.  The archiver also offers backup
@@ -991,6 +1015,25 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	if (pagestore_localsvc_read_lsn() != 0)
 		return false;
 
+	/* An empty store's index begins at the first segment actually shipped. */
+	shipped_end = pagestore_localsvc_wal_end();
+	if (pagestore_wal_index_max_lag_mb > 0)
+	{
+		indexed_end = shipped_end == 0 ? seg_start :
+			pagestore_localsvc_walidx_progress();
+		max_lag = (uint64) pagestore_wal_index_max_lag_mb * 1024 * 1024;
+		/*
+		 * XLogRecordMaxSize counts record bytes, not their WAL-address span.
+		 * Conservatively charge every page the larger long-header size, plus
+		 * one initial partial page for a record that starts at page end.
+		 */
+		max_record_wal_span =
+			((uint64) XLogRecordMaxSize +
+			 (XLOG_BLCKSZ - SizeOfXLogLongPHD) - 1) /
+			(XLOG_BLCKSZ - SizeOfXLogLongPHD) * XLOG_BLCKSZ + XLOG_BLCKSZ;
+		headroom = max_lag + max_record_wal_span + wal_segment_size;
+	}
+
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 	{
@@ -1000,11 +1043,36 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 						path)));
 		return false;
 	}
-
 	buf = palloc(PS_IO_UNIT);
 	for (;;)
 	{
-		ssize_t		n = read(fd, buf, PS_IO_UNIT);
+		ssize_t		n;
+
+		if (pagestore_wal_index_max_lag_mb > 0)
+		{
+			/*
+			 * A decoder cannot advance past a partial record.  Reserve enough for
+			 * PostgreSQL's largest legal record plus segment/page padding so
+			 * backpressure cannot strand the index boundary inside that record.
+			 */
+			if (seg_start + off > indexed_end &&
+				seg_start + off - indexed_end >= headroom)
+			{
+				indexed_end = pagestore_localsvc_walidx_progress();
+				if (seg_start + off > indexed_end &&
+					seg_start + off - indexed_end >= headroom)
+				{
+					pfree(buf);
+					close(fd);
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: WAL index is %llu bytes behind",
+									(unsigned long long) (seg_start + off - indexed_end)),
+							 errhint("Increase pagestore.wal_index_max_lag_mb or restore WAL indexing progress.")));
+					return false;
+				}
+			}
+		}
+		n = read(fd, buf, PS_IO_UNIT);
 
 		if (n < 0)
 		{
@@ -1014,7 +1082,11 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 		}
 		if (n == 0)
 			break;
-		/* ship this chunk at its WAL position */
+		/*
+		 * Resend overlap deliberately: WAL_APPEND compares every durable byte,
+		 * rejecting a second writer or divergent history before accepting a
+		 * suffix.  Matching overlap is idempotent.
+		 */
 		pagestore_localsvc_wal_append(seg_start + off, buf, (uint32) n);
 		off += (uint64) n;
 	}
@@ -1133,8 +1205,6 @@ pagestore_rel_exists_asof(PG_FUNCTION_ARGS)
  * image with rm_redo (the `--wal-redo`-style helper -- the remaining step).
  * Returns NULL if no full-page image for the page is indexed at/below lsn.
  */
-#define PS_REDO_MAX_RECS 4096
-
 PG_FUNCTION_INFO_V1(pagestore_redo_page);
 
 Datum
@@ -1160,20 +1230,8 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 	key.forkNum = forknum;
 	relation_close(rel, AccessShareLock);
 
-	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
-	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  recs, PS_REDO_MAX_RECS);
-
-	/*
-	 * A full result set means the daemon may have truncated it: the cap is
-	 * filled with the OLDEST matching records, so treating recs[n-1] as the
-	 * newest state would silently materialize a stale page (and mis-judge
-	 * truncation liveness).  Fail closed instead of returning wrong bytes.
-	 */
-	if (n >= PS_REDO_MAX_RECS)
-		ereport(ERROR,
-				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
-						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
+									  (uint64) lsn, &recs);
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -1249,12 +1307,13 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
  */
 static uint32 ps_redo_cur_timeline;		/* timeline of the record being read */
 static uint32 ps_redo_local_timeline;	/* this compute's own timeline */
+static bool ps_redo_liveness_from_store;	/* branch-aware truncate scan */
 
 static int
 ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 				  XLogRecPtr targetRecPtr, char *readBuf)
 {
-	if (pagestore_redo_wal_from_store ||
+	if (pagestore_redo_wal_from_store || ps_redo_liveness_from_store ||
 		ps_redo_cur_timeline != ps_redo_local_timeline)
 	{
 		int			n = pagestore_localsvc_wal_read(ps_redo_cur_timeline,
@@ -1270,7 +1329,7 @@ ps_redo_page_read(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 }
 
 /*
- * Liveness: scan local WAL in (from_lsn, to_lsn] for an smgr truncate of
+ * Liveness: scan the branch WAL stream in (from_lsn, to_lsn] for an smgr truncate of
  * (rloc, forknum) down to <= block.  If found, the block was truncated away after
  * its last write and not re-extended, so it is not live as of to_lsn and must not
  * be materialized.  Only the main fork is checked -- the truncate record carries
@@ -1380,20 +1439,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	key.relNumber = rloc.relNumber;
 	key.forkNum = forknum;
 
-	recs = palloc(sizeof(PsWalRec) * PS_REDO_MAX_RECS);
-	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum, (uint64) lsn,
-									  recs, PS_REDO_MAX_RECS);
-
-	/*
-	 * A full result set means the daemon may have truncated it: the cap is
-	 * filled with the OLDEST matching records, so treating recs[n-1] as the
-	 * newest state would silently materialize a stale page (and mis-judge
-	 * truncation liveness).  Fail closed instead of returning wrong bytes.
-	 */
-	if (n >= PS_REDO_MAX_RECS)
-		ereport(ERROR,
-				(errmsg("pagestore: page has more than %d indexed WAL records at/below %X/%08X; refusing a possibly truncated redo",
-						PS_REDO_MAX_RECS, LSN_FORMAT_ARGS((XLogRecPtr) lsn))));
+	n = pagestore_localsvc_walidx_get(&key, (BlockNumber) blocknum,
+									  (uint64) lsn, &recs);
 	if (n == 0)
 		PG_RETURN_NULL();
 
@@ -1471,48 +1518,42 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 	 * at/below lsn.
 	 */
 	{
-		RedoBlockLiveness liveness;
+		volatile RedoBlockLiveness liveness = REDO_BLOCK_SCAN_INCOMPLETE;
+		bool		saved_liveness_from_store = ps_redo_liveness_from_store;
 
 		/*
-		 * The truncate scan walks the WAL after the block's last write.  Read it
-		 * from that record's source timeline (an ancestor in cross-branch redo)
-		 * and from the store when store-backed -- so DON'T force local/off here, or
-		 * a no-local-WAL (store-backed) compute would skip the truncate check.
-		 * Invalidate the reader's page cache first since the timeline may differ
-		 * from the record loop above.  (A scan range that itself crosses a branch
-		 * point spans timelines and is a known limitation.)
+		 * The truncate scan walks the WAL after the block's last write.  Force the
+		 * current branch's store-backed stream: it performs the ancestry walk when
+		 * the range crosses a fork, and also works on a compute with no local WAL.
+		 * Invalidate the reader's page cache first since the source timeline may
+		 * differ from the record loop above.
 		 */
 		/*
-		 * Fail closed when the last write is inherited from an ancestor
-		 * timeline: the truncate scan below covers only that ancestor's WAL,
-		 * but a relation truncate on THIS branch after the fork adds no
-		 * per-page index entry, so it would be invisible to the scan and a
-		 * stale ancestor FPI could be returned for a block the branch
-		 * already truncated away.  Proving liveness across the fork needs a
-		 * two-leg scan (ancestor to the fork point, then this timeline);
-		 * until that exists, cross-timeline liveness is unprovable here.
+		 * Read the current branch's WAL from the store.  Its WAL read-through
+		 * walks ancestors below each fork point, so this single scan covers an
+		 * ancestor last-write and a branch-local truncate in the same history.
 		 */
-		if (recs[n - 1].timeline != pagestore_localsvc_timeline())
+		PG_TRY();
 		{
-			XLogReaderFree(reader);
-			pfree(pd);
-			pfree(recs);
-			pfree(base);
-			pfree(page);
-			PG_RETURN_NULL();
+			ps_redo_liveness_from_store =
+				recs[n - 1].timeline != pagestore_localsvc_timeline();
+			ps_redo_cur_timeline = pagestore_localsvc_timeline();
+			reader->readLen = 0;
+			liveness = redo_block_truncated_away(reader, rloc, forknum,
+												 (BlockNumber) blocknum,
+												 (XLogRecPtr) recs[n - 1].lsn, lsn);
 		}
-
-		ps_redo_cur_timeline = recs[n - 1].timeline;
-		reader->readLen = 0;
-		liveness = redo_block_truncated_away(reader, rloc, forknum,
-											 (BlockNumber) blocknum,
-											 (XLogRecPtr) recs[n - 1].lsn, lsn);
+		PG_FINALLY();
+		{
+			ps_redo_liveness_from_store = saved_liveness_from_store;
+		}
+		PG_END_TRY();
 		/*
 		 * Fail closed unless the scan proved the block live: a confirmed truncate
 		 * and an incomplete scan (the WAL could not be read through lsn) both mean
 		 * we must not return a possibly-stale FPI for a block that may be gone.
 		 */
-		if (liveness != REDO_BLOCK_LIVE)
+		if ((RedoBlockLiveness) liveness != REDO_BLOCK_LIVE)
 		{
 			XLogReaderFree(reader);
 			pfree(pd);
@@ -9326,6 +9367,15 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
+							"Pause WAL archiving when durable WAL indexing falls too far behind.",
+							"Zero disables the limit. Headroom for one maximum-size WAL record "
+							"and segment padding is always reserved.",
+							&pagestore_wal_index_max_lag_mb,
+							0, 0, INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
 
 	if (pagestore_advance_read_lsn && pagestore_localsvc_read_lsn() == 0)
 		ereport(ERROR,

@@ -45,6 +45,13 @@ typedef struct PageStoreRelKey
 	int32		forkNum;		/* ForkNumber, widened for stability */
 } PageStoreRelKey;
 
+typedef struct PageStoreWalIndexEntry
+{
+	PageStoreRelKey key;
+	BlockNumber block;
+	uint64		lsn;
+} PageStoreWalIndexEntry;
+
 /*
  * A storage backend.  All ops are page-granular (BLCKSZ buffers) and keyed by
  * version-neutral identity.  "localreln" is the originating SMgrRelation,
@@ -160,12 +167,14 @@ extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
 extern void pagestore_localsvc_walidx_add(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn);
+extern void pagestore_localsvc_walidx_add_batch(
+	const PageStoreWalIndexEntry *entries, int nentries);
 extern uint64 pagestore_localsvc_wal_end(void);
 extern int	pagestore_localsvc_walidx_count(const PageStoreRelKey *key,
 											BlockNumber block);
 extern int	pagestore_localsvc_walidx_get(const PageStoreRelKey *key,
 										  BlockNumber block, uint64 lsn_max,
-										  PsWalRec *out, int maxn);
+										  PsWalRec **out);
 extern uint64 pagestore_localsvc_walidx_progress(void);
 extern void pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn);
 extern bool pagestore_localsvc_timeline_parent(uint32 timeline,

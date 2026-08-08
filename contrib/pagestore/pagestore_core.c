@@ -2207,6 +2207,8 @@ load_timelines(void)
 
 /* ===================== shipped WAL log (per timeline) ================== */
 
+static void publish_wal_index_metrics(void);
+
 /*
  * Each timeline has an append-only WAL log "wal_<tl>" of self-describing
  * records [WalRecHdr | bytes].  This is the durability/transport half of WAL
@@ -2425,6 +2427,7 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	wal_end_advance(tl, start_lsn + len);
 	if (len > 0)
 		walidx_progress_init(tl, start_lsn);
+	publish_wal_index_metrics();
 	return 0;
 }
 
@@ -2726,6 +2729,50 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *metrics_header;
+
+static void
+publish_wal_index_metrics(void)
+{
+	uint64_t	pending = 0;
+	uint32_t	lagging = 0;
+
+	if (metrics_header == NULL)
+		return;
+	pthread_mutex_lock(&walidx_meta_lock);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		uint64_t shipped = wal_end_read(tl);
+		uint64_t indexed = walidx_progress[tl];
+
+		/* Unused timelines have neither lag nor a WAL log to probe. */
+		if (shipped == 0)
+			continue;
+		if (indexed == 0)
+		{
+			uint64_t first = wal_log_start(tl);
+
+			indexed = first == UINT64_MAX ? shipped : first;
+		}
+		if (shipped > indexed)
+		{
+			uint64_t delta = shipped - indexed;
+
+			pending = UINT64_MAX - pending < delta ? UINT64_MAX : pending + delta;
+			lagging++;
+		}
+	}
+	pthread_mutex_unlock(&walidx_meta_lock);
+	ps_store_release_u64(&metrics_header->wal_index_pending_bytes, pending);
+	ps_store_release(&metrics_header->wal_index_lagging_timelines, lagging);
+}
+
+void
+ps_core_set_metrics_header(PsShmHeader *hdr)
+{
+	metrics_header = hdr;
+	publish_wal_index_metrics();
+}
 
 static void
 walidx_progress_init(uint32_t tl, uint64_t first_lsn)
@@ -2877,47 +2924,83 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 }
 
 static int
-walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
+						uint32_t nentries)
 {
-	WalIdxRec	rec;
-	WalIdxEnt  *e;
+	WalIdxRec  *records;
+	uint32_t	nrecords = 0;
 	uint32_t	shard;
-	int			pos;
-	int			rc = -1;
 
-	if (tl >= MAX_TIMELINES)
+	if (tl >= MAX_TIMELINES || nentries == 0)
 		return -1;
-	e = walidx_find(tl, key, block);
-	if (e)
+	shard = ps_shard_of(&entries[0].key);
+	records = malloc((size_t) nentries * sizeof(*records));
+	if (!records)
+		return -1;
+	for (uint32_t i = 0; i < nentries; i++)
 	{
-		pos = walidx_lower_bound(e, lsn);
-		if (pos < e->n && e->lsns[pos] == lsn)
-			return 0;
+		WalIdxEnt  *e;
+		WalIdxRec  *rec;
+		int			pos;
+
+		if (ps_shard_of(&entries[i].key) != shard)
+		{
+			free(records);
+			return -1;
+		}
+		e = walidx_find(tl, &entries[i].key, entries[i].block);
+		if (e)
+		{
+			pos = walidx_lower_bound(e, entries[i].lsn);
+			if (pos < e->n && e->lsns[pos] == entries[i].lsn)
+				continue;
+		}
+		rec = &records[nrecords++];
+		rec->magic = WALIDX_MAGIC;
+		rec->rec_len = sizeof(*rec);
+		rec->crc = 0;
+		rec->pad = 0;
+		rec->timeline = tl;
+		rec->block = entries[i].block;
+		rec->lsn = entries[i].lsn;
+		rec->key = entries[i].key;
+		rec->crc = walidx_rec_crc(rec);
 	}
-	shard = ps_shard_of(key);
-	rec.magic = WALIDX_MAGIC;
-	rec.rec_len = sizeof(rec);
-	rec.crc = 0;
-	rec.pad = 0;
-	rec.timeline = tl;
-	rec.block = block;
-	rec.lsn = lsn;
-	rec.key = *key;
-	rec.crc = walidx_rec_crc(&rec);
-	pthread_rwlock_rdlock(&walidx_publish_lock);
-	if (ps_storage->walidx_append(tl, shard, &rec, sizeof(rec)) != 0)
+	if (nrecords == 0)
 	{
-		pthread_rwlock_unlock(&walidx_publish_lock);
+		free(records);
+		return 0;
+	}
+	if (ps_storage->walidx_append(tl, shard, records,
+								(uint32_t) (nrecords * sizeof(*records))) != 0)
+	{
+		free(records);
 		return -1;
 	}
 	pthread_mutex_lock(&walidx_meta_lock);
-	walidx_shard_offsets_seen[tl][shard] += sizeof(rec);
+	walidx_shard_offsets_seen[tl][shard] += nrecords * sizeof(*records);
 	walidx_mark_shard(walidx_shards_seen[tl], shard);
-	rc = 0;
 	pthread_mutex_unlock(&walidx_meta_lock);
+	for (uint32_t i = 0; i < nrecords; i++)
+		walidx_add_memory(tl, &records[i].key, records[i].block,
+						  records[i].lsn);
+	free(records);
+	return 0;
+}
+
+static int
+walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+{
+	PsWalIndexEntry entry;
+	int			rc;
+
+	entry.key = *key;
+	entry.block = block;
+	entry.pad = 0;
+	entry.lsn = lsn;
+	pthread_rwlock_rdlock(&walidx_publish_lock);
+	rc = walidx_add_batch_locked(tl, &entry, 1);
 	pthread_rwlock_unlock(&walidx_publish_lock);
-	if (rc == 0)
-		walidx_add_memory(tl, key, block, lsn);
 	return rc;
 }
 
@@ -3108,6 +3191,7 @@ out:
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
 	pthread_rwlock_unlock(&walidx_publish_lock);
+	publish_wal_index_metrics();
 	return rc;
 }
 
@@ -3122,23 +3206,45 @@ walidx_progress_read(uint32_t tl)
 	return progress;
 }
 
-/* Copy the record LSNs for (tl,key,block) that are <= lsn_max into out (cap
- * max_out); return how many.  Walks the timeline ancestry. */
 static int
-walrec_cmp(const void *a, const void *b)
+walidx_upper_bound(WalIdxEnt *e, uint64_t lsn)
 {
-	uint64_t	la = ((const PsWalRec *) a)->lsn;
-	uint64_t	lb = ((const PsWalRec *) b)->lsn;
+	int			lo = 0;
+	int			hi = e->n;
 
-	return (la > lb) - (la < lb);
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (e->lsns[mid] <= lsn)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
 }
 
+/*
+ * Merge the already-sorted per-timeline arrays directly into one bounded
+ * response page.  A cursor request neither allocates nor scans the remaining
+ * history beyond the next max_out records.
+ */
 static int
 walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
+		   int have_cursor, uint64_t cursor_lsn, uint32_t cursor_timeline,
 		   PsWalRec *out, int max_out)
 {
+	typedef struct WalIdxSource
+	{
+		WalIdxEnt  *entry;
+		uint32_t	timeline;
+		int			pos;
+		int			end;
+	} WalIdxSource;
+	WalIdxSource sources[MAX_TIMELINES];
 	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
-	int			got = 0;
+	int			nsources = 0;
+	int			nout = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
 
 	do
@@ -3153,22 +3259,59 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
-				/* tag each record with the timeline it lives on (w.tl) */
-				for (int i = 0; i < e->n && got < max_out; i++)
-					if (e->lsns[i] <= w.lsn && e->lsns[i] < visible_end)
-					{
-						out[got].lsn = e->lsns[i];
-						out[got].timeline = w.tl;
-						got++;
-					}
+				int			pos = have_cursor ?
+					walidx_lower_bound(e, cursor_lsn) : 0;
+				uint64_t	cap_lsn = w.lsn < visible_end - 1 ?
+					w.lsn : visible_end - 1;
+				int			end = walidx_upper_bound(e, cap_lsn);
+
+				if (have_cursor && pos < end && e->lsns[pos] == cursor_lsn &&
+					w.tl <= cursor_timeline)
+					pos++;
+				if (pos < end)
+				{
+					sources[nsources].entry = e;
+					sources[nsources].timeline = w.tl;
+					sources[nsources].pos = pos;
+					sources[nsources].end = end;
+					nsources++;
+				}
 				break;
 			}
 	} while (tl_walk_next(&w));
 
-	/* gathered newest-timeline-first across the ancestry; redo (and the base
-	 * search) need them in ascending LSN order */
-	qsort(out, (size_t) got, sizeof(PsWalRec), walrec_cmp);
-	return got;
+	while (nout < max_out)
+	{
+		int			best = -1;
+
+		for (int i = 0; i < nsources; i++)
+		{
+			uint64_t	lsn;
+			uint64_t	best_lsn;
+
+			if (sources[i].pos >= sources[i].end)
+				continue;
+			lsn = sources[i].entry->lsns[sources[i].pos];
+			if (best < 0)
+			{
+				best = i;
+				continue;
+			}
+			best_lsn = sources[best].entry->lsns[sources[best].pos];
+			if (lsn < best_lsn ||
+				(lsn == best_lsn &&
+				 sources[i].timeline < sources[best].timeline))
+				best = i;
+		}
+		if (best < 0)
+			break;
+		out[nout] = (PsWalRec) {
+			.lsn = sources[best].entry->lsns[sources[best].pos++],
+			.timeline = sources[best].timeline
+		};
+		nout++;
+	}
+	return nout;
 }
 
 /* ===================== write / read primitives ========================= */
@@ -4387,10 +4530,41 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 			break;
 
+		case PS_OP_WAL_INDEX_ADD_BATCH:
+			if (ch->nblocks == 0 ||
+				ch->datalen % sizeof(PsWalIndexEntry) != 0 ||
+				ch->nblocks != ch->datalen / sizeof(PsWalIndexEntry) ||
+				ch->datalen > PS_IO_UNIT)
+				ch->status = PS_STATUS_ERROR;
+			else
+			{
+				PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+				uint32_t shard = ps_shard_of(&ch->key);
+
+				pthread_rwlock_rdlock(&walidx_publish_lock);
+				if (ps_shard_of(&entries[0].key) != shard ||
+					walidx_add_batch_locked(tl, entries, ch->nblocks) != 0)
+					ch->status = PS_STATUS_ERROR;
+				pthread_rwlock_unlock(&walidx_publish_lock);
+			}
+			break;
+
 		case PS_OP_WAL_INDEX_GET:
-			ch->result = (uint32_t) walidx_get(tl, &ch->key, ch->blocknum,
-											   ch->req_lsn, (PsWalRec *) ch->data,
-											   (int) (PS_IO_UNIT / sizeof(PsWalRec)));
+			{
+				int max_out = (int) (PS_IO_UNIT / sizeof(PsWalRec));
+				int n;
+
+				if (ch->nblocks > 0 && ch->nblocks < (uint32_t) max_out)
+					max_out = (int) ch->nblocks;
+				n = walidx_get(tl, &ch->key, ch->blocknum, ch->req_lsn,
+								   ch->pad1 != 0, ch->req_seq, ch->parent_timeline,
+								   (PsWalRec *) ch->data, max_out);
+
+				if (n < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = (uint32_t) n;
+			}
 			break;
 
 		case PS_OP_WAL_INDEX_PROGRESS:

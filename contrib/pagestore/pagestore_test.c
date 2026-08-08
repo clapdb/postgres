@@ -130,7 +130,9 @@ check_inspector(const char *shm, uint32_t page_size)
 	check(strstr(output, "\"idle\":128") != NULL &&
 		  strstr(output, "\"claimed\":0") != NULL &&
 		  strstr(output, "\"request\":0") != NULL &&
-		  strstr(output, "\"done\":0") != NULL,
+		  strstr(output, "\"done\":0") != NULL &&
+		  strstr(output, "\"wal_index_pending_bytes\":0") != NULL &&
+		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
 }
 
@@ -963,10 +965,33 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec();
 }
 
+static void
+op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
+					const uint32_t *blocks, const uint64_t *lsns, uint32_t nentries)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
+
+	cl_setkey(ch, rel, fork);
+	for (uint32_t i = 0; i < nentries; i++)
+	{
+		entries[i].key = ch->key;
+		entries[i].block = blocks[i];
+		entries[i].pad = 0;
+		entries[i].lsn = lsns[i];
+	}
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch->nblocks = nentries;
+	ch->datalen = nentries * sizeof(*entries);
+	cl_exec();
+}
+
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
 static int
-op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
-			  uint64_t lsn_max, PsWalRec *out)
+op_walidx_get_after(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					uint64_t lsn_max, int have_cursor, uint64_t cursor_lsn,
+					uint32_t cursor_timeline, uint32_t max_out, PsWalRec *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	int			n;
@@ -975,10 +1000,21 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_GET;
 	ch->blocknum = block;
+	ch->nblocks = max_out;
 	ch->req_lsn = lsn_max;
+	ch->pad1 = have_cursor;
+	ch->req_seq = cursor_lsn;
+	ch->parent_timeline = cursor_timeline;
 	n = (int) cl_exec()->result;
 	memcpy(out, ch->data, (size_t) n * sizeof(PsWalRec));
 	return n;
+}
+
+static int
+op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+			  uint64_t lsn_max, PsWalRec *out)
+{
+	return op_walidx_get_after(tl, rel, fork, block, lsn_max, 0, 0, 0, 0, out);
 }
 
 static int
@@ -3003,6 +3039,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	op_walidx_add(0, REL_A, FORK0, 0, 200);
 	op_walidx_add(0, REL_A, FORK0, 0, 300);
 	op_walidx_add(0, REL_A, FORK0, 1, 150);
+	{
+		const uint32_t blocks[] = {7, 8, 7};
+		const uint64_t lsns[] = {175, 225, 275};
+
+		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, 3);
+	}
 	check(nonzero_rel != 0, "test harness can find a nonzero WAL-index shard relation");
 	if (nonzero_rel != 0)
 	{
@@ -3021,6 +3063,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
 	check(n == 2 && out[0].lsn == 100 && out[1].lsn == 200,
 		  "index returns records <= lsn (block 0 as-of 250 -> [100,200])");
+	n = op_walidx_get_after(0, REL_A, FORK0, 0, 1000000, 0, 0, 0, 1, out);
+	check(n == 1 && out[0].lsn == 100,
+		  "index query honors a caller-requested page size");
+	n = op_walidx_get_after(0, REL_A, FORK0, 0, 1000000, 1, 100, 0, 0, out);
+	check(n == 2 && out[0].lsn == 200 && out[1].lsn == 300,
+		  "index cursor returns only records after the (LSN,timeline) boundary");
 	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
 	check(n == 3 && out[2].lsn == 300, "index returns all records up to a high lsn");
 	check(out[0].timeline == 0 && out[2].timeline == 0,
@@ -3029,6 +3077,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 200, out);
 	check(n == 1 && out[0].lsn == 150, "per-block separation (block 1 -> [150])");
 	check(op_walidx_get(0, REL_A, FORK0, 9, 1000000, out) == 0, "unindexed block -> empty");
+	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
+	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
+		  "batched WAL-index entries are queryable in LSN order");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
@@ -3075,6 +3126,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 1, 1000000, out);
 	check(n == 1 && out[0].lsn == 150,
 		  "restart replays WAL index records without duplicating them");
+	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
+	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
+		  "batched WAL-index entries survive daemon restart");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;

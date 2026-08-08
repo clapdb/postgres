@@ -68,8 +68,21 @@ read pages at an LSN.
          context the reader asserts on (both `read_local_xlog_page` and `WALRead`
          abort there).  With `pagestore.auto_wal_index`, a background worker
          continuously decodes the durable shipped prefix and resumes from the
-         store's durable progress marker after restart.  The SQL function remains
-         available for targeted tests.  No daemon-side WAL parser is written.
+         store's durable progress marker after restart.  Index entries are sent
+         in shard-local batches so backlog replay does not pay one IPC round trip
+         per touched block.  The SQL function remains available for targeted
+         tests.  No daemon-side WAL parser is written.
+         The read-only `backpressure` inspection reports aggregate
+         `wal_index_pending_bytes` and `wal_index_lagging_timelines`.  Pending
+         bytes are the shipped-end minus the durable record-aligned scan
+         boundary; after a segment switch this can include zero padding until a
+         later segment supplies the next valid record.  Operators can set
+         `pagestore.wal_index_max_lag_mb` to pause WAL archiving when this
+         durable indexing boundary falls behind.  The limit retains enough
+         WAL-address headroom for a maximum-size record, its page headers, and
+         segment padding, so the decoder cannot be stranded inside a record.
+         Archive retries resend and validate durable overlap before appending
+         any missing suffix.
        - **3c-3** Reconstruct a single page's base image from WAL. ✅
          `pagestore_redo_page(rel, fork, block, lsn)` uses the per-page index to
          find the newest full-page image at/below lsn and restores it
@@ -88,13 +101,11 @@ read pages at an LSN.
          is enabled -- a no-local-WAL compute (a fresh branch) must set that
          GUC or local-timeline deltas fail to replay.  The integration test
          proves the materialized page contains a change that the base image
-         alone lacks.  Caveats: a page with
-         PS_REDO_MAX_RECS (4096) or more indexed records at/below the target
-         LSN fails closed (the capped index result would otherwise be treated as
-         complete), and when the last write is inherited from an ancestor
-         timeline the truncate-liveness check fails closed (a truncate on the
-         reading branch after the fork is not visible to the ancestor-WAL
-         scan).
+         alone lacks.  WAL-index reads use cursor pagination, so redo is not
+         capped by the shared-memory mailbox payload.  When the last write is
+         inherited from an ancestor timeline is checked against the current
+         branch's store-backed WAL stream, whose read-through includes both
+         the ancestor history and branch-local truncates.
    - **3d-2/3** SLRU/clog + `pg_control` on the store, and branch WAL
      read-through (serve a branch's WAL across its fork point), so multiple
      independent computes can run concurrently on different branches with no
