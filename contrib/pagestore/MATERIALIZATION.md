@@ -146,9 +146,22 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     `pagestore.materializer = on`; startup then requires the localsvc backend,
     full relation routing, and an unpinned read horizon.  Installing the
     `pagestore` extension provisions these declarations persistently in each
-    monitored database.  A production control-plane lifecycle
-    (provisioning, restart, and backpressure for that declared worker) is the
-    next step.
+    monitored database.  After the first durable marker is established,
+    writers may set `pagestore.materializer_max_lag_mb` to pause WAL archiving
+    when that marker falls too far behind.  The
+    limiter stops only at complete segment boundaries and always includes the
+    first writer-owned checkpoint completion observed for the current marker
+    (plus room for a crossing record), so recovery cannot be stranded behind a
+    partial segment or before its next usable restartpoint.  Writer checkpoint
+    state is separate from recovery's pg_control updates.  The release
+    checkpoint is durably latched: later checkpoints cannot move the bound
+    until materialization advances.  Any already-started segment is allowed to
+    finish, including an interrupted bootstrap or a prefix left before the
+    limit was enabled.  All progress records carry the logical timeline, so a
+    branch cannot inherit its parent's marker or latch.  PostgreSQL's archive
+    retry loop resumes shipping when the marker selects the next release
+    checkpoint.  Production provisioning and restartpoint/restart policy for
+    the declared worker remain control-plane work.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is

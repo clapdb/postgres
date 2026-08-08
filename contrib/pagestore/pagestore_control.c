@@ -95,12 +95,27 @@
  */
 #define PS_CONTROL_DRAIN_BUDGET_MS	30000
 
+#define PS_WRITER_CHECKPOINT_MAGIC	0x50535743
+#define PS_WRITER_CHECKPOINT_VERSION	1
+#define PS_WRITER_CHECKPOINT_BLOCK	5
+
+typedef struct PsWriterCheckpoint
+{
+	uint32		magic;
+	uint32		version;
+	uint32		timeline;
+	uint32		pad;
+	uint64		checkpoint_lsn;
+	uint64		checkpoint_lsn_complement;
+} PsWriterCheckpoint;
+
 typedef struct PsControlPending
 {
 	ControlFileData image;
 	XLogRecPtr	update_lsn;
 	uint64		fence_token;	/* pending shared admission gate, or zero */
 	bool		posted;			/* a drain has posted this image at least once */
+	bool		writer_checkpoint;	/* non-recovery checkpoint completion */
 } PsControlPending;
 
 static PsControlPending ps_control_queue[PS_CONTROL_QUEUE_CAPACITY];
@@ -343,6 +358,33 @@ ps_control_drain(void)
 					PS_KLASS_CONTROL, &key, 2, page, (uint64) p->update_lsn, nb,
 					PS_CONTROL_SHIP_TIMEOUT_MS);
 			}
+
+			/*
+			 * Publish writer checkpoint completion separately from pg_control
+			 * history.  Recovery also mirrors pg_control while advancing
+			 * minRecoveryPoint, so the newest generic image is not necessarily
+			 * writer-owned and can carry a stale checkPoint field.
+			 */
+			if (p->writer_checkpoint)
+			{
+				PsWriterCheckpoint checkpoint;
+
+				memset(&checkpoint, 0, sizeof(checkpoint));
+				checkpoint.magic = PS_WRITER_CHECKPOINT_MAGIC;
+				checkpoint.version = PS_WRITER_CHECKPOINT_VERSION;
+				checkpoint.timeline = pagestore_localsvc_timeline();
+				checkpoint.checkpoint_lsn = (uint64) p->image.checkPoint;
+				checkpoint.checkpoint_lsn_complement =
+					~checkpoint.checkpoint_lsn;
+				memset(page, 0, sizeof(page));
+				memcpy(page, &checkpoint, sizeof(checkpoint));
+				nb = pagestore_localsvc_obj_write_prepare_timeout(
+					PS_KLASS_CONTROL, &key, PS_CONTROL_SHIP_TIMEOUT_MS);
+				(void) pagestore_localsvc_obj_write_post_timeout(
+					PS_KLASS_CONTROL, &key, PS_WRITER_CHECKPOINT_BLOCK, page,
+					(uint64) p->update_lsn, nb,
+					PS_CONTROL_SHIP_TIMEOUT_MS);
+			}
 			shipped = true;
 			done_tokens[ndone++] = p->fence_token;
 			if (shipped_redo < p->image.checkPointCopy.redo)
@@ -431,6 +473,9 @@ static void
 ps_control_write_hook(const struct ControlFileData *control,
 					  XLogRecPtr update_lsn, bool checkpoint_completion)
 {
+	bool		writer_checkpoint = checkpoint_completion &&
+		!RecoveryInProgress();
+
 	if (prev_control_file_write_hook)
 		(*prev_control_file_write_hook) (control, update_lsn,
 									 checkpoint_completion);
@@ -470,6 +515,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 				pagestore_localsvc_admission_fence_end(q->fence_token);
 				memcpy(&q->image, control, sizeof(ControlFileData));
 				q->fence_token = 0;
+				q->writer_checkpoint = writer_checkpoint;
 				if (checkpoint_completion)
 					(void) pagestore_localsvc_admission_fence_begin(
 						(uint64) control->checkPointCopy.redo, &q->fence_token);
@@ -512,6 +558,7 @@ ps_control_write_hook(const struct ControlFileData *control,
 		memcpy(&ps_control_queue[slot].image, control, sizeof(ControlFileData));
 		ps_control_queue[slot].update_lsn = update_lsn;
 		ps_control_queue[slot].fence_token = 0;
+		ps_control_queue[slot].writer_checkpoint = writer_checkpoint;
 		if (checkpoint_completion)
 			(void) pagestore_localsvc_admission_fence_begin(
 				(uint64) control->checkPointCopy.redo,
@@ -530,6 +577,27 @@ ps_control_write_hook(const struct ControlFileData *control,
 	 */
 	if (CritSectionCount == 0 && !LWLockHeldByMe(ControlFileLock))
 		ps_control_drain();
+}
+
+/* Latest durable checkpoint completion published by a writer on this timeline. */
+XLogRecPtr
+pagestore_control_writer_checkpoint_lsn_timeout(int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsWriterCheckpoint checkpoint;
+	char		page[BLCKSZ];
+
+	if (!pagestore_localsvc_obj_read_at_timeout(
+			PS_KLASS_CONTROL, &key, PS_WRITER_CHECKPOINT_BLOCK,
+			UINT64_MAX, page, NULL, timeout_ms))
+		return InvalidXLogRecPtr;
+	memcpy(&checkpoint, page, sizeof(checkpoint));
+	if (checkpoint.magic != PS_WRITER_CHECKPOINT_MAGIC ||
+		checkpoint.version != PS_WRITER_CHECKPOINT_VERSION ||
+		checkpoint.timeline != pagestore_localsvc_timeline() ||
+		checkpoint.checkpoint_lsn_complement != ~checkpoint.checkpoint_lsn)
+		return InvalidXLogRecPtr;
+	return (XLogRecPtr) checkpoint.checkpoint_lsn;
 }
 
 /*
