@@ -3129,14 +3129,18 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	do
 	{
 		uint32_t	h = page_hash(w.tl, key, block);
+		uint64_t	visible_end = walidx_progress_read(w.tl);
 		WalIdxEnt  *e;
 
+		/* Entries become queryable only with their durable progress marker. */
+		if (visible_end == 0)
+			continue;
 		for (e = s->walidx[h & IDX_MASK]; e; e = e->next)
 			if (e->timeline == w.tl && e->block == block && key_eq(&e->key, key))
 			{
 				/* tag each record with the timeline it lives on (w.tl) */
 				for (int i = 0; i < e->n && got < max_out; i++)
-					if (e->lsns[i] <= w.lsn)
+					if (e->lsns[i] <= w.lsn && e->lsns[i] < visible_end)
 					{
 						out[got].lsn = e->lsns[i];
 						out[got].timeline = w.tl;

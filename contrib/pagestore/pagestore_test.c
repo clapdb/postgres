@@ -3007,7 +3007,15 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	if (nonzero_rel != 0)
 	{
 		op_walidx_add(0, nonzero_rel, FORK0, 0, 320);
-		op_walidx_add(0, nonzero_rel, FORK0, 0, 330);
+		 op_walidx_add(0, nonzero_rel, FORK0, 0, 330);
+	}
+	check(op_walidx_get(0, REL_A, FORK0, 0, 1000000, out) == 0,
+		  "WAL index entries stay hidden before their progress commit");
+	{
+		uint64_t	progress;
+
+		check(op_walidx_progress(0, 0, 350, &progress) == 0,
+			  "contiguous indexed WAL interval commits a durable progress marker");
 	}
 
 	n = op_walidx_get(0, REL_A, FORK0, 0, 250, out);
@@ -3025,8 +3033,6 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 350, &progress) == 0,
-			  "contiguous indexed WAL interval commits a durable progress marker");
 		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
 			  "WAL index progress reports the committed end");
 		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
@@ -3089,7 +3095,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  parent_tl == 0 && branch_lsn == 250,
 			  "branch timeline reports its parent and fork LSN");
 	}
+	op_wal_append(1, 400, wal, 16);
 	op_walidx_add(1, REL_A, FORK0, 0, 400);
+	check(op_walidx_progress(1, 400, 416, NULL) == 0,
+		  "branch WAL index entries become visible with branch progress");
 	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
 	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
 	check(n == 3, "branch index reads through to parent capped at the branch lsn");
