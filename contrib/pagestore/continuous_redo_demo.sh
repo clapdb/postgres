@@ -93,6 +93,20 @@ wait_redo_value()
 	return 1
 }
 
+wait_replay_lsn()
+{
+	local target=$1 reached=
+
+	for _ in $(seq 1 400); do
+		reached=$($RP -c "SELECT pg_last_wal_replay_lsn() >= '$target'::pg_lsn;" \
+			2>/dev/null || true)
+		[ "$reached" = "t" ] && return 0
+		sleep 0.1
+	done
+	echo "redo did not replay checkpoint boundary $target" >&2
+	return 1
+}
+
 mkdir -p "$STORE"
 "$BIN/initdb" -D "$WRITER" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "initdb failed"
@@ -164,11 +178,25 @@ archive_current_wal || fail "first update WAL did not reach pagestore"
 wait_redo_value first || fail "redo worker did not materialize the first value"
 echo "ok   - live redo worker materialized the first archived change"
 
-$WP -c "UPDATE continuous_redo SET v='second' WHERE id=1;" >/dev/null ||
+checkpoint_lsn=$($WP -c "UPDATE continuous_redo SET v='second' WHERE id=1;
+	CHECKPOINT;
+	SELECT pg_current_wal_lsn();" | tail -1) ||
 	fail "could not update the writer test relation"
 archive_current_wal || fail "second update WAL did not reach pagestore"
 wait_redo_value second || fail "redo worker did not follow the second value"
 echo "ok   - redo worker continuously followed later archived WAL"
+wait_replay_lsn "$checkpoint_lsn" ||
+	fail "redo worker did not replay the newer checkpoint"
+
+# Clear the recovery worker's shared buffers before checking again.  Its fast
+# shutdown performs a restartpoint, so the next process must fetch the page
+# materialized through pagestore rather than reuse the page dirtied by redo.
+"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
+	fail "redo worker restartpoint/restart failed"
+$RP -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qx t ||
+	fail "redo worker left recovery after restartpoint"
+wait_redo_value second || fail "second value was not store-visible after restart"
+echo "ok   - materialized value survived redo worker restart/cache eviction"
 
 [ ! -f "$REDO/$relfile" ] ||
 	fail "redo worker created a local heap instead of materializing into pagestore"
