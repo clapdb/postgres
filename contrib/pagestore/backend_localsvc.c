@@ -1237,6 +1237,7 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 	const int	batch_max = PS_IO_UNIT / sizeof(PsWalRec);
 	PsWalRec  *result = palloc(sizeof(*result));
 	int			nresult = 0;
+	int			capacity = 1;
 
 	for (;;)
 	{
@@ -1261,9 +1262,26 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 		n = (int) ch->result;
 		if (n > 0)
 		{
-			result = repalloc(result, (size_t) (nresult + n) * sizeof(*result));
+			int			required;
+
+			if (nresult > PG_INT32_MAX - n)
+				elog(ERROR, "pagestore WAL index result is too large");
+			required = nresult + n;
+			if (required > capacity)
+			{
+				while (capacity < required)
+				{
+					if (capacity > PG_INT32_MAX / 2)
+					{
+						capacity = required;
+						break;
+					}
+					capacity *= 2;
+				}
+				result = repalloc_array(result, PsWalRec, capacity);
+			}
 			memcpy(&result[nresult], ch->data, (size_t) n * sizeof(*result));
-			nresult += n;
+			nresult = required;
 		}
 		if (n < batch_max)
 			break;
