@@ -4267,6 +4267,16 @@ ps_handle_meta(PsChannel *ch)
 											 ch->req_lsn))
 				ch->status = PS_STATUS_ERROR;
 			break;
+		case PS_OP_TIMELINE_INFO:
+			if (tl >= MAX_TIMELINES || !timelines[tl].defined)
+				ch->status = PS_STATUS_ERROR;
+			else if (timeline_has_parent(tl))
+			{
+				ch->result = 1;
+				ch->parent_timeline = (uint32_t) timelines[tl].parent;
+				ch->req_lsn = timelines[tl].branch_lsn;
+			}
+			break;
 
 		case PS_OP_WAL_APPEND:
 			if (wal_append(tl, ch->req_lsn, ch->data, ch->datalen) != 0)

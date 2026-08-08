@@ -1227,6 +1227,23 @@ pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
 	ls_exec(ch);
 }
 
+/* Return this timeline's parent and fork point, or false for the root. */
+bool
+pagestore_localsvc_timeline_parent(uint32 timeline, uint32 *parent_timeline,
+								   uint64 *branch_lsn)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	ch->timeline = timeline;
+	ls_exec(ch);
+	if (ch->result == 0)
+		return false;
+	*parent_timeline = ch->parent_timeline;
+	*branch_lsn = ch->req_lsn;
+	return true;
+}
+
 /*
  * Non-relation object I/O.  The store is keyed by the full PsKey including klass,
  * so a non-relation object (SLRU page, control state, ...) goes through the same

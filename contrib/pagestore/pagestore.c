@@ -761,74 +761,99 @@ pagestore_archive_configured(ArchiveModuleState *state)
 	return pagestore_localsvc_read_lsn() == 0;
 }
 
+/* Index only WAL that the daemon has durably accepted. */
+static int
+pagestore_index_wal_page_read(XLogReaderState *state,
+							 XLogRecPtr targetPagePtr, int reqLen,
+							 XLogRecPtr targetRecPtr, char *readBuf)
+{
+	int			n = pagestore_localsvc_wal_read(pagestore_localsvc_timeline(),
+											(uint64) targetPagePtr,
+											XLOG_BLCKSZ, readBuf);
+
+	(void) state;
+	(void) targetRecPtr;
+	return n >= reqLen ? n : -1;
+}
+
 /*
- * Decode the WAL in [start, end) and record, for each block a record modifies,
- * an entry in the store's per-page WAL index.  Reuses PostgreSQL's WAL reader
- * (read_local_xlog_page) -- which is why this must run in a normal backend, not
- * the archiver (the archiver lacks the recovery/timeline context the reader
- * asserts on).  In production a background worker would call this as WAL is
- * shipped; the SQL wrapper below lets a test drive it.
+ * Decode WAL in [start, end) and record, for each block a record modifies, an
+ * entry in the store's per-page WAL index.  The worker reads the durable store;
+ * the test-only SQL wrapper can still inspect the current local WAL tail.
  */
 static XLogRecPtr
-pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end)
+pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 {
-	ReadLocalXLogPageNoWaitPrivate *pd;
-	XLogReaderState *reader;
+	XLogReaderState *volatile reader = NULL;
+	ReadLocalXLogPageNoWaitPrivate *volatile pd = NULL;
 	XLogRecPtr	first;
 	XLogRecPtr	indexed_end = start;
 
-	pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
-	reader = XLogReaderAllocate(wal_segment_size, NULL,
-								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
-										   .segment_open = &wal_segment_open,
-										   .segment_close = &wal_segment_close),
-								pd);
-	if (reader == NULL)
+	PG_TRY();
 	{
-		pfree(pd);
-		return start;
-	}
-
-	{
-		char	   *ferrm;
-
-		first = XLogFindNextRecord(reader, start, &ferrm);
-	}
-	while (!XLogRecPtrIsInvalid(first))
-	{
-		char	   *errm;
-		XLogRecord *rec = XLogReadRecord(reader, &errm);
-
-		if (rec == NULL)
-			break;				/* end of flushed WAL / torn tail */
-		if (reader->ReadRecPtr >= end)
-			break;
-		if (reader->EndRecPtr > end)
-			break;				/* record crosses the shipped-WAL boundary */
-
-		for (int b = 0; b <= XLogRecMaxBlockId(reader); b++)
+		if (from_store)
+			reader = XLogReaderAllocate(wal_segment_size, NULL,
+									 XL_ROUTINE(.page_read = &pagestore_index_wal_page_read),
+									 NULL);
+		else
 		{
-			RelFileLocator rloc;
-			ForkNumber	fk;
-			BlockNumber blk;
-			PageStoreRelKey key;
-
-			if (!XLogRecHasBlockRef(reader, b))
-				continue;
-			XLogRecGetBlockTagExtended(reader, b, &rloc, &fk, &blk, NULL);
-			key.spcOid = rloc.spcOid;
-			key.dbOid = rloc.dbOid;
-			key.relNumber = rloc.relNumber;
-			key.forkNum = fk;
-			pagestore_localsvc_walidx_add(&key, blk, reader->ReadRecPtr);
+			pd = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+			reader = XLogReaderAllocate(wal_segment_size, NULL,
+									 XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+												.segment_open = &wal_segment_open,
+												.segment_close = &wal_segment_close),
+									 (void *) pd);
 		}
-		indexed_end = reader->EndRecPtr;
-	}
+		if (reader != NULL)
+		{
+			{
+				char	   *ferrm;
 
-	if (reader != NULL)
-		XLogReaderFree(reader);
-	if (pd != NULL)
-		pfree(pd);
+				first = XLogFindNextRecord((XLogReaderState *) reader, start, &ferrm);
+			}
+			while (!XLogRecPtrIsInvalid(first))
+			{
+				char	   *errm;
+				XLogRecord *rec = XLogReadRecord((XLogReaderState *) reader, &errm);
+
+				if (rec == NULL)
+					break;				/* end of shipped WAL / torn tail */
+				if (reader->ReadRecPtr >= end)
+					break;
+				if (reader->EndRecPtr > end)
+					break;				/* record crosses shipped boundary */
+
+				for (int b = 0;
+					 b <= XLogRecMaxBlockId((XLogReaderState *) reader); b++)
+				{
+					RelFileLocator rloc;
+					ForkNumber	fk;
+					BlockNumber blk;
+					PageStoreRelKey key;
+
+					if (!XLogRecHasBlockRef((XLogReaderState *) reader, b))
+						continue;
+					XLogRecGetBlockTagExtended((XLogReaderState *) reader, b,
+										   &rloc, &fk, &blk, NULL);
+					key.spcOid = rloc.spcOid;
+					key.dbOid = rloc.dbOid;
+					key.relNumber = rloc.relNumber;
+					key.forkNum = fk;
+					pagestore_localsvc_walidx_add(&key, blk,
+										   reader->ReadRecPtr);
+				}
+				indexed_end = reader->EndRecPtr;
+			}
+		}
+	}
+	PG_FINALLY();
+	{
+		if (reader != NULL)
+			XLogReaderFree((XLogReaderState *) reader);
+		if (pd != NULL)
+			pfree((ReadLocalXLogPageNoWaitPrivate *) pd);
+	}
+	PG_END_TRY();
 	return indexed_end;
 }
 
@@ -859,11 +884,24 @@ pagestore_wal_index_worker_main(Datum main_arg)
 		{
 			XLogRecPtr start = pagestore_localsvc_walidx_progress();
 			XLogRecPtr shipped_end = pagestore_localsvc_wal_end();
+			XLogRecPtr scan_start = start;
+			uint32		parent_timeline;
+			uint64		branch_lsn;
 
 			if (!XLogRecPtrIsInvalid(start) && shipped_end > start)
 			{
-				XLogRecPtr indexed_end = pagestore_index_wal_range(start,
-																 shipped_end);
+				XLogRecPtr indexed_end;
+
+				/* A branch's first segment contains a copied parent prefix. */
+				if (pagestore_localsvc_timeline_parent(
+						pagestore_localsvc_timeline(), &parent_timeline,
+						&branch_lsn) && scan_start < (XLogRecPtr) branch_lsn)
+					scan_start = (XLogRecPtr) branch_lsn;
+				if (scan_start >= shipped_end)
+					indexed_end = shipped_end;
+				else
+					indexed_end = pagestore_index_wal_range(scan_start,
+														 shipped_end, true);
 
 				if (indexed_end > start)
 				{
@@ -918,7 +956,7 @@ pagestore_index_wal(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	start = PG_GETARG_LSN(0);
 	XLogRecPtr	end = PG_GETARG_LSN(1);
-	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end);
+	XLogRecPtr	indexed_end = pagestore_index_wal_range(start, end, false);
 
 	/* Only a contiguous scan may advance the durable resume boundary. */
 	if (pagestore_localsvc_walidx_progress() == start && indexed_end > start)

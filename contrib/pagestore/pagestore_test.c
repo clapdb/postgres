@@ -919,6 +919,20 @@ op_wal_size(uint32_t tl)
 	return ch->req_lsn;
 }
 
+/* Read a timeline's ancestry metadata; return whether it has a parent. */
+static int
+op_timeline_info(uint32_t tl, uint32_t *parent_tl, uint64_t *branch_lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->timeline = tl;
+	ch->opcode = PS_OP_TIMELINE_INFO;
+	cl_exec();
+	*parent_tl = ch->parent_timeline;
+	*branch_lsn = ch->req_lsn;
+	return ch->result != 0;
+}
+
 /* Read len WAL bytes from start_lsn into out; returns bytes filled. */
 static uint32_t
 op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
@@ -3065,6 +3079,16 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
 	op_create_branch(1, 0, 250);
+	{
+		uint32_t	parent_tl = UINT32_MAX;
+		uint64_t	branch_lsn = 0;
+
+		check(!op_timeline_info(0, &parent_tl, &branch_lsn),
+			  "root timeline reports no parent");
+		check(op_timeline_info(1, &parent_tl, &branch_lsn) &&
+			  parent_tl == 0 && branch_lsn == 250,
+			  "branch timeline reports its parent and fork LSN");
+	}
 	op_walidx_add(1, REL_A, FORK0, 0, 400);
 	n = op_walidx_get(1, REL_A, FORK0, 0, 1000000, out);
 	/* branch's 400, plus parent's <= branch_lsn 250 (100,200; not 300) */
