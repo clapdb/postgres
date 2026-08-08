@@ -996,6 +996,7 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	uint64		shipped_end;
 	uint64		indexed_end = 0;
 	uint64		max_lag = 0;
+	uint64		headroom = 0;
 
 	/*
 	 * Only ship real WAL segment files.  The archiver also offers backup
@@ -1013,17 +1014,15 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	if (pagestore_localsvc_read_lsn() != 0)
 		return false;
 
-	/* Resume a partially shipped segment without replaying its durable prefix. */
+	/* An empty store's index begins at the first segment actually shipped. */
 	shipped_end = pagestore_localsvc_wal_end();
 	if (pagestore_wal_index_max_lag_mb > 0)
 	{
-		indexed_end = pagestore_localsvc_walidx_progress();
+		indexed_end = shipped_end == 0 ? seg_start :
+			pagestore_localsvc_walidx_progress();
 		max_lag = (uint64) pagestore_wal_index_max_lag_mb * 1024 * 1024;
+		headroom = max_lag + XLogRecordMaxSize + wal_segment_size;
 	}
-	if (shipped_end >= seg_start + wal_segment_size)
-		return true;
-	if (shipped_end > seg_start)
-		off = shipped_end - seg_start;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
@@ -1034,16 +1033,6 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 						path)));
 		return false;
 	}
-	if (off > 0 && lseek(fd, (off_t) off, SEEK_SET) < 0)
-	{
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("pagestore archive: could not seek WAL segment \"%s\": %m",
-						path)));
-		close(fd);
-		return false;
-	}
-
 	buf = palloc(PS_IO_UNIT);
 	for (;;)
 	{
@@ -1052,16 +1041,16 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 		if (pagestore_wal_index_max_lag_mb > 0)
 		{
 			/*
-			 * A decoder can need bytes from the next segment to step over zero
-			 * padding.  Reserve one segment beyond the configured lag so archive
-			 * backpressure cannot prevent the bytes needed to advance the index.
+			 * A decoder cannot advance past a partial record.  Reserve enough for
+			 * PostgreSQL's largest legal record plus segment/page padding so
+			 * backpressure cannot strand the index boundary inside that record.
 			 */
 			if (seg_start + off > indexed_end &&
-				seg_start + off - indexed_end >= max_lag + wal_segment_size)
+				seg_start + off - indexed_end >= headroom)
 			{
 				indexed_end = pagestore_localsvc_walidx_progress();
 				if (seg_start + off > indexed_end &&
-					seg_start + off - indexed_end >= max_lag + wal_segment_size)
+					seg_start + off - indexed_end >= headroom)
 				{
 					pfree(buf);
 					close(fd);
@@ -1083,7 +1072,11 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 		}
 		if (n == 0)
 			break;
-		/* ship this chunk at its WAL position */
+		/*
+		 * Resend overlap deliberately: WAL_APPEND compares every durable byte,
+		 * rejecting a second writer or divergent history before accepting a
+		 * suffix.  Matching overlap is idempotent.
+		 */
 		pagestore_localsvc_wal_append(seg_start + off, buf, (uint32) n);
 		off += (uint64) n;
 	}
@@ -9397,8 +9390,8 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
 							"Pause WAL archiving when durable WAL indexing falls too far behind.",
-							"Zero disables the limit. One WAL segment of headroom is always reserved "
-							"so the indexer can cross segment padding.",
+							"Zero disables the limit. Headroom for one maximum-size WAL record "
+							"and segment padding is always reserved.",
 							&pagestore_wal_index_max_lag_mb,
 							0, 0, INT_MAX,
 							PGC_POSTMASTER,
