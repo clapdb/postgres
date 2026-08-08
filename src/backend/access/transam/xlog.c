@@ -4649,6 +4649,9 @@ static XLogRecPtr LastControlUpdateLSN = InvalidXLogRecPtr;
  */
 control_file_flush_hook_type control_file_flush_hook = NULL;
 
+/* Post-buffer-flush publication point for recovery materializers. */
+recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+
 static inline void
 CallControlFileFlushHook(void)
 {
@@ -8353,6 +8356,7 @@ CreateRestartPoint(int flags)
 	XLogRecPtr	PriorRedoPtr;
 	XLogRecPtr	receivePtr;
 	XLogRecPtr	replayPtr;
+	XLogRecPtr	flushReplayPtr;
 	TimeLineID	replayTLI;
 	XLogRecPtr	endptr;
 	XLogSegNo	_logSegNo;
@@ -8449,7 +8453,16 @@ CreateRestartPoint(int flags)
 	/* Update the process title */
 	update_checkpoint_display(flags, true, false);
 
+	/*
+	 * Capture the replay boundary before flushing starts.  Replay may continue
+	 * concurrently, but all buffers dirty at this point are included in the
+	 * restartpoint; later writes can only make the stored page newer.
+	 */
+	flushReplayPtr = GetXLogReplayRecPtr(NULL);
 	CheckPointGuts(lastCheckPoint.redo, flags);
+	if (recovery_restartpoint_flush_hook &&
+		!XLogRecPtrIsInvalid(flushReplayPtr))
+		(*recovery_restartpoint_flush_hook) (flushReplayPtr);
 
 	/*
 	 * This location needs to be after CheckPointGuts() to ensure that some

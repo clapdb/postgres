@@ -1,6 +1,8 @@
 # contrib/pagestore/Makefile
 
 MODULE_big = pagestore
+EXTENSION = pagestore
+DATA = pagestore--1.0.sql
 OBJS = \
 	$(WIN32RES) \
 	backend_localsvc.o \

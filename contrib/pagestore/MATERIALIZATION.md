@@ -136,9 +136,16 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
   - local-worker — **continuous topology proven**: `wal_only_redo_demo.sh` runs
     a recovery worker that replays shipped WAL into image layers via smgr, and
     `continuous_redo_demo.sh` keeps a WAL-only writer and a distinct recovery
-    worker online together while later archived segments are materialized.  A
-    production control-plane lifecycle (provisioning, health, restart, and
-    backpressure for that worker) is the next step.
+    worker online together while later archived segments are materialized.
+    Restartpoints publish a durable `pagestore_materialized_wal_lsn()` only
+    after their buffer flush completes.  Supervisors compare that watermark
+    with `pagestore_shipped_wal_lsn()`, or read
+    `pagestore_materializer_lag_bytes()` directly; the lag API fails closed
+    outside recovery so a writer cannot masquerade as a
+    caught-up materializer, and also requires the localsvc backend with full
+    relation routing.  `CREATE EXTENSION pagestore` installs these declarations
+    persistently in each monitored database.  A production control-plane lifecycle
+    (provisioning, restart, and backpressure for that worker) is the next step.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is

@@ -107,6 +107,19 @@ wait_replay_lsn()
 	return 1
 }
 
+wait_materializer_caught_up()
+{
+	local lag=
+
+	for _ in $(seq 1 400); do
+		lag=$($RP -c "SELECT pagestore_materializer_lag_bytes();" 2>/dev/null || true)
+		[ "$lag" = "0" ] && return 0
+		sleep 0.1
+	done
+	echo "materializer lag remained '${lag:-unknown}' bytes" >&2
+	return 1
+}
+
 mkdir -p "$STORE"
 "$BIN/initdb" -D "$WRITER" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "initdb failed"
@@ -169,9 +182,17 @@ $RP -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qx t ||
 
 # Both changes happen after the redo worker is live.  Completing each segment
 # lets archive recovery consume it without stopping either process.
-$WP -c "CREATE TABLE continuous_redo(id int primary key, v text);
+$WP -c "CREATE EXTENSION pagestore;
+	CREATE TABLE continuous_redo(id int primary key, v text);
 	INSERT INTO continuous_redo VALUES (1, 'first');" >/dev/null ||
 	fail "could not create the writer test relation"
+if $WP -c "SELECT pagestore_materializer_lag_bytes();" \
+		>"$TMPROOT/writer-lag.out" 2>"$TMPROOT/writer-lag.err"; then
+	fail "materializer lag API accepted a non-recovery writer"
+fi
+grep -q "materializer monitoring requires recovery mode" "$TMPROOT/writer-lag.err" ||
+	fail "writer lag rejection did not explain the recovery requirement"
+echo "ok   - materializer lag API rejects a non-recovery writer"
 relfile=$($WP -c "SELECT pg_relation_filepath('continuous_redo');")
 [ -f "$WRITER/$relfile" ] || fail "writer did not keep the relation page local"
 archive_current_wal || fail "first update WAL did not reach pagestore"
@@ -188,15 +209,20 @@ echo "ok   - redo worker continuously followed later archived WAL"
 wait_replay_lsn "$checkpoint_lsn" ||
 	fail "redo worker did not replay the newer checkpoint"
 
-# Clear the recovery worker's shared buffers before checking again.  Its fast
-# shutdown performs a restartpoint, so the next process must fetch the page
-# materialized through pagestore rather than reuse the page dirtied by redo.
+# A replay LSN alone is not a materialization boundary: the changed page may
+# still live only in this standby's dirty buffer cache.  Shutdown recovery
+# performs a restartpoint, whose post-flush hook publishes the durable store
+# watermark.  Restarting also clears the cache, so the next read proves the
+# page itself is store-visible.
 "$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
 	fail "redo worker restartpoint/restart failed"
 $RP -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qx t ||
 	fail "redo worker left recovery after restartpoint"
 wait_redo_value second || fail "second value was not store-visible after restart"
-echo "ok   - materialized value survived redo worker restart/cache eviction"
+wait_materializer_caught_up || fail "materializer lag did not return to zero"
+shipped_lsn=$($RP -c "SELECT pagestore_shipped_wal_lsn();")
+materialized_lsn=$($RP -c "SELECT pagestore_materialized_wal_lsn();")
+echo "ok   - materializer reports zero lag (shipped $shipped_lsn, materialized $materialized_lsn)"
 
 [ ! -f "$REDO/$relfile" ] ||
 	fail "redo worker created a local heap instead of materializing into pagestore"

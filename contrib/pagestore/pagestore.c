@@ -44,6 +44,7 @@
 #include "access/slru.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
@@ -118,6 +119,20 @@ static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorRun_hook_type prev_executor_run_hook = NULL;
+static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
+
+#define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
+#define PS_MATERIALIZER_MARKER_VERSION	1
+#define PS_MATERIALIZER_MARKER_BLOCK		3
+#define PS_MATERIALIZER_MARKER_TIMEOUT_MS 10000
+
+typedef struct PsMaterializerMarker
+{
+	uint32		magic;
+	uint32		version;
+	uint64		materialized_lsn;
+	uint64		materialized_lsn_complement;
+} PsMaterializerMarker;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
@@ -981,6 +996,186 @@ pagestore_index_wal(PG_FUNCTION_ARGS)
 	if (pagestore_localsvc_walidx_progress() == start && indexed_end > start)
 		pagestore_localsvc_walidx_commit(start, indexed_end);
 	PG_RETURN_VOID();
+}
+
+/*
+ * End of the durable WAL prefix available to this timeline.  A new branch may
+ * have no child-local WAL yet, but its inherited history is complete through
+ * the fork LSN and is served by the ancestry-aware WAL read path.
+ */
+static XLogRecPtr
+pagestore_materializer_shipped_lsn(int timeout_ms)
+{
+	uint64		shipped = pagestore_localsvc_wal_end_timeout(timeout_ms);
+	uint32		parent_timeline;
+	uint64		branch_lsn;
+
+	if (pagestore_localsvc_timeline_parent_timeout(
+			pagestore_localsvc_timeline(), &parent_timeline, &branch_lsn,
+			timeout_ms) &&
+		shipped < branch_lsn)
+		shipped = branch_lsn;
+	return (XLogRecPtr) shipped;
+}
+
+/* Publish a durable marker only after a restartpoint flushed relation pages. */
+static void
+pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerMarker marker;
+	char		page[BLCKSZ];
+
+	if (prev_restartpoint_flush_hook)
+		(*prev_restartpoint_flush_hook) (replay_lsn);
+	if (!RecoveryInProgress() || XLogRecPtrIsInvalid(replay_lsn))
+		return;
+
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
+	marker.version = PS_MATERIALIZER_MARKER_VERSION;
+	marker.materialized_lsn = (uint64) replay_lsn;
+	marker.materialized_lsn_complement = ~marker.materialized_lsn;
+	memset(page, 0, sizeof(page));
+	memcpy(page, &marker, sizeof(marker));
+
+	/*
+	 * A store outage must leave the old marker in place, not fail recovery.
+	 * CheckPointGuts has issued the relation writes, but remote smgr sync is a
+	 * no-op.  Persist those pages before making the new marker readable, then
+	 * persist the marker itself.  A crash between marker write and its sync can
+	 * only regress monitoring to the previous conservative boundary.
+	 */
+	PG_TRY();
+	{
+		pagestore_localsvc_store_sync_timeout(
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
+										PS_MATERIALIZER_MARKER_BLOCK, page,
+										(uint64) replay_lsn,
+										PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		pagestore_localsvc_store_sync_timeout(
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(old_context);
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore materializer watermark publish failed: %s",
+						edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+static XLogRecPtr
+pagestore_materialized_wal_lsn_internal(void)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerMarker marker;
+	char		page[BLCKSZ];
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_CONTROL, &key,
+													PS_MATERIALIZER_MARKER_BLOCK,
+													UINT64_MAX, page, NULL,
+													PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+		return InvalidXLogRecPtr;
+	memcpy(&marker, page, sizeof(marker));
+	if (marker.magic != PS_MATERIALIZER_MARKER_MAGIC ||
+		marker.version != PS_MATERIALIZER_MARKER_VERSION ||
+		marker.materialized_lsn_complement != ~marker.materialized_lsn)
+		return InvalidXLogRecPtr;
+	return (XLogRecPtr) marker.materialized_lsn;
+}
+
+static void
+pagestore_require_localsvc_monitoring(void)
+{
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore WAL monitoring requires the localsvc backend")));
+}
+
+static void
+pagestore_require_materializer(void)
+{
+	pagestore_require_localsvc_monitoring();
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore materializer monitoring requires recovery mode")));
+	if (!pagestore_route_all)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore materializer monitoring requires full relation routing")));
+	if (pagestore_localsvc_read_lsn() != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore materializer monitoring requires an unpinned recovery worker")));
+}
+
+/* End of the durable WAL prefix currently available from pagestore. */
+PG_FUNCTION_INFO_V1(pagestore_shipped_wal_lsn);
+
+Datum
+pagestore_shipped_wal_lsn(PG_FUNCTION_ARGS)
+{
+	pagestore_require_localsvc_monitoring();
+	PG_RETURN_LSN(pagestore_materializer_shipped_lsn(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS));
+}
+
+/* Last restartpoint boundary whose relation pages are durable in pagestore. */
+PG_FUNCTION_INFO_V1(pagestore_materialized_wal_lsn);
+
+Datum
+pagestore_materialized_wal_lsn(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	materialized;
+
+	pagestore_require_materializer();
+	materialized = pagestore_materialized_wal_lsn_internal();
+	/* Promotion during the store read must fail closed. */
+	pagestore_require_materializer();
+	PG_RETURN_LSN(materialized);
+}
+
+/*
+ * Bytes between the store's durable WAL end and this recovery worker's flushed
+ * materialization watermark.  This is deliberately recovery-only: a writer
+ * does not publish restartpoint materialization progress and could otherwise
+ * masquerade as a caught-up worker.
+ */
+PG_FUNCTION_INFO_V1(pagestore_materializer_lag_bytes);
+
+Datum
+pagestore_materializer_lag_bytes(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	shipped;
+	XLogRecPtr	materialized;
+	uint64		lag;
+
+	pagestore_require_materializer();
+
+	/* Sample the flushed watermark first to prevent a concurrent false zero. */
+	materialized = pagestore_materialized_wal_lsn_internal();
+	shipped = pagestore_materializer_shipped_lsn(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	/* Promotion during either store read must fail closed. */
+	pagestore_require_materializer();
+	lag = shipped > materialized ? shipped - materialized : 0;
+	if (lag > PG_INT64_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("pagestore materializer lag exceeds bigint range")));
+	PG_RETURN_INT64((int64) lag);
 }
 
 static bool
@@ -9442,6 +9637,14 @@ _PG_init(void)
 	 */
 	pagestore_control_mirror_init(pagestore_backend_name != NULL &&
 								  strcmp(pagestore_backend_name, "localsvc") == 0);
+	if (pagestore_backend_name != NULL &&
+		strcmp(pagestore_backend_name, "localsvc") == 0 &&
+		pagestore_route_all && pagestore_localsvc_read_lsn() == 0)
+	{
+		prev_restartpoint_flush_hook = recovery_restartpoint_flush_hook;
+		recovery_restartpoint_flush_hook =
+			pagestore_materializer_restartpoint_flush;
+	}
 	if (pagestore_backend_name != NULL &&
 		strcmp(pagestore_backend_name, "localsvc") == 0 &&
 		pagestore_localsvc_read_lsn() == 0)

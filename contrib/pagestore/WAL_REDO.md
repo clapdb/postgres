@@ -58,8 +58,17 @@ read pages at an LSN.
      base backup with no local WAL, consumes store-served segments, and exposes
      two successive writer values while retaining no local heap file.  This
      proves the stock recovery process can continuously follow and materialize
-     newly archived WAL; production worker provisioning, supervision, lag
-     control, and restart policy remain control-plane work.
+     newly archived WAL.  `pagestore_shipped_wal_lsn()` exposes the durable
+     store boundary and recovery-only `pagestore_materializer_lag_bytes()`
+     compares it with the worker's flushed materialization watermark, giving
+     supervision a fail-closed caught-up signal.  `CREATE EXTENSION pagestore`
+     provisions the SQL API.  Lag is measured from a store-resident watermark
+     published only after a restartpoint flush, rather than from the in-memory
+     replay LSN; it
+     requires recovery, localsvc, and full relation routing.  An empty child
+     timeline inherits its fork LSN as the available WAL boundary.  Production
+     worker provisioning, restart
+     policy, and lag backpressure remain control-plane work.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
      everything.

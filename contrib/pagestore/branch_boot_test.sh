@@ -103,7 +103,8 @@ port = $PORT
 EOF
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 
-$P -c "CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
+$P -c "CREATE EXTENSION pagestore;
+       CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
@@ -172,6 +173,8 @@ assert "$($PB -c "SELECT note FROM demo WHERE id=1;" 2>/dev/null)" "before_fork"
 	"branch sees the row committed before the fork LSN"
 assert "$($PB -c "SELECT count(*) FROM demo WHERE id=2;" 2>/dev/null)" "0" \
 	"branch does NOT see the row the parent committed after the fork"
+assert "$($PB -c "SELECT pagestore_shipped_wal_lsn();" 2>/dev/null)" "$bL" \
+	"empty branch WAL inherits a durable boundary at the fork LSN"
 
 # write forward on the branch timeline, force it to the store, evict buffers by
 # restarting, and re-read: the write must have gone to timeline 1, not the parent

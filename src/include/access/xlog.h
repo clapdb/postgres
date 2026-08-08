@@ -277,6 +277,14 @@ extern PGDLLIMPORT bool wal_insert_restricted;
  */
 typedef void (*control_file_flush_hook_type) (void);
 extern PGDLLIMPORT control_file_flush_hook_type control_file_flush_hook;
+
+/*
+ * Called after a recovery restartpoint has flushed its buffer set.  The LSN is
+ * sampled before flushing begins, so every page change through that replay
+ * position is represented in durable storage when the hook runs.
+ */
+typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn);
+extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 
