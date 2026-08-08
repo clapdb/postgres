@@ -2915,6 +2915,9 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 	int			used = 0;
 	int			torn = 0;
 
+	if (tl >= MAX_TIMELINES || shard >= PS_MAX_CHANNELS ||
+		shard >= core_shards())
+		return -1;
 	for (;;)
 	{
 		int			n;
