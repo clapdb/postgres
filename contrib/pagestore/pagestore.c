@@ -111,6 +111,7 @@ static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
 static bool pagestore_auto_wal_index = false;
 static bool pagestore_materializer = false;
+static int pagestore_materializer_max_lag_mb = 0;
 static int pagestore_wal_index_max_lag_mb = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -123,17 +124,34 @@ static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
 
 #define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
-#define PS_MATERIALIZER_MARKER_VERSION	1
+#define PS_MATERIALIZER_MARKER_VERSION	2
 #define PS_MATERIALIZER_MARKER_BLOCK		3
+#define PS_MATERIALIZER_RELEASE_MAGIC		0x50534d52
+#define PS_MATERIALIZER_RELEASE_VERSION	2
+#define PS_MATERIALIZER_RELEASE_BLOCK		4
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS 10000
 
 typedef struct PsMaterializerMarker
 {
 	uint32		magic;
 	uint32		version;
+	uint32		timeline;
+	uint32		pad;
 	uint64		materialized_lsn;
 	uint64		materialized_lsn_complement;
 } PsMaterializerMarker;
+
+typedef struct PsMaterializerRelease
+{
+	uint32		magic;
+	uint32		version;
+	uint32		timeline;
+	uint32		pad;
+	uint64		materialized_lsn;
+	uint64		materialized_lsn_complement;
+	uint64		checkpoint_lsn;
+	uint64		checkpoint_lsn_complement;
+} PsMaterializerRelease;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static CmdType pagestore_current_command_type = CMD_UNKNOWN;
 static bool pagestore_current_has_modifying_cte = false;
@@ -1035,6 +1053,7 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
 	marker.version = PS_MATERIALIZER_MARKER_VERSION;
+	marker.timeline = pagestore_localsvc_timeline();
 	marker.materialized_lsn = (uint64) replay_lsn;
 	marker.materialized_lsn_complement = ~marker.materialized_lsn;
 	memset(page, 0, sizeof(page));
@@ -1089,9 +1108,133 @@ pagestore_materialized_wal_lsn_internal(void)
 	memcpy(&marker, page, sizeof(marker));
 	if (marker.magic != PS_MATERIALIZER_MARKER_MAGIC ||
 		marker.version != PS_MATERIALIZER_MARKER_VERSION ||
+		marker.timeline != pagestore_localsvc_timeline() ||
 		marker.materialized_lsn_complement != ~marker.materialized_lsn)
 		return InvalidXLogRecPtr;
 	return (XLogRecPtr) marker.materialized_lsn;
+}
+
+/*
+ * Pin the first completed checkpoint observed for one materialized watermark.
+ * Persisting the choice prevents repeated archive retries (or an archiver
+ * restart) from chasing newer checkpoints forever while the materializer is
+ * stalled.  A newer marker invalidates the old choice naturally.
+ */
+static XLogRecPtr
+pagestore_materializer_release_checkpoint(XLogRecPtr materialized)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerRelease release;
+	XLogRecPtr	checkpoint;
+	uint64		marker;
+	char		page[BLCKSZ];
+
+	/* Provisioning establishes the first marker before enabling the limiter. */
+	if (XLogRecPtrIsInvalid(materialized))
+		return InvalidXLogRecPtr;
+	marker = (uint64) materialized;
+
+	if (pagestore_localsvc_obj_read_at_timeout(
+			PS_KLASS_CONTROL, &key, PS_MATERIALIZER_RELEASE_BLOCK,
+			UINT64_MAX, page, NULL, PS_MATERIALIZER_MARKER_TIMEOUT_MS))
+	{
+		memcpy(&release, page, sizeof(release));
+		if (release.magic == PS_MATERIALIZER_RELEASE_MAGIC &&
+			release.version == PS_MATERIALIZER_RELEASE_VERSION &&
+			release.timeline == pagestore_localsvc_timeline() &&
+			release.materialized_lsn_complement ==
+			~release.materialized_lsn &&
+			release.checkpoint_lsn_complement == ~release.checkpoint_lsn &&
+			release.materialized_lsn == marker &&
+			release.checkpoint_lsn > marker)
+			return (XLogRecPtr) release.checkpoint_lsn;
+	}
+
+	checkpoint = pagestore_control_writer_checkpoint_lsn_timeout(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	if (XLogRecPtrIsInvalid(checkpoint) || (uint64) checkpoint <= marker)
+		return InvalidXLogRecPtr;
+
+	memset(&release, 0, sizeof(release));
+	release.magic = PS_MATERIALIZER_RELEASE_MAGIC;
+	release.version = PS_MATERIALIZER_RELEASE_VERSION;
+	release.timeline = pagestore_localsvc_timeline();
+	release.materialized_lsn = marker;
+	release.materialized_lsn_complement = ~marker;
+	release.checkpoint_lsn = (uint64) checkpoint;
+	release.checkpoint_lsn_complement = ~release.checkpoint_lsn;
+	memset(page, 0, sizeof(page));
+	memcpy(page, &release, sizeof(release));
+	pagestore_localsvc_obj_write_timeout(
+		PS_KLASS_CONTROL, &key, PS_MATERIALIZER_RELEASE_BLOCK, page,
+		(uint64) checkpoint, PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	return checkpoint;
+}
+
+static uint64
+pagestore_wal_align_up(uint64 lsn)
+{
+	uint64		remainder = lsn % wal_segment_size;
+	uint64		advance;
+
+	if (remainder == 0)
+		return lsn;
+	advance = wal_segment_size - remainder;
+	return lsn > UINT64_MAX - advance ? UINT64_MAX : lsn + advance;
+}
+
+/* End of the nth complete segment after the segment containing lsn. */
+static uint64
+pagestore_wal_segments_after(uint64 lsn, uint64 nsegments)
+{
+	uint64		segment_start = lsn - lsn % wal_segment_size;
+	uint64		advance = nsegments * (uint64) wal_segment_size;
+
+	return segment_start > UINT64_MAX - advance ?
+		UINT64_MAX : segment_start + advance;
+}
+
+/*
+ * Compute an exclusive, segment-aligned shipping boundary.  Besides the
+ * configured lag, always finish the materializer's next input segment and the
+ * segment after the latched release checkpoint's start (the checkpoint record
+ * itself may cross a segment boundary).  Thus recovery can consume a complete
+ * segment containing a checkpoint and publish a newer restartpoint.
+ */
+static uint64
+pagestore_materializer_archive_limit(XLogRecPtr marker,
+									 XLogRecPtr checkpoint,
+									 XLogRecPtr seg_start,
+									 uint64 shipped_end)
+{
+	uint64		limit = 0;
+
+	if (!XLogRecPtrIsInvalid(marker))
+	{
+		uint64		max_lag =
+			(uint64) pagestore_materializer_max_lag_mb * 1024 * 1024;
+		uint64		lag_end = (uint64) marker > UINT64_MAX - max_lag ?
+			UINT64_MAX : (uint64) marker + max_lag;
+
+		limit = pagestore_wal_align_up(lag_end);
+		limit = Max(limit,
+					pagestore_wal_segments_after((uint64) marker, 2));
+	}
+	else if (shipped_end == 0 ||
+			 (shipped_end > (uint64) seg_start &&
+			  shipped_end < (uint64) seg_start + wal_segment_size))
+	{
+		/* Complete a fresh or interrupted bootstrap segment. */
+		limit = (uint64) seg_start + wal_segment_size;
+	}
+
+	if (!XLogRecPtrIsInvalid(checkpoint))
+		limit = Max(limit,
+					pagestore_wal_segments_after((uint64) checkpoint, 2));
+	if (shipped_end % wal_segment_size != 0)
+		limit = Max(limit, pagestore_wal_align_up(shipped_end));
+	return limit;
 }
 
 static void
@@ -1197,6 +1340,9 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	uint64		indexed_end = 0;
 	uint64		max_lag = 0;
 	uint64		headroom = 0;
+	XLogRecPtr	materialized = InvalidXLogRecPtr;
+	XLogRecPtr	checkpoint = InvalidXLogRecPtr;
+	uint64		materializer_limit = 0;
 	uint64		max_record_wal_span;
 
 	/*
@@ -1215,8 +1361,15 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	if (pagestore_localsvc_read_lsn() != 0)
 		return false;
 
-	/* An empty store's index begins at the first segment actually shipped. */
+	/* Both lag controllers compare against the store's durable WAL prefix. */
 	shipped_end = pagestore_localsvc_wal_end();
+	if (pagestore_materializer_max_lag_mb > 0)
+	{
+		materialized = pagestore_materialized_wal_lsn_internal();
+		checkpoint = pagestore_materializer_release_checkpoint(materialized);
+		materializer_limit = pagestore_materializer_archive_limit(
+			materialized, checkpoint, seg_start, shipped_end);
+	}
 	if (pagestore_wal_index_max_lag_mb > 0)
 	{
 		indexed_end = shipped_end == 0 ? seg_start :
@@ -1247,6 +1400,42 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 	for (;;)
 	{
 		ssize_t		n;
+		uint64		current = seg_start + off;
+
+		n = read(fd, buf, PS_IO_UNIT);
+		if (n < 0)
+		{
+			pfree(buf);
+			close(fd);
+			return false;
+		}
+		if (n == 0)
+			break;
+
+		if (pagestore_materializer_max_lag_mb > 0 &&
+			current >= shipped_end && current >= materializer_limit)
+		{
+			materialized = pagestore_materialized_wal_lsn_internal();
+			checkpoint = pagestore_materializer_release_checkpoint(materialized);
+			materializer_limit = pagestore_materializer_archive_limit(
+				materialized, checkpoint, seg_start, shipped_end);
+			if (current >= materializer_limit)
+			{
+				pfree(buf);
+				close(fd);
+				if (XLogRecPtrIsInvalid(materialized))
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: materializer watermark is unavailable"),
+							 errhint("Start or repair the declared pagestore materializer, "
+									 "or disable pagestore.materializer_max_lag_mb.")));
+				else
+					ereport(WARNING,
+							(errmsg("pagestore archive paused: materializer is %llu bytes behind",
+									(unsigned long long) (current - (uint64) materialized)),
+							 errhint("Increase pagestore.materializer_max_lag_mb or restore materializer progress.")));
+				return false;
+			}
+		}
 
 		if (pagestore_wal_index_max_lag_mb > 0)
 		{
@@ -1272,16 +1461,6 @@ pagestore_archive_file(ArchiveModuleState *state, const char *file,
 				}
 			}
 		}
-		n = read(fd, buf, PS_IO_UNIT);
-
-		if (n < 0)
-		{
-			pfree(buf);
-			close(fd);
-			return false;
-		}
-		if (n == 0)
-			break;
 		/*
 		 * Resend overlap deliberately: WAL_APPEND compares every durable byte,
 		 * rejecting a second writer or divergent history before accepting a
@@ -9577,6 +9756,15 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.materializer_max_lag_mb",
+							"Pause WAL archiving when durable materialization falls too far behind.",
+							"Zero disables the limit. The boundary stays segment-aligned and "
+							"latches one completed checkpoint so recovery cannot strand.",
+							&pagestore_materializer_max_lag_mb,
+							0, 0, INT_MAX,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
 	DefineCustomIntVariable("pagestore.wal_index_max_lag_mb",
 							"Pause WAL archiving when durable WAL indexing falls too far behind.",
 							"Zero disables the limit. Headroom for one maximum-size WAL record "

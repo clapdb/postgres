@@ -68,8 +68,20 @@ read pages at an LSN.
      `pagestore.materializer = on` role.
      Startup rejects that role unless it uses localsvc, full relation routing,
      and an unpinned read horizon.  An empty child timeline inherits its fork
-     LSN as the available WAL boundary.  Production worker provisioning, restart
-     policy, and lag backpressure remain control-plane work.
+     LSN as the available WAL boundary.  After provisioning establishes the
+     first marker, writers can bound this lag with
+     `pagestore.materializer_max_lag_mb`: the archive module rounds its limit to
+     complete segments and durably latches the first writer-owned checkpoint
+     completion observed for each materialized marker, plus one segment for a
+     crossing record.  This checkpoint state is published separately from
+     recovery's pg_control mirrors.  Recovery therefore never waits on a
+     partial segment or on a checkpoint record trapped behind the limiter,
+     while later writer checkpoints cannot keep moving the bound for a stalled
+     worker.  Any pre-existing partial segment can finish.  Markers and latches
+     are timeline-bound, so child timelines reject inherited parent progress.
+     PostgreSQL's normal archive retry loop selects a new release checkpoint
+     only after the marker advances.  Production worker provisioning and
+     restartpoint/restart policy remain control-plane work.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
      everything.

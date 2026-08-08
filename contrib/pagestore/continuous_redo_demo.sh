@@ -225,6 +225,109 @@ shipped_lsn=$($RP -c "SELECT pagestore_shipped_wal_lsn();")
 materialized_lsn=$($RP -c "SELECT pagestore_materialized_wal_lsn();")
 echo "ok   - materializer reports zero lag (shipped $shipped_lsn, materialized $materialized_lsn)"
 
+# Stop recovery, establish a checkpoint, then advance several segments without
+# another checkpoint.  The aligned limiter must finish usable input segments
+# but eventually pause.  A later writer checkpoint moves the guaranteed-safe
+# archive boundary far enough for recovery to reach a real restartpoint.
+$WP -c "ALTER SYSTEM SET pagestore.materializer_max_lag_mb = '1';" >/dev/null ||
+	fail "could not configure materializer backpressure"
+"$BIN/pg_ctl" -D "$WRITER" -m fast -w stop >/dev/null 2>&1 ||
+	fail "writer backpressure stop failed"
+"$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start >/dev/null 2>&1 ||
+	fail "writer backpressure start failed"
+"$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
+	fail "could not stop the materializer for backpressure testing"
+blocked_target=
+$WP -c "CREATE TABLE materializer_backpressure_test(i int);" >/dev/null ||
+	fail "could not create the materializer backpressure test relation"
+$WP -c "INSERT INTO materializer_backpressure_test VALUES (1); CHECKPOINT;" \
+	>/dev/null || fail "could not establish the backlog checkpoint"
+$WP -c "SELECT pg_switch_wal();" >/dev/null ||
+	fail "could not switch the checkpoint-bearing WAL segment"
+for i in 2 3 4 5 6; do
+	$WP -c "INSERT INTO materializer_backpressure_test VALUES ($i);" >/dev/null ||
+		fail "could not generate materializer backlog segment $i"
+	switch_lsn=$($WP -c "SELECT pg_switch_wal();") ||
+		fail "could not switch materializer backlog segment $i"
+	blocked_target=$($WP -c "SELECT pg_walfile_name('$switch_lsn'::pg_lsn - 1);") ||
+		fail "could not identify backlog WAL segment $i"
+done
+backpressure_seen=0
+for _ in $(seq 1 300); do
+	if grep -q "archive paused: materializer" "$WRITER/writer.log"; then
+		backpressure_seen=1
+		break
+	fi
+	sleep 0.1
+done
+[ "$backpressure_seen" -eq 1 ] ||
+	fail "archiver did not pause for a stalled materializer"
+[ -f "$WRITER/pg_wal/archive_status/$blocked_target.ready" ] ||
+	fail "materializer backpressure left no WAL segment pending"
+echo "ok   - stalled materializer applies bounded WAL archive backpressure"
+
+# Publish a newer completed checkpoint while archiving is paused.  The limiter
+# keeps the earlier release checkpoint latched until the materializer advances,
+# then admits complete segments through this next checkpoint.
+$WP -c "CHECKPOINT;" >/dev/null ||
+	fail "could not publish the backlog release checkpoint"
+release_lsn=$($WP -c "SELECT pg_switch_wal();") ||
+	fail "could not switch the backlog release checkpoint"
+release_target=$($WP -c "SELECT pg_walfile_name('$release_lsn'::pg_lsn - 1);") ||
+	fail "could not identify the backlog release segment"
+# Wake an archiver that may have entered its longer retry backoff after three
+# failures; production would make the same retry without this test nudge.
+$WP -c "SELECT pg_reload_conf();" >/dev/null ||
+	fail "could not wake the WAL archiver after checkpoint progress"
+sleep 2
+[ -f "$WRITER/pg_wal/archive_status/$release_target.ready" ] ||
+	fail "a later writer checkpoint moved the latched bound before materialization advanced"
+"$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
+	fail "materializer did not restart after backpressure"
+release_replayed=0
+for _ in $(seq 1 400); do
+	release_value=$($RP -c "SELECT max(i) FROM materializer_backpressure_test;" \
+		2>/dev/null || true)
+	if [ "${release_value:-0}" -ge 2 ] 2>/dev/null; then
+		release_replayed=1
+		break
+	fi
+	sleep 0.1
+done
+[ "$release_replayed" -eq 1 ] ||
+	fail "materializer did not reach the latched release checkpoint"
+"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
+	fail "materializer did not publish progress at the release checkpoint"
+$WP -c "SELECT pg_reload_conf();" >/dev/null ||
+	fail "could not wake the WAL archiver after materializer progress"
+archive_drained=0
+for _ in $(seq 1 600); do
+	if [ -f "$WRITER/pg_wal/archive_status/$release_target.done" ]; then
+		archive_drained=1
+		break
+	fi
+	sleep 0.1
+done
+[ "$archive_drained" -eq 1 ] ||
+	fail "archive backlog did not drain after materializer restart"
+backlog_replayed=0
+for _ in $(seq 1 400); do
+	backlog_value=$($RP -c "SELECT max(i) FROM materializer_backpressure_test;" \
+		2>/dev/null || true)
+	if [ "$backlog_value" = "6" ]; then
+		backlog_replayed=1
+		break
+	fi
+	sleep 0.1
+done
+[ "$backlog_replayed" -eq 1 ] ||
+	fail "materializer did not replay the released archive backlog"
+"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
+	fail "materializer restartpoint after backlog drain failed"
+wait_materializer_caught_up ||
+	fail "materializer did not catch up after releasing archive backpressure"
+echo "ok   - materializer progress releases WAL archive backpressure"
+
 # Recovery alone is not a materializer identity.  Restart with the explicit
 # role disabled and prove that a stale marker cannot make this worker pass the
 # supervision contract.

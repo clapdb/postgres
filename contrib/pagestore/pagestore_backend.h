@@ -202,6 +202,7 @@ extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
 /* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */
 extern void pagestore_control_mirror_init(bool localsvc_active);
+extern XLogRecPtr pagestore_control_writer_checkpoint_lsn_timeout(int timeout_ms);
 
 /* pagestore_slru.c: live SLRU page mirror (write-side capture + ship) */
 extern void pagestore_slru_mirror_init(bool localsvc_active);
