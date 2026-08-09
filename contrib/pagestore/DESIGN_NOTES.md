@@ -5,21 +5,29 @@ for PostgreSQL.  Several pieces are deliberately simplified to get the end-to-en
 architecture working and tested; this file records the directions they must take
 to become production-grade.
 
+Current MVP progress and scope are tracked in [MVP_STATUS.md](MVP_STATUS.md).
 The test direction and rollout plan are in [HARNESS_DESIGN.md](HARNESS_DESIGN.md).
 
 ## 1. Storage & indexes should become LSM-like
 
-**Current.**  The daemon keeps its metadata as plain in-memory chained hash
-tables:
+**Current.**  The POSIX daemon uses the append-only segment log as write-ahead
+staging, per-shard memtables, immutable image layers, a durable manifest, and a
+layer map.  Flush coverage watermarks let restart rebuild the covered prefix
+from layers and scan only the segment tail.  A background maintenance controller
+compacts image layers, reclaims covered segments, and manages the optional
+filesystem-backed object tier.
+
+Some hot metadata remains in plain in-memory chained hash tables:
 
 - page versions: `(timeline, key, block) -> list of {lsn, segment, offset}`
 - fork sizes:    `(timeline, key) -> nblocks`
 - per-page WAL index: `(timeline, key, block) -> ascending list of record LSNs`
 
-Page data is appended to flat segment files (`seg_NNNNNNNN`); shipped WAL goes to
-flat per-timeline logs (`wal_<tl>`).  There is **no compaction and no GC**: the
-version lists and the per-page LSN lists grow without bound, and the indexes are
-rebuilt by scanning everything on restart.
+Page data is still appended to flat segment files before layer flush, and shipped
+WAL goes to flat per-timeline logs (`wal_<tl>`).  Image compaction currently
+merges all layers for a timeline/shard and keeps every version.  Retention-driven
+version pruning, shipped-WAL GC, and WAL-index compaction are not implemented, so
+long-running logical history still grows without bound.
 
 **Target.**  An LSM-like layered store, along the lines of Neon's pageserver:
 
@@ -37,11 +45,12 @@ to object storage).
 
 ## 2. The daemon must run on multiple CPUs
 
-**Current.**  The daemon is **single-threaded**: one poll loop scans all
-channels and processes requests serially, with synchronous blocking I/O
-(`pread`/`pwrite`/`open`).  It uses a single core.  This is precisely why the
-in-memory indexes above need no locking — there is only one accessor.  It is
-also a serialization point and a hard throughput ceiling.
+**Current.**  The POSIX daemon runs one foreground worker per logical shard plus
+a dedicated maintenance controller.  Per-shard locks protect page/fork/WAL-index
+state and memtables; a shared lock still protects the global layer map and
+timeline tree.  This provides real cross-shard concurrency and keeps compaction
+off serve threads, but it is not yet the target share-nothing design: synchronous
+I/O can block a shard and the shared map remains a coordination point.
 
 **Target.**  The daemon must scale across cores, and the data structures must be
 designed for multi-core from the start (not retrofitted):

@@ -10,6 +10,9 @@ model, read planner, compaction/GC), [`WAL_REDO.md`](WAL_REDO.md) (the redo
 mechanics) and [`LSM_OBJECT_STORAGE_PLAN.md`](LSM_OBJECT_STORAGE_PLAN.md)
 (tiering). It defines the *deployment-agnostic* contract those pieces plug into.
 
+Current MVP progress and the remaining operational gates are tracked in
+[`MVP_STATUS.md`](MVP_STATUS.md).
+
 ## First principle: WAL is truth, page is a materialized view
 
 A page is never the unit that *must* be durable — the change is. The durable
@@ -123,8 +126,9 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 ## Mapping to current code & status
 
 - `PsStorage` (posix / spdk) — **done** (byte-log backend).
-- `PsLayerStore` local (posix) — **done**; object/S3 ops — **planned** (tiering,
-  `LSM_OBJECT_STORAGE_PLAN.md` phases 4–6).
+- `PsLayerStore` local (posix) — **done**.  The filesystem-backed object provider
+  and the phase 4–6 upload/verification/eviction/download/remote-GC state
+  machine are **done for local testing**.  A real S3 provider is planned.
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
   restart-from-layers) — **done** (LSM phases 2–3).
 - `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +

@@ -4,6 +4,8 @@ This document records the planned evolution of `contrib/pagestore` from the
 current append-only page-version segment log into an LSM-like page store whose
 lowest tier can be object storage.
 
+Current MVP scope and progress are tracked in [MVP_STATUS.md](MVP_STATUS.md).
+
 The design target is intentionally scoped to pagestore.  It should not require
 rewriting PostgreSQL heapam/tableam, and the existing smgr/local-service IPC ABI
 should remain stable unless a later performance phase proves that it must
@@ -351,7 +353,7 @@ while allowing the daemon to scale across cores.
 
 ## Implementation phases
 
-### Phase 1: local-only layer metadata foundation
+### Phase 1: local-only layer metadata foundation — done
 
 - Add `PsLayerDesc`, layer map, and manifest event log.
 - Add a `PsLayerStore` abstraction, initially backed only by local POSIX files.
@@ -364,7 +366,7 @@ Acceptance criteria:
 - sealed layers are visible through the layer map;
 - core read code does not depend on segment filenames directly.
 
-### Phase 2: full-page image layers
+### Phase 2: full-page image layers — done for POSIX
 
 - Flush mutable full-page records into immutable image layers.
 - Read from memtable first, then image layers.
@@ -376,7 +378,7 @@ Acceptance criteria:
 - restart does not need to scan all historical page records;
 - image layer files have checksums and sparse indexes.
 
-### Phase 3: local compaction and local GC
+### Phase 3: local compaction and local GC — done for image layers
 
 - Merge image layers and small ranges locally.
 - Add manifest state transitions for replacement and deletion.
@@ -388,7 +390,7 @@ Acceptance criteria:
 - old local layers are removed only after manifest state is durable;
 - restart after interrupted compaction or GC is safe.
 
-### Phase 4: object-tier metadata and upload
+### Phase 4: object-tier metadata and upload — done with filesystem provider
 
 - Extend layer locations to include remote object URIs.
 - Add object-storage provider code behind the layer-store/tiering layer.
@@ -408,7 +410,7 @@ Acceptance criteria:
 - restart can resume or retry incomplete uploads;
 - normal reads still work from local copies.
 
-### Phase 5: local eviction and remote download
+### Phase 5: local eviction and remote download — done with filesystem provider
 
 - Add local cold-cache eviction policy.
 - On read, download a remote-durable layer when local copy is missing.
@@ -420,7 +422,7 @@ Acceptance criteria:
 - downloaded layers are verified before use;
 - repeated reads use the local cache/copy.
 
-### Phase 6: remote-aware GC
+### Phase 6: remote-aware GC — done with filesystem provider
 
 - Extend GC to delete remote objects.
 - Persist `deleting` state and retry failed deletes.
@@ -431,7 +433,11 @@ Acceptance criteria:
 - manifest never references a removed layer as readable;
 - remote leaks can be detected and repaired by tooling.
 
-### Phase 7: delta layers and page redo
+### Phase 7: delta layers and page redo — partial
+
+The delta file format and read planner exist, and PostgreSQL recovery-worker
+materialization is proven.  WAL ingest does not yet seal its staging stream into
+delta layers or compact delta chains through this layer path.
 
 - Add mutable delta staging and immutable delta layers.
 - Use per-page WAL indexing to find deltas for reads.
@@ -444,7 +450,7 @@ Acceptance criteria:
 - page reads at an LSN match full-page materialization semantics;
 - unsupported WAL records do not corrupt reads.
 
-### Phase 8: materialized-page cache
+### Phase 8: materialized-page cache — initial implementation done
 
 - Add cache keyed by `(timeline, key, block, read_lsn)`.
 - Use delta-chain length as an admission/value signal.
@@ -456,7 +462,11 @@ Acceptance criteria:
 - GC does not invalidate fixed-LSN materialized pages incorrectly;
 - latest-read entries are invalidated or versioned correctly.
 
-### Phase 9: sharded multi-core daemon
+### Phase 9: sharded multi-core daemon — partial
+
+Logical shard workers, shard-local indexes/memtables/segments, and multi-shard
+stress coverage exist.  The manifest/layer map and maintenance scheduling still
+contain shared coordination rather than the target share-nothing ownership.
 
 - Partition key space across shards.
 - Give each shard its own memtable, layer map, caches, and queues.
