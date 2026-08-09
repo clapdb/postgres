@@ -905,6 +905,8 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_seed_branch_slrus' LANGUAGE C STRICT;
        CREATE OR REPLACE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn, xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS bigint
+        AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
@@ -1029,6 +1031,69 @@ prepMxMem=$($P -c "SELECT md5(pg_read_binary_file('$PREPSEED/pg_multixact/member
 assert "$prepMxOff" "$mxRP" "branch prepare multixact offsets page == reconstructed as-of-L page"
 assert "$prepMxMem" "$mbRecon" "branch prepare multixact members page == reconstructed as-of-L page"
 rm -rf "$PREPSEED"
+
+# --- 24. control-derived branch prepare: one exact checkpoint owns every horizon ---
+# The non-expert entrypoint accepts only the proven base snapshot and an exact,
+# durably mirrored checkpoint redo.  Every bootstrap horizon must come from that
+# same control image; in particular, oldestMulti's member offset is reconstructed
+# from the base + WAL window instead of being guessed by the caller.
+$P -c "CHECKPOINT;" >/dev/null
+read -r autoL autoOldestXid autoNextXid autoOldestCts autoNextCts autoOldestMulti autoNextMulti autoNextMember <<< "$($P -c "
+	SELECT redo_lsn || ' ' || oldest_xid || ' ' || split_part(next_xid, ':', 2) || ' ' ||
+	       CASE WHEN current_setting('track_commit_timestamp')::bool
+	            THEN CASE WHEN oldest_commit_ts_xid::text = '0' THEN split_part(next_xid, ':', 2)
+	                      ELSE oldest_commit_ts_xid::text END
+	            ELSE '0' END || ' ' ||
+	       CASE WHEN current_setting('track_commit_timestamp')::bool
+	            THEN CASE WHEN newest_commit_ts_xid::text = '0' THEN split_part(next_xid, ':', 2)
+	                      ELSE CASE WHEN newest_commit_ts_xid::text::bigint = 4294967295 THEN '3'
+	                                ELSE (newest_commit_ts_xid::text::bigint + 1)::text END END
+	            ELSE '0' END || ' ' ||
+	       oldest_multi_xid || ' ' || next_multixact_id || ' ' || next_multi_offset
+	FROM pg_control_checkpoint();")"
+if [ "$autoOldestMulti" = "$autoNextMulti" ]; then
+	autoOldestMember=$autoNextMember
+else
+	autoOldestMember=$($P -c "SELECT pagestore_multixact_offset_asof(
+		'$autoOldestMulti'::xid, '$mxC', '$autoL');")
+fi
+autoFork=$($P -c "SELECT pg_current_wal_lsn();")
+AUTOSEED=$(mktemp -d)
+autoSeeded=$($P -c "SELECT pagestore_prepare_branch_from_control(
+	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
+assert "$([ "${autoSeeded:-0}" -ge 3 ] && echo ok || echo no)" "ok" \
+	"control-derived prepare seeded all branch SLRUs ($autoSeeded page(s))"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'oldest_xid')::text;")" \
+	"$autoOldestXid" "control-derived prepare records checkpoint oldestXid"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'next_xid')::text;")" \
+	"$autoNextXid" "control-derived prepare records checkpoint nextXid"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'oldest_commit_ts_xid')::text;")" \
+	"$autoOldestCts" "control-derived prepare derives the checkpoint commit-ts lower bound"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'next_commit_ts_xid')::text;")" \
+	"$autoNextCts" "control-derived prepare derives the exclusive commit-ts upper bound"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'oldest_multi')::text;")" \
+	"$autoOldestMulti" "control-derived prepare records checkpoint oldestMulti"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'next_multi')::text;")" \
+	"$autoNextMulti" "control-derived prepare records checkpoint nextMulti"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'next_member')::text;")" \
+	"$autoNextMember" "control-derived prepare records checkpoint next member offset"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'oldest_member')::text;")" \
+	"$autoOldestMember" "control-derived prepare reconstructs oldestMulti's member offset"
+assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'fork_lsn')::pg_lsn::text;")" \
+	"$autoFork" "control-derived prepare forks at the separate materialized boundary"
+autoRetry=$($P -c "SELECT pagestore_prepare_branch_from_control(
+	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
+assert "$autoRetry" "$autoSeeded" \
+	"control-derived prepare retry is idempotent"
+shortFork=$($P -c "SELECT pagestore_prepare_branch_from_control(
+	'$AUTOSEED.short', 4, 0, '$mxC', '$autoL', '$autoL');" 2>/dev/null || echo ERROR)
+assert "$shortFork" "ERROR" \
+	"control-derived prepare rejects a fork that does not cover the checkpoint record"
+badAuto=$($P -c "SELECT pagestore_prepare_branch_from_control(
+	'$AUTOSEED.bad', 4, 0, '$mxC', '$autoL'::pg_lsn + 1, '$autoFork');" 2>/dev/null || echo ERROR)
+assert "$badAuto" "ERROR" \
+	"control-derived prepare rejects a target without an exact checkpoint control state"
+rm -rf "$AUTOSEED"
 
 # --- 26. pg_control mirror: control writes publish LSN-versioned store images ---
 # Every UpdateControlFile() queues the just-written image (versioned by the LSN

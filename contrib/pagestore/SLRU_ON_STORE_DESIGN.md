@@ -29,11 +29,13 @@ Known caveats -- each remains open work, with its exact failure mode stated:
   commits touch with no prior ZEROPAGE.  A target inside an off window
   fails closed with a distinct error; an inactive fork is seeded with a
   non-normal horizon (the pre-existing empty-`pg_commit_ts` path).  The
-  caller's horizon still comes from the fork's pg_control (the control
-  mirror ships a fresh image at the toggle itself, via
-  XLogReportParameters' UpdateControlFile, so `track_commit_timestamp`
-  as-of-L is reliable); deriving it automatically remains the pg_control
-  bootstrap helper follow-up.
+  branch horizon comes from the fork's pg_control (the control mirror ships
+  a fresh image at the toggle itself, via XLogReportParameters'
+  UpdateControlFile, so `track_commit_timestamp` as-of-L is reliable).
+  `pagestore_prepare_branch_from_control` performs that derivation for an
+  exact, admission-fenced checkpoint redo and cuts ancestry at a separately
+  supplied materialized fork boundary covering the checkpoint; the legacy
+  prepare ABI still accepts explicit horizons for compatibility.
 - **Snapshot shipping trusts the caller's cutoff.**  `pagestore_ship_slru_snapshot`
   copies segment files and keys them by a caller-supplied cutoff C; it errors
   only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
