@@ -6,6 +6,7 @@ this document is the target architecture and module boundary reference.
 See `MATERIALIZATION.md` for the deployment-agnostic ingest/materialize
 abstraction (page-ingest vs wal-ingest, and where redo runs: local worker vs
 cloud serverless) that this layer model plugs into.
+Current MVP progress is tracked separately in [`MVP_STATUS.md`](MVP_STATUS.md).
 
 ## Design intent
 

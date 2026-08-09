@@ -5,6 +5,9 @@ pages by replaying WAL**, so that a read compute can be stateless and a branch
 is a complete clone.  It is a multi-step effort; this document records the plan
 and what is implemented so far.
 
+Current MVP scope, composed acceptance criteria, and remaining operational work
+are tracked in [`MVP_STATUS.md`](MVP_STATUS.md).
+
 ## Why not reimplement redo
 
 PostgreSQL applies WAL per resource manager (`heap`, `btree`, `gin`, `xact`,

@@ -10,6 +10,9 @@ model, read planner, compaction/GC), [`WAL_REDO.md`](WAL_REDO.md) (the redo
 mechanics) and [`LSM_OBJECT_STORAGE_PLAN.md`](LSM_OBJECT_STORAGE_PLAN.md)
 (tiering). It defines the *deployment-agnostic* contract those pieces plug into.
 
+Current MVP progress and the remaining operational gates are tracked in
+[`MVP_STATUS.md`](MVP_STATUS.md).
+
 ## First principle: WAL is truth, page is a materialized view
 
 A page is never the unit that *must* be durable — the change is. The durable
@@ -123,10 +126,15 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 ## Mapping to current code & status
 
 - `PsStorage` (posix / spdk) — **done** (byte-log backend).
-- `PsLayerStore` local (posix) — **done**; object/S3 ops — **planned** (tiering,
-  `LSM_OBJECT_STORAGE_PLAN.md` phases 4–6).
+- `PsLayerStore` local (posix) — **done**.  The filesystem-backed object provider
+  and durable upload/verification are done for local testing.  Download,
+  eviction, and remote deletion mechanisms exist, while cache residency policy
+  and remote-orphan reconciliation keep phases 5–6 partial.  A real S3 provider
+  is planned.
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
-  restart-from-layers) — **done** (LSM phases 2–3).
+  restart-from-layers) — **functional path done**.  LSM phases 2–3 remain
+  partial because image indexes are dense and layer-block cache invalidation is
+  not implemented.
 - `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +
   delta-layer format + read plan — **partial** (7a/7b and continuous auto-index
   done; the continuous recovery-worker topology is proven, while its managed

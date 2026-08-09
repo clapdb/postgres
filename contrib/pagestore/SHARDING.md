@@ -1,5 +1,9 @@
 # pagestore — multi-core sharding design
 
+Current MVP progress is tracked in [MVP_STATUS.md](MVP_STATUS.md).  This document
+describes the eventual share-nothing ownership model; some sections intentionally
+remain targets rather than descriptions of the current shared-map implementation.
+
 ## Guiding principle: follow ScyllaDB
 
 ScyllaDB is our primary reference for the concurrency/engine model.  Concrete
@@ -29,11 +33,11 @@ cross-process concern (see `MATERIALIZATION.md`), not a Scylla mechanism.
 
 ## Overview
 
-The daemon is single-threaded: one thread polls every channel and owns all state
-lock-free.  On fast NVMe/SPDK that single core is the throughput ceiling.  This
-doc commits to a shard-by-key model that keeps each shard single-owner and
-lock-free (no global locks on the hot path) and lays out an incremental migration
-that never breaks the standalone suite.
+The POSIX daemon now runs one foreground worker per logical shard and a dedicated
+maintenance controller.  Page/fork/WAL-index state, memtables, append cursors,
+and segment namespaces are sharded; the layer map and timeline tree remain
+shared and lock-protected.  This document commits to completing that migration
+as a shard-by-key, single-owner model with no global lock on the hot path.
 
 Expands the sketch in `LSM_ARCHITECTURE.md` (§Sharding model).
 
@@ -55,7 +59,7 @@ Trade-off: a single hot relation maps to one shard (no intra-relation
 parallelism).  Acceptable — real workloads spread across many relations/forks,
 and keeping per-key state on one core is what makes it lock-free.
 
-## What each shard owns (single-owner, lock-free)
+## Target: what each shard owns (single-owner, lock-free)
 
 ```text
 Shard {
@@ -74,7 +78,7 @@ Because the shard key is block-independent, a sealed image/delta layer produced
 by a shard covers **only that shard's keys** — no layer ever spans shards, so the
 layer map partitions cleanly and compaction/GC stay per-shard and lock-free.
 
-## Shared state (kept off the hot path)
+## Target: shared state kept off the hot path
 
 - **Timelines (branch tree)** — global, read-mostly.  Every shard needs it for
   `read_through` ancestry.  Replicate a read-only copy per shard; on branch
@@ -121,18 +125,20 @@ timeline tree under a brief coordination point, not on the read/write hot path.
 
 ## Migration plan (each step keeps the standalone suite green)
 
-1. **This design.**
-2. **Refactor global state into a `Shard` struct, `nshards = 1`, still one
-   thread.** Pure mechanical refactor (page_idx/fork_idx/memtable/pgcache/
-   layer_map/cursor/next_layer_id become `shard->...`); behavior identical,
-   116/116 unchanged.  De-risks everything below.
-3. **Partition channels + client-side routing**, still `nshards = 1` (routing is
-   identity) — proves the routing path without parallelism.
-4. **`nshards > 1` + one worker thread per shard** (POSIX first).  Per-shard
-   manifest files + shard-namespaced layer/segment files.  This is where real
-   parallelism lands.
-5. **SPDK per-thread qpairs** so the async path scales per core.
-6. **Branch-create coordination** for the shared timeline tree.
+1. **[done] This design.**
+2. **[partial] Refactor global state into a `Shard` struct.** Page/fork/WAL-index
+   state, memtables, append cursors, and layer-id cursors are shard-owned.  The
+   materialized-page cache and layer map remain process-global and lock-protected;
+   moving them into shard ownership is still required for share-nothing.
+3. **[done] Partition channels + client-side routing.** Localsvc derives the
+   logical shard from the final key and claims a channel from that shard's pool.
+4. **[partial] `nshards > 1` + one worker thread per shard** (POSIX first).
+   Workers, shard state, layer IDs, and segment namespaces are sharded and the
+   multi-shard stress suite is green.  The manifest/layer map remain shared.
+5. **[done for the segment path] SPDK per-thread qpairs** so the async path
+   scales per core.  SPDK still does not use image-layer recovery/GC.
+6. **[implemented with locks] Branch-create coordination** for the shared
+   timeline tree.  Per-shard replicated timeline metadata remains the target.
 
 Each step is independently testable; step 2 is the big mechanical change and is
 behavior-preserving, so the risky parallelism (step 4) sits on a proven refactor.
@@ -166,7 +172,7 @@ change *before or with* sharding, or per-shard threads will stall:
 These are tracked as co-requisites: step 4 (real parallelism) should not ship
 without (1); (2) and (3) can land incrementally alongside.
 
-## Invariants
+## Target invariants
 
 - Every version/timeline/block of a given key lives on exactly one shard.
 - No layer spans shards; no manifest entry is shared.
