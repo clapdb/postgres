@@ -79,6 +79,7 @@ typedef struct PsStorage
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);
 	int			(*meta_read) (uint64_t off, void *buf, uint32_t len);
+	int			(*meta_rewrite) (const void *buf, uint32_t len);
 
 	/*
 	 * Fork metadata log: the durable record of fork-size events the segment

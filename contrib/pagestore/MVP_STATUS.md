@@ -187,11 +187,10 @@ therefore consume one authority.  Still required for the gate:
 - timeline deletion and its layer/WAL cleanup.
 
 The reader/materializer controllers must also register and release their owner
-generations before those reclaimers are enabled.  The legacy fixed-record
-`timelines` log also needs CRC-protected, fail-closed recovery before GC trusts
-structural branch pins to delete history.  Until those consumers, registrations,
-and metadata hardening land, correctness demos run but disk use can grow without
-bound.
+generations before those reclaimers are enabled.  The `timelines` log now uses
+CRC-protected records, rejects truncated or corrupt entries, and atomically
+migrates complete legacy logs before opening the store.  Until the consumers and
+registrations land, correctness demos run but disk use can grow without bound.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
 
@@ -205,8 +204,8 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Harden timeline-metadata recovery and wire reader/materializer owner
-   generations into the retained-horizon registry, then reclaim image history,
+1. Wire reader/materializer owner generations into the retained-horizon registry,
+   then reclaim image history,
    WAL, WAL index, and deleted timelines.
 2. Promote the golden scenario into the declarative crash/compatibility harness.
 

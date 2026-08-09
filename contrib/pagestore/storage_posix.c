@@ -780,6 +780,44 @@ posix_meta_read(uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+posix_meta_rewrite(const void *buf, uint32_t len)
+{
+	char path[4096], tmp[4096];
+	int fd = -1, rc = -1;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	snprintf(tmp, sizeof(tmp), "%s/timelines.tmp", posix_dir);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		goto out;
+	for (uint32_t off = 0; off < len; )
+	{
+		n = write(fd, (const char *) buf + off, len - off);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		off += (uint32_t) n;
+	}
+	if (fsync(fd) != 0 || close(fd) != 0)
+		goto out_closed;
+	fd = -1;
+	if (rename(tmp, path) != 0)
+		goto out;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0)
+		unlink(tmp);
+out_closed:
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
+static int
 posix_fork_meta_append(const void *buf, uint32_t len)
 {
 	/* Standalone-test fault injection; ordinary deployments leave this zero. */
@@ -838,6 +876,7 @@ const PsStorage PsStoragePosix = {
 	.walidx_truncate = posix_walidx_truncate,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
+	.meta_rewrite = posix_meta_rewrite,
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
 	.fork_meta_truncate = posix_fork_meta_truncate,
