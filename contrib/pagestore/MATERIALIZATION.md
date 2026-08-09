@@ -132,7 +132,9 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
   and remote-orphan reconciliation keep phases 5–6 partial.  A real S3 provider
   is planned.
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
-  restart-from-layers) — **done** (LSM phases 2–3).
+  restart-from-layers) — **functional path done**.  LSM phases 2–3 remain
+  partial because image indexes are dense and layer-block cache invalidation is
+  not implemented.
 - `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +
   delta-layer format + read plan — **partial** (7a/7b and continuous auto-index
   done; the continuous recovery-worker topology is proven, while its managed

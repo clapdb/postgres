@@ -28,7 +28,7 @@ work and must not expand the MVP critical path.
 | Area | Status | Current proof |
 |---|---|---|
 | Page ingest and copy-on-write reads | Implemented | standalone and PostgreSQL integration suites |
-| Image layers, manifest replay, compaction, segment GC | Implemented for POSIX | layer/manifest/GC tests and restart coverage |
+| Image-layer path | Functional mechanisms implemented; phases 2–3 partial | manifest/compaction/segment-GC restart tests; sparse indexes and layer-block cache invalidation remain |
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Implemented | integration and branch tests |

@@ -366,7 +366,13 @@ Acceptance criteria:
 - sealed layers are visible through the layer map;
 - core read code does not depend on segment filenames directly.
 
-### Phase 2: full-page image layers — done for POSIX
+### Phase 2: full-page image layers — partial
+
+POSIX memtable flush, immutable image files, checksum validation, layer reads,
+coverage-watermark recovery, and segment-tail replay are implemented.  The
+on-disk index remains dense: it stores and loads one `PsImgIndexEnt` per page
+version rather than the sparse index required by this phase's acceptance
+criteria.
 
 - Flush mutable full-page records into immutable image layers.
 - Read from memtable first, then image layers.
@@ -378,7 +384,13 @@ Acceptance criteria:
 - restart does not need to scan all historical page records;
 - image layer files have checksums and sparse indexes.
 
-### Phase 3: local compaction and local GC — done for image layers
+### Phase 3: local compaction and local GC — partial
+
+Install-new-before-delete-old image compaction, durable deleting state,
+idempotent file removal, and crash recovery are implemented.  There is no
+separate layer-block cache or `layer_id` invalidation API yet, so the cache
+invalidation deliverable below remains open.  Retention-driven version pruning
+is tracked separately as an MVP space-reclamation gate.
 
 - Merge image layers and small ranges locally.
 - Add manifest state transitions for replacement and deletion.

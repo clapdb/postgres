@@ -130,8 +130,8 @@ timeline tree under a brief coordination point, not on the read/write hot path.
    state, memtables, append cursors, and layer-id cursors are shard-owned.  The
    materialized-page cache and layer map remain process-global and lock-protected;
    moving them into shard ownership is still required for share-nothing.
-3. **[done] Partition channels + client-side routing**, still `nshards = 1` (routing is
-   identity) — proves the routing path without parallelism.
+3. **[done] Partition channels + client-side routing.** Localsvc derives the
+   logical shard from the final key and claims a channel from that shard's pool.
 4. **[partial] `nshards > 1` + one worker thread per shard** (POSIX first).
    Workers, shard state, layer IDs, and segment namespaces are sharded and the
    multi-shard stress suite is green.  The manifest/layer map remain shared.
