@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work through the local materializer supervisor.
+Status below includes work through recovery-materializer SLRU snapshot capture.
 
 ## MVP scope
 
@@ -35,7 +35,7 @@ work and must not expand the MVP critical path.
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
-| `pg_control` and branch SLRU bootstrap | Implemented | prepared branch install and fail-closed startup validation |
+| `pg_control` and branch SLRU bootstrap | Core mechanisms implemented; automatic bootstrap partial | proven recovery snapshot capture, control-derived prepare, prepared install, and fail-closed startup validation |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
@@ -52,8 +52,8 @@ The existing CI proves both focused subsystem paths and the composed contract:
   materialized boundaries, replaces a crashed worker, and continues following
   WAL;
 - `mvp_golden_test.sh` composes WAL-only ingest, durable materialization,
-  prepared branch boot, parent/child isolation, and store/materializer/compute
-  restarts in one topology;
+  a proven recovery-produced SLRU base, prepared branch boot, parent/child
+  isolation, and store/materializer/compute restarts in one topology;
 - `branch_boot_test.sh` proves an independent branch compute can boot, preserve
   fork-point visibility, and write on its own timeline.
 
@@ -100,7 +100,16 @@ data-path work.
 
 ### 3. Safe automatic branch bootstrap -- partial
 
-`pagestore_prepare_branch_from_control` now accepts a proven SLRU base cutoff,
+`pagestore_capture_slru_snapshot()` now turns a confirmed recovery pause into
+that proven base cutoff.  It requests and waits for a restartpoint, requires
+the durable materializer marker to equal the unchanged paused replay LSN, then
+stages `pg_xact`, commit-ts, and both multixact SLRUs locally.  A second replay
+check prevents a concurrent resume from publishing a mixed image; only then
+does it publish and sync every staged page under the returned cutoff.  The
+golden scenario exercises both its unpaused fail-closed case and the successful
+path, replacing its former writer-side expert snapshot calls.
+
+`pagestore_prepare_branch_from_control` accepts that proven SLRU base cutoff,
 an exact checkpoint redo, and the materialized fork boundary which covers that
 checkpoint.  It requires the matching durable control admission fence and WAL
 checkpoint record, then derives every XID, commit-ts, multixact-ID, and
@@ -109,17 +118,16 @@ otherwise-unrecorded oldest member offset from the same `(C, R]` window, fails
 closed on a missing or inconsistent bound, cuts the store branch at the
 separate materialized LSN (avoiding exact-R admission-sequence ties), and reuses
 the prepared-manifest/store-branch idempotency protocol.  The legacy expert ABI
-remains available for compatibility.  Until the producer-side quiesce protocol
-lands, the control plane must keep the parent free of horizon-changing work
-between the selected checkpoint and that materialized boundary.
+remains available for compatibility.  The control plane must still keep the
+parent free of horizon-changing work between the selected checkpoint and that
+materialized boundary.
 
-The current demo still chooses and ships the base cutoff explicitly and copies
-a stopped parent data directory.  Completing this gate requires a brief SLRU
-write barrier (or another producer-side quiesce protocol) which captures and
-ships an exact-as-of snapshot under a proven cutoff, followed by a portable
-catalog/control bootstrap artifact.  The live SLRU watermark cannot substitute:
-its newest-image contract deliberately permits bytes newer than its completeness
-floor and is therefore unsafe as an exact branch seed.
+The current demo still copies a stopped parent data directory.  Completing this
+gate requires a portable catalog/control bootstrap artifact plus one serialized
+control-plane operation spanning checkpoint selection through the materialized
+fork boundary.  The live SLRU watermark cannot substitute for the new capture
+API: its newest-image contract deliberately permits bytes newer than its
+completeness floor and is therefore unsafe as an exact branch seed.
 
 ### 4. Retention-driven space reclamation -- remaining
 
@@ -148,8 +156,9 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Add producer-side proven-cutoff snapshot capture and portable catalog/control
-   bootstrap, building on the control-derived prepare operation.
+1. Add the portable catalog/control bootstrap artifact and serialize checkpoint
+   selection through the materialized fork, building on proven SLRU capture and
+   the control-derived prepare operation.
 2. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
    and deleted timelines.
 3. Promote the golden scenario into the declarative crash/compatibility harness.

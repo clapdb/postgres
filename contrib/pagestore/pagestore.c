@@ -70,6 +70,7 @@
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
@@ -93,6 +94,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_classes.h"
+#include "utils/wait_event.h"
 #include "walredo_client.h"
 
 PG_MODULE_MAGIC;
@@ -2247,15 +2249,16 @@ static const char *const ps_slru_dirs[] = {
 	"pg_commit_ts",
 };
 
-static void
+static int
 slru_check_dir(const char *slru)
 {
 	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
 		if (strcmp(ps_slru_dirs[i], slru) == 0)
-			return;
+			return i;
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+	pg_unreachable();
 }
 
 static void
@@ -2267,32 +2270,19 @@ slru_obj_key(PageStoreRelKey *key, const char *slru)
 	key->forkNum = 0;
 }
 
-/*
- * pagestore_ship_slru_snapshot(slru text, cutoff pg_lsn) returns bigint
- *
- * Ship a clean whole-segment snapshot of SLRU directory 'slru' (e.g. 'pg_xact')
- * keyed by 'cutoff'.  'cutoff' must provably upper-bound the on-disk segments'
- * contents -- the caller captures it at a quiescent point (a clean
- * shutdown/restartpoint, or under a brief SLRU write barrier).  The online,
- * automatically-triggered, proven-C path is a follow-up.  Returns the page count;
- * fails closed (ereport) on any read/IPC error rather than shipping a partial snap.
- */
-PG_FUNCTION_INFO_V1(pagestore_ship_slru_snapshot);
-Datum
-pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
+typedef void (*PsSlruPageConsumer) (const char *slru, BlockNumber pageno,
+									const char *page, void *arg);
+
+/* Scan one clean SLRU directory and hand every complete page to a consumer. */
+static int64
+slru_scan_snapshot(const char *slru, PsSlruPageConsumer consume, void *arg)
 {
-	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
 	DIR		   *dir;
 	struct dirent *de;
-	int64		shipped = 0;
+	int64		pages = 0;
 	char	   *page = palloc(BLCKSZ);
 
-	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
-		ereport(ERROR,
-				(errmsg("pagestore.backend must be 'localsvc'")));
 	slru_check_dir(slru);
-
 	dir = AllocateDir(slru);
 	if (dir == NULL)
 		ereport(ERROR,
@@ -2309,13 +2299,9 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		size_t		namelen = strlen(de->d_name);
 
 		/*
-		 * Mirror SlruScanDirectory()'s filename test so we ship only real segment
-		 * files: SlruCorrectSegmentFilenameLength() allows short names of 4, 5 or
-		 * 6 upper-case hex characters (the "%04X" width is a minimum, so a segno
-		 * past 0xFFFF -- e.g. advanced commit_ts -- yields 5-6 chars), and
-		 * exactly 15 for long-name SLRUs (pg_multixact/members, whose offsets
-		 * are 64-bit).  Anything else in the directory is skipped, not shipped
-		 * as bogus SLRU pages.
+		 * Match SlruScanDirectory()'s filename test: short SLRUs use
+		 * 4-6 upper-case hex characters, while long-name SLRUs such as
+		 * pg_multixact/members use exactly 15.
 		 */
 		if ((namelen < 4 || namelen > 6) && namelen != 15)
 			continue;
@@ -2325,6 +2311,10 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		segno = strtoll(de->d_name, &endp, 16);
 		if (endp == de->d_name || *endp != '\0' || errno != 0 || segno < 0)
 			continue;
+		if ((uint64) segno > MaxBlockNumber / SLRU_PAGES_PER_SEGMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("SLRU page number exceeds pagestore block range")));
 
 		snprintf(segpath, sizeof(segpath), "%s/%s", slru, de->d_name);
 		fd = OpenTransientFile(segpath, O_RDONLY | PG_BINARY);
@@ -2336,10 +2326,10 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		for (pageidx = 0; pageidx < SLRU_PAGES_PER_SEGMENT; pageidx++)
 		{
 			int			n = read(fd, page, BLCKSZ);
-			PageStoreRelKey key;
+			uint64		pageno;
 
 			if (n == 0)
-				break;			/* fewer than a full segment's pages on disk */
+				break;
 			if (n != BLCKSZ)
 			{
 				CloseTransientFile(fd);
@@ -2347,18 +2337,209 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 						(errcode_for_file_access(),
 						 errmsg("short read on SLRU segment \"%s\"", segpath)));
 			}
-			slru_obj_key(&key, slru);
-			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key,
-										 (BlockNumber) (segno * SLRU_PAGES_PER_SEGMENT
-														+ pageidx),
-										 page, (uint64) cutoff);
-			shipped++;
+			pageno = (uint64) segno * SLRU_PAGES_PER_SEGMENT + pageidx;
+			if (pageno > MaxBlockNumber)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("SLRU page number exceeds pagestore block range")));
+			}
+			consume(slru, (BlockNumber) pageno, page, arg);
+			pages++;
 		}
 		CloseTransientFile(fd);
+		CHECK_FOR_INTERRUPTS();
 	}
 	FreeDir(dir);
+	pfree(page);
+	return pages;
+}
+
+typedef struct PsSlruDirectContext
+{
+	XLogRecPtr	cutoff;
+} PsSlruDirectContext;
+
+static void
+slru_publish_page(const char *slru, BlockNumber pageno, const char *page,
+				  void *arg)
+{
+	PsSlruDirectContext *context = arg;
+	PageStoreRelKey key;
+
+	slru_obj_key(&key, slru);
+	pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, pageno, page,
+								 (uint64) context->cutoff);
+}
+
+typedef struct PsSlruStagePage
+{
+	uint32		dir_index;
+	BlockNumber pageno;
+	char		page[BLCKSZ];
+} PsSlruStagePage;
+
+typedef struct PsSlruStageContext
+{
+	File		file;
+	pgoff_t		offset;
+} PsSlruStageContext;
+
+static void
+slru_stage_page(const char *slru, BlockNumber pageno, const char *page,
+				void *arg)
+{
+	PsSlruStageContext *context = arg;
+	PsSlruStagePage staged;
+	ssize_t		written;
+
+	memset(&staged, 0, sizeof(staged));
+	staged.dir_index = (uint32) slru_check_dir(slru);
+	staged.pageno = pageno;
+	memcpy(staged.page, page, BLCKSZ);
+	written = FileWrite(context->file, &staged, sizeof(staged), context->offset,
+						WAIT_EVENT_DATA_FILE_WRITE);
+	if (written < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stage pagestore SLRU snapshot: %m")));
+	if (written != sizeof(staged))
+		ereport(ERROR,
+				(errcode(ERRCODE_DISK_FULL),
+				 errmsg("short write while staging pagestore SLRU snapshot")));
+	context->offset += sizeof(staged);
+}
+
+static void
+slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
+{
+	PsSlruDirectContext context = {.cutoff = cutoff};
+	PsSlruStagePage staged;
+	pgoff_t		offset = 0;
+
+	for (int64 i = 0; i < pages; i++)
+	{
+		ssize_t		read_bytes;
+
+		read_bytes = FileRead(file, &staged, sizeof(staged), offset,
+						  WAIT_EVENT_DATA_FILE_READ);
+		if (read_bytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read staged pagestore SLRU snapshot: %m")));
+		if (read_bytes != sizeof(staged))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("short read from staged pagestore SLRU snapshot")));
+		if (staged.dir_index >= lengthof(ps_slru_dirs))
+			elog(ERROR, "invalid staged pagestore SLRU directory index");
+		slru_publish_page(ps_slru_dirs[staged.dir_index], staged.pageno,
+						  staged.page, &context);
+		offset += sizeof(staged);
+	}
+}
+
+/*
+ * pagestore_ship_slru_snapshot(slru text, cutoff pg_lsn) returns bigint
+ *
+ * Ship a clean whole-segment snapshot of SLRU directory 'slru' (e.g. 'pg_xact')
+ * keyed by 'cutoff'.  'cutoff' must provably upper-bound the on-disk segments'
+ * contents -- the caller captures it at a quiescent point (a clean
+ * shutdown/restartpoint, or under a brief SLRU write barrier).  This remains
+ * the expert API; pagestore_capture_slru_snapshot() is the installed path that
+ * proves C on a recovery materializer.  Returns the page count; fails closed
+ * (ereport) on any read/IPC error rather than shipping a partial snapshot.
+ */
+PG_FUNCTION_INFO_V1(pagestore_ship_slru_snapshot);
+Datum
+pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
+	PsSlruDirectContext context = {.cutoff = cutoff};
+	int64		shipped;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	shipped = slru_scan_snapshot(slru, slru_publish_page, &context);
 
 	PG_RETURN_INT64(shipped);
+}
+
+/*
+ * Capture all in-scope SLRUs at a cutoff proven by a paused recovery worker.
+ * The temporary stage prevents a concurrent resume from publishing a mixed
+ * image: replay is rechecked before any staged page reaches the store.
+ */
+PG_FUNCTION_INFO_V1(pagestore_capture_slru_snapshot);
+Datum
+pagestore_capture_slru_snapshot(PG_FUNCTION_ARGS)
+{
+	PsSlruStageContext stage;
+	XLogRecPtr	replay_before;
+	XLogRecPtr	replay_after;
+	XLogRecPtr	materialized;
+	int64		pages = 0;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to capture a pagestore SLRU snapshot")));
+	pagestore_require_materializer();
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore SLRU snapshot capture requires paused WAL replay"),
+				 errhint("Call pg_wal_replay_pause() and wait until pg_get_wal_replay_pause_state() returns 'paused'.")));
+
+	replay_before = GetXLogReplayRecPtr(NULL);
+	if (XLogRecPtrIsInvalid(replay_before))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore SLRU snapshot cutoff is unavailable")));
+
+	/* Flush all four SLRUs and publish the matching durable marker. */
+	RequestCheckpoint(CHECKPOINT_WAIT | CHECKPOINT_FAST);
+	pagestore_require_materializer();
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay resumed during pagestore SLRU snapshot capture")));
+	replay_after = GetXLogReplayRecPtr(NULL);
+	if (replay_after != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay advanced during pagestore SLRU snapshot capture")));
+	materialized = pagestore_materialized_wal_lsn_internal();
+	if (materialized != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("restartpoint did not durably cover the paused WAL replay position"),
+				 errdetail("Paused replay is at %X/%08X, but the durable materializer watermark is at %X/%08X.",
+						   LSN_FORMAT_ARGS(replay_before),
+						   LSN_FORMAT_ARGS(materialized)),
+				 errhint("Replay through a newer checkpoint record, pause recovery again, and retry.")));
+
+	stage.file = OpenTemporaryFile(false);
+	stage.offset = 0;
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+		pages += slru_scan_snapshot(ps_slru_dirs[i], slru_stage_page, &stage);
+
+	/* Fail before store writes if the supposedly stable local image moved. */
+	pagestore_require_materializer();
+	replay_after = GetXLogReplayRecPtr(NULL);
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED ||
+		replay_after != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay changed while staging pagestore SLRU snapshot")));
+
+	slru_publish_stage(stage.file, pages, replay_before);
+	pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	FileClose(stage.file);
+	PG_RETURN_LSN(replay_before);
 }
 
 /*
