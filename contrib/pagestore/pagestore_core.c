@@ -212,10 +212,10 @@ static Shard g_shards[MAX_SHARDS];
  * reverse, so there is no deadlock.
  *
  * Each daemon worker owns exactly one shard and only ever touches its own
- * g_shards[]; maintenance (worker 0) takes one shard for compaction or all
+ * g_shards[]; the maintenance controller takes one shard for compaction or all
  * shards for physical-segment rebinding, then map_lock.  Reads take shard-rd +
  * map-rd; ordinary writes take only shard-wr, escalating to a brief map-wr
- * inside append_page when a flush or inline compaction mutates the map; branch
+ * inside append_page when a flush mutates the map; branch
  * creation takes map-wr alone.
  */
 static pthread_rwlock_t shard_locks[MAX_SHARDS];
@@ -3557,18 +3557,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 			s->coverage_broken = 1;
 		if (ps_memtable_full(s->memtable))
 		{
-			/* A flush (and any inline compaction) mutates the cross-shard
+			/* A flush mutates the cross-shard
 			 * ps_layer_map, so take map_lock here -- only on the rare flush, not
 			 * on every write.  The caller already holds this shard's write lock,
 			 * preserving the shard -> map order. */
 			ps_lock_map_wr();
 			flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off);
-			/* backpressure only: normal compaction runs off the write path in
-			 * ps_core_maintenance() when the daemon is idle.  Compact inline
-			 * here only if the layer count is running away far past the
-			 * threshold (writes outpacing background compaction). */
-			if (count_image_layers(timeline, s->id) > (uint32_t) compact_layers * 4)
-				compact_timeline(timeline, s->id);
 			ps_unlock_map();
 		}
 	}
@@ -5214,10 +5208,10 @@ finish_evict:
 
 /*
  * Off-the-write-path background maintenance: compact one timeline whose image
- * layer count exceeds the (low-water) threshold.  The daemon calls this when it
- * is otherwise idle; doing at most one compaction per call keeps the serve loop
- * responsive.  Returns 1 if it compacted (the caller should not sleep), 0 if
- * nothing was due.
+ * layer count exceeds the (low-water) threshold.  The maintenance controller
+ * calls this repeatedly; doing at most one compaction per call lets other
+ * maintenance classes make progress.  Returns 1 if it did work (the caller
+ * should run another tick), 0 if nothing was due.
  */
 int
 ps_core_maintenance(void)
@@ -5251,11 +5245,22 @@ ps_core_maintenance(void)
 	{
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{
-			Shard	   *s = &g_shards[sh];
+			uint32_t	victim = 0;
+			int			due;
 
-			if (s->flush_watermark_valid &&
-				s->gc_next_seg < s->flush_watermark.seg_id)
-				prepare_segment_layers(s->id, s->gc_next_seg);
+			/* flush_memtable() publishes the coverage watermark while its
+			 * foreground worker holds shard-wr.  Snapshot the candidate under
+			 * shard-rd, then release it before layer materialization can perform
+			 * remote I/O.  A newer watermark only makes this victim safer. */
+			ps_lock_shard_rd(sh);
+			due = g_shards[sh].flush_watermark_valid &&
+				g_shards[sh].gc_next_seg <
+				g_shards[sh].flush_watermark.seg_id;
+			if (due)
+				victim = g_shards[sh].gc_next_seg;
+			ps_unlock_shard(sh);
+			if (due)
+				prepare_segment_layers(sh, victim);
 		}
 		for (uint32_t sh = 0; sh < ns; sh++)
 			ps_lock_shard_wr(sh);

@@ -324,10 +324,11 @@ until the manifest durably exposes the replacement.
 Execution & strategy (informed by RocksDB/ScyllaDB; see `SHARDING.md`):
 
 - **Run compaction in the background, never on the foreground write/serve
-  thread.**  The current prototype calls it inline from the write path; that must
-  become a background per-shard task with write backpressure (high-water mark on
-  layer count / memtable backlog) before multi-core sharding, à la ScyllaDB's
-  compaction/flush controllers.
+  thread.**  The POSIX daemon has a dedicated maintenance controller which
+  selects due timeline/shard work.  Compaction takes the target shard and layer
+  map locks, so foreground flushes naturally wait while maintenance catches up
+  instead of executing a merge inline.  A later controller can refine this
+  coarse lock-based backpressure into CPU/IO shares and explicit admission.
 - **Use a real strategy, not "merge all".**  Start with size-tiered (merge
   similarly-sized layers); adopt an incremental/fragmented scheme (ScyllaDB ICS)
   if temporary space amplification during a merge matters.
@@ -494,4 +495,3 @@ The first milestone is local-only full-page image layers:
 This milestone is intentionally architectural.  It creates the seams needed for
 image layers, object storage, compaction, GC, and later sharding without forcing
 all of those changes into one implementation step.
-

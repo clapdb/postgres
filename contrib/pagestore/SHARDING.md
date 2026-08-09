@@ -144,13 +144,12 @@ ScyllaDB is the reference for share-nothing shard-per-core LSM (Seastar:
 per-core I/O scheduler).  This design matches it.  But a few engine details must
 change *before or with* sharding, or per-shard threads will stall:
 
-1. **Compaction must move off the serve thread (hard prerequisite).** Today
-   `maybe_compact()` runs inline in `append_page()` on the write path.  Once each
-   shard is a single thread, an inline compaction blocks that shard's reads and
-   writes for the whole merge.  Compaction must become a **background per-shard
-   task** with **backpressure** (throttle/stall writes only when the layer count
-   or memtable backlog crosses a high-water mark), à la ScyllaDB's compaction /
-   flush controllers.  Until this lands, sharding would just multiply stalls.
+1. **Keep compaction off the serve threads.** The POSIX daemon now runs a
+   dedicated maintenance controller; `append_page()` only stages and flushes.
+   When compaction is due, its target-shard and layer-map locks provide coarse
+   backpressure while it catches up.  Evolve that controller toward explicit
+   CPU/IO shares and high-water admission as workloads require, à la ScyllaDB's
+   compaction/flush controllers.
 2. **Real compaction strategy, not "merge all".** The current policy rewrites all
    of a timeline's image layers into one whenever the count exceeds a threshold —
    unbounded read/space amplification control.  Adopt **size-tiered** (simplest:

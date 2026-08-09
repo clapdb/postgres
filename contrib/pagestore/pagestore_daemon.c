@@ -435,19 +435,32 @@ shard_worker(void *arg)
 				did_work = 1;
 		}
 
-		if (shard == 0)
+		if (!did_work)
 		{
-			/* maintenance takes the shard + map locks it needs internally */
-			int			do_maint = ps_core_maintenance();
+			struct timespec ts = {0, 20000};	/* 20us */
 
-			if (!did_work && !do_maint)
-			{
-				struct timespec ts = {0, 20000};	/* 20us */
-
-				nanosleep(&ts, NULL);
-			}
+			nanosleep(&ts, NULL);
 		}
-		else if (!did_work)
+	}
+
+	return NULL;
+}
+
+/*
+ * Keep potentially long tiering, GC, and compaction work off every shard's
+ * foreground serve thread.  ps_core_maintenance() takes the shard and map
+ * locks needed by each job; once compaction is due, that lock contention is
+ * the bounded backpressure seen by writers instead of making an arbitrary
+ * write request execute the merge itself.
+ */
+static void *
+maintenance_worker(void *arg)
+{
+	(void) arg;
+
+	while (!stop_requested)
+	{
+		if (!ps_core_maintenance())
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
 
@@ -583,7 +596,9 @@ main(int argc, char **argv)
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
 		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		pthread_t	maintenance;
 		uint32_t	started = 0;
+		int			maintenance_started = 0;
 
 		if (!workers || !threads)
 		{
@@ -608,9 +623,21 @@ main(int argc, char **argv)
 			}
 			started++;
 		}
+		if (started == hdr->nshards)
+		{
+			if (pthread_create(&maintenance, NULL, maintenance_worker, NULL) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: failed to start maintenance worker\n");
+				stop_requested = 1;
+			}
+			else
+				maintenance_started = 1;
+		}
 
 		for (uint32_t shard = 0; shard < started; shard++)
 			pthread_join(threads[shard], NULL);
+		if (maintenance_started)
+			pthread_join(maintenance, NULL);
 
 		free(workers);
 		free(threads);
