@@ -10118,7 +10118,6 @@ pagestore_install_prepared_branch_bootstrap(PG_FUNCTION_ARGS)
 				(errcode_for_file_access(),
 				 errmsg("could not remove stale branch manifest \"%s\": %m",
 						manifest_path)));
-
 	pagestore_install_branch_bootstrap_maps(prepared_dir, target_dir,
 											artifact, header);
 	pfree(artifact);
@@ -10661,7 +10660,6 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 				 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
 						   LSN_FORMAT_ARGS(fork_lsn),
 						   LSN_FORMAT_ARGS(materialized))));
-
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 											base, fork_lsn,
 											h.oldest_xid, h.next_xid,
@@ -10698,7 +10696,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	else
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not inspect branch bootstrap artifact \"%s\": %m",
+					 errmsg("could not inspect branch bootstrap artifact \"%s\": %m",
 						bootstrap_path)));
 	PG_RETURN_INT64(seeded);
 }
