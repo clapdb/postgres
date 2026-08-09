@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work merged through PR #160.
+Status below includes work through the composed MVP golden scenario.
 
 ## MVP scope
 
@@ -34,27 +34,30 @@ work and must not expand the MVP critical path.
 | WAL shipping and ancestry-aware WAL reads | Implemented | integration and branch tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
 | Continuous recovery materializer | Topology proven | `continuous_redo_demo.sh`, durable progress and bounded archive-lag tests |
+| Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU bootstrap | Implemented | prepared branch install and fail-closed startup validation |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 
-The existing CI proves the major paths separately:
+The existing CI proves both focused subsystem paths and the composed contract:
 
 - `integration_test.sh` exercises the PostgreSQL-facing storage, control, SLRU,
   reader, and branch primitives;
 - `wal_only_redo_demo.sh` proves non-redundant WAL ingest;
 - `continuous_redo_demo.sh` proves a live writer and materializer following new
   archived WAL, publishing durable progress, and applying lag backpressure;
+- `mvp_golden_test.sh` composes WAL-only ingest, durable materialization,
+  prepared branch boot, parent/child isolation, and store/materializer/compute
+  restarts in one topology;
 - `branch_boot_test.sh` proves an independent branch compute can boot, preserve
   fork-point visibility, and write on its own timeline.
 
-## Remaining MVP gates
+## MVP gates
 
-### 1. One composed golden scenario
+### 1. One composed golden scenario -- implemented
 
-CI still proves continuous materialization and branch boot as separate
-topologies.  The MVP acceptance scenario must compose them:
+`mvp_golden_test.sh` now composes the acceptance path:
 
 ```text
 WAL-only writer
@@ -65,10 +68,13 @@ WAL-only writer
   -> store/materializer/compute restart
 ```
 
-This is the first remaining gate: it tests the seams between mechanisms that
-already work independently and becomes the stable end-to-end MVP contract.
+The test requires the recovery worker's durable materialized watermark to cover
+an explicit workload checkpoint, uses that watermark as the child fork LSN,
+then materializes a newer parent page and proves the child cannot see it.  It
+also restarts the POSIX store daemon, writer, materializer, and branch compute.
+The scenario is wired into CI and is the stable end-to-end MVP contract.
 
-### 2. Managed materializer lifecycle
+### 2. Managed materializer lifecycle -- remaining
 
 The data-plane contract exists (`pagestore_materializer_status()`, durable
 materialized markers, timeline-bound lag backpressure), but production
@@ -76,7 +82,7 @@ provisioning and restartpoint/restart policy are still external manual work.
 The MVP control path must create the recovery worker, supervise it, replace it
 after failure, and drive progress without test-only restart nudges.
 
-### 3. Safe automatic branch bootstrap
+### 3. Safe automatic branch bootstrap -- remaining
 
 The prepared branch protocol is fail-closed, but the current demo still supplies
 the SLRU base cutoff and transaction/multixact horizons explicitly and copies a
@@ -85,7 +91,7 @@ cutoff, derive bootstrap horizons from the matching control state, and expose an
 idempotent control-plane operation rather than a sequence of expert-only SQL
 calls and filesystem steps.
 
-### 4. Retention-driven space reclamation
+### 4. Retention-driven space reclamation -- remaining
 
 Segment GC removes page-log segments covered by image layers, but long-running
 logical history is not yet bounded.  The MVP needs one retained-horizon model
@@ -100,7 +106,7 @@ materializer.  That horizon must drive:
 Until this gate lands, correctness demos run but disk use can grow without
 bound.
 
-### 5. Composed crash and format-compatibility coverage
+### 5. Composed crash and format-compatibility coverage -- remaining
 
 Focused crash-safety tests exist, while the declarative harness remains partial.
 Before declaring the MVP repeatable, add process-level fault scenarios around
@@ -109,13 +115,15 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 
 ## Recommended sequence
 
-1. Add the composed WAL-only -> materializer -> branch golden scenario.
-2. Put materializer provisioning/supervision and restart policy behind the
+Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
+acceptance contract.  The implementation sequence for the remaining gates is:
+
+1. Put materializer provisioning/supervision and restart policy behind the
    harness/control-plane contract.
-3. Automate proven-cutoff branch preparation and bootstrap inputs.
-4. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
+2. Automate proven-cutoff branch preparation and bootstrap inputs.
+3. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
    and deleted timelines.
-5. Promote the golden scenario into the declarative crash/compatibility harness.
+4. Promote the golden scenario into the declarative crash/compatibility harness.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit
