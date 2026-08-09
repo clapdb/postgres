@@ -53,7 +53,7 @@ wait_daemon_ready() {
 				continue
 			fi
 			[ "$magic" = "$((0x50414753))" ] &&
-				[ "$version" = 25 ] && [ "$page_size" = 8192 ] &&
+				[ "$version" = 26 ] && [ "$page_size" = 8192 ] &&
 				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&
 				[ "$nshards" = 1 ] && return 0
 		fi

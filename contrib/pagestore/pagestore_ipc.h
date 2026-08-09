@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		25	/* 25: WAL_INDEX_GET cursor pagination;
+#define PS_SHM_VERSION		26	/* 26: durable retention registry opcodes;
+								 * 25: WAL_INDEX_GET cursor pagination;
 								 * 24: WAL-index lag metrics added;
 								 * 23: WAL_INDEX_ADD_BATCH opcode added;
 								 * 22: TIMELINE_INFO opcode added;
@@ -105,6 +106,10 @@ typedef enum PsOpcode
 	PS_OP_WAL_INDEX_PROGRESS,	/* req_lsn=start, req_seq=end; 0/0 reads end */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
 	PS_OP_ADMISSION_BARRIER,	/* out req_seq: sequence after prior mutations */
+	PS_OP_RETENTION_PIN_SET,	/* durable set/update; fields described below */
+	PS_OP_RETENTION_PIN_DROP,	/* durable idempotent drop by owner key */
+	PS_OP_RETENTION_PIN_GET,	/* enumerate by blocknum; nblocks = total count */
+	PS_OP_RETENTION_FLOOR,		/* effective floor for parent_timeline resource */
 } PsOpcode;
 
 /* Status codes */
@@ -171,6 +176,36 @@ typedef struct PsWalIndexEntry
 	uint32_t	pad;
 	uint64_t	lsn;
 } PsWalIndexEntry;
+
+/* Retention owners are intentionally few: structural branch pins are derived
+ * from timeline metadata instead of duplicated in this mutable registry. */
+typedef enum PsRetentionOwnerKind
+{
+	PS_RETENTION_OWNER_READER = 1,
+	PS_RETENTION_OWNER_MATERIALIZER = 2,
+	PS_RETENTION_OWNER_CONFIGURED = 3,
+} PsRetentionOwnerKind;
+
+typedef enum PsRetentionResource
+{
+	PS_RETENTION_RESOURCE_PAGE_HISTORY = 1u << 0,
+	PS_RETENTION_RESOURCE_WAL = 1u << 1,
+	PS_RETENTION_RESOURCE_WAL_INDEX = 1u << 2,
+	PS_RETENTION_RESOURCE_ALL = (1u << 3) - 1,
+} PsRetentionResource;
+
+/* Stable owner key = (timeline, owner_kind, owner_id); SET replaces its value.
+ * The IPC encoding uses timeline/req_seq as that key, blocknum as owner_kind,
+ * parent_timeline as resources, and req_lsn as lsn. */
+typedef struct PsRetentionPin
+{
+	uint32_t	timeline;
+	uint32_t	owner_kind;
+	uint32_t	resources;
+	uint32_t	pad;
+	uint64_t	owner_id;
+	uint64_t	lsn;
+} PsRetentionPin;
 
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
  * stable enough for shard selection, and it is reused for client+daemon key->shard.

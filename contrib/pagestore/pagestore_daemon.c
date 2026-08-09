@@ -189,6 +189,8 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
 		case PS_OP_WAL_INDEX_ADD_BATCH:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
@@ -200,6 +202,8 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
+		case PS_OP_RETENTION_PIN_GET:
+		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
 			return 0;
 		default:
@@ -218,7 +222,8 @@ run_request_admitted(PsChannel *ch)
 	 * not against per-shard work on unrelated shards.
 	 */
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
-		op == PS_OP_REQUIRE_BRANCH)
+		op == PS_OP_REQUIRE_BRANCH || op == PS_OP_RETENTION_PIN_SET ||
+		op == PS_OP_RETENTION_PIN_DROP)
 	{
 		ps_lock_map_wr();
 		handle_request(ch);
@@ -270,7 +275,8 @@ run_request_admitted(PsChannel *ch)
 		if (op == PS_OP_WAL_APPEND || op == PS_OP_WAL_SIZE || op == PS_OP_WAL_READ ||
 			op == PS_OP_WAL_INDEX_PROGRESS)
 			shard = 0;
-		else if (op == PS_OP_WAL_RETAIN_FLOOR)
+		else if (op == PS_OP_WAL_RETAIN_FLOOR ||
+				 op == PS_OP_RETENTION_FLOOR)
 		{
 			/*
 			 * The floor query always scans the fixed control object; derive
@@ -303,7 +309,7 @@ run_request_admitted(PsChannel *ch)
 			 * remote-layer I/O.  Other timeline readers complete under map_rd. */
 			ps_lock_shard_rd(shard);
 			if (op == PS_OP_READV || op == PS_OP_READ_AT ||
-				op == PS_OP_WAL_RETAIN_FLOOR)
+				op == PS_OP_WAL_RETAIN_FLOOR || op == PS_OP_RETENTION_FLOOR)
 				handle_request(ch);
 			else
 			{

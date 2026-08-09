@@ -47,6 +47,7 @@
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
 #include "pagestore_pgcache.h"
+#include "pagestore_retention.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -3976,6 +3977,129 @@ done:
 	return rc;
 }
 
+static void
+retention_floor_add(uint64_t candidate, uint64_t *floor)
+{
+	/* LSN zero is a real branch cap but the public zero result means "no
+	 * constraint".  Floor 1 is the established retain-everything sentinel. */
+	if (candidate == 0)
+		candidate = 1;
+	if (*floor == 0 || candidate < *floor)
+		*floor = candidate;
+}
+
+/* Project one descendant LSN onto target's physical history.  Caller holds
+ * map-rd.  Return 1 if target is an ancestor (including self), else 0. */
+static int
+retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
+{
+	uint32_t	current = descendant;
+	uint32_t	hops = 0;
+
+	while (current != target)
+	{
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current) || ++hops > MAX_TIMELINES)
+			return 0;
+		if (timelines[current].branch_lsn < *lsn)
+			*lsn = timelines[current].branch_lsn;
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 1;
+}
+
+/*
+ * One conservative floor for one resource on one timeline.  Explicit pins on
+ * descendants are projected through every branch cap; a live direct child is
+ * itself a structural pin.  WAL additionally includes every restorable control
+ * image on the target and descendants.  Thus page pruning, WAL GC and WAL-index
+ * GC can share this authority instead of each inventing a partial horizon.
+ */
+static int
+retention_effective_floor(uint32_t timeline, uint32_t resource,
+						  uint64_t *floor_out)
+{
+	typedef struct RetentionControlProjection
+	{
+		uint32_t	timeline;
+		uint64_t	cap;
+	} RetentionControlProjection;
+	RetentionControlProjection controls[MAX_TIMELINES];
+	uint32_t	ncontrols = 0;
+	uint32_t	npins = 0;
+	uint64_t	floor = 0;
+
+	if (resource != PS_RETENTION_RESOURCE_PAGE_HISTORY &&
+		resource != PS_RETENTION_RESOURCE_WAL &&
+		resource != PS_RETENTION_RESOURCE_WAL_INDEX)
+		return -1;
+
+	ps_lock_map_rd();
+	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
+		ps_retention_count(&npins) != 0)
+	{
+		ps_unlock_map();
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		PsRetentionPin pin;
+		uint64_t	projected;
+		int			found;
+
+		found = ps_retention_get(i, &pin, NULL);
+		if (found != 1 || pin.timeline >= MAX_TIMELINES ||
+			!timelines[pin.timeline].defined)
+		{
+			ps_unlock_map();
+			return -1;
+		}
+		if ((pin.resources & resource) == 0)
+			continue;
+		projected = pin.lsn;
+		if (retention_project_lsn(pin.timeline, timeline, &projected))
+			retention_floor_add(projected, &floor);
+	}
+
+	/* Every descendant can be started or read again later even with no active
+	 * owner pin.  Project all of their branch caps, not just direct children: a
+	 * nested branch may fork below its parent's own fork point.  The same walk
+	 * snapshots the descendants whose visible control images constrain WAL. */
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t	cap = UINT64_MAX;
+
+		if (!timelines[candidate].defined ||
+			!retention_project_lsn(candidate, timeline, &cap))
+			continue;
+		if (candidate != timeline)
+			retention_floor_add(cap, &floor);
+		if (resource == PS_RETENTION_RESOURCE_WAL)
+		{
+			controls[ncontrols].timeline = candidate;
+			controls[ncontrols].cap = cap;
+			ncontrols++;
+		}
+	}
+	ps_unlock_map();
+
+	for (uint32_t i = 0; i < ncontrols; i++)
+	{
+		uint64_t	control_floor = 0;
+
+		if (wal_retain_floor(controls[i].timeline, &control_floor) != 0)
+			return -1;
+		if (control_floor != 0)
+		{
+			if (controls[i].cap < control_floor)
+				control_floor = controls[i].cap;
+			retention_floor_add(control_floor, &floor);
+		}
+	}
+	*floor_out = floor;
+	return 0;
+}
+
 /* ===================== recovery (layers + segment tail) =============== */
 
 typedef struct LayerRecoverRec
@@ -4592,6 +4716,64 @@ ps_handle_meta(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_RETENTION_PIN_SET:
+			{
+				PsRetentionPin pin;
+
+				memset(&pin, 0, sizeof(pin));
+				pin.timeline = tl;
+				pin.owner_kind = ch->blocknum;
+				pin.resources = ch->parent_timeline;
+				pin.owner_id = ch->req_seq;
+				pin.lsn = ch->req_lsn;
+				if (tl >= MAX_TIMELINES || !timelines[tl].defined ||
+					ps_retention_set(&pin) != 0)
+					ch->status = PS_STATUS_ERROR;
+			}
+			break;
+
+		case PS_OP_RETENTION_PIN_DROP:
+			if (tl >= MAX_TIMELINES || !timelines[tl].defined ||
+				ps_retention_drop(tl, ch->blocknum, ch->req_seq) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+
+		case PS_OP_RETENTION_PIN_GET:
+			{
+				PsRetentionPin pin;
+				uint32_t	count = 0;
+				int			found = ps_retention_get(ch->blocknum, &pin, &count);
+
+				if (found < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+				{
+					ch->nblocks = count;
+					if (found)
+					{
+						ch->result = 1;
+						ch->timeline = pin.timeline;
+						ch->blocknum = pin.owner_kind;
+						ch->parent_timeline = pin.resources;
+						ch->req_seq = pin.owner_id;
+						ch->req_lsn = pin.lsn;
+					}
+				}
+			}
+			break;
+
+		case PS_OP_RETENTION_FLOOR:
+			{
+				uint64_t	floor = 0;
+
+				if (retention_effective_floor(tl, ch->parent_timeline,
+										  &floor) != 0)
+					ch->status = PS_STATUS_ERROR;
+				ch->req_lsn = floor;
+				ch->result = (floor != 0);
+			}
+			break;
+
 		case PS_OP_IMMEDSYNC:
 			/*
 			 * Surface the failure: callers (the pg_control mirror) pop their
@@ -4720,6 +4902,7 @@ ps_core_close(void)
 		}
 	}
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+	ps_retention_close();
 	ps_manifest_close();
 }
 
@@ -5222,6 +5405,11 @@ ps_core_maintenance(void)
 	int			found = 0;
 	int			did = 0;
 
+	/* Pin churn is independent of the layer read path (SPDK uses the same host
+	 * metadata), so bound this log before considering LSM-only work. */
+	if (ps_retention_should_compact())
+		return ps_retention_compact() == 0;
+
 	if (!use_layers)
 		return 0;
 
@@ -5435,6 +5623,27 @@ ps_core_open(const char *store_dir)
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
 	load_timelines();
+	if (ps_retention_open(store_dir) != 0)
+		return -1;
+	{
+		uint32_t	npins = 0;
+
+		if (ps_retention_count(&npins) != 0)
+			return -1;
+		for (uint32_t i = 0; i < npins; i++)
+		{
+			PsRetentionPin pin;
+
+			if (ps_retention_get(i, &pin, NULL) != 1 ||
+				pin.timeline >= MAX_TIMELINES ||
+				!timelines[pin.timeline].defined)
+			{
+				fprintf(stderr, "pagestore: retention pin references an undefined timeline\n");
+				errno = EILSEQ;
+				return -1;
+			}
+		}
+	}
 
 	/*
 	 * Definitive fork-size events (create/truncate/unlink/zero-extend) load

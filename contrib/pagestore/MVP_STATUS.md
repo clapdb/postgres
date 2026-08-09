@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work through serialized portable branch preparation.
+Status below includes work through the durable retention-horizon registry.
 
 ## MVP scope
 
@@ -37,6 +37,7 @@ work and must not expand the MVP critical path.
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
+| Retention horizon authority | Durable registry and unified floor implemented; reclaim consumers remaining | restart/corruption tests for explicit owners, branch projection, control-WAL floors, and bounded log replay |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 
@@ -163,19 +164,33 @@ watermark still cannot substitute for the proven capture API: its newest-image
 contract deliberately permits bytes newer than its completeness floor and is
 therefore unsafe as an exact branch seed.
 
-### 4. Retention-driven space reclamation -- remaining
+### 4. Retention-driven space reclamation -- registry implemented, consumers remaining
 
 Segment GC removes page-log segments covered by image layers, but long-running
-logical history is not yet bounded.  The MVP needs one retained-horizon model
-covering active readers, branch fork points, restorable control images, and the
-materializer.  That horizon must drive:
+logical history is not yet bounded.  `retention.meta` is now the durable,
+CRC-protected owner registry for reader, materializer, and configured pins.
+Each pin carries a resource mask for page history, shipped WAL, and the WAL
+index; updates replace a stable `(timeline, owner kind, owner id)` generation,
+drops are idempotent, enumeration is available over IPC, and churn is compacted
+off the request path.  Recovery truncates only an incomplete final record and
+fails closed on any complete corrupt record or a pin whose timeline is absent.
+
+The effective-floor query projects explicit descendant pins through every
+branch cap, derives permanent fork-point pins from timeline metadata rather
+than duplicating them, and folds every branch-visible restorable control image
+into the WAL resource.  Page pruning, WAL reclaim, and WAL-index reclaim can
+therefore consume one authority.  Still required for the gate:
 
 - version pruning during image-layer compaction;
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
 - timeline deletion and its layer/WAL cleanup.
 
-Until this gate lands, correctness demos run but disk use can grow without
+The reader/materializer controllers must also register and release their owner
+generations before those reclaimers are enabled.  The legacy fixed-record
+`timelines` log also needs CRC-protected, fail-closed recovery before GC trusts
+structural branch pins to delete history.  Until those consumers, registrations,
+and metadata hardening land, correctness demos run but disk use can grow without
 bound.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
@@ -190,8 +205,9 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
-   and deleted timelines.
+1. Harden timeline-metadata recovery and wire reader/materializer owner
+   generations into the retained-horizon registry, then reclaim image history,
+   WAL, WAL index, and deleted timelines.
 2. Promote the golden scenario into the declarative crash/compatibility harness.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,

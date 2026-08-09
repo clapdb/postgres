@@ -668,6 +668,74 @@ op_wal_retain_floor(uint32_t timeline)
 	return ch->req_lsn;
 }
 
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t resources, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	return cl_exec()->status;
+}
+
+static int
+op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_DROP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	return cl_exec()->status;
+}
+
+static int
+op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_GET;
+	ch->blocknum = index;
+	cl_exec();
+	if (count)
+		*count = ch->nblocks;
+	if (ch->status != PS_STATUS_OK || ch->result == 0)
+		return 0;
+	if (pin)
+	{
+		memset(pin, 0, sizeof(*pin));
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+	}
+	return 1;
+}
+
+static int
+op_retention_floor(uint32_t timeline, uint32_t resource, uint64_t *floor)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_FLOOR;
+	ch->timeline = timeline;
+	ch->parent_timeline = resource;
+	ch->req_lsn = 0;
+	cl_exec();
+	if (floor)
+		*floor = ch->req_lsn;
+	return ch->status;
+}
+
 /* --- timeline-aware operations (for branch tests) --- */
 
 /* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
@@ -2604,6 +2672,194 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	free(rb);
 }
 
+/* Durable, enumerable retention pins and the effective per-resource floor. */
+static void
+run_retention_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	char		path[512];
+	pid_t		dpid;
+	uint32_t	ps = 8192;
+	uint64_t	floor = UINT64_MAX;
+	uint32_t	count = 0;
+	PsRetentionPin pin;
+	unsigned char *note = calloc(1, ps);
+	unsigned char *image = calloc(1, ps);
+	uint64_t	redo = 800;
+	struct stat before,
+				after;
+	int			fd;
+	unsigned char byte;
+
+	fprintf(stderr, "== retention registry ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_retention", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_retention", tmpbase);
+	snprintf(path, sizeof(path), "%s/retention.meta", store);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 0,
+		  "page retention starts unconstrained");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL, &floor) ==
+		  PS_STATUS_OK && floor == 0,
+		  "WAL retention starts unconstrained");
+	check(op_retention_set(99, PS_RETENTION_OWNER_READER, 1,
+						   PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_ERROR,
+		  "a pin cannot reference an undefined timeline");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 1, 0, 1000) ==
+		  PS_STATUS_ERROR,
+		  "a pin must name at least one known resource");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 0) == PS_STATUS_ERROR,
+		  "owner id zero cannot drop a pin");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_ALL, &floor) ==
+		  PS_STATUS_ERROR,
+		  "a floor query names exactly one resource");
+
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
+		  "reader pin is durably registered");
+	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+						   PS_RETENTION_RESOURCE_WAL |
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) == PS_STATUS_OK,
+		  "materializer pin can retain WAL without page history");
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
+		  "configured page-history pin is registered");
+	check(op_retention_get(0, &pin, &count) && count == 3 &&
+		  pin.timeline == 0 && pin.owner_kind == PS_RETENTION_OWNER_READER &&
+		  pin.owner_id == 101 && pin.lsn == 5000,
+		  "registry enumeration returns the first pin and total count");
+	check(op_retention_get(2, &pin, &count) && count == 3 &&
+		  pin.owner_kind == PS_RETENTION_OWNER_CONFIGURED && pin.owner_id == 303,
+		  "registry enumeration returns every owner kind");
+	check(!op_retention_get(3, &pin, &count) && count == 3,
+		  "registry enumeration ends at the reported count");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 4000,
+		  "page floor is the minimum matching explicit pin");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL, &floor) ==
+		  PS_STATUS_OK && floor == 3000,
+		  "WAL floor ignores page-only pins");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL_INDEX, &floor) ==
+		  PS_STATUS_OK && floor == 3000,
+		  "WAL-index floor shares the resource registry");
+
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK,
+		  "SET atomically replaces the same owner generation");
+	check(stat(path, &before) == 0, "retention log exists after its first pin");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK &&
+		  stat(path, &after) == 0 && before.st_size == after.st_size,
+		  "an exact SET retry is idempotent without log churn");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 2000,
+		  "an owner update immediately lowers the effective floor");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 101) == PS_STATUS_OK &&
+		  op_retention_drop(0, PS_RETENTION_OWNER_READER, 101) == PS_STATUS_OK,
+		  "DROP is durable and idempotent");
+
+	op_create_branch(1, 0, 1500);
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 1500,
+		  "a child fork point structurally pins parent page history");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL_INDEX, &floor) ==
+		  PS_STATUS_OK && floor == 1500,
+		  "a child fork point structurally pins the parent WAL index");
+	check(op_retention_set(1, PS_RETENTION_OWNER_READER, 404,
+						   PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_OK,
+		  "a descendant reader pin is registered on its own timeline");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 1000,
+		  "a descendant pin projects through branch ancestry to the parent");
+	check(op_retention_floor(1, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 1000,
+		  "a descendant pin directly constrains its own timeline");
+	op_create_branch(2, 1, 900);
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 900,
+		  "a nested branch's lower fork cap structurally projects to the root");
+	check(op_retention_floor(1, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 900,
+		  "a nested branch structurally pins its direct parent without an owner pin");
+
+	/* A restorable root control image is another WAL-only authority, and its
+	 * version is below the fork so it constrains both timelines. */
+	memcpy(note, &redo, sizeof(redo));
+	memset(image, 0x5c, 64);
+	op_write_control(1, note, 1400);
+	op_write_control(0, image, 1400);
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL, &floor) ==
+		  PS_STATUS_OK && floor == redo,
+		  "restorable control images participate in the unified WAL floor");
+	check(op_retention_floor(1, PS_RETENTION_RESOURCE_WAL, &floor) ==
+		  PS_STATUS_OK && floor == redo,
+		  "control WAL requirements follow branch visibility");
+
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_get(2, &pin, &count) && count == 3 &&
+		  pin.timeline == 1 && pin.owner_id == 404,
+		  "retention pins survive daemon restart and remain enumerable");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 900,
+		  "projected effective floor survives restart");
+	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404) == PS_STATUS_OK,
+		  "a restarted controller can release its durable pin");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 900,
+		  "dropping the reader leaves the nested structural fork floor");
+	client_detach();
+	stop_daemon(dpid);
+
+	/* Only an incomplete final record is recoverable: it cannot be committed,
+	 * and truncating a partial DROP conservatively keeps the old pin. */
+	fd = open(path, O_WRONLY | O_APPEND);
+	check(fd >= 0 && write(fd, "partial", 7) == 7 && fsync(fd) == 0,
+		  "synthesized a short retention-log tail");
+	if (fd >= 0)
+		close(fd);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_get(1, &pin, &count) && count == 2,
+		  "restart truncates a short tail without losing committed pins");
+	client_detach();
+	stop_daemon(dpid);
+
+	/* A complete corrupt record could have been the last live SET.  Refuse the
+	 * store rather than guessing that it was an ignorable torn tail. */
+	fd = open(path, O_RDWR);
+	check(fd >= 0 && pread(fd, &byte, 1, 0) == 1,
+		  "opened a complete retention record for corruption testing");
+	if (fd >= 0)
+	{
+		byte ^= 0x80;
+		check(pwrite(fd, &byte, 1, 0) == 1 && fsync(fd) == 0,
+			  "corrupted one byte in a complete retention record");
+		close(fd);
+	}
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+	expect_daemon_open_failure(dpid, shm,
+						   "complete retention-record corruption fails closed");
+
+	rm_rf(store);
+	shm_unlink(shm);
+	free(note);
+	free(image);
+}
+
 /*
  * Branch / snapshot isolation: a branch is an instant, copy-on-write clone.
  * It shares the parent's pages by read-through until it writes; its writes do
@@ -3498,6 +3754,9 @@ main(int argc, char **argv)
 	/* run the whole suite once per page size: proves page-size independence */
 	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
 		run_suite(daemon_path, tmpbase, sizes[i]);
+
+	/* durable pins and structural/effective retention floors */
+	run_retention_suite(daemon_path, tmpbase);
 
 	/* branch / snapshot isolation (page-size independent, run once) */
 	run_branch_suite(daemon_path, tmpbase);
