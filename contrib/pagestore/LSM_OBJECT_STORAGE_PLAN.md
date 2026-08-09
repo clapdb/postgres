@@ -410,7 +410,12 @@ Acceptance criteria:
 - restart can resume or retry incomplete uploads;
 - normal reads still work from local copies.
 
-### Phase 5: local eviction and remote download — done with filesystem provider
+### Phase 5: local eviction and remote download — partial
+
+Whole-layer download, verification, and cache refresh are implemented for the
+filesystem provider.  Idle eviction does not yet enforce a cache budget or
+residency/recency policy, so a refreshed remote-only layer can be selected for
+eviction again on the next maintenance pass.
 
 - Add local cold-cache eviction policy.
 - On read, download a remote-durable layer when local copy is missing.
@@ -422,7 +427,11 @@ Acceptance criteria:
 - downloaded layers are verified before use;
 - repeated reads use the local cache/copy.
 
-### Phase 6: remote-aware GC — done with filesystem provider
+### Phase 6: remote-aware GC — partial
+
+Durable deleting state, retryable remote deletion, and crash recovery are
+implemented for the filesystem provider.  An inspection/reconciliation tool to
+detect and repair orphaned remote objects is still missing.
 
 - Extend GC to delete remote objects.
 - Persist `deleting` state and retry failed deletes.

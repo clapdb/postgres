@@ -29,7 +29,7 @@ work and must not expand the MVP critical path.
 |---|---|---|
 | Page ingest and copy-on-write reads | Implemented | standalone and PostgreSQL integration suites |
 | Image layers, manifest replay, compaction, segment GC | Implemented for POSIX | layer/manifest/GC tests and restart coverage |
-| Filesystem object tier | Implemented | upload, verification, eviction, refresh, and remote-GC tests |
+| Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | WAL shipping and ancestry-aware WAL reads | Implemented | integration and branch tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
 | Continuous recovery materializer | Topology proven | `continuous_redo_demo.sh`, durable progress and bounded archive-lag tests |

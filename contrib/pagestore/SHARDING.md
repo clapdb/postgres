@@ -126,10 +126,10 @@ timeline tree under a brief coordination point, not on the read/write hot path.
 ## Migration plan (each step keeps the standalone suite green)
 
 1. **[done] This design.**
-2. **[done] Refactor global state into a `Shard` struct, `nshards = 1`, still one
-   thread.** Pure mechanical refactor (page_idx/fork_idx/memtable/pgcache/
-   layer_map/cursor/next_layer_id become `shard->...`); behavior identical,
-   116/116 unchanged.  De-risks everything below.
+2. **[partial] Refactor global state into a `Shard` struct.** Page/fork/WAL-index
+   state, memtables, append cursors, and layer-id cursors are shard-owned.  The
+   materialized-page cache and layer map remain process-global and lock-protected;
+   moving them into shard ownership is still required for share-nothing.
 3. **[done] Partition channels + client-side routing**, still `nshards = 1` (routing is
    identity) — proves the routing path without parallelism.
 4. **[partial] `nshards > 1` + one worker thread per shard** (POSIX first).

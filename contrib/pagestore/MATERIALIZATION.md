@@ -127,8 +127,10 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 
 - `PsStorage` (posix / spdk) — **done** (byte-log backend).
 - `PsLayerStore` local (posix) — **done**.  The filesystem-backed object provider
-  and the phase 4–6 upload/verification/eviction/download/remote-GC state
-  machine are **done for local testing**.  A real S3 provider is planned.
+  and durable upload/verification are done for local testing.  Download,
+  eviction, and remote deletion mechanisms exist, while cache residency policy
+  and remote-orphan reconciliation keep phases 5–6 partial.  A real S3 provider
+  is planned.
 - `ship` page-ingest → memtable → image layer (+manifest, compaction, GC,
   restart-from-layers) — **done** (LSM phases 2–3).
 - `ship` wal-ingest: WAL shipping (`archive_library`) + per-page WAL index +
