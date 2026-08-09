@@ -150,6 +150,20 @@ wait_replay_lsn()
 	return 1
 }
 
+wait_recovery_paused()
+{
+	local state=
+
+	for _ in $(seq 1 400); do
+		state=$("${MP[@]}" -c "SELECT pg_get_wal_replay_pause_state();" \
+			2>/dev/null || true)
+		[ "$state" = "paused" ] && return 0
+		sleep 0.1
+	done
+	echo "materializer recovery pause state is '${state:-unknown}'" >&2
+	return 1
+}
+
 wait_materialized_lsn()
 {
 	local target=$1 reached=
@@ -215,8 +229,6 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	"materializer is a distinct recovery compute"
 
 "${WP[@]}" -c "CREATE EXTENSION pagestore;
-	CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
-	 AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;
 	CREATE FUNCTION pagestore_install_prepared_branch(text, text, int, int,
 	 pg_lsn) RETURNS void
 	 AS 'pagestore','pagestore_install_prepared_branch' LANGUAGE C STRICT;
@@ -224,7 +236,8 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	 AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 	CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
 	fail "could not create the golden test relation"
-"${WP[@]}" -c "CHECKPOINT;" >/dev/null ||
+ddl_checkpoint_lsn=$("${WP[@]}" -c "CHECKPOINT;
+	SELECT pg_current_wal_lsn();" | tail -1) ||
 	fail "could not checkpoint the committed test DDL"
 relfile=$("${WP[@]}" -c "SELECT pg_relation_filepath('mvp_golden');")
 [ -f "$WRITER/$relfile" ] || fail "WAL-only writer did not keep its heap local"
@@ -236,13 +249,26 @@ attblock=$("${WP[@]}" -c "SELECT split_part(trim(both '()' from ctid::text), ','
 	FROM pg_attribute WHERE attrelid='mvp_golden'::regclass AND attname='note';") ||
 	fail "could not locate the relation's pg_attribute page"
 
-# C is the SLRU base.  The fork-visible transaction commits in (C,L].
-base_lsn=$("${WP[@]}" -c "SELECT pg_current_wal_lsn();") ||
-	fail "could not choose the SLRU base cutoff"
-"${WP[@]}" -c "SELECT pagestore_ship_slru_snapshot('pg_xact', '$base_lsn');
-	SELECT pagestore_ship_slru_snapshot('pg_multixact/offsets', '$base_lsn');
-	SELECT pagestore_ship_slru_snapshot('pg_multixact/members', '$base_lsn');" \
-	>/dev/null || fail "could not ship branch SLRU snapshots"
+# C is now produced by the recovery compute itself.  Pausing makes its local
+# SLRUs stable; capture requests a restartpoint, requires its durable marker to
+# equal the paused replay LSN, stages all four SLRUs, and only then publishes
+# the exact-as-of snapshot.  The fork-visible transaction commits in (C,L].
+archive_current_wal || fail "DDL checkpoint WAL did not reach pagestore"
+wait_replay_lsn "$ddl_checkpoint_lsn" ||
+	fail "materializer did not reach the DDL checkpoint"
+if "${MP[@]}" -c "SELECT pagestore_capture_slru_snapshot();" \
+	>/dev/null 2>&1; then
+	fail "SLRU capture accepted an unpaused recovery worker"
+fi
+echo "ok   - SLRU capture fails closed before recovery is paused"
+"${MP[@]}" -c "SELECT pg_wal_replay_pause();" >/dev/null ||
+	fail "could not request materializer recovery pause"
+wait_recovery_paused || fail "materializer recovery did not pause"
+base_lsn=$("${MP[@]}" -c "SELECT pagestore_capture_slru_snapshot();") ||
+	fail "could not capture a proven branch SLRU snapshot"
+"${MP[@]}" -c "SELECT pg_wal_replay_resume();" >/dev/null ||
+	fail "could not resume materializer recovery"
+echo "ok   - recovery restartpoint produced proven SLRU cutoff $base_lsn"
 
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
