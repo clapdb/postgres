@@ -459,7 +459,13 @@ Acceptance criteria:
 - page reads at an LSN match full-page materialization semantics;
 - unsupported WAL records do not corrupt reads.
 
-### Phase 8: materialized-page cache — initial implementation done
+### Phase 8: materialized-page cache — partial
+
+A bounded, version-keyed materialized-page cache with invalidation and
+scan-resistant admission tests is implemented.  It does not yet use delta-chain
+length/reproduction cost as an admission signal, there is no separate
+layer-block cache, and the integrated delta-read path is not complete enough to
+prove that cache hits avoid redo.
 
 - Add cache keyed by `(timeline, key, block, read_lsn)`.
 - Use delta-chain length as an admission/value signal.
