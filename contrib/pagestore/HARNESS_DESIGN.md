@@ -7,9 +7,10 @@ The focused C unit tests check layer, manifest, cache, and GC invariants.
 `integration_test.sh` proves several PostgreSQL-facing paths end to end.
 `harness/pagestore_harness.py` now provides the first reusable runner: it
 validates the basic JSONL schema and some boundary references, owns private
-test environments, captures diagnostic run roots, runs daemon-smoke and
-writer-smoke modes, and can wrap the legacy integration script in a failure
-bundle.  It is not yet the full semantic harness described below: full
+test environments, captures diagnostic run roots, runs daemon-smoke,
+writer-smoke, and managed materializer-smoke modes, and can wrap the legacy
+integration script in a failure bundle.  It is not yet the full semantic
+harness described below: full
 mode-specific plan validation, per-action timeouts, replay commands, generated
 workloads, controlled faults, branch plans, redo/materialization comparisons,
 shrinking, and compatibility fixtures remain future work.
@@ -46,15 +47,24 @@ to observe state newer than its horizon.
 
 The host-side executable is `contrib/pagestore/harness/pagestore_harness.py`,
 with only the Python standard library.  It receives capability metadata plus a
-scenario plan for `--validate`, `--daemon-smoke`, and `--writer-smoke`;
+scenario plan for `--validate`, `--daemon-smoke`, `--writer-smoke`, and
+`--materializer-smoke`;
 `--list` instead receives a scenario directory and inventories the plans below
 it.  Runtime modes then add the inputs they actually need: `--daemon-smoke`
-takes daemon and inspector binaries, `--writer-smoke` also takes the Meson
-build directory, and `--legacy-integration` takes the Meson build directory
-plus the legacy script path.  It owns temporary directories,
+takes daemon and inspector binaries, `--writer-smoke` and
+`--materializer-smoke` also take the Meson build directory, and
+`--legacy-integration` takes the Meson build directory plus the legacy script
+path.  It owns temporary directories,
 daemon/PostgreSQL lifecycle, and capture of diagnostic artifacts.  Full
 per-action timeout enforcement, complete replay metadata, and deterministic
 scheduling are still future generated-scenario work.
+
+The materializer runtime owns the first concrete managed-worker contract.  It
+provisions a WAL-only writer and route-all recovery worker, turns each declared
+writer checkpoint into an archived and durably materialized boundary, records
+worker generations, and replaces a worker killed with the `compute` crash
+model.  Production ownership/fencing and a continuously running service
+controller remain outside this test coordinator.
 
 Use JSON Lines for plans rather than YAML.  It is dependency-free, easy to
 generate or shrink, and each action is independently visible in failure logs.

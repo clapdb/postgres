@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work through the composed MVP golden scenario.
+Status below includes work through the managed materializer harness runtime.
 
 ## MVP scope
 
@@ -33,7 +33,7 @@ work and must not expand the MVP critical path.
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Implemented | integration and branch tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
-| Continuous recovery materializer | Topology proven | `continuous_redo_demo.sh`, durable progress and bounded archive-lag tests |
+| Continuous recovery materializer | Topology and harness-managed lifecycle proven | `continuous_redo_demo.sh`; `materializer_smoke` provisioning, durable progress, and crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU bootstrap | Implemented | prepared branch install and fail-closed startup validation |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
@@ -47,6 +47,9 @@ The existing CI proves both focused subsystem paths and the composed contract:
 - `wal_only_redo_demo.sh` proves non-redundant WAL ingest;
 - `continuous_redo_demo.sh` proves a live writer and materializer following new
   archived WAL, publishing durable progress, and applying lag backpressure;
+- `materializer_lifecycle.jsonl` proves the harness can provision the WAL-only
+  topology, turn writer checkpoints into durable materialized boundaries,
+  replace a crashed worker, and continue following WAL;
 - `mvp_golden_test.sh` composes WAL-only ingest, durable materialization,
   prepared branch boot, parent/child isolation, and store/materializer/compute
   restarts in one topology;
@@ -74,13 +77,19 @@ then materializes a newer parent page and proves the child cannot see it.  It
 also restarts the POSIX store daemon, writer, materializer, and branch compute.
 The scenario is wired into CI and is the stable end-to-end MVP contract.
 
-### 2. Managed materializer lifecycle -- remaining
+### 2. Managed materializer lifecycle -- partial
 
-The data-plane contract exists (`pagestore_materializer_status()`, durable
-materialized markers, timeline-bound lag backpressure), but production
-provisioning and restartpoint/restart policy are still external manual work.
-The MVP control path must create the recovery worker, supervise it, replace it
-after failure, and drive progress without test-only restart nudges.
+The `materializer_smoke` runtime now owns the executable lifecycle contract: it
+creates a WAL-only writer and recovery worker, checks the declared recovery
+role, archives each writer checkpoint, drives a restartpoint until the durable
+marker covers that boundary, records worker generations, and replaces a worker
+after an immediate compute crash.  The replacement then materializes later WAL
+and the writer observes zero lag.
+
+The remaining MVP work is to move this proven policy into a continuously
+running control-plane supervisor with single-owner fencing and bounded retry /
+failure reporting.  The harness remains the acceptance client for that service;
+it is not itself the production controller.
 
 ### 3. Safe automatic branch bootstrap -- remaining
 
@@ -118,8 +127,8 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Put materializer provisioning/supervision and restart policy behind the
-   harness/control-plane contract.
+1. Promote the harness-proven materializer policy into a continuously running,
+   ownership-fenced control-plane supervisor.
 2. Automate proven-cutoff branch preparation and bootstrap inputs.
 3. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
    and deleted timelines.

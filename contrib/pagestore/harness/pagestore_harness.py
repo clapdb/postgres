@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validate and inventory deterministic pagestore harness plans.
+"""Validate and execute deterministic pagestore harness plans.
 
-This is deliberately stdlib-only.  It is phase zero of the harness: plans and
-capabilities are made strict before lifecycle/fault execution is introduced.
+The runner is deliberately stdlib-only.  Plans and runtime capabilities stay
+strict as daemon, writer, reader, and materializer lifecycle coverage grows.
 """
 
 from __future__ import annotations
@@ -232,6 +232,7 @@ RUNTIME_OPERATIONS = {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
     },
+    "materializer_smoke": {"sql", "checkpoint", "crash", "assert"},
 }
 
 RUNTIME_CONSTRAINTS = {
@@ -249,6 +250,20 @@ RUNTIME_CONSTRAINTS = {
         "install_reader": {"forbidden_values": {"target": ["writer"]}},
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]},
+    },
+    "materializer_smoke": {
+        "sql": {
+            "target": ["writer"],
+            "forbidden_fields": ["expect_error", "expect_sqlstate"],
+        },
+        "checkpoint": {"target": ["writer"]},
+        "crash": {
+            "target": ["materializer"], "model": ["compute"],
+            "forbidden_fields": ["fault"],
+        },
+        "assert": {
+            "target": ["writer", "materializer"], "oracle": ["sql_scalar"],
+        },
     },
 }
 
@@ -467,6 +482,13 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 writer_mutated_since_checkpoint = True
             elif action["op"] in ("sql", "assert") and action["target"] == "writer":
                 writer_mutated_since_checkpoint = True
+    elif runtime == "materializer_smoke":
+        required = {"writer", "materializer"}
+        computes = set(plan.header["case"]["compute"])
+        if computes != required:
+            raise PlanError(
+                f"runtime {runtime!r} requires exactly writer and materializer computes"
+            )
 
 
 def validate_runtime_health(
@@ -1190,7 +1212,386 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
         if (data / "postmaster.pid").exists():
             subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(data), "-m", "immediate", "-w", "stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         if dproc is not None and dproc.poll() is None:
-            dproc.terminate(); dproc.wait(timeout=5)
+            dproc.terminate()
+            dproc.wait(timeout=5)
+        remove_shm(shm)
+    if temporary and not keep:
+        shutil.rmtree(root)
+    return root
+
+
+def run_materializer_smoke(
+    plan: Plan, capabilities: dict[str, Any], schema: dict[str, Any],
+    daemon: Path, inspector: Path, build: Path, requested_root: Path | None,
+    keep: bool,
+) -> Path:
+    """Provision and supervise a WAL-only writer/materializer pair."""
+    pg_bin = find_pg_bin(build)
+    postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
+    profile = runtime_capabilities(capabilities, "materializer_smoke")
+    recovery_settings = (
+        "recovery_prefetch = try\n" if postgres_major >= 15 else ""
+    )
+    validate_postgres_block_size(build, profile["page_size"])
+    validate_postgres_relation_segment_size(build, profile["page_size"])
+    walrestore = pagestore_build_program(build, "pagestore_walrestore")
+    importer = pagestore_build_program(build, "pagestore_import")
+    root, temporary = run_root(requested_root)
+    trace = root / "trace"
+    store = root / "store"
+    writer_data = root / "computes" / "writer"
+    materializer_data = root / "computes" / "materializer"
+    writer_socket = root / "socket" / "writer"
+    materializer_socket = root / "socket" / "materializer"
+    artifacts = root / "artifacts" / "checkpoints"
+    for path in (
+        trace, store, writer_data, materializer_data, writer_socket,
+        materializer_socket, artifacts,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(plan.path, root / "plan.jsonl")
+    (root / "case.json").write_text(
+        json.dumps(plan.header["case"], indent=2) + "\n", encoding="utf-8"
+    )
+    events = EventLog(trace / "events.jsonl")
+    shm = f"/psharness_materializer_{os.getpid()}_{time.monotonic_ns()}"
+    writer_port = free_port()
+    materializer_port = free_port()
+    env = private_environment()
+    install = pg_bin.parent
+    env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
+    dproc: subprocess.Popen[str] | None = None
+    materializer_generation = 0
+
+    def sql_result(socket_dir: Path, port: int, sql: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(pg_bin / "psql"), "-h", str(socket_dir), "-p", str(port),
+                "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql,
+            ],
+            check=True, capture_output=True, encoding="utf-8", env=env,
+        )
+
+    def sql_scalar(socket_dir: Path, port: int, sql: str) -> str:
+        return sql_result(socket_dir, port, sql).stdout.strip()
+
+    def wait_scalar(
+        socket_dir: Path, port: int, sql: str, expected: str, context: str,
+        timeout: float = 40,
+    ) -> str:
+        deadline = time.monotonic() + timeout
+        last = ""
+        while time.monotonic() < deadline:
+            try:
+                last = sql_scalar(socket_dir, port, sql)
+            except subprocess.CalledProcessError as error:
+                last = (error.stderr or error.stdout or "").strip()
+            if last == expected:
+                return last
+            time.sleep(.1)
+        raise PlanError(f"{context}: got {last!r}, expected {expected!r}")
+
+    def start_materializer(reason: str) -> None:
+        nonlocal materializer_generation
+        subprocess.run(
+            [
+                str(pg_bin / "pg_ctl"), "-D", str(materializer_data), "-l",
+                str(trace / "materializer.log"), "-w", "start",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        materializer_generation += 1
+        wait_scalar(
+            materializer_socket, materializer_port,
+            "SELECT pg_is_in_recovery() AND "
+            "current_setting('pagestore.materializer')::boolean",
+            "t", "materializer did not enter its declared recovery role",
+        )
+        events.emit(
+            "process_start", target="materializer",
+            generation=materializer_generation, reason=reason,
+        )
+        events.emit(
+            "ready", target="materializer", generation=materializer_generation,
+            port=materializer_port,
+        )
+
+    def stop_materializer(mode: str, reason: str) -> None:
+        subprocess.run(
+            [
+                str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+                "-m", mode, "-w", "stop",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        events.emit(
+            "process_stop", target="materializer",
+            generation=materializer_generation, mode=mode, reason=reason,
+        )
+
+    def archive_current_wal() -> str:
+        wal_file = sql_scalar(
+            writer_socket, writer_port,
+            "SELECT pg_walfile_name(pg_switch_wal() - 1);",
+        )
+        done = writer_data / "pg_wal" / "archive_status" / f"{wal_file}.done"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if done.is_file():
+                return wal_file
+            time.sleep(.1)
+        status = sql_scalar(
+            writer_socket, writer_port,
+            "SELECT row(archived_count, failed_count, last_archived_wal, "
+            "last_failed_wal)::text FROM pg_stat_archiver;",
+        )
+        raise PlanError(
+            f"writer did not archive WAL file {wal_file}; archiver status {status}"
+        )
+
+    def make_boundary_durable(action: dict[str, Any], checkpoint_lsn: str) -> dict[str, Any]:
+        wal_file = archive_current_wal()
+        wait_scalar(
+            materializer_socket, materializer_port,
+            f"SELECT pg_last_wal_replay_lsn() >= '{checkpoint_lsn}'::pg_lsn",
+            "t", f"materializer did not replay checkpoint {checkpoint_lsn}",
+        )
+        stop_materializer("fast", f"publish {action['name']}")
+        start_materializer(f"restartpoint policy for {action['name']}")
+        wait_scalar(
+            materializer_socket, materializer_port,
+            f"SELECT pagestore_materialized_wal_lsn() >= "
+            f"'{checkpoint_lsn}'::pg_lsn",
+            "t", f"materializer marker did not cover checkpoint {checkpoint_lsn}",
+        )
+        status = sql_scalar(
+            writer_socket, writer_port,
+            "SELECT row(shipped_wal_lsn::text, materialized_wal_lsn::text, "
+            "lag_bytes)::text FROM pagestore_materializer_status();",
+        )
+        shipped, materialized, lag = status.strip("()").split(",")
+        if lag != "0":
+            raise PlanError(
+                f"materializer boundary {action['name']} retained {lag} bytes of lag"
+            )
+        horizon = {
+            "checkpoint_lsn": checkpoint_lsn,
+            "shipped_wal_lsn": shipped,
+            "materialized_wal_lsn": materialized,
+            "lag_bytes": lag,
+            "wal_file": wal_file,
+            "materializer_generation": materializer_generation,
+        }
+        events.emit(
+            "materialized_boundary", id=action["id"], name=action["name"],
+            horizon=horizon,
+        )
+        return horizon
+
+    try:
+        events.emit(
+            "run_start", scenario=plan.header["scenario"], seed=plan.header["seed"],
+            shm=shm, postgres_major=postgres_major,
+        )
+        with (trace / "daemon.log").open("w", encoding="utf-8") as log:
+            dproc = subprocess.Popen(
+                [
+                    str(daemon), "--shm", shm, "--store", str(store),
+                    "--page-size", str(profile["page_size"]),
+                    "--nshards", str(plan.header["case"]["shards"]),
+                    "--storage", plan.header["case"]["storage"],
+                ],
+                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+        deadline = time.monotonic() + 10
+        while True:
+            if dproc.poll() is not None:
+                raise PlanError(
+                    f"daemon exited before readiness with status {dproc.returncode}"
+                )
+            try:
+                health = inspect_store(inspector, shm, "health", schema)
+                break
+            except PlanError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.05)
+        validate_runtime_health(
+            plan, capabilities, "materializer_smoke", health, schema
+        )
+        probe_runtime_inspection(inspector, shm, capabilities, schema)
+        subprocess.run(
+            [
+                str(pg_bin / "initdb"), "-D", str(writer_data),
+                "-U", "postgres", "-A", "trust",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        subprocess.run(
+            pagestore_import_command(importer, shm, writer_data, profile["page_size"]),
+            check=True, capture_output=True, encoding="utf-8", env=env,
+        )
+        with (writer_data / "postgresql.conf").open("a", encoding="utf-8") as config:
+            config.write(
+                "shared_preload_libraries = 'pagestore'\n"
+                "pagestore.backend = 'localsvc'\n"
+                f"pagestore.localsvc_shm = '{shm}'\n"
+                "pagestore.route_all = off\n"
+                "pagestore.timeline = 0\n"
+                f"{postgres_runtime_settings(postgres_major)}"
+                f"{recovery_settings}"
+                "archive_mode = on\n"
+                "archive_library = 'pagestore'\n"
+                "listen_addresses = ''\n"
+                f"unix_socket_directories = '{writer_socket}'\n"
+                f"port = {writer_port}\n"
+            )
+        subprocess.run(
+            [
+                str(pg_bin / "pg_ctl"), "-D", str(writer_data), "-l",
+                str(trace / "writer.log"), "-w", "start",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        events.emit("ready", target="writer", health=health, port=writer_port)
+
+        subprocess.run(
+            [
+                str(pg_bin / "pg_basebackup"), "-h", str(writer_socket),
+                "-p", str(writer_port), "-U", "postgres", "-D",
+                str(materializer_data), "--wal-method=none", "--checkpoint=fast",
+            ],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        materializer_data.chmod(0o700)
+        archive_current_wal()
+        with (materializer_data / "postgresql.conf").open(
+            "a", encoding="utf-8"
+        ) as config:
+            config.write(
+                "pagestore.route_all = on\n"
+                "pagestore.materializer = on\n"
+                "archive_mode = off\n"
+                "hot_standby = on\n"
+                "listen_addresses = ''\n"
+                f"unix_socket_directories = '{materializer_socket}'\n"
+                f"port = {materializer_port}\n"
+                f"restore_command = '{walrestore} --shm {shm} --timeline 0 "
+                "--segsize 16777216 %f %p'\n"
+            )
+        (materializer_data / "standby.signal").touch()
+        for wal_path in (materializer_data / "pg_wal").glob("0000000*"):
+            if wal_path.is_file():
+                wal_path.unlink()
+        start_materializer("provisioned")
+        # Install after the worker base is taken: route_all recovery must replay
+        # the extension catalog into the store instead of relying on a local
+        # catalog copy that the WAL-only topology cannot keep authoritative.
+        sql_result(writer_socket, writer_port, "CREATE EXTENSION pagestore;")
+
+        for action in plan.actions:
+            events.emit(
+                "action_start", id=action["id"], op=action["op"],
+                target=action["target"],
+            )
+            if action["op"] == "sql":
+                output = sql_scalar(writer_socket, writer_port, action["sql"])
+                events.emit(
+                    "action", id=action["id"], op="sql", target="writer",
+                    result=output,
+                )
+            elif action["op"] == "checkpoint":
+                output = sql_result(
+                    writer_socket, writer_port,
+                    "CHECKPOINT; SELECT pg_current_wal_lsn();",
+                ).stdout.strip().splitlines()
+                checkpoint_lsn = output[-1]
+                horizon = make_boundary_durable(action, checkpoint_lsn)
+                (artifacts / f"{action['name']}.json").write_text(
+                    json.dumps(horizon, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                events.emit(
+                    "checkpoint", id=action["id"], name=action["name"],
+                    horizon=horizon,
+                )
+            elif action["op"] == "crash":
+                crashed_generation = materializer_generation
+                stop_materializer("immediate", action["id"])
+                events.emit(
+                    "crash", id=action["id"], target="materializer",
+                    model="compute", generation=crashed_generation,
+                )
+                start_materializer(f"replacement after {action['id']}")
+                events.emit(
+                    "replacement", id=action["id"], target="materializer",
+                    crashed_generation=crashed_generation,
+                    generation=materializer_generation,
+                )
+            elif action["op"] == "assert":
+                if action["target"] == "writer":
+                    socket_dir, port = writer_socket, writer_port
+                else:
+                    socket_dir, port = materializer_socket, materializer_port
+                output = sql_scalar(socket_dir, port, action["sql"])
+                if output != action["expect"]:
+                    raise PlanError(
+                        f"assert {action['id']} got {output!r}, "
+                        f"expected {action['expect']!r}"
+                    )
+                events.emit(
+                    "assert", id=action["id"], target=action["target"],
+                    actual=output, generation=(
+                        materializer_generation
+                        if action["target"] == "materializer" else None
+                    ),
+                )
+            else:
+                raise PlanError(
+                    f"materializer smoke does not execute {action['op']}"
+                )
+        events.emit(
+            "run_pass", materializer_generation=materializer_generation
+        )
+    except Exception as error:
+        events.emit(
+            "run_fail", error=str(error), error_type=type(error).__name__,
+            materializer_generation=materializer_generation,
+        )
+        (root / "failure.json").write_text(
+            json.dumps(
+                {"classification": "setup", "error": str(error)}, indent=2
+            ) + "\n",
+            encoding="utf-8",
+        )
+        raise PlanError(
+            f"materializer smoke failed; failure bundle: {root}: {error}"
+        ) from error
+    finally:
+        if (materializer_data / "postmaster.pid").exists():
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+                    "-m", "immediate", "-w", "stop",
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            )
+        if (writer_data / "postmaster.pid").exists():
+            subprocess.run(
+                [
+                    str(pg_bin / "pg_ctl"), "-D", str(writer_data),
+                    "-m", "immediate", "-w", "stop",
+                ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            )
+        if dproc is not None and dproc.poll() is None:
+            dproc.terminate()
+            dproc.wait(timeout=5)
         remove_shm(shm)
     if temporary and not keep:
         shutil.rmtree(root)
@@ -1200,7 +1601,8 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
 def run_legacy_integration(script: Path, build: Path, requested_root: Path | None, keep: bool) -> Path:
     """Bridge the existing reader/branch integration coverage into a bundle."""
     root, temporary = run_root(requested_root)
-    trace = root / "trace"; trace.mkdir()
+    trace = root / "trace"
+    trace.mkdir()
     events = EventLog(trace / "events.jsonl")
     events.emit("run_start", scenario="legacy-integration", build=str(build))
     with (trace / "integration.log").open("w", encoding="utf-8") as log:
@@ -1211,7 +1613,8 @@ def run_legacy_integration(script: Path, build: Path, requested_root: Path | Non
         (root / "failure.json").write_text(json.dumps({"classification": "oracle_mismatch", "returncode": result.returncode}, indent=2) + "\n", encoding="utf-8")
         raise PlanError(f"legacy integration failed; failure bundle: {root}")
     events.emit("run_pass", returncode=0)
-    if temporary and not keep: shutil.rmtree(root)
+    if temporary and not keep:
+        shutil.rmtree(root)
     return root
 
 
@@ -1224,6 +1627,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--inspect", choices=["health", "backpressure"])
     group.add_argument("--daemon-smoke", type=Path, metavar="PLAN")
     group.add_argument("--writer-smoke", type=Path, metavar="PLAN")
+    group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--legacy-integration", action="store_true")
     parser.add_argument("--daemon-binary", type=Path)
     parser.add_argument("--build-dir", type=Path)
@@ -1242,6 +1646,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--daemon-smoke requires --daemon-binary and --inspect-binary")
     if args.writer_smoke and (args.daemon_binary is None or args.inspect_binary is None or args.build_dir is None):
         parser.error("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary")
+    if args.materializer_smoke and (
+        args.daemon_binary is None
+        or args.inspect_binary is None
+        or args.build_dir is None
+    ):
+        parser.error(
+            "--materializer-smoke requires --build-dir, --daemon-binary "
+            "and --inspect-binary"
+        )
     if args.legacy_integration and args.build_dir is None:
         parser.error("--legacy-integration requires --build-dir")
     return args
@@ -1272,17 +1685,36 @@ def main(argv: list[str] | None = None) -> int:
                 print(root)
             return 0
         if args.writer_smoke:
-            plan = read_plan(args.writer_smoke); validate_plan(plan, capabilities)
+            plan = read_plan(args.writer_smoke)
+            validate_plan(plan, capabilities)
             validate_runtime_plan(plan, capabilities, "writer_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
             schema = read_inspection_schema(schema_path, capabilities)
             root = run_writer_smoke(plan, capabilities, schema, args.daemon_binary, args.inspect_binary,
                                     args.build_dir, args.run_root, args.keep)
-            if args.keep or args.run_root: print(root)
+            if args.keep or args.run_root:
+                print(root)
+            return 0
+        if args.materializer_smoke:
+            plan = read_plan(args.materializer_smoke)
+            validate_plan(plan, capabilities)
+            validate_runtime_plan(plan, capabilities, "materializer_smoke")
+            schema_path = (
+                args.inspection_schema
+                or args.capabilities.with_name("inspection_schema.json")
+            )
+            schema = read_inspection_schema(schema_path, capabilities)
+            root = run_materializer_smoke(
+                plan, capabilities, schema, args.daemon_binary,
+                args.inspect_binary, args.build_dir, args.run_root, args.keep,
+            )
+            if args.keep or args.run_root:
+                print(root)
             return 0
         if args.legacy_integration:
             root = run_legacy_integration(args.integration_script, args.build_dir, args.run_root, args.keep)
-            if args.keep or args.run_root: print(root)
+            if args.keep or args.run_root:
+                print(root)
             return 0
         paths = [args.validate] if args.validate else list(plan_files(args.list))
         if not paths:

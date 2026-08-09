@@ -172,8 +172,11 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     limit was enabled.  All progress records carry the logical timeline, so a
     branch cannot inherit its parent's marker or latch.  PostgreSQL's archive
     retry loop resumes shipping when the marker selects the next release
-    checkpoint.  Production provisioning and restartpoint/restart policy for
-    the declared worker remain control-plane work.
+    checkpoint.  The `materializer_smoke` harness runtime now provisions the
+    pair, drives checkpoint-to-marker progress, records worker generations, and
+    replaces a crashed worker.  Promoting that proven lifecycle contract into
+    a continuously running, ownership-fenced production controller remains
+    control-plane work.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is
