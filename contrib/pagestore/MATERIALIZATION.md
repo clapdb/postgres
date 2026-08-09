@@ -208,6 +208,44 @@ adopts that worker.  Startup, health, missing progress API, restartpoint, and
 replacement failures share bounded exponential retry.  Exhaustion publishes
 `failed` and exits nonzero for the outer service manager to handle.
 
+## Local serialized branch prepare
+
+Meson also installs the one-shot `pagestore_branch_prepare --config PATH`
+controller.  Its strict schema-1 JSON names absolute `pg_ctl`, `psql`, writer
+and materializer PGDATA, writer log, private socket, and prepared-artifact
+paths; public writer/materializer hosts and ports; a private writer port;
+logical parent/child timelines; and optional database, user, polling, progress,
+and command timeouts.  `--check-config` validates the topology and prepares the
+owner-only socket/artifact directories.
+
+The controller serializes the complete branch boundary:
+
+1. Take a writer-PGDATA operation lock and the materializer supervisor's own
+   PGDATA lock.  A live supervisor or another branch operation fails with exit
+   status 75; an externally owned replay pause also fails closed.
+2. Pause the materializer, capture a restartpoint-proven SLRU base `C`, and
+   resume it.  Then fast-stop the public writer so existing clients drain.
+3. Restart that writer with TCP disabled on a mode-0700 private Unix socket;
+   disable autovacuum, WAL senders, logical workers, and optional pagestore
+   artifact/index workers.  `pagestore_branch_checkpoint()` verifies the clean
+   shutdown checkpoint's exact mirrored control image and admission fence and
+   returns its real WAL-record boundary `R/E`.
+4. Switch/archive WAL, wait for durable shipping and materializer replay through
+   `E`, pause again, and capture restartpoint/materialized fork `L >= E`.
+   Prepare the store branch, catalog maps, and SLRUs while both sides remain
+   fenced.
+5. Atomically publish `pagestore_branch.prepare.json`, resume materialization,
+   stop the private writer, restore its normal configuration, and update the
+   receipt from `prepared` to `complete`.
+
+Handled failures and termination signals make a best-effort service restore;
+the intermediate receipt makes a branch already prepared before a cleanup
+failure visible.  A hard process kill may still require manually resuming the
+materializer or starting the writer.  The deployment must suspend an external
+writer service manager for the command's duration; the materializer side is
+mechanically fenced by the shared supervisor lock.  The portable artifact
+continues to reject user tablespaces rather than guessing their topology.
+
 ## Why this shape (vs Neon read-time redo)
 
 On **local NVMe**, reading a stored page is ~tens of µs; doing redo on the read

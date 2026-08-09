@@ -29,6 +29,7 @@ IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 INSPECT="$BUILD/contrib/pagestore/pagestore_inspect"
 WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
 CONTROLRESTORE="$BUILD/contrib/pagestore/pagestore_control_restore"
+BRANCHPREP="$BIN/pagestore_branch_prepare"
 
 TMPROOT=$(mktemp -d)
 WRITER="$TMPROOT/writer"
@@ -37,10 +38,13 @@ BRANCH="$TMPROOT/branch"
 PREPARED="$TMPROOT/prepared"
 STORE="$TMPROOT/store"
 BRANCH_SCRATCH="$TMPROOT/branch-walredo"
+PRIVATE_SOCKET="$TMPROOT/private-writer-socket"
+BRANCH_CONFIG="$TMPROOT/branch-prepare.json"
 SHM=/psmvpgolden_$$
 WPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 MPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 BPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+PRIVATE_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 WP=("$BIN/psql" -h 127.0.0.1 -p "$WPORT" -U postgres -tA -v ON_ERROR_STOP=1)
 MP=("$BIN/psql" -h 127.0.0.1 -p "$MPORT" -U postgres -tA -v ON_ERROR_STOP=1)
 BP=("$BIN/psql" -h 127.0.0.1 -p "$BPORT" -U postgres -tA -v ON_ERROR_STOP=1)
@@ -206,6 +210,20 @@ wait_materialized_lsn()
 	return 1
 }
 
+wait_branch_promoted()
+{
+	local in_recovery=
+
+	for _ in $(seq 1 400); do
+		in_recovery=$("${BP[@]}" -c "SELECT pg_is_in_recovery();" \
+			2>/dev/null || true)
+		[ "$in_recovery" = "f" ] && return 0
+		sleep 0.1
+	done
+	echo "branch recovery state is '${in_recovery:-unknown}'" >&2
+	return 1
+}
+
 mkdir -p "$STORE" "$PREPARED"
 "$BIN/initdb" -D "$WRITER" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "writer initdb failed"
@@ -275,10 +293,11 @@ attblock=$("${WP[@]}" -c "SELECT split_part(trim(both '()' from ctid::text), ','
 	FROM pg_attribute WHERE attrelid='mvp_golden'::regclass AND attname='note';") ||
 	fail "could not locate the relation's pg_attribute page"
 
-# C is now produced by the recovery compute itself.  Pausing makes its local
-# SLRUs stable; capture requests a restartpoint, requires its durable marker to
-# equal the paused replay LSN, stages all four SLRUs, and only then publishes
-# the exact-as-of snapshot.  The fork-visible transaction commits in (C,L].
+# The installed controller owns both process lifecycles across the correctness
+# window.  First retain the direct API's fail-closed assertion, then let the
+# controller select C, stop the public writer, establish exact R/E on a private
+# socket, archive and materialize through E, pause at L, and capture maps plus
+# the prepared branch while no horizon-changing client can interleave.
 archive_current_wal || fail "DDL checkpoint WAL did not reach pagestore"
 wait_replay_lsn "$ddl_checkpoint_lsn" ||
 	fail "materializer did not reach the DDL checkpoint"
@@ -287,27 +306,51 @@ if "${MP[@]}" -c "SELECT pagestore_capture_slru_snapshot();" \
 	fail "SLRU capture accepted an unpaused recovery worker"
 fi
 echo "ok   - SLRU capture fails closed before recovery is paused"
-"${MP[@]}" -c "SELECT pg_wal_replay_pause();" >/dev/null ||
-	fail "could not request materializer recovery pause"
-wait_recovery_paused || fail "materializer recovery did not pause"
-base_lsn=$("${MP[@]}" -c "SELECT pagestore_capture_slru_snapshot();") ||
-	fail "could not capture a proven branch SLRU snapshot"
-"${MP[@]}" -c "SELECT pg_wal_replay_resume();" >/dev/null ||
-	fail "could not resume materializer recovery"
-echo "ok   - recovery restartpoint produced proven SLRU cutoff $base_lsn"
 
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
-checkpoint_lsn=$("${WP[@]}" -c "CHECKPOINT;
-	SELECT pg_current_wal_lsn();" | tail -1) ||
-	fail "could not establish the workload checkpoint"
-checkpoint_redo=$("${WP[@]}" -c "SELECT redo_lsn FROM pg_control_checkpoint();") ||
-	fail "could not capture the workload checkpoint redo"
-archive_current_wal || fail "fork WAL did not reach pagestore"
+
+cat > "$BRANCH_CONFIG" <<EOF
+{
+  "schema": 1,
+  "pg_ctl": "$BIN/pg_ctl",
+  "psql": "$BIN/psql",
+  "writer_data_dir": "$WRITER",
+  "writer_host": "127.0.0.1",
+  "writer_port": $WPORT,
+  "writer_log_file": "$WRITER/writer.log",
+  "private_socket_dir": "$PRIVATE_SOCKET",
+  "private_port": $PRIVATE_PORT,
+  "materializer_data_dir": "$MATERIALIZER",
+  "materializer_host": "127.0.0.1",
+  "materializer_port": $MPORT,
+  "prepared_dir": "$PREPARED",
+  "new_timeline": 1,
+  "parent_timeline": 0,
+  "database": "postgres",
+  "user": "postgres",
+  "poll_interval_ms": 50,
+  "progress_timeout_ms": 40000,
+  "command_timeout_seconds": 60
+}
+EOF
+branch_receipt=$("$BRANCHPREP" --config "$BRANCH_CONFIG") ||
+	fail "serialized branch preparation failed"
+IFS='|' read -r receipt_state base_lsn checkpoint_redo checkpoint_lsn \
+	fork_lsn seeded <<EOF
+$(python3 -c 'import json, sys
+r = json.loads(sys.argv[1])
+print("|".join(str(r[k]) for k in (
+    "state", "base_lsn", "checkpoint_redo_lsn", "checkpoint_end_lsn",
+    "fork_lsn", "seeded_slru_pages")))' "$branch_receipt")
+EOF
+assert_eq "$receipt_state" "complete" \
+	"branch controller restored both services after prepare"
+[ "${seeded:-0}" -gt 0 ] || fail "branch preparation seeded no SLRU pages"
+echo "ok   - serialized branch window selected C=$base_lsn R=$checkpoint_redo E=$checkpoint_lsn L=$fork_lsn"
+
 wait_materializer_note 1 before_fork ||
 	fail "materializer did not produce the fork-visible page"
-wait_replay_lsn "$checkpoint_lsn" ||
-	fail "materializer did not reach the workload checkpoint"
 
 # The restartpoint flushes dirty routed pages before publishing the marker; the
 # subsequent read runs with an empty buffer cache and is therefore store-backed.
@@ -318,20 +361,13 @@ wait_materialized_lsn "$checkpoint_lsn" ||
 wait_materializer_note 1 before_fork ||
 	fail "fork-visible page was not store-visible after materializer restart"
 materialized_lsn=$("${MP[@]}" -c "SELECT pagestore_materialized_wal_lsn();")
-# Dirty pages flushed by a restartpoint are versioned at its replay horizon.
-# Forking at the earlier workload checkpoint could therefore hide a catalog
-# page whose changes precede the checkpoint but whose durable store version is
-# stamped with this later flush boundary.
-fork_lsn=$materialized_lsn
+assert_eq "$materialized_lsn" "$fork_lsn" \
+	"controller receipt matches the durable materialized fork"
 echo "ok   - durable materialized fork $fork_lsn covers workload checkpoint $checkpoint_lsn"
 assert_eq "$("${WP[@]}" -c "SELECT position('note'::bytea in
 	pagestore_read_at('pg_attribute', 0, '$attblock', '$fork_lsn')) > 0;")" \
 	"t" "materialized catalog page is visible at the fork LSN"
 
-seeded=$("${WP[@]}" -c "SELECT pagestore_prepare_branch_from_control(
-	'$PREPARED', 1, 0, '$base_lsn', '$checkpoint_redo', '$fork_lsn');") ||
-	fail "branch preparation failed"
-[ "${seeded:-0}" -gt 0 ] || fail "branch preparation seeded no SLRU pages"
 echo "ok   - branch prepared at the materialized fork ($seeded SLRU page(s))"
 
 # Both attached processes must be down while the daemon reinitializes its shm.
