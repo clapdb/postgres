@@ -52,19 +52,24 @@ scenario plan for `--validate`, `--daemon-smoke`, `--writer-smoke`, and
 `--list` instead receives a scenario directory and inventories the plans below
 it.  Runtime modes then add the inputs they actually need: `--daemon-smoke`
 takes daemon and inspector binaries, `--writer-smoke` and
-`--materializer-smoke` also take the Meson build directory, and
+`--materializer-smoke` also take the Meson build directory, while the latter
+additionally takes the installed or source `--materializer-supervisor`, and
 `--legacy-integration` takes the Meson build directory plus the legacy script
 path.  It owns temporary directories,
 daemon/PostgreSQL lifecycle, and capture of diagnostic artifacts.  Full
 per-action timeout enforcement, complete replay metadata, and deterministic
 scheduling are still future generated-scenario work.
 
-The materializer runtime owns the first concrete managed-worker contract.  It
-provisions a WAL-only writer and route-all recovery worker, turns each declared
-writer checkpoint into an archived and durably materialized boundary, records
-worker generations, and replaces a worker killed with the `compute` crash
-model.  Production ownership/fencing and a continuously running service
-controller remain outside this test coordinator.
+The materializer runtime is the acceptance client for the first concrete
+managed-worker contract.  It provisions a WAL-only writer and route-all
+recovery worker, then starts the production-facing supervisor.  The supervisor,
+not the coordinator, turns each declared writer checkpoint into an archived and
+durably materialized boundary and replaces a worker killed with the `compute`
+crash model.  The runtime also starts a competing owner and requires temporary-
+failure exit status 75 before continuing, and hands ownership to a replacement
+supervisor without restarting the healthy worker.  Worker generations, owner
+epochs, and progress come from the supervisor's atomic status file and are
+copied into the failure bundle.
 
 Use JSON Lines for plans rather than YAML.  It is dependency-free, easy to
 generate or shrink, and each action is independently visible in failure logs.

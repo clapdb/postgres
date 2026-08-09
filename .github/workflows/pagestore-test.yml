@@ -152,7 +152,9 @@ jobs:
             --materializer-smoke contrib/pagestore/harness/scenarios/materializer_lifecycle.jsonl \
             --build-dir "$(pwd)/build" \
             --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
-            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"

@@ -1028,6 +1028,7 @@ class PlanValidationTests(unittest.TestCase):
             ("--build-dir", "build"),
             ("--daemon-binary", "daemon"),
             ("--inspect-binary", "inspect"),
+            ("--materializer-supervisor", "supervisor"),
         ]
         base_args = [
             "--capabilities", str(ROOT / "capabilities.json"),
@@ -1049,7 +1050,8 @@ class PlanValidationTests(unittest.TestCase):
                 self.assertNotEqual(raised.exception.code, 0)
                 self.assertIn(
                     "--materializer-smoke requires --build-dir, "
-                    "--daemon-binary and --inspect-binary",
+                    "--daemon-binary, --inspect-binary and "
+                    "--materializer-supervisor",
                     stderr.getvalue(),
                 )
 
