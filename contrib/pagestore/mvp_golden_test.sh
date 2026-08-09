@@ -28,6 +28,7 @@ DAEMON="$BUILD/contrib/pagestore/pagestore_daemon"
 IMPORT="$BUILD/contrib/pagestore/pagestore_import"
 INSPECT="$BUILD/contrib/pagestore/pagestore_inspect"
 WALRESTORE="$BUILD/contrib/pagestore/pagestore_walrestore"
+CONTROLRESTORE="$BUILD/contrib/pagestore/pagestore_control_restore"
 
 TMPROOT=$(mktemp -d)
 WRITER="$TMPROOT/writer"
@@ -229,9 +230,6 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	"materializer is a distinct recovery compute"
 
 "${WP[@]}" -c "CREATE EXTENSION pagestore;
-	CREATE FUNCTION pagestore_install_prepared_branch(text, text, int, int,
-	 pg_lsn) RETURNS void
-	 AS 'pagestore','pagestore_install_prepared_branch' LANGUAGE C STRICT;
 	CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
 	 AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 	CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
@@ -308,13 +306,11 @@ seeded=$("${WP[@]}" -c "SELECT pagestore_prepare_branch_from_control(
 [ "${seeded:-0}" -gt 0 ] || fail "branch preparation seeded no SLRU pages"
 echo "ok   - branch prepared at the materialized fork ($seeded SLRU page(s))"
 
-# Copy the writer while it is stopped and still before the parent advances.
 # Both attached processes must be down while the daemon reinitializes its shm.
 "$BIN/pg_ctl" -D "$MATERIALIZER" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop the materializer for store restart"
 "$BIN/pg_ctl" -D "$WRITER" -m fast -w stop >/dev/null 2>&1 ||
 	fail "could not stop the writer at the fork"
-cp -a "$WRITER" "$BRANCH" || fail "could not copy the branch datadir"
 stop_daemon || fail "pagestore daemon did not stop cleanly"
 start_daemon || fail "pagestore daemon did not recover its durable store"
 "$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start >/dev/null 2>&1 ||
@@ -337,21 +333,47 @@ wait_materializer_note 2 after_fork ||
 	fail "post-fork parent page was not store-visible after restart"
 echo "ok   - parent advanced and was durably materialized beyond the child fork"
 
-"${WP[@]}" -c "SELECT pagestore_install_prepared_branch('$PREPARED', '$BRANCH',
-	1, 0, '$fork_lsn');" >/dev/null || fail "could not install the prepared branch"
+# Portable boot path from a fresh same-build cluster skeleton.  Relation files
+# belong to pagestore; the CRC-bound bootstrap artifact installs the source
+# cluster's complete default-tablespace relation-map topology and SLRUs after
+# exact checkpoint control is restored.  Archive recovery consumes the real
+# checkpoint record and promotes at its record end; the store branch itself
+# remains cut at the later durable materialized fork.
+"$BIN/initdb" -D "$BRANCH" -U postgres -A trust >/dev/null 2>&1 ||
+	fail "branch bootstrap initdb failed"
+"$CONTROLRESTORE" --shm "$SHM" --timeline 1 --lsn "$checkpoint_redo" \
+	--archive-bootstrap \
+	"$BRANCH" >/dev/null || fail "could not restore branch checkpoint control"
+"${WP[@]}" -c "SELECT pagestore_install_prepared_branch_bootstrap(
+	'$PREPARED', '$BRANCH', 1, 0, '$checkpoint_redo', '$checkpoint_lsn',
+	'$fork_lsn');" >/dev/null || fail "could not install the portable branch bootstrap"
+# Remove the unrelated WAL segment created by the fresh initdb.  The restored
+# cluster identity must fetch its checkpoint and all subsequent WAL from store.
+find "$BRANCH/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
 "$BIN/initdb" -D "$BRANCH_SCRATCH" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "branch WAL-redo scratch initdb failed"
 cat >> "$BRANCH/postgresql.conf" <<EOF
+shared_preload_libraries = 'pagestore'
+pagestore.backend = 'localsvc'
+pagestore.localsvc_shm = '$SHM'
 pagestore.route_all = on
 pagestore.timeline = 1
 pagestore.walredo_datadir = '$BRANCH_SCRATCH'
+io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $BPORT
+restore_command = '$WALRESTORE --shm $SHM --timeline 1 --segsize 16777216 %f %p'
+recovery_target_lsn = '$checkpoint_lsn'
+recovery_target_inclusive = on
+recovery_target_action = 'promote'
 EOF
+touch "$BRANCH/recovery.signal"
 
 "$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -w start >/dev/null 2>&1 ||
 	fail "independent branch compute did not boot"
+assert_eq "$("${BP[@]}" -c "SELECT pg_is_in_recovery();")" "f" \
+	"portable branch recovery promoted from the prepared checkpoint"
 assert_eq "$("${BP[@]}" -c "SELECT current_setting('pagestore.route_all');")" "on" \
 	"branch compute uses page-store routing, not its copied local heap"
 assert_eq "$("${BP[@]}" -c "SELECT pg_xact_status('$ddl_xid'::text::xid8);")" \
