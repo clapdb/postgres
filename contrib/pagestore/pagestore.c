@@ -10428,6 +10428,77 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 						(long long) h->next_member)));
 }
 
+/*
+ * Return the exact R/E pair for the local writer's current checkpoint, but
+ * only after proving that the same checkpoint and its admission fence are
+ * durable in the store.  The serialized branch controller calls this after a
+ * clean stop/restart: the shutdown checkpoint is therefore the first control
+ * state selected after all public clients have drained.  pg_current_wal_lsn()
+ * cannot substitute for E because startup can advance WAL beyond the
+ * checkpoint record without changing its control identity.
+ */
+PG_FUNCTION_INFO_V1(pagestore_branch_checkpoint);
+Datum
+pagestore_branch_checkpoint(PG_FUNCTION_ARGS)
+{
+	ControlFileData *local;
+	ControlFileData mirrored;
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	bool		crc_ok;
+	XLogRecPtr	redo;
+	XLogRecPtr	end;
+	uint64		read_seq;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to select a pagestore branch checkpoint")));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore branch checkpoint selection requires a writer")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR, (errmsg("pagestore.backend must be 'localsvc'")));
+
+	local = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		ereport(ERROR, (errmsg("local pg_control has an invalid CRC")));
+	redo = local->checkPointCopy.redo;
+	if (XLogRecPtrIsInvalid(redo) ||
+		!ps_control_asof_timeout(redo, &mirrored,
+							 PAGESTORE_READER_HORIZON_TIMEOUT_MS) ||
+		mirrored.checkPointCopy.redo != redo ||
+		mirrored.checkPoint != local->checkPoint ||
+		mirrored.system_identifier != local->system_identifier ||
+		!ps_checkpoint_matches_control(&mirrored.checkPointCopy,
+								   &local->checkPointCopy))
+		ereport(ERROR,
+				(errmsg("current writer checkpoint is not exactly mirrored"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+						   LSN_FORMAT_ARGS(redo))));
+	if (!pagestore_localsvc_read_fence_timeout(
+			(uint64) redo, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("current writer checkpoint has no matching durable admission fence"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+						   LSN_FORMAT_ARGS(redo))));
+	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+	end = ps_checkpoint_record_end(mirrored.checkPoint,
+								&mirrored.checkPointCopy);
+	pfree(local);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	values[0] = LSNGetDatum(redo);
+	values[1] = LSNGetDatum(end);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
 static int64
 pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 							  int32 parent_tl, XLogRecPtr base,

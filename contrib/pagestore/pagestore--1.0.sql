@@ -40,6 +40,13 @@ RETURNS pg_lsn
 AS 'MODULE_PATHNAME', 'pagestore_capture_slru_snapshot'
 LANGUAGE C PARALLEL UNSAFE;
 
+CREATE FUNCTION pagestore_branch_checkpoint(
+    OUT checkpoint_redo_lsn pg_lsn,
+    OUT checkpoint_end_lsn pg_lsn)
+RETURNS record
+AS 'MODULE_PATHNAME', 'pagestore_branch_checkpoint'
+LANGUAGE C PARALLEL RESTRICTED;
+
 CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(
     prepared_dir text,
     target_dir text,
@@ -69,6 +76,9 @@ COMMENT ON FUNCTION pagestore_prepare_branch_from_control(text, integer, integer
 
 COMMENT ON FUNCTION pagestore_capture_slru_snapshot() IS
 'capture all branch SLRU bases at a cutoff proven by a paused recovery materializer restartpoint';
+
+COMMENT ON FUNCTION pagestore_branch_checkpoint() IS
+'return the exact durable checkpoint boundary selected from a quiesced pagestore writer';
 
 COMMENT ON FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, integer, integer, pg_lsn, pg_lsn, pg_lsn) IS
 'install a prepared branch into a fresh same-build initdb skeleton after exact archive-bootstrap control restore';

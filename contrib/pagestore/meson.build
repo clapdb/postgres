@@ -37,6 +37,14 @@ if host_system != 'windows'
     install_mode: 'rwxr-xr-x',
     rename: 'pagestore_materializer_supervisor',
   )
+  # This one-shot controller owns the writer/materializer correctness window
+  # while selecting and preparing a branch boundary.
+  install_data(
+    'pagestore_branch_prepare.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_branch_prepare',
+  )
 endif
 
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it
@@ -192,6 +200,12 @@ if host_system != 'windows'
   test('pagestore_materializer_supervisor',
     pagestore_harness_python,
     args: [files('harness/tests/test_materializer_supervisor.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+  test('pagestore_branch_prepare',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_branch_prepare.py')],
     suite: ['pagestore'],
     timeout: 30,
   )

@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work through portable fresh-skeleton branch bootstrap.
+Status below includes work through serialized portable branch preparation.
 
 ## MVP scope
 
@@ -35,7 +35,7 @@ work and must not expand the MVP critical path.
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
-| `pg_control` and branch SLRU/catalog bootstrap | Portable local path implemented; automatic orchestration partial | fresh-initdb golden boot from CRC-bound maps/SLRUs/control plus fail-closed recovery/startup validation |
+| `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
@@ -103,7 +103,7 @@ Provisioning the initial PGDATA and registering this foreground process with a
 deployment's service manager remain deployment orchestration, not page-store
 data-path work.
 
-### 3. Safe automatic branch bootstrap -- partial
+### 3. Safe automatic branch bootstrap -- implemented for local POSIX
 
 `pagestore_capture_slru_snapshot()` now turns a confirmed recovery pause into
 that proven base cutoff.  It requests and waits for a restartpoint, requires
@@ -123,9 +123,20 @@ otherwise-unrecorded oldest member offset from the same `(C, R]` window, fails
 closed on a missing or inconsistent bound, cuts the store branch at the
 separate materialized LSN (avoiding exact-R admission-sequence ties), and reuses
 the prepared-manifest/store-branch idempotency protocol.  The legacy expert ABI
-remains available for compatibility.  The control plane must still keep the
-parent free of horizon-changing work between the selected checkpoint and that
-materialized boundary.
+remains available for compatibility.
+
+`pagestore_branch_prepare` now owns that control-plane window.  It takes the
+materializer supervisor's PGDATA lock, rejects a pre-existing replay pause,
+captures the proven base `C`, drains and cleanly stops the public writer, and
+restarts it on an owner-only Unix socket with autonomous writers disabled.  The
+clean stop's shutdown checkpoint is the serialized horizon boundary;
+`pagestore_branch_checkpoint()` admits it only when its exact control image and
+admission fence are durable, and resolves the checkpoint record's true end `E`
+from WAL.  The controller completes and archives that segment, waits for the
+materializer through `E`, pauses it again, captures the durable fork `L`, and
+prepares maps, SLRUs, and the store branch before resuming the materializer and
+restoring the normal writer.  An atomic JSON receipt records `C/R/E/L`, archive
+coverage, seeded page count, and whether service restoration completed.
 
 The same prepare now captures every default-tablespace database relation map
 plus the global map under `RelationMappingLock` into one CRC-protected
@@ -144,10 +155,10 @@ path without reading any artifact from the stopped parent.
 
 Portable bootstrap currently fails explicitly when the source or target has a
 user-tablespace topology; encoding those paths is outside the default-
-tablespace local MVP format rather than being silently guessed.  The remaining
-gate-3 work is the control-plane transaction: serialize pause/capture,
-checkpoint selection, map capture, and the materialized fork boundary so no
-horizon- or topology-changing operation can interleave.  The live SLRU
+tablespace local MVP format rather than being silently guessed.  The local
+controller also assumes it owns the writer service lifecycle for the operation:
+an outer service manager must not independently restart the writer, while the
+shared materializer lock mechanically excludes its supervisor.  The live SLRU
 watermark still cannot substitute for the proven capture API: its newest-image
 contract deliberately permits bytes newer than its completeness floor and is
 therefore unsafe as an exact branch seed.
@@ -179,11 +190,9 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Wrap proven SLRU capture, checkpoint selection, portable artifact prepare,
-   and materialized fork creation in one serialized control-plane operation.
-2. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
+1. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
    and deleted timelines.
-3. Promote the golden scenario into the declarative crash/compatibility harness.
+2. Promote the golden scenario into the declarative crash/compatibility harness.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit
