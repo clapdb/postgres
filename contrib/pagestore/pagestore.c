@@ -9807,6 +9807,7 @@ pagestore_install_branch_bootstrap_maps(const char *prepared_dir,
 		PagestoreBranchBootstrapMapHeader entry;
 		const char *mapdata;
 		char		mapdir[MAXPGPATH];
+		char		initpath[MAXPGPATH];
 		struct stat st;
 
 		memcpy(&entry, cursor, sizeof(entry));
@@ -9831,8 +9832,20 @@ pagestore_install_branch_bootstrap_maps(const char *prepared_dir,
 		else if (!S_ISDIR(st.st_mode))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("branch database path \"%s\" is not a directory",
+						 errmsg("branch database path \"%s\" is not a directory",
 							mapdir)));
+		/* initdb's relcache files can describe different catalog filenodes.
+		 * Rebuild them from the restored map and catalog pages on first boot. */
+		pathlen = snprintf(initpath, sizeof(initpath), "%s/pg_internal.init",
+							   mapdir);
+		PS_CHECK_PATH_FORMAT(pathlen, initpath);
+		if (unlink(initpath) == 0)
+			fsync_fname(mapdir, true);
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove stale relcache init file \"%s\": %m",
+							initpath)));
 		pagestore_publish_artifact(mapdir, "pg_filenode.map",
 								   "branch relation map", mapdata,
 								   (int) entry.size);
@@ -9869,6 +9882,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	XLogRecPtr	fork_lsn;
 	char	   *manifest_data;
 	char	   *target_manifest;
+	char		manifest_path[MAXPGPATH];
 	char		stage[MAXPGPATH];
 	uint32_t	target_new_tl;
 	uint32_t	target_parent_tl;
@@ -10092,6 +10106,18 @@ pagestore_install_prepared_branch_bootstrap(PG_FUNCTION_ARGS)
 						   header->system_identifier,
 						   LSN_FORMAT_ARGS(checkpoint_redo))));
 	pfree(control);
+
+	/* A previous successful install is no longer evidence of readiness while
+	 * maps are being replaced.  Publish the new manifest only after all files. */
+	snprintf(manifest_path, sizeof(manifest_path), "%s/pagestore_branch.manifest",
+			 target_dir);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
 
 	pagestore_install_branch_bootstrap_maps(prepared_dir, target_dir,
 											artifact, header);
