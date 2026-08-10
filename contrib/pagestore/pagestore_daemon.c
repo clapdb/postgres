@@ -223,6 +223,8 @@ run_request_admitted(PsChannel *ch)
 	 */
 	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
 	{
+		int		timeline_ok;
+
 		/*
 		 * Pin mutations fsync their own retention log.  Timeline definitions are
 		 * append-only for a daemon lifetime, so validate the timeline under the
@@ -230,11 +232,12 @@ run_request_admitted(PsChannel *ch)
 		 * unrelated map readers across all shards.
 		 */
 		ps_lock_map_rd();
-		if (!ps_timeline_defined(ch->timeline))
-			ch->status = PS_STATUS_ERROR;
+		timeline_ok = ps_timeline_defined(ch->timeline);
 		ps_unlock_map();
-		if (ch->status != PS_STATUS_ERROR)
+		if (timeline_ok)
 			handle_request(ch);
+		else
+			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
 		return;
 	}
