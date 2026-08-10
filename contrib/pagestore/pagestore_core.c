@@ -2246,6 +2246,7 @@ load_timelines(void)
 			if (n != (int) sizeof(rec) || rec.magic != TIMELINE_META_V2_MAGIC ||
 				rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
 				rec.crc != timeline_rec_crc(&rec) ||
+				rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
 				!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 				return -1;
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
@@ -2262,6 +2263,7 @@ load_timelines(void)
 		if (n == 0)
 			break;
 		if (n != (int) sizeof(rec) || nlegacy == MAX_TIMELINES ||
+			rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
 			!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 			return -1;
 		legacy[nlegacy++] = rec;
