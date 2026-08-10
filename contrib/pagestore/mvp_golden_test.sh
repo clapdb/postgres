@@ -82,6 +82,18 @@ assert_eq()
 	echo "ok   - $message"
 }
 
+wal_segment_size()
+{
+	local data_dir=$1 size=
+
+	size=$("$BIN/pg_controldata" "$data_dir" |
+		awk -F': *' '$1 == "Bytes per WAL segment" { print $2; exit }') || return 1
+	case "$size" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$size"
+}
+
 start_daemon()
 {
 	"$DAEMON" --shm "$SHM" --store "$STORE" >>"$TMPROOT/daemon.log" 2>&1 &
@@ -165,6 +177,20 @@ wait_recovery_paused()
 	return 1
 }
 
+wait_branch_promotion()
+{
+	local recovering=
+
+	for _ in $(seq 1 400); do
+		recovering=$("${BP[@]}" -c "SELECT pg_is_in_recovery();" \
+			2>/dev/null || true)
+		[ "$recovering" = "f" ] && return 0
+		sleep 0.1
+	done
+	echo "branch recovery state is '${recovering:-unknown}'" >&2
+	return 1
+}
+
 wait_materialized_lsn()
 {
 	local target=$1 reached=
@@ -210,6 +236,8 @@ EOF
 "$BIN/pg_basebackup" -h 127.0.0.1 -p "$WPORT" -U postgres \
 	-D "$MATERIALIZER" --wal-method=none --checkpoint=fast >/dev/null 2>&1 ||
 	fail "could not create the materializer base backup"
+materializer_wal_segment_size=$(wal_segment_size "$MATERIALIZER") ||
+	fail "could not read materializer WAL segment size"
 archive_current_wal || fail "base-backup WAL did not reach pagestore"
 
 cat >> "$MATERIALIZER/postgresql.conf" <<EOF
@@ -219,7 +247,7 @@ archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT
 hot_standby = on
-restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize $materializer_wal_segment_size %f %p'
 EOF
 touch "$MATERIALIZER/standby.signal"
 find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
@@ -344,6 +372,8 @@ echo "ok   - parent advanced and was durably materialized beyond the child fork"
 "$CONTROLRESTORE" --shm "$SHM" --timeline 1 --lsn "$checkpoint_redo" \
 	--archive-bootstrap \
 	"$BRANCH" >/dev/null || fail "could not restore branch checkpoint control"
+branch_wal_segment_size=$(wal_segment_size "$BRANCH") ||
+	fail "could not read branch WAL segment size"
 "${WP[@]}" -c "SELECT pagestore_install_prepared_branch_bootstrap(
 	'$PREPARED', '$BRANCH', 1, 0, '$checkpoint_redo', '$checkpoint_lsn',
 	'$fork_lsn');" >/dev/null || fail "could not install the portable branch bootstrap"
@@ -363,7 +393,7 @@ io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $BPORT
-restore_command = '$WALRESTORE --shm $SHM --timeline 1 --segsize 16777216 %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 1 --segsize $branch_wal_segment_size %f %p'
 recovery_target_lsn = '$checkpoint_lsn'
 recovery_target_inclusive = on
 recovery_target_action = 'promote'
@@ -372,6 +402,7 @@ touch "$BRANCH/recovery.signal"
 
 "$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -w start >/dev/null 2>&1 ||
 	fail "independent branch compute did not boot"
+wait_branch_promotion || fail "portable branch recovery did not promote"
 assert_eq "$("${BP[@]}" -c "SELECT pg_is_in_recovery();")" "f" \
 	"portable branch recovery promoted from the prepared checkpoint"
 assert_eq "$("${BP[@]}" -c "SELECT current_setting('pagestore.route_all');")" "on" \
