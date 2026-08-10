@@ -161,9 +161,14 @@ class Config:
                 )
             strings[field] = item
 
-        paths["socket_dir"].mkdir(parents=True, exist_ok=True)
-        paths["state_dir"].mkdir(parents=True, exist_ok=True)
-        paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
+        try:
+            paths["socket_dir"].mkdir(parents=True, exist_ok=True)
+            paths["state_dir"].mkdir(parents=True, exist_ok=True)
+            paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise ConfigError(
+                f"could not prepare supervisor runtime directories: {error}"
+            ) from error
         return cls(
             **paths,
             **integers,
@@ -367,6 +372,7 @@ class Supervisor:
         result = self.command(
             [
                 str(self.config.psql),
+                "-X",
                 "-h",
                 str(self.config.socket_dir),
                 "-p",
@@ -392,10 +398,12 @@ class Supervisor:
 
     def worker_healthy(self) -> bool:
         try:
+            expected_data_dir = str(self.config.data_dir.resolve()).replace("'", "''")
             return (
                 self.psql(
                     "SELECT pg_is_in_recovery() AND "
-                    "current_setting('pagestore.materializer')::boolean"
+                    "current_setting('pagestore.materializer')::boolean AND "
+                    "current_setting('data_directory') = '" + expected_data_dir + "'"
                 )
                 == "t"
             )
