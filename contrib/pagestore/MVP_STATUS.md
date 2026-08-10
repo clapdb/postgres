@@ -98,14 +98,28 @@ Provisioning the initial PGDATA and registering this foreground process with a
 deployment's service manager remain deployment orchestration, not page-store
 data-path work.
 
-### 3. Safe automatic branch bootstrap -- remaining
+### 3. Safe automatic branch bootstrap -- partial
 
-The prepared branch protocol is fail-closed, but the current demo still supplies
-the SLRU base cutoff and transaction/multixact horizons explicitly and copies a
-stopped parent data directory.  The MVP path must obtain a proven snapshot
-cutoff, derive bootstrap horizons from the matching control state, and expose an
-idempotent control-plane operation rather than a sequence of expert-only SQL
-calls and filesystem steps.
+`pagestore_prepare_branch_from_control` now accepts a proven SLRU base cutoff,
+an exact checkpoint redo, and the materialized fork boundary which covers that
+checkpoint.  It requires the matching durable control admission fence and WAL
+checkpoint record, then derives every XID, commit-ts, multixact-ID, and
+multixact-member horizon from that one control state.  It reconstructs the
+otherwise-unrecorded oldest member offset from the same `(C, R]` window, fails
+closed on a missing or inconsistent bound, cuts the store branch at the
+separate materialized LSN (avoiding exact-R admission-sequence ties), and reuses
+the prepared-manifest/store-branch idempotency protocol.  The legacy expert ABI
+remains available for compatibility.  Until the producer-side quiesce protocol
+lands, the control plane must keep the parent free of horizon-changing work
+between the selected checkpoint and that materialized boundary.
+
+The current demo still chooses and ships the base cutoff explicitly and copies
+a stopped parent data directory.  Completing this gate requires a brief SLRU
+write barrier (or another producer-side quiesce protocol) which captures and
+ships an exact-as-of snapshot under a proven cutoff, followed by a portable
+catalog/control bootstrap artifact.  The live SLRU watermark cannot substitute:
+its newest-image contract deliberately permits bytes newer than its completeness
+floor and is therefore unsafe as an exact branch seed.
 
 ### 4. Retention-driven space reclamation -- remaining
 
@@ -134,7 +148,8 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Automate proven-cutoff branch preparation and bootstrap inputs.
+1. Add producer-side proven-cutoff snapshot capture and portable catalog/control
+   bootstrap, building on the control-derived prepare operation.
 2. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
    and deleted timelines.
 3. Promote the golden scenario into the declarative crash/compatibility harness.

@@ -24,6 +24,17 @@ RETURNS record
 AS 'MODULE_PATHNAME', 'pagestore_materializer_status'
 LANGUAGE C PARALLEL RESTRICTED;
 
+CREATE FUNCTION pagestore_prepare_branch_from_control(
+    target_dir text,
+    new_timeline integer,
+    parent_timeline integer,
+    base_lsn pg_lsn,
+    checkpoint_redo pg_lsn,
+    fork_lsn pg_lsn)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pagestore_prepare_branch_from_control'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
 COMMENT ON FUNCTION pagestore_shipped_wal_lsn() IS
 'end of the durable WAL prefix available to this pagestore timeline';
 
@@ -35,3 +46,6 @@ COMMENT ON FUNCTION pagestore_materialized_wal_lsn() IS
 
 COMMENT ON FUNCTION pagestore_materializer_status() IS
 'store-observed materializer progress for writer-side control-plane monitoring';
+
+COMMENT ON FUNCTION pagestore_prepare_branch_from_control(text, integer, integer, pg_lsn, pg_lsn, pg_lsn) IS
+'idempotently prepare a materialized branch using bootstrap horizons derived from an exact durable checkpoint';

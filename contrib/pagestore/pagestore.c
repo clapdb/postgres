@@ -2567,6 +2567,79 @@ ps_wal_reaches(XLogRecPtr target)
 	return ps_local_wal_limit() >= target;
 }
 
+static bool
+ps_checkpoint_matches_control(const CheckPoint *record,
+							  const CheckPoint *control)
+{
+	return record->redo == control->redo &&
+		record->ThisTimeLineID == control->ThisTimeLineID &&
+		record->PrevTimeLineID == control->PrevTimeLineID &&
+		record->fullPageWrites == control->fullPageWrites &&
+		record->wal_level == control->wal_level &&
+		record->logicalDecodingEnabled == control->logicalDecodingEnabled &&
+		FullTransactionIdEquals(record->nextXid, control->nextXid) &&
+		record->nextOid == control->nextOid &&
+		record->nextMulti == control->nextMulti &&
+		record->nextMultiOffset == control->nextMultiOffset &&
+		record->oldestXid == control->oldestXid &&
+		record->oldestXidDB == control->oldestXidDB &&
+		record->oldestMulti == control->oldestMulti &&
+		record->oldestMultiDB == control->oldestMultiDB &&
+		record->time == control->time &&
+		record->oldestCommitTsXid == control->oldestCommitTsXid &&
+		record->newestCommitTsXid == control->newestCommitTsXid &&
+		record->oldestActiveXid == control->oldestActiveXid &&
+		record->dataChecksumState == control->dataChecksumState;
+}
+
+/*
+ * Resolve and verify the checkpoint record named by a mirrored control image.
+ * Its EndRecPtr is the earliest branch LSN which contains the complete record;
+ * comparing only against ControlFileData.checkPoint (the record start) would
+ * admit a cutoff in the middle of the record.
+ */
+static XLogRecPtr
+ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
+						 const CheckPoint *expected)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	XLogRecPtr	end = InvalidXLogRecPtr;
+	bool		matches = false;
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	XLogBeginRead(reader, checkpoint_lsn);
+	if (XLogReadRecord(reader, &errm) != NULL &&
+		reader->ReadRecPtr == checkpoint_lsn &&
+		XLogRecGetRmid(reader) == RM_XLOG_ID &&
+		((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE ||
+		 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN) &&
+		XLogRecGetDataLen(reader) == sizeof(CheckPoint) &&
+		ps_checkpoint_matches_control(
+			(const CheckPoint *) XLogRecGetData(reader), expected))
+	{
+		end = reader->EndRecPtr;
+		matches = true;
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	if (!matches)
+		ereport(ERROR,
+				(errmsg("mirrored control image has no matching readable checkpoint record"),
+				 errdetail("Expected checkpoint record at %X/%08X.",
+							   LSN_FORMAT_ARGS(checkpoint_lsn))));
+	return end;
+}
+
 /*
  * Replay (base_lsn, target_lsn] from the local WAL onto clog page 'pageno' in 'page':
  *  - XLOG_XACT_{COMMIT,ABORT}[_PREPARED]: set the top xid + subxids' status;
@@ -9314,38 +9387,161 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/*
- * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
- *                          base pg_lsn, target pg_lsn,
- *                          oldest_xid xid, next_xid xid,
- *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
- *                          oldest_multi xid, next_multi xid,
- *                          oldest_member bigint, next_member bigint)
- * returns bigint
- *
- * Control-plane bootstrap entrypoint for a branch-capable compute: materialize
- * branch SLRUs, fork the store timeline, and durably record the fork metadata in
- * the target datadir.  This is still intentionally pg_control-adjacent rather
- * than pg_control-editing: the manifest gives later bootstrap code one durable
- * protocol artifact to consume.
- */
-PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
-Datum
-pagestore_prepare_branch(PG_FUNCTION_ARGS)
+typedef struct PagestoreBranchHorizons
 {
-	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int32		new_tl = PG_GETARG_INT32(1);
-	int32		parent_tl = PG_GETARG_INT32(2);
-	XLogRecPtr	base = PG_GETARG_LSN(3);
-	XLogRecPtr	target = PG_GETARG_LSN(4);
-	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
-	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
-	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
-	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(8);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(9);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(10);
-	int64		oldest_member = PG_GETARG_INT64(11);
-	int64		next_member = PG_GETARG_INT64(12);
+	XLogRecPtr	checkpoint_end_lsn;
+	TransactionId oldest_xid;
+	TransactionId next_xid;
+	TransactionId oldest_commit_ts_xid;
+	TransactionId next_commit_ts_xid;
+	MultiXactId oldest_multi;
+	MultiXactId next_multi;
+	int64		oldest_member;
+	int64		next_member;
+} PagestoreBranchHorizons;
+
+/*
+ * Derive one complete SLRU bootstrap horizon from an exact, durably mirrored
+ * checkpoint.  A merely newest-at-or-below control image is insufficient:
+ * requiring both checkPointCopy.redo == target and the exact-redo admission
+ * fence prevents an older/still-unsynced control state from being blessed as
+ * the branch horizon source.
+ *
+ * The checkpoint contains every bound except the starting member offset of
+ * oldestMulti.  Reconstruct that one offsets entry from the exact base + WAL
+ * window which the seeders will consume.  If the oldest multixact does not
+ * exist because the range is empty, PostgreSQL defines its offset as the next
+ * free member offset.
+ */
+static void
+pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
+									   PagestoreBranchHorizons *h)
+{
+	ControlFileData control;
+	CheckPoint  *checkpoint = &control.checkPointCopy;
+	uint64		read_seq;
+	MultiXactOffset next_member;
+
+	if (target < base || XLogRecPtrIsInvalid(target))
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo is invalid or precedes the base cutoff")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (!ps_control_asof_timeout(target, &control,
+								 PAGESTORE_READER_HORIZON_TIMEOUT_MS) ||
+		checkpoint->redo != target)
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo is not exactly mirrored"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+							   LSN_FORMAT_ARGS(target))));
+	if (!pagestore_localsvc_read_fence_timeout(
+			(uint64) target, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo has no matching durable admission fence"),
+				 errdetail("Requested branch target is %X/%08X.",
+							   LSN_FORMAT_ARGS(target))));
+
+	/* READ_AT may race the control drain before its final sync. */
+	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+
+	memset(h, 0, sizeof(*h));
+	h->checkpoint_end_lsn = ps_checkpoint_record_end(control.checkPoint,
+												 checkpoint);
+	h->oldest_xid = checkpoint->oldestXid;
+	h->next_xid = XidFromFullTransactionId(checkpoint->nextXid);
+	if (!TransactionIdIsNormal(h->oldest_xid) ||
+		!TransactionIdIsNormal(h->next_xid) ||
+		TransactionIdFollows(h->oldest_xid, h->next_xid))
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid XID horizons [%u, %u)",
+						h->oldest_xid, h->next_xid)));
+
+	if (control.track_commit_timestamp)
+	{
+		TransactionId oldest = checkpoint->oldestCommitTsXid;
+		TransactionId newest = checkpoint->newestCommitTsXid;
+
+		if (!TransactionIdIsNormal(oldest) &&
+			!TransactionIdIsNormal(newest))
+		{
+			/* Active but with no timestamped XID yet: publish an empty era. */
+			h->oldest_commit_ts_xid = h->next_xid;
+			h->next_commit_ts_xid = h->next_xid;
+		}
+		else if (!TransactionIdIsNormal(oldest) ||
+				 !TransactionIdIsNormal(newest))
+			ereport(ERROR,
+					(errmsg("checkpoint has inconsistent commit-ts horizons [%u, %u]",
+							oldest, newest)));
+		else
+		{
+			h->oldest_commit_ts_xid = oldest;
+			h->next_commit_ts_xid = newest;
+			TransactionIdAdvance(h->next_commit_ts_xid);
+		}
+	}
+	/* Both InvalidTransactionId when commit-ts is inactive (memset above). */
+
+	h->oldest_multi = checkpoint->oldestMulti;
+	h->next_multi = checkpoint->nextMulti;
+	if (!MultiXactIdIsValid(h->oldest_multi) ||
+		!MultiXactIdIsValid(h->next_multi) ||
+		(h->oldest_multi != h->next_multi &&
+		 !MultiXactIdPrecedes(h->oldest_multi, h->next_multi)))
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid multixact horizons [%u, %u)",
+						h->oldest_multi, h->next_multi)));
+	next_member = checkpoint->nextMultiOffset;
+	if (next_member > PG_INT64_MAX)
+		ereport(ERROR,
+				(errmsg("checkpoint multixact member offset " UINT64_FORMAT
+						" exceeds the SQL bigint bootstrap limit",
+						(uint64) next_member)));
+	h->next_member = (int64) next_member;
+	if (h->oldest_multi == h->next_multi)
+		h->oldest_member = h->next_member;
+	else
+	{
+		int64		pageno = h->oldest_multi / PS_MXOFF_PER_PAGE;
+		int		entryno = h->oldest_multi % PS_MXOFF_PER_PAGE;
+		char	   *page = palloc(BLCKSZ);
+		MultiXactOffset oldest_member;
+
+		if (!ps_mxoff_reconstruct(page, pageno, base, target))
+			ereport(ERROR,
+					(errmsg("checkpoint oldest multixact %u was truncated at the checkpoint redo",
+							h->oldest_multi)));
+		memcpy(&oldest_member,
+			   page + (Size) entryno * sizeof(MultiXactOffset),
+			   sizeof(MultiXactOffset));
+		pfree(page);
+		/* Zero is an uninitialized offset slot, never a created multixact. */
+		if (oldest_member == 0 || oldest_member > PG_INT64_MAX)
+			ereport(ERROR,
+					(errmsg("checkpoint oldest multixact %u has no usable member offset",
+							h->oldest_multi)));
+		h->oldest_member = (int64) oldest_member;
+	}
+	if (h->oldest_member > h->next_member)
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid multixact member horizons [%lld, %lld)",
+						(long long) h->oldest_member,
+						(long long) h->next_member)));
+}
+
+static int64
+pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
+							  int32 parent_tl, XLogRecPtr base,
+							  XLogRecPtr target,
+							  TransactionId oldest_xid,
+							  TransactionId next_xid,
+							  TransactionId oldest_commit_ts_xid,
+							  TransactionId next_commit_ts_xid,
+							  MultiXactId oldest_multi,
+							  MultiXactId next_multi,
+							  int64 oldest_member, int64 next_member)
+{
 	int64		seeded;
 	char		manifest_path[MAXPGPATH];
 	int			pathlen;
@@ -9393,7 +9589,7 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	{
 		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 										 (uint64) target);
-		PG_RETURN_INT64(seeded);
+		return seeded;
 	}
 
 	/*
@@ -9443,7 +9639,109 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 									oldest_member, next_member,
 									seeded);
 
-	PG_RETURN_INT64(seeded);
+	return seeded;
+}
+
+/*
+ * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
+ *                          base pg_lsn, target pg_lsn,
+ *                          oldest_xid xid, next_xid xid,
+ *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
+ *                          oldest_multi xid, next_multi xid,
+ *                          oldest_member bigint, next_member bigint)
+ * returns bigint
+ *
+ * Legacy expert entrypoint.  Keep its ABI for existing operators and tests;
+ * new control-plane callers should use pagestore_prepare_branch_from_control.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
+Datum
+pagestore_prepare_branch(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	target = PG_GETARG_LSN(4);
+
+	PG_RETURN_INT64(pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
+											base, target,
+											PG_GETARG_TRANSACTIONID(5),
+											PG_GETARG_TRANSACTIONID(6),
+											PG_GETARG_TRANSACTIONID(7),
+											PG_GETARG_TRANSACTIONID(8),
+											PG_GETARG_TRANSACTIONID(9),
+											PG_GETARG_TRANSACTIONID(10),
+											PG_GETARG_INT64(11),
+											PG_GETARG_INT64(12)));
+}
+
+/*
+ * pagestore_prepare_branch_from_control(target_dir text, new_timeline int,
+ *                                       parent_timeline int, base pg_lsn,
+ *                                       checkpoint_redo pg_lsn,
+ *                                       fork_lsn pg_lsn) returns bigint
+ *
+ * Control-derived entrypoint: the caller supplies the proven exact base
+ * snapshot cutoff C, a durably mirrored checkpoint redo R, and a materialized
+ * fork boundary L which covers that completed checkpoint.  XID,
+ * commit-ts, multixact-ID and member-offset horizons all come from that same
+ * checkpoint/control state at R; the store branch is cut at L, where no
+ * admission-sequence tie remains.  Retrying the operation is idempotent
+ * through the same prepared-manifest and CREATE_BRANCH checks as the legacy
+ * entrypoint.  The control plane must keep the parent quiescent between the
+ * selected checkpoint and L; automatically establishing that quiesce together
+ * with the proven base snapshot is the remaining producer-side protocol.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_control);
+Datum
+pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
+	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
+	XLogRecPtr	materialized;
+	PagestoreBranchHorizons h;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to prepare a branch")));
+	pagestore_branch_horizons_from_control(base, checkpoint_redo, &h);
+	if (fork_lsn < h.checkpoint_end_lsn)
+		ereport(ERROR,
+				(errmsg("branch fork LSN does not cover the selected checkpoint"),
+				 errdetail("Fork %X/%08X precedes checkpoint record end %X/%08X.",
+							   LSN_FORMAT_ARGS(fork_lsn),
+							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
+	/*
+	 * The declared materializer can only fork at a restartpoint marker: that is
+	 * the point through which its replayed relation pages are durable.  Other
+	 * direct-write computes synchronously persist each routed page, including
+	 * pages whose WAL record is still in the current unarchived segment.  They
+	 * therefore need no materializer-watermark bound.
+	 */
+	if (pagestore_materializer)
+	{
+		materialized = pagestore_materialized_wal_lsn_internal();
+		if (fork_lsn > materialized)
+			ereport(ERROR,
+					(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+					 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
+							   LSN_FORMAT_ARGS(fork_lsn),
+							   LSN_FORMAT_ARGS(materialized))));
+	}
+
+	PG_RETURN_INT64(pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
+											base, fork_lsn,
+											h.oldest_xid, h.next_xid,
+											h.oldest_commit_ts_xid,
+											h.next_commit_ts_xid,
+											h.oldest_multi, h.next_multi,
+											h.oldest_member, h.next_member));
 }
 
 /*

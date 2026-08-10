@@ -217,9 +217,6 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 "${WP[@]}" -c "CREATE EXTENSION pagestore;
 	CREATE FUNCTION pagestore_ship_slru_snapshot(text, pg_lsn) RETURNS bigint
 	 AS 'pagestore','pagestore_ship_slru_snapshot' LANGUAGE C STRICT;
-	CREATE FUNCTION pagestore_prepare_branch(text, int, int, pg_lsn, pg_lsn,
-	 xid, xid, xid, xid, xid, xid, bigint, bigint) RETURNS bigint
-	 AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
 	CREATE FUNCTION pagestore_install_prepared_branch(text, text, int, int,
 	 pg_lsn) RETURNS void
 	 AS 'pagestore','pagestore_install_prepared_branch' LANGUAGE C STRICT;
@@ -252,8 +249,8 @@ base_lsn=$("${WP[@]}" -c "SELECT pg_current_wal_lsn();") ||
 checkpoint_lsn=$("${WP[@]}" -c "CHECKPOINT;
 	SELECT pg_current_wal_lsn();" | tail -1) ||
 	fail "could not establish the workload checkpoint"
-next_xid=$("${WP[@]}" -c "SELECT pg_snapshot_xmax(pg_current_snapshot());") ||
-	fail "could not capture the branch xid horizon"
+checkpoint_redo=$("${WP[@]}" -c "SELECT redo_lsn FROM pg_control_checkpoint();") ||
+	fail "could not capture the workload checkpoint redo"
 archive_current_wal || fail "fork WAL did not reach pagestore"
 wait_materializer_note 1 before_fork ||
 	fail "materializer did not produce the fork-visible page"
@@ -279,9 +276,8 @@ assert_eq "$("${WP[@]}" -c "SELECT position('note'::bytea in
 	pagestore_read_at('pg_attribute', 0, '$attblock', '$fork_lsn')) > 0;")" \
 	"t" "materialized catalog page is visible at the fork LSN"
 
-seeded=$("${WP[@]}" -c "SELECT pagestore_prepare_branch('$PREPARED', 1, 0,
-	'$base_lsn', '$fork_lsn', '3'::xid, '$next_xid'::xid,
-	'1'::xid, '1'::xid, '1'::xid, '1'::xid, 0, 0);") ||
+seeded=$("${WP[@]}" -c "SELECT pagestore_prepare_branch_from_control(
+	'$PREPARED', 1, 0, '$base_lsn', '$checkpoint_redo', '$fork_lsn');") ||
 	fail "branch preparation failed"
 [ "${seeded:-0}" -gt 0 ] || fail "branch preparation seeded no SLRU pages"
 echo "ok   - branch prepared at the materialized fork ($seeded SLRU page(s))"
