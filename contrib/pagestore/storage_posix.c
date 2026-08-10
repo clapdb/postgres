@@ -813,8 +813,15 @@ posix_meta_rewrite(const void *buf, uint32_t len)
 			goto out;
 		off += (uint32_t) n;
 	}
-	if (fsync(fd) != 0 || close(fd) != 0)
-		goto out_closed;
+	if (fsync(fd) != 0)
+		goto out;
+	/* A failing close leaves the descriptor's state unspecified; do not retry
+	 * it in cleanup, but still remove the uncommitted temporary file. */
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto out;
+	}
 	fd = -1;
 	if (rename(tmp, path) != 0)
 		goto out;
@@ -832,7 +839,6 @@ out:
 		close(dfd);
 	if (rc != 0)
 		unlink(tmp);
-out_closed:
 	pthread_mutex_unlock(&posix_log_lock);
 	return rc;
 }
