@@ -10620,6 +10620,9 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	materialized;
 	PagestoreBranchHorizons h;
 	int64		seeded;
+	char		bootstrap_path[MAXPGPATH];
+	PagestoreBranchBootstrapHeader *existing_header;
+	char	   *existing;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -10671,10 +10674,31 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	 * that exact manifest.  The target installer still publishes the ordinary
 	 * branch manifest last.
 	 */
-	pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
-								 checkpoint_redo,
-								 h.checkpoint_end_lsn, fork_lsn,
-								 h.system_identifier);
+	if (snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s", target_dir,
+				 PAGESTORE_BRANCH_BOOTSTRAP_FILE) >= (int) sizeof(bootstrap_path))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch bootstrap path is too long")));
+	if (access(bootstrap_path, F_OK) == 0)
+	{
+		/* A retry must retain the relation maps captured at the original fork;
+		 * recapturing live parent maps can name filenodes absent on the child. */
+		existing = pagestore_load_branch_bootstrap(target_dir, new_tl,
+			parent_tl, checkpoint_redo, h.checkpoint_end_lsn, fork_lsn,
+			&existing_header);
+
+		pfree(existing);
+	}
+	else if (errno == ENOENT)
+		pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
+									checkpoint_redo,
+									h.checkpoint_end_lsn, fork_lsn,
+									h.system_identifier);
+	else
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not inspect branch bootstrap artifact \"%s\": %m",
+						bootstrap_path)));
 	PG_RETURN_INT64(seeded);
 }
 
