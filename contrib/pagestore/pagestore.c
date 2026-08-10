@@ -9720,21 +9720,20 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	/*
 	 * The declared materializer can only fork at a restartpoint marker: that is
 	 * the point through which its replayed relation pages are durable.  Other
-	 * direct-write or recovery computes have no such replay dependency.  Their local service
-	 * synchronously persists each routed page, so its contiguous durable WAL end
-	 * is the applicable bound.  In particular, do not let an old marker left by
-	 * an earlier recovery compute constrain a direct-write parent.
+	 * direct-write computes synchronously persist each routed page, including
+	 * pages whose WAL record is still in the current unarchived segment.  They
+	 * therefore need no materializer-watermark bound.
 	 */
 	if (pagestore_materializer)
+	{
 		materialized = pagestore_materialized_wal_lsn_internal();
-	else
-		materialized = pagestore_localsvc_wal_end();
-	if (fork_lsn > materialized)
-		ereport(ERROR,
-				(errmsg("branch fork LSN exceeds the durable materialized horizon"),
-				 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
-						   LSN_FORMAT_ARGS(fork_lsn),
-						   LSN_FORMAT_ARGS(materialized))));
+		if (fork_lsn > materialized)
+			ereport(ERROR,
+					(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+					 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
+							   LSN_FORMAT_ARGS(fork_lsn),
+							   LSN_FORMAT_ARGS(materialized))));
+	}
 
 	PG_RETURN_INT64(pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 											base, fork_lsn,
