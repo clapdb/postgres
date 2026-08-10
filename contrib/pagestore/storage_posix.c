@@ -783,7 +783,7 @@ static int
 posix_meta_rewrite(const void *buf, uint32_t len)
 {
 	char path[4096], tmp[4096];
-	int fd = -1, rc = -1;
+	int fd = -1, dfd = -1, rc = -1;
 	ssize_t n;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
@@ -806,10 +806,18 @@ posix_meta_rewrite(const void *buf, uint32_t len)
 	fd = -1;
 	if (rename(tmp, path) != 0)
 		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 || fsync(dfd) != 0)
+		goto out;
+	if (close(dfd) != 0)
+		goto out;
+	dfd = -1;
 	rc = 0;
 out:
 	if (fd >= 0)
 		close(fd);
+	if (dfd >= 0)
+		close(dfd);
 	if (rc != 0)
 		unlink(tmp);
 out_closed:
