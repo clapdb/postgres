@@ -90,8 +90,13 @@ read pages at an LSN.
      worker.  Any pre-existing partial segment can finish.  Markers and latches
      are timeline-bound, so child timelines reject inherited parent progress.
      PostgreSQL's normal archive retry loop selects a new release checkpoint
-     only after the marker advances.  Production worker provisioning and
-     restartpoint/restart policy remain control-plane work.
+     only after the marker advances.  The installed POSIX
+     `pagestore_materializer_supervisor` now owns the restartpoint/restart
+     policy for one provisioned PGDATA, fences duplicate owners, bounds retry,
+     and publishes atomic progress/failure status.  `materializer_smoke` proves
+     owner handoff with healthy-worker adoption, duplicate rejection, and crash
+     replacement while later WAL still reaches zero lag.  Initial worker
+     provisioning remains deployment orchestration.
    - **3c** Materialize-on-demand: when a read misses a page at an LSN, drive
      redo for just that page (Neon's per-page model) instead of replaying
      everything.

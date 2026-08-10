@@ -27,6 +27,18 @@ install_data(
   kwargs: contrib_data_args,
 )
 
+if host_system != 'windows'
+  # The recovery worker is an ordinary PostgreSQL process; this small
+  # stdlib-only POSIX control-plane process owns its lifecycle and publishes
+  # machine-readable state.
+  install_data(
+    'pagestore_materializer_supervisor.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_materializer_supervisor',
+  )
+endif
+
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
@@ -176,6 +188,14 @@ test('pagestore_harness_plan',
   suite: ['pagestore'],
   timeout: 30,
 )
+if host_system != 'windows'
+  test('pagestore_materializer_supervisor',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_materializer_supervisor.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endif
 test('pagestore_harness_reader_visibility_plan',
   pagestore_harness_python,
   args: [files('harness/pagestore_harness.py'),

@@ -1,0 +1,210 @@
+import contextlib
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+PAGESTORE_ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location(
+    "pagestore_materializer_supervisor",
+    PAGESTORE_ROOT / "pagestore_materializer_supervisor.py",
+)
+MODULE = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class SupervisorTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "PG_VERSION").write_text("19\n", encoding="utf-8")
+
+    def config_value(self, **overrides):
+        value = {
+            "schema": 1,
+            "pg_ctl": sys.executable,
+            "psql": sys.executable,
+            "data_dir": str(self.data),
+            "socket_dir": str(self.root / "socket"),
+            "port": 5432,
+            "log_file": str(self.root / "log" / "materializer.log"),
+            "state_dir": str(self.root / "state"),
+            "poll_interval_ms": 1,
+            "retry_initial_ms": 1,
+            "retry_max_ms": 2,
+            "max_consecutive_failures": 3,
+        }
+        value.update(overrides)
+        return value
+
+    def write_config(self, **overrides):
+        path = self.root / "supervisor.json"
+        path.write_text(
+            json.dumps(self.config_value(**overrides)) + "\n", encoding="utf-8"
+        )
+        return path
+
+    def test_config_is_strict_and_prepares_private_state(self):
+        config = MODULE.Config.load(self.write_config())
+        self.assertEqual(config.port, 5432)
+        self.assertTrue(config.socket_dir.is_dir())
+        self.assertTrue(config.state_dir.is_dir())
+        self.assertTrue(config.log_file.parent.is_dir())
+
+        with self.assertRaisesRegex(MODULE.ConfigError, "unknown.*typo"):
+            MODULE.Config.load(self.write_config(typo=True))
+        with self.assertRaisesRegex(MODULE.ConfigError, "must be absolute"):
+            MODULE.Config.load(self.write_config(state_dir="relative"))
+        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 1"):
+            MODULE.Config.load(self.write_config(schema=True))
+
+    def test_lsn_and_backoff_helpers(self):
+        self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
+        with self.assertRaisesRegex(ValueError, "invalid PostgreSQL LSN"):
+            MODULE.parse_lsn("not-an-lsn")
+
+        config = MODULE.Config.load(self.write_config())
+        self.assertEqual(MODULE.retry_delay_ms(config, 1), 1)
+        self.assertEqual(MODULE.retry_delay_ms(config, 2), 2)
+        self.assertEqual(MODULE.retry_delay_ms(config, 20), 2)
+
+    def test_owner_lock_rejects_a_duplicate(self):
+        first_config = MODULE.Config.load(self.write_config())
+        second_config = MODULE.Config.load(
+            self.write_config(state_dir=str(self.root / "other-state"))
+        )
+        self.assertEqual(first_config.lock_file, second_config.lock_file)
+        first = MODULE.OwnerLock(first_config.lock_file)
+        second = MODULE.OwnerLock(second_config.lock_file)
+        first.acquire()
+        self.addCleanup(first.close)
+        with self.assertRaisesRegex(MODULE.OwnershipError, "another.*owns"):
+            second.acquire()
+
+    def test_duplicate_main_returns_temporary_failure(self):
+        config_path = self.write_config()
+        config = MODULE.Config.load(config_path)
+        with MODULE.OwnerLock(config.lock_file):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    MODULE.main(["--config", str(config_path)]), MODULE.EX_TEMPFAIL
+                )
+
+    def test_status_update_is_atomic_and_carries_epochs(self):
+        config = MODULE.Config.load(self.write_config())
+        MODULE.atomic_write_json(
+            config.status_file,
+            {"owner_epoch": 4, "worker_generation": 7},
+        )
+        supervisor = MODULE.Supervisor(config)
+        self.assertEqual(supervisor.owner_epoch, 5)
+        self.assertEqual(supervisor.generation, 7)
+
+        supervisor.publish("running", reason="test")
+        status = json.loads(config.status_file.read_text(encoding="utf-8"))
+        self.assertEqual(status["schema"], MODULE.STATUS_SCHEMA)
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["reason"], "test")
+
+    def test_start_failures_retry_to_the_configured_bound(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class AlwaysFailingSupervisor(MODULE.Supervisor):
+            def __init__(self, supervisor_config):
+                super().__init__(supervisor_config)
+                self.starts = 0
+
+            def worker_running(self):
+                return False
+
+            def start_worker(self, reason):
+                self.starts += 1
+                raise RuntimeError(f"start {self.starts} failed: {reason}")
+
+        class Owner:
+            def publish_owner(self, _pid, _epoch):
+                pass
+
+        supervisor = AlwaysFailingSupervisor(config)
+        self.assertEqual(supervisor.run(Owner()), 1)
+        self.assertEqual(supervisor.starts, config.max_consecutive_failures)
+        status = json.loads(config.status_file.read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(
+            status["consecutive_failures"], config.max_consecutive_failures
+        )
+
+    def test_restartpoint_without_new_checkpoint_is_retried(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class StalledSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return MODULE.Progress("0/2", "0/2", "0/1", 1)
+
+        supervisor = StalledSupervisor(config)
+        for failure in range(1, config.max_consecutive_failures + 1):
+            supervisor.restart_baseline = 1
+            supervisor.restart_deadline = 0
+            keep_running = supervisor.observe_progress(float(failure))
+            self.assertTrue(keep_running)
+        self.assertEqual(supervisor.failures, 0)
+
+    def test_missing_progress_api_reaches_the_configured_bound(self):
+        config = MODULE.Config.load(self.write_config(progress_timeout_ms=1))
+
+        class MissingProgressSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return None
+
+        supervisor = MissingProgressSupervisor(config)
+        supervisor.progress_api_wait_started = 0
+        for failure in range(1, config.max_consecutive_failures + 1):
+            supervisor.retry_not_before = 0
+            keep_running = supervisor.observe_progress(float(failure))
+            self.assertEqual(keep_running, failure < config.max_consecutive_failures)
+        self.assertEqual(supervisor.failures, config.max_consecutive_failures)
+
+    def test_missing_progress_api_honors_retry_backoff(self):
+        config = MODULE.Config.load(self.write_config(progress_timeout_ms=1))
+
+        class MissingProgressSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return None
+
+        supervisor = MissingProgressSupervisor(config)
+        supervisor.progress_api_wait_started = 0
+        supervisor.retry_not_before = 2
+        self.assertTrue(supervisor.observe_progress(1))
+        self.assertEqual(supervisor.failures, 0)
+
+        supervisor.retry_not_before = 0
+        self.assertTrue(supervisor.observe_progress(1))
+        self.assertEqual(supervisor.failures, 1)
+
+    def test_restartpoint_progress_resets_lag_timer(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class RestartedSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return MODULE.Progress("0/4", "0/3", "0/1", 1)
+
+        supervisor = RestartedSupervisor(config)
+        supervisor.restart_baseline = 0
+        supervisor.lag_started_at = 0
+        supervisor.last_replay = 4
+        supervisor.observe_progress(10)
+        self.assertEqual(supervisor.restart_baseline, None)
+        self.assertEqual(supervisor.lag_started_at, 10)
+
+
+if __name__ == "__main__":
+    unittest.main()

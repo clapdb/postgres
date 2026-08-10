@@ -172,16 +172,41 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     limit was enabled.  All progress records carry the logical timeline, so a
     branch cannot inherit its parent's marker or latch.  PostgreSQL's archive
     retry loop resumes shipping when the marker selects the next release
-    checkpoint.  The `materializer_smoke` harness runtime now provisions the
-    pair, drives checkpoint-to-marker progress, records worker generations, and
-    replaces a crashed worker.  Promoting that proven lifecycle contract into
-    a continuously running, ownership-fenced production controller remains
-    control-plane work.
+    checkpoint.  `pagestore_materializer_supervisor` now continuously drives
+    checkpoint-to-marker progress for one provisioned worker, records owner and
+    worker generations, fences duplicate owners, applies bounded retry, and
+    replaces a crashed worker.  `materializer_smoke` provisions the pair and
+    acts as its acceptance client.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is
   the recovery worker. Promoting it to an explicit interface (inline /
   local-worker / serverless) is the abstraction this doc commits to.
+
+## Local materializer supervisor
+
+Meson installs the POSIX foreground service as
+`pagestore_materializer_supervisor`.  It accepts `--config PATH`; the strict
+schema-1 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
+`socket_dir`, `log_file`, and `state_dir` paths plus a PostgreSQL `port`.
+Optional fields select `database`, `user`, polling/replay-idle/progress timeout
+intervals, command timeout, exponential retry bounds, and the maximum
+consecutive failure count.  `--check-config` validates and prepares the runtime
+directories without taking ownership.
+
+The nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
+`state_dir` cannot create a second owner for the same worker.  Lock contention
+exits with status 75; invalid configuration exits with 78.  The lock contents
+are diagnostic only—the held `flock` is authoritative.
+
+`state_dir/status.json` is replaced atomically after fsync and reports schema,
+state, owner PID/epoch, worker generation, consecutive failures, last error,
+timestamps, and the last replay/shipped/materialized LSNs and lag.  Normal
+service-manager termination releases ownership but deliberately leaves a
+healthy PostgreSQL worker running; the next owner increments its epoch and
+adopts that worker.  Startup, health, missing progress API, restartpoint, and
+replacement failures share bounded exponential retry.  Exhaustion publishes
+`failed` and exits nonzero for the outer service manager to handle.
 
 ## Why this shape (vs Neon read-time redo)
 
