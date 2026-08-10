@@ -5632,6 +5632,8 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
+	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
