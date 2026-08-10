@@ -9718,6 +9718,10 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
 	materialized = pagestore_materialized_wal_lsn_internal();
+	/* Direct-write deployments have no materializer marker; their WAL end is
+	 * committed only after the same localsvc has durably accepted the pages. */
+	if (XLogRecPtrIsInvalid(materialized))
+		materialized = pagestore_localsvc_wal_end();
 	if (fork_lsn > materialized)
 		ereport(ERROR,
 				(errmsg("branch fork LSN exceeds the durable materialized horizon"),
