@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -245,7 +246,11 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
+            try:
+                os.fsync(directory_fd)
+            except OSError as error:
+                if error.errno not in (errno.EBADF, errno.EINVAL):
+                    raise
         finally:
             os.close(directory_fd)
     finally:
@@ -400,7 +405,7 @@ class Supervisor:
 
     def worker_healthy(self) -> bool:
         try:
-            expected_data_dir = str(self.config.data_dir.resolve()).replace("'", "''")
+            expected_data_dir = str(self.config.data_dir).replace("'", "''")
             return (
                 self.psql(
                     "SELECT pg_is_in_recovery() AND "
@@ -423,10 +428,12 @@ class Supervisor:
                 if not schema:
                     return None
                 self.progress_schema = '"' + schema.replace('"', '""') + '"'
+                regprocedure = (
+                    self.progress_schema + ".pagestore_shipped_wal_lsn()"
+                ).replace("'", "''")
                 self.progress_api_ready = (
                     self.psql(
-                        "SELECT to_regprocedure('" + self.progress_schema +
-                        ".pagestore_shipped_wal_lsn()') "
+                        "SELECT to_regprocedure('" + regprocedure + "') "
                         "IS NOT NULL"
                     )
                     == "t"
@@ -459,9 +466,9 @@ class Supervisor:
     def start_worker(self, reason: str) -> None:
         self.publish("starting", reason=reason)
         self.pg_ctl("-l", str(self.config.log_file), "-w", "start")
+        self.generation += 1
         if not self.worker_healthy():
             raise RuntimeError("materializer failed its recovery-role health check")
-        self.generation += 1
         self.publish("running", reason=reason)
 
     def stop_worker(self, mode: str, reason: str) -> None:
@@ -531,6 +538,10 @@ class Supervisor:
             return True
         if progress.replay_int <= progress.materialized_int:
             if now - self.replay_changed_at >= self.config.progress_timeout_ms / 1000:
+                if now < self.retry_not_before:
+                    self.publish("catching_up")
+                    return True
+                self.replay_changed_at = now
                 return self.record_failure(
                     "replay did not advance beyond the materialized watermark"
                 )
