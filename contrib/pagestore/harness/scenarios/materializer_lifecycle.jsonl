@@ -1,0 +1,10 @@
+{"schema":1,"scenario":"materializer-lifecycle","seed":1,"contracts":["lifecycle","wal_materialization","durability"],"case":{"storage":"posix","shards":1,"compute":["writer","materializer"]}}
+{"op":"sql","id":"first-write","target":"writer","sql":"CREATE TABLE managed_materializer(id int primary key, v text); INSERT INTO managed_materializer VALUES (1, 'before-crash')"}
+{"op":"checkpoint","id":"first-boundary","target":"writer","name":"R1"}
+{"op":"assert","id":"first-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM managed_materializer WHERE id=1","expect":"before-crash"}
+{"op":"crash","id":"worker-crash","target":"materializer","model":"compute"}
+{"op":"assert","id":"replacement-in-recovery","target":"materializer","oracle":"sql_scalar","sql":"SELECT pg_is_in_recovery() AND current_setting('pagestore.materializer')::boolean","expect":"t"}
+{"op":"sql","id":"second-write","target":"writer","sql":"UPDATE managed_materializer SET v='after-replacement' WHERE id=1"}
+{"op":"checkpoint","id":"second-boundary","target":"writer","name":"R2"}
+{"op":"assert","id":"replacement-materialized","target":"materializer","oracle":"sql_scalar","sql":"SELECT v FROM managed_materializer WHERE id=1","expect":"after-replacement"}
+{"op":"assert","id":"writer-sees-zero-lag","target":"writer","oracle":"sql_scalar","sql":"SELECT lag_bytes = 0 FROM pagestore_materializer_status()","expect":"t"}

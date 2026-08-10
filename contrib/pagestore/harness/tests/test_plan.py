@@ -295,6 +295,54 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), capabilities, "writer_smoke"
             )
 
+    def test_materializer_runtime_accepts_managed_lifecycle(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "sql", "id": "write", "target": "writer",
+             "sql": "SELECT 1"},
+            {"op": "checkpoint", "id": "boundary", "target": "writer",
+             "name": "R"},
+            {"op": "crash", "id": "replace", "target": "materializer",
+             "model": "compute"},
+            {"op": "assert", "id": "healthy", "target": "materializer",
+             "oracle": "sql_scalar", "sql": "SELECT 1", "expect": "1"},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+        MODULE.validate_runtime_plan(
+            MODULE.read_plan(path), capabilities, "materializer_smoke"
+        )
+
+    def test_materializer_runtime_requires_exact_topology(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([self.header()])
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "requires exactly writer and materializer"
+        ):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "materializer_smoke"
+            )
+
+    def test_materializer_runtime_rejects_duplicate_compute_roles(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer", "materializer"]
+        path = self.write_plan([header])
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "requires exactly writer and materializer"
+        ):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "materializer_smoke"
+            )
+
+    def test_postgresql_conf_string_escapes_path_characters(self):
+        self.assertEqual(
+            MODULE.postgresql_conf_string("/tmp/alice's\\socket"),
+            "'/tmp/alice''s\\\\socket'",
+        )
+
     def test_writer_runtime_requires_reader_artifacts_before_install(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
@@ -974,6 +1022,36 @@ class PlanValidationTests(unittest.TestCase):
                 self.assertNotEqual(raised.exception.code, 0)
                 self.assertIn("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary",
                               stderr.getvalue())
+
+    def test_materializer_smoke_requires_runtime_binaries_and_build_dir(self):
+        prerequisites = [
+            ("--build-dir", "build"),
+            ("--daemon-binary", "daemon"),
+            ("--inspect-binary", "inspect"),
+        ]
+        base_args = [
+            "--capabilities", str(ROOT / "capabilities.json"),
+            "--materializer-smoke",
+            str(ROOT / "scenarios" / "materializer_lifecycle.jsonl"),
+        ]
+
+        for missing, _ in prerequisites:
+            with self.subTest(missing=missing):
+                args = list(base_args)
+                for option, value in prerequisites:
+                    if option != missing:
+                        args.extend([option, value])
+
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        MODULE.parse_args(args)
+
+                self.assertNotEqual(raised.exception.code, 0)
+                self.assertIn(
+                    "--materializer-smoke requires --build-dir, "
+                    "--daemon-binary and --inspect-binary",
+                    stderr.getvalue(),
+                )
 
     def test_legacy_integration_is_captured_in_a_bundle(self):
         directory = tempfile.TemporaryDirectory()

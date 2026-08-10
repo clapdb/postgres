@@ -26,12 +26,24 @@
       "protocol_version": 25,
       "page_size": 8192,
       "io_unit": 262144
+    },
+    "materializer_smoke": {
+      "operations": ["sql", "checkpoint", "crash", "assert"],
+      "constraints": {
+        "sql": {"target": ["writer"], "forbidden_fields": ["expect_error", "expect_sqlstate"]},
+        "checkpoint": {"target": ["writer"]},
+        "crash": {"target": ["materializer"], "model": ["compute"], "forbidden_fields": ["fault"]},
+        "assert": {"target": ["writer", "materializer"], "oracle": ["sql_scalar"]}
+      },
+      "protocol_version": 25,
+      "page_size": 8192,
+      "io_unit": 262144
     }
   },
   "storage": ["posix"],
   "postgres_major": [13, 14, 15, 16, 17, 18, 19],
   "shards": [1],
-  "compute": ["writer", "reader", "branch"],
+  "compute": ["writer", "reader", "branch", "materializer"],
   "crash_models": ["power_loss", "compute", "process_abort"],
   "operations": [
     "sql",
