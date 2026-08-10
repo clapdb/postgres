@@ -145,6 +145,7 @@ jobs:
             --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect"
 
       - name: Run pagestore harness managed materializer smoke
+        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \

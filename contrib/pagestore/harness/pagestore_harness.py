@@ -13,6 +13,7 @@ import errno
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -1475,6 +1476,11 @@ def run_materializer_smoke(
         )
         materializer_data.chmod(0o700)
         archive_current_wal()
+        restore_command = (
+            f"{shlex.quote(str(walrestore))} --shm {shlex.quote(str(shm))} "
+            "--timeline 0 --segsize 16777216 %f %p"
+        )
+        restore_command_setting = restore_command.replace("\\", "\\\\").replace("'", "''")
         with (materializer_data / "postgresql.conf").open(
             "a", encoding="utf-8"
         ) as config:
@@ -1486,8 +1492,7 @@ def run_materializer_smoke(
                 "listen_addresses = ''\n"
                 f"unix_socket_directories = '{materializer_socket}'\n"
                 f"port = {materializer_port}\n"
-                f"restore_command = '{walrestore} --shm {shm} --timeline 0 "
-                "--segsize 16777216 %f %p'\n"
+                f"restore_command = '{restore_command_setting}'\n"
             )
         (materializer_data / "standby.signal").touch()
         for wal_path in (materializer_data / "pg_wal").glob("0000000*"):
