@@ -9718,14 +9718,14 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
 	/*
-	 * A recovery materializer can only fork at a restartpoint marker: that is
-	 * the point through which its replayed relation pages are durable.  A normal
-	 * direct-write parent has no such replay dependency.  Its local service
+	 * The declared materializer can only fork at a restartpoint marker: that is
+	 * the point through which its replayed relation pages are durable.  Other
+	 * direct-write or recovery computes have no such replay dependency.  Their local service
 	 * synchronously persists each routed page, so its contiguous durable WAL end
 	 * is the applicable bound.  In particular, do not let an old marker left by
 	 * an earlier recovery compute constrain a direct-write parent.
 	 */
-	if (RecoveryInProgress())
+	if (pagestore_materializer)
 		materialized = pagestore_materialized_wal_lsn_internal();
 	else
 		materialized = pagestore_localsvc_wal_end();
