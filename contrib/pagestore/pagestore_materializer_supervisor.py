@@ -357,22 +357,22 @@ class Supervisor:
         atomic_write_json(self.config.status_file, status)
 
     def command(
-        self, command: list[str], check: bool = False
+        self, command: list[str], check: bool = False, timeout: int | None = None
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command,
             check=check,
             capture_output=True,
             encoding="utf-8",
-            timeout=self.config.command_timeout_seconds,
+            timeout=self.config.command_timeout_seconds if timeout is None else timeout,
         )
 
     def pg_ctl(
-        self, *arguments: str, check: bool = True
+        self, *arguments: str, check: bool = True, timeout: int | None = None
     ) -> subprocess.CompletedProcess[str]:
         return self.command(
             [str(self.config.pg_ctl), "-D", str(self.config.data_dir), *arguments],
-            check=check,
+            check=check, timeout=timeout,
         )
 
     def psql(self, sql: str) -> str:
@@ -473,7 +473,10 @@ class Supervisor:
 
     def stop_worker(self, mode: str, reason: str) -> None:
         self.publish("stopping", mode=mode, reason=reason)
-        self.pg_ctl("-m", mode, "-w", "stop")
+        self.pg_ctl(
+            "-m", mode, "-w", "stop",
+            timeout=max(self.config.command_timeout_seconds, 60),
+        )
 
     def restart_for_progress(self) -> None:
         assert self.progress is not None
@@ -516,8 +519,9 @@ class Supervisor:
             return True
         self.progress = progress
         self.progress_api_wait_started = now
-        self.failures = 0
-        self.last_error = None
+        if self.last_error == "materializer progress API did not become available":
+            self.failures = 0
+            self.last_error = None
 
         if self.restart_baseline is not None:
             if progress.materialized_int > self.restart_baseline:
