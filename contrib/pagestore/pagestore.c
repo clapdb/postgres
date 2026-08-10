@@ -9703,6 +9703,7 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	base = PG_GETARG_LSN(3);
 	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
+	XLogRecPtr	materialized;
 	PagestoreBranchHorizons h;
 
 	if (!superuser())
@@ -9716,6 +9717,13 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 				 errdetail("Fork %X/%08X precedes checkpoint record end %X/%08X.",
 							   LSN_FORMAT_ARGS(fork_lsn),
 							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
+	materialized = pagestore_materialized_wal_lsn_internal();
+	if (fork_lsn > materialized)
+		ereport(ERROR,
+				(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+				 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
+						   LSN_FORMAT_ARGS(fork_lsn),
+						   LSN_FORMAT_ARGS(materialized))));
 
 	PG_RETURN_INT64(pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
 											base, fork_lsn,
