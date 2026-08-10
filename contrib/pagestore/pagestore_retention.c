@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pagestore_retention.h"
@@ -56,7 +57,36 @@ static uint32_t retention_npins;
 static uint32_t retention_cap;
 static uint64_t retention_nrecords;
 static int retention_is_poisoned;
+static struct timespec retention_compact_retry_at;
 static pthread_mutex_t retention_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define PS_RETENTION_COMPACT_RETRY_MS 1000
+
+static int
+retention_compact_retry_ready(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return 0;
+	return now.tv_sec > retention_compact_retry_at.tv_sec ||
+		(now.tv_sec == retention_compact_retry_at.tv_sec &&
+		 now.tv_nsec >= retention_compact_retry_at.tv_nsec);
+}
+
+static void
+retention_defer_compact(void)
+{
+	if (clock_gettime(CLOCK_MONOTONIC, &retention_compact_retry_at) != 0)
+		return;
+	retention_compact_retry_at.tv_nsec +=
+		(long) PS_RETENTION_COMPACT_RETRY_MS * 1000000L;
+	if (retention_compact_retry_at.tv_nsec >= 1000000000L)
+	{
+		retention_compact_retry_at.tv_sec++;
+		retention_compact_retry_at.tv_nsec -= 1000000000L;
+	}
+}
 
 static uint32_t
 retention_fnv1a(uint32_t h, const void *data, size_t len)
@@ -481,7 +511,8 @@ ps_retention_should_compact(void)
 
 	pthread_mutex_lock(&retention_lock);
 	should = !retention_is_poisoned && retention_nrecords >= 64 &&
-		retention_nrecords > 4 * ((uint64_t) retention_npins + 1);
+		retention_nrecords > 4 * ((uint64_t) retention_npins + 1) &&
+		retention_compact_retry_ready();
 	pthread_mutex_unlock(&retention_lock);
 	return should;
 }
@@ -529,12 +560,15 @@ ps_retention_compact(void)
 		goto done;
 	}
 	retention_nrecords = retention_npins;
+	memset(&retention_compact_retry_at, 0, sizeof(retention_compact_retry_at));
 	rc = 0;
 done:
 	if (fd >= 0)
 		close(fd);
 	if (rc != 0 && tmp[0] != '\0')
 		unlink(tmp);
+	if (rc != 0 && !retention_is_poisoned)
+		retention_defer_compact();
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
