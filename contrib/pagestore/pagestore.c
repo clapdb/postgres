@@ -9516,8 +9516,8 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 			   page + (Size) entryno * sizeof(MultiXactOffset),
 			   sizeof(MultiXactOffset));
 		pfree(page);
-		/* Offset zero is the first valid member offset in a new cluster. */
-		if (oldest_member > PG_INT64_MAX)
+		/* Zero is an uninitialized offset slot, never a created multixact. */
+		if (oldest_member == 0 || oldest_member > PG_INT64_MAX)
 			ereport(ERROR,
 					(errmsg("checkpoint oldest multixact %u has no usable member offset",
 							h->oldest_multi)));
