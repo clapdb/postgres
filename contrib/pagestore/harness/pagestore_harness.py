@@ -1228,6 +1228,11 @@ def run_materializer_smoke(
     """Provision and supervise a WAL-only writer/materializer pair."""
     pg_bin = find_pg_bin(build)
     postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
+    if postgres_major < 15:
+        raise PlanError(
+            "materializer_smoke requires PostgreSQL 15 or newer: "
+            "archive_library is unavailable on older releases"
+        )
     profile = runtime_capabilities(capabilities, "materializer_smoke")
     recovery_settings = (
         "recovery_prefetch = try\n" if postgres_major >= 15 else ""
