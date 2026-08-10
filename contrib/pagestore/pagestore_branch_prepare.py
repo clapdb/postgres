@@ -250,6 +250,11 @@ class Config:
             strings[field] = item
 
         paths["writer_log_file"].parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_fd = os.open(paths["writer_log_file"], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            os.close(log_fd)
+        except OSError as error:
+            raise ConfigError(f"writer_log_file is not writable: {paths['writer_log_file']}: {error}") from error
         paths["prepared_dir"].mkdir(parents=True, exist_ok=True)
         private_socket = paths["private_socket_dir"]
         existed = private_socket.exists()
@@ -257,7 +262,7 @@ class Config:
         private_stat = private_socket.stat()
         if not stat.S_ISDIR(private_stat.st_mode):
             raise ConfigError("private_socket_dir is not a directory")
-        if private_stat.st_uid != os.geteuid() or stat.S_IMODE(private_stat.st_mode) & 0o077:
+        if private_stat.st_uid != os.geteuid() or stat.S_IMODE(private_stat.st_mode) != 0o700:
             if not existed:
                 private_socket.chmod(0o700)
             else:
@@ -277,6 +282,10 @@ class Config:
     @property
     def receipt_file(self) -> Path:
         return self.prepared_dir / "pagestore_branch.prepare.json"
+
+    @property
+    def prepared_lock_file(self) -> Path:
+        return self.prepared_dir / ".pagestore-branch-prepare.lock"
 
 
 class OwnerLock:
@@ -393,11 +402,13 @@ class BranchPreparer:
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"
                 " '0/0')::pg_lsn = '0/0'::pg_lsn"
-                " AND current_setting('archive_mode') = 'on'"
+                " AND current_setting('archive_mode') IN ('on', 'always')"
                 " AND current_setting('archive_library') = 'pagestore'"
                 " AND to_regprocedure('pagestore_prepare_branch_from_control("
                 "text,integer,integer,pg_lsn,pg_lsn,pg_lsn)') IS NOT NULL"
                 " AND to_regprocedure('pagestore_branch_checkpoint()') IS NOT NULL"
+                " AND NOT EXISTS (SELECT 1 FROM pg_tablespace"
+                " WHERE spcname NOT IN ('pg_default', 'pg_global'))"
             )
         )
         if writer_ok != "t":
@@ -460,8 +471,8 @@ class BranchPreparer:
         )
         if state != "not paused":
             raise BranchPrepareError(f"cannot own materializer pause from state {state}")
-        self.materializer_sql("SELECT pg_wal_replay_pause()")
         self.pause_owned = True
+        self.materializer_sql("SELECT pg_wal_replay_pause()")
         try:
             self.wait_until(
                 "materializer replay pause",
@@ -708,20 +719,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with OwnerLock(config.lock_file, "branch prepare"):
             try:
-                with OwnerLock(
-                    config.materializer_lock_file,
-                    "materializer supervisor or branch prepare",
-                ):
-                    preparer = BranchPreparer(config)
+                with OwnerLock(config.prepared_lock_file, "prepared artifact directory"):
+                    with OwnerLock(
+                        config.materializer_lock_file,
+                        "materializer supervisor or branch prepare",
+                    ):
+                        preparer = BranchPreparer(config)
 
-                    def cancel(signum: int, _frame: object) -> None:
-                        raise CancelledError(f"received signal {signum}")
+                        def cancel(signum: int, _frame: object) -> None:
+                            raise CancelledError(f"received signal {signum}")
 
-                    signal.signal(signal.SIGINT, cancel)
-                    signal.signal(signal.SIGTERM, cancel)
-                    receipt = preparer.execute()
-                    print(json.dumps(receipt, sort_keys=True))
-                    return 0
+                        signal.signal(signal.SIGINT, cancel)
+                        signal.signal(signal.SIGTERM, cancel)
+                        receipt = preparer.execute()
+                        print(json.dumps(receipt, sort_keys=True))
+                        return 0
             except OwnershipError as error:
                 raise OwnershipError(
                     f"{error}; stop the materializer supervisor before preparing a branch"
