@@ -9508,10 +9508,17 @@ pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
 		char	   *page = palloc(BLCKSZ);
 		MultiXactOffset oldest_member;
 
-		if (!ps_mxoff_reconstruct(page, pageno, base, target))
+		/*
+		 * The control file's multixact horizons describe the completed
+		 * checkpoint record, not merely its redo pointer.  CreateCheckPoint()
+		 * selects those horizons after establishing the redo pointer, so WAL
+		 * for oldestMulti can fall between target and the checkpoint record's
+		 * end.  Replay through that end before reading the offsets page.
+		 */
+		if (!ps_mxoff_reconstruct(page, pageno, base, h->checkpoint_end_lsn))
 			ereport(ERROR,
-					(errmsg("checkpoint oldest multixact %u was truncated at the checkpoint redo",
-							h->oldest_multi)));
+					(errmsg("checkpoint oldest multixact %u was truncated at the checkpoint record",
+								h->oldest_multi)));
 		memcpy(&oldest_member,
 			   page + (Size) entryno * sizeof(MultiXactOffset),
 			   sizeof(MultiXactOffset));
