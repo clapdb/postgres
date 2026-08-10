@@ -1485,8 +1485,10 @@ def run_materializer_smoke(
         )
         materializer_data.chmod(0o700)
         archive_current_wal()
+        restore_program = str(walrestore).replace("%", "%%")
+        restore_shm = str(shm).replace("%", "%%")
         restore_command = (
-            f"{shlex.quote(str(walrestore))} --shm {shlex.quote(str(shm))} "
+            f"{shlex.quote(restore_program)} --shm {shlex.quote(restore_shm)} "
             "--timeline 0 --segsize 16777216 %f %p"
         )
         restore_command_setting = postgresql_conf_string(restore_command)
