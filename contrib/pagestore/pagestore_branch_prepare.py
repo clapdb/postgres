@@ -197,7 +197,11 @@ class Config:
         if writer_data == materializer_data:
             raise ConfigError("writer and materializer data directories must differ")
         for data_dir in (writer_data, materializer_data):
-            if prepared == data_dir or data_dir in prepared.parents:
+            if (
+                prepared == data_dir
+                or data_dir in prepared.parents
+                or prepared in data_dir.parents
+            ):
                 raise ConfigError("prepared_dir must be outside both PostgreSQL data directories")
         if not SAFE_POSTGRES_OPTION_PATH.fullmatch(str(paths["private_socket_dir"])):
             raise ConfigError("private_socket_dir contains characters unsafe for pg_ctl -o")
@@ -586,6 +590,7 @@ class BranchPreparer:
     def prepare_branch(self, base: str, redo: str, fork: str) -> int:
         output = last_output_line(
             self.writer_sql(
+                "SET pagestore.redo_wal_from_store = on; "
                 "SELECT pagestore_prepare_branch_from_control("
                 + sql_literal(str(self.config.prepared_dir))
                 + f", {self.config.new_timeline}, {self.config.parent_timeline}, "
