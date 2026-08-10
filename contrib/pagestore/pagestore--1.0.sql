@@ -35,6 +35,11 @@ RETURNS bigint
 AS 'MODULE_PATHNAME', 'pagestore_prepare_branch_from_control'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+CREATE FUNCTION pagestore_capture_slru_snapshot()
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_capture_slru_snapshot'
+LANGUAGE C PARALLEL UNSAFE;
+
 COMMENT ON FUNCTION pagestore_shipped_wal_lsn() IS
 'end of the durable WAL prefix available to this pagestore timeline';
 
@@ -49,3 +54,6 @@ COMMENT ON FUNCTION pagestore_materializer_status() IS
 
 COMMENT ON FUNCTION pagestore_prepare_branch_from_control(text, integer, integer, pg_lsn, pg_lsn, pg_lsn) IS
 'idempotently prepare a materialized branch using bootstrap horizons derived from an exact durable checkpoint';
+
+COMMENT ON FUNCTION pagestore_capture_slru_snapshot() IS
+'capture all branch SLRU bases at a cutoff proven by a paused recovery materializer restartpoint';
