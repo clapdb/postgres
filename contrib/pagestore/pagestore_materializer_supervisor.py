@@ -505,6 +505,9 @@ class Supervisor:
                 now - self.progress_api_wait_started
                 >= self.config.progress_timeout_ms / 1000
             ):
+                if now < self.retry_not_before:
+                    self.publish("waiting_for_progress_api")
+                    return True
                 self.progress_api_wait_started = now
                 return self.record_failure(
                     "materializer progress API did not become available"

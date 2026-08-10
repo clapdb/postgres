@@ -168,9 +168,27 @@ class SupervisorTests(unittest.TestCase):
         supervisor = MissingProgressSupervisor(config)
         supervisor.progress_api_wait_started = 0
         for failure in range(1, config.max_consecutive_failures + 1):
+            supervisor.retry_not_before = 0
             keep_running = supervisor.observe_progress(float(failure))
             self.assertEqual(keep_running, failure < config.max_consecutive_failures)
         self.assertEqual(supervisor.failures, config.max_consecutive_failures)
+
+    def test_missing_progress_api_honors_retry_backoff(self):
+        config = MODULE.Config.load(self.write_config(progress_timeout_ms=1))
+
+        class MissingProgressSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return None
+
+        supervisor = MissingProgressSupervisor(config)
+        supervisor.progress_api_wait_started = 0
+        supervisor.retry_not_before = 2
+        self.assertTrue(supervisor.observe_progress(1))
+        self.assertEqual(supervisor.failures, 0)
+
+        supervisor.retry_not_before = 0
+        self.assertTrue(supervisor.observe_progress(1))
+        self.assertEqual(supervisor.failures, 1)
 
 
 if __name__ == "__main__":
