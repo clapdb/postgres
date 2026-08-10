@@ -209,13 +209,21 @@ different system identifier and must never be mistaken for source-cluster WAL.
 
 The portable branch path therefore uses the following narrower protocol:
 
-1. `pagestore_prepare_branch_from_control` selects an exact mirrored checkpoint
-   redo `R`, derives the checkpoint record end `E`, and cuts the page-store
-   branch at a durable materialized boundary `L >= E`.  It publishes
+1. `pagestore_branch_prepare` captures a proven SLRU base `C`, drains and stops
+   the public writer, and brings it back only on an owner-private socket.  The
+   clean stop's shutdown checkpoint is the first horizon after all clients have
+   drained.  `pagestore_branch_checkpoint()` requires its exact mirrored
+   control image and admission fence, then reads its matching WAL record to
+   return redo `R` and the true record end `E` (never the possibly newer current
+   WAL position).  After the checkpoint segment is archived, the controller
+   waits for materialization through `E`, pauses at durable `L >= E`, and calls
+   `pagestore_prepare_branch_from_control` while the writer remains private.
+   The prepare cuts the page-store branch and publishes
    `pagestore_branch.bootstrap`, whose CRC covers the source system identifier,
    logical timelines, `R/E/L`, topology flags, and every captured relation-map
    byte; a second checksum binds the exact prepared SLRU manifest so artifacts
-   from two prepares cannot be mixed.
+   from two prepares cannot be mixed.  The controller restores both processes
+   and publishes an atomic receipt carrying the exact `C/R/E/L` tuple.
 2. Run `initdb` with the same PostgreSQL build, while the target remains offline.
 3. Run `pagestore_control_restore --timeline <child> --lsn R
    --archive-bootstrap <target>`.  This mode requires an exact-redo image.  It

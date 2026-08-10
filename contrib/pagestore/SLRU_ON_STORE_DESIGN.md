@@ -51,8 +51,11 @@ Known caveats -- each remains open work, with its exact failure mode stated:
   paused; capture requests a restartpoint, requires its durable materializer
   marker to equal the unchanged replay LSN, stages all four SLRUs, rechecks the
   pause/replay position, then publishes and syncs the staged image at C.  A
-  failed or concurrent-resume attempt returns no usable cutoff.  Automating the
-  surrounding pause/resume remains control-plane orchestration.
+  failed or concurrent-resume attempt returns no usable cutoff.
+  `pagestore_branch_prepare` supplies the surrounding local POSIX orchestration:
+  it owns the supervisor lock, produces `C` before draining the writer, selects
+  an admission-fenced shutdown checkpoint `R/E`, and keeps the private writer
+  plus materializer pause fenced while it captures `L` and seeds the branch.
 - **The appliers can read the (C, L] WAL from the store.**  DONE:
   `pagestore.redo_wal_from_store` redirects the SLRU appliers' and seeders'
   linear scans to the store's shipped per-timeline WAL log, exactly as it
