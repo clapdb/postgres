@@ -78,6 +78,8 @@ class BranchPrepareTests(unittest.TestCase):
             MODULE.Config.load(
                 self.write_config(prepared_dir=str(self.writer / "prepared"))
             )
+        with self.assertRaisesRegex(MODULE.ConfigError, "outside"):
+            MODULE.Config.load(self.write_config(prepared_dir=str(self.root)))
         with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 1"):
             MODULE.Config.load(self.write_config(schema=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "exceeds 1023"):
@@ -220,6 +222,20 @@ class BranchPrepareTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MODULE.CancelledError, "cancelled"):
             preparer.wait_until("cancellation", cancel)
+
+    def test_prepare_branch_reads_wal_from_store(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class RecordingPreparer(MODULE.BranchPreparer):
+            def writer_sql(self, sql, *, private=False):
+                self.sql = sql
+                self.private = private
+                return "1\n"
+
+        preparer = RecordingPreparer(config)
+        self.assertEqual(preparer.prepare_branch("0/1", "0/2", "0/3"), 1)
+        self.assertTrue(preparer.private)
+        self.assertTrue(preparer.sql.startswith("SET pagestore.redo_wal_from_store = on;"))
 
     def test_duplicate_branch_main_returns_temporary_failure(self):
         config_path = self.write_config()
