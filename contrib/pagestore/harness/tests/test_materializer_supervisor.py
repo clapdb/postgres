@@ -143,7 +143,7 @@ class SupervisorTests(unittest.TestCase):
             status["consecutive_failures"], config.max_consecutive_failures
         )
 
-    def test_progress_failures_remain_bounded(self):
+    def test_restartpoint_without_new_checkpoint_is_retried(self):
         config = MODULE.Config.load(self.write_config())
 
         class StalledSupervisor(MODULE.Supervisor):
@@ -155,8 +155,8 @@ class SupervisorTests(unittest.TestCase):
             supervisor.restart_baseline = 1
             supervisor.restart_deadline = 0
             keep_running = supervisor.observe_progress(float(failure))
-            self.assertEqual(keep_running, failure < config.max_consecutive_failures)
-        self.assertEqual(supervisor.failures, config.max_consecutive_failures)
+            self.assertTrue(keep_running)
+        self.assertEqual(supervisor.failures, 0)
 
     def test_missing_progress_api_reaches_the_configured_bound(self):
         config = MODULE.Config.load(self.write_config(progress_timeout_ms=1))

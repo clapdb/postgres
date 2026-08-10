@@ -516,6 +516,8 @@ class Supervisor:
             return True
         self.progress = progress
         self.progress_api_wait_started = now
+        self.failures = 0
+        self.last_error = None
 
         if self.restart_baseline is not None:
             if progress.materialized_int > self.restart_baseline:
@@ -525,9 +527,13 @@ class Supervisor:
                 self.last_error = None
             elif now >= self.restart_deadline:
                 self.restart_baseline = None
-                return self.record_failure(
-                    "restartpoint completed without advancing the materialized watermark"
+                self.lag_started_at = now
+                self.replay_changed_at = now
+                self.retry_not_before = (
+                    now + self.config.replay_idle_ms / 1000
                 )
+                self.publish("awaiting_checkpoint")
+                return True
 
         replay = progress.replay_int
         if replay != self.last_replay:
