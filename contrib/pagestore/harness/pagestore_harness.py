@@ -66,6 +66,11 @@ def sqlstate_from_output(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def postgresql_conf_string(value: str | Path) -> str:
+    """Return value as a safely quoted PostgreSQL configuration string."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+
+
 HEADER_FIELDS = {"schema", "scenario", "seed", "contracts", "case", "extra"}
 ACTION_FIELDS = {
     "sql": {"op", "id", "target", "sql", "expect_error", "expect_sqlstate", "extra"},
@@ -485,8 +490,8 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 writer_mutated_since_checkpoint = True
     elif runtime == "materializer_smoke":
         required = {"writer", "materializer"}
-        computes = set(plan.header["case"]["compute"])
-        if computes != required:
+        computes = plan.header["case"]["compute"]
+        if len(computes) != len(required) or set(computes) != required:
             raise PlanError(
                 f"runtime {runtime!r} requires exactly writer and materializer computes"
             )
@@ -1444,7 +1449,7 @@ def run_materializer_smoke(
             config.write(
                 "shared_preload_libraries = 'pagestore'\n"
                 "pagestore.backend = 'localsvc'\n"
-                f"pagestore.localsvc_shm = '{shm}'\n"
+                f"pagestore.localsvc_shm = {postgresql_conf_string(shm)}\n"
                 "pagestore.route_all = off\n"
                 "pagestore.timeline = 0\n"
                 f"{postgres_runtime_settings(postgres_major)}"
@@ -1452,7 +1457,7 @@ def run_materializer_smoke(
                 "archive_mode = on\n"
                 "archive_library = 'pagestore'\n"
                 "listen_addresses = ''\n"
-                f"unix_socket_directories = '{writer_socket}'\n"
+                f"unix_socket_directories = {postgresql_conf_string(writer_socket)}\n"
                 f"port = {writer_port}\n"
             )
         subprocess.run(
@@ -1480,7 +1485,7 @@ def run_materializer_smoke(
             f"{shlex.quote(str(walrestore))} --shm {shlex.quote(str(shm))} "
             "--timeline 0 --segsize 16777216 %f %p"
         )
-        restore_command_setting = restore_command.replace("\\", "\\\\").replace("'", "''")
+        restore_command_setting = postgresql_conf_string(restore_command)
         with (materializer_data / "postgresql.conf").open(
             "a", encoding="utf-8"
         ) as config:
@@ -1490,9 +1495,9 @@ def run_materializer_smoke(
                 "archive_mode = off\n"
                 "hot_standby = on\n"
                 "listen_addresses = ''\n"
-                f"unix_socket_directories = '{materializer_socket}'\n"
+                f"unix_socket_directories = {postgresql_conf_string(materializer_socket)}\n"
                 f"port = {materializer_port}\n"
-                f"restore_command = '{restore_command_setting}'\n"
+                f"restore_command = {restore_command_setting}\n"
             )
         (materializer_data / "standby.signal").touch()
         for wal_path in (materializer_data / "pg_wal").glob("0000000*"):

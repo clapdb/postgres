@@ -325,6 +325,24 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.read_plan(path), capabilities, "materializer_smoke"
             )
 
+    def test_materializer_runtime_rejects_duplicate_compute_roles(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer", "materializer"]
+        path = self.write_plan([header])
+        with self.assertRaisesRegex(
+            MODULE.PlanError, "requires exactly writer and materializer"
+        ):
+            MODULE.validate_runtime_plan(
+                MODULE.read_plan(path), capabilities, "materializer_smoke"
+            )
+
+    def test_postgresql_conf_string_escapes_path_characters(self):
+        self.assertEqual(
+            MODULE.postgresql_conf_string("/tmp/alice's\\socket"),
+            "'/tmp/alice''s\\\\socket'",
+        )
+
     def test_writer_runtime_requires_reader_artifacts_before_install(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
