@@ -213,6 +213,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *crash_after_writes;
 	const char *fail_fork_meta_at;
 	const char *max_log_read;
+	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
@@ -233,6 +234,17 @@ posix_open(const char *path, uint64_t segment_size)
 	max_log_read = getenv("PAGESTORE_TEST_MAX_LOG_READ");
 	test_max_log_read = max_log_read ? atoi(max_log_read) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
+	/* A prior metadata rename whose directory sync failed must be made durable
+	 * before this process can accept writes against its visible replacement. */
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 || fsync(dfd) != 0)
+	{
+		if (dfd >= 0)
+			close(dfd);
+		return -1;
+	}
+	if (close(dfd) != 0)
+		return -1;
 	return 0;
 }
 
