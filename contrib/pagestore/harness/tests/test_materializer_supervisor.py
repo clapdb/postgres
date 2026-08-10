@@ -190,6 +190,21 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(supervisor.observe_progress(1))
         self.assertEqual(supervisor.failures, 1)
 
+    def test_restartpoint_progress_resets_lag_timer(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class RestartedSupervisor(MODULE.Supervisor):
+            def read_progress(self):
+                return MODULE.Progress("0/4", "0/3", "0/1", 1)
+
+        supervisor = RestartedSupervisor(config)
+        supervisor.restart_baseline = 0
+        supervisor.lag_started_at = 0
+        supervisor.last_replay = 4
+        supervisor.observe_progress(10)
+        self.assertEqual(supervisor.restart_baseline, None)
+        self.assertEqual(supervisor.lag_started_at, 10)
+
 
 if __name__ == "__main__":
     unittest.main()

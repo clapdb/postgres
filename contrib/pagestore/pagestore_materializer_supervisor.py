@@ -520,6 +520,7 @@ class Supervisor:
         if self.restart_baseline is not None:
             if progress.materialized_int > self.restart_baseline:
                 self.restart_baseline = None
+                self.lag_started_at = now
                 self.failures = 0
                 self.last_error = None
             elif now >= self.restart_deadline:
