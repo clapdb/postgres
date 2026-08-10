@@ -31,6 +31,10 @@ class PlanError(ValueError):
     """A plan is syntactically valid JSON but has invalid harness semantics."""
 
 
+class OracleMismatch(PlanError):
+    """A runtime assertion produced a value different from its oracle."""
+
+
 class EventLog:
     """Append-only event stream retained as part of every run bundle."""
 
@@ -1555,7 +1559,7 @@ def run_materializer_smoke(
                     socket_dir, port = materializer_socket, materializer_port
                 output = sql_scalar(socket_dir, port, action["sql"])
                 if output != action["expect"]:
-                    raise PlanError(
+                    raise OracleMismatch(
                         f"assert {action['id']} got {output!r}, "
                         f"expected {action['expect']!r}"
                     )
@@ -1574,13 +1578,16 @@ def run_materializer_smoke(
             "run_pass", materializer_generation=materializer_generation
         )
     except Exception as error:
+        classification = (
+            "oracle_mismatch" if isinstance(error, OracleMismatch) else "setup"
+        )
         events.emit(
             "run_fail", error=str(error), error_type=type(error).__name__,
             materializer_generation=materializer_generation,
         )
         (root / "failure.json").write_text(
             json.dumps(
-                {"classification": "setup", "error": str(error)}, indent=2
+                {"classification": classification, "error": str(error)}, indent=2
             ) + "\n",
             encoding="utf-8",
         )
