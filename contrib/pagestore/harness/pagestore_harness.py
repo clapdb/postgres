@@ -1249,7 +1249,7 @@ def run_materializer_smoke(
     )
     validate_postgres_block_size(build, profile["page_size"])
     validate_postgres_relation_segment_size(build, profile["page_size"])
-    walrestore = pagestore_build_program(build, "pagestore_walrestore")
+    walrestore = pagestore_build_program(build, "pagestore_walrestore").resolve()
     importer = pagestore_build_program(build, "pagestore_import")
     root, temporary = run_root(requested_root)
     trace = root / "trace"
@@ -1557,7 +1557,13 @@ def run_materializer_smoke(
                     socket_dir, port = writer_socket, writer_port
                 else:
                     socket_dir, port = materializer_socket, materializer_port
-                output = sql_scalar(socket_dir, port, action["sql"])
+                try:
+                    output = sql_scalar(socket_dir, port, action["sql"])
+                except subprocess.CalledProcessError as error:
+                    detail = (error.stderr or error.stdout or str(error)).strip()
+                    raise OracleMismatch(
+                        f"assert {action['id']} query failed: {detail}"
+                    ) from error
                 if output != action["expect"]:
                     raise OracleMismatch(
                         f"assert {action['id']} got {output!r}, "
