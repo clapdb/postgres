@@ -331,7 +331,9 @@ class Supervisor:
         self.restart_deadline = 0.0
         self.retry_not_before = 0.0
         self.progress_api_ready = False
+        self.progress_schema: str | None = None
         self.progress_api_wait_started = time.monotonic()
+        self.lag_started_at: float | None = None
 
     def publish(self, state: str, **fields: Any) -> None:
         status = {
@@ -413,20 +415,31 @@ class Supervisor:
     def read_progress(self) -> Progress | None:
         try:
             if not self.progress_api_ready:
+                schema = self.psql(
+                    "SELECT n.nspname FROM pg_extension e "
+                    "JOIN pg_namespace n ON n.oid = e.extnamespace "
+                    "WHERE e.extname = 'pagestore'"
+                )
+                if not schema:
+                    return None
+                self.progress_schema = '"' + schema.replace('"', '""') + '"'
                 self.progress_api_ready = (
                     self.psql(
-                        "SELECT to_regprocedure('pagestore_shipped_wal_lsn()') "
+                        "SELECT to_regprocedure('" + self.progress_schema +
+                        ".pagestore_shipped_wal_lsn()') "
                         "IS NOT NULL"
                     )
                     == "t"
                 )
                 if not self.progress_api_ready:
                     return None
+            if self.progress_schema is None:
+                return None
             output = self.psql(
-                "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn), "
-                "pagestore_shipped_wal_lsn(), "
-                "pagestore_materialized_wal_lsn(), "
-                "pagestore_materializer_lag_bytes()"
+                "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn), " +
+                self.progress_schema + ".pagestore_shipped_wal_lsn(), " +
+                self.progress_schema + ".pagestore_materialized_wal_lsn(), " +
+                self.progress_schema + ".pagestore_materializer_lag_bytes()"
             )
             replay, shipped, materialized, lag = output.split("|")
             progress = Progress(replay, shipped, materialized, int(lag))
@@ -440,6 +453,7 @@ class Supervisor:
             return progress
         except (subprocess.SubprocessError, OSError, ValueError):
             self.progress_api_ready = False
+            self.progress_schema = None
             return None
 
     def start_worker(self, reason: str) -> None:
@@ -510,17 +524,25 @@ class Supervisor:
             self.replay_changed_at = now
 
         if progress.lag_bytes == 0:
+            self.lag_started_at = None
             self.failures = 0
             self.last_error = None
             self.publish("running")
             return True
         if progress.replay_int <= progress.materialized_int:
+            if now - self.replay_changed_at >= self.config.progress_timeout_ms / 1000:
+                return self.record_failure(
+                    "replay did not advance beyond the materialized watermark"
+                )
             self.publish("catching_up")
             return True
+        if self.lag_started_at is None:
+            self.lag_started_at = now
         if self.restart_baseline is not None or now < self.retry_not_before:
             self.publish("awaiting_restartpoint")
             return True
-        if now - self.replay_changed_at >= self.config.replay_idle_ms / 1000:
+        if (now - self.replay_changed_at >= self.config.replay_idle_ms / 1000 or
+                now - self.lag_started_at >= self.config.replay_idle_ms / 1000):
             try:
                 self.restart_for_progress()
             except (subprocess.SubprocessError, OSError, RuntimeError) as error:
