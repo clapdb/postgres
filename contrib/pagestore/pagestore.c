@@ -9882,6 +9882,7 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	XLogRecPtr	fork_lsn;
 	char	   *manifest_data;
 	char	   *target_manifest;
+	char		manifest_path[MAXPGPATH];
 	char		stage[MAXPGPATH];
 	uint32_t	target_new_tl;
 	uint32_t	target_parent_tl;
