@@ -221,9 +221,26 @@ run_request_admitted(PsChannel *ch)
 	 * alone (no shard lock), so it serializes against map readers/writers but
 	 * not against per-shard work on unrelated shards.
 	 */
+	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+	{
+		/*
+		 * Pin mutations fsync their own retention log.  Timeline definitions are
+		 * append-only for a daemon lifetime, so validate the timeline under the
+		 * map lock and then perform that slow durable mutation without blocking
+		 * unrelated map readers across all shards.
+		 */
+		ps_lock_map_rd();
+		if (!ps_timeline_defined(ch->timeline))
+			ch->status = PS_STATUS_ERROR;
+		ps_unlock_map();
+		if (ch->status != PS_STATUS_ERROR)
+			handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return;
+	}
+
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
-		op == PS_OP_REQUIRE_BRANCH || op == PS_OP_RETENTION_PIN_SET ||
-		op == PS_OP_RETENTION_PIN_DROP)
+		op == PS_OP_REQUIRE_BRANCH)
 	{
 		ps_lock_map_wr();
 		handle_request(ch);

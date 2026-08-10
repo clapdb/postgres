@@ -1761,6 +1761,12 @@ timeline_has_parent(uint32_t timeline)
 		timelines[timeline].parent >= 0;
 }
 
+int
+ps_timeline_defined(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timelines[timeline].defined;
+}
+
 /*
  * Ancestry iterator.  A read on a branch resolves against the branch and then
  * each ancestor, with read_lsn frozen at each branch point so the branch sees a
