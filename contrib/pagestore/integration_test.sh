@@ -907,6 +907,8 @@ $P -c "CREATE FUNCTION pagestore_multixact_members_page_asof(int, pg_lsn, pg_lsn
         AS 'pagestore','pagestore_prepare_branch' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_prepare_branch_from_control(text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS bigint
         AS 'pagestore','pagestore_prepare_branch_from_control' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, int, int, pg_lsn, pg_lsn, pg_lsn) RETURNS void
+        AS 'pagestore','pagestore_install_prepared_branch_bootstrap' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_validate_branch_manifest(text, int, int, pg_lsn) RETURNS bool
         AS 'pagestore','pagestore_validate_branch_manifest' LANGUAGE C STRICT;" >/dev/null
 mOff=$mxRecon                                          # mA's first member offset (step 20)
@@ -1081,10 +1083,63 @@ assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::js
 	"$autoOldestMember" "control-derived prepare reconstructs oldestMulti's member offset"
 assert "$($P -c "SELECT (pg_read_file('$AUTOSEED/pagestore_branch.manifest')::json->>'fork_lsn')::pg_lsn::text;")" \
 	"$autoFork" "control-derived prepare forks at the separate materialized boundary"
+assert "$([ -s "$AUTOSEED/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
+	"present" "control-derived prepare publishes the portable catalog bootstrap artifact"
+bootstrapMd5=$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')
 autoRetry=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED', 3, 0, '$mxC', '$autoL', '$autoFork');")
 assert "$autoRetry" "$autoSeeded" \
 	"control-derived prepare retry is idempotent"
+assert "$(md5sum "$AUTOSEED/pagestore_branch.bootstrap" | awk '{print $1}')" \
+	"$bootstrapMd5" "control-derived prepare retry reproduces the same bootstrap artifact"
+portableTsError=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
+	'$AUTOSEED', '$AUTOSEED.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	2>&1 || true)
+case "$portableTsError" in
+	*"does not yet support user tablespaces"*) portableTsRejected=yes ;;
+	*) portableTsRejected=no ;;
+esac
+assert "$portableTsRejected" "yes" \
+	"portable bootstrap explicitly rejects an unrepresented user-tablespace topology"
+CORRUPTBOOT=$(mktemp -d)
+cp -a "$AUTOSEED/." "$CORRUPTBOOT/"
+printf '\001' | dd of="$CORRUPTBOOT/pagestore_branch.bootstrap" bs=1 seek=80 \
+	conv=notrunc status=none
+corruptBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
+	'$CORRUPTBOOT', '$CORRUPTBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	2>&1 || true)
+case "$corruptBootstrap" in
+	*"invalid checksum"*) corruptRejected=yes ;;
+	*) corruptRejected=no ;;
+esac
+assert "$corruptRejected" "yes" "portable bootstrap rejects a corrupted artifact"
+rm -rf "$CORRUPTBOOT"
+MIXEDBOOT=$(mktemp -d)
+cp -a "$AUTOSEED/." "$MIXEDBOOT/"
+printf '\n' >> "$MIXEDBOOT/pagestore_branch.manifest"
+mixedBootstrap=$($P -c "SELECT pagestore_install_prepared_branch_bootstrap(
+	'$MIXEDBOOT', '$MIXEDBOOT.target', 3, 0, '$autoL', '$autoFork', '$autoFork');" \
+	2>&1 || true)
+case "$mixedBootstrap" in
+	*"does not match the prepared branch manifest"*) mixedRejected=yes ;;
+	*) mixedRejected=no ;;
+esac
+assert "$mixedRejected" "yes" \
+	"portable bootstrap rejects an artifact mixed with another prepared manifest"
+rm -rf "$MIXEDBOOT"
+LEGACYREUSE=$(mktemp -d)
+cp -a "$AUTOSEED/." "$LEGACYREUSE/"
+legacyReuse=$($P -c "SELECT pagestore_prepare_branch(
+	'$LEGACYREUSE', 3, 0, '$mxC', '$autoFork',
+	'$autoOldestXid'::xid, '$autoNextXid'::xid,
+	'$autoOldestCts'::xid, '$autoNextCts'::xid,
+	'$autoOldestMulti'::xid, '$autoNextMulti'::xid,
+	$autoOldestMember, $autoNextMember);")
+assert "$legacyReuse" "$autoSeeded" \
+	"legacy expert prepare can reuse the same branch bundle"
+assert "$([ -e "$LEGACYREUSE/pagestore_branch.bootstrap" ] && echo present || echo absent)" \
+	"absent" "legacy expert prepare removes a stale portable bootstrap marker"
+rm -rf "$LEGACYREUSE"
 shortFork=$($P -c "SELECT pagestore_prepare_branch_from_control(
 	'$AUTOSEED.short', 4, 0, '$mxC', '$autoL', '$autoL');" 2>/dev/null || echo ERROR)
 assert "$shortFork" "ERROR" \
@@ -1124,6 +1179,12 @@ else
 fi
 ctrl_ok=$("$BIN/pg_controldata" -D "$RESTOREDIR" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ctrl_ok" "ok" "pg_controldata accepts the restored control file"
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 --archive-bootstrap "$RESTOREDIR" >/dev/null 2>&1; then
+	echo "FAIL - archive bootstrap without an exact LSN should fail closed"; fail=1
+else
+	echo "ok   - archive bootstrap requires an exact checkpoint-redo LSN"
+fi
 rm -f "$RESTOREDIR/global/pg_control"
 if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn 0/1 "$RESTOREDIR" >/dev/null 2>&1; then
 	echo "FAIL - restore below the first update LSN should fail closed"; fail=1

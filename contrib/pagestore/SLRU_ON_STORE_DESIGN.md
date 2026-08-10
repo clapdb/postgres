@@ -7,7 +7,13 @@ reconstruction this document specifies has landed: snapshot shipping
 multixact offsets+members, the branch seeders, and the
 prepare/install/manifest bootstrap flow (`pagestore_prepare_branch` /
 `pagestore_install_prepared_branch`) with fail-closed branch startup
-validation.  The "matching parent state across `track_commit_timestamp`
+validation.  The control-derived path additionally publishes a CRC-bound
+portable catalog-map artifact, and
+`pagestore_install_prepared_branch_bootstrap` installs it together with these
+SLRUs into a fresh same-build `initdb` skeleton after archive-bootstrap control
+restore; the ordinary branch manifest remains the last readiness marker.  The
+current portable format rejects user tablespaces explicitly.  The "matching
+parent state across `track_commit_timestamp`
 toggles" acceptance criterion is met: the commit-ts appliers replay toggle
 eras (first item below).  64-bit multixact
 member horizons are accepted end to end, but store page addressing uses

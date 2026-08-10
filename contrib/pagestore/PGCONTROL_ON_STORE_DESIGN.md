@@ -11,7 +11,10 @@ over the restorable images on a timeline's ancestry, rebuilt from the segment
 log across daemon restarts -- any future shipped-WAL GC must refuse to drop WAL
 at/above it), and the atomic bootstrap restore tool
 (`pagestore_control_restore`: as-of-branch-LSN read, CRC verify, temp+rename,
-directory fsync, channel released on every exit path).  History: the original
+directory fsync, channel released on every exit path).  The tool's
+`--archive-bootstrap` mode and the CRC-bound `pagestore_branch.bootstrap` now
+also boot a branch from a fresh same-build `initdb` skeleton without copying
+parent PGDATA.  History: the original
 PR-#50 prototype mirrored inside recovery-critical sections and restored
 non-atomically; review (5 P1 / 11 P2) froze it until this protocol existed.
 
@@ -23,9 +26,9 @@ versions. A bootable branch compute needs a consistent `pg_control` to start
 recovery on its branch timeline. Putting it on the store lets a branch compute
 bootstrap that metadata without a pre-seeded local file.
 
-In scope: the control object model, a critical-section-safe mirror protocol, and
-an atomic, durable restore protocol. Out of scope: full branch startup/recovery
-flow (the rest of M4) and retention (M5).
+In scope: the control object model, a critical-section-safe mirror protocol, an
+atomic durable restore protocol, and the fresh-skeleton archive-recovery
+bootstrap handoff.  Retention-driven reclamation remains M5.
 
 ## Why the prototype is not mergeable
 
@@ -196,6 +199,48 @@ The restore must be atomic and durable:
    `global/pg_control` (or the pre-existing one) and exit non-zero; the tool never
    reports success for a torn or unverified control file.
 
+### Fresh-skeleton archive bootstrap
+
+An ordinary online-checkpoint control image is not enough by itself on a fresh
+`initdb` skeleton.  In the primary/crash-recovery state PostgreSQL first looks
+for the checkpoint in local `pg_wal`; it does not invoke `restore_command` for
+that initial lookup.  The skeleton's preallocated WAL also belongs to a
+different system identifier and must never be mistaken for source-cluster WAL.
+
+The portable branch path therefore uses the following narrower protocol:
+
+1. `pagestore_prepare_branch_from_control` selects an exact mirrored checkpoint
+   redo `R`, derives the checkpoint record end `E`, and cuts the page-store
+   branch at a durable materialized boundary `L >= E`.  It publishes
+   `pagestore_branch.bootstrap`, whose CRC covers the source system identifier,
+   logical timelines, `R/E/L`, topology flags, and every captured relation-map
+   byte; a second checksum binds the exact prepared SLRU manifest so artifacts
+   from two prepares cannot be mixed.
+2. Run `initdb` with the same PostgreSQL build, while the target remains offline.
+3. Run `pagestore_control_restore --timeline <child> --lsn R
+   --archive-bootstrap <target>`.  This mode requires an exact-redo image.  It
+   leaves the real checkpoint identity and database state intact, sets
+   `minRecoveryPoint = R` with the checkpoint's physical WAL timeline, clears
+   stale backup bounds, recomputes the control CRC, and installs the image using
+   the ordinary atomic protocol.  It does **not** forge `DB_SHUTDOWNED`, invent a
+   checkpoint record, or advance the checkpoint pointer.
+4. `pagestore_install_prepared_branch_bootstrap` verifies the restored control
+   CRC, system identifier, redo, recovery marker, and backup bounds against the
+   artifact before installing catalog relation maps and prepared SLRUs.  The
+   normal branch manifest is installed last, so an interrupted install remains
+   inert at startup.
+5. Remove the unrelated WAL segment preallocated by the fresh `initdb`, configure
+   store-backed `restore_command`, set recovery target `E` with action
+   `promote`, and start.  PostgreSQL enters archive recovery immediately, fetches
+   and validates the real online-checkpoint record plus later WAL from the
+   store, and writes its own legitimate end-of-recovery checkpoint/control
+   state.  Relation I/O is fully routed to the page-store branch already cut at
+   `L`; no parent heap/catalog files are copied.
+
+The current artifact deliberately rejects user tablespaces.  Their filesystem
+link/database topology needs an explicit portable representation; accepting it
+without one would turn a missing path into silent catalog corruption.
+
 ## Sequencing
 
 1. Module: assert `BLCKSZ >= PG_CONTROL_FILE_SIZE`; refuse control-on-store on
@@ -246,6 +291,11 @@ The restore must be atomic and durable:
 - A compute with no local `pg_control` restores the control image **as of its
   branch-creation LSN** -- even if the parent advanced afterward -- and boots into
   recovery from the checkpoint visible at the branch point, never a later one.
+- A fresh same-build `initdb` skeleton restored in archive-bootstrap mode fetches
+  the real checkpoint/WAL from the store, promotes at the artifact's checkpoint
+  record end, and boots the page-store branch without a parent PGDATA copy; a
+  mismatched control system identifier, redo, artifact CRC, or relation-map
+  topology fails before the branch manifest is published.
 - Control-on-store is refused on a `BLCKSZ < PG_CONTROL_FILE_SIZE` build rather
   than silently truncating the image.
 - A previously installed control-file write hook still runs after ours.
