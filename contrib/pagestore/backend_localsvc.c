@@ -1007,6 +1007,42 @@ pagestore_localsvc_wal_retain_floor(void)
 	return ch->req_lsn;
 }
 
+bool
+pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
+								 uint32 resources, uint64 owner_id, uint64 lsn)
+{
+	PsChannel *ch;
+	PageStoreRelKey key = {0};
+
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	return ls_exec_wait(ch, 0) == PS_STATUS_OK;
+}
+
+bool
+pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
+								 uint64 owner_id)
+{
+	PsChannel *ch;
+	PageStoreRelKey key = {0};
+
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_DROP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	return ls_exec_wait(ch, 0) == PS_STATUS_OK;
+}
+
 /*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
