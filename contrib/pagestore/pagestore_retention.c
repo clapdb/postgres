@@ -13,8 +13,9 @@
  * uncommitted append and is truncated during recovery; a full corrupt record
  * fails startup.  Losing a valid DROP would only retain too much, but losing a
  * valid SET could reclaim live history, so recovery never guesses.
- * If a failed append cannot be durably rolled back, retention.failed makes
- * that uncertainty survive process restart and blocks replay until repair.
+ * A durable pending marker is installed before every mutation.  It is removed
+ * only after the log and its independently checksummed committed-prefix state
+ * are durable, so an uncertain append or rewrite fails closed across restart.
  *
  *-------------------------------------------------------------------------
  */
@@ -34,6 +35,7 @@
 #define PS_RETENTION_MAGIC		0x4e544552	/* "RETN" */
 #define PS_RETENTION_VERSION	1
 #define PS_RETENTION_FNV_INIT	2166136261u
+#define PS_RETENTION_STATE_MAGIC 0x53544552	/* "RETS" */
 
 typedef enum PsRetentionRecordType
 {
@@ -52,14 +54,25 @@ typedef struct PsRetentionRecord
 	uint32_t	pad;
 } PsRetentionRecord;
 
+typedef struct PsRetentionState
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint64_t	nrecords;
+	uint32_t	log_hash;
+	uint32_t	crc;
+} PsRetentionState;
+
 static char retention_path[4096];
 static char retention_marker_path[4096];
-static char retention_failed_path[4096];
+static char retention_pending_path[4096];
+static char retention_state_path[4096];
 static char retention_dir[2048];
 static PsRetentionPin *retention_pins;
 static uint32_t retention_npins;
 static uint32_t retention_cap;
 static uint64_t retention_nrecords;
+static uint32_t retention_log_hash;
 static int retention_is_poisoned;
 static dev_t retention_dev;
 static ino_t retention_ino;
@@ -250,15 +263,15 @@ retention_mark_initialized(void)
 	return rc;
 }
 
-/* Caller holds retention_lock.  This marker is deliberately permanent: an
- * operator must inspect/repair the registry before removing it. */
+/* Caller holds retention_lock.  No log byte may change until this guard and
+ * its directory entry are durable. */
 static int
-retention_mark_failed(void)
+retention_begin_pending(void)
 {
 	int fd;
 	int rc = 0;
 
-	fd = open(retention_failed_path, O_WRONLY | O_CREAT, 0600);
+	fd = open(retention_pending_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	if (fd < 0)
 		return -1;
 	if (fsync(fd) != 0)
@@ -266,6 +279,98 @@ retention_mark_failed(void)
 	if (close(fd) != 0)
 		rc = -1;
 	if (rc == 0 && retention_fsync_dir() != 0)
+		rc = -1;
+	if (rc != 0)
+	{
+		unlink(retention_pending_path);
+		(void) retention_fsync_dir();
+	}
+	return rc;
+}
+
+/* Once unlink succeeds, either the guard removal reaches disk or recovery
+ * sees the still-durable guard and fails closed.  Directory fsync is still
+ * attempted, but its failure cannot make the committed state unsafe. */
+static int
+retention_clear_pending(void)
+{
+	if (unlink(retention_pending_path) != 0)
+		return -1;
+	(void) retention_fsync_dir();
+	return 0;
+}
+
+static uint32_t
+retention_state_crc(const PsRetentionState *state)
+{
+	return retention_fnv1a(PS_RETENTION_FNV_INIT, state,
+						   offsetof(PsRetentionState, crc));
+}
+
+/* Caller holds retention_lock.  Atomic rewrite plus directory fsync makes the
+ * expected prefix independent of retention.meta itself. */
+static int
+retention_write_state(uint64_t nrecords, uint32_t log_hash)
+{
+	char tmp[4096];
+	PsRetentionState state;
+	int fd = -1;
+	int n;
+	int rc = -1;
+
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", retention_state_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+	memset(&state, 0, sizeof(state));
+	state.magic = PS_RETENTION_STATE_MAGIC;
+	state.version = PS_RETENTION_VERSION;
+	state.nrecords = nrecords;
+	state.log_hash = log_hash;
+	state.crc = retention_state_crc(&state);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		goto done;
+	if (write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0)
+		goto done;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (rename(tmp, retention_state_path) != 0 || retention_fsync_dir() != 0)
+		goto done;
+	rc = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0)
+		unlink(tmp);
+	return rc;
+}
+
+static int
+retention_read_state(PsRetentionState *state)
+{
+	int fd;
+	int rc = -1;
+	unsigned char extra;
+
+	fd = open(retention_state_path, O_RDONLY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (read(fd, state, sizeof(*state)) != (ssize_t) sizeof(*state) ||
+		read(fd, &extra, 1) != 0 || state->magic != PS_RETENTION_STATE_MAGIC ||
+		state->version != PS_RETENTION_VERSION ||
+		state->crc != retention_state_crc(state))
+	{
+		errno = EILSEQ;
+		goto done;
+	}
+	rc = 1;
+done:
+	if (close(fd) != 0)
 		rc = -1;
 	return rc;
 }
@@ -302,14 +407,15 @@ retention_rollback(int fd, off_t old_size, int created)
 }
 
 /* Caller holds retention_lock.  If rollback cannot prove that the old prefix
- * is durable, leave a durable marker so a restart cannot replay an
- * unacknowledged full DROP as committed. */
+ * is durable, leave the pre-durable guard in place so a restart cannot replay
+ * an unacknowledged full DROP as committed. */
 static int
 retention_abort_append(int fd, off_t old_size, int created)
 {
 	if (retention_rollback(fd, old_size, created) != 0)
-		(void) retention_mark_failed();
-	retention_is_poisoned = 1;
+		retention_is_poisoned = 1;
+	else
+		(void) retention_clear_pending();
 	return -1;
 }
 
@@ -323,6 +429,8 @@ retention_append(const PsRetentionRecord *rec)
 
 	if (retention_is_poisoned)
 		return -1;
+	if (retention_begin_pending() != 0)
+		return -1;
 	created = 0;
 	fd = open(retention_path, O_WRONLY | O_APPEND);
 	if (fd < 0 && errno == ENOENT)
@@ -332,11 +440,15 @@ retention_append(const PsRetentionRecord *rec)
 			created = 1;
 	}
 	if (fd < 0)
+	{
+		(void) retention_clear_pending();
 		return -1;
+	}
 	old_size = lseek(fd, 0, SEEK_END);
 	if (old_size < 0)
 	{
 		close(fd);
+		(void) retention_clear_pending();
 		return -1;
 	}
 	/* Detect an externally lost/truncated/replaced log before appending after
@@ -349,7 +461,9 @@ retention_append(const PsRetentionRecord *rec)
 			old_size != (off_t) (retention_nrecords * sizeof(*rec)))
 		{
 			errno = EILSEQ;
-			return retention_abort_append(fd, old_size, created);
+			(void) retention_abort_append(fd, old_size, created);
+			retention_is_poisoned = 1;
+			return -1;
 		}
 		if (created)
 		{
@@ -369,19 +483,11 @@ retention_append(const PsRetentionRecord *rec)
 		return retention_abort_append(fd, old_size, created);
 	if (close(fd) != 0)
 	{
-		fd = open(retention_path, O_WRONLY);
-		if (fd >= 0)
-			return retention_abort_append(fd, old_size, created);
-		(void) retention_mark_failed();
 		retention_is_poisoned = 1;
 		return -1;
 	}
 	if (created && retention_fsync_dir() != 0)
 	{
-		fd = open(retention_path, O_WRONLY);
-		if (fd >= 0)
-			return retention_abort_append(fd, old_size, created);
-		(void) retention_mark_failed();
 		retention_is_poisoned = 1;
 		return -1;
 	}
@@ -390,7 +496,22 @@ retention_append(const PsRetentionRecord *rec)
 		retention_is_poisoned = 1;
 		return -1;
 	}
+	{
+		uint32_t new_hash = retention_fnv1a(retention_log_hash, rec, sizeof(*rec));
+
+		if (retention_write_state(retention_nrecords + 1, new_hash) != 0)
+		{
+			retention_is_poisoned = 1;
+			return -1;
+		}
+		retention_log_hash = new_hash;
+	}
 	retention_nrecords++;
+	if (retention_clear_pending() != 0)
+	{
+		retention_is_poisoned = 1;
+		return -1;
+	}
 	return 0;
 }
 
@@ -413,7 +534,9 @@ ps_retention_open(const char *store_dir)
 	int			fd = -1;
 	int			rc = -1;
 	int			n;
+	int			state_rc;
 	struct stat st;
+	PsRetentionState committed;
 	off_t		off = 0;
 
 	pthread_mutex_lock(&retention_lock);
@@ -422,6 +545,7 @@ ps_retention_open(const char *store_dir)
 	retention_npins = 0;
 	retention_cap = 0;
 	retention_nrecords = 0;
+	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_is_poisoned = 0;
 	retention_dev = 0;
 	retention_ino = 0;
@@ -438,15 +562,22 @@ ps_retention_open(const char *store_dir)
 				 "%s/retention.initialized", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_marker_path))
 		goto done;
-	n = snprintf(retention_failed_path, sizeof(retention_failed_path),
-				 "%s/retention.failed", store_dir);
-	if (n < 0 || (size_t) n >= sizeof(retention_failed_path))
+	n = snprintf(retention_pending_path, sizeof(retention_pending_path),
+				 "%s/retention.pending", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(retention_pending_path))
 		goto done;
-	if (access(retention_failed_path, F_OK) == 0 || errno != ENOENT)
+	n = snprintf(retention_state_path, sizeof(retention_state_path),
+				 "%s/retention.state", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(retention_state_path))
+		goto done;
+	if (access(retention_pending_path, F_OK) == 0 || errno != ENOENT)
 	{
 		errno = EILSEQ;
 		goto done;
 	}
+	state_rc = retention_read_state(&committed);
+	if (state_rc < 0)
+		goto done;
 	{
 		const char *fail_append = getenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
 		const char *fail_rollback = getenv("PS_TEST_FAIL_RETENTION_ROLLBACK");
@@ -458,7 +589,7 @@ ps_retention_open(const char *store_dir)
 	if (fd < 0)
 	{
 		if (errno == ENOENT && access(retention_marker_path, F_OK) != 0 &&
-			errno == ENOENT)
+			errno == ENOENT && state_rc == 0)
 			rc = 0;
 		goto done;
 	}
@@ -479,14 +610,36 @@ ps_retention_open(const char *store_dir)
 		}
 		if (retention_apply(&rec) != 0)
 			goto done;
+		retention_log_hash = retention_fnv1a(retention_log_hash,
+										  &rec, sizeof(rec));
 		off += sizeof(rec);
 		retention_nrecords++;
 	}
-	/* A short tail can only be an uncommitted append.  Keeping a partial DROP
-	 * would be unsafe; truncate it before accepting any new mutation. */
-	if (off != st.st_size &&
-		(ftruncate(fd, off) != 0 || fsync(fd) != 0))
-		goto done;
+	if (state_rc > 0)
+	{
+		if (committed.nrecords != retention_nrecords ||
+			committed.log_hash != retention_log_hash)
+		{
+			errno = EILSEQ;
+			goto done;
+		}
+		/* The committed-prefix state proves that a shorter final fragment is
+		 * outside the acknowledged log and can be discarded safely. */
+		if (off != st.st_size &&
+			(ftruncate(fd, off) != 0 || fsync(fd) != 0))
+			goto done;
+	}
+	else
+	{
+		/* One-time migration from the pre-committed-prefix format. */
+		if (retention_begin_pending() != 0)
+			goto done;
+		if ((off != st.st_size &&
+			 (ftruncate(fd, off) != 0 || fsync(fd) != 0)) ||
+			retention_write_state(retention_nrecords, retention_log_hash) != 0 ||
+			retention_clear_pending() != 0)
+			goto done;
+	}
 	if (retention_mark_initialized() != 0)
 		goto done;
 	rc = 0;
@@ -514,9 +667,11 @@ ps_retention_close(void)
 	retention_npins = 0;
 	retention_cap = 0;
 	retention_nrecords = 0;
+	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_path[0] = '\0';
 	retention_marker_path[0] = '\0';
-	retention_failed_path[0] = '\0';
+	retention_pending_path[0] = '\0';
+	retention_state_path[0] = '\0';
 	retention_dir[0] = '\0';
 	retention_dev = 0;
 	retention_ino = 0;
@@ -704,10 +859,16 @@ ps_retention_compact(void)
 	int			fd = -1;
 	int			rc = -1;
 	int			n;
+	int			pending = 0;
+	int			published = 0;
+	uint32_t	new_hash = PS_RETENTION_FNV_INIT;
 
 	pthread_mutex_lock(&retention_lock);
 	if (retention_is_poisoned)
 		goto done;
+	if (retention_begin_pending() != 0)
+		goto done;
+	pending = 1;
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", retention_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
 		goto done;
@@ -721,6 +882,7 @@ ps_retention_compact(void)
 		retention_make_record(&rec, PS_RETENTION_SET, &retention_pins[i]);
 		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
 			goto done;
+		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
 	}
 	if (fsync(fd) != 0)
 	{
@@ -736,6 +898,7 @@ ps_retention_compact(void)
 	fd = -1;
 	if (rename(tmp, retention_path) != 0)
 		goto done;
+	published = 1;
 	/* Once rename publishes the new inode, a failed directory fsync means its
 	 * durability is unknown.  Do not continue from an in-memory state that a
 	 * crash may roll back. */
@@ -755,7 +918,19 @@ ps_retention_compact(void)
 		retention_dev = st.st_dev;
 		retention_ino = st.st_ino;
 	}
+	if (retention_write_state(retention_npins, new_hash) != 0)
+	{
+		retention_is_poisoned = 1;
+		goto done;
+	}
 	retention_nrecords = retention_npins;
+	retention_log_hash = new_hash;
+	if (retention_clear_pending() != 0)
+	{
+		retention_is_poisoned = 1;
+		goto done;
+	}
+	pending = 0;
 	memset(&retention_compact_retry_at, 0, sizeof(retention_compact_retry_at));
 	rc = 0;
 done:
@@ -763,6 +938,10 @@ done:
 		close(fd);
 	if (rc != 0 && tmp[0] != '\0')
 		unlink(tmp);
+	if (rc != 0 && pending && !published)
+		(void) retention_clear_pending();
+	if (rc != 0 && pending && published)
+		retention_is_poisoned = 1;
 	if (rc != 0 && !retention_is_poisoned)
 		retention_defer_compact();
 	pthread_mutex_unlock(&retention_lock);

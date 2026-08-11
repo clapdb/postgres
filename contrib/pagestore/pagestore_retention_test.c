@@ -52,6 +52,7 @@ main(void)
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
+	char		current[520];
 	PsRetentionPin pin = {0};
 	PsRetentionPin got;
 	uint32_t	count = 0;
@@ -68,6 +69,7 @@ main(void)
 	snprintf(path, sizeof(path), "%s/retention.meta", dir);
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	snprintf(backup, sizeof(backup), "%s.backup", path);
+	snprintf(current, sizeof(current), "%s.current", path);
 	check(ps_retention_open(dir) == 0, "open an empty registry");
 	pin.timeline = 7;
 	pin.owner_kind = PS_RETENTION_OWNER_READER;
@@ -97,11 +99,17 @@ main(void)
 		check(ps_retention_set(&pin) == 0, "append another replacement SET");
 	}
 	check(ps_retention_compact() == 0, "compact replacement generation");
+	check(copy_file(path, current) == 0, "save the current registry generation");
 	check(rename(backup, path) == 0,
 		  "atomically restore an older same-sized registry");
 	check(ps_retention_set(&pin) != 0,
 		  "exact SET rejects a same-sized registry with a different identity");
 	ps_retention_close();
+	check(ps_retention_open(dir) != 0,
+		  "committed-prefix hash rejects the replaced registry after restart");
+	ps_retention_close();
+	check(rename(current, path) == 0,
+		  "restore the committed registry generation after mismatch test");
 
 	fd = open(path, O_WRONLY | O_APPEND);
 	check(fd >= 0 && write(fd, "short", 5) == 5 && fsync(fd) == 0,
@@ -109,9 +117,21 @@ main(void)
 	if (fd >= 0)
 		close(fd);
 	check(ps_retention_open(dir) == 0, "short final record is recoverable");
-	check(ps_retention_get(0, &got, &count) == 1 && count == 1 && got.lsn == 169,
+	check(ps_retention_get(0, &got, &count) == 1 && count == 1 && got.lsn == 239,
 		  "short-tail recovery preserves the committed SET");
 	ps_retention_close();
+	check(copy_file(path, current) == 0,
+		  "save registry before complete-prefix truncation");
+	fd = open(path, O_WRONLY);
+	check(fd >= 0 && ftruncate(fd, 0) == 0 && fsync(fd) == 0,
+		  "truncate registry at a complete-record boundary");
+	if (fd >= 0)
+		close(fd);
+	check(ps_retention_open(dir) != 0,
+		  "committed-prefix state rejects complete-record loss after restart");
+	ps_retention_close();
+	check(rename(current, path) == 0,
+		  "restore registry after complete-prefix truncation test");
 
 	fd = open(path, O_RDWR);
 	check(fd >= 0 && pread(fd, &byte, 1, 0) == 1,
@@ -139,6 +159,20 @@ main(void)
 	check(ps_retention_set(&pin) == 0,
 		  "persist pin before rollback-failure test");
 	ps_retention_close();
+	check(setenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE", "1", 1) == 0,
+		  "enable append fault injection");
+	check(ps_retention_open(faildir) == 0,
+		  "reopen registry with append fault injection");
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id) != 0,
+		  "failed DROP is not acknowledged after a proven rollback");
+	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
+		  got.lsn == pin.lsn,
+		  "proven rollback keeps the registry usable");
+	pin.lsn++;
+	check(ps_retention_set(&pin) == 0,
+		  "a new mutation succeeds after the proven rollback");
+	ps_retention_close();
+	unsetenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
 	check(setenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE", "1", 1) == 0 &&
 		  setenv("PS_TEST_FAIL_RETENTION_ROLLBACK", "1", 1) == 0,
 		  "enable retention append and rollback fault injection");
@@ -149,24 +183,35 @@ main(void)
 	ps_retention_close();
 	unsetenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
 	unsetenv("PS_TEST_FAIL_RETENTION_ROLLBACK");
-	snprintf(path, sizeof(path), "%s/retention.failed", faildir);
+	snprintf(path, sizeof(path), "%s/retention.pending", faildir);
 	check(stat(path, &before) == 0,
-		  "failed rollback leaves a durable fail-closed marker");
+		  "failed rollback leaves the pre-durable fail-closed guard");
 	check(ps_retention_open(faildir) != 0,
 		  "restart rejects a registry with an uncertain full DROP");
 	ps_retention_close();
 
 	unlink(tmp);
 	unlink(backup);
+	unlink(current);
 	unlink(path);
 	snprintf(tmp, sizeof(tmp), "%s/retention.initialized", dir);
+	unlink(tmp);
+	snprintf(tmp, sizeof(tmp), "%s/retention.state", dir);
+	unlink(tmp);
+	snprintf(tmp, sizeof(tmp), "%s/retention.state.tmp", dir);
+	unlink(tmp);
+	snprintf(tmp, sizeof(tmp), "%s/retention.pending", dir);
 	unlink(tmp);
 	rmdir(dir);
 	snprintf(path, sizeof(path), "%s/retention.meta", faildir);
 	unlink(path);
 	snprintf(path, sizeof(path), "%s/retention.initialized", faildir);
 	unlink(path);
-	snprintf(path, sizeof(path), "%s/retention.failed", faildir);
+	snprintf(path, sizeof(path), "%s/retention.pending", faildir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state", faildir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state.tmp", faildir);
 	unlink(path);
 	rmdir(faildir);
 	if (!failed)
