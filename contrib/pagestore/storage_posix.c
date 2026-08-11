@@ -213,6 +213,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *crash_after_writes;
 	const char *fail_fork_meta_at;
 	const char *max_log_read;
+	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
@@ -233,6 +234,17 @@ posix_open(const char *path, uint64_t segment_size)
 	max_log_read = getenv("PAGESTORE_TEST_MAX_LOG_READ");
 	test_max_log_read = max_log_read ? atoi(max_log_read) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
+	/* A prior metadata rename whose directory sync failed must be made durable
+	 * before this process can accept writes against its visible replacement. */
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 || fsync(dfd) != 0)
+	{
+		if (dfd >= 0)
+			close(dfd);
+		return -1;
+	}
+	if (close(dfd) != 0)
+		return -1;
 	return 0;
 }
 
@@ -780,6 +792,58 @@ posix_meta_read(uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+posix_meta_rewrite(const void *buf, uint32_t len)
+{
+	char path[4096], tmp[4096];
+	int fd = -1, dfd = -1, rc = -1;
+	ssize_t n;
+
+	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
+	snprintf(tmp, sizeof(tmp), "%s/timelines.tmp", posix_dir);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		goto out;
+	for (uint32_t off = 0; off < len; )
+	{
+		n = write(fd, (const char *) buf + off, len - off);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		off += (uint32_t) n;
+	}
+	if (fsync(fd) != 0)
+		goto out;
+	/* A failing close leaves the descriptor's state unspecified; do not retry
+	 * it in cleanup, but still remove the uncommitted temporary file. */
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto out;
+	}
+	fd = -1;
+	if (rename(tmp, path) != 0)
+		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 || fsync(dfd) != 0)
+		goto out;
+	if (close(dfd) != 0)
+		goto out;
+	dfd = -1;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	if (dfd >= 0)
+		close(dfd);
+	if (rc != 0)
+		unlink(tmp);
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
+static int
 posix_fork_meta_append(const void *buf, uint32_t len)
 {
 	/* Standalone-test fault injection; ordinary deployments leave this zero. */
@@ -838,6 +902,7 @@ const PsStorage PsStoragePosix = {
 	.walidx_truncate = posix_walidx_truncate,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
+	.meta_rewrite = posix_meta_rewrite,
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
 	.fork_meta_truncate = posix_fork_meta_truncate,

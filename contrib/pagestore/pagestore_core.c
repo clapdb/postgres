@@ -1975,10 +1975,42 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
+#define TIMELINE_META_V2_MAGIC 0x324d4c54U /* "TLM2" */
+typedef struct TimelineRecV2
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t id;
+	int32_t parent;
+	uint64_t branch_lsn;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecV2;
+
+static uint32_t
+timeline_rec_crc(TimelineRecV2 *rec)
+{
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
 static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
-	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
+	TimelineRecV2 rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.id = id;
+	rec.parent = (int32_t) parent;
+	rec.branch_lsn = branch_lsn;
+	rec.crc = timeline_rec_crc(&rec);
 
 	return ps_storage->meta_append(&rec, sizeof(rec));
 }
@@ -2187,29 +2219,75 @@ load_fork_meta(void)
 	return 0;
 }
 
-static void
+static int
 load_timelines(void)
 {
-	TimelineRec rec;
-	uint64_t	off = 0;
+	uint32_t magic;
+	uint64_t off = 0;
+	TimelineRec legacy[ MAX_TIMELINES ];
+	uint32_t nlegacy = 0;
+	int n;
 
-	/*
-	 * Records are appended in creation order, so a record's parent is defined by
-	 * an earlier record (or is the root).  Re-validate each with the same check
-	 * used at creation, so a corrupt, truncated, or duplicated persisted record
-	 * cannot reintroduce an undefined parent or a cycle that the creation path
-	 * rejects -- which would otherwise hang read_through()'s ancestry walk after
-	 * a restart.  Invalid records are skipped, not applied.
-	 */
-	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
+	n = ps_storage->meta_read(0, &magic, sizeof(magic));
+	if (n < 0 && errno == ENOENT)
+		return 0;
+	if (n == 0)
+		return 0;
+	if (n != (int) sizeof(magic))
+		return -1;
+	if (magic == TIMELINE_META_V2_MAGIC)
 	{
-		if (branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+		TimelineRecV2 rec;
+		for (;;)
+		{
+			n = ps_storage->meta_read(off, &rec, sizeof(rec));
+			if (n == 0)
+				return 0;
+			if (n != (int) sizeof(rec) || rec.magic != TIMELINE_META_V2_MAGIC ||
+				rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+				rec.crc != timeline_rec_crc(&rec) ||
+				rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+				!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+				return -1;
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
-		else
-			fprintf(stderr, "pagestore: skipping invalid timeline record "
-					"(id=%u parent=%d)\n", rec.id, rec.parent);
+			off += sizeof(rec);
+		}
+	}
+	/* Legacy records are accepted only when complete and valid, then atomically
+	 * rewritten in the checksummed format before the daemon becomes writable. */
+	off = 0;
+	for (;;)
+	{
+		TimelineRec rec;
+		n = ps_storage->meta_read(off, &rec, sizeof(rec));
+		if (n == 0)
+			break;
+		if (n != (int) sizeof(rec) || nlegacy == MAX_TIMELINES ||
+			rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+			!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+			return -1;
+		legacy[nlegacy++] = rec;
+		timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		off += sizeof(rec);
 	}
+	if (nlegacy > 0)
+	{
+		TimelineRecV2 out[MAX_TIMELINES];
+		for (uint32_t i = 0; i < nlegacy; i++)
+		{
+			memset(&out[i], 0, sizeof(out[i]));
+			out[i].magic = TIMELINE_META_V2_MAGIC;
+			out[i].rec_len = sizeof(out[i]);
+			out[i].id = legacy[i].id;
+			out[i].parent = legacy[i].parent;
+			out[i].branch_lsn = legacy[i].branch_lsn;
+			out[i].crc = timeline_rec_crc(&out[i]);
+		}
+		if (!ps_storage->meta_rewrite ||
+			ps_storage->meta_rewrite(out, nlegacy * sizeof(out[0])) != 0)
+			return -1;
+	}
+	return 0;
 }
 
 /* ===================== shipped WAL log (per timeline) ================== */
@@ -5555,6 +5633,8 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
+	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
@@ -5629,7 +5709,11 @@ ps_core_open(const char *store_dir)
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
-	load_timelines();
+	if (load_timelines() != 0)
+	{
+		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
+		return -1;
+	}
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
 	{
