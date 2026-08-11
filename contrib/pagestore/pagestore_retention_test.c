@@ -20,12 +20,37 @@ check(int condition, const char *message)
 	}
 }
 
+static int
+copy_file(const char *src, const char *dst)
+{
+	unsigned char buf[4096];
+	int in = open(src, O_RDONLY);
+	int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	ssize_t n;
+	int rc = -1;
+
+	if (in < 0 || out < 0)
+		goto done;
+	while ((n = read(in, buf, sizeof(buf))) > 0)
+		if (write(out, buf, (size_t) n) != n)
+			goto done;
+	if (n == 0 && fsync(out) == 0)
+		rc = 0;
+done:
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	return rc;
+}
+
 int
 main(void)
 {
 	char		dir[] = "/tmp/psretentionXXXXXX";
 	char		path[512];
 	char		tmp[520];
+	char		backup[520];
 	PsRetentionPin pin = {0};
 	PsRetentionPin got;
 	uint32_t	count = 0;
@@ -41,6 +66,7 @@ main(void)
 	}
 	snprintf(path, sizeof(path), "%s/retention.meta", dir);
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	snprintf(backup, sizeof(backup), "%s.backup", path);
 	check(ps_retention_open(dir) == 0, "open an empty registry");
 	pin.timeline = 7;
 	pin.owner_kind = PS_RETENTION_OWNER_READER;
@@ -63,6 +89,17 @@ main(void)
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.timeline == 7 && got.owner_id == 42 && got.lsn == 169,
 		  "compacted owner state survives replay");
+	check(copy_file(path, backup) == 0, "save a same-sized valid old registry");
+	for (uint64_t i = 0; i < 70; i++)
+	{
+		pin.lsn = 170 + i;
+		check(ps_retention_set(&pin) == 0, "append another replacement SET");
+	}
+	check(ps_retention_compact() == 0, "compact replacement generation");
+	check(rename(backup, path) == 0,
+		  "atomically restore an older same-sized registry");
+	check(ps_retention_set(&pin) != 0,
+		  "exact SET rejects a same-sized registry with a different identity");
 	ps_retention_close();
 
 	fd = open(path, O_WRONLY | O_APPEND);
@@ -89,8 +126,16 @@ main(void)
 		  "a complete corrupt record fails closed instead of dropping a pin");
 	ps_retention_close();
 
+	check(unlink(path) == 0, "remove an initialized retention registry");
+	check(ps_retention_open(dir) != 0,
+		  "an initialized store fails closed when its registry is missing");
+	ps_retention_close();
+
 	unlink(tmp);
+	unlink(backup);
 	unlink(path);
+	snprintf(tmp, sizeof(tmp), "%s/retention.initialized", dir);
+	unlink(tmp);
 	rmdir(dir);
 	if (!failed)
 		fprintf(stderr, "retention registry test: PASS\n");

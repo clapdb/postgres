@@ -2818,6 +2818,13 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 900,
 		  "dropping the reader leaves the nested structural fork floor");
+	for (uint64_t owner = 1000; owner < 2025; owner++)
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, owner,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
+			  PS_STATUS_OK, "registry admits more owners than timelines");
+	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
+		  PS_STATUS_OK && floor == 900,
+		  "floor snapshot covers every owner beyond MAX_TIMELINES");
 	client_detach();
 	stop_daemon(dpid);
 
@@ -2832,7 +2839,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
-	check(op_retention_get(1, &pin, &count) && count == 2,
+	check(op_retention_get(1, &pin, &count) && count == 1027,
 		  "restart truncates a short tail without losing committed pins");
 	client_detach();
 	stop_daemon(dpid);

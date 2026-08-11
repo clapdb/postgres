@@ -141,8 +141,6 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_APPEND:
 		case PS_OP_WAL_INDEX_ADD:
 		case PS_OP_WAL_INDEX_ADD_BATCH:
-		case PS_OP_RETENTION_PIN_SET:
-		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_IMMEDSYNC:
 			return 1;
 		case PS_OP_EXISTS:
@@ -154,6 +152,8 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
 		case PS_OP_RETENTION_PIN_GET:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
 			return 0;
@@ -377,6 +377,25 @@ run_request(uint32_t i, PsChannel *ch)
 	PsOpcode	op = (PsOpcode) ch->opcode;
 	int			is_write = request_is_write(op);
 	uint64_t	epoch;
+
+	/* Retention registry mutations own their own mutex and can fsync host
+	 * metadata.  Do not hold the global core lock across that latency. */
+	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+	{
+		int timeline_ok;
+
+		pthread_rwlock_rdlock(&core_rwlock);
+		timeline_ok = ps_timeline_defined(ch->timeline);
+		pthread_rwlock_unlock(&core_rwlock);
+		if (timeline_ok)
+			begin(i, ch);
+		else
+		{
+			ch->status = PS_STATUS_ERROR;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+		}
+		return 1;
+	}
 
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{

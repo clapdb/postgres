@@ -23,6 +23,8 @@ extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);
 extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 								 uint32_t *count_out);
+extern int ps_retention_snapshot_alloc(PsRetentionPin **pins_out,
+									   uint32_t *count_out);
 
 extern int ps_retention_should_compact(void);
 extern int ps_retention_compact(void);

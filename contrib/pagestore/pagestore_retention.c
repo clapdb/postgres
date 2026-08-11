@@ -51,12 +51,15 @@ typedef struct PsRetentionRecord
 } PsRetentionRecord;
 
 static char retention_path[4096];
+static char retention_marker_path[4096];
 static char retention_dir[2048];
 static PsRetentionPin *retention_pins;
 static uint32_t retention_npins;
 static uint32_t retention_cap;
 static uint64_t retention_nrecords;
 static int retention_is_poisoned;
+static dev_t retention_dev;
+static ino_t retention_ino;
 static struct timespec retention_compact_retry_at;
 static pthread_mutex_t retention_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -220,6 +223,33 @@ retention_fsync_dir(void)
 	return rc;
 }
 
+/* Caller holds retention_lock.  The marker is permanent: once a registry has
+ * existed, a missing log must never be interpreted as a new empty registry. */
+static int
+retention_mark_initialized(void)
+{
+	int fd;
+	int rc = 0;
+
+	fd = open(retention_marker_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0)
+		return errno == EEXIST ? 0 : -1;
+	if (fsync(fd) != 0)
+		rc = -1;
+	if (close(fd) != 0)
+		rc = -1;
+	if (rc == 0 && retention_fsync_dir() != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
+retention_identity_matches(const struct stat *st)
+{
+	return retention_ino != 0 && st->st_dev == retention_dev &&
+		st->st_ino == retention_ino;
+}
+
 static void
 retention_rollback(int fd, off_t old_size, int created)
 {
@@ -267,12 +297,23 @@ retention_append(const PsRetentionRecord *rec)
 	}
 	/* Detect an externally lost/truncated/replaced log before appending after
 	 * the gap.  Replaying such a file could silently omit the last live SET. */
-	if (old_size != (off_t) (retention_nrecords * sizeof(*rec)))
 	{
-		errno = EILSEQ;
-		retention_rollback(fd, old_size, created);
-		retention_is_poisoned = 1;
-		return -1;
+		struct stat st;
+
+		if (fstat(fd, &st) != 0 ||
+			(!created && !retention_identity_matches(&st)) ||
+			old_size != (off_t) (retention_nrecords * sizeof(*rec)))
+		{
+			errno = EILSEQ;
+			retention_rollback(fd, old_size, created);
+			retention_is_poisoned = 1;
+			return -1;
+		}
+		if (created)
+		{
+			retention_dev = st.st_dev;
+			retention_ino = st.st_ino;
+		}
 	}
 	if (write(fd, rec, sizeof(*rec)) != (ssize_t) sizeof(*rec) ||
 		fsync(fd) != 0)
@@ -294,6 +335,11 @@ retention_append(const PsRetentionRecord *rec)
 		fd = open(retention_path, O_WRONLY);
 		if (fd >= 0)
 			retention_rollback(fd, old_size, created);
+		retention_is_poisoned = 1;
+		return -1;
+	}
+	if (created && retention_mark_initialized() != 0)
+	{
 		retention_is_poisoned = 1;
 		return -1;
 	}
@@ -330,6 +376,8 @@ ps_retention_open(const char *store_dir)
 	retention_cap = 0;
 	retention_nrecords = 0;
 	retention_is_poisoned = 0;
+	retention_dev = 0;
+	retention_ino = 0;
 	n = snprintf(retention_dir, sizeof(retention_dir), "%s", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_dir))
 		goto done;
@@ -337,15 +385,22 @@ ps_retention_open(const char *store_dir)
 				 store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_path))
 		goto done;
+	n = snprintf(retention_marker_path, sizeof(retention_marker_path),
+				 "%s/retention.initialized", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(retention_marker_path))
+		goto done;
 	fd = open(retention_path, O_RDWR);
 	if (fd < 0)
 	{
-		if (errno == ENOENT)
+		if (errno == ENOENT && access(retention_marker_path, F_OK) != 0 &&
+			errno == ENOENT)
 			rc = 0;
 		goto done;
 	}
 	if (fstat(fd, &st) != 0)
 		goto done;
+	retention_dev = st.st_dev;
+	retention_ino = st.st_ino;
 	while (off + (off_t) sizeof(PsRetentionRecord) <= st.st_size)
 	{
 		PsRetentionRecord rec;
@@ -366,6 +421,8 @@ ps_retention_open(const char *store_dir)
 	 * would be unsafe; truncate it before accepting any new mutation. */
 	if (off != st.st_size &&
 		(ftruncate(fd, off) != 0 || fsync(fd) != 0))
+		goto done;
+	if (retention_mark_initialized() != 0)
 		goto done;
 	rc = 0;
 done:
@@ -393,7 +450,10 @@ ps_retention_close(void)
 	retention_cap = 0;
 	retention_nrecords = 0;
 	retention_path[0] = '\0';
+	retention_marker_path[0] = '\0';
 	retention_dir[0] = '\0';
+	retention_dev = 0;
+	retention_ino = 0;
 	pthread_mutex_unlock(&retention_lock);
 }
 
@@ -415,6 +475,7 @@ ps_retention_set(const PsRetentionPin *pin)
 		struct stat st;
 
 		if (stat(retention_path, &st) == 0 &&
+			retention_identity_matches(&st) &&
 			st.st_size == (off_t) (retention_nrecords * sizeof(rec)))
 			rc = 0;			/* exact retry: no log churn */
 		else
@@ -531,6 +592,33 @@ ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 }
 
 int
+ps_retention_snapshot_alloc(PsRetentionPin **pins_out, uint32_t *count_out)
+{
+	PsRetentionPin *snapshot = NULL;
+	int			rc = -1;
+
+	if (!pins_out || !count_out)
+		return -1;
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		goto done;
+	if (retention_npins > 0)
+	{
+		snapshot = malloc((size_t) retention_npins * sizeof(*snapshot));
+		if (!snapshot)
+			goto done;
+		memcpy(snapshot, retention_pins,
+			   (size_t) retention_npins * sizeof(*snapshot));
+	}
+	*pins_out = snapshot;
+	*count_out = retention_npins;
+	rc = 0;
+done:
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
 ps_retention_should_compact(void)
 {
 	int			should;
@@ -589,6 +677,17 @@ ps_retention_compact(void)
 	{
 		retention_is_poisoned = 1;
 		goto done;
+	}
+	{
+		struct stat st;
+
+		if (stat(retention_path, &st) != 0)
+		{
+			retention_is_poisoned = 1;
+			goto done;
+		}
+		retention_dev = st.st_dev;
+		retention_ino = st.st_ino;
 	}
 	retention_nrecords = retention_npins;
 	memset(&retention_compact_retry_at, 0, sizeof(retention_compact_retry_at));

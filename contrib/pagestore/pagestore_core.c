@@ -4061,6 +4061,79 @@ done:
 	return rc;
 }
 
+/* Scan one timeline's local control versions through cap.  This is used by
+ * the batched effective-floor path so each descendant is read exactly once. */
+static int
+wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
+					   uint64_t *floor)
+{
+	PsKey		key;
+	PageEnt    *notes;
+	PageEnt    *images;
+
+	memset(&key, 0, sizeof(key));
+	key.klass = PS_KLASS_CONTROL;
+	notes = page_find(timeline, &key, 1);
+	images = page_find(timeline, &key, 0);
+	if (notes)
+	{
+		for (int i = 0; i < notes->nver; i++)
+		{
+			PageVer *v = &notes->vers[i];
+			uint64_t redo;
+
+			if (v->lsn > cap)
+				continue;
+			if (v->seg >= 0)
+			{
+				if (read_version(v, tmp) != 0)
+					return -1;
+			}
+			else
+			{
+				uint64_t layer_lsn;
+
+				if (layer_map_lookup(timeline, &key, 1, v->lsn, 0, v->lsn,
+								 &layer_lsn, NULL, tmp) != 1 ||
+					layer_lsn != v->lsn)
+					return -1;
+			}
+			memcpy(&redo, tmp, sizeof(redo));
+			if (redo == 0)
+			{
+				*floor = 1;
+				return 0;
+			}
+			if (*floor == 0 || redo < *floor)
+				*floor = redo;
+		}
+	}
+	if (images)
+	{
+		for (int i = 0; i < images->nver; i++)
+		{
+			PageVer *v = &images->vers[i];
+			int covered = 0;
+
+			if (v->lsn > cap)
+				continue;
+			if (notes)
+				for (int j = 0; j < notes->nver; j++)
+					if (notes->vers[j].lsn == v->lsn)
+					{
+						covered = 1;
+						break;
+					}
+			if (!covered)
+			{
+				*floor = 1;
+				return 0;
+			}
+		}
+	}
+	return 0;
+}
+
 static void
 retention_floor_add(uint64_t candidate, uint64_t *floor)
 {
@@ -4109,9 +4182,11 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		uint64_t	cap;
 	} RetentionControlProjection;
 	RetentionControlProjection controls[MAX_TIMELINES];
+	TlWalk		ancestors[MAX_TIMELINES];
 	uint32_t	ncontrols = 0;
+	uint32_t	nancestors = 0;
 	uint32_t	npins = 0;
-	PsRetentionPin pins[MAX_TIMELINES];
+	PsRetentionPin *pins = NULL;
 	uint64_t	floor = 0;
 
 	if (resource != PS_RETENTION_RESOURCE_PAGE_HISTORY &&
@@ -4121,9 +4196,10 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 
 	ps_lock_map_rd();
 	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
-		ps_retention_snapshot(pins, MAX_TIMELINES, &npins) != 0)
+		ps_retention_snapshot_alloc(&pins, &npins) != 0)
 	{
 		ps_unlock_map();
+		free(pins);
 		return -1;
 	}
 	for (uint32_t i = 0; i < npins; i++)
@@ -4137,6 +4213,7 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 			!timelines[pin.timeline].defined)
 		{
 			ps_unlock_map();
+			free(pins);
 			return -1;
 		}
 		if ((pin.resources & resource) == 0)
@@ -4145,6 +4222,7 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		if (retention_project_lsn(pin.timeline, timeline, &projected))
 			retention_floor_add(projected, &floor);
 	}
+	free(pins);
 
 	/* Every descendant can be started or read again later even with no active
 	 * owner pin.  Project all of their branch caps, not just direct children: a
@@ -4162,24 +4240,53 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		if (resource == PS_RETENTION_RESOURCE_WAL)
 		{
 			controls[ncontrols].timeline = candidate;
-			controls[ncontrols].cap = cap;
+			controls[ncontrols].cap = UINT64_MAX;
 			ncontrols++;
+		}
+	}
+	if (resource == PS_RETENTION_RESOURCE_WAL)
+	{
+		uint32_t current = timeline;
+		uint64_t cap = UINT64_MAX;
+
+		while (timeline_has_parent(current))
+		{
+			if (nancestors >= MAX_TIMELINES)
+			{
+				ps_unlock_map();
+				return -1;
+			}
+			if (timelines[current].branch_lsn < cap)
+				cap = timelines[current].branch_lsn;
+			current = (uint32_t) timelines[current].parent;
+			ancestors[nancestors].tl = current;
+			ancestors[nancestors].lsn = cap;
+			nancestors++;
 		}
 	}
 	ps_unlock_map();
 
-	for (uint32_t i = 0; i < ncontrols; i++)
+	if (resource == PS_RETENTION_RESOURCE_WAL)
 	{
-		uint64_t	control_floor = 0;
+		unsigned char *tmp = malloc(page_size);
 
-		if (wal_retain_floor(controls[i].timeline, &control_floor) != 0)
+		if (!tmp)
 			return -1;
-		if (control_floor != 0)
-		{
-			if (controls[i].cap < control_floor)
-				control_floor = controls[i].cap;
-			retention_floor_add(control_floor, &floor);
-		}
+		for (uint32_t i = 0; i < ncontrols && floor != 1; i++)
+			if (wal_retain_floor_level(controls[i].timeline,
+								   controls[i].cap, tmp, &floor) != 0)
+			{
+				free(tmp);
+				return -1;
+			}
+		for (uint32_t i = 0; i < nancestors && floor != 1; i++)
+			if (wal_retain_floor_level(ancestors[i].tl, ancestors[i].lsn,
+								   tmp, &floor) != 0)
+			{
+				free(tmp);
+				return -1;
+			}
+		free(tmp);
 	}
 	*floor_out = floor;
 	return 0;
