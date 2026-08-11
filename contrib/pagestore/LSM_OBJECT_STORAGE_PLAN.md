@@ -290,13 +290,22 @@ GC candidates.
 
 ## Garbage collection
 
-GC depends on a retained-LSN horizon:
+GC depends on a retained-LSN horizon.  The implemented registry tracks an LSN
+and a page/WAL/WAL-index resource mask for each reader, materializer, and
+configured owner generation; branch pins remain structural timeline metadata,
+and restorable control images contribute to the WAL resource:
 
 ```text
 retain_lsn = min(active read LSNs,
                  branch/timeline required LSNs,
-                 configured retention LSN)
+                 materializer required LSNs,
+                 configured retention LSN,
+                 restorable control redo LSNs [WAL only])
 ```
+
+Pins on descendants are projected onto each ancestor through the intervening
+fork LSNs.  A zero result means no owner constrains that resource; a branch at
+LSN zero is reported as floor 1 (retain everything), avoiding ambiguity.
 
 A layer can be removed only when:
 

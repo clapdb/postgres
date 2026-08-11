@@ -47,6 +47,7 @@
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
 #include "pagestore_pgcache.h"
+#include "pagestore_retention.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -1760,6 +1761,12 @@ timeline_has_parent(uint32_t timeline)
 		timelines[timeline].parent >= 0;
 }
 
+int
+ps_timeline_defined(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES && timelines[timeline].defined;
+}
+
 /*
  * Ancestry iterator.  A read on a branch resolves against the branch and then
  * each ancestor, with read_lsn frozen at each branch point so the branch sees a
@@ -1968,10 +1975,42 @@ typedef struct TimelineRec
 	uint64_t	branch_lsn;
 } TimelineRec;
 
+#define TIMELINE_META_V2_MAGIC 0x324d4c54U /* "TLM2" */
+typedef struct TimelineRecV2
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t id;
+	int32_t parent;
+	uint64_t branch_lsn;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecV2;
+
+static uint32_t
+timeline_rec_crc(TimelineRecV2 *rec)
+{
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
 static int
 timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
 {
-	TimelineRec rec = {id, (int32_t) parent, branch_lsn};
+	TimelineRecV2 rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.id = id;
+	rec.parent = (int32_t) parent;
+	rec.branch_lsn = branch_lsn;
+	rec.crc = timeline_rec_crc(&rec);
 
 	return ps_storage->meta_append(&rec, sizeof(rec));
 }
@@ -2180,29 +2219,94 @@ load_fork_meta(void)
 	return 0;
 }
 
-static void
+static int
 load_timelines(void)
 {
-	TimelineRec rec;
-	uint64_t	off = 0;
+	uint32_t magic;
+	uint64_t off = 0;
+	TimelineRec legacy[ MAX_TIMELINES ];
+	uint32_t nlegacy = 0;
+	int n;
 
-	/*
-	 * Records are appended in creation order, so a record's parent is defined by
-	 * an earlier record (or is the root).  Re-validate each with the same check
-	 * used at creation, so a corrupt, truncated, or duplicated persisted record
-	 * cannot reintroduce an undefined parent or a cycle that the creation path
-	 * rejects -- which would otherwise hang read_through()'s ancestry walk after
-	 * a restart.  Invalid records are skipped, not applied.
-	 */
-	while (ps_storage->meta_read(off, &rec, sizeof(rec)) == (int) sizeof(rec))
+	n = ps_storage->meta_read(0, &magic, sizeof(magic));
+	if (n < 0 && errno == ENOENT)
+		return 0;
+	if (n == 0)
+		return 0;
+	if (n != (int) sizeof(magic))
 	{
-		if (branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+		if (n > 0 && ps_storage->meta_truncate &&
+			ps_storage->meta_truncate(0) == 0)
+			return 0;
+		return -1;
+	}
+	if (magic == TIMELINE_META_V2_MAGIC)
+	{
+		TimelineRecV2 rec;
+		for (;;)
+		{
+			n = ps_storage->meta_read(off, &rec, sizeof(rec));
+			if (n == 0)
+				return 0;
+			if (n != (int) sizeof(rec))
+			{
+				if (n > 0 && ps_storage->meta_truncate &&
+					ps_storage->meta_truncate(off) == 0)
+					return 0;
+				return -1;
+			}
+			if (rec.magic != TIMELINE_META_V2_MAGIC ||
+				rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+				rec.crc != timeline_rec_crc(&rec) ||
+				rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+				!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+				return -1;
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
-		else
-			fprintf(stderr, "pagestore: skipping invalid timeline record "
-					"(id=%u parent=%d)\n", rec.id, rec.parent);
+			off += sizeof(rec);
+		}
+	}
+	/* Legacy records are accepted only when complete and valid, then atomically
+	 * rewritten in the checksummed format before the daemon becomes writable. */
+	off = 0;
+	for (;;)
+	{
+		TimelineRec rec;
+		n = ps_storage->meta_read(off, &rec, sizeof(rec));
+		if (n == 0)
+			break;
+		if (n != (int) sizeof(rec))
+		{
+			if (n < 0 || !ps_storage->meta_truncate ||
+				ps_storage->meta_truncate(off) != 0)
+				return -1;
+			break;
+		}
+		if (nlegacy == MAX_TIMELINES ||
+			rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+			!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+			return -1;
+		legacy[nlegacy++] = rec;
+		timeline_define(rec.id, rec.parent, rec.branch_lsn);
 		off += sizeof(rec);
 	}
+	if (nlegacy > 0)
+	{
+		TimelineRecV2 out[MAX_TIMELINES];
+		for (uint32_t i = 0; i < nlegacy; i++)
+		{
+			memset(&out[i], 0, sizeof(out[i]));
+			out[i].magic = TIMELINE_META_V2_MAGIC;
+			out[i].rec_len = sizeof(out[i]);
+			out[i].id = legacy[i].id;
+			out[i].parent = legacy[i].parent;
+			out[i].branch_lsn = legacy[i].branch_lsn;
+			out[i].crc = timeline_rec_crc(&out[i]);
+		}
+		if (!ps_storage->meta_rewrite ||
+			ps_storage->meta_rewrite(out, nlegacy * sizeof(out[0])) != 0)
+			return -1;
+	}
+	return 0;
 }
 
 /* ===================== shipped WAL log (per timeline) ================== */
@@ -3833,6 +3937,75 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * Returns 0 when no control image exists (nothing constrains WAL yet).  Any
  * future shipped-WAL GC must refuse to drop WAL at or above this floor.
  */
+typedef struct ControlLsnSlot
+{
+	uint64_t	lsn;
+	unsigned char used;
+} ControlLsnSlot;
+
+/* Return 1 when every image through cap has a same-LSN note, 0 when one is
+ * missing, and -1 when coverage cannot be proved.  Version chains are in
+ * arrival rather than LSN order, so use a one-pass hash set instead of a
+ * quadratic nested scan. */
+static int
+control_images_covered(PageEnt *notes, PageEnt *images, uint64_t cap)
+{
+	ControlLsnSlot *slots;
+	size_t		nslots = 1;
+
+	if (!images)
+		return 1;
+	if (!notes)
+	{
+		for (int i = 0; i < images->nver; i++)
+			if (images->vers[i].lsn <= cap)
+				return 0;
+		return 1;
+	}
+	while (nslots < (size_t) notes->nver * 2 + 1)
+	{
+		if (nslots > SIZE_MAX / 2)
+			return -1;
+		nslots *= 2;
+	}
+	slots = calloc(nslots, sizeof(*slots));
+	if (!slots)
+		return -1;
+	for (int i = 0; i < notes->nver; i++)
+	{
+		uint64_t lsn = notes->vers[i].lsn;
+		size_t pos;
+
+		if (lsn > cap)
+			continue;
+		pos = (size_t) ((lsn ^ (lsn >> 33)) * 0xff51afd7ed558ccdULL) &
+			(nslots - 1);
+		while (slots[pos].used && slots[pos].lsn != lsn)
+			pos = (pos + 1) & (nslots - 1);
+		slots[pos].used = 1;
+		slots[pos].lsn = lsn;
+	}
+	for (int i = 0; i < images->nver; i++)
+	{
+		uint64_t lsn = images->vers[i].lsn;
+		size_t pos;
+
+		if (lsn > cap)
+			continue;
+		pos = (size_t) ((lsn ^ (lsn >> 33)) * 0xff51afd7ed558ccdULL) &
+			(nslots - 1);
+		while (slots[pos].used && slots[pos].lsn != lsn)
+			pos = (pos + 1) & (nslots - 1);
+		if (!slots[pos].used)
+		{
+			free(slots);
+			return 0;
+		}
+	}
+	free(slots);
+	return 1;
+}
+
 int
 wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 {
@@ -3946,25 +4119,17 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 		 */
 		if (images)
 		{
-			for (int i = 0; i < images->nver; i++)
-			{
-				PageVer    *v = &images->vers[i];
-				int			covered = 0;
+			int covered = control_images_covered(notes, images, w.lsn);
 
-				if (v->lsn > w.lsn)
-					continue;
-				if (notes)
-					for (int j = 0; j < notes->nver; j++)
-						if (notes->vers[j].lsn == v->lsn)
-						{
-							covered = 1;
-							break;
-						}
-				if (!covered)
-				{
-					floor = 1;
-					goto done;
-				}
+			if (covered < 0)
+			{
+				rc = -1;
+				goto done;
+			}
+			if (!covered)
+			{
+				floor = 1;
+				goto done;
 			}
 		}
 	}
@@ -3974,6 +4139,226 @@ done:
 	if (rc == 0)
 		*floor_out = floor;
 	return rc;
+}
+
+/* Scan one timeline's local control versions through cap.  This is used by
+ * the batched effective-floor path so each descendant is read exactly once. */
+static int
+wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
+					   uint64_t *floor)
+{
+	PsKey		key;
+	PageEnt    *notes;
+	PageEnt    *images;
+
+	memset(&key, 0, sizeof(key));
+	key.klass = PS_KLASS_CONTROL;
+	notes = page_find(timeline, &key, 1);
+	images = page_find(timeline, &key, 0);
+	if (notes)
+	{
+		for (int i = 0; i < notes->nver; i++)
+		{
+			PageVer *v = &notes->vers[i];
+			uint64_t redo;
+
+			if (v->lsn > cap)
+				continue;
+			if (v->seg >= 0)
+			{
+				if (read_version(v, tmp) != 0)
+					return -1;
+			}
+			else
+			{
+				uint64_t layer_lsn;
+
+				if (layer_map_lookup(timeline, &key, 1, v->lsn, 0, v->lsn,
+								 &layer_lsn, NULL, tmp) != 1 ||
+					layer_lsn != v->lsn)
+					return -1;
+			}
+			memcpy(&redo, tmp, sizeof(redo));
+			if (redo == 0)
+			{
+				*floor = 1;
+				return 0;
+			}
+			if (*floor == 0 || redo < *floor)
+				*floor = redo;
+		}
+	}
+	if (images)
+	{
+		int covered = control_images_covered(notes, images, cap);
+
+		if (covered < 0)
+			return -1;
+		if (!covered)
+		{
+			*floor = 1;
+			return 0;
+		}
+	}
+	return 0;
+}
+
+static void
+retention_floor_add(uint64_t candidate, uint64_t *floor)
+{
+	/* LSN zero is a real branch cap but the public zero result means "no
+	 * constraint".  Floor 1 is the established retain-everything sentinel. */
+	if (candidate == 0)
+		candidate = 1;
+	if (*floor == 0 || candidate < *floor)
+		*floor = candidate;
+}
+
+/* Project one descendant LSN onto target's physical history.  Caller holds
+ * map-rd.  Return 1 if target is an ancestor (including self), else 0. */
+static int
+retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
+{
+	uint32_t	current = descendant;
+	uint32_t	hops = 0;
+
+	while (current != target)
+	{
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current) || ++hops > MAX_TIMELINES)
+			return 0;
+		if (timelines[current].branch_lsn < *lsn)
+			*lsn = timelines[current].branch_lsn;
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 1;
+}
+
+/*
+ * One conservative floor for one resource on one timeline.  Explicit pins on
+ * descendants are projected through every branch cap; a live direct child is
+ * itself a structural pin.  WAL additionally includes every restorable control
+ * image on the target and descendants.  Thus page pruning, WAL GC and WAL-index
+ * GC can share this authority instead of each inventing a partial horizon.
+ */
+static int
+retention_effective_floor(uint32_t timeline, uint32_t resource,
+						  uint64_t *floor_out)
+{
+	typedef struct RetentionControlProjection
+	{
+		uint32_t	timeline;
+		uint64_t	cap;
+	} RetentionControlProjection;
+	RetentionControlProjection controls[MAX_TIMELINES];
+	TlWalk		ancestors[MAX_TIMELINES];
+	uint32_t	ncontrols = 0;
+	uint32_t	nancestors = 0;
+	uint32_t	npins = 0;
+	PsRetentionPin *pins = NULL;
+	uint64_t	floor = 0;
+
+	if (resource != PS_RETENTION_RESOURCE_PAGE_HISTORY &&
+		resource != PS_RETENTION_RESOURCE_WAL &&
+		resource != PS_RETENTION_RESOURCE_WAL_INDEX)
+		return -1;
+
+	ps_lock_map_rd();
+	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
+		ps_retention_snapshot_alloc(&pins, &npins) != 0)
+	{
+		ps_unlock_map();
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		PsRetentionPin pin = pins[i];
+		uint64_t	projected;
+		int			found;
+
+		found = 1;
+		if (found != 1 || pin.timeline >= MAX_TIMELINES ||
+			!timelines[pin.timeline].defined)
+		{
+			ps_unlock_map();
+			free(pins);
+			return -1;
+		}
+		if ((pin.resources & resource) == 0)
+			continue;
+		projected = pin.lsn;
+		if (retention_project_lsn(pin.timeline, timeline, &projected))
+			retention_floor_add(projected, &floor);
+	}
+	free(pins);
+
+	/* Every descendant can be started or read again later even with no active
+	 * owner pin.  Project all of their branch caps, not just direct children: a
+	 * nested branch may fork below its parent's own fork point.  The same walk
+	 * snapshots the descendants whose visible control images constrain WAL. */
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t	cap = UINT64_MAX;
+
+		if (!timelines[candidate].defined ||
+			!retention_project_lsn(candidate, timeline, &cap))
+			continue;
+		if (candidate != timeline)
+			retention_floor_add(cap, &floor);
+		if (resource == PS_RETENTION_RESOURCE_WAL)
+		{
+			controls[ncontrols].timeline = candidate;
+			controls[ncontrols].cap = UINT64_MAX;
+			ncontrols++;
+		}
+	}
+	if (resource == PS_RETENTION_RESOURCE_WAL)
+	{
+		uint32_t current = timeline;
+		uint64_t cap = UINT64_MAX;
+
+		while (timeline_has_parent(current))
+		{
+			if (nancestors >= MAX_TIMELINES)
+			{
+				ps_unlock_map();
+				return -1;
+			}
+			if (timelines[current].branch_lsn < cap)
+				cap = timelines[current].branch_lsn;
+			current = (uint32_t) timelines[current].parent;
+			ancestors[nancestors].tl = current;
+			ancestors[nancestors].lsn = cap;
+			nancestors++;
+		}
+	}
+	ps_unlock_map();
+
+	if (resource == PS_RETENTION_RESOURCE_WAL)
+	{
+		unsigned char *tmp = malloc(page_size);
+
+		if (!tmp)
+			return -1;
+		for (uint32_t i = 0; i < ncontrols && floor != 1; i++)
+			if (wal_retain_floor_level(controls[i].timeline,
+								   controls[i].cap, tmp, &floor) != 0)
+			{
+				free(tmp);
+				return -1;
+			}
+		for (uint32_t i = 0; i < nancestors && floor != 1; i++)
+			if (wal_retain_floor_level(ancestors[i].tl, ancestors[i].lsn,
+								   tmp, &floor) != 0)
+			{
+				free(tmp);
+				return -1;
+			}
+		free(tmp);
+	}
+	*floor_out = floor;
+	return 0;
 }
 
 /* ===================== recovery (layers + segment tail) =============== */
@@ -4592,6 +4977,64 @@ ps_handle_meta(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_RETENTION_PIN_SET:
+			{
+				PsRetentionPin pin;
+
+				memset(&pin, 0, sizeof(pin));
+				pin.timeline = tl;
+				pin.owner_kind = ch->blocknum;
+				pin.resources = ch->parent_timeline;
+				pin.owner_id = ch->req_seq;
+				pin.lsn = ch->req_lsn;
+				if (tl >= MAX_TIMELINES || !timelines[tl].defined ||
+					ps_retention_set(&pin) != 0)
+					ch->status = PS_STATUS_ERROR;
+			}
+			break;
+
+		case PS_OP_RETENTION_PIN_DROP:
+			if (tl >= MAX_TIMELINES || !timelines[tl].defined ||
+				ps_retention_drop(tl, ch->blocknum, ch->req_seq) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+
+		case PS_OP_RETENTION_PIN_GET:
+			{
+				PsRetentionPin pin;
+				uint32_t	count = 0;
+				int			found = ps_retention_get(ch->blocknum, &pin, &count);
+
+				if (found < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+				{
+					ch->nblocks = count;
+					if (found)
+					{
+						ch->result = 1;
+						ch->timeline = pin.timeline;
+						ch->blocknum = pin.owner_kind;
+						ch->parent_timeline = pin.resources;
+						ch->req_seq = pin.owner_id;
+						ch->req_lsn = pin.lsn;
+					}
+				}
+			}
+			break;
+
+		case PS_OP_RETENTION_FLOOR:
+			{
+				uint64_t	floor = 0;
+
+				if (retention_effective_floor(tl, ch->parent_timeline,
+										  &floor) != 0)
+					ch->status = PS_STATUS_ERROR;
+				ch->req_lsn = floor;
+				ch->result = (floor != 0);
+			}
+			break;
+
 		case PS_OP_IMMEDSYNC:
 			/*
 			 * Surface the failure: callers (the pg_control mirror) pop their
@@ -4720,6 +5163,7 @@ ps_core_close(void)
 		}
 	}
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+	ps_retention_close();
 	ps_manifest_close();
 }
 
@@ -5222,6 +5666,11 @@ ps_core_maintenance(void)
 	int			found = 0;
 	int			did = 0;
 
+	/* Pin churn is independent of the layer read path (SPDK uses the same host
+	 * metadata), so bound this log before considering LSM-only work. */
+	if (ps_retention_should_compact())
+		return ps_retention_compact() == 0;
+
 	if (!use_layers)
 		return 0;
 
@@ -5360,6 +5809,8 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
+	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
@@ -5434,7 +5885,32 @@ ps_core_open(const char *store_dir)
 
 	/* timeline 0 is the root; load any persisted branches, then rebuild data */
 	timeline_define(0, -1, 0);
-	load_timelines();
+	if (load_timelines() != 0)
+	{
+		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
+		return -1;
+	}
+	if (ps_retention_open(store_dir) != 0)
+		return -1;
+	{
+		uint32_t	npins = 0;
+
+		if (ps_retention_count(&npins) != 0)
+			return -1;
+		for (uint32_t i = 0; i < npins; i++)
+		{
+			PsRetentionPin pin;
+
+			if (ps_retention_get(i, &pin, NULL) != 1 ||
+				pin.timeline >= MAX_TIMELINES ||
+				!timelines[pin.timeline].defined)
+			{
+				fprintf(stderr, "pagestore: retention pin references an undefined timeline\n");
+				errno = EILSEQ;
+				return -1;
+			}
+		}
+	}
 
 	/*
 	 * Definitive fork-size events (create/truncate/unlink/zero-extend) load

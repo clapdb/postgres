@@ -52,7 +52,7 @@ endif
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
-        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_retention.c'),
   dependencies: [dependency('threads')],
   kwargs: default_bin_args,
 )
@@ -141,7 +141,7 @@ test('pagestore_layer_store',
 pagestore_tiering_test = executable('pagestore_tiering_test',
   files('pagestore_tiering_test.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
-        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_retention.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
@@ -159,6 +159,18 @@ pagestore_manifest_test = executable('pagestore_manifest_test',
 )
 test('pagestore_manifest',
   pagestore_manifest_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for durable retention pins, replay and churn compaction.
+pagestore_retention_test = executable('pagestore_retention_test',
+  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_retention',
+  pagestore_retention_test,
   suite: ['pagestore'],
   timeout: 60,
 )
