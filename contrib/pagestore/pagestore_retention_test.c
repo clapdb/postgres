@@ -49,6 +49,7 @@ main(void)
 {
 	char		dir[] = "/tmp/psretentionXXXXXX";
 	char		faildir[] = "/tmp/psretentionfailXXXXXX";
+	char		legacydir[] = "/tmp/psretentionlegacyXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -190,6 +191,22 @@ main(void)
 		  "restart rejects a registry with an uncertain full DROP");
 	ps_retention_close();
 
+	check(mkdtemp(legacydir) != NULL, "create legacy-guard test directory");
+	check(ps_retention_open(legacydir) == 0,
+		  "open registry for legacy-guard test");
+	check(ps_retention_set(&pin) == 0,
+		  "persist pin before legacy-guard test");
+	ps_retention_close();
+	snprintf(path, sizeof(path), "%s/retention.failed", legacydir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	check(fd >= 0 && fsync(fd) == 0,
+		  "install a legacy uncertain-rollback guard");
+	if (fd >= 0)
+		close(fd);
+	check(ps_retention_open(legacydir) != 0,
+		  "migration honors the legacy fail-closed guard");
+	ps_retention_close();
+
 	unlink(tmp);
 	unlink(backup);
 	unlink(current);
@@ -214,6 +231,15 @@ main(void)
 	snprintf(path, sizeof(path), "%s/retention.state.tmp", faildir);
 	unlink(path);
 	rmdir(faildir);
+	snprintf(path, sizeof(path), "%s/retention.meta", legacydir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.initialized", legacydir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state", legacydir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.failed", legacydir);
+	unlink(path);
+	rmdir(legacydir);
 	if (!failed)
 		fprintf(stderr, "retention registry test: PASS\n");
 	return failed;

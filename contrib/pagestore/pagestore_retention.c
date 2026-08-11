@@ -537,6 +537,7 @@ ps_retention_open(const char *store_dir)
 	int			state_rc;
 	struct stat st;
 	PsRetentionState committed;
+	char		legacy_failed_path[4096];
 	off_t		off = 0;
 
 	pthread_mutex_lock(&retention_lock);
@@ -570,7 +571,18 @@ ps_retention_open(const char *store_dir)
 				 "%s/retention.state", store_dir);
 	if (n < 0 || (size_t) n >= sizeof(retention_state_path))
 		goto done;
+	n = snprintf(legacy_failed_path, sizeof(legacy_failed_path),
+				 "%s/retention.failed", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(legacy_failed_path))
+		goto done;
 	if (access(retention_pending_path, F_OK) == 0 || errno != ENOENT)
+	{
+		errno = EILSEQ;
+		goto done;
+	}
+	/* The immediately preceding format wrote this permanent guard after an
+	 * uncertain rollback.  Never migrate/replay past that evidence. */
+	if (access(legacy_failed_path, F_OK) == 0 || errno != ENOENT)
 	{
 		errno = EILSEQ;
 		goto done;
