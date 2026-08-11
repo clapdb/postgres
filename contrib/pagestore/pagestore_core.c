@@ -3937,6 +3937,75 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
  * Returns 0 when no control image exists (nothing constrains WAL yet).  Any
  * future shipped-WAL GC must refuse to drop WAL at or above this floor.
  */
+typedef struct ControlLsnSlot
+{
+	uint64_t	lsn;
+	unsigned char used;
+} ControlLsnSlot;
+
+/* Return 1 when every image through cap has a same-LSN note, 0 when one is
+ * missing, and -1 when coverage cannot be proved.  Version chains are in
+ * arrival rather than LSN order, so use a one-pass hash set instead of a
+ * quadratic nested scan. */
+static int
+control_images_covered(PageEnt *notes, PageEnt *images, uint64_t cap)
+{
+	ControlLsnSlot *slots;
+	size_t		nslots = 1;
+
+	if (!images)
+		return 1;
+	if (!notes)
+	{
+		for (int i = 0; i < images->nver; i++)
+			if (images->vers[i].lsn <= cap)
+				return 0;
+		return 1;
+	}
+	while (nslots < (size_t) notes->nver * 2 + 1)
+	{
+		if (nslots > SIZE_MAX / 2)
+			return -1;
+		nslots *= 2;
+	}
+	slots = calloc(nslots, sizeof(*slots));
+	if (!slots)
+		return -1;
+	for (int i = 0; i < notes->nver; i++)
+	{
+		uint64_t lsn = notes->vers[i].lsn;
+		size_t pos;
+
+		if (lsn > cap)
+			continue;
+		pos = (size_t) ((lsn ^ (lsn >> 33)) * 0xff51afd7ed558ccdULL) &
+			(nslots - 1);
+		while (slots[pos].used && slots[pos].lsn != lsn)
+			pos = (pos + 1) & (nslots - 1);
+		slots[pos].used = 1;
+		slots[pos].lsn = lsn;
+	}
+	for (int i = 0; i < images->nver; i++)
+	{
+		uint64_t lsn = images->vers[i].lsn;
+		size_t pos;
+
+		if (lsn > cap)
+			continue;
+		pos = (size_t) ((lsn ^ (lsn >> 33)) * 0xff51afd7ed558ccdULL) &
+			(nslots - 1);
+		while (slots[pos].used && slots[pos].lsn != lsn)
+			pos = (pos + 1) & (nslots - 1);
+		if (!slots[pos].used)
+		{
+			free(slots);
+			return 0;
+		}
+	}
+	free(slots);
+	return 1;
+}
+
 int
 wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 {
@@ -4050,25 +4119,17 @@ wal_retain_floor(uint32_t timeline, uint64_t *floor_out)
 		 */
 		if (images)
 		{
-			for (int i = 0; i < images->nver; i++)
-			{
-				PageVer    *v = &images->vers[i];
-				int			covered = 0;
+			int covered = control_images_covered(notes, images, w.lsn);
 
-				if (v->lsn > w.lsn)
-					continue;
-				if (notes)
-					for (int j = 0; j < notes->nver; j++)
-						if (notes->vers[j].lsn == v->lsn)
-						{
-							covered = 1;
-							break;
-						}
-				if (!covered)
-				{
-					floor = 1;
-					goto done;
-				}
+			if (covered < 0)
+			{
+				rc = -1;
+				goto done;
+			}
+			if (!covered)
+			{
+				floor = 1;
+				goto done;
 			}
 		}
 	}
@@ -4129,25 +4190,14 @@ wal_retain_floor_level(uint32_t timeline, uint64_t cap, unsigned char *tmp,
 	}
 	if (images)
 	{
-		for (int i = 0; i < images->nver; i++)
-		{
-			PageVer *v = &images->vers[i];
-			int covered = 0;
+		int covered = control_images_covered(notes, images, cap);
 
-			if (v->lsn > cap)
-				continue;
-			if (notes)
-				for (int j = 0; j < notes->nver; j++)
-					if (notes->vers[j].lsn == v->lsn)
-					{
-						covered = 1;
-						break;
-					}
-			if (!covered)
-			{
-				*floor = 1;
-				return 0;
-			}
+		if (covered < 0)
+			return -1;
+		if (!covered)
+		{
+			*floor = 1;
+			return 0;
 		}
 	}
 	return 0;
