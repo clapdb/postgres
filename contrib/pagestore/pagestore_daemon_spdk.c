@@ -484,11 +484,7 @@ shard_worker(void *arg)
 			{
 				next_maintenance = now + MAINTENANCE_CHECK_NS;
 				if (ps_retention_should_compact())
-				{
-					pthread_rwlock_wrlock(&core_rwlock);
-					did_work |= ps_core_maintenance();
-					pthread_rwlock_unlock(&core_rwlock);
-				}
+					did_work |= ps_retention_compact() == 0;
 			}
 		}
 
