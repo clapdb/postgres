@@ -868,6 +868,12 @@ spdk_meta_read(uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+spdk_meta_truncate(uint64_t len)
+{
+	return PsStoragePosix.meta_truncate(len);
+}
+
+static int
 spdk_meta_rewrite(const void *buf, uint32_t len)
 {
 	return PsStoragePosix.meta_rewrite(buf, len);
@@ -910,6 +916,7 @@ const PsStorage PsStorageSpdk = {
 	.walidx_truncate = spdk_walidx_truncate,
 	.meta_append = spdk_meta_append,
 	.meta_read = spdk_meta_read,
+	.meta_truncate = spdk_meta_truncate,
 	.meta_rewrite = spdk_meta_rewrite,
 	.fork_meta_append = spdk_fork_meta_append,
 	.fork_meta_read = spdk_fork_meta_read,

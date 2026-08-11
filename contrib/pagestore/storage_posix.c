@@ -792,6 +792,35 @@ posix_meta_read(uint64_t off, void *buf, uint32_t len)
 }
 
 static int
+posix_log_truncate(const char *name, uint64_t len)
+{
+	char		path[4096];
+	int			fd;
+	int			rc = 0;
+
+	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
+	pthread_mutex_lock(&posix_log_lock);
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		rc = (errno == ENOENT && len == 0) ? 0 : -1;
+	else
+	{
+		if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
+			rc = -1;
+		if (close(fd) != 0)
+			rc = -1;
+	}
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
+static int
+posix_meta_truncate(uint64_t len)
+{
+	return posix_log_truncate("timelines", len);
+}
+
+static int
 posix_meta_rewrite(const void *buf, uint32_t len)
 {
 	char path[4096], tmp[4096];
@@ -865,24 +894,7 @@ posix_fork_meta_read(uint64_t off, void *buf, uint32_t len)
 static int
 posix_fork_meta_truncate(uint64_t len)
 {
-	char		path[4096];
-	int			fd;
-	int			rc = 0;
-
-	snprintf(path, sizeof(path), "%s/forkmeta", posix_dir);
-	pthread_mutex_lock(&posix_log_lock);
-	fd = open(path, O_WRONLY);
-	if (fd < 0)
-		rc = (errno == ENOENT && len == 0) ? 0 : -1;
-	else
-	{
-		if (ftruncate(fd, (off_t) len) != 0 || fsync(fd) != 0)
-			rc = -1;
-		if (close(fd) != 0)
-			rc = -1;
-	}
-	pthread_mutex_unlock(&posix_log_lock);
-	return rc;
+	return posix_log_truncate("forkmeta", len);
 }
 
 const PsStorage PsStoragePosix = {
@@ -902,6 +914,7 @@ const PsStorage PsStoragePosix = {
 	.walidx_truncate = posix_walidx_truncate,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
+	.meta_truncate = posix_meta_truncate,
 	.meta_rewrite = posix_meta_rewrite,
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,

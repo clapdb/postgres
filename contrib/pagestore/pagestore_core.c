@@ -2234,7 +2234,12 @@ load_timelines(void)
 	if (n == 0)
 		return 0;
 	if (n != (int) sizeof(magic))
+	{
+		if (n > 0 && ps_storage->meta_truncate &&
+			ps_storage->meta_truncate(0) == 0)
+			return 0;
 		return -1;
+	}
 	if (magic == TIMELINE_META_V2_MAGIC)
 	{
 		TimelineRecV2 rec;
@@ -2243,7 +2248,14 @@ load_timelines(void)
 			n = ps_storage->meta_read(off, &rec, sizeof(rec));
 			if (n == 0)
 				return 0;
-			if (n != (int) sizeof(rec) || rec.magic != TIMELINE_META_V2_MAGIC ||
+			if (n != (int) sizeof(rec))
+			{
+				if (n > 0 && ps_storage->meta_truncate &&
+					ps_storage->meta_truncate(off) == 0)
+					return 0;
+				return -1;
+			}
+			if (rec.magic != TIMELINE_META_V2_MAGIC ||
 				rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
 				rec.crc != timeline_rec_crc(&rec) ||
 				rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
@@ -2262,7 +2274,14 @@ load_timelines(void)
 		n = ps_storage->meta_read(off, &rec, sizeof(rec));
 		if (n == 0)
 			break;
-		if (n != (int) sizeof(rec) || nlegacy == MAX_TIMELINES ||
+		if (n != (int) sizeof(rec))
+		{
+			if (n < 0 || !ps_storage->meta_truncate ||
+				ps_storage->meta_truncate(off) != 0)
+				return -1;
+			break;
+		}
+		if (nlegacy == MAX_TIMELINES ||
 			rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
 			!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 			return -1;

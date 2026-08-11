@@ -948,6 +948,30 @@ write_short_wal_payload(const char *store, uint32_t tl, uint64_t start_lsn,
 	check(close(fd) == 0, "test closes the short WAL log");
 }
 
+static off_t
+append_torn_timeline_tail(const char *store)
+{
+	static const unsigned char tail[] = {0x54, 0x4c, 0x4d};
+	char		path[512];
+	struct stat st;
+	int			fd;
+	off_t		committed_size = -1;
+
+	snprintf(path, sizeof(path), "%s/timelines", store);
+	fd = open(path, O_WRONLY | O_APPEND);
+	check(fd >= 0, "test opens timeline metadata for torn-tail injection");
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) == 0)
+		committed_size = st.st_size;
+	check(committed_size >= 0 &&
+		  write(fd, tail, sizeof(tail)) == (ssize_t) sizeof(tail) &&
+		  fsync(fd) == 0,
+		  "test appends an incomplete timeline metadata record");
+	check(close(fd) == 0, "test closes torn timeline metadata");
+	return committed_size;
+}
+
 /* Append len WAL bytes at start_lsn on a timeline. */
 static void
 op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
@@ -2981,12 +3005,23 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 56),
 		  "newest branch read sees its copied-page rewrite");
 
-	/* branches survive a daemon restart (timeline metadata is persisted) */
+	/* A crash can leave part of the next append at EOF.  Recovery preserves
+	 * every complete branch record and truncates the tail before new appends. */
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
-	wait_ready(shm, ps);
+	{
+		off_t		committed_size = append_torn_timeline_tail(store);
+		char		path[512];
+		struct stat st;
+
+		dpid = spawn_daemon(daemon_path, shm, store, ps, test_nshards);
+		wait_ready(shm, ps);
+		snprintf(path, sizeof(path), "%s/timelines", store);
+		check(committed_size >= 0 && stat(path, &st) == 0 &&
+			  st.st_size == committed_size,
+			  "restart truncates an incomplete timeline metadata record");
+	}
 	client_attach(shm, ps);
 	op_read_tl(1, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 22), "branch write survives daemon restart");
