@@ -21,6 +21,8 @@ extern int ps_retention_drop(uint32_t timeline, uint32_t owner_kind,
 extern int ps_retention_count(uint32_t *count_out);
 extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);
+extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
+								 uint32_t *count_out);
 
 extern int ps_retention_should_compact(void);
 extern int ps_retention_compact(void);

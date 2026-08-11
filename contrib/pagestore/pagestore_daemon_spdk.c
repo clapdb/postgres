@@ -445,7 +445,7 @@ shard_worker(void *arg)
 		if (ps_spdk_poll(shard) > 0)
 			did_work = 1;
 
-		if (!did_work && shard == 0)
+		if (!did_work && shard == 0 && ps_retention_should_compact())
 		{
 			int			do_maint = 0;
 

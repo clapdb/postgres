@@ -411,7 +411,15 @@ ps_retention_set(const PsRetentionPin *pin)
 		goto done;
 	idx = retention_find(pin->timeline, pin->owner_kind, pin->owner_id);
 	if (idx >= 0 && memcmp(&retention_pins[idx], pin, sizeof(*pin)) == 0)
-		rc = 0;				/* exact retry: no log churn */
+	{
+		struct stat st;
+
+		if (stat(retention_path, &st) == 0 &&
+			st.st_size == (off_t) (retention_nrecords * sizeof(rec)))
+			rc = 0;			/* exact retry: no log churn */
+		else
+			retention_is_poisoned = 1;
+	}
 	else
 	{
 		if (idx < 0 && retention_reserve(retention_npins + 1) != 0)
@@ -505,6 +513,24 @@ ps_retention_get(uint32_t index, PsRetentionPin *pin_out, uint32_t *count_out)
 }
 
 int
+ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
+					  uint32_t *count_out)
+{
+	int rc = 0;
+
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned || capacity < retention_npins)
+		rc = -1;
+	else
+	{
+		memcpy(pins, retention_pins, (size_t) retention_npins * sizeof(*pins));
+		*count_out = retention_npins;
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
 ps_retention_should_compact(void)
 {
 	int			should;
@@ -554,7 +580,12 @@ ps_retention_compact(void)
 		goto done;
 	}
 	fd = -1;
-	if (rename(tmp, retention_path) != 0 || retention_fsync_dir() != 0)
+	if (rename(tmp, retention_path) != 0)
+		goto done;
+	/* Once rename publishes the new inode, a failed directory fsync means its
+	 * durability is unknown.  Do not continue from an in-memory state that a
+	 * crash may roll back. */
+	if (retention_fsync_dir() != 0)
 	{
 		retention_is_poisoned = 1;
 		goto done;

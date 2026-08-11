@@ -4033,6 +4033,7 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 	RetentionControlProjection controls[MAX_TIMELINES];
 	uint32_t	ncontrols = 0;
 	uint32_t	npins = 0;
+	PsRetentionPin pins[MAX_TIMELINES];
 	uint64_t	floor = 0;
 
 	if (resource != PS_RETENTION_RESOURCE_PAGE_HISTORY &&
@@ -4042,18 +4043,18 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 
 	ps_lock_map_rd();
 	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
-		ps_retention_count(&npins) != 0)
+		ps_retention_snapshot(pins, MAX_TIMELINES, &npins) != 0)
 	{
 		ps_unlock_map();
 		return -1;
 	}
 	for (uint32_t i = 0; i < npins; i++)
 	{
-		PsRetentionPin pin;
+		PsRetentionPin pin = pins[i];
 		uint64_t	projected;
 		int			found;
 
-		found = ps_retention_get(i, &pin, NULL);
+		found = 1;
 		if (found != 1 || pin.timeline >= MAX_TIMELINES ||
 			!timelines[pin.timeline].defined)
 		{
