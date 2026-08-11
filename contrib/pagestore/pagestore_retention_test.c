@@ -48,6 +48,7 @@ int
 main(void)
 {
 	char		dir[] = "/tmp/psretentionXXXXXX";
+	char		faildir[] = "/tmp/psretentionfailXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -131,12 +132,43 @@ main(void)
 		  "an initialized store fails closed when its registry is missing");
 	ps_retention_close();
 
+	check(mkdtemp(faildir) != NULL, "create rollback-failure test directory");
+	check(ps_retention_open(faildir) == 0,
+		  "open registry for rollback-failure test");
+	pin.lsn = 500;
+	check(ps_retention_set(&pin) == 0,
+		  "persist pin before rollback-failure test");
+	ps_retention_close();
+	check(setenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE", "1", 1) == 0 &&
+		  setenv("PS_TEST_FAIL_RETENTION_ROLLBACK", "1", 1) == 0,
+		  "enable retention append and rollback fault injection");
+	check(ps_retention_open(faildir) == 0,
+		  "reopen registry with rollback fault injection");
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id) != 0,
+		  "failed full DROP with failed rollback is not acknowledged");
+	ps_retention_close();
+	unsetenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
+	unsetenv("PS_TEST_FAIL_RETENTION_ROLLBACK");
+	snprintf(path, sizeof(path), "%s/retention.failed", faildir);
+	check(stat(path, &before) == 0,
+		  "failed rollback leaves a durable fail-closed marker");
+	check(ps_retention_open(faildir) != 0,
+		  "restart rejects a registry with an uncertain full DROP");
+	ps_retention_close();
+
 	unlink(tmp);
 	unlink(backup);
 	unlink(path);
 	snprintf(tmp, sizeof(tmp), "%s/retention.initialized", dir);
 	unlink(tmp);
 	rmdir(dir);
+	snprintf(path, sizeof(path), "%s/retention.meta", faildir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.initialized", faildir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.failed", faildir);
+	unlink(path);
+	rmdir(faildir);
 	if (!failed)
 		fprintf(stderr, "retention registry test: PASS\n");
 	return failed;
