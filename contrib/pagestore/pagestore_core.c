@@ -4989,6 +4989,8 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
+				pin.admission_seq = (uint64_t) ch->nblocks |
+					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||

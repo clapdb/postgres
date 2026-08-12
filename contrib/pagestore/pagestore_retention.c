@@ -33,7 +33,7 @@
 #include "pagestore_retention.h"
 
 #define PS_RETENTION_MAGIC		0x4e544552	/* "RETN" */
-#define PS_RETENTION_VERSION	1
+#define PS_RETENTION_VERSION	2
 #define PS_RETENTION_FNV_INIT	2166136261u
 #define PS_RETENTION_STATE_MAGIC 0x53544552	/* "RETS" */
 

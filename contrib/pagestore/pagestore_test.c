@@ -681,6 +681,8 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
+	ch->nblocks = 0;
+	ch->pad1 = 0;
 	return cl_exec()->status;
 }
 

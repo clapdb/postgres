@@ -1015,7 +1015,8 @@ pagestore_localsvc_wal_retain_floor(void)
 uint8
 pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
 								 uint64 owner_id, uint32 generation,
-								 uint32 resources, uint64 lsn)
+								 uint32 resources, uint64 lsn,
+								 uint64 admission_seq)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch;
@@ -1034,6 +1035,8 @@ pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
 	ch->parent_timeline = resources;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
+	ch->nblocks = (uint32) admission_seq;
+	ch->pad1 = (uint32) (admission_seq >> 32);
 	return ls_exec_wait(ch, 0);
 }
 
