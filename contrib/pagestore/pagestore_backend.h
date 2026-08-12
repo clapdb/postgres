@@ -222,11 +222,11 @@ extern uint8 pagestore_localsvc_retention_set(uint32 timeline,
 extern uint8 pagestore_localsvc_retention_drop(uint32 timeline,
 											  uint32 owner_kind, uint64 owner_id,
 											  uint32 generation);
-/* Enumerate durable owners by index.  Returns transport/daemon status while
- * reporting end-of-enumeration separately through found. */
+/* Enumerate durable owners by index.  Start with *epoch = 0 and reuse the
+ * returned epoch; PS_STATUS_STALE requires restarting at index zero. */
 extern uint8 pagestore_localsvc_retention_get(uint32 index,
 											 PsRetentionPin *pin, uint32 *count,
-											 bool *found);
+											 uint64 *epoch, bool *found);
 extern void pagestore_localsvc_store_sync(void);
 extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,

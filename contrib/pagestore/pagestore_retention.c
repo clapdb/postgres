@@ -97,6 +97,7 @@ static PsRetentionPin *retention_pins;
 static uint32_t retention_npins;
 static uint32_t retention_cap;
 static uint64_t retention_nrecords;
+static uint64_t retention_mutation_epoch;
 static uint32_t retention_log_hash;
 static int retention_is_poisoned;
 static dev_t retention_dev;
@@ -745,6 +746,7 @@ ps_retention_open(const char *store_dir)
 	retention_npins = 0;
 	retention_cap = 0;
 	retention_nrecords = 0;
+	retention_mutation_epoch = 0;
 	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_is_poisoned = 0;
 	retention_dev = 0;
@@ -914,6 +916,8 @@ done:
 		retention_cap = 0;
 		retention_is_poisoned = 1;
 	}
+	else
+		retention_mutation_epoch = 1;
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
@@ -927,6 +931,7 @@ ps_retention_close(void)
 	retention_npins = 0;
 	retention_cap = 0;
 	retention_nrecords = 0;
+	retention_mutation_epoch = 0;
 	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_path[0] = '\0';
 	retention_marker_path[0] = '\0';
@@ -981,6 +986,7 @@ ps_retention_set(const PsRetentionPin *pin)
 			retention_pins[idx] = *pin;
 		else
 			retention_pins[retention_npins++] = *pin;
+		retention_mutation_epoch++;
 		rc = PS_RETENTION_OK;
 	}
 done:
@@ -1031,6 +1037,7 @@ ps_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 		retention_pins[idx] = pin;
 	else
 		retention_pins[retention_npins++] = pin;
+	retention_mutation_epoch++;
 	rc = PS_RETENTION_OK;
 done:
 	pthread_mutex_unlock(&retention_lock);
@@ -1064,6 +1071,45 @@ ps_retention_get(uint32_t index, PsRetentionPin *pin_out, uint32_t *count_out)
 		uint32_t	active = retention_active_count();
 		uint32_t	seen = 0;
 
+		if (count_out)
+			*count_out = active;
+		for (uint32_t i = 0; i < retention_npins; i++)
+		{
+			if (!retention_pin_active(&retention_pins[i]))
+				continue;
+			if (seen++ == index)
+			{
+				if (pin_out)
+					*pin_out = retention_pins[i];
+				rc = 1;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
+							PsRetentionPin *pin_out, uint32_t *count_out)
+{
+	int			rc = 0;
+
+	if (epoch_io == NULL)
+		return PS_RETENTION_ERROR;
+	/* Keep epoch validation and indexed lookup under the same mutex. */
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = PS_RETENTION_ERROR;
+	else if (*epoch_io != 0 && *epoch_io != retention_mutation_epoch)
+		rc = PS_RETENTION_STALE;
+	else
+	{
+		uint32_t	active = retention_active_count();
+		uint32_t	seen = 0;
+
+		*epoch_io = retention_mutation_epoch;
 		if (count_out)
 			*count_out = active;
 		for (uint32_t i = 0; i < retention_npins; i++)

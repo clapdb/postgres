@@ -218,6 +218,15 @@ typedef struct PsRetentionPin
 	uint64_t	admission_seq;
 } PsRetentionPin;
 
+/* RETENTION_PIN_GET returns the pin's fence and the registry mutation epoch.
+ * A caller sends its prior epoch in req_lsn; PS_STATUS_STALE means it must
+ * restart enumeration from index zero. */
+typedef struct PsRetentionGetResult
+{
+	uint64_t	admission_seq;
+	uint64_t	mutation_epoch;
+} PsRetentionGetResult;
+
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
  * stable enough for shard selection, and it is reused for client+daemon key->shard.
  */

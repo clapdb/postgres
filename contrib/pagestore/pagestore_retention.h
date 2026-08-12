@@ -25,6 +25,9 @@ extern int ps_retention_drop(uint32_t timeline, uint32_t owner_kind,
 extern int ps_retention_count(uint32_t *count_out);
 extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);
+extern int ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
+										PsRetentionPin *pin_out,
+										uint32_t *count_out);
 extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 								 uint32_t *count_out);
 extern int ps_retention_snapshot_alloc(PsRetentionPin **pins_out,

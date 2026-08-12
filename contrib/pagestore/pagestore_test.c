@@ -701,17 +701,28 @@ op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 static int
-op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
+op_retention_get_consistent(uint32_t index, PsRetentionPin *pin,
+							uint32_t *count, uint64_t *epoch, int *found)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsRetentionGetResult result;
 
 	ch->opcode = PS_OP_RETENTION_PIN_GET;
 	ch->blocknum = index;
+	ch->req_lsn = *epoch;
 	cl_exec();
+	*found = 0;
 	if (count)
 		*count = ch->nblocks;
-	if (ch->status != PS_STATUS_OK || ch->result == 0)
-		return 0;
+	if (ch->status != PS_STATUS_OK)
+		return ch->status;
+	if (ch->datalen != sizeof(result))
+		return PS_STATUS_ERROR;
+	memcpy(&result, ch->data, sizeof(result));
+	*epoch = result.mutation_epoch;
+	if (ch->result == 0)
+		return PS_STATUS_OK;
+	*found = 1;
 	if (pin)
 	{
 		memset(pin, 0, sizeof(*pin));
@@ -721,11 +732,19 @@ op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
-		if (ch->datalen != sizeof(pin->admission_seq))
-			return 0;
-		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
+		pin->admission_seq = result.admission_seq;
 	}
-	return 1;
+	return PS_STATUS_OK;
+}
+
+static int
+op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
+{
+	uint64_t	epoch = 0;
+	int			found = 0;
+
+	return op_retention_get_consistent(index, pin, count, &epoch, &found) ==
+		PS_STATUS_OK && found;
 }
 
 static int
@@ -2778,6 +2797,24 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "registry enumeration returns every owner kind");
 	check(!op_retention_get(3, &pin, &count) && count == 3,
 		  "registry enumeration ends at the reported count");
+	{
+		uint64_t	epoch = 0;
+		int			found = 0;
+
+		check(op_retention_get_consistent(0, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_OK && found && epoch != 0,
+			  "registry enumeration returns a stable mutation epoch");
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 304,
+							   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) ==
+			  PS_STATUS_OK,
+			  "a concurrent owner mutation changes the registry epoch");
+		check(op_retention_get_consistent(1, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_STALE && !found,
+			  "enumeration detects a mutation and requires restart");
+		check(op_retention_drop(0, PS_RETENTION_OWNER_CONFIGURED, 304, 1) ==
+			  PS_STATUS_OK,
+			  "temporary mutation owner is removed");
+	}
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 4000,
 		  "page floor is the minimum matching explicit pin");

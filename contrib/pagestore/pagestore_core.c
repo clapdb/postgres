@@ -5022,14 +5022,21 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_GET:
 			{
 				PsRetentionPin pin;
+				PsRetentionGetResult result;
 				uint32_t	count = 0;
-				int			found = ps_retention_get(ch->blocknum, &pin, &count);
+				uint64_t	epoch = ch->req_lsn;
+				int			found = ps_retention_get_consistent(ch->blocknum,
+														   &epoch, &pin, &count);
 
-				if (found < 0)
+				if (found == PS_RETENTION_STALE)
+					ch->status = PS_STATUS_STALE;
+				else if (found < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
 					ch->nblocks = count;
+					memset(&result, 0, sizeof(result));
+					result.mutation_epoch = epoch;
 					if (found)
 					{
 						ch->result = 1;
@@ -5039,10 +5046,10 @@ ps_handle_meta(PsChannel *ch)
 						ch->old_nblocks = pin.generation;
 						ch->req_seq = pin.owner_id;
 						ch->req_lsn = pin.lsn;
-						memcpy(ch->data, &pin.admission_seq,
-							   sizeof(pin.admission_seq));
-						ch->datalen = sizeof(pin.admission_seq);
+						result.admission_seq = pin.admission_seq;
 					}
+					memcpy(ch->data, &result, sizeof(result));
+					ch->datalen = sizeof(result);
 				}
 			}
 			break;

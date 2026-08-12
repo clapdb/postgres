@@ -1069,10 +1069,11 @@ pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
  */
 uint8
 pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
-								 uint32 *count, bool *found)
+								 uint32 *count, uint64 *epoch, bool *found)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch;
+	PsRetentionGetResult result;
 	uint8		status;
 
 	if (pin != NULL)
@@ -1081,21 +1082,26 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
 		*count = 0;
 	if (found != NULL)
 		*found = false;
+	if (epoch == NULL)
+		return PS_STATUS_ERROR;
 
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_GET;
 	ch->blocknum = index;
+	ch->req_lsn = *epoch;
 	status = ls_exec_wait(ch, 0);
 	if (status != PS_STATUS_OK)
 		return status;
+	if (ch->datalen != sizeof(result))
+		return PS_STATUS_ERROR;
+	memcpy(&result, ch->data, sizeof(result));
+	*epoch = result.mutation_epoch;
 	if (count != NULL)
 		*count = ch->nblocks;
 	if (ch->result == 0)
 		return PS_STATUS_OK;
-	if (ch->datalen != sizeof(uint64))
-		return PS_STATUS_ERROR;
 	if (pin != NULL)
 	{
 		pin->timeline = ch->timeline;
@@ -1104,7 +1110,7 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
-		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
+		pin->admission_seq = result.admission_seq;
 	}
 	if (found != NULL)
 		*found = true;
