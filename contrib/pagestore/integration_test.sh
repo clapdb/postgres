@@ -1432,6 +1432,12 @@ READER_SUBXID_SQL=$(mktemp)
 } > "$READER_SUBXID_SQL"
 $P -f "$READER_SUBXID_SQL" >/dev/null
 rm -f "$READER_SUBXID_SQL"
+# The controller must establish authority before creating a horizon: otherwise
+# compaction is allowed to discard the SLRU/page base that prepare_reader will
+# consume after the checkpoint.  The fixed reader later takes over this exact
+# owner key and generation.
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'0/1');")" "0" \
+	"controller pins page history before creating reader checkpoint R"
 $P -c "CHECKPOINT;" >/dev/null
 read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerOldestMulti readerCtsOldest readerCtsNext <<< "$($P -c "
 	SELECT redo_lsn || ' ' || split_part(next_xid, ':', 2) || ' ' || oldest_xid || ' ' ||
@@ -1439,6 +1445,8 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	       CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END || ' ' ||
 	       CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END
 	FROM pg_control_checkpoint();")"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
+	"controller advances the prepared reader owner to exact checkpoint R"
 # This test has no concurrent catalog-changing workload across the checkpoint,
 # so its stopped copy is the control-plane catalog artifact for R.  The
 # prepared reader bundle replaces its SLRUs; pg_control is restored

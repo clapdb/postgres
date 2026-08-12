@@ -518,6 +518,24 @@ op_read_at_seq(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* Like op_read_at_seq but reports found-ness (ch->result). */
+static int
+op_read_at_seq_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
+					 uint64_t seq, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
 /* Like op_read_at but reports found-ness (ch->result). */
 static int
 op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
@@ -1889,6 +1907,10 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29200,
+						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) ==
+		  PS_STATUS_OK,
+		  "reader pins admission-fenced page history during compaction");
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
 	fence_seq = op_write_one_seq(rel, 0, 0, page);
@@ -2036,6 +2058,62 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			  restarted_barrier_seq > durable_barrier_seq,
 			  "restart allocates above an unclaimed durable admission barrier");
 	}
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
+		  PS_STATUS_OK,
+		  "dropping the reader releases admission-fenced page history");
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		for (int i = 0; i < 500; i++)
+		{
+			cl_setkey(ch, rel, 0);
+			ch->opcode = PS_OP_READ_AT;
+			ch->blocknum = 0;
+			ch->req_lsn = 5000;
+			ch->req_seq = fence_seq;
+			cl_exec();
+			if (ch->status == PS_STATUS_OK && ch->result == 0)
+				break;
+			usleep(10000);
+		}
+		check(ch->status == PS_STATUS_OK && ch->result == 0,
+			  "retention release recomputes a lone layer without new writes");
+	}
+	for (uint32_t block = 42; block < 66; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_one(rel, 0, block, page);
+	}
+	for (int i = 0; i < 500 && segment_exists(store, shard, 7); i++)
+		usleep(10000);
+	check(!segment_exists(store, shard, 7),
+		  "released page history is covered before its segment is reclaimed");
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		for (int i = 0; i < 500; i++)
+		{
+			cl_setkey(ch, rel, 0);
+			ch->opcode = PS_OP_READ_AT;
+			ch->blocknum = 0;
+			ch->req_lsn = 5000;
+			ch->req_seq = fence_seq;
+			cl_exec();
+			if (ch->result == 0)
+				break;
+			usleep(10000);
+		}
+		check(ch->status == PS_STATUS_OK && ch->result == 0,
+			  "live page index forgets history removed by compaction");
+	}
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_seq_found(rel, 0, 0, 5000, fence_seq, readback),
+		  "compaction durably prunes released admission-fenced page history");
 	client_detach();
 	stop_daemon(pid);
 
@@ -2297,6 +2375,9 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	wait_ready(shm, page_size);
 	check_inspector(shm, page_size);
 	client_attach(shm, page_size);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29001, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1) == PS_STATUS_OK,
+		  "generic as-of tests pin the history they later read");
 
 	/* --- lifecycle / metadata --- */
 	check(!op_exists(REL_A, FORK0), "fork should not exist before create");
