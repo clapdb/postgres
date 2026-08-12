@@ -316,7 +316,7 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 
 cat > "$BRANCH_CONFIG" <<EOF
 {
-  "schema": 1,
+  "schema": 2,
   "pg_ctl": "$BIN/pg_ctl",
   "psql": "$BIN/psql",
   "writer_data_dir": "$WRITER",
