@@ -60,6 +60,7 @@ R0 retention localsvc API
        -> R2 page-version pruning
        -> R3 shipped-WAL reclamation
        -> R4 WAL-index reclamation
+       -> R4b fork-metadata compaction
        -> R5 timeline deletion
             -> R6 bounded-space acceptance
 
@@ -67,7 +68,8 @@ H0 harness fault/inspection primitives
   -> H1 composed crash scenarios
   -> H2 persisted-format compatibility lane
 
-R2-R5 feed GC scenarios in H1.  R6 and H2 close the two MVP gates.
+R2-R5, including R4b, feed GC scenarios in H1.  R6 and H2 close the two MVP
+gates.
 ```
 
 R0 and H0 may proceed independently.  Reclaimers must not be enabled before R1
@@ -85,36 +87,52 @@ stacked branch.
 
 Deliverables:
 
-- `pagestore_localsvc_retention_set()`;
-- `pagestore_localsvc_retention_drop()`;
+- `pagestore_localsvc_retention_set()` with explicit owner generation;
+- `pagestore_localsvc_retention_drop()` with explicit owner generation;
 - backend declarations and protocol-field documentation;
 - tests for successful set/drop, idempotent drop, invalid owner/resource input,
-  daemon rejection, and reconnect/restart behavior.
+  daemon rejection, and reconnect/restart behavior;
+- durable, non-enumerable owner tombstones that retain the maximum accepted
+  generation after DROP, including across log compaction and restart.
+- persisted per-resource reclamation frontiers.  SET admission and reclaimer
+  cutoff selection share one synchronization protocol: a SET below any
+  requested resource frontier is rejected, while an accepted SET is visible
+  before a reclaimer can select a conflicting cutoff.
 
 Acceptance:
 
-- the backend can durably replace a stable owner generation and drop it;
+- the backend carries the controller-assigned generation on every durable
+  SET/DROP and reports a stale-generation rejection distinctly;
 - failures are reported without pretending the pin was installed or removed;
+- a delayed SET or DROP below the tombstone generation is rejected, and a
+  same-generation SET cannot resurrect a dropped owner; tests cover both
+  orderings before and after restart/compaction;
 - standalone, PostgreSQL integration, and retention recovery tests pass.
 
 Expected scope: one PR.
 
 ### R1. Register reader and materializer owner generations
 
-Status: **blocked on R0 and decisions D1-D2**.
+Status: **blocked on R0 and decision D2**.
 
 Deliverables:
 
 - stable owner identity and monotonically replaceable generation for each
   managed materializer and fixed/advancing reader;
 - registration before a process can consume retained history;
-- safe horizon replacement before an advancing reader adopts a newer view;
-- release during an owned, orderly shutdown or explicit deprovision operation;
+- atomic advancing-reader handoff: prepare and validate the newer view while
+  the old pin remains active, then prevent every old-view request while the
+  durable pin advances and the runtime switches views (or use an equivalent
+  protocol with the same no-gap property);
+- pins survive ordinary process shutdown and restart.  Release happens only
+  during authoritative deprovisioning or after a durable handoff to another
+  owner that protects an equal-or-older safe horizon;
 - supervisor handoff/restart behavior that never creates an unprotected window;
 - status/inspection output that identifies active and stale owners.
 
-Safety rule: uncertainty keeps data.  A timeout or ambiguous drop must leave the
-owner conservatively pinned until a later authoritative reconciliation.
+Safety rule: uncertainty keeps data.  An ambiguous SET/DROP must either leave
+the old pin/view pair usable or fail closed until a later authoritative
+reconciliation proves which durable owner state won.
 
 Acceptance:
 
@@ -122,6 +140,9 @@ Acceptance:
   duplicate-owner tests cover each lifecycle transition;
 - no runtime can serve or redo at LSN `R` unless its required resource masks are
   protected at or below `R`;
+- a registration racing page/WAL/index reclamation either installs before
+  cutoff selection or is rejected below the already durable frontier; it can
+  never report protection for reclaimed history;
 - a stale owner can be identified and explicitly reconciled without wall-clock
   expiry changing correctness.
 
@@ -133,6 +154,12 @@ Status: **not started; blocked on R1**.
 
 Compaction currently rewrites image layers while retaining every historical
 version.  It must consume the page-history effective floor.
+
+An effective floor of zero means that no retention owner or descendant
+constrains page history; it is not a literal LSN cutoff.  In that case the GC
+cutoff is the latest horizon proven durable and materialized for the timeline.
+Compaction retains the base required at that cutoff and must fail closed if no
+such horizon has been established.
 
 Deliverables:
 
@@ -206,18 +233,62 @@ Acceptance:
 
 Expected scope: one or two PRs.
 
-### R5. Delete timelines durably
+### R4b. Compact and reclaim fork metadata
 
-Status: **not started; blocked on R1-R4 and decision D4**.
+Status: **not started; blocked on R1 and R2**.
+
+The shared append-only `forkmeta` stream reconstructs historical relation
+existence and size, so it is retained with page history rather than treated as
+current-state-only metadata.
 
 Deliverables:
 
+- compaction against the effective page-history floor, including descendant
+  projections through fork caps;
+- for each relation incarnation, the definitive create/size/existence base at
+  or below the floor plus every later ordered extend/truncate/drop/recreate
+  event;
+- preservation of same-LSN admission ordering needed by retained reader
+  fences;
+- bounded replay from an atomically published checkpoint plus tail, with the
+  old log removed only after the replacement and directory entry are durable.
+
+Acceptance:
+
+- relation existence and size at every retained horizon match before and after
+  compaction;
+- crashes before replacement publication, after publication, and during old
+  log removal reopen to either complete old or complete new state;
+- H1 exercises each publication boundary before R6 begins its soak.
+
+Expected scope: one implementation PR and one crash-test PR.
+
+### R5. Delete timelines durably
+
+Status: **not started; blocked on R1-R4b and decision D4**.
+
+Deliverables:
+
+- an atomic durable transition from live to deleting that first fences all new
+  owner registrations and page/WAL/timeline operations, then drains every
+  already-admitted operation before physical cleanup;
 - deletion admission checks for descendants, active owners, and structural
-  retention requirements;
-- durable timeline tombstone/state transition;
+  retention requirements performed as part of that fenced transition;
+- durable timeline tombstone/state transition carrying a monotonically
+  increasing timeline incarnation generation;
 - idempotent removal of manifests, layers, page segments, WAL, WAL index,
-  control/SLRU metadata, and object-tier copies;
+  control/SLRU metadata, fork metadata, and object-tier copies;
 - restart resumes deletion and never resurrects a deleted timeline;
+- timeline-ID reuse is permitted only after cleanup is durable and only with a
+  higher incarnation generation carried by every request and durable record;
+  delayed metadata, retention mutations, and requests from an older
+  incarnation are rejected;
+- after a timeline incarnation is durably deleted, reclaim its owner
+  tombstones while retaining the incarnation fence that rejects delayed owner
+  mutations;
+- crash-safe checkpoint/compaction of the shared timeline-state log, retaining
+  each slot's current state and maximum incarnation while bounding startup
+  replay;
 - inspection reports pending and failed cleanup.
 
 Acceptance:
@@ -226,6 +297,8 @@ Acceptance:
 - every fault boundary leaves the timeline either fully readable or durably
   deleting/deleted;
 - repeated delete requests are idempotent;
+- repeated delete/recreate cycles reuse the bounded ID space without aliasing
+  an older incarnation, including across daemon restart;
 - deleting a branch does not affect its parent or siblings.
 
 Expected scope: one or two PRs.
@@ -241,9 +314,16 @@ daemon restart.
 Acceptance:
 
 - page history, shipped WAL, WAL index, and deleted-timeline debris each remain
-  within a declared bound after maintenance catches up;
+  within a declared bound while the workload continues;
+- the append-only shared `forkmeta` log is compacted/reclaimed and its physical
+  bytes are included in the declared bound;
+- retention owner/tombstone metadata and the timeline-state log remain within
+  declared bounds across repeated owner and timeline incarnations;
+- each reclaimer has a declared maximum lag/catch-up interval, and controller
+  backpressure bounds foreground admission when maintenance exceeds it;
 - the report includes logical live bytes, physical bytes, write amplification,
-  GC lag, and active retention owners;
+  per-category GC lag/catch-up time, backpressure time, and active retention
+  owners;
 - retained SQL-visible state remains correct throughout the run.
 
 Expected scope: one PR.  Passing it closes the retention MVP gate.
@@ -337,22 +417,28 @@ work.
 
 ### D1. Owner identity authority
 
-Recommended: deployment/controller-assigned stable 64-bit owner ID plus a
-monotonic generation stored in controller state.  A replacement supervisor
+Selected: deployment/controller-assigned stable 64-bit owner ID plus a
+monotonic generation stored in controller state and carried on every durable
+SET/DROP.  The retention registry stores the maximum generation, including as
+a durable non-enumerable tombstone after DROP, and rejects stale or
+same-generation resurrection.  Delayed cleanup from an old supervisor therefore
+cannot remove or resurrect its replacement's pin.  A replacement supervisor
 updates the same owner key rather than adding another logical owner.
 
 Alternative: derive identity from PGDATA or reader artifact.  This is easier to
 bootstrap but makes cloning and deliberate replacement ambiguous.
 
-Decision: **open**.
+Decision: **accepted**.
 
 ### D2. Owner release and stale-owner policy
 
-Recommended: explicit durable release or authoritative generation replacement;
-never use wall-clock lease expiry for correctness.  Stale owners retain space
-until an operator/controller reconciliation proves them dead.
+Selected: ordinary process shutdown retains the durable pin.  Release requires
+explicit authoritative deprovisioning or a safe durable horizon handoff;
+generation replacement alone must quiesce the old runtime before its pin is
+superseded.  Never use wall-clock lease expiry for correctness.  Stale owners
+retain space until controller/operator reconciliation proves them dead.
 
-Decision: **open**.
+Decision: **accepted**.
 
 ### D3. Shipped-WAL physical layout
 
@@ -415,4 +501,3 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | Date | Change | Evidence |
 |---|---|---|
 | 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
-
