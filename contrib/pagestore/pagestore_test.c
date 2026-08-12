@@ -1982,6 +1982,24 @@ wait_for_compacted_layers(const char *store, int maximum)
 	return 0;
 }
 
+static int
+wait_for_pruning_compaction(const char *shm, uint64_t previous,
+							uint64_t *current)
+{
+	uint64_t scanned,
+			 kept,
+			 deleted;
+
+	for (int i = 0; i < 500; i++)
+	{
+		if (read_pruning_metrics(shm, current, &scanned, &kept, &deleted) &&
+			*current > previous)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
 static void
 run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 {
@@ -2629,17 +2647,22 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel, 0, 500);
 	for (uint32_t cycle = 0; cycle < 12; cycle++)
 	{
+		uint64_t	before = compactions;
+
 		for (uint32_t write = 0; write < 32; write++)
 		{
 			uint64_t lsn = 1000 + cycle * 100 + write;
+			unsigned char tag = (unsigned char) (20 + cycle * 32 + write);
 
-			fill_page(page, ps, lsn, (unsigned char) (20 + cycle));
+			fill_page(page, ps, lsn, tag);
 			op_write_tl(0, rel, 0, write % 4, page);
 		}
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY,
 						   1000 + cycle * 100 + 31) == PS_STATUS_OK,
 			  "churn cycle %u advances its durable page cutoff", cycle);
+		check(wait_for_pruning_compaction(shm, before, &compactions),
+			  "churn cycle %u waits for its requested pruning pass", cycle);
 		check(wait_for_compacted_layers(store, 3),
 			  "churn cycle %u returns to the configured live-layer bound", cycle);
 	}
@@ -2651,8 +2674,10 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 		  "pruning counters account for churn and delete more versions than remain");
 	for (uint32_t block = 0; block < 4; block++)
 	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+
 		op_read_one(rel, 0, block, readback);
-		check(page_has_tag(readback, ps, 31),
+		check(page_has_tag(readback, ps, expected),
 			  "bounded churn serves the newest page for block %u", block);
 	}
 
@@ -2662,12 +2687,41 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	{
+		uint64_t before = 0;
+		uint64_t restart_scanned,
+				 restart_kept,
+				 restart_deleted;
+
+		check(read_pruning_metrics(shm, &before, &restart_scanned,
+							   &restart_kept, &restart_deleted),
+			  "restarted churn reads its fresh pruning counter baseline");
+
+		for (uint32_t write = 0; write < 32; write++)
+		{
+			uint64_t lsn = 2200 + write;
+			unsigned char tag = (unsigned char) (20 + 12 * 32 + write);
+
+			fill_page(page, ps, lsn, tag);
+			op_write_tl(0, rel, 0, write % 4, page);
+		}
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 2231) ==
+			  PS_STATUS_OK,
+			  "restarted churn advances the restored retention owner");
+		check(wait_for_pruning_compaction(shm, before, &compactions),
+			  "restarted churn completes a fresh pruning pass");
+		check(wait_for_compacted_layers(store, 3),
+			  "restarted churn returns to the live-layer bound");
+	}
 	check(local_layer_bytes(store) < (uint64_t) ps * 64,
 		  "bounded retained page history survives restart");
 	for (uint32_t block = 0; block < 4; block++)
 	{
+		unsigned char expected = (unsigned char) (20 + 12 * 32 + 28 + block);
+
 		op_read_one(rel, 0, block, readback);
-		check(page_has_tag(readback, ps, 31),
+		check(page_has_tag(readback, ps, expected),
 			  "restarted bounded churn serves newest block %u", block);
 	}
 	client_detach();
