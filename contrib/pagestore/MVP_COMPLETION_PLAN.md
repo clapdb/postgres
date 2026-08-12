@@ -155,11 +155,20 @@ Status: **not started; blocked on R1**.
 Compaction currently rewrites image layers while retaining every historical
 version.  It must consume the page-history effective floor.
 
-An effective floor of zero means that no retention owner or descendant
-constrains page history; it is not a literal LSN cutoff.  In that case the GC
-cutoff is the latest horizon proven durable and materialized for the timeline.
-Compaction retains the base required at that cutoff and must fail closed if no
-such horizon has been established.
+An effective floor of zero means that no retention owner constrains page
+history; it is not a literal LSN cutoff.  In that case the GC cutoff is the
+latest horizon proven durable and materialized for the timeline.  Compaction
+must fail closed if no such horizon has been established.  All page-history
+pins and reclamation frontiers are ordered `(LSN, admission_sequence)` fences,
+not bare LSNs: for every retained fence compaction preserves the newest version
+not later than that exact fence.  This keeps the version visible before a
+same-LSN hint rewrite as well as the version visible after it.
+
+Branch points are discrete structural base requirements, not moving retention
+floors.  A child at fork fence `F` requires the parent base visible at `F`, but
+does not pin every later parent version.  The parent's operational GC cutoff
+may continue to advance while compaction retains those discrete bases for all
+live descendants.
 
 Deliverables:
 
@@ -201,6 +210,12 @@ Deliverables:
   scanning;
 - migration or fail-closed handling for the existing flat format.
 
+With no owner floor, the WAL cutoff is the newest restart/recovery boundary
+whose control image and required WAL are durably published.  It is independent
+of discrete ancestor WAL bases required by live branches.  Reclamation fails
+closed until that boundary is proven, and persists its resulting per-timeline
+frontier so later pins and branches below it are rejected.
+
 Acceptance:
 
 - WAL read/restore results are identical before and after reclaim at every
@@ -224,6 +239,12 @@ Deliverables:
 - atomic publication and old-log deletion;
 - bounded startup replay and compaction scheduling off serve threads.
 
+With no owner floor, the WAL-index cutoff is the latest completely indexed and
+durably published WAL horizon.  Discrete branch-point lookup bases are retained
+separately.  Compaction fails closed without that proof and persists the
+per-(timeline, shard) reclaimed frontier before removing entries, so a later
+registration below it cannot be admitted.
+
 Acceptance:
 
 - retained `redo_page_asof` results match before and after compaction;
@@ -243,15 +264,23 @@ current-state-only metadata.
 
 Deliverables:
 
-- compaction against the effective page-history floor, including descendant
-  projections through fork caps;
-- for each relation incarnation, the definitive create/size/existence base at
-  or below the floor plus every later ordered extend/truncate/drop/recreate
-  event;
+- compaction against a proven forkmeta GC cutoff: the effective owner fence, or
+  (when it is unconstrained) the latest durably materialized timeline fence;
+  fail closed when neither is available and persist the reclaimed frontier;
+- discrete descendant fork fences retained as required historical bases rather
+  than projected as a moving floor that pins all later parent metadata;
+- for each relation incarnation and each retained owner/branch fence, the
+  definitive create/size/existence base visible at that `(LSN,
+  admission_sequence)` fence, plus every event required above the operational
+  cutoff;
 - preservation of same-LSN admission ordering needed by retained reader
   fences;
 - bounded replay from an atomically published checkpoint plus tail, with the
   old log removed only after the replacement and directory entry are durable.
+- an append cutover barrier or sequence handoff: publication freezes a precise
+  input sequence, and every concurrent create/extend/truncate/drop/recreate is
+  either included in the replacement tail or redirected to the new log before
+  publication becomes visible; no append may fall between snapshots.
 
 Acceptance:
 
@@ -259,6 +288,8 @@ Acceptance:
   compaction;
 - crashes before replacement publication, after publication, and during old
   log removal reopen to either complete old or complete new state;
+- concurrent metadata mutations at every publication/crash boundary reopen
+  with every acknowledged event exactly once;
 - H1 exercises each publication boundary before R6 begins its soak.
 
 Expected scope: one implementation PR and one crash-test PR.
@@ -283,9 +314,15 @@ Deliverables:
   higher incarnation generation carried by every request and durable record;
   delayed metadata, retention mutations, and requests from an older
   incarnation are rejected;
-- after a timeline incarnation is durably deleted, reclaim its owner
-  tombstones while retaining the incarnation fence that rejects delayed owner
-  mutations;
+- retention owner IDs carry a controller-assigned, monotonically increasing
+  owner incarnation (independent of the per-owner generation).  Authoritative
+  DROP durably closes that incarnation; after every operation admitted under it
+  has drained, its generation tombstone may be folded into a bounded durable
+  per-controller allocation frontier even while the timeline remains live.
+  Reuse requires a higher owner incarnation, and delayed mutations for a folded
+  incarnation are rejected by that frontier.  Deleting a timeline incarnation
+  may reclaim all of its owner records while retaining the timeline-incarnation
+  fence;
 - crash-safe checkpoint/compaction of the shared timeline-state log, retaining
   each slot's current state and maximum incarnation while bounding startup
   replay;
@@ -299,6 +336,8 @@ Acceptance:
 - repeated delete requests are idempotent;
 - repeated delete/recreate cycles reuse the bounded ID space without aliasing
   an older incarnation, including across daemon restart;
+- repeated provision/drop churn on one long-lived timeline keeps owner metadata
+  bounded and rejects delayed SET/DROP from every folded owner incarnation;
 - deleting a branch does not affect its parent or siblings.
 
 Expected scope: one or two PRs.
@@ -486,11 +525,12 @@ The default sequence is:
 5. R3a segmented WAL format and compatibility;
 6. R3b WAL reclaimer;
 7. R4 WAL-index compaction/reclamation;
-8. R5 timeline deletion;
-9. H0 fault/inspection primitives (may start in parallel with R0-R1);
-10. H1 composed crash scenarios;
-11. H2 format fixtures and compatibility CI;
-12. R6 bounded-space acceptance and final MVP status update.
+8. R4b forkmeta compaction/reclamation and publication crash tests;
+9. R5 timeline deletion;
+10. H0 fault/inspection primitives (may start in parallel with R0-R1);
+11. H1 composed crash scenarios;
+12. H2 format fixtures and compatibility CI;
+13. R6 bounded-space acceptance and final MVP status update.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
