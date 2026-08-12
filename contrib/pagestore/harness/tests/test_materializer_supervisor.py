@@ -179,6 +179,40 @@ class SupervisorTests(unittest.TestCase):
         recovered = MODULE.Supervisor(config)
         self.assertEqual(recovered.retention_generation, 1)
 
+    def test_takeover_quiesces_the_previous_pgdata_before_generation_advance(self):
+        first = MODULE.Config.load(self.write_config())
+        MODULE.atomic_write_json(
+            first.retention_generation_file,
+            {
+                "retention_generation": 4,
+                "consumer_data_dir": str(first.data_dir),
+            },
+        )
+        clone = self.root / "clone"
+        clone.mkdir()
+        (clone / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        second = MODULE.Config.load(self.write_config(data_dir=str(clone)))
+
+        class TakeoverSupervisor(MODULE.Supervisor):
+            def __init__(self, supervisor_config):
+                super().__init__(supervisor_config)
+                self.commands = []
+
+            def command(self, arguments, **_kwargs):
+                self.commands.append(arguments)
+                status = 0 if arguments[-1] == "status" else 0
+                return MODULE.subprocess.CompletedProcess(arguments, status, "", "")
+
+            def worker_healthy(self):
+                return True
+
+        supervisor = TakeoverSupervisor(second)
+        supervisor.start_worker("takeover")
+        rendered = [" ".join(command) for command in supervisor.commands]
+        self.assertTrue(any(str(first.data_dir) in item and " stop" in item
+                            for item in rendered))
+        self.assertEqual(supervisor.retention_generation, 5)
+
     def test_existing_ambiguous_status_fails_closed(self):
         config = MODULE.Config.load(self.write_config())
         MODULE.atomic_write_json(config.status_file, {"state": "running"})

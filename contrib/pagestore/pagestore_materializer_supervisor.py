@@ -350,6 +350,7 @@ class Supervisor:
         authority_exists = config.retention_generation_file.exists()
         authority = previous_status(config.retention_generation_file)
         authority_generation = authority.get("retention_generation")
+        authority_data_dir = authority.get("consumer_data_dir")
         if authority_exists:
             if (
                 not isinstance(authority_generation, int)
@@ -359,6 +360,10 @@ class Supervisor:
             ):
                 raise OwnershipError(
                     "materializer retention generation authority is unreadable"
+                )
+            if not isinstance(authority_data_dir, str) or not authority_data_dir:
+                raise OwnershipError(
+                    "materializer retention generation authority lacks consumer identity"
                 )
             old_retention_generation = authority_generation
         elif old:
@@ -375,14 +380,20 @@ class Supervisor:
                 )
             atomic_write_json(
                 config.retention_generation_file,
-                {"retention_generation": old_retention_generation},
+                {
+                    "retention_generation": old_retention_generation,
+                    "consumer_data_dir": str(config.data_dir),
+                },
             )
+            authority_data_dir = str(config.data_dir)
         else:
             # A genuinely new PGDATA has no prior worker or durable owner.
             old_retention_generation = 0
+            authority_data_dir = None
         self.owner_epoch = old_epoch + 1
         self.generation = old_generation
         self.retention_generation = old_retention_generation
+        self.previous_consumer_data_dir = authority_data_dir
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -527,6 +538,7 @@ class Supervisor:
             return None
 
     def start_worker(self, reason: str) -> None:
+        self.quiesce_previous_consumer()
         if self.retention_generation >= (1 << 32) - 1:
             raise RuntimeError("materializer retention generation exhausted")
         self.retention_generation += 1
@@ -534,8 +546,12 @@ class Supervisor:
         # Losing status.json after this point cannot cause generation reuse.
         atomic_write_json(
             self.config.retention_generation_file,
-            {"retention_generation": self.retention_generation},
+            {
+                "retention_generation": self.retention_generation,
+                "consumer_data_dir": str(self.config.data_dir),
+            },
         )
+        self.previous_consumer_data_dir = str(self.config.data_dir)
         self.publish("starting", reason=reason)
         server_options = (
             "-c pagestore.retention_owner_id="
@@ -552,6 +568,31 @@ class Supervisor:
         if not self.worker_healthy():
             raise RuntimeError("materializer failed its recovery-role health check")
         self.publish("running", reason=reason)
+
+    def quiesce_previous_consumer(self) -> None:
+        previous = self.previous_consumer_data_dir
+        if previous is None or Path(previous) == self.config.data_dir:
+            return
+        if not Path(previous).is_dir():
+            raise OwnershipError(
+                "cannot prove the previous materializer consumer is quiesced"
+            )
+        status = self.command(
+            [str(self.config.pg_ctl), "-D", previous, "status"], check=False
+        )
+        if status.returncode == 0:
+            self.command(
+                [
+                    str(self.config.pg_ctl), "-D", previous,
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True,
+                timeout=max(self.config.command_timeout_seconds, 60),
+            )
+        elif status.returncode != 3:
+            raise OwnershipError(
+                "cannot prove the previous materializer consumer is quiesced"
+            )
 
     def stop_worker(self, mode: str, reason: str) -> None:
         self.publish("stopping", mode=mode, reason=reason)
