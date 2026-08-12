@@ -245,6 +245,12 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.OwnershipError, "cannot be migrated"):
             MODULE.Supervisor(config)
 
+    def test_malformed_existing_status_fails_closed(self):
+        config = MODULE.Config.load(self.write_config())
+        config.status_file.write_text("{broken", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.OwnershipError, "status is unreadable"):
+            MODULE.Supervisor(config)
+
     def test_takeover_from_another_controller_instance_fails_closed(self):
         config = MODULE.Config.load(self.write_config())
         MODULE.atomic_write_json(

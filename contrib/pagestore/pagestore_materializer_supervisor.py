@@ -342,18 +342,26 @@ class OwnerLock:
         self.close()
 
 
-def previous_status(path: Path) -> dict[str, Any]:
+def previous_status(path: Path, *, required_if_present: bool = False) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
-    return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError) as error:
+        if required_if_present:
+            raise OwnershipError(f"materializer status is unreadable: {error}") from error
+        return {}
+    if not isinstance(value, dict):
+        if required_if_present:
+            raise OwnershipError("materializer status is not a JSON object")
+        return {}
+    return value
 
 
 class Supervisor:
     def __init__(self, config: Config) -> None:
         self.config = config
-        old = previous_status(config.status_file)
+        old = previous_status(config.status_file, required_if_present=True)
         old_epoch = old.get("owner_epoch", 0)
         old_generation = old.get("worker_generation", 0)
         old_retention_generation = old.get("retention_generation")
