@@ -57,7 +57,9 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 	uint64_t *numbers = NULL;
 	uint32_t count = 0;
 	uint32_t capacity = 0;
-	int removed_temporary = 0;
+	char **orphans = NULL;
+	uint32_t norphans = 0;
+	uint32_t orphan_capacity = 0;
 	int duplicated_fd;
 	int rc = -1;
 	int n;
@@ -99,9 +101,12 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 				const char *timeline_text = entry->d_name + 6;
 				const char *separator = strchr(timeline_text, '_');
 				uint64_t parsed = 0;
-				int valid = separator != NULL && separator != timeline_text;
+				int signed_spelling = separator != NULL &&
+					(*timeline_text == '+' || *timeline_text == '-');
+				const char *digits = signed_spelling ? timeline_text + 1 : timeline_text;
+				int valid = separator != NULL && separator != digits;
 
-				for (const char *p = timeline_text; valid && p < separator; p++)
+				for (const char *p = digits; valid && p < separator; p++)
 				{
 					unsigned int digit;
 
@@ -118,7 +123,8 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 					}
 					parsed = parsed * 10 + digit;
 				}
-				if (valid && parsed == store->timeline)
+				if (valid && parsed == store->timeline &&
+					(!signed_spelling || *timeline_text == '+'))
 					goto cleanup;
 			}
 			continue;
@@ -150,9 +156,20 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 					  (suffix[i] >= 'A' && suffix[i] <= 'Z') ||
 					  (suffix[i] >= 'a' && suffix[i] <= 'z')))
 					goto cleanup;
-			if (unlinkat(store->directory_fd, entry->d_name, 0) != 0)
+			if (norphans == orphan_capacity)
+			{
+				uint32_t next = orphan_capacity == 0 ? 4 : orphan_capacity * 2;
+				char **grown = realloc(orphans, (size_t) next * sizeof(*grown));
+
+				if (grown == NULL)
+					goto cleanup;
+				orphans = grown;
+				orphan_capacity = next;
+			}
+			orphans[norphans] = strdup(entry->d_name);
+			if (orphans[norphans] == NULL)
 				goto cleanup;
-			removed_temporary = 1;
+			norphans++;
 			continue;
 		}
 		if (count == capacity)
@@ -168,7 +185,18 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 		}
 		numbers[count++] = number;
 	}
-	if (removed_temporary && fsync(store->directory_fd) != 0)
+	if (closedir(directory) != 0)
+	{
+		directory = NULL;
+		goto cleanup;
+	}
+	directory = NULL;
+	for (uint32_t i = 0; i < norphans; i++)
+		if (unlinkat(store->directory_fd, orphans[i], 0) != 0)
+			goto cleanup;
+	/* Also makes a final link durable when its publisher crashed after unlinking
+	 * the temporary name but before its directory fsync. */
+	if (fsync(store->directory_fd) != 0)
 		goto cleanup;
 	if (count > 1)
 		qsort(numbers, count, sizeof(*numbers), segment_number_cmp);
@@ -179,7 +207,10 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 
 cleanup:
 	free(numbers);
-	if (closedir(directory) != 0)
+	for (uint32_t i = 0; i < norphans; i++)
+		free(orphans[i]);
+	free(orphans);
+	if (directory != NULL && closedir(directory) != 0)
 		rc = -1;
 	return rc;
 }
