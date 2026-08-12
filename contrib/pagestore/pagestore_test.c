@@ -1914,6 +1914,10 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
 	fence_seq = op_write_one_seq(rel, 0, 0, page);
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29200,
+								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								  5000, fence_seq) == PS_STATUS_OK,
+		  "reader refines its provisional pin to the exact admission fence");
 	for (uint32_t block = 1; block < 16; block++)
 	{
 		fill_page(page, ps, 6000 + block, (unsigned char) block);
