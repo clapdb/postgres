@@ -7182,9 +7182,14 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 		return false;
 	if (created)
 	{
+		static const char version[] = PG_MAJORVERSION "\n";
+
 		strlcpy(parent, mapdir, sizeof(parent));
 		get_parent_directory(parent);
 		fsync_fname(parent, true);
+		pagestore_publish_artifact(mapdir, "PG_VERSION",
+							   "reader database version", version,
+							   (int) strlen(version));
 	}
 	pagestore_publish_artifact(mapdir, "pg_filenode.map",
 							   "reader relation map", data, (int) data_size);
