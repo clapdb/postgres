@@ -30,7 +30,7 @@ class SupervisorTests(unittest.TestCase):
 
     def config_value(self, **overrides):
         value = {
-            "schema": 1,
+            "schema": MODULE.CONFIG_SCHEMA,
             "pg_ctl": sys.executable,
             "psql": sys.executable,
             "data_dir": str(self.data),
@@ -38,6 +38,7 @@ class SupervisorTests(unittest.TestCase):
             "port": 5432,
             "log_file": str(self.root / "log" / "materializer.log"),
             "state_dir": str(self.root / "state"),
+            "retention_owner_id": 7001,
             "poll_interval_ms": 1,
             "retry_initial_ms": 1,
             "retry_max_ms": 2,
@@ -64,8 +65,14 @@ class SupervisorTests(unittest.TestCase):
             MODULE.Config.load(self.write_config(typo=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "must be absolute"):
             MODULE.Config.load(self.write_config(state_dir="relative"))
-        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 1"):
+        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 2"):
             MODULE.Config.load(self.write_config(schema=True))
+        with self.assertRaisesRegex(MODULE.ConfigError, "retention_owner_id"):
+            value = self.config_value()
+            del value["retention_owner_id"]
+            path = self.root / "missing-owner.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            MODULE.Config.load(path)
 
     def test_lsn_and_backoff_helpers(self):
         self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
@@ -103,17 +110,64 @@ class SupervisorTests(unittest.TestCase):
         config = MODULE.Config.load(self.write_config())
         MODULE.atomic_write_json(
             config.status_file,
-            {"owner_epoch": 4, "worker_generation": 7},
+            {
+                "owner_epoch": 4,
+                "worker_generation": 7,
+                "retention_generation": 11,
+            },
         )
         supervisor = MODULE.Supervisor(config)
         self.assertEqual(supervisor.owner_epoch, 5)
         self.assertEqual(supervisor.generation, 7)
+        self.assertEqual(supervisor.retention_generation, 11)
+        self.assertEqual(
+            json.loads(config.retention_generation_file.read_text(encoding="utf-8"))[
+                "retention_generation"
+            ],
+            11,
+        )
 
         supervisor.publish("running", reason="test")
         status = json.loads(config.status_file.read_text(encoding="utf-8"))
         self.assertEqual(status["schema"], MODULE.STATUS_SCHEMA)
         self.assertEqual(status["state"], "running")
         self.assertEqual(status["reason"], "test")
+        self.assertEqual(status["retention_owner_id"], 7001)
+        self.assertEqual(status["retention_generation"], 11)
+
+    def test_start_persists_and_passes_a_new_retention_generation(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class StartingSupervisor(MODULE.Supervisor):
+            def __init__(self, supervisor_config):
+                super().__init__(supervisor_config)
+                self.command_args = None
+
+            def pg_ctl(self, *arguments, **_kwargs):
+                self.command_args = arguments
+
+            def worker_healthy(self):
+                return True
+
+        supervisor = StartingSupervisor(config)
+        supervisor.start_worker("test")
+        self.assertEqual(supervisor.retention_generation, 1)
+        command = " ".join(supervisor.command_args)
+        self.assertIn("pagestore.retention_owner_id=7001", command)
+        self.assertIn(
+            "pagestore.retention_owner_generation=1", command
+        )
+        status = json.loads(config.status_file.read_text(encoding="utf-8"))
+        self.assertEqual(status["retention_generation"], 1)
+        config.status_file.unlink()
+        recovered = MODULE.Supervisor(config)
+        self.assertEqual(recovered.retention_generation, 1)
+
+    def test_existing_ambiguous_status_fails_closed(self):
+        config = MODULE.Config.load(self.write_config())
+        MODULE.atomic_write_json(config.status_file, {"state": "running"})
+        with self.assertRaisesRegex(MODULE.OwnershipError, "generation authority"):
+            MODULE.Supervisor(config)
 
     def test_start_failures_retry_to_the_configured_bound(self):
         config = MODULE.Config.load(self.write_config())

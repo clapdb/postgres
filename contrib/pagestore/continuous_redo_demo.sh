@@ -165,6 +165,8 @@ archive_current_wal || fail "base-backup WAL did not reach pagestore"
 cat >> "$REDO/postgresql.conf" <<EOF
 pagestore.route_all = on
 pagestore.materializer = on
+pagestore.retention_owner_id = '1'
+pagestore.retention_owner_generation = '1'
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $RPORT
@@ -184,9 +186,15 @@ $RP -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qx t ||
 # Both changes happen after the redo worker is live.  Completing each segment
 # lets archive recovery consume it without stopping either process.
 $WP -c "CREATE EXTENSION pagestore;
+	CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn) RETURNS int
+	 AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
 	CREATE TABLE continuous_redo(id int primary key, v text);
 	INSERT INTO continuous_redo VALUES (1, 'first');" >/dev/null ||
 	fail "could not create the writer test relation"
+# The recovery-start hook is before the first redo record and raises FATAL if
+# this durable SET fails.  Reaching hot-standby service above therefore proves
+# generation 1 was registered without relying on reserved generation zero.
+echo "ok   - materializer retention owner is registered before serving redo"
 if $WP -c "SELECT pagestore_materializer_lag_bytes();" \
 		>"$TMPROOT/writer-lag.out" 2>"$TMPROOT/writer-lag.err"; then
 	fail "materializer lag API accepted a non-recovery writer"
@@ -349,8 +357,18 @@ echo "ok   - materializer progress releases WAL archive backpressure"
 # Recovery alone is not a materializer identity.  Restart with the explicit
 # role disabled and prove that a stale marker cannot make this worker pass the
 # supervision contract.
+"$BIN/pg_ctl" -D "$REDO" -m fast -w stop >/dev/null 2>&1 ||
+	fail "could not stop materializer before stale-owner test"
+takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$materialized_lsn');")
+[ "$takeover_status" = "0" ] || fail "could not publish replacement owner generation"
+if "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1; then
+	fail "stale materializer generation started after controller takeover"
+fi
+grep -q "retention generation is stale" "$REDO/redo.log" ||
+	fail "stale materializer startup did not report owner fencing"
+echo "ok   - replacement owner generation fences stale materializer startup"
 echo "pagestore.materializer = off" >> "$REDO/postgresql.conf"
-"$BIN/pg_ctl" -D "$REDO" -m fast -w restart >/dev/null 2>&1 ||
+"$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
 	fail "redo worker role-disabled restart failed"
 if $RP -c "SELECT pagestore_materializer_lag_bytes();" \
 		>"$TMPROOT/role-lag.out" 2>"$TMPROOT/role-lag.err"; then
