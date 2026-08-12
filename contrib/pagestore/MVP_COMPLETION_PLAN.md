@@ -302,7 +302,10 @@ page, compaction retains its required FPI/base entry and every redo entry from
 that base through each retained horizon.  Discrete branch-point lookup bases
 are retained separately.  Compaction fails closed without that proof and
 persists the per-(timeline, shard) reclaimed frontier before removing entries,
-so a later registration below it cannot be admitted.
+so a later registration below it cannot be admitted.  Timeline-level SET and
+branch admission atomically aggregate these frontiers and reject below the
+maximum reclaimed tuple across every relevant shard; a lagging shard cannot
+mask missing history on a more advanced shard while frontiers move.
 
 Index append and compaction publication share a cutover protocol.  The
 compactor freezes an append sequence under the shard append lock, publishes a
@@ -389,9 +392,12 @@ Deliverables:
   DROP durably closes that incarnation; after every operation admitted under it
   has drained, its generation tombstone may be folded into a bounded allocation-
   domain frontier even past lower live tokens.  Every live or undrained token at
-  or below that frontier remains an explicit durable exception; admission
-  rejects a token covered by the frontier unless its matching exception is
-  present.  Removing an exception after authoritative DROP and drain makes the
+  or below that frontier remains an explicit durable exception.  Allocation
+  must durably reserve that exception before returning a token to its caller,
+  or frontier advancement must be capped by a controller-published safe
+  allocation watermark.  Exceptions persist a live/closed state: only a live
+  exception admits SET/DROP, while a closed exception rejects all new mutations
+  but remains until already-admitted operations drain.  Removing it then makes the
   already-advanced frontier reject delayed mutations.  Thus metadata is bounded
   by active/undrained owners rather than historical reader churn.  Reuse
   requires a higher owner incarnation.  Deleting a timeline incarnation may
