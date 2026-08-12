@@ -390,9 +390,10 @@ run_request(uint32_t i, PsChannel *ch)
 	int			is_write = request_is_write(op);
 	uint64_t	epoch;
 
-	/* Retention registry mutations own their own mutex and can fsync host
-	 * metadata.  Do not hold the global core lock across that latency. */
-	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+	/* Retention registry operations own their own mutex; mutations can also
+	 * fsync host metadata.  Do not nest the global core lock around either. */
+	if (op == PS_OP_RETENTION_PIN_LOOKUP ||
+		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
 	{
 		int timeline_ok;
 
