@@ -86,6 +86,9 @@ main(void)
 	check(ps_wal_segment_seal(&header, 0, 0, 0, NULL, 1) != 0 &&
 		  ps_wal_segment_seal(&header, 0, 0, 0, payload, 0) != 0,
 		  "empty or missing payload is rejected");
+	check(ps_wal_segment_seal(&header, 0, 0, 0, &header,
+							 sizeof(header)) != 0,
+		  "payload overlapping the output header is rejected");
 
 	printf("pagestore_wal_segment_test: %d checks, %d failed\n", run, failed);
 	return failed != 0;
