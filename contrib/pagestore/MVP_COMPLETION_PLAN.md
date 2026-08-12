@@ -170,6 +170,14 @@ does not pin every later parent version.  The parent's operational GC cutoff
 may continue to advance while compaction retains those discrete bases for all
 live descendants.
 
+Branch creation participates in the same cutoff-selection fence as owner SET.
+It validates the requested `(LSN, admission_sequence)` against the durable
+page, WAL, WAL-index, and forkmeta frontiers before publishing the child; a
+frontier already beyond any required base rejects the branch.  Control-object
+versions are protected independently by the WAL floor: compaction retains the
+newest usable control image and redo-floor note at or below every retained WAL
+boundary even when the page-history floor is newer.
+
 Deliverables:
 
 - a precise keep/drop rule that retains the newest required base version at or
@@ -177,7 +185,14 @@ Deliverables:
 - descendant pins projected through each fork cap;
 - structural branch ancestry preserved independently of explicit owners;
 - install-new-before-delete-old manifest transition;
+- publication of the replacement to every durability tier represented by its
+  sources before deletion begins there (or retention of the old remote copies
+  until that publication is durable);
 - idempotent local and remote deletion retries;
+- crash-safe page-log reclamation after the pruned replacement and frontier are
+  durable: recovery ignores dropped references, mixed segments are rewritten
+  or retained until every live record is covered, and only then are source
+  segments removed;
 - pruning statistics and inspection output.
 
 Acceptance:
@@ -240,16 +255,26 @@ Deliverables:
 - bounded startup replay and compaction scheduling off serve threads.
 
 With no owner floor, the WAL-index cutoff is the latest completely indexed and
-durably published WAL horizon.  Discrete branch-point lookup bases are retained
-separately.  Compaction fails closed without that proof and persists the
-per-(timeline, shard) reclaimed frontier before removing entries, so a later
-registration below it cannot be admitted.
+durably published WAL horizon for which every retained page also has a durable
+reconstruction base.  Index progress alone is not a reclamation proof: for each
+page, compaction retains its required FPI/base entry and every redo entry from
+that base through each retained horizon.  Discrete branch-point lookup bases
+are retained separately.  Compaction fails closed without that proof and
+persists the per-(timeline, shard) reclaimed frontier before removing entries,
+so a later registration below it cannot be admitted.
+
+Index append and compaction publication share a cutover protocol.  The
+compactor freezes an append sequence under the shard append lock, publishes a
+replacement through that sequence, then hands off and durably appends any tail
+before replacing the old log.  This includes the shard-0 durable progress
+record; acknowledged concurrent appends can never be omitted by publication.
 
 Acceptance:
 
 - retained `redo_page_asof` results match before and after compaction;
 - incomplete final records, complete corruption, interrupted publication, and
-  daemon restart are covered;
+  daemon restart are covered, including concurrent appends at every publication
+  crash boundary;
 - repeated WAL indexing and compaction reaches bounded index size.
 
 Expected scope: one or two PRs.
