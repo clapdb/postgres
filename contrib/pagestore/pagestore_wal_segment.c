@@ -91,8 +91,13 @@ ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
 					uint64_t segment_no, uint64_t start_lsn,
 					const void *payload, uint32_t payload_len)
 {
+	uintptr_t hstart = (uintptr_t) header;
+	uintptr_t pstart = (uintptr_t) payload;
+
 	if (header == NULL || payload_len == 0 || payload == NULL ||
-		payload_len > PS_WAL_SEGMENT_PAYLOAD_BYTES)
+		payload_len > PS_WAL_SEGMENT_PAYLOAD_BYTES ||
+		pstart > UINTPTR_MAX - payload_len ||
+		(pstart < hstart + sizeof(*header) && pstart + payload_len > hstart))
 		return -1;
 	memset(header, 0, sizeof(*header));
 	header->magic = PS_WAL_SEGMENT_MAGIC;
