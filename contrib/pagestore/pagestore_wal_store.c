@@ -168,7 +168,14 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	store->directory_fd = open(directory, O_RDONLY | O_DIRECTORY);
 	if (store->directory_fd < 0)
 		return -1;
-	if (created)
+	/* Always sync the parent, including EEXIST retries.  A prior attempt may
+	 * have created the directory and failed before making that entry durable. */
+	if (created && getenv("PAGESTORE_TEST_FAIL_WAL_PARENT_FSYNC") != NULL)
+	{
+		close(store->directory_fd);
+		store->directory_fd = -1;
+		return -1;
+	}
 	{
 		parent_fd = openat(store->directory_fd, "..", O_RDONLY | O_DIRECTORY);
 		if (parent_fd < 0 || fsync(parent_fd) != 0)
@@ -306,7 +313,8 @@ load_validated_segment(const PsWalStore *store,
 	if (actual.timeline != expected->timeline ||
 		actual.segment_no != expected->segment_no ||
 		actual.start_lsn != expected->start_lsn ||
-		actual.payload_len != expected->payload_len)
+		actual.payload_len != expected->payload_len ||
+		actual.payload_crc != expected->payload_crc)
 		goto cleanup;
 	payload = malloc(actual.payload_len);
 	if (payload == NULL ||
