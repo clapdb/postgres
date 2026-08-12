@@ -90,6 +90,15 @@ reconstruction.
    whose pd_lsn never advances past the pin.  Because R never moves,
    shared-buffer staleness is a non-issue.
 
+   Before startup performs its first store lookup, the reader durably registers
+   `PS_RETENTION_OWNER_READER` for page history, WAL, and the WAL index at R.
+   The controller supplies a stable nonzero `pagestore.retention_owner_id` and
+   a monotonically increasing `pagestore.retention_owner_generation`; stale
+   authority or an ambiguous registration failure aborts startup.  A restart
+   repeats the same idempotent SET.  Crashes and ordinary shutdown do not DROP
+   the record: only an explicit controller deprovision may release it, so
+   uncertainty always retains data.
+
    A pinned compute must also generate NO page-content WAL of its own:
    with checksums on, a plain SELECT sets hint bits and emits an
    `FPI_FOR_HINT` carrying the as-of-R page image; replaying that WAL
@@ -250,8 +259,23 @@ reconstruction.
    alias.  A missing, corrupt, or temporarily unavailable candidate artifact
    leaves the old view intact.  Adoption also invalidates catalog, relation,
    and plan caches before the transaction can use the new view.  Transaction
-   status is read from the newest complete live SLRU image; the exact-R running
-   set masks commits after R.  If the writer has since tombstoned a status page,
+   advancement is retention-atomic.  The MVP serializes advancing-reader
+   transactions behind one shared gate, waits for the old-view transaction to
+   leave, durably replaces the reader owner's pin with the new R, and only then
+   swaps the backend view.  Every transaction re-reads the durable owner record,
+   so another backend's advance or a crash between durable SET and shared-memory
+   publication cannot expose an unprotected old view.  A definitive rejection
+   leaves both the old pin and old view intact; an ambiguous result aborts the
+   transaction and reconciles from the durable record on retry.  A stale
+   generation terminates the fenced compute.  Startup likewise preserves an
+   already-advanced same-generation pin and adopts it before serving.  As with
+   every prepared reader restart, the controller first reinstalls the manifest's
+   exact boot-R `pg_control`; pinned shutdown checkpoints are local process
+   artifacts and are not a replacement boot identity.  This intentionally
+   favors correctness over read concurrency until per-epoch owner slots replace
+   the gate.  Transaction status is read from the newest complete live SLRU
+   image; the exact-R running set masks commits after R.  If the writer has
+   since tombstoned a status page,
    the reader retains its prepared local seed instead of letting newest
    truncation erase history needed by old relation pages.  Commit-timestamp
    validity bounds are backend-local, so transactions on different adopted

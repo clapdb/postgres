@@ -1084,6 +1084,65 @@ pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
 	return ls_exec_wait(ch, timeout_ms);
 }
 
+uint8
+pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
+								 uint32 *count, bool *found)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	uint8		status;
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_GET;
+	ch->blocknum = index;
+	status = ls_exec_wait(ch, 0);
+	if (count != NULL)
+		*count = ch->nblocks;
+	if (found != NULL)
+		*found = status == PS_STATUS_OK && ch->result != 0;
+	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
+	{
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+	}
+	return status;
+}
+
+uint8
+pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
+									uint64 owner_id, PsRetentionPin *pin,
+									bool *found)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	uint8		status;
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	status = ls_exec_wait(ch, 0);
+	if (found != NULL)
+		*found = status == PS_STATUS_OK && ch->result != 0;
+	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
+	{
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+	}
+	return status;
+}
+
 /*
  * Enumerate the durable retention registry.  Keep a missing index distinct
  * from an IPC/daemon failure so a restarting controller can reconcile the

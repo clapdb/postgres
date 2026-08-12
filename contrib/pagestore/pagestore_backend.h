@@ -235,6 +235,12 @@ extern uint8 pagestore_localsvc_retention_get(uint32 index,
 extern uint8 pagestore_localsvc_retention_drop_timeout(uint32 timeline,
 											  uint32 owner_kind, uint64 owner_id,
 											  uint32 generation, int timeout_ms);
+extern uint8 pagestore_localsvc_retention_get(uint32 index,
+										 PsRetentionPin *pin, uint32 *count,
+										 bool *found);
+extern uint8 pagestore_localsvc_retention_lookup(uint32 timeline,
+											uint32 owner_kind, uint64 owner_id,
+											PsRetentionPin *pin, bool *found);
 extern void pagestore_localsvc_store_sync(void);
 extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,

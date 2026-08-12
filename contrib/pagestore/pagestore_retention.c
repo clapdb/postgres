@@ -1235,6 +1235,30 @@ ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 }
 
 int
+ps_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					PsRetentionPin *pin_out)
+{
+	int			rc = 0;
+
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = -1;
+	else
+	{
+		int			idx = retention_find(timeline, owner_kind, owner_id);
+
+		if (idx >= 0 && retention_pin_active(&retention_pins[idx]))
+		{
+			if (pin_out)
+				*pin_out = retention_pins[idx];
+			rc = 1;
+		}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
 ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 					  uint32_t *count_out)
 {
