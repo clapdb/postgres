@@ -12,7 +12,8 @@ typedef struct PsPruneVersion
 
 /*
  * versions must be sorted by (lsn, admission_seq).  keep receives one byte per
- * input version.  A zero floor means no historical horizon is retained.
+ * input version.  A zero floor has no proven reclamation meaning and is
+ * rejected; the caller must supply a durable materialization cutoff.
  * Returns the number of kept versions, or -1 for invalid input.
  */
 extern int ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,

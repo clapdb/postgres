@@ -27,9 +27,8 @@ main(void)
 	unsigned char keep[5];
 
 	check(ps_page_prune_plan(NULL, 0, 0, NULL) == 0, "empty chain");
-	check(ps_page_prune_plan(versions, 5, 0, keep) == 1 &&
-		  !keep[0] && !keep[1] && !keep[2] && !keep[3] && keep[4],
-		  "unconstrained chain keeps newest current image");
+	check(ps_page_prune_plan(versions, 5, 0, keep) == -1,
+		  "zero floor fails closed without durable cutoff");
 	check(ps_page_prune_plan(versions, 5, 25, keep) == 4 &&
 		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
 		  "floor between versions keeps every base admission variant");
