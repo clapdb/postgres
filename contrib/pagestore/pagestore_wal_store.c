@@ -237,6 +237,8 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	uint32_t done = 0;
 
 	if (store == NULL || store->directory_fd < 0 || data == NULL || len == 0 ||
+		start_lsn % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
+		len % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
 		start_lsn > store->end_lsn || start_lsn + len < start_lsn ||
 		start_lsn + len < store->end_lsn)
 		return -1;
@@ -254,14 +256,12 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	while (done < len)
 	{
 		PsWalSegmentHeader header;
-		uint32_t chunk = len - done;
+		uint32_t chunk = PS_WAL_SEGMENT_PAYLOAD_BYTES;
 		uint64_t segment_start = start_lsn + done;
 
 		if (segment_start % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
 			segment_start / PS_WAL_SEGMENT_PAYLOAD_BYTES != store->next_segment_no)
 			return -1;
-		if (chunk > PS_WAL_SEGMENT_PAYLOAD_BYTES)
-			chunk = PS_WAL_SEGMENT_PAYLOAD_BYTES;
 		{
 			const char *fail_segment = getenv("PAGESTORE_TEST_FAIL_WAL_SEGMENT_NO");
 
