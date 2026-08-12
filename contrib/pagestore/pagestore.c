@@ -768,6 +768,13 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 	int64		generation = PG_GETARG_INT64(3);
 	int32		resources = PG_GETARG_INT32(4);
 	XLogRecPtr	lsn = PG_GETARG_LSN(5);
+	uint64		admission_seq = PG_NARGS() > 6 ?
+		(uint64) PG_GETARG_INT64(6) : 0;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to manage pagestore retention owners")));
 
 	if (pagestore_backend_name == NULL ||
 		strcmp(pagestore_backend_name, "localsvc") != 0)
@@ -783,7 +790,8 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 				(errmsg("pagestore retention owner fields are invalid or out of range")));
 	PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
 		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
-		(uint32) generation, (uint32) resources, (uint64) lsn));
+		(uint32) generation, (uint32) resources, (uint64) lsn,
+		admission_seq));
 }
 
 PG_FUNCTION_INFO_V1(pagestore_retention_drop);
@@ -795,6 +803,11 @@ pagestore_retention_drop(PG_FUNCTION_ARGS)
 	int32		owner_kind = PG_GETARG_INT32(1);
 	int64		owner_id = PG_GETARG_INT64(2);
 	int64		generation = PG_GETARG_INT64(3);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to manage pagestore retention owners")));
 
 	if (pagestore_backend_name == NULL ||
 		strcmp(pagestore_backend_name, "localsvc") != 0)

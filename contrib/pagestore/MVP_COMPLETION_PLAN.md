@@ -82,7 +82,8 @@ R4's replacement bases to have removed the oldest raw-WAL dependencies.
 
 ### R0. Land the localsvc retention-owner API
 
-Status: **implemented in the R0 stacked change; awaiting merge**.
+Status: **partially implemented in the R0 stacked change; reclamation-frontier
+admission remains open and must land before any reclaimer is enabled**.
 
 The previously reviewed stacked PR #171 did not reach the final `pagestore`
 history.  Port its current-state equivalent rather than merging the stale

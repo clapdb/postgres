@@ -101,6 +101,7 @@ main(void)
 	pin.resources = PS_RETENTION_RESOURCE_ALL;
 	pin.owner_id = 42;
 	pin.generation = 1;
+	pin.admission_seq = 77;
 	for (uint64_t i = 0; i < 70; i++)
 	{
 		pin.lsn = 100 + i;
@@ -117,7 +118,7 @@ main(void)
 	check(ps_retention_open(dir) == 0, "reopen compacted registry");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.timeline == 7 && got.owner_id == 42 && got.generation == 1 &&
-		  got.lsn == 169,
+		  got.lsn == 169 && got.admission_seq == 77,
 		  "compacted owner state survives replay");
 	check(ps_retention_set(&fenced) == PS_RETENTION_STALE,
 		  "compaction preserves a released generation tombstone");

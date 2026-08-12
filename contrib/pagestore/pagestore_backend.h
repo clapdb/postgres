@@ -218,7 +218,7 @@ extern uint64 pagestore_localsvc_wal_retain_floor(void);
 extern uint8 pagestore_localsvc_retention_set(uint32 timeline,
 											 uint32 owner_kind, uint64 owner_id,
 											 uint32 generation, uint32 resources,
-											 uint64 lsn);
+											 uint64 lsn, uint64 admission_seq);
 extern uint8 pagestore_localsvc_retention_drop(uint32 timeline,
 											  uint32 owner_kind, uint64 owner_id,
 											  uint32 generation);

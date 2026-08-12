@@ -202,7 +202,8 @@ typedef enum PsRetentionResource
  * is reserved for records written by the version-26 protocol.
  *
  * IPC uses timeline/req_seq as the key, blocknum as owner_kind,
- * parent_timeline as resources, old_nblocks as generation, and req_lsn as lsn.
+ * parent_timeline as resources, old_nblocks as generation, req_lsn as lsn,
+ * and nblocks/pad1 as the low/high halves of admission_seq.
  */
 typedef struct PsRetentionPin
 {
@@ -212,6 +213,7 @@ typedef struct PsRetentionPin
 	uint32_t	generation;
 	uint64_t	owner_id;
 	uint64_t	lsn;
+	uint64_t	admission_seq;
 } PsRetentionPin;
 
 /* Shared hash helper for key routing.  FNV-1a over bytes keeps this cheap and
