@@ -669,8 +669,10 @@ op_wal_retain_floor(uint32_t timeline)
 }
 
 static int
-op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
-				 uint32_t generation, uint32_t resources, uint64_t lsn)
+op_retention_set_fenced(uint32_t timeline, uint32_t owner_kind,
+						uint64_t owner_id, uint32_t generation,
+						uint32_t resources, uint64_t lsn,
+						uint64_t admission_seq)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
@@ -681,9 +683,17 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
-	ch->nblocks = 0;
-	ch->pad1 = 0;
+	ch->nblocks = (uint32_t) admission_seq;
+	ch->pad1 = (uint32_t) (admission_seq >> 32);
 	return cl_exec()->status;
+}
+
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	return op_retention_set_fenced(timeline, owner_kind, owner_id, generation,
+								resources, lsn, 0);
 }
 
 static int
@@ -750,6 +760,9 @@ op_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return 0;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
 	}
 	return 1;
 }
@@ -2787,10 +2800,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
 		  "reader pin is durably registered");
-	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
 						   1,
 						   PS_RETENTION_RESOURCE_WAL |
-						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) == PS_STATUS_OK,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000, 0x100000002ULL) ==
+		  PS_STATUS_OK,
 		  "materializer pin can retain WAL without page history");
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
@@ -2803,7 +2817,8 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  pin.owner_kind == PS_RETENTION_OWNER_CONFIGURED && pin.owner_id == 303,
 		  "registry enumeration returns every owner kind");
 	check(op_retention_lookup(0, PS_RETENTION_OWNER_MATERIALIZER, 202, &pin) &&
-		  pin.generation == 1 && pin.lsn == 3000,
+		  pin.generation == 1 && pin.lsn == 3000 &&
+		  pin.admission_seq == 0x100000002ULL,
 		  "registry atomically looks up one owner by stable key");
 	check(!op_retention_lookup(0, PS_RETENTION_OWNER_READER, 9999, &pin),
 		  "keyed owner lookup reports an absent owner atomically");

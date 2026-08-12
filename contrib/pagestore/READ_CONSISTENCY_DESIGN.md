@@ -308,7 +308,14 @@ reconstruction.
    database count.  Each worker primes its relation maps and binds the newest
    complete staged snapshot to a database manifest; unchanged artifacts are
    not rewritten, so publication no longer requires control-plane scheduling
-   or generates idle store traffic.
+   or generates idle store traffic.  Advancing-reader artifact publication
+   requires this automatic mode on the writer; the manual per-database SQL
+   probe does not publish the instance-wide barrier.  The launcher locks
+   `pg_database` against create/drop, selects a fresh checkpoint while holding
+   that lock, and keeps it through every per-database manifest and the final
+   barrier.  The barrier records the exact ordered `(database OID, default
+   tablespace OID)` set at R, so readers neither infer membership from
+   non-connectable PGDATA directories nor mix the set with later catalog state.
 
 3. **Read-your-writes handoff (implemented).**  A writer hands a session over
    to a reader with `pagestore_writer_handoff_token()`, which returns the
