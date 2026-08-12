@@ -22,7 +22,7 @@
 static void
 usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s --shm NAME health|backpressure\n", prog);
+	fprintf(stderr, "usage: %s --shm NAME health|backpressure|pruning\n", prog);
 }
 
 static int
@@ -89,6 +89,21 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   ps_load_acquire(&hdr->wal_index_lagging_timelines));
 }
 
+static void
+print_pruning(PsShmHeader *hdr)
+{
+	printf("{\"compactions\":%llu,\"versions_scanned\":%llu,"
+		   "\"versions_kept\":%llu,\"versions_deleted\":%llu}\n",
+		   (unsigned long long)
+		   ps_load_acquire_u64(&hdr->page_prune_compactions),
+		   (unsigned long long)
+		   ps_load_acquire_u64(&hdr->page_prune_versions_scanned),
+		   (unsigned long long)
+		   ps_load_acquire_u64(&hdr->page_prune_versions_kept),
+		   (unsigned long long)
+		   ps_load_acquire_u64(&hdr->page_prune_versions_deleted));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -104,7 +119,9 @@ main(int argc, char **argv)
 		operation = argv[3];
 	}
 	if (shm_name == NULL ||
-		(strcmp(operation, "health") != 0 && strcmp(operation, "backpressure") != 0))
+		(strcmp(operation, "health") != 0 &&
+		 strcmp(operation, "backpressure") != 0 &&
+		 strcmp(operation, "pruning") != 0))
 	{
 		usage(argv[0]);
 		return 2;
@@ -131,8 +148,10 @@ main(int argc, char **argv)
 	}
 	if (strcmp(operation, "health") == 0)
 		print_health(hdr);
-	else
+	else if (strcmp(operation, "backpressure") == 0)
 		print_backpressure(shm, hdr);
+	else
+		print_pruning(hdr);
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }

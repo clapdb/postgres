@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		30	/* 30: keyed retention lookup;
+#define PS_SHM_VERSION		31	/* 31: page-pruning metrics;
+								 * 30: keyed retention lookup;
 								 * 29: retention GET epoch/result payload;
 								 * 28: exact retention admission sequences;
 								 * 27: retention owner generations + stale status;
@@ -319,6 +320,10 @@ typedef struct PsShmHeader
 	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
 	uint32_t	wal_index_lagging_timelines;
 	uint32_t	pad2;
+	uint64_t	page_prune_compactions;
+	uint64_t	page_prune_versions_scanned;
+	uint64_t	page_prune_versions_kept;
+	uint64_t	page_prune_versions_deleted;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)
