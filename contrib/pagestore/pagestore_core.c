@@ -114,6 +114,7 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *metrics_header;
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
 #define PS_PAGE_FRONTIER_VERSION 2
@@ -1087,7 +1088,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	unsigned char **pages = NULL;
 	uint32_t	nrec = 0,
 				cap = 0,
-				npages = 0;
+				npages = 0,
+				scanned = 0;
 	uint64_t	nid;
 	PsLayerDesc newdesc;
 	PsLayerLocation remote;
@@ -1197,6 +1199,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	}
 	if (nrec == 0)
 		goto cleanup;
+	scanned = nrec;
 	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
 								 &dropped, &ndropped) != 0 || nrec == 0)
 		goto cleanup;
@@ -1263,6 +1266,14 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	 * the advertised bytes.  Recovery already derives the same index from the
 	 * surviving layer set. */
 	page_remove_compacted_versions(timeline, dropped, ndropped);
+	if (metrics_header != NULL)
+	{
+		ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, nrec);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+						 scanned - nrec);
+	}
 	for (uint32_t k = 0; k < nold; k++)
 	{
 		/*
@@ -3729,8 +3740,6 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
-static PsShmHeader *metrics_header;
-
 static void
 publish_wal_index_metrics(void)
 {

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "inspection_schema": 1,
-  "inspection_operations": ["health", "backpressure"],
+  "inspection_operations": ["health", "backpressure", "pruning"],
   "runtimes": {
     "daemon_smoke": {
       "operations": ["crash"],
