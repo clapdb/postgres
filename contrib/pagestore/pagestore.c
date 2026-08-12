@@ -6837,6 +6837,14 @@ pagestore_reader_snapshot_ready_at(XLogRecPtr read_lsn)
 		ready.reserved == 0 && EQ_CRC32C(ready.crc, checked.crc);
 }
 
+static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
+										 XLogRecPtr read_lsn,
+										 pg_crc32c *data_crc,
+										 char *data, Size *data_size);
+static bool pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
+											   XLogRecPtr read_lsn,
+											   const char *mapdir);
+
 static bool
 pagestore_reader_database_dir_valid(const char *mapdir, Oid dboid,
 									XLogRecPtr read_lsn, pg_crc32c global_crc)
@@ -6915,7 +6923,9 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 				return false;
 			mapdir = GetDatabasePath(entry->database_oid,
 								 entry->tablespace_oid);
-			if (!pagestore_reader_database_dir_valid(mapdir,
+			if (!pagestore_install_missing_reader_database(
+					entry->database_oid, entry->tablespace_oid, read_lsn, mapdir) ||
+				!pagestore_reader_database_dir_valid(mapdir,
 					entry->database_oid, read_lsn, global_crc))
 			{
 				pfree(mapdir);
@@ -7028,10 +7038,6 @@ pagestore_publish_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr lsn,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 }
 
-static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
-										 XLogRecPtr read_lsn,
-										 pg_crc32c *data_crc);
-
 PG_FUNCTION_INFO_V1(pagestore_prime_reader_relmaps);
 Datum
 pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
@@ -7072,10 +7078,10 @@ pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
 	FIN_CRC32C(local_crc);
 	if (pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
 			PG_UINT64_MAX,
-			&stored_global_crc) &&
+			&stored_global_crc, NULL, NULL) &&
 		pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
 			PG_UINT64_MAX,
-			&stored_local_crc) &&
+			&stored_local_crc, NULL, NULL) &&
 		EQ_CRC32C(global_crc, stored_global_crc) &&
 		EQ_CRC32C(local_crc, stored_local_crc))
 	{
@@ -7102,7 +7108,8 @@ pagestore_prime_reader_relmaps(PG_FUNCTION_ARGS)
 
 static bool
 pagestore_load_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr read_lsn,
-							 pg_crc32c *data_crc)
+								 pg_crc32c *data_crc, char *data,
+								 Size *data_size)
 {
 	PagestoreReaderRelmap artifact;
 	PagestoreReaderRelmap checked;
@@ -7135,6 +7142,51 @@ pagestore_load_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr read_lsn,
 	if (!EQ_CRC32C(crc, artifact.data_crc))
 		return false;
 	*data_crc = artifact.data_crc;
+	if (data != NULL)
+		memcpy(data, page + offsetof(PagestoreReaderRelmap, data), artifact.size);
+	if (data_size != NULL)
+		*data_size = artifact.size;
+	return true;
+}
+
+static bool
+pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
+										XLogRecPtr read_lsn,
+										const char *mapdir)
+{
+	char		map_path[MAXPGPATH];
+	char		parent[MAXPGPATH];
+	char		data[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	struct stat st;
+	pg_crc32c	data_crc;
+	Size		data_size;
+	int			len;
+	bool		created = false;
+
+	len = snprintf(map_path, sizeof(map_path), "%s/pg_filenode.map", mapdir);
+	PS_CHECK_PATH_FORMAT(len, map_path);
+	if (lstat(map_path, &st) == 0)
+		return S_ISREG(st.st_mode);
+	if (errno != ENOENT ||
+		!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
+									 data, &data_size))
+		return false;
+	if (lstat(mapdir, &st) != 0)
+	{
+		if (errno != ENOENT || (MakePGDirectory(mapdir) != 0 && errno != EEXIST))
+			return false;
+		created = true;
+	}
+	else if (!S_ISDIR(st.st_mode))
+		return false;
+	if (created)
+	{
+		strlcpy(parent, mapdir, sizeof(parent));
+		get_parent_directory(parent);
+		fsync_fname(parent, true);
+	}
+	pagestore_publish_artifact(mapdir, "pg_filenode.map",
+							   "reader relation map", data, (int) data_size);
 	return true;
 }
 
@@ -7827,10 +7879,10 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	manifest.artifact_crc = ready.header.crc;
 	if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
 			(XLogRecPtr) resolved,
-			&manifest.global_relmap_crc) ||
+			&manifest.global_relmap_crc, NULL, NULL) ||
 		!pagestore_load_reader_relmap(MyDatabaseId, MyDatabaseTableSpace,
 			(XLogRecPtr) resolved,
-			&manifest.local_relmap_crc))
+			&manifest.local_relmap_crc, NULL, NULL))
 		PG_RETURN_NULL();
 	LWLockAcquire(RelationMappingLock, LW_SHARED);
 	current_global_crc = pagestore_reader_relmap_crc("global");
