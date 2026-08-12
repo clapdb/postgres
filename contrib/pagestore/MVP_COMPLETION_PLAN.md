@@ -181,7 +181,10 @@ Branch points are discrete structural base requirements, not moving retention
 floors.  A child at fork fence `F` requires the parent base visible at `F`, but
 does not pin every later parent version.  The parent's operational GC cutoff
 may continue to advance while compaction retains those discrete bases for all
-live descendants.
+live descendants.  Durable timeline metadata stores the complete fork tuple
+`(branch_lsn, branch_admission_sequence)`, not a bare LSN; restart, ancestor
+reads, page/forkmeta visibility, and compaction all apply that tuple so a
+same-LSN post-fork mutation cannot enter the child.
 
 Branch creation participates in the same cutoff-selection fence as owner SET.
 It validates the requested `(LSN, admission_sequence)` against the durable
@@ -250,8 +253,11 @@ Deliverables:
 - a read-lifetime pin/reference for every selected physical WAL segment, with
   unlink deferred until existing readers drain (or an equivalent epoch/barrier),
   including a concurrent read-versus-reclaim fault test;
-- explicit protection for restorable control images and in-progress WAL-index
-  scanning;
+- explicit protection for restorable control images, in-progress WAL-index
+  scanning, and the durable WAL-index resume position even while no scan is
+  running.  Reclamation cannot cross the undecoded interval after that resume
+  point unless durable replacement page coverage proves the entire interval is
+  unnecessary;
 - migration or fail-closed handling for the existing flat format.
 
 With no owner floor, the WAL cutoff is the newest restart/recovery boundary
@@ -493,7 +499,9 @@ Fixture families:
 - timeline metadata and retention registry;
 - manifest and image/delta layer headers/indexes;
 - page segments, shipped WAL metadata, and WAL index;
-- control, SLRU, reader, and branch-bootstrap artifacts.
+- control, SLRU, reader, branch-bootstrap, and fork-metadata artifacts.  The
+  forkmeta checkpoint/tail format is checksummed; fixtures cover legacy reopen
+  or migration, truncation, and corruption of a structurally complete record;
 
 Acceptance:
 
