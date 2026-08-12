@@ -29,28 +29,31 @@ main(void)
 	PsPruneFence later_fence[] = {{25, 1}};
 	unsigned char keep[5];
 
-	check(ps_page_prune_plan(NULL, 0, 0, NULL, 0, NULL) == 0, "empty chain");
-	check(ps_page_prune_plan(versions, 5, 0, NULL, 0, keep) == -1,
+	check(ps_page_prune_plan(NULL, 0, (PsPruneFence) {0, 0}, NULL, 0, NULL) == 0, "empty chain");
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {0, 0}, NULL, 0, keep) == -1,
 		  "zero floor fails closed without durable cutoff");
-	check(ps_page_prune_plan(versions, 5, 25, fence, 1, keep) == 4 &&
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {25, 0}, fence, 1, keep) == 4 &&
 		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
 		  "an admission fence keeps only its visible same-LSN base");
-	check(ps_page_prune_plan(versions, 5, 20, NULL, 0, keep) == 4 &&
-		  keep[0] && !keep[1] && keep[2] && keep[3] && keep[4],
-		  "operational history collapses redundant same-LSN admissions");
-	check(ps_page_prune_plan(versions, 5, 10, NULL, 0, keep) == 4,
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 1}, NULL, 0, keep) == 4 &&
+		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
+		  "operational tuple keeps its exact visible same-LSN base");
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 2}, NULL, 0, keep) == 3 &&
+		  !keep[0] && !keep[1] && keep[2] && keep[3] && keep[4],
+		  "operational tuple collapses versions through its admission sequence");
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {10, 0}, NULL, 0, keep) == 4,
 		  "floor at oldest version keeps the newest admission per LSN");
-	check(ps_page_prune_plan(versions, 5, 50, zero_fence, 1, keep) == 2 &&
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 0}, zero_fence, 1, keep) == 2 &&
 		  keep[2] && keep[4],
 		  "a zero-sequence fence has uncapped admission visibility");
-	check(ps_page_prune_plan(versions, 5, 50, later_fence, 1, keep) == 2 &&
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 0}, later_fence, 1, keep) == 2 &&
 		  keep[1] && keep[4],
 		  "a nonzero admission fence constrains versions below its LSN");
-	check(ps_page_prune_plan(versions, 5, 50, NULL, 0, keep) == 1 && keep[4],
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 0}, NULL, 0, keep) == 1 && keep[4],
 		  "floor above newest keeps newest base");
-	check(ps_page_prune_plan(unsorted, 2, 20, NULL, 0, keep) == -1,
+	check(ps_page_prune_plan(unsorted, 2, (PsPruneFence) {20, 0}, NULL, 0, keep) == -1,
 		  "unsorted admission sequence is rejected");
-	check(ps_page_prune_plan(NULL, 1, 20, NULL, 0, keep) == -1,
+	check(ps_page_prune_plan(NULL, 1, (PsPruneFence) {20, 0}, NULL, 0, keep) == -1,
 		  "missing input is rejected");
 
 	printf("pagestore_prune_test: %d checks, %d failed\n", run, failed);
