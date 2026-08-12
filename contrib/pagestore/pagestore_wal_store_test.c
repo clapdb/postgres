@@ -22,12 +22,31 @@ check(int condition, const char *name)
 	}
 }
 
+static int
+pwrite_all(int fd, const void *data, size_t len, off_t offset)
+{
+	const unsigned char *bytes = data;
+	size_t done = 0;
+
+	while (done < len)
+	{
+		ssize_t amount = pwrite(fd, bytes + done, len - done,
+							 offset + (off_t) done);
+
+		if (amount <= 0)
+			return -1;
+		done += (size_t) amount;
+	}
+	return 0;
+}
+
 int
 main(void)
 {
 	char directory[] = "/tmp/pswalstoreXXXXXX";
 	char path[1024];
 	char retry_directory[512];
+	char create_retry_directory[512];
 	uint32_t first_len = 2 * PS_WAL_SEGMENT_PAYLOAD_BYTES;
 	uint32_t retry_len = 2 * PS_WAL_SEGMENT_PAYLOAD_BYTES;
 	unsigned char *input = malloc((size_t) first_len +
@@ -69,6 +88,16 @@ main(void)
 		  "read rejects bytes outside the contiguous retained range");
 	check(ps_wal_store_create(&retry_store, path, 8, 1) != 0,
 		  "store creation rejects a noncanonical segment start");
+	snprintf(create_retry_directory, sizeof(create_retry_directory),
+			 "%s/create_retry", directory);
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_PARENT_FSYNC", "1", 1) == 0 &&
+		  ps_wal_store_create(&retry_store, create_retry_directory, 9, 0) != 0,
+		  "store creation can fail after mkdir but before parent durability");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_PARENT_FSYNC");
+	check(ps_wal_store_create(&retry_store, create_retry_directory, 9, 0) == 0,
+		  "an EEXIST retry still makes the directory entry durable");
+	ps_wal_store_close(&retry_store);
+	rmdir(create_retry_directory);
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDONLY);
@@ -106,16 +135,27 @@ main(void)
 	fd = open(path, O_RDWR);
 	if (fd >= 0)
 	{
-		unsigned char byte;
+		PsWalSegmentHeader replacement;
+		unsigned char *different = malloc(PS_WAL_SEGMENT_PAYLOAD_BYTES);
 
-		check(pread(fd, &byte, 1, PS_WAL_SEGMENT_HEADER_BYTES + 10) == 1 &&
-			  pwrite(fd, (unsigned char[]) {byte ^ 0xff}, 1,
-					 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 1,
-			  "corrupt a published payload without changing its size");
+		if (different != NULL)
+		{
+			memcpy(different, input, PS_WAL_SEGMENT_PAYLOAD_BYTES);
+			different[10] ^= 0xff;
+		}
+		check(different != NULL &&
+			  ps_wal_segment_seal(&replacement, 7, 0, 0, different,
+								  PS_WAL_SEGMENT_PAYLOAD_BYTES) == 0 &&
+			  ps_wal_segment_encode(&replacement, encoded) == 0 &&
+			  pwrite_all(fd, encoded, sizeof(encoded), 0) == 0 &&
+			  pwrite_all(fd, different, PS_WAL_SEGMENT_PAYLOAD_BYTES,
+						 PS_WAL_SEGMENT_HEADER_BYTES) == 0,
+			  "replace a segment with different internally valid WAL");
+		free(different);
 		close(fd);
 	}
 	check(fd >= 0 && ps_wal_store_read(&store, 10, window, 1) != 0,
-		  "read validates payload checksum before returning WAL bytes");
+		  "read compares the persisted checksum with its published header");
 	ps_wal_store_close(&store);
 	for (uint64_t segment = 0; segment < 3; segment++)
 	{
