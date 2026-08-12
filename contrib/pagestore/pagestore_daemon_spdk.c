@@ -163,6 +163,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
 		case PS_OP_RETENTION_PIN_GET:
+		case PS_OP_RETENTION_PIN_LOOKUP:
 		case PS_OP_RETENTION_PIN_SET:
 		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_RETENTION_FLOOR:

@@ -371,10 +371,9 @@ static bool pagestore_reader_advance_lock_held = false;
 static void
 pagestore_reader_advance_locktag(LOCKTAG *tag)
 {
-	SET_LOCKTAG_ADVISORY(*tag, pagestore_localsvc_timeline(),
-						 (uint32) (pagestore_retention_owner_id >> 32),
-						 (uint32) pagestore_retention_owner_id,
-						 3);
+	SET_LOCKTAG_PAGESTORE_READER(*tag, pagestore_localsvc_timeline(),
+								 (uint32) (pagestore_retention_owner_id >> 32),
+								 (uint32) pagestore_retention_owner_id);
 }
 
 static void
@@ -924,7 +923,7 @@ pagestore_retention_owner_lsn(PG_FUNCTION_ARGS)
 	int64		generation = PG_GETARG_INT64(3);
 	PsRetentionPin pin;
 
-	if (timeline < 0 || owner_kind <= 0 || owner_id <= 0 || generation <= 0 ||
+	if (timeline < 0 || owner_kind <= 0 || owner_id == 0 || generation <= 0 ||
 		(uint64) generation > UINT32_MAX)
 		ereport(ERROR,
 				(errmsg("pagestore retention owner fields must be positive and in range")));
@@ -6821,11 +6820,95 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 	COMP_CRC32C(checked.crc, &checked,
 				offsetof(PagestoreReaderDatabaseBarrier, crc));
 	FIN_CRC32C(checked.crc);
-	return barrier.magic == PAGESTORE_READER_DATABASE_BARRIER_MAGIC &&
+	if (!(barrier.magic == PAGESTORE_READER_DATABASE_BARRIER_MAGIC &&
 		barrier.format == PAGESTORE_READER_DATABASE_BARRIER_FORMAT &&
 		barrier.timeline == pagestore_localsvc_timeline() &&
 		barrier.read_lsn == read_lsn && barrier.database_count != 0 &&
-		EQ_CRC32C(barrier.crc, checked.crc);
+		EQ_CRC32C(barrier.crc, checked.crc)))
+		return false;
+
+	/*
+	 * The durable manifests are produced on the writer.  Before allowing one
+	 * database to advance the instance-wide reader pin, independently verify
+	 * every default-tablespace relation map in this reader's PGDATA.  The
+	 * count and ordered-OID checksum prevent silently omitting another
+	 * database whose local map has not reached this horizon.
+	 */
+	{
+		DIR		   *dir = AllocateDir("base");
+		struct dirent *de;
+		Oid		   *oids;
+		int			count = 0;
+		int			capacity = 16;
+		pg_crc32c	database_crc;
+		pg_crc32c	global_crc;
+
+		if (dir == NULL)
+			return false;
+		oids = palloc(sizeof(Oid) * capacity);
+		global_crc = pagestore_reader_relmap_crc("global");
+		while ((de = ReadDir(dir, "base")) != NULL)
+		{
+			char	   *endptr;
+			unsigned long parsed;
+			Oid			dboid;
+			PagestoreReaderSnapshotManifest manifest;
+			PagestoreReaderSnapshotManifest manifest_checked;
+			PageStoreRelKey manifest_key;
+			char		manifest_page[BLCKSZ];
+			char		mapdir[MAXPGPATH];
+			uint64		manifest_lsn = 0;
+			int			len;
+
+			errno = 0;
+			parsed = strtoul(de->d_name, &endptr, 10);
+			if (errno != 0 || *de->d_name == '\0' || *endptr != '\0' ||
+				parsed == 0 || parsed > PG_UINT32_MAX)
+				continue;
+			dboid = (Oid) parsed;
+			manifest_key = pagestore_reader_snapshot_key(
+				PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, dboid);
+			if (!pagestore_localsvc_obj_read_at_timeout(
+					PS_KLASS_READER_SNAPSHOT, &manifest_key, 0,
+					(uint64) read_lsn, manifest_page, &manifest_lsn,
+					PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) ||
+				manifest_lsn != read_lsn)
+				continue;
+			memcpy(&manifest, manifest_page, sizeof(manifest));
+			manifest_checked = manifest;
+			pagestore_reader_snapshot_manifest_crc(&manifest_checked);
+			len = snprintf(mapdir, sizeof(mapdir), "base/%u", dboid);
+			if (len < 0 || len >= (int) sizeof(mapdir) ||
+				manifest.magic != PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC ||
+				manifest.format != PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT ||
+				manifest.timeline != pagestore_localsvc_timeline() ||
+				manifest.read_lsn != read_lsn ||
+				!EQ_CRC32C(manifest.crc, manifest_checked.crc) ||
+				!EQ_CRC32C(manifest.global_relmap_crc, global_crc) ||
+				!EQ_CRC32C(manifest.local_relmap_crc,
+							 pagestore_reader_relmap_crc(mapdir)))
+			{
+				FreeDir(dir);
+				pfree(oids);
+				return false;
+			}
+			if (count == capacity)
+			{
+				capacity *= 2;
+				oids = repalloc(oids, sizeof(Oid) * capacity);
+			}
+			oids[count++] = dboid;
+		}
+		FreeDir(dir);
+		qsort(oids, count, sizeof(Oid), oid_cmp);
+		INIT_CRC32C(database_crc);
+		for (int i = 0; i < count; i++)
+			COMP_CRC32C(database_crc, &oids[i], sizeof(Oid));
+		FIN_CRC32C(database_crc);
+		pfree(oids);
+		return count == barrier.database_count &&
+			EQ_CRC32C(database_crc, barrier.database_crc);
+	}
 }
 
 static void
@@ -11593,7 +11676,7 @@ pagestore_reader_artifact_databases(void)
 		elog(ERROR, "SPI_connect failed");
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_execute("SELECT oid FROM pg_database "
-					"WHERE datallowconn",
+					"WHERE datallowconn ORDER BY oid",
 					true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not enumerate databases");
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
