@@ -1063,6 +1063,55 @@ pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
 }
 
 /*
+ * Enumerate the durable retention registry.  Keep a missing index distinct
+ * from an IPC/daemon failure so a restarting controller can reconcile the
+ * complete owner set without treating an error as end-of-enumeration.
+ */
+uint8
+pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
+								 uint32 *count, bool *found)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	uint8		status;
+
+	if (pin != NULL)
+		memset(pin, 0, sizeof(*pin));
+	if (count != NULL)
+		*count = 0;
+	if (found != NULL)
+		*found = false;
+
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_GET;
+	ch->blocknum = index;
+	status = ls_exec_wait(ch, 0);
+	if (status != PS_STATUS_OK)
+		return status;
+	if (count != NULL)
+		*count = ch->nblocks;
+	if (ch->result == 0)
+		return PS_STATUS_OK;
+	if (ch->datalen != sizeof(uint64))
+		return PS_STATUS_ERROR;
+	if (pin != NULL)
+	{
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
+	}
+	if (found != NULL)
+		*found = true;
+	return PS_STATUS_OK;
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
