@@ -106,6 +106,22 @@ class SupervisorTests(unittest.TestCase):
                     MODULE.main(["--config", str(config_path)]), MODULE.EX_TEMPFAIL
                 )
 
+    def test_controller_authority_fences_a_cloned_pgdata(self):
+        first = MODULE.Config.load(self.write_config())
+        clone = self.root / "clone"
+        clone.mkdir()
+        (clone / "PG_VERSION").write_text("19\n", encoding="utf-8")
+        second = MODULE.Config.load(self.write_config(data_dir=str(clone)))
+        self.assertNotEqual(first.lock_file, second.lock_file)
+        self.assertEqual(
+            first.retention_authority_lock_file,
+            second.retention_authority_lock_file,
+        )
+        with MODULE.OwnerLock(first.retention_authority_lock_file):
+            with self.assertRaisesRegex(MODULE.OwnershipError, "another.*owns"):
+                with MODULE.OwnerLock(second.retention_authority_lock_file):
+                    self.fail("cloned PGDATA acquired controller authority")
+
     def test_status_update_is_atomic_and_carries_epochs(self):
         config = MODULE.Config.load(self.write_config())
         MODULE.atomic_write_json(

@@ -1261,7 +1261,8 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 
 /* Publish a durable marker only after a restartpoint flushed relation pages. */
 static void
-pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
+pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
+											XLogRecPtr restart_redo_lsn)
 {
 	PageStoreRelKey key = {0};
 	PsMaterializerMarker marker;
@@ -1269,7 +1270,7 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 	bool		published = false;
 
 	if (prev_restartpoint_flush_hook)
-		(*prev_restartpoint_flush_hook) (replay_lsn);
+		(*prev_restartpoint_flush_hook) (replay_lsn, restart_redo_lsn);
 	if (!RecoveryInProgress() || XLogRecPtrIsInvalid(replay_lsn))
 		return;
 
@@ -1315,8 +1316,8 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
-	if (published)
-		pagestore_materializer_retention_advance(replay_lsn);
+	if (published && !XLogRecPtrIsInvalid(restart_redo_lsn))
+		pagestore_materializer_retention_advance(restart_redo_lsn);
 }
 
 static XLogRecPtr
