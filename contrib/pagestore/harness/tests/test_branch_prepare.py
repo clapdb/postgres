@@ -85,6 +85,17 @@ class BranchPrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ConfigError, "exceeds 1023"):
             MODULE.Config.load(self.write_config(new_timeline=1024))
 
+        bad_log = self.root / "bad-log"
+        bad_log.mkdir()
+        with self.assertRaisesRegex(MODULE.ConfigError, "writer_log_file is not writable"):
+            MODULE.Config.load(self.write_config(writer_log_file=str(bad_log)))
+
+        bad_socket = self.root / "bad-socket"
+        bad_socket.mkdir(mode=0o700)
+        bad_socket.chmod(0o710)
+        with self.assertRaisesRegex(MODULE.ConfigError, "mode 0700"):
+            MODULE.Config.load(self.write_config(private_socket_dir=str(bad_socket)))
+
     def test_lsn_sql_and_output_helpers(self):
         self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
         self.assertEqual(MODULE.sql_literal("a'b"), "'a''b'")
@@ -97,7 +108,11 @@ class BranchPrepareTests(unittest.TestCase):
 
     def test_owner_locks_fence_branch_and_supervisor(self):
         config = MODULE.Config.load(self.write_config())
-        for path in (config.lock_file, config.materializer_lock_file):
+        for path in (
+            config.lock_file,
+            config.prepared_lock_file,
+            config.materializer_lock_file,
+        ):
             first = MODULE.OwnerLock(path, "first owner")
             second = MODULE.OwnerLock(path, "second owner")
             first.acquire()
@@ -278,6 +293,38 @@ class BranchPrepareTests(unittest.TestCase):
             '"Materializer Store".pagestore_capture_slru_snapshot()',
             preparer.materializer_queries[1],
         )
+        self.assertIn("archive_mode') IN ('on', 'always')", preparer.writer_queries[1])
+        self.assertIn("FROM pg_tablespace", preparer.writer_queries[1])
+
+    def test_ambiguous_pause_failure_remains_owned_for_cleanup(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class AmbiguousPausePreparer(MODULE.BranchPreparer):
+            def __init__(self, branch_config):
+                super().__init__(branch_config)
+                self.owned_at_failure = False
+                self.resumed = False
+
+            def preflight(self):
+                pass
+
+            def materializer_sql(self, sql):
+                if "pg_get_wal_replay_pause_state" in sql:
+                    return "not paused"
+                if "pg_wal_replay_pause" in sql:
+                    self.owned_at_failure = self.pause_owned
+                    raise MODULE.BranchPrepareError("ambiguous pause result")
+                raise AssertionError(sql)
+
+            def resume_materializer(self):
+                self.resumed = True
+                self.pause_owned = False
+
+        preparer = AmbiguousPausePreparer(config)
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "ambiguous pause result"):
+            preparer.execute()
+        self.assertTrue(preparer.owned_at_failure)
+        self.assertTrue(preparer.resumed)
 
     def test_duplicate_branch_main_returns_temporary_failure(self):
         config_path = self.write_config()
@@ -287,6 +334,15 @@ class BranchPrepareTests(unittest.TestCase):
                 self.assertEqual(
                     MODULE.main(["--config", str(config_path)]), MODULE.EX_TEMPFAIL
                 )
+
+        stderr = io.StringIO()
+        with MODULE.OwnerLock(config.prepared_lock_file, "test"):
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(
+                    MODULE.main(["--config", str(config_path)]), MODULE.EX_TEMPFAIL
+                )
+        self.assertIn("prepared artifact directory", stderr.getvalue())
+        self.assertNotIn("stop the materializer supervisor", stderr.getvalue())
 
 
 if __name__ == "__main__":
