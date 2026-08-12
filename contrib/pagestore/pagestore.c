@@ -56,6 +56,7 @@
 #include "catalog/storage_xlog.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
+#include "common/relpath.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -79,6 +80,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/lock.h"
+#include "storage/lmgr.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
 #include "storage/shmem.h"
@@ -6552,7 +6554,15 @@ typedef struct PagestoreReaderSnapshotManifest
 } PagestoreReaderSnapshotManifest;
 
 #define PAGESTORE_READER_DATABASE_BARRIER_MAGIC UINT32_C(0x50535242)
-#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 1
+#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 2
+typedef struct PagestoreReaderDatabaseEntry
+{
+	Oid			database_oid;
+	Oid			tablespace_oid;
+} PagestoreReaderDatabaseEntry;
+
+#define PAGESTORE_READER_DATABASE_MAX ((BLCKSZ - 32) / \
+									 sizeof(PagestoreReaderDatabaseEntry))
 typedef struct PagestoreReaderDatabaseBarrier
 {
 	uint64		read_lsn;
@@ -6560,9 +6570,12 @@ typedef struct PagestoreReaderDatabaseBarrier
 	uint32		format;
 	uint32		timeline;
 	uint32		database_count;
-	pg_crc32c	database_crc;
+	PagestoreReaderDatabaseEntry databases[PAGESTORE_READER_DATABASE_MAX];
 	pg_crc32c	crc;
+	uint32		reserved;
 } PagestoreReaderDatabaseBarrier;
+StaticAssertDecl(sizeof(PagestoreReaderDatabaseBarrier) <= BLCKSZ,
+				 "reader database barrier must fit in one pagestore page");
 
 typedef struct PagestoreReaderCatalogProvenance
 {
@@ -6852,135 +6865,41 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 		barrier.format == PAGESTORE_READER_DATABASE_BARRIER_FORMAT &&
 		barrier.timeline == pagestore_localsvc_timeline() &&
 		barrier.read_lsn == read_lsn && barrier.database_count != 0 &&
+		barrier.database_count <= PAGESTORE_READER_DATABASE_MAX &&
+		barrier.reserved == 0 &&
 		EQ_CRC32C(barrier.crc, checked.crc)))
 		return false;
 
 	/*
-	 * The durable manifests are produced on the writer.  Before allowing one
-	 * database to advance the instance-wide reader pin, independently verify
-	 * every database-local relation map across pg_default and pg_tblspc in this
-	 * reader's PGDATA.  The
-	 * count and ordered-OID checksum prevent silently omitting another
-	 * database whose local map has not reached this horizon.
+	 * Validate exactly the connectable database set frozen by the writer at R.
+	 * Do not infer membership from numeric PGDATA directories: template0 is
+	 * deliberately non-connectable, and default tablespaces may live elsewhere.
 	 */
 	{
-		DIR		   *dir = AllocateDir("base");
-		struct dirent *de;
-		Oid		   *oids;
-		int			count = 0;
-		int			capacity = 16;
-		pg_crc32c	database_crc;
 		pg_crc32c	global_crc;
 
-		if (dir == NULL)
-			return false;
-		oids = palloc(sizeof(Oid) * capacity);
 		global_crc = pagestore_reader_relmap_crc("global");
-		while ((de = ReadDir(dir, "base")) != NULL)
+		for (uint32 i = 0; i < barrier.database_count; i++)
 		{
-			char	   *endptr;
-			unsigned long parsed;
-			Oid			dboid;
-			char		mapdir[MAXPGPATH];
-			int			len;
+			PagestoreReaderDatabaseEntry *entry = &barrier.databases[i];
+			char *mapdir;
 
-			errno = 0;
-			parsed = strtoul(de->d_name, &endptr, 10);
-			if (errno != 0 || *de->d_name == '\0' || *endptr != '\0' ||
-				parsed == 0 || parsed > PG_UINT32_MAX)
-				continue;
-			dboid = (Oid) parsed;
-			len = snprintf(mapdir, sizeof(mapdir), "base/%u", dboid);
-			if (len < 0 || len >= (int) sizeof(mapdir) ||
-				!pagestore_reader_database_dir_valid(mapdir, dboid, read_lsn,
-												 global_crc))
+			if (!OidIsValid(entry->database_oid) ||
+				!OidIsValid(entry->tablespace_oid) ||
+				(i > 0 && barrier.databases[i - 1].database_oid >=
+				 entry->database_oid))
+				return false;
+			mapdir = GetDatabasePath(entry->database_oid,
+								 entry->tablespace_oid);
+			if (!pagestore_reader_database_dir_valid(mapdir,
+					entry->database_oid, read_lsn, global_crc))
 			{
-				FreeDir(dir);
-				pfree(oids);
+				pfree(mapdir);
 				return false;
 			}
-			if (count == capacity)
-			{
-				capacity *= 2;
-				oids = repalloc(oids, sizeof(Oid) * capacity);
-			}
-			oids[count++] = dboid;
+			pfree(mapdir);
 		}
-		FreeDir(dir);
-		/* A database whose default tablespace is not pg_default lives below
-		 * pg_tblspc/<tablespace>/<version>/<dboid>.  Only the default database
-		 * directory carries pg_filenode.map, which also avoids duplicate OIDs for
-		 * relations placed in additional tablespaces. */
-		dir = AllocateDir("pg_tblspc");
-		if (dir == NULL)
-		{
-			pfree(oids);
-			return false;
-		}
-		while ((de = ReadDir(dir, "pg_tblspc")) != NULL)
-		{
-			char versiondir[MAXPGPATH];
-			DIR *dbdir;
-			struct dirent *dbde;
-			int len = snprintf(versiondir, sizeof(versiondir),
-				"pg_tblspc/%s/%s", de->d_name, TABLESPACE_VERSION_DIRECTORY);
-
-			if (len < 0 || len >= (int) sizeof(versiondir) ||
-				(dbdir = AllocateDir(versiondir)) == NULL)
-				continue;
-			while ((dbde = ReadDir(dbdir, versiondir)) != NULL)
-			{
-				char *endptr;
-				unsigned long parsed;
-				Oid dboid;
-				char mapdir[MAXPGPATH];
-				char mapfile[MAXPGPATH];
-				bool duplicate = false;
-
-				errno = 0;
-				parsed = strtoul(dbde->d_name, &endptr, 10);
-				if (errno != 0 || *dbde->d_name == '\0' || *endptr != '\0' ||
-					parsed == 0 || parsed > PG_UINT32_MAX)
-					continue;
-				dboid = (Oid) parsed;
-				for (int i = 0; i < count; i++)
-					if (oids[i] == dboid)
-						duplicate = true;
-				if (duplicate)
-					continue;
-				len = snprintf(mapdir, sizeof(mapdir), "%s/%u",
-					versiondir, dboid);
-				if (len < 0 || len >= (int) sizeof(mapdir) ||
-					(len = snprintf(mapfile, sizeof(mapfile),
-									"%s/pg_filenode.map", mapdir)) < 0 ||
-					len >= (int) sizeof(mapfile) || access(mapfile, F_OK) != 0)
-					continue;
-				if (!pagestore_reader_database_dir_valid(mapdir, dboid, read_lsn,
-												 global_crc))
-				{
-					FreeDir(dbdir);
-					FreeDir(dir);
-					pfree(oids);
-					return false;
-				}
-				if (count == capacity)
-				{
-					capacity *= 2;
-					oids = repalloc(oids, sizeof(Oid) * capacity);
-				}
-				oids[count++] = dboid;
-			}
-			FreeDir(dbdir);
-		}
-		FreeDir(dir);
-		qsort(oids, count, sizeof(Oid), oid_cmp);
-		INIT_CRC32C(database_crc);
-		for (int i = 0; i < count; i++)
-			COMP_CRC32C(database_crc, &oids[i], sizeof(Oid));
-		FIN_CRC32C(database_crc);
-		pfree(oids);
-		return count == barrier.database_count &&
-			EQ_CRC32C(database_crc, barrier.database_crc);
+		return true;
 	}
 }
 
@@ -6994,15 +6913,23 @@ pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 	BlockNumber nblocks;
 
 	memset(&barrier, 0, sizeof(barrier));
+	if (list_length(databases) > PAGESTORE_READER_DATABASE_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("too many databases for a pagestore reader barrier")));
 	barrier.read_lsn = read_lsn;
 	barrier.magic = PAGESTORE_READER_DATABASE_BARRIER_MAGIC;
 	barrier.format = PAGESTORE_READER_DATABASE_BARRIER_FORMAT;
 	barrier.timeline = pagestore_localsvc_timeline();
 	barrier.database_count = list_length(databases);
-	INIT_CRC32C(barrier.database_crc);
-	foreach_oid(dboid, databases)
-		COMP_CRC32C(barrier.database_crc, &dboid, sizeof(dboid));
-	FIN_CRC32C(barrier.database_crc);
+	{
+		uint32 i = 0;
+		ListCell *lc;
+
+		foreach(lc, databases)
+			barrier.databases[i++] =
+				*((PagestoreReaderDatabaseEntry *) lfirst(lc));
+	}
 	INIT_CRC32C(barrier.crc);
 	COMP_CRC32C(barrier.crc, &barrier,
 				offsetof(PagestoreReaderDatabaseBarrier, crc));
@@ -7673,11 +7600,10 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		manifest.timeline = pagestore_localsvc_timeline();
 		manifest.block_count = blocks;
 		manifest.artifact_crc = snapshot.header.crc;
-		if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
-				read_lsn, &manifest.global_relmap_crc))
-			ereport(ERROR,
-					(errmsg("global relation map is unavailable for reader snapshot at %X/%08X",
-							LSN_FORMAT_ARGS(read_lsn))));
+		/* READY is database-independent staging.  The database workers prime
+		 * and validate the exact-R global map together with each local map before
+		 * publishing adoption manifests and the all-database barrier. */
+		manifest.global_relmap_crc = 0;
 		pagestore_reader_snapshot_manifest_crc(&manifest);
 		memset(page, 0, sizeof(page));
 		memcpy(page, &manifest, sizeof(manifest));
@@ -7892,6 +7818,17 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	pagestore_reader_snapshot_manifest_crc(&manifest);
 	memset(page, 0, sizeof(page));
 	memcpy(page, &manifest, sizeof(manifest));
+	/* READY deliberately carries no relmap checksum.  Once a database worker
+	 * has primed the exact-R global map, replace the global manifest first so
+	 * backends can validate the database-independent snapshot header. */
+	key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, resolved, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, MyDatabaseId);
 	{
@@ -10147,6 +10084,7 @@ pagestore_validate_datadir_branch_manifest(void)
 	PsRetentionPin existing_pin;
 	bool		have_existing_pin;
 	bool		set_reader_pin;
+	bool		provisional_reader_pin = false;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -10226,17 +10164,11 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (reader_snapshot->xids != NULL)
 			pfree(reader_snapshot->xids);
 		pfree(reader_snapshot);
-		if (!pagestore_localsvc_read_fence_timeout(read_lsn, &read_seq,
-				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
-			ereport(FATAL,
-					(errmsg("pagestore reader has no durable admission fence at its configured horizon")));
-
 		/*
-		 * This is the last local-only validation step.  Reconcile or register
-		 * before branch ancestry, the published running-XID snapshot, or any
-		 * relation page can be read from the store.  A failed or stale
-		 * registration fails startup; the previous durable generation remains
-		 * conservative.
+		 * This is the last local-only validation step.  Install a conservative
+		 * zero-sequence pin before even reading the exact admission fence.  It
+		 * protects every same-LSN variant while the fence is resolved, closing
+		 * the read-fence/SET race for a new or advancing owner.
 		 */
 		have_existing_pin = pagestore_find_retention_owner(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
@@ -10266,10 +10198,31 @@ pagestore_validate_datadir_branch_manifest(void)
 				ereport(FATAL,
 						(errmsg("fixed pagestore reader owner is already above its configured horizon"),
 						 errhint("Reprovision the fixed reader with a new owner identity at a retained horizon.")));
-			set_reader_pin = existing_pin.lsn < read_lsn ||
-				(existing_pin.lsn == read_lsn &&
-				 existing_pin.admission_seq != read_seq);
+			set_reader_pin = existing_pin.lsn < read_lsn;
 		}
+		if (set_reader_pin)
+		{
+			retention_status = pagestore_localsvc_retention_set_timeout(
+				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
+				pagestore_retention_owner_id,
+				pagestore_retention_owner_generation,
+				PS_READER_RETENTION_RESOURCES, read_lsn, 0,
+				PS_READER_RETENTION_TIMEOUT_MS);
+			if (retention_status == PS_STATUS_STALE)
+				ereport(FATAL,
+						(errmsg("pagestore reader retention generation is stale")));
+			if (retention_status != PS_STATUS_OK)
+				ereport(FATAL,
+						(errmsg("pagestore reader could not install its provisional retention owner")));
+			provisional_reader_pin = true;
+		}
+		if (!pagestore_localsvc_read_fence_timeout(read_lsn, &read_seq,
+				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+			ereport(FATAL,
+					(errmsg("pagestore reader has no durable admission fence at its configured horizon")));
+		set_reader_pin = provisional_reader_pin ||
+			(have_existing_pin && existing_pin.lsn == read_lsn &&
+			 existing_pin.admission_seq != read_seq);
 		if (set_reader_pin)
 		{
 			retention_status = pagestore_localsvc_retention_set_timeout(
@@ -11754,10 +11707,14 @@ pagestore_reader_artifact_databases(void)
 	MemoryContext oldcontext;
 
 	StartTransactionCommand();
+	/* CREATE/DROP DATABASE take a conflicting lock on pg_database.  Keep this
+	 * lock and transaction through the checkpoint, per-database publication,
+	 * and barrier write so the recorded set is exactly the set at R. */
+	LockRelationOid(DatabaseRelationId, ShareLock);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	PushActiveSnapshot(GetTransactionSnapshot());
-	if (SPI_execute("SELECT oid FROM pg_database "
+	if (SPI_execute("SELECT oid, dattablespace FROM pg_database "
 					"WHERE datallowconn ORDER BY oid",
 					true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not enumerate databases");
@@ -11765,16 +11722,21 @@ pagestore_reader_artifact_databases(void)
 	for (uint64 i = 0; i < SPI_processed; i++)
 	{
 		bool		isnull;
+		PagestoreReaderDatabaseEntry *entry = palloc(sizeof(*entry));
 		Oid			dboid = DatumGetObjectId(SPI_getbinval(
 			SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
 
+		if (isnull)
+			continue;
+		entry->database_oid = dboid;
+		entry->tablespace_oid = DatumGetObjectId(SPI_getbinval(
+			SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
 		if (!isnull)
-			databases = lappend_oid(databases, dboid);
+			databases = lappend(databases, entry);
 	}
 	MemoryContextSwitchTo(oldcontext);
 	PopActiveSnapshot();
 	SPI_finish();
-	CommitTransactionCommand();
 	return databases;
 }
 
@@ -11833,19 +11795,47 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		{
 			databases = pagestore_reader_artifact_databases();
 			barrier_lsn = pagestore_latest_reader_snapshot_ready();
+			/* LockRelationOid() above prevents membership changes now; page LSNs
+			 * prove the enumerated catalog has not changed since this exact R. */
 			barrier_complete = !XLogRecPtrIsInvalid(barrier_lsn) &&
 				databases != NIL;
-			foreach_oid(dboid, databases)
+			for (int pass = 0; barrier_complete && pass < 3; pass++)
 			{
-				if (ShutdownRequestPending)
-					break;
-				pagestore_run_reader_artifact_worker(dboid);
-				if (!pagestore_database_reader_manifest_ready(dboid, barrier_lsn))
-					barrier_complete = false;
-				CHECK_FOR_INTERRUPTS();
+				ListCell *lc;
+				XLogRecPtr pass_lsn = barrier_lsn;
+
+				foreach(lc, databases)
+				{
+					PagestoreReaderDatabaseEntry *entry = lfirst(lc);
+
+					if (ShutdownRequestPending)
+					{
+						barrier_complete = false;
+						break;
+					}
+					pagestore_run_reader_artifact_worker(entry->database_oid);
+					CHECK_FOR_INTERRUPTS();
+				}
+				barrier_lsn = pagestore_latest_reader_snapshot_ready();
+				if (barrier_lsn != pass_lsn)
+				{
+					if (pass == 2)
+						barrier_complete = false;
+					continue;
+				}
+				foreach(lc, databases)
+				{
+					PagestoreReaderDatabaseEntry *entry = lfirst(lc);
+
+					if (!pagestore_database_reader_manifest_ready(
+							entry->database_oid, barrier_lsn))
+						barrier_complete = false;
+				}
+				break;
 			}
 			if (barrier_complete && !ShutdownRequestPending)
 				pagestore_publish_reader_database_barrier(databases, barrier_lsn);
+			CommitTransactionCommand();
 		}
 		PG_CATCH();
 		{
@@ -11869,7 +11859,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			FreeErrorData(edata);
 		}
 		PG_END_TRY();
-		list_free(databases);
+		list_free_deep(databases);
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -11955,7 +11945,7 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("pagestore.auto_reader_artifacts",
 							 "Automatically publish per-database reader artifacts.",
-							 "A launcher maintains one artifact worker for every connectable database.",
+							 "Required on the writer for advancing readers; a launcher maintains one artifact worker for every connectable database.",
 							 &pagestore_auto_reader_artifacts,
 							 false,
 							 PGC_POSTMASTER,

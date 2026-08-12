@@ -5120,6 +5120,9 @@ ps_handle_meta(PsChannel *ch)
 						ch->old_nblocks = pin.generation;
 						ch->req_seq = pin.owner_id;
 						ch->req_lsn = pin.lsn;
+						memcpy(ch->data, &pin.admission_seq,
+							   sizeof(pin.admission_seq));
+						ch->datalen = sizeof(pin.admission_seq);
 					}
 				}
 			}

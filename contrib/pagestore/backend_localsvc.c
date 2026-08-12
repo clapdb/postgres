@@ -1103,12 +1103,16 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
 		*found = status == PS_STATUS_OK && ch->result != 0;
 	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
 	{
+		memset(pin, 0, sizeof(*pin));
 		pin->timeline = ch->timeline;
 		pin->owner_kind = ch->blocknum;
 		pin->resources = ch->parent_timeline;
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return PS_STATUS_ERROR;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
 	}
 	return status;
 }
@@ -1133,12 +1137,16 @@ pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
 		*found = status == PS_STATUS_OK && ch->result != 0;
 	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
 	{
+		memset(pin, 0, sizeof(*pin));
 		pin->timeline = ch->timeline;
 		pin->owner_kind = ch->blocknum;
 		pin->resources = ch->parent_timeline;
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return PS_STATUS_ERROR;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
 	}
 	return status;
 }
