@@ -5,6 +5,10 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
+The ordered work packages, acceptance criteria, and open decisions for closing
+the remaining gates are tracked in
+[`MVP_COMPLETION_PLAN.md`](MVP_COMPLETION_PLAN.md).
+
 Status below includes work through the durable retention-horizon registry.
 
 ## MVP scope

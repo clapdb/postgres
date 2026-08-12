@@ -1,0 +1,418 @@
+# Pagestore MVP completion plan
+
+This document is the execution plan for closing the remaining pagestore MVP
+gates.  [`MVP_STATUS.md`](MVP_STATUS.md) remains the source of truth for current
+status and MVP scope; this document records the ordered work packages,
+dependencies, acceptance criteria, and decisions that still need agreement.
+
+Update this plan when a decision is made, a pull request lands, or evidence
+changes an acceptance criterion.  Do not mark a work package complete merely
+because its implementation PR merged: its listed evidence must pass on the
+`pagestore` branch.
+
+## Baseline
+
+Baseline as of 2026-08-12:
+
+- PRs #174 and #175 are merged into `pagestore`.
+- The local POSIX golden path is green: WAL-only writer -> continuous
+  materializer -> durable fork -> independent branch -> process restarts.
+- Managed materializer lifecycle and serialized portable branch bootstrap are
+  implemented for the default-tablespace local POSIX topology.
+- The durable retention registry and effective per-resource floor are
+  implemented, but controllers and reclaimers do not consume them yet.
+- Focused crash tests exist, but the composed fault and persisted-format
+  compatibility gates remain open.
+
+Three of the five MVP gates are therefore complete.  The two remaining gates
+are:
+
+1. retention-driven, bounded space reclamation;
+2. composed crash recovery and persisted-format compatibility.
+
+## Completion definition
+
+The MVP is complete when all of the following are true on `pagestore`:
+
+- the existing composed golden scenario remains green;
+- every running fixed/advancing reader and materializer protects the exact
+  resources and LSNs it may still consume;
+- page history, shipped WAL, and WAL-index history are reclaimed without
+  crossing the effective retention floor;
+- a deleted timeline is durably and idempotently removed with all of its local
+  data, subject to ancestry and owner checks;
+- a bounded long-running workload reaches a bounded steady-state disk size;
+- process crashes at declared materializer, branch, manifest/layer, and GC
+  transitions recover to a valid old or new state, never a torn state;
+- persisted-format fixtures prove supported reopen/upgrade paths and fail
+  closed on unsupported or corrupt formats;
+- the complete pagestore CI suite and the new bounded-space/crash/compatibility
+  lanes are green.
+
+S3/Lambda, SPDK layer recovery, multi-writer timelines, user-tablespace portable
+bootstrap, and production performance targets remain outside this MVP.
+
+## Dependency order
+
+```text
+R0 retention localsvc API
+  -> R1 controller owner lifecycle
+       -> R2 page-version pruning
+       -> R3 shipped-WAL reclamation
+       -> R4 WAL-index reclamation
+       -> R5 timeline deletion
+            -> R6 bounded-space acceptance
+
+H0 harness fault/inspection primitives
+  -> H1 composed crash scenarios
+  -> H2 persisted-format compatibility lane
+
+R2-R5 feed GC scenarios in H1.  R6 and H2 close the two MVP gates.
+```
+
+R0 and H0 may proceed independently.  Reclaimers must not be enabled before R1
+has made every in-scope runtime owner visible to the retention authority.
+
+## Retention and reclamation work
+
+### R0. Land the localsvc retention-owner API
+
+Status: **not started on `pagestore`**.
+
+The previously reviewed stacked PR #171 did not reach the final `pagestore`
+history.  Port its current-state equivalent rather than merging the stale
+stacked branch.
+
+Deliverables:
+
+- `pagestore_localsvc_retention_set()`;
+- `pagestore_localsvc_retention_drop()`;
+- backend declarations and protocol-field documentation;
+- tests for successful set/drop, idempotent drop, invalid owner/resource input,
+  daemon rejection, and reconnect/restart behavior.
+
+Acceptance:
+
+- the backend can durably replace a stable owner generation and drop it;
+- failures are reported without pretending the pin was installed or removed;
+- standalone, PostgreSQL integration, and retention recovery tests pass.
+
+Expected scope: one PR.
+
+### R1. Register reader and materializer owner generations
+
+Status: **blocked on R0 and decisions D1-D2**.
+
+Deliverables:
+
+- stable owner identity and monotonically replaceable generation for each
+  managed materializer and fixed/advancing reader;
+- registration before a process can consume retained history;
+- safe horizon replacement before an advancing reader adopts a newer view;
+- release during an owned, orderly shutdown or explicit deprovision operation;
+- supervisor handoff/restart behavior that never creates an unprotected window;
+- status/inspection output that identifies active and stale owners.
+
+Safety rule: uncertainty keeps data.  A timeout or ambiguous drop must leave the
+owner conservatively pinned until a later authoritative reconciliation.
+
+Acceptance:
+
+- process start, handoff, advancement, clean stop, crash, daemon restart, and
+  duplicate-owner tests cover each lifecycle transition;
+- no runtime can serve or redo at LSN `R` unless its required resource masks are
+  protected at or below `R`;
+- a stale owner can be identified and explicitly reconciled without wall-clock
+  expiry changing correctness.
+
+Expected scope: two PRs, materializer then reader.
+
+### R2. Prune page versions during image compaction
+
+Status: **not started; blocked on R1**.
+
+Compaction currently rewrites image layers while retaining every historical
+version.  It must consume the page-history effective floor.
+
+Deliverables:
+
+- a precise keep/drop rule that retains the newest required base version at or
+  below the floor and every version required above it;
+- descendant pins projected through each fork cap;
+- structural branch ancestry preserved independently of explicit owners;
+- install-new-before-delete-old manifest transition;
+- idempotent local and remote deletion retries;
+- pruning statistics and inspection output.
+
+Acceptance:
+
+- reads at every retained horizon agree before and after compaction;
+- reads below the declared floor may be rejected, but never return a wrong
+  version;
+- branch divergence, relation truncate/drop/recreate, restart, and injected GC
+  failures preserve the rule;
+- repeated update/compact cycles stop growing retained page history.
+
+Expected scope: one implementation PR and, if needed, one fault-test PR.
+
+### R3. Reclaim shipped WAL
+
+Status: **design decision required; blocked on R1 and D3**.
+
+The current flat `wal_<timeline>` file does not support simple crash-safe prefix
+deletion.  WAL reclamation must first gain a durable physical base LSN and a
+layout that can remove an old prefix without rewriting an unbounded file under
+the serve path.
+
+Deliverables:
+
+- segmented WAL storage or another agreed crash-safe prefix-reclaim format;
+- persisted base/end metadata with checksum and reopen validation;
+- append/read across physical segment boundaries and branch ancestry;
+- reclamation driven by the WAL effective floor;
+- explicit protection for restorable control images and in-progress WAL-index
+  scanning;
+- migration or fail-closed handling for the existing flat format.
+
+Acceptance:
+
+- WAL read/restore results are identical before and after reclaim at every
+  retained LSN;
+- reclaim never crosses a control, branch, reader, materializer, or indexing
+  requirement;
+- crash at create, fsync, publish, and unlink boundaries reopens safely;
+- a continuous WAL-only workload reaches bounded WAL disk usage.
+
+Expected scope: two or three PRs (format, reclaimer, crash/migration coverage).
+
+### R4. Compact and reclaim the WAL index
+
+Status: **not started; blocked on R1**.
+
+Deliverables:
+
+- compacted per-(timeline, shard) durable index representation;
+- removal of entries strictly below the WAL-index effective floor while
+  retaining the necessary base/read boundary;
+- atomic publication and old-log deletion;
+- bounded startup replay and compaction scheduling off serve threads.
+
+Acceptance:
+
+- retained `redo_page_asof` results match before and after compaction;
+- incomplete final records, complete corruption, interrupted publication, and
+  daemon restart are covered;
+- repeated WAL indexing and compaction reaches bounded index size.
+
+Expected scope: one or two PRs.
+
+### R5. Delete timelines durably
+
+Status: **not started; blocked on R1-R4 and decision D4**.
+
+Deliverables:
+
+- deletion admission checks for descendants, active owners, and structural
+  retention requirements;
+- durable timeline tombstone/state transition;
+- idempotent removal of manifests, layers, page segments, WAL, WAL index,
+  control/SLRU metadata, and object-tier copies;
+- restart resumes deletion and never resurrects a deleted timeline;
+- inspection reports pending and failed cleanup.
+
+Acceptance:
+
+- unsafe deletes fail before mutation;
+- every fault boundary leaves the timeline either fully readable or durably
+  deleting/deleted;
+- repeated delete requests are idempotent;
+- deleting a branch does not affect its parent or siblings.
+
+Expected scope: one or two PRs.
+
+### R6. Prove bounded space
+
+Status: **blocked on R2-R5**.
+
+Add a deterministic soak scenario with bounded live data but repeated updates,
+WAL generation, compaction, reader advancement, branch creation/deletion, and
+daemon restart.
+
+Acceptance:
+
+- page history, shipped WAL, WAL index, and deleted-timeline debris each remain
+  within a declared bound after maintenance catches up;
+- the report includes logical live bytes, physical bytes, write amplification,
+  GC lag, and active retention owners;
+- retained SQL-visible state remains correct throughout the run.
+
+Expected scope: one PR.  Passing it closes the retention MVP gate.
+
+## Crash and compatibility work
+
+### H0. Add common fault and inspection primitives
+
+Status: **partial harness exists**.
+
+Deliverables:
+
+- one test-only named fault registry with crash/error/pause actions and hit
+  counts;
+- reachability accounting so an unhit expected fault fails the test;
+- harness timeouts, replay metadata, and diagnostic bundles;
+- read-only inspection for timeline, manifest/layer, retention/GC, and owner
+  state needed by recovery assertions.
+
+Acceptance:
+
+- faults do not add durability edges or alter production behavior when disabled;
+- every run reports scenario, seed, fault, hit count, and operation identity;
+- paused faults have a watchdog and actionable diagnostics.
+
+Expected scope: one or two PRs.
+
+### H1. Compose process-level crash scenarios
+
+Status: **blocked partly on H0; GC cases also depend on R2-R5**.
+
+Required scenario families:
+
+- materializer replay/restartpoint/durable-marker publication;
+- branch prepare, receipt publication, bootstrap install, and service restore;
+- manifest replacement and image-layer seal/publication;
+- page pruning, WAL reclaim, WAL-index compaction, and timeline deletion;
+- daemon, writer, materializer, and branch-compute restart combinations.
+
+Acceptance:
+
+- each declared transition is exercised before and after its durability point;
+- recovery yields a valid complete old or new state;
+- direct and recovered SQL-visible results agree at declared horizons.
+
+Expected scope: two or three focused PRs.
+
+### H2. Add persisted-format fixtures and compatibility CI
+
+Status: **not started; decision D5 required**.
+
+Fixture families:
+
+- timeline metadata and retention registry;
+- manifest and image/delta layer headers/indexes;
+- page segments, shipped WAL metadata, and WAL index;
+- control, SLRU, reader, and branch-bootstrap artifacts.
+
+Acceptance:
+
+- supported old fixtures reopen or upgrade to the documented state;
+- unsupported newer/unknown versions fail closed with an actionable error;
+- checksum corruption and illegal truncation are rejected;
+- every persisted-format change must update or add a fixture.
+
+Expected scope: one or two PRs.  Passing it with H1 closes the crash/compatibility
+MVP gate.
+
+## Work that follows the MVP
+
+These items matter, but should not delay the two remaining MVP gates unless
+measurement proves they block the acceptance scenarios:
+
+- user-tablespace portable branch bootstrap;
+- materializer PGDATA provisioning and service-manager integration;
+- object-tier cache budget/residency and orphan reconciliation;
+- production S3 provider;
+- sparse image indexes and a separate layer-block cache;
+- immutable WAL delta sealing and bounded redo-chain compaction;
+- cost-aware materialized-page cache admission and proven redo avoidance;
+- size-tiered/incremental compaction, key-range pruning, and bloom filters;
+- per-shard manifest/layer map/cache and replicated timeline metadata;
+- asynchronous POSIX I/O and explicit CPU/IO scheduling;
+- SPDK image-layer recovery/GC;
+- production backup/restore, observability, alerting, and repair procedures.
+
+## Decisions for discussion
+
+Record the selected answer and rationale here before implementing the dependent
+work.
+
+### D1. Owner identity authority
+
+Recommended: deployment/controller-assigned stable 64-bit owner ID plus a
+monotonic generation stored in controller state.  A replacement supervisor
+updates the same owner key rather than adding another logical owner.
+
+Alternative: derive identity from PGDATA or reader artifact.  This is easier to
+bootstrap but makes cloning and deliberate replacement ambiguous.
+
+Decision: **open**.
+
+### D2. Owner release and stale-owner policy
+
+Recommended: explicit durable release or authoritative generation replacement;
+never use wall-clock lease expiry for correctness.  Stale owners retain space
+until an operator/controller reconciliation proves them dead.
+
+Decision: **open**.
+
+### D3. Shipped-WAL physical layout
+
+Recommended: immutable fixed-size logical WAL segment files plus small durable
+timeline metadata recording the retained base and append end.  Reclaim deletes
+whole old files and retains the boundary file when needed.
+
+Alternative: periodically rewrite the flat file.  It minimizes format count but
+causes unbounded copy cost and a larger crash-publication protocol.
+
+Decision: **open**.
+
+### D4. Timeline deletion with descendants
+
+Recommended for MVP: reject deletion while any descendant exists.  Do not add
+cascade or ancestry reparenting semantics.
+
+Decision: **open**.
+
+### D5. Persisted-format support window
+
+Recommended: preserve fixtures for every format shipped on `pagestore` after the
+MVP format baseline; require explicit migration for supported older versions and
+fail closed otherwise.  Release branches can define a narrower cross-major
+policy separately.
+
+Decision: **open**.
+
+### D6. MVP deployment boundary
+
+Recommended: keep default-tablespace local POSIX as the MVP boundary.  Treat
+user tablespaces, S3, SPDK layers, and service-manager packaging as follow-up
+work.
+
+Decision: **open**.
+
+## Proposed PR sequence
+
+The default sequence is:
+
+1. R0 localsvc retention API;
+2. R1a materializer owner lifecycle;
+3. R1b reader owner lifecycle;
+4. R2 page-version pruning;
+5. R3a segmented WAL format and compatibility;
+6. R3b WAL reclaimer;
+7. R4 WAL-index compaction/reclamation;
+8. R5 timeline deletion;
+9. H0 fault/inspection primitives (may start in parallel with R0-R1);
+10. H1 composed crash scenarios;
+11. H2 format fixtures and compatibility CI;
+12. R6 bounded-space acceptance and final MVP status update.
+
+Keep each PR independently reviewable and keep the existing standalone and
+golden suites green.  If work packages depend on one another before their base
+lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
+
+## Progress log
+
+| Date | Change | Evidence |
+|---|---|---|
+| 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
+
