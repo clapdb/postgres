@@ -77,6 +77,10 @@ read_all_at(int fd, void *data, size_t len, off_t offset)
 	return 0;
 }
 
+static int load_validated_segment(const PsWalStore *store,
+								  const PsWalSegmentHeader *expected,
+								  unsigned char **payload_out);
+
 static int
 publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 				const void *payload)
@@ -145,6 +149,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 
 	if (store == NULL || directory == NULL)
 		return -1;
+	if (start_lsn % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0)
+		return -1;
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
 	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
@@ -182,7 +188,45 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	}
 	store->start_lsn = start_lsn;
 	store->end_lsn = start_lsn;
+	store->next_segment_no = start_lsn / PS_WAL_SEGMENT_PAYLOAD_BYTES;
 	return 0;
+}
+
+/* Validate each immutable segment at most once, then compare the complete
+ * overlapping range from that in-memory payload. */
+static int
+validate_committed_prefix(const PsWalStore *store, uint64_t start_lsn,
+						  const unsigned char *bytes, uint32_t prefix)
+{
+	uint32_t done = 0;
+	uint64_t end_lsn = start_lsn + prefix;
+
+	for (uint32_t i = 0; i < store->nentries && done < prefix; i++)
+	{
+		const PsWalSegmentHeader *header = &store->entries[i].header;
+		uint64_t segment_end = header->start_lsn + header->payload_len;
+		uint64_t overlap_start = start_lsn > header->start_lsn ?
+			start_lsn : header->start_lsn;
+		uint64_t overlap_end = end_lsn < segment_end ? end_lsn : segment_end;
+
+		if (overlap_start < overlap_end)
+		{
+			unsigned char *payload = NULL;
+			size_t amount = (size_t) (overlap_end - overlap_start);
+
+			if (load_validated_segment(store, header, &payload) != 0)
+				return -1;
+			if (memcmp(payload + (overlap_start - header->start_lsn),
+					   bytes + (overlap_start - start_lsn), amount) != 0)
+			{
+				free(payload);
+				return -1;
+			}
+			free(payload);
+			done += (uint32_t) amount;
+		}
+	}
+	return done == prefix ? 0 : -1;
 }
 
 int
@@ -201,26 +245,21 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	 * divergent bytes so immutable WAL identity remains fail closed. */
 	if (start_lsn < store->end_lsn)
 	{
-		unsigned char verify[65536];
-		uint64_t prefix = store->end_lsn - start_lsn;
+		uint32_t prefix = (uint32_t) (store->end_lsn - start_lsn);
 
-		while (done < prefix)
-		{
-			uint32_t amount = (uint32_t) (prefix - done);
-
-			if (amount > sizeof(verify))
-				amount = sizeof(verify);
-			if (ps_wal_store_read(store, start_lsn + done, verify, amount) != 0 ||
-				memcmp(verify, bytes + done, amount) != 0)
-				return -1;
-			done += amount;
-		}
+		if (validate_committed_prefix(store, start_lsn, bytes, prefix) != 0)
+			return -1;
+		done = prefix;
 	}
 	while (done < len)
 	{
 		PsWalSegmentHeader header;
 		uint32_t chunk = len - done;
+		uint64_t segment_start = start_lsn + done;
 
+		if (segment_start % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
+			segment_start / PS_WAL_SEGMENT_PAYLOAD_BYTES != store->next_segment_no)
+			return -1;
 		if (chunk > PS_WAL_SEGMENT_PAYLOAD_BYTES)
 			chunk = PS_WAL_SEGMENT_PAYLOAD_BYTES;
 		{
