@@ -213,6 +213,18 @@ test('pagestore_wal_segment',
   timeout: 30,
 )
 
+# Atomic immutable segment publication and cross-segment shipped-WAL reads.
+pagestore_wal_store_test = executable('pagestore_wal_store_test',
+  files('pagestore_wal_store_test.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c'),
+  install: false,
+)
+test('pagestore_wal_store',
+  pagestore_wal_store_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
