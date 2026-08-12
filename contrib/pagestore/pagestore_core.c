@@ -1038,43 +1038,30 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 			free(fences);
 			return -1;
 		}
-		for (uint32_t i = first; i < end; i++)
-			if (keep[i - first])
-			{
-				int duplicate = 0;
+		for (uint32_t i = first; i < end;)
+		{
+			uint32_t next = i + 1;
+			int kept_source = -1;
 
-				for (uint32_t j = first; j < i; j++)
-					if (keep[j - first] &&
-						order[j].version.lsn == order[i].version.lsn &&
-						order[j].version.admission_seq ==
-						order[i].version.admission_seq)
-					{
-						duplicate = 1;
-						break;
-					}
-				if (!duplicate)
-					selected[out++] = recs[order[i].source];
-			}
+			while (next < end &&
+				   order[next].version.lsn == order[i].version.lsn &&
+				   order[next].version.admission_seq ==
+				   order[i].version.admission_seq)
+				next++;
+			for (uint32_t j = i; j < next; j++)
+				if (keep[j - first])
+				{
+					kept_source = (int) order[j].source;
+					break;
+				}
+			/* Sorted equal identities are one logical version.  Retain one
+			 * physical copy, or remove the identity from page_idx exactly once. */
+			if (kept_source >= 0)
+				selected[out++] = recs[kept_source];
 			else
-			{
-				int			identity_kept = 0;
-
-				/* Crash recovery can expose the install-before-delete copy and
-				 * its old source layer together.  The policy may discard one
-				 * physical duplicate while retaining the same logical version;
-				 * that is not a reason to remove the version from page_idx. */
-				for (uint32_t j = first; j < end; j++)
-					if (keep[j - first] &&
-						order[j].version.lsn == order[i].version.lsn &&
-						order[j].version.admission_seq ==
-						order[i].version.admission_seq)
-					{
-						identity_kept = 1;
-						break;
-					}
-				if (!identity_kept)
-					dropped[ndropped++] = recs[order[i].source];
-			}
+				dropped[ndropped++] = recs[order[i].source];
+			i = next;
+		}
 		first = end;
 	}
 	memcpy(recs, selected, (size_t) out * sizeof(*recs));
@@ -2255,6 +2242,23 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 			return 0;			/* cycle */
 		if (!timelines[t].defined)
 			return 0;			/* broken chain: refuse rather than risk a loop */
+	}
+	return 1;
+}
+
+/* Project a requested branch horizon through every ancestor cap and reject
+ * any ancestor whose durable reclamation frontier has already passed it. */
+static int
+branch_frontiers_allow(int parent, uint64_t branch_lsn)
+{
+	uint64_t cap = branch_lsn;
+
+	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
+	{
+		if (!timelines[t].defined || cap < page_reclaimed_floor[t])
+			return 0;
+		if (timelines[t].parent >= 0 && cap > timelines[t].branch_lsn)
+			cap = timelines[t].branch_lsn;
 	}
 	return 1;
 }
@@ -5310,10 +5314,11 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (ch->parent_timeline < MAX_TIMELINES &&
-				ch->req_lsn >= page_reclaimed_floor[ch->parent_timeline] &&
-				branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn))
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn) &&
+				(timelines[ch->timeline].defined ||
+				 branch_frontiers_allow((int) ch->parent_timeline,
+								ch->req_lsn)))
 			{
 				if (timelines[ch->timeline].defined)
 					break;
@@ -5333,10 +5338,11 @@ ps_handle_meta(PsChannel *ch)
 			 * This keeps prepare/retry paths deterministic: invalid requests are
 			 * rejected in-place before any SLRU directory mutation.
 			 */
-			if (ch->parent_timeline < MAX_TIMELINES &&
-				ch->req_lsn >= page_reclaimed_floor[ch->parent_timeline] &&
-				branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn))
+			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
+								 ch->req_lsn) &&
+				(timelines[ch->timeline].defined ||
+				 branch_frontiers_allow((int) ch->parent_timeline,
+								ch->req_lsn)))
 			{
 				/* valid */
 			}
@@ -5455,10 +5461,9 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_SET:
 			{
 				PsRetentionPin pin;
-				PsRetentionPin previous;
 				int			ret;
-				int			had_previous;
-				int			page_released = 0;
+				uint64_t	old_floor = 0;
+				uint64_t	new_floor = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -5481,8 +5486,8 @@ ps_handle_meta(PsChannel *ch)
 					 * with mutations and advance allocation before admitting more. */
 					pthread_rwlock_wrlock(&admission_lock);
 					pthread_rwlock_wrlock(&page_prune_lock);
-					had_previous = ps_retention_lookup(tl, ch->blocknum,
-						ch->req_seq, &previous);
+					(void) retention_effective_floor_internal(tl,
+						PS_RETENTION_RESOURCE_PAGE_HISTORY, &old_floor, 0);
 					ret = ((pin.resources &
 							PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
 						pin.lsn < page_reclaimed_floor[tl]) ?
@@ -5490,16 +5495,12 @@ ps_handle_meta(PsChannel *ch)
 					if (ret == PS_RETENTION_OK)
 					{
 						admission_seq_observe(pin.admission_seq);
-						if (had_previous == 1 &&
-							(previous.resources &
-							 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
-							(((pin.resources &
-							   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-							 pin.lsn > previous.lsn))
-							page_released = 1;
+						if (retention_effective_floor_internal(tl,
+								PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								&new_floor, 0) == 0 &&
+							new_floor != old_floor)
+							page_prune_mark_all_due();
 					}
-					if (page_released)
-						page_prune_mark_all_due();
 					pthread_rwlock_unlock(&page_prune_lock);
 					pthread_rwlock_unlock(&admission_lock);
 				}
@@ -5545,19 +5546,21 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_DROP:
 			{
 				int			ret;
-				PsRetentionPin previous;
-				int			had_previous;
+				uint64_t	old_floor = 0;
+				uint64_t	new_floor = 0;
 
 				pthread_rwlock_wrlock(&page_prune_lock);
-				had_previous = ps_retention_lookup(tl, ch->blocknum,
-					ch->req_seq, &previous);
+				(void) retention_effective_floor_internal(tl,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, &old_floor, 0);
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
 					   !timelines[tl].defined) ?
 					PS_RETENTION_ERROR :
 					ps_retention_drop(tl, ch->blocknum, ch->req_seq,
 									  ch->old_nblocks);
-				if (ret == PS_RETENTION_OK && had_previous == 1 &&
-					(previous.resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+				if (ret == PS_RETENTION_OK &&
+					retention_effective_floor_internal(tl,
+						PS_RETENTION_RESOURCE_PAGE_HISTORY, &new_floor, 0) == 0 &&
+					new_floor != old_floor)
 					page_prune_mark_all_due();
 				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)
