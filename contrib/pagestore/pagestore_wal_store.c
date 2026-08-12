@@ -123,8 +123,7 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 					}
 					parsed = parsed * 10 + digit;
 				}
-				if (valid && parsed == store->timeline &&
-					(!signed_spelling || *timeline_text == '+'))
+				if (valid && parsed == store->timeline)
 					goto cleanup;
 			}
 			continue;

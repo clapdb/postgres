@@ -344,6 +344,14 @@ main(void)
 			  "reopen rejects a signed equivalent timeline spelling");
 		check(rename(noncanonical, path) == 0,
 			  "restore the canonical timeline after signed spelling test");
+		snprintf(noncanonical, sizeof(noncanonical),
+				 "%s/walv1_-7_%020llu", directory, 2ULL);
+		check(rename(path, noncanonical) == 0,
+			  "inject a negative spelling of the requested timeline");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a negative equivalent timeline spelling");
+		check(rename(noncanonical, path) == 0,
+			  "restore the canonical timeline after negative spelling test");
 	}
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
