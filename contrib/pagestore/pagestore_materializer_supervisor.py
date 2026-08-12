@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import fcntl
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -181,7 +181,20 @@ class Config:
         try:
             paths["socket_dir"].mkdir(parents=True, exist_ok=True)
             paths["state_dir"].mkdir(parents=True, exist_ok=True)
-            paths["retention_authority_dir"].mkdir(parents=True, exist_ok=True)
+            authority_dir = paths["retention_authority_dir"]
+            try:
+                authority_dir.mkdir(parents=True, mode=0o700)
+            except FileExistsError:
+                pass
+            authority_stat = authority_dir.stat()
+            if (
+                not stat.S_ISDIR(authority_stat.st_mode)
+                or authority_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(authority_stat.st_mode) != 0o700
+            ):
+                raise ConfigError(
+                    "retention_authority_dir must be owned by this user and mode 0700"
+                )
             paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise ConfigError(
@@ -274,11 +287,7 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            try:
-                os.fsync(directory_fd)
-            except OSError as error:
-                if error.errno not in (errno.EBADF, errno.EINVAL):
-                    raise
+            os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
     finally:

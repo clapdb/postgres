@@ -37,6 +37,8 @@ CONFIG_FIELDS = {
     "materializer_data_dir",
     "materializer_host",
     "materializer_port",
+    "retention_authority_dir",
+    "retention_owner_id",
     "prepared_dir",
     "new_timeline",
     "parent_timeline",
@@ -59,6 +61,8 @@ REQUIRED_CONFIG_FIELDS = {
     "materializer_data_dir",
     "materializer_host",
     "materializer_port",
+    "retention_authority_dir",
+    "retention_owner_id",
     "prepared_dir",
     "new_timeline",
     "parent_timeline",
@@ -147,6 +151,8 @@ class Config:
     materializer_data_dir: Path
     materializer_host: str
     materializer_port: int
+    retention_authority_dir: Path
+    retention_owner_id: int
     prepared_dir: Path
     new_timeline: int
     parent_timeline: int
@@ -181,6 +187,7 @@ class Config:
             "writer_log_file",
             "private_socket_dir",
             "materializer_data_dir",
+            "retention_authority_dir",
             "prepared_dir",
         ):
             item = value[field]
@@ -217,6 +224,7 @@ class Config:
             "writer_port": None,
             "private_port": None,
             "materializer_port": None,
+            "retention_owner_id": None,
             "new_timeline": None,
             "parent_timeline": None,
             "poll_interval_ms": 100,
@@ -237,6 +245,8 @@ class Config:
         for field in ("writer_port", "private_port", "materializer_port"):
             if integers[field] > 65535:
                 raise ConfigError(f"branch config {field} exceeds 65535")
+        if integers["retention_owner_id"] > (1 << 64) - 1:
+            raise ConfigError("branch config retention_owner_id exceeds uint64")
         if integers["new_timeline"] == integers["parent_timeline"]:
             raise ConfigError("new_timeline must differ from parent_timeline")
         for field in ("new_timeline", "parent_timeline"):
@@ -268,6 +278,17 @@ class Config:
                 f"writer_log_file is not writable: {paths['writer_log_file']}: {error}"
             ) from error
         paths["prepared_dir"].mkdir(parents=True, exist_ok=True)
+        authority_dir = paths["retention_authority_dir"]
+        authority_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        authority_stat = authority_dir.stat()
+        if (
+            not stat.S_ISDIR(authority_stat.st_mode)
+            or authority_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(authority_stat.st_mode) != 0o700
+        ):
+            raise ConfigError(
+                "retention_authority_dir must be owned by this user and mode 0700"
+            )
         private_socket = paths["private_socket_dir"]
         existed = private_socket.exists()
         private_socket.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -293,6 +314,10 @@ class Config:
         # Share the supervisor's ownership fence.  The branch operation itself
         # controls pause/resume and must not race a supervisor restartpoint.
         return self.materializer_data_dir / ".pagestore-materializer-supervisor.lock"
+
+    @property
+    def retention_authority_lock_file(self) -> Path:
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.lock"
 
     @property
     def receipt_file(self) -> Path:
@@ -791,27 +816,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_config:
             print("ok")
             return 0
-        with OwnerLock(config.lock_file, "branch prepare"):
-            with OwnerLock(config.prepared_lock_file, "prepared artifact directory"):
-                try:
-                    with OwnerLock(
-                        config.materializer_lock_file,
-                        "materializer supervisor or branch prepare",
-                    ):
-                        preparer = BranchPreparer(config)
+        with OwnerLock(config.retention_authority_lock_file, "retention owner authority"):
+            with OwnerLock(config.lock_file, "branch prepare"):
+                with OwnerLock(config.prepared_lock_file, "prepared artifact directory"):
+                    try:
+                        with OwnerLock(
+                            config.materializer_lock_file,
+                            "materializer supervisor or branch prepare",
+                        ):
+                            preparer = BranchPreparer(config)
 
-                        def cancel(signum: int, _frame: object) -> None:
-                            raise CancelledError(f"received signal {signum}")
+                            def cancel(signum: int, _frame: object) -> None:
+                                raise CancelledError(f"received signal {signum}")
 
-                        signal.signal(signal.SIGINT, cancel)
-                        signal.signal(signal.SIGTERM, cancel)
-                        receipt = preparer.execute()
-                        print(json.dumps(receipt, sort_keys=True))
-                        return 0
-                except OwnershipError as error:
-                    raise OwnershipError(
-                        f"{error}; stop the materializer supervisor before preparing a branch"
-                    ) from error
+                            signal.signal(signal.SIGINT, cancel)
+                            signal.signal(signal.SIGTERM, cancel)
+                            receipt = preparer.execute()
+                            print(json.dumps(receipt, sort_keys=True))
+                            return 0
+                    except OwnershipError as error:
+                        raise OwnershipError(
+                            f"{error}; stop the materializer supervisor before preparing a branch"
+                        ) from error
     except OwnershipError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return EX_TEMPFAIL

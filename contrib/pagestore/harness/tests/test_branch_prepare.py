@@ -46,6 +46,8 @@ class BranchPrepareTests(unittest.TestCase):
             "materializer_data_dir": str(self.materializer),
             "materializer_host": "127.0.0.1",
             "materializer_port": 5434,
+            "retention_authority_dir": str(self.root / "controller-authority"),
+            "retention_owner_id": 1,
             "prepared_dir": str(self.root / "prepared"),
             "new_timeline": 1,
             "parent_timeline": 0,

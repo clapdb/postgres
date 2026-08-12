@@ -328,6 +328,8 @@ cat > "$BRANCH_CONFIG" <<EOF
   "materializer_data_dir": "$MATERIALIZER",
   "materializer_host": "127.0.0.1",
   "materializer_port": $MPORT,
+  "retention_authority_dir": "$D/controller-authority",
+  "retention_owner_id": 1,
   "prepared_dir": "$PREPARED",
   "new_timeline": 1,
   "parent_timeline": 0,

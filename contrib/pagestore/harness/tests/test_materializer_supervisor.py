@@ -61,6 +61,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(config.socket_dir.is_dir())
         self.assertTrue(config.state_dir.is_dir())
         self.assertTrue(config.retention_authority_dir.is_dir())
+        self.assertEqual(config.retention_authority_dir.stat().st_mode & 0o777, 0o700)
         self.assertTrue(config.log_file.parent.is_dir())
 
         with self.assertRaisesRegex(MODULE.ConfigError, "unknown.*typo"):
@@ -75,6 +76,14 @@ class SupervisorTests(unittest.TestCase):
             path = self.root / "missing-owner.json"
             path.write_text(json.dumps(value), encoding="utf-8")
             MODULE.Config.load(path)
+
+        unsafe = self.root / "unsafe-authority"
+        unsafe.mkdir(mode=0o777)
+        unsafe.chmod(0o777)
+        with self.assertRaisesRegex(MODULE.ConfigError, "mode 0700"):
+            MODULE.Config.load(
+                self.write_config(retention_authority_dir=str(unsafe))
+            )
 
     def test_lsn_and_backoff_helpers(self):
         self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
