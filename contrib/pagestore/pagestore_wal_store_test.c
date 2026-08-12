@@ -228,6 +228,19 @@ main(void)
 		  "restore the published segment after replacement test");
 	if (fd >= 0)
 		close(fd);
+	{
+		char held[1024];
+
+		check(ps_wal_store_read(&store, 0, window, 1) == 0,
+			  "populate the validated segment cache");
+		snprintf(held, sizeof(held), "%s/held_cached_segment", directory);
+		check(rename(path, held) == 0 && symlink("held_cached_segment", path) == 0,
+			  "replace a cached canonical segment with a symlink");
+		check(ps_wal_store_read(&store, 0, window, 1) != 0,
+			  "cached read rejects a symlink at the canonical segment path");
+		check(unlink(path) == 0 && rename(held, path) == 0,
+			  "restore the canonical cached segment path");
+	}
 	ps_wal_store_close(&store);
 
 	/* Only a canonical mkstemp orphan belongs to recovery cleanup. */
