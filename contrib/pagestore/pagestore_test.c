@@ -2286,6 +2286,101 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 }
 
 static void
+run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== relation-lifecycle page pruning ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_relation", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_relation", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 2200, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 6500) ==
+		  PS_STATUS_OK,
+		  "reader pins relation history before truncate/drop/recreate");
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 1500, 15);
+	op_write_tl(0, rel, 0, 0, page);
+	fill_page(page, ps, 6000, 60);
+	op_write_tl(0, rel, 0, 0, page);
+	op_truncate_at(rel, 0, 0, 7000);
+	op_unlink_at(rel, 0, 9000);
+	op_create_at(rel, 0, 10000);
+	fill_page(page, ps, 11000, 110);
+	op_write_tl(0, rel, 0, 0, page);
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(page, ps, 12000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "relation-lifecycle history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 2000, readback),
+		  "compaction prunes the obsolete page version below the reader base");
+	check(op_read_at_found(rel, 0, 0, 6500, readback) &&
+		  page_has_tag(readback, ps, 60),
+		  "reader base survives relation compaction and restart");
+	check(op_exists_asof(rel, 0, 6500) && op_nblocks_asof(rel, 0, 6500) == 1,
+		  "pre-truncate relation metadata remains visible at the retained floor");
+	check(op_exists_asof(rel, 0, 7500) && op_nblocks_asof(rel, 0, 7500) == 0,
+		  "truncate remains visible after page pruning");
+	check(!op_exists_asof(rel, 0, 9500),
+		  "drop remains visible between drop and recreate");
+	check(op_exists_asof(rel, 0, 10500) &&
+		  op_nblocks_asof(rel, 0, 10500) == 0,
+		  "recreated relation is empty before its new generation page");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "new relation generation remains current after compaction and restart");
+
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 2200, 1) ==
+		  PS_STATUS_OK,
+		  "reader releases relation-lifecycle history");
+	for (uint32_t block = 49; block <= 96; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "released relation history is compacted again");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 6500, readback),
+		  "unprotected pre-truncate page history is durably pruned");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "pruning released history cannot expose an older relation generation");
+
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
 run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
@@ -4185,6 +4280,8 @@ main(int argc, char **argv)
 	run_segment_gc_suite(daemon_path, tmpbase);
 	/* Descendant owners and nested fork caps constrain parent page pruning. */
 	run_prune_branch_retention_suite(daemon_path, tmpbase);
+	/* Fork lifecycle metadata must continue to gate pruned page generations. */
+	run_prune_relation_lifecycle_suite(daemon_path, tmpbase);
 	/* Recovery must not reuse a sealed layer file absent from the manifest. */
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */
