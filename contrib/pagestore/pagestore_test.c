@@ -1983,8 +1983,9 @@ wait_for_compacted_layers(const char *store, int maximum)
 }
 
 static int
-wait_for_pruning_compaction(const char *shm, uint64_t previous,
-							uint64_t *current)
+wait_for_pruning_compaction(const char *shm, uint32_t rel,
+							uint64_t obsolete_lsn, uint64_t previous,
+							uint64_t *current, unsigned char *readback)
 {
 	uint64_t scanned,
 			 kept,
@@ -1992,8 +1993,24 @@ wait_for_pruning_compaction(const char *shm, uint64_t previous,
 
 	for (int i = 0; i < 500; i++)
 	{
-		if (read_pruning_metrics(shm, current, &scanned, &kept, &deleted) &&
-			*current > previous)
+		if (!op_read_at_found(rel, 0, 0, obsolete_lsn, readback) &&
+			read_pruning_metrics(shm, current, &scanned, &kept, &deleted) &&
+			*current > previous && scanned == kept + deleted)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+wait_for_accounted_pruning_metrics(const char *shm, uint64_t minimum,
+								   uint64_t *compactions, uint64_t *scanned,
+								   uint64_t *kept, uint64_t *deleted)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		if (read_pruning_metrics(shm, compactions, scanned, kept, deleted) &&
+			*compactions >= minimum && *scanned == *kept + *deleted)
 			return 1;
 		usleep(10000);
 	}
@@ -2645,9 +2662,12 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 500);
+	fill_page(page, ps, 600, 19);
+	op_write_tl(0, rel, 0, 0, page);
 	for (uint32_t cycle = 0; cycle < 12; cycle++)
 	{
-		uint64_t	before = compactions;
+		uint64_t	before;
+		uint64_t	obsolete_lsn = cycle == 0 ? 600 : 1000 + (cycle - 1) * 100;
 
 		for (uint32_t write = 0; write < 32; write++)
 		{
@@ -2657,11 +2677,14 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 			fill_page(page, ps, lsn, tag);
 			op_write_tl(0, rel, 0, write % 4, page);
 		}
+		check(read_pruning_metrics(shm, &before, &scanned, &kept, &deleted),
+			  "churn cycle %u captures its post-write pruning baseline", cycle);
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY,
 						   1000 + cycle * 100 + 31) == PS_STATUS_OK,
 			  "churn cycle %u advances its durable page cutoff", cycle);
-		check(wait_for_pruning_compaction(shm, before, &compactions),
+		check(wait_for_pruning_compaction(shm, rel, obsolete_lsn, before,
+								  &compactions, readback),
 			  "churn cycle %u waits for its requested pruning pass", cycle);
 		check(wait_for_compacted_layers(store, 3),
 			  "churn cycle %u returns to the configured live-layer bound", cycle);
@@ -2669,8 +2692,8 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	bytes = local_layer_bytes(store);
 	check(bytes > 0 && bytes < (uint64_t) ps * 64,
 		  "twelve churn cycles retain fewer than 64 page images on disk");
-	check(read_pruning_metrics(shm, &compactions, &scanned, &kept, &deleted) &&
-		  compactions >= 12 && scanned == kept + deleted && deleted > kept,
+	check(wait_for_accounted_pruning_metrics(shm, 12, &compactions, &scanned,
+										  &kept, &deleted) && deleted > kept,
 		  "pruning counters account for churn and delete more versions than remain");
 	for (uint32_t block = 0; block < 4; block++)
 	{
@@ -2693,10 +2716,6 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 				 restart_kept,
 				 restart_deleted;
 
-		check(read_pruning_metrics(shm, &before, &restart_scanned,
-							   &restart_kept, &restart_deleted),
-			  "restarted churn reads its fresh pruning counter baseline");
-
 		for (uint32_t write = 0; write < 32; write++)
 		{
 			uint64_t lsn = 2200 + write;
@@ -2705,11 +2724,15 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 			fill_page(page, ps, lsn, tag);
 			op_write_tl(0, rel, 0, write % 4, page);
 		}
+		check(read_pruning_metrics(shm, &before, &restart_scanned,
+							   &restart_kept, &restart_deleted),
+			  "restarted churn captures its post-write pruning baseline");
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 2231) ==
 			  PS_STATUS_OK,
 			  "restarted churn advances the restored retention owner");
-		check(wait_for_pruning_compaction(shm, before, &compactions),
+		check(wait_for_pruning_compaction(shm, rel, 2100, before,
+								  &compactions, readback),
 			  "restarted churn completes a fresh pruning pass");
 		check(wait_for_compacted_layers(store, 3),
 			  "restarted churn returns to the live-layer bound");
