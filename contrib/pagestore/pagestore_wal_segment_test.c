@@ -1,0 +1,78 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "pagestore_wal_segment.h"
+
+static int run;
+static int failed;
+
+static void
+check(int condition, const char *name)
+{
+	run++;
+	if (!condition)
+	{
+		fprintf(stderr, "FAIL: %s\n", name);
+		failed++;
+	}
+}
+
+int
+main(void)
+{
+	unsigned char payload[32];
+	PsWalSegmentHeader header;
+	PsWalSegmentHeader damaged;
+	PsWalSegmentHeader decoded;
+	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+
+	for (size_t i = 0; i < sizeof(payload); i++)
+		payload[i] = (unsigned char) i;
+	check(ps_wal_segment_seal(&header, 7, 11, 0x1000000, payload,
+						  sizeof(payload)) == 0,
+		  "seal a complete segment payload");
+	check(header.timeline == 7 && header.segment_no == 11 &&
+		  header.start_lsn == 0x1000000 &&
+		  ps_wal_segment_validate(&header, payload, sizeof(payload)) == 0,
+		  "validate persisted identity and checksums");
+	check(ps_wal_segment_encode(&header, encoded) == 0 &&
+		  ps_wal_segment_decode(&decoded, encoded, sizeof(encoded)) == 0 &&
+		  decoded.timeline == 7 && decoded.segment_no == 11 &&
+		  decoded.start_lsn == 0x1000000,
+		  "fixed little-endian header round-trips");
+	check(encoded[0] == 0x31 && encoded[1] == 0x47 &&
+		  encoded[2] == 0x53 && encoded[3] == 0x57 &&
+		  encoded[24] == 11 && encoded[25] == 0,
+		  "persisted integers use little-endian byte order");
+	check(ps_wal_segment_seal(&header, 7, UINT64_C(1) << 40, 0x1000000,
+						  payload, sizeof(payload)) == 0 &&
+		  header.segment_no == (UINT64_C(1) << 40),
+		  "segment identity preserves all 64 bits");
+
+	damaged = header;
+	damaged.timeline++;
+	check(ps_wal_segment_validate(&damaged, payload, sizeof(payload)) != 0,
+		  "header checksum rejects identity corruption");
+	damaged = header;
+	damaged.reserved64[0] = 1;
+	damaged.header_crc = header.header_crc;
+	check(ps_wal_segment_validate(&damaged, payload, sizeof(payload)) != 0,
+		  "reserved format fields must remain zero");
+	payload[5] ^= 0xff;
+	check(ps_wal_segment_validate(&header, payload, sizeof(payload)) != 0,
+		  "payload checksum rejects byte corruption");
+	payload[5] ^= 0xff;
+	check(ps_wal_segment_validate(&header, payload, sizeof(payload) - 1) != 0,
+		  "truncated payload is rejected");
+	check(ps_wal_segment_validate(&header, payload, sizeof(payload) + 1) != 0,
+		  "trailing payload bytes are rejected");
+	check(ps_wal_segment_seal(&header, 0, 0, UINT64_MAX - 3, payload, 8) != 0,
+		  "overflowing end LSN is rejected");
+	check(ps_wal_segment_seal(&header, 0, 0, 0, NULL, 1) != 0 &&
+		  ps_wal_segment_seal(&header, 0, 0, 0, payload, 0) != 0,
+		  "empty or missing payload is rejected");
+
+	printf("pagestore_wal_segment_test: %d checks, %d failed\n", run, failed);
+	return failed != 0;
+}
