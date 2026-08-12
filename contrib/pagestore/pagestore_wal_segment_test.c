@@ -26,29 +26,43 @@ main(void)
 	PsWalSegmentHeader damaged;
 	PsWalSegmentHeader decoded;
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	union
+	{
+		PsWalSegmentHeader header;
+		unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	} alias;
 
 	for (size_t i = 0; i < sizeof(payload); i++)
 		payload[i] = (unsigned char) i;
-	check(ps_wal_segment_seal(&header, 7, 11, 0x1000000, payload,
+	check(ps_wal_segment_seal(&header, 7, 11, 0xb000000, payload,
 						  sizeof(payload)) == 0,
 		  "seal a complete segment payload");
 	check(header.timeline == 7 && header.segment_no == 11 &&
-		  header.start_lsn == 0x1000000 &&
+		  header.start_lsn == 0xb000000 &&
 		  ps_wal_segment_validate(&header, payload, sizeof(payload)) == 0,
 		  "validate persisted identity and checksums");
 	check(ps_wal_segment_encode(&header, encoded) == 0 &&
 		  ps_wal_segment_decode(&decoded, encoded, sizeof(encoded)) == 0 &&
 		  decoded.timeline == 7 && decoded.segment_no == 11 &&
-		  decoded.start_lsn == 0x1000000,
+		  decoded.start_lsn == 0xb000000,
 		  "fixed little-endian header round-trips");
+	alias.header = header;
+	check(ps_wal_segment_encode(&alias.header, alias.encoded) == 0 &&
+		  ps_wal_segment_decode(&alias.header, alias.encoded,
+								sizeof(alias.encoded)) == 0 &&
+		  alias.header.segment_no == 11 && alias.header.start_lsn == 0xb000000,
+		  "overlapping encode and decode buffers are supported");
 	check(encoded[0] == 0x31 && encoded[1] == 0x47 &&
 		  encoded[2] == 0x53 && encoded[3] == 0x57 &&
 		  encoded[24] == 11 && encoded[25] == 0,
 		  "persisted integers use little-endian byte order");
-	check(ps_wal_segment_seal(&header, 7, UINT64_C(1) << 40, 0x1000000,
+	check(ps_wal_segment_seal(&header, 7, UINT64_C(1) << 39, UINT64_C(1) << 63,
 						  payload, sizeof(payload)) == 0 &&
-		  header.segment_no == (UINT64_C(1) << 40),
-		  "segment identity preserves all 64 bits");
+		  header.segment_no == (UINT64_C(1) << 39),
+		  "large segment identities are preserved");
+	check(ps_wal_segment_seal(&damaged, 7, 11, 0x1000000, payload,
+						  sizeof(payload)) != 0,
+		  "mismatched segment number and start LSN are rejected");
 
 	damaged = header;
 	damaged.timeline++;
