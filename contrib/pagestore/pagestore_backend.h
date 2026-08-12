@@ -213,6 +213,15 @@ extern void pagestore_publish_checkpoint_reader_snapshot(
 	const struct ControlFileData *control);
 extern uint32 pagestore_slru_klass_id(const char *name);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
+/* Returns PS_STATUS_OK, PS_STATUS_STALE, or PS_STATUS_ERROR.  A controller
+ * must not treat either non-OK result as a successful ownership change. */
+extern uint8 pagestore_localsvc_retention_set(uint32 timeline,
+											 uint32 owner_kind, uint64 owner_id,
+											 uint32 generation, uint32 resources,
+											 uint64 lsn);
+extern uint8 pagestore_localsvc_retention_drop(uint32 timeline,
+											  uint32 owner_kind, uint64 owner_id,
+											  uint32 generation);
 extern void pagestore_localsvc_store_sync(void);
 extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,

@@ -1008,6 +1008,58 @@ pagestore_localsvc_wal_retain_floor(void)
 }
 
 /*
+ * Publish or replace one controller-owned retention horizon.  Keep the daemon
+ * status visible: PS_STATUS_STALE is an ownership-fencing result, not a
+ * transport failure and not a successful retry.
+ */
+uint8
+pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
+								 uint64 owner_id, uint32 generation,
+								 uint32 resources, uint64 lsn)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+
+	/* Zero is reserved for replaying retention records predating protocol v27. */
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	return ls_exec_wait(ch, 0);
+}
+
+/* A successful DROP leaves the store-side generation tombstone in place. */
+uint8
+pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
+								  uint64 owner_id, uint32 generation)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_DROP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	return ls_exec_wait(ch, 0);
+}
+
+/*
  * Create a branch (new timeline) forking from parent_tl at branch_lsn.  This is
  * an O(1) metadata operation in the daemon -- no page data is copied.  Exposed
  * for the pagestore_create_branch() SQL function.
