@@ -364,6 +364,7 @@ typedef struct PagestoreReaderSnapshotJobShmem
 	slock_t		mutex;
 	ControlFileData control;
 	uint64		generation;
+	uint64		completed_generation;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7742,7 +7743,8 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	return succeeded;
 }
 
-/* Checkpoint completion only replaces the pending job; the worker does I/O. */
+/* Keep one backpressured job.  Checkpoint completion never replaces work the
+ * snapshot worker has not acknowledged, so an exact redo target cannot vanish. */
 void
 pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 {
@@ -7750,16 +7752,18 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 		!pagestore_branch_backend_active())
 		return;
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
-	pagestore_reader_snapshot_job->control = *control;
-	pagestore_reader_snapshot_job->generation++;
+	if (pagestore_reader_snapshot_job->generation ==
+		pagestore_reader_snapshot_job->completed_generation)
+	{
+		pagestore_reader_snapshot_job->control = *control;
+		pagestore_reader_snapshot_job->generation++;
+	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 }
 
 void
 pagestore_reader_snapshot_worker_main(Datum main_arg)
 {
-	uint64		processed = 0;
-
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
@@ -7768,16 +7772,21 @@ pagestore_reader_snapshot_worker_main(Datum main_arg)
 	{
 		ControlFileData control;
 		uint64		generation;
+		uint64		completed;
 
 		SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 		control = pagestore_reader_snapshot_job->control;
 		generation = pagestore_reader_snapshot_job->generation;
+		completed = pagestore_reader_snapshot_job->completed_generation;
 		SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
-		if (generation > processed)
+		if (generation > completed)
 		{
 			if (pagestore_build_checkpoint_reader_snapshot(&control))
 			{
-				processed = generation;
+				SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+				if (pagestore_reader_snapshot_job->generation == generation)
+					pagestore_reader_snapshot_job->completed_generation = generation;
+				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 				continue;
 			}
 		}
@@ -10194,6 +10203,7 @@ pagestore_validate_datadir_branch_manifest(void)
 		memset(&pagestore_reader_snapshot_job->control, 0,
 			   sizeof(ControlFileData));
 		pagestore_reader_snapshot_job->generation = 0;
+		pagestore_reader_snapshot_job->completed_generation = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -11881,16 +11891,43 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		}
 		PG_TRY();
 		{
+			XLogRecPtr membership_lsn;
+
 			databases = pagestore_reader_artifact_databases();
-			/* Select R only after pg_database membership is locked.  Waiting for
-			 * its exact READY excludes an older checkpoint whose asynchronous
-			 * publication happened to finish after the lock was acquired. */
-			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
-			barrier_lsn = GetRedoRecPtr();
-			/* Keep backpressure on this exact checkpoint target.  Replacing a
-			 * slow outstanding job with a newer checkpoint can starve barrier
-			 * publication forever, so wait until it completes or shutdown/ERROR
-			 * definitively aborts this launcher iteration. */
+			membership_lsn = GetRedoRecPtr();
+			/* First obtain a non-replaceable job whose checkpoint is no older than
+			 * the locked database membership.  An older outstanding job is allowed
+			 * to finish, then the empty slot receives our forced checkpoint. */
+			while (XLogRecPtrIsInvalid(barrier_lsn))
+			{
+				ControlFileData job_control;
+				uint64 generation;
+				uint64 completed;
+
+				SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+				job_control = pagestore_reader_snapshot_job->control;
+				generation = pagestore_reader_snapshot_job->generation;
+				completed = pagestore_reader_snapshot_job->completed_generation;
+				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+				if (generation > completed &&
+					job_control.checkPointCopy.redo >= membership_lsn)
+				{
+					barrier_lsn = job_control.checkPointCopy.redo;
+					break;
+				}
+				if (generation == completed)
+				{
+					RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST |
+								  CHECKPOINT_WAIT);
+					continue;
+				}
+				(void) WaitLatch(MyLatch,
+					WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					100L, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+			/* Keep backpressure on the acknowledged exact target until READY. */
 			while (!XLogRecPtrIsInvalid(barrier_lsn) &&
 				   !pagestore_reader_snapshot_ready_at(barrier_lsn))
 			{
