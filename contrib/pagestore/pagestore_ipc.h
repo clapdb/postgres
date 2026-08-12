@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		27	/* 27: retention owner generations + stale status;
+#define PS_SHM_VERSION		28	/* 28: exact retention admission sequences;
+								 * 27: retention owner generations + stale status;
 								 * 26: durable retention registry opcodes;
 								 * 25: WAL_INDEX_GET cursor pagination;
 								 * 24: WAL-index lag metrics added;
@@ -203,7 +204,8 @@ typedef enum PsRetentionResource
  *
  * IPC uses timeline/req_seq as the key, blocknum as owner_kind,
  * parent_timeline as resources, old_nblocks as generation, req_lsn as lsn,
- * and nblocks/pad1 as the low/high halves of admission_seq.
+ * and nblocks/pad1 as the low/high halves of admission_seq.  GET keeps
+ * nblocks for the result count and returns admission_seq in data[0..7].
  */
 typedef struct PsRetentionPin
 {

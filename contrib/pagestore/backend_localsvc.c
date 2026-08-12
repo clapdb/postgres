@@ -1021,7 +1021,7 @@ pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
 	PageStoreRelKey key = {0};
 	PsChannel  *ch;
 
-	/* Zero is reserved for replaying retention records predating protocol v27. */
+	/* Zero is reserved for replaying retention records predating protocol v28. */
 	if (generation == 0)
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);

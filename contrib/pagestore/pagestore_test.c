@@ -721,6 +721,9 @@ op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return 0;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
 	}
 	return 1;
 }

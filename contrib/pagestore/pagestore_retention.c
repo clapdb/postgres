@@ -34,6 +34,7 @@
 
 #define PS_RETENTION_MAGIC		0x4e544552	/* "RETN" */
 #define PS_RETENTION_VERSION	2
+#define PS_RETENTION_VERSION_V1 1
 #define PS_RETENTION_FNV_INIT	2166136261u
 #define PS_RETENTION_STATE_MAGIC 0x53544552	/* "RETS" */
 
@@ -53,6 +54,30 @@ typedef struct PsRetentionRecord
 	uint32_t	crc;
 	uint32_t	pad;
 } PsRetentionRecord;
+
+/* Version 1 predates exact same-LSN admission fences.  Keep its byte layout
+ * here so an upgrade can validate the committed old prefix before rewriting
+ * it.  Missing admission sequences replay as the conservative legacy value 0. */
+typedef struct PsRetentionPinV1
+{
+	uint32_t	timeline;
+	uint32_t	owner_kind;
+	uint32_t	resources;
+	uint32_t	generation;
+	uint64_t	owner_id;
+	uint64_t	lsn;
+} PsRetentionPinV1;
+
+typedef struct PsRetentionRecordV1
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	type;
+	uint32_t	len;
+	PsRetentionPinV1 pin;
+	uint32_t	crc;
+	uint32_t	pad;
+} PsRetentionRecordV1;
 
 typedef struct PsRetentionState
 {
@@ -133,6 +158,13 @@ retention_record_crc(const PsRetentionRecord *rec)
 						   offsetof(PsRetentionRecord, crc));
 }
 
+static uint32_t
+retention_record_v1_crc(const PsRetentionRecordV1 *rec)
+{
+	return retention_fnv1a(PS_RETENTION_FNV_INIT, rec,
+						   offsetof(PsRetentionRecordV1, crc));
+}
+
 static int
 retention_kind_valid(uint32_t kind)
 {
@@ -177,6 +209,34 @@ retention_record_valid(const PsRetentionRecord *rec)
 			rec->pin.owner_id != 0 && rec->pin.resources == 0 &&
 			rec->pin.lsn == 0;
 	return 0;
+}
+
+static int
+retention_record_v1_convert(const PsRetentionRecordV1 *old,
+							PsRetentionRecord *rec)
+{
+	PsRetentionPin pin;
+
+	if (old->magic != PS_RETENTION_MAGIC ||
+		old->version != PS_RETENTION_VERSION_V1 ||
+		old->len != sizeof(*old) || old->pad != 0 ||
+		retention_record_v1_crc(old) != old->crc)
+		return -1;
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = old->pin.timeline;
+	pin.owner_kind = old->pin.owner_kind;
+	pin.resources = old->pin.resources;
+	pin.generation = old->pin.generation;
+	pin.owner_id = old->pin.owner_id;
+	pin.lsn = old->pin.lsn;
+	memset(rec, 0, sizeof(*rec));
+	rec->magic = PS_RETENTION_MAGIC;
+	rec->version = PS_RETENTION_VERSION;
+	rec->type = old->type;
+	rec->len = sizeof(*rec);
+	rec->pin = pin;
+	rec->crc = retention_record_crc(rec);
+	return retention_record_valid(rec) ? 0 : -1;
 }
 
 static int
@@ -406,7 +466,8 @@ retention_read_state(PsRetentionState *state)
 		return errno == ENOENT ? 0 : -1;
 	if (read(fd, state, sizeof(*state)) != (ssize_t) sizeof(*state) ||
 		read(fd, &extra, 1) != 0 || state->magic != PS_RETENTION_STATE_MAGIC ||
-		state->version != PS_RETENTION_VERSION ||
+		(state->version != PS_RETENTION_VERSION &&
+		 state->version != PS_RETENTION_VERSION_V1) ||
 		state->crc != retention_state_crc(state))
 	{
 		errno = EILSEQ;
@@ -572,6 +633,99 @@ retention_make_record(PsRetentionRecord *rec, uint32_t type,
 	rec->crc = retention_record_crc(rec);
 }
 
+/* Caller holds retention_lock.  This is also the fail-safe v1 -> v2 upgrade:
+ * publish the new log before its v2 committed-prefix state, with the durable
+ * pending marker making every interrupted ordering fail closed. */
+static int
+retention_rewrite_current(void)
+{
+	char		tmp[4096] = {0};
+	int			fd = -1;
+	int			rc = -1;
+	int			n;
+	int			pending = 0;
+	int			published = 0;
+	uint32_t	new_hash = PS_RETENTION_FNV_INIT;
+
+	if (retention_is_poisoned)
+		goto done;
+	if (retention_begin_pending() != 0)
+		goto done;
+	pending = 1;
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", retention_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		goto done;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		goto done;
+	for (uint32_t i = 0; i < retention_npins; i++)
+	{
+		PsRetentionRecord rec;
+
+		retention_make_record(&rec,
+						  retention_pin_active(&retention_pins[i]) ?
+						  PS_RETENTION_SET : PS_RETENTION_DROP,
+						  &retention_pins[i]);
+		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
+			goto done;
+		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
+	}
+	if (fsync(fd) != 0)
+		goto done;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (rename(tmp, retention_path) != 0)
+		goto done;
+	published = 1;
+	if (retention_fsync_dir() != 0)
+	{
+		retention_is_poisoned = 1;
+		goto done;
+	}
+	{
+		struct stat st;
+
+		if (stat(retention_path, &st) != 0)
+		{
+			retention_is_poisoned = 1;
+			goto done;
+		}
+		retention_dev = st.st_dev;
+		retention_ino = st.st_ino;
+	}
+	if (retention_write_state(retention_npins, new_hash) != 0)
+	{
+		retention_is_poisoned = 1;
+		goto done;
+	}
+	retention_nrecords = retention_npins;
+	retention_log_hash = new_hash;
+	if (retention_clear_pending() != 0)
+	{
+		retention_is_poisoned = 1;
+		goto done;
+	}
+	pending = 0;
+	memset(&retention_compact_retry_at, 0, sizeof(retention_compact_retry_at));
+	rc = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0 && tmp[0] != '\0')
+		unlink(tmp);
+	if (rc != 0 && pending && !published)
+		(void) retention_clear_pending();
+	if (rc != 0 && pending && published)
+		retention_is_poisoned = 1;
+	if (rc != 0 && !retention_is_poisoned)
+		retention_defer_compact();
+	return rc;
+}
+
 int
 ps_retention_open(const char *store_dir)
 {
@@ -583,6 +737,7 @@ ps_retention_open(const char *store_dir)
 	PsRetentionState committed;
 	char		legacy_failed_path[4096];
 	off_t		off = 0;
+	int			legacy_format = 0;
 
 	pthread_mutex_lock(&retention_lock);
 	free(retention_pins);
@@ -653,22 +808,67 @@ ps_retention_open(const char *store_dir)
 		goto done;
 	retention_dev = st.st_dev;
 	retention_ino = st.st_ino;
-	while (off + (off_t) sizeof(PsRetentionRecord) <= st.st_size)
+	if (st.st_size >= (off_t) (4 * sizeof(uint32_t)))
+	{
+		uint32_t header[4];
+
+		if (pread(fd, header, sizeof(header), 0) != (ssize_t) sizeof(header) ||
+			header[0] != PS_RETENTION_MAGIC)
+		{
+			errno = EILSEQ;
+			goto done;
+		}
+		if (header[1] == PS_RETENTION_VERSION_V1 &&
+			header[3] == sizeof(PsRetentionRecordV1))
+			legacy_format = 1;
+		else if (header[1] != PS_RETENTION_VERSION ||
+				 header[3] != sizeof(PsRetentionRecord))
+		{
+			errno = EILSEQ;
+			goto done;
+		}
+	}
+	else if (state_rc > 0)
+		legacy_format = committed.version == PS_RETENTION_VERSION_V1;
+	if (state_rc > 0 &&
+		(committed.version == PS_RETENTION_VERSION_V1) != legacy_format)
+	{
+		errno = EILSEQ;
+		goto done;
+	}
+	while (off + (off_t) (legacy_format ? sizeof(PsRetentionRecordV1) :
+									  sizeof(PsRetentionRecord)) <= st.st_size)
 	{
 		PsRetentionRecord rec;
 
-		if (pread(fd, &rec, sizeof(rec), off) != (ssize_t) sizeof(rec))
-			goto done;
-		if (!retention_record_valid(&rec))
+		if (legacy_format)
+		{
+			PsRetentionRecordV1 old;
+
+			if (pread(fd, &old, sizeof(old), off) != (ssize_t) sizeof(old) ||
+				retention_record_v1_convert(&old, &rec) != 0)
+			{
+				errno = EILSEQ;
+				goto done;
+			}
+			retention_log_hash = retention_fnv1a(retention_log_hash,
+											  &old, sizeof(old));
+			off += sizeof(old);
+		}
+		else if (pread(fd, &rec, sizeof(rec), off) != (ssize_t) sizeof(rec) ||
+				 !retention_record_valid(&rec))
 		{
 			errno = EILSEQ;
 			goto done;			/* a full corrupt record is never discarded */
 		}
 		if (retention_apply(&rec) != 0)
 			goto done;
-		retention_log_hash = retention_fnv1a(retention_log_hash,
-										  &rec, sizeof(rec));
-		off += sizeof(rec);
+		if (!legacy_format)
+		{
+			retention_log_hash = retention_fnv1a(retention_log_hash,
+											  &rec, sizeof(rec));
+			off += sizeof(rec);
+		}
 		retention_nrecords++;
 	}
 	if (state_rc > 0)
@@ -685,7 +885,7 @@ ps_retention_open(const char *store_dir)
 			(ftruncate(fd, off) != 0 || fsync(fd) != 0))
 			goto done;
 	}
-	else
+	else if (!legacy_format)
 	{
 		/* One-time migration from the pre-committed-prefix format. */
 		if (retention_begin_pending() != 0)
@@ -696,6 +896,10 @@ ps_retention_open(const char *store_dir)
 			retention_clear_pending() != 0)
 			goto done;
 	}
+	/* Rewrite all live pins and tombstones only after validating the complete
+	 * committed v1 prefix.  The rewrite also installs the v2 state atomically. */
+	if (legacy_format && retention_rewrite_current() != 0)
+		goto done;
 	if (retention_mark_initialized() != 0)
 		goto done;
 	rc = 0;
