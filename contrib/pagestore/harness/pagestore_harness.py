@@ -1539,7 +1539,7 @@ def run_materializer_smoke(
         supervisor_config.write_text(
             json.dumps(
                 {
-                    "schema": 3,
+                    "schema": 4,
                     "pg_ctl": str(pg_bin / "pg_ctl"),
                     "psql": str(pg_bin / "psql"),
                     "data_dir": str(materializer_data),
