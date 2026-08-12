@@ -1293,6 +1293,17 @@ page_has_tag(const unsigned char *buf, uint32_t ps, unsigned char tag)
 }
 
 static int
+page_has_lsn(const unsigned char *buf, uint64_t lsn)
+{
+	uint32_t xlogid;
+	uint32_t xrecoff;
+
+	memcpy(&xlogid, buf, 4);
+	memcpy(&xrecoff, buf + 4, 4);
+	return (((uint64_t) xlogid << 32) | xrecoff) == lsn;
+}
+
+static int
 page_all_zero(const unsigned char *buf, uint32_t ps)
 {
 	for (uint32_t i = 0; i < ps; i++)
@@ -2655,7 +2666,7 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	for (uint32_t cycle = 0; cycle < 12; cycle++)
 	{
 		uint64_t	before;
-		uint64_t	obsolete_lsn = cycle == 0 ? 600 : 1000 + (cycle - 1) * 100;
+		uint64_t	obsolete_lsn = 1000 + cycle * 100;
 
 		for (uint32_t write = 0; write < 32; write++)
 		{
@@ -2678,17 +2689,19 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 			  "churn cycle %u returns to the configured live-layer bound", cycle);
 	}
 	bytes = local_layer_bytes(store);
-	check(bytes > 0 && bytes < (uint64_t) ps * 64,
-		  "twelve churn cycles retain fewer than 64 page images on disk");
+	check(bytes > 0 && bytes < (uint64_t) ps * 16,
+		  "twelve churn cycles retain a constant-size page history on disk");
 	check(wait_for_accounted_pruning_metrics(shm, 12, &compactions, &scanned,
 										  &kept, &deleted),
 		  "pruning counters account for churn and record deleted versions");
 	for (uint32_t block = 0; block < 4; block++)
 	{
 		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
 
 		op_read_one(rel, 0, block, readback);
-		check(page_has_tag(readback, ps, expected),
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
 			  "bounded churn serves the newest page for block %u", block);
 	}
 
@@ -2719,20 +2732,22 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 2231) ==
 			  PS_STATUS_OK,
 			  "restarted churn advances the restored retention owner");
-		check(wait_for_pruning_compaction(shm, rel, 2100, before,
+		check(wait_for_pruning_compaction(shm, rel, 2200, before,
 								  &compactions, readback),
 			  "restarted churn completes a fresh pruning pass");
 		check(wait_for_compacted_layers(store, 3),
 			  "restarted churn returns to the live-layer bound");
 	}
-	check(local_layer_bytes(store) < (uint64_t) ps * 64,
+	check(local_layer_bytes(store) < (uint64_t) ps * 16,
 		  "bounded retained page history survives restart");
 	for (uint32_t block = 0; block < 4; block++)
 	{
 		unsigned char expected = (unsigned char) (20 + 12 * 32 + 28 + block);
+		uint64_t expected_lsn = 2200 + 28 + block;
 
 		op_read_one(rel, 0, block, readback);
-		check(page_has_tag(readback, ps, expected),
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
 			  "restarted bounded churn serves newest block %u", block);
 	}
 	client_detach();
