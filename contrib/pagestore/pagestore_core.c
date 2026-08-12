@@ -2380,9 +2380,16 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	do
 	{
+		ForkEnt    *fe = fork_find(w.tl, key);
+		uint32_t	nb = 0;
+		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, read_seq, &nb) :
+			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
 		PageVer    *v = e ? page_visible(e, w.lsn, read_seq) : NULL;
 
+		if (fork_state == FORK_HOP_DEAD ||
+			(fork_state == FORK_HOP_DEF && block >= nb))
+			return NULL;
 		if (v)
 			return v;
 	} while (tl_walk_next(&w));
@@ -4341,11 +4348,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		w = walk[level];
 		{
-		uint32_t	tl = w.tl;
-		uint64_t	rl = w.lsn;
-		PageEnt    *e = page_find(tl, key, block);
-		PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
+			uint32_t	tl = w.tl;
+			uint64_t	rl = w.lsn;
+			ForkEnt    *fe = fork_find(tl, key);
+			uint32_t	nb = 0;
+			int			fork_state = fe ? fork_asof_hop(fe, rl, read_seq, &nb) :
+				FORK_HOP_NONE;
+			PageEnt    *e = page_find(tl, key, block);
+			PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
 
+		if (fork_state == FORK_HOP_DEAD ||
+			(fork_state == FORK_HOP_DEF && block >= nb))
+			return 0;
 		if (pv)
 		{
 			uint64_t	l,

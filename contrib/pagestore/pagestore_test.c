@@ -2346,6 +2346,8 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	check(op_exists_asof(rel, 0, 10500) &&
 		  op_nblocks_asof(rel, 0, 10500) == 0,
 		  "recreated relation is empty before its new generation page");
+	check(!op_read_at_found(rel, 0, 0, 10500, readback),
+		  "empty recreated generation cannot expose the dropped generation page");
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 110),
 		  "new relation generation remains current after compaction and restart");
