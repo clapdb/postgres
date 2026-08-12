@@ -2623,6 +2623,10 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 			fill_page(page, ps, lsn, (unsigned char) (20 + cycle));
 			op_write_tl(0, rel, 0, write % 4, page);
 		}
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY,
+						   1000 + cycle * 100 + 31) == PS_STATUS_OK,
+			  "churn cycle %u advances its durable page cutoff", cycle);
 		check(wait_for_compacted_layers(store, 3),
 			  "churn cycle %u returns to the configured live-layer bound", cycle);
 	}
