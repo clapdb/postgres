@@ -189,6 +189,17 @@ test('pagestore_gc',
   timeout: 60,
 )
 
+# Pure keep/drop rule for retention-driven image compaction.
+pagestore_prune_test = executable('pagestore_prune_test',
+  files('pagestore_prune_test.c', 'pagestore_prune.c'),
+  install: false,
+)
+test('pagestore_prune',
+  pagestore_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
