@@ -28,7 +28,8 @@ main(void)
 	char directory[] = "/tmp/pswalstoreXXXXXX";
 	char path[1024];
 	char retry_directory[512];
-	uint32_t first_len = PS_WAL_SEGMENT_PAYLOAD_BYTES + 97;
+	uint32_t first_len = 2 * PS_WAL_SEGMENT_PAYLOAD_BYTES;
+	uint32_t retry_len = PS_WAL_SEGMENT_PAYLOAD_BYTES + 97;
 	unsigned char *input = malloc((size_t) first_len + 211);
 	unsigned char window[256];
 	PsWalSegmentHeader header;
@@ -40,27 +41,29 @@ main(void)
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
 	for (uint32_t i = 0; i < first_len + 211; i++)
 		input[i] = (unsigned char) (i * 31u + 7u);
-	check(ps_wal_store_create(&store, directory, 7, 1000) == 0,
+	check(ps_wal_store_create(&store, directory, 7, 0) == 0,
 		  "create an empty timeline WAL segment store");
-	check(ps_wal_store_append(&store, 1000, input, first_len) == 0 &&
-		  store.nentries == 2 && store.end_lsn == 1000 + first_len,
+	check(ps_wal_store_append(&store, 0, input, first_len) == 0 &&
+		  store.nentries == 2 && store.end_lsn == first_len,
 		  "one append splits at the immutable segment payload boundary");
 	check(ps_wal_store_read(&store,
-						1000 + PS_WAL_SEGMENT_PAYLOAD_BYTES - 64,
+						PS_WAL_SEGMENT_PAYLOAD_BYTES - 64,
 						window, 128) == 0 &&
 		  memcmp(window, input + PS_WAL_SEGMENT_PAYLOAD_BYTES - 64, 128) == 0,
 		  "one read crosses two immutable segment files");
 	check(ps_wal_store_append(&store, store.end_lsn, input + first_len, 211) == 0 &&
 		  store.nentries == 3,
 		  "a later contiguous append publishes the next segment identity");
-	check(ps_wal_store_read(&store, 1000 + first_len - 32, window, 96) == 0 &&
+	check(ps_wal_store_read(&store, first_len - 32, window, 96) == 0 &&
 		  memcmp(window, input + first_len - 32, 96) == 0,
 		  "read spans segment files created by separate appends");
 	check(ps_wal_store_append(&store, store.end_lsn + 1, input, 1) != 0,
 		  "append rejects a gap in shipped WAL");
-	check(ps_wal_store_read(&store, 999, window, 1) != 0 &&
+	check(ps_wal_store_read(&store, UINT64_MAX, window, 1) != 0 &&
 		  ps_wal_store_read(&store, store.end_lsn, window, 1) != 0,
 		  "read rejects bytes outside the contiguous retained range");
+	check(ps_wal_store_create(&retry_store, path, 8, 1) != 0,
+		  "store creation rejects a noncanonical segment start");
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDONLY);
@@ -73,17 +76,17 @@ main(void)
 		close(fd);
 
 	snprintf(retry_directory, sizeof(retry_directory), "%s/retry", directory);
-	check(ps_wal_store_create(&retry_store, retry_directory, 8, 5000) == 0,
+	check(ps_wal_store_create(&retry_store, retry_directory, 8, 0) == 0,
 		  "create retryable split-append store");
 	check(setenv("PAGESTORE_TEST_FAIL_WAL_SEGMENT_NO", "1", 1) == 0 &&
-		  ps_wal_store_append(&retry_store, 5000, input, first_len) != 0 &&
+		  ps_wal_store_append(&retry_store, 0, input, retry_len) != 0 &&
 		  retry_store.nentries == 1 &&
-		  retry_store.end_lsn == 5000 + PS_WAL_SEGMENT_PAYLOAD_BYTES,
+		  retry_store.end_lsn == PS_WAL_SEGMENT_PAYLOAD_BYTES,
 		  "split append reports a failure after its durable prefix");
 	unsetenv("PAGESTORE_TEST_FAIL_WAL_SEGMENT_NO");
-	check(ps_wal_store_append(&retry_store, 5000, input, first_len) == 0 &&
+	check(ps_wal_store_append(&retry_store, 0, input, retry_len) == 0 &&
 		  retry_store.nentries == 2 &&
-		  retry_store.end_lsn == 5000 + first_len,
+		  retry_store.end_lsn == retry_len,
 		  "identical retry validates its prefix and resumes publication");
 	ps_wal_store_close(&retry_store);
 	for (uint64_t segment = 0; segment < 2; segment++)
@@ -106,7 +109,7 @@ main(void)
 			  "corrupt a published payload without changing its size");
 		close(fd);
 	}
-	check(fd >= 0 && ps_wal_store_read(&store, 1010, window, 1) != 0,
+	check(fd >= 0 && ps_wal_store_read(&store, 10, window, 1) != 0,
 		  "read validates payload checksum before returning WAL bytes");
 	ps_wal_store_close(&store);
 	for (uint64_t segment = 0; segment < 3; segment++)
