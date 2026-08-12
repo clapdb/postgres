@@ -76,6 +76,38 @@ read_all_at(int fd, void *data, size_t len, off_t offset)
 	return 0;
 }
 
+static int
+random_suffix(char suffix[7])
+{
+	static const char alphabet[] =
+		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	unsigned char random_bytes[6];
+	size_t done = 0;
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	while (done < sizeof(random_bytes))
+	{
+		ssize_t n = read(fd, random_bytes + done, sizeof(random_bytes) - done);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+		{
+			close(fd);
+			return -1;
+		}
+		done += (size_t) n;
+	}
+	if (close(fd) != 0)
+		return -1;
+	for (size_t i = 0; i < sizeof(random_bytes); i++)
+		suffix[i] = alphabet[random_bytes[i] % (sizeof(alphabet) - 1)];
+	suffix[6] = '\0';
+	return 0;
+}
+
 static int load_validated_segment(PsWalStore *store,
 								  const PsWalSegmentHeader *expected,
 								  unsigned char **payload_out);
@@ -94,14 +126,23 @@ publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 	if (segment_name(store, header->segment_no, final_name,
 					 sizeof(final_name)) != 0)
 		return -1;
-	n = snprintf(temporary, sizeof(temporary), ".%s.tmp.%ld.%llu", final_name,
-				 (long) getpid(), (unsigned long long) header->segment_no);
-	if (n < 0 || (size_t) n >= sizeof(temporary))
-		return -1;
 	if (ps_wal_segment_encode(header, encoded) != 0)
 		return -1;
-	fd = openat(store->directory_fd, temporary,
-			O_CREAT | O_EXCL | O_WRONLY, 0600);
+	for (unsigned int attempt = 0; attempt < 128; attempt++)
+	{
+		char suffix[7];
+
+		if (random_suffix(suffix) != 0)
+			return -1;
+		n = snprintf(temporary, sizeof(temporary), "%s.tmp.%s",
+					 final_name, suffix);
+		if (n < 0 || (size_t) n >= sizeof(temporary))
+			return -1;
+		fd = openat(store->directory_fd, temporary,
+					O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+		if (fd >= 0 || errno != EEXIST)
+			break;
+	}
 	if (fd < 0)
 		return -1;
 	if (write_all(fd, encoded, sizeof(encoded)) != 0 ||
