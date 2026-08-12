@@ -4651,6 +4651,7 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 
 /* Post-buffer-flush publication point for recovery materializers. */
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+recovery_start_hook_type recovery_start_hook = NULL;
 
 static inline void
 CallControlFileFlushHook(void)

@@ -261,6 +261,8 @@ archive_current_wal || fail "base-backup WAL did not reach pagestore"
 cat >> "$MATERIALIZER/postgresql.conf" <<EOF
 pagestore.route_all = on
 pagestore.materializer = on
+pagestore.retention_owner_id = '1'
+pagestore.retention_owner_generation = '1'
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT

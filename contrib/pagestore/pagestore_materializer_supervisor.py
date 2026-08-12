@@ -20,7 +20,8 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-STATUS_SCHEMA = 1
+CONFIG_SCHEMA = 2
+STATUS_SCHEMA = 2
 CONFIG_FIELDS = {
     "schema",
     "pg_ctl",
@@ -30,6 +31,7 @@ CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_owner_id",
     "database",
     "user",
     "poll_interval_ms",
@@ -49,6 +51,7 @@ REQUIRED_CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_owner_id",
 }
 
 
@@ -69,6 +72,7 @@ class Config:
     port: int
     log_file: Path
     state_dir: Path
+    retention_owner_id: int
     database: str = "postgres"
     user: str = "postgres"
     poll_interval_ms: int = 1000
@@ -99,8 +103,13 @@ class Config:
             raise ConfigError(
                 f"missing supervisor config field(s): {', '.join(missing)}"
             )
-        if value.get("schema") != 1 or isinstance(value.get("schema"), bool):
-            raise ConfigError("supervisor config schema must be 1")
+        if (
+            value.get("schema") != CONFIG_SCHEMA
+            or isinstance(value.get("schema"), bool)
+        ):
+            raise ConfigError(
+                f"supervisor config schema must be {CONFIG_SCHEMA}"
+            )
 
         paths: dict[str, Path] = {}
         for field in (
@@ -133,6 +142,7 @@ class Config:
         integers: dict[str, int] = {}
         defaults = {
             "port": None,
+            "retention_owner_id": None,
             "poll_interval_ms": 1000,
             "replay_idle_ms": 3000,
             "progress_timeout_ms": 30000,
@@ -150,6 +160,8 @@ class Config:
             integers[field] = item
         if integers["port"] > 65535:
             raise ConfigError("supervisor config port exceeds 65535")
+        if integers["retention_owner_id"] > (1 << 64) - 1:
+            raise ConfigError("supervisor config retention_owner_id exceeds uint64")
         if integers["retry_initial_ms"] > integers["retry_max_ms"]:
             raise ConfigError("retry_initial_ms must not exceed retry_max_ms")
 
@@ -185,6 +197,11 @@ class Config:
     @property
     def status_file(self) -> Path:
         return self.state_dir / "status.json"
+
+    @property
+    def retention_generation_file(self) -> Path:
+        # Generation authority must outlive disposable monitoring/status state.
+        return self.data_dir / ".pagestore-materializer-retention-generation.json"
 
 
 @dataclass(frozen=True)
@@ -312,6 +329,7 @@ class Supervisor:
         old = previous_status(config.status_file)
         old_epoch = old.get("owner_epoch", 0)
         old_generation = old.get("worker_generation", 0)
+        old_retention_generation = old.get("retention_generation")
         if (
             not isinstance(old_epoch, int)
             or isinstance(old_epoch, bool)
@@ -324,8 +342,42 @@ class Supervisor:
             or old_generation < 0
         ):
             old_generation = 0
+        authority_exists = config.retention_generation_file.exists()
+        authority = previous_status(config.retention_generation_file)
+        authority_generation = authority.get("retention_generation")
+        if authority_exists:
+            if (
+                not isinstance(authority_generation, int)
+                or isinstance(authority_generation, bool)
+                or authority_generation < 1
+                or authority_generation > (1 << 32) - 1
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority is unreadable"
+                )
+            old_retention_generation = authority_generation
+        elif old:
+            # Upgrade from the status-only format is allowed only with an
+            # intact positive generation; ambiguity must not reuse generation 1.
+            if (
+                not isinstance(old_retention_generation, int)
+                or isinstance(old_retention_generation, bool)
+                or old_retention_generation < 1
+                or old_retention_generation > (1 << 32) - 1
+            ):
+                raise OwnershipError(
+                    "materializer status lacks retention generation authority"
+                )
+            atomic_write_json(
+                config.retention_generation_file,
+                {"retention_generation": old_retention_generation},
+            )
+        else:
+            # A genuinely new PGDATA has no prior worker or durable owner.
+            old_retention_generation = 0
         self.owner_epoch = old_epoch + 1
         self.generation = old_generation
+        self.retention_generation = old_retention_generation
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -347,6 +399,8 @@ class Supervisor:
             "owner_pid": os.getpid(),
             "owner_epoch": self.owner_epoch,
             "worker_generation": self.generation,
+            "retention_owner_id": self.config.retention_owner_id,
+            "retention_generation": self.retention_generation,
             "consecutive_failures": self.failures,
             "last_error": self.last_error,
             "updated_at": time.time(),
@@ -410,6 +464,10 @@ class Supervisor:
                 self.psql(
                     "SELECT pg_is_in_recovery() AND "
                     "current_setting('pagestore.materializer')::boolean AND "
+                    "current_setting('pagestore.retention_owner_id') = '"
+                    + str(self.config.retention_owner_id) + "' AND "
+                    "current_setting('pagestore.retention_owner_generation')::bigint = "
+                    + str(self.retention_generation) + " AND "
                     "current_setting('data_directory') = '" + expected_data_dir + "'"
                 )
                 == "t"
@@ -464,8 +522,27 @@ class Supervisor:
             return None
 
     def start_worker(self, reason: str) -> None:
+        if self.retention_generation >= (1 << 32) - 1:
+            raise RuntimeError("materializer retention generation exhausted")
+        self.retention_generation += 1
+        # Persist authority before the worker can register this generation.
+        # Losing status.json after this point cannot cause generation reuse.
+        atomic_write_json(
+            self.config.retention_generation_file,
+            {"retention_generation": self.retention_generation},
+        )
         self.publish("starting", reason=reason)
-        self.pg_ctl("-l", str(self.config.log_file), "-w", "start")
+        server_options = (
+            "-c pagestore.retention_owner_id="
+            + str(self.config.retention_owner_id)
+            + " -c pagestore.retention_owner_generation="
+            + str(self.retention_generation)
+        )
+        self.pg_ctl(
+            "-l", str(self.config.log_file),
+            "-o", server_options,
+            "-w", "start",
+        )
         self.generation += 1
         if not self.worker_healthy():
             raise RuntimeError("materializer failed its recovery-role health check")

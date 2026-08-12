@@ -1646,6 +1646,11 @@ PerformWalRecovery(void)
 	/* Also ensure XLogReceiptTime has a sane value */
 	XLogReceiptTime = GetCurrentTimestamp();
 
+	/* A retained-history consumer must publish its floor before redo can read
+	 * or apply the first record.  Failure from the hook aborts startup. */
+	if (recovery_start_hook)
+		(*recovery_start_hook) (RedoStartLSN);
+
 	/*
 	 * Let postmaster know we've started redo now, so that it can launch the
 	 * archiver if necessary.

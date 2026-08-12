@@ -115,6 +115,10 @@ static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
 static bool pagestore_auto_wal_index = false;
 static bool pagestore_materializer = false;
+static char *pagestore_retention_owner_id_str = NULL;
+static char *pagestore_retention_owner_generation_str = NULL;
+static uint64 pagestore_retention_owner_id = 0;
+static uint32 pagestore_retention_owner_generation = 0;
 static int pagestore_materializer_max_lag_mb = 0;
 static int pagestore_wal_index_max_lag_mb = 0;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -125,6 +129,7 @@ static buffer_tag_read_epoch_hook_type prev_buffer_tag_read_epoch_hook = NULL;
 static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorRun_hook_type prev_executor_run_hook = NULL;
+static recovery_start_hook_type prev_recovery_start_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
 
 #define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
@@ -134,6 +139,8 @@ static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL
 #define PS_MATERIALIZER_RELEASE_VERSION	2
 #define PS_MATERIALIZER_RELEASE_BLOCK		4
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS 10000
+#define PS_MATERIALIZER_RETENTION_RESOURCES \
+	(PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX)
 
 typedef struct PsMaterializerMarker
 {
@@ -716,6 +723,60 @@ assign_backend_name(const char *newval, void *extra)
 		pagestore_active_backend = b;
 }
 
+static bool
+check_retention_owner_id(char **newval, void **extra, GucSource source)
+{
+	char	   *end;
+	unsigned long long parsed;
+
+	if (*newval == NULL || **newval == '\0')
+		return true;
+	if (**newval < '0' || **newval > '9')
+		goto invalid;
+	errno = 0;
+	parsed = strtoull(*newval, &end, 10);
+	if (errno == 0 && *end == '\0' && parsed != 0)
+		return true;
+invalid:
+	GUC_check_errdetail("Expected a nonzero unsigned 64-bit decimal integer.");
+	return false;
+}
+
+static void
+assign_retention_owner_id(const char *newval, void *extra)
+{
+	pagestore_retention_owner_id =
+		(newval != NULL && *newval != '\0') ? (uint64) strtoull(newval, NULL, 10) : 0;
+}
+
+static bool
+check_retention_owner_generation(char **newval, void **extra, GucSource source)
+{
+	char	   *end;
+	unsigned long long parsed;
+
+	if (*newval == NULL || **newval == '\0')
+		return true;
+	if (**newval < '0' || **newval > '9')
+		goto invalid;
+	errno = 0;
+	parsed = strtoull(*newval, &end, 10);
+	if (errno == 0 && *end == '\0' && parsed > 0 && parsed <= UINT32_MAX)
+		return true;
+invalid:
+	GUC_check_errdetail("Expected an unsigned decimal integer from 1 through %u.",
+						UINT32_MAX);
+	return false;
+}
+
+static void
+assign_retention_owner_generation(const char *newval, void *extra)
+{
+	pagestore_retention_owner_generation =
+		(newval != NULL && *newval != '\0') ?
+		(uint32) strtoull(newval, NULL, 10) : 0;
+}
+
 /* --- SQL-callable: COW time-travel read --------------------------------- */
 
 /*
@@ -1115,6 +1176,89 @@ pagestore_materializer_shipped_lsn(int timeout_ms)
 	return (XLogRecPtr) shipped;
 }
 
+/* Fence this recovery process before it can consume the first WAL record. */
+static void
+pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
+{
+	uint8		status;
+
+	if (pagestore_materializer)
+	{
+		if (XLogRecPtrIsInvalid(redo_lsn) ||
+			pagestore_retention_owner_id == 0 ||
+			pagestore_retention_owner_generation == 0)
+			ereport(FATAL,
+					(errmsg("pagestore materializer has no valid retention owner authority")));
+		status = pagestore_localsvc_retention_set_timeout(
+			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
+			pagestore_retention_owner_id,
+			pagestore_retention_owner_generation,
+			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) redo_lsn,
+			0,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		if (status == PS_STATUS_STALE)
+			ereport(FATAL,
+					(errmsg("pagestore materializer retention generation is stale"),
+					 errdetail("Owner %llu generation %u was fenced by a newer controller generation.",
+							   (unsigned long long) pagestore_retention_owner_id,
+							   pagestore_retention_owner_generation)));
+		if (status != PS_STATUS_OK)
+			ereport(FATAL,
+					(errmsg("pagestore materializer could not register its retention owner")));
+	}
+
+	if (prev_recovery_start_hook)
+		(*prev_recovery_start_hook) (redo_lsn);
+}
+
+/* The durable marker may move first; a failed pin update simply retains the
+ * older, conservative floor.  A stale result means this worker has lost
+ * authority and must stop before applying more WAL. */
+static void
+pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
+{
+	uint8		status = PS_STATUS_ERROR;
+	bool		failed = false;
+
+	PG_TRY();
+	{
+		status = pagestore_localsvc_retention_set_timeout(
+			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
+			pagestore_retention_owner_id,
+			pagestore_retention_owner_generation,
+			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) replay_lsn,
+			0,
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+
+		edata = CopyErrorData();
+		MemoryContextSwitchTo(old_context);
+		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("pagestore materializer retention advance failed: %s",
+						edata->message)));
+		FreeErrorData(edata);
+		failed = true;
+	}
+	PG_END_TRY();
+	if (failed)
+		return;
+
+	if (status == PS_STATUS_STALE)
+		ereport(FATAL,
+				(errmsg("pagestore materializer lost retention owner authority"),
+				 errdetail("Owner %llu generation %u was fenced by a newer controller generation.",
+						   (unsigned long long) pagestore_retention_owner_id,
+						   pagestore_retention_owner_generation)));
+	if (status != PS_STATUS_OK)
+		ereport(WARNING,
+				(errmsg("pagestore materializer retention advance was rejected by the daemon")));
+}
+
 /* Publish a durable marker only after a restartpoint flushed relation pages. */
 static void
 pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
@@ -1122,6 +1266,7 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 	PageStoreRelKey key = {0};
 	PsMaterializerMarker marker;
 	char		page[BLCKSZ];
+	bool		published = false;
 
 	if (prev_restartpoint_flush_hook)
 		(*prev_restartpoint_flush_hook) (replay_lsn);
@@ -1154,6 +1299,7 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 										PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 		pagestore_localsvc_store_sync_timeout(
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		published = true;
 	}
 	PG_CATCH();
 	{
@@ -1169,6 +1315,8 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn)
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
+	if (published)
+		pagestore_materializer_retention_advance(replay_lsn);
 }
 
 static XLogRecPtr
@@ -11242,7 +11390,27 @@ _PG_init(void)
 							 false,
 							 PGC_POSTMASTER,
 							 0,
-							 NULL, NULL, NULL);
+								 NULL, NULL, NULL);
+	DefineCustomStringVariable("pagestore.retention_owner_id",
+							   "Controller-assigned stable retention owner ID.",
+							   "Required for a managed materializer; it remains stable across replacement workers.",
+							   &pagestore_retention_owner_id_str,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   check_retention_owner_id,
+							   assign_retention_owner_id,
+							   NULL);
+	DefineCustomStringVariable("pagestore.retention_owner_generation",
+							   "Controller-assigned retention owner takeover generation.",
+							   "Required for a managed materializer and incremented before each replacement worker starts.",
+							   &pagestore_retention_owner_generation_str,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   check_retention_owner_generation,
+							   assign_retention_owner_generation,
+							   NULL);
 	DefineCustomIntVariable("pagestore.materializer_max_lag_mb",
 							"Pause WAL archiving when durable materialization falls too far behind.",
 							"Zero disables the limit. The boundary stays segment-aligned and "
@@ -11280,6 +11448,12 @@ _PG_init(void)
 	if (pagestore_materializer && pagestore_localsvc_read_lsn() != 0)
 		ereport(ERROR,
 				(errmsg("pagestore.materializer cannot use pagestore.read_lsn")));
+	if (pagestore_materializer &&
+		(pagestore_retention_owner_id == 0 ||
+		 pagestore_retention_owner_generation == 0))
+		ereport(ERROR,
+				(errmsg("pagestore.materializer requires retention owner authority"),
+				 errhint("Set pagestore.retention_owner_id and pagestore.retention_owner_generation from durable controller state.")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
 	prev_executor_run_hook = ExecutorRun_hook;
@@ -11342,6 +11516,8 @@ _PG_init(void)
 		strcmp(pagestore_backend_name, "localsvc") == 0 &&
 		pagestore_route_all && pagestore_localsvc_read_lsn() == 0)
 	{
+		prev_recovery_start_hook = recovery_start_hook;
+		recovery_start_hook = pagestore_materializer_recovery_start;
 		prev_restartpoint_flush_hook = recovery_restartpoint_flush_hook;
 		recovery_restartpoint_flush_hook =
 			pagestore_materializer_restartpoint_flush;

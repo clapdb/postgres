@@ -285,6 +285,12 @@ extern PGDLLIMPORT control_file_flush_hook_type control_file_flush_hook;
  */
 typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn);
 extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook;
+
+/* Called in the startup process after the checkpoint redo pointer is known
+ * and before the first WAL record can be applied.  Consumers that depend on
+ * retained history use this point to establish their durable protection. */
+typedef void (*recovery_start_hook_type) (XLogRecPtr redo_lsn);
+extern PGDLLIMPORT recovery_start_hook_type recovery_start_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 

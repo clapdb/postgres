@@ -122,7 +122,8 @@ Expected scope: one PR.
 
 ### R1. Register reader and materializer owner generations
 
-Status: **blocked on R0 and decision D2**.
+Status: **materializer lifecycle implemented in the first R1 stacked change;
+reader lifecycle remains**.
 
 Deliverables:
 
@@ -549,7 +550,14 @@ generation replacement alone must quiesce the old runtime before its pin is
 superseded.  Never use wall-clock lease expiry for correctness.  Stale owners
 retain space until controller/operator reconciliation proves them dead.
 
-Decision: **accepted**.
+Decision: **accepted 2026-08-12**.
+
+Correctness never depends on wall-clock expiry.  A controller replacement
+increments the durable generation only after quiescing the old consumer, then
+atomically supersedes the old owner.
+Crashes, timeouts, ambiguous failures, and ordinary supervisor handoff retain
+the last pin.  DROP is reserved for explicit deprovision after consumption has
+stopped; if that proof or the DROP acknowledgement is uncertain, the pin stays.
 
 ### D3. Shipped-WAL physical layout
 
