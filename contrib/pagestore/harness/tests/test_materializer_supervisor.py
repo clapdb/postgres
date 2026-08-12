@@ -38,6 +38,7 @@ class SupervisorTests(unittest.TestCase):
             "port": 5432,
             "log_file": str(self.root / "log" / "materializer.log"),
             "state_dir": str(self.root / "state"),
+            "retention_authority_dir": str(self.root / "controller-authority"),
             "retention_owner_id": 7001,
             "poll_interval_ms": 1,
             "retry_initial_ms": 1,
@@ -59,13 +60,14 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(config.port, 5432)
         self.assertTrue(config.socket_dir.is_dir())
         self.assertTrue(config.state_dir.is_dir())
+        self.assertTrue(config.retention_authority_dir.is_dir())
         self.assertTrue(config.log_file.parent.is_dir())
 
         with self.assertRaisesRegex(MODULE.ConfigError, "unknown.*typo"):
             MODULE.Config.load(self.write_config(typo=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "must be absolute"):
             MODULE.Config.load(self.write_config(state_dir="relative"))
-        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 2"):
+        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 3"):
             MODULE.Config.load(self.write_config(schema=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "retention_owner_id"):
             value = self.config_value()
@@ -111,7 +113,10 @@ class SupervisorTests(unittest.TestCase):
         clone = self.root / "clone"
         clone.mkdir()
         (clone / "PG_VERSION").write_text("19\n", encoding="utf-8")
-        second = MODULE.Config.load(self.write_config(data_dir=str(clone)))
+        second = MODULE.Config.load(self.write_config(
+            data_dir=str(clone), state_dir=str(self.root / "clone-state")
+        ))
+        self.assertNotEqual(first.state_dir, second.state_dir)
         self.assertNotEqual(first.lock_file, second.lock_file)
         self.assertEqual(
             first.retention_authority_lock_file,

@@ -1539,7 +1539,7 @@ def run_materializer_smoke(
         supervisor_config.write_text(
             json.dumps(
                 {
-                    "schema": 2,
+                    "schema": 3,
                     "pg_ctl": str(pg_bin / "pg_ctl"),
                     "psql": str(pg_bin / "psql"),
                     "data_dir": str(materializer_data),
@@ -1547,6 +1547,7 @@ def run_materializer_smoke(
                     "port": materializer_port,
                     "log_file": str(trace / "materializer.log"),
                     "state_dir": str(supervisor_state),
+                    "retention_authority_dir": str(root / "controller-authority"),
                     "retention_owner_id": 1,
                     "poll_interval_ms": 100,
                     "replay_idle_ms": 300,
