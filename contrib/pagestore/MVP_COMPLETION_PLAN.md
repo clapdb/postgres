@@ -647,7 +647,23 @@ updates the same owner key rather than adding another logical owner.
 Alternative: derive identity from PGDATA or reader artifact.  This is easier to
 bootstrap but makes cloning and deliberate replacement ambiguous.
 
-Decision: **accepted**.
+Decision: **accepted 2026-08-12**.
+
+The authority is a deployment/controller-assigned nonzero 64-bit `owner_id`
+plus a monotonically increasing 32-bit `generation`, both durably stored by the
+controller.  The key remains `(timeline, owner_kind, owner_id)`.  Generation 0
+is reserved for retention records written by the pre-D1 protocol; a controller
+starts at generation 1 and must fail rather than wrap.
+
+The store persists the greatest observed generation, including after DROP.
+SET/DROP below that generation return `PS_STATUS_STALE`; DROP leaves an
+unenumerated tombstone, so a delayed request cannot resurrect or remove state
+after restart or compaction.  SET at the current live generation may update the
+horizon, and a greater generation atomically takes over the key.  For log
+compatibility only, generation-0 SET-after-DROP retains the legacy unfenced
+behavior until a generation-1 controller takes over the key.  The existing
+materializer supervisor `owner_epoch` and `worker_generation` are local process
+coordination fields, not this controller authority.
 
 ### D2. Owner release and stale-owner policy
 

@@ -292,8 +292,10 @@ GC candidates.
 
 GC depends on a retained-LSN horizon.  The implemented registry tracks an LSN
 and a page/WAL/WAL-index resource mask for each reader, materializer, and
-configured owner generation; branch pins remain structural timeline metadata,
-and restorable control images contribute to the WAL resource:
+configured owner generation.  Stable owner IDs are controller-assigned;
+monotonic generations fence stale SET/DROP requests, including across durable
+DROP tombstones.  Branch pins remain structural timeline metadata, and
+restorable control images contribute to the WAL resource:
 
 ```text
 retain_lsn = min(active read LSNs,
