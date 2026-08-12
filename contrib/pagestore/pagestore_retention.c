@@ -105,6 +105,23 @@ static ino_t retention_ino;
 static struct timespec retention_compact_retry_at;
 static pthread_mutex_t retention_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static int
+retention_new_incarnation(uint64_t *epoch)
+{
+	int fd = open("/dev/urandom", O_RDONLY);
+	ssize_t amount;
+
+	if (fd < 0)
+		return -1;
+	do
+		amount = read(fd, epoch, sizeof(*epoch));
+	while (amount < 0 && errno == EINTR);
+	if (close(fd) != 0 || amount != sizeof(*epoch) || *epoch == 0 ||
+		*epoch == UINT64_MAX)
+		return -1;
+	return 0;
+}
+
 /* Standalone-test fault injection; ordinary deployments leave these zero. */
 static int test_fail_append_after_write;
 static int test_fail_rollback;
@@ -916,8 +933,11 @@ done:
 		retention_cap = 0;
 		retention_is_poisoned = 1;
 	}
-	else
-		retention_mutation_epoch = 1;
+	else if (retention_new_incarnation(&retention_mutation_epoch) != 0)
+	{
+		retention_is_poisoned = 1;
+		rc = -1;
+	}
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
