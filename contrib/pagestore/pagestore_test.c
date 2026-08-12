@@ -2058,6 +2058,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			  restarted_barrier_seq > durable_barrier_seq,
 			  "restart allocates above an unclaimed durable admission barrier");
 	}
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 29201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "a durable replacement cutoff protects current page history");
 	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
 		  PS_STATUS_OK,
 		  "dropping the reader releases admission-fenced page history");
@@ -2114,6 +2117,12 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	client_attach(shm, ps);
 	check(!op_read_at_seq_found(rel, 0, 0, 5000, fence_seq, readback),
 		  "compaction durably prunes released admission-fenced page history");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29202, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 7000) ==
+		  PS_STATUS_ERROR,
+		  "restart rejects a pin below the durable page reclamation frontier");
+	check(op_create_branch_status(20, 0, 7000) == PS_STATUS_ERROR,
+		  "restart rejects a branch below the durable page reclamation frontier");
 	client_detach();
 	stop_daemon(pid);
 
