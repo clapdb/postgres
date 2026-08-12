@@ -5,7 +5,7 @@
 
 int
 ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
-				   uint64_t floor, const PsPruneFence *fences,
+				   PsPruneFence floor, const PsPruneFence *fences,
 				   uint32_t nfences, unsigned char *keep)
 {
 	int		base = -1;
@@ -23,12 +23,15 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 			 versions[i].admission_seq < versions[i - 1].admission_seq))
 			return -1;
 
-	if (floor == 0)
+	if (floor.lsn == 0)
 		return -1;
 
 	for (uint32_t i = 0; i < n; i++)
 	{
-		if (versions[i].lsn < floor)
+		if (versions[i].lsn < floor.lsn ||
+			(versions[i].lsn == floor.lsn &&
+			 (floor.admission_seq == 0 || versions[i].admission_seq <=
+			  floor.admission_seq)))
 			base = (int) i;
 		/* An unfenced operational read sees only the last admission at one
 		 * LSN.  Exact reader fences below retain any older variant they need. */

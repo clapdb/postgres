@@ -21,7 +21,7 @@ typedef PsPruneVersion PsPruneFence;
  * Returns the number of kept versions, or -1 for invalid input.
  */
 extern int ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
-							  uint64_t floor, const PsPruneFence *fences,
+							  PsPruneFence floor, const PsPruneFence *fences,
 							  uint32_t nfences, unsigned char *keep);
 
 #endif
