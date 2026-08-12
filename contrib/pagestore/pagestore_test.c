@@ -2350,6 +2350,9 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(readback, ps, 110),
 		  "new relation generation remains current after compaction and restart");
 
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "relation lifecycle establishes a durable replacement cutoff");
 	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 2200, 1) ==
 		  PS_STATUS_OK,
 		  "reader releases relation-lifecycle history");
