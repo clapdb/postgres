@@ -202,6 +202,17 @@ test('pagestore_prune',
   timeout: 30,
 )
 
+# Persisted immutable shipped-WAL segment header and checksum contract.
+pagestore_wal_segment_test = executable('pagestore_wal_segment_test',
+  files('pagestore_wal_segment_test.c', 'pagestore_wal_segment.c'),
+  install: false,
+)
+test('pagestore_wal_segment',
+  pagestore_wal_segment_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
