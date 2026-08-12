@@ -239,7 +239,8 @@ main(void)
 		close(fd);
 	check(ps_wal_store_open(&store, directory, 7) == 0 &&
 		  access(path, F_OK) != 0 && store.nentries == 3 &&
-		  store.start_lsn == 0 && store.end_lsn == first_len + 211,
+		  store.start_lsn == 0 &&
+		  store.end_lsn == first_len + PS_WAL_SEGMENT_PAYLOAD_BYTES,
 		  "reopen reclaims a canonical orphan and reconstructs the WAL range");
 	check(ps_wal_store_read(&store,
 						PS_WAL_SEGMENT_PAYLOAD_BYTES - 64,
@@ -322,6 +323,19 @@ main(void)
 			  "reopen rejects a FIFO without blocking");
 		check(unlink(path) == 0 && rename(held, path) == 0,
 			  "restore the regular segment after special-file tests");
+	}
+	{
+		char noncanonical[1024];
+
+		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
+		snprintf(noncanonical, sizeof(noncanonical),
+				 "%s/walv1_07_%020llu", directory, 2ULL);
+		check(rename(path, noncanonical) == 0,
+			  "inject a noncanonical spelling of the requested timeline");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a numerically equivalent timeline spelling");
+		check(rename(noncanonical, path) == 0,
+			  "restore the canonical timeline spelling");
 	}
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);

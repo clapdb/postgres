@@ -58,13 +58,22 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 	uint32_t count = 0;
 	uint32_t capacity = 0;
 	int removed_temporary = 0;
+	int duplicated_fd;
 	int rc = -1;
 	int n;
 
 	n = snprintf(prefix, sizeof(prefix), "walv1_%u_", store->timeline);
-	if (n < 0 || (size_t) n >= sizeof(prefix) ||
-		(directory = fdopendir(dup(store->directory_fd))) == NULL)
+	if (n < 0 || (size_t) n >= sizeof(prefix))
 		return -1;
+	duplicated_fd = dup(store->directory_fd);
+	if (duplicated_fd < 0)
+		return -1;
+	directory = fdopendir(duplicated_fd);
+	if (directory == NULL)
+	{
+		close(duplicated_fd);
+		return -1;
+	}
 	for (;;)
 	{
 		struct dirent *entry;
@@ -82,7 +91,38 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 		}
 
 		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+		{
+			/* Do not let a leading-zero spelling of this timeline hide a
+			 * boundary segment and make recovery accept a shorter history. */
+			if (strncmp(entry->d_name, "walv1_", 6) == 0)
+			{
+				const char *timeline_text = entry->d_name + 6;
+				const char *separator = strchr(timeline_text, '_');
+				uint64_t parsed = 0;
+				int valid = separator != NULL && separator != timeline_text;
+
+				for (const char *p = timeline_text; valid && p < separator; p++)
+				{
+					unsigned int digit;
+
+					if (*p < '0' || *p > '9')
+					{
+						valid = 0;
+						break;
+					}
+					digit = (unsigned int) (*p - '0');
+					if (parsed > (UINT64_MAX - digit) / 10)
+					{
+						valid = 0;
+						break;
+					}
+					parsed = parsed * 10 + digit;
+				}
+				if (valid && parsed == store->timeline)
+					goto cleanup;
+			}
 			continue;
+		}
 		suffix = entry->d_name + n;
 		suffix_len = strlen(suffix);
 		/* Published identities have exactly 20 decimal digits.  mkstemp orphan
@@ -477,8 +517,7 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 			(fd = open_regular_segment_at(store, name, &st)) < 0 ||
 			read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
 			ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
-			header.payload_len == 0 ||
-			header.payload_len > PS_WAL_SEGMENT_PAYLOAD_BYTES ||
+			header.payload_len != PS_WAL_SEGMENT_PAYLOAD_BYTES ||
 			(uint64_t) st.st_size != PS_WAL_SEGMENT_HEADER_BYTES +
 				header.payload_len)
 		{
