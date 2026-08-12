@@ -34,10 +34,21 @@
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
+#include "pagestore_retention.h"
 #include "storage_spdk.h"
 
 /* most page reads a single request can carry (nblocks * page_size <= io_unit) */
 #define MAX_BLOCKS	128
+#define MAINTENANCE_CHECK_NS	100000000L	/* 100ms */
+
+static uint64_t
+monotonic_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
 
 static volatile sig_atomic_t stop_requested = 0;
 static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
@@ -151,6 +162,10 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_READ:
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
+		case PS_OP_RETENTION_PIN_GET:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_DROP:
+		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
 			return 0;
 		default:
@@ -374,6 +389,25 @@ run_request(uint32_t i, PsChannel *ch)
 	int			is_write = request_is_write(op);
 	uint64_t	epoch;
 
+	/* Retention registry mutations own their own mutex and can fsync host
+	 * metadata.  Do not hold the global core lock across that latency. */
+	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+	{
+		int timeline_ok;
+
+		pthread_rwlock_rdlock(&core_rwlock);
+		timeline_ok = ps_timeline_defined(ch->timeline);
+		pthread_rwlock_unlock(&core_rwlock);
+		if (timeline_ok)
+			begin(i, ch);
+		else
+		{
+			ch->status = PS_STATUS_ERROR;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+		}
+		return 1;
+	}
+
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{
 		pthread_rwlock_wrlock(&core_rwlock);
@@ -416,6 +450,7 @@ shard_worker(void *arg)
 	void	   *shm = wa->shm;
 	uint32_t	nchannels = wa->nchannels;
 	uint32_t	nshards = wa->nshards;
+	uint64_t	next_maintenance = monotonic_ns();
 
 	if (ps_spdk_thread_init(shard) != 0)
 	{
@@ -441,21 +476,19 @@ shard_worker(void *arg)
 		if (ps_spdk_poll(shard) > 0)
 			did_work = 1;
 
-		if (!did_work && shard == 0 && use_layers)
+		if (shard == 0)
 		{
-			int			do_maint = 0;
+			uint64_t	now = monotonic_ns();
 
-			pthread_rwlock_wrlock(&core_rwlock);
-			do_maint = ps_core_maintenance();
-			pthread_rwlock_unlock(&core_rwlock);
-			if (!do_maint)
+			if (now >= next_maintenance)
 			{
-				struct timespec ts = {0, 20000};	/* 20us */
-
-				nanosleep(&ts, NULL);
+				next_maintenance = now + MAINTENANCE_CHECK_NS;
+				if (ps_retention_should_compact())
+					did_work |= ps_retention_compact() == 0;
 			}
 		}
-		else if (!did_work)
+
+		if (!did_work)
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
 

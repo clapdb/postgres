@@ -22,10 +22,14 @@
  *   - any failure exits non-zero without replacing the existing file.
  *
  * Usage:
- *   pagestore_control_restore --shm NAME --timeline N [--lsn X/Y] <datadir>
+ *   pagestore_control_restore --shm NAME --timeline N [--lsn X/Y]
+ *       [--archive-bootstrap] <datadir>
  *
  * --lsn is the as-of point (a branch passes its fork LSN); without it the
  * newest mirrored image on the timeline's ancestry is restored.
+ * --archive-bootstrap requires an exact checkpoint-redo --lsn and adjusts
+ * only minRecoveryPoint so a fresh cluster skeleton enters archive recovery
+ * immediately and can fetch the checkpoint record itself from pagestore.
  *
  * src/../contrib/pagestore/pagestore_control_restore.c
  *
@@ -281,6 +285,7 @@ main(int argc, char **argv)
 	uint32_t	timeline = 0;
 	bool		have_timeline = false;
 	uint64_t	read_lsn = UINT64_MAX;
+	bool		archive_bootstrap = false;
 	unsigned char image[PG_CONTROL_FILE_SIZE];
 	ControlFileData control;
 	pg_crc32c	crc;
@@ -340,6 +345,8 @@ main(int argc, char **argv)
 			}
 			read_lsn = ((uint64_t) hi << 32) | (uint64_t) lo;
 		}
+		else if (strcmp(argv[i], "--archive-bootstrap") == 0)
+			archive_bootstrap = true;
 		else if (!datadir)
 			datadir = argv[i];
 		else
@@ -351,13 +358,18 @@ main(int argc, char **argv)
 	}
 	if (!shm_name || !have_timeline || !datadir)
 	{
-		fprintf(stderr, "usage: %s --shm NAME --timeline N [--lsn X/Y] <datadir>\n",
+		fprintf(stderr, "usage: %s --shm NAME --timeline N [--lsn X/Y] [--archive-bootstrap] <datadir>\n",
 				argv[0]);
 		return 2;
 	}
 	if (read_lsn == 0)
 	{
 		fprintf(stderr, "pagestore_control_restore: --lsn 0/0 selects nothing; a branch passes its fork LSN\n");
+		return 2;
+	}
+	if (archive_bootstrap && read_lsn == UINT64_MAX)
+	{
+		fprintf(stderr, "pagestore_control_restore: --archive-bootstrap requires an exact --lsn\n");
 		return 2;
 	}
 
@@ -487,6 +499,37 @@ main(int argc, char **argv)
 		fprintf(stderr, "pagestore_control_restore: control image WAL segment size %u is invalid\n",
 				control.xlog_seg_size);
 		return 1;
+	}
+
+	/*
+	 * A fresh initdb skeleton has no source-cluster WAL locally.  With the
+	 * ordinary primary control state PostgreSQL first attempts crash recovery,
+	 * and therefore refuses to invoke restore_command for the checkpoint
+	 * record.  An exact mirrored checkpoint is already a valid archive-recovery
+	 * starting point: make that requirement explicit through minRecoveryPoint.
+	 * Startup will then fetch the online checkpoint record from the store,
+	 * replay through the configured target, and produce its own legitimate
+	 * end-of-recovery control state.  Do not forge DB_SHUTDOWNED or checkpoint
+	 * record bytes.
+	 */
+	if (archive_bootstrap)
+	{
+		if (control.checkPointCopy.redo != (XLogRecPtr) read_lsn)
+		{
+			fprintf(stderr, "pagestore_control_restore: archive bootstrap requires an exact checkpoint-redo control image\n");
+			return 1;
+		}
+		control.minRecoveryPoint = control.checkPointCopy.redo;
+		control.minRecoveryPointTLI = control.checkPointCopy.ThisTimeLineID;
+		control.backupStartPoint = InvalidXLogRecPtr;
+		control.backupEndPoint = InvalidXLogRecPtr;
+		control.backupEndRequired = false;
+		INIT_CRC32C(control.crc);
+		COMP_CRC32C(control.crc, (char *) &control,
+					offsetof(ControlFileData, crc));
+		FIN_CRC32C(control.crc);
+		memset(image, 0, sizeof(image));
+		memcpy(image, &control, sizeof(control));
 	}
 
 	/*

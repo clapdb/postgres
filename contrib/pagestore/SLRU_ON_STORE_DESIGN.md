@@ -2,11 +2,18 @@
 
 Status: implemented (M4), with explicit caveats.  The WAL-based as-of
 reconstruction this document specifies has landed: snapshot shipping
-(`pagestore_ship_slru_snapshot`), the as-of appliers for clog / commit-ts /
+(`pagestore_ship_slru_snapshot`), recovery-materializer proven-cutoff capture
+(`pagestore_capture_slru_snapshot`), the as-of appliers for clog / commit-ts /
 multixact offsets+members, the branch seeders, and the
 prepare/install/manifest bootstrap flow (`pagestore_prepare_branch` /
 `pagestore_install_prepared_branch`) with fail-closed branch startup
-validation.  The "matching parent state across `track_commit_timestamp`
+validation.  The control-derived path additionally publishes a CRC-bound
+portable catalog-map artifact, and
+`pagestore_install_prepared_branch_bootstrap` installs it together with these
+SLRUs into a fresh same-build `initdb` skeleton after archive-bootstrap control
+restore; the ordinary branch manifest remains the last readiness marker.  The
+current portable format rejects user tablespaces explicitly.  The "matching
+parent state across `track_commit_timestamp`
 toggles" acceptance criterion is met: the commit-ts appliers replay toggle
 eras (first item below).  64-bit multixact
 member horizons are accepted end to end, but store page addressing uses
@@ -29,16 +36,26 @@ Known caveats -- each remains open work, with its exact failure mode stated:
   commits touch with no prior ZEROPAGE.  A target inside an off window
   fails closed with a distinct error; an inactive fork is seeded with a
   non-normal horizon (the pre-existing empty-`pg_commit_ts` path).  The
-  caller's horizon still comes from the fork's pg_control (the control
-  mirror ships a fresh image at the toggle itself, via
-  XLogReportParameters' UpdateControlFile, so `track_commit_timestamp`
-  as-of-L is reliable); deriving it automatically remains the pg_control
-  bootstrap helper follow-up.
-- **Snapshot shipping trusts the caller's cutoff.**  `pagestore_ship_slru_snapshot`
-  copies segment files and keys them by a caller-supplied cutoff C; it errors
-  only on I/O/IPC failures and does NOT validate the proof (checkpointed, no
-  concurrent SLRU writes).  An unproven cutoff silently ships mis-keyed
-  bytes.  The online, automatically triggered proven-C ship is the follow-up.
+  branch horizon comes from the fork's pg_control (the control mirror ships
+  a fresh image at the toggle itself, via XLogReportParameters'
+  UpdateControlFile, so `track_commit_timestamp` as-of-L is reliable).
+  `pagestore_prepare_branch_from_control` performs that derivation for an
+  exact, admission-fenced checkpoint redo and cuts ancestry at a separately
+  supplied materialized fork boundary covering the checkpoint; the legacy
+  prepare ABI still accepts explicit horizons for compatibility.
+- **The legacy expert snapshot API trusts the caller's cutoff.**
+  `pagestore_ship_slru_snapshot` copies one named directory and keys it by a
+  caller-supplied cutoff C; it does not validate the quiescence proof.  The
+  installed `pagestore_capture_slru_snapshot()` path closes that gap for the
+  recovery-materializer topology: the caller first confirms WAL replay is
+  paused; capture requests a restartpoint, requires its durable materializer
+  marker to equal the unchanged replay LSN, stages all four SLRUs, rechecks the
+  pause/replay position, then publishes and syncs the staged image at C.  A
+  failed or concurrent-resume attempt returns no usable cutoff.
+  `pagestore_branch_prepare` supplies the surrounding local POSIX orchestration:
+  it owns the supervisor lock, produces `C` before draining the writer, selects
+  an admission-fenced shutdown checkpoint `R/E`, and keeps the private writer
+  plus materializer pause fenced while it captures `L` and seeds the branch.
 - **The appliers can read the (C, L] WAL from the store.**  DONE:
   `pagestore.redo_wal_from_store` redirects the SLRU appliers' and seeders'
   linear scans to the store's shipped per-timeline WAL log, exactly as it
@@ -138,9 +155,10 @@ first start of the branch compute):
     -- captured at a quiesce/restartpoint, or under a brief SLRU write barrier that
     stamps the current insert LSN as `C`. A base may seed only branches with
     `L >= C`; a branch below the nearest snapshot uses an earlier one.
-  - Source: the parent ships such a clean whole-segment SLRU snapshot to the store
-    (coarse, periodic, keyed by its proven cutoff `C`), or its current segments are
-    copied as the base when the parent is reachable at branch time.
+  - Source: a recovery materializer ships such a clean whole-segment SLRU
+    snapshot to the store with `pagestore_capture_slru_snapshot()` (coarse,
+    periodic, keyed by its proven cutoff `C`), or the parent's current segments
+    are copied as the base under an equivalent proven quiesce.
 - **Forward replay `(C, L]`.** Apply only the SLRU status effects of the records in
   `(C, L]` onto the base to bring it to exactly `L`, reusing #53's shipped-WAL +
   `XLogReader` path. Use a **narrowly scoped SLRU-status applier**, not full
@@ -341,9 +359,10 @@ This list is the spec for that feature; none of it blocks M4.
 
 ## Sequencing (M4)
 
-1. Parent: ship a clean whole-segment SLRU snapshot (clog/multixact/commit-ts) to
-   the store, keyed by a **proven cutoff `C`** (at/after the checkpoint completion
-   record, or a barrier-stamped insert LSN) -- never the redo LSN.
+1. Recovery materializer: pause replay, request a restartpoint, and use
+   `pagestore_capture_slru_snapshot()` to ship a clean whole-segment SLRU
+   snapshot (clog/multixact/commit-ts) to the store, keyed by its **proven
+   cutoff `C`** -- never the checkpoint redo LSN.  DONE for the local POSIX MVP.
 2. A narrowly scoped **SLRU-status applier** that applies only the status effects of
    xact/multixact/commit-ts **and `XLOG_PARAMETER_CHANGE`** records (no relation
    drops, stats, or invalidations).

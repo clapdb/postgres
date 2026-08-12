@@ -172,16 +172,79 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     limit was enabled.  All progress records carry the logical timeline, so a
     branch cannot inherit its parent's marker or latch.  PostgreSQL's archive
     retry loop resumes shipping when the marker selects the next release
-    checkpoint.  The `materializer_smoke` harness runtime now provisions the
-    pair, drives checkpoint-to-marker progress, records worker generations, and
-    replaces a crashed worker.  Promoting that proven lifecycle contract into
-    a continuously running, ownership-fenced production controller remains
-    control-plane work.
+    checkpoint.  `pagestore_materializer_supervisor` now continuously drives
+    checkpoint-to-marker progress for one provisioned worker, records owner and
+    worker generations, fences duplicate owners, applies bounded retry, and
+    replaces a crashed worker.  `materializer_smoke` provisions the pair and
+    acts as its acceptance client.
   - serverless (Lambda) — **planned**; same read-plan input, writes an image
     layer object to S3.
 - `PsMaterializer` is not yet a named vtable in code — today materialization is
   the recovery worker. Promoting it to an explicit interface (inline /
   local-worker / serverless) is the abstraction this doc commits to.
+
+## Local materializer supervisor
+
+Meson installs the POSIX foreground service as
+`pagestore_materializer_supervisor`.  It accepts `--config PATH`; the strict
+schema-1 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
+`socket_dir`, `log_file`, and `state_dir` paths plus a PostgreSQL `port`.
+Optional fields select `database`, `user`, polling/replay-idle/progress timeout
+intervals, command timeout, exponential retry bounds, and the maximum
+consecutive failure count.  `--check-config` validates and prepares the runtime
+directories without taking ownership.
+
+The nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
+`state_dir` cannot create a second owner for the same worker.  Lock contention
+exits with status 75; invalid configuration exits with 78.  The lock contents
+are diagnostic only—the held `flock` is authoritative.
+
+`state_dir/status.json` is replaced atomically after fsync and reports schema,
+state, owner PID/epoch, worker generation, consecutive failures, last error,
+timestamps, and the last replay/shipped/materialized LSNs and lag.  Normal
+service-manager termination releases ownership but deliberately leaves a
+healthy PostgreSQL worker running; the next owner increments its epoch and
+adopts that worker.  Startup, health, missing progress API, restartpoint, and
+replacement failures share bounded exponential retry.  Exhaustion publishes
+`failed` and exits nonzero for the outer service manager to handle.
+
+## Local serialized branch prepare
+
+Meson also installs the one-shot `pagestore_branch_prepare --config PATH`
+controller.  Its strict schema-1 JSON names absolute `pg_ctl`, `psql`, writer
+and materializer PGDATA, writer log, private socket, and prepared-artifact
+paths; public writer/materializer hosts and ports; a private writer port;
+logical parent/child timelines; and optional database, user, polling, progress,
+and command timeouts.  `--check-config` validates the topology and prepares the
+owner-only socket/artifact directories.
+
+The controller serializes the complete branch boundary:
+
+1. Take a writer-PGDATA operation lock and the materializer supervisor's own
+   PGDATA lock.  A live supervisor or another branch operation fails with exit
+   status 75; an externally owned replay pause also fails closed.
+2. Pause the materializer, capture a restartpoint-proven SLRU base `C`, and
+   resume it.  Then fast-stop the public writer so existing clients drain.
+3. Restart that writer with TCP disabled on a mode-0700 private Unix socket;
+   disable autovacuum, WAL senders, logical workers, and optional pagestore
+   artifact/index workers.  `pagestore_branch_checkpoint()` verifies the clean
+   shutdown checkpoint's exact mirrored control image and admission fence and
+   returns its real WAL-record boundary `R/E`.
+4. Switch/archive WAL, wait for durable shipping and materializer replay through
+   `E`, pause again, and capture restartpoint/materialized fork `L >= E`.
+   Prepare the store branch, catalog maps, and SLRUs while both sides remain
+   fenced.
+5. Atomically publish `pagestore_branch.prepare.json`, resume materialization,
+   stop the private writer, restore its normal configuration, and update the
+   receipt from `prepared` to `complete`.
+
+Handled failures and termination signals make a best-effort service restore;
+the intermediate receipt makes a branch already prepared before a cleanup
+failure visible.  A hard process kill may still require manually resuming the
+materializer or starting the writer.  The deployment must suspend an external
+writer service manager for the command's duration; the materializer side is
+mechanically fenced by the shared supervisor lock.  The portable artifact
+continues to reject user tablespaces rather than guessing their topology.
 
 ## Why this shape (vs Neon read-time redo)
 

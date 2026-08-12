@@ -70,6 +70,7 @@
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "storage/aio.h"
 #include "storage/bufpage.h"
@@ -93,6 +94,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_classes.h"
+#include "utils/wait_event.h"
 #include "walredo_client.h"
 
 PG_MODULE_MAGIC;
@@ -2247,15 +2249,16 @@ static const char *const ps_slru_dirs[] = {
 	"pg_commit_ts",
 };
 
-static void
+static int
 slru_check_dir(const char *slru)
 {
 	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
 		if (strcmp(ps_slru_dirs[i], slru) == 0)
-			return;
+			return i;
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("\"%s\" is not an in-scope SLRU directory", slru)));
+	pg_unreachable();
 }
 
 static void
@@ -2267,32 +2270,19 @@ slru_obj_key(PageStoreRelKey *key, const char *slru)
 	key->forkNum = 0;
 }
 
-/*
- * pagestore_ship_slru_snapshot(slru text, cutoff pg_lsn) returns bigint
- *
- * Ship a clean whole-segment snapshot of SLRU directory 'slru' (e.g. 'pg_xact')
- * keyed by 'cutoff'.  'cutoff' must provably upper-bound the on-disk segments'
- * contents -- the caller captures it at a quiescent point (a clean
- * shutdown/restartpoint, or under a brief SLRU write barrier).  The online,
- * automatically-triggered, proven-C path is a follow-up.  Returns the page count;
- * fails closed (ereport) on any read/IPC error rather than shipping a partial snap.
- */
-PG_FUNCTION_INFO_V1(pagestore_ship_slru_snapshot);
-Datum
-pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
+typedef void (*PsSlruPageConsumer) (const char *slru, BlockNumber pageno,
+									const char *page, void *arg);
+
+/* Scan one clean SLRU directory and hand every complete page to a consumer. */
+static int64
+slru_scan_snapshot(const char *slru, PsSlruPageConsumer consume, void *arg)
 {
-	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
 	DIR		   *dir;
 	struct dirent *de;
-	int64		shipped = 0;
+	int64		pages = 0;
 	char	   *page = palloc(BLCKSZ);
 
-	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
-		ereport(ERROR,
-				(errmsg("pagestore.backend must be 'localsvc'")));
 	slru_check_dir(slru);
-
 	dir = AllocateDir(slru);
 	if (dir == NULL)
 		ereport(ERROR,
@@ -2309,13 +2299,9 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		size_t		namelen = strlen(de->d_name);
 
 		/*
-		 * Mirror SlruScanDirectory()'s filename test so we ship only real segment
-		 * files: SlruCorrectSegmentFilenameLength() allows short names of 4, 5 or
-		 * 6 upper-case hex characters (the "%04X" width is a minimum, so a segno
-		 * past 0xFFFF -- e.g. advanced commit_ts -- yields 5-6 chars), and
-		 * exactly 15 for long-name SLRUs (pg_multixact/members, whose offsets
-		 * are 64-bit).  Anything else in the directory is skipped, not shipped
-		 * as bogus SLRU pages.
+		 * Match SlruScanDirectory()'s filename test: short SLRUs use
+		 * 4-6 upper-case hex characters, while long-name SLRUs such as
+		 * pg_multixact/members use exactly 15.
 		 */
 		if ((namelen < 4 || namelen > 6) && namelen != 15)
 			continue;
@@ -2325,6 +2311,10 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		segno = strtoll(de->d_name, &endp, 16);
 		if (endp == de->d_name || *endp != '\0' || errno != 0 || segno < 0)
 			continue;
+		if ((uint64) segno > MaxBlockNumber / SLRU_PAGES_PER_SEGMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("SLRU page number exceeds pagestore block range")));
 
 		snprintf(segpath, sizeof(segpath), "%s/%s", slru, de->d_name);
 		fd = OpenTransientFile(segpath, O_RDONLY | PG_BINARY);
@@ -2336,10 +2326,10 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 		for (pageidx = 0; pageidx < SLRU_PAGES_PER_SEGMENT; pageidx++)
 		{
 			int			n = read(fd, page, BLCKSZ);
-			PageStoreRelKey key;
+			uint64		pageno;
 
 			if (n == 0)
-				break;			/* fewer than a full segment's pages on disk */
+				break;
 			if (n != BLCKSZ)
 			{
 				CloseTransientFile(fd);
@@ -2347,18 +2337,209 @@ pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
 						(errcode_for_file_access(),
 						 errmsg("short read on SLRU segment \"%s\"", segpath)));
 			}
-			slru_obj_key(&key, slru);
-			pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key,
-										 (BlockNumber) (segno * SLRU_PAGES_PER_SEGMENT
-														+ pageidx),
-										 page, (uint64) cutoff);
-			shipped++;
+			pageno = (uint64) segno * SLRU_PAGES_PER_SEGMENT + pageidx;
+			if (pageno > MaxBlockNumber)
+			{
+				CloseTransientFile(fd);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("SLRU page number exceeds pagestore block range")));
+			}
+			consume(slru, (BlockNumber) pageno, page, arg);
+			pages++;
 		}
 		CloseTransientFile(fd);
+		CHECK_FOR_INTERRUPTS();
 	}
 	FreeDir(dir);
+	pfree(page);
+	return pages;
+}
+
+typedef struct PsSlruDirectContext
+{
+	XLogRecPtr	cutoff;
+} PsSlruDirectContext;
+
+static void
+slru_publish_page(const char *slru, BlockNumber pageno, const char *page,
+				  void *arg)
+{
+	PsSlruDirectContext *context = arg;
+	PageStoreRelKey key;
+
+	slru_obj_key(&key, slru);
+	pagestore_localsvc_obj_write(PS_KLASS_SLRU, &key, pageno, page,
+								 (uint64) context->cutoff);
+}
+
+typedef struct PsSlruStagePage
+{
+	uint32		dir_index;
+	BlockNumber pageno;
+	char		page[BLCKSZ];
+} PsSlruStagePage;
+
+typedef struct PsSlruStageContext
+{
+	File		file;
+	pgoff_t		offset;
+} PsSlruStageContext;
+
+static void
+slru_stage_page(const char *slru, BlockNumber pageno, const char *page,
+				void *arg)
+{
+	PsSlruStageContext *context = arg;
+	PsSlruStagePage staged;
+	ssize_t		written;
+
+	memset(&staged, 0, sizeof(staged));
+	staged.dir_index = (uint32) slru_check_dir(slru);
+	staged.pageno = pageno;
+	memcpy(staged.page, page, BLCKSZ);
+	written = FileWrite(context->file, &staged, sizeof(staged), context->offset,
+						WAIT_EVENT_DATA_FILE_WRITE);
+	if (written < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stage pagestore SLRU snapshot: %m")));
+	if (written != sizeof(staged))
+		ereport(ERROR,
+				(errcode(ERRCODE_DISK_FULL),
+				 errmsg("short write while staging pagestore SLRU snapshot")));
+	context->offset += sizeof(staged);
+}
+
+static void
+slru_publish_stage(File file, int64 pages, XLogRecPtr cutoff)
+{
+	PsSlruDirectContext context = {.cutoff = cutoff};
+	PsSlruStagePage staged;
+	pgoff_t		offset = 0;
+
+	for (int64 i = 0; i < pages; i++)
+	{
+		ssize_t		read_bytes;
+
+		read_bytes = FileRead(file, &staged, sizeof(staged), offset,
+						  WAIT_EVENT_DATA_FILE_READ);
+		if (read_bytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read staged pagestore SLRU snapshot: %m")));
+		if (read_bytes != sizeof(staged))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("short read from staged pagestore SLRU snapshot")));
+		if (staged.dir_index >= lengthof(ps_slru_dirs))
+			elog(ERROR, "invalid staged pagestore SLRU directory index");
+		slru_publish_page(ps_slru_dirs[staged.dir_index], staged.pageno,
+						  staged.page, &context);
+		offset += sizeof(staged);
+	}
+}
+
+/*
+ * pagestore_ship_slru_snapshot(slru text, cutoff pg_lsn) returns bigint
+ *
+ * Ship a clean whole-segment snapshot of SLRU directory 'slru' (e.g. 'pg_xact')
+ * keyed by 'cutoff'.  'cutoff' must provably upper-bound the on-disk segments'
+ * contents -- the caller captures it at a quiescent point (a clean
+ * shutdown/restartpoint, or under a brief SLRU write barrier).  This remains
+ * the expert API; pagestore_capture_slru_snapshot() is the installed path that
+ * proves C on a recovery materializer.  Returns the page count; fails closed
+ * (ereport) on any read/IPC error rather than shipping a partial snapshot.
+ */
+PG_FUNCTION_INFO_V1(pagestore_ship_slru_snapshot);
+Datum
+pagestore_ship_slru_snapshot(PG_FUNCTION_ARGS)
+{
+	char	   *slru = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	XLogRecPtr	cutoff = PG_GETARG_LSN(1);
+	PsSlruDirectContext context = {.cutoff = cutoff};
+	int64		shipped;
+
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	shipped = slru_scan_snapshot(slru, slru_publish_page, &context);
 
 	PG_RETURN_INT64(shipped);
+}
+
+/*
+ * Capture all in-scope SLRUs at a cutoff proven by a paused recovery worker.
+ * The temporary stage prevents a concurrent resume from publishing a mixed
+ * image: replay is rechecked before any staged page reaches the store.
+ */
+PG_FUNCTION_INFO_V1(pagestore_capture_slru_snapshot);
+Datum
+pagestore_capture_slru_snapshot(PG_FUNCTION_ARGS)
+{
+	PsSlruStageContext stage;
+	XLogRecPtr	replay_before;
+	XLogRecPtr	replay_after;
+	XLogRecPtr	materialized;
+	int64		pages = 0;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to capture a pagestore SLRU snapshot")));
+	pagestore_require_materializer();
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore SLRU snapshot capture requires paused WAL replay"),
+				 errhint("Call pg_wal_replay_pause() and wait until pg_get_wal_replay_pause_state() returns 'paused'.")));
+
+	replay_before = GetXLogReplayRecPtr(NULL);
+	if (XLogRecPtrIsInvalid(replay_before))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore SLRU snapshot cutoff is unavailable")));
+
+	/* Flush all four SLRUs and publish the matching durable marker. */
+	RequestCheckpoint(CHECKPOINT_WAIT | CHECKPOINT_FAST);
+	pagestore_require_materializer();
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay resumed during pagestore SLRU snapshot capture")));
+	replay_after = GetXLogReplayRecPtr(NULL);
+	if (replay_after != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay advanced during pagestore SLRU snapshot capture")));
+	materialized = pagestore_materialized_wal_lsn_internal();
+	if (materialized != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("restartpoint did not durably cover the paused WAL replay position"),
+				 errdetail("Paused replay is at %X/%08X, but the durable materializer watermark is at %X/%08X.",
+						   LSN_FORMAT_ARGS(replay_before),
+						   LSN_FORMAT_ARGS(materialized)),
+				 errhint("Replay through a newer checkpoint record, pause recovery again, and retry.")));
+
+	stage.file = OpenTemporaryFile(false);
+	stage.offset = 0;
+	for (int i = 0; i < (int) lengthof(ps_slru_dirs); i++)
+		pages += slru_scan_snapshot(ps_slru_dirs[i], slru_stage_page, &stage);
+
+	/* Fail before store writes if the supposedly stable local image moved. */
+	pagestore_require_materializer();
+	replay_after = GetXLogReplayRecPtr(NULL);
+	if (GetRecoveryPauseState() != RECOVERY_PAUSED ||
+		replay_after != replay_before)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("WAL replay changed while staging pagestore SLRU snapshot")));
+
+	slru_publish_stage(stage.file, pages, replay_before);
+	pagestore_localsvc_store_sync_timeout(PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	FileClose(stage.file);
+	PG_RETURN_LSN(replay_before);
 }
 
 /*
@@ -2565,6 +2746,79 @@ ps_wal_reaches(XLogRecPtr target)
 										   (uint64) (target - 1), 1, &b) == 1;
 	}
 	return ps_local_wal_limit() >= target;
+}
+
+static bool
+ps_checkpoint_matches_control(const CheckPoint *record,
+							  const CheckPoint *control)
+{
+	return record->redo == control->redo &&
+		record->ThisTimeLineID == control->ThisTimeLineID &&
+		record->PrevTimeLineID == control->PrevTimeLineID &&
+		record->fullPageWrites == control->fullPageWrites &&
+		record->wal_level == control->wal_level &&
+		record->logicalDecodingEnabled == control->logicalDecodingEnabled &&
+		FullTransactionIdEquals(record->nextXid, control->nextXid) &&
+		record->nextOid == control->nextOid &&
+		record->nextMulti == control->nextMulti &&
+		record->nextMultiOffset == control->nextMultiOffset &&
+		record->oldestXid == control->oldestXid &&
+		record->oldestXidDB == control->oldestXidDB &&
+		record->oldestMulti == control->oldestMulti &&
+		record->oldestMultiDB == control->oldestMultiDB &&
+		record->time == control->time &&
+		record->oldestCommitTsXid == control->oldestCommitTsXid &&
+		record->newestCommitTsXid == control->newestCommitTsXid &&
+		record->oldestActiveXid == control->oldestActiveXid &&
+		record->dataChecksumState == control->dataChecksumState;
+}
+
+/*
+ * Resolve and verify the checkpoint record named by a mirrored control image.
+ * Its EndRecPtr is the earliest branch LSN which contains the complete record;
+ * comparing only against ControlFileData.checkPoint (the record start) would
+ * admit a cutoff in the middle of the record.
+ */
+static XLogRecPtr
+ps_checkpoint_record_end(XLogRecPtr checkpoint_lsn,
+						 const CheckPoint *expected)
+{
+	ReadLocalXLogPageNoWaitPrivate *pd = palloc0(sizeof(*pd));
+	XLogReaderState *reader;
+	char	   *errm = NULL;
+	XLogRecPtr	end = InvalidXLogRecPtr;
+	bool		matches = false;
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &ps_slru_wal_page_read,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								pd);
+	if (reader == NULL)
+		ereport(ERROR, (errmsg("pagestore: could not allocate a WAL reader")));
+
+	XLogBeginRead(reader, checkpoint_lsn);
+	if (XLogReadRecord(reader, &errm) != NULL &&
+		reader->ReadRecPtr == checkpoint_lsn &&
+		XLogRecGetRmid(reader) == RM_XLOG_ID &&
+		((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_ONLINE ||
+		 (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_CHECKPOINT_SHUTDOWN) &&
+		XLogRecGetDataLen(reader) == sizeof(CheckPoint) &&
+		ps_checkpoint_matches_control(
+			(const CheckPoint *) XLogRecGetData(reader), expected))
+	{
+		end = reader->EndRecPtr;
+		matches = true;
+	}
+
+	XLogReaderFree(reader);
+	pfree(pd);
+	if (!matches)
+		ereport(ERROR,
+				(errmsg("mirrored control image has no matching readable checkpoint record"),
+				 errdetail("Expected checkpoint record at %X/%08X.",
+							   LSN_FORMAT_ARGS(checkpoint_lsn))));
+	return end;
 }
 
 /*
@@ -7652,6 +7906,412 @@ pagestore_reader_handoff_ready(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL((XLogRecPtr) read_lsn >= (XLogRecPtr) token.lsn);
 }
 
+#define PAGESTORE_BRANCH_BOOTSTRAP_FILE "pagestore_branch.bootstrap"
+#define PAGESTORE_BRANCH_BOOTSTRAP_MAGIC UINT32_C(0x50534242)
+#define PAGESTORE_BRANCH_BOOTSTRAP_FORMAT 1
+#define PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES UINT32_C(0x00000001)
+
+typedef struct PagestoreBranchBootstrapHeader
+{
+	uint64		checkpoint_redo;
+	uint64		recovery_lsn;
+	uint64		fork_lsn;
+	uint64		system_identifier;
+	uint64		artifact_size;
+	uint32		magic;
+	uint32		format;
+	uint32		new_timeline;
+	uint32		parent_timeline;
+	uint32		map_count;
+	uint32		flags;
+	pg_crc32c	crc;
+	pg_crc32c	manifest_crc;
+} PagestoreBranchBootstrapHeader;
+
+typedef struct PagestoreBranchBootstrapMapHeader
+{
+	uint32		database_oid;
+	uint32		size;
+} PagestoreBranchBootstrapMapHeader;
+
+typedef struct PagestoreBranchBootstrapMap
+{
+	Oid			database_oid;
+	Size		size;
+	char	   *data;
+} PagestoreBranchBootstrapMap;
+
+static void pagestore_require_prepared_artifact(const char *prepared_dir,
+											 const char *relpath,
+											 bool directory);
+static char *pagestore_read_branch_manifest(const char *target_dir);
+
+static pg_crc32c
+pagestore_branch_manifest_crc(const char *manifest)
+{
+	pg_crc32c	crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, manifest, strlen(manifest));
+	FIN_CRC32C(crc);
+	return crc;
+}
+
+static int
+pagestore_branch_bootstrap_map_cmp(const void *a, const void *b)
+{
+	const PagestoreBranchBootstrapMap *ma = a;
+	const PagestoreBranchBootstrapMap *mb = b;
+
+	if (ma->database_oid < mb->database_oid)
+		return -1;
+	if (ma->database_oid > mb->database_oid)
+		return 1;
+	return 0;
+}
+
+static void
+pagestore_branch_bootstrap_add_map(PagestoreBranchBootstrapMap **maps,
+								   int *count, int *capacity,
+								   Oid database_oid, const char *dir)
+{
+	PagestoreBranchBootstrapMap *map;
+	char	   *data;
+
+	if (*count == *capacity)
+	{
+		int			new_capacity;
+
+		if (*capacity == 0)
+			new_capacity = 8;
+		else if (*capacity > INT_MAX / 2)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("too many database relation maps for branch bootstrap")));
+		else
+			new_capacity = *capacity * 2;
+		if ((Size) new_capacity > MaxAllocSize / sizeof(**maps))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("too many database relation maps for branch bootstrap")));
+		if (*maps == NULL)
+			*maps = palloc(sizeof(**maps) * new_capacity);
+		else
+			*maps = repalloc(*maps, sizeof(**maps) * new_capacity);
+		*capacity = new_capacity;
+	}
+
+	data = palloc(PAGESTORE_READER_RELMAP_MAX_SIZE);
+	map = &(*maps)[(*count)++];
+	map->database_oid = database_oid;
+	map->size = pagestore_read_reader_relmap(dir, data,
+											PAGESTORE_READER_RELMAP_MAX_SIZE);
+	map->data = data;
+}
+
+static bool
+pagestore_branch_bootstrap_has_user_tablespaces(void)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir("pg_tblspc");
+	while ((de = ReadDir(dir, "pg_tblspc")) != NULL)
+	{
+		if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+		{
+			FreeDir(dir);
+			return true;
+		}
+	}
+	FreeDir(dir);
+	return false;
+}
+
+/*
+ * Capture the local catalog identity which a fully routed branch still needs
+ * before it can read catalog relations from pagestore.  One cluster-wide lock
+ * protects every relation map, so the global map and all default-tablespace
+ * database maps form one point-in-time bundle.  The surrounding branch-create
+ * quiesce protects database directory topology.
+ */
+static void
+pagestore_write_branch_bootstrap(const char *target_dir,
+								 int32 new_tl, int32 parent_tl,
+								 XLogRecPtr checkpoint_redo,
+								 XLogRecPtr recovery_lsn,
+								 XLogRecPtr fork_lsn,
+								 uint64 system_identifier)
+{
+	PagestoreBranchBootstrapMap *maps = NULL;
+	PagestoreBranchBootstrapHeader *header;
+	char	   *artifact;
+	char	   *cursor;
+	DIR		   *dir = NULL;
+	struct dirent *de;
+	Size		artifact_size;
+	int			map_count = 0;
+	int			map_capacity = 0;
+	uint32		flags = 0;
+	pg_crc32c	crc;
+	char	   *manifest;
+
+	if (pagestore_branch_bootstrap_has_user_tablespaces())
+		flags |= PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES;
+	manifest = pagestore_read_branch_manifest(target_dir);
+	if (manifest == NULL)
+		ereport(ERROR,
+				(errmsg("branch manifest is missing while publishing portable bootstrap")));
+
+	LWLockAcquire(RelationMappingLock, LW_SHARED);
+	PG_TRY();
+	{
+		pagestore_branch_bootstrap_add_map(&maps, &map_count, &map_capacity,
+										   InvalidOid, "global");
+		dir = AllocateDir("base");
+		while ((de = ReadDir(dir, "base")) != NULL)
+		{
+			char	   *end;
+			char		path[MAXPGPATH];
+			unsigned long oid_value;
+			struct stat st;
+			int			pathlen;
+
+			if (*de->d_name == '\0' ||
+				strspn(de->d_name, "0123456789") != strlen(de->d_name))
+				continue;
+			errno = 0;
+			oid_value = strtoul(de->d_name, &end, 10);
+			if (errno != 0 || end == de->d_name || *end != '\0' ||
+				oid_value == InvalidOid || oid_value > UINT32_MAX)
+				continue;
+			pathlen = snprintf(path, sizeof(path), "base/%s", de->d_name);
+			PS_CHECK_PATH_FORMAT(pathlen, path);
+			if (lstat(path, &st) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not stat database directory \"%s\": %m",
+								path)));
+			if (!S_ISDIR(st.st_mode))
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("database path \"%s\" is not a directory",
+								path)));
+			pagestore_branch_bootstrap_add_map(&maps, &map_count,
+											   &map_capacity,
+											   (Oid) oid_value, path);
+		}
+		FreeDir(dir);
+		dir = NULL;
+	}
+	PG_FINALLY();
+	{
+		if (dir != NULL)
+			FreeDir(dir);
+		LWLockRelease(RelationMappingLock);
+	}
+	PG_END_TRY();
+
+	qsort(maps, map_count, sizeof(*maps),
+		  pagestore_branch_bootstrap_map_cmp);
+	if (map_count < 2 || maps[0].database_oid != InvalidOid)
+		ereport(ERROR,
+				(errmsg("branch bootstrap relation-map set is incomplete")));
+
+	artifact_size = sizeof(*header);
+	for (int i = 0; i < map_count; i++)
+	{
+		if (i > 0 && maps[i - 1].database_oid == maps[i].database_oid)
+			ereport(ERROR,
+					(errmsg("branch bootstrap contains duplicate database relation maps")));
+		if (artifact_size >
+			MaxAllocSize - sizeof(PagestoreBranchBootstrapMapHeader) ||
+			maps[i].size > MaxAllocSize - artifact_size -
+			sizeof(PagestoreBranchBootstrapMapHeader))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("branch bootstrap artifact is too large")));
+		artifact_size += sizeof(PagestoreBranchBootstrapMapHeader) + maps[i].size;
+	}
+	if (artifact_size > PG_INT32_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("branch bootstrap artifact is too large")));
+
+	artifact = palloc0(artifact_size);
+	header = (PagestoreBranchBootstrapHeader *) artifact;
+	header->checkpoint_redo = (uint64) checkpoint_redo;
+	header->recovery_lsn = (uint64) recovery_lsn;
+	header->fork_lsn = (uint64) fork_lsn;
+	header->system_identifier = system_identifier;
+	header->artifact_size = artifact_size;
+	header->magic = PAGESTORE_BRANCH_BOOTSTRAP_MAGIC;
+	header->format = PAGESTORE_BRANCH_BOOTSTRAP_FORMAT;
+	header->new_timeline = (uint32) new_tl;
+	header->parent_timeline = (uint32) parent_tl;
+	header->map_count = map_count;
+	header->flags = flags;
+	header->manifest_crc = pagestore_branch_manifest_crc(manifest);
+	cursor = artifact + sizeof(*header);
+	for (int i = 0; i < map_count; i++)
+	{
+		PagestoreBranchBootstrapMapHeader entry;
+
+		entry.database_oid = maps[i].database_oid;
+		entry.size = maps[i].size;
+		memcpy(cursor, &entry, sizeof(entry));
+		cursor += sizeof(entry);
+		memcpy(cursor, maps[i].data, maps[i].size);
+		cursor += maps[i].size;
+	}
+	Assert(cursor == artifact + artifact_size);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, artifact, artifact_size);
+	FIN_CRC32C(crc);
+	header->crc = crc;
+	pagestore_publish_artifact(target_dir, PAGESTORE_BRANCH_BOOTSTRAP_FILE,
+								   "branch bootstrap", artifact,
+								   (int) artifact_size);
+	for (int i = 0; i < map_count; i++)
+		pfree(maps[i].data);
+	pfree(maps);
+	pfree(artifact);
+	pfree(manifest);
+}
+
+/*
+ * Load and completely validate the self-contained bootstrap artifact before
+ * an installer changes the target datadir.  The artifact CRC covers both its
+ * identity header and every relation-map byte; relation-map files also carry
+ * PostgreSQL's own checksum, which startup verifies when it consumes them.
+ */
+static char *
+pagestore_load_branch_bootstrap(const char *dir,
+								int32 new_tl, int32 parent_tl,
+								XLogRecPtr checkpoint_redo,
+								XLogRecPtr recovery_lsn,
+								XLogRecPtr fork_lsn,
+								PagestoreBranchBootstrapHeader **header_out)
+{
+	PagestoreBranchBootstrapHeader *header;
+	char	   *artifact;
+	char	   *cursor;
+	char	   *end;
+	char		path[MAXPGPATH];
+	struct stat st;
+	pg_crc32c	stored_crc;
+	pg_crc32c	crc;
+	uint32		previous_oid = InvalidOid;
+	int			fd;
+	int			pathlen;
+
+	pathlen = snprintf(path, sizeof(path), "%s/%s", dir,
+					   PAGESTORE_BRANCH_BOOTSTRAP_FILE);
+	PS_CHECK_PATH_FORMAT(pathlen, path);
+	pagestore_require_prepared_artifact(dir, PAGESTORE_BRANCH_BOOTSTRAP_FILE,
+										false);
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open branch bootstrap artifact \"%s\": %m",
+						path)));
+	if (fstat(fd, &st) != 0)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat branch bootstrap artifact \"%s\": %m",
+						path)));
+	}
+	if (st.st_size < (off_t) sizeof(*header) || st.st_size > PG_INT32_MAX)
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("branch bootstrap artifact \"%s\" has an invalid size",
+						path)));
+	}
+	artifact = palloc((Size) st.st_size);
+	if (!pagestore_pread_exact(fd, artifact, (Size) st.st_size, 0))
+	{
+		CloseTransientFile(fd);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read branch bootstrap artifact \"%s\": %m",
+						path)));
+	}
+	CloseTransientFile(fd);
+	header = (PagestoreBranchBootstrapHeader *) artifact;
+	if (header->magic != PAGESTORE_BRANCH_BOOTSTRAP_MAGIC ||
+		header->format != PAGESTORE_BRANCH_BOOTSTRAP_FORMAT ||
+		header->artifact_size != (uint64) st.st_size ||
+		header->new_timeline != (uint32) new_tl ||
+		header->parent_timeline != (uint32) parent_tl ||
+		header->checkpoint_redo != (uint64) checkpoint_redo ||
+		header->recovery_lsn != (uint64) recovery_lsn ||
+		header->fork_lsn != (uint64) fork_lsn ||
+		header->system_identifier == 0 ||
+		header->map_count < 2 ||
+		(header->flags & ~PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES) != 0 ||
+		XLogRecPtrIsInvalid((XLogRecPtr) header->checkpoint_redo) ||
+		header->recovery_lsn < header->checkpoint_redo ||
+		header->fork_lsn < header->recovery_lsn ||
+		header->map_count >
+		((Size) st.st_size - sizeof(*header)) /
+		sizeof(PagestoreBranchBootstrapMapHeader))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("branch bootstrap artifact \"%s\" has an invalid identity or header",
+						path)));
+
+	stored_crc = header->crc;
+	header->crc = 0;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, artifact, (Size) st.st_size);
+	FIN_CRC32C(crc);
+	header->crc = stored_crc;
+	if (!EQ_CRC32C(crc, stored_crc))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("branch bootstrap artifact \"%s\" has an invalid checksum",
+						path)));
+
+	cursor = artifact + sizeof(*header);
+	end = artifact + (Size) st.st_size;
+	for (uint32 i = 0; i < header->map_count; i++)
+	{
+		PagestoreBranchBootstrapMapHeader entry;
+
+		if ((Size) (end - cursor) < sizeof(entry))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("branch bootstrap artifact \"%s\" has a truncated relation-map table",
+							path)));
+		memcpy(&entry, cursor, sizeof(entry));
+		cursor += sizeof(entry);
+		if ((i == 0 && entry.database_oid != InvalidOid) ||
+			(i > 0 && (entry.database_oid == InvalidOid ||
+						   entry.database_oid <= previous_oid)) ||
+			entry.size == 0 || entry.size > PAGESTORE_READER_RELMAP_MAX_SIZE ||
+			(Size) (end - cursor) < entry.size)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("branch bootstrap artifact \"%s\" has an invalid relation-map entry",
+							path)));
+		previous_oid = entry.database_oid;
+		cursor += entry.size;
+	}
+	if (cursor != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("branch bootstrap artifact \"%s\" has trailing data",
+						path)));
+
+	*header_out = header;
+	return artifact;
+}
+
 static void
 pagestore_write_branch_manifest(const char *target_dir,
 								int32 new_tl, int32 parent_tl,
@@ -9027,6 +9687,173 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
 	fsync_fname(target_dir, true);
 }
 
+static void
+pagestore_require_real_directory(const char *path, const char *kind)
+{
+	struct stat st;
+
+	if (lstat(path, &st) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat %s directory \"%s\": %m", kind, path)));
+	if (!S_ISDIR(st.st_mode))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("%s path \"%s\" is not a directory", kind, path)));
+}
+
+/*
+ * A portable install targets an offline, freshly initdb'd skeleton.  Validate
+ * all of its fixed directories and every existing database directory before
+ * writing the first map.  User tablespace links would carry a different local
+ * filesystem topology, so both the source artifact and target must be empty
+ * until that topology gets its own portable artifact format.
+ */
+static void
+pagestore_preflight_branch_bootstrap_target(const char *target_dir,
+										 const char *artifact,
+										 const PagestoreBranchBootstrapHeader *header)
+{
+	const char *cursor = artifact + sizeof(*header);
+	char		base[MAXPGPATH];
+	char		global[MAXPGPATH];
+	char		tblspc[MAXPGPATH];
+	char		pidfile[MAXPGPATH];
+	DIR		   *dir;
+	struct dirent *de;
+	struct stat pidst;
+	int			pathlen;
+
+	pagestore_require_real_directory(target_dir, "branch target");
+	pathlen = snprintf(base, sizeof(base), "%s/base", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, base);
+	pathlen = snprintf(global, sizeof(global), "%s/global", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, global);
+	pathlen = snprintf(tblspc, sizeof(tblspc), "%s/pg_tblspc", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, tblspc);
+	pathlen = snprintf(pidfile, sizeof(pidfile), "%s/postmaster.pid", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, pidfile);
+	pagestore_require_real_directory(base, "branch base");
+	pagestore_require_real_directory(global, "branch global");
+	pagestore_require_real_directory(tblspc, "branch tablespace");
+	if (lstat(pidfile, &pidst) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("branch target \"%s\" has a postmaster.pid file",
+						target_dir),
+				 errhint("Stop the target server before installing bootstrap artifacts.")));
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat branch target lock file \"%s\": %m",
+						pidfile)));
+
+	dir = AllocateDir(tblspc);
+	while ((de = ReadDir(dir, tblspc)) != NULL)
+	{
+		if (strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0)
+		{
+			FreeDir(dir);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("portable branch bootstrap requires an empty target pg_tblspc")));
+		}
+	}
+	FreeDir(dir);
+
+	for (uint32 i = 0; i < header->map_count; i++)
+	{
+		PagestoreBranchBootstrapMapHeader entry;
+		char		mapdir[MAXPGPATH];
+		struct stat st;
+
+		memcpy(&entry, cursor, sizeof(entry));
+		cursor += sizeof(entry) + entry.size;
+		if (entry.database_oid == InvalidOid)
+			continue;
+		pathlen = snprintf(mapdir, sizeof(mapdir), "%s/%u", base,
+						   entry.database_oid);
+		PS_CHECK_PATH_FORMAT(pathlen, mapdir);
+		if (lstat(mapdir, &st) == 0)
+		{
+			if (!S_ISDIR(st.st_mode))
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("branch database path \"%s\" is not a directory",
+								mapdir)));
+		}
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat branch database directory \"%s\": %m",
+							mapdir)));
+	}
+}
+
+static void
+pagestore_install_branch_bootstrap_maps(const char *prepared_dir,
+										const char *target_dir,
+										const char *artifact,
+										const PagestoreBranchBootstrapHeader *header)
+{
+	const char *cursor = artifact + sizeof(*header);
+	char		base[MAXPGPATH];
+	int			pathlen;
+
+	pathlen = snprintf(base, sizeof(base), "%s/base", target_dir);
+	PS_CHECK_PATH_FORMAT(pathlen, base);
+	for (uint32 i = 0; i < header->map_count; i++)
+	{
+		PagestoreBranchBootstrapMapHeader entry;
+		const char *mapdata;
+		char		mapdir[MAXPGPATH];
+		char		initpath[MAXPGPATH];
+		struct stat st;
+
+		memcpy(&entry, cursor, sizeof(entry));
+		cursor += sizeof(entry);
+		mapdata = cursor;
+		cursor += entry.size;
+		if (entry.database_oid == InvalidOid)
+			pathlen = snprintf(mapdir, sizeof(mapdir), "%s/global", target_dir);
+		else
+			pathlen = snprintf(mapdir, sizeof(mapdir), "%s/%u", base,
+							   entry.database_oid);
+		PS_CHECK_PATH_FORMAT(pathlen, mapdir);
+		if (lstat(mapdir, &st) != 0)
+		{
+			if (errno != ENOENT || MakePGDirectory(mapdir) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not create branch database directory \"%s\": %m",
+								mapdir)));
+			fsync_fname(base, true);
+		}
+		else if (!S_ISDIR(st.st_mode))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("branch database path \"%s\" is not a directory",
+							mapdir)));
+		/* initdb's relcache files can describe different catalog filenodes.
+		 * Rebuild them from the restored map and catalog pages on first boot. */
+		pathlen = snprintf(initpath, sizeof(initpath), "%s/pg_internal.init",
+							   mapdir);
+		PS_CHECK_PATH_FORMAT(pathlen, initpath);
+		if (unlink(initpath) == 0)
+			fsync_fname(mapdir, true);
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove stale relcache init file \"%s\": %m",
+							initpath)));
+		pagestore_publish_artifact(mapdir, "pg_filenode.map",
+								   "branch relation map", mapdata,
+								   (int) entry.size);
+	}
+	pagestore_install_prepared_file(prepared_dir, target_dir,
+									PAGESTORE_BRANCH_BOOTSTRAP_FILE, true);
+}
+
 /*
  * pagestore_install_prepared_branch(prepared_dir text, target_dir text,
  *                                  new_timeline int, parent_timeline int,
@@ -9158,6 +9985,148 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 									"pagestore_branch.manifest", true);
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * Install a prepared branch into a fresh same-build initdb skeleton without a
+ * parent PGDATA copy.  The caller first restores exact checkpoint control with
+ * pagestore_control_restore --archive-bootstrap.  This entrypoint binds that
+ * control file to the prepared bootstrap artifact, installs every source
+ * relation map and the SLRU bundle, and publishes the ordinary branch manifest
+ * last.  Skeleton WAL in target/pg_wal is deliberately a separate orchestrator
+ * step: archive recovery must start with no foreign initdb WAL.
+ */
+PG_FUNCTION_INFO_V1(pagestore_install_prepared_branch_bootstrap);
+Datum
+pagestore_install_prepared_branch_bootstrap(PG_FUNCTION_ARGS)
+{
+	char	   *prepared_dir;
+	char	   *target_dir;
+	int32		new_tl;
+	int32		parent_tl;
+	XLogRecPtr	checkpoint_redo;
+	XLogRecPtr	recovery_lsn;
+	XLogRecPtr	fork_lsn;
+	char	   *manifest_data;
+	char	   *target_manifest;
+	char		manifest_path[MAXPGPATH];
+	char	   *artifact;
+	PagestoreBranchBootstrapHeader *header;
+	ControlFileData *control;
+	bool		control_crc_ok;
+	bool		commit_ts_required;
+	Datum		result;
+
+	if (PG_NARGS() != 7)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pagestore_install_prepared_branch_bootstrap requires 7 arguments (prepared_dir, target_dir, new_timeline, parent_timeline, checkpoint_redo, recovery_lsn, fork_lsn)")));
+	prepared_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	target_dir = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	new_tl = PG_GETARG_INT32(2);
+	parent_tl = PG_GETARG_INT32(3);
+	checkpoint_redo = PG_GETARG_LSN(4);
+	recovery_lsn = PG_GETARG_LSN(5);
+	fork_lsn = PG_GETARG_LSN(6);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to install a prepared branch bootstrap")));
+	if (new_tl <= 0 || parent_tl < 0 ||
+		XLogRecPtrIsInvalid(checkpoint_redo) ||
+		recovery_lsn < checkpoint_redo || fork_lsn < recovery_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid portable branch bootstrap identity or LSN bounds")));
+	pagestore_require_disjoint_install_dirs(prepared_dir, target_dir);
+
+	/* Preflight the complete legacy bundle before any target map is changed. */
+	manifest_data = pagestore_read_branch_manifest(prepared_dir);
+	if (manifest_data == NULL ||
+		!pagestore_manifest_matches(manifest_data, new_tl, parent_tl, fork_lsn))
+		ereport(ERROR,
+				(errmsg("prepared branch manifest does not match the requested branch identity")));
+	if (!pagestore_manifest_get_commit_ts_required(manifest_data,
+											   &commit_ts_required))
+		ereport(ERROR,
+				(errmsg("prepared branch manifest has invalid commit-ts horizons")));
+	pagestore_require_prepared_artifact(prepared_dir, "pg_xact", true);
+	if (commit_ts_required)
+		pagestore_require_prepared_artifact(prepared_dir, "pg_commit_ts", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/offsets", true);
+	pagestore_require_prepared_artifact(prepared_dir, "pg_multixact/members", true);
+	pagestore_require_prepared_artifact(prepared_dir,
+										"pagestore_branch.manifest", false);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_xact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_commit_ts", commit_ts_required);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pg_multixact", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  "pagestore_branch.manifest", true);
+	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
+										  PAGESTORE_BRANCH_BOOTSTRAP_FILE, true);
+	target_manifest = pagestore_read_branch_manifest(target_dir);
+	if (target_manifest != NULL &&
+		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+		ereport(ERROR,
+				(errmsg("target branch manifest does not match the requested portable branch identity")));
+
+	artifact = pagestore_load_branch_bootstrap(prepared_dir, new_tl, parent_tl,
+											   checkpoint_redo, recovery_lsn,
+											   fork_lsn, &header);
+	if (!EQ_CRC32C(header->manifest_crc,
+					   pagestore_branch_manifest_crc(manifest_data)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("branch bootstrap artifact does not match the prepared branch manifest")));
+	if (header->flags & PAGESTORE_BRANCH_BOOTSTRAP_HAS_USER_TABLESPACES)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("portable branch bootstrap does not yet support user tablespaces"),
+				 errdetail("The prepared source has entries in pg_tblspc.")));
+	pagestore_preflight_branch_bootstrap_target(target_dir, artifact, header);
+
+	control = get_controlfile(target_dir, &control_crc_ok);
+	if (!control_crc_ok ||
+		control->system_identifier != header->system_identifier ||
+		control->checkPointCopy.redo != checkpoint_redo ||
+		control->minRecoveryPoint != checkpoint_redo ||
+		control->minRecoveryPointTLI != control->checkPointCopy.ThisTimeLineID ||
+		!XLogRecPtrIsInvalid(control->backupStartPoint) ||
+		!XLogRecPtrIsInvalid(control->backupEndPoint) ||
+		control->backupEndRequired)
+		ereport(ERROR,
+				(errmsg("target pg_control does not match the prepared archive bootstrap"),
+				 errdetail("The target requires system identifier " UINT64_FORMAT
+						   " and checkpoint redo %X/%08X restored with --archive-bootstrap.",
+						   header->system_identifier,
+						   LSN_FORMAT_ARGS(checkpoint_redo))));
+	pfree(control);
+
+	/* A previous successful install is no longer evidence of readiness while
+	 * maps are being replaced.  Publish the new manifest only after all files. */
+	snprintf(manifest_path, sizeof(manifest_path), "%s/pagestore_branch.manifest",
+			 target_dir);
+	if (unlink(manifest_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch manifest \"%s\": %m",
+						manifest_path)));
+
+	pagestore_install_branch_bootstrap_maps(prepared_dir, target_dir,
+											artifact, header);
+	pfree(artifact);
+	result = DirectFunctionCall5(pagestore_install_prepared_branch,
+								 PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
+								 PG_GETARG_DATUM(2), PG_GETARG_DATUM(3),
+								 PG_GETARG_DATUM(6));
+	return result;
 }
 
 /* Install an as-of local-state bundle without creating a store timeline. */
@@ -9314,38 +10283,234 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/*
- * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
- *                          base pg_lsn, target pg_lsn,
- *                          oldest_xid xid, next_xid xid,
- *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
- *                          oldest_multi xid, next_multi xid,
- *                          oldest_member bigint, next_member bigint)
- * returns bigint
- *
- * Control-plane bootstrap entrypoint for a branch-capable compute: materialize
- * branch SLRUs, fork the store timeline, and durably record the fork metadata in
- * the target datadir.  This is still intentionally pg_control-adjacent rather
- * than pg_control-editing: the manifest gives later bootstrap code one durable
- * protocol artifact to consume.
- */
-PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
-Datum
-pagestore_prepare_branch(PG_FUNCTION_ARGS)
+typedef struct PagestoreBranchHorizons
 {
-	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	int32		new_tl = PG_GETARG_INT32(1);
-	int32		parent_tl = PG_GETARG_INT32(2);
-	XLogRecPtr	base = PG_GETARG_LSN(3);
-	XLogRecPtr	target = PG_GETARG_LSN(4);
-	TransactionId oldest_xid = PG_GETARG_TRANSACTIONID(5);
-	TransactionId next_xid = PG_GETARG_TRANSACTIONID(6);
-	TransactionId oldest_commit_ts_xid = PG_GETARG_TRANSACTIONID(7);
-	TransactionId next_commit_ts_xid = PG_GETARG_TRANSACTIONID(8);
-	MultiXactId oldest_multi = PG_GETARG_TRANSACTIONID(9);
-	MultiXactId next_multi = PG_GETARG_TRANSACTIONID(10);
-	int64		oldest_member = PG_GETARG_INT64(11);
-	int64		next_member = PG_GETARG_INT64(12);
+	XLogRecPtr	checkpoint_end_lsn;
+	uint64		system_identifier;
+	TransactionId oldest_xid;
+	TransactionId next_xid;
+	TransactionId oldest_commit_ts_xid;
+	TransactionId next_commit_ts_xid;
+	MultiXactId oldest_multi;
+	MultiXactId next_multi;
+	int64		oldest_member;
+	int64		next_member;
+} PagestoreBranchHorizons;
+
+/*
+ * Derive one complete SLRU bootstrap horizon from an exact, durably mirrored
+ * checkpoint.  A merely newest-at-or-below control image is insufficient:
+ * requiring both checkPointCopy.redo == target and the exact-redo admission
+ * fence prevents an older/still-unsynced control state from being blessed as
+ * the branch horizon source.
+ *
+ * The checkpoint contains every bound except the starting member offset of
+ * oldestMulti.  Reconstruct that one offsets entry from the exact base + WAL
+ * window which the seeders will consume.  If the oldest multixact does not
+ * exist because the range is empty, PostgreSQL defines its offset as the next
+ * free member offset.
+ */
+static void
+pagestore_branch_horizons_from_control(XLogRecPtr base, XLogRecPtr target,
+									   PagestoreBranchHorizons *h)
+{
+	ControlFileData control;
+	CheckPoint  *checkpoint = &control.checkPointCopy;
+	uint64		read_seq;
+	MultiXactOffset next_member;
+
+	if (target < base || XLogRecPtrIsInvalid(target))
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo is invalid or precedes the base cutoff")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR,
+				(errmsg("pagestore.backend must be 'localsvc'")));
+	if (!ps_control_asof_timeout(target, &control,
+								 PAGESTORE_READER_HORIZON_TIMEOUT_MS) ||
+		checkpoint->redo != target)
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo is not exactly mirrored"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+							   LSN_FORMAT_ARGS(target))));
+	if (!pagestore_localsvc_read_fence_timeout(
+			(uint64) target, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("branch checkpoint redo has no matching durable admission fence"),
+				 errdetail("Requested branch target is %X/%08X.",
+							   LSN_FORMAT_ARGS(target))));
+
+	/* READ_AT may race the control drain before its final sync. */
+	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+
+	memset(h, 0, sizeof(*h));
+	h->checkpoint_end_lsn = ps_checkpoint_record_end(control.checkPoint,
+												 checkpoint);
+	h->system_identifier = control.system_identifier;
+	h->oldest_xid = checkpoint->oldestXid;
+	h->next_xid = XidFromFullTransactionId(checkpoint->nextXid);
+	if (!TransactionIdIsNormal(h->oldest_xid) ||
+		!TransactionIdIsNormal(h->next_xid) ||
+		TransactionIdFollows(h->oldest_xid, h->next_xid))
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid XID horizons [%u, %u)",
+						h->oldest_xid, h->next_xid)));
+
+	if (control.track_commit_timestamp)
+	{
+		TransactionId oldest = checkpoint->oldestCommitTsXid;
+		TransactionId newest = checkpoint->newestCommitTsXid;
+
+		if (!TransactionIdIsNormal(oldest) &&
+			!TransactionIdIsNormal(newest))
+		{
+			/* Active but with no timestamped XID yet: publish an empty era. */
+			h->oldest_commit_ts_xid = h->next_xid;
+			h->next_commit_ts_xid = h->next_xid;
+		}
+		else if (!TransactionIdIsNormal(oldest) ||
+				 !TransactionIdIsNormal(newest))
+			ereport(ERROR,
+					(errmsg("checkpoint has inconsistent commit-ts horizons [%u, %u]",
+							oldest, newest)));
+		else
+		{
+			h->oldest_commit_ts_xid = oldest;
+			h->next_commit_ts_xid = newest;
+			TransactionIdAdvance(h->next_commit_ts_xid);
+		}
+	}
+	/* Both InvalidTransactionId when commit-ts is inactive (memset above). */
+
+	h->oldest_multi = checkpoint->oldestMulti;
+	h->next_multi = checkpoint->nextMulti;
+	if (!MultiXactIdIsValid(h->oldest_multi) ||
+		!MultiXactIdIsValid(h->next_multi) ||
+		(h->oldest_multi != h->next_multi &&
+		 !MultiXactIdPrecedes(h->oldest_multi, h->next_multi)))
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid multixact horizons [%u, %u)",
+						h->oldest_multi, h->next_multi)));
+	next_member = checkpoint->nextMultiOffset;
+	if (next_member > PG_INT64_MAX)
+		ereport(ERROR,
+				(errmsg("checkpoint multixact member offset " UINT64_FORMAT
+						" exceeds the SQL bigint bootstrap limit",
+						(uint64) next_member)));
+	h->next_member = (int64) next_member;
+	if (h->oldest_multi == h->next_multi)
+		h->oldest_member = h->next_member;
+	else
+	{
+		int64		pageno = h->oldest_multi / PS_MXOFF_PER_PAGE;
+		int		entryno = h->oldest_multi % PS_MXOFF_PER_PAGE;
+		char	   *page = palloc(BLCKSZ);
+		MultiXactOffset oldest_member;
+
+		if (!ps_mxoff_reconstruct(page, pageno, base, target))
+			ereport(ERROR,
+					(errmsg("checkpoint oldest multixact %u was truncated at the checkpoint redo",
+							h->oldest_multi)));
+		memcpy(&oldest_member,
+			   page + (Size) entryno * sizeof(MultiXactOffset),
+			   sizeof(MultiXactOffset));
+		pfree(page);
+		/* Zero is an uninitialized offset slot, never a created multixact. */
+		if (oldest_member == 0 || oldest_member > PG_INT64_MAX)
+			ereport(ERROR,
+					(errmsg("checkpoint oldest multixact %u has no usable member offset",
+							h->oldest_multi)));
+		h->oldest_member = (int64) oldest_member;
+	}
+	if (h->oldest_member > h->next_member)
+		ereport(ERROR,
+				(errmsg("checkpoint has invalid multixact member horizons [%lld, %lld)",
+						(long long) h->oldest_member,
+						(long long) h->next_member)));
+}
+
+/*
+ * Return the exact R/E pair for the local writer's current checkpoint, but
+ * only after proving that the same checkpoint and its admission fence are
+ * durable in the store.  The serialized branch controller calls this after a
+ * clean stop/restart: the shutdown checkpoint is therefore the first control
+ * state selected after all public clients have drained.  pg_current_wal_lsn()
+ * cannot substitute for E because startup can advance WAL beyond the
+ * checkpoint record without changing its control identity.
+ */
+PG_FUNCTION_INFO_V1(pagestore_branch_checkpoint);
+Datum
+pagestore_branch_checkpoint(PG_FUNCTION_ARGS)
+{
+	ControlFileData *local;
+	ControlFileData mirrored;
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	bool		crc_ok;
+	XLogRecPtr	redo;
+	XLogRecPtr	end;
+	uint64		read_seq;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to select a pagestore branch checkpoint")));
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore branch checkpoint selection requires a writer")));
+	if (strcmp(pagestore_backend_name ? pagestore_backend_name : "", "localsvc") != 0)
+		ereport(ERROR, (errmsg("pagestore.backend must be 'localsvc'")));
+
+	local = get_controlfile(DataDir, &crc_ok);
+	if (!crc_ok)
+		ereport(ERROR, (errmsg("local pg_control has an invalid CRC")));
+	redo = local->checkPointCopy.redo;
+	if (XLogRecPtrIsInvalid(redo) ||
+		!ps_control_asof_timeout(redo, &mirrored,
+							 PAGESTORE_READER_HORIZON_TIMEOUT_MS) ||
+		mirrored.checkPointCopy.redo != redo ||
+		mirrored.checkPoint != local->checkPoint ||
+		mirrored.system_identifier != local->system_identifier ||
+		!ps_checkpoint_matches_control(&mirrored.checkPointCopy,
+								   &local->checkPointCopy))
+		ereport(ERROR,
+				(errmsg("current writer checkpoint is not exactly mirrored"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+						   LSN_FORMAT_ARGS(redo))));
+	if (!pagestore_localsvc_read_fence_timeout(
+			(uint64) redo, &read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+		ereport(ERROR,
+				(errmsg("current writer checkpoint has no matching durable admission fence"),
+				 errdetail("Requested checkpoint redo is %X/%08X.",
+						   LSN_FORMAT_ARGS(redo))));
+	pagestore_localsvc_store_sync_timeout(PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+	end = ps_checkpoint_record_end(mirrored.checkPoint,
+								&mirrored.checkPointCopy);
+	pfree(local);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	tupdesc = BlessTupleDesc(tupdesc);
+	values[0] = LSNGetDatum(redo);
+	values[1] = LSNGetDatum(end);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+static int64
+pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
+							  int32 parent_tl, XLogRecPtr base,
+							  XLogRecPtr target,
+							  TransactionId oldest_xid,
+							  TransactionId next_xid,
+							  TransactionId oldest_commit_ts_xid,
+							  TransactionId next_commit_ts_xid,
+							  MultiXactId oldest_multi,
+							  MultiXactId next_multi,
+							  int64 oldest_member, int64 next_member)
+{
 	int64		seeded;
 	char		manifest_path[MAXPGPATH];
 	int			pathlen;
@@ -9393,7 +10558,7 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	{
 		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
 										 (uint64) target);
-		PG_RETURN_INT64(seeded);
+		return seeded;
 	}
 
 	/*
@@ -9443,6 +10608,168 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 									oldest_member, next_member,
 									seeded);
 
+	return seeded;
+}
+
+/*
+ * pagestore_prepare_branch(target_dir text, new_timeline int, parent_timeline int,
+ *                          base pg_lsn, target pg_lsn,
+ *                          oldest_xid xid, next_xid xid,
+ *                          oldest_commit_ts_xid xid, next_commit_ts_xid xid,
+ *                          oldest_multi xid, next_multi xid,
+ *                          oldest_member bigint, next_member bigint)
+ * returns bigint
+ *
+ * Legacy expert entrypoint.  Keep its ABI for existing operators and tests;
+ * new control-plane callers should use pagestore_prepare_branch_from_control.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch);
+Datum
+pagestore_prepare_branch(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	target = PG_GETARG_LSN(4);
+	int64		seeded;
+	char		bootstrap_path[MAXPGPATH];
+	int			pathlen;
+
+	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
+											base, target,
+											PG_GETARG_TRANSACTIONID(5),
+											PG_GETARG_TRANSACTIONID(6),
+											PG_GETARG_TRANSACTIONID(7),
+											PG_GETARG_TRANSACTIONID(8),
+											PG_GETARG_TRANSACTIONID(9),
+											PG_GETARG_TRANSACTIONID(10),
+											PG_GETARG_INT64(11),
+											PG_GETARG_INT64(12));
+
+	/* The expert ABI does not produce the catalog/control-bound artifact. */
+	pathlen = snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s",
+					   target_dir, PAGESTORE_BRANCH_BOOTSTRAP_FILE);
+	PS_CHECK_PATH_FORMAT(pathlen, bootstrap_path);
+	if (unlink(bootstrap_path) == 0)
+		fsync_fname(target_dir, true);
+	else if (errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale branch bootstrap artifact \"%s\": %m",
+						bootstrap_path)));
+	PG_RETURN_INT64(seeded);
+}
+
+/*
+ * pagestore_prepare_branch_from_control(target_dir text, new_timeline int,
+ *                                       parent_timeline int, base pg_lsn,
+ *                                       checkpoint_redo pg_lsn,
+ *                                       fork_lsn pg_lsn) returns bigint
+ *
+ * Control-derived entrypoint: the caller supplies the proven exact base
+ * snapshot cutoff C, a durably mirrored checkpoint redo R, and a materialized
+ * fork boundary L which covers that completed checkpoint.  XID,
+ * commit-ts, multixact-ID and member-offset horizons all come from that same
+ * checkpoint/control state at R; the store branch is cut at L, where no
+ * admission-sequence tie remains.  Retrying the operation is idempotent
+ * through the same prepared-manifest and CREATE_BRANCH checks as the legacy
+ * entrypoint.  The control plane must keep the parent quiescent between the
+ * selected checkpoint and L; automatically establishing that quiesce together
+ * with the proven base snapshot is the remaining producer-side protocol.
+ */
+PG_FUNCTION_INFO_V1(pagestore_prepare_branch_from_control);
+Datum
+pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
+{
+	char	   *target_dir = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		new_tl = PG_GETARG_INT32(1);
+	int32		parent_tl = PG_GETARG_INT32(2);
+	XLogRecPtr	base = PG_GETARG_LSN(3);
+	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
+	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
+	XLogRecPtr	materialized;
+	PagestoreBranchHorizons h;
+	int64		seeded;
+	char		bootstrap_path[MAXPGPATH];
+	PagestoreBranchBootstrapHeader *existing_header;
+	char	   *existing;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to prepare a branch")));
+	if (new_tl <= 0 || parent_tl < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid branch timeline identity")));
+	if ((uint32) parent_tl != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
+						parent_tl, pagestore_localsvc_timeline())));
+	pagestore_branch_horizons_from_control(base, checkpoint_redo, &h);
+	if (fork_lsn < h.checkpoint_end_lsn)
+		ereport(ERROR,
+				(errmsg("branch fork LSN does not cover the selected checkpoint"),
+				 errdetail("Fork %X/%08X precedes checkpoint record end %X/%08X.",
+							   LSN_FORMAT_ARGS(fork_lsn),
+							   LSN_FORMAT_ARGS(h.checkpoint_end_lsn))));
+	/*
+	 * The declared materializer can only fork at a restartpoint marker: that is
+	 * the point through which its replayed relation pages are durable.  Other
+	 * direct-write computes synchronously persist each routed page, including
+	 * pages whose WAL record is still in the current unarchived segment.  They
+	 * therefore need no materializer-watermark bound.
+	 */
+	if (pagestore_materializer)
+	{
+		materialized = pagestore_materialized_wal_lsn_internal();
+		if (fork_lsn > materialized)
+			ereport(ERROR,
+					(errmsg("branch fork LSN exceeds the durable materialized horizon"),
+					 errdetail("Fork %X/%08X exceeds materialized horizon %X/%08X.",
+							   LSN_FORMAT_ARGS(fork_lsn),
+							   LSN_FORMAT_ARGS(materialized))));
+	}
+
+	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
+											base, fork_lsn,
+											h.oldest_xid, h.next_xid,
+											h.oldest_commit_ts_xid,
+											h.next_commit_ts_xid,
+											h.oldest_multi, h.next_multi,
+											h.oldest_member, h.next_member);
+	/*
+	 * The portable artifact is its own readiness marker in the prepared dir.
+	 * Publish it only after the SLRU manifest exists, and bind its checksum to
+	 * that exact manifest.  The target installer still publishes the ordinary
+	 * branch manifest last.
+	 */
+	if (snprintf(bootstrap_path, sizeof(bootstrap_path), "%s/%s", target_dir,
+				 PAGESTORE_BRANCH_BOOTSTRAP_FILE) >= (int) sizeof(bootstrap_path))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch bootstrap path is too long")));
+	if (access(bootstrap_path, F_OK) == 0)
+	{
+		/* A retry must retain the relation maps captured at the original fork;
+		 * recapturing live parent maps can name filenodes absent on the child. */
+		existing = pagestore_load_branch_bootstrap(target_dir, new_tl,
+			parent_tl, checkpoint_redo, h.checkpoint_end_lsn, fork_lsn,
+			&existing_header);
+
+		pfree(existing);
+	}
+	else if (errno == ENOENT)
+		pagestore_write_branch_bootstrap(target_dir, new_tl, parent_tl,
+									checkpoint_redo,
+									h.checkpoint_end_lsn, fork_lsn,
+									h.system_identifier);
+	else
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not inspect branch bootstrap artifact \"%s\": %m",
+						bootstrap_path)));
 	PG_RETURN_INT64(seeded);
 }
 

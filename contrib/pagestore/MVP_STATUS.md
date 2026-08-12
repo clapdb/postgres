@@ -5,7 +5,7 @@ documents in this directory describe subsystem designs and longer-term target
 architecture; their future-looking sections do not by themselves define MVP
 scope or completion.
 
-Status below includes work through the managed materializer harness runtime.
+Status below includes work through the durable retention-horizon registry.
 
 ## MVP scope
 
@@ -33,10 +33,11 @@ work and must not expand the MVP critical path.
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Implemented | integration and branch tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
-| Continuous recovery materializer | Topology and harness-managed lifecycle proven | `continuous_redo_demo.sh`; `materializer_smoke` provisioning, durable progress, and crash replacement |
+| Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
-| `pg_control` and branch SLRU bootstrap | Implemented | prepared branch install and fail-closed startup validation |
+| `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
+| Retention horizon authority | Durable registry and unified floor implemented; reclaim consumers remaining | restart/corruption tests for explicit owners, branch projection, control-WAL floors, and bounded log replay |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 
@@ -47,12 +48,14 @@ The existing CI proves both focused subsystem paths and the composed contract:
 - `wal_only_redo_demo.sh` proves non-redundant WAL ingest;
 - `continuous_redo_demo.sh` proves a live writer and materializer following new
   archived WAL, publishing durable progress, and applying lag backpressure;
-- `materializer_lifecycle.jsonl` proves the harness can provision the WAL-only
-  topology, turn writer checkpoints into durable materialized boundaries,
-  replace a crashed worker, and continue following WAL;
+- `materializer_lifecycle.jsonl` proves the installed supervisor exclusively
+  owns a provisioned WAL-only worker, turns writer checkpoints into durable
+  materialized boundaries, replaces a crashed worker, and continues following
+  WAL;
 - `mvp_golden_test.sh` composes WAL-only ingest, durable materialization,
-  prepared branch boot, parent/child isolation, and store/materializer/compute
-  restarts in one topology;
+  a proven recovery-produced SLRU base, portable branch boot from a fresh
+  `initdb` skeleton (no parent PGDATA copy), parent/child isolation, and
+  store/materializer/compute restarts in one topology;
 - `branch_boot_test.sh` proves an independent branch compute can boot, preserve
   fork-point visibility, and write on its own timeline.
 
@@ -74,46 +77,120 @@ WAL-only writer
 The test requires the recovery worker's durable materialized watermark to cover
 an explicit workload checkpoint, uses that watermark as the child fork LSN,
 then materializes a newer parent page and proves the child cannot see it.  It
-also restarts the POSIX store daemon, writer, materializer, and branch compute.
-The scenario is wired into CI and is the stable end-to-end MVP contract.
+also builds the child from a fresh same-build `initdb` skeleton, restores exact
+checkpoint control, installs the prepared portable catalog/SLRU artifact,
+recovers WAL from the store, promotes, and restarts the POSIX store daemon,
+writer, materializer, and branch compute.  No stopped-parent PGDATA copy is in
+the golden path.  The scenario is wired into CI and is the stable end-to-end
+MVP contract.
 
-### 2. Managed materializer lifecycle -- partial
+### 2. Managed materializer lifecycle -- implemented for local POSIX
 
-The `materializer_smoke` runtime now owns the executable lifecycle contract: it
-creates a WAL-only writer and recovery worker, checks the declared recovery
-role, archives each writer checkpoint, drives a restartpoint until the durable
-marker covers that boundary, records worker generations, and replaces a worker
-after an immediate compute crash.  The replacement then materializes later WAL
-and the writer observes zero lag.
+`pagestore_materializer_supervisor` is a continuously running, stdlib-only
+service process for one provisioned recovery worker.  A nonblocking lock
+anchored in the worker PGDATA fences duplicate owners even when they use
+different status directories.  The supervisor validates the recovery role,
+monitors replay and durable lag, issues a fast restartpoint after replay settles,
+replaces a crashed worker, and applies bounded exponential retry before
+publishing a terminal failure.  Atomic JSON status carries distinct owner
+epochs and worker generations; a replacement supervisor adopts an already
+running healthy worker.
 
-The remaining MVP work is to move this proven policy into a continuously
-running control-plane supervisor with single-owner fencing and bounded retry /
-failure reporting.  The harness remains the acceptance client for that service;
-it is not itself the production controller.
+`materializer_smoke` is now the acceptance client rather than the lifecycle
+implementation.  It proves healthy-worker adoption across supervisor handoff,
+duplicate-owner rejection, automatic durable progress, immediate compute-crash
+replacement, later WAL materialization, and zero writer-observed lag.
+Provisioning the initial PGDATA and registering this foreground process with a
+deployment's service manager remain deployment orchestration, not page-store
+data-path work.
 
-### 3. Safe automatic branch bootstrap -- remaining
+### 3. Safe automatic branch bootstrap -- implemented for local POSIX
 
-The prepared branch protocol is fail-closed, but the current demo still supplies
-the SLRU base cutoff and transaction/multixact horizons explicitly and copies a
-stopped parent data directory.  The MVP path must obtain a proven snapshot
-cutoff, derive bootstrap horizons from the matching control state, and expose an
-idempotent control-plane operation rather than a sequence of expert-only SQL
-calls and filesystem steps.
+`pagestore_capture_slru_snapshot()` now turns a confirmed recovery pause into
+that proven base cutoff.  It requests and waits for a restartpoint, requires
+the durable materializer marker to equal the unchanged paused replay LSN, then
+stages `pg_xact`, commit-ts, and both multixact SLRUs locally.  A second replay
+check prevents a concurrent resume from publishing a mixed image; only then
+does it publish and sync every staged page under the returned cutoff.  The
+golden scenario exercises both its unpaused fail-closed case and the successful
+path, replacing its former writer-side expert snapshot calls.
 
-### 4. Retention-driven space reclamation -- remaining
+`pagestore_prepare_branch_from_control` accepts that proven SLRU base cutoff,
+an exact checkpoint redo, and the materialized fork boundary which covers that
+checkpoint.  It requires the matching durable control admission fence and WAL
+checkpoint record, then derives every XID, commit-ts, multixact-ID, and
+multixact-member horizon from that one control state.  It reconstructs the
+otherwise-unrecorded oldest member offset from the same `(C, R]` window, fails
+closed on a missing or inconsistent bound, cuts the store branch at the
+separate materialized LSN (avoiding exact-R admission-sequence ties), and reuses
+the prepared-manifest/store-branch idempotency protocol.  The legacy expert ABI
+remains available for compatibility.
+
+`pagestore_branch_prepare` now owns that control-plane window.  It takes the
+materializer supervisor's PGDATA lock, rejects a pre-existing replay pause,
+captures the proven base `C`, drains and cleanly stops the public writer, and
+restarts it on an owner-only Unix socket with autonomous writers disabled.  The
+clean stop's shutdown checkpoint is the serialized horizon boundary;
+`pagestore_branch_checkpoint()` admits it only when its exact control image and
+admission fence are durable, and resolves the checkpoint record's true end `E`
+from WAL.  The controller completes and archives that segment, waits for the
+materializer through `E`, pauses it again, captures the durable fork `L`, and
+prepares maps, SLRUs, and the store branch before resuming the materializer and
+restoring the normal writer.  An atomic JSON receipt records `C/R/E/L`, archive
+coverage, seeded page count, and whether service restoration completed.
+
+The same prepare now captures every default-tablespace database relation map
+plus the global map under `RelationMappingLock` into one CRC-protected
+`pagestore_branch.bootstrap`.  Its header binds the system identifier, logical
+ancestry, exact checkpoint redo `R`, checkpoint-record end `E`, materialized
+fork `L`, topology flags, map count, and the exact prepared SLRU manifest.  After
+a fresh same-build `initdb`,
+`pagestore_control_restore --archive-bootstrap --lsn R` restores exact control
+and forces archive recovery without forging shutdown state or checkpoint WAL.
+`pagestore_install_prepared_branch_bootstrap` validates that control against the
+artifact, installs maps and SLRUs, and publishes the ordinary branch manifest
+last.  With foreign initdb WAL removed, recovery fetches the real checkpoint
+record and subsequent WAL from the store through `E`, promotes, and continues
+on the already-cut page-store branch at `L`.  The golden scenario proves this
+path without reading any artifact from the stopped parent.
+
+Portable bootstrap currently fails explicitly when the source or target has a
+user-tablespace topology; encoding those paths is outside the default-
+tablespace local MVP format rather than being silently guessed.  The local
+controller also assumes it owns the writer service lifecycle for the operation:
+an outer service manager must not independently restart the writer, while the
+shared materializer lock mechanically excludes its supervisor.  The live SLRU
+watermark still cannot substitute for the proven capture API: its newest-image
+contract deliberately permits bytes newer than its completeness floor and is
+therefore unsafe as an exact branch seed.
+
+### 4. Retention-driven space reclamation -- registry implemented, consumers remaining
 
 Segment GC removes page-log segments covered by image layers, but long-running
-logical history is not yet bounded.  The MVP needs one retained-horizon model
-covering active readers, branch fork points, restorable control images, and the
-materializer.  That horizon must drive:
+logical history is not yet bounded.  `retention.meta` is now the durable,
+CRC-protected owner registry for reader, materializer, and configured pins.
+Each pin carries a resource mask for page history, shipped WAL, and the WAL
+index; updates replace a stable `(timeline, owner kind, owner id)` generation,
+drops are idempotent, enumeration is available over IPC, and churn is compacted
+off the request path.  Recovery truncates only an incomplete final record and
+fails closed on any complete corrupt record or a pin whose timeline is absent.
+
+The effective-floor query projects explicit descendant pins through every
+branch cap, derives permanent fork-point pins from timeline metadata rather
+than duplicating them, and folds every branch-visible restorable control image
+into the WAL resource.  Page pruning, WAL reclaim, and WAL-index reclaim can
+therefore consume one authority.  Still required for the gate:
 
 - version pruning during image-layer compaction;
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
 - timeline deletion and its layer/WAL cleanup.
 
-Until this gate lands, correctness demos run but disk use can grow without
-bound.
+The reader/materializer controllers must also register and release their owner
+generations before those reclaimers are enabled.  The `timelines` log now uses
+CRC-protected records, rejects truncated or corrupt entries, and atomically
+migrates complete legacy logs before opening the store.  Until the consumers and
+registrations land, correctness demos run but disk use can grow without bound.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
 
@@ -127,12 +204,10 @@ retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
 Keep the composed WAL-only -> materializer -> branch scenario green as the MVP
 acceptance contract.  The implementation sequence for the remaining gates is:
 
-1. Promote the harness-proven materializer policy into a continuously running,
-   ownership-fenced control-plane supervisor.
-2. Automate proven-cutoff branch preparation and bootstrap inputs.
-3. Add the retained-horizon registry, then reclaim image history, WAL, WAL index,
-   and deleted timelines.
-4. Promote the golden scenario into the declarative crash/compatibility harness.
+1. Wire reader/materializer owner generations into the retained-horizon registry,
+   then reclaim image history,
+   WAL, WAL index, and deleted timelines.
+2. Promote the golden scenario into the declarative crash/compatibility harness.
 
 Performance refinements such as size-tiered compaction, layer key-range pruning,
 bloom filters, per-shard layer maps, asynchronous POSIX I/O, and explicit

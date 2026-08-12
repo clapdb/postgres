@@ -23,7 +23,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from xml.sax.saxutils import escape
 
 
@@ -1232,10 +1232,10 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
 
 def run_materializer_smoke(
     plan: Plan, capabilities: dict[str, Any], schema: dict[str, Any],
-    daemon: Path, inspector: Path, build: Path, requested_root: Path | None,
-    keep: bool,
+    daemon: Path, inspector: Path, supervisor: Path, build: Path,
+    requested_root: Path | None, keep: bool,
 ) -> Path:
-    """Provision and supervise a WAL-only writer/materializer pair."""
+    """Provision a WAL-only pair and exercise its materializer supervisor."""
     pg_bin = find_pg_bin(build)
     postgres_major = validate_postgres_runtime(pg_bin / "postgres", capabilities)
     if postgres_major < 15:
@@ -1252,16 +1252,18 @@ def run_materializer_smoke(
     walrestore = pagestore_build_program(build, "pagestore_walrestore").resolve()
     importer = pagestore_build_program(build, "pagestore_import")
     root, temporary = run_root(requested_root)
+    root = root.resolve()
     trace = root / "trace"
     store = root / "store"
     writer_data = root / "computes" / "writer"
     materializer_data = root / "computes" / "materializer"
     writer_socket = root / "socket" / "writer"
     materializer_socket = root / "socket" / "materializer"
+    supervisor_state = root / "control" / "materializer"
     artifacts = root / "artifacts" / "checkpoints"
     for path in (
         trace, store, writer_data, materializer_data, writer_socket,
-        materializer_socket, artifacts,
+        materializer_socket, supervisor_state, artifacts,
     ):
         path.mkdir(parents=True, exist_ok=True)
     shutil.copy2(plan.path, root / "plan.jsonl")
@@ -1276,6 +1278,7 @@ def run_materializer_smoke(
     install = pg_bin.parent
     env["LD_LIBRARY_PATH"] = f"{install / 'lib'}:{install / 'lib64'}"
     dproc: subprocess.Popen[str] | None = None
+    supervisor_proc: subprocess.Popen[str] | None = None
     materializer_generation = 0
 
     def sql_result(socket_dir: Path, port: int, sql: str) -> subprocess.CompletedProcess[str]:
@@ -1306,44 +1309,53 @@ def run_materializer_smoke(
             time.sleep(.1)
         raise PlanError(f"{context}: got {last!r}, expected {expected!r}")
 
-    def start_materializer(reason: str) -> None:
-        nonlocal materializer_generation
-        subprocess.run(
-            [
-                str(pg_bin / "pg_ctl"), "-D", str(materializer_data), "-l",
-                str(trace / "materializer.log"), "-w", "start",
-            ],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        materializer_generation += 1
-        wait_scalar(
-            materializer_socket, materializer_port,
-            "SELECT pg_is_in_recovery() AND "
-            "current_setting('pagestore.materializer')::boolean",
-            "t", "materializer did not enter its declared recovery role",
-        )
-        events.emit(
-            "process_start", target="materializer",
-            generation=materializer_generation, reason=reason,
-        )
-        events.emit(
-            "ready", target="materializer", generation=materializer_generation,
-            port=materializer_port,
-        )
+    def read_supervisor_status() -> dict[str, Any]:
+        try:
+            value = json.loads(
+                (supervisor_state / "status.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
-    def stop_materializer(mode: str, reason: str) -> None:
+    def wait_supervisor_status(
+        predicate: Callable[[dict[str, Any]], bool], context: str,
+        timeout: float = 40,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            if supervisor_proc is not None and supervisor_proc.poll() is not None:
+                raise PlanError(
+                    f"{context}: supervisor exited with status "
+                    f"{supervisor_proc.returncode}"
+                )
+            last = read_supervisor_status()
+            if predicate(last):
+                return last
+            time.sleep(.05)
+        raise PlanError(f"{context}: last supervisor status {last!r}")
+
+    def sync_materializer_generation(status: dict[str, Any]) -> int:
+        nonlocal materializer_generation
+        generation = status.get("worker_generation")
+        if not isinstance(generation, int) or generation <= 0:
+            raise PlanError(f"invalid supervisor worker generation: {status!r}")
+        materializer_generation = generation
+        return generation
+
+    def crash_materializer(reason: str) -> None:
         subprocess.run(
             [
                 str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
-                "-m", mode, "-w", "stop",
+                "-m", "immediate", "-W", "stop",
             ],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env,
         )
         events.emit(
             "process_stop", target="materializer",
-            generation=materializer_generation, mode=mode, reason=reason,
+            generation=materializer_generation, mode="immediate", reason=reason,
         )
 
     def archive_current_wal() -> str:
@@ -1373,14 +1385,21 @@ def run_materializer_smoke(
             f"SELECT pg_last_wal_replay_lsn() >= '{checkpoint_lsn}'::pg_lsn",
             "t", f"materializer did not replay checkpoint {checkpoint_lsn}",
         )
-        stop_materializer("fast", f"publish {action['name']}")
-        start_materializer(f"restartpoint policy for {action['name']}")
         wait_scalar(
             materializer_socket, materializer_port,
             f"SELECT pagestore_materialized_wal_lsn() >= "
             f"'{checkpoint_lsn}'::pg_lsn",
             "t", f"materializer marker did not cover checkpoint {checkpoint_lsn}",
         )
+        supervisor_status = wait_supervisor_status(
+            lambda status: (
+                status.get("state") == "running"
+                and isinstance(status.get("progress"), dict)
+                and status["progress"].get("lag_bytes") == 0
+            ),
+            f"supervisor did not publish zero lag for {action['name']}",
+        )
+        sync_materializer_generation(supervisor_status)
         status = sql_scalar(
             writer_socket, writer_port,
             "SELECT row(shipped_wal_lsn::text, materialized_wal_lsn::text, "
@@ -1509,7 +1528,134 @@ def run_materializer_smoke(
         for wal_path in (materializer_data / "pg_wal").glob("0000000*"):
             if wal_path.is_file():
                 wal_path.unlink()
-        start_materializer("provisioned")
+        supervisor_config = root / "materializer-supervisor.json"
+        supervisor_config.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "pg_ctl": str(pg_bin / "pg_ctl"),
+                    "psql": str(pg_bin / "psql"),
+                    "data_dir": str(materializer_data),
+                    "socket_dir": str(materializer_socket),
+                    "port": materializer_port,
+                    "log_file": str(trace / "materializer.log"),
+                    "state_dir": str(supervisor_state),
+                    "poll_interval_ms": 100,
+                    "replay_idle_ms": 300,
+                    "progress_timeout_ms": 10000,
+                    "retry_initial_ms": 50,
+                    "retry_max_ms": 1000,
+                    "max_consecutive_failures": 5,
+                },
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        with (trace / "materializer-supervisor.log").open(
+            "w", encoding="utf-8"
+        ) as log:
+            supervisor_proc = subprocess.Popen(
+                [
+                    sys.executable, str(supervisor),
+                    "--config", str(supervisor_config),
+                ],
+                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+        supervisor_status = wait_supervisor_status(
+            lambda status: (
+                status.get("owner_pid") == supervisor_proc.pid
+                and status.get("state")
+                in {"running", "waiting_for_progress_api"}
+            ),
+            "materializer supervisor did not start its worker",
+        )
+        sync_materializer_generation(supervisor_status)
+        wait_scalar(
+            materializer_socket, materializer_port,
+            "SELECT pg_is_in_recovery() AND "
+            "current_setting('pagestore.materializer')::boolean",
+            "t", "materializer did not enter its declared recovery role",
+        )
+        events.emit(
+            "process_start", target="materializer",
+            generation=materializer_generation, reason="supervisor provisioned",
+        )
+        events.emit(
+            "ready", target="materializer", generation=materializer_generation,
+            port=materializer_port,
+        )
+        initial_owner_pid = supervisor_proc.pid
+        initial_owner_epoch = supervisor_status["owner_epoch"]
+        initial_worker_pid = int(
+            (materializer_data / "postmaster.pid")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        supervisor_proc.terminate()
+        supervisor_proc.wait(timeout=5)
+        if supervisor_proc.returncode != 0:
+            raise PlanError(
+                "materializer supervisor did not stop cleanly for handoff: "
+                f"status {supervisor_proc.returncode}"
+            )
+        with (trace / "materializer-supervisor-replacement.log").open(
+            "w", encoding="utf-8"
+        ) as log:
+            supervisor_proc = subprocess.Popen(
+                [
+                    sys.executable, str(supervisor),
+                    "--config", str(supervisor_config),
+                ],
+                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+            )
+        supervisor_status = wait_supervisor_status(
+            lambda status: (
+                status.get("owner_pid") == supervisor_proc.pid
+                and status.get("owner_epoch", 0) > initial_owner_epoch
+                and status.get("worker_generation") == materializer_generation
+                and status.get("state")
+                in {"running", "waiting_for_progress_api"}
+            ),
+            "replacement supervisor did not adopt the running worker",
+        )
+        adopted_worker_pid = int(
+            (materializer_data / "postmaster.pid")
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        if adopted_worker_pid != initial_worker_pid:
+            raise PlanError(
+                "supervisor handoff restarted the healthy materializer: "
+                f"worker {initial_worker_pid} became {adopted_worker_pid}"
+            )
+        events.emit(
+            "supervisor_replacement", target="materializer-supervisor",
+            previous_owner_pid=initial_owner_pid,
+            owner_pid=supervisor_proc.pid,
+            owner_epoch=supervisor_status["owner_epoch"],
+            adopted_generation=materializer_generation,
+        )
+        duplicate = subprocess.run(
+            [
+                sys.executable, str(supervisor),
+                "--config", str(supervisor_config),
+            ],
+            check=False, capture_output=True, encoding="utf-8", env=env,
+            timeout=10,
+        )
+        (trace / "duplicate-supervisor.log").write_text(
+            duplicate.stdout + duplicate.stderr, encoding="utf-8"
+        )
+        if duplicate.returncode != 75:
+            raise PlanError(
+                "duplicate materializer supervisor was not fenced: "
+                f"status {duplicate.returncode}"
+            )
+        events.emit(
+            "ownership_fenced", target="materializer-supervisor",
+            owner_pid=supervisor_proc.pid, duplicate_status=duplicate.returncode,
+        )
         # Install after the worker base is taken: route_all recovery must replay
         # the extension catalog into the store instead of relying on a local
         # catalog copy that the WAL-only topology cannot keep authoritative.
@@ -1543,12 +1689,27 @@ def run_materializer_smoke(
                 )
             elif action["op"] == "crash":
                 crashed_generation = materializer_generation
-                stop_materializer("immediate", action["id"])
+                crash_materializer(action["id"])
                 events.emit(
                     "crash", id=action["id"], target="materializer",
                     model="compute", generation=crashed_generation,
                 )
-                start_materializer(f"replacement after {action['id']}")
+                supervisor_status = wait_supervisor_status(
+                    lambda status: (
+                        isinstance(status.get("worker_generation"), int)
+                        and status["worker_generation"] > crashed_generation
+                        and status.get("state")
+                        in {"running", "waiting_for_progress_api"}
+                    ),
+                    f"supervisor did not replace worker after {action['id']}",
+                )
+                sync_materializer_generation(supervisor_status)
+                wait_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT pg_is_in_recovery() AND "
+                    "current_setting('pagestore.materializer')::boolean",
+                    "t", "replacement materializer did not become healthy",
+                )
                 events.emit(
                     "replacement", id=action["id"], target="materializer",
                     crashed_generation=crashed_generation,
@@ -1603,6 +1764,13 @@ def run_materializer_smoke(
             f"materializer smoke failed; failure bundle: {root}: {error}"
         ) from error
     finally:
+        if supervisor_proc is not None and supervisor_proc.poll() is None:
+            supervisor_proc.terminate()
+            try:
+                supervisor_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                supervisor_proc.kill()
+                supervisor_proc.wait(timeout=5)
         if (materializer_data / "postmaster.pid").exists():
             subprocess.run(
                 [
@@ -1660,6 +1828,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--legacy-integration", action="store_true")
     parser.add_argument("--daemon-binary", type=Path)
+    parser.add_argument("--materializer-supervisor", type=Path)
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--integration-script", type=Path,
                         default=Path(__file__).resolve().parents[1] / "integration_test.sh")
@@ -1679,11 +1848,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.materializer_smoke and (
         args.daemon_binary is None
         or args.inspect_binary is None
+        or args.materializer_supervisor is None
         or args.build_dir is None
     ):
         parser.error(
-            "--materializer-smoke requires --build-dir, --daemon-binary "
-            "and --inspect-binary"
+            "--materializer-smoke requires --build-dir, --daemon-binary, "
+            "--inspect-binary and --materializer-supervisor"
         )
     if args.legacy_integration and args.build_dir is None:
         parser.error("--legacy-integration requires --build-dir")
@@ -1736,7 +1906,8 @@ def main(argv: list[str] | None = None) -> int:
             schema = read_inspection_schema(schema_path, capabilities)
             root = run_materializer_smoke(
                 plan, capabilities, schema, args.daemon_binary,
-                args.inspect_binary, args.build_dir, args.run_root, args.keep,
+                args.inspect_binary, args.materializer_supervisor,
+                args.build_dir, args.run_root, args.keep,
             )
             if args.keep or args.run_root:
                 print(root)

@@ -24,15 +24,37 @@ contrib_targets += pagestore
 install_data(
   'pagestore.control',
   'pagestore--1.0.sql',
+  'pagestore--1.0--1.1.sql',
+  'pagestore--1.1.sql',
   kwargs: contrib_data_args,
 )
+
+if host_system != 'windows'
+  # The recovery worker is an ordinary PostgreSQL process; this small
+  # stdlib-only POSIX control-plane process owns its lifecycle and publishes
+  # machine-readable state.
+  install_data(
+    'pagestore_materializer_supervisor.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_materializer_supervisor',
+  )
+  # This one-shot controller owns the writer/materializer correctness window
+  # while selecting and preparing a branch boundary.
+  install_data(
+    'pagestore_branch_prepare.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_branch_prepare',
+  )
+endif
 
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
-        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_retention.c'),
   dependencies: [dependency('threads')],
   kwargs: default_bin_args,
 )
@@ -121,7 +143,7 @@ test('pagestore_layer_store',
 pagestore_tiering_test = executable('pagestore_tiering_test',
   files('pagestore_tiering_test.c', 'pagestore_core.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
-        'pagestore_memtable.c', 'pagestore_pgcache.c'),
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_retention.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
@@ -139,6 +161,18 @@ pagestore_manifest_test = executable('pagestore_manifest_test',
 )
 test('pagestore_manifest',
   pagestore_manifest_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
+# Unit test for durable retention pins, replay and churn compaction.
+pagestore_retention_test = executable('pagestore_retention_test',
+  files('pagestore_retention_test.c', 'pagestore_retention.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_retention',
+  pagestore_retention_test,
   suite: ['pagestore'],
   timeout: 60,
 )
@@ -176,6 +210,20 @@ test('pagestore_harness_plan',
   suite: ['pagestore'],
   timeout: 30,
 )
+if host_system != 'windows'
+  test('pagestore_materializer_supervisor',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_materializer_supervisor.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+  test('pagestore_branch_prepare',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_branch_prepare.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endif
 test('pagestore_harness_reader_visibility_plan',
   pagestore_harness_python,
   args: [files('harness/pagestore_harness.py'),

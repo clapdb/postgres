@@ -112,6 +112,8 @@ extern void ps_unlock_shard(uint32_t shard);
 extern void ps_lock_map_rd(void);
 extern void ps_lock_map_wr(void);
 extern void ps_unlock_map(void);
+/* Caller holds map_lock.  Definitions are append-only during an open. */
+extern int ps_timeline_defined(uint32_t timeline);
 
 /* Shard index that will be touched for 'key' (klass-aware); the frontend takes
  * the per-shard lock from the final request key, not a client-supplied shard. */
