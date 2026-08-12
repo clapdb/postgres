@@ -6814,6 +6814,30 @@ pagestore_latest_reader_snapshot_ready(void)
 }
 
 static bool
+pagestore_reader_snapshot_ready_at(XLogRecPtr read_lsn)
+{
+	PagestoreReaderSnapshotReady ready;
+	PagestoreReaderSnapshotReady checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		return false;
+	memcpy(&ready, page, sizeof(ready));
+	checked = ready;
+	pagestore_reader_snapshot_ready_crc(&checked);
+	return ready.header.magic == PAGESTORE_READER_SNAPSHOT_MAGIC &&
+		ready.header.format == PAGESTORE_READER_SNAPSHOT_FORMAT &&
+		ready.header.timeline == pagestore_localsvc_timeline() &&
+		ready.header.read_lsn == read_lsn && ready.block_count != 0 &&
+		ready.reserved == 0 && EQ_CRC32C(ready.crc, checked.crc);
+}
+
+static bool
 pagestore_reader_database_dir_valid(const char *mapdir, Oid dboid,
 									XLogRecPtr read_lsn, pg_crc32c global_crc)
 {
@@ -10079,6 +10103,7 @@ pagestore_validate_datadir_branch_manifest(void)
 	XLogRecPtr	reader_fork_lsn;
 	uint64		read_lsn;
 	uint64		read_seq = 0;
+	uint64		pin_lsn;
 	bool		found;
 	uint8		retention_status;
 	PsRetentionPin existing_pin;
@@ -10216,12 +10241,23 @@ pagestore_validate_datadir_branch_manifest(void)
 						(errmsg("pagestore reader could not install its provisional retention owner")));
 			provisional_reader_pin = true;
 		}
-		if (!pagestore_localsvc_read_fence_timeout(read_lsn, &read_seq,
+		/* An advancing reader may restart from an older boot image after its
+		 * durable owner already moved forward.  Resolve (or reuse) that newer
+		 * frontier; reclaimed boot-image fence history is no longer required. */
+		pin_lsn = read_lsn;
+		if (have_existing_pin && pagestore_advance_read_lsn &&
+			existing_pin.lsn > read_lsn)
+		{
+			pin_lsn = existing_pin.lsn;
+			read_seq = existing_pin.admission_seq;
+		}
+		if (read_seq == 0 &&
+			!pagestore_localsvc_read_fence_timeout(pin_lsn, &read_seq,
 				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
 			ereport(FATAL,
-					(errmsg("pagestore reader has no durable admission fence at its configured horizon")));
+					(errmsg("pagestore reader has no durable admission fence at its retained horizon")));
 		set_reader_pin = provisional_reader_pin ||
-			(have_existing_pin && existing_pin.lsn == read_lsn &&
+			(have_existing_pin && existing_pin.lsn == pin_lsn &&
 			 existing_pin.admission_seq != read_seq);
 		if (set_reader_pin)
 		{
@@ -10229,7 +10265,7 @@ pagestore_validate_datadir_branch_manifest(void)
 				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
 				pagestore_retention_owner_id,
 				pagestore_retention_owner_generation,
-				PS_READER_RETENTION_RESOURCES, read_lsn,
+				PS_READER_RETENTION_RESOURCES, pin_lsn,
 				read_seq,
 				PS_READER_RETENTION_TIMEOUT_MS);
 			if (retention_status == PS_STATUS_STALE)
@@ -11794,11 +11830,26 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		PG_TRY();
 		{
 			databases = pagestore_reader_artifact_databases();
-			barrier_lsn = pagestore_latest_reader_snapshot_ready();
-			/* LockRelationOid() above prevents membership changes now; page LSNs
-			 * prove the enumerated catalog has not changed since this exact R. */
+			/* Select R only after pg_database membership is locked.  Waiting for
+			 * its exact READY excludes an older checkpoint whose asynchronous
+			 * publication happened to finish after the lock was acquired. */
+			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
+			barrier_lsn = GetRedoRecPtr();
+			for (int wait = 0;
+				 !XLogRecPtrIsInvalid(barrier_lsn) && wait < 300 &&
+				 !pagestore_reader_snapshot_ready_at(barrier_lsn);
+				 wait++)
+			{
+				(void) WaitLatch(MyLatch,
+					WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					100L, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+			/* The lock remains held through per-database publication and barrier
+			 * write, so this catalog set is exactly the set visible at R. */
 			barrier_complete = !XLogRecPtrIsInvalid(barrier_lsn) &&
-				databases != NIL;
+				databases != NIL && pagestore_reader_snapshot_ready_at(barrier_lsn);
 			for (int pass = 0; barrier_complete && pass < 3; pass++)
 			{
 				ListCell *lc;
