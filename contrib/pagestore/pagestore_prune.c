@@ -28,14 +28,14 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 
 	for (uint32_t i = 0; i < n; i++)
 	{
-		if (versions[i].lsn < floor.lsn ||
-			(versions[i].lsn == floor.lsn &&
-			 (floor.admission_seq == 0 || versions[i].admission_seq <=
-			  floor.admission_seq)))
+		if (versions[i].lsn <= floor.lsn &&
+			(floor.admission_seq == 0 || versions[i].admission_seq == 0 ||
+			 versions[i].admission_seq <= floor.admission_seq))
 			base = (int) i;
-		/* An unfenced operational read sees only the last admission at one
-		 * LSN.  Exact reader fences below retain any older variant they need. */
-		else if (i + 1 == n || versions[i + 1].lsn != versions[i].lsn)
+		/* Every tuple outside the admitted frontier remains a legal future
+		 * fence.  Do not collapse same-LSN variants until the durable tuple
+		 * frontier has advanced past them. */
+		else
 		{
 			keep[i] = 1;
 			kept++;
