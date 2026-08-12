@@ -192,6 +192,10 @@ Deliverables:
 - descendant pins projected through each fork cap;
 - structural branch ancestry preserved independently of explicit owners;
 - install-new-before-delete-old manifest transition;
+- durable publication of the full `(LSN, admission_sequence)` page reclamation
+  frontier before any pruned source image layer is marked deleting or removed;
+  recovery must therefore reject a below-frontier SET or branch even after a
+  crash at every replacement/frontier/source-retirement boundary;
 - publication of the replacement to every durability tier represented by its
   sources before deletion begins there (or retention of the old remote copies
   until that publication is durable);
