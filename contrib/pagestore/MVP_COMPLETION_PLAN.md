@@ -104,6 +104,10 @@ Deliverables:
   an accepted SET is visible before a reclaimer can select a conflicting
   cutoff.  The record/recovery format and lifecycle tests preserve the
   sequence through append, enumeration, compaction, and restart.
+- fork metadata shares the page-history reclamation frontier: its compactor
+  advances that same full tuple atomically before retiring events, and every
+  page-history SET is checked against the maximum of page-image and forkmeta
+  progress.  Tests reject SET at/below a forkmeta-only advance.
 
 Acceptance:
 
@@ -231,6 +235,10 @@ Deliverables:
 
 - segmented WAL storage or another agreed crash-safe prefix-reclaim format;
 - persisted base/end metadata with checksum and reopen validation;
+- WAL append and base/end replacement share a cutover lock (or frozen sequence
+  plus durable tail handoff), so an append acknowledged during reclamation is
+  represented exactly once in the replacement metadata or its tail.  Crash
+  tests overlap appends with every metadata publication boundary;
 - append/read across physical segment boundaries and branch ancestry;
 - reclamation driven by the WAL effective floor;
 - a read-lifetime pin/reference for every selected physical WAL segment, with
@@ -362,11 +370,13 @@ Deliverables:
   higher incarnation generation carried by every request and durable record;
   delayed metadata, retention mutations, and requests from an older
   incarnation are rejected;
-- retention owner IDs carry a controller-assigned, monotonically increasing
-  owner incarnation (independent of the per-owner generation).  Authoritative
+- retention owner IDs carry an incarnation token allocated from one named,
+  durable controller allocation domain.  Tokens are globally monotonic within
+  that domain, are carried by every SET/DROP and durable owner record, and are
+  never inferred from a per-owner generation.  Authoritative
   DROP durably closes that incarnation; after every operation admitted under it
   has drained, its generation tombstone may be folded into a bounded durable
-  per-controller allocation frontier even while the timeline remains live.
+  frontier for that allocation domain even while the timeline remains live.
   Reuse requires a higher owner incarnation, and delayed mutations for a folded
   incarnation are rejected by that frontier.  Deleting a timeline incarnation
   may reclaim all of its owner records while retaining the timeline-incarnation
