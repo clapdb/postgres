@@ -200,8 +200,13 @@ class Config:
 
     @property
     def retention_generation_file(self) -> Path:
-        # Generation authority must outlive disposable monitoring/status state.
-        return self.data_dir / ".pagestore-materializer-retention-generation.json"
+        # Controller state must not be copied with a disposable PGDATA clone.
+        return self.state_dir / f"retention-owner-{self.retention_owner_id}.json"
+
+    @property
+    def retention_authority_lock_file(self) -> Path:
+        # Serialize generation allocation across replacement PGDATA trees.
+        return self.state_dir / f"retention-owner-{self.retention_owner_id}.lock"
 
 
 @dataclass(frozen=True)
@@ -727,15 +732,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_config:
             print("ok")
             return 0
-        with OwnerLock(config.lock_file) as owner:
-            supervisor = Supervisor(config)
+        with OwnerLock(config.retention_authority_lock_file):
+            with OwnerLock(config.lock_file) as owner:
+                supervisor = Supervisor(config)
 
-            def request_stop(_signum: int, _frame: object) -> None:
-                supervisor.stop_requested = True
+                def request_stop(_signum: int, _frame: object) -> None:
+                    supervisor.stop_requested = True
 
-            signal.signal(signal.SIGINT, request_stop)
-            signal.signal(signal.SIGTERM, request_stop)
-            return supervisor.run(owner)
+                signal.signal(signal.SIGINT, request_stop)
+                signal.signal(signal.SIGTERM, request_stop)
+                return supervisor.run(owner)
     except OwnershipError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return EX_TEMPFAIL
