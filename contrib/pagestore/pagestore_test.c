@@ -2249,6 +2249,9 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(readback, ps, 100),
 		  "descendant reader floor preserves parent history through nested caps");
 
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2101, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
+		  "branch test installs a replacement operational cutoff");
 	check(op_retention_drop(21, PS_RETENTION_OWNER_READER, 2100, 1) ==
 		  PS_STATUS_OK,
 		  "descendant reader releases its projected page-history floor");
