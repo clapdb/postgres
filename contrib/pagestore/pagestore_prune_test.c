@@ -24,6 +24,7 @@ main(void)
 		{10, 1}, {20, 1}, {20, 2}, {30, 1}, {40, 1}
 	};
 	PsPruneVersion unsorted[] = {{20, 2}, {20, 1}};
+	PsPruneVersion lower_lsn[] = {{10, 1}, {10, 3}, {20, 2}, {20, 3}};
 	PsPruneFence fence[] = {{20, 1}};
 	PsPruneFence zero_fence[] = {{20, 0}};
 	PsPruneFence later_fence[] = {{25, 1}};
@@ -41,8 +42,11 @@ main(void)
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 2}, NULL, 0, keep) == 3 &&
 		  !keep[0] && !keep[1] && keep[2] && keep[3] && keep[4],
 		  "operational tuple collapses versions through its admission sequence");
-	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {10, 0}, NULL, 0, keep) == 4,
-		  "floor at oldest version keeps the newest admission per LSN");
+	check(ps_page_prune_plan(lower_lsn, 4, (PsPruneFence) {15, 1}, NULL, 0,
+							 keep) == 4 && keep[0] && keep[1] && keep[2] && keep[3],
+		  "frontier admission sequence caps lower-LSN base visibility");
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {10, 0}, NULL, 0, keep) == 5,
+		  "floor at oldest version preserves every tuple above it");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 0}, zero_fence, 1, keep) == 2 &&
 		  keep[2] && keep[4],
 		  "a zero-sequence fence has uncapped admission visibility");
