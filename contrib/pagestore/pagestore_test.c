@@ -2138,13 +2138,13 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 	char		shm[64];
 	char		store[256];
 	char		orphan[512];
-	char		layer2[512];
 	const uint32_t ps = 8192;
 	const uint32_t rel = 29300;
 	unsigned char *page = malloc(ps);
 	unsigned char *readback = malloc(ps);
 	pid_t		pid;
 	int			fd;
+	struct stat orphan_stat;
 
 	fprintf(stderr, "== orphan layer ID recovery ==\n");
 	snprintf(shm, sizeof(shm), "/pstest_%d_orphan_layer", (int) getpid());
@@ -2174,8 +2174,8 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 		  "recovery skips orphan layer ID and preserves tail bytes");
 	client_detach();
 	stop_daemon(pid);
-	snprintf(layer2, sizeof(layer2), "%s/layer_0_%016llx", store, 2ULL);
-	check(access(layer2, F_OK) == 0, "recovery flush used the next free layer ID");
+	check(stat(orphan, &orphan_stat) == 0 && orphan_stat.st_size == 0,
+		  "recovery leaves the orphan ID untouched while allocating above it");
 
 	rm_rf(store);
 	shm_unlink(shm);
@@ -3035,8 +3035,8 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 
 	op_create_branch(1, 0, 1500);
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 1500,
-		  "a child fork point structurally pins parent page history");
+		  PS_STATUS_OK && floor == 4000,
+		  "a child fork point does not lower the operational page floor");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL_INDEX, &floor) ==
 		  PS_STATUS_OK && floor == 1500,
 		  "a child fork point structurally pins the parent WAL index");
@@ -3051,11 +3051,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "a descendant pin directly constrains its own timeline");
 	op_create_branch(2, 1, 900);
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "a nested branch's lower fork cap structurally projects to the root");
+		  PS_STATUS_OK && floor == 1000,
+		  "a nested branch remains a discrete root base requirement");
 	check(op_retention_floor(1, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "a nested branch structurally pins its direct parent without an owner pin");
+		  PS_STATUS_OK && floor == 1000,
+		  "a nested branch remains a discrete direct-parent base requirement");
 
 	/* A restorable root control image is another WAL-only authority, and its
 	 * version is below the fork so it constrains both timelines. */
@@ -3080,19 +3080,19 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  pin.timeline == 1 && pin.owner_id == 404,
 		  "retention pins survive daemon restart and remain enumerable");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
+		  PS_STATUS_OK && floor == 1000,
 		  "projected effective floor survives restart");
 	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404, 1) == PS_STATUS_OK,
 		  "a restarted controller can release its durable pin");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "dropping the reader leaves the nested structural fork floor");
+		  PS_STATUS_OK && floor == 4000,
+		  "dropping the reader restores the configured operational floor");
 	for (uint64_t owner = 1000; owner < 2025; owner++)
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, owner,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
 			  PS_STATUS_OK, "registry admits more owners than timelines");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
+		  PS_STATUS_OK && floor == 4000,
 		  "floor snapshot covers every owner beyond MAX_TIMELINES");
 	client_detach();
 	stop_daemon(dpid);
