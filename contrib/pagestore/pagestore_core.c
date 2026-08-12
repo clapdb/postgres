@@ -94,6 +94,10 @@ static volatile int evict_local_state; /* 0 idle, 1 verifying, 2 verified, 3 fai
 static uint32_t evict_local_map_cursor;
 static void page_remove_compacted_versions(uint32_t timeline,
 										   const PsImgRec *recs, uint32_t nrec);
+static int retention_project_lsn(uint32_t descendant, uint32_t target,
+								 uint64_t *lsn);
+static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+								 uint32_t *nfences_out);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -961,7 +965,8 @@ compact_same_page(const CompactOrder *a, const CompactOrder *b)
 }
 
 static int
-prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
+prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
+						 uint64_t floor,
 						 PsImgRec **dropped_out, uint32_t *ndropped_out)
 {
 	CompactOrder *order;
@@ -971,6 +976,11 @@ prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
 	PsImgRec   *dropped;
 	uint32_t	out = 0;
 	uint32_t	ndropped = 0;
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+
+	if (page_prune_fences(timeline, &fences, &nfences) != 0)
+		return -1;
 
 	order = malloc((size_t) *nrec * sizeof(*order));
 	versions = malloc((size_t) *nrec * sizeof(*versions));
@@ -984,6 +994,7 @@ prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
 		free(keep);
 		free(selected);
 		free(dropped);
+		free(fences);
 		return -1;
 	}
 	for (uint32_t i = 0; i < *nrec; i++)
@@ -999,7 +1010,7 @@ prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
 	{
 		uint32_t end = first + 1;
 
-	while (end < *nrec && compact_same_page(&order[first], &order[end]))
+		while (end < *nrec && compact_same_page(&order[first], &order[end]))
 			end++;
 		/* pg_control images and their same-version floor notes are the durable
 		 * authority from which WAL retention is computed.  A page-history floor
@@ -1014,13 +1025,17 @@ prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
 		}
 		for (uint32_t i = first; i < end; i++)
 			versions[i - first] = order[i].version;
-		if (ps_page_prune_plan(versions, end - first, floor, keep) < 0)
+		if (floor == 0)
+			memset(keep, 1, end - first);
+		else if (ps_page_prune_plan(versions, end - first, floor, fences,
+									 nfences, keep) < 0)
 		{
 			free(order);
 			free(versions);
 			free(keep);
 			free(selected);
 			free(dropped);
+			free(fences);
 			return -1;
 		}
 		for (uint32_t i = first; i < end; i++)
@@ -1067,6 +1082,7 @@ prune_compaction_records(PsImgRec *recs, uint32_t *nrec, uint64_t floor,
 	free(versions);
 	free(keep);
 	free(selected);
+	free(fences);
 	*nrec = out;
 	*dropped_out = dropped;
 	*ndropped_out = ndropped;
@@ -1190,7 +1206,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	}
 	if (nrec == 0)
 		goto cleanup;
-	if (prune_compaction_records(recs, &nrec, page_floor,
+	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
 								 &dropped, &ndropped) != 0 || nrec == 0)
 		goto cleanup;
 
@@ -1205,9 +1221,12 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	/* Reject later pins/branches below this cutoff before the pruned layer can
 	 * become durable and visible.  Advancing conservatively when publication
 	 * later fails is safe; admitting already-reclaimed history is not. */
-	if (page_frontier_advance(timeline, page_floor) != 0 ||
+	if ((page_floor != 0 && page_frontier_advance(timeline, page_floor) != 0) ||
 		record_layer(NULL, &newdesc) != 0)
+	{
+		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
+	}
 	/* The durable replacement no longer contains these versions.  Drop their
 	 * in-memory index entries at the same publication point; otherwise a live
 	 * read can select a pruned PageVer and then fail because no layer can serve
@@ -4610,6 +4629,55 @@ retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
 	return 1;
 }
 
+/* Caller holds map-wr and the page-prune read fence. */
+static int
+page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+				  uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	PsPruneFence *fences;
+	uint32_t nfences = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES) * sizeof(*fences));
+	if (fences == NULL)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			{
+				fences[nfences].lsn = projected;
+				fences[nfences].admission_seq = projected == pins[i].lsn &&
+					pins[i].admission_seq != 0 ? pins[i].admission_seq : UINT64_MAX;
+				nfences++;
+			}
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t cap = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &cap))
+		{
+			fences[nfences].lsn = cap;
+			fences[nfences].admission_seq = UINT64_MAX;
+			nfences++;
+		}
+	}
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
 /*
  * One conservative floor for one resource on one timeline.  Explicit pins on
  * descendants are projected through every branch cap; a live direct child is
@@ -4683,7 +4751,7 @@ retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 		if (!timelines[candidate].defined ||
 			!retention_project_lsn(candidate, timeline, &cap))
 			continue;
-		if (candidate != timeline)
+		if (candidate != timeline && resource != PS_RETENTION_RESOURCE_PAGE_HISTORY)
 			retention_floor_add(cap, &floor);
 		if (resource == PS_RETENTION_RESOURCE_WAL)
 		{
@@ -6207,6 +6275,7 @@ ps_core_maintenance(void)
 	uint64_t	page_floor = 0;
 	int			found = 0;
 	int			did = 0;
+	int			legacy_compaction = 0;
 
 	/* Pin churn is independent of the layer read path (SPDK uses the same host
 	 * metadata), so bound this log before considering LSM-only work. */
@@ -6279,6 +6348,13 @@ ps_core_maintenance(void)
 				ftl = tl;
 				fsh = sh;
 				found = 1;
+				for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+					if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+						!ps_layer_map.layers[i].deleting &&
+						ps_layer_map.layers[i].timeline == tl &&
+						layer_shard_from_id(ps_layer_map.layers[i].layer_id) == sh &&
+						ps_layer_map.layers[i].legacy_shard_zero)
+						legacy_compaction = 1;
 				break;
 			}
 	ps_unlock_map();
@@ -6292,7 +6368,11 @@ ps_core_maintenance(void)
 	{
 		if (materialize_compaction_inputs(ftl, fsh) == 0)
 		{
-			ps_lock_shard_wr(fsh);
+			if (legacy_compaction)
+				for (uint32_t sh = 0; sh < ns; sh++)
+					ps_lock_shard_wr(sh);
+			else
+				ps_lock_shard_wr(fsh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
 			if ((count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
@@ -6301,16 +6381,19 @@ ps_core_maintenance(void)
 				retention_effective_floor_internal(ftl,
 					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1) == 0)
 			{
-				/* Zero is unconstrained, not a proven GC horizon. */
-				did = page_floor != 0 &&
-					compact_timeline(ftl, fsh, page_floor) > 0;
+				/* Zero disables pruning but still permits a safe layer merge. */
+				did = compact_timeline(ftl, fsh, page_floor) > 0;
 				if (did)
 					__atomic_store_n(&page_prune_due[ftl][fsh], 0,
 									 __ATOMIC_RELEASE);
 			}
 			ps_unlock_map();
 			pthread_rwlock_unlock(&page_prune_lock);
-			ps_unlock_shard(fsh);
+			if (legacy_compaction)
+				for (uint32_t sh = ns; sh > 0; sh--)
+					ps_unlock_shard(sh - 1);
+			else
+				ps_unlock_shard(fsh);
 		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
