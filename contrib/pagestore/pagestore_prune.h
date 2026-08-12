@@ -13,9 +13,11 @@ typedef struct PsPruneVersion
 typedef PsPruneVersion PsPruneFence;
 
 /*
- * versions must be sorted by (lsn, admission_seq).  keep receives one byte per
- * input version.  A zero floor has no proven reclamation meaning and is
- * rejected; the caller must supply a durable materialization cutoff.  fences
+ * versions must be sorted by (lsn, admission_seq), preserving source append
+ * order for exact tuple ties; the last tied element is authoritative.  keep
+ * receives one byte per input version.  A floor with either component zero has
+ * no proven reclamation meaning and is rejected; the caller must supply an
+ * exact durable materialization cutoff.  fences
  * are exact reader-admission or structural branch requirements and do not
  * lower the moving operational floor.
  * Returns the number of kept versions, or -1 for invalid input.
