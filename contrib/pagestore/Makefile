@@ -2,7 +2,7 @@
 
 MODULE_big = pagestore
 EXTENSION = pagestore
-DATA = pagestore--1.0.sql
+DATA = pagestore--1.0.sql pagestore--1.0--1.1.sql pagestore--1.1.sql
 OBJS = \
 	$(WIN32RES) \
 	backend_localsvc.o \

@@ -1,5 +1,5 @@
 # pagestore extension
 comment = 'monitoring functions for the pagestore storage backend'
-default_version = '1.0'
+default_version = '1.1'
 module_pathname = '$libdir/pagestore'
 relocatable = true

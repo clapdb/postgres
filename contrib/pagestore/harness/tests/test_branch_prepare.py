@@ -88,6 +88,7 @@ class BranchPrepareTests(unittest.TestCase):
     def test_lsn_sql_and_output_helpers(self):
         self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
         self.assertEqual(MODULE.sql_literal("a'b"), "'a''b'")
+        self.assertEqual(MODULE.sql_identifier('Page "Store"'), '"Page ""Store"""')
         self.assertEqual(MODULE.last_output_line("CHECKPOINT\n0/20|0/30\n"), "0/20|0/30")
         with self.assertRaisesRegex(ValueError, "invalid PostgreSQL LSN"):
             MODULE.parse_lsn("bad")
@@ -233,9 +234,50 @@ class BranchPrepareTests(unittest.TestCase):
                 return "1\n"
 
         preparer = RecordingPreparer(config)
+        preparer.writer_extension_schema = '"Page Store"'
         self.assertEqual(preparer.prepare_branch("0/1", "0/2", "0/3"), 1)
         self.assertTrue(preparer.private)
         self.assertTrue(preparer.sql.startswith("SET pagestore.redo_wal_from_store = on;"))
+        self.assertIn('"Page Store".pagestore_prepare_branch_from_control(', preparer.sql)
+
+    def test_preflight_discovers_and_qualifies_extension_schemas(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class RecordingPreparer(MODULE.BranchPreparer):
+            def __init__(self, branch_config):
+                super().__init__(branch_config)
+                self.writer_queries = []
+                self.materializer_queries = []
+
+            def server_running(self, data_dir):
+                return True
+
+            def writer_sql(self, sql, private=False):
+                self.writer_queries.append(sql)
+                if "FROM pg_extension" in sql:
+                    return 'Writer "Store"'
+                return "t"
+
+            def materializer_sql(self, sql):
+                self.materializer_queries.append(sql)
+                if "FROM pg_extension" in sql:
+                    return "Materializer Store"
+                if "pg_get_wal_replay_pause_state" in sql:
+                    return "not paused"
+                return "t"
+
+        preparer = RecordingPreparer(config)
+        preparer.preflight()
+        self.assertEqual(preparer.writer_extension_schema, '"Writer ""Store"""')
+        self.assertEqual(preparer.materializer_extension_schema, '"Materializer Store"')
+        self.assertIn(
+            "\"Writer \"\"Store\"\"\".pagestore_branch_checkpoint()",
+            preparer.writer_queries[1],
+        )
+        self.assertIn(
+            '"Materializer Store".pagestore_capture_slru_snapshot()',
+            preparer.materializer_queries[1],
+        )
 
     def test_duplicate_branch_main_returns_temporary_failure(self):
         config_path = self.write_config()

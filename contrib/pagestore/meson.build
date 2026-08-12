@@ -24,6 +24,8 @@ contrib_targets += pagestore
 install_data(
   'pagestore.control',
   'pagestore--1.0.sql',
+  'pagestore--1.0--1.1.sql',
+  'pagestore--1.1.sql',
   kwargs: contrib_data_args,
 )
 

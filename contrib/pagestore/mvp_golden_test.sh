@@ -201,7 +201,7 @@ wait_materialized_lsn()
 
 	for _ in $(seq 1 400); do
 		reached=$("${MP[@]}" -c \
-			"SELECT pagestore_materialized_wal_lsn() >= '$target'::pg_lsn;" \
+			"SELECT pagestore_ext.pagestore_materialized_wal_lsn() >= '$target'::pg_lsn;" \
 			2>/dev/null || true)
 		[ "$reached" = "t" ] && return 0
 		sleep 0.1
@@ -275,8 +275,10 @@ find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
 assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 	"materializer is a distinct recovery compute"
 
-"${WP[@]}" -c "CREATE EXTENSION pagestore;
-	CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
+"${WP[@]}" -c "CREATE SCHEMA pagestore_ext;
+	CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.0';
+	ALTER EXTENSION pagestore UPDATE TO '1.1';
+		CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
 	 AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
 	CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
 	fail "could not create the golden test relation"
@@ -301,7 +303,7 @@ attblock=$("${WP[@]}" -c "SELECT split_part(trim(both '()' from ctid::text), ','
 archive_current_wal || fail "DDL checkpoint WAL did not reach pagestore"
 wait_replay_lsn "$ddl_checkpoint_lsn" ||
 	fail "materializer did not reach the DDL checkpoint"
-if "${MP[@]}" -c "SELECT pagestore_capture_slru_snapshot();" \
+if "${MP[@]}" -c "SELECT pagestore_ext.pagestore_capture_slru_snapshot();" \
 	>/dev/null 2>&1; then
 	fail "SLRU capture accepted an unpaused recovery worker"
 fi
@@ -360,7 +362,7 @@ wait_materialized_lsn "$checkpoint_lsn" ||
 	fail "workload checkpoint is not covered by durable materialization"
 wait_materializer_note 1 before_fork ||
 	fail "fork-visible page was not store-visible after materializer restart"
-materialized_lsn=$("${MP[@]}" -c "SELECT pagestore_materialized_wal_lsn();")
+materialized_lsn=$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_materialized_wal_lsn();")
 assert_eq "$materialized_lsn" "$fork_lsn" \
 	"controller receipt matches the durable materialized fork"
 echo "ok   - durable materialized fork $fork_lsn covers workload checkpoint $checkpoint_lsn"
@@ -410,7 +412,7 @@ echo "ok   - parent advanced and was durably materialized beyond the child fork"
 	"$BRANCH" >/dev/null || fail "could not restore branch checkpoint control"
 branch_wal_segment_size=$(wal_segment_size "$BRANCH") ||
 	fail "could not read branch WAL segment size"
-"${WP[@]}" -c "SELECT pagestore_install_prepared_branch_bootstrap(
+"${WP[@]}" -c "SELECT pagestore_ext.pagestore_install_prepared_branch_bootstrap(
 	'$PREPARED', '$BRANCH', 1, 0, '$checkpoint_redo', '$checkpoint_lsn',
 	'$fork_lsn');" >/dev/null || fail "could not install the portable branch bootstrap"
 # Remove the unrelated WAL segment created by the fresh initdb.  The restored
@@ -452,7 +454,7 @@ assert_eq "$("${BP[@]}" -c "SELECT note FROM mvp_golden WHERE id=1;")" \
 	"before_fork" "branch sees the materialized pre-fork row"
 assert_eq "$("${BP[@]}" -c "SELECT count(*) FROM mvp_golden WHERE id=2;")" \
 	"0" "branch excludes the materialized post-fork parent row"
-assert_eq "$("${BP[@]}" -c "SELECT pagestore_shipped_wal_lsn();")" \
+assert_eq "$("${BP[@]}" -c "SELECT pagestore_ext.pagestore_shipped_wal_lsn();")" \
 	"$fork_lsn" "branch inherits the durable WAL boundary at its fork"
 
 "${BP[@]}" -c "INSERT INTO mvp_golden VALUES (3, 'branch_local'); CHECKPOINT;" \

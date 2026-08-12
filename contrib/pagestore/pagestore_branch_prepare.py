@@ -95,6 +95,12 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def sql_identifier(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("SQL identifier contains NUL")
+    return '"' + value.replace('"', '""') + '"'
+
+
 def last_output_line(value: str) -> str:
     lines = [line.strip() for line in value.splitlines() if line.strip()]
     if not lines:
@@ -318,6 +324,8 @@ class BranchPreparer:
         self.pause_owned = False
         self.writer_owned = False
         self.restricted_writer_running = False
+        self.writer_extension_schema: str | None = None
+        self.materializer_extension_schema: str | None = None
 
     def command(self, command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
@@ -380,11 +388,46 @@ class BranchPreparer:
     def server_running(self, data_dir: Path) -> bool:
         return self.pg_ctl(data_dir, "status", check=False).returncode == 0
 
+    def extension_schema(self, query: Any, role: str) -> str:
+        try:
+            schema = last_output_line(
+                query(
+                    "SELECT n.nspname FROM pg_extension e "
+                    "JOIN pg_namespace n ON n.oid = e.extnamespace "
+                    "WHERE e.extname = 'pagestore'"
+                )
+            )
+        except BranchPrepareError as error:
+            raise BranchPrepareError(
+                f"{role} does not have the pagestore extension installed"
+            ) from error
+        return sql_identifier(schema)
+
+    @staticmethod
+    def extension_function(schema: str | None, signature: str) -> str:
+        if schema is None:
+            raise BranchPrepareError("pagestore extension schema is not initialized")
+        return f"{schema}.{signature}"
+
     def preflight(self) -> None:
         if not self.server_running(self.config.writer_data_dir):
             raise BranchPrepareError("writer is not running")
         if not self.server_running(self.config.materializer_data_dir):
             raise BranchPrepareError("materializer is not running")
+        self.writer_extension_schema = self.extension_schema(self.writer_sql, "writer")
+        self.materializer_extension_schema = self.extension_schema(
+            self.materializer_sql, "materializer"
+        )
+        prepare_signature = self.extension_function(
+            self.writer_extension_schema,
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn)",
+        )
+        checkpoint_signature = self.extension_function(
+            self.writer_extension_schema, "pagestore_branch_checkpoint()"
+        )
+        capture_signature = self.extension_function(
+            self.materializer_extension_schema, "pagestore_capture_slru_snapshot()"
+        )
         writer_ok = last_output_line(
             self.writer_sql(
                 "SELECT NOT pg_is_in_recovery()"
@@ -395,9 +438,12 @@ class BranchPreparer:
                 " '0/0')::pg_lsn = '0/0'::pg_lsn"
                 " AND current_setting('archive_mode') = 'on'"
                 " AND current_setting('archive_library') = 'pagestore'"
-                " AND to_regprocedure('pagestore_prepare_branch_from_control("
-                "text,integer,integer,pg_lsn,pg_lsn,pg_lsn)') IS NOT NULL"
-                " AND to_regprocedure('pagestore_branch_checkpoint()') IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(prepare_signature)
+                + ") IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(checkpoint_signature)
+                + ") IS NOT NULL"
             )
         )
         if writer_ok != "t":
@@ -412,7 +458,9 @@ class BranchPreparer:
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"
                 " '0/0')::pg_lsn = '0/0'::pg_lsn"
-                " AND to_regprocedure('pagestore_capture_slru_snapshot()') IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(capture_signature)
+                + ") IS NOT NULL"
             )
         )
         if materializer_ok != "t":
@@ -471,7 +519,13 @@ class BranchPreparer:
                 == "paused",
             )
             cutoff = last_output_line(
-                self.materializer_sql("SELECT pagestore_capture_slru_snapshot()")
+                self.materializer_sql(
+                    "SELECT "
+                    + self.extension_function(
+                        self.materializer_extension_schema,
+                        "pagestore_capture_slru_snapshot()",
+                    )
+                )
             )
             parse_lsn(cutoff)
             return cutoff
@@ -528,7 +582,10 @@ class BranchPreparer:
         # record end from WAL; the current insert/flush point may be newer.
         output = last_output_line(
             self.writer_sql(
-                "SELECT * FROM pagestore_branch_checkpoint()",
+                "SELECT * FROM "
+                + self.extension_function(
+                    self.writer_extension_schema, "pagestore_branch_checkpoint()"
+                ),
                 private=True,
             )
         )
@@ -564,7 +621,11 @@ class BranchPreparer:
             f"durable pagestore WAL through {switch_lsn}",
             lambda: last_output_line(
                 self.writer_sql(
-                    "SELECT pagestore_shipped_wal_lsn() >= "
+                    "SELECT "
+                    + self.extension_function(
+                        self.writer_extension_schema, "pagestore_shipped_wal_lsn()"
+                    )
+                    + " >= "
                     + sql_literal(switch_lsn)
                     + "::pg_lsn",
                     private=True,
@@ -591,7 +652,11 @@ class BranchPreparer:
         output = last_output_line(
             self.writer_sql(
                 "SET pagestore.redo_wal_from_store = on; "
-                "SELECT pagestore_prepare_branch_from_control("
+                "SELECT "
+                + self.extension_function(
+                    self.writer_extension_schema,
+                    "pagestore_prepare_branch_from_control(",
+                )
                 + sql_literal(str(self.config.prepared_dir))
                 + f", {self.config.new_timeline}, {self.config.parent_timeline}, "
                 + sql_literal(base)
