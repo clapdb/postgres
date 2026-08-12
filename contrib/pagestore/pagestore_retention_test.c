@@ -1,5 +1,6 @@
 /* Durable retention-registry log unit test (no daemon, no PostgreSQL). */
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,84 @@
 #include "pagestore_retention.h"
 
 static int failed;
+
+#define TEST_RETENTION_MAGIC 0x4e544552u
+#define TEST_RETENTION_STATE_MAGIC 0x53544552u
+#define TEST_FNV_INIT 2166136261u
+
+typedef struct TestRetentionPinV1
+{
+	uint32_t timeline, owner_kind, resources, generation;
+	uint64_t owner_id, lsn;
+} TestRetentionPinV1;
+
+typedef struct TestRetentionRecordV1
+{
+	uint32_t magic, version, type, len;
+	TestRetentionPinV1 pin;
+	uint32_t crc, pad;
+} TestRetentionRecordV1;
+
+typedef struct TestRetentionState
+{
+	uint32_t magic, version;
+	uint64_t nrecords;
+	uint32_t log_hash, crc;
+} TestRetentionState;
+
+static uint32_t
+test_fnv1a(uint32_t h, const void *data, size_t len)
+{
+	const unsigned char *p = data;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static int
+write_v1_registry(const char *dir)
+{
+	char path[512];
+	TestRetentionRecordV1 rec = {0};
+	TestRetentionState state = {0};
+	int fd;
+
+	rec.magic = TEST_RETENTION_MAGIC;
+	rec.version = 1;
+	rec.type = 1;
+	rec.len = sizeof(rec);
+	rec.pin.timeline = 7;
+	rec.pin.owner_kind = PS_RETENTION_OWNER_READER;
+	rec.pin.resources = PS_RETENTION_RESOURCE_ALL;
+	rec.pin.generation = 3;
+	rec.pin.owner_id = 9001;
+	rec.pin.lsn = 456;
+	rec.crc = test_fnv1a(TEST_FNV_INIT, &rec,
+						 offsetof(TestRetentionRecordV1, crc));
+	snprintf(path, sizeof(path), "%s/retention.meta", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0 || write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec) ||
+		fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	state.magic = TEST_RETENTION_STATE_MAGIC;
+	state.version = 1;
+	state.nrecords = 1;
+	state.log_hash = test_fnv1a(TEST_FNV_INIT, &rec, sizeof(rec));
+	state.crc = test_fnv1a(TEST_FNV_INIT, &state,
+						   offsetof(TestRetentionState, crc));
+	snprintf(path, sizeof(path), "%s/retention.state", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0 || write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	snprintf(path, sizeof(path), "%s/retention.initialized", dir);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	return fd >= 0 && close(fd) == 0 ? 0 : -1;
+}
 
 static void
 check(int condition, const char *message)
@@ -50,6 +129,7 @@ main(void)
 	char		dir[] = "/tmp/psretentionXXXXXX";
 	char		faildir[] = "/tmp/psretentionfailXXXXXX";
 	char		legacydir[] = "/tmp/psretentionlegacyXXXXXX";
+	char		migratedir[] = "/tmp/psretentionmigrateXXXXXX";
 	char		path[512];
 	char		tmp[520];
 	char		backup[520];
@@ -63,12 +143,32 @@ main(void)
 				after;
 	int			fd;
 	unsigned char byte;
+	uint32_t	format_version;
 
 	if (mkdtemp(dir) == NULL)
 	{
 		perror("mkdtemp");
 		return 2;
 	}
+	check(mkdtemp(migratedir) != NULL, "create v1 migration directory");
+	check(write_v1_registry(migratedir) == 0, "write committed v1 registry");
+	check(ps_retention_open(migratedir) == 0, "migrate committed v1 registry");
+	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
+		  got.owner_id == 9001 && got.generation == 3 && got.lsn == 456 &&
+		  got.admission_seq == 0,
+		  "v1 pin replays with conservative admission sequence");
+	ps_retention_close();
+	snprintf(path, sizeof(path), "%s/retention.meta", migratedir);
+	fd = open(path, O_RDONLY);
+	check(fd >= 0 && pread(fd, &format_version, sizeof(format_version),
+						 sizeof(uint32_t)) == (ssize_t) sizeof(format_version) &&
+		  format_version == 2,
+		  "v1 migration publishes the current record format");
+	if (fd >= 0)
+		close(fd);
+	check(ps_retention_open(migratedir) == 0,
+		  "reopen registry after v1 migration");
+	ps_retention_close();
 	snprintf(path, sizeof(path), "%s/retention.meta", dir);
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	snprintf(backup, sizeof(backup), "%s.backup", path);
@@ -285,6 +385,17 @@ main(void)
 	snprintf(path, sizeof(path), "%s/retention.failed", legacydir);
 	unlink(path);
 	rmdir(legacydir);
+	snprintf(path, sizeof(path), "%s/retention.meta", migratedir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.initialized", migratedir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state", migratedir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.state.tmp", migratedir);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/retention.pending", migratedir);
+	unlink(path);
+	rmdir(migratedir);
 	if (!failed)
 		fprintf(stderr, "retention registry test: PASS\n");
 	return failed;
