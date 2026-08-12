@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <glob.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -544,6 +545,23 @@ op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
+static int
+op_read_at_tl_found(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
@@ -1882,6 +1900,36 @@ segment_exists(const char *store, uint32_t shard, int seg)
 	return access(path, F_OK) == 0;
 }
 
+static int
+local_layer_count(const char *store)
+{
+	char		pattern[512];
+	glob_t		matches;
+	int			count;
+
+	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
+	memset(&matches, 0, sizeof(matches));
+	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+		return 0;
+	count = (int) matches.gl_pathc;
+	globfree(&matches);
+	return count;
+}
+
+static int
+wait_for_compacted_layers(const char *store, int maximum)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		int count = local_layer_count(store);
+
+		if (count > 0 && count <= maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
 static void
 run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 {
@@ -2138,6 +2186,96 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(pid);
 
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	target_shard = test_nshards > 1 ? 1 : 0;
+	uint32_t	rel = find_relation_on_shard(target_shard, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	const struct
+	{
+		uint64_t lsn;
+		unsigned char tag;
+	} versions[] = {{500, 50}, {1000, 100}, {2000, 120},
+				   {3000, 130}, {4000, 140}};
+	pid_t		pid;
+
+	fprintf(stderr, "== branch-projected page pruning ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_branch", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_branch", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++)
+	{
+		fill_page(page, ps, versions[i].lsn, versions[i].tag);
+		op_write_tl(0, rel, 0, 0, page);
+	}
+	op_create_branch(20, 0, 3500);
+	op_create_branch(21, 20, 2500);
+	check(op_retention_set(21, PS_RETENTION_OWNER_READER, 2100, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1500) ==
+		  PS_STATUS_OK,
+		  "descendant reader registers a page-history floor below both fork caps");
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(page, ps, 5000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "descendant-pinned history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_tl_found(0, rel, 0, 0, 750, readback),
+		  "compaction prunes history older than the descendant reader base");
+	op_read_at_tl(21, rel, 0, 0, 1500, readback);
+	check(page_has_tag(readback, ps, 100),
+		  "descendant reader floor preserves parent history through nested caps");
+
+	check(op_retention_drop(21, PS_RETENTION_OWNER_READER, 2100, 1) ==
+		  PS_STATUS_OK,
+		  "descendant reader releases its projected page-history floor");
+	for (uint32_t block = 49; block <= 96; block++)
+	{
+		fill_page(page, ps, 6000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "fork-capped history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_tl_found(0, rel, 0, 0, 1500, readback),
+		  "nested structural floor prunes history released by the descendant");
+	op_read_tl(20, rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 130),
+		  "direct child retains the newest parent page below its fork cap");
+	op_read_tl(21, rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 120),
+		  "nested child retains the newest parent page below its lower fork cap");
+
+	client_detach();
+	stop_daemon(pid);
 	rm_rf(store);
 	shm_unlink(shm);
 	free(page);
@@ -4042,6 +4180,8 @@ main(int argc, char **argv)
 	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
 	/* Layer watermarks permit complete, covered POSIX segments to be removed. */
 	run_segment_gc_suite(daemon_path, tmpbase);
+	/* Descendant owners and nested fork caps constrain parent page pruning. */
+	run_prune_branch_retention_suite(daemon_path, tmpbase);
 	/* Recovery must not reuse a sealed layer file absent from the manifest. */
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */
