@@ -23,7 +23,7 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 			 versions[i].admission_seq < versions[i - 1].admission_seq))
 			return -1;
 
-	if (floor.lsn == 0)
+	if (floor.lsn == 0 || floor.admission_seq == 0)
 		return -1;
 
 	for (uint32_t i = 0; i < n; i++)
