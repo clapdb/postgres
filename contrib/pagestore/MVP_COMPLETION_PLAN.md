@@ -381,14 +381,16 @@ Deliverables:
   that domain, are carried by every SET/DROP and durable owner record, and are
   never inferred from a per-owner generation.  Authoritative
   DROP durably closes that incarnation; after every operation admitted under it
-  has drained, its generation tombstone may be folded only when every earlier
-  allocated token is also durably closed and drained.  The bounded allocation-
-  domain frontier therefore advances across a contiguous closed prefix; live
-  or undrained holes remain explicit durable records and prevent it from
-  passing them.  Reuse requires a higher owner incarnation, and delayed
-  mutations for a folded incarnation are rejected by that frontier.  Deleting
-  a timeline incarnation may reclaim all of its owner records while retaining
-  the timeline-incarnation fence;
+  has drained, its generation tombstone may be folded into a bounded allocation-
+  domain frontier even past lower live tokens.  Every live or undrained token at
+  or below that frontier remains an explicit durable exception; admission
+  rejects a token covered by the frontier unless its matching exception is
+  present.  Removing an exception after authoritative DROP and drain makes the
+  already-advanced frontier reject delayed mutations.  Thus metadata is bounded
+  by active/undrained owners rather than historical reader churn.  Reuse
+  requires a higher owner incarnation.  Deleting a timeline incarnation may
+  reclaim all of its owner records while retaining the timeline-incarnation
+  fence;
 - crash-safe checkpoint/compaction of the shared timeline-state log, retaining
   each slot's current state and maximum incarnation while bounding startup
   replay;
