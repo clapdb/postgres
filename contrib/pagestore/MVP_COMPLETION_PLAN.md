@@ -87,7 +87,8 @@ stacked branch.
 
 Deliverables:
 
-- `pagestore_localsvc_retention_set()` with explicit owner generation;
+- `pagestore_localsvc_retention_set()` and owner lookup/enumeration with the
+  exact `(LSN, admission_sequence)` fence plus explicit owner generation;
 - `pagestore_localsvc_retention_drop()` with explicit owner generation;
 - backend declarations and protocol-field documentation;
 - tests for successful set/drop, idempotent drop, invalid owner/resource input,
@@ -96,13 +97,16 @@ Deliverables:
   generation after DROP, including across log compaction and restart.
 - persisted per-resource reclamation frontiers.  SET admission and reclaimer
   cutoff selection share one synchronization protocol: a SET below any
-  requested resource frontier is rejected, while an accepted SET is visible
-  before a reclaimer can select a conflicting cutoff.
+  requested `(LSN, admission_sequence)` resource frontier is rejected, while
+  an accepted SET is visible before a reclaimer can select a conflicting
+  cutoff.  The record/recovery format and lifecycle tests preserve the
+  sequence through append, enumeration, compaction, and restart.
 
 Acceptance:
 
-- the backend carries the controller-assigned generation on every durable
-  SET/DROP and reports a stale-generation rejection distinctly;
+- the backend carries the controller-assigned generation and exact admission
+  sequence on every durable SET, returns both through lookup, and reports a
+  stale-generation rejection distinctly;
 - failures are reported without pretending the pin was installed or removed;
 - a delayed SET or DROP below the tombstone generation is rejected, and a
   same-generation SET cannot resurrect a dropped owner; tests cover both
@@ -231,6 +235,11 @@ of discrete ancestor WAL bases required by live branches.  Reclamation fails
 closed until that boundary is proven, and persists its resulting per-timeline
 frontier so later pins and branches below it are rejected.
 
+The WAL cutoff also includes the oldest raw WAL record referenced by every
+surviving WAL-index reconstruction chain.  R3 cannot cross an indexed FPI/base
+until R4 has durably published an equivalent replacement page base and removed
+that WAL dependency; index progress by itself never authorizes WAL deletion.
+
 Acceptance:
 
 - WAL read/restore results are identical before and after reclaim at every
@@ -328,8 +337,10 @@ Deliverables:
 - an atomic durable transition from live to deleting that first fences all new
   owner registrations and page/WAL/timeline operations, then drains every
   already-admitted operation before physical cleanup;
-- deletion admission checks for descendants, active owners, and structural
-  retention requirements performed as part of that fenced transition;
+- deletion admission checks for descendants, every non-dropped durable owner
+  (whether its process is active or offline), and structural retention
+  requirements performed as part of that fenced transition; only an
+  authoritative DROP or completed safe handoff removes an owner's veto;
 - durable timeline tombstone/state transition carrying a monotonically
   increasing timeline incarnation generation;
 - idempotent removal of manifests, layers, page segments, WAL, WAL index,
@@ -351,6 +362,10 @@ Deliverables:
 - crash-safe checkpoint/compaction of the shared timeline-state log, retaining
   each slot's current state and maximum incarnation while bounding startup
   replay;
+- a timeline-state append cutover lock or frozen-sequence plus tail-handoff
+  protocol, so concurrent create/delete/incarnation events acknowledged during
+  checkpoint publication are present exactly once in either the replacement or
+  its durable tail;
 - inspection reports pending and failed cleanup.
 
 Acceptance:
@@ -363,6 +378,8 @@ Acceptance:
   an older incarnation, including across daemon restart;
 - repeated provision/drop churn on one long-lived timeline keeps owner metadata
   bounded and rejects delayed SET/DROP from every folded owner incarnation;
+- concurrent timeline transitions at every state-log publication crash boundary
+  reopen with no lost state or incarnation event;
 - deleting a branch does not affect its parent or siblings.
 
 Expected scope: one or two PRs.
