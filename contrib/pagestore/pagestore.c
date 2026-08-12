@@ -11835,10 +11835,12 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			 * publication happened to finish after the lock was acquired. */
 			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST | CHECKPOINT_WAIT);
 			barrier_lsn = GetRedoRecPtr();
-			for (int wait = 0;
-				 !XLogRecPtrIsInvalid(barrier_lsn) && wait < 300 &&
-				 !pagestore_reader_snapshot_ready_at(barrier_lsn);
-				 wait++)
+			/* Keep backpressure on this exact checkpoint target.  Replacing a
+			 * slow outstanding job with a newer checkpoint can starve barrier
+			 * publication forever, so wait until it completes or shutdown/ERROR
+			 * definitively aborts this launcher iteration. */
+			while (!XLogRecPtrIsInvalid(barrier_lsn) &&
+				   !pagestore_reader_snapshot_ready_at(barrier_lsn))
 			{
 				(void) WaitLatch(MyLatch,
 					WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
