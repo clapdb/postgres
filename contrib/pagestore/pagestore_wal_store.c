@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,111 @@ segment_name(const PsWalStore *store, uint64_t segment_no,
 					 (unsigned long long) segment_no);
 
 	return n < 0 || (size_t) n >= name_len ? -1 : 0;
+}
+
+static int
+segment_number_cmp(const void *left, const void *right)
+{
+	uint64_t a = *(const uint64_t *) left;
+	uint64_t b = *(const uint64_t *) right;
+
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static int
+list_segments(const PsWalStore *store, uint64_t **numbers_out,
+			  uint32_t *count_out)
+{
+	char prefix[64];
+	DIR *directory;
+	uint64_t *numbers = NULL;
+	uint32_t count = 0;
+	uint32_t capacity = 0;
+	int removed_temporary = 0;
+	int rc = -1;
+	int n;
+
+	n = snprintf(prefix, sizeof(prefix), "walv1_%u_", store->timeline);
+	if (n < 0 || (size_t) n >= sizeof(prefix) ||
+		(directory = fdopendir(dup(store->directory_fd))) == NULL)
+		return -1;
+	for (;;)
+	{
+		struct dirent *entry;
+		const char *suffix;
+		size_t suffix_len;
+		uint64_t number = 0;
+
+		errno = 0;
+		entry = readdir(directory);
+		if (entry == NULL)
+		{
+			if (errno != 0)
+				goto cleanup;
+			break;
+		}
+
+		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+			continue;
+		suffix = entry->d_name + n;
+		suffix_len = strlen(suffix);
+		/* Published identities have exactly 20 decimal digits.  mkstemp orphan
+		 * names add exactly `.tmp.` plus six ASCII alphanumerics.  Anything else
+		 * in this timeline's reserved namespace is corruption, not debris. */
+		if (suffix_len != 20 && suffix_len != 31)
+			goto cleanup;
+		for (int i = 0; i < 20; i++)
+		{
+			unsigned int digit;
+
+			if (suffix[i] < '0' || suffix[i] > '9')
+				goto cleanup;
+			digit = (unsigned int) (suffix[i] - '0');
+			if (number > (UINT64_MAX - digit) / 10)
+				goto cleanup;
+			number = number * 10 + digit;
+		}
+		if (suffix_len == 31)
+		{
+			if (strncmp(suffix + 20, ".tmp.", 5) != 0)
+				goto cleanup;
+			for (int i = 25; i < 31; i++)
+				if (!((suffix[i] >= '0' && suffix[i] <= '9') ||
+					  (suffix[i] >= 'A' && suffix[i] <= 'Z') ||
+					  (suffix[i] >= 'a' && suffix[i] <= 'z')))
+					goto cleanup;
+			if (unlinkat(store->directory_fd, entry->d_name, 0) != 0)
+				goto cleanup;
+			removed_temporary = 1;
+			continue;
+		}
+		if (count == capacity)
+		{
+			uint32_t next_capacity = capacity == 0 ? 8 : capacity * 2;
+			uint64_t *grown = realloc(numbers,
+									 (size_t) next_capacity * sizeof(*grown));
+
+			if (grown == NULL)
+				goto cleanup;
+			numbers = grown;
+			capacity = next_capacity;
+		}
+		numbers[count++] = number;
+	}
+	if (removed_temporary && fsync(store->directory_fd) != 0)
+		goto cleanup;
+	if (count > 1)
+		qsort(numbers, count, sizeof(*numbers), segment_number_cmp);
+	*numbers_out = numbers;
+	*count_out = count;
+	numbers = NULL;
+	rc = 0;
+
+cleanup:
+	free(numbers);
+	if (closedir(directory) != 0)
+		rc = -1;
+	return rc;
 }
 
 static int
@@ -145,6 +251,23 @@ random_suffix(char suffix[7])
 		suffix[i] = alphabet[random_bytes[i] % (sizeof(alphabet) - 1)];
 	suffix[6] = '\0';
 	return 0;
+}
+
+static int
+open_regular_segment_at(const PsWalStore *store, const char *name,
+						struct stat *st)
+{
+	int fd = openat(store->directory_fd, name,
+				O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, st) != 0 || !S_ISREG(st->st_mode))
+	{
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 static int read_validated_segment_range(PsWalStore *store,
@@ -319,6 +442,90 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 }
 
 int
+ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
+{
+	uint64_t *numbers = NULL;
+	uint32_t count = 0;
+	unsigned char *payload = NULL;
+	uint64_t expected_lsn = 0;
+	int n;
+	int rc = -1;
+
+	if (store == NULL || directory == NULL)
+		return -1;
+	memset(store, 0, sizeof(*store));
+	store->directory_fd = -1;
+	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
+	if (n < 0 || (size_t) n >= sizeof(store->directory))
+		return -1;
+	store->directory_fd = open(directory, O_RDONLY | O_DIRECTORY);
+	if (store->directory_fd < 0)
+		return -1;
+	store->timeline = timeline;
+	if (list_segments(store, &numbers, &count) != 0 || count == 0)
+		goto cleanup;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		char name[128];
+		unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+		PsWalSegmentHeader header;
+		struct stat st;
+		int fd = -1;
+
+		if (numbers[i] != numbers[0] + i ||
+			segment_name(store, numbers[i], name, sizeof(name)) != 0 ||
+			(fd = open_regular_segment_at(store, name, &st)) < 0 ||
+			read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
+			ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
+			header.payload_len == 0 ||
+			header.payload_len > PS_WAL_SEGMENT_PAYLOAD_BYTES ||
+			(uint64_t) st.st_size != PS_WAL_SEGMENT_HEADER_BYTES +
+				header.payload_len)
+		{
+			if (fd >= 0)
+				close(fd);
+			goto cleanup;
+		}
+		payload = malloc(header.payload_len);
+		if (payload == NULL ||
+			read_all_at(fd, payload, header.payload_len,
+						PS_WAL_SEGMENT_HEADER_BYTES) != 0)
+		{
+			close(fd);
+			fd = -1;
+			goto cleanup;
+		}
+		if (close(fd) != 0)
+		{
+			fd = -1;
+			goto cleanup;
+		}
+		fd = -1;
+		if (ps_wal_segment_validate(&header, payload, header.payload_len) != 0 ||
+			header.timeline != timeline || header.segment_no != numbers[i] ||
+			(i != 0 && header.start_lsn != expected_lsn) ||
+			reserve_entry(store) != 0)
+			goto cleanup;
+		if (i == 0)
+			store->start_lsn = header.start_lsn;
+		expected_lsn = header.start_lsn + header.payload_len;
+		store->entries[store->nentries++].header = header;
+		free(payload);
+		payload = NULL;
+	}
+	store->next_segment_no = numbers[0] + count;
+	store->end_lsn = expected_lsn;
+	rc = 0;
+
+cleanup:
+	free(payload);
+	free(numbers);
+	if (rc != 0)
+		ps_wal_store_close(store);
+	return rc;
+}
+
+int
 ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 					const void *data, uint32_t len)
 {
@@ -402,8 +609,7 @@ read_validated_segment_range(PsWalStore *store,
 	int rc = -1;
 
 	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
-		(fd = openat(store->directory_fd, name, O_RDONLY)) < 0 ||
-		fstat(fd, &st) != 0)
+		(fd = open_regular_segment_at(store, name, &st)) < 0)
 		goto cleanup;
 	if (st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
 						 expected->payload_len) ||

@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -54,8 +57,10 @@ main(void)
 	unsigned char *input = malloc((size_t) first_len +
 								  TEST_SEGMENT_BYTES);
 	unsigned char window[256];
-	PsWalSegmentHeader header;
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char saved_header[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char saved_byte;
+	PsWalSegmentHeader header;
 	PsWalStore store;
 	PsWalStore retry_store;
 	int fd;
@@ -155,8 +160,14 @@ main(void)
 	}
 	rmdir(retry_directory);
 
+	/* Reads validate the complete immutable file before returning any bytes. */
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDWR);
+	check(fd >= 0 &&
+		  pread(fd, &saved_byte, 1, PS_WAL_SEGMENT_HEADER_BYTES + 10) == 1 &&
+		  pwrite(fd, (unsigned char[]) {saved_byte ^ 0xff}, 1,
+				 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 1 && fsync(fd) == 0,
+		  "corrupt a published payload without changing its size");
 	if (fd >= 0)
 	{
 		PsWalSegmentHeader mismatched;
@@ -209,20 +220,120 @@ main(void)
 	}
 	check(fd >= 0 && ps_wal_store_read(&store, 10, window, 1) != 0,
 		  "read compares the persisted checksum with its published header");
+	fd = open(path, O_RDWR);
+	check(fd >= 0 && ps_wal_segment_encode(&header, encoded) == 0 &&
+		  pwrite_all(fd, encoded, sizeof(encoded), 0) == 0 &&
+		  pwrite_all(fd, input, PS_WAL_SEGMENT_PAYLOAD_BYTES,
+					 PS_WAL_SEGMENT_HEADER_BYTES) == 0 && fsync(fd) == 0,
+		  "restore the published segment after replacement test");
+	if (fd >= 0)
+		close(fd);
 	ps_wal_store_close(&store);
+
+	/* Only a canonical mkstemp orphan belongs to recovery cleanup. */
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu.tmp.A1b2C3",
+			 directory, 3ULL);
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(fd >= 0, "create a canonical orphan temporary segment");
+	if (fd >= 0)
+		close(fd);
+	check(ps_wal_store_open(&store, directory, 7) == 0 &&
+		  access(path, F_OK) != 0 && store.nentries == 3 &&
+		  store.start_lsn == 0 && store.end_lsn == first_len + 211,
+		  "reopen reclaims a canonical orphan and reconstructs the WAL range");
+	check(ps_wal_store_read(&store,
+						PS_WAL_SEGMENT_PAYLOAD_BYTES - 64,
+						window, 128) == 0 &&
+		  memcmp(window, input + PS_WAL_SEGMENT_PAYLOAD_BYTES - 64, 128) == 0,
+		  "reopened store reads across a segment boundary");
+	ps_wal_store_close(&store);
+
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu.tmp.bad",
+			 directory, 3ULL);
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(fd >= 0, "create a noncanonical reserved-name file");
+	if (fd >= 0)
+		close(fd);
+	check(ps_wal_store_open(&store, directory, 7) != 0 &&
+		  access(path, F_OK) == 0,
+		  "reopen rejects and preserves a noncanonical reserved-name file");
+	unlink(path);
+
+	/* Every published file is authoritative: corruption, missing identities and
+	 * short tails fail closed rather than silently changing retained history. */
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
+	fd = open(path, O_RDWR);
+	check(fd >= 0 &&
+		  pread(fd, &saved_byte, 1, PS_WAL_SEGMENT_HEADER_BYTES + 3) == 1 &&
+		  pwrite(fd, (unsigned char[]) {saved_byte ^ 0xff}, 1,
+				 PS_WAL_SEGMENT_HEADER_BYTES + 3) == 1 && fsync(fd) == 0,
+		  "inject payload corruption into a published segment");
+	if (fd >= 0)
+		close(fd);
+	check(ps_wal_store_open(&store, directory, 7) != 0,
+		  "reopen rejects a payload checksum mismatch");
+	fd = open(path, O_RDWR);
+	check(fd >= 0 && pwrite(fd, &saved_byte, 1,
+						PS_WAL_SEGMENT_HEADER_BYTES + 3) == 1 && fsync(fd) == 0,
+		  "restore payload after corruption test");
+	if (fd >= 0)
+		close(fd);
+
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
+	fd = open(path, O_RDWR);
+	check(fd >= 0 && pread(fd, saved_header, sizeof(saved_header), 0) ==
+		  sizeof(saved_header), "read header for corruption injection");
+	encoded[0] = saved_header[0] ^ 0xff;
+	check(fd >= 0 && pwrite(fd, encoded, 1, 0) == 1 && fsync(fd) == 0,
+		  "inject header corruption into a published segment");
+	if (fd >= 0)
+		close(fd);
+	check(ps_wal_store_open(&store, directory, 7) != 0,
+		  "reopen rejects a header checksum mismatch");
+	fd = open(path, O_RDWR);
+	check(fd >= 0 && pwrite(fd, saved_header, sizeof(saved_header), 0) ==
+		  sizeof(saved_header) && fsync(fd) == 0,
+		  "restore header after corruption test");
+	if (fd >= 0)
+		close(fd);
+
+	{
+		char missing[1024];
+
+		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
+		snprintf(missing, sizeof(missing), "%s/held_segment", directory);
+		check(rename(path, missing) == 0, "inject a segment-number gap");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a missing interior segment");
+		check(rename(missing, path) == 0, "restore the missing segment");
+	}
 	{
 		char held[1024];
 
-		snprintf(held, sizeof(held), "%s-held", directory);
-		check(rename(directory, held) == 0 && symlink(held, directory) == 0,
-			  "replace the WAL store directory with a symlink");
-		check(ps_wal_store_open(&store, directory, 7, 0,
-						   first_len + TEST_SEGMENT_BYTES,
-						   TEST_SEGMENT_BYTES) != 0,
-			  "reopen rejects a symlinked WAL store directory");
-		check(unlink(directory) == 0 && rename(held, directory) == 0,
-			  "restore the WAL store directory after symlink test");
+		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
+		snprintf(held, sizeof(held), "%s/held_special", directory);
+		check(rename(path, held) == 0 && symlink("held_special", path) == 0,
+			  "replace a canonical segment with a symlink");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a symlink at a canonical segment path");
+		check(unlink(path) == 0 && mkfifo(path, 0600) == 0,
+			  "replace a canonical segment with a FIFO");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a FIFO without blocking");
+		check(unlink(path) == 0 && rename(held, path) == 0,
+			  "restore the regular segment after special-file tests");
 	}
+
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
+	fd = open(path, O_RDWR);
+	check(fd >= 0 &&
+		  ftruncate(fd, (off_t) (PS_WAL_SEGMENT_HEADER_BYTES + 210)) == 0 &&
+		  fsync(fd) == 0, "inject a truncated final segment");
+	if (fd >= 0)
+		close(fd);
+	check(ps_wal_store_open(&store, directory, 7) != 0,
+		  "reopen rejects a truncated final segment");
+
 	for (uint64_t segment = 0; segment < 3; segment++)
 	{
 		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory,
