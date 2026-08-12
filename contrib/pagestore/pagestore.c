@@ -756,6 +756,60 @@ pagestore_read_at(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P(result);
 }
 
+/* SQL-callable protocol probes used by integration tests and controller bringup. */
+PG_FUNCTION_INFO_V1(pagestore_retention_set);
+
+Datum
+pagestore_retention_set(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int32		owner_kind = PG_GETARG_INT32(1);
+	int64		owner_id = PG_GETARG_INT64(2);
+	int64		generation = PG_GETARG_INT64(3);
+	int32		resources = PG_GETARG_INT32(4);
+	XLogRecPtr	lsn = PG_GETARG_LSN(5);
+
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore retention operations require the localsvc backend")));
+	/* SQL bigint supplies the uint64 bit pattern.  Negative values therefore
+	 * represent owner IDs with the high bit set; only the all-zero ID is
+	 * reserved. */
+	if (timeline < 0 || owner_kind < 0 || owner_id == 0 || generation <= 0 ||
+		(uint64) generation > UINT32_MAX || resources < 0)
+		ereport(ERROR,
+				(errmsg("pagestore retention owner fields are invalid or out of range")));
+	PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
+		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
+		(uint32) generation, (uint32) resources, (uint64) lsn));
+}
+
+PG_FUNCTION_INFO_V1(pagestore_retention_drop);
+
+Datum
+pagestore_retention_drop(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int32		owner_kind = PG_GETARG_INT32(1);
+	int64		owner_id = PG_GETARG_INT64(2);
+	int64		generation = PG_GETARG_INT64(3);
+
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore retention operations require the localsvc backend")));
+	if (timeline < 0 || owner_kind < 0 || owner_id == 0 || generation <= 0 ||
+		(uint64) generation > UINT32_MAX)
+		ereport(ERROR,
+				(errmsg("pagestore retention owner fields are invalid or out of range")));
+	PG_RETURN_INT32((int32) pagestore_localsvc_retention_drop(
+		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
+		(uint32) generation));
+}
+
 /*
  * pagestore_create_branch(new_timeline int, parent_timeline int, lsn pg_lsn)
  *
