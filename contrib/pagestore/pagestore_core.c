@@ -5047,6 +5047,30 @@ ps_handle_meta(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_RETENTION_PIN_LOOKUP:
+			{
+				PsRetentionPin pin;
+				int			found = ps_retention_lookup(tl, ch->blocknum,
+												 ch->req_seq, &pin);
+
+				if (found < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+				{
+					ch->result = found != 0;
+					if (found)
+					{
+						ch->timeline = pin.timeline;
+						ch->blocknum = pin.owner_kind;
+						ch->parent_timeline = pin.resources;
+						ch->old_nblocks = pin.generation;
+						ch->req_seq = pin.owner_id;
+						ch->req_lsn = pin.lsn;
+					}
+				}
+			}
+			break;
+
 		case PS_OP_RETENTION_FLOOR:
 			{
 				uint64_t	floor = 0;

@@ -77,6 +77,8 @@
 #include "storage/copydir.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/lock.h"
 #include "storage/md.h"
 #include "storage/procarray.h"
 #include "storage/shmem.h"
@@ -141,6 +143,8 @@ static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL
 #define PS_MATERIALIZER_MARKER_TIMEOUT_MS 10000
 #define PS_MATERIALIZER_RETENTION_RESOURCES \
 	(PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX)
+#define PS_READER_RETENTION_RESOURCES PS_RETENTION_RESOURCE_ALL
+#define PS_READER_RETENTION_TIMEOUT_MS 10000
 
 typedef struct PsMaterializerMarker
 {
@@ -362,6 +366,16 @@ typedef struct PagestoreReaderSnapshotJobShmem
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
 static PagestoreReaderSnapshotJobShmem *pagestore_reader_snapshot_job = NULL;
+static bool pagestore_reader_advance_lock_held = false;
+
+static void
+pagestore_reader_advance_locktag(LOCKTAG *tag)
+{
+	SET_LOCKTAG_ADVISORY(*tag, pagestore_localsvc_timeline(),
+						 (uint32) (pagestore_retention_owner_id >> 32),
+						 (uint32) pagestore_retention_owner_id,
+						 3);
+}
 
 static void
 pagestore_shmem_request(void)
@@ -882,6 +896,41 @@ pagestore_retention_drop(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) pagestore_localsvc_retention_drop(
 		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
 		(uint32) generation));
+}
+
+PG_FUNCTION_INFO_V1(pagestore_retention_owner_lsn);
+
+static bool
+pagestore_find_retention_owner(uint32 timeline, uint32 owner_kind,
+							   uint64 owner_id, PsRetentionPin *result)
+{
+	bool		found = false;
+
+	if (pagestore_localsvc_retention_lookup(timeline, owner_kind, owner_id,
+			result, &found) != PS_STATUS_OK)
+		ereport(ERROR,
+				(errmsg("pagestore retention owner lookup failed")));
+	return found;
+}
+
+Datum
+pagestore_retention_owner_lsn(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int32		owner_kind = PG_GETARG_INT32(1);
+	int64		owner_id = PG_GETARG_INT64(2);
+	int64		generation = PG_GETARG_INT64(3);
+	PsRetentionPin pin;
+
+	if (timeline < 0 || owner_kind <= 0 || owner_id <= 0 || generation <= 0 ||
+		(uint64) generation > UINT32_MAX)
+		ereport(ERROR,
+				(errmsg("pagestore retention owner fields must be positive and in range")));
+	if (pagestore_find_retention_owner((uint32) timeline,
+			(uint32) owner_kind, (uint64) owner_id, &pin) &&
+		pin.generation == (uint32) generation)
+		PG_RETURN_LSN((XLogRecPtr) pin.lsn);
+	PG_RETURN_NULL();
 }
 
 /*
@@ -6431,6 +6480,7 @@ typedef struct PagestoreReaderSnapshot
 #define PAGESTORE_READER_SNAPSHOT_DATA_OBJECT 1
 #define PAGESTORE_READER_SNAPSHOT_READY_OBJECT 2
 #define PAGESTORE_READER_RELMAP_OBJECT 3
+#define PAGESTORE_READER_DATABASE_BARRIER_OBJECT 4
 #define PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS 10000
 
 #define PAGESTORE_READER_RELMAP_MAGIC UINT32_C(0x5053524C)
@@ -6486,6 +6536,19 @@ typedef struct PagestoreReaderSnapshotManifest
 	pg_crc32c	local_relmap_crc;
 	pg_crc32c	crc;
 } PagestoreReaderSnapshotManifest;
+
+#define PAGESTORE_READER_DATABASE_BARRIER_MAGIC UINT32_C(0x50535242)
+#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 1
+typedef struct PagestoreReaderDatabaseBarrier
+{
+	uint64		read_lsn;
+	uint32		magic;
+	uint32		format;
+	uint32		timeline;
+	uint32		database_count;
+	pg_crc32c	database_crc;
+	pg_crc32c	crc;
+} PagestoreReaderDatabaseBarrier;
 
 typedef struct PagestoreReaderCatalogProvenance
 {
@@ -6670,6 +6733,119 @@ pagestore_reader_snapshot_key(uint32 object, Oid dbid)
 	key.dbOid = dbid;
 	key.relNumber = object;
 	return key;
+}
+
+static bool
+pagestore_database_reader_manifest_ready(Oid dbid, XLogRecPtr read_lsn)
+{
+	PagestoreReaderSnapshotManifest manifest;
+	PagestoreReaderSnapshotManifest checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, dbid);
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		return false;
+	memcpy(&manifest, page, sizeof(manifest));
+	checked = manifest;
+	pagestore_reader_snapshot_manifest_crc(&checked);
+	return manifest.magic == PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC &&
+		manifest.format == PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT &&
+		manifest.timeline == pagestore_localsvc_timeline() &&
+		manifest.read_lsn == read_lsn && manifest.block_count != 0 &&
+		EQ_CRC32C(manifest.crc, checked.crc);
+}
+
+static XLogRecPtr
+pagestore_latest_reader_snapshot_ready(void)
+{
+	PagestoreReaderSnapshotReady ready;
+	PagestoreReaderSnapshotReady checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, PG_UINT64_MAX, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
+		return InvalidXLogRecPtr;
+	memcpy(&ready, page, sizeof(ready));
+	checked = ready;
+	pagestore_reader_snapshot_ready_crc(&checked);
+	if (ready.header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
+		ready.header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
+		ready.header.timeline != pagestore_localsvc_timeline() ||
+		ready.header.read_lsn != (XLogRecPtr) resolved ||
+		ready.block_count == 0 || ready.reserved != 0 ||
+		!EQ_CRC32C(ready.crc, checked.crc))
+		return InvalidXLogRecPtr;
+	return (XLogRecPtr) resolved;
+}
+
+static bool
+pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
+{
+	PagestoreReaderDatabaseBarrier barrier;
+	PagestoreReaderDatabaseBarrier checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		return false;
+	memcpy(&barrier, page, sizeof(barrier));
+	checked = barrier;
+	INIT_CRC32C(checked.crc);
+	COMP_CRC32C(checked.crc, &checked,
+				offsetof(PagestoreReaderDatabaseBarrier, crc));
+	FIN_CRC32C(checked.crc);
+	return barrier.magic == PAGESTORE_READER_DATABASE_BARRIER_MAGIC &&
+		barrier.format == PAGESTORE_READER_DATABASE_BARRIER_FORMAT &&
+		barrier.timeline == pagestore_localsvc_timeline() &&
+		barrier.read_lsn == read_lsn && barrier.database_count != 0 &&
+		EQ_CRC32C(barrier.crc, checked.crc);
+}
+
+static void
+pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
+{
+	PagestoreReaderDatabaseBarrier barrier;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
+	char		page[BLCKSZ];
+	BlockNumber nblocks;
+
+	memset(&barrier, 0, sizeof(barrier));
+	barrier.read_lsn = read_lsn;
+	barrier.magic = PAGESTORE_READER_DATABASE_BARRIER_MAGIC;
+	barrier.format = PAGESTORE_READER_DATABASE_BARRIER_FORMAT;
+	barrier.timeline = pagestore_localsvc_timeline();
+	barrier.database_count = list_length(databases);
+	INIT_CRC32C(barrier.database_crc);
+	foreach_oid(dboid, databases)
+		COMP_CRC32C(barrier.database_crc, &dboid, sizeof(dboid));
+	FIN_CRC32C(barrier.database_crc);
+	INIT_CRC32C(barrier.crc);
+	COMP_CRC32C(barrier.crc, &barrier,
+				offsetof(PagestoreReaderDatabaseBarrier, crc));
+	FIN_CRC32C(barrier.crc);
+	memset(page, 0, sizeof(page));
+	memcpy(page, &barrier, sizeof(barrier));
+	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+		PS_KLASS_READER_SNAPSHOT, &key,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+		&key, 0, page, (uint64) read_lsn, nblocks,
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(
+		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 }
 
 static Size
@@ -7219,6 +7395,7 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		PagestoreReaderSnapshot snapshot;
 		PagestoreReaderSnapshotReady ready;
+		PagestoreReaderSnapshotManifest manifest;
 		PageStoreRelKey key;
 		char		page[BLCKSZ];
 		TransactionId *xids;
@@ -7309,6 +7486,40 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 		snapshot.xids = xids;
 		pagestore_reader_snapshot_crc(&snapshot.header, xids);
 		blocks = pagestore_publish_reader_snapshot_data(&snapshot);
+
+		/*
+		 * Publish a database-independent manifest before READY.  A backend can
+		 * be forked after the reader pin advances but before DatabasePath is
+		 * available; this exact-R global artifact lets it adopt safely during
+		 * catalog startup.  The database worker later adds the local relmap CRC.
+		 */
+		memset(&manifest, 0, sizeof(manifest));
+		manifest.read_lsn = read_lsn;
+		manifest.artifact_size = sizeof(snapshot.header) +
+			(Size) snapshot.header.count * sizeof(TransactionId);
+		manifest.magic = PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC;
+		manifest.format = PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT;
+		manifest.timeline = pagestore_localsvc_timeline();
+		manifest.block_count = blocks;
+		manifest.artifact_crc = snapshot.header.crc;
+		if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+				read_lsn, &manifest.global_relmap_crc))
+			ereport(ERROR,
+					(errmsg("global relation map is unavailable for reader snapshot at %X/%08X",
+							LSN_FORMAT_ARGS(read_lsn))));
+		pagestore_reader_snapshot_manifest_crc(&manifest);
+		memset(page, 0, sizeof(page));
+		memcpy(page, &manifest, sizeof(manifest));
+		key = pagestore_reader_snapshot_key(
+			PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, InvalidOid);
+		nblocks = pagestore_localsvc_obj_write_prepare_timeout(
+			PS_KLASS_READER_SNAPSHOT, &key,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, page, (uint64) read_lsn, nblocks,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		pagestore_localsvc_store_sync_timeout(
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
 
 		memset(&ready, 0, sizeof(ready));
 		ready.header = snapshot.header;
@@ -7833,6 +8044,30 @@ pagestore_transaction_id_is_in_progress(TransactionId xid, bool *result)
 	return true;
 }
 
+/*
+ * One controller-owned pin cannot protect two concurrently served reader
+ * epochs.  Serialize advancing-reader transactions until per-epoch owners are
+ * introduced: the durable pin can then move only after the old transaction
+ * has ended, and every later transaction adopts the protected view first.
+ */
+static void
+pagestore_reader_advance_xact_end(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT &&
+		event != XACT_EVENT_PREPARE && event != XACT_EVENT_PARALLEL_COMMIT &&
+		event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+
+	if (pagestore_reader_advance_lock_held)
+	{
+		LOCKTAG		tag;
+
+		pagestore_reader_advance_locktag(&tag);
+		(void) LockRelease(&tag, ExclusiveLock, true);
+		pagestore_reader_advance_lock_held = false;
+	}
+}
+
 static void
 pagestore_adopt_reader_view_at_xact_start(void)
 {
@@ -7843,23 +8078,46 @@ pagestore_adopt_reader_view_at_xact_start(void)
 	MemoryContext cxt = CurrentMemoryContext;
 	ErrorData  *edata = NULL;
 	XLogRecPtr	candidate;
-	XLogRecPtr	published;
+	XLogRecPtr	published = InvalidXLogRecPtr;
+	XLogRecPtr	protected_lsn;
 	XLogRecPtr	newest_adoptable;
 	ControlFileData control;
 	uint32		adoption_generation;
 	uint64		read_seq = 0;
 	bool		valid = false;
+	bool		must_adopt;
+	PsRetentionPin protected_pin;
 
 	if (prev_xact_start_hook != NULL)
 		prev_xact_start_hook();
 	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
 		pagestore_localsvc_read_lsn() == 0 || IsParallelWorker())
 		return;
+	{
+		LOCKTAG		tag;
+
+		pagestore_reader_advance_locktag(&tag);
+		/* A session-owned heavyweight lock survives savepoint rollback; the
+		 * top-level transaction callback releases it explicitly. */
+		(void) LockAcquire(&tag, ExclusiveLock, true, false);
+	}
+	pagestore_reader_advance_lock_held = true;
+	if (!pagestore_find_retention_owner(pagestore_localsvc_timeline(),
+			PS_RETENTION_OWNER_READER, pagestore_retention_owner_id,
+			&protected_pin) ||
+		protected_pin.generation != pagestore_retention_owner_generation ||
+		protected_pin.resources != PS_READER_RETENTION_RESOURCES)
+		ereport(FATAL,
+				(errmsg("pagestore advancing reader lost retention owner authority")));
+	protected_lsn = (XLogRecPtr) protected_pin.lsn;
+	must_adopt = protected_lsn > (XLogRecPtr) pagestore_localsvc_read_lsn();
 
 	pagestore_refresh_reader_horizon();
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
 	candidate = pagestore_reader_horizon->candidate_lsn;
 	SpinLockRelease(&pagestore_reader_horizon->mutex);
+	if (candidate < protected_lsn)
+		candidate = protected_lsn;
 	if (candidate <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 		return;
 	snapshot_context = AllocSetContextCreate(TopMemoryContext,
@@ -7867,7 +8125,16 @@ pagestore_adopt_reader_view_at_xact_start(void)
 
 	PG_TRY();
 	{
-		published = pagestore_resolve_published_reader_snapshot(candidate);
+		/*
+		 * A backend forked after another process advanced the durable pin still
+		 * starts with the postmaster's boot-time view.  During early database
+		 * initialization MyDatabaseId/DatabasePath may not yet identify the
+		 * database-specific manifest, so recover the exact protected global
+		 * artifact.  The post-database-path hook validates the per-database map
+		 * before normal query service.
+		 */
+		published = must_adopt ? protected_lsn :
+			pagestore_resolve_published_reader_snapshot(candidate);
 		if (XLogRecPtrIsInvalid(published) ||
 			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 			goto adoption_done;
@@ -7877,6 +8144,7 @@ pagestore_adopt_reader_view_at_xact_start(void)
 			pagestore_validate_database_reader_manifest(published);
 		valid = ps_control_asof_timeout(published, &control,
 			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
+			pagestore_reader_database_barrier_valid(published) &&
 			control.checkPointCopy.redo == published &&
 			pagestore_localsvc_read_fence_timeout((uint64) published,
 				&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
@@ -7896,7 +8164,7 @@ adoption_done:
 		snapshot_context = NULL;
 		if (edata->elevel >= FATAL ||
 			edata->sqlerrcode == ERRCODE_QUERY_CANCELED ||
-			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN)
+			edata->sqlerrcode == ERRCODE_ADMIN_SHUTDOWN || must_adopt)
 			ReThrowError(edata);
 		FreeErrorData(edata);
 		FlushErrorState();
@@ -7905,7 +8173,70 @@ adoption_done:
 	{
 		if (snapshot_context != NULL)
 			MemoryContextDelete(snapshot_context);
+		if (must_adopt)
+			ereport(ERROR,
+					(errmsg("pagestore reader cannot adopt its durable retention horizon"),
+					 errdetail("Durable pin %X/%08X, candidate %X/%08X, published snapshot %X/%08X.",
+							   LSN_FORMAT_ARGS(protected_lsn),
+							   LSN_FORMAT_ARGS(candidate),
+							   LSN_FORMAT_ARGS(published))));
 		return;
+	}
+	if (published < protected_lsn)
+	{
+		MemoryContextDelete(snapshot_context);
+		ereport(ERROR,
+				(errmsg("pagestore reader snapshot is older than its durable retention horizon")));
+	}
+	/*
+	 * The transaction gate proves that no old-view transaction remains.  Move
+	 * the durable pin before publishing or adopting the new view.  An ambiguous
+	 * failure keeps the old pin and old view; stale authority must stop serving.
+	 */
+	{
+		uint8		status = PS_STATUS_ERROR;
+		ErrorData  *pin_edata = NULL;
+
+		PG_TRY();
+		{
+			status = pagestore_localsvc_retention_set_timeout(
+				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
+				pagestore_retention_owner_id,
+				pagestore_retention_owner_generation,
+				PS_READER_RETENTION_RESOURCES, (uint64) published,
+				PS_READER_RETENTION_TIMEOUT_MS);
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cxt);
+			pin_edata = CopyErrorData();
+			FlushErrorState();
+		}
+		PG_END_TRY();
+		if (pin_edata != NULL)
+		{
+			MemoryContextDelete(snapshot_context);
+			ReThrowError(pin_edata);
+		}
+		if (status == PS_STATUS_ERROR)
+		{
+			MemoryContextDelete(snapshot_context);
+			if (must_adopt)
+				ereport(ERROR,
+						(errmsg("pagestore reader retention advance was rejected")));
+			return;
+		}
+		if (status == PS_STATUS_STALE)
+			ereport(FATAL,
+					(errmsg("pagestore reader lost retention owner authority"),
+					 errdetail("Owner %llu generation %u was fenced by a newer controller generation.",
+							   (unsigned long long) pagestore_retention_owner_id,
+							   pagestore_retention_owner_generation)));
+		if (status != PS_STATUS_OK)
+		{
+			MemoryContextDelete(snapshot_context);
+			return;
+		}
 	}
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
 	if (published > pagestore_reader_horizon->adoptable_lsn)
@@ -9639,6 +9970,10 @@ pagestore_validate_datadir_branch_manifest(void)
 	XLogRecPtr	reader_fork_lsn;
 	uint64		read_lsn;
 	bool		found;
+	uint8		retention_status;
+	PsRetentionPin existing_pin;
+	bool		have_existing_pin;
+	bool		set_reader_pin;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -9673,7 +10008,6 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_snapshot_job->generation = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
-
 	if (DataDir == NULL)
 		return;
 
@@ -9713,6 +10047,76 @@ pagestore_validate_datadir_branch_manifest(void)
 			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
 			control->system_identifier, FATAL);
 		pfree(control);
+		reader_snapshot = pagestore_load_reader_snapshot(DataDir,
+			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
+			TopMemoryContext, FATAL);
+		if (reader_snapshot->xids != NULL)
+			pfree(reader_snapshot->xids);
+		pfree(reader_snapshot);
+
+		/*
+		 * This is the last local-only validation step.  Reconcile or register
+		 * before branch ancestry, the published running-XID snapshot, or any
+		 * relation page can be read from the store.  A failed or stale
+		 * registration fails startup; the previous durable generation remains
+		 * conservative.
+		 */
+		have_existing_pin = pagestore_find_retention_owner(
+			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
+			pagestore_retention_owner_id, &existing_pin);
+		set_reader_pin = !have_existing_pin;
+		if (have_existing_pin)
+		{
+			if (existing_pin.generation > pagestore_retention_owner_generation)
+				ereport(FATAL,
+						(errmsg("pagestore reader retention generation is stale"),
+						 errdetail("Owner %llu generation %u was fenced by generation %u.",
+								   (unsigned long long) pagestore_retention_owner_id,
+								   pagestore_retention_owner_generation,
+								   existing_pin.generation)));
+			/* A different postmaster can still be serving the old generation;
+			 * this process-local startup path cannot prove it quiescent.  The
+			 * controller must stop it and durably DROP that generation before a
+			 * replacement may register against the tombstone. */
+			if (existing_pin.generation < pagestore_retention_owner_generation)
+				ereport(FATAL,
+						(errmsg("pagestore reader generation takeover is not quiesced"),
+						 errhint("Stop the old reader and durably drop its generation before starting the replacement.")));
+			if (existing_pin.resources != PS_READER_RETENTION_RESOURCES)
+				ereport(FATAL,
+						(errmsg("pagestore reader retention owner has the wrong resource mask")));
+			if (!pagestore_advance_read_lsn && existing_pin.lsn > read_lsn)
+				ereport(FATAL,
+						(errmsg("fixed pagestore reader owner is already above its configured horizon"),
+						 errhint("Reprovision the fixed reader with a new owner identity at a retained horizon.")));
+			set_reader_pin = existing_pin.lsn < read_lsn;
+		}
+		if (set_reader_pin)
+		{
+			retention_status = pagestore_localsvc_retention_set_timeout(
+				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
+				pagestore_retention_owner_id,
+				pagestore_retention_owner_generation,
+				PS_READER_RETENTION_RESOURCES, read_lsn,
+				PS_READER_RETENTION_TIMEOUT_MS);
+			if (retention_status == PS_STATUS_STALE)
+				ereport(FATAL,
+						(errmsg("pagestore reader retention generation is stale"),
+						 errdetail("Owner %llu generation %u was fenced by a newer controller generation.",
+								   (unsigned long long) pagestore_retention_owner_id,
+								   pagestore_retention_owner_generation)));
+			if (retention_status != PS_STATUS_OK)
+				ereport(FATAL,
+						(errmsg("pagestore reader could not register its retention owner")));
+		}
+		else if (existing_pin.lsn > read_lsn)
+		{
+			SpinLockAcquire(&pagestore_reader_horizon->mutex);
+			pagestore_reader_horizon->candidate_lsn =
+				(XLogRecPtr) existing_pin.lsn;
+			SpinLockRelease(&pagestore_reader_horizon->mutex);
+		}
+		pagestore_localsvc_detach();
 		if (pagestore_localsvc_timeline() != 0)
 		{
 			if (!pagestore_reader_manifest_get_branch_identity(reader_manifest,
@@ -9726,12 +10130,6 @@ pagestore_validate_datadir_branch_manifest(void)
 											  (uint64) reader_fork_lsn, 5000);
 			pagestore_localsvc_detach();
 		}
-		reader_snapshot = pagestore_load_reader_snapshot(DataDir,
-			pagestore_localsvc_timeline(), (XLogRecPtr) read_lsn,
-			TopMemoryContext, FATAL);
-		if (reader_snapshot->xids != NULL)
-			pfree(reader_snapshot->xids);
-		pfree(reader_snapshot);
 		return;
 	}
 	if (read_lsn != 0)
@@ -11243,6 +11641,8 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 	while (!ShutdownRequestPending)
 	{
 		List	   *databases = NIL;
+		XLogRecPtr	barrier_lsn = InvalidXLogRecPtr;
+		bool		barrier_complete = false;
 
 		if (ConfigReloadPending)
 		{
@@ -11252,13 +11652,20 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		PG_TRY();
 		{
 			databases = pagestore_reader_artifact_databases();
+			barrier_lsn = pagestore_latest_reader_snapshot_ready();
+			barrier_complete = !XLogRecPtrIsInvalid(barrier_lsn) &&
+				databases != NIL;
 			foreach_oid(dboid, databases)
 			{
 				if (ShutdownRequestPending)
 					break;
 				pagestore_run_reader_artifact_worker(dboid);
+				if (!pagestore_database_reader_manifest_ready(dboid, barrier_lsn))
+					barrier_complete = false;
 				CHECK_FOR_INTERRUPTS();
 			}
+			if (barrier_complete && !ShutdownRequestPending)
+				pagestore_publish_reader_database_barrier(databases, barrier_lsn);
 		}
 		PG_CATCH();
 		{
@@ -11394,7 +11801,7 @@ _PG_init(void)
 								 NULL, NULL, NULL);
 	DefineCustomStringVariable("pagestore.retention_owner_id",
 							   "Controller-assigned stable retention owner ID.",
-							   "Required for a managed materializer; it remains stable across replacement workers.",
+							   "Required for a managed materializer or reader; it remains stable across replacement processes.",
 							   &pagestore_retention_owner_id_str,
 							   "",
 							   PGC_POSTMASTER,
@@ -11404,7 +11811,7 @@ _PG_init(void)
 							   NULL);
 	DefineCustomStringVariable("pagestore.retention_owner_generation",
 							   "Controller-assigned retention owner takeover generation.",
-							   "Required for a managed materializer and incremented before each replacement worker starts.",
+							   "Required for a managed materializer or reader and incremented before each replacement starts.",
 							   &pagestore_retention_owner_generation_str,
 							   "",
 							   PGC_POSTMASTER,
@@ -11455,6 +11862,12 @@ _PG_init(void)
 		ereport(ERROR,
 				(errmsg("pagestore.materializer requires retention owner authority"),
 				 errhint("Set pagestore.retention_owner_id and pagestore.retention_owner_generation from durable controller state.")));
+	if (pagestore_localsvc_read_lsn() != 0 &&
+		(pagestore_retention_owner_id == 0 ||
+		 pagestore_retention_owner_generation == 0))
+		ereport(ERROR,
+				(errmsg("pagestore.read_lsn requires retention owner authority"),
+				 errhint("Set pagestore.retention_owner_id and pagestore.retention_owner_generation from durable controller state.")));
 	prev_planner_hook = planner_hook;
 	planner_hook = pagestore_planner;
 	prev_executor_run_hook = ExecutorRun_hook;
@@ -11502,6 +11915,8 @@ _PG_init(void)
 		pagestore_transaction_id_is_in_progress;
 	prev_xact_start_hook = xact_start_hook;
 	xact_start_hook = pagestore_adopt_reader_view_at_xact_start;
+	if (pagestore_advance_read_lsn)
+		RegisterXactCallback(pagestore_reader_advance_xact_end, NULL);
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pagestore_validate_datadir_branch_manifest;

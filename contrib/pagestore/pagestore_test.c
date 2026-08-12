@@ -729,6 +729,32 @@ op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
 }
 
 static int
+op_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					PsRetentionPin *pin)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	cl_exec();
+	if (ch->status != PS_STATUS_OK || ch->result == 0)
+		return 0;
+	if (pin)
+	{
+		memset(pin, 0, sizeof(*pin));
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+	}
+	return 1;
+}
+
+static int
 op_retention_floor(uint32_t timeline, uint32_t resource, uint64_t *floor)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -2776,6 +2802,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_get(2, &pin, &count) && count == 3 &&
 		  pin.owner_kind == PS_RETENTION_OWNER_CONFIGURED && pin.owner_id == 303,
 		  "registry enumeration returns every owner kind");
+	check(op_retention_lookup(0, PS_RETENTION_OWNER_MATERIALIZER, 202, &pin) &&
+		  pin.generation == 1 && pin.lsn == 3000,
+		  "registry atomically looks up one owner by stable key");
+	check(!op_retention_lookup(0, PS_RETENTION_OWNER_READER, 9999, &pin),
+		  "keyed owner lookup reports an absent owner atomically");
 	check(!op_retention_get(3, &pin, &count) && count == 3,
 		  "registry enumeration ends at the reported count");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==

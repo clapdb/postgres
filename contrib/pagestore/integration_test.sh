@@ -153,7 +153,9 @@ assert "$($P -c 'SELECT count(*) FROM t;')" "20000" "row count after restart"
 $P -c "CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn) RETURNS int
         AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_retention_drop(int,int,bigint,bigint) RETURNS int
-        AS 'pagestore','pagestore_retention_drop' LANGUAGE C STRICT;" >/dev/null
+        AS 'pagestore','pagestore_retention_drop' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_retention_owner_lsn(int,int,bigint,bigint) RETURNS pg_lsn
+        AS 'pagestore','pagestore_retention_owner_lsn' LANGUAGE C STRICT;" >/dev/null
 assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,0,'0/1');")" "1" \
 	"retention SET reports daemon rejection of an invalid resource mask"
 if $P -v ON_ERROR_STOP=1 -c \
@@ -1371,6 +1373,7 @@ assert "$($P -c "SELECT pagestore_slru_tombstone_asof('pg_xact', pg_current_wal_
 # default/global catalogs first; the following checkpoint puts both those
 # imported pages and the already-routed user-tablespace pages behind R's
 # admission fence.
+$P -c "CREATE DATABASE reader_aux;" >/dev/null
 "$BIN/pg_ctl" -D "$DATA" -w stop >/dev/null 2>&1
 "$BUILD/contrib/pagestore/pagestore_import" --shm "$SHM" --pgdata "$DATA" >/dev/null 2>&1
 cat >> "$DATA/postgresql.conf" <<EOF
@@ -1604,6 +1607,8 @@ READER_SOCK=$(new_sockdir reader)
 cat >> "$READERDATA/postgresql.conf" <<EOF
 pagestore.read_lsn = '$readerR'
 pagestore.advance_read_lsn = off
+pagestore.retention_owner_id = '8001'
+pagestore.retention_owner_generation = '1'
 archive_mode = off
 listen_addresses = ''
 unix_socket_directories = '$READER_SOCK'
@@ -1689,6 +1694,21 @@ assert "$pin_route_started" "0" "pinned start without full store routing is refu
 rm -rf "$(dirname "$BADREADER")"
 BADREADER=
 echo "pagestore.route_all = on" >> "$READERDATA/postgresql.conf"
+# A reader without controller-issued authority must fail before it can consume
+# any store history.
+BADREADER=$(mktemp -d)/reader
+cp -a "$READERDATA" "$BADREADER"
+BADREADER_SOCK=$(new_sockdir badreader)
+cat >> "$BADREADER/postgresql.conf" <<EOF
+pagestore.retention_owner_id = ''
+pagestore.retention_owner_generation = ''
+unix_socket_directories = '$BADREADER_SOCK'
+EOF
+"$BIN/pg_ctl" -D "$BADREADER" -l "$BADREADER/server.log" -w start >/dev/null 2>&1 && pin_owner_started=1 || pin_owner_started=0
+assert "$pin_owner_started" "0" "pinned start without retention owner authority is refused"
+"$BIN/pg_ctl" -D "$BADREADER" -m immediate -w stop >/dev/null 2>&1 || true
+rm -rf "$(dirname "$BADREADER")"
+BADREADER=
 # Startup must reject a reader whose manifest was moved to another timeline.
 # Catalog provenance is checked before daemon ancestry, so the copied timeline-0
 # artifact prevents the forged timeline-1 manifest from reaching that lookup.
@@ -1721,6 +1741,16 @@ if ! $PR -c "SELECT 1;" >/dev/null 2>&1; then
 	echo "FAIL - prepared reader did not accept connections"
 	tail -100 "$READERDATA/server.log" 2>/dev/null || true
 	exit 1
+fi
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerR'::pg_lsn;")" "t" \
+	"fixed reader registers its page-history pin before serving"
+if $P -v ON_ERROR_STOP=1 -c \
+	"SELECT pagestore_retention_set(0, 1, 8001, 0, 7, '$readerR');" \
+	>/dev/null 2>&1; then
+	echo "FAIL - fixed reader accepts reserved generation zero"
+	fail=1
+else
+	echo "ok   - fixed reader rejects reserved generation zero"
 fi
 assert "$($PR -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR') > 20000;")" "t" \
 	"reader loads and validates the exact-R multi-block snapshot from the page store"
@@ -1797,6 +1827,8 @@ assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on 
 	"advancing reader rejects exporting a snapshot without its read view"
 assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerR2'::pg_lsn;")" "t" \
+	"advancing reader moves its durable pin before serving the new view"
 assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "t" \
 	"advancing reader accepts the writer handoff after reaching its token"
 assert "$($PR -c "SELECT pg_visible_in_snapshot('$readerV2Xid'::xid8, pg_current_snapshot());")" "t" \
@@ -1814,6 +1846,21 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	SET parallel_tuple_cost = 0;
 	EXPLAIN SELECT count(*) FROM reader_subxid;" | grep -c Gather)" "0" \
 	"advancing readers cannot re-enable parallel plans with session settings"
+"$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
+if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
+	echo "FAIL - advancing reader restart could not restore its boot control image"
+	exit 1
+fi
+if ! "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null; then
+	echo "FAIL - advancing reader did not restart at its durable owner horizon"
+	tail -100 "$ADVANCINGDATA/server.log" 2>/dev/null || true
+	exit 1
+fi
+assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
+	"advancing reader restart adopts its durable owner horizon before serving"
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerR2'::pg_lsn;")" "t" \
+	"advancing reader restart does not regress its durable pin"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
 rm -rf "$(dirname "$READERDATA")" "$(dirname "$ADVANCINGDATA")"

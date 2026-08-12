@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		28	/* 28: exact retention admission sequences;
+#define PS_SHM_VERSION		29	/* 29: keyed retention lookup;
+								 * 28: exact retention admission sequences;
 								 * 27: retention owner generations + stale status;
 								 * 26: durable retention registry opcodes;
 								 * 25: WAL_INDEX_GET cursor pagination;
@@ -111,6 +112,7 @@ typedef enum PsOpcode
 	PS_OP_RETENTION_PIN_SET,	/* durable set/update; fields described below */
 	PS_OP_RETENTION_PIN_DROP,	/* durable idempotent drop by owner key */
 	PS_OP_RETENTION_PIN_GET,	/* enumerate by blocknum; nblocks = total count */
+	PS_OP_RETENTION_PIN_LOOKUP,	/* atomic lookup by timeline/kind/owner id */
 	PS_OP_RETENTION_FLOOR,		/* effective floor for parent_timeline resource */
 } PsOpcode;
 
