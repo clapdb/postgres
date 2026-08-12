@@ -58,8 +58,9 @@ bootstrap, and production performance targets remain outside this MVP.
 R0 retention localsvc API
   -> R1 controller owner lifecycle
        -> R2 page-version pruning
-       -> R3 shipped-WAL reclamation
-       -> R4 WAL-index reclamation
+       -> R3a segmented-WAL format
+       -> R4 WAL-index reclamation/replacement bases
+            -> R3b shipped-WAL reclamation acceptance
        -> R4b fork-metadata compaction
        -> R5 timeline deletion
             -> R6 bounded-space acceptance
@@ -74,6 +75,8 @@ gates.
 
 R0 and H0 may proceed independently.  Reclaimers must not be enabled before R1
 has made every in-scope runtime owner visible to the retention authority.
+R3a may land before R4, but R3b and its bounded-WAL acceptance gate require
+R4's replacement bases to have removed the oldest raw-WAL dependencies.
 
 ## Retention and reclamation work
 
@@ -212,7 +215,8 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 
 ### R3. Reclaim shipped WAL
 
-Status: **design decision required; blocked on R1 and D3**.
+Status: **design decision required; R3a is blocked on R1 and D3; R3b
+acceptance is additionally blocked on the R4 replacement-base milestone**.
 
 The current flat `wal_<timeline>` file does not support simple crash-safe prefix
 deletion.  WAL reclamation must first gain a durable physical base LSN and a
@@ -225,6 +229,9 @@ Deliverables:
 - persisted base/end metadata with checksum and reopen validation;
 - append/read across physical segment boundaries and branch ancestry;
 - reclamation driven by the WAL effective floor;
+- a read-lifetime pin/reference for every selected physical WAL segment, with
+  unlink deferred until existing readers drain (or an equivalent epoch/barrier),
+  including a concurrent read-versus-reclaim fault test;
 - explicit protection for restorable control images and in-progress WAL-index
   scanning;
 - migration or fail-closed handling for the existing flat format.
@@ -249,7 +256,8 @@ Acceptance:
 - crash at create, fsync, publish, and unlink boundaries reopens safely;
 - a continuous WAL-only workload reaches bounded WAL disk usage.
 
-Expected scope: two or three PRs (format, reclaimer, crash/migration coverage).
+Expected scope: two or three PRs (format, reclaimer, crash/migration coverage),
+coordinated or stacked with R4 where the acceptance criteria overlap.
 
 ### R4. Compact and reclaim the WAL index
 
@@ -565,8 +573,8 @@ The default sequence is:
 3. R1b reader owner lifecycle;
 4. R2 page-version pruning;
 5. R3a segmented WAL format and compatibility;
-6. R3b WAL reclaimer;
-7. R4 WAL-index compaction/reclamation;
+6. R4 WAL-index compaction/reclamation and replacement bases;
+7. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
 8. R4b forkmeta compaction/reclamation and publication crash tests;
 9. R5 timeline deletion;
 10. H0 fault/inspection primitives (may start in parallel with R0-R1);
