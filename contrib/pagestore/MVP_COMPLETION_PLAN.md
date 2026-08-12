@@ -107,7 +107,9 @@ Deliverables:
 - fork metadata shares the page-history reclamation frontier: its compactor
   advances that same full tuple atomically before retiring events, and every
   page-history SET is checked against the maximum of page-image and forkmeta
-  progress.  Tests reject SET at/below a forkmeta-only advance.
+  progress.  The frontier is the oldest retained, readable tuple, so tests
+  reject SET strictly below a forkmeta-only advance and accept SET exactly at
+  it.
 
 Acceptance:
 
@@ -241,6 +243,10 @@ Deliverables:
   tests overlap appends with every metadata publication boundary;
 - append/read across physical segment boundaries and branch ancestry;
 - reclamation driven by the WAL effective floor;
+- the authoritative per-timeline WAL retained-base frontier is durably
+  published before any segment below it is unlinked.  SET and branch admission
+  consult that same metadata; crash tests stop between frontier publication and
+  each unlink and prove recovery rejects requests below the retained base;
 - a read-lifetime pin/reference for every selected physical WAL segment, with
   unlink deferred until existing readers drain (or an equivalent epoch/barrier),
   including a concurrent read-versus-reclaim fault test;
@@ -375,12 +381,14 @@ Deliverables:
   that domain, are carried by every SET/DROP and durable owner record, and are
   never inferred from a per-owner generation.  Authoritative
   DROP durably closes that incarnation; after every operation admitted under it
-  has drained, its generation tombstone may be folded into a bounded durable
-  frontier for that allocation domain even while the timeline remains live.
-  Reuse requires a higher owner incarnation, and delayed mutations for a folded
-  incarnation are rejected by that frontier.  Deleting a timeline incarnation
-  may reclaim all of its owner records while retaining the timeline-incarnation
-  fence;
+  has drained, its generation tombstone may be folded only when every earlier
+  allocated token is also durably closed and drained.  The bounded allocation-
+  domain frontier therefore advances across a contiguous closed prefix; live
+  or undrained holes remain explicit durable records and prevent it from
+  passing them.  Reuse requires a higher owner incarnation, and delayed
+  mutations for a folded incarnation are rejected by that frontier.  Deleting
+  a timeline incarnation may reclaim all of its owner records while retaining
+  the timeline-incarnation fence;
 - crash-safe checkpoint/compaction of the shared timeline-state log, retaining
   each slot's current state and maximum incarnation while bounding startup
   replay;
