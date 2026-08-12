@@ -29,8 +29,9 @@ main(void)
 	char path[1024];
 	char retry_directory[512];
 	uint32_t first_len = 2 * PS_WAL_SEGMENT_PAYLOAD_BYTES;
-	uint32_t retry_len = PS_WAL_SEGMENT_PAYLOAD_BYTES + 97;
-	unsigned char *input = malloc((size_t) first_len + 211);
+	uint32_t retry_len = 2 * PS_WAL_SEGMENT_PAYLOAD_BYTES;
+	unsigned char *input = malloc((size_t) first_len +
+								  PS_WAL_SEGMENT_PAYLOAD_BYTES);
 	unsigned char window[256];
 	PsWalSegmentHeader header;
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
@@ -39,7 +40,7 @@ main(void)
 	int fd;
 
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
-	for (uint32_t i = 0; i < first_len + 211; i++)
+	for (uint32_t i = 0; i < first_len + PS_WAL_SEGMENT_PAYLOAD_BYTES; i++)
 		input[i] = (unsigned char) (i * 31u + 7u);
 	check(ps_wal_store_create(&store, directory, 7, 0) == 0,
 		  "create an empty timeline WAL segment store");
@@ -51,9 +52,13 @@ main(void)
 						window, 128) == 0 &&
 		  memcmp(window, input + PS_WAL_SEGMENT_PAYLOAD_BYTES - 64, 128) == 0,
 		  "one read crosses two immutable segment files");
-	check(ps_wal_store_append(&store, store.end_lsn, input + first_len, 211) == 0 &&
+	check(ps_wal_store_append(&store, store.end_lsn, input + first_len, 211) != 0 &&
+		  store.nentries == 2 && store.end_lsn == first_len,
+		  "partial append is rejected without stranding an immutable segment");
+	check(ps_wal_store_append(&store, store.end_lsn, input + first_len,
+								 PS_WAL_SEGMENT_PAYLOAD_BYTES) == 0 &&
 		  store.nentries == 3,
-		  "a later contiguous append publishes the next segment identity");
+		  "a later complete append publishes the next segment identity");
 	check(ps_wal_store_read(&store, first_len - 32, window, 96) == 0 &&
 		  memcmp(window, input + first_len - 32, 96) == 0,
 		  "read spans segment files created by separate appends");
