@@ -6786,6 +6786,34 @@ pagestore_latest_reader_snapshot_ready(void)
 }
 
 static bool
+pagestore_reader_database_dir_valid(const char *mapdir, Oid dboid,
+									XLogRecPtr read_lsn, pg_crc32c global_crc)
+{
+	PagestoreReaderSnapshotManifest manifest;
+	PagestoreReaderSnapshotManifest checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, dboid);
+	char page[BLCKSZ];
+	uint64 manifest_lsn = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &manifest_lsn,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || manifest_lsn != read_lsn)
+		return false;
+	memcpy(&manifest, page, sizeof(manifest));
+	checked = manifest;
+	pagestore_reader_snapshot_manifest_crc(&checked);
+	return manifest.magic == PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC &&
+		manifest.format == PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT &&
+		manifest.timeline == pagestore_localsvc_timeline() &&
+		manifest.read_lsn == read_lsn &&
+		EQ_CRC32C(manifest.crc, checked.crc) &&
+		EQ_CRC32C(manifest.global_relmap_crc, global_crc) &&
+		EQ_CRC32C(manifest.local_relmap_crc,
+					 pagestore_reader_relmap_crc(mapdir));
+}
+
+static bool
 pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 {
 	PagestoreReaderDatabaseBarrier barrier;
@@ -6815,7 +6843,8 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 	/*
 	 * The durable manifests are produced on the writer.  Before allowing one
 	 * database to advance the instance-wide reader pin, independently verify
-	 * every default-tablespace relation map in this reader's PGDATA.  The
+	 * every database-local relation map across pg_default and pg_tblspc in this
+	 * reader's PGDATA.  The
 	 * count and ordered-OID checksum prevent silently omitting another
 	 * database whose local map has not reached this horizon.
 	 */
@@ -6837,12 +6866,7 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 			char	   *endptr;
 			unsigned long parsed;
 			Oid			dboid;
-			PagestoreReaderSnapshotManifest manifest;
-			PagestoreReaderSnapshotManifest manifest_checked;
-			PageStoreRelKey manifest_key;
-			char		manifest_page[BLCKSZ];
 			char		mapdir[MAXPGPATH];
-			uint64		manifest_lsn = 0;
 			int			len;
 
 			errno = 0;
@@ -6851,27 +6875,10 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 				parsed == 0 || parsed > PG_UINT32_MAX)
 				continue;
 			dboid = (Oid) parsed;
-			manifest_key = pagestore_reader_snapshot_key(
-				PAGESTORE_READER_SNAPSHOT_MANIFEST_OBJECT, dboid);
-			if (!pagestore_localsvc_obj_read_at_timeout(
-					PS_KLASS_READER_SNAPSHOT, &manifest_key, 0,
-					(uint64) read_lsn, manifest_page, &manifest_lsn,
-					PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) ||
-				manifest_lsn != read_lsn)
-				continue;
-			memcpy(&manifest, manifest_page, sizeof(manifest));
-			manifest_checked = manifest;
-			pagestore_reader_snapshot_manifest_crc(&manifest_checked);
 			len = snprintf(mapdir, sizeof(mapdir), "base/%u", dboid);
 			if (len < 0 || len >= (int) sizeof(mapdir) ||
-				manifest.magic != PAGESTORE_READER_SNAPSHOT_MANIFEST_MAGIC ||
-				manifest.format != PAGESTORE_READER_SNAPSHOT_MANIFEST_FORMAT ||
-				manifest.timeline != pagestore_localsvc_timeline() ||
-				manifest.read_lsn != read_lsn ||
-				!EQ_CRC32C(manifest.crc, manifest_checked.crc) ||
-				!EQ_CRC32C(manifest.global_relmap_crc, global_crc) ||
-				!EQ_CRC32C(manifest.local_relmap_crc,
-							 pagestore_reader_relmap_crc(mapdir)))
+				!pagestore_reader_database_dir_valid(mapdir, dboid, read_lsn,
+												 global_crc))
 			{
 				FreeDir(dir);
 				pfree(oids);
@@ -6883,6 +6890,72 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 				oids = repalloc(oids, sizeof(Oid) * capacity);
 			}
 			oids[count++] = dboid;
+		}
+		FreeDir(dir);
+		/* A database whose default tablespace is not pg_default lives below
+		 * pg_tblspc/<tablespace>/<version>/<dboid>.  Only the default database
+		 * directory carries pg_filenode.map, which also avoids duplicate OIDs for
+		 * relations placed in additional tablespaces. */
+		dir = AllocateDir("pg_tblspc");
+		if (dir == NULL)
+		{
+			pfree(oids);
+			return false;
+		}
+		while ((de = ReadDir(dir, "pg_tblspc")) != NULL)
+		{
+			char versiondir[MAXPGPATH];
+			DIR *dbdir;
+			struct dirent *dbde;
+			int len = snprintf(versiondir, sizeof(versiondir),
+				"pg_tblspc/%s/%s", de->d_name, TABLESPACE_VERSION_DIRECTORY);
+
+			if (len < 0 || len >= (int) sizeof(versiondir) ||
+				(dbdir = AllocateDir(versiondir)) == NULL)
+				continue;
+			while ((dbde = ReadDir(dbdir, versiondir)) != NULL)
+			{
+				char *endptr;
+				unsigned long parsed;
+				Oid dboid;
+				char mapdir[MAXPGPATH];
+				char mapfile[MAXPGPATH];
+				bool duplicate = false;
+
+				errno = 0;
+				parsed = strtoul(dbde->d_name, &endptr, 10);
+				if (errno != 0 || *dbde->d_name == '\0' || *endptr != '\0' ||
+					parsed == 0 || parsed > PG_UINT32_MAX)
+					continue;
+				dboid = (Oid) parsed;
+				for (int i = 0; i < count; i++)
+					if (oids[i] == dboid)
+						duplicate = true;
+				if (duplicate)
+					continue;
+				len = snprintf(mapdir, sizeof(mapdir), "%s/%u",
+					versiondir, dboid);
+				if (len < 0 || len >= (int) sizeof(mapdir) ||
+					(len = snprintf(mapfile, sizeof(mapfile),
+									"%s/pg_filenode.map", mapdir)) < 0 ||
+					len >= (int) sizeof(mapfile) || access(mapfile, F_OK) != 0)
+					continue;
+				if (!pagestore_reader_database_dir_valid(mapdir, dboid, read_lsn,
+												 global_crc))
+				{
+					FreeDir(dbdir);
+					FreeDir(dir);
+					pfree(oids);
+					return false;
+				}
+				if (count == capacity)
+				{
+					capacity *= 2;
+					oids = repalloc(oids, sizeof(Oid) * capacity);
+				}
+				oids[count++] = dboid;
+			}
+			FreeDir(dbdir);
 		}
 		FreeDir(dir);
 		qsort(oids, count, sizeof(Oid), oid_cmp);
@@ -8287,6 +8360,7 @@ adoption_done:
 				pagestore_retention_owner_id,
 				pagestore_retention_owner_generation,
 				PS_READER_RETENTION_RESOURCES, (uint64) published,
+				read_seq,
 				PS_READER_RETENTION_TIMEOUT_MS);
 		}
 		PG_CATCH();
@@ -10052,6 +10126,7 @@ pagestore_validate_datadir_branch_manifest(void)
 	XLogRecPtr	fork_lsn;
 	XLogRecPtr	reader_fork_lsn;
 	uint64		read_lsn;
+	uint64		read_seq = 0;
 	bool		found;
 	uint8		retention_status;
 	PsRetentionPin existing_pin;
@@ -10136,6 +10211,10 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (reader_snapshot->xids != NULL)
 			pfree(reader_snapshot->xids);
 		pfree(reader_snapshot);
+		if (!pagestore_localsvc_read_fence_timeout(read_lsn, &read_seq,
+				PAGESTORE_READER_HORIZON_TIMEOUT_MS))
+			ereport(FATAL,
+					(errmsg("pagestore reader has no durable admission fence at its configured horizon")));
 
 		/*
 		 * This is the last local-only validation step.  Reconcile or register
@@ -10172,7 +10251,9 @@ pagestore_validate_datadir_branch_manifest(void)
 				ereport(FATAL,
 						(errmsg("fixed pagestore reader owner is already above its configured horizon"),
 						 errhint("Reprovision the fixed reader with a new owner identity at a retained horizon.")));
-			set_reader_pin = existing_pin.lsn < read_lsn;
+			set_reader_pin = existing_pin.lsn < read_lsn ||
+				(existing_pin.lsn == read_lsn &&
+				 existing_pin.admission_seq != read_seq);
 		}
 		if (set_reader_pin)
 		{
@@ -10181,6 +10262,7 @@ pagestore_validate_datadir_branch_manifest(void)
 				pagestore_retention_owner_id,
 				pagestore_retention_owner_generation,
 				PS_READER_RETENTION_RESOURCES, read_lsn,
+				read_seq,
 				PS_READER_RETENTION_TIMEOUT_MS);
 			if (retention_status == PS_STATUS_STALE)
 				ereport(FATAL,
