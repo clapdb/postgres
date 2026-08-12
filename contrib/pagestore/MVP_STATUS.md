@@ -174,10 +174,12 @@ Segment GC removes page-log segments covered by image layers, but long-running
 logical history is not yet bounded.  `retention.meta` is now the durable,
 CRC-protected owner registry for reader, materializer, and configured pins.
 Each pin carries a resource mask for page history, shipped WAL, and the WAL
-index; updates replace a stable `(timeline, owner kind, owner id)` generation,
-drops are idempotent, enumeration is available over IPC, and churn is compacted
-off the request path.  Recovery truncates only an incomplete final record and
-fails closed on any complete corrupt record or a pin whose timeline is absent.
+index.  Controller-assigned stable owner IDs now carry monotonic generations;
+the registry rejects stale SET/DROP requests and retains an unenumerated
+generation tombstone after DROP so delayed owners stay fenced across restart
+and compaction.  Enumeration is available over IPC, and churn is compacted off
+the request path.  Recovery truncates only an incomplete final record and fails
+closed on any complete corrupt record or a pin whose timeline is absent.
 
 The effective-floor query projects explicit descendant pins through every
 branch cap, derives permanent fork-point pins from timeline metadata rather

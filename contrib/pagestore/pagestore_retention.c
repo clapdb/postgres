@@ -83,6 +83,8 @@ static pthread_mutex_t retention_lock = PTHREAD_MUTEX_INITIALIZER;
 static int test_fail_append_after_write;
 static int test_fail_rollback;
 
+static int retention_identity_matches(const struct stat *st);
+
 #define PS_RETENTION_COMPACT_RETRY_MS 1000
 
 static int
@@ -151,7 +153,13 @@ retention_pin_valid(const PsRetentionPin *pin)
 {
 	return pin != NULL && retention_kind_valid(pin->owner_kind) &&
 		retention_resources_valid(pin->resources) && pin->owner_id != 0 &&
-		pin->lsn != 0 && pin->pad == 0;
+		pin->lsn != 0;
+}
+
+static int
+retention_pin_active(const PsRetentionPin *pin)
+{
+	return pin->resources != 0;
 }
 
 static int
@@ -167,7 +175,7 @@ retention_record_valid(const PsRetentionRecord *rec)
 	if (rec->type == PS_RETENTION_DROP)
 		return retention_kind_valid(rec->pin.owner_kind) &&
 			rec->pin.owner_id != 0 && rec->pin.resources == 0 &&
-			rec->pin.lsn == 0 && rec->pin.pad == 0;
+			rec->pin.lsn == 0;
 	return 0;
 }
 
@@ -180,6 +188,30 @@ retention_find(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id)
 			retention_pins[i].owner_id == owner_id)
 			return (int) i;
 	return -1;
+}
+
+/* Caller holds retention_lock. */
+static uint32_t
+retention_active_count(void)
+{
+	uint32_t	count = 0;
+
+	for (uint32_t i = 0; i < retention_npins; i++)
+		if (retention_pin_active(&retention_pins[i]))
+			count++;
+	return count;
+}
+
+/* Exact retries must still notice a lost, truncated, or replaced log. */
+static int
+retention_log_matches(void)
+{
+	struct stat st;
+
+	return stat(retention_path, &st) == 0 &&
+		retention_identity_matches(&st) &&
+		st.st_size == (off_t) (retention_nrecords *
+								 sizeof(PsRetentionRecord));
 }
 
 static int
@@ -209,6 +241,14 @@ retention_apply(const PsRetentionRecord *rec)
 
 	if (rec->type == PS_RETENTION_SET)
 	{
+		if (idx >= 0 &&
+			rec->pin.generation < retention_pins[idx].generation)
+			return -1;
+		if (idx >= 0 &&
+			rec->pin.generation == retention_pins[idx].generation &&
+			rec->pin.generation != 0 &&
+			!retention_pin_active(&retention_pins[idx]))
+			return -1;
 		if (idx >= 0)
 			retention_pins[idx] = rec->pin;
 		else
@@ -220,11 +260,15 @@ retention_apply(const PsRetentionRecord *rec)
 	}
 	else if (idx >= 0)
 	{
-		if ((uint32_t) idx + 1 < retention_npins)
-			memmove(&retention_pins[idx], &retention_pins[idx + 1],
-					(size_t) (retention_npins - (uint32_t) idx - 1) *
-						sizeof(*retention_pins));
-		retention_npins--;
+		if (rec->pin.generation < retention_pins[idx].generation)
+			return -1;
+		retention_pins[idx] = rec->pin;
+	}
+	else
+	{
+		if (retention_reserve(retention_npins + 1) != 0)
+			return -1;
+		retention_pins[retention_npins++] = rec->pin;
 	}
 	return 0;
 }
@@ -703,14 +747,22 @@ ps_retention_set(const PsRetentionPin *pin)
 	if (retention_is_poisoned)
 		goto done;
 	idx = retention_find(pin->timeline, pin->owner_kind, pin->owner_id);
+	if (idx >= 0 && pin->generation < retention_pins[idx].generation)
+	{
+		rc = PS_RETENTION_STALE;
+		goto done;
+	}
+	if (idx >= 0 && pin->generation == retention_pins[idx].generation &&
+		pin->generation != 0 &&
+		!retention_pin_active(&retention_pins[idx]))
+	{
+		rc = PS_RETENTION_STALE;
+		goto done;
+	}
 	if (idx >= 0 && memcmp(&retention_pins[idx], pin, sizeof(*pin)) == 0)
 	{
-		struct stat st;
-
-		if (stat(retention_path, &st) == 0 &&
-			retention_identity_matches(&st) &&
-			st.st_size == (off_t) (retention_nrecords * sizeof(rec)))
-			rc = 0;			/* exact retry: no log churn */
+		if (retention_log_matches())
+			rc = PS_RETENTION_OK;	/* exact retry: no log churn */
 		else
 			retention_is_poisoned = 1;
 	}
@@ -725,7 +777,7 @@ ps_retention_set(const PsRetentionPin *pin)
 			retention_pins[idx] = *pin;
 		else
 			retention_pins[retention_npins++] = *pin;
-		rc = 0;
+		rc = PS_RETENTION_OK;
 	}
 done:
 	pthread_mutex_unlock(&retention_lock);
@@ -733,7 +785,8 @@ done:
 }
 
 int
-ps_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id)
+ps_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				  uint32_t generation)
 {
 	PsRetentionPin pin;
 	PsRetentionRecord rec;
@@ -746,24 +799,35 @@ ps_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id)
 	if (retention_is_poisoned)
 		goto done;
 	idx = retention_find(timeline, owner_kind, owner_id);
-	if (idx < 0)
+	if (idx >= 0 && generation < retention_pins[idx].generation)
 	{
-		rc = 0;				/* idempotent retry */
+		rc = PS_RETENTION_STALE;
+		goto done;
+	}
+	if (idx >= 0 && generation == retention_pins[idx].generation &&
+		!retention_pin_active(&retention_pins[idx]))
+	{
+		if (retention_log_matches())
+			rc = PS_RETENTION_OK;	/* exact retry: no log churn */
+		else
+			retention_is_poisoned = 1;
 		goto done;
 	}
 	memset(&pin, 0, sizeof(pin));
 	pin.timeline = timeline;
 	pin.owner_kind = owner_kind;
 	pin.owner_id = owner_id;
+	pin.generation = generation;
+	if (idx < 0 && retention_reserve(retention_npins + 1) != 0)
+		goto done;
 	retention_make_record(&rec, PS_RETENTION_DROP, &pin);
 	if (retention_append(&rec) != 0)
 		goto done;
-	if ((uint32_t) idx + 1 < retention_npins)
-		memmove(&retention_pins[idx], &retention_pins[idx + 1],
-				(size_t) (retention_npins - (uint32_t) idx - 1) *
-					sizeof(*retention_pins));
-	retention_npins--;
-	rc = 0;
+	if (idx >= 0)
+		retention_pins[idx] = pin;
+	else
+		retention_pins[retention_npins++] = pin;
+	rc = PS_RETENTION_OK;
 done:
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
@@ -778,7 +842,7 @@ ps_retention_count(uint32_t *count_out)
 	if (retention_is_poisoned)
 		rc = -1;
 	else if (count_out)
-		*count_out = retention_npins;
+		*count_out = retention_active_count();
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
@@ -793,13 +857,22 @@ ps_retention_get(uint32_t index, PsRetentionPin *pin_out, uint32_t *count_out)
 		rc = -1;
 	else
 	{
+		uint32_t	active = retention_active_count();
+		uint32_t	seen = 0;
+
 		if (count_out)
-			*count_out = retention_npins;
-		if (index < retention_npins)
+			*count_out = active;
+		for (uint32_t i = 0; i < retention_npins; i++)
 		{
-			if (pin_out)
-				*pin_out = retention_pins[index];
-			rc = 1;
+			if (!retention_pin_active(&retention_pins[i]))
+				continue;
+			if (seen++ == index)
+			{
+				if (pin_out)
+					*pin_out = retention_pins[i];
+				rc = 1;
+				break;
+			}
 		}
 	}
 	pthread_mutex_unlock(&retention_lock);
@@ -813,12 +886,16 @@ ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 	int rc = 0;
 
 	pthread_mutex_lock(&retention_lock);
-	if (retention_is_poisoned || capacity < retention_npins)
+	if (retention_is_poisoned || capacity < retention_active_count())
 		rc = -1;
 	else
 	{
-		memcpy(pins, retention_pins, (size_t) retention_npins * sizeof(*pins));
-		*count_out = retention_npins;
+		uint32_t	count = 0;
+
+		for (uint32_t i = 0; i < retention_npins; i++)
+			if (retention_pin_active(&retention_pins[i]))
+				pins[count++] = retention_pins[i];
+		*count_out = count;
 	}
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
@@ -835,16 +912,22 @@ ps_retention_snapshot_alloc(PsRetentionPin **pins_out, uint32_t *count_out)
 	pthread_mutex_lock(&retention_lock);
 	if (retention_is_poisoned)
 		goto done;
-	if (retention_npins > 0)
+	if (retention_active_count() > 0)
 	{
-		snapshot = malloc((size_t) retention_npins * sizeof(*snapshot));
+		uint32_t	count = retention_active_count();
+
+		snapshot = malloc((size_t) count * sizeof(*snapshot));
 		if (!snapshot)
 			goto done;
-		memcpy(snapshot, retention_pins,
-			   (size_t) retention_npins * sizeof(*snapshot));
+		count = 0;
+		for (uint32_t i = 0; i < retention_npins; i++)
+			if (retention_pin_active(&retention_pins[i]))
+				snapshot[count++] = retention_pins[i];
+		*count_out = count;
 	}
+	else
+		*count_out = 0;
 	*pins_out = snapshot;
-	*count_out = retention_npins;
 	rc = 0;
 done:
 	pthread_mutex_unlock(&retention_lock);
@@ -891,7 +974,10 @@ ps_retention_compact(void)
 	{
 		PsRetentionRecord rec;
 
-		retention_make_record(&rec, PS_RETENTION_SET, &retention_pins[i]);
+		retention_make_record(&rec,
+						  retention_pin_active(&retention_pins[i]) ?
+						  PS_RETENTION_SET : PS_RETENTION_DROP,
+						  &retention_pins[i]);
 		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
 			goto done;
 		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
