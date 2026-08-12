@@ -187,8 +187,9 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 
 Meson installs the POSIX foreground service as
 `pagestore_materializer_supervisor`.  It accepts `--config PATH`; the strict
-schema-2 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
-`socket_dir`, `log_file`, and `state_dir` paths, a PostgreSQL `port`, and a
+schema-3 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
+`socket_dir`, `log_file`, `state_dir`, and controller-owned
+`retention_authority_dir` paths, a PostgreSQL `port`, and a
 controller-assigned nonzero `retention_owner_id` that remains stable across
 replacement workers.
 Optional fields select `database`, `user`, polling/replay-idle/progress timeout
@@ -198,10 +199,16 @@ durably increments `retention_generation` and passes both retention values as
 postmaster settings.  `--check-config` validates and prepares the runtime
 directories without taking ownership.
 
-The nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
+The per-PGDATA nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
 `state_dir` cannot create a second owner for the same worker.  Lock contention
 exits with status 75; invalid configuration exits with 78.  The lock contents
 are diagnostic only—the held `flock` is authoritative.
+
+Generation allocation and its lock are stored by owner ID in
+`retention_authority_dir`.  The controller must supply one shared durable
+namespace for every incarnation of an owner; it must not be a per-PGDATA or
+per-supervisor status directory.  Consequently replacement PGDATA instances
+with different `state_dir` values serialize on the same generation authority.
 
 `state_dir/status.json` is replaced atomically after fsync and reports schema,
 state, owner PID/epoch, worker generation, retention owner ID/generation,

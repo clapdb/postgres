@@ -20,7 +20,7 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-CONFIG_SCHEMA = 2
+CONFIG_SCHEMA = 3
 STATUS_SCHEMA = 2
 CONFIG_FIELDS = {
     "schema",
@@ -31,6 +31,7 @@ CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_authority_dir",
     "retention_owner_id",
     "database",
     "user",
@@ -51,6 +52,7 @@ REQUIRED_CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_authority_dir",
     "retention_owner_id",
 }
 
@@ -72,6 +74,7 @@ class Config:
     port: int
     log_file: Path
     state_dir: Path
+    retention_authority_dir: Path
     retention_owner_id: int
     database: str = "postgres"
     user: str = "postgres"
@@ -119,6 +122,7 @@ class Config:
             "socket_dir",
             "log_file",
             "state_dir",
+            "retention_authority_dir",
         ):
             item = value[field]
             if not isinstance(item, str) or not item:
@@ -177,6 +181,7 @@ class Config:
         try:
             paths["socket_dir"].mkdir(parents=True, exist_ok=True)
             paths["state_dir"].mkdir(parents=True, exist_ok=True)
+            paths["retention_authority_dir"].mkdir(parents=True, exist_ok=True)
             paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise ConfigError(
@@ -200,13 +205,14 @@ class Config:
 
     @property
     def retention_generation_file(self) -> Path:
-        # Controller state must not be copied with a disposable PGDATA clone.
-        return self.state_dir / f"retention-owner-{self.retention_owner_id}.json"
+        # The controller namespace is shared by every incarnation of an owner;
+        # it is deliberately independent of PGDATA and local status state.
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.json"
 
     @property
     def retention_authority_lock_file(self) -> Path:
-        # Serialize generation allocation across replacement PGDATA trees.
-        return self.state_dir / f"retention-owner-{self.retention_owner_id}.lock"
+        # Serialize generation allocation across replacement PGDATA/status trees.
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.lock"
 
 
 @dataclass(frozen=True)
