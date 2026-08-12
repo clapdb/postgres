@@ -21,6 +21,7 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
+CONFIG_SCHEMA = 2
 RECEIPT_SCHEMA = 1
 SAFE_POSTGRES_OPTION_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
 WAL_FILE_NAME = re.compile(r"^[0-9A-F]{24}$")
@@ -176,8 +177,11 @@ class Config:
             raise ConfigError(f"unknown branch config field(s): {', '.join(unknown)}")
         if missing:
             raise ConfigError(f"missing branch config field(s): {', '.join(missing)}")
-        if value.get("schema") != 1 or isinstance(value.get("schema"), bool):
-            raise ConfigError("branch config schema must be 1")
+        if (
+            value.get("schema") != CONFIG_SCHEMA
+            or isinstance(value.get("schema"), bool)
+        ):
+            raise ConfigError(f"branch config schema must be {CONFIG_SCHEMA}")
 
         paths: dict[str, Path] = {}
         for field in (
@@ -499,6 +503,8 @@ class BranchPreparer:
                 " AND current_setting('pagestore.backend') = 'localsvc'"
                 " AND current_setting('pagestore.materializer')::boolean"
                 " AND current_setting('pagestore.route_all')::boolean"
+                " AND current_setting('pagestore.retention_owner_id') = '"
+                + str(self.config.retention_owner_id) + "'"
                 " AND current_setting('pagestore.timeline')::integer = "
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"

@@ -1549,6 +1549,7 @@ def run_materializer_smoke(
                     "state_dir": str(supervisor_state),
                     "retention_authority_dir": str(root / "controller-authority"),
                     "retention_owner_id": 1,
+                    "controller_instance_id": "harness-controller-1",
                     "poll_interval_ms": 100,
                     "replay_idle_ms": 300,
                     "progress_timeout_ms": 10000,

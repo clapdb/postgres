@@ -20,7 +20,7 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-CONFIG_SCHEMA = 3
+CONFIG_SCHEMA = 4
 STATUS_SCHEMA = 2
 CONFIG_FIELDS = {
     "schema",
@@ -33,6 +33,7 @@ CONFIG_FIELDS = {
     "state_dir",
     "retention_authority_dir",
     "retention_owner_id",
+    "controller_instance_id",
     "database",
     "user",
     "poll_interval_ms",
@@ -54,6 +55,7 @@ REQUIRED_CONFIG_FIELDS = {
     "state_dir",
     "retention_authority_dir",
     "retention_owner_id",
+    "controller_instance_id",
 }
 
 
@@ -76,6 +78,7 @@ class Config:
     state_dir: Path
     retention_authority_dir: Path
     retention_owner_id: int
+    controller_instance_id: str
     database: str = "postgres"
     user: str = "postgres"
     poll_interval_ms: int = 1000
@@ -170,9 +173,13 @@ class Config:
             raise ConfigError("retry_initial_ms must not exceed retry_max_ms")
 
         strings: dict[str, str] = {}
-        for field, default in (("database", "postgres"), ("user", "postgres")):
+        for field, default in (
+            ("controller_instance_id", None),
+            ("database", "postgres"),
+            ("user", "postgres"),
+        ):
             item = value.get(field, default)
-            if not isinstance(item, str) or not item:
+            if not isinstance(item, str) or not item or "\x00" in item:
                 raise ConfigError(
                     f"supervisor config {field} must be a non-empty string"
                 )
@@ -366,6 +373,7 @@ class Supervisor:
         authority = previous_status(config.retention_generation_file)
         authority_generation = authority.get("retention_generation")
         authority_data_dir = authority.get("consumer_data_dir")
+        authority_instance_id = authority.get("consumer_instance_id")
         if authority_exists:
             if (
                 not isinstance(authority_generation, int)
@@ -380,35 +388,27 @@ class Supervisor:
                 raise OwnershipError(
                     "materializer retention generation authority lacks consumer identity"
                 )
+            if not isinstance(authority_instance_id, str) or not authority_instance_id:
+                raise OwnershipError(
+                    "materializer retention generation authority lacks controller identity"
+                )
             old_retention_generation = authority_generation
         elif old:
-            # Upgrade from the status-only format is allowed only with an
-            # intact positive generation; ambiguity must not reuse generation 1.
-            if (
-                not isinstance(old_retention_generation, int)
-                or isinstance(old_retention_generation, bool)
-                or old_retention_generation < 1
-                or old_retention_generation > (1 << 32) - 1
-            ):
-                raise OwnershipError(
-                    "materializer status lacks retention generation authority"
-                )
-            atomic_write_json(
-                config.retention_generation_file,
-                {
-                    "retention_generation": old_retention_generation,
-                    "consumer_data_dir": str(config.data_dir),
-                },
+            # Status did not durably identify the controller/consumer that
+            # owns its generation, so migration cannot safely quiesce it.
+            raise OwnershipError(
+                "status-only materializer authority cannot be migrated safely"
             )
-            authority_data_dir = str(config.data_dir)
         else:
             # A genuinely new PGDATA has no prior worker or durable owner.
             old_retention_generation = 0
             authority_data_dir = None
+            authority_instance_id = None
         self.owner_epoch = old_epoch + 1
         self.generation = old_generation
         self.retention_generation = old_retention_generation
         self.previous_consumer_data_dir = authority_data_dir
+        self.previous_consumer_instance_id = authority_instance_id
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -564,9 +564,11 @@ class Supervisor:
             {
                 "retention_generation": self.retention_generation,
                 "consumer_data_dir": str(self.config.data_dir),
+                "consumer_instance_id": self.config.controller_instance_id,
             },
         )
         self.previous_consumer_data_dir = str(self.config.data_dir)
+        self.previous_consumer_instance_id = self.config.controller_instance_id
         self.publish("starting", reason=reason)
         server_options = (
             "-c pagestore.retention_owner_id="
@@ -586,8 +588,13 @@ class Supervisor:
 
     def quiesce_previous_consumer(self) -> None:
         previous = self.previous_consumer_data_dir
-        if previous is None or Path(previous) == self.config.data_dir:
+        previous_instance = self.previous_consumer_instance_id
+        if previous is None:
             return
+        if previous_instance != self.config.controller_instance_id:
+            raise OwnershipError(
+                "cannot prove a materializer owned by another controller instance is quiesced"
+            )
         if not Path(previous).is_dir():
             raise OwnershipError(
                 "cannot prove the previous materializer consumer is quiesced"

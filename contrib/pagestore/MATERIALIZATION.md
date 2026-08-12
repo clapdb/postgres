@@ -187,11 +187,14 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 
 Meson installs the POSIX foreground service as
 `pagestore_materializer_supervisor`.  It accepts `--config PATH`; the strict
-schema-3 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
+schema-4 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
 `socket_dir`, `log_file`, `state_dir`, and controller-owned
 `retention_authority_dir` paths, a PostgreSQL `port`, and a
 controller-assigned nonzero `retention_owner_id` that remains stable across
-replacement workers.
+replacement workers.  It also requires a globally unique
+`controller_instance_id`; generation authority records bind the consumer to
+that identity, and takeover from another identity fails closed until the old
+controller has explicitly quiesced and handed off its worker.
 Optional fields select `database`, `user`, polling/replay-idle/progress timeout
 intervals, command timeout, exponential retry bounds, and the maximum
 consecutive failure count.  Before starting a replacement worker the supervisor
@@ -231,7 +234,7 @@ until a higher controller generation takes over.
 ## Local serialized branch prepare
 
 Meson also installs the one-shot `pagestore_branch_prepare --config PATH`
-controller.  Its strict schema-1 JSON names absolute `pg_ctl`, `psql`, writer
+controller.  Its strict schema-2 JSON names absolute `pg_ctl`, `psql`, writer
 and materializer PGDATA, writer log, private socket, and prepared-artifact
 paths; public writer/materializer hosts and ports; a private writer port;
 logical parent/child timelines; and optional database, user, polling, progress,

@@ -40,6 +40,7 @@ class SupervisorTests(unittest.TestCase):
             "state_dir": str(self.root / "state"),
             "retention_authority_dir": str(self.root / "controller-authority"),
             "retention_owner_id": 7001,
+            "controller_instance_id": "controller-test-1",
             "poll_interval_ms": 1,
             "retry_initial_ms": 1,
             "retry_max_ms": 2,
@@ -68,7 +69,9 @@ class SupervisorTests(unittest.TestCase):
             MODULE.Config.load(self.write_config(typo=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "must be absolute"):
             MODULE.Config.load(self.write_config(state_dir="relative"))
-        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 3"):
+        with self.assertRaisesRegex(
+            MODULE.ConfigError, f"schema must be {MODULE.CONFIG_SCHEMA}"
+        ):
             MODULE.Config.load(self.write_config(schema=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "retention_owner_id"):
             value = self.config_value()
@@ -146,6 +149,14 @@ class SupervisorTests(unittest.TestCase):
                 "retention_generation": 11,
             },
         )
+        MODULE.atomic_write_json(
+            config.retention_generation_file,
+            {
+                "retention_generation": 11,
+                "consumer_data_dir": str(config.data_dir),
+                "consumer_instance_id": config.controller_instance_id,
+            },
+        )
         supervisor = MODULE.Supervisor(config)
         self.assertEqual(supervisor.owner_epoch, 5)
         self.assertEqual(supervisor.generation, 7)
@@ -200,6 +211,7 @@ class SupervisorTests(unittest.TestCase):
             {
                 "retention_generation": 4,
                 "consumer_data_dir": str(first.data_dir),
+                "consumer_instance_id": first.controller_instance_id,
             },
         )
         clone = self.root / "clone"
@@ -230,8 +242,22 @@ class SupervisorTests(unittest.TestCase):
     def test_existing_ambiguous_status_fails_closed(self):
         config = MODULE.Config.load(self.write_config())
         MODULE.atomic_write_json(config.status_file, {"state": "running"})
-        with self.assertRaisesRegex(MODULE.OwnershipError, "generation authority"):
+        with self.assertRaisesRegex(MODULE.OwnershipError, "cannot be migrated"):
             MODULE.Supervisor(config)
+
+    def test_takeover_from_another_controller_instance_fails_closed(self):
+        config = MODULE.Config.load(self.write_config())
+        MODULE.atomic_write_json(
+            config.retention_generation_file,
+            {
+                "retention_generation": 4,
+                "consumer_data_dir": str(config.data_dir),
+                "consumer_instance_id": "another-controller",
+            },
+        )
+        supervisor = MODULE.Supervisor(config)
+        with self.assertRaisesRegex(MODULE.OwnershipError, "another controller"):
+            supervisor.start_worker("takeover")
 
     def test_start_failures_retry_to_the_configured_bound(self):
         config = MODULE.Config.load(self.write_config())

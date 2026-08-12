@@ -34,7 +34,7 @@ class BranchPrepareTests(unittest.TestCase):
 
     def config_value(self, **overrides):
         value = {
-            "schema": 1,
+            "schema": MODULE.CONFIG_SCHEMA,
             "pg_ctl": sys.executable,
             "psql": sys.executable,
             "writer_data_dir": str(self.writer),
@@ -82,7 +82,9 @@ class BranchPrepareTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(MODULE.ConfigError, "outside"):
             MODULE.Config.load(self.write_config(prepared_dir=str(self.root)))
-        with self.assertRaisesRegex(MODULE.ConfigError, "schema must be 1"):
+        with self.assertRaisesRegex(
+            MODULE.ConfigError, f"schema must be {MODULE.CONFIG_SCHEMA}"
+        ):
             MODULE.Config.load(self.write_config(schema=True))
         with self.assertRaisesRegex(MODULE.ConfigError, "exceeds 1023"):
             MODULE.Config.load(self.write_config(new_timeline=1024))
