@@ -129,7 +129,8 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
             set(schema["operations"]),
-            {"health", "timeline", "relation", "manifest", "gc", "backpressure"},
+            {"health", "timeline", "relation", "manifest", "gc", "backpressure",
+             "pruning"},
         )
 
     def test_inspector_response_must_match_schema(self):
@@ -856,6 +857,9 @@ class PlanValidationTests(unittest.TestCase):
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0}' ;;\n"
+            "pruning) printf '%s\\n' "
+            "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
+            "\"versions_deleted\":0}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -928,6 +932,9 @@ class PlanValidationTests(unittest.TestCase):
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0}' ;;\n"
+            "pruning) printf '%s\\n' "
+            "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
+            "\"versions_deleted\":0}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )

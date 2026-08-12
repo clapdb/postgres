@@ -231,6 +231,9 @@ INSPECTION_RESPONSES = {
         "idle", "claimed", "request", "done", "shards",
         "wal_index_pending_bytes", "wal_index_lagging_timelines",
     },
+    "pruning": {
+        "compactions", "versions_scanned", "versions_kept", "versions_deleted",
+    },
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
 PG_CONTROL_FILE_SIZE = 8192
@@ -1852,7 +1855,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--validate", type=Path, metavar="PLAN")
     group.add_argument("--list", type=Path, metavar="SCENARIO_DIR")
-    group.add_argument("--inspect", choices=["health", "backpressure"])
+    group.add_argument("--inspect", choices=["health", "backpressure", "pruning"])
     group.add_argument("--daemon-smoke", type=Path, metavar="PLAN")
     group.add_argument("--writer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")

@@ -135,6 +135,13 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"wal_index_pending_bytes\":0") != NULL &&
 		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
+	check(run_inspector(shm, "pruning", output, sizeof(output)),
+		  "read-only inspector pruning exits cleanly");
+	check(strstr(output, "\"compactions\":") != NULL &&
+		  strstr(output, "\"versions_scanned\":") != NULL &&
+		  strstr(output, "\"versions_kept\":") != NULL &&
+		  strstr(output, "\"versions_deleted\":") != NULL,
+		  "read-only inspector reports page-pruning counters");
 }
 
 /* An offline segment-format migration must invalidate derived LSM metadata. */
@@ -2342,6 +2349,15 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	}
 	check(wait_for_compacted_layers(store, 3),
 		  "relation-lifecycle history reaches a bounded compacted layer set");
+	{
+		char output[512];
+
+		check(run_inspector(shm, "pruning", output, sizeof(output)) &&
+			  strstr(output, "\"compactions\":0") == NULL &&
+			  strstr(output, "\"versions_scanned\":0") == NULL &&
+			  strstr(output, "\"versions_deleted\":0") == NULL,
+			  "pruning inspection exposes nonzero compaction work and deletion");
+	}
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);
