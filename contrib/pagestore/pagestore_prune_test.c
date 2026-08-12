@@ -24,24 +24,25 @@ main(void)
 		{10, 1}, {20, 1}, {20, 2}, {30, 1}, {40, 1}
 	};
 	PsPruneVersion unsorted[] = {{20, 2}, {20, 1}};
+	PsPruneFence fence[] = {{20, 1}};
 	unsigned char keep[5];
 
-	check(ps_page_prune_plan(NULL, 0, 0, NULL) == 0, "empty chain");
-	check(ps_page_prune_plan(versions, 5, 0, keep) == -1,
+	check(ps_page_prune_plan(NULL, 0, 0, NULL, 0, NULL) == 0, "empty chain");
+	check(ps_page_prune_plan(versions, 5, 0, NULL, 0, keep) == -1,
 		  "zero floor fails closed without durable cutoff");
-	check(ps_page_prune_plan(versions, 5, 25, keep) == 4 &&
+	check(ps_page_prune_plan(versions, 5, 25, fence, 1, keep) == 4 &&
 		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
-		  "floor between versions keeps every base admission variant");
-	check(ps_page_prune_plan(versions, 5, 20, keep) == 5 &&
+		  "an admission fence keeps only its visible same-LSN base");
+	check(ps_page_prune_plan(versions, 5, 20, NULL, 0, keep) == 5 &&
 		  keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
-		  "exact floor keeps older base and every same-LSN admission variant");
-	check(ps_page_prune_plan(versions, 5, 10, keep) == 5,
+		  "exact floor keeps history at and above the operational cutoff");
+	check(ps_page_prune_plan(versions, 5, 10, NULL, 0, keep) == 5,
 		  "floor at oldest version keeps complete retained history");
-	check(ps_page_prune_plan(versions, 5, 50, keep) == 1 && keep[4],
+	check(ps_page_prune_plan(versions, 5, 50, NULL, 0, keep) == 1 && keep[4],
 		  "floor above newest keeps newest base");
-	check(ps_page_prune_plan(unsorted, 2, 20, keep) == -1,
+	check(ps_page_prune_plan(unsorted, 2, 20, NULL, 0, keep) == -1,
 		  "unsorted admission sequence is rejected");
-	check(ps_page_prune_plan(NULL, 1, 20, keep) == -1,
+	check(ps_page_prune_plan(NULL, 1, 20, NULL, 0, keep) == -1,
 		  "missing input is rejected");
 
 	printf("pagestore_prune_test: %d checks, %d failed\n", run, failed);
