@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		26	/* 26: durable retention registry opcodes;
+#define PS_SHM_VERSION		27	/* 27: retention owner generations + stale status;
+								 * 26: durable retention registry opcodes;
 								 * 25: WAL_INDEX_GET cursor pagination;
 								 * 24: WAL-index lag metrics added;
 								 * 23: WAL_INDEX_ADD_BATCH opcode added;
@@ -115,6 +116,7 @@ typedef enum PsOpcode
 /* Status codes */
 #define PS_STATUS_OK		0
 #define PS_STATUS_ERROR		1
+#define PS_STATUS_STALE		2	/* fenced by a newer owner generation */
 
 /*
  * Object class of a stored key.  Almost everything is a relation fork page
@@ -194,15 +196,20 @@ typedef enum PsRetentionResource
 	PS_RETENTION_RESOURCE_ALL = (1u << 3) - 1,
 } PsRetentionResource;
 
-/* Stable owner key = (timeline, owner_kind, owner_id); SET replaces its value.
- * The IPC encoding uses timeline/req_seq as that key, blocknum as owner_kind,
- * parent_timeline as resources, and req_lsn as lsn. */
+/* Stable owner key = (timeline, owner_kind, owner_id); SET replaces its value
+ * only at the current or a newer generation.  Controllers allocate owner_id
+ * durably and increment generation on logical-owner takeover.  Generation 0
+ * is reserved for records written by the version-26 protocol.
+ *
+ * IPC uses timeline/req_seq as the key, blocknum as owner_kind,
+ * parent_timeline as resources, old_nblocks as generation, and req_lsn as lsn.
+ */
 typedef struct PsRetentionPin
 {
 	uint32_t	timeline;
 	uint32_t	owner_kind;
 	uint32_t	resources;
-	uint32_t	pad;
+	uint32_t	generation;
 	uint64_t	owner_id;
 	uint64_t	lsn;
 } PsRetentionPin;
@@ -247,7 +254,7 @@ typedef struct PsChannel
 	uint32_t	skip_fsync;
 	uint32_t	blocknum;
 	uint32_t	nblocks;		/* WAL_INDEX_GET: optional result-page limit */
-	uint32_t	old_nblocks;
+	uint32_t	old_nblocks;		/* RETENTION_PIN_{SET,DROP}: generation */
 	uint32_t	timeline;		/* timeline this op targets (0 = main) */
 	uint32_t	parent_timeline;	/* CREATE_BRANCH parent; WAL_INDEX_GET cursor timeline */
 	uint32_t	datalen;		/* WAL_APPEND: number of WAL bytes in data[] */
