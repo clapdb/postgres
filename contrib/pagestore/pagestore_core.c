@@ -1735,7 +1735,7 @@ page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
 	if (lsn < frontier.lsn)
 		return 0;
 	/* Sequence zero is the established uncapped/latest-visible fence. */
-	if (lsn == frontier.lsn && admission_seq != 0 &&
+	if (admission_seq != 0 &&
 		admission_seq < frontier.admission_seq)
 		return 0;
 	return 1;

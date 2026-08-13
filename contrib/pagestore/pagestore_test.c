@@ -2129,6 +2129,10 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 								  PS_RETENTION_RESOURCE_PAGE_HISTORY,
 								  12000, 1) == PS_STATUS_ERROR,
 		  "restart rejects a lower admission fence at the reclaimed frontier LSN");
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29204, 1,
+								  PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								  13000, 1) == PS_STATUS_ERROR,
+		  "restart rejects a lower admission fence above the frontier LSN");
 	check(op_create_branch_status(20, 0, 7000) == PS_STATUS_ERROR,
 		  "restart rejects a branch below the durable page reclamation frontier");
 	client_detach();
