@@ -537,7 +537,7 @@ ls_pinned_read_seq(void)
 static uint64
 ls_op_lsn(void)
 {
-	if (RecoveryInProgress())
+	if (AmStartupProcess())
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
@@ -555,7 +555,13 @@ ls_read_lsn(void)
 		return localsvc_read_lsn;
 	if (RecoveryInProgress())
 	{
-		XLogRecPtr replay = GetCurrentReplayRecPtr(NULL);
+		XLogRecPtr replay;
+
+		/* Only startup is inside rm_redo and may use the in-progress record.
+		 * A hot-standby backend must observe the last completed replay record. */
+		if (!AmStartupProcess())
+			return (uint64) GetXLogReplayRecPtr(NULL);
+		replay = GetCurrentReplayRecPtr(NULL);
 
 		/* Between records the current pointer is invalid, but read-only
 		 * backends can still touch catalogs.  Bound those reads at the last
@@ -645,7 +651,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = ls_read_lsn();
-	ch->is_redo = RecoveryInProgress() ? 1 : 0;
+	ch->is_redo = AmStartupProcess() ? 1 : 0;
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
