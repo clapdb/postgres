@@ -10,6 +10,7 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 {
 	int		base = -1;
 	int		kept = 0;
+	uint64_t	future_seq = ~(uint64_t) 0;
 
 	if ((n != 0 && (versions == NULL || keep == NULL)) ||
 		(nfences != 0 && fences == NULL))
@@ -48,6 +49,22 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 	{
 		keep[base] = 1;
 		kept++;
+	}
+	/* A future fence can advance LSN while retaining an older admission cap.
+	 * Preserve the reverse record-low sequence staircase: each such version is
+	 * the newest version visible for some possible future sequence cap. */
+	for (int64_t i = (int64_t) n - 1; i >= 0; i--)
+	{
+		uint64_t seq = versions[i].admission_seq;
+
+		if (versions[i].lsn > floor.lsn || seq >= future_seq)
+			continue;
+		future_seq = seq;
+		if (!keep[i])
+		{
+			keep[i] = 1;
+			kept++;
+		}
 	}
 	for (uint32_t f = 0; f < nfences; f++)
 	{
