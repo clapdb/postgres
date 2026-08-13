@@ -12024,36 +12024,22 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 }
 
 static bool
-pagestore_reader_artifact_worker_cycle(bool prime)
+pagestore_reader_artifact_worker_cycle(bool prime, bool publish)
 {
 	LOCAL_FCINFO(fcinfo, 0);
 	bool		succeeded = false;
-	XLogRecPtr	barrier_lsn = InvalidXLogRecPtr;
 
 	InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
 	PG_TRY();
 	{
 		StartTransactionCommand();
-		SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
-		barrier_lsn = pagestore_reader_snapshot_job->reserved_lsn;
-		SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		if (prime)
+			(void) pagestore_prime_reader_relmaps(fcinfo);
+		if (publish)
 		{
-			XLogRecPtr sample_lsn = DatumGetLSN(
-				pagestore_prime_reader_relmaps(fcinfo));
-
-			/* A relation map sampled after the reserved checkpoint belongs to a
-			 * future catalog view.  Leave this database without a manifest so the
-			 * launcher cannot publish a mixed-horizon barrier. */
-			if (!XLogRecPtrIsInvalid(barrier_lsn) && sample_lsn > barrier_lsn)
-				ereport(ERROR,
-						(errmsg("reader relation-map sample is newer than checkpoint"),
-						 errdetail("Sample %X/%08X exceeds checkpoint %X/%08X.",
-								   LSN_FORMAT_ARGS(sample_lsn),
-								   LSN_FORMAT_ARGS(barrier_lsn))));
+			fcinfo->isnull = false;
+			(void) pagestore_publish_database_reader_manifest(fcinfo);
 		}
-		fcinfo->isnull = false;
-		(void) pagestore_publish_database_reader_manifest(fcinfo);
 		CommitTransactionCommand();
 		succeeded = true;
 	}
@@ -12086,6 +12072,7 @@ void
 pagestore_reader_artifact_database_main(Datum main_arg)
 {
 	Oid			dboid = DatumGetObjectId(main_arg);
+	bool		publish;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
@@ -12099,8 +12086,11 @@ pagestore_reader_artifact_database_main(Datum main_arg)
 		ConfigReloadPending = false;
 		ProcessConfigFile(PGC_SIGHUP);
 	}
+	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+	publish = !XLogRecPtrIsInvalid(pagestore_reader_snapshot_job->reserved_lsn);
+	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 	if (!ShutdownRequestPending)
-		(void) pagestore_reader_artifact_worker_cycle(true);
+		(void) pagestore_reader_artifact_worker_cycle(!publish, publish);
 	proc_exit(0);
 }
 
@@ -12210,7 +12200,23 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		PG_TRY();
 		{
 			uint64		membership_generation;
+			ListCell   *lc;
+
 			databases = pagestore_reader_artifact_databases();
+			/* Capture each database's relation maps before the checkpoint that
+			 * defines R.  Publication happens in a separate worker pass after R
+			 * is durable, and verifies the primed artifacts as of that exact LSN. */
+			foreach(lc, databases)
+			{
+				PagestoreReaderDatabaseEntry *entry = lfirst(lc);
+
+				if (ShutdownRequestPending)
+					break;
+				pagestore_run_reader_artifact_worker(entry->database_oid);
+				CHECK_FOR_INTERRUPTS();
+			}
+			if (ShutdownRequestPending)
+				goto reader_artifact_cycle_done;
 			/* The forced checkpoint must produce a generation strictly newer than
 			 * the frozen membership set.  Sampling after CHECKPOINT_WAIT would
 			 * skip that exact target. */
@@ -12288,8 +12294,6 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				databases != NIL && pagestore_reader_snapshot_ready_at(barrier_lsn);
 			if (barrier_complete)
 			{
-				ListCell *lc;
-
 				foreach(lc, databases)
 				{
 					PagestoreReaderDatabaseEntry *entry = lfirst(lc);
@@ -12313,6 +12317,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			}
 			if (barrier_complete && !ShutdownRequestPending)
 				pagestore_publish_reader_database_barrier(databases, barrier_lsn);
+	reader_artifact_cycle_done:
 			CommitTransactionCommand();
 		}
 		PG_CATCH();
