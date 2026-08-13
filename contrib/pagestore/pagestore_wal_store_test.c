@@ -377,6 +377,14 @@ main(void)
 			  "reopen rejects a current-timeline name without a suffix separator");
 		check(rename(malformed, path) == 0,
 			  "restore the final segment after missing-separator test");
+		snprintf(malformed, sizeof(malformed), "%s/walv1_7x_%020llu",
+				 directory, 2ULL);
+		check(rename(path, malformed) == 0,
+			  "inject a malformed requested-timeline token");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a malformed requested-timeline token");
+		check(rename(malformed, path) == 0,
+			  "restore the final segment after malformed timeline test");
 		for (const char *alias = "walv1_+7"; alias != NULL;
 			 alias = strcmp(alias, "walv1_+7") == 0 ? "walv1_07" : NULL)
 		{

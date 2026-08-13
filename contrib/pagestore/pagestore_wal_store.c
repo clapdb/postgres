@@ -105,21 +105,19 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 				uint64_t parsed = 0;
 				int signed_spelling;
 				const char *digits;
+				const char *p;
 				int valid;
 				signed_spelling =
 					(*timeline_text == '+' || *timeline_text == '-');
 				digits = signed_spelling ? timeline_text + 1 : timeline_text;
 				valid = token_end != digits;
 
-				for (const char *p = digits; valid && p < token_end; p++)
+				for (p = digits; valid && p < token_end; p++)
 				{
 					unsigned int digit;
 
 					if (*p < '0' || *p > '9')
-					{
-						valid = 0;
 						break;
-					}
 					digit = (unsigned int) (*p - '0');
 					if (parsed > (UINT64_MAX - digit) / 10)
 					{
@@ -128,6 +126,9 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 					}
 					parsed = parsed * 10 + digit;
 				}
+				/* A malformed token that starts with this timeline still owns
+				 * its namespace.  Ignoring e.g. walv1_7x_... could hide the
+				 * boundary segment and silently shorten recovered history. */
 				if (valid && parsed == store->timeline)
 					goto cleanup;
 			}
