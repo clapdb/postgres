@@ -92,18 +92,23 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 static void
 print_pruning(PsShmHeader *hdr)
 {
+	const unsigned int max_attempts = 10000;
 	uint64_t seq_before,
 			 seq_after,
 			 compactions,
 			 scanned,
 			 kept,
 			 deleted;
+	unsigned int attempt;
 
-	for (;;)
+	for (attempt = 0; attempt < max_attempts; attempt++)
 	{
 		seq_before = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
 		if (seq_before & 1)
+		{
+			usleep(100);
 			continue;
+		}
 		compactions = ps_load_acquire_u64(&hdr->page_prune_compactions);
 		scanned = ps_load_acquire_u64(&hdr->page_prune_versions_scanned);
 		kept = ps_load_acquire_u64(&hdr->page_prune_versions_kept);
@@ -111,6 +116,13 @@ print_pruning(PsShmHeader *hdr)
 		seq_after = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
 		if (seq_before == seq_after && !(seq_after & 1))
 			break;
+		usleep(100);
+	}
+	if (attempt == max_attempts)
+	{
+		fprintf(stderr,
+				"pagestore_inspect: pruning metrics snapshot stayed unstable\n");
+		exit(1);
 	}
 	printf("{\"compactions\":%llu,\"versions_scanned\":%llu,"
 		   "\"versions_kept\":%llu,\"versions_deleted\":%llu}\n",
