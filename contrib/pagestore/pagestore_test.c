@@ -2315,6 +2315,7 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	fill_page(page, ps, 6000, 60);
 	op_write_tl(0, rel, 0, 0, page);
 	op_truncate_at(rel, 0, 0, 7000);
+	op_zeroextend_at(rel, 0, 0, 1, 8000);
 	op_unlink_at(rel, 0, 9000);
 	op_create_at(rel, 0, 10000);
 	fill_page(page, ps, 11000, 110);
@@ -2341,6 +2342,10 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 		  "pre-truncate relation metadata remains visible at the retained floor");
 	check(op_exists_asof(rel, 0, 7500) && op_nblocks_asof(rel, 0, 7500) == 0,
 		  "truncate remains visible after page pruning");
+	check(!op_read_at_found(rel, 0, 0, 7500, readback),
+		  "truncated interval cannot expose the retained page");
+	check(!op_read_at_found(rel, 0, 0, 8500, readback),
+		  "regrowth cannot revive the pre-truncate page bytes");
 	check(!op_exists_asof(rel, 0, 9500),
 		  "drop remains visible between drop and recreate");
 	check(op_exists_asof(rel, 0, 10500) &&
