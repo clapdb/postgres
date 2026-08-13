@@ -2268,7 +2268,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 {
 	uint32_t	i;
 
-	if (kind == FEV_GROW &&
+	if (!fork_event_cache_defer && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
 		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
@@ -2452,17 +2452,31 @@ fork_event_precedes_known_state(const ForkEnt *e, uint64_t lsn,
  * Those page records did not need GROW events when admitted, but the delayed
  * truncate/drop can make them growth retroactively.  Reconstruct the transient
  * events now; segment recovery derives the same events durably after restart. */
+typedef struct DeferredGrow
+{
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint32_t	nblocks;
+} DeferredGrow;
+
+static int
+fork_deferred_grow_cmp(const void *left, const void *right)
+{
+	const DeferredGrow *a = left;
+	const DeferredGrow *b = right;
+
+	if (a->lsn != b->lsn)
+		return a->lsn < b->lsn ? -1 : 1;
+	if (a->admission_seq != b->admission_seq)
+		return a->admission_seq < b->admission_seq ? -1 : 1;
+	return 0;
+}
+
 static void
 fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
-							   uint64_t lsn, uint64_t admission_seq)
+								   uint64_t lsn, uint64_t admission_seq)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
-	typedef struct DeferredGrow
-	{
-		uint64_t	lsn;
-		uint64_t	admission_seq;
-		uint32_t	nblocks;
-	} DeferredGrow;
 	DeferredGrow *grows = NULL;
 	uint32_t	ngrows = 0;
 	uint32_t	cap = 0;
@@ -2482,43 +2496,39 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 				 (version->lsn == lsn &&
 				  version->admission_seq > admission_seq)))
 			{
-				uint32_t	j;
-
-				for (j = 0; j < ngrows; j++)
-					if (grows[j].lsn == version->lsn &&
-						grows[j].admission_seq == version->admission_seq)
-						break;
-				if (j == ngrows)
+				if (ngrows == cap)
 				{
-					if (ngrows == cap)
-					{
-						cap = cap ? cap * 2 : 16;
-						grows = realloc(grows, (size_t) cap * sizeof(*grows));
-						if (grows == NULL)
-							return;
-					}
-					grows[ngrows++] = (DeferredGrow)
-						{version->lsn, version->admission_seq, page->block + 1};
+					cap = cap ? cap * 2 : 16;
+					grows = realloc(grows, (size_t) cap * sizeof(*grows));
+					if (grows == NULL)
+						return;
 				}
-				else if (page->block + 1 > grows[j].nblocks)
-					grows[j].nblocks = page->block + 1;
+				grows[ngrows++] = (DeferredGrow)
+					{version->lsn, version->admission_seq, page->block + 1};
 			}
 		}
 	}
-	/* There are normally only one or two delayed lifecycle records per fork.
-	 * Reusing the normal insertion path preserves all equal-LSN semantics; sort
-	 * restores in chronological order so each insertion appends and does not
-	 * repeatedly rebuild an increasingly long cached suffix. */
-	for (uint32_t i = 0; i < ngrows; i++)
-		for (uint32_t j = i + 1; j < ngrows; j++)
-			if (grows[j].lsn < grows[i].lsn ||
-				(grows[j].lsn == grows[i].lsn &&
-				 grows[j].admission_seq < grows[i].admission_seq))
+	/* Sort once and coalesce adjacent equal page-version tuples.  In deferred
+	 * mode fork_event_add deliberately bypasses its cache-based deduplication:
+	 * the cache is rebuilt only after the entire batch, so it cannot suppress a
+	 * necessary later growth using stale values. */
+	qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
+	{
+		uint32_t out = 0;
+
+		for (uint32_t i = 0; i < ngrows; i++)
+		{
+			if (out != 0 && grows[out - 1].lsn == grows[i].lsn &&
+				grows[out - 1].admission_seq == grows[i].admission_seq)
 			{
-				DeferredGrow tmp = grows[i];
-				grows[i] = grows[j];
-				grows[j] = tmp;
+				if (grows[i].nblocks > grows[out - 1].nblocks)
+					grows[out - 1].nblocks = grows[i].nblocks;
 			}
+			else
+				grows[out++] = grows[i];
+		}
+		ngrows = out;
+	}
 	fork_event_cache_defer++;
 	for (uint32_t i = 0; i < ngrows; i++)
 		fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
