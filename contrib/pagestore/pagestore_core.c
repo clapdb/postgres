@@ -4850,7 +4850,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * Current reads remain valid: their UINT64_MAX horizon is always newer
 	 * than the frontier.
 	 */
-	if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL)
+	if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
 	{
 		int		frontier_allows;
 
