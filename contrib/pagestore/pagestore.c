@@ -363,11 +363,13 @@ typedef struct PagestoreReaderSnapshotJobShmem
 {
 	slock_t		mutex;
 	ControlFileData control;
+	ControlFileData pending_control;
 	uint64		generation;
 	uint64		completed_generation;
 	uint64		failed_generation;
 	uint64		reserved_generation;
 	int			reservation_owner_pid;
+	bool		pending;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7867,10 +7869,20 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 		return;
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	if (pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation)
+		pagestore_reader_snapshot_job->completed_generation &&
+		pagestore_reader_snapshot_job->reserved_generation == 0)
 	{
 		pagestore_reader_snapshot_job->control = *control;
 		pagestore_reader_snapshot_job->generation++;
+	}
+	else if (pagestore_reader_snapshot_job->generation ==
+		pagestore_reader_snapshot_job->completed_generation)
+	{
+		/* The artifact launcher must keep its exact-R READY object as the
+		 * newest one until the database barrier commits.  Preserve the newest
+		 * checkpoint meanwhile and promote it when that reservation ends. */
+		pagestore_reader_snapshot_job->pending_control = *control;
+		pagestore_reader_snapshot_job->pending = true;
 	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 }
@@ -10344,6 +10356,7 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_snapshot_job->failed_generation = 0;
 		pagestore_reader_snapshot_job->reserved_generation = 0;
 		pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+		pagestore_reader_snapshot_job->pending = false;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -12028,6 +12041,15 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	pagestore_reader_snapshot_job->reserved_generation = 0;
 	pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+	if (pagestore_reader_snapshot_job->pending &&
+		pagestore_reader_snapshot_job->generation ==
+		pagestore_reader_snapshot_job->completed_generation)
+	{
+		pagestore_reader_snapshot_job->control =
+			pagestore_reader_snapshot_job->pending_control;
+		pagestore_reader_snapshot_job->pending = false;
+		pagestore_reader_snapshot_job->generation++;
+	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 
 	while (!ShutdownRequestPending)
@@ -12193,6 +12215,15 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			{
 				pagestore_reader_snapshot_job->reserved_generation = 0;
 				pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+				if (pagestore_reader_snapshot_job->pending &&
+					pagestore_reader_snapshot_job->generation ==
+					pagestore_reader_snapshot_job->completed_generation)
+				{
+					pagestore_reader_snapshot_job->control =
+						pagestore_reader_snapshot_job->pending_control;
+					pagestore_reader_snapshot_job->pending = false;
+					pagestore_reader_snapshot_job->generation++;
+				}
 			}
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		}
