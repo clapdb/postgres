@@ -109,10 +109,17 @@ build_chunk_hashes_and_payload_crc(const void *payload, uint32_t payload_len,
 		uint32_t off = i * PS_WAL_STORE_VERIFY_CHUNK_BYTES;
 		uint32_t amount = payload_len - off < PS_WAL_STORE_VERIFY_CHUNK_BYTES ?
 			payload_len - off : PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+		uint32_t chunk_hash = 2166136261u;
 
-		hashes[i] = wal_payload_hash(2166136261u, bytes + off, amount);
-		*payload_crc_out = wal_payload_hash(*payload_crc_out, bytes + off,
-													 amount);
+		/* Keep the payload and per-chunk FNV states in one pass. */
+		for (uint32_t j = 0; j < amount; j++)
+		{
+			chunk_hash ^= bytes[off + j];
+			chunk_hash *= 16777619u;
+			*payload_crc_out ^= bytes[off + j];
+			*payload_crc_out *= 16777619u;
+		}
+		hashes[i] = chunk_hash;
 	}
 	*hashes_out = hashes;
 	*nchunks_out = nchunks;
