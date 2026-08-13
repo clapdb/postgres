@@ -112,6 +112,23 @@ main(void)
 		  "published file carries its durable segment identity");
 	if (fd >= 0)
 		close(fd);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		unsigned char damaged = input[10] ^ 0xff;
+
+		check(pwrite_all(fd, &damaged, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "corrupt one byte in a verification chunk");
+		check(ps_wal_store_read(&store, 10, window, 1) != 0,
+			  "range read rejects corruption in its verification chunk");
+		check(pwrite_all(fd, input + 10, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "restore the verification chunk after corruption test");
+		close(fd);
+	}
+	else
+		check(0, "open WAL segment for verification-chunk corruption");
 
 	snprintf(retry_directory, sizeof(retry_directory), "%s/retry", directory);
 	check(ps_wal_store_create(&retry_store, retry_directory, 8, 0,
