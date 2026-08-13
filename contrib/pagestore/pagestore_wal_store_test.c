@@ -65,6 +65,8 @@ main(void)
 		input[i] = (unsigned char) (i * 31u + 7u);
 	check(ps_wal_store_create(&store, directory, 7, 0, TEST_SEGMENT_BYTES) == 0,
 		  "create an empty timeline WAL segment store");
+	check((fcntl(store.directory_fd, F_GETFD) & FD_CLOEXEC) != 0,
+		  "the WAL store directory descriptor is close-on-exec");
 	check(ps_wal_store_append(&store, 0, input, first_len) == 0 &&
 		  store.nentries == 2 && store.end_lsn == first_len,
 		  "one append splits at the immutable segment payload boundary");
