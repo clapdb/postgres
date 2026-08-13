@@ -363,12 +363,14 @@ typedef struct PagestoreReaderSnapshotJobShmem
 {
 	slock_t		mutex;
 	ControlFileData control;
+	ControlFileData pending_control;
 	uint64		generation;
 	uint64		completed_generation;
 	uint64		failed_generation;
 	uint64		reserved_generation;
 	XLogRecPtr	reserved_lsn;
 	int			reservation_owner_pid;
+	bool		pending;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7957,8 +7959,8 @@ pagestore_build_checkpoint_reader_snapshot(const ControlFileData *control)
 	return succeeded;
 }
 
-/* Keep one backpressured job.  Checkpoint completion never replaces work the
- * snapshot worker has not acknowledged, so an exact redo target cannot vanish. */
+/* Keep one active job plus the newest pending checkpoint.  A long-running
+ * snapshot must not make later completed checkpoints disappear. */
 void
 pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 {
@@ -7971,6 +7973,11 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 	{
 		pagestore_reader_snapshot_job->control = *control;
 		pagestore_reader_snapshot_job->generation++;
+	}
+	else
+	{
+		pagestore_reader_snapshot_job->pending_control = *control;
+		pagestore_reader_snapshot_job->pending = true;
 	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 }
@@ -7999,7 +8006,16 @@ pagestore_reader_snapshot_worker_main(Datum main_arg)
 			{
 				SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 				if (pagestore_reader_snapshot_job->generation == generation)
+				{
 					pagestore_reader_snapshot_job->completed_generation = generation;
+					if (pagestore_reader_snapshot_job->pending)
+					{
+						pagestore_reader_snapshot_job->control =
+							pagestore_reader_snapshot_job->pending_control;
+						pagestore_reader_snapshot_job->pending = false;
+						pagestore_reader_snapshot_job->generation++;
+					}
+				}
 				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 				continue;
 			}
@@ -8008,6 +8024,13 @@ pagestore_reader_snapshot_worker_main(Datum main_arg)
 			{
 				pagestore_reader_snapshot_job->failed_generation = generation;
 				pagestore_reader_snapshot_job->completed_generation = generation;
+				if (pagestore_reader_snapshot_job->pending)
+				{
+					pagestore_reader_snapshot_job->control =
+						pagestore_reader_snapshot_job->pending_control;
+					pagestore_reader_snapshot_job->pending = false;
+					pagestore_reader_snapshot_job->generation++;
+				}
 			}
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		}
@@ -10444,12 +10467,15 @@ pagestore_validate_datadir_branch_manifest(void)
 		SpinLockInit(&pagestore_reader_snapshot_job->mutex);
 		memset(&pagestore_reader_snapshot_job->control, 0,
 			   sizeof(ControlFileData));
+		memset(&pagestore_reader_snapshot_job->pending_control, 0,
+			   sizeof(ControlFileData));
 		pagestore_reader_snapshot_job->generation = 0;
 		pagestore_reader_snapshot_job->completed_generation = 0;
 		pagestore_reader_snapshot_job->failed_generation = 0;
 		pagestore_reader_snapshot_job->reserved_generation = 0;
 		pagestore_reader_snapshot_job->reserved_lsn = InvalidXLogRecPtr;
 		pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+		pagestore_reader_snapshot_job->pending = false;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
