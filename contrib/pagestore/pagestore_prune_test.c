@@ -27,6 +27,7 @@ main(void)
 	PsPruneVersion lower_lsn[] = {{10, 1}, {10, 3}, {20, 2}, {20, 3}};
 	PsPruneVersion legacy_ties[] = {{10, 0}, {10, 0}, {20, 1}};
 	PsPruneVersion future_ties[] = {{10, 1}, {20, 0}, {20, 0}, {30, 1}};
+	PsPruneVersion mixed_direction[] = {{10, 5}, {20, 10}};
 	PsPruneFence fence[] = {{20, 1}};
 	PsPruneFence zero_fence[] = {{20, 0}};
 	PsPruneFence later_fence[] = {{25, 1}};
@@ -41,9 +42,9 @@ main(void)
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 1}, NULL, 0, keep) == 4 &&
 		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
 		  "operational tuple keeps its exact visible same-LSN base");
-	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 2}, NULL, 0, keep) == 3 &&
-		  !keep[0] && !keep[1] && keep[2] && keep[3] && keep[4],
-		  "operational tuple collapses versions through its admission sequence");
+	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {20, 2}, NULL, 0, keep) == 4 &&
+		  !keep[0] && keep[1] && keep[2] && keep[3] && keep[4],
+		  "operational tuple retains lower-sequence future-fence bases");
 	check(ps_page_prune_plan(lower_lsn, 4, (PsPruneFence) {15, 1}, NULL, 0,
 							 keep) == 4 && keep[0] && keep[1] && keep[2] && keep[3],
 		  "frontier admission sequence caps lower-LSN base visibility");
@@ -57,12 +58,15 @@ main(void)
 		  "a nonzero admission fence constrains versions below its LSN");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 10}, NULL, 0, keep) == 1 && keep[4],
 		  "floor above newest keeps newest base");
-	check(ps_page_prune_plan(legacy_ties, 3, (PsPruneFence) {20, 1}, NULL, 0, keep) == 1 &&
-		  !keep[0] && !keep[1] && keep[2],
-		  "legacy exact ties use stable source append order");
+	check(ps_page_prune_plan(legacy_ties, 3, (PsPruneFence) {20, 1}, NULL, 0, keep) == 2 &&
+		  !keep[0] && keep[1] && keep[2],
+		  "legacy exact ties retain their authoritative future-fence base");
 	check(ps_page_prune_plan(future_ties, 4, (PsPruneFence) {10, 1}, NULL, 0, keep) == 3 &&
 		  keep[0] && !keep[1] && keep[2] && keep[3],
 		  "future exact ties retain only the authoritative last append");
+	check(ps_page_prune_plan(mixed_direction, 2, (PsPruneFence) {20, 10}, NULL, 0,
+						 keep) == 2 && keep[0] && keep[1],
+		  "a later lower-sequence fence retains its visible base");
 	check(ps_page_prune_plan(unsorted, 2, (PsPruneFence) {20, 2}, NULL, 0, keep) == -1,
 		  "unsorted admission sequence is rejected");
 	check(ps_page_prune_plan(NULL, 1, (PsPruneFence) {20, 1}, NULL, 0, keep) == -1,
