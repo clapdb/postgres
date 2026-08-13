@@ -366,6 +366,18 @@ main(void)
 		check(rename(noncanonical, path) == 0,
 			  "restore the canonical timeline after negative spelling test");
 	}
+	{
+		char malformed[512];
+
+		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
+		snprintf(malformed, sizeof(malformed), "%s/walv1_7", directory);
+		check(rename(path, malformed) == 0,
+			  "inject a current-timeline name without a suffix separator");
+		check(ps_wal_store_open(&store, directory, 7) != 0,
+			  "reopen rejects a current-timeline name without a suffix separator");
+		check(rename(malformed, path) == 0,
+			  "restore the final segment after missing-separator test");
+	}
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
 	fd = open(path, O_RDWR);
