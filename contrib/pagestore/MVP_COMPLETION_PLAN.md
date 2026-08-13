@@ -110,6 +110,11 @@ Deliverables:
   progress.  The frontier is the oldest retained, readable tuple, so tests
   reject SET strictly below a forkmeta-only advance and accept SET exactly at
   it.
+- recovery resumes the global admission-sequence allocator strictly above the
+  maximum sequence in every durable pin, reclamation frontier, branch fence,
+  page/forkmeta record, and other sequence-bearing state before admitting a
+  mutation; alternatively, allocation advances a durable high-water mark
+  before returning a sequence.
 
 Acceptance:
 
@@ -388,6 +393,10 @@ Deliverables:
   higher incarnation generation carried by every request and durable record;
   delayed metadata, retention mutations, and requests from an older
   incarnation are rejected;
+- before a numeric timeline ID becomes reusable, deletion purges every
+  shard-local page/fork/WAL index and materialized-page cache entry for the old
+  incarnation (or those runtime keys include the incarnation); tests reuse the
+  ID immediately with identical relation keys and horizons without restarting;
 - retention owner IDs carry an incarnation token allocated from one named,
   durable controller allocation domain.  Tokens are globally monotonic within
   that domain, are carried by every SET/DROP and durable owner record, and are
