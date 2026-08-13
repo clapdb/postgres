@@ -3517,6 +3517,13 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
 		  page_has_tag(rb, ps, 59),
 		  "delayed older truncate does not invalidate a newer page");
+	{
+		uint32_t current_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(current_nblocks == 7,
+			  "delayed older truncate reconstructs growth from the newer page (got %u)",
+			  current_nblocks);
+	}
 
 	/* Kept event-free locally for the failed WAL-less write test below. */
 	op_create_branch(4, 0, 5000);
@@ -3563,8 +3570,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
 	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
 		  "pre-truncate branch-local growth survives restart");
-	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
-		  "branch truncate survives restart");
+	{
+		uint32_t recovered_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(recovered_nblocks == 7,
+			  "reconstructed post-truncate growth survives restart (got %u)",
+			  recovered_nblocks);
+	}
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "newer page remains readable after delayed-truncate recovery");
 	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
 	check(page_has_tag(rb, ps, 11),
 		  "branch-point copied-page floor survives restart");
