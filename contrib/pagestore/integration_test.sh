@@ -1816,21 +1816,24 @@ sed -i 's/pagestore.advance_read_lsn = off/pagestore.advance_read_lsn = on/' \
 	"$ADVANCINGDATA/postgresql.conf"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >/dev/null
 readerAutoPublished=no
+readerAutoR=
 for ((i = 0; i < 100; i++)); do
-	if [ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerR2');" 2>/dev/null)" = "0" ]; then
+	readerAutoR=$($P -c "SELECT redo_lsn FROM pg_control_checkpoint();" 2>/dev/null || true)
+	if [ -n "$readerAutoR" ] &&
+		[ "$($P -c "SELECT pagestore_validate_published_reader_snapshot(0, '$readerAutoR');" 2>/dev/null)" = "0" ]; then
 		readerAutoPublished=yes
 		break
 	fi
 	sleep 0.1
 done
 assert "$readerAutoPublished" "yes" \
-	"database worker binds exact-R relation maps to the automatic snapshot"
+	"database worker binds relation maps to its automatic exact-R snapshot"
 reader_export=$($PR -c "SELECT pg_export_snapshot();" 2>&1)
 assert "$(printf '%s\n' "$reader_export" | grep -c 'cannot export a snapshot on an advancing pagestore reader')" "1" \
 	"advancing reader rejects exporting a snapshot without its read view"
-assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerR2'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
+assert "$($PR -c "SELECT pagestore_reader_effective_lsn() = '$readerAutoR'::pg_lsn AND pagestore_reader_effective_generation() >= 2;")" "t" \
 	"the next transaction atomically adopts the published reader view"
-assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerR2'::pg_lsn;")" "t" \
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
 	"advancing reader moves its durable pin before serving the new view"
 assert "$($PR -c "SELECT pagestore_reader_handoff_ready('$readerHandoffToken');")" "t" \
 	"advancing reader accepts the writer handoff after reaching its token"
@@ -1862,7 +1865,7 @@ if ! "$BIN/pg_ctl" -D "$ADVANCINGDATA" -l "$ADVANCINGDATA/server.log" -w start >
 fi
 assert "$($PR -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" \
 	"advancing reader restart adopts its durable owner horizon before serving"
-assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerR2'::pg_lsn;")" "t" \
+assert "$($P -c "SELECT pagestore_retention_owner_lsn(0, 1, 8001, 1) = '$readerAutoR'::pg_lsn;")" "t" \
 	"advancing reader restart does not regress its durable pin"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 assert "$($P -c "SELECT v FROM reader_t WHERE id = 1;")" "v2" "unpinned compute sees the newest version again"
