@@ -1280,6 +1280,7 @@ def run_materializer_smoke(
     dproc: subprocess.Popen[str] | None = None
     supervisor_proc: subprocess.Popen[str] | None = None
     materializer_generation = 0
+    materializer_retention_generation = 0
 
     def sql_result(socket_dir: Path, port: int, sql: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -1337,11 +1338,15 @@ def run_materializer_smoke(
         raise PlanError(f"{context}: last supervisor status {last!r}")
 
     def sync_materializer_generation(status: dict[str, Any]) -> int:
-        nonlocal materializer_generation
+        nonlocal materializer_generation, materializer_retention_generation
         generation = status.get("worker_generation")
+        retention_generation = status.get("retention_generation")
         if not isinstance(generation, int) or generation <= 0:
             raise PlanError(f"invalid supervisor worker generation: {status!r}")
+        if not isinstance(retention_generation, int) or retention_generation <= 0:
+            raise PlanError(f"invalid supervisor retention generation: {status!r}")
         materializer_generation = generation
+        materializer_retention_generation = retention_generation
         return generation
 
     def crash_materializer(reason: str) -> None:
@@ -1517,6 +1522,8 @@ def run_materializer_smoke(
             config.write(
                 "pagestore.route_all = on\n"
                 "pagestore.materializer = on\n"
+                "pagestore.retention_owner_id = '1'\n"
+                "pagestore.retention_owner_generation = '1'\n"
                 "archive_mode = off\n"
                 "hot_standby = on\n"
                 "listen_addresses = ''\n"
@@ -1532,7 +1539,7 @@ def run_materializer_smoke(
         supervisor_config.write_text(
             json.dumps(
                 {
-                    "schema": 1,
+                    "schema": 4,
                     "pg_ctl": str(pg_bin / "pg_ctl"),
                     "psql": str(pg_bin / "psql"),
                     "data_dir": str(materializer_data),
@@ -1540,6 +1547,9 @@ def run_materializer_smoke(
                     "port": materializer_port,
                     "log_file": str(trace / "materializer.log"),
                     "state_dir": str(supervisor_state),
+                    "retention_authority_dir": str(root / "controller-authority"),
+                    "retention_owner_id": 1,
+                    "controller_instance_id": "harness-controller-1",
                     "poll_interval_ms": 100,
                     "replay_idle_ms": 300,
                     "progress_timeout_ms": 10000,
@@ -1587,6 +1597,7 @@ def run_materializer_smoke(
         )
         initial_owner_pid = supervisor_proc.pid
         initial_owner_epoch = supervisor_status["owner_epoch"]
+        initial_retention_generation = materializer_retention_generation
         initial_worker_pid = int(
             (materializer_data / "postmaster.pid")
             .read_text(encoding="utf-8")
@@ -1614,6 +1625,8 @@ def run_materializer_smoke(
                 status.get("owner_pid") == supervisor_proc.pid
                 and status.get("owner_epoch", 0) > initial_owner_epoch
                 and status.get("worker_generation") == materializer_generation
+                and status.get("retention_generation")
+                    == initial_retention_generation
                 and status.get("state")
                 in {"running", "waiting_for_progress_api"}
             ),
@@ -1689,6 +1702,7 @@ def run_materializer_smoke(
                 )
             elif action["op"] == "crash":
                 crashed_generation = materializer_generation
+                crashed_retention_generation = materializer_retention_generation
                 crash_materializer(action["id"])
                 events.emit(
                     "crash", id=action["id"], target="materializer",
@@ -1698,6 +1712,9 @@ def run_materializer_smoke(
                     lambda status: (
                         isinstance(status.get("worker_generation"), int)
                         and status["worker_generation"] > crashed_generation
+                        and isinstance(status.get("retention_generation"), int)
+                        and status["retention_generation"]
+                            > crashed_retention_generation
                         and status.get("state")
                         in {"running", "waiting_for_progress_api"}
                     ),

@@ -21,6 +21,7 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
+CONFIG_SCHEMA = 2
 RECEIPT_SCHEMA = 1
 SAFE_POSTGRES_OPTION_PATH = re.compile(r"^[A-Za-z0-9_./-]+$")
 WAL_FILE_NAME = re.compile(r"^[0-9A-F]{24}$")
@@ -37,6 +38,8 @@ CONFIG_FIELDS = {
     "materializer_data_dir",
     "materializer_host",
     "materializer_port",
+    "retention_authority_dir",
+    "retention_owner_id",
     "prepared_dir",
     "new_timeline",
     "parent_timeline",
@@ -59,6 +62,8 @@ REQUIRED_CONFIG_FIELDS = {
     "materializer_data_dir",
     "materializer_host",
     "materializer_port",
+    "retention_authority_dir",
+    "retention_owner_id",
     "prepared_dir",
     "new_timeline",
     "parent_timeline",
@@ -67,6 +72,44 @@ REQUIRED_CONFIG_FIELDS = {
 
 class ConfigError(ValueError):
     pass
+
+
+def validate_authority_path(authority_dir: Path) -> os.stat_result:
+    effective_uid = os.geteuid()
+    authority_stat = os.lstat(authority_dir)
+    if (
+        not stat.S_ISDIR(authority_stat.st_mode)
+        or authority_stat.st_uid != effective_uid
+        or stat.S_IMODE(authority_stat.st_mode) != 0o700
+    ):
+        raise ConfigError(
+            "retention_authority_dir must be owned by this user and mode 0700"
+        )
+    component = authority_dir.parent
+    immediate = True
+    while True:
+        component_stat = os.lstat(component)
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ConfigError(
+                "retention_authority_dir ancestry must contain only directories"
+            )
+        writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky = component_stat.st_mode & stat.S_ISVTX
+        if immediate and (
+            component_stat.st_uid != effective_uid or writable
+        ):
+            raise ConfigError(
+                "retention_authority_dir parent must be owner-controlled and not group/world writable"
+            )
+        if not immediate and writable and not sticky:
+            raise ConfigError(
+                "retention_authority_dir ancestry contains a replaceable writable directory"
+            )
+        if component.parent == component:
+            break
+        component = component.parent
+        immediate = False
+    return authority_stat
 
 
 class OwnershipError(RuntimeError):
@@ -147,6 +190,8 @@ class Config:
     materializer_data_dir: Path
     materializer_host: str
     materializer_port: int
+    retention_authority_dir: Path
+    retention_owner_id: int
     prepared_dir: Path
     new_timeline: int
     parent_timeline: int
@@ -170,8 +215,11 @@ class Config:
             raise ConfigError(f"unknown branch config field(s): {', '.join(unknown)}")
         if missing:
             raise ConfigError(f"missing branch config field(s): {', '.join(missing)}")
-        if value.get("schema") != 1 or isinstance(value.get("schema"), bool):
-            raise ConfigError("branch config schema must be 1")
+        if (
+            value.get("schema") != CONFIG_SCHEMA
+            or isinstance(value.get("schema"), bool)
+        ):
+            raise ConfigError(f"branch config schema must be {CONFIG_SCHEMA}")
 
         paths: dict[str, Path] = {}
         for field in (
@@ -181,6 +229,7 @@ class Config:
             "writer_log_file",
             "private_socket_dir",
             "materializer_data_dir",
+            "retention_authority_dir",
             "prepared_dir",
         ):
             item = value[field]
@@ -217,6 +266,7 @@ class Config:
             "writer_port": None,
             "private_port": None,
             "materializer_port": None,
+            "retention_owner_id": None,
             "new_timeline": None,
             "parent_timeline": None,
             "poll_interval_ms": 100,
@@ -237,6 +287,8 @@ class Config:
         for field in ("writer_port", "private_port", "materializer_port"):
             if integers[field] > 65535:
                 raise ConfigError(f"branch config {field} exceeds 65535")
+        if integers["retention_owner_id"] > (1 << 64) - 1:
+            raise ConfigError("branch config retention_owner_id exceeds uint64")
         if integers["new_timeline"] == integers["parent_timeline"]:
             raise ConfigError("new_timeline must differ from parent_timeline")
         for field in ("new_timeline", "parent_timeline"):
@@ -268,6 +320,9 @@ class Config:
                 f"writer_log_file is not writable: {paths['writer_log_file']}: {error}"
             ) from error
         paths["prepared_dir"].mkdir(parents=True, exist_ok=True)
+        authority_dir = paths["retention_authority_dir"]
+        authority_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        validate_authority_path(authority_dir)
         private_socket = paths["private_socket_dir"]
         existed = private_socket.exists()
         private_socket.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -293,6 +348,20 @@ class Config:
         # Share the supervisor's ownership fence.  The branch operation itself
         # controls pause/resume and must not race a supervisor restartpoint.
         return self.materializer_data_dir / ".pagestore-materializer-supervisor.lock"
+
+    @property
+    def retention_authority_lock_file(self) -> Path:
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.lock"
+
+    @property
+    def retention_authority_file(self) -> Path:
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.json"
+
+    @property
+    def branch_retention_generation_file(self) -> Path:
+        return self.retention_authority_dir / (
+            f"branch-retention-generation-{self.retention_owner_id}.json"
+        )
 
     @property
     def receipt_file(self) -> Path:
@@ -344,6 +413,8 @@ class BranchPreparer:
         self.restricted_writer_running = False
         self.writer_extension_schema: str | None = None
         self.materializer_extension_schema: str | None = None
+        self.branch_retention_generation: int | None = None
+        self.branch_retention_owned = False
 
     def command(self, command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
@@ -432,6 +503,29 @@ class BranchPreparer:
             raise BranchPrepareError("writer is not running")
         if not self.server_running(self.config.materializer_data_dir):
             raise BranchPrepareError("materializer is not running")
+        try:
+            authority = json.loads(
+                self.config.retention_authority_file.read_text(encoding="utf-8")
+            )
+            authority_generation = authority["retention_generation"]
+            authority_data_dir = authority["consumer_data_dir"]
+            authority_stat = self.config.materializer_data_dir.stat()
+            namespace_stat = self.config.retention_authority_dir.stat()
+            if (
+                not isinstance(authority_generation, int)
+                or isinstance(authority_generation, bool)
+                or authority_generation <= 0
+                or authority_data_dir != str(self.config.materializer_data_dir)
+                or authority.get("consumer_data_dev") != authority_stat.st_dev
+                or authority.get("consumer_data_ino") != authority_stat.st_ino
+                or authority.get("authority_namespace_dev") != namespace_stat.st_dev
+                or authority.get("authority_namespace_ino") != namespace_stat.st_ino
+            ):
+                raise ValueError("authority identity mismatch")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BranchPrepareError(
+                "materializer retention authority does not match the configured consumer"
+            ) from error
         self.writer_extension_schema = self.extension_schema(self.writer_sql, "writer")
         self.materializer_extension_schema = self.extension_schema(
             self.materializer_sql, "materializer"
@@ -445,6 +539,14 @@ class BranchPreparer:
         )
         capture_signature = self.extension_function(
             self.materializer_extension_schema, "pagestore_capture_slru_snapshot()"
+        )
+        retention_set_signature = self.extension_function(
+            self.materializer_extension_schema,
+            "pagestore_retention_set(integer,integer,bigint,bigint,integer,pg_lsn)",
+        )
+        retention_drop_signature = self.extension_function(
+            self.materializer_extension_schema,
+            "pagestore_retention_drop(integer,integer,bigint,bigint)",
         )
         writer_ok = last_output_line(
             self.writer_sql(
@@ -474,17 +576,30 @@ class BranchPreparer:
                 " AND current_setting('pagestore.backend') = 'localsvc'"
                 " AND current_setting('pagestore.materializer')::boolean"
                 " AND current_setting('pagestore.route_all')::boolean"
-                " AND current_setting('pagestore.timeline')::integer = "
+                " AND current_setting('pagestore.retention_owner_id') = '"
+                + str(self.config.retention_owner_id) + "'"
+                " AND current_setting('pagestore.retention_owner_generation')::bigint = "
+                + str(authority_generation)
+                + " AND current_setting('data_directory') = "
+                + sql_literal(str(self.config.materializer_data_dir))
+                + " AND current_setting('pagestore.timeline')::integer = "
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"
                 " '0/0')::pg_lsn = '0/0'::pg_lsn"
                 " AND to_regprocedure("
                 + sql_literal(capture_signature)
                 + ") IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(retention_set_signature)
+                + ") IS NOT NULL"
+                " AND to_regprocedure("
+                + sql_literal(retention_drop_signature)
+                + ") IS NOT NULL"
             )
         )
         if materializer_ok != "t":
             raise BranchPrepareError("materializer failed the recovery-role health check")
+        self.reserve_branch_retention_generation()
         pause_state = last_output_line(
             self.materializer_sql("SELECT pg_get_wal_replay_pause_state()")
         )
@@ -521,6 +636,100 @@ class BranchPreparer:
             == "not paused",
         )
         self.pause_owned = False
+
+    def reserve_branch_retention_generation(self) -> None:
+        path = self.config.branch_retention_generation_file
+        generation = 0
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                value.get("schema") != 1
+                or value.get("retention_owner_id")
+                != self.config.retention_owner_id
+                or not isinstance(value.get("generation"), int)
+                or isinstance(value.get("generation"), bool)
+                or value["generation"] <= 0
+            ):
+                raise ValueError("branch retention generation identity mismatch")
+            generation = value["generation"]
+        except FileNotFoundError:
+            pass
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BranchPrepareError(
+                "branch retention generation authority is unreadable"
+            ) from error
+        if generation >= (1 << 32) - 1:
+            raise BranchPrepareError("branch retention generation exhausted")
+        generation += 1
+        atomic_write_json(
+            path,
+            {
+                "schema": 1,
+                "retention_owner_id": self.config.retention_owner_id,
+                "generation": generation,
+            },
+        )
+        self.branch_retention_generation = generation
+
+    def install_branch_retention(self, base: str) -> None:
+        if self.branch_retention_generation is None:
+            raise BranchPrepareError("branch retention generation is unavailable")
+        owner_id = self.config.retention_owner_id
+        if owner_id > (1 << 63) - 1:
+            owner_id -= 1 << 64
+        status = last_output_line(
+            self.materializer_sql(
+                "SELECT "
+                + self.extension_function(
+                    self.materializer_extension_schema,
+                    "pagestore_retention_set(",
+                )
+                + f"{self.config.parent_timeline}, 3, {owner_id}, "
+                + f"{self.branch_retention_generation}, 6, "
+                + sql_literal(base)
+                + "::pg_lsn)"
+            )
+        )
+        if status != "0":
+            raise BranchPrepareError(
+                f"could not install branch-base retention pin (status {status})"
+            )
+        self.branch_retention_owned = True
+
+    def release_branch_retention(self) -> None:
+        if not self.branch_retention_owned:
+            return
+        if self.branch_retention_generation is None:
+            raise BranchPrepareError("branch retention generation is unavailable")
+        owner_id = self.config.retention_owner_id
+        if owner_id > (1 << 63) - 1:
+            owner_id -= 1 << 64
+        status = last_output_line(
+            self.materializer_sql(
+                "SELECT "
+                + self.extension_function(
+                    self.materializer_extension_schema,
+                    "pagestore_retention_drop(",
+                )
+                + f"{self.config.parent_timeline}, 3, {owner_id}, "
+                + f"{self.branch_retention_generation})"
+            )
+        )
+        if status != "0":
+            raise BranchPrepareError(
+                f"could not release branch-base retention pin (status {status})"
+            )
+        self.branch_retention_owned = False
+
+    def capture_and_pin_base(self) -> str:
+        base = self.pause_and_capture(keep_paused=True)
+        try:
+            self.install_branch_retention(base)
+        except BaseException:
+            self.resume_materializer()
+            raise
+        self.resume_materializer()
+        return base
 
     def pause_and_capture(self, keep_paused: bool) -> str:
         state = last_output_line(
@@ -698,6 +907,11 @@ class BranchPreparer:
 
     def restore_services(self) -> list[str]:
         errors: list[str] = []
+        if self.branch_retention_owned:
+            try:
+                self.release_branch_retention()
+            except Exception as error:
+                errors.append(f"could not release branch-base retention: {error}")
         if self.pause_owned:
             try:
                 self.resume_materializer()
@@ -730,7 +944,7 @@ class BranchPreparer:
         receipt: dict[str, Any] | None = None
         failure: BaseException | None = None
         try:
-            base = self.pause_and_capture(keep_paused=False)
+            base = self.capture_and_pin_base()
             self.stop_writer()
             self.start_restricted_writer()
             redo, checkpoint_end = self.select_checkpoint()
@@ -791,27 +1005,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_config:
             print("ok")
             return 0
-        with OwnerLock(config.lock_file, "branch prepare"):
-            with OwnerLock(config.prepared_lock_file, "prepared artifact directory"):
-                try:
-                    with OwnerLock(
-                        config.materializer_lock_file,
-                        "materializer supervisor or branch prepare",
-                    ):
-                        preparer = BranchPreparer(config)
+        with OwnerLock(config.retention_authority_lock_file, "retention owner authority"):
+            with OwnerLock(config.lock_file, "branch prepare"):
+                with OwnerLock(config.prepared_lock_file, "prepared artifact directory"):
+                    try:
+                        with OwnerLock(
+                            config.materializer_lock_file,
+                            "materializer supervisor or branch prepare",
+                        ):
+                            preparer = BranchPreparer(config)
 
-                        def cancel(signum: int, _frame: object) -> None:
-                            raise CancelledError(f"received signal {signum}")
+                            def cancel(signum: int, _frame: object) -> None:
+                                raise CancelledError(f"received signal {signum}")
 
-                        signal.signal(signal.SIGINT, cancel)
-                        signal.signal(signal.SIGTERM, cancel)
-                        receipt = preparer.execute()
-                        print(json.dumps(receipt, sort_keys=True))
-                        return 0
-                except OwnershipError as error:
-                    raise OwnershipError(
-                        f"{error}; stop the materializer supervisor before preparing a branch"
-                    ) from error
+                            signal.signal(signal.SIGINT, cancel)
+                            signal.signal(signal.SIGTERM, cancel)
+                            receipt = preparer.execute()
+                            print(json.dumps(receipt, sort_keys=True))
+                            return 0
+                    except OwnershipError as error:
+                        raise OwnershipError(
+                            f"{error}; stop the materializer supervisor before preparing a branch"
+                        ) from error
     except OwnershipError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return EX_TEMPFAIL

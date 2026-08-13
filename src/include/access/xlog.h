@@ -283,8 +283,15 @@ extern PGDLLIMPORT control_file_flush_hook_type control_file_flush_hook;
  * sampled before flushing begins, so every page change through that replay
  * position is represented in durable storage when the hook runs.
  */
-typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn);
+typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn,
+														XLogRecPtr restart_redo_lsn);
 extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook;
+
+/* Called in the startup process after the checkpoint redo pointer is known
+ * and before the checkpoint or redo WAL is read.  Consumers that depend on
+ * retained history use this point to establish their durable protection. */
+typedef void (*recovery_start_hook_type) (XLogRecPtr redo_lsn);
+extern PGDLLIMPORT recovery_start_hook_type recovery_start_hook;
 extern XLogRecPtr GetXLogInsertEndRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
 
