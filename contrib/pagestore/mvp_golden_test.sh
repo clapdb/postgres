@@ -314,17 +314,17 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
 
-mkdir -m 700 "$D/controller-authority" ||
+mkdir -m 700 "$TMPROOT/controller-authority" ||
 	fail "could not create materializer authority directory"
 materializer_dev=$(stat -c %d "$MATERIALIZER") ||
 	fail "could not inspect materializer device identity"
 materializer_ino=$(stat -c %i "$MATERIALIZER") ||
 	fail "could not inspect materializer inode identity"
-authority_dev=$(stat -c %d "$D/controller-authority") ||
+authority_dev=$(stat -c %d "$TMPROOT/controller-authority") ||
 	fail "could not inspect authority namespace device identity"
-authority_ino=$(stat -c %i "$D/controller-authority") ||
+authority_ino=$(stat -c %i "$TMPROOT/controller-authority") ||
 	fail "could not inspect authority namespace inode identity"
-cat > "$D/controller-authority/retention-owner-1.json" <<EOF
+cat > "$TMPROOT/controller-authority/retention-owner-1.json" <<EOF
 {"retention_generation":1,"consumer_data_dir":"$MATERIALIZER","consumer_instance_id":"mvp-golden","consumer_data_dev":$materializer_dev,"consumer_data_ino":$materializer_ino,"authority_namespace_dev":$authority_dev,"authority_namespace_ino":$authority_ino}
 EOF
 
@@ -342,7 +342,7 @@ cat > "$BRANCH_CONFIG" <<EOF
   "materializer_data_dir": "$MATERIALIZER",
   "materializer_host": "127.0.0.1",
   "materializer_port": $MPORT,
-  "retention_authority_dir": "$D/controller-authority",
+  "retention_authority_dir": "$TMPROOT/controller-authority",
   "retention_owner_id": 1,
   "prepared_dir": "$PREPARED",
   "new_timeline": 1,
