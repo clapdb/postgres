@@ -2530,9 +2530,32 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 		ngrows = out;
 	}
 	fork_event_cache_defer++;
-	for (uint32_t i = 0; i < ngrows; i++)
-		fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
-					   grows[i].nblocks, FEV_GROW);
+	{
+		uint32_t existing = 0;
+
+		for (uint32_t i = 0; i < ngrows; i++)
+		{
+			int present = 0;
+
+			while (existing < e->nev &&
+				(e->ev[existing].lsn < grows[i].lsn ||
+				 (e->ev[existing].lsn == grows[i].lsn &&
+				  e->ev[existing].admission_seq < grows[i].admission_seq)))
+				existing++;
+			for (uint32_t j = existing; j < e->nev &&
+				 e->ev[j].lsn == grows[i].lsn &&
+				 e->ev[j].admission_seq == grows[i].admission_seq; j++)
+				if (e->ev[j].kind == FEV_GROW &&
+					e->ev[j].nblocks >= grows[i].nblocks)
+				{
+					present = 1;
+					break;
+				}
+			if (!present)
+				fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
+							   grows[i].nblocks, FEV_GROW);
+		}
+	}
 	fork_event_cache_defer--;
 	if (ngrows != 0)
 	{
