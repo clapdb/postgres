@@ -90,8 +90,9 @@ wal_payload_hash(uint32_t hash, const void *data, size_t len)
 }
 
 static int
-build_chunk_hashes(const void *payload, uint32_t payload_len,
-				   uint32_t **hashes_out, uint32_t *nchunks_out)
+build_chunk_hashes_and_payload_crc(const void *payload, uint32_t payload_len,
+									 uint32_t **hashes_out, uint32_t *nchunks_out,
+									 uint32_t *payload_crc_out)
 {
 	const unsigned char *bytes = payload;
 	uint32_t	nchunks;
@@ -102,6 +103,7 @@ build_chunk_hashes(const void *payload, uint32_t payload_len,
 	hashes = malloc((size_t) nchunks * sizeof(*hashes));
 	if (hashes == NULL)
 		return -1;
+	*payload_crc_out = 2166136261u;
 	for (uint32_t i = 0; i < nchunks; i++)
 	{
 		uint32_t off = i * PS_WAL_STORE_VERIFY_CHUNK_BYTES;
@@ -109,6 +111,8 @@ build_chunk_hashes(const void *payload, uint32_t payload_len,
 			payload_len - off : PS_WAL_STORE_VERIFY_CHUNK_BYTES;
 
 		hashes[i] = wal_payload_hash(2166136261u, bytes + off, amount);
+		*payload_crc_out = wal_payload_hash(*payload_crc_out, bytes + off,
+													 amount);
 	}
 	*hashes_out = hashes;
 	*nchunks_out = nchunks;
@@ -436,10 +440,13 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 				return -1;
 		}
 		if (reserve_entry(store) != 0 ||
-			ps_wal_segment_seal(&header, store->timeline,
+			build_chunk_hashes_and_payload_crc(bytes + done, chunk,
+															 &chunk_hashes, &nchunks,
+															 &header.payload_crc) != 0 ||
+			ps_wal_segment_seal_with_crc(&header, store->timeline,
 								 store->next_segment_no, start_lsn + done,
-								 store->segment_size, bytes + done, chunk) != 0 ||
-			build_chunk_hashes(bytes + done, chunk, &chunk_hashes, &nchunks) != 0)
+								 store->segment_size, bytes + done, chunk,
+								 header.payload_crc) != 0)
 			return -1;
 		if (publish_segment(store, &header, bytes + done) != 0)
 		{
@@ -476,8 +483,9 @@ read_validated_segment_range(PsWalStore *store,
 	int rc = -1;
 
 	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
-		(fd = openat(store->directory_fd, name, O_RDONLY | O_CLOEXEC)) < 0 ||
-		fstat(fd, &st) != 0)
+		(fd = openat(store->directory_fd, name,
+					 O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) < 0 ||
+		fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
 		goto cleanup;
 	if (st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
 						 expected->payload_len) ||
