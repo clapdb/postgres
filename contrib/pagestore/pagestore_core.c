@@ -4788,7 +4788,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * Current reads remain valid: their UINT64_MAX horizon is always newer
 	 * than the frontier.
 	 */
-	if (read_lsn != UINT64_MAX)
+	if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL)
 	{
 		int		frontier_allows;
 
@@ -4798,7 +4798,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		frontier_allows = page_frontier_allows(timeline, read_lsn, read_seq);
 		ps_unlock_map();
 		if (!frontier_allows)
-			return 0;
+			return -2;
 	}
 
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
@@ -4816,12 +4816,23 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			uint32_t	tl = w.tl;
 			uint64_t	rl = w.lsn;
 			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
-			ForkEnt    *fe = fork_find(tl, key);
+			ForkEnt    *fe;
 			uint32_t	nb = 0;
-			int			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
+			int			fork_state;
+			PageEnt    *e;
+			PageVer    *pv;
+
+			/* A child can inherit this page from a parent.  Check every
+			 * traversed timeline so a parent frontier cannot be bypassed merely
+			 * because the child has not compacted locally. */
+			if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL &&
+				!page_frontier_allows(tl, rl, seq_cap))
+				return -2;
+			fe = fork_find(tl, key);
+			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
 				FORK_HOP_NONE;
-			PageEnt    *e = page_find(tl, key, block);
-			PageVer    *pv = e ? page_visible(e, rl, seq_cap) : NULL;
+			e = page_find(tl, key, block);
+			pv = e ? page_visible(e, rl, seq_cap) : NULL;
 
 		if (pv)
 		{
