@@ -713,12 +713,16 @@ static int
 op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 				 uint32_t generation, uint32_t resources, uint64_t lsn)
 {
-	uint64_t	admission_seq;
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
-	if (op_admission_barrier(&admission_seq) != PS_STATUS_OK)
-		return PS_STATUS_ERROR;
-	return op_retention_set_seq(timeline, owner_kind, owner_id, generation,
-							resources, lsn, admission_seq);
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->parent_timeline = resources;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	return cl_exec()->status;
 }
 
 static int

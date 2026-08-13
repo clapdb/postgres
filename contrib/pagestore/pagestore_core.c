@@ -5047,6 +5047,38 @@ ps_handle_meta(PsChannel *ch)
 			}
 			break;
 
+		case PS_OP_RETENTION_PIN_RESERVE:
+			{
+				PsRetentionPin pin;
+				uint64_t	seq;
+				int			ret = PS_RETENTION_ERROR;
+
+				memset(&pin, 0, sizeof(pin));
+				pin.timeline = tl;
+				pin.owner_kind = ch->blocknum;
+				pin.resources = ch->parent_timeline;
+				pin.generation = ch->old_nblocks;
+				pin.owner_id = ch->req_seq;
+				pin.lsn = ch->req_lsn;
+				pthread_rwlock_wrlock(&admission_lock);
+				seq = admission_seq_alloc();
+				pin.admission_seq = seq;
+				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES &&
+					timelines[tl].defined)
+					ret = ps_retention_reserve_and_set(&pin);
+				if (ret == PS_RETENTION_OK)
+				{
+					memcpy(ch->data, &seq, sizeof(seq));
+					ch->datalen = sizeof(seq);
+				}
+				pthread_rwlock_unlock(&admission_lock);
+				if (ret == PS_RETENTION_STALE)
+					ch->status = PS_STATUS_STALE;
+				else if (ret != PS_RETENTION_OK)
+					ch->status = PS_STATUS_ERROR;
+			}
+			break;
+
 		case PS_OP_RETENTION_PIN_DROP:
 			{
 				int			ret;

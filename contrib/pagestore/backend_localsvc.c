@@ -1053,6 +1053,38 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 	return ls_exec_wait(ch, timeout_ms);
 }
 
+uint8
+pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
+									 uint32 owner_kind, uint64 owner_id,
+									 uint32 generation, uint32 resources,
+									 uint64 lsn, uint64 *admission_seq,
+									 int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	uint8		status;
+
+	*admission_seq = 0;
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	status = ls_exec_wait(ch, timeout_ms);
+	if (status == PS_STATUS_OK && ch->datalen == sizeof(*admission_seq))
+		memcpy(admission_seq, ch->data, sizeof(*admission_seq));
+	else if (status == PS_STATUS_OK)
+		status = PS_STATUS_ERROR;
+	return status;
+}
+
 /* A successful DROP leaves the store-side generation tombstone in place. */
 uint8
 pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,

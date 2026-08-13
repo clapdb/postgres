@@ -867,13 +867,18 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 		(uint64) generation > UINT32_MAX || resources < 0)
 		ereport(ERROR,
 				(errmsg("pagestore retention owner fields are invalid or out of range")));
-	admission_seq = PG_NARGS() > 6 ?
-		(uint64) PG_GETARG_INT64(6) :
-		pagestore_localsvc_admission_barrier_timeout(30000);
-	PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
+	if (PG_NARGS() > 6)
+	{
+		admission_seq = (uint64) PG_GETARG_INT64(6);
+		PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
+			(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
+			(uint32) generation, (uint32) resources, (uint64) lsn,
+			admission_seq));
+	}
+	PG_RETURN_INT32((int32) pagestore_localsvc_retention_reserve_timeout(
 		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
 		(uint32) generation, (uint32) resources, (uint64) lsn,
-		admission_seq));
+		&admission_seq, 30000));
 }
 
 PG_FUNCTION_INFO_V1(pagestore_retention_drop);
@@ -1246,17 +1251,12 @@ pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 			pagestore_retention_owner_generation == 0)
 				ereport(FATAL,
 						(errmsg("pagestore materializer has no valid retention owner authority")));
-		admission_seq = pagestore_localsvc_admission_barrier_timeout(
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
-		if (admission_seq == 0)
-			ereport(FATAL,
-					(errmsg("pagestore materializer could not establish an admission fence")));
-		status = pagestore_localsvc_retention_set_timeout(
+		status = pagestore_localsvc_retention_reserve_timeout(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
 			pagestore_retention_owner_id,
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) redo_lsn,
-			admission_seq,
+			&admission_seq,
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 		if (status == PS_STATUS_STALE)
 			ereport(FATAL,
@@ -1286,17 +1286,12 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 	{
 		uint64		admission_seq;
 
-		admission_seq = pagestore_localsvc_admission_barrier_timeout(
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
-		if (admission_seq == 0)
-			ereport(ERROR,
-					(errmsg("pagestore materializer could not establish an admission fence")));
-		status = pagestore_localsvc_retention_set_timeout(
+		status = pagestore_localsvc_retention_reserve_timeout(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
 			pagestore_retention_owner_id,
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) replay_lsn,
-			admission_seq,
+			&admission_seq,
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	}
 	PG_CATCH();
@@ -10353,16 +10348,11 @@ pagestore_validate_datadir_branch_manifest(void)
 		}
 		if (set_reader_pin)
 		{
-			provisional_seq = pagestore_localsvc_admission_barrier_timeout(
-				PS_READER_RETENTION_TIMEOUT_MS);
-			if (provisional_seq == 0)
-				ereport(FATAL,
-						(errmsg("pagestore reader could not establish a provisional admission fence")));
-			retention_status = pagestore_localsvc_retention_set_timeout(
+			retention_status = pagestore_localsvc_retention_reserve_timeout(
 				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
 				pagestore_retention_owner_id,
 				pagestore_retention_owner_generation,
-				PS_READER_RETENTION_RESOURCES, read_lsn, provisional_seq,
+				PS_READER_RETENTION_RESOURCES, read_lsn, &provisional_seq,
 				PS_READER_RETENTION_TIMEOUT_MS);
 			if (retention_status == PS_STATUS_STALE)
 				ereport(FATAL,

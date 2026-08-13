@@ -110,6 +110,7 @@ typedef enum PsOpcode
 	PS_OP_WAL_INDEX_PROGRESS,	/* req_lsn=start, req_seq=end; 0/0 reads end */
 	PS_OP_WAL_RETAIN_FLOOR,		/* out req_lsn: durable WAL retention floor (timeline) */
 	PS_OP_ADMISSION_BARRIER,	/* out req_seq: sequence after prior mutations */
+	PS_OP_RETENTION_PIN_RESERVE, /* allocate fence and atomically install pin */
 	PS_OP_RETENTION_PIN_SET,	/* durable set/update; fields described below */
 	PS_OP_RETENTION_PIN_DROP,	/* durable idempotent drop by owner key */
 	PS_OP_RETENTION_PIN_GET,	/* enumerate by blocknum; nblocks = total count */

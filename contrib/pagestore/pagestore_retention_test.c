@@ -220,6 +220,8 @@ main(void)
 	check(ps_retention_set(&pin) == PS_RETENTION_ERROR,
 		  "new controller pin cannot use the legacy zero sequence");
 	pin.admission_seq = 77;
+	check(ps_retention_reserve_and_set(&pin) == PS_RETENTION_OK,
+		  "reserve a sequence and publish its pin atomically");
 	for (uint64_t i = 0; i < 70; i++)
 	{
 		pin.lsn = 100 + i;
@@ -235,7 +237,7 @@ main(void)
 
 	check(ps_retention_open(dir) == 0, "reopen compacted registry");
 	check(ps_retention_admission_highwater(&admission_highwater) == 0 &&
-		  admission_highwater == 55,
+		  admission_highwater == 77,
 		  "compaction preserves the admission reservation high-water");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.timeline == 7 && got.owner_id == 42 && got.generation == 1 &&
