@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		31	/* 31: page-pruning metrics;
+#define PS_SHM_VERSION		32	/* 32: coherent page-pruning metrics;
+								 * 31: page-pruning metrics;
 								 * 30: keyed retention lookup;
 								 * 29: retention GET epoch/result payload;
 								 * 28: exact retention admission sequences;

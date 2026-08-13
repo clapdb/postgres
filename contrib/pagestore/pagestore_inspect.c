@@ -99,7 +99,7 @@ print_pruning(PsShmHeader *hdr)
 			 kept,
 			 deleted;
 
-	do
+	for (;;)
 	{
 		seq_before = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
 		if (seq_before & 1)
@@ -109,7 +109,9 @@ print_pruning(PsShmHeader *hdr)
 		kept = ps_load_acquire_u64(&hdr->page_prune_versions_kept);
 		deleted = ps_load_acquire_u64(&hdr->page_prune_versions_deleted);
 		seq_after = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
-	} while (seq_before != seq_after || (seq_after & 1));
+		if (seq_before == seq_after && !(seq_after & 1))
+			break;
+	}
 	printf("{\"compactions\":%llu,\"versions_scanned\":%llu,"
 		   "\"versions_kept\":%llu,\"versions_deleted\":%llu}\n",
 		   (unsigned long long) compactions,
