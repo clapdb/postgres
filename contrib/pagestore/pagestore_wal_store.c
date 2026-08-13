@@ -182,7 +182,8 @@ cleanup:
 
 int
 ps_wal_store_create(PsWalStore *store, const char *directory,
-					uint32_t timeline, uint64_t start_lsn)
+					uint32_t timeline, uint64_t start_lsn,
+					uint32_t segment_size)
 {
 	char path[128];
 	int created = 0;
@@ -191,12 +192,16 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 
 	if (store == NULL || directory == NULL)
 		return -1;
-	if (start_lsn % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0)
+	if (segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
+		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
+		(segment_size & (segment_size - 1)) != 0 ||
+		start_lsn % segment_size != 0)
 		return -1;
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
 	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
 	store->timeline = timeline;
+	store->segment_size = segment_size;
 	if (n < 0 || (size_t) n >= sizeof(store->directory) ||
 		segment_name(store, UINT64_MAX, path, sizeof(path)) != 0)
 		return -1;
@@ -234,7 +239,7 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	}
 	store->start_lsn = start_lsn;
 	store->end_lsn = start_lsn;
-	store->next_segment_no = start_lsn / PS_WAL_SEGMENT_PAYLOAD_BYTES;
+	store->next_segment_no = start_lsn / store->segment_size;
 	store->cached_segment_no = UINT64_MAX;
 	return 0;
 }
@@ -280,8 +285,8 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	uint32_t done = 0;
 
 	if (store == NULL || store->directory_fd < 0 || data == NULL || len == 0 ||
-		start_lsn % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
-		len % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
+		start_lsn % store->segment_size != 0 ||
+		len % store->segment_size != 0 ||
 		start_lsn > store->end_lsn || start_lsn + len < start_lsn ||
 		start_lsn + len < store->end_lsn)
 		return -1;
@@ -299,11 +304,11 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	while (done < len)
 	{
 		PsWalSegmentHeader header;
-		uint32_t chunk = PS_WAL_SEGMENT_PAYLOAD_BYTES;
+		uint32_t chunk = store->segment_size;
 		uint64_t segment_start = start_lsn + done;
 
-		if (segment_start % PS_WAL_SEGMENT_PAYLOAD_BYTES != 0 ||
-			segment_start / PS_WAL_SEGMENT_PAYLOAD_BYTES != store->next_segment_no)
+		if (segment_start % store->segment_size != 0 ||
+			segment_start / store->segment_size != store->next_segment_no)
 			return -1;
 		{
 			const char *fail_segment = getenv("PAGESTORE_TEST_FAIL_WAL_SEGMENT_NO");
@@ -315,7 +320,7 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 		if (reserve_entry(store) != 0 ||
 			ps_wal_segment_seal(&header, store->timeline,
 								 store->next_segment_no, start_lsn + done,
-								 bytes + done, chunk) != 0 ||
+								 store->segment_size, bytes + done, chunk) != 0 ||
 			publish_segment(store, &header, bytes + done) != 0)
 			return -1;
 		store->entries[store->nentries++].header = header;
@@ -403,7 +408,7 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 	if (start_lsn < store->start_lsn || end_lsn > store->end_lsn)
 		return -1;
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
-			 PS_WAL_SEGMENT_PAYLOAD_BYTES); i < store->nentries && done < len; i++)
+			 store->segment_size); i < store->nentries && done < len; i++)
 	{
 		const PsWalSegmentHeader *header = &store->entries[i].header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
