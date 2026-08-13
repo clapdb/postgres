@@ -2637,15 +2637,16 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 	do
 	{
 		ForkEnt    *fe = fork_find(w.tl, key);
+		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
 		uint32_t	nb = 0;
-		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, read_seq, &nb) :
+		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, seq_cap, &nb) :
 			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
-		PageVer    *v = e ? page_visible(e, w.lsn, read_seq) : NULL;
+		PageVer    *v = e ? page_visible(e, w.lsn, seq_cap) : NULL;
 
 		if (v)
 		{
-			if (!fork_page_invalidated(fe, block, v, w.lsn, read_seq))
+			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
 				return v;
 			return NULL;
 		}
@@ -2653,7 +2654,7 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return NULL;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, w.lsn, read_seq))
+			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
 			return NULL;
 	} while (tl_walk_next(&w));
 	return NULL;
@@ -2684,7 +2685,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
+			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return maxnb;
@@ -2711,7 +2713,8 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
+			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return 0;
@@ -4613,12 +4616,13 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		{
 			uint32_t	tl = w.tl;
 			uint64_t	rl = w.lsn;
+			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
 			ForkEnt    *fe = fork_find(tl, key);
 			uint32_t	nb = 0;
-			int			fork_state = fe ? fork_asof_hop(fe, rl, read_seq, &nb) :
+			int			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
 				FORK_HOP_NONE;
 			PageEnt    *e = page_find(tl, key, block);
-			PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
+			PageVer    *pv = e ? page_visible(e, rl, seq_cap) : NULL;
 
 		if (pv)
 		{
@@ -4627,7 +4631,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			int			served;
 			int			poisoned;
 
-			if (fork_page_invalidated(fe, block, pv, rl, read_seq))
+			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
 				return 0;
 
 			/*
@@ -4650,7 +4654,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				return 1;
 
 			if (s->memtable && !poisoned &&
-				ps_memtable_lookup(s->memtable, tl, key, block, rl, read_seq,
+				ps_memtable_lookup(s->memtable, tl, key, block, rl, seq_cap,
 								   &l, &a, out) &&
 				l == pv->lsn && a == pv->admission_seq)
 			{
@@ -4689,7 +4693,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return 0;
 		if (fork_state == FORK_HOP_DEF &&
-			fork_inheritance_fenced(fe, block, rl, read_seq))
+			fork_inheritance_fenced(fe, block, rl, seq_cap))
 			return 0;
 		}
 	}
