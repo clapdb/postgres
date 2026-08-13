@@ -148,10 +148,59 @@ random_suffix(char suffix[7])
 }
 
 static int read_validated_segment_range(PsWalStore *store,
-											const PsWalStoreEntry *entry,
-										uint64_t range_off, unsigned char *out,
-										const unsigned char *compare,
-										size_t range_len);
+																const PsWalStoreEntry *entry,
+																uint64_t range_off, unsigned char *out,
+																const unsigned char *compare,
+																size_t range_len);
+
+/* A directory fsync can fail after linkat() has exposed the final name.  Before
+ * reporting failure, determine whether that name is the immutable segment we
+ * were publishing, so an otherwise successful retry cannot be wedged by EEXIST. */
+static int
+published_segment_matches(PsWalStore *store, const PsWalSegmentHeader *expected,
+						  const void *payload)
+{
+	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
+	const unsigned char *bytes = payload;
+	PsWalSegmentHeader actual;
+	struct stat st;
+	char name[128];
+	uint32_t done = 0;
+	int fd = -1;
+	int rc = -1;
+
+	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
+		(fd = openat(store->directory_fd, name, O_RDONLY | O_CLOEXEC)) < 0 ||
+		fstat(fd, &st) != 0 ||
+		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES + expected->payload_len) ||
+		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
+		ps_wal_segment_decode(&actual, encoded, sizeof(encoded)) != 0 ||
+		actual.timeline != expected->timeline ||
+		actual.segment_no != expected->segment_no ||
+		actual.start_lsn != expected->start_lsn ||
+		actual.payload_len != expected->payload_len ||
+		actual.segment_size != expected->segment_size ||
+		actual.payload_crc != expected->payload_crc)
+		goto cleanup;
+	while (done < expected->payload_len)
+	{
+		size_t amount = expected->payload_len - done < sizeof(buf) ?
+			expected->payload_len - done : sizeof(buf);
+
+		if (read_all_at(fd, buf, amount,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0 ||
+			memcmp(buf, bytes + done, amount) != 0)
+			goto cleanup;
+		done += (uint32_t) amount;
+	}
+	rc = 0;
+
+cleanup:
+	if (fd >= 0)
+		close(fd);
+	return rc;
+}
 
 static int
 publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
@@ -203,12 +252,26 @@ publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 	 * immutable segment that already owns this timeline/sequence identity. */
 	if (linkat(store->directory_fd, temporary, store->directory_fd,
 			   final_name, 0) != 0)
+	{
+		/* A previous ambiguous publication can leave our final name behind.
+		 * Reconcile it before treating EEXIST as a permanent append failure. */
+		if (errno == EEXIST &&
+			published_segment_matches(store, header, payload) == 0 &&
+			fsync(store->directory_fd) == 0)
+			rc = 0;
 		goto cleanup;
+	}
 	(void) unlinkat(store->directory_fd, temporary, 0);
 	if (fsync(store->directory_fd) != 0)
 	{
-		(void) unlinkat(store->directory_fd, final_name, 0);
-		(void) fsync(store->directory_fd);
+		if (published_segment_matches(store, header, payload) == 0 &&
+			fsync(store->directory_fd) == 0)
+		{
+			rc = 0;
+			goto cleanup;
+		}
+		/* The published identity is not ours.  Do not unlink an immutable name
+		 * that may have become durable despite the failed directory fsync. */
 		goto cleanup;
 	}
 	rc = 0;
