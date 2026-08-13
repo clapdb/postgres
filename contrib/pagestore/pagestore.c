@@ -367,6 +367,7 @@ typedef struct PagestoreReaderSnapshotJobShmem
 	uint64		completed_generation;
 	uint64		failed_generation;
 	uint64		reserved_generation;
+	int			reservation_owner_pid;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7157,6 +7158,7 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 										XLogRecPtr read_lsn,
 										const char *mapdir)
 {
+	bool		map_exists = false;
 	char		map_path[MAXPGPATH];
 	char		version_path[MAXPGPATH];
 	char		tablespace_link[MAXPGPATH];
@@ -7170,11 +7172,18 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	len = snprintf(map_path, sizeof(map_path), "%s/pg_filenode.map", mapdir);
 	PS_CHECK_PATH_FORMAT(len, map_path);
 	if (lstat(map_path, &st) == 0)
-		return S_ISREG(st.st_mode);
-	if (errno != ENOENT ||
-		!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
-									 data, &data_size))
-		return false;
+	{
+		if (!S_ISREG(st.st_mode))
+			return false;
+		map_exists = true;
+	}
+	else
+	{
+		if (errno != ENOENT ||
+			!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
+										 data, &data_size))
+			return false;
+	}
 	if (tsid != DEFAULTTABLESPACE_OID && tsid != GLOBALTABLESPACE_OID)
 	{
 		len = snprintf(tablespace_link, sizeof(tablespace_link),
@@ -7212,8 +7221,9 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	}
 	else if (!S_ISREG(st.st_mode))
 		return false;
-	pagestore_publish_artifact(mapdir, "pg_filenode.map",
-							   "reader relation map", data, (int) data_size);
+	if (!map_exists)
+		pagestore_publish_artifact(mapdir, "pg_filenode.map",
+								   "reader relation map", data, (int) data_size);
 	return true;
 }
 
@@ -10255,6 +10265,7 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_snapshot_job->completed_generation = 0;
 		pagestore_reader_snapshot_job->failed_generation = 0;
 		pagestore_reader_snapshot_job->reserved_generation = 0;
+		pagestore_reader_snapshot_job->reservation_owner_pid = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -11935,6 +11946,16 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 	BackgroundWorkerInitializeConnectionByOid(Template1DbOid, InvalidOid,
 										  BGWORKER_BYPASS_ALLOWCONN);
+	/*
+	 * The postmaster runs only one instance of this statically registered
+	 * launcher at a time.  A replacement therefore owns recovery of a
+	 * reservation left behind if its predecessor exited between reserving a
+	 * generation and the normal cycle cleanup below.
+	 */
+	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+	pagestore_reader_snapshot_job->reserved_generation = 0;
+	pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 
 	while (!ShutdownRequestPending)
 	{
@@ -11989,7 +12010,10 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				{
 					barrier_lsn = job_control.checkPointCopy.redo;
 					barrier_generation = generation;
+					SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 					pagestore_reader_snapshot_job->reserved_generation = generation;
+					pagestore_reader_snapshot_job->reservation_owner_pid = MyProcPid;
+					SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 					break;
 				}
 				if (generation == completed)
@@ -12091,8 +12115,12 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		{
 			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 			if (pagestore_reader_snapshot_job->reserved_generation ==
-				barrier_generation)
+				barrier_generation &&
+				pagestore_reader_snapshot_job->reservation_owner_pid == MyProcPid)
+			{
 				pagestore_reader_snapshot_job->reserved_generation = 0;
+				pagestore_reader_snapshot_job->reservation_owner_pid = 0;
+			}
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		}
 		list_free_deep(databases);
