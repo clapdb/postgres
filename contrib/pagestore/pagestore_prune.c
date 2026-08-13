@@ -35,7 +35,8 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 			versions[i].admission_seq == versions[i + 1].admission_seq)
 			continue;
 		if (versions[i].lsn <= floor.lsn &&
-			(floor.admission_seq == 0 || versions[i].admission_seq == 0 ||
+			(versions[i].lsn < floor.lsn || floor.admission_seq == 0 ||
+			 versions[i].admission_seq == 0 ||
 			 versions[i].admission_seq <= floor.admission_seq))
 			base = (int) i;
 		/* Every distinct tuple outside the admitted frontier remains a legal
@@ -60,7 +61,8 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 
 		for (uint32_t i = 0; i < n; i++)
 			if (versions[i].lsn <= fences[f].lsn &&
-				(fences[f].admission_seq == 0 ||
+				(versions[i].lsn < fences[f].lsn ||
+				 fences[f].admission_seq == 0 ||
 				 versions[i].admission_seq == 0 ||
 				 versions[i].admission_seq <= fences[f].admission_seq))
 				visible = (int) i;
