@@ -25,7 +25,6 @@ typedef struct PsWalStore
 	uint32_t	nentries;
 	uint32_t	capacity;
 	uint64_t	cached_segment_no;
-	unsigned char *cached_payload;
 	dev_t		cached_dev;
 	ino_t		cached_ino;
 	off_t		cached_size;
