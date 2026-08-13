@@ -1183,20 +1183,26 @@ static void
 pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
 {
 	uint8		status;
+	uint64		admission_seq;
 
 	if (pagestore_materializer)
 	{
 		if (XLogRecPtrIsInvalid(redo_lsn) ||
 			pagestore_retention_owner_id == 0 ||
 			pagestore_retention_owner_generation == 0)
+				ereport(FATAL,
+						(errmsg("pagestore materializer has no valid retention owner authority")));
+		admission_seq = pagestore_localsvc_admission_barrier_timeout(
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		if (admission_seq == 0)
 			ereport(FATAL,
-					(errmsg("pagestore materializer has no valid retention owner authority")));
+					(errmsg("pagestore materializer could not establish an admission fence")));
 		status = pagestore_localsvc_retention_set_timeout(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
 			pagestore_retention_owner_id,
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) redo_lsn,
-			0,
+			admission_seq,
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 		if (status == PS_STATUS_STALE)
 			ereport(FATAL,
@@ -1224,12 +1230,19 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 
 	PG_TRY();
 	{
+		uint64		admission_seq;
+
+		admission_seq = pagestore_localsvc_admission_barrier_timeout(
+			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		if (admission_seq == 0)
+			ereport(ERROR,
+					(errmsg("pagestore materializer could not establish an admission fence")));
 		status = pagestore_localsvc_retention_set_timeout(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_MATERIALIZER,
 			pagestore_retention_owner_id,
 			pagestore_retention_owner_generation,
 			PS_MATERIALIZER_RETENTION_RESOURCES, (uint64) replay_lsn,
-			0,
+			admission_seq,
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	}
 	PG_CATCH();
