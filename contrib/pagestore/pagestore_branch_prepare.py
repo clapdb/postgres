@@ -534,6 +534,8 @@ class BranchPreparer:
                 + str(self.config.retention_owner_id) + "'"
                 " AND current_setting('pagestore.retention_owner_generation')::bigint = "
                 + str(authority_generation)
+                + " AND current_setting('data_directory') = "
+                + sql_literal(str(self.config.materializer_data_dir))
                 + " AND current_setting('pagestore.timeline')::integer = "
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"

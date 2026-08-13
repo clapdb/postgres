@@ -320,8 +320,12 @@ materializer_dev=$(stat -c %d "$MATERIALIZER") ||
 	fail "could not inspect materializer device identity"
 materializer_ino=$(stat -c %i "$MATERIALIZER") ||
 	fail "could not inspect materializer inode identity"
+authority_dev=$(stat -c %d "$D/controller-authority") ||
+	fail "could not inspect authority namespace device identity"
+authority_ino=$(stat -c %i "$D/controller-authority") ||
+	fail "could not inspect authority namespace inode identity"
 cat > "$D/controller-authority/retention-owner-1.json" <<EOF
-{"retention_generation":1,"consumer_data_dir":"$MATERIALIZER","consumer_instance_id":"mvp-golden","consumer_data_dev":$materializer_dev,"consumer_data_ino":$materializer_ino}
+{"retention_generation":1,"consumer_data_dir":"$MATERIALIZER","consumer_instance_id":"mvp-golden","consumer_data_dev":$materializer_dev,"consumer_data_ino":$materializer_ino,"authority_namespace_dev":$authority_dev,"authority_namespace_ino":$authority_ino}
 EOF
 
 cat > "$BRANCH_CONFIG" <<EOF
