@@ -150,6 +150,9 @@ assert "$($P -c 'SELECT count(*) FROM t;')" "20000" "row count after restart"
 # R0 retention-owner calls return the daemon's status instead of collapsing a
 # stale generation into success.  Keep owner 9001 live across the later daemon
 # crash/reconnect test; it is released immediately after recovery there.
+"$BIN/psql" -h "$MAIN_SOCK" -p "$PORT" -U postgres -d template1 \
+	-c "CREATE EXTENSION pagestore; SELECT pagestore_retention_owner_lsn(0, 1, 1, 1);" \
+	>/dev/null
 $P -c "CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn) RETURNS int
         AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_retention_drop(int,int,bigint,bigint) RETURNS int

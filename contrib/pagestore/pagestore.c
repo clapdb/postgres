@@ -8580,10 +8580,6 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 		if (XLogRecPtrIsInvalid(published) ||
 			published <= (XLogRecPtr) pagestore_localsvc_read_lsn())
 			goto adoption_done;
-		snapshot = pagestore_load_published_reader_snapshot(
-			pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
-		if (OidIsValid(MyDatabaseId) && DatabasePath != NULL)
-			pagestore_validate_database_reader_manifest(published);
 		valid = ps_control_asof_timeout(published, &control,
 			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
 			pagestore_reader_database_barrier_valid(published) &&
@@ -8591,6 +8587,13 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 			(must_adopt || pagestore_localsvc_read_fence_timeout(
 				(uint64) published, &read_seq,
 				PAGESTORE_READER_HORIZON_TIMEOUT_MS));
+		if (valid)
+		{
+			snapshot = pagestore_load_published_reader_snapshot(
+				pagestore_localsvc_timeline(), published, snapshot_context, ERROR);
+			if (OidIsValid(MyDatabaseId) && DatabasePath != NULL)
+				pagestore_validate_database_reader_manifest(published);
+		}
 adoption_done:
 		;
 	}
@@ -12179,18 +12182,14 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		{
 			uint64		membership_generation;
 			databases = pagestore_reader_artifact_databases();
-			/*
-			 * CHECKPOINT_WAIT may attach to a checkpoint that began before the
-			 * pg_database membership lock was acquired.  Drain that checkpoint
-			 * first.  The generation sampled below is therefore a lower bound,
-			 * and the following forced checkpoint must begin while the membership
-			 * lock is held.
-			 */
-			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST |
-							  CHECKPOINT_WAIT);
+			/* The forced checkpoint must produce a generation strictly newer than
+			 * the frozen membership set.  Sampling after CHECKPOINT_WAIT would
+			 * skip that exact target. */
 			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 			membership_generation = pagestore_reader_snapshot_job->generation;
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST |
+							  CHECKPOINT_WAIT);
 			/* Require a checkpoint job created after the database membership lock.
 			 * An older outstanding job is allowed to finish, then the empty slot
 			 * receives our forced checkpoint. */
