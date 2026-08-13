@@ -6455,6 +6455,7 @@ pagestore_publish_artifact(const char *target_dir, const char *filename,
 #define PAGESTORE_READER_SNAPSHOT_MAGIC UINT32_C(0x50535253)
 #define PAGESTORE_READER_SNAPSHOT_FORMAT 1
 #define PAGESTORE_READER_SNAPSHOT_FILE "pagestore_reader.snapshot"
+#define PAGESTORE_READER_MAP_PENDING_FILE ".pagestore-reader-map-pending"
 #define PAGESTORE_READER_CATALOG_MAGIC UINT32_C(0x50534350)
 #define PAGESTORE_READER_CATALOG_FORMAT 1
 #define PAGESTORE_READER_CATALOG_FILE "pagestore_reader.catalog"
@@ -6936,6 +6937,58 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 	}
 }
 
+/* The durable reader pin has advanced, so maps installed while validating this
+ * exact barrier are now visible at an adopted horizon.  Remove their persistent
+ * retry markers only after the pin update succeeds. */
+static void
+pagestore_commit_reader_database_maps(XLogRecPtr read_lsn)
+{
+	PagestoreReaderDatabaseBarrier barrier;
+	PagestoreReaderDatabaseBarrier checked;
+	PageStoreRelKey key = pagestore_reader_snapshot_key(
+		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
+	char		page[BLCKSZ];
+	uint64		resolved = 0;
+
+	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, 0, (uint64) read_lsn, page, &resolved,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+		ereport(ERROR, (errmsg("could not reload adopted reader database barrier")));
+	memcpy(&barrier, page, sizeof(barrier));
+	checked = barrier;
+	INIT_CRC32C(checked.crc);
+	COMP_CRC32C(checked.crc, &checked,
+				offsetof(PagestoreReaderDatabaseBarrier, crc));
+	FIN_CRC32C(checked.crc);
+	if (barrier.magic != PAGESTORE_READER_DATABASE_BARRIER_MAGIC ||
+		barrier.format != PAGESTORE_READER_DATABASE_BARRIER_FORMAT ||
+		barrier.timeline != pagestore_localsvc_timeline() ||
+		barrier.read_lsn != read_lsn || barrier.database_count == 0 ||
+		barrier.database_count > PAGESTORE_READER_DATABASE_MAX ||
+		barrier.reserved != 0 || !EQ_CRC32C(barrier.crc, checked.crc))
+		ereport(ERROR, (errmsg("adopted reader database barrier changed")));
+	for (uint32 i = 0; i < barrier.database_count; i++)
+	{
+		PagestoreReaderDatabaseEntry *entry = &barrier.databases[i];
+		char	   *mapdir = GetDatabasePath(entry->database_oid,
+									 entry->tablespace_oid);
+		char		pending_path[MAXPGPATH];
+		int			len;
+
+		len = snprintf(pending_path, sizeof(pending_path), "%s/%s", mapdir,
+					   PAGESTORE_READER_MAP_PENDING_FILE);
+		PS_CHECK_PATH_FORMAT(len, pending_path);
+		if (unlink(pending_path) == 0)
+			fsync_fname(mapdir, true);
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not commit reader relation map \"%s\": %m",
+							pending_path)));
+		pfree(mapdir);
+	}
+}
+
 static void
 pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 {
@@ -7154,7 +7207,9 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 										const char *mapdir)
 {
 	bool		map_exists = false;
+	bool		pending = false;
 	char		map_path[MAXPGPATH];
+	char		pending_path[MAXPGPATH];
 	char		version_path[MAXPGPATH];
 	char		tablespace_link[MAXPGPATH];
 	char		parent[MAXPGPATH];
@@ -7163,6 +7218,8 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	pg_crc32c	data_crc;
 	Size		data_size;
 	int			len;
+	int			fd;
+	XLogRecPtr	pending_lsn;
 
 	len = snprintf(map_path, sizeof(map_path), "%s/pg_filenode.map", mapdir);
 	PS_CHECK_PATH_FORMAT(len, map_path);
@@ -7174,11 +7231,29 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	}
 	else
 	{
-		if (errno != ENOENT ||
-			!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
-										 data, &data_size))
+		if (errno != ENOENT)
 			return false;
 	}
+	len = snprintf(pending_path, sizeof(pending_path), "%s/%s", mapdir,
+				   PAGESTORE_READER_MAP_PENDING_FILE);
+	PS_CHECK_PATH_FORMAT(len, pending_path);
+	if (lstat(pending_path, &st) == 0)
+	{
+		if (!S_ISREG(st.st_mode) || st.st_size != sizeof(pending_lsn) ||
+			(fd = OpenTransientFile(pending_path, O_RDONLY | PG_BINARY)) < 0)
+			return false;
+		pending = pagestore_pread_exact(fd, &pending_lsn, sizeof(pending_lsn), 0);
+		if (CloseTransientFile(fd) != 0)
+			pending = false;
+		if (!pending)
+			return false;
+	}
+	else if (errno != ENOENT)
+		return false;
+	if ((!map_exists || pending) &&
+		!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
+									 data, &data_size))
+		return false;
 	if (tsid != DEFAULTTABLESPACE_OID && tsid != GLOBALTABLESPACE_OID)
 	{
 		len = snprintf(tablespace_link, sizeof(tablespace_link),
@@ -7216,9 +7291,17 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	}
 	else if (!S_ISREG(st.st_mode))
 		return false;
-	if (!map_exists)
+	if (!map_exists || pending)
+	{
+		/* Persist intent first.  A crash or later barrier failure then leaves a
+		 * durable indication that this map has never become visible at an adopted
+		 * horizon and must be refreshed on retry. */
+		pagestore_publish_artifact(mapdir, PAGESTORE_READER_MAP_PENDING_FILE,
+								   "reader relation-map pending horizon",
+								   (char *) &read_lsn, sizeof(read_lsn));
 		pagestore_publish_artifact(mapdir, "pg_filenode.map",
 								   "reader relation map", data, (int) data_size);
+	}
 	return true;
 }
 
@@ -8472,6 +8555,7 @@ adoption_done:
 			return;
 		}
 	}
+	pagestore_commit_reader_database_maps(published);
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
 	if (published > pagestore_reader_horizon->adoptable_lsn)
 	{

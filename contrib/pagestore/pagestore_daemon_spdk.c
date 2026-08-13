@@ -393,7 +393,8 @@ run_request(uint32_t i, PsChannel *ch)
 	/* Retention registry operations own their own mutex; mutations can also
 	 * fsync host metadata.  Do not nest the global core lock around either. */
 	if (op == PS_OP_RETENTION_PIN_LOOKUP ||
-		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP ||
+		op == PS_OP_RETENTION_PIN_RESERVE)
 	{
 		int timeline_ok;
 
