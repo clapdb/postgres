@@ -203,7 +203,7 @@ retention_pin_valid(const PsRetentionPin *pin)
 {
 	return pin != NULL && retention_kind_valid(pin->owner_kind) &&
 		retention_resources_valid(pin->resources) && pin->owner_id != 0 &&
-		pin->lsn != 0 && pin->admission_seq != UINT64_MAX;
+		pin->lsn != 0 && pin->admission_seq < UINT64_MAX - 1;
 }
 
 static int
@@ -970,7 +970,7 @@ ps_retention_set(const PsRetentionPin *pin)
 	int			idx;
 	int			rc = -1;
 
-	if (!retention_pin_valid(pin))
+	if (!retention_pin_valid(pin) || pin->admission_seq == 0)
 		return -1;
 	pthread_mutex_lock(&retention_lock);
 	if (retention_is_poisoned)
@@ -1123,7 +1123,10 @@ ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 	if (retention_is_poisoned)
 		rc = PS_RETENTION_ERROR;
 	else if (*epoch_io != 0 && *epoch_io != retention_mutation_epoch)
+	{
+		*epoch_io = 0;
 		rc = PS_RETENTION_STALE;
+	}
 	else
 	{
 		uint32_t	active = retention_active_count();

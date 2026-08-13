@@ -1022,7 +1022,8 @@ pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
 	PsChannel  *ch;
 
 	/* Zero is reserved for replaying retention records predating protocol v28. */
-	if (generation == 0)
+	if (generation == 0 || admission_seq == 0 ||
+		admission_seq >= UINT64_MAX - 1)
 		return PS_STATUS_ERROR;
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 
@@ -1093,7 +1094,11 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
 	ch->req_lsn = *epoch;
 	status = ls_exec_wait(ch, 0);
 	if (status != PS_STATUS_OK)
+	{
+		if (status == PS_STATUS_STALE)
+			*epoch = 0;
 		return status;
+	}
 	if (ch->datalen != sizeof(result))
 		return PS_STATUS_ERROR;
 	memcpy(&result, ch->data, sizeof(result));

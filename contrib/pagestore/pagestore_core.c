@@ -108,7 +108,16 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 static uint64_t
 admission_seq_alloc(void)
 {
-	return __atomic_fetch_add(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
+
+	for (;;)
+	{
+		if (next == 0 || next == UINT64_MAX)
+			return 0;
+		if (__atomic_compare_exchange_n(&next_admission_seq, &next, next + 1,
+								false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+			return next;
+	}
 }
 
 static void
@@ -116,8 +125,9 @@ admission_seq_observe(uint64_t seq)
 {
 	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 
-	while (next <= seq &&
-		   !__atomic_compare_exchange_n(&next_admission_seq, &next, seq + 1,
+	while (next <= seq && next != UINT64_MAX &&
+		   !__atomic_compare_exchange_n(&next_admission_seq, &next,
+								 seq == UINT64_MAX ? UINT64_MAX : seq + 1,
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
@@ -1702,6 +1712,9 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 	uint64_t	admission_seq = admission_seq_alloc();
+
+	if (admission_seq == 0)
+		return -1;
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -3462,6 +3475,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	branch_floor = 0;
 	uint64_t	growth_floor = fe ? fe->last_def_lsn : 0;
 
+	if (admission_seq == 0)
+		return -1;
+
 	/* A branch-local version written after the branch snapshot must not become
 	 * visible AT that snapshot merely because copied bytes retain an older
 	 * source LSN.  The first representable local position is branch_lsn + 1. */
@@ -4732,6 +4748,11 @@ ps_handle_meta(PsChannel *ch)
 				uint32_t	nb;
 				int			r = fork_asof_hop(e, lsn, 0, &nb);
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
@@ -4769,6 +4790,11 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
@@ -4804,6 +4830,11 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
 								  FEV_SET) != 0)
 					ch->status = PS_STATUS_ERROR;
@@ -5029,7 +5060,10 @@ ps_handle_meta(PsChannel *ch)
 														   &epoch, &pin, &count);
 
 				if (found == PS_RETENTION_STALE)
+				{
 					ch->status = PS_STATUS_STALE;
+					ch->req_lsn = epoch;
+				}
 				else if (found < 0)
 					ch->status = PS_STATUS_ERROR;
 				else

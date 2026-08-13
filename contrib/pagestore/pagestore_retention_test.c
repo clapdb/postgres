@@ -179,6 +179,7 @@ main(void)
 	legacy.resources = PS_RETENTION_RESOURCE_ALL;
 	legacy.owner_id = 41;
 	legacy.lsn = 80;
+	legacy.admission_seq = 1;
 	check(ps_retention_set(&legacy) == PS_RETENTION_OK &&
 		  ps_retention_drop(legacy.timeline, legacy.owner_kind, legacy.owner_id,
 							legacy.generation) == PS_RETENTION_OK,
@@ -206,6 +207,12 @@ main(void)
 	pin.admission_seq = UINT64_MAX;
 	check(ps_retention_set(&pin) == PS_RETENTION_ERROR,
 		  "unrecoverable maximum admission sequence is rejected");
+	pin.admission_seq = UINT64_MAX - 1;
+	check(ps_retention_set(&pin) == PS_RETENTION_ERROR,
+		  "sequence immediately before allocator exhaustion is rejected");
+	pin.admission_seq = 0;
+	check(ps_retention_set(&pin) == PS_RETENTION_ERROR,
+		  "new controller pin cannot use the legacy zero sequence");
 	pin.admission_seq = 77;
 	for (uint64_t i = 0; i < 70; i++)
 	{

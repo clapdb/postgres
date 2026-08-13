@@ -669,8 +669,9 @@ op_wal_retain_floor(uint32_t timeline)
 }
 
 static int
-op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
-				 uint32_t generation, uint32_t resources, uint64_t lsn)
+op_retention_set_seq(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					 uint32_t generation, uint32_t resources, uint64_t lsn,
+					 uint64_t admission_seq)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
@@ -681,9 +682,23 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
-	ch->nblocks = 0;
-	ch->pad1 = 0;
+	ch->nblocks = (uint32_t) admission_seq;
+	ch->pad1 = (uint32_t) (admission_seq >> 32);
 	return cl_exec()->status;
+}
+
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	cl_exec();
+	if (ch->req_seq == 0)
+		return PS_STATUS_ERROR;
+	return op_retention_set_seq(timeline, owner_kind, owner_id, generation,
+							resources, lsn, ch->req_seq);
 }
 
 static int
@@ -715,7 +730,11 @@ op_retention_get_consistent(uint32_t index, PsRetentionPin *pin,
 	if (count)
 		*count = ch->nblocks;
 	if (ch->status != PS_STATUS_OK)
+	{
+		if (ch->status == PS_STATUS_STALE)
+			*epoch = ch->req_lsn;
 		return ch->status;
+	}
 	if (ch->datalen != sizeof(result))
 		return PS_STATUS_ERROR;
 	memcpy(&result, ch->data, sizeof(result));
@@ -2809,8 +2828,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 			  PS_STATUS_OK,
 			  "a concurrent owner mutation changes the registry epoch");
 		check(op_retention_get_consistent(1, &pin, &count, &epoch, &found) ==
-			  PS_STATUS_STALE && !found,
+			  PS_STATUS_STALE && !found && epoch == 0,
 			  "enumeration detects a mutation and requires restart");
+		check(op_retention_get_consistent(0, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_OK && found && epoch != 0,
+			  "enumeration restarts successfully with its cleared epoch");
 		check(op_retention_drop(0, PS_RETENTION_OWNER_CONFIGURED, 304, 1) ==
 			  PS_STATUS_OK,
 			  "temporary mutation owner is removed");
@@ -2828,9 +2850,12 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK,
 		  "SET atomically replaces the same owner generation");
+	check(op_retention_get(0, &pin, &count) && pin.owner_id == 101,
+		  "updated owner exposes its exact admission fence");
 	check(stat(path, &before) == 0, "retention log exists after its first pin");
-	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
-						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK &&
+	check(op_retention_set_seq(0, PS_RETENTION_OWNER_READER, 101,
+							   1, PS_RETENTION_RESOURCE_ALL, 2000,
+							   pin.admission_seq) == PS_STATUS_OK &&
 		  stat(path, &after) == 0 && before.st_size == after.st_size,
 		  "an exact SET retry is idempotent without log churn");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
