@@ -518,7 +518,9 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 }
 
 int
-ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
+ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline,
+				  uint64_t start_lsn, uint64_t end_lsn,
+				  uint32_t segment_size)
 {
 	uint64_t *numbers = NULL;
 	uint32_t count = 0;
@@ -526,7 +528,12 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 	int n;
 	int rc = -1;
 
-	if (store == NULL || directory == NULL)
+	if (store == NULL || directory == NULL ||
+		segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
+		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
+		(segment_size & (segment_size - 1)) != 0 ||
+		start_lsn % segment_size != 0 || end_lsn < start_lsn ||
+		end_lsn % segment_size != 0)
 		return -1;
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
@@ -537,7 +544,18 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 	if (store->directory_fd < 0)
 		return -1;
 	store->timeline = timeline;
-	if (list_segments(store, &numbers, &count) != 0 || count == 0)
+	store->segment_size = segment_size;
+	store->start_lsn = start_lsn;
+	store->end_lsn = start_lsn;
+	store->next_segment_no = start_lsn / segment_size;
+	if (list_segments(store, &numbers, &count) != 0)
+		goto cleanup;
+	if (count == 0)
+	{
+		rc = end_lsn == start_lsn ? 0 : -1;
+		goto cleanup;
+	}
+	if (numbers[0] != store->next_segment_no)
 		goto cleanup;
 	for (uint32_t i = 0; i < count; i++)
 	{
@@ -567,20 +585,19 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 		}
 		fd = -1;
 		if (header.timeline != timeline || header.segment_no != numbers[i] ||
-			(i != 0 && header.segment_size != store->segment_size) ||
-			(i != 0 && header.start_lsn != expected_lsn) ||
+			header.segment_size != store->segment_size ||
+			(i == 0 ? header.start_lsn != store->start_lsn :
+			 header.start_lsn != expected_lsn) ||
 			read_validated_segment_range(store, &header, 0, NULL, NULL, 0) != 0 ||
 			reserve_entry(store) != 0)
 			goto cleanup;
-		if (i == 0)
-			store->segment_size = (uint32_t) header.segment_size;
-		if (i == 0)
-			store->start_lsn = header.start_lsn;
 		expected_lsn = header.start_lsn + header.payload_len;
 		store->entries[store->nentries++].header = header;
 	}
 	store->next_segment_no = numbers[0] + count;
 	store->end_lsn = expected_lsn;
+	if (store->end_lsn != end_lsn)
+		goto cleanup;
 	rc = 0;
 
 cleanup:

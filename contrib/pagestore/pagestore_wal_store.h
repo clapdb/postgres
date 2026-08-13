@@ -31,8 +31,10 @@ typedef struct PsWalStore
 extern int ps_wal_store_create(PsWalStore *store, const char *directory,
 							   uint32_t timeline, uint64_t start_lsn,
 							   uint32_t segment_size);
+/* Reopen against caller-durable bounds, including a valid empty range. */
 extern int ps_wal_store_open(PsWalStore *store, const char *directory,
-							 uint32_t timeline);
+							 uint32_t timeline, uint64_t start_lsn,
+							 uint64_t end_lsn, uint32_t segment_size);
 /* Append one or more complete, segment-aligned immutable WAL segments. */
 extern int ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 							   const void *data, uint32_t len);

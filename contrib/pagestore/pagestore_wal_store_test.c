@@ -49,6 +49,7 @@ int
 main(void)
 {
 	char directory[] = "/tmp/pswalstoreXXXXXX";
+	char empty_directory[512];
 	char path[1024];
 	char retry_directory[512];
 	char create_retry_directory[512];
@@ -68,6 +69,24 @@ main(void)
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
 	for (uint32_t i = 0; i < first_len + TEST_SEGMENT_BYTES; i++)
 		input[i] = (unsigned char) (i * 31u + 7u);
+	snprintf(empty_directory, sizeof(empty_directory), "%s/empty", directory);
+	check(ps_wal_store_create(&store, empty_directory, 6,
+							 2 * TEST_SEGMENT_BYTES, TEST_SEGMENT_BYTES) == 0,
+		  "create a WAL store without publishing its first segment");
+	ps_wal_store_close(&store);
+	check(ps_wal_store_open(&store, empty_directory, 6,
+						   2 * TEST_SEGMENT_BYTES, 3 * TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
+		  "reopen rejects an empty directory when durable progress expects WAL");
+	check(ps_wal_store_open(&store, empty_directory, 6,
+						   2 * TEST_SEGMENT_BYTES, 2 * TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) == 0 &&
+		  store.nentries == 0 &&
+		  store.start_lsn == 2 * TEST_SEGMENT_BYTES &&
+		  store.end_lsn == store.start_lsn && store.next_segment_no == 2,
+		  "reopen an empty WAL store from its durable caller-owned identity");
+	ps_wal_store_close(&store);
+	rmdir(empty_directory);
 	check(ps_wal_store_create(&store, directory, 7, 0, TEST_SEGMENT_BYTES) == 0,
 		  "create an empty timeline WAL segment store");
 	check((fcntl(store.directory_fd, F_GETFD) & FD_CLOEXEC) != 0,
@@ -250,7 +269,9 @@ main(void)
 	check(fd >= 0, "create a canonical orphan temporary segment");
 	if (fd >= 0)
 		close(fd);
-	check(ps_wal_store_open(&store, directory, 7) == 0 &&
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) == 0 &&
 		  access(path, F_OK) != 0 && store.nentries == 3 &&
 		  store.start_lsn == 0 &&
 		  store.end_lsn == first_len + TEST_SEGMENT_BYTES,
@@ -268,7 +289,9 @@ main(void)
 	check(fd >= 0, "create a noncanonical reserved-name file");
 	if (fd >= 0)
 		close(fd);
-	check(ps_wal_store_open(&store, directory, 7) != 0 &&
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0 &&
 		  access(path, F_OK) == 0,
 		  "reopen rejects and preserves a noncanonical reserved-name file");
 	unlink(path);
@@ -284,7 +307,9 @@ main(void)
 		  "inject payload corruption into a published segment");
 	if (fd >= 0)
 		close(fd);
-	check(ps_wal_store_open(&store, directory, 7) != 0,
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 		  "reopen rejects a payload checksum mismatch");
 	fd = open(path, O_RDWR);
 	check(fd >= 0 && pwrite(fd, &saved_byte, 1,
@@ -302,7 +327,9 @@ main(void)
 		  "inject header corruption into a published segment");
 	if (fd >= 0)
 		close(fd);
-	check(ps_wal_store_open(&store, directory, 7) != 0,
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 		  "reopen rejects a header checksum mismatch");
 	fd = open(path, O_RDWR);
 	check(fd >= 0 && pwrite(fd, saved_header, sizeof(saved_header), 0) ==
@@ -317,7 +344,9 @@ main(void)
 		snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
 		snprintf(missing, sizeof(missing), "%s/held_segment", directory);
 		check(rename(path, missing) == 0, "inject a segment-number gap");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a missing interior segment");
 		check(rename(missing, path) == 0, "restore the missing segment");
 	}
@@ -328,11 +357,15 @@ main(void)
 		snprintf(held, sizeof(held), "%s/held_special", directory);
 		check(rename(path, held) == 0 && symlink("held_special", path) == 0,
 			  "replace a canonical segment with a symlink");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a symlink at a canonical segment path");
 		check(unlink(path) == 0 && mkfifo(path, 0600) == 0,
 			  "replace a canonical segment with a FIFO");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a FIFO without blocking");
 		check(unlink(path) == 0 && rename(held, path) == 0,
 			  "restore the regular segment after special-file tests");
@@ -345,7 +378,9 @@ main(void)
 				 "%s/walv1_07_%020llu", directory, 2ULL);
 		check(rename(path, noncanonical) == 0,
 			  "inject a noncanonical spelling of the requested timeline");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a numerically equivalent timeline spelling");
 		check(rename(noncanonical, path) == 0,
 			  "restore the canonical timeline spelling");
@@ -353,7 +388,9 @@ main(void)
 				 "%s/walv1_+7_%020llu", directory, 2ULL);
 		check(rename(path, noncanonical) == 0,
 			  "inject a signed spelling of the requested timeline");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a signed equivalent timeline spelling");
 		check(rename(noncanonical, path) == 0,
 			  "restore the canonical timeline after signed spelling test");
@@ -361,7 +398,9 @@ main(void)
 				 "%s/walv1_-7_%020llu", directory, 2ULL);
 		check(rename(path, noncanonical) == 0,
 			  "inject a negative spelling of the requested timeline");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a negative equivalent timeline spelling");
 		check(rename(noncanonical, path) == 0,
 			  "restore the canonical timeline after negative spelling test");
@@ -373,7 +412,9 @@ main(void)
 		snprintf(malformed, sizeof(malformed), "%s/walv1_7", directory);
 		check(rename(path, malformed) == 0,
 			  "inject a current-timeline name without a suffix separator");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a current-timeline name without a suffix separator");
 		check(rename(malformed, path) == 0,
 			  "restore the final segment after missing-separator test");
@@ -381,7 +422,9 @@ main(void)
 				 directory, 2ULL);
 		check(rename(path, malformed) == 0,
 			  "inject a malformed requested-timeline token");
-		check(ps_wal_store_open(&store, directory, 7) != 0,
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 			  "reopen rejects a malformed requested-timeline token");
 		check(rename(malformed, path) == 0,
 			  "restore the final segment after malformed timeline test");
@@ -391,7 +434,9 @@ main(void)
 			snprintf(malformed, sizeof(malformed), "%s/%s", directory, alias);
 			check(rename(path, malformed) == 0,
 				  "inject an incomplete equivalent timeline alias");
-			check(ps_wal_store_open(&store, directory, 7) != 0,
+			check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 				  "reopen rejects an incomplete equivalent timeline alias");
 			check(rename(malformed, path) == 0,
 				  "restore the final segment after incomplete alias test");
@@ -405,7 +450,9 @@ main(void)
 		  fsync(fd) == 0, "inject a truncated final segment");
 	if (fd >= 0)
 		close(fd);
-	check(ps_wal_store_open(&store, directory, 7) != 0,
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
 		  "reopen rejects a truncated final segment");
 
 	for (uint64_t segment = 0; segment < 3; segment++)
