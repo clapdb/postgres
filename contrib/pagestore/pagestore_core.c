@@ -2151,22 +2151,18 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 			 v->admission_seq > seq_cap) ||
 			(v->kind != FEV_SET && v->kind != FEV_DEAD))
 			continue;
-		/* LSN orders WAL-backed history.  A WAL-less page deliberately keeps
-		 * version zero, so only its durable admission sequence can place it
-		 * relative to fork metadata. */
-		if (v->lsn == 0 || page->lsn == 0)
-		{
-			if (v->admission_seq <= page->admission_seq)
-				continue;
-		}
-		else
+		/* Fully legacy records have no sequence, so their LSN is the only
+		 * durable order.  If either side is sequenced, that order deliberately
+		 * places a WAL-less page relative to its lifecycle record. */
+		if (v->admission_seq == 0 && page->admission_seq == 0)
 		{
 			if (v->lsn < page->lsn)
 				break;
-			if (v->lsn == page->lsn &&
-				v->admission_seq <= page->admission_seq)
+			if (v->lsn == page->lsn)
 				continue;
 		}
+		else if (v->admission_seq <= page->admission_seq)
+			continue;
 		if (v->kind == FEV_DEAD || block >= v->nblocks)
 			return 1;
 	}
@@ -2196,20 +2192,35 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
 			block >= e->ev[lo - 1].cached_fence_nblocks;
 	}
-	for (int i = (int) e->nev - 1; i >= 0; i--)
 	{
-		const ForkEvent *v = &e->ev[i];
+		uint32_t first = 0;
+		uint32_t end = e->nev;
+		uint32_t fence;
 
-		if (v->lsn > cap ||
-			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
-			 v->admission_seq > seq_cap))
-			continue;
-		if (v->kind == FEV_DEAD)
-			return 1;
-		if (v->kind == FEV_SET && block >= v->nblocks)
-			return 1;
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		fence = first == 0 ? UINT32_MAX :
+			e->ev[first - 1].cached_fence_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->kind == FEV_SET && v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
 	}
-	return 0;
 }
 
 /* Markerless SEG0 spans an intermediate format transition: some stores already
