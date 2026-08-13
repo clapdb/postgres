@@ -5718,6 +5718,14 @@ ps_handle_meta(PsChannel *ch)
 					break;
 
 				lsn = fork_op_lsn(e, ch->req_lsn);
+				/* XLogReadBufferExtended() asks smgr to ensure the relation fork
+				 * exists before applying every redo record.  That call has the
+				 * record's LSN but is not a relation-creation record: if the fork
+				 * already exists at this replay position, recording FEV_SET would
+				 * manufacture a zero-block generation and hide older pages. */
+				if (ch->is_redo && ch->key.klass == PS_KLASS_RELATION &&
+					fork_exists_through(tl, &ch->key, lsn, 0))
+					break;
 				seq = admission_seq_alloc();
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
