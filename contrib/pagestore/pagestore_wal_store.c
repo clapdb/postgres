@@ -279,8 +279,10 @@ publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 cleanup:
 	if (fd >= 0)
 		close(fd);
-	if (rc != 0)
-		unlinkat(store->directory_fd, temporary, 0);
+	/* The final name is immutable once linked.  Whether publication succeeded
+	 * directly or was reconciled after EEXIST, our private staging name must
+	 * never remain as an orphaned full segment. */
+	(void) unlinkat(store->directory_fd, temporary, 0);
 	return rc;
 }
 
@@ -464,7 +466,7 @@ read_validated_segment_range(PsWalStore *store,
 	int rc = -1;
 
 	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
-		(fd = openat(store->directory_fd, name, O_RDONLY)) < 0 ||
+		(fd = openat(store->directory_fd, name, O_RDONLY | O_CLOEXEC)) < 0 ||
 		fstat(fd, &st) != 0)
 		goto cleanup;
 	if (st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
