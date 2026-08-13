@@ -2259,7 +2259,9 @@ fork_has_create_at(const ForkEnt *e, uint64_t lsn)
  * newest-first scan).  GROW events that do not raise the size visible at
  * their own LSN are dropped: steady-state rewrites of existing blocks at ever
  * newer pd_lsns add nothing, so the history stays O(distinct sizes).
- */
+*/
+static _Thread_local int fork_event_cache_defer = 0;
+
 static void
 fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind)
@@ -2293,6 +2295,8 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].kind = kind;
 	e->nev++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
+	if (fork_event_cache_defer)
+		return;
 	fork_event_cache_from(e, i);
 
 	/*
@@ -2453,6 +2457,19 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 							   uint64_t lsn, uint64_t admission_seq)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
+	typedef struct DeferredGrow
+	{
+		uint64_t	lsn;
+		uint64_t	admission_seq;
+		uint32_t	nblocks;
+	} DeferredGrow;
+	DeferredGrow *grows = NULL;
+	uint32_t	ngrows = 0;
+	uint32_t	cap = 0;
+
+	/* The per-fork page chain is block-descending.  Collect its later page
+	 * versions first so a delayed lifecycle event does not rebuild the suffix
+	 * once per block while holding the shard lock. */
 
 	for (PageEnt *page = e->pages; page; page = page->fork_next)
 	{
@@ -2464,10 +2481,55 @@ fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 				(version->lsn > lsn ||
 				 (version->lsn == lsn &&
 				  version->admission_seq > admission_seq)))
-				fork_event_add(e, version->lsn, version->admission_seq,
-							   page->block + 1, FEV_GROW);
+			{
+				uint32_t	j;
+
+				for (j = 0; j < ngrows; j++)
+					if (grows[j].lsn == version->lsn &&
+						grows[j].admission_seq == version->admission_seq)
+						break;
+				if (j == ngrows)
+				{
+					if (ngrows == cap)
+					{
+						cap = cap ? cap * 2 : 16;
+						grows = realloc(grows, (size_t) cap * sizeof(*grows));
+						if (grows == NULL)
+							return;
+					}
+					grows[ngrows++] = (DeferredGrow)
+						{version->lsn, version->admission_seq, page->block + 1};
+				}
+				else if (page->block + 1 > grows[j].nblocks)
+					grows[j].nblocks = page->block + 1;
+			}
 		}
 	}
+	/* There are normally only one or two delayed lifecycle records per fork.
+	 * Reusing the normal insertion path preserves all equal-LSN semantics; sort
+	 * restores in chronological order so each insertion appends and does not
+	 * repeatedly rebuild an increasingly long cached suffix. */
+	for (uint32_t i = 0; i < ngrows; i++)
+		for (uint32_t j = i + 1; j < ngrows; j++)
+			if (grows[j].lsn < grows[i].lsn ||
+				(grows[j].lsn == grows[i].lsn &&
+				 grows[j].admission_seq < grows[i].admission_seq))
+			{
+				DeferredGrow tmp = grows[i];
+				grows[i] = grows[j];
+				grows[j] = tmp;
+			}
+	fork_event_cache_defer++;
+	for (uint32_t i = 0; i < ngrows; i++)
+		fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
+					   grows[i].nblocks, FEV_GROW);
+	fork_event_cache_defer--;
+	if (ngrows != 0)
+	{
+		fork_event_cache_from(e, 0);
+		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	}
+	free(grows);
 }
 
 /*

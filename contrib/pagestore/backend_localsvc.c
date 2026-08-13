@@ -544,6 +544,29 @@ ls_op_lsn(void)
 	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
 }
 
+/* A materializer is writable, not a pinned reader, but during recovery it
+ * must not resolve relation metadata or page bytes beyond the WAL record it
+ * is currently replaying.  Doing so exposes a future CREATE/TRUNCATE and can
+ * make redo attempt an extension against the wrong fork generation. */
+static uint64
+ls_read_lsn(void)
+{
+	if (localsvc_read_lsn != 0)
+		return localsvc_read_lsn;
+	if (RecoveryInProgress())
+	{
+		XLogRecPtr replay = GetCurrentReplayRecPtr(NULL);
+
+		/* Between records the current pointer is invalid, but read-only
+		 * backends can still touch catalogs.  Bound those reads at the last
+		 * completed replay position rather than accidentally using newest. */
+		if (replay == InvalidXLogRecPtr)
+			replay = GetXLogReplayRecPtr(NULL);
+		return (uint64) replay;
+	}
+	return 0;
+}
+
 /*
  * Make the fork exist in the store (with zero blocks).  isRedo is set during
  * WAL replay, where re-creating an existing fork must be tolerated.
@@ -573,7 +596,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return ch->result != 0;
@@ -621,7 +644,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
@@ -671,7 +694,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
-		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+		ch->req_lsn = ls_read_lsn();
 		ch->req_seq = read_seq;
 		ls_exec(ch);
 
@@ -813,7 +836,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 
