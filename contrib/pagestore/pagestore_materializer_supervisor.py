@@ -361,6 +361,7 @@ def previous_status(path: Path, *, required_if_present: bool = False) -> dict[st
 class Supervisor:
     def __init__(self, config: Config) -> None:
         self.config = config
+        status_exists = config.status_file.exists()
         old = previous_status(config.status_file, required_if_present=True)
         old_epoch = old.get("owner_epoch", 0)
         old_generation = old.get("worker_generation", 0)
@@ -401,7 +402,7 @@ class Supervisor:
                     "materializer retention generation authority lacks controller identity"
                 )
             old_retention_generation = authority_generation
-        elif old:
+        elif status_exists:
             # Status did not durably identify the controller/consumer that
             # owns its generation, so migration cannot safely quiesce it.
             raise OwnershipError(
@@ -497,6 +498,12 @@ class Supervisor:
         return self.pg_ctl("status", check=False).returncode == 0
 
     def worker_healthy(self) -> bool:
+        if (
+            self.previous_consumer_data_dir != str(self.config.data_dir)
+            or self.previous_consumer_instance_id
+            != self.config.controller_instance_id
+        ):
+            return False
         try:
             expected_data_dir = str(self.config.data_dir).replace("'", "''")
             return (
