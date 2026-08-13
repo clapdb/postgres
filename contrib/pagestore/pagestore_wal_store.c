@@ -640,7 +640,11 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline,
 	}
 	store->next_segment_no = numbers[0] + count;
 	store->end_lsn = expected_lsn;
-	if (store->end_lsn != end_lsn)
+	/* A linked and directory-synced segment is durable even if the caller
+	 * crashed before checkpointing its new bound.  Recover that valid suffix and
+	 * expose the authoritative end_lsn for the caller to checkpoint; only a
+	 * missing durable prefix is irreconcilable. */
+	if (store->end_lsn < end_lsn)
 		goto cleanup;
 	rc = 0;
 

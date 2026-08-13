@@ -259,7 +259,13 @@ main(void)
 			  "cached read rejects a symlink at the canonical segment path");
 		check(unlink(path) == 0 && rename(held, path) == 0,
 			  "restore the canonical cached segment path");
-	}
+		}
+		ps_wal_store_close(&store);
+	check(ps_wal_store_open(&store, directory, 7, 0, first_len,
+						   TEST_SEGMENT_BYTES) == 0 &&
+		  store.nentries == 3 &&
+		  store.end_lsn == first_len + TEST_SEGMENT_BYTES,
+		  "reopen recovers a valid segment published beyond the caller checkpoint");
 	ps_wal_store_close(&store);
 
 	/* Only a canonical mkstemp orphan belongs to recovery cleanup. */

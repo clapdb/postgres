@@ -31,7 +31,8 @@ typedef struct PsWalStore
 extern int ps_wal_store_create(PsWalStore *store, const char *directory,
 							   uint32_t timeline, uint64_t start_lsn,
 							   uint32_t segment_size);
-/* Reopen against caller-durable bounds, including a valid empty range. */
+/* Reopen against the caller checkpoint.  A fully validated published suffix
+ * advances store->end_lsn so the caller can checkpoint the recovered bound. */
 extern int ps_wal_store_open(PsWalStore *store, const char *directory,
 							 uint32_t timeline, uint64_t start_lsn,
 							 uint64_t end_lsn, uint32_t segment_size);
