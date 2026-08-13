@@ -366,6 +366,7 @@ typedef struct PagestoreReaderSnapshotJobShmem
 	uint64		generation;
 	uint64		completed_generation;
 	uint64		failed_generation;
+	uint64		reserved_generation;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7778,7 +7779,8 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 		return;
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	if (pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation)
+		pagestore_reader_snapshot_job->completed_generation &&
+		pagestore_reader_snapshot_job->reserved_generation == 0)
 	{
 		pagestore_reader_snapshot_job->control = *control;
 		pagestore_reader_snapshot_job->generation++;
@@ -8334,6 +8336,8 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 				(errmsg("pagestore advancing reader lost retention owner authority")));
 	protected_lsn = (XLogRecPtr) protected_pin.lsn;
 	must_adopt = protected_lsn > (XLogRecPtr) pagestore_localsvc_read_lsn();
+	if (must_adopt)
+		read_seq = protected_pin.admission_seq;
 
 	pagestore_refresh_reader_horizon();
 	SpinLockAcquire(&pagestore_reader_horizon->mutex);
@@ -8369,8 +8373,9 @@ pagestore_adopt_reader_view_at_xact_start_impl(void)
 			PAGESTORE_READER_HORIZON_TIMEOUT_MS) &&
 			pagestore_reader_database_barrier_valid(published) &&
 			control.checkPointCopy.redo == published &&
-			pagestore_localsvc_read_fence_timeout((uint64) published,
-				&read_seq, PAGESTORE_READER_HORIZON_TIMEOUT_MS);
+			(must_adopt || pagestore_localsvc_read_fence_timeout(
+				(uint64) published, &read_seq,
+				PAGESTORE_READER_HORIZON_TIMEOUT_MS));
 adoption_done:
 		;
 	}
@@ -10249,6 +10254,7 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_snapshot_job->generation = 0;
 		pagestore_reader_snapshot_job->completed_generation = 0;
 		pagestore_reader_snapshot_job->failed_generation = 0;
+		pagestore_reader_snapshot_job->reserved_generation = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -11935,6 +11941,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		List	   *databases = NIL;
 		XLogRecPtr	barrier_lsn = InvalidXLogRecPtr;
 		bool		barrier_complete = false;
+		uint64		barrier_generation = 0;
 
 		if (ConfigReloadPending)
 		{
@@ -11944,8 +11951,6 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		PG_TRY();
 		{
 			uint64		membership_generation;
-			uint64		barrier_generation = 0;
-
 			databases = pagestore_reader_artifact_databases();
 			/*
 			 * CHECKPOINT_WAIT may attach to a checkpoint that began before the
@@ -11984,6 +11989,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				{
 					barrier_lsn = job_control.checkPointCopy.redo;
 					barrier_generation = generation;
+					pagestore_reader_snapshot_job->reserved_generation = generation;
 					break;
 				}
 				if (generation == completed)
@@ -12081,6 +12087,14 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			FreeErrorData(edata);
 		}
 		PG_END_TRY();
+		if (barrier_generation != 0)
+		{
+			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+			if (pagestore_reader_snapshot_job->reserved_generation ==
+				barrier_generation)
+				pagestore_reader_snapshot_job->reserved_generation = 0;
+			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+		}
 		list_free_deep(databases);
 
 		(void) WaitLatch(MyLatch,
