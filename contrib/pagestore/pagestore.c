@@ -8294,7 +8294,7 @@ pagestore_reader_advance_xact_end(XactEvent event, void *arg)
 }
 
 static void
-pagestore_adopt_reader_view_at_xact_start(void)
+pagestore_adopt_reader_view_at_xact_start_impl(void)
 {
 	PagestoreReaderSnapshot *snapshot = NULL;
 	PagestoreReaderSnapshot *old_snapshot;
@@ -8313,8 +8313,6 @@ pagestore_adopt_reader_view_at_xact_start(void)
 	bool		must_adopt;
 	PsRetentionPin protected_pin;
 
-	if (prev_xact_start_hook != NULL)
-		prev_xact_start_hook();
 	if (!pagestore_advance_read_lsn || pagestore_reader_horizon == NULL ||
 		pagestore_localsvc_read_lsn() == 0 || IsParallelWorker())
 		return;
@@ -8510,6 +8508,19 @@ adoption_done:
 			pfree(old_snapshot->xids);
 		pfree(old_snapshot);
 	}
+}
+
+static void
+pagestore_adopt_reader_view_at_xact_start(void)
+{
+	/*
+	 * Install the pagestore transaction gate before handing control to another
+	 * extension.  Otherwise that hook can observe or pin the old reader view
+	 * while this transaction is already considered started.
+	 */
+	pagestore_adopt_reader_view_at_xact_start_impl();
+	if (prev_xact_start_hook != NULL)
+		prev_xact_start_hook();
 }
 
 static bool
@@ -11846,7 +11857,7 @@ pagestore_reader_artifact_databases(void)
 		elog(ERROR, "SPI_connect failed");
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_execute("SELECT oid, dattablespace FROM pg_database "
-					"WHERE datallowconn ORDER BY oid",
+					"WHERE datallowconn AND datconnlimit <> -2 ORDER BY oid",
 					true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not enumerate databases");
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
@@ -11928,6 +11939,15 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			uint64		barrier_generation = 0;
 
 			databases = pagestore_reader_artifact_databases();
+			/*
+			 * CHECKPOINT_WAIT may attach to a checkpoint that began before the
+			 * pg_database membership lock was acquired.  Drain that checkpoint
+			 * first.  The generation sampled below is therefore a lower bound,
+			 * and the following forced checkpoint must begin while the membership
+			 * lock is held.
+			 */
+			RequestCheckpoint(CHECKPOINT_FORCE | CHECKPOINT_FAST |
+							  CHECKPOINT_WAIT);
 			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 			membership_generation = pagestore_reader_snapshot_job->generation;
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
