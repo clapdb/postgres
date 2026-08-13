@@ -1746,6 +1746,7 @@ page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
 		return 0;
 	/* Sequence zero is the established uncapped/latest-visible fence. */
 	if (admission_seq != 0 &&
+		lsn == frontier.lsn &&
 		admission_seq < frontier.admission_seq)
 		return 0;
 	return 1;
@@ -1982,9 +1983,6 @@ static int
 fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 			  uint32_t *nb_out)
 {
-	uint32_t	grow = 0;
-	int			have_grow = 0;
-
 	*nb_out = 0;
 	if (seq_cap == 0)
 	{
@@ -2005,42 +2003,52 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 		*nb_out = e->ev[lo - 1].cached_nblocks;
 		return e->ev[lo - 1].cached_state;
 	}
-	for (int i = (int) e->nev - 1; i >= 0; i--)
 	{
-		const ForkEvent *v = &e->ev[i];
+		uint32_t	first = 0;
+		uint32_t	end = e->nev;
+		uint8_t		state;
+		uint32_t	nb;
 
-		if (v->lsn > cap)
-			continue;
-		if (seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
-			v->admission_seq > seq_cap)
-			continue;
-		if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT ||
-			v->kind == FEV_SEG_GROW_BOUND || v->kind == FEV_SEG_COMMIT_BOUND)
-			continue;			/* marker alone never changes fork size */
-		if (v->kind == FEV_GROW)
+		/* Everything below cap is visible regardless of admission sequence.
+		 * Reuse its cached fold, then inspect only the equal-cap run. */
+		while (first < end)
 		{
-			if (v->nblocks > grow)
-				grow = v->nblocks;
-			have_grow = 1;
-			continue;
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
 		}
-		if (v->kind == FEV_DEAD)
+		state = first == 0 ? FORK_HOP_NONE : e->ev[first - 1].cached_state;
+		nb = first == 0 ? 0 : e->ev[first - 1].cached_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
 		{
-			if (!have_grow)
-				return FORK_HOP_DEAD;
-			*nb_out = grow;
-			return FORK_HOP_DEF;
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_GROW)
+			{
+				if (v->nblocks > nb)
+					nb = v->nblocks;
+				state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+					FORK_HOP_GROW : FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_SET)
+			{
+				nb = v->nblocks;
+				state = FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_DEAD)
+			{
+				nb = 0;
+				state = FORK_HOP_DEAD;
+			}
 		}
-		/* FEV_SET */
-		*nb_out = v->nblocks > grow ? v->nblocks : grow;
-		return FORK_HOP_DEF;
+		*nb_out = nb;
+		return state;
 	}
-	if (have_grow)
-	{
-		*nb_out = grow;
-		return FORK_HOP_GROW;
-	}
-	return FORK_HOP_NONE;
 }
 
 static void
