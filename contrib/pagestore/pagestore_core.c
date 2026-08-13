@@ -2237,6 +2237,22 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	return 0;
 }
 
+/* A retry can follow page growth at the CREATE's LSN.  The last lifecycle
+ * boundary, not the last event, determines whether that CREATE already made
+ * an empty generation. */
+static int
+fork_has_create_at(const ForkEnt *e, uint64_t lsn)
+{
+	const ForkEvent *last_def = NULL;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == lsn &&
+			(e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD))
+			last_def = &e->ev[i];
+	return last_def != NULL && last_def->kind == FEV_SET &&
+		last_def->nblocks == 0;
+}
+
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
@@ -2396,7 +2412,7 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 */
 	if (lsn < e->last_def_lsn || lsn == 0)
 		lsn = e->last_def_lsn;
-	if (!fork_has_growth_at(e, lsn, to_nblocks) &&
+	if (fork_size_asof_hop(e, lsn, admission_seq) < to_nblocks &&
 		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
 						  FEV_GROW) != 0)
 		return -1;			/* not durable: do not apply in memory */
@@ -5576,8 +5592,6 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn;
 				uint64_t	seq;
 				int			delayed;
-				uint32_t	nb;
-				int			r;
 
 				/* Object writers issue CREATE as a preparatory operation before
 				 * every write.  Unlike a relation WAL CREATE, an unstamped retry
@@ -5589,17 +5603,13 @@ ps_handle_meta(PsChannel *ch)
 				lsn = fork_op_lsn(e, ch->req_lsn);
 				seq = admission_seq_alloc();
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
-				r = fork_asof_hop(e, lsn, 0, &nb);
 
 				if (seq == 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				/* A delayed CREATE can be observed as live because newer state is
-				 * already present.  Its SET is still the durable boundary of an
-				 * empty recreated generation. */
-				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD || delayed)
+				if (!fork_has_create_at(e, lsn))
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
