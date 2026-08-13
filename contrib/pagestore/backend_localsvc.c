@@ -454,8 +454,9 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * admission fence.  Block 2 is versioned by redo itself, so requiring an exact
  * hit prevents an older checkpoint's fence from being used for a newer R. */
 bool
-pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
-									 int timeout_ms)
+pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+											  uint64 read_lsn, uint64 *read_seq,
+											  int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsAdmissionFence fence;
@@ -466,6 +467,7 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
+	ch->timeline = timeline;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 2;
 	ch->req_lsn = read_lsn;
@@ -479,6 +481,14 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 		return false;
 	*read_seq = fence.admission_seq;
 	return true;
+}
+
+bool
+pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
+									 int timeout_ms)
+{
+	return pagestore_localsvc_read_fence_for_timeline_timeout(
+		pagestore_localsvc_timeline(), read_lsn, read_seq, timeout_ms);
 }
 
 static uint64
@@ -578,7 +588,8 @@ ls_read_lsn(void)
  * WAL replay, where re-creating an existing fork must be tolerated.
  */
 static void
-ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
+ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
+		  bool isRedoEnsure)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
@@ -588,7 +599,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
-	ch->is_redo = isRedo ? 1 : 0;
+	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
 	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }

@@ -2815,10 +2815,10 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
  * into this store.  A later CREATE/TRUNCATE is a logical visibility boundary,
  * not permission to reject an earlier FPI as beyond EOF. */
 static uint32_t
-fork_nblocks_recovery(uint32_t timeline, const PsKey *key)
+fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 {
 	uint32_t maxnb = 0;
-	TlWalk w = tl_walk_first(timeline, UINT64_MAX);
+	TlWalk w = tl_walk_first(timeline, read_lsn);
 
 	do
 	{
@@ -2826,7 +2826,7 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key)
 
 		if (e != NULL)
 			for (uint32_t i = 0; i < e->nev; i++)
-				if (e->ev[i].kind != FEV_DEAD &&
+				if (e->ev[i].lsn <= w.lsn && e->ev[i].kind != FEV_DEAD &&
 					e->ev[i].nblocks > maxnb)
 					maxnb = e->ev[i].nblocks;
 	} while (tl_walk_next(&w));
@@ -5723,7 +5723,7 @@ ps_handle_meta(PsChannel *ch)
 				 * record's LSN but is not a relation-creation record: if the fork
 				 * already exists at this replay position, recording FEV_SET would
 				 * manufacture a zero-block generation and hide older pages. */
-				if (ch->is_redo && ch->key.klass == PS_KLASS_RELATION &&
+				if (ch->is_redo == 2 && ch->key.klass == PS_KLASS_RELATION &&
 					fork_exists_through(tl, &ch->key, lsn, 0))
 					break;
 				seq = admission_seq_alloc();
@@ -5800,7 +5800,8 @@ ps_handle_meta(PsChannel *ch)
 				break;
 			}
 			ch->result = ch->is_redo ?
-				fork_nblocks_recovery(tl, &ch->key) :
+				fork_nblocks_recovery(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX) :
 				fork_nblocks_through(tl, &ch->key,
 										  ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										  ch->req_seq);
@@ -6049,9 +6050,7 @@ ps_handle_meta(PsChannel *ch)
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
-							   (old_pin.lsn < pin.lsn ||
-								(old_pin.lsn == pin.lsn &&
-								 old_pin.admission_seq <= pin.admission_seq)))) ||
+							   old_pin.lsn < pin.lsn)) ||
 							!timeline_defined) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
