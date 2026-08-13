@@ -1287,6 +1287,10 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
 	}
+	/* The replacement is published before any source is retired.  Keep this
+	 * distinct crash boundary so recovery covers both live sources and the
+	 * replacement together. */
+	test_crash_compaction_at("after_publish");
 	/* The durable replacement no longer contains these versions.  Drop their
 	 * in-memory index entries at the same publication point; otherwise a live
 	 * read can select a pruned PageVer and then fail because no layer can serve
@@ -1327,7 +1331,6 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		/* The replacement is visible and this source is now durably retired. */
-		test_crash_compaction_at("after_publish");
 		test_crash_compaction_at("after_mark_delete");
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
@@ -1790,7 +1793,8 @@ page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
 	/* Sequence zero is the established uncapped/latest-visible fence. */
 	if (admission_seq != 0 &&
 		lsn == frontier.lsn &&
-		admission_seq < frontier.admission_seq)
+		admission_seq < frontier.admission_seq &&
+		!ps_retention_page_fence_active(timeline, lsn, admission_seq))
 		return 0;
 	return 1;
 }
@@ -4784,9 +4788,18 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	 * Current reads remain valid: their UINT64_MAX horizon is always newer
 	 * than the frontier.
 	 */
-	if (read_lsn != UINT64_MAX &&
-		!page_frontier_allows(timeline, read_lsn, read_seq))
-		return 0;
+	if (read_lsn != UINT64_MAX)
+	{
+		int		frontier_allows;
+
+		/* page_reclaimed_frontier is published by compaction while holding the
+		 * map write lock.  Sample the two-word fence under the same lock. */
+		ps_lock_map_rd();
+		frontier_allows = page_frontier_allows(timeline, read_lsn, read_seq);
+		ps_unlock_map();
+		if (!frontier_allows)
+			return 0;
+	}
 
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */
