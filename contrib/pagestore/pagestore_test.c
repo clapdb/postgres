@@ -1966,6 +1966,15 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
 								  5000, fence_seq) == PS_STATUS_OK,
 		  "reader refines its provisional pin to the exact admission fence");
+	/* The sequence fence disambiguates mutations only at the boundary LSN.
+	 * An older-LSN page admitted later remains part of that as-of view, first
+	 * in the memtable and later in its image layer. */
+	op_create_at(rel + 3, 0, 4000);
+	fill_page(page, ps, 4000, 79);
+	op_write_one(rel + 3, 0, 0, page);
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN memtable page");
 	for (uint32_t block = 1; block < 16; block++)
 	{
 		fill_page(page, ps, 6000 + block, (unsigned char) block);
@@ -1989,6 +1998,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission fence excludes a later same-LSN layer rewrite");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN layer page");
 
 	/* Fork metadata uses the same fence: a same-LSN truncate admitted later
 	 * must not shrink the pinned view. */
@@ -2096,6 +2108,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission-fenced same-LSN page survives compaction, GC, and restart");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "older-LSN page remains visible through admission-fenced recovery");
 	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
 		  "admission-fenced fork metadata survives restart");
 	op_read_one(rel, 0, 41, readback);

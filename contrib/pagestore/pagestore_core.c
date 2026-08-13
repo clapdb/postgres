@@ -1461,6 +1461,7 @@ typedef struct SegRecHdrBoundAdmission
 typedef struct PageEnt
 {
 	struct PageEnt *next;		/* bucket chain */
+	struct PageEnt *fork_next;	/* pages belonging to the same fork */
 	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	block;
@@ -1511,6 +1512,10 @@ typedef struct ForkEnt
 	ForkEvent  *ev;				/* lsn-ordered size history */
 	uint32_t	nev;
 	uint32_t	evcap;
+	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
+	uint32_t	ndef;
+	uint32_t	defcap;
+	PageEnt    *pages;			/* local pages belonging to this fork */
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
 	uint64_t	last_page_lsn;	/* newest durable local page tuple */
 	uint64_t	last_page_seq;
@@ -1866,7 +1871,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
-	ForkEnt    *fork;
+	ForkEnt    *fork = fork_get_or_create(timeline, key);
 
 	timeline_mark_used(timeline);
 	if (!e)
@@ -1875,6 +1880,8 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->timeline = timeline;
 		e->key = *key;
 		e->block = block;
+		e->fork_next = fork->pages;
+		fork->pages = e;
 		e->next = s->page_idx[h & IDX_MASK];
 		s->page_idx[h & IDX_MASK] = e;
 	}
@@ -1889,7 +1896,6 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
 	e->nver++;
-	fork = fork_get_or_create(timeline, key);
 	if (lsn > fork->last_page_lsn ||
 		(lsn == fork->last_page_lsn && admission_seq > fork->last_page_seq))
 	{
@@ -2075,6 +2081,40 @@ fork_event_cache_from(ForkEnt *e, uint32_t start)
 	}
 }
 
+/* Keep a compact index over definitive lifecycle events.  Inserts can shift
+ * existing event offsets, but their cost is proportional to the number of
+ * truncates/unlinks rather than the usually much larger number of GROWs. */
+static void
+fork_def_index_insert(ForkEnt *e, uint32_t event_idx, int definitive)
+{
+	uint32_t	pos = 0;
+
+	while (pos < e->ndef && e->def_idx[pos] < event_idx)
+		pos++;
+	for (uint32_t i = pos; i < e->ndef; i++)
+		e->def_idx[i]++;
+	if (!definitive)
+		return;
+	if (e->ndef == e->defcap)
+	{
+		e->defcap = e->defcap ? e->defcap * 2 : 4;
+		e->def_idx = realloc(e->def_idx,
+			(size_t) e->defcap * sizeof(*e->def_idx));
+	}
+	memmove(&e->def_idx[pos + 1], &e->def_idx[pos],
+		(size_t) (e->ndef - pos) * sizeof(*e->def_idx));
+	e->def_idx[pos] = event_idx;
+	e->ndef++;
+}
+
+static void
+fork_def_index_remove_nondef(ForkEnt *e, uint32_t event_idx)
+{
+	for (uint32_t i = 0; i < e->ndef; i++)
+		if (e->def_idx[i] > event_idx)
+			e->def_idx[i]--;
+}
+
 /* Size of e as of cap, hop-local (for the GROW-dedup below). */
 static uint32_t
 fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
@@ -2094,9 +2134,9 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 {
 	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
 		return 0;
-	for (int i = (int) e->nev - 1; i >= 0; i--)
+	for (int i = (int) e->ndef - 1; i >= 0; i--)
 	{
-		const ForkEvent *v = &e->ev[i];
+		const ForkEvent *v = &e->ev[e->def_idx[i]];
 
 		if (v->lsn > cap ||
 			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
@@ -2216,6 +2256,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
 	fork_event_cache_from(e, i);
 
 	/*
@@ -2281,6 +2322,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_def_index_insert(e, i, 0);
 	fork_event_cache_from(e, i);
 }
 
@@ -2309,6 +2351,7 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			{
 				memmove(v, v + 1, (e->nev - i - 1) * sizeof(*v));
 				e->nev--;
+				fork_def_index_remove_nondef(e, i);
 				fork_event_cache_from(e, i);
 			}
 			return 1;
@@ -2373,26 +2416,22 @@ static void
 fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
 							   uint64_t lsn, uint64_t admission_seq)
 {
-	Shard	   *s = shard_for(key);
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 
-	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-		for (PageEnt *page = s->page_idx[bucket]; page; page = page->next)
+	for (PageEnt *page = e->pages; page; page = page->fork_next)
+	{
+		for (int i = 0; i < page->nver; i++)
 		{
-			if (page->timeline != timeline || !key_eq(&page->key, key))
-				continue;
-			for (int i = 0; i < page->nver; i++)
-			{
-				PageVer    *version = &page->vers[i];
+			PageVer    *version = &page->vers[i];
 
-				if (version->lsn != 0 &&
-					(version->lsn > lsn ||
-					 (version->lsn == lsn &&
-					  version->admission_seq > admission_seq)))
-					fork_event_add(e, version->lsn, version->admission_seq,
-								   page->block + 1, FEV_GROW);
-			}
+			if (version->lsn != 0 &&
+				(version->lsn > lsn ||
+				 (version->lsn == lsn &&
+				  version->admission_seq > admission_seq)))
+				fork_event_add(e, version->lsn, version->admission_seq,
+							   page->block + 1, FEV_GROW);
 		}
+	}
 }
 
 /*
