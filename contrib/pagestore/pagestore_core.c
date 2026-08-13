@@ -2827,7 +2827,8 @@ fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
 
 		if (e != NULL)
 			for (uint32_t i = 0; i < e->nev; i++)
-				if (e->ev[i].lsn <= w.lsn && e->ev[i].kind != FEV_DEAD &&
+				if (e->ev[i].lsn <= w.lsn &&
+					(e->ev[i].kind == FEV_GROW || e->ev[i].kind == FEV_SET) &&
 					e->ev[i].nblocks > maxnb)
 					maxnb = e->ev[i].nblocks;
 	} while (tl_walk_next(&w));
