@@ -5024,9 +5024,20 @@ ps_handle_meta(PsChannel *ch)
 					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
-				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timelines[tl].defined) ?
-					PS_RETENTION_ERROR : ps_retention_set(&pin);
+				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
+					!timelines[tl].defined)
+					ret = PS_RETENTION_ERROR;
+				else
+				{
+					/* A retried controller fence may be newer than this
+					 * process's recovered allocator.  Serialize its durable SET
+					 * with mutations and advance allocation before admitting more. */
+					pthread_rwlock_wrlock(&admission_lock);
+					ret = ps_retention_set(&pin);
+					if (ret == PS_RETENTION_OK)
+						admission_seq_observe(pin.admission_seq);
+					pthread_rwlock_unlock(&admission_lock);
+				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
