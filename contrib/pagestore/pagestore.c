@@ -768,9 +768,7 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 	int64		generation = PG_GETARG_INT64(3);
 	int32		resources = PG_GETARG_INT32(4);
 	XLogRecPtr	lsn = PG_GETARG_LSN(5);
-	uint64		admission_seq = PG_NARGS() > 6 ?
-		(uint64) PG_GETARG_INT64(6) :
-		pagestore_localsvc_admission_barrier_timeout(30000);
+	uint64		admission_seq;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -789,6 +787,9 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 		(uint64) generation > UINT32_MAX || resources < 0)
 		ereport(ERROR,
 				(errmsg("pagestore retention owner fields are invalid or out of range")));
+	admission_seq = PG_NARGS() > 6 ?
+		(uint64) PG_GETARG_INT64(6) :
+		pagestore_localsvc_admission_barrier_timeout(30000);
 	PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
 		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
 		(uint32) generation, (uint32) resources, (uint64) lsn,
