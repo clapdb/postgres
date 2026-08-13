@@ -98,7 +98,8 @@ Deliverables:
   daemon rejection, and reconnect/restart behavior;
 - durable, non-enumerable owner tombstones that retain the maximum accepted
   generation after DROP, including across log compaction and restart.
-- persisted per-resource reclamation frontiers.  SET admission and reclaimer
+- persisted per-resource reclamation cutoffs plus exact retained-base
+  exceptions.  SET admission and reclaimer
   cutoff selection share one synchronization protocol: a SET below any
   requested `(LSN, admission_sequence)` resource frontier is rejected, while
   an accepted SET is visible before a reclaimer can select a conflicting
@@ -107,9 +108,17 @@ Deliverables:
 - fork metadata shares the page-history reclamation frontier: its compactor
   advances that same full tuple atomically before retiring events, and every
   page-history SET is checked against the maximum of page-image and forkmeta
-  progress.  The frontier is the oldest retained, readable tuple, so tests
-  reject SET strictly below a forkmeta-only advance and accept SET exactly at
-  it.
+  progress.  A resource may retain a sparse fixed-reader base `F` while its
+  operational cutoff advances to `C > F`: admission accepts `F` and tuples at
+  or above `C`, but rejects reclaimed tuples in `(F, C)`.  The durable cutoff
+  and exact exception set are updated crash-atomically and consulted by page,
+  WAL, WAL-index, and forkmeta admission; tests cover restart and exception
+  removal after the owning reader drains.
+- the R0 wire/API and durable owner record carry a controller allocation-domain
+  token distinct from the per-owner generation, plus durable live-token
+  reservation.  R1 clients must reserve and transmit it from their first
+  deployment; older records are upgraded to explicit live exceptions before
+  any R5 allocation-domain frontier may advance.
 - recovery resumes the global admission-sequence allocator strictly above the
   maximum sequence in every durable pin, reclamation frontier, branch fence,
   page/forkmeta record, and other sequence-bearing state before admitting a
@@ -484,7 +493,7 @@ Expected scope: one or two PRs.
 
 ### R6. Prove bounded space
 
-Status: **blocked on R2-R5**.
+Status: **blocked on R2-R5 and R5b**.
 
 Add a deterministic soak scenario with bounded live data but repeated updates,
 WAL generation, compaction, reader advancement, branch creation/deletion, and
@@ -506,6 +515,20 @@ Acceptance:
 - retained SQL-visible state remains correct throughout the run.
 
 Expected scope: one PR.  Passing it closes the retention MVP gate.
+
+### R5b. Add reclaimer backpressure controllers
+
+Status: **blocked on R2-R5**.
+
+Before the soak test, add one lean lag controller for page, WAL, WAL-index, and
+forkmeta reclamation.  Each controller publishes a high-water threshold and
+catch-up target, throttles foreground admission when lag exceeds the threshold,
+and releases admission only after the target is reached.  Controller state and
+wait time are inspectable, shard-local work remains run-to-completion, and
+tests prove bounded queues under ingestion faster than maintenance.
+
+Expected scope: one or two PRs.  R6 consumes these controls; it does not
+introduce them.
 
 ## Crash and compatibility work
 
@@ -657,7 +680,9 @@ Recommended: keep default-tablespace local POSIX as the MVP boundary.  Treat
 user tablespaces, S3, SPDK layers, and service-manager packaging as follow-up
 work.
 
-Decision: **open**.
+Decision: **accepted for MVP**.  Default-tablespace local POSIX is the required
+deployment boundary.  User tablespaces, S3, SPDK layers, and service-manager
+packaging do not block MVP completion.
 
 ## Proposed PR sequence
 
@@ -672,7 +697,8 @@ The default sequence is:
 7. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
 8. R4b forkmeta compaction/reclamation and publication crash tests;
 9. R5 timeline deletion;
-10. H0 fault/inspection primitives (may start in parallel with R0-R1);
+10. R5b reclaimer backpressure controllers;
+11. H0 fault/inspection primitives (may start in parallel with R0-R1);
 11. H1 composed crash scenarios;
 12. H2 format fixtures and compatibility CI;
 13. R6 bounded-space acceptance and final MVP status update.
