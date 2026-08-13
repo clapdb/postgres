@@ -207,9 +207,10 @@ versions are protected independently by the WAL floor: compaction retains the
 newest usable control image and redo-floor note at or below every retained WAL
 boundary even when the page-history floor is newer.
 If SLRU capture yields a replay base `C` earlier than branch fence `L`, branch
-preparation validates and temporarily pins the WAL resource at `C` before
-seeding; that per-resource protection remains until the branch artifact and
-its structural retention are durable.
+preparation validates and temporarily pins both WAL and page history at `C`
+before seeding: WAL protects the replay stream, while page history protects the
+exact SLRU image that seeding must resolve at `C`.  Both protections remain
+until the branch artifact and its structural retention are durable.
 
 Deliverables:
 
@@ -373,7 +374,9 @@ Acceptance:
 - relation existence and size at every retained horizon match before and after
   compaction;
 - crashes before replacement publication, after publication, and during old
-  log removal reopen to either complete old or complete new state;
+  log removal reopen to the complete old state only before the replacement is
+  durably published and to the complete new state after publication; no fault
+  during source-log removal may roll acknowledged metadata back;
 - concurrent metadata mutations at every publication/crash boundary reopen
   with every acknowledged event exactly once;
 - H1 exercises each publication boundary before R6 begins its soak.
@@ -388,7 +391,10 @@ Deliverables:
 
 - an atomic durable transition from live to deleting that first fences all new
   owner registrations and page/WAL/timeline operations, then drains every
-  already-admitted operation before physical cleanup;
+  already-admitted operation and timeline-scoped maintenance task before
+  physical cleanup.  The drain includes compaction, tier upload/eviction,
+  remote GC, and cache/background publication, so none can recreate an
+  artifact after cleanup;
 - deletion admission checks for descendants, every non-dropped durable owner
   (whether its process is active or offline), and structural retention
   requirements performed as part of that fenced transition; only an
@@ -401,6 +407,10 @@ Deliverables:
   crash-safe filtered rewrite plus durable coverage transition; deletion never
   unlinks a mixed source segment and never permits ID reuse while an
   old-incarnation record remains recoverable from it;
+- the shared `forkmeta` log is reclaimed by an R4b-style crash-safe filtered
+  checkpoint/tail rewrite that removes only the deleted incarnation; deletion
+  never unlinks the shared stream or permits ID reuse until the filtered
+  replacement and its coverage transition are durable;
 - restart resumes deletion and never resurrects a deleted timeline;
 - timeline-ID reuse is permitted only after cleanup is durable and only with a
   higher incarnation generation carried by every request and durable record;
