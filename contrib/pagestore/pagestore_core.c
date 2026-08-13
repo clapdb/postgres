@@ -132,6 +132,27 @@ static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 								 uint64_t admission_seq);
 
+/* Test-only crash boundaries for publication recovery.  They are inert unless
+ * the daemon was explicitly started with the fault switch and the test has
+ * armed the store-local marker after startup. */
+static void
+test_crash_compaction_at(const char *phase)
+{
+	const char *enabled = getenv("PAGESTORE_TEST_FAULT");
+	const char *requested = getenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	char		marker[4096];
+	int			n;
+
+	if (enabled == NULL || strcmp(enabled, "1") != 0 || requested == NULL ||
+		strcmp(requested, phase) != 0 || page_frontier_dir[0] == '\0')
+		return;
+	n = snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed",
+				 page_frontier_dir);
+	if (n < 0 || (size_t) n >= sizeof(marker) || access(marker, F_OK) != 0)
+		return;
+	_exit(88);
+}
+
 static uint64_t
 admission_seq_alloc(void)
 {
@@ -1254,9 +1275,14 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	/* Reject later pins/branches below this cutoff before the pruned layer can
 	 * become durable and visible.  Advancing conservatively when publication
 	 * later fails is safe; admitting already-reclaimed history is not. */
-	if ((ndropped != 0 &&
-		 page_frontier_advance(timeline, page_floor, frontier_seq) != 0) ||
-		record_layer(NULL, &newdesc) != 0)
+	if (ndropped != 0 &&
+		page_frontier_advance(timeline, page_floor, frontier_seq) != 0)
+	{
+		(void) ps_layer_store->delete_local_layer(&newdesc);
+		goto cleanup;
+	}
+	test_crash_compaction_at("after_frontier");
+	if (record_layer(NULL, &newdesc) != 0)
 	{
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
@@ -1300,6 +1326,9 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		/* The replacement is visible and this source is now durably retired. */
+		test_crash_compaction_at("after_publish");
+		test_crash_compaction_at("after_mark_delete");
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -4748,6 +4777,16 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	TlWalk		walk[MAX_TIMELINES];
 	uint32_t	levels = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
+
+	/*
+	 * A durable compaction frontier makes older page history unavailable even
+	 * while a crash-recovery pass still has its source layers to clean up.
+	 * Current reads remain valid: their UINT64_MAX horizon is always newer
+	 * than the frontier.
+	 */
+	if (read_lsn != UINT64_MAX &&
+		!page_frontier_allows(timeline, read_lsn, read_seq))
+		return 0;
 
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */

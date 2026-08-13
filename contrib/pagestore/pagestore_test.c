@@ -144,6 +144,23 @@ check_inspector(const char *shm, uint32_t page_size)
 		  "read-only inspector reports page-pruning counters");
 }
 
+static int
+wait_for_daemon_exit(pid_t pid, int expected_status)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		int		status;
+		pid_t		result = waitpid(pid, &status, WNOHANG);
+
+		if (result == pid)
+			return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
+		if (result < 0)
+			return 0;
+		usleep(10000);
+	}
+	return 0;
+}
+
 /* An offline segment-format migration must invalidate derived LSM metadata. */
 static void
 remove_lsm_metadata(const char *store)
