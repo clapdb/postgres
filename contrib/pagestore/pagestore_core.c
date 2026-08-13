@@ -2243,11 +2243,12 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 static int
 fork_has_create_at(const ForkEnt *e, uint64_t lsn)
 {
+	const ForkEvent *last = NULL;
+
 	for (uint32_t i = 0; i < e->nev; i++)
-		if (e->ev[i].kind == FEV_SET && e->ev[i].nblocks == 0 &&
-			e->ev[i].lsn == lsn)
-			return 1;
-	return 0;
+		if (e->ev[i].lsn == lsn)
+			last = &e->ev[i];
+	return last != NULL && last->kind == FEV_SET && last->nblocks == 0;
 }
 
 /*
@@ -2263,9 +2264,6 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 {
 	uint32_t	i;
 
-	if (kind == FEV_GROW &&
-		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
-		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -2409,7 +2407,7 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 	 */
 	if (lsn < e->last_def_lsn || lsn == 0)
 		lsn = e->last_def_lsn;
-	if (fork_size_asof_hop(e, lsn, admission_seq) < to_nblocks &&
+	if (!fork_has_growth_at(e, lsn, to_nblocks) &&
 		fork_meta_persist(timeline, key, lsn, admission_seq, to_nblocks,
 						  FEV_GROW) != 0)
 		return -1;			/* not durable: do not apply in memory */
@@ -5586,9 +5584,20 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
-				uint64_t	seq = admission_seq_alloc();
-				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
+				uint64_t	lsn;
+				uint64_t	seq;
+				int			delayed;
+
+				/* Object writers issue CREATE as a preparatory operation before
+				 * every write.  Unlike a relation WAL CREATE, an unstamped retry
+				 * must preserve the existing fork and its block count. */
+				if (ch->req_lsn == 0 && ch->key.klass != PS_KLASS_RELATION &&
+					fork_exists_through(tl, &ch->key, UINT64_MAX, 0))
+					break;
+
+				lsn = fork_op_lsn(e, ch->req_lsn);
+				seq = admission_seq_alloc();
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
 				{
