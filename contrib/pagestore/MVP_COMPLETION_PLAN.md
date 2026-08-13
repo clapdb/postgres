@@ -193,8 +193,8 @@ retains the state visible at that fence while the operational frontier may
 advance past it.  The bounded-space soak keeps a fixed reader alive while its
 timeline receives continuing updates and verifies bounded page, forkmeta,
 WAL-index, and raw-WAL storage.
-may continue to advance while compaction retains those discrete bases for all
-live descendants.  Durable timeline metadata stores the complete fork tuple
+The operational frontier may continue to advance while compaction retains
+those discrete bases for all live descendants.  Durable timeline metadata stores the complete fork tuple
 `(branch_lsn, branch_admission_sequence)`, not a bare LSN; restart, ancestor
 reads, page/forkmeta visibility, and compaction all apply that tuple so a
 same-LSN post-fork mutation cannot enter the child.
@@ -206,6 +206,10 @@ frontier already beyond any required base rejects the branch.  Control-object
 versions are protected independently by the WAL floor: compaction retains the
 newest usable control image and redo-floor note at or below every retained WAL
 boundary even when the page-history floor is newer.
+If SLRU capture yields a replay base `C` earlier than branch fence `L`, branch
+preparation validates and temporarily pins the WAL resource at `C` before
+seeding; that per-resource protection remains until the branch artifact and
+its structural retention are durable.
 
 Deliverables:
 
@@ -393,6 +397,10 @@ Deliverables:
   increasing timeline incarnation generation;
 - idempotent removal of manifests, layers, page segments, WAL, WAL index,
   control/SLRU metadata, fork metadata, and object-tier copies;
+- shard page segments shared with live timelines are reclaimed only by a
+  crash-safe filtered rewrite plus durable coverage transition; deletion never
+  unlinks a mixed source segment and never permits ID reuse while an
+  old-incarnation record remains recoverable from it;
 - restart resumes deletion and never resurrects a deleted timeline;
 - timeline-ID reuse is permitted only after cleanup is durable and only with a
   higher incarnation generation carried by every request and durable record;
