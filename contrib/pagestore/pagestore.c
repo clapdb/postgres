@@ -10208,6 +10208,7 @@ pagestore_validate_datadir_branch_manifest(void)
 	uint64		read_lsn;
 	uint64		read_seq = 0;
 	uint64		pin_lsn;
+	uint64		provisional_seq;
 	bool		found;
 	uint8		retention_status;
 	PsRetentionPin existing_pin;
@@ -10297,9 +10298,11 @@ pagestore_validate_datadir_branch_manifest(void)
 		pfree(reader_snapshot);
 		/*
 		 * This is the last local-only validation step.  Install a conservative
-		 * zero-sequence pin before even reading the exact admission fence.  It
-		 * protects every same-LSN variant while the fence is resolved, closing
-		 * the read-fence/SET race for a new or advancing owner.
+		 * pin at a freshly drained admission barrier before reading the exact
+		 * checkpoint fence.  This conservative upper fence protects every
+		 * same-LSN variant that could belong to the artifact while the exact
+		 * fence is resolved, closing the read-fence/SET race for a new or
+		 * advancing owner without using the legacy zero-sequence sentinel.
 		 */
 		have_existing_pin = pagestore_find_retention_owner(
 			pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
@@ -10333,11 +10336,16 @@ pagestore_validate_datadir_branch_manifest(void)
 		}
 		if (set_reader_pin)
 		{
+			provisional_seq = pagestore_localsvc_admission_barrier_timeout(
+				PS_READER_RETENTION_TIMEOUT_MS);
+			if (provisional_seq == 0)
+				ereport(FATAL,
+						(errmsg("pagestore reader could not establish a provisional admission fence")));
 			retention_status = pagestore_localsvc_retention_set_timeout(
 				pagestore_localsvc_timeline(), PS_RETENTION_OWNER_READER,
 				pagestore_retention_owner_id,
 				pagestore_retention_owner_generation,
-				PS_READER_RETENTION_RESOURCES, read_lsn, 0,
+				PS_READER_RETENTION_RESOURCES, read_lsn, provisional_seq,
 				PS_READER_RETENTION_TIMEOUT_MS);
 			if (retention_status == PS_STATUS_STALE)
 				ereport(FATAL,
