@@ -1013,11 +1013,12 @@ prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
 
 		while (end < *nrec && compact_same_page(&order[first], &order[end]))
 			end++;
-		/* pg_control images and their same-version floor notes are the durable
-		 * authority from which WAL retention is computed.  A page-history floor
-		 * cannot safely prune that authority (doing so would be circular); WAL GC
-		 * will eventually retire control checkpoints under its own proof. */
-		if (order[first].key.klass == PS_KLASS_CONTROL)
+		/* Relation page history is the only history governed by the page-prune
+		 * frontier.  Control and SLRU pages are reader-artifact authority: an
+		 * exact checkpoint can require an older SLRU base even when its ordinary
+		 * relation pages have advanced.  Keep all non-relation versions until
+		 * their dedicated retention protocols prove them reclaimable. */
+		if (order[first].key.klass != PS_KLASS_RELATION)
 		{
 			for (uint32_t i = first; i < end; i++)
 				selected[out++] = recs[order[i].source];
