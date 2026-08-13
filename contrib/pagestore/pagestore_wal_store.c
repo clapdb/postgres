@@ -90,6 +90,32 @@ wal_payload_hash(uint32_t hash, const void *data, size_t len)
 }
 
 static int
+build_chunk_hashes(const void *payload, uint32_t payload_len,
+				   uint32_t **hashes_out, uint32_t *nchunks_out)
+{
+	const unsigned char *bytes = payload;
+	uint32_t	nchunks;
+	uint32_t   *hashes;
+
+	nchunks = (payload_len + PS_WAL_STORE_VERIFY_CHUNK_BYTES - 1) /
+		PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+	hashes = malloc((size_t) nchunks * sizeof(*hashes));
+	if (hashes == NULL)
+		return -1;
+	for (uint32_t i = 0; i < nchunks; i++)
+	{
+		uint32_t off = i * PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+		uint32_t amount = payload_len - off < PS_WAL_STORE_VERIFY_CHUNK_BYTES ?
+			payload_len - off : PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+
+		hashes[i] = wal_payload_hash(2166136261u, bytes + off, amount);
+	}
+	*hashes_out = hashes;
+	*nchunks_out = nchunks;
+	return 0;
+}
+
+static int
 random_suffix(char suffix[7])
 {
 	static const char alphabet[] =
@@ -122,7 +148,7 @@ random_suffix(char suffix[7])
 }
 
 static int read_validated_segment_range(PsWalStore *store,
-										const PsWalSegmentHeader *expected,
+											const PsWalStoreEntry *entry,
 										uint64_t range_off, unsigned char *out,
 										const unsigned char *compare,
 										size_t range_len);
@@ -270,7 +296,8 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < prefix; i++)
 	{
-		const PsWalSegmentHeader *header = &store->entries[i].header;
+		const PsWalStoreEntry *entry = &store->entries[i];
+		const PsWalSegmentHeader *header = &entry->header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
 		uint64_t overlap_start = start_lsn > header->start_lsn ?
 			start_lsn : header->start_lsn;
@@ -280,7 +307,7 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 		{
 			size_t amount = (size_t) (overlap_end - overlap_start);
 
-			if (read_validated_segment_range(store, header,
+			if (read_validated_segment_range(store, entry,
 					overlap_start - header->start_lsn, NULL,
 					bytes + (overlap_start - start_lsn), amount) != 0)
 				return -1;
@@ -318,6 +345,8 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	while (done < len)
 	{
 		PsWalSegmentHeader header;
+		uint32_t   *chunk_hashes = NULL;
+		uint32_t	nchunks = 0;
 		uint32_t chunk = store->segment_size;
 		uint64_t segment_start = start_lsn + done;
 
@@ -335,9 +364,17 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 			ps_wal_segment_seal(&header, store->timeline,
 								 store->next_segment_no, start_lsn + done,
 								 store->segment_size, bytes + done, chunk) != 0 ||
-			publish_segment(store, &header, bytes + done) != 0)
+			build_chunk_hashes(bytes + done, chunk, &chunk_hashes, &nchunks) != 0)
 			return -1;
-		store->entries[store->nentries++].header = header;
+		if (publish_segment(store, &header, bytes + done) != 0)
+		{
+			free(chunk_hashes);
+			return -1;
+		}
+		store->entries[store->nentries].header = header;
+		store->entries[store->nentries].chunk_hashes = chunk_hashes;
+		store->entries[store->nentries].nchunks = nchunks;
+		store->nentries++;
 		store->next_segment_no++;
 		store->end_lsn += chunk;
 		done += chunk;
@@ -347,17 +384,19 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 
 static int
 read_validated_segment_range(PsWalStore *store,
-						 const PsWalSegmentHeader *expected,
+							 const PsWalStoreEntry *entry,
 						 uint64_t range_off, unsigned char *out,
 						 const unsigned char *compare, size_t range_len)
 {
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
-	unsigned char buf[64 * 1024];
+	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
+	const PsWalSegmentHeader *expected = &entry->header;
 	PsWalSegmentHeader actual;
 	struct stat st;
 	char name[128];
-	uint32_t hash = 2166136261u;
-	uint64_t done = 0;
+	uint64_t range_end;
+	uint32_t first_chunk;
+	uint32_t last_chunk;
 	int fd = -1;
 	int rc = -1;
 
@@ -377,23 +416,32 @@ read_validated_segment_range(PsWalStore *store,
 		actual.segment_size != expected->segment_size ||
 		actual.payload_crc != expected->payload_crc)
 		goto cleanup;
-	if (range_off + range_len < range_off ||
+	if (range_len == 0 || range_off + range_len < range_off ||
 		range_off + range_len > actual.payload_len)
 		goto cleanup;
-	while (done < actual.payload_len)
+	range_end = range_off + range_len;
+	first_chunk = (uint32_t) (range_off / PS_WAL_STORE_VERIFY_CHUNK_BYTES);
+	last_chunk = (uint32_t) ((range_end - 1) /
+							 PS_WAL_STORE_VERIFY_CHUNK_BYTES);
+	if (entry->chunk_hashes == NULL ||
+		entry->nchunks != (actual.payload_len + PS_WAL_STORE_VERIFY_CHUNK_BYTES - 1) /
+			PS_WAL_STORE_VERIFY_CHUNK_BYTES || last_chunk >= entry->nchunks)
+		goto cleanup;
+	for (uint32_t chunk_no = first_chunk; chunk_no <= last_chunk; chunk_no++)
 	{
-		size_t amount = actual.payload_len - done < sizeof(buf) ?
-			(size_t) (actual.payload_len - done) : sizeof(buf);
-		uint64_t chunk_start = done;
-		uint64_t chunk_end = done + amount;
+		uint64_t chunk_start = (uint64_t) chunk_no *
+			PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+		size_t amount = actual.payload_len - chunk_start < sizeof(buf) ?
+			(size_t) (actual.payload_len - chunk_start) : sizeof(buf);
+		uint64_t chunk_end = chunk_start + amount;
 		uint64_t copy_start = range_off > chunk_start ? range_off : chunk_start;
-		uint64_t copy_end = range_off + range_len < chunk_end ?
-			range_off + range_len : chunk_end;
+		uint64_t copy_end = range_end < chunk_end ? range_end : chunk_end;
 
 		if (read_all_at(fd, buf, amount,
-				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0)
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) chunk_start) != 0 ||
+			wal_payload_hash(2166136261u, buf, amount) !=
+				entry->chunk_hashes[chunk_no])
 			goto cleanup;
-		hash = wal_payload_hash(hash, buf, amount);
 		if (copy_start < copy_end)
 		{
 			size_t copy_len = (size_t) (copy_end - copy_start);
@@ -406,10 +454,7 @@ read_validated_segment_range(PsWalStore *store,
 				memcmp(source, compare + target_off, copy_len) != 0)
 				goto cleanup;
 		}
-		done += amount;
 	}
-	if (hash != actual.payload_crc)
-		goto cleanup;
 	rc = 0;
 
 cleanup:
@@ -434,7 +479,8 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < len; i++)
 	{
-		const PsWalSegmentHeader *header = &store->entries[i].header;
+		const PsWalStoreEntry *entry = &store->entries[i];
+		const PsWalSegmentHeader *header = &entry->header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
 		uint64_t overlap_start = start_lsn > header->start_lsn ?
 			start_lsn : header->start_lsn;
@@ -444,7 +490,7 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 		{
 			size_t amount = (size_t) (overlap_end - overlap_start);
 
-			if (read_validated_segment_range(store, header,
+			if (read_validated_segment_range(store, entry,
 					overlap_start - header->start_lsn,
 					out + (overlap_start - start_lsn), NULL, amount) != 0)
 				return -1;
@@ -461,6 +507,8 @@ ps_wal_store_close(PsWalStore *store)
 		return;
 	if (store->directory_fd >= 0)
 		close(store->directory_fd);
+	for (uint32_t i = 0; i < store->nentries; i++)
+		free(store->entries[i].chunk_hashes);
 	free(store->entries);
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
