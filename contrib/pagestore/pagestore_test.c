@@ -1957,6 +1957,21 @@ local_layer_bytes(const char *store)
 }
 
 static int
+wait_for_local_layer_bytes(const char *store, uint64_t maximum)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		uint64_t bytes = local_layer_bytes(store);
+
+		/* Compaction publication precedes asynchronous source unlink. */
+		if (bytes > 0 && bytes < maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
 read_pruning_metrics(const char *shm, uint64_t *compactions, uint64_t *scanned,
 					 uint64_t *kept, uint64_t *deleted)
 {
@@ -2648,7 +2663,6 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 				scanned = 0,
 				kept = 0,
 				deleted = 0;
-	uint64_t	bytes;
 	pid_t		pid;
 
 	fprintf(stderr, "== bounded page-history churn ==\n");
@@ -2686,9 +2700,8 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 		check(wait_for_compacted_layers(store, 3),
 			  "churn cycle %u returns to the configured live-layer bound", cycle);
 	}
-	bytes = local_layer_bytes(store);
-	check(bytes > 0 && bytes < (uint64_t) ps * 16,
-		  "twelve churn cycles retain a constant-size page history on disk");
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "twelve churn cycles reclaim source layers to a constant-size history");
 	check(wait_for_accounted_pruning_metrics(shm, 12, &compactions, &scanned,
 										  &kept, &deleted),
 		  "pruning counters account for churn and record deleted versions");
@@ -2746,8 +2759,8 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 		check(wait_for_compacted_layers(store, 3),
 			  "restarted churn returns to the live-layer bound");
 	}
-	check(local_layer_bytes(store) < (uint64_t) ps * 16,
-		  "bounded retained page history survives restart");
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "bounded retained page history is physically reclaimed after restart");
 	for (uint32_t block = 0; block < 4; block++)
 	{
 		unsigned char expected = (unsigned char) (20 + 12 * 32 + 28 + block);
