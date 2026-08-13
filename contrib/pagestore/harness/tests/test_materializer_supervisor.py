@@ -88,6 +88,18 @@ class SupervisorTests(unittest.TestCase):
                 self.write_config(retention_authority_dir=str(unsafe))
             )
 
+        writable_ancestor = self.root / "writable-ancestor"
+        owned_parent = writable_ancestor / "owned-parent"
+        writable_ancestor.mkdir(mode=0o777)
+        writable_ancestor.chmod(0o777)
+        owned_parent.mkdir(mode=0o700)
+        with self.assertRaisesRegex(MODULE.ConfigError, "replaceable writable"):
+            MODULE.Config.load(
+                self.write_config(
+                    retention_authority_dir=str(owned_parent / "authority")
+                )
+            )
+
     def test_lsn_and_backoff_helpers(self):
         self.assertEqual(MODULE.parse_lsn("1/00000002"), (1 << 32) + 2)
         with self.assertRaisesRegex(ValueError, "invalid PostgreSQL LSN"):

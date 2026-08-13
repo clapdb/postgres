@@ -126,6 +126,22 @@ class BranchPrepareTests(unittest.TestCase):
             finally:
                 first.close()
 
+    def test_branch_retention_generation_is_durable_and_monotonic(self):
+        config = MODULE.Config.load(self.write_config())
+        first = MODULE.BranchPreparer(config)
+        second = MODULE.BranchPreparer(config)
+
+        first.reserve_branch_retention_generation()
+        second.reserve_branch_retention_generation()
+        self.assertEqual(first.branch_retention_generation, 1)
+        self.assertEqual(second.branch_retention_generation, 2)
+        self.assertEqual(
+            json.loads(
+                config.branch_retention_generation_file.read_text(encoding="utf-8")
+            )["generation"],
+            2,
+        )
+
     def test_execute_orders_both_captures_and_restores_services(self):
         config = MODULE.Config.load(self.write_config())
 
@@ -137,9 +153,13 @@ class BranchPrepareTests(unittest.TestCase):
             def preflight(self):
                 self.events.append("preflight")
 
+            def capture_and_pin_base(self):
+                self.events.extend(("capture:True", "pin-base", "resume-base"))
+                return "0/10"
+
             def pause_and_capture(self, keep_paused):
                 self.events.append(f"capture:{keep_paused}")
-                return "0/10" if not keep_paused else "0/40"
+                return "0/40"
 
             def stop_writer(self):
                 self.events.append("stop-writer")
@@ -172,7 +192,9 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.events,
             [
                 "preflight",
-                "capture:False",
+                "capture:True",
+                "pin-base",
+                "resume-base",
                 "stop-writer",
                 "start-restricted",
                 "checkpoint",
@@ -202,8 +224,11 @@ class BranchPrepareTests(unittest.TestCase):
             def preflight(self):
                 pass
 
+            def capture_and_pin_base(self):
+                return "0/10"
+
             def pause_and_capture(self, keep_paused):
-                return "0/10" if not keep_paused else "0/40"
+                return "0/40"
 
             def stop_writer(self):
                 pass

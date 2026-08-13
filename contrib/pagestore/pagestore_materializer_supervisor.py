@@ -63,6 +63,46 @@ class ConfigError(ValueError):
     pass
 
 
+def validate_authority_path(authority_dir: Path) -> os.stat_result:
+    """Return the leaf identity after rejecting replaceable path ancestry."""
+    effective_uid = os.geteuid()
+    authority_stat = os.lstat(authority_dir)
+    if (
+        not stat.S_ISDIR(authority_stat.st_mode)
+        or authority_stat.st_uid != effective_uid
+        or stat.S_IMODE(authority_stat.st_mode) != 0o700
+    ):
+        raise ConfigError(
+            "retention_authority_dir must be owned by this user and mode 0700"
+        )
+
+    component = authority_dir.parent
+    immediate = True
+    while True:
+        component_stat = os.lstat(component)
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ConfigError(
+                "retention_authority_dir ancestry must contain only directories"
+            )
+        writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky = component_stat.st_mode & stat.S_ISVTX
+        if immediate and (
+            component_stat.st_uid != effective_uid or writable
+        ):
+            raise ConfigError(
+                "retention_authority_dir parent must be owner-controlled and not group/world writable"
+            )
+        if not immediate and writable and not sticky:
+            raise ConfigError(
+                "retention_authority_dir ancestry contains a replaceable writable directory"
+            )
+        if component.parent == component:
+            break
+        component = component.parent
+        immediate = False
+    return authority_stat
+
+
 class OwnershipError(RuntimeError):
     pass
 
@@ -199,23 +239,7 @@ class Config:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
-            authority_stat = authority_dir.stat()
-            authority_parent_stat = authority_dir.parent.stat()
-            if (
-                not stat.S_ISDIR(authority_stat.st_mode)
-                or authority_stat.st_uid != os.geteuid()
-                or stat.S_IMODE(authority_stat.st_mode) != 0o700
-            ):
-                raise ConfigError(
-                    "retention_authority_dir must be owned by this user and mode 0700"
-                )
-            if (
-                authority_parent_stat.st_uid != os.geteuid()
-                or authority_parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            ):
-                raise ConfigError(
-                    "retention_authority_dir parent must be owner-controlled and not group/world writable"
-                )
+            validate_authority_path(authority_dir)
             paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise ConfigError(
