@@ -922,7 +922,7 @@ pagestore_find_retention_owner(uint32 timeline, uint32 owner_kind,
 	bool		found = false;
 
 	if (pagestore_localsvc_retention_lookup(timeline, owner_kind, owner_id,
-			result, &found) != PS_STATUS_OK)
+			result, &found, PS_READER_RETENTION_TIMEOUT_MS) != PS_STATUS_OK)
 		ereport(ERROR,
 				(errmsg("pagestore retention owner lookup failed")));
 	return found;
@@ -12028,13 +12028,30 @@ pagestore_reader_artifact_worker_cycle(bool prime)
 {
 	LOCAL_FCINFO(fcinfo, 0);
 	bool		succeeded = false;
+	XLogRecPtr	barrier_lsn = InvalidXLogRecPtr;
 
 	InitFunctionCallInfoData(*fcinfo, NULL, 0, InvalidOid, NULL, NULL);
 	PG_TRY();
 	{
 		StartTransactionCommand();
+		SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+		barrier_lsn = pagestore_reader_snapshot_job->reserved_lsn;
+		SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		if (prime)
-			(void) pagestore_prime_reader_relmaps(fcinfo);
+		{
+			XLogRecPtr sample_lsn = DatumGetLSN(
+				pagestore_prime_reader_relmaps(fcinfo));
+
+			/* A relation map sampled after the reserved checkpoint belongs to a
+			 * future catalog view.  Leave this database without a manifest so the
+			 * launcher cannot publish a mixed-horizon barrier. */
+			if (!XLogRecPtrIsInvalid(barrier_lsn) && sample_lsn > barrier_lsn)
+				ereport(ERROR,
+						(errmsg("reader relation-map sample is newer than checkpoint"),
+						 errdetail("Sample %X/%08X exceeds checkpoint %X/%08X.",
+								   LSN_FORMAT_ARGS(sample_lsn),
+								   LSN_FORMAT_ARGS(barrier_lsn))));
+		}
 		fcinfo->isnull = false;
 		(void) pagestore_publish_database_reader_manifest(fcinfo);
 		CommitTransactionCommand();

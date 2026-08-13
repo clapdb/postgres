@@ -1119,7 +1119,7 @@ pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
 uint8
 pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
 									uint64 owner_id, PsRetentionPin *pin,
-									bool *found)
+									bool *found, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
@@ -1131,7 +1131,7 @@ pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
 	ch->req_seq = owner_id;
-	status = ls_exec_wait(ch, 0);
+	status = ls_exec_wait(ch, timeout_ms);
 	if (found != NULL)
 		*found = status == PS_STATUS_OK && ch->result != 0;
 	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
