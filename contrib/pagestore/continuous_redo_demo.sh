@@ -361,11 +361,29 @@ echo "ok   - materializer progress releases WAL archive backpressure"
 	fail "could not stop materializer before stale-owner test"
 takeover_status=$($WP -c "SELECT pagestore_retention_set(0,2,1,2,6,'$materialized_lsn');")
 [ "$takeover_status" = "0" ] || fail "could not publish replacement owner generation"
-if "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1; then
-	fail "stale materializer generation started after controller takeover"
-fi
-grep -q "retention generation is stale" "$REDO/redo.log" ||
+# Hot-standby startup can briefly make pg_ctl report success before recovery
+# reaches the pagestore owner check.  Observe the durable fencing result instead
+# of treating that transient readiness as a successful stale takeover.
+"$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 || true
+stale_fenced=0
+for _ in $(seq 1 100); do
+	if grep -q "retention generation is stale" "$REDO/redo.log"; then
+		stale_fenced=1
+		break
+	fi
+	sleep 0.1
+done
+[ "$stale_fenced" -eq 1 ] ||
 	fail "stale materializer startup did not report owner fencing"
+for _ in $(seq 1 100); do
+	if ! "$BIN/pg_ctl" -D "$REDO" status >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.1
+done
+if "$BIN/pg_ctl" -D "$REDO" status >/dev/null 2>&1; then
+	fail "stale materializer generation remained running after controller takeover"
+fi
 echo "ok   - replacement owner generation fences stale materializer startup"
 echo "pagestore.materializer = off" >> "$REDO/postgresql.conf"
 "$BIN/pg_ctl" -D "$REDO" -l "$REDO/redo.log" -w start >/dev/null 2>&1 ||
