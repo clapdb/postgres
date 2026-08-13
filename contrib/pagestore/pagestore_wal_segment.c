@@ -64,8 +64,8 @@ encode_fields(const PsWalSegmentHeader *header, unsigned char *out,
 	put_le64(out + 32, header->start_lsn);
 	put_le32(out + 40, header->payload_crc);
 	put_le32(out + 44, include_crc ? header->header_crc : 0);
-	put_le64(out + 48, header->reserved64[0]);
-	put_le64(out + 56, header->reserved64[1]);
+	put_le64(out + 48, header->segment_size);
+	put_le64(out + 56, header->reserved64);
 }
 
 static uint32_t
@@ -80,22 +80,26 @@ header_crc(const PsWalSegmentHeader *header)
 static int
 segment_identity_valid(const PsWalSegmentHeader *header)
 {
-	return header->start_lsn % PS_WAL_SEGMENT_PAYLOAD_BYTES == 0 &&
-		header->start_lsn / PS_WAL_SEGMENT_PAYLOAD_BYTES == header->segment_no &&
+	return header->segment_size >= PS_WAL_SEGMENT_MIN_BYTES &&
+		header->segment_size <= PS_WAL_SEGMENT_MAX_BYTES &&
+		(header->segment_size & (header->segment_size - 1)) == 0 &&
+		header->start_lsn % header->segment_size == 0 &&
+		header->start_lsn / header->segment_size == header->segment_no &&
 		header->start_lsn + header->payload_len >= header->start_lsn &&
-		header->payload_len <= PS_WAL_SEGMENT_PAYLOAD_BYTES;
+		header->payload_len <= header->segment_size;
 }
 
 int
 ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
 					uint64_t segment_no, uint64_t start_lsn,
-					const void *payload, uint32_t payload_len)
+					uint32_t segment_size, const void *payload,
+					uint32_t payload_len)
 {
 	uintptr_t hstart = (uintptr_t) header;
 	uintptr_t pstart = (uintptr_t) payload;
 
 	if (header == NULL || payload_len == 0 || payload == NULL ||
-		payload_len > PS_WAL_SEGMENT_PAYLOAD_BYTES ||
+		segment_size == 0 || payload_len > segment_size ||
 		pstart > UINTPTR_MAX - payload_len ||
 		(pstart < hstart + sizeof(*header) && pstart + payload_len > hstart))
 		return -1;
@@ -107,6 +111,7 @@ ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
 	header->segment_no = segment_no;
 	header->start_lsn = start_lsn;
 	header->payload_len = payload_len;
+	header->segment_size = segment_size;
 	if (!segment_identity_valid(header))
 		return -1;
 	header->payload_crc = payload_crc(payload, payload_len);
@@ -125,8 +130,7 @@ ps_wal_segment_validate(const PsWalSegmentHeader *header,
 		header->payload_len == 0 ||
 		header->payload_len != payload_len ||
 		!segment_identity_valid(header) ||
-		header->reserved64[0] != 0 ||
-		header->reserved64[1] != 0 || header->header_crc != header_crc(header))
+		header->reserved64 != 0 || header->header_crc != header_crc(header))
 		return -1;
 	return header->payload_crc == payload_crc(payload, payload_len) ? 0 : -1;
 }
@@ -166,14 +170,14 @@ ps_wal_segment_decode(PsWalSegmentHeader *header, const unsigned char *input,
 	decoded.start_lsn = get_le64(encoded + 32);
 	decoded.payload_crc = get_le32(encoded + 40);
 	decoded.header_crc = get_le32(encoded + 44);
-	decoded.reserved64[0] = get_le64(encoded + 48);
-	decoded.reserved64[1] = get_le64(encoded + 56);
+	decoded.segment_size = get_le64(encoded + 48);
+	decoded.reserved64 = get_le64(encoded + 56);
 	if (decoded.magic != PS_WAL_SEGMENT_MAGIC ||
 		decoded.version != PS_WAL_SEGMENT_VERSION ||
 		decoded.header_len != PS_WAL_SEGMENT_HEADER_BYTES ||
 		decoded.flags != 0 || decoded.payload_len == 0 ||
 		!segment_identity_valid(&decoded) ||
-		decoded.reserved64[0] != 0 || decoded.reserved64[1] != 0 ||
+		decoded.reserved64 != 0 ||
 		decoded.header_crc != header_crc(&decoded))
 		return -1;
 	*header = decoded;
