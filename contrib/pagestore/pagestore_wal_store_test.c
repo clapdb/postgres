@@ -63,6 +63,10 @@ main(void)
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
 	for (uint32_t i = 0; i < first_len + TEST_SEGMENT_BYTES; i++)
 		input[i] = (unsigned char) (i * 31u + 7u);
+	snprintf(path, sizeof(path), "%s/zero", directory);
+	check(ps_wal_store_create(&store, path, 0, 0, TEST_SEGMENT_BYTES) != 0 &&
+		  access(path, F_OK) != 0,
+		  "store creation rejects an unset timeline before filesystem changes");
 	check(ps_wal_store_create(&store, directory, 7, 0, TEST_SEGMENT_BYTES) == 0,
 		  "create an empty timeline WAL segment store");
 	check((fcntl(store.directory_fd, F_GETFD) & FD_CLOEXEC) != 0,
