@@ -2333,6 +2333,16 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	op_zeroextend_at(rel, 0, 0, 1, 8000);
 	op_unlink_at(rel, 0, 9000);
 	op_create_at(rel, 0, 10000);
+	/* WAL replay can observe the new CREATE before an older UNLINK.  The
+	 * empty generation must survive even though no new page growth follows it. */
+	op_create_at(rel + test_nshards, 0, 1000);
+	fill_page(page, ps, 6000, 61);
+	op_write_tl(0, rel + test_nshards, 0, 0, page);
+	op_create_at(rel + test_nshards, 0, 10000);
+	op_unlink_at(rel + test_nshards, 0, 9000);
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "create before delayed unlink preserves an empty recreated generation");
 	fill_page(page, ps, 11000, 110);
 	op_write_tl(0, rel, 0, 0, page);
 	for (uint32_t block = 1; block <= 48; block++)
@@ -2368,6 +2378,9 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 		  "recreated relation is empty before its new generation page");
 	check(!op_read_at_found(rel, 0, 0, 10500, readback),
 		  "empty recreated generation cannot expose the dropped generation page");
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "empty generation from create-before-unlink survives restart");
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 110),
 		  "new relation generation remains current after compaction and restart");

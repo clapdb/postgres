@@ -2237,6 +2237,19 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	return 0;
 }
 
+/* CREATE retry/redo must not append another empty-generation boundary, but a
+ * CREATE that is currently hidden by the old live generation must still leave
+ * durable evidence for a delayed older UNLINK. */
+static int
+fork_has_create_at(const ForkEnt *e, uint64_t lsn)
+{
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].kind == FEV_SET && e->ev[i].nblocks == 0 &&
+			e->ev[i].lsn == lsn)
+			return 1;
+	return 0;
+}
+
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
@@ -5567,17 +5580,14 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_CREATE:
 			/*
 			 * Definitive existence from ch->req_lsn on (the backend stamps
-			 * its WAL position; see fork_op_lsn for a legacy 0).  Re-creating
-			 * a fork that already exists at that horizon is an idempotent
-			 * retry or a redo replay: record nothing, so the event history
-			 * is not polluted and no walk gets cut short by a stray SET 0.
+			 * its WAL position; see fork_op_lsn for a legacy 0).  Keep the
+			 * empty-generation boundary even if an older live generation still
+			 * appears current: its UNLINK may arrive later during replay.
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
-				uint32_t	nb;
-				int			r = fork_asof_hop(e, lsn, 0, &nb);
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
 				if (seq == 0)
@@ -5585,10 +5595,7 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				/* A delayed CREATE can be observed as live because newer state is
-				 * already present.  Its SET is still the durable boundary of an
-				 * empty recreated generation. */
-				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD || delayed)
+				if (!fork_has_create_at(e, lsn))
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
