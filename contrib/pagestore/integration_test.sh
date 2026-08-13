@@ -52,7 +52,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=27
+	local expected_version=29
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128
@@ -146,6 +146,40 @@ assert "$nfiles" "0" "routed tablespace has no local relation files (I/O went to
 ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM t;")
 assert "$ck2" "$ck1" "data intact after restart (read back from daemon)"
 assert "$($P -c 'SELECT count(*) FROM t;')" "20000" "row count after restart"
+
+# R0 retention-owner calls return the daemon's status instead of collapsing a
+# stale generation into success.  Keep owner 9001 live across the later daemon
+# crash/reconnect test; it is released immediately after recovery there.
+$P -c "CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn) RETURNS int
+        AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_retention_drop(int,int,bigint,bigint) RETURNS int
+        AS 'pagestore','pagestore_retention_drop' LANGUAGE C STRICT;" >/dev/null
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,0,'0/1');")" "1" \
+	"retention SET reports daemon rejection of an invalid resource mask"
+if $P -v ON_ERROR_STOP=1 -c \
+	"SELECT pagestore_retention_drop(0,1,0,5);" >/dev/null 2>&1; then
+	echo "FAIL - retention DROP accepts owner id zero"
+	fail=1
+else
+	echo "ok   - retention DROP rejects owner id zero"
+fi
+if $P -v ON_ERROR_STOP=1 -c \
+	"SELECT pagestore_retention_set(0,1,9001,0,7,'0/1');" >/dev/null 2>&1; then
+	echo "FAIL - retention SET accepts reserved generation zero"
+	fail=1
+else
+	echo "ok   - retention SET rejects reserved generation zero"
+fi
+assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,6,7,'0/1');")" "0" \
+	"retention SET preserves a high-bit uint64 owner ID"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,-9223372036854775808,6);")" "0" \
+	"retention DROP preserves a high-bit uint64 owner ID"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/1');")" "0" \
+	"localsvc registers a durable retention owner generation"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'0/2');")" "2" \
+	"localsvc reports a stale retention SET distinctly"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,4);")" "2" \
+	"localsvc reports a stale retention DROP distinctly"
 
 # --- 2. copy-on-write time-travel read -------------------------------------
 $P -c "CREATE FUNCTION pagestore_read_at(regclass,int,int,pg_lsn) RETURNS bytea
@@ -414,6 +448,16 @@ wait_daemon_ready
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-log recovery)"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'0/2');")" "2" \
+	"retention fencing survives daemon restart and backend reconnect"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/2');")" "0" \
+	"the current owner generation can update after reconnect"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,5);")" "0" \
+	"the current owner generation can release after reconnect"
+assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,5);")" "0" \
+	"retention DROP retry is idempotent"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/3');")" "2" \
+	"a released generation cannot resurrect through localsvc"
 
 # --- 16. SLRU snapshot shipping (M4 step 1): ship clog to the store, keyed by C ----
 # CHECKPOINT flushes pg_xact to a clean on-disk image; the single-client test has no

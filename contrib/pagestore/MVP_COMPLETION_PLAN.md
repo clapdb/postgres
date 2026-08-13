@@ -82,7 +82,8 @@ R4's replacement bases to have removed the oldest raw-WAL dependencies.
 
 ### R0. Land the localsvc retention-owner API
 
-Status: **not started on `pagestore`**.
+Status: **partially implemented in the R0 stacked change; reclamation-frontier
+admission remains open and must land before any reclaimer is enabled**.
 
 The previously reviewed stacked PR #171 did not reach the final `pagestore`
 history.  Port its current-state equivalent rather than merging the stale
@@ -134,6 +135,7 @@ Acceptance:
 - a delayed SET or DROP below the tombstone generation is rejected, and a
   same-generation SET cannot resurrect a dropped owner; tests cover both
   orderings before and after restart/compaction;
+- callers can distinguish `PS_STATUS_STALE` from a general daemon error;
 - standalone, PostgreSQL integration, and retention recovery tests pass.
 
 Expected scope: one PR.

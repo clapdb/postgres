@@ -108,7 +108,16 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 static uint64_t
 admission_seq_alloc(void)
 {
-	return __atomic_fetch_add(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
+
+	for (;;)
+	{
+		if (next == 0 || next == UINT64_MAX)
+			return 0;
+		if (__atomic_compare_exchange_n(&next_admission_seq, &next, next + 1,
+								false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+			return next;
+	}
 }
 
 static void
@@ -116,8 +125,9 @@ admission_seq_observe(uint64_t seq)
 {
 	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 
-	while (next <= seq &&
-		   !__atomic_compare_exchange_n(&next_admission_seq, &next, seq + 1,
+	while (next <= seq && next != UINT64_MAX &&
+		   !__atomic_compare_exchange_n(&next_admission_seq, &next,
+								 seq == UINT64_MAX ? UINT64_MAX : seq + 1,
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
@@ -142,6 +152,8 @@ ps_admission_barrier(void)
 
 	pthread_rwlock_wrlock(&admission_lock);
 	seq = admission_seq_alloc();
+	if (seq != 0 && ps_retention_reserve_admission_seq(seq) != 0)
+		seq = 0;
 	pthread_rwlock_unlock(&admission_lock);
 	return seq;
 }
@@ -1702,6 +1714,9 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 	uint64_t	admission_seq = admission_seq_alloc();
+
+	if (admission_seq == 0)
+		return -1;
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -3462,6 +3477,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	branch_floor = 0;
 	uint64_t	growth_floor = fe ? fe->last_def_lsn : 0;
 
+	if (admission_seq == 0)
+		return -1;
+
 	/* A branch-local version written after the branch snapshot must not become
 	 * visible AT that snapshot merely because copied bytes retain an older
 	 * source LSN.  The first representable local position is branch_lsn + 1. */
@@ -4732,6 +4750,11 @@ ps_handle_meta(PsChannel *ch)
 				uint32_t	nb;
 				int			r = fork_asof_hop(e, lsn, 0, &nb);
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
@@ -4769,6 +4792,11 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
@@ -4804,6 +4832,11 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
 								  FEV_SET) != 0)
 					ch->status = PS_STATUS_ERROR;
@@ -4989,11 +5022,24 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
+				pin.admission_seq = (uint64_t) ch->nblocks |
+					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
-				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timelines[tl].defined) ?
-					PS_RETENTION_ERROR : ps_retention_set(&pin);
+				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
+					!timelines[tl].defined)
+					ret = PS_RETENTION_ERROR;
+				else
+				{
+					/* A retried controller fence may be newer than this
+					 * process's recovered allocator.  Serialize its durable SET
+					 * with mutations and advance allocation before admitting more. */
+					pthread_rwlock_wrlock(&admission_lock);
+					ret = ps_retention_set(&pin);
+					if (ret == PS_RETENTION_OK)
+						admission_seq_observe(pin.admission_seq);
+					pthread_rwlock_unlock(&admission_lock);
+				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
@@ -5020,14 +5066,24 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_GET:
 			{
 				PsRetentionPin pin;
+				PsRetentionGetResult result;
 				uint32_t	count = 0;
-				int			found = ps_retention_get(ch->blocknum, &pin, &count);
+				uint64_t	epoch = ch->req_lsn;
+				int			found = ps_retention_get_consistent(ch->blocknum,
+														   &epoch, &pin, &count);
 
-				if (found < 0)
+				if (found == PS_RETENTION_STALE)
+				{
+					ch->status = PS_STATUS_STALE;
+					ch->req_lsn = epoch;
+				}
+				else if (found < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
 					ch->nblocks = count;
+					memset(&result, 0, sizeof(result));
+					result.mutation_epoch = epoch;
 					if (found)
 					{
 						ch->result = 1;
@@ -5037,7 +5093,10 @@ ps_handle_meta(PsChannel *ch)
 						ch->old_nblocks = pin.generation;
 						ch->req_seq = pin.owner_id;
 						ch->req_lsn = pin.lsn;
+						result.admission_seq = pin.admission_seq;
 					}
+					memcpy(ch->data, &result, sizeof(result));
+					ch->datalen = sizeof(result);
 				}
 			}
 			break;
@@ -5828,6 +5887,7 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
@@ -5912,8 +5972,12 @@ ps_core_open(const char *store_dir)
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
 	{
+		uint64_t	admission_highwater;
 		uint32_t	npins = 0;
 
+		if (ps_retention_admission_highwater(&admission_highwater) != 0)
+			return -1;
+		admission_seq_observe(admission_highwater);
 		if (ps_retention_count(&npins) != 0)
 			return -1;
 		for (uint32_t i = 0; i < npins; i++)
@@ -5928,6 +5992,8 @@ ps_core_open(const char *store_dir)
 				errno = EILSEQ;
 				return -1;
 			}
+			if (pin.admission_seq != 0)
+				admission_seq_observe(pin.admission_seq);
 		}
 	}
 

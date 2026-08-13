@@ -406,6 +406,8 @@ run_request(PsChannel *ch)
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
 		ch->req_seq = ps_admission_barrier();
+		if (ch->req_seq == 0)
+			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
 		return 1;
 	}
