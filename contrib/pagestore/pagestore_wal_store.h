@@ -8,7 +8,11 @@
 typedef struct PsWalStoreEntry
 {
 	PsWalSegmentHeader header;
+	uint32_t   *chunk_hashes;
+	uint32_t	nchunks;
 } PsWalStoreEntry;
+
+#define PS_WAL_STORE_VERIFY_CHUNK_BYTES (64u * 1024u)
 
 typedef struct PsWalStore
 {
