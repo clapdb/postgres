@@ -6556,15 +6556,13 @@ typedef struct PagestoreReaderSnapshotManifest
 } PagestoreReaderSnapshotManifest;
 
 #define PAGESTORE_READER_DATABASE_BARRIER_MAGIC UINT32_C(0x50535242)
-#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 2
+#define PAGESTORE_READER_DATABASE_BARRIER_FORMAT 3
 typedef struct PagestoreReaderDatabaseEntry
 {
 	Oid			database_oid;
 	Oid			tablespace_oid;
 } PagestoreReaderDatabaseEntry;
 
-#define PAGESTORE_READER_DATABASE_MAX ((BLCKSZ - 32) / \
-									 sizeof(PagestoreReaderDatabaseEntry))
 typedef struct PagestoreReaderDatabaseBarrier
 {
 	uint64		read_lsn;
@@ -6572,12 +6570,10 @@ typedef struct PagestoreReaderDatabaseBarrier
 	uint32		format;
 	uint32		timeline;
 	uint32		database_count;
-	PagestoreReaderDatabaseEntry databases[PAGESTORE_READER_DATABASE_MAX];
+	uint32		block_count;
 	pg_crc32c	crc;
 	uint32		reserved;
 } PagestoreReaderDatabaseBarrier;
-StaticAssertDecl(sizeof(PagestoreReaderDatabaseBarrier) <= BLCKSZ,
-				 "reader database barrier must fit in one pagestore page");
 
 typedef struct PagestoreReaderCatalogProvenance
 {
@@ -6843,6 +6839,7 @@ static bool pagestore_load_reader_relmap(Oid dbid, Oid tsid,
 										 XLogRecPtr read_lsn,
 										 pg_crc32c *data_crc,
 										 char *data, Size *data_size);
+static bool pagestore_install_global_reader_relmap(XLogRecPtr read_lsn);
 static bool pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 											   XLogRecPtr read_lsn,
 											   const char *mapdir);
@@ -6876,32 +6873,78 @@ pagestore_reader_database_dir_valid(const char *mapdir, Oid dboid,
 }
 
 static bool
-pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
+pagestore_load_reader_database_barrier(XLogRecPtr read_lsn,
+									   PagestoreReaderDatabaseBarrier *barrier,
+									   PagestoreReaderDatabaseEntry **databases)
 {
-	PagestoreReaderDatabaseBarrier barrier;
 	PagestoreReaderDatabaseBarrier checked;
 	PageStoreRelKey key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
 	char		page[BLCKSZ];
 	uint64		resolved = 0;
+	Size		entries_size;
+	Size		first_chunk;
 
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
 			&key, 0, (uint64) read_lsn, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
 		return false;
-	memcpy(&barrier, page, sizeof(barrier));
-	checked = barrier;
+	memcpy(barrier, page, sizeof(*barrier));
+	if (barrier->magic != PAGESTORE_READER_DATABASE_BARRIER_MAGIC ||
+		barrier->format != PAGESTORE_READER_DATABASE_BARRIER_FORMAT ||
+		barrier->timeline != pagestore_localsvc_timeline() ||
+		barrier->read_lsn != read_lsn || barrier->database_count == 0 ||
+		barrier->database_count >
+		(MaxAllocSize - sizeof(*barrier)) / sizeof(**databases) ||
+		barrier->block_count != (sizeof(*barrier) +
+			(Size) barrier->database_count * sizeof(**databases) + BLCKSZ - 1) /
+			BLCKSZ || barrier->reserved != 0)
+		return false;
+	entries_size = (Size) barrier->database_count * sizeof(**databases);
+	*databases = palloc(entries_size);
+	first_chunk = Min(entries_size, (Size) BLCKSZ - sizeof(*barrier));
+	memcpy(*databases, page + sizeof(*barrier), first_chunk);
+	for (BlockNumber block = 1; block < barrier->block_count; block++)
+	{
+		Size offset = (Size) BLCKSZ - sizeof(*barrier) +
+			(Size) (block - 1) * BLCKSZ;
+		Size chunk = Min((Size) BLCKSZ, entries_size - offset);
+
+		resolved = 0;
+		if (!pagestore_localsvc_obj_read_at_timeout(
+				PS_KLASS_READER_SNAPSHOT, &key, block, (uint64) read_lsn,
+				page, &resolved, PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) ||
+			resolved != read_lsn)
+		{
+			pfree(*databases);
+			*databases = NULL;
+			return false;
+		}
+		memcpy((char *) *databases + offset, page, chunk);
+	}
+	checked = *barrier;
 	INIT_CRC32C(checked.crc);
 	COMP_CRC32C(checked.crc, &checked,
 				offsetof(PagestoreReaderDatabaseBarrier, crc));
+	COMP_CRC32C(checked.crc, *databases, entries_size);
 	FIN_CRC32C(checked.crc);
-	if (!(barrier.magic == PAGESTORE_READER_DATABASE_BARRIER_MAGIC &&
-		barrier.format == PAGESTORE_READER_DATABASE_BARRIER_FORMAT &&
-		barrier.timeline == pagestore_localsvc_timeline() &&
-		barrier.read_lsn == read_lsn && barrier.database_count != 0 &&
-		barrier.database_count <= PAGESTORE_READER_DATABASE_MAX &&
-		barrier.reserved == 0 &&
-		EQ_CRC32C(barrier.crc, checked.crc)))
+	if (!EQ_CRC32C(barrier->crc, checked.crc))
+	{
+		pfree(*databases);
+		*databases = NULL;
+		return false;
+	}
+	return true;
+}
+
+static bool
+pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
+{
+	PagestoreReaderDatabaseBarrier barrier;
+	PagestoreReaderDatabaseEntry *databases = NULL;
+
+	if (!pagestore_load_reader_database_barrier(read_lsn, &barrier,
+			&databases))
 		return false;
 
 	/*
@@ -6912,17 +6955,25 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 	{
 		pg_crc32c	global_crc;
 
+		if (!pagestore_install_global_reader_relmap(read_lsn))
+		{
+			pfree(databases);
+			return false;
+		}
 		global_crc = pagestore_reader_relmap_crc("global");
 		for (uint32 i = 0; i < barrier.database_count; i++)
 		{
-			PagestoreReaderDatabaseEntry *entry = &barrier.databases[i];
+			PagestoreReaderDatabaseEntry *entry = &databases[i];
 			char *mapdir;
 
 			if (!OidIsValid(entry->database_oid) ||
 				!OidIsValid(entry->tablespace_oid) ||
-				(i > 0 && barrier.databases[i - 1].database_oid >=
+				(i > 0 && databases[i - 1].database_oid >=
 				 entry->database_oid))
+			{
+				pfree(databases);
 				return false;
+			}
 			mapdir = GetDatabasePath(entry->database_oid,
 								 entry->tablespace_oid);
 			if (!pagestore_install_missing_reader_database(
@@ -6931,10 +6982,12 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 					entry->database_oid, read_lsn, global_crc))
 			{
 				pfree(mapdir);
+				pfree(databases);
 				return false;
 			}
 			pfree(mapdir);
 		}
+		pfree(databases);
 		return true;
 	}
 }
@@ -6946,32 +6999,29 @@ static void
 pagestore_commit_reader_database_maps(XLogRecPtr read_lsn)
 {
 	PagestoreReaderDatabaseBarrier barrier;
-	PagestoreReaderDatabaseBarrier checked;
-	PageStoreRelKey key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
-	char		page[BLCKSZ];
-	uint64		resolved = 0;
+	PagestoreReaderDatabaseEntry *databases = NULL;
 
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, 0, (uint64) read_lsn, page, &resolved,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS) || resolved != read_lsn)
+	if (!pagestore_load_reader_database_barrier(read_lsn, &barrier,
+			&databases))
 		ereport(ERROR, (errmsg("could not reload adopted reader database barrier")));
-	memcpy(&barrier, page, sizeof(barrier));
-	checked = barrier;
-	INIT_CRC32C(checked.crc);
-	COMP_CRC32C(checked.crc, &checked,
-				offsetof(PagestoreReaderDatabaseBarrier, crc));
-	FIN_CRC32C(checked.crc);
-	if (barrier.magic != PAGESTORE_READER_DATABASE_BARRIER_MAGIC ||
-		barrier.format != PAGESTORE_READER_DATABASE_BARRIER_FORMAT ||
-		barrier.timeline != pagestore_localsvc_timeline() ||
-		barrier.read_lsn != read_lsn || barrier.database_count == 0 ||
-		barrier.database_count > PAGESTORE_READER_DATABASE_MAX ||
-		barrier.reserved != 0 || !EQ_CRC32C(barrier.crc, checked.crc))
-		ereport(ERROR, (errmsg("adopted reader database barrier changed")));
+	{
+		char		global_pending[MAXPGPATH];
+		int			len;
+
+		len = snprintf(global_pending, sizeof(global_pending), "global/%s",
+					   PAGESTORE_READER_MAP_PENDING_FILE);
+		PS_CHECK_PATH_FORMAT(len, global_pending);
+		if (unlink(global_pending) == 0)
+			fsync_fname("global", true);
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not commit reader relation map \"%s\": %m",
+							global_pending)));
+	}
 	for (uint32 i = 0; i < barrier.database_count; i++)
 	{
-		PagestoreReaderDatabaseEntry *entry = &barrier.databases[i];
+		PagestoreReaderDatabaseEntry *entry = &databases[i];
 		char	   *mapdir = GetDatabasePath(entry->database_oid,
 									 entry->tablespace_oid);
 		char		pending_path[MAXPGPATH];
@@ -6989,6 +7039,7 @@ pagestore_commit_reader_database_maps(XLogRecPtr read_lsn)
 							pending_path)));
 		pfree(mapdir);
 	}
+	pfree(databases);
 }
 
 static void
@@ -6997,41 +7048,60 @@ pagestore_publish_reader_database_barrier(List *databases, XLogRecPtr read_lsn)
 	PagestoreReaderDatabaseBarrier barrier;
 	PageStoreRelKey key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_DATABASE_BARRIER_OBJECT, InvalidOid);
+	char	   *artifact;
 	char		page[BLCKSZ];
+	Size		artifact_size;
 	BlockNumber nblocks;
 
 	memset(&barrier, 0, sizeof(barrier));
-	if (list_length(databases) > PAGESTORE_READER_DATABASE_MAX)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("too many databases for a pagestore reader barrier")));
+	if (list_length(databases) >
+		(MaxAllocSize - sizeof(barrier)) / sizeof(PagestoreReaderDatabaseEntry))
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				errmsg("too many databases for a pagestore reader barrier")));
 	barrier.read_lsn = read_lsn;
 	barrier.magic = PAGESTORE_READER_DATABASE_BARRIER_MAGIC;
 	barrier.format = PAGESTORE_READER_DATABASE_BARRIER_FORMAT;
 	barrier.timeline = pagestore_localsvc_timeline();
 	barrier.database_count = list_length(databases);
+	artifact_size = sizeof(barrier) +
+		(Size) barrier.database_count * sizeof(PagestoreReaderDatabaseEntry);
+	barrier.block_count = (artifact_size + BLCKSZ - 1) / BLCKSZ;
+	artifact = palloc0(artifact_size);
+	memcpy(artifact, &barrier, sizeof(barrier));
 	{
 		uint32 i = 0;
 		ListCell *lc;
 
 		foreach(lc, databases)
-			barrier.databases[i++] =
+			((PagestoreReaderDatabaseEntry *) (artifact + sizeof(barrier)))[i++] =
 				*((PagestoreReaderDatabaseEntry *) lfirst(lc));
 	}
 	INIT_CRC32C(barrier.crc);
 	COMP_CRC32C(barrier.crc, &barrier,
 				offsetof(PagestoreReaderDatabaseBarrier, crc));
+	COMP_CRC32C(barrier.crc, artifact + sizeof(barrier),
+			  artifact_size - sizeof(barrier));
 	FIN_CRC32C(barrier.crc);
-	memset(page, 0, sizeof(page));
-	memcpy(page, &barrier, sizeof(barrier));
+	memcpy(artifact, &barrier, sizeof(barrier));
 	nblocks = pagestore_localsvc_obj_write_prepare_timeout(
 		PS_KLASS_READER_SNAPSHOT, &key,
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
-	pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
-		&key, 0, page, (uint64) read_lsn, nblocks,
-		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	for (BlockNumber block = 0; block < barrier.block_count; block++)
+	{
+		Size offset = (Size) block * BLCKSZ;
+		Size chunk = Min((Size) BLCKSZ, artifact_size - offset);
+
+		memset(page, 0, sizeof(page));
+		memcpy(page, artifact + offset, chunk);
+		pagestore_localsvc_obj_write_post_timeout(PS_KLASS_READER_SNAPSHOT,
+			&key, block, page, (uint64) read_lsn, nblocks,
+			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+		if (block >= nblocks)
+			nblocks = block + 1;
+	}
 	pagestore_localsvc_store_sync_timeout(
 		PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS);
+	pfree(artifact);
 }
 
 static Size
@@ -7204,6 +7274,40 @@ pagestore_load_reader_relmap(Oid dbid, Oid tsid, XLogRecPtr read_lsn,
 }
 
 static bool
+pagestore_install_global_reader_relmap(XLogRecPtr read_lsn)
+{
+	char		data[PAGESTORE_READER_RELMAP_MAX_SIZE];
+	char		pending_path[MAXPGPATH];
+	struct stat st;
+	pg_crc32c	data_crc;
+	Size		data_size;
+	bool		refresh = false;
+	int			len;
+
+	len = snprintf(pending_path, sizeof(pending_path), "global/%s",
+				   PAGESTORE_READER_MAP_PENDING_FILE);
+	PS_CHECK_PATH_FORMAT(len, pending_path);
+	if (lstat("global/pg_filenode.map", &st) != 0 || !S_ISREG(st.st_mode) ||
+		lstat(pending_path, &st) == 0)
+		refresh = true;
+	if (!pagestore_load_reader_relmap(InvalidOid, GLOBALTABLESPACE_OID,
+			read_lsn, &data_crc, data, &data_size))
+		return false;
+	if (!refresh &&
+		!EQ_CRC32C(pagestore_reader_relmap_crc("global"), data_crc))
+		refresh = true;
+	if (refresh)
+	{
+		pagestore_publish_artifact("global", PAGESTORE_READER_MAP_PENDING_FILE,
+			"reader global relation-map pending horizon",
+			(char *) &read_lsn, sizeof(read_lsn));
+		pagestore_publish_artifact("global", "pg_filenode.map",
+			"reader global relation map", data, (int) data_size);
+	}
+	return true;
+}
+
+static bool
 pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 										XLogRecPtr read_lsn,
 										const char *mapdir)
@@ -7252,10 +7356,12 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 	}
 	else if (errno != ENOENT)
 		return false;
-	if ((!map_exists || pending) &&
-		!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
-									 data, &data_size))
+	if (!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
+								 data, &data_size))
 		return false;
+	if (map_exists && !pending &&
+		!EQ_CRC32C(pagestore_reader_relmap_crc(mapdir), data_crc))
+		pending = true;
 	if (tsid != DEFAULTTABLESPACE_OID && tsid != GLOBALTABLESPACE_OID)
 	{
 		len = snprintf(tablespace_link, sizeof(tablespace_link),
@@ -7291,8 +7397,28 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 							   "reader database version", version,
 							   (int) strlen(version));
 	}
-	else if (!S_ISREG(st.st_mode))
-		return false;
+	else
+	{
+		static const char version[] = PG_MAJORVERSION "\n";
+		char		existing[sizeof(version)];
+		bool		valid = false;
+
+		if (!S_ISREG(st.st_mode))
+			return false;
+		fd = OpenTransientFile(version_path, O_RDONLY | PG_BINARY);
+		if (fd >= 0)
+		{
+			valid = st.st_size == (off_t) strlen(version) &&
+				pagestore_pread_exact(fd, existing, strlen(version), 0) &&
+				memcmp(existing, version, strlen(version)) == 0;
+			if (CloseTransientFile(fd) != 0)
+				valid = false;
+		}
+		if (!valid)
+			pagestore_publish_artifact(mapdir, "PG_VERSION",
+								   "reader database version", version,
+								   (int) strlen(version));
+	}
 	if (!map_exists || pending)
 	{
 		/* Persist intent first.  A crash or later barrier failure then leaves a
