@@ -2237,20 +2237,6 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	return 0;
 }
 
-/* CREATE retry/redo must not append another empty-generation boundary, but a
- * CREATE that is currently hidden by the old live generation must still leave
- * durable evidence for a delayed older UNLINK. */
-static int
-fork_has_create_at(const ForkEnt *e, uint64_t lsn)
-{
-	const ForkEvent *last = NULL;
-
-	for (uint32_t i = 0; i < e->nev; i++)
-		if (e->ev[i].lsn == lsn)
-			last = &e->ev[i];
-	return last != NULL && last->kind == FEV_SET && last->nblocks == 0;
-}
-
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
@@ -2264,6 +2250,9 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 {
 	uint32_t	i;
 
+	if (kind == FEV_GROW &&
+		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
+		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
 		e->last_def_lsn = lsn;
 	if (e->nev == e->evcap)
@@ -5587,6 +5576,8 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	lsn;
 				uint64_t	seq;
 				int			delayed;
+				uint32_t	nb;
+				int			r;
 
 				/* Object writers issue CREATE as a preparatory operation before
 				 * every write.  Unlike a relation WAL CREATE, an unstamped retry
@@ -5598,13 +5589,17 @@ ps_handle_meta(PsChannel *ch)
 				lsn = fork_op_lsn(e, ch->req_lsn);
 				seq = admission_seq_alloc();
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
+				r = fork_asof_hop(e, lsn, 0, &nb);
 
 				if (seq == 0)
 				{
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				if (!fork_has_create_at(e, lsn))
+				/* A delayed CREATE can be observed as live because newer state is
+				 * already present.  Its SET is still the durable boundary of an
+				 * empty recreated generation. */
+				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD || delayed)
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
