@@ -151,7 +151,10 @@ handle_request(PsChannel *ch)
 				/* READ_AT is a diagnostic found-ness probe: reclaimed history is
 				 * reported as absent.  Capped READV above fails closed instead. */
 				if (read_result == -2)
+				{
+					memset(ch->data, 0, page_size);
 					ch->result = 0;
+				}
 				else if (read_result < 0)
 					ch->status = PS_STATUS_ERROR;
 				else if (read_result > 0)
