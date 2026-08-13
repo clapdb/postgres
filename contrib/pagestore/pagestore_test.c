@@ -3499,6 +3499,25 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
 		  "branch truncate remains definitive at newest");
 
+	/* A later regrowth and less-severe shrink cannot erase the older hole in
+	 * inherited storage: block 7 was in the parent at the branch point, but the
+	 * truncate to 2 permanently fenced those bytes on this timeline. */
+	fill_page(p, ps, 8000, 58);
+	op_write_tl(3, REL_B, FORK0, 9, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 8, 9000);
+	check(!op_read_at_tl_found(3, REL_B, FORK0, 7, 9500, rb),
+		  "older branch truncate still fences parent bytes after regrowth");
+
+	/* Arrival order is not version order.  A delayed, older truncate must not
+	 * invalidate a page whose LSN is newer, even though its admission sequence
+	 * was allocated first. */
+	fill_page(p, ps, 10000, 59);
+	op_write_tl(3, REL_B, FORK0, 6, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 2, 9500);
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "delayed older truncate does not invalidate a newer page");
+
 	/* Kept event-free locally for the failed WAL-less write test below. */
 	op_create_branch(4, 0, 5000);
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
