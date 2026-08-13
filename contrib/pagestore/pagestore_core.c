@@ -1780,8 +1780,43 @@ page_frontier_advance(uint32_t timeline, uint64_t floor,
 	return 0;
 }
 
+/* A reader pin on a descendant is projected while compaction runs on an
+ * ancestor.  Match that same projection here: the ancestor's frontier may
+ * have advanced past the branch point while the projected page version is
+ * still deliberately retained.  Caller holds map_lock. */
 static int
-page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
+page_frontier_projected_fence_active(uint32_t reader_timeline,
+							 uint32_t timeline, uint64_t lsn,
+							 uint64_t admission_seq)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int active = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		uint64_t projected;
+
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 ||
+			pins[i].timeline != reader_timeline)
+			continue;
+		projected = pins[i].lsn;
+		if (retention_project_lsn(reader_timeline, timeline, &projected) &&
+			projected == lsn && pins[i].admission_seq == admission_seq)
+		{
+			active = 1;
+			break;
+		}
+	}
+	free(pins);
+	return active;
+}
+
+static int
+page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
+					 uint64_t lsn, uint64_t admission_seq)
 {
 	PsPruneFence frontier;
 
@@ -1794,7 +1829,9 @@ page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
 	if (admission_seq != 0 &&
 		lsn == frontier.lsn &&
 		admission_seq < frontier.admission_seq &&
-		!ps_retention_page_fence_active(timeline, lsn, admission_seq))
+		!ps_retention_page_fence_active(timeline, lsn, admission_seq) &&
+		!page_frontier_projected_fence_active(reader_timeline, timeline,
+									  lsn, admission_seq))
 		return 0;
 	return 1;
 }
@@ -4795,7 +4832,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 		/* page_reclaimed_frontier is published by compaction while holding the
 		 * map write lock.  Sample the two-word fence under the same lock. */
 		ps_lock_map_rd();
-		frontier_allows = page_frontier_allows(timeline, read_lsn, read_seq);
+		frontier_allows = page_frontier_allows(timeline, timeline, read_lsn, read_seq);
 		ps_unlock_map();
 		if (!frontier_allows)
 			return -2;
@@ -4831,7 +4868,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 
 				/* Compaction publishes the two-word frontier under map_lock. */
 				ps_lock_map_rd();
-				frontier_allows = page_frontier_allows(tl, rl, seq_cap);
+				frontier_allows = page_frontier_allows(tl, timeline, rl, seq_cap);
 				ps_unlock_map();
 				if (!frontier_allows)
 					return -2;
@@ -6129,8 +6166,8 @@ ps_handle_meta(PsChannel *ch)
 					 * frontier is stricter than the new point. */
 					ret = (((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
-							 !page_frontier_allows(tl, pin.lsn,
-												  pin.admission_seq) &&
+							 !page_frontier_allows(tl, tl, pin.lsn,
+													  pin.admission_seq) &&
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
@@ -6190,7 +6227,7 @@ ps_handle_meta(PsChannel *ch)
 					if (timeline_defined &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-						 page_frontier_allows(tl, pin.lsn, pin.admission_seq)))
+						 page_frontier_allows(tl, tl, pin.lsn, pin.admission_seq)))
 						ret = ps_retention_reserve_and_set(&pin);
 				}
 				if (ret == PS_RETENTION_OK)
