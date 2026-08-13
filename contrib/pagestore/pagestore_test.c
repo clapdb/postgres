@@ -670,7 +670,7 @@ op_wal_retain_floor(uint32_t timeline)
 
 static int
 op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
-				 uint32_t resources, uint64_t lsn)
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
@@ -678,19 +678,22 @@ op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
 	ch->parent_timeline = resources;
+	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	ch->req_lsn = lsn;
 	return cl_exec()->status;
 }
 
 static int
-op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id)
+op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				  uint32_t generation)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->opcode = PS_OP_RETENTION_PIN_DROP;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	return cl_exec()->status;
 }
@@ -713,6 +716,7 @@ op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
 		pin->timeline = ch->timeline;
 		pin->owner_kind = ch->blocknum;
 		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
 	}
@@ -2733,30 +2737,36 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  PS_STATUS_OK && floor == 0,
 		  "WAL retention starts unconstrained");
 	check(op_retention_set(99, PS_RETENTION_OWNER_READER, 1,
-						   PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_ERROR,
+						   1, PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_ERROR,
 		  "a pin cannot reference an undefined timeline");
-	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 1, 0, 1000) ==
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 1, 1, 0, 1000) ==
 		  PS_STATUS_ERROR,
 		  "a pin must name at least one known resource");
-	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 0) == PS_STATUS_ERROR,
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 0, 1) == PS_STATUS_ERROR,
 		  "owner id zero cannot drop a pin");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   0, PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_ERROR &&
+		  op_retention_drop(0, PS_RETENTION_OWNER_READER, 101, 0) ==
+			PS_STATUS_ERROR,
+		  "current retention IPC rejects reserved generation zero");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_ALL, &floor) ==
 		  PS_STATUS_ERROR,
 		  "a floor query names exactly one resource");
 
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
-						   PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
+						   1, PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
 		  "reader pin is durably registered");
 	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+						   1,
 						   PS_RETENTION_RESOURCE_WAL |
 						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) == PS_STATUS_OK,
 		  "materializer pin can retain WAL without page history");
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
-						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
+						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
 		  "configured page-history pin is registered");
 	check(op_retention_get(0, &pin, &count) && count == 3 &&
 		  pin.timeline == 0 && pin.owner_kind == PS_RETENTION_OWNER_READER &&
-		  pin.owner_id == 101 && pin.lsn == 5000,
+		  pin.owner_id == 101 && pin.generation == 1 && pin.lsn == 5000,
 		  "registry enumeration returns the first pin and total count");
 	check(op_retention_get(2, &pin, &count) && count == 3 &&
 		  pin.owner_kind == PS_RETENTION_OWNER_CONFIGURED && pin.owner_id == 303,
@@ -2774,19 +2784,30 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "WAL-index floor shares the resource registry");
 
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
-						   PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK,
+						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK,
 		  "SET atomically replaces the same owner generation");
 	check(stat(path, &before) == 0, "retention log exists after its first pin");
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
-						   PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK &&
+						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK &&
 		  stat(path, &after) == 0 && before.st_size == after.st_size,
 		  "an exact SET retry is idempotent without log churn");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 2000,
 		  "an owner update immediately lowers the effective floor");
-	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 101) == PS_STATUS_OK &&
-		  op_retention_drop(0, PS_RETENTION_OWNER_READER, 101) == PS_STATUS_OK,
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   2, PS_RETENTION_RESOURCE_ALL, 2500) == PS_STATUS_OK &&
+		  op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   1, PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_STALE,
+		  "a takeover fences SET from an older owner generation");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 101, 1) ==
+		  PS_STATUS_STALE,
+		  "an older owner generation cannot drop its replacement's pin");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 101, 2) == PS_STATUS_OK &&
+		  op_retention_drop(0, PS_RETENTION_OWNER_READER, 101, 2) == PS_STATUS_OK,
 		  "DROP is durable and idempotent");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
+						   2, PS_RETENTION_RESOURCE_ALL, 2500) == PS_STATUS_STALE,
+		  "a released generation cannot resurrect its pin");
 
 	op_create_branch(1, 0, 1500);
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
@@ -2796,7 +2817,7 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  PS_STATUS_OK && floor == 1500,
 		  "a child fork point structurally pins the parent WAL index");
 	check(op_retention_set(1, PS_RETENTION_OWNER_READER, 404,
-						   PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_OK,
+						   1, PS_RETENTION_RESOURCE_ALL, 1000) == PS_STATUS_OK,
 		  "a descendant reader pin is registered on its own timeline");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 1000,
@@ -2837,14 +2858,14 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 900,
 		  "projected effective floor survives restart");
-	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404) == PS_STATUS_OK,
+	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404, 1) == PS_STATUS_OK,
 		  "a restarted controller can release its durable pin");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 900,
 		  "dropping the reader leaves the nested structural fork floor");
 	for (uint64_t owner = 1000; owner < 2025; owner++)
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, owner,
-						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
+						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
 			  PS_STATUS_OK, "registry admits more owners than timelines");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 900,

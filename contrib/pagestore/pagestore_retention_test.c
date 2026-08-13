@@ -55,6 +55,8 @@ main(void)
 	char		backup[520];
 	char		current[520];
 	PsRetentionPin pin = {0};
+	PsRetentionPin legacy = {0};
+	PsRetentionPin fenced = {0};
 	PsRetentionPin got;
 	uint32_t	count = 0;
 	struct stat before,
@@ -72,10 +74,33 @@ main(void)
 	snprintf(backup, sizeof(backup), "%s.backup", path);
 	snprintf(current, sizeof(current), "%s.current", path);
 	check(ps_retention_open(dir) == 0, "open an empty registry");
+	legacy.timeline = 7;
+	legacy.owner_kind = PS_RETENTION_OWNER_READER;
+	legacy.resources = PS_RETENTION_RESOURCE_ALL;
+	legacy.owner_id = 41;
+	legacy.lsn = 80;
+	check(ps_retention_set(&legacy) == PS_RETENTION_OK &&
+		  ps_retention_drop(legacy.timeline, legacy.owner_kind, legacy.owner_id,
+							legacy.generation) == PS_RETENTION_OK,
+		  "generation zero can replay a legacy SET/DROP sequence");
+	legacy.lsn++;
+	check(ps_retention_set(&legacy) == PS_RETENTION_OK &&
+		  ps_retention_drop(legacy.timeline, legacy.owner_kind, legacy.owner_id,
+							legacy.generation) == PS_RETENTION_OK,
+		  "legacy generation zero may reuse an owner key after DROP");
+	fenced = legacy;
+	fenced.owner_id = 43;
+	fenced.generation = 5;
+	fenced.lsn = 90;
+	check(ps_retention_set(&fenced) == PS_RETENTION_OK &&
+		  ps_retention_drop(fenced.timeline, fenced.owner_kind, fenced.owner_id,
+							fenced.generation) == PS_RETENTION_OK,
+		  "a current generation is durably fenced on release");
 	pin.timeline = 7;
 	pin.owner_kind = PS_RETENTION_OWNER_READER;
 	pin.resources = PS_RETENTION_RESOURCE_ALL;
 	pin.owner_id = 42;
+	pin.generation = 1;
 	for (uint64_t i = 0; i < 70; i++)
 	{
 		pin.lsn = 100 + i;
@@ -91,8 +116,25 @@ main(void)
 
 	check(ps_retention_open(dir) == 0, "reopen compacted registry");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
-		  got.timeline == 7 && got.owner_id == 42 && got.lsn == 169,
+		  got.timeline == 7 && got.owner_id == 42 && got.generation == 1 &&
+		  got.lsn == 169,
 		  "compacted owner state survives replay");
+	check(ps_retention_set(&fenced) == PS_RETENTION_STALE,
+		  "compaction preserves a released generation tombstone");
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
+							pin.generation) == PS_RETENTION_OK,
+		  "release writes a durable generation tombstone");
+	ps_retention_close();
+	check(ps_retention_open(dir) == 0, "reopen a released owner tombstone");
+	check(ps_retention_count(&count) == 0 && count == 0,
+		  "generation tombstones are not live retention pins");
+	pin.lsn = 170;
+	check(ps_retention_set(&pin) == PS_RETENTION_STALE,
+		  "a released generation cannot resurrect after restart");
+	pin.generation = 2;
+	pin.lsn = 169;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+		  "a newer generation can replace a durable tombstone");
 	check(copy_file(path, backup) == 0, "save a same-sized valid old registry");
 	for (uint64_t i = 0; i < 70; i++)
 	{
@@ -164,7 +206,8 @@ main(void)
 		  "enable append fault injection");
 	check(ps_retention_open(faildir) == 0,
 		  "reopen registry with append fault injection");
-	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id) != 0,
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
+							pin.generation) != 0,
 		  "failed DROP is not acknowledged after a proven rollback");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.lsn == pin.lsn,
@@ -179,7 +222,8 @@ main(void)
 		  "enable retention append and rollback fault injection");
 	check(ps_retention_open(faildir) == 0,
 		  "reopen registry with rollback fault injection");
-	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id) != 0,
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
+							pin.generation) != 0,
 		  "failed full DROP with failed rollback is not acknowledged");
 	ps_retention_close();
 	unsetenv("PS_TEST_FAIL_RETENTION_APPEND_AFTER_WRITE");
