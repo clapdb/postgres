@@ -365,6 +365,7 @@ typedef struct PagestoreReaderSnapshotJobShmem
 	ControlFileData control;
 	uint64		generation;
 	uint64		completed_generation;
+	uint64		failed_generation;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -7813,6 +7814,13 @@ pagestore_reader_snapshot_worker_main(Datum main_arg)
 				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 				continue;
 			}
+			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+			if (pagestore_reader_snapshot_job->generation == generation)
+			{
+				pagestore_reader_snapshot_job->failed_generation = generation;
+				pagestore_reader_snapshot_job->completed_generation = generation;
+			}
+			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		}
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -10228,6 +10236,7 @@ pagestore_validate_datadir_branch_manifest(void)
 			   sizeof(ControlFileData));
 		pagestore_reader_snapshot_job->generation = 0;
 		pagestore_reader_snapshot_job->completed_generation = 0;
+		pagestore_reader_snapshot_job->failed_generation = 0;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -11916,6 +11925,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		PG_TRY();
 		{
 			uint64		membership_generation;
+			uint64		barrier_generation = 0;
 
 			databases = pagestore_reader_artifact_databases();
 			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
@@ -11929,16 +11939,23 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				ControlFileData job_control;
 				uint64 generation;
 				uint64 completed;
+				uint64 failed;
 
 				SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 				job_control = pagestore_reader_snapshot_job->control;
 				generation = pagestore_reader_snapshot_job->generation;
 				completed = pagestore_reader_snapshot_job->completed_generation;
+				failed = pagestore_reader_snapshot_job->failed_generation;
 				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+				if (failed > membership_generation)
+					ereport(ERROR,
+						(errmsg("reader snapshot generation %llu failed",
+								(unsigned long long) failed)));
 				if (generation > completed &&
 					generation > membership_generation)
 				{
 					barrier_lsn = job_control.checkPointCopy.redo;
+					barrier_generation = generation;
 					break;
 				}
 				if (generation == completed)
@@ -11957,6 +11974,15 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			while (!XLogRecPtrIsInvalid(barrier_lsn) &&
 				   !pagestore_reader_snapshot_ready_at(barrier_lsn))
 			{
+				uint64 failed;
+
+				SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+				failed = pagestore_reader_snapshot_job->failed_generation;
+				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+				if (failed >= barrier_generation)
+					ereport(ERROR,
+						(errmsg("reader snapshot generation %llu failed",
+								(unsigned long long) barrier_generation)));
 				(void) WaitLatch(MyLatch,
 					WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					100L, PG_WAIT_EXTENSION);
