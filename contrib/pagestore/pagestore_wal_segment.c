@@ -91,10 +91,10 @@ segment_identity_valid(const PsWalSegmentHeader *header)
 }
 
 int
-ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
-					uint64_t segment_no, uint64_t start_lsn,
-					uint32_t segment_size, const void *payload,
-					uint32_t payload_len)
+ps_wal_segment_seal_with_crc(PsWalSegmentHeader *header, uint32_t timeline,
+							 uint64_t segment_no, uint64_t start_lsn,
+							 uint32_t segment_size, const void *payload,
+							 uint32_t payload_len, uint32_t stored_payload_crc)
 {
 	uintptr_t hstart = (uintptr_t) header;
 	uintptr_t pstart = (uintptr_t) payload;
@@ -115,9 +115,22 @@ ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
 	header->segment_size = segment_size;
 	if (!segment_identity_valid(header))
 		return -1;
-	header->payload_crc = payload_crc(payload, payload_len);
+	header->payload_crc = stored_payload_crc;
 	header->header_crc = header_crc(header);
 	return 0;
+}
+
+int
+ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
+					uint64_t segment_no, uint64_t start_lsn,
+					uint32_t segment_size, const void *payload,
+					uint32_t payload_len)
+{
+	if (payload == NULL)
+		return -1;
+	return ps_wal_segment_seal_with_crc(header, timeline, segment_no,
+										start_lsn, segment_size, payload, payload_len,
+										payload_crc(payload, payload_len));
 }
 
 int

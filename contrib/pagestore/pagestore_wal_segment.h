@@ -27,9 +27,15 @@ typedef struct PsWalSegmentHeader
 } PsWalSegmentHeader;
 
 extern int ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
-							   uint64_t segment_no, uint64_t start_lsn,
-							   uint32_t segment_size, const void *payload,
-							   uint32_t payload_len);
+								   uint64_t segment_no, uint64_t start_lsn,
+								   uint32_t segment_size, const void *payload,
+								   uint32_t payload_len);
+/* Seal a header after a caller has already computed the FNV-1a payload CRC. */
+extern int ps_wal_segment_seal_with_crc(PsWalSegmentHeader *header,
+											uint32_t timeline, uint64_t segment_no,
+											uint64_t start_lsn, uint32_t segment_size,
+											const void *payload, uint32_t payload_len,
+											uint32_t payload_crc);
 extern int ps_wal_segment_validate(const PsWalSegmentHeader *header,
 								 const void *payload, uint32_t payload_len);
 extern int ps_wal_segment_encode(const PsWalSegmentHeader *header,
