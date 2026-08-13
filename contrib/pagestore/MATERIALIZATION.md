@@ -191,7 +191,8 @@ schema-4 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
 `socket_dir`, `log_file`, `state_dir`, and controller-owned
 `retention_authority_dir` paths, a PostgreSQL `port`, and a
 controller-assigned nonzero `retention_owner_id` that remains stable across
-replacement workers.  It also requires a globally unique
+replacement workers and is globally unique across every timeline managed by
+the authority directory (owner IDs are not merely timeline-local).  It also requires a globally unique
 `controller_instance_id`; generation authority records bind the consumer to
 that identity, and takeover from another identity fails closed until the old
 controller has explicitly quiesced and handed off its worker.

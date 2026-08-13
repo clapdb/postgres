@@ -194,6 +194,7 @@ class Config:
             except FileExistsError:
                 pass
             authority_stat = authority_dir.stat()
+            authority_parent_stat = authority_dir.parent.stat()
             if (
                 not stat.S_ISDIR(authority_stat.st_mode)
                 or authority_stat.st_uid != os.geteuid()
@@ -201,6 +202,13 @@ class Config:
             ):
                 raise ConfigError(
                     "retention_authority_dir must be owned by this user and mode 0700"
+                )
+            if (
+                authority_parent_stat.st_uid != os.geteuid()
+                or authority_parent_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ConfigError(
+                    "retention_authority_dir parent must be owner-controlled and not group/world writable"
                 )
             paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
@@ -342,27 +350,24 @@ class OwnerLock:
         self.close()
 
 
-def previous_status(path: Path, *, required_if_present: bool = False) -> dict[str, Any]:
+def previous_status(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return None
     except (OSError, json.JSONDecodeError) as error:
-        if required_if_present:
-            raise OwnershipError(f"materializer status is unreadable: {error}") from error
-        return {}
+        raise OwnershipError(f"materializer status is unreadable: {error}") from error
     if not isinstance(value, dict):
-        if required_if_present:
-            raise OwnershipError("materializer status is not a JSON object")
-        return {}
+        raise OwnershipError("materializer status is not a JSON object")
     return value
 
 
 class Supervisor:
     def __init__(self, config: Config) -> None:
         self.config = config
-        status_exists = config.status_file.exists()
-        old = previous_status(config.status_file, required_if_present=True)
+        old_value = previous_status(config.status_file)
+        status_exists = old_value is not None
+        old = old_value or {}
         old_epoch = old.get("owner_epoch", 0)
         old_generation = old.get("worker_generation", 0)
         old_retention_generation = old.get("retention_generation")
@@ -378,11 +383,14 @@ class Supervisor:
             or old_generation < 0
         ):
             old_generation = 0
-        authority_exists = config.retention_generation_file.exists()
-        authority = previous_status(config.retention_generation_file)
+        authority_value = previous_status(config.retention_generation_file)
+        authority_exists = authority_value is not None
+        authority = authority_value or {}
         authority_generation = authority.get("retention_generation")
         authority_data_dir = authority.get("consumer_data_dir")
         authority_instance_id = authority.get("consumer_instance_id")
+        authority_data_dev = authority.get("consumer_data_dev")
+        authority_data_ino = authority.get("consumer_data_ino")
         if authority_exists:
             if (
                 not isinstance(authority_generation, int)
@@ -401,6 +409,13 @@ class Supervisor:
                 raise OwnershipError(
                     "materializer retention generation authority lacks controller identity"
                 )
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in (authority_data_dev, authority_data_ino)
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority lacks filesystem identity"
+                )
             old_retention_generation = authority_generation
         elif status_exists:
             # Status did not durably identify the controller/consumer that
@@ -413,11 +428,15 @@ class Supervisor:
             old_retention_generation = 0
             authority_data_dir = None
             authority_instance_id = None
+            authority_data_dev = None
+            authority_data_ino = None
         self.owner_epoch = old_epoch + 1
         self.generation = old_generation
         self.retention_generation = old_retention_generation
         self.previous_consumer_data_dir = authority_data_dir
         self.previous_consumer_instance_id = authority_instance_id
+        self.previous_consumer_data_dev = authority_data_dev
+        self.previous_consumer_data_ino = authority_data_ino
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -574,16 +593,21 @@ class Supervisor:
         self.retention_generation += 1
         # Persist authority before the worker can register this generation.
         # Losing status.json after this point cannot cause generation reuse.
+        data_stat = self.config.data_dir.stat()
         atomic_write_json(
             self.config.retention_generation_file,
             {
                 "retention_generation": self.retention_generation,
                 "consumer_data_dir": str(self.config.data_dir),
                 "consumer_instance_id": self.config.controller_instance_id,
+                "consumer_data_dev": data_stat.st_dev,
+                "consumer_data_ino": data_stat.st_ino,
             },
         )
         self.previous_consumer_data_dir = str(self.config.data_dir)
         self.previous_consumer_instance_id = self.config.controller_instance_id
+        self.previous_consumer_data_dev = data_stat.st_dev
+        self.previous_consumer_data_ino = data_stat.st_ino
         self.publish("starting", reason=reason)
         server_options = (
             "-c pagestore.retention_owner_id="
@@ -613,6 +637,14 @@ class Supervisor:
         if not Path(previous).is_dir():
             raise OwnershipError(
                 "cannot prove the previous materializer consumer is quiesced"
+            )
+        previous_stat = Path(previous).stat()
+        if (
+            previous_stat.st_dev != self.previous_consumer_data_dev
+            or previous_stat.st_ino != self.previous_consumer_data_ino
+        ):
+            raise OwnershipError(
+                "previous materializer data directory identity changed"
             )
         status = self.command(
             [str(self.config.pg_ctl), "-D", previous, "status"], check=False

@@ -155,6 +155,8 @@ class SupervisorTests(unittest.TestCase):
                 "retention_generation": 11,
                 "consumer_data_dir": str(config.data_dir),
                 "consumer_instance_id": config.controller_instance_id,
+                "consumer_data_dev": config.data_dir.stat().st_dev,
+                "consumer_data_ino": config.data_dir.stat().st_ino,
             },
         )
         supervisor = MODULE.Supervisor(config)
@@ -212,6 +214,8 @@ class SupervisorTests(unittest.TestCase):
                 "retention_generation": 4,
                 "consumer_data_dir": str(first.data_dir),
                 "consumer_instance_id": first.controller_instance_id,
+                "consumer_data_dev": first.data_dir.stat().st_dev,
+                "consumer_data_ino": first.data_dir.stat().st_ino,
             },
         )
         clone = self.root / "clone"
@@ -259,6 +263,8 @@ class SupervisorTests(unittest.TestCase):
                 "retention_generation": 4,
                 "consumer_data_dir": str(config.data_dir),
                 "consumer_instance_id": "another-controller",
+                "consumer_data_dev": config.data_dir.stat().st_dev,
+                "consumer_data_ino": config.data_dir.stat().st_ino,
             },
         )
         supervisor = MODULE.Supervisor(config)
