@@ -76,6 +76,19 @@ read_all_at(int fd, void *data, size_t len, off_t offset)
 	return 0;
 }
 
+static uint32_t
+wal_payload_hash(uint32_t hash, const void *data, size_t len)
+{
+	const unsigned char *bytes = data;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
 static int
 random_suffix(char suffix[7])
 {
@@ -108,9 +121,11 @@ random_suffix(char suffix[7])
 	return 0;
 }
 
-static int load_validated_segment(PsWalStore *store,
-								  const PsWalSegmentHeader *expected,
-								  unsigned char **payload_out);
+static int read_validated_segment_range(PsWalStore *store,
+										const PsWalSegmentHeader *expected,
+										uint64_t range_off, unsigned char *out,
+										const unsigned char *compare,
+										size_t range_len);
 
 static int
 publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
@@ -244,8 +259,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	return 0;
 }
 
-/* Validate each immutable segment at most once, then compare the complete
- * overlapping range from that in-memory payload. */
+/* Start at the first overlapping entry.  Segment validation streams through a
+ * bounded buffer; retry comparison never allocates the full payload. */
 static int
 validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 						  const unsigned char *bytes, uint32_t prefix)
@@ -253,7 +268,8 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 	uint32_t done = 0;
 	uint64_t end_lsn = start_lsn + prefix;
 
-	for (uint32_t i = 0; i < store->nentries && done < prefix; i++)
+	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
+			 store->segment_size); i < store->nentries && done < prefix; i++)
 	{
 		const PsWalSegmentHeader *header = &store->entries[i].header;
 		uint64_t segment_end = header->start_lsn + header->payload_len;
@@ -263,13 +279,11 @@ validate_committed_prefix(PsWalStore *store, uint64_t start_lsn,
 
 		if (overlap_start < overlap_end)
 		{
-			unsigned char *payload = NULL;
 			size_t amount = (size_t) (overlap_end - overlap_start);
 
-			if (load_validated_segment(store, header, &payload) != 0)
-				return -1;
-			if (memcmp(payload + (overlap_start - header->start_lsn),
-					   bytes + (overlap_start - start_lsn), amount) != 0)
+			if (read_validated_segment_range(store, header,
+					overlap_start - header->start_lsn, NULL,
+					bytes + (overlap_start - start_lsn), amount) != 0)
 				return -1;
 			done += (uint32_t) amount;
 		}
@@ -287,6 +301,7 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	if (store == NULL || store->directory_fd < 0 || data == NULL || len == 0 ||
 		start_lsn % store->segment_size != 0 ||
 		len % store->segment_size != 0 ||
+		start_lsn < store->start_lsn ||
 		start_lsn > store->end_lsn || start_lsn + len < start_lsn ||
 		start_lsn + len < store->end_lsn)
 		return -1;
@@ -332,34 +347,58 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 }
 
 static int
-load_validated_segment(PsWalStore *store,
-					   const PsWalSegmentHeader *expected,
-					   unsigned char **payload_out)
+read_validated_segment_range(PsWalStore *store,
+						 const PsWalSegmentHeader *expected,
+						 uint64_t range_off, unsigned char *out,
+						 const unsigned char *compare, size_t range_len)
 {
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char buf[64 * 1024];
 	PsWalSegmentHeader actual;
 	struct stat st;
-	struct stat path_st;
 	char name[128];
-	unsigned char *payload = NULL;
+	uint32_t hash = 2166136261u;
+	uint64_t done = 0;
 	int fd = -1;
 	int rc = -1;
 
 	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
-		fstatat(store->directory_fd, name, &path_st, 0) != 0)
+		(fd = openat(store->directory_fd, name, O_RDONLY)) < 0 ||
+		fstat(fd, &st) != 0)
 		goto cleanup;
-	if (store->cached_payload != NULL &&
-		store->cached_segment_no == expected->segment_no &&
-		store->cached_dev == path_st.st_dev && store->cached_ino == path_st.st_ino &&
-		store->cached_size == path_st.st_size &&
-		store->cached_mtime.tv_sec == path_st.st_mtim.tv_sec &&
-		store->cached_mtime.tv_nsec == path_st.st_mtim.tv_nsec)
+	if (store->cached_segment_no == expected->segment_no &&
+		store->cached_dev == st.st_dev && store->cached_ino == st.st_ino &&
+		store->cached_size == st.st_size &&
+		store->cached_mtime.tv_sec == st.st_mtim.tv_sec &&
+		store->cached_mtime.tv_nsec == st.st_mtim.tv_nsec)
 	{
-		*payload_out = store->cached_payload;
-		return 0;
+		if (range_off + range_len < range_off ||
+			range_off + range_len > expected->payload_len)
+			goto cleanup;
+		if (out != NULL && read_all_at(fd, out, range_len,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) range_off) != 0)
+			goto cleanup;
+		if (compare != NULL)
+		{
+			size_t compared = 0;
+
+			while (compared < range_len)
+			{
+				size_t amount = range_len - compared < sizeof(buf) ?
+					range_len - compared : sizeof(buf);
+
+				if (read_all_at(fd, buf, amount,
+						PS_WAL_SEGMENT_HEADER_BYTES + (off_t) range_off +
+						(off_t) compared) != 0 ||
+					memcmp(buf, compare + compared, amount) != 0)
+					goto cleanup;
+				compared += amount;
+			}
+		}
+		rc = 0;
+		goto cleanup;
 	}
-	if ((fd = openat(store->directory_fd, name, O_RDONLY)) < 0 || fstat(fd, &st) != 0 ||
-		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
+	if (st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
 						 expected->payload_len) ||
 		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
 		ps_wal_segment_decode(&actual, encoded, sizeof(encoded)) != 0)
@@ -368,27 +407,50 @@ load_validated_segment(PsWalStore *store,
 		actual.segment_no != expected->segment_no ||
 		actual.start_lsn != expected->start_lsn ||
 		actual.payload_len != expected->payload_len ||
+		actual.segment_size != expected->segment_size ||
 		actual.payload_crc != expected->payload_crc)
 		goto cleanup;
-	payload = malloc(actual.payload_len);
-	if (payload == NULL ||
-		read_all_at(fd, payload, actual.payload_len,
-					PS_WAL_SEGMENT_HEADER_BYTES) != 0 ||
-		ps_wal_segment_validate(&actual, payload, actual.payload_len) != 0)
+	if (range_off + range_len < range_off ||
+		range_off + range_len > actual.payload_len)
 		goto cleanup;
-	free(store->cached_payload);
-	store->cached_payload = payload;
+	while (done < actual.payload_len)
+	{
+		size_t amount = actual.payload_len - done < sizeof(buf) ?
+			(size_t) (actual.payload_len - done) : sizeof(buf);
+		uint64_t chunk_start = done;
+		uint64_t chunk_end = done + amount;
+		uint64_t copy_start = range_off > chunk_start ? range_off : chunk_start;
+		uint64_t copy_end = range_off + range_len < chunk_end ?
+			range_off + range_len : chunk_end;
+
+		if (read_all_at(fd, buf, amount,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0)
+			goto cleanup;
+		hash = wal_payload_hash(hash, buf, amount);
+		if (copy_start < copy_end)
+		{
+			size_t copy_len = (size_t) (copy_end - copy_start);
+			const unsigned char *source = buf + (copy_start - chunk_start);
+			size_t target_off = (size_t) (copy_start - range_off);
+
+			if (out != NULL)
+				memcpy(out + target_off, source, copy_len);
+			if (compare != NULL &&
+				memcmp(source, compare + target_off, copy_len) != 0)
+				goto cleanup;
+		}
+		done += amount;
+	}
+	if (hash != actual.payload_crc)
+		goto cleanup;
 	store->cached_segment_no = expected->segment_no;
 	store->cached_dev = st.st_dev;
 	store->cached_ino = st.st_ino;
 	store->cached_size = st.st_size;
 	store->cached_mtime = st.st_mtim;
-	*payload_out = payload;
-	payload = NULL;
 	rc = 0;
 
 cleanup:
-	free(payload);
 	if (fd >= 0)
 		close(fd);
 	return rc;
@@ -418,13 +480,12 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 
 		if (overlap_start < overlap_end)
 		{
-			unsigned char *payload = NULL;
 			size_t amount = (size_t) (overlap_end - overlap_start);
 
-			if (load_validated_segment(store, header, &payload) != 0)
+			if (read_validated_segment_range(store, header,
+					overlap_start - header->start_lsn,
+					out + (overlap_start - start_lsn), NULL, amount) != 0)
 				return -1;
-			memcpy(out + (overlap_start - start_lsn),
-				   payload + (overlap_start - header->start_lsn), amount);
 			done += (uint32_t) amount;
 		}
 	}
@@ -439,7 +500,6 @@ ps_wal_store_close(PsWalStore *store)
 	if (store->directory_fd >= 0)
 		close(store->directory_fd);
 	free(store->entries);
-	free(store->cached_payload);
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
 }

@@ -140,6 +140,34 @@ main(void)
 	fd = open(path, O_RDWR);
 	if (fd >= 0)
 	{
+		PsWalSegmentHeader mismatched;
+
+		check(ps_wal_segment_seal(&mismatched, 7, 0, 0,
+								  2 * TEST_SEGMENT_BYTES, input,
+								  TEST_SEGMENT_BYTES) == 0 &&
+			  ps_wal_segment_encode(&mismatched, encoded) == 0 &&
+			  pwrite_all(fd, encoded, sizeof(encoded), 0) == 0,
+			  "replace a segment header with a mismatched segment size");
+		close(fd);
+	}
+	check(fd >= 0 && ps_wal_store_read(&store, 10, window, 1) != 0,
+		  "read rejects a persisted segment-size mismatch");
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		PsWalSegmentHeader restored;
+
+		check(ps_wal_segment_seal(&restored, 7, 0, 0,
+								  TEST_SEGMENT_BYTES, input,
+								  TEST_SEGMENT_BYTES) == 0 &&
+			  ps_wal_segment_encode(&restored, encoded) == 0 &&
+			  pwrite_all(fd, encoded, sizeof(encoded), 0) == 0,
+			  "restore the canonical segment header after mismatch test");
+		close(fd);
+	}
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
 		PsWalSegmentHeader replacement;
 		unsigned char *different = malloc(TEST_SEGMENT_BYTES);
 
