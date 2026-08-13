@@ -2661,8 +2661,6 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 500);
-	fill_page(page, ps, 600, 19);
-	op_write_tl(0, rel, 0, 0, page);
 	for (uint32_t cycle = 0; cycle < 12; cycle++)
 	{
 		uint64_t	before;
@@ -2711,6 +2709,16 @@ run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "restart recovers compacted newest page for block %u", block);
+	}
 	{
 		uint64_t before = 0;
 		uint64_t restart_scanned,

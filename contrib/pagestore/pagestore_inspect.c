@@ -92,16 +92,30 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 static void
 print_pruning(PsShmHeader *hdr)
 {
+	uint64_t seq_before,
+			 seq_after,
+			 compactions,
+			 scanned,
+			 kept,
+			 deleted;
+
+	do
+	{
+		seq_before = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
+		if (seq_before & 1)
+			continue;
+		compactions = ps_load_acquire_u64(&hdr->page_prune_compactions);
+		scanned = ps_load_acquire_u64(&hdr->page_prune_versions_scanned);
+		kept = ps_load_acquire_u64(&hdr->page_prune_versions_kept);
+		deleted = ps_load_acquire_u64(&hdr->page_prune_versions_deleted);
+		seq_after = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
+	} while (seq_before != seq_after || (seq_after & 1));
 	printf("{\"compactions\":%llu,\"versions_scanned\":%llu,"
 		   "\"versions_kept\":%llu,\"versions_deleted\":%llu}\n",
-		   (unsigned long long)
-		   ps_load_acquire_u64(&hdr->page_prune_compactions),
-		   (unsigned long long)
-		   ps_load_acquire_u64(&hdr->page_prune_versions_scanned),
-		   (unsigned long long)
-		   ps_load_acquire_u64(&hdr->page_prune_versions_kept),
-		   (unsigned long long)
-		   ps_load_acquire_u64(&hdr->page_prune_versions_deleted));
+		   (unsigned long long) compactions,
+		   (unsigned long long) scanned,
+		   (unsigned long long) kept,
+		   (unsigned long long) deleted);
 }
 
 int

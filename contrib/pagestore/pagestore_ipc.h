@@ -320,6 +320,7 @@ typedef struct PsShmHeader
 	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
 	uint32_t	wal_index_lagging_timelines;
 	uint32_t	pad2;
+	uint64_t	page_prune_metrics_seq;
 	uint64_t	page_prune_compactions;
 	uint64_t	page_prune_versions_scanned;
 	uint64_t	page_prune_versions_kept;
