@@ -54,30 +54,6 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 		keep[base] = 1;
 		kept++;
 	}
-	/* A later fence can move forward in LSN while lowering its admission
-	 * sequence.  Preserve the reverse record-low staircase below the current
-	 * base so that each such legal fence still has a visible version. */
-	if (base >= 0)
-	{
-		uint64_t lowest_seq = versions[base].admission_seq;
-
-		for (int i = base - 1; i >= 0; i--)
-		{
-			if (i + 1 < n && versions[i].lsn == versions[i + 1].lsn &&
-				versions[i].admission_seq == versions[i + 1].admission_seq)
-				continue;
-			if (versions[i].admission_seq == 0 ||
-				(lowest_seq != 0 && versions[i].admission_seq < lowest_seq))
-			{
-				if (!keep[i])
-				{
-					keep[i] = 1;
-					kept++;
-				}
-				lowest_seq = versions[i].admission_seq;
-			}
-		}
-	}
 	for (uint32_t f = 0; f < nfences; f++)
 	{
 		int visible = -1;
