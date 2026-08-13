@@ -552,7 +552,7 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 			(fd = open_regular_segment_at(store, name, &st)) < 0 ||
 			read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
 			ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
-			header.payload_len != PS_WAL_SEGMENT_PAYLOAD_BYTES ||
+			header.payload_len != header.segment_size ||
 			(uint64_t) st.st_size != PS_WAL_SEGMENT_HEADER_BYTES +
 				header.payload_len)
 		{
@@ -577,9 +577,12 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 		fd = -1;
 		if (ps_wal_segment_validate(&header, payload, header.payload_len) != 0 ||
 			header.timeline != timeline || header.segment_no != numbers[i] ||
+			(i != 0 && header.segment_size != store->segment_size) ||
 			(i != 0 && header.start_lsn != expected_lsn) ||
 			reserve_entry(store) != 0)
 			goto cleanup;
+		if (i == 0)
+			store->segment_size = (uint32_t) header.segment_size;
 		if (i == 0)
 			store->start_lsn = header.start_lsn;
 		expected_lsn = header.start_lsn + header.payload_len;

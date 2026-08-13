@@ -223,7 +223,7 @@ main(void)
 	fd = open(path, O_RDWR);
 	check(fd >= 0 && ps_wal_segment_encode(&header, encoded) == 0 &&
 		  pwrite_all(fd, encoded, sizeof(encoded), 0) == 0 &&
-		  pwrite_all(fd, input, PS_WAL_SEGMENT_PAYLOAD_BYTES,
+		  pwrite_all(fd, input, TEST_SEGMENT_BYTES,
 					 PS_WAL_SEGMENT_HEADER_BYTES) == 0 && fsync(fd) == 0,
 		  "restore the published segment after replacement test");
 	if (fd >= 0)
@@ -253,12 +253,12 @@ main(void)
 	check(ps_wal_store_open(&store, directory, 7) == 0 &&
 		  access(path, F_OK) != 0 && store.nentries == 3 &&
 		  store.start_lsn == 0 &&
-		  store.end_lsn == first_len + PS_WAL_SEGMENT_PAYLOAD_BYTES,
+		  store.end_lsn == first_len + TEST_SEGMENT_BYTES,
 		  "reopen reclaims a canonical orphan and reconstructs the WAL range");
 	check(ps_wal_store_read(&store,
-						PS_WAL_SEGMENT_PAYLOAD_BYTES - 64,
+						TEST_SEGMENT_BYTES - 64,
 						window, 128) == 0 &&
-		  memcmp(window, input + PS_WAL_SEGMENT_PAYLOAD_BYTES - 64, 128) == 0,
+		  memcmp(window, input + TEST_SEGMENT_BYTES - 64, 128) == 0,
 		  "reopened store reads across a segment boundary");
 	ps_wal_store_close(&store);
 
