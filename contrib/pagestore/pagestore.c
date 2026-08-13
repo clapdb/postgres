@@ -7867,8 +7867,7 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 		return;
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	if (pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation &&
-		pagestore_reader_snapshot_job->reserved_generation == 0)
+		pagestore_reader_snapshot_job->completed_generation)
 	{
 		pagestore_reader_snapshot_job->control = *control;
 		pagestore_reader_snapshot_job->generation++;

@@ -202,7 +202,7 @@ ls_attach(void)
 		close(fd);
 		ereport(ERROR,
 				(errmsg("pagestore localsvc shared memory incompatible"),
-				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
+				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
 						   got_page_size, BLCKSZ, got_magic, got_version)));
 	}
 	ls_shm = shm;
