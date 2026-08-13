@@ -298,6 +298,42 @@ build_chunk_hashes(const void *payload, uint32_t payload_len,
 }
 
 static int
+load_validated_chunk_hashes(int fd, const PsWalSegmentHeader *header,
+							uint32_t **hashes_out, uint32_t *nchunks_out)
+{
+	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
+	uint32_t	nchunks = (header->payload_len + sizeof(buf) - 1) / sizeof(buf);
+	uint32_t   *hashes = malloc((size_t) nchunks * sizeof(*hashes));
+	uint32_t	whole_hash = 2166136261u;
+
+	if (hashes == NULL)
+		return -1;
+	for (uint32_t i = 0; i < nchunks; i++)
+	{
+		uint64_t off = (uint64_t) i * sizeof(buf);
+		size_t amount = header->payload_len - off < sizeof(buf) ?
+			(size_t) (header->payload_len - off) : sizeof(buf);
+
+		if (read_all_at(fd, buf, amount,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) off) != 0)
+		{
+			free(hashes);
+			return -1;
+		}
+		hashes[i] = wal_payload_hash(2166136261u, buf, amount);
+		whole_hash = wal_payload_hash(whole_hash, buf, amount);
+	}
+	if (whole_hash != header->payload_crc)
+	{
+		free(hashes);
+		return -1;
+	}
+	*hashes_out = hashes;
+	*nchunks_out = nchunks;
+	return 0;
+}
+
+static int
 random_suffix(char suffix[7])
 {
 	static const char alphabet[] =
@@ -563,6 +599,8 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline,
 		unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
 		PsWalSegmentHeader header;
 		struct stat st;
+		uint32_t   *chunk_hashes = NULL;
+		uint32_t	nchunks = 0;
 		int fd = -1;
 
 		if (numbers[i] != numbers[0] + i ||
@@ -578,21 +616,27 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline,
 				close(fd);
 			goto cleanup;
 		}
-		if (close(fd) != 0)
-		{
-			fd = -1;
-			goto cleanup;
-		}
-		fd = -1;
 		if (header.timeline != timeline || header.segment_no != numbers[i] ||
 			header.segment_size != store->segment_size ||
 			(i == 0 ? header.start_lsn != store->start_lsn :
 			 header.start_lsn != expected_lsn) ||
-			read_validated_segment_range(store, &header, 0, NULL, NULL, 0) != 0 ||
-			reserve_entry(store) != 0)
+			reserve_entry(store) != 0 ||
+			load_validated_chunk_hashes(fd, &header, &chunk_hashes, &nchunks) != 0)
+		{
+			close(fd);
 			goto cleanup;
+		}
+		if (close(fd) != 0)
+		{
+			free(chunk_hashes);
+			goto cleanup;
+		}
+		fd = -1;
 		expected_lsn = header.start_lsn + header.payload_len;
-		store->entries[store->nentries++].header = header;
+		store->entries[store->nentries].header = header;
+		store->entries[store->nentries].chunk_hashes = chunk_hashes;
+		store->entries[store->nentries].nchunks = nchunks;
+		store->nentries++;
 	}
 	store->next_segment_no = numbers[0] + count;
 	store->end_lsn = expected_lsn;
