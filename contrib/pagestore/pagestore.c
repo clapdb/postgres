@@ -7156,13 +7156,14 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 										const char *mapdir)
 {
 	char		map_path[MAXPGPATH];
+	char		version_path[MAXPGPATH];
+	char		tablespace_link[MAXPGPATH];
 	char		parent[MAXPGPATH];
 	char		data[PAGESTORE_READER_RELMAP_MAX_SIZE];
 	struct stat st;
 	pg_crc32c	data_crc;
 	Size		data_size;
 	int			len;
-	bool		created = false;
 
 	len = snprintf(map_path, sizeof(map_path), "%s/pg_filenode.map", mapdir);
 	PS_CHECK_PATH_FORMAT(len, map_path);
@@ -7172,18 +7173,34 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 		!pagestore_load_reader_relmap(dbid, tsid, read_lsn, &data_crc,
 									 data, &data_size))
 		return false;
+	if (tsid != DEFAULTTABLESPACE_OID && tsid != GLOBALTABLESPACE_OID)
+	{
+		len = snprintf(tablespace_link, sizeof(tablespace_link),
+					   "pg_tblspc/%u", tsid);
+		PS_CHECK_PATH_FORMAT(len, tablespace_link);
+		if (lstat(tablespace_link, &st) != 0 || !S_ISLNK(st.st_mode))
+			ereport(ERROR,
+					(errmsg("reader tablespace %u is not provisioned", tsid),
+					 errhint("Reprovision the reader so pg_tblspc/%u names the writer tablespace.", tsid)));
+		strlcpy(parent, mapdir, sizeof(parent));
+		if (pg_mkdir_p(parent, pg_dir_create_mode) < 0 && errno != EEXIST)
+			return false;
+	}
 	if (lstat(mapdir, &st) != 0)
 	{
 		if (errno != ENOENT || (MakePGDirectory(mapdir) != 0 && errno != EEXIST))
 			return false;
-		created = true;
 	}
 	else if (!S_ISDIR(st.st_mode))
 		return false;
-	if (created)
+	len = snprintf(version_path, sizeof(version_path), "%s/PG_VERSION", mapdir);
+	PS_CHECK_PATH_FORMAT(len, version_path);
+	if (lstat(version_path, &st) != 0)
 	{
 		static const char version[] = PG_MAJORVERSION "\n";
 
+		if (errno != ENOENT)
+			return false;
 		strlcpy(parent, mapdir, sizeof(parent));
 		get_parent_directory(parent);
 		fsync_fname(parent, true);
@@ -7191,6 +7208,8 @@ pagestore_install_missing_reader_database(Oid dbid, Oid tsid,
 							   "reader database version", version,
 							   (int) strlen(version));
 	}
+	else if (!S_ISREG(st.st_mode))
+		return false;
 	pagestore_publish_artifact(mapdir, "pg_filenode.map",
 							   "reader relation map", data, (int) data_size);
 	return true;
@@ -11896,13 +11915,15 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		}
 		PG_TRY();
 		{
-			XLogRecPtr membership_lsn;
+			uint64		membership_generation;
 
 			databases = pagestore_reader_artifact_databases();
-			membership_lsn = GetRedoRecPtr();
-			/* First obtain a non-replaceable job whose checkpoint is no older than
-			 * the locked database membership.  An older outstanding job is allowed
-			 * to finish, then the empty slot receives our forced checkpoint. */
+			SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+			membership_generation = pagestore_reader_snapshot_job->generation;
+			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
+			/* Require a checkpoint job created after the database membership lock.
+			 * An older outstanding job is allowed to finish, then the empty slot
+			 * receives our forced checkpoint. */
 			while (XLogRecPtrIsInvalid(barrier_lsn))
 			{
 				ControlFileData job_control;
@@ -11915,7 +11936,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				completed = pagestore_reader_snapshot_job->completed_generation;
 				SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 				if (generation > completed &&
-					job_control.checkPointCopy.redo >= membership_lsn)
+					generation > membership_generation)
 				{
 					barrier_lsn = job_control.checkPointCopy.redo;
 					break;
