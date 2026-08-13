@@ -211,6 +211,13 @@ preparation validates and temporarily pins both WAL and page history at `C`
 before seeding: WAL protects the replay stream, while page history protects the
 exact SLRU image that seeding must resolve at `C`.  Both protections remain
 until the branch artifact and its structural retention are durable.
+Temporary pins belong to a durable branch-preparation operation ID with
+`preparing -> committed|aborting -> complete` transitions.  Success converts
+them atomically to structural retention; abort first fences the operation and
+drains admitted seeding, then authoritatively drops both pins.  Restart resumes
+either transition idempotently, so an abandoned preparation cannot leave an
+unbounded orphan.  Fault tests stop before and after every state publication,
+pin SET/DROP, seeding drain, and structural handoff.
 
 Deliverables:
 
@@ -263,7 +270,9 @@ Deliverables:
   represented exactly once in the replacement metadata or its tail.  Crash
   tests overlap appends with every metadata publication boundary;
 - append/read across physical segment boundaries and branch ancestry;
-- reclamation driven by the WAL effective floor;
+- reclamation driven by an independently advancing operational WAL cutoff;
+  fixed-reader and branch fences retain only their discrete replacement bases
+  and do not pin every later WAL record;
 - the authoritative per-timeline WAL retained-base frontier is durably
   published before any segment below it is unlinked.  SET and branch admission
   consult that same metadata; crash tests stop between frontier publication and
@@ -308,8 +317,9 @@ Status: **not started; blocked on R1**.
 Deliverables:
 
 - compacted per-(timeline, shard) durable index representation;
-- removal of entries strictly below the WAL-index effective floor while
-  retaining the necessary base/read boundary;
+- removal below an independently advancing operational WAL-index cutoff while
+  retaining the necessary reconstruction base at every fixed owner/branch
+  fence;
 - atomic publication and old-log deletion;
 - bounded startup replay and compaction scheduling off serve threads.
 
@@ -330,6 +340,11 @@ compactor freezes an append sequence under the shard append lock, publishes a
 replacement through that sequence, then hands off and durably appends any tail
 before replacing the old log.  This includes the shard-0 durable progress
 record; acknowledged concurrent appends can never be omitted by publication.
+Publication also runs on the owning shard's run-to-completion path and drains
+all admitted `walidx_get()` readers before retiring the old arrays/log.  An
+equivalent epoch/reference scheme is acceptable only if old representations
+remain reachable until their final reader exits; tests overlap reads with
+cutover and retirement.
 
 Acceptance:
 
@@ -351,9 +366,10 @@ current-state-only metadata.
 
 Deliverables:
 
-- compaction against a proven forkmeta GC cutoff: the effective owner fence, or
-  (when it is unconstrained) the latest durably materialized timeline fence;
-  fail closed when neither is available and persist the reclaimed frontier;
+- compaction against an independently advancing operational forkmeta cutoff;
+  each owner/branch fence below it retains only the exact visible base tuple.
+  With no proven operational cutoff compaction fails closed and does not use a
+  fixed owner's minimum as the moving cutoff;
 - discrete descendant fork fences retained as required historical bases rather
   than projected as a moving floor that pins all later parent metadata;
 - for each relation incarnation and each retained owner/branch fence, the
@@ -362,6 +378,9 @@ Deliverables:
   cutoff;
 - preservation of same-LSN admission ordering needed by retained reader
   fences;
+- restartpoint/materialization publication captures and durably stores a full
+  `(LSN, admission_sequence)` barrier; an LSN-only marker never authorizes a
+  page or forkmeta cutoff when same-LSN mutations can exist;
 - bounded replay from an atomically published checkpoint plus tail, with the
   old log removed only after the replacement and directory entry are durable.
 - an append cutover barrier or sequence handoff: publication freezes a precise
