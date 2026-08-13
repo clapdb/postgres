@@ -431,6 +431,11 @@ Deliverables:
   increasing timeline incarnation generation;
 - idempotent removal of manifests, layers, page segments, WAL, WAL index,
   control/SLRU metadata, fork metadata, and object-tier copies;
+- remote uploads use a durable operation identity or upload-intent record
+  published before object creation.  Startup and deletion reconcile every
+  completed-but-unpublished upload, so a crash between `upload_layer()` and
+  manifest publication cannot leave an undiscoverable object or collide with
+  a reused layer identity;
 - shard page segments shared with live timelines are reclaimed only by a
   crash-safe filtered rewrite plus durable coverage transition; deletion never
   unlinks a mixed source segment and never permits ID reuse while an
@@ -458,7 +463,13 @@ Deliverables:
   or below that frontier remains an explicit durable exception.  Allocation
   must durably reserve that exception before returning a token to its caller,
   or frontier advancement must be capped by a controller-published safe
-  allocation watermark.  Exceptions persist a live/closed state: only a live
+  allocation watermark.  Each reservation carries a durable, idempotent
+  allocation-operation identity before token delivery.  On retry or startup,
+  the controller either returns the same token or durably closes an
+  undelivered reservation after proving no caller can possess it; fault tests
+  cover crashes before reservation, after reservation, and during token
+  delivery so interrupted allocations cannot accumulate permanent live
+  exceptions.  Exceptions persist a live/closed state: only a live
   exception admits SET/DROP, while a closed exception rejects all new mutations
   but remains until already-admitted operations drain.  Removing it then makes the
   already-advanced frontier reject delayed mutations.  Thus metadata is bounded
@@ -562,7 +573,8 @@ Required scenario families:
 - materializer replay/restartpoint/durable-marker publication;
 - branch prepare, receipt publication, bootstrap install, and service restore;
 - manifest replacement and image-layer seal/publication;
-- page pruning, WAL reclaim, WAL-index compaction, and timeline deletion;
+- page pruning, WAL reclaim, WAL-index compaction, remote upload intent and
+  orphan reconciliation, and timeline deletion;
 - daemon, writer, materializer, and branch-compute restart combinations.
 
 Acceptance:
@@ -606,7 +618,7 @@ measurement proves they block the acceptance scenarios:
 
 - user-tablespace portable branch bootstrap;
 - materializer PGDATA provisioning and service-manager integration;
-- object-tier cache budget/residency and orphan reconciliation;
+- object-tier cache budget/residency;
 - production S3 provider;
 - sparse image indexes and a separate layer-block cache;
 - immutable WAL delta sealing and bounded redo-chain compaction;
