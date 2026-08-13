@@ -363,13 +363,12 @@ typedef struct PagestoreReaderSnapshotJobShmem
 {
 	slock_t		mutex;
 	ControlFileData control;
-	ControlFileData pending_control;
 	uint64		generation;
 	uint64		completed_generation;
 	uint64		failed_generation;
 	uint64		reserved_generation;
+	XLogRecPtr	reserved_lsn;
 	int			reservation_owner_pid;
-	bool		pending;
 } PagestoreReaderSnapshotJobShmem;
 
 static PagestoreReaderHorizonShmem *pagestore_reader_horizon = NULL;
@@ -6784,33 +6783,6 @@ pagestore_database_reader_manifest_ready(Oid dbid, XLogRecPtr read_lsn)
 		EQ_CRC32C(manifest.crc, checked.crc);
 }
 
-static XLogRecPtr
-pagestore_latest_reader_snapshot_ready(void)
-{
-	PagestoreReaderSnapshotReady ready;
-	PagestoreReaderSnapshotReady checked;
-	PageStoreRelKey key = pagestore_reader_snapshot_key(
-		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
-	char		page[BLCKSZ];
-	uint64		resolved = 0;
-
-	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, 0, PG_UINT64_MAX, page, &resolved,
-			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
-		return InvalidXLogRecPtr;
-	memcpy(&ready, page, sizeof(ready));
-	checked = ready;
-	pagestore_reader_snapshot_ready_crc(&checked);
-	if (ready.header.magic != PAGESTORE_READER_SNAPSHOT_MAGIC ||
-		ready.header.format != PAGESTORE_READER_SNAPSHOT_FORMAT ||
-		ready.header.timeline != pagestore_localsvc_timeline() ||
-		ready.header.read_lsn != (XLogRecPtr) resolved ||
-		ready.block_count == 0 || ready.reserved != 0 ||
-		!EQ_CRC32C(ready.crc, checked.crc))
-		return InvalidXLogRecPtr;
-	return (XLogRecPtr) resolved;
-}
-
 static bool
 pagestore_reader_snapshot_ready_at(XLogRecPtr read_lsn)
 {
@@ -7995,20 +7967,10 @@ pagestore_publish_checkpoint_reader_snapshot(const ControlFileData *control)
 		return;
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	if (pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation &&
-		pagestore_reader_snapshot_job->reserved_generation == 0)
+		pagestore_reader_snapshot_job->completed_generation)
 	{
 		pagestore_reader_snapshot_job->control = *control;
 		pagestore_reader_snapshot_job->generation++;
-	}
-	else if (pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation)
-	{
-		/* The artifact launcher must keep its exact-R READY object as the
-		 * newest one until the database barrier commits.  Preserve the newest
-		 * checkpoint meanwhile and promote it when that reservation ends. */
-		pagestore_reader_snapshot_job->pending_control = *control;
-		pagestore_reader_snapshot_job->pending = true;
 	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 }
@@ -8101,6 +8063,7 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 	PageStoreRelKey key;
 	char		page[BLCKSZ];
 	uint64		resolved = 0;
+	uint64		target = PG_UINT64_MAX;
 	BlockNumber nblocks;
 	pg_crc32c	current_global_crc;
 	pg_crc32c	current_local_crc;
@@ -8117,8 +8080,12 @@ pagestore_publish_database_reader_manifest(PG_FUNCTION_ARGS)
 				 errmsg("reader manifest publication requires a fully routed writable pagestore compute")));
 	key = pagestore_reader_snapshot_key(
 		PAGESTORE_READER_SNAPSHOT_READY_OBJECT, InvalidOid);
+	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
+	if (pagestore_reader_snapshot_job->reserved_generation != 0)
+		target = pagestore_reader_snapshot_job->reserved_lsn;
+	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 	if (!pagestore_localsvc_obj_read_at_timeout(PS_KLASS_READER_SNAPSHOT,
-			&key, 0, PG_UINT64_MAX, page, &resolved,
+			&key, 0, target, page, &resolved,
 			PAGESTORE_READER_SNAPSHOT_IO_TIMEOUT_MS))
 		PG_RETURN_NULL();
 	memcpy(&ready, page, sizeof(ready));
@@ -10481,8 +10448,8 @@ pagestore_validate_datadir_branch_manifest(void)
 		pagestore_reader_snapshot_job->completed_generation = 0;
 		pagestore_reader_snapshot_job->failed_generation = 0;
 		pagestore_reader_snapshot_job->reserved_generation = 0;
+		pagestore_reader_snapshot_job->reserved_lsn = InvalidXLogRecPtr;
 		pagestore_reader_snapshot_job->reservation_owner_pid = 0;
-		pagestore_reader_snapshot_job->pending = false;
 	}
 	LWLockRelease(AddinShmemInitLock);
 	if (DataDir == NULL)
@@ -12166,16 +12133,8 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 	 */
 	SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 	pagestore_reader_snapshot_job->reserved_generation = 0;
+	pagestore_reader_snapshot_job->reserved_lsn = InvalidXLogRecPtr;
 	pagestore_reader_snapshot_job->reservation_owner_pid = 0;
-	if (pagestore_reader_snapshot_job->pending &&
-		pagestore_reader_snapshot_job->generation ==
-		pagestore_reader_snapshot_job->completed_generation)
-	{
-		pagestore_reader_snapshot_job->control =
-			pagestore_reader_snapshot_job->pending_control;
-		pagestore_reader_snapshot_job->pending = false;
-		pagestore_reader_snapshot_job->generation++;
-	}
 	SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 
 	while (!ShutdownRequestPending)
@@ -12233,6 +12192,7 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 					barrier_generation = generation;
 					SpinLockAcquire(&pagestore_reader_snapshot_job->mutex);
 					pagestore_reader_snapshot_job->reserved_generation = generation;
+					pagestore_reader_snapshot_job->reserved_lsn = barrier_lsn;
 					pagestore_reader_snapshot_job->reservation_owner_pid = MyProcPid;
 					SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 					break;
@@ -12272,10 +12232,9 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 			 * write, so this catalog set is exactly the set visible at R. */
 			barrier_complete = !XLogRecPtrIsInvalid(barrier_lsn) &&
 				databases != NIL && pagestore_reader_snapshot_ready_at(barrier_lsn);
-			for (int pass = 0; barrier_complete && pass < 3; pass++)
+			if (barrier_complete)
 			{
 				ListCell *lc;
-				XLogRecPtr pass_lsn = barrier_lsn;
 
 				foreach(lc, databases)
 				{
@@ -12289,13 +12248,6 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 					pagestore_run_reader_artifact_worker(entry->database_oid);
 					CHECK_FOR_INTERRUPTS();
 				}
-				barrier_lsn = pagestore_latest_reader_snapshot_ready();
-				if (barrier_lsn != pass_lsn)
-				{
-					if (pass == 2)
-						barrier_complete = false;
-					continue;
-				}
 				foreach(lc, databases)
 				{
 					PagestoreReaderDatabaseEntry *entry = lfirst(lc);
@@ -12304,7 +12256,6 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 							entry->database_oid, barrier_lsn))
 						barrier_complete = false;
 				}
-				break;
 			}
 			if (barrier_complete && !ShutdownRequestPending)
 				pagestore_publish_reader_database_barrier(databases, barrier_lsn);
@@ -12340,16 +12291,8 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 				pagestore_reader_snapshot_job->reservation_owner_pid == MyProcPid)
 			{
 				pagestore_reader_snapshot_job->reserved_generation = 0;
+				pagestore_reader_snapshot_job->reserved_lsn = InvalidXLogRecPtr;
 				pagestore_reader_snapshot_job->reservation_owner_pid = 0;
-				if (pagestore_reader_snapshot_job->pending &&
-					pagestore_reader_snapshot_job->generation ==
-					pagestore_reader_snapshot_job->completed_generation)
-				{
-					pagestore_reader_snapshot_job->control =
-						pagestore_reader_snapshot_job->pending_control;
-					pagestore_reader_snapshot_job->pending = false;
-					pagestore_reader_snapshot_job->generation++;
-				}
 			}
 			SpinLockRelease(&pagestore_reader_snapshot_job->mutex);
 		}
