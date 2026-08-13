@@ -1192,7 +1192,7 @@ pagestore_wal_index_worker_main(Datum main_arg)
 			continue;
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 5000L, PG_WAIT_EXTENSION);
+						 1000L, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
