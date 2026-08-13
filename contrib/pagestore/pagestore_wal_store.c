@@ -301,7 +301,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	if (segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
 		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
 		(segment_size & (segment_size - 1)) != 0 ||
-		start_lsn % segment_size != 0)
+		start_lsn % segment_size != 0 ||
+		start_lsn > UINT64_MAX - segment_size)
 		return -1;
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
@@ -327,7 +328,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 		return -1;
 	}
 	{
-		parent_fd = openat(store->directory_fd, "..", O_RDONLY | O_DIRECTORY);
+		parent_fd = openat(store->directory_fd, "..",
+						   O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 		if (parent_fd < 0 || fsync(parent_fd) != 0)
 		{
 			if (parent_fd >= 0)
