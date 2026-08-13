@@ -131,7 +131,7 @@ Expected scope: one PR.
 
 ### R1. Register reader and materializer owner generations
 
-Status: **blocked on R0 and decision D2**.
+Status: **blocked on R0**.  Decision D2 is accepted below.
 
 Deliverables:
 
@@ -188,6 +188,11 @@ same-LSN hint rewrite as well as the version visible after it.
 Branch points are discrete structural base requirements, not moving retention
 floors.  A child at fork fence `F` requires the parent base visible at `F`, but
 does not pin every later parent version.  The parent's operational GC cutoff
+and fixed-reader pins follow the same discrete-base rule: each fixed fence
+retains the state visible at that fence while the operational frontier may
+advance past it.  The bounded-space soak keeps a fixed reader alive while its
+timeline receives continuing updates and verifies bounded page, forkmeta,
+WAL-index, and raw-WAL storage.
 may continue to advance while compaction retains those discrete bases for all
 live descendants.  Durable timeline metadata stores the complete fork tuple
 `(branch_lsn, branch_admission_sequence)`, not a bare LSN; restart, ancestor
@@ -503,7 +508,10 @@ Required scenario families:
 Acceptance:
 
 - each declared transition is exercised before and after its durability point;
-- recovery yields a valid complete old or new state;
+- recovery yields the complete old state only for crashes before durability
+  and the complete new state for crashes after durability; acknowledged
+  markers, deletion states, reclamation frontiers, and branch publications are
+  monotonic and cannot roll back even when they are not SQL-visible;
 - direct and recovered SQL-visible results agree at declared horizons.
 
 Expected scope: two or three focused PRs.
