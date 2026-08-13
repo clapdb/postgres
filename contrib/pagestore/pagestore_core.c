@@ -6050,7 +6050,10 @@ ps_handle_meta(PsChannel *ch)
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
-							   old_pin.lsn < pin.lsn)) ||
+							   (old_pin.lsn < pin.lsn ||
+								/* An exact retry cannot expose a new fence. */
+								(old_pin.lsn == pin.lsn &&
+								 old_pin.admission_seq == pin.admission_seq)))) ||
 							!timeline_defined) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
