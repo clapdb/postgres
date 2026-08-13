@@ -2099,6 +2099,28 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 	return 0;
 }
 
+static int
+fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
+						uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL)
+		return 0;
+	for (int i = (int) e->nev - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[i];
+
+		if (v->lsn > cap ||
+			(seq_cap != 0 && v->admission_seq != 0 &&
+			 v->admission_seq > seq_cap))
+			continue;
+		if (v->kind == FEV_DEAD)
+			return 1;
+		if (v->kind == FEV_SET)
+			return block >= v->nblocks;
+	}
+	return 0;
+}
+
 /* Markerless SEG0 spans an intermediate format transition: some stores already
  * persisted the same growth in forkmeta, while later ones relied on SEG0 alone.
  * Detect the former without re-evaluating equal-LSN definitive-event order. */
@@ -2480,6 +2502,9 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			return NULL;
 		if (v && !fork_page_invalidated(fe, block, v, w.lsn, read_seq))
 			return v;
+		if (fork_state == FORK_HOP_DEF &&
+			fork_inheritance_fenced(fe, block, w.lsn, read_seq))
+			return NULL;
 	} while (tl_walk_next(&w));
 	return NULL;
 }
@@ -4511,6 +4536,9 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
+		if (fork_state == FORK_HOP_DEF &&
+			fork_inheritance_fenced(fe, block, rl, read_seq))
+			return 0;
 		}
 	}
 	return 0;

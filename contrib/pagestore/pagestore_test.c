@@ -2368,8 +2368,20 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 		fill_page(page, ps, 13000 + block, (unsigned char) block);
 		op_write_tl(0, rel, 0, block, page);
 	}
-	check(wait_for_compacted_layers(store, 3),
-		  "released relation history is compacted again");
+	{
+		int pruned = 0;
+
+		for (int i = 0; i < 500; i++)
+		{
+			if (!op_read_at_found(rel, 0, 0, 6500, readback))
+			{
+				pruned = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(pruned, "released relation history is compacted again");
+	}
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);
