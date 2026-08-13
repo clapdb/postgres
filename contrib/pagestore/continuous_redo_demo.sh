@@ -186,8 +186,6 @@ $RP -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qx t ||
 # Both changes happen after the redo worker is live.  Completing each segment
 # lets archive recovery consume it without stopping either process.
 $WP -c "CREATE EXTENSION pagestore;
-	CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn) RETURNS int
-	 AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
 	CREATE TABLE continuous_redo(id int primary key, v text);
 	INSERT INTO continuous_redo VALUES (1, 'first');" >/dev/null ||
 	fail "could not create the writer test relation"
