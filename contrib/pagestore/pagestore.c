@@ -117,6 +117,7 @@ static char *pagestore_walredo_datadir = NULL;
 static bool pagestore_redo_wal_from_store = false;
 static bool pagestore_advance_read_lsn = false;
 static bool pagestore_auto_reader_artifacts = false;
+static int	pagestore_reader_artifact_interval = 5;
 static bool pagestore_auto_wal_index = false;
 static bool pagestore_materializer = false;
 static char *pagestore_retention_owner_id_str = NULL;
@@ -12357,13 +12358,12 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		}
 		list_free_deep(databases);
 
-		/* A completed barrier has no reason to force a second checkpoint before
-		 * PostgreSQL's configured checkpoint cadence.  Apart from avoiding idle
-		 * WAL and flush churn, this leaves snapshot production backpressured by
-		 * the normal checkpointer when no reader needs a fresher horizon. */
+		/* Rate-limit forced checkpoints independently from checkpoint_timeout:
+		 * advancing readers need a fresh artifact promptly, but an idle writer
+		 * must not force one every launcher pass. */
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 (long) CheckPointTimeout * 1000L,
+						 (long) pagestore_reader_artifact_interval * 1000L,
 						 PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
@@ -12452,6 +12452,14 @@ _PG_init(void)
 							 PGC_POSTMASTER,
 							 0,
 							 NULL, NULL, NULL);
+	DefineCustomIntVariable("pagestore.reader_artifact_interval",
+							"Minimum interval between automatic reader artifact checkpoints.",
+							"Bounds idle checkpoint traffic while keeping advancing reader views fresh.",
+							&pagestore_reader_artifact_interval,
+							5, 1, 3600,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
 	DefineCustomBoolVariable("pagestore.auto_wal_index",
 							 "Continuously index WAL after it is shipped to pagestore.",
 							 "The worker advances only across a record-aligned, durable shipped-WAL prefix.",
