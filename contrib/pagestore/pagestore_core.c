@@ -4887,7 +4887,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			/* A child can inherit this page from a parent.  Check every
 			 * traversed timeline so a parent frontier cannot be bypassed merely
 			 * because the child has not compacted locally. */
-			if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL)
+			if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
 			{
 				int	frontier_allows;
 
