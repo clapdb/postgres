@@ -2151,14 +2151,15 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 			 v->admission_seq > seq_cap) ||
 			(v->kind != FEV_SET && v->kind != FEV_DEAD))
 			continue;
-		/* Fully legacy records have no sequence, so their LSN is the only
-		 * durable order.  If either side is sequenced, that order deliberately
-		 * places a WAL-less page relative to its lifecycle record. */
-		if (v->admission_seq == 0 && page->admission_seq == 0)
+		/* Nonzero LSN is the primary order, including across legacy and
+		 * sequenced records.  WAL-less records have no LSN order, so retain
+		 * their established admission-order semantics. */
+		if (v->lsn != 0 && page->lsn != 0)
 		{
 			if (v->lsn < page->lsn)
 				break;
-			if (v->lsn == page->lsn)
+			if (v->lsn == page->lsn &&
+				v->admission_seq <= page->admission_seq)
 				continue;
 		}
 		else if (v->admission_seq <= page->admission_seq)
@@ -4664,7 +4665,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			else if (pv->seg < 0)
 			{
 				int		layer_result = layer_map_lookup(tl, key, block, rl,
-																	read_seq, pv->lsn, &l, &a, out);
+															seq_cap, pv->lsn, &l, &a, out);
 
 				if (layer_result < 0)
 					return -1;
@@ -5584,7 +5585,10 @@ ps_handle_meta(PsChannel *ch)
 					ch->status = PS_STATUS_ERROR;
 					break;
 				}
-				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
+				/* A delayed CREATE can be observed as live because newer state is
+				 * already present.  Its SET is still the durable boundary of an
+				 * empty recreated generation. */
+				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD || delayed)
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
