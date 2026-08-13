@@ -269,6 +269,8 @@ class BranchPrepareTests(unittest.TestCase):
                     "consumer_data_dir": str(config.materializer_data_dir),
                     "consumer_data_dev": materializer_stat.st_dev,
                     "consumer_data_ino": materializer_stat.st_ino,
+                    "authority_namespace_dev": config.retention_authority_dir.stat().st_dev,
+                    "authority_namespace_ino": config.retention_authority_dir.stat().st_ino,
                 }
             ),
             encoding="utf-8",

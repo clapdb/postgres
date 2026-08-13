@@ -157,6 +157,8 @@ class SupervisorTests(unittest.TestCase):
                 "consumer_instance_id": config.controller_instance_id,
                 "consumer_data_dev": config.data_dir.stat().st_dev,
                 "consumer_data_ino": config.data_dir.stat().st_ino,
+                "authority_namespace_dev": config.retention_authority_dir.stat().st_dev,
+                "authority_namespace_ino": config.retention_authority_dir.stat().st_ino,
             },
         )
         supervisor = MODULE.Supervisor(config)
@@ -216,6 +218,8 @@ class SupervisorTests(unittest.TestCase):
                 "consumer_instance_id": first.controller_instance_id,
                 "consumer_data_dev": first.data_dir.stat().st_dev,
                 "consumer_data_ino": first.data_dir.stat().st_ino,
+                "authority_namespace_dev": first.retention_authority_dir.stat().st_dev,
+                "authority_namespace_ino": first.retention_authority_dir.stat().st_ino,
             },
         )
         clone = self.root / "clone"
@@ -265,6 +269,8 @@ class SupervisorTests(unittest.TestCase):
                 "consumer_instance_id": "another-controller",
                 "consumer_data_dev": config.data_dir.stat().st_dev,
                 "consumer_data_ino": config.data_dir.stat().st_ino,
+                "authority_namespace_dev": config.retention_authority_dir.stat().st_dev,
+                "authority_namespace_ino": config.retention_authority_dir.stat().st_ino,
             },
         )
         supervisor = MODULE.Supervisor(config)
@@ -299,6 +305,20 @@ class SupervisorTests(unittest.TestCase):
         # status-only state created by the transient startup failures.
         recovered = MODULE.Supervisor(config)
         self.assertEqual(recovered.retention_generation, 0)
+
+    def test_running_worker_without_authority_fails_closed(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class LegacySupervisor(MODULE.Supervisor):
+            def worker_running(self):
+                return True
+
+        class Owner:
+            def publish_owner(self, _pid, _epoch):
+                pass
+
+        with self.assertRaisesRegex(MODULE.OwnershipError, "no durable"):
+            LegacySupervisor(config).run(Owner())
 
     def test_restartpoint_without_new_checkpoint_is_retried(self):
         config = MODULE.Config.load(self.write_config())

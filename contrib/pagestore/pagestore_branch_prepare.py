@@ -472,6 +472,7 @@ class BranchPreparer:
             authority_generation = authority["retention_generation"]
             authority_data_dir = authority["consumer_data_dir"]
             authority_stat = self.config.materializer_data_dir.stat()
+            namespace_stat = self.config.retention_authority_dir.stat()
             if (
                 not isinstance(authority_generation, int)
                 or isinstance(authority_generation, bool)
@@ -479,6 +480,8 @@ class BranchPreparer:
                 or authority_data_dir != str(self.config.materializer_data_dir)
                 or authority.get("consumer_data_dev") != authority_stat.st_dev
                 or authority.get("consumer_data_ino") != authority_stat.st_ino
+                or authority.get("authority_namespace_dev") != namespace_stat.st_dev
+                or authority.get("authority_namespace_ino") != namespace_stat.st_ino
             ):
                 raise ValueError("authority identity mismatch")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:

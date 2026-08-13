@@ -398,6 +398,8 @@ class Supervisor:
         authority_instance_id = authority.get("consumer_instance_id")
         authority_data_dev = authority.get("consumer_data_dev")
         authority_data_ino = authority.get("consumer_data_ino")
+        authority_namespace_dev = authority.get("authority_namespace_dev")
+        authority_namespace_ino = authority.get("authority_namespace_ino")
         if authority_exists:
             if (
                 not isinstance(authority_generation, int)
@@ -418,10 +420,23 @@ class Supervisor:
                 )
             if not all(
                 isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                for value in (authority_data_dev, authority_data_ino)
+                for value in (
+                    authority_data_dev,
+                    authority_data_ino,
+                    authority_namespace_dev,
+                    authority_namespace_ino,
+                )
             ):
                 raise OwnershipError(
                     "materializer retention generation authority lacks filesystem identity"
+                )
+            namespace_stat = config.retention_authority_dir.stat()
+            if (
+                authority_namespace_dev != namespace_stat.st_dev
+                or authority_namespace_ino != namespace_stat.st_ino
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority namespace mismatch"
                 )
             old_retention_generation = authority_generation
         elif status_exists:
@@ -610,6 +625,7 @@ class Supervisor:
         # Persist authority before the worker can register this generation.
         # Losing status.json after this point cannot cause generation reuse.
         data_stat = self.config.data_dir.stat()
+        namespace_stat = self.config.retention_authority_dir.stat()
         atomic_write_json(
             self.config.retention_generation_file,
             {
@@ -618,6 +634,8 @@ class Supervisor:
                 "consumer_instance_id": self.config.controller_instance_id,
                 "consumer_data_dev": data_stat.st_dev,
                 "consumer_data_ino": data_stat.st_ino,
+                "authority_namespace_dev": namespace_stat.st_dev,
+                "authority_namespace_ino": namespace_stat.st_ino,
             },
         )
         self.authority_published = True
@@ -822,18 +840,12 @@ class Supervisor:
                 else:
                     self.publish("degraded")
             elif not self.authority_published:
-                # A running process without durable generation authority is
-                # not adoptable.  Stop it and start a freshly fenced worker;
-                # publish() remains suppressed until start_worker() has synced
-                # the authority record.
-                if now >= self.retry_not_before:
-                    try:
-                        self.stop_worker("fast", "establish retention authority")
-                        self.start_worker("establish retention authority")
-                        worker_observed = True
-                    except (subprocess.SubprocessError, OSError, RuntimeError) as error:
-                        if not self.record_failure(error):
-                            return 1
+                # A running legacy/direct worker may already own generation 1.
+                # Without durable prior authority there is no safe generation
+                # to advance from, even after pg_ctl reports it stopped.
+                raise OwnershipError(
+                    "running materializer has no durable retention generation authority"
+                )
             elif not self.worker_healthy():
                 if now >= self.retry_not_before:
                     try:
