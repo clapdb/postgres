@@ -6948,6 +6948,15 @@ pagestore_reader_database_barrier_valid(XLogRecPtr read_lsn)
 				pfree(databases);
 				return false;
 			}
+			/* RelationInitPhysicalAddr caches this backend's default tablespace.
+			 * Do not adopt a barrier that moved the connected database: a fresh
+			 * backend will initialize the new path from pg_database. */
+			if (entry->database_oid == MyDatabaseId &&
+				entry->tablespace_oid != MyDatabaseTableSpace)
+			{
+				pfree(databases);
+				return false;
+			}
 			mapdir = GetDatabasePath(entry->database_oid,
 								 entry->tablespace_oid);
 			if (!pagestore_install_missing_reader_database(
@@ -12064,7 +12073,10 @@ pagestore_reader_artifact_database_main(Datum main_arg)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
-	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid, 0);
+	/* An existing reader session remains valid after ALLOW_CONNECTIONS is
+	 * cleared, so publish its database's next barrier artifact as well. */
+	BackgroundWorkerInitializeConnectionByOid(dboid, InvalidOid,
+									  BGWORKER_BYPASS_ALLOWCONN);
 	if (ConfigReloadPending)
 	{
 		ConfigReloadPending = false;
@@ -12090,7 +12102,7 @@ pagestore_reader_artifact_databases(void)
 		elog(ERROR, "SPI_connect failed");
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_execute("SELECT oid, dattablespace FROM pg_database "
-					"WHERE datallowconn AND datconnlimit <> -2 ORDER BY oid",
+					"WHERE datconnlimit <> -2 ORDER BY oid",
 					true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not enumerate databases");
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
