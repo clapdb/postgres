@@ -293,11 +293,12 @@ class SupervisorTests(unittest.TestCase):
         supervisor = AlwaysFailingSupervisor(config)
         self.assertEqual(supervisor.run(Owner()), 1)
         self.assertEqual(supervisor.starts, config.max_consecutive_failures)
-        status = json.loads(config.status_file.read_text(encoding="utf-8"))
-        self.assertEqual(status["state"], "failed")
-        self.assertEqual(
-            status["consecutive_failures"], config.max_consecutive_failures
-        )
+        self.assertFalse(config.status_file.exists())
+        self.assertFalse(config.retention_generation_file.exists())
+        # A retry remains a genuinely new owner instead of failing on
+        # status-only state created by the transient startup failures.
+        recovered = MODULE.Supervisor(config)
+        self.assertEqual(recovered.retention_generation, 0)
 
     def test_restartpoint_without_new_checkpoint_is_retried(self):
         config = MODULE.Config.load(self.write_config())

@@ -189,10 +189,16 @@ class Config:
             paths["socket_dir"].mkdir(parents=True, exist_ok=True)
             paths["state_dir"].mkdir(parents=True, exist_ok=True)
             authority_dir = paths["retention_authority_dir"]
-            try:
-                authority_dir.mkdir(parents=True, mode=0o700)
-            except FileExistsError:
-                pass
+            authority_created = not authority_dir.exists()
+            authority_dir.mkdir(mode=0o700, exist_ok=True)
+            if authority_created:
+                directory_fd = os.open(
+                    authority_dir.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             authority_stat = authority_dir.stat()
             authority_parent_stat = authority_dir.parent.stat()
             if (
@@ -289,7 +295,8 @@ def retry_delay_ms(config: Config, failures: int) -> int:
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir():
+        raise FileNotFoundError(f"durable state directory is absent: {path.parent}")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
@@ -437,6 +444,7 @@ class Supervisor:
         self.previous_consumer_instance_id = authority_instance_id
         self.previous_consumer_data_dev = authority_data_dev
         self.previous_consumer_data_ino = authority_data_ino
+        self.authority_published = authority_exists
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -452,6 +460,11 @@ class Supervisor:
         self.lag_started_at: float | None = None
 
     def publish(self, state: str, **fields: Any) -> None:
+        # Never create status-only state.  A restart may interpret any status
+        # file as evidence of a prior retention generation, so authority must
+        # be durable before the first status publication.
+        if not self.authority_published:
+            return
         status = {
             "schema": STATUS_SCHEMA,
             "state": state,
@@ -607,6 +620,7 @@ class Supervisor:
                 "consumer_data_ino": data_stat.st_ino,
             },
         )
+        self.authority_published = True
         self.previous_consumer_data_dir = str(self.config.data_dir)
         self.previous_consumer_instance_id = self.config.controller_instance_id
         self.previous_consumer_data_dev = data_stat.st_dev
@@ -807,6 +821,19 @@ class Supervisor:
                             return 1
                 else:
                     self.publish("degraded")
+            elif not self.authority_published:
+                # A running process without durable generation authority is
+                # not adoptable.  Stop it and start a freshly fenced worker;
+                # publish() remains suppressed until start_worker() has synced
+                # the authority record.
+                if now >= self.retry_not_before:
+                    try:
+                        self.stop_worker("fast", "establish retention authority")
+                        self.start_worker("establish retention authority")
+                        worker_observed = True
+                    except (subprocess.SubprocessError, OSError, RuntimeError) as error:
+                        if not self.record_failure(error):
+                            return 1
             elif not self.worker_healthy():
                 if now >= self.retry_not_before:
                     try:
