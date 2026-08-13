@@ -5613,8 +5613,11 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_RESERVE:
 			{
 				PsRetentionPin pin;
+				PsRetentionPin old_pin;
 				uint64_t	seq;
 				int			ret = PS_RETENTION_ERROR;
+				int			old_found = 0;
+				int			timeline_defined = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -5626,14 +5629,32 @@ ps_handle_meta(PsChannel *ch)
 				pthread_rwlock_wrlock(&admission_lock);
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
-				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES &&
-					timelines[tl].defined)
-					ret = ps_retention_reserve_and_set(&pin);
+				pthread_rwlock_wrlock(&page_prune_lock);
+				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
+				{
+					old_found = ps_retention_lookup(tl, pin.owner_kind,
+						pin.owner_id, &old_pin);
+					ps_lock_map_rd();
+					timeline_defined = timelines[tl].defined;
+					ps_unlock_map();
+					if (timeline_defined &&
+						(((pin.resources &
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
+						 page_frontier_allows(tl, pin.lsn, pin.admission_seq)))
+						ret = ps_retention_reserve_and_set(&pin);
+				}
 				if (ret == PS_RETENTION_OK)
 				{
 					memcpy(ch->data, &seq, sizeof(seq));
 					ch->datalen = sizeof(seq);
+					if ((old_found != 1 ||
+						 memcmp(&old_pin, &pin, sizeof(pin)) != 0) &&
+						(((old_found == 1 ? old_pin.resources : 0) |
+						  pin.resources) &
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+						page_prune_mark_all_due();
 				}
+				pthread_rwlock_unlock(&page_prune_lock);
 				pthread_rwlock_unlock(&admission_lock);
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
