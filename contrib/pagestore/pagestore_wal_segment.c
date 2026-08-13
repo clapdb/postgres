@@ -80,7 +80,8 @@ header_crc(const PsWalSegmentHeader *header)
 static int
 segment_identity_valid(const PsWalSegmentHeader *header)
 {
-	return header->segment_size >= PS_WAL_SEGMENT_MIN_BYTES &&
+	return header->timeline != 0 &&
+		header->segment_size >= PS_WAL_SEGMENT_MIN_BYTES &&
 		header->segment_size <= PS_WAL_SEGMENT_MAX_BYTES &&
 		(header->segment_size & (header->segment_size - 1)) == 0 &&
 		header->start_lsn % header->segment_size == 0 &&

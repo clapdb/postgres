@@ -100,13 +100,16 @@ main(void)
 		  "truncated payload is rejected");
 	check(ps_wal_segment_validate(&header, payload, sizeof(payload) + 1) != 0,
 		  "trailing payload bytes are rejected");
-	check(ps_wal_segment_seal(&header, 0, 0, UINT64_MAX - 3,
+	check(ps_wal_segment_seal(&header, 0, 0, 0, 16 * 1024 * 1024, payload,
+						  8) != 0,
+		  "timeline zero is rejected");
+	check(ps_wal_segment_seal(&header, 1, 0, UINT64_MAX - 3,
 						  16 * 1024 * 1024, payload, 8) != 0,
 		  "overflowing end LSN is rejected");
-	check(ps_wal_segment_seal(&header, 0, 0, 0, 16 * 1024 * 1024, NULL, 1) != 0 &&
-		  ps_wal_segment_seal(&header, 0, 0, 0, 16 * 1024 * 1024, payload, 0) != 0,
+	check(ps_wal_segment_seal(&header, 1, 0, 0, 16 * 1024 * 1024, NULL, 1) != 0 &&
+		  ps_wal_segment_seal(&header, 1, 0, 0, 16 * 1024 * 1024, payload, 0) != 0,
 		  "empty or missing payload is rejected");
-	check(ps_wal_segment_seal(&header, 0, 0, 0, 16 * 1024 * 1024, &header,
+	check(ps_wal_segment_seal(&header, 1, 0, 0, 16 * 1024 * 1024, &header,
 							 sizeof(header)) != 0,
 		  "payload overlapping the output header is rejected");
 
