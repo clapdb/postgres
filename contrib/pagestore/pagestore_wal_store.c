@@ -576,7 +576,8 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline,
 	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
 	if (n < 0 || (size_t) n >= sizeof(store->directory))
 		return -1;
-	store->directory_fd = open(directory, O_RDONLY | O_DIRECTORY);
+	store->directory_fd = open(directory,
+					   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
 		return -1;
 	store->timeline = timeline;

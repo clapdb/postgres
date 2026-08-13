@@ -449,6 +449,20 @@ main(void)
 		}
 	}
 
+	{
+		char held[512];
+
+		snprintf(held, sizeof(held), "%s-held", directory);
+		check(rename(directory, held) == 0 && symlink(held, directory) == 0,
+			  "replace the WAL store directory with a symlink");
+		check(ps_wal_store_open(&store, directory, 7, 0,
+						   first_len + TEST_SEGMENT_BYTES,
+						   TEST_SEGMENT_BYTES) != 0,
+			  "reopen rejects a symlinked WAL store directory");
+		check(unlink(directory) == 0 && rename(held, directory) == 0,
+			  "restore the WAL store directory after symlink test");
+	}
+
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 2ULL);
 	fd = open(path, O_RDWR);
 	check(fd >= 0 &&
