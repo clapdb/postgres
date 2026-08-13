@@ -4825,9 +4825,17 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			/* A child can inherit this page from a parent.  Check every
 			 * traversed timeline so a parent frontier cannot be bypassed merely
 			 * because the child has not compacted locally. */
-			if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL &&
-				!page_frontier_allows(tl, rl, seq_cap))
-				return -2;
+			if (read_lsn != UINT64_MAX && key->klass != PS_KLASS_CONTROL)
+			{
+				int	frontier_allows;
+
+				/* Compaction publishes the two-word frontier under map_lock. */
+				ps_lock_map_rd();
+				frontier_allows = page_frontier_allows(tl, rl, seq_cap);
+				ps_unlock_map();
+				if (!frontier_allows)
+					return -2;
+			}
 			fe = fork_find(tl, key);
 			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
 				FORK_HOP_NONE;
