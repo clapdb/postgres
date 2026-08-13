@@ -1485,7 +1485,9 @@ typedef struct ForkEvent
 	uint64_t	admission_seq;	/* global mutation order; 0 = legacy */
 	uint64_t	order_id;		/* bound segment marker identity, else zero */
 	uint32_t	nblocks;
+	uint32_t	cached_nblocks;	/* hop result through this sorted event */
 	uint8_t		kind;
+	uint8_t		cached_state;
 } ForkEvent;
 
 #define FEV_GROW	0
@@ -1967,6 +1969,25 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 	int			have_grow = 0;
 
 	*nb_out = 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[lo - 1].cached_nblocks;
+		return e->ev[lo - 1].cached_state;
+	}
 	for (int i = (int) e->nev - 1; i >= 0; i--)
 	{
 		const ForkEvent *v = &e->ev[i];
@@ -2005,6 +2026,38 @@ fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 	return FORK_HOP_NONE;
 }
 
+static void
+fork_event_cache_from(ForkEnt *e, uint32_t start)
+{
+	uint8_t state = start == 0 ? FORK_HOP_NONE : e->ev[start - 1].cached_state;
+	uint32_t nb = start == 0 ? 0 : e->ev[start - 1].cached_nblocks;
+
+	for (uint32_t i = start; i < e->nev; i++)
+	{
+		ForkEvent *v = &e->ev[i];
+
+		if (v->kind == FEV_GROW)
+		{
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_SET)
+		{
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+		}
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+		}
+		v->cached_nblocks = nb;
+		v->cached_state = state;
+	}
+}
+
 /* Size of e as of cap, hop-local (for the GROW-dedup below). */
 static uint32_t
 fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
@@ -2013,6 +2066,37 @@ fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
 
 	(void) fork_asof_hop(e, cap, seq_cap, &nb);
 	return nb;
+}
+
+/* A later truncate/drop invalidates old page bytes even if subsequent growth
+ * makes the block addressable again.  The current fast path avoids touching
+ * event history unless a definitive event is newer than the selected page. */
+static int
+fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
+					  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
+		return 0;
+	for (int i = (int) e->nev - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[i];
+
+		if (v->lsn > cap ||
+			(seq_cap != 0 && v->admission_seq != 0 &&
+			 v->admission_seq > seq_cap) ||
+			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+			continue;
+		if (v->admission_seq != 0 && page->admission_seq != 0)
+		{
+			if (v->admission_seq <= page->admission_seq)
+				continue;
+		}
+		else if (v->lsn <= page->lsn)
+			break;
+		if (v->kind == FEV_DEAD || block >= v->nblocks)
+			return 1;
+	}
+	return 0;
 }
 
 /* Markerless SEG0 spans an intermediate format transition: some stores already
@@ -2067,6 +2151,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_event_cache_from(e, i);
 
 	/*
 	 * Maintain the newest-size scalar.  A tail insert governs directly.  A
@@ -2131,6 +2216,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_event_cache_from(e, i);
 }
 
 static int
@@ -2151,12 +2237,14 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_GROW_BOUND)
 			{
 				v->kind = FEV_GROW;
+				fork_event_cache_from(e, i);
 				e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 			}
 			else
 			{
 				memmove(v, v + 1, (e->nev - i - 1) * sizeof(*v));
 				e->nev--;
+				fork_event_cache_from(e, i);
 			}
 			return 1;
 		}
@@ -2390,7 +2478,7 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return NULL;
-		if (v)
+		if (v && !fork_page_invalidated(fe, block, v, w.lsn, read_seq))
 			return v;
 	} while (tl_walk_next(&w));
 	return NULL;
@@ -4359,6 +4447,8 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
+			return 0;
+		if (pv && fork_page_invalidated(fe, block, pv, rl, read_seq))
 			return 0;
 		if (pv)
 		{
