@@ -2086,13 +2086,24 @@ fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
 			 v->admission_seq > seq_cap) ||
 			(v->kind != FEV_SET && v->kind != FEV_DEAD))
 			continue;
-		if (v->admission_seq != 0 && page->admission_seq != 0)
+		/* LSN orders WAL-backed history.  A WAL-less page deliberately keeps
+		 * version zero, so only its durable admission sequence can place it
+		 * relative to fork metadata. */
+		if (v->lsn == 0 || page->lsn == 0)
 		{
-			if (v->admission_seq <= page->admission_seq)
+			if (v->admission_seq != 0 && page->admission_seq != 0 &&
+				v->admission_seq <= page->admission_seq)
 				continue;
 		}
-		else if (v->lsn <= page->lsn)
-			break;
+		else
+		{
+			if (v->lsn < page->lsn)
+				break;
+			if (v->lsn == page->lsn &&
+				(v->admission_seq == 0 || page->admission_seq == 0 ||
+				 v->admission_seq <= page->admission_seq))
+				continue;
+		}
 		if (v->kind == FEV_DEAD || block >= v->nblocks)
 			return 1;
 	}
@@ -2115,8 +2126,8 @@ fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
 			continue;
 		if (v->kind == FEV_DEAD)
 			return 1;
-		if (v->kind == FEV_SET)
-			return block >= v->nblocks;
+		if (v->kind == FEV_SET && block >= v->nblocks)
+			return 1;
 	}
 	return 0;
 }
@@ -2497,11 +2508,15 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 		PageEnt    *e = page_find(w.tl, key, block);
 		PageVer    *v = e ? page_visible(e, w.lsn, read_seq) : NULL;
 
+		if (v)
+		{
+			if (!fork_page_invalidated(fe, block, v, w.lsn, read_seq))
+				return v;
+			return NULL;
+		}
 		if (fork_state == FORK_HOP_DEAD ||
 			(fork_state == FORK_HOP_DEF && block >= nb))
 			return NULL;
-		if (v && !fork_page_invalidated(fe, block, v, w.lsn, read_seq))
-			return v;
 		if (fork_state == FORK_HOP_DEF &&
 			fork_inheritance_fenced(fe, block, w.lsn, read_seq))
 			return NULL;
@@ -4470,16 +4485,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			PageEnt    *e = page_find(tl, key, block);
 			PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
 
-		if (fork_state == FORK_HOP_DEAD ||
-			(fork_state == FORK_HOP_DEF && block >= nb))
-			return 0;
-		if (pv && fork_page_invalidated(fe, block, pv, rl, read_seq))
-			return 0;
 		if (pv)
 		{
 			uint64_t	l,
 						a;
 			int			served;
+			int			poisoned;
+
+			if (fork_page_invalidated(fe, block, pv, rl, read_seq))
+				return 0;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -4488,7 +4502,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * can lag the segment-backed page index.  Bypass transient sources in
 			 * that state; reclaimed versions still use their durable layer.
 			 */
-			int			poisoned = ps_manifest_poisoned();
+			poisoned = ps_manifest_poisoned();
 
 			/* the resolved version (newest <= read_lsn); a caller that needs an
 			 * exact-cutoff match -- e.g. an SLRU snapshot read -- compares it. */
@@ -4536,6 +4550,9 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
+		if (fork_state == FORK_HOP_DEAD ||
+			(fork_state == FORK_HOP_DEF && block >= nb))
+			return 0;
 		if (fork_state == FORK_HOP_DEF &&
 			fork_inheritance_fenced(fe, block, rl, read_seq))
 			return 0;
