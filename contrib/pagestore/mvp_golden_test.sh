@@ -314,6 +314,16 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
 
+mkdir -m 700 "$D/controller-authority" ||
+	fail "could not create materializer authority directory"
+materializer_dev=$(stat -c %d "$MATERIALIZER") ||
+	fail "could not inspect materializer device identity"
+materializer_ino=$(stat -c %i "$MATERIALIZER") ||
+	fail "could not inspect materializer inode identity"
+cat > "$D/controller-authority/retention-owner-1.json" <<EOF
+{"retention_generation":1,"consumer_data_dir":"$MATERIALIZER","consumer_instance_id":"mvp-golden","consumer_data_dev":$materializer_dev,"consumer_data_ino":$materializer_ino}
+EOF
+
 cat > "$BRANCH_CONFIG" <<EOF
 {
   "schema": 2,

@@ -781,7 +781,6 @@ class Supervisor:
                 "cannot supervise a materializer owned by another controller instance"
             )
         owner.publish_owner(os.getpid(), self.owner_epoch)
-        self.publish("starting")
         worker_observed = False
         while not self.stop_requested:
             now = time.monotonic()
