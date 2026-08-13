@@ -256,9 +256,15 @@ publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 		/* A previous ambiguous publication can leave our final name behind.
 		 * Reconcile it before treating EEXIST as a permanent append failure. */
 		if (errno == EEXIST &&
-			published_segment_matches(store, header, payload) == 0 &&
-			fsync(store->directory_fd) == 0)
-			rc = 0;
+			published_segment_matches(store, header, payload) == 0)
+		{
+			/* The existing immutable name is ours.  Remove our staging
+			 * entry before syncing the directory so its deletion is durable
+			 * too; otherwise a crash can resurrect a full-size .tmp file. */
+			if (unlinkat(store->directory_fd, temporary, 0) == 0 &&
+				fsync(store->directory_fd) == 0)
+				rc = 0;
+		}
 		goto cleanup;
 	}
 	(void) unlinkat(store->directory_fd, temporary, 0);
