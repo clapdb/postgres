@@ -96,6 +96,7 @@ static void page_remove_compacted_versions(uint32_t timeline,
 										   const PsImgRec *recs, uint32_t nrec);
 static int retention_project_lsn(uint32_t descendant, uint32_t target,
 								 uint64_t *lsn);
+static int timeline_has_parent(uint32_t timeline);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 
@@ -1786,8 +1787,8 @@ page_frontier_advance(uint32_t timeline, uint64_t floor,
  * still deliberately retained.  Caller holds map_lock. */
 static int
 page_frontier_projected_fence_active(uint32_t reader_timeline,
-							 uint32_t timeline, uint64_t lsn,
-							 uint64_t admission_seq)
+								 uint32_t timeline, uint64_t lsn,
+								 uint64_t admission_seq)
 {
 	PsRetentionPin *pins = NULL;
 	uint32_t npins = 0;
@@ -1814,6 +1815,29 @@ page_frontier_projected_fence_active(uint32_t reader_timeline,
 	return active;
 }
 
+/* Every live child is a structural page-prune fence at its branch point,
+ * independent of whether the child currently has an explicit owner pin.
+ * page_prune_fences() retains that inherited version, so an as-of child read
+ * must be allowed to reach it even if the parent's global frontier moved on. */
+static int
+page_frontier_structural_fence_active(uint32_t reader_timeline,
+									  uint32_t timeline, uint64_t lsn)
+{
+	uint32_t current = reader_timeline;
+	uint32_t hops = 0;
+
+	while (current != timeline)
+	{
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current) || ++hops > MAX_TIMELINES)
+			return 0;
+		if (timelines[current].branch_lsn == lsn)
+			return 1;
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 0;
+}
+
 static int
 page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 					 uint64_t lsn, uint64_t admission_seq)
@@ -1823,7 +1847,8 @@ page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 	if (timeline >= MAX_TIMELINES)
 		return 0;
 	frontier = page_reclaimed_frontier[timeline];
-	if (lsn < frontier.lsn)
+	if (lsn < frontier.lsn &&
+		!page_frontier_structural_fence_active(reader_timeline, timeline, lsn))
 		return 0;
 	/* Sequence zero is the established uncapped/latest-visible fence. */
 	if (admission_seq != 0 &&
