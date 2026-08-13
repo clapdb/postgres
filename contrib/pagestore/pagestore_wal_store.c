@@ -522,7 +522,6 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 {
 	uint64_t *numbers = NULL;
 	uint32_t count = 0;
-	unsigned char *payload = NULL;
 	uint64_t expected_lsn = 0;
 	int n;
 	int rc = -1;
@@ -561,25 +560,16 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 				close(fd);
 			goto cleanup;
 		}
-		payload = malloc(header.payload_len);
-		if (payload == NULL ||
-			read_all_at(fd, payload, header.payload_len,
-						PS_WAL_SEGMENT_HEADER_BYTES) != 0)
-		{
-			close(fd);
-			fd = -1;
-			goto cleanup;
-		}
 		if (close(fd) != 0)
 		{
 			fd = -1;
 			goto cleanup;
 		}
 		fd = -1;
-		if (ps_wal_segment_validate(&header, payload, header.payload_len) != 0 ||
-			header.timeline != timeline || header.segment_no != numbers[i] ||
+		if (header.timeline != timeline || header.segment_no != numbers[i] ||
 			(i != 0 && header.segment_size != store->segment_size) ||
 			(i != 0 && header.start_lsn != expected_lsn) ||
+			read_validated_segment_range(store, &header, 0, NULL, NULL, 0) != 0 ||
 			reserve_entry(store) != 0)
 			goto cleanup;
 		if (i == 0)
@@ -588,15 +578,12 @@ ps_wal_store_open(PsWalStore *store, const char *directory, uint32_t timeline)
 			store->start_lsn = header.start_lsn;
 		expected_lsn = header.start_lsn + header.payload_len;
 		store->entries[store->nentries++].header = header;
-		free(payload);
-		payload = NULL;
 	}
 	store->next_segment_no = numbers[0] + count;
 	store->end_lsn = expected_lsn;
 	rc = 0;
 
 cleanup:
-	free(payload);
 	free(numbers);
 	if (rc != 0)
 		ps_wal_store_close(store);
