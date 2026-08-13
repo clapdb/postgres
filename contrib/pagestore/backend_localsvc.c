@@ -202,7 +202,7 @@ ls_attach(void)
 		close(fd);
 		ereport(ERROR,
 				(errmsg("pagestore localsvc shared memory incompatible"),
-				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
+				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
 						   got_page_size, BLCKSZ, got_magic, got_version)));
 	}
 	ls_shm = shm;
@@ -1053,6 +1053,38 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 	return ls_exec_wait(ch, timeout_ms);
 }
 
+uint8
+pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
+									 uint32 owner_kind, uint64 owner_id,
+									 uint32 generation, uint32 resources,
+									 uint64 lsn, uint64 *admission_seq,
+									 int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	uint8		status;
+
+	*admission_seq = 0;
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	status = ls_exec_wait(ch, timeout_ms);
+	if (status == PS_STATUS_OK && ch->datalen == sizeof(*admission_seq))
+		memcpy(admission_seq, ch->data, sizeof(*admission_seq));
+	else if (status == PS_STATUS_OK)
+		status = PS_STATUS_ERROR;
+	return status;
+}
+
 /* A successful DROP leaves the store-side generation tombstone in place. */
 uint8
 pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
@@ -1082,6 +1114,40 @@ pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
 	ch->old_nblocks = generation;
 	ch->req_seq = owner_id;
 	return ls_exec_wait(ch, timeout_ms);
+}
+
+uint8
+pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
+									uint64 owner_id, PsRetentionPin *pin,
+									bool *found, int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	uint8		status;
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	status = ls_exec_wait(ch, timeout_ms);
+	if (found != NULL)
+		*found = status == PS_STATUS_OK && ch->result != 0;
+	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
+	{
+		memset(pin, 0, sizeof(*pin));
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return PS_STATUS_ERROR;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
+	}
+	return status;
 }
 
 /*

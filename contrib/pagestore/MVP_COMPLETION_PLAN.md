@@ -143,7 +143,8 @@ Expected scope: one PR.
 ### R1. Register reader and materializer owner generations
 
 Status: **materializer lifecycle implemented in the first R1 stacked change;
-reader lifecycle remains; decision D2 is accepted below**.
+reader lifecycle implemented in the second R1 stacked change; awaiting merge;
+decision D2 is accepted below**.
 
 Deliverables:
 

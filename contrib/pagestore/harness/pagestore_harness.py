@@ -1072,6 +1072,7 @@ def run_writer_smoke(
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
         reader_data_dirs: dict[str, Path] = {}
+        reader_owner_ids: dict[str, int] = {}
         for action in plan.actions:
             if action["op"] == "sql":
                 sql = action["sql"].replace("${tablespace}", str(tablespace).replace("'", "''"))
@@ -1144,7 +1145,19 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                 sql = f"SELECT pagestore_mark_reader_catalog_snapshot('{reader_data_sql}', 0, '{lsn}'); SELECT pagestore_install_prepared_reader('{str(prepared).replace(chr(39), chr(39) * 2)}', '{reader_data_sql}', 0, '{lsn}')"
                 result = subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql], check=True, capture_output=True, encoding="utf-8", env=env)
                 reader_port = free_port()
-                (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(f"pagestore.read_lsn = '{lsn}'\npagestore.route_all = on\narchive_mode = off\nlisten_addresses = ''\nunix_socket_directories = '{reader_socket}'\nport = {reader_port}\n")
+                owner_id = reader_owner_ids.setdefault(
+                    action["target"], 10000 + len(reader_owner_ids) + 1
+                )
+                (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(
+                    f"pagestore.read_lsn = '{lsn}'\n"
+                    "pagestore.retention_owner_generation = '1'\n"
+                    f"pagestore.retention_owner_id = '{owner_id}'\n"
+                    "pagestore.route_all = on\n"
+                    "archive_mode = off\n"
+                    "listen_addresses = ''\n"
+                    f"unix_socket_directories = '{reader_socket}'\n"
+                    f"port = {reader_port}\n"
+                )
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 reader_clients[action["target"]] = (reader_socket, reader_port)
                 reader_data_dirs[action["target"]] = reader_data

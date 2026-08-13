@@ -43,6 +43,15 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'pagestore_retention_drop'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+CREATE FUNCTION pagestore_retention_owner_lsn(
+    timeline integer,
+    owner_kind integer,
+    owner_id bigint,
+    generation bigint)
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_retention_owner_lsn'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
 CREATE FUNCTION pagestore_install_prepared_branch_bootstrap(
     prepared_dir text,
     target_dir text,
@@ -69,6 +78,9 @@ COMMENT ON FUNCTION pagestore_retention_set(integer, integer, bigint, bigint, in
 
 COMMENT ON FUNCTION pagestore_retention_drop(integer, integer, bigint, bigint) IS
 'durably release a fenced pagestore retention owner generation';
+
+COMMENT ON FUNCTION pagestore_retention_owner_lsn(integer, integer, bigint, bigint) IS
+'return the durable LSN held by a fenced pagestore retention owner generation';
 
 COMMENT ON FUNCTION pagestore_install_prepared_branch_bootstrap(text, text, integer, integer, pg_lsn, pg_lsn, pg_lsn) IS
 'install a prepared branch into a fresh same-build initdb skeleton after exact archive-bootstrap control restore';

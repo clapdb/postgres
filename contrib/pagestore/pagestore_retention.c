@@ -998,30 +998,28 @@ ps_retention_close(void)
 	pthread_mutex_unlock(&retention_lock);
 }
 
-int
-ps_retention_set(const PsRetentionPin *pin)
+/* Caller holds retention_lock and has validated pin. */
+static int
+retention_set_locked(const PsRetentionPin *pin)
 {
 	PsRetentionRecord rec;
 	int			idx;
 	int			rc = -1;
 
-	if (!retention_pin_valid(pin) || pin->admission_seq == 0)
-		return -1;
-	pthread_mutex_lock(&retention_lock);
 	if (retention_is_poisoned)
-		goto done;
+		return -1;
 	idx = retention_find(pin->timeline, pin->owner_kind, pin->owner_id);
 	if (idx >= 0 && pin->generation < retention_pins[idx].generation)
 	{
 		rc = PS_RETENTION_STALE;
-		goto done;
+		return rc;
 	}
 	if (idx >= 0 && pin->generation == retention_pins[idx].generation &&
 		pin->generation != 0 &&
 		!retention_pin_active(&retention_pins[idx]))
 	{
 		rc = PS_RETENTION_STALE;
-		goto done;
+		return rc;
 	}
 	if (idx >= 0 && memcmp(&retention_pins[idx], pin, sizeof(*pin)) == 0)
 	{
@@ -1033,10 +1031,10 @@ ps_retention_set(const PsRetentionPin *pin)
 	else
 	{
 		if (idx < 0 && retention_reserve(retention_npins + 1) != 0)
-			goto done;
+			return -1;
 		retention_make_record(&rec, PS_RETENTION_SET, pin);
 		if (retention_append(&rec) != 0)
-			goto done;
+			return -1;
 		if (idx >= 0)
 			retention_pins[idx] = *pin;
 		else
@@ -1044,6 +1042,42 @@ ps_retention_set(const PsRetentionPin *pin)
 		retention_mutation_epoch++;
 		rc = PS_RETENTION_OK;
 	}
+	return rc;
+}
+
+int
+ps_retention_set(const PsRetentionPin *pin)
+{
+	int			rc;
+
+	if (!retention_pin_valid(pin) || pin->admission_seq == 0)
+		return -1;
+	pthread_mutex_lock(&retention_lock);
+	rc = retention_set_locked(pin);
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_reserve_and_set(const PsRetentionPin *pin)
+{
+	PsRetentionPin reservation = {0};
+	PsRetentionRecord rec;
+	int			rc = -1;
+
+	if (!retention_pin_valid(pin) || pin->admission_seq == 0)
+		return -1;
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned ||
+		pin->admission_seq <= retention_admission_highwater)
+		goto done;
+	reservation.admission_seq = pin->admission_seq;
+	retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &reservation);
+	if (retention_append(&rec) != 0)
+		goto done;
+	retention_admission_highwater = pin->admission_seq;
+	/* Snapshot/floor readers cannot observe the reservation without its pin. */
+	rc = retention_set_locked(pin);
 done:
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
@@ -1228,6 +1262,30 @@ ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
 				rc = 1;
 				break;
 			}
+		}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					PsRetentionPin *pin_out)
+{
+	int			rc = 0;
+
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		rc = -1;
+	else
+	{
+		int			idx = retention_find(timeline, owner_kind, owner_id);
+
+		if (idx >= 0 && retention_pin_active(&retention_pins[idx]))
+		{
+			if (pin_out)
+				*pin_out = retention_pins[idx];
+			rc = 1;
 		}
 	}
 	pthread_mutex_unlock(&retention_lock);
