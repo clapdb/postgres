@@ -126,7 +126,11 @@ ps_wal_segment_seal(PsWalSegmentHeader *header, uint32_t timeline,
 					uint32_t segment_size, const void *payload,
 					uint32_t payload_len)
 {
-	if (payload == NULL)
+	/* Reject malformed identities before touching the claimed payload.  In
+	 * particular, an invalid uint32 length must not turn into a multi-gigabyte
+	 * synchronous hash scan on the append shard. */
+	if (ps_wal_segment_seal_with_crc(header, timeline, segment_no,
+										start_lsn, segment_size, payload, payload_len, 0) != 0)
 		return -1;
 	return ps_wal_segment_seal_with_crc(header, timeline, segment_no,
 										start_lsn, segment_size, payload, payload_len,
