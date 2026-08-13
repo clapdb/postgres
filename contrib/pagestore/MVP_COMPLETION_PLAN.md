@@ -108,12 +108,17 @@ Deliverables:
 - fork metadata shares the page-history reclamation frontier: its compactor
   advances that same full tuple atomically before retiring events, and every
   page-history SET is checked against the maximum of page-image and forkmeta
-  progress.  A resource may retain a sparse fixed-reader base `F` while its
+  progress.  Retention owners declare whether each resource is a point-in-time
+  base consumer or a range/replay consumer.  A point-in-time owner may retain
+  a sparse fixed-reader base `F` while its
   operational cutoff advances to `C > F`: admission accepts `F` and tuples at
   or above `C`, but rejects reclaimed tuples in `(F, C)`.  The durable cutoff
   and exact exception set are updated crash-atomically and consulted by page,
   WAL, WAL-index, and forkmeta admission; tests cover restart and exception
-  removal after the owning reader drains.
+  removal after the owning reader drains.  Materializers and other range
+  consumers must instead declare their full required interval; admission
+  rejects them unless that interval is continuously retained and never treats
+  equality with a discrete reader base as sufficient proof.
 - the R0 wire/API and durable owner record carry a controller allocation-domain
   token distinct from the per-owner generation, plus durable live-token
   reservation.  R1 clients must reserve and transmit it from their first
@@ -347,8 +352,13 @@ mask missing history on a more advanced shard while frontiers move.
 Index append and compaction publication share a cutover protocol.  The
 compactor freezes an append sequence under the shard append lock, publishes a
 replacement through that sequence, then hands off and durably appends any tail
-before replacing the old log.  This includes the shard-0 durable progress
-record; acknowledged concurrent appends can never be omitted by publication.
+before replacing the old log.  All replacement shards and the shard-0 durable
+progress record are named by one durable publication generation.  The complete
+old generation remains reachable until every replacement shard and its exact
+required-byte offsets are durable, after which one atomic generation manifest
+makes the new set visible; recovery selects only a complete generation and
+never combines old shards with new progress.  Acknowledged concurrent appends
+can never be omitted by publication.
 Publication also runs on the owning shard's run-to-completion path and drains
 all admitted `walidx_get()` readers before retiring the old arrays/log.  An
 equivalent epoch/reference scheme is acceptable only if old representations
