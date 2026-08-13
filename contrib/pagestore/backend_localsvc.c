@@ -645,6 +645,7 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = ls_read_lsn();
+	ch->is_redo = RecoveryInProgress() ? 1 : 0;
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;

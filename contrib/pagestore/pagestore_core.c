@@ -2788,6 +2788,28 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 	return maxnb;
 }
 
+/* Redo must reserve every block that can be reached by WAL already accepted
+ * into this store.  A later CREATE/TRUNCATE is a logical visibility boundary,
+ * not permission to reject an earlier FPI as beyond EOF. */
+static uint32_t
+fork_nblocks_recovery(uint32_t timeline, const PsKey *key)
+{
+	uint32_t maxnb = 0;
+	TlWalk w = tl_walk_first(timeline, UINT64_MAX);
+
+	do
+	{
+		ForkEnt *e = fork_find(w.tl, key);
+
+		if (e != NULL)
+			for (uint32_t i = 0; i < e->nev; i++)
+				if (e->ev[i].kind != FEV_DEAD &&
+					e->ev[i].nblocks > maxnb)
+					maxnb = e->ev[i].nblocks;
+	} while (tl_walk_next(&w));
+	return maxnb;
+}
+
 /* Does the fork exist on 'timeline' or any ancestor, as of read_lsn? */
 static int
 fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
@@ -5746,7 +5768,9 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 				break;
 			}
-			ch->result = fork_nblocks_through(tl, &ch->key,
+			ch->result = ch->is_redo ?
+				fork_nblocks_recovery(tl, &ch->key) :
+				fork_nblocks_through(tl, &ch->key,
 										  ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										  ch->req_seq);
 			break;
