@@ -769,7 +769,8 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 	int32		resources = PG_GETARG_INT32(4);
 	XLogRecPtr	lsn = PG_GETARG_LSN(5);
 	uint64		admission_seq = PG_NARGS() > 6 ?
-		(uint64) PG_GETARG_INT64(6) : 0;
+		(uint64) PG_GETARG_INT64(6) :
+		pagestore_localsvc_admission_barrier_timeout(30000);
 
 	if (!superuser())
 		ereport(ERROR,
