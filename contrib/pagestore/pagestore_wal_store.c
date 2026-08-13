@@ -250,7 +250,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 		created = 1;
 	else if (errno != EEXIST)
 		return -1;
-	store->directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	store->directory_fd = open(directory,
+					   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
 		return -1;
 	/* Always sync the parent, including EEXIST retries.  A prior attempt may
