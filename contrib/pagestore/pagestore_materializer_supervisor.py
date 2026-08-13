@@ -517,13 +517,16 @@ class Supervisor:
         return self.pg_ctl("status", check=False).returncode == 0
 
     def worker_healthy(self) -> bool:
-        if (
-            self.previous_consumer_data_dir != str(self.config.data_dir)
-            or self.previous_consumer_instance_id
-            != self.config.controller_instance_id
-        ):
-            return False
         try:
+            data_stat = self.config.data_dir.stat()
+            if (
+                self.previous_consumer_data_dir != str(self.config.data_dir)
+                or self.previous_consumer_instance_id
+                != self.config.controller_instance_id
+                or self.previous_consumer_data_dev != data_stat.st_dev
+                or self.previous_consumer_data_ino != data_stat.st_ino
+            ):
+                return False
             expected_data_dir = str(self.config.data_dir).replace("'", "''")
             return (
                 self.psql(
@@ -769,6 +772,14 @@ class Supervisor:
         return True
 
     def run(self, owner: OwnerLock) -> int:
+        if (
+            self.previous_consumer_instance_id is not None
+            and self.previous_consumer_instance_id
+            != self.config.controller_instance_id
+        ):
+            raise OwnershipError(
+                "cannot supervise a materializer owned by another controller instance"
+            )
         owner.publish_owner(os.getpid(), self.owner_epoch)
         self.publish("starting")
         worker_observed = False

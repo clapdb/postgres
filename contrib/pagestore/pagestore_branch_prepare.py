@@ -324,6 +324,10 @@ class Config:
         return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.lock"
 
     @property
+    def retention_authority_file(self) -> Path:
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.json"
+
+    @property
     def receipt_file(self) -> Path:
         return self.prepared_dir / "pagestore_branch.prepare.json"
 
@@ -461,6 +465,26 @@ class BranchPreparer:
             raise BranchPrepareError("writer is not running")
         if not self.server_running(self.config.materializer_data_dir):
             raise BranchPrepareError("materializer is not running")
+        try:
+            authority = json.loads(
+                self.config.retention_authority_file.read_text(encoding="utf-8")
+            )
+            authority_generation = authority["retention_generation"]
+            authority_data_dir = authority["consumer_data_dir"]
+            authority_stat = self.config.materializer_data_dir.stat()
+            if (
+                not isinstance(authority_generation, int)
+                or isinstance(authority_generation, bool)
+                or authority_generation <= 0
+                or authority_data_dir != str(self.config.materializer_data_dir)
+                or authority.get("consumer_data_dev") != authority_stat.st_dev
+                or authority.get("consumer_data_ino") != authority_stat.st_ino
+            ):
+                raise ValueError("authority identity mismatch")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BranchPrepareError(
+                "materializer retention authority does not match the configured consumer"
+            ) from error
         self.writer_extension_schema = self.extension_schema(self.writer_sql, "writer")
         self.materializer_extension_schema = self.extension_schema(
             self.materializer_sql, "materializer"
@@ -505,7 +529,9 @@ class BranchPreparer:
                 " AND current_setting('pagestore.route_all')::boolean"
                 " AND current_setting('pagestore.retention_owner_id') = '"
                 + str(self.config.retention_owner_id) + "'"
-                " AND current_setting('pagestore.timeline')::integer = "
+                " AND current_setting('pagestore.retention_owner_generation')::bigint = "
+                + str(authority_generation)
+                + " AND current_setting('pagestore.timeline')::integer = "
                 f"{self.config.parent_timeline}"
                 " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"
                 " '0/0')::pg_lsn = '0/0'::pg_lsn"

@@ -261,6 +261,18 @@ class BranchPrepareTests(unittest.TestCase):
 
     def test_preflight_discovers_and_qualifies_extension_schemas(self):
         config = MODULE.Config.load(self.write_config())
+        materializer_stat = config.materializer_data_dir.stat()
+        config.retention_authority_file.write_text(
+            json.dumps(
+                {
+                    "retention_generation": 4,
+                    "consumer_data_dir": str(config.materializer_data_dir),
+                    "consumer_data_dev": materializer_stat.st_dev,
+                    "consumer_data_ino": materializer_stat.st_ino,
+                }
+            ),
+            encoding="utf-8",
+        )
 
         class RecordingPreparer(MODULE.BranchPreparer):
             def __init__(self, branch_config):
