@@ -140,6 +140,9 @@ Deliverables:
 - pins survive ordinary process shutdown and restart.  Release happens only
   during authoritative deprovisioning or after a durable handoff to another
   owner that protects an equal-or-older safe horizon;
+- authoritative deprovisioning first fences new operations for that owner and
+  drains every already-admitted page, WAL, and index operation (or retains an
+  equivalent per-operation pin) before durably dropping the owner pin;
 - supervisor handoff/restart behavior that never creates an unprotected window;
 - status/inspection output that identifies active and stale owners.
 
