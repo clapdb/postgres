@@ -101,17 +101,20 @@ list_segments(const PsWalStore *store, uint64_t **numbers_out,
 				const char *timeline_text = entry->d_name + 6;
 				const char *separator = strchr(timeline_text, '_');
 				char canonical[32];
+				uint64_t parsed = 0;
+				int signed_spelling;
+				const char *digits;
+				int valid;
 				int canonical_len = snprintf(canonical, sizeof(canonical), "%u",
 								 store->timeline);
 
 				if (separator == NULL && canonical_len > 0 &&
 					strcmp(timeline_text, canonical) == 0)
 					goto cleanup;
-				uint64_t parsed = 0;
-				int signed_spelling = separator != NULL &&
+				signed_spelling = separator != NULL &&
 					(*timeline_text == '+' || *timeline_text == '-');
-				const char *digits = signed_spelling ? timeline_text + 1 : timeline_text;
-				int valid = separator != NULL && separator != digits;
+				digits = signed_spelling ? timeline_text + 1 : timeline_text;
+				valid = separator != NULL && separator != digits;
 
 				for (const char *p = digits; valid && p < separator; p++)
 				{
