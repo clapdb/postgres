@@ -231,7 +231,7 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	int parent_fd = -1;
 	int n;
 
-	if (store == NULL || directory == NULL)
+	if (store == NULL || directory == NULL || timeline == 0)
 		return -1;
 	if (segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
 		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
