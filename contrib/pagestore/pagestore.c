@@ -12357,9 +12357,14 @@ pagestore_reader_artifact_launcher_main(Datum main_arg)
 		}
 		list_free_deep(databases);
 
+		/* A completed barrier has no reason to force a second checkpoint before
+		 * PostgreSQL's configured checkpoint cadence.  Apart from avoiding idle
+		 * WAL and flush churn, this leaves snapshot production backpressured by
+		 * the normal checkpointer when no reader needs a fresher horizon. */
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 1000L, PG_WAIT_EXTENSION);
+						 (long) CheckPointTimeout * 1000L,
+						 PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
