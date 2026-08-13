@@ -5940,6 +5940,8 @@ ps_core_open(const char *store_dir)
 				errno = EILSEQ;
 				return -1;
 			}
+			if (pin.admission_seq != 0)
+				admission_seq_observe(pin.admission_seq);
 		}
 	}
 
