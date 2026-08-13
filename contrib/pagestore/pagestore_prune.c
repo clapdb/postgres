@@ -28,13 +28,18 @@ ps_page_prune_plan(const PsPruneVersion *versions, uint32_t n,
 
 	for (uint32_t i = 0; i < n; i++)
 	{
+		/* An exact tuple has one authoritative value: the last append.  This
+		 * remains true above the prune frontier, where a future fence at this
+		 * tuple also resolves to that last value. */
+		if (i + 1 < n && versions[i].lsn == versions[i + 1].lsn &&
+			versions[i].admission_seq == versions[i + 1].admission_seq)
+			continue;
 		if (versions[i].lsn <= floor.lsn &&
 			(floor.admission_seq == 0 || versions[i].admission_seq == 0 ||
 			 versions[i].admission_seq <= floor.admission_seq))
 			base = (int) i;
-		/* Every tuple outside the admitted frontier remains a legal future
-		 * fence.  Do not collapse same-LSN variants until the durable tuple
-		 * frontier has advanced past them. */
+		/* Every distinct tuple outside the admitted frontier remains a legal
+		 * future fence. */
 		else
 		{
 			keep[i] = 1;
