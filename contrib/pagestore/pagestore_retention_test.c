@@ -202,6 +202,11 @@ main(void)
 	pin.owner_id = 42;
 	pin.generation = 1;
 	pin.admission_seq = 77;
+	pin.lsn = 99;
+	pin.admission_seq = UINT64_MAX;
+	check(ps_retention_set(&pin) == PS_RETENTION_ERROR,
+		  "unrecoverable maximum admission sequence is rejected");
+	pin.admission_seq = 77;
 	for (uint64_t i = 0; i < 70; i++)
 	{
 		pin.lsn = 100 + i;

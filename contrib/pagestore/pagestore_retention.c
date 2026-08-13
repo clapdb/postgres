@@ -203,7 +203,7 @@ retention_pin_valid(const PsRetentionPin *pin)
 {
 	return pin != NULL && retention_kind_valid(pin->owner_kind) &&
 		retention_resources_valid(pin->resources) && pin->owner_id != 0 &&
-		pin->lsn != 0;
+		pin->lsn != 0 && pin->admission_seq != UINT64_MAX;
 }
 
 static int
