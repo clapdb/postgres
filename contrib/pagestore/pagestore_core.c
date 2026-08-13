@@ -152,6 +152,8 @@ ps_admission_barrier(void)
 
 	pthread_rwlock_wrlock(&admission_lock);
 	seq = admission_seq_alloc();
+	if (seq != 0 && ps_retention_reserve_admission_seq(seq) != 0)
+		seq = 0;
 	pthread_rwlock_unlock(&admission_lock);
 	return seq;
 }
@@ -5885,6 +5887,7 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
@@ -5969,8 +5972,12 @@ ps_core_open(const char *store_dir)
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
 	{
+		uint64_t	admission_highwater;
 		uint32_t	npins = 0;
 
+		if (ps_retention_admission_highwater(&admission_highwater) != 0)
+			return -1;
+		admission_seq_observe(admission_highwater);
 		if (ps_retention_count(&npins) != 0)
 			return -1;
 		for (uint32_t i = 0; i < npins; i++)

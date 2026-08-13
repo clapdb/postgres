@@ -42,6 +42,7 @@ typedef enum PsRetentionRecordType
 {
 	PS_RETENTION_SET = 1,
 	PS_RETENTION_DROP = 2,
+	PS_RETENTION_ADMISSION_RESERVE = 3,
 } PsRetentionRecordType;
 
 typedef struct PsRetentionRecord
@@ -98,6 +99,7 @@ static uint32_t retention_npins;
 static uint32_t retention_cap;
 static uint64_t retention_nrecords;
 static uint64_t retention_mutation_epoch;
+static uint64_t retention_admission_highwater;
 static uint32_t retention_log_hash;
 static int retention_is_poisoned;
 static dev_t retention_dev;
@@ -226,6 +228,15 @@ retention_record_valid(const PsRetentionRecord *rec)
 		return retention_kind_valid(rec->pin.owner_kind) &&
 			rec->pin.owner_id != 0 && rec->pin.resources == 0 &&
 			rec->pin.lsn == 0;
+	if (rec->type == PS_RETENTION_ADMISSION_RESERVE)
+	{
+		PsRetentionPin zero = {0};
+
+		zero.admission_seq = rec->pin.admission_seq;
+		return rec->pin.admission_seq != 0 &&
+			rec->pin.admission_seq < UINT64_MAX - 1 &&
+			memcmp(&rec->pin, &zero, sizeof(zero)) == 0;
+	}
 	return 0;
 }
 
@@ -314,8 +325,17 @@ retention_reserve(uint32_t need)
 static int
 retention_apply(const PsRetentionRecord *rec)
 {
-	int			idx = retention_find(rec->pin.timeline,
-								 rec->pin.owner_kind, rec->pin.owner_id);
+	int			idx;
+
+	if (rec->type == PS_RETENTION_ADMISSION_RESERVE)
+	{
+		if (rec->pin.admission_seq <= retention_admission_highwater)
+			return -1;
+		retention_admission_highwater = rec->pin.admission_seq;
+		return 0;
+	}
+	idx = retention_find(rec->pin.timeline,
+					 rec->pin.owner_kind, rec->pin.owner_id);
 
 	if (rec->type == PS_RETENTION_SET)
 	{
@@ -688,6 +708,17 @@ retention_rewrite_current(void)
 			goto done;
 		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
 	}
+	if (retention_admission_highwater != 0)
+	{
+		PsRetentionPin pin = {0};
+		PsRetentionRecord rec;
+
+		pin.admission_seq = retention_admission_highwater;
+		retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
+		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
+			goto done;
+		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
+	}
 	if (fsync(fd) != 0)
 		goto done;
 	if (close(fd) != 0)
@@ -715,12 +746,14 @@ retention_rewrite_current(void)
 		retention_dev = st.st_dev;
 		retention_ino = st.st_ino;
 	}
-	if (retention_write_state(retention_npins, new_hash) != 0)
+	if (retention_write_state(retention_npins +
+			(retention_admission_highwater != 0), new_hash) != 0)
 	{
 		retention_is_poisoned = 1;
 		goto done;
 	}
-	retention_nrecords = retention_npins;
+	retention_nrecords = retention_npins +
+		(retention_admission_highwater != 0);
 	retention_log_hash = new_hash;
 	if (retention_clear_pending() != 0)
 	{
@@ -764,6 +797,7 @@ ps_retention_open(const char *store_dir)
 	retention_cap = 0;
 	retention_nrecords = 0;
 	retention_mutation_epoch = 0;
+	retention_admission_highwater = 0;
 	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_is_poisoned = 0;
 	retention_dev = 0;
@@ -952,6 +986,7 @@ ps_retention_close(void)
 	retention_cap = 0;
 	retention_nrecords = 0;
 	retention_mutation_epoch = 0;
+	retention_admission_highwater = 0;
 	retention_log_hash = PS_RETENTION_FNV_INIT;
 	retention_path[0] = '\0';
 	retention_marker_path[0] = '\0';
@@ -1010,6 +1045,53 @@ ps_retention_set(const PsRetentionPin *pin)
 		rc = PS_RETENTION_OK;
 	}
 done:
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_reserve_admission_seq(uint64_t admission_seq)
+{
+	PsRetentionPin pin = {0};
+	PsRetentionRecord rec;
+	int			rc = -1;
+
+	if (admission_seq == 0 || admission_seq >= UINT64_MAX - 1)
+		return -1;
+	pthread_mutex_lock(&retention_lock);
+	if (retention_is_poisoned)
+		goto done;
+	if (admission_seq <= retention_admission_highwater)
+	{
+		rc = retention_log_matches() ? 0 : -1;
+		if (rc != 0)
+			retention_is_poisoned = 1;
+		goto done;
+	}
+	pin.admission_seq = admission_seq;
+	retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
+	if (retention_append(&rec) != 0)
+		goto done;
+	retention_admission_highwater = admission_seq;
+	rc = 0;
+done:
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_admission_highwater(uint64_t *admission_seq_out)
+{
+	int			rc = -1;
+
+	if (admission_seq_out == NULL)
+		return -1;
+	pthread_mutex_lock(&retention_lock);
+	if (!retention_is_poisoned)
+	{
+		*admission_seq_out = retention_admission_highwater;
+		rc = 0;
+	}
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }
@@ -1214,7 +1296,7 @@ ps_retention_should_compact(void)
 
 	pthread_mutex_lock(&retention_lock);
 	should = !retention_is_poisoned && retention_nrecords >= 64 &&
-		retention_nrecords > 4 * ((uint64_t) retention_npins + 1) &&
+		retention_nrecords > 4 * ((uint64_t) retention_npins + 2) &&
 		retention_compact_retry_ready();
 	pthread_mutex_unlock(&retention_lock);
 	return should;
@@ -1255,6 +1337,17 @@ ps_retention_compact(void)
 			goto done;
 		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
 	}
+	if (retention_admission_highwater != 0)
+	{
+		PsRetentionPin pin = {0};
+		PsRetentionRecord rec;
+
+		pin.admission_seq = retention_admission_highwater;
+		retention_make_record(&rec, PS_RETENTION_ADMISSION_RESERVE, &pin);
+		if (write(fd, &rec, sizeof(rec)) != (ssize_t) sizeof(rec))
+			goto done;
+		new_hash = retention_fnv1a(new_hash, &rec, sizeof(rec));
+	}
 	if (fsync(fd) != 0)
 	{
 		close(fd);
@@ -1289,12 +1382,14 @@ ps_retention_compact(void)
 		retention_dev = st.st_dev;
 		retention_ino = st.st_ino;
 	}
-	if (retention_write_state(retention_npins, new_hash) != 0)
+	if (retention_write_state(retention_npins +
+			(retention_admission_highwater != 0), new_hash) != 0)
 	{
 		retention_is_poisoned = 1;
 		goto done;
 	}
-	retention_nrecords = retention_npins;
+	retention_nrecords = retention_npins +
+		(retention_admission_highwater != 0);
 	retention_log_hash = new_hash;
 	if (retention_clear_pending() != 0)
 	{

@@ -139,6 +139,7 @@ main(void)
 	PsRetentionPin fenced = {0};
 	PsRetentionPin got;
 	uint32_t	count = 0;
+	uint64_t	admission_highwater = 0;
 	struct stat before,
 				after;
 	int			fd;
@@ -174,6 +175,11 @@ main(void)
 	snprintf(backup, sizeof(backup), "%s.backup", path);
 	snprintf(current, sizeof(current), "%s.current", path);
 	check(ps_retention_open(dir) == 0, "open an empty registry");
+	check(ps_retention_reserve_admission_seq(55) == 0 &&
+		  ps_retention_reserve_admission_seq(54) == 0 &&
+		  ps_retention_admission_highwater(&admission_highwater) == 0 &&
+		  admission_highwater == 55,
+		  "persist an admission reservation high-water without regression");
 	legacy.timeline = 7;
 	legacy.owner_kind = PS_RETENTION_OWNER_READER;
 	legacy.resources = PS_RETENTION_RESOURCE_ALL;
@@ -228,6 +234,9 @@ main(void)
 	ps_retention_close();
 
 	check(ps_retention_open(dir) == 0, "reopen compacted registry");
+	check(ps_retention_admission_highwater(&admission_highwater) == 0 &&
+		  admission_highwater == 55,
+		  "compaction preserves the admission reservation high-water");
 	check(ps_retention_get(0, &got, &count) == 1 && count == 1 &&
 		  got.timeline == 7 && got.owner_id == 42 && got.generation == 1 &&
 		  got.lsn == 169 && got.admission_seq == 77,

@@ -688,17 +688,27 @@ op_retention_set_seq(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 static int
-op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
-				 uint32_t generation, uint32_t resources, uint64_t lsn)
+op_admission_barrier(uint64_t *admission_seq_out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
 	cl_exec();
-	if (ch->req_seq == 0)
+	if (admission_seq_out != NULL)
+		*admission_seq_out = ch->req_seq;
+	return ch->req_seq == 0 ? PS_STATUS_ERROR : ch->status;
+}
+
+static int
+op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+				 uint32_t generation, uint32_t resources, uint64_t lsn)
+{
+	uint64_t	admission_seq;
+
+	if (op_admission_barrier(&admission_seq) != PS_STATUS_OK)
 		return PS_STATUS_ERROR;
 	return op_retention_set_seq(timeline, owner_kind, owner_id, generation,
-							resources, lsn, ch->req_seq);
+							resources, lsn, admission_seq);
 }
 
 static int
@@ -1824,6 +1834,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	unsigned char *readback = malloc(ps);
 	uint64_t	fence_seq;
 	uint64_t	fork_fence_seq;
+	uint64_t	durable_barrier_seq = 0;
 	pid_t		pid;
 
 	fprintf(stderr, "== segment GC ==\n");
@@ -1882,7 +1893,6 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		PsChannel  *write_ch = ps_channel(cl_shm, cl_chan);
 		PsChannel  *barrier_ch = NULL;
 		uint64_t	epoch;
-		uint64_t	barrier_seq = 0;
 
 		op_create_at(rel + 2, 0, 12000);
 		fill_page(page, ps, 12000, 101);
@@ -1920,8 +1930,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			barrier_ch->req_lsn = 0;
 			barrier_ch->req_seq = 0;
 			exec_channel(barrier_ch);
-			barrier_seq = barrier_ch->req_seq;
-			check(barrier_seq != 0,
+			durable_barrier_seq = barrier_ch->req_seq;
+			check(durable_barrier_seq != 0,
 				  "admission barrier returns a durable sequence");
 			check(ps_load_acquire(&write_ch->state) == PS_STATE_REQUEST,
 				  "post-boundary same-LSN write remains gated");
@@ -1930,7 +1940,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			barrier_ch->opcode = PS_OP_READ_AT;
 			barrier_ch->blocknum = 0;
 			barrier_ch->req_lsn = 12000;
-			barrier_ch->req_seq = barrier_seq;
+			barrier_ch->req_seq = durable_barrier_seq;
 			exec_channel(barrier_ch);
 			check(page_has_tag(barrier_ch->data, ps, 101),
 				  "barrier-capped read excludes the gated same-LSN write");
@@ -1944,7 +1954,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			;
 		if (barrier_ch)
 		{
-			check(write_ch->req_seq > barrier_seq,
+			check(write_ch->req_seq > durable_barrier_seq,
 				  "released same-LSN write is admitted after the barrier");
 			ps_store_release(&barrier_ch->claimed, 0);
 		}
@@ -1976,6 +1986,13 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		  "unflushed segment tail survives watermark-boundary crash recovery");
 	check(op_nblocks(rel, 0) == 42,
 		  "fork growth survives layer-prefix recovery after GC");
+	{
+		uint64_t	restarted_barrier_seq = 0;
+
+		check(op_admission_barrier(&restarted_barrier_seq) == PS_STATUS_OK &&
+			  restarted_barrier_seq > durable_barrier_seq,
+			  "restart allocates above an unclaimed durable admission barrier");
+	}
 	client_detach();
 	stop_daemon(pid);
 
