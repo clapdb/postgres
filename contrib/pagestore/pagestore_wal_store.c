@@ -255,7 +255,6 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	store->start_lsn = start_lsn;
 	store->end_lsn = start_lsn;
 	store->next_segment_no = start_lsn / store->segment_size;
-	store->cached_segment_no = UINT64_MAX;
 	return 0;
 }
 
@@ -366,38 +365,6 @@ read_validated_segment_range(PsWalStore *store,
 		(fd = openat(store->directory_fd, name, O_RDONLY)) < 0 ||
 		fstat(fd, &st) != 0)
 		goto cleanup;
-	if (store->cached_segment_no == expected->segment_no &&
-		store->cached_dev == st.st_dev && store->cached_ino == st.st_ino &&
-		store->cached_size == st.st_size &&
-		store->cached_mtime.tv_sec == st.st_mtim.tv_sec &&
-		store->cached_mtime.tv_nsec == st.st_mtim.tv_nsec)
-	{
-		if (range_off + range_len < range_off ||
-			range_off + range_len > expected->payload_len)
-			goto cleanup;
-		if (out != NULL && read_all_at(fd, out, range_len,
-				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) range_off) != 0)
-			goto cleanup;
-		if (compare != NULL)
-		{
-			size_t compared = 0;
-
-			while (compared < range_len)
-			{
-				size_t amount = range_len - compared < sizeof(buf) ?
-					range_len - compared : sizeof(buf);
-
-				if (read_all_at(fd, buf, amount,
-						PS_WAL_SEGMENT_HEADER_BYTES + (off_t) range_off +
-						(off_t) compared) != 0 ||
-					memcmp(buf, compare + compared, amount) != 0)
-					goto cleanup;
-				compared += amount;
-			}
-		}
-		rc = 0;
-		goto cleanup;
-	}
 	if (st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
 						 expected->payload_len) ||
 		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
@@ -443,11 +410,6 @@ read_validated_segment_range(PsWalStore *store,
 	}
 	if (hash != actual.payload_crc)
 		goto cleanup;
-	store->cached_segment_no = expected->segment_no;
-	store->cached_dev = st.st_dev;
-	store->cached_ino = st.st_ino;
-	store->cached_size = st.st_size;
-	store->cached_mtime = st.st_mtim;
 	rc = 0;
 
 cleanup:

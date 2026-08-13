@@ -2,8 +2,6 @@
 #define PAGESTORE_WAL_STORE_H
 
 #include <stdint.h>
-#include <sys/types.h>
-#include <time.h>
 
 #include "pagestore_wal_segment.h"
 
@@ -24,11 +22,6 @@ typedef struct PsWalStore
 	PsWalStoreEntry *entries;
 	uint32_t	nentries;
 	uint32_t	capacity;
-	uint64_t	cached_segment_no;
-	dev_t		cached_dev;
-	ino_t		cached_ino;
-	off_t		cached_size;
-	struct timespec cached_mtime;
 } PsWalStore;
 
 extern int ps_wal_store_create(PsWalStore *store, const char *directory,
