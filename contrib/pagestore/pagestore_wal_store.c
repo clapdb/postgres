@@ -171,8 +171,10 @@ published_segment_matches(PsWalStore *store, const PsWalSegmentHeader *expected,
 	int rc = -1;
 
 	if (segment_name(store, expected->segment_no, name, sizeof(name)) != 0 ||
-		(fd = openat(store->directory_fd, name, O_RDONLY | O_CLOEXEC)) < 0 ||
+		(fd = openat(store->directory_fd, name,
+				 O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) < 0 ||
 		fstat(fd, &st) != 0 ||
+		!S_ISREG(st.st_mode) ||
 		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES + expected->payload_len) ||
 		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
 		ps_wal_segment_decode(&actual, encoded, sizeof(encoded)) != 0 ||
@@ -267,8 +269,8 @@ publish_segment(PsWalStore *store, const PsWalSegmentHeader *header,
 		}
 		goto cleanup;
 	}
-	(void) unlinkat(store->directory_fd, temporary, 0);
-	if (fsync(store->directory_fd) != 0)
+	if (unlinkat(store->directory_fd, temporary, 0) != 0 ||
+		fsync(store->directory_fd) != 0)
 	{
 		if (published_segment_matches(store, header, payload) == 0 &&
 			fsync(store->directory_fd) == 0)
