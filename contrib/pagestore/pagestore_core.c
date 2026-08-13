@@ -6038,10 +6038,20 @@ ps_handle_meta(PsChannel *ch)
 					ps_lock_map_rd();
 					timeline_defined = timelines[tl].defined;
 					ps_unlock_map();
+					/* An active owner can only advance its own horizon.  Its old
+					 * pin already protected all history needed by the newer view, so
+					 * permit the atomic handoff even if a previously published global
+					 * frontier is stricter than the new point. */
 					ret = (((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
 							 !page_frontier_allows(tl, pin.lsn,
-												  pin.admission_seq)) ||
+												  pin.admission_seq) &&
+							 !(old_found == 1 &&
+							   old_pin.generation == pin.generation &&
+							   old_pin.resources == pin.resources &&
+							   (old_pin.lsn < pin.lsn ||
+								(old_pin.lsn == pin.lsn &&
+								 old_pin.admission_seq <= pin.admission_seq)))) ||
 							!timeline_defined) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
