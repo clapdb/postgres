@@ -354,6 +354,9 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 			goto cleanup;
 		if (generation < current.generation)
 			identical = 0;
+		else if (generation > current.generation &&
+				 (start_lsn < current.start_lsn || end_lsn < current.end_lsn))
+			identical = 0;
 		else if (generation == current.generation)
 		{
 			if (current.start_lsn != start_lsn || current.end_lsn != end_lsn ||

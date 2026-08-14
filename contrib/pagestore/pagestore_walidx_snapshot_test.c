@@ -110,6 +110,9 @@ main(void)
 	check(ps_walidx_snapshot_publish(directory, 0, 1, 100, 500,
 								 first, 3) != 0,
 		  "publication cannot move the durable generation backward");
+	check(ps_walidx_snapshot_publish(directory, 0, 3, 400, 1000,
+								 second, 3) != 0,
+		  "a newer generation cannot move its retained frontier backward");
 
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 2ULL, 1U);
