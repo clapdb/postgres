@@ -92,7 +92,8 @@ extern int	wal_retain_floor(uint32_t timeline, uint64_t *floor_out);
 /*
  * Resolve a read into out (page_size bytes), serving from memtable / image
  * layers with a segment fallback.  Returns 1 if found (out filled), 0 if the
- * page is unwritten, and -1 if an authoritative stored version cannot be read.
+ * page is unwritten, -1 if an authoritative stored version cannot be read, and
+ * -2 when the requested capped horizon has been reclaimed.
  */
 extern int	read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 						 uint64_t read_lsn, uint64_t read_seq,

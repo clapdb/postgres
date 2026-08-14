@@ -231,6 +231,9 @@ INSPECTION_RESPONSES = {
         "idle", "claimed", "request", "done", "shards",
         "wal_index_pending_bytes", "wal_index_lagging_timelines",
     },
+    "pruning": {
+        "compactions", "versions_scanned", "versions_kept", "versions_deleted",
+    },
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
 PG_CONTROL_FILE_SIZE = 8192
@@ -1072,6 +1075,7 @@ def run_writer_smoke(
         reader_seeds: dict[str, Path] = {}
         reader_clients: dict[str, tuple[Path, int]] = {}
         reader_data_dirs: dict[str, Path] = {}
+        reader_owner_ids: dict[str, int] = {}
         for action in plan.actions:
             if action["op"] == "sql":
                 sql = action["sql"].replace("${tablespace}", str(tablespace).replace("'", "''"))
@@ -1144,7 +1148,19 @@ CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_
                 sql = f"SELECT pagestore_mark_reader_catalog_snapshot('{reader_data_sql}', 0, '{lsn}'); SELECT pagestore_install_prepared_reader('{str(prepared).replace(chr(39), chr(39) * 2)}', '{reader_data_sql}', 0, '{lsn}')"
                 result = subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", sql], check=True, capture_output=True, encoding="utf-8", env=env)
                 reader_port = free_port()
-                (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(f"pagestore.read_lsn = '{lsn}'\npagestore.route_all = on\narchive_mode = off\nlisten_addresses = ''\nunix_socket_directories = '{reader_socket}'\nport = {reader_port}\n")
+                owner_id = reader_owner_ids.setdefault(
+                    action["target"], 10000 + len(reader_owner_ids) + 1
+                )
+                (reader_data / "postgresql.conf").open("a", encoding="utf-8").write(
+                    f"pagestore.read_lsn = '{lsn}'\n"
+                    "pagestore.retention_owner_generation = '1'\n"
+                    f"pagestore.retention_owner_id = '{owner_id}'\n"
+                    "pagestore.route_all = on\n"
+                    "archive_mode = off\n"
+                    "listen_addresses = ''\n"
+                    f"unix_socket_directories = '{reader_socket}'\n"
+                    f"port = {reader_port}\n"
+                )
                 subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(reader_data), "-l", str(trace / "reader.log"), "-w", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
                 reader_clients[action["target"]] = (reader_socket, reader_port)
                 reader_data_dirs[action["target"]] = reader_data
@@ -1280,6 +1296,7 @@ def run_materializer_smoke(
     dproc: subprocess.Popen[str] | None = None
     supervisor_proc: subprocess.Popen[str] | None = None
     materializer_generation = 0
+    materializer_retention_generation = 0
 
     def sql_result(socket_dir: Path, port: int, sql: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -1337,11 +1354,15 @@ def run_materializer_smoke(
         raise PlanError(f"{context}: last supervisor status {last!r}")
 
     def sync_materializer_generation(status: dict[str, Any]) -> int:
-        nonlocal materializer_generation
+        nonlocal materializer_generation, materializer_retention_generation
         generation = status.get("worker_generation")
+        retention_generation = status.get("retention_generation")
         if not isinstance(generation, int) or generation <= 0:
             raise PlanError(f"invalid supervisor worker generation: {status!r}")
+        if not isinstance(retention_generation, int) or retention_generation <= 0:
+            raise PlanError(f"invalid supervisor retention generation: {status!r}")
         materializer_generation = generation
+        materializer_retention_generation = retention_generation
         return generation
 
     def crash_materializer(reason: str) -> None:
@@ -1517,6 +1538,8 @@ def run_materializer_smoke(
             config.write(
                 "pagestore.route_all = on\n"
                 "pagestore.materializer = on\n"
+                "pagestore.retention_owner_id = '1'\n"
+                "pagestore.retention_owner_generation = '1'\n"
                 "archive_mode = off\n"
                 "hot_standby = on\n"
                 "listen_addresses = ''\n"
@@ -1532,7 +1555,7 @@ def run_materializer_smoke(
         supervisor_config.write_text(
             json.dumps(
                 {
-                    "schema": 1,
+                    "schema": 4,
                     "pg_ctl": str(pg_bin / "pg_ctl"),
                     "psql": str(pg_bin / "psql"),
                     "data_dir": str(materializer_data),
@@ -1540,6 +1563,9 @@ def run_materializer_smoke(
                     "port": materializer_port,
                     "log_file": str(trace / "materializer.log"),
                     "state_dir": str(supervisor_state),
+                    "retention_authority_dir": str(root / "controller-authority"),
+                    "retention_owner_id": 1,
+                    "controller_instance_id": "harness-controller-1",
                     "poll_interval_ms": 100,
                     "replay_idle_ms": 300,
                     "progress_timeout_ms": 10000,
@@ -1587,6 +1613,7 @@ def run_materializer_smoke(
         )
         initial_owner_pid = supervisor_proc.pid
         initial_owner_epoch = supervisor_status["owner_epoch"]
+        initial_retention_generation = materializer_retention_generation
         initial_worker_pid = int(
             (materializer_data / "postmaster.pid")
             .read_text(encoding="utf-8")
@@ -1614,6 +1641,8 @@ def run_materializer_smoke(
                 status.get("owner_pid") == supervisor_proc.pid
                 and status.get("owner_epoch", 0) > initial_owner_epoch
                 and status.get("worker_generation") == materializer_generation
+                and status.get("retention_generation")
+                    == initial_retention_generation
                 and status.get("state")
                 in {"running", "waiting_for_progress_api"}
             ),
@@ -1689,6 +1718,7 @@ def run_materializer_smoke(
                 )
             elif action["op"] == "crash":
                 crashed_generation = materializer_generation
+                crashed_retention_generation = materializer_retention_generation
                 crash_materializer(action["id"])
                 events.emit(
                     "crash", id=action["id"], target="materializer",
@@ -1698,6 +1728,9 @@ def run_materializer_smoke(
                     lambda status: (
                         isinstance(status.get("worker_generation"), int)
                         and status["worker_generation"] > crashed_generation
+                        and isinstance(status.get("retention_generation"), int)
+                        and status["retention_generation"]
+                            > crashed_retention_generation
                         and status.get("state")
                         in {"running", "waiting_for_progress_api"}
                     ),
@@ -1822,7 +1855,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--validate", type=Path, metavar="PLAN")
     group.add_argument("--list", type=Path, metavar="SCENARIO_DIR")
-    group.add_argument("--inspect", choices=["health", "backpressure"])
+    group.add_argument("--inspect", choices=["health", "backpressure", "pruning"])
     group.add_argument("--daemon-smoke", type=Path, metavar="PLAN")
     group.add_argument("--writer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")

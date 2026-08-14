@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <glob.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -134,6 +135,30 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"wal_index_pending_bytes\":0") != NULL &&
 		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
+	check(run_inspector(shm, "pruning", output, sizeof(output)),
+		  "read-only inspector pruning exits cleanly");
+	check(strstr(output, "\"compactions\":") != NULL &&
+		  strstr(output, "\"versions_scanned\":") != NULL &&
+		  strstr(output, "\"versions_kept\":") != NULL &&
+		  strstr(output, "\"versions_deleted\":") != NULL,
+		  "read-only inspector reports page-pruning counters");
+}
+
+static int
+wait_for_daemon_exit(pid_t pid, int expected_status)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		int		status;
+		pid_t		result = waitpid(pid, &status, WNOHANG);
+
+		if (result == pid)
+			return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
+		if (result < 0)
+			return 0;
+		usleep(10000);
+	}
+	return 0;
 }
 
 /* An offline segment-format migration must invalidate derived LSM metadata. */
@@ -518,6 +543,24 @@ op_read_at_seq(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	memcpy(out, ch->data, cl_page_size);
 }
 
+/* Like op_read_at_seq but reports found-ness (ch->result). */
+static int
+op_read_at_seq_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
+					 uint64_t seq, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	ch->req_seq = seq;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
 /* Like op_read_at but reports found-ness (ch->result). */
 static int
 op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
@@ -526,6 +569,23 @@ op_read_at_found(uint32_t rel, int32_t fork, uint32_t block, uint64_t lsn,
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	cl_setkey(ch, rel, fork);
+	ch->opcode = PS_OP_READ_AT;
+	ch->blocknum = block;
+	ch->req_lsn = lsn;
+	if (cl_exec()->result == 0)
+		return 0;
+	memcpy(out, ch->data, cl_page_size);
+	return 1;
+}
+
+static int
+op_read_at_tl_found(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					uint64_t lsn, unsigned char *out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
@@ -669,12 +729,53 @@ op_wal_retain_floor(uint32_t timeline)
 }
 
 static int
+op_retention_set_fenced(uint32_t timeline, uint32_t owner_kind,
+						uint64_t owner_id, uint32_t generation,
+						uint32_t resources, uint64_t lsn,
+						uint64_t admission_seq)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->parent_timeline = resources;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	ch->nblocks = (uint32_t) admission_seq;
+	ch->pad1 = (uint32_t) (admission_seq >> 32);
+	return cl_exec()->status;
+}
+
+static int
+op_retention_set_seq(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					 uint32_t generation, uint32_t resources, uint64_t lsn,
+					 uint64_t admission_seq)
+{
+	return op_retention_set_fenced(timeline, owner_kind, owner_id, generation,
+								resources, lsn, admission_seq);
+}
+
+static int
+op_admission_barrier(uint64_t *admission_seq_out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_ADMISSION_BARRIER;
+	cl_exec();
+	if (admission_seq_out != NULL)
+		*admission_seq_out = ch->req_seq;
+	return ch->req_seq == 0 ? PS_STATUS_ERROR : ch->status;
+}
+
+static int
 op_retention_set(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 				 uint32_t generation, uint32_t resources, uint64_t lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
-	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->timeline = timeline;
 	ch->blocknum = owner_kind;
 	ch->parent_timeline = resources;
@@ -699,15 +800,67 @@ op_retention_drop(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 static int
-op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
+op_retention_get_consistent(uint32_t index, PsRetentionPin *pin,
+							uint32_t *count, uint64_t *epoch, int *found)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	PsRetentionGetResult result;
 
 	ch->opcode = PS_OP_RETENTION_PIN_GET;
 	ch->blocknum = index;
+	ch->req_lsn = *epoch;
 	cl_exec();
+	*found = 0;
 	if (count)
 		*count = ch->nblocks;
+	if (ch->status != PS_STATUS_OK)
+	{
+		if (ch->status == PS_STATUS_STALE)
+			*epoch = ch->req_lsn;
+		return ch->status;
+	}
+	if (ch->datalen != sizeof(result))
+		return PS_STATUS_ERROR;
+	memcpy(&result, ch->data, sizeof(result));
+	*epoch = result.mutation_epoch;
+	if (ch->result == 0)
+		return PS_STATUS_OK;
+	*found = 1;
+	if (pin)
+	{
+		memset(pin, 0, sizeof(*pin));
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+		pin->admission_seq = result.admission_seq;
+	}
+	return PS_STATUS_OK;
+}
+
+static int
+op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
+{
+	uint64_t	epoch = 0;
+	int			found = 0;
+
+	return op_retention_get_consistent(index, pin, count, &epoch, &found) ==
+		PS_STATUS_OK && found;
+}
+
+static int
+op_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
+					PsRetentionPin *pin)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	cl_exec();
 	if (ch->status != PS_STATUS_OK || ch->result == 0)
 		return 0;
 	if (pin)
@@ -719,6 +872,9 @@ op_retention_get(uint32_t index, PsRetentionPin *pin, uint32_t *count)
 		pin->generation = ch->old_nblocks;
 		pin->owner_id = ch->req_seq;
 		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return 0;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
 	}
 	return 1;
 }
@@ -1151,6 +1307,17 @@ page_has_tag(const unsigned char *buf, uint32_t ps, unsigned char tag)
 		if (buf[i] != (unsigned char) (tag ^ (i & 0xFF)))
 			return 0;
 	return 1;
+}
+
+static int
+page_has_lsn(const unsigned char *buf, uint64_t lsn)
+{
+	uint32_t xlogid;
+	uint32_t xrecoff;
+
+	memcpy(&xlogid, buf, 4);
+	memcpy(&xrecoff, buf + 4, 4);
+	return (((uint64_t) xlogid << 32) | xrecoff) == lsn;
 }
 
 static int
@@ -1768,6 +1935,132 @@ segment_exists(const char *store, uint32_t shard, int seg)
 	return access(path, F_OK) == 0;
 }
 
+static int
+local_layer_count(const char *store)
+{
+	char		pattern[512];
+	glob_t		matches;
+	int			count;
+
+	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
+	memset(&matches, 0, sizeof(matches));
+	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+		return 0;
+	count = (int) matches.gl_pathc;
+	globfree(&matches);
+	return count;
+}
+
+static uint64_t
+local_layer_bytes(const char *store)
+{
+	char		pattern[512];
+	glob_t		matches;
+	uint64_t	bytes = 0;
+
+	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
+	memset(&matches, 0, sizeof(matches));
+	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+		return 0;
+	for (size_t i = 0; i < matches.gl_pathc; i++)
+	{
+		struct stat st;
+
+		if (stat(matches.gl_pathv[i], &st) == 0)
+			bytes += (uint64_t) st.st_size;
+	}
+	globfree(&matches);
+	return bytes;
+}
+
+static int
+wait_for_local_layer_bytes(const char *store, uint64_t maximum)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		uint64_t bytes = local_layer_bytes(store);
+
+		/* Compaction publication precedes asynchronous source unlink. */
+		if (bytes > 0 && bytes < maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+read_pruning_metrics(const char *shm, uint64_t *compactions, uint64_t *scanned,
+					 uint64_t *kept, uint64_t *deleted)
+{
+	char output[512];
+	unsigned long long c,
+					s,
+					k,
+					d;
+
+	if (!run_inspector(shm, "pruning", output, sizeof(output)) ||
+		sscanf(output,
+			   "{\"compactions\":%llu,\"versions_scanned\":%llu,"
+			   "\"versions_kept\":%llu,\"versions_deleted\":%llu}",
+			   &c, &s, &k, &d) != 4)
+		return 0;
+	*compactions = (uint64_t) c;
+	*scanned = (uint64_t) s;
+	*kept = (uint64_t) k;
+	*deleted = (uint64_t) d;
+	return 1;
+}
+
+static int
+wait_for_compacted_layers(const char *store, int maximum)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		int count = local_layer_count(store);
+
+		if (count > 0 && count <= maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+wait_for_pruning_compaction(const char *shm, uint32_t rel,
+							uint64_t obsolete_lsn, uint64_t previous,
+							uint64_t *current, unsigned char *readback)
+{
+	uint64_t scanned,
+			 kept,
+			 deleted;
+
+	for (int i = 0; i < 500; i++)
+	{
+		if (!op_read_at_found(rel, 0, 0, obsolete_lsn, readback) &&
+			read_pruning_metrics(shm, current, &scanned, &kept, &deleted) &&
+			*current > previous && scanned == kept + deleted)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+wait_for_accounted_pruning_metrics(const char *shm, uint64_t minimum,
+								   uint64_t *compactions, uint64_t *scanned,
+								   uint64_t *kept, uint64_t *deleted)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		if (read_pruning_metrics(shm, compactions, scanned, kept, deleted) &&
+			*compactions >= minimum && *scanned == *kept + *deleted &&
+			*deleted > 0)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
 static void
 run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 {
@@ -1781,6 +2074,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	unsigned char *readback = malloc(ps);
 	uint64_t	fence_seq;
 	uint64_t	fork_fence_seq;
+	uint64_t	durable_barrier_seq = 0;
 	pid_t		pid;
 
 	fprintf(stderr, "== segment GC ==\n");
@@ -1792,9 +2086,26 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29200,
+						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 5000) ==
+		  PS_STATUS_OK,
+		  "reader pins admission-fenced page history during compaction");
 	op_create_at(rel, 0, 1000);
 	fill_page(page, ps, 5000, 80);
 	fence_seq = op_write_one_seq(rel, 0, 0, page);
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29200,
+								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								  5000, fence_seq) == PS_STATUS_OK,
+		  "reader refines its provisional pin to the exact admission fence");
+	/* The sequence fence disambiguates mutations only at the boundary LSN.
+	 * An older-LSN page admitted later remains part of that as-of view, first
+	 * in the memtable and later in its image layer. */
+	op_create_at(rel + 3, 0, 4000);
+	fill_page(page, ps, 4000, 79);
+	op_write_one(rel + 3, 0, 0, page);
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN memtable page");
 	for (uint32_t block = 1; block < 16; block++)
 	{
 		fill_page(page, ps, 6000 + block, (unsigned char) block);
@@ -1818,6 +2129,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission fence excludes a later same-LSN layer rewrite");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN layer page");
 
 	/* Fork metadata uses the same fence: a same-LSN truncate admitted later
 	 * must not shrink the pinned view. */
@@ -1839,7 +2153,6 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		PsChannel  *write_ch = ps_channel(cl_shm, cl_chan);
 		PsChannel  *barrier_ch = NULL;
 		uint64_t	epoch;
-		uint64_t	barrier_seq = 0;
 
 		op_create_at(rel + 2, 0, 12000);
 		fill_page(page, ps, 12000, 101);
@@ -1877,8 +2190,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			barrier_ch->req_lsn = 0;
 			barrier_ch->req_seq = 0;
 			exec_channel(barrier_ch);
-			barrier_seq = barrier_ch->req_seq;
-			check(barrier_seq != 0,
+			durable_barrier_seq = barrier_ch->req_seq;
+			check(durable_barrier_seq != 0,
 				  "admission barrier returns a durable sequence");
 			check(ps_load_acquire(&write_ch->state) == PS_STATE_REQUEST,
 				  "post-boundary same-LSN write remains gated");
@@ -1887,7 +2200,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			barrier_ch->opcode = PS_OP_READ_AT;
 			barrier_ch->blocknum = 0;
 			barrier_ch->req_lsn = 12000;
-			barrier_ch->req_seq = barrier_seq;
+			barrier_ch->req_seq = durable_barrier_seq;
 			exec_channel(barrier_ch);
 			check(page_has_tag(barrier_ch->data, ps, 101),
 				  "barrier-capped read excludes the gated same-LSN write");
@@ -1901,7 +2214,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 			;
 		if (barrier_ch)
 		{
-			check(write_ch->req_seq > barrier_seq,
+			check(write_ch->req_seq > durable_barrier_seq,
 				  "released same-LSN write is admitted after the barrier");
 			ps_store_release(&barrier_ch->claimed, 0);
 		}
@@ -1926,6 +2239,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission-fenced same-LSN page survives compaction, GC, and restart");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "older-LSN page remains visible through admission-fenced recovery");
 	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
 		  "admission-fenced fork metadata survives restart");
 	op_read_one(rel, 0, 41, readback);
@@ -1933,9 +2249,566 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		  "unflushed segment tail survives watermark-boundary crash recovery");
 	check(op_nblocks(rel, 0) == 42,
 		  "fork growth survives layer-prefix recovery after GC");
+	{
+		uint64_t	restarted_barrier_seq = 0;
+
+		check(op_admission_barrier(&restarted_barrier_seq) == PS_STATUS_OK &&
+			  restarted_barrier_seq > durable_barrier_seq,
+			  "restart allocates above an unclaimed durable admission barrier");
+	}
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 29201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "a durable replacement cutoff protects current page history");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 29200, 1) ==
+		  PS_STATUS_OK,
+		  "dropping the reader releases admission-fenced page history");
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		for (int i = 0; i < 500; i++)
+		{
+			cl_setkey(ch, rel, 0);
+			ch->opcode = PS_OP_READ_AT;
+			ch->blocknum = 0;
+			ch->req_lsn = 5000;
+			ch->req_seq = fence_seq;
+			cl_exec();
+			if (ch->status == PS_STATUS_OK && ch->result == 0)
+				break;
+			usleep(10000);
+		}
+		check(ch->status == PS_STATUS_OK && ch->result == 0,
+			  "retention release recomputes a lone layer without new writes");
+	}
+	for (uint32_t block = 42; block < 66; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_one(rel, 0, block, page);
+	}
+	for (int i = 0; i < 500 && segment_exists(store, shard, 7); i++)
+		usleep(10000);
+	check(!segment_exists(store, shard, 7),
+		  "released page history is covered before its segment is reclaimed");
+	{
+		PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+		for (int i = 0; i < 500; i++)
+		{
+			cl_setkey(ch, rel, 0);
+			ch->opcode = PS_OP_READ_AT;
+			ch->blocknum = 0;
+			ch->req_lsn = 5000;
+			ch->req_seq = fence_seq;
+			cl_exec();
+			if (ch->result == 0)
+				break;
+			usleep(10000);
+		}
+		check(ch->status == PS_STATUS_OK && ch->result == 0,
+			  "live page index forgets history removed by compaction");
+	}
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_seq_found(rel, 0, 0, 5000, fence_seq, readback),
+		  "compaction durably prunes released admission-fenced page history");
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29202, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 7000) ==
+		  PS_STATUS_ERROR,
+		  "restart rejects a pin below the durable page reclamation frontier");
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29203, 1,
+								  PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								  12000, 1) == PS_STATUS_ERROR,
+		  "restart rejects a lower admission fence at the reclaimed frontier LSN");
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29204, 1,
+								  PS_RETENTION_RESOURCE_PAGE_HISTORY,
+								  13000, 1) == PS_STATUS_OK,
+		  "restart accepts a lower admission sequence above the frontier LSN");
+	check(op_create_branch_status(20, 0, 7000) == PS_STATUS_ERROR,
+		  "restart rejects a branch below the durable page reclamation frontier");
 	client_detach();
 	stop_daemon(pid);
 
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	target_shard = test_nshards > 1 ? 1 : 0;
+	uint32_t	rel = find_relation_on_shard(target_shard, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	const struct
+	{
+		uint64_t lsn;
+		unsigned char tag;
+	} versions[] = {{500, 50}, {1000, 100}, {2000, 120},
+				   {3000, 130}, {4000, 140}};
+	pid_t		pid;
+
+	fprintf(stderr, "== branch-projected page pruning ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_branch", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_branch", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (size_t i = 0; i < sizeof(versions) / sizeof(versions[0]); i++)
+	{
+		fill_page(page, ps, versions[i].lsn, versions[i].tag);
+		op_write_tl(0, rel, 0, 0, page);
+	}
+	op_create_branch(20, 0, 3500);
+	op_create_branch(21, 20, 2500);
+	check(op_retention_set(21, PS_RETENTION_OWNER_READER, 2100, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1500) ==
+		  PS_STATUS_OK,
+		  "descendant reader registers a page-history floor below both fork caps");
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(page, ps, 5000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "descendant-pinned history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_tl_found(0, rel, 0, 0, 750, readback),
+		  "compaction prunes history older than the descendant reader base");
+	op_read_at_tl(21, rel, 0, 0, 1500, readback);
+	check(page_has_tag(readback, ps, 100),
+		  "descendant reader floor preserves parent history through nested caps");
+
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2101, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
+		  "branch test installs a replacement operational cutoff");
+	check(op_retention_drop(21, PS_RETENTION_OWNER_READER, 2100, 1) ==
+		  PS_STATUS_OK,
+		  "descendant reader releases its projected page-history floor");
+	for (uint32_t block = 49; block <= 96; block++)
+	{
+		fill_page(page, ps, 6000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "fork-capped history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_tl_found(0, rel, 0, 0, 1500, readback),
+		  "nested structural floor prunes history released by the descendant");
+	op_read_tl(20, rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 130),
+		  "direct child retains the newest parent page below its fork cap");
+	op_read_tl(21, rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 120),
+		  "nested child retains the newest parent page below its lower fork cap");
+
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== relation-lifecycle page pruning ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_relation", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_relation", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 2200, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 6500) ==
+		  PS_STATUS_OK,
+		  "reader pins relation history before truncate/drop/recreate");
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 1500, 15);
+	op_write_tl(0, rel, 0, 0, page);
+	fill_page(page, ps, 6000, 60);
+	op_write_tl(0, rel, 0, 0, page);
+	op_truncate_at(rel, 0, 0, 7000);
+	op_zeroextend_at(rel, 0, 0, 1, 8000);
+	op_unlink_at(rel, 0, 9000);
+	op_create_at(rel, 0, 10000);
+	/* WAL replay can observe the new CREATE before an older UNLINK.  The
+	 * empty generation must survive even though no new page growth follows it. */
+	op_create_at(rel + test_nshards, 0, 1000);
+	fill_page(page, ps, 6000, 61);
+	op_write_tl(0, rel + test_nshards, 0, 0, page);
+	op_create_at(rel + test_nshards, 0, 10000);
+	op_unlink_at(rel + test_nshards, 0, 9000);
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "create before delayed unlink preserves an empty recreated generation");
+	fill_page(page, ps, 11000, 110);
+	op_write_tl(0, rel, 0, 0, page);
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(page, ps, 12000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "relation-lifecycle history reaches a bounded compacted layer set");
+	{
+		char output[512];
+
+		check(run_inspector(shm, "pruning", output, sizeof(output)) &&
+			  strstr(output, "\"compactions\":0") == NULL &&
+			  strstr(output, "\"versions_scanned\":0") == NULL &&
+			  strstr(output, "\"versions_deleted\":0") == NULL,
+			  "pruning inspection exposes nonzero compaction work and deletion");
+	}
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 2000, readback),
+		  "compaction prunes the obsolete page version below the reader base");
+	check(op_read_at_found(rel, 0, 0, 6500, readback) &&
+		  page_has_tag(readback, ps, 60),
+		  "reader base survives relation compaction and restart");
+	check(op_exists_asof(rel, 0, 6500) && op_nblocks_asof(rel, 0, 6500) == 1,
+		  "pre-truncate relation metadata remains visible at the retained floor");
+	check(op_exists_asof(rel, 0, 7500) && op_nblocks_asof(rel, 0, 7500) == 0,
+		  "truncate remains visible after page pruning");
+	check(!op_read_at_found(rel, 0, 0, 7500, readback),
+		  "truncated interval cannot expose the retained page");
+	check(!op_read_at_found(rel, 0, 0, 8500, readback),
+		  "regrowth cannot revive the pre-truncate page bytes");
+	check(!op_exists_asof(rel, 0, 9500),
+		  "drop remains visible between drop and recreate");
+	check(op_exists_asof(rel, 0, 10500) &&
+		  op_nblocks_asof(rel, 0, 10500) == 0,
+		  "recreated relation is empty before its new generation page");
+	check(!op_read_at_found(rel, 0, 0, 10500, readback),
+		  "empty recreated generation cannot expose the dropped generation page");
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "empty generation from create-before-unlink survives restart");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "new relation generation remains current after compaction and restart");
+
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "relation lifecycle establishes a durable replacement cutoff");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 2200, 1) ==
+		  PS_STATUS_OK,
+		  "reader releases relation-lifecycle history");
+	for (uint32_t block = 49; block <= 96; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	{
+		int pruned = 0;
+
+		for (int i = 0; i < 500; i++)
+		{
+			if (!op_read_at_found(rel, 0, 0, 6500, readback))
+			{
+				pruned = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(pruned, "released relation history is compacted again");
+	}
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 6500, readback),
+		  "unprotected pre-truncate page history is durably pruned");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "pruning released history cannot expose an older relation generation");
+
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
+								 const char *phase, int case_no)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	int			crashed_layer_count;
+	char		marker[512];
+	pid_t		pid;
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_crash_%d",
+			 (int) getpid(), case_no);
+	snprintf(store, sizeof(store), "%s/store_prune_crash_%d", tmpbase, case_no);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE", phase, 1) == 0,
+		  "configure guarded compaction fault %s", phase);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	unsetenv("PAGESTORE_TEST_FAULT");
+	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 500);
+	for (uint32_t batch = 1; batch <= 3; batch++)
+	{
+		fill_page(page, ps, batch * 1000, (unsigned char) (batch * 10));
+		op_write_tl(0, rel, 0, 0, page);
+		for (uint32_t i = 1; i < 8; i++)
+		{
+			uint32_t block = (batch - 1) * 7 + i;
+
+			fill_page(page, ps, batch * 1000 + i, (unsigned char) block);
+			op_write_tl(0, rel, 0, block, page);
+		}
+	}
+	fill_page(page, ps, 4000, 40);
+	op_write_tl(0, rel, 0, 0, page);
+	snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
+	{
+		int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+		check(fd >= 0, "arm compaction publication fault %s", phase);
+		if (fd >= 0)
+			close(fd);
+	}
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
+					   23000 + (uint64_t) case_no, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500) == PS_STATUS_OK,
+		  "crash case establishes a durable page cutoff");
+	client_detach();
+	check(wait_for_daemon_exit(pid, 88),
+		  "compaction crashes at deterministic phase %s", phase);
+	unlink(marker);
+	crashed_layer_count = local_layer_count(store);
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 40),
+		  "restart after %s serves the published newest page", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "restart after %s preserves a page present only in compacted layers", phase);
+	check(!op_read_at_found(rel, 0, 0, 1000, readback),
+		  "restart after %s cannot resurrect pruned source history", phase);
+	for (int i = 0; i < 500 &&
+		 local_layer_count(store) >= crashed_layer_count; i++)
+		usleep(10000);
+	check(local_layer_count(store) < crashed_layer_count,
+		  "restart after %s removes a specifically marked source layer", phase);
+	check(wait_for_compacted_layers(store, 3),
+		  "restart after %s resumes deletion and bounds live layers", phase);
+	check(!op_read_at_found(rel, 0, 0, 1000, readback),
+		  "recovered cleanup after %s removes obsolete page history", phase);
+	client_detach();
+	stop_daemon(pid);
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 40),
+		  "second restart after %s preserves the recovered compacted layer", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "second restart after %s preserves compacted-layer-only data", phase);
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_publication_recovery_suite(const char *daemon_path,
+								 const char *tmpbase)
+{
+	fprintf(stderr, "== page-pruning publication recovery ==\n");
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_publish", 1);
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_mark_delete", 2);
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_frontier", 3);
+}
+
+static void
+run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	uint64_t	compactions = 0,
+				scanned = 0,
+				kept = 0,
+				deleted = 0;
+	pid_t		pid;
+
+	fprintf(stderr, "== bounded page-history churn ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_churn", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_churn", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 500);
+	for (uint32_t cycle = 0; cycle < 12; cycle++)
+	{
+		uint64_t	before;
+		uint64_t	obsolete_lsn = 1000 + cycle * 100;
+
+		for (uint32_t write = 0; write < 32; write++)
+		{
+			uint64_t lsn = 1000 + cycle * 100 + write;
+			unsigned char tag = (unsigned char) (20 + cycle * 32 + write);
+
+			fill_page(page, ps, lsn, tag);
+			op_write_tl(0, rel, 0, write % 4, page);
+		}
+		check(read_pruning_metrics(shm, &before, &scanned, &kept, &deleted),
+			  "churn cycle %u captures its post-write pruning baseline", cycle);
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY,
+						   1000 + cycle * 100 + 31) == PS_STATUS_OK,
+			  "churn cycle %u advances its durable page cutoff", cycle);
+		check(wait_for_pruning_compaction(shm, rel, obsolete_lsn, before,
+								  &compactions, readback),
+			  "churn cycle %u waits for its requested pruning pass", cycle);
+		check(wait_for_compacted_layers(store, 3),
+			  "churn cycle %u returns to the configured live-layer bound", cycle);
+	}
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "twelve churn cycles reclaim source layers to a constant-size history");
+	check(wait_for_accounted_pruning_metrics(shm, 12, &compactions, &scanned,
+										  &kept, &deleted),
+		  "pruning counters account for churn and record deleted versions");
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "bounded churn serves the newest page for block %u", block);
+	}
+
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "restart recovers compacted newest page for block %u", block);
+	}
+	{
+		uint64_t before = 0;
+		uint64_t restart_scanned,
+				 restart_kept,
+				 restart_deleted;
+
+		for (uint32_t write = 0; write < 32; write++)
+		{
+			uint64_t lsn = 2200 + write;
+			unsigned char tag = (unsigned char) (20 + 12 * 32 + write);
+
+			fill_page(page, ps, lsn, tag);
+			op_write_tl(0, rel, 0, write % 4, page);
+		}
+		check(read_pruning_metrics(shm, &before, &restart_scanned,
+							   &restart_kept, &restart_deleted),
+			  "restarted churn captures its post-write pruning baseline");
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 2231) ==
+			  PS_STATUS_OK,
+			  "restarted churn advances the restored retention owner");
+		check(wait_for_pruning_compaction(shm, rel, 2200, before,
+								  &compactions, readback),
+			  "restarted churn completes a fresh pruning pass");
+		check(wait_for_compacted_layers(store, 3),
+			  "restarted churn returns to the live-layer bound");
+	}
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "bounded retained page history is physically reclaimed after restart");
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 12 * 32 + 28 + block);
+		uint64_t expected_lsn = 2200 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "restarted bounded churn serves newest block %u", block);
+	}
+	client_detach();
+	stop_daemon(pid);
 	rm_rf(store);
 	shm_unlink(shm);
 	free(page);
@@ -1948,13 +2821,13 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 	char		shm[64];
 	char		store[256];
 	char		orphan[512];
-	char		layer2[512];
 	const uint32_t ps = 8192;
 	const uint32_t rel = 29300;
 	unsigned char *page = malloc(ps);
 	unsigned char *readback = malloc(ps);
 	pid_t		pid;
 	int			fd;
+	struct stat orphan_stat;
 
 	fprintf(stderr, "== orphan layer ID recovery ==\n");
 	snprintf(shm, sizeof(shm), "/pstest_%d_orphan_layer", (int) getpid());
@@ -1984,8 +2857,8 @@ run_orphan_layer_suite(const char *daemon_path, const char *tmpbase)
 		  "recovery skips orphan layer ID and preserves tail bytes");
 	client_detach();
 	stop_daemon(pid);
-	snprintf(layer2, sizeof(layer2), "%s/layer_0_%016llx", store, 2ULL);
-	check(access(layer2, F_OK) == 0, "recovery flush used the next free layer ID");
+	check(stat(orphan, &orphan_stat) == 0 && orphan_stat.st_size == 0,
+		  "recovery leaves the orphan ID untouched while allocating above it");
 
 	rm_rf(store);
 	shm_unlink(shm);
@@ -2194,6 +3067,9 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	wait_ready(shm, page_size);
 	check_inspector(shm, page_size);
 	client_attach(shm, page_size);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29001, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1) == PS_STATUS_OK,
+		  "generic as-of tests pin the history they later read");
 
 	/* --- lifecycle / metadata --- */
 	check(!op_exists(REL_A, FORK0), "fork should not exist before create");
@@ -2756,10 +3632,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 5000) == PS_STATUS_OK,
 		  "reader pin is durably registered");
-	check(op_retention_set(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
+	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_MATERIALIZER, 202,
 						   1,
 						   PS_RETENTION_RESOURCE_WAL |
-						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000) == PS_STATUS_OK,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 3000, 0x100000002ULL) ==
+		  PS_STATUS_OK,
 		  "materializer pin can retain WAL without page history");
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
@@ -2771,8 +3648,35 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_get(2, &pin, &count) && count == 3 &&
 		  pin.owner_kind == PS_RETENTION_OWNER_CONFIGURED && pin.owner_id == 303,
 		  "registry enumeration returns every owner kind");
+	check(op_retention_lookup(0, PS_RETENTION_OWNER_MATERIALIZER, 202, &pin) &&
+		  pin.generation == 1 && pin.lsn == 3000 &&
+		  pin.admission_seq == 0x100000002ULL,
+		  "registry atomically looks up one owner by stable key");
+	check(!op_retention_lookup(0, PS_RETENTION_OWNER_READER, 9999, &pin),
+		  "keyed owner lookup reports an absent owner atomically");
 	check(!op_retention_get(3, &pin, &count) && count == 3,
 		  "registry enumeration ends at the reported count");
+	{
+		uint64_t	epoch = 0;
+		int			found = 0;
+
+		check(op_retention_get_consistent(0, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_OK && found && epoch != 0,
+			  "registry enumeration returns a stable mutation epoch");
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 304,
+							   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4500) ==
+			  PS_STATUS_OK,
+			  "a concurrent owner mutation changes the registry epoch");
+		check(op_retention_get_consistent(1, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_STALE && !found && epoch == 0,
+			  "enumeration detects a mutation and requires restart");
+		check(op_retention_get_consistent(0, &pin, &count, &epoch, &found) ==
+			  PS_STATUS_OK && found && epoch != 0,
+			  "enumeration restarts successfully with its cleared epoch");
+		check(op_retention_drop(0, PS_RETENTION_OWNER_CONFIGURED, 304, 1) ==
+			  PS_STATUS_OK,
+			  "temporary mutation owner is removed");
+	}
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 4000,
 		  "page floor is the minimum matching explicit pin");
@@ -2786,9 +3690,12 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
 						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK,
 		  "SET atomically replaces the same owner generation");
+	check(op_retention_get(0, &pin, &count) && pin.owner_id == 101,
+		  "updated owner exposes its exact admission fence");
 	check(stat(path, &before) == 0, "retention log exists after its first pin");
-	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 101,
-						   1, PS_RETENTION_RESOURCE_ALL, 2000) == PS_STATUS_OK &&
+	check(op_retention_set_seq(0, PS_RETENTION_OWNER_READER, 101,
+							   1, PS_RETENTION_RESOURCE_ALL, 2000,
+							   pin.admission_seq) == PS_STATUS_OK &&
 		  stat(path, &after) == 0 && before.st_size == after.st_size,
 		  "an exact SET retry is idempotent without log churn");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
@@ -2811,8 +3718,8 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 
 	op_create_branch(1, 0, 1500);
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 1500,
-		  "a child fork point structurally pins parent page history");
+		  PS_STATUS_OK && floor == 4000,
+		  "a child fork point does not lower the operational page floor");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL_INDEX, &floor) ==
 		  PS_STATUS_OK && floor == 1500,
 		  "a child fork point structurally pins the parent WAL index");
@@ -2827,11 +3734,11 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  "a descendant pin directly constrains its own timeline");
 	op_create_branch(2, 1, 900);
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "a nested branch's lower fork cap structurally projects to the root");
+		  PS_STATUS_OK && floor == 1000,
+		  "a nested branch remains a discrete root base requirement");
 	check(op_retention_floor(1, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "a nested branch structurally pins its direct parent without an owner pin");
+		  PS_STATUS_OK && floor == 1000,
+		  "a nested branch remains a discrete direct-parent base requirement");
 
 	/* A restorable root control image is another WAL-only authority, and its
 	 * version is below the fork so it constrains both timelines. */
@@ -2856,19 +3763,19 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 		  pin.timeline == 1 && pin.owner_id == 404,
 		  "retention pins survive daemon restart and remain enumerable");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
+		  PS_STATUS_OK && floor == 1000,
 		  "projected effective floor survives restart");
 	check(op_retention_drop(1, PS_RETENTION_OWNER_READER, 404, 1) == PS_STATUS_OK,
 		  "a restarted controller can release its durable pin");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
-		  "dropping the reader leaves the nested structural fork floor");
+		  PS_STATUS_OK && floor == 4000,
+		  "dropping the reader restores the configured operational floor");
 	for (uint64_t owner = 1000; owner < 2025; owner++)
 		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, owner,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 6000 + owner) ==
 			  PS_STATUS_OK, "registry admits more owners than timelines");
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
-		  PS_STATUS_OK && floor == 900,
+		  PS_STATUS_OK && floor == 4000,
 		  "floor snapshot covers every owner beyond MAX_TIMELINES");
 	client_detach();
 	stop_daemon(dpid);
@@ -3005,6 +3912,32 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
 		  "branch truncate remains definitive at newest");
 
+	/* A later regrowth and less-severe shrink cannot erase the older hole in
+	 * inherited storage: block 7 was in the parent at the branch point, but the
+	 * truncate to 2 permanently fenced those bytes on this timeline. */
+	fill_page(p, ps, 8000, 58);
+	op_write_tl(3, REL_B, FORK0, 9, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 8, 9000);
+	check(!op_read_at_tl_found(3, REL_B, FORK0, 7, 9500, rb),
+		  "older branch truncate still fences parent bytes after regrowth");
+
+	/* Arrival order is not version order.  A delayed, older truncate must not
+	 * invalidate a page whose LSN is newer, even though its admission sequence
+	 * was allocated first. */
+	fill_page(p, ps, 10000, 59);
+	op_write_tl(3, REL_B, FORK0, 6, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 2, 9500);
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "delayed older truncate does not invalidate a newer page");
+	{
+		uint32_t current_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(current_nblocks == 7,
+			  "delayed older truncate reconstructs growth from the newer page (got %u)",
+			  current_nblocks);
+	}
+
 	/* Kept event-free locally for the failed WAL-less write test below. */
 	op_create_branch(4, 0, 5000);
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
@@ -3050,8 +3983,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
 	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
 		  "pre-truncate branch-local growth survives restart");
-	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
-		  "branch truncate survives restart");
+	{
+		uint32_t recovered_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(recovered_nblocks == 7,
+			  "reconstructed post-truncate growth survives restart (got %u)",
+			  recovered_nblocks);
+	}
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "newer page remains readable after delayed-truncate recovery");
 	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
 	check(page_has_tag(rb, ps, 11),
 		  "branch-point copied-page floor survives restart");
@@ -3806,6 +4747,14 @@ main(int argc, char **argv)
 	run_markerless_seg0_dedup_suite(daemon_path, tmpbase);
 	/* Layer watermarks permit complete, covered POSIX segments to be removed. */
 	run_segment_gc_suite(daemon_path, tmpbase);
+	/* Descendant owners and nested fork caps constrain parent page pruning. */
+	run_prune_branch_retention_suite(daemon_path, tmpbase);
+	/* Fork lifecycle metadata must continue to gate pruned page generations. */
+	run_prune_relation_lifecycle_suite(daemon_path, tmpbase);
+	/* Compaction publication and old-layer deletion are crash-restartable. */
+	run_prune_publication_recovery_suite(daemon_path, tmpbase);
+	/* Repeated updates and compactions must bound retained page history. */
+	run_prune_bounded_churn_suite(daemon_path, tmpbase);
 	/* Recovery must not reuse a sealed layer file absent from the manifest. */
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */

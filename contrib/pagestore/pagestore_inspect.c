@@ -22,7 +22,7 @@
 static void
 usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s --shm NAME health|backpressure\n", prog);
+	fprintf(stderr, "usage: %s --shm NAME health|backpressure|pruning\n", prog);
 }
 
 static int
@@ -89,6 +89,49 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   ps_load_acquire(&hdr->wal_index_lagging_timelines));
 }
 
+static void
+print_pruning(PsShmHeader *hdr)
+{
+	const unsigned int max_attempts = 10000;
+	uint64_t seq_before,
+			 seq_after,
+			 compactions,
+			 scanned,
+			 kept,
+			 deleted;
+	unsigned int attempt;
+
+	for (attempt = 0; attempt < max_attempts; attempt++)
+	{
+		seq_before = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
+		if (seq_before & 1)
+		{
+			usleep(100);
+			continue;
+		}
+		compactions = ps_load_acquire_u64(&hdr->page_prune_compactions);
+		scanned = ps_load_acquire_u64(&hdr->page_prune_versions_scanned);
+		kept = ps_load_acquire_u64(&hdr->page_prune_versions_kept);
+		deleted = ps_load_acquire_u64(&hdr->page_prune_versions_deleted);
+		seq_after = ps_load_acquire_u64(&hdr->page_prune_metrics_seq);
+		if (seq_before == seq_after && !(seq_after & 1))
+			break;
+		usleep(100);
+	}
+	if (attempt == max_attempts)
+	{
+		fprintf(stderr,
+				"pagestore_inspect: pruning metrics snapshot stayed unstable\n");
+		exit(1);
+	}
+	printf("{\"compactions\":%llu,\"versions_scanned\":%llu,"
+		   "\"versions_kept\":%llu,\"versions_deleted\":%llu}\n",
+		   (unsigned long long) compactions,
+		   (unsigned long long) scanned,
+		   (unsigned long long) kept,
+		   (unsigned long long) deleted);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -104,7 +147,9 @@ main(int argc, char **argv)
 		operation = argv[3];
 	}
 	if (shm_name == NULL ||
-		(strcmp(operation, "health") != 0 && strcmp(operation, "backpressure") != 0))
+		(strcmp(operation, "health") != 0 &&
+		 strcmp(operation, "backpressure") != 0 &&
+		 strcmp(operation, "pruning") != 0))
 	{
 		usage(argv[0]);
 		return 2;
@@ -131,8 +176,10 @@ main(int argc, char **argv)
 	}
 	if (strcmp(operation, "health") == 0)
 		print_health(hdr);
-	else
+	else if (strcmp(operation, "backpressure") == 0)
 		print_backpressure(shm, hdr);
+	else
+		print_pruning(hdr);
 	munmap(shm, PS_SHM_SIZE);
 	return 0;
 }

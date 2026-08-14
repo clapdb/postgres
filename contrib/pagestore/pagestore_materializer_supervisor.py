@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import fcntl
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,7 +20,8 @@ from typing import Any
 
 EX_TEMPFAIL = 75
 EX_CONFIG = 78
-STATUS_SCHEMA = 1
+CONFIG_SCHEMA = 4
+STATUS_SCHEMA = 2
 CONFIG_FIELDS = {
     "schema",
     "pg_ctl",
@@ -30,6 +31,9 @@ CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_authority_dir",
+    "retention_owner_id",
+    "controller_instance_id",
     "database",
     "user",
     "poll_interval_ms",
@@ -49,11 +53,54 @@ REQUIRED_CONFIG_FIELDS = {
     "port",
     "log_file",
     "state_dir",
+    "retention_authority_dir",
+    "retention_owner_id",
+    "controller_instance_id",
 }
 
 
 class ConfigError(ValueError):
     pass
+
+
+def validate_authority_path(authority_dir: Path) -> os.stat_result:
+    """Return the leaf identity after rejecting replaceable path ancestry."""
+    effective_uid = os.geteuid()
+    authority_stat = os.lstat(authority_dir)
+    if (
+        not stat.S_ISDIR(authority_stat.st_mode)
+        or authority_stat.st_uid != effective_uid
+        or stat.S_IMODE(authority_stat.st_mode) != 0o700
+    ):
+        raise ConfigError(
+            "retention_authority_dir must be owned by this user and mode 0700"
+        )
+
+    component = authority_dir.parent
+    immediate = True
+    while True:
+        component_stat = os.lstat(component)
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ConfigError(
+                "retention_authority_dir ancestry must contain only directories"
+            )
+        writable = component_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky = component_stat.st_mode & stat.S_ISVTX
+        if immediate and (
+            component_stat.st_uid != effective_uid or writable
+        ):
+            raise ConfigError(
+                "retention_authority_dir parent must be owner-controlled and not group/world writable"
+            )
+        if not immediate and writable and not sticky:
+            raise ConfigError(
+                "retention_authority_dir ancestry contains a replaceable writable directory"
+            )
+        if component.parent == component:
+            break
+        component = component.parent
+        immediate = False
+    return authority_stat
 
 
 class OwnershipError(RuntimeError):
@@ -69,6 +116,9 @@ class Config:
     port: int
     log_file: Path
     state_dir: Path
+    retention_authority_dir: Path
+    retention_owner_id: int
+    controller_instance_id: str
     database: str = "postgres"
     user: str = "postgres"
     poll_interval_ms: int = 1000
@@ -99,8 +149,13 @@ class Config:
             raise ConfigError(
                 f"missing supervisor config field(s): {', '.join(missing)}"
             )
-        if value.get("schema") != 1 or isinstance(value.get("schema"), bool):
-            raise ConfigError("supervisor config schema must be 1")
+        if (
+            value.get("schema") != CONFIG_SCHEMA
+            or isinstance(value.get("schema"), bool)
+        ):
+            raise ConfigError(
+                f"supervisor config schema must be {CONFIG_SCHEMA}"
+            )
 
         paths: dict[str, Path] = {}
         for field in (
@@ -110,6 +165,7 @@ class Config:
             "socket_dir",
             "log_file",
             "state_dir",
+            "retention_authority_dir",
         ):
             item = value[field]
             if not isinstance(item, str) or not item:
@@ -133,6 +189,7 @@ class Config:
         integers: dict[str, int] = {}
         defaults = {
             "port": None,
+            "retention_owner_id": None,
             "poll_interval_ms": 1000,
             "replay_idle_ms": 3000,
             "progress_timeout_ms": 30000,
@@ -150,13 +207,19 @@ class Config:
             integers[field] = item
         if integers["port"] > 65535:
             raise ConfigError("supervisor config port exceeds 65535")
+        if integers["retention_owner_id"] > (1 << 64) - 1:
+            raise ConfigError("supervisor config retention_owner_id exceeds uint64")
         if integers["retry_initial_ms"] > integers["retry_max_ms"]:
             raise ConfigError("retry_initial_ms must not exceed retry_max_ms")
 
         strings: dict[str, str] = {}
-        for field, default in (("database", "postgres"), ("user", "postgres")):
+        for field, default in (
+            ("controller_instance_id", None),
+            ("database", "postgres"),
+            ("user", "postgres"),
+        ):
             item = value.get(field, default)
-            if not isinstance(item, str) or not item:
+            if not isinstance(item, str) or not item or "\x00" in item:
                 raise ConfigError(
                     f"supervisor config {field} must be a non-empty string"
                 )
@@ -165,6 +228,18 @@ class Config:
         try:
             paths["socket_dir"].mkdir(parents=True, exist_ok=True)
             paths["state_dir"].mkdir(parents=True, exist_ok=True)
+            authority_dir = paths["retention_authority_dir"]
+            authority_created = not authority_dir.exists()
+            authority_dir.mkdir(mode=0o700, exist_ok=True)
+            if authority_created:
+                directory_fd = os.open(
+                    authority_dir.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            validate_authority_path(authority_dir)
             paths["log_file"].parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
             raise ConfigError(
@@ -185,6 +260,17 @@ class Config:
     @property
     def status_file(self) -> Path:
         return self.state_dir / "status.json"
+
+    @property
+    def retention_generation_file(self) -> Path:
+        # The controller namespace is shared by every incarnation of an owner;
+        # it is deliberately independent of PGDATA and local status state.
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.json"
+
+    @property
+    def retention_authority_lock_file(self) -> Path:
+        # Serialize generation allocation across replacement PGDATA/status trees.
+        return self.retention_authority_dir / f"retention-owner-{self.retention_owner_id}.lock"
 
 
 @dataclass(frozen=True)
@@ -233,7 +319,8 @@ def retry_delay_ms(config: Config, failures: int) -> int:
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir():
+        raise FileNotFoundError(f"durable state directory is absent: {path.parent}")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
@@ -246,11 +333,7 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            try:
-                os.fsync(directory_fd)
-            except OSError as error:
-                if error.errno not in (errno.EBADF, errno.EINVAL):
-                    raise
+            os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
     finally:
@@ -298,20 +381,27 @@ class OwnerLock:
         self.close()
 
 
-def previous_status(path: Path) -> dict[str, Any]:
+def previous_status(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as error:
+        raise OwnershipError(f"materializer status is unreadable: {error}") from error
+    if not isinstance(value, dict):
+        raise OwnershipError("materializer status is not a JSON object")
+    return value
 
 
 class Supervisor:
     def __init__(self, config: Config) -> None:
         self.config = config
-        old = previous_status(config.status_file)
+        old_value = previous_status(config.status_file)
+        status_exists = old_value is not None
+        old = old_value or {}
         old_epoch = old.get("owner_epoch", 0)
         old_generation = old.get("worker_generation", 0)
+        old_retention_generation = old.get("retention_generation")
         if (
             not isinstance(old_epoch, int)
             or isinstance(old_epoch, bool)
@@ -324,8 +414,76 @@ class Supervisor:
             or old_generation < 0
         ):
             old_generation = 0
+        authority_value = previous_status(config.retention_generation_file)
+        authority_exists = authority_value is not None
+        authority = authority_value or {}
+        authority_generation = authority.get("retention_generation")
+        authority_data_dir = authority.get("consumer_data_dir")
+        authority_instance_id = authority.get("consumer_instance_id")
+        authority_data_dev = authority.get("consumer_data_dev")
+        authority_data_ino = authority.get("consumer_data_ino")
+        authority_namespace_dev = authority.get("authority_namespace_dev")
+        authority_namespace_ino = authority.get("authority_namespace_ino")
+        if authority_exists:
+            if (
+                not isinstance(authority_generation, int)
+                or isinstance(authority_generation, bool)
+                or authority_generation < 1
+                or authority_generation > (1 << 32) - 1
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority is unreadable"
+                )
+            if not isinstance(authority_data_dir, str) or not authority_data_dir:
+                raise OwnershipError(
+                    "materializer retention generation authority lacks consumer identity"
+                )
+            if not isinstance(authority_instance_id, str) or not authority_instance_id:
+                raise OwnershipError(
+                    "materializer retention generation authority lacks controller identity"
+                )
+            if not all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in (
+                    authority_data_dev,
+                    authority_data_ino,
+                    authority_namespace_dev,
+                    authority_namespace_ino,
+                )
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority lacks filesystem identity"
+                )
+            namespace_stat = config.retention_authority_dir.stat()
+            if (
+                authority_namespace_dev != namespace_stat.st_dev
+                or authority_namespace_ino != namespace_stat.st_ino
+            ):
+                raise OwnershipError(
+                    "materializer retention generation authority namespace mismatch"
+                )
+            old_retention_generation = authority_generation
+        elif status_exists:
+            # Status did not durably identify the controller/consumer that
+            # owns its generation, so migration cannot safely quiesce it.
+            raise OwnershipError(
+                "status-only materializer authority cannot be migrated safely"
+            )
+        else:
+            # A genuinely new PGDATA has no prior worker or durable owner.
+            old_retention_generation = 0
+            authority_data_dir = None
+            authority_instance_id = None
+            authority_data_dev = None
+            authority_data_ino = None
         self.owner_epoch = old_epoch + 1
         self.generation = old_generation
+        self.retention_generation = old_retention_generation
+        self.previous_consumer_data_dir = authority_data_dir
+        self.previous_consumer_instance_id = authority_instance_id
+        self.previous_consumer_data_dev = authority_data_dev
+        self.previous_consumer_data_ino = authority_data_ino
+        self.authority_published = authority_exists
         self.failures = 0
         self.last_error: str | None = None
         self.progress: Progress | None = None
@@ -341,12 +499,19 @@ class Supervisor:
         self.lag_started_at: float | None = None
 
     def publish(self, state: str, **fields: Any) -> None:
+        # Never create status-only state.  A restart may interpret any status
+        # file as evidence of a prior retention generation, so authority must
+        # be durable before the first status publication.
+        if not self.authority_published:
+            return
         status = {
             "schema": STATUS_SCHEMA,
             "state": state,
             "owner_pid": os.getpid(),
             "owner_epoch": self.owner_epoch,
             "worker_generation": self.generation,
+            "retention_owner_id": self.config.retention_owner_id,
+            "retention_generation": self.retention_generation,
             "consecutive_failures": self.failures,
             "last_error": self.last_error,
             "updated_at": time.time(),
@@ -405,11 +570,24 @@ class Supervisor:
 
     def worker_healthy(self) -> bool:
         try:
+            data_stat = self.config.data_dir.stat()
+            if (
+                self.previous_consumer_data_dir != str(self.config.data_dir)
+                or self.previous_consumer_instance_id
+                != self.config.controller_instance_id
+                or self.previous_consumer_data_dev != data_stat.st_dev
+                or self.previous_consumer_data_ino != data_stat.st_ino
+            ):
+                return False
             expected_data_dir = str(self.config.data_dir).replace("'", "''")
             return (
                 self.psql(
                     "SELECT pg_is_in_recovery() AND "
                     "current_setting('pagestore.materializer')::boolean AND "
+                    "current_setting('pagestore.retention_owner_id') = '"
+                    + str(self.config.retention_owner_id) + "' AND "
+                    "current_setting('pagestore.retention_owner_generation')::bigint = "
+                    + str(self.retention_generation) + " AND "
                     "current_setting('data_directory') = '" + expected_data_dir + "'"
                 )
                 == "t"
@@ -464,12 +642,85 @@ class Supervisor:
             return None
 
     def start_worker(self, reason: str) -> None:
+        self.quiesce_previous_consumer()
+        if self.retention_generation >= (1 << 32) - 1:
+            raise RuntimeError("materializer retention generation exhausted")
+        self.retention_generation += 1
+        # Persist authority before the worker can register this generation.
+        # Losing status.json after this point cannot cause generation reuse.
+        data_stat = self.config.data_dir.stat()
+        namespace_stat = self.config.retention_authority_dir.stat()
+        atomic_write_json(
+            self.config.retention_generation_file,
+            {
+                "retention_generation": self.retention_generation,
+                "consumer_data_dir": str(self.config.data_dir),
+                "consumer_instance_id": self.config.controller_instance_id,
+                "consumer_data_dev": data_stat.st_dev,
+                "consumer_data_ino": data_stat.st_ino,
+                "authority_namespace_dev": namespace_stat.st_dev,
+                "authority_namespace_ino": namespace_stat.st_ino,
+            },
+        )
+        self.authority_published = True
+        self.previous_consumer_data_dir = str(self.config.data_dir)
+        self.previous_consumer_instance_id = self.config.controller_instance_id
+        self.previous_consumer_data_dev = data_stat.st_dev
+        self.previous_consumer_data_ino = data_stat.st_ino
         self.publish("starting", reason=reason)
-        self.pg_ctl("-l", str(self.config.log_file), "-w", "start")
+        server_options = (
+            "-c pagestore.retention_owner_id="
+            + str(self.config.retention_owner_id)
+            + " -c pagestore.retention_owner_generation="
+            + str(self.retention_generation)
+        )
+        self.pg_ctl(
+            "-l", str(self.config.log_file),
+            "-o", server_options,
+            "-w", "start",
+        )
         self.generation += 1
         if not self.worker_healthy():
             raise RuntimeError("materializer failed its recovery-role health check")
         self.publish("running", reason=reason)
+
+    def quiesce_previous_consumer(self) -> None:
+        previous = self.previous_consumer_data_dir
+        previous_instance = self.previous_consumer_instance_id
+        if previous is None:
+            return
+        if previous_instance != self.config.controller_instance_id:
+            raise OwnershipError(
+                "cannot prove a materializer owned by another controller instance is quiesced"
+            )
+        if not Path(previous).is_dir():
+            raise OwnershipError(
+                "cannot prove the previous materializer consumer is quiesced"
+            )
+        previous_stat = Path(previous).stat()
+        if (
+            previous_stat.st_dev != self.previous_consumer_data_dev
+            or previous_stat.st_ino != self.previous_consumer_data_ino
+        ):
+            raise OwnershipError(
+                "previous materializer data directory identity changed"
+            )
+        status = self.command(
+            [str(self.config.pg_ctl), "-D", previous, "status"], check=False
+        )
+        if status.returncode == 0:
+            self.command(
+                [
+                    str(self.config.pg_ctl), "-D", previous,
+                    "-m", "fast", "-w", "stop",
+                ],
+                check=True,
+                timeout=max(self.config.command_timeout_seconds, 60),
+            )
+        elif status.returncode != 3:
+            raise OwnershipError(
+                "cannot prove the previous materializer consumer is quiesced"
+            )
 
     def stop_worker(self, mode: str, reason: str) -> None:
         self.publish("stopping", mode=mode, reason=reason)
@@ -577,8 +828,15 @@ class Supervisor:
         return True
 
     def run(self, owner: OwnerLock) -> int:
+        if (
+            self.previous_consumer_instance_id is not None
+            and self.previous_consumer_instance_id
+            != self.config.controller_instance_id
+        ):
+            raise OwnershipError(
+                "cannot supervise a materializer owned by another controller instance"
+            )
         owner.publish_owner(os.getpid(), self.owner_epoch)
-        self.publish("starting")
         worker_observed = False
         while not self.stop_requested:
             now = time.monotonic()
@@ -605,6 +863,13 @@ class Supervisor:
                             return 1
                 else:
                     self.publish("degraded")
+            elif not self.authority_published:
+                # A running legacy/direct worker may already own generation 1.
+                # Without durable prior authority there is no safe generation
+                # to advance from, even after pg_ctl reports it stopped.
+                raise OwnershipError(
+                    "running materializer has no durable retention generation authority"
+                )
             elif not self.worker_healthy():
                 if now >= self.retry_not_before:
                     try:
@@ -650,15 +915,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_config:
             print("ok")
             return 0
-        with OwnerLock(config.lock_file) as owner:
-            supervisor = Supervisor(config)
+        with OwnerLock(config.retention_authority_lock_file):
+            with OwnerLock(config.lock_file) as owner:
+                supervisor = Supervisor(config)
 
-            def request_stop(_signum: int, _frame: object) -> None:
-                supervisor.stop_requested = True
+                def request_stop(_signum: int, _frame: object) -> None:
+                    supervisor.stop_requested = True
 
-            signal.signal(signal.SIGINT, request_stop)
-            signal.signal(signal.SIGTERM, request_stop)
-            return supervisor.run(owner)
+                signal.signal(signal.SIGINT, request_stop)
+                signal.signal(signal.SIGTERM, request_stop)
+                return supervisor.run(owner)
     except OwnershipError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return EX_TEMPFAIL

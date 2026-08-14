@@ -1829,8 +1829,9 @@ AND c1.path[c2.level] = c2.path[c2.level];
        <literal>spectoken</literal>,
        <literal>object</literal>,
        <literal>userlock</literal>,
-       <literal>advisory</literal>, or
-       <literal>applytransaction</literal>.
+       <literal>advisory</literal>,
+       <literal>applytransaction</literal>, or
+       <literal>pagestore_reader</literal>.
        (See also <xref linkend="wait-event-lock-table"/>.)
       </para></entry>
      </row>

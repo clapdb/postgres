@@ -4651,6 +4651,7 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 
 /* Post-buffer-flush publication point for recovery materializers. */
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+recovery_start_hook_type recovery_start_hook = NULL;
 
 static inline void
 CallControlFileFlushHook(void)
@@ -8460,10 +8461,6 @@ CreateRestartPoint(int flags)
 	 */
 	flushReplayPtr = GetXLogReplayRecPtr(NULL);
 	CheckPointGuts(lastCheckPoint.redo, flags);
-	if (recovery_restartpoint_flush_hook &&
-		!XLogRecPtrIsInvalid(flushReplayPtr))
-		(*recovery_restartpoint_flush_hook) (flushReplayPtr);
-
 	/*
 	 * This location needs to be after CheckPointGuts() to ensure that some
 	 * work has already happened during this checkpoint.
@@ -8538,6 +8535,16 @@ CreateRestartPoint(int flags)
 
 	/* ship the image queued while ControlFileLock was held */
 	CallControlFileFlushHook();
+
+	/*
+	 * Only now is the restart redo pointer durable in pg_control.  Consumers
+	 * may publish the flushed replay watermark for monitoring, but must not
+	 * release retained WAL beyond this restart location.
+	 */
+	if (recovery_restartpoint_flush_hook &&
+		!XLogRecPtrIsInvalid(flushReplayPtr))
+		(*recovery_restartpoint_flush_hook) (flushReplayPtr,
+											 lastCheckPoint.redo);
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

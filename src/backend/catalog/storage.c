@@ -1023,7 +1023,7 @@ smgr_redo(XLogReaderState *record)
 		 * XLogReadBufferForRedo, we prefer to recreate the rel and replay the
 		 * log as best we can until the drop is seen.
 		 */
-		smgrcreate(reln, MAIN_FORKNUM, true);
+		smgrcreate_ensure(reln, MAIN_FORKNUM);
 
 		/*
 		 * Before we perform the truncation, update minimum recovery point to

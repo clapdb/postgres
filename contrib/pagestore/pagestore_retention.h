@@ -20,11 +20,21 @@ extern void ps_retention_close(void);
 #define PS_RETENTION_STALE	(-2)
 
 extern int ps_retention_set(const PsRetentionPin *pin);
+extern int ps_retention_reserve_and_set(const PsRetentionPin *pin);
+extern int ps_retention_reserve_admission_seq(uint64_t admission_seq);
+extern int ps_retention_admission_highwater(uint64_t *admission_seq_out);
 extern int ps_retention_drop(uint32_t timeline, uint32_t owner_kind,
 								 uint64_t owner_id, uint32_t generation);
 extern int ps_retention_count(uint32_t *count_out);
 extern int ps_retention_get(uint32_t index, PsRetentionPin *pin_out,
 								 uint32_t *count_out);
+extern int ps_retention_get_consistent(uint32_t index, uint64_t *epoch_io,
+										PsRetentionPin *pin_out,
+										uint32_t *count_out);
+extern int ps_retention_lookup(uint32_t timeline, uint32_t owner_kind,
+									uint64_t owner_id, PsRetentionPin *pin_out);
+extern int ps_retention_page_fence_active(uint32_t timeline, uint64_t lsn,
+									uint64_t admission_seq);
 extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 								 uint32_t *count_out);
 extern int ps_retention_snapshot_alloc(PsRetentionPin **pins_out,

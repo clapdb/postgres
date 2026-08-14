@@ -26,7 +26,8 @@ extern PGDLLIMPORT const PgAioHandleCallbacks aio_md_readv_cb;
 extern void mdinit(void);
 extern void mdopen(SMgrRelation reln);
 extern void mdclose(SMgrRelation reln, ForkNumber forknum);
-extern void mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo,
+					 bool isRedoEnsure);
 extern bool mdexists(SMgrRelation reln, ForkNumber forknum);
 extern void mdunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
 extern void mdextend(SMgrRelation reln, ForkNumber forknum,

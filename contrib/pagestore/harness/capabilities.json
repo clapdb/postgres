@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "inspection_schema": 1,
-  "inspection_operations": ["health", "backpressure"],
+  "inspection_operations": ["health", "backpressure", "pruning"],
   "runtimes": {
     "daemon_smoke": {
       "operations": ["crash"],
       "constraints": {
         "crash": {"target": ["store"], "model": ["power_loss"], "forbidden_fields": ["fault"]}
       },
-      "protocol_version": 27,
+      "protocol_version": 32,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -23,7 +23,7 @@
         "assert": {"oracle": ["sql_scalar"]},
         "capture": {"target": ["writer"], "kind": ["reader_datadir"]}
       },
-      "protocol_version": 27,
+      "protocol_version": 32,
       "page_size": 8192,
       "io_unit": 262144
     },
@@ -35,7 +35,7 @@
         "crash": {"target": ["materializer"], "model": ["compute"], "forbidden_fields": ["fault"]},
         "assert": {"target": ["writer", "materializer"], "oracle": ["sql_scalar"]}
       },
-      "protocol_version": 27,
+      "protocol_version": 32,
       "page_size": 8192,
       "io_unit": 262144
     }

@@ -489,7 +489,20 @@ void
 smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	HOLD_INTERRUPTS();
-	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
+	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo, false);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * Ensure that a redo target exists before replaying a page record.  This is
+ * deliberately distinct from replaying an XLOG_SMGR_CREATE record: remote
+ * storage backends need to retain the latter as a generation boundary.
+ */
+void
+smgrcreate_ensure(SMgrRelation reln, ForkNumber forknum)
+{
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_create(reln, forknum, true, true);
 	RESUME_INTERRUPTS();
 }
 
