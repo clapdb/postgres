@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +48,7 @@ main(void)
 {
 	char directory[] = "/tmp/pswalstoreXXXXXX";
 	char path[1024];
+	char temporary_path[1024];
 	char retry_directory[512];
 	char create_retry_directory[512];
 	uint32_t first_len = 2 * TEST_SEGMENT_BYTES;
@@ -89,6 +91,33 @@ main(void)
 	check(ps_wal_store_read(&store, first_len - 32, window, 96) == 0 &&
 		  memcmp(window, input + first_len - 32, 96) == 0,
 		  "read spans segment files created by separate appends");
+	ps_wal_store_close(&store);
+	snprintf(temporary_path, sizeof(temporary_path),
+			 "%s/walv1_7_%020llu.tmp.Ab12Z9", directory, 3ULL);
+	fd = open(temporary_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(fd >= 0 && write(fd, "partial", 7) == 7 && close(fd) == 0,
+		  "leave a recognized pre-publication staging file");
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						 TEST_SEGMENT_BYTES) == 0 &&
+		  store.nentries == 3 && store.end_lsn == first_len + TEST_SEGMENT_BYTES,
+		  "restart rebuilds a contiguous validated segment catalog");
+	check(access(temporary_path, F_OK) != 0 && errno == ENOENT,
+		  "restart durably removes a recognized staging orphan");
+	check(ps_wal_store_read(&store, first_len - 32, window, 96) == 0 &&
+		  memcmp(window, input + first_len - 32, 96) == 0,
+		  "reopened store serves a cross-segment read");
+	ps_wal_store_close(&store);
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
+	snprintf(temporary_path, sizeof(temporary_path), "%s/held_segment", directory);
+	check(rename(path, temporary_path) == 0,
+		  "temporarily remove the middle segment from the catalog");
+	check(ps_wal_store_open(&store, directory, 7, 0,
+						 TEST_SEGMENT_BYTES) != 0,
+		  "restart rejects a gap in immutable segment identities");
+	check(rename(temporary_path, path) == 0 &&
+		  ps_wal_store_open(&store, directory, 7, 0,
+						 TEST_SEGMENT_BYTES) == 0,
+		  "restart succeeds after the contiguous segment is restored");
 	check(ps_wal_store_append(&store, store.end_lsn + 1, input, 1) != 0,
 		  "append rejects a gap in shipped WAL");
 	check(ps_wal_store_read(&store, UINT64_MAX, window, 1) != 0 &&

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,9 @@
 #include <unistd.h>
 
 #include "pagestore_wal_store.h"
+
+static int segment_name(const PsWalStore *store, uint64_t segment_no,
+						char *name, size_t name_len);
 
 static int
 reserve_entry(PsWalStore *store)
@@ -25,6 +29,34 @@ reserve_entry(PsWalStore *store)
 		return -1;
 	store->entries = grown;
 	store->capacity = capacity;
+	return 0;
+}
+
+static int
+initialize_store(PsWalStore *store, const char *directory, uint32_t timeline,
+				 uint64_t start_lsn, uint32_t segment_size)
+{
+	char path[128];
+	int n;
+
+	if (store == NULL || directory == NULL || timeline == 0 ||
+		segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
+		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
+		(segment_size & (segment_size - 1)) != 0 ||
+		start_lsn % segment_size != 0 ||
+		start_lsn > UINT64_MAX - segment_size)
+		return -1;
+	memset(store, 0, sizeof(*store));
+	store->directory_fd = -1;
+	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
+	store->timeline = timeline;
+	store->segment_size = segment_size;
+	if (n < 0 || (size_t) n >= sizeof(store->directory) ||
+		segment_name(store, UINT64_MAX, path, sizeof(path)) != 0)
+		return -1;
+	store->start_lsn = start_lsn;
+	store->end_lsn = start_lsn;
+	store->next_segment_no = start_lsn / segment_size;
 	return 0;
 }
 
@@ -310,32 +342,18 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 					uint32_t timeline, uint64_t start_lsn,
 					uint32_t segment_size)
 {
-	char path[128];
 	int created = 0;
 	int parent_fd = -1;
-	int n;
 
-	if (store == NULL || directory == NULL || timeline == 0)
-		return -1;
-	if (segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
-		segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
-		(segment_size & (segment_size - 1)) != 0 ||
-		start_lsn % segment_size != 0 ||
-		start_lsn > UINT64_MAX - segment_size)
-		return -1;
-	memset(store, 0, sizeof(*store));
-	store->directory_fd = -1;
-	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
-	store->timeline = timeline;
-	store->segment_size = segment_size;
-	if (n < 0 || (size_t) n >= sizeof(store->directory) ||
-		segment_name(store, UINT64_MAX, path, sizeof(path)) != 0)
+	if (initialize_store(store, directory, timeline, start_lsn,
+					 segment_size) != 0)
 		return -1;
 	if (mkdir(directory, 0700) == 0)
 		created = 1;
 	else if (errno != EEXIST)
 		return -1;
-	store->directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	store->directory_fd = open(directory,
+							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
 		return -1;
 	/* Always sync the parent, including EEXIST retries.  A prior attempt may
@@ -364,10 +382,180 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 			return -1;
 		}
 	}
-	store->start_lsn = start_lsn;
-	store->end_lsn = start_lsn;
-	store->next_segment_no = start_lsn / store->segment_size;
 	return 0;
+}
+
+static int
+load_segment(PsWalStore *store, uint64_t segment_no)
+{
+	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
+	PsWalSegmentHeader header;
+	struct stat st;
+	char name[128];
+	uint32_t *hashes = NULL;
+	uint32_t nchunks;
+	uint32_t payload_crc = 2166136261u;
+	uint32_t done = 0;
+	int fd = -1;
+	int rc = -1;
+
+	if (segment_name(store, segment_no, name, sizeof(name)) != 0 ||
+		(fd = openat(store->directory_fd, name,
+					 O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) < 0 ||
+		fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
+		ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
+		header.timeline != store->timeline ||
+		header.segment_no != segment_no ||
+		header.start_lsn != store->end_lsn ||
+		header.segment_size != store->segment_size ||
+		header.payload_len != store->segment_size ||
+		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
+							 header.payload_len))
+		goto cleanup;
+	nchunks = (header.payload_len + PS_WAL_STORE_VERIFY_CHUNK_BYTES - 1) /
+		PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+	hashes = malloc((size_t) nchunks * sizeof(*hashes));
+	if (hashes == NULL || reserve_entry(store) != 0)
+		goto cleanup;
+	for (uint32_t i = 0; i < nchunks; i++)
+	{
+		uint32_t amount = header.payload_len - done < sizeof(buf) ?
+			header.payload_len - done : (uint32_t) sizeof(buf);
+
+		if (read_all_at(fd, buf, amount,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0)
+			goto cleanup;
+		hashes[i] = wal_payload_hash(2166136261u, buf, amount);
+		payload_crc = wal_payload_hash(payload_crc, buf, amount);
+		done += amount;
+	}
+	if (payload_crc != header.payload_crc)
+		goto cleanup;
+	store->entries[store->nentries].header = header;
+	store->entries[store->nentries].chunk_hashes = hashes;
+	store->entries[store->nentries].nchunks = nchunks;
+	hashes = NULL;
+	store->nentries++;
+	store->next_segment_no++;
+	store->end_lsn += header.payload_len;
+	rc = 0;
+
+cleanup:
+	free(hashes);
+	if (fd >= 0)
+		close(fd);
+	return rc;
+}
+
+int
+ps_wal_store_open(PsWalStore *store, const char *directory,
+				  uint32_t timeline, uint64_t start_lsn,
+				  uint32_t segment_size)
+{
+	struct dirent *de;
+	DIR *dir = NULL;
+	uint64_t count = 0;
+	char prefix[64];
+	int prefix_len;
+	int parent_fd = -1;
+	int scan_fd = -1;
+	int removed_temporary = 0;
+	int rc = -1;
+
+	if (initialize_store(store, directory, timeline, start_lsn,
+					 segment_size) != 0)
+		return -1;
+	store->directory_fd = open(directory,
+							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (store->directory_fd < 0)
+		return -1;
+	/* An earlier create may have exposed the directory and then reported an
+	 * ambiguous parent-fsync failure.  Reopen completes that durability step
+	 * before accepting or publishing segment contents. */
+	parent_fd = openat(store->directory_fd, "..",
+					 O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (parent_fd < 0)
+		goto cleanup;
+	if (fsync(parent_fd) != 0)
+	{
+		close(parent_fd);
+		parent_fd = -1;
+		goto cleanup;
+	}
+	if (close(parent_fd) != 0)
+	{
+		parent_fd = -1;
+		goto cleanup;
+	}
+	parent_fd = -1;
+	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", timeline);
+	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
+		(scan_fd = dup(store->directory_fd)) < 0 ||
+		(dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	while ((de = readdir(dir)) != NULL)
+	{
+		char expected[128];
+		char *end = NULL;
+		unsigned long long parsed;
+		const char *suffix;
+
+		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
+			continue;
+		parsed = strtoull(de->d_name + prefix_len, &end, 10);
+		if (end == de->d_name + prefix_len ||
+			segment_name(store, (uint64_t) parsed, expected,
+						 sizeof(expected)) != 0)
+			goto cleanup;
+		if (*end == '\0' && strcmp(expected, de->d_name) == 0)
+		{
+			if ((uint64_t) parsed < store->next_segment_no)
+				goto cleanup;
+			count++;
+			continue;
+		}
+		/* A crash before publication may leave only the private staging link.
+		 * Its strictly generated name is safe to unlink; malformed names fail
+		 * closed so startup never guesses about user data. */
+		suffix = de->d_name + strlen(expected);
+		if (strncmp(de->d_name, expected, strlen(expected)) != 0 ||
+			strncmp(suffix, ".tmp.", 5) != 0 || strlen(suffix + 5) != 6)
+			goto cleanup;
+		for (size_t i = 0; i < 6; i++)
+			if (!((suffix[5 + i] >= '0' && suffix[5 + i] <= '9') ||
+				  (suffix[5 + i] >= 'A' && suffix[5 + i] <= 'Z') ||
+				  (suffix[5 + i] >= 'a' && suffix[5 + i] <= 'z')))
+				goto cleanup;
+		if (unlinkat(store->directory_fd, de->d_name, 0) != 0)
+			goto cleanup;
+		removed_temporary = 1;
+	}
+	if (closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto cleanup;
+	}
+	dir = NULL;
+	if (removed_temporary && fsync(store->directory_fd) != 0)
+		goto cleanup;
+	for (uint64_t i = 0; i < count; i++)
+		if (load_segment(store, store->next_segment_no) != 0)
+			goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	if (scan_fd >= 0)
+		close(scan_fd);
+	if (parent_fd >= 0)
+		close(parent_fd);
+	if (rc != 0)
+		ps_wal_store_close(store);
+	return rc;
 }
 
 /* Start at the first overlapping entry.  Segment validation streams through a
