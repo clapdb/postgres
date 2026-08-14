@@ -1218,7 +1218,7 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec();
 }
 
-static void
+static int
 op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
 					const uint32_t *blocks, const uint64_t *lsns,
 					const uint32_t *flags, uint32_t nentries)
@@ -1239,7 +1239,7 @@ op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
 	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
 	ch->nblocks = nentries;
 	ch->datalen = nentries * sizeof(*entries);
-	cl_exec();
+	return cl_exec()->status;
 }
 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
@@ -1270,6 +1270,30 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			  uint64_t lsn_max, PsWalRec *out)
 {
 	return op_walidx_get_after(tl, rel, fork, block, lsn_max, 0, 0, 0, 0, out);
+}
+
+static int
+op_walidx_get_status(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					 uint64_t lsn_max, PsWalRec *out, int *count_out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int status;
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = block;
+	ch->nblocks = 0;
+	ch->req_lsn = lsn_max;
+	ch->pad1 = 0;
+	ch->req_seq = 0;
+	ch->parent_timeline = 0;
+	cl_exec();
+	status = ch->status;
+	*count_out = (int) ch->result;
+	if (status == PS_STATUS_OK)
+		memcpy(out, ch->data, (size_t) *count_out * sizeof(PsWalRec));
+	return status;
 }
 
 static int
@@ -4582,9 +4606,203 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	check(out[0].timeline == 0 && out[1].timeline == 0 && out[2].timeline == 1,
 		  "each record carries its source timeline tag (parent=0, branch=1)");
 
+	/* A metadata-complete timeline can advance independently of a fixed reader:
+	 * retain that reader's exact FPI-led chain plus the newest operational chain,
+	 * while rejecting every unrepresented point below the durable frontier. */
+	op_create_branch(5, 0, 0);
+	op_wal_append(5, 0, wal, sizeof(wal));
+	{
+		const uint32_t blocks[] = {12, 12, 12, 12, 12, 12};
+		const uint64_t lsns[] = {10, 30, 50, 70, 90, 110};
+		const uint32_t flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+		int compacted = 0;
+
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5001, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_OK,
+			  "register a fixed WAL-index horizon before compaction");
+		op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 6);
+		check(op_walidx_progress(5, 0, sizeof(wal), NULL) == 0,
+			  "commit the metadata-complete WAL-index interval");
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			int count = 0;
+
+			if (op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal),
+									 out, &count) == PS_STATUS_OK && count == 4)
+			{
+				compacted = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(compacted && out[0].lsn == 10 && out[1].lsn == 30 &&
+			  out[2].lsn == 90 && out[3].lsn == 110,
+			  "compaction retains the discrete and operational redo chains");
+	}
+	{
+		int count = 0;
+
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_OK && count == 2 && out[0].lsn == 10 && out[1].lsn == 30,
+			  "the active exact pin can read its retained replacement chain");
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5002, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 60) == PS_STATUS_ERROR,
+			  "a new pin at an unrepresented point below the frontier is rejected");
+		check(op_create_branch_status(6, 5, 60) == PS_STATUS_ERROR,
+			  "a branch at an unrepresented WAL-index point is rejected");
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5004, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_OK,
+			  "another owner can share an exactly retained WAL-index exception");
+		check(op_retention_drop(5, PS_RETENTION_OWNER_READER, 5001, 1) ==
+			  PS_STATUS_OK,
+			  "drop the original fixed WAL-index owner");
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_OK &&
+			  op_retention_drop(5, PS_RETENTION_OWNER_READER, 5004, 1) ==
+			  PS_STATUS_OK,
+			  "the shared exception remains until its final owner drops");
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_ERROR &&
+			  op_retention_set(5, PS_RETENTION_OWNER_READER, 5003, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_ERROR,
+			  "a retired exception cannot authorize reads or later admissions");
+	}
+
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE",
+				 "after_walidx_frontier", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
+		  "configure WAL-index frontier publication crash");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_FAULT");
+	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_wal_append(5, sizeof(wal), wal, sizeof(wal));
+	{
+		const uint32_t blocks[] = {12, 12};
+		const uint64_t lsns[] = {530, 550};
+		const uint32_t flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+		char marker[512];
+		int fd;
+
+		op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 2);
+		snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
+		fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && close(fd) == 0,
+			  "arm the WAL-index frontier publication crash");
+		check(op_walidx_progress(5, sizeof(wal), sizeof(wal) * 2, NULL) == 0,
+			  "commit a second WAL-index interval for crash recovery");
+		client_detach();
+		check(wait_for_daemon_exit(dpid, 88),
+			  "WAL-index compaction crashes after durable frontier publication");
+		unlink(marker);
+	}
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "hold the crashed WAL-index generation pending for admission tests");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		const uint32_t blocks[] = {12};
+		const uint64_t lsns[] = {570};
+		const uint32_t flags[] = {PS_WAL_INDEX_FLAG_KNOWN};
+
+		check(op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 1) ==
+			  PS_STATUS_ERROR &&
+			  op_retention_set(5, PS_RETENTION_OWNER_READER, 5005, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX, 1200) ==
+			  PS_STATUS_ERROR &&
+			  op_create_branch_status(6, 5, sizeof(wal) * 2) == PS_STATUS_ERROR,
+			  "pending frontier cutover backpressures index, pin, and branch mutations");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
+		  "enable immediate WAL-index publication retry after crash");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		int count = 0;
+		int recovered = 0;
+
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			if (op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal) * 2,
+									 out, &count) == PS_STATUS_OK && count == 2)
+			{
+				recovered = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(recovered && out[0].lsn == 530 && out[1].lsn == 550 &&
+			  op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal), out,
+									 &count) ==
+			  PS_STATUS_ERROR,
+			  "restart retries the prepared generation behind its durable frontier");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		int count = 0;
+
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal) * 2,
+									 out, &count) == PS_STATUS_OK && count == 2 &&
+			  out[0].lsn == 530 && out[1].lsn == 550,
+			  "second restart preserves the compacted snapshot and frontier");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	{
+		char path[512];
+		unsigned char byte;
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/walidx-prune.frontiers", store);
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && read(fd, &byte, 1) == 1 &&
+			  pwrite(fd, (unsigned char[]) {byte ^ 0xff}, 1, 0) == 1 &&
+			  fsync(fd) == 0 && close(fd) == 0,
+			  "corrupt the durable WAL-index frontier checksum domain");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+						   "corrupt WAL-index frontier fails startup closed");
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && pwrite(fd, &byte, 1, 0) == 1 && fsync(fd) == 0 &&
+			  close(fd) == 0,
+			  "restore the WAL-index frontier for later recovery tests");
+	}
 	if (walidx_nshards > 2)
 	{
 		char path[512];

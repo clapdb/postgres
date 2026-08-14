@@ -346,21 +346,26 @@ coordinated or stacked with R4 where the acceptance criteria overlap.
 
 ### R4. Compact and reclaim the WAL index
 
-Status: **R4a durable multi-shard snapshot generation, live cutover, and raw
-log-epoch reclamation implemented.  New index records durably carry explicit
-known/FPI metadata and the decoded record-end LSN needed for fence visibility
-(legacy records remain unknown and conservatively unprunable).  The pure
-replacement-base planner now retains the union of the operational chain,
-discrete owner/branch chains, and the future tail while failing closed without
-known metadata or an FPI; durable frontier/cutover integration and snapshot
-entry compaction remain**.
+Status: **implemented for the MVP POSIX path**.  New records durably carry
+known/FPI metadata and decoded record-end LSNs; legacy records remain unknown
+and conservatively unprunable.  Timeline compaction proves every page across
+all configured shards, retains the union of the operational FPI-led chain,
+discrete owner/branch chains, and the future tail, and falls back to a complete
+snapshot if any shard cannot prove a base.  A checksummed durable timeline
+frontier rejects unrepresented reads, pins, and branches after restart.
 
 Snapshot publication now also exposes an explicit staged boundary: prepare
 writes, checksum-validates, and fsyncs every immutable shard without changing
 the selected manifest; commit revalidates those files and atomically selects
 the generation.  R4 frontier integration can therefore publish its durable
 reclamation fence between prepare and commit, matching the page-compaction
-write-replacement-before-frontier-before-retirement ordering.
+write-replacement-before-frontier-before-retirement ordering.  Live cutover
+uses exactly that order, then removes discarded entries from memory only after
+the compacted manifest is selected.  If a crash leaves the durable frontier
+ahead of the selected snapshot, recovery serves the conservative old snapshot
+but backpressures WAL-index append/progress, WAL-index pin mutation, and branch
+creation until it retries the already-prepared generation; its immutable
+replacement inputs therefore cannot diverge during the recovery window.
 
 R4a publishes every per-shard snapshot as an immutable checksummed file before
 atomically replacing one checksummed timeline manifest.  Recovery validates
@@ -376,8 +381,8 @@ and idempotently removes older immutable snapshot shard generations; newer
 unpublished retry files are preserved.  New payloads also name one prepared,
 durable log epoch per shard.  The manifest atomically selects those empty log
 epochs with the snapshot, later appends land only in the selected epochs, and
-maintenance removes legacy/older log epochs.  Snapshot entries and raw WAL are
-not pruned yet.
+maintenance removes legacy/older log epochs.  Snapshot entries are now pruned;
+raw WAL reclamation remains R3b.
 
 Deliverables:
 
@@ -788,15 +793,14 @@ packaging do not block MVP completion.
 
 The remaining default sequence is:
 
-1. select replacement bases and compact retained WAL-index snapshot entries;
-2. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
-3. R4b forkmeta compaction/reclamation and publication crash tests;
-4. R5 timeline deletion;
-5. R5b reclaimer backpressure controllers;
-6. H0 fault/inspection primitives (may proceed alongside R3/R4);
-7. H1 composed crash scenarios;
-8. H2 format fixtures and compatibility CI;
-9. R6 bounded-space acceptance and final MVP status update.
+1. R3b WAL reclaimer, now enabled by replacement-base compaction;
+2. R4b forkmeta compaction/reclamation and publication crash tests;
+3. R5 timeline deletion;
+4. R5b reclaimer backpressure controllers;
+5. H0 fault/inspection primitives;
+6. H1 composed crash scenarios;
+7. H2 format fixtures and compatibility CI;
+8. R6 bounded-space acceptance and final MVP status update.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -811,3 +815,4 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
+| 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |

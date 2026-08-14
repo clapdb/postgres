@@ -52,6 +52,7 @@
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 #include "pagestore_wal_store.h"
+#include "pagestore_walidx_prune.h"
 #include "pagestore_walidx_snapshot.h"
 
 /* configuration, set by the frontend before ps_core_open() */
@@ -103,6 +104,8 @@ static int retention_project_lsn(uint32_t descendant, uint32_t target,
 static int timeline_has_parent(uint32_t timeline);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
+static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
+								   uint32_t *nfences_out);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -119,6 +122,9 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* WAL-index pins must stay fixed from replacement-chain planning through the
+ * durable frontier and generation-manifest cutover. */
+static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *metrics_header;
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
@@ -136,6 +142,24 @@ static PsPruneFence page_reclaimed_frontier[1024];
 static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 								 uint64_t admission_seq);
+
+#define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
+#define PS_WALIDX_FRONTIER_VERSION 1
+typedef struct PsWalIdxFrontierState
+{
+	uint32_t	magic;
+	uint32_t	version;
+	uint64_t	frontiers[1024];
+	uint32_t	crc;
+} PsWalIdxFrontierState;
+static char walidx_frontier_path[4096];
+static char walidx_frontier_dir[4096];
+static uint64_t walidx_reclaimed_frontier[1024];
+static int walidx_frontier_load(const char *store_dir);
+static int walidx_frontier_advance(uint32_t timeline, uint64_t frontier);
+static int walidx_frontier_ancestry_allows(uint32_t reader_timeline,
+									   uint64_t read_lsn);
+static int walidx_frontier_publication_pending(uint32_t timeline);
 
 /* Test-only crash boundaries for publication recovery.  They are inert unless
  * the daemon was explicitly started with the fault switch and the test has
@@ -1870,6 +1894,156 @@ page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 	return 1;
 }
 
+static uint32_t
+walidx_frontier_crc(const PsWalIdxFrontierState *state)
+{
+	return fnv(state, offsetof(PsWalIdxFrontierState, crc));
+}
+
+static int
+walidx_frontier_publish(void)
+{
+	PsWalIdxFrontierState state;
+	char		tmp[4096];
+	int			fd = -1;
+	int			n;
+	int			rc = -1;
+
+	memset(&state, 0, sizeof(state));
+	state.magic = PS_WALIDX_FRONTIER_MAGIC;
+	state.version = PS_WALIDX_FRONTIER_VERSION;
+	memcpy(state.frontiers, walidx_reclaimed_frontier,
+		   sizeof(state.frontiers));
+	state.crc = walidx_frontier_crc(&state);
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", walidx_frontier_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0 || write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0)
+		goto done;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (rename(tmp, walidx_frontier_path) != 0 ||
+		fsync_dir_path(walidx_frontier_dir) != 0)
+		goto done;
+	rc = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0)
+		unlink(tmp);
+	return rc;
+}
+
+static int
+walidx_frontier_load(const char *store_dir)
+{
+	PsWalIdxFrontierState state;
+	unsigned char extra;
+	int			fd;
+	int			n;
+
+	memset(walidx_reclaimed_frontier, 0,
+		   sizeof(walidx_reclaimed_frontier));
+	n = snprintf(walidx_frontier_dir, sizeof(walidx_frontier_dir), "%s",
+				 store_dir);
+	if (n < 0 || (size_t) n >= sizeof(walidx_frontier_dir))
+		return -1;
+	n = snprintf(walidx_frontier_path, sizeof(walidx_frontier_path),
+				 "%s/walidx-prune.frontiers", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(walidx_frontier_path))
+		return -1;
+	fd = open(walidx_frontier_path, O_RDONLY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		read(fd, &extra, 1) != 0 ||
+		state.magic != PS_WALIDX_FRONTIER_MAGIC ||
+		state.version != PS_WALIDX_FRONTIER_VERSION ||
+		state.crc != walidx_frontier_crc(&state))
+	{
+		close(fd);
+		errno = EILSEQ;
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	memcpy(walidx_reclaimed_frontier, state.frontiers,
+		   sizeof(walidx_reclaimed_frontier));
+	return 0;
+}
+
+static int
+walidx_frontier_advance(uint32_t timeline, uint64_t frontier)
+{
+	uint64_t old;
+
+	if (timeline >= MAX_TIMELINES || frontier == 0)
+		return -1;
+	old = walidx_reclaimed_frontier[timeline];
+	if (frontier <= old)
+		return 0;
+	walidx_reclaimed_frontier[timeline] = frontier;
+	if (walidx_frontier_publish() != 0)
+	{
+		walidx_reclaimed_frontier[timeline] = old;
+		return -1;
+	}
+	return 0;
+}
+
+/* Caller holds map_lock.  Every active WAL-index pin and every descendant
+ * branch point is an exact exception represented in a compacted snapshot. */
+static int
+walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int active = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected) &&
+				projected == lsn)
+			{
+				active = 1;
+				break;
+			}
+		}
+	free(pins);
+	if (active)
+		return 1;
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t projected = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &projected) &&
+			projected == lsn)
+			return 1;
+	}
+	return 0;
+}
+
+static int
+walidx_frontier_allows(uint32_t timeline, uint64_t lsn)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return lsn >= walidx_reclaimed_frontier[timeline] ||
+		walidx_frontier_exception_active(timeline, lsn);
+}
+
 static int
 key_eq(const PsKey *a, const PsKey *b)
 {
@@ -2785,6 +2959,21 @@ page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
 	}
 }
 
+/* Caller holds map_lock. */
+static int
+walidx_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+
+	for (;;)
+	{
+		if (!walidx_frontier_allows(w.tl, w.lsn))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
+}
+
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
  * the whole ancestry before EXISTS/NBLOCKS can turn a hidden LSN-0 version
  * into an apparently valid empty relation. */
@@ -2854,7 +3043,10 @@ branch_frontiers_allow(int parent, uint64_t branch_lsn)
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
 	{
 		if (!timelines[t].defined ||
-			cap < page_reclaimed_frontier[t].lsn)
+			walidx_frontier_publication_pending((uint32_t) t) ||
+			cap < page_reclaimed_frontier[t].lsn ||
+			(cap < walidx_reclaimed_frontier[t] &&
+			 !walidx_frontier_exception_active((uint32_t) t, cap)))
 			return 0;
 		if (timelines[t].parent >= 0 && cap > timelines[t].branch_lsn)
 			cap = timelines[t].branch_lsn;
@@ -4141,6 +4333,20 @@ walidx_publish_wrunlock(void)
 		pthread_cond_broadcast(&walidx_publish_lock.readers_ready);
 	pthread_mutex_unlock(&walidx_publish_lock.mutex);
 }
+
+static int
+walidx_frontier_publication_pending(uint32_t timeline)
+{
+	uint64_t snapshot_end;
+
+	if (timeline >= MAX_TIMELINES)
+		return 1;
+	pthread_mutex_lock(&walidx_meta_lock);
+	snapshot_end = walidx_snapshot_end[timeline];
+	pthread_mutex_unlock(&walidx_meta_lock);
+	return snapshot_end < walidx_reclaimed_frontier[timeline];
+}
+
 static void
 publish_wal_index_metrics(void)
 {
@@ -4509,6 +4715,69 @@ walidx_snapshot_path(uint32_t tl, char *path, size_t path_len)
 	return n < 0 || (size_t) n >= path_len ? -1 : 0;
 }
 
+static int
+walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
+						const uint64_t *horizons, uint32_t nhorizons,
+						unsigned char *keep)
+{
+	PsWalIdxPruneItem *items;
+	int rc;
+
+	if (e->n == 0)
+		return 0;
+	items = malloc((size_t) e->n * sizeof(*items));
+	if (items == NULL)
+		return -1;
+	for (int i = 0; i < e->n; i++)
+	{
+		items[i].lsn = e->items[i].lsn;
+		items[i].end_lsn = e->items[i].end_lsn;
+		items[i].known =
+			(e->items[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0;
+		items[i].fpi =
+			(e->items[i].flags & PS_WAL_INDEX_FLAG_FPI) != 0;
+	}
+	rc = ps_walidx_prune_plan(items, (uint32_t) e->n, cutoff,
+							  horizons, nhorizons, keep);
+	free(items);
+	return rc;
+}
+
+/* Prove every page before writing any compacted shard.  One unprovable page
+ * keeps the whole timeline on its full snapshot generation, so the single
+ * timeline frontier can never mask a lagging shard. */
+static int
+walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
+								const uint64_t *horizons,
+								uint32_t nhorizons, uint64_t *dropped_out)
+{
+	uint64_t dropped = 0;
+
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		Shard *s = &g_shards[shard];
+
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+				if (e->timeline == tl && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int kept;
+
+					if (keep == NULL)
+						return 0;
+					kept = walidx_entry_prune_plan(e, cutoff, horizons,
+											  nhorizons, keep);
+					free(keep);
+					if (kept < 0)
+						return 0;
+					dropped += (uint64_t) e->n - (uint64_t) kept;
+				}
+	}
+	*dropped_out = dropped;
+	return 1;
+}
+
 typedef struct WalIdxSnapshotProduceCtx
 {
 	uint32_t tl;
@@ -4519,6 +4788,9 @@ typedef struct WalIdxSnapshotProduceCtx
 	uint64_t source_offset;
 	uint64_t log_epoch;
 	uint64_t nrecords;
+	int compact;
+	const uint64_t *horizons;
+	uint32_t nhorizons;
 } WalIdxSnapshotProduceCtx;
 
 static int
@@ -4539,7 +4811,27 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
 			if (e->timeline == ctx->tl)
+			{
+				unsigned char *keep = NULL;
+
+				if (ctx->compact && e->n != 0)
+				{
+					int kept;
+
+					keep = malloc((size_t) e->n);
+					if (keep == NULL)
+						return -1;
+					kept = walidx_entry_prune_plan(e, ctx->end_lsn,
+													  ctx->horizons, ctx->nhorizons,
+													  keep);
+					if (kept < 0)
+					{
+						free(keep);
+						return -1;
+					}
+				}
 				for (int i = 0; i < e->n; i++)
+					if (!ctx->compact || keep[i])
 				{
 					WalIdxRec *rec = &records[used++];
 
@@ -4560,6 +4852,8 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 						used = 0;
 					}
 				}
+				free(keep);
+			}
 	return used == 0 ? 0 :
 		consume(consume_arg, records, used * sizeof(records[0]));
 }
@@ -4567,9 +4861,11 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 static int
 walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 							 uint64_t generation, uint64_t start_lsn,
-							 uint64_t end_lsn, uint64_t source_offset,
-							 uint64_t log_epoch,
-							 WalIdxSnapshotProduceCtx *ctx,
+								 uint64_t end_lsn, uint64_t source_offset,
+								 uint64_t log_epoch,
+								 int compact, const uint64_t *horizons,
+								 uint32_t nhorizons,
+								 WalIdxSnapshotProduceCtx *ctx,
 							 PsWalIdxSnapshotInput *input)
 {
 	Shard *s = &g_shards[shard];
@@ -4579,9 +4875,25 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
 			if (e->timeline == tl)
 			{
-				if (UINT64_MAX - nrecords < (uint64_t) e->n)
+				uint64_t kept = (uint64_t) e->n;
+
+				if (compact && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int n;
+
+					if (keep == NULL)
+						return -1;
+					n = walidx_entry_prune_plan(e, end_lsn, horizons,
+													  nhorizons, keep);
+					free(keep);
+					if (n < 0)
+						return -1;
+					kept = (uint64_t) n;
+				}
+				if (UINT64_MAX - nrecords < kept)
 					return -1;
-				nrecords += (uint64_t) e->n;
+				nrecords += kept;
 			}
 	if (nrecords > (UINT64_MAX - WALIDX_SNAPSHOT_PAYLOAD_BYTES) /
 		sizeof(WalIdxRec) ||
@@ -4589,7 +4901,7 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		return -1;
 	*ctx = (WalIdxSnapshotProduceCtx) {
 		tl, shard, generation, start_lsn, end_lsn, source_offset, log_epoch,
-		nrecords
+		nrecords, compact, horizons, nhorizons
 	};
 	*input = (PsWalIdxSnapshotInput) {
 		NULL,
@@ -4598,6 +4910,37 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		ctx
 	};
 	return 0;
+}
+
+static void
+walidx_prune_memory(uint32_t tl, uint64_t cutoff, const uint64_t *horizons,
+					uint32_t nhorizons)
+{
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		Shard *s = &g_shards[shard];
+
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+				if (e->timeline == tl && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int out = 0;
+
+					if (keep == NULL ||
+						walidx_entry_prune_plan(e, cutoff, horizons,
+											 nhorizons, keep) < 0)
+					{
+						free(keep);
+						continue;
+					}
+					for (int i = 0; i < e->n; i++)
+						if (keep[i])
+							e->items[out++] = e->items[i];
+					e->n = out;
+					free(keep);
+				}
+	}
 }
 
 static int
@@ -4609,6 +4952,8 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 	uint32_t	shard;
 
 	if (tl >= MAX_TIMELINES || nentries == 0)
+		return -1;
+	if (walidx_frontier_publication_pending(tl))
 		return -1;
 	shard = ps_shard_of(&entries[0].key);
 	records = malloc((size_t) nentries * sizeof(*records));
@@ -4863,6 +5208,9 @@ walidx_snapshot_publish_one(void)
 {
 	PsWalIdxSnapshotInput inputs[PS_MAX_CHANNELS];
 	WalIdxSnapshotProduceCtx producers[PS_MAX_CHANNELS];
+	PsWalIdxSnapshotPrepared prepared;
+	uint64_t *fences = NULL;
+	uint32_t nfences = 0;
 	uint64_t trigger = walidx_snapshot_trigger_bytes();
 	uint32_t ns = core_shards();
 	struct timespec now;
@@ -4917,6 +5265,8 @@ walidx_snapshot_publish_one(void)
 	if (candidate < 0)
 		return 0;
 
+	pthread_rwlock_rdlock(&walidx_prune_lock);
+	ps_lock_map_rd();
 	walidx_publish_wrlock();
 	{
 		uint32_t tl = (uint32_t) candidate;
@@ -4925,7 +5275,9 @@ walidx_snapshot_publish_one(void)
 		uint64_t end_lsn;
 		uint64_t previous_end;
 		uint64_t snapshot_bytes = 0;
+		uint64_t dropped = 0;
 		char directory[4096];
+		int compact = 0;
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
@@ -4946,11 +5298,16 @@ walidx_snapshot_publish_one(void)
 		}
 		if (generation > walidx_snapshot_test_max_generation())
 			goto publish_done;
+		if (walidx_prune_fences(tl, &fences, &nfences) != 0)
+			goto publish_done;
+		compact = walidx_snapshot_compaction_plan(tl, end_lsn, fences,
+											nfences, &dropped) && dropped != 0;
 		for (uint32_t shard = 0; shard < ns; shard++)
 		{
 			if (walidx_snapshot_prepare_shard(tl, shard, generation,
-										start_lsn, end_lsn, 0, generation,
-										&producers[shard], &inputs[shard]) != 0)
+											start_lsn, end_lsn, 0, generation,
+											compact, fences, nfences,
+											&producers[shard], &inputs[shard]) != 0)
 			{
 				retry = 1;
 				goto publish_done;
@@ -4969,11 +5326,28 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
-		if (ps_walidx_snapshot_publish(directory, tl, generation,
-									start_lsn, end_lsn, inputs, ns) != 0)
+		if (compact)
+		{
+			if (ps_walidx_snapshot_prepare(&prepared, directory, tl, generation,
+													start_lsn, end_lsn, inputs, ns) != 0 ||
+				walidx_frontier_advance(tl, end_lsn) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			test_crash_compaction_at("after_walidx_frontier");
+			if (ps_walidx_snapshot_commit(&prepared) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			walidx_prune_memory(tl, end_lsn, fences, nfences);
+		}
+		else if (ps_walidx_snapshot_publish(directory, tl, generation,
+											start_lsn, end_lsn, inputs, ns) != 0)
 		{
 			int discard = ps_walidx_snapshot_discard_generation(directory, tl,
-													generation, ns);
+															generation, ns);
 
 			if (discard != 1)
 			{
@@ -5012,6 +5386,9 @@ publish_done:
 		walidx_snapshot_retry_at[candidate].tv_sec++;
 	}
 	walidx_publish_wrunlock();
+	free(fences);
+	ps_unlock_map();
+	pthread_rwlock_unlock(&walidx_prune_lock);
 	return rc;
 }
 
@@ -5231,7 +5608,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	int			append_progress = 0;
 
 	/* A durable marker must name a contiguous prefix of shipped WAL. */
-	if (tl >= MAX_TIMELINES)
+	if (tl >= MAX_TIMELINES || walidx_frontier_publication_pending(tl))
 		return -1;
 	walidx_publish_wrlock();
 	pthread_mutex_lock(&walidx_meta_lock);
@@ -5348,6 +5725,9 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	int			nsources = 0;
 	int			nout = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
+
+	if (!walidx_frontier_ancestry_allows(tl, lsn_max))
+		return -1;
 
 	do
 	{
@@ -6340,6 +6720,46 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	return 0;
 }
 
+/* Caller holds map-rd and the WAL-index prune read fence. */
+static int
+walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
+					uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	uint64_t *fences;
+	uint32_t nfences = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES) * sizeof(*fences));
+	if (fences == NULL)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+				fences[nfences++] = projected;
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t projected = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &projected))
+			fences[nfences++] = projected;
+	}
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
 /*
  * One conservative floor for one resource on one timeline.  Explicit pins on
  * descendants are projected through every branch cap; a live direct child is
@@ -7159,6 +7579,8 @@ ps_handle_meta(PsChannel *ch)
 				int			old_found;
 				int			timeline_defined;
 				int			page_history_allowed;
+				int			wal_index_allowed;
+				int			wal_index_pending;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -7180,6 +7602,7 @@ ps_handle_meta(PsChannel *ch)
 					 * with mutations and advance allocation before admitting more. */
 					pthread_rwlock_wrlock(&admission_lock);
 					pthread_rwlock_wrlock(&page_prune_lock);
+					pthread_rwlock_wrlock(&walidx_prune_lock);
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
@@ -7187,12 +7610,19 @@ ps_handle_meta(PsChannel *ch)
 					page_history_allowed = timeline_defined &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
+					wal_index_allowed = timeline_defined &&
+						walidx_frontier_ancestry_allows(tl, pin.lsn);
 					ps_unlock_map();
-					/* An active owner can only advance its own horizon.  Its old
-					 * pin already protected all history needed by the newer view, so
-					 * permit the atomic handoff even if a previously published global
-					 * frontier is stricter than the new point. */
-					ret = (((pin.resources &
+					wal_index_pending =
+						walidx_frontier_publication_pending(tl) &&
+						((((old_found == 1 ? old_pin.resources : 0) |
+						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0) &&
+						!(old_found == 1 &&
+						  memcmp(&old_pin, &pin, sizeof(pin)) == 0);
+					/* Page history permits an active owner to advance from its old
+					 * protected image.  WAL-index history is sparse after compaction,
+					 * so its new point must independently name a retained chain. */
+					ret = ((((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
 							 !page_history_allowed &&
 							 !(old_found == 1 &&
@@ -7202,6 +7632,8 @@ ps_handle_meta(PsChannel *ch)
 								/* An exact retry cannot expose a new fence. */
 								(old_pin.lsn == pin.lsn &&
 								 old_pin.admission_seq == pin.admission_seq)))) ||
+							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+							 !wal_index_allowed) || wal_index_pending) ||
 							!timeline_defined) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
@@ -7214,6 +7646,7 @@ ps_handle_meta(PsChannel *ch)
 							 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 							page_prune_mark_all_due();
 					}
+					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
 					pthread_rwlock_unlock(&admission_lock);
 				}
@@ -7233,6 +7666,8 @@ ps_handle_meta(PsChannel *ch)
 				int			old_found = 0;
 				int			timeline_defined = 0;
 				int			page_history_allowed = 0;
+				int			wal_index_allowed = 0;
+				int			wal_index_pending = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -7245,6 +7680,7 @@ ps_handle_meta(PsChannel *ch)
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
 				pthread_rwlock_wrlock(&page_prune_lock);
+				pthread_rwlock_wrlock(&walidx_prune_lock);
 				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
 				{
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
@@ -7254,11 +7690,19 @@ ps_handle_meta(PsChannel *ch)
 					page_history_allowed = timeline_defined &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
+					wal_index_allowed = timeline_defined &&
+						walidx_frontier_ancestry_allows(tl, pin.lsn);
 					ps_unlock_map();
+					wal_index_pending =
+						walidx_frontier_publication_pending(tl) &&
+						((((old_found == 1 ? old_pin.resources : 0) |
+						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
 					if (timeline_defined &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-						 page_history_allowed))
+						 page_history_allowed) &&
+						(((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0) ||
+						 wal_index_allowed) && !wal_index_pending)
 						ret = ps_retention_reserve_and_set(&pin);
 				}
 				if (ret == PS_RETENTION_OK)
@@ -7272,6 +7716,7 @@ ps_handle_meta(PsChannel *ch)
 						 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 						page_prune_mark_all_due();
 				}
+				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				pthread_rwlock_unlock(&admission_lock);
 				if (ret == PS_RETENTION_STALE)
@@ -7287,21 +7732,27 @@ ps_handle_meta(PsChannel *ch)
 				int			ret;
 				int			old_found;
 				int			timeline_defined;
+				int			wal_index_pending;
 
 				pthread_rwlock_wrlock(&page_prune_lock);
+				pthread_rwlock_wrlock(&walidx_prune_lock);
 				old_found = ps_retention_lookup(tl, ch->blocknum,
 											ch->req_seq, &old_pin);
 				ps_lock_map_rd();
 				timeline_defined = tl < MAX_TIMELINES && timelines[tl].defined;
 				ps_unlock_map();
+				wal_index_pending = old_found == 1 &&
+					(old_pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+					walidx_frontier_publication_pending(tl);
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timeline_defined) ?
+					   !timeline_defined || wal_index_pending) ?
 					PS_RETENTION_ERROR :
 					ps_retention_drop(tl, ch->blocknum, ch->req_seq,
 									  ch->old_nblocks);
 				if (ret == PS_RETENTION_OK && old_found == 1 &&
 					(old_pin.resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 					page_prune_mark_all_due();
+				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
@@ -8314,6 +8765,12 @@ ps_core_open(const char *store_dir)
 	if (page_frontier_load(store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
+		return -1;
+	}
+	if (walidx_frontier_load(store_dir) != 0)
+	{
+		fprintf(stderr, "pagestore: refusing to open corrupt WAL-index "
+				"reclamation frontiers\n");
 		return -1;
 	}
 	{

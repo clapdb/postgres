@@ -24,10 +24,12 @@ Some hot metadata remains in plain in-memory chained hash tables:
 - per-page WAL index: `(timeline, key, block) -> ascending list of record LSNs`
 
 Page data is still appended to flat segment files before layer flush, and shipped
-WAL goes to flat per-timeline logs (`wal_<tl>`).  Image compaction currently
-merges all layers for a timeline/shard and keeps every version.  Retention-driven
-version pruning, shipped-WAL GC, and WAL-index compaction are not implemented, so
-long-running logical history still grows without bound.
+WAL still has a flat per-timeline migration/tail authority (`wal_<tl>`).  Image
+compaction prunes relation-page history behind durable resource frontiers, and
+WAL-index snapshot compaction retains only proven FPI-led reconstruction chains
+at the moving operational cutoff and discrete reader/branch fences.  Fork
+metadata compaction and shipped-WAL reclamation are not implemented yet, so
+long-running logical history is not fully bounded.
 
 **Target.**  An LSM-like layered store, along the lines of Neon's pageserver:
 
