@@ -1099,7 +1099,11 @@ pagestore_index_wal_range(XLogRecPtr start, XLogRecPtr end, bool from_store)
 					key.forkNum = fk;
 					batch[nbatch].key = key;
 					batch[nbatch].block = blk;
+					batch[nbatch].flags = PS_WAL_INDEX_FLAG_KNOWN |
+						(XLogRecHasBlockImage((XLogReaderState *) reader, b) ?
+						 PS_WAL_INDEX_FLAG_FPI : 0);
 					batch[nbatch].lsn = reader->ReadRecPtr;
+					batch[nbatch].end_lsn = reader->EndRecPtr;
 					nbatch++;
 					if (nbatch == PAGESTORE_WAL_INDEX_BATCH_MAX)
 					{
@@ -2019,6 +2023,10 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
+		if ((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+			((recs[i].flags & PS_WAL_INDEX_FLAG_FPI) == 0 ||
+			 recs[i].end_lsn > (uint64) lsn))
+			continue;
 		XLogBeginRead(reader, recs[i].lsn);
 		rec = XLogReadRecord(reader, &errm);
 		if (rec == NULL)
@@ -2039,6 +2047,8 @@ pagestore_redo_page(PG_FUNCTION_ARGS)
 				continue;
 			/* a record ending after lsn is not in the as-of stream */
 			if (reader->EndRecPtr <= (XLogRecPtr) lsn &&
+				((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 ||
+				 reader->EndRecPtr == (XLogRecPtr) recs[i].end_lsn) &&
 				RestoreBlockImage(reader, b, page))
 			{
 				result = (bytea *) palloc(BLCKSZ + VARHDRSZ);
@@ -2232,6 +2242,10 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		char	   *errm;
 		XLogRecord *rec;
 
+		if ((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+			((recs[i].flags & PS_WAL_INDEX_FLAG_FPI) == 0 ||
+			 recs[i].end_lsn > (uint64) lsn))
+			continue;
 		ps_redo_cur_timeline = recs[i].timeline;
 		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
 		 * same-offset page on another timeline would be a false hit; invalidate it
@@ -2256,6 +2270,8 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 			/* a record ending after the as-of point is not in the as-of
 			 * stream; its image must not become the base either */
 			if (reader->EndRecPtr <= (XLogRecPtr) lsn &&
+				((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) == 0 ||
+				 reader->EndRecPtr == (XLogRecPtr) recs[i].end_lsn) &&
 				RestoreBlockImage(reader, b, base))
 			{
 				base_idx = i;
@@ -2342,6 +2358,9 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 		uint32		firstpage;
 		char	   *raw;
 
+		if ((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+			recs[i].end_lsn > (uint64) lsn)
+			break;
 		ps_redo_cur_timeline = recs[i].timeline;
 		/* the reader caches a page by (segno,offset) only -- not timeline -- so a
 		 * same-offset page on another timeline would be a false hit; invalidate it
@@ -2366,6 +2385,14 @@ pagestore_redo_page_asof(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errmsg("could not read WAL record at %X/%08X for redo: %s",
 							LSN_FORMAT_ARGS(recs[i].lsn), errm ? errm : "(unknown)")));
+		}
+		if ((recs[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 &&
+			reader->EndRecPtr != (XLogRecPtr) recs[i].end_lsn)
+		{
+			walredo_stop(p);
+			ereport(ERROR,
+					(errmsg("WAL-index record end does not match decoded WAL at %X/%08X",
+							LSN_FORMAT_ARGS(recs[i].lsn))));
 		}
 
 		/*

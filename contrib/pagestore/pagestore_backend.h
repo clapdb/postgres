@@ -49,7 +49,9 @@ typedef struct PageStoreWalIndexEntry
 {
 	PageStoreRelKey key;
 	BlockNumber block;
+	uint32		flags;			/* PS_WAL_INDEX_FLAG_* */
 	uint64		lsn;
+	uint64		end_lsn;		/* decoded WAL record EndRecPtr */
 } PageStoreWalIndexEntry;
 
 /*

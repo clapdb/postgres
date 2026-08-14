@@ -34,6 +34,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4013,17 +4014,37 @@ typedef struct WalIdxLogHdr
 	uint32_t	rec_len;
 } WalIdxLogHdr;
 
+typedef struct WalIdxRecV1
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	crc;
+	uint32_t	reserved;
+	uint32_t	timeline;
+	uint32_t	block;
+	uint64_t	lsn;
+	PsKey		key;
+} WalIdxRecV1;
+
 typedef struct WalIdxRec
 {
 	uint32_t	magic;
 	uint32_t	rec_len;
 	uint32_t	crc;
-	uint32_t	pad;
+	uint32_t	flags;			/* PS_WAL_INDEX_FLAG_* */
 	uint32_t	timeline;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	end_lsn;
 	PsKey		key;
 } WalIdxRec;
+
+_Static_assert(sizeof(WalIdxRecV1) == 56,
+			   "legacy WAL-index record format must remain readable");
+_Static_assert(sizeof(WalIdxRec) == 64,
+			   "WAL-index record format must remain stable");
+_Static_assert(offsetof(WalIdxRec, flags) == 12,
+			   "WAL-index flags must reuse the legacy reserved field");
 
 typedef struct WalIdxProgressRec
 {
@@ -4187,6 +4208,18 @@ walidx_rec_crc(WalIdxRec *rec)
 }
 
 static uint32_t
+walidx_rec_v1_crc(WalIdxRecV1 *rec)
+{
+	uint32_t	save = rec->crc;
+	uint32_t	crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+static uint32_t
 walidx_progress_crc(WalIdxProgressRec *rec)
 {
 	uint32_t	save = rec->crc;
@@ -4240,10 +4273,17 @@ typedef struct WalIdxEnt
 	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	block;
-	uint64_t   *lsns;			/* ascending */
+	struct WalIdxItem *items;	/* ascending by LSN */
 	int			n;
 	int			cap;
 } WalIdxEnt;
+
+typedef struct WalIdxItem
+{
+	uint64_t	lsn;
+	uint64_t	end_lsn;
+	uint32_t	flags;
+} WalIdxItem;
 
 static WalIdxEnt *
 walidx_find(uint32_t tl, const PsKey *key, uint32_t block)
@@ -4268,7 +4308,7 @@ walidx_lower_bound(const WalIdxEnt *e, uint64_t lsn)
 	{
 		int mid = lo + (hi - lo) / 2;
 
-		if (e->lsns[mid] < lsn)
+		if (e->items[mid].lsn < lsn)
 			lo = mid + 1;
 		else
 			hi = mid;
@@ -4276,8 +4316,19 @@ walidx_lower_bound(const WalIdxEnt *e, uint64_t lsn)
 	return lo;
 }
 
-static void
-walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+static int
+walidx_metadata_valid(uint32_t flags, uint64_t lsn, uint64_t end_lsn)
+{
+	return (flags & ~PS_WAL_INDEX_FLAG_MASK) == 0 &&
+		((flags & PS_WAL_INDEX_FLAG_FPI) == 0 ||
+		 (flags & PS_WAL_INDEX_FLAG_KNOWN) != 0) &&
+		(((flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 && end_lsn > lsn) ||
+		 (flags == 0 && end_lsn == 0));
+}
+
+static int
+walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
+				  uint64_t end_lsn, uint32_t flags)
 {
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
@@ -4289,6 +4340,8 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	if (!e)
 	{
 		e = calloc(1, sizeof(*e));
+		if (e == NULL)
+			return -1;
 		e->timeline = tl;
 		e->key = *key;
 		e->block = block;
@@ -4297,19 +4350,36 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	}
 	if (e->n == e->cap)
 	{
-		e->cap = e->cap ? e->cap * 2 : 4;
-		e->lsns = realloc(e->lsns, (size_t) e->cap * sizeof(uint64_t));
+		int newcap;
+		WalIdxItem *grown;
+
+		if (e->cap > INT_MAX / 2)
+			return -1;
+		newcap = e->cap ? e->cap * 2 : 4;
+		grown = realloc(e->items, (size_t) newcap * sizeof(*e->items));
+		if (grown == NULL)
+			return -1;
+		e->items = grown;
+		e->cap = newcap;
 	}
 	{
 		int i = walidx_lower_bound(e, lsn);
 
-		if (i < e->n && e->lsns[i] == lsn)
-			return;
-		memmove(&e->lsns[i + 1], &e->lsns[i],
-				(size_t) (e->n - i) * sizeof(uint64_t));
-		e->lsns[i] = lsn;
+		if (i < e->n && e->items[i].lsn == lsn)
+		{
+			e->items[i].flags |= flags;
+			if (end_lsn != 0)
+				e->items[i].end_lsn = end_lsn;
+			return 0;
+		}
+		memmove(&e->items[i + 1], &e->items[i],
+				(size_t) (e->n - i) * sizeof(*e->items));
+		e->items[i].lsn = lsn;
+		e->items[i].end_lsn = end_lsn;
+		e->items[i].flags = flags;
 		e->n++;
 	}
+	return 0;
 }
 
 static uint32_t
@@ -4371,7 +4441,8 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 							  uint32_t tl,
 							  uint32_t shard, uint64_t generation,
 							  uint64_t start_lsn, uint64_t end_lsn,
-							  uint32_t *header_bytes, uint64_t *nrecords,
+							  uint32_t *header_bytes, uint32_t *record_bytes,
+							  uint64_t *nrecords,
 							  uint64_t *source_offset, uint64_t *log_epoch)
 {
 	unsigned char copy[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
@@ -4413,15 +4484,17 @@ walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
 		fnv(copy, bytes) != stored_crc)
 		return -1;
 	*header_bytes = bytes;
+	*record_bytes = version == WALIDX_SNAPSHOT_PAYLOAD_VERSION ?
+		sizeof(WalIdxRec) : sizeof(WalIdxRecV1);
 	*nrecords = walidx_get_le32(copy + 20);
 	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 60) << 32;
 	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 68) << 32;
 	*source_offset = walidx_get_le64(copy + 48);
-	*log_epoch = version == WALIDX_SNAPSHOT_PAYLOAD_VERSION ?
+	*log_epoch = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 ?
 		walidx_get_le64(copy + 56) : 0;
-	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
+	if (version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 &&
 		(*log_epoch != generation || *source_offset != 0))
 		return -1;
 	return 0;
@@ -4475,7 +4548,9 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 					rec->rec_len = sizeof(*rec);
 					rec->timeline = ctx->tl;
 					rec->block = e->block;
-					rec->lsn = e->lsns[i];
+					rec->lsn = e->items[i].lsn;
+					rec->end_lsn = e->items[i].end_lsn;
+					rec->flags = e->items[i].flags;
 					rec->key = e->key;
 					rec->crc = walidx_rec_crc(rec);
 					if (used == sizeof(records) / sizeof(records[0]))
@@ -4545,7 +4620,9 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		WalIdxRec  *rec;
 		int			pos;
 
-		if (ps_shard_of(&entries[i].key) != shard)
+		if (ps_shard_of(&entries[i].key) != shard ||
+			!walidx_metadata_valid(entries[i].flags, entries[i].lsn,
+								 entries[i].end_lsn))
 		{
 			free(records);
 			return -1;
@@ -4554,17 +4631,28 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		if (e)
 		{
 			pos = walidx_lower_bound(e, entries[i].lsn);
-			if (pos < e->n && e->lsns[pos] == entries[i].lsn)
+			if (pos < e->n && e->items[pos].lsn == entries[i].lsn &&
+				e->items[pos].end_lsn != 0 && entries[i].end_lsn != 0 &&
+				e->items[pos].end_lsn != entries[i].end_lsn)
+			{
+				free(records);
+				return -1;
+			}
+			if (pos < e->n && e->items[pos].lsn == entries[i].lsn &&
+				(e->items[pos].flags | entries[i].flags) == e->items[pos].flags &&
+				(e->items[pos].end_lsn != 0 || entries[i].end_lsn == 0))
 				continue;
 		}
 		rec = &records[nrecords++];
+		memset(rec, 0, sizeof(*rec));
 		rec->magic = WALIDX_MAGIC;
 		rec->rec_len = sizeof(*rec);
 		rec->crc = 0;
-		rec->pad = 0;
+		rec->flags = entries[i].flags;
 		rec->timeline = tl;
 		rec->block = entries[i].block;
 		rec->lsn = entries[i].lsn;
+		rec->end_lsn = entries[i].end_lsn;
 		rec->key = entries[i].key;
 		rec->crc = walidx_rec_crc(rec);
 	}
@@ -4584,8 +4672,13 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 	walidx_mark_shard(walidx_shards_seen[tl], shard);
 	pthread_mutex_unlock(&walidx_meta_lock);
 	for (uint32_t i = 0; i < nrecords; i++)
-		walidx_add_memory(tl, &records[i].key, records[i].block,
-						  records[i].lsn);
+		if (walidx_add_memory(tl, &records[i].key, records[i].block,
+							  records[i].lsn, records[i].end_lsn,
+							  records[i].flags) != 0)
+		{
+			free(records);
+			return -1;
+		}
 	free(records);
 	return 0;
 }
@@ -4598,8 +4691,9 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 
 	entry.key = *key;
 	entry.block = block;
-	entry.pad = 0;
+	entry.flags = 0;
 	entry.lsn = lsn;
+	entry.end_lsn = 0;
 	walidx_publish_rdlock();
 	rc = walidx_add_batch_locked(tl, &entry, 1);
 	walidx_publish_rdunlock();
@@ -4634,8 +4728,9 @@ walidx_snapshot_recover(uint32_t tl)
 	for (uint32_t shard = 0; shard < snapshot.nshards; shard++)
 	{
 		unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
-		WalIdxRec records[1024];
+		unsigned char records[1024 * sizeof(WalIdxRec)];
 		uint32_t header_bytes;
+		uint32_t record_bytes;
 		uint64_t nrecords;
 		uint64_t source_offset;
 		uint64_t log_epoch;
@@ -4651,35 +4746,56 @@ walidx_snapshot_recover(uint32_t tl)
 			walidx_snapshot_decode_header(header, snapshot.shards[shard].len,
 								 tl, shard, snapshot.generation,
 								 snapshot.start_lsn, snapshot.end_lsn,
-								 &header_bytes, &nrecords, &source_offset,
+								 &header_bytes, &record_bytes, &nrecords,
+								 &source_offset,
 								 &log_epoch) != 0 ||
-			nrecords > (UINT64_MAX - header_bytes) /
-				sizeof(WalIdxRec))
+			nrecords > (UINT64_MAX - header_bytes) / record_bytes)
 			goto fail;
 		expected_len = header_bytes +
-			nrecords * sizeof(WalIdxRec);
+			 nrecords * record_bytes;
 		if (expected_len != snapshot.shards[shard].len)
 			goto fail;
 		while (done < nrecords)
 		{
 			uint32_t amount = nrecords - done <
-				(sizeof(records) / sizeof(records[0])) ?
+				(sizeof(records) / record_bytes) ?
 				(uint32_t) (nrecords - done) :
-				(uint32_t) (sizeof(records) / sizeof(records[0]));
+				(uint32_t) (sizeof(records) / record_bytes);
 
 			if (ps_walidx_snapshot_read(&snapshot, shard,
-					header_bytes + done * sizeof(WalIdxRec),
-					records, amount * sizeof(WalIdxRec)) != 0)
+					header_bytes + done * record_bytes,
+					records, amount * record_bytes) != 0)
 				goto fail;
 			for (uint32_t i = 0; i < amount; i++)
 			{
-				WalIdxRec *rec = &records[i];
+				const unsigned char *raw = records + (size_t) i * record_bytes;
 
-				if (rec->magic != WALIDX_MAGIC || rec->rec_len != sizeof(*rec) ||
-					rec->timeline != tl || rec->crc != walidx_rec_crc(rec) ||
-					(!reshard && ps_shard_of(&rec->key) != shard))
-					goto fail;
-				walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+				if (record_bytes == sizeof(WalIdxRec))
+				{
+					WalIdxRec rec;
+
+					memcpy(&rec, raw, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.timeline != tl || rec.crc != walidx_rec_crc(&rec) ||
+						(!reshard && ps_shard_of(&rec.key) != shard) ||
+						!walidx_metadata_valid(rec.flags, rec.lsn, rec.end_lsn) ||
+						walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  rec.end_lsn, rec.flags) != 0)
+						goto fail;
+				}
+				else
+				{
+					WalIdxRecV1 rec;
+
+					memcpy(&rec, raw, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.reserved != 0 || rec.timeline != tl ||
+						rec.crc != walidx_rec_v1_crc(&rec) ||
+						(!reshard && ps_shard_of(&rec.key) != shard) ||
+						walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  0, 0) != 0)
+						goto fail;
+				}
 			}
 			done += amount;
 		}
@@ -5010,8 +5126,10 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 			uint32_t	rec_len;
 
 			memcpy(&hdr, buf + pos, sizeof(hdr));
-			if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
-				rec_len = sizeof(WalIdxRec);
+			if (hdr.magic == WALIDX_MAGIC &&
+				(hdr.rec_len == sizeof(WalIdxRec) ||
+				 hdr.rec_len == sizeof(WalIdxRecV1)))
+				rec_len = hdr.rec_len;
 			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
 					 hdr.rec_len == sizeof(WalIdxProgressRec))
 				rec_len = sizeof(WalIdxProgressRec);
@@ -5022,14 +5140,32 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 
 			if (hdr.magic == WALIDX_MAGIC)
 			{
-				WalIdxRec rec;
+				if (rec_len == sizeof(WalIdxRec))
+				{
+					WalIdxRec rec;
 
-				memcpy(&rec, buf + pos, sizeof(rec));
-				if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
-					rec.timeline != tl || rec.crc != walidx_rec_crc(&rec))
-					return -1;
+					memcpy(&rec, buf + pos, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.timeline != tl || rec.crc != walidx_rec_crc(&rec) ||
+						!walidx_metadata_valid(rec.flags, rec.lsn, rec.end_lsn))
+						return -1;
+					if (walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  rec.end_lsn, rec.flags) != 0)
+						return -1;
+				}
+				else
+				{
+					WalIdxRecV1 rec;
+
+					memcpy(&rec, buf + pos, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.reserved != 0 || rec.timeline != tl ||
+						rec.crc != walidx_rec_v1_crc(&rec))
+						return -1;
+					if (walidx_add_memory(tl, &rec.key, rec.block, rec.lsn, 0, 0) != 0)
+						return -1;
+				}
 				walidx_mark_shard(walidx_shards_seen[tl], shard);
-				walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
 			}
 			else
 			{
@@ -5182,7 +5318,7 @@ walidx_upper_bound(WalIdxEnt *e, uint64_t lsn)
 	{
 		int			mid = lo + (hi - lo) / 2;
 
-		if (e->lsns[mid] <= lsn)
+		if (e->items[mid].lsn <= lsn)
 			lo = mid + 1;
 		else
 			hi = mid;
@@ -5231,7 +5367,7 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 					w.lsn : visible_end - 1;
 				int			end = walidx_upper_bound(e, cap_lsn);
 
-				if (have_cursor && pos < end && e->lsns[pos] == cursor_lsn &&
+				if (have_cursor && pos < end && e->items[pos].lsn == cursor_lsn &&
 					w.tl <= cursor_timeline)
 					pos++;
 				if (pos < end)
@@ -5257,13 +5393,13 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 
 			if (sources[i].pos >= sources[i].end)
 				continue;
-			lsn = sources[i].entry->lsns[sources[i].pos];
+			lsn = sources[i].entry->items[sources[i].pos].lsn;
 			if (best < 0)
 			{
 				best = i;
 				continue;
 			}
-			best_lsn = sources[best].entry->lsns[sources[best].pos];
+			best_lsn = sources[best].entry->items[sources[best].pos].lsn;
 			if (lsn < best_lsn ||
 				(lsn == best_lsn &&
 				 sources[i].timeline < sources[best].timeline))
@@ -5272,9 +5408,12 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		if (best < 0)
 			break;
 		out[nout] = (PsWalRec) {
-			.lsn = sources[best].entry->lsns[sources[best].pos++],
-			.timeline = sources[best].timeline
+			.lsn = sources[best].entry->items[sources[best].pos].lsn,
+			.end_lsn = sources[best].entry->items[sources[best].pos].end_lsn,
+			.timeline = sources[best].timeline,
+			.flags = sources[best].entry->items[sources[best].pos].flags
 		};
+		sources[best].pos++;
 		nout++;
 	}
 	return nout;

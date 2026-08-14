@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		32	/* 32: coherent page-pruning metrics;
+#define PS_SHM_VERSION		33	/* 33: WAL-index known/FPI + record-end metadata;
+								 * 32: coherent page-pruning metrics;
 								 * 31: page-pruning metrics;
 								 * 30: keyed retention lookup;
 								 * 29: retention GET epoch/result payload;
@@ -175,15 +176,22 @@ typedef struct PsKey
 typedef struct PsWalRec
 {
 	uint64_t	lsn;			/* record start LSN (ReadRecPtr) */
+	uint64_t	end_lsn;		/* record end LSN; zero for legacy unknown */
 	uint32_t	timeline;		/* source timeline the record lives on */
+	uint32_t	flags;			/* PS_WAL_INDEX_FLAG_* */
 } PsWalRec;
+
+#define PS_WAL_INDEX_FLAG_KNOWN	(1u << 0)
+#define PS_WAL_INDEX_FLAG_FPI	(1u << 1)
+#define PS_WAL_INDEX_FLAG_MASK	(PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI)
 
 typedef struct PsWalIndexEntry
 {
 	PsKey		key;
 	uint32_t	block;
-	uint32_t	pad;
+	uint32_t	flags;			/* PS_WAL_INDEX_FLAG_* */
 	uint64_t	lsn;
+	uint64_t	end_lsn;		/* record EndRecPtr; zero for legacy unknown */
 } PsWalIndexEntry;
 
 /* Retention owners are intentionally few: structural branch pins are derived

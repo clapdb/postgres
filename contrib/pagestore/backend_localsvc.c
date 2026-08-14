@@ -1448,8 +1448,9 @@ pagestore_localsvc_walidx_add_batch(const PageStoreWalIndexEntry *entries,
 				elog(ERROR, "pagestore WAL index batch is too large");
 			wire[count].key = key;
 			wire[count].block = entries[i].block;
-			wire[count].pad = 0;
+			wire[count].flags = entries[i].flags;
 			wire[count].lsn = entries[i].lsn;
+			wire[count].end_lsn = entries[i].end_lsn;
 			count++;
 		}
 		if (count == 0)

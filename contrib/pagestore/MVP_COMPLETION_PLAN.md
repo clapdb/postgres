@@ -347,8 +347,10 @@ coordinated or stacked with R4 where the acceptance criteria overlap.
 ### R4. Compact and reclaim the WAL index
 
 Status: **R4a durable multi-shard snapshot generation, live cutover, and raw
-log-epoch reclamation implemented; replacement-base selection and snapshot
-entry compaction remain**.
+log-epoch reclamation implemented.  New index records durably carry explicit
+known/FPI metadata and the decoded record-end LSN needed for fence visibility
+(legacy records remain unknown and conservatively unprunable); replacement-base
+selection and snapshot entry compaction remain**.
 
 R4a publishes every per-shard snapshot as an immutable checksummed file before
 atomically replacing one checksummed timeline manifest.  Recovery validates
@@ -796,3 +798,4 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 |---|---|---|
 | 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
 | 2026-08-14 | Completed R0/R1 owner lifecycle and R2 page pruning; added R3a immutable WAL segment/store primitives | Stacked PRs #177-#191, standalone/integration CI, bounded-churn and publication-crash tests |
+| 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |

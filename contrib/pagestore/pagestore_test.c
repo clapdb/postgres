@@ -1220,7 +1220,8 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 
 static void
 op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
-					const uint32_t *blocks, const uint64_t *lsns, uint32_t nentries)
+					const uint32_t *blocks, const uint64_t *lsns,
+					const uint32_t *flags, uint32_t nentries)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
@@ -1230,8 +1231,9 @@ op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
 	{
 		entries[i].key = ch->key;
 		entries[i].block = blocks[i];
-		entries[i].pad = 0;
+		entries[i].flags = flags != NULL ? flags[i] : 0;
 		entries[i].lsn = lsns[i];
+		entries[i].end_lsn = flags != NULL ? lsns[i] + 1 : 0;
 	}
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
@@ -4365,8 +4367,11 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	{
 		const uint32_t blocks[] = {7, 8, 7};
 		const uint64_t lsns[] = {175, 225, 275};
+		const uint32_t flags[] = {PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI};
 
-		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, 3);
+		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, flags, 3);
 	}
 	check(nonzero_rel != 0, "test harness can find a nonzero WAL-index shard relation");
 	if (nonzero_rel != 0)
@@ -4403,6 +4408,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries are queryable in LSN order");
+	check(n == 2 && out[0].flags == PS_WAL_INDEX_FLAG_KNOWN &&
+		  out[1].flags == (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) &&
+		  out[0].end_lsn == 176 && out[1].end_lsn == 276,
+		  "WAL-index known/FPI and record-end metadata is returned with each entry");
 	{
 		char manifest[512];
 		int visible = 0;
@@ -4483,6 +4492,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries survive daemon restart");
+	check(n == 2 && out[0].flags == PS_WAL_INDEX_FLAG_KNOWN &&
+		  out[1].flags == (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) &&
+		  out[0].end_lsn == 176 && out[1].end_lsn == 276,
+		  "WAL-index replacement-base metadata survives snapshot recovery");
 	n = op_walidx_get(0, REL_A, FORK0, 9, 1000000, out);
 	check(n == 1 && out[0].lsn == 400,
 		  "restart replays the WAL-index log tail after the snapshot offset");
