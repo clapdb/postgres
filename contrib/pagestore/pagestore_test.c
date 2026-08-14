@@ -4346,11 +4346,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
-		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD_ONCE", "0", 1) == 0,
 		  "force one WAL-index snapshot generation for recovery coverage");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD_ONCE");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
@@ -4502,6 +4504,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	{
 		char old_shard[512];
 		char current_shard[512];
+		char legacy_log[512];
+		char old_log[512];
+		char current_log[512];
 		int collected = 0;
 
 		snprintf(old_shard, sizeof(old_shard),
@@ -4510,10 +4515,18 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		snprintf(current_shard, sizeof(current_shard),
 				 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
 				 store, 2ULL, 0U);
+		snprintf(legacy_log, sizeof(legacy_log), "%s/walidx_0_0", store);
+		snprintf(old_log, sizeof(old_log), "%s/walidx_0_0_e%020llu",
+				 store, 1ULL);
+		snprintf(current_log, sizeof(current_log), "%s/walidx_0_0_e%020llu",
+				 store, 2ULL);
 		for (int attempt = 0; attempt < 500; attempt++)
 		{
 			if (access(old_shard, F_OK) != 0 && errno == ENOENT &&
-				access(current_shard, F_OK) == 0)
+				access(current_shard, F_OK) == 0 &&
+				access(legacy_log, F_OK) != 0 && errno == ENOENT &&
+				access(old_log, F_OK) != 0 && errno == ENOENT &&
+				access(current_log, F_OK) == 0)
 			{
 				collected = 1;
 				break;
@@ -4521,7 +4534,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			usleep(10000);
 		}
 		check(collected,
-			  "maintenance retires the old WAL-index snapshot generation");
+			  "maintenance retires old WAL-index snapshot and log epochs");
+	}
+	if (nonzero_rel != 0)
+	{
+		op_walidx_add(0, nonzero_rel, FORK0, 1, 500);
+		check(op_walidx_progress(0, 512, 512, NULL) == 0,
+			  "new WAL-index log epoch accepts and commits shard tail records");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
@@ -4553,12 +4572,29 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
+	if (walidx_nshards > 2)
+	{
+		char path[512];
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/walidx_0_%u_e%020llu",
+				 store, 2U, 2ULL);
+		check(unlink(path) == 0,
+			  "remove an empty but manifest-selected WAL-index log epoch");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+							   "missing selected WAL-index log epoch fails closed");
+		fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && fsync(fd) == 0 && close(fd) == 0,
+			  "restore the selected empty WAL-index log epoch for corruption test");
+	}
 	if (nonzero_rel != 0)
 	{
 		char		path[512];
 		struct stat st;
 
-		snprintf(path, sizeof(path), "%s/walidx_0_%u", store, nonzero_shard);
+		snprintf(path, sizeof(path), "%s/walidx_0_%u_e%020llu",
+				 store, nonzero_shard, 2ULL);
 		check(stat(path, &st) == 0 && st.st_size > 1 &&
 			  truncate(path, st.st_size / 2) == 0,
 			  "truncate a committed nonzero WAL-index shard");

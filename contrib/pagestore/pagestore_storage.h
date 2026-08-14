@@ -70,11 +70,19 @@ typedef struct PsStorage
 	int			(*wal_truncate) (uint32_t tl, uint64_t len);
 
 	/* Per-(timeline, shard) durable per-page WAL index records. */
-	int			(*walidx_append) (uint32_t tl, uint32_t shard,
+	int			(*walidx_append) (uint32_t tl, uint32_t shard, uint64_t epoch,
 							 const void *buf, uint32_t len);
-	int			(*walidx_read) (uint32_t tl, uint32_t shard, uint64_t off,
-							 void *buf, uint32_t len);
-	int			(*walidx_truncate) (uint32_t tl, uint32_t shard, uint64_t len);
+	int			(*walidx_read) (uint32_t tl, uint32_t shard, uint64_t epoch,
+							 uint64_t off, void *buf, uint32_t len);
+	int			(*walidx_truncate) (uint32_t tl, uint32_t shard, uint64_t epoch,
+							   uint64_t len);
+	/* Prepare a durable empty epoch before a snapshot manifest selects it, then
+	 * retire only epochs older than the selected one.  GC returns 1 if it
+	 * removed files, 0 if already clean, and -1 on error. */
+	int			(*walidx_epoch_create) (uint32_t tl, uint32_t shard,
+								 uint64_t epoch);
+	int			(*walidx_epoch_gc) (uint32_t tl, uint32_t shard,
+							 uint64_t keep_epoch);
 
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);

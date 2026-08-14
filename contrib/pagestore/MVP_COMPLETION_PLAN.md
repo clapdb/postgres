@@ -346,8 +346,9 @@ coordinated or stacked with R4 where the acceptance criteria overlap.
 
 ### R4. Compact and reclaim the WAL index
 
-Status: **R4a durable multi-shard snapshot generation and live cutover
-implemented; replacement-base selection and reclamation remain**.
+Status: **R4a durable multi-shard snapshot generation, live cutover, and raw
+log-epoch reclamation implemented; replacement-base selection and snapshot
+entry compaction remain**.
 
 R4a publishes every per-shard snapshot as an immutable checksummed file before
 atomically replacing one checksummed timeline manifest.  Recovery validates
@@ -360,8 +361,11 @@ publish lock, publishes all shard images, and records each source-log offset.
 Recovery restores the selected generation and replays only the tail after those
 absolute offsets.  Once a newer manifest is durable, maintenance validates it
 and idempotently removes older immutable snapshot shard generations; newer
-unpublished retry files are preserved.  No WAL-index log entry or raw WAL is
-dropped yet.
+unpublished retry files are preserved.  New payloads also name one prepared,
+durable log epoch per shard.  The manifest atomically selects those empty log
+epochs with the snapshot, later appends land only in the selected epochs, and
+maintenance removes legacy/older log epochs.  Snapshot entries and raw WAL are
+not pruned yet.
 
 Deliverables:
 
@@ -772,7 +776,7 @@ packaging do not block MVP completion.
 
 The remaining default sequence is:
 
-1. select replacement bases and reclaim old WAL-index generations;
+1. select replacement bases and compact retained WAL-index snapshot entries;
 2. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
 3. R4b forkmeta compaction/reclamation and publication crash tests;
 4. R5 timeline deletion;
