@@ -804,7 +804,8 @@ retry:
 		if (idx[i].block != block || key_cmp(&idx[i].key, key) != 0)
 			continue;
 		if (idx[i].lsn <= read_lsn &&
-			(read_seq == 0 || idx[i].admission_seq == 0 ||
+			(idx[i].lsn < read_lsn || read_seq == 0 ||
+			 idx[i].admission_seq == 0 ||
 			 idx[i].admission_seq <= read_seq) &&
 			(!found || idx[i].lsn > best_lsn ||
 			 (idx[i].lsn == best_lsn && idx[i].admission_seq >= best_seq)))

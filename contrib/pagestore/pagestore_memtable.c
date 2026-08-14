@@ -138,7 +138,7 @@ ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 			e->key.klass != key->klass)
 			continue;
 		if (e->lsn <= read_lsn &&
-			(read_seq == 0 || e->admission_seq == 0 ||
+			(e->lsn < read_lsn || read_seq == 0 || e->admission_seq == 0 ||
 			 e->admission_seq <= read_seq) &&
 			(!best || e->lsn > best->lsn ||
 			 (e->lsn == best->lsn && e->admission_seq >= best->admission_seq)))

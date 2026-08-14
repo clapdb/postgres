@@ -47,6 +47,7 @@
 #include "pagestore_manifest.h"
 #include "pagestore_memtable.h"
 #include "pagestore_pgcache.h"
+#include "pagestore_prune.h"
 #include "pagestore_retention.h"
 
 /* configuration, set by the frontend before ps_core_open() */
@@ -91,6 +92,13 @@ static pthread_t evict_local_thread;
 static PsLayerDesc evict_local_candidate;
 static volatile int evict_local_state; /* 0 idle, 1 verifying, 2 verified, 3 failed */
 static uint32_t evict_local_map_cursor;
+static void page_remove_compacted_versions(uint32_t timeline,
+										   const PsImgRec *recs, uint32_t nrec);
+static int retention_project_lsn(uint32_t descendant, uint32_t target,
+								 uint64_t *lsn);
+static int timeline_has_parent(uint32_t timeline);
+static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+								 uint32_t *nfences_out);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -104,11 +112,61 @@ uint32_t	ps_nshards = 1;
 static uint64_t next_segment_order_id = 1;
 static uint64_t next_admission_seq = 1;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* A page-history pin must not change between a compaction floor snapshot and
+ * publication of the pruned replacement layer. */
+static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *metrics_header;
+
+#define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
+#define PS_PAGE_FRONTIER_VERSION 2
+typedef struct PsPageFrontierState
+{
+	uint32_t	magic;
+	uint32_t	version;
+	PsPruneFence frontiers[1024];
+	uint32_t	crc;
+} PsPageFrontierState;
+static char page_frontier_path[4096];
+static char page_frontier_dir[4096];
+static PsPruneFence page_reclaimed_frontier[1024];
+static int page_frontier_load(const char *store_dir);
+static int page_frontier_advance(uint32_t timeline, uint64_t floor,
+								 uint64_t admission_seq);
+
+/* Test-only crash boundaries for publication recovery.  They are inert unless
+ * the daemon was explicitly started with the fault switch and the test has
+ * armed the store-local marker after startup. */
+static void
+test_crash_compaction_at(const char *phase)
+{
+	const char *enabled = getenv("PAGESTORE_TEST_FAULT");
+	const char *requested = getenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	char		marker[4096];
+	int			n;
+
+	if (enabled == NULL || strcmp(enabled, "1") != 0 || requested == NULL ||
+		strcmp(requested, phase) != 0 || page_frontier_dir[0] == '\0')
+		return;
+	n = snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed",
+				 page_frontier_dir);
+	if (n < 0 || (size_t) n >= sizeof(marker) || access(marker, F_OK) != 0)
+		return;
+	_exit(88);
+}
 
 static uint64_t
 admission_seq_alloc(void)
 {
-	return __atomic_fetch_add(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
+
+	for (;;)
+	{
+		if (next == 0 || next == UINT64_MAX)
+			return 0;
+		if (__atomic_compare_exchange_n(&next_admission_seq, &next, next + 1,
+								false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+			return next;
+	}
 }
 
 static void
@@ -116,8 +174,9 @@ admission_seq_observe(uint64_t seq)
 {
 	uint64_t	next = __atomic_load_n(&next_admission_seq, __ATOMIC_RELAXED);
 
-	while (next <= seq &&
-		   !__atomic_compare_exchange_n(&next_admission_seq, &next, seq + 1,
+	while (next <= seq && next != UINT64_MAX &&
+		   !__atomic_compare_exchange_n(&next_admission_seq, &next,
+								 seq == UINT64_MAX ? UINT64_MAX : seq + 1,
 									 false, __ATOMIC_RELAXED,
 									 __ATOMIC_RELAXED))
 		;
@@ -142,6 +201,8 @@ ps_admission_barrier(void)
 
 	pthread_rwlock_wrlock(&admission_lock);
 	seq = admission_seq_alloc();
+	if (seq != 0 && ps_retention_reserve_admission_seq(seq) != 0)
+		seq = 0;
 	pthread_rwlock_unlock(&admission_lock);
 	return seq;
 }
@@ -882,24 +943,185 @@ gc_remote_one(void)
  * layer count and the per-read layer scan), then GC the merged-away layers.
  * Install-new-before-delete-old: the new layer is written and recorded durably
  * before any old layer is marked for deletion, so a crash at any point leaves
- * the data readable and GC resumable.  Keeps every version (dedup-free: each
- * version lives in exactly one source layer); version-level GC by retained-LSN
- * horizon is a later step.
+ * the data readable and GC resumable.  Each version lives in exactly one
+ * source layer; page-history pruning keeps the newest version below the
+ * effective floor plus every version at or above it.
  */
+typedef struct CompactOrder
+{
+	PsKey		key;
+	uint32_t	block;
+	PsPruneVersion version;
+	uint32_t	source;
+} CompactOrder;
+
 static int
-compact_timeline(uint32_t timeline, uint32_t shard)
+compact_order_cmp(const void *va, const void *vb)
+{
+	const CompactOrder *a = va;
+	const CompactOrder *b = vb;
+
+#define CMP_KEY_FIELD(field) \
+	if (a->key.field != b->key.field) \
+		return a->key.field < b->key.field ? -1 : 1
+	CMP_KEY_FIELD(spcOid);
+	CMP_KEY_FIELD(dbOid);
+	CMP_KEY_FIELD(relNumber);
+	CMP_KEY_FIELD(forkNum);
+	CMP_KEY_FIELD(klass);
+#undef CMP_KEY_FIELD
+	if (a->block != b->block)
+		return a->block < b->block ? -1 : 1;
+	if (a->version.lsn != b->version.lsn)
+		return a->version.lsn < b->version.lsn ? -1 : 1;
+	if (a->version.admission_seq != b->version.admission_seq)
+		return a->version.admission_seq < b->version.admission_seq ? -1 : 1;
+	return a->source < b->source ? -1 : (a->source > b->source ? 1 : 0);
+}
+
+static int
+compact_same_page(const CompactOrder *a, const CompactOrder *b)
+{
+	return a->block == b->block &&
+		a->key.spcOid == b->key.spcOid && a->key.dbOid == b->key.dbOid &&
+		a->key.relNumber == b->key.relNumber &&
+		a->key.forkNum == b->key.forkNum && a->key.klass == b->key.klass;
+}
+
+static int
+prune_compaction_records(uint32_t timeline, PsImgRec *recs, uint32_t *nrec,
+						 uint64_t floor,
+						 PsImgRec **dropped_out, uint32_t *ndropped_out)
+{
+	CompactOrder *order;
+	PsPruneVersion *versions;
+	unsigned char *keep;
+	PsImgRec   *selected;
+	PsImgRec   *dropped;
+	uint32_t	out = 0;
+	uint32_t	ndropped = 0;
+	PsPruneFence *fences = NULL;
+	uint32_t	nfences = 0;
+
+	if (page_prune_fences(timeline, &fences, &nfences) != 0)
+		return -1;
+
+	order = malloc((size_t) *nrec * sizeof(*order));
+	versions = malloc((size_t) *nrec * sizeof(*versions));
+	keep = malloc(*nrec);
+	selected = malloc((size_t) *nrec * sizeof(*selected));
+	dropped = malloc((size_t) *nrec * sizeof(*dropped));
+	if (!order || !versions || !keep || !selected || !dropped)
+	{
+		free(order);
+		free(versions);
+		free(keep);
+		free(selected);
+		free(dropped);
+		free(fences);
+		return -1;
+	}
+	for (uint32_t i = 0; i < *nrec; i++)
+	{
+		order[i].key = recs[i].key;
+		order[i].block = recs[i].block;
+		order[i].version.lsn = recs[i].lsn;
+		order[i].version.admission_seq = recs[i].admission_seq;
+		order[i].source = i;
+	}
+	qsort(order, *nrec, sizeof(*order), compact_order_cmp);
+	for (uint32_t first = 0; first < *nrec;)
+	{
+		uint32_t end = first + 1;
+
+		while (end < *nrec && compact_same_page(&order[first], &order[end]))
+			end++;
+		/* Relation page history is the only history governed by the page-prune
+		 * frontier.  Control and SLRU pages are reader-artifact authority: an
+		 * exact checkpoint can require an older SLRU base even when its ordinary
+		 * relation pages have advanced.  Keep all non-relation versions until
+		 * their dedicated retention protocols prove them reclaimable. */
+		if (order[first].key.klass != PS_KLASS_RELATION)
+		{
+			for (uint32_t i = first; i < end; i++)
+				selected[out++] = recs[order[i].source];
+			first = end;
+			continue;
+		}
+		for (uint32_t i = first; i < end; i++)
+			versions[i - first] = order[i].version;
+		if (floor == 0)
+			memset(keep, 1, end - first);
+		else if (ps_page_prune_plan(versions, end - first,
+								(PsPruneFence) {floor, UINT64_MAX}, fences,
+									 nfences, keep) < 0)
+		{
+			free(order);
+			free(versions);
+			free(keep);
+			free(selected);
+			free(dropped);
+			free(fences);
+			return -1;
+		}
+		for (uint32_t i = first; i < end;)
+		{
+			uint32_t next = i + 1;
+			int kept_source = -1;
+
+			while (next < end &&
+				   order[next].version.lsn == order[i].version.lsn &&
+				   order[next].version.admission_seq ==
+				   order[i].version.admission_seq)
+				next++;
+			for (uint32_t j = i; j < next; j++)
+				if (keep[j - first])
+				{
+					kept_source = (int) order[j].source;
+					break;
+				}
+			/* Sorted equal identities are one logical version.  Retain one
+			 * physical copy, or remove the identity from page_idx exactly once. */
+			if (kept_source >= 0)
+				selected[out++] = recs[kept_source];
+			else
+				dropped[ndropped++] = recs[order[i].source];
+			i = next;
+		}
+		first = end;
+	}
+	memcpy(recs, selected, (size_t) out * sizeof(*recs));
+	free(order);
+	free(versions);
+	free(keep);
+	free(selected);
+	free(fences);
+	*nrec = out;
+	*dropped_out = dropped;
+	*ndropped_out = ndropped;
+	return 0;
+}
+
+static int
+compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 {
 	PsLayerDesc *old;
 	uint32_t	nold = count_image_layers(timeline, shard);
 	PsImgRec   *recs = NULL;
 	unsigned char **pages = NULL;
 	uint32_t	nrec = 0,
-				cap = 0;
+				cap = 0,
+				npages = 0,
+				scanned = 0;
 	uint64_t	nid;
 	PsLayerDesc newdesc;
+	PsLayerLocation remote;
+	PsImgRec   *dropped = NULL;
+	uint32_t	ndropped = 0;
+	uint64_t	frontier_seq;
 	int			rc = -1;
 
-	if (nold < 2)
+	if (nold == 0)
 		return 0;				/* nothing worth merging */
 
 	/*
@@ -994,11 +1216,19 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 			recs[nrec].flags = idx[j].flags;
 			pages[nrec] = pg;
 			nrec++;
+			npages = nrec;
 		}
 		free(idx);
 	}
 	if (nrec == 0)
 		goto cleanup;
+	scanned = nrec;
+	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
+								 &dropped, &ndropped) != 0 || nrec == 0)
+		goto cleanup;
+	frontier_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (frontier_seq != 0)
+		frontier_seq--;
 
 	/* install the new merged layer durably, THEN delete the old ones */
 	nid = alloc_layer_id(&g_shards[shard]);
@@ -1008,8 +1238,76 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 	for (uint32_t k = 0; k < nold; k++)
 		if (old[k].legacy_shard_zero)
 			newdesc.legacy_shard_zero = true;
-	if (record_layer(NULL, &newdesc) != 0)
+	/* A remote-durable source may be the only copy surviving loss of the local
+	 * store.  Publish and verify the replacement in that same durability tier
+	 * before its ADD can make any source eligible for deletion. */
+	for (uint32_t k = 0; k < nold; k++)
+		if (old[k].remote_durable)
+		{
+			const PsLayerLocation *local = tier_local_location(&newdesc);
+
+			if (local == NULL || ps_layer_store->upload_layer == NULL ||
+				ps_layer_store->remote_uri == NULL ||
+				newdesc.location_count >= PS_LAYER_MAX_LOCATIONS)
+			{
+				(void) ps_layer_store->delete_local_layer(&newdesc);
+				goto cleanup;
+			}
+			if (ps_layer_store->upload_layer(&newdesc) != 0)
+			{
+				(void) ps_layer_store->delete_local_layer(&newdesc);
+				goto cleanup;
+			}
+			memset(&remote, 0, sizeof(remote));
+			remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
+			remote.size = local->size;
+			remote.available = true;
+			if (ps_layer_store->remote_uri(newdesc.layer_id, remote.uri,
+										 sizeof(remote.uri)) != 0)
+			{
+				(void) ps_layer_store->delete_local_layer(&newdesc);
+				goto cleanup;
+			}
+			newdesc.locations[newdesc.location_count++] = remote;
+			newdesc.remote_durable = true;
+			newdesc.remote_uploaded_lsn = newdesc.lsn_end;
+			break;
+		}
+	/* Reject later pins/branches below this cutoff before the pruned layer can
+	 * become durable and visible.  Advancing conservatively when publication
+	 * later fails is safe; admitting already-reclaimed history is not. */
+	if (ndropped != 0 &&
+		page_frontier_advance(timeline, page_floor, frontier_seq) != 0)
+	{
+		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
+	}
+	test_crash_compaction_at("after_frontier");
+	if (record_layer(NULL, &newdesc) != 0)
+	{
+		(void) ps_layer_store->delete_local_layer(&newdesc);
+		goto cleanup;
+	}
+	/* The replacement is published before any source is retired.  Keep this
+	 * distinct crash boundary so recovery covers both live sources and the
+	 * replacement together. */
+	test_crash_compaction_at("after_publish");
+	/* The durable replacement no longer contains these versions.  Drop their
+	 * in-memory index entries at the same publication point; otherwise a live
+	 * read can select a pruned PageVer and then fail because no layer can serve
+	 * the advertised bytes.  Recovery already derives the same index from the
+	 * surviving layer set. */
+	page_remove_compacted_versions(timeline, dropped, ndropped);
+	if (metrics_header != NULL)
+	{
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, nrec);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+						 scanned - nrec);
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+	}
 	for (uint32_t k = 0; k < nold; k++)
 	{
 		/*
@@ -1033,6 +1331,8 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		/* The replacement is visible and this source is now durably retired. */
+		test_crash_compaction_at("after_mark_delete");
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -1052,10 +1352,11 @@ compact_timeline(uint32_t timeline, uint32_t shard)
 	rc = 1;
 
 cleanup:
-	for (uint32_t j = 0; j < nrec; j++)
+	for (uint32_t j = 0; j < npages; j++)
 		free(pages[j]);
 	free(recs);
 	free(pages);
+	free(dropped);
 	free(old);
 	return rc;
 }
@@ -1207,6 +1508,7 @@ typedef struct SegRecHdrBoundAdmission
 typedef struct PageEnt
 {
 	struct PageEnt *next;		/* bucket chain */
+	struct PageEnt *fork_next;	/* pages belonging to the same fork */
 	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	block;
@@ -1231,7 +1533,10 @@ typedef struct ForkEvent
 	uint64_t	admission_seq;	/* global mutation order; 0 = legacy */
 	uint64_t	order_id;		/* bound segment marker identity, else zero */
 	uint32_t	nblocks;
+	uint32_t	cached_nblocks;	/* hop result through this sorted event */
+	uint32_t	cached_fence_nblocks; /* smallest inherited block boundary */
 	uint8_t		kind;
+	uint8_t		cached_state;
 } ForkEvent;
 
 #define FEV_GROW	0
@@ -1254,7 +1559,13 @@ typedef struct ForkEnt
 	ForkEvent  *ev;				/* lsn-ordered size history */
 	uint32_t	nev;
 	uint32_t	evcap;
+	uint32_t   *def_idx;		/* indexes of SET/DEAD events only */
+	uint32_t	ndef;
+	uint32_t	defcap;
+	PageEnt    *pages;			/* local pages belonging to this fork */
 	uint64_t	last_def_lsn;	/* newest SET/DEAD lsn (growth-clamp floor) */
+	uint64_t	last_page_lsn;	/* newest durable local page tuple */
+	uint64_t	last_page_seq;
 	int			has_wal_less;	/* at least one page version has lsn 0 */
 } ForkEnt;
 
@@ -1273,6 +1584,23 @@ typedef struct TimelineMeta
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+/* Retention changes can make projected ancestor history reclaimable even when
+ * no new layer arrives.  Maintenance rewrites every marked nonempty shard and
+ * clears its mark only after publishing at the new effective floor. */
+static unsigned char page_prune_due[MAX_TIMELINES][PS_MAX_CHANNELS];
+
+static void
+page_prune_mark_all_due(void)
+{
+	uint32_t	ns = core_shards();
+
+	ps_lock_map_rd();
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (tl == 0 || timelines[tl].defined)
+			for (uint32_t sh = 0; sh < ns; sh++)
+				__atomic_store_n(&page_prune_due[tl][sh], 1, __ATOMIC_RELEASE);
+	ps_unlock_map();
+}
 
 /*
  * Branch-local usage marker: set once a timeline acquires any local state (a
@@ -1347,6 +1675,197 @@ fnv(const void *p, size_t n)
 	return h;
 }
 
+static uint32_t
+page_frontier_crc(const PsPageFrontierState *state)
+{
+	return fnv(state, offsetof(PsPageFrontierState, crc));
+}
+
+static int
+page_frontier_publish(void)
+{
+	PsPageFrontierState state;
+	char		tmp[4096];
+	int			fd = -1;
+	int			n;
+	int			rc = -1;
+
+	memset(&state, 0, sizeof(state));
+	state.magic = PS_PAGE_FRONTIER_MAGIC;
+	state.version = PS_PAGE_FRONTIER_VERSION;
+	memcpy(state.frontiers, page_reclaimed_frontier,
+		   sizeof(state.frontiers));
+	state.crc = page_frontier_crc(&state);
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", page_frontier_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0 || write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0)
+		goto done;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (rename(tmp, page_frontier_path) != 0 ||
+		fsync_dir_path(page_frontier_dir) != 0)
+		goto done;
+	rc = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0)
+		unlink(tmp);
+	return rc;
+}
+
+static int
+page_frontier_load(const char *store_dir)
+{
+	PsPageFrontierState state;
+	unsigned char extra;
+	int			fd;
+	int			n;
+
+	memset(page_reclaimed_frontier, 0, sizeof(page_reclaimed_frontier));
+	n = snprintf(page_frontier_dir, sizeof(page_frontier_dir), "%s", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(page_frontier_dir))
+		return -1;
+	n = snprintf(page_frontier_path, sizeof(page_frontier_path),
+				 "%s/page-prune.frontiers", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(page_frontier_path))
+		return -1;
+	fd = open(page_frontier_path, O_RDONLY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		read(fd, &extra, 1) != 0 ||
+		state.magic != PS_PAGE_FRONTIER_MAGIC ||
+		state.version != PS_PAGE_FRONTIER_VERSION ||
+		state.crc != page_frontier_crc(&state))
+	{
+		close(fd);
+		errno = EILSEQ;
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	memcpy(page_reclaimed_frontier, state.frontiers,
+		   sizeof(page_reclaimed_frontier));
+	return 0;
+}
+
+static int
+page_frontier_advance(uint32_t timeline, uint64_t floor,
+					  uint64_t admission_seq)
+{
+	PsPruneFence old;
+	PsPruneFence next;
+
+	if (timeline >= MAX_TIMELINES || floor == 0)
+		return -1;
+	old = page_reclaimed_frontier[timeline];
+	next.lsn = floor;
+	next.admission_seq = admission_seq;
+	if (next.lsn < old.lsn ||
+		(next.lsn == old.lsn && next.admission_seq <= old.admission_seq))
+		return 0;
+	page_reclaimed_frontier[timeline] = next;
+	if (page_frontier_publish() != 0)
+	{
+		page_reclaimed_frontier[timeline] = old;
+		return -1;
+	}
+	return 0;
+}
+
+/* A reader pin on a descendant is projected while compaction runs on an
+ * ancestor.  Match that same projection here: the ancestor's frontier may
+ * have advanced past the branch point while the projected page version is
+ * still deliberately retained.  Caller holds map_lock. */
+static int
+page_frontier_projected_fence_active(uint32_t reader_timeline,
+								 uint32_t timeline, uint64_t lsn,
+								 uint64_t admission_seq)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int active = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		uint64_t projected;
+
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 ||
+			pins[i].timeline != reader_timeline)
+			continue;
+		projected = pins[i].lsn;
+		if (retention_project_lsn(reader_timeline, timeline, &projected) &&
+			projected == lsn && pins[i].admission_seq == admission_seq)
+		{
+			active = 1;
+			break;
+		}
+	}
+	free(pins);
+	return active;
+}
+
+/* Every live child is a structural page-prune fence at its branch point,
+ * independent of whether the child currently has an explicit owner pin.
+ * page_prune_fences() retains that inherited version, so an as-of child read
+ * must be allowed to reach it even if the parent's global frontier moved on. */
+static int
+page_frontier_structural_fence_active(uint32_t reader_timeline,
+									  uint32_t timeline, uint64_t lsn)
+{
+	uint32_t current = reader_timeline;
+	uint32_t hops = 0;
+
+	while (current != timeline)
+	{
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current) || ++hops > MAX_TIMELINES)
+			return 0;
+		if (timelines[current].branch_lsn == lsn)
+			return 1;
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 0;
+}
+
+static int
+page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
+					 uint64_t lsn, uint64_t admission_seq)
+{
+	PsPruneFence frontier;
+
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	frontier = page_reclaimed_frontier[timeline];
+	if (lsn < frontier.lsn &&
+		!((admission_seq == 0 &&
+		   page_frontier_structural_fence_active(reader_timeline, timeline, lsn)) ||
+		  (admission_seq != 0 &&
+		   (ps_retention_page_fence_active(timeline, lsn, admission_seq) ||
+			page_frontier_projected_fence_active(reader_timeline, timeline,
+											lsn, admission_seq)))))
+		return 0;
+	/* Sequence zero is the established uncapped/latest-visible fence. */
+	if (admission_seq != 0 &&
+		lsn == frontier.lsn &&
+		admission_seq < frontier.admission_seq &&
+		!ps_retention_page_fence_active(timeline, lsn, admission_seq) &&
+		!page_frontier_projected_fence_active(reader_timeline, timeline,
+									  lsn, admission_seq))
+		return 0;
+	return 1;
+}
+
 static int
 key_eq(const PsKey *a, const PsKey *b)
 {
@@ -1364,6 +1883,7 @@ page_hash(uint32_t timeline, const PsKey *key, uint32_t block)
 }
 
 static ForkEnt *fork_get_or_create(uint32_t timeline, const PsKey *key);
+static ForkEnt *fork_find(uint32_t timeline, const PsKey *key);
 
 static PageEnt *
 page_find(uint32_t timeline, const PsKey *key, uint32_t block)
@@ -1376,6 +1896,79 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 		if (e->timeline == timeline && e->block == block && key_eq(&e->key, key))
 			return e;
 	return NULL;
+}
+
+/* Forget versions omitted from a durably published compacted layer.  The
+ * caller holds this shard's write lock and map write lock, so page chains
+ * cannot change while the replacement layer and index become consistent. */
+static void
+page_remove_compacted_versions(uint32_t timeline, const PsImgRec *recs,
+							   uint32_t nrec)
+{
+	for (uint32_t r = 0; r < nrec;)
+	{
+		uint32_t	end = r + 1;
+		PageEnt    *e = page_find(timeline, &recs[r].key, recs[r].block);
+		int			out = 0;
+
+		while (end < nrec && recs[end].block == recs[r].block &&
+			   key_eq(&recs[end].key, &recs[r].key))
+			end++;
+
+		if (e == NULL)
+		{
+			r = end;
+			continue;
+		}
+		/* dropped identities are sorted by (LSN, admission sequence).  Compact
+		 * this page's live version array once; binary lookup avoids repeatedly
+		 * shifting a hot page while the shard write lock is held. */
+		for (int i = 0; i < e->nver; i++)
+		{
+			PageVer    *v = &e->vers[i];
+			uint32_t	lo = r;
+			uint32_t	hi = end;
+			int			remove = 0;
+
+			while (lo < hi)
+			{
+				uint32_t mid = lo + (hi - lo) / 2;
+
+				if (recs[mid].lsn < v->lsn ||
+					(recs[mid].lsn == v->lsn &&
+					 recs[mid].admission_seq < v->admission_seq))
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo < end && recs[lo].lsn == v->lsn &&
+				recs[lo].admission_seq == v->admission_seq)
+				remove = 1;
+			if (!remove)
+				e->vers[out++] = *v;
+		}
+		e->nver = out;
+		r = end;
+	}
+	for (uint32_t r = 0; r < nrec; r++)
+		if (recs[r].lsn == 0)
+		{
+			ForkEnt    *fork = fork_find(timeline, &recs[r].key);
+			Shard	   *shard = shard_for(&recs[r].key);
+			int			found = 0;
+
+			for (uint32_t b = 0; b < IDX_BUCKETS && !found; b++)
+				for (PageEnt *e = shard->page_idx[b]; e && !found; e = e->next)
+					if (e->timeline == timeline && key_eq(&e->key, &recs[r].key))
+						for (int i = 0; i < e->nver; i++)
+							if (e->vers[i].lsn == 0)
+							{
+								found = 1;
+								break;
+							}
+			if (fork != NULL)
+				fork->has_wal_less = found;
+		}
 }
 
 /*
@@ -1393,6 +1986,7 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint32_t	h = page_hash(timeline, key, block);
 	Shard	   *s = shard_for(key);
 	PageEnt    *e = page_find(timeline, key, block);
+	ForkEnt    *fork = fork_get_or_create(timeline, key);
 
 	timeline_mark_used(timeline);
 	if (!e)
@@ -1401,6 +1995,8 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 		e->timeline = timeline;
 		e->key = *key;
 		e->block = block;
+		e->fork_next = fork->pages;
+		fork->pages = e;
 		e->next = s->page_idx[h & IDX_MASK];
 		s->page_idx[h & IDX_MASK] = e;
 	}
@@ -1415,8 +2011,14 @@ page_add_version(uint32_t timeline, const PsKey *key, uint32_t block,
 	e->vers[e->nver].seg = seg;
 	e->vers[e->nver].off = off;
 	e->nver++;
+	if (lsn > fork->last_page_lsn ||
+		(lsn == fork->last_page_lsn && admission_seq > fork->last_page_seq))
+	{
+		fork->last_page_lsn = lsn;
+		fork->last_page_seq = admission_seq;
+	}
 	if (lsn == 0)
-		fork_get_or_create(timeline, key)->has_wal_less = 1;
+		fork->has_wal_less = 1;
 }
 
 /* Newest version on this entry with lsn <= read_lsn, or NULL if none. */
@@ -1430,7 +2032,7 @@ page_visible(PageEnt *e, uint64_t read_lsn, uint64_t read_seq)
 		PageVer    *v = &e->vers[i];
 
 		if (v->lsn <= read_lsn &&
-			(read_seq == 0 || v->admission_seq == 0 ||
+			(v->lsn < read_lsn || read_seq == 0 || v->admission_seq == 0 ||
 			 v->admission_seq <= read_seq) &&
 			(!best || v->lsn > best->lsn ||
 			 (v->lsn == best->lsn &&
@@ -1495,46 +2097,144 @@ static int
 fork_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap,
 			  uint32_t *nb_out)
 {
-	uint32_t	grow = 0;
-	int			have_grow = 0;
-
 	*nb_out = 0;
-	for (int i = (int) e->nev - 1; i >= 0; i--)
+	if (seq_cap == 0)
 	{
-		const ForkEvent *v = &e->ev[i];
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
 
-		if (v->lsn > cap)
-			continue;
-		if (seq_cap != 0 && v->admission_seq != 0 &&
-			v->admission_seq > seq_cap)
-			continue;
-		if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_COMMIT ||
-			v->kind == FEV_SEG_GROW_BOUND || v->kind == FEV_SEG_COMMIT_BOUND)
-			continue;			/* marker alone never changes fork size */
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		if (lo == 0)
+			return FORK_HOP_NONE;
+		*nb_out = e->ev[lo - 1].cached_nblocks;
+		return e->ev[lo - 1].cached_state;
+	}
+	{
+		uint32_t	first = 0;
+		uint32_t	end = e->nev;
+		uint8_t		state;
+		uint32_t	nb;
+
+		/* Everything below cap is visible regardless of admission sequence.
+		 * Reuse its cached fold, then inspect only the equal-cap run. */
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		state = first == 0 ? FORK_HOP_NONE : e->ev[first - 1].cached_state;
+		nb = first == 0 ? 0 : e->ev[first - 1].cached_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_GROW)
+			{
+				if (v->nblocks > nb)
+					nb = v->nblocks;
+				state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+					FORK_HOP_GROW : FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_SET)
+			{
+				nb = v->nblocks;
+				state = FORK_HOP_DEF;
+			}
+			else if (v->kind == FEV_DEAD)
+			{
+				nb = 0;
+				state = FORK_HOP_DEAD;
+			}
+		}
+		*nb_out = nb;
+		return state;
+	}
+}
+
+static void
+fork_event_cache_from(ForkEnt *e, uint32_t start)
+{
+	uint8_t state = start == 0 ? FORK_HOP_NONE : e->ev[start - 1].cached_state;
+	uint32_t nb = start == 0 ? 0 : e->ev[start - 1].cached_nblocks;
+	uint32_t fence = start == 0 ? UINT32_MAX :
+		e->ev[start - 1].cached_fence_nblocks;
+
+	for (uint32_t i = start; i < e->nev; i++)
+	{
+		ForkEvent *v = &e->ev[i];
+
 		if (v->kind == FEV_GROW)
 		{
-			if (v->nblocks > grow)
-				grow = v->nblocks;
-			have_grow = 1;
-			continue;
+			if (v->nblocks > nb)
+				nb = v->nblocks;
+			state = (state == FORK_HOP_NONE || state == FORK_HOP_GROW) ?
+				FORK_HOP_GROW : FORK_HOP_DEF;
 		}
-		if (v->kind == FEV_DEAD)
+		else if (v->kind == FEV_SET)
 		{
-			if (!have_grow)
-				return FORK_HOP_DEAD;
-			*nb_out = grow;
-			return FORK_HOP_DEF;
+			nb = v->nblocks;
+			state = FORK_HOP_DEF;
+			if (v->nblocks < fence)
+				fence = v->nblocks;
 		}
-		/* FEV_SET */
-		*nb_out = v->nblocks > grow ? v->nblocks : grow;
-		return FORK_HOP_DEF;
+		else if (v->kind == FEV_DEAD)
+		{
+			nb = 0;
+			state = FORK_HOP_DEAD;
+			fence = 0;
+		}
+		v->cached_nblocks = nb;
+		v->cached_state = state;
+		v->cached_fence_nblocks = fence;
 	}
-	if (have_grow)
+}
+
+/* Keep a compact index over definitive lifecycle events.  Inserts can shift
+ * existing event offsets, but their cost is proportional to the number of
+ * truncates/unlinks rather than the usually much larger number of GROWs. */
+static void
+fork_def_index_insert(ForkEnt *e, uint32_t event_idx, int definitive)
+{
+	uint32_t	pos = 0;
+
+	while (pos < e->ndef && e->def_idx[pos] < event_idx)
+		pos++;
+	for (uint32_t i = pos; i < e->ndef; i++)
+		e->def_idx[i]++;
+	if (!definitive)
+		return;
+	if (e->ndef == e->defcap)
 	{
-		*nb_out = grow;
-		return FORK_HOP_GROW;
+		e->defcap = e->defcap ? e->defcap * 2 : 4;
+		e->def_idx = realloc(e->def_idx,
+			(size_t) e->defcap * sizeof(*e->def_idx));
 	}
-	return FORK_HOP_NONE;
+	memmove(&e->def_idx[pos + 1], &e->def_idx[pos],
+		(size_t) (e->ndef - pos) * sizeof(*e->def_idx));
+	e->def_idx[pos] = event_idx;
+	e->ndef++;
+}
+
+static void
+fork_def_index_remove_nondef(ForkEnt *e, uint32_t event_idx)
+{
+	for (uint32_t i = 0; i < e->ndef; i++)
+		if (e->def_idx[i] > event_idx)
+			e->def_idx[i]--;
 }
 
 /* Size of e as of cap, hop-local (for the GROW-dedup below). */
@@ -1545,6 +2245,97 @@ fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
 
 	(void) fork_asof_hop(e, cap, seq_cap, &nb);
 	return nb;
+}
+
+/* A later truncate/drop invalidates old page bytes even if subsequent growth
+ * makes the block addressable again.  The current fast path avoids touching
+ * event history unless a definitive event is newer than the selected page. */
+static int
+fork_page_invalidated(const ForkEnt *e, uint32_t block, const PageVer *page,
+					  uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL || page == NULL || e->last_def_lsn < page->lsn)
+		return 0;
+	for (int i = (int) e->ndef - 1; i >= 0; i--)
+	{
+		const ForkEvent *v = &e->ev[e->def_idx[i]];
+
+		if (v->lsn > cap ||
+			(seq_cap != 0 && v->lsn == cap && v->admission_seq != 0 &&
+			 v->admission_seq > seq_cap) ||
+			(v->kind != FEV_SET && v->kind != FEV_DEAD))
+			continue;
+		/* Nonzero LSN is the primary order, including across legacy and
+		 * sequenced records.  WAL-less records have no LSN order, so retain
+		 * their established admission-order semantics. */
+		if (v->lsn != 0 && page->lsn != 0)
+		{
+			if (v->lsn < page->lsn)
+				break;
+			if (v->lsn == page->lsn &&
+				v->admission_seq <= page->admission_seq)
+				continue;
+		}
+		else if (v->admission_seq <= page->admission_seq)
+			continue;
+		if (v->kind == FEV_DEAD || block >= v->nblocks)
+			return 1;
+	}
+	return 0;
+}
+
+static int
+fork_inheritance_fenced(const ForkEnt *e, uint32_t block,
+						uint64_t cap, uint64_t seq_cap)
+{
+	if (e == NULL)
+		return 0;
+	if (seq_cap == 0)
+	{
+		uint32_t lo = 0;
+		uint32_t hi = e->nev;
+
+		while (lo < hi)
+		{
+			uint32_t mid = lo + (hi - lo) / 2;
+
+			if (e->ev[mid].lsn <= cap)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		return lo != 0 && e->ev[lo - 1].cached_fence_nblocks != UINT32_MAX &&
+			block >= e->ev[lo - 1].cached_fence_nblocks;
+	}
+	{
+		uint32_t first = 0;
+		uint32_t end = e->nev;
+		uint32_t fence;
+
+		while (first < end)
+		{
+			uint32_t mid = first + (end - first) / 2;
+
+			if (e->ev[mid].lsn < cap)
+				first = mid + 1;
+			else
+				end = mid;
+		}
+		fence = first == 0 ? UINT32_MAX :
+			e->ev[first - 1].cached_fence_nblocks;
+		for (uint32_t i = first; i < e->nev && e->ev[i].lsn == cap; i++)
+		{
+			const ForkEvent *v = &e->ev[i];
+
+			if (v->admission_seq != 0 && v->admission_seq > seq_cap)
+				continue;
+			if (v->kind == FEV_DEAD)
+				fence = 0;
+			else if (v->kind == FEV_SET && v->nblocks < fence)
+				fence = v->nblocks;
+		}
+		return fence != UINT32_MAX && block >= fence;
+	}
 }
 
 /* Markerless SEG0 spans an intermediate format transition: some stores already
@@ -1560,20 +2351,38 @@ fork_has_growth_at(const ForkEnt *e, uint64_t lsn, uint32_t nblocks)
 	return 0;
 }
 
+/* A retry can follow page growth at the CREATE's LSN.  The last lifecycle
+ * boundary, not the last event, determines whether that CREATE already made
+ * an empty generation. */
+static int
+fork_has_create_at(const ForkEnt *e, uint64_t lsn)
+{
+	const ForkEvent *last_def = NULL;
+
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == lsn &&
+			(e->ev[i].kind == FEV_SET || e->ev[i].kind == FEV_DEAD))
+			last_def = &e->ev[i];
+	return last_def != NULL && last_def->kind == FEV_SET &&
+		last_def->nblocks == 0;
+}
+
 /*
  * Record a fork-size event, keeping the history lsn-ordered (equal LSNs keep
  * arrival order, so a later definitive event at the same LSN wins a
  * newest-first scan).  GROW events that do not raise the size visible at
  * their own LSN are dropped: steady-state rewrites of existing blocks at ever
  * newer pd_lsns add nothing, so the history stays O(distinct sizes).
- */
+*/
+static _Thread_local int fork_event_cache_defer = 0;
+
 static void
 fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 			   uint32_t nblocks, uint8_t kind)
 {
 	uint32_t	i;
 
-	if (kind == FEV_GROW &&
+	if (!fork_event_cache_defer && kind == FEV_GROW &&
 		fork_size_asof_hop(e, lsn, admission_seq) >= nblocks)
 		return;
 	if (kind != FEV_GROW && lsn > e->last_def_lsn)
@@ -1599,6 +2408,10 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
+	if (fork_event_cache_defer)
+		return;
+	fork_event_cache_from(e, i);
 
 	/*
 	 * Maintain the newest-size scalar.  A tail insert governs directly.  A
@@ -1663,6 +2476,8 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
 	e->nev++;
+	fork_def_index_insert(e, i, 0);
+	fork_event_cache_from(e, i);
 }
 
 static int
@@ -1683,12 +2498,15 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			if (v->kind == FEV_SEG_GROW || v->kind == FEV_SEG_GROW_BOUND)
 			{
 				v->kind = FEV_GROW;
+				fork_event_cache_from(e, i);
 				e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
 			}
 			else
 			{
 				memmove(v, v + 1, (e->nev - i - 1) * sizeof(*v));
 				e->nev--;
+				fork_def_index_remove_nondef(e, i);
+				fork_event_cache_from(e, i);
 			}
 			return 1;
 		}
@@ -1702,6 +2520,9 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
 	uint64_t	admission_seq = admission_seq_alloc();
+
+	if (admission_seq == 0)
+		return -1;
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -1724,6 +2545,138 @@ fork_grow_apply(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 {
 	fork_event_add(fork_get_or_create(timeline, key), lsn, admission_seq, to_nblocks,
 				   FEV_GROW);
+}
+
+static int
+fork_event_precedes_known_state(const ForkEnt *e, uint64_t lsn,
+							uint64_t admission_seq)
+{
+	const ForkEvent *tail;
+
+	if (e == NULL || e->nev == 0)
+		return 0;
+	tail = &e->ev[e->nev - 1];
+	return tail->lsn > lsn ||
+		(tail->lsn == lsn && tail->admission_seq > admission_seq) ||
+		e->last_page_lsn > lsn ||
+		(e->last_page_lsn == lsn && e->last_page_seq > admission_seq);
+}
+
+/* A definitive event can arrive after pages whose WAL positions are newer.
+ * Those page records did not need GROW events when admitted, but the delayed
+ * truncate/drop can make them growth retroactively.  Reconstruct the transient
+ * events now; segment recovery derives the same events durably after restart. */
+typedef struct DeferredGrow
+{
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint32_t	nblocks;
+} DeferredGrow;
+
+static int
+fork_deferred_grow_cmp(const void *left, const void *right)
+{
+	const DeferredGrow *a = left;
+	const DeferredGrow *b = right;
+
+	if (a->lsn != b->lsn)
+		return a->lsn < b->lsn ? -1 : 1;
+	if (a->admission_seq != b->admission_seq)
+		return a->admission_seq < b->admission_seq ? -1 : 1;
+	return 0;
+}
+
+static void
+fork_restore_later_page_growth(uint32_t timeline, const PsKey *key,
+								   uint64_t lsn, uint64_t admission_seq)
+{
+	ForkEnt    *e = fork_get_or_create(timeline, key);
+	DeferredGrow *grows = NULL;
+	uint32_t	ngrows = 0;
+	uint32_t	cap = 0;
+
+	/* The per-fork page chain is block-descending.  Collect its later page
+	 * versions first so a delayed lifecycle event does not rebuild the suffix
+	 * once per block while holding the shard lock. */
+
+	for (PageEnt *page = e->pages; page; page = page->fork_next)
+	{
+		for (int i = 0; i < page->nver; i++)
+		{
+			PageVer    *version = &page->vers[i];
+
+			if (version->lsn != 0 &&
+				(version->lsn > lsn ||
+				 (version->lsn == lsn &&
+				  version->admission_seq > admission_seq)))
+			{
+				if (ngrows == cap)
+				{
+					cap = cap ? cap * 2 : 16;
+					grows = realloc(grows, (size_t) cap * sizeof(*grows));
+					if (grows == NULL)
+						return;
+				}
+				grows[ngrows++] = (DeferredGrow)
+					{version->lsn, version->admission_seq, page->block + 1};
+			}
+		}
+	}
+	/* Sort once and coalesce adjacent equal page-version tuples.  In deferred
+	 * mode fork_event_add deliberately bypasses its cache-based deduplication:
+	 * the cache is rebuilt only after the entire batch, so it cannot suppress a
+	 * necessary later growth using stale values. */
+	qsort(grows, ngrows, sizeof(*grows), fork_deferred_grow_cmp);
+	{
+		uint32_t out = 0;
+
+		for (uint32_t i = 0; i < ngrows; i++)
+		{
+			if (out != 0 && grows[out - 1].lsn == grows[i].lsn &&
+				grows[out - 1].admission_seq == grows[i].admission_seq)
+			{
+				if (grows[i].nblocks > grows[out - 1].nblocks)
+					grows[out - 1].nblocks = grows[i].nblocks;
+			}
+			else
+				grows[out++] = grows[i];
+		}
+		ngrows = out;
+	}
+	fork_event_cache_defer++;
+	{
+		uint32_t existing = 0;
+
+		for (uint32_t i = 0; i < ngrows; i++)
+		{
+			int present = 0;
+
+			while (existing < e->nev &&
+				(e->ev[existing].lsn < grows[i].lsn ||
+				 (e->ev[existing].lsn == grows[i].lsn &&
+				  e->ev[existing].admission_seq < grows[i].admission_seq)))
+				existing++;
+			for (uint32_t j = existing; j < e->nev &&
+				 e->ev[j].lsn == grows[i].lsn &&
+				 e->ev[j].admission_seq == grows[i].admission_seq; j++)
+				if (e->ev[j].kind == FEV_GROW &&
+					e->ev[j].nblocks >= grows[i].nblocks)
+				{
+					present = 1;
+					break;
+				}
+			if (!present)
+				fork_event_add(e, grows[i].lsn, grows[i].admission_seq,
+							   grows[i].nblocks, FEV_GROW);
+		}
+	}
+	fork_event_cache_defer--;
+	if (ngrows != 0)
+	{
+		fork_event_cache_from(e, 0);
+		e->nblocks = fork_size_asof_hop(e, UINT64_MAX, 0);
+	}
+	free(grows);
 }
 
 /*
@@ -1808,6 +2761,26 @@ tl_walk_next(TlWalk *w)
 	return 1;
 }
 
+/* Caller holds map_lock for reading.  A pin on a child must be admissible at
+ * every ancestor position reached by its capped read, not merely at the
+ * child's own frontier. */
+static int
+page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
+						  uint64_t read_seq)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+
+	for (;;)
+	{
+		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+
+		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
+}
+
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
  * the whole ancestry before EXISTS/NBLOCKS can turn a hidden LSN-0 version
  * into an apparently valid empty relation. */
@@ -1867,6 +2840,24 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 	return 1;
 }
 
+/* Project a requested branch horizon through every ancestor cap and reject
+ * any ancestor whose durable reclamation frontier has already passed it. */
+static int
+branch_frontiers_allow(int parent, uint64_t branch_lsn)
+{
+	uint64_t cap = branch_lsn;
+
+	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
+	{
+		if (!timelines[t].defined ||
+			cap < page_reclaimed_frontier[t].lsn)
+			return 0;
+		if (timelines[t].parent >= 0 && cap > timelines[t].branch_lsn)
+			cap = timelines[t].branch_lsn;
+	}
+	return 1;
+}
+
 static int
 branch_exists_with_metadata(uint32_t tl, int parent, uint64_t branch_lsn)
 {
@@ -1891,11 +2882,26 @@ read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 
 	do
 	{
+		ForkEnt    *fe = fork_find(w.tl, key);
+		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+		uint32_t	nb = 0;
+		int			fork_state = fe ? fork_asof_hop(fe, w.lsn, seq_cap, &nb) :
+			FORK_HOP_NONE;
 		PageEnt    *e = page_find(w.tl, key, block);
-		PageVer    *v = e ? page_visible(e, w.lsn, read_seq) : NULL;
+		PageVer    *v = e ? page_visible(e, w.lsn, seq_cap) : NULL;
 
 		if (v)
-			return v;
+		{
+			if (!fork_page_invalidated(fe, block, v, w.lsn, seq_cap))
+				return v;
+			return NULL;
+		}
+		if (fork_state == FORK_HOP_DEAD ||
+			(fork_state == FORK_HOP_DEF && block >= nb))
+			return NULL;
+		if (fork_state == FORK_HOP_DEF &&
+			fork_inheritance_fenced(fe, block, w.lsn, seq_cap))
+			return NULL;
 	} while (tl_walk_next(&w));
 	return NULL;
 }
@@ -1925,7 +2931,8 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
+			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return maxnb;
@@ -1934,6 +2941,29 @@ fork_nblocks_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 			if (r == FORK_HOP_GROW && nb > maxnb)
 				maxnb = nb;
 		}
+	} while (tl_walk_next(&w));
+	return maxnb;
+}
+
+/* Redo must reserve every block that can be reached by WAL already accepted
+ * into this store.  A later CREATE/TRUNCATE is a logical visibility boundary,
+ * not permission to reject an earlier FPI as beyond EOF. */
+static uint32_t
+fork_nblocks_recovery(uint32_t timeline, const PsKey *key, uint64_t read_lsn)
+{
+	uint32_t maxnb = 0;
+	TlWalk w = tl_walk_first(timeline, read_lsn);
+
+	do
+	{
+		ForkEnt *e = fork_find(w.tl, key);
+
+		if (e != NULL)
+			for (uint32_t i = 0; i < e->nev; i++)
+				if (e->ev[i].lsn <= w.lsn &&
+					(e->ev[i].kind == FEV_GROW || e->ev[i].kind == FEV_SET) &&
+					e->ev[i].nblocks > maxnb)
+					maxnb = e->ev[i].nblocks;
 	} while (tl_walk_next(&w));
 	return maxnb;
 }
@@ -1952,7 +2982,8 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 		if (e)
 		{
 			uint32_t	nb;
-			int			r = fork_asof_hop(e, w.lsn, read_seq, &nb);
+			uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+			int			r = fork_asof_hop(e, w.lsn, seq_cap, &nb);
 
 			if (r == FORK_HOP_DEAD)
 				return 0;
@@ -2833,8 +3864,6 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
-static PsShmHeader *metrics_header;
-
 static void
 publish_wal_index_metrics(void)
 {
@@ -3462,6 +4491,9 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	branch_floor = 0;
 	uint64_t	growth_floor = fe ? fe->last_def_lsn : 0;
 
+	if (admission_seq == 0)
+		return -1;
+
 	/* A branch-local version written after the branch snapshot must not become
 	 * visible AT that snapshot merely because copied bytes retain an older
 	 * source LSN.  The first representable local position is branch_lsn + 1. */
@@ -3837,6 +4869,25 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint32_t	levels = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
+	/*
+	 * A durable compaction frontier makes older page history unavailable even
+	 * while a crash-recovery pass still has its source layers to clean up.
+	 * Current reads remain valid: their UINT64_MAX horizon is always newer
+	 * than the frontier.
+	 */
+	if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+	{
+		int		frontier_allows;
+
+		/* page_reclaimed_frontier is published by compaction while holding the
+		 * map write lock.  Sample the two-word fence under the same lock. */
+		ps_lock_map_rd();
+		frontier_allows = page_frontier_allows(timeline, timeline, read_lsn, read_seq);
+		ps_unlock_map();
+		if (!frontier_allows)
+			return -2;
+	}
+
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
@@ -3849,16 +4900,44 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	{
 		w = walk[level];
 		{
-		uint32_t	tl = w.tl;
-		uint64_t	rl = w.lsn;
-		PageEnt    *e = page_find(tl, key, block);
-		PageVer    *pv = e ? page_visible(e, rl, read_seq) : NULL;
+			uint32_t	tl = w.tl;
+			uint64_t	rl = w.lsn;
+			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
+			ForkEnt    *fe;
+			uint32_t	nb = 0;
+			int			fork_state;
+			PageEnt    *e;
+			PageVer    *pv;
+
+			/* A child can inherit this page from a parent.  Check every
+			 * traversed timeline so a parent frontier cannot be bypassed merely
+			 * because the child has not compacted locally. */
+			if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+			{
+				int	frontier_allows;
+
+				/* Compaction publishes the two-word frontier under map_lock. */
+				ps_lock_map_rd();
+				frontier_allows = page_frontier_allows(tl, timeline, rl, seq_cap);
+				ps_unlock_map();
+				if (!frontier_allows)
+					return -2;
+			}
+			fe = fork_find(tl, key);
+			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
+				FORK_HOP_NONE;
+			e = page_find(tl, key, block);
+			pv = e ? page_visible(e, rl, seq_cap) : NULL;
 
 		if (pv)
 		{
 			uint64_t	l,
 						a;
 			int			served;
+			int			poisoned;
+
+			if (fork_page_invalidated(fe, block, pv, rl, seq_cap))
+				return 0;
 
 			/*
 			 * The materialized-page cache and the memtable are safe read sources
@@ -3867,7 +4946,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 * can lag the segment-backed page index.  Bypass transient sources in
 			 * that state; reclaimed versions still use their durable layer.
 			 */
-			int			poisoned = ps_manifest_poisoned();
+			poisoned = ps_manifest_poisoned();
 
 			/* the resolved version (newest <= read_lsn); a caller that needs an
 			 * exact-cutoff match -- e.g. an SLRU snapshot read -- compares it. */
@@ -3880,7 +4959,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 				return 1;
 
 			if (s->memtable && !poisoned &&
-				ps_memtable_lookup(s->memtable, tl, key, block, rl, read_seq,
+				ps_memtable_lookup(s->memtable, tl, key, block, rl, seq_cap,
 								   &l, &a, out) &&
 				l == pv->lsn && a == pv->admission_seq)
 			{
@@ -3890,7 +4969,7 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			else if (pv->seg < 0)
 			{
 				int		layer_result = layer_map_lookup(tl, key, block, rl,
-																	read_seq, pv->lsn, &l, &a, out);
+															seq_cap, pv->lsn, &l, &a, out);
 
 				if (layer_result < 0)
 					return -1;
@@ -3915,6 +4994,12 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 								  pv->admission_seq, out);
 			return served ? 1 : 0;
 		}
+		if (fork_state == FORK_HOP_DEAD ||
+			(fork_state == FORK_HOP_DEF && block >= nb))
+			return 0;
+		if (fork_state == FORK_HOP_DEF &&
+			fork_inheritance_fenced(fe, block, rl, seq_cap))
+			return 0;
 		}
 	}
 	return 0;
@@ -4234,6 +5319,55 @@ retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
 	return 1;
 }
 
+/* Caller holds map-wr and the page-prune read fence. */
+static int
+page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
+				  uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	PsPruneFence *fences;
+	uint32_t nfences = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES) * sizeof(*fences));
+	if (fences == NULL)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+			{
+				fences[nfences].lsn = projected;
+				fences[nfences].admission_seq = projected == pins[i].lsn &&
+					pins[i].admission_seq != 0 ? pins[i].admission_seq : UINT64_MAX;
+				nfences++;
+			}
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t cap = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &cap))
+		{
+			fences[nfences].lsn = cap;
+			fences[nfences].admission_seq = UINT64_MAX;
+			nfences++;
+		}
+	}
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
 /*
  * One conservative floor for one resource on one timeline.  Explicit pins on
  * descendants are projected through every branch cap; a live direct child is
@@ -4242,8 +5376,8 @@ retention_project_lsn(uint32_t descendant, uint32_t target, uint64_t *lsn)
  * GC can share this authority instead of each inventing a partial horizon.
  */
 static int
-retention_effective_floor(uint32_t timeline, uint32_t resource,
-						  uint64_t *floor_out)
+retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
+							   uint64_t *floor_out, int map_locked)
 {
 	typedef struct RetentionControlProjection
 	{
@@ -4263,11 +5397,13 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		resource != PS_RETENTION_RESOURCE_WAL_INDEX)
 		return -1;
 
-	ps_lock_map_rd();
+	if (!map_locked)
+		ps_lock_map_rd();
 	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
 		ps_retention_snapshot_alloc(&pins, &npins) != 0)
 	{
-		ps_unlock_map();
+		if (!map_locked)
+			ps_unlock_map();
 		free(pins);
 		return -1;
 	}
@@ -4281,7 +5417,8 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		if (found != 1 || pin.timeline >= MAX_TIMELINES ||
 			!timelines[pin.timeline].defined)
 		{
-			ps_unlock_map();
+			if (!map_locked)
+				ps_unlock_map();
 			free(pins);
 			return -1;
 		}
@@ -4304,7 +5441,7 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		if (!timelines[candidate].defined ||
 			!retention_project_lsn(candidate, timeline, &cap))
 			continue;
-		if (candidate != timeline)
+		if (candidate != timeline && resource != PS_RETENTION_RESOURCE_PAGE_HISTORY)
 			retention_floor_add(cap, &floor);
 		if (resource == PS_RETENTION_RESOURCE_WAL)
 		{
@@ -4322,7 +5459,8 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 		{
 			if (nancestors >= MAX_TIMELINES)
 			{
-				ps_unlock_map();
+				if (!map_locked)
+					ps_unlock_map();
 				return -1;
 			}
 			if (timelines[current].branch_lsn < cap)
@@ -4333,7 +5471,8 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 			nancestors++;
 		}
 	}
-	ps_unlock_map();
+	if (!map_locked)
+		ps_unlock_map();
 
 	if (resource == PS_RETENTION_RESOURCE_WAL)
 	{
@@ -4359,6 +5498,13 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 	}
 	*floor_out = floor;
 	return 0;
+}
+
+static int
+retention_effective_floor(uint32_t timeline, uint32_t resource,
+						  uint64_t *floor_out)
+{
+	return retention_effective_floor_internal(timeline, resource, floor_out, 0);
 }
 
 /* ===================== recovery (layers + segment tail) =============== */
@@ -4705,9 +5851,14 @@ fail:
 static uint64_t
 fork_op_lsn(const ForkEnt *e, uint64_t req_lsn)
 {
+	uint64_t	newest;
+
 	if (req_lsn != 0)
 		return req_lsn;
-	return e->nev ? e->ev[e->nev - 1].lsn + 1 : 1;
+	newest = e->nev ? e->ev[e->nev - 1].lsn : 0;
+	if (e->last_page_lsn > newest)
+		newest = e->last_page_lsn;
+	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
 }
 
 int
@@ -4720,25 +5871,49 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_CREATE:
 			/*
 			 * Definitive existence from ch->req_lsn on (the backend stamps
-			 * its WAL position; see fork_op_lsn for a legacy 0).  Re-creating
-			 * a fork that already exists at that horizon is an idempotent
-			 * retry or a redo replay: record nothing, so the event history
-			 * is not polluted and no walk gets cut short by a stray SET 0.
+			 * its WAL position; see fork_op_lsn for a legacy 0).  Keep the
+			 * empty-generation boundary even if an older live generation still
+			 * appears current: its UNLINK may arrive later during replay.
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
-				uint64_t	seq = admission_seq_alloc();
-				uint32_t	nb;
-				int			r = fork_asof_hop(e, lsn, 0, &nb);
+				uint64_t	lsn;
+				uint64_t	seq;
+				int			delayed;
 
-				if (r == FORK_HOP_NONE || r == FORK_HOP_DEAD)
+				/* Object writers issue CREATE as a preparatory operation before
+				 * every write.  Unlike a relation WAL CREATE, an unstamped retry
+				 * must preserve the existing fork and its block count. */
+				if (ch->req_lsn == 0 && ch->key.klass != PS_KLASS_RELATION &&
+					fork_exists_through(tl, &ch->key, UINT64_MAX, 0))
+					break;
+
+				lsn = fork_op_lsn(e, ch->req_lsn);
+				/* XLogReadBufferExtended() asks smgr to ensure the relation fork
+				 * exists before applying every redo record.  That call has the
+				 * record's LSN but is not a relation-creation record: if the fork
+				 * already exists at this replay position, recording FEV_SET would
+				 * manufacture a zero-block generation and hide older pages. */
+				if (ch->is_redo == 2 && ch->key.klass == PS_KLASS_RELATION &&
+					fork_exists_through(tl, &ch->key, lsn, 0))
+					break;
+				seq = admission_seq_alloc();
+				delayed = fork_event_precedes_known_state(e, lsn, seq);
+
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
+				if (!fork_has_create_at(e, lsn))
 				{
 					if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_SET) != 0)
 						ch->status = PS_STATUS_ERROR;
 					else
 					{
 						fork_event_add(e, lsn, seq, 0, FEV_SET);
+						if (delayed)
+							fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 						ch->req_seq = seq;
 					}
 				}
@@ -4768,12 +5943,20 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
+				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, 0, FEV_DEAD) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
 					fork_event_add(e, lsn, seq, 0, FEV_DEAD);
+					if (delayed)
+						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
 				}
 			}
@@ -4787,7 +5970,10 @@ ps_handle_meta(PsChannel *ch)
 				ch->status = PS_STATUS_ERROR;
 				break;
 			}
-			ch->result = fork_nblocks_through(tl, &ch->key,
+			ch->result = ch->is_redo ?
+				fork_nblocks_recovery(tl, &ch->key,
+					ch->req_lsn ? ch->req_lsn : UINT64_MAX) :
+				fork_nblocks_through(tl, &ch->key,
 										  ch->req_lsn ? ch->req_lsn : UINT64_MAX,
 										  ch->req_seq);
 			break;
@@ -4803,13 +5989,21 @@ ps_handle_meta(PsChannel *ch)
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
 				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
+				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
+				if (seq == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
 				if (fork_meta_persist(tl, &ch->key, lsn, seq, ch->nblocks,
 								  FEV_SET) != 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
 					fork_event_add(e, lsn, seq, ch->nblocks, FEV_SET);
+					if (delayed)
+						fork_restore_later_page_growth(tl, &ch->key, lsn, seq);
 					ch->req_seq = seq;
 				}
 			}
@@ -4840,7 +6034,10 @@ ps_handle_meta(PsChannel *ch)
 			 * until it writes (copy-on-write).
 			 */
 			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn))
+								 ch->req_lsn) &&
+				(timelines[ch->timeline].defined ||
+				 branch_frontiers_allow((int) ch->parent_timeline,
+								ch->req_lsn)))
 			{
 				if (timelines[ch->timeline].defined)
 					break;
@@ -4861,7 +6058,10 @@ ps_handle_meta(PsChannel *ch)
 			 * rejected in-place before any SLRU directory mutation.
 			 */
 			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn))
+								 ch->req_lsn) &&
+				(timelines[ch->timeline].defined ||
+				 branch_frontiers_allow((int) ch->parent_timeline,
+								ch->req_lsn)))
 			{
 				/* valid */
 			}
@@ -4980,7 +6180,11 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_SET:
 			{
 				PsRetentionPin pin;
+				PsRetentionPin old_pin;
 				int			ret;
+				int			old_found;
+				int			timeline_defined;
+				int			page_history_allowed;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -4989,11 +6193,113 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
+				pin.admission_seq = (uint64_t) ch->nblocks |
+					(uint64_t) ch->pad1 << 32;
 				/* Generation zero exists only for replaying pre-v27 retention
 				 * records.  It is never valid on the current IPC boundary. */
-				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timelines[tl].defined) ?
-					PS_RETENTION_ERROR : ps_retention_set(&pin);
+				if (ch->old_nblocks == 0 || tl >= MAX_TIMELINES)
+					ret = PS_RETENTION_ERROR;
+				else
+				{
+					/* A retried controller fence may be newer than this
+					 * process's recovered allocator.  Serialize its durable SET
+					 * with mutations and advance allocation before admitting more. */
+					pthread_rwlock_wrlock(&admission_lock);
+					pthread_rwlock_wrlock(&page_prune_lock);
+					old_found = ps_retention_lookup(tl, pin.owner_kind,
+						pin.owner_id, &old_pin);
+					ps_lock_map_rd();
+					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
+					ps_unlock_map();
+					/* An active owner can only advance its own horizon.  Its old
+					 * pin already protected all history needed by the newer view, so
+					 * permit the atomic handoff even if a previously published global
+					 * frontier is stricter than the new point. */
+					ret = (((pin.resources &
+							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
+							 !page_history_allowed &&
+							 !(old_found == 1 &&
+							   old_pin.generation == pin.generation &&
+							   old_pin.resources == pin.resources &&
+							   (old_pin.lsn < pin.lsn ||
+								/* An exact retry cannot expose a new fence. */
+								(old_pin.lsn == pin.lsn &&
+								 old_pin.admission_seq == pin.admission_seq)))) ||
+							!timeline_defined) ?
+						PS_RETENTION_ERROR : ps_retention_set(&pin);
+					if (ret == PS_RETENTION_OK)
+					{
+						admission_seq_observe(pin.admission_seq);
+						if ((old_found != 1 ||
+							 memcmp(&old_pin, &pin, sizeof(pin)) != 0) &&
+							(((old_found == 1 ? old_pin.resources : 0) |
+							  pin.resources) &
+							 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+							page_prune_mark_all_due();
+					}
+					pthread_rwlock_unlock(&page_prune_lock);
+					pthread_rwlock_unlock(&admission_lock);
+				}
+				if (ret == PS_RETENTION_STALE)
+					ch->status = PS_STATUS_STALE;
+				else if (ret != PS_RETENTION_OK)
+					ch->status = PS_STATUS_ERROR;
+			}
+			break;
+
+		case PS_OP_RETENTION_PIN_RESERVE:
+			{
+				PsRetentionPin pin;
+				PsRetentionPin old_pin;
+				uint64_t	seq;
+				int			ret = PS_RETENTION_ERROR;
+				int			old_found = 0;
+				int			timeline_defined = 0;
+				int			page_history_allowed = 0;
+
+				memset(&pin, 0, sizeof(pin));
+				pin.timeline = tl;
+				pin.owner_kind = ch->blocknum;
+				pin.resources = ch->parent_timeline;
+				pin.generation = ch->old_nblocks;
+				pin.owner_id = ch->req_seq;
+				pin.lsn = ch->req_lsn;
+				pthread_rwlock_wrlock(&admission_lock);
+				seq = admission_seq_alloc();
+				pin.admission_seq = seq;
+				pthread_rwlock_wrlock(&page_prune_lock);
+				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
+				{
+					old_found = ps_retention_lookup(tl, pin.owner_kind,
+						pin.owner_id, &old_pin);
+					ps_lock_map_rd();
+					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
+					ps_unlock_map();
+					if (timeline_defined &&
+						(((pin.resources &
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
+						 page_history_allowed))
+						ret = ps_retention_reserve_and_set(&pin);
+				}
+				if (ret == PS_RETENTION_OK)
+				{
+					memcpy(ch->data, &seq, sizeof(seq));
+					ch->datalen = sizeof(seq);
+					if ((old_found != 1 ||
+						 memcmp(&old_pin, &pin, sizeof(pin)) != 0) &&
+						(((old_found == 1 ? old_pin.resources : 0) |
+						  pin.resources) &
+						 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+						page_prune_mark_all_due();
+				}
+				pthread_rwlock_unlock(&page_prune_lock);
+				pthread_rwlock_unlock(&admission_lock);
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
@@ -5003,13 +6309,26 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_RETENTION_PIN_DROP:
 			{
+				PsRetentionPin old_pin;
 				int			ret;
+				int			old_found;
+				int			timeline_defined;
 
+				pthread_rwlock_wrlock(&page_prune_lock);
+				old_found = ps_retention_lookup(tl, ch->blocknum,
+											ch->req_seq, &old_pin);
+				ps_lock_map_rd();
+				timeline_defined = tl < MAX_TIMELINES && timelines[tl].defined;
+				ps_unlock_map();
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timelines[tl].defined) ?
+					   !timeline_defined) ?
 					PS_RETENTION_ERROR :
 					ps_retention_drop(tl, ch->blocknum, ch->req_seq,
 									  ch->old_nblocks);
+				if (ret == PS_RETENTION_OK && old_found == 1 &&
+					(old_pin.resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
+					page_prune_mark_all_due();
+				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
@@ -5020,14 +6339,24 @@ ps_handle_meta(PsChannel *ch)
 		case PS_OP_RETENTION_PIN_GET:
 			{
 				PsRetentionPin pin;
+				PsRetentionGetResult result;
 				uint32_t	count = 0;
-				int			found = ps_retention_get(ch->blocknum, &pin, &count);
+				uint64_t	epoch = ch->req_lsn;
+				int			found = ps_retention_get_consistent(ch->blocknum,
+														   &epoch, &pin, &count);
 
-				if (found < 0)
+				if (found == PS_RETENTION_STALE)
+				{
+					ch->status = PS_STATUS_STALE;
+					ch->req_lsn = epoch;
+				}
+				else if (found < 0)
 					ch->status = PS_STATUS_ERROR;
 				else
 				{
 					ch->nblocks = count;
+					memset(&result, 0, sizeof(result));
+					result.mutation_epoch = epoch;
 					if (found)
 					{
 						ch->result = 1;
@@ -5037,6 +6366,36 @@ ps_handle_meta(PsChannel *ch)
 						ch->old_nblocks = pin.generation;
 						ch->req_seq = pin.owner_id;
 						ch->req_lsn = pin.lsn;
+						result.admission_seq = pin.admission_seq;
+					}
+					memcpy(ch->data, &result, sizeof(result));
+					ch->datalen = sizeof(result);
+				}
+			}
+			break;
+
+		case PS_OP_RETENTION_PIN_LOOKUP:
+			{
+				PsRetentionPin pin;
+				int			found = ps_retention_lookup(tl, ch->blocknum,
+												 ch->req_seq, &pin);
+
+				if (found < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+				{
+					ch->result = found != 0;
+					if (found)
+					{
+						ch->timeline = pin.timeline;
+						ch->blocknum = pin.owner_kind;
+						ch->parent_timeline = pin.resources;
+						ch->old_nblocks = pin.generation;
+						ch->req_seq = pin.owner_id;
+						ch->req_lsn = pin.lsn;
+						memcpy(ch->data, &pin.admission_seq,
+							   sizeof(pin.admission_seq));
+						ch->datalen = sizeof(pin.admission_seq);
 					}
 				}
 			}
@@ -5682,8 +7041,10 @@ ps_core_maintenance(void)
 	uint32_t	ns;
 	uint32_t	ftl = 0,
 				fsh = 0;
+	uint64_t	page_floor = 0;
 	int			found = 0;
 	int			did = 0;
+	int			legacy_compaction = 0;
 
 	/* Pin churn is independent of the layer read path (SPDK uses the same host
 	 * metadata), so bound this log before considering LSM-only work. */
@@ -5749,11 +7110,20 @@ ps_core_maintenance(void)
 	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
 		for (uint32_t sh = 0; sh < ns; sh++)
 			if ((tl == 0 || timelines[tl].defined) &&
-				count_image_layers(tl, sh) > (uint32_t) compact_layers)
+				(count_image_layers(tl, sh) > (uint32_t) compact_layers ||
+				 (__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE) != 0 &&
+				  count_image_layers(tl, sh) > 0)))
 			{
 				ftl = tl;
 				fsh = sh;
 				found = 1;
+				for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+					if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+						!ps_layer_map.layers[i].deleting &&
+						ps_layer_map.layers[i].timeline == tl &&
+						layer_shard_from_id(ps_layer_map.layers[i].layer_id) == sh &&
+						ps_layer_map.layers[i].legacy_shard_zero)
+						legacy_compaction = 1;
 				break;
 			}
 	ps_unlock_map();
@@ -5767,12 +7137,32 @@ ps_core_maintenance(void)
 	{
 		if (materialize_compaction_inputs(ftl, fsh) == 0)
 		{
-			ps_lock_shard_wr(fsh);
+			if (legacy_compaction)
+				for (uint32_t sh = 0; sh < ns; sh++)
+					ps_lock_shard_wr(sh);
+			else
+				ps_lock_shard_wr(fsh);
+			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
-			if (count_image_layers(ftl, fsh) > (uint32_t) compact_layers)
-				did = compact_timeline(ftl, fsh) > 0;
+			if ((count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
+				 (__atomic_load_n(&page_prune_due[ftl][fsh], __ATOMIC_ACQUIRE) != 0 &&
+				  count_image_layers(ftl, fsh) > 0)) &&
+				retention_effective_floor_internal(ftl,
+					PS_RETENTION_RESOURCE_PAGE_HISTORY, &page_floor, 1) == 0)
+			{
+				/* Zero disables pruning but still permits a safe layer merge. */
+				did = compact_timeline(ftl, fsh, page_floor) > 0;
+				if (did)
+					__atomic_store_n(&page_prune_due[ftl][fsh], 0,
+									 __ATOMIC_RELEASE);
+			}
 			ps_unlock_map();
-			ps_unlock_shard(fsh);
+			pthread_rwlock_unlock(&page_prune_lock);
+			if (legacy_compaction)
+				for (uint32_t sh = ns; sh > 0; sh--)
+					ps_unlock_shard(sh - 1);
+			else
+				ps_unlock_shard(fsh);
 		}
 	}
 	/* Keep compaction inputs resident until due compaction has run.  Evicting
@@ -5828,6 +7218,7 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	map_locks_ready = 0;
@@ -5911,9 +7302,18 @@ ps_core_open(const char *store_dir)
 	}
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
+	if (page_frontier_load(store_dir) != 0)
 	{
+		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
+		return -1;
+	}
+	{
+		uint64_t	admission_highwater;
 		uint32_t	npins = 0;
 
+		if (ps_retention_admission_highwater(&admission_highwater) != 0)
+			return -1;
+		admission_seq_observe(admission_highwater);
 		if (ps_retention_count(&npins) != 0)
 			return -1;
 		for (uint32_t i = 0; i < npins; i++)
@@ -5928,6 +7328,8 @@ ps_core_open(const char *store_dir)
 				errno = EILSEQ;
 				return -1;
 			}
+			if (pin.admission_seq != 0)
+				admission_seq_observe(pin.admission_seq);
 		}
 	}
 
@@ -5954,6 +7356,9 @@ ps_core_open(const char *store_dir)
 		if (recover(sh) != 0)
 			return -1;
 	}
+	/* Retention mutations may have committed immediately before shutdown.
+	 * Conservatively revisit every nonempty layer set after recovery. */
+	page_prune_mark_all_due();
 	if (use_layers && mark_legacy_shard_zero_layers() != 0)
 		return -1;
 

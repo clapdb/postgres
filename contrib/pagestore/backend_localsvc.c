@@ -202,7 +202,7 @@ ls_attach(void)
 		close(fd);
 		ereport(ERROR,
 				(errmsg("pagestore localsvc shared memory incompatible"),
-				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=%#x version=%u)",
+				 errdetail("daemon page_size=%u, this engine BLCKSZ=%d (magic=0x%x version=%u)",
 						   got_page_size, BLCKSZ, got_magic, got_version)));
 	}
 	ls_shm = shm;
@@ -454,8 +454,9 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * admission fence.  Block 2 is versioned by redo itself, so requiring an exact
  * hit prevents an older checkpoint's fence from being used for a newer R. */
 bool
-pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
-									 int timeout_ms)
+pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+											  uint64 read_lsn, uint64 *read_seq,
+											  int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsAdmissionFence fence;
@@ -466,6 +467,7 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
+	ch->timeline = timeline;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 2;
 	ch->req_lsn = read_lsn;
@@ -479,6 +481,14 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 		return false;
 	*read_seq = fence.admission_seq;
 	return true;
+}
+
+bool
+pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
+									 int timeout_ms)
+{
+	return pagestore_localsvc_read_fence_for_timeline_timeout(
+		pagestore_localsvc_timeline(), read_lsn, read_seq, timeout_ms);
 }
 
 static uint64
@@ -537,11 +547,40 @@ ls_pinned_read_seq(void)
 static uint64
 ls_op_lsn(void)
 {
-	if (RecoveryInProgress())
+	if (AmStartupProcess())
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
 	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+}
+
+/* A materializer is writable, not a pinned reader, but during recovery it
+ * must not resolve relation metadata or page bytes beyond the WAL record it
+ * is currently replaying.  Doing so exposes a future CREATE/TRUNCATE and can
+ * make redo attempt an extension against the wrong fork generation. */
+static uint64
+ls_read_lsn(void)
+{
+	if (localsvc_read_lsn != 0)
+		return localsvc_read_lsn;
+	if (RecoveryInProgress())
+	{
+		XLogRecPtr replay;
+
+		/* Only startup is inside rm_redo and may use the in-progress record.
+		 * A hot-standby backend must observe the last completed replay record. */
+		if (!AmStartupProcess())
+			return (uint64) GetXLogReplayRecPtr(NULL);
+		replay = GetCurrentReplayRecPtr(NULL);
+
+		/* Between records the current pointer is invalid, but read-only
+		 * backends can still touch catalogs.  Bound those reads at the last
+		 * completed replay position rather than accidentally using newest. */
+		if (replay == InvalidXLogRecPtr)
+			replay = GetXLogReplayRecPtr(NULL);
+		return (uint64) replay;
+	}
+	return 0;
 }
 
 /*
@@ -549,7 +588,8 @@ ls_op_lsn(void)
  * WAL replay, where re-creating an existing fork must be tolerated.
  */
 static void
-ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
+ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
+		  bool isRedoEnsure)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
@@ -559,7 +599,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
-	ch->is_redo = isRedo ? 1 : 0;
+	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
 	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
@@ -573,7 +613,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return ch->result != 0;
@@ -621,7 +661,8 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
+	ch->is_redo = AmStartupProcess() ? 1 : 0;
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
@@ -671,7 +712,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
-		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+		ch->req_lsn = ls_read_lsn();
 		ch->req_seq = read_seq;
 		ls_exec(ch);
 
@@ -813,7 +854,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 
@@ -1005,6 +1046,208 @@ pagestore_localsvc_wal_retain_floor(void)
 	ch->timeline = (uint32) localsvc_timeline;
 	ls_exec(ch);
 	return ch->req_lsn;
+}
+
+/*
+ * Publish or replace one controller-owned retention horizon.  Keep the daemon
+ * status visible: PS_STATUS_STALE is an ownership-fencing result, not a
+ * transport failure and not a successful retry.
+ */
+uint8
+pagestore_localsvc_retention_set(uint32 timeline, uint32 owner_kind,
+								 uint64 owner_id, uint32 generation,
+								 uint32 resources, uint64 lsn,
+								 uint64 admission_seq)
+{
+	return pagestore_localsvc_retention_set_timeout(timeline, owner_kind,
+												 owner_id, generation, resources,
+												 lsn, admission_seq, 0);
+}
+
+uint8
+pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
+										 uint64 owner_id, uint32 generation,
+										 uint32 resources, uint64 lsn,
+										 uint64 admission_seq,
+										 int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+
+	/* Zero is reserved for replaying retention records predating protocol v28. */
+	if (generation == 0 || admission_seq == 0 ||
+		admission_seq >= UINT64_MAX - 1)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_SET;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	ch->nblocks = (uint32) admission_seq;
+	ch->pad1 = (uint32) (admission_seq >> 32);
+	return ls_exec_wait(ch, timeout_ms);
+}
+
+uint8
+pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
+									 uint32 owner_kind, uint64 owner_id,
+									 uint32 generation, uint32 resources,
+									 uint64 lsn, uint64 *admission_seq,
+									 int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	uint8		status;
+
+	*admission_seq = 0;
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->parent_timeline = resources;
+	ch->req_seq = owner_id;
+	ch->req_lsn = lsn;
+	status = ls_exec_wait(ch, timeout_ms);
+	if (status == PS_STATUS_OK && ch->datalen == sizeof(*admission_seq))
+		memcpy(admission_seq, ch->data, sizeof(*admission_seq));
+	else if (status == PS_STATUS_OK)
+		status = PS_STATUS_ERROR;
+	return status;
+}
+
+/* A successful DROP leaves the store-side generation tombstone in place. */
+uint8
+pagestore_localsvc_retention_drop(uint32 timeline, uint32 owner_kind,
+								  uint64 owner_id, uint32 generation)
+{
+	return pagestore_localsvc_retention_drop_timeout(timeline, owner_kind,
+												  owner_id, generation, 0);
+}
+
+uint8
+pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
+										  uint64 owner_id, uint32 generation,
+										  int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+
+	if (generation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_DROP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	return ls_exec_wait(ch, timeout_ms);
+}
+
+uint8
+pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
+									uint64 owner_id, PsRetentionPin *pin,
+									bool *found, int timeout_ms)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	uint8		status;
+
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
+	ch->timeline = timeline;
+	ch->blocknum = owner_kind;
+	ch->req_seq = owner_id;
+	status = ls_exec_wait(ch, timeout_ms);
+	if (found != NULL)
+		*found = status == PS_STATUS_OK && ch->result != 0;
+	if (pin != NULL && status == PS_STATUS_OK && ch->result != 0)
+	{
+		memset(pin, 0, sizeof(*pin));
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+		if (ch->datalen != sizeof(pin->admission_seq))
+			return PS_STATUS_ERROR;
+		memcpy(&pin->admission_seq, ch->data, sizeof(pin->admission_seq));
+	}
+	return status;
+}
+
+/*
+ * Enumerate the durable retention registry.  Keep a missing index distinct
+ * from an IPC/daemon failure so a restarting controller can reconcile the
+ * complete owner set without treating an error as end-of-enumeration.
+ */
+uint8
+pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
+								 uint32 *count, uint64 *epoch, bool *found)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+	PsRetentionGetResult result;
+	uint8		status;
+
+	if (pin != NULL)
+		memset(pin, 0, sizeof(*pin));
+	if (count != NULL)
+		*count = 0;
+	if (found != NULL)
+		*found = false;
+	if (epoch == NULL)
+		return PS_STATUS_ERROR;
+
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->opcode = PS_OP_RETENTION_PIN_GET;
+	ch->blocknum = index;
+	ch->req_lsn = *epoch;
+	status = ls_exec_wait(ch, 0);
+	if (status != PS_STATUS_OK)
+	{
+		if (status == PS_STATUS_STALE)
+			*epoch = 0;
+		return status;
+	}
+	if (ch->datalen != sizeof(result))
+		return PS_STATUS_ERROR;
+	memcpy(&result, ch->data, sizeof(result));
+	*epoch = result.mutation_epoch;
+	if (count != NULL)
+		*count = ch->nblocks;
+	if (ch->result == 0)
+		return PS_STATUS_OK;
+	if (pin != NULL)
+	{
+		pin->timeline = ch->timeline;
+		pin->owner_kind = ch->blocknum;
+		pin->resources = ch->parent_timeline;
+		pin->generation = ch->old_nblocks;
+		pin->owner_id = ch->req_seq;
+		pin->lsn = ch->req_lsn;
+		pin->admission_seq = result.admission_seq;
+	}
+	if (found != NULL)
+		*found = true;
+	return PS_STATUS_OK;
 }
 
 /*

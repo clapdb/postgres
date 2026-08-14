@@ -441,5 +441,6 @@ object	"Waiting to acquire a lock on a non-relation database object."
 userlock	"Waiting to acquire a user lock."
 advisory	"Waiting to acquire an advisory user lock."
 applytransaction	"Waiting to acquire a lock on a remote transaction being applied by a logical replication subscriber."
+pagestore_reader	"Waiting to acquire a lock that serializes pagestore reader horizon advancement."
 
 # No "ABI_compatibility" region here as WaitEventLock has its own C code.

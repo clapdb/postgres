@@ -1329,6 +1329,13 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
+		case LOCKTAG_PAGESTORE_READER:
+			appendStringInfo(buf,
+							 _("pagestore reader owner [%u,%u] on timeline %u"),
+							 tag->locktag_field2,
+							 tag->locktag_field3,
+							 tag->locktag_field1);
+			break;
 		default:
 			appendStringInfo(buf,
 							 _("unrecognized locktag type %d"),

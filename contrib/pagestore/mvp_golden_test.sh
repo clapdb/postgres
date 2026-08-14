@@ -261,6 +261,8 @@ archive_current_wal || fail "base-backup WAL did not reach pagestore"
 cat >> "$MATERIALIZER/postgresql.conf" <<EOF
 pagestore.route_all = on
 pagestore.materializer = on
+pagestore.retention_owner_id = '1'
+pagestore.retention_owner_generation = '1'
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT
@@ -312,9 +314,23 @@ echo "ok   - SLRU capture fails closed before recovery is paused"
 "${WP[@]}" -c "INSERT INTO mvp_golden VALUES (1, 'before_fork');" >/dev/null ||
 	fail "could not commit the fork-visible row"
 
+mkdir -m 700 "$TMPROOT/controller-authority" ||
+	fail "could not create materializer authority directory"
+materializer_dev=$(stat -c %d "$MATERIALIZER") ||
+	fail "could not inspect materializer device identity"
+materializer_ino=$(stat -c %i "$MATERIALIZER") ||
+	fail "could not inspect materializer inode identity"
+authority_dev=$(stat -c %d "$TMPROOT/controller-authority") ||
+	fail "could not inspect authority namespace device identity"
+authority_ino=$(stat -c %i "$TMPROOT/controller-authority") ||
+	fail "could not inspect authority namespace inode identity"
+cat > "$TMPROOT/controller-authority/retention-owner-1.json" <<EOF
+{"retention_generation":1,"consumer_data_dir":"$MATERIALIZER","consumer_instance_id":"mvp-golden","consumer_data_dev":$materializer_dev,"consumer_data_ino":$materializer_ino,"authority_namespace_dev":$authority_dev,"authority_namespace_ino":$authority_ino}
+EOF
+
 cat > "$BRANCH_CONFIG" <<EOF
 {
-  "schema": 1,
+  "schema": 2,
   "pg_ctl": "$BIN/pg_ctl",
   "psql": "$BIN/psql",
   "writer_data_dir": "$WRITER",
@@ -326,6 +342,8 @@ cat > "$BRANCH_CONFIG" <<EOF
   "materializer_data_dir": "$MATERIALIZER",
   "materializer_host": "127.0.0.1",
   "materializer_port": $MPORT,
+  "retention_authority_dir": "$TMPROOT/controller-authority",
+  "retention_owner_id": 1,
   "prepared_dir": "$PREPARED",
   "new_timeline": 1,
   "parent_timeline": 0,

@@ -47,9 +47,10 @@ typedef enum LockTagType
 	LOCKTAG_ADVISORY,			/* advisory user locks */
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
+	LOCKTAG_PAGESTORE_READER,	/* internal pagestore reader epoch gate */
 } LockTagType;
 
-#define LOCKTAG_LAST_TYPE	LOCKTAG_APPLY_TRANSACTION
+#define LOCKTAG_LAST_TYPE	LOCKTAG_PAGESTORE_READER
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -174,6 +175,14 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field4 = (id4), \
 	 (locktag).locktag_type = LOCKTAG_ADVISORY, \
 	 (locktag).locktag_lockmethodid = USER_LOCKMETHOD)
+
+#define SET_LOCKTAG_PAGESTORE_READER(locktag,timeline,owner_hi,owner_lo) \
+	((locktag).locktag_field1 = (timeline), \
+	 (locktag).locktag_field2 = (owner_hi), \
+	 (locktag).locktag_field3 = (owner_lo), \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_PAGESTORE_READER, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 /*
  * ID info for a remote transaction on a logical replication subscriber is: DB

@@ -82,7 +82,8 @@ R4's replacement bases to have removed the oldest raw-WAL dependencies.
 
 ### R0. Land the localsvc retention-owner API
 
-Status: **not started on `pagestore`**.
+Status: **partially implemented in the R0 stacked change; reclamation-frontier
+admission remains open and must land before any reclaimer is enabled**.
 
 The previously reviewed stacked PR #171 did not reach the final `pagestore`
 history.  Port its current-state equivalent rather than merging the stale
@@ -139,13 +140,16 @@ Acceptance:
 - a delayed SET or DROP below the tombstone generation is rejected, and a
   same-generation SET cannot resurrect a dropped owner; tests cover both
   orderings before and after restart/compaction;
+- callers can distinguish `PS_STATUS_STALE` from a general daemon error;
 - standalone, PostgreSQL integration, and retention recovery tests pass.
 
 Expected scope: one PR.
 
 ### R1. Register reader and materializer owner generations
 
-Status: **blocked on R0**.  Decision D2 is accepted below.
+Status: **materializer lifecycle implemented in the first R1 stacked change;
+reader lifecycle implemented in the second R1 stacked change; awaiting merge;
+decision D2 is accepted below**.
 
 Deliverables:
 
@@ -683,7 +687,14 @@ generation replacement alone must quiesce the old runtime before its pin is
 superseded.  Never use wall-clock lease expiry for correctness.  Stale owners
 retain space until controller/operator reconciliation proves them dead.
 
-Decision: **accepted**.
+Decision: **accepted 2026-08-12**.
+
+Correctness never depends on wall-clock expiry.  A controller replacement
+increments the durable generation only after quiescing the old consumer, then
+atomically supersedes the old owner.
+Crashes, timeouts, ambiguous failures, and ordinary supervisor handoff retain
+the last pin.  DROP is reserved for explicit deprovision after consumption has
+stopped; if that proof or the DROP acknowledgement is uncertain, the pin stays.
 
 ### D3. Shipped-WAL physical layout
 

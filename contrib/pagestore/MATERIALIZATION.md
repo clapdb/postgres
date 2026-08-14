@@ -187,31 +187,55 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
 
 Meson installs the POSIX foreground service as
 `pagestore_materializer_supervisor`.  It accepts `--config PATH`; the strict
-schema-1 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
-`socket_dir`, `log_file`, and `state_dir` paths plus a PostgreSQL `port`.
+schema-4 JSON object requires absolute `pg_ctl`, `psql`, `data_dir`,
+`socket_dir`, `log_file`, `state_dir`, and controller-owned
+`retention_authority_dir` paths, a PostgreSQL `port`, and a
+controller-assigned nonzero `retention_owner_id` that remains stable across
+replacement workers and is globally unique across every timeline managed by
+the authority directory (owner IDs are not merely timeline-local).  It also requires a globally unique
+`controller_instance_id`; generation authority records bind the consumer to
+that identity, and takeover from another identity fails closed until the old
+controller has explicitly quiesced and handed off its worker.
 Optional fields select `database`, `user`, polling/replay-idle/progress timeout
 intervals, command timeout, exponential retry bounds, and the maximum
-consecutive failure count.  `--check-config` validates and prepares the runtime
+consecutive failure count.  Before starting a replacement worker the supervisor
+durably increments `retention_generation` and passes both retention values as
+postmaster settings.  `--check-config` validates and prepares the runtime
 directories without taking ownership.
 
-The nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
+The per-PGDATA nonblocking owner lock is stored at a fixed name in `data_dir`, so changing
 `state_dir` cannot create a second owner for the same worker.  Lock contention
 exits with status 75; invalid configuration exits with 78.  The lock contents
 are diagnostic only—the held `flock` is authoritative.
 
+Generation allocation and its lock are stored by owner ID in
+`retention_authority_dir`.  The controller must supply one shared durable
+namespace for every incarnation of an owner; it must not be a per-PGDATA or
+per-supervisor status directory.  Consequently replacement PGDATA instances
+with different `state_dir` values serialize on the same generation authority.
+
 `state_dir/status.json` is replaced atomically after fsync and reports schema,
-state, owner PID/epoch, worker generation, consecutive failures, last error,
-timestamps, and the last replay/shipped/materialized LSNs and lag.  Normal
+state, owner PID/epoch, worker generation, retention owner ID/generation,
+consecutive failures, last error, timestamps, and the last
+replay/shipped/materialized LSNs and lag.  Normal
 service-manager termination releases ownership but deliberately leaves a
 healthy PostgreSQL worker running; the next owner increments its epoch and
 adopts that worker.  Startup, health, missing progress API, restartpoint, and
 replacement failures share bounded exponential retry.  Exhaustion publishes
 `failed` and exits nonzero for the outer service manager to handle.
 
+The recovery startup process registers its WAL and WAL-index floor before the
+first redo record is applied.  A stale generation or registration failure is a
+fatal startup error.  After a restartpoint marker becomes durable, the worker
+advances the same pin; a transient failure leaves the older conservative floor,
+while a stale response stops the fenced worker.  Supervisor handoff does not
+drop the pin because the healthy worker remains live, and crashes retain it
+until a higher controller generation takes over.
+
 ## Local serialized branch prepare
 
 Meson also installs the one-shot `pagestore_branch_prepare --config PATH`
-controller.  Its strict schema-1 JSON names absolute `pg_ctl`, `psql`, writer
+controller.  Its strict schema-2 JSON names absolute `pg_ctl`, `psql`, writer
 and materializer PGDATA, writer log, private socket, and prepared-artifact
 paths; public writer/materializer hosts and ports; a private writer port;
 logical parent/child timelines; and optional database, user, polling, progress,

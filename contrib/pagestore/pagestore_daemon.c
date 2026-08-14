@@ -148,7 +148,14 @@ handle_request(PsChannel *ch)
 
 				read_result = read_resolve(tl, &ch->key, ch->blocknum, read_lsn,
 												  ch->req_seq, ch->data, &resolved);
-				if (read_result < 0)
+				/* READ_AT is a diagnostic found-ness probe: reclaimed history is
+				 * reported as absent.  Capped READV above fails closed instead. */
+				if (read_result == -2)
+				{
+					memset(ch->data, 0, page_size);
+					ch->result = 0;
+				}
+				else if (read_result < 0)
 					ch->status = PS_STATUS_ERROR;
 				else if (read_result > 0)
 				{
@@ -201,6 +208,8 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_WAL_INDEX_GET:
 		case PS_OP_WAL_RETAIN_FLOOR:
 		case PS_OP_RETENTION_PIN_GET:
+		case PS_OP_RETENTION_PIN_LOOKUP:
+		case PS_OP_RETENTION_PIN_RESERVE:
 		case PS_OP_RETENTION_PIN_SET:
 		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_RETENTION_FLOOR:
@@ -221,12 +230,14 @@ run_request_admitted(PsChannel *ch)
 	 * alone (no shard lock), so it serializes against map readers/writers but
 	 * not against per-shard work on unrelated shards.
 	 */
-	if (op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
+	if (op == PS_OP_RETENTION_PIN_LOOKUP || op == PS_OP_RETENTION_PIN_RESERVE ||
+		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
 	{
 		int		timeline_ok;
 
 		/*
-		 * Pin mutations fsync their own retention log.  Timeline definitions are
+		 * Pin operations own the retention mutex, and mutations fsync their log.
+		 * Timeline definitions are
 		 * append-only for a daemon lifetime, so validate the timeline under the
 		 * map lock and then perform that slow durable mutation without blocking
 		 * unrelated map readers across all shards.
@@ -406,7 +417,14 @@ run_request(PsChannel *ch)
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
 		ch->req_seq = ps_admission_barrier();
+		if (ch->req_seq == 0)
+			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
+		return 1;
+	}
+	if (op == PS_OP_RETENTION_PIN_RESERVE)
+	{
+		run_request_admitted(ch);
 		return 1;
 	}
 	if (!request_is_write(op))

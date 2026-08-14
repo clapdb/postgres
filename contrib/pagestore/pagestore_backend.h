@@ -86,7 +86,8 @@ typedef struct PageStoreBackend
 	/* --- fork lifecycle / metadata --- */
 
 	/* create the fork (make it exist with zero blocks) */
-	void		(*create) (const PageStoreRelKey *key, void *localreln, bool isRedo);
+	void		(*create) (const PageStoreRelKey *key, void *localreln,
+						 bool isRedo, bool isRedoEnsure);
 	/* does the fork exist? */
 	bool		(*fork_exists) (const PageStoreRelKey *key, void *localreln);
 	/* remove the fork entirely */
@@ -197,7 +198,10 @@ extern uint32 pagestore_localsvc_read_epoch(void);
 extern void pagestore_localsvc_adopt_read_view(uint64 read_lsn,
 										   uint64 read_seq, uint32 read_epoch);
 extern bool pagestore_localsvc_read_fence_timeout(uint64 read_lsn,
-											  uint64 *read_seq, int timeout_ms);
+										  uint64 *read_seq, int timeout_ms);
+extern bool pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+													   uint64 read_lsn,
+													   uint64 *read_seq, int timeout_ms);
 extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
 /* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */
@@ -213,6 +217,37 @@ extern void pagestore_publish_checkpoint_reader_snapshot(
 	const struct ControlFileData *control);
 extern uint32 pagestore_slru_klass_id(const char *name);
 extern uint64 pagestore_localsvc_wal_retain_floor(void);
+/* Returns PS_STATUS_OK, PS_STATUS_STALE, or PS_STATUS_ERROR.  A controller
+ * must not treat either non-OK result as a successful ownership change. */
+extern uint8 pagestore_localsvc_retention_set(uint32 timeline,
+											 uint32 owner_kind, uint64 owner_id,
+											 uint32 generation, uint32 resources,
+											 uint64 lsn, uint64 admission_seq);
+extern uint8 pagestore_localsvc_retention_set_timeout(uint32 timeline,
+										 uint32 owner_kind, uint64 owner_id,
+										 uint32 generation, uint32 resources,
+										 uint64 lsn, uint64 admission_seq,
+										 int timeout_ms);
+extern uint8 pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
+									 uint32 owner_kind, uint64 owner_id,
+									 uint32 generation, uint32 resources,
+									 uint64 lsn, uint64 *admission_seq,
+									 int timeout_ms);
+extern uint8 pagestore_localsvc_retention_drop(uint32 timeline,
+											  uint32 owner_kind, uint64 owner_id,
+											  uint32 generation);
+/* Enumerate durable owners by index.  Start with *epoch = 0 and reuse the
+ * returned epoch; PS_STATUS_STALE requires restarting at index zero. */
+extern uint8 pagestore_localsvc_retention_get(uint32 index,
+											 PsRetentionPin *pin, uint32 *count,
+											 uint64 *epoch, bool *found);
+extern uint8 pagestore_localsvc_retention_drop_timeout(uint32 timeline,
+											  uint32 owner_kind, uint64 owner_id,
+											  uint32 generation, int timeout_ms);
+extern uint8 pagestore_localsvc_retention_lookup(uint32 timeline,
+											uint32 owner_kind, uint64 owner_id,
+											PsRetentionPin *pin, bool *found,
+											int timeout_ms);
 extern void pagestore_localsvc_store_sync(void);
 extern void pagestore_localsvc_store_sync_timeout(int timeout_ms);
 extern bool pagestore_localsvc_admission_fence_begin(uint64 redo_lsn,
