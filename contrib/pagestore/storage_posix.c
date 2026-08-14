@@ -545,9 +545,11 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 
 /*
  * Copy the retained suffix to a sibling, make it durable, then publish it with
- * rename.  The old file remains authoritative before rename.  The caller must
- * reopen/recover after any error that could follow rename rather than retrying
- * the same physical offset against an already-shortened file.
+ * rename.  The old file remains authoritative before rename.  Once rename
+ * succeeds, either the old or new directory entry is crash-valid because the
+ * immutable store also holds the removed prefix; a directory-fsync failure
+ * must therefore not be reported as an unpublished replacement to a caller
+ * that still has the old physical offsets.
  */
 static int
 posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
@@ -615,16 +617,14 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	}
 	if (rename(tmp, path) != 0)
 		goto out;
-	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
-	if (dfd < 0 || fsync(dfd) != 0)
-		goto out;
-	if (close(dfd) != 0)
-	{
-		dfd = -1;
-		goto out;
-	}
-	dfd = -1;
 	rc = 0;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd >= 0)
+	{
+		(void) fsync(dfd);
+		(void) close(dfd);
+		dfd = -1;
+	}
 
 out:
 	if (src >= 0)

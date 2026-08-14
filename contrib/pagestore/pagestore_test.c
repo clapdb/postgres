@@ -4158,6 +4158,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	char		shm[64];
 	char		store[256];
 	char		immutable_path[512];
+	char		flat_path[512];
 	pid_t		dpid;
 	struct stat immutable_st;
 	uint32_t	ps = 8192;
@@ -4170,13 +4171,13 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	fprintf(stderr, "== shipped WAL ==\n");
 	memset(bufa, 0xAA, sizeof(bufa));	/* WAL [1000,1500) */
 	memset(bufb, 0xBB, sizeof(bufb));	/* WAL [1500,2000) */
-	segment = malloc(1024 * 1024);
+	segment = malloc(2 * 1024 * 1024);
 	if (segment == NULL)
 	{
 		check(0, "allocate immutable WAL segment test input");
 		return;
 	}
-	for (uint32_t i = 0; i < 1024 * 1024; i++)
+	for (uint32_t i = 0; i < 2 * 1024 * 1024; i++)
 		segment[i] = (unsigned char) (i * 17u + 3u);
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
@@ -4278,10 +4279,44 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(stat(immutable_path, &immutable_st) == 0 &&
 		  immutable_st.st_size == 1024 * 1024 + 64,
 		  "chunked WAL shipping publishes one immutable logical segment");
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_8", store);
+	check(stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "sealed WAL records leave no duplicate flat staging prefix");
+	check(op_wal_append_status(8, 0, segment, PS_IO_UNIT) == PS_STATUS_OK &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "an identical retry is validated from immutable WAL without regrowing flat");
+	segment[0] ^= 0xff;
+	check(op_wal_append_status(8, 0, segment, 1) == PS_STATUS_ERROR,
+		  "immutable WAL rejects a divergent retry after flat reclaim");
+	segment[0] ^= 0xff;
+	check(op_walidx_progress(8, PS_IO_UNIT, 1024 * 1024, NULL) == 0,
+		  "WAL-index progress accepts a fully immutable shipped prefix");
 	memset(rback, 0, sizeof(rback));
 	check(op_wal_read(8, PS_IO_UNIT - 256, 512, rback) == 512 &&
 		  memcmp(rback, segment + PS_IO_UNIT - 256, 512) == 0,
 		  "chunked WAL shipping seals and reads an immutable logical segment");
+
+	/* Keep a whole flat record when it crosses the sealed boundary.  Its
+	 * prefix overlaps immutable WAL and its suffix remains the staging tail. */
+	op_create_branch(9, 0, 0);
+	for (uint32_t off = 0; off < 900 * 1024;)
+	{
+		uint32_t amount = 900 * 1024 - off < PS_IO_UNIT ?
+			900 * 1024 - off : PS_IO_UNIT;
+
+		op_wal_append(9, off, segment + off, amount);
+		off += amount;
+	}
+	op_wal_append(9, 900 * 1024, segment + 900 * 1024, PS_IO_UNIT);
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_9", store);
+	check(stat(flat_path, &immutable_st) == 0 && immutable_st.st_size > PS_IO_UNIT,
+		  "a boundary-crossing record remains whole in the flat tail");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 512) == 0,
+		  "WAL read stitches an immutable prefix to a crossing flat record");
+	check(op_walidx_progress(9, PS_IO_UNIT, 900 * 1024 + PS_IO_UNIT, NULL) == 0,
+		  "WAL-index progress spans immutable coverage and a crossing flat tail");
 
 	/* a retry that carries an already-accepted prefix plus new bytes (a
 	 * partially shipped chunk re-sent whole) appends only the uncovered
@@ -4323,6 +4358,38 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 		  op_wal_read(8, 700000, sizeof(rback), rback) == sizeof(rback) &&
 		  memcmp(rback, segment + 700000, sizeof(rback)) == 0,
 		  "restart reopens and validates the immutable WAL segment catalog");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_size(9) == 900 * 1024 + PS_IO_UNIT &&
+		  op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 512) == 0,
+		  "restart validates the retained flat/immutable overlap");
+	for (uint32_t off = 900 * 1024 + PS_IO_UNIT; off < 2 * 1024 * 1024;)
+	{
+		uint32_t amount = 2 * 1024 * 1024 - off < PS_IO_UNIT ?
+			2 * 1024 * 1024 - off : PS_IO_UNIT;
+
+		op_wal_append(9, off, segment + off, amount);
+		off += amount;
+	}
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_9", store);
+	check(op_wal_size(9) == 2 * 1024 * 1024 &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "the crossing record is reclaimed after its complete range seals");
+	for (uint32_t off = 1024 * 1024; off < 2 * 1024 * 1024;
+		 off += PS_IO_UNIT)
+		op_wal_append(8, off, segment + off - 1024 * 1024, PS_IO_UNIT);
+	snprintf(immutable_path, sizeof(immutable_path),
+			 "%s/wal_segments_8/walv1_9_%020llu", store, 1ULL);
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_8", store);
+	check(op_wal_size(8) == 2 * 1024 * 1024 &&
+		  stat(immutable_path, &immutable_st) == 0 &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "shipping continues with the next immutable segment after flat reclaim");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(8, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 256) == 0 &&
+		  memcmp(rback + 256, segment, 256) == 0,
+		  "WAL read crosses reclaimed immutable segment generations");
 	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
 		  "shipped WAL also closes the idempotent re-create window (post-restart)");
 

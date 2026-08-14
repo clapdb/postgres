@@ -275,9 +275,10 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 
 ### R3. Reclaim shipped WAL
 
-Status: **R3a immutable segment/store primitives and live-path integration and
-the R3b crash-atomic flat-log prefix-rewrite primitive are implemented; durable
-retained-base publication and reclamation policy remain**.
+Status: **R3a immutable segment/store primitives and live-path integration are
+implemented.  R3b now reclaims the flat-log copy of every complete record
+already sealed immutable; durable retained-base publication and immutable
+segment reclamation remain**.
 
 The transition path accepts the existing arbitrary-size archive IPC chunks in
 the flat staging log, seals every complete contiguous segment-aligned 1 MiB
@@ -290,16 +291,22 @@ pre-publication crash.  R3b may make retained-base metadata authoritative and
 reclaim flat prefixes only after R4 removes their remaining raw-WAL
 dependencies.
 
-Each flat `wal_<timeline>` record is self-describing, so the POSIX backend can
-now copy a retained suffix from a complete record boundary, fsync it, and
-atomically replace the old log while serializing physical append/truncate
-publication.  A crash before rename leaves the old file authoritative and a
-retry replaces any staging orphan; after rename, directory fsync makes the new
-suffix durable.  The core must still durably publish the logical retained-base
-frontier first, freeze its WAL catalog across cutover, translate in-memory file
-offsets, and then use this primitive.  This rewrite is an MVP transition path;
-bounded steady-state operation should move reclamation onto immutable segment
-lifecycle so it does not repeatedly copy an unbounded live suffix.
+Each flat `wal_<timeline>` record is self-describing.  The POSIX backend copies
+the retained suffix from a complete record boundary, fsyncs it, and atomically
+replaces the old log while serializing physical append/truncate publication.
+The core holds a WAL catalog cutover lock, translates every surviving physical
+offset, and trims only records fully covered by validated immutable segments.
+Restart discovers the immutable store's start from its own headers instead of
+depending on the removed flat prefix; retries are compared against immutable
+bytes, so reclaim cannot reopen a divergent-history window.  Concurrent reads
+either finish on the old inode/offset catalog or begin on the new pair.
+
+This bounds the duplicate flat staging tail but deliberately does not advance a
+logical WAL frontier or unlink an immutable segment.  The compacted WAL index
+still names FPI records in raw WAL; until those FPIs are published as independent
+replacement page bases, their immutable WAL segments remain reconstruction
+dependencies.  The next reclamation phase must remove that dependency, publish
+the retained-base frontier, and only then unlink immutable segments.
 
 Deliverables:
 

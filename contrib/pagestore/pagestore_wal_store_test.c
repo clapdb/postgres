@@ -51,6 +51,7 @@ main(void)
 	char temporary_path[1024];
 	char retry_directory[512];
 	char create_retry_directory[512];
+	char discover_directory[512];
 	uint32_t first_len = 2 * TEST_SEGMENT_BYTES;
 	uint32_t retry_len = 2 * TEST_SEGMENT_BYTES;
 	unsigned char *input = malloc((size_t) first_len +
@@ -60,6 +61,7 @@ main(void)
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
 	PsWalStore store;
 	PsWalStore retry_store;
+	PsWalStore discover_store;
 	int fd;
 
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
@@ -187,6 +189,26 @@ main(void)
 		unlink(path);
 	}
 	rmdir(retry_directory);
+
+	snprintf(discover_directory, sizeof(discover_directory), "%s/discover",
+			 directory);
+	check(ps_wal_store_create(&discover_store, discover_directory, 10,
+								3ULL * TEST_SEGMENT_BYTES,
+								TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&discover_store, 3ULL * TEST_SEGMENT_BYTES,
+						  input, TEST_SEGMENT_BYTES) == 0,
+		  "create a nonzero-start immutable WAL store");
+	ps_wal_store_close(&discover_store);
+	check(ps_wal_store_open_existing(&discover_store, discover_directory, 10,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  discover_store.start_lsn == 3ULL * TEST_SEGMENT_BYTES &&
+		  discover_store.end_lsn == 4ULL * TEST_SEGMENT_BYTES,
+		  "reopen discovers the immutable start without flat-log metadata");
+	ps_wal_store_close(&discover_store);
+	snprintf(path, sizeof(path), "%s/walv1_10_%020llu", discover_directory,
+			 3ULL);
+	unlink(path);
+	rmdir(discover_directory);
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDWR);

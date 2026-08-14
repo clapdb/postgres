@@ -558,6 +558,59 @@ cleanup:
 	return rc;
 }
 
+int
+ps_wal_store_open_existing(PsWalStore *store, const char *directory,
+						   uint32_t timeline, uint32_t segment_size)
+{
+	PsWalStore probe;
+	struct dirent *de;
+	DIR	   *dir = NULL;
+	uint64_t	first = UINT64_MAX;
+	char		prefix[64];
+	int		prefix_len;
+	int		rc = -1;
+
+	if (initialize_store(&probe, directory, timeline, 0, segment_size) != 0)
+		return -1;
+	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", timeline);
+	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
+		(dir = opendir(directory)) == NULL)
+		return -1;
+	while ((de = readdir(dir)) != NULL)
+	{
+		char expected[128];
+		char *end = NULL;
+		unsigned long long parsed;
+
+		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
+			continue;
+		errno = 0;
+		parsed = strtoull(de->d_name + prefix_len, &end, 10);
+		if (errno != 0 || end == de->d_name + prefix_len ||
+			segment_name(&probe, (uint64_t) parsed, expected,
+						 sizeof(expected)) != 0)
+			goto done;
+		if (*end == '\0' && strcmp(expected, de->d_name) == 0 &&
+			(uint64_t) parsed < first)
+			first = (uint64_t) parsed;
+	}
+	if (closedir(dir) != 0)
+	{
+		dir = NULL;
+		return -1;
+	}
+	dir = NULL;
+	if (first == UINT64_MAX || first > UINT64_MAX / segment_size)
+		return -1;
+	rc = ps_wal_store_open(store, directory, timeline,
+						   first * segment_size, segment_size);
+
+done:
+	if (dir != NULL)
+		closedir(dir);
+	return rc;
+}
+
 /* Start at the first overlapping entry.  Segment validation streams through a
  * bounded buffer; retry comparison never allocates the full payload. */
 static int

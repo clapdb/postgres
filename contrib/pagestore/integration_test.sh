@@ -207,8 +207,15 @@ for i in 1 2; do
 	       SELECT pg_switch_wal();" >/dev/null
 done
 sleep 2
-walsz=$(stat -c %s "$STORE/wal_0" 2>/dev/null || echo 0)
-if [ "$walsz" -gt 0 ]; then echo "ok   - WAL shipped to daemon (wal_0 = $walsz bytes)"; else echo "FAIL - no WAL shipped"; fail=1; fi
+$P -c "CREATE FUNCTION pagestore_shipped_wal_lsn() RETURNS pg_lsn
+        AS 'pagestore','pagestore_shipped_wal_lsn' LANGUAGE C;" >/dev/null
+walend=$($P -c "SELECT pg_wal_lsn_diff(pagestore_shipped_wal_lsn(),'0/0');")
+if [ "${walend:-0}" -gt 0 ]; then
+	echo "ok   - WAL shipped to daemon (logical end = $walend bytes)"
+else
+	echo "FAIL - no WAL shipped"
+	fail=1
+fi
 
 # --- 4. reconstruct a standard WAL segment from the store (redo step 3a) ----
 seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)" .done)
