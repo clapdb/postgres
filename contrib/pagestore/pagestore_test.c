@@ -144,6 +144,23 @@ check_inspector(const char *shm, uint32_t page_size)
 		  "read-only inspector reports page-pruning counters");
 }
 
+static int
+wait_for_daemon_exit(pid_t pid, int expected_status)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		int		status;
+		pid_t		result = waitpid(pid, &status, WNOHANG);
+
+		if (result == pid)
+			return WIFEXITED(status) && WEXITSTATUS(status) == expected_status;
+		if (result < 0)
+			return 0;
+		usleep(10000);
+	}
+	return 0;
+}
+
 /* An offline segment-format migration must invalidate derived LSM metadata. */
 static void
 remove_lsm_metadata(const char *store)
@@ -1293,6 +1310,17 @@ page_has_tag(const unsigned char *buf, uint32_t ps, unsigned char tag)
 }
 
 static int
+page_has_lsn(const unsigned char *buf, uint64_t lsn)
+{
+	uint32_t xlogid;
+	uint32_t xrecoff;
+
+	memcpy(&xlogid, buf, 4);
+	memcpy(&xrecoff, buf + 4, 4);
+	return (((uint64_t) xlogid << 32) | xrecoff) == lsn;
+}
+
+static int
 page_all_zero(const unsigned char *buf, uint32_t ps)
 {
 	for (uint32_t i = 0; i < ps; i++)
@@ -1923,6 +1951,66 @@ local_layer_count(const char *store)
 	return count;
 }
 
+static uint64_t
+local_layer_bytes(const char *store)
+{
+	char		pattern[512];
+	glob_t		matches;
+	uint64_t	bytes = 0;
+
+	snprintf(pattern, sizeof(pattern), "%s/layer_*", store);
+	memset(&matches, 0, sizeof(matches));
+	if (glob(pattern, 0, NULL, &matches) == GLOB_NOMATCH)
+		return 0;
+	for (size_t i = 0; i < matches.gl_pathc; i++)
+	{
+		struct stat st;
+
+		if (stat(matches.gl_pathv[i], &st) == 0)
+			bytes += (uint64_t) st.st_size;
+	}
+	globfree(&matches);
+	return bytes;
+}
+
+static int
+wait_for_local_layer_bytes(const char *store, uint64_t maximum)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		uint64_t bytes = local_layer_bytes(store);
+
+		/* Compaction publication precedes asynchronous source unlink. */
+		if (bytes > 0 && bytes < maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+read_pruning_metrics(const char *shm, uint64_t *compactions, uint64_t *scanned,
+					 uint64_t *kept, uint64_t *deleted)
+{
+	char output[512];
+	unsigned long long c,
+					s,
+					k,
+					d;
+
+	if (!run_inspector(shm, "pruning", output, sizeof(output)) ||
+		sscanf(output,
+			   "{\"compactions\":%llu,\"versions_scanned\":%llu,"
+			   "\"versions_kept\":%llu,\"versions_deleted\":%llu}",
+			   &c, &s, &k, &d) != 4)
+		return 0;
+	*compactions = (uint64_t) c;
+	*scanned = (uint64_t) s;
+	*kept = (uint64_t) k;
+	*deleted = (uint64_t) d;
+	return 1;
+}
+
 static int
 wait_for_compacted_layers(const char *store, int maximum)
 {
@@ -1931,6 +2019,42 @@ wait_for_compacted_layers(const char *store, int maximum)
 		int count = local_layer_count(store);
 
 		if (count > 0 && count <= maximum)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+wait_for_pruning_compaction(const char *shm, uint32_t rel,
+							uint64_t obsolete_lsn, uint64_t previous,
+							uint64_t *current, unsigned char *readback)
+{
+	uint64_t scanned,
+			 kept,
+			 deleted;
+
+	for (int i = 0; i < 500; i++)
+	{
+		if (!op_read_at_found(rel, 0, 0, obsolete_lsn, readback) &&
+			read_pruning_metrics(shm, current, &scanned, &kept, &deleted) &&
+			*current > previous && scanned == kept + deleted)
+			return 1;
+		usleep(10000);
+	}
+	return 0;
+}
+
+static int
+wait_for_accounted_pruning_metrics(const char *shm, uint64_t minimum,
+								   uint64_t *compactions, uint64_t *scanned,
+								   uint64_t *kept, uint64_t *deleted)
+{
+	for (int i = 0; i < 500; i++)
+	{
+		if (read_pruning_metrics(shm, compactions, scanned, kept, deleted) &&
+			*compactions >= minimum && *scanned == *kept + *deleted &&
+			*deleted > 0)
 			return 1;
 		usleep(10000);
 	}
@@ -2438,6 +2562,251 @@ run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(readback, ps, 110),
 		  "pruning released history cannot expose an older relation generation");
 
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
+								 const char *phase, int case_no)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	int			crashed_layer_count;
+	char		marker[512];
+	pid_t		pid;
+
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_crash_%d",
+			 (int) getpid(), case_no);
+	snprintf(store, sizeof(store), "%s/store_prune_crash_%d", tmpbase, case_no);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE", phase, 1) == 0,
+		  "configure guarded compaction fault %s", phase);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	unsetenv("PAGESTORE_TEST_FAULT");
+	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 500);
+	for (uint32_t batch = 1; batch <= 3; batch++)
+	{
+		fill_page(page, ps, batch * 1000, (unsigned char) (batch * 10));
+		op_write_tl(0, rel, 0, 0, page);
+		for (uint32_t i = 1; i < 8; i++)
+		{
+			uint32_t block = (batch - 1) * 7 + i;
+
+			fill_page(page, ps, batch * 1000 + i, (unsigned char) block);
+			op_write_tl(0, rel, 0, block, page);
+		}
+	}
+	fill_page(page, ps, 4000, 40);
+	op_write_tl(0, rel, 0, 0, page);
+	snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
+	{
+		int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+		check(fd >= 0, "arm compaction publication fault %s", phase);
+		if (fd >= 0)
+			close(fd);
+	}
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED,
+					   23000 + (uint64_t) case_no, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 3500) == PS_STATUS_OK,
+		  "crash case establishes a durable page cutoff");
+	client_detach();
+	check(wait_for_daemon_exit(pid, 88),
+		  "compaction crashes at deterministic phase %s", phase);
+	unlink(marker);
+	crashed_layer_count = local_layer_count(store);
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 40),
+		  "restart after %s serves the published newest page", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "restart after %s preserves a page present only in compacted layers", phase);
+	check(!op_read_at_found(rel, 0, 0, 1000, readback),
+		  "restart after %s cannot resurrect pruned source history", phase);
+	for (int i = 0; i < 500 &&
+		 local_layer_count(store) >= crashed_layer_count; i++)
+		usleep(10000);
+	check(local_layer_count(store) < crashed_layer_count,
+		  "restart after %s removes a specifically marked source layer", phase);
+	check(wait_for_compacted_layers(store, 3),
+		  "restart after %s resumes deletion and bounds live layers", phase);
+	check(!op_read_at_found(rel, 0, 0, 1000, readback),
+		  "recovered cleanup after %s removes obsolete page history", phase);
+	client_detach();
+	stop_daemon(pid);
+
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 40),
+		  "second restart after %s preserves the recovered compacted layer", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "second restart after %s preserves compacted-layer-only data", phase);
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_publication_recovery_suite(const char *daemon_path,
+								 const char *tmpbase)
+{
+	fprintf(stderr, "== page-pruning publication recovery ==\n");
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_publish", 1);
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_mark_delete", 2);
+	run_prune_publication_crash_case(daemon_path, tmpbase,
+								 "after_frontier", 3);
+}
+
+static void
+run_prune_bounded_churn_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	uint64_t	compactions = 0,
+				scanned = 0,
+				kept = 0,
+				deleted = 0;
+	pid_t		pid;
+
+	fprintf(stderr, "== bounded page-history churn ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_churn", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_churn", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_create_at(rel, 0, 500);
+	for (uint32_t cycle = 0; cycle < 12; cycle++)
+	{
+		uint64_t	before;
+		uint64_t	obsolete_lsn = 1000 + cycle * 100;
+
+		for (uint32_t write = 0; write < 32; write++)
+		{
+			uint64_t lsn = 1000 + cycle * 100 + write;
+			unsigned char tag = (unsigned char) (20 + cycle * 32 + write);
+
+			fill_page(page, ps, lsn, tag);
+			op_write_tl(0, rel, 0, write % 4, page);
+		}
+		check(read_pruning_metrics(shm, &before, &scanned, &kept, &deleted),
+			  "churn cycle %u captures its post-write pruning baseline", cycle);
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY,
+						   1000 + cycle * 100 + 31) == PS_STATUS_OK,
+			  "churn cycle %u advances its durable page cutoff", cycle);
+		check(wait_for_pruning_compaction(shm, rel, obsolete_lsn, before,
+								  &compactions, readback),
+			  "churn cycle %u waits for its requested pruning pass", cycle);
+		check(wait_for_compacted_layers(store, 3),
+			  "churn cycle %u returns to the configured live-layer bound", cycle);
+	}
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "twelve churn cycles reclaim source layers to a constant-size history");
+	check(wait_for_accounted_pruning_metrics(shm, 12, &compactions, &scanned,
+										  &kept, &deleted),
+		  "pruning counters account for churn and record deleted versions");
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "bounded churn serves the newest page for block %u", block);
+	}
+
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 11 * 32 + 28 + block);
+		uint64_t expected_lsn = 1000 + 11 * 100 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "restart recovers compacted newest page for block %u", block);
+	}
+	{
+		uint64_t before = 0;
+		uint64_t restart_scanned,
+				 restart_kept,
+				 restart_deleted;
+
+		for (uint32_t write = 0; write < 32; write++)
+		{
+			uint64_t lsn = 2200 + write;
+			unsigned char tag = (unsigned char) (20 + 12 * 32 + write);
+
+			fill_page(page, ps, lsn, tag);
+			op_write_tl(0, rel, 0, write % 4, page);
+		}
+		check(read_pruning_metrics(shm, &before, &restart_scanned,
+							   &restart_kept, &restart_deleted),
+			  "restarted churn captures its post-write pruning baseline");
+		check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2400, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 2231) ==
+			  PS_STATUS_OK,
+			  "restarted churn advances the restored retention owner");
+		check(wait_for_pruning_compaction(shm, rel, 2200, before,
+								  &compactions, readback),
+			  "restarted churn completes a fresh pruning pass");
+		check(wait_for_compacted_layers(store, 3),
+			  "restarted churn returns to the live-layer bound");
+	}
+	check(wait_for_local_layer_bytes(store, (uint64_t) ps * 16),
+		  "bounded retained page history is physically reclaimed after restart");
+	for (uint32_t block = 0; block < 4; block++)
+	{
+		unsigned char expected = (unsigned char) (20 + 12 * 32 + 28 + block);
+		uint64_t expected_lsn = 2200 + 28 + block;
+
+		op_read_one(rel, 0, block, readback);
+		check(page_has_tag(readback, ps, expected) &&
+			  page_has_lsn(readback, expected_lsn),
+			  "restarted bounded churn serves newest block %u", block);
+	}
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
@@ -4382,6 +4751,10 @@ main(int argc, char **argv)
 	run_prune_branch_retention_suite(daemon_path, tmpbase);
 	/* Fork lifecycle metadata must continue to gate pruned page generations. */
 	run_prune_relation_lifecycle_suite(daemon_path, tmpbase);
+	/* Compaction publication and old-layer deletion are crash-restartable. */
+	run_prune_publication_recovery_suite(daemon_path, tmpbase);
+	/* Repeated updates and compactions must bound retained page history. */
+	run_prune_bounded_churn_suite(daemon_path, tmpbase);
 	/* Recovery must not reuse a sealed layer file absent from the manifest. */
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */

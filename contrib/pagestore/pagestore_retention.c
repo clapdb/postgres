@@ -1293,6 +1293,32 @@ ps_retention_lookup(uint32_t timeline, uint32_t owner_kind, uint64_t owner_id,
 }
 
 int
+ps_retention_page_fence_active(uint32_t timeline, uint64_t lsn,
+							  uint64_t admission_seq)
+{
+	int			rc = 0;
+
+	pthread_mutex_lock(&retention_lock);
+	if (!retention_is_poisoned)
+	{
+		for (uint32_t i = 0; i < retention_npins; i++)
+		{
+			PsRetentionPin *pin = &retention_pins[i];
+
+			if (retention_pin_active(pin) && pin->timeline == timeline &&
+				(pin->resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
+				pin->lsn == lsn && pin->admission_seq == admission_seq)
+			{
+				rc = 1;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
 ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 					  uint32_t *count_out)
 {
