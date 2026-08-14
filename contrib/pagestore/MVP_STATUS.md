@@ -37,7 +37,7 @@ work and must not expand the MVP critical path.
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
-| Per-page WAL index and PostgreSQL `rm_redo` reuse | Implemented | WAL redo and WAL-only demos |
+| Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index implemented; durable multi-shard snapshot generation format ready for cutover integration | WAL redo demos plus snapshot publication/recovery tests |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
