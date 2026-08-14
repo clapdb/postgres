@@ -56,7 +56,8 @@ pagestore_daemon = executable('pagestore_daemon',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
         'pagestore_retention.c', 'pagestore_wal_store.c',
-        'pagestore_wal_segment.c', 'pagestore_walidx_snapshot.c'),
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c'),
   dependencies: [dependency('threads')],
   kwargs: default_bin_args,
 )
@@ -200,6 +201,17 @@ pagestore_prune_test = executable('pagestore_prune_test',
 )
 test('pagestore_prune',
   pagestore_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Pure replacement-base chain selection for WAL-index compaction.
+pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
+  files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
+  install: false,
+)
+test('pagestore_walidx_prune',
+  pagestore_walidx_prune_test,
   suite: ['pagestore'],
   timeout: 30,
 )
