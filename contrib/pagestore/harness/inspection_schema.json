@@ -2,7 +2,7 @@
   "schema": 1,
   "transport": "private-test-ipc",
   "mutating_operations": [],
-  "implemented_operations": ["health", "backpressure"],
+  "implemented_operations": ["health", "backpressure", "pruning"],
   "operations": {
     "health": {
       "response": ["protocol_version", "page_size", "io_unit", "nchannels", "nshards", "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn"]
@@ -23,6 +23,9 @@
     },
     "backpressure": {
       "response": ["idle", "claimed", "request", "done", "shards", "wal_index_pending_bytes", "wal_index_lagging_timelines"]
+    },
+    "pruning": {
+      "response": ["compactions", "versions_scanned", "versions_kept", "versions_deleted"]
     }
   }
 }

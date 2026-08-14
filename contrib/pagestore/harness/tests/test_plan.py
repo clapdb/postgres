@@ -28,7 +28,7 @@ CAPABILITIES = {
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 30,
+            "operations": ["crash"], "protocol_version": 32,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -129,7 +129,8 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
             set(schema["operations"]),
-            {"health", "timeline", "relation", "manifest", "gc", "backpressure"},
+            {"health", "timeline", "relation", "manifest", "gc", "backpressure",
+             "pruning"},
         )
 
     def test_inspector_response_must_match_schema(self):
@@ -139,7 +140,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":30,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -670,7 +671,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 30, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 32, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -686,7 +687,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\n"
             "if [ \"$3\" = health ]; then\n"
-            "  echo '{\"protocol_version\":30,\"page_size\":8192,\"io_unit\":262144,"
+            "  echo '{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}'\n"
             "else\n"
@@ -850,12 +851,15 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":30,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0}' ;;\n"
+            "pruning) printf '%s\\n' "
+            "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
+            "\"versions_deleted\":0}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -922,12 +926,15 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":30,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0}' ;;\n"
+            "pruning) printf '%s\\n' "
+            "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
+            "\"versions_deleted\":0}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -964,7 +971,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":30,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "

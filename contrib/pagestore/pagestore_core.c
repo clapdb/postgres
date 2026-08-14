@@ -96,6 +96,7 @@ static void page_remove_compacted_versions(uint32_t timeline,
 										   const PsImgRec *recs, uint32_t nrec);
 static int retention_project_lsn(uint32_t descendant, uint32_t target,
 								 uint64_t *lsn);
+static int timeline_has_parent(uint32_t timeline);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 
@@ -114,6 +115,7 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsShmHeader *metrics_header;
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
 #define PS_PAGE_FRONTIER_VERSION 2
@@ -130,6 +132,27 @@ static PsPruneFence page_reclaimed_frontier[1024];
 static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 								 uint64_t admission_seq);
+
+/* Test-only crash boundaries for publication recovery.  They are inert unless
+ * the daemon was explicitly started with the fault switch and the test has
+ * armed the store-local marker after startup. */
+static void
+test_crash_compaction_at(const char *phase)
+{
+	const char *enabled = getenv("PAGESTORE_TEST_FAULT");
+	const char *requested = getenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	char		marker[4096];
+	int			n;
+
+	if (enabled == NULL || strcmp(enabled, "1") != 0 || requested == NULL ||
+		strcmp(requested, phase) != 0 || page_frontier_dir[0] == '\0')
+		return;
+	n = snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed",
+				 page_frontier_dir);
+	if (n < 0 || (size_t) n >= sizeof(marker) || access(marker, F_OK) != 0)
+		return;
+	_exit(88);
+}
 
 static uint64_t
 admission_seq_alloc(void)
@@ -1088,7 +1111,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	unsigned char **pages = NULL;
 	uint32_t	nrec = 0,
 				cap = 0,
-				npages = 0;
+				npages = 0,
+				scanned = 0;
 	uint64_t	nid;
 	PsLayerDesc newdesc;
 	PsLayerLocation remote;
@@ -1198,6 +1222,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	}
 	if (nrec == 0)
 		goto cleanup;
+	scanned = nrec;
 	if (prune_compaction_records(timeline, recs, &nrec, page_floor,
 								 &dropped, &ndropped) != 0 || nrec == 0)
 		goto cleanup;
@@ -1251,19 +1276,38 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	/* Reject later pins/branches below this cutoff before the pruned layer can
 	 * become durable and visible.  Advancing conservatively when publication
 	 * later fails is safe; admitting already-reclaimed history is not. */
-	if ((ndropped != 0 &&
-		 page_frontier_advance(timeline, page_floor, frontier_seq) != 0) ||
-		record_layer(NULL, &newdesc) != 0)
+	if (ndropped != 0 &&
+		page_frontier_advance(timeline, page_floor, frontier_seq) != 0)
 	{
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
 	}
+	test_crash_compaction_at("after_frontier");
+	if (record_layer(NULL, &newdesc) != 0)
+	{
+		(void) ps_layer_store->delete_local_layer(&newdesc);
+		goto cleanup;
+	}
+	/* The replacement is published before any source is retired.  Keep this
+	 * distinct crash boundary so recovery covers both live sources and the
+	 * replacement together. */
+	test_crash_compaction_at("after_publish");
 	/* The durable replacement no longer contains these versions.  Drop their
 	 * in-memory index entries at the same publication point; otherwise a live
 	 * read can select a pruned PageVer and then fail because no layer can serve
 	 * the advertised bytes.  Recovery already derives the same index from the
 	 * surviving layer set. */
 	page_remove_compacted_versions(timeline, dropped, ndropped);
+	if (metrics_header != NULL)
+	{
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_compactions, 1);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, nrec);
+		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
+						 scanned - nrec);
+		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
+	}
 	for (uint32_t k = 0; k < nold; k++)
 	{
 		/*
@@ -1287,6 +1331,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 				goto next_old;
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
+		/* The replacement is visible and this source is now durably retired. */
+		test_crash_compaction_at("after_mark_delete");
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -1735,20 +1781,87 @@ page_frontier_advance(uint32_t timeline, uint64_t floor,
 	return 0;
 }
 
+/* A reader pin on a descendant is projected while compaction runs on an
+ * ancestor.  Match that same projection here: the ancestor's frontier may
+ * have advanced past the branch point while the projected page version is
+ * still deliberately retained.  Caller holds map_lock. */
 static int
-page_frontier_allows(uint32_t timeline, uint64_t lsn, uint64_t admission_seq)
+page_frontier_projected_fence_active(uint32_t reader_timeline,
+								 uint32_t timeline, uint64_t lsn,
+								 uint64_t admission_seq)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int active = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		uint64_t projected;
+
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0 ||
+			pins[i].timeline != reader_timeline)
+			continue;
+		projected = pins[i].lsn;
+		if (retention_project_lsn(reader_timeline, timeline, &projected) &&
+			projected == lsn && pins[i].admission_seq == admission_seq)
+		{
+			active = 1;
+			break;
+		}
+	}
+	free(pins);
+	return active;
+}
+
+/* Every live child is a structural page-prune fence at its branch point,
+ * independent of whether the child currently has an explicit owner pin.
+ * page_prune_fences() retains that inherited version, so an as-of child read
+ * must be allowed to reach it even if the parent's global frontier moved on. */
+static int
+page_frontier_structural_fence_active(uint32_t reader_timeline,
+									  uint32_t timeline, uint64_t lsn)
+{
+	uint32_t current = reader_timeline;
+	uint32_t hops = 0;
+
+	while (current != timeline)
+	{
+		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+			!timeline_has_parent(current) || ++hops > MAX_TIMELINES)
+			return 0;
+		if (timelines[current].branch_lsn == lsn)
+			return 1;
+		current = (uint32_t) timelines[current].parent;
+	}
+	return 0;
+}
+
+static int
+page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
+					 uint64_t lsn, uint64_t admission_seq)
 {
 	PsPruneFence frontier;
 
 	if (timeline >= MAX_TIMELINES)
 		return 0;
 	frontier = page_reclaimed_frontier[timeline];
-	if (lsn < frontier.lsn)
+	if (lsn < frontier.lsn &&
+		!((admission_seq == 0 &&
+		   page_frontier_structural_fence_active(reader_timeline, timeline, lsn)) ||
+		  (admission_seq != 0 &&
+		   (ps_retention_page_fence_active(timeline, lsn, admission_seq) ||
+			page_frontier_projected_fence_active(reader_timeline, timeline,
+											lsn, admission_seq)))))
 		return 0;
 	/* Sequence zero is the established uncapped/latest-visible fence. */
 	if (admission_seq != 0 &&
 		lsn == frontier.lsn &&
-		admission_seq < frontier.admission_seq)
+		admission_seq < frontier.admission_seq &&
+		!ps_retention_page_fence_active(timeline, lsn, admission_seq) &&
+		!page_frontier_projected_fence_active(reader_timeline, timeline,
+									  lsn, admission_seq))
 		return 0;
 	return 1;
 }
@@ -2646,6 +2759,26 @@ tl_walk_next(TlWalk *w)
 		w->lsn = timelines[w->tl].branch_lsn;
 	w->tl = (uint32_t) timelines[w->tl].parent;
 	return 1;
+}
+
+/* Caller holds map_lock for reading.  A pin on a child must be admissible at
+ * every ancestor position reached by its capped read, not merely at the
+ * child's own frontier. */
+static int
+page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
+						  uint64_t read_seq)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+
+	for (;;)
+	{
+		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+
+		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
 }
 
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
@@ -3731,8 +3864,6 @@ static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
-static PsShmHeader *metrics_header;
-
 static void
 publish_wal_index_metrics(void)
 {
@@ -4738,6 +4869,25 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint32_t	levels = 0;
 	TlWalk		w = tl_walk_first(timeline, read_lsn);
 
+	/*
+	 * A durable compaction frontier makes older page history unavailable even
+	 * while a crash-recovery pass still has its source layers to clean up.
+	 * Current reads remain valid: their UINT64_MAX horizon is always newer
+	 * than the frontier.
+	 */
+	if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+	{
+		int		frontier_allows;
+
+		/* page_reclaimed_frontier is published by compaction while holding the
+		 * map write lock.  Sample the two-word fence under the same lock. */
+		ps_lock_map_rd();
+		frontier_allows = page_frontier_allows(timeline, timeline, read_lsn, read_seq);
+		ps_unlock_map();
+		if (!frontier_allows)
+			return -2;
+	}
+
 	/* Copy ancestry while CREATE_BRANCH is excluded, then release map_lock
 	 * before a remote layer read can block. */
 	ps_lock_map_rd();
@@ -4753,12 +4903,31 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			uint32_t	tl = w.tl;
 			uint64_t	rl = w.lsn;
 			uint64_t	seq_cap = rl == read_lsn ? read_seq : 0;
-			ForkEnt    *fe = fork_find(tl, key);
+			ForkEnt    *fe;
 			uint32_t	nb = 0;
-			int			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
+			int			fork_state;
+			PageEnt    *e;
+			PageVer    *pv;
+
+			/* A child can inherit this page from a parent.  Check every
+			 * traversed timeline so a parent frontier cannot be bypassed merely
+			 * because the child has not compacted locally. */
+			if (read_lsn != UINT64_MAX && key->klass == PS_KLASS_RELATION)
+			{
+				int	frontier_allows;
+
+				/* Compaction publishes the two-word frontier under map_lock. */
+				ps_lock_map_rd();
+				frontier_allows = page_frontier_allows(tl, timeline, rl, seq_cap);
+				ps_unlock_map();
+				if (!frontier_allows)
+					return -2;
+			}
+			fe = fork_find(tl, key);
+			fork_state = fe ? fork_asof_hop(fe, rl, seq_cap, &nb) :
 				FORK_HOP_NONE;
-			PageEnt    *e = page_find(tl, key, block);
-			PageVer    *pv = e ? page_visible(e, rl, seq_cap) : NULL;
+			e = page_find(tl, key, block);
+			pv = e ? page_visible(e, rl, seq_cap) : NULL;
 
 		if (pv)
 		{
@@ -6015,6 +6184,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret;
 				int			old_found;
 				int			timeline_defined;
+				int			page_history_allowed;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -6040,6 +6210,9 @@ ps_handle_meta(PsChannel *ch)
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
 					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
 					ps_unlock_map();
 					/* An active owner can only advance its own horizon.  Its old
 					 * pin already protected all history needed by the newer view, so
@@ -6047,8 +6220,7 @@ ps_handle_meta(PsChannel *ch)
 					 * frontier is stricter than the new point. */
 					ret = (((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
-							 !page_frontier_allows(tl, pin.lsn,
-												  pin.admission_seq) &&
+							 !page_history_allowed &&
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
@@ -6086,6 +6258,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret = PS_RETENTION_ERROR;
 				int			old_found = 0;
 				int			timeline_defined = 0;
+				int			page_history_allowed = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -6104,11 +6277,14 @@ ps_handle_meta(PsChannel *ch)
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
 					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
 					ps_unlock_map();
 					if (timeline_defined &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-						 page_frontier_allows(tl, pin.lsn, pin.admission_seq)))
+						 page_history_allowed))
 						ret = ps_retention_reserve_and_set(&pin);
 				}
 				if (ret == PS_RETENTION_OK)
