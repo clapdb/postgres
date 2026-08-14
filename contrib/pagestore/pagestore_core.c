@@ -1305,7 +1305,7 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		ps_fetch_add_u64(&metrics_header->page_prune_versions_scanned, scanned);
 		ps_fetch_add_u64(&metrics_header->page_prune_versions_kept, nrec);
 		ps_fetch_add_u64(&metrics_header->page_prune_versions_deleted,
-						 ndropped);
+						 scanned - nrec);
 		ps_fetch_add_u64(&metrics_header->page_prune_metrics_seq, 1);
 	}
 	for (uint32_t k = 0; k < nold; k++)
