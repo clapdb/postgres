@@ -220,6 +220,43 @@ fail:
 }
 
 static int
+parse_shard_name(const char *name, uint64_t *generation_out)
+{
+	static const char prefix[] = "walidxg1_";
+	const size_t prefix_len = sizeof(prefix) - 1;
+	const size_t generation_end = prefix_len + 20;
+	const size_t shard_start = generation_end + 1;
+	const size_t name_len = shard_start + 3;
+	uint64_t generation = 0;
+	uint32_t shard = 0;
+
+	if (strlen(name) != name_len || memcmp(name, prefix, prefix_len) != 0 ||
+		name[generation_end] != '_')
+		return -1;
+	for (size_t i = prefix_len; i < generation_end; i++)
+	{
+		unsigned int digit;
+
+		if (name[i] < '0' || name[i] > '9')
+			return -1;
+		digit = (unsigned int) (name[i] - '0');
+		if (generation > (UINT64_MAX - digit) / 10)
+			return -1;
+		generation = generation * 10 + digit;
+	}
+	for (size_t i = shard_start; i < name_len; i++)
+	{
+		if (name[i] < '0' || name[i] > '9')
+			return -1;
+		shard = shard * 10 + (uint32_t) (name[i] - '0');
+	}
+	if (generation == 0 || shard >= PS_WALIDX_SNAPSHOT_MAX_SHARDS)
+		return -1;
+	*generation_out = generation;
+	return 0;
+}
+
+static int
 open_directory(const char *directory, int create)
 {
 	int directory_fd;
@@ -710,6 +747,48 @@ ps_walidx_snapshot_read(const PsWalIdxSnapshot *snapshot, uint32_t shard,
 	rc = read_all_at(fd, data, len, offset);
 	if (close(fd) != 0)
 		rc = -1;
+	return rc;
+}
+
+int
+ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
+{
+	PsWalIdxSnapshot current;
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int scan_fd = -1;
+	int removed = 0;
+	int rc = -1;
+
+	if (ps_walidx_snapshot_open(&current, directory, timeline) != 0)
+		return -1;
+	scan_fd = fcntl(current.directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		uint64_t generation;
+
+		if (parse_shard_name(entry->d_name, &generation) != 0 ||
+			generation >= current.generation)
+			continue;
+		if (unlinkat(current.directory_fd, entry->d_name, 0) != 0)
+			goto cleanup;
+		removed = 1;
+		errno = 0;
+	}
+	if (errno != 0 || (removed && fsync(current.directory_fd) != 0))
+		goto cleanup;
+	rc = removed;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	ps_walidx_snapshot_close(&current);
 	return rc;
 }
 

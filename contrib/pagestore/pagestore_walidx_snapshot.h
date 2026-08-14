@@ -61,6 +61,10 @@ extern int ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot,
 extern int ps_walidx_snapshot_read(const PsWalIdxSnapshot *snapshot,
 								   uint32_t shard, uint64_t offset,
 								   void *data, uint32_t len);
+/* Remove immutable shard files older than the generation selected by the
+ * validated manifest.  Returns 1 if files were removed, 0 if already clean,
+ * and -1 on error.  Newer unpublished files are left for publication retry. */
+extern int ps_walidx_snapshot_gc(const char *directory, uint32_t timeline);
 extern void ps_walidx_snapshot_close(PsWalIdxSnapshot *snapshot);
 
 #endif

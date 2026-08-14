@@ -155,6 +155,27 @@ main(void)
 	check(ps_walidx_snapshot_publish(directory, 0, 3, 400, 1000,
 								 second, 3) != 0,
 		  "a newer generation cannot move its retained frontier backward");
+	check(setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD", "0", 1) == 0 &&
+		  ps_walidx_snapshot_publish(directory, 0, 3, 900, 1000,
+								 second, 3) != 0,
+		  "leave a newer unpublished shard for publication retry");
+	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+	check(ps_walidx_snapshot_gc(directory, 0) == 1,
+		  "generation GC removes superseded immutable shards");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 directory, 1ULL, 0U);
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "generation GC removes the old selected generation");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 directory, 2ULL, 0U);
+	check(access(path, F_OK) == 0,
+		  "generation GC preserves the currently selected generation");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 directory, 3ULL, 0U);
+	check(access(path, F_OK) == 0,
+		  "generation GC preserves newer unpublished retry state");
+	check(ps_walidx_snapshot_gc(directory, 0) == 0,
+		  "generation GC is idempotent after old shards are gone");
 
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 2ULL, 1U);
@@ -162,6 +183,8 @@ main(void)
 		  "corrupt one selected shard byte");
 	check(ps_walidx_snapshot_open(&snapshot, directory, 0) != 0,
 		  "recovery rejects a corrupt shard in the selected generation");
+	check(ps_walidx_snapshot_gc(directory, 0) != 0,
+		  "generation GC fails closed when the selected generation is corrupt");
 	check(pwrite_byte(path, 17, shard1[17]) == 0 &&
 		  ps_walidx_snapshot_open(&snapshot, directory, 0) == 0,
 		  "recovery succeeds after the shard is restored");
@@ -181,6 +204,9 @@ main(void)
 		unlink(path);
 		snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 				 directory, 2ULL, shard);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+				 directory, 3ULL, shard);
 		unlink(path);
 	}
 	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", directory);

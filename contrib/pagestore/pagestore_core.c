@@ -4048,6 +4048,7 @@ static uint64_t walidx_snapshot_offsets[MAX_TIMELINES][PS_MAX_CHANNELS];
 static unsigned char walidx_snapshot_reshard_pending[MAX_TIMELINES];
 static struct timespec walidx_snapshot_retry_at[MAX_TIMELINES];
 static uint32_t walidx_snapshot_cursor;
+static unsigned char walidx_snapshot_gc_pending[MAX_TIMELINES];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct WalIdxPublishLock
 {
@@ -4648,6 +4649,7 @@ walidx_snapshot_recover(uint32_t tl)
 	walidx_snapshot_start[tl] = snapshot.start_lsn;
 	walidx_snapshot_end[tl] = snapshot.end_lsn;
 	walidx_snapshot_reshard_pending[tl] = (unsigned char) reshard;
+	walidx_snapshot_gc_pending[tl] = 1;
 	walidx_progress[tl] = snapshot.end_lsn;
 	ps_walidx_snapshot_close(&snapshot);
 	return 0;
@@ -4810,6 +4812,7 @@ walidx_snapshot_publish_one(void)
 			   sizeof(walidx_snapshot_retry_at[tl]));
 		for (uint32_t shard = 0; shard < ns; shard++)
 			walidx_snapshot_offsets[tl][shard] = offsets[shard];
+		walidx_snapshot_gc_pending[tl] = 1;
 		pthread_mutex_unlock(&walidx_meta_lock);
 		rc = 1;
 	}
@@ -4822,6 +4825,33 @@ publish_done:
 	}
 	walidx_publish_wrunlock();
 	return rc;
+}
+
+static int
+walidx_snapshot_gc_one(void)
+{
+	int candidate = -1;
+	int rc;
+	char directory[4096];
+
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (walidx_snapshot_gc_pending[tl])
+		{
+			candidate = (int) tl;
+			break;
+		}
+	if (candidate < 0)
+		return 0;
+	walidx_publish_wrlock();
+	if (walidx_snapshot_path((uint32_t) candidate, directory,
+							 sizeof(directory)) != 0)
+		rc = -1;
+	else
+		rc = ps_walidx_snapshot_gc(directory, (uint32_t) candidate);
+	if (rc >= 0)
+		walidx_snapshot_gc_pending[candidate] = 0;
+	walidx_publish_wrunlock();
+	return rc > 0;
 }
 
 static int
@@ -7754,6 +7784,8 @@ ps_core_maintenance(void)
 	 * metadata), so bound this log before considering LSM-only work. */
 	if (ps_retention_should_compact())
 		return ps_retention_compact() == 0;
+	if (walidx_snapshot_gc_one())
+		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
 
@@ -7951,6 +7983,8 @@ ps_core_open(const char *store_dir)
 		   sizeof(walidx_snapshot_reshard_pending));
 	memset(walidx_snapshot_retry_at, 0, sizeof(walidx_snapshot_retry_at));
 	walidx_snapshot_cursor = 0;
+	memset(walidx_snapshot_gc_pending, 0,
+		   sizeof(walidx_snapshot_gc_pending));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 

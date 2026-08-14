@@ -358,7 +358,10 @@ remain reachable for reader-drain and later reclamation.  Live maintenance now
 freezes append/progress and drains admitted index readers under the existing
 publish lock, publishes all shard images, and records each source-log offset.
 Recovery restores the selected generation and replays only the tail after those
-absolute offsets.  No log entry, old generation, or raw WAL is dropped yet.
+absolute offsets.  Once a newer manifest is durable, maintenance validates it
+and idempotently removes older immutable snapshot shard generations; newer
+unpublished retry files are preserved.  No WAL-index log entry or raw WAL is
+dropped yet.
 
 Deliverables:
 
