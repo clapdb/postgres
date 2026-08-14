@@ -83,6 +83,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_manifest_test pagestore_manifest_test.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_retention_test pagestore_retention_test.c pagestore_retention.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_gc_test pagestore_gc_test.c pagestore_core.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_snapshot_test pagestore_walidx_snapshot_test.c pagestore_walidx_snapshot.c -lrt
 
       - name: Run standalone test suite
         working-directory: contrib/pagestore
@@ -115,6 +116,10 @@ jobs:
       - name: Run GC crash-safety unit test
         working-directory: contrib/pagestore
         run: ./pagestore_gc_test
+
+      - name: Run WAL-index snapshot publication unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_walidx_snapshot_test
 
   # In-engine test: build PostgreSQL and exercise the real path (smgr hijack,
   # localsvc backend over the daemon, COW read_at, WAL shipping).  Heavier --

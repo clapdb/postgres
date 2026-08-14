@@ -227,6 +227,17 @@ test('pagestore_wal_store',
   timeout: 30,
 )
 
+# Crash-atomic multi-shard WAL-index snapshot generation publication.
+pagestore_walidx_snapshot_test = executable('pagestore_walidx_snapshot_test',
+  files('pagestore_walidx_snapshot_test.c', 'pagestore_walidx_snapshot.c'),
+  install: false,
+)
+test('pagestore_walidx_snapshot',
+  pagestore_walidx_snapshot_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),
