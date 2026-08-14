@@ -12,15 +12,21 @@ because its implementation PR merged: its listed evidence must pass on the
 
 ## Baseline
 
-Baseline as of 2026-08-12:
+Baseline as of 2026-08-14:
 
-- PRs #174 and #175 are merged into `pagestore`.
+- PRs #174-#191 have completed their stacked review flow.  The reclamation
+  roll-up lands their aggregate on `pagestore`; this includes retention-owner
+  lifecycle, page-version pruning, bounded page-history churn, and immutable
+  WAL segment/store primitives.
 - The local POSIX golden path is green: WAL-only writer -> continuous
   materializer -> durable fork -> independent branch -> process restarts.
 - Managed materializer lifecycle and serialized portable branch bootstrap are
   implemented for the default-tablespace local POSIX topology.
-- The durable retention registry and effective per-resource floor are
-  implemented, but controllers and reclaimers do not consume them yet.
+- The durable retention registry is consumed by reader and materializer
+  controllers.  Image compaction consumes its exact page-history fences and
+  publishes a durable reclamation frontier before retiring sources.
+- Repeated update/compact cycles bound retained page history.  Shipped WAL,
+  WAL-index history, fork metadata, and deleted timelines remain unbounded.
 - Focused crash tests exist, but the composed fault and persisted-format
   compatibility gates remain open.
 
@@ -82,12 +88,8 @@ R4's replacement bases to have removed the oldest raw-WAL dependencies.
 
 ### R0. Land the localsvc retention-owner API
 
-Status: **partially implemented in the R0 stacked change; reclamation-frontier
-admission remains open and must land before any reclaimer is enabled**.
-
-The previously reviewed stacked PR #171 did not reach the final `pagestore`
-history.  Port its current-state equivalent rather than merging the stale
-stacked branch.
+Status: **implemented for durable owners and page-history admission; the WAL,
+WAL-index, and forkmeta resource frontiers remain coupled to R3/R4/R4b**.
 
 Deliverables:
 
@@ -147,8 +149,7 @@ Expected scope: one PR.
 
 ### R1. Register reader and materializer owner generations
 
-Status: **materializer lifecycle implemented in the first R1 stacked change;
-reader lifecycle implemented in the second R1 stacked change; awaiting merge;
+Status: **implemented for managed materializers and fixed/advancing readers;
 decision D2 is accepted below**.
 
 Deliverables:
@@ -189,10 +190,11 @@ Expected scope: two PRs, materializer then reader.
 
 ### R2. Prune page versions during image compaction
 
-Status: **not started; blocked on R1**.
+Status: **implemented in the reclamation roll-up**.
 
-Compaction currently rewrites image layers while retaining every historical
-version.  It must consume the page-history effective floor.
+Image compaction consumes exact page-history fences, retains discrete reader
+and descendant bases, publishes the durable frontier before source retirement,
+and fails closed below reclaimed history.
 
 An effective floor of zero means that no retention owner constrains page
 history; it is not a literal LSN cutoff.  In that case the GC cutoff is the
@@ -271,8 +273,9 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 
 ### R3. Reclaim shipped WAL
 
-Status: **design decision required; R3a is blocked on R1 and D3; R3b
-acceptance is additionally blocked on the R4 replacement-base milestone**.
+Status: **R3a immutable segment/store primitives implemented; integration and
+R3b reclamation remain, with acceptance blocked on the R4 replacement-base
+milestone**.
 
 The current flat `wal_<timeline>` file does not support simple crash-safe prefix
 deletion.  WAL reclamation must first gain a durable physical base LSN and a
@@ -330,7 +333,7 @@ coordinated or stacked with R4 where the acceptance criteria overlap.
 
 ### R4. Compact and reclaim the WAL index
 
-Status: **not started; blocked on R1**.
+Status: **not started; R1 and R2 prerequisites are complete**.
 
 Deliverables:
 
@@ -381,7 +384,7 @@ Expected scope: one or two PRs.
 
 ### R4b. Compact and reclaim fork metadata
 
-Status: **not started; blocked on R1 and R2**.
+Status: **not started; R1 and R2 prerequisites are complete**.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -705,7 +708,10 @@ whole old files and retains the boundary file when needed.
 Alternative: periodically rewrite the flat file.  It minimizes format count but
 causes unbounded copy cost and a larger crash-publication protocol.
 
-Decision: **open**.
+Decision: **accepted 2026-08-14**.  Use immutable fixed-size logical WAL
+segments with checksummed metadata and bounded chunk validation.  R3b will
+integrate the segment store into the daemon WAL path and add retained-base
+publication and prefix deletion.
 
 ### D4. Timeline deletion with descendants
 
@@ -735,22 +741,18 @@ packaging do not block MVP completion.
 
 ## Proposed PR sequence
 
-The default sequence is:
+The remaining default sequence is:
 
-1. R0 localsvc retention API;
-2. R1a materializer owner lifecycle;
-3. R1b reader owner lifecycle;
-4. R2 page-version pruning;
-5. R3a segmented WAL format and compatibility;
-6. R4 WAL-index compaction/reclamation and replacement bases;
-7. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
-8. R4b forkmeta compaction/reclamation and publication crash tests;
-9. R5 timeline deletion;
-10. R5b reclaimer backpressure controllers;
-11. H0 fault/inspection primitives (may start in parallel with R0-R1);
-11. H1 composed crash scenarios;
-12. H2 format fixtures and compatibility CI;
-13. R6 bounded-space acceptance and final MVP status update.
+1. integrate the R3a segment store into shipped-WAL append/read/recovery;
+2. R4 WAL-index compaction/reclamation and replacement bases;
+3. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
+4. R4b forkmeta compaction/reclamation and publication crash tests;
+5. R5 timeline deletion;
+6. R5b reclaimer backpressure controllers;
+7. H0 fault/inspection primitives (may proceed alongside R3/R4);
+8. H1 composed crash scenarios;
+9. H2 format fixtures and compatibility CI;
+10. R6 bounded-space acceptance and final MVP status update.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
@@ -761,3 +763,4 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | Date | Change | Evidence |
 |---|---|---|
 | 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
+| 2026-08-14 | Completed R0/R1 owner lifecycle and R2 page pruning; added R3a immutable WAL segment/store primitives | Stacked PRs #177-#191, standalone/integration CI, bounded-churn and publication-crash tests |
