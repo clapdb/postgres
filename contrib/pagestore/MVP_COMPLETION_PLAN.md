@@ -275,9 +275,9 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 
 ### R3. Reclaim shipped WAL
 
-Status: **R3a immutable segment/store primitives and live-path integration
-implemented; R3b reclamation remains, with acceptance blocked on the R4
-replacement-base milestone**.
+Status: **R3a immutable segment/store primitives and live-path integration and
+the R3b crash-atomic flat-log prefix-rewrite primitive are implemented; durable
+retained-base publication and reclamation policy remain**.
 
 The transition path accepts the existing arbitrary-size archive IPC chunks in
 the flat staging log, seals every complete contiguous segment-aligned 1 MiB
@@ -290,10 +290,16 @@ pre-publication crash.  R3b may make retained-base metadata authoritative and
 reclaim flat prefixes only after R4 removes their remaining raw-WAL
 dependencies.
 
-The current flat `wal_<timeline>` file does not support simple crash-safe prefix
-deletion.  WAL reclamation must first gain a durable physical base LSN and a
-layout that can remove an old prefix without rewriting an unbounded file under
-the serve path.
+Each flat `wal_<timeline>` record is self-describing, so the POSIX backend can
+now copy a retained suffix from a complete record boundary, fsync it, and
+atomically replace the old log while serializing physical append/truncate
+publication.  A crash before rename leaves the old file authoritative and a
+retry replaces any staging orphan; after rename, directory fsync makes the new
+suffix durable.  The core must still durably publish the logical retained-base
+frontier first, freeze its WAL catalog across cutover, translate in-memory file
+offsets, and then use this primitive.  This rewrite is an MVP transition path;
+bounded steady-state operation should move reclamation onto immutable segment
+lifecycle so it does not repeatedly copy an unbounded live suffix.
 
 Deliverables:
 

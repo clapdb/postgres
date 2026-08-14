@@ -68,6 +68,14 @@ typedef struct PsStorage
 							   const void *b, uint32_t blen);
 	int			(*wal_read) (uint32_t tl, uint64_t off, void *buf, uint32_t len);
 	int			(*wal_truncate) (uint32_t tl, uint64_t len);
+	/*
+	 * Crash-atomically replace a flat WAL log with the byte suffix beginning at
+	 * keep_off.  The caller must freeze logical WAL catalog mutation across the
+	 * call and rebuild its file-offset references before admitting an append.
+	 * An error after publication is recovery-fatal: reopen instead of retrying
+	 * the same physical offset.
+	 */
+	int			(*wal_rewrite_prefix) (uint32_t tl, uint64_t keep_off);
 
 	/* Per-(timeline, shard) durable per-page WAL index records. */
 	int			(*walidx_append) (uint32_t tl, uint32_t shard, uint64_t epoch,

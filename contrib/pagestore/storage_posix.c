@@ -47,7 +47,10 @@ static int test_fail_seg_writes;
 static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
 static int test_max_log_read;
+static int test_fail_wal_rewrite_before_rename;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Serializes flat-WAL append/truncate/rewrite publication. */
+static pthread_mutex_t posix_wal_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * WAL-index records are independent per (timeline, shard).  The metadata
@@ -214,6 +217,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *crash_after_writes;
 	const char *fail_fork_meta_at;
 	const char *max_log_read;
+	const char *fail_wal_rewrite;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -234,6 +238,9 @@ posix_open(const char *path, uint64_t segment_size)
 		atoi(fail_fork_meta_at) : 0;
 	max_log_read = getenv("PAGESTORE_TEST_MAX_LOG_READ");
 	test_max_log_read = max_log_read ? atoi(max_log_read) : 0;
+	fail_wal_rewrite = getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_BEFORE_RENAME");
+	test_fail_wal_rewrite_before_rename = fail_wal_rewrite ?
+		atoi(fail_wal_rewrite) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -398,8 +405,8 @@ posix_wal_rollback(const char *path, int fd, off_t oldsz, int created)
 }
 
 static int
-posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
-			 const void *b, uint32_t blen)
+posix_wal_append_locked(uint32_t tl, const void *a, uint32_t alen,
+						const void *b, uint32_t blen)
 {
 	char		path[4096];
 	int		fd;
@@ -448,6 +455,18 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 }
 
 static int
+posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
+			 const void *b, uint32_t blen)
+{
+	int rc;
+
+	pthread_mutex_lock(&posix_wal_lock);
+	rc = posix_wal_append_locked(tl, a, alen, b, blen);
+	pthread_mutex_unlock(&posix_wal_lock);
+	return rc;
+}
+
+static int
 posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
 	char		path[4096];
@@ -478,7 +497,7 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 }
 
 static int
-posix_wal_truncate(uint32_t tl, uint64_t len)
+posix_wal_truncate_locked(uint32_t tl, uint64_t len)
 {
 	char		path[4096];
 	int			fd;
@@ -492,6 +511,110 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 		rc = -1;
 	if (close(fd) != 0)
 		rc = -1;
+	return rc;
+}
+
+static int
+posix_wal_truncate(uint32_t tl, uint64_t len)
+{
+	int rc;
+
+	pthread_mutex_lock(&posix_wal_lock);
+	rc = posix_wal_truncate_locked(tl, len);
+	pthread_mutex_unlock(&posix_wal_lock);
+	return rc;
+}
+
+/*
+ * Copy the retained suffix to a sibling, make it durable, then publish it with
+ * rename.  The old file remains authoritative before rename.  The caller must
+ * reopen/recover after any error that could follow rename rather than retrying
+ * the same physical offset against an already-shortened file.
+ */
+static int
+posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
+{
+	char		path[4096];
+	char		tmp[4096];
+	unsigned char buf[64 * 1024];
+	struct stat st;
+	uint64_t	off;
+	int		src = -1;
+	int		dst = -1;
+	int		dfd = -1;
+	int		rc = -1;
+
+	pthread_mutex_lock(&posix_wal_lock);
+	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
+	snprintf(tmp, sizeof(tmp), "%s/wal_%u.rewrite.tmp", posix_dir, tl);
+	src = open(path, O_RDONLY);
+	if (src < 0 || fstat(src, &st) != 0 || st.st_size < 0 ||
+		keep_off > (uint64_t) st.st_size)
+		goto out;
+	dst = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (dst < 0)
+		goto out;
+	for (off = keep_off; off < (uint64_t) st.st_size;)
+	{
+		size_t want = (uint64_t) st.st_size - off < sizeof(buf) ?
+			(size_t) ((uint64_t) st.st_size - off) : sizeof(buf);
+		ssize_t nread = pread(src, buf, want, (off_t) off);
+		size_t written = 0;
+
+		if (nread < 0 && errno == EINTR)
+			continue;
+		if (nread <= 0)
+			goto out;
+		while (written < (size_t) nread)
+		{
+			ssize_t nwrite = write(dst, buf + written,
+								 (size_t) nread - written);
+
+			if (nwrite < 0 && errno == EINTR)
+				continue;
+			if (nwrite <= 0)
+				goto out;
+			written += (size_t) nwrite;
+		}
+		off += (uint64_t) nread;
+	}
+	if (fsync(dst) != 0)
+		goto out;
+	if (close(dst) != 0)
+	{
+		dst = -1;
+		goto out;
+	}
+	dst = -1;
+	if (test_fail_wal_rewrite_before_rename > 0 &&
+		--test_fail_wal_rewrite_before_rename == 0)
+	{
+		errno = EIO;
+		goto out;
+	}
+	if (rename(tmp, path) != 0)
+		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 || fsync(dfd) != 0)
+		goto out;
+	if (close(dfd) != 0)
+	{
+		dfd = -1;
+		goto out;
+	}
+	dfd = -1;
+	rc = 0;
+
+out:
+	if (src >= 0)
+		close(src);
+	if (dst >= 0)
+		close(dst);
+	if (dfd >= 0)
+		close(dfd);
+	if (rc != 0)
+		(void) unlink(tmp);
+	pthread_mutex_unlock(&posix_wal_lock);
 	return rc;
 }
 
@@ -1275,6 +1398,7 @@ const PsStorage PsStoragePosix = {
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
 	.wal_truncate = posix_wal_truncate,
+	.wal_rewrite_prefix = posix_wal_rewrite_prefix,
 	.walidx_append = posix_walidx_append,
 	.walidx_read = posix_walidx_read,
 	.walidx_truncate = posix_walidx_truncate,

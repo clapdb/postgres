@@ -240,6 +240,18 @@ test('pagestore_wal_store',
   timeout: 30,
 )
 
+# Crash-atomic prefix replacement for the authoritative flat shipped-WAL log.
+storage_posix_wal_test = executable('storage_posix_wal_test',
+  files('storage_posix_wal_test.c', 'storage_posix.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_posix_wal',
+  storage_posix_wal_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Crash-atomic multi-shard WAL-index snapshot generation publication.
 pagestore_walidx_snapshot_test = executable('pagestore_walidx_snapshot_test',
   files('pagestore_walidx_snapshot_test.c', 'pagestore_walidx_snapshot.c'),

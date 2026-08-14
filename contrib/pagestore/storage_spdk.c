@@ -837,6 +837,12 @@ spdk_wal_truncate(uint32_t tl, uint64_t len)
 }
 
 static int
+spdk_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
+{
+	return PsStoragePosix.wal_rewrite_prefix(tl, keep_off);
+}
+
+static int
 spdk_walidx_append(uint32_t tl, uint32_t shard, uint64_t epoch,
 				   const void *buf, uint32_t len)
 {
@@ -925,6 +931,7 @@ const PsStorage PsStorageSpdk = {
 	.wal_append = spdk_wal_append,
 	.wal_read = spdk_wal_read,
 	.wal_truncate = spdk_wal_truncate,
+	.wal_rewrite_prefix = spdk_wal_rewrite_prefix,
 	.walidx_append = spdk_walidx_append,
 	.walidx_read = spdk_walidx_read,
 	.walidx_truncate = spdk_walidx_truncate,
