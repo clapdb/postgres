@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,6 +50,7 @@
 #include "pagestore_pgcache.h"
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
+#include "pagestore_wal_store.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -3371,8 +3373,13 @@ static WalChunkRef *wal_chunks[MAX_TIMELINES];
 static uint32_t wal_chunks_n[MAX_TIMELINES];
 static uint32_t wal_chunks_cap[MAX_TIMELINES];
 static uint64_t wal_log_bytes[MAX_TIMELINES];
+#define WAL_IMMUTABLE_SEGMENT_BYTES PS_WAL_SEGMENT_MIN_BYTES
+static PsWalStore wal_segment_stores[MAX_TIMELINES];
+static unsigned char wal_segment_store_opened[MAX_TIMELINES];
+static char wal_segment_root[4096];
 
 static void walidx_progress_init(uint32_t tl, uint64_t first_lsn);
+static int wal_segment_sync(uint32_t tl);
 
 static int
 wal_chunk_reserve(uint32_t tl)
@@ -3536,7 +3543,7 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 							  &covered_prefix, &prefix_only) != 0)
 			return -1;
 		if (covered_prefix == len)
-			return 0;
+			return wal_segment_sync(tl);
 		if (!prefix_only)
 		{
 			fprintf(stderr, "pagestore: refusing WAL re-ship with non-prefix "
@@ -3563,14 +3570,14 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	if (len > 0)
 		walidx_progress_init(tl, start_lsn);
 	publish_wal_index_metrics();
-	return 0;
+	return wal_segment_sync(tl);
 }
 
 /* Fill 'out' from ONE timeline's log: the overlap of [start, start+len) with
  * [.., cap) and with each shipped chunk.  Bytes not covered are left as-is. */
 static uint32_t
-wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
-			 unsigned char *out)
+wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
+				  unsigned char *out)
 {
 	uint32_t	filled = 0;
 	uint64_t	we = start + len;
@@ -3598,6 +3605,57 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			if (n > 0)
 				filled += (uint32_t) n;
 		}
+	}
+	return filled;
+}
+
+/* Prefer validated immutable segments for their sealed prefix.  The flat log
+ * remains the authoritative staging/tail representation until prefix
+ * reclamation publishes a durable retained base. */
+static uint32_t
+wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
+			 unsigned char *out)
+{
+	uint64_t end = start + len;
+	uint64_t sealed_start;
+	uint64_t sealed_end;
+	uint32_t filled = 0;
+
+	if (end < start)
+		return 0;
+	if (end > cap)
+		end = cap;
+	if (end <= start)
+		return 0;
+	if (tl >= MAX_TIMELINES || !wal_segment_store_opened[tl])
+		return wal_read_flat_one(tl, start, (uint32_t) (end - start), end, out);
+	sealed_start = wal_segment_stores[tl].start_lsn;
+	sealed_end = wal_segment_stores[tl].end_lsn;
+	if (start < sealed_start)
+	{
+		uint64_t left_end = end < sealed_start ? end : sealed_start;
+
+		filled += wal_read_flat_one(tl, start,
+								(uint32_t) (left_end - start), left_end, out);
+	}
+	if (start < sealed_end && end > sealed_start)
+	{
+		uint64_t segment_start = start > sealed_start ? start : sealed_start;
+		uint64_t segment_end = end < sealed_end ? end : sealed_end;
+
+		if (ps_wal_store_read(&wal_segment_stores[tl], segment_start,
+						  out + (segment_start - start),
+						  (uint32_t) (segment_end - segment_start)) != 0)
+			return filled;
+		filled += (uint32_t) (segment_end - segment_start);
+	}
+	if (end > sealed_end)
+	{
+		uint64_t tail_start = start > sealed_end ? start : sealed_end;
+
+		filled += wal_read_flat_one(tl, tail_start,
+								(uint32_t) (end - tail_start), end,
+								out + (tail_start - start));
 	}
 	return filled;
 }
@@ -3698,6 +3756,118 @@ wal_coverage_advance(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	return 1;
 }
 
+static int
+wal_segment_open_one(uint32_t tl)
+{
+	char path[4096];
+	unsigned char *segment_buf = NULL;
+	unsigned char *flat_buf = NULL;
+	uint64_t start_lsn;
+	struct stat st;
+	int n;
+
+	if (tl >= MAX_TIMELINES || wal_segment_store_opened[tl])
+		return tl < MAX_TIMELINES ? 0 : -1;
+	start_lsn = wal_log_start(tl);
+	if (start_lsn == UINT64_MAX ||
+		start_lsn % WAL_IMMUTABLE_SEGMENT_BYTES != 0)
+		return 0;
+	n = snprintf(path, sizeof(path), "%s/wal_segments_%u",
+				 wal_segment_root, tl);
+	if (n < 0 || (size_t) n >= sizeof(path))
+		return -1;
+	if (lstat(path, &st) == 0)
+	{
+		if (!S_ISDIR(st.st_mode) ||
+			ps_wal_store_open(&wal_segment_stores[tl], path, tl + 1,
+							  start_lsn, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
+			return -1;
+	}
+	else if (errno == ENOENT)
+	{
+		if (ps_wal_store_create(&wal_segment_stores[tl], path, tl + 1,
+								start_lsn, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
+			return -1;
+	}
+	else
+		return -1;
+	/* The flat log is still authoritative during this migration.  A valid but
+	 * divergent immutable file must never silently replace its bytes. */
+	segment_buf = malloc(PS_WAL_STORE_VERIFY_CHUNK_BYTES);
+	flat_buf = malloc(PS_WAL_STORE_VERIFY_CHUNK_BYTES);
+	if (segment_buf == NULL || flat_buf == NULL)
+		goto fail;
+	for (uint64_t pos = start_lsn;
+		 pos < wal_segment_stores[tl].end_lsn;)
+	{
+		uint32_t amount = wal_segment_stores[tl].end_lsn - pos <
+			PS_WAL_STORE_VERIFY_CHUNK_BYTES ?
+			(uint32_t) (wal_segment_stores[tl].end_lsn - pos) :
+			PS_WAL_STORE_VERIFY_CHUNK_BYTES;
+
+		if (!wal_coverage_advance(tl, pos, pos + amount) ||
+			ps_wal_store_read(&wal_segment_stores[tl], pos,
+						  segment_buf, amount) != 0 ||
+			wal_read_flat_one(tl, pos, amount, pos + amount,
+							  flat_buf) != amount ||
+			memcmp(segment_buf, flat_buf, amount) != 0)
+			goto fail;
+		pos += amount;
+	}
+	free(segment_buf);
+	free(flat_buf);
+	wal_segment_store_opened[tl] = 1;
+	return 0;
+
+fail:
+	free(segment_buf);
+	free(flat_buf);
+	ps_wal_store_close(&wal_segment_stores[tl]);
+	return -1;
+}
+
+static int
+wal_segment_sync(uint32_t tl)
+{
+	unsigned char *buf;
+	PsWalStore *store;
+	int rc = 0;
+
+	if (tl >= MAX_TIMELINES || wal_segment_open_one(tl) != 0)
+		return -1;
+	if (!wal_segment_store_opened[tl])
+		return 0;
+	store = &wal_segment_stores[tl];
+	if (store->end_lsn > wal_end_read(tl))
+		return -1;
+	if (store->end_lsn > UINT64_MAX - WAL_IMMUTABLE_SEGMENT_BYTES ||
+		store->end_lsn + WAL_IMMUTABLE_SEGMENT_BYTES > wal_end_read(tl))
+		return 0;
+	buf = malloc(WAL_IMMUTABLE_SEGMENT_BYTES);
+	if (buf == NULL)
+		return -1;
+	while (store->end_lsn <= UINT64_MAX - WAL_IMMUTABLE_SEGMENT_BYTES &&
+		   store->end_lsn + WAL_IMMUTABLE_SEGMENT_BYTES <= wal_end_read(tl) &&
+		   wal_coverage_advance(tl, store->end_lsn,
+							store->end_lsn + WAL_IMMUTABLE_SEGMENT_BYTES))
+	{
+		uint64_t segment_start = store->end_lsn;
+
+		if (wal_read_flat_one(tl, segment_start,
+							  WAL_IMMUTABLE_SEGMENT_BYTES,
+							  segment_start + WAL_IMMUTABLE_SEGMENT_BYTES,
+							  buf) != WAL_IMMUTABLE_SEGMENT_BYTES ||
+			ps_wal_store_append(store, segment_start, buf,
+							WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
+		{
+			rc = -1;
+			break;
+		}
+	}
+	free(buf);
+	return rc;
+}
+
 /*
  * Read up to 'len' WAL bytes starting at WAL position 'start' from a
  * timeline's HISTORY into 'out'; returns the number of DISTINCT bytes
@@ -3774,6 +3944,10 @@ wal_recover_one(uint32_t tl)
 	wal_chunks_n[tl] = 0;
 	wal_chunks_cap[tl] = 0;
 	wal_log_bytes[tl] = 0;
+	__atomic_store_n(&wal_end[tl], 0, __ATOMIC_RELEASE);
+	wal_covered[tl] = 0;
+	wal_covered_off[tl] = 0;
+	wal_covered_valid[tl] = 0;
 	while ((nread = ps_storage->wal_read(tl, off, &h, sizeof(h))) ==
 		   (int) sizeof(h))
 	{
@@ -6541,6 +6715,12 @@ ps_core_close(void)
 		}
 	}
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (wal_segment_store_opened[tl])
+		{
+			ps_wal_store_close(&wal_segment_stores[tl]);
+			wal_segment_store_opened[tl] = 0;
+		}
 	ps_retention_close();
 	ps_manifest_close();
 }
@@ -7227,6 +7407,10 @@ ps_core_open(const char *store_dir)
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
 	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	gc_remote_layer_cursor = 0;
+	if (snprintf(wal_segment_root, sizeof(wal_segment_root), "%s", store_dir) < 0 ||
+		strlen(store_dir) >= sizeof(wal_segment_root))
+		return -1;
+	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 
@@ -7392,6 +7576,12 @@ ps_core_open(const char *store_dir)
 		{
 			if (wal_recover_one(tl) != 0)
 				return -1;
+			if (wal_segment_sync(tl) != 0)
+			{
+				fprintf(stderr, "pagestore: refusing invalid immutable WAL segments "
+						"for timeline %u\n", tl);
+				return -1;
+			}
 			walidx_progress_init(tl, wal_log_start(tl));
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
 				if (walidx_recover_one(tl, shard) != 0)

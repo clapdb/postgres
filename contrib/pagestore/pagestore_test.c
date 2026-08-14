@@ -4108,16 +4108,27 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
 	char		store[256];
+	char		immutable_path[512];
 	pid_t		dpid;
+	struct stat immutable_st;
 	uint32_t	ps = 8192;
 	unsigned char bufa[500];
 	unsigned char bufb[500];
 	unsigned char rback[1024];
+	unsigned char *segment;
 	int			ok;
 
 	fprintf(stderr, "== shipped WAL ==\n");
 	memset(bufa, 0xAA, sizeof(bufa));	/* WAL [1000,1500) */
 	memset(bufb, 0xBB, sizeof(bufb));	/* WAL [1500,2000) */
+	segment = malloc(1024 * 1024);
+	if (segment == NULL)
+	{
+		check(0, "allocate immutable WAL segment test input");
+		return;
+	}
+	for (uint32_t i = 0; i < 1024 * 1024; i++)
+		segment[i] = (unsigned char) (i * 17u + 3u);
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_wal", tmpbase);
@@ -4207,6 +4218,22 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_wal_read(2, 2300, 300, rback) == 200,
 		  "a hole below the branch's own coverage is not double-counted");
 
+	/* The IPC carries at most 256 KiB, while the immutable format seals 1 MiB
+	 * logical segments.  Four acknowledged chunks must assemble one segment,
+	 * and reads switch to that validated representation transparently. */
+	op_create_branch(8, 0, 0);
+	for (uint32_t off = 0; off < 1024 * 1024; off += PS_IO_UNIT)
+		op_wal_append(8, off, segment + off, PS_IO_UNIT);
+	snprintf(immutable_path, sizeof(immutable_path),
+			 "%s/wal_segments_8/walv1_9_%020llu", store, 0ULL);
+	check(stat(immutable_path, &immutable_st) == 0 &&
+		  immutable_st.st_size == 1024 * 1024 + 64,
+		  "chunked WAL shipping publishes one immutable logical segment");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(8, PS_IO_UNIT - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + PS_IO_UNIT - 256, 512) == 0,
+		  "chunked WAL shipping seals and reads an immutable logical segment");
+
 	/* a retry that carries an already-accepted prefix plus new bytes (a
 	 * partially shipped chunk re-sent whole) appends only the uncovered
 	 * suffix -- no duplicate chunk, exact distinct-byte counts */
@@ -4242,6 +4269,11 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	client_attach(shm, ps);
 	check(op_wal_size(0) == 3200, "main WAL end LSN survives daemon restart");
 	check(op_wal_size(1) == 2300, "branch WAL end LSN survives daemon restart");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_size(8) == 1024 * 1024 &&
+		  op_wal_read(8, 700000, sizeof(rback), rback) == sizeof(rback) &&
+		  memcmp(rback, segment + 700000, sizeof(rback)) == 0,
+		  "restart reopens and validates the immutable WAL segment catalog");
 	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
 		  "shipped WAL also closes the idempotent re-create window (post-restart)");
 
@@ -4262,6 +4294,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	stop_daemon(dpid);
 	rm_rf(store);
 	shm_unlink(shm);
+	free(segment);
 }
 
 /*

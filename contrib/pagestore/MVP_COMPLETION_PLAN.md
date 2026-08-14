@@ -25,8 +25,10 @@ Baseline as of 2026-08-14:
 - The durable retention registry is consumed by reader and materializer
   controllers.  Image compaction consumes its exact page-history fences and
   publishes a durable reclamation frontier before retiring sources.
-- Repeated update/compact cycles bound retained page history.  Shipped WAL,
-  WAL-index history, fork metadata, and deleted timelines remain unbounded.
+- Repeated update/compact cycles bound retained page history.  The live WAL
+  path seals validated 1 MiB immutable segments while retaining its flat log
+  as the migration/tail authority.  Shipped WAL, WAL-index history, fork
+  metadata, and deleted timelines remain unbounded.
 - Focused crash tests exist, but the composed fault and persisted-format
   compatibility gates remain open.
 
@@ -273,9 +275,20 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 
 ### R3. Reclaim shipped WAL
 
-Status: **R3a immutable segment/store primitives implemented; integration and
-R3b reclamation remain, with acceptance blocked on the R4 replacement-base
-milestone**.
+Status: **R3a immutable segment/store primitives and live-path integration
+implemented; R3b reclamation remains, with acceptance blocked on the R4
+replacement-base milestone**.
+
+The transition path accepts the existing arbitrary-size archive IPC chunks in
+the flat staging log, seals every complete contiguous segment-aligned 1 MiB
+logical range into an immutable segment, and prefers validated segments for
+reads.  Startup reopens the segment catalog, removes only strictly recognized
+staging orphans,
+validates headers and bounded payload chunks, compares the sealed prefix with
+the still-authoritative flat history, and seals any complete tail missed by a
+pre-publication crash.  R3b may make retained-base metadata authoritative and
+reclaim flat prefixes only after R4 removes their remaining raw-WAL
+dependencies.
 
 The current flat `wal_<timeline>` file does not support simple crash-safe prefix
 deletion.  WAL reclamation must first gain a durable physical base LSN and a
@@ -709,9 +722,10 @@ Alternative: periodically rewrite the flat file.  It minimizes format count but
 causes unbounded copy cost and a larger crash-publication protocol.
 
 Decision: **accepted 2026-08-14**.  Use immutable fixed-size logical WAL
-segments with checksummed metadata and bounded chunk validation.  R3b will
-integrate the segment store into the daemon WAL path and add retained-base
-publication and prefix deletion.
+segments with checksummed metadata and bounded chunk validation.  The segment
+store is integrated into daemon append/read/recovery with the flat log retained
+as migration/tail authority.  R3b will add retained-base publication, read
+pins, segment deletion, and reclamation of the corresponding flat prefix.
 
 ### D4. Timeline deletion with descendants
 
@@ -743,16 +757,15 @@ packaging do not block MVP completion.
 
 The remaining default sequence is:
 
-1. integrate the R3a segment store into shipped-WAL append/read/recovery;
-2. R4 WAL-index compaction/reclamation and replacement bases;
-3. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
-4. R4b forkmeta compaction/reclamation and publication crash tests;
-5. R5 timeline deletion;
-6. R5b reclaimer backpressure controllers;
-7. H0 fault/inspection primitives (may proceed alongside R3/R4);
-8. H1 composed crash scenarios;
-9. H2 format fixtures and compatibility CI;
-10. R6 bounded-space acceptance and final MVP status update.
+1. R4 WAL-index compaction/reclamation and replacement bases;
+2. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
+3. R4b forkmeta compaction/reclamation and publication crash tests;
+4. R5 timeline deletion;
+5. R5b reclaimer backpressure controllers;
+6. H0 fault/inspection primitives (may proceed alongside R3/R4);
+7. H1 composed crash scenarios;
+8. H2 format fixtures and compatibility CI;
+9. R6 bounded-space acceptance and final MVP status update.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base
