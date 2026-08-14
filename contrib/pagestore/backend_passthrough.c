@@ -29,9 +29,11 @@
  * treated as an error.
  */
 static void
-passthrough_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
+passthrough_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
+				   bool isRedoEnsure)
 {
-	mdcreate((SMgrRelation) localreln, (ForkNumber) key->forkNum, isRedo);
+	mdcreate((SMgrRelation) localreln, (ForkNumber) key->forkNum, isRedo,
+			 isRedoEnsure);
 }
 
 /* Report whether the fork's file exists on disk. */

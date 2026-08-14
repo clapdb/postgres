@@ -86,7 +86,8 @@ typedef struct PageStoreBackend
 	/* --- fork lifecycle / metadata --- */
 
 	/* create the fork (make it exist with zero blocks) */
-	void		(*create) (const PageStoreRelKey *key, void *localreln, bool isRedo);
+	void		(*create) (const PageStoreRelKey *key, void *localreln,
+						 bool isRedo, bool isRedoEnsure);
 	/* does the fork exist? */
 	bool		(*fork_exists) (const PageStoreRelKey *key, void *localreln);
 	/* remove the fork entirely */
@@ -197,7 +198,10 @@ extern uint32 pagestore_localsvc_read_epoch(void);
 extern void pagestore_localsvc_adopt_read_view(uint64 read_lsn,
 										   uint64 read_seq, uint32 read_epoch);
 extern bool pagestore_localsvc_read_fence_timeout(uint64 read_lsn,
-											  uint64 *read_seq, int timeout_ms);
+										  uint64 *read_seq, int timeout_ms);
+extern bool pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+													   uint64 read_lsn,
+													   uint64 *read_seq, int timeout_ms);
 extern void pagestore_localsvc_pinned_init(bool localsvc_active);
 
 /* pagestore_control.c: mirror pg_control to the store (write/flush hooks) */

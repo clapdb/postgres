@@ -1966,6 +1966,15 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 								  1, PS_RETENTION_RESOURCE_PAGE_HISTORY,
 								  5000, fence_seq) == PS_STATUS_OK,
 		  "reader refines its provisional pin to the exact admission fence");
+	/* The sequence fence disambiguates mutations only at the boundary LSN.
+	 * An older-LSN page admitted later remains part of that as-of view, first
+	 * in the memtable and later in its image layer. */
+	op_create_at(rel + 3, 0, 4000);
+	fill_page(page, ps, 4000, 79);
+	op_write_one(rel + 3, 0, 0, page);
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN memtable page");
 	for (uint32_t block = 1; block < 16; block++)
 	{
 		fill_page(page, ps, 6000 + block, (unsigned char) block);
@@ -1989,6 +1998,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission fence excludes a later same-LSN layer rewrite");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "admission fence does not exclude a later-admitted older-LSN layer page");
 
 	/* Fork metadata uses the same fence: a same-LSN truncate admitted later
 	 * must not shrink the pinned view. */
@@ -2096,6 +2108,9 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 	op_read_at_seq(rel, 0, 0, 5000, fence_seq, readback);
 	check(page_has_tag(readback, ps, 80),
 		  "admission-fenced same-LSN page survives compaction, GC, and restart");
+	op_read_at_seq(rel + 3, 0, 0, 5000, fence_seq, readback);
+	check(page_has_tag(readback, ps, 79),
+		  "older-LSN page remains visible through admission-fenced recovery");
 	check(op_nblocks_asof_seq(rel + 1, 0, 9000, fork_fence_seq) == 1,
 		  "admission-fenced fork metadata survives restart");
 	op_read_one(rel, 0, 41, readback);
@@ -2179,8 +2194,8 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		  "restart rejects a lower admission fence at the reclaimed frontier LSN");
 	check(op_retention_set_fenced(0, PS_RETENTION_OWNER_READER, 29204, 1,
 								  PS_RETENTION_RESOURCE_PAGE_HISTORY,
-								  13000, 1) == PS_STATUS_ERROR,
-		  "restart rejects a lower admission fence above the frontier LSN");
+								  13000, 1) == PS_STATUS_OK,
+		  "restart accepts a lower admission sequence above the frontier LSN");
 	check(op_create_branch_status(20, 0, 7000) == PS_STATUS_ERROR,
 		  "restart rejects a branch below the durable page reclamation frontier");
 	client_detach();
@@ -2276,6 +2291,136 @@ run_prune_branch_retention_suite(const char *daemon_path, const char *tmpbase)
 	op_read_tl(21, rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 120),
 		  "nested child retains the newest parent page below its lower fork cap");
+
+	client_detach();
+	stop_daemon(pid);
+	rm_rf(store);
+	shm_unlink(shm);
+	free(page);
+	free(readback);
+}
+
+static void
+run_prune_relation_lifecycle_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	uint32_t	rel = find_relation_on_shard(0, test_nshards);
+	unsigned char *page = malloc(ps);
+	unsigned char *readback = malloc(ps);
+	pid_t		pid;
+
+	fprintf(stderr, "== relation-lifecycle page pruning ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_prune_relation", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_prune_relation", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 2200, 1,
+						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 6500) ==
+		  PS_STATUS_OK,
+		  "reader pins relation history before truncate/drop/recreate");
+	op_create_at(rel, 0, 1000);
+	fill_page(page, ps, 1500, 15);
+	op_write_tl(0, rel, 0, 0, page);
+	fill_page(page, ps, 6000, 60);
+	op_write_tl(0, rel, 0, 0, page);
+	op_truncate_at(rel, 0, 0, 7000);
+	op_zeroextend_at(rel, 0, 0, 1, 8000);
+	op_unlink_at(rel, 0, 9000);
+	op_create_at(rel, 0, 10000);
+	/* WAL replay can observe the new CREATE before an older UNLINK.  The
+	 * empty generation must survive even though no new page growth follows it. */
+	op_create_at(rel + test_nshards, 0, 1000);
+	fill_page(page, ps, 6000, 61);
+	op_write_tl(0, rel + test_nshards, 0, 0, page);
+	op_create_at(rel + test_nshards, 0, 10000);
+	op_unlink_at(rel + test_nshards, 0, 9000);
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "create before delayed unlink preserves an empty recreated generation");
+	fill_page(page, ps, 11000, 110);
+	op_write_tl(0, rel, 0, 0, page);
+	for (uint32_t block = 1; block <= 48; block++)
+	{
+		fill_page(page, ps, 12000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	check(wait_for_compacted_layers(store, 3),
+		  "relation-lifecycle history reaches a bounded compacted layer set");
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 2000, readback),
+		  "compaction prunes the obsolete page version below the reader base");
+	check(op_read_at_found(rel, 0, 0, 6500, readback) &&
+		  page_has_tag(readback, ps, 60),
+		  "reader base survives relation compaction and restart");
+	check(op_exists_asof(rel, 0, 6500) && op_nblocks_asof(rel, 0, 6500) == 1,
+		  "pre-truncate relation metadata remains visible at the retained floor");
+	check(op_exists_asof(rel, 0, 7500) && op_nblocks_asof(rel, 0, 7500) == 0,
+		  "truncate remains visible after page pruning");
+	check(!op_read_at_found(rel, 0, 0, 7500, readback),
+		  "truncated interval cannot expose the retained page");
+	check(!op_read_at_found(rel, 0, 0, 8500, readback),
+		  "regrowth cannot revive the pre-truncate page bytes");
+	check(!op_exists_asof(rel, 0, 9500),
+		  "drop remains visible between drop and recreate");
+	check(op_exists_asof(rel, 0, 10500) &&
+		  op_nblocks_asof(rel, 0, 10500) == 0,
+		  "recreated relation is empty before its new generation page");
+	check(!op_read_at_found(rel, 0, 0, 10500, readback),
+		  "empty recreated generation cannot expose the dropped generation page");
+	check(op_exists_asof(rel + test_nshards, 0, 10500) &&
+		  op_nblocks_asof(rel + test_nshards, 0, 10500) == 0,
+		  "empty generation from create-before-unlink survives restart");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "new relation generation remains current after compaction and restart");
+
+	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 2201, 1,
+					   PS_RETENTION_RESOURCE_PAGE_HISTORY, 12000) == PS_STATUS_OK,
+		  "relation lifecycle establishes a durable replacement cutoff");
+	check(op_retention_drop(0, PS_RETENTION_OWNER_READER, 2200, 1) ==
+		  PS_STATUS_OK,
+		  "reader releases relation-lifecycle history");
+	for (uint32_t block = 49; block <= 96; block++)
+	{
+		fill_page(page, ps, 13000 + block, (unsigned char) block);
+		op_write_tl(0, rel, 0, block, page);
+	}
+	{
+		int pruned = 0;
+
+		for (int i = 0; i < 500; i++)
+		{
+			if (!op_read_at_found(rel, 0, 0, 6500, readback))
+			{
+				pruned = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(pruned, "released relation history is compacted again");
+	}
+	client_detach();
+	stop_daemon(pid);
+	shm_unlink(shm);
+	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	check(!op_read_at_found(rel, 0, 0, 6500, readback),
+		  "unprotected pre-truncate page history is durably pruned");
+	op_read_one(rel, 0, 0, readback);
+	check(page_has_tag(readback, ps, 110),
+		  "pruning released history cannot expose an older relation generation");
 
 	client_detach();
 	stop_daemon(pid);
@@ -3382,6 +3527,32 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
 		  "branch truncate remains definitive at newest");
 
+	/* A later regrowth and less-severe shrink cannot erase the older hole in
+	 * inherited storage: block 7 was in the parent at the branch point, but the
+	 * truncate to 2 permanently fenced those bytes on this timeline. */
+	fill_page(p, ps, 8000, 58);
+	op_write_tl(3, REL_B, FORK0, 9, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 8, 9000);
+	check(!op_read_at_tl_found(3, REL_B, FORK0, 7, 9500, rb),
+		  "older branch truncate still fences parent bytes after regrowth");
+
+	/* Arrival order is not version order.  A delayed, older truncate must not
+	 * invalidate a page whose LSN is newer, even though its admission sequence
+	 * was allocated first. */
+	fill_page(p, ps, 10000, 59);
+	op_write_tl(3, REL_B, FORK0, 6, p);
+	op_truncate_at_tl(3, REL_B, FORK0, 2, 9500);
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "delayed older truncate does not invalidate a newer page");
+	{
+		uint32_t current_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(current_nblocks == 7,
+			  "delayed older truncate reconstructs growth from the newer page (got %u)",
+			  current_nblocks);
+	}
+
 	/* Kept event-free locally for the failed WAL-less write test below. */
 	op_create_branch(4, 0, 5000);
 	check(op_nblocks_tl(4, REL_B, FORK0) == 8,
@@ -3427,8 +3598,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 	check(page_has_tag(rb, ps, 51), "branch snapshot view survives restart");
 	check(op_nblocks_asof_tl(3, REL_B, FORK0, 6500) == 10,
 		  "pre-truncate branch-local growth survives restart");
-	check(op_nblocks_tl(3, REL_B, FORK0) == 2,
-		  "branch truncate survives restart");
+	{
+		uint32_t recovered_nblocks = op_nblocks_tl(3, REL_B, FORK0);
+
+		check(recovered_nblocks == 7,
+			  "reconstructed post-truncate growth survives restart (got %u)",
+			  recovered_nblocks);
+	}
+	check(op_read_at_tl_found(3, REL_B, FORK0, 6, 11000, rb) &&
+		  page_has_tag(rb, ps, 59),
+		  "newer page remains readable after delayed-truncate recovery");
 	op_read_at_tl(5, REL_B, FORK0, 0, 5000, rb);
 	check(page_has_tag(rb, ps, 11),
 		  "branch-point copied-page floor survives restart");
@@ -4185,6 +4364,8 @@ main(int argc, char **argv)
 	run_segment_gc_suite(daemon_path, tmpbase);
 	/* Descendant owners and nested fork caps constrain parent page pruning. */
 	run_prune_branch_retention_suite(daemon_path, tmpbase);
+	/* Fork lifecycle metadata must continue to gate pruned page generations. */
+	run_prune_relation_lifecycle_suite(daemon_path, tmpbase);
 	/* Recovery must not reuse a sealed layer file absent from the manifest. */
 	run_orphan_layer_suite(daemon_path, tmpbase);
 	/* Legacy physical shard 0 can feed page indexes on every new logical shard. */

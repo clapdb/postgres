@@ -28,6 +28,7 @@ main(void)
 	PsPruneVersion legacy_ties[] = {{10, 0}, {10, 0}, {20, 1}};
 	PsPruneVersion future_ties[] = {{10, 1}, {20, 0}, {20, 0}, {30, 1}};
 	PsPruneVersion mixed_direction[] = {{10, 5}, {20, 10}};
+	PsPruneVersion late_lower[] = {{6000, 300}, {10000, 250}};
 	PsPruneFence fence[] = {{20, 1}};
 	PsPruneFence zero_fence[] = {{20, 0}};
 	PsPruneFence later_fence[] = {{25, 1}};
@@ -47,16 +48,20 @@ main(void)
 		  !keep[0] && !keep[1] && keep[2] && keep[3] && keep[4],
 		  "operational tuple keeps only its current base");
 	check(ps_page_prune_plan(lower_lsn, 4, (PsPruneFence) {15, 1}, NULL, 0,
-							 keep) == 4 && keep[0] && keep[1] && keep[2] && keep[3],
-		  "frontier admission sequence caps lower-LSN base visibility");
+							 keep) == 3 && !keep[0] && keep[1] && keep[2] && keep[3],
+		  "frontier admission sequence applies only at its boundary LSN");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {10, 1}, NULL, 0, keep) == 5,
 		  "floor at oldest version preserves every tuple above it");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 10}, zero_fence, 1, keep) == 2 &&
 		  keep[2] && keep[4],
 		  "a zero-sequence fence has uncapped admission visibility");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 10}, later_fence, 1, keep) == 2 &&
-		  keep[1] && keep[4],
-		  "a nonzero admission fence constrains versions below its LSN");
+		  keep[2] && keep[4],
+		  "a nonzero admission fence leaves lower-LSN versions uncapped");
+	check(ps_page_prune_plan(late_lower, 2, (PsPruneFence) {11000, 1},
+							 (PsPruneFence[]) {{10000, 200}}, 1, keep) == 2 &&
+		  keep[0] && keep[1],
+		  "discrete fence retains a later-admitted lower-LSN visible page");
 	check(ps_page_prune_plan(versions, 5, (PsPruneFence) {50, 10}, NULL, 0, keep) == 1 && keep[4],
 		  "floor above newest keeps newest base");
 	check(ps_page_prune_plan(legacy_ties, 3, (PsPruneFence) {20, 1}, NULL, 0, keep) == 1 &&

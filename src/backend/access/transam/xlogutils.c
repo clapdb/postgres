@@ -496,7 +496,7 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	 * filesystem loses an inode during a crash.  Better to write the data
 	 * until we are actually told to delete the file.)
 	 */
-	smgrcreate(smgr, forknum, true);
+	smgrcreate_ensure(smgr, forknum);
 
 	lastblock = smgrnblocks(smgr, forknum);
 

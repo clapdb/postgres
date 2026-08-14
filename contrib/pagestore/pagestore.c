@@ -476,11 +476,12 @@ ps_close(SMgrRelation reln, ForkNumber forknum)
 }
 
 static void
-ps_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+ps_create(SMgrRelation reln, ForkNumber forknum, bool isRedo,
+		  bool isRedoEnsure)
 {
 	PageStoreRelKey key = pagestore_key(&reln->smgr_rlocator.locator, forknum);
 
-	ACTIVE()->create(&key, reln, isRedo);
+	ACTIVE()->create(&key, reln, isRedo, isRedoEnsure);
 }
 
 static bool
@@ -879,6 +880,19 @@ pagestore_retention_set(PG_FUNCTION_ARGS)
 			(uint32) generation, (uint32) resources, (uint64) lsn,
 			admission_seq));
 	}
+	/* A checkpoint LSN has one durable admission fence.  Preserve that exact
+	 * fence when a controller pins a reader artifact: reserving a newer
+	 * sequence at the same LSN can make the later reader registration appear
+	 * to move backwards after compaction has reclaimed the older variants.
+	 * Keep reserve-and-set for generic (non-checkpoint) controller horizons. */
+	if (lsn != InvalidXLogRecPtr &&
+		pagestore_localsvc_read_fence_for_timeline_timeout((uint32) timeline,
+			(uint64) lsn, &admission_seq,
+			30000))
+		PG_RETURN_INT32((int32) pagestore_localsvc_retention_set(
+			(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
+			(uint32) generation, (uint32) resources, (uint64) lsn,
+			admission_seq));
 	PG_RETURN_INT32((int32) pagestore_localsvc_retention_reserve_timeout(
 		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
 		(uint32) generation, (uint32) resources, (uint64) lsn,

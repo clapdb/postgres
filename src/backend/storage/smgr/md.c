@@ -220,11 +220,15 @@ mdexists(SMgrRelation reln, ForkNumber forknum)
  * If isRedo is true, it's okay for the relation to exist already.
  */
 void
-mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo,
+		 bool isRedoEnsure)
 {
 	MdfdVec    *mdfd;
 	RelPathStr	path;
 	File		fd;
+
+	/* The local file manager does not distinguish the two redo cases. */
+	(void) isRedoEnsure;
 
 	if (isRedo && reln->md_num_open_segs[forknum] > 0)
 		return;					/* created and opened already... */

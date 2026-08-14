@@ -454,8 +454,9 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
  * admission fence.  Block 2 is versioned by redo itself, so requiring an exact
  * hit prevents an older checkpoint's fence from being used for a newer R. */
 bool
-pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
-									 int timeout_ms)
+pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
+											  uint64 read_lsn, uint64 *read_seq,
+											  int timeout_ms)
 {
 	PageStoreRelKey key = {0};
 	PsAdmissionFence fence;
@@ -466,6 +467,7 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
 	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
+	ch->timeline = timeline;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 2;
 	ch->req_lsn = read_lsn;
@@ -479,6 +481,14 @@ pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
 		return false;
 	*read_seq = fence.admission_seq;
 	return true;
+}
+
+bool
+pagestore_localsvc_read_fence_timeout(uint64 read_lsn, uint64 *read_seq,
+									 int timeout_ms)
+{
+	return pagestore_localsvc_read_fence_for_timeline_timeout(
+		pagestore_localsvc_timeline(), read_lsn, read_seq, timeout_ms);
 }
 
 static uint64
@@ -537,11 +547,40 @@ ls_pinned_read_seq(void)
 static uint64
 ls_op_lsn(void)
 {
-	if (RecoveryInProgress())
+	if (AmStartupProcess())
 		return (uint64) GetCurrentReplayRecPtr(NULL);
 	if (XactLastRecEnd != 0)
 		return (uint64) XactLastRecEnd;
 	return (uint64) Max(XactLastCommitEnd, XactLastAbortEnd);
+}
+
+/* A materializer is writable, not a pinned reader, but during recovery it
+ * must not resolve relation metadata or page bytes beyond the WAL record it
+ * is currently replaying.  Doing so exposes a future CREATE/TRUNCATE and can
+ * make redo attempt an extension against the wrong fork generation. */
+static uint64
+ls_read_lsn(void)
+{
+	if (localsvc_read_lsn != 0)
+		return localsvc_read_lsn;
+	if (RecoveryInProgress())
+	{
+		XLogRecPtr replay;
+
+		/* Only startup is inside rm_redo and may use the in-progress record.
+		 * A hot-standby backend must observe the last completed replay record. */
+		if (!AmStartupProcess())
+			return (uint64) GetXLogReplayRecPtr(NULL);
+		replay = GetCurrentReplayRecPtr(NULL);
+
+		/* Between records the current pointer is invalid, but read-only
+		 * backends can still touch catalogs.  Bound those reads at the last
+		 * completed replay position rather than accidentally using newest. */
+		if (replay == InvalidXLogRecPtr)
+			replay = GetXLogReplayRecPtr(NULL);
+		return (uint64) replay;
+	}
+	return 0;
 }
 
 /*
@@ -549,7 +588,8 @@ ls_op_lsn(void)
  * WAL replay, where re-creating an existing fork must be tolerated.
  */
 static void
-ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
+ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
+		  bool isRedoEnsure)
 {
 	PsChannel  *ch = ls_chan_for_key(key);
 
@@ -559,7 +599,7 @@ ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
-	ch->is_redo = isRedo ? 1 : 0;
+	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
 	ch->req_lsn = ls_op_lsn();
 	ls_exec(ch);
 }
@@ -573,7 +613,7 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return ch->result != 0;
@@ -621,7 +661,8 @@ ls_nblocks(const PageStoreRelKey *key, void *localreln)
 
 	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
+	ch->is_redo = AmStartupProcess() ? 1 : 0;
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 	return (BlockNumber) ch->result;
@@ -671,7 +712,7 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
-		ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+		ch->req_lsn = ls_read_lsn();
 		ch->req_seq = read_seq;
 		ls_exec(ch);
 
@@ -813,7 +854,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
-	ch->req_lsn = localsvc_read_lsn;	/* 0 = newest (the writer path) */
+	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
 	ls_exec(ch);
 
