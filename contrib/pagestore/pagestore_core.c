@@ -3833,7 +3833,7 @@ wal_segment_sync(uint32_t tl)
 	PsWalStore *store;
 	int rc = 0;
 
-	if (wal_segment_open_one(tl) != 0)
+	if (tl >= MAX_TIMELINES || wal_segment_open_one(tl) != 0)
 		return -1;
 	if (!wal_segment_store_opened[tl])
 		return 0;
