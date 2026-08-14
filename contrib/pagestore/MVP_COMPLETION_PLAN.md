@@ -355,6 +355,13 @@ discrete owner/branch chains, and the future tail while failing closed without
 known metadata or an FPI; durable frontier/cutover integration and snapshot
 entry compaction remain**.
 
+Snapshot publication now also exposes an explicit staged boundary: prepare
+writes, checksum-validates, and fsyncs every immutable shard without changing
+the selected manifest; commit revalidates those files and atomically selects
+the generation.  R4 frontier integration can therefore publish its durable
+reclamation fence between prepare and commit, matching the page-compaction
+write-replacement-before-frontier-before-retirement ordering.
+
 R4a publishes every per-shard snapshot as an immutable checksummed file before
 atomically replacing one checksummed timeline manifest.  Recovery validates
 the complete selected generation and never discovers an unpublished partial
@@ -803,3 +810,4 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-14 | Completed R0/R1 owner lifecycle and R2 page pruning; added R3a immutable WAL segment/store primitives | Stacked PRs #177-#191, standalone/integration CI, bounded-churn and publication-crash tests |
 | 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
+| 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |

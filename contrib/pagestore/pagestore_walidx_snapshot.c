@@ -383,6 +383,40 @@ fail:
 }
 
 static int
+published_shard_valid(int directory_fd, const char *name, uint64_t len,
+					uint32_t expected_crc)
+{
+	unsigned char buf[VERIFY_BYTES];
+	struct stat st;
+	uint64_t done = 0;
+	uint32_t crc = 2166136261u;
+	int fd = openat(directory_fd, name,
+					O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+		(uint64_t) st.st_size != len)
+		goto fail;
+	while (done < len)
+	{
+		size_t amount = len - done < sizeof(buf) ?
+			(size_t) (len - done) : sizeof(buf);
+
+		if (read_all_at(fd, buf, amount, done) != 0)
+			goto fail;
+		crc = fnv1a(crc, buf, amount);
+		done += amount;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return crc == expected_crc ? 0 : -1;
+
+fail:
+	if (fd >= 0)
+		close(fd);
+	return -1;
+}
+
+static int
 publish_shard(int directory_fd, uint64_t generation, uint32_t shard,
 			  const PsWalIdxSnapshotInput *input, uint32_t crc)
 {
@@ -516,23 +550,24 @@ publish_manifest(int directory_fd, const unsigned char *encoded, size_t len,
 }
 
 int
-ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
-						   uint64_t generation, uint64_t start_lsn,
-						   uint64_t end_lsn,
-						   const PsWalIdxSnapshotInput *inputs,
-						   uint32_t nshards)
+ps_walidx_snapshot_prepare(PsWalIdxSnapshotPrepared *prepared,
+					   const char *directory, uint32_t timeline,
+					   uint64_t generation, uint64_t start_lsn,
+					   uint64_t end_lsn,
+					   const PsWalIdxSnapshotInput *inputs,
+					   uint32_t nshards)
 {
 	PsWalIdxSnapshotShard shards[PS_WALIDX_SNAPSHOT_MAX_SHARDS];
 	PsWalIdxSnapshot current;
-	unsigned char *manifest;
-	size_t manifest_len;
 	int directory_fd;
 	int rc = -1;
+	int n;
 
-	if (directory == NULL || generation == 0 ||
+	if (prepared == NULL || directory == NULL || generation == 0 ||
 		inputs == NULL || nshards == 0 ||
 		nshards > PS_WALIDX_SNAPSHOT_MAX_SHARDS || end_lsn < start_lsn)
 		return -1;
+	memset(prepared, 0, sizeof(*prepared));
 	for (uint32_t i = 0; i < nshards; i++)
 	{
 		SnapshotCrcCtx ctx = {2166136261u, 0};
@@ -569,7 +604,9 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 			{
 				char name[128];
 
-				if (shard_name(generation, i, name, sizeof(name)) != 0 ||
+				if (current.shards[i].len != shards[i].len ||
+					current.shards[i].crc != shards[i].crc ||
+					shard_name(generation, i, name, sizeof(name)) != 0 ||
 					published_shard_matches(current.directory_fd, name,
 										&inputs[i],
 										shards[i].crc) != 0)
@@ -577,10 +614,7 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 			}
 			ps_walidx_snapshot_close(&current);
 			if (identical)
-			{
-				close(directory_fd);
-				return 0;
-			}
+				goto prepared_ok;
 			goto cleanup;
 		}
 		ps_walidx_snapshot_close(&current);
@@ -609,17 +643,109 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 			}
 		}
 	}
-	manifest = encode_manifest(timeline, generation, start_lsn, end_lsn,
-						   shards, nshards, &manifest_len);
-	if (manifest == NULL)
+
+prepared_ok:
+	n = snprintf(prepared->directory, sizeof(prepared->directory), "%s", directory);
+	if (n < 0 || (size_t) n >= sizeof(prepared->directory))
 		goto cleanup;
-	if (publish_manifest(directory_fd, manifest, manifest_len, generation) == 0)
-		rc = 0;
-	free(manifest);
+	prepared->timeline = timeline;
+	prepared->nshards = nshards;
+	prepared->generation = generation;
+	prepared->start_lsn = start_lsn;
+	prepared->end_lsn = end_lsn;
+	memcpy(prepared->shards, shards, (size_t) nshards * sizeof(shards[0]));
+	rc = 0;
 
 cleanup:
 	close(directory_fd);
 	return rc;
+}
+
+int
+ps_walidx_snapshot_commit(const PsWalIdxSnapshotPrepared *prepared)
+{
+	PsWalIdxSnapshot current;
+	unsigned char *manifest = NULL;
+	size_t manifest_len;
+	int directory_fd;
+	int rc = -1;
+
+	if (prepared == NULL || prepared->directory[0] == '\0' ||
+		prepared->generation == 0 || prepared->nshards == 0 ||
+		prepared->nshards > PS_WALIDX_SNAPSHOT_MAX_SHARDS ||
+		prepared->end_lsn < prepared->start_lsn)
+		return -1;
+	directory_fd = open_directory(prepared->directory, 0);
+	if (directory_fd < 0)
+		return -1;
+	for (uint32_t i = 0; i < prepared->nshards; i++)
+	{
+		char name[128];
+
+		if (shard_name(prepared->generation, i, name, sizeof(name)) != 0 ||
+			published_shard_valid(directory_fd, name, prepared->shards[i].len,
+							 prepared->shards[i].crc) != 0)
+			goto cleanup;
+	}
+	if (faccessat(directory_fd, WALIDX_SNAPSHOT_MANIFEST, F_OK, 0) == 0)
+	{
+		if (ps_walidx_snapshot_open(&current, prepared->directory,
+								 prepared->timeline) != 0)
+			goto cleanup;
+		if (prepared->generation < current.generation ||
+			(prepared->generation > current.generation &&
+			 (prepared->start_lsn < current.start_lsn ||
+			  prepared->end_lsn < current.end_lsn)))
+		{
+			ps_walidx_snapshot_close(&current);
+			goto cleanup;
+		}
+		if (prepared->generation == current.generation)
+		{
+			int identical = current.start_lsn == prepared->start_lsn &&
+				current.end_lsn == prepared->end_lsn &&
+				current.nshards == prepared->nshards;
+
+			for (uint32_t i = 0; identical && i < prepared->nshards; i++)
+				if (current.shards[i].len != prepared->shards[i].len ||
+					current.shards[i].crc != prepared->shards[i].crc)
+					identical = 0;
+			ps_walidx_snapshot_close(&current);
+			rc = identical ? 0 : -1;
+			goto cleanup;
+		}
+		ps_walidx_snapshot_close(&current);
+	}
+	else if (errno != ENOENT)
+		goto cleanup;
+	manifest = encode_manifest(prepared->timeline, prepared->generation,
+						   prepared->start_lsn, prepared->end_lsn,
+						   prepared->shards, prepared->nshards,
+						   &manifest_len);
+	if (manifest != NULL &&
+		publish_manifest(directory_fd, manifest, manifest_len,
+						 prepared->generation) == 0)
+		rc = 0;
+
+cleanup:
+	free(manifest);
+	close(directory_fd);
+	return rc;
+}
+
+int
+ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
+						   uint64_t generation, uint64_t start_lsn,
+						   uint64_t end_lsn,
+						   const PsWalIdxSnapshotInput *inputs,
+						   uint32_t nshards)
+{
+	PsWalIdxSnapshotPrepared prepared;
+
+	if (ps_walidx_snapshot_prepare(&prepared, directory, timeline, generation,
+								 start_lsn, end_lsn, inputs, nshards) != 0)
+		return -1;
+	return ps_walidx_snapshot_commit(&prepared);
 }
 
 static int

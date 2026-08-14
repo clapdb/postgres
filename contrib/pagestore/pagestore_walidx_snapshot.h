@@ -37,6 +37,28 @@ typedef struct PsWalIdxSnapshot
 	PsWalIdxSnapshotShard shards[PS_WALIDX_SNAPSHOT_MAX_SHARDS];
 } PsWalIdxSnapshot;
 
+typedef struct PsWalIdxSnapshotPrepared
+{
+	char		directory[4096];
+	uint32_t	timeline;
+	uint32_t	nshards;
+	uint64_t	generation;
+	uint64_t	start_lsn;
+	uint64_t	end_lsn;
+	PsWalIdxSnapshotShard shards[PS_WALIDX_SNAPSHOT_MAX_SHARDS];
+} PsWalIdxSnapshotPrepared;
+
+/* Write and fsync every immutable shard without changing the selected
+ * generation.  The caller may durably publish a reclamation frontier after
+ * this succeeds and before commit atomically replaces the manifest. */
+extern int ps_walidx_snapshot_prepare(PsWalIdxSnapshotPrepared *prepared,
+									  const char *directory, uint32_t timeline,
+									  uint64_t generation, uint64_t start_lsn,
+									  uint64_t end_lsn,
+									  const PsWalIdxSnapshotInput *shards,
+									  uint32_t nshards);
+extern int ps_walidx_snapshot_commit(const PsWalIdxSnapshotPrepared *prepared);
+
 /* Publish a complete immutable shard generation, then atomically select it.
  * The owning timeline must serialize publishers with its append cutover.  Old
  * generation files deliberately remain available until reader drain and GC. */

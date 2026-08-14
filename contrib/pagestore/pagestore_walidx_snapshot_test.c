@@ -73,6 +73,7 @@ main(void)
 	PsWalIdxSnapshot snapshot;
 	PsWalIdxSnapshot wrong;
 	ProduceCtx streamed;
+	PsWalIdxSnapshotPrepared prepared;
 
 	check(mkdtemp(root) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
@@ -142,13 +143,30 @@ main(void)
 		  snapshot.generation == 1,
 		  "recovery ignores an incomplete unpublished generation");
 	ps_walidx_snapshot_close(&snapshot);
-	check(ps_walidx_snapshot_publish(directory, 0, 2, 500, 900,
+	check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 2, 500, 900,
 								 second, 3) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
+		  snapshot.generation == 1,
+		  "prepare makes every replacement shard durable without selecting it");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_commit(&prepared) == 0 &&
 		  ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
 		  snapshot.generation == 2 && snapshot.start_lsn == 500 &&
 		  snapshot.end_lsn == 900,
-		  "retry completes and atomically selects the next generation");
+		  "commit atomically selects the prepared generation");
 	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_commit(&prepared) == 0,
+		  "an identical staged commit retry is idempotent");
+	check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 3, 900, 1000,
+								 second, 3) == 0,
+		  "prepare another complete unpublished generation");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 directory, 3ULL, 0U);
+	check(pwrite_byte(path, 17, newer0[17] ^ 0xff) == 0 &&
+		  ps_walidx_snapshot_commit(&prepared) != 0,
+		  "commit validates prepared shard durability before cutover");
+	check(pwrite_byte(path, 17, newer0[17]) == 0,
+		  "restore the unpublished generation after validation coverage");
 	check(ps_walidx_snapshot_publish(directory, 0, 1, 100, 500,
 								 first, 3) != 0,
 		  "publication cannot move the durable generation backward");
