@@ -2638,6 +2638,9 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 40),
 		  "restart after %s serves the published newest page", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "restart after %s preserves a page present only in compacted layers", phase);
 	check(!op_read_at_found(rel, 0, 0, 1000, readback),
 		  "restart after %s cannot resurrect pruned source history", phase);
 	for (int i = 0; i < 500 &&
@@ -2659,6 +2662,9 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	op_read_one(rel, 0, 0, readback);
 	check(page_has_tag(readback, ps, 40),
 		  "second restart after %s preserves the recovered compacted layer", phase);
+	op_read_one(rel, 0, 1, readback);
+	check(page_has_tag(readback, ps, 1),
+		  "second restart after %s preserves compacted-layer-only data", phase);
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);

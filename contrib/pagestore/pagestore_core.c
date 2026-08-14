@@ -1848,7 +1848,12 @@ page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 		return 0;
 	frontier = page_reclaimed_frontier[timeline];
 	if (lsn < frontier.lsn &&
-		!page_frontier_structural_fence_active(reader_timeline, timeline, lsn))
+		!((admission_seq == 0 &&
+		   page_frontier_structural_fence_active(reader_timeline, timeline, lsn)) ||
+		  (admission_seq != 0 &&
+		   (ps_retention_page_fence_active(timeline, lsn, admission_seq) ||
+			page_frontier_projected_fence_active(reader_timeline, timeline,
+											lsn, admission_seq)))))
 		return 0;
 	/* Sequence zero is the established uncapped/latest-visible fence. */
 	if (admission_seq != 0 &&
@@ -2754,6 +2759,26 @@ tl_walk_next(TlWalk *w)
 		w->lsn = timelines[w->tl].branch_lsn;
 	w->tl = (uint32_t) timelines[w->tl].parent;
 	return 1;
+}
+
+/* Caller holds map_lock for reading.  A pin on a child must be admissible at
+ * every ancestor position reached by its capped read, not merely at the
+ * child's own frontier. */
+static int
+page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
+						  uint64_t read_seq)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+
+	for (;;)
+	{
+		uint64_t	seq_cap = w.lsn == read_lsn ? read_seq : 0;
+
+		if (!page_frontier_allows(w.tl, reader_timeline, w.lsn, seq_cap))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
 }
 
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
@@ -6159,6 +6184,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret;
 				int			old_found;
 				int			timeline_defined;
+				int			page_history_allowed;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -6184,6 +6210,9 @@ ps_handle_meta(PsChannel *ch)
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
 					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
 					ps_unlock_map();
 					/* An active owner can only advance its own horizon.  Its old
 					 * pin already protected all history needed by the newer view, so
@@ -6191,8 +6220,7 @@ ps_handle_meta(PsChannel *ch)
 					 * frontier is stricter than the new point. */
 					ret = (((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
-							 !page_frontier_allows(tl, tl, pin.lsn,
-													  pin.admission_seq) &&
+							 !page_history_allowed &&
 							 !(old_found == 1 &&
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
@@ -6230,6 +6258,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret = PS_RETENTION_ERROR;
 				int			old_found = 0;
 				int			timeline_defined = 0;
+				int			page_history_allowed = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -6248,11 +6277,14 @@ ps_handle_meta(PsChannel *ch)
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
 					timeline_defined = timelines[tl].defined;
+					page_history_allowed = timeline_defined &&
+						page_frontier_ancestry_allows(tl, pin.lsn,
+							pin.admission_seq);
 					ps_unlock_map();
 					if (timeline_defined &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-						 page_frontier_allows(tl, tl, pin.lsn, pin.admission_seq)))
+						 page_history_allowed))
 						ret = ps_retention_reserve_and_set(&pin);
 				}
 				if (ret == PS_RETENTION_OK)
