@@ -4049,6 +4049,8 @@ static unsigned char walidx_snapshot_reshard_pending[MAX_TIMELINES];
 static struct timespec walidx_snapshot_retry_at[MAX_TIMELINES];
 static uint32_t walidx_snapshot_cursor;
 static unsigned char walidx_snapshot_gc_pending[MAX_TIMELINES];
+static uint32_t walidx_snapshot_gc_cursor;
+static struct timespec walidx_snapshot_gc_retry_at[MAX_TIMELINES];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct WalIdxPublishLock
 {
@@ -4833,13 +4835,23 @@ walidx_snapshot_gc_one(void)
 	int candidate = -1;
 	int rc;
 	char directory[4096];
+	struct timespec now;
 
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if (walidx_snapshot_gc_pending[tl])
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	for (uint32_t step = 0; step < MAX_TIMELINES; step++)
+	{
+		uint32_t tl = (walidx_snapshot_gc_cursor + step) % MAX_TIMELINES;
+		struct timespec retry = walidx_snapshot_gc_retry_at[tl];
+
+		if (walidx_snapshot_gc_pending[tl] &&
+			(now.tv_sec > retry.tv_sec ||
+			 (now.tv_sec == retry.tv_sec && now.tv_nsec >= retry.tv_nsec)))
 		{
 			candidate = (int) tl;
+			walidx_snapshot_gc_cursor = (tl + 1) % MAX_TIMELINES;
 			break;
 		}
+	}
 	if (candidate < 0)
 		return 0;
 	walidx_publish_wrlock();
@@ -4849,7 +4861,16 @@ walidx_snapshot_gc_one(void)
 	else
 		rc = ps_walidx_snapshot_gc(directory, (uint32_t) candidate);
 	if (rc >= 0)
+	{
 		walidx_snapshot_gc_pending[candidate] = 0;
+		memset(&walidx_snapshot_gc_retry_at[candidate], 0,
+			   sizeof(walidx_snapshot_gc_retry_at[candidate]));
+	}
+	else
+	{
+		walidx_snapshot_gc_retry_at[candidate] = now;
+		walidx_snapshot_gc_retry_at[candidate].tv_sec++;
+	}
 	walidx_publish_wrunlock();
 	return rc > 0;
 }
@@ -7985,6 +8006,9 @@ ps_core_open(const char *store_dir)
 	walidx_snapshot_cursor = 0;
 	memset(walidx_snapshot_gc_pending, 0,
 		   sizeof(walidx_snapshot_gc_pending));
+	walidx_snapshot_gc_cursor = 0;
+	memset(walidx_snapshot_gc_retry_at, 0,
+		   sizeof(walidx_snapshot_gc_retry_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 
