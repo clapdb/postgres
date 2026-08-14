@@ -51,6 +51,7 @@
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 #include "pagestore_wal_store.h"
+#include "pagestore_walidx_snapshot.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -3998,6 +3999,10 @@ wal_recover_one(uint32_t tl)
  */
 #define WALIDX_MAGIC	0x57494458	/* "WIDX" */
 #define WALIDX_PROGRESS_MAGIC	0x57495047	/* "WIPG" */
+#define WALIDX_SNAPSHOT_PAYLOAD_MAGIC UINT32_C(0x44534957) /* "WISD" */
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 1
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 64
+#define WALIDX_SNAPSHOT_DEFAULT_TRIGGER (1024u * 1024u)
 
 typedef struct WalIdxLogHdr
 {
@@ -4036,6 +4041,10 @@ static uint64_t walidx_shards_seen[MAX_TIMELINES][2];
 static uint64_t walidx_shards_required[MAX_TIMELINES][2];
 static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
 static uint64_t walidx_shard_offsets_required[MAX_TIMELINES][PS_MAX_CHANNELS];
+static uint64_t walidx_snapshot_generation[MAX_TIMELINES];
+static uint64_t walidx_snapshot_start[MAX_TIMELINES];
+static uint64_t walidx_snapshot_end[MAX_TIMELINES];
+static uint64_t walidx_snapshot_offsets[MAX_TIMELINES][PS_MAX_CHANNELS];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t walidx_publish_lock = PTHREAD_RWLOCK_INITIALIZER;
 static void
@@ -4230,6 +4239,143 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	}
 }
 
+static uint32_t
+walidx_get_le32(const unsigned char *p)
+{
+	return (uint32_t) p[0] | (uint32_t) p[1] << 8 |
+		(uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+}
+
+static uint64_t
+walidx_get_le64(const unsigned char *p)
+{
+	return (uint64_t) walidx_get_le32(p) |
+		(uint64_t) walidx_get_le32(p + 4) << 32;
+}
+
+static void
+walidx_put_le32(unsigned char *p, uint32_t value)
+{
+	for (unsigned int i = 0; i < 4; i++)
+		p[i] = (unsigned char) (value >> (i * 8));
+}
+
+static void
+walidx_put_le64(unsigned char *p, uint64_t value)
+{
+	for (unsigned int i = 0; i < 8; i++)
+		p[i] = (unsigned char) (value >> (i * 8));
+}
+
+static void
+walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
+							  uint32_t tl, uint32_t shard,
+							  uint32_t nrecords, uint64_t generation,
+							  uint64_t start_lsn, uint64_t end_lsn,
+							  uint64_t source_offset)
+{
+	uint32_t crc;
+
+	memset(out, 0, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
+	walidx_put_le32(out + 0, WALIDX_SNAPSHOT_PAYLOAD_MAGIC);
+	walidx_put_le32(out + 4, WALIDX_SNAPSHOT_PAYLOAD_VERSION);
+	walidx_put_le32(out + 8, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
+	walidx_put_le32(out + 12, tl);
+	walidx_put_le32(out + 16, shard);
+	walidx_put_le32(out + 20, nrecords);
+	walidx_put_le64(out + 24, generation);
+	walidx_put_le64(out + 32, start_lsn);
+	walidx_put_le64(out + 40, end_lsn);
+	walidx_put_le64(out + 48, source_offset);
+	crc = fnv(out, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
+	walidx_put_le32(out + 56, crc);
+}
+
+static int
+walidx_snapshot_decode_header(const unsigned char *header, uint32_t tl,
+							  uint32_t shard, uint64_t generation,
+							  uint64_t start_lsn, uint64_t end_lsn,
+							  uint32_t *nrecords, uint64_t *source_offset)
+{
+	unsigned char copy[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
+	uint32_t stored_crc;
+
+	memcpy(copy, header, sizeof(copy));
+	stored_crc = walidx_get_le32(copy + 56);
+	walidx_put_le32(copy + 56, 0);
+	if (walidx_get_le32(copy + 0) != WALIDX_SNAPSHOT_PAYLOAD_MAGIC ||
+		walidx_get_le32(copy + 4) != WALIDX_SNAPSHOT_PAYLOAD_VERSION ||
+		walidx_get_le32(copy + 8) != WALIDX_SNAPSHOT_PAYLOAD_BYTES ||
+		walidx_get_le32(copy + 12) != tl ||
+		walidx_get_le32(copy + 16) != shard ||
+		walidx_get_le64(copy + 24) != generation ||
+		walidx_get_le64(copy + 32) != start_lsn ||
+		walidx_get_le64(copy + 40) != end_lsn ||
+		walidx_get_le32(copy + 60) != 0 || fnv(copy, sizeof(copy)) != stored_crc)
+		return -1;
+	*nrecords = walidx_get_le32(copy + 20);
+	*source_offset = walidx_get_le64(copy + 48);
+	return 0;
+}
+
+static int
+walidx_snapshot_path(uint32_t tl, char *path, size_t path_len)
+{
+	int n = snprintf(path, path_len, "%s/walidx_snapshots_%u",
+				 wal_segment_root, tl);
+
+	return n < 0 || (size_t) n >= path_len ? -1 : 0;
+}
+
+static int
+walidx_snapshot_build_shard(uint32_t tl, uint32_t shard,
+							uint64_t generation, uint64_t start_lsn,
+							uint64_t end_lsn, uint64_t source_offset,
+							unsigned char **data_out, uint64_t *len_out)
+{
+	Shard *s = &g_shards[shard];
+	uint64_t nrecords = 0;
+	uint64_t len;
+	unsigned char *data;
+	WalIdxRec *records;
+	uint64_t pos = 0;
+
+	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+			if (e->timeline == tl)
+				nrecords += (uint64_t) e->n;
+	if (nrecords > UINT32_MAX ||
+		nrecords > (UINT32_MAX - WALIDX_SNAPSHOT_PAYLOAD_BYTES) /
+			sizeof(WalIdxRec))
+		return -1;
+	len = WALIDX_SNAPSHOT_PAYLOAD_BYTES + nrecords * sizeof(WalIdxRec);
+	data = malloc((size_t) len);
+	if (data == NULL)
+		return -1;
+	walidx_snapshot_encode_header(data, tl, shard, (uint32_t) nrecords,
+							  generation, start_lsn, end_lsn, source_offset);
+	records = (WalIdxRec *) (data + WALIDX_SNAPSHOT_PAYLOAD_BYTES);
+	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+			if (e->timeline == tl)
+				for (int i = 0; i < e->n; i++)
+				{
+					WalIdxRec *rec = &records[pos++];
+
+					memset(rec, 0, sizeof(*rec));
+					rec->magic = WALIDX_MAGIC;
+					rec->rec_len = sizeof(*rec);
+					rec->timeline = tl;
+					rec->block = e->block;
+					rec->lsn = e->lsns[i];
+					rec->key = e->key;
+					rec->crc = walidx_rec_crc(rec);
+				}
+	*data_out = data;
+	*len_out = len;
+	return 0;
+}
+
 static int
 walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 						uint32_t nentries)
@@ -4312,10 +4458,225 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 }
 
 static int
+walidx_snapshot_recover(uint32_t tl)
+{
+	PsWalIdxSnapshot snapshot;
+	char directory[4096];
+	char manifest[4096];
+	struct stat st;
+	int n;
+
+	if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
+		return -1;
+	n = snprintf(manifest, sizeof(manifest), "%s/walidx_manifest_v1", directory);
+	if (n < 0 || (size_t) n >= sizeof(manifest))
+		return -1;
+	if (lstat(manifest, &st) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (ps_walidx_snapshot_open(&snapshot, directory, tl) != 0)
+		return -1;
+	if (snapshot.nshards != core_shards() ||
+		snapshot.start_lsn != wal_log_start(tl) ||
+		snapshot.end_lsn > wal_end_read(tl) ||
+		!wal_coverage_advance(tl, snapshot.start_lsn, snapshot.end_lsn))
+		goto fail;
+	for (uint32_t shard = 0; shard < snapshot.nshards; shard++)
+	{
+		unsigned char *data;
+		WalIdxRec *records;
+		uint32_t nrecords;
+		uint64_t source_offset;
+		uint64_t expected_len;
+
+		if (snapshot.shards[shard].len < WALIDX_SNAPSHOT_PAYLOAD_BYTES ||
+			snapshot.shards[shard].len > UINT32_MAX)
+			goto fail;
+		data = malloc((size_t) snapshot.shards[shard].len);
+		if (data == NULL ||
+			ps_walidx_snapshot_read(&snapshot, shard, 0, data,
+								 (uint32_t) snapshot.shards[shard].len) != 0 ||
+			walidx_snapshot_decode_header(data, tl, shard, snapshot.generation,
+									 snapshot.start_lsn, snapshot.end_lsn,
+									 &nrecords, &source_offset) != 0)
+		{
+			free(data);
+			goto fail;
+		}
+		expected_len = WALIDX_SNAPSHOT_PAYLOAD_BYTES +
+			(uint64_t) nrecords * sizeof(WalIdxRec);
+		if (expected_len != snapshot.shards[shard].len)
+		{
+			free(data);
+			goto fail;
+		}
+		records = (WalIdxRec *) (data + WALIDX_SNAPSHOT_PAYLOAD_BYTES);
+		for (uint32_t i = 0; i < nrecords; i++)
+		{
+			WalIdxRec *rec = &records[i];
+
+			if (rec->magic != WALIDX_MAGIC || rec->rec_len != sizeof(*rec) ||
+				rec->timeline != tl || rec->crc != walidx_rec_crc(rec) ||
+				ps_shard_of(&rec->key) != shard)
+			{
+				free(data);
+				goto fail;
+			}
+			walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+		}
+		free(data);
+		walidx_snapshot_offsets[tl][shard] = source_offset;
+		walidx_shard_offsets_seen[tl][shard] = source_offset;
+		walidx_shard_offsets_required[tl][shard] = source_offset;
+		if (source_offset != 0)
+		{
+			walidx_mark_shard(walidx_shards_seen[tl], shard);
+			walidx_mark_shard(walidx_shards_required[tl], shard);
+		}
+	}
+	walidx_snapshot_generation[tl] = snapshot.generation;
+	walidx_snapshot_start[tl] = snapshot.start_lsn;
+	walidx_snapshot_end[tl] = snapshot.end_lsn;
+	walidx_progress[tl] = snapshot.end_lsn;
+	ps_walidx_snapshot_close(&snapshot);
+	return 0;
+
+fail:
+	ps_walidx_snapshot_close(&snapshot);
+	return -1;
+}
+
+static uint64_t
+walidx_snapshot_trigger_bytes(void)
+{
+	const char *value = getenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsigned long long parsed;
+	char *end = NULL;
+
+	if (value == NULL)
+		return WALIDX_SNAPSHOT_DEFAULT_TRIGGER;
+	errno = 0;
+	parsed = strtoull(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0' || parsed == 0)
+		return WALIDX_SNAPSHOT_DEFAULT_TRIGGER;
+	return (uint64_t) parsed;
+}
+
+static uint64_t
+walidx_snapshot_test_max_generation(void)
+{
+	const char *value = getenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	unsigned long long parsed;
+	char *end = NULL;
+
+	if (value == NULL)
+		return UINT64_MAX;
+	errno = 0;
+	parsed = strtoull(value, &end, 10);
+	if (errno != 0 || end == value || *end != '\0')
+		return UINT64_MAX;
+	return (uint64_t) parsed;
+}
+
+static int
+walidx_snapshot_publish_one(void)
+{
+	PsWalIdxSnapshotInput inputs[PS_MAX_CHANNELS];
+	unsigned char *buffers[PS_MAX_CHANNELS] = {0};
+	uint64_t lengths[PS_MAX_CHANNELS];
+	uint64_t offsets[PS_MAX_CHANNELS];
+	uint64_t trigger = walidx_snapshot_trigger_bytes();
+	uint32_t ns = core_shards();
+	int candidate = -1;
+	int rc = 0;
+
+	pthread_mutex_lock(&walidx_meta_lock);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if ((tl == 0 || timelines[tl].defined) &&
+			walidx_progress[tl] > walidx_snapshot_end[tl])
+		{
+			uint64_t tail = 0;
+			int invalid = 0;
+
+			for (uint32_t shard = 0; shard < ns; shard++)
+			{
+				uint64_t seen = walidx_shard_offsets_seen[tl][shard];
+				uint64_t snap = walidx_snapshot_offsets[tl][shard];
+
+				if (seen < snap)
+				{
+					invalid = 1;
+					break;
+				}
+				tail = UINT64_MAX - tail < seen - snap ?
+					UINT64_MAX : tail + seen - snap;
+			}
+			if (!invalid && tail >= trigger)
+			{
+				candidate = (int) tl;
+				break;
+			}
+		}
+	pthread_mutex_unlock(&walidx_meta_lock);
+	if (candidate < 0)
+		return 0;
+
+	pthread_rwlock_wrlock(&walidx_publish_lock);
+	{
+		uint32_t tl = (uint32_t) candidate;
+		uint64_t generation;
+		uint64_t start_lsn;
+		uint64_t end_lsn;
+		uint64_t previous_end;
+		char directory[4096];
+
+		pthread_mutex_lock(&walidx_meta_lock);
+		generation = walidx_snapshot_generation[tl] + 1;
+		start_lsn = walidx_snapshot_generation[tl] != 0 ?
+			walidx_snapshot_start[tl] : wal_log_start(tl);
+		end_lsn = walidx_progress[tl];
+		previous_end = walidx_snapshot_end[tl];
+		for (uint32_t shard = 0; shard < ns; shard++)
+			offsets[shard] = walidx_shard_offsets_seen[tl][shard];
+		pthread_mutex_unlock(&walidx_meta_lock);
+		if (generation == 0 ||
+			generation > walidx_snapshot_test_max_generation() ||
+			start_lsn == UINT64_MAX || end_lsn <= previous_end ||
+			walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
+			goto publish_done;
+		for (uint32_t shard = 0; shard < ns; shard++)
+		{
+			if (walidx_snapshot_build_shard(tl, shard, generation,
+										start_lsn, end_lsn, offsets[shard],
+										&buffers[shard], &lengths[shard]) != 0)
+				goto publish_done;
+			inputs[shard].data = buffers[shard];
+			inputs[shard].len = lengths[shard];
+		}
+		if (ps_walidx_snapshot_publish(directory, tl, generation,
+									start_lsn, end_lsn, inputs, ns) != 0)
+			goto publish_done;
+		pthread_mutex_lock(&walidx_meta_lock);
+		walidx_snapshot_generation[tl] = generation;
+		walidx_snapshot_start[tl] = start_lsn;
+		walidx_snapshot_end[tl] = end_lsn;
+		for (uint32_t shard = 0; shard < ns; shard++)
+			walidx_snapshot_offsets[tl][shard] = offsets[shard];
+		pthread_mutex_unlock(&walidx_meta_lock);
+		rc = 1;
+	}
+
+publish_done:
+	for (uint32_t shard = 0; shard < ns; shard++)
+		free(buffers[shard]);
+	pthread_rwlock_unlock(&walidx_publish_lock);
+	return rc;
+}
+
+static int
 walidx_recover_one(uint32_t tl, uint32_t shard)
 {
-	uint64_t	read_off = 0;
-	uint64_t	good_off = 0;
+	uint64_t	read_off;
+	uint64_t	good_off;
 	unsigned char buf[PS_IO_UNIT];
 	int			used = 0;
 	int			torn = 0;
@@ -4323,6 +4684,15 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 	if (tl >= MAX_TIMELINES || shard >= PS_MAX_CHANNELS ||
 		shard >= core_shards())
 		return -1;
+	read_off = walidx_snapshot_offsets[tl][shard];
+	good_off = read_off;
+	if (read_off != 0)
+	{
+		unsigned char byte;
+
+		if (ps_storage->walidx_read(tl, shard, read_off - 1, &byte, 1) != 1)
+			return -1;
+	}
 	for (;;)
 	{
 		int			n;
@@ -6309,9 +6679,11 @@ ps_handle_meta(PsChannel *ch)
 
 				if (ch->nblocks > 0 && ch->nblocks < (uint32_t) max_out)
 					max_out = (int) ch->nblocks;
+				pthread_rwlock_rdlock(&walidx_publish_lock);
 				n = walidx_get(tl, &ch->key, ch->blocknum, ch->req_lsn,
 								   ch->pad1 != 0, ch->req_seq, ch->parent_timeline,
 								   (PsWalRec *) ch->data, max_out);
+				pthread_rwlock_unlock(&walidx_publish_lock);
 
 				if (n < 0)
 					ch->status = PS_STATUS_ERROR;
@@ -7230,6 +7602,8 @@ ps_core_maintenance(void)
 	 * metadata), so bound this log before considering LSM-only work. */
 	if (ps_retention_should_compact())
 		return ps_retention_compact() == 0;
+	if (walidx_snapshot_publish_one())
+		return 1;
 
 	if (!use_layers)
 		return 0;
@@ -7411,6 +7785,16 @@ ps_core_open(const char *store_dir)
 		strlen(store_dir) >= sizeof(wal_segment_root))
 		return -1;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
+	memset(walidx_progress, 0, sizeof(walidx_progress));
+	memset(walidx_shards_seen, 0, sizeof(walidx_shards_seen));
+	memset(walidx_shards_required, 0, sizeof(walidx_shards_required));
+	memset(walidx_shard_offsets_seen, 0, sizeof(walidx_shard_offsets_seen));
+	memset(walidx_shard_offsets_required, 0,
+		   sizeof(walidx_shard_offsets_required));
+	memset(walidx_snapshot_generation, 0, sizeof(walidx_snapshot_generation));
+	memset(walidx_snapshot_start, 0, sizeof(walidx_snapshot_start));
+	memset(walidx_snapshot_end, 0, sizeof(walidx_snapshot_end));
+	memset(walidx_snapshot_offsets, 0, sizeof(walidx_snapshot_offsets));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 
@@ -7583,6 +7967,8 @@ ps_core_open(const char *store_dir)
 				return -1;
 			}
 			walidx_progress_init(tl, wal_log_start(tl));
+			if (walidx_snapshot_recover(tl) != 0)
+				return -1;
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
 				if (walidx_recover_one(tl, shard) != 0)
 					return -1;

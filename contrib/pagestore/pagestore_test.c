@@ -4322,7 +4322,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "force one WAL-index snapshot generation for recovery coverage");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
@@ -4374,17 +4379,39 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries are queryable in LSN order");
 	{
+		char manifest[512];
+		int visible = 0;
+
+		snprintf(manifest, sizeof(manifest),
+				 "%s/walidx_snapshots_0/walidx_manifest_v1", store);
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			if (access(manifest, F_OK) == 0)
+			{
+				visible = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(visible, "maintenance publishes a live WAL-index snapshot");
+	}
+	/* This is deliberately newer than the test-capped snapshot generation, so
+	 * restart must combine the immutable image with the original log tail. */
+	op_walidx_add(0, REL_A, FORK0, 9, 400);
+	check(op_walidx_progress(0, 350, 512, NULL) == 0,
+		  "WAL-index progress advances beyond the snapshot generation");
+	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "WAL index progress reports the committed end");
 		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
 			  "WAL index progress rejects an out-of-range timeline");
 		op_wal_append(0, high, wal, 16);
-		check(op_walidx_progress(0, 350, high + 16, &progress) != 0,
+		check(op_walidx_progress(0, 512, high + 16, &progress) != 0,
 			  "WAL index progress rejects a marker crossing unshipped WAL");
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "rejected WAL index progress leaves the committed end unchanged");
 		op_create_branch(2, 0, 0);
 		op_wal_append(2, high, wal, 16);
@@ -4422,11 +4449,14 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries survive daemon restart");
+	n = op_walidx_get(0, REL_A, FORK0, 9, 1000000, out);
+	check(n == 1 && out[0].lsn == 400,
+		  "restart replays the WAL-index log tail after the snapshot offset");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "WAL index progress survives daemon restart");
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
