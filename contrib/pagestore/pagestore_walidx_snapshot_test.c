@@ -11,6 +11,29 @@
 static int run;
 static int failed;
 
+typedef struct ProduceCtx
+{
+	const unsigned char *data;
+	size_t len;
+} ProduceCtx;
+
+static int
+produce_fragmented(void *arg, PsWalIdxSnapshotConsume consume,
+				   void *consume_arg)
+{
+	ProduceCtx *ctx = arg;
+
+	for (size_t off = 0; off < ctx->len;)
+	{
+		size_t amount = ctx->len - off < 17 ? ctx->len - off : 17;
+
+		if (consume(consume_arg, ctx->data + off, amount) != 0)
+			return -1;
+		off += amount;
+	}
+	return 0;
+}
+
 static void
 check(int condition, const char *name)
 {
@@ -49,6 +72,7 @@ main(void)
 	PsWalIdxSnapshotInput second[3];
 	PsWalIdxSnapshot snapshot;
 	PsWalIdxSnapshot wrong;
+	ProduceCtx streamed;
 
 	check(mkdtemp(root) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
@@ -57,9 +81,14 @@ main(void)
 		shard1[i] = (unsigned char) (i * 5u + 2u);
 	memcpy(newer0, shard0, sizeof(newer0));
 	newer0[100] ^= 0x5a;
-	first[0] = (PsWalIdxSnapshotInput) {shard0, sizeof(shard0)};
-	first[1] = (PsWalIdxSnapshotInput) {shard1, sizeof(shard1)};
-	first[2] = (PsWalIdxSnapshotInput) {NULL, 0};
+	first[0] = (PsWalIdxSnapshotInput) {.data = shard0, .len = sizeof(shard0)};
+	streamed = (ProduceCtx) {shard1, sizeof(shard1)};
+	first[1] = (PsWalIdxSnapshotInput) {
+		.len = sizeof(shard1),
+		.produce = produce_fragmented,
+		.produce_arg = &streamed
+	};
+	first[2] = (PsWalIdxSnapshotInput) {.data = NULL, .len = 0};
 	memcpy(second, first, sizeof(second));
 	second[0].data = newer0;
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
@@ -103,6 +132,11 @@ main(void)
 										  &next_generation) == 0 &&
 			  next_generation == 3,
 			  "generation allocation skips immutable publication debris");
+		check(ps_walidx_snapshot_discard_generation(directory, 0, 2, 3) == 0 &&
+			  ps_walidx_snapshot_next_generation(directory, 1,
+											  &next_generation) == 0 &&
+			  next_generation == 2,
+			  "failed publication cleanup bounds immutable debris");
 	}
 	check(ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
 		  snapshot.generation == 1,

@@ -25,6 +25,8 @@
 #define WALIDX_SNAPSHOT_MANIFEST "walidx_manifest_v1"
 #define VERIFY_BYTES (64u * 1024u)
 
+static int open_directory(const char *directory, int create);
+
 static uint32_t
 fnv1a(uint32_t hash, const void *data, size_t len)
 {
@@ -170,6 +172,53 @@ ps_walidx_snapshot_next_generation(const char *directory,
 	return 0;
 }
 
+int
+ps_walidx_snapshot_discard_generation(const char *directory, uint32_t timeline,
+									  uint64_t generation, uint32_t nshards)
+{
+	PsWalIdxSnapshot current;
+	int directory_fd;
+	int manifest_exists;
+
+	if (directory == NULL || generation == 0 || nshards == 0 ||
+		nshards > PS_WALIDX_SNAPSHOT_MAX_SHARDS)
+		return -1;
+	directory_fd = open_directory(directory, 0);
+	if (directory_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	manifest_exists = faccessat(directory_fd, WALIDX_SNAPSHOT_MANIFEST,
+								 F_OK, 0) == 0;
+	if (!manifest_exists && errno != ENOENT)
+		goto fail;
+	if (manifest_exists)
+	{
+		if (ps_walidx_snapshot_open(&current, directory, timeline) != 0)
+			goto fail;
+		if (current.generation == generation)
+		{
+			ps_walidx_snapshot_close(&current);
+			close(directory_fd);
+			return 1;
+		}
+		ps_walidx_snapshot_close(&current);
+	}
+	for (uint32_t shard = 0; shard < nshards; shard++)
+	{
+		char name[128];
+
+		if (shard_name(generation, shard, name, sizeof(name)) != 0 ||
+			(unlinkat(directory_fd, name, 0) != 0 && errno != ENOENT))
+			goto fail;
+	}
+	if (fsync(directory_fd) != 0 || close(directory_fd) != 0)
+		return -1;
+	return 0;
+
+fail:
+	close(directory_fd);
+	return -1;
+}
+
 static int
 open_directory(const char *directory, int create)
 {
@@ -199,34 +248,95 @@ open_directory(const char *directory, int create)
 }
 
 static int
-published_shard_matches(int directory_fd, const char *name,
-						const void *data, uint64_t len, uint32_t crc)
+input_emit(const PsWalIdxSnapshotInput *input,
+		   PsWalIdxSnapshotConsume consume, void *consume_arg)
 {
+	if (input->produce != NULL)
+		return input->data == NULL ?
+			input->produce(input->produce_arg, consume, consume_arg) : -1;
+	if (input->data == NULL && input->len != 0)
+		return -1;
+	if (input->len > (uint64_t) SIZE_MAX)
+		return -1;
+	return consume(consume_arg, input->data, (size_t) input->len);
+}
+
+typedef struct SnapshotCrcCtx
+{
+	uint32_t crc;
+	uint64_t len;
+} SnapshotCrcCtx;
+
+static int
+consume_crc(void *arg, const void *data, size_t len)
+{
+	SnapshotCrcCtx *ctx = arg;
+
+	if (UINT64_MAX - ctx->len < len)
+		return -1;
+	ctx->crc = fnv1a(ctx->crc, data, len);
+	ctx->len += len;
+	return 0;
+}
+
+static int
+consume_write(void *arg, const void *data, size_t len)
+{
+	int fd = *(int *) arg;
+
+	return write_all(fd, data, len);
+}
+
+typedef struct SnapshotCompareCtx
+{
+	int fd;
+	uint64_t offset;
+	uint32_t crc;
+} SnapshotCompareCtx;
+
+static int
+consume_compare(void *arg, const void *data, size_t len)
+{
+	SnapshotCompareCtx *ctx = arg;
 	unsigned char buf[VERIFY_BYTES];
 	const unsigned char *expected = data;
+	size_t done = 0;
+
+	while (done < len)
+	{
+		size_t amount = len - done < sizeof(buf) ? len - done : sizeof(buf);
+
+		if (read_all_at(ctx->fd, buf, amount, ctx->offset) != 0 ||
+			memcmp(buf, expected + done, amount) != 0)
+			return -1;
+		ctx->crc = fnv1a(ctx->crc, buf, amount);
+		ctx->offset += amount;
+		done += amount;
+	}
+	return 0;
+}
+
+static int
+published_shard_matches(int directory_fd, const char *name,
+						const PsWalIdxSnapshotInput *input, uint32_t crc)
+{
+	SnapshotCompareCtx ctx;
 	struct stat st;
-	uint64_t done = 0;
-	uint32_t actual_crc = 2166136261u;
 	int fd = openat(directory_fd, name,
 					O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
 
 	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
-		(uint64_t) st.st_size != len)
+		(uint64_t) st.st_size != input->len)
 		goto fail;
-	while (done < len)
-	{
-		size_t amount = len - done < sizeof(buf) ?
-			(size_t) (len - done) : sizeof(buf);
-
-		if (read_all_at(fd, buf, amount, done) != 0 ||
-			memcmp(buf, expected + done, amount) != 0)
-			goto fail;
-		actual_crc = fnv1a(actual_crc, buf, amount);
-		done += amount;
-	}
+	ctx.fd = fd;
+	ctx.offset = 0;
+	ctx.crc = 2166136261u;
+	if (input_emit(input, consume_compare, &ctx) != 0 ||
+		ctx.offset != input->len || ctx.crc != crc)
+		goto fail;
 	if (close(fd) != 0)
 		return -1;
-	return actual_crc == crc ? 0 : -1;
+	return 0;
 
 fail:
 	if (fd >= 0)
@@ -236,7 +346,7 @@ fail:
 
 static int
 publish_shard(int directory_fd, uint64_t generation, uint32_t shard,
-			  const void *data, uint64_t len, uint32_t crc)
+			  const PsWalIdxSnapshotInput *input, uint32_t crc)
 {
 	char final_name[128];
 	char temporary[160];
@@ -259,7 +369,7 @@ publish_shard(int directory_fd, uint64_t generation, uint32_t shard,
 	}
 	if (fd < 0)
 		return -1;
-	if (write_all(fd, data, len) != 0 || fsync(fd) != 0)
+	if (input_emit(input, consume_write, &fd) != 0 || fsync(fd) != 0)
 	{
 		close(fd);
 		fd = -1;
@@ -275,7 +385,7 @@ publish_shard(int directory_fd, uint64_t generation, uint32_t shard,
 	{
 		if (errno != EEXIST ||
 			published_shard_matches(directory_fd, final_name,
-								data, len, crc) != 0)
+								input, crc) != 0)
 			goto cleanup;
 	}
 	if (unlinkat(directory_fd, temporary, 0) != 0 || fsync(directory_fd) != 0)
@@ -387,13 +497,16 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 		return -1;
 	for (uint32_t i = 0; i < nshards; i++)
 	{
-		if ((inputs[i].data == NULL && inputs[i].len != 0) ||
-			inputs[i].len > (uint64_t) SIZE_MAX ||
-			inputs[i].len > (uint64_t) INT64_MAX)
+		SnapshotCrcCtx ctx = {2166136261u, 0};
+
+		if ((inputs[i].data != NULL && inputs[i].produce != NULL) ||
+			(inputs[i].data == NULL && inputs[i].produce == NULL &&
+			 inputs[i].len != 0) || inputs[i].len > (uint64_t) INT64_MAX ||
+			input_emit(&inputs[i], consume_crc, &ctx) != 0 ||
+			ctx.len != inputs[i].len)
 			return -1;
 		shards[i].len = inputs[i].len;
-		shards[i].crc = fnv1a(2166136261u, inputs[i].data,
-								(size_t) inputs[i].len);
+		shards[i].crc = ctx.crc;
 	}
 	directory_fd = open_directory(directory, 1);
 	if (directory_fd < 0)
@@ -420,7 +533,7 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 
 				if (shard_name(generation, i, name, sizeof(name)) != 0 ||
 					published_shard_matches(current.directory_fd, name,
-										inputs[i].data, inputs[i].len,
+										&inputs[i],
 										shards[i].crc) != 0)
 					identical = 0;
 			}
@@ -440,8 +553,8 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 		goto cleanup;
 	for (uint32_t i = 0; i < nshards; i++)
 	{
-		if (publish_shard(directory_fd, generation, i, inputs[i].data,
-						  inputs[i].len, shards[i].crc) != 0)
+		if (publish_shard(directory_fd, generation, i, &inputs[i],
+						  shards[i].crc) != 0)
 			goto cleanup;
 		{
 			const char *fail_after = getenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");

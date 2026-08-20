@@ -1,14 +1,22 @@
 #ifndef PAGESTORE_WALIDX_SNAPSHOT_H
 #define PAGESTORE_WALIDX_SNAPSHOT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define PS_WALIDX_SNAPSHOT_MAX_SHARDS 128
+
+typedef int (*PsWalIdxSnapshotConsume)(void *arg, const void *data, size_t len);
+typedef int (*PsWalIdxSnapshotProduce)(void *arg,
+									  PsWalIdxSnapshotConsume consume,
+									  void *consume_arg);
 
 typedef struct PsWalIdxSnapshotInput
 {
 	const void *data;
 	uint64_t	len;
+	PsWalIdxSnapshotProduce produce;
+	void	   *produce_arg;
 } PsWalIdxSnapshotInput;
 
 typedef struct PsWalIdxSnapshotShard
@@ -41,6 +49,11 @@ extern int ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 extern int ps_walidx_snapshot_next_generation(const char *directory,
 										   uint64_t selected_generation,
 										   uint64_t *generation_out);
+/* Remove one failed, unselected publication; return 1 if it was selected. */
+extern int ps_walidx_snapshot_discard_generation(const char *directory,
+											 uint32_t timeline,
+											 uint64_t generation,
+											 uint32_t nshards);
 /* Open only the generation named by the durable manifest and validate every shard. */
 extern int ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot,
 								   const char *directory,
