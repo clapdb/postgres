@@ -40,6 +40,24 @@ typedef struct PsFaultState
 static PsFaultState fault = {0, 0, PS_FAULT_POINT_INVALID, 0, 0, -1};
 
 static int
+write_all(int fd, const char *buffer, size_t length)
+{
+	size_t written = 0;
+
+	while (written < length)
+	{
+		ssize_t result = write(fd, buffer + written, length - written);
+
+		if (result < 0 && errno == EINTR)
+			continue;
+		if (result <= 0)
+			return -1;
+		written += (size_t) result;
+	}
+	return 0;
+}
+
+static int
 component_prefix(const char *a, const char *b)
 {
 	size_t n = strlen(a);
@@ -206,6 +224,7 @@ ps_fault_probe(PsFaultPoint point)
 {
 	uint64_t observed;
 	int fd;
+	int report_ok = 0;
 	char line[256];
 	int n;
 	struct stat st;
@@ -234,11 +253,14 @@ ps_fault_probe(PsFaultPoint point)
 				"{\"schema\":1,\"name\":\"%s\",\"action\":\"crash\","
 				"\"hit\":%llu,\"pid\":%ld}\n", ps_fault_name(point),
 				(unsigned long long) fault.target_hit, (long) getpid());
-		if (n > 0 && (size_t) n < sizeof(line))
-			(void) write(fd, line, (size_t) n);
+		if (n > 0 && (size_t) n < sizeof(line) &&
+			write_all(fd, line, (size_t) n) == 0)
+			report_ok = 1;
 	}
 	if (fd >= 0)
 		close(fd);
+	if (!report_ok)
+		_exit(89);
 	_exit(88);
 }
 

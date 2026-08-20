@@ -132,6 +132,27 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "requires hit=1"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+    def test_named_fault_rejects_nonfinite_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-recovery", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "crash", "hit": 1, "timeout": float("inf"),
+            },
+        ])
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("Infinity", "1e309"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "finite and positive"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
     def test_fault_marker_is_created_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "arm"
@@ -243,6 +264,44 @@ class PlanValidationTests(unittest.TestCase):
         )
         self.assertEqual(first_stop["returncode"], 88)
         self.assertFalse((root / "fault-control").exists())
+
+    def test_fault_failure_bundle_contains_inspection_schema_for_rerun(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        inspection_schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        plan = MODULE.read_plan(ROOT / "scenarios" / "daemon_fault_recovery.jsonl")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name) / "failure"
+
+        class FakeProcess:
+            pid = 701
+            returncode = 88
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with (
+            mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()),
+            mock.patch.object(MODULE, "remove_shm"),
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "failure bundle"):
+                MODULE.run_daemon_fault_recovery(
+                    plan, capabilities, inspection_schema,
+                    Path("daemon"), Path("inspect"), root, True,
+                    ROOT / "capabilities.json",
+                )
+
+        metadata = json.loads((root / "failure.json").read_text(encoding="utf-8"))
+        bundled_schema = root / "inspection_schema.json"
+        self.assertEqual(
+            json.loads(bundled_schema.read_text(encoding="utf-8")), inspection_schema
+        )
+        schema_index = metadata["command"].index("--inspection-schema")
+        self.assertEqual(metadata["command"][schema_index + 1], str(bundled_schema))
+        self.assertEqual(metadata["inspection_schema"], str(bundled_schema))
 
     def test_fault_report_rejects_extra_fields_and_multiple_lines(self):
         with tempfile.TemporaryDirectory() as temporary:

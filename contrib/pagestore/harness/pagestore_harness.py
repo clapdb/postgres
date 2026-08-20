@@ -11,6 +11,7 @@ import argparse
 import ctypes
 import errno
 import json
+import math
 import os
 import re
 import shlex
@@ -906,8 +907,13 @@ def validate_plan(
                 raise PlanError(f"{action_context}: steps must be a positive integer")
         if operation == "crash" and "timeout" in action:
             timeout = action["timeout"]
-            if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
-                raise PlanError(f"{action_context}: timeout must be positive")
+            if (
+                not isinstance(timeout, (int, float))
+                or isinstance(timeout, bool)
+                or not math.isfinite(timeout)
+                or timeout <= 0
+            ):
+                raise PlanError(f"{action_context}: timeout must be finite and positive")
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
@@ -1241,6 +1247,11 @@ def run_daemon_fault_recovery(
     bundle_capabilities.write_text(
         json.dumps(bundle_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    bundle_inspection_schema = root / "inspection_schema.json"
+    bundle_inspection_schema.write_text(
+        json.dumps(inspection_schema, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     events = EventLog(trace / "events.jsonl")
     scenario = plan.header["scenario"]
     seed = plan.header["seed"]
@@ -1417,10 +1428,12 @@ def run_daemon_fault_recovery(
             "plan": str(root / "plan.jsonl"),
             "capabilities": str(bundle_capabilities),
             "catalog": str(bundle_catalog),
+            "inspection_schema": str(bundle_inspection_schema),
             "binaries": {"daemon": str(daemon), "inspector": str(inspector)},
             "command": [
                 sys.executable, str(Path(__file__).resolve()),
                 "--capabilities", str(bundle_capabilities),
+                "--inspection-schema", str(bundle_inspection_schema),
                 "--daemon-fault-recovery", str(root / "plan.jsonl"),
                 "--daemon-binary", str(daemon), "--inspect-binary", str(inspector),
                 "--run-root", str(root.parent / f"{root.name}.rerun"), "--keep",
