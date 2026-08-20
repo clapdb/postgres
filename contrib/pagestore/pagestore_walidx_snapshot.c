@@ -771,8 +771,13 @@ ps_walidx_snapshot_abort(const PsWalIdxSnapshotPrepared *prepared)
 			(unlinkat(directory_fd, name, 0) != 0 && errno != ENOENT))
 			goto fail;
 	}
-	if (fsync(directory_fd) != 0 || close(directory_fd) != 0)
-		return -1;
+	{
+		int sync_rc = fsync(directory_fd);
+		int close_rc = close(directory_fd);
+
+		if (sync_rc != 0 || close_rc != 0)
+			return -1;
+	}
 	return 0;
 
 fail:
