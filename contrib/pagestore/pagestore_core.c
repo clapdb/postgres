@@ -4822,6 +4822,7 @@ walidx_snapshot_publish_one(void)
 publish_done:
 	if (retry && candidate >= 0)
 	{
+		clock_gettime(CLOCK_MONOTONIC, &now);
 		walidx_snapshot_retry_at[candidate] = now;
 		walidx_snapshot_retry_at[candidate].tv_sec++;
 	}

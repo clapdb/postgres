@@ -257,6 +257,36 @@ parse_shard_name(const char *name, uint64_t *generation_out)
 }
 
 static int
+parse_shard_temp_name(const char *name)
+{
+	const char *marker = strstr(name, ".tmp.");
+	char final_name[128];
+	uint64_t generation;
+	const char *p;
+	size_t final_len;
+
+	if (marker == NULL || strstr(marker + 1, ".tmp.") != NULL)
+		return -1;
+	final_len = (size_t) (marker - name);
+	if (final_len == 0 || final_len >= sizeof(final_name))
+		return -1;
+	memcpy(final_name, name, final_len);
+	final_name[final_len] = '\0';
+	if (parse_shard_name(final_name, &generation) != 0)
+		return -1;
+	p = marker + strlen(".tmp.");
+	if (*p < '0' || *p > '9')
+		return -1;
+	while (*p >= '0' && *p <= '9')
+		p++;
+	if (*p++ != '.' || *p < '0' || *p > '9')
+		return -1;
+	while (*p >= '0' && *p <= '9')
+		p++;
+	return *p == '\0' ? 0 : -1;
+}
+
+static int
 open_directory(const char *directory, int create)
 {
 	int directory_fd;
@@ -774,8 +804,9 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 		uint64_t generation;
 		char (*grown)[128];
 
-		if (parse_shard_name(entry->d_name, &generation) != 0 ||
-			generation >= current.generation)
+		if (parse_shard_temp_name(entry->d_name) != 0 &&
+			(parse_shard_name(entry->d_name, &generation) != 0 ||
+			 generation >= current.generation))
 			continue;
 		if (count == capacity)
 		{

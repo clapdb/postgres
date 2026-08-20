@@ -160,6 +160,14 @@ main(void)
 								 second, 3) != 0,
 		  "leave a newer unpublished shard for publication retry");
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
+			 directory, 4ULL, 0U, 123U, 0U);
+	{
+		int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+		check(fd >= 0 && close(fd) == 0,
+			  "create crash-left snapshot temporary file");
+	}
 	check(setenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC", "1", 1) == 0 &&
 		  ps_walidx_snapshot_gc(directory, 0) != 0,
 		  "generation GC reports a directory sync failure after unlinking");
@@ -175,6 +183,10 @@ main(void)
 			 directory, 3ULL, 0U);
 	check(access(path, F_OK) == 0,
 		  "generation GC preserves newer unpublished retry state");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
+			 directory, 4ULL, 0U, 123U, 0U);
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "generation GC removes crash-left snapshot temporaries");
 	check(ps_walidx_snapshot_gc(directory, 0) != 0,
 		  "generation GC retry still syncs after prior unlinks disappeared");
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC");

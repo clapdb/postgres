@@ -41,15 +41,6 @@
 #define MAX_BLOCKS	128
 #define MAINTENANCE_CHECK_NS	100000000L	/* 100ms */
 
-static uint64_t
-monotonic_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
-}
-
 static volatile sig_atomic_t stop_requested = 0;
 static pthread_rwlock_t core_rwlock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *daemon_hdr = NULL;
@@ -455,7 +446,6 @@ shard_worker(void *arg)
 	void	   *shm = wa->shm;
 	uint32_t	nchannels = wa->nchannels;
 	uint32_t	nshards = wa->nshards;
-	uint64_t	next_maintenance = monotonic_ns();
 
 	if (ps_spdk_thread_init(shard) != 0)
 	{
@@ -481,19 +471,6 @@ shard_worker(void *arg)
 		if (ps_spdk_poll(shard) > 0)
 			did_work = 1;
 
-		if (shard == 0)
-		{
-			uint64_t	now = monotonic_ns();
-
-			if (now >= next_maintenance)
-			{
-				next_maintenance = now + MAINTENANCE_CHECK_NS;
-				/* With use_layers=0 this runs shared retention and WAL-index
-				 * maintenance, then returns before POSIX-only LSM work. */
-				did_work |= ps_core_maintenance();
-			}
-		}
-
 		if (!did_work)
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
@@ -502,6 +479,23 @@ shard_worker(void *arg)
 		}
 	}
 	ps_spdk_thread_close(shard);
+	return NULL;
+}
+
+static void *
+maintenance_worker(void *arg)
+{
+	(void) arg;
+
+	while (!stop_requested)
+	{
+		if (!ps_core_maintenance())
+		{
+			struct timespec ts = {0, MAINTENANCE_CHECK_NS};
+
+			nanosleep(&ts, NULL);
+		}
+	}
 	return NULL;
 }
 
@@ -609,7 +603,9 @@ main(int argc, char **argv)
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
 		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		pthread_t	maintenance;
 		uint32_t	started = 0;
+		int			maintenance_started = 0;
 
 		if (!workers || !threads)
 		{
@@ -634,9 +630,21 @@ main(int argc, char **argv)
 			}
 			started++;
 		}
+		if (started == hdr->nshards)
+		{
+			if (pthread_create(&maintenance, NULL, maintenance_worker, NULL) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon_spdk: failed to start maintenance worker\n");
+				stop_requested = 1;
+			}
+			else
+				maintenance_started = 1;
+		}
 
 		for (uint32_t shard = 0; shard < started; shard++)
 			pthread_join(threads[shard], NULL);
+		if (maintenance_started)
+			pthread_join(maintenance, NULL);
 
 		free(workers);
 		free(threads);
