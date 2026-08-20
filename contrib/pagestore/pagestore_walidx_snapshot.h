@@ -37,6 +37,10 @@ extern int ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 									  uint64_t end_lsn,
 									  const PsWalIdxSnapshotInput *shards,
 									  uint32_t nshards);
+/* Allocate above both the selected generation and immutable publication debris. */
+extern int ps_walidx_snapshot_next_generation(const char *directory,
+										   uint64_t selected_generation,
+										   uint64_t *generation_out);
 /* Open only the generation named by the durable manifest and validate every shard. */
 extern int ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot,
 								   const char *directory,

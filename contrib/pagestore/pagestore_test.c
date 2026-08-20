@@ -2970,6 +2970,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
 	char		store[256];
+	char		snapshot_path[512];
 	const uint32_t ps = 8192;
 	uint32_t	rel = find_relation_on_shard(1, 4);
 	unsigned char wal[512] = {0};
@@ -2985,13 +2986,26 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 
 	check(rel != 0, "test harness can find a relation that moves to shard 1");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "force a legacy one-shard WAL-index snapshot");
 	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
 	op_walidx_add(0, rel, 0, 0, 320);
 	check(op_walidx_progress(0, 0, 350, &progress) == 0,
 		  "single-shard WAL-index progress commits before reshard");
+	snprintf(snapshot_path, sizeof(snapshot_path),
+			 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+			 store, 1ULL, 0U);
+	for (int attempt = 0; attempt < 500 &&
+		 access(snapshot_path, F_OK) != 0; attempt++)
+		usleep(10000);
+	check(access(snapshot_path, F_OK) == 0,
+		  "single-shard store publishes a WAL-index snapshot before reshard");
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);
@@ -3004,6 +3018,14 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 		  "reshard replays legacy physical shard-zero WAL-index record");
 	check(op_walidx_progress(0, 350, 400, &progress) == 0,
 		  "post-reshard progress keeps legacy WAL-index ownership physical");
+	snprintf(snapshot_path, sizeof(snapshot_path),
+			 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+			 store, 2ULL, 3U);
+	for (int attempt = 0; attempt < 500 &&
+		 access(snapshot_path, F_OK) != 0; attempt++)
+		usleep(10000);
+	check(access(snapshot_path, F_OK) == 0,
+		  "reshard republishes the snapshot in the current shard layout");
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);

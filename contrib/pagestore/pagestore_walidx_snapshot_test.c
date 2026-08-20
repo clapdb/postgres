@@ -96,6 +96,14 @@ main(void)
 								 second, 3) != 0,
 		  "fault before manifest publication leaves generation one selected");
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+	{
+		uint64_t next_generation = 0;
+
+		check(ps_walidx_snapshot_next_generation(directory, 1,
+										  &next_generation) == 0 &&
+			  next_generation == 3,
+			  "generation allocation skips immutable publication debris");
+	}
 	check(ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
 		  snapshot.generation == 1,
 		  "recovery ignores an incomplete unpublished generation");

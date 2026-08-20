@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -116,6 +117,57 @@ shard_name(uint64_t generation, uint32_t shard, char *name, size_t name_len)
 				 (unsigned long long) generation, shard);
 
 	return n < 0 || (size_t) n >= name_len ? -1 : 0;
+}
+
+int
+ps_walidx_snapshot_next_generation(const char *directory,
+								   uint64_t selected_generation,
+								   uint64_t *generation_out)
+{
+	static const char prefix[] = "walidxg1_";
+	struct dirent *entry;
+	DIR *dir;
+	uint64_t highest = selected_generation;
+
+	if (directory == NULL || generation_out == NULL ||
+		selected_generation == UINT64_MAX)
+		return -1;
+	dir = opendir(directory);
+	if (dir == NULL)
+	{
+		if (errno != ENOENT)
+			return -1;
+		*generation_out = selected_generation + 1;
+		return 0;
+	}
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char expected[128];
+		char *end = NULL;
+		unsigned long long parsed;
+		unsigned long shard;
+
+		if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1) != 0)
+			continue;
+		errno = 0;
+		parsed = strtoull(entry->d_name + sizeof(prefix) - 1, &end, 10);
+		if (errno != 0 || end == entry->d_name + sizeof(prefix) - 1 ||
+			*end != '_')
+			continue;
+		errno = 0;
+		shard = strtoul(end + 1, &end, 10);
+		if (errno != 0 || *end != '\0' || shard >= PS_WALIDX_SNAPSHOT_MAX_SHARDS ||
+			shard_name((uint64_t) parsed, (uint32_t) shard,
+					   expected, sizeof(expected)) != 0 ||
+			strcmp(expected, entry->d_name) != 0)
+			continue;
+		if ((uint64_t) parsed > highest)
+			highest = (uint64_t) parsed;
+	}
+	if (closedir(dir) != 0 || highest == UINT64_MAX)
+		return -1;
+	*generation_out = highest + 1;
+	return 0;
 }
 
 static int
