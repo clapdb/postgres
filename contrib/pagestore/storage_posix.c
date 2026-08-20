@@ -49,8 +49,17 @@ static int test_fail_fork_meta_append_at;
 static int test_max_log_read;
 static int test_fail_wal_rewrite_before_rename;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
-/* Serializes flat-WAL append/truncate/rewrite publication. */
-static pthread_mutex_t posix_wal_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Flat WAL files are independent per timeline. */
+typedef struct PosixWalLock
+{
+	uint32_t	tl;
+	pthread_mutex_t lock;
+	struct PosixWalLock *next;
+} PosixWalLock;
+
+static PosixWalLock *posix_wal_locks;
+static pthread_mutex_t posix_wal_locks_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * WAL-index records are independent per (timeline, shard).  The metadata
@@ -69,12 +78,14 @@ typedef struct PosixWalIdxLock
 static PosixWalIdxLock *posix_walidx_locks;
 static pthread_mutex_t posix_walidx_locks_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void posix_wal_locks_clear(void);
 static void posix_walidx_locks_clear(void);
 
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
 static int posix_log_append_locked(const char *name, const void *buf,
-							 uint32_t len);
+								 uint32_t len);
+static PosixWalLock *posix_wal_lock_for(uint32_t tl);
 static PosixWalIdxLock *posix_walidx_lock_for(uint32_t tl, uint32_t shard);
 
 static void
@@ -260,6 +271,7 @@ static void
 posix_close(void)
 {
 	free_shard_caches();
+	posix_wal_locks_clear();
 	posix_walidx_locks_clear();
 }
 
@@ -458,11 +470,14 @@ static int
 posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 			 const void *b, uint32_t blen)
 {
+	PosixWalLock *lock = posix_wal_lock_for(tl);
 	int rc;
 
-	pthread_mutex_lock(&posix_wal_lock);
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
 	rc = posix_wal_append_locked(tl, a, alen, b, blen);
-	pthread_mutex_unlock(&posix_wal_lock);
+	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
 
@@ -517,11 +532,14 @@ posix_wal_truncate_locked(uint32_t tl, uint64_t len)
 static int
 posix_wal_truncate(uint32_t tl, uint64_t len)
 {
+	PosixWalLock *lock = posix_wal_lock_for(tl);
 	int rc;
 
-	pthread_mutex_lock(&posix_wal_lock);
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
 	rc = posix_wal_truncate_locked(tl, len);
-	pthread_mutex_unlock(&posix_wal_lock);
+	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
 
@@ -534,6 +552,7 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 static int
 posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 {
+	PosixWalLock *lock = posix_wal_lock_for(tl);
 	char		path[4096];
 	char		tmp[4096];
 	unsigned char buf[64 * 1024];
@@ -544,7 +563,9 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	int		dfd = -1;
 	int		rc = -1;
 
-	pthread_mutex_lock(&posix_wal_lock);
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	snprintf(tmp, sizeof(tmp), "%s/wal_%u.rewrite.tmp", posix_dir, tl);
 	src = open(path, O_RDONLY);
@@ -614,8 +635,58 @@ out:
 		close(dfd);
 	if (rc != 0)
 		(void) unlink(tmp);
-	pthread_mutex_unlock(&posix_wal_lock);
+	pthread_mutex_unlock(&lock->lock);
 	return rc;
+}
+
+static PosixWalLock *
+posix_wal_lock_for(uint32_t tl)
+{
+	PosixWalLock *entry;
+
+	pthread_mutex_lock(&posix_wal_locks_lock);
+	for (entry = posix_wal_locks; entry; entry = entry->next)
+		if (entry->tl == tl)
+			break;
+	if (entry == NULL)
+	{
+		entry = calloc(1, sizeof(*entry));
+		if (entry != NULL)
+		{
+			entry->tl = tl;
+			if (pthread_mutex_init(&entry->lock, NULL) != 0)
+			{
+				free(entry);
+				entry = NULL;
+			}
+			else
+			{
+				entry->next = posix_wal_locks;
+				posix_wal_locks = entry;
+			}
+		}
+	}
+	pthread_mutex_unlock(&posix_wal_locks_lock);
+	return entry;
+}
+
+static void
+posix_wal_locks_clear(void)
+{
+	PosixWalLock *entry;
+
+	pthread_mutex_lock(&posix_wal_locks_lock);
+	entry = posix_wal_locks;
+	posix_wal_locks = NULL;
+	pthread_mutex_unlock(&posix_wal_locks_lock);
+	while (entry != NULL)
+	{
+		PosixWalLock *next = entry->next;
+
+		pthread_mutex_destroy(&entry->lock);
+		free(entry);
+		entry = next;
+	}
 }
 
 static int
