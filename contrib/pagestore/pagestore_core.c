@@ -4286,6 +4286,9 @@ static uint64_t walidx_log_epoch[MAX_TIMELINES][PS_MAX_CHANNELS];
 static unsigned char walidx_snapshot_gc_pending[MAX_TIMELINES];
 static uint32_t walidx_snapshot_gc_cursor;
 static struct timespec walidx_snapshot_gc_retry_at[MAX_TIMELINES];
+static PsWalIdxSnapshotPrepared walidx_snapshot_cleanup[MAX_TIMELINES];
+static int walidx_snapshot_cleanup_pending[MAX_TIMELINES];
+static struct timespec walidx_snapshot_cleanup_retry_at[MAX_TIMELINES];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct WalIdxPublishLock
 {
@@ -4357,6 +4360,9 @@ walidx_frontier_publication_pending(uint32_t timeline)
 	uint64_t snapshot_end;
 
 	if (timeline >= MAX_TIMELINES)
+		return 1;
+	if (__atomic_load_n(&walidx_snapshot_cleanup_pending[timeline],
+						__ATOMIC_ACQUIRE))
 		return 1;
 	pthread_mutex_lock(&walidx_meta_lock);
 	snapshot_end = walidx_snapshot_end[timeline];
@@ -5236,6 +5242,26 @@ walidx_snapshot_publish_one(void)
 	int rc = 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
+							__ATOMIC_ACQUIRE) &&
+			(now.tv_sec > walidx_snapshot_cleanup_retry_at[tl].tv_sec ||
+			 (now.tv_sec == walidx_snapshot_cleanup_retry_at[tl].tv_sec &&
+			  now.tv_nsec >= walidx_snapshot_cleanup_retry_at[tl].tv_nsec)))
+		{
+			if (ps_walidx_snapshot_abort(&walidx_snapshot_cleanup[tl]) == 0)
+			{
+				memset(&walidx_snapshot_cleanup[tl], 0,
+					   sizeof(walidx_snapshot_cleanup[tl]));
+				memset(&walidx_snapshot_cleanup_retry_at[tl], 0,
+					   sizeof(walidx_snapshot_cleanup_retry_at[tl]));
+				__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 0,
+								 __ATOMIC_RELEASE);
+				return 1;
+			}
+			walidx_snapshot_cleanup_retry_at[tl] = now;
+			walidx_snapshot_cleanup_retry_at[tl].tv_sec++;
+		}
 	pthread_mutex_lock(&walidx_meta_lock);
 	for (uint32_t step = 0; step < MAX_TIMELINES; step++)
 	{
@@ -5245,6 +5271,8 @@ walidx_snapshot_publish_one(void)
 		if ((tl == 0 || timelines[tl].defined) &&
 			(now.tv_sec > retry_at.tv_sec ||
 			 (now.tv_sec == retry_at.tv_sec && now.tv_nsec >= retry_at.tv_nsec)) &&
+			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
+							 __ATOMIC_ACQUIRE) &&
 			(walidx_snapshot_reshard_pending[tl] ||
 			 walidx_progress[tl] > walidx_snapshot_end[tl]))
 		{
@@ -5346,9 +5374,23 @@ walidx_snapshot_publish_one(void)
 		if (compact)
 		{
 			if (ps_walidx_snapshot_prepare(&prepared, directory, tl, generation,
-													start_lsn, end_lsn, inputs, ns) != 0 ||
-				walidx_frontier_advance(tl, end_lsn) != 0)
+													start_lsn, end_lsn, inputs, ns) != 0)
 			{
+				retry = 1;
+				goto publish_done;
+			}
+			if (walidx_frontier_advance(tl, end_lsn) != 0)
+			{
+				walidx_snapshot_cleanup[tl] = prepared;
+				__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 1,
+								 __ATOMIC_RELEASE);
+				if (ps_walidx_snapshot_abort(&walidx_snapshot_cleanup[tl]) == 0)
+				{
+					memset(&walidx_snapshot_cleanup[tl], 0,
+						   sizeof(walidx_snapshot_cleanup[tl]));
+					__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 0,
+									 __ATOMIC_RELEASE);
+				}
 				retry = 1;
 				goto publish_done;
 			}
@@ -8712,6 +8754,11 @@ ps_core_open(const char *store_dir)
 	walidx_snapshot_gc_cursor = 0;
 	memset(walidx_snapshot_gc_retry_at, 0,
 		   sizeof(walidx_snapshot_gc_retry_at));
+	memset(walidx_snapshot_cleanup, 0, sizeof(walidx_snapshot_cleanup));
+	memset(walidx_snapshot_cleanup_pending, 0,
+		   sizeof(walidx_snapshot_cleanup_pending));
+	memset(walidx_snapshot_cleanup_retry_at, 0,
+		   sizeof(walidx_snapshot_cleanup_retry_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 

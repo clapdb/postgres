@@ -734,6 +734,53 @@ cleanup:
 }
 
 int
+ps_walidx_snapshot_abort(const PsWalIdxSnapshotPrepared *prepared)
+{
+	PsWalIdxSnapshot current;
+	int directory_fd;
+	int manifest_exists;
+
+	if (prepared == NULL || prepared->directory[0] == '\0' ||
+		prepared->generation == 0 || prepared->nshards == 0 ||
+		prepared->nshards > PS_WALIDX_SNAPSHOT_MAX_SHARDS)
+		return -1;
+	directory_fd = open_directory(prepared->directory, 0);
+	if (directory_fd < 0)
+		return -1;
+	manifest_exists = faccessat(directory_fd, WALIDX_SNAPSHOT_MANIFEST,
+								 F_OK, 0) == 0;
+	if (!manifest_exists && errno != ENOENT)
+		goto fail;
+	if (manifest_exists)
+	{
+		if (ps_walidx_snapshot_open(&current, prepared->directory,
+								 prepared->timeline) != 0)
+			goto fail;
+		if (current.generation == prepared->generation)
+		{
+			ps_walidx_snapshot_close(&current);
+			goto fail;
+		}
+		ps_walidx_snapshot_close(&current);
+	}
+	for (uint32_t shard = 0; shard < prepared->nshards; shard++)
+	{
+		char name[128];
+
+		if (shard_name(prepared->generation, shard, name, sizeof(name)) != 0 ||
+			(unlinkat(directory_fd, name, 0) != 0 && errno != ENOENT))
+			goto fail;
+	}
+	if (fsync(directory_fd) != 0 || close(directory_fd) != 0)
+		return -1;
+	return 0;
+
+fail:
+	close(directory_fd);
+	return -1;
+}
+
+int
 ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 						   uint64_t generation, uint64_t start_lsn,
 						   uint64_t end_lsn,

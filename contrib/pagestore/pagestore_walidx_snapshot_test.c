@@ -167,6 +167,10 @@ main(void)
 		  "commit validates prepared shard durability before cutover");
 	check(pwrite_byte(path, 17, newer0[17]) == 0,
 		  "restore the unpublished generation after validation coverage");
+	check(ps_walidx_snapshot_abort(&prepared) == 0 &&
+		  access(path, F_OK) != 0 && errno == ENOENT &&
+		  ps_walidx_snapshot_commit(&prepared) != 0,
+		  "abort removes a prepared generation before input can change");
 	check(ps_walidx_snapshot_publish(directory, 0, 1, 100, 500,
 								 first, 3) != 0,
 		  "publication cannot move the durable generation backward");

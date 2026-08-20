@@ -58,6 +58,8 @@ extern int ps_walidx_snapshot_prepare(PsWalIdxSnapshotPrepared *prepared,
 									  const PsWalIdxSnapshotInput *shards,
 									  uint32_t nshards);
 extern int ps_walidx_snapshot_commit(const PsWalIdxSnapshotPrepared *prepared);
+/* Remove a prepared generation that has not been selected by the manifest. */
+extern int ps_walidx_snapshot_abort(const PsWalIdxSnapshotPrepared *prepared);
 
 /* Publish a complete immutable shard generation, then atomically select it.
  * The owning timeline must serialize publishers with its append cutover.  Old
