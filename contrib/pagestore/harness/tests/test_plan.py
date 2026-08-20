@@ -238,6 +238,7 @@ class PlanValidationTests(unittest.TestCase):
             )
         self.assertEqual([call[1] for call in calls], [True, False, False])
         self.assertTrue(calls[0][2])
+        self.assertTrue(Path(calls[0][3][0]).is_absolute())
         self.assertTrue(
             Path(calls[0][3][calls[0][3].index("--store") + 1]).is_absolute()
         )

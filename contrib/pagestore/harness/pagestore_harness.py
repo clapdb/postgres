@@ -1223,6 +1223,8 @@ def run_daemon_fault_recovery(
     timeout: float = 15.0,
 ) -> Path:
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
+    daemon = daemon.resolve()
+    inspector = inspector.resolve()
     root, temporary = run_root(requested_root)
     # The C fault registry rejects relative control paths. Resolve before
     # deriving store, trace, bundle, and control paths; ordinary daemon smoke
