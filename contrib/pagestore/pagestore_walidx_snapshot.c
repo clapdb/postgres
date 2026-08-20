@@ -220,6 +220,43 @@ fail:
 }
 
 static int
+parse_shard_name(const char *name, uint64_t *generation_out)
+{
+	static const char prefix[] = "walidxg1_";
+	const size_t prefix_len = sizeof(prefix) - 1;
+	const size_t generation_end = prefix_len + 20;
+	const size_t shard_start = generation_end + 1;
+	const size_t name_len = shard_start + 3;
+	uint64_t generation = 0;
+	uint32_t shard = 0;
+
+	if (strlen(name) != name_len || memcmp(name, prefix, prefix_len) != 0 ||
+		name[generation_end] != '_')
+		return -1;
+	for (size_t i = prefix_len; i < generation_end; i++)
+	{
+		unsigned int digit;
+
+		if (name[i] < '0' || name[i] > '9')
+			return -1;
+		digit = (unsigned int) (name[i] - '0');
+		if (generation > (UINT64_MAX - digit) / 10)
+			return -1;
+		generation = generation * 10 + digit;
+	}
+	for (size_t i = shard_start; i < name_len; i++)
+	{
+		if (name[i] < '0' || name[i] > '9')
+			return -1;
+		shard = shard * 10 + (uint32_t) (name[i] - '0');
+	}
+	if (generation == 0 || shard >= PS_WALIDX_SNAPSHOT_MAX_SHARDS)
+		return -1;
+	*generation_out = generation;
+	return 0;
+}
+
+static int
 open_directory(const char *directory, int create)
 {
 	int directory_fd;
@@ -710,6 +747,76 @@ ps_walidx_snapshot_read(const PsWalIdxSnapshot *snapshot, uint32_t shard,
 	rc = read_all_at(fd, data, len, offset);
 	if (close(fd) != 0)
 		rc = -1;
+	return rc;
+}
+
+int
+ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
+{
+	PsWalIdxSnapshot current;
+	struct dirent *entry;
+	char (*names)[128] = NULL;
+	DIR *dir = NULL;
+	size_t count = 0;
+	size_t capacity = 0;
+	int scan_fd = -1;
+	int rc = -1;
+
+	if (ps_walidx_snapshot_open(&current, directory, timeline) != 0)
+		return -1;
+	scan_fd = fcntl(current.directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		uint64_t generation;
+		char (*grown)[128];
+
+		if (parse_shard_name(entry->d_name, &generation) != 0 ||
+			generation >= current.generation)
+			continue;
+		if (count == capacity)
+		{
+			size_t next = capacity == 0 ? 16 : capacity * 2;
+
+			if (next < capacity || next > SIZE_MAX / sizeof(*names) ||
+				(grown = realloc(names, next * sizeof(*names))) == NULL)
+				goto cleanup;
+			names = grown;
+			capacity = next;
+		}
+		memcpy(names[count++], entry->d_name, strlen(entry->d_name) + 1);
+	}
+	{
+		int scan_errno = errno;
+		int close_rc = closedir(dir);
+
+		dir = NULL;
+		if (scan_errno != 0 || close_rc != 0)
+			goto cleanup;
+	}
+	for (size_t i = 0; i < count; i++)
+		if (unlinkat(current.directory_fd, names[i], 0) != 0)
+			goto cleanup;
+	/* Always sync, including a retry after an ambiguous earlier fsync error. */
+	if (getenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC") != NULL)
+	{
+		errno = EIO;
+		goto cleanup;
+	}
+	if (fsync(current.directory_fd) != 0)
+		goto cleanup;
+	rc = count != 0;
+
+cleanup:
+	free(names);
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	ps_walidx_snapshot_close(&current);
 	return rc;
 }
 
