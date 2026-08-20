@@ -5969,7 +5969,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				first = wal_log_start(tl);
 				if (!walidx_progress_valid[tl] && first != UINT64_MAX)
 				{
-					walidx_progress[tl] = first;
+					walidx_progress[tl] = first == 0 ? rec.start_lsn : first;
 					walidx_progress_valid[tl] = 1;
 				}
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
