@@ -12,6 +12,15 @@
       "page_size": 8192,
       "io_unit": 262144
     },
+    "daemon_fault_smoke": {
+      "operations": ["crash"],
+      "constraints": {
+        "crash": {}
+      },
+      "protocol_version": 33,
+      "page_size": 8192,
+      "io_unit": 262144
+    },
     "writer_smoke": {
       "operations": ["sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap", "install_reader", "assert", "capture"],
       "constraints": {
@@ -45,6 +54,7 @@
   "shards": [1],
   "compute": ["writer", "reader", "branch", "materializer"],
   "crash_models": ["power_loss", "compute", "process_abort"],
+  "fault_catalog": "../pagestore_fault_points.def",
   "operations": [
     "sql",
     "checkpoint",

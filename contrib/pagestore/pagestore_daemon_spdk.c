@@ -35,6 +35,7 @@
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
 #include "pagestore_retention.h"
+#include "pagestore_fault.h"
 #include "storage_spdk.h"
 
 /* most page reads a single request can carry (nblocks * page_size <= io_unit) */
@@ -563,6 +564,11 @@ main(int argc, char **argv)
 	ps_nshards = nshards;
 	if (pci_addr)
 		setenv("PS_SPDK_PCI", pci_addr, 1);
+	if (ps_fault_init(store_dir) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: invalid fault configuration\n");
+		return 1;
+	}
 
 	if (ps_core_open(store_dir) != 0)
 	{
@@ -611,6 +617,14 @@ main(int argc, char **argv)
 			"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
 			PS_MAX_CHANNELS, hdr->nshards);
+	if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: fault probe daemon.after_ready failed\n");
+		ps_core_close();
+		ps_storage->close();
+		munmap(shm, PS_SHM_SIZE);
+		return 1;
+	}
 
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));

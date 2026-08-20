@@ -33,6 +33,7 @@
 #include "pagestore_ipc.h"
 #include "pagestore_core.h"
 #include "pagestore_pgcache.h"
+#include "pagestore_fault.h"
 
 static volatile sig_atomic_t stop_requested = 0;
 static PsShmHeader *daemon_hdr = NULL;
@@ -581,6 +582,13 @@ main(int argc, char **argv)
 		return 2;
 	}
 	ps_nshards = nshards;
+	/* Validate explicit test fault configuration before opening any store
+	 * state.  A malformed configuration must never silently disable a probe. */
+	if (ps_fault_init(store_dir) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon: invalid fault configuration\n");
+		return 1;
+	}
 
 	if (ps_core_open(store_dir) != 0)
 	{
@@ -636,6 +644,13 @@ main(int argc, char **argv)
 			"io_unit=%u channels=%u nshards=%u ready\n",
 			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
 			PS_MAX_CHANNELS, hdr->nshards);
+	if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon: fault probe daemon.after_ready failed\n");
+		ps_core_close();
+		munmap(shm, PS_SHM_SIZE);
+		return 1;
+	}
 
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));

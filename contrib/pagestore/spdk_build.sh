@@ -37,6 +37,7 @@ set -x
 cc -O2 -Wall -Wextra -DPAGESTORE_SPDK -I"$here" $cflags \
 	-o "$out" \
 	"$here/pagestore_daemon_spdk.c" "$here/pagestore_core.c" \
+	"$here/pagestore_fault.c" \
 	"$here/storage_spdk.c" "$here/storage_posix.c" \
 	"$here/pagestore_layer.c" "$here/pagestore_layer_store.c" \
 	"$here/pagestore_manifest.c" "$here/pagestore_memtable.c" "$here/pagestore_pgcache.c" \

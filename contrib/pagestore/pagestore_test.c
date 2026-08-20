@@ -2605,6 +2605,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 {
 	char		shm[64];
 	char		store[256];
+	char		fault_dir[256];
 	const uint32_t ps = 8192;
 	uint32_t	rel = find_relation_on_shard(0, test_nshards);
 	unsigned char *page = malloc(ps);
@@ -2612,19 +2613,32 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	int			crashed_layer_count;
 	char		marker[512];
 	pid_t		pid;
+	const char *fault_name;
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_prune_crash_%d",
 			 (int) getpid(), case_no);
 	snprintf(store, sizeof(store), "%s/store_prune_crash_%d", tmpbase, case_no);
+	snprintf(fault_dir, sizeof(fault_dir), "%s/fault_prune_crash_%d", tmpbase, case_no);
 	rm_rf(store);
+	rm_rf(fault_dir);
+	check(mkdir(fault_dir, 0700) == 0, "create fault control directory %s", phase);
 	shm_unlink(shm);
 
-	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
-		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE", phase, 1) == 0,
+	fault_name = strcmp(phase, "after_publish") == 0 ?
+		"page_compaction.after_publish" :
+		(strcmp(phase, "after_mark_delete") == 0 ?
+		 "page_gc.after_mark_delete" : "page_prune.after_frontier");
+	snprintf(marker, sizeof(marker), "%s/arm", fault_dir);
+	check(setenv("PAGESTORE_TEST_FAULT_NAME", fault_name, 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0,
 		  "configure guarded compaction fault %s", phase);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
-	unsetenv("PAGESTORE_TEST_FAULT");
-	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	unsetenv("PAGESTORE_TEST_FAULT_NAME");
+	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
+	unsetenv("PAGESTORE_TEST_FAULT_HIT");
+	unsetenv("PAGESTORE_TEST_FAULT_DIR");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 500);
@@ -2642,7 +2656,6 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	}
 	fill_page(page, ps, 4000, 40);
 	op_write_tl(0, rel, 0, 0, page);
-	snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
 	{
 		int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 
@@ -2697,6 +2710,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
+	rm_rf(fault_dir);
 	shm_unlink(shm);
 	free(page);
 	free(readback);
@@ -4432,6 +4446,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
 	char		store[256];
+	char		fault_dir[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
 	uint32_t	walidx_nshards = test_nshards < 2 ? 4 : test_nshards;
@@ -4440,12 +4455,16 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		find_relation_on_shard(nonzero_shard, walidx_nshards) : 0;
 	PsWalRec	out[16];
 	unsigned char wal[512] = {0};
+	char		fault_arm[512];
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
 	snprintf(shm, sizeof(shm), "/pstest_%d_widx", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_widx", tmpbase);
+	snprintf(fault_dir, sizeof(fault_dir), "%s/fault_widx", tmpbase);
 	rm_rf(store);
+	rm_rf(fault_dir);
+	check(mkdir(fault_dir, 0700) == 0, "create WAL-index fault control directory");
 	shm_unlink(shm);
 
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
@@ -4756,15 +4775,19 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
-	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
-		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE",
-				 "after_walidx_frontier", 1) == 0 &&
+	check(setenv("PAGESTORE_TEST_FAULT_NAME", "wal_index.after_frontier", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
+		  snprintf(fault_arm, sizeof(fault_arm), "%s/arm", fault_dir) > 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0 &&
 		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
 		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
 		  "configure WAL-index frontier publication crash");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
-	unsetenv("PAGESTORE_TEST_FAULT");
-	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	unsetenv("PAGESTORE_TEST_FAULT_NAME");
+	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
+	unsetenv("PAGESTORE_TEST_FAULT_HIT");
+	unsetenv("PAGESTORE_TEST_FAULT_DIR");
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
@@ -4781,7 +4804,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		int fd;
 
 		op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 2);
-		snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
+		snprintf(marker, sizeof(marker), "%s/arm", fault_dir);
 		fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		check(fd >= 0 && close(fd) == 0,
 			  "arm the WAL-index frontier publication crash");
@@ -4936,6 +4959,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 								   "watermark detects complete loss of selected epoch records");
 	}
 	rm_rf(store);
+	rm_rf(fault_dir);
 	shm_unlink(shm);
 }
 

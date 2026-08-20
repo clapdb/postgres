@@ -17,6 +17,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,28 @@ class PlanError(ValueError):
 
 class OracleMismatch(PlanError):
     """A runtime assertion produced a value different from its oracle."""
+
+
+class HarnessTimeout(PlanError):
+    """A bounded harness operation exceeded its deadline."""
+
+
+class FaultNotReached(PlanError):
+    """The expected named fault did not produce its signed report."""
+
+
+class UnexpectedExit(PlanError):
+    """A faulted process exited for a reason other than the expected abort."""
+
+
+def fault_failure_classification(error: Exception) -> str:
+    if isinstance(error, FaultNotReached):
+        return "fault_not_reached"
+    if isinstance(error, HarnessTimeout):
+        return "timeout"
+    if isinstance(error, UnexpectedExit):
+        return "unexpected_exit"
+    return "setup"
 
 
 class EventLog:
@@ -86,7 +109,7 @@ ACTION_FIELDS = {
     "bootstrap": {"op", "id", "target", "extra"},
     "install_reader": {"op", "id", "target", "prepared", "read_lsn", "extra"},
     "restart": {"op", "id", "target", "extra"},
-    "crash": {"op", "id", "target", "model", "fault", "extra"},
+    "crash": {"op", "id", "target", "model", "fault", "action", "hit", "timeout", "extra"},
     "advance": {"op", "id", "target", "profile", "steps", "extra"},
     "assert": {"op", "id", "target", "oracle", "sql", "expect", "extra"},
     "parallel": {"op", "id", "lanes", "barrier", "extra"},
@@ -142,7 +165,7 @@ class Plan:
 def read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise PlanError(f"{path}: cannot read JSON: {error}") from error
     if not isinstance(value, dict):
         raise PlanError(f"{path}: expected a JSON object")
@@ -222,6 +245,117 @@ def runtime_capabilities(capabilities: dict[str, Any], runtime: str) -> dict[str
     return runtimes[runtime]
 
 
+FAULT_CATALOG_KEY = "fault_catalog"
+
+
+def fault_catalog_path(capabilities: dict[str, Any], base_path: Path | None = None) -> Path:
+    relative = capabilities.get(FAULT_CATALOG_KEY)
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise PlanError(f"capabilities: {FAULT_CATALOG_KEY} must be a relative path")
+    base = (base_path.parent if base_path is not None else Path(__file__).resolve().parent)
+    candidate = base / relative
+    if candidate.is_symlink() or not candidate.is_file():
+        raise PlanError(f"capabilities: fault catalog is not a regular file: {candidate}")
+    path = candidate.resolve()
+    return path
+
+
+def fault_catalog(
+    capabilities: dict[str, Any], base_path: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Parse the shared ``pagestore_fault_points.def`` as the sole catalog."""
+    path = fault_catalog_path(capabilities, base_path)
+    entries: dict[str, dict[str, Any]] = {}
+    try:
+        source = path.read_text(encoding="utf-8")
+        source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        lines = source.splitlines()
+    except OSError as error:
+        raise PlanError(f"cannot read fault catalog {path}: {error}") from error
+    pattern = re.compile(
+        r'^PAGESTORE_FAULT_POINT\('
+        r'([A-Z][A-Z0-9_]*),\s*"([a-z][a-z0-9_.-]*)",\s*'
+        r'"([a-z][a-z0-9_-]*)",\s*"([a-z][a-z0-9_-]*)",\s*'
+        r'"([a-z]+)",\s*([1-9][0-9]*),\s*([0-9]+)\)$'
+    )
+    symbols: set[str] = set()
+    for number, raw in enumerate(lines, start=1):
+        line = raw.split("#", 1)[0].split("//", 1)[0].strip()
+        if not line:
+            continue
+        match = pattern.fullmatch(line)
+        if match is None:
+            raise PlanError(f"fault catalog {path}:{number}: invalid record")
+        symbol, name, target, model, action, hit_text, max_hit_text = match.groups()
+        hit = int(hit_text, 10)
+        max_hit = int(max_hit_text, 10)
+        if hit <= 0 or hit > 2**63 - 1:
+            raise PlanError(f"fault catalog {path}:{number}: hit out of range")
+        if max_hit > 2**63 - 1 or (max_hit != 0 and hit > max_hit):
+            raise PlanError(f"fault catalog {path}:{number}: max_hit out of range")
+        models = capabilities.get("crash_models", [])
+        if isinstance(models, list) and model not in models:
+            raise PlanError(f"fault catalog {path}:{number}: unknown model {model!r}")
+        computes = capabilities.get("compute", [])
+        if isinstance(computes, list) and target != "store" and target not in computes:
+            raise PlanError(f"fault catalog {path}:{number}: unknown target {target!r}")
+        if action != "crash":
+            raise PlanError(f"fault catalog {path}:{number}: unknown action {action!r}")
+        if name in entries or symbol in symbols:
+            raise PlanError(f"fault catalog {path}:{number}: duplicate fault name or symbol")
+        symbols.add(symbol)
+        entries[name] = {"name": name, "target": target, "model": model,
+                         "action": action, "hit": hit, "max_hit": max_hit,
+                         "symbol": symbol}
+    if not entries:
+        raise PlanError(f"fault catalog {path}: no fault points")
+    return entries
+
+
+def validate_fault_action(
+    action: dict[str, Any], capabilities: dict[str, Any], context: str,
+    catalog_path: Path | None = None,
+) -> None:
+    """Validate a crash action against the named fault catalog."""
+    name = action.get("fault")
+    if not isinstance(name, str) or not name:
+        raise PlanError(f"{context}: named fault must be a non-empty string")
+    entry = fault_catalog(capabilities, catalog_path).get(name)
+    if entry is None:
+        raise PlanError(f"{context}: unknown fault {name!r}")
+    for field in ("action", "hit"):
+        if field not in action:
+            raise PlanError(f"{context}: named fault {name!r} requires {field}")
+    if not isinstance(action["action"], str) or not action["action"]:
+        raise PlanError(f"{context}: named fault action must be a string")
+    if (
+        not isinstance(action["hit"], int) or isinstance(action["hit"], bool)
+        or action["hit"] <= 0 or action["hit"] > 2**63 - 1
+    ):
+        raise PlanError(f"{context}: named fault hit must be a bounded positive integer")
+    for field in ("target", "model"):
+        if action.get(field) != entry[field]:
+            raise PlanError(
+                f"{context}: fault {name!r} requires {field}={entry[field]!r}, "
+                f"got {action.get(field)!r}"
+            )
+    action_name = action["action"]
+    if action_name != entry["action"]:
+        raise PlanError(
+            f"{context}: fault {name!r} requires action={entry['action']!r}, "
+            f"got {action_name!r}"
+        )
+    hit = action["hit"]
+    if entry["max_hit"] == entry["hit"] and hit != entry["hit"]:
+        raise PlanError(
+            f"{context}: fault {name!r} requires hit={entry['hit']!r}, got {hit!r}"
+        )
+    if entry["max_hit"] != 0 and hit > entry["max_hit"]:
+        raise PlanError(
+            f"{context}: fault {name!r} hit {hit!r} exceeds {entry['max_hit']!r}"
+        )
+
+
 INSPECTION_RESPONSES = {
     "health": {
         "protocol_version", "page_size", "io_unit", "nchannels", "nshards",
@@ -241,6 +375,7 @@ PG_CONTROL_FILE_SIZE = 8192
 
 RUNTIME_OPERATIONS = {
     "daemon_smoke": {"crash"},
+    "daemon_fault_smoke": {"crash"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
@@ -254,6 +389,9 @@ RUNTIME_CONSTRAINTS = {
             "target": ["store"], "model": ["power_loss"],
             "forbidden_fields": ["fault"],
         },
+    },
+    "daemon_fault_smoke": {
+        "crash": {},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -502,6 +640,18 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             raise PlanError(
                 f"runtime {runtime!r} requires exactly writer and materializer computes"
             )
+    elif runtime == "daemon_fault_smoke":
+        named = [
+            action for action in plan.actions
+            if action["op"] == "crash" and "fault" in action
+        ]
+        if len(named) != 1 or any(
+            action["op"] == "crash" and "fault" not in action
+            for action in plan.actions
+        ):
+            raise PlanError(
+                "runtime daemon_fault_smoke requires exactly one named crash action"
+            )
 
 
 def validate_runtime_health(
@@ -643,7 +793,9 @@ def reject_unknown_fields(record: dict[str, Any], allowed: set[str], context: st
         raise PlanError(f"{context}: extra must be an object")
 
 
-def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
+def validate_plan(
+    plan: Plan, capabilities: dict[str, Any], catalog_path: Path | None = None,
+) -> None:
     header = plan.header
     context = str(plan.path)
     reject_unknown_fields(header, HEADER_FIELDS, context)
@@ -738,21 +890,37 @@ def validate_plan(plan: Plan, capabilities: dict[str, Any]) -> None:
             model = require_string(action, "model", action_context)
             if model not in capability_values(capabilities, "crash_models"):
                 raise PlanError(f"{action_context}: unsupported crash model {model!r}")
+            if "fault" in action:
+                validate_fault_action(action, capabilities, action_context, catalog_path)
+            elif "action" in action or "hit" in action:
+                raise PlanError(
+                    f"{action_context}: crash action/hit fields require a named fault"
+                )
+        elif operation in ("set_fault", "release_fault"):
+            name = require_string(action, "fault", action_context)
+            if name not in fault_catalog(capabilities, catalog_path):
+                raise PlanError(f"{action_context}: unknown fault {name!r}")
         if operation == "advance":
             steps = action["steps"]
             if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
                 raise PlanError(f"{action_context}: steps must be a positive integer")
+        if operation == "crash" and "timeout" in action:
+            timeout = action["timeout"]
+            if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+                raise PlanError(f"{action_context}: timeout must be positive")
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
     return sorted(path for path in directory.rglob("*.jsonl") if path.is_file())
 
 
-def validate_paths(paths: Iterable[Path], capabilities: dict[str, Any]) -> list[PlanError]:
+def validate_paths(
+    paths: Iterable[Path], capabilities: dict[str, Any], catalog_path: Path | None = None,
+) -> list[PlanError]:
     errors: list[PlanError] = []
     for path in paths:
         try:
-            validate_plan(read_plan(path), capabilities)
+            validate_plan(read_plan(path), capabilities, catalog_path)
         except PlanError as error:
             errors.append(error)
     return errors
@@ -962,6 +1130,316 @@ def run_daemon_smoke(
 
     if failure is not None:
         raise PlanError(f"daemon smoke failed; failure bundle: {root}: {failure}") from failure
+    if temporary and not keep:
+        shutil.rmtree(root)
+    return root
+
+
+def _atomic_arm_marker(path: Path) -> None:
+    """Create a fault arm marker exactly once, without a truncate race."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, b"armed\n")
+    finally:
+        os.close(fd)
+
+
+def _cleanup_fault_control(control: Path) -> None:
+    """Remove only a real control directory; preserve other diagnostics."""
+    try:
+        control_stat = control.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISDIR(control_stat.st_mode):
+        return
+    for child in list(control.iterdir()):
+        try:
+            child_stat = child.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(child_stat.st_mode) and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+    try:
+        control.rmdir()
+    except OSError:
+        pass
+
+
+def _fault_report(
+    path: Path, expected_name: str, expected_hit: int, expected_pid: int,
+) -> dict[str, Any]:
+    try:
+        file_stat = path.lstat()
+    except OSError as error:
+        raise FaultNotReached(f"fault report {path} is missing: {error}") from error
+    if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
+        raise FaultNotReached(f"fault report {path} is not a regular file")
+    try:
+        if file_stat.st_size <= 0 or file_stat.st_size > 4096:
+            raise ValueError("report size is outside the bounded schema")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) != 1 or not lines[0].strip():
+            raise ValueError("expected exactly one JSON line")
+        value = json.loads(lines[0])
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise FaultNotReached(f"fault report {path} is missing or invalid: {error}") from error
+    if not isinstance(value, dict):
+        raise FaultNotReached("fault report must be an object")
+    if set(value) != {"schema", "name", "action", "hit", "pid"}:
+        raise FaultNotReached("fault report has unexpected keys")
+    if (
+        value["schema"] != 1 or isinstance(value["schema"], bool)
+        or value["name"] != expected_name or value["action"] != "crash"
+        or value["hit"] != expected_hit or isinstance(value["hit"], bool)
+        or not isinstance(value["hit"], int) or value["hit"] <= 0
+        or value["hit"] > 2**63 - 1
+        or not isinstance(value["pid"], int) or isinstance(value["pid"], bool)
+        or value["pid"] <= 0 or value["pid"] != expected_pid
+        or value["pid"] > 2**31 - 1
+    ):
+        raise FaultNotReached("fault report fields do not match expected fault")
+    return value
+
+
+def run_daemon_fault_recovery(
+    plan: Plan,
+    capabilities: dict[str, Any],
+    inspection_schema: dict[str, Any],
+    daemon: Path,
+    inspector: Path,
+    requested_root: Path | None,
+    keep: bool,
+    capabilities_path: Path | None = None,
+    rerun_command: list[str] | None = None,
+    timeout: float = 15.0,
+) -> Path:
+    """Run one pre-armed named daemon fault and prove recovery is idempotent."""
+    root, temporary = run_root(requested_root)
+    # The C fault registry rejects relative control paths. Resolve before
+    # deriving store, trace, bundle, and control paths; ordinary daemon smoke
+    # keeps its historical run_root semantics.
+    root = root.resolve()
+    trace = root / "trace"
+    store = root / "store"
+    control = root / "fault-control"
+    trace.mkdir()
+    store.mkdir()
+    shutil.copy2(plan.path, root / "plan.jsonl")
+    (root / "case.json").write_text(
+        json.dumps(plan.header["case"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    catalog_path = fault_catalog_path(capabilities, capabilities_path)
+    bundle_catalog = root / "catalog" / catalog_path.name
+    bundle_catalog.parent.mkdir()
+    shutil.copy2(catalog_path, bundle_catalog)
+    bundle_capabilities = root / "capabilities.json"
+    bundle_value = dict(capabilities)
+    bundle_value[FAULT_CATALOG_KEY] = f"catalog/{catalog_path.name}"
+    bundle_capabilities.write_text(
+        json.dumps(bundle_value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    events = EventLog(trace / "events.jsonl")
+    scenario = plan.header["scenario"]
+    seed = plan.header["seed"]
+    named_crashes = [
+        item for item in plan.actions if item["op"] == "crash" and "fault" in item
+    ]
+    if len(named_crashes) != 1 or any(
+        item["op"] == "crash" and "fault" not in item for item in plan.actions
+    ):
+        raise PlanError("daemon fault recovery requires exactly one named crash action")
+    action = named_crashes[0]
+    validate_fault_action(
+        action, capabilities, f"{plan.path}:{action['id']}", capabilities_path,
+    )
+    fault_name = action["fault"]
+    fault_hit = action["hit"]
+    generation = 0  # next generation; fault, recovery, clean restart: 0, 1, 2
+    active_generation = 0
+    process: subprocess.Popen[str] | None = None
+    shm_names: list[str] = []
+    shm_base = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
+    shm = ""
+    daemon_log = trace / "daemon.log"
+    marker = control / "arm"
+    report = control / "report.jsonl"
+    failure: Exception | None = None
+    current_action_id: str | None = None
+
+    def emit(event: str, **fields: Any) -> None:
+        fields.setdefault("scenario", scenario)
+        fields.setdefault("seed", seed)
+        fields.setdefault("action_id", current_action_id)
+        fields.setdefault("generation", active_generation)
+        events.emit(event, **fields)
+
+    def start_daemon(inject_fault: bool, action_id: str | None = None) -> subprocess.Popen[str]:
+        nonlocal generation, active_generation, process, shm
+        this_generation = generation
+        generation += 1
+        active_generation = this_generation
+        shm = f"{shm_base}_{this_generation}"
+        shm_names.append(shm)
+        command = [
+            str(daemon), "--shm", shm, "--store", str(store),
+            "--page-size", str(runtime_capabilities(capabilities, "daemon_fault_smoke")["page_size"]),
+            "--nshards", str(plan.header["case"]["shards"]),
+            "--storage", plan.header["case"]["storage"],
+        ]
+        env = private_environment()
+        if inject_fault:
+            # Keep these names local and explicit: inherited PAGESTORE_* values
+            # are removed by private_environment before this point.
+            env.update({
+                "PAGESTORE_TEST_FAULT_NAME": fault_name,
+                "PAGESTORE_TEST_FAULT_ACTION": "crash",
+                "PAGESTORE_TEST_FAULT_HIT": str(fault_hit),
+                "PAGESTORE_TEST_FAULT_DIR": str(control),
+            })
+        with daemon_log.open("a", encoding="utf-8") as log:
+            daemon_process = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT, text=True,
+                env=env, start_new_session=True,
+            )
+        process = daemon_process
+        emit("process_start", target="store", pid=daemon_process.pid,
+             argv=command, action_id=action_id, generation=this_generation)
+        return daemon_process
+
+    def stop_daemon() -> None:
+        if process is None or process.poll() is not None:
+            return
+        signal_process_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    def wait_ready(daemon_process: subprocess.Popen[str]) -> dict[str, Any]:
+        deadline = time.monotonic() + min(10.0, timeout)
+        last_error: PlanError | None = None
+        while time.monotonic() < deadline:
+            if daemon_process.poll() is not None:
+                raise UnexpectedExit(
+                    "daemon exited during recovery readiness with status "
+                    f"{daemon_process.returncode}"
+                )
+            try:
+                health = inspect_store(inspector, shm, "health", inspection_schema)
+                validate_runtime_health(
+                    plan, capabilities, "daemon_fault_smoke", health,
+                    inspection_schema,
+                )
+                return health
+            except PlanError as error:
+                last_error = error
+                time.sleep(0.05)
+        raise HarnessTimeout(
+            f"timeout while waiting for recovered daemon readiness: {last_error}"
+        )
+
+    try:
+        if control.exists() or control.is_symlink():
+            raise PlanError(f"fault control path is stale: {control}")
+        control.mkdir(mode=0o700)
+        if any(control.iterdir()):
+            raise PlanError(f"fault control path is not fresh: {control}")
+        _atomic_arm_marker(marker)
+        daemon_log.touch()
+        emit("run_start", shm_base=shm_base)
+        current_action_id = action["id"]
+        emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
+        process = start_daemon(True, action["id"])
+        deadline = time.monotonic() + float(action.get("timeout", timeout))
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if process.poll() is None:
+            raise HarnessTimeout(f"deadline waiting for fault {fault_name!r} expired")
+        if process.returncode != 88:
+            exit_status = process.returncode
+            emit(
+                "crash_exit", target="store", name=fault_name, action="crash",
+                hit=fault_hit, returncode=process.returncode,
+            )
+            emit(
+                "process_stop", target="store", pid=process.pid, name=fault_name,
+                action="crash", hit=fault_hit, returncode=process.returncode,
+            )
+            process = None
+            raise UnexpectedExit(
+                f"fault {fault_name!r} exited with status {exit_status}, expected 88"
+            )
+        fault_process = process
+        process = None
+        # The exit itself is evidence even if report validation fails. Keep
+        # these events before parsing so missing/corrupt reports retain a
+        # complete process lifecycle in the diagnostic bundle.
+        emit(
+            "crash_exit", target="store", name=fault_name, action="crash",
+            hit=fault_hit, returncode=fault_process.returncode,
+        )
+        emit(
+            "process_stop", target="store", pid=fault_process.pid, name=fault_name,
+            action="crash", hit=fault_hit, returncode=fault_process.returncode,
+        )
+        result = _fault_report(report, fault_name, fault_hit, fault_process.pid)
+        shutil.copy2(report, trace / "fault-report.jsonl")
+        emit("fault", target="store", name=fault_name, hit=fault_hit,
+             model=action["model"], returncode=fault_process.returncode, report=result)
+        remove_shm(shm)
+        shutil.rmtree(control)
+        # Recovery is intentionally followed by one additional clean restart.
+        process = start_daemon(False, action["id"])
+        health = wait_ready(process)
+        emit("recovered", target="store", health=health)
+        stop_daemon()
+        emit("process_stop", target="store", pid=process.pid,
+             returncode=process.returncode)
+        remove_shm(shm)
+        process = start_daemon(False, action["id"])
+        health = wait_ready(process)
+        emit("restarted", target="store", health=health)
+        emit("run_pass")
+    except Exception as error:
+        failure = error
+        classification = fault_failure_classification(error)
+        emit("run_fail", error=str(error), error_type=type(error).__name__,
+             classification=classification)
+        metadata = {
+            "classification": classification,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "run_root": str(root),
+            "plan": str(root / "plan.jsonl"),
+            "capabilities": str(bundle_capabilities),
+            "catalog": str(bundle_catalog),
+            "binaries": {"daemon": str(daemon), "inspector": str(inspector)},
+            "command": [
+                sys.executable, str(Path(__file__).resolve()),
+                "--capabilities", str(bundle_capabilities),
+                "--daemon-fault-recovery", str(root / "plan.jsonl"),
+                "--daemon-binary", str(daemon), "--inspect-binary", str(inspector),
+                "--run-root", str(root.parent / f"{root.name}.rerun"), "--keep",
+            ],
+        }
+        (root / "failure.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    finally:
+        if process is not None:
+            stop_daemon()
+            emit("process_stop", target="store", pid=process.pid,
+                 returncode=process.returncode)
+        for name in shm_names:
+            remove_shm(name)
+        _cleanup_fault_control(control)
+
+    if failure is not None:
+        raise PlanError(f"daemon fault recovery failed; failure bundle: {root}: {failure}") from failure
     if temporary and not keep:
         shutil.rmtree(root)
     return root
@@ -1857,6 +2335,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--list", type=Path, metavar="SCENARIO_DIR")
     group.add_argument("--inspect", choices=["health", "backpressure", "pruning"])
     group.add_argument("--daemon-smoke", type=Path, metavar="PLAN")
+    group.add_argument(
+        "--daemon-fault-smoke", "--daemon-fault-recovery",
+        dest="daemon_fault_smoke", type=Path, metavar="PLAN",
+    )
     group.add_argument("--writer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--legacy-integration", action="store_true")
@@ -1876,6 +2358,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--inspect requires --inspect-binary and --shm")
     if args.daemon_smoke and (args.daemon_binary is None or args.inspect_binary is None):
         parser.error("--daemon-smoke requires --daemon-binary and --inspect-binary")
+    if args.daemon_fault_smoke and (args.daemon_binary is None or args.inspect_binary is None):
+        parser.error(
+            "--daemon-fault-smoke requires --daemon-binary and --inspect-binary"
+        )
     if args.writer_smoke and (args.daemon_binary is None or args.inspect_binary is None or args.build_dir is None):
         parser.error("--writer-smoke requires --build-dir, --daemon-binary and --inspect-binary")
     if args.materializer_smoke and (
@@ -1899,6 +2385,7 @@ def main(argv: list[str] | None = None) -> int:
         capabilities = read_json(args.capabilities)
         if capabilities.get("schema") != 1:
             raise PlanError(f"{args.capabilities}: capability schema must be 1")
+        fault_catalog(capabilities, args.capabilities)
         if args.inspect:
             if args.inspect not in capability_values(capabilities, "inspection_operations"):
                 raise PlanError(f"capabilities: inspection operation {args.inspect!r} is unavailable")
@@ -1908,7 +2395,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.daemon_smoke:
             plan = read_plan(args.daemon_smoke)
-            validate_plan(plan, capabilities)
+            validate_plan(plan, capabilities, args.capabilities)
             validate_runtime_plan(plan, capabilities, "daemon_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
             schema = read_inspection_schema(schema_path, capabilities)
@@ -1917,9 +2404,35 @@ def main(argv: list[str] | None = None) -> int:
             if args.keep or args.run_root:
                 print(root)
             return 0
+        if args.daemon_fault_smoke:
+            plan = read_plan(args.daemon_fault_smoke)
+            validate_plan(plan, capabilities, args.capabilities)
+            validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+            command = [
+                sys.executable, str(Path(__file__).resolve()),
+                "--capabilities", str(args.capabilities),
+                "--daemon-fault-smoke", str(args.daemon_fault_smoke),
+                "--daemon-binary", str(args.daemon_binary),
+                "--inspect-binary", str(args.inspect_binary),
+            ]
+            if args.run_root is not None:
+                command.extend(["--run-root", str(args.run_root)])
+            root = run_daemon_fault_recovery(
+                plan, capabilities,
+                read_inspection_schema(
+                    args.inspection_schema
+                    or args.capabilities.with_name("inspection_schema.json"),
+                    capabilities,
+                ),
+                args.daemon_binary, args.inspect_binary, args.run_root, args.keep,
+                args.capabilities, command,
+            )
+            if args.keep or args.run_root:
+                print(root)
+            return 0
         if args.writer_smoke:
             plan = read_plan(args.writer_smoke)
-            validate_plan(plan, capabilities)
+            validate_plan(plan, capabilities, args.capabilities)
             validate_runtime_plan(plan, capabilities, "writer_smoke")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
             schema = read_inspection_schema(schema_path, capabilities)
@@ -1930,7 +2443,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.materializer_smoke:
             plan = read_plan(args.materializer_smoke)
-            validate_plan(plan, capabilities)
+            validate_plan(plan, capabilities, args.capabilities)
             validate_runtime_plan(plan, capabilities, "materializer_smoke")
             schema_path = (
                 args.inspection_schema
@@ -1953,7 +2466,7 @@ def main(argv: list[str] | None = None) -> int:
         paths = [args.validate] if args.validate else list(plan_files(args.list))
         if not paths:
             raise PlanError("no scenario plans found")
-        errors = validate_paths(paths, capabilities)
+        errors = validate_paths(paths, capabilities, args.capabilities)
     except PlanError as error:
         errors = [error]
         paths = []

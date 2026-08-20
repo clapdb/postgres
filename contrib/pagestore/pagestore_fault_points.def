@@ -1,0 +1,9 @@
+/*
+ * Single source of truth for C probes and harness plan validation.
+ * Keep every record on one line; the Python harness parses this strict form.
+ */
+PAGESTORE_FAULT_POINT(DAEMON_AFTER_READY, "daemon.after_ready", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(PAGE_COMPACTION_AFTER_PUBLISH, "page_compaction.after_publish", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(PAGE_GC_AFTER_MARK_DELETE, "page_gc.after_mark_delete", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(PAGE_PRUNE_AFTER_FRONTIER, "page_prune.after_frontier", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(WAL_INDEX_AFTER_FRONTIER, "wal_index.after_frontier", "store", "process_abort", "crash", 1, 0)

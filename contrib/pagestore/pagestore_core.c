@@ -54,6 +54,7 @@
 #include "pagestore_wal_store.h"
 #include "pagestore_walidx_prune.h"
 #include "pagestore_walidx_snapshot.h"
+#include "pagestore_fault.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -161,27 +162,6 @@ static int walidx_frontier_ancestry_allows(uint32_t reader_timeline,
 									   uint64_t read_lsn);
 static int walidx_frontier_publication_pending(uint32_t timeline);
 static int walidx_frontier_ancestry_pending(uint32_t reader_timeline);
-
-/* Test-only crash boundaries for publication recovery.  They are inert unless
- * the daemon was explicitly started with the fault switch and the test has
- * armed the store-local marker after startup. */
-static void
-test_crash_compaction_at(const char *phase)
-{
-	const char *enabled = getenv("PAGESTORE_TEST_FAULT");
-	const char *requested = getenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
-	char		marker[4096];
-	int			n;
-
-	if (enabled == NULL || strcmp(enabled, "1") != 0 || requested == NULL ||
-		strcmp(requested, phase) != 0 || page_frontier_dir[0] == '\0')
-		return;
-	n = snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed",
-				 page_frontier_dir);
-	if (n < 0 || (size_t) n >= sizeof(marker) || access(marker, F_OK) != 0)
-		return;
-	_exit(88);
-}
 
 static uint64_t
 admission_seq_alloc(void)
@@ -1311,7 +1291,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
 	}
-	test_crash_compaction_at("after_frontier");
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
+		goto cleanup;
 	if (record_layer(NULL, &newdesc) != 0)
 	{
 		(void) ps_layer_store->delete_local_layer(&newdesc);
@@ -1320,7 +1301,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	/* The replacement is published before any source is retired.  Keep this
 	 * distinct crash boundary so recovery covers both live sources and the
 	 * replacement together. */
-	test_crash_compaction_at("after_publish");
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0)
+		goto cleanup;
 	/* The durable replacement no longer contains these versions.  Drop their
 	 * in-memory index entries at the same publication point; otherwise a live
 	 * read can select a pruned PageVer and then fail because no layer can serve
@@ -1361,7 +1343,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		/* The replacement is visible and this source is now durably retired. */
-		test_crash_compaction_at("after_mark_delete");
+		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
+			goto cleanup;
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -5767,7 +5750,8 @@ walidx_snapshot_publish_one(void)
 				retry = 1;
 				goto publish_done;
 			}
-			test_crash_compaction_at("after_walidx_frontier");
+			if (ps_fault_probe(PS_FAULT_POINT_WAL_INDEX_AFTER_FRONTIER) != 0)
+				goto publish_done;
 			if (ps_walidx_snapshot_commit(&prepared) != 0)
 			{
 				retry = 1;
