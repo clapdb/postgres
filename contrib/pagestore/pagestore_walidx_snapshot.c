@@ -755,9 +755,11 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 {
 	PsWalIdxSnapshot current;
 	struct dirent *entry;
+	char (*names)[128] = NULL;
 	DIR *dir = NULL;
+	size_t count = 0;
+	size_t capacity = 0;
 	int scan_fd = -1;
-	int removed = 0;
 	int rc = -1;
 
 	if (ps_walidx_snapshot_open(&current, directory, timeline) != 0)
@@ -770,20 +772,41 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 	while ((entry = readdir(dir)) != NULL)
 	{
 		uint64_t generation;
+		char (*grown)[128];
 
 		if (parse_shard_name(entry->d_name, &generation) != 0 ||
 			generation >= current.generation)
 			continue;
-		if (unlinkat(current.directory_fd, entry->d_name, 0) != 0)
-			goto cleanup;
-		removed = 1;
-		errno = 0;
+		if (count == capacity)
+		{
+			size_t next = capacity == 0 ? 16 : capacity * 2;
+
+			if (next < capacity || next > SIZE_MAX / sizeof(*names) ||
+				(grown = realloc(names, next * sizeof(*names))) == NULL)
+				goto cleanup;
+			names = grown;
+			capacity = next;
+		}
+		memcpy(names[count++], entry->d_name, strlen(entry->d_name) + 1);
 	}
-	if (errno != 0 || (removed && fsync(current.directory_fd) != 0))
+	if (errno != 0 || closedir(dir) != 0)
 		goto cleanup;
-	rc = removed;
+	dir = NULL;
+	for (size_t i = 0; i < count; i++)
+		if (unlinkat(current.directory_fd, names[i], 0) != 0)
+			goto cleanup;
+	/* Always sync, including a retry after an ambiguous earlier fsync error. */
+	if (getenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC") != NULL)
+	{
+		errno = EIO;
+		goto cleanup;
+	}
+	if (fsync(current.directory_fd) != 0)
+		goto cleanup;
+	rc = count != 0;
 
 cleanup:
+	free(names);
 	if (dir != NULL)
 		closedir(dir);
 	else if (scan_fd >= 0)

@@ -4421,6 +4421,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	/* This is deliberately newer than the test-capped snapshot generation, so
 	 * restart must combine the immutable image with the original log tail. */
 	op_walidx_add(0, REL_A, FORK0, 9, 400);
+	/* Supply enough tail to cross the geometric replacement threshold after
+	 * restart without weakening the production anti-rewrite policy. */
+	for (uint32_t i = 0; i < 32; i++)
+		op_walidx_add(0, REL_A, FORK0, 10 + i, 401 + i);
 	check(op_walidx_progress(0, 350, 512, NULL) == 0,
 		  "WAL-index progress advances beyond the snapshot generation");
 	{

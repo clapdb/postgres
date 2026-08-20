@@ -160,8 +160,9 @@ main(void)
 								 second, 3) != 0,
 		  "leave a newer unpublished shard for publication retry");
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
-	check(ps_walidx_snapshot_gc(directory, 0) == 1,
-		  "generation GC removes superseded immutable shards");
+	check(setenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC", "1", 1) == 0 &&
+		  ps_walidx_snapshot_gc(directory, 0) != 0,
+		  "generation GC reports a directory sync failure after unlinking");
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 1ULL, 0U);
 	check(access(path, F_OK) != 0 && errno == ENOENT,
@@ -174,8 +175,11 @@ main(void)
 			 directory, 3ULL, 0U);
 	check(access(path, F_OK) == 0,
 		  "generation GC preserves newer unpublished retry state");
+	check(ps_walidx_snapshot_gc(directory, 0) != 0,
+		  "generation GC retry still syncs after prior unlinks disappeared");
+	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC");
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
-		  "generation GC is idempotent after old shards are gone");
+		  "generation GC durably completes an ambiguous sync retry");
 
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 2ULL, 1U);
