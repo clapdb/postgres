@@ -1174,6 +1174,26 @@ def _cleanup_fault_control(control: Path) -> None:
         pass
 
 
+def _disarm_fault_control(control: Path) -> None:
+    """Remove only the arm marker while retaining failure diagnostics."""
+    try:
+        control_stat = control.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISDIR(control_stat.st_mode):
+        return
+    marker = control / "arm"
+    try:
+        marker_stat = marker.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISDIR(marker_stat.st_mode):
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _fault_report(
     path: Path, expected_name: str, expected_hit: int, expected_pid: int,
 ) -> dict[str, Any]:
@@ -1451,7 +1471,10 @@ def run_daemon_fault_recovery(
                  returncode=process.returncode)
         for name in shm_names:
             remove_shm(name)
-        _cleanup_fault_control(control)
+        if failure is None:
+            _cleanup_fault_control(control)
+        else:
+            _disarm_fault_control(control)
 
     if failure is not None:
         raise PlanError(f"daemon fault recovery failed; failure bundle: {root}: {failure}") from failure

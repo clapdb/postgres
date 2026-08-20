@@ -284,8 +284,13 @@ class PlanValidationTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return self.returncode
 
+        def fake_popen(command, **kwargs):
+            control = Path(kwargs["env"]["PAGESTORE_TEST_FAULT_DIR"])
+            (control / "report.jsonl").write_text("{malformed\n", encoding="utf-8")
+            return FakeProcess()
+
         with (
-            mock.patch.object(MODULE.subprocess, "Popen", return_value=FakeProcess()),
+            mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
             mock.patch.object(MODULE, "remove_shm"),
         ):
             with self.assertRaisesRegex(MODULE.PlanError, "failure bundle"):
@@ -303,6 +308,11 @@ class PlanValidationTests(unittest.TestCase):
         schema_index = metadata["command"].index("--inspection-schema")
         self.assertEqual(metadata["command"][schema_index + 1], str(bundled_schema))
         self.assertEqual(metadata["inspection_schema"], str(bundled_schema))
+        self.assertEqual(
+            (root / "fault-control" / "report.jsonl").read_text(encoding="utf-8"),
+            "{malformed\n",
+        )
+        self.assertFalse((root / "fault-control" / "arm").exists())
 
     def test_fault_report_rejects_extra_fields_and_multiple_lines(self):
         with tempfile.TemporaryDirectory() as temporary:
