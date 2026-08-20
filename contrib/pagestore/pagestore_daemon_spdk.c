@@ -488,8 +488,9 @@ shard_worker(void *arg)
 			if (now >= next_maintenance)
 			{
 				next_maintenance = now + MAINTENANCE_CHECK_NS;
-				if (ps_retention_should_compact())
-					did_work |= ps_retention_compact() == 0;
+				/* With use_layers=0 this runs shared retention and WAL-index
+				 * maintenance, then returns before POSIX-only LSM work. */
+				did_work |= ps_core_maintenance();
 			}
 		}
 
