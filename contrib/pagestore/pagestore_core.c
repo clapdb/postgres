@@ -4555,6 +4555,7 @@ typedef struct WalIdxProgressRec
 } WalIdxProgressRec;
 
 static uint64_t walidx_progress[MAX_TIMELINES];
+static unsigned char walidx_progress_valid[MAX_TIMELINES];
 static uint64_t walidx_shards_seen[MAX_TIMELINES][2];
 static uint64_t walidx_shards_required[MAX_TIMELINES][2];
 static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
@@ -4672,7 +4673,7 @@ publish_wal_index_metrics(void)
 		/* Unused timelines have neither lag nor a WAL log to probe. */
 		if (shipped == 0)
 			continue;
-		if (indexed == 0)
+		if (!walidx_progress_valid[tl])
 		{
 			uint64_t first = wal_log_start(tl);
 
@@ -4704,8 +4705,11 @@ walidx_progress_init(uint32_t tl, uint64_t first_lsn)
 	if (tl >= MAX_TIMELINES || first_lsn == UINT64_MAX)
 		return;
 	pthread_mutex_lock(&walidx_meta_lock);
-	if (walidx_progress[tl] == 0)
+	if (!walidx_progress_valid[tl])
+	{
 		walidx_progress[tl] = first_lsn;
+		walidx_progress_valid[tl] = 1;
+	}
 	pthread_mutex_unlock(&walidx_meta_lock);
 }
 
@@ -5503,6 +5507,7 @@ walidx_snapshot_recover(uint32_t tl)
 	walidx_snapshot_reshard_pending[tl] = (unsigned char) reshard;
 	walidx_snapshot_gc_pending[tl] = 1;
 	walidx_progress[tl] = snapshot.end_lsn;
+	walidx_progress_valid[tl] = 1;
 	ps_walidx_snapshot_close(&snapshot);
 	return 0;
 
@@ -5978,16 +5983,15 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 
 				memcpy(&rec, buf + pos, sizeof(rec));
 				first = wal_log_start(tl);
-				if (walidx_progress[tl] == 0 && first != UINT64_MAX)
+				if (!walidx_progress_valid[tl] && first != UINT64_MAX)
 				{
-					/* Zero is both a valid WAL start and the in-memory unset
-					 * sentinel.  Recover the original starting point from the
-					 * first durable progress record after flat-prefix reclaim. */
-					walidx_progress[tl] = first == 0 ? rec.start_lsn : first;
+					walidx_progress[tl] = first;
+					walidx_progress_valid[tl] = 1;
 				}
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
 					rec.crc != walidx_progress_crc(&rec) ||
+					!walidx_progress_valid[tl] ||
 					rec.start_lsn != walidx_progress[tl] ||
 					rec.end_lsn < rec.start_lsn ||
 					rec.end_lsn > wal_end_read(tl) ||
@@ -6003,6 +6007,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 						walidx_shard_offsets_required[tl][i] =
 							rec.shard_offsets[i];
 				walidx_progress[tl] = rec.end_lsn;
+				walidx_progress_valid[tl] = 1;
 			}
 			pos += (int) rec_len;
 			good_off += rec_len;
@@ -6039,6 +6044,7 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	uint64_t	first;
 	int			rc = -1;
 	int			append_progress = 0;
+	int			current_valid;
 
 	/* A durable marker must name a contiguous prefix of shipped WAL. */
 	if (tl >= MAX_TIMELINES)
@@ -6059,13 +6065,17 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	pthread_rwlock_rdlock(wal_lock);
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
-	if (current == 0)
+	current_valid = walidx_progress_valid[tl];
+	if (!current_valid)
 	{
 		first = wal_log_start(tl);
 		if (first != UINT64_MAX)
+		{
 			current = first;
+			current_valid = 1;
+		}
 	}
-	if (start_lsn != current || end_lsn < start_lsn ||
+	if (!current_valid || start_lsn != current || end_lsn < start_lsn ||
 		end_lsn > wal_end_read(tl) ||
 		!wal_coverage_advance(tl, start_lsn, end_lsn))
 		goto out;
@@ -6099,13 +6109,17 @@ out:
 	}
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
-	if (current == 0)
+	current_valid = walidx_progress_valid[tl];
+	if (!current_valid)
 	{
 		first = wal_log_start(tl);
 		if (first != UINT64_MAX)
+		{
 			current = first;
+			current_valid = 1;
+		}
 	}
-	if (current != rec.start_lsn)
+	if (!current_valid || current != rec.start_lsn)
 		goto out_update;
 	walidx_shard_offsets_seen[tl][0] += sizeof(rec);
 	walidx_shards_required[tl][0] |= rec.shard_mask[0];
@@ -6114,6 +6128,7 @@ out:
 		if (rec.shard_offsets[shard] > walidx_shard_offsets_required[tl][shard])
 			walidx_shard_offsets_required[tl][shard] = rec.shard_offsets[shard];
 	walidx_progress[tl] = rec.end_lsn;
+	walidx_progress_valid[tl] = 1;
 	rc = 0;
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
@@ -9126,6 +9141,7 @@ ps_core_open(const char *store_dir)
 		return -1;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	memset(walidx_progress, 0, sizeof(walidx_progress));
+	memset(walidx_progress_valid, 0, sizeof(walidx_progress_valid));
 	memset(walidx_shards_seen, 0, sizeof(walidx_shards_seen));
 	memset(walidx_shards_required, 0, sizeof(walidx_shards_required));
 	memset(walidx_shard_offsets_seen, 0, sizeof(walidx_shard_offsets_seen));

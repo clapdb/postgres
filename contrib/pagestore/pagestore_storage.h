@@ -72,7 +72,9 @@ typedef struct PsStorage
 	 * Crash-atomically replace a flat WAL log with the byte suffix beginning at
 	 * keep_off.  The caller must freeze logical WAL catalog mutation across the
 	 * call and rebuild its file-offset references before admitting an append.
-	 * A reported error guarantees that rename did not publish the replacement.
+	 * An error after publication is ambiguous: the backend must reject further
+	 * WAL access for that timeline, and the caller must reopen storage before
+	 * retrying with rebuilt physical offsets.
 	 */
 	int			(*wal_rewrite_prefix) (uint32_t tl, uint64_t keep_off);
 

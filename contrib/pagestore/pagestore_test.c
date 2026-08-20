@@ -4291,7 +4291,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_wal_append_status(8, 0, segment, 1) == PS_STATUS_ERROR,
 		  "immutable WAL rejects a divergent retry after flat reclaim");
 	segment[0] ^= 0xff;
-	check(op_walidx_progress(8, PS_IO_UNIT, 1024 * 1024, NULL) == 0,
+	check(op_walidx_progress(8, 0, 1024 * 1024, NULL) == 0,
 		  "WAL-index progress accepts a fully immutable shipped prefix");
 	memset(rback, 0, sizeof(rback));
 	check(op_wal_read(8, PS_IO_UNIT - 256, 512, rback) == 512 &&
@@ -4317,7 +4317,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&
 		  memcmp(rback, segment + 1024 * 1024 - 256, 512) == 0,
 		  "WAL read stitches an immutable prefix to a crossing flat record");
-	check(op_walidx_progress(9, PS_IO_UNIT, 900 * 1024 + PS_IO_UNIT, NULL) == 0,
+	check(op_walidx_progress(9, 0, 900 * 1024 + PS_IO_UNIT, NULL) == 0,
 		  "WAL-index progress spans immutable coverage and a crossing flat tail");
 
 	/* Timeline 7 deliberately has no branch metadata.  After its flat prefix
