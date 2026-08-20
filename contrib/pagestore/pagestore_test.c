@@ -4592,15 +4592,35 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	{
 		char		path[512];
 		struct stat st;
+		unsigned char last;
+		int fd;
 
 		snprintf(path, sizeof(path), "%s/walidx_0_%u_e%020llu",
 				 store, nonzero_shard, 2ULL);
-		check(stat(path, &st) == 0 && st.st_size > 1 &&
-			  truncate(path, st.st_size / 2) == 0,
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 1 &&
+			  pread(fd, &last, 1, st.st_size - 1) == 1 &&
+			  ftruncate(fd, st.st_size - 1) == 0 && fsync(fd) == 0 &&
+			  close(fd) == 0,
 			  "truncate a committed nonzero WAL-index shard");
 		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 		expect_daemon_open_failure(dpid, shm,
 								   "truncated committed nonzero WAL-index shard fails closed");
+		fd = open(path, O_WRONLY | O_APPEND);
+		check(fd >= 0 && write(fd, &last, 1) == 1 && fsync(fd) == 0 &&
+			  close(fd) == 0,
+			  "restore the committed nonzero WAL-index shard tail");
+	}
+	{
+		char path[512];
+		struct stat st;
+
+		snprintf(path, sizeof(path), "%s/walidx_0_0_e%020llu", store, 2ULL);
+		check(stat(path, &st) == 0 && st.st_size > 0 && truncate(path, 0) == 0,
+			  "truncate an acknowledged shard-0 epoch at a complete-record boundary");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+								   "watermark detects complete loss of selected epoch records");
 	}
 	rm_rf(store);
 	shm_unlink(shm);
