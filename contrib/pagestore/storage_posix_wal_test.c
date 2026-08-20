@@ -85,6 +85,22 @@ main(void)
 		  "an empty retained suffix remains appendable");
 	PsStoragePosix.close();
 
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC", "1", 1) == 0 &&
+		  PsStoragePosix.open(directory, 0) == 0 &&
+		  PsStoragePosix.wal_append(7, "xy", 2, NULL, 0) == 0,
+		  "prepare a post-rename directory-sync failure");
+	check(PsStoragePosix.wal_rewrite_prefix(7, 1) != 0 &&
+		  PsStoragePosix.wal_append(7, "lost", 4, NULL, 0) != 0 &&
+		  PsStoragePosix.wal_read(7, 0, temporary, 1) < 0,
+		  "an ambiguous rename poisons WAL access until reopen");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC");
+	check(PsStoragePosix.open(directory, 0) == 0 && read_is(7, "xy", 2) &&
+		  PsStoragePosix.wal_append(7, "q", 1, NULL, 0) == 0 &&
+		  read_is(7, "xyq", 3),
+		  "reopen reconciles the visible replacement before new appends");
+	PsStoragePosix.close();
+
 	snprintf(temporary, sizeof(temporary), "%s/wal_7", directory);
 	unlink(temporary);
 	rmdir(directory);

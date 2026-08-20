@@ -1665,9 +1665,37 @@ static int		wal_start_valid[MAX_TIMELINES];
 static uint64_t wal_covered[MAX_TIMELINES];
 static uint64_t wal_covered_off[MAX_TIMELINES];
 static int		wal_covered_valid[MAX_TIMELINES];
-/* Flat-log offsets are replaced as one catalog cutover.  Readers retain the
- * matching offset map until their physical reads complete. */
-static pthread_rwlock_t wal_log_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* Flat-log offsets are replaced independently per timeline.  Readers retain
+ * that timeline's matching offset map until their physical reads complete. */
+static pthread_rwlock_t wal_log_locks[MAX_TIMELINES];
+static pthread_once_t wal_log_locks_once = PTHREAD_ONCE_INIT;
+static int wal_log_locks_failed;
+
+static void
+wal_log_locks_init(void)
+{
+	uint32_t initialized = 0;
+
+	for (; initialized < MAX_TIMELINES; initialized++)
+		if (pthread_rwlock_init(&wal_log_locks[initialized], NULL) != 0)
+			break;
+	if (initialized != MAX_TIMELINES)
+	{
+		while (initialized > 0)
+			pthread_rwlock_destroy(&wal_log_locks[--initialized]);
+		wal_log_locks_failed = 1;
+	}
+}
+
+static pthread_rwlock_t *
+wal_log_lock_for(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES ||
+		pthread_once(&wal_log_locks_once, wal_log_locks_init) != 0 ||
+		wal_log_locks_failed)
+		return NULL;
+	return &wal_log_locks[timeline];
+}
 
 static inline uint64_t
 wal_end_read(uint32_t timeline)
@@ -3843,11 +3871,14 @@ static int
 wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
 {
+	pthread_rwlock_t *lock = wal_log_lock_for(tl);
 	int rc;
 
-	pthread_rwlock_wrlock(&wal_log_lock);
+	if (lock == NULL)
+		return -1;
+	pthread_rwlock_wrlock(lock);
 	rc = wal_append_locked(tl, start_lsn, data, len);
-	pthread_rwlock_unlock(&wal_log_lock);
+	pthread_rwlock_unlock(lock);
 	return rc;
 }
 
@@ -4248,7 +4279,13 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 
 	for (;;)
 	{
-		uint64_t	ls = wal_log_start(tl);
+		pthread_rwlock_t *lock = wal_log_lock_for(tl);
+		uint64_t	ls;
+
+		if (lock == NULL)
+			break;
+		pthread_rwlock_rdlock(lock);
+		ls = wal_log_start(tl);
 
 		if (ls != UINT64_MAX && start + len > ls && start < cap)
 		{
@@ -4257,6 +4294,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 			filled += wal_read_one(tl, ws, (uint32_t) (start + len - ws),
 								   cap, out + (ws - start));
 		}
+		pthread_rwlock_unlock(lock);
 
 		/* everything below min(cap, fork, own coverage) is the parent's */
 		if (!timeline_has_parent(tl))
@@ -4277,12 +4315,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 static uint32_t
 wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 {
-	uint32_t filled;
-
-	pthread_rwlock_rdlock(&wal_log_lock);
-	filled = wal_read_locked(tl, start, len, out);
-	pthread_rwlock_unlock(&wal_log_lock);
-	return filled;
+	return wal_read_locked(tl, start, len, out);
 }
 
 /* Rebuild wal_end[tl] by scanning the timeline's WAL log at startup. */
@@ -5865,7 +5898,12 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				memcpy(&rec, buf + pos, sizeof(rec));
 				first = wal_log_start(tl);
 				if (walidx_progress[tl] == 0 && first != UINT64_MAX)
-					walidx_progress[tl] = first;
+				{
+					/* Zero is both a valid WAL start and the in-memory unset
+					 * sentinel.  Recover the original starting point from the
+					 * first durable progress record after flat-prefix reclaim. */
+					walidx_progress[tl] = first == 0 ? rec.start_lsn : first;
+				}
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
 					rec.crc != walidx_progress_crc(&rec) ||

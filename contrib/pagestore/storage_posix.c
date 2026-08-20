@@ -48,12 +48,14 @@ static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
 static int test_max_log_read;
 static int test_fail_wal_rewrite_before_rename;
+static int test_fail_wal_rewrite_dir_fsync;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flat WAL files are independent per timeline. */
 typedef struct PosixWalLock
 {
 	uint32_t	tl;
+	int		poisoned;
 	pthread_mutex_t lock;
 	struct PosixWalLock *next;
 } PosixWalLock;
@@ -229,6 +231,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_fork_meta_at;
 	const char *max_log_read;
 	const char *fail_wal_rewrite;
+	const char *fail_wal_rewrite_dir_fsync;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -252,6 +255,10 @@ posix_open(const char *path, uint64_t segment_size)
 	fail_wal_rewrite = getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_BEFORE_RENAME");
 	test_fail_wal_rewrite_before_rename = fail_wal_rewrite ?
 		atoi(fail_wal_rewrite) : 0;
+	fail_wal_rewrite_dir_fsync =
+		getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC");
+	test_fail_wal_rewrite_dir_fsync = fail_wal_rewrite_dir_fsync ?
+		atoi(fail_wal_rewrite_dir_fsync) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -476,7 +483,8 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 	if (lock == NULL)
 		return -1;
 	pthread_mutex_lock(&lock->lock);
-	rc = posix_wal_append_locked(tl, a, alen, b, blen);
+	rc = lock->poisoned ? -1 :
+		posix_wal_append_locked(tl, a, alen, b, blen);
 	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
@@ -484,15 +492,27 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 static int
 posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
+	PosixWalLock *lock = posix_wal_lock_for(tl);
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
 	uint32_t	done = 0;
 
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	if (lock->poisoned)
+	{
+		pthread_mutex_unlock(&lock->lock);
+		return -1;
+	}
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
+	{
+		pthread_mutex_unlock(&lock->lock);
 		return -1;
+	}
 	while (done < len)
 	{
 		n = pread(fd, (char *) buf + done, len - done, (off_t) off + done);
@@ -501,6 +521,7 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 			if (errno == EINTR)
 				continue;
 			close(fd);
+			pthread_mutex_unlock(&lock->lock);
 			return -1;
 		}
 		if (n == 0)
@@ -508,6 +529,7 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 		done += (uint32_t) n;
 	}
 	close(fd);
+	pthread_mutex_unlock(&lock->lock);
 	return (int) done;
 }
 
@@ -538,18 +560,17 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 	if (lock == NULL)
 		return -1;
 	pthread_mutex_lock(&lock->lock);
-	rc = posix_wal_truncate_locked(tl, len);
+	rc = lock->poisoned ? -1 : posix_wal_truncate_locked(tl, len);
 	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
 
 /*
  * Copy the retained suffix to a sibling, make it durable, then publish it with
- * rename.  The old file remains authoritative before rename.  Once rename
- * succeeds, either the old or new directory entry is crash-valid because the
- * immutable store also holds the removed prefix; a directory-fsync failure
- * must therefore not be reported as an unpublished replacement to a caller
- * that still has the old physical offsets.
+ * rename.  The old file remains authoritative before rename.  Success is
+ * reported only after the directory entry is durable; an ambiguous failure
+ * after rename poisons the timeline until storage is reopened and its physical
+ * offsets are recovered.
  */
 static int
 posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
@@ -568,6 +589,11 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	if (lock == NULL)
 		return -1;
 	pthread_mutex_lock(&lock->lock);
+	if (lock->poisoned)
+	{
+		pthread_mutex_unlock(&lock->lock);
+		return -1;
+	}
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	snprintf(tmp, sizeof(tmp), "%s/wal_%u.rewrite.tmp", posix_dir, tl);
 	src = open(path, O_RDONLY);
@@ -617,14 +643,24 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	}
 	if (rename(tmp, path) != 0)
 		goto out;
-	rc = 0;
 	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
-	if (dfd >= 0)
+	if (dfd < 0 ||
+		(test_fail_wal_rewrite_dir_fsync > 0 &&
+		 --test_fail_wal_rewrite_dir_fsync == 0) ||
+		fsync(dfd) != 0 || close(dfd) != 0)
 	{
-		(void) fsync(dfd);
-		(void) close(dfd);
+		/* The visible replacement has ambiguous crash durability.  Its physical
+		 * offsets no longer match the caller's catalog; force a reopen before
+		 * any further operation can observe or extend it. */
+		lock->poisoned = 1;
+		if (dfd >= 0)
+			(void) close(dfd);
 		dfd = -1;
+		errno = EIO;
+		goto out;
 	}
+	dfd = -1;
+	rc = 0;
 
 out:
 	if (src >= 0)
