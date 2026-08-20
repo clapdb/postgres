@@ -81,7 +81,8 @@ typedef struct PsStorage
 	 * removed files, 0 if already clean, and -1 on error. */
 	int			(*walidx_epoch_create) (uint32_t tl, uint32_t shard,
 								 uint64_t epoch);
-	int			(*walidx_epoch_gc) (uint32_t tl, uint64_t keep_epoch);
+	int			(*walidx_epoch_gc) (uint32_t tl, const uint64_t *keep_epochs,
+								 uint32_t nshards);
 
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);

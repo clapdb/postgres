@@ -4935,7 +4935,7 @@ walidx_snapshot_gc_one(void)
 	if (rc >= 0 && ps_storage->walidx_epoch_gc != NULL)
 	{
 		rc = ps_storage->walidx_epoch_gc((uint32_t) candidate,
-								walidx_log_epoch[candidate][0]);
+								walidx_log_epoch[candidate], core_shards());
 		if (rc > 0)
 			did = 1;
 	}

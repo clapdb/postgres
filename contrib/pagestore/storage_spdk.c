@@ -863,9 +863,10 @@ spdk_walidx_epoch_create(uint32_t tl, uint32_t shard, uint64_t epoch)
 }
 
 static int
-spdk_walidx_epoch_gc(uint32_t tl, uint64_t keep_epoch)
+spdk_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
+					uint32_t nshards)
 {
-	return PsStoragePosix.walidx_epoch_gc(tl, keep_epoch);
+	return PsStoragePosix.walidx_epoch_gc(tl, keep_epochs, nshards);
 }
 
 static int

@@ -579,30 +579,58 @@ posix_walidx_watermark_write(const char *log_name, uint64_t length, int create)
 {
 	PosixWalIdxWatermark watermark;
 	char marker[160];
-	char path[4096];
-	int flags = O_WRONLY | O_CLOEXEC | O_NOFOLLOW;
-	int fd;
+	char temporary[192] = {0};
+	struct stat st;
+	int directory_fd = -1;
+	int fd = -1;
+	int rc = -1;
 
 	if (posix_walidx_watermark_name(log_name, marker, sizeof(marker)) != 0 ||
-		snprintf(path, sizeof(path), "%s/%s", posix_dir, marker) < 0 ||
-		strlen(posix_dir) + 1 + strlen(marker) >= sizeof(path))
+		(directory_fd = open(posix_dir,
+						 O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
 		return -1;
-	if (create)
-		flags |= O_CREAT;
+	if (!create &&
+		(fstatat(directory_fd, marker, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+		 !S_ISREG(st.st_mode)))
+		goto cleanup;
 	memset(&watermark, 0, sizeof(watermark));
 	watermark.magic = POSIX_WALIDX_WATERMARK_MAGIC;
 	watermark.length = length;
 	watermark.crc = posix_walidx_watermark_crc(&watermark);
-	fd = open(path, flags, 0600);
-	if (fd < 0 || pwrite(fd, &watermark, sizeof(watermark), 0) !=
-			(ssize_t) sizeof(watermark) ||
-		ftruncate(fd, (off_t) sizeof(watermark)) != 0 || fsync(fd) != 0)
+	for (unsigned int attempt = 0; attempt < 128; attempt++)
 	{
-		if (fd >= 0)
-			close(fd);
-		return -1;
+		int n = snprintf(temporary, sizeof(temporary), "%s.tmp.%ld.%u",
+						 marker, (long) getpid(), attempt);
+
+		if (n < 0 || (size_t) n >= sizeof(temporary))
+			goto cleanup;
+		fd = openat(directory_fd, temporary,
+					O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+		if (fd >= 0 || errno != EEXIST)
+			break;
 	}
-	return close(fd);
+	if (fd < 0 || write(fd, &watermark, sizeof(watermark)) !=
+			(ssize_t) sizeof(watermark) || fsync(fd) != 0)
+		goto cleanup;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto cleanup;
+	}
+	fd = -1;
+	if (renameat(directory_fd, temporary, directory_fd, marker) != 0 ||
+		fsync(directory_fd) != 0)
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (fd >= 0)
+		close(fd);
+	if (temporary[0] != '\0')
+		(void) unlinkat(directory_fd, temporary, 0);
+	if (directory_fd >= 0 && close(directory_fd) != 0)
+		rc = -1;
+	return rc;
 }
 
 /* The watermark is the acknowledged epoch length.  A longer file is an
@@ -842,7 +870,8 @@ cleanup:
 }
 
 static int
-posix_walidx_epoch_gc(uint32_t tl, uint64_t keep_epoch)
+posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
+					 uint32_t nshards)
 {
 	char prefix[128];
 	struct dirent *entry;
@@ -853,9 +882,10 @@ posix_walidx_epoch_gc(uint32_t tl, uint64_t keep_epoch)
 	int rc = -1;
 	int n;
 
-	/* The manifest cutover drains old-epoch appenders before selecting
-	 * keep_epoch.  Older files are therefore immutable and can be scanned and
-	 * removed without taking the lock used by foreground appends to keep_epoch. */
+	if (keep_epochs == NULL || nshards == 0)
+		return -1;
+	/* The manifest cutover drains old-epoch appenders before selecting each
+	 * shard's keep epoch.  Older files are therefore immutable. */
 	n = snprintf(prefix, sizeof(prefix), "walidx_%u_", tl);
 	if (n < 0 || (size_t) n >= sizeof(prefix))
 		return -1;
@@ -883,7 +913,7 @@ posix_walidx_epoch_gc(uint32_t tl, uint64_t keep_epoch)
 		errno = 0;
 		parsed_shard = strtoul(entry->d_name + n, &shard_end, 10);
 		if (errno != 0 || shard_end == entry->d_name + n ||
-			parsed_shard > UINT32_MAX)
+			parsed_shard >= nshards)
 			goto next_entry;
 		suffix = shard_end;
 		if (strncmp(suffix, "_e", 2) == 0)
@@ -908,7 +938,7 @@ posix_walidx_epoch_gc(uint32_t tl, uint64_t keep_epoch)
 			posix_walidx_watermark_name(canonical, marker, sizeof(marker)) != 0 ||
 			strcmp(entry->d_name, is_marker ? marker : canonical) != 0)
 			goto next_entry;
-		if (epoch >= keep_epoch)
+		if (epoch >= keep_epochs[parsed_shard])
 			goto next_entry;
 		if (unlinkat(directory_fd, entry->d_name, 0) != 0)
 			goto cleanup;
