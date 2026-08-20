@@ -4255,6 +4255,28 @@ _Static_assert(sizeof(WalIdxRec) == 64,
 _Static_assert(offsetof(WalIdxRec, flags) == 12,
 			   "WAL-index flags must reuse the legacy reserved field");
 
+static int
+walidx_rec_compare(const void *left, const void *right)
+{
+	const WalIdxRec *a = left;
+	const WalIdxRec *b = right;
+
+#define CMP_FIELD(field) \
+	do { if (a->field < b->field) return -1; if (a->field > b->field) return 1; } while (0)
+	CMP_FIELD(key.spcOid);
+	CMP_FIELD(key.dbOid);
+	CMP_FIELD(key.relNumber);
+	CMP_FIELD(key.forkNum);
+	CMP_FIELD(key.klass);
+	CMP_FIELD(block);
+	CMP_FIELD(lsn);
+	CMP_FIELD(end_lsn);
+	CMP_FIELD(flags);
+	CMP_FIELD(timeline);
+#undef CMP_FIELD
+	return 0;
+}
+
 typedef struct WalIdxProgressRec
 {
 	uint32_t	magic;
@@ -4823,13 +4845,20 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 	WalIdxSnapshotProduceCtx *ctx = arg;
 	Shard *s = &g_shards[ctx->shard];
 	unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
-	WalIdxRec records[1024];
+	WalIdxRec *records;
 	size_t used = 0;
+	size_t total;
 
 	walidx_snapshot_encode_header(header, ctx->tl, ctx->shard, ctx->nrecords,
 							  ctx->generation, ctx->start_lsn, ctx->end_lsn,
 							  ctx->source_offset, ctx->log_epoch);
 	if (consume(consume_arg, header, sizeof(header)) != 0)
+		return -1;
+	if (ctx->nrecords > SIZE_MAX / sizeof(*records))
+		return -1;
+	total = (size_t) ctx->nrecords;
+	records = total == 0 ? NULL : malloc(total * sizeof(*records));
+	if (total != 0 && records == NULL)
 		return -1;
 	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
@@ -4856,7 +4885,14 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 				for (int i = 0; i < e->n; i++)
 					if (!ctx->compact || keep[i])
 				{
-					WalIdxRec *rec = &records[used++];
+					WalIdxRec *rec;
+
+					if (used == total)
+					{
+						free(records);
+						return -1;
+					}
+					rec = &records[used++];
 
 					memset(rec, 0, sizeof(*rec));
 					rec->magic = WALIDX_MAGIC;
@@ -4868,17 +4904,31 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 					rec->flags = e->items[i].flags;
 					rec->key = e->key;
 					rec->crc = walidx_rec_crc(rec);
-					if (used == sizeof(records) / sizeof(records[0]))
-					{
-						if (consume(consume_arg, records, sizeof(records)) != 0)
-							return -1;
-						used = 0;
-					}
 				}
 				free(keep);
 			}
-	return used == 0 ? 0 :
-		consume(consume_arg, records, used * sizeof(records[0]));
+	if (used != total)
+	{
+		free(records);
+		return -1;
+	}
+	qsort(records, total, sizeof(*records), walidx_rec_compare);
+	for (size_t offset = 0; offset < total; )
+	{
+		size_t count = total - offset;
+
+		if (count > 1024)
+			count = 1024;
+		if (consume(consume_arg, records + offset,
+						count * sizeof(*records)) != 0)
+		{
+			free(records);
+			return -1;
+		}
+		offset += count;
+	}
+	free(records);
+	return 0;
 }
 
 static int
@@ -8937,6 +8987,14 @@ ps_core_open(const char *store_dir)
 				return -1;
 			}
 			walidx_progress_init(tl, wal_log_start(tl));
+			{
+				char directory[4096];
+
+				if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
+					ps_walidx_snapshot_recover_prepared(directory, tl,
+									walidx_reclaimed_frontier[tl]) != 0)
+					return -1;
+			}
 			if (walidx_snapshot_recover(tl) != 0)
 				return -1;
 			for (uint32_t shard = 0; shard < core_shards(); shard++)

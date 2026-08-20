@@ -63,6 +63,7 @@ main(void)
 {
 	char root[] = "/tmp/pswalidxsnapXXXXXX";
 	char directory[1024];
+	char recovery_directory[1024];
 	char path[1200];
 	unsigned char shard0[257];
 	unsigned char shard1[513];
@@ -93,6 +94,7 @@ main(void)
 	memcpy(second, first, sizeof(second));
 	second[0].data = newer0;
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
+	snprintf(recovery_directory, sizeof(recovery_directory), "%s/timeline_1", root);
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,
 								 first, 3) != 0 && access(directory, F_OK) != 0,
@@ -203,6 +205,30 @@ main(void)
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
 		  "generation GC durably completes an ambiguous sync retry");
 
+	check(ps_walidx_snapshot_publish(recovery_directory, 1, 1, 100, 500,
+								 first, 3) == 0 &&
+		  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 1,
+		  "restart aborts a durable prepare intent behind an old frontier");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 900) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 1,
+		  "restart retains a durable prepare intent covered by the frontier");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_commit(&prepared) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 2 && snapshot.end_lsn == 900,
+		  "publisher retries the retained prepare intent idempotently");
+	ps_walidx_snapshot_close(&snapshot);
+
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 2ULL, 1U);
 	check(pwrite_byte(path, 17, shard1[17] ^ 0xff) == 0,
@@ -237,6 +263,16 @@ main(void)
 	}
 	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", directory);
 	unlink(path);
+	for (uint32_t generation = 1; generation <= 2; generation++)
+		for (uint32_t shard = 0; shard < 3; shard++)
+		{
+			snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+					 recovery_directory, (unsigned long long) generation, shard);
+			unlink(path);
+		}
+	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", recovery_directory);
+	unlink(path);
+	rmdir(recovery_directory);
 	rmdir(directory);
 	rmdir(root);
 

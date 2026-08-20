@@ -60,6 +60,12 @@ extern int ps_walidx_snapshot_prepare(PsWalIdxSnapshotPrepared *prepared,
 extern int ps_walidx_snapshot_commit(const PsWalIdxSnapshotPrepared *prepared);
 /* Remove a prepared generation that has not been selected by the manifest. */
 extern int ps_walidx_snapshot_abort(const PsWalIdxSnapshotPrepared *prepared);
+/* Reconcile a durable prepare intent before the owning timeline accepts writes.
+ * A frontier covering the prepared end retains it for publication retry; an
+ * older frontier aborts it.  Returns zero when no intent needs cleanup. */
+extern int ps_walidx_snapshot_recover_prepared(const char *directory,
+										uint32_t timeline,
+										uint64_t durable_frontier);
 
 /* Publish a complete immutable shard generation, then atomically select it.
  * The owning timeline must serialize publishers with its append cutover.  Old
