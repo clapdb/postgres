@@ -14,6 +14,138 @@
 
 static int segment_name(const PsWalStore *store, uint64_t segment_no,
 						char *name, size_t name_len);
+static int write_all(int fd, const void *data, size_t len);
+static int read_all_at(int fd, void *data, size_t len, off_t offset);
+static int random_suffix(char suffix[7]);
+
+#define PS_WAL_STORE_IDENTITY_BYTES 128
+
+static int
+format_store_identity(uint32_t timeline, uint64_t start_lsn,
+					  uint32_t segment_size, char *buf, size_t len)
+{
+	int n = snprintf(buf, len, "PSWALSTORE1 %u %u %020llu\n", timeline,
+					 segment_size, (unsigned long long) start_lsn);
+
+	return n < 0 || (size_t) n >= len ? -1 : n;
+}
+
+static int
+read_store_identity_fd(int directory_fd, uint32_t *timeline,
+					   uint64_t *start_lsn, uint32_t *segment_size)
+{
+	char buf[PS_WAL_STORE_IDENTITY_BYTES];
+	struct stat st;
+	unsigned int parsed_timeline;
+	unsigned int parsed_segment_size;
+	unsigned long long parsed_start;
+	int consumed = 0;
+	int fd;
+
+	fd = openat(directory_fd, PS_WAL_STORE_IDENTITY_FILE,
+				O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		st.st_size <= 0 || st.st_size >= (off_t) sizeof(buf))
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	if (read_all_at(fd, buf, (size_t) st.st_size, 0) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	buf[st.st_size] = '\0';
+	if (sscanf(buf, "PSWALSTORE1 %u %u %llu%n", &parsed_timeline,
+			   &parsed_segment_size, &parsed_start, &consumed) != 3 ||
+		consumed < 0 || consumed + 1 != st.st_size || buf[consumed] != '\n' ||
+		parsed_timeline == 0 ||
+		parsed_segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
+		parsed_segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
+		(parsed_segment_size & (parsed_segment_size - 1)) != 0 ||
+		parsed_start % parsed_segment_size != 0 ||
+		parsed_start > UINT64_MAX - parsed_segment_size)
+		return -1;
+	*timeline = parsed_timeline;
+	*segment_size = parsed_segment_size;
+	*start_lsn = parsed_start;
+	return 0;
+}
+
+static int
+store_identity_matches(int directory_fd, uint32_t timeline,
+					   uint64_t start_lsn, uint32_t segment_size)
+{
+	uint32_t actual_timeline;
+	uint32_t actual_segment_size;
+	uint64_t actual_start;
+
+	return read_store_identity_fd(directory_fd, &actual_timeline,
+							  &actual_start, &actual_segment_size) == 0 &&
+		actual_timeline == timeline && actual_start == start_lsn &&
+		actual_segment_size == segment_size ? 0 : -1;
+}
+
+static int
+publish_store_identity(PsWalStore *store)
+{
+	char buf[PS_WAL_STORE_IDENTITY_BYTES];
+	char temporary[128] = {0};
+	int len;
+	int fd = -1;
+	int rc = -1;
+
+	len = format_store_identity(store->timeline, store->start_lsn,
+							store->segment_size, buf, sizeof(buf));
+	if (len < 0)
+		return -1;
+	for (unsigned int attempt = 0; attempt < 128; attempt++)
+	{
+		char suffix[7];
+		int n;
+
+		if (random_suffix(suffix) != 0)
+			return -1;
+		n = snprintf(temporary, sizeof(temporary), "%s.tmp.%s",
+					 PS_WAL_STORE_IDENTITY_FILE, suffix);
+		if (n < 0 || (size_t) n >= sizeof(temporary))
+			return -1;
+		fd = openat(store->directory_fd, temporary,
+					O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+		if (fd >= 0 || errno != EEXIST)
+			break;
+	}
+	if (fd < 0)
+		return -1;
+	if (write_all(fd, buf, (size_t) len) != 0 || fsync(fd) != 0)
+		goto cleanup;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto cleanup;
+	}
+	fd = -1;
+	if (linkat(store->directory_fd, temporary, store->directory_fd,
+			   PS_WAL_STORE_IDENTITY_FILE, 0) != 0 &&
+		!(errno == EEXIST &&
+		  store_identity_matches(store->directory_fd, store->timeline,
+							 store->start_lsn, store->segment_size) == 0))
+		goto cleanup;
+	if (unlinkat(store->directory_fd, temporary, 0) != 0 ||
+		fsync(store->directory_fd) != 0)
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (fd >= 0)
+		close(fd);
+	if (temporary[0] != '\0')
+		(void) unlinkat(store->directory_fd, temporary, 0);
+	return rc;
+}
 
 static int
 reserve_entry(PsWalStore *store)
@@ -356,6 +488,12 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
 		return -1;
+	if (publish_store_identity(store) != 0)
+	{
+		close(store->directory_fd);
+		store->directory_fd = -1;
+		return -1;
+	}
 	/* Always sync the parent, including EEXIST retries.  A prior attempt may
 	 * have created the directory and failed before making that entry durable. */
 	if (created && getenv("PAGESTORE_TEST_FAIL_WAL_PARENT_FSYNC") != NULL)
@@ -461,6 +599,7 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	int prefix_len;
 	int parent_fd = -1;
 	int scan_fd = -1;
+	int identity_missing = 0;
 	int removed_temporary = 0;
 	int rc = -1;
 
@@ -471,6 +610,19 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
 		return -1;
+	/* Explicit-start open remains the safe migration path for legacy stores
+	 * that predate the identity file.  Once an identity exists it is immutable
+	 * and must match exactly. */
+	if (store_identity_matches(store->directory_fd, timeline, start_lsn,
+							   segment_size) != 0)
+	{
+		struct stat identity_st;
+
+		if (fstatat(store->directory_fd, PS_WAL_STORE_IDENTITY_FILE,
+					&identity_st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+			goto cleanup;
+		identity_missing = 1;
+	}
 	/* An earlier create may have exposed the directory and then reported an
 	 * ambiguous parent-fsync failure.  Reopen completes that durability step
 	 * before accepting or publishing segment contents. */
@@ -544,6 +696,11 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	for (uint64_t i = 0; i < count; i++)
 		if (load_segment(store, store->next_segment_no) != 0)
 			goto cleanup;
+	/* A legacy store can be opened only with an externally proven start LSN.
+	 * Publish that identity after validating every immutable segment, before a
+	 * later flat-prefix reclaim removes the final duplicate source of truth. */
+	if (identity_missing && publish_store_identity(store) != 0)
+		goto cleanup;
 	rc = 0;
 
 cleanup:
@@ -562,53 +719,25 @@ int
 ps_wal_store_open_existing(PsWalStore *store, const char *directory,
 						   uint32_t timeline, uint32_t segment_size)
 {
-	PsWalStore probe;
-	struct dirent *de;
-	DIR	   *dir = NULL;
-	uint64_t	first = UINT64_MAX;
-	char		prefix[64];
-	int		prefix_len;
-	int		rc = -1;
+	uint32_t identity_timeline;
+	uint32_t identity_segment_size;
+	uint64_t identity_start;
+	int directory_fd;
+	int rc;
 
-	if (initialize_store(&probe, directory, timeline, 0, segment_size) != 0)
+	directory_fd = open(directory,
+						O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (directory_fd < 0)
 		return -1;
-	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", timeline);
-	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
-		(dir = opendir(directory)) == NULL)
+	rc = read_store_identity_fd(directory_fd, &identity_timeline,
+								&identity_start, &identity_segment_size);
+	if (close(directory_fd) != 0)
+		rc = -1;
+	if (rc != 0 || identity_timeline != timeline ||
+		identity_segment_size != segment_size)
 		return -1;
-	while ((de = readdir(dir)) != NULL)
-	{
-		char expected[128];
-		char *end = NULL;
-		unsigned long long parsed;
-
-		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
-			continue;
-		errno = 0;
-		parsed = strtoull(de->d_name + prefix_len, &end, 10);
-		if (errno != 0 || end == de->d_name + prefix_len ||
-			segment_name(&probe, (uint64_t) parsed, expected,
-						 sizeof(expected)) != 0)
-			goto done;
-		if (*end == '\0' && strcmp(expected, de->d_name) == 0 &&
-			(uint64_t) parsed < first)
-			first = (uint64_t) parsed;
-	}
-	if (closedir(dir) != 0)
-	{
-		dir = NULL;
-		return -1;
-	}
-	dir = NULL;
-	if (first == UINT64_MAX || first > UINT64_MAX / segment_size)
-		return -1;
-	rc = ps_wal_store_open(store, directory, timeline,
-						   first * segment_size, segment_size);
-
-done:
-	if (dir != NULL)
-		closedir(dir);
-	return rc;
+	return ps_wal_store_open(store, directory, timeline, identity_start,
+							 segment_size);
 }
 
 /* Start at the first overlapping entry.  Segment validation streams through a

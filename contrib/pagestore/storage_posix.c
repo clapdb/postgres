@@ -647,7 +647,7 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	if (dfd < 0 ||
 		(test_fail_wal_rewrite_dir_fsync > 0 &&
 		 --test_fail_wal_rewrite_dir_fsync == 0) ||
-		fsync(dfd) != 0 || close(dfd) != 0)
+		fsync(dfd) != 0)
 	{
 		/* The visible replacement has ambiguous crash durability.  Its physical
 		 * offsets no longer match the caller's catalog; force a reopen before
@@ -659,7 +659,17 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 		errno = EIO;
 		goto out;
 	}
-	dfd = -1;
+	{
+		int close_rc = close(dfd);
+
+		dfd = -1;
+		if (close_rc != 0)
+		{
+			lock->poisoned = 1;
+			errno = EIO;
+			goto out;
+		}
+	}
 	rc = 0;
 
 out:

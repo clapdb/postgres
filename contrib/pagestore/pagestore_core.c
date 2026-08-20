@@ -3082,7 +3082,8 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 			timelines[new_tl].branch_lsn == branch_lsn &&
 			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
 
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES ||
+		timeline_is_used(new_tl) || wal_end_read(new_tl) != 0 || parent < 0 ||
 		parent >= MAX_TIMELINES || !timelines[parent].defined)
 		return 0;
 
@@ -3884,7 +3885,7 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 
 /* Fill 'out' from ONE timeline's log: the overlap of [start, start+len) with
  * [.., cap) and with each shipped chunk.  Bytes not covered are left as-is. */
-static uint32_t
+static int64_t
 wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 				  unsigned char *out)
 {
@@ -3911,6 +3912,8 @@ wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			int			n = ps_storage->wal_read(tl, src, out + (os - start),
 												 (uint32_t) (oe - os));
 
+			if (n < 0)
+				return -1;
 			if (n > 0)
 				filled += (uint32_t) n;
 		}
@@ -3921,7 +3924,7 @@ wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 /* Prefer validated immutable segments for their sealed prefix.  The flat log
  * remains the authoritative staging/tail representation until prefix
  * reclamation publishes a durable retained base. */
-static uint32_t
+static int64_t
 wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			 unsigned char *out)
 {
@@ -3943,9 +3946,13 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 	if (start < sealed_start)
 	{
 		uint64_t left_end = end < sealed_start ? end : sealed_start;
+		int64_t n;
 
-		filled += wal_read_flat_one(tl, start,
-								(uint32_t) (left_end - start), left_end, out);
+		n = wal_read_flat_one(tl, start,
+						  (uint32_t) (left_end - start), left_end, out);
+		if (n < 0)
+			return -1;
+		filled += (uint32_t) n;
 	}
 	if (start < sealed_end && end > sealed_start)
 	{
@@ -3955,16 +3962,20 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 		if (ps_wal_store_read(&wal_segment_stores[tl], segment_start,
 						  out + (segment_start - start),
 						  (uint32_t) (segment_end - segment_start)) != 0)
-			return filled;
+			return -1;
 		filled += (uint32_t) (segment_end - segment_start);
 	}
 	if (end > sealed_end)
 	{
 		uint64_t tail_start = start > sealed_end ? start : sealed_end;
+		int64_t n;
 
-		filled += wal_read_flat_one(tl, tail_start,
-								(uint32_t) (end - tail_start), end,
-								out + (tail_start - start));
+		n = wal_read_flat_one(tl, tail_start,
+						  (uint32_t) (end - tail_start), end,
+						  out + (tail_start - start));
+		if (n < 0)
+			return -1;
+		filled += (uint32_t) n;
 	}
 	return filled;
 }
@@ -4154,6 +4165,8 @@ wal_segment_open_one(uint32_t tl)
 	free(segment_buf);
 	free(flat_buf);
 	wal_segment_store_opened[tl] = 1;
+	if (wal_segment_stores[tl].nentries != 0)
+		timeline_mark_used(tl);
 	wal_start_observe(tl, wal_segment_stores[tl].start_lsn);
 	wal_end_advance(tl, wal_segment_stores[tl].end_lsn);
 	return 0;
@@ -4163,6 +4176,67 @@ fail:
 	free(flat_buf);
 	ps_wal_store_close(&wal_segment_stores[tl]);
 	return -1;
+}
+
+/* Immutable WAL can outlive both its reclaimed flat prefix and branch
+ * metadata (for example, an archiver may have shipped a timeline before its
+ * branch declaration arrives).  Discover canonical segment directories before
+ * selecting timelines for recovery so those ids remain occupied after restart. */
+static int
+wal_segment_discover_used(void)
+{
+	const char prefix[] = "wal_segments_";
+	struct dirent *de;
+	DIR *dir = NULL;
+	int root_fd = -1;
+	int scan_fd = -1;
+	int rc = -1;
+
+	root_fd = open(wal_segment_root,
+				   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (root_fd < 0 || (scan_fd = dup(root_fd)) < 0 ||
+		(dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((de = readdir(dir)) != NULL)
+	{
+		char expected[64];
+		char *end = NULL;
+		unsigned long parsed;
+		struct stat st;
+		int n;
+
+		if (strncmp(de->d_name, prefix, sizeof(prefix) - 1) != 0)
+			continue;
+		errno = 0;
+		parsed = strtoul(de->d_name + sizeof(prefix) - 1, &end, 10);
+		n = snprintf(expected, sizeof(expected), "%s%lu", prefix, parsed);
+		if (errno != 0 || end == de->d_name + sizeof(prefix) - 1 ||
+			*end != '\0' || n < 0 || (size_t) n >= sizeof(expected) ||
+			strcmp(expected, de->d_name) != 0 || parsed >= MAX_TIMELINES ||
+			fstatat(root_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+			!S_ISDIR(st.st_mode))
+			goto cleanup;
+		timeline_mark_used((uint32_t) parsed);
+		errno = 0;
+	}
+	if (errno != 0 || closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto cleanup;
+	}
+	dir = NULL;
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	if (scan_fd >= 0)
+		close(scan_fd);
+	if (root_fd >= 0)
+		close(root_fd);
+	return rc;
 }
 
 /* Remove only flat-log records whose complete logical range is already held
@@ -4266,7 +4340,7 @@ wal_segment_sync(uint32_t tl)
  * metadata is write-once after definition (see timeline_define), so the
  * walk needs no lock, matching tl_walk.
  */
-static uint32_t
+static int64_t
 wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 				unsigned char *out)
 {
@@ -4290,9 +4364,16 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 		if (ls != UINT64_MAX && start + len > ls && start < cap)
 		{
 			uint64_t	ws = start > ls ? start : ls;
+			int64_t		n;
 
-			filled += wal_read_one(tl, ws, (uint32_t) (start + len - ws),
-								   cap, out + (ws - start));
+			n = wal_read_one(tl, ws, (uint32_t) (start + len - ws),
+						 cap, out + (ws - start));
+			if (n < 0)
+			{
+				pthread_rwlock_unlock(lock);
+				return -1;
+			}
+			filled += (uint32_t) n;
 		}
 		pthread_rwlock_unlock(lock);
 
@@ -4312,7 +4393,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 	return filled;
 }
 
-static uint32_t
+static int64_t
 wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 {
 	return wal_read_locked(tl, start, len, out);
@@ -5953,6 +6034,7 @@ static int
 walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 {
 	WalIdxProgressRec rec;
+	pthread_rwlock_t *wal_lock;
 	uint64_t	current;
 	uint64_t	first;
 	int			rc = -1;
@@ -5968,6 +6050,13 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 		walidx_publish_wrunlock();
 		return -1;
 	}
+	wal_lock = wal_log_lock_for(tl);
+	if (wal_lock == NULL)
+	{
+		walidx_publish_wrunlock();
+		return -1;
+	}
+	pthread_rwlock_rdlock(wal_lock);
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
 	if (current == 0)
@@ -5997,12 +6086,14 @@ out:
 	pthread_mutex_unlock(&walidx_meta_lock);
 	if (!append_progress)
 	{
+		pthread_rwlock_unlock(wal_lock);
 		walidx_publish_wrunlock();
 		return -1;
 	}
 	if (ps_storage->walidx_append(tl, 0, walidx_log_epoch[tl][0],
 								&rec, sizeof(rec)) != 0)
 	{
+		pthread_rwlock_unlock(wal_lock);
 		walidx_publish_wrunlock();
 		return -1;
 	}
@@ -6026,6 +6117,7 @@ out:
 	rc = 0;
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
+	pthread_rwlock_unlock(wal_lock);
 	walidx_publish_wrunlock();
 	publish_wal_index_metrics();
 	return rc;
@@ -7850,7 +7942,14 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_READ:
-			ch->result = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
+			{
+				int64_t n = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
+
+				if (n < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = (uint32_t) n;
+			}
 			break;
 
 		case PS_OP_WAL_INDEX_ADD:
@@ -9015,6 +9114,7 @@ ps_core_open(const char *store_dir)
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	memset(timeline_used, 0, sizeof(timeline_used));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
@@ -9124,6 +9224,11 @@ ps_core_open(const char *store_dir)
 		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
 		return -1;
 	}
+	/* Load durable branch definitions before immutable-only ids are marked used:
+	 * metadata replay must be allowed to reconstruct a legitimate branch, while
+	 * later CREATE_BRANCH requests must not reuse any discovered id. */
+	if (wal_segment_discover_used() != 0)
+		return -1;
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
 	if (page_frontier_load(store_dir) != 0)
@@ -9218,7 +9323,7 @@ ps_core_open(const char *store_dir)
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if (tl == 0 || timelines[tl].defined)
+		if (tl == 0 || timelines[tl].defined || timeline_is_used(tl))
 		{
 			if (wal_recover_one(tl) != 0)
 				return -1;

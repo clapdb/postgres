@@ -1188,8 +1188,8 @@ op_timeline_info(uint32_t tl, uint32_t *parent_tl, uint64_t *branch_lsn)
 	return ch->result != 0;
 }
 
-/* Read len WAL bytes from start_lsn into out; returns bytes filled. */
-static uint32_t
+/* Read len WAL bytes from start_lsn into out; returns bytes filled or -1. */
+static int
 op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -1199,8 +1199,10 @@ op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	cl_exec();
+	if (ch->status != PS_STATUS_OK)
+		return -1;
 	memcpy(out, ch->data, len);
-	return ch->result;
+	return (int) ch->result;
 }
 
 /* --- per-page WAL index operations --- */
@@ -4318,6 +4320,12 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(op_walidx_progress(9, PS_IO_UNIT, 900 * 1024 + PS_IO_UNIT, NULL) == 0,
 		  "WAL-index progress spans immutable coverage and a crossing flat tail");
 
+	/* Timeline 7 deliberately has no branch metadata.  After its flat prefix
+	 * is fully reclaimed, restart must still rebuild the usage marker from the
+	 * immutable catalog and refuse reuse of the numeric timeline id. */
+	for (uint32_t off = 0; off < 1024 * 1024; off += PS_IO_UNIT)
+		op_wal_append(7, off, segment + off, PS_IO_UNIT);
+
 	/* a retry that carries an already-accepted prefix plus new bytes (a
 	 * partially shipped chunk re-sent whole) appends only the uncovered
 	 * suffix -- no duplicate chunk, exact distinct-byte counts */
@@ -4358,6 +4366,8 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 		  op_wal_read(8, 700000, sizeof(rback), rback) == sizeof(rback) &&
 		  memcmp(rback, segment + 700000, sizeof(rback)) == 0,
 		  "restart reopens and validates the immutable WAL segment catalog");
+	check(op_create_branch_status(7, 0, 0) == PS_STATUS_ERROR,
+		  "immutable-only WAL keeps a timeline id used across restart");
 	memset(rback, 0, sizeof(rback));
 	check(op_wal_size(9) == 900 * 1024 + PS_IO_UNIT &&
 		  op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&

@@ -13,6 +13,7 @@ typedef struct PsWalStoreEntry
 } PsWalStoreEntry;
 
 #define PS_WAL_STORE_VERIFY_CHUNK_BYTES (64u * 1024u)
+#define PS_WAL_STORE_IDENTITY_FILE "wal_store_identity_v1"
 
 typedef struct PsWalStore
 {
@@ -35,9 +36,9 @@ extern int ps_wal_store_create(PsWalStore *store, const char *directory,
 extern int ps_wal_store_open(PsWalStore *store, const char *directory,
 							 uint32_t timeline, uint64_t start_lsn,
 							 uint32_t segment_size);
-/* Discover the first canonical immutable segment and validate the full store.
- * This is used after the duplicate flat-log prefix no longer records the
- * immutable store's original start LSN. */
+/* Read the durable store identity and validate the full immutable store.  This
+ * is used after the duplicate flat-log prefix no longer records the immutable
+ * store's original start LSN. */
 extern int ps_wal_store_open_existing(PsWalStore *store, const char *directory,
 								  uint32_t timeline, uint32_t segment_size);
 /* Append one or more complete, segment-aligned immutable WAL segments. */
