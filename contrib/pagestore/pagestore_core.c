@@ -160,6 +160,7 @@ static int walidx_frontier_advance(uint32_t timeline, uint64_t frontier);
 static int walidx_frontier_ancestry_allows(uint32_t reader_timeline,
 									   uint64_t read_lsn);
 static int walidx_frontier_publication_pending(uint32_t timeline);
+static int walidx_frontier_ancestry_pending(uint32_t reader_timeline);
 
 /* Test-only crash boundaries for publication recovery.  They are inert unless
  * the daemon was explicitly started with the fault switch and the test has
@@ -2974,6 +2975,22 @@ walidx_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn)
 	}
 }
 
+/* Caller holds map_lock.  Descendant pins participate in every ancestor's
+ * prune fence, so a prepared cutover freezes mutations across that ancestry. */
+static int
+walidx_frontier_ancestry_pending(uint32_t reader_timeline)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, UINT64_MAX);
+
+	for (;;)
+	{
+		if (walidx_frontier_publication_pending(w.tl))
+			return 1;
+		if (!tl_walk_next(&w))
+			return 0;
+	}
+}
+
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
  * the whole ancestry before EXISTS/NBLOCKS can turn a hidden LSN-0 version
  * into an apparently valid empty relation. */
@@ -5608,9 +5625,15 @@ walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 	int			append_progress = 0;
 
 	/* A durable marker must name a contiguous prefix of shipped WAL. */
-	if (tl >= MAX_TIMELINES || walidx_frontier_publication_pending(tl))
+	if (tl >= MAX_TIMELINES)
 		return -1;
 	walidx_publish_wrlock();
+	/* Compaction may have published a frontier while this request waited. */
+	if (walidx_frontier_publication_pending(tl))
+	{
+		walidx_publish_wrunlock();
+		return -1;
+	}
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
 	if (current == 0)
@@ -7612,9 +7635,10 @@ ps_handle_meta(PsChannel *ch)
 							pin.admission_seq);
 					wal_index_allowed = timeline_defined &&
 						walidx_frontier_ancestry_allows(tl, pin.lsn);
+					wal_index_pending = timeline_defined &&
+						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
-					wal_index_pending =
-						walidx_frontier_publication_pending(tl) &&
+					wal_index_pending = wal_index_pending &&
 						((((old_found == 1 ? old_pin.resources : 0) |
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0) &&
 						!(old_found == 1 &&
@@ -7692,9 +7716,10 @@ ps_handle_meta(PsChannel *ch)
 							pin.admission_seq);
 					wal_index_allowed = timeline_defined &&
 						walidx_frontier_ancestry_allows(tl, pin.lsn);
+					wal_index_pending = timeline_defined &&
+						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
-					wal_index_pending =
-						walidx_frontier_publication_pending(tl) &&
+					wal_index_pending = wal_index_pending &&
 						((((old_found == 1 ? old_pin.resources : 0) |
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
 					if (timeline_defined &&
@@ -7740,10 +7765,10 @@ ps_handle_meta(PsChannel *ch)
 											ch->req_seq, &old_pin);
 				ps_lock_map_rd();
 				timeline_defined = tl < MAX_TIMELINES && timelines[tl].defined;
-				ps_unlock_map();
-				wal_index_pending = old_found == 1 &&
+				wal_index_pending = timeline_defined && old_found == 1 &&
 					(old_pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
-					walidx_frontier_publication_pending(tl);
+					walidx_frontier_ancestry_pending(tl);
+				ps_unlock_map();
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
 					   !timeline_defined || wal_index_pending) ?
 					PS_RETENTION_ERROR :

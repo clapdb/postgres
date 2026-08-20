@@ -4674,6 +4674,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 							   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_ERROR,
 			  "a retired exception cannot authorize reads or later admissions");
 	}
+	op_create_branch(7, 5, sizeof(wal) * 2);
 
 	client_detach();
 	stop_daemon(dpid);
@@ -4733,8 +4734,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			  op_retention_set(5, PS_RETENTION_OWNER_READER, 5005, 1,
 							   PS_RETENTION_RESOURCE_WAL_INDEX, 1200) ==
 			  PS_STATUS_ERROR &&
+			  op_retention_set(7, PS_RETENTION_OWNER_READER, 7001, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX,
+							   sizeof(wal) * 2) ==
+			  PS_STATUS_ERROR &&
 			  op_create_branch_status(6, 5, sizeof(wal) * 2) == PS_STATUS_ERROR,
-			  "pending frontier cutover backpressures index, pin, and branch mutations");
+			  "pending frontier cutover backpressures index, descendant pin, and branch mutations");
 	}
 	client_detach();
 	stop_daemon(dpid);
