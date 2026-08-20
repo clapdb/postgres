@@ -4854,7 +4854,6 @@ walidx_snapshot_gc_one(void)
 	}
 	if (candidate < 0)
 		return 0;
-	walidx_publish_wrlock();
 	if (walidx_snapshot_path((uint32_t) candidate, directory,
 							 sizeof(directory)) != 0)
 		rc = -1;
@@ -4871,7 +4870,6 @@ walidx_snapshot_gc_one(void)
 		walidx_snapshot_gc_retry_at[candidate] = now;
 		walidx_snapshot_gc_retry_at[candidate].tv_sec++;
 	}
-	walidx_publish_wrunlock();
 	return rc > 0;
 }
 

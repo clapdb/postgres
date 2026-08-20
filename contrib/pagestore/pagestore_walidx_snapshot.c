@@ -789,9 +789,14 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 		}
 		memcpy(names[count++], entry->d_name, strlen(entry->d_name) + 1);
 	}
-	if (errno != 0 || closedir(dir) != 0)
-		goto cleanup;
-	dir = NULL;
+	{
+		int scan_errno = errno;
+		int close_rc = closedir(dir);
+
+		dir = NULL;
+		if (scan_errno != 0 || close_rc != 0)
+			goto cleanup;
+	}
 	for (size_t i = 0; i < count; i++)
 		if (unlinkat(current.directory_fd, names[i], 0) != 0)
 			goto cleanup;
