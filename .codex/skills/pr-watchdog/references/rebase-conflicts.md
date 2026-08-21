@@ -33,6 +33,15 @@ must be reviewed as behavior. If an earlier stacked commit is already in base,
 replay only the commits after that semantic boundary, then verify the final
 base-to-head diff.
 
+If the watch starts after the preceding stacked branch was already rewritten,
+the current base tip is not necessarily the old PR boundary. Fetch the complete
+history and compare the current base-to-head commits with `git log
+--cherry-pick --right-only`, stable patch IDs, and parent-to-child diffs. Locate
+the first contiguous commit whose behavior is unique to the PR and use its
+parent as the old base tip before constructing the old range. If that boundary
+is ambiguous, do not fabricate an old range; report the ambiguity and use the
+reconstruction fallback from a fresh current base.
+
 Build an explicit mapping before editing:
 
 | Change in the conflict | Default treatment |
@@ -116,10 +125,11 @@ recorded lease and explicit refspec, then safely synchronize the isolated PR
 head worktree to the published tip:
 
 ```sh
-git push --force-with-lease=refs/heads/<head>:<recorded-remote-sha> \
-  <head-remote> <temporary-rebase-branch>:refs/heads/<head>
-git -C <pr-head-worktree> fetch <head-remote> <head>
-git -C <pr-head-worktree> reset --hard FETCH_HEAD
+git check-ref-format --branch "$head"
+git push --force-with-lease="refs/heads/$head:$recorded_remote_sha" \
+  "$head_remote" "$temporary_rebase_branch:refs/heads/$head"
+git -C "$pr_head_worktree" fetch "$head_remote" "$head"
+git -C "$pr_head_worktree" reset --hard FETCH_HEAD
 ```
 
 Only run the reset after confirming that the PR-head worktree is isolated,
