@@ -90,11 +90,14 @@ snapshot if the switch occurs after a remote update, commit, or push.
 ## Monitoring cycle
 
 Use the product's monitoring or wait mechanism when available. In this
-repository, use `script/poll_pr.py <pr> --interval 60 --cycles 5` for the
-fallback poller. The Python program is read-only: it owns `poll_pr`, gathers one
-coherent JSON snapshot per cycle, and must not decide readiness or mutate the
-PR. Sol owns `check`/interpretation of each snapshot, including stable review
-IDs, `(base, head)` identity, CI fingerprints, conflicts, and terminal state.
+repository, use `script/poll_pr.py <pr> --repo <owner/repo> --interval 60
+--cycles 5` for the fallback poller; always pass the repository recorded during
+establishment. The Python program is read-only: it owns `poll_pr`, gathers one
+coherent JSON snapshot per cycle, including GraphQL review-thread IDs and
+`isResolved` state, and must not decide readiness or mutate the PR. Sol owns
+`check`/interpretation of each snapshot, including stable review IDs, thread
+resolution, `(base, head)` identity, CI fingerprints, conflicts, and terminal
+state.
 After triggering a Codex review, or while a required review or CI run is
 pending, perform at least five polling cycles before concluding that the result
 is unavailable. Stop the wait early when a new head, actionable review, failed
@@ -148,8 +151,10 @@ authoritative.
 
 ## Handle reviews
 
-- Collect unresolved review threads and review decisions, including inline
-  comments. Deduplicate by stable review/thread identity, not comment text.
+- Collect review threads and review decisions, including inline comments, and
+  use the thread-level `isResolved` state from the poller's GraphQL snapshot.
+  Deduplicate by stable review/thread identity, not comment text; REST review
+  comments alone do not expose whether a thread is resolved.
 - Evaluate each finding against the code and repository rules. Do not implement
   a suggestion merely because it exists. Fix valid findings; explain incorrect,
   stale, conflicting, or out-of-scope findings with concrete evidence.

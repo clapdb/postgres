@@ -31,6 +31,50 @@ def repo_name() -> str:
     return value["nameWithOwner"]
 
 
+def graphql_json(query: str, variables: dict[str, Any]) -> Any:
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for name, value in variables.items():
+        args.extend(["-F", f"{name}={value}"])
+    return gh_json(args)
+
+
+def review_threads(repo: str, pr: str) -> list[dict[str, Any]]:
+    owner, name = repo.split("/", 1)
+    query = """
+      query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            reviewThreads(first: 100, after: $cursor) {
+              nodes {
+                id
+                isResolved
+                comments(first: 100) { nodes { databaseId } }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }
+        }
+      }
+    """
+    cursor: str | None = None
+    threads: list[dict[str, Any]] = []
+    while True:
+        result = graphql_json(
+            query,
+            {
+                "owner": owner,
+                "name": name,
+                "number": pr,
+                "cursor": cursor or "null",
+            },
+        )
+        page = result["data"]["repository"]["pullRequest"]["reviewThreads"]
+        threads.extend(page["nodes"])
+        if not page["pageInfo"]["hasNextPage"]:
+            return threads
+        cursor = page["pageInfo"]["endCursor"]
+
+
 def gh_collection(args: list[str]) -> list[Any]:
     pages = gh_json([*args, "--paginate", "--slurp"])
     if not pages:
@@ -71,6 +115,7 @@ def snapshot(repo: str, pr: str, cycle: int) -> dict[str, Any]:
     reviews = gh_collection(["api", f"repos/{repo}/pulls/{pr}/reviews"])
     inline = gh_collection(["api", f"repos/{repo}/pulls/{pr}/comments"])
     comments = gh_collection(["api", f"repos/{repo}/issues/{pr}/comments"])
+    threads = review_threads(repo, pr)
     return {
         "cycle": cycle,
         "observed_at": int(time.time()),
@@ -79,6 +124,7 @@ def snapshot(repo: str, pr: str, cycle: int) -> dict[str, Any]:
         "pull": view,
         "reviews": reviews,
         "inline_comments": inline,
+        "review_threads": threads,
         "issue_comments": comments,
     }
 
