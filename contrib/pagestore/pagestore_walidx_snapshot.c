@@ -179,13 +179,12 @@ ps_walidx_snapshot_next_generation(const char *directory,
 }
 
 int
-ps_walidx_snapshot_prepared_generation(const char *directory, uint32_t timeline,
-									   uint64_t *generation_out)
+ps_walidx_snapshot_read_prepared(const char *directory, uint32_t timeline,
+									   PsWalIdxSnapshotPrepared *prepared)
 {
-	PsWalIdxSnapshotPrepared prepared;
 	int directory_fd;
 
-	if (directory == NULL || generation_out == NULL)
+	if (directory == NULL || prepared == NULL)
 		return -1;
 	directory_fd = open_directory(directory, 0);
 	if (directory_fd < 0)
@@ -197,15 +196,29 @@ ps_walidx_snapshot_prepared_generation(const char *directory, uint32_t timeline,
 		close(directory_fd);
 		return saved_errno == ENOENT ? 0 : -1;
 	}
-	if (read_prepared(directory_fd, directory, timeline, &prepared, 1) != 0)
+	if (read_prepared(directory_fd, directory, timeline, prepared, 1) != 0)
 	{
 		close(directory_fd);
 		return -1;
 	}
 	if (close(directory_fd) != 0)
 		return -1;
-	*generation_out = prepared.generation;
 	return 1;
+}
+
+int
+ps_walidx_snapshot_prepared_generation(const char *directory, uint32_t timeline,
+									   uint64_t *generation_out)
+{
+	PsWalIdxSnapshotPrepared prepared;
+	int rc;
+
+	if (generation_out == NULL)
+		return -1;
+	rc = ps_walidx_snapshot_read_prepared(directory, timeline, &prepared);
+	if (rc == 1)
+		*generation_out = prepared.generation;
+	return rc;
 }
 
 int

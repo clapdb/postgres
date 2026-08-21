@@ -83,6 +83,10 @@ extern int ps_walidx_snapshot_next_generation(const char *directory,
 extern int ps_walidx_snapshot_prepared_generation(const char *directory,
 										 uint32_t timeline,
 										 uint64_t *generation_out);
+/* Read and validate the durable prepare intent, returning 0 when absent. */
+extern int ps_walidx_snapshot_read_prepared(const char *directory,
+										 uint32_t timeline,
+										 PsWalIdxSnapshotPrepared *prepared);
 /* Remove one failed, unselected publication; return 1 if it was selected. */
 extern int ps_walidx_snapshot_discard_generation(const char *directory,
 											 uint32_t timeline,
