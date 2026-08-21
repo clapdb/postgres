@@ -30,11 +30,12 @@ If the user only asks for PR status or analysis, remain read-only.
 
 ## Model routing
 
-For review and CI work, select `5.3-code-spark` by default. This includes
+For review and CI work, select `5.3codex-spark` by default (also known as
+`5.3-code-spark` in environments that expose the longer alias). This includes
 evaluating findings, diagnosing failed jobs, planning and implementing scoped
 fixes, and checking the resulting diff and test evidence.
 
-If `5.3-code-spark` is unavailable, rejected, not installed, or cannot be
+If `5.3codex-spark` is unavailable, rejected, not installed, or cannot be
 selected in the current execution environment, fall back to `luna` and
 continue the same workflow. Do not switch models merely because a task is
 complex or slow. If the runtime cannot select models at all, treat these names
@@ -88,12 +89,16 @@ snapshot if the switch occurs after a remote update, commit, or push.
 
 ## Monitoring cycle
 
-Use the product's monitoring or wait mechanism when available. Otherwise poll
-once every 60 seconds. After triggering a Codex review, or while a required
-review or CI run is pending, perform at least five polling cycles before
-concluding that the result is unavailable. Stop the wait early when a new
-head, actionable review, failed check, conflict, terminal PR state, or successful
-completion of the pending review/check appears;
+Use the product's monitoring or wait mechanism when available. In this
+repository, use `script/poll_pr.py <pr> --interval 60 --cycles 5` for the
+fallback poller. The Python program is read-only: it owns `poll_pr`, gathers one
+coherent JSON snapshot per cycle, and must not decide readiness or mutate the
+PR. Sol owns `check`/interpretation of each snapshot, including stable review
+IDs, `(base, head)` identity, CI fingerprints, conflicts, and terminal state.
+After triggering a Codex review, or while a required review or CI run is
+pending, perform at least five polling cycles before concluding that the result
+is unavailable. Stop the wait early when a new head, actionable review, failed
+check, conflict, terminal PR state, or successful completion of the pending review/check appears;
 process that state immediately and reset the polling counter after every state
 change or push. Respect API rate limits and do not emit unchanged status on
 every poll.
