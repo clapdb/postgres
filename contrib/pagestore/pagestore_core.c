@@ -5347,7 +5347,8 @@ walidx_snapshot_publish_one(void)
 			}
 			/* Full snapshots grow geometrically with the already snapshotted
 			 * log, bounding retained generations and total rewrite I/O. */
-			if (!invalid && (walidx_snapshot_reshard_pending[tl] ||
+			if (!invalid && (walidx_snapshot_end[tl] < walidx_reclaimed_frontier[tl] ||
+						 walidx_snapshot_reshard_pending[tl] ||
 						 tail >= threshold))
 			{
 				candidate = (int) tl;
@@ -5373,19 +5374,34 @@ walidx_snapshot_publish_one(void)
 		uint64_t dropped = 0;
 		char directory[4096];
 		int compact = 0;
+		int frontier_pending;
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
 			walidx_snapshot_start[tl] : wal_log_start(tl);
 		end_lsn = walidx_progress[tl];
 		previous_end = walidx_snapshot_end[tl];
+		frontier_pending = previous_end < walidx_reclaimed_frontier[tl];
 		pthread_mutex_unlock(&walidx_meta_lock);
 		if (start_lsn == UINT64_MAX ||
 			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
 			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
 			goto publish_done;
-		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
-			ps_walidx_snapshot_next_generation(directory,
+		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
+		{
+			retry = 1;
+			goto publish_done;
+		}
+		if (frontier_pending)
+		{
+			if (walidx_snapshot_generation[tl] == UINT64_MAX)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			generation = walidx_snapshot_generation[tl] + 1;
+		}
+		else if (ps_walidx_snapshot_next_generation(directory,
 					walidx_snapshot_generation[tl], &generation) != 0)
 		{
 			retry = 1;
