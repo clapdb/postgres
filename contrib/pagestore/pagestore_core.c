@@ -8859,10 +8859,10 @@ ps_core_open(const char *store_dir)
 	walidx_snapshot_gc_cursor = 0;
 	memset(walidx_snapshot_gc_retry_at, 0,
 		   sizeof(walidx_snapshot_gc_retry_at));
-memset(walidx_snapshot_cleanup, 0, sizeof(walidx_snapshot_cleanup));
-memset(walidx_snapshot_cleanup_pending, 0,
+	memset(walidx_snapshot_cleanup, 0, sizeof(walidx_snapshot_cleanup));
+	memset(walidx_snapshot_cleanup_pending, 0,
 		   sizeof(walidx_snapshot_cleanup_pending));
-memset(walidx_snapshot_cleanup_retry_at, 0,
+	memset(walidx_snapshot_cleanup_retry_at, 0,
 		   sizeof(walidx_snapshot_cleanup_retry_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
