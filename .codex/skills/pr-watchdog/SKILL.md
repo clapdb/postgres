@@ -28,6 +28,22 @@ secrets, or expanding the feature. Stop and ask before any such action.
 
 If the user only asks for PR status or analysis, remain read-only.
 
+## Model routing
+
+For review and CI work, select `5.3-code-spark` by default. This includes
+evaluating findings, diagnosing failed jobs, planning and implementing scoped
+fixes, and checking the resulting diff and test evidence.
+
+If `5.3-code-spark` is unavailable, rejected, not installed, or cannot be
+selected in the current execution environment, fall back to `luna` and
+continue the same workflow. Do not switch models merely because a task is
+complex or slow. If neither model is available, report the model-availability
+blocker instead of silently substituting another model.
+
+The selected model does not change the authorization boundary or repository
+rules. When switching from `5.3-code-spark` to `luna`, rebuild the current PR
+snapshot if the switch occurs after a remote update, commit, or push.
+
 ## Establish the watch
 
 1. Resolve the repository and exact PR URL or number. Read applicable
@@ -191,4 +207,3 @@ head repeatedly moves during a mutation, conflict resolution is ambiguous,
 required secrets or external infrastructure are unavailable, the same failure
 recurs for three cycles without new evidence, repository policy forbids the
 needed action, or the user cancels the watch.
-
