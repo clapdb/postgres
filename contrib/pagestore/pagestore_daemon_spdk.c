@@ -440,7 +440,13 @@ run_request(uint32_t i, PsChannel *ch)
 	}
 	else
 		pthread_rwlock_rdlock(&core_rwlock);
+	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
+		op == PS_OP_REQUIRE_BRANCH)
+		ps_lock_map_wr();
 	begin(i, ch);
+	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
+		op == PS_OP_REQUIRE_BRANCH)
+		ps_unlock_map();
 	if (is_write)
 		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);

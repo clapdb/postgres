@@ -29,7 +29,8 @@
 static int open_directory(const char *directory, int create);
 static int read_prepared(int directory_fd, const char *directory,
 						 uint32_t timeline,
-						 PsWalIdxSnapshotPrepared *prepared);
+						 PsWalIdxSnapshotPrepared *prepared,
+						 int validate_shards);
 static int test_failed_walidx_after_shard_once;
 
 static uint32_t
@@ -196,7 +197,7 @@ ps_walidx_snapshot_prepared_generation(const char *directory, uint32_t timeline,
 		close(directory_fd);
 		return saved_errno == ENOENT ? 0 : -1;
 	}
-	if (read_prepared(directory_fd, directory, timeline, &prepared) != 0)
+	if (read_prepared(directory_fd, directory, timeline, &prepared, 1) != 0)
 	{
 		close(directory_fd);
 		return -1;
@@ -585,7 +586,7 @@ publish_manifest(int directory_fd, const unsigned char *encoded, size_t len,
 
 static int
 read_prepared(int directory_fd, const char *directory, uint32_t timeline,
-			  PsWalIdxSnapshotPrepared *prepared)
+			  PsWalIdxSnapshotPrepared *prepared, int validate_shards)
 {
 	unsigned char header[WALIDX_SNAPSHOT_HEADER_BYTES];
 	unsigned char *encoded = NULL;
@@ -641,9 +642,10 @@ read_prepared(int directory_fd, const char *directory, uint32_t timeline,
 			goto cleanup;
 		prepared->shards[i].crc = get_le32(entry + 4);
 		prepared->shards[i].len = get_le64(entry + 8);
-		if (shard_name(prepared->generation, i, name, sizeof(name)) != 0 ||
-			published_shard_valid(directory_fd, name, prepared->shards[i].len,
-							 prepared->shards[i].crc) != 0)
+		if (validate_shards &&
+			(shard_name(prepared->generation, i, name, sizeof(name)) != 0 ||
+			 published_shard_valid(directory_fd, name, prepared->shards[i].len,
+							  prepared->shards[i].crc) != 0))
 			goto cleanup;
 	}
 	rc = 0;
@@ -681,7 +683,7 @@ publish_prepared(int directory_fd, const PsWalIdxSnapshotPrepared *prepared)
 
 	if (faccessat(directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) == 0)
 		return read_prepared(directory_fd, prepared->directory,
-						 prepared->timeline, &existing) == 0 &&
+						 prepared->timeline, &existing, 1) == 0 &&
 			prepared_equal(&existing, prepared) ? 0 : -1;
 	if (errno != ENOENT)
 		return -1;
@@ -983,12 +985,18 @@ ps_walidx_snapshot_recover_prepared(const char *directory, uint32_t timeline,
 	directory_fd = open_directory(directory, 0);
 	if (directory_fd < 0)
 		return errno == ENOENT ? 0 : -1;
-	if (read_prepared(directory_fd, directory, timeline, &prepared) != 0)
+	if (read_prepared(directory_fd, directory, timeline, &prepared, 1) != 0)
 	{
 		int saved_errno = errno;
+		PsWalIdxSnapshotPrepared partial;
 
-		if (faccessat(directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) != 0 &&
-			errno == ENOENT)
+		if (faccessat(directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) == 0 &&
+			read_prepared(directory_fd, directory, timeline, &partial, 0) == 0)
+		{
+			close(directory_fd);
+			return ps_walidx_snapshot_abort(&partial);
+		}
+		if (errno == ENOENT)
 		{
 			close(directory_fd);
 			return 0;
@@ -1027,7 +1035,18 @@ ps_walidx_snapshot_recover_prepared(const char *directory, uint32_t timeline,
 			ps_walidx_snapshot_close(&current);
 			return ps_walidx_snapshot_abort(&prepared);
 		}
-		ps_walidx_snapshot_close(&current);
+		/* An equal frontier only covers the selected manifest.  A staged
+		 * reshard with the same end LSN has not published a new frontier and
+		 * must be discarded after a crash. */
+		{
+			int frontier_covers_prepare =
+				prepared.end_lsn > current.end_lsn &&
+				durable_frontier >= prepared.end_lsn;
+
+			ps_walidx_snapshot_close(&current);
+			return frontier_covers_prepare ? 0 :
+				ps_walidx_snapshot_abort(&prepared);
+		}
 	}
 	/* The durable frontier is the publication decision.  Keep a covered
 	 * generation staged so the normal publisher retries the same canonical
