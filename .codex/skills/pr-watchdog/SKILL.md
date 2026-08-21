@@ -53,12 +53,20 @@ snapshot if the switch occurs after a remote update, commit, or push.
    and all required checks. Prefer connected GitHub tools when available;
    otherwise use `gh`.
 3. Confirm authentication, write access to the head branch, and that the head is
-   not a protected/default branch. A fork PR without writable head access is a
-   blocker, not permission to push somewhere else.
-4. Inspect the local worktree before switching branches. Preserve unrelated
+   not a protected/default branch or a prohibited release branch. Under the
+   repository policy, `branchdb_13` through `branchdb_19` must not be mutated
+   directly; release work must be cherry-picked from `pagestore`. A fork PR
+   without writable head access is a blocker, not permission to push somewhere
+   else. Stop before any mutation when the head violates this policy.
+4. Validate the PR base before any rebase or mutation. An ordinary PR must target
+   `pagestore`; a stacked PR may target its explicitly documented preceding
+   feature branch. Do not rebase or declare ready when the base is `master`, a
+   release branch, or another policy-invalid branch.
+5. Inspect the local worktree before switching branches. Preserve unrelated
    changes. Do not overwrite, stash, clean, or relocate user work without
    permission. Create a separate worktree if isolation is needed and safe.
-5. Record at least: PR identity, base branch, remote head SHA, handled review
+6. Record at least: PR identity, base branch, head repository and remote,
+   remote head SHA, handled review
    thread IDs, check run identities, and the last head SHA for which a Codex
    review was requested.
 
@@ -80,13 +88,20 @@ state. Process in this order:
 2. Remote head changed externally: stop any pending mutation, fetch, inspect the
    new commits, and rebuild the state snapshot before continuing.
 3. Merge conflict: run the conflict workflow.
-4. New actionable review feedback: run the review workflow.
-5. Failed or cancelled required CI: run the CI workflow.
-6. Pending CI or review: wait.
-7. Ready-state criteria satisfied: report readiness and stop.
+4. Current head has no Codex review and no recorded review request: post one
+   `@codex, review` trigger, record the head SHA, and wait for that review.
+5. New actionable review feedback: run the review workflow.
+6. Any failed or cancelled reported CI, including the standalone pagestore test
+   suite even when GitHub does not mark it required: run the CI workflow.
+7. Pending CI or review: wait.
+8. Ready-state criteria satisfied: report readiness and stop.
 
-After any commit or push, discard conclusions tied to the old SHA and start a
-fresh cycle. Never treat checks or reviews from an older head as current proof.
+Keep a local fix-and-push mutation atomic: after committing a fix, verify the
+diff and push it to the recorded head repository before restarting the monitoring
+cycle. If the local head is ahead of the remote, do not process the old snapshot
+or wait; finish the verified push or report the push blocker. After a successful
+push, discard conclusions tied to the old SHA and start a fresh cycle. Never
+treat checks or reviews from an older head as current proof.
 
 ## Handle reviews
 
@@ -149,11 +164,13 @@ For the detailed stacked-history and three-way conflict procedure, read
    with evidence that the commit's complete behavior is present.
 6. Run the affected tests, inspect the rewritten range with `git range-diff`,
    verify that the final diff against the base still contains the intended
-   feature and no accidental base reverts, and push only with an exact lease,
-   for example:
+   feature and no accidental base reverts. Push to the recorded head repository
+   remote, not an assumed `origin`, and use an explicit local-to-remote refspec
+   with an exact lease, for example:
 
    ```sh
-   git push --force-with-lease=refs/heads/<head>:<recorded-remote-sha> origin <head>
+   git push --force-with-lease=refs/heads/<head>:<recorded-remote-sha> \
+     <head-remote> HEAD:refs/heads/<head>
    ```
 
 7. If the lease fails, do not override it. Fetch the collaborator's update and
@@ -170,8 +187,9 @@ the base branch.
 ## Push and request a fresh Codex review
 
 - Before pushing, verify the diff, tests, intended branch, and current remote
-  head. Prefer ordinary push for additive fix commits; use force-with-lease only
-  for the authorized rebase workflow.
+  head. Prefer ordinary push for additive fix commits, still using the recorded
+  head remote and an explicit refspec (`<head-remote> HEAD:refs/heads/<head>`);
+  use force-with-lease only for the authorized rebase workflow.
 - After a successful push, read back the new remote head SHA and post exactly:
 
   ```text
@@ -197,7 +215,10 @@ the base branch.
 The default ready state requires all of the following on one unchanged head SHA:
 
 - the PR is open and mergeable without conflicts;
-- every required check has completed successfully;
+- every reported check has completed successfully, including the standalone
+  pagestore suite when present, regardless of whether branch protection marks it
+  required;
+- the PR base and head branches satisfy repository policy;
 - no unresolved actionable review thread or changes-requested decision remains;
 - the requested Codex review for the current pushed head has completed and its
   actionable findings are handled;

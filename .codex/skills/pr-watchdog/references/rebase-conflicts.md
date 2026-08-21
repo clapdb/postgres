@@ -9,9 +9,14 @@ Record the remote head and base before mutation. In an isolated worktree:
 
 ```sh
 git log --graph --oneline --decorate <base>..<head>
-git range-diff <base>...<head> <old-base>...<head>
+git range-diff <old-base>..<old-head> <new-base>..<new-head>
 git log --cherry-pick --right-only --oneline <base>...<head>
 ```
+
+Record both complete series before editing: `<old-base>..<old-head>` is the
+original PR series, and `<new-base>..<new-head>` is the candidate rebased
+series. Use the two-dot ranges in `range-diff`; symmetric three-dot ranges mix
+base-only commits with PR commits and can produce a misleading equivalence map.
 
 For suspected duplicates, compare `git show <commit>` with the base history
 and stable patch IDs. A different SHA is not enough to call a commit
@@ -89,11 +94,25 @@ git diff <unique-commit>^ <unique-commit> -- <paths>
 
 Replay each unique commit in order by applying its parent-to-child changes to
 the fresh base, resolving them by behavioral unit, then committing with the
-original message. This is still a rebase of the PR head: do not merge the base
-branch and do not copy already-integrated commits. After every reconstructed
-commit, compare its diff with the original commit's intended behavior and run
-the narrow test. Remove the temporary worktree only after the final diff and
-tests are recorded.
+original message while preserving its author metadata, for example with
+`git commit -C <source-commit>` after staging the reconstructed change. This is
+still a rebase of the PR head: do not merge the base branch and do not copy
+already-integrated commits. After every reconstructed commit, compare its diff
+with the original commit's intended behavior and run the narrow test.
+
+After the final reconstructed commit passes validation, publish that exact
+history as the PR head before removing the temporary worktree. Either move the
+local PR-head ref to the temporary branch's tip, or push the temporary branch
+directly with the recorded lease and explicit refspec, for example:
+
+```sh
+git update-ref refs/heads/<head> <temporary-rebase-branch>
+git push --force-with-lease=refs/heads/<head>:<recorded-remote-sha> \
+  <head-remote> <temporary-rebase-branch>:refs/heads/<head>
+```
+
+Verify the remote head SHA and final diff before cleanup. Remove the temporary
+worktree only after the PR head has been published and the tests are recorded.
 
 This fallback is preferred for a large refactor conflict because it separates
 base integration from feature replay. It is not permission to redesign the
@@ -127,4 +146,3 @@ that condition, complete at least one behavioral-unit attempt and the
 reconstruction fallback when the conflict is merely large. Report the exact
 conflicted files, competing invariants, attempted resolutions, test results,
 and missing decision.
-
