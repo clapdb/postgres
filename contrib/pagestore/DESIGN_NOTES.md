@@ -112,9 +112,10 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
 
 - Relation and fork indexes are rebuilt on restart.  The per-page WAL index is
   durably appended in per-(timeline, shard) logs; maintenance publishes an
-  immutable multi-shard snapshot and restart replays only its log tail.
-  Replacement-base selection and safe retirement of old logs/generations are
-  still future maintenance work.
+  immutable multi-shard snapshot that atomically selects fresh log epochs, and
+  restart replays only the selected epoch tail.  Superseded snapshot and log
+  epochs are removed asynchronously.  Replacement-base selection and pruning
+  old entries from the snapshot are still future maintenance work.
 - The IPC channel uses busy-polling (no eventfd) and one copy via the channel
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon

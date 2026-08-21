@@ -837,22 +837,36 @@ spdk_wal_truncate(uint32_t tl, uint64_t len)
 }
 
 static int
-spdk_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
+spdk_walidx_append(uint32_t tl, uint32_t shard, uint64_t epoch,
+				   const void *buf, uint32_t len)
 {
-	return PsStoragePosix.walidx_append(tl, shard, buf, len);
+	return PsStoragePosix.walidx_append(tl, shard, epoch, buf, len);
 }
 
 static int
-spdk_walidx_read(uint32_t tl, uint32_t shard, uint64_t off, void *buf,
-				 uint32_t len)
+spdk_walidx_read(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t off,
+				 void *buf, uint32_t len)
 {
-	return PsStoragePosix.walidx_read(tl, shard, off, buf, len);
+	return PsStoragePosix.walidx_read(tl, shard, epoch, off, buf, len);
 }
 
 static int
-spdk_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
+spdk_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t len)
 {
-	return PsStoragePosix.walidx_truncate(tl, shard, len);
+	return PsStoragePosix.walidx_truncate(tl, shard, epoch, len);
+}
+
+static int
+spdk_walidx_epoch_create(uint32_t tl, uint32_t shard, uint64_t epoch)
+{
+	return PsStoragePosix.walidx_epoch_create(tl, shard, epoch);
+}
+
+static int
+spdk_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
+					uint32_t nshards)
+{
+	return PsStoragePosix.walidx_epoch_gc(tl, keep_epochs, nshards);
 }
 
 static int
@@ -914,6 +928,8 @@ const PsStorage PsStorageSpdk = {
 	.walidx_append = spdk_walidx_append,
 	.walidx_read = spdk_walidx_read,
 	.walidx_truncate = spdk_walidx_truncate,
+	.walidx_epoch_create = spdk_walidx_epoch_create,
+	.walidx_epoch_gc = spdk_walidx_epoch_gc,
 	.meta_append = spdk_meta_append,
 	.meta_read = spdk_meta_read,
 	.meta_truncate = spdk_meta_truncate,

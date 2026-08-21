@@ -26,6 +26,7 @@
 #define VERIFY_BYTES (64u * 1024u)
 
 static int open_directory(const char *directory, int create);
+static int test_failed_walidx_after_shard_once;
 
 static uint32_t
 fnv1a(uint32_t hash, const void *data, size_t len)
@@ -595,9 +596,17 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 			goto cleanup;
 		{
 			const char *fail_after = getenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+			const char *fail_once =
+				getenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD_ONCE");
 
 			if (fail_after != NULL && strtoul(fail_after, NULL, 10) == i)
 				goto cleanup;
+			if (!test_failed_walidx_after_shard_once && fail_once != NULL &&
+				strtoul(fail_once, NULL, 10) == i)
+			{
+				test_failed_walidx_after_shard_once = 1;
+				goto cleanup;
+			}
 		}
 	}
 	manifest = encode_manifest(timeline, generation, start_lsn, end_lsn,
