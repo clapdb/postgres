@@ -50,8 +50,10 @@ snapshot if the switch occurs after a remote update, commit, or push.
    `AGENTS.md` files and repository-specific contribution instructions.
 2. Inspect the PR's open/closed state, head and base repositories/branches,
    current head SHA, mergeability, review decision, review threads, comments,
-   and all required checks. Prefer connected GitHub tools when available;
-   otherwise use `gh`.
+   auto-merge state, draft state, and all reported checks. Fetch both review
+   summaries and inline review comments; a summary with no body is not proof
+   that there are no findings. Prefer connected GitHub tools when available;
+   otherwise use `gh` and the corresponding pull-request review-comments API.
 3. Confirm authentication, write access to the head branch, and that the head is
    not a protected/default branch or a prohibited release branch. Under the
    repository policy, `branchdb_13` through `branchdb_19` must not be mutated
@@ -62,10 +64,12 @@ snapshot if the switch occurs after a remote update, commit, or push.
    `pagestore`; a stacked PR may target its explicitly documented preceding
    feature branch. Do not rebase or declare ready when the base is `master`, a
    release branch, or another policy-invalid branch.
-5. Inspect the local worktree before switching branches. Preserve unrelated
+5. If auto-merge is armed, stop before any mutation and ask for direction; this
+   skill is not authorized to alter or rely on an armed auto-merge request.
+6. Inspect the local worktree before switching branches. Preserve unrelated
    changes. Do not overwrite, stash, clean, or relocate user work without
    permission. Create a separate worktree if isolation is needed and safe.
-6. Record at least: PR identity, base branch, head repository and remote,
+7. Record at least: PR identity, base branch, head repository and remote,
    remote head SHA, handled review
    thread IDs, check run identities, and the last head SHA for which a Codex
    review was requested.
@@ -92,7 +96,9 @@ state. Process in this order:
    `@codex, review` trigger, record the head SHA, and wait for that review.
 5. New actionable review feedback: run the review workflow.
 6. Any failed or cancelled reported CI, including the standalone pagestore test
-   suite even when GitHub does not mark it required: run the CI workflow.
+   suite even when GitHub does not mark it required: run the CI workflow. Treat
+   an explicitly permitted `skipping` result as a terminal nonfailure, but
+   require an actual passing result from the standalone pagestore suite.
 7. Pending CI or review: wait.
 8. Ready-state criteria satisfied: report readiness and stop.
 
@@ -215,9 +221,11 @@ the base branch.
 The default ready state requires all of the following on one unchanged head SHA:
 
 - the PR is open and mergeable without conflicts;
-- every reported check has completed successfully, including the standalone
-  pagestore suite when present, regardless of whether branch protection marks it
-  required;
+- the PR is not a draft;
+- every reported check has completed successfully or is an explicitly permitted
+  `skipping` result, including the standalone pagestore suite when present,
+  regardless of whether branch protection marks it required; the standalone
+  suite itself must pass rather than skip;
 - the PR base and head branches satisfy repository policy;
 - no unresolved actionable review thread or changes-requested decision remains;
 - the requested Codex review for the current pushed head has completed and its

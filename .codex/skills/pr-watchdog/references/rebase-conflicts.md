@@ -5,18 +5,26 @@ rewritten equivalent commits.
 
 ## Establish the commit mapping
 
-Record the remote head and base before mutation. In an isolated worktree:
+Record the remote head and base before mutation. In an isolated worktree,
+inspect the old PR series and base/cherry/patch-ID evidence first:
 
 ```sh
 git log --graph --oneline --decorate <base>..<head>
-git range-diff <old-base>..<old-head> <new-base>..<new-head>
 git log --cherry-pick --right-only --oneline <base>...<head>
 ```
 
-Record both complete series before editing: `<old-base>..<old-head>` is the
-original PR series, and `<new-base>..<new-head>` is the candidate rebased
-series. Use the two-dot ranges in `range-diff`; symmetric three-dot ranges mix
-base-only commits with PR commits and can produce a misleading equivalence map.
+Do not invent a `<new-head>` before the rebase or reconstruction has produced
+it. After the candidate series exists, record both complete series and compare
+them with the two-dot form:
+
+```sh
+git range-diff <old-base>..<old-head> <new-base>..<new-head>
+```
+
+Here `<old-base>..<old-head>` is the original PR series and
+`<new-base>..<new-head>` is the candidate rebased series. Symmetric three-dot
+ranges mix base-only commits with PR commits and can produce a misleading
+equivalence map.
 
 For suspected duplicates, compare `git show <commit>` with the base history
 and stable patch IDs. A different SHA is not enough to call a commit
@@ -101,18 +109,24 @@ already-integrated commits. After every reconstructed commit, compare its diff
 with the original commit's intended behavior and run the narrow test.
 
 After the final reconstructed commit passes validation, publish that exact
-history as the PR head before removing the temporary worktree. Either move the
-local PR-head ref to the temporary branch's tip, or push the temporary branch
-directly with the recorded lease and explicit refspec, for example:
+history as the PR head before removing the temporary worktree. Do not move a
+ref that is checked out in another worktree with `git update-ref`; that leaves
+its index and files out of sync. Push the temporary branch directly with the
+recorded lease and explicit refspec, then safely synchronize the isolated PR
+head worktree to the published tip:
 
 ```sh
-git update-ref refs/heads/<head> <temporary-rebase-branch>
 git push --force-with-lease=refs/heads/<head>:<recorded-remote-sha> \
   <head-remote> <temporary-rebase-branch>:refs/heads/<head>
+git -C <pr-head-worktree> fetch <head-remote> <head>
+git -C <pr-head-worktree> reset --hard FETCH_HEAD
 ```
 
-Verify the remote head SHA and final diff before cleanup. Remove the temporary
-worktree only after the PR head has been published and the tests are recorded.
+Only run the reset after confirming that the PR-head worktree is isolated,
+clean, and contains no user changes. Verify the remote head SHA and final diff
+before cleanup. Remove the temporary worktree only after the PR head has been
+published, the isolated head worktree is synchronized, and the tests are
+recorded.
 
 This fallback is preferred for a large refactor conflict because it separates
 base integration from feature replay. It is not permission to redesign the
