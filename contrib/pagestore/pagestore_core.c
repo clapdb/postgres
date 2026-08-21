@@ -9130,6 +9130,7 @@ ps_core_open(const char *store_dir)
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	memset(timeline_used, 0, sizeof(timeline_used));
+	memset(wal_end, 0, sizeof(wal_end));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));

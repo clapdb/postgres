@@ -642,6 +642,11 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 		goto cleanup;
 	}
 	parent_fd = -1;
+	/* A matching identity may have become visible before the previous open
+	 * reported its child-directory fsync failure.  Re-sync the directory before
+	 * allowing recovery to rely on its immutable segments. */
+	if (!identity_missing && fsync(store->directory_fd) != 0)
+		goto cleanup;
 	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", timeline);
 	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
 		(scan_fd = dup(store->directory_fd)) < 0 ||
