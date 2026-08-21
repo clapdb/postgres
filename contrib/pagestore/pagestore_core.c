@@ -5389,60 +5389,42 @@ walidx_snapshot_publish_one(void)
 		previous_end = walidx_snapshot_end[tl];
 		frontier_pending = previous_end < walidx_reclaimed_frontier[tl];
 		pthread_mutex_unlock(&walidx_meta_lock);
+		if (start_lsn == UINT64_MAX ||
+			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
+			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
+			goto publish_done;
 		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
 		{
 			retry = 1;
 			goto publish_done;
 		}
-		/* A crash or a directory-fsync failure can leave a durable prepare
-		 * intent without a matching in-memory pending flag.  Reconcile it before
-		 * looking at the current shard layout: the prepared descriptor, not the
-		 * current ns, is the retry input. */
+		/* Reconcile an intent left by a failed prepare before allocating a new
+		 * generation.  A frontier-covered intent remains the authoritative retry
+		 * input; do not rebuild it with a changed shard layout. */
 		prepared_generation =
 			ps_walidx_snapshot_read_prepared(directory, tl, &staged);
 		if (prepared_generation < 0)
 		{
-			retry = 1;
-			goto publish_done;
+			if (ps_walidx_snapshot_recover_prepared(directory, tl,
+										 walidx_reclaimed_frontier[tl]) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
 		}
-		if (prepared_generation == 1)
+		else if (prepared_generation == 1)
 		{
-			if (walidx_reclaimed_frontier[tl] < staged.end_lsn)
+			if (!frontier_pending)
 			{
-				if (ps_walidx_snapshot_abort(&staged) != 0)
-					retry = 1;
+				retry = ps_walidx_snapshot_abort(&staged) != 0;
 				goto publish_done;
 			}
-			if (ps_walidx_snapshot_commit(&staged) != 0)
-			{
-				retry = 1;
-				goto publish_done;
-			}
-			if (walidx_prune_fences(tl, &fences, &nfences) != 0)
+			if (staged.nshards != ns)
 			{
 				retry = 1;
 				goto publish_done;
 			}
-			walidx_prune_memory(tl, staged.end_lsn, fences, nfences);
-			pthread_mutex_lock(&walidx_meta_lock);
-			walidx_snapshot_generation[tl] = staged.generation;
-			walidx_snapshot_start[tl] = staged.start_lsn;
-			walidx_snapshot_end[tl] = staged.end_lsn;
-			walidx_snapshot_bytes[tl] = 0;
-			for (uint32_t shard = 0; shard < staged.nshards; shard++)
-				walidx_snapshot_bytes[tl] += staged.shards[shard].len;
-			walidx_snapshot_reshard_pending[tl] = staged.nshards != ns;
-			memset(&walidx_snapshot_retry_at[tl], 0,
-				   sizeof(walidx_snapshot_retry_at[tl]));
-			walidx_snapshot_gc_pending[tl] = 1;
-			pthread_mutex_unlock(&walidx_meta_lock);
-			rc = 1;
-			goto publish_done;
 		}
-		if (start_lsn == UINT64_MAX ||
-			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
-			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
-			goto publish_done;
 		if (frontier_pending)
 		{
 			prepared_generation =
