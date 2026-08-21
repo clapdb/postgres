@@ -346,18 +346,22 @@ coordinated or stacked with R4 where the acceptance criteria overlap.
 
 ### R4. Compact and reclaim the WAL index
 
-Status: **R4a durable multi-shard snapshot generation format implemented;
-live index cutover, replacement-base selection, and reclamation remain**.
+Status: **R4a durable multi-shard snapshot generation and live cutover
+implemented; replacement-base selection and reclamation remain**.
 
 R4a publishes every per-shard snapshot as an immutable checksummed file before
 atomically replacing one checksummed timeline manifest.  Recovery validates
 the complete selected generation and never discovers an unpublished partial
 generation by directory scan.  Identical publication retries are idempotent,
 divergent retries and generation rollback fail closed, and old generations
-remain reachable for reader-drain and later reclamation.  The live integration
-must serialize this publisher with WAL-index append/progress under the existing
-publish lock; this format alone does not authorize dropping any log entry or
-raw WAL.
+remain reachable for reader-drain and later reclamation.  Live maintenance now
+freezes append/progress and drains admitted index readers under the existing
+publish lock, publishes all shard images, and records each source-log offset.
+Recovery restores the selected generation and replays only the tail after those
+absolute offsets.  Once a newer manifest is durable, maintenance validates it
+and idempotently removes older immutable snapshot shard generations; newer
+unpublished retry files are preserved.  No WAL-index log entry or raw WAL is
+dropped yet.
 
 Deliverables:
 
@@ -768,16 +772,15 @@ packaging do not block MVP completion.
 
 The remaining default sequence is:
 
-1. integrate R4a snapshots with WAL-index append/progress cutover;
-2. select replacement bases and reclaim old WAL-index generations;
-3. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
-4. R4b forkmeta compaction/reclamation and publication crash tests;
-5. R5 timeline deletion;
-6. R5b reclaimer backpressure controllers;
-7. H0 fault/inspection primitives (may proceed alongside R3/R4);
-8. H1 composed crash scenarios;
-9. H2 format fixtures and compatibility CI;
-10. R6 bounded-space acceptance and final MVP status update.
+1. select replacement bases and reclaim old WAL-index generations;
+2. R3b WAL reclaimer, enabled after those raw-WAL dependencies are removed;
+3. R4b forkmeta compaction/reclamation and publication crash tests;
+4. R5 timeline deletion;
+5. R5b reclaimer backpressure controllers;
+6. H0 fault/inspection primitives (may proceed alongside R3/R4);
+7. H1 composed crash scenarios;
+8. H2 format fixtures and compatibility CI;
+9. R6 bounded-space acceptance and final MVP status update.
 
 Keep each PR independently reviewable and keep the existing standalone and
 golden suites green.  If work packages depend on one another before their base

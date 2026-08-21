@@ -18,6 +18,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <signal.h>
@@ -2970,6 +2971,7 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
 	char		store[256];
+	char		snapshot_path[512];
 	const uint32_t ps = 8192;
 	uint32_t	rel = find_relation_on_shard(1, 4);
 	unsigned char wal[512] = {0};
@@ -2985,13 +2987,26 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 
 	check(rel != 0, "test harness can find a relation that moves to shard 1");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "force a legacy one-shard WAL-index snapshot");
 	pid = spawn_daemon(daemon_path, shm, store, ps, 1);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
 	op_walidx_add(0, rel, 0, 0, 320);
 	check(op_walidx_progress(0, 0, 350, &progress) == 0,
 		  "single-shard WAL-index progress commits before reshard");
+	snprintf(snapshot_path, sizeof(snapshot_path),
+			 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+			 store, 1ULL, 0U);
+	for (int attempt = 0; attempt < 500 &&
+		 access(snapshot_path, F_OK) != 0; attempt++)
+		usleep(10000);
+	check(access(snapshot_path, F_OK) == 0,
+		  "single-shard store publishes a WAL-index snapshot before reshard");
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);
@@ -3004,6 +3019,14 @@ run_legacy_walidx_reshard_suite(const char *daemon_path, const char *tmpbase)
 		  "reshard replays legacy physical shard-zero WAL-index record");
 	check(op_walidx_progress(0, 350, 400, &progress) == 0,
 		  "post-reshard progress keeps legacy WAL-index ownership physical");
+	snprintf(snapshot_path, sizeof(snapshot_path),
+			 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+			 store, 2ULL, 3U);
+	for (int attempt = 0; attempt < 500 &&
+		 access(snapshot_path, F_OK) != 0; attempt++)
+		usleep(10000);
+	check(access(snapshot_path, F_OK) == 0,
+		  "reshard republishes the snapshot in the current shard layout");
 	client_detach();
 	stop_daemon(pid);
 	shm_unlink(shm);
@@ -4322,7 +4345,12 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	rm_rf(store);
 	shm_unlink(shm);
 
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "force one WAL-index snapshot generation for recovery coverage");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
@@ -4374,17 +4402,43 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries are queryable in LSN order");
 	{
+		char manifest[512];
+		int visible = 0;
+
+		snprintf(manifest, sizeof(manifest),
+				 "%s/walidx_snapshots_0/walidx_manifest_v1", store);
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			if (access(manifest, F_OK) == 0)
+			{
+				visible = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(visible, "maintenance publishes a live WAL-index snapshot");
+	}
+	/* This is deliberately newer than the test-capped snapshot generation, so
+	 * restart must combine the immutable image with the original log tail. */
+	op_walidx_add(0, REL_A, FORK0, 9, 400);
+	/* Supply enough tail to cross the geometric replacement threshold after
+	 * restart without weakening the production anti-rewrite policy. */
+	for (uint32_t i = 0; i < 32; i++)
+		op_walidx_add(0, REL_A, FORK0, 10 + i, 401 + i);
+	check(op_walidx_progress(0, 350, 512, NULL) == 0,
+		  "WAL-index progress advances beyond the snapshot generation");
+	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "WAL index progress reports the committed end");
 		check(op_walidx_progress(UINT32_MAX, 0, 0, &progress) != 0,
 			  "WAL index progress rejects an out-of-range timeline");
 		op_wal_append(0, high, wal, 16);
-		check(op_walidx_progress(0, 350, high + 16, &progress) != 0,
+		check(op_walidx_progress(0, 512, high + 16, &progress) != 0,
 			  "WAL index progress rejects a marker crossing unshipped WAL");
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "rejected WAL index progress leaves the committed end unchanged");
 		op_create_branch(2, 0, 0);
 		op_wal_append(2, high, wal, 16);
@@ -4409,8 +4463,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
 		  "enable short log reads during WAL index recovery");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
+		  "allow one replacement snapshot after tail recovery");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 	unsetenv("PAGESTORE_TEST_MAX_LOG_READ");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	n = op_walidx_get(0, REL_A, FORK0, 0, 1000000, out);
@@ -4422,11 +4481,14 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries survive daemon restart");
+	n = op_walidx_get(0, REL_A, FORK0, 9, 1000000, out);
+	check(n == 1 && out[0].lsn == 400,
+		  "restart replays the WAL-index log tail after the snapshot offset");
 	{
 		uint64_t	progress;
 		uint64_t	high = 0x100000000ULL;
 
-		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 350,
+		check(op_walidx_progress(0, 0, 0, &progress) == 0 && progress == 512,
 			  "WAL index progress survives daemon restart");
 		check(op_walidx_progress(2, 0, 0, &progress) == 0 &&
 			  progress == high + 16,
@@ -4436,6 +4498,30 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		check(op_walidx_progress(4, 0, 0, &progress) == 0 &&
 			  progress == high + 32,
 			  "initial indexing boundary is recovered from durable WAL");
+	}
+	{
+		char old_shard[512];
+		char current_shard[512];
+		int collected = 0;
+
+		snprintf(old_shard, sizeof(old_shard),
+				 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+				 store, 1ULL, 0U);
+		snprintf(current_shard, sizeof(current_shard),
+				 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+				 store, 2ULL, 0U);
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			if (access(old_shard, F_OK) != 0 && errno == ENOENT &&
+				access(current_shard, F_OK) == 0)
+			{
+				collected = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(collected,
+			  "maintenance retires the old WAL-index snapshot generation");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
