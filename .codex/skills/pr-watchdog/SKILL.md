@@ -65,9 +65,13 @@ snapshot if the switch occurs after a remote update, commit, or push.
 ## Monitoring cycle
 
 Use the product's monitoring or wait mechanism when available. Otherwise poll
-with backoff: start around 30 seconds, increase toward five minutes while state
-is unchanged, and reset after a state change or push. Respect API rate limits.
-Do not spin or repeatedly emit unchanged status.
+once every 60 seconds. After triggering a Codex review, or while a required
+review or CI run is pending, perform at least five polling cycles before
+concluding that the result is unavailable. Stop the wait early only when a new
+head, actionable review, failed check, conflict, or terminal PR state appears;
+process that state immediately and reset the polling counter after every state
+change or push. Respect API rate limits and do not emit unchanged status on
+every poll.
 
 For every cycle, take one coherent snapshot and compare it with the previous
 state. Process in this order:
@@ -182,8 +186,8 @@ the base branch.
 
 - Request once per pushed head SHA. Do not post duplicate triggers for the same
   SHA. If the integration provides no acknowledgement or review after a
-  reasonable wait, verify that Codex review is enabled and retry once; then
-  report the integration problem instead of spamming comments.
+  minimum of five one-minute polls, verify that Codex review is enabled and
+  retry once; then report the integration problem instead of spamming comments.
 - Wait for the resulting review and associate it with the current head before
   declaring the PR ready. Handle any new actionable findings through the normal
   review workflow.
