@@ -27,6 +27,9 @@
 #define VERIFY_BYTES (64u * 1024u)
 
 static int open_directory(const char *directory, int create);
+static int read_prepared(int directory_fd, const char *directory,
+						 uint32_t timeline,
+						 PsWalIdxSnapshotPrepared *prepared);
 static int test_failed_walidx_after_shard_once;
 
 static uint32_t
@@ -172,6 +175,36 @@ ps_walidx_snapshot_next_generation(const char *directory,
 		return -1;
 	*generation_out = highest + 1;
 	return 0;
+}
+
+int
+ps_walidx_snapshot_prepared_generation(const char *directory, uint32_t timeline,
+									   uint64_t *generation_out)
+{
+	PsWalIdxSnapshotPrepared prepared;
+	int directory_fd;
+
+	if (directory == NULL || generation_out == NULL)
+		return -1;
+	directory_fd = open_directory(directory, 0);
+	if (directory_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (faccessat(directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) != 0)
+	{
+		int saved_errno = errno;
+
+		close(directory_fd);
+		return saved_errno == ENOENT ? 0 : -1;
+	}
+	if (read_prepared(directory_fd, directory, timeline, &prepared) != 0)
+	{
+		close(directory_fd);
+		return -1;
+	}
+	if (close(directory_fd) != 0)
+		return -1;
+	*generation_out = prepared.generation;
+	return 1;
 }
 
 int
@@ -1015,7 +1048,13 @@ ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 	if (ps_walidx_snapshot_prepare(&prepared, directory, timeline, generation,
 								 start_lsn, end_lsn, inputs, nshards) != 0)
 		return -1;
-	return ps_walidx_snapshot_commit(&prepared);
+	if (ps_walidx_snapshot_commit(&prepared) == 0)
+		return 0;
+	/* A failed manifest cutover must not leave an ordinary prepared intent
+	 * behind.  If the manifest was already selected, abort deliberately fails
+	 * and recovery will reconcile the idempotent selected generation. */
+	(void) ps_walidx_snapshot_abort(&prepared);
+	return -1;
 }
 
 static int

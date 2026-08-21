@@ -77,8 +77,12 @@ extern int ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 									  uint32_t nshards);
 /* Allocate above both the selected generation and immutable publication debris. */
 extern int ps_walidx_snapshot_next_generation(const char *directory,
-										   uint64_t selected_generation,
-										   uint64_t *generation_out);
+									  uint64_t selected_generation,
+									  uint64_t *generation_out);
+/* Return the durable prepare generation, or zero when no intent exists. */
+extern int ps_walidx_snapshot_prepared_generation(const char *directory,
+										 uint32_t timeline,
+										 uint64_t *generation_out);
 /* Remove one failed, unselected publication; return 1 if it was selected. */
 extern int ps_walidx_snapshot_discard_generation(const char *directory,
 											 uint32_t timeline,

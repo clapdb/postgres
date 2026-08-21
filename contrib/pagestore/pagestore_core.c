@@ -4872,13 +4872,17 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 
 					keep = malloc((size_t) e->n);
 					if (keep == NULL)
+					{
+						free(records);
 						return -1;
+					}
 					kept = walidx_entry_prune_plan(e, ctx->end_lsn,
 													  ctx->horizons, ctx->nhorizons,
 													  keep);
 					if (kept < 0)
 					{
 						free(keep);
+						free(records);
 						return -1;
 					}
 				}
@@ -5375,6 +5379,7 @@ walidx_snapshot_publish_one(void)
 		char directory[4096];
 		int compact = 0;
 		int frontier_pending;
+		int prepared_generation;
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
@@ -5394,12 +5399,18 @@ walidx_snapshot_publish_one(void)
 		}
 		if (frontier_pending)
 		{
-			if (walidx_snapshot_generation[tl] == UINT64_MAX)
+			prepared_generation =
+				ps_walidx_snapshot_prepared_generation(directory, tl,
+											 &generation);
+			if (prepared_generation < 0 ||
+				(prepared_generation == 0 &&
+				 walidx_snapshot_generation[tl] == UINT64_MAX))
 			{
 				retry = 1;
 				goto publish_done;
 			}
-			generation = walidx_snapshot_generation[tl] + 1;
+			if (prepared_generation == 0)
+				generation = walidx_snapshot_generation[tl] + 1;
 		}
 		else if (ps_walidx_snapshot_next_generation(directory,
 					walidx_snapshot_generation[tl], &generation) != 0)
