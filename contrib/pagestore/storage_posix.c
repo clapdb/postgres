@@ -271,6 +271,8 @@ posix_open(const char *path, uint64_t segment_size)
 	}
 	if (close(dfd) != 0)
 		return -1;
+	/* A successful reopen has reconciled any ambiguous post-rename state. */
+	posix_wal_locks_clear();
 	return 0;
 }
 

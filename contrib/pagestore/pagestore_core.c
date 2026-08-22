@@ -4292,7 +4292,7 @@ wal_segment_sync(uint32_t tl)
 		return -1;
 	if (store->end_lsn > UINT64_MAX - WAL_IMMUTABLE_SEGMENT_BYTES ||
 		store->end_lsn + WAL_IMMUTABLE_SEGMENT_BYTES > wal_end_read(tl))
-		return 0;
+		return wal_flat_reclaim(tl) < 0 ? -1 : 0;
 	buf = malloc(WAL_IMMUTABLE_SEGMENT_BYTES);
 	if (buf == NULL)
 		return -1;
@@ -4357,7 +4357,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 		uint64_t	ls;
 
 		if (lock == NULL)
-			break;
+			return -1;
 		pthread_rwlock_rdlock(lock);
 		ls = wal_log_start(tl);
 
@@ -9127,10 +9127,32 @@ ps_core_open(const char *store_dir)
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	/* A close/open cycle may switch to a store with different timelines.  Drop
+	 * every in-memory flat-WAL catalog before metadata replay selects which
+	 * timelines to recover; resetting only wal_end would leave stale offsets and
+	 * chunk references available for a newly reused timeline id. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		if (wal_segment_store_opened[tl])
+		{
+			ps_wal_store_close(&wal_segment_stores[tl]);
+			wal_segment_store_opened[tl] = 0;
+		}
+		free(wal_chunks[tl]);
+		wal_chunks[tl] = NULL;
+		wal_chunks_n[tl] = 0;
+		wal_chunks_cap[tl] = 0;
+	}
+	memset(wal_log_bytes, 0, sizeof(wal_log_bytes));
+	memset(wal_start, 0, sizeof(wal_start));
+	memset(wal_start_valid, 0, sizeof(wal_start_valid));
+	memset(wal_end, 0, sizeof(wal_end));
+	memset(wal_covered, 0, sizeof(wal_covered));
+	memset(wal_covered_off, 0, sizeof(wal_covered_off));
+	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	memset(timeline_used, 0, sizeof(timeline_used));
-	memset(wal_end, 0, sizeof(wal_end));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
