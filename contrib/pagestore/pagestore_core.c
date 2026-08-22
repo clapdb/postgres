@@ -34,6 +34,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,7 +52,9 @@
 #include "pagestore_prune.h"
 #include "pagestore_retention.h"
 #include "pagestore_wal_store.h"
+#include "pagestore_walidx_prune.h"
 #include "pagestore_walidx_snapshot.h"
+#include "pagestore_fault.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -102,6 +105,8 @@ static int retention_project_lsn(uint32_t descendant, uint32_t target,
 static int timeline_has_parent(uint32_t timeline);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
+static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
+								   uint32_t *nfences_out);
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
@@ -118,6 +123,9 @@ static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
+/* WAL-index pins must stay fixed from replacement-chain planning through the
+ * durable frontier and generation-manifest cutover. */
+static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *metrics_header;
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
@@ -136,26 +144,24 @@ static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
 								 uint64_t admission_seq);
 
-/* Test-only crash boundaries for publication recovery.  They are inert unless
- * the daemon was explicitly started with the fault switch and the test has
- * armed the store-local marker after startup. */
-static void
-test_crash_compaction_at(const char *phase)
+#define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
+#define PS_WALIDX_FRONTIER_VERSION 1
+typedef struct PsWalIdxFrontierState
 {
-	const char *enabled = getenv("PAGESTORE_TEST_FAULT");
-	const char *requested = getenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
-	char		marker[4096];
-	int			n;
-
-	if (enabled == NULL || strcmp(enabled, "1") != 0 || requested == NULL ||
-		strcmp(requested, phase) != 0 || page_frontier_dir[0] == '\0')
-		return;
-	n = snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed",
-				 page_frontier_dir);
-	if (n < 0 || (size_t) n >= sizeof(marker) || access(marker, F_OK) != 0)
-		return;
-	_exit(88);
-}
+	uint32_t	magic;
+	uint32_t	version;
+	uint64_t	frontiers[1024];
+	uint32_t	crc;
+} PsWalIdxFrontierState;
+static char walidx_frontier_path[4096];
+static char walidx_frontier_dir[4096];
+static uint64_t walidx_reclaimed_frontier[1024];
+static int walidx_frontier_load(const char *store_dir);
+static int walidx_frontier_advance(uint32_t timeline, uint64_t frontier);
+static int walidx_frontier_ancestry_allows(uint32_t reader_timeline,
+									   uint64_t read_lsn);
+static int walidx_frontier_publication_pending(uint32_t timeline);
+static int walidx_frontier_ancestry_pending(uint32_t reader_timeline);
 
 static uint64_t
 admission_seq_alloc(void)
@@ -1285,7 +1291,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		(void) ps_layer_store->delete_local_layer(&newdesc);
 		goto cleanup;
 	}
-	test_crash_compaction_at("after_frontier");
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) != 0)
+		goto cleanup;
 	if (record_layer(NULL, &newdesc) != 0)
 	{
 		(void) ps_layer_store->delete_local_layer(&newdesc);
@@ -1294,7 +1301,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	/* The replacement is published before any source is retired.  Keep this
 	 * distinct crash boundary so recovery covers both live sources and the
 	 * replacement together. */
-	test_crash_compaction_at("after_publish");
+	if (ps_fault_probe(PS_FAULT_POINT_PAGE_COMPACTION_AFTER_PUBLISH) != 0)
+		goto cleanup;
 	/* The durable replacement no longer contains these versions.  Drop their
 	 * in-memory index entries at the same publication point; otherwise a live
 	 * read can select a pruned PageVer and then fail because no layer can serve
@@ -1335,7 +1343,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 		if (ps_manifest_mark_delete(old[k].layer_id) != 0)
 			goto cleanup;		/* incomplete: old layers stay live, count not cut */
 		/* The replacement is visible and this source is now durably retired. */
-		test_crash_compaction_at("after_mark_delete");
+		if (ps_fault_probe(PS_FAULT_POINT_PAGE_GC_AFTER_MARK_DELETE) != 0)
+			goto cleanup;
 		if (ps_layer_store->delete_local_layer(&old[k]) != 0)
 			continue;			/* still "deleting"; gc_resume() will retry */
 		/*
@@ -1634,9 +1643,42 @@ timeline_is_used(uint32_t timeline)
 
 /* highest end LSN (start+len) of shipped WAL received per timeline */
 static uint64_t wal_end[MAX_TIMELINES];
+static uint64_t wal_start[MAX_TIMELINES];
+static int		wal_start_valid[MAX_TIMELINES];
 static uint64_t wal_covered[MAX_TIMELINES];
 static uint64_t wal_covered_off[MAX_TIMELINES];
 static int		wal_covered_valid[MAX_TIMELINES];
+/* Flat-log offsets are replaced independently per timeline.  Readers retain
+ * that timeline's matching offset map until their physical reads complete. */
+static pthread_rwlock_t wal_log_locks[MAX_TIMELINES];
+static pthread_once_t wal_log_locks_once = PTHREAD_ONCE_INIT;
+static int wal_log_locks_failed;
+
+static void
+wal_log_locks_init(void)
+{
+	uint32_t initialized = 0;
+
+	for (; initialized < MAX_TIMELINES; initialized++)
+		if (pthread_rwlock_init(&wal_log_locks[initialized], NULL) != 0)
+			break;
+	if (initialized != MAX_TIMELINES)
+	{
+		while (initialized > 0)
+			pthread_rwlock_destroy(&wal_log_locks[--initialized]);
+		wal_log_locks_failed = 1;
+	}
+}
+
+static pthread_rwlock_t *
+wal_log_lock_for(uint32_t timeline)
+{
+	if (timeline >= MAX_TIMELINES ||
+		pthread_once(&wal_log_locks_once, wal_log_locks_init) != 0 ||
+		wal_log_locks_failed)
+		return NULL;
+	return &wal_log_locks[timeline];
+}
 
 static inline uint64_t
 wal_end_read(uint32_t timeline)
@@ -1660,6 +1702,19 @@ wal_end_advance(uint32_t timeline, uint64_t end_lsn)
 										__ATOMIC_RELEASE,
 										__ATOMIC_RELAXED))
 		;
+}
+
+static inline void
+wal_start_observe(uint32_t timeline, uint64_t start_lsn)
+{
+	if (timeline >= MAX_TIMELINES)
+		return;
+	if (!__atomic_load_n(&wal_start_valid[timeline], __ATOMIC_ACQUIRE) ||
+		start_lsn < __atomic_load_n(&wal_start[timeline], __ATOMIC_RELAXED))
+	{
+		__atomic_store_n(&wal_start[timeline], start_lsn, __ATOMIC_RELAXED);
+		__atomic_store_n(&wal_start_valid[timeline], 1, __ATOMIC_RELEASE);
+	}
 }
 
 /* FNV-1a hash over a byte range (used to hash keys into buckets). */
@@ -1867,6 +1922,156 @@ page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 									  lsn, admission_seq))
 		return 0;
 	return 1;
+}
+
+static uint32_t
+walidx_frontier_crc(const PsWalIdxFrontierState *state)
+{
+	return fnv(state, offsetof(PsWalIdxFrontierState, crc));
+}
+
+static int
+walidx_frontier_publish(void)
+{
+	PsWalIdxFrontierState state;
+	char		tmp[4096];
+	int			fd = -1;
+	int			n;
+	int			rc = -1;
+
+	memset(&state, 0, sizeof(state));
+	state.magic = PS_WALIDX_FRONTIER_MAGIC;
+	state.version = PS_WALIDX_FRONTIER_VERSION;
+	memcpy(state.frontiers, walidx_reclaimed_frontier,
+		   sizeof(state.frontiers));
+	state.crc = walidx_frontier_crc(&state);
+	n = snprintf(tmp, sizeof(tmp), "%s.tmp", walidx_frontier_path);
+	if (n < 0 || (size_t) n >= sizeof(tmp))
+		return -1;
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0 || write(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		fsync(fd) != 0)
+		goto done;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto done;
+	}
+	fd = -1;
+	if (rename(tmp, walidx_frontier_path) != 0 ||
+		fsync_dir_path(walidx_frontier_dir) != 0)
+		goto done;
+	rc = 0;
+done:
+	if (fd >= 0)
+		close(fd);
+	if (rc != 0)
+		unlink(tmp);
+	return rc;
+}
+
+static int
+walidx_frontier_load(const char *store_dir)
+{
+	PsWalIdxFrontierState state;
+	unsigned char extra;
+	int			fd;
+	int			n;
+
+	memset(walidx_reclaimed_frontier, 0,
+		   sizeof(walidx_reclaimed_frontier));
+	n = snprintf(walidx_frontier_dir, sizeof(walidx_frontier_dir), "%s",
+				 store_dir);
+	if (n < 0 || (size_t) n >= sizeof(walidx_frontier_dir))
+		return -1;
+	n = snprintf(walidx_frontier_path, sizeof(walidx_frontier_path),
+				 "%s/walidx-prune.frontiers", store_dir);
+	if (n < 0 || (size_t) n >= sizeof(walidx_frontier_path))
+		return -1;
+	fd = open(walidx_frontier_path, O_RDONLY);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+		read(fd, &extra, 1) != 0 ||
+		state.magic != PS_WALIDX_FRONTIER_MAGIC ||
+		state.version != PS_WALIDX_FRONTIER_VERSION ||
+		state.crc != walidx_frontier_crc(&state))
+	{
+		close(fd);
+		errno = EILSEQ;
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	memcpy(walidx_reclaimed_frontier, state.frontiers,
+		   sizeof(walidx_reclaimed_frontier));
+	return 0;
+}
+
+static int
+walidx_frontier_advance(uint32_t timeline, uint64_t frontier)
+{
+	uint64_t old;
+
+	if (timeline >= MAX_TIMELINES || frontier == 0)
+		return -1;
+	old = walidx_reclaimed_frontier[timeline];
+	if (frontier <= old)
+		return 0;
+	walidx_reclaimed_frontier[timeline] = frontier;
+	if (walidx_frontier_publish() != 0)
+	{
+		walidx_reclaimed_frontier[timeline] = old;
+		return -1;
+	}
+	return 0;
+}
+
+/* Caller holds map_lock.  Every active WAL-index pin and every descendant
+ * branch point is an exact exception represented in a compacted snapshot. */
+static int
+walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int active = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 0;
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected) &&
+				projected == lsn)
+			{
+				active = 1;
+				break;
+			}
+		}
+	free(pins);
+	if (active)
+		return 1;
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t projected = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &projected) &&
+			projected == lsn)
+			return 1;
+	}
+	return 0;
+}
+
+static int
+walidx_frontier_allows(uint32_t timeline, uint64_t lsn)
+{
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	return lsn >= walidx_reclaimed_frontier[timeline] ||
+		walidx_frontier_exception_active(timeline, lsn);
 }
 
 static int
@@ -2784,6 +2989,37 @@ page_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn,
 	}
 }
 
+/* Caller holds map_lock. */
+static int
+walidx_frontier_ancestry_allows(uint32_t reader_timeline, uint64_t read_lsn)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, read_lsn);
+
+	for (;;)
+	{
+		if (!walidx_frontier_allows(w.tl, w.lsn))
+			return 0;
+		if (!tl_walk_next(&w))
+			return 1;
+	}
+}
+
+/* Caller holds map_lock.  Descendant pins participate in every ancestor's
+ * prune fence, so a prepared cutover freezes mutations across that ancestry. */
+static int
+walidx_frontier_ancestry_pending(uint32_t reader_timeline)
+{
+	TlWalk		w = tl_walk_first(reader_timeline, UINT64_MAX);
+
+	for (;;)
+	{
+		if (walidx_frontier_publication_pending(w.tl))
+			return 1;
+		if (!tl_walk_next(&w))
+			return 0;
+	}
+}
+
 /* A capped relation read cannot prove completeness for WAL-less pages.  Check
  * the whole ancestry before EXISTS/NBLOCKS can turn a hidden LSN-0 version
  * into an apparently valid empty relation. */
@@ -2829,7 +3065,8 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 			timelines[new_tl].branch_lsn == branch_lsn &&
 			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
 
-	if (new_tl == 0 || new_tl >= MAX_TIMELINES || parent < 0 ||
+	if (new_tl == 0 || new_tl >= MAX_TIMELINES ||
+		timeline_is_used(new_tl) || wal_end_read(new_tl) != 0 || parent < 0 ||
 		parent >= MAX_TIMELINES || !timelines[parent].defined)
 		return 0;
 
@@ -2853,7 +3090,10 @@ branch_frontiers_allow(int parent, uint64_t branch_lsn)
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
 	{
 		if (!timelines[t].defined ||
-			cap < page_reclaimed_frontier[t].lsn)
+			walidx_frontier_publication_pending((uint32_t) t) ||
+			cap < page_reclaimed_frontier[t].lsn ||
+			(cap < walidx_reclaimed_frontier[t] &&
+			 !walidx_frontier_exception_active((uint32_t) t, cap)))
 			return 0;
 		if (timelines[t].parent >= 0 && cap > timelines[t].branch_lsn)
 			cap = timelines[t].branch_lsn;
@@ -3381,6 +3621,7 @@ static char wal_segment_root[4096];
 
 static void walidx_progress_init(uint32_t tl, uint64_t first_lsn);
 static int wal_segment_sync(uint32_t tl);
+static int wal_flat_reclaim(uint32_t tl);
 
 static int
 wal_chunk_reserve(uint32_t tl)
@@ -3408,6 +3649,7 @@ wal_chunk_add(uint32_t tl, uint64_t record_off, const WalRecHdr *h)
 	ref->end_lsn = h->start_lsn + h->len;
 	ref->payload_off = record_off + sizeof(*h);
 	wal_log_bytes[tl] = ref->payload_off + h->len;
+	wal_start_observe(tl, h->start_lsn);
 }
 
 static uint32_t
@@ -3457,6 +3699,41 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 
 	*covered_prefix = 0;
 	*prefix_only = 1;
+	/* A reclaimed flat prefix remains authoritative in immutable segments.
+	 * Include it in retry/divergence detection before consulting the tail map. */
+	if (wal_segment_store_opened[tl])
+	{
+		PsWalStore *store = &wal_segment_stores[tl];
+		uint64_t os = start_lsn > store->start_lsn ?
+			start_lsn : store->start_lsn;
+		uint64_t oe = we < store->end_lsn ? we : store->end_lsn;
+
+		if (os < oe)
+		{
+			uint32_t n = (uint32_t) (oe - os);
+			uint32_t base = (uint32_t) (os - start_lsn);
+
+			tmp = malloc(len);
+			mask = calloc(1, len);
+			if (!tmp || !mask ||
+				ps_wal_store_read(store, os, tmp, n) != 0 ||
+				memcmp(tmp, data + base, n) != 0)
+			{
+				fprintf(stderr, "pagestore: refusing divergent WAL overlap on "
+						"timeline %u at %llu (+%u): bytes differ from the "
+						"immutable shipped history\n",
+						tl, (unsigned long long) os, n);
+				free(tmp);
+				free(mask);
+				return -1;
+			}
+			for (uint32_t j = 0; j < n; j++)
+			{
+				mask[base + j] = 1;
+				covered++;
+			}
+		}
+	}
 	for (uint32_t i = wal_chunk_lower_bound(tl, start_lsn);
 		 i < wal_chunks_n[tl] && wal_chunks[tl][i].start_lsn < we; i++)
 	{
@@ -3517,8 +3794,8 @@ wal_overlap_check(uint32_t tl, uint64_t start_lsn,
 }
 
 static int
-wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
-		   uint32_t len)
+wal_append_locked(uint32_t tl, uint64_t start_lsn,
+				  const unsigned char *data, uint32_t len)
 {
 	WalRecHdr	h;
 
@@ -3574,9 +3851,24 @@ wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
 	return wal_segment_sync(tl);
 }
 
+static int
+wal_append(uint32_t tl, uint64_t start_lsn, const unsigned char *data,
+		   uint32_t len)
+{
+	pthread_rwlock_t *lock = wal_log_lock_for(tl);
+	int rc;
+
+	if (lock == NULL)
+		return -1;
+	pthread_rwlock_wrlock(lock);
+	rc = wal_append_locked(tl, start_lsn, data, len);
+	pthread_rwlock_unlock(lock);
+	return rc;
+}
+
 /* Fill 'out' from ONE timeline's log: the overlap of [start, start+len) with
  * [.., cap) and with each shipped chunk.  Bytes not covered are left as-is. */
-static uint32_t
+static int64_t
 wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 				  unsigned char *out)
 {
@@ -3603,6 +3895,8 @@ wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			int			n = ps_storage->wal_read(tl, src, out + (os - start),
 												 (uint32_t) (oe - os));
 
+			if (n < 0)
+				return -1;
 			if (n > 0)
 				filled += (uint32_t) n;
 		}
@@ -3613,7 +3907,7 @@ wal_read_flat_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 /* Prefer validated immutable segments for their sealed prefix.  The flat log
  * remains the authoritative staging/tail representation until prefix
  * reclamation publishes a durable retained base. */
-static uint32_t
+static int64_t
 wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 			 unsigned char *out)
 {
@@ -3635,9 +3929,13 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 	if (start < sealed_start)
 	{
 		uint64_t left_end = end < sealed_start ? end : sealed_start;
+		int64_t n;
 
-		filled += wal_read_flat_one(tl, start,
-								(uint32_t) (left_end - start), left_end, out);
+		n = wal_read_flat_one(tl, start,
+						  (uint32_t) (left_end - start), left_end, out);
+		if (n < 0)
+			return -1;
+		filled += (uint32_t) n;
 	}
 	if (start < sealed_end && end > sealed_start)
 	{
@@ -3647,16 +3945,20 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 		if (ps_wal_store_read(&wal_segment_stores[tl], segment_start,
 						  out + (segment_start - start),
 						  (uint32_t) (segment_end - segment_start)) != 0)
-			return filled;
+			return -1;
 		filled += (uint32_t) (segment_end - segment_start);
 	}
 	if (end > sealed_end)
 	{
 		uint64_t tail_start = start > sealed_end ? start : sealed_end;
+		int64_t n;
 
-		filled += wal_read_flat_one(tl, tail_start,
-								(uint32_t) (end - tail_start), end,
-								out + (tail_start - start));
+		n = wal_read_flat_one(tl, tail_start,
+						  (uint32_t) (end - tail_start), end,
+						  out + (tail_start - start));
+		if (n < 0)
+			return -1;
+		filled += (uint32_t) n;
 	}
 	return filled;
 }
@@ -3667,8 +3969,9 @@ wal_read_one(uint32_t tl, uint64_t start, uint32_t len, uint64_t cap,
 static uint64_t
 wal_log_start(uint32_t tl)
 {
-	if (tl < MAX_TIMELINES && wal_chunks_n[tl] != 0)
-		return wal_chunks[tl][0].start_lsn;
+	if (tl < MAX_TIMELINES &&
+		__atomic_load_n(&wal_start_valid[tl], __ATOMIC_ACQUIRE))
+		return __atomic_load_n(&wal_start[tl], __ATOMIC_RELAXED);
 	return UINT64_MAX;
 }
 
@@ -3691,9 +3994,19 @@ wal_coverage_advance(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 {
 	uint64_t	covered;
 	uint64_t	off;
+	int		immutable_prefix = 0;
 
 	if (tl >= MAX_TIMELINES)
 		return 0;
+	if (wal_segment_store_opened[tl] &&
+		start_lsn >= wal_segment_stores[tl].start_lsn &&
+		start_lsn <= wal_segment_stores[tl].end_lsn)
+	{
+		if (end_lsn <= wal_segment_stores[tl].end_lsn)
+			return 1;
+		start_lsn = wal_segment_stores[tl].end_lsn;
+		immutable_prefix = 1;
+	}
 	if (!wal_covered_valid[tl])
 	{
 		WalRecHdr	h;
@@ -3701,12 +4014,21 @@ wal_coverage_advance(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 		if (ps_storage->wal_read(tl, 0, &h, sizeof(h)) != (int) sizeof(h) ||
 			h.magic != WAL_MAGIC)
 			return start_lsn == end_lsn;
+		if (immutable_prefix && h.start_lsn > start_lsn)
+			return 0;
 		wal_covered[tl] = h.start_lsn;
 		wal_covered_off[tl] = 0;
 		wal_covered_valid[tl] = 1;
 	}
 	covered = wal_covered[tl];
 	off = wal_covered_off[tl];
+	/* A crossing flat record may begin before the immutable end.  Its header is
+	 * retained, while the immutable prefix proves continuity up to start_lsn. */
+	if (immutable_prefix && covered <= start_lsn)
+	{
+		covered = start_lsn;
+		wal_covered[tl] = covered;
+	}
 	if (start_lsn > covered)
 		return 0;
 	while (covered < end_lsn)
@@ -3763,16 +4085,15 @@ wal_segment_open_one(uint32_t tl)
 	char path[4096];
 	unsigned char *segment_buf = NULL;
 	unsigned char *flat_buf = NULL;
-	uint64_t start_lsn;
+	uint64_t flat_start;
+	uint64_t compare_start;
 	struct stat st;
 	int n;
 
 	if (tl >= MAX_TIMELINES || wal_segment_store_opened[tl])
 		return tl < MAX_TIMELINES ? 0 : -1;
-	start_lsn = wal_log_start(tl);
-	if (start_lsn == UINT64_MAX ||
-		start_lsn % WAL_IMMUTABLE_SEGMENT_BYTES != 0)
-		return 0;
+	flat_start = wal_chunks_n[tl] == 0 ? UINT64_MAX :
+		wal_chunks[tl][0].start_lsn;
 	n = snprintf(path, sizeof(path), "%s/wal_segments_%u",
 				 wal_segment_root, tl);
 	if (n < 0 || (size_t) n >= sizeof(path))
@@ -3780,14 +4101,21 @@ wal_segment_open_one(uint32_t tl)
 	if (lstat(path, &st) == 0)
 	{
 		if (!S_ISDIR(st.st_mode) ||
-			ps_wal_store_open(&wal_segment_stores[tl], path, tl + 1,
-							  start_lsn, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
+			(ps_wal_store_open_existing(&wal_segment_stores[tl], path, tl + 1,
+									WAL_IMMUTABLE_SEGMENT_BYTES) != 0 &&
+			 (flat_start == UINT64_MAX ||
+			  flat_start % WAL_IMMUTABLE_SEGMENT_BYTES != 0 ||
+			  ps_wal_store_open(&wal_segment_stores[tl], path, tl + 1,
+							 flat_start, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)))
 			return -1;
 	}
 	else if (errno == ENOENT)
 	{
+		if (flat_start == UINT64_MAX ||
+			flat_start % WAL_IMMUTABLE_SEGMENT_BYTES != 0)
+			return 0;
 		if (ps_wal_store_create(&wal_segment_stores[tl], path, tl + 1,
-								start_lsn, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
+								flat_start, WAL_IMMUTABLE_SEGMENT_BYTES) != 0)
 			return -1;
 	}
 	else
@@ -3798,7 +4126,9 @@ wal_segment_open_one(uint32_t tl)
 	flat_buf = malloc(PS_WAL_STORE_VERIFY_CHUNK_BYTES);
 	if (segment_buf == NULL || flat_buf == NULL)
 		goto fail;
-	for (uint64_t pos = start_lsn;
+	compare_start = flat_start > wal_segment_stores[tl].start_lsn ?
+		flat_start : wal_segment_stores[tl].start_lsn;
+	for (uint64_t pos = compare_start;
 		 pos < wal_segment_stores[tl].end_lsn;)
 	{
 		uint32_t amount = wal_segment_stores[tl].end_lsn - pos <
@@ -3818,6 +4148,10 @@ wal_segment_open_one(uint32_t tl)
 	free(segment_buf);
 	free(flat_buf);
 	wal_segment_store_opened[tl] = 1;
+	if (wal_segment_stores[tl].nentries != 0)
+		timeline_mark_used(tl);
+	wal_start_observe(tl, wal_segment_stores[tl].start_lsn);
+	wal_end_advance(tl, wal_segment_stores[tl].end_lsn);
 	return 0;
 
 fail:
@@ -3825,6 +4159,104 @@ fail:
 	free(flat_buf);
 	ps_wal_store_close(&wal_segment_stores[tl]);
 	return -1;
+}
+
+/* Immutable WAL can outlive both its reclaimed flat prefix and branch
+ * metadata (for example, an archiver may have shipped a timeline before its
+ * branch declaration arrives).  Discover canonical segment directories before
+ * selecting timelines for recovery so those ids remain occupied after restart. */
+static int
+wal_segment_discover_used(void)
+{
+	const char prefix[] = "wal_segments_";
+	struct dirent *de;
+	DIR *dir = NULL;
+	int root_fd = -1;
+	int scan_fd = -1;
+	int rc = -1;
+
+	root_fd = open(wal_segment_root,
+				   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (root_fd < 0 || (scan_fd = dup(root_fd)) < 0 ||
+		(dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((de = readdir(dir)) != NULL)
+	{
+		char expected[64];
+		char *end = NULL;
+		unsigned long parsed;
+		struct stat st;
+		int n;
+
+		if (strncmp(de->d_name, prefix, sizeof(prefix) - 1) != 0)
+			continue;
+		errno = 0;
+		parsed = strtoul(de->d_name + sizeof(prefix) - 1, &end, 10);
+		n = snprintf(expected, sizeof(expected), "%s%lu", prefix, parsed);
+		if (errno != 0 || end == de->d_name + sizeof(prefix) - 1 ||
+			*end != '\0' || n < 0 || (size_t) n >= sizeof(expected) ||
+			strcmp(expected, de->d_name) != 0 || parsed >= MAX_TIMELINES ||
+			fstatat(root_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+			!S_ISDIR(st.st_mode))
+			goto cleanup;
+		timeline_mark_used((uint32_t) parsed);
+		errno = 0;
+	}
+	if (errno != 0 || closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto cleanup;
+	}
+	dir = NULL;
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	if (scan_fd >= 0)
+		close(scan_fd);
+	if (root_fd >= 0)
+		close(root_fd);
+	return rc;
+}
+
+/* Remove only flat-log records whose complete logical range is already held
+ * by the validated immutable store.  A boundary-crossing record stays whole;
+ * this keeps the flat suffix self-describing for restart.  The caller holds
+ * wal_log_lock exclusively (or startup is still single-threaded). */
+static int
+wal_flat_reclaim(uint32_t tl)
+{
+	uint32_t drop = 0;
+	uint64_t keep_off;
+
+	if (tl >= MAX_TIMELINES || !wal_segment_store_opened[tl] ||
+		wal_segment_stores[tl].nentries == 0 ||
+		ps_storage->wal_rewrite_prefix == NULL)
+		return 0;
+	while (drop < wal_chunks_n[tl] &&
+		   wal_chunks[tl][drop].end_lsn <= wal_segment_stores[tl].end_lsn)
+		drop++;
+	if (drop == 0)
+		return 0;
+	keep_off = drop < wal_chunks_n[tl] ?
+		wal_chunks[tl][drop].payload_off - sizeof(WalRecHdr) :
+		wal_log_bytes[tl];
+	if (keep_off == 0 || ps_storage->wal_rewrite_prefix(tl, keep_off) != 0)
+		return -1;
+	for (uint32_t i = drop; i < wal_chunks_n[tl]; i++)
+	{
+		wal_chunks[tl][i - drop] = wal_chunks[tl][i];
+		wal_chunks[tl][i - drop].payload_off -= keep_off;
+	}
+	wal_chunks_n[tl] -= drop;
+	wal_log_bytes[tl] -= keep_off;
+	wal_covered[tl] = 0;
+	wal_covered_off[tl] = 0;
+	wal_covered_valid[tl] = 0;
+	return 1;
 }
 
 static int
@@ -3843,7 +4275,7 @@ wal_segment_sync(uint32_t tl)
 		return -1;
 	if (store->end_lsn > UINT64_MAX - WAL_IMMUTABLE_SEGMENT_BYTES ||
 		store->end_lsn + WAL_IMMUTABLE_SEGMENT_BYTES > wal_end_read(tl))
-		return 0;
+		return wal_flat_reclaim(tl) < 0 ? -1 : 0;
 	buf = malloc(WAL_IMMUTABLE_SEGMENT_BYTES);
 	if (buf == NULL)
 		return -1;
@@ -3866,6 +4298,8 @@ wal_segment_sync(uint32_t tl)
 		}
 	}
 	free(buf);
+	if (rc == 0 && wal_flat_reclaim(tl) < 0)
+		rc = -1;
 	return rc;
 }
 
@@ -3889,8 +4323,9 @@ wal_segment_sync(uint32_t tl)
  * metadata is write-once after definition (see timeline_define), so the
  * walk needs no lock, matching tl_walk.
  */
-static uint32_t
-wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
+static int64_t
+wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
+				unsigned char *out)
 {
 	uint32_t	filled = 0;
 	uint64_t	cap = UINT64_MAX;
@@ -3901,15 +4336,29 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 
 	for (;;)
 	{
-		uint64_t	ls = wal_log_start(tl);
+		pthread_rwlock_t *lock = wal_log_lock_for(tl);
+		uint64_t	ls;
+
+		if (lock == NULL)
+			return -1;
+		pthread_rwlock_rdlock(lock);
+		ls = wal_log_start(tl);
 
 		if (ls != UINT64_MAX && start + len > ls && start < cap)
 		{
 			uint64_t	ws = start > ls ? start : ls;
+			int64_t		n;
 
-			filled += wal_read_one(tl, ws, (uint32_t) (start + len - ws),
-								   cap, out + (ws - start));
+			n = wal_read_one(tl, ws, (uint32_t) (start + len - ws),
+						 cap, out + (ws - start));
+			if (n < 0)
+			{
+				pthread_rwlock_unlock(lock);
+				return -1;
+			}
+			filled += (uint32_t) n;
 		}
+		pthread_rwlock_unlock(lock);
 
 		/* everything below min(cap, fork, own coverage) is the parent's */
 		if (!timeline_has_parent(tl))
@@ -3925,6 +4374,12 @@ wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
 		tl = (uint32_t) timelines[tl].parent;
 	}
 	return filled;
+}
+
+static int64_t
+wal_read(uint32_t tl, uint64_t start, uint32_t len, unsigned char *out)
+{
+	return wal_read_locked(tl, start, len, out);
 }
 
 /* Rebuild wal_end[tl] by scanning the timeline's WAL log at startup. */
@@ -3945,6 +4400,7 @@ wal_recover_one(uint32_t tl)
 	wal_chunks_n[tl] = 0;
 	wal_chunks_cap[tl] = 0;
 	wal_log_bytes[tl] = 0;
+	__atomic_store_n(&wal_start_valid[tl], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&wal_end[tl], 0, __ATOMIC_RELEASE);
 	wal_covered[tl] = 0;
 	wal_covered_off[tl] = 0;
@@ -4000,8 +4456,11 @@ wal_recover_one(uint32_t tl)
 #define WALIDX_MAGIC	0x57494458	/* "WIDX" */
 #define WALIDX_PROGRESS_MAGIC	0x57495047	/* "WIPG" */
 #define WALIDX_SNAPSHOT_PAYLOAD_MAGIC UINT32_C(0x44534957) /* "WISD" */
-#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 2
-#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 64
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 1
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 2
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1 64
+#define WALIDX_SNAPSHOT_PAYLOAD_VERSION 3
+#define WALIDX_SNAPSHOT_PAYLOAD_BYTES 72
 #define WALIDX_SNAPSHOT_DEFAULT_TRIGGER (1024u * 1024u)
 
 typedef struct WalIdxLogHdr
@@ -4010,17 +4469,37 @@ typedef struct WalIdxLogHdr
 	uint32_t	rec_len;
 } WalIdxLogHdr;
 
+typedef struct WalIdxRecV1
+{
+	uint32_t	magic;
+	uint32_t	rec_len;
+	uint32_t	crc;
+	uint32_t	reserved;
+	uint32_t	timeline;
+	uint32_t	block;
+	uint64_t	lsn;
+	PsKey		key;
+} WalIdxRecV1;
+
 typedef struct WalIdxRec
 {
 	uint32_t	magic;
 	uint32_t	rec_len;
 	uint32_t	crc;
-	uint32_t	pad;
+	uint32_t	flags;			/* PS_WAL_INDEX_FLAG_* */
 	uint32_t	timeline;
 	uint32_t	block;
 	uint64_t	lsn;
+	uint64_t	end_lsn;
 	PsKey		key;
 } WalIdxRec;
+
+_Static_assert(sizeof(WalIdxRecV1) == 56,
+			   "legacy WAL-index record format must remain readable");
+_Static_assert(sizeof(WalIdxRec) == 64,
+			   "WAL-index record format must remain stable");
+_Static_assert(offsetof(WalIdxRec, flags) == 12,
+			   "WAL-index flags must reuse the legacy reserved field");
 
 typedef struct WalIdxProgressRec
 {
@@ -4037,6 +4516,7 @@ typedef struct WalIdxProgressRec
 } WalIdxProgressRec;
 
 static uint64_t walidx_progress[MAX_TIMELINES];
+static unsigned char walidx_progress_valid[MAX_TIMELINES];
 static uint64_t walidx_shards_seen[MAX_TIMELINES][2];
 static uint64_t walidx_shards_required[MAX_TIMELINES][2];
 static uint64_t walidx_shard_offsets_seen[MAX_TIMELINES][PS_MAX_CHANNELS];
@@ -4045,12 +4525,17 @@ static uint64_t walidx_snapshot_generation[MAX_TIMELINES];
 static uint64_t walidx_snapshot_start[MAX_TIMELINES];
 static uint64_t walidx_snapshot_end[MAX_TIMELINES];
 static uint64_t walidx_snapshot_offsets[MAX_TIMELINES][PS_MAX_CHANNELS];
+static uint64_t walidx_snapshot_bytes[MAX_TIMELINES];
 static unsigned char walidx_snapshot_reshard_pending[MAX_TIMELINES];
 static struct timespec walidx_snapshot_retry_at[MAX_TIMELINES];
 static uint32_t walidx_snapshot_cursor;
+static uint64_t walidx_log_epoch[MAX_TIMELINES][PS_MAX_CHANNELS];
 static unsigned char walidx_snapshot_gc_pending[MAX_TIMELINES];
 static uint32_t walidx_snapshot_gc_cursor;
 static struct timespec walidx_snapshot_gc_retry_at[MAX_TIMELINES];
+static PsWalIdxSnapshotPrepared walidx_snapshot_cleanup[MAX_TIMELINES];
+static int walidx_snapshot_cleanup_pending[MAX_TIMELINES];
+static struct timespec walidx_snapshot_cleanup_retry_at[MAX_TIMELINES];
 static pthread_mutex_t walidx_meta_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct WalIdxPublishLock
 {
@@ -4115,6 +4600,23 @@ walidx_publish_wrunlock(void)
 		pthread_cond_broadcast(&walidx_publish_lock.readers_ready);
 	pthread_mutex_unlock(&walidx_publish_lock.mutex);
 }
+
+static int
+walidx_frontier_publication_pending(uint32_t timeline)
+{
+	uint64_t snapshot_end;
+
+	if (timeline >= MAX_TIMELINES)
+		return 1;
+	if (__atomic_load_n(&walidx_snapshot_cleanup_pending[timeline],
+						__ATOMIC_ACQUIRE))
+		return 1;
+	pthread_mutex_lock(&walidx_meta_lock);
+	snapshot_end = walidx_snapshot_end[timeline];
+	pthread_mutex_unlock(&walidx_meta_lock);
+	return snapshot_end < walidx_reclaimed_frontier[timeline];
+}
+
 static void
 publish_wal_index_metrics(void)
 {
@@ -4132,7 +4634,7 @@ publish_wal_index_metrics(void)
 		/* Unused timelines have neither lag nor a WAL log to probe. */
 		if (shipped == 0)
 			continue;
-		if (indexed == 0)
+		if (!walidx_progress_valid[tl])
 		{
 			uint64_t first = wal_log_start(tl);
 
@@ -4164,13 +4666,28 @@ walidx_progress_init(uint32_t tl, uint64_t first_lsn)
 	if (tl >= MAX_TIMELINES || first_lsn == UINT64_MAX)
 		return;
 	pthread_mutex_lock(&walidx_meta_lock);
-	if (walidx_progress[tl] == 0)
+	if (!walidx_progress_valid[tl])
+	{
 		walidx_progress[tl] = first_lsn;
+		walidx_progress_valid[tl] = 1;
+	}
 	pthread_mutex_unlock(&walidx_meta_lock);
 }
 
 static uint32_t
 walidx_rec_crc(WalIdxRec *rec)
+{
+	uint32_t	save = rec->crc;
+	uint32_t	crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+static uint32_t
+walidx_rec_v1_crc(WalIdxRecV1 *rec)
 {
 	uint32_t	save = rec->crc;
 	uint32_t	crc;
@@ -4235,10 +4752,35 @@ typedef struct WalIdxEnt
 	uint32_t	timeline;
 	PsKey		key;
 	uint32_t	block;
-	uint64_t   *lsns;			/* ascending */
+	struct WalIdxItem *items;	/* ascending by LSN */
 	int			n;
 	int			cap;
 } WalIdxEnt;
+
+typedef struct WalIdxItem
+{
+	uint64_t	lsn;
+	uint64_t	end_lsn;
+	uint32_t	flags;
+} WalIdxItem;
+
+/* Keep each hash chain canonical so a fixed-size heap can merge the chains
+ * into the same key/block/LSN order as the former whole-shard qsort. */
+static int
+walidx_entry_compare(const WalIdxEnt *a, const WalIdxEnt *b)
+{
+#define CMP_FIELD(field) \
+	do { if (a->field < b->field) return -1; if (a->field > b->field) return 1; } while (0)
+	CMP_FIELD(key.spcOid);
+	CMP_FIELD(key.dbOid);
+	CMP_FIELD(key.relNumber);
+	CMP_FIELD(key.forkNum);
+	CMP_FIELD(key.klass);
+	CMP_FIELD(block);
+	CMP_FIELD(timeline);
+#undef CMP_FIELD
+	return 0;
+}
 
 static WalIdxEnt *
 walidx_find(uint32_t tl, const PsKey *key, uint32_t block)
@@ -4263,7 +4805,7 @@ walidx_lower_bound(const WalIdxEnt *e, uint64_t lsn)
 	{
 		int mid = lo + (hi - lo) / 2;
 
-		if (e->lsns[mid] < lsn)
+		if (e->items[mid].lsn < lsn)
 			lo = mid + 1;
 		else
 			hi = mid;
@@ -4271,8 +4813,19 @@ walidx_lower_bound(const WalIdxEnt *e, uint64_t lsn)
 	return lo;
 }
 
-static void
-walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
+static int
+walidx_metadata_valid(uint32_t flags, uint64_t lsn, uint64_t end_lsn)
+{
+	return (flags & ~PS_WAL_INDEX_FLAG_MASK) == 0 &&
+		((flags & PS_WAL_INDEX_FLAG_FPI) == 0 ||
+		 (flags & PS_WAL_INDEX_FLAG_KNOWN) != 0) &&
+		(((flags & PS_WAL_INDEX_FLAG_KNOWN) != 0 && end_lsn > lsn) ||
+		 (flags == 0 && end_lsn == 0));
+}
+
+static int
+walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
+				  uint64_t end_lsn, uint32_t flags)
 {
 	uint32_t	h = page_hash(tl, key, block);
 	Shard	   *s = shard_for(key);
@@ -4283,28 +4836,51 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 	e = walidx_find(tl, key, block);
 	if (!e)
 	{
+		WalIdxEnt **link = &s->walidx[h & IDX_MASK];
+
 		e = calloc(1, sizeof(*e));
+		if (e == NULL)
+			return -1;
 		e->timeline = tl;
 		e->key = *key;
 		e->block = block;
-		e->next = s->walidx[h & IDX_MASK];
-		s->walidx[h & IDX_MASK] = e;
+		while (*link != NULL && walidx_entry_compare(*link, e) < 0)
+			link = &(*link)->next;
+		e->next = *link;
+		*link = e;
 	}
 	if (e->n == e->cap)
 	{
-		e->cap = e->cap ? e->cap * 2 : 4;
-		e->lsns = realloc(e->lsns, (size_t) e->cap * sizeof(uint64_t));
+		int newcap;
+		WalIdxItem *grown;
+
+		if (e->cap > INT_MAX / 2)
+			return -1;
+		newcap = e->cap ? e->cap * 2 : 4;
+		grown = realloc(e->items, (size_t) newcap * sizeof(*e->items));
+		if (grown == NULL)
+			return -1;
+		e->items = grown;
+		e->cap = newcap;
 	}
 	{
 		int i = walidx_lower_bound(e, lsn);
 
-		if (i < e->n && e->lsns[i] == lsn)
-			return;
-		memmove(&e->lsns[i + 1], &e->lsns[i],
-				(size_t) (e->n - i) * sizeof(uint64_t));
-		e->lsns[i] = lsn;
+		if (i < e->n && e->items[i].lsn == lsn)
+		{
+			e->items[i].flags |= flags;
+			if (end_lsn != 0)
+				e->items[i].end_lsn = end_lsn;
+			return 0;
+		}
+		memmove(&e->items[i + 1], &e->items[i],
+				(size_t) (e->n - i) * sizeof(*e->items));
+		e->items[i].lsn = lsn;
+		e->items[i].end_lsn = end_lsn;
+		e->items[i].flags = flags;
 		e->n++;
 	}
+	return 0;
 }
 
 static uint32_t
@@ -4340,7 +4916,7 @@ walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
 							  uint32_t tl, uint32_t shard,
 							  uint64_t nrecords, uint64_t generation,
 							  uint64_t start_lsn, uint64_t end_lsn,
-							  uint64_t source_offset)
+							  uint64_t source_offset, uint64_t log_epoch)
 {
 	uint32_t crc;
 
@@ -4355,40 +4931,73 @@ walidx_snapshot_encode_header(unsigned char out[WALIDX_SNAPSHOT_PAYLOAD_BYTES],
 	walidx_put_le64(out + 32, start_lsn);
 	walidx_put_le64(out + 40, end_lsn);
 	walidx_put_le64(out + 48, source_offset);
-	walidx_put_le32(out + 60, (uint32_t) (nrecords >> 32));
+	walidx_put_le64(out + 56, log_epoch);
+	walidx_put_le32(out + 68, (uint32_t) (nrecords >> 32));
 	crc = fnv(out, WALIDX_SNAPSHOT_PAYLOAD_BYTES);
-	walidx_put_le32(out + 56, crc);
+	walidx_put_le32(out + 64, crc);
 }
 
 static int
-walidx_snapshot_decode_header(const unsigned char *header, uint32_t tl,
+walidx_snapshot_decode_header(const unsigned char *header, uint64_t available,
+							  uint32_t tl,
 							  uint32_t shard, uint64_t generation,
 							  uint64_t start_lsn, uint64_t end_lsn,
-							  uint64_t *nrecords, uint64_t *source_offset)
+							  uint32_t *header_bytes, uint32_t *record_bytes,
+							  uint64_t *nrecords,
+							  uint64_t *source_offset, uint64_t *log_epoch)
 {
 	unsigned char copy[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
 	uint32_t version;
+	uint32_t bytes;
+	uint32_t crc_offset;
 	uint32_t stored_crc;
 
-	memcpy(copy, header, sizeof(copy));
-	stored_crc = walidx_get_le32(copy + 56);
-	walidx_put_le32(copy + 56, 0);
-	version = walidx_get_le32(copy + 4);
+	if (available < WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1 ||
+		walidx_get_le32(header + 0) != WALIDX_SNAPSHOT_PAYLOAD_MAGIC)
+		return -1;
+	version = walidx_get_le32(header + 4);
+	bytes = walidx_get_le32(header + 8);
+	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 &&
+		bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1)
+		crc_offset = 56;
+	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 &&
+			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1)
+		crc_offset = 56;
+	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION &&
+			 bytes == WALIDX_SNAPSHOT_PAYLOAD_BYTES)
+		crc_offset = 64;
+	else
+		return -1;
+	if (available < bytes)
+		return -1;
+	memset(copy, 0, sizeof(copy));
+	memcpy(copy, header, bytes);
+	stored_crc = walidx_get_le32(copy + crc_offset);
+	walidx_put_le32(copy + crc_offset, 0);
 	if (walidx_get_le32(copy + 0) != WALIDX_SNAPSHOT_PAYLOAD_MAGIC ||
-		(version != 1 && version != WALIDX_SNAPSHOT_PAYLOAD_VERSION) ||
-		walidx_get_le32(copy + 8) != WALIDX_SNAPSHOT_PAYLOAD_BYTES ||
 		walidx_get_le32(copy + 12) != tl ||
 		walidx_get_le32(copy + 16) != shard ||
 		walidx_get_le64(copy + 24) != generation ||
 		walidx_get_le64(copy + 32) != start_lsn ||
 		walidx_get_le64(copy + 40) != end_lsn ||
-		(version == 1 && walidx_get_le32(copy + 60) != 0) ||
-		fnv(copy, sizeof(copy)) != stored_crc)
+		(version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V1 &&
+		 walidx_get_le32(copy + 60) != 0) ||
+		fnv(copy, bytes) != stored_crc)
 		return -1;
+	*header_bytes = bytes;
+	*record_bytes = version == WALIDX_SNAPSHOT_PAYLOAD_VERSION ?
+		sizeof(WalIdxRec) : sizeof(WalIdxRecV1);
 	*nrecords = walidx_get_le32(copy + 20);
-	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION)
+	if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2)
 		*nrecords |= (uint64_t) walidx_get_le32(copy + 60) << 32;
+	else if (version == WALIDX_SNAPSHOT_PAYLOAD_VERSION)
+		*nrecords |= (uint64_t) walidx_get_le32(copy + 68) << 32;
 	*source_offset = walidx_get_le64(copy + 48);
+	*log_epoch = version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 ?
+		walidx_get_le64(copy + 56) : 0;
+	if (version >= WALIDX_SNAPSHOT_PAYLOAD_VERSION_V2 &&
+		(*log_epoch != generation || *source_offset != 0))
+		return -1;
 	return 0;
 }
 
@@ -4401,6 +5010,69 @@ walidx_snapshot_path(uint32_t tl, char *path, size_t path_len)
 	return n < 0 || (size_t) n >= path_len ? -1 : 0;
 }
 
+static int
+walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
+						const uint64_t *horizons, uint32_t nhorizons,
+						unsigned char *keep)
+{
+	PsWalIdxPruneItem *items;
+	int rc;
+
+	if (e->n == 0)
+		return 0;
+	items = malloc((size_t) e->n * sizeof(*items));
+	if (items == NULL)
+		return -1;
+	for (int i = 0; i < e->n; i++)
+	{
+		items[i].lsn = e->items[i].lsn;
+		items[i].end_lsn = e->items[i].end_lsn;
+		items[i].known =
+			(e->items[i].flags & PS_WAL_INDEX_FLAG_KNOWN) != 0;
+		items[i].fpi =
+			(e->items[i].flags & PS_WAL_INDEX_FLAG_FPI) != 0;
+	}
+	rc = ps_walidx_prune_plan(items, (uint32_t) e->n, cutoff,
+							  horizons, nhorizons, keep);
+	free(items);
+	return rc;
+}
+
+/* Prove every page before writing any compacted shard.  One unprovable page
+ * keeps the whole timeline on its full snapshot generation, so the single
+ * timeline frontier can never mask a lagging shard. */
+static int
+walidx_snapshot_compaction_plan(uint32_t tl, uint64_t cutoff,
+								const uint64_t *horizons,
+								uint32_t nhorizons, uint64_t *dropped_out)
+{
+	uint64_t dropped = 0;
+
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		Shard *s = &g_shards[shard];
+
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+				if (e->timeline == tl && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int kept;
+
+					if (keep == NULL)
+						return 0;
+					kept = walidx_entry_prune_plan(e, cutoff, horizons,
+											  nhorizons, keep);
+					free(keep);
+					if (kept < 0)
+						return 0;
+					dropped += (uint64_t) e->n - (uint64_t) kept;
+				}
+	}
+	*dropped_out = dropped;
+	return 1;
+}
+
 typedef struct WalIdxSnapshotProduceCtx
 {
 	uint32_t tl;
@@ -4409,7 +5081,11 @@ typedef struct WalIdxSnapshotProduceCtx
 	uint64_t start_lsn;
 	uint64_t end_lsn;
 	uint64_t source_offset;
+	uint64_t log_epoch;
 	uint64_t nrecords;
+	int compact;
+	const uint64_t *horizons;
+	uint32_t nhorizons;
 } WalIdxSnapshotProduceCtx;
 
 static int
@@ -4420,44 +5096,144 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 	Shard *s = &g_shards[ctx->shard];
 	unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
 	WalIdxRec records[1024];
+	WalIdxEnt **heap;
+	uint32_t heap_size = 0;
+	uint64_t emitted = 0;
 	size_t used = 0;
 
 	walidx_snapshot_encode_header(header, ctx->tl, ctx->shard, ctx->nrecords,
 							  ctx->generation, ctx->start_lsn, ctx->end_lsn,
-							  ctx->source_offset);
+							  ctx->source_offset, ctx->log_epoch);
 	if (consume(consume_arg, header, sizeof(header)) != 0)
 		return -1;
+	/* One cursor per fixed hash bucket bounds serialization memory regardless
+	 * of the number of live WAL-index records. */
+	heap = malloc(IDX_BUCKETS * sizeof(*heap));
+	if (heap == NULL)
+		return -1;
 	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
-			if (e->timeline == ctx->tl)
-				for (int i = 0; i < e->n; i++)
-				{
-					WalIdxRec *rec = &records[used++];
+	{
+		WalIdxEnt *e = s->walidx[bucket];
+		uint32_t pos;
 
-					memset(rec, 0, sizeof(*rec));
-					rec->magic = WALIDX_MAGIC;
-					rec->rec_len = sizeof(*rec);
-					rec->timeline = ctx->tl;
-					rec->block = e->block;
-					rec->lsn = e->lsns[i];
-					rec->key = e->key;
-					rec->crc = walidx_rec_crc(rec);
-					if (used == sizeof(records) / sizeof(records[0]))
+		while (e != NULL && e->timeline != ctx->tl)
+			e = e->next;
+		if (e == NULL)
+			continue;
+		pos = heap_size++;
+		while (pos != 0)
+		{
+			uint32_t parent = (pos - 1) / 2;
+
+			if (walidx_entry_compare(heap[parent], e) <= 0)
+				break;
+			heap[pos] = heap[parent];
+			pos = parent;
+		}
+		heap[pos] = e;
+	}
+	while (heap_size != 0)
+	{
+		WalIdxEnt *e = heap[0];
+		WalIdxEnt *next = e->next;
+		unsigned char *keep = NULL;
+
+		while (next != NULL && next->timeline != ctx->tl)
+			next = next->next;
+		if (next == NULL)
+			heap[0] = heap[--heap_size];
+		else
+			heap[0] = next;
+		if (heap_size != 0)
+		{
+			uint32_t pos = 0;
+
+			for (;;)
+			{
+				uint32_t left = pos * 2 + 1;
+				uint32_t right = left + 1;
+				uint32_t child;
+				WalIdxEnt *value;
+
+				if (left >= heap_size)
+					break;
+				child = right < heap_size &&
+					walidx_entry_compare(heap[right], heap[left]) < 0 ?
+					right : left;
+				if (walidx_entry_compare(heap[pos], heap[child]) <= 0)
+					break;
+				value = heap[pos];
+				heap[pos] = heap[child];
+				heap[child] = value;
+				pos = child;
+			}
+		}
+		if (ctx->compact && e->n != 0)
+		{
+			int kept;
+
+			keep = malloc((size_t) e->n);
+			if (keep == NULL)
+				goto fail;
+			kept = walidx_entry_prune_plan(e, ctx->end_lsn,
+										  ctx->horizons, ctx->nhorizons, keep);
+			if (kept < 0)
+			{
+				free(keep);
+				goto fail;
+			}
+		}
+		for (int i = 0; i < e->n; i++)
+			if (!ctx->compact || keep[i])
+			{
+				WalIdxRec *rec = &records[used++];
+
+				memset(rec, 0, sizeof(*rec));
+				rec->magic = WALIDX_MAGIC;
+				rec->rec_len = sizeof(*rec);
+				rec->timeline = ctx->tl;
+				rec->block = e->block;
+				rec->lsn = e->items[i].lsn;
+				rec->end_lsn = e->items[i].end_lsn;
+				rec->flags = e->items[i].flags;
+				rec->key = e->key;
+				rec->crc = walidx_rec_crc(rec);
+				emitted++;
+				if (used == sizeof(records) / sizeof(records[0]))
+				{
+					if (consume(consume_arg, records, sizeof(records)) != 0)
 					{
-						if (consume(consume_arg, records, sizeof(records)) != 0)
-							return -1;
-						used = 0;
+						free(keep);
+						goto fail;
 					}
+					used = 0;
 				}
-	return used == 0 ? 0 :
-		consume(consume_arg, records, used * sizeof(records[0]));
+			}
+		free(keep);
+	}
+	if (emitted != ctx->nrecords ||
+		(used != 0 && consume(consume_arg, records,
+								 used * sizeof(records[0])) != 0))
+	{
+		free(heap);
+		return -1;
+	}
+	free(heap);
+	return 0;
+
+fail:
+	free(heap);
+	return -1;
 }
 
 static int
 walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 							 uint64_t generation, uint64_t start_lsn,
-							 uint64_t end_lsn, uint64_t source_offset,
-							 WalIdxSnapshotProduceCtx *ctx,
+								 uint64_t end_lsn, uint64_t source_offset,
+								 uint64_t log_epoch,
+								 int compact, const uint64_t *horizons,
+								 uint32_t nhorizons,
+								 WalIdxSnapshotProduceCtx *ctx,
 							 PsWalIdxSnapshotInput *input)
 {
 	Shard *s = &g_shards[shard];
@@ -4467,16 +5243,33 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
 			if (e->timeline == tl)
 			{
-				if (UINT64_MAX - nrecords < (uint64_t) e->n)
+				uint64_t kept = (uint64_t) e->n;
+
+				if (compact && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int n;
+
+					if (keep == NULL)
+						return -1;
+					n = walidx_entry_prune_plan(e, end_lsn, horizons,
+													  nhorizons, keep);
+					free(keep);
+					if (n < 0)
+						return -1;
+					kept = (uint64_t) n;
+				}
+				if (UINT64_MAX - nrecords < kept)
 					return -1;
-				nrecords += (uint64_t) e->n;
+				nrecords += kept;
 			}
 	if (nrecords > (UINT64_MAX - WALIDX_SNAPSHOT_PAYLOAD_BYTES) /
 		sizeof(WalIdxRec) ||
 		WALIDX_SNAPSHOT_PAYLOAD_BYTES + nrecords * sizeof(WalIdxRec) > INT64_MAX)
 		return -1;
 	*ctx = (WalIdxSnapshotProduceCtx) {
-		tl, shard, generation, start_lsn, end_lsn, source_offset, nrecords
+		tl, shard, generation, start_lsn, end_lsn, source_offset, log_epoch,
+		nrecords, compact, horizons, nhorizons
 	};
 	*input = (PsWalIdxSnapshotInput) {
 		NULL,
@@ -4485,6 +5278,37 @@ walidx_snapshot_prepare_shard(uint32_t tl, uint32_t shard,
 		ctx
 	};
 	return 0;
+}
+
+static void
+walidx_prune_memory(uint32_t tl, uint64_t cutoff, const uint64_t *horizons,
+					uint32_t nhorizons)
+{
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		Shard *s = &g_shards[shard];
+
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
+				if (e->timeline == tl && e->n != 0)
+				{
+					unsigned char *keep = malloc((size_t) e->n);
+					int out = 0;
+
+					if (keep == NULL ||
+						walidx_entry_prune_plan(e, cutoff, horizons,
+											 nhorizons, keep) < 0)
+					{
+						free(keep);
+						continue;
+					}
+					for (int i = 0; i < e->n; i++)
+						if (keep[i])
+							e->items[out++] = e->items[i];
+					e->n = out;
+					free(keep);
+				}
+	}
 }
 
 static int
@@ -4497,6 +5321,8 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 
 	if (tl >= MAX_TIMELINES || nentries == 0)
 		return -1;
+	if (walidx_frontier_publication_pending(tl))
+		return -1;
 	shard = ps_shard_of(&entries[0].key);
 	records = malloc((size_t) nentries * sizeof(*records));
 	if (!records)
@@ -4507,7 +5333,9 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		WalIdxRec  *rec;
 		int			pos;
 
-		if (ps_shard_of(&entries[i].key) != shard)
+		if (ps_shard_of(&entries[i].key) != shard ||
+			!walidx_metadata_valid(entries[i].flags, entries[i].lsn,
+								 entries[i].end_lsn))
 		{
 			free(records);
 			return -1;
@@ -4516,17 +5344,28 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		if (e)
 		{
 			pos = walidx_lower_bound(e, entries[i].lsn);
-			if (pos < e->n && e->lsns[pos] == entries[i].lsn)
+			if (pos < e->n && e->items[pos].lsn == entries[i].lsn &&
+				e->items[pos].end_lsn != 0 && entries[i].end_lsn != 0 &&
+				e->items[pos].end_lsn != entries[i].end_lsn)
+			{
+				free(records);
+				return -1;
+			}
+			if (pos < e->n && e->items[pos].lsn == entries[i].lsn &&
+				(e->items[pos].flags | entries[i].flags) == e->items[pos].flags &&
+				(e->items[pos].end_lsn != 0 || entries[i].end_lsn == 0))
 				continue;
 		}
 		rec = &records[nrecords++];
+		memset(rec, 0, sizeof(*rec));
 		rec->magic = WALIDX_MAGIC;
 		rec->rec_len = sizeof(*rec);
 		rec->crc = 0;
-		rec->pad = 0;
+		rec->flags = entries[i].flags;
 		rec->timeline = tl;
 		rec->block = entries[i].block;
 		rec->lsn = entries[i].lsn;
+		rec->end_lsn = entries[i].end_lsn;
 		rec->key = entries[i].key;
 		rec->crc = walidx_rec_crc(rec);
 	}
@@ -4535,7 +5374,7 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		free(records);
 		return 0;
 	}
-	if (ps_storage->walidx_append(tl, shard, records,
+	if (ps_storage->walidx_append(tl, shard, walidx_log_epoch[tl][shard], records,
 								(uint32_t) (nrecords * sizeof(*records))) != 0)
 	{
 		free(records);
@@ -4546,8 +5385,13 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 	walidx_mark_shard(walidx_shards_seen[tl], shard);
 	pthread_mutex_unlock(&walidx_meta_lock);
 	for (uint32_t i = 0; i < nrecords; i++)
-		walidx_add_memory(tl, &records[i].key, records[i].block,
-						  records[i].lsn);
+		if (walidx_add_memory(tl, &records[i].key, records[i].block,
+							  records[i].lsn, records[i].end_lsn,
+							  records[i].flags) != 0)
+		{
+			free(records);
+			return -1;
+		}
 	free(records);
 	return 0;
 }
@@ -4560,8 +5404,9 @@ walidx_add(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn)
 
 	entry.key = *key;
 	entry.block = block;
-	entry.pad = 0;
+	entry.flags = 0;
 	entry.lsn = lsn;
+	entry.end_lsn = 0;
 	walidx_publish_rdlock();
 	rc = walidx_add_batch_locked(tl, &entry, 1);
 	walidx_publish_rdunlock();
@@ -4596,49 +5441,82 @@ walidx_snapshot_recover(uint32_t tl)
 	for (uint32_t shard = 0; shard < snapshot.nshards; shard++)
 	{
 		unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
-		WalIdxRec records[1024];
+		unsigned char records[1024 * sizeof(WalIdxRec)];
+		uint32_t header_bytes;
+		uint32_t record_bytes;
 		uint64_t nrecords;
 		uint64_t source_offset;
+		uint64_t log_epoch;
 		uint64_t expected_len;
 		uint64_t done = 0;
+		uint32_t header_read = snapshot.shards[shard].len < sizeof(header) ?
+			(uint32_t) snapshot.shards[shard].len : (uint32_t) sizeof(header);
 
-		if (snapshot.shards[shard].len < WALIDX_SNAPSHOT_PAYLOAD_BYTES ||
+		memset(header, 0, sizeof(header));
+		if (snapshot.shards[shard].len < WALIDX_SNAPSHOT_PAYLOAD_BYTES_V1 ||
 			ps_walidx_snapshot_read(&snapshot, shard, 0, header,
-								 sizeof(header)) != 0 ||
-			walidx_snapshot_decode_header(header, tl, shard, snapshot.generation,
+								 header_read) != 0 ||
+			walidx_snapshot_decode_header(header, snapshot.shards[shard].len,
+								 tl, shard, snapshot.generation,
 								 snapshot.start_lsn, snapshot.end_lsn,
-								 &nrecords, &source_offset) != 0 ||
-			nrecords > (UINT64_MAX - WALIDX_SNAPSHOT_PAYLOAD_BYTES) /
-				sizeof(WalIdxRec))
+								 &header_bytes, &record_bytes, &nrecords,
+								 &source_offset,
+								 &log_epoch) != 0 ||
+			nrecords > (UINT64_MAX - header_bytes) / record_bytes)
 			goto fail;
-		expected_len = WALIDX_SNAPSHOT_PAYLOAD_BYTES +
-			nrecords * sizeof(WalIdxRec);
+		expected_len = header_bytes +
+			 nrecords * record_bytes;
 		if (expected_len != snapshot.shards[shard].len)
 			goto fail;
 		while (done < nrecords)
 		{
 			uint32_t amount = nrecords - done <
-				(sizeof(records) / sizeof(records[0])) ?
+				(sizeof(records) / record_bytes) ?
 				(uint32_t) (nrecords - done) :
-				(uint32_t) (sizeof(records) / sizeof(records[0]));
+				(uint32_t) (sizeof(records) / record_bytes);
 
 			if (ps_walidx_snapshot_read(&snapshot, shard,
-					WALIDX_SNAPSHOT_PAYLOAD_BYTES + done * sizeof(WalIdxRec),
-					records, amount * sizeof(WalIdxRec)) != 0)
+					header_bytes + done * record_bytes,
+					records, amount * record_bytes) != 0)
 				goto fail;
 			for (uint32_t i = 0; i < amount; i++)
 			{
-				WalIdxRec *rec = &records[i];
+				const unsigned char *raw = records + (size_t) i * record_bytes;
 
-				if (rec->magic != WALIDX_MAGIC || rec->rec_len != sizeof(*rec) ||
-					rec->timeline != tl || rec->crc != walidx_rec_crc(rec) ||
-					(!reshard && ps_shard_of(&rec->key) != shard))
-					goto fail;
-				walidx_add_memory(tl, &rec->key, rec->block, rec->lsn);
+				if (record_bytes == sizeof(WalIdxRec))
+				{
+					WalIdxRec rec;
+
+					memcpy(&rec, raw, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.timeline != tl || rec.crc != walidx_rec_crc(&rec) ||
+						(!reshard && ps_shard_of(&rec.key) != shard) ||
+						!walidx_metadata_valid(rec.flags, rec.lsn, rec.end_lsn) ||
+						walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  rec.end_lsn, rec.flags) != 0)
+						goto fail;
+				}
+				else
+				{
+					WalIdxRecV1 rec;
+
+					memcpy(&rec, raw, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.reserved != 0 || rec.timeline != tl ||
+						rec.crc != walidx_rec_v1_crc(&rec) ||
+						(!reshard && ps_shard_of(&rec.key) != shard) ||
+						walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  0, 0) != 0)
+						goto fail;
+				}
 			}
 			done += amount;
 		}
+		walidx_log_epoch[tl][shard] = log_epoch;
 		walidx_snapshot_offsets[tl][shard] = source_offset;
+		walidx_snapshot_bytes[tl] =
+			UINT64_MAX - walidx_snapshot_bytes[tl] < snapshot.shards[shard].len ?
+			UINT64_MAX : walidx_snapshot_bytes[tl] + snapshot.shards[shard].len;
 		walidx_shard_offsets_seen[tl][shard] = source_offset;
 		walidx_shard_offsets_required[tl][shard] = source_offset;
 		if (source_offset != 0)
@@ -4653,6 +5531,7 @@ walidx_snapshot_recover(uint32_t tl)
 	walidx_snapshot_reshard_pending[tl] = (unsigned char) reshard;
 	walidx_snapshot_gc_pending[tl] = 1;
 	walidx_progress[tl] = snapshot.end_lsn;
+	walidx_progress_valid[tl] = 1;
 	ps_walidx_snapshot_close(&snapshot);
 	return 0;
 
@@ -4698,7 +5577,9 @@ walidx_snapshot_publish_one(void)
 {
 	PsWalIdxSnapshotInput inputs[PS_MAX_CHANNELS];
 	WalIdxSnapshotProduceCtx producers[PS_MAX_CHANNELS];
-	uint64_t offsets[PS_MAX_CHANNELS];
+	PsWalIdxSnapshotPrepared prepared;
+	uint64_t *fences = NULL;
+	uint32_t nfences = 0;
 	uint64_t trigger = walidx_snapshot_trigger_bytes();
 	uint32_t ns = core_shards();
 	struct timespec now;
@@ -4707,6 +5588,26 @@ walidx_snapshot_publish_one(void)
 	int rc = 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
+							__ATOMIC_ACQUIRE) &&
+			(now.tv_sec > walidx_snapshot_cleanup_retry_at[tl].tv_sec ||
+			 (now.tv_sec == walidx_snapshot_cleanup_retry_at[tl].tv_sec &&
+			  now.tv_nsec >= walidx_snapshot_cleanup_retry_at[tl].tv_nsec)))
+		{
+			if (ps_walidx_snapshot_abort(&walidx_snapshot_cleanup[tl]) == 0)
+			{
+				memset(&walidx_snapshot_cleanup[tl], 0,
+					   sizeof(walidx_snapshot_cleanup[tl]));
+				memset(&walidx_snapshot_cleanup_retry_at[tl], 0,
+					   sizeof(walidx_snapshot_cleanup_retry_at[tl]));
+				__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 0,
+								 __ATOMIC_RELEASE);
+				return 1;
+			}
+			walidx_snapshot_cleanup_retry_at[tl] = now;
+			walidx_snapshot_cleanup_retry_at[tl].tv_sec++;
+		}
 	pthread_mutex_lock(&walidx_meta_lock);
 	for (uint32_t step = 0; step < MAX_TIMELINES; step++)
 	{
@@ -4716,11 +5617,15 @@ walidx_snapshot_publish_one(void)
 		if ((tl == 0 || timelines[tl].defined) &&
 			(now.tv_sec > retry_at.tv_sec ||
 			 (now.tv_sec == retry_at.tv_sec && now.tv_nsec >= retry_at.tv_nsec)) &&
+			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
+							 __ATOMIC_ACQUIRE) &&
 			(walidx_snapshot_reshard_pending[tl] ||
 			 walidx_progress[tl] > walidx_snapshot_end[tl]))
 		{
 			uint64_t tail = 0;
-			uint64_t threshold = trigger;
+			uint64_t threshold =
+				UINT64_MAX - trigger < walidx_snapshot_bytes[tl] ?
+				UINT64_MAX : trigger + walidx_snapshot_bytes[tl];
 			int invalid = 0;
 
 			for (uint32_t shard = 0; shard < ns; shard++)
@@ -4735,12 +5640,11 @@ walidx_snapshot_publish_one(void)
 				}
 				tail = UINT64_MAX - tail < seen - snap ?
 					UINT64_MAX : tail + seen - snap;
-				threshold = UINT64_MAX - threshold < snap ?
-					UINT64_MAX : threshold + snap;
 			}
 			/* Full snapshots grow geometrically with the already snapshotted
 			 * log, bounding retained generations and total rewrite I/O. */
-			if (!invalid && (walidx_snapshot_reshard_pending[tl] ||
+			if (!invalid && (walidx_snapshot_end[tl] < walidx_reclaimed_frontier[tl] ||
+						 walidx_snapshot_reshard_pending[tl] ||
 						 tail >= threshold))
 			{
 				candidate = (int) tl;
@@ -4753,6 +5657,8 @@ walidx_snapshot_publish_one(void)
 	if (candidate < 0)
 		return 0;
 
+	pthread_rwlock_rdlock(&walidx_prune_lock);
+	ps_lock_map_rd();
 	walidx_publish_wrlock();
 	{
 		uint32_t tl = (uint32_t) candidate;
@@ -4760,22 +5666,73 @@ walidx_snapshot_publish_one(void)
 		uint64_t start_lsn;
 		uint64_t end_lsn;
 		uint64_t previous_end;
+		uint64_t snapshot_bytes = 0;
+		uint64_t dropped = 0;
 		char directory[4096];
+		PsWalIdxSnapshotPrepared staged;
+		int compact = 0;
+		int frontier_pending;
+		int prepared_generation;
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
 			walidx_snapshot_start[tl] : wal_log_start(tl);
 		end_lsn = walidx_progress[tl];
 		previous_end = walidx_snapshot_end[tl];
-		for (uint32_t shard = 0; shard < ns; shard++)
-			offsets[shard] = walidx_shard_offsets_seen[tl][shard];
+		frontier_pending = previous_end < walidx_reclaimed_frontier[tl];
 		pthread_mutex_unlock(&walidx_meta_lock);
 		if (start_lsn == UINT64_MAX ||
 			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
 			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
 			goto publish_done;
-		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
-			ps_walidx_snapshot_next_generation(directory,
+		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
+		{
+			retry = 1;
+			goto publish_done;
+		}
+		/* Reconcile an intent left by a failed prepare before allocating a new
+		 * generation.  A frontier-covered intent remains the authoritative retry
+		 * input; do not rebuild it with a changed shard layout. */
+		prepared_generation =
+			ps_walidx_snapshot_read_prepared(directory, tl, &staged);
+		if (prepared_generation < 0)
+		{
+			if (ps_walidx_snapshot_recover_prepared(directory, tl,
+										 walidx_reclaimed_frontier[tl]) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+		}
+		else if (prepared_generation == 1)
+		{
+			if (!frontier_pending)
+			{
+				retry = ps_walidx_snapshot_abort(&staged) != 0;
+				goto publish_done;
+			}
+			if (staged.nshards != ns)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+		}
+		if (frontier_pending)
+		{
+			prepared_generation =
+				ps_walidx_snapshot_prepared_generation(directory, tl,
+											 &generation);
+			if (prepared_generation < 0 ||
+				(prepared_generation == 0 &&
+				 walidx_snapshot_generation[tl] == UINT64_MAX))
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			if (prepared_generation == 0)
+				generation = walidx_snapshot_generation[tl] + 1;
+		}
+		else if (ps_walidx_snapshot_next_generation(directory,
 					walidx_snapshot_generation[tl], &generation) != 0)
 		{
 			retry = 1;
@@ -4783,21 +5740,71 @@ walidx_snapshot_publish_one(void)
 		}
 		if (generation > walidx_snapshot_test_max_generation())
 			goto publish_done;
+		if (walidx_prune_fences(tl, &fences, &nfences) != 0)
+			goto publish_done;
+		compact = walidx_snapshot_compaction_plan(tl, end_lsn, fences,
+											nfences, &dropped) && dropped != 0;
 		for (uint32_t shard = 0; shard < ns; shard++)
 		{
 			if (walidx_snapshot_prepare_shard(tl, shard, generation,
-										start_lsn, end_lsn, offsets[shard],
-										&producers[shard], &inputs[shard]) != 0)
+											start_lsn, end_lsn, 0, generation,
+											compact, fences, nfences,
+											&producers[shard], &inputs[shard]) != 0)
 			{
 				retry = 1;
 				goto publish_done;
 			}
+			snapshot_bytes = UINT64_MAX - snapshot_bytes < inputs[shard].len ?
+				UINT64_MAX : snapshot_bytes + inputs[shard].len;
 		}
-		if (ps_walidx_snapshot_publish(directory, tl, generation,
-									start_lsn, end_lsn, inputs, ns) != 0)
+		if (ps_storage->walidx_epoch_create == NULL)
+		{
+			retry = 1;
+			goto publish_done;
+		}
+		for (uint32_t shard = 0; shard < ns; shard++)
+			if (ps_storage->walidx_epoch_create(tl, shard, generation) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+		if (compact)
+		{
+			if (ps_walidx_snapshot_prepare(&prepared, directory, tl, generation,
+													start_lsn, end_lsn, inputs, ns) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			if (walidx_frontier_advance(tl, end_lsn) != 0)
+			{
+				walidx_snapshot_cleanup[tl] = prepared;
+				__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 1,
+								 __ATOMIC_RELEASE);
+				if (ps_walidx_snapshot_abort(&walidx_snapshot_cleanup[tl]) == 0)
+				{
+					memset(&walidx_snapshot_cleanup[tl], 0,
+						   sizeof(walidx_snapshot_cleanup[tl]));
+					__atomic_store_n(&walidx_snapshot_cleanup_pending[tl], 0,
+									 __ATOMIC_RELEASE);
+				}
+				retry = 1;
+				goto publish_done;
+			}
+			if (ps_fault_probe(PS_FAULT_POINT_WAL_INDEX_AFTER_FRONTIER) != 0)
+				goto publish_done;
+			if (ps_walidx_snapshot_commit(&prepared) != 0)
+			{
+				retry = 1;
+				goto publish_done;
+			}
+			walidx_prune_memory(tl, end_lsn, fences, nfences);
+		}
+		else if (ps_walidx_snapshot_publish(directory, tl, generation,
+											start_lsn, end_lsn, inputs, ns) != 0)
 		{
 			int discard = ps_walidx_snapshot_discard_generation(directory, tl,
-													generation, ns);
+															generation, ns);
 
 			if (discard != 1)
 			{
@@ -4809,11 +5816,21 @@ walidx_snapshot_publish_one(void)
 		walidx_snapshot_generation[tl] = generation;
 		walidx_snapshot_start[tl] = start_lsn;
 		walidx_snapshot_end[tl] = end_lsn;
+		walidx_snapshot_bytes[tl] = snapshot_bytes;
 		walidx_snapshot_reshard_pending[tl] = 0;
 		memset(&walidx_snapshot_retry_at[tl], 0,
 			   sizeof(walidx_snapshot_retry_at[tl]));
+		walidx_shards_seen[tl][0] = 0;
+		walidx_shards_seen[tl][1] = 0;
+		walidx_shards_required[tl][0] = 0;
+		walidx_shards_required[tl][1] = 0;
 		for (uint32_t shard = 0; shard < ns; shard++)
-			walidx_snapshot_offsets[tl][shard] = offsets[shard];
+		{
+			walidx_log_epoch[tl][shard] = generation;
+			walidx_snapshot_offsets[tl][shard] = 0;
+			walidx_shard_offsets_seen[tl][shard] = 0;
+			walidx_shard_offsets_required[tl][shard] = 0;
+		}
 		walidx_snapshot_gc_pending[tl] = 1;
 		pthread_mutex_unlock(&walidx_meta_lock);
 		rc = 1;
@@ -4827,6 +5844,9 @@ publish_done:
 		walidx_snapshot_retry_at[candidate].tv_sec++;
 	}
 	walidx_publish_wrunlock();
+	free(fences);
+	ps_unlock_map();
+	pthread_rwlock_unlock(&walidx_prune_lock);
 	return rc;
 }
 
@@ -4834,6 +5854,7 @@ static int
 walidx_snapshot_gc_one(void)
 {
 	int candidate = -1;
+	int did = 0;
 	int rc;
 	char directory[4096];
 	struct timespec now;
@@ -4860,6 +5881,15 @@ walidx_snapshot_gc_one(void)
 		rc = -1;
 	else
 		rc = ps_walidx_snapshot_gc(directory, (uint32_t) candidate);
+	if (rc > 0)
+		did = 1;
+	if (rc >= 0 && ps_storage->walidx_epoch_gc != NULL)
+	{
+		rc = ps_storage->walidx_epoch_gc((uint32_t) candidate,
+								walidx_log_epoch[candidate], core_shards());
+		if (rc > 0)
+			did = 1;
+	}
 	if (rc >= 0)
 	{
 		walidx_snapshot_gc_pending[candidate] = 0;
@@ -4871,7 +5901,7 @@ walidx_snapshot_gc_one(void)
 		walidx_snapshot_gc_retry_at[candidate] = now;
 		walidx_snapshot_gc_retry_at[candidate].tv_sec++;
 	}
-	return rc > 0;
+	return did;
 }
 
 static int
@@ -4892,7 +5922,8 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 	{
 		unsigned char byte;
 
-		if (ps_storage->walidx_read(tl, shard, read_off - 1, &byte, 1) != 1)
+		if (ps_storage->walidx_read(tl, shard, walidx_log_epoch[tl][shard],
+									read_off - 1, &byte, 1) != 1)
 			return -1;
 	}
 	for (;;)
@@ -4901,7 +5932,8 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 		int			want = (int) sizeof(buf) - used;
 		int			pos = 0;
 
-		n = ps_storage->walidx_read(tl, shard, read_off, buf + used,
+		n = ps_storage->walidx_read(tl, shard, walidx_log_epoch[tl][shard],
+									read_off, buf + used,
 									(uint32_t) want);
 		if (n == 0)
 		{
@@ -4911,7 +5943,11 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 		}
 		if (n < 0)
 		{
-			if (errno == ENOENT &&
+			/* Epoch zero is the legacy lazy-created log.  A selected nonzero
+			 * epoch was durably prepared before its manifest, so even an empty
+			 * epoch must exist; accepting ENOENT could silently lose a shard-0
+			 * progress tail before it tells us which other shards are required. */
+			if (errno == ENOENT && walidx_log_epoch[tl][shard] == 0 &&
 				!walidx_shard_marked(walidx_shards_required[tl], shard))
 				return 0;
 			return -1;
@@ -4925,8 +5961,10 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 			uint32_t	rec_len;
 
 			memcpy(&hdr, buf + pos, sizeof(hdr));
-			if (hdr.magic == WALIDX_MAGIC && hdr.rec_len == sizeof(WalIdxRec))
-				rec_len = sizeof(WalIdxRec);
+			if (hdr.magic == WALIDX_MAGIC &&
+				(hdr.rec_len == sizeof(WalIdxRec) ||
+				 hdr.rec_len == sizeof(WalIdxRecV1)))
+				rec_len = hdr.rec_len;
 			else if (shard == 0 && hdr.magic == WALIDX_PROGRESS_MAGIC &&
 					 hdr.rec_len == sizeof(WalIdxProgressRec))
 				rec_len = sizeof(WalIdxProgressRec);
@@ -4937,14 +5975,32 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 
 			if (hdr.magic == WALIDX_MAGIC)
 			{
-				WalIdxRec rec;
+				if (rec_len == sizeof(WalIdxRec))
+				{
+					WalIdxRec rec;
 
-				memcpy(&rec, buf + pos, sizeof(rec));
-				if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
-					rec.timeline != tl || rec.crc != walidx_rec_crc(&rec))
-					return -1;
+					memcpy(&rec, buf + pos, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.timeline != tl || rec.crc != walidx_rec_crc(&rec) ||
+						!walidx_metadata_valid(rec.flags, rec.lsn, rec.end_lsn))
+						return -1;
+					if (walidx_add_memory(tl, &rec.key, rec.block, rec.lsn,
+										  rec.end_lsn, rec.flags) != 0)
+						return -1;
+				}
+				else
+				{
+					WalIdxRecV1 rec;
+
+					memcpy(&rec, buf + pos, sizeof(rec));
+					if (rec.magic != WALIDX_MAGIC || rec.rec_len != sizeof(rec) ||
+						rec.reserved != 0 || rec.timeline != tl ||
+						rec.crc != walidx_rec_v1_crc(&rec))
+						return -1;
+					if (walidx_add_memory(tl, &rec.key, rec.block, rec.lsn, 0, 0) != 0)
+						return -1;
+				}
 				walidx_mark_shard(walidx_shards_seen[tl], shard);
-				walidx_add_memory(tl, &rec.key, rec.block, rec.lsn);
 			}
 			else
 			{
@@ -4953,11 +6009,15 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 
 				memcpy(&rec, buf + pos, sizeof(rec));
 				first = wal_log_start(tl);
-				if (walidx_progress[tl] == 0 && first != UINT64_MAX)
-					walidx_progress[tl] = first;
+				if (!walidx_progress_valid[tl] && first != UINT64_MAX)
+				{
+					walidx_progress[tl] = first == 0 ? rec.start_lsn : first;
+					walidx_progress_valid[tl] = 1;
+				}
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
 					rec.crc != walidx_progress_crc(&rec) ||
+					!walidx_progress_valid[tl] ||
 					rec.start_lsn != walidx_progress[tl] ||
 					rec.end_lsn < rec.start_lsn ||
 					rec.end_lsn > wal_end_read(tl) ||
@@ -4973,6 +6033,7 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 						walidx_shard_offsets_required[tl][i] =
 							rec.shard_offsets[i];
 				walidx_progress[tl] = rec.end_lsn;
+				walidx_progress_valid[tl] = 1;
 			}
 			pos += (int) rec_len;
 			good_off += rec_len;
@@ -4994,7 +6055,8 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 		return -1;
 	walidx_shard_offsets_seen[tl][shard] = good_off;
 	/* Do not let a torn/corrupt suffix become a permanent replay barrier. */
-	if (torn && ps_storage->walidx_truncate(tl, shard, good_off) != 0)
+	if (torn && ps_storage->walidx_truncate(tl, shard,
+									walidx_log_epoch[tl][shard], good_off) != 0)
 		return -1;
 	return 0;
 }
@@ -5003,24 +6065,43 @@ static int
 walidx_commit(uint32_t tl, uint64_t start_lsn, uint64_t end_lsn)
 {
 	WalIdxProgressRec rec;
+	pthread_rwlock_t *wal_lock;
 	uint64_t	current;
 	uint64_t	first;
 	int			rc = -1;
 	int			append_progress = 0;
+	int			current_valid;
 
 	/* A durable marker must name a contiguous prefix of shipped WAL. */
 	if (tl >= MAX_TIMELINES)
 		return -1;
 	walidx_publish_wrlock();
+	/* Compaction may have published a frontier while this request waited. */
+	if (walidx_frontier_publication_pending(tl))
+	{
+		walidx_publish_wrunlock();
+		return -1;
+	}
+	wal_lock = wal_log_lock_for(tl);
+	if (wal_lock == NULL)
+	{
+		walidx_publish_wrunlock();
+		return -1;
+	}
+	pthread_rwlock_rdlock(wal_lock);
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
-	if (current == 0)
+	current_valid = walidx_progress_valid[tl];
+	if (!current_valid)
 	{
 		first = wal_log_start(tl);
 		if (first != UINT64_MAX)
+		{
 			current = first;
+			current_valid = 1;
+		}
 	}
-	if (start_lsn != current || end_lsn < start_lsn ||
+	if (!current_valid || start_lsn != current || end_lsn < start_lsn ||
 		end_lsn > wal_end_read(tl) ||
 		!wal_coverage_advance(tl, start_lsn, end_lsn))
 		goto out;
@@ -5041,23 +6122,30 @@ out:
 	pthread_mutex_unlock(&walidx_meta_lock);
 	if (!append_progress)
 	{
+		pthread_rwlock_unlock(wal_lock);
 		walidx_publish_wrunlock();
 		return -1;
 	}
-	if (ps_storage->walidx_append(tl, 0, &rec, sizeof(rec)) != 0)
+	if (ps_storage->walidx_append(tl, 0, walidx_log_epoch[tl][0],
+								&rec, sizeof(rec)) != 0)
 	{
+		pthread_rwlock_unlock(wal_lock);
 		walidx_publish_wrunlock();
 		return -1;
 	}
 	pthread_mutex_lock(&walidx_meta_lock);
 	current = walidx_progress[tl];
-	if (current == 0)
+	current_valid = walidx_progress_valid[tl];
+	if (!current_valid)
 	{
 		first = wal_log_start(tl);
 		if (first != UINT64_MAX)
+		{
 			current = first;
+			current_valid = 1;
+		}
 	}
-	if (current != rec.start_lsn)
+	if (!current_valid || current != rec.start_lsn)
 		goto out_update;
 	walidx_shard_offsets_seen[tl][0] += sizeof(rec);
 	walidx_shards_required[tl][0] |= rec.shard_mask[0];
@@ -5066,9 +6154,11 @@ out:
 		if (rec.shard_offsets[shard] > walidx_shard_offsets_required[tl][shard])
 			walidx_shard_offsets_required[tl][shard] = rec.shard_offsets[shard];
 	walidx_progress[tl] = rec.end_lsn;
+	walidx_progress_valid[tl] = 1;
 	rc = 0;
 out_update:
 	pthread_mutex_unlock(&walidx_meta_lock);
+	pthread_rwlock_unlock(wal_lock);
 	walidx_publish_wrunlock();
 	publish_wal_index_metrics();
 	return rc;
@@ -5095,7 +6185,7 @@ walidx_upper_bound(WalIdxEnt *e, uint64_t lsn)
 	{
 		int			mid = lo + (hi - lo) / 2;
 
-		if (e->lsns[mid] <= lsn)
+		if (e->items[mid].lsn <= lsn)
 			lo = mid + 1;
 		else
 			hi = mid;
@@ -5126,6 +6216,9 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 	int			nout = 0;
 	TlWalk		w = tl_walk_first(tl, lsn_max);
 
+	if (!walidx_frontier_ancestry_allows(tl, lsn_max))
+		return -1;
+
 	do
 	{
 		uint32_t	h = page_hash(w.tl, key, block);
@@ -5144,7 +6237,7 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 					w.lsn : visible_end - 1;
 				int			end = walidx_upper_bound(e, cap_lsn);
 
-				if (have_cursor && pos < end && e->lsns[pos] == cursor_lsn &&
+				if (have_cursor && pos < end && e->items[pos].lsn == cursor_lsn &&
 					w.tl <= cursor_timeline)
 					pos++;
 				if (pos < end)
@@ -5170,13 +6263,13 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 
 			if (sources[i].pos >= sources[i].end)
 				continue;
-			lsn = sources[i].entry->lsns[sources[i].pos];
+			lsn = sources[i].entry->items[sources[i].pos].lsn;
 			if (best < 0)
 			{
 				best = i;
 				continue;
 			}
-			best_lsn = sources[best].entry->lsns[sources[best].pos];
+			best_lsn = sources[best].entry->items[sources[best].pos].lsn;
 			if (lsn < best_lsn ||
 				(lsn == best_lsn &&
 				 sources[i].timeline < sources[best].timeline))
@@ -5185,9 +6278,12 @@ walidx_get(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn_max,
 		if (best < 0)
 			break;
 		out[nout] = (PsWalRec) {
-			.lsn = sources[best].entry->lsns[sources[best].pos++],
-			.timeline = sources[best].timeline
+			.lsn = sources[best].entry->items[sources[best].pos].lsn,
+			.end_lsn = sources[best].entry->items[sources[best].pos].end_lsn,
+			.timeline = sources[best].timeline,
+			.flags = sources[best].entry->items[sources[best].pos].flags
 		};
+		sources[best].pos++;
 		nout++;
 	}
 	return nout;
@@ -6114,6 +7210,46 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	return 0;
 }
 
+/* Caller holds map-rd and the WAL-index prune read fence. */
+static int
+walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
+					uint32_t *nfences_out)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	uint64_t *fences;
+	uint32_t nfences = 0;
+
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	fences = malloc((size_t) (npins + MAX_TIMELINES) * sizeof(*fences));
+	if (fences == NULL)
+	{
+		free(pins);
+		return -1;
+	}
+	for (uint32_t i = 0; i < npins; i++)
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0)
+		{
+			uint64_t projected = pins[i].lsn;
+
+			if (retention_project_lsn(pins[i].timeline, timeline, &projected))
+				fences[nfences++] = projected;
+		}
+	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
+	{
+		uint64_t projected = UINT64_MAX;
+
+		if (candidate != timeline && timelines[candidate].defined &&
+			retention_project_lsn(candidate, timeline, &projected))
+			fences[nfences++] = projected;
+	}
+	free(pins);
+	*fences_out = fences;
+	*nfences_out = nfences;
+	return 0;
+}
+
 /*
  * One conservative floor for one resource on one timeline.  Explicit pins on
  * descendants are projected through every branch cap; a live direct child is
@@ -6847,7 +7983,14 @@ ps_handle_meta(PsChannel *ch)
 			break;
 
 		case PS_OP_WAL_READ:
-			ch->result = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
+			{
+				int64_t n = wal_read(tl, ch->req_lsn, ch->datalen, ch->data);
+
+				if (n < 0)
+					ch->status = PS_STATUS_ERROR;
+				else
+					ch->result = (uint32_t) n;
+			}
 			break;
 
 		case PS_OP_WAL_INDEX_ADD:
@@ -6933,6 +8076,8 @@ ps_handle_meta(PsChannel *ch)
 				int			old_found;
 				int			timeline_defined;
 				int			page_history_allowed;
+				int			wal_index_allowed;
+				int			wal_index_pending;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -6954,6 +8099,7 @@ ps_handle_meta(PsChannel *ch)
 					 * with mutations and advance allocation before admitting more. */
 					pthread_rwlock_wrlock(&admission_lock);
 					pthread_rwlock_wrlock(&page_prune_lock);
+					pthread_rwlock_wrlock(&walidx_prune_lock);
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
@@ -6961,12 +8107,20 @@ ps_handle_meta(PsChannel *ch)
 					page_history_allowed = timeline_defined &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
+					wal_index_allowed = timeline_defined &&
+						walidx_frontier_ancestry_allows(tl, pin.lsn);
+					wal_index_pending = timeline_defined &&
+						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
-					/* An active owner can only advance its own horizon.  Its old
-					 * pin already protected all history needed by the newer view, so
-					 * permit the atomic handoff even if a previously published global
-					 * frontier is stricter than the new point. */
-					ret = (((pin.resources &
+					wal_index_pending = wal_index_pending &&
+						((((old_found == 1 ? old_pin.resources : 0) |
+						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0) &&
+						!(old_found == 1 &&
+						  memcmp(&old_pin, &pin, sizeof(pin)) == 0);
+					/* Page history permits an active owner to advance from its old
+					 * protected image.  WAL-index history is sparse after compaction,
+					 * so its new point must independently name a retained chain. */
+					ret = ((((pin.resources &
 							  PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0 &&
 							 !page_history_allowed &&
 							 !(old_found == 1 &&
@@ -6976,6 +8130,8 @@ ps_handle_meta(PsChannel *ch)
 								/* An exact retry cannot expose a new fence. */
 								(old_pin.lsn == pin.lsn &&
 								 old_pin.admission_seq == pin.admission_seq)))) ||
+							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+							 !wal_index_allowed) || wal_index_pending) ||
 							!timeline_defined) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
@@ -6988,6 +8144,7 @@ ps_handle_meta(PsChannel *ch)
 							 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 							page_prune_mark_all_due();
 					}
+					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
 					pthread_rwlock_unlock(&admission_lock);
 				}
@@ -7007,6 +8164,8 @@ ps_handle_meta(PsChannel *ch)
 				int			old_found = 0;
 				int			timeline_defined = 0;
 				int			page_history_allowed = 0;
+				int			wal_index_allowed = 0;
+				int			wal_index_pending = 0;
 
 				memset(&pin, 0, sizeof(pin));
 				pin.timeline = tl;
@@ -7019,6 +8178,7 @@ ps_handle_meta(PsChannel *ch)
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
 				pthread_rwlock_wrlock(&page_prune_lock);
+				pthread_rwlock_wrlock(&walidx_prune_lock);
 				if (seq != 0 && ch->old_nblocks != 0 && tl < MAX_TIMELINES)
 				{
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
@@ -7028,11 +8188,20 @@ ps_handle_meta(PsChannel *ch)
 					page_history_allowed = timeline_defined &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
+					wal_index_allowed = timeline_defined &&
+						walidx_frontier_ancestry_allows(tl, pin.lsn);
+					wal_index_pending = timeline_defined &&
+						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
+					wal_index_pending = wal_index_pending &&
+						((((old_found == 1 ? old_pin.resources : 0) |
+						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
 					if (timeline_defined &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
-						 page_history_allowed))
+						 page_history_allowed) &&
+						(((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) == 0) ||
+						 wal_index_allowed) && !wal_index_pending)
 						ret = ps_retention_reserve_and_set(&pin);
 				}
 				if (ret == PS_RETENTION_OK)
@@ -7046,6 +8215,7 @@ ps_handle_meta(PsChannel *ch)
 						 PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 						page_prune_mark_all_due();
 				}
+				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				pthread_rwlock_unlock(&admission_lock);
 				if (ret == PS_RETENTION_STALE)
@@ -7061,21 +8231,27 @@ ps_handle_meta(PsChannel *ch)
 				int			ret;
 				int			old_found;
 				int			timeline_defined;
+				int			wal_index_pending;
 
 				pthread_rwlock_wrlock(&page_prune_lock);
+				pthread_rwlock_wrlock(&walidx_prune_lock);
 				old_found = ps_retention_lookup(tl, ch->blocknum,
 											ch->req_seq, &old_pin);
 				ps_lock_map_rd();
 				timeline_defined = tl < MAX_TIMELINES && timelines[tl].defined;
+				wal_index_pending = timeline_defined && old_found == 1 &&
+					(old_pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
+					walidx_frontier_ancestry_pending(tl);
 				ps_unlock_map();
 				ret = (ch->old_nblocks == 0 || tl >= MAX_TIMELINES ||
-					   !timeline_defined) ?
+					   !timeline_defined || wal_index_pending) ?
 					PS_RETENTION_ERROR :
 					ps_retention_drop(tl, ch->blocknum, ch->req_seq,
 									  ch->old_nblocks);
 				if (ret == PS_RETENTION_OK && old_found == 1 &&
 					(old_pin.resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) != 0)
 					page_prune_mark_all_due();
+				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
@@ -7977,8 +9153,32 @@ ps_core_open(const char *store_dir)
 
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
+	/* A close/open cycle may switch to a store with different timelines.  Drop
+	 * every in-memory flat-WAL catalog before metadata replay selects which
+	 * timelines to recover; resetting only wal_end would leave stale offsets and
+	 * chunk references available for a newly reused timeline id. */
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		if (wal_segment_store_opened[tl])
+		{
+			ps_wal_store_close(&wal_segment_stores[tl]);
+			wal_segment_store_opened[tl] = 0;
+		}
+		free(wal_chunks[tl]);
+		wal_chunks[tl] = NULL;
+		wal_chunks_n[tl] = 0;
+		wal_chunks_cap[tl] = 0;
+	}
+	memset(wal_log_bytes, 0, sizeof(wal_log_bytes));
+	memset(wal_start, 0, sizeof(wal_start));
+	memset(wal_start_valid, 0, sizeof(wal_start_valid));
+	memset(wal_end, 0, sizeof(wal_end));
+	memset(wal_covered, 0, sizeof(wal_covered));
+	memset(wal_covered_off, 0, sizeof(wal_covered_off));
+	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	memset(timeline_used, 0, sizeof(timeline_used));
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
@@ -7990,6 +9190,7 @@ ps_core_open(const char *store_dir)
 		return -1;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	memset(walidx_progress, 0, sizeof(walidx_progress));
+	memset(walidx_progress_valid, 0, sizeof(walidx_progress_valid));
 	memset(walidx_shards_seen, 0, sizeof(walidx_shards_seen));
 	memset(walidx_shards_required, 0, sizeof(walidx_shards_required));
 	memset(walidx_shard_offsets_seen, 0, sizeof(walidx_shard_offsets_seen));
@@ -7999,15 +9200,22 @@ ps_core_open(const char *store_dir)
 	memset(walidx_snapshot_start, 0, sizeof(walidx_snapshot_start));
 	memset(walidx_snapshot_end, 0, sizeof(walidx_snapshot_end));
 	memset(walidx_snapshot_offsets, 0, sizeof(walidx_snapshot_offsets));
+	memset(walidx_snapshot_bytes, 0, sizeof(walidx_snapshot_bytes));
 	memset(walidx_snapshot_reshard_pending, 0,
 		   sizeof(walidx_snapshot_reshard_pending));
 	memset(walidx_snapshot_retry_at, 0, sizeof(walidx_snapshot_retry_at));
 	walidx_snapshot_cursor = 0;
+	memset(walidx_log_epoch, 0, sizeof(walidx_log_epoch));
 	memset(walidx_snapshot_gc_pending, 0,
 		   sizeof(walidx_snapshot_gc_pending));
 	walidx_snapshot_gc_cursor = 0;
 	memset(walidx_snapshot_gc_retry_at, 0,
 		   sizeof(walidx_snapshot_gc_retry_at));
+	memset(walidx_snapshot_cleanup, 0, sizeof(walidx_snapshot_cleanup));
+	memset(walidx_snapshot_cleanup_pending, 0,
+		   sizeof(walidx_snapshot_cleanup_pending));
+	memset(walidx_snapshot_cleanup_retry_at, 0,
+		   sizeof(walidx_snapshot_cleanup_retry_at));
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 
@@ -8081,11 +9289,22 @@ ps_core_open(const char *store_dir)
 		fprintf(stderr, "pagestore_core: refusing to open corrupt timelines metadata\n");
 		return -1;
 	}
+	/* Load durable branch definitions before immutable-only ids are marked used:
+	 * metadata replay must be allowed to reconstruct a legitimate branch, while
+	 * later CREATE_BRANCH requests must not reuse any discovered id. */
+	if (wal_segment_discover_used() != 0)
+		return -1;
 	if (ps_retention_open(store_dir) != 0)
 		return -1;
 	if (page_frontier_load(store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
+		return -1;
+	}
+	if (walidx_frontier_load(store_dir) != 0)
+	{
+		fprintf(stderr, "pagestore: refusing to open corrupt WAL-index "
+				"reclamation frontiers\n");
 		return -1;
 	}
 	{
@@ -8169,7 +9388,7 @@ ps_core_open(const char *store_dir)
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		if (tl == 0 || timelines[tl].defined)
+		if (tl == 0 || timelines[tl].defined || timeline_is_used(tl))
 		{
 			if (wal_recover_one(tl) != 0)
 				return -1;
@@ -8180,6 +9399,14 @@ ps_core_open(const char *store_dir)
 				return -1;
 			}
 			walidx_progress_init(tl, wal_log_start(tl));
+			{
+				char directory[4096];
+
+				if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
+					ps_walidx_snapshot_recover_prepared(directory, tl,
+									walidx_reclaimed_frontier[tl]) != 0)
+					return -1;
+			}
 			if (walidx_snapshot_recover(tl) != 0)
 				return -1;
 			for (uint32_t shard = 0; shard < core_shards(); shard++)

@@ -58,6 +58,20 @@ class PlanValidationTests(unittest.TestCase):
             "case": {"storage": "posix", "shards": 1, "compute": ["writer", "reader"]},
         }
 
+    def test_fault_failure_classifications_distinguish_timeout_and_unreached(self):
+        self.assertEqual(
+            MODULE.fault_failure_classification(MODULE.HarnessTimeout("alive")),
+            "timeout",
+        )
+        self.assertEqual(
+            MODULE.fault_failure_classification(MODULE.FaultNotReached("report")),
+            "fault_not_reached",
+        )
+        self.assertEqual(
+            MODULE.fault_failure_classification(MODULE.UnexpectedExit("status")),
+            "unexpected_exit",
+        )
+
     def test_accepts_declared_horizon(self):
         path = self.write_plan([
             self.header(),
@@ -82,6 +96,260 @@ class PlanValidationTests(unittest.TestCase):
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "unsupported crash model"):
             MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
+
+    def test_named_fault_catalog_validates_target_model_action_and_hit(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-recovery", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities)
+        MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_named_fault_catalog_rejects_wrong_hit_without_launch(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-recovery", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "crash", "hit": 2,
+            },
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "requires hit=1"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_named_fault_rejects_nonfinite_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-recovery", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "crash", "hit": 1, "timeout": float("inf"),
+            },
+        ])
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("Infinity", "1e309"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(MODULE.PlanError, "finite and positive"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_fault_marker_is_created_atomically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "arm"
+            MODULE._atomic_arm_marker(marker)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "armed\n")
+            with self.assertRaises(FileExistsError):
+                MODULE._atomic_arm_marker(marker)
+
+    def test_fault_report_requires_name_and_hit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "daemon.after_ready", "action": "crash",
+                "hit": 1, "pid": 123,
+            }), encoding="utf-8")
+            self.assertEqual(
+                MODULE._fault_report(report, "daemon.after_ready", 1, 123)["hit"], 1
+            )
+            report.write_text(json.dumps({"name": "wrong", "hit": 1}), encoding="utf-8")
+            with self.assertRaises(MODULE.FaultNotReached):
+                MODULE._fault_report(report, "daemon.after_ready", 1, 123)
+
+    def test_fault_runtime_arms_before_popen_and_restarts_twice(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        plan = MODULE.read_plan(ROOT / "scenarios" / "daemon_fault_recovery.jsonl")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        previous_cwd = MODULE.os.getcwd()
+        MODULE.os.chdir(directory.name)
+        self.addCleanup(MODULE.os.chdir, previous_cwd)
+        root = Path("run")
+        health = {
+            "protocol_version": 33, "page_size": 8192, "io_unit": 262144,
+            "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
+            "admission_pending_epoch": 0, "admission_pending_lsn": 0,
+        }
+        calls = []
+
+        class FakeProcess:
+            next_pid = 700
+
+            def __init__(self, env):
+                self.pid = FakeProcess.next_pid
+                FakeProcess.next_pid += 1
+                self.returncode = 88 if "PAGESTORE_TEST_FAULT_NAME" in env else None
+                self.env = env
+                if self.returncode == 88:
+                    (Path(env["PAGESTORE_TEST_FAULT_DIR"]) / "report.jsonl").write_text(
+                        json.dumps({"schema": 1, "name": "daemon.after_ready",
+                                    "action": "crash", "hit": 1, "pid": self.pid}) + "\n",
+                        encoding="utf-8",
+                    )
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        def fake_popen(command, **kwargs):
+            env = kwargs["env"]
+            control = Path(env["PAGESTORE_TEST_FAULT_DIR"]) \
+                if "PAGESTORE_TEST_FAULT_DIR" in env else None
+            calls.append((
+                "popen", "PAGESTORE_TEST_FAULT_NAME" in env,
+                (control / "arm").exists() if control is not None else False,
+                command, env,
+            ))
+            return FakeProcess(env)
+
+        with (
+            mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(MODULE, "inspect_store", return_value=health),
+            mock.patch.object(MODULE, "validate_runtime_health"),
+            mock.patch.object(MODULE, "signal_process_group"),
+            mock.patch.object(MODULE, "remove_shm"),
+        ):
+            MODULE.run_daemon_fault_recovery(
+                plan, capabilities, {}, Path("daemon"), Path("inspect"), root, True,
+                ROOT / "capabilities.json",
+            )
+        self.assertEqual([call[1] for call in calls], [True, False, False])
+        self.assertTrue(calls[0][2])
+        self.assertTrue(Path(calls[0][3][0]).is_absolute())
+        self.assertTrue(
+            Path(calls[0][3][calls[0][3].index("--store") + 1]).is_absolute()
+        )
+        self.assertTrue(Path(calls[0][4]["PAGESTORE_TEST_FAULT_DIR"]).is_absolute())
+        events = [
+            json.loads(line)
+            for line in (root / "trace" / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertTrue(all({"scenario", "seed", "action_id", "generation"} <= set(event)
+                            for event in events))
+        self.assertEqual(
+            [event["event"] for event in events].count("ready"), 0
+        )
+        self.assertEqual([event["event"] for event in events].count("recovered"), 1)
+        self.assertEqual([event["event"] for event in events].count("restarted"), 1)
+        crash_exit = next(event for event in events if event["event"] == "crash_exit")
+        self.assertEqual(
+            {crash_exit[field] for field in ("name", "action", "hit", "returncode")},
+            {"daemon.after_ready", "crash", 1, 88},
+        )
+        first_stop = next(
+            event for event in events
+            if event["event"] == "process_stop" and event["generation"] == 0
+        )
+        self.assertEqual(first_stop["returncode"], 88)
+        self.assertFalse((root / "fault-control").exists())
+
+    def test_fault_failure_bundle_contains_inspection_schema_for_rerun(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        inspection_schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        plan = MODULE.read_plan(ROOT / "scenarios" / "daemon_fault_recovery.jsonl")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name) / "failure"
+
+        class FakeProcess:
+            pid = 701
+            returncode = 88
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def fake_popen(command, **kwargs):
+            control = Path(kwargs["env"]["PAGESTORE_TEST_FAULT_DIR"])
+            (control / "report.jsonl").write_text("{malformed\n", encoding="utf-8")
+            return FakeProcess()
+
+        with (
+            mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(MODULE, "remove_shm"),
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "failure bundle"):
+                MODULE.run_daemon_fault_recovery(
+                    plan, capabilities, inspection_schema,
+                    Path("daemon"), Path("inspect"), root, True,
+                    ROOT / "capabilities.json",
+                )
+
+        metadata = json.loads((root / "failure.json").read_text(encoding="utf-8"))
+        bundled_schema = root / "inspection_schema.json"
+        self.assertEqual(
+            json.loads(bundled_schema.read_text(encoding="utf-8")), inspection_schema
+        )
+        schema_index = metadata["command"].index("--inspection-schema")
+        self.assertEqual(metadata["command"][schema_index + 1], str(bundled_schema))
+        self.assertEqual(metadata["inspection_schema"], str(bundled_schema))
+        self.assertEqual(
+            (root / "fault-control" / "report.jsonl").read_text(encoding="utf-8"),
+            "{malformed\n",
+        )
+        self.assertFalse((root / "fault-control" / "arm").exists())
+
+    def test_fault_report_rejects_extra_fields_and_multiple_lines(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(
+                "{\"schema\":1,\"name\":\"daemon.after_ready\","
+                "\"action\":\"crash\",\"hit\":1,\"pid\":123,\"extra\":true}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(MODULE.FaultNotReached):
+                MODULE._fault_report(report, "daemon.after_ready", 1, 123)
+
+            report.write_bytes(b"\xff\xfe\xfd\n")
+            with self.assertRaises(MODULE.FaultNotReached):
+                MODULE._fault_report(report, "daemon.after_ready", 1, 123)
+            line = (
+                "{\"schema\":1,\"name\":\"daemon.after_ready\","
+                "\"action\":\"crash\",\"hit\":1,\"pid\":123}\n"
+            )
+            report.write_text(line + line, encoding="utf-8")
+            with self.assertRaises(MODULE.FaultNotReached):
+                MODULE._fault_report(report, "daemon.after_ready", 1, 123)
+
+    def test_fault_control_cleanup_preserves_file_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            regular = root / "control-file"
+            regular.write_text("diagnostic", encoding="utf-8")
+            MODULE._cleanup_fault_control(regular)
+            self.assertEqual(regular.read_text(encoding="utf-8"), "diagnostic")
+            target = root / "target"
+            target.write_text("diagnostic", encoding="utf-8")
+            link = root / "control-link"
+            link.symlink_to(target)
+            MODULE._cleanup_fault_control(link)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "diagnostic")
 
     def test_rejects_unknown_action_field(self):
         path = self.write_plan([
@@ -851,7 +1119,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":33,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -926,7 +1194,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":33,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -984,8 +1252,8 @@ class PlanValidationTests(unittest.TestCase):
         plan = self.write_plan([
             {"schema": 1, "scenario": "fault", "seed": 1, "contracts": ["lifecycle"],
              "case": {"storage": "posix", "shards": 1, "compute": ["writer"]}},
-            {"op": "crash", "id": "fault", "target": "store", "model": "power_loss",
-             "fault": "manifest.after_rename"},
+            {"op": "crash", "id": "fault", "target": "store", "model": "process_abort",
+             "fault": "daemon.after_ready", "action": "crash", "hit": 1},
         ])
         root = base / "run"
         with contextlib.redirect_stderr(io.StringIO()) as stderr:
@@ -997,6 +1265,23 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("does not support field(s): fault", stderr.getvalue())
         self.assertFalse(root.exists())
+
+    def test_named_fault_rejects_unknown_catalog_entry(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "fault", "seed": 1,
+                "contracts": ["lifecycle"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "unknown.after_ready",
+                "action": "crash", "hit": 1,
+            },
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "unknown fault"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
     def test_daemon_signal_targets_its_process_group(self):
         process = mock.Mock(pid=4321)

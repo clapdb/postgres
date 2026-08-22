@@ -53,14 +53,28 @@ endif
 # includes only pagestore_ipc.h and libc, no PostgreSQL libraries.
 pagestore_daemon = executable('pagestore_daemon',
   files('pagestore_daemon.c', 'pagestore_core.c', 'storage_posix.c',
+        'pagestore_fault.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
         'pagestore_retention.c', 'pagestore_wal_store.c',
-        'pagestore_wal_segment.c', 'pagestore_walidx_snapshot.c'),
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c'),
   dependencies: [dependency('threads')],
   kwargs: default_bin_args,
 )
 contrib_targets += pagestore_daemon
+
+# Pure process-local unit test for the first crash-only named fault registry.
+pagestore_fault_test = executable('pagestore_fault_test',
+  files('pagestore_fault_test.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_fault',
+  pagestore_fault_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
 
 # Import an existing PGDATA's relation files into the daemon, so a whole
 # database can be moved onto the page store.  Freestanding like the daemon.
@@ -143,11 +157,12 @@ test('pagestore_layer_store',
 
 # Integration test for idle layer upload and durable remote manifest state.
 pagestore_tiering_test = executable('pagestore_tiering_test',
-  files('pagestore_tiering_test.c', 'pagestore_core.c', 'storage_posix.c',
+  files('pagestore_tiering_test.c', 'pagestore_core.c', 'pagestore_fault.c', 'storage_posix.c',
         'pagestore_layer.c', 'pagestore_layer_store.c', 'pagestore_manifest.c',
         'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
         'pagestore_retention.c', 'pagestore_wal_store.c',
-        'pagestore_wal_segment.c', 'pagestore_walidx_snapshot.c'),
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c'),
   dependencies: [dependency('threads')],
   install: false,
 )
@@ -204,6 +219,17 @@ test('pagestore_prune',
   timeout: 30,
 )
 
+# Pure replacement-base chain selection for WAL-index compaction.
+pagestore_walidx_prune_test = executable('pagestore_walidx_prune_test',
+  files('pagestore_walidx_prune_test.c', 'pagestore_walidx_prune.c'),
+  install: false,
+)
+test('pagestore_walidx_prune',
+  pagestore_walidx_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Persisted immutable shipped-WAL segment header and checksum contract.
 pagestore_wal_segment_test = executable('pagestore_wal_segment_test',
   files('pagestore_wal_segment_test.c', 'pagestore_wal_segment.c'),
@@ -223,6 +249,18 @@ pagestore_wal_store_test = executable('pagestore_wal_store_test',
 )
 test('pagestore_wal_store',
   pagestore_wal_store_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Crash-atomic prefix replacement for the authoritative flat shipped-WAL log.
+storage_posix_wal_test = executable('storage_posix_wal_test',
+  files('storage_posix_wal_test.c', 'storage_posix.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_posix_wal',
+  storage_posix_wal_test,
   suite: ['pagestore'],
   timeout: 30,
 )
@@ -313,6 +351,17 @@ test('pagestore_harness_daemon_recovery',
   args: [files('harness/pagestore_harness.py'),
          '--capabilities', files('harness/capabilities.json'),
          '--daemon-smoke', files('harness/scenarios/daemon_recovery.jsonl'),
+         '--daemon-binary', pagestore_daemon,
+         '--inspect-binary', pagestore_inspect],
+  depends: [pagestore_daemon, pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+test('pagestore_harness_daemon_fault_recovery',
+  pagestore_harness_python,
+  args: [files('harness/pagestore_harness.py'),
+         '--capabilities', files('harness/capabilities.json'),
+         '--daemon-fault-recovery', files('harness/scenarios/daemon_fault_recovery.jsonl'),
          '--daemon-binary', pagestore_daemon,
          '--inspect-binary', pagestore_inspect],
   depends: [pagestore_daemon, pagestore_inspect],

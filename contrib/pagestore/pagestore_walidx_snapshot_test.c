@@ -63,6 +63,8 @@ main(void)
 {
 	char root[] = "/tmp/pswalidxsnapXXXXXX";
 	char directory[1024];
+	char recovery_directory[1024];
+	char reshard_directory[1024];
 	char path[1200];
 	unsigned char shard0[257];
 	unsigned char shard1[513];
@@ -73,6 +75,7 @@ main(void)
 	PsWalIdxSnapshot snapshot;
 	PsWalIdxSnapshot wrong;
 	ProduceCtx streamed;
+	PsWalIdxSnapshotPrepared prepared;
 
 	check(mkdtemp(root) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
@@ -92,6 +95,8 @@ main(void)
 	memcpy(second, first, sizeof(second));
 	second[0].data = newer0;
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
+	snprintf(recovery_directory, sizeof(recovery_directory), "%s/timeline_1", root);
+	snprintf(reshard_directory, sizeof(reshard_directory), "%s/timeline_2", root);
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,
 								 first, 3) != 0 && access(directory, F_OK) != 0,
@@ -142,13 +147,34 @@ main(void)
 		  snapshot.generation == 1,
 		  "recovery ignores an incomplete unpublished generation");
 	ps_walidx_snapshot_close(&snapshot);
-	check(ps_walidx_snapshot_publish(directory, 0, 2, 500, 900,
+	check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 2, 500, 900,
 								 second, 3) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
+		  snapshot.generation == 1,
+		  "prepare makes every replacement shard durable without selecting it");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_commit(&prepared) == 0 &&
 		  ps_walidx_snapshot_open(&snapshot, directory, 0) == 0 &&
 		  snapshot.generation == 2 && snapshot.start_lsn == 500 &&
 		  snapshot.end_lsn == 900,
-		  "retry completes and atomically selects the next generation");
+		  "commit atomically selects the prepared generation");
 	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_commit(&prepared) == 0,
+		  "an identical staged commit retry is idempotent");
+	check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 3, 900, 1000,
+								 second, 3) == 0,
+		  "prepare another complete unpublished generation");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 directory, 3ULL, 0U);
+	check(pwrite_byte(path, 17, newer0[17] ^ 0xff) == 0 &&
+		  ps_walidx_snapshot_commit(&prepared) != 0,
+		  "commit validates prepared shard durability before cutover");
+	check(pwrite_byte(path, 17, newer0[17]) == 0,
+		  "restore the unpublished generation after validation coverage");
+	check(ps_walidx_snapshot_abort(&prepared) == 0 &&
+		  access(path, F_OK) != 0 && errno == ENOENT &&
+		  ps_walidx_snapshot_commit(&prepared) != 0,
+		  "abort removes a prepared generation before input can change");
 	check(ps_walidx_snapshot_publish(directory, 0, 1, 100, 500,
 								 first, 3) != 0,
 		  "publication cannot move the durable generation backward");
@@ -193,6 +219,54 @@ main(void)
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
 		  "generation GC durably completes an ambiguous sync retry");
 
+	check(ps_walidx_snapshot_publish(recovery_directory, 1, 1, 100, 500,
+								 first, 3) == 0 &&
+		  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 1,
+		  "restart aborts a durable prepare intent behind an old frontier");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_publish(reshard_directory, 2, 1, 100, 500,
+								 first, 1) == 0 &&
+			  ps_walidx_snapshot_prepare(&prepared, reshard_directory, 2, 2,
+								 500, 500, second, 3) == 0 &&
+			  ps_walidx_snapshot_recover_prepared(reshard_directory, 2, 500) == 0,
+			  "restart aborts an uncommitted reshard when the frontier only covers the selected snapshot");
+	snprintf(path, sizeof(path), "%s/walidx_prepared_v1", reshard_directory);
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "uncommitted reshard intent is removed at the selected frontier");
+	check(ps_walidx_snapshot_open(&snapshot, reshard_directory, 2) == 0 &&
+		  snapshot.generation == 1 && snapshot.nshards == 1,
+		  "selected one-shard snapshot survives an aborted reshard");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 3,
+								 900, 1000, second, 3) == 0,
+		  "prepare a generation for partial abort recovery");
+	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+			 recovery_directory, 3ULL, 1U);
+	check(unlink(path) == 0 &&
+		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 899) == 0,
+		  "restart completes abort after one prepared shard is already missing");
+	snprintf(path, sizeof(path), "%s/walidx_prepared_v1", recovery_directory);
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "partial abort recovery clears the durable prepare intent");
+	check(ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 900) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 1,
+		  "restart retains a durable prepare intent covered by the frontier");
+	ps_walidx_snapshot_close(&snapshot);
+	check(ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+								 500, 900, second, 3) == 0 &&
+		  ps_walidx_snapshot_commit(&prepared) == 0 &&
+		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+		  snapshot.generation == 2 && snapshot.end_lsn == 900,
+		  "publisher retries the retained prepare intent idempotently");
+	ps_walidx_snapshot_close(&snapshot);
+
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 2ULL, 1U);
 	check(pwrite_byte(path, 17, shard1[17] ^ 0xff) == 0,
@@ -227,6 +301,28 @@ main(void)
 	}
 	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", directory);
 	unlink(path);
+	for (uint32_t generation = 1; generation <= 2; generation++)
+		for (uint32_t shard = 0; shard < 3; shard++)
+		{
+			snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+					 recovery_directory, (unsigned long long) generation, shard);
+			unlink(path);
+		}
+	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", recovery_directory);
+	unlink(path);
+	for (uint32_t shard = 0; shard < 3; shard++)
+	{
+		snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+				 reshard_directory, 1ULL, shard);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
+				 reshard_directory, 2ULL, shard);
+		unlink(path);
+	}
+	snprintf(path, sizeof(path), "%s/walidx_manifest_v1", reshard_directory);
+	unlink(path);
+	rmdir(recovery_directory);
+	rmdir(reshard_directory);
 	rmdir(directory);
 	rmdir(root);
 

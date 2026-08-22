@@ -1188,8 +1188,8 @@ op_timeline_info(uint32_t tl, uint32_t *parent_tl, uint64_t *branch_lsn)
 	return ch->result != 0;
 }
 
-/* Read len WAL bytes from start_lsn into out; returns bytes filled. */
-static uint32_t
+/* Read len WAL bytes from start_lsn into out; returns bytes filled or -1. */
+static int
 op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
@@ -1199,8 +1199,10 @@ op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	cl_exec();
+	if (ch->status != PS_STATUS_OK)
+		return -1;
 	memcpy(out, ch->data, len);
-	return ch->result;
+	return (int) ch->result;
 }
 
 /* --- per-page WAL index operations --- */
@@ -1218,9 +1220,10 @@ op_walidx_add(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block, uint64_t 
 	cl_exec();
 }
 
-static void
+static int
 op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
-					const uint32_t *blocks, const uint64_t *lsns, uint32_t nentries)
+					const uint32_t *blocks, const uint64_t *lsns,
+					const uint32_t *flags, uint32_t nentries)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 	PsWalIndexEntry *entries = (PsWalIndexEntry *) ch->data;
@@ -1230,14 +1233,15 @@ op_walidx_add_batch(uint32_t tl, uint32_t rel, int32_t fork,
 	{
 		entries[i].key = ch->key;
 		entries[i].block = blocks[i];
-		entries[i].pad = 0;
+		entries[i].flags = flags != NULL ? flags[i] : 0;
 		entries[i].lsn = lsns[i];
+		entries[i].end_lsn = flags != NULL ? lsns[i] + 1 : 0;
 	}
 	ch->timeline = tl;
 	ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
 	ch->nblocks = nentries;
 	ch->datalen = nentries * sizeof(*entries);
-	cl_exec();
+	return cl_exec()->status;
 }
 
 /* Returns count; fills out[] with the record LSNs <= lsn_max. */
@@ -1268,6 +1272,30 @@ op_walidx_get(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
 			  uint64_t lsn_max, PsWalRec *out)
 {
 	return op_walidx_get_after(tl, rel, fork, block, lsn_max, 0, 0, 0, 0, out);
+}
+
+static int
+op_walidx_get_status(uint32_t tl, uint32_t rel, int32_t fork, uint32_t block,
+					 uint64_t lsn_max, PsWalRec *out, int *count_out)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	int status;
+
+	cl_setkey(ch, rel, fork);
+	ch->timeline = tl;
+	ch->opcode = PS_OP_WAL_INDEX_GET;
+	ch->blocknum = block;
+	ch->nblocks = 0;
+	ch->req_lsn = lsn_max;
+	ch->pad1 = 0;
+	ch->req_seq = 0;
+	ch->parent_timeline = 0;
+	cl_exec();
+	status = ch->status;
+	*count_out = (int) ch->result;
+	if (status == PS_STATUS_OK)
+		memcpy(out, ch->data, (size_t) *count_out * sizeof(PsWalRec));
+	return status;
 }
 
 static int
@@ -2577,6 +2605,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 {
 	char		shm[64];
 	char		store[256];
+	char		fault_dir[256];
 	const uint32_t ps = 8192;
 	uint32_t	rel = find_relation_on_shard(0, test_nshards);
 	unsigned char *page = malloc(ps);
@@ -2584,19 +2613,32 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	int			crashed_layer_count;
 	char		marker[512];
 	pid_t		pid;
+	const char *fault_name;
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_prune_crash_%d",
 			 (int) getpid(), case_no);
 	snprintf(store, sizeof(store), "%s/store_prune_crash_%d", tmpbase, case_no);
+	snprintf(fault_dir, sizeof(fault_dir), "%s/fault_prune_crash_%d", tmpbase, case_no);
 	rm_rf(store);
+	rm_rf(fault_dir);
+	check(mkdir(fault_dir, 0700) == 0, "create fault control directory %s", phase);
 	shm_unlink(shm);
 
-	check(setenv("PAGESTORE_TEST_FAULT", "1", 1) == 0 &&
-		  setenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE", phase, 1) == 0,
+	fault_name = strcmp(phase, "after_publish") == 0 ?
+		"page_compaction.after_publish" :
+		(strcmp(phase, "after_mark_delete") == 0 ?
+		 "page_gc.after_mark_delete" : "page_prune.after_frontier");
+	snprintf(marker, sizeof(marker), "%s/arm", fault_dir);
+	check(setenv("PAGESTORE_TEST_FAULT_NAME", fault_name, 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0,
 		  "configure guarded compaction fault %s", phase);
 	pid = spawn_daemon_gc(daemon_path, shm, store, ps, test_nshards);
-	unsetenv("PAGESTORE_TEST_FAULT");
-	unsetenv("PAGESTORE_TEST_CRASH_COMPACTION_PHASE");
+	unsetenv("PAGESTORE_TEST_FAULT_NAME");
+	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
+	unsetenv("PAGESTORE_TEST_FAULT_HIT");
+	unsetenv("PAGESTORE_TEST_FAULT_DIR");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_create_at(rel, 0, 500);
@@ -2614,7 +2656,6 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	}
 	fill_page(page, ps, 4000, 40);
 	op_write_tl(0, rel, 0, 0, page);
-	snprintf(marker, sizeof(marker), "%s/.test-crash-compaction-armed", store);
 	{
 		int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
 
@@ -2669,6 +2710,7 @@ run_prune_publication_crash_case(const char *daemon_path, const char *tmpbase,
 	client_detach();
 	stop_daemon(pid);
 	rm_rf(store);
+	rm_rf(fault_dir);
 	shm_unlink(shm);
 	free(page);
 	free(readback);
@@ -4132,6 +4174,7 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	char		shm[64];
 	char		store[256];
 	char		immutable_path[512];
+	char		flat_path[512];
 	pid_t		dpid;
 	struct stat immutable_st;
 	uint32_t	ps = 8192;
@@ -4144,13 +4187,13 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	fprintf(stderr, "== shipped WAL ==\n");
 	memset(bufa, 0xAA, sizeof(bufa));	/* WAL [1000,1500) */
 	memset(bufb, 0xBB, sizeof(bufb));	/* WAL [1500,2000) */
-	segment = malloc(1024 * 1024);
+	segment = malloc(2 * 1024 * 1024);
 	if (segment == NULL)
 	{
 		check(0, "allocate immutable WAL segment test input");
 		return;
 	}
-	for (uint32_t i = 0; i < 1024 * 1024; i++)
+	for (uint32_t i = 0; i < 2 * 1024 * 1024; i++)
 		segment[i] = (unsigned char) (i * 17u + 3u);
 
 	snprintf(shm, sizeof(shm), "/pstest_%d_wal", (int) getpid());
@@ -4252,10 +4295,50 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	check(stat(immutable_path, &immutable_st) == 0 &&
 		  immutable_st.st_size == 1024 * 1024 + 64,
 		  "chunked WAL shipping publishes one immutable logical segment");
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_8", store);
+	check(stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "sealed WAL records leave no duplicate flat staging prefix");
+	check(op_wal_append_status(8, 0, segment, PS_IO_UNIT) == PS_STATUS_OK &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "an identical retry is validated from immutable WAL without regrowing flat");
+	segment[0] ^= 0xff;
+	check(op_wal_append_status(8, 0, segment, 1) == PS_STATUS_ERROR,
+		  "immutable WAL rejects a divergent retry after flat reclaim");
+	segment[0] ^= 0xff;
+	check(op_walidx_progress(8, 0, 1024 * 1024, NULL) == 0,
+		  "WAL-index progress accepts a fully immutable shipped prefix");
 	memset(rback, 0, sizeof(rback));
 	check(op_wal_read(8, PS_IO_UNIT - 256, 512, rback) == 512 &&
 		  memcmp(rback, segment + PS_IO_UNIT - 256, 512) == 0,
 		  "chunked WAL shipping seals and reads an immutable logical segment");
+
+	/* Keep a whole flat record when it crosses the sealed boundary.  Its
+	 * prefix overlaps immutable WAL and its suffix remains the staging tail. */
+	op_create_branch(9, 0, 0);
+	for (uint32_t off = 0; off < 900 * 1024;)
+	{
+		uint32_t amount = 900 * 1024 - off < PS_IO_UNIT ?
+			900 * 1024 - off : PS_IO_UNIT;
+
+		op_wal_append(9, off, segment + off, amount);
+		off += amount;
+	}
+	op_wal_append(9, 900 * 1024, segment + 900 * 1024, PS_IO_UNIT);
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_9", store);
+	check(stat(flat_path, &immutable_st) == 0 && immutable_st.st_size > PS_IO_UNIT,
+		  "a boundary-crossing record remains whole in the flat tail");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 512) == 0,
+		  "WAL read stitches an immutable prefix to a crossing flat record");
+	check(op_walidx_progress(9, 0, 900 * 1024 + PS_IO_UNIT, NULL) == 0,
+		  "WAL-index progress spans immutable coverage and a crossing flat tail");
+
+	/* Timeline 7 deliberately has no branch metadata.  After its flat prefix
+	 * is fully reclaimed, restart must still rebuild the usage marker from the
+	 * immutable catalog and refuse reuse of the numeric timeline id. */
+	for (uint32_t off = 0; off < 1024 * 1024; off += PS_IO_UNIT)
+		op_wal_append(7, off, segment + off, PS_IO_UNIT);
 
 	/* a retry that carries an already-accepted prefix plus new bytes (a
 	 * partially shipped chunk re-sent whole) appends only the uncovered
@@ -4297,6 +4380,40 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 		  op_wal_read(8, 700000, sizeof(rback), rback) == sizeof(rback) &&
 		  memcmp(rback, segment + 700000, sizeof(rback)) == 0,
 		  "restart reopens and validates the immutable WAL segment catalog");
+	check(op_create_branch_status(7, 0, 0) == PS_STATUS_ERROR,
+		  "immutable-only WAL keeps a timeline id used across restart");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_size(9) == 900 * 1024 + PS_IO_UNIT &&
+		  op_wal_read(9, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 512) == 0,
+		  "restart validates the retained flat/immutable overlap");
+	for (uint32_t off = 900 * 1024 + PS_IO_UNIT; off < 2 * 1024 * 1024;)
+	{
+		uint32_t amount = 2 * 1024 * 1024 - off < PS_IO_UNIT ?
+			2 * 1024 * 1024 - off : PS_IO_UNIT;
+
+		op_wal_append(9, off, segment + off, amount);
+		off += amount;
+	}
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_9", store);
+	check(op_wal_size(9) == 2 * 1024 * 1024 &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "the crossing record is reclaimed after its complete range seals");
+	for (uint32_t off = 1024 * 1024; off < 2 * 1024 * 1024;
+		 off += PS_IO_UNIT)
+		op_wal_append(8, off, segment + off - 1024 * 1024, PS_IO_UNIT);
+	snprintf(immutable_path, sizeof(immutable_path),
+			 "%s/wal_segments_8/walv1_9_%020llu", store, 1ULL);
+	snprintf(flat_path, sizeof(flat_path), "%s/wal_8", store);
+	check(op_wal_size(8) == 2 * 1024 * 1024 &&
+		  stat(immutable_path, &immutable_st) == 0 &&
+		  stat(flat_path, &immutable_st) == 0 && immutable_st.st_size == 0,
+		  "shipping continues with the next immutable segment after flat reclaim");
+	memset(rback, 0, sizeof(rback));
+	check(op_wal_read(8, 1024 * 1024 - 256, 512, rback) == 512 &&
+		  memcmp(rback, segment + 1024 * 1024 - 256, 256) == 0 &&
+		  memcmp(rback + 256, segment, 256) == 0,
+		  "WAL read crosses reclaimed immutable segment generations");
 	check(op_create_branch_status(1, 0, 2000) == PS_STATUS_ERROR,
 		  "shipped WAL also closes the idempotent re-create window (post-restart)");
 
@@ -4329,6 +4446,7 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 {
 	char		shm[64];
 	char		store[256];
+	char		fault_dir[256];
 	pid_t		dpid;
 	uint32_t	ps = 8192;
 	uint32_t	walidx_nshards = test_nshards < 2 ? 4 : test_nshards;
@@ -4337,20 +4455,26 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		find_relation_on_shard(nonzero_shard, walidx_nshards) : 0;
 	PsWalRec	out[16];
 	unsigned char wal[512] = {0};
+	char		fault_arm[512];
 	int		n;
 
 	fprintf(stderr, "== per-page WAL index ==\n");
 	snprintf(shm, sizeof(shm), "/pstest_%d_widx", (int) getpid());
 	snprintf(store, sizeof(store), "%s/store_widx", tmpbase);
+	snprintf(fault_dir, sizeof(fault_dir), "%s/fault_widx", tmpbase);
 	rm_rf(store);
+	rm_rf(fault_dir);
+	check(mkdir(fault_dir, 0700) == 0, "create WAL-index fault control directory");
 	shm_unlink(shm);
 
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
-		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD_ONCE", "0", 1) == 0,
 		  "force one WAL-index snapshot generation for recovery coverage");
 	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD_ONCE");
 	wait_ready(shm, ps);
 	client_attach(shm, ps);
 	op_wal_append(0, 0, wal, sizeof(wal));
@@ -4363,8 +4487,11 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	{
 		const uint32_t blocks[] = {7, 8, 7};
 		const uint64_t lsns[] = {175, 225, 275};
+		const uint32_t flags[] = {PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI};
 
-		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, 3);
+		op_walidx_add_batch(0, REL_A, FORK0, blocks, lsns, flags, 3);
 	}
 	check(nonzero_rel != 0, "test harness can find a nonzero WAL-index shard relation");
 	if (nonzero_rel != 0)
@@ -4401,6 +4528,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries are queryable in LSN order");
+	check(n == 2 && out[0].flags == PS_WAL_INDEX_FLAG_KNOWN &&
+		  out[1].flags == (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) &&
+		  out[0].end_lsn == 176 && out[1].end_lsn == 276,
+		  "WAL-index known/FPI and record-end metadata is returned with each entry");
 	{
 		char manifest[512];
 		int visible = 0;
@@ -4481,6 +4612,10 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	n = op_walidx_get(0, REL_A, FORK0, 7, 1000000, out);
 	check(n == 2 && out[0].lsn == 175 && out[1].lsn == 275,
 		  "batched WAL-index entries survive daemon restart");
+	check(n == 2 && out[0].flags == PS_WAL_INDEX_FLAG_KNOWN &&
+		  out[1].flags == (PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI) &&
+		  out[0].end_lsn == 176 && out[1].end_lsn == 276,
+		  "WAL-index replacement-base metadata survives snapshot recovery");
 	n = op_walidx_get(0, REL_A, FORK0, 9, 1000000, out);
 	check(n == 1 && out[0].lsn == 400,
 		  "restart replays the WAL-index log tail after the snapshot offset");
@@ -4502,6 +4637,9 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	{
 		char old_shard[512];
 		char current_shard[512];
+		char legacy_log[512];
+		char old_log[512];
+		char current_log[512];
 		int collected = 0;
 
 		snprintf(old_shard, sizeof(old_shard),
@@ -4510,10 +4648,18 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 		snprintf(current_shard, sizeof(current_shard),
 				 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
 				 store, 2ULL, 0U);
+		snprintf(legacy_log, sizeof(legacy_log), "%s/walidx_0_0", store);
+		snprintf(old_log, sizeof(old_log), "%s/walidx_0_0_e%020llu",
+				 store, 1ULL);
+		snprintf(current_log, sizeof(current_log), "%s/walidx_0_0_e%020llu",
+				 store, 2ULL);
 		for (int attempt = 0; attempt < 500; attempt++)
 		{
 			if (access(old_shard, F_OK) != 0 && errno == ENOENT &&
-				access(current_shard, F_OK) == 0)
+				access(current_shard, F_OK) == 0 &&
+				access(legacy_log, F_OK) != 0 && errno == ENOENT &&
+				access(old_log, F_OK) != 0 && errno == ENOENT &&
+				access(current_log, F_OK) == 0)
 			{
 				collected = 1;
 				break;
@@ -4521,7 +4667,13 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 			usleep(10000);
 		}
 		check(collected,
-			  "maintenance retires the old WAL-index snapshot generation");
+			  "maintenance retires old WAL-index snapshot and log epochs");
+	}
+	if (nonzero_rel != 0)
+	{
+		op_walidx_add(0, nonzero_rel, FORK0, 1, 500);
+		check(op_walidx_progress(0, 512, 512, NULL) == 0,
+			  "new WAL-index log epoch accepts and commits shard tail records");
 	}
 
 	/* a branch sees its own records plus the parent's, capped at the fork LSN */
@@ -4550,23 +4702,264 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	check(out[0].timeline == 0 && out[1].timeline == 0 && out[2].timeline == 1,
 		  "each record carries its source timeline tag (parent=0, branch=1)");
 
+	/* A metadata-complete timeline can advance independently of a fixed reader:
+	 * retain that reader's exact FPI-led chain plus the newest operational chain,
+	 * while rejecting every unrepresented point below the durable frontier. */
+	op_create_branch(5, 0, 0);
+	op_wal_append(5, 0, wal, sizeof(wal));
+	{
+		const uint32_t blocks[] = {12, 12, 12, 12, 12, 12};
+		const uint64_t lsns[] = {10, 30, 50, 70, 90, 110};
+		const uint32_t flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN,
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+		int compacted = 0;
+
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5001, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_OK,
+			  "register a fixed WAL-index horizon before compaction");
+		op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 6);
+		check(op_walidx_progress(5, 0, sizeof(wal), NULL) == 0,
+			  "commit the metadata-complete WAL-index interval");
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			int count = 0;
+
+			if (op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal),
+									 out, &count) == PS_STATUS_OK && count == 4)
+			{
+				compacted = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(compacted && out[0].lsn == 10 && out[1].lsn == 30 &&
+			  out[2].lsn == 90 && out[3].lsn == 110,
+			  "compaction retains the discrete and operational redo chains");
+	}
+	{
+		int count = 0;
+
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_OK && count == 2 && out[0].lsn == 10 && out[1].lsn == 30,
+			  "the active exact pin can read its retained replacement chain");
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5002, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 60) == PS_STATUS_ERROR,
+			  "a new pin at an unrepresented point below the frontier is rejected");
+		check(op_create_branch_status(6, 5, 60) == PS_STATUS_ERROR,
+			  "a branch at an unrepresented WAL-index point is rejected");
+		check(op_retention_set(5, PS_RETENTION_OWNER_READER, 5004, 1,
+						   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_OK,
+			  "another owner can share an exactly retained WAL-index exception");
+		check(op_retention_drop(5, PS_RETENTION_OWNER_READER, 5001, 1) ==
+			  PS_STATUS_OK,
+			  "drop the original fixed WAL-index owner");
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_OK &&
+			  op_retention_drop(5, PS_RETENTION_OWNER_READER, 5004, 1) ==
+			  PS_STATUS_OK,
+			  "the shared exception remains until its final owner drops");
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, 40, out, &count) ==
+			  PS_STATUS_ERROR &&
+			  op_retention_set(5, PS_RETENTION_OWNER_READER, 5003, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX, 40) == PS_STATUS_ERROR,
+			  "a retired exception cannot authorize reads or later admissions");
+	}
+	op_create_branch(7, 5, sizeof(wal) * 2);
+
 	client_detach();
 	stop_daemon(dpid);
 	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_FAULT_NAME", "wal_index.after_frontier", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_HIT", "1", 1) == 0 &&
+		  snprintf(fault_arm, sizeof(fault_arm), "%s/arm", fault_dir) > 0 &&
+		  setenv("PAGESTORE_TEST_FAULT_DIR", fault_dir, 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
+		  "configure WAL-index frontier publication crash");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_FAULT_NAME");
+	unsetenv("PAGESTORE_TEST_FAULT_ACTION");
+	unsetenv("PAGESTORE_TEST_FAULT_HIT");
+	unsetenv("PAGESTORE_TEST_FAULT_DIR");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	op_wal_append(5, sizeof(wal), wal, sizeof(wal));
+	{
+		const uint32_t blocks[] = {12, 12};
+		const uint64_t lsns[] = {530, 550};
+		const uint32_t flags[] = {
+			PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI,
+			PS_WAL_INDEX_FLAG_KNOWN
+		};
+		char marker[512];
+		int fd;
+
+		op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 2);
+		snprintf(marker, sizeof(marker), "%s/arm", fault_dir);
+		fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && close(fd) == 0,
+			  "arm the WAL-index frontier publication crash");
+		check(op_walidx_progress(5, sizeof(wal), sizeof(wal) * 2, NULL) == 0,
+			  "commit a second WAL-index interval for crash recovery");
+		client_detach();
+		check(wait_for_daemon_exit(dpid, 88),
+			  "WAL-index compaction crashes after durable frontier publication");
+		unlink(marker);
+	}
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "1", 1) == 0,
+		  "hold the crashed WAL-index generation pending for admission tests");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		const uint32_t blocks[] = {12};
+		const uint64_t lsns[] = {570};
+		const uint32_t flags[] = {PS_WAL_INDEX_FLAG_KNOWN};
+
+		check(op_walidx_add_batch(5, REL_A, FORK0, blocks, lsns, flags, 1) ==
+			  PS_STATUS_ERROR &&
+			  op_retention_set(5, PS_RETENTION_OWNER_READER, 5005, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX, 1200) ==
+			  PS_STATUS_ERROR &&
+			  op_retention_set(7, PS_RETENTION_OWNER_READER, 7001, 1,
+							   PS_RETENTION_RESOURCE_WAL_INDEX,
+							   sizeof(wal) * 2) ==
+			  PS_STATUS_ERROR &&
+			  op_create_branch_status(6, 5, sizeof(wal) * 2) == PS_STATUS_ERROR,
+			  "pending frontier cutover backpressures index, descendant pin, and branch mutations");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION", "2", 1) == 0,
+		  "enable immediate WAL-index publication retry after crash");
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_MAX_GENERATION");
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		int count = 0;
+		int recovered = 0;
+
+		for (int attempt = 0; attempt < 500; attempt++)
+		{
+			if (op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal) * 2,
+									 out, &count) == PS_STATUS_OK && count == 2)
+			{
+				recovered = 1;
+				break;
+			}
+			usleep(10000);
+		}
+		check(recovered && out[0].lsn == 530 && out[1].lsn == 550 &&
+			  op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal), out,
+									 &count) ==
+			  PS_STATUS_ERROR,
+			  "restart retries the prepared generation behind its durable frontier");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+	wait_ready(shm, ps);
+	client_attach(shm, ps);
+	{
+		int count = 0;
+
+		check(op_walidx_get_status(5, REL_A, FORK0, 12, sizeof(wal) * 2,
+									 out, &count) == PS_STATUS_OK && count == 2 &&
+			  out[0].lsn == 530 && out[1].lsn == 550,
+			  "second restart preserves the compacted snapshot and frontier");
+	}
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+	{
+		char path[512];
+		unsigned char byte;
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/walidx-prune.frontiers", store);
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && read(fd, &byte, 1) == 1 &&
+			  pwrite(fd, (unsigned char[]) {byte ^ 0xff}, 1, 0) == 1 &&
+			  fsync(fd) == 0 && close(fd) == 0,
+			  "corrupt the durable WAL-index frontier checksum domain");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+						   "corrupt WAL-index frontier fails startup closed");
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && pwrite(fd, &byte, 1, 0) == 1 && fsync(fd) == 0 &&
+			  close(fd) == 0,
+			  "restore the WAL-index frontier for later recovery tests");
+	}
+	if (walidx_nshards > 2)
+	{
+		char path[512];
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/walidx_0_%u_e%020llu",
+				 store, 2U, 2ULL);
+		check(unlink(path) == 0,
+			  "remove an empty but manifest-selected WAL-index log epoch");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+							   "missing selected WAL-index log epoch fails closed");
+		fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && fsync(fd) == 0 && close(fd) == 0,
+			  "restore the selected empty WAL-index log epoch for corruption test");
+	}
 	if (nonzero_rel != 0)
 	{
 		char		path[512];
 		struct stat st;
+		unsigned char last;
+		int fd;
 
-		snprintf(path, sizeof(path), "%s/walidx_0_%u", store, nonzero_shard);
-		check(stat(path, &st) == 0 && st.st_size > 1 &&
-			  truncate(path, st.st_size / 2) == 0,
+		snprintf(path, sizeof(path), "%s/walidx_0_%u_e%020llu",
+				 store, nonzero_shard, 2ULL);
+		fd = open(path, O_RDWR);
+		check(fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 1 &&
+			  pread(fd, &last, 1, st.st_size - 1) == 1 &&
+			  ftruncate(fd, st.st_size - 1) == 0 && fsync(fd) == 0 &&
+			  close(fd) == 0,
 			  "truncate a committed nonzero WAL-index shard");
 		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
 		expect_daemon_open_failure(dpid, shm,
 								   "truncated committed nonzero WAL-index shard fails closed");
+		fd = open(path, O_WRONLY | O_APPEND);
+		check(fd >= 0 && write(fd, &last, 1) == 1 && fsync(fd) == 0 &&
+			  close(fd) == 0,
+			  "restore the committed nonzero WAL-index shard tail");
+	}
+	{
+		char path[512];
+		struct stat st;
+
+		snprintf(path, sizeof(path), "%s/walidx_0_0_e%020llu", store, 2ULL);
+		check(stat(path, &st) == 0 && st.st_size > 0 && truncate(path, 0) == 0,
+			  "truncate an acknowledged shard-0 epoch at a complete-record boundary");
+		dpid = spawn_daemon(daemon_path, shm, store, ps, walidx_nshards);
+		expect_daemon_open_failure(dpid, shm,
+								   "watermark detects complete loss of selected epoch records");
 	}
 	rm_rf(store);
+	rm_rf(fault_dir);
 	shm_unlink(shm);
 }
 

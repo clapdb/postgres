@@ -8,11 +8,14 @@ The focused C unit tests check layer, manifest, cache, and GC invariants.
 `harness/pagestore_harness.py` now provides the first reusable runner: it
 validates the basic JSONL schema and some boundary references, owns private
 test environments, captures diagnostic run roots, runs daemon-smoke,
-writer-smoke, and managed materializer-smoke modes, and can wrap the legacy
-integration script in a failure bundle.  It is not yet the full semantic
+named daemon-fault recovery, writer-smoke, and managed materializer-smoke
+modes, and can wrap the legacy integration script in a failure bundle.  The
+named-fault mode pre-arms one crash-only fault before launch, proves its exact
+hit from a bounded report, and performs two clean recovery opens.  It is not
+yet the full semantic
 harness described below: full
 mode-specific plan validation, per-action timeouts, replay commands, generated
-workloads, controlled faults, branch plans, redo/materialization comparisons,
+workloads, error/pause faults, branch plans, redo/materialization comparisons,
 shrinking, and compatibility fixtures remain future work.
 
 This document specifies that harness.  Its job is to find semantic regressions
@@ -48,7 +51,8 @@ to observe state newer than its horizon.
 The host-side executable is `contrib/pagestore/harness/pagestore_harness.py`,
 with only the Python standard library.  It receives capability metadata plus a
 scenario plan for `--validate`, `--daemon-smoke`, `--writer-smoke`, and
-`--materializer-smoke`;
+`--materializer-smoke`; `--daemon-fault-recovery` runs the first named,
+crash-only daemon recovery case;
 `--list` instead receives a scenario directory and inventories the plans below
 it.  Runtime modes then add the inputs they actually need: `--daemon-smoke`
 takes daemon and inspector binaries, `--writer-smoke` and
@@ -362,8 +366,18 @@ slru.after_ship            crash | error | pause
 
 `pause` is important: the harness can stop at a precise point, checkpoint or
 inspect another process, then release it.  Faults must be compiled into test
-builds only or guarded by an explicit `PAGESTORE_TEST_FAULT` setting; production
-configuration never activates them.
+builds only or guarded by explicit `PAGESTORE_TEST_FAULT_*` settings;
+production configuration never activates them.
+
+The first registry slice is deliberately crash-only.  Its canonical names and
+harness metadata share `pagestore_fault_points.def`; the registry is inert when
+no fault variables are present, while a partial
+`PAGESTORE_TEST_FAULT_{NAME,ACTION,HIT,DIR}` configuration fails closed.
+The control directory is outside the store, contains fixed `arm` and
+`report.jsonl` names, and is never fsynced by a fault probe.  Error and pause
+actions remain future work.  A future pause point must be outside core locks;
+publication probes reached while holding shard, map, or WAL-index locks remain
+crash-only.
 
 Each scenario explores one fault point per run.  The coordinator enumerates
 them deterministically instead of injecting several independent crashes into
@@ -559,8 +573,11 @@ advancing durable horizon.
 2. Add checkpoint records and SQL/metadata/visibility oracles.  Port the
    current reader R test, including running-XID and oversized-subxid cases, and
    add the local-control differential trace.
-3. Add the test-only fault registry with reachability accounting.  Port
-   manifest/segment/GC crash windows as daemon-restart scenarios.
+3. [partial] Add the test-only fault registry with reachability accounting.
+   The crash-only registry, daemon after-ready reachability case, and existing
+   page/GC/WAL-index publication crash windows use canonical names.  Error and
+   pause actions plus composed manifest/segment/GC daemon-restart scenarios
+   remain to be added.
 4. Add branch, control, SLRU, lifecycle, and corruption scenarios, retaining
    one understandable topology per scenario.
 5. Add WAL redo/materialization topology and direct-versus-redo cases; then add

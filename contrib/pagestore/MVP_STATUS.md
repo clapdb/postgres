@@ -37,12 +37,12 @@ work and must not expand the MVP critical path.
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
-| Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index, durable multi-shard snapshot cutover, and old snapshot-generation GC implemented; replacement-base/log reclamation remains | WAL redo demos plus snapshot publication, generation-GC, tail-replay, and restart tests |
+| Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index plus crash-safe replacement-chain compaction, durable timeline frontier, multi-shard snapshot/log-epoch cutover, and old generation/epoch GC implemented | WAL redo demos plus discrete/operational chain pruning, frontier admission/restart/corruption/crash tests, snapshot publication, generation/epoch GC, and tail replay |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
-| Retention horizon authority | Reader/materializer owners and page-history frontier implemented; other reclaim consumers remaining | restart/corruption tests, exact-fence admission, branch projection, page-pruning crash tests, and bounded page churn |
+| Retention horizon authority | Reader/materializer owners plus page-history and WAL-index frontiers implemented; WAL and forkmeta reclaim consumers remain | restart/corruption tests, exact-fence admission, branch projection, page/WAL-index publication crash tests, and bounded page churn |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 

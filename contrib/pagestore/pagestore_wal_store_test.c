@@ -51,6 +51,7 @@ main(void)
 	char temporary_path[1024];
 	char retry_directory[512];
 	char create_retry_directory[512];
+	char discover_directory[512];
 	uint32_t first_len = 2 * TEST_SEGMENT_BYTES;
 	uint32_t retry_len = 2 * TEST_SEGMENT_BYTES;
 	unsigned char *input = malloc((size_t) first_len +
@@ -60,6 +61,7 @@ main(void)
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
 	PsWalStore store;
 	PsWalStore retry_store;
+	PsWalStore discover_store;
 	int fd;
 
 	check(mkdtemp(directory) != NULL, "create WAL segment test directory");
@@ -107,6 +109,18 @@ main(void)
 		  memcmp(window, input + first_len - 32, 96) == 0,
 		  "reopened store serves a cross-segment read");
 	ps_wal_store_close(&store);
+	snprintf(path, sizeof(path), "%s/%s", directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	check(unlink(path) == 0 &&
+		  ps_wal_store_open(&store, directory, 7, 0,
+						 TEST_SEGMENT_BYTES) == 0,
+		  "explicit-start open validates a legacy store before identity backfill");
+	ps_wal_store_close(&store);
+	check(access(path, F_OK) == 0 &&
+		  ps_wal_store_open_existing(&store, directory, 7,
+								 TEST_SEGMENT_BYTES) == 0,
+		  "legacy identity backfill survives loss of flat-log start metadata");
+	ps_wal_store_close(&store);
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 1ULL);
 	snprintf(temporary_path, sizeof(temporary_path), "%s/held_segment", directory);
 	check(rename(path, temporary_path) == 0,
@@ -136,6 +150,9 @@ main(void)
 							 TEST_SEGMENT_BYTES) == 0,
 		  "an EEXIST retry still makes the directory entry durable");
 	ps_wal_store_close(&retry_store);
+	snprintf(path, sizeof(path), "%s/%s", create_retry_directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
 	rmdir(create_retry_directory);
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
@@ -186,7 +203,39 @@ main(void)
 				 (unsigned long long) segment);
 		unlink(path);
 	}
+	snprintf(path, sizeof(path), "%s/%s", retry_directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
 	rmdir(retry_directory);
+
+	snprintf(discover_directory, sizeof(discover_directory), "%s/discover",
+			 directory);
+	check(ps_wal_store_create(&discover_store, discover_directory, 10,
+								3ULL * TEST_SEGMENT_BYTES,
+								TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&discover_store, 3ULL * TEST_SEGMENT_BYTES,
+						  input, 2 * TEST_SEGMENT_BYTES) == 0,
+		  "create a nonzero-start immutable WAL store");
+	ps_wal_store_close(&discover_store);
+	check(ps_wal_store_open_existing(&discover_store, discover_directory, 10,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  discover_store.start_lsn == 3ULL * TEST_SEGMENT_BYTES &&
+		  discover_store.end_lsn == 5ULL * TEST_SEGMENT_BYTES,
+		  "reopen discovers the immutable start without flat-log metadata");
+	ps_wal_store_close(&discover_store);
+	snprintf(path, sizeof(path), "%s/walv1_10_%020llu", discover_directory,
+			 3ULL);
+	check(unlink(path) == 0 &&
+		  ps_wal_store_open_existing(&discover_store, discover_directory, 10,
+								 TEST_SEGMENT_BYTES) != 0,
+		  "durable identity rejects a shifted store when its first segment is missing");
+	snprintf(path, sizeof(path), "%s/walv1_10_%020llu", discover_directory,
+			 4ULL);
+	unlink(path);
+	snprintf(path, sizeof(path), "%s/%s", discover_directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(discover_directory);
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDWR);
@@ -249,6 +298,9 @@ main(void)
 				 (unsigned long long) segment);
 		unlink(path);
 	}
+	snprintf(path, sizeof(path), "%s/%s", directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
 	rmdir(directory);
 	free(input);
 

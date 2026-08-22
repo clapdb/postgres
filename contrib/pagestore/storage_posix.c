@@ -14,6 +14,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -46,7 +47,21 @@ static int test_fail_seg_writes;
 static int test_crash_after_seg_writes;
 static int test_fail_fork_meta_append_at;
 static int test_max_log_read;
+static int test_fail_wal_rewrite_before_rename;
+static int test_fail_wal_rewrite_dir_fsync;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Flat WAL files are independent per timeline. */
+typedef struct PosixWalLock
+{
+	uint32_t	tl;
+	int		poisoned;
+	pthread_mutex_t lock;
+	struct PosixWalLock *next;
+} PosixWalLock;
+
+static PosixWalLock *posix_wal_locks;
+static pthread_mutex_t posix_wal_locks_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * WAL-index records are independent per (timeline, shard).  The metadata
@@ -65,12 +80,14 @@ typedef struct PosixWalIdxLock
 static PosixWalIdxLock *posix_walidx_locks;
 static pthread_mutex_t posix_walidx_locks_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void posix_wal_locks_clear(void);
 static void posix_walidx_locks_clear(void);
 
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
 static int posix_log_append_locked(const char *name, const void *buf,
-							 uint32_t len);
+								 uint32_t len);
+static PosixWalLock *posix_wal_lock_for(uint32_t tl);
 static PosixWalIdxLock *posix_walidx_lock_for(uint32_t tl, uint32_t shard);
 
 static void
@@ -213,6 +230,8 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *crash_after_writes;
 	const char *fail_fork_meta_at;
 	const char *max_log_read;
+	const char *fail_wal_rewrite;
+	const char *fail_wal_rewrite_dir_fsync;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -233,6 +252,13 @@ posix_open(const char *path, uint64_t segment_size)
 		atoi(fail_fork_meta_at) : 0;
 	max_log_read = getenv("PAGESTORE_TEST_MAX_LOG_READ");
 	test_max_log_read = max_log_read ? atoi(max_log_read) : 0;
+	fail_wal_rewrite = getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_BEFORE_RENAME");
+	test_fail_wal_rewrite_before_rename = fail_wal_rewrite ?
+		atoi(fail_wal_rewrite) : 0;
+	fail_wal_rewrite_dir_fsync =
+		getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC");
+	test_fail_wal_rewrite_dir_fsync = fail_wal_rewrite_dir_fsync ?
+		atoi(fail_wal_rewrite_dir_fsync) : 0;
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -245,6 +271,8 @@ posix_open(const char *path, uint64_t segment_size)
 	}
 	if (close(dfd) != 0)
 		return -1;
+	/* A successful reopen has reconciled any ambiguous post-rename state. */
+	posix_wal_locks_clear();
 	return 0;
 }
 
@@ -252,6 +280,7 @@ static void
 posix_close(void)
 {
 	free_shard_caches();
+	posix_wal_locks_clear();
 	posix_walidx_locks_clear();
 }
 
@@ -397,8 +426,8 @@ posix_wal_rollback(const char *path, int fd, off_t oldsz, int created)
 }
 
 static int
-posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
-			 const void *b, uint32_t blen)
+posix_wal_append_locked(uint32_t tl, const void *a, uint32_t alen,
+						const void *b, uint32_t blen)
 {
 	char		path[4096];
 	int		fd;
@@ -447,17 +476,45 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 }
 
 static int
+posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
+			 const void *b, uint32_t blen)
+{
+	PosixWalLock *lock = posix_wal_lock_for(tl);
+	int rc;
+
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	rc = lock->poisoned ? -1 :
+		posix_wal_append_locked(tl, a, alen, b, blen);
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
+}
+
+static int
 posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
+	PosixWalLock *lock = posix_wal_lock_for(tl);
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
 	uint32_t	done = 0;
 
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	if (lock->poisoned)
+	{
+		pthread_mutex_unlock(&lock->lock);
+		return -1;
+	}
 	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
+	{
+		pthread_mutex_unlock(&lock->lock);
 		return -1;
+	}
 	while (done < len)
 	{
 		n = pread(fd, (char *) buf + done, len - done, (off_t) off + done);
@@ -466,6 +523,7 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 			if (errno == EINTR)
 				continue;
 			close(fd);
+			pthread_mutex_unlock(&lock->lock);
 			return -1;
 		}
 		if (n == 0)
@@ -473,11 +531,12 @@ posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 		done += (uint32_t) n;
 	}
 	close(fd);
+	pthread_mutex_unlock(&lock->lock);
 	return (int) done;
 }
 
 static int
-posix_wal_truncate(uint32_t tl, uint64_t len)
+posix_wal_truncate_locked(uint32_t tl, uint64_t len)
 {
 	char		path[4096];
 	int			fd;
@@ -495,18 +554,396 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 }
 
 static int
-posix_walidx_append(uint32_t tl, uint32_t shard, const void *buf, uint32_t len)
+posix_wal_truncate(uint32_t tl, uint64_t len)
 {
-	char		name[64];
+	PosixWalLock *lock = posix_wal_lock_for(tl);
+	int rc;
+
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	rc = lock->poisoned ? -1 : posix_wal_truncate_locked(tl, len);
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
+}
+
+/*
+ * Copy the retained suffix to a sibling, make it durable, then publish it with
+ * rename.  The old file remains authoritative before rename.  Success is
+ * reported only after the directory entry is durable; an ambiguous failure
+ * after rename poisons the timeline until storage is reopened and its physical
+ * offsets are recovered.
+ */
+static int
+posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
+{
+	PosixWalLock *lock = posix_wal_lock_for(tl);
+	char		path[4096];
+	char		tmp[4096];
+	unsigned char buf[64 * 1024];
+	struct stat st;
+	uint64_t	off;
+	int		src = -1;
+	int		dst = -1;
+	int		dfd = -1;
+	int		rc = -1;
+
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	if (lock->poisoned)
+	{
+		pthread_mutex_unlock(&lock->lock);
+		return -1;
+	}
+	snprintf(path, sizeof(path), "%s/wal_%u", posix_dir, tl);
+	snprintf(tmp, sizeof(tmp), "%s/wal_%u.rewrite.tmp", posix_dir, tl);
+	src = open(path, O_RDONLY);
+	if (src < 0 || fstat(src, &st) != 0 || st.st_size < 0 ||
+		keep_off > (uint64_t) st.st_size)
+		goto out;
+	dst = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (dst < 0)
+		goto out;
+	for (off = keep_off; off < (uint64_t) st.st_size;)
+	{
+		size_t want = (uint64_t) st.st_size - off < sizeof(buf) ?
+			(size_t) ((uint64_t) st.st_size - off) : sizeof(buf);
+		ssize_t nread = pread(src, buf, want, (off_t) off);
+		size_t written = 0;
+
+		if (nread < 0 && errno == EINTR)
+			continue;
+		if (nread <= 0)
+			goto out;
+		while (written < (size_t) nread)
+		{
+			ssize_t nwrite = write(dst, buf + written,
+								 (size_t) nread - written);
+
+			if (nwrite < 0 && errno == EINTR)
+				continue;
+			if (nwrite <= 0)
+				goto out;
+			written += (size_t) nwrite;
+		}
+		off += (uint64_t) nread;
+	}
+	if (fsync(dst) != 0)
+		goto out;
+	if (close(dst) != 0)
+	{
+		dst = -1;
+		goto out;
+	}
+	dst = -1;
+	if (test_fail_wal_rewrite_before_rename > 0 &&
+		--test_fail_wal_rewrite_before_rename == 0)
+	{
+		errno = EIO;
+		goto out;
+	}
+	if (rename(tmp, path) != 0)
+		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 ||
+		(test_fail_wal_rewrite_dir_fsync > 0 &&
+		 --test_fail_wal_rewrite_dir_fsync == 0) ||
+		fsync(dfd) != 0)
+	{
+		/* The visible replacement has ambiguous crash durability.  Its physical
+		 * offsets no longer match the caller's catalog; force a reopen before
+		 * any further operation can observe or extend it. */
+		lock->poisoned = 1;
+		if (dfd >= 0)
+			(void) close(dfd);
+		dfd = -1;
+		errno = EIO;
+		goto out;
+	}
+	{
+		int close_rc = close(dfd);
+
+		dfd = -1;
+		if (close_rc != 0)
+		{
+			lock->poisoned = 1;
+			errno = EIO;
+			goto out;
+		}
+	}
+	rc = 0;
+
+out:
+	if (src >= 0)
+		close(src);
+	if (dst >= 0)
+		close(dst);
+	if (dfd >= 0)
+		close(dfd);
+	if (rc != 0)
+		(void) unlink(tmp);
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
+}
+
+static PosixWalLock *
+posix_wal_lock_for(uint32_t tl)
+{
+	PosixWalLock *entry;
+
+	pthread_mutex_lock(&posix_wal_locks_lock);
+	for (entry = posix_wal_locks; entry; entry = entry->next)
+		if (entry->tl == tl)
+			break;
+	if (entry == NULL)
+	{
+		entry = calloc(1, sizeof(*entry));
+		if (entry != NULL)
+		{
+			entry->tl = tl;
+			if (pthread_mutex_init(&entry->lock, NULL) != 0)
+			{
+				free(entry);
+				entry = NULL;
+			}
+			else
+			{
+				entry->next = posix_wal_locks;
+				posix_wal_locks = entry;
+			}
+		}
+	}
+	pthread_mutex_unlock(&posix_wal_locks_lock);
+	return entry;
+}
+
+static void
+posix_wal_locks_clear(void)
+{
+	PosixWalLock *entry;
+
+	pthread_mutex_lock(&posix_wal_locks_lock);
+	entry = posix_wal_locks;
+	posix_wal_locks = NULL;
+	pthread_mutex_unlock(&posix_wal_locks_lock);
+	while (entry != NULL)
+	{
+		PosixWalLock *next = entry->next;
+
+		pthread_mutex_destroy(&entry->lock);
+		free(entry);
+		entry = next;
+	}
+}
+
+static int
+posix_walidx_name(uint32_t tl, uint32_t shard, uint64_t epoch,
+				  char *name, size_t name_len)
+{
+	int n;
+
+	if (epoch == 0)
+		n = snprintf(name, name_len, "walidx_%u_%u", tl, shard);
+	else
+		n = snprintf(name, name_len, "walidx_%u_%u_e%020llu", tl, shard,
+					 (unsigned long long) epoch);
+	return n < 0 || (size_t) n >= name_len ? -1 : 0;
+}
+
+#define POSIX_WALIDX_WATERMARK_MAGIC UINT64_C(0x31524b4d58444957)
+typedef struct PosixWalIdxWatermark
+{
+	uint64_t magic;
+	uint64_t length;
+	uint32_t crc;
+	uint32_t reserved;
+} PosixWalIdxWatermark;
+
+static uint32_t
+posix_walidx_watermark_crc(PosixWalIdxWatermark *watermark)
+{
+	const unsigned char *bytes = (const unsigned char *) watermark;
+	uint32_t saved = watermark->crc;
+	uint32_t hash = 2166136261u;
+
+	watermark->crc = 0;
+	for (size_t i = 0; i < sizeof(*watermark); i++)
+	{
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	watermark->crc = saved;
+	return hash;
+}
+
+static int
+posix_walidx_watermark_name(const char *log_name, char *name, size_t name_len)
+{
+	int n = snprintf(name, name_len, "%s.size", log_name);
+
+	return n < 0 || (size_t) n >= name_len ? -1 : 0;
+}
+
+static int
+posix_walidx_watermark_read(const char *log_name, uint64_t *length)
+{
+	PosixWalIdxWatermark watermark;
+	char marker[160];
+	char path[4096];
+	struct stat st;
+	int fd;
+
+	if (posix_walidx_watermark_name(log_name, marker, sizeof(marker)) != 0 ||
+		snprintf(path, sizeof(path), "%s/%s", posix_dir, marker) < 0 ||
+		strlen(posix_dir) + 1 + strlen(marker) >= sizeof(path))
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		st.st_size != (off_t) sizeof(watermark) ||
+		pread(fd, &watermark, sizeof(watermark), 0) !=
+			(ssize_t) sizeof(watermark))
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	if (close(fd) != 0 || watermark.magic != POSIX_WALIDX_WATERMARK_MAGIC ||
+		watermark.reserved != 0 ||
+		watermark.crc != posix_walidx_watermark_crc(&watermark))
+		return -1;
+	*length = watermark.length;
+	return 0;
+}
+
+static int
+posix_walidx_watermark_write(const char *log_name, uint64_t length, int create)
+{
+	PosixWalIdxWatermark watermark;
+	char marker[160];
+	char temporary[192] = {0};
+	struct stat st;
+	int directory_fd = -1;
+	int fd = -1;
+	int rc = -1;
+
+	if (posix_walidx_watermark_name(log_name, marker, sizeof(marker)) != 0 ||
+		(directory_fd = open(posix_dir,
+						 O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
+		return -1;
+	if (!create &&
+		(fstatat(directory_fd, marker, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+		 !S_ISREG(st.st_mode)))
+		goto cleanup;
+	memset(&watermark, 0, sizeof(watermark));
+	watermark.magic = POSIX_WALIDX_WATERMARK_MAGIC;
+	watermark.length = length;
+	watermark.crc = posix_walidx_watermark_crc(&watermark);
+	for (unsigned int attempt = 0; attempt < 128; attempt++)
+	{
+		int n = snprintf(temporary, sizeof(temporary), "%s.tmp.%ld.%u",
+						 marker, (long) getpid(), attempt);
+
+		if (n < 0 || (size_t) n >= sizeof(temporary))
+			goto cleanup;
+		fd = openat(directory_fd, temporary,
+					O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+		if (fd >= 0 || errno != EEXIST)
+			break;
+	}
+	if (fd < 0 || write(fd, &watermark, sizeof(watermark)) !=
+			(ssize_t) sizeof(watermark) || fsync(fd) != 0)
+		goto cleanup;
+	if (close(fd) != 0)
+	{
+		fd = -1;
+		goto cleanup;
+	}
+	fd = -1;
+	if (renameat(directory_fd, temporary, directory_fd, marker) != 0 ||
+		fsync(directory_fd) != 0)
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (fd >= 0)
+		close(fd);
+	if (temporary[0] != '\0')
+		(void) unlinkat(directory_fd, temporary, 0);
+	if (directory_fd >= 0 && close(directory_fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+/* The watermark is the acknowledged epoch length.  A longer file is an
+ * unacknowledged append tail and is rolled back; a shorter file lost
+ * acknowledged records and must fail closed.  Caller holds the shard lock. */
+static int
+posix_walidx_epoch_reconcile_locked(const char *name, uint64_t *length)
+{
+	char path[4096];
+	struct stat st;
+	int fd = -1;
+	int rc = -1;
+
+	if (posix_walidx_watermark_read(name, length) != 0 ||
+		snprintf(path, sizeof(path), "%s/%s", posix_dir, name) < 0 ||
+		strlen(posix_dir) + 1 + strlen(name) >= sizeof(path) ||
+		(fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)) < 0 ||
+		fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+		(uint64_t) st.st_size < *length)
+		goto cleanup;
+	if ((uint64_t) st.st_size > *length &&
+		(ftruncate(fd, (off_t) *length) != 0 || fsync(fd) != 0))
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (fd >= 0 && close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
+posix_walidx_append(uint32_t tl, uint32_t shard, uint64_t epoch,
+					const void *buf, uint32_t len)
+{
+	char		name[128];
+	char		path[4096];
 	PosixWalIdxLock *lock;
+	uint64_t	old_length = 0;
 	int			rc;
 
-	snprintf(name, sizeof(name), "walidx_%u_%u", tl, shard);
+	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0)
+		return -1;
 	lock = posix_walidx_lock_for(tl, shard);
 	if (!lock)
 		return -1;
 	pthread_mutex_lock(&lock->lock);
+	if (epoch != 0 &&
+		posix_walidx_epoch_reconcile_locked(name, &old_length) != 0)
+	{
+		pthread_mutex_unlock(&lock->lock);
+		return -1;
+	}
 	rc = posix_log_append_locked(name, buf, len);
+	if (rc == 0 && epoch != 0 &&
+		(UINT64_MAX - old_length < len ||
+		 posix_walidx_watermark_write(name, old_length + len, 0) != 0))
+	{
+		int fd;
+
+		snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
+		fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+		if (fd >= 0)
+		{
+			if (ftruncate(fd, (off_t) old_length) == 0)
+				(void) fsync(fd);
+			close(fd);
+		}
+		(void) posix_walidx_watermark_write(name, old_length, 0);
+		rc = -1;
+	}
 	pthread_mutex_unlock(&lock->lock);
 	return rc;
 }
@@ -558,28 +995,66 @@ posix_walidx_locks_clear(void)
 }
 
 static int
-posix_walidx_read(uint32_t tl, uint32_t shard, uint64_t off, void *buf,
-			  uint32_t len)
+posix_walidx_read(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t off,
+			  void *buf, uint32_t len)
 {
-	char		name[64];
+	char		name[128];
+	PosixWalIdxLock *lock;
+	uint64_t	length;
+	int			rc;
 
-	snprintf(name, sizeof(name), "walidx_%u_%u", tl, shard);
-	return posix_log_read(name, off, buf, len);
+	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0)
+		return -1;
+	if (epoch == 0)
+		return posix_log_read(name, off, buf, len);
+	lock = posix_walidx_lock_for(tl, shard);
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	if (posix_walidx_epoch_reconcile_locked(name, &length) != 0)
+		rc = -1;
+	else if (off >= length)
+		rc = 0;
+	else
+	{
+		uint64_t available = length - off;
+
+		if (available < len)
+			len = (uint32_t) available;
+		rc = posix_log_read(name, off, buf, len);
+	}
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
 }
 
 static int
-posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
+posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t len)
 {
 	char		path[4096];
+	char		name[128];
 	int			fd;
 	int			rc = 0;
 	PosixWalIdxLock *lock;
 
-	snprintf(path, sizeof(path), "%s/walidx_%u_%u", posix_dir, tl, shard);
+	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0 ||
+		snprintf(path, sizeof(path), "%s/%s", posix_dir, name) < 0 ||
+		strlen(posix_dir) + 1 + strlen(name) >= sizeof(path))
+		return -1;
 	lock = posix_walidx_lock_for(tl, shard);
 	if (!lock)
 		return -1;
 	pthread_mutex_lock(&lock->lock);
+	if (epoch != 0)
+	{
+		uint64_t acknowledged;
+
+		if (posix_walidx_epoch_reconcile_locked(name, &acknowledged) != 0 ||
+			len != acknowledged)
+		{
+			pthread_mutex_unlock(&lock->lock);
+			return -1;
+		}
+	}
 	fd = open(path, O_WRONLY);
 	if (fd < 0)
 		rc = (errno == ENOENT && len == 0) ? 0 : -1;
@@ -591,6 +1066,139 @@ posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t len)
 			rc = -1;
 	}
 	pthread_mutex_unlock(&lock->lock);
+	return rc;
+}
+
+static int
+posix_walidx_epoch_create(uint32_t tl, uint32_t shard, uint64_t epoch)
+{
+	char name[128];
+	char path[4096];
+	struct stat st;
+	PosixWalIdxLock *lock;
+	int dir_fd = -1;
+	int fd = -1;
+	int rc = -1;
+
+	if (epoch == 0 ||
+		posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0 ||
+		snprintf(path, sizeof(path), "%s/%s", posix_dir, name) < 0 ||
+		strlen(posix_dir) + 1 + strlen(name) >= sizeof(path))
+		return -1;
+	lock = posix_walidx_lock_for(tl, shard);
+	if (lock == NULL)
+		return -1;
+	pthread_mutex_lock(&lock->lock);
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+	if (fd < 0 && errno == EEXIST)
+		fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		st.st_size != 0 || fsync(fd) != 0)
+		goto cleanup;
+	if (posix_walidx_watermark_write(name, 0, 1) != 0)
+		goto cleanup;
+	dir_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dir_fd < 0 || fsync(dir_fd) != 0)
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (dir_fd >= 0 && close(dir_fd) != 0)
+		rc = -1;
+	if (fd >= 0 && close(fd) != 0)
+		rc = -1;
+	pthread_mutex_unlock(&lock->lock);
+	return rc;
+}
+
+static int
+posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
+					 uint32_t nshards)
+{
+	char prefix[128];
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int directory_fd = -1;
+	int scan_fd = -1;
+	int removed = 0;
+	int rc = -1;
+	int n;
+
+	if (keep_epochs == NULL || nshards == 0)
+		return -1;
+	/* The manifest cutover drains old-epoch appenders before selecting each
+	 * shard's keep epoch.  Older files are therefore immutable. */
+	n = snprintf(prefix, sizeof(prefix), "walidx_%u_", tl);
+	if (n < 0 || (size_t) n >= sizeof(prefix))
+		return -1;
+	directory_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (directory_fd < 0 ||
+		(scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0)) < 0 ||
+		(dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char canonical[128];
+		char marker[160];
+		char *shard_end = NULL;
+		unsigned long parsed_shard;
+		uint64_t epoch = 0;
+		const char *suffix;
+		const char *digits = NULL;
+		char *end = NULL;
+		int is_marker = 0;
+
+		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+			continue;
+		errno = 0;
+		parsed_shard = strtoul(entry->d_name + n, &shard_end, 10);
+		if (errno != 0 || shard_end == entry->d_name + n ||
+			parsed_shard >= nshards)
+			goto next_entry;
+		suffix = shard_end;
+		if (strncmp(suffix, "_e", 2) == 0)
+		{
+			digits = suffix + 2;
+			if (strlen(digits) != 20 &&
+				!(strlen(digits) == 25 && strcmp(digits + 20, ".size") == 0))
+				goto next_entry;
+			for (size_t i = 0; i < 20; i++)
+				if (digits[i] < '0' || digits[i] > '9')
+					goto next_entry;
+			errno = 0;
+			epoch = strtoull(digits, &end, 10);
+			if (errno != 0 || end != digits + 20 || epoch == 0)
+				goto next_entry;
+			is_marker = strcmp(end, ".size") == 0;
+		}
+		else if (*suffix != '\0')
+			goto next_entry;
+		if (posix_walidx_name(tl, (uint32_t) parsed_shard, epoch,
+							 canonical, sizeof(canonical)) != 0 ||
+			posix_walidx_watermark_name(canonical, marker, sizeof(marker)) != 0 ||
+			strcmp(entry->d_name, is_marker ? marker : canonical) != 0)
+			goto next_entry;
+		if (epoch >= keep_epochs[parsed_shard])
+			goto next_entry;
+		if (unlinkat(directory_fd, entry->d_name, 0) != 0)
+			goto cleanup;
+		removed = 1;
+next_entry:
+		errno = 0;
+	}
+	if (errno != 0 || (removed && fsync(directory_fd) != 0))
+		goto cleanup;
+	rc = removed;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	if (directory_fd >= 0)
+		close(directory_fd);
 	return rc;
 }
 
@@ -909,9 +1517,12 @@ const PsStorage PsStoragePosix = {
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
 	.wal_truncate = posix_wal_truncate,
+	.wal_rewrite_prefix = posix_wal_rewrite_prefix,
 	.walidx_append = posix_walidx_append,
 	.walidx_read = posix_walidx_read,
 	.walidx_truncate = posix_walidx_truncate,
+	.walidx_epoch_create = posix_walidx_epoch_create,
+	.walidx_epoch_gc = posix_walidx_epoch_gc,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
 	.meta_truncate = posix_meta_truncate,

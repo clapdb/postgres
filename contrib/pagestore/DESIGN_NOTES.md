@@ -24,10 +24,12 @@ Some hot metadata remains in plain in-memory chained hash tables:
 - per-page WAL index: `(timeline, key, block) -> ascending list of record LSNs`
 
 Page data is still appended to flat segment files before layer flush, and shipped
-WAL goes to flat per-timeline logs (`wal_<tl>`).  Image compaction currently
-merges all layers for a timeline/shard and keeps every version.  Retention-driven
-version pruning, shipped-WAL GC, and WAL-index compaction are not implemented, so
-long-running logical history still grows without bound.
+WAL still has a flat per-timeline migration/tail authority (`wal_<tl>`).  Image
+compaction prunes relation-page history behind durable resource frontiers, and
+WAL-index snapshot compaction retains only proven FPI-led reconstruction chains
+at the moving operational cutoff and discrete reader/branch fences.  Fork
+metadata compaction and shipped-WAL reclamation are not implemented yet, so
+long-running logical history is not fully bounded.
 
 **Target.**  An LSM-like layered store, along the lines of Neon's pageserver:
 
@@ -112,9 +114,13 @@ disciplined about scans.  Items 1, 2 and 3 are co-designed.
 
 - Relation and fork indexes are rebuilt on restart.  The per-page WAL index is
   durably appended in per-(timeline, shard) logs; maintenance publishes an
-  immutable multi-shard snapshot and restart replays only its log tail.
-  Replacement-base selection and safe retirement of old logs/generations are
-  still future maintenance work.
+  immutable multi-shard snapshot that atomically selects fresh log epochs, and
+  restart replays only the selected epoch tail.  Superseded snapshot and log
+  epochs are removed asynchronously.  Newly decoded entries durably distinguish
+  known FPI bases from known deltas and carry the record-end LSN used for as-of
+  visibility; legacy entries remain explicitly unknown and cannot authorize
+  pruning.  Replacement-base selection and pruning old entries from the
+  snapshot are still future maintenance work.
 - The IPC channel uses busy-polling (no eventfd) and one copy via the channel
   buffer (no zero-copy into shared_buffers); see the performance discussion.
 - WAL is parsed by reusing PostgreSQL's reader, never reimplemented in the daemon

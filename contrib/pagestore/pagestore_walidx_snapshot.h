@@ -37,6 +37,36 @@ typedef struct PsWalIdxSnapshot
 	PsWalIdxSnapshotShard shards[PS_WALIDX_SNAPSHOT_MAX_SHARDS];
 } PsWalIdxSnapshot;
 
+typedef struct PsWalIdxSnapshotPrepared
+{
+	char		directory[4096];
+	uint32_t	timeline;
+	uint32_t	nshards;
+	uint64_t	generation;
+	uint64_t	start_lsn;
+	uint64_t	end_lsn;
+	PsWalIdxSnapshotShard shards[PS_WALIDX_SNAPSHOT_MAX_SHARDS];
+} PsWalIdxSnapshotPrepared;
+
+/* Write and fsync every immutable shard without changing the selected
+ * generation.  The caller may durably publish a reclamation frontier after
+ * this succeeds and before commit atomically replaces the manifest. */
+extern int ps_walidx_snapshot_prepare(PsWalIdxSnapshotPrepared *prepared,
+									  const char *directory, uint32_t timeline,
+									  uint64_t generation, uint64_t start_lsn,
+									  uint64_t end_lsn,
+									  const PsWalIdxSnapshotInput *shards,
+									  uint32_t nshards);
+extern int ps_walidx_snapshot_commit(const PsWalIdxSnapshotPrepared *prepared);
+/* Remove a prepared generation that has not been selected by the manifest. */
+extern int ps_walidx_snapshot_abort(const PsWalIdxSnapshotPrepared *prepared);
+/* Reconcile a durable prepare intent before the owning timeline accepts writes.
+ * A frontier covering the prepared end retains it for publication retry; an
+ * older frontier aborts it.  Returns zero when no intent needs cleanup. */
+extern int ps_walidx_snapshot_recover_prepared(const char *directory,
+										uint32_t timeline,
+										uint64_t durable_frontier);
+
 /* Publish a complete immutable shard generation, then atomically select it.
  * The owning timeline must serialize publishers with its append cutover.  Old
  * generation files deliberately remain available until reader drain and GC. */
@@ -47,8 +77,16 @@ extern int ps_walidx_snapshot_publish(const char *directory, uint32_t timeline,
 									  uint32_t nshards);
 /* Allocate above both the selected generation and immutable publication debris. */
 extern int ps_walidx_snapshot_next_generation(const char *directory,
-										   uint64_t selected_generation,
-										   uint64_t *generation_out);
+									  uint64_t selected_generation,
+									  uint64_t *generation_out);
+/* Return the durable prepare generation, or zero when no intent exists. */
+extern int ps_walidx_snapshot_prepared_generation(const char *directory,
+										 uint32_t timeline,
+										 uint64_t *generation_out);
+/* Read and validate the durable prepare intent, returning 0 when absent. */
+extern int ps_walidx_snapshot_read_prepared(const char *directory,
+										 uint32_t timeline,
+										 PsWalIdxSnapshotPrepared *prepared);
 /* Remove one failed, unselected publication; return 1 if it was selected. */
 extern int ps_walidx_snapshot_discard_generation(const char *directory,
 											 uint32_t timeline,
