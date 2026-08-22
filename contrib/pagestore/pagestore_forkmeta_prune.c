@@ -40,25 +40,24 @@ retain_horizon(const PsForkMetaEvent *events, uint32_t nitems,
 		{
 			latest_def = i;
 			have_def = 1;
+			keep[i] = 1;
 		}
-		else if (!have_grow ||
-				 events[i].nblocks > events[largest_grow].nblocks ||
-				 (events[i].nblocks == events[largest_grow].nblocks &&
-				  i > largest_grow))
+	}
+
+	for (uint32_t i = have_def ? latest_def + 1 : 0; i < nitems; i++)
+	{
+		if (event_visible(&events[i], horizon) &&
+			events[i].kind == PS_FORKMETA_GROW &&
+			(!have_grow ||
+			 events[i].nblocks > events[largest_grow].nblocks ||
+			 (events[i].nblocks == events[largest_grow].nblocks &&
+			  i > largest_grow)))
 		{
 			largest_grow = i;
 			have_grow = 1;
 		}
 	}
-
-	if (have_def)
-	{
-		keep[latest_def] = 1;
-		for (uint32_t i = latest_def + 1; i < nitems; i++)
-			if (event_visible(&events[i], horizon))
-				keep[i] = 1;
-	}
-	else if (have_grow)
+	if (have_grow)
 		keep[largest_grow] = 1;
 }
 

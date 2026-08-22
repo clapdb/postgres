@@ -86,6 +86,18 @@ same_value(RefValue a, RefValue b)
 	return a.state == b.state && a.nblocks == b.nblocks;
 }
 
+static int
+preserves_visible_definitives(const PsForkMetaEvent *events, uint32_t nitems,
+					  const unsigned char *keep, PsForkMetaFence fence)
+{
+	for (uint32_t i = 0; i < nitems; i++)
+		if (oracle_visible(&events[i], fence) &&
+			(events[i].kind == PS_FORKMETA_SET ||
+			 events[i].kind == PS_FORKMETA_DEAD) && !keep[i])
+			return 0;
+	return 1;
+}
+
 static void
 check_model(const PsForkMetaEvent *events, uint32_t nitems,
 			PsForkMetaFence cutoff, const PsForkMetaFence *fences,
@@ -95,9 +107,13 @@ check_model(const PsForkMetaEvent *events, uint32_t nitems,
 	memset(all, 1, sizeof(all));
 	check(same_value(fold(events, nitems, all, cutoff),
 					 fold(events, nitems, keep, cutoff)), name);
+	check(preserves_visible_definitives(events, nitems, keep, cutoff), name);
 	for (uint32_t f = 0; f < nfences; f++)
+	{
 		check(same_value(fold(events, nitems, all, fences[f]),
 					 fold(events, nitems, keep, fences[f])), name);
+		check(preserves_visible_definitives(events, nitems, keep, fences[f]), name);
+	}
 }
 
 static uint32_t
@@ -194,6 +210,19 @@ main(void)
 		{30, 3, 8, PS_FORKMETA_GROW},
 		{40, 4, 6, PS_FORKMETA_GROW}
 	};
+	PsForkMetaEvent set_grow_set[] = {
+		{10, 1, 5, PS_FORKMETA_SET},
+		{20, 2, 20, PS_FORKMETA_GROW},
+		{30, 3, 15, PS_FORKMETA_SET}
+	};
+	PsForkMetaEvent based_growth[] = {
+		{10, 1, 0, PS_FORKMETA_SET},
+		{20, 2, 3, PS_FORKMETA_GROW},
+		{30, 3, 20, PS_FORKMETA_GROW},
+		{40, 4, 7, PS_FORKMETA_GROW},
+		{50, 5, 20, PS_FORKMETA_GROW},
+		{60, 6, 1, PS_FORKMETA_GROW}
+	};
 	PsForkMetaEvent bad_lsn[] = {{20, 1, 1, PS_FORKMETA_GROW},
 		{10, 2, 2, PS_FORKMETA_GROW}};
 	PsForkMetaEvent bad_seq[] = {{20, 3, 1, PS_FORKMETA_GROW},
@@ -232,16 +261,16 @@ main(void)
 							 NULL, 0, mask) == -1,
 				 "zero cutoff sequence rejected for nonempty input");
 	check(ps_forkmeta_prune_plan(lifecycle, 5, (PsForkMetaFence) {30, 4},
-							 NULL, 0, mask) == 4 && !mask[0] && mask[1] &&
-				 mask[2] && mask[3] && mask[4], "operational base and future tail");
+							 NULL, 0, mask) == 3 && !mask[0] && mask[1] &&
+							 !mask[2] && mask[3] && mask[4], "operational base and future tail");
 	check(ps_forkmeta_prune_plan(sparse, 5, (PsForkMetaFence) {50, 4},
 							 (PsForkMetaFence[]) {{15, 0}, {35, 3}, {15, 0}}, 3,
 							 mask) == 5 && mask[0] && mask[1] && mask[2] && mask[3] &&
 				 mask[4], "sparse duplicate fences are a union");
 	check(ps_forkmeta_prune_plan(generations, 7, (PsForkMetaFence) {60, 6},
-							 (PsForkMetaFence[]) {{25, 2}, {45, 4}}, 2, mask) == 5 &&
-				 mask[0] && mask[1] && !mask[2] && mask[3] && !mask[4] && mask[5] &&
-				 mask[6], "multiple lifecycle generations");
+							 (PsForkMetaFence[]) {{25, 2}, {45, 4}}, 2, mask) == 6 &&
+					 mask[0] && mask[1] && mask[2] && mask[3] && !mask[4] && mask[5] &&
+					 mask[6], "multiple lifecycle generations");
 	check(ps_forkmeta_prune_plan(same_lsn, 4, (PsForkMetaFence) {20, 2},
 							 NULL, 0, mask) == 3 && !mask[0] && mask[1] && mask[2] &&
 				 mask[3], "same-LSN sequence cutoff");
@@ -253,7 +282,24 @@ main(void)
 				 !mask[3], "growth-only maximum uses latest tie");
 	check(ps_forkmeta_prune_plan(growth, 4, (PsForkMetaFence) {40, 4},
 							 (PsForkMetaFence[]) {{5, 0}}, 1, mask) == 1 && mask[2],
-				 "fence with no visible event needs no base");
+					 "fence with no visible event needs no base");
+	check(ps_forkmeta_prune_plan(set_grow_set, 3,
+							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 2 &&
+					 mask[0] && !mask[1] && mask[2],
+					 "all visible definitive boundaries are retained");
+	check(ps_forkmeta_prune_plan(set_grow_set, 3,
+							 (PsForkMetaFence) {30, 3},
+							 (PsForkMetaFence[]) {{20, 2}}, 1, mask) == 3 &&
+					 mask[0] && mask[1] && mask[2] &&
+					 same_value(fold(set_grow_set, 3, NULL,
+									 (PsForkMetaFence) {20, 2}),
+							 fold(set_grow_set, 3, mask,
+									 (PsForkMetaFence) {20, 2})),
+					 "SET-GROW-SET preserves the page fence history");
+	check(ps_forkmeta_prune_plan(based_growth, 6,
+							 (PsForkMetaFence) {60, 6}, NULL, 0, mask) == 2 &&
+					 mask[0] && !mask[1] && !mask[2] && !mask[3] && mask[4] &&
+					 !mask[5], "base growth history keeps only the maximum");
 	check(ps_forkmeta_prune_plan(legacy_order, 3, (PsForkMetaFence) {20, 5},
 							 NULL, 0, mask) == 1 && !mask[0] && !mask[1] && mask[2],
 				 "legacy order is preserved without false sorting rejection");
@@ -261,8 +307,8 @@ main(void)
 							 (PsForkMetaFence) {20, 2}, NULL, 0, mask) == -1,
 				 "legacy entry cannot hide decreasing same-LSN sequence");
 	check(ps_forkmeta_prune_plan(dead_then_grow, 3,
-							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 2 &&
-				 !mask[0] && mask[1] && mask[2] &&
+							 (PsForkMetaFence) {30, 3}, NULL, 0, mask) == 3 &&
+					 mask[0] && mask[1] && mask[2] &&
 				 fold(dead_then_grow, 3, NULL,
 					  (PsForkMetaFence) {30, 3}).state == REF_DEF &&
 				 fold(dead_then_grow, 3, NULL,
@@ -274,8 +320,8 @@ main(void)
 				 "DEAD followed by GROW becomes definitive and raises size");
 	check(ps_forkmeta_prune_plan(wildcard_fence, 4,
 							 (PsForkMetaFence) {30, 4},
-							 (PsForkMetaFence[]) {{20, 0}}, 1, mask) == 3 &&
-				 !mask[0] && mask[1] && mask[2] && mask[3],
+							 (PsForkMetaFence[]) {{20, 0}}, 1, mask) == 4 &&
+					 mask[0] && mask[1] && mask[2] && mask[3],
 				 "lower discrete sequence-zero fence has wildcard visibility");
 	check(ps_forkmeta_prune_plan(bad_lsn, 2, (PsForkMetaFence) {30, 1},
 							 NULL, 0, mask) == -1, "decreasing LSN rejected");

@@ -38,14 +38,16 @@ typedef struct PsForkMetaFence
  * and lie within the cutoff's visibility domain.  Fences are deliberately
  * accepted in arbitrary order and duplicates are harmless.
  *
- * The planner marks every event not visible at the operational cutoff, then
- * adds the smallest original-event base for the cutoff and each supplied
- * fence: the latest visible SET/DEAD plus all visible events after it, or the
- * largest visible GROW (latest source event on a tie) when no definitive
- * event exists.  keep receives one byte per input event.  The planner uses no
- * storage proportional to the input.  nitems above INT_MAX are rejected
- * because the return type is int.  The planner returns the number kept, or -1
- * when the input cannot be proven valid and safe.
+ * The planner marks every event not visible at the operational cutoff as the
+ * future tail.  For the cutoff and each supplied fence it retains every
+ * visible SET/DEAD boundary, plus the maximum visible GROW strictly after the
+ * latest visible definitive event (latest source event wins a tie).  If no
+ * definitive event is visible, the maximum visible GROW in the whole prefix
+ * is retained instead.  The keep mask is the union across all horizons.
+ * keep receives one byte per input event.  The planner uses no storage
+ * proportional to the input.  nitems above INT_MAX are rejected because the
+ * return type is int.  The planner returns the number kept, or -1 when the
+ * input cannot be proven valid and safe.
  */
 extern int ps_forkmeta_prune_plan(const PsForkMetaEvent *events,
 						  uint32_t nitems,
