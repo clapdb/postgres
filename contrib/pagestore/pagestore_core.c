@@ -4501,28 +4501,6 @@ _Static_assert(sizeof(WalIdxRec) == 64,
 _Static_assert(offsetof(WalIdxRec, flags) == 12,
 			   "WAL-index flags must reuse the legacy reserved field");
 
-static int
-walidx_rec_compare(const void *left, const void *right)
-{
-	const WalIdxRec *a = left;
-	const WalIdxRec *b = right;
-
-#define CMP_FIELD(field) \
-	do { if (a->field < b->field) return -1; if (a->field > b->field) return 1; } while (0)
-	CMP_FIELD(key.spcOid);
-	CMP_FIELD(key.dbOid);
-	CMP_FIELD(key.relNumber);
-	CMP_FIELD(key.forkNum);
-	CMP_FIELD(key.klass);
-	CMP_FIELD(block);
-	CMP_FIELD(lsn);
-	CMP_FIELD(end_lsn);
-	CMP_FIELD(flags);
-	CMP_FIELD(timeline);
-#undef CMP_FIELD
-	return 0;
-}
-
 typedef struct WalIdxProgressRec
 {
 	uint32_t	magic;
@@ -4786,6 +4764,24 @@ typedef struct WalIdxItem
 	uint32_t	flags;
 } WalIdxItem;
 
+/* Keep each hash chain canonical so a fixed-size heap can merge the chains
+ * into the same key/block/LSN order as the former whole-shard qsort. */
+static int
+walidx_entry_compare(const WalIdxEnt *a, const WalIdxEnt *b)
+{
+#define CMP_FIELD(field) \
+	do { if (a->field < b->field) return -1; if (a->field > b->field) return 1; } while (0)
+	CMP_FIELD(key.spcOid);
+	CMP_FIELD(key.dbOid);
+	CMP_FIELD(key.relNumber);
+	CMP_FIELD(key.forkNum);
+	CMP_FIELD(key.klass);
+	CMP_FIELD(block);
+	CMP_FIELD(timeline);
+#undef CMP_FIELD
+	return 0;
+}
+
 static WalIdxEnt *
 walidx_find(uint32_t tl, const PsKey *key, uint32_t block)
 {
@@ -4840,14 +4836,18 @@ walidx_add_memory(uint32_t tl, const PsKey *key, uint32_t block, uint64_t lsn,
 	e = walidx_find(tl, key, block);
 	if (!e)
 	{
+		WalIdxEnt **link = &s->walidx[h & IDX_MASK];
+
 		e = calloc(1, sizeof(*e));
 		if (e == NULL)
 			return -1;
 		e->timeline = tl;
 		e->key = *key;
 		e->block = block;
-		e->next = s->walidx[h & IDX_MASK];
-		s->walidx[h & IDX_MASK] = e;
+		while (*link != NULL && walidx_entry_compare(*link, e) < 0)
+			link = &(*link)->next;
+		e->next = *link;
+		*link = e;
 	}
 	if (e->n == e->cap)
 	{
@@ -5095,94 +5095,135 @@ walidx_snapshot_produce(void *arg, PsWalIdxSnapshotConsume consume,
 	WalIdxSnapshotProduceCtx *ctx = arg;
 	Shard *s = &g_shards[ctx->shard];
 	unsigned char header[WALIDX_SNAPSHOT_PAYLOAD_BYTES];
-	WalIdxRec *records;
+	WalIdxRec records[1024];
+	WalIdxEnt **heap;
+	uint32_t heap_size = 0;
+	uint64_t emitted = 0;
 	size_t used = 0;
-	size_t total;
 
 	walidx_snapshot_encode_header(header, ctx->tl, ctx->shard, ctx->nrecords,
 							  ctx->generation, ctx->start_lsn, ctx->end_lsn,
 							  ctx->source_offset, ctx->log_epoch);
 	if (consume(consume_arg, header, sizeof(header)) != 0)
 		return -1;
-	if (ctx->nrecords > SIZE_MAX / sizeof(*records))
-		return -1;
-	total = (size_t) ctx->nrecords;
-	records = total == 0 ? NULL : malloc(total * sizeof(*records));
-	if (total != 0 && records == NULL)
+	/* One cursor per fixed hash bucket bounds serialization memory regardless
+	 * of the number of live WAL-index records. */
+	heap = malloc(IDX_BUCKETS * sizeof(*heap));
+	if (heap == NULL)
 		return -1;
 	for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
-		for (WalIdxEnt *e = s->walidx[bucket]; e; e = e->next)
-			if (e->timeline == ctx->tl)
+	{
+		WalIdxEnt *e = s->walidx[bucket];
+		uint32_t pos;
+
+		while (e != NULL && e->timeline != ctx->tl)
+			e = e->next;
+		if (e == NULL)
+			continue;
+		pos = heap_size++;
+		while (pos != 0)
+		{
+			uint32_t parent = (pos - 1) / 2;
+
+			if (walidx_entry_compare(heap[parent], e) <= 0)
+				break;
+			heap[pos] = heap[parent];
+			pos = parent;
+		}
+		heap[pos] = e;
+	}
+	while (heap_size != 0)
+	{
+		WalIdxEnt *e = heap[0];
+		WalIdxEnt *next = e->next;
+		unsigned char *keep = NULL;
+
+		while (next != NULL && next->timeline != ctx->tl)
+			next = next->next;
+		if (next == NULL)
+			heap[0] = heap[--heap_size];
+		else
+			heap[0] = next;
+		if (heap_size != 0)
+		{
+			uint32_t pos = 0;
+
+			for (;;)
 			{
-				unsigned char *keep = NULL;
+				uint32_t left = pos * 2 + 1;
+				uint32_t right = left + 1;
+				uint32_t child;
+				WalIdxEnt *value;
 
-				if (ctx->compact && e->n != 0)
+				if (left >= heap_size)
+					break;
+				child = right < heap_size &&
+					walidx_entry_compare(heap[right], heap[left]) < 0 ?
+					right : left;
+				if (walidx_entry_compare(heap[pos], heap[child]) <= 0)
+					break;
+				value = heap[pos];
+				heap[pos] = heap[child];
+				heap[child] = value;
+				pos = child;
+			}
+		}
+		if (ctx->compact && e->n != 0)
+		{
+			int kept;
+
+			keep = malloc((size_t) e->n);
+			if (keep == NULL)
+				goto fail;
+			kept = walidx_entry_prune_plan(e, ctx->end_lsn,
+										  ctx->horizons, ctx->nhorizons, keep);
+			if (kept < 0)
+			{
+				free(keep);
+				goto fail;
+			}
+		}
+		for (int i = 0; i < e->n; i++)
+			if (!ctx->compact || keep[i])
+			{
+				WalIdxRec *rec = &records[used++];
+
+				memset(rec, 0, sizeof(*rec));
+				rec->magic = WALIDX_MAGIC;
+				rec->rec_len = sizeof(*rec);
+				rec->timeline = ctx->tl;
+				rec->block = e->block;
+				rec->lsn = e->items[i].lsn;
+				rec->end_lsn = e->items[i].end_lsn;
+				rec->flags = e->items[i].flags;
+				rec->key = e->key;
+				rec->crc = walidx_rec_crc(rec);
+				emitted++;
+				if (used == sizeof(records) / sizeof(records[0]))
 				{
-					int kept;
-
-					keep = malloc((size_t) e->n);
-					if (keep == NULL)
-					{
-						free(records);
-						return -1;
-					}
-					kept = walidx_entry_prune_plan(e, ctx->end_lsn,
-													  ctx->horizons, ctx->nhorizons,
-													  keep);
-					if (kept < 0)
+					if (consume(consume_arg, records, sizeof(records)) != 0)
 					{
 						free(keep);
-						free(records);
-						return -1;
+						goto fail;
 					}
+					used = 0;
 				}
-				for (int i = 0; i < e->n; i++)
-					if (!ctx->compact || keep[i])
-				{
-					WalIdxRec *rec;
-
-					if (used == total)
-					{
-						free(records);
-						return -1;
-					}
-					rec = &records[used++];
-
-					memset(rec, 0, sizeof(*rec));
-					rec->magic = WALIDX_MAGIC;
-					rec->rec_len = sizeof(*rec);
-					rec->timeline = ctx->tl;
-					rec->block = e->block;
-					rec->lsn = e->items[i].lsn;
-					rec->end_lsn = e->items[i].end_lsn;
-					rec->flags = e->items[i].flags;
-					rec->key = e->key;
-					rec->crc = walidx_rec_crc(rec);
-				}
-				free(keep);
 			}
-	if (used != total)
+		free(keep);
+	}
+	if (emitted != ctx->nrecords ||
+		(used != 0 && consume(consume_arg, records,
+								 used * sizeof(records[0])) != 0))
 	{
-		free(records);
+		free(heap);
 		return -1;
 	}
-	qsort(records, total, sizeof(*records), walidx_rec_compare);
-	for (size_t offset = 0; offset < total; )
-	{
-		size_t count = total - offset;
-
-		if (count > 1024)
-			count = 1024;
-		if (consume(consume_arg, records + offset,
-						count * sizeof(*records)) != 0)
-		{
-			free(records);
-			return -1;
-		}
-		offset += count;
-	}
-	free(records);
+	free(heap);
 	return 0;
+
+fail:
+	free(heap);
+	return -1;
 }
 
 static int
