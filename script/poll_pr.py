@@ -16,14 +16,26 @@ import time
 from typing import Any
 
 
+class PollError(RuntimeError):
+    """A poll failed after bounded retries and may be transient."""
+
+
 def gh_json(args: list[str]) -> Any:
-    result = subprocess.run(
-        ["gh", *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(result.stdout)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["gh", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return json.loads(result.stdout)
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2**attempt)
+    raise PollError(str(last_error)) from last_error
 
 
 def repo_name() -> str:
@@ -84,7 +96,26 @@ def gh_collection(args: list[str]) -> list[Any]:
     return pages
 
 
-def snapshot(repo: str, pr: str, cycle: int) -> dict[str, Any]:
+VIEW_FIELDS = ",".join(
+    [
+        "url",
+        "state",
+        "isDraft",
+        "headRepositoryOwner",
+        "headRefName",
+        "headRefOid",
+        "baseRefName",
+        "baseRefOid",
+        "mergeable",
+        "mergeStateStatus",
+        "reviewDecision",
+        "autoMergeRequest",
+        "statusCheckRollup",
+    ]
+)
+
+
+def pull_view(repo: str, pr: str) -> dict[str, Any]:
     view = gh_json(
         [
             "pr",
@@ -93,29 +124,34 @@ def snapshot(repo: str, pr: str, cycle: int) -> dict[str, Any]:
             "--repo",
             repo,
             "--json",
-            ",".join(
-                [
-                    "url",
-                    "state",
-                    "isDraft",
-                    "headRepositoryOwner",
-                    "headRefName",
-                    "headRefOid",
-                    "baseRefName",
-                    "baseRefOid",
-                    "mergeable",
-                    "mergeStateStatus",
-                    "reviewDecision",
-                    "autoMergeRequest",
-                    "statusCheckRollup",
-                ]
-            ),
+            VIEW_FIELDS,
         ]
     )
-    reviews = gh_collection(["api", f"repos/{repo}/pulls/{pr}/reviews"])
-    inline = gh_collection(["api", f"repos/{repo}/pulls/{pr}/comments"])
-    comments = gh_collection(["api", f"repos/{repo}/issues/{pr}/comments"])
-    threads = review_threads(repo, pr)
+    return view
+
+
+def identity(view: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(view.get(name) for name in (
+        "state", "isDraft", "headRefOid", "baseRefOid", "baseRefName",
+        "headRefName", "headRepositoryOwner",
+    ))
+
+
+def snapshot(repo: str, pr: str, cycle: int) -> dict[str, Any]:
+    for attempt in range(3):
+        view = pull_view(repo, pr)
+        before = identity(view)
+        reviews = gh_collection(["api", f"repos/{repo}/pulls/{pr}/reviews"])
+        inline = gh_collection(["api", f"repos/{repo}/pulls/{pr}/comments"])
+        comments = gh_collection(["api", f"repos/{repo}/issues/{pr}/comments"])
+        threads = review_threads(repo, pr)
+        after_view = pull_view(repo, pr)
+        if before == identity(after_view):
+            view = after_view
+            break
+        if attempt == 2:
+            raise PollError("PR identity changed during snapshot collection")
+        time.sleep(1)
     return {
         "cycle": cycle,
         "observed_at": int(time.time()),
@@ -145,8 +181,11 @@ def main() -> int:
     for cycle in range(1, cycles + 1):
         try:
             print(json.dumps(snapshot(repo, str(args.pr), cycle), sort_keys=True), flush=True)
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
+        except (PollError, KeyError) as exc:
             print(json.dumps({"cycle": cycle, "error": str(exc)}), flush=True)
+            if cycle != cycles:
+                time.sleep(args.interval)
+                continue
             return 1
         if cycle != cycles:
             time.sleep(args.interval)

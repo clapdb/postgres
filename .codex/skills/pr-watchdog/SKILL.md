@@ -94,7 +94,10 @@ repository, use `script/poll_pr.py <pr> --repo <owner/repo> --interval 60
 --cycles 5` for the fallback poller; always pass the repository recorded during
 establishment. The Python program is read-only: it owns `poll_pr`, gathers one
 coherent JSON snapshot per cycle, including GraphQL review-thread IDs and
-`isResolved` state, and must not decide readiness or mutate the PR. Sol owns
+`isResolved` state. It re-reads the PR identity after collecting auxiliary data
+and retries if the head, base, or lifecycle identity changed; bounded transient
+API failures are reported for the cycle and do not terminate the remaining
+polling cycles. It must not decide readiness or mutate the PR. Sol owns
 `check`/interpretation of each snapshot, including stable review IDs, thread
 resolution, `(base, head)` identity, CI fingerprints, conflicts, and terminal
 state.
