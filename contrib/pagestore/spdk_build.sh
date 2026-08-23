@@ -42,8 +42,11 @@ cc -O2 -Wall -Wextra -DPAGESTORE_SPDK -I"$here" $cflags \
 	"$here/pagestore_layer.c" "$here/pagestore_layer_store.c" \
 	"$here/pagestore_manifest.c" "$here/pagestore_memtable.c" "$here/pagestore_pgcache.c" \
 	"$here/pagestore_prune.c" "$here/pagestore_retention.c" \
+	"$here/pagestore_wal_store.c" "$here/pagestore_wal_segment.c" \
 	"$here/pagestore_walidx_snapshot.c" \
 	"$here/pagestore_walidx_prune.c" \
+	"$here/pagestore_forkmeta_prune.c" \
+	"$here/pagestore_forkmeta_snapshot.c" \
 	-pthread $rpath $spdk_libs -lrt
 set +x
 echo "built $out"

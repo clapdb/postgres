@@ -446,7 +446,7 @@ Expected scope: one or two PRs.
 
 ### R4b. Compact and reclaim fork metadata
 
-Status: **foundation slice landed; R4b implementation remains incomplete**.
+Status: **runtime implementation landed; crash-matrix PR remains incomplete**.
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -454,10 +454,19 @@ fail-closed input contract.  Meson and standalone CI run this planner directly.
 A durable POSIX checkpoint/captured-tail format foundation now also exists: a
 single selected generation is discovered through a checksummed manifest, with
 immutable checkpoint and tail files, staged prepare/commit, exact tuple fences,
-bounded reads, recovery, and conservative GC.  This is format and publication
-infrastructure only; append cutover, frontier publication, core replay
-integration, crash-recovery orchestration, maintenance integration, and
-physical reclamation remain incomplete.
+bounded reads, recovery, and conservative GC.  This runtime slice now wires
+that format into daemon/tiering builds and core maintenance: the controller
+holds the admission, all-shard, page-prune, WAL-index, and map fences, derives
+the cutoff from the lexicographic minimum durable page frontier, commits the
+manifest, atomically rewrites the forkmeta epoch with a matching snapshot-base
+marker, and leaves the live in-memory arrays conservative for SPDK readers;
+restart rebuilds compacted arrays from the selected snapshot.  The versioned
+snapshot payload records the exact cutoff and frozen admission highwater.
+Startup treats the selected snapshot as authoritative over an old epoch, while
+preserving a matching marker's complete post-cutover suffix.  Ambiguous
+manifest publication or source rewrite poisons the runtime until restart.  The
+complete concurrent/crash boundary matrix and full R4b acceptance gate remain
+incomplete and belong to the follow-up crash test PR.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
@@ -843,6 +852,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-12 | Established completion plan after PRs #174 and #175 landed | Existing pagestore CI green; remaining gates from `MVP_STATUS.md` |
 | 2026-08-14 | Completed R0/R1 owner lifecycle and R2 page pruning; added R3a immutable WAL segment/store primitives | Stacked PRs #177-#191, standalone/integration CI, bounded-churn and publication-crash tests |
 | 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |
+| 2026-08-23 | Landed the R4b runtime cutover foundation: durable frontier-gated normalized forkmeta snapshots, all-shard run-to-completion maintenance, source-log rewrite/epoch marker, startup reconcile, poison-on-ambiguous rewrite, and daemon/tiering wiring | Strict standalone, ASan/UBSan unit coverage, focused Meson, and existing pagestore suite; publication crash matrix remains a follow-up |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |

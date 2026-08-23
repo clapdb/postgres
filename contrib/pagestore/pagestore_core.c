@@ -55,6 +55,8 @@
 #include "pagestore_walidx_prune.h"
 #include "pagestore_walidx_snapshot.h"
 #include "pagestore_fault.h"
+#include "pagestore_forkmeta_prune.h"
+#include "pagestore_forkmeta_snapshot.h"
 
 /* configuration, set by the frontend before ps_core_open() */
 uint32_t	page_size = PS_DEFAULT_PAGE_SIZE;
@@ -110,6 +112,41 @@ static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 
 /* the active storage backend (POSIX by default; the frontend may override) */
 const PsStorage *ps_storage = &PsStoragePosix;
+
+/* Forkmeta state is declared early because the append helpers precede the
+ * detailed source-record definitions below. */
+static int fork_meta_poisoned;
+static uint64_t fork_meta_bytes;
+
+static inline int
+fork_meta_poisoned_load(void)
+{
+	return __atomic_load_n(&fork_meta_poisoned, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+fork_meta_poisoned_store(int value)
+{
+	__atomic_store_n(&fork_meta_poisoned, value, __ATOMIC_RELEASE);
+}
+
+static inline uint64_t
+fork_meta_bytes_load(void)
+{
+	return __atomic_load_n(&fork_meta_bytes, __ATOMIC_RELAXED);
+}
+
+static inline void
+fork_meta_bytes_store(uint64_t value)
+{
+	__atomic_store_n(&fork_meta_bytes, value, __ATOMIC_RELAXED);
+}
+
+static inline void
+fork_meta_bytes_add(uint64_t value)
+{
+	(void) __atomic_fetch_add(&fork_meta_bytes, value, __ATOMIC_RELAXED);
+}
 
 /* configured logical shards for this daemon (set by frontend main before open()) */
 uint32_t	ps_nshards = 1;
@@ -1548,6 +1585,7 @@ typedef struct ForkEvent
 	uint32_t	cached_nblocks;	/* hop result through this sorted event */
 	uint32_t	cached_fence_nblocks; /* smallest inherited block boundary */
 	uint8_t		kind;
+	uint8_t		marker_kind;	/* durable ordered marker kind, even after activation */
 	uint8_t		cached_state;
 } ForkEvent;
 
@@ -1561,6 +1599,7 @@ typedef struct ForkEvent
 #define FEV_SEG_GROW_BOUND 7	/* FEV_SEG_GROW paired with a segment identity */
 #define FEV_SEG_COMMIT_BOUND 8 /* FEV_SEG_COMMIT paired with a segment identity */
 #define FEV_SEG_ID 9			/* second record carrying a bound marker's identity */
+#define FEV_SNAPSHOT_BASE 10	/* source-log epoch marker after snapshot cutover */
 
 typedef struct ForkEnt
 {
@@ -1580,6 +1619,41 @@ typedef struct ForkEnt
 	uint64_t	last_page_seq;
 	int			has_wal_less;	/* at least one page version has lsn 0 */
 } ForkEnt;
+
+static void
+free_page_fork_indexes(void)
+{
+	for (uint32_t sh = 0; sh < MAX_SHARDS; sh++)
+	{
+		Shard *s = &g_shards[sh];
+
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			PageEnt *page = s->page_idx[bucket];
+			ForkEnt *fork = s->fork_idx[bucket];
+
+			while (page != NULL)
+			{
+				PageEnt *next = page->next;
+
+				free(page->vers);
+				free(page);
+				page = next;
+			}
+			while (fork != NULL)
+			{
+				ForkEnt *next = fork->next;
+
+				free(fork->ev);
+				free(fork->def_idx);
+				free(fork);
+				fork = next;
+			}
+			s->page_idx[bucket] = NULL;
+			s->fork_idx[bucket] = NULL;
+		}
+	}
+}
 
 /*
  * Timeline metadata.  Timeline 0 is the root (no parent).  A branch records its
@@ -2437,14 +2511,6 @@ fork_def_index_insert(ForkEnt *e, uint32_t event_idx, int definitive)
 	e->ndef++;
 }
 
-static void
-fork_def_index_remove_nondef(ForkEnt *e, uint32_t event_idx)
-{
-	for (uint32_t i = 0; i < e->ndef; i++)
-		if (e->def_idx[i] > event_idx)
-			e->def_idx[i]--;
-}
-
 /* Size of e as of cap, hop-local (for the GROW-dedup below). */
 static uint32_t
 fork_size_asof_hop(const ForkEnt *e, uint64_t cap, uint64_t seq_cap)
@@ -2615,6 +2681,7 @@ fork_event_add(ForkEnt *e, uint64_t lsn, uint64_t admission_seq,
 	e->ev[i].order_id = 0;
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
+	e->ev[i].marker_kind = 0;
 	e->nev++;
 	fork_def_index_insert(e, i, kind == FEV_SET || kind == FEV_DEAD);
 	if (fork_event_cache_defer)
@@ -2683,6 +2750,7 @@ fork_event_add_seg_marker(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	e->ev[i].order_id = order_id;
 	e->ev[i].nblocks = nblocks;
 	e->ev[i].kind = kind;
+	e->ev[i].marker_kind = kind;
 	e->nev++;
 	fork_def_index_insert(e, i, 0);
 	fork_event_cache_from(e, i);
@@ -2711,10 +2779,6 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 			}
 			else
 			{
-				memmove(v, v + 1, (e->nev - i - 1) * sizeof(*v));
-				e->nev--;
-				fork_def_index_remove_nondef(e, i);
-				fork_event_cache_from(e, i);
 			}
 			return 1;
 		}
@@ -2722,15 +2786,11 @@ fork_event_activate_seg(ForkEnt *e, uint64_t lsn, uint32_t nblocks,
 	return 0;
 }
 
-int
-fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
-		  uint64_t lsn)
+static int
+fork_grow_with_seq(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+				   uint64_t lsn, uint64_t admission_seq)
 {
 	ForkEnt    *e = fork_get_or_create(timeline, key);
-	uint64_t	admission_seq = admission_seq_alloc();
-
-	if (admission_seq == 0)
-		return -1;
 
 	/*
 	 * Zeroextend has no page record from which recovery can reconstruct its
@@ -2744,6 +2804,17 @@ fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		return -1;			/* not durable: do not apply in memory */
 	fork_event_add(e, lsn, admission_seq, to_nblocks, FEV_GROW);
 	return 0;
+}
+
+int
+fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
+		  uint64_t lsn)
+{
+	uint64_t admission_seq = admission_seq_alloc();
+
+	if (admission_seq == 0)
+		return -1;
+	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq);
 }
 
 /* Apply growth whose durability is already represented by metadata/segment. */
@@ -3237,6 +3308,58 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 	return 0;
 }
 
+/* Caller holds the key's shard lock and map_lock for reading.  Find the newest
+ * fork/page LSN reachable through the child's ancestry, respecting every
+ * branch cap.  Page versions require a per-entry lookup when a local fork's
+ * cached newest page lies above an ancestor cap. */
+static uint64_t
+fork_newest_visible_lsn_through(uint32_t timeline, const PsKey *key)
+{
+	uint64_t	newest = 0;
+	TlWalk		w = tl_walk_first(timeline, UINT64_MAX);
+
+	do
+	{
+		ForkEnt    *e = fork_find(w.tl, key);
+
+		if (e == NULL)
+			continue;
+		if (e->nev != 0)
+		{
+			uint32_t lo = 0;
+			uint32_t hi = e->nev;
+
+			while (lo < hi)
+			{
+				uint32_t mid = lo + (hi - lo) / 2;
+
+				if (e->ev[mid].lsn <= w.lsn)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo != 0 && e->ev[lo - 1].lsn > newest)
+				newest = e->ev[lo - 1].lsn;
+		}
+		if (e->last_page_lsn <= w.lsn)
+		{
+			if (e->last_page_lsn > newest)
+				newest = e->last_page_lsn;
+		}
+		else
+		{
+			for (PageEnt *page = e->pages; page; page = page->fork_next)
+			{
+				PageVer    *version = page_visible(page, w.lsn, 0);
+
+				if (version != NULL && version->lsn > newest)
+					newest = version->lsn;
+			}
+		}
+	} while (tl_walk_next(&w));
+	return newest;
+}
+
 /*
  * Timeline metadata is persisted as an append-only log of fixed records in
  * "<store>/timelines", so branches survive a daemon restart.  (The page data
@@ -3306,6 +3429,10 @@ typedef struct ForkMetaRecV1
 } ForkMetaRecV1;
 
 #define FORK_META_V2_MAGIC 0x324d4b46 /* "FKM2" */
+#define FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46 /* "FMS1" */
+#define FORK_META_SNAPSHOT_PAYLOAD_VERSION 1
+#define FORK_META_SNAPSHOT_CHECKPOINT 0
+#define FORK_META_SNAPSHOT_TAIL 1
 
 typedef struct ForkMetaRecV2
 {
@@ -3321,11 +3448,50 @@ typedef struct ForkMetaRecV2
 	uint8_t		pad[3];
 } ForkMetaRecV2;
 
+typedef struct ForkMetaSnapshotPayloadHeader
+{
+	uint32_t	magic;
+	uint16_t	version;
+	uint16_t	header_bytes;
+	uint32_t	part;
+	uint32_t	record_bytes;
+	uint64_t	generation;
+	uint64_t	cutoff_lsn;
+	uint64_t	cutoff_admission_seq;
+	uint64_t	freeze_admission_seq;
+	uint64_t	checkpoint_records;
+	uint64_t	tail_records;
+	uint64_t	checkpoint_bytes;
+	uint64_t	tail_bytes;
+} ForkMetaSnapshotPayloadHeader;
+
+static uint64_t fork_meta_snapshot_generation;
+static uint64_t fork_meta_snapshot_cutoff_lsn;
+static uint64_t fork_meta_snapshot_cutoff_seq;
+static uint64_t fork_meta_snapshot_freeze_seq;
+static int fork_meta_event_future(uint64_t lsn, uint64_t admission_seq,
+							  uint64_t cutoff_lsn, uint64_t cutoff_seq);
+
+static int
+fork_meta_mutation_future(uint64_t lsn, uint64_t admission_seq)
+{
+	return fork_meta_snapshot_generation == 0 ||
+		fork_meta_event_future(lsn, admission_seq,
+						   fork_meta_snapshot_cutoff_lsn,
+						   fork_meta_snapshot_cutoff_seq);
+}
+
 static int
 fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 				  uint64_t admission_seq, uint32_t nblocks, uint8_t kind)
 {
 	ForkMetaRecV2 rec;
+	int rc;
+
+	if (fork_meta_poisoned_load())
+		return -1;
+	if (kind <= FEV_DEAD && !fork_meta_mutation_future(lsn, admission_seq))
+		return -1;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = FORK_META_V2_MAGIC;
@@ -3336,7 +3502,10 @@ fork_meta_persist(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.admission_seq = admission_seq;
 	rec.nblocks = nblocks;
 	rec.kind = kind;
-	return ps_storage->fork_meta_append(&rec, sizeof(rec));
+	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
+	if (rc == 0)
+		fork_meta_bytes_add(sizeof(rec));
+	return rc;
 }
 
 /* Persist a bound segment marker and its 64-bit identity in one self-sized
@@ -3347,6 +3516,10 @@ fork_meta_persist_segment(uint32_t timeline, const PsKey *key, uint64_t lsn,
 							  uint64_t admission_seq)
 {
 	ForkMetaRecV2 rec;
+	int rc;
+
+	if (fork_meta_poisoned_load())
+		return -1;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = FORK_META_V2_MAGIC;
@@ -3359,7 +3532,15 @@ fork_meta_persist_segment(uint32_t timeline, const PsKey *key, uint64_t lsn,
 	rec.nblocks = nblocks;
 	rec.kind = kind == FEV_SEG_GROW ? FEV_SEG_GROW_BOUND :
 		FEV_SEG_COMMIT_BOUND;
-	return ps_storage->fork_meta_append(&rec, sizeof(rec));
+	rc = ps_storage->fork_meta_append(&rec, sizeof(rec));
+	if (rc == 0)
+		fork_meta_bytes_add(sizeof(rec));
+	else
+		/* The ordered segment body may already be complete.  Until restart,
+		 * poison all forkmeta mutation and snapshot maintenance so no later
+		 * freeze highwater can authorize that uncommitted body without marker. */
+		fork_meta_poisoned_store(1);
+	return rc;
 }
 
 /*
@@ -3374,6 +3555,453 @@ static int fork_meta_migrating = 0;	/* the log carries the migration-start marke
 static int fork_meta_migrated = 0;	/* the log carries the migration-done marker */
 static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migration */
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
+static uint64_t fork_meta_snapshot_bytes;
+static int fork_meta_snapshot_gc_pending;
+static struct timespec fork_meta_snapshot_retry_at;
+static char fork_meta_snapshot_dir[4096];
+
+typedef struct ForkMetaByteVec
+{
+	unsigned char *data;
+	size_t len;
+	size_t cap;
+} ForkMetaByteVec;
+
+static int fork_meta_snapshot_load(const char *directory);
+static int fork_meta_snapshot_reconcile_source(void);
+static int fork_meta_snapshot_maintenance(void);
+static int fork_meta_snapshot_due(void);
+
+static int
+fork_meta_vec_append(ForkMetaByteVec *vec, const void *data, size_t len)
+{
+	size_t needed;
+
+	if (len == 0)
+		return 0;
+	if (len > SIZE_MAX - vec->len)
+		return -1;
+	needed = vec->len + len;
+	if (needed > vec->cap)
+	{
+		size_t cap = vec->cap ? vec->cap : 4096;
+		unsigned char *grown;
+
+		while (cap < needed)
+		{
+			if (cap > SIZE_MAX / 2)
+				return -1;
+			cap *= 2;
+		}
+		grown = realloc(vec->data, cap);
+		if (grown == NULL)
+			return -1;
+		vec->data = grown;
+		vec->cap = cap;
+	}
+	memcpy(vec->data + vec->len, data, len);
+	vec->len = needed;
+	return 0;
+}
+
+static int
+fork_meta_vec_record(ForkMetaByteVec *vec, uint32_t timeline,
+					 const PsKey *key, uint64_t lsn, uint64_t admission_seq,
+					 uint64_t order_id, uint32_t nblocks, uint8_t kind)
+{
+	ForkMetaRecV2 rec;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = FORK_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.timeline = timeline;
+	rec.key = *key;
+	rec.lsn = lsn;
+	rec.admission_seq = admission_seq;
+	rec.order_id = order_id;
+	rec.nblocks = nblocks;
+	rec.kind = kind;
+	return fork_meta_vec_append(vec, &rec, sizeof(rec));
+}
+
+static int
+fork_meta_event_future(uint64_t lsn, uint64_t admission_seq,
+					   uint64_t cutoff_lsn, uint64_t cutoff_seq)
+{
+	return lsn > cutoff_lsn ||
+		(lsn == cutoff_lsn && admission_seq != 0 && admission_seq > cutoff_seq);
+}
+
+static int
+fork_meta_snapshot_manifest_exists(const char *directory)
+{
+	char path[4096];
+	int n;
+
+	n = snprintf(path, sizeof(path), "%s/forkmeta_manifest_v1", directory);
+	if (n < 0 || (size_t) n >= sizeof(path))
+		return -1;
+	if (access(path, F_OK) == 0)
+		return 1;
+	return errno == ENOENT ? 0 : -1;
+}
+
+static int
+fork_meta_ordered_marker_valid(const ForkMetaRecV2 *rec,
+							   int allow_zero_bound_seq)
+{
+	int bound = rec->kind == FEV_SEG_GROW_BOUND ||
+		rec->kind == FEV_SEG_COMMIT_BOUND;
+	int unbound = rec->kind == FEV_SEG_GROW || rec->kind == FEV_SEG_COMMIT;
+
+	return (bound || unbound) && rec->magic == FORK_META_V2_MAGIC &&
+		rec->rec_len == sizeof(*rec) && rec->timeline < MAX_TIMELINES &&
+		rec->key.klass <= PS_KLASS_READER_SNAPSHOT &&
+		rec->nblocks != 0 &&
+		((bound && rec->order_id != 0 &&
+		  (allow_zero_bound_seq || rec->admission_seq != 0)) ||
+		 (unbound && rec->order_id == 0 && rec->admission_seq == 0)) &&
+		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
+}
+
+static int
+fork_meta_bound_marker_valid(const ForkMetaRecV2 *rec, int allow_zero_seq)
+{
+	return (rec->kind == FEV_SEG_GROW_BOUND ||
+			rec->kind == FEV_SEG_COMMIT_BOUND) &&
+		fork_meta_ordered_marker_valid(rec, allow_zero_seq);
+}
+
+static int
+fork_meta_snapshot_record_valid(const ForkMetaRecV2 *records, uint64_t index,
+								unsigned int part, PsPruneFence cutoff)
+{
+	const ForkMetaRecV2 *rec = &records[index];
+	int ordered_marker = rec->kind >= FEV_SEG_GROW &&
+		rec->kind <= FEV_SEG_COMMIT_BOUND;
+	int future;
+
+	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+		rec->timeline >= MAX_TIMELINES ||
+		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
+		(!ordered_marker && (rec->kind > FEV_DEAD || rec->order_id != 0)) ||
+		(ordered_marker && !fork_meta_ordered_marker_valid(rec, 1)) ||
+		rec->pad[0] != 0 || rec->pad[1] != 0 ||
+		rec->pad[2] != 0 || (rec->kind == FEV_DEAD && rec->nblocks != 0))
+	{
+		fprintf(stderr, "pagestore: invalid forkmeta snapshot record part=%u index=%llu kind=%u timeline=%u\n",
+				part, (unsigned long long) index, rec->kind, rec->timeline);
+		return 0;
+	}
+	future = fork_meta_event_future(rec->lsn, rec->admission_seq,
+									  cutoff.lsn, cutoff.admission_seq);
+	if ((part == FORK_META_SNAPSHOT_CHECKPOINT && future) ||
+		(part == FORK_META_SNAPSHOT_TAIL && !future))
+	{
+		fprintf(stderr, "pagestore: forkmeta snapshot partition violation part=%u index=%llu lsn=%llu seq=%llu\n",
+				part, (unsigned long long) index,
+				(unsigned long long) rec->lsn,
+				(unsigned long long) rec->admission_seq);
+		return 0;
+	}
+	return 1;
+}
+
+typedef struct ForkMetaSnapshotOrderSlot
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	int		used;
+} ForkMetaSnapshotOrderSlot;
+
+static int
+fork_meta_snapshot_order_slots_init(uint64_t nrecords,
+								 ForkMetaSnapshotOrderSlot **slots_out,
+								 size_t *capacity_out)
+{
+	size_t capacity = 16;
+
+	if (nrecords > SIZE_MAX / 2 || (size_t) nrecords > SIZE_MAX / 2)
+		return -1;
+	while (capacity < (size_t) nrecords * 2)
+	{
+		if (capacity > SIZE_MAX / 2)
+			return -1;
+		capacity *= 2;
+	}
+	*slots_out = calloc(capacity, sizeof(**slots_out));
+	if (*slots_out == NULL)
+		return -1;
+	*capacity_out = capacity;
+	return 0;
+}
+
+static int
+fork_meta_snapshot_order_check(ForkMetaSnapshotOrderSlot *slots,
+							   size_t capacity, const ForkMetaRecV2 *rec,
+							   unsigned int part, uint64_t index)
+{
+	size_t pos = (fnv(&rec->key, sizeof(rec->key)) ^
+					 (rec->timeline * 40503u)) & (capacity - 1);
+
+	for (;;)
+	{
+		ForkMetaSnapshotOrderSlot *slot = &slots[pos];
+
+		if (!slot->used)
+		{
+			slot->used = 1;
+			slot->timeline = rec->timeline;
+			slot->key = rec->key;
+			slot->lsn = rec->lsn;
+			slot->admission_seq = rec->admission_seq;
+			return 1;
+		}
+		if (slot->timeline == rec->timeline && key_eq(&slot->key, &rec->key))
+		{
+			if (slot->lsn > rec->lsn ||
+				(slot->lsn == rec->lsn && slot->admission_seq != 0 &&
+				 rec->admission_seq != 0 &&
+				 slot->admission_seq > rec->admission_seq))
+			{
+				fprintf(stderr, "pagestore: forkmeta snapshot order violation part=%u index=%llu prev=(%llu,%llu) current=(%llu,%llu)\n",
+						part, (unsigned long long) index,
+						(unsigned long long) slot->lsn,
+						(unsigned long long) slot->admission_seq,
+						(unsigned long long) rec->lsn,
+						(unsigned long long) rec->admission_seq);
+				return 0;
+			}
+			slot->lsn = rec->lsn;
+			slot->admission_seq = rec->admission_seq;
+			return 1;
+		}
+		pos = (pos + 1) & (capacity - 1);
+	}
+}
+
+static int
+fork_meta_snapshot_load(const char *directory)
+{
+	PsForkmetaSnapshot snapshot;
+	unsigned char *data[2] = {NULL, NULL};
+	uint64_t lengths[2];
+	ForkMetaSnapshotPayloadHeader headers[2];
+	PsPruneFence cutoff;
+
+	if (ps_forkmeta_snapshot_open(&snapshot, directory) != 0)
+		return -1;
+	lengths[0] = snapshot.checkpoint.len;
+	lengths[1] = snapshot.tail.len;
+	cutoff.lsn = snapshot.cutoff_lsn;
+	cutoff.admission_seq = snapshot.cutoff_admission_seq;
+	for (unsigned int part = 0; part < 2; part++)
+	{
+		uint64_t nrecords;
+		ForkMetaRecV2 *records;
+		ForkMetaSnapshotOrderSlot *order_slots = NULL;
+		size_t order_capacity = 0;
+
+		if (lengths[part] > SIZE_MAX ||
+			lengths[part] < sizeof(ForkMetaSnapshotPayloadHeader))
+			goto fail;
+		if ((data[part] = malloc((size_t) lengths[part])) == NULL)
+			goto fail;
+		if (ps_forkmeta_snapshot_read(&snapshot, part, 0, data[part],
+								 lengths[part]) != 0)
+			goto fail;
+		memcpy(&headers[part], data[part], sizeof(headers[part]));
+		if (headers[part].magic != FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
+			headers[part].version != FORK_META_SNAPSHOT_PAYLOAD_VERSION ||
+			headers[part].header_bytes != sizeof(headers[part]) ||
+			headers[part].part != part ||
+			headers[part].record_bytes != sizeof(ForkMetaRecV2) ||
+			headers[part].generation != snapshot.generation ||
+			headers[part].cutoff_lsn != snapshot.cutoff_lsn ||
+			headers[part].cutoff_admission_seq != snapshot.cutoff_admission_seq ||
+			headers[part].freeze_admission_seq == 0)
+			goto fail;
+		if (part == FORK_META_SNAPSHOT_CHECKPOINT)
+			nrecords = headers[part].checkpoint_records;
+		else
+			nrecords = headers[part].tail_records;
+		if (headers[part].checkpoint_records >
+			UINT64_MAX / sizeof(ForkMetaRecV2) ||
+			headers[part].tail_records > UINT64_MAX / sizeof(ForkMetaRecV2) ||
+			nrecords > (UINT64_MAX - sizeof(headers[part])) / sizeof(ForkMetaRecV2) ||
+			lengths[part] != sizeof(headers[part]) + nrecords * sizeof(ForkMetaRecV2) ||
+			headers[part].checkpoint_bytes !=
+				headers[part].checkpoint_records * sizeof(ForkMetaRecV2) ||
+				headers[part].tail_bytes !=
+					headers[part].tail_records * sizeof(ForkMetaRecV2))
+			goto fail;
+		records = (ForkMetaRecV2 *) (data[part] + sizeof(headers[part]));
+		if (fork_meta_snapshot_order_slots_init(nrecords, &order_slots,
+												&order_capacity) != 0)
+			goto fail;
+		for (uint64_t i = 0; i < nrecords; i++)
+		{
+			if (!fork_meta_snapshot_record_valid(records, i, part, cutoff) ||
+				!fork_meta_snapshot_order_check(order_slots, order_capacity,
+												&records[i], part, i))
+			{
+				free(order_slots);
+				goto fail;
+			}
+		}
+		free(order_slots);
+	}
+	if (memcmp(&headers[0].generation, &headers[1].generation,
+			   sizeof(headers[0]) - offsetof(ForkMetaSnapshotPayloadHeader,
+											 generation)) != 0)
+		goto fail;
+	admission_seq_observe(headers[0].freeze_admission_seq);
+	for (unsigned int part = 0; part < 2; part++)
+	{
+		uint64_t nrecords = part == FORK_META_SNAPSHOT_CHECKPOINT ?
+			headers[part].checkpoint_records : headers[part].tail_records;
+		ForkMetaRecV2 *records = (ForkMetaRecV2 *)
+			(data[part] + sizeof(headers[part]));
+
+		for (uint64_t i = 0; i < nrecords; i++)
+		{
+			admission_seq_observe(records[i].admission_seq);
+			if (records[i].kind >= FEV_SEG_GROW &&
+				records[i].kind <= FEV_SEG_COMMIT_BOUND)
+				fork_event_add_seg_marker(
+					fork_get_or_create(records[i].timeline, &records[i].key),
+					records[i].lsn, records[i].nblocks, records[i].kind,
+					records[i].order_id, records[i].admission_seq);
+			else
+				fork_event_add(fork_get_or_create(records[i].timeline, &records[i].key),
+							   records[i].lsn, records[i].admission_seq,
+							   records[i].nblocks, records[i].kind);
+		}
+	}
+	fork_meta_snapshot_generation = snapshot.generation;
+	fork_meta_snapshot_cutoff_lsn = snapshot.cutoff_lsn;
+	fork_meta_snapshot_cutoff_seq = snapshot.cutoff_admission_seq;
+	fork_meta_snapshot_freeze_seq = headers[0].freeze_admission_seq;
+	fork_meta_snapshot_bytes = snapshot.checkpoint.len + snapshot.tail.len;
+	ps_forkmeta_snapshot_close(&snapshot);
+	free(data[0]);
+	free(data[1]);
+	return 0;
+
+fail:
+	ps_forkmeta_snapshot_close(&snapshot);
+	free(data[0]);
+	free(data[1]);
+	return -1;
+}
+
+static int
+fork_meta_snapshot_marker_matches(const ForkMetaRecV2 *rec)
+{
+	PsKey zero_key;
+
+	memset(&zero_key, 0, sizeof(zero_key));
+	return rec->magic == FORK_META_V2_MAGIC && rec->rec_len == sizeof(*rec) &&
+		rec->timeline == 0 && key_eq(&rec->key, &zero_key) &&
+		rec->lsn == fork_meta_snapshot_cutoff_lsn &&
+		rec->admission_seq == fork_meta_snapshot_cutoff_seq &&
+		rec->order_id == fork_meta_snapshot_generation && rec->nblocks == 0 &&
+		rec->kind == FEV_SNAPSHOT_BASE && rec->pad[0] == 0 &&
+		rec->pad[1] == 0 && rec->pad[2] == 0;
+}
+
+static int
+fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec)
+{
+	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+		rec->timeline >= MAX_TIMELINES ||
+		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
+		rec->admission_seq == 0 || rec->pad[0] != 0 || rec->pad[1] != 0 ||
+		rec->pad[2] != 0 ||
+		!fork_meta_event_future(rec->lsn, rec->admission_seq,
+								fork_meta_snapshot_cutoff_lsn,
+								fork_meta_snapshot_cutoff_seq))
+		return 0;
+	switch (rec->kind)
+	{
+		case FEV_GROW:
+			return rec->order_id == 0 && rec->nblocks != 0;
+		case FEV_SET:
+			return rec->order_id == 0;
+		case FEV_DEAD:
+			return rec->order_id == 0 && rec->nblocks == 0;
+		case FEV_SEG_GROW_BOUND:
+		case FEV_SEG_COMMIT_BOUND:
+			return fork_meta_bound_marker_valid(rec, 0);
+		default:
+			/* Migration, legacy/unbound segment, SEG_ID, and epoch markers are
+			 * never valid records after a selected current-epoch marker. */
+			return 0;
+	}
+}
+
+/* The selected snapshot owns the entire old epoch, including its captured
+ * future tail.  Preserve a matching new epoch byte-for-byte; otherwise replace
+ * the whole source with a marker-only epoch. */
+static int
+fork_meta_snapshot_reconcile_source(void)
+{
+	ForkMetaByteVec rewritten = {0};
+	PsKey zero_key;
+	ForkMetaRecV2 first;
+	int nread;
+
+	memset(&zero_key, 0, sizeof(zero_key));
+	if (fork_meta_vec_record(&rewritten, 0, &zero_key,
+						 fork_meta_snapshot_cutoff_lsn,
+						 fork_meta_snapshot_cutoff_seq,
+						 fork_meta_snapshot_generation, 0, FEV_SNAPSHOT_BASE) != 0)
+		goto fail;
+	nread = ps_storage->fork_meta_read(0, &first, sizeof(first));
+	if (nread == (int) sizeof(first) && fork_meta_snapshot_marker_matches(&first))
+	{
+		uint64_t off = sizeof(first);
+
+		for (;;)
+		{
+			ForkMetaRecV2 rec;
+
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread == 0)
+				break;
+			if (nread < 0)
+				goto fail;
+			if (nread != (int) sizeof(rec))
+			{
+				/* The marker and every complete suffix record are acknowledged.
+				 * Discard only the unacknowledged crash tail, matching ordinary
+				 * pre-snapshot log recovery. */
+				if (ps_storage->fork_meta_truncate == NULL ||
+					ps_storage->fork_meta_truncate(off) != 0)
+					goto fail;
+				break;
+			}
+			if (!fork_meta_selected_suffix_valid(&rec))
+				goto fail;
+			off += sizeof(rec);
+		}
+		fork_meta_bytes_store(off);
+		free(rewritten.data);
+		return 0;
+	}
+	if (rewritten.len > UINT32_MAX || ps_storage->fork_meta_rewrite == NULL ||
+		ps_storage->fork_meta_rewrite(rewritten.data, (uint32_t) rewritten.len) != 0)
+		goto fail;
+	fork_meta_bytes_store(rewritten.len);
+	free(rewritten.data);
+	return 0;
+
+fail:
+	free(rewritten.data);
+	return -1;
+}
 
 static int
 load_fork_meta(void)
@@ -3381,12 +4009,14 @@ load_fork_meta(void)
 	uint64_t	off = 0;
 	int			have_records = 0;
 	int			nread = 0;
+	uint64_t	record_number = 0;
 
 	for (;;)
 	{
 		ForkMetaRecV2 rec;
 		uint32_t	first;
 		uint64_t	rec_size;
+		int			ordered_marker_valid = 0;
 
 		nread = ps_storage->fork_meta_read(off, &first, sizeof(first));
 		if (nread != (int) sizeof(first))
@@ -3398,6 +4028,10 @@ load_fork_meta(void)
 			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
 				break;
 			rec_size = sizeof(rec);
+			if (rec.kind >= FEV_SEG_GROW &&
+				rec.kind <= FEV_SEG_COMMIT_BOUND)
+				ordered_marker_valid =
+					fork_meta_ordered_marker_valid(&rec, 0);
 		}
 		else
 		{
@@ -3411,7 +4045,13 @@ load_fork_meta(void)
 			rec.lsn = old.lsn;
 			rec.nblocks = old.nblocks;
 			rec.kind = old.kind;
+			rec.magic = FORK_META_V2_MAGIC;
+			rec.rec_len = sizeof(rec);
+			memcpy(rec.pad, old.pad, sizeof(rec.pad));
 			rec_size = sizeof(old);
+			if (old.kind == FEV_SEG_GROW || old.kind == FEV_SEG_COMMIT)
+				ordered_marker_valid =
+					fork_meta_ordered_marker_valid(&rec, 1);
 			if (old.kind == FEV_SEG_GROW_BOUND ||
 				old.kind == FEV_SEG_COMMIT_BOUND)
 			{
@@ -3424,25 +4064,40 @@ load_fork_meta(void)
 					break;
 				rec_size += sizeof(idrec);
 				if (idrec.kind == FEV_SEG_ID && idrec.timeline == old.timeline &&
-					key_eq(&idrec.key, &old.key) && idrec.nblocks == old.nblocks)
+					key_eq(&idrec.key, &old.key) && idrec.nblocks == old.nblocks &&
+					idrec.lsn != 0 && idrec.pad[0] == 0 && idrec.pad[1] == 0 &&
+					idrec.pad[2] == 0)
+				{
 					rec.order_id = idrec.lsn;
+					ordered_marker_valid =
+						fork_meta_bound_marker_valid(&rec, 1);
+				}
 			}
 		}
 		have_records = 1;
+		if (fork_meta_snapshot_generation != 0)
+			if ((record_number == 0 && !fork_meta_snapshot_marker_matches(&rec)) ||
+				(record_number != 0 && !fork_meta_selected_suffix_valid(&rec)))
+				return -1;
 		if (rec.admission_seq != 0)
 			admission_seq_observe(rec.admission_seq);
-		if (rec.order_id != 0)
+		if (rec.order_id != 0 && rec.kind != FEV_SNAPSHOT_BASE &&
+			ordered_marker_valid)
 			segment_order_id_observe(rec.order_id);
 		if (rec.kind == FEV_MIGRATED)
 			fork_meta_migrated = 1;
 		else if (rec.kind == FEV_MIGRATING)
 			fork_meta_migrating = 1;
-		else if ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT ||
-				  rec.kind == FEV_SEG_GROW_BOUND ||
-				  rec.kind == FEV_SEG_COMMIT_BOUND) &&
-				 rec.timeline < MAX_TIMELINES &&
-				 ((rec.kind == FEV_SEG_GROW || rec.kind == FEV_SEG_COMMIT) ||
-				  rec.order_id != 0))
+		else if (rec.kind == FEV_SNAPSHOT_BASE)
+		{
+			if (record_number != 0 || fork_meta_snapshot_generation == 0 ||
+				!fork_meta_snapshot_marker_matches(&rec))
+				return -1;
+			/* The selected snapshot has already been loaded.  The marker is
+			 * an epoch boundary, not a fork event. */
+		}
+		else if (ordered_marker_valid &&
+				 rec.timeline < MAX_TIMELINES)
 			fork_event_add_seg_marker(
 				fork_get_or_create(rec.timeline, &rec.key),
 				rec.lsn, rec.nblocks, rec.kind, rec.order_id,
@@ -3456,13 +4111,17 @@ load_fork_meta(void)
 			fprintf(stderr, "pagestore: skipping invalid fork-meta record "
 					"(timeline=%u kind=%u)\n", rec.timeline, rec.kind);
 		off += rec_size;
+		record_number++;
 	}
 	/* A short tail is not a record and must not become a prefix of the first
 	 * migration marker (or any later append). */
+	if (fork_meta_snapshot_generation != 0 && nread != 0)
+		return -1;
 	if (nread > 0 && ps_storage->fork_meta_truncate(off) != 0)
 		return -1;
 	if (nread < 0 && off != 0)
 		return -1;
+	fork_meta_bytes_store(off);
 	/*
 	 * Only an absent/empty log is unambiguously a pre-fork-events store.  A
 	 * nonempty log without either marker was written by the immediately
@@ -3490,6 +4149,553 @@ load_fork_meta(void)
 	}
 	else
 		fork_meta_legacy = fork_meta_migrating && !fork_meta_migrated;
+	return 0;
+}
+
+/* The cutoff is the lexicographic minimum of the durable page-reclaimed
+ * frontier for every timeline that owns fork metadata.  Retention owners are
+ * deliberately not consulted here: they are admission fences, not proof that
+ * the source fork history has been durably replaced. */
+static int
+fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out)
+{
+	PsPruneFence cutoff = {0, 0};
+	int have = 0;
+
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+			{
+				int owns = 0;
+
+				for (uint32_t i = 0; i < e->nev; i++)
+					if (e->ev[i].kind <= FEV_DEAD)
+					{
+						owns = 1;
+						break;
+					}
+				if (!owns)
+					continue;
+				if (e->timeline >= MAX_TIMELINES ||
+					page_reclaimed_frontier[e->timeline].lsn == 0 ||
+					page_reclaimed_frontier[e->timeline].admission_seq == 0)
+					return -1;
+				if (!have ||
+					page_reclaimed_frontier[e->timeline].lsn < cutoff.lsn ||
+					(page_reclaimed_frontier[e->timeline].lsn == cutoff.lsn &&
+					 page_reclaimed_frontier[e->timeline].admission_seq <
+					 cutoff.admission_seq))
+				{
+					cutoff = page_reclaimed_frontier[e->timeline];
+					have = 1;
+				}
+			}
+	if (!have)
+		return -1;
+	*cutoff_out = cutoff;
+	return 0;
+}
+
+static int
+fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
+{
+	ForkEnt *e = fork_find(rec->timeline, &rec->key);
+
+	if (e == NULL)
+		return 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].lsn == rec->lsn &&
+			e->ev[i].admission_seq == rec->admission_seq &&
+			e->ev[i].order_id == rec->order_id &&
+			e->ev[i].nblocks == rec->nblocks &&
+			e->ev[i].marker_kind == rec->kind)
+			return 1;
+	return 0;
+}
+
+/* A non-future ordered marker is useful only while its exact page admission
+ * remains recoverable.  Modern admissions are identified by their sequence;
+ * legacy sequence-zero SEG1/SEG3 and V1 bound records additionally rely on
+ * block and page/growth LSN.  WAL-less pages retain page LSN zero while their
+ * marker carries the fork growth floor. */
+static int
+fork_meta_snapshot_marker_page_retained(uint32_t timeline, const PsKey *key,
+										uint64_t marker_lsn,
+										uint64_t admission_seq,
+										uint32_t nblocks)
+{
+	ForkEnt *fork = fork_find(timeline, key);
+	uint32_t block;
+
+	if (fork == NULL || nblocks == 0)
+		return 0;
+	block = nblocks - 1;
+	for (PageEnt *page = fork->pages; page != NULL; page = page->fork_next)
+		if (page->block == block)
+			for (int i = 0; i < page->nver; i++)
+				if (page->vers[i].admission_seq == admission_seq &&
+					(page->vers[i].lsn == marker_lsn || page->vers[i].lsn == 0))
+					return 1;
+	return 0;
+}
+
+static int
+fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
+										ForkMetaByteVec *tail,
+										PsPruneFence cutoff)
+{
+	uint64_t off = 0;
+
+	for (;;)
+	{
+		ForkMetaRecV2 rec;
+		uint32_t magic;
+		int nread = ps_storage->fork_meta_read(off, &magic, sizeof(magic));
+
+		if (nread == 0)
+			return 0;
+		if (nread != (int) sizeof(magic))
+			return -1;
+		if (magic == FORK_META_V2_MAGIC)
+		{
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
+				return -1;
+			if (fork_meta_ordered_marker_valid(&rec, 0) &&
+				(fork_meta_event_future(rec.lsn, rec.admission_seq,
+										cutoff.lsn, cutoff.admission_seq) ||
+				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+														 rec.lsn, rec.admission_seq,
+														 rec.nblocks)) &&
+				!fork_meta_snapshot_marker_present(&rec))
+			{
+				ForkMetaByteVec *part = fork_meta_event_future(
+					rec.lsn, rec.admission_seq, cutoff.lsn,
+					cutoff.admission_seq) ? tail : checkpoint;
+
+				if (fork_meta_vec_record(part, rec.timeline, &rec.key,
+						rec.lsn, rec.admission_seq, rec.order_id,
+						rec.nblocks, rec.kind) != 0)
+					return -1;
+			}
+			off += sizeof(rec);
+		}
+		else
+		{
+			ForkMetaRecV1 old;
+			ForkMetaRecV1 idrec;
+
+			nread = ps_storage->fork_meta_read(off, &old, sizeof(old));
+			if (nread != (int) sizeof(old))
+				return -1;
+			off += sizeof(old);
+			memset(&rec, 0, sizeof(rec));
+			rec.magic = FORK_META_V2_MAGIC;
+			rec.rec_len = sizeof(rec);
+			rec.timeline = old.timeline;
+			rec.key = old.key;
+			rec.lsn = old.lsn;
+			rec.nblocks = old.nblocks;
+			rec.kind = old.kind;
+			memcpy(rec.pad, old.pad, sizeof(rec.pad));
+			if (old.kind == FEV_SEG_GROW_BOUND ||
+				old.kind == FEV_SEG_COMMIT_BOUND)
+			{
+				memset(&idrec, 0, sizeof(idrec));
+				nread = ps_storage->fork_meta_read(off, &idrec, sizeof(idrec));
+				if (nread != (int) sizeof(idrec))
+					return -1;
+				off += sizeof(idrec);
+				rec.order_id = idrec.lsn;
+			}
+			if ((old.kind == FEV_SEG_GROW || old.kind == FEV_SEG_COMMIT ||
+				 old.kind == FEV_SEG_GROW_BOUND ||
+				 old.kind == FEV_SEG_COMMIT_BOUND) &&
+				(old.kind < FEV_SEG_GROW_BOUND ||
+				 (idrec.kind == FEV_SEG_ID && idrec.timeline == old.timeline &&
+				  key_eq(&idrec.key, &old.key) && idrec.nblocks == old.nblocks &&
+				  idrec.lsn != 0 && idrec.pad[0] == 0 && idrec.pad[1] == 0 &&
+				  idrec.pad[2] == 0)) &&
+				fork_meta_ordered_marker_valid(&rec, 1) &&
+				(fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
+										cutoff.admission_seq) ||
+				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+														 rec.lsn, 0, rec.nblocks)) &&
+				!fork_meta_snapshot_marker_present(&rec))
+			{
+				ForkMetaByteVec *part = fork_meta_event_future(
+					rec.lsn, 0, cutoff.lsn, cutoff.admission_seq) ?
+					tail : checkpoint;
+
+				if (fork_meta_vec_record(part, rec.timeline, &rec.key,
+						rec.lsn, 0, rec.order_id, rec.nblocks,
+						rec.kind) != 0)
+					return -1;
+			}
+		}
+	}
+}
+
+static int
+fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
+						  ForkMetaByteVec *source, PsPruneFence cutoff,
+						  uint64_t generation, uint64_t freeze_seq)
+{
+	PsKey zero_key;
+
+	memset(&zero_key, 0, sizeof(zero_key));
+	if (fork_meta_vec_record(source, 0, &zero_key, cutoff.lsn,
+						 cutoff.admission_seq, generation,
+						 0, FEV_SNAPSHOT_BASE) != 0)
+		return -1;
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+			{
+				PsForkMetaEvent *events = NULL;
+				unsigned char *keep = NULL;
+				uint32_t *indices = NULL;
+				PsPruneFence *raw_fences = NULL;
+				PsForkMetaFence *fences = NULL;
+				uint32_t nitems = 0, nfences = 0;
+				int planned;
+
+				for (uint32_t i = 0; i < e->nev; i++)
+					if (e->ev[i].kind <= FEV_DEAD)
+						nitems++;
+				events = nitems == 0 ? NULL :
+					malloc((size_t) nitems * sizeof(*events));
+				indices = nitems == 0 ? NULL :
+					malloc((size_t) nitems * sizeof(*indices));
+				keep = calloc(e->nev, 1);
+				if ((nitems != 0 && (!events || !indices)) || !keep)
+					goto fail_entry;
+				for (uint32_t i = 0, j = 0; i < e->nev; i++)
+					if (e->ev[i].kind <= FEV_DEAD)
+					{
+						events[j].lsn = e->ev[i].lsn;
+						events[j].admission_seq = e->ev[i].admission_seq;
+						events[j].nblocks = e->ev[i].nblocks;
+						events[j].kind = e->ev[i].kind;
+						indices[j++] = i;
+					}
+				if (page_prune_fences(e->timeline, &raw_fences, &nfences) != 0)
+					goto fail_entry;
+				fences = malloc((size_t) nfences * sizeof(*fences));
+				if (nfences != 0 && fences == NULL)
+					goto fail_entry;
+				{
+					uint32_t out = 0;
+
+					for (uint32_t i = 0; i < nfences; i++)
+						if (raw_fences[i].lsn < cutoff.lsn ||
+							(raw_fences[i].lsn == cutoff.lsn &&
+							 raw_fences[i].admission_seq != 0 &&
+							 raw_fences[i].admission_seq <= cutoff.admission_seq))
+						{
+							fences[out].lsn = raw_fences[i].lsn;
+							fences[out].admission_seq = raw_fences[i].admission_seq;
+							out++;
+						}
+					nfences = out;
+				}
+				if (nitems != 0)
+				{
+					unsigned char *planned_keep = malloc(nitems);
+
+					if (planned_keep == NULL)
+						goto fail_entry;
+					planned = ps_forkmeta_prune_plan(events, nitems,
+						(PsForkMetaFence) {cutoff.lsn, cutoff.admission_seq},
+						fences, nfences, planned_keep);
+					if (planned < 0)
+					{
+						free(planned_keep);
+						goto fail_entry;
+					}
+					for (uint32_t j = 0; j < nitems; j++)
+						keep[indices[j]] = planned_keep[j] ||
+							fork_meta_event_future(events[j].lsn,
+								events[j].admission_seq, cutoff.lsn,
+								cutoff.admission_seq);
+					free(planned_keep);
+				}
+				/* Serialize the retained lifecycle and ordered-admission records in
+				 * their original per-fork order.  Legacy sequence-zero markers rely
+				 * on this physical order at equal LSN. */
+				for (uint32_t i = 0; i < e->nev; i++)
+				{
+					ForkEvent *event = &e->ev[i];
+					int future = fork_meta_event_future(event->lsn,
+						 event->admission_seq, cutoff.lsn, cutoff.admission_seq);
+					uint8_t kind;
+					uint64_t order_id;
+
+					if (event->marker_kind != 0 &&
+						(future || fork_meta_snapshot_marker_page_retained(
+							e->timeline, &e->key, event->lsn,
+							event->admission_seq, event->nblocks)))
+					{
+						kind = event->marker_kind;
+						order_id = event->order_id;
+					}
+					else if (event->kind <= FEV_DEAD && keep[i])
+					{
+						kind = event->kind;
+						order_id = 0;
+					}
+					else
+						continue;
+
+					if (fork_meta_vec_record(future ? tail : checkpoint,
+							e->timeline, &e->key, event->lsn,
+							event->admission_seq, order_id,
+							event->nblocks, kind) != 0)
+						goto fail_entry;
+				}
+				free(events);
+				free(indices);
+				free(keep);
+				free(raw_fences);
+				free(fences);
+				continue;
+
+fail_entry:
+				free(events);
+				free(indices);
+				free(keep);
+				free(raw_fences);
+				free(fences);
+				return -1;
+			}
+	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff) != 0)
+		return -1;
+	{
+		ForkMetaSnapshotPayloadHeader headers[2];
+		ForkMetaByteVec wrapped[2] = {{0}, {0}};
+		ForkMetaByteVec *parts[2] = {checkpoint, tail};
+
+		memset(headers, 0, sizeof(headers));
+		for (unsigned int part = 0; part < 2; part++)
+		{
+			headers[part].magic = FORK_META_SNAPSHOT_PAYLOAD_MAGIC;
+			headers[part].version = FORK_META_SNAPSHOT_PAYLOAD_VERSION;
+			headers[part].header_bytes = sizeof(headers[part]);
+			headers[part].part = part;
+			headers[part].record_bytes = sizeof(ForkMetaRecV2);
+			headers[part].generation = generation;
+			headers[part].cutoff_lsn = cutoff.lsn;
+			headers[part].cutoff_admission_seq = cutoff.admission_seq;
+			headers[part].freeze_admission_seq = freeze_seq;
+			headers[part].checkpoint_records =
+				checkpoint->len / sizeof(ForkMetaRecV2);
+			headers[part].tail_records = tail->len / sizeof(ForkMetaRecV2);
+			headers[part].checkpoint_bytes = checkpoint->len;
+			headers[part].tail_bytes = tail->len;
+			if (fork_meta_vec_append(&wrapped[part], &headers[part],
+								 sizeof(headers[part])) != 0 ||
+				fork_meta_vec_append(&wrapped[part], parts[part]->data,
+								 parts[part]->len) != 0)
+			{
+				free(wrapped[0].data);
+				free(wrapped[1].data);
+				return -1;
+			}
+		}
+		free(checkpoint->data);
+		free(tail->data);
+		*checkpoint = wrapped[0];
+		*tail = wrapped[1];
+	}
+	if (source->len > UINT32_MAX)
+		return -1;
+	return 0;
+}
+
+static int
+fork_meta_snapshot_retry_due(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec > fork_meta_snapshot_retry_at.tv_sec ||
+		(now.tv_sec == fork_meta_snapshot_retry_at.tv_sec &&
+		 now.tv_nsec >= fork_meta_snapshot_retry_at.tv_nsec);
+}
+
+static int
+fork_meta_snapshot_gc_due(void)
+{
+	return fork_meta_snapshot_gc_pending && fork_meta_snapshot_retry_due();
+}
+
+static int
+fork_meta_snapshot_due(void)
+{
+	const char *value = getenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+	uint64_t threshold = value ? strtoull(value, NULL, 10) : 65536;
+
+	if (threshold < 1024)
+		threshold = 1024;
+	if (value == NULL && fork_meta_snapshot_generation != 0 &&
+		fork_meta_snapshot_bytes <= UINT64_MAX / 2 &&
+		fork_meta_snapshot_bytes * 2 > threshold)
+		threshold = fork_meta_snapshot_bytes * 2;
+	if (!fork_meta_snapshot_retry_due())
+		return 0;
+	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
+		fork_meta_bytes_load() >= threshold;
+}
+
+static int
+fork_meta_prepared_matches_selected(const PsForkmetaSnapshotPrepared *pending,
+									const PsForkmetaSnapshot *selected)
+{
+	return pending->generation == selected->generation &&
+		pending->cutoff_lsn == selected->cutoff_lsn &&
+		pending->cutoff_admission_seq == selected->cutoff_admission_seq &&
+		pending->checkpoint.len == selected->checkpoint.len &&
+		pending->checkpoint.crc == selected->checkpoint.crc &&
+		pending->tail.len == selected->tail.len &&
+		pending->tail.crc == selected->tail.crc;
+}
+
+static int
+fork_meta_snapshot_maintenance(void)
+{
+	PsPruneFence cutoff;
+	ForkMetaByteVec checkpoint = {0}, tail = {0}, source = {0};
+	PsForkmetaSnapshotInput cp, tl;
+	PsForkmetaSnapshotPrepared prepared;
+	uint64_t generation;
+	uint64_t freeze_seq;
+	int rc = 0;
+
+	if (fork_meta_snapshot_gc_pending)
+	{
+		int gc;
+
+		if (!fork_meta_snapshot_retry_due())
+			return 0;
+		gc = ps_forkmeta_snapshot_gc(fork_meta_snapshot_dir);
+
+		if (gc >= 0)
+		{
+			fork_meta_snapshot_gc_pending = 0;
+			memset(&fork_meta_snapshot_retry_at, 0,
+				   sizeof(fork_meta_snapshot_retry_at));
+		}
+		if (gc < 0)
+		{
+			clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
+			fork_meta_snapshot_retry_at.tv_sec++;
+			return 0;
+		}
+	}
+	if (!fork_meta_snapshot_due() || fork_meta_snapshot_cutoff(&cutoff) != 0)
+	{
+		if (fork_meta_bytes_load() != 0)
+		{
+			clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
+			fork_meta_snapshot_retry_at.tv_sec++;
+		}
+		return 0;
+	}
+	{
+		PsForkmetaSnapshotPrepared pending;
+		int pending_rc = ps_forkmeta_snapshot_read_prepared(
+			fork_meta_snapshot_dir, &pending);
+
+		if (pending_rc < 0)
+			goto retry;
+		if (pending_rc == 1)
+		{
+			if (fork_meta_snapshot_generation != 0)
+			{
+				PsForkmetaSnapshot selected;
+
+				if (ps_forkmeta_snapshot_open(&selected,
+									 fork_meta_snapshot_dir) != 0)
+					goto retry;
+				if (fork_meta_prepared_matches_selected(&pending, &selected))
+				{
+					ps_forkmeta_snapshot_close(&selected);
+					if (ps_forkmeta_snapshot_commit(&pending) != 0)
+						goto retry;
+				}
+				else
+				{
+					ps_forkmeta_snapshot_close(&selected);
+					if (ps_forkmeta_snapshot_abort(&pending) != 0)
+						goto retry;
+				}
+			}
+			else if (ps_forkmeta_snapshot_abort(&pending) != 0)
+				goto retry;
+		}
+		if (ps_forkmeta_snapshot_next_generation(fork_meta_snapshot_dir,
+										 fork_meta_snapshot_generation, &generation) != 0)
+			goto retry;
+	}
+	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
+	if (freeze_seq <= 1)
+		goto retry;
+	freeze_seq--;
+	if (fork_meta_snapshot_build(&checkpoint, &tail, &source, cutoff,
+								 generation, freeze_seq) != 0)
+		goto retry_done;
+	cp.data = checkpoint.data;
+	cp.len = checkpoint.len;
+	cp.produce = NULL;
+	cp.produce_arg = NULL;
+	tl.data = tail.data;
+	tl.len = tail.len;
+	tl.produce = NULL;
+	tl.produce_arg = NULL;
+	if (ps_forkmeta_snapshot_prepare(&prepared, fork_meta_snapshot_dir,
+								 generation, cutoff.lsn, cutoff.admission_seq,
+								 &cp, &tl) != 0)
+		goto retry_done;
+	if (ps_forkmeta_snapshot_commit(&prepared) != 0)
+	{
+		fork_meta_poisoned_store(1);
+		goto done;
+	}
+	/* The manifest is now authoritative.  Any failure here poisons mutation;
+	 * continuing to append to the old epoch would make source identity unknown. */
+	if (ps_storage->fork_meta_rewrite == NULL ||
+		ps_storage->fork_meta_rewrite(source.data, (uint32_t) source.len) != 0)
+	{
+		fork_meta_poisoned_store(1);
+		goto done;
+	}
+	fork_meta_bytes_store(source.len);
+	fork_meta_snapshot_generation = generation;
+	fork_meta_snapshot_cutoff_lsn = cutoff.lsn;
+	fork_meta_snapshot_cutoff_seq = cutoff.admission_seq;
+	fork_meta_snapshot_freeze_seq = freeze_seq;
+	fork_meta_snapshot_bytes = checkpoint.len + tail.len;
+	fork_meta_snapshot_gc_pending = 1;
+	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
+	/* Keep the in-memory chain conservative until the next restart.  All
+	 * acknowledged events remain available to readers; the durable checkpoint
+	 * is the source of truth for the next boot. */
+	rc = 1;
+
+done:
+	free(checkpoint.data);
+	free(tail.data);
+	free(source.data);
+	return rc;
+
+retry_done:
+	clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
+	fork_meta_snapshot_retry_at.tv_sec++;
+	goto done;
+
+retry:
+	clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
+	fork_meta_snapshot_retry_at.tv_sec++;
 	return 0;
 }
 
@@ -4763,6 +5969,26 @@ typedef struct WalIdxItem
 	uint64_t	end_lsn;
 	uint32_t	flags;
 } WalIdxItem;
+
+static void
+free_walidx_indexes(void)
+{
+	for (uint32_t sh = 0; sh < MAX_SHARDS; sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			WalIdxEnt *entry = g_shards[sh].walidx[bucket];
+
+			while (entry != NULL)
+			{
+				WalIdxEnt *next = entry->next;
+
+				free(entry->items);
+				free(entry);
+				entry = next;
+			}
+			g_shards[sh].walidx[bucket] = NULL;
+		}
+}
 
 /* Keep each hash chain canonical so a fixed-size heap can merge the chains
  * into the same key/block/LSN order as the former whole-shard qsort. */
@@ -6448,6 +7674,12 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	ordered_record = zero_version || clamped;
 	segment_grows = (!fe ||
 		fork_size_asof_hop(fe, hdr_grow_lsn, admission_seq) < block + 1);
+	/* An ordered body is acknowledged only together with its bound marker.
+	 * Reject an inadmissible tuple before either header or page bytes reach the
+	 * segment, even when this is a non-growth commit marker. */
+	if ((ordered_record || segment_grows) &&
+		!fork_meta_mutation_future(hdr_grow_lsn, admission_seq))
+		return -1;
 	if (ordered_record)
 	{
 		order_id = segment_order_id_alloc();
@@ -7431,7 +8663,7 @@ replay_page_record(uint32_t timeline, const PsKey *key, uint32_t block,
 		ForkEnt    *fe = fork_find(timeline, key);
 
 		if ((!fe || !fork_event_activate_seg(fe, growth_lsn, block + 1,
-										order_id, admission_seq)) &&
+												 order_id, admission_seq)) &&
 			!fork_meta_legacy)
 			return 0;
 	}
@@ -7731,15 +8963,23 @@ fail:
  * unstamped callers).
  */
 static uint64_t
-fork_op_lsn(const ForkEnt *e, uint64_t req_lsn)
+fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 {
 	uint64_t	newest;
 
 	if (req_lsn != 0)
 		return req_lsn;
-	newest = e->nev ? e->ev[e->nev - 1].lsn : 0;
-	if (e->last_page_lsn > newest)
-		newest = e->last_page_lsn;
+	ps_lock_map_rd();
+	newest = fork_newest_visible_lsn_through(timeline, key);
+	ps_unlock_map();
+	/* A WAL-less mutation admitted after snapshot cutover has no historical
+	 * position to preserve.  Place an otherwise-empty fork at the selected
+	 * cutoff; its freshly allocated admission sequence orders it strictly after
+	 * the snapshot.  Explicit nonzero LSNs still pass through unchanged and are
+	 * rejected below the cutoff by fork_meta_mutation_future(). */
+	if (fork_meta_snapshot_generation != 0 &&
+		newest < fork_meta_snapshot_cutoff_lsn)
+		return fork_meta_snapshot_cutoff_lsn;
 	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
 }
 
@@ -7763,22 +9003,38 @@ ps_handle_meta(PsChannel *ch)
 				uint64_t	seq;
 				int			delayed;
 
-				/* Object writers issue CREATE as a preparatory operation before
-				 * every write.  Unlike a relation WAL CREATE, an unstamped retry
-				 * must preserve the existing fork and its block count. */
-				if (ch->req_lsn == 0 && ch->key.klass != PS_KLASS_RELATION &&
-					fork_exists_through(tl, &ch->key, UINT64_MAX, 0))
-					break;
+				/* An unstamped CREATE is an ensure when this fork's generation is
+				 * already live.  This includes normal-backend relation opens as well
+				 * as object writers; neither may manufacture an empty generation.
+				 * A missing/dead fork falls through as a real durable lifecycle
+				 * CREATE, ordered by fork_op_lsn() and the admission sequence. */
+				if (ch->req_lsn == 0)
+				{
+					int live;
 
-				lsn = fork_op_lsn(e, ch->req_lsn);
+					ps_lock_map_rd();
+					live = fork_exists_through(tl, &ch->key, UINT64_MAX, 0);
+					ps_unlock_map();
+					if (live)
+						break;
+				}
+
+				lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				/* XLogReadBufferExtended() asks smgr to ensure the relation fork
 				 * exists before applying every redo record.  That call has the
 				 * record's LSN but is not a relation-creation record: if the fork
 				 * already exists at this replay position, recording FEV_SET would
 				 * manufacture a zero-block generation and hide older pages. */
-				if (ch->is_redo == 2 && ch->key.klass == PS_KLASS_RELATION &&
-					fork_exists_through(tl, &ch->key, lsn, 0))
-					break;
+				if (ch->is_redo == 2 && ch->key.klass == PS_KLASS_RELATION)
+				{
+					int live;
+
+					ps_lock_map_rd();
+					live = fork_exists_through(tl, &ch->key, lsn, 0);
+					ps_unlock_map();
+					if (live)
+						break;
+				}
 				seq = admission_seq_alloc();
 				delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -7804,6 +9060,12 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_EXISTS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			if (ch->req_lsn != 0 &&
+				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+			{
+				ch->status = PS_STATUS_ERROR;
+				break;
+			}
 			if (ch->req_seq != 0 && ch->key.klass == PS_KLASS_RELATION &&
 				fork_has_wal_less_page(tl, &ch->key))
 			{
@@ -7823,7 +9085,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -7846,6 +9108,12 @@ ps_handle_meta(PsChannel *ch)
 
 		case PS_OP_NBLOCKS:
 			/* req_lsn caps the horizon; 0 = newest (the writer path) */
+			if (ch->req_lsn != 0 &&
+				!page_frontier_ancestry_allows(tl, ch->req_lsn, ch->req_seq))
+			{
+				ch->status = PS_STATUS_ERROR;
+				break;
+			}
 			if (ch->req_seq != 0 && ch->key.klass == PS_KLASS_RELATION &&
 				fork_has_wal_less_page(tl, &ch->key))
 			{
@@ -7869,7 +9137,7 @@ ps_handle_meta(PsChannel *ch)
 			 */
 			{
 				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
 				uint64_t	seq = admission_seq_alloc();
 				int			delayed = fork_event_precedes_known_state(e, lsn, seq);
 
@@ -7899,12 +9167,19 @@ ps_handle_meta(PsChannel *ch)
 			 * horizon, keeping the log as sparse as the in-memory dedup.
 			 */
 			{
-				ForkEnt    *e = fork_get_or_create(tl, &ch->key);
-				uint64_t	lsn = fork_op_lsn(e, ch->req_lsn);
+				uint64_t	lsn = fork_op_lsn(tl, &ch->key, ch->req_lsn);
+				uint64_t	seq = admission_seq_alloc();
 				uint32_t	to = ch->blocknum + ch->nblocks;
 
-				if (fork_grow(tl, &ch->key, to, lsn) != 0)
+				/* Validate the caller's explicit tuple before fork_grow_with_seq()
+				 * can clamp its effective LSN to a newer definitive event. */
+				if (seq == 0 ||
+					(ch->req_lsn != 0 &&
+					 !fork_meta_mutation_future(ch->req_lsn, seq)) ||
+					fork_grow_with_seq(tl, &ch->key, to, lsn, seq) != 0)
 					ch->status = PS_STATUS_ERROR;
+				else
+					ch->req_seq = seq;
 			}
 			break;
 
@@ -8473,6 +9748,8 @@ ps_core_close(void)
 		}
 	ps_retention_close();
 	ps_manifest_close();
+	free_page_fork_indexes();
+	free_walidx_indexes();
 }
 
 static int
@@ -8984,6 +10261,29 @@ ps_core_maintenance(void)
 		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
+	if (fork_meta_snapshot_gc_due() || fork_meta_snapshot_due())
+	{
+		int snapshot_rc;
+
+		/* The cutover is a single run-to-completion operation.  Admission write
+		 * drains acknowledged writers, then shard locks precede page/wal-index
+		 * fences in the existing shard-to-page ordering. */
+		pthread_rwlock_wrlock(&admission_lock);
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_lock_shard_wr(sh);
+		pthread_rwlock_wrlock(&page_prune_lock);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		ps_lock_map_wr();
+		snapshot_rc = fork_meta_snapshot_maintenance();
+		ps_unlock_map();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		pthread_rwlock_unlock(&page_prune_lock);
+		for (uint32_t sh = core_shards(); sh > 0; sh--)
+			ps_unlock_shard(sh - 1);
+		pthread_rwlock_unlock(&admission_lock);
+		if (snapshot_rc)
+			return 1;
+	}
 
 	if (!use_layers)
 		return 0;
@@ -9151,6 +10451,10 @@ ps_core_open(const char *store_dir)
 	uint32_t	ns = core_shards();
 	int			publish_shard_count = 0;
 
+	/* A test or embedding process may reopen without a fresh daemon.  Drop
+	 * every hash entry before recovery repopulates the indexes. */
+	free_page_fork_indexes();
+	free_walidx_indexes();
 	__atomic_store_n(&next_segment_order_id, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&next_admission_seq, 1, __ATOMIC_RELAXED);
 	/* A close/open cycle may switch to a store with different timelines.  Drop
@@ -9179,6 +10483,20 @@ ps_core_open(const char *store_dir)
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
 	memset(timeline_used, 0, sizeof(timeline_used));
+	fork_meta_poisoned_store(0);
+	fork_meta_bytes_store(0);
+	fork_meta_snapshot_generation = 0;
+	fork_meta_snapshot_cutoff_lsn = 0;
+	fork_meta_snapshot_cutoff_seq = 0;
+	fork_meta_snapshot_freeze_seq = 0;
+	fork_meta_snapshot_bytes = 0;
+	fork_meta_snapshot_gc_pending = 0;
+	memset(&fork_meta_snapshot_retry_at, 0,
+		   sizeof(fork_meta_snapshot_retry_at));
+	fork_meta_migrating = 0;
+	fork_meta_migrated = 0;
+	fork_meta_legacy = 0;
+	fork_meta_migrate_failed = 0;
 	map_locks_ready = 0;
 	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
@@ -9187,6 +10505,10 @@ ps_core_open(const char *store_dir)
 	gc_remote_layer_cursor = 0;
 	if (snprintf(wal_segment_root, sizeof(wal_segment_root), "%s", store_dir) < 0 ||
 		strlen(store_dir) >= sizeof(wal_segment_root))
+		return -1;
+	if (snprintf(fork_meta_snapshot_dir, sizeof(fork_meta_snapshot_dir),
+				 "%s/forkmeta_snapshots", store_dir) < 0 ||
+		strlen(fork_meta_snapshot_dir) >= sizeof(fork_meta_snapshot_dir))
 		return -1;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	memset(walidx_progress, 0, sizeof(walidx_progress));
@@ -9330,6 +10652,65 @@ ps_core_open(const char *store_dir)
 			}
 			if (pin.admission_seq != 0)
 				admission_seq_observe(pin.admission_seq);
+		}
+	}
+	/* Reconcile the snapshot intent before loading either source epoch.  Only a
+	 * selected manifest transfers ownership away from the old source epoch. */
+	{
+		int manifest_exists = fork_meta_snapshot_manifest_exists(
+			fork_meta_snapshot_dir);
+		if (manifest_exists < 0)
+			return -1;
+		if (manifest_exists)
+		{
+			PsForkmetaSnapshot selected = {.directory_fd = -1,
+				.checkpoint_fd = -1, .tail_fd = -1};
+			PsForkmetaSnapshotPrepared pending;
+			int have_pending;
+
+			if (ps_forkmeta_snapshot_open(&selected, fork_meta_snapshot_dir) != 0)
+				return -1;
+			have_pending = ps_forkmeta_snapshot_read_prepared(
+				fork_meta_snapshot_dir, &pending);
+			if (have_pending < 0 ||
+				(have_pending == 1 &&
+				 (fork_meta_prepared_matches_selected(&pending, &selected) ?
+				  ps_forkmeta_snapshot_commit(&pending) :
+				  ps_forkmeta_snapshot_abort(&pending)) != 0))
+			{
+				fprintf(stderr, "pagestore: forkmeta prepared-intent reconcile failed\n");
+				ps_forkmeta_snapshot_close(&selected);
+				return -1;
+			}
+			ps_forkmeta_snapshot_close(&selected);
+			if (fork_meta_snapshot_load(fork_meta_snapshot_dir) != 0)
+			{
+				fprintf(stderr, "pagestore: selected forkmeta snapshot is invalid\n");
+				return -1;
+			}
+			if (fork_meta_snapshot_reconcile_source() != 0)
+			{
+				fprintf(stderr, "pagestore: forkmeta source epoch reconcile failed\n");
+				return -1;
+			}
+			/* Startup has selected the authoritative generation.  Reclaim older
+			 * generations asynchronously; recovery must not leave them behind just
+			 * because the in-memory pending bit was reset for this process. */
+			fork_meta_snapshot_gc_pending = 1;
+			memset(&fork_meta_snapshot_retry_at, 0,
+				   sizeof(fork_meta_snapshot_retry_at));
+		}
+		else
+		{
+			PsForkmetaSnapshotPrepared prepared;
+			int have_prepared = ps_forkmeta_snapshot_read_prepared(
+				fork_meta_snapshot_dir, &prepared);
+
+			if (have_prepared < 0)
+				return -1;
+			if (have_prepared == 1 &&
+				ps_forkmeta_snapshot_abort(&prepared) != 0)
+				return -1;
 		}
 	}
 

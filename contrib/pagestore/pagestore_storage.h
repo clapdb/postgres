@@ -109,6 +109,14 @@ typedef struct PsStorage
 	int			(*fork_meta_append) (const void *buf, uint32_t len);
 	int			(*fork_meta_read) (uint64_t off, void *buf, uint32_t len);
 	int			(*fork_meta_truncate) (uint64_t len);
+	/*
+	 * Atomically replace the fixed fork-meta log via durable temporary file,
+	 * rename, and parent-directory fsync.  The core externally serializes this
+	 * operation against append/read/truncate.  A failure after rename is
+	 * intentionally ambiguous: callers must poison the live process and reopen
+	 * to reconcile the selected snapshot with whichever name survived.
+	 */
+	int			(*fork_meta_rewrite) (const void *buf, uint32_t len);
 } PsStorage;
 
 /* the active backend, selected at startup */

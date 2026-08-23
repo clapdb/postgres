@@ -49,6 +49,8 @@ static int test_fail_fork_meta_append_at;
 static int test_max_log_read;
 static int test_fail_wal_rewrite_before_rename;
 static int test_fail_wal_rewrite_dir_fsync;
+static int test_fail_fork_meta_rewrite_before_rename;
+static int test_fail_fork_meta_rewrite_dir_fsync;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flat WAL files are independent per timeline. */
@@ -238,9 +240,12 @@ posix_open(const char *path, uint64_t segment_size)
 	if (mkdir(path, 0700) != 0 && errno != EEXIST)
 		return -1;
 
-	seg_fds = NULL;
-	seg_fds_caps = NULL;
-	seg_shards_cap = 0;
+	/* Backend ownership permits an explicit OPEN to abandon a previous POSIX
+	 * instance.  Serialize teardown before installing the new path so stale fd
+	 * caches cannot leak or accidentally address the replacement directory. */
+	pthread_mutex_lock(&seg_fds_lock);
+	free_shard_caches();
+	pthread_mutex_unlock(&seg_fds_lock);
 	/* Standalone-test fault injection; ordinary deployments never set it. */
 	fail_writes = getenv("PAGESTORE_TEST_FAIL_SEG_WRITES");
 	test_fail_seg_writes = fail_writes ? atoi(fail_writes) : 0;
@@ -259,6 +264,12 @@ posix_open(const char *path, uint64_t segment_size)
 		getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC");
 	test_fail_wal_rewrite_dir_fsync = fail_wal_rewrite_dir_fsync ?
 		atoi(fail_wal_rewrite_dir_fsync) : 0;
+	{
+		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
+		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
+		value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
+		test_fail_fork_meta_rewrite_dir_fsync = value ? atoi(value) : 0;
+	}
 	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
@@ -279,7 +290,9 @@ posix_open(const char *path, uint64_t segment_size)
 static void
 posix_close(void)
 {
+	pthread_mutex_lock(&seg_fds_lock);
 	free_shard_caches();
+	pthread_mutex_unlock(&seg_fds_lock);
 	posix_wal_locks_clear();
 	posix_walidx_locks_clear();
 }
@@ -1505,6 +1518,76 @@ posix_fork_meta_truncate(uint64_t len)
 	return posix_log_truncate("forkmeta", len);
 }
 
+static int
+posix_fork_meta_rewrite(const void *buf, uint32_t len)
+{
+	char path[4096], tmp[4096];
+	int fd = -1, dfd = -1, rc = -1;
+	uint32_t off = 0;
+
+	if (buf == NULL && len != 0)
+		return -1;
+	pthread_mutex_lock(&posix_log_lock);
+	snprintf(path, sizeof(path), "%s/forkmeta", posix_dir);
+	snprintf(tmp, sizeof(tmp), "%s/forkmeta.rewrite.tmp", posix_dir);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		goto out;
+	while (off < len)
+	{
+		ssize_t n = write(fd, (const unsigned char *) buf + off, len - off);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out;
+		off += (uint32_t) n;
+	}
+	{
+		int sync_rc = fsync(fd);
+		int close_rc = close(fd);
+
+		fd = -1;
+		if (sync_rc != 0 || close_rc != 0)
+			goto out;
+	}
+	if (test_fail_fork_meta_rewrite_before_rename > 0 &&
+		--test_fail_fork_meta_rewrite_before_rename == 0)
+	{
+		errno = EIO;
+		goto out;
+	}
+	if (rename(tmp, path) != 0)
+		goto out;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0 || (test_fail_fork_meta_rewrite_dir_fsync > 0 &&
+		--test_fail_fork_meta_rewrite_dir_fsync == 0) || fsync(dfd) != 0)
+	{
+		if (dfd >= 0)
+			close(dfd);
+		dfd = -1;
+		errno = EIO;
+		goto out;
+	}
+	if (close(dfd) != 0)
+	{
+		dfd = -1;
+		errno = EIO;
+		goto out;
+	}
+	dfd = -1;
+	rc = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	if (dfd >= 0)
+		close(dfd);
+	if (rc != 0)
+		(void) unlink(tmp);
+	pthread_mutex_unlock(&posix_log_lock);
+	return rc;
+}
+
 const PsStorage PsStoragePosix = {
 	.name = "posix",
 	.open = posix_open,
@@ -1530,4 +1613,5 @@ const PsStorage PsStoragePosix = {
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
 	.fork_meta_truncate = posix_fork_meta_truncate,
+	.fork_meta_rewrite = posix_fork_meta_rewrite,
 };
