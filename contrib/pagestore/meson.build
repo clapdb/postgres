@@ -230,6 +230,17 @@ test('pagestore_walidx_prune',
   timeout: 30,
 )
 
+# Pure keep/drop rule for fork-metadata compaction.
+pagestore_forkmeta_prune_test = executable('pagestore_forkmeta_prune_test',
+  files('pagestore_forkmeta_prune_test.c', 'pagestore_forkmeta_prune.c'),
+  install: false,
+)
+test('pagestore_forkmeta_prune',
+  pagestore_forkmeta_prune_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Persisted immutable shipped-WAL segment header and checksum contract.
 pagestore_wal_segment_test = executable('pagestore_wal_segment_test',
   files('pagestore_wal_segment_test.c', 'pagestore_wal_segment.c'),
