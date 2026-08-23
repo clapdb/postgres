@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <stdio.h>
@@ -19,9 +20,28 @@ static int failed;
 #define TEST_FORK_META_SNAPSHOT_PAYLOAD_MAGIC 0x31534d46U
 #define TEST_FEV_GROW 0
 #define TEST_FEV_SET 1
+#define TEST_FEV_DEAD 2
+#define TEST_FEV_SEG_GROW 5
+#define TEST_FEV_SEG_COMMIT 6
+#define TEST_FEV_SEG_GROW_BOUND 7
+#define TEST_FEV_SEG_COMMIT_BOUND 8
+#define TEST_FEV_SEG_ID 9
 #define TEST_FEV_MIGRATED 3
 #define TEST_FEV_SNAPSHOT_BASE 10
+#define TEST_SEG_WALLESS_ORDERED_MAGIC 0x53454731U
+#define TEST_SEG_CLAMPED_ORDERED_MAGIC 0x53454733U
+#define TEST_SEG_WALLESS_BOUND_MAGIC 0x53454734U
 #define TEST_MAX_TIMELINES 1024
+
+typedef struct TestForkMetaRecV1
+{
+	uint32_t timeline;
+	PsKey key;
+	uint64_t lsn;
+	uint32_t nblocks;
+	uint8_t kind;
+	uint8_t pad[3];
+} TestForkMetaRecV1;
 
 typedef struct TestForkMetaRecV2
 {
@@ -53,6 +73,22 @@ typedef struct TestSnapshotHeader
 	uint64_t checkpoint_bytes;
 	uint64_t tail_bytes;
 } TestSnapshotHeader;
+
+typedef struct TestSegRecHdr
+{
+	uint32_t magic;
+	uint32_t timeline;
+	PsKey key;
+	uint32_t block;
+	uint64_t lsn;
+	uint32_t len;
+} TestSegRecHdr;
+
+typedef struct TestSegRecHdrBound
+{
+	TestSegRecHdr hdr;
+	uint64_t order_id;
+} TestSegRecHdrBound;
 
 static void
 remove_tree(const char *path)
@@ -212,6 +248,51 @@ run_maintenance_until(const char *path, int want_exists)
 }
 
 static int
+snapshot_has_ordered_marker(const char *directory, const PsKey *key,
+								uint64_t admission_seq)
+{
+	PsForkmetaSnapshot selected = {.directory_fd = -1,
+		.checkpoint_fd = -1, .tail_fd = -1};
+	int found = 0;
+
+	if (ps_forkmeta_snapshot_open(&selected, directory) != 0)
+		return 0;
+	for (unsigned int part = 0; part <= PS_FORKMETA_SNAPSHOT_TAIL && !found;
+		 part++)
+	{
+		TestSnapshotHeader header;
+		uint64_t records;
+
+		if (ps_forkmeta_snapshot_read(&selected, part, 0, &header,
+									  sizeof(header)) != 0)
+			break;
+		records = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+			header.checkpoint_records : header.tail_records;
+		for (uint64_t i = 0; i < records; i++)
+		{
+			TestForkMetaRecV2 rec;
+
+			if (ps_forkmeta_snapshot_read(&selected, part,
+									  sizeof(header) + i * sizeof(rec), &rec,
+									  sizeof(rec)) != 0)
+				break;
+			if ((rec.kind == TEST_FEV_SEG_GROW ||
+				 rec.kind == TEST_FEV_SEG_COMMIT ||
+				 rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+				 rec.kind == TEST_FEV_SEG_COMMIT_BOUND) &&
+				rec.admission_seq == admission_seq &&
+				memcmp(&rec.key, key, sizeof(*key)) == 0)
+			{
+				found = 1;
+				break;
+			}
+		}
+	}
+	ps_forkmeta_snapshot_close(&selected);
+	return found;
+}
+
+static int
 read_selected_header(const char *directory, TestSnapshotHeader *header)
 {
 	PsForkmetaSnapshot selected = {.directory_fd = -1,
@@ -368,6 +449,187 @@ test_no_manifest_marker_only_rejected(void)
 	remove_tree(store);
 }
 
+static void
+test_v1_bound_marker_snapshot(void)
+{
+	char store[] = "/tmp/psforkmetav1boundXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {5, 5, 5, 0, PS_KLASS_RELATION};
+	PsKey lifecycle_key = {5, 5, 7, 0, PS_KLASS_RELATION};
+	PsKey seg1_key = {5, 5, 8, 0, PS_KLASS_RELATION};
+	PsKey seg3_key = {5, 5, 9, 0, PS_KLASS_RELATION};
+	PsKey pin_key = {5, 5, 6, 0, PS_KLASS_RELATION};
+	TestForkMetaRecV1 records[6];
+	TestSegRecHdrBound bound_bodies[2];
+	TestSegRecHdr legacy_bodies[2];
+	PsRetentionPin pin;
+	PsChannel reply;
+	unsigned char page[8192];
+	unsigned char legacy_pages[4][8192];
+	uint64_t first_seq = 0;
+	uint64_t second_seq = 0;
+	int64_t seg_off;
+	uint64_t offsets[4];
+	int n;
+
+	check(mkdtemp(store) != NULL, "create V1 bound-marker store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build V1 snapshot directory path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build V1 snapshot manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build V1 frontier path");
+	flush_pages = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0,
+		  "open V1 fixture store before installing legacy body");
+	memset(page, 0, sizeof(page));
+	check(meta_request(PS_OP_CREATE, &pin_key, 100, 0, 0, 0, NULL) &&
+		  append_relation(&pin_key, 0, 100, page, &first_seq) == 0 &&
+		  append_relation(&pin_key, 0, 200, page, &second_seq) == 0,
+		  "write page history for V1 fixture frontier");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 77;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = second_seq;
+	check(first_seq != 0 && second_seq > first_seq &&
+		  ps_retention_set(&pin) == PS_RETENTION_OK,
+		  "install page-history pin for V1 snapshot fixture");
+	check(run_maintenance_until(frontier, 1),
+		  "publish safe frontier for V1 snapshot fixture");
+	close_runtime();
+
+	memset(records, 0, sizeof(records));
+	for (int i = 0; i < 6; i++)
+	{
+		records[i].timeline = 0;
+		records[i].nblocks = 1;
+	}
+	records[0].key = key;
+	records[0].lsn = 200;
+	records[0].kind = TEST_FEV_SEG_GROW_BOUND;
+	records[1].key = key;
+	records[1].lsn = 77;
+	records[1].kind = TEST_FEV_SEG_ID;
+	records[2].key = lifecycle_key;
+	records[2].lsn = 150;
+	records[2].kind = TEST_FEV_SEG_GROW_BOUND;
+	records[3].key = lifecycle_key;
+	records[3].lsn = 78;
+	records[3].kind = TEST_FEV_SEG_ID;
+	records[4].key = seg1_key;
+	records[4].lsn = 160;
+	records[4].kind = TEST_FEV_SEG_GROW;
+	records[5].key = seg3_key;
+	records[5].lsn = 170;
+	records[5].kind = TEST_FEV_SEG_GROW;
+	memset(bound_bodies, 0, sizeof(bound_bodies));
+	for (int i = 0; i < 2; i++)
+	{
+		bound_bodies[i].hdr.magic = TEST_SEG_WALLESS_BOUND_MAGIC;
+		bound_bodies[i].hdr.timeline = 0;
+		bound_bodies[i].hdr.block = 0;
+		bound_bodies[i].hdr.len = sizeof(page);
+	}
+	bound_bodies[0].hdr.key = key;
+	bound_bodies[0].hdr.lsn = 200;
+	bound_bodies[0].order_id = 77;
+	bound_bodies[1].hdr.key = lifecycle_key;
+	bound_bodies[1].hdr.lsn = 150;
+	bound_bodies[1].order_id = 78;
+	memset(legacy_bodies, 0, sizeof(legacy_bodies));
+	legacy_bodies[0].magic = TEST_SEG_WALLESS_ORDERED_MAGIC;
+	legacy_bodies[0].timeline = 0;
+	legacy_bodies[0].key = seg1_key;
+	legacy_bodies[0].lsn = 160;
+	legacy_bodies[0].len = sizeof(page);
+	legacy_bodies[1].magic = TEST_SEG_CLAMPED_ORDERED_MAGIC;
+	legacy_bodies[1].timeline = 0;
+	legacy_bodies[1].key = seg3_key;
+	legacy_bodies[1].lsn = 170;
+	legacy_bodies[1].len = sizeof(page);
+	memset(legacy_pages, 0, sizeof(legacy_pages));
+	legacy_pages[0][128] = 0x6d;
+	legacy_pages[1][128] = 0x7d;
+	legacy_pages[2][128] = 0x31;
+	legacy_pages[3][128] = 0x33;
+	check(PsStoragePosix.open(store, segment_size) == 0 &&
+		  (seg_off = PsStoragePosix.seg_size(0, 0)) >= 0 &&
+		  PsStoragePosix.fork_meta_append(records, sizeof(records)) == 0 &&
+		  (offsets[0] = (uint64_t) seg_off, 1) &&
+		  (offsets[1] = offsets[0] + sizeof(bound_bodies[0]) + sizeof(page), 1) &&
+		  (offsets[2] = offsets[1] + sizeof(bound_bodies[1]) + sizeof(page), 1) &&
+		  (offsets[3] = offsets[2] + sizeof(legacy_bodies[0]) + sizeof(page), 1) &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0], &bound_bodies[0],
+								 sizeof(bound_bodies[0])) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[0] + sizeof(bound_bodies[0]),
+								 legacy_pages[0], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1], &bound_bodies[1],
+								 sizeof(bound_bodies[1])) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[1] + sizeof(bound_bodies[1]),
+								 legacy_pages[1], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[2], &legacy_bodies[0],
+								 sizeof(legacy_bodies[0])) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[2] + sizeof(legacy_bodies[0]),
+								 legacy_pages[2], sizeof(page)) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[3], &legacy_bodies[1],
+								 sizeof(legacy_bodies[1])) == 0 &&
+		  PsStoragePosix.seg_write(0, 0, offsets[3] + sizeof(legacy_bodies[1]),
+								 legacy_pages[3], sizeof(page)) == 0 &&
+		  PsStoragePosix.sync() == 0,
+		  "install V1 bound and unbound SEG1/SEG3 ordered bodies");
+	PsStoragePosix.close();
+	check(ps_core_open(store) == 0,
+		  "open committed V1 ordered-page fixture");
+	memset(page, 0, sizeof(page));
+	check(read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x6d,
+		  "V1 bound marker admits its ordered page before snapshot");
+	check(read_resolve(0, &lifecycle_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x7d &&
+		  read_resolve(0, &seg1_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x31 &&
+		  read_resolve(0, &seg3_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x33,
+		  "V1 SEG1/SEG3 and lifecycle bodies admit before snapshot");
+	check(meta_request(PS_OP_UNLINK, &lifecycle_key, 150, 0, 0, 0, NULL) &&
+		  meta_request(PS_OP_EXISTS, &lifecycle_key, 0, 0, 0, 0, &reply) &&
+		  reply.result == 0,
+		  "append same-LSN lifecycle event after V1 sequence-zero marker");
+	check(append_growth_batch(1800, 1500) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "publish snapshot containing V1 ordered admission");
+	check(snapshot_has_ordered_marker(snapshots, &key, 0),
+		  "snapshot preserves V1 bound marker with sequence zero");
+	check(snapshot_has_ordered_marker(snapshots, &lifecycle_key, 0) &&
+		  snapshot_has_ordered_marker(snapshots, &seg1_key, 0) &&
+		  snapshot_has_ordered_marker(snapshots, &seg3_key, 0),
+		  "snapshot preserves same-LSN and legacy SEG1/SEG3 admissions");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x6d &&
+		  read_resolve(0, &seg1_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x31 &&
+		  read_resolve(0, &seg3_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x33 &&
+		  read_resolve(0, &lifecycle_key, 0, UINT64_MAX, 0, page, NULL) == 0,
+		  "V1 bound, SEG1/SEG3, and same-LSN lifecycle survive restart");
+	close_runtime();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -383,6 +645,8 @@ main(void)
 	PsKey lazy_fsm_key = {1, 1, 1, 2, PS_KLASS_RELATION};
 	PsKey delayed_create_key = {1, 1, 5, 0, PS_KLASS_RELATION};
 	PsKey ancestry_key = {1, 1, 6, 0, PS_KLASS_RELATION};
+	PsKey invalid_marker_key = {3, 3, 333, 0, PS_KLASS_RELATION};
+	PsKey invalid_unbound_key = {3, 3, 334, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	unsigned char page[8192];
 	PsForkmetaSnapshot selected;
@@ -392,6 +656,7 @@ main(void)
 	TestForkMetaRecV2 marker;
 	PsChannel reply;
 	uint64_t first_seq = 0, second_seq = 0, ordered_seq = 0;
+	uint64_t invalid_marker_seq = 0;
 	uint64_t generation;
 	uint64_t poison_generation;
 	off_t source_after_append;
@@ -480,6 +745,29 @@ main(void)
 		ps_unlock_shard(ps_shard_of(&key));
 		ps_admission_read_unlock();
 	}
+	{
+		TestForkMetaRecV2 bad;
+
+		memset(&bad, 0, sizeof(bad));
+		bad.magic = TEST_FORK_META_V2_MAGIC;
+		bad.rec_len = sizeof(bad);
+		bad.timeline = TEST_MAX_TIMELINES;
+		bad.key = invalid_marker_key;
+		bad.lsn = 500;
+		bad.admission_seq = invalid_marker_seq = ordered_seq + 1000;
+		bad.order_id = 999;
+		bad.nblocks = 1;
+		bad.kind = TEST_FEV_SEG_GROW_BOUND;
+		check(append_source_record(source, &bad),
+			  "append invalid V2 bound marker source fixture");
+		bad.timeline = 0;
+		bad.key = invalid_unbound_key;
+		bad.admission_seq = 0;
+		bad.order_id = 999;
+		bad.kind = TEST_FEV_SEG_GROW;
+		check(append_source_record(source, &bad),
+			  "append invalid unbound marker identity fixture");
+	}
 	stale_part.data = "stale";
 	stale_part.len = 5;
 	stale_part.produce = NULL;
@@ -504,6 +792,37 @@ main(void)
 		  header.freeze_admission_seq >= ordered_seq &&
 		  header.checkpoint_records != 0 && header.tail_records != 0,
 		  "versioned payload records cutoff, counts, and freeze highwater");
+	{
+		char stale_gc[1400];
+		int fd;
+
+		n = snprintf(stale_gc, sizeof(stale_gc),
+					 "%s/forkmeta_manifest_v1.tmp.999.1", snapshots);
+		fd = n > 0 && (size_t) n < sizeof(stale_gc) ?
+			open(stale_gc, O_WRONLY | O_CREAT | O_TRUNC, 0600) : -1;
+		check(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0 &&
+			  setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0,
+			  "install stale generation and arm snapshot GC failure");
+		(void) ps_core_maintenance();
+		fd = open(stale_gc, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		check(fd >= 0 && write(fd, "x", 1) == 1 && close(fd) == 0,
+			  "restore stale generation after failed GC attempt");
+		unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC");
+		(void) ps_core_maintenance();
+		check(access(stale_gc, F_OK) == 0,
+			  "snapshot GC failure backs off the immediate maintenance tick");
+		usleep(1100000);
+		(void) ps_core_maintenance();
+		check(access(stale_gc, F_OK) != 0 && errno == ENOENT,
+			  "snapshot GC retries after its bounded backoff deadline");
+	}
+	check(snapshot_has_ordered_marker(snapshots, &page_key, ordered_seq),
+		  "snapshot records the committed ordered admission marker");
+	check(!snapshot_has_ordered_marker(snapshots, &invalid_marker_key,
+									 invalid_marker_seq),
+		  "snapshot skips invalid V2 bound marker source record");
+	check(!snapshot_has_ordered_marker(snapshots, &invalid_unbound_key, 0),
+		  "snapshot skips invalid unbound marker identity");
 	check(source_is_marker_only(store, &marker),
 		  "new source epoch initially contains only its exact marker");
 	check(marker.order_id == header.generation &&
@@ -828,6 +1147,7 @@ main(void)
 			  "child operational truncate preserves inherited pre-mutation history");
 	}
 	close_runtime();
+	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();
 	if (!failed)
 		remove_tree(store);
