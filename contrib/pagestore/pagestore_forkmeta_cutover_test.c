@@ -248,8 +248,55 @@ run_maintenance_until(const char *path, int want_exists)
 }
 
 static int
+snapshot_ordered_marker_count(const char *directory, const PsKey *key,
+								  uint64_t admission_seq, int match_seq)
+{
+	PsForkmetaSnapshot selected = {.directory_fd = -1,
+		.checkpoint_fd = -1, .tail_fd = -1};
+	int found = 0;
+
+	if (ps_forkmeta_snapshot_open(&selected, directory) != 0)
+		return 0;
+	for (unsigned int part = 0; part <= PS_FORKMETA_SNAPSHOT_TAIL; part++)
+	{
+		TestSnapshotHeader header;
+		uint64_t records;
+
+		if (ps_forkmeta_snapshot_read(&selected, part, 0, &header,
+									  sizeof(header)) != 0)
+			break;
+		records = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+			header.checkpoint_records : header.tail_records;
+		for (uint64_t i = 0; i < records; i++)
+		{
+			TestForkMetaRecV2 rec;
+
+			if (ps_forkmeta_snapshot_read(&selected, part,
+									  sizeof(header) + i * sizeof(rec), &rec,
+									  sizeof(rec)) != 0)
+				break;
+			if ((rec.kind == TEST_FEV_SEG_GROW ||
+				 rec.kind == TEST_FEV_SEG_COMMIT ||
+				 rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+				 rec.kind == TEST_FEV_SEG_COMMIT_BOUND) &&
+				(!match_seq || rec.admission_seq == admission_seq) &&
+				memcmp(&rec.key, key, sizeof(*key)) == 0)
+				found++;
+		}
+	}
+	ps_forkmeta_snapshot_close(&selected);
+	return found;
+}
+
+static int
 snapshot_has_ordered_marker(const char *directory, const PsKey *key,
 								uint64_t admission_seq)
+{
+	return snapshot_ordered_marker_count(directory, key, admission_seq, 1) != 0;
+}
+
+static int
+snapshot_has_plain_grow(const char *directory, const PsKey *key)
 {
 	PsForkmetaSnapshot selected = {.directory_fd = -1,
 		.checkpoint_fd = -1, .tail_fd = -1};
@@ -276,11 +323,7 @@ snapshot_has_ordered_marker(const char *directory, const PsKey *key,
 									  sizeof(header) + i * sizeof(rec), &rec,
 									  sizeof(rec)) != 0)
 				break;
-			if ((rec.kind == TEST_FEV_SEG_GROW ||
-				 rec.kind == TEST_FEV_SEG_COMMIT ||
-				 rec.kind == TEST_FEV_SEG_GROW_BOUND ||
-				 rec.kind == TEST_FEV_SEG_COMMIT_BOUND) &&
-				rec.admission_seq == admission_seq &&
+			if (rec.kind == TEST_FEV_GROW && rec.order_id == 0 &&
 				memcmp(&rec.key, key, sizeof(*key)) == 0)
 			{
 				found = 1;
@@ -336,15 +379,20 @@ source_is_marker_only(const char *store, TestForkMetaRecV2 *marker)
 }
 
 static int
-append_source_record(const char *path, const TestForkMetaRecV2 *record)
+append_source_bytes(const char *path, const void *data, size_t len)
 {
 	int fd = open(path, O_WRONLY | O_APPEND);
-	int ok = fd >= 0 && write(fd, record, sizeof(*record)) ==
-		(ssize_t) sizeof(*record) && fsync(fd) == 0;
+	int ok = fd >= 0 && write(fd, data, len) == (ssize_t) len && fsync(fd) == 0;
 
 	if (fd >= 0 && close(fd) != 0)
 		ok = 0;
 	return ok;
+}
+
+static int
+append_source_record(const char *path, const TestForkMetaRecV2 *record)
+{
+	return append_source_bytes(path, record, sizeof(*record));
 }
 
 static off_t
@@ -630,6 +678,78 @@ test_v1_bound_marker_snapshot(void)
 	remove_tree(store);
 }
 
+static void
+test_reclaimed_ordered_markers_pruned(void)
+{
+	char store[] = "/tmp/psforkmetamarkerpruneXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	char frontier[1200];
+	PsKey key = {6, 6, 6, 0, PS_KLASS_RELATION};
+	PsRetentionPin pin;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	int markers;
+	int n;
+
+	check(mkdtemp(store) != NULL, "create ordered-marker pruning store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build marker-pruning snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build marker-pruning manifest path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build marker-pruning frontier path");
+	flush_pages = 1;
+	compact_layers = 2;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 &&
+		  meta_request(PS_OP_CREATE, &key, 100, 0, 0, 0, NULL),
+		  "open marker-pruning fixture and create fork");
+	check(append_relation_tag(&key, 0, 50, page, 0x40, &seq) == 0,
+		  "write initial ordered growth before reviewer restart");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x40,
+		  "restart with activated marker-growth as sole durable size event");
+	for (int i = 1; i < 12; i++)
+		check(append_relation_tag(&key, 0, 50, page,
+								  (unsigned char) (0x40 + i), &seq) == 0,
+			  "write later ordered COMMIT for the same block");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = 1;
+	pin.owner_id = 88;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 200;
+	pin.admission_seq = seq;
+	check(seq != 0 && ps_retention_set(&pin) == PS_RETENTION_OK &&
+		  run_maintenance_until(frontier, 1),
+		  "compact and durably reclaim old ordered page identities");
+	check(append_growth_batch(2200, 500) &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0 &&
+		  run_maintenance_until(manifest, 1),
+		  "snapshot after ordered page-version reclamation");
+	markers = snapshot_ordered_marker_count(snapshots, &key, 0, 0);
+	check(markers > 0 && markers < 12 && snapshot_has_plain_grow(snapshots, &key),
+		  "reclaimed growth marker becomes retained ordinary GROW while markers bound");
+	close_runtime();
+	memset(page, 0, sizeof(page));
+	check(ps_core_open(store) == 0 &&
+		  read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
+		  page[128] == 0x4b &&
+		  snapshot_ordered_marker_count(snapshots, &key, 0, 0) == markers,
+		  "bounded ordered-marker snapshot restarts with latest page intact");
+	close_runtime();
+	remove_tree(store);
+	compact_layers = 0;
+}
+
 int
 main(void)
 {
@@ -647,6 +767,7 @@ main(void)
 	PsKey ancestry_key = {1, 1, 6, 0, PS_KLASS_RELATION};
 	PsKey invalid_marker_key = {3, 3, 333, 0, PS_KLASS_RELATION};
 	PsKey invalid_unbound_key = {3, 3, 334, 0, PS_KLASS_RELATION};
+	PsKey torn_tail_key = {3, 3, 335, 0, PS_KLASS_RELATION};
 	PsRetentionPin pin;
 	unsigned char page[8192];
 	PsForkmetaSnapshot selected;
@@ -1049,6 +1170,29 @@ main(void)
 		  "restart reconciles post-rename source ambiguity deterministically");
 	close_runtime();
 	{
+		TestForkMetaRecV2 valid = marker;
+		TestForkMetaRecV2 torn = marker;
+
+		valid.key = torn_tail_key;
+		valid.lsn++;
+		valid.admission_seq++;
+		valid.order_id = 0;
+		valid.nblocks = 2;
+		valid.kind = TEST_FEV_GROW;
+		torn = valid;
+		torn.lsn++;
+		torn.admission_seq++;
+		check(append_source_record(source, &valid) &&
+			  append_source_bytes(source, &torn, sizeof(torn) / 2),
+			  "append valid selected suffix followed by a torn crash tail");
+		check(ps_core_open(store) == 0 &&
+			  file_size(source) == (off_t) (2 * sizeof(TestForkMetaRecV2)) &&
+			  meta_request(PS_OP_NBLOCKS, &torn_tail_key, 0, 0, 0, 0, &reply) &&
+			  reply.result == 2,
+			  "startup retains complete selected suffix and truncates only torn tail");
+		close_runtime();
+	}
+	{
 		TestForkMetaRecV2 bad;
 
 		check(append_source_record(source, &marker),
@@ -1147,6 +1291,7 @@ main(void)
 			  "child operational truncate preserves inherited pre-mutation history");
 	}
 	close_runtime();
+	test_reclaimed_ordered_markers_pruned();
 	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();
 	if (!failed)

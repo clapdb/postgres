@@ -3585,6 +3585,7 @@ fork_meta_vec_append(ForkMetaByteVec *vec, const void *data, size_t len)
 	if (needed > vec->cap)
 	{
 		size_t cap = vec->cap ? vec->cap : 4096;
+		unsigned char *grown;
 
 		while (cap < needed)
 		{
@@ -3592,13 +3593,10 @@ fork_meta_vec_append(ForkMetaByteVec *vec, const void *data, size_t len)
 				return -1;
 			cap *= 2;
 		}
-		vec->data = realloc(vec->data, cap);
-		if (vec->data == NULL)
-		{
-			vec->cap = 0;
-			vec->len = 0;
+		grown = realloc(vec->data, cap);
+		if (grown == NULL)
 			return -1;
-		}
+		vec->data = grown;
 		vec->cap = cap;
 	}
 	memcpy(vec->data + vec->len, data, len);
@@ -3973,8 +3971,19 @@ fork_meta_snapshot_reconcile_source(void)
 			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
 			if (nread == 0)
 				break;
-			if (nread < 0 || nread != (int) sizeof(rec) ||
-				!fork_meta_selected_suffix_valid(&rec))
+			if (nread < 0)
+				goto fail;
+			if (nread != (int) sizeof(rec))
+			{
+				/* The marker and every complete suffix record are acknowledged.
+				 * Discard only the unacknowledged crash tail, matching ordinary
+				 * pre-snapshot log recovery. */
+				if (ps_storage->fork_meta_truncate == NULL ||
+					ps_storage->fork_meta_truncate(off) != 0)
+					goto fail;
+				break;
+			}
+			if (!fork_meta_selected_suffix_valid(&rec))
 				goto fail;
 			off += sizeof(rec);
 		}
@@ -4204,6 +4213,32 @@ fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
 	return 0;
 }
 
+/* A non-future ordered marker is useful only while its exact page admission
+ * remains recoverable.  Modern admissions are identified by their sequence;
+ * legacy sequence-zero SEG1/SEG3 and V1 bound records additionally rely on
+ * block and page/growth LSN.  WAL-less pages retain page LSN zero while their
+ * marker carries the fork growth floor. */
+static int
+fork_meta_snapshot_marker_page_retained(uint32_t timeline, const PsKey *key,
+										uint64_t marker_lsn,
+										uint64_t admission_seq,
+										uint32_t nblocks)
+{
+	ForkEnt *fork = fork_find(timeline, key);
+	uint32_t block;
+
+	if (fork == NULL || nblocks == 0)
+		return 0;
+	block = nblocks - 1;
+	for (PageEnt *page = fork->pages; page != NULL; page = page->fork_next)
+		if (page->block == block)
+			for (int i = 0; i < page->nver; i++)
+				if (page->vers[i].admission_seq == admission_seq &&
+					(page->vers[i].lsn == marker_lsn || page->vers[i].lsn == 0))
+					return 1;
+	return 0;
+}
+
 static int
 fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 										ForkMetaByteVec *tail,
@@ -4227,6 +4262,11 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
 				return -1;
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
+				(fork_meta_event_future(rec.lsn, rec.admission_seq,
+										cutoff.lsn, cutoff.admission_seq) ||
+				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+														 rec.lsn, rec.admission_seq,
+														 rec.nblocks)) &&
 				!fork_meta_snapshot_marker_present(&rec))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
@@ -4277,6 +4317,10 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 				  idrec.lsn != 0 && idrec.pad[0] == 0 && idrec.pad[1] == 0 &&
 				  idrec.pad[2] == 0)) &&
 				fork_meta_ordered_marker_valid(&rec, 1) &&
+				(fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
+										cutoff.admission_seq) ||
+				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+														 rec.lsn, 0, rec.nblocks)) &&
 				!fork_meta_snapshot_marker_present(&rec))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
@@ -4317,8 +4361,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				int planned;
 
 				for (uint32_t i = 0; i < e->nev; i++)
-					if (e->ev[i].kind <= FEV_DEAD &&
-						e->ev[i].marker_kind == 0)
+					if (e->ev[i].kind <= FEV_DEAD)
 						nitems++;
 				events = nitems == 0 ? NULL :
 					malloc((size_t) nitems * sizeof(*events));
@@ -4328,8 +4371,7 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				if ((nitems != 0 && (!events || !indices)) || !keep)
 					goto fail_entry;
 				for (uint32_t i = 0, j = 0; i < e->nev; i++)
-					if (e->ev[i].kind <= FEV_DEAD &&
-						e->ev[i].marker_kind == 0)
+					if (e->ev[i].kind <= FEV_DEAD)
 					{
 						events[j].lsn = e->ev[i].lsn;
 						events[j].admission_seq = e->ev[i].admission_seq;
@@ -4389,7 +4431,10 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					uint8_t kind;
 					uint64_t order_id;
 
-					if (event->marker_kind != 0)
+					if (event->marker_kind != 0 &&
+						(future || fork_meta_snapshot_marker_page_retained(
+							e->timeline, &e->key, event->lsn,
+							event->admission_seq, event->nblocks)))
 					{
 						kind = event->marker_kind;
 						order_id = event->order_id;
