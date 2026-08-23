@@ -287,6 +287,19 @@ test('pagestore_walidx_snapshot',
   timeout: 30,
 )
 
+# Crash-atomic single-stream fork-metadata checkpoint and captured-tail
+# publication.  This foundation is deliberately independent of the runtime
+# fork-metadata append path.
+pagestore_forkmeta_snapshot_test = executable('pagestore_forkmeta_snapshot_test',
+  files('pagestore_forkmeta_snapshot_test.c', 'pagestore_forkmeta_snapshot.c'),
+  install: false,
+)
+test('pagestore_forkmeta_snapshot',
+  pagestore_forkmeta_snapshot_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the scan-resistant materialized-page cache (no daemon, no PG).
 pagestore_pgcache_test = executable('pagestore_pgcache_test',
   files('pagestore_pgcache_test.c', 'pagestore_pgcache.c'),

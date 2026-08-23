@@ -451,9 +451,13 @@ Status: **foundation slice landed; R4b implementation remains incomplete**.
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
 fail-closed input contract.  Meson and standalone CI run this planner directly.
-Storage checkpoint/tail format, append cutover, frontier publication,
-maintenance integration, restart/crash recovery, and physical reclamation are
-not implemented by this slice.
+A durable POSIX checkpoint/captured-tail format foundation now also exists: a
+single selected generation is discovered through a checksummed manifest, with
+immutable checkpoint and tail files, staged prepare/commit, exact tuple fences,
+bounded reads, recovery, and conservative GC.  This is format and publication
+infrastructure only; append cutover, frontier publication, core replay
+integration, crash-recovery orchestration, maintenance integration, and
+physical reclamation remain incomplete.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
