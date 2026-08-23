@@ -33,6 +33,28 @@ read_is(uint32_t timeline, const char *expected, uint32_t len)
 		memcmp(buf, expected, len) == 0;
 }
 
+static int
+fork_read_is(const char *expected, uint32_t len)
+{
+	char buf[64];
+
+	memset(buf, 0, sizeof(buf));
+	return len <= sizeof(buf) &&
+		PsStoragePosix.fork_meta_read(0, buf, sizeof(buf)) == (int) len &&
+		memcmp(buf, expected, len) == 0;
+}
+
+static int
+segment_read_is(uint32_t shard, int segment, const char *expected, uint32_t len)
+{
+	char buf[64];
+
+	memset(buf, 0, sizeof(buf));
+	return len <= sizeof(buf) &&
+		PsStoragePosix.seg_read(shard, segment, 0, buf, len) == 0 &&
+		memcmp(buf, expected, len) == 0;
+}
+
 int
 main(void)
 {
@@ -101,7 +123,43 @@ main(void)
 		  "reopen reconciles the visible replacement before new appends");
 	PsStoragePosix.close();
 
+	check(setenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
+		PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.fork_meta_append("old", 3) == 0 &&
+		PsStoragePosix.fork_meta_rewrite("new", 3) != 0,
+		"forkmeta rewrite failure before rename preserves the old log");
+	check(fork_read_is("old", 3), "forkmeta old epoch remains readable");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.fork_meta_rewrite("new", 3) == 0 &&
+		fork_read_is("new", 3),
+		"forkmeta rewrite publishes a bounded replacement");
+	PsStoragePosix.close();
+
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.seg_write(0, 0, 0, "zero", 4) == 0 &&
+		PsStoragePosix.seg_write(2, 3, 0, "shard-two", 9) == 0,
+		"populate per-shard segment fd caches");
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		segment_read_is(0, 0, "zero", 4) &&
+		segment_read_is(2, 3, "shard-two", 9),
+		"open-again abandons and rebuilds stale segment fd caches");
+	PsStoragePosix.close();
+	for (int reopen = 0; reopen < 3; reopen++)
+	{
+		check(PsStoragePosix.open(directory, 0) == 0 &&
+			segment_read_is(0, 0, "zero", 4) &&
+			segment_read_is(2, 3, "shard-two", 9),
+			"repeated storage close/reopen rebuilds segment fd caches");
+		PsStoragePosix.close();
+	}
+
 	snprintf(temporary, sizeof(temporary), "%s/wal_7", directory);
+	unlink(temporary);
+	snprintf(temporary, sizeof(temporary), "%s/seg_00000000", directory);
+	unlink(temporary);
+	snprintf(temporary, sizeof(temporary), "%s/seg_2_00000003", directory);
 	unlink(temporary);
 	rmdir(directory);
 	printf("storage_posix_wal_test: %d checks, %d failed\n", run, failed);
