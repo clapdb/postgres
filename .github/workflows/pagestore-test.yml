@@ -86,6 +86,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_prune_test pagestore_walidx_prune_test.c pagestore_walidx_prune.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_prune_test pagestore_forkmeta_prune_test.c pagestore_forkmeta_prune.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_snapshot_test pagestore_walidx_snapshot_test.c pagestore_walidx_snapshot.c -lrt
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_snapshot_test pagestore_forkmeta_snapshot_test.c pagestore_forkmeta_snapshot.c -lrt
           cc -O2 -Wall -Wextra -Werror -o storage_posix_wal_test storage_posix_wal_test.c storage_posix.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
 
@@ -137,6 +138,10 @@ jobs:
       - name: Run WAL-index snapshot publication unit test
         working-directory: contrib/pagestore
         run: ./pagestore_walidx_snapshot_test
+
+      - name: Run fork-metadata checkpoint snapshot unit test
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_snapshot_test
 
       - name: Run WAL-index prune planning unit test
         working-directory: contrib/pagestore
