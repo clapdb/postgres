@@ -7,3 +7,7 @@ PAGESTORE_FAULT_POINT(PAGE_COMPACTION_AFTER_PUBLISH, "page_compaction.after_publ
 PAGESTORE_FAULT_POINT(PAGE_GC_AFTER_MARK_DELETE, "page_gc.after_mark_delete", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(PAGE_PRUNE_AFTER_FRONTIER, "page_prune.after_frontier", "store", "process_abort", "crash", 1, 0)
 PAGESTORE_FAULT_POINT(WAL_INDEX_AFTER_FRONTIER, "wal_index.after_frontier", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_PREPARE, "forkmeta.after_prepare", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_MANIFEST_COMMIT, "forkmeta.after_manifest_commit", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SOURCE_REWRITE, "forkmeta.after_source_rewrite", "store", "process_abort", "crash", 1, 0)
+PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SNAPSHOT_GC, "forkmeta.after_snapshot_gc", "store", "process_abort", "crash", 1, 0)

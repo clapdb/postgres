@@ -64,6 +64,18 @@ extern void ps_admission_read_lock(void);
 extern void ps_admission_read_unlock(void);
 extern uint64_t ps_admission_barrier(void);
 
+/* Test-only observability for deterministic admission/cutover overlap.  The
+ * cutover callback runs immediately before forkmeta maintenance attempts
+ * admission-wr; the admission callback runs after a test operation acquires
+ * admission-rd.  Neither callback may call back into the core.  Production
+ * frontends never install them. */
+typedef void (*PsForkmetaCutoverTestHook)(void *arg);
+typedef void (*PsAdmissionReadTestHook)(void *arg);
+extern void ps_test_set_forkmeta_cutover_hook(
+	PsForkmetaCutoverTestHook hook, void *arg);
+extern void ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook,
+	void *arg);
+
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
 

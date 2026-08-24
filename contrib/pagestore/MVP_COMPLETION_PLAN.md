@@ -446,7 +446,7 @@ Expected scope: one or two PRs.
 
 ### R4b. Compact and reclaim fork metadata
 
-Status: **runtime implementation landed; crash-matrix PR remains incomplete**.
+Status: **runtime implementation and the focused POSIX crash-matrix first slice are implemented; the full R4b acceptance matrix remains incomplete**.
 
 The pure forkmeta keep-planner and exhaustive unit/property coverage now define
 the event visibility, exact-fence base retention, legacy sequence handling, and
@@ -465,8 +465,13 @@ snapshot payload records the exact cutoff and frozen admission highwater.
 Startup treats the selected snapshot as authoritative over an old epoch, while
 preserving a matching marker's complete post-cutover suffix.  Ambiguous
 manifest publication or source rewrite poisons the runtime until restart.  The
-complete concurrent/crash boundary matrix and full R4b acceptance gate remain
-incomplete and belong to the follow-up crash test PR.
+first crash-matrix slice now covers real child-process aborts at durable
+prepare, manifest-commit, source-rewrite, and completed snapshot-generation GC
+boundaries. It reopens each store in a fresh parent, checks the exact named
+fault report and exit 88, and covers deterministic concurrent append overlap
+plus four configured POSIX shards. This work does not claim coverage of every
+internal unlink/fsync instruction, SPDK hardware, or the remaining composed H1
+crash scenarios; the full R4b acceptance gate remains incomplete.
 
 The shared append-only `forkmeta` stream reconstructs historical relation
 existence and size, so it is retained with page history rather than treated as
