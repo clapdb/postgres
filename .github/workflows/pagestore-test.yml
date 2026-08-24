@@ -80,6 +80,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_layer_store_test pagestore_layer_store_test.c pagestore_layer_store.c pagestore_layer.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_tiering_test pagestore_tiering_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_cutover_test pagestore_forkmeta_cutover_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_crash_matrix_test pagestore_forkmeta_crash_matrix_test.c pagestore_core.c pagestore_fault.c storage_posix.c pagestore_layer.c pagestore_layer_store.c pagestore_manifest.c pagestore_memtable.c pagestore_pgcache.c pagestore_prune.c pagestore_retention.c pagestore_wal_store.c pagestore_wal_segment.c pagestore_walidx_prune.c pagestore_walidx_snapshot.c pagestore_forkmeta_prune.c pagestore_forkmeta_snapshot.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_pgcache_test pagestore_pgcache_test.c pagestore_pgcache.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_manifest_test pagestore_manifest_test.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_retention_test pagestore_retention_test.c pagestore_retention.c -lrt -lpthread
@@ -143,6 +144,10 @@ jobs:
       - name: Run forkmeta runtime cutover smoke
         working-directory: contrib/pagestore
         run: ./pagestore_forkmeta_cutover_test
+
+      - name: Run forkmeta POSIX process-crash matrix
+        working-directory: contrib/pagestore
+        run: ./pagestore_forkmeta_crash_matrix_test
 
       - name: Run fork-metadata checkpoint snapshot unit test
         working-directory: contrib/pagestore

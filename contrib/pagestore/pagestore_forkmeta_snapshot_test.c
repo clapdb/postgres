@@ -518,7 +518,9 @@ main(void)
 					 sizeof(path)) == 0,
 		  "create GC fsync retry fixture");
 	check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
-		  ps_forkmeta_snapshot_gc(directory) != 0 && access(path, F_OK) != 0,
+		  ps_forkmeta_snapshot_gc(directory) ==
+		  PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS &&
+		  access(path, F_OK) != 0,
 		  "GC fsync fault leaves an empty unlink retry");
 	check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0 &&
 		  ps_forkmeta_snapshot_gc(directory) == 0,

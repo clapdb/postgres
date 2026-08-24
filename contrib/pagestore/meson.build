@@ -175,7 +175,7 @@ test('pagestore_tiering',
 )
 
 # Runtime forkmeta cutover/reopen smoke.  This deliberately exercises the
-# normal frontier-gated path; the complete process-crash matrix is a follow-up.
+# normal frontier-gated path; the process-crash boundaries are tested below.
 pagestore_forkmeta_cutover_test = executable('pagestore_forkmeta_cutover_test',
   files('pagestore_forkmeta_cutover_test.c', 'pagestore_core.c',
         'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
@@ -192,6 +192,27 @@ test('pagestore_forkmeta_cutover',
   pagestore_forkmeta_cutover_test,
   suite: ['pagestore'],
   timeout: 60,
+)
+
+# Focused POSIX process-crash matrix for runtime forkmeta cutover.  The shared
+# core probes are also safe for the optional SPDK frontend; this filesystem
+# matrix itself intentionally runs only with the POSIX storage implementation.
+pagestore_forkmeta_crash_matrix_test = executable('pagestore_forkmeta_crash_matrix_test',
+  files('pagestore_forkmeta_crash_matrix_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_forkmeta_crash_matrix',
+  pagestore_forkmeta_crash_matrix_test,
+  suite: ['pagestore'],
+  timeout: 120,
 )
 
 # Unit test for the durable layer manifest replay (no daemon, no PG).

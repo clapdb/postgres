@@ -157,6 +157,12 @@ uint32_t	ps_nshards = 1;
 static uint64_t next_segment_order_id = 1;
 static uint64_t next_admission_seq = 1;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
+static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
+static void *forkmeta_cutover_test_hook_arg;
+static PsAdmissionReadTestHook admission_read_test_hook;
+static void *admission_read_test_hook_arg;
+static PsAdmissionWriteLockTestHook admission_write_lock_test_hook;
+static void *admission_write_lock_test_hook_arg;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -232,12 +238,45 @@ void
 ps_admission_read_lock(void)
 {
 	pthread_rwlock_rdlock(&admission_lock);
+	if (admission_read_test_hook != NULL)
+		admission_read_test_hook(admission_read_test_hook_arg);
 }
 
 void
 ps_admission_read_unlock(void)
 {
 	pthread_rwlock_unlock(&admission_lock);
+}
+
+void
+ps_test_set_forkmeta_cutover_hook(PsForkmetaCutoverTestHook hook, void *arg)
+{
+	forkmeta_cutover_test_hook = hook;
+	forkmeta_cutover_test_hook_arg = arg;
+}
+
+void
+ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook, void *arg)
+{
+	admission_read_test_hook = hook;
+	admission_read_test_hook_arg = arg;
+}
+
+void
+ps_test_set_admission_write_lock_hook(PsAdmissionWriteLockTestHook hook,
+									  void *arg)
+{
+	admission_write_lock_test_hook = hook;
+	admission_write_lock_test_hook_arg = arg;
+}
+
+static int
+admission_write_lock(void)
+{
+	if (admission_write_lock_test_hook != NULL)
+		return admission_write_lock_test_hook(&admission_lock,
+										  admission_write_lock_test_hook_arg);
+	return pthread_rwlock_wrlock(&admission_lock);
 }
 
 uint64_t
@@ -3557,8 +3596,17 @@ static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migratio
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 static uint64_t fork_meta_snapshot_bytes;
 static int fork_meta_snapshot_gc_pending;
+/* A failed directory fsync after unlink leaves the next successful empty GC
+ * as the operation that closes the durability ambiguity. */
+static int fork_meta_snapshot_gc_ambiguous;
 static struct timespec fork_meta_snapshot_retry_at;
 static char fork_meta_snapshot_dir[4096];
+
+void
+ps_test_forkmeta_snapshot_gc_retry_now(void)
+{
+	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
+}
 
 typedef struct ForkMetaByteVec
 {
@@ -4581,12 +4629,20 @@ fork_meta_snapshot_maintenance(void)
 
 		if (gc >= 0)
 		{
+			/* The unlink set and its directory fsync are complete.  A crash
+			 * here must reopen the selected generation with no dependence on
+			 * the retired generation. */
+			if (gc > 0 || fork_meta_snapshot_gc_ambiguous)
+				(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_SNAPSHOT_GC);
 			fork_meta_snapshot_gc_pending = 0;
+			fork_meta_snapshot_gc_ambiguous = 0;
 			memset(&fork_meta_snapshot_retry_at, 0,
 				   sizeof(fork_meta_snapshot_retry_at));
 		}
 		if (gc < 0)
 		{
+			if (gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS)
+				fork_meta_snapshot_gc_ambiguous = 1;
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
 			fork_meta_snapshot_retry_at.tv_sec++;
 			return 0;
@@ -4656,11 +4712,17 @@ fork_meta_snapshot_maintenance(void)
 								 generation, cutoff.lsn, cutoff.admission_seq,
 								 &cp, &tl) != 0)
 		goto retry_done;
+	/* Prepare has fsynced both immutable parts and the durable intent.  The
+	 * manifest is still the selected authority at this boundary. */
+	(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_PREPARE);
 	if (ps_forkmeta_snapshot_commit(&prepared) != 0)
 	{
 		fork_meta_poisoned_store(1);
 		goto done;
 	}
+	/* The manifest replacement and its directory fsync are durable.  The
+	 * source epoch still names the pre-cutover log at this point. */
+	(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_MANIFEST_COMMIT);
 	/* The manifest is now authoritative.  Any failure here poisons mutation;
 	 * continuing to append to the old epoch would make source identity unknown. */
 	if (ps_storage->fork_meta_rewrite == NULL ||
@@ -4669,6 +4731,9 @@ fork_meta_snapshot_maintenance(void)
 		fork_meta_poisoned_store(1);
 		goto done;
 	}
+	/* fork_meta_rewrite returns only after the replacement file and containing
+	 * directory have been fsynced. */
+	(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_SOURCE_REWRITE);
 	fork_meta_bytes_store(source.len);
 	fork_meta_snapshot_generation = generation;
 	fork_meta_snapshot_cutoff_lsn = cutoff.lsn;
@@ -10268,7 +10333,10 @@ ps_core_maintenance(void)
 		/* The cutover is a single run-to-completion operation.  Admission write
 		 * drains acknowledged writers, then shard locks precede page/wal-index
 		 * fences in the existing shard-to-page ordering. */
-		pthread_rwlock_wrlock(&admission_lock);
+		if (forkmeta_cutover_test_hook != NULL)
+			forkmeta_cutover_test_hook(forkmeta_cutover_test_hook_arg);
+		if (admission_write_lock() != 0)
+			return 0;
 		for (uint32_t sh = 0; sh < core_shards(); sh++)
 			ps_lock_shard_wr(sh);
 		pthread_rwlock_wrlock(&page_prune_lock);
@@ -10491,6 +10559,7 @@ ps_core_open(const char *store_dir)
 	fork_meta_snapshot_freeze_seq = 0;
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
+	fork_meta_snapshot_gc_ambiguous = 0;
 	memset(&fork_meta_snapshot_retry_at, 0,
 		   sizeof(fork_meta_snapshot_retry_at));
 	fork_meta_migrating = 0;
