@@ -23,7 +23,15 @@
 #define MATRIX_SHARDS 4
 #define MATRIX_KEYS 24
 #define TEST_FORK_META_V2_MAGIC UINT32_C(0x324d4b46)
+#define TEST_MAX_TIMELINES 1024
 #define TEST_FEV_SNAPSHOT_BASE 10
+#define TEST_FEV_GROW 0
+#define TEST_FEV_SET 1
+#define TEST_FEV_DEAD 2
+#define TEST_FEV_SEG_GROW 5
+#define TEST_FEV_SEG_COMMIT 6
+#define TEST_FEV_SEG_GROW_BOUND 7
+#define TEST_FEV_SEG_COMMIT_BOUND 8
 #define ACK_CAPACITY 16
 
 typedef enum CrashCase
@@ -55,7 +63,9 @@ typedef struct ConcurrentAppend
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
 	int admission_entered;
-	int cutover_started;
+	int write_lock_path_entered;
+	int write_lock_path_returned;
+	int release_writer;
 	int operation_acknowledged;
 	int operation_failed;
 	struct AckLedger *ledger;
@@ -218,13 +228,19 @@ append_anchor_page(const PsKey *key, uint64_t lsn, unsigned char tag,
 	int rc;
 
 	memset(page, 0, sizeof(page));
+	{
+		uint32_t hi = (uint32_t) (lsn >> 32);
+		uint32_t lo = (uint32_t) lsn;
+
+		memcpy(page, &hi, sizeof(hi));
+		memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	}
 	page[128] = tag;
 	ps_admission_read_lock();
 	ps_lock_shard_wr(shard);
 	rc = append_page(0, key, 0, page, 0, seq_out);
 	ps_unlock_shard(shard);
 	ps_admission_read_unlock();
-	(void) lsn;
 	return rc == 0;
 }
 
@@ -662,6 +678,100 @@ source_epoch_valid(const char *store, uint64_t generation, int require_marker)
 }
 
 static int
+source_epoch_matches_selected(const char *store, const char *snapshots,
+							 uint64_t expected_generation)
+{
+	PsForkmetaSnapshot selected = {
+		.directory_fd = -1, .checkpoint_fd = -1, .tail_fd = -1
+	};
+	TestForkMetaRecV2 rec;
+	PsKey zero_key;
+	char path[1600];
+	struct stat st;
+	uint64_t offset;
+	int fd = -1;
+	int ok = 0;
+
+	memset(&zero_key, 0, sizeof(zero_key));
+	if (ps_forkmeta_snapshot_open(&selected, snapshots) != 0 ||
+		selected.generation != expected_generation ||
+		snprintf(path, sizeof(path), "%s/forkmeta", store) < 0 ||
+		stat(path, &st) != 0 || st.st_size < (off_t) sizeof(rec) ||
+		st.st_size % (off_t) sizeof(rec) != 0)
+		goto done;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0 || pread(fd, &rec, sizeof(rec), 0) != (ssize_t) sizeof(rec) ||
+		rec.magic != TEST_FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec) ||
+		rec.timeline != 0 || memcmp(&rec.key, &zero_key, sizeof(zero_key)) != 0 ||
+		rec.lsn != selected.cutoff_lsn ||
+		rec.admission_seq != selected.cutoff_admission_seq ||
+		rec.order_id != selected.generation || rec.nblocks != 0 ||
+		rec.kind != TEST_FEV_SNAPSHOT_BASE || rec.pad[0] != 0 ||
+		rec.pad[1] != 0 || rec.pad[2] != 0)
+		goto done;
+	for (offset = sizeof(rec); offset < (uint64_t) st.st_size;
+			offset += sizeof(rec))
+	{
+		int ordered_marker;
+		int ordered_marker_valid = 0;
+
+		if (pread(fd, &rec, sizeof(rec), (off_t) offset) != (ssize_t) sizeof(rec) ||
+			rec.magic != TEST_FORK_META_V2_MAGIC || rec.rec_len != sizeof(rec) ||
+			rec.timeline >= TEST_MAX_TIMELINES ||
+			rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
+			rec.admission_seq == 0 || rec.pad[0] != 0 || rec.pad[1] != 0 ||
+			rec.pad[2] != 0 ||
+			!(rec.lsn > selected.cutoff_lsn ||
+			 (rec.lsn == selected.cutoff_lsn &&
+			  rec.admission_seq > selected.cutoff_admission_seq)))
+			goto done;
+		ordered_marker = rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+			rec.kind == TEST_FEV_SEG_COMMIT_BOUND;
+		if (ordered_marker)
+		{
+			ordered_marker_valid =
+				rec.timeline < TEST_MAX_TIMELINES &&
+				rec.key.klass <= PS_KLASS_READER_SNAPSHOT &&
+				rec.nblocks != 0 &&
+				rec.order_id != 0 && rec.admission_seq != 0;
+			if (!ordered_marker_valid)
+				goto done;
+		}
+		/* Keep this branch in lockstep with fork_meta_selected_suffix_valid()
+		 * and fork_meta_ordered_marker_valid() in pagestore_core.c.  In
+		 * particular, only bound ordered markers are accepted in a selected
+		 * suffix; ordinary records may not carry an order id. */
+		switch (rec.kind)
+		{
+			case TEST_FEV_GROW:
+				if (rec.order_id != 0 || rec.nblocks == 0)
+					goto done;
+				break;
+			case TEST_FEV_SET:
+				if (rec.order_id != 0)
+					goto done;
+				break;
+			case TEST_FEV_DEAD:
+				if (rec.order_id != 0 || rec.nblocks != 0)
+					goto done;
+				break;
+			case TEST_FEV_SEG_GROW_BOUND:
+			case TEST_FEV_SEG_COMMIT_BOUND:
+				break;
+			default:
+				goto done;
+		}
+	}
+	ok = 1;
+
+done:
+	if (fd >= 0)
+		(void) close(fd);
+	ps_forkmeta_snapshot_close(&selected);
+	return ok;
+}
+
+static int
 record_ack(AckLedger *ledger, uint32_t key_index, uint32_t nblocks)
 {
 	uint32_t index = __atomic_load_n(&ledger->count, __ATOMIC_RELAXED);
@@ -685,27 +795,76 @@ admission_read_hook(void *arg)
 	{
 		append->admission_entered = 1;
 		(void) pthread_cond_broadcast(&append->cond);
-		/* Keep this operation inside the admission lifecycle until maintenance
-		 * has started competing for the freeze.  Returning releases rd and lets
-		 * the operation finish and publish its explicit acknowledgment. */
-		while (!append->cutover_started && !append->operation_failed)
+		/* Keep the writer inside admission-rd until a separate coordinator has
+		 * observed maintenance enter its real blocking wrlock path. */
+		while (!append->release_writer && !append->operation_failed)
 			(void) pthread_cond_wait(&append->cond, &append->mutex);
 	}
 	(void) pthread_mutex_unlock(&append->mutex);
 }
 
-/* Runs in the maintenance thread immediately before it attempts admission-wr. */
-static void
-cutover_started_hook(void *arg)
+/* This is installed as the exact admission-wr call made by maintenance.  It
+ * records entry and then immediately calls the real blocking primitive; the
+ * coordinator releases the held admission-rd only after this path is entered. */
+static int
+admission_write_lock_hook(pthread_rwlock_t *lock, void *arg)
+{
+	ConcurrentAppend *append = arg;
+	int try_rc;
+	int rc;
+
+	/* This probe is inside the exact replacement for maintenance's wrlock,
+	 * not a second observer.  EBUSY proves that this same path encountered the
+	 * admitted writer before publishing the handshake below. */
+	try_rc = pthread_rwlock_trywrlock(lock);
+	if (try_rc != EBUSY)
+	{
+		if (try_rc == 0)
+			(void) pthread_rwlock_unlock(lock);
+		(void) pthread_mutex_lock(&append->mutex);
+		append->operation_failed = 1;
+		append->release_writer = 1;
+		(void) pthread_cond_broadcast(&append->cond);
+		(void) pthread_mutex_unlock(&append->mutex);
+		return try_rc == 0 ? EBUSY : try_rc;
+	}
+	(void) pthread_mutex_lock(&append->mutex);
+	append->write_lock_path_entered = 1;
+	__atomic_store_n(&append->ledger->overlap_observed, 1, __ATOMIC_RELEASE);
+	(void) pthread_cond_broadcast(&append->cond);
+	(void) pthread_mutex_unlock(&append->mutex);
+
+	rc = pthread_rwlock_wrlock(lock);
+	(void) pthread_mutex_lock(&append->mutex);
+	append->write_lock_path_returned = 1;
+	if (rc != 0)
+		append->operation_failed = 1;
+	(void) pthread_cond_broadcast(&append->cond);
+	(void) pthread_mutex_unlock(&append->mutex);
+	return rc;
+}
+
+/* The coordinator is the only test participant allowed to release the
+ * admitted writer.  It waits until maintenance has entered the exact
+ * replacement for its blocking wrlock, then lets the worker finish and waits
+ * for its explicit durable-operation ack. */
+static void *
+admission_coordinator(void *arg)
 {
 	ConcurrentAppend *append = arg;
 
 	(void) pthread_mutex_lock(&append->mutex);
-	append->cutover_started = 1;
-	(void) pthread_cond_broadcast(&append->cond);
-	while (!append->operation_acknowledged && !append->operation_failed)
+	while (!append->write_lock_path_entered && !append->operation_failed)
 		(void) pthread_cond_wait(&append->cond, &append->mutex);
+	if (append->write_lock_path_entered)
+	{
+		append->release_writer = 1;
+		(void) pthread_cond_broadcast(&append->cond);
+		while (!append->operation_acknowledged && !append->operation_failed)
+			(void) pthread_cond_wait(&append->cond, &append->mutex);
+	}
 	(void) pthread_mutex_unlock(&append->mutex);
+	return NULL;
 }
 
 static void *
@@ -719,8 +878,6 @@ concurrent_appender(void *arg)
 	if (append->ok)
 	{
 		append->operation_acknowledged = 1;
-		__atomic_store_n(&append->ledger->overlap_observed, 1,
-						 __ATOMIC_RELEASE);
 	}
 	else
 		append->operation_failed = 1;
@@ -737,7 +894,9 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 	char snapshots[1600];
 	ConcurrentAppend appender;
 	pthread_t thread;
+	pthread_t coordinator;
 	int thread_started = 0;
+	int coordinator_started = 0;
 
 	if (!configure_fault(store, fault_dir, case_fault_name(which)) ||
 		ps_core_open(store) != 0 || !populate_store(store, keys))
@@ -762,17 +921,25 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 		for (unsigned int i = 0; i < MATRIX_KEYS; i++)
 			if (!grow_key(&keys[i], 2, 600 + i))
 				_exit(2);
-		/* Generation 1 leaves GC pending.  Add the next acknowledged suffix
-		 * before the next maintenance tick so that the GC and generation-2
-		 * publication can make progress without a retry-time sleep. */
-		if (!drive_until_generation(store, 2) || !arm_fault(fault_dir))
+		/* Generation 1 leaves GC pending.  Publish generation 2, then make the
+		 * first GC attempt unlink generation 1 but fail its directory fsync.
+		 * The next empty retry must fsync again and is the completion boundary
+		 * covered by the named crash probe. */
+		if (!drive_until_generation(store, 2) ||
+			setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) != 0)
 		{
 			uint64_t observed = 0;
 			(void) selected_generation(store, &observed);
-			dprintf(STDERR_FILENO, "child gen2/arm failed observed=%llu\n",
+			dprintf(STDERR_FILENO, "child gen2/gc fault setup failed observed=%llu\n",
 					(unsigned long long) observed);
 			_exit(2);
 		}
+		(void) ps_core_maintenance();
+		if (unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != 0)
+			_exit(2);
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		if (!arm_fault(fault_dir))
+			_exit(2);
 		(void) ps_core_maintenance();
 		_exit(3);
 	}
@@ -785,10 +952,14 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 			pthread_cond_init(&appender.cond, NULL) != 0)
 			_exit(2);
 		ps_test_set_admission_read_hook(admission_read_hook, &appender);
-		ps_test_set_forkmeta_cutover_hook(cutover_started_hook, &appender);
+		ps_test_set_admission_write_lock_hook(admission_write_lock_hook,
+										  &appender);
 		if (pthread_create(&thread, NULL, concurrent_appender, &appender) != 0)
 			_exit(2);
 		thread_started = 1;
+		if (pthread_create(&coordinator, NULL, admission_coordinator, &appender) != 0)
+			_exit(2);
+		coordinator_started = 1;
 		(void) pthread_mutex_lock(&appender.mutex);
 		while (!appender.admission_entered && !appender.operation_failed)
 			(void) pthread_cond_wait(&appender.cond, &appender.mutex);
@@ -809,8 +980,10 @@ run_crashing_child(CrashCase which, const char *store, const char *fault_dir,
 	if (thread_started)
 	{
 		(void) pthread_join(thread, NULL);
+		if (coordinator_started)
+			(void) pthread_join(coordinator, NULL);
 		ps_test_set_admission_read_hook(NULL, NULL);
-		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		ps_test_set_admission_write_lock_hook(NULL, NULL);
 	}
 	dprintf(STDERR_FILENO, "child maintenance returned case=%s\n", case_fault_name(which));
 	_exit(3);
@@ -927,22 +1100,32 @@ verify_recovered(const char *store, CrashCase which, PsKey keys[MATRIX_KEYS],
 		check(meta_request(PS_OP_EXISTS, &keys[i], 0, 0, &reply) &&
 			  reply.result == 1,
 			  "cross-shard relation existence survives restart");
-		if (!meta_request(PS_OP_NBLOCKS, &keys[i], 0, 0, &reply) ||
-			reply.result < 1)
 		{
-			dprintf(STDERR_FILENO, "size failure case=%d key=%u shard=%u status=%u result=%u\n",
-					(int) which, i, ps_shard_of(&keys[i]), reply.status, reply.result);
-			check(0, "cross-shard relation size does not roll back");
+			uint32_t expected_nblocks = which == CASE_AFTER_SNAPSHOT_GC ? 2 : 1;
+
+			if (!meta_request(PS_OP_NBLOCKS, &keys[i], 0, 0, &reply) ||
+				(which == CASE_AFTER_SNAPSHOT_GC ?
+				 reply.result != expected_nblocks : reply.result < expected_nblocks))
+			{
+				dprintf(STDERR_FILENO, "size failure case=%d key=%u shard=%u status=%u result=%u expected=%u\n",
+						(int) which, i, ps_shard_of(&keys[i]), reply.status,
+						reply.result, expected_nblocks);
+				check(0, which == CASE_AFTER_SNAPSHOT_GC ?
+					  "GC recovery restores every grown relation at exactly two blocks" :
+					  "cross-shard relation size does not roll back");
+			}
+			else
+				check(1, which == CASE_AFTER_SNAPSHOT_GC ?
+					  "GC recovery restores every grown relation at exactly two blocks" :
+					  "cross-shard relation size does not roll back");
 		}
-		else
-			check(1, "cross-shard relation size does not roll back");
 	}
 	if (which == CASE_AFTER_SOURCE_REWRITE)
 	{
 		uint32_t ack_count = __atomic_load_n(&ledger->count, __ATOMIC_ACQUIRE);
 
 		check(__atomic_load_n(&ledger->overlap_observed, __ATOMIC_ACQUIRE) == 1,
-			  "append was admitted while cutover had deterministically started");
+			  "maintenance entered the real blocking wrlock behind admitted writer");
 		check(ack_count != 0 && ack_count <= ACK_CAPACITY,
 			  "concurrent appender recorded every acknowledged append");
 		for (uint32_t i = 0; i < ack_count && i < ACK_CAPACITY; i++)
@@ -968,6 +1151,7 @@ run_case(CrashCase which)
 {
 	char store[] = "/tmp/psforkmetacrashXXXXXX";
 	char fault_dir[1600];
+	char snapshots[1600];
 	PsKey keys[MATRIX_KEYS];
 	PreRecoveryEvidence evidence;
 	AckLedger *ledger = MAP_FAILED;
@@ -1009,6 +1193,12 @@ run_case(CrashCase which)
 		 * process.  The parent never inherits an open core from the child. */
 		check(find_matrix_keys(keys),
 			  "matrix key discovery initializes 24 unique keys across four shards");
+		if (which == CASE_AFTER_SOURCE_REWRITE)
+			check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots",
+					   store) >= 0 &&
+				  source_epoch_matches_selected(store, snapshots,
+									 evidence.selected_generation),
+				  "source marker and future suffix match selected generation before reopen");
 		/* Repeated maintenance needed to create two snapshot generations can
 		 * independently publish a page-prune layer whose recovery belongs to the
 		 * R2 crash matrix.  Keep this focused GC-retirement case on the POSIX

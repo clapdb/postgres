@@ -142,6 +142,7 @@ extern int ps_forkmeta_snapshot_read_tail(
  * durable-prepared generations.  Every call fsyncs the directory, including
  * an empty retry after an ambiguous prior unlink fsync. */
 extern int ps_forkmeta_snapshot_gc(const char *directory);
+#define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
 /* Release the stable part descriptors and directory descriptor. */
 extern void ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot);
 

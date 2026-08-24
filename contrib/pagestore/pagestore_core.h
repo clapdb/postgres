@@ -19,6 +19,7 @@
 #ifndef PAGESTORE_CORE_H
 #define PAGESTORE_CORE_H
 
+#include <pthread.h>
 #include <stdint.h>
 
 #include "pagestore_ipc.h"
@@ -65,16 +66,24 @@ extern void ps_admission_read_unlock(void);
 extern uint64_t ps_admission_barrier(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
- * cutover callback runs immediately before forkmeta maintenance attempts
- * admission-wr; the admission callback runs after a test operation acquires
- * admission-rd.  Neither callback may call back into the core.  Production
- * frontends never install them. */
+ * admission callback runs after a test operation acquires admission-rd.
+ * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 typedef void (*PsAdmissionReadTestHook)(void *arg);
+/* Test-only replacement for the exact blocking admission-wr call.  The
+ * production path invokes pthread_rwlock_wrlock directly; when installed,
+ * the hook is called in its place and must call pthread_rwlock_wrlock(lock)
+ * itself.  This lets a test observe entry to the real blocking call without
+ * adding a separate try-lock probe to production maintenance. */
+typedef int (*PsAdmissionWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
 extern void ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook,
 	void *arg);
+extern void ps_test_set_admission_write_lock_hook(
+	PsAdmissionWriteLockTestHook hook, void *arg);
+/* Test-only scheduling seam for a pending forkmeta snapshot GC retry. */
+extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
 
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);

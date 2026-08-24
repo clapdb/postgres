@@ -1539,11 +1539,17 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != NULL)
 	{
 		errno = EIO;
+		if (removed)
+			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 		goto cleanup;
 	}
 	/* Always sync: an empty retry closes an ambiguous prior unlink fsync. */
 	if (fsync(current.directory_fd) != 0)
+	{
 		unlink_failed = 1;
+		if (removed)
+			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+	}
 	if (!unlink_failed)
 		rc = removed ? 1 : 0;
 
