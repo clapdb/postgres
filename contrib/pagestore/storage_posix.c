@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "pagestore_storage.h"
+#include "pagestore_wal_store.h"
 
 /* bounded well under the 4096-byte path buffers so suffixes never truncate */
 static char posix_dir[2048];
@@ -1215,6 +1216,480 @@ cleanup:
 	return rc;
 }
 
+static int
+posix_all_digits(const char *begin, const char *end)
+{
+	if (begin == end)
+		return 0;
+	for (const char *p = begin; p < end; p++)
+		if (*p < '0' || *p > '9')
+			return 0;
+	return 1;
+}
+
+static int
+posix_alnum6(const char *name)
+{
+	for (int i = 0; i < 6; i++)
+		if (!((name[i] >= '0' && name[i] <= '9') ||
+			  (name[i] >= 'A' && name[i] <= 'Z') ||
+			  (name[i] >= 'a' && name[i] <= 'z')))
+			return 0;
+	return name[6] == '\0';
+}
+
+static int
+posix_timeline_walidx_entry(uint32_t tl, const char *name)
+{
+	char prefix[64];
+	char canonical[160];
+	char watermark[192];
+	const char *p;
+	char *end;
+	unsigned long shard;
+	unsigned long long epoch;
+	int n;
+
+	n = snprintf(prefix, sizeof(prefix), "walidx_%u_", tl);
+	if (n < 0 || (size_t) n >= sizeof(prefix) ||
+		strncmp(name, prefix, (size_t) n) != 0)
+		return 0;
+	p = name + n;
+	errno = 0;
+	shard = strtoul(p, &end, 10);
+	if (errno != 0 || end == p || shard > UINT32_MAX ||
+		!posix_all_digits(p, end))
+		return -1;
+	if (*end == '\0')
+	{
+		if (posix_walidx_name(tl, (uint32_t) shard, 0,
+						  canonical, sizeof(canonical)) != 0 ||
+			strcmp(name, canonical) != 0)
+			return -1;
+		return 1;
+	}
+	if (strncmp(end, "_e", 2) != 0)
+		return -1;
+	p = end + 2;
+	if (strlen(p) < 20 || !posix_all_digits(p, p + 20))
+		return -1;
+	errno = 0;
+	epoch = strtoull(p, &end, 10);
+	if (errno != 0 || epoch == 0 || end != p + 20)
+		return -1;
+	if (*end == '\0' || (strcmp(end, ".size") == 0))
+	{
+		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
+						  canonical, sizeof(canonical)) != 0)
+			return -1;
+		if (strcmp(name, canonical) == 0)
+			return 1;
+		if (posix_walidx_watermark_name(canonical, watermark,
+							 sizeof(watermark)) != 0)
+			return -1;
+		return strcmp(name, watermark) == 0 ? 1 : -1;
+	}
+	/* Exact generated watermark temporary: <canonical>.size.tmp.<pid>.<try>. */
+	if (strncmp(end, ".size.tmp.", 10) == 0)
+	{
+		const char *q = end + 10;
+		const char *dot = strchr(q, '.');
+		size_t base_len;
+
+		if (dot == NULL || !posix_all_digits(q, dot) ||
+			!posix_all_digits(dot + 1, name + strlen(name)) ||
+			dot == q || dot[1] == '\0')
+			return -1;
+		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
+						  canonical, sizeof(canonical)) != 0)
+			return -1;
+		base_len = (size_t) (end - name);
+		if (strlen(canonical) != base_len ||
+			memcmp(name, canonical, base_len) != 0)
+			return -1;
+		return 1;
+	}
+	return -1;
+}
+
+static int
+posix_wal_store_entry(uint32_t tl, const char *name)
+{
+	char prefix[64];
+	char canonical[160];
+	const char *p;
+	char *end;
+	unsigned long long segment;
+	int n;
+
+	if (strcmp(name, PS_WAL_STORE_IDENTITY_FILE) == 0)
+		return 1;
+	if (strncmp(name, PS_WAL_STORE_IDENTITY_FILE ".tmp.",
+			   strlen(PS_WAL_STORE_IDENTITY_FILE ".tmp.")) == 0)
+		return posix_alnum6(name + strlen(PS_WAL_STORE_IDENTITY_FILE ".tmp.")) ? 1 : -1;
+	n = snprintf(prefix, sizeof(prefix), "walv1_%u_", tl);
+	if (n < 0 || (size_t) n >= sizeof(prefix) ||
+		strncmp(name, prefix, (size_t) n) != 0)
+		return 0;
+	p = name + n;
+	if (strlen(p) < 20 || !posix_all_digits(p, p + 20))
+		return -1;
+	errno = 0;
+	segment = strtoull(p, &end, 10);
+	if (errno != 0 || end != p + 20 || segment == UINT64_MAX)
+		return -1;
+	n = snprintf(canonical, sizeof(canonical), "walv1_%u_%020llu", tl,
+				 (unsigned long long) segment);
+	if (n < 0 || (size_t) n >= sizeof(canonical))
+		return -1;
+	if (strcmp(name, canonical) == 0)
+		return 1;
+	if (strncmp(end, ".tmp.", 5) == 0 && posix_alnum6(end + 5))
+		return 1;
+	return -1;
+}
+
+static int
+posix_snapshot_entry(const char *name)
+{
+	const char *p;
+	char *end;
+	unsigned long long generation;
+	unsigned long shard;
+
+	if (strcmp(name, "walidx_manifest_v1") == 0 ||
+		strcmp(name, "walidx_prepared_v1") == 0)
+		return 1;
+	if (strncmp(name, "walidx_manifest_v1.tmp.", 23) == 0)
+	{
+		const char *dot;
+
+		p = name + 23;
+		if (strlen(p) < 20 || !posix_all_digits(p, p + 20))
+			return -1;
+		errno = 0;
+		generation = strtoull(p, &end, 10);
+		if (errno != 0 || generation == 0 || end != p + 20 || *end++ != '.')
+			return -1;
+		p = end;
+		dot = strchr(p, '.');
+		if (dot == NULL || !posix_all_digits(p, dot) ||
+			!posix_all_digits(dot + 1, name + strlen(name)))
+			return -1;
+		return 1;
+	}
+	if (strncmp(name, "walidx_prepared_v1.tmp.", 23) == 0)
+	{
+		const char *dot;
+
+		p = name + 23;
+		dot = strchr(p, '.');
+		if (dot == NULL || !posix_all_digits(p, dot) ||
+			!posix_all_digits(dot + 1, name + strlen(name)))
+			return -1;
+		return 1;
+	}
+	if (strncmp(name, "walidxg1_", 9) != 0)
+		return -1;
+	p = name + 9;
+	if (strlen(p) < 24 || !posix_all_digits(p, p + 20) || p[20] != '_')
+		return -1;
+	errno = 0;
+	generation = strtoull(p, &end, 10);
+	if (errno != 0 || generation == 0 || end != p + 20)
+		return -1;
+	p = end + 1;
+	if (!posix_all_digits(p, p + 3))
+		return -1;
+	errno = 0;
+	shard = strtoul(p, &end, 10);
+	if (errno != 0 || shard >= 128 || end != p + 3)
+		return -1;
+	if (*end == '\0')
+		return 1;
+	if (strncmp(end, ".tmp.", 5) != 0)
+		return -1;
+	p = end + 5;
+	{
+		const char *dot = strchr(p, '.');
+
+		return dot != NULL && posix_all_digits(p, dot) &&
+			posix_all_digits(dot + 1, name + strlen(name)) ? 1 : -1;
+	}
+}
+
+static int
+posix_validate_entry(int directory_fd, const char *name, int recognized)
+{
+	struct stat st;
+
+	if (recognized <= 0 || fstatat(directory_fd, name, &st,
+							AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode))
+		return -1;
+	return 0;
+}
+
+static int
+posix_validate_private_dir(int root_fd, const char *name, uint32_t tl,
+						   int wal_store)
+{
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int dir_fd = -1;
+	int scan_fd = -1;
+	int rc = -1;
+
+	dir_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (dir_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto done;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int recognized;
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0)
+			continue;
+		recognized = wal_store ? posix_wal_store_entry(tl, entry->d_name) :
+			posix_snapshot_entry(entry->d_name);
+		if (posix_validate_entry(dir_fd, entry->d_name, recognized) != 0)
+		{
+			fprintf(stderr, "pagestore: refusing timeline WAL cleanup for %s/%s\n",
+					name, entry->d_name);
+			goto done;
+		}
+	}
+	if (errno != 0)
+		goto done;
+	rc = 0;
+done:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	close(dir_fd);
+	return rc;
+}
+
+static int
+posix_remove_private_dir(int root_fd, const char *name, uint32_t tl,
+						 int wal_store)
+{
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int dir_fd = -1;
+	int scan_fd = -1;
+	int removed = 0;
+	int rc = -1;
+
+	dir_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (dir_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	scan_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto done;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int recognized = (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0) ? 1 :
+			wal_store ? posix_wal_store_entry(tl, entry->d_name) :
+			posix_snapshot_entry(entry->d_name);
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (posix_validate_entry(dir_fd, entry->d_name, recognized) != 0 ||
+			(unlinkat(dir_fd, entry->d_name, 0) != 0 && errno != ENOENT))
+			goto done;
+		removed = 1;
+	}
+	if (errno != 0 || fsync(dir_fd) != 0 || closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto done;
+	}
+	dir = NULL;
+	if (close(dir_fd) != 0)
+	{
+		dir_fd = -1;
+		goto done;
+	}
+	dir_fd = -1;
+	if (unlinkat(root_fd, name, AT_REMOVEDIR) != 0 && errno != ENOENT)
+		goto done;
+	if (fsync(root_fd) != 0)
+		goto done;
+	(void) removed;
+	rc = 1;
+done:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	if (dir_fd >= 0)
+		close(dir_fd);
+	return rc;
+}
+
+static int
+posix_timeline_root_entry(uint32_t tl, const char *name,
+						  const char *wal_name,
+						  const char *wal_rewrite_name,
+						  const char *walidx_prefix)
+{
+	if (strcmp(name, wal_name) == 0 || strcmp(name, wal_rewrite_name) == 0)
+		return 1;
+	if (strncmp(name, wal_name, strlen(wal_name)) == 0 &&
+		name[strlen(wal_name)] == '.')
+		return -1;
+	if (strncmp(name, walidx_prefix, strlen(walidx_prefix)) == 0)
+		return posix_timeline_walidx_entry(tl, name);
+	return 0;
+}
+
+static int
+posix_timeline_wal_cleanup(uint32_t tl)
+{
+	char wal_name[64];
+	char wal_rewrite_name[96];
+	char walidx_prefix[64];
+	char wal_store[64];
+	char snapshots[64];
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int root_fd = -1;
+	int scan_fd = -1;
+	int removed = 0;
+	int rc = -1;
+
+	if (tl == 0 || tl == UINT32_MAX ||
+		snprintf(wal_name, sizeof(wal_name), "wal_%u", tl) < 0 ||
+		snprintf(wal_rewrite_name, sizeof(wal_rewrite_name),
+				 "wal_%u.rewrite.tmp", tl) < 0 ||
+		snprintf(walidx_prefix, sizeof(walidx_prefix), "walidx_%u_", tl) < 0 ||
+		snprintf(wal_store, sizeof(wal_store), "wal_segments_%u", tl) < 0 ||
+		snprintf(snapshots, sizeof(snapshots), "walidx_snapshots_%u", tl) < 0)
+		return -1;
+	root_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (root_fd < 0)
+		return -1;
+	if (posix_validate_private_dir(root_fd, wal_store, tl + 1, 1) < 0 ||
+		posix_validate_private_dir(root_fd, snapshots, tl, 0) < 0)
+		goto done;
+	/* Validate the complete shared-root target set before unlinking any entry.
+	 * This keeps an unexpected target-shaped artifact fail-closed without
+	 * partially deleting otherwise valid target files. */
+	scan_fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto done;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int recognized;
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0)
+			continue;
+		recognized = posix_timeline_root_entry(tl, entry->d_name,
+										 wal_name, wal_rewrite_name,
+										 walidx_prefix);
+		if (recognized < 0)
+		{
+			fprintf(stderr, "pagestore: refusing timeline WAL cleanup for %s\n",
+					entry->d_name);
+			goto done;
+		}
+		if (recognized != 0 &&
+			posix_validate_entry(root_fd, entry->d_name, recognized) != 0)
+			goto done;
+	}
+	if (errno != 0 || closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto done;
+	}
+	dir = NULL;
+	/* Re-scan after complete validation and remove only exact target entries. */
+	scan_fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto done;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int target = posix_timeline_root_entry(tl, entry->d_name,
+									   wal_name, wal_rewrite_name,
+									   walidx_prefix);
+
+		if (target < 0)
+			goto done;
+		if (target && unlinkat(root_fd, entry->d_name, 0) != 0 && errno != ENOENT)
+			goto done;
+		removed |= target;
+	}
+	if (errno != 0 || closedir(dir) != 0 || (removed && fsync(root_fd) != 0))
+	{
+		dir = NULL;
+		goto done;
+	}
+	dir = NULL;
+	if (getenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_AFTER_ROOT") != NULL)
+	{
+		errno = EIO;
+		goto done;
+	}
+	if (posix_remove_private_dir(root_fd, wal_store, tl + 1, 1) < 0 ||
+		posix_remove_private_dir(root_fd, snapshots, tl, 0) < 0)
+		goto done;
+	/* Revalidate after deletion.  Internal publishers are drained by the core;
+	 * this final pass also refuses a target-shaped entry introduced by an
+	 * unsupported concurrent external writer instead of declaring completion. */
+	scan_fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto done;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int target = posix_timeline_root_entry(tl, entry->d_name,
+									   wal_name, wal_rewrite_name,
+									   walidx_prefix);
+
+		if (strcmp(entry->d_name, wal_store) == 0 ||
+			strcmp(entry->d_name, snapshots) == 0)
+			target = 1;
+		if (target != 0)
+			goto done;
+	}
+	if (errno != 0 || closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto done;
+	}
+	dir = NULL;
+	/* Always sync on a successful retry.  If an earlier unlink/rmdir became
+	 * visible but its directory fsync reported an ambiguous failure, an empty
+	 * target set is the operation that closes that durability ambiguity. */
+	if (fsync(root_fd) != 0)
+		goto done;
+	rc = 0;
+done:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	if (root_fd >= 0)
+		close(root_fd);
+	return rc;
+}
+
 /*
  * Truncate fd back to old_size on an error path.  Best-effort: the caller
  * is already returning an error and cannot act on a rollback failure; the
@@ -1606,6 +2081,7 @@ const PsStorage PsStoragePosix = {
 	.walidx_truncate = posix_walidx_truncate,
 	.walidx_epoch_create = posix_walidx_epoch_create,
 	.walidx_epoch_gc = posix_walidx_epoch_gc,
+	.timeline_wal_cleanup = posix_timeline_wal_cleanup,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,
 	.meta_truncate = posix_meta_truncate,
