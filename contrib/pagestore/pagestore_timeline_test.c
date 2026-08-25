@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,8 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_layer_store.h"
+#include "pagestore_manifest.h"
 #include "pagestore_retention.h"
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
@@ -66,6 +69,80 @@ enum TimelineAppendMode
 	TIMELINE_APPEND_AMBIGUOUS
 };
 static enum TimelineAppendMode timeline_append_mode;
+static PsLayerStore maintenance_store;
+static uint32_t watched_maintenance_timeline;
+static int watched_uploads;
+static int watched_remote_verifications;
+
+static int
+counted_upload(const PsLayerDesc *layer)
+{
+	if (layer->timeline == watched_maintenance_timeline)
+		watched_uploads++;
+	return PsLayerStoreLocal.upload_layer(layer);
+}
+
+static int
+counted_verify(const PsLayerDesc *layer)
+{
+	if (layer->timeline == watched_maintenance_timeline)
+		watched_remote_verifications++;
+	return PsLayerStoreLocal.verify_remote_layer(layer);
+}
+
+static void
+install_maintenance_counter(void)
+{
+	maintenance_store = PsLayerStoreLocal;
+	maintenance_store.upload_layer = counted_upload;
+	maintenance_store.verify_remote_layer = counted_verify;
+	ps_layer_store = &maintenance_store;
+}
+
+static uint32_t
+timeline_layer_count(uint32_t timeline)
+{
+	uint32_t count = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+			count++;
+	ps_unlock_map();
+	return count;
+}
+
+static int
+snapshot_timeline_layer(uint32_t timeline, PsLayerDesc *out)
+{
+	int found = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+		{
+			if (out != NULL)
+				*out = ps_layer_map.layers[i];
+			found = 1;
+			break;
+		}
+	ps_unlock_map();
+	return found;
+}
+
+static int
+write_timeline_layer(uint32_t timeline)
+{
+	unsigned char page[8192];
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int rc;
+
+	memset(page, 0x5A, sizeof(page));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, 0, page, 0, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
 
 static int
 test_meta_append(const void *buf, uint32_t len)
@@ -260,6 +337,15 @@ typedef struct LockObserver
 	int release;
 } LockObserver;
 
+typedef struct InterruptibleWriter
+{
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	volatile sig_atomic_t stop;
+	int done;
+	int rc;
+} InterruptibleWriter;
+
 static void
 observer_init(LockObserver *observer)
 {
@@ -313,6 +399,91 @@ observe_writer_queued(void *arg)
 	observer->entered = 1;
 	pthread_cond_broadcast(&observer->cond);
 	pthread_mutex_unlock(&observer->mutex);
+}
+
+static void *
+interruptible_writer_main(void *arg)
+{
+	InterruptibleWriter *writer = arg;
+	int rc = ps_lifecycle_write_lock_interruptible(&writer->stop);
+
+	if (rc == 0)
+		ps_lifecycle_write_unlock();
+	pthread_mutex_lock(&writer->mutex);
+	writer->rc = rc;
+	writer->done = 1;
+	pthread_cond_broadcast(&writer->cond);
+	pthread_mutex_unlock(&writer->mutex);
+	return NULL;
+}
+
+static int
+test_interruptible_lifecycle_writer(uint32_t timeline)
+{
+	AdmissionReader reader;
+	LockObserver observer;
+	InterruptibleWriter writer;
+	pthread_t reader_thread;
+	pthread_t writer_thread;
+	int ok = 0;
+
+	memset(&reader, 0, sizeof(reader));
+	memset(&writer, 0, sizeof(writer));
+	observer_init(&observer);
+	pthread_mutex_init(&reader.mutex, NULL);
+	pthread_cond_init(&reader.cond, NULL);
+	pthread_mutex_init(&writer.mutex, NULL);
+	pthread_cond_init(&writer.cond, NULL);
+	reader.timeline = timeline;
+	if (pthread_create(&reader_thread, NULL, lifecycle_reader_main, &reader) != 0)
+		goto out;
+	pthread_mutex_lock(&reader.mutex);
+	while (!reader.ready)
+		pthread_cond_wait(&reader.cond, &reader.mutex);
+	pthread_mutex_unlock(&reader.mutex);
+	ps_test_set_lifecycle_write_queued_hook(observe_writer_queued, &observer);
+	if (pthread_create(&writer_thread, NULL, interruptible_writer_main, &writer) != 0)
+	{
+		pthread_mutex_lock(&reader.mutex);
+		reader.release = 1;
+		pthread_cond_broadcast(&reader.cond);
+		pthread_mutex_unlock(&reader.mutex);
+		pthread_join(reader_thread, NULL);
+		goto clear_hook;
+	}
+	observer_wait(&observer, 0);
+	writer.stop = 1;
+	pthread_mutex_lock(&writer.mutex);
+	while (!writer.done)
+		pthread_cond_wait(&writer.cond, &writer.mutex);
+	pthread_mutex_unlock(&writer.mutex);
+	pthread_join(writer_thread, NULL);
+	check(writer.rc == ECANCELED,
+		  "stop-aware lifecycle writer withdraws from the queued writer set");
+	pthread_mutex_lock(&reader.mutex);
+	reader.release = 1;
+	pthread_cond_broadcast(&reader.cond);
+	pthread_mutex_unlock(&reader.mutex);
+	pthread_join(reader_thread, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	check(ps_lifecycle_write_lock() == 0,
+		  "a canceled lifecycle writer leaves the normal writer path usable");
+	ps_lifecycle_write_unlock();
+	ps_lifecycle_read_lock();
+	ps_lifecycle_read_unlock();
+	ok = 1;
+	goto out;
+
+clear_hook:
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+out:
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	pthread_cond_destroy(&writer.cond);
+	pthread_mutex_destroy(&writer.mutex);
+	pthread_cond_destroy(&reader.cond);
+	pthread_mutex_destroy(&reader.mutex);
+	observer_destroy(&observer);
+	return ok;
 }
 
 typedef struct DeleteThread
@@ -985,6 +1156,8 @@ test_v2_and_mixed_lifecycle(void)
 			  state == PS_TIMELINE_DELETING && incarnation == 1,
 			  "ambiguous append replays the durable deleting event");
 	check(create_branch(14, 0, 320), "create lifecycle drain test timeline");
+	check(test_interruptible_lifecycle_writer(14),
+		  "SIGTERM-aware BEGIN_DELETE writer exits before shutdown joins");
 	check(test_lifecycle_drain(14),
 		  "BEGIN_DELETE drains ordinary lifecycle readers and queues fairly");
 	check(state_of(14, &state, NULL) && state == PS_TIMELINE_DELETING,

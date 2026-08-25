@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -360,16 +361,55 @@ ps_lifecycle_read_cancel_reservation(void)
 }
 
 static int
-lifecycle_write_lock(void)
+lifecycle_write_lock_interruptible(const volatile sig_atomic_t *stop_flag)
 {
 	int rc;
 
 	pthread_mutex_lock(&lifecycle_turnstile);
+	if (stop_flag != NULL && *stop_flag)
+	{
+		pthread_mutex_unlock(&lifecycle_turnstile);
+		return ECANCELED;
+	}
 	lifecycle_waiting_writers++;
 	if (lifecycle_write_queued_test_hook != NULL)
 		lifecycle_write_queued_test_hook(lifecycle_write_queued_test_hook_arg);
 	while (lifecycle_writer_active || lifecycle_active_readers != 0)
-		pthread_cond_wait(&lifecycle_turnstile_cond, &lifecycle_turnstile);
+	{
+		struct timespec deadline;
+
+		if (stop_flag != NULL && *stop_flag)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return ECANCELED;
+		}
+		/* A signal handler only stores stop_requested.  The waiter notices it
+		 * without requiring the handler to touch a pthread mutex or condvar. */
+		if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return errno;
+		}
+		deadline.tv_nsec += 10000000L; /* 10ms stop-aware polling bound */
+		if (deadline.tv_nsec >= 1000000000L)
+		{
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000000000L;
+		}
+		rc = pthread_cond_timedwait(&lifecycle_turnstile_cond,
+										&lifecycle_turnstile, &deadline);
+		if (rc != 0 && rc != ETIMEDOUT)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return rc;
+		}
+	}
 	lifecycle_waiting_writers--;
 	lifecycle_writer_active = 1;
 	pthread_mutex_unlock(&lifecycle_turnstile);
@@ -389,10 +429,22 @@ lifecycle_write_lock(void)
 	return rc;
 }
 
+static int
+lifecycle_write_lock(void)
+{
+	return lifecycle_write_lock_interruptible(NULL);
+}
+
 int
 ps_lifecycle_write_lock(void)
 {
 	return lifecycle_write_lock();
+}
+
+int
+ps_lifecycle_write_lock_interruptible(const volatile sig_atomic_t *stop_flag)
+{
+	return lifecycle_write_lock_interruptible(stop_flag);
 }
 
 void
@@ -1148,7 +1200,8 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == layer_id &&
-			ps_layer_map.layers[i].deleting)
+			ps_layer_map.layers[i].deleting &&
+			ps_timeline_live(ps_layer_map.layers[i].timeline))
 		{
 			layer = &ps_layer_map.layers[i];
 			break;
@@ -1203,6 +1256,7 @@ gc_remote_one(void)
 		uint32_t i = (gc_remote_map_cursor + pass) % ps_layer_map.nlayers;
 		{
 			if (ps_layer_map.layers[i].deleting &&
+				ps_timeline_live(ps_layer_map.layers[i].timeline) &&
 				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
 				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			{
@@ -1441,6 +1495,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	uint64_t	frontier_seq;
 	int			rc = -1;
 
+	if (!ps_timeline_live(timeline))
+		return 0;
 	if (nold == 0)
 		return 0;				/* nothing worth merging */
 
@@ -1461,7 +1517,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting &&
 			d->timeline == timeline &&
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
@@ -1696,7 +1753,8 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting &&
 			d->timeline == timeline && layer_shard_from_id(d->layer_id) == shard)
 		{
 			PsLayerDesc *nlayers_ptr;
@@ -7340,8 +7398,8 @@ walidx_snapshot_publish_one(void)
 		uint32_t tl = (walidx_snapshot_cursor + step) % MAX_TIMELINES;
 		struct timespec retry_at = walidx_snapshot_retry_at[tl];
 
-		if ((tl == 0 || timelines[tl].defined) &&
-			(now.tv_sec > retry_at.tv_sec ||
+			if (ps_timeline_live(tl) &&
+				(now.tv_sec > retry_at.tv_sec ||
 			 (now.tv_sec == retry_at.tv_sec && now.tv_nsec >= retry_at.tv_nsec)) &&
 			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
 							 __ATOMIC_ACQUIRE) &&
@@ -7385,6 +7443,14 @@ walidx_snapshot_publish_one(void)
 
 	pthread_rwlock_rdlock(&walidx_prune_lock);
 	ps_lock_map_rd();
+	/* The first scan is a scheduling hint.  Recheck the timeline state while
+	 * holding map-rd before any snapshot publication is prepared. */
+	if (!ps_timeline_live((uint32_t) candidate))
+	{
+		ps_unlock_map();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		return 0;
+	}
 	walidx_publish_wrlock();
 	{
 		uint32_t tl = (uint32_t) candidate;
@@ -7586,12 +7652,13 @@ walidx_snapshot_gc_one(void)
 	struct timespec now;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	ps_lock_map_rd();
 	for (uint32_t step = 0; step < MAX_TIMELINES; step++)
 	{
 		uint32_t tl = (walidx_snapshot_gc_cursor + step) % MAX_TIMELINES;
 		struct timespec retry = walidx_snapshot_gc_retry_at[tl];
 
-		if (walidx_snapshot_gc_pending[tl] &&
+		if (ps_timeline_live(tl) && walidx_snapshot_gc_pending[tl] &&
 			(now.tv_sec > retry.tv_sec ||
 			 (now.tv_sec == retry.tv_sec && now.tv_nsec >= retry.tv_nsec)))
 		{
@@ -7600,6 +7667,7 @@ walidx_snapshot_gc_one(void)
 			break;
 		}
 	}
+	ps_unlock_map();
 	if (candidate < 0)
 		return 0;
 	if (walidx_snapshot_path((uint32_t) candidate, directory,
@@ -10639,7 +10707,8 @@ finish_upload(const PsLayerDesc *candidate)
 			current = &ps_layer_map.layers[i];
 			break;
 		}
-	if (current == NULL || current->deleting)
+	if (current == NULL || current->deleting ||
+		!ps_timeline_live(current->timeline))
 	{
 		ps_unlock_map();
 		return 1;
@@ -10755,7 +10824,8 @@ tier_one_layer(void)
 		{
 			PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-			if (!layer->deleting && !layer->remote_durable &&
+			if (ps_timeline_live(layer->timeline) && !layer->deleting &&
+				!layer->remote_durable &&
 				tier_local_location(layer) != NULL &&
 				layer_shard_from_id(layer->layer_id) == shard &&
 				(tier_remote_location(layer) == NULL ||
@@ -10803,7 +10873,8 @@ finish_evict(const PsLayerDesc *candidate)
 		{
 			PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
+				if (!ps_timeline_live(layer->timeline) || layer->deleting ||
+					!layer->remote_durable || layer->local_pinned ||
 				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
 				(!layer->local_cleanup_pending &&
 				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
@@ -10903,7 +10974,8 @@ evict_one_layer(void)
 		uint32_t	i = (evict_local_map_cursor + pass) % map_nlayers;
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
+			if (ps_timeline_live(layer->timeline) && !layer->deleting &&
+				layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
 			(layer->local_cleanup_pending ||
 			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
@@ -11048,7 +11120,7 @@ ps_core_maintenance_impl(void)
 	ps_lock_map_rd();
 	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
 		for (uint32_t sh = 0; sh < ns; sh++)
-			if ((tl == 0 || timelines[tl].defined) &&
+			if (ps_timeline_live(tl) &&
 				(count_image_layers(tl, sh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(tl, sh) > 0)))
@@ -11083,7 +11155,8 @@ ps_core_maintenance_impl(void)
 				ps_lock_shard_wr(fsh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
-			if ((count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
+				if (ps_timeline_live(ftl) &&
+					(count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[ftl][fsh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(ftl, fsh) > 0)) &&
 				retention_effective_floor_internal(ftl,

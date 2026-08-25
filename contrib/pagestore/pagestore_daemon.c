@@ -418,8 +418,8 @@ run_request(PsChannel *ch)
 	{
 		/* lifecycle-wr drains every complete POSIX request, including ordinary
 		 * reads and reserve operations, before admission/map state changes. */
-		if (ps_lifecycle_write_lock() != 0)
-			ch->status = PS_STATUS_ERROR;
+			if (ps_lifecycle_write_lock_interruptible(&stop_requested) != 0)
+				ch->status = PS_STATUS_ERROR;
 		else if (ps_admission_write_lock() == 0)
 		{
 			ps_lock_map_wr();

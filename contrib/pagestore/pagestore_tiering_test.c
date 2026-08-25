@@ -228,13 +228,24 @@ check(int cond, const char *msg)
 	}
 }
 
-static PsLayerDesc *
-find_layer(uint64_t id)
+/* finish_upload() publishes descriptor fields under map-wr.  Copy the
+ * descriptor under map-rd before observing it after a maintenance tick. */
+static int
+snapshot_layer(uint64_t id, PsLayerDesc *out)
 {
+	int found = 0;
+
+	ps_lock_map_rd();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == id)
-			return &ps_layer_map.layers[i];
-	return NULL;
+		{
+			if (out != NULL)
+				*out = ps_layer_map.layers[i];
+			found = 1;
+			break;
+		}
+	ps_unlock_map();
+	return found;
 }
 
 static int
@@ -269,10 +280,7 @@ static void
 run_maintenance_ticks(int nticks)
 {
 	for (int i = 0; i < nticks; i++)
-	{
 		ps_core_maintenance();
-		usleep(1000);
-	}
 }
 
 static int
@@ -289,7 +297,6 @@ wait_local_evicted(uint64_t layer_id)
 		if (ps_layer_store->layer_exists_local(layer_id) == 0)
 			return 1;
 		ps_core_maintenance();
-		usleep(1000);
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		if (now.tv_sec > deadline.tv_sec ||
 			(now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
@@ -307,10 +314,11 @@ main(void)
 	PsKey		key = {1, 1, 1, 0, PS_KLASS_RELATION};
 	uint32_t	lsn_hi = 0, lsn_lo = 100;
 	uint64_t	layer_id;
-	PsLayerDesc *layer;
+	PsLayerDesc snapshot;
+	PsLayerDesc current;
+	PsLayerDesc replayed;
 	const PsLayerLocation *remote;
 	char		remote_uri[PS_LAYER_URI_MAX];
-	struct timespec deadline;
 
 	if (mkdtemp(store) == NULL || mkdtemp(objects) == NULL ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0)
@@ -337,40 +345,32 @@ main(void)
 	check(append_page(0, &key, 0, page, 0, NULL) == 0,
 		  "write and flush an image layer");
 	ps_unlock_shard(ps_shard_of(&key));
+	ps_lock_map_rd();
 	check(ps_layer_map.nlayers == 1, "flush created one layer");
+	if (ps_layer_map.nlayers == 1)
+		snapshot = ps_layer_map.layers[0];
+	ps_unlock_map();
 	check(test_async_upload_lifecycle_gate(),
 		  "idle maintenance worker is covered by lifecycle drain");
 	check(ps_core_maintenance() == 1,
 		  "publish the completed lifecycle-gated upload");
 	check(ps_core_maintenance() == 1,
 		  "run startup page-prune maintenance before eviction checks");
-	clock_gettime(CLOCK_MONOTONIC, &deadline);
-	deadline.tv_sec += 5;
-	for (;;)
-	{
-		struct timespec now;
-
-		layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
-		if (layer != NULL && layer->remote_durable)
-			break;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (now.tv_sec > deadline.tv_sec ||
-			(now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
-			break;
-		ps_core_maintenance();
-		usleep(1000);
-	}
-	layer = ps_layer_map.nlayers == 1 ? &ps_layer_map.layers[0] : NULL;
-	layer_id = layer ? layer->layer_id : 0;
-	check(layer != NULL && layer->remote_durable &&
-		  ps_layer_store->layer_exists_remote(layer) == 1,
+	/* The preceding tick joins the worker after its map-wr publication.  This is
+	 * the deterministic publication barrier; no polling or unlocked snapshot is
+	 * needed to establish remote_durable. */
+	check(snapshot_layer(snapshot.layer_id, &snapshot),
+		  "snapshot the uploaded layer under map-rd");
+	layer_id = snapshot.layer_id;
+	check(snapshot.remote_durable &&
+		  ps_layer_store->layer_exists_remote(&snapshot) == 1,
 		  "uploaded layer is durably recorded and present remotely");
 	remote = NULL;
 	remote_uri[0] = '\0';
-	for (uint32_t i = 0; layer != NULL && i < layer->location_count; i++)
-		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
-			layer->locations[i].available)
-			remote = &layer->locations[i];
+	for (uint32_t i = 0; i < snapshot.location_count; i++)
+		if (snapshot.locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+			snapshot.locations[i].available)
+			remote = &snapshot.locations[i];
 	if (remote != NULL)
 	{
 		int		n = snprintf(remote_uri, sizeof(remote_uri), "%s", remote->uri);
@@ -384,35 +384,34 @@ main(void)
 		  "corrupt the remote layer object");
 	check(ps_core_maintenance() == 1, "start remote verification for eviction");
 	run_maintenance_ticks(100);
-	check(layer->locations[0].available &&
-		  ps_layer_store->layer_exists_local(layer->layer_id) == 1,
+	check(snapshot_layer(layer_id, &current) && current.locations[0].available &&
+		  ps_layer_store->layer_exists_local(layer_id) == 1,
 		  "remote corruption prevents local layer eviction");
 	check(remote != NULL && unlink(remote_uri) == 0 &&
-		  ps_layer_store->upload_layer(layer) == 0,
+		  ps_layer_store->upload_layer(&snapshot) == 0,
 		  "restore the remote layer object from the verified local copy");
 	check(corrupt_image_index_byte(remote_uri) == 0,
 		  "corrupt the remote layer index");
 	check(ps_core_maintenance() == 1, "start remote index verification for eviction");
 	run_maintenance_ticks(100);
-	check(layer->locations[0].available &&
-		  ps_layer_store->layer_exists_local(layer->layer_id) == 1,
+	check(snapshot_layer(layer_id, &current) && current.locations[0].available &&
+		  ps_layer_store->layer_exists_local(layer_id) == 1,
 		  "remote index corruption prevents local layer eviction");
 	check(remote != NULL && unlink(remote_uri) == 0 &&
-		  ps_layer_store->upload_layer(layer) == 0,
+		  ps_layer_store->upload_layer(&snapshot) == 0,
 		  "restore the remote layer object after index corruption");
-	check(wait_local_evicted(layer->layer_id) &&
-		  !layer->locations[0].available,
+	check(wait_local_evicted(layer_id) && snapshot_layer(layer_id, &current) &&
+		  !current.locations[0].available,
 		  "next idle pass evicts the remote-durable local layer");
 	ps_core_close();
 	ps_layer_store->close();
 	check(ps_layer_store->open(store) == 0 && ps_manifest_open(store) == 0 &&
 		  ps_manifest_replay(&ps_layer_map) == 0,
 		  "replay a remote-only layer after restart");
-	layer = find_layer(layer_id);
-	check(layer != NULL && !layer->locations[0].available &&
-		  ps_image_layer_lookup(layer, &key, 0, 100, 0, out, PSZ, NULL, NULL) == 1 &&
+	check(snapshot_layer(layer_id, &replayed) && !replayed.locations[0].available &&
+		  ps_image_layer_lookup(&replayed, &key, 0, 100, 0, out, PSZ, NULL, NULL) == 1 &&
 		  memcmp(out, page, PSZ) == 0 &&
-		  ps_layer_store->layer_exists_local(layer->layer_id) == 1,
+		  ps_layer_store->layer_exists_local(layer_id) == 1,
 		  "remote-only layer downloads into the local cache after restart");
 	ps_manifest_close();
 	ps_layer_store->close();

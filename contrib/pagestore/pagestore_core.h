@@ -20,6 +20,7 @@
 #define PAGESTORE_CORE_H
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 
 #include "pagestore_ipc.h"
@@ -66,6 +67,11 @@ extern void ps_core_set_metrics_header(PsShmHeader *hdr);
 extern void ps_lifecycle_read_lock(void);
 extern void ps_lifecycle_read_unlock(void);
 extern int ps_lifecycle_write_lock(void);
+/* POSIX shutdown path: wait in short timed intervals and withdraw from the
+ * writer queue when the signal-visible stop flag is set.  The signal handler
+ * itself only stores the flag; it never calls pthread APIs. */
+extern int ps_lifecycle_write_lock_interruptible(
+	const volatile sig_atomic_t *stop_flag);
 extern void ps_lifecycle_write_unlock(void);
 
 /* Assign a fence sequence only after all prior mutation bodies have left. */
