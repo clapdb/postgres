@@ -41,6 +41,7 @@ typedef struct LifecycleWriter
 
 static BlockingGate upload_gate;
 static BlockingGate publication_gate;
+static BlockingGate verification_gate;
 static PsLayerStore blocking_store;
 
 static int
@@ -59,6 +60,25 @@ blocking_upload(const PsLayerDesc *layer)
 	upload_gate.finished = 1;
 	pthread_cond_broadcast(&upload_gate.cond);
 	pthread_mutex_unlock(&upload_gate.mutex);
+	return rc;
+}
+
+static int
+blocking_verify(const PsLayerDesc *layer)
+{
+	int rc;
+
+	pthread_mutex_lock(&verification_gate.mutex);
+	verification_gate.entered = 1;
+	pthread_cond_broadcast(&verification_gate.cond);
+	while (!verification_gate.release)
+		pthread_cond_wait(&verification_gate.cond, &verification_gate.mutex);
+	pthread_mutex_unlock(&verification_gate.mutex);
+	rc = PsLayerStoreLocal.verify_remote_layer(layer);
+	pthread_mutex_lock(&verification_gate.mutex);
+	verification_gate.finished = 1;
+	pthread_cond_broadcast(&verification_gate.cond);
+	pthread_mutex_unlock(&verification_gate.mutex);
 	return rc;
 }
 
@@ -249,6 +269,33 @@ snapshot_layer(uint64_t id, PsLayerDesc *out)
 }
 
 static int
+snapshot_remote_durable_layer(PsLayerDesc *out)
+{
+	int found = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (!ps_layer_map.layers[i].deleting &&
+			ps_layer_map.layers[i].remote_durable)
+		{
+			for (uint32_t j = 0;
+				 j < ps_layer_map.layers[i].location_count; j++)
+				if (ps_layer_map.layers[i].locations[j].tier !=
+					PS_LAYER_TIER_REMOTE_OBJECT &&
+					ps_layer_map.layers[i].locations[j].available)
+				{
+					*out = ps_layer_map.layers[i];
+					found = 1;
+					break;
+				}
+			if (found)
+				break;
+		}
+	ps_unlock_map();
+	return found;
+}
+
+static int
 corrupt_image_index_byte(const char *path)
 {
 	FILE	   *f;
@@ -280,7 +327,10 @@ static void
 run_maintenance_ticks(int nticks)
 {
 	for (int i = 0; i < nticks; i++)
+	{
 		ps_core_maintenance();
+		usleep(1000);
+	}
 }
 
 static int
@@ -297,6 +347,7 @@ wait_local_evicted(uint64_t layer_id)
 		if (ps_layer_store->layer_exists_local(layer_id) == 0)
 			return 1;
 		ps_core_maintenance();
+		usleep(1000);
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		if (now.tv_sec > deadline.tv_sec ||
 			(now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
@@ -319,6 +370,8 @@ main(void)
 	PsLayerDesc replayed;
 	const PsLayerLocation *remote;
 	char		remote_uri[PS_LAYER_URI_MAX];
+	int		durable_found = 0;
+	int		verification_entered = 0;
 
 	if (mkdtemp(store) == NULL || mkdtemp(objects) == NULL ||
 		setenv("PAGESTORE_OBJECT_DIR", objects, 1) != 0)
@@ -347,27 +400,53 @@ main(void)
 	ps_unlock_shard(ps_shard_of(&key));
 	ps_lock_map_rd();
 	check(ps_layer_map.nlayers == 1, "flush created one layer");
-	if (ps_layer_map.nlayers == 1)
-		snapshot = ps_layer_map.layers[0];
 	ps_unlock_map();
 	check(test_async_upload_lifecycle_gate(),
 		  "idle maintenance worker is covered by lifecycle drain");
-	check(ps_core_maintenance() == 1,
-		  "publish the completed lifecycle-gated upload");
-	check(ps_core_maintenance() == 1,
-		  "run startup page-prune maintenance before eviction checks");
-	/* The preceding tick joins the worker after its map-wr publication.  This is
-	 * the deterministic publication barrier; no polling or unlocked snapshot is
-	 * needed to establish remote_durable. */
-	check(snapshot_layer(snapshot.layer_id, &snapshot),
-		  "snapshot the uploaded layer under map-rd");
-	layer_id = snapshot.layer_id;
-	check(snapshot.remote_durable &&
+	/* Block eviction before advancing maintenance through any compaction/upload
+	 * work that follows the lifecycle-gate exercise. */
+	memset(&verification_gate, 0, sizeof(verification_gate));
+	pthread_mutex_init(&verification_gate.mutex, NULL);
+	pthread_cond_init(&verification_gate.cond, NULL);
+	blocking_store = PsLayerStoreLocal;
+	blocking_store.verify_remote_layer = blocking_verify;
+	ps_layer_store = &blocking_store;
+	for (int i = 0; i < 5000; i++)
+	{
+		if (snapshot_remote_durable_layer(&snapshot))
+		{
+			durable_found = 1;
+			break;
+		}
+		(void) ps_core_maintenance();
+		usleep(1000);
+	}
+	check(durable_found && snapshot.remote_durable &&
 		  ps_layer_store->layer_exists_remote(&snapshot) == 1,
 		  "uploaded layer is durably recorded and present remotely");
+	/* Hold the verifier before it opens the object.  This makes corruption vs.
+	 * eviction ordering deterministic without reading publication fields outside
+	 * map-rd or relying on scheduler timing. */
+	for (int i = 0; i < 100; i++)
+	{
+		pthread_mutex_lock(&verification_gate.mutex);
+		verification_entered = verification_gate.entered;
+		pthread_mutex_unlock(&verification_gate.mutex);
+		if (verification_entered)
+			break;
+		(void) ps_core_maintenance();
+		usleep(1000);
+	}
+	check(verification_entered,
+		  "start blocked remote verification for eviction");
+	/* Compaction may have replaced the originally uploaded layer before eviction
+	 * became eligible.  Snapshot the actual live candidate only after its
+	 * verifier is blocked. */
+	durable_found = snapshot_remote_durable_layer(&snapshot);
+	layer_id = durable_found ? snapshot.layer_id : 0;
 	remote = NULL;
 	remote_uri[0] = '\0';
-	for (uint32_t i = 0; i < snapshot.location_count; i++)
+	for (uint32_t i = 0; durable_found && i < snapshot.location_count; i++)
 		if (snapshot.locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
 			snapshot.locations[i].available)
 			remote = &snapshot.locations[i];
@@ -382,7 +461,14 @@ main(void)
 		check(0, "remember the remote layer object");
 	check(remote != NULL && truncate(remote_uri, 1) == 0,
 		  "corrupt the remote layer object");
-	check(ps_core_maintenance() == 1, "start remote verification for eviction");
+	if (verification_entered)
+	{
+		pthread_mutex_lock(&verification_gate.mutex);
+		verification_gate.release = 1;
+		pthread_cond_broadcast(&verification_gate.cond);
+		pthread_mutex_unlock(&verification_gate.mutex);
+		wait_gate_flag(&verification_gate, &verification_gate.finished);
+	}
 	run_maintenance_ticks(100);
 	check(snapshot_layer(layer_id, &current) && current.locations[0].available &&
 		  ps_layer_store->layer_exists_local(layer_id) == 1,
@@ -422,6 +508,9 @@ main(void)
 		  "recovery retains cache when remote object fails verification");
 	ps_core_close();
 	ps_layer_store->close();
+	ps_layer_store = &PsLayerStoreLocal;
+	pthread_cond_destroy(&verification_gate.cond);
+	pthread_mutex_destroy(&verification_gate.mutex);
 	unsetenv("PAGESTORE_OBJECT_DIR");
 	printf("pagestore_tiering_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;

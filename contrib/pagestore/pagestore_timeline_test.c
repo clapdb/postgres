@@ -72,78 +72,23 @@ static enum TimelineAppendMode timeline_append_mode;
 static PsLayerStore maintenance_store;
 static uint32_t watched_maintenance_timeline;
 static int watched_uploads;
-static int watched_remote_verifications;
+
+static int
+maintenance_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
+{
+	int n = snprintf(uri, uri_len, "/tmp/unused-layer-%llu",
+					 (unsigned long long) layer_id);
+
+	return n < 0 || (uint32_t) n >= uri_len ? -1 : 0;
+}
 
 static int
 counted_upload(const PsLayerDesc *layer)
 {
 	if (layer->timeline == watched_maintenance_timeline)
 		watched_uploads++;
-	return PsLayerStoreLocal.upload_layer(layer);
+	return -1;
 }
-
-static int
-counted_verify(const PsLayerDesc *layer)
-{
-	if (layer->timeline == watched_maintenance_timeline)
-		watched_remote_verifications++;
-	return PsLayerStoreLocal.verify_remote_layer(layer);
-}
-
-static void
-install_maintenance_counter(void)
-{
-	maintenance_store = PsLayerStoreLocal;
-	maintenance_store.upload_layer = counted_upload;
-	maintenance_store.verify_remote_layer = counted_verify;
-	ps_layer_store = &maintenance_store;
-}
-
-static uint32_t
-timeline_layer_count(uint32_t timeline)
-{
-	uint32_t count = 0;
-
-	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].timeline == timeline)
-			count++;
-	ps_unlock_map();
-	return count;
-}
-
-static int
-snapshot_timeline_layer(uint32_t timeline, PsLayerDesc *out)
-{
-	int found = 0;
-
-	ps_lock_map_rd();
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].timeline == timeline)
-		{
-			if (out != NULL)
-				*out = ps_layer_map.layers[i];
-			found = 1;
-			break;
-		}
-	ps_unlock_map();
-	return found;
-}
-
-static int
-write_timeline_layer(uint32_t timeline)
-{
-	unsigned char page[8192];
-	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
-	int rc;
-
-	memset(page, 0x5A, sizeof(page));
-	ps_lock_shard_wr(ps_shard_of(&key));
-	rc = append_page(timeline, &key, 0, page, 0, NULL);
-	ps_unlock_shard(ps_shard_of(&key));
-	return rc;
-}
-
 static int
 test_meta_append(const void *buf, uint32_t len)
 {
@@ -298,6 +243,94 @@ begin_delete(uint32_t timeline, uint64_t expected_incarnation,
 }
 
 static int
+write_timeline_layer(uint32_t timeline, uint32_t block, uint32_t lsn_lo)
+{
+	unsigned char page[8192];
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint32_t lsn_hi = 0;
+	int rc;
+
+	memset(page, 0x5A, sizeof(page));
+	memcpy(page, &lsn_hi, sizeof(lsn_hi));
+	memcpy(page + sizeof(lsn_hi), &lsn_lo, sizeof(lsn_lo));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, block, page, 0, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
+
+static uint32_t
+timeline_layer_fingerprint(uint32_t timeline, uint64_t *fingerprint,
+						   int *remote_durable)
+{
+	uint32_t count = 0;
+	uint64_t ids = 0;
+	int remote = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+		{
+			ids ^= ps_layer_map.layers[i].layer_id;
+			remote |= ps_layer_map.layers[i].remote_durable;
+			count++;
+		}
+	ps_unlock_map();
+	*fingerprint = ids;
+	*remote_durable = remote;
+	return count;
+}
+
+static int
+test_deleting_timeline_skips_maintenance(uint32_t timeline)
+{
+	uint64_t before_ids;
+	uint64_t after_ids;
+	uint64_t saved_segment_size = segment_size;
+	uint32_t before_count;
+	uint32_t after_count;
+	int before_remote;
+	int after_remote;
+	int ok;
+
+	/* Two page records cannot share a 16KiB segment, making segment 0 a due
+	 * reclamation victim once both flushes publish their layer watermarks. */
+	segment_size = 16384;
+	if (write_timeline_layer(timeline, 0, 100) != 0 ||
+		write_timeline_layer(timeline, 1, 200) != 0)
+	{
+		segment_size = saved_segment_size;
+		return 0;
+	}
+	before_count = timeline_layer_fingerprint(timeline, &before_ids,
+										 &before_remote);
+	if (before_count == 0 || ps_storage->seg_size(0, 0) <= 0 ||
+		ps_storage->seg_size(0, 1) <= 0 || !begin_delete(timeline, 1, NULL))
+	{
+		segment_size = saved_segment_size;
+		return 0;
+	}
+	maintenance_store = PsLayerStoreLocal;
+	maintenance_store.remote_uri = maintenance_remote_uri;
+	maintenance_store.upload_layer = counted_upload;
+	ps_layer_store = &maintenance_store;
+	watched_maintenance_timeline = timeline;
+	watched_uploads = 0;
+	segment_gc_enabled = 1;
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	after_count = timeline_layer_fingerprint(timeline, &after_ids,
+									  &after_remote);
+	ok = watched_uploads == 0 && ps_storage->seg_size(0, 0) > 0 &&
+		after_count == before_count && after_ids == before_ids &&
+		!before_remote && !after_remote;
+	ps_layer_store = &PsLayerStoreLocal;
+	segment_gc_enabled = 0;
+	segment_size = saved_segment_size;
+	return ok;
+}
+
+static int
 branch_request(PsOpcode opcode, uint32_t timeline, uint32_t parent,
 			   uint64_t branch_lsn)
 {
@@ -345,6 +378,8 @@ typedef struct InterruptibleWriter
 	int done;
 	int rc;
 } InterruptibleWriter;
+
+static void *lifecycle_reader_main(void *arg);
 
 static void
 observer_init(LockObserver *observer)
@@ -1170,6 +1205,10 @@ test_v2_and_mixed_lifecycle(void)
 	check(test_admission_drain(12) && state_of(12, &state, NULL) &&
 		  state == PS_TIMELINE_DELETING,
 		  "BEGIN_DELETE waits for mutation admission section to drain");
+	check(create_branch(16, 0, 340),
+		  "create deleting-timeline maintenance test timeline");
+	check(test_deleting_timeline_skips_maintenance(16),
+		  "maintenance does not tier, compact, or segment-GC a DELETING timeline");
 	close_store();
 
 	/* A partial final event is discarded, while the valid prefix remains. */

@@ -10503,7 +10503,8 @@ prepare_segment_layers(uint32_t source_shard, uint32_t victim)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(d->timeline) &&
+			d->kind == PS_LAYER_IMAGE && !d->deleting &&
 			layer_shard_from_id(d->layer_id) == source_shard)
 			nlayers++;
 	}
@@ -10520,7 +10521,8 @@ prepare_segment_layers(uint32_t source_shard, uint32_t victim)
 		{
 			PsLayerDesc *d = &ps_layer_map.layers[i];
 
-			if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			if (ps_timeline_live(d->timeline) &&
+				d->kind == PS_LAYER_IMAGE && !d->deleting &&
 				layer_shard_from_id(d->layer_id) == source_shard)
 				layers[nlayers++] = *d;
 		}
@@ -10568,7 +10570,8 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 		uint32_t	n;
 		int			covers = 0;
 
-		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+		if (!ps_timeline_live(d->timeline) ||
+			d->kind != PS_LAYER_IMAGE || d->deleting ||
 			layer_shard_from_id(d->layer_id) != source_shard)
 			continue;
 		if (ps_image_layer_read_index(d, &idx, &n) != 0)
@@ -10873,8 +10876,8 @@ finish_evict(const PsLayerDesc *candidate)
 		{
 			PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-				if (!ps_timeline_live(layer->timeline) || layer->deleting ||
-					!layer->remote_durable || layer->local_pinned ||
+			if (!ps_timeline_live(layer->timeline) || layer->deleting ||
+				!layer->remote_durable || layer->local_pinned ||
 				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
 				(!layer->local_cleanup_pending &&
 				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
@@ -10974,8 +10977,8 @@ evict_one_layer(void)
 		uint32_t	i = (evict_local_map_cursor + pass) % map_nlayers;
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-			if (ps_timeline_live(layer->timeline) && !layer->deleting &&
-				layer->remote_durable && !layer->local_pinned &&
+		if (ps_timeline_live(layer->timeline) && !layer->deleting &&
+			layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
 			(layer->local_cleanup_pending ||
 			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
@@ -11155,8 +11158,8 @@ ps_core_maintenance_impl(void)
 				ps_lock_shard_wr(fsh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
-				if (ps_timeline_live(ftl) &&
-					(count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
+			if (ps_timeline_live(ftl) &&
+				(count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[ftl][fsh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(ftl, fsh) > 0)) &&
 				retention_effective_floor_internal(ftl,
