@@ -72,15 +72,10 @@ static enum TimelineAppendMode timeline_append_mode;
 static PsLayerStore maintenance_store;
 static uint32_t watched_maintenance_timeline;
 static int watched_uploads;
-
-static int
-maintenance_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
-{
-	int n = snprintf(uri, uri_len, "/tmp/unused-layer-%llu",
-					 (unsigned long long) layer_id);
-
-	return n < 0 || (uint32_t) n >= uri_len ? -1 : 0;
-}
+static char cleanup_remote_dir[512];
+static int cleanup_local_deletes;
+static int cleanup_remote_deletes;
+static int cleanup_remote_fail;
 
 static int
 counted_upload(const PsLayerDesc *layer)
@@ -88,6 +83,38 @@ counted_upload(const PsLayerDesc *layer)
 	if (layer->timeline == watched_maintenance_timeline)
 		watched_uploads++;
 	return -1;
+}
+
+static int
+cleanup_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
+{
+	int n = snprintf(uri, uri_len, "%s/layer-%llu", cleanup_remote_dir,
+					 (unsigned long long) layer_id);
+
+	return n < 0 || (uint32_t) n >= uri_len ? -1 : 0;
+}
+
+static int
+cleanup_delete_local(const PsLayerDesc *layer)
+{
+	cleanup_local_deletes++;
+	return PsLayerStoreLocal.delete_local_layer(layer);
+}
+
+static int
+cleanup_delete_remote(const PsLayerDesc *layer)
+{
+	int rc = 0;
+
+	cleanup_remote_deletes++;
+	if (cleanup_remote_fail)
+		return -1;
+	for (uint32_t i = 0; i < layer->location_count; i++)
+		if (layer->locations[i].tier == PS_LAYER_TIER_REMOTE_OBJECT &&
+			layer->locations[i].available &&
+			unlink(layer->locations[i].uri) != 0 && errno != ENOENT)
+			rc = -1;
+	return rc;
 }
 static int
 test_meta_append(const void *buf, uint32_t len)
@@ -282,51 +309,191 @@ timeline_layer_fingerprint(uint32_t timeline, uint64_t *fingerprint,
 }
 
 static int
-test_deleting_timeline_skips_maintenance(uint32_t timeline)
+first_timeline_layer(uint32_t timeline)
 {
-	uint64_t before_ids;
+	uint64_t layer_id = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+		{
+			layer_id = ps_layer_map.layers[i].layer_id;
+			break;
+		}
+	ps_unlock_map();
+	return layer_id;
+}
+
+static int
+timeline_has_deleting_layer(uint32_t timeline)
+{
+	int found = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline &&
+			ps_layer_map.layers[i].deleting)
+		{
+			found = 1;
+			break;
+		}
+	ps_unlock_map();
+	return found;
+}
+
+static int
+test_deleting_timeline_cleanup(const char *store, uint32_t timeline)
+{
 	uint64_t after_ids;
 	uint64_t saved_segment_size = segment_size;
+	uint64_t layer_id;
 	uint32_t before_count;
 	uint32_t after_count;
+	uint32_t sibling = timeline + 1;
 	int before_remote;
 	int after_remote;
 	int ok;
+	int reopened;
+	char orphan[512];
+	int old_compact_layers = compact_layers;
+	int old_segment_gc = segment_gc_enabled;
 
 	/* Two page records cannot share a 16KiB segment, making segment 0 a due
 	 * reclamation victim once both flushes publish their layer watermarks. */
 	segment_size = 16384;
-	if (write_timeline_layer(timeline, 0, 100) != 0 ||
+	compact_layers = 100;
+	if (!create_branch(sibling, 0, 350) ||
+		write_timeline_layer(0, 2, 50) != 0 ||
+		write_timeline_layer(sibling, 3, 350) != 0 ||
+		write_timeline_layer(timeline, 0, 100) != 0 ||
 		write_timeline_layer(timeline, 1, 200) != 0)
 	{
 		segment_size = saved_segment_size;
+		compact_layers = old_compact_layers;
 		return 0;
 	}
-	before_count = timeline_layer_fingerprint(timeline, &before_ids,
+	before_count = timeline_layer_fingerprint(timeline, &after_ids,
 										 &before_remote);
 	if (before_count == 0 || ps_storage->seg_size(0, 0) <= 0 ||
 		ps_storage->seg_size(0, 1) <= 0 || !begin_delete(timeline, 1, NULL))
 	{
 		segment_size = saved_segment_size;
+		compact_layers = old_compact_layers;
+		return 0;
+	}
+	layer_id = first_timeline_layer(timeline);
+	if (snprintf(cleanup_remote_dir, sizeof(cleanup_remote_dir),
+				 "%s/delete-objects", store) < 0 ||
+		mkdir(cleanup_remote_dir, 0700) != 0 || layer_id == 0 ||
+		cleanup_remote_uri(layer_id, orphan, sizeof(orphan)) < 0 ||
+		write_bytes(orphan, "orphan", sizeof("orphan") - 1) != 0)
+	{
+		segment_size = saved_segment_size;
+		compact_layers = old_compact_layers;
 		return 0;
 	}
 	maintenance_store = PsLayerStoreLocal;
-	maintenance_store.remote_uri = maintenance_remote_uri;
+	maintenance_store.remote_uri = cleanup_remote_uri;
 	maintenance_store.upload_layer = counted_upload;
+	maintenance_store.delete_local_layer = cleanup_delete_local;
+	maintenance_store.delete_remote_layer = cleanup_delete_remote;
 	ps_layer_store = &maintenance_store;
 	watched_maintenance_timeline = timeline;
 	watched_uploads = 0;
+	cleanup_local_deletes = 0;
+	cleanup_remote_deletes = 0;
 	segment_gc_enabled = 1;
+	check(ps_core_maintenance() == 1 && timeline_has_deleting_layer(timeline),
+		  "MARK_DELETE is the durable cleanup discovery boundary");
+	ps_layer_store = &PsLayerStoreLocal;
+	close_store();
+	reopened = ps_core_open(store);
+	check(reopened == 0 && timeline_has_deleting_layer(timeline),
+		  "restart resumes a layer left after MARK_DELETE");
+	ps_layer_store = &maintenance_store;
 	for (int i = 0; i < 100; i++)
 		(void) ps_core_maintenance();
+	for (int i = 0; i < 100 && timeline_has_deleting_layer(timeline); i++)
+	{
+		(void) ps_core_maintenance();
+		usleep(1000);
+	}
 	after_count = timeline_layer_fingerprint(timeline, &after_ids,
 									  &after_remote);
-	ok = watched_uploads == 0 && ps_storage->seg_size(0, 0) > 0 &&
-		after_count == before_count && after_ids == before_ids &&
-		!before_remote && !after_remote;
+	/* Explicit deletion cleanup removes only the target timeline's layers.  The
+	 * sibling and parent remain discoverable, and shared segments remain intact. */
+	{
+		uint64_t ignored;
+		int ignored_remote;
+		uint32_t sibling_count = timeline_layer_fingerprint(sibling, &ignored,
+											 &ignored_remote);
+		uint32_t parent_count = timeline_layer_fingerprint(0, &ignored,
+											&ignored_remote);
+		int local_before = cleanup_local_deletes;
+		int remote_before = cleanup_remote_deletes;
+
+		ok = watched_uploads == 0 && cleanup_local_deletes > 0 &&
+			cleanup_remote_deletes > 0 && access(orphan, F_OK) != 0 &&
+			ps_storage->seg_size(0, 0) > 0 && after_count == 0 && after_ids == 0 &&
+			!before_remote && !after_remote && sibling_count > 0 && parent_count > 0;
+		(void) ps_core_maintenance();
+		(void) ps_core_maintenance();
+		check(cleanup_local_deletes == local_before &&
+			  cleanup_remote_deletes == remote_before &&
+			  !timeline_has_deleting_layer(timeline) &&
+			  ps_storage->seg_size(0, 0) > 0,
+			  "completed cleanup is idempotent and shared segment GC stays fenced");
+	}
+	/* Recovery must not rebuild the deleted owner's layers from retained shared
+	 * segments, and the lifecycle tombstone must continue to reject ID reuse. */
 	ps_layer_store = &PsLayerStoreLocal;
-	segment_gc_enabled = 0;
+	close_store();
+	reopened = ps_core_open(store);
+	ps_layer_store = &maintenance_store;
+	{
+		PsTimelineState state;
+		uint64_t ids;
+		int remote;
+
+		check(reopened == 0 &&
+			  timeline_layer_fingerprint(timeline, &ids, &remote) == 0 &&
+			  state_of(timeline, &state, NULL) && state == PS_TIMELINE_DELETING &&
+			  ps_storage->seg_size(0, 0) > 0 &&
+			  !create_branch(timeline, 0, 370),
+			  "restart keeps cleanup complete, shared data, and ID-reuse fence");
+	}
+	/* A provider failure leaves the durable tombstone in place and backs off the
+	 * asynchronous retry.  Clear the failure and let the same worker finish it. */
+	check(create_branch(sibling + 1, 0, 360) &&
+		  write_timeline_layer(sibling + 1, 4, 360) == 0 &&
+		  begin_delete(sibling + 1, 1, NULL),
+		  "create a timeline for remote-delete failure recovery");
+	cleanup_remote_fail = 1;
+	check(ps_core_maintenance() == 1, "mark failed remote cleanup layer deleting");
+	(void) ps_core_maintenance();
+	usleep(10000);
+	(void) ps_core_maintenance();
+	{
+		int failed_remote = cleanup_remote_deletes;
+
+		(void) ps_core_maintenance();
+		check(cleanup_remote_deletes == failed_remote &&
+			  timeline_has_deleting_layer(sibling + 1),
+			  "remote cleanup failure backs off without busy-looping");
+	}
+	cleanup_remote_fail = 0;
+	usleep(1100000);
+	for (int i = 0; i < 100 && timeline_has_deleting_layer(sibling + 1); i++)
+	{
+		(void) ps_core_maintenance();
+		usleep(1000);
+	}
+	check(!timeline_has_deleting_layer(sibling + 1),
+		  "remote cleanup retry resumes after backoff");
+	ps_layer_store = &PsLayerStoreLocal;
+	segment_gc_enabled = old_segment_gc;
 	segment_size = saved_segment_size;
+	compact_layers = old_compact_layers;
 	return ok;
 }
 
@@ -1064,6 +1231,37 @@ test_legacy_migration_and_parser_fail_closed(void)
 }
 
 static void
+test_delete_discards_unflushed_memtable(void)
+{
+	char store[] = "/tmp/pagestore-timeline-memtable-XXXXXX";
+	uint64_t ids;
+	int remote;
+
+	check(mkdtemp(store) != NULL, "create unflushed-delete test store");
+	page_size = 8192;
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	compact_layers = 100;
+	segment_gc_enabled = 1;
+	cache_pages = 0;
+	ps_nshards = 1;
+	use_layers = 1;
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100),
+		  "open store for unflushed deletion");
+	check(write_timeline_layer(1, 0, 100) == 0 &&
+		  timeline_layer_fingerprint(1, &ids, &remote) == 0,
+		  "leave deleting timeline page staged below flush threshold");
+	check(begin_delete(1, 1, NULL),
+		  "begin deletion after draining the staged writer");
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  timeline_layer_fingerprint(1, &ids, &remote) == 0,
+		  "shutdown and recovery do not recreate a deleting timeline layer");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_v2_and_mixed_lifecycle(void)
 {
 	char store[] = "/tmp/pagestore-timeline-test-XXXXXX";
@@ -1207,16 +1405,21 @@ test_v2_and_mixed_lifecycle(void)
 		  "BEGIN_DELETE waits for mutation admission section to drain");
 	check(create_branch(16, 0, 340),
 		  "create deleting-timeline maintenance test timeline");
-	check(test_deleting_timeline_skips_maintenance(16),
-		  "maintenance does not tier, compact, or segment-GC a DELETING timeline");
+	check(test_deleting_timeline_cleanup(store, 16),
+		  "DELETING timeline cleanup is owner-scoped and restartable");
 	close_store();
 
 	/* A partial final event is discarded, while the valid prefix remains. */
 	bad = 0xA5;
 	check(append_bytes(timelines_path, &bad, 1) == 0,
 		  "append simulated short lifecycle tail");
-	check(ps_core_open(store) == 0 && access(timelines_path, F_OK) == 0,
-		  "short lifecycle tail is truncated on replay");
+	{
+		int reopened = ps_core_open(store);
+
+		check(reopened == 0, "short lifecycle tail reopens successfully");
+		check(access(timelines_path, F_OK) == 0,
+			  "short lifecycle tail is truncated on replay");
+	}
 	close_store();
 
 	/* A complete record with a bad CRC is not repairable. */
@@ -1243,6 +1446,7 @@ int
 main(void)
 {
 	test_legacy_migration_and_parser_fail_closed();
+	test_delete_discards_unflushed_memtable();
 	test_v2_and_mixed_lifecycle();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;

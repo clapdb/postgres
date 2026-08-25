@@ -517,7 +517,7 @@ Expected scope: one implementation PR and one crash-test PR.
 
 ### R5. Delete timelines durably
 
-Status: **foundation plus POSIX runtime quiescence implemented**.  The first
+Status: **foundation, POSIX runtime quiescence, and layer cleanup implemented**.  The first
 slice adds legacy-only migration and V2 create/event mixed records,
 LIVE/DELETING state plus a reserved DELETED format value with incarnation,
 BEGIN_DELETE/STATE IPC, and descendant/retention-owner admission vetoes.  The
@@ -527,9 +527,12 @@ BEGIN_DELETE takes lifecycle
 write, then admission write, then map write.  A fair turnstile closes new
 readers once a delete writer queues, independent of the platform's default
 pthread rwlock reader/writer preference.  SPDK BEGIN_DELETE remains
-fail-closed: async request drain is still follow-up work.  No DELETED
-transition is exposed yet; physical cleanup and ID reuse remain follow-up
-stacked work.
+fail-closed: async request drain is still follow-up work.  DELETING timelines
+now durably mark and asynchronously reclaim manifest-owned local and remote
+layers, resume after restart, retry provider failures with backoff, and
+reconcile deterministic remote objects from completed-but-unpublished uploads.
+No DELETED transition is exposed yet; filtered shared-stream cleanup and ID
+reuse remain follow-up stacked work.
 
 Deliverables:
 
@@ -873,6 +876,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-14 | Added R4a live snapshot/log-epoch cutover and GC, then persisted known/FPI plus record-end metadata needed for safe replacement-base selection | Stacked PRs #195-#197 plus the replacement-base metadata follow-up; standalone and integration coverage |
 | 2026-08-23 | Landed the R4b runtime cutover foundation: durable frontier-gated normalized forkmeta snapshots, all-shard run-to-completion maintenance, source-log rewrite/epoch marker, startup reconcile, poison-on-ambiguous rewrite, and daemon/tiering wiring | Strict standalone, ASan/UBSan unit coverage, focused Meson, and existing pagestore suite; publication crash matrix remains a follow-up |
 | 2026-08-25 | Added R5 POSIX runtime quiescence: lifecycle read coverage for complete requests and synchronous/asynchronous maintenance, fair queued-writer turnstile, and deterministic ordinary/maintenance/delete-drain tests | Focused POSIX timeline test: 58 checks, 0 failures; tiering worker/publication test: 23 checks, 0 failures; SPDK async drain remains explicitly fail-closed/follow-up |
+| 2026-08-26 | Added R5 manifest-owned layer cleanup for DELETING timelines: durable per-layer tombstones, asynchronous local/remote deletion, restart resume, orphan-object reconciliation, and retry backoff | Timeline cleanup/restart/failure coverage; strict focused suites and standalone 1998-check suite |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |

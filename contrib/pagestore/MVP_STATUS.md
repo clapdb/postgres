@@ -202,9 +202,11 @@ publication-crash coverage.  Still required for the gate:
   for descendants or active retention owners.  The POSIX runtime-quiescence
   slice now drains complete ordinary requests (including reads and reserves)
   and complete maintenance work, including async workers, with a fair lifecycle
-  turnstile; SPDK async
-  drain, physical cleanup, DELETED publication, and ID reuse remain follow-up
-  work.
+  turnstile.  Deleting timelines now reclaim their manifest-owned local and
+  remote layer artifacts through restartable MARK_DELETE/REMOVE_LAYER GC, with
+  idempotent remote retry and completed-but-unpublished upload reconciliation.
+  SPDK async drain, filtered cleanup of shared page/WAL/forkmeta streams,
+  DELETED publication, and ID reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
