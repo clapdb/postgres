@@ -240,10 +240,9 @@ run_request_admitted(PsChannel *ch)
 
 		/*
 		 * Pin operations own the retention mutex, and mutations fsync their log.
-		 * Timeline definitions are
-		 * append-only for a daemon lifetime, so validate the timeline under the
-		 * map lock and then perform that slow durable mutation without blocking
-		 * unrelated map readers across all shards.
+		 * Timeline definitions are append-only for a daemon lifetime, so validate
+		 * the timeline under the map lock and release it before the core takes any
+		 * admission/page/WAL-index locks for the durable mutation.
 		 */
 		ps_lock_map_rd();
 		timeline_ok = ps_timeline_defined(ch->timeline);
@@ -417,37 +416,56 @@ run_request(PsChannel *ch)
 
 	if (op == PS_OP_BEGIN_DELETE)
 	{
-		if (ps_admission_write_lock() == 0)
+		/* lifecycle-wr drains every complete POSIX request, including ordinary
+		 * reads and reserve operations, before admission/map state changes. */
+		if (ps_lifecycle_write_lock_interruptible(&stop_requested) != 0)
+			ch->status = PS_STATUS_ERROR;
+		else if (ps_admission_write_lock() == 0)
 		{
 			ps_lock_map_wr();
 			handle_request(ch);
 			ps_unlock_map();
 			ps_admission_write_unlock();
+			ps_lifecycle_write_unlock();
 		}
 		else
+		{
 			ch->status = PS_STATUS_ERROR;
+			ps_lifecycle_write_unlock();
+		}
 		ps_store_release(&ch->state, PS_STATE_DONE);
 		return 1;
 	}
 
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{
+		/* The barrier is an ordinary complete request: lifecycle-rd is held
+		 * while its inner admission-wr establishes the sequence.  BEGIN_DELETE
+		 * is the sole lifecycle-wr exception. */
+		ps_lifecycle_read_lock();
 		ch->status = PS_STATUS_OK;
 		ch->result = 0;
 		ch->req_seq = ps_admission_barrier();
 		if (ch->req_seq == 0)
 			ch->status = PS_STATUS_ERROR;
 		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_lifecycle_read_unlock();
 		return 1;
 	}
+
+	/* Keep the lifecycle read side across every retry and every request
+	 * completion.  The only early return below releases both gates first. */
+	ps_lifecycle_read_lock();
 	if (op == PS_OP_RETENTION_PIN_RESERVE)
 	{
 		run_request_admitted(ch);
+		ps_lifecycle_read_unlock();
 		return 1;
 	}
 	if (!request_is_write(op))
 	{
 		run_request_admitted(ch);
+		ps_lifecycle_read_unlock();
 		return 1;
 	}
 
@@ -465,10 +483,12 @@ run_request(PsChannel *ch)
 			ps_load_acquire_u64(&daemon_hdr->admission_pending_lsn))
 		{
 			ps_admission_read_unlock();
+			ps_lifecycle_read_unlock();
 			return 0;
 		}
 		run_request_admitted(ch);
 		ps_admission_read_unlock();
+		ps_lifecycle_read_unlock();
 		return 1;
 	}
 }

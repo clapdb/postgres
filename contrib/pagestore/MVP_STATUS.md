@@ -199,9 +199,12 @@ publication-crash coverage.  Still required for the gate:
   now migrates legacy-only timeline logs to V2 and persists V2 create/event
   records, exposes LIVE/DELETING plus
   a reserved DELETED format value with incarnation, and vetoes BEGIN_DELETE
-  for descendants or active retention owners.  Its POSIX barrier covers
-  admitted mutation sections; ordinary reads, maintenance, SPDK async drain,
-  physical cleanup, DELETED publication, and ID reuse remain follow-up work.
+  for descendants or active retention owners.  The POSIX runtime-quiescence
+  slice now drains complete ordinary requests (including reads and reserves)
+  and complete maintenance work, including async workers, with a fair lifecycle
+  turnstile; SPDK async
+  drain, physical cleanup, DELETED publication, and ID reuse remain follow-up
+  work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.

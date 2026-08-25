@@ -20,6 +20,7 @@
 #define PAGESTORE_CORE_H
 
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 
 #include "pagestore_ipc.h"
@@ -60,6 +61,19 @@ extern int	ps_core_maintenance(void);
 extern uint32_t ps_core_layer_count(void);
 extern void ps_core_set_metrics_header(PsShmHeader *hdr);
 
+/* Runtime lifecycle gate.  POSIX frontend requests and complete maintenance
+ * work take the read side; destructive lifecycle transitions take the write
+ * side.  The lock order is lifecycle -> admission -> shard/page/walidx -> map. */
+extern void ps_lifecycle_read_lock(void);
+extern void ps_lifecycle_read_unlock(void);
+extern int ps_lifecycle_write_lock(void);
+/* POSIX shutdown path: wait in short timed intervals and withdraw from the
+ * writer queue when the signal-visible stop flag is set.  The signal handler
+ * itself only stores the flag; it never calls pthread APIs. */
+extern int ps_lifecycle_write_lock_interruptible(
+	const volatile sig_atomic_t *stop_flag);
+extern void ps_lifecycle_write_unlock(void);
+
 /* Assign a fence sequence only after all prior mutation bodies have left. */
 extern void ps_admission_read_lock(void);
 extern void ps_admission_read_unlock(void);
@@ -72,18 +86,38 @@ extern uint64_t ps_admission_barrier(void);
  * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 typedef void (*PsAdmissionReadTestHook)(void *arg);
+typedef void (*PsLifecycleReadTestHook)(void *arg);
+typedef void (*PsTierUploadBeforePublishTestHook)(void *arg);
+/* Called after the lifecycle turnstile mutex is acquired, before the reader
+ * tests whether a writer is queued.  The callback must not take lifecycle
+ * locks. */
+typedef void (*PsLifecycleReadQueuedTestHook)(void *arg);
+/* Called after lifecycle_waiting_writers is incremented, before the writer
+ * waits for active readers.  The callback must not take lifecycle locks. */
+typedef void (*PsLifecycleWriteQueuedTestHook)(void *arg);
 /* Test-only replacement for the exact blocking admission-wr call.  The
  * production path invokes pthread_rwlock_wrlock directly; when installed,
  * the hook is called in its place and must call pthread_rwlock_wrlock(lock)
  * itself.  This lets a test observe entry to the real blocking call without
  * adding a separate try-lock probe to production maintenance. */
 typedef int (*PsAdmissionWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
+typedef int (*PsLifecycleWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
 extern void ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook,
 	void *arg);
+extern void ps_test_set_lifecycle_read_hook(PsLifecycleReadTestHook hook,
+	void *arg);
+extern void ps_test_set_tier_upload_before_publish_hook(
+	PsTierUploadBeforePublishTestHook hook, void *arg);
+extern void ps_test_set_lifecycle_read_queued_hook(
+	PsLifecycleReadQueuedTestHook hook, void *arg);
+extern void ps_test_set_lifecycle_write_queued_hook(
+	PsLifecycleWriteQueuedTestHook hook, void *arg);
 extern void ps_test_set_admission_write_lock_hook(
 	PsAdmissionWriteLockTestHook hook, void *arg);
+extern void ps_test_set_lifecycle_write_lock_hook(
+	PsLifecycleWriteLockTestHook hook, void *arg);
 /* Test-only scheduling seam for a pending forkmeta snapshot GC retry. */
 extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
 

@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,11 +78,11 @@ int			use_layers = 1;
 static pthread_t tier_upload_thread;
 static PsLayerDesc tier_upload_candidate;
 static volatile int tier_upload_state; /* 0 idle, 1 running, 2 success, 3 failed */
-static int tier_upload_joined;
 static uint32_t tier_upload_shard_cursor;
 static struct timespec tier_upload_retry_at;
 static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
+static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static int refresh_remote_only_layer(const PsLayerDesc *layer);
@@ -100,6 +101,8 @@ static pthread_t evict_local_thread;
 static PsLayerDesc evict_local_candidate;
 static volatile int evict_local_state; /* 0 idle, 1 verifying, 2 verified, 3 failed */
 static uint32_t evict_local_map_cursor;
+static int gc_finish_local(uint64_t layer_id, int remote_done);
+static int finish_evict(const PsLayerDesc *candidate);
 static void page_remove_compacted_versions(uint32_t timeline,
 										   const PsImgRec *recs, uint32_t nrec);
 static int retention_project_lsn(uint32_t descendant, uint32_t target,
@@ -156,13 +159,38 @@ uint32_t	ps_nshards = 1;
  * continues above both committed and uncommitted records after a restart. */
 static uint64_t next_segment_order_id = 1;
 static uint64_t next_admission_seq = 1;
+/* These static synchronization objects intentionally survive ps_core_open()
+ * / ps_core_close() cycles.  Open/close must only run after callers have
+ * released their sections; reinitializing the lock or turnstile counters
+ * would invalidate an in-flight ownership record.  The rwlock is the
+ * lifecycle gate.  The small turnstile around it closes the
+ * POSIX rwlock's unspecified reader/writer scheduling gap: once a writer is
+ * queued, new readers wait until that writer has acquired and released the
+ * rwlock.  This keeps BEGIN_DELETE from being starved by a stream of requests
+ * on platforms whose default pthread rwlock is reader-preferred. */
+static pthread_rwlock_t lifecycle_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t lifecycle_turnstile = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lifecycle_turnstile_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t lifecycle_active_readers;
+static uint32_t lifecycle_waiting_writers;
+static int lifecycle_writer_active;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
 static void *admission_read_test_hook_arg;
+static PsLifecycleReadTestHook lifecycle_read_test_hook;
+static void *lifecycle_read_test_hook_arg;
+static PsTierUploadBeforePublishTestHook tier_upload_before_publish_test_hook;
+static void *tier_upload_before_publish_test_hook_arg;
+static PsLifecycleReadQueuedTestHook lifecycle_read_queued_test_hook;
+static void *lifecycle_read_queued_test_hook_arg;
+static PsLifecycleWriteQueuedTestHook lifecycle_write_queued_test_hook;
+static void *lifecycle_write_queued_test_hook_arg;
 static PsAdmissionWriteLockTestHook admission_write_lock_test_hook;
 static void *admission_write_lock_test_hook_arg;
+static PsLifecycleWriteLockTestHook lifecycle_write_lock_test_hook;
+static void *lifecycle_write_lock_test_hook_arg;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -235,6 +263,201 @@ admission_seq_observe(uint64_t seq)
 }
 
 void
+ps_lifecycle_read_lock(void)
+{
+	int rc;
+
+	pthread_mutex_lock(&lifecycle_turnstile);
+	if (lifecycle_read_queued_test_hook != NULL)
+		lifecycle_read_queued_test_hook(lifecycle_read_queued_test_hook_arg);
+	while (lifecycle_waiting_writers != 0 || lifecycle_writer_active)
+		pthread_cond_wait(&lifecycle_turnstile_cond, &lifecycle_turnstile);
+	lifecycle_active_readers++;
+	pthread_mutex_unlock(&lifecycle_turnstile);
+
+	rc = pthread_rwlock_rdlock(&lifecycle_lock);
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&lifecycle_turnstile);
+		lifecycle_active_readers--;
+		pthread_cond_broadcast(&lifecycle_turnstile_cond);
+		pthread_mutex_unlock(&lifecycle_turnstile);
+		/* A void lock API cannot safely report this to callers: continuing
+		 * would execute an unprotected request and later unlock a lock that was
+		 * never acquired.  Lock exhaustion or corruption is fatal instead. */
+		abort();
+	}
+	if (lifecycle_read_test_hook != NULL)
+		lifecycle_read_test_hook(lifecycle_read_test_hook_arg);
+}
+
+void
+ps_lifecycle_read_unlock(void)
+{
+	pthread_rwlock_unlock(&lifecycle_lock);
+	pthread_mutex_lock(&lifecycle_turnstile);
+	if (lifecycle_active_readers == 0)
+		abort();
+	lifecycle_active_readers--;
+	if (lifecycle_active_readers == 0)
+		pthread_cond_broadcast(&lifecycle_turnstile_cond);
+	pthread_mutex_unlock(&lifecycle_turnstile);
+}
+
+static void
+ps_lifecycle_read_reserve(void)
+{
+	/* The caller must already own lifecycle-rd.  The reservation is a
+	 * turnstile token, not another pthread rwlock read ownership. */
+	pthread_mutex_lock(&lifecycle_turnstile);
+	if (lifecycle_active_readers == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&lifecycle_turnstile);
+		abort();
+	}
+	lifecycle_active_readers++;
+	pthread_mutex_unlock(&lifecycle_turnstile);
+}
+
+static void
+ps_lifecycle_read_adopt_reserved(void)
+{
+	/* The parent already counted this reader before pthread_create().  The
+	 * parent holds the actual pthread rwlock until the maintenance call
+	 * returns; after that, lifecycle_active_readers is the authoritative
+	 * reservation which keeps a writer out until this worker is done.  Taking
+	 * another pthread rwlock read here would deadlock if a writer queued between
+	 * pthread_create() and worker startup: the writer waits for this reservation
+	 * while the worker waits for the writer. */
+}
+
+static void
+lifecycle_drop_reserved(void)
+{
+	pthread_mutex_lock(&lifecycle_turnstile);
+	if (lifecycle_active_readers == 0)
+	{
+		pthread_mutex_unlock(&lifecycle_turnstile);
+		abort();
+	}
+	lifecycle_active_readers--;
+	if (lifecycle_active_readers == 0)
+		pthread_cond_broadcast(&lifecycle_turnstile_cond);
+	pthread_mutex_unlock(&lifecycle_turnstile);
+}
+
+static void
+ps_lifecycle_read_release_reserved(void)
+{
+	lifecycle_drop_reserved();
+}
+
+static void
+ps_lifecycle_read_cancel_reservation(void)
+{
+	/* Called by the parent when pthread_create() failed; no rwlock ownership
+	 * exists for a reservation that was never handed to a worker. */
+	lifecycle_drop_reserved();
+}
+
+static int
+lifecycle_write_lock_interruptible(const volatile sig_atomic_t *stop_flag)
+{
+	int rc;
+
+	pthread_mutex_lock(&lifecycle_turnstile);
+	if (stop_flag != NULL && *stop_flag)
+	{
+		pthread_mutex_unlock(&lifecycle_turnstile);
+		return ECANCELED;
+	}
+	lifecycle_waiting_writers++;
+	if (lifecycle_write_queued_test_hook != NULL)
+		lifecycle_write_queued_test_hook(lifecycle_write_queued_test_hook_arg);
+	while (lifecycle_writer_active || lifecycle_active_readers != 0)
+	{
+		struct timespec deadline;
+
+		if (stop_flag != NULL && *stop_flag)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return ECANCELED;
+		}
+		/* A signal handler only stores stop_requested.  The waiter notices it
+		 * without requiring the handler to touch a pthread mutex or condvar. */
+		if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return errno;
+		}
+		deadline.tv_nsec += 10000000L; /* 10ms stop-aware polling bound */
+		if (deadline.tv_nsec >= 1000000000L)
+		{
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000000000L;
+		}
+		rc = pthread_cond_timedwait(&lifecycle_turnstile_cond,
+										&lifecycle_turnstile, &deadline);
+		if (rc != 0 && rc != ETIMEDOUT)
+		{
+			lifecycle_waiting_writers--;
+			pthread_cond_broadcast(&lifecycle_turnstile_cond);
+			pthread_mutex_unlock(&lifecycle_turnstile);
+			return rc;
+		}
+	}
+	lifecycle_waiting_writers--;
+	lifecycle_writer_active = 1;
+	pthread_mutex_unlock(&lifecycle_turnstile);
+
+	if (lifecycle_write_lock_test_hook != NULL)
+		rc = lifecycle_write_lock_test_hook(&lifecycle_lock,
+											 lifecycle_write_lock_test_hook_arg);
+	else
+		rc = pthread_rwlock_wrlock(&lifecycle_lock);
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&lifecycle_turnstile);
+		lifecycle_writer_active = 0;
+		pthread_cond_broadcast(&lifecycle_turnstile_cond);
+		pthread_mutex_unlock(&lifecycle_turnstile);
+	}
+	return rc;
+}
+
+static int
+lifecycle_write_lock(void)
+{
+	return lifecycle_write_lock_interruptible(NULL);
+}
+
+int
+ps_lifecycle_write_lock(void)
+{
+	return lifecycle_write_lock();
+}
+
+int
+ps_lifecycle_write_lock_interruptible(const volatile sig_atomic_t *stop_flag)
+{
+	return lifecycle_write_lock_interruptible(stop_flag);
+}
+
+void
+ps_lifecycle_write_unlock(void)
+{
+	pthread_rwlock_unlock(&lifecycle_lock);
+	pthread_mutex_lock(&lifecycle_turnstile);
+	lifecycle_writer_active = 0;
+	pthread_cond_broadcast(&lifecycle_turnstile_cond);
+	pthread_mutex_unlock(&lifecycle_turnstile);
+}
+
+void
 ps_admission_read_lock(void)
 {
 	pthread_rwlock_rdlock(&admission_lock);
@@ -263,11 +486,50 @@ ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook, void *arg)
 }
 
 void
+ps_test_set_lifecycle_read_hook(PsLifecycleReadTestHook hook, void *arg)
+{
+	lifecycle_read_test_hook = hook;
+	lifecycle_read_test_hook_arg = arg;
+}
+
+void
+ps_test_set_tier_upload_before_publish_hook(
+	PsTierUploadBeforePublishTestHook hook, void *arg)
+{
+	tier_upload_before_publish_test_hook = hook;
+	tier_upload_before_publish_test_hook_arg = arg;
+}
+
+void
+ps_test_set_lifecycle_read_queued_hook(PsLifecycleReadQueuedTestHook hook,
+									   void *arg)
+{
+	lifecycle_read_queued_test_hook = hook;
+	lifecycle_read_queued_test_hook_arg = arg;
+}
+
+void
+ps_test_set_lifecycle_write_queued_hook(PsLifecycleWriteQueuedTestHook hook,
+									void *arg)
+{
+	lifecycle_write_queued_test_hook = hook;
+	lifecycle_write_queued_test_hook_arg = arg;
+}
+
+void
 ps_test_set_admission_write_lock_hook(PsAdmissionWriteLockTestHook hook,
 									  void *arg)
 {
 	admission_write_lock_test_hook = hook;
 	admission_write_lock_test_hook_arg = arg;
+}
+
+void
+ps_test_set_lifecycle_write_lock_hook(PsLifecycleWriteLockTestHook hook,
+									  void *arg)
+{
+	lifecycle_write_lock_test_hook = hook;
+	lifecycle_write_lock_test_hook_arg = arg;
 }
 
 static int
@@ -366,8 +628,10 @@ static Shard g_shards[MAX_SHARDS];
  * Concurrency.  A per-shard rwlock guards each shard's in-memory state
  * (g_shards[i]: the page/fork/walidx indexes, memtable, append cursor and
  * layer-id cursor).  A single map_lock guards the cross-shard state: the global
- * ps_layer_map and the timelines[] array.  Lock order is always shard (outer,
- * ascending shard id when taking more than one) then map (inner), never the
+ * ps_layer_map and the timelines[] array.  Runtime paths add the lifecycle
+ * gate and admission fence outside this existing order: lifecycle -> admission
+ * -> shard/page/walidx -> map.  Lock order is otherwise always shard
+ * (ascending shard id when taking more than one) then map (inner), never the
  * reverse, so there is no deadlock.
  *
  * Each daemon worker owns exactly one shard and only ever touches its own
@@ -890,6 +1154,15 @@ gc_resume(void)
 	return did;
 }
 
+static void
+lifecycle_worker_cleanup(void *arg)
+{
+	(void) arg;
+	/* This handler runs both on normal return and deferred cancellation.  The
+	 * reservation token was counted by its parent before pthread_create(). */
+	ps_lifecycle_read_release_reserved();
+}
+
 static void *
 gc_remote_worker(void *arg)
 {
@@ -898,12 +1171,18 @@ gc_remote_worker(void *arg)
 	int rc;
 
 	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+	ps_lifecycle_read_adopt_reserved();
+	pthread_cleanup_push(lifecycle_worker_cleanup, NULL);
 	rc = ps_layer_store->delete_remote_layer(layer);
-	pthread_setcancelstate(old_state, NULL);
-	pthread_testcancel();
-
+	/* The remote delete and its local/manifest publication are one lifecycle
+	 * reservation.  A cancellation may interrupt the provider call, but once
+	 * it returns successfully the publication must run to completion. */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+	if (rc == 0)
+		rc = gc_finish_local(layer->layer_id, 1) ? 0 : -1;
 	__atomic_store_n(&gc_remote_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	pthread_setcancelstate(old_state, NULL);
+	pthread_cleanup_pop(1);
 	return NULL;
 }
 
@@ -921,7 +1200,8 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == layer_id &&
-			ps_layer_map.layers[i].deleting)
+			ps_layer_map.layers[i].deleting &&
+			ps_timeline_live(ps_layer_map.layers[i].timeline))
 		{
 			layer = &ps_layer_map.layers[i];
 			break;
@@ -968,12 +1248,6 @@ gc_remote_one(void)
 			return 0;
 		}
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
-		if (!gc_finish_local(gc_remote_candidate.layer_id, 1))
-		{
-			gc_remote_retry_at = now;
-			gc_remote_retry_at.tv_sec++;
-			return 0;
-		}
 		return 1;
 	}
 	ps_lock_map_rd();
@@ -982,6 +1256,7 @@ gc_remote_one(void)
 		uint32_t i = (gc_remote_map_cursor + pass) % ps_layer_map.nlayers;
 		{
 			if (ps_layer_map.layers[i].deleting &&
+				ps_timeline_live(ps_layer_map.layers[i].timeline) &&
 				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
 				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			{
@@ -1020,10 +1295,12 @@ gc_remote_one(void)
 						return 0;
 					}
 				}
+				ps_lifecycle_read_reserve();
 				__atomic_store_n(&gc_remote_state, 1, __ATOMIC_RELEASE);
 				if (pthread_create(&gc_remote_thread, NULL, gc_remote_worker,
-								   &gc_remote_candidate) != 0)
+							   &gc_remote_candidate) != 0)
 				{
+					ps_lifecycle_read_cancel_reservation();
 					__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 					return 0;
 				}
@@ -1218,6 +1495,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	uint64_t	frontier_seq;
 	int			rc = -1;
 
+	if (!ps_timeline_live(timeline))
+		return 0;
 	if (nold == 0)
 		return 0;				/* nothing worth merging */
 
@@ -1238,7 +1517,8 @@ compact_timeline(uint32_t timeline, uint32_t shard, uint64_t page_floor)
 	{
 		const PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting &&
 			d->timeline == timeline &&
 			layer_shard_from_id(d->layer_id) == shard)
 			old[nold++] = *d;
@@ -1473,7 +1753,8 @@ materialize_compaction_inputs(uint32_t timeline, uint32_t shard)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(timeline) && d->kind == PS_LAYER_IMAGE &&
+			!d->deleting &&
 			d->timeline == timeline && layer_shard_from_id(d->layer_id) == shard)
 		{
 			PsLayerDesc *nlayers_ptr;
@@ -7117,8 +7398,8 @@ walidx_snapshot_publish_one(void)
 		uint32_t tl = (walidx_snapshot_cursor + step) % MAX_TIMELINES;
 		struct timespec retry_at = walidx_snapshot_retry_at[tl];
 
-		if ((tl == 0 || timelines[tl].defined) &&
-			(now.tv_sec > retry_at.tv_sec ||
+			if (ps_timeline_live(tl) &&
+				(now.tv_sec > retry_at.tv_sec ||
 			 (now.tv_sec == retry_at.tv_sec && now.tv_nsec >= retry_at.tv_nsec)) &&
 			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
 							 __ATOMIC_ACQUIRE) &&
@@ -7162,6 +7443,14 @@ walidx_snapshot_publish_one(void)
 
 	pthread_rwlock_rdlock(&walidx_prune_lock);
 	ps_lock_map_rd();
+	/* The first scan is a scheduling hint.  Recheck the timeline state while
+	 * holding map-rd before any snapshot publication is prepared. */
+	if (!ps_timeline_live((uint32_t) candidate))
+	{
+		ps_unlock_map();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		return 0;
+	}
 	walidx_publish_wrlock();
 	{
 		uint32_t tl = (uint32_t) candidate;
@@ -7363,12 +7652,13 @@ walidx_snapshot_gc_one(void)
 	struct timespec now;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
+	ps_lock_map_rd();
 	for (uint32_t step = 0; step < MAX_TIMELINES; step++)
 	{
 		uint32_t tl = (walidx_snapshot_gc_cursor + step) % MAX_TIMELINES;
 		struct timespec retry = walidx_snapshot_gc_retry_at[tl];
 
-		if (walidx_snapshot_gc_pending[tl] &&
+		if (ps_timeline_live(tl) && walidx_snapshot_gc_pending[tl] &&
 			(now.tv_sec > retry.tv_sec ||
 			 (now.tv_sec == retry.tv_sec && now.tv_nsec >= retry.tv_nsec)))
 		{
@@ -7377,6 +7667,7 @@ walidx_snapshot_gc_one(void)
 			break;
 		}
 	}
+	ps_unlock_map();
 	if (candidate < 0)
 		return 0;
 	if (walidx_snapshot_path((uint32_t) candidate, directory,
@@ -9338,11 +9629,10 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
 										incarnation) != 0)
 		return -1;
-	/* Durable append precedes this publication.  The POSIX mutation admission
-	 * barrier keeps already-admitted mutation sections drained before this
-	 * point; ordinary reads, maintenance, and SPDK async drain are follow-up
-	 * work.  Cleanup must not start from DELETING alone until that full drain
-	 * exists. */
+	/* Durable append precedes this publication.  The POSIX lifecycle gate and
+	 * mutation-admission barrier drain complete requests and maintenance before
+	 * this point.  SPDK async drain remains follow-up work, so cleanup must not
+	 * start from DELETING alone yet. */
 	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
 																__ATOMIC_RELEASE);
 	ch->result = PS_TIMELINE_DELETING;
@@ -10077,7 +10367,7 @@ ps_core_close(void)
 {
 	uint32_t	ns = core_shards();
 	int		join_gc = 0;
-	int		cancel_upload = 0;
+	int		join_upload = 0;
 	int		join_evict = 0;
 	int		evict_state;
 	struct timespec deadline;
@@ -10089,20 +10379,14 @@ ps_core_close(void)
 			pthread_cancel(gc_remote_thread);
 		join_gc = 1;
 	}
-	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
+	if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0)
 	{
-		/* Remote tiering is optional: do not let a stalled object store delay
-		 * shutdown of the locally durable store.  The interrupted copy is
-		 * crash-safe and a later open reclaims its temporary file. */
-		pthread_cancel(tier_upload_thread);
-		cancel_upload = 1;
-	}
-	else if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 2)
-	{
-		pthread_join(tier_upload_thread, NULL);
-		tier_upload_joined = 1;
-		/* Persist a completed upload before closing its manifest. */
-		tier_one_layer();
+		/* Remote tiering is optional: cancel only the provider I/O.  The worker
+		 * defers cancellation during publication, and every nonzero state is
+		 * joined before core state is torn down. */
+		if (__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1)
+			pthread_cancel(tier_upload_thread);
+		join_upload = 1;
 	}
 	evict_state = __atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE);
 	if (evict_state != 0)
@@ -10139,21 +10423,7 @@ ps_core_close(void)
 		}
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	}
-
-	for (uint32_t i = 0; i < ns; i++)
-	{
-		Shard	   *s = &g_shards[i];
-
-		if (s->memtable)
-		{
-			flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off);
-			ps_memtable_destroy(s->memtable);
-			s->memtable = NULL;
-		}
-	}
-
-	ps_pgcache_free();
-	if (cancel_upload)
+	if (join_upload)
 	{
 		clock_gettime(CLOCK_REALTIME, &deadline);
 		deadline.tv_sec++;
@@ -10161,7 +10431,7 @@ ps_core_close(void)
 		if (join_rc != 0)
 		{
 			/* Do not detach an upload that still owns core/provider state.  The
-			 * local store is synced above; terminate the process so the kernel
+			 * local store is synced below; terminate the process so the kernel
 			 * reclaims the stuck worker rather than permitting a concurrent reopen. */
 			fprintf(stderr, "pagestore_daemon: FATAL: tier upload did not stop during shutdown\n");
 			_exit(EXIT_FAILURE);
@@ -10178,8 +10448,22 @@ ps_core_close(void)
 			fprintf(stderr, "pagestore_daemon: FATAL: local eviction verifier did not stop during shutdown\n");
 			_exit(EXIT_FAILURE);
 		}
+		__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	}
-	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
+
+	for (uint32_t i = 0; i < ns; i++)
+	{
+		Shard	   *s = &g_shards[i];
+
+		if (s->memtable)
+		{
+			flush_memtable(s, (uint32_t) s->cur_seg, s->cur_off);
+			ps_memtable_destroy(s->memtable);
+			s->memtable = NULL;
+		}
+	}
+
+	ps_pgcache_free();
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (wal_segment_store_opened[tl])
 		{
@@ -10219,7 +10503,8 @@ prepare_segment_layers(uint32_t source_shard, uint32_t victim)
 	{
 		PsLayerDesc *d = &ps_layer_map.layers[i];
 
-		if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+		if (ps_timeline_live(d->timeline) &&
+			d->kind == PS_LAYER_IMAGE && !d->deleting &&
 			layer_shard_from_id(d->layer_id) == source_shard)
 			nlayers++;
 	}
@@ -10236,7 +10521,8 @@ prepare_segment_layers(uint32_t source_shard, uint32_t victim)
 		{
 			PsLayerDesc *d = &ps_layer_map.layers[i];
 
-			if (d->kind == PS_LAYER_IMAGE && !d->deleting &&
+			if (ps_timeline_live(d->timeline) &&
+				d->kind == PS_LAYER_IMAGE && !d->deleting &&
 				layer_shard_from_id(d->layer_id) == source_shard)
 				layers[nlayers++] = *d;
 		}
@@ -10284,7 +10570,8 @@ verify_segment_layers_locked(uint32_t source_shard, uint32_t victim, int need_la
 		uint32_t	n;
 		int			covers = 0;
 
-		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+		if (!ps_timeline_live(d->timeline) ||
+			d->kind != PS_LAYER_IMAGE || d->deleting ||
 			layer_shard_from_id(d->layer_id) != source_shard)
 			continue;
 		if (ps_image_layer_read_index(d, &idx, &n) != 0)
@@ -10406,117 +10693,25 @@ verify_image_layer_refreshing(const PsLayerDesc *layer)
 	return ps_image_layer_verify_data(layer, page_size);
 }
 
-static void *
-tier_upload_worker(void *arg)
-{
-	PsLayerDesc *layer = arg;
-	int			rc;
-
-	/* Shutdown cancels optional object copies rather than waiting for a slow
-	 * object mount.  This worker owns no locks or shared allocations. */
-	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-	rc = ps_layer_store->upload_layer(layer);
-
-	__atomic_store_n(&tier_upload_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
-	return NULL;
-}
-
-/* Start or finish one immutable-layer upload without blocking a shard worker. */
+/* Publish the remote location and durability marker for an uploaded layer.
+ * The caller must have deferred cancellation disabled and hold the worker's
+ * lifecycle reservation for the entire operation. */
 static int
-tier_one_layer(void)
+finish_upload(const PsLayerDesc *candidate)
 {
-	PsLayerDesc candidate;
 	PsLayerDesc *current = NULL;
 	PsLayerLocation remote;
 	const PsLayerLocation *local;
-	struct timespec now;
-	int			state;
-	int			found = 0;
 
-	if (ps_layer_store->remote_uri == NULL || ps_layer_store->upload_layer == NULL)
-		return 0;
-	/* The local provider is always installed, but exposes remote callbacks even
-	 * when PAGESTORE_OBJECT_DIR is disabled.  Probe configuration before
-	 * scheduling a worker so local-only stores do not spin on ENOTSUP uploads. */
-	if (ps_layer_store->remote_uri(0, remote.uri, sizeof(remote.uri)) != 0)
-		return 0;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	if (tier_upload_retry_at.tv_sec != 0 &&
-		(now.tv_sec < tier_upload_retry_at.tv_sec ||
-		 (now.tv_sec == tier_upload_retry_at.tv_sec &&
-		  now.tv_nsec < tier_upload_retry_at.tv_nsec)))
-		return 0;
-	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
-	if (state == 1)
-		return 0;
-	if (state != 0)
-	{
-		if (!tier_upload_joined)
-			pthread_join(tier_upload_thread, NULL);
-		tier_upload_joined = 0;
-		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
-		if (state != 2)
-		{
-			clock_gettime(CLOCK_MONOTONIC, &tier_upload_retry_at);
-			tier_upload_retry_at.tv_sec++;
-			return 0;
-		}
-		memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
-		candidate = tier_upload_candidate;
-		goto finish_upload;
-	}
-	ps_lock_map_rd();
-	for (uint32_t pass = 0; pass < core_shards() && !found; pass++)
-	{
-		uint32_t shard = (tier_upload_shard_cursor + pass) % core_shards();
-
-		for (uint32_t phase = 0; phase < 2 && !found; phase++)
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		{
-			PsLayerDesc *layer = &ps_layer_map.layers[i];
-
-			if (!layer->deleting && !layer->remote_durable &&
-				tier_local_location(layer) != NULL &&
-				layer_shard_from_id(layer->layer_id) == shard &&
-				(tier_remote_location(layer) == NULL ||
-				 (ps_layer_store->remote_uri(layer->layer_id, remote.uri,
-										 sizeof(remote.uri)) == 0 &&
-				  strcmp(tier_remote_location(layer)->uri, remote.uri) == 0)) &&
-				((phase == 0 && layer->layer_id > tier_upload_layer_cursor[shard]) ||
-				 (phase == 1 && layer->layer_id <= tier_upload_layer_cursor[shard])))
-			{
-				candidate = *layer;
-				found = 1;
-				break;
-			}
-		}
-	}
-	ps_unlock_map();
-	if (!found)
-		return 0;
-
-	tier_upload_shard_cursor = (layer_shard_from_id(candidate.layer_id) + 1) % core_shards();
-	tier_upload_layer_cursor[layer_shard_from_id(candidate.layer_id)] = candidate.layer_id;
-	tier_upload_candidate = candidate;
-	__atomic_store_n(&tier_upload_state, 1, __ATOMIC_RELEASE);
-	if (pthread_create(&tier_upload_thread, NULL, tier_upload_worker,
-					   &tier_upload_candidate) != 0)
-	{
-		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
-		return 0;
-	}
-	return 1;
-
-
-finish_upload:
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+		if (ps_layer_map.layers[i].layer_id == candidate->layer_id)
 		{
 			current = &ps_layer_map.layers[i];
 			break;
 		}
-	if (current == NULL || current->deleting)
+	if (current == NULL || current->deleting ||
+		!ps_timeline_live(current->timeline))
 	{
 		ps_unlock_map();
 		return 1;
@@ -10529,6 +10724,11 @@ finish_upload:
 	if (tier_remote_location(current) == NULL)
 	{
 		local = tier_local_location(current);
+		if (local == NULL)
+		{
+			ps_unlock_map();
+			return 0;
+		}
 		memset(&remote, 0, sizeof(remote));
 		remote.tier = PS_LAYER_TIER_REMOTE_OBJECT;
 		remote.size = local->size;
@@ -10551,18 +10751,197 @@ finish_upload:
 }
 
 static void *
+tier_upload_worker(void *arg)
+{
+	PsLayerDesc *layer = arg;
+	int old_state;
+	int			rc;
+
+	/* Shutdown cancels optional object copies rather than waiting for a slow
+	 * object mount.  The cleanup handler releases its lifecycle reservation. */
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	ps_lifecycle_read_adopt_reserved();
+	pthread_cleanup_push(lifecycle_worker_cleanup, NULL);
+	rc = ps_layer_store->upload_layer(layer);
+	if (tier_upload_before_publish_test_hook != NULL)
+		tier_upload_before_publish_test_hook(
+			tier_upload_before_publish_test_hook_arg);
+	/* Keep the reservation through map/manifest publication.  In particular,
+	 * do not let shutdown cancellation split a successful remote upload from
+	 * its local durable publication. */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+	if (rc == 0)
+		rc = finish_upload(layer) ? 0 : -1;
+	__atomic_store_n(&tier_upload_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	pthread_setcancelstate(old_state, NULL);
+	pthread_cleanup_pop(1);
+	return NULL;
+}
+
+/* Start or finish one immutable-layer upload without blocking a shard worker. */
+static int
+tier_one_layer(void)
+{
+	PsLayerDesc candidate;
+	PsLayerLocation remote;
+	struct timespec now;
+	int			state;
+	int			found = 0;
+
+	if (ps_layer_store->remote_uri == NULL || ps_layer_store->upload_layer == NULL)
+		return 0;
+	/* The local provider is always installed, but exposes remote callbacks even
+	 * when PAGESTORE_OBJECT_DIR is disabled.  Probe configuration before
+	 * scheduling a worker so local-only stores do not spin on ENOTSUP uploads. */
+	if (ps_layer_store->remote_uri(0, remote.uri, sizeof(remote.uri)) != 0)
+		return 0;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (tier_upload_retry_at.tv_sec != 0 &&
+		(now.tv_sec < tier_upload_retry_at.tv_sec ||
+		 (now.tv_sec == tier_upload_retry_at.tv_sec &&
+		  now.tv_nsec < tier_upload_retry_at.tv_nsec)))
+		return 0;
+	state = __atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE);
+	if (state == 1)
+		return 0;
+	if (state != 0)
+	{
+		pthread_join(tier_upload_thread, NULL);
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		if (state != 2)
+		{
+			clock_gettime(CLOCK_MONOTONIC, &tier_upload_retry_at);
+			tier_upload_retry_at.tv_sec++;
+			return 0;
+		}
+		memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
+		return 1;
+	}
+	ps_lock_map_rd();
+	for (uint32_t pass = 0; pass < core_shards() && !found; pass++)
+	{
+		uint32_t shard = (tier_upload_shard_cursor + pass) % core_shards();
+
+		for (uint32_t phase = 0; phase < 2 && !found; phase++)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			if (ps_timeline_live(layer->timeline) && !layer->deleting &&
+				!layer->remote_durable &&
+				tier_local_location(layer) != NULL &&
+				layer_shard_from_id(layer->layer_id) == shard &&
+				(tier_remote_location(layer) == NULL ||
+				 (ps_layer_store->remote_uri(layer->layer_id, remote.uri,
+										 sizeof(remote.uri)) == 0 &&
+				  strcmp(tier_remote_location(layer)->uri, remote.uri) == 0)) &&
+				((phase == 0 && layer->layer_id > tier_upload_layer_cursor[shard]) ||
+				 (phase == 1 && layer->layer_id <= tier_upload_layer_cursor[shard])))
+			{
+				candidate = *layer;
+				found = 1;
+				break;
+			}
+		}
+	}
+	ps_unlock_map();
+	if (!found)
+		return 0;
+
+	tier_upload_shard_cursor = (layer_shard_from_id(candidate.layer_id) + 1) % core_shards();
+	tier_upload_layer_cursor[layer_shard_from_id(candidate.layer_id)] = candidate.layer_id;
+	tier_upload_candidate = candidate;
+	ps_lifecycle_read_reserve();
+	__atomic_store_n(&tier_upload_state, 1, __ATOMIC_RELEASE);
+	if (pthread_create(&tier_upload_thread, NULL, tier_upload_worker,
+					   &tier_upload_candidate) != 0)
+	{
+		ps_lifecycle_read_cancel_reservation();
+		__atomic_store_n(&tier_upload_state, 0, __ATOMIC_RELEASE);
+		return 0;
+	}
+	return 1;
+}
+
+/* Complete local eviction after remote verification, while the worker still
+ * owns its lifecycle reservation. */
+static int
+finish_evict(const PsLayerDesc *candidate)
+{
+	int found = 0;
+
+	ps_lock_map_wr();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].layer_id == candidate->layer_id)
+		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			if (!ps_timeline_live(layer->timeline) || layer->deleting ||
+				!layer->remote_durable || layer->local_pinned ||
+				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
+				(!layer->local_cleanup_pending &&
+				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			if (tier_local_location(layer) != NULL &&
+				ps_manifest_drop_local(candidate->layer_id) != 0)
+			{
+				ps_unlock_map();
+				return 0;
+			}
+			/* A later cache refill installs different physical bytes; require
+			 * the image data checksum to be verified again before serving it. */
+			layer->data_verified = false;
+			layer->cache_resident = false;
+			layer->local_cleanup_pending = true;
+			found = 1;
+			break;
+		}
+	if (!found)
+	{
+		ps_unlock_map();
+		return 0;
+	}
+	/* Keep the write lock through unlink: layer reads hold the matching read
+	 * lock while downloading/opening their cache file. */
+	found = (ps_layer_store->delete_local_layer(candidate) == 0);
+	if (found)
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == candidate->layer_id)
+			{
+				ps_layer_map.layers[i].local_cleanup_pending = false;
+				break;
+			}
+	ps_unlock_map();
+	return found;
+}
+
+static void *
 evict_local_worker(void *arg)
 {
 	PsLayerDesc *layer = arg;
-	int			rc = -1;
+	volatile int rc = -1;
+	int old_state;
 
 	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+	ps_lifecycle_read_adopt_reserved();
+	pthread_cleanup_push(lifecycle_worker_cleanup, NULL);
 	if (ps_layer_store->verify_remote_layer != NULL)
 		rc = ps_layer_store->verify_remote_layer(layer);
 	else if (ps_layer_store->layer_exists_remote != NULL &&
 			 ps_layer_store->layer_exists_remote(layer) == 1)
 		rc = 0;
+	/* Verification and manifest-drop/unlink publication share this lifecycle
+	 * reservation.  Do not allow deferred cancellation while publication holds
+	 * map-wr or performs manifest/filesystem I/O. */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+	if (rc == 0)
+		rc = finish_evict(layer) ? 0 : -1;
 	__atomic_store_n(&evict_local_state, rc == 0 ? 2 : 3, __ATOMIC_RELEASE);
+	pthread_setcancelstate(old_state, NULL);
+	pthread_cleanup_pop(1);
 	return NULL;
 }
 
@@ -10588,10 +10967,7 @@ evict_one_layer(void)
 	{
 		pthread_join(evict_local_thread, NULL);
 		__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
-		if (state != 2)
-			return 1;
-		candidate = evict_local_candidate;
-		goto finish_evict;
+		return 1;
 	}
 
 	ps_lock_map_rd();
@@ -10601,7 +10977,8 @@ evict_one_layer(void)
 		uint32_t	i = (evict_local_map_cursor + pass) % map_nlayers;
 		PsLayerDesc *layer = &ps_layer_map.layers[i];
 
-		if (!layer->deleting && layer->remote_durable && !layer->local_pinned &&
+		if (ps_timeline_live(layer->timeline) && !layer->deleting &&
+			layer->remote_durable && !layer->local_pinned &&
 			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) == 0 &&
 			(layer->local_cleanup_pending ||
 			 ps_layer_store->layer_exists_local(layer->layer_id) == 1))
@@ -10617,62 +10994,16 @@ evict_one_layer(void)
 		return 0;
 	evict_local_map_cursor = (found_idx + 1) % map_nlayers;
 	evict_local_candidate = candidate;
+	ps_lifecycle_read_reserve();
 	__atomic_store_n(&evict_local_state, 1, __ATOMIC_RELEASE);
 	if (pthread_create(&evict_local_thread, NULL, evict_local_worker,
 					   &evict_local_candidate) != 0)
 	{
+		ps_lifecycle_read_cancel_reservation();
 		__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 		return 0;
 	}
 	return 1;
-
-finish_evict:
-	ps_lock_map_wr();
-	found = 0;
-	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-		if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
-		{
-			PsLayerDesc *layer = &ps_layer_map.layers[i];
-
-			if (layer->deleting || !layer->remote_durable || layer->local_pinned ||
-				__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0 ||
-				(!layer->local_cleanup_pending &&
-				 ps_layer_store->layer_exists_local(layer->layer_id) != 1))
-			{
-				ps_unlock_map();
-				return 0;
-			}
-			if (tier_local_location(&ps_layer_map.layers[i]) != NULL &&
-				ps_manifest_drop_local(candidate.layer_id) != 0)
-			{
-				ps_unlock_map();
-				return 0;
-			}
-			/* A later cache refill installs different physical bytes; require
-			 * the image data checksum to be verified again before serving it. */
-			ps_layer_map.layers[i].data_verified = false;
-			ps_layer_map.layers[i].cache_resident = false;
-			ps_layer_map.layers[i].local_cleanup_pending = true;
-			found = 1;
-			break;
-		}
-	if (!found)
-	{
-		ps_unlock_map();
-		return 0;
-	}
-	/* Keep the write lock through unlink: layer reads hold the matching read
-	 * lock while downloading/opening their cache file. */
-	found = (ps_layer_store->delete_local_layer(&candidate) == 0);
-	if (found)
-		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
-			if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
-			{
-				ps_layer_map.layers[i].local_cleanup_pending = false;
-				break;
-			}
-	ps_unlock_map();
-	return found;
 }
 
 /*
@@ -10682,8 +11013,8 @@ finish_evict:
  * maintenance classes make progress.  Returns 1 if it did work (the caller
  * should run another tick), 0 if nothing was due.
  */
-int
-ps_core_maintenance(void)
+static int
+ps_core_maintenance_impl(void)
 {
 	uint32_t	ns;
 	uint32_t	ftl = 0,
@@ -10792,7 +11123,7 @@ ps_core_maintenance(void)
 	ps_lock_map_rd();
 	for (uint32_t tl = 0; tl < MAX_TIMELINES && !found; tl++)
 		for (uint32_t sh = 0; sh < ns; sh++)
-			if ((tl == 0 || timelines[tl].defined) &&
+			if (ps_timeline_live(tl) &&
 				(count_image_layers(tl, sh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[tl][sh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(tl, sh) > 0)))
@@ -10827,7 +11158,8 @@ ps_core_maintenance(void)
 				ps_lock_shard_wr(fsh);
 			pthread_rwlock_rdlock(&page_prune_lock);
 			ps_lock_map_wr();
-			if ((count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
+			if (ps_timeline_live(ftl) &&
+				(count_image_layers(ftl, fsh) > (uint32_t) compact_layers ||
 				 (__atomic_load_n(&page_prune_due[ftl][fsh], __ATOMIC_ACQUIRE) != 0 &&
 				  count_image_layers(ftl, fsh) > 0)) &&
 				retention_effective_floor_internal(ftl,
@@ -10883,6 +11215,20 @@ ps_core_maintenance(void)
 			did = 1;
 	}
 
+	return did;
+}
+
+int
+ps_core_maintenance(void)
+{
+	int did;
+
+	/* Keep lifecycle-rd across the complete synchronous call.  Any asynchronous
+	 * worker started within it reserves an additional reader before create and
+	 * releases that reservation from its thread cleanup handler. */
+	ps_lifecycle_read_lock();
+	did = ps_core_maintenance_impl();
+	ps_lifecycle_read_unlock();
 	return did;
 }
 
@@ -10949,7 +11295,6 @@ ps_core_open(const char *store_dir)
 	fork_meta_legacy = 0;
 	fork_meta_migrate_failed = 0;
 	map_locks_ready = 0;
-	tier_upload_joined = 0;
 	memset(&tier_upload_retry_at, 0, sizeof(tier_upload_retry_at));
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
 	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);

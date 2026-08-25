@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,8 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_layer_store.h"
+#include "pagestore_manifest.h"
 #include "pagestore_retention.h"
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
@@ -66,7 +69,26 @@ enum TimelineAppendMode
 	TIMELINE_APPEND_AMBIGUOUS
 };
 static enum TimelineAppendMode timeline_append_mode;
+static PsLayerStore maintenance_store;
+static uint32_t watched_maintenance_timeline;
+static int watched_uploads;
 
+static int
+maintenance_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
+{
+	int n = snprintf(uri, uri_len, "/tmp/unused-layer-%llu",
+					 (unsigned long long) layer_id);
+
+	return n < 0 || (uint32_t) n >= uri_len ? -1 : 0;
+}
+
+static int
+counted_upload(const PsLayerDesc *layer)
+{
+	if (layer->timeline == watched_maintenance_timeline)
+		watched_uploads++;
+	return -1;
+}
 static int
 test_meta_append(const void *buf, uint32_t len)
 {
@@ -158,9 +180,11 @@ state_of(uint32_t timeline, PsTimelineState *state, uint64_t *incarnation)
 	ch.opcode = PS_OP_TIMELINE_STATE;
 	ch.timeline = timeline;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_lock_map_rd();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
+	ps_lifecycle_read_unlock();
 	ok = ch.status == PS_STATUS_OK;
 	if (ok && state != NULL)
 		*state = (PsTimelineState) ch.result;
@@ -180,11 +204,13 @@ create_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
 	ch.parent_timeline = parent;
 	ch.req_lsn = branch_lsn;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_admission_read_lock();
 	ps_lock_map_wr();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
 	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
 
@@ -199,15 +225,109 @@ begin_delete(uint32_t timeline, uint64_t expected_incarnation,
 	ch.timeline = timeline;
 	ch.req_seq = expected_incarnation;
 	ch.status = PS_STATUS_OK;
-	if (ps_admission_write_lock() != 0)
+	if (ps_lifecycle_write_lock() != 0)
 		return 0;
+	if (ps_admission_write_lock() != 0)
+	{
+		ps_lifecycle_write_unlock();
+		return 0;
+	}
 	ps_lock_map_wr();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
 	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
 	if (out != NULL)
 		*out = ch;
 	return ch.status == PS_STATUS_OK;
+}
+
+static int
+write_timeline_layer(uint32_t timeline, uint32_t block, uint32_t lsn_lo)
+{
+	unsigned char page[8192];
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint32_t lsn_hi = 0;
+	int rc;
+
+	memset(page, 0x5A, sizeof(page));
+	memcpy(page, &lsn_hi, sizeof(lsn_hi));
+	memcpy(page + sizeof(lsn_hi), &lsn_lo, sizeof(lsn_lo));
+	ps_lock_shard_wr(ps_shard_of(&key));
+	rc = append_page(timeline, &key, block, page, 0, NULL);
+	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
+
+static uint32_t
+timeline_layer_fingerprint(uint32_t timeline, uint64_t *fingerprint,
+						   int *remote_durable)
+{
+	uint32_t count = 0;
+	uint64_t ids = 0;
+	int remote = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+		{
+			ids ^= ps_layer_map.layers[i].layer_id;
+			remote |= ps_layer_map.layers[i].remote_durable;
+			count++;
+		}
+	ps_unlock_map();
+	*fingerprint = ids;
+	*remote_durable = remote;
+	return count;
+}
+
+static int
+test_deleting_timeline_skips_maintenance(uint32_t timeline)
+{
+	uint64_t before_ids;
+	uint64_t after_ids;
+	uint64_t saved_segment_size = segment_size;
+	uint32_t before_count;
+	uint32_t after_count;
+	int before_remote;
+	int after_remote;
+	int ok;
+
+	/* Two page records cannot share a 16KiB segment, making segment 0 a due
+	 * reclamation victim once both flushes publish their layer watermarks. */
+	segment_size = 16384;
+	if (write_timeline_layer(timeline, 0, 100) != 0 ||
+		write_timeline_layer(timeline, 1, 200) != 0)
+	{
+		segment_size = saved_segment_size;
+		return 0;
+	}
+	before_count = timeline_layer_fingerprint(timeline, &before_ids,
+										 &before_remote);
+	if (before_count == 0 || ps_storage->seg_size(0, 0) <= 0 ||
+		ps_storage->seg_size(0, 1) <= 0 || !begin_delete(timeline, 1, NULL))
+	{
+		segment_size = saved_segment_size;
+		return 0;
+	}
+	maintenance_store = PsLayerStoreLocal;
+	maintenance_store.remote_uri = maintenance_remote_uri;
+	maintenance_store.upload_layer = counted_upload;
+	ps_layer_store = &maintenance_store;
+	watched_maintenance_timeline = timeline;
+	watched_uploads = 0;
+	segment_gc_enabled = 1;
+	for (int i = 0; i < 100; i++)
+		(void) ps_core_maintenance();
+	after_count = timeline_layer_fingerprint(timeline, &after_ids,
+									  &after_remote);
+	ok = watched_uploads == 0 && ps_storage->seg_size(0, 0) > 0 &&
+		after_count == before_count && after_ids == before_ids &&
+		!before_remote && !after_remote;
+	ps_layer_store = &PsLayerStoreLocal;
+	segment_gc_enabled = 0;
+	segment_size = saved_segment_size;
+	return ok;
 }
 
 static int
@@ -222,11 +342,13 @@ branch_request(PsOpcode opcode, uint32_t timeline, uint32_t parent,
 	ch.parent_timeline = parent;
 	ch.req_lsn = branch_lsn;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_admission_read_lock();
 	ps_lock_map_wr();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
 	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
 
@@ -234,9 +356,170 @@ typedef struct AdmissionReader
 {
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
+	uint32_t timeline;
 	int ready;
 	int release;
 } AdmissionReader;
+
+typedef struct LockObserver
+{
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int entered;
+	int acquired;
+	int release;
+} LockObserver;
+
+typedef struct InterruptibleWriter
+{
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	volatile sig_atomic_t stop;
+	int done;
+	int rc;
+} InterruptibleWriter;
+
+static void *lifecycle_reader_main(void *arg);
+
+static void
+observer_init(LockObserver *observer)
+{
+	memset(observer, 0, sizeof(*observer));
+	pthread_mutex_init(&observer->mutex, NULL);
+	pthread_cond_init(&observer->cond, NULL);
+}
+
+static void
+observer_destroy(LockObserver *observer)
+{
+	pthread_cond_destroy(&observer->cond);
+	pthread_mutex_destroy(&observer->mutex);
+}
+
+static void
+observer_wait(LockObserver *observer, int acquired)
+{
+	pthread_mutex_lock(&observer->mutex);
+	while (!(acquired ? observer->acquired : observer->entered))
+		pthread_cond_wait(&observer->cond, &observer->mutex);
+	pthread_mutex_unlock(&observer->mutex);
+}
+
+static int
+observe_write_lock(pthread_rwlock_t *lock, void *arg)
+{
+	LockObserver *observer = arg;
+
+	pthread_mutex_lock(&observer->mutex);
+	observer->entered = 1;
+	pthread_cond_broadcast(&observer->cond);
+	pthread_mutex_unlock(&observer->mutex);
+	if (pthread_rwlock_wrlock(lock) != 0)
+		return -1;
+	pthread_mutex_lock(&observer->mutex);
+	observer->acquired = 1;
+	pthread_cond_broadcast(&observer->cond);
+	while (!observer->release)
+		pthread_cond_wait(&observer->cond, &observer->mutex);
+	pthread_mutex_unlock(&observer->mutex);
+	return 0;
+}
+
+static void
+observe_writer_queued(void *arg)
+{
+	LockObserver *observer = arg;
+
+	pthread_mutex_lock(&observer->mutex);
+	observer->entered = 1;
+	pthread_cond_broadcast(&observer->cond);
+	pthread_mutex_unlock(&observer->mutex);
+}
+
+static void *
+interruptible_writer_main(void *arg)
+{
+	InterruptibleWriter *writer = arg;
+	int rc = ps_lifecycle_write_lock_interruptible(&writer->stop);
+
+	if (rc == 0)
+		ps_lifecycle_write_unlock();
+	pthread_mutex_lock(&writer->mutex);
+	writer->rc = rc;
+	writer->done = 1;
+	pthread_cond_broadcast(&writer->cond);
+	pthread_mutex_unlock(&writer->mutex);
+	return NULL;
+}
+
+static int
+test_interruptible_lifecycle_writer(uint32_t timeline)
+{
+	AdmissionReader reader;
+	LockObserver observer;
+	InterruptibleWriter writer;
+	pthread_t reader_thread;
+	pthread_t writer_thread;
+	int ok = 0;
+
+	memset(&reader, 0, sizeof(reader));
+	memset(&writer, 0, sizeof(writer));
+	observer_init(&observer);
+	pthread_mutex_init(&reader.mutex, NULL);
+	pthread_cond_init(&reader.cond, NULL);
+	pthread_mutex_init(&writer.mutex, NULL);
+	pthread_cond_init(&writer.cond, NULL);
+	reader.timeline = timeline;
+	if (pthread_create(&reader_thread, NULL, lifecycle_reader_main, &reader) != 0)
+		goto out;
+	pthread_mutex_lock(&reader.mutex);
+	while (!reader.ready)
+		pthread_cond_wait(&reader.cond, &reader.mutex);
+	pthread_mutex_unlock(&reader.mutex);
+	ps_test_set_lifecycle_write_queued_hook(observe_writer_queued, &observer);
+	if (pthread_create(&writer_thread, NULL, interruptible_writer_main, &writer) != 0)
+	{
+		pthread_mutex_lock(&reader.mutex);
+		reader.release = 1;
+		pthread_cond_broadcast(&reader.cond);
+		pthread_mutex_unlock(&reader.mutex);
+		pthread_join(reader_thread, NULL);
+		goto clear_hook;
+	}
+	observer_wait(&observer, 0);
+	writer.stop = 1;
+	pthread_mutex_lock(&writer.mutex);
+	while (!writer.done)
+		pthread_cond_wait(&writer.cond, &writer.mutex);
+	pthread_mutex_unlock(&writer.mutex);
+	pthread_join(writer_thread, NULL);
+	check(writer.rc == ECANCELED,
+		  "stop-aware lifecycle writer withdraws from the queued writer set");
+	pthread_mutex_lock(&reader.mutex);
+	reader.release = 1;
+	pthread_cond_broadcast(&reader.cond);
+	pthread_mutex_unlock(&reader.mutex);
+	pthread_join(reader_thread, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	check(ps_lifecycle_write_lock() == 0,
+		  "a canceled lifecycle writer leaves the normal writer path usable");
+	ps_lifecycle_write_unlock();
+	ps_lifecycle_read_lock();
+	ps_lifecycle_read_unlock();
+	ok = 1;
+	goto out;
+
+clear_hook:
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+out:
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	pthread_cond_destroy(&writer.cond);
+	pthread_mutex_destroy(&writer.mutex);
+	pthread_cond_destroy(&reader.cond);
+	pthread_mutex_destroy(&reader.mutex);
+	observer_destroy(&observer);
+	return ok;
+}
 
 typedef struct DeleteThread
 {
@@ -264,6 +547,92 @@ admission_reader_main(void *arg)
 }
 
 static void *
+lifecycle_reader_main(void *arg)
+{
+	AdmissionReader *reader = arg;
+	PsChannel ch;
+
+	ps_lifecycle_read_lock();
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_TIMELINE_STATE;
+	ch.timeline = reader->timeline;
+	ch.status = PS_STATUS_OK;
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	pthread_mutex_lock(&reader->mutex);
+	reader->ready = 1;
+	pthread_cond_broadcast(&reader->cond);
+	while (!reader->release)
+		pthread_cond_wait(&reader->cond, &reader->mutex);
+	pthread_mutex_unlock(&reader->mutex);
+	ps_lifecycle_read_unlock();
+	return NULL;
+}
+
+typedef struct ReadProbe
+{
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int started;
+	int entered;
+	int done;
+} ReadProbe;
+
+static void
+observe_reader_queued(void *arg)
+{
+	ReadProbe *probe = arg;
+
+	pthread_mutex_lock(&probe->mutex);
+	probe->started = 1;
+	pthread_cond_broadcast(&probe->cond);
+	pthread_mutex_unlock(&probe->mutex);
+}
+
+static void
+read_probe_init(ReadProbe *probe)
+{
+	memset(probe, 0, sizeof(*probe));
+	pthread_mutex_init(&probe->mutex, NULL);
+	pthread_cond_init(&probe->cond, NULL);
+}
+
+static void
+read_probe_destroy(ReadProbe *probe)
+{
+	pthread_cond_destroy(&probe->cond);
+	pthread_mutex_destroy(&probe->mutex);
+}
+
+static void *
+read_probe_main(void *arg)
+{
+	ReadProbe *probe = arg;
+
+	ps_lifecycle_read_lock();
+	pthread_mutex_lock(&probe->mutex);
+	probe->entered = 1;
+	pthread_cond_broadcast(&probe->cond);
+	pthread_mutex_unlock(&probe->mutex);
+	ps_lifecycle_read_unlock();
+	pthread_mutex_lock(&probe->mutex);
+	probe->done = 1;
+	pthread_cond_broadcast(&probe->cond);
+	pthread_mutex_unlock(&probe->mutex);
+	return NULL;
+}
+
+static void
+read_probe_wait_started(ReadProbe *probe)
+{
+	pthread_mutex_lock(&probe->mutex);
+	while (!probe->started)
+		pthread_cond_wait(&probe->cond, &probe->mutex);
+	pthread_mutex_unlock(&probe->mutex);
+}
+
+static void *
 delete_thread_main(void *arg)
 {
 	DeleteThread *request = arg;
@@ -277,14 +646,14 @@ static int
 test_admission_drain(uint32_t timeline)
 {
 	AdmissionReader reader;
+	LockObserver observer;
 	DeleteThread request;
 	pthread_t reader_thread;
 	pthread_t delete_thread;
-	struct timespec pause = {0, 30000000};
-	int not_done;
 
 	memset(&reader, 0, sizeof(reader));
 	memset(&request, 0, sizeof(request));
+	observer_init(&observer);
 	pthread_mutex_init(&reader.mutex, NULL);
 	pthread_cond_init(&reader.cond, NULL);
 	request.timeline = timeline;
@@ -292,12 +661,14 @@ test_admission_drain(uint32_t timeline)
 	{
 		pthread_cond_destroy(&reader.cond);
 		pthread_mutex_destroy(&reader.mutex);
+		observer_destroy(&observer);
 		return 0;
 	}
 	pthread_mutex_lock(&reader.mutex);
 	while (!reader.ready)
 		pthread_cond_wait(&reader.cond, &reader.mutex);
 	pthread_mutex_unlock(&reader.mutex);
+	ps_test_set_admission_write_lock_hook(observe_write_lock, &observer);
 	if (pthread_create(&delete_thread, NULL, delete_thread_main, &request) != 0)
 	{
 		pthread_mutex_lock(&reader.mutex);
@@ -305,21 +676,218 @@ test_admission_drain(uint32_t timeline)
 		pthread_cond_broadcast(&reader.cond);
 		pthread_mutex_unlock(&reader.mutex);
 		pthread_join(reader_thread, NULL);
+		ps_test_set_admission_write_lock_hook(NULL, NULL);
 		pthread_cond_destroy(&reader.cond);
 		pthread_mutex_destroy(&reader.mutex);
+		observer_destroy(&observer);
 		return 0;
 	}
-	nanosleep(&pause, NULL);
-	not_done = __atomic_load_n(&request.done, __ATOMIC_ACQUIRE) == 0;
+	observer_wait(&observer, 0);
+	/* The admission writer is now known to be queued behind the reader. */
 	pthread_mutex_lock(&reader.mutex);
 	reader.release = 1;
 	pthread_cond_broadcast(&reader.cond);
 	pthread_mutex_unlock(&reader.mutex);
+	observer_wait(&observer, 1);
+	pthread_mutex_lock(&observer.mutex);
+	observer.release = 1;
+	pthread_cond_broadcast(&observer.cond);
+	pthread_mutex_unlock(&observer.mutex);
 	pthread_join(reader_thread, NULL);
 	pthread_join(delete_thread, NULL);
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	pthread_cond_destroy(&reader.cond);
 	pthread_mutex_destroy(&reader.mutex);
-	return not_done && request.ok;
+	observer_destroy(&observer);
+	return request.ok;
+}
+
+static int
+test_lifecycle_drain(uint32_t timeline)
+{
+	AdmissionReader reader;
+	LockObserver observer;
+	ReadProbe late_reader;
+	DeleteThread request;
+	pthread_t reader_thread;
+	pthread_t delete_thread;
+	pthread_t late_thread;
+	int late_entered;
+
+	memset(&reader, 0, sizeof(reader));
+	memset(&request, 0, sizeof(request));
+	observer_init(&observer);
+	read_probe_init(&late_reader);
+	pthread_mutex_init(&reader.mutex, NULL);
+	pthread_cond_init(&reader.cond, NULL);
+	reader.timeline = timeline;
+	request.timeline = timeline;
+	if (pthread_create(&reader_thread, NULL, lifecycle_reader_main, &reader) != 0)
+		goto fail;
+	pthread_mutex_lock(&reader.mutex);
+	while (!reader.ready)
+		pthread_cond_wait(&reader.cond, &reader.mutex);
+	pthread_mutex_unlock(&reader.mutex);
+	ps_test_set_lifecycle_write_queued_hook(observe_writer_queued, &observer);
+	ps_test_set_lifecycle_write_lock_hook(observe_write_lock, &observer);
+	if (pthread_create(&delete_thread, NULL, delete_thread_main, &request) != 0)
+	{
+		pthread_mutex_lock(&reader.mutex);
+		reader.release = 1;
+		pthread_cond_broadcast(&reader.cond);
+		pthread_mutex_unlock(&reader.mutex);
+		pthread_join(reader_thread, NULL);
+		goto fail_hooks;
+	}
+	observer_wait(&observer, 0);
+	/* The delete writer is queued behind the complete ordinary request. */
+	ps_test_set_lifecycle_read_queued_hook(observe_reader_queued, &late_reader);
+	if (pthread_create(&late_thread, NULL, read_probe_main, &late_reader) != 0)
+	{
+		pthread_mutex_lock(&reader.mutex);
+		reader.release = 1;
+		pthread_cond_broadcast(&reader.cond);
+		pthread_mutex_unlock(&reader.mutex);
+		pthread_join(reader_thread, NULL);
+		pthread_mutex_lock(&observer.mutex);
+		observer.release = 1;
+		pthread_cond_broadcast(&observer.cond);
+		pthread_mutex_unlock(&observer.mutex);
+		pthread_join(delete_thread, NULL);
+		goto fail_hooks;
+	}
+	read_probe_wait_started(&late_reader);
+	/* The queued writer closes the turnstile before this late reader can enter. */
+	pthread_mutex_lock(&late_reader.mutex);
+	late_entered = late_reader.entered;
+	pthread_mutex_unlock(&late_reader.mutex);
+
+	pthread_mutex_lock(&reader.mutex);
+	reader.release = 1;
+	pthread_cond_broadcast(&reader.cond);
+	pthread_mutex_unlock(&reader.mutex);
+	observer_wait(&observer, 1);
+
+	pthread_mutex_lock(&observer.mutex);
+	observer.release = 1;
+	pthread_cond_broadcast(&observer.cond);
+	pthread_mutex_unlock(&observer.mutex);
+	pthread_join(reader_thread, NULL);
+	pthread_join(delete_thread, NULL);
+	pthread_join(late_thread, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+	ps_test_set_lifecycle_read_queued_hook(NULL, NULL);
+	pthread_cond_destroy(&reader.cond);
+	pthread_mutex_destroy(&reader.mutex);
+	observer_destroy(&observer);
+	read_probe_destroy(&late_reader);
+	return !late_entered && request.ok;
+
+fail_hooks:
+	ps_test_set_lifecycle_read_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+fail:
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+	pthread_cond_destroy(&reader.cond);
+	pthread_mutex_destroy(&reader.mutex);
+	observer_destroy(&observer);
+	read_probe_destroy(&late_reader);
+	return 0;
+}
+
+static void
+lifecycle_read_hold_hook(void *arg)
+{
+	AdmissionReader *reader = arg;
+
+	pthread_mutex_lock(&reader->mutex);
+	reader->ready = 1;
+	pthread_cond_broadcast(&reader->cond);
+	while (!reader->release)
+		pthread_cond_wait(&reader->cond, &reader->mutex);
+	pthread_mutex_unlock(&reader->mutex);
+}
+
+static void *
+maintenance_main(void *arg)
+{
+	int *done = arg;
+
+	(void) ps_core_maintenance();
+	*done = 1;
+	return NULL;
+}
+
+static int
+test_maintenance_drain(uint32_t timeline)
+{
+	AdmissionReader gate;
+	LockObserver observer;
+	DeleteThread request;
+	pthread_t maintenance_thread;
+	pthread_t delete_thread;
+	int maintenance_done = 0;
+
+	memset(&gate, 0, sizeof(gate));
+	memset(&request, 0, sizeof(request));
+	observer_init(&observer);
+	pthread_mutex_init(&gate.mutex, NULL);
+	pthread_cond_init(&gate.cond, NULL);
+	request.timeline = timeline;
+	ps_test_set_lifecycle_read_hook(lifecycle_read_hold_hook, &gate);
+	if (pthread_create(&maintenance_thread, NULL, maintenance_main,
+						   &maintenance_done) != 0)
+		goto fail;
+	pthread_mutex_lock(&gate.mutex);
+	while (!gate.ready)
+		pthread_cond_wait(&gate.cond, &gate.mutex);
+	pthread_mutex_unlock(&gate.mutex);
+	ps_test_set_lifecycle_write_queued_hook(observe_writer_queued, &observer);
+	ps_test_set_lifecycle_write_lock_hook(observe_write_lock, &observer);
+	if (pthread_create(&delete_thread, NULL, delete_thread_main, &request) != 0)
+	{
+		pthread_mutex_lock(&gate.mutex);
+		gate.release = 1;
+		pthread_cond_broadcast(&gate.cond);
+		pthread_mutex_unlock(&gate.mutex);
+		pthread_join(maintenance_thread, NULL);
+		goto fail_hooks;
+	}
+	observer_wait(&observer, 0);
+	pthread_mutex_lock(&gate.mutex);
+	gate.release = 1;
+	pthread_cond_broadcast(&gate.cond);
+	pthread_mutex_unlock(&gate.mutex);
+	observer_wait(&observer, 1);
+	pthread_mutex_lock(&observer.mutex);
+	observer.release = 1;
+	pthread_cond_broadcast(&observer.cond);
+	pthread_mutex_unlock(&observer.mutex);
+	pthread_join(maintenance_thread, NULL);
+	pthread_join(delete_thread, NULL);
+	ps_test_set_lifecycle_read_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+	pthread_cond_destroy(&gate.cond);
+	pthread_mutex_destroy(&gate.mutex);
+	observer_destroy(&observer);
+	return maintenance_done == 1 && request.ok;
+
+fail_hooks:
+	ps_test_set_lifecycle_read_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+fail:
+	ps_test_set_lifecycle_read_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_queued_hook(NULL, NULL);
+	ps_test_set_lifecycle_write_lock_hook(NULL, NULL);
+	pthread_cond_destroy(&gate.cond);
+	pthread_mutex_destroy(&gate.mutex);
+	observer_destroy(&observer);
+	return 0;
 }
 
 static int
@@ -333,11 +901,13 @@ meta_exists(uint32_t timeline)
 	ch.timeline = timeline;
 	ch.key = key;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_lock_shard_rd(ps_shard_of(&key));
 	ps_lock_map_rd();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
 	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
 
@@ -350,9 +920,11 @@ timeline_info(uint32_t timeline)
 	ch.opcode = PS_OP_TIMELINE_INFO;
 	ch.timeline = timeline;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_lock_map_rd();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
+	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
 
@@ -365,11 +937,13 @@ wal_size_allowed(uint32_t timeline)
 	ch.opcode = PS_OP_WAL_SIZE;
 	ch.timeline = timeline;
 	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
 	ps_lock_shard_rd(0);
 	ps_lock_map_rd();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
 	ps_unlock_shard(0);
+	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
 
@@ -613,12 +1187,28 @@ test_v2_and_mixed_lifecycle(void)
 	}
 	close_store();
 	check(ps_core_open(store) == 0, "reopen after ambiguous append");
-	check(state_of(13, &state, &incarnation) &&
-		  state == PS_TIMELINE_DELETING && incarnation == 1,
-		  "ambiguous append replays the durable deleting event");
+		check(state_of(13, &state, &incarnation) &&
+			  state == PS_TIMELINE_DELETING && incarnation == 1,
+			  "ambiguous append replays the durable deleting event");
+	check(create_branch(14, 0, 320), "create lifecycle drain test timeline");
+	check(test_interruptible_lifecycle_writer(14),
+		  "SIGTERM-aware BEGIN_DELETE writer exits before shutdown joins");
+	check(test_lifecycle_drain(14),
+		  "BEGIN_DELETE drains ordinary lifecycle readers and queues fairly");
+	check(state_of(14, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "ordinary-reader drain leaves timeline deleting");
+	check(create_branch(15, 0, 330), "create maintenance drain test timeline");
+	check(test_maintenance_drain(15),
+		  "BEGIN_DELETE waits for complete maintenance invocation");
+	check(state_of(15, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "maintenance drain leaves timeline deleting");
 	check(test_admission_drain(12) && state_of(12, &state, NULL) &&
 		  state == PS_TIMELINE_DELETING,
 		  "BEGIN_DELETE waits for mutation admission section to drain");
+	check(create_branch(16, 0, 340),
+		  "create deleting-timeline maintenance test timeline");
+	check(test_deleting_timeline_skips_maintenance(16),
+		  "maintenance does not tier, compact, or segment-GC a DELETING timeline");
 	close_store();
 
 	/* A partial final event is discarded, while the valid prefix remains. */
