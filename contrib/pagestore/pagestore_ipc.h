@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		33	/* 33: WAL-index known/FPI + record-end metadata;
+#define PS_SHM_VERSION		34	/* 34: timeline deletion lifecycle/state query;
+								 * 33: WAL-index known/FPI + record-end metadata;
 								 * 32: coherent page-pruning metrics;
 								 * 31: page-pruning metrics;
 								 * 30: keyed retention lookup;
@@ -119,7 +120,16 @@ typedef enum PsOpcode
 	PS_OP_RETENTION_PIN_GET,	/* enumerate by blocknum; nblocks = total count */
 	PS_OP_RETENTION_PIN_LOOKUP,	/* atomic lookup by timeline/kind/owner id */
 	PS_OP_RETENTION_FLOOR,		/* effective floor for parent_timeline resource */
+	PS_OP_BEGIN_DELETE,			/* durable LIVE -> DELETING transition */
+	PS_OP_TIMELINE_STATE,		/* return lifecycle state/incarnation */
 } PsOpcode;
+
+typedef enum PsTimelineState
+{
+	PS_TIMELINE_LIVE = 1,
+	PS_TIMELINE_DELETING = 2,
+	PS_TIMELINE_DELETED = 3,
+} PsTimelineState;
 
 /* Status codes */
 #define PS_STATUS_OK		0

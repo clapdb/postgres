@@ -517,7 +517,13 @@ Expected scope: one implementation PR and one crash-test PR.
 
 ### R5. Delete timelines durably
 
-Status: **not started; blocked on R1-R4b and decision D4**.
+Status: **foundation in progress**.  The first slice adds legacy-only migration
+and V2 create/event mixed records, LIVE/DELETING state plus a reserved DELETED
+format value with incarnation, BEGIN_DELETE/STATE IPC, and
+descendant/retention-owner admission vetoes.  Its POSIX barrier drains admitted
+mutation sections only.  Ordinary reads, maintenance, and SPDK async request
+drain are follow-up work; no DELETED transition is exposed yet.  Physical
+cleanup and ID reuse remain follow-up stacked work.
 
 Deliverables:
 
@@ -812,7 +818,9 @@ pins, segment deletion, and reclamation of the corresponding flat prefix.
 Recommended for MVP: reject deletion while any descendant exists.  Do not add
 cascade or ancestry reparenting semantics.
 
-Decision: **open**.
+Decision: **accepted 2026-08-25**.  Reject deletion while any live or deleting
+descendant exists; do not cascade or reparent.  The first lifecycle slice
+implements this rule before durable transition publication.
 
 ### D5. Persisted-format support window
 

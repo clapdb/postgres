@@ -63,6 +63,8 @@ extern void ps_core_set_metrics_header(PsShmHeader *hdr);
 /* Assign a fence sequence only after all prior mutation bodies have left. */
 extern void ps_admission_read_lock(void);
 extern void ps_admission_read_unlock(void);
+extern int ps_admission_write_lock(void);
+extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
@@ -136,6 +138,9 @@ extern void ps_lock_map_wr(void);
 extern void ps_unlock_map(void);
 /* Caller holds map_lock.  Definitions are append-only during an open. */
 extern int ps_timeline_defined(uint32_t timeline);
+extern int ps_timeline_state(uint32_t timeline, PsTimelineState *state,
+							 uint64_t *incarnation);
+extern int ps_timeline_live(uint32_t timeline);
 
 /* Shard index that will be touched for 'key' (klass-aware); the frontend takes
  * the per-shard lock from the final request key, not a client-supplied shard. */

@@ -132,6 +132,11 @@ request_is_write(PsOpcode opcode)
 {
 	switch (opcode)
 	{
+		case PS_OP_BEGIN_DELETE:
+			/* The shared core lifecycle path needs a map lock and a complete
+			 * async-I/O drain.  This frontend does not provide that drain yet;
+			 * fail closed until the lifecycle-specific SPDK barrier lands. */
+			return 0;
 		case PS_OP_CREATE:
 		case PS_OP_UNLINK:
 		case PS_OP_TRUNCATE:
@@ -160,6 +165,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
+		case PS_OP_TIMELINE_STATE:
 			return 0;
 		default:
 			return 1;
@@ -381,6 +387,16 @@ run_request(uint32_t i, PsChannel *ch)
 	PsOpcode	op = (PsOpcode) ch->opcode;
 	int			is_write = request_is_write(op);
 	uint64_t	epoch;
+
+	if (op == PS_OP_BEGIN_DELETE)
+	{
+		ch->status = PS_STATUS_ERROR;
+		/* No SPDK lifecycle drain exists in this slice.  Complete the request
+		 * explicitly rather than entering begin()/the shared core without its
+		 * required map/admission synchronization. */
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return 1;
+	}
 
 	/* Retention registry operations own their own mutex; mutations can also
 	 * fsync host metadata.  Do not nest the global core lock around either. */
