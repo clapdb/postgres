@@ -4128,6 +4128,11 @@ static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migratio
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 static uint64_t fork_meta_snapshot_bytes;
 static int fork_meta_snapshot_gc_pending;
+/* A successful deletion-filtered cutover is sufficient for this process.  The
+ * selected snapshot/source pair remains authoritative after restart, while
+ * this transient fence prevents an idle maintenance loop from publishing the
+ * same filtered generation repeatedly before a reopen. */
+static unsigned char fork_meta_deletion_cutover_done[MAX_TIMELINES];
 /* A failed directory fsync after unlink leaves the next successful empty GC
  * as the operation that closes the durability ambiguity. */
 static int fork_meta_snapshot_gc_ambiguous;
@@ -4151,6 +4156,7 @@ static int fork_meta_snapshot_load(const char *directory);
 static int fork_meta_snapshot_reconcile_source(void);
 static int fork_meta_snapshot_maintenance(void);
 static int fork_meta_snapshot_due(void);
+static int fork_meta_snapshot_due_locked(void);
 
 static int
 fork_meta_vec_append(ForkMetaByteVec *vec, const void *data, size_t len)
@@ -4732,21 +4738,93 @@ load_fork_meta(void)
 	return 0;
 }
 
+static int
+fork_meta_timeline_is_deleting(uint32_t timeline)
+{
+	PsTimelineState state;
+
+	return ps_timeline_state(timeline, &state, NULL) &&
+		state == PS_TIMELINE_DELETING;
+}
+
+/* This lock-free outer probe consults only atomically published lifecycle
+ * state.  The fork-index scan itself must wait for the cutover's admission and
+ * shard write locks. */
+static int
+fork_meta_deletion_probe_due(void)
+{
+	for (uint32_t timeline = 0; timeline < MAX_TIMELINES; timeline++)
+		if (!__atomic_load_n(&fork_meta_deletion_cutover_done[timeline],
+								 __ATOMIC_ACQUIRE) &&
+			fork_meta_timeline_is_deleting(timeline))
+			return 1;
+	return 0;
+}
+
+/* Caller holds admission-write, every shard-write lock, and map-write. */
+static int
+fork_meta_deletion_records_present_locked(void)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+				if (e->timeline < MAX_TIMELINES && e->nev != 0 &&
+					fork_meta_timeline_is_deleting(e->timeline))
+					return 1;
+	return 0;
+}
+
+/* Caller holds admission-write, every shard-write lock, and map-write. */
+static int
+fork_meta_deletion_cutover_due_locked(void)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+			{
+				if (e->timeline >= MAX_TIMELINES ||
+					__atomic_load_n(&fork_meta_deletion_cutover_done[e->timeline],
+									__ATOMIC_ACQUIRE) ||
+					!fork_meta_timeline_is_deleting(e->timeline))
+					continue;
+				if (e->nev != 0)
+					return 1;
+			}
+	return 0;
+}
+
+static void
+fork_meta_mark_deletion_cutover_done_locked(void)
+{
+	for (uint32_t timeline = 0; timeline < MAX_TIMELINES; timeline++)
+		if (fork_meta_timeline_is_deleting(timeline))
+			__atomic_store_n(&fork_meta_deletion_cutover_done[timeline], 1,
+							 __ATOMIC_RELEASE);
+}
+
 /* The cutoff is the lexicographic minimum of the durable page-reclaimed
  * frontier for every timeline that owns fork metadata.  Retention owners are
  * deliberately not consulted here: they are admission fences, not proof that
- * the source fork history has been durably replaced. */
+ * the source fork history has been durably replaced.  A deletion-filtered
+ * cutover may use the selected cutoff, or (for a store without one) the small
+ * conservative operational floor. */
 static int
-fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out)
+fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
+						  int preserve_survivors)
 {
 	PsPruneFence cutoff = {0, 0};
 	int have = 0;
+	int missing = 0;
 
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
 			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
 			{
 				int owns = 0;
+
+				if (filter_deleting &&
+					fork_meta_timeline_is_deleting(e->timeline))
+					continue;
 
 				for (uint32_t i = 0; i < e->nev; i++)
 					if (e->ev[i].kind <= FEV_DEAD)
@@ -4759,7 +4837,10 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out)
 				if (e->timeline >= MAX_TIMELINES ||
 					page_reclaimed_frontier[e->timeline].lsn == 0 ||
 					page_reclaimed_frontier[e->timeline].admission_seq == 0)
-					return -1;
+				{
+					missing = 1;
+					continue;
+				}
 				if (!have ||
 					page_reclaimed_frontier[e->timeline].lsn < cutoff.lsn ||
 					(page_reclaimed_frontier[e->timeline].lsn == cutoff.lsn &&
@@ -4770,8 +4851,40 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out)
 					have = 1;
 				}
 			}
-	if (!have)
-		return -1;
+	if (missing || !have)
+	{
+		if (!filter_deleting || (missing && !preserve_survivors))
+			return -1;
+		if (fork_meta_snapshot_generation != 0 &&
+			fork_meta_snapshot_cutoff_lsn != 0 &&
+			fork_meta_snapshot_cutoff_seq != 0)
+		{
+			cutoff.lsn = fork_meta_snapshot_cutoff_lsn;
+			cutoff.admission_seq = fork_meta_snapshot_cutoff_seq;
+		}
+		else
+		{
+			/* (1,1) is the first valid post-snapshot operational position.
+			 * fork_op_lsn() promotes unstamped metadata mutations to this
+			 * position, while explicit future WAL positions remain ordered after
+			 * it. */
+			cutoff.lsn = 1;
+			cutoff.admission_seq = 1;
+		}
+	}
+	if (fork_meta_snapshot_generation != 0 &&
+		(cutoff.lsn < fork_meta_snapshot_cutoff_lsn ||
+		 (cutoff.lsn == fork_meta_snapshot_cutoff_lsn &&
+		  cutoff.admission_seq < fork_meta_snapshot_cutoff_seq)))
+	{
+		/* A deletion-forced generation retains every surviving record, so it
+		 * can safely keep the already-selected coverage tuple.  Ordinary pruning
+		 * must fail closed if its durable frontiers somehow regress. */
+		if (!preserve_survivors)
+			return -1;
+		cutoff.lsn = fork_meta_snapshot_cutoff_lsn;
+		cutoff.admission_seq = fork_meta_snapshot_cutoff_seq;
+	}
 	*cutoff_out = cutoff;
 	return 0;
 }
@@ -4822,7 +4935,9 @@ fork_meta_snapshot_marker_page_retained(uint32_t timeline, const PsKey *key,
 static int
 fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 										ForkMetaByteVec *tail,
-										PsPruneFence cutoff)
+										PsPruneFence cutoff,
+										int filter_deleting,
+										int preserve_survivors)
 {
 	uint64_t off = 0;
 
@@ -4842,11 +4957,14 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			if (nread != (int) sizeof(rec) || rec.rec_len != sizeof(rec))
 				return -1;
 			if (fork_meta_ordered_marker_valid(&rec, 0) &&
-				(fork_meta_event_future(rec.lsn, rec.admission_seq,
-										cutoff.lsn, cutoff.admission_seq) ||
-				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
-														 rec.lsn, rec.admission_seq,
-														 rec.nblocks)) &&
+				(!filter_deleting ||
+				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				(preserve_survivors ||
+				 (fork_meta_event_future(rec.lsn, rec.admission_seq,
+										 cutoff.lsn, cutoff.admission_seq) ||
+				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+															  rec.lsn, rec.admission_seq,
+															  rec.nblocks))) &&
 				!fork_meta_snapshot_marker_present(&rec))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
@@ -4889,18 +5007,21 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 				rec.order_id = idrec.lsn;
 			}
 			if ((old.kind == FEV_SEG_GROW || old.kind == FEV_SEG_COMMIT ||
-				 old.kind == FEV_SEG_GROW_BOUND ||
-				 old.kind == FEV_SEG_COMMIT_BOUND) &&
+					 old.kind == FEV_SEG_GROW_BOUND ||
+					 old.kind == FEV_SEG_COMMIT_BOUND) &&
 				(old.kind < FEV_SEG_GROW_BOUND ||
 				 (idrec.kind == FEV_SEG_ID && idrec.timeline == old.timeline &&
 				  key_eq(&idrec.key, &old.key) && idrec.nblocks == old.nblocks &&
 				  idrec.lsn != 0 && idrec.pad[0] == 0 && idrec.pad[1] == 0 &&
 				  idrec.pad[2] == 0)) &&
 				fork_meta_ordered_marker_valid(&rec, 1) &&
-				(fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
-										cutoff.admission_seq) ||
-				 fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
-														 rec.lsn, 0, rec.nblocks)) &&
+				(!filter_deleting ||
+				 !fork_meta_timeline_is_deleting(rec.timeline)) &&
+				(preserve_survivors ||
+				 (fork_meta_event_future(rec.lsn, 0, cutoff.lsn,
+										 cutoff.admission_seq) ||
+				  fork_meta_snapshot_marker_page_retained(rec.timeline, &rec.key,
+															  rec.lsn, 0, rec.nblocks))) &&
 				!fork_meta_snapshot_marker_present(&rec))
 			{
 				ForkMetaByteVec *part = fork_meta_event_future(
@@ -4919,7 +5040,8 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 static int
 fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						  ForkMetaByteVec *source, PsPruneFence cutoff,
-						  uint64_t generation, uint64_t freeze_seq)
+						  uint64_t generation, uint64_t freeze_seq,
+						  int filter_deleting, int preserve_survivors)
 {
 	PsKey zero_key;
 
@@ -4939,6 +5061,13 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				PsForkMetaFence *fences = NULL;
 				uint32_t nitems = 0, nfences = 0;
 				int planned;
+				int deleting = filter_deleting &&
+					fork_meta_timeline_is_deleting(e->timeline);
+
+				/* A deletion-filtered generation must not carry any lifecycle or
+				 * ordered record owned by an explicit DELETING timeline. */
+				if (deleting)
+					continue;
 
 				for (uint32_t i = 0; i < e->nev; i++)
 					if (e->ev[i].kind <= FEV_DEAD)
@@ -4959,27 +5088,31 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 						events[j].kind = e->ev[i].kind;
 						indices[j++] = i;
 					}
-				if (page_prune_fences(e->timeline, &raw_fences, &nfences) != 0)
-					goto fail_entry;
-				fences = malloc((size_t) nfences * sizeof(*fences));
-				if (nfences != 0 && fences == NULL)
-					goto fail_entry;
+				if (!preserve_survivors)
 				{
-					uint32_t out = 0;
+					if (page_prune_fences(e->timeline, &raw_fences,
+										  &nfences) != 0)
+						goto fail_entry;
+					fences = malloc((size_t) nfences * sizeof(*fences));
+					if (nfences != 0 && fences == NULL)
+						goto fail_entry;
+					{
+						uint32_t out = 0;
 
-					for (uint32_t i = 0; i < nfences; i++)
-						if (raw_fences[i].lsn < cutoff.lsn ||
-							(raw_fences[i].lsn == cutoff.lsn &&
-							 raw_fences[i].admission_seq != 0 &&
-							 raw_fences[i].admission_seq <= cutoff.admission_seq))
-						{
-							fences[out].lsn = raw_fences[i].lsn;
-							fences[out].admission_seq = raw_fences[i].admission_seq;
-							out++;
-						}
-					nfences = out;
+						for (uint32_t i = 0; i < nfences; i++)
+							if (raw_fences[i].lsn < cutoff.lsn ||
+								(raw_fences[i].lsn == cutoff.lsn &&
+								 raw_fences[i].admission_seq != 0 &&
+								 raw_fences[i].admission_seq <= cutoff.admission_seq))
+							{
+								fences[out].lsn = raw_fences[i].lsn;
+								fences[out].admission_seq = raw_fences[i].admission_seq;
+								out++;
+							}
+						nfences = out;
+					}
 				}
-				if (nitems != 0)
+				if (nitems != 0 && !preserve_survivors)
 				{
 					unsigned char *planned_keep = malloc(nitems);
 
@@ -5002,7 +5135,8 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 				}
 				/* Serialize the retained lifecycle and ordered-admission records in
 				 * their original per-fork order.  Legacy sequence-zero markers rely
-				 * on this physical order at equal LSN. */
+				 * on this physical order at equal LSN.  The forced deletion path
+				 * deliberately retains every record for surviving owners. */
 				for (uint32_t i = 0; i < e->nev; i++)
 				{
 					ForkEvent *event = &e->ev[i];
@@ -5011,7 +5145,13 @@ fork_meta_snapshot_build(ForkMetaByteVec *checkpoint, ForkMetaByteVec *tail,
 					uint8_t kind;
 					uint64_t order_id;
 
-					if (event->marker_kind != 0 &&
+					if (preserve_survivors)
+					{
+						kind = event->marker_kind != 0 ? event->marker_kind :
+							event->kind;
+						order_id = event->marker_kind != 0 ? event->order_id : 0;
+					}
+					else if (event->marker_kind != 0 &&
 						(future || fork_meta_snapshot_marker_page_retained(
 							e->timeline, &e->key, event->lsn,
 							event->admission_seq, event->nblocks)))
@@ -5048,7 +5188,9 @@ fail_entry:
 				free(fences);
 				return -1;
 			}
-	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff) != 0)
+	if (fork_meta_snapshot_append_source_markers(checkpoint, tail, cutoff,
+											 filter_deleting,
+											 preserve_survivors) != 0)
 		return -1;
 	{
 		ForkMetaSnapshotPayloadHeader headers[2];
@@ -5110,6 +5252,25 @@ fork_meta_snapshot_gc_due(void)
 }
 
 static int
+fork_meta_snapshot_due_locked(void)
+{
+	const char *value = getenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+	uint64_t threshold = value ? strtoull(value, NULL, 10) : 65536;
+
+	if (threshold < 1024)
+		threshold = 1024;
+	if (value == NULL && fork_meta_snapshot_generation != 0 &&
+		fork_meta_snapshot_bytes <= UINT64_MAX / 2 &&
+		fork_meta_snapshot_bytes * 2 > threshold)
+		threshold = fork_meta_snapshot_bytes * 2;
+	if (!fork_meta_snapshot_retry_due())
+		return 0;
+	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
+		(fork_meta_bytes_load() >= threshold ||
+		 fork_meta_deletion_cutover_due_locked());
+}
+
+static int
 fork_meta_snapshot_due(void)
 {
 	const char *value = getenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
@@ -5124,7 +5285,8 @@ fork_meta_snapshot_due(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		fork_meta_bytes_load() >= threshold;
+		(fork_meta_bytes_load() >= threshold ||
+		 fork_meta_deletion_probe_due());
 }
 
 static int
@@ -5149,6 +5311,8 @@ fork_meta_snapshot_maintenance(void)
 	PsForkmetaSnapshotPrepared prepared;
 	uint64_t generation;
 	uint64_t freeze_seq;
+	int force_deleting;
+	int filter_deleting;
 	int rc = 0;
 
 	if (fork_meta_snapshot_gc_pending)
@@ -5180,7 +5344,16 @@ fork_meta_snapshot_maintenance(void)
 			return 0;
 		}
 	}
-	if (!fork_meta_snapshot_due() || fork_meta_snapshot_cutoff(&cutoff) != 0)
+	force_deleting = fork_meta_deletion_cutover_due_locked();
+	filter_deleting = fork_meta_deletion_records_present_locked();
+	/* A restart after a completed filtered cutover has DELETING lifecycle state
+	 * but no matching fork entries.  Record that one locked probe as complete
+	 * instead of publishing an identical generation. */
+	if (!filter_deleting && fork_meta_deletion_probe_due())
+		fork_meta_mark_deletion_cutover_done_locked();
+	if ((!fork_meta_snapshot_due_locked() && !force_deleting) ||
+		fork_meta_snapshot_cutoff(&cutoff, filter_deleting,
+							  force_deleting) != 0)
 	{
 		if (fork_meta_bytes_load() != 0)
 		{
@@ -5225,12 +5398,18 @@ fork_meta_snapshot_maintenance(void)
 										 fork_meta_snapshot_generation, &generation) != 0)
 			goto retry;
 	}
+	/* A legacy-only source has no admission sequence to observe during replay.
+	 * The deletion fallback cutoff is nevertheless (1,1), so advance the
+	 * allocator through that selected position before freezing the snapshot. */
+	if (force_deleting)
+		admission_seq_observe(cutoff.admission_seq);
 	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (freeze_seq <= 1)
 		goto retry;
 	freeze_seq--;
 	if (fork_meta_snapshot_build(&checkpoint, &tail, &source, cutoff,
-								 generation, freeze_seq) != 0)
+								 generation, freeze_seq, filter_deleting,
+								 force_deleting) != 0)
 		goto retry_done;
 	cp.data = checkpoint.data;
 	cp.len = checkpoint.len;
@@ -5274,6 +5453,8 @@ fork_meta_snapshot_maintenance(void)
 	fork_meta_snapshot_bytes = checkpoint.len + tail.len;
 	fork_meta_snapshot_gc_pending = 1;
 	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
+	if (filter_deleting)
+		fork_meta_mark_deletion_cutover_done_locked();
 	/* Keep the in-memory chain conservative until the next restart.  All
 	 * acknowledged events remain available to readers; the durable checkpoint
 	 * is the source of truth for the next boot. */
@@ -11432,6 +11613,8 @@ ps_core_open(const char *store_dir)
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
 	fork_meta_snapshot_gc_ambiguous = 0;
+	memset(fork_meta_deletion_cutover_done, 0,
+		   sizeof(fork_meta_deletion_cutover_done));
 	memset(&fork_meta_snapshot_retry_at, 0,
 		   sizeof(fork_meta_snapshot_retry_at));
 	fork_meta_migrating = 0;
