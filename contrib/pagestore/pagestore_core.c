@@ -108,6 +108,8 @@ static void page_remove_compacted_versions(uint32_t timeline,
 static int retention_project_lsn(uint32_t descendant, uint32_t target,
 								 uint64_t *lsn);
 static int timeline_has_parent(uint32_t timeline);
+static int timeline_delete_active(void);
+static int timeline_recovery_allowed(uint32_t timeline);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -1200,9 +1202,13 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	ps_lock_map_wr();
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].layer_id == layer_id &&
-			ps_layer_map.layers[i].deleting &&
-			ps_timeline_live(ps_layer_map.layers[i].timeline))
+			ps_layer_map.layers[i].deleting)
 		{
+			PsTimelineState state;
+
+			if (!ps_timeline_state(ps_layer_map.layers[i].timeline, &state, NULL) ||
+				(state != PS_TIMELINE_LIVE && state != PS_TIMELINE_DELETING))
+				break;
 			layer = &ps_layer_map.layers[i];
 			break;
 		}
@@ -1223,7 +1229,77 @@ gc_finish_local(uint64_t layer_id, int remote_done)
 	return 1;
 }
 
+/*
+ * Durably mark one layer owned by a timeline whose lifecycle state is
+ * DELETING.  This is deliberately separate from ordinary compaction GC:
+ * deleting a timeline is the only path allowed to select a layer on a
+ * DELETING timeline, and it never touches segments or fork metadata shared by
+ * other timelines.
+ *
+ * The existing asynchronous GC worker performs the physical deletion and
+ * REMOVE_LAYER append after this function returns.  Thus MARK_DELETE remains
+ * the durable discovery boundary for restart recovery.
+ */
+static int
+timeline_delete_mark_one(void)
+{
+	PsLayerDesc candidate;
+	PsLayerDesc *current;
+	int			found = 0;
+
+	ps_lock_map_rd();
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		PsLayerDesc *layer = &ps_layer_map.layers[i];
+		PsTimelineState state;
+
+		if (!ps_timeline_state(layer->timeline, &state, NULL) ||
+			state != PS_TIMELINE_DELETING ||
+			__atomic_load_n(&layer->cache_readers, __ATOMIC_ACQUIRE) != 0)
+			continue;
+		candidate = *layer;
+		found = 1;
+		break;
+	}
+	ps_unlock_map();
+	if (!found)
+		return 0;
+
+	/* Establish the durable per-layer tombstone before unlinking anything. */
+	if (!candidate.deleting)
+	{
+		ps_lock_map_wr();
+		current = NULL;
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].layer_id == candidate.layer_id)
+			{
+				PsTimelineState state;
+
+				if (ps_timeline_state(ps_layer_map.layers[i].timeline, &state, NULL) &&
+					state == PS_TIMELINE_DELETING &&
+					!ps_layer_map.layers[i].deleting)
+					current = &ps_layer_map.layers[i];
+				break;
+			}
+		if (current == NULL || ps_manifest_mark_delete(candidate.layer_id) != 0)
+		{
+			ps_unlock_map();
+			return 0;
+		}
+		ps_unlock_map();
+		return 1;
+	}
+	return 0;
+}
+
 /* Run at most one remote-GC operation without blocking the maintenance loop. */
+static void
+gc_remote_backoff(const struct timespec *now)
+{
+	gc_remote_retry_at = *now;
+	gc_remote_retry_at.tv_sec++;
+}
+
 static int
 gc_remote_one(void)
 {
@@ -1243,8 +1319,7 @@ gc_remote_one(void)
 		if (state != 2)
 		{
 			__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
-			gc_remote_retry_at = now;
-			gc_remote_retry_at.tv_sec++;
+			gc_remote_backoff(&now);
 			return 0;
 		}
 		__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
@@ -1255,8 +1330,13 @@ gc_remote_one(void)
 	{
 		uint32_t i = (gc_remote_map_cursor + pass) % ps_layer_map.nlayers;
 		{
+			PsTimelineState timeline_state;
+
 			if (ps_layer_map.layers[i].deleting &&
-				ps_timeline_live(ps_layer_map.layers[i].timeline) &&
+				ps_timeline_state(ps_layer_map.layers[i].timeline,
+								  &timeline_state, NULL) &&
+				(timeline_state == PS_TIMELINE_LIVE ||
+				 timeline_state == PS_TIMELINE_DELETING) &&
 				!(__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 &&
 				  ps_layer_map.layers[i].layer_id == tier_upload_candidate.layer_id))
 			{
@@ -1265,7 +1345,13 @@ gc_remote_one(void)
 				gc_remote_map_cursor = (i + 1) % ps_layer_map.nlayers;
 				ps_unlock_map();
 				if (gc_remote_candidate.remote_cleanup_done)
-					return gc_finish_local(gc_remote_candidate.layer_id, 0);
+				{
+					int finished = gc_finish_local(gc_remote_candidate.layer_id, 0);
+
+					if (!finished)
+						gc_remote_backoff(&now);
+					return finished;
+				}
 				if (tier_remote_location(&gc_remote_candidate) == NULL)
 				{
 					PsLayerLocation *remote;
@@ -1291,7 +1377,14 @@ gc_remote_one(void)
 						 * until the remote URI is available again. */
 						if (!gc_remote_candidate.remote_durable &&
 							(ps_layer_store->remote_uri == NULL || uri_errno == ENOTSUP))
-							return gc_finish_local(gc_remote_candidate.layer_id, 0);
+						{
+							int finished = gc_finish_local(gc_remote_candidate.layer_id, 0);
+
+							if (!finished)
+								gc_remote_backoff(&now);
+							return finished;
+						}
+						gc_remote_backoff(&now);
 						return 0;
 					}
 				}
@@ -1302,6 +1395,7 @@ gc_remote_one(void)
 				{
 					ps_lifecycle_read_cancel_reservation();
 					__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
+					gc_remote_backoff(&now);
 					return 0;
 				}
 				return 1;
@@ -3376,6 +3470,32 @@ ps_timeline_live(uint32_t timeline)
 	PsTimelineState state;
 
 	return ps_timeline_state(timeline, &state, NULL) &&
+		state == PS_TIMELINE_LIVE;
+}
+
+static int
+timeline_delete_active(void)
+{
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		PsTimelineState state;
+
+		if (ps_timeline_state(tl, &state, NULL) &&
+			state == PS_TIMELINE_DELETING)
+			return 1;
+	}
+	return 0;
+}
+
+/* Legacy clients may write page data before creating timeline metadata.  Keep
+ * that compatibility path recoverable; only an explicit durable lifecycle
+ * state other than LIVE suppresses page/layer reconstruction. */
+static int
+timeline_recovery_allowed(uint32_t timeline)
+{
+	PsTimelineState state;
+
+	return !ps_timeline_state(timeline, &state, NULL) ||
 		state == PS_TIMELINE_LIVE;
 }
 
@@ -9284,6 +9404,7 @@ recover_layer_prefix(uint32_t shard)
 		int			first_covered = -1;
 
 		if (d->kind != PS_LAYER_IMAGE || d->deleting ||
+			!timeline_recovery_allowed(d->timeline) ||
 			layer_shard_from_id(d->layer_id) != shard)
 			continue;
 		if (read_image_index_refreshing(d, &idx, &n) != 0)
@@ -9351,8 +9472,18 @@ recover_layer_prefix(uint32_t shard)
 			goto fail;
 	}
 
+	/* A deleting timeline can be the sole former owner of this shard's covered
+	 * prefix.  Its layers are intentionally absent from recovery, while shared
+	 * segments stay fenced from reclamation until filtered rewrite exists. */
 	if (nrec == 0)
+	{
+		if (timeline_delete_active())
+		{
+			free(recs);
+			return 0;
+		}
 		goto fail;
+	}
 	qsort(recs, nrec, sizeof(*recs), layer_recover_cmp);
 	for (uint32_t i = 0; i < nrec; i++)
 	{
@@ -9484,7 +9615,7 @@ recover(uint32_t shard)
 				retire_segment = 1;
 				break;
 			}
-			if (s->memtable)
+			if (s->memtable && timeline_recovery_allowed(hdr.timeline))
 			{
 				if (ps_storage->seg_read(shard, id, data_off, page, page_size) != 0 ||
 					ps_memtable_put(s->memtable, hdr.timeline, &hdr.key, hdr.block,
@@ -9629,10 +9760,16 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
 										incarnation) != 0)
 		return -1;
+	/* All writers are drained by the caller's lifecycle/admission fences.  Drop
+	 * their staged pages now so shutdown cannot publish a fresh manifest layer
+	 * after deletion cleanup has already passed this timeline. */
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_memtable_discard_timeline(g_shards[sh].memtable, timeline);
 	/* Durable append precedes this publication.  The POSIX lifecycle gate and
 	 * mutation-admission barrier drain complete requests and maintenance before
-	 * this point.  SPDK async drain remains follow-up work, so cleanup must not
-	 * start from DELETING alone yet. */
+	 * this point, so idle maintenance may start owner-scoped layer cleanup after
+	 * observing DELETING.  SPDK BEGIN_DELETE remains fail-closed until its async
+	 * request drain exists. */
 	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
 																__ATOMIC_RELEASE);
 	ch->result = PS_TIMELINE_DELETING;
@@ -11077,14 +11214,21 @@ ps_core_maintenance_impl(void)
 	if (ps_manifest_poisoned())
 		return 0;
 	ns = core_shards();
+	/* Timeline deletion is an explicit owner-scoped cleanup path.  Establish each
+	 * layer tombstone before handing it to the existing asynchronous remote GC;
+	 * normal tiering, segment GC, and compaction remain LIVE-only selectors. */
+	if (timeline_delete_mark_one())
+		return 1;
 	if (gc_remote_one())
 		return 1;
 	if (tier_one_layer())
 		return 1;
 
 	/* Reclaim at most one complete segment.  The boundary segment containing
-	 * the watermark stays present because its suffix may not be in a layer. */
-	if (segment_gc_enabled && ps_storage->seg_remove)
+	 * the watermark stays present because its suffix may not be in a layer.
+	 * Shared segments can contain records from several timelines, so retain all
+	 * of them while any deletion awaits its filtered-rewrite phase. */
+	if (segment_gc_enabled && !timeline_delete_active() && ps_storage->seg_remove)
 	{
 		for (uint32_t sh = 0; sh < ns; sh++)
 		{

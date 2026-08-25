@@ -120,6 +120,27 @@ ps_memtable_full(const PsMemtable *mt)
 	return mt->n >= mt->threshold;
 }
 
+void
+ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline)
+{
+	uint32_t out = 0;
+
+	if (mt == NULL)
+		return;
+	for (uint32_t i = 0; i < mt->n; i++)
+	{
+		if (mt->ents[i].timeline == timeline)
+		{
+			free(mt->ents[i].page);
+			continue;
+		}
+		if (out != i)
+			mt->ents[out] = mt->ents[i];
+		out++;
+	}
+	mt->n = out;
+}
+
 int
 ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 				   uint32_t block, uint64_t read_lsn, uint64_t read_seq,
