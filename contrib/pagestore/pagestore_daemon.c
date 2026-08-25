@@ -192,6 +192,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_TRUNCATE:
 		case PS_OP_ZEROEXTEND:
 		case PS_OP_CREATE_BRANCH:
+		case PS_OP_BEGIN_DELETE:
 		case PS_OP_EXTEND:
 		case PS_OP_WRITEV:
 		case PS_OP_WAL_APPEND:
@@ -215,6 +216,7 @@ request_is_write(PsOpcode opcode)
 		case PS_OP_RETENTION_PIN_DROP:
 		case PS_OP_RETENTION_FLOOR:
 		case PS_OP_ADMISSION_BARRIER:
+		case PS_OP_TIMELINE_STATE:
 			return 0;
 		default:
 			return 1;
@@ -412,6 +414,21 @@ static int
 run_request(PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	if (op == PS_OP_BEGIN_DELETE)
+	{
+		if (ps_admission_write_lock() == 0)
+		{
+			ps_lock_map_wr();
+			handle_request(ch);
+			ps_unlock_map();
+			ps_admission_write_unlock();
+		}
+		else
+			ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return 1;
+	}
 
 	if (op == PS_OP_ADMISSION_BARRIER)
 	{

@@ -279,6 +279,18 @@ admission_write_lock(void)
 	return pthread_rwlock_wrlock(&admission_lock);
 }
 
+int
+ps_admission_write_lock(void)
+{
+	return admission_write_lock();
+}
+
+void
+ps_admission_write_unlock(void)
+{
+	pthread_rwlock_unlock(&admission_lock);
+}
+
 uint64_t
 ps_admission_barrier(void)
 {
@@ -1706,9 +1718,27 @@ typedef struct TimelineMeta
 	int			defined;		/* 1 if this timeline exists */
 	int			parent;			/* parent timeline id, or -1 for the root */
 	uint64_t	branch_lsn;		/* parent LSN this timeline forked at */
+	uint32_t	state;			/* PsTimelineState; published after durable append */
+	uint64_t	incarnation;		/* nonzero fencing generation */
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
+/* A metadata append failure is ambiguous: the lower layer may have made the
+ * record durable before reporting an error.  Refuse all timeline services
+ * until the process reopens and replays the log. */
+static volatile int timeline_meta_poisoned;
+
+static inline int
+timeline_meta_poisoned_load(void)
+{
+	return __atomic_load_n(&timeline_meta_poisoned, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+timeline_meta_poison(void)
+{
+	__atomic_store_n(&timeline_meta_poisoned, 1, __ATOMIC_RELEASE);
+}
 /* Retention changes can make projected ancestor history reclaimable even when
  * no new layer arrives.  Maintenance rewrites every marked nonempty shard and
  * clears its mark only after publishing at the new effective floor. */
@@ -3020,9 +3050,13 @@ timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
 {
 	if (id >= MAX_TIMELINES)
 		return;
-	timelines[id].defined = 1;
 	timelines[id].parent = parent;
 	timelines[id].branch_lsn = branch_lsn;
+	__atomic_store_n(&timelines[id].incarnation, 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&timelines[id].state, PS_TIMELINE_LIVE, __ATOMIC_RELEASE);
+	/* Publish the complete definition last.  Readers outside map_lock use the
+	 * acquire load below and can never observe a half-defined branch. */
+	__atomic_store_n(&timelines[id].defined, 1, __ATOMIC_RELEASE);
 }
 
 static int
@@ -3035,7 +3069,33 @@ timeline_has_parent(uint32_t timeline)
 int
 ps_timeline_defined(uint32_t timeline)
 {
-	return timeline < MAX_TIMELINES && timelines[timeline].defined;
+	return !timeline_meta_poisoned_load() && timeline < MAX_TIMELINES &&
+		__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE);
+}
+
+int
+ps_timeline_state(uint32_t timeline, PsTimelineState *state,
+					 uint64_t *incarnation)
+{
+	if (timeline_meta_poisoned_load() || timeline >= MAX_TIMELINES ||
+		!__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE))
+		return 0;
+	if (state != NULL)
+		*state = (PsTimelineState) __atomic_load_n(&timelines[timeline].state,
+																__ATOMIC_ACQUIRE);
+	if (incarnation != NULL)
+		*incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+																__ATOMIC_ACQUIRE);
+	return 1;
+}
+
+int
+ps_timeline_live(uint32_t timeline)
+{
+	PsTimelineState state;
+
+	return ps_timeline_state(timeline, &state, NULL) &&
+		state == PS_TIMELINE_LIVE;
 }
 
 /*
@@ -3173,11 +3233,15 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 	if (new_tl < MAX_TIMELINES && timelines[new_tl].defined)
 		return timelines[new_tl].parent == parent &&
 			timelines[new_tl].branch_lsn == branch_lsn &&
+			__atomic_load_n(&timelines[new_tl].state, __ATOMIC_ACQUIRE) ==
+			PS_TIMELINE_LIVE &&
 			!timeline_is_used(new_tl) && wal_end_read(new_tl) == 0;
 
 	if (new_tl == 0 || new_tl >= MAX_TIMELINES ||
 		timeline_is_used(new_tl) || wal_end_read(new_tl) != 0 || parent < 0 ||
-		parent >= MAX_TIMELINES || !timelines[parent].defined)
+		parent >= MAX_TIMELINES || !timelines[parent].defined ||
+		__atomic_load_n(&timelines[parent].state, __ATOMIC_ACQUIRE) !=
+		PS_TIMELINE_LIVE)
 		return 0;
 
 	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
@@ -3423,6 +3487,25 @@ typedef struct TimelineRecV2
 	uint32_t reserved;
 } TimelineRecV2;
 
+/* The V2 create record remains readable forever.  Lifecycle records use the
+ * same log and magic, but are self-sized so V2 creates and events can be mixed
+ * after a legacy-only log has been migrated. */
+#define TIMELINE_META_EVENT_CREATE 1U
+#define TIMELINE_META_EVENT_STATE  2U
+typedef struct TimelineRecEvent
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t kind;
+	uint32_t id;
+	int32_t	 parent;
+	uint32_t state;
+	uint64_t branch_lsn;
+	uint64_t incarnation;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecEvent;
+
 static uint32_t
 timeline_rec_crc(TimelineRecV2 *rec)
 {
@@ -3435,20 +3518,68 @@ timeline_rec_crc(TimelineRecV2 *rec)
 	return crc;
 }
 
-static int
-timeline_persist(uint32_t id, int parent, uint64_t branch_lsn)
+static uint32_t
+timeline_event_crc(TimelineRecEvent *rec)
 {
-	TimelineRecV2 rec;
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
+static int
+timeline_meta_append(const void *data, uint32_t len)
+{
+	int rc = ps_storage->meta_append(data, len);
+
+	if (rc != 0)
+		timeline_meta_poison();
+	return rc;
+}
+
+static int
+timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn)
+{
+	TimelineRecEvent rec;
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = TIMELINE_META_V2_MAGIC;
 	rec.rec_len = sizeof(rec);
+	rec.kind = TIMELINE_META_EVENT_CREATE;
 	rec.id = id;
 	rec.parent = (int32_t) parent;
+	rec.state = PS_TIMELINE_LIVE;
 	rec.branch_lsn = branch_lsn;
-	rec.crc = timeline_rec_crc(&rec);
+	rec.incarnation = 1;
+	rec.crc = timeline_event_crc(&rec);
 
-	return ps_storage->meta_append(&rec, sizeof(rec));
+	return timeline_meta_append(&rec, sizeof(rec));
+}
+
+static int
+timeline_persist_state(uint32_t id, PsTimelineState state,
+						   uint64_t incarnation)
+{
+	TimelineRecEvent rec;
+
+	if (id >= MAX_TIMELINES || state < PS_TIMELINE_LIVE ||
+		state > PS_TIMELINE_DELETED || incarnation == 0)
+		return -1;
+	memset(&rec, 0, sizeof(rec));
+	rec.magic = TIMELINE_META_V2_MAGIC;
+	rec.rec_len = sizeof(rec);
+	rec.kind = TIMELINE_META_EVENT_STATE;
+	rec.id = id;
+	rec.parent = timelines[id].parent;
+	rec.state = state;
+	rec.branch_lsn = timelines[id].branch_lsn;
+	rec.incarnation = incarnation;
+	rec.crc = timeline_event_crc(&rec);
+
+	return timeline_meta_append(&rec, sizeof(rec));
 }
 
 /*
@@ -4767,89 +4898,170 @@ retry:
 static int
 load_timelines(void)
 {
-	uint32_t magic;
 	uint64_t off = 0;
-	TimelineRec legacy[ MAX_TIMELINES ];
-	uint32_t nlegacy = 0;
+	uint32_t header[2];
+	uint32_t magic;
 	int n;
 
-	n = ps_storage->meta_read(0, &magic, sizeof(magic));
+	/* The first record selects the grammar for the entire file.  Legacy is a
+	 * fixed-record migration input; a TLM2 file is V2/event mixed only. */
+	n = ps_storage->meta_read(0, header, sizeof(header));
 	if (n < 0 && errno == ENOENT)
 		return 0;
 	if (n == 0)
 		return 0;
-	if (n != (int) sizeof(magic))
+	if (n != (int) sizeof(header))
 	{
 		if (n > 0 && ps_storage->meta_truncate &&
 			ps_storage->meta_truncate(0) == 0)
 			return 0;
 		return -1;
 	}
+	memcpy(&magic, &header[0], sizeof(magic));
+
 	if (magic == TIMELINE_META_V2_MAGIC)
 	{
-		TimelineRecV2 rec;
 		for (;;)
 		{
+			uint32_t rec_len;
+
+			n = ps_storage->meta_read(off, header, sizeof(header));
+			if (n == 0)
+				break;
+			if (n != (int) sizeof(header))
+			{
+				if (n > 0 && ps_storage->meta_truncate &&
+					ps_storage->meta_truncate(off) == 0)
+					break;
+				return -1;
+			}
+			memcpy(&magic, &header[0], sizeof(magic));
+			memcpy(&rec_len, &header[1], sizeof(rec_len));
+			if (magic != TIMELINE_META_V2_MAGIC ||
+				(rec_len != sizeof(TimelineRecV2) &&
+				 rec_len != sizeof(TimelineRecEvent)))
+				return -1;
+			if (rec_len == sizeof(TimelineRecV2))
+			{
+				TimelineRecV2 rec;
+
+				n = ps_storage->meta_read(off, &rec, sizeof(rec));
+				if (n != (int) sizeof(rec))
+				{
+					if (n >= 0 && ps_storage->meta_truncate &&
+						ps_storage->meta_truncate(off) == 0)
+						break;
+					return -1;
+				}
+				if (rec.magic != TIMELINE_META_V2_MAGIC ||
+					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+					rec.crc != timeline_rec_crc(&rec) ||
+					rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+					!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+					return -1;
+				timeline_define(rec.id, rec.parent, rec.branch_lsn);
+				off += sizeof(rec);
+			}
+			else
+			{
+				TimelineRecEvent rec;
+				n = ps_storage->meta_read(off, &rec, sizeof(rec));
+				if (n != (int) sizeof(rec))
+				{
+					if (n >= 0 && ps_storage->meta_truncate &&
+						ps_storage->meta_truncate(off) == 0)
+						break;
+					return -1;
+				}
+				if (rec.magic != TIMELINE_META_V2_MAGIC ||
+					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+					rec.crc != timeline_event_crc(&rec) ||
+					rec.id >= MAX_TIMELINES || rec.incarnation == 0 ||
+					rec.state < PS_TIMELINE_LIVE ||
+					rec.state > PS_TIMELINE_DELETED)
+					return -1;
+				if (rec.kind == TIMELINE_META_EVENT_CREATE)
+				{
+					if (rec.state != PS_TIMELINE_LIVE ||
+						rec.incarnation != 1 || timelines[rec.id].defined ||
+						!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+						return -1;
+					timeline_define(rec.id, rec.parent, rec.branch_lsn);
+				}
+				else if (rec.kind == TIMELINE_META_EVENT_STATE)
+				{
+					uint32_t old_state;
+
+					if (!timelines[rec.id].defined ||
+						timelines[rec.id].parent != rec.parent ||
+						timelines[rec.id].branch_lsn != rec.branch_lsn ||
+						__atomic_load_n(&timelines[rec.id].incarnation,
+																							__ATOMIC_ACQUIRE) != rec.incarnation)
+						return -1;
+					old_state = __atomic_load_n(&timelines[rec.id].state,
+																								__ATOMIC_ACQUIRE);
+					if (rec.state != old_state &&
+								!((old_state == PS_TIMELINE_LIVE &&
+									rec.state == PS_TIMELINE_DELETING) ||
+								  (old_state == PS_TIMELINE_DELETING &&
+									rec.state == PS_TIMELINE_DELETED)))
+						return -1;
+					__atomic_store_n(&timelines[rec.id].state, rec.state,
+																								__ATOMIC_RELEASE);
+				}
+				else
+					return -1;
+				off += sizeof(rec);
+			}
+		}
+		return 0;
+	}
+
+	/* A non-TLM2 first record must be a complete legacy-only file. */
+	{
+		TimelineRec legacy[MAX_TIMELINES];
+		uint32_t nlegacy = 0;
+
+		for (;;)
+		{
+			TimelineRec rec;
+
 			n = ps_storage->meta_read(off, &rec, sizeof(rec));
 			if (n == 0)
-				return 0;
+				break;
 			if (n != (int) sizeof(rec))
 			{
 				if (n > 0 && ps_storage->meta_truncate &&
 					ps_storage->meta_truncate(off) == 0)
-					return 0;
+					break;
 				return -1;
 			}
-			if (rec.magic != TIMELINE_META_V2_MAGIC ||
-				rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
-				rec.crc != timeline_rec_crc(&rec) ||
-				rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
+			if (nlegacy == MAX_TIMELINES || rec.id >= MAX_TIMELINES ||
+				timelines[rec.id].defined ||
 				!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
 				return -1;
+			legacy[nlegacy++] = rec;
 			timeline_define(rec.id, rec.parent, rec.branch_lsn);
 			off += sizeof(rec);
 		}
-	}
-	/* Legacy records are accepted only when complete and valid, then atomically
-	 * rewritten in the checksummed format before the daemon becomes writable. */
-	off = 0;
-	for (;;)
-	{
-		TimelineRec rec;
-		n = ps_storage->meta_read(off, &rec, sizeof(rec));
-		if (n == 0)
-			break;
-		if (n != (int) sizeof(rec))
+		if (nlegacy != 0)
 		{
-			if (n < 0 || !ps_storage->meta_truncate ||
-				ps_storage->meta_truncate(off) != 0)
+			TimelineRecV2 out[MAX_TIMELINES];
+
+			for (uint32_t i = 0; i < nlegacy; i++)
+			{
+				memset(&out[i], 0, sizeof(out[i]));
+				out[i].magic = TIMELINE_META_V2_MAGIC;
+				out[i].rec_len = sizeof(out[i]);
+				out[i].id = legacy[i].id;
+				out[i].parent = legacy[i].parent;
+				out[i].branch_lsn = legacy[i].branch_lsn;
+				out[i].crc = timeline_rec_crc(&out[i]);
+			}
+			if (!ps_storage->meta_rewrite ||
+				ps_storage->meta_rewrite(out, nlegacy * sizeof(out[0])) != 0)
 				return -1;
-			break;
 		}
-		if (nlegacy == MAX_TIMELINES ||
-			rec.id >= MAX_TIMELINES || timelines[rec.id].defined ||
-			!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
-			return -1;
-		legacy[nlegacy++] = rec;
-		timeline_define(rec.id, rec.parent, rec.branch_lsn);
-		off += sizeof(rec);
-	}
-	if (nlegacy > 0)
-	{
-		TimelineRecV2 out[MAX_TIMELINES];
-		for (uint32_t i = 0; i < nlegacy; i++)
-		{
-			memset(&out[i], 0, sizeof(out[i]));
-			out[i].magic = TIMELINE_META_V2_MAGIC;
-			out[i].rec_len = sizeof(out[i]);
-			out[i].id = legacy[i].id;
-			out[i].parent = legacy[i].parent;
-			out[i].branch_lsn = legacy[i].branch_lsn;
-			out[i].crc = timeline_rec_crc(&out[i]);
-		}
-		if (!ps_storage->meta_rewrite ||
-			ps_storage->meta_rewrite(out, nlegacy * sizeof(out[0])) != 0)
-			return -1;
 	}
 	return 0;
 }
@@ -9048,10 +9260,141 @@ fork_op_lsn(uint32_t timeline, const PsKey *key, uint64_t req_lsn)
 	return newest == UINT64_MAX ? UINT64_MAX : newest + 1;
 }
 
+/* Caller holds map_lock for writing and the global admission write lock. */
+static int
+timeline_has_live_descendant(uint32_t ancestor)
+{
+	for (uint32_t candidate = 1; candidate < MAX_TIMELINES; candidate++)
+	{
+		int current;
+		uint32_t state;
+
+		if (!timelines[candidate].defined || candidate == ancestor)
+			continue;
+		state = __atomic_load_n(&timelines[candidate].state, __ATOMIC_ACQUIRE);
+		if (state != PS_TIMELINE_LIVE && state != PS_TIMELINE_DELETING)
+			continue;
+		current = timelines[candidate].parent;
+		for (uint32_t hops = 0; current >= 0 && current < MAX_TIMELINES &&
+					hops < MAX_TIMELINES; hops++)
+		{
+			if ((uint32_t) current == ancestor)
+				return 1;
+			if (!timelines[current].defined)
+				break;
+			current = timelines[current].parent;
+		}
+	}
+	return 0;
+}
+
+static int
+timeline_has_active_owner(uint32_t timeline)
+{
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+	int found = 0;
+
+	/* One immutable snapshot makes the veto independent of owner churn after
+	 * admission write lock is acquired.  A poisoned registry fails closed. */
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return 1;
+	for (uint32_t i = 0; i < npins; i++)
+		if (pins[i].timeline == timeline)
+		{
+			found = 1;
+			break;
+		}
+	free(pins);
+	return found;
+}
+
+static int
+timeline_begin_delete(uint32_t timeline, PsChannel *ch)
+{
+	uint32_t state;
+	uint64_t incarnation;
+
+	if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
+		timeline == 0)
+		return -1;
+	state = __atomic_load_n(&timelines[timeline].state, __ATOMIC_ACQUIRE);
+	incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+																						__ATOMIC_ACQUIRE);
+	/* req_seq is the caller's fencing token.  An old retry may not turn a
+	 * different incarnation into an apparently idempotent success. */
+	if (ch->req_seq == 0 || ch->req_seq != incarnation ||
+		incarnation == 0 || state == PS_TIMELINE_DELETED)
+		return -1;
+	if (state == PS_TIMELINE_DELETING)
+	{
+		ch->result = state;
+		ch->req_seq = incarnation;
+		return 0;
+	}
+	if (state != PS_TIMELINE_LIVE || timeline_has_live_descendant(timeline) ||
+		timeline_has_active_owner(timeline))
+		return -1;
+	if (timeline_persist_state(timeline, PS_TIMELINE_DELETING,
+										incarnation) != 0)
+		return -1;
+	/* Durable append precedes this publication.  The POSIX mutation admission
+	 * barrier keeps already-admitted mutation sections drained before this
+	 * point; ordinary reads, maintenance, and SPDK async drain are follow-up
+	 * work.  Cleanup must not start from DELETING alone until that full drain
+	 * exists. */
+	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
+																__ATOMIC_RELEASE);
+	ch->result = PS_TIMELINE_DELETING;
+	ch->req_seq = incarnation;
+	return 0;
+}
+
+static int
+timeline_op_allowed(uint32_t timeline, PsOpcode opcode)
+{
+	PsTimelineState state;
+
+	if (timeline_meta_poisoned_load())
+		return 0;
+
+	/* Lifecycle control and diagnostics remain available while a timeline is
+	 * deleting.  Branch validation is different: a new target is undefined and
+	 * may be checked, but an existing target must still be LIVE. */
+	if (opcode == PS_OP_BEGIN_DELETE || opcode == PS_OP_TIMELINE_STATE ||
+		opcode == PS_OP_TIMELINE_INFO || opcode == PS_OP_RETENTION_PIN_GET)
+		return 1;
+	if (opcode == PS_OP_CREATE_BRANCH || opcode == PS_OP_CHECK_BRANCH)
+	{
+		if (timeline >= MAX_TIMELINES || !ps_timeline_defined(timeline))
+			return 1;
+		return __atomic_load_n(&timelines[timeline].state, __ATOMIC_ACQUIRE) ==
+			PS_TIMELINE_LIVE;
+	}
+	if (opcode == PS_OP_REQUIRE_BRANCH)
+		return ps_timeline_live(timeline);
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	/* Before lifecycle state existed, shipped WAL and page records could arrive
+	 * before ancestry metadata was defined.  Preserve that recovery/import
+	 * behavior: only a durably defined non-LIVE timeline is fenced here. */
+	if (!__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE))
+		return 1;
+	state = (PsTimelineState) __atomic_load_n(&timelines[timeline].state,
+														__ATOMIC_ACQUIRE);
+	return state == PS_TIMELINE_LIVE;
+}
+
 int
 ps_handle_meta(PsChannel *ch)
 {
 	uint32_t	tl = ch->timeline;
+
+	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return 1;
+	}
 
 	switch ((PsOpcode) ch->opcode)
 	{
@@ -9263,8 +9606,8 @@ ps_handle_meta(PsChannel *ch)
 			{
 				if (timelines[ch->timeline].defined)
 					break;
-				if (timeline_persist(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn) == 0)
+				if (timeline_persist_create(ch->timeline, (int) ch->parent_timeline,
+									ch->req_lsn) == 0)
 					timeline_define(ch->timeline, (int) ch->parent_timeline,
 									ch->req_lsn);
 				else
@@ -9310,6 +9653,24 @@ ps_handle_meta(PsChannel *ch)
 				ch->result = 1;
 				ch->parent_timeline = (uint32_t) timelines[tl].parent;
 				ch->req_lsn = timelines[tl].branch_lsn;
+			}
+			break;
+		case PS_OP_BEGIN_DELETE:
+			if (timeline_begin_delete(tl, ch) != 0)
+				ch->status = PS_STATUS_ERROR;
+			break;
+		case PS_OP_TIMELINE_STATE:
+			{
+				PsTimelineState state;
+				uint64_t incarnation;
+
+				if (!ps_timeline_state(tl, &state, &incarnation))
+					ch->status = PS_STATUS_ERROR;
+				else
+				{
+					ch->result = state;
+					ch->req_seq = incarnation;
+				}
 			}
 			break;
 
@@ -9415,6 +9776,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret;
 				int			old_found;
 				int			timeline_defined;
+				int			timeline_live;
 				int			page_history_allowed;
 				int			wal_index_allowed;
 				int			wal_index_pending;
@@ -9443,13 +9805,19 @@ ps_handle_meta(PsChannel *ch)
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
-					timeline_defined = timelines[tl].defined;
-					page_history_allowed = timeline_defined &&
+					timeline_defined = __atomic_load_n(&timelines[tl].defined,
+																						__ATOMIC_ACQUIRE);
+					timeline_live = timeline_defined &&
+						__atomic_load_n(&timelines[tl].state, __ATOMIC_ACQUIRE) ==
+						PS_TIMELINE_LIVE;
+					/* Recheck LIVE under map_lock while admission write is held;
+					 * this serializes the owner update with BEGIN_DELETE. */
+					page_history_allowed = timeline_live &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
-					wal_index_allowed = timeline_defined &&
+					wal_index_allowed = timeline_live &&
 						walidx_frontier_ancestry_allows(tl, pin.lsn);
-					wal_index_pending = timeline_defined &&
+					wal_index_pending = timeline_live &&
 						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
 					wal_index_pending = wal_index_pending &&
@@ -9472,7 +9840,7 @@ ps_handle_meta(PsChannel *ch)
 								 old_pin.admission_seq == pin.admission_seq)))) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
 							 !wal_index_allowed) || wal_index_pending) ||
-							!timeline_defined) ?
+							!timeline_live) ?
 						PS_RETENTION_ERROR : ps_retention_set(&pin);
 					if (ret == PS_RETENTION_OK)
 					{
@@ -9503,6 +9871,7 @@ ps_handle_meta(PsChannel *ch)
 				int			ret = PS_RETENTION_ERROR;
 				int			old_found = 0;
 				int			timeline_defined = 0;
+				int			timeline_live = 0;
 				int			page_history_allowed = 0;
 				int			wal_index_allowed = 0;
 				int			wal_index_pending = 0;
@@ -9524,19 +9893,25 @@ ps_handle_meta(PsChannel *ch)
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
 						pin.owner_id, &old_pin);
 					ps_lock_map_rd();
-					timeline_defined = timelines[tl].defined;
-					page_history_allowed = timeline_defined &&
+					timeline_defined = __atomic_load_n(&timelines[tl].defined,
+																						__ATOMIC_ACQUIRE);
+					timeline_live = timeline_defined &&
+						__atomic_load_n(&timelines[tl].state, __ATOMIC_ACQUIRE) ==
+						PS_TIMELINE_LIVE;
+					/* Recheck LIVE under map_lock after admission write, not merely
+					 * defined, so BEGIN_DELETE cannot race this owner publication. */
+					page_history_allowed = timeline_live &&
 						page_frontier_ancestry_allows(tl, pin.lsn,
 							pin.admission_seq);
-					wal_index_allowed = timeline_defined &&
+					wal_index_allowed = timeline_live &&
 						walidx_frontier_ancestry_allows(tl, pin.lsn);
-					wal_index_pending = timeline_defined &&
+					wal_index_pending = timeline_live &&
 						walidx_frontier_ancestry_pending(tl);
 					ps_unlock_map();
 					wal_index_pending = wal_index_pending &&
 						((((old_found == 1 ? old_pin.resources : 0) |
 						   pin.resources) & PS_RETENTION_RESOURCE_WAL_INDEX) != 0);
-					if (timeline_defined &&
+					if (timeline_live &&
 						(((pin.resources &
 						   PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0) ||
 						 page_history_allowed) &&
@@ -10318,6 +10693,12 @@ ps_core_maintenance(void)
 	int			did = 0;
 	int			legacy_compaction = 0;
 
+	/* A failed timeline metadata append may already be durable.  Until reopen
+	 * resolves that ambiguity, background work must fail closed alongside the
+	 * request path instead of publishing more timeline-derived metadata. */
+	if (timeline_meta_poisoned_load())
+		return 0;
+
 	/* Pin churn is independent of the layer read path (SPDK uses the same host
 	 * metadata), so bound this log before considering LSM-only work. */
 	if (ps_retention_should_compact())
@@ -10550,6 +10931,7 @@ ps_core_open(const char *store_dir)
 	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
 	fork_meta_poisoned_store(0);
 	fork_meta_bytes_store(0);

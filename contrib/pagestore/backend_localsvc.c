@@ -1594,6 +1594,34 @@ pagestore_localsvc_timeline_parent_timeout(uint32 timeline,
 	return true;
 }
 
+uint8
+pagestore_localsvc_begin_delete(uint32 timeline, uint64 expected_incarnation)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_BEGIN_DELETE;
+	ch->timeline = timeline;
+	ch->req_seq = expected_incarnation;
+	return ls_exec_wait(ch, 0);
+}
+
+bool
+pagestore_localsvc_timeline_state(uint32 timeline, uint32 *state,
+								  uint64 *incarnation)
+{
+	PsChannel  *ch = ls_chan();
+
+	ch->opcode = PS_OP_TIMELINE_STATE;
+	ch->timeline = timeline;
+	if (ls_exec_wait(ch, 0) != PS_STATUS_OK)
+		return false;
+	if (state != NULL)
+		*state = ch->result;
+	if (incarnation != NULL)
+		*incarnation = ch->req_seq;
+	return true;
+}
+
 /*
  * Non-relation object I/O.  The store is keyed by the full PsKey including klass,
  * so a non-relation object (SLRU page, control state, ...) goes through the same

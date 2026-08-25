@@ -215,6 +215,27 @@ test('pagestore_forkmeta_crash_matrix',
   timeout: 120,
 )
 
+# Focused POSIX-only unit test for the durable timeline deletion lifecycle.
+# It links the shared core directly; it does not start a daemon or exercise
+# the optional SPDK frontend.
+pagestore_timeline_test = executable('pagestore_timeline_test',
+  files('pagestore_timeline_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_timeline',
+  pagestore_timeline_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',

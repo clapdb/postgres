@@ -195,7 +195,13 @@ publication-crash coverage.  Still required for the gate:
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
 - fork-metadata compaction/reclamation;
-- timeline deletion and its layer/WAL cleanup.
+- timeline deletion and its layer/WAL cleanup.  The first R5 lifecycle slice
+  now migrates legacy-only timeline logs to V2 and persists V2 create/event
+  records, exposes LIVE/DELETING plus
+  a reserved DELETED format value with incarnation, and vetoes BEGIN_DELETE
+  for descendants or active retention owners.  Its POSIX barrier covers
+  admitted mutation sections; ordinary reads, maintenance, SPDK async drain,
+  physical cleanup, DELETED publication, and ID reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
