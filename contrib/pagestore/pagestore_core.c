@@ -9373,8 +9373,15 @@ timeline_op_allowed(uint32_t timeline, PsOpcode opcode)
 	}
 	if (opcode == PS_OP_REQUIRE_BRANCH)
 		return ps_timeline_live(timeline);
-	if (!ps_timeline_state(timeline, &state, NULL))
+	if (timeline >= MAX_TIMELINES)
 		return 0;
+	/* Before lifecycle state existed, shipped WAL and page records could arrive
+	 * before ancestry metadata was defined.  Preserve that recovery/import
+	 * behavior: only a durably defined non-LIVE timeline is fenced here. */
+	if (!__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE))
+		return 1;
+	state = (PsTimelineState) __atomic_load_n(&timelines[timeline].state,
+														__ATOMIC_ACQUIRE);
 	return state == PS_TIMELINE_LIVE;
 }
 

@@ -357,6 +357,23 @@ timeline_info(uint32_t timeline)
 }
 
 static int
+wal_size_allowed(uint32_t timeline)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_SIZE;
+	ch.timeline = timeline;
+	ch.status = PS_STATUS_OK;
+	ps_lock_shard_rd(0);
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
 expect_open_failure(const char *store)
 {
 	pid_t pid = fork();
@@ -511,6 +528,8 @@ test_v2_and_mixed_lifecycle(void)
 		  incarnation == 1, "root defaults to LIVE incarnation 1");
 	check(state_of(7, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
 		  incarnation == 1, "legacy V2 branch defaults to LIVE incarnation 1");
+	check(wal_size_allowed(99),
+		  "undefined timeline keeps pre-metadata shipped-WAL compatibility");
 	check(create_branch(10, 0, 200), "append new mixed-format create event");
 	check(state_of(10, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
 		  incarnation == 1, "new branch starts LIVE incarnation 1");
