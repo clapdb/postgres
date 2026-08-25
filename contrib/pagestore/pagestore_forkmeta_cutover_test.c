@@ -226,6 +226,26 @@ append_relation(const PsKey *key, uint32_t block, uint64_t lsn,
 	return append_relation_tag(key, block, lsn, page, 0, seq);
 }
 
+static int
+append_relation_timeline(uint32_t timeline, const PsKey *key, uint32_t block,
+						 uint64_t lsn, unsigned char *page, uint64_t *seq)
+{
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+	int rc;
+
+	memset(page, 0, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+	page[128] = (unsigned char) (timeline + 0x20);
+	ps_admission_read_lock();
+	ps_lock_shard_wr(ps_shard_of(key));
+	rc = append_page(timeline, key, block, page, 0, seq);
+	ps_unlock_shard(ps_shard_of(key));
+	ps_admission_read_unlock();
+	return rc;
+}
+
 static off_t
 file_size(const char *path)
 {
@@ -405,6 +425,68 @@ source_record_count(const char *path)
 }
 
 static int
+snapshot_timeline_record_count(const char *directory, uint32_t timeline)
+{
+	PsForkmetaSnapshot selected = {.directory_fd = -1,
+		.checkpoint_fd = -1, .tail_fd = -1};
+	int found = 0;
+
+	if (ps_forkmeta_snapshot_open(&selected, directory) != 0)
+		return -1;
+	for (unsigned int part = 0; part <= PS_FORKMETA_SNAPSHOT_TAIL; part++)
+	{
+		TestSnapshotHeader header;
+		uint64_t records;
+
+		if (ps_forkmeta_snapshot_read(&selected, part, 0, &header,
+									  sizeof(header)) != 0)
+		{
+			found = -1;
+			break;
+		}
+		records = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+			header.checkpoint_records : header.tail_records;
+		for (uint64_t i = 0; i < records; i++)
+		{
+			TestForkMetaRecV2 rec;
+
+			if (ps_forkmeta_snapshot_read(&selected, part,
+									  sizeof(header) + i * sizeof(rec), &rec,
+									  sizeof(rec)) != 0)
+			{
+				found = -1;
+				break;
+			}
+			if (rec.timeline == timeline)
+				found++;
+		}
+		if (found < 0)
+			break;
+	}
+	ps_forkmeta_snapshot_close(&selected);
+	return found;
+}
+
+static int
+source_has_timeline_record(const char *path, uint32_t timeline)
+{
+	TestForkMetaRecV2 rec;
+	int fd = open(path, O_RDONLY);
+	int found = 0;
+
+	if (fd < 0)
+		return 0;
+	while (read(fd, &rec, sizeof(rec)) == (ssize_t) sizeof(rec))
+		if (rec.timeline == timeline)
+		{
+			found = 1;
+			break;
+		}
+	close(fd);
+	return found;
+}
+
+static int
 read_last_source_record(const char *path, TestForkMetaRecV2 *record)
 {
 	off_t size = file_size(path);
@@ -454,6 +536,45 @@ close_runtime(void)
 	ps_core_close();
 	if (ps_storage->close)
 		ps_storage->close();
+}
+
+static int
+begin_delete_timeline(uint32_t timeline)
+{
+	PsChannel state_ch;
+	PsChannel delete_ch;
+	int lifecycle_locked;
+
+	memset(&state_ch, 0, sizeof(state_ch));
+	state_ch.opcode = PS_OP_TIMELINE_STATE;
+	state_ch.timeline = timeline;
+	state_ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&state_ch);
+	ps_unlock_map();
+	ps_lifecycle_read_unlock();
+	if (state_ch.status != PS_STATUS_OK)
+		return 0;
+	memset(&delete_ch, 0, sizeof(delete_ch));
+	delete_ch.opcode = PS_OP_BEGIN_DELETE;
+	delete_ch.timeline = timeline;
+	delete_ch.req_seq = state_ch.req_seq;
+	delete_ch.status = PS_STATUS_OK;
+	lifecycle_locked = ps_lifecycle_write_lock() == 0;
+	if (!lifecycle_locked || ps_admission_write_lock() != 0)
+	{
+		if (lifecycle_locked)
+			ps_lifecycle_write_unlock();
+		return 0;
+	}
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&delete_ch);
+	ps_unlock_map();
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	return delete_ch.status == PS_STATUS_OK &&
+		delete_ch.result == PS_TIMELINE_DELETING;
 }
 
 static int
@@ -748,6 +869,233 @@ test_reclaimed_ordered_markers_pruned(void)
 	close_runtime();
 	remove_tree(store);
 	compact_layers = 0;
+}
+
+static void
+test_deletion_filtered_forkmeta(void)
+{
+	char store[] = "/tmp/psforkmetadeletefilterXXXXXX";
+	char failed_store[] = "/tmp/psforkmetadeletefailXXXXXX";
+	char snapshots[1024];
+	char frontier[1200];
+	char manifest[1200];
+	char source[1200];
+	PsKey target_key = {11, 11, 1, 0, PS_KLASS_RELATION};
+	PsKey sibling_key = {11, 11, 2, 0, PS_KLASS_RELATION};
+	PsKey sibling_extra_key = {11, 11, 3, 0, PS_KLASS_RELATION};
+	PsKey undefined_key = {11, 11, 5, 0, PS_KLASS_RELATION};
+	TestForkMetaRecV2 extra;
+	TestForkMetaRecV2 target_marker;
+	TestForkMetaRecV2 undefined_marker;
+	TestSnapshotHeader before;
+	TestSnapshotHeader after;
+	PsChannel reply;
+	unsigned char page[8192];
+	uint64_t seq = 0;
+	uint64_t generation;
+	int advanced = 0;
+	int n;
+
+	page_size = sizeof(page);
+	segment_size = 1024 * 1024;
+	flush_pages = 1;
+	compact_layers = 0;
+	segment_gc_enabled = 0;
+	cache_pages = 0;
+	ps_nshards = 1;
+	use_layers = 1;
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0,
+		  "arm deletion-filter snapshot threshold below forced trigger");
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open deletion-filter forkmeta store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build deletion-filter snapshot path");
+	n = snprintf(frontier, sizeof(frontier), "%s/page-prune.frontiers", store);
+	check(n > 0 && (size_t) n < sizeof(frontier),
+		  "build deletion-filter page frontier path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build deletion-filter manifest path");
+	n = snprintf(source, sizeof(source), "%s/forkmeta", store);
+	check(n > 0 && (size_t) n < sizeof(source),
+		  "build deletion-filter source path");
+	check(create_branch_request(1, 0, 1) &&
+			  create_branch_request(2, 0, 1) &&
+			  create_branch_request(3, 0, 1),
+		  "create target, marker-only target, and live sibling timelines");
+	check(meta_request_timeline(1, PS_OP_CREATE, &target_key, 100, 0, 0, 0,
+								 NULL) &&
+			  meta_request_timeline(2, PS_OP_CREATE, &sibling_key, 100, 0, 0, 0,
+								 NULL),
+		  "create target and sibling fork metadata");
+	check(append_relation_timeline(1, &target_key, 0, 0, page, &seq) == 0 &&
+			  append_relation_timeline(2, &sibling_key, 0, 0, page, &seq) == 0 &&
+			  append_relation_timeline(2, &sibling_key, 0, 200, page, &seq) == 0,
+		  "write target and sibling ordered markers");
+	memset(&extra, 0, sizeof(extra));
+	extra.magic = TEST_FORK_META_V2_MAGIC;
+	extra.rec_len = sizeof(extra);
+	extra.timeline = 2;
+	extra.key = sibling_extra_key;
+	extra.lsn = 200;
+	extra.admission_seq = seq + 100;
+	extra.order_id = 9001;
+	extra.nblocks = 1;
+	extra.kind = TEST_FEV_SEG_GROW_BOUND;
+	check(append_source_record(source, &extra),
+		  "append surviving source marker outside the in-memory index");
+	undefined_marker = extra;
+	undefined_marker.timeline = 99;
+	undefined_marker.key = undefined_key;
+	undefined_marker.admission_seq += 2;
+	undefined_marker.order_id += 2;
+	check(append_source_record(source, &undefined_marker),
+		  "append undefined/pre-metadata owner marker");
+	target_marker = extra;
+	target_marker.timeline = 3;
+	target_marker.admission_seq++;
+	target_marker.order_id++;
+	target_marker.kind = TEST_FEV_SEG_COMMIT_BOUND;
+	check(append_source_record(source, &target_marker),
+		  "append deleting owner with only an ordered commit marker");
+	close_runtime();
+	check(ps_core_open(store) == 0,
+		  "reopen to load source-only ordered markers before deletion");
+	check(begin_delete_timeline(3),
+		  "begin marker-only timeline deletion before forkmeta maintenance");
+	check(run_maintenance_until(manifest, 1),
+		  "marker-only deletion forces cutover below the byte threshold");
+	check(read_selected_header(snapshots, &before) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 3) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 2) > 0 &&
+			  snapshot_timeline_record_count(snapshots, 99) > 0,
+		  "marker-only target is filtered while live and undefined owners survive");
+	generation = before.generation;
+	check(begin_delete_timeline(1),
+		  "begin a second target deletion in the same process");
+	for (int i = 0; i < 40; i++)
+	{
+		(void) ps_core_maintenance();
+		if (read_selected_header(snapshots, &after) == 0 &&
+			after.generation > generation)
+		{
+			advanced = 1;
+			break;
+		}
+		usleep(100000);
+	}
+	check(advanced && snapshot_timeline_record_count(snapshots, 1) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 3) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 2) > 0 &&
+			  snapshot_timeline_record_count(snapshots, 99) > 0,
+		  "later deletion publishes one new generation and preserves survivors");
+	check(!source_has_timeline_record(source, 1) &&
+			  !source_has_timeline_record(source, 3) &&
+			  snapshot_ordered_marker_count(snapshots, &sibling_extra_key,
+											extra.admission_seq, 1) == 1,
+		  "rewritten source filters target markers while surviving source marker remains selected");
+	generation = after.generation;
+	for (int i = 0; i < 4; i++)
+		(void) ps_core_maintenance();
+	check(read_selected_header(snapshots, &after) == 0 &&
+			  after.generation == generation,
+		  "successful deletion filtering does not repeat in this process");
+	{
+		PsRetentionPin pin;
+
+		memset(&pin, 0, sizeof(pin));
+		pin.timeline = 2;
+		pin.owner_kind = PS_RETENTION_OWNER_READER;
+		pin.owner_id = 2202;
+		pin.generation = 1;
+		pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		pin.lsn = 200;
+		pin.admission_seq = seq;
+		check(ps_retention_set(&pin) == PS_RETENTION_OK &&
+			  run_maintenance_until(frontier, 1),
+			  "publish surviving owner frontier for ordinary pruning");
+	}
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+		  "arm an ordinary size-triggered snapshot after deletion filtering");
+	for (uint32_t i = 0; i < 20; i++)
+	{
+		PsKey churn_key = sibling_key;
+
+		churn_key.relNumber = 100 + i;
+		check(meta_request_timeline(2, PS_OP_CREATE, &churn_key, 400 + i,
+									 0, 0, 0, NULL),
+			  "append surviving owner churn after filtered cutover");
+	}
+	advanced = 0;
+	for (int i = 0; i < 40; i++)
+	{
+		(void) ps_core_maintenance();
+		if (read_selected_header(snapshots, &after) == 0 &&
+			after.generation > generation)
+		{
+			advanced = 1;
+			break;
+		}
+		usleep(100000);
+	}
+	check(advanced, "ordinary threshold publishes a later generation");
+	check(snapshot_timeline_record_count(snapshots, 1) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 3) == 0,
+		  "ordinary threshold snapshot cannot resurrect filtered owners");
+	check(snapshot_timeline_record_count(snapshots, 2) > 0,
+		  "ordinary threshold snapshot retains live owner");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0,
+		  "restore high threshold after ordinary snapshot regression check");
+	close_runtime();
+	check(ps_core_open(store) == 0,
+		  "reopen after ordinary threshold snapshot");
+	check(snapshot_timeline_record_count(snapshots, 1) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 3) == 0 &&
+			  !source_has_timeline_record(source, 1),
+		  "restart does not resurrect filtered targets");
+	check(snapshot_timeline_record_count(snapshots, 2) > 0,
+		  "restart retains live metadata");
+	check(meta_request_timeline(2, PS_OP_NBLOCKS, &sibling_key, 0, 0, 0, 0,
+								 &reply) && reply.result == 1,
+		  "live sibling metadata resolves after restart");
+	close_runtime();
+	remove_tree(store);
+
+	check(mkdtemp(failed_store) != NULL &&
+			  setenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
+			  ps_core_open(failed_store) == 0,
+		  "open deletion-filter failure-boundary store");
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", failed_store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build failure-boundary snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build failure-boundary manifest path");
+	n = snprintf(source, sizeof(source), "%s/forkmeta", failed_store);
+	check(n > 0 && (size_t) n < sizeof(source),
+		  "build failure-boundary source path");
+	check(create_branch_request(1, 0, 1) && create_branch_request(2, 0, 1) &&
+			  meta_request_timeline(1, PS_OP_CREATE, &target_key, 100, 0, 0, 0,
+									 NULL) &&
+			  meta_request_timeline(2, PS_OP_CREATE, &sibling_key, 100, 0, 0, 0,
+									 NULL) &&
+			  append_relation_timeline(1, &target_key, 0, 0, page, &seq) == 0 &&
+			  append_relation_timeline(2, &sibling_key, 0, 0, page, &seq) == 0 &&
+			  begin_delete_timeline(1),
+		  "prepare deletion-filter manifest failure boundary");
+	(void) ps_core_maintenance();
+	unsetenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
+	check(access(manifest, F_OK) == 0 && source_has_timeline_record(source, 1),
+		  "source remains old while selected filtered manifest is ambiguous");
+	close_runtime();
+	check(ps_core_open(failed_store) == 0 &&
+			  snapshot_timeline_record_count(snapshots, 1) == 0 &&
+			  !source_has_timeline_record(source, 1),
+		  "restart reconciles selected filtered manifest and removes target source records");
+	close_runtime();
+	remove_tree(failed_store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
 }
 
 int
@@ -1291,6 +1639,7 @@ main(void)
 			  "child operational truncate preserves inherited pre-mutation history");
 	}
 	close_runtime();
+	test_deletion_filtered_forkmeta();
 	test_reclaimed_ordered_markers_pruned();
 	test_v1_bound_marker_snapshot();
 	test_no_manifest_marker_only_rejected();

@@ -205,8 +205,11 @@ publication-crash coverage.  Still required for the gate:
   turnstile.  Deleting timelines now reclaim their manifest-owned local and
   remote layer artifacts through restartable MARK_DELETE/REMOVE_LAYER GC, with
   idempotent remote retry and completed-but-unpublished upload reconciliation.
-  SPDK async drain, filtered cleanup of shared page/WAL/forkmeta streams,
-  DELETED publication, and ID reuse remain follow-up work.
+  Shared fork metadata is now filtered through the existing crash-safe
+  snapshot/epoch cutover whenever an owner enters DELETING, without pruning
+  surviving live or pre-metadata owners in that forced generation.  SPDK async
+  drain, filtered cleanup of shared page/WAL streams, DELETED publication, and
+  ID reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
