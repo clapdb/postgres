@@ -872,6 +872,51 @@ test_reclaimed_ordered_markers_pruned(void)
 }
 
 static void
+test_legacy_only_deletion_filtered_forkmeta(void)
+{
+	char store[] = "/tmp/psforkmetadeletelegacyXXXXXX";
+	char snapshots[1024];
+	char manifest[1200];
+	PsKey key = {10, 10, 10, 0, PS_KLASS_RELATION};
+	TestForkMetaRecV1 legacy;
+	TestSnapshotHeader header;
+	int n;
+
+	check(mkdtemp(store) != NULL &&
+		  setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1073741824", 1) == 0 &&
+		  ps_core_open(store) == 0 && create_branch_request(1, 0, 1),
+		  "create timeline for legacy-only deletion cutover");
+	close_runtime();
+	memset(&legacy, 0, sizeof(legacy));
+	legacy.timeline = 1;
+	legacy.key = key;
+	legacy.lsn = 1;
+	legacy.nblocks = 1;
+	legacy.kind = TEST_FEV_GROW;
+	check(PsStoragePosix.open(store, segment_size) == 0 &&
+		  PsStoragePosix.fork_meta_rewrite(&legacy, sizeof(legacy)) == 0,
+		  "install legacy-only sequence-zero forkmeta source");
+	PsStoragePosix.close();
+	n = snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store);
+	check(n > 0 && (size_t) n < sizeof(snapshots),
+		  "build legacy deletion snapshot path");
+	n = snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots);
+	check(n > 0 && (size_t) n < sizeof(manifest),
+		  "build legacy deletion manifest path");
+	check(ps_core_open(store) == 0 && begin_delete_timeline(1) &&
+		  run_maintenance_until(manifest, 1),
+		  "legacy-only deletion advances admission and publishes cutover");
+	check(read_selected_header(snapshots, &header) == 0 &&
+		  header.cutoff_lsn == 1 && header.cutoff_admission_seq == 1 &&
+		  header.freeze_admission_seq >= 1 &&
+		  snapshot_timeline_record_count(snapshots, 1) == 0,
+		  "legacy-only deletion snapshot filters target at valid freeze");
+	close_runtime();
+	remove_tree(store);
+	unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
+}
+
+static void
 test_deletion_filtered_forkmeta(void)
 {
 	char store[] = "/tmp/psforkmetadeletefilterXXXXXX";
@@ -1639,6 +1684,7 @@ main(void)
 			  "child operational truncate preserves inherited pre-mutation history");
 	}
 	close_runtime();
+	test_legacy_only_deletion_filtered_forkmeta();
 	test_deletion_filtered_forkmeta();
 	test_reclaimed_ordered_markers_pruned();
 	test_v1_bound_marker_snapshot();

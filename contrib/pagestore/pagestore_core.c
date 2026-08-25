@@ -5398,6 +5398,11 @@ fork_meta_snapshot_maintenance(void)
 										 fork_meta_snapshot_generation, &generation) != 0)
 			goto retry;
 	}
+	/* A legacy-only source has no admission sequence to observe during replay.
+	 * The deletion fallback cutoff is nevertheless (1,1), so advance the
+	 * allocator through that selected position before freezing the snapshot. */
+	if (force_deleting)
+		admission_seq_observe(cutoff.admission_seq);
 	freeze_seq = __atomic_load_n(&next_admission_seq, __ATOMIC_ACQUIRE);
 	if (freeze_seq <= 1)
 		goto retry;
