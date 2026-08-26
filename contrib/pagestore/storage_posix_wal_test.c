@@ -155,6 +155,67 @@ main(void)
 		PsStoragePosix.close();
 	}
 
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_CACHE_REFRESH", "1", 1) == 0 &&
+		PsStoragePosix.open(directory, 0) == 0 &&
+		segment_read_is(0, 0, "zero", 4) &&
+		PsStoragePosix.seg_rewrite(0, 0, "published", 9) != 0,
+		"post-publication cache refresh failure reports ambiguity");
+	errno = 0;
+	check(PsStoragePosix.seg_read(0, 0, 0, temporary, 1) < 0 && errno == EIO,
+		"cache refresh failure poisons same-process segment access");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_CACHE_REFRESH");
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		segment_read_is(0, 0, "published", 9),
+		"reopen releases tracked stale fd and observes published bytes");
+	check(PsStoragePosix.seg_rewrite(0, 0, "retry", 5) == 0 &&
+		segment_read_is(0, 0, "retry", 5),
+		"rewrite continues after cache-refresh reconciliation");
+	PsStoragePosix.close();
+
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
+		PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.seg_rewrite(0, 0, "new", 3) != 0 &&
+		segment_read_is(0, 0, "retry", 5),
+		"segment pre-rename failure preserves the old bytes");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_BEFORE_RENAME");
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_FILE_FSYNC", "1", 1) == 0 &&
+		PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.seg_rewrite(0, 0, "fsync-fail", 10) != 0 &&
+		segment_read_is(0, 0, "retry", 5),
+		"segment temp fsync failure closes fd and preserves old bytes");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_FILE_FSYNC");
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.seg_rewrite(0, 0, "new", 3) == 0 &&
+		segment_read_is(0, 0, "new", 3),
+		"segment replacement publishes the complete new byte stream");
+	PsStoragePosix.close();
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_DIR_FSYNC", "1", 1) == 0 &&
+		PsStoragePosix.open(directory, 0) == 0 &&
+		PsStoragePosix.seg_rewrite(0, 0, "final", 5) != 0 &&
+		PsStoragePosix.seg_read(0, 0, 0, temporary, 1) < 0,
+		"segment post-rename failure poisons access until reopen");
+	errno = 0;
+	check(PsStoragePosix.seg_read(0, 0, 0, temporary, 1) < 0 && errno == EIO,
+		"poisoned segment read reports EIO");
+	errno = 0;
+	check(PsStoragePosix.seg_write(0, 0, 0, "x", 1) < 0 && errno == EIO,
+		"poisoned segment write reports EIO");
+	errno = 0;
+	check(PsStoragePosix.seg_size(0, 0) < 0 && errno == EIO,
+		"poisoned segment size reports EIO");
+	errno = 0;
+	check(PsStoragePosix.seg_rewrite(0, 0, "again", 5) < 0 && errno == EIO,
+		"poisoned segment rewrite reports EIO");
+	PsStoragePosix.close();
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_DIR_FSYNC");
+	check(PsStoragePosix.open(directory, 0) == 0 &&
+		segment_read_is(0, 0, "final", 5),
+		"segment reopen reconciles an ambiguous replacement");
+	PsStoragePosix.close();
+
 	snprintf(temporary, sizeof(temporary), "%s/wal_7", directory);
 	unlink(temporary);
 	snprintf(temporary, sizeof(temporary), "%s/seg_00000000", directory);

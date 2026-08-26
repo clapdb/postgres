@@ -56,6 +56,11 @@ static int test_fail_fork_meta_rewrite_before_rename;
 static int test_fail_fork_meta_rewrite_dir_fsync;
 static int test_fail_timeline_cleanup_private_dir_fsync;
 static int test_fail_timeline_cleanup_shared_scan;
+static int test_fail_seg_rewrite_before_rename;
+static int test_fail_seg_rewrite_cache_refresh;
+static int test_fail_seg_rewrite_file_fsync;
+static int test_fail_seg_rewrite_dir_fsync;
+static int posix_seg_rewrite_poisoned;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flat WAL files are independent per timeline. */
@@ -241,6 +246,10 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_wal_rewrite_dir_fsync;
 	const char *fail_timeline_cleanup_private_dir_fsync;
 	const char *fail_timeline_cleanup_shared_scan;
+	const char *fail_seg_rewrite;
+	const char *fail_seg_rewrite_cache_refresh;
+	const char *fail_seg_rewrite_file_fsync;
+	const char *fail_seg_rewrite_dir_fsync;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -280,6 +289,19 @@ posix_open(const char *path, uint64_t segment_size)
 		getenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN");
 	test_fail_timeline_cleanup_shared_scan = fail_timeline_cleanup_shared_scan ?
 		atoi(fail_timeline_cleanup_shared_scan) : 0;
+	fail_seg_rewrite = getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_BEFORE_RENAME");
+	test_fail_seg_rewrite_before_rename = fail_seg_rewrite ? atoi(fail_seg_rewrite) : 0;
+	fail_seg_rewrite_cache_refresh =
+		getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_CACHE_REFRESH");
+	test_fail_seg_rewrite_cache_refresh = fail_seg_rewrite_cache_refresh ?
+		atoi(fail_seg_rewrite_cache_refresh) : 0;
+	fail_seg_rewrite_file_fsync = getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_FILE_FSYNC");
+	test_fail_seg_rewrite_file_fsync = fail_seg_rewrite_file_fsync ?
+		atoi(fail_seg_rewrite_file_fsync) : 0;
+	fail_seg_rewrite_dir_fsync = getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_DIR_FSYNC");
+	test_fail_seg_rewrite_dir_fsync = fail_seg_rewrite_dir_fsync ?
+		atoi(fail_seg_rewrite_dir_fsync) : 0;
+	posix_seg_rewrite_poisoned = 0;
 	{
 		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
@@ -394,6 +416,11 @@ static int
 posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 			uint32_t len)
 {
+	if (posix_seg_rewrite_poisoned)
+	{
+		errno = EIO;
+		return -1;
+	}
 	int		fd = seg_fd(shard, seg, 1);
 
 	if (fd < 0)
@@ -415,6 +442,11 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 static int
 posix_seg_read(uint32_t shard, int seg, uint64_t off, void *buf, uint32_t len)
 {
+	if (posix_seg_rewrite_poisoned)
+	{
+		errno = EIO;
+		return -1;
+	}
 	int		fd = seg_fd(shard, seg, 0);
 
 	if (fd < 0)
@@ -430,10 +462,178 @@ posix_seg_size(uint32_t shard, int seg)
 	char		path[4096];
 	struct stat st;
 
+	if (posix_seg_rewrite_poisoned)
+	{
+		errno = EIO;
+		return -1;
+	}
 	seg_path(path, sizeof(path), shard, seg);
 	if (stat(path, &st) != 0)
 		return -1;
 	return (int64_t) st.st_size;
+}
+
+static int
+posix_seg_rewrite(uint32_t shard, int seg, const void *buf, uint64_t len)
+{
+	char path[4096];
+	char tmp[4096];
+	struct stat st;
+	const unsigned char *p = buf;
+	uint64_t off = 0;
+	int fd = -1;
+	int dfd = -1;
+	int newfd = -1;
+	int cache_locked = 0;
+	int rc = -1;
+
+	if (posix_seg_rewrite_poisoned)
+	{
+		errno = EIO;
+		return -1;
+	}
+	if (seg < 0 || (len != 0 && buf == NULL) || len > (uint64_t) LLONG_MAX)
+		return -1;
+	seg_path(path, sizeof(path), shard, seg);
+	if (snprintf(tmp, sizeof(tmp), "%s.rewrite.tmp", path) < 0 ||
+		strlen(path) + strlen(".rewrite.tmp") >= sizeof(tmp))
+		return -1;
+	if (lstat(path, &st) != 0)
+	{
+		if (errno == ENOENT && len == 0)
+			return 0;
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode))
+		return -1;
+	/* A stale temporary is never authoritative.  Refuse a non-regular name
+	 * instead of opening a FIFO/device or following a symlink. */
+	if (lstat(tmp, &st) == 0)
+	{
+		if (!S_ISREG(st.st_mode) || unlink(tmp) != 0)
+			return -1;
+	}
+	else if (errno != ENOENT)
+		return -1;
+
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0)
+		goto out_unlock;
+	while (off < len)
+	{
+		ssize_t n = write(fd, p + off,
+						(size_t) (len - off < (uint64_t) SSIZE_MAX ?
+						 (len - off) : (uint64_t) SSIZE_MAX));
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto out_unlock;
+		off += (uint64_t) n;
+	}
+	{
+		int fsync_rc;
+		int fsync_errno;
+		int close_rc;
+		int close_errno;
+
+		if (test_fail_seg_rewrite_file_fsync > 0 &&
+			--test_fail_seg_rewrite_file_fsync == 0)
+		{
+			errno = EIO;
+			fsync_rc = -1;
+		}
+		else
+			fsync_rc = fsync(fd);
+		fsync_errno = fsync_rc == 0 ? 0 : errno;
+		close_rc = close(fd);
+		close_errno = close_rc == 0 ? 0 : errno;
+
+		fd = -1;
+		if (fsync_rc != 0 || close_rc != 0)
+		{
+			errno = fsync_errno != 0 ? fsync_errno : close_errno;
+			goto out_unlock;
+		}
+	}
+	if (test_fail_seg_rewrite_before_rename > 0 &&
+		--test_fail_seg_rewrite_before_rename == 0)
+	{
+		errno = EIO;
+		goto out_unlock;
+	}
+	if (rename(tmp, path) != 0)
+		goto out_unlock;
+	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
+	if (dfd < 0 ||
+		(test_fail_seg_rewrite_dir_fsync > 0 &&
+		 --test_fail_seg_rewrite_dir_fsync == 0) || fsync(dfd) != 0)
+	{
+		posix_seg_rewrite_poisoned = 1;
+		if (dfd >= 0)
+			close(dfd);
+		dfd = -1;
+		errno = EIO;
+		goto out_unlock;
+	}
+	if (close(dfd) != 0)
+	{
+		dfd = -1;
+		posix_seg_rewrite_poisoned = 1;
+		errno = EIO;
+		goto out_unlock;
+	}
+	dfd = -1;
+
+	/* Publication is now durable.  Keep the cached descriptor number stable
+	 * for readers that already know it, but atomically retarget that number to
+	 * the replacement inode.  Any refresh failure is ambiguous to this process:
+	 * leave the slot tracked, poison segment access, and require close/reopen. */
+	pthread_mutex_lock(&seg_fds_lock);
+	cache_locked = 1;
+	if (shard < (uint32_t) seg_shards_cap && seg >= 0 &&
+		seg < seg_fds_caps[shard] && seg_fds[shard] &&
+		seg_fds[shard][seg] >= 0)
+	{
+		int oldfd = seg_fds[shard][seg];
+
+		if (test_fail_seg_rewrite_cache_refresh > 0 &&
+			--test_fail_seg_rewrite_cache_refresh == 0)
+			goto refresh_fail;
+		newfd = open(path, O_RDWR | O_CLOEXEC);
+		if (newfd < 0 || dup2(newfd, oldfd) < 0 ||
+			fcntl(oldfd, F_SETFD, FD_CLOEXEC) < 0)
+			goto refresh_fail;
+		if (close(newfd) != 0)
+		{
+			newfd = -1;
+			goto refresh_fail;
+		}
+		newfd = -1;
+	}
+	pthread_mutex_unlock(&seg_fds_lock);
+	cache_locked = 0;
+	rc = 0;
+	goto out_unlock;
+
+refresh_fail:
+	posix_seg_rewrite_poisoned = 1;
+	errno = EIO;
+
+out_unlock:
+	if (fd >= 0)
+		close(fd);
+	if (dfd >= 0)
+		close(dfd);
+	if (newfd >= 0)
+		close(newfd);
+	if (rc != 0)
+		(void) unlink(tmp);
+	if (cache_locked)
+		pthread_mutex_unlock(&seg_fds_lock);
+	if (rc != 0 && posix_seg_rewrite_poisoned)
+		errno = EIO;
+	return rc;
 }
 
 static void
@@ -2217,6 +2417,7 @@ const PsStorage PsStoragePosix = {
 	.seg_read = posix_seg_read,
 	.seg_size = posix_seg_size,
 	.seg_remove = posix_seg_remove,
+	.seg_rewrite = posix_seg_rewrite,
 	.wal_append = posix_wal_append,
 	.wal_read = posix_wal_read,
 	.wal_truncate = posix_wal_truncate,

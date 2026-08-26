@@ -58,6 +58,9 @@ typedef struct PsStorage
 	int64_t		(*seg_size) (uint32_t shard, int seg);
 	/* Optional: remove a no-longer-referenced segment (ENOENT is success). */
 	int			(*seg_remove) (uint32_t shard, int seg);
+	/* Crash-safe same-id replacement: fsync temp, rename, fsync parent dir. */
+	int			(*seg_rewrite) (uint32_t shard, int seg, const void *buf,
+							 uint64_t len);
 
 	/*
 	 * Per-timeline shipped-WAL log.  wal_append takes the record header (a) and

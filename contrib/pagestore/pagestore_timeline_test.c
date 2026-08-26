@@ -26,6 +26,10 @@
 #include "pagestore_retention.h"
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
+#define TEST_FORK_META_V2_MAGIC 0x324d4b46U
+#define TEST_FEV_SEG_GROW_BOUND 7
+#define TEST_FEV_SEG_COMMIT_BOUND 8
+#define TEST_SEG_CLAMPED_ADMISSION_MAGIC 0x53454738U
 
 typedef struct TestTimelineV2
 {
@@ -58,6 +62,30 @@ typedef struct TestTimelineEvent
 	uint32_t crc;
 	uint32_t reserved;
 } TestTimelineEvent;
+
+typedef struct TestForkMetaRecV2
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t timeline;
+	PsKey	 key;
+	uint64_t lsn;
+	uint64_t admission_seq;
+	uint64_t order_id;
+	uint32_t nblocks;
+	uint8_t	 kind;
+	uint8_t	 pad[3];
+} TestForkMetaRecV2;
+
+typedef struct TestSegRecHdr
+{
+	uint32_t magic;
+	uint32_t timeline;
+	PsKey	 key;
+	uint32_t block;
+	uint64_t lsn;
+	uint32_t len;
+} TestSegRecHdr;
 
 static int checks;
 static int failed;
@@ -320,6 +348,16 @@ write_timeline_layer(uint32_t timeline, uint32_t block, uint32_t lsn_lo)
 	ps_lock_shard_wr(ps_shard_of(&key));
 	rc = append_page(timeline, &key, block, page, 0, NULL);
 	ps_unlock_shard(ps_shard_of(&key));
+	return rc;
+}
+
+static int
+read_test_page(uint32_t timeline, uint32_t block, unsigned char *page)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int rc;
+
+	rc = read_resolve(timeline, &key, block, UINT64_MAX, 0, page, NULL);
 	return rc;
 }
 
@@ -1201,6 +1239,57 @@ remove_tree(const char *path)
 		(void) system(command);
 }
 
+/* Remove one target's ordered segment markers while preserving the rest of the
+ * fixed forkmeta log.  This models a crash/loss of the marker after the page
+ * body reached the segment, without changing the physical segment bytes. */
+static int
+strip_ordered_markers(const char *store, uint32_t timeline)
+{
+	char path[512];
+	TestForkMetaRecV2 rec;
+	off_t in = 0;
+	off_t out = 0;
+	int removed = 0;
+	int fd;
+
+	if (snprintf(path, sizeof(path), "%s/forkmeta", store) < 0)
+		return -1;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	for (;;)
+	{
+		ssize_t n = pread(fd, &rec, sizeof(rec), in);
+
+		if (n == 0)
+			break;
+		if (n != (ssize_t) sizeof(rec) ||
+			rec.magic != TEST_FORK_META_V2_MAGIC ||
+			rec.rec_len != sizeof(rec))
+		{
+			(void) close(fd);
+			return -1;
+		}
+		in += (off_t) sizeof(rec);
+		if ((rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+			 rec.kind == TEST_FEV_SEG_COMMIT_BOUND) &&
+			rec.timeline == timeline)
+		{
+			removed++;
+			continue;
+		}
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			(void) close(fd);
+			return -1;
+		}
+		out += (off_t) sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return removed == 1 ? 0 : -1;
+}
+
 static void
 configure_timeline_core(void)
 {
@@ -1722,12 +1811,276 @@ test_v2_and_mixed_lifecycle(void)
 	remove_tree(store);
 }
 
+static void
+test_deleting_timeline_page_cleanup(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-cleanup-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	int64_t before, after;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 1; /* force a watermark in the mixed source segment */
+	cache_pages = 8;
+	check(mkdtemp(store) != NULL, "create shared page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100),
+		  "open shared page-cleanup store with 1/10 siblings");
+	check(write_timeline_layer(0, 2, 50) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write parent, target, and sibling into one segment");
+		memset(page, 0, sizeof(page));
+		check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
+			  "populate target page cache before deletion");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && begin_delete(1, 1, NULL),
+		  "begin shared page-segment deletion");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	after = ps_storage->seg_size(0, 0);
+	check(after > 0 && after < before,
+		  "mixed segment is atomically filtered without unlinking it");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+		  "target page and cache reference are gone");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+		  "timeline 10 sibling bytes survive byte-for-byte");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "page cleanup does not publish DELETED");
+	check(!create_branch(1, 0, 300), "page cleanup preserves ID-reuse fence");
+	close_store();
+	check(ps_core_open(store) == 0,
+			"restart resumes from the filtered shared segment");
+	memset(page, 0, sizeof(page));
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"restart preserves deleting state during page cleanup");
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+			"restart keeps sibling after page cleanup");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+			"restart does not resurrect target page");
+	close_store();
+	remove_tree(store);
+
+	/* A segment containing only the target becomes an empty canonical segment;
+	 * its identity remains so recovery and the append cursor stay unambiguous. */
+	strcpy(store, "/tmp/pagestore-timeline-page-cleanup-XXXXXX");
+	check(mkdtemp(store) != NULL, "create pure-target page-cleanup store");
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 100;
+	check(ps_core_open(store) == 0 && create_branch(2, 0, 100) &&
+			write_timeline_layer(2, 0, 100) == 0 && begin_delete(2, 1, NULL),
+		  "write pure-target segment");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 0) == 0,
+		  "pure-target segment is replaced by an empty segment");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deleting_timeline_page_cleanup_fail_closed(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-malformed-XXXXXX";
+	unsigned char page[8192];
+	uint32_t bad = 0xdeadbeefU;
+	int64_t valid_size;
+
+	configure_timeline_core();
+	segment_size = 1024 * 1024;
+	flush_pages = 100;
+	check(mkdtemp(store) != NULL, "create malformed page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+		  "write target and sibling before malformed tail");
+	valid_size = ps_storage->seg_size(0, 0);
+	check(valid_size > 0 &&
+			ps_storage->seg_write(0, 0, (uint64_t) valid_size, &bad,
+								 sizeof(bad)) == 0 && ps_storage->sync() == 0 &&
+			begin_delete(1, 1, NULL),
+		  "install a truncated record tail after BEGIN_DELETE target");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 0) == valid_size + (int64_t) sizeof(bad),
+		  "malformed segment cleanup stays fail-closed and retryable");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1,
+		  "failed cleanup retains the target until repair");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deleting_timeline_page_cleanup_oversized(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-oversized-XXXXXX";
+	unsigned char page[8192];
+	unsigned char sparse_tail = 0;
+	PsTimelineState state;
+	int64_t oversized;
+
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	cache_pages = 0;
+	check(mkdtemp(store) != NULL, "create oversized page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+			"write target and sibling before oversized sparse tail");
+	check(ps_storage->seg_write(0, 0, segment_size, &sparse_tail,
+								 sizeof(sparse_tail)) == 0 &&
+			ps_storage->sync() == 0 && begin_delete(1, 1, NULL),
+			"extend mixed segment beyond configured size before cleanup");
+	oversized = ps_storage->seg_size(0, 0);
+	check(oversized == (int64_t) segment_size + 1,
+			"oversized sparse segment is present");
+	for (int i = 0; i < 16; i++)
+		(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 0) == oversized,
+			"oversized segment fails closed without partial replacement");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
+			"oversized cleanup failure retains target page");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+			"oversized cleanup failure leaves sibling undamaged");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"oversized cleanup failure remains retryable in DELETING");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deleting_timeline_page_cleanup_prefix_hole(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-hole-XXXXXX";
+	unsigned char page[8192];
+	int64_t before;
+
+	/* Two records fill the first segment; the target and sibling then land in
+	 * segment 1.  Removing segment 0 models prefix GC leaving a later mixed
+	 * segment that cleanup must still visit. */
+	configure_timeline_core();
+	segment_size = 20000;
+	flush_pages = 100;
+	cache_pages = 0;
+	check(mkdtemp(store) != NULL, "create prefix-hole page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(0, 2, 50) == 0 &&
+			write_timeline_layer(0, 3, 60) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0,
+			"write prefix filler and later target/sibling records");
+	before = ps_storage->seg_size(0, 1);
+	check(before > 0 && ps_storage->seg_remove(0, 0) == 0 &&
+			begin_delete(1, 1, NULL),
+			"remove prefix segment before deleting later target");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	check(ps_storage->seg_size(0, 1) > 0 &&
+			ps_storage->seg_size(0, 1) < before,
+			"cleanup crosses prefix hole and filters later mixed segment");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 0,
+			"prefix-hole cleanup removes target page");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
+			"prefix-hole cleanup preserves later sibling page");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deleting_timeline_page_cleanup_retired_short_segment(void)
+{
+	char store[] = "/tmp/pagestore-timeline-retired-short-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr sibling_hdr;
+	int64_t before;
+	int64_t after;
+
+	/* A missing ordered forkmeta marker for the still-live sibling makes
+	 * recovery retire the physical segment at cur_off == segment_size even
+	 * though the file is short.  The deleting target follows it physically. */
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	use_layers = 0; /* keep the recovery case on the physical segment path */
+	check(mkdtemp(store) != NULL, "create retired-short page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			/* The below-branch-floor LSN forces the sibling into the ordered
+			 * SEG8 shape whose forkmeta marker recovery must validate. */
+			write_timeline_layer(10, 1, 50) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0,
+			"write target and sibling into one short segment");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && before < (int64_t) segment_size &&
+			begin_delete(1, 1, NULL) && ps_storage->sync() == 0,
+			"begin deletion before simulating a missing ordered marker");
+	close_store();
+	check(strip_ordered_markers(store, 10) == 0,
+			"remove only the live sibling ordered forkmeta marker");
+
+	check(ps_core_open(store) == 0,
+			"restart accepts a short segment with a retired recovery cursor");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	after = ps_storage->seg_size(0, 0);
+	check(after > 0 && after < before,
+			"DELETING cleanup filters a retired short segment");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"retired-segment cleanup keeps the target DELETING");
+	memset(page, 0, sizeof(page));
+	check(ps_storage->seg_read(0, 0, 0, &sibling_hdr,
+						 sizeof(sibling_hdr)) == 0 &&
+			sibling_hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC &&
+			sibling_hdr.timeline == 10 && sibling_hdr.block == 1 &&
+			ps_storage->seg_read(0, 0,
+						 sizeof(sibling_hdr) + 2 * sizeof(uint64_t),
+						 page, page_size) == 0 && page[100] == 0x5A,
+			"filtered retired segment preserves sibling bytes");
+
+	/* The sentinel must survive the rewrite.  A subsequent live write therefore
+	 * starts segment 1 instead of appending to the compacted physical tail. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after &&
+			ps_storage->seg_size(0, 1) > 0,
+			"next write rolls past the retired compacted segment");
+	close_store();
+	check(ps_core_open(store) == 0,
+			"restart after retired-segment cleanup and rolled append");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+			"rolled append survives retired-segment recovery");
+	check(read_test_page(1, 0, page) == 0,
+			"target page stays absent after retired-segment recovery");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
+	test_deleting_timeline_page_cleanup();
+	test_deleting_timeline_page_cleanup_fail_closed();
+	test_deleting_timeline_page_cleanup_oversized();
+	test_deleting_timeline_page_cleanup_prefix_hole();
+	test_deleting_timeline_page_cleanup_retired_short_segment();
 	test_v2_and_mixed_lifecycle();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
