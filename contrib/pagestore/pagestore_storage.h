@@ -92,6 +92,12 @@ typedef struct PsStorage
 								 uint64_t epoch);
 	int			(*walidx_epoch_gc) (uint32_t tl, const uint64_t *keep_epochs,
 								 uint32_t nshards);
+	/* Remove only the deleting timeline's private WAL/WAL-index artifacts.
+	 * The backend must validate the complete target set before unlinking any
+	 * entry, fsync every changed directory, and return an error for unknown or
+	 * non-regular entries.  A backend without a safe implementation leaves this
+	 * NULL (fail closed). */
+	int			(*timeline_wal_cleanup) (uint32_t tl);
 
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);

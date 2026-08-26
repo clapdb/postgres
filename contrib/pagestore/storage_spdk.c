@@ -943,6 +943,8 @@ const PsStorage PsStorageSpdk = {
 	.walidx_truncate = spdk_walidx_truncate,
 	.walidx_epoch_create = spdk_walidx_epoch_create,
 	.walidx_epoch_gc = spdk_walidx_epoch_gc,
+	/* WAL cleanup is POSIX-path ownership logic; SPDK deliberately fails closed. */
+	.timeline_wal_cleanup = NULL,
 	.meta_append = spdk_meta_append,
 	.meta_read = spdk_meta_read,
 	.meta_truncate = spdk_meta_truncate,

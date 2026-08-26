@@ -110,6 +110,7 @@ static int retention_project_lsn(uint32_t descendant, uint32_t target,
 static int timeline_has_parent(uint32_t timeline);
 static int timeline_delete_active(void);
 static int timeline_recovery_allowed(uint32_t timeline);
+static int timeline_delete_wal_cleanup_one(void);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -2143,6 +2144,10 @@ page_prune_mark_all_due(void)
  * would silently serve the previous branch's pages.
  */
 static int timeline_used[MAX_TIMELINES];
+/* Set only after the POSIX private WAL cleanup and the matching runtime purge
+ * have both completed.  DELETING remains the durable terminal state for this
+ * slice; this bit is only a maintenance retry guard. */
+static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
 
 static inline void
 timeline_mark_used(uint32_t timeline)
@@ -6849,6 +6854,153 @@ free_walidx_indexes(void)
 		}
 }
 
+static void
+walidx_purge_timeline(uint32_t tl)
+{
+	for (uint32_t sh = 0; sh < MAX_SHARDS; sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			WalIdxEnt **link = &g_shards[sh].walidx[bucket];
+
+			while (*link != NULL)
+			{
+				WalIdxEnt *entry = *link;
+
+				if (entry->timeline != tl)
+				{
+					link = &entry->next;
+					continue;
+				}
+				*link = entry->next;
+				free(entry->items);
+				free(entry);
+			}
+		}
+	pthread_mutex_lock(&walidx_meta_lock);
+	walidx_progress[tl] = 0;
+	walidx_progress_valid[tl] = 0;
+	memset(walidx_shards_seen[tl], 0, sizeof(walidx_shards_seen[tl]));
+	memset(walidx_shards_required[tl], 0,
+		   sizeof(walidx_shards_required[tl]));
+	memset(walidx_shard_offsets_seen[tl], 0,
+		   sizeof(walidx_shard_offsets_seen[tl]));
+	memset(walidx_shard_offsets_required[tl], 0,
+		   sizeof(walidx_shard_offsets_required[tl]));
+	walidx_snapshot_generation[tl] = 0;
+	walidx_snapshot_start[tl] = 0;
+	walidx_snapshot_end[tl] = 0;
+	memset(walidx_snapshot_offsets[tl], 0,
+		   sizeof(walidx_snapshot_offsets[tl]));
+	walidx_snapshot_bytes[tl] = 0;
+	walidx_snapshot_reshard_pending[tl] = 0;
+	memset(&walidx_snapshot_retry_at[tl], 0,
+		   sizeof(walidx_snapshot_retry_at[tl]));
+	memset(walidx_log_epoch[tl], 0, sizeof(walidx_log_epoch[tl]));
+	walidx_snapshot_gc_pending[tl] = 0;
+	memset(&walidx_snapshot_gc_retry_at[tl], 0,
+		   sizeof(walidx_snapshot_gc_retry_at[tl]));
+	memset(&walidx_snapshot_cleanup[tl], 0,
+		   sizeof(walidx_snapshot_cleanup[tl]));
+	walidx_snapshot_cleanup_pending[tl] = 0;
+	memset(&walidx_snapshot_cleanup_retry_at[tl], 0,
+		   sizeof(walidx_snapshot_cleanup_retry_at[tl]));
+	/* Keep walidx_reclaimed_frontier[tl] as the durable old-incarnation fence.
+	 * It lives in a shared metadata file and may be removed only by the later
+	 * crash-safe ID-reuse cutover, never by this private-artifact cleanup. */
+	pthread_mutex_unlock(&walidx_meta_lock);
+}
+
+static void
+wal_runtime_purge(uint32_t tl)
+{
+	if (wal_segment_store_opened[tl])
+	{
+		ps_wal_store_close(&wal_segment_stores[tl]);
+		wal_segment_store_opened[tl] = 0;
+	}
+	free(wal_chunks[tl]);
+	wal_chunks[tl] = NULL;
+	wal_chunks_n[tl] = 0;
+	wal_chunks_cap[tl] = 0;
+	wal_log_bytes[tl] = 0;
+	__atomic_store_n(&wal_start[tl], 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&wal_start_valid[tl], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&wal_end[tl], 0, __ATOMIC_RELEASE);
+	wal_covered[tl] = 0;
+	wal_covered_off[tl] = 0;
+	wal_covered_valid[tl] = 0;
+	walidx_purge_timeline(tl);
+}
+
+/* The lifecycle writer has already drained all ordinary requests before the
+ * timeline became DELETING.  This maintenance operation therefore owns the
+ * target's WAL lock, every runtime WAL-index shard, the prune fence and the
+ * snapshot publication gate while it drops the private artifacts. */
+static int
+timeline_delete_wal_cleanup_one(void)
+{
+	for (uint32_t tl = 1; tl < MAX_TIMELINES; tl++)
+	{
+		PsTimelineState state;
+		pthread_rwlock_t *wal_lock;
+		int rc;
+
+		if (__atomic_load_n(&timeline_wal_cleanup_done[tl], __ATOMIC_ACQUIRE) ||
+			!ps_timeline_state(tl, &state, NULL) ||
+			state != PS_TIMELINE_DELETING)
+			continue;
+		/* A backend without an owner-scoped implementation must not guess how
+		 * to remove filesystem/device state.  The tombstone remains retryable. */
+		if (ps_storage->timeline_wal_cleanup == NULL)
+			continue;
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_lock_shard_wr(sh);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		wal_lock = wal_log_lock_for(tl);
+		if (wal_lock == NULL)
+		{
+			walidx_publish_wrunlock();
+			pthread_rwlock_unlock(&walidx_prune_lock);
+			for (uint32_t sh = core_shards(); sh > 0; sh--)
+				ps_unlock_shard(sh - 1);
+			/* A missing per-timeline lock is a failed attempt, not a reason
+			 * to starve later DELETING timelines. */
+			continue;
+		}
+		pthread_rwlock_wrlock(wal_lock);
+		/* Close the immutable store before rmdir so no cleanup retry depends on
+		 * an unlinked directory fd.  The in-memory catalog is purged only after
+		 * the complete physical validation/deletion succeeds. */
+		if (wal_segment_store_opened[tl])
+		{
+			ps_wal_store_close(&wal_segment_stores[tl]);
+			wal_segment_store_opened[tl] = 0;
+		}
+		rc = ps_storage->timeline_wal_cleanup(tl);
+		if (rc == 0)
+		{
+			wal_runtime_purge(tl);
+			/* Purging a timeline removes its contribution from the aggregate
+			 * pending/lagging view.  Publish while the WAL-index write gate is
+			 * still held so readers cannot observe a half-purged runtime state. */
+			publish_wal_index_metrics();
+			__atomic_store_n(&timeline_wal_cleanup_done[tl], 1,
+							 __ATOMIC_RELEASE);
+		}
+		pthread_rwlock_unlock(wal_lock);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		for (uint32_t sh = core_shards(); sh > 0; sh--)
+			ps_unlock_shard(sh - 1);
+		if (rc == 0)
+			return 1;
+		/* Keep the failed tombstone retryable, but do not let it starve a
+		 * later DELETING timeline on this maintenance tick. */
+	}
+	return 0;
+}
+
 /* Keep each hash chain canonical so a fixed-size heap can merge the chains
  * into the same key/block/LSN order as the former whole-shard qsort. */
 static int
@@ -11382,9 +11534,12 @@ ps_core_maintenance_impl(void)
 		if (snapshot_rc)
 			return 1;
 	}
-
 	if (!use_layers)
+	{
+		if (timeline_delete_wal_cleanup_one())
+			return 1;
 		return 0;
+	}
 
 	/*
 	 * Back off all maintenance once the manifest is poisoned: compaction cannot
@@ -11394,12 +11549,17 @@ ps_core_maintenance_impl(void)
 	 */
 	if (ps_manifest_poisoned())
 		return 0;
+	/* Establish the durable layer tombstone before any owner-scoped WAL
+	 * cleanup.  Keeping this first preserves the existing restart discovery
+	 * boundary while the two cleanup classes remain independent. */
+	if (timeline_delete_mark_one())
+		return 1;
+	if (timeline_delete_wal_cleanup_one())
+		return 1;
 	ns = core_shards();
 	/* Timeline deletion is an explicit owner-scoped cleanup path.  Establish each
 	 * layer tombstone before handing it to the existing asynchronous remote GC;
 	 * normal tiering, segment GC, and compaction remain LIVE-only selectors. */
-	if (timeline_delete_mark_one())
-		return 1;
 	if (gc_remote_one())
 		return 1;
 	if (tier_one_layer())
@@ -11604,6 +11764,7 @@ ps_core_open(const char *store_dir)
 	memset(timelines, 0, sizeof(timelines));
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
+	memset(timeline_wal_cleanup_done, 0, sizeof(timeline_wal_cleanup_done));
 	fork_meta_poisoned_store(0);
 	fork_meta_bytes_store(0);
 	fork_meta_snapshot_generation = 0;
@@ -11894,6 +12055,15 @@ ps_core_open(const char *store_dir)
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (tl == 0 || timelines[tl].defined || timeline_is_used(tl))
 		{
+			PsTimelineState timeline_state;
+
+			/* A crash can leave any prefix of a DELETING timeline's private
+			 * WAL set behind.  Do not parse or reopen those artifacts: the
+			 * maintenance cleanup owns the retry and the tombstone remains
+			 * DELETING throughout. */
+			if (ps_timeline_state(tl, &timeline_state, NULL) &&
+				timeline_state == PS_TIMELINE_DELETING)
+				continue;
 			if (wal_recover_one(tl) != 0)
 				return -1;
 			if (wal_segment_sync(tl) != 0)

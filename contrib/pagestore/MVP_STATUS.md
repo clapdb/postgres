@@ -207,9 +207,12 @@ publication-crash coverage.  Still required for the gate:
   idempotent remote retry and completed-but-unpublished upload reconciliation.
   Shared fork metadata is now filtered through the existing crash-safe
   snapshot/epoch cutover whenever an owner enters DELETING, without pruning
-  surviving live or pre-metadata owners in that forced generation.  SPDK async
-  drain, filtered cleanup of shared page/WAL streams, DELETED publication, and
-  ID reuse remain follow-up work.
+  surviving live or pre-metadata owners in that forced generation.  POSIX
+  maintenance now validates and removes each deleting owner's private flat and
+  immutable WAL plus WAL-index epochs, watermarks, and snapshots; partial
+  deletion resumes after restart while sibling artifacts survive.  SPDK async
+  drain, filtered cleanup of shared page segments, DELETED publication, and ID
+  reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
