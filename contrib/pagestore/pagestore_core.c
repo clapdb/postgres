@@ -6952,7 +6952,7 @@ timeline_delete_wal_cleanup_one(void)
 		/* A backend without an owner-scoped implementation must not guess how
 		 * to remove filesystem/device state.  The tombstone remains retryable. */
 		if (ps_storage->timeline_wal_cleanup == NULL)
-			return 0;
+			continue;
 		for (uint32_t sh = 0; sh < core_shards(); sh++)
 			ps_lock_shard_wr(sh);
 		pthread_rwlock_wrlock(&walidx_prune_lock);
@@ -6964,7 +6964,9 @@ timeline_delete_wal_cleanup_one(void)
 			pthread_rwlock_unlock(&walidx_prune_lock);
 			for (uint32_t sh = core_shards(); sh > 0; sh--)
 				ps_unlock_shard(sh - 1);
-			return 0;
+			/* A missing per-timeline lock is a failed attempt, not a reason
+			 * to starve later DELETING timelines. */
+			continue;
 		}
 		pthread_rwlock_wrlock(wal_lock);
 		/* Close the immutable store before rmdir so no cleanup retry depends on
@@ -6979,6 +6981,10 @@ timeline_delete_wal_cleanup_one(void)
 		if (rc == 0)
 		{
 			wal_runtime_purge(tl);
+			/* Purging a timeline removes its contribution from the aggregate
+			 * pending/lagging view.  Publish while the WAL-index write gate is
+			 * still held so readers cannot observe a half-purged runtime state. */
+			publish_wal_index_metrics();
 			__atomic_store_n(&timeline_wal_cleanup_done[tl], 1,
 							 __ATOMIC_RELEASE);
 		}
@@ -6987,7 +6993,10 @@ timeline_delete_wal_cleanup_one(void)
 		pthread_rwlock_unlock(&walidx_prune_lock);
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
-		return rc == 0 ? 1 : 0;
+		if (rc == 0)
+			return 1;
+		/* Keep the failed tombstone retryable, but do not let it starve a
+		 * later DELETING timeline on this maintenance tick. */
 	}
 	return 0;
 }

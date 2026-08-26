@@ -52,6 +52,7 @@ static int test_fail_wal_rewrite_before_rename;
 static int test_fail_wal_rewrite_dir_fsync;
 static int test_fail_fork_meta_rewrite_before_rename;
 static int test_fail_fork_meta_rewrite_dir_fsync;
+static int test_fail_timeline_cleanup_private_dir_fsync;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flat WAL files are independent per timeline. */
@@ -235,6 +236,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *max_log_read;
 	const char *fail_wal_rewrite;
 	const char *fail_wal_rewrite_dir_fsync;
+	const char *fail_timeline_cleanup_private_dir_fsync;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -265,6 +267,11 @@ posix_open(const char *path, uint64_t segment_size)
 		getenv("PAGESTORE_TEST_FAIL_WAL_REWRITE_DIR_FSYNC");
 	test_fail_wal_rewrite_dir_fsync = fail_wal_rewrite_dir_fsync ?
 		atoi(fail_wal_rewrite_dir_fsync) : 0;
+	fail_timeline_cleanup_private_dir_fsync =
+		getenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC");
+	test_fail_timeline_cleanup_private_dir_fsync =
+		fail_timeline_cleanup_private_dir_fsync ?
+		atoi(fail_timeline_cleanup_private_dir_fsync) : 0;
 	{
 		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
@@ -1485,6 +1492,8 @@ posix_remove_private_dir(int root_fd, const char *name, uint32_t tl,
 	int scan_fd = -1;
 	int removed = 0;
 	int rc = -1;
+	int dir_fsync_rc;
+	int dir_close_rc;
 
 	dir_fd = openat(root_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (dir_fd < 0)
@@ -1509,12 +1518,24 @@ posix_remove_private_dir(int root_fd, const char *name, uint32_t tl,
 			goto done;
 		removed = 1;
 	}
-	if (errno != 0 || fsync(dir_fd) != 0 || closedir(dir) != 0)
+	if (errno != 0)
+		goto done;
+	if (test_fail_timeline_cleanup_private_dir_fsync > 0 &&
+		--test_fail_timeline_cleanup_private_dir_fsync == 0)
 	{
-		dir = NULL;
+		errno = EIO;
+		dir_fsync_rc = -1;
+	}
+	else
+		dir_fsync_rc = fsync(dir_fd);
+	/* Do not short-circuit closedir after a failed fsync: dir owns scan_fd,
+	 * and every retry must release it before returning the error. */
+	dir_close_rc = closedir(dir);
+	dir = NULL;
+	if (dir_fsync_rc != 0 || dir_close_rc != 0)
+	{
 		goto done;
 	}
-	dir = NULL;
 	if (close(dir_fd) != 0)
 	{
 		dir_fd = -1;

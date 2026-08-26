@@ -1152,6 +1152,25 @@ wal_size_allowed(uint32_t timeline)
 }
 
 static int
+append_wal(uint32_t timeline, uint64_t start_lsn, const unsigned char *data,
+		   uint32_t len)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_APPEND;
+	ch.timeline = timeline;
+	ch.req_lsn = start_lsn;
+	ch.datalen = len;
+	memcpy(ch.data, data, len);
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
 expect_open_failure(const char *store)
 {
 	pid_t pid = fork();
@@ -1303,16 +1322,24 @@ test_deleting_timeline_wal_cleanup(void)
 {
 	char store[] = "/tmp/pagestore-timeline-wal-cleanup-XXXXXX";
 	char path[1024];
+	PsShmHeader metrics;
+	unsigned char wal_data[] = {0x11, 0x22, 0x33, 0x44};
 	PsTimelineState state;
+	int did;
 
 	check(mkdtemp(store) != NULL, "create timeline WAL-cleanup store");
 	configure_timeline_core();
+	memset(&metrics, 0, sizeof(metrics));
 	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
 		  create_branch(10, 0, 100),
 		  "open WAL-cleanup store with target and prefix sibling");
+	ps_core_set_metrics_header(&metrics);
+	check(append_wal(1, 100, wal_data, sizeof(wal_data)) &&
+		  metrics.wal_index_pending_bytes == sizeof(wal_data) &&
+		  metrics.wal_index_lagging_timelines == 1,
+		  "publish aggregate WAL-index metrics for target timeline");
 	check(begin_delete(1, 1, NULL), "begin WAL-cleanup target deletion");
-	check(fixture_file(store, "wal_1") &&
-		  fixture_file(store, "wal_1.rewrite.tmp") &&
+	check(fixture_file(store, "wal_1.rewrite.tmp") &&
 		  fixture_file(store, "walidx_1_0") &&
 		  fixture_file(store, "walidx_1_0_e00000000000000000001") &&
 		  fixture_file(store, "walidx_1_0_e00000000000000000001.size") &&
@@ -1336,6 +1363,9 @@ test_deleting_timeline_wal_cleanup(void)
 		  "cleanup removes target immutable WAL and WAL-index snapshots");
 	check(fixture_exists(store, "wal_10") && fixture_exists(store, "walidx_10_0"),
 		  "cleanup preserves prefix-matching sibling artifacts");
+	check(metrics.wal_index_pending_bytes == 0 &&
+		  metrics.wal_index_lagging_timelines == 0,
+		  "purging target timeline refreshes aggregate WAL-index metrics");
 	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
 		  "private WAL cleanup does not publish DELETED early");
 
@@ -1356,6 +1386,10 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_exists(store,
 					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
 		  "non-canonical WAL-index temporary fails closed");
+	check(create_branch(4, 0, 300) && begin_delete(4, 1, NULL) &&
+		  fixture_file(store, "wal_4") && ps_core_maintenance() == 1 &&
+		  !fixture_exists(store, "wal_4"),
+		  "a failed timeline does not starve a later cleanup retry");
 	check(
 		  fixture_path(path, sizeof(path), store,
 					   "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
@@ -1363,6 +1397,23 @@ test_deleting_timeline_wal_cleanup(void)
 		  !fixture_exists(store, "wal_2") &&
 		  !fixture_exists(store, "wal_segments_2"),
 		  "cleanup retries after unknown entry is reconciled");
+	check(create_branch(5, 0, 400) && begin_delete(5, 1, NULL) &&
+		  fixture_dir(store, "wal_segments_5") &&
+		  fixture_file(store, "wal_segments_5/wal_store_identity_v1") &&
+		  setenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC", "1", 1) == 0,
+		  "install private-directory fsync failure fixture");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC") == 0,
+		  "reopen with private-directory fsync fault armed");
+	do
+		did = ps_core_maintenance();
+	while (did);
+	check(fixture_exists(store, "wal_segments_5"),
+		  "private-directory fsync failure leaves cleanup retryable");
+	check(ps_core_maintenance() == 1 && !fixture_exists(store, "wal_segments_5"),
+		  "private-directory cleanup retry succeeds after fsync failure");
 
 	check(create_branch(3, 0, 300) && begin_delete(3, 1, NULL) &&
 		  fixture_file(store, "wal_3") && fixture_dir(store, "wal_segments_3") &&
@@ -1383,6 +1434,7 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_exists(store, "wal_10") &&
 		  state_of(3, &state, NULL) && state == PS_TIMELINE_DELETING,
 		  "restart skips partial target recovery and resumes owner-scoped cleanup");
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }
