@@ -26,6 +26,10 @@
 #include "pagestore_retention.h"
 
 #define TEST_TIMELINE_MAGIC 0x324d4c54U
+#define TEST_FORK_META_V2_MAGIC 0x324d4b46U
+#define TEST_FEV_SEG_GROW_BOUND 7
+#define TEST_FEV_SEG_COMMIT_BOUND 8
+#define TEST_SEG_CLAMPED_ADMISSION_MAGIC 0x53454738U
 
 typedef struct TestTimelineV2
 {
@@ -58,6 +62,30 @@ typedef struct TestTimelineEvent
 	uint32_t crc;
 	uint32_t reserved;
 } TestTimelineEvent;
+
+typedef struct TestForkMetaRecV2
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t timeline;
+	PsKey	 key;
+	uint64_t lsn;
+	uint64_t admission_seq;
+	uint64_t order_id;
+	uint32_t nblocks;
+	uint8_t	 kind;
+	uint8_t	 pad[3];
+} TestForkMetaRecV2;
+
+typedef struct TestSegRecHdr
+{
+	uint32_t magic;
+	uint32_t timeline;
+	PsKey	 key;
+	uint32_t block;
+	uint64_t lsn;
+	uint32_t len;
+} TestSegRecHdr;
 
 static int checks;
 static int failed;
@@ -1211,6 +1239,57 @@ remove_tree(const char *path)
 		(void) system(command);
 }
 
+/* Remove one target's ordered segment markers while preserving the rest of the
+ * fixed forkmeta log.  This models a crash/loss of the marker after the page
+ * body reached the segment, without changing the physical segment bytes. */
+static int
+strip_ordered_markers(const char *store, uint32_t timeline)
+{
+	char path[512];
+	TestForkMetaRecV2 rec;
+	off_t in = 0;
+	off_t out = 0;
+	int removed = 0;
+	int fd;
+
+	if (snprintf(path, sizeof(path), "%s/forkmeta", store) < 0)
+		return -1;
+	fd = open(path, O_RDWR);
+	if (fd < 0)
+		return -1;
+	for (;;)
+	{
+		ssize_t n = pread(fd, &rec, sizeof(rec), in);
+
+		if (n == 0)
+			break;
+		if (n != (ssize_t) sizeof(rec) ||
+			rec.magic != TEST_FORK_META_V2_MAGIC ||
+			rec.rec_len != sizeof(rec))
+		{
+			(void) close(fd);
+			return -1;
+		}
+		in += (off_t) sizeof(rec);
+		if ((rec.kind == TEST_FEV_SEG_GROW_BOUND ||
+			 rec.kind == TEST_FEV_SEG_COMMIT_BOUND) &&
+			rec.timeline == timeline)
+		{
+			removed++;
+			continue;
+		}
+		if (pwrite(fd, &rec, sizeof(rec), out) != (ssize_t) sizeof(rec))
+		{
+			(void) close(fd);
+			return -1;
+		}
+		out += (off_t) sizeof(rec);
+	}
+	if (ftruncate(fd, out) != 0 || fsync(fd) != 0 || close(fd) != 0)
+		return -1;
+	return removed == 1 ? 0 : -1;
+}
+
 static void
 configure_timeline_core(void)
 {
@@ -1921,6 +2000,76 @@ test_deleting_timeline_page_cleanup_prefix_hole(void)
 	remove_tree(store);
 }
 
+static void
+test_deleting_timeline_page_cleanup_retired_short_segment(void)
+{
+	char store[] = "/tmp/pagestore-timeline-retired-short-XXXXXX";
+	unsigned char page[8192];
+	PsTimelineState state;
+	TestSegRecHdr sibling_hdr;
+	int64_t before;
+	int64_t after;
+
+	/* A missing ordered forkmeta marker for the still-live sibling makes
+	 * recovery retire the physical segment at cur_off == segment_size even
+	 * though the file is short.  The deleting target follows it physically. */
+	configure_timeline_core();
+	segment_size = 32768;
+	flush_pages = 100;
+	use_layers = 0; /* keep the recovery case on the physical segment path */
+	check(mkdtemp(store) != NULL, "create retired-short page-cleanup store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			/* The below-branch-floor LSN forces the sibling into the ordered
+			 * SEG8 shape whose forkmeta marker recovery must validate. */
+			write_timeline_layer(10, 1, 50) == 0 &&
+			write_timeline_layer(1, 0, 100) == 0,
+			"write target and sibling into one short segment");
+	before = ps_storage->seg_size(0, 0);
+	check(before > 0 && before < (int64_t) segment_size &&
+			begin_delete(1, 1, NULL) && ps_storage->sync() == 0,
+			"begin deletion before simulating a missing ordered marker");
+	close_store();
+	check(strip_ordered_markers(store, 10) == 0,
+			"remove only the live sibling ordered forkmeta marker");
+
+	check(ps_core_open(store) == 0,
+			"restart accepts a short segment with a retired recovery cursor");
+	for (int i = 0; i < 32; i++)
+		(void) ps_core_maintenance();
+	after = ps_storage->seg_size(0, 0);
+	check(after > 0 && after < before,
+			"DELETING cleanup filters a retired short segment");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"retired-segment cleanup keeps the target DELETING");
+	memset(page, 0, sizeof(page));
+	check(ps_storage->seg_read(0, 0, 0, &sibling_hdr,
+						 sizeof(sibling_hdr)) == 0 &&
+			sibling_hdr.magic == TEST_SEG_CLAMPED_ADMISSION_MAGIC &&
+			sibling_hdr.timeline == 10 && sibling_hdr.block == 1 &&
+			ps_storage->seg_read(0, 0,
+						 sizeof(sibling_hdr) + 2 * sizeof(uint64_t),
+						 page, page_size) == 0 && page[100] == 0x5A,
+			"filtered retired segment preserves sibling bytes");
+
+	/* The sentinel must survive the rewrite.  A subsequent live write therefore
+	 * starts segment 1 instead of appending to the compacted physical tail. */
+	check(write_timeline_layer(10, 2, 300) == 0 &&
+			ps_storage->seg_size(0, 0) == after &&
+			ps_storage->seg_size(0, 1) > 0,
+			"next write rolls past the retired compacted segment");
+	close_store();
+	check(ps_core_open(store) == 0,
+			"restart after retired-segment cleanup and rolled append");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(10, 2, page) == 1 && page[100] == 0x5A,
+			"rolled append survives retired-segment recovery");
+	check(read_test_page(1, 0, page) == 0,
+			"target page stays absent after retired-segment recovery");
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -1931,6 +2080,7 @@ main(void)
 	test_deleting_timeline_page_cleanup_fail_closed();
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();
+	test_deleting_timeline_page_cleanup_retired_short_segment();
 	test_v2_and_mixed_lifecycle();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;

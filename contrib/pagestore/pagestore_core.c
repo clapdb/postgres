@@ -2682,7 +2682,7 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	uint32_t nrelocs = 0, reloc_cap = 0;
 	uint64_t off = 0, out_off = 0;
 	uint64_t watermark_new = 0, cursor_new = 0;
-	int watermark_seen = 0, cursor_seen = 0, found = 0;
+	int watermark_seen = 0, cursor_seen = 0, cursor_retired = 0, found = 0;
 	PsFlushWatermark watermark = {0};
 	int have_watermark = s->flush_watermark_valid &&
 		s->flush_watermark.seg_id == (uint32_t) seg;
@@ -2702,8 +2702,19 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	if (s->cur_seg == seg)
 	{
 		if (s->cur_off > (uint64_t) bytes)
-			return -1;
-		cursor_seen = s->cur_off == 0;
+		{
+			/* Recovery uses segment_size as a retirement sentinel when an
+			 * ordered record is physically present but its forkmeta marker is
+			 * missing.  It is not an append cursor into this short segment:
+			 * cleanup may rewrite the physical bytes, but must preserve the
+			 * sentinel so the next append rolls to a new segment. */
+			if (s->cur_off != segment_size ||
+				(uint64_t) bytes >= segment_size)
+				return -1;
+			cursor_retired = 1;
+		}
+		else
+			cursor_seen = s->cur_off == 0;
 	}
 	replacement = malloc((size_t) bytes ? (size_t) bytes : 1);
 	if (!replacement)
@@ -2813,7 +2824,7 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	}
 	if (have_watermark && !watermark_seen)
 		goto fail;
-	if (s->cur_seg == seg && !cursor_seen)
+	if (s->cur_seg == seg && !cursor_seen && !cursor_retired)
 		goto fail;
 	if (!found)
 		goto no_rewrite;
@@ -2857,7 +2868,7 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 								r->old_off, r->new_off);
 	}
 	if (s->cur_seg == seg)
-		s->cur_off = cursor_new;
+		s->cur_off = cursor_retired ? segment_size : cursor_new;
 	free(relocs);
 	free(replacement);
 	return 1;
