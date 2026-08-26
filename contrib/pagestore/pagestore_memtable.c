@@ -141,6 +141,17 @@ ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline)
 	mt->n = out;
 }
 
+void
+ps_memtable_rewrite_segment(PsMemtable *mt, uint32_t seg_id,
+							uint64_t old_off, uint64_t new_off)
+{
+	if (mt == NULL)
+		return;
+	for (uint32_t i = 0; i < mt->n; i++)
+		if (mt->ents[i].seg_id == seg_id && mt->ents[i].seg_off == old_off)
+			mt->ents[i].seg_off = new_off;
+}
+
 int
 ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline, const PsKey *key,
 				   uint32_t block, uint64_t read_lsn, uint64_t read_seq,

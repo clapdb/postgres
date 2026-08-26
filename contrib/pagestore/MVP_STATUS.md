@@ -209,10 +209,10 @@ publication-crash coverage.  Still required for the gate:
   snapshot/epoch cutover whenever an owner enters DELETING, without pruning
   surviving live or pre-metadata owners in that forced generation.  POSIX
   maintenance now validates and removes each deleting owner's private flat and
-  immutable WAL plus WAL-index epochs, watermarks, and snapshots; partial
+  immutable WAL plus WAL-index epochs, watermarks, and snapshots; it also
+  atomically filters shared page segments and updates survivor offsets.  Partial
   deletion resumes after restart while sibling artifacts survive.  SPDK async
-  drain, filtered cleanup of shared page segments, DELETED publication, and ID
-  reuse remain follow-up work.
+  drain, DELETED publication, and ID reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.

@@ -48,6 +48,8 @@ extern void ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline);
  * timeline only -- ancestry is the caller's job).  On a hit copies page_size
  * bytes into out, stores its lsn in *out_lsn, and returns 1; else 0.
  */
+extern void	ps_memtable_rewrite_segment(PsMemtable *mt, uint32_t seg_id,
+								 uint64_t old_off, uint64_t new_off);
 extern int	ps_memtable_lookup(const PsMemtable *mt, uint32_t timeline,
 							   const PsKey *key, uint32_t block,
 							   uint64_t read_lsn, uint64_t read_seq,

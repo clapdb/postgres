@@ -934,6 +934,7 @@ const PsStorage PsStorageSpdk = {
 	.seg_read = spdk_seg_read,
 	.seg_size = spdk_seg_size,
 	.seg_remove = NULL,
+	.seg_rewrite = NULL,
 	.wal_append = spdk_wal_append,
 	.wal_read = spdk_wal_read,
 	.wal_truncate = spdk_wal_truncate,

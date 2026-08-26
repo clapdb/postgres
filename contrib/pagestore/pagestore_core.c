@@ -111,6 +111,7 @@ static int timeline_has_parent(uint32_t timeline);
 static int timeline_delete_active(void);
 static int timeline_recovery_allowed(uint32_t timeline);
 static int timeline_delete_wal_cleanup_one(void);
+static int timeline_delete_page_cleanup_one(void);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -1956,6 +1957,44 @@ typedef struct SegRecHdrBoundAdmission
 	uint64_t	admission_seq;
 } SegRecHdrBoundAdmission;
 
+typedef struct SegmentReloc
+{
+	uint32_t	timeline;
+	PsKey		key;
+	uint32_t	block;
+	uint64_t	lsn;
+	uint64_t	admission_seq;
+	uint64_t	old_off;
+	uint64_t	new_off;
+} SegmentReloc;
+
+static int
+segment_record_shape(uint32_t magic, uint64_t *header_size, int *wal_less,
+					 int *bound, int *admission)
+{
+	*wal_less = magic == SEG_WALLESS_MAGIC ||
+		magic == SEG_WALLESS_ORDERED_MAGIC ||
+		magic == SEG_WALLESS_BOUND_MAGIC ||
+		magic == SEG_WALLESS_ADMISSION_MAGIC;
+	*bound = magic == SEG_WALLESS_BOUND_MAGIC ||
+		magic == SEG_CLAMPED_BOUND_MAGIC ||
+		magic == SEG_WALLESS_ADMISSION_MAGIC ||
+		magic == SEG_CLAMPED_ADMISSION_MAGIC;
+	*admission = magic == SEG_ADMISSION_MAGIC ||
+		magic == SEG_WALLESS_ADMISSION_MAGIC ||
+		magic == SEG_CLAMPED_ADMISSION_MAGIC;
+	if (magic != SEG_MAGIC && magic != SEG_WALLESS_MAGIC &&
+		magic != SEG_WALLESS_ORDERED_MAGIC && magic != SEG_CLAMPED_ORDERED_MAGIC &&
+		magic != SEG_WALLESS_BOUND_MAGIC && magic != SEG_CLAMPED_BOUND_MAGIC &&
+		magic != SEG_ADMISSION_MAGIC && magic != SEG_WALLESS_ADMISSION_MAGIC &&
+		magic != SEG_CLAMPED_ADMISSION_MAGIC)
+		return -1;
+	*header_size = sizeof(SegRecHdr) +
+		(*bound ? sizeof(uint64_t) : 0) +
+		(*admission ? sizeof(uint64_t) : 0);
+	return 0;
+}
+
 /*
  * Segments are addressed by (id, byte offset); how they are stored is the
  * storage backend's business (see pagestore_storage.h).  Here we keep only the
@@ -2148,6 +2187,8 @@ static int timeline_used[MAX_TIMELINES];
  * have both completed.  DELETING remains the durable terminal state for this
  * slice; this bit is only a maintenance retry guard. */
 static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
+static unsigned char timeline_page_cleanup_done[MAX_TIMELINES];
+static uint32_t timeline_page_cleanup_cursor;
 
 static inline void
 timeline_mark_used(uint32_t timeline)
@@ -2627,6 +2668,309 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 		if (e->timeline == timeline && e->block == block && key_eq(&e->key, key))
 			return e;
 	return NULL;
+}
+
+/* Rewrite one POSIX segment after validating every record in it.  The raw
+ * record bytes are copied unchanged for survivors; only their physical
+ * offsets move.  Caller holds every shard write lock and map write lock. */
+static int
+page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
+{
+	int64_t bytes = ps_storage->seg_size(s->id, seg);
+	unsigned char *replacement = NULL;
+	SegmentReloc *relocs = NULL;
+	uint32_t nrelocs = 0, reloc_cap = 0;
+	uint64_t off = 0, out_off = 0;
+	uint64_t watermark_new = 0, cursor_new = 0;
+	int watermark_seen = 0, cursor_seen = 0, found = 0;
+	PsFlushWatermark watermark = {0};
+	int have_watermark = s->flush_watermark_valid &&
+		s->flush_watermark.seg_id == (uint32_t) seg;
+
+	if (bytes < 0 || (uint64_t) bytes > segment_size ||
+		(uint64_t) bytes > SIZE_MAX ||
+		(uint64_t) bytes > (uint64_t) LLONG_MAX)
+		return -1;
+	if (have_watermark)
+	{
+		watermark = s->flush_watermark;
+		if (watermark.seg_off > (uint64_t) bytes)
+			return -1;
+		watermark_seen = watermark.seg_off == 0;
+		watermark_new = 0;
+	}
+	if (s->cur_seg == seg)
+	{
+		if (s->cur_off > (uint64_t) bytes)
+			return -1;
+		cursor_seen = s->cur_off == 0;
+	}
+	replacement = malloc((size_t) bytes ? (size_t) bytes : 1);
+	if (!replacement)
+		return -1;
+	while (off < (uint64_t) bytes)
+	{
+		SegRecHdr hdr;
+		uint64_t header_size, rec_len, end;
+		uint64_t order_id = 0, admission_seq = 0;
+		int wal_less, bound, admission;
+		unsigned char *raw;
+
+		if ((uint64_t) bytes - off < sizeof(hdr) ||
+			ps_storage->seg_read(s->id, seg, off, &hdr, sizeof(hdr)) != 0 ||
+			segment_record_shape(hdr.magic, &header_size, &wal_less,
+								 &bound, &admission) != 0 ||
+			hdr.timeline >= MAX_TIMELINES || hdr.len != page_size ||
+			header_size > UINT64_MAX - hdr.len)
+			goto fail;
+		rec_len = header_size + hdr.len;
+		if (rec_len > UINT32_MAX || rec_len > (uint64_t) bytes - off)
+			goto fail;
+		end = off + rec_len;
+		if (bound &&
+			(ps_storage->seg_read(s->id, seg, off + sizeof(hdr), &order_id,
+							   sizeof(order_id)) != 0 || order_id == 0))
+			goto fail;
+		if (admission &&
+			(ps_storage->seg_read(s->id, seg,
+							 off + header_size - sizeof(admission_seq),
+							 &admission_seq, sizeof(admission_seq)) != 0 ||
+			 admission_seq == 0))
+			goto fail;
+		raw = malloc((size_t) rec_len);
+		if (!raw || ps_storage->seg_read(s->id, seg, off, raw, (uint32_t) rec_len) != 0)
+		{
+			free(raw);
+			goto fail;
+		}
+		if (hdr.timeline == target)
+		{
+			found = 1;
+			free(raw);
+		}
+		else
+		{
+			uint64_t new_data_off = out_off + header_size;
+
+			if (out_off > (uint64_t) bytes - rec_len)
+			{
+				free(raw);
+				goto fail;
+			}
+			memcpy(replacement + out_off, raw, (size_t) rec_len);
+			if (nrelocs == reloc_cap)
+			{
+				uint32_t new_cap;
+				size_t alloc_size;
+				SegmentReloc *nr;
+
+				if (reloc_cap != 0 && reloc_cap > UINT32_MAX / 2)
+				{
+					free(raw);
+					goto fail;
+				}
+				new_cap = reloc_cap ? reloc_cap * 2 : 128;
+				alloc_size = (size_t) new_cap * sizeof(*relocs);
+				if (new_cap != 0 &&
+					alloc_size / sizeof(*relocs) != (size_t) new_cap)
+				{
+					free(raw);
+					goto fail;
+				}
+				nr = realloc(relocs, alloc_size);
+
+				if (!nr)
+				{
+					free(raw);
+					goto fail;
+				}
+				relocs = nr;
+				reloc_cap = new_cap;
+			}
+			relocs[nrelocs++] = (SegmentReloc) {
+				.timeline = hdr.timeline,
+				.key = hdr.key,
+				.block = hdr.block,
+				.lsn = wal_less ? 0 : hdr.lsn,
+				.admission_seq = admission_seq,
+				.old_off = off + header_size,
+				.new_off = new_data_off
+			};
+			out_off += rec_len;
+			free(raw);
+		}
+		if (have_watermark && end == watermark.seg_off)
+		{
+			watermark_seen = 1;
+			watermark_new = out_off;
+		}
+		if (s->cur_seg == seg && end == s->cur_off)
+		{
+			cursor_seen = 1;
+			cursor_new = out_off;
+		}
+		off = end;
+	}
+	if (have_watermark && !watermark_seen)
+		goto fail;
+	if (s->cur_seg == seg && !cursor_seen)
+		goto fail;
+	if (!found)
+		goto no_rewrite;
+	if (ps_storage->seg_rewrite == NULL)
+		goto fail;
+	/* Retreat the recovery boundary before replacement.  This is conservative
+	 * when a crash occurs between the two operations: either old or new bytes
+	 * are scanned, and durable layers still cover the original prefix. */
+	if (have_watermark && watermark_new < watermark.seg_off)
+	{
+		/* Image indexes retain source-segment offsets.  Once bytes inside the
+		 * covered prefix move, an index entry after the removed record can no
+		 * longer be used as a recovery hint.  Rewind the whole segment boundary
+		 * so recovery rebuilds those entries from the replacement bytes instead
+		 * of consulting stale layer offsets. */
+		watermark_new = 0;
+		if (ps_manifest_rebase_flush_watermark(s->id, (uint32_t) seg,
+											watermark_new) != 0)
+			goto fail;
+		s->flush_watermark.seg_off = watermark_new;
+	}
+	if (ps_storage->seg_rewrite(s->id, seg, replacement, out_off) != 0)
+		goto fail;
+	for (uint32_t i = 0; i < nrelocs; i++)
+	{
+		SegmentReloc *r = &relocs[i];
+
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+				for (PageEnt *e = g_shards[sh].page_idx[bucket]; e; e = e->next)
+					if (e->timeline == r->timeline && e->block == r->block &&
+						key_eq(&e->key, &r->key))
+						for (int v = 0; v < e->nver; v++)
+							if (e->vers[v].shard == s->id &&
+								e->vers[v].seg == seg &&
+								e->vers[v].off == r->old_off &&
+								e->vers[v].lsn == r->lsn &&
+								e->vers[v].admission_seq == r->admission_seq)
+								e->vers[v].off = r->new_off;
+		ps_memtable_rewrite_segment(s->memtable, (uint32_t) seg,
+								r->old_off, r->new_off);
+	}
+	if (s->cur_seg == seg)
+		s->cur_off = cursor_new;
+	free(relocs);
+	free(replacement);
+	return 1;
+
+no_rewrite:
+	free(relocs);
+	free(replacement);
+	return 0;
+fail:
+	free(relocs);
+	free(replacement);
+	return -1;
+}
+
+/* Remove target-owned in-memory page/fork entries after all physical segments
+ * have been successfully filtered.  A deleting timeline is not readable, so
+ * no historical PageVer is needed after this point. */
+static void
+page_cleanup_purge_timeline_locked(uint32_t timeline)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			PageEnt **link = &g_shards[sh].page_idx[bucket];
+
+			while (*link)
+			{
+				PageEnt *e = *link;
+
+				if (e->timeline != timeline)
+				{
+					link = &e->next;
+					continue;
+				}
+				*link = e->next;
+				free(e->vers);
+				free(e);
+			}
+		}
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			ForkEnt **link = &g_shards[sh].fork_idx[bucket];
+
+			while (*link)
+			{
+				ForkEnt *e = *link;
+
+				if (e->timeline != timeline)
+				{
+					link = &e->next;
+					continue;
+				}
+				*link = e->next;
+				free(e->ev);
+				free(e->def_idx);
+				free(e);
+			}
+		}
+}
+
+static int
+page_cleanup_has_index_entries_locked(uint32_t timeline)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+		{
+			for (PageEnt *p = g_shards[sh].page_idx[bucket]; p; p = p->next)
+				if (p->timeline == timeline)
+					return 1;
+			for (ForkEnt *f = g_shards[sh].fork_idx[bucket]; f; f = f->next)
+				if (f->timeline == timeline)
+					return 1;
+		}
+	return 0;
+}
+
+/* Caller holds every shard write lock and map write lock.  One successful
+ * replacement is enough work for a maintenance turn; the next turn rescans,
+ * which makes the operation restartable without a durable done bit. */
+static int
+page_cleanup_scan_timeline_locked(uint32_t timeline)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+	{
+		Shard *s = &g_shards[sh];
+
+		/* GC may remove a prefix segment while leaving later segments.  The
+		 * append cursor is the authoritative finite scan bound; a missing
+		 * segment inside that range is a hole, not end-of-log. */
+		for (int seg = 0; seg <= s->cur_seg; seg++)
+		{
+			int64_t size;
+
+			errno = 0;
+			size = ps_storage->seg_size(sh, seg);
+			if (size < 0)
+			{
+				if (errno == ENOENT)
+					continue;
+				return -1;
+			}
+			{
+				int rc = page_cleanup_rewrite_segment(s, seg, timeline);
+
+				if (rc < 0)
+					return -1;
+				if (rc > 0)
+					return 1;
+			}
+		}
+	}
+	return 0;
 }
 
 /* Forget versions omitted from a durably published compacted layer.  The
@@ -7001,6 +7345,51 @@ timeline_delete_wal_cleanup_one(void)
 	return 0;
 }
 
+static int
+timeline_delete_page_cleanup_one(void)
+{
+	if (ps_storage->seg_rewrite == NULL)
+		return 0; /* SPDK has no safe same-id replacement primitive. */
+	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
+	{
+		uint32_t tl = 1 + (timeline_page_cleanup_cursor + pass) % (MAX_TIMELINES - 1);
+		PsTimelineState state;
+		int had_entries;
+		int rc;
+
+		if (__atomic_load_n(&timeline_page_cleanup_done[tl], __ATOMIC_ACQUIRE) ||
+			!__atomic_load_n(&timeline_wal_cleanup_done[tl], __ATOMIC_ACQUIRE) ||
+			!ps_timeline_state(tl, &state, NULL) ||
+			state != PS_TIMELINE_DELETING)
+			continue;
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_lock_shard_wr(sh);
+		ps_lock_map_wr();
+		had_entries = page_cleanup_has_index_entries_locked(tl);
+		rc = page_cleanup_scan_timeline_locked(tl);
+		if (rc == 0 && __atomic_load_n(&fork_meta_deletion_cutover_done[tl],
+											__ATOMIC_ACQUIRE))
+		{
+			page_cleanup_purge_timeline_locked(tl);
+			for (uint32_t sh = 0; sh < core_shards(); sh++)
+				ps_memtable_discard_timeline(g_shards[sh].memtable, tl);
+			ps_pgcache_invalidate_timeline(tl);
+			__atomic_store_n(&timeline_page_cleanup_done[tl], 1,
+							 __ATOMIC_RELEASE);
+			rc = had_entries ? 1 : 0;
+		}
+		ps_unlock_map();
+		for (uint32_t sh = core_shards(); sh > 0; sh--)
+			ps_unlock_shard(sh - 1);
+		timeline_page_cleanup_cursor = (tl - 1) % (MAX_TIMELINES - 1);
+		if (rc > 0)
+			return 1;
+		/* A malformed target segment must not prevent another deleting timeline
+		 * from being attempted on the same maintenance tick. */
+	}
+	return 0;
+}
+
 /* Keep each hash chain canonical so a fixed-size heap can merge the chains
  * into the same key/block/LSN order as the former whole-shard qsort. */
 static int
@@ -9940,7 +10329,8 @@ recover(uint32_t shard)
 			if (fork_meta_legacy)
 				flags &= ~PS_IMG_REC_ORDERED;
 			page_version = wal_less ? 0 : hdr.lsn;
-			if (!replay_page_record(hdr.timeline, &hdr.key, hdr.block,
+			if (timeline_recovery_allowed(hdr.timeline) &&
+				!replay_page_record(hdr.timeline, &hdr.key, hdr.block,
 								page_version, admission_seq, hdr.lsn, order_id,
 								flags,
 								shard, id, data_off))
@@ -11538,6 +11928,8 @@ ps_core_maintenance_impl(void)
 	{
 		if (timeline_delete_wal_cleanup_one())
 			return 1;
+		if (timeline_delete_page_cleanup_one())
+			return 1;
 		return 0;
 	}
 
@@ -11555,6 +11947,8 @@ ps_core_maintenance_impl(void)
 	if (timeline_delete_mark_one())
 		return 1;
 	if (timeline_delete_wal_cleanup_one())
+		return 1;
+	if (timeline_delete_page_cleanup_one())
 		return 1;
 	ns = core_shards();
 	/* Timeline deletion is an explicit owner-scoped cleanup path.  Establish each
@@ -11765,6 +12159,8 @@ ps_core_open(const char *store_dir)
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
 	memset(timeline_wal_cleanup_done, 0, sizeof(timeline_wal_cleanup_done));
+	memset(timeline_page_cleanup_done, 0, sizeof(timeline_page_cleanup_done));
+	timeline_page_cleanup_cursor = 0;
 	fork_meta_poisoned_store(0);
 	fork_meta_bytes_store(0);
 	fork_meta_snapshot_generation = 0;
