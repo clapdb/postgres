@@ -120,6 +120,17 @@ ps_memtable_full(const PsMemtable *mt)
 	return mt->n >= mt->threshold;
 }
 
+int
+ps_memtable_has_timeline(const PsMemtable *mt, uint32_t timeline)
+{
+	if (mt == NULL)
+		return 0;
+	for (uint32_t i = 0; i < mt->n; i++)
+		if (mt->ents[i].timeline == timeline)
+			return 1;
+	return 0;
+}
+
 void
 ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline)
 {

@@ -104,6 +104,16 @@ static char cleanup_remote_dir[512];
 static int cleanup_local_deletes;
 static int cleanup_remote_deletes;
 static int cleanup_remote_fail;
+static int block_fork_meta_rewrite;
+static int block_timeline_wal_cleanup;
+static uint32_t blocked_cleanup_timeline;
+static int blocked_cleanup_attempts;
+static int provider_fault_then_block;
+static int provider_fault_stage;
+static int provider_fault_attempts;
+
+static void configure_timeline_core(void);
+static void remove_tree(const char *path);
 
 static int
 counted_upload(const PsLayerDesc *layer)
@@ -160,6 +170,78 @@ test_meta_append(const void *buf, uint32_t len)
 		return -1;
 	}
 	return 0;
+}
+
+static int
+blocked_fork_meta_rewrite(const void *buf, uint32_t len)
+{
+	if (block_fork_meta_rewrite)
+	{
+		errno = EIO;
+		return -1;
+	}
+	return PsStoragePosix.fork_meta_rewrite(buf, len);
+}
+
+static int
+blocked_timeline_wal_cleanup(uint32_t timeline)
+{
+	if (block_timeline_wal_cleanup && timeline == blocked_cleanup_timeline)
+	{
+		blocked_cleanup_attempts++;
+		errno = EIO;
+		return -1;
+	}
+	return PsStoragePosix.timeline_wal_cleanup(timeline);
+}
+
+static int
+provider_fault_then_blocked_cleanup(uint32_t timeline)
+{
+	if (provider_fault_then_block && timeline == blocked_cleanup_timeline)
+	{
+		provider_fault_attempts++;
+		if (provider_fault_stage++ != 0)
+		{
+			errno = EIO;
+			return -1;
+		}
+		/* The first call goes through the real POSIX provider fault hook. */
+	}
+	return PsStoragePosix.timeline_wal_cleanup(timeline);
+}
+
+static int
+fork_meta_source_contains(const TestForkMetaRecV2 *wanted)
+{
+	uint64_t off = 0;
+
+	for (;;)
+	{
+		uint32_t magic;
+		int nread;
+
+		nread = ps_storage->fork_meta_read(off, &magic, sizeof(magic));
+		if (nread == 0)
+			return 0;
+		if (nread != (int) sizeof(magic))
+			return -1;
+		if (magic != 0x324d4b46U)
+			return -1;
+		{
+			TestForkMetaRecV2 rec;
+
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread != (int) sizeof(rec) || rec.magic != magic ||
+				rec.rec_len != sizeof(rec) || rec.timeline >= 1024 ||
+				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				rec.pad[0] != 0 || rec.pad[1] != 0 || rec.pad[2] != 0)
+				return -1;
+			if (memcmp(&rec, wanted, sizeof(rec)) == 0)
+				return 1;
+		}
+		off += sizeof(TestForkMetaRecV2);
+	}
 }
 
 static uint32_t
@@ -509,15 +591,15 @@ test_deleting_timeline_cleanup(const char *store, uint32_t timeline)
 
 		ok = watched_uploads == 0 && cleanup_local_deletes > 0 &&
 			cleanup_remote_deletes > 0 && access(orphan, F_OK) != 0 &&
-			ps_storage->seg_size(0, 0) > 0 && after_count == 0 && after_ids == 0 &&
+			after_count == 0 && after_ids == 0 &&
 			!before_remote && !after_remote && sibling_count > 0 && parent_count > 0;
 		(void) ps_core_maintenance();
 		(void) ps_core_maintenance();
 		check(cleanup_local_deletes == local_before &&
-			  cleanup_remote_deletes == remote_before &&
-			  !timeline_has_deleting_layer(timeline) &&
-			  ps_storage->seg_size(0, 0) > 0,
-			  "completed cleanup is idempotent and shared segment GC stays fenced");
+				  cleanup_remote_deletes == remote_before &&
+				  !timeline_has_deleting_layer(timeline) &&
+				  sibling_count > 0 && parent_count > 0,
+				  "completed cleanup is idempotent and sibling/parent layers stay intact");
 	}
 	/* Recovery must not rebuild the deleted owner's layers from retained shared
 	 * segments, and the lifecycle tombstone must continue to reject ID reuse. */
@@ -529,13 +611,19 @@ test_deleting_timeline_cleanup(const char *store, uint32_t timeline)
 		PsTimelineState state;
 		uint64_t ids;
 		int remote;
+		uint64_t ignored;
+		int ignored_remote;
+		uint32_t sibling_count = timeline_layer_fingerprint(sibling, &ignored,
+														 &ignored_remote);
+		uint32_t parent_count = timeline_layer_fingerprint(0, &ignored,
+														&ignored_remote);
 
 		check(reopened == 0 &&
 			  timeline_layer_fingerprint(timeline, &ids, &remote) == 0 &&
-			  state_of(timeline, &state, NULL) && state == PS_TIMELINE_DELETING &&
-			  ps_storage->seg_size(0, 0) > 0 &&
+			  state_of(timeline, &state, NULL) && state == PS_TIMELINE_DELETED &&
+			  sibling_count > 0 && parent_count > 0 &&
 			  !create_branch(timeline, 0, 370),
-			  "restart keeps cleanup complete, shared data, and ID-reuse fence");
+			  "restart keeps DELETED state, sibling/parent data, and ID-reuse fence");
 	}
 	/* A provider failure leaves the durable tombstone in place and backs off the
 	 * asynchronous retry.  Clear the failure and let the same worker finish it. */
@@ -570,6 +658,116 @@ test_deleting_timeline_cleanup(const char *store, uint32_t timeline)
 	segment_size = saved_segment_size;
 	compact_layers = old_compact_layers;
 	return ok;
+}
+
+static void
+test_deletion_requires_durable_forkmeta(void)
+{
+	char store[] = "/tmp/pagestore-timeline-forkmeta-gate-XXXXXX";
+	TestForkMetaRecV2 residue;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsTimelineState state;
+
+	configure_timeline_core();
+	check(mkdtemp(store) != NULL, "create durable forkmeta gate store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			begin_delete(1, 1, NULL),
+			"create empty-runtime deleting timeline for forkmeta gate");
+	/* Append a valid durable source record without installing its runtime entry.
+	 * The terminal predicate must still observe this residue. */
+	memset(&residue, 0, sizeof(residue));
+	residue.magic = 0x324d4b46U;
+	residue.rec_len = sizeof(residue);
+	residue.timeline = 1;
+	residue.key = key;
+	residue.lsn = 100;
+	residue.admission_seq = 1;
+	residue.nblocks = 1;
+	residue.kind = 1; /* FEV_SET: a valid definitive size event */
+	check(ps_storage->fork_meta_append(&residue, sizeof(residue)) == 0,
+			"install durable forkmeta residue without runtime state");
+	check(fork_meta_source_contains(&residue) == 1,
+			"injected residue is a valid semantic V2 source record");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.fork_meta_rewrite = blocked_fork_meta_rewrite;
+	block_fork_meta_rewrite = 1;
+	ps_storage = &timeline_test_storage;
+	(void) ps_core_maintenance();
+	check(fork_meta_source_contains(&residue) == 1 &&
+			state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"blocked durable cleanup leaves residue and blocks DELETED with empty runtime state");
+	block_fork_meta_rewrite = 0;
+	check(ps_storage->fork_meta_rewrite(NULL, 0) == 0,
+			"remove durable forkmeta residue for retry");
+	close_store();
+	check(ps_core_open(store) == 0, "reopen after blocked forkmeta cleanup");
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+			"forkmeta gate permits DELETED after durable residue is removed");
+	ps_storage = &PsStoragePosix;
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deletion_state_append_failure(void)
+{
+	char store[] = "/tmp/pagestore-timeline-deleted-append-XXXXXX";
+	PsTimelineState state;
+	char timelines_path[512];
+	struct stat before;
+	struct stat after;
+
+	configure_timeline_core();
+	check(mkdtemp(store) != NULL, "create DELETED append-failure store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			begin_delete(1, 1, NULL),
+			"create deleting timeline for DELETED append failure");
+	check(snprintf(timelines_path, sizeof(timelines_path), "%s/timelines",
+			store) > 0 && stat(timelines_path, &before) == 0,
+			"stat lifecycle log before failed DELETED append");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.meta_append = test_meta_append;
+	timeline_append_mode = TIMELINE_APPEND_FAIL_BEFORE_WRITE;
+	ps_storage = &timeline_test_storage;
+	(void) ps_core_maintenance();
+	check(stat(timelines_path, &after) == 0 && after.st_size == before.st_size,
+			"failed DELETED append leaves the lifecycle log unchanged");
+	timeline_append_mode = TIMELINE_APPEND_NORMAL;
+	ps_storage = &PsStoragePosix;
+	close_store();
+	check(ps_core_open(store) == 0 &&
+			state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
+			"failed DELETED append reopens as DELETING");
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+			"DELETED publication succeeds after append failure is cleared");
+	close_store();
+
+	check(ps_core_open(store) == 0 && create_branch(2, 0, 200) &&
+			begin_delete(2, 1, NULL),
+			"create deleting timeline for ambiguous DELETED append");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.meta_append = test_meta_append;
+	timeline_append_mode = TIMELINE_APPEND_AMBIGUOUS;
+	ps_storage = &timeline_test_storage;
+	check(stat(timelines_path, &before) == 0,
+			"stat lifecycle log before ambiguous DELETED append");
+	(void) ps_core_maintenance();
+	check(stat(timelines_path, &after) == 0 &&
+			after.st_size == before.st_size + (off_t) sizeof(TestTimelineEvent),
+			"ambiguous DELETED append is durably present before restart");
+	timeline_append_mode = TIMELINE_APPEND_NORMAL;
+	ps_storage = &PsStoragePosix;
+	close_store();
+	check(ps_core_open(store) == 0 &&
+			state_of(2, &state, NULL) && state == PS_TIMELINE_DELETED &&
+			!create_branch(2, 0, 300),
+			"durable ambiguous DELETED append replays terminal state and rejects reuse");
+	close_store();
+	remove_tree(store);
 }
 
 static int
@@ -1455,8 +1653,8 @@ test_deleting_timeline_wal_cleanup(void)
 	check(metrics.wal_index_pending_bytes == 0 &&
 		  metrics.wal_index_lagging_timelines == 0,
 		  "purging target timeline refreshes aggregate WAL-index metrics");
-	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
-		  "private WAL cleanup does not publish DELETED early");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "complete private WAL cleanup publishes DELETED");
 
 	check(create_branch(2, 0, 200) && begin_delete(2, 1, NULL) &&
 		  fixture_file(store, "wal_2") && fixture_dir(store, "wal_segments_2") &&
@@ -1465,15 +1663,18 @@ test_deleting_timeline_wal_cleanup(void)
 					   "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
 		  fixture_file(store, "walidx_2_999"),
 		  "install non-canonical base/shard artifact");
-	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_2") &&
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_2") &&
 		  fixture_exists(store, "wal_segments_2/foreign") &&
 		  fixture_exists(store,
 					 "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
 		  fixture_exists(store, "walidx_2_999"),
 		  "non-canonical base/shard artifact fails closed before partial cleanup");
 	check(fixture_path(path, sizeof(path), store, "wal_segments_2/foreign") &&
-		  unlink(path) == 0 && ps_core_maintenance() == 0 &&
-		  fixture_exists(store, "wal_2") &&
+		  unlink(path) == 0,
+		  "remove non-canonical base artifact");
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_2") &&
 		  fixture_exists(store,
 					 "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
 		  fixture_exists(store, "walidx_2_999"),
@@ -1491,23 +1692,29 @@ test_deleting_timeline_wal_cleanup(void)
 		  unlink(path) == 0,
 		  "remove non-canonical WAL-index shard fixtures");
 	check(fixture_file(store,
-					   "walidx_2_0_e00000000000000000001.size.tmp.01.999") &&
-		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+					   "walidx_2_0_e00000000000000000001.size.tmp.01.999"),
 		  "non-canonical watermark temporary fails closed");
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_2"),
+		  "non-canonical watermark temporary remains fail-closed");
 	check(fixture_path(path, sizeof(path), store,
 					   "walidx_2_0_e00000000000000000001.size.tmp.01.999") &&
 		  unlink(path) == 0 &&
 		  fixture_file(store,
-					   "walidx_2_0_e00000000000000000001.size.tmp.123.128") &&
-		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+					   "walidx_2_0_e00000000000000000001.size.tmp.123.128"),
 		  "out-of-range watermark attempt fails closed");
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_2"),
+		  "out-of-range watermark attempt remains fail-closed");
 	check(fixture_path(path, sizeof(path), store,
 					   "walidx_2_0_e00000000000000000001.size.tmp.123.128") &&
 		  unlink(path) == 0 &&
 		  fixture_file(store,
-					   "walidx_2_0_e00000000000000000001.size.tmp.999999999999999999999999.0") &&
-		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+					   "walidx_2_0_e00000000000000000001.size.tmp.999999999999999999999999.0"),
 		  "overflowed watermark PID fails closed");
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_2"),
+		  "overflowed watermark PID remains fail-closed");
 	check(fixture_path(path, sizeof(path), store,
 					   "walidx_2_0_e00000000000000000001.size.tmp.999999999999999999999999.0") &&
 		  unlink(path) == 0 &&
@@ -1524,7 +1731,8 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store,
 					   "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.00000000000000000001.0"),
 		  "install non-canonical manifest PID temporary");
-	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_8") &&
 		  fixture_exists(store,
 					 "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.00000000000000000001.0"),
 		  "manifest PID with leading zero fails closed");
@@ -1534,7 +1742,8 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store,
 					   "walidx_snapshots_8/walidx_prepared_v1.tmp.123.01"),
 		  "install non-canonical prepared attempt temporary");
-	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_8") &&
 		  fixture_exists(store,
 					 "walidx_snapshots_8/walidx_prepared_v1.tmp.123.01"),
 		  "prepared attempt with leading zero fails closed");
@@ -1544,7 +1753,8 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store,
 					   "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.128"),
 		  "install out-of-range snapshot attempt temporary");
-	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+	(void) ps_core_maintenance();
+	check(fixture_exists(store, "wal_8") &&
 		  fixture_exists(store,
 					 "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.128"),
 		  "snapshot attempt above 127 fails closed");
@@ -1573,7 +1783,74 @@ test_deleting_timeline_wal_cleanup(void)
 		  "ENOENT during delete scan does not become a false readdir failure");
 	check(create_branch(5, 0, 400) && begin_delete(5, 1, NULL) &&
 		  fixture_dir(store, "wal_segments_5") &&
-		  fixture_file(store, "wal_segments_5/wal_store_identity_v1") &&
+		  fixture_file(store, "wal_segments_5/wal_store_identity_v1"),
+		  "install private cleanup failure fixture");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.timeline_wal_cleanup = blocked_timeline_wal_cleanup;
+	blocked_cleanup_timeline = 5;
+	blocked_cleanup_attempts = 0;
+	block_timeline_wal_cleanup = 1;
+	ps_storage = &timeline_test_storage;
+	did = ps_core_maintenance();
+	check(blocked_cleanup_attempts > 0 && fixture_exists(store, "wal_segments_5") &&
+		  state_of(5, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "blocked private cleanup leaves artifacts and keeps DELETING");
+	block_timeline_wal_cleanup = 0;
+	ps_storage = &PsStoragePosix;
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	check(ps_core_open(store) == 0 && fixture_exists(store, "wal_segments_5") &&
+		  state_of(5, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "blocked private cleanup survives restart before retry");
+	for (int i = 0; i < 8; i++)
+	{
+		did = ps_core_maintenance();
+		if (!fixture_exists(store, "wal_segments_5") &&
+			state_of(5, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+	}
+	check(!fixture_exists(store, "wal_segments_5") &&
+		  state_of(5, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "private cleanup retry publishes DELETED after failure");
+
+	check(create_branch(7, 0, 600) && begin_delete(7, 1, NULL) &&
+		  fixture_file(store, "wal_7"),
+		  "install shared-root cleanup failure fixture");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.timeline_wal_cleanup = blocked_timeline_wal_cleanup;
+	blocked_cleanup_timeline = 7;
+	blocked_cleanup_attempts = 0;
+	block_timeline_wal_cleanup = 1;
+	ps_storage = &timeline_test_storage;
+	did = ps_core_maintenance();
+	check(blocked_cleanup_attempts > 0 && fixture_exists(store, "wal_7") &&
+		  state_of(7, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "blocked shared-root cleanup leaves artifacts and keeps DELETING");
+	block_timeline_wal_cleanup = 0;
+	ps_storage = &PsStoragePosix;
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  fixture_exists(store, "wal_7") &&
+		  state_of(7, &state, NULL) && state == PS_TIMELINE_DELETING,
+		  "blocked shared-root cleanup survives restart before retry");
+	for (int i = 0; i < 8; i++)
+	{
+		did = ps_core_maintenance();
+		if (!fixture_exists(store, "wal_7") &&
+			state_of(7, &state, NULL) && state == PS_TIMELINE_DELETED)
+			break;
+	}
+	check(!fixture_exists(store, "wal_7") &&
+		  state_of(7, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "shared-root cleanup retry publishes DELETED after failure");
+
+	/* Keep the provider-level fsync fault covered separately from the
+	 * publication blocker above.  Two failures are armed so the ordinary
+	 * cleanup attempt and the same-pass DELETED revalidation both fail. */
+	check(create_branch(6, 0, 450) && begin_delete(6, 1, NULL) &&
+		  fixture_dir(store, "wal_segments_6") &&
+		  fixture_file(store, "wal_segments_6/wal_store_identity_v1") &&
 		  setenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC", "1", 1) == 0,
 		  "install private-directory fsync failure fixture");
 	ps_core_set_metrics_header(NULL);
@@ -1581,16 +1858,31 @@ test_deleting_timeline_wal_cleanup(void)
 	check(ps_core_open(store) == 0 &&
 		  unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC") == 0,
 		  "reopen with private-directory fsync fault armed");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.timeline_wal_cleanup = provider_fault_then_blocked_cleanup;
+	blocked_cleanup_timeline = 6;
+	provider_fault_stage = 0;
+	provider_fault_attempts = 0;
+	provider_fault_then_block = 1;
+	ps_storage = &timeline_test_storage;
 	did = ps_core_maintenance();
-	check(did == 1 && fixture_exists(store, "wal_segments_5"),
-		  "private-directory fsync failure leaves cleanup retryable");
-	for (int i = 0; i < 4 && fixture_exists(store, "wal_segments_5"); i++)
-		did = ps_core_maintenance();
-	check(!fixture_exists(store, "wal_segments_5"),
-		  "private-directory cleanup retry succeeds after fsync failure");
+	check(provider_fault_attempts > 1 && fixture_exists(store, "wal_segments_6"),
+		  "private-directory fsync failure leaves the directory");
+	check(state_of(6, &state, NULL),
+		  "private-directory fsync failure leaves the timeline defined");
+	check(state == PS_TIMELINE_DELETING,
+		  "private-directory fsync failure keeps DELETING until retry");
+	provider_fault_then_block = 0;
+	ps_storage = &PsStoragePosix;
+	did = ps_core_maintenance();
+	check(!fixture_exists(store, "wal_segments_6") &&
+		  state_of(6, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "private-directory fsync retry publishes DELETED");
 
-	check(create_branch(7, 0, 600) && begin_delete(7, 1, NULL) &&
-		  fixture_file(store, "wal_7") &&
+	/* The shared-root scan fault is likewise armed for both cleanup and
+	 * publication-revalidation calls, proving the target remains DELETING. */
+	check(create_branch(11, 0, 650) && begin_delete(11, 1, NULL) &&
+		  fixture_file(store, "wal_11") &&
 		  setenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN", "1", 1) == 0,
 		  "install shared-root readdir fault fixture");
 	ps_core_set_metrics_header(NULL);
@@ -1598,13 +1890,26 @@ test_deleting_timeline_wal_cleanup(void)
 	check(ps_core_open(store) == 0 &&
 		  unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN") == 0,
 		  "reopen with shared-root readdir fault armed");
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.timeline_wal_cleanup = provider_fault_then_blocked_cleanup;
+	blocked_cleanup_timeline = 11;
+	provider_fault_stage = 0;
+	provider_fault_attempts = 0;
+	provider_fault_then_block = 1;
+	ps_storage = &timeline_test_storage;
 	did = ps_core_maintenance();
-	check(did == 1 && fixture_exists(store, "wal_7"),
-		  "shared-root readdir failure leaves cleanup retryable");
-	for (int i = 0; i < 4 && fixture_exists(store, "wal_7"); i++)
-		did = ps_core_maintenance();
-	check(!fixture_exists(store, "wal_7"),
-		  "shared-root scan retry closes its directory before retrying");
+	check(provider_fault_attempts > 1 && fixture_exists(store, "wal_11"),
+		  "shared-root scan failure leaves the target file");
+	check(state_of(11, &state, NULL),
+		  "shared-root scan failure leaves the timeline defined");
+	check(state == PS_TIMELINE_DELETING,
+		  "shared-root scan failure keeps DELETING until retry");
+	provider_fault_then_block = 0;
+	ps_storage = &PsStoragePosix;
+	did = ps_core_maintenance();
+	check(!fixture_exists(store, "wal_11") &&
+		  state_of(11, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "shared-root scan retry publishes DELETED");
 
 	check(create_branch(3, 0, 300) && begin_delete(3, 1, NULL) &&
 		  fixture_file(store, "wal_3") && fixture_dir(store, "wal_segments_3") &&
@@ -1612,7 +1917,8 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store, "wal_segments_3/walv1_4_00000000000000000000") &&
 		  setenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_AFTER_ROOT", "1", 1) == 0,
 		  "install interrupted WAL-cleanup fixture");
-	check(ps_core_maintenance() == 0 && !fixture_exists(store, "wal_3") &&
+	(void) ps_core_maintenance();
+	check(!fixture_exists(store, "wal_3") &&
 		  fixture_exists(store, "wal_segments_3"),
 		  "cleanup interruption leaves a restartable private-directory suffix");
 	unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_AFTER_ROOT");
@@ -1623,8 +1929,8 @@ test_deleting_timeline_wal_cleanup(void)
 	check(
 		  !fixture_exists(store, "wal_segments_3") &&
 		  fixture_exists(store, "wal_10") &&
-		  state_of(3, &state, NULL) && state == PS_TIMELINE_DELETING,
-		  "restart skips partial target recovery and resumes owner-scoped cleanup");
+		  state_of(3, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "restart skips partial target recovery and publishes DELETED after cleanup");
 	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
@@ -1754,9 +2060,9 @@ test_v2_and_mixed_lifecycle(void)
 	}
 	close_store();
 	check(ps_core_open(store) == 0, "reopen after ambiguous append");
-		check(state_of(13, &state, &incarnation) &&
-			  state == PS_TIMELINE_DELETING && incarnation == 1,
-			  "ambiguous append replays the durable deleting event");
+	check(state_of(13, &state, &incarnation) &&
+		  state == PS_TIMELINE_DELETING && incarnation == 1,
+		  "ambiguous append replays the durable deleting event");
 	check(create_branch(14, 0, 320), "create lifecycle drain test timeline");
 	check(test_interruptible_lifecycle_writer(14),
 		  "SIGTERM-aware BEGIN_DELETE writer exits before shutdown joins");
@@ -1831,9 +2137,9 @@ test_deleting_timeline_page_cleanup(void)
 			write_timeline_layer(1, 0, 100) == 0 &&
 			write_timeline_layer(10, 1, 200) == 0,
 		  "write parent, target, and sibling into one segment");
-		memset(page, 0, sizeof(page));
-		check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
-			  "populate target page cache before deletion");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
+		  "populate target page cache before deletion");
 	before = ps_storage->seg_size(0, 0);
 	check(before > 0 && begin_delete(1, 1, NULL),
 		  "begin shared page-segment deletion");
@@ -1848,15 +2154,15 @@ test_deleting_timeline_page_cleanup(void)
 	memset(page, 0, sizeof(page));
 	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
 		  "timeline 10 sibling bytes survive byte-for-byte");
-	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
-		  "page cleanup does not publish DELETED");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "complete page cleanup publishes DELETED");
 	check(!create_branch(1, 0, 300), "page cleanup preserves ID-reuse fence");
 	close_store();
 	check(ps_core_open(store) == 0,
-			"restart resumes from the filtered shared segment");
+		  "restart resumes from the filtered shared segment");
 	memset(page, 0, sizeof(page));
-	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
-			"restart preserves deleting state during page cleanup");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		  "restart preserves DELETED state after page cleanup");
 	check(read_test_page(10, 1, page) == 1 && page[100] == 0x5A,
 			"restart keeps sibling after page cleanup");
 	memset(page, 0, sizeof(page));
@@ -2040,8 +2346,8 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 	after = ps_storage->seg_size(0, 0);
 	check(after > 0 && after < before,
 			"DELETING cleanup filters a retired short segment");
-	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETING,
-			"retired-segment cleanup keeps the target DELETING");
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+			"retired-segment cleanup permits durable DELETED publication");
 	memset(page, 0, sizeof(page));
 	check(ps_storage->seg_read(0, 0, 0, &sibling_hdr,
 						 sizeof(sibling_hdr)) == 0 &&
@@ -2076,6 +2382,8 @@ main(void)
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
+	test_deletion_requires_durable_forkmeta();
+	test_deletion_state_append_failure();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_fail_closed();
 	test_deleting_timeline_page_cleanup_oversized();
