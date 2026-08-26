@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "pagestore_storage.h"
+#include "pagestore_ipc.h"
 #include "pagestore_wal_store.h"
 
 /* bounded well under the 4096-byte path buffers so suffixes never truncate */
@@ -54,6 +55,7 @@ static int test_fail_wal_rewrite_dir_fsync;
 static int test_fail_fork_meta_rewrite_before_rename;
 static int test_fail_fork_meta_rewrite_dir_fsync;
 static int test_fail_timeline_cleanup_private_dir_fsync;
+static int test_fail_timeline_cleanup_shared_scan;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Flat WAL files are independent per timeline. */
@@ -238,6 +240,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_wal_rewrite;
 	const char *fail_wal_rewrite_dir_fsync;
 	const char *fail_timeline_cleanup_private_dir_fsync;
+	const char *fail_timeline_cleanup_shared_scan;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -273,6 +276,10 @@ posix_open(const char *path, uint64_t segment_size)
 	test_fail_timeline_cleanup_private_dir_fsync =
 		fail_timeline_cleanup_private_dir_fsync ?
 		atoi(fail_timeline_cleanup_private_dir_fsync) : 0;
+	fail_timeline_cleanup_shared_scan =
+		getenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN");
+	test_fail_timeline_cleanup_shared_scan = fail_timeline_cleanup_shared_scan ?
+		atoi(fail_timeline_cleanup_shared_scan) : 0;
 	{
 		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
 		test_fail_fork_meta_rewrite_before_rename = value ? atoi(value) : 0;
@@ -1291,6 +1298,12 @@ posix_canonical_pid(const char *begin, const char *end)
 }
 
 static int
+posix_canonical_attempt(const char *begin, const char *end)
+{
+	return posix_canonical_decimal(begin, end, 127, NULL);
+}
+
+static int
 posix_alnum6(const char *name)
 {
 	for (int i = 0; i < 6; i++)
@@ -1321,6 +1334,7 @@ posix_timeline_walidx_entry(uint32_t tl, const char *name)
 	errno = 0;
 	shard = strtoul(p, &end, 10);
 	if (errno != 0 || end == p || shard > UINT32_MAX ||
+		shard >= PS_MAX_CHANNELS ||
 		!posix_all_digits(p, end))
 		return -1;
 	if (*end == '\0')
@@ -1360,8 +1374,7 @@ posix_timeline_walidx_entry(uint32_t tl, const char *name)
 		size_t base_len;
 
 		if (dot == NULL || !posix_canonical_pid(q, dot) ||
-			!posix_canonical_decimal(dot + 1, name + strlen(name), 127,
-										NULL))
+			!posix_canonical_attempt(dot + 1, name + strlen(name)))
 			return -1;
 		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
 						  canonical, sizeof(canonical)) != 0)
@@ -1436,8 +1449,8 @@ posix_snapshot_entry(const char *name)
 			return -1;
 		p = end;
 		dot = strchr(p, '.');
-		if (dot == NULL || !posix_all_digits(p, dot) ||
-			!posix_all_digits(dot + 1, name + strlen(name)))
+		if (dot == NULL || !posix_canonical_pid(p, dot) ||
+			!posix_canonical_attempt(dot + 1, name + strlen(name)))
 			return -1;
 		return 1;
 	}
@@ -1447,8 +1460,8 @@ posix_snapshot_entry(const char *name)
 
 		p = name + 23;
 		dot = strchr(p, '.');
-		if (dot == NULL || !posix_all_digits(p, dot) ||
-			!posix_all_digits(dot + 1, name + strlen(name)))
+		if (dot == NULL || !posix_canonical_pid(p, dot) ||
+			!posix_canonical_attempt(dot + 1, name + strlen(name)))
 			return -1;
 		return 1;
 	}
@@ -1466,7 +1479,7 @@ posix_snapshot_entry(const char *name)
 		return -1;
 	errno = 0;
 	shard = strtoul(p, &end, 10);
-	if (errno != 0 || shard >= 128 || end != p + 3)
+	if (errno != 0 || shard >= PS_MAX_CHANNELS || end != p + 3)
 		return -1;
 	if (*end == '\0')
 		return 1;
@@ -1476,9 +1489,39 @@ posix_snapshot_entry(const char *name)
 	{
 		const char *dot = strchr(p, '.');
 
-		return dot != NULL && posix_all_digits(p, dot) &&
-			posix_all_digits(dot + 1, name + strlen(name)) ? 1 : -1;
+		return dot != NULL && posix_canonical_pid(p, dot) &&
+			posix_canonical_attempt(dot + 1, name + strlen(name)) ? 1 : -1;
 	}
+}
+
+/* readdir() reports scan errors through errno, while closedir() owns the
+ * descriptor handed to fdopendir().  Save the former before closing the
+ * latter, and clear the DIR pointer so the caller cannot close its fd again.
+ */
+static int
+posix_finish_scan(DIR **dirp, int readdir_errno)
+{
+	int close_rc = 0;
+	int close_errno = 0;
+
+	if (*dirp != NULL)
+	{
+		close_rc = closedir(*dirp);
+		if (close_rc != 0)
+			close_errno = errno;
+		*dirp = NULL;
+	}
+	if (readdir_errno != 0)
+	{
+		errno = readdir_errno;
+		return -1;
+	}
+	if (close_rc != 0)
+	{
+		errno = close_errno;
+		return -1;
+	}
+	return 0;
 }
 
 static int
@@ -1644,6 +1687,7 @@ posix_timeline_wal_cleanup(uint32_t tl)
 	int scan_fd = -1;
 	int removed = 0;
 	int rc = -1;
+	int readdir_errno;
 
 	if (tl == 0 || tl == UINT32_MAX ||
 		snprintf(wal_name, sizeof(wal_name), "wal_%u", tl) < 0 ||
@@ -1687,36 +1731,61 @@ posix_timeline_wal_cleanup(uint32_t tl)
 			posix_validate_entry(root_fd, entry->d_name, recognized) != 0)
 			goto done;
 	}
-	if (errno != 0 || closedir(dir) != 0)
+	readdir_errno = errno;
+	if (test_fail_timeline_cleanup_shared_scan > 0 &&
+		--test_fail_timeline_cleanup_shared_scan == 0)
+		readdir_errno = EIO;
+	if (posix_finish_scan(&dir, readdir_errno) != 0)
 	{
-		dir = NULL;
 		goto done;
 	}
-	dir = NULL;
 	/* Re-scan after complete validation and remove only exact target entries. */
 	scan_fd = openat(root_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
 		goto done;
 	scan_fd = -1;
-	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
+	for (;;)
 	{
-		int target = posix_timeline_root_entry(tl, entry->d_name,
-									   wal_name, wal_rewrite_name,
-									   walidx_prefix);
+		int target;
+
+		/* Operations on the previous entry may leave errno set (notably an
+		 * accepted ENOENT from unlinkat).  Clear it immediately before each
+		 * readdir so a NULL result retains only a real directory-scan error. */
+		errno = 0;
+		entry = readdir(dir);
+		if (entry == NULL)
+			break;
+		target = posix_timeline_root_entry(tl, entry->d_name,
+									 wal_name, wal_rewrite_name,
+									 walidx_prefix);
 
 		if (target < 0)
 			goto done;
-		if (target && unlinkat(root_fd, entry->d_name, 0) != 0 && errno != ENOENT)
-			goto done;
+		if (target)
+		{
+			int unlink_errno = 0;
+
+			/* Standalone-test race hook: make this validated and enumerated
+			 * target disappear immediately before the cleanup unlink. */
+			if (getenv("PAGESTORE_TEST_REMOVE_TIMELINE_CLEANUP_TARGET_BEFORE_UNLINK") != NULL &&
+				unlinkat(root_fd, entry->d_name, 0) != 0 && errno != ENOENT)
+				goto done;
+			if (unlinkat(root_fd, entry->d_name, 0) != 0)
+			{
+				unlink_errno = errno;
+				if (unlink_errno != ENOENT)
+					goto done;
+			}
+		}
 		removed |= target;
 	}
-	if (errno != 0 || closedir(dir) != 0 || (removed && fsync(root_fd) != 0))
+	readdir_errno = errno;
+	if (posix_finish_scan(&dir, readdir_errno) != 0)
 	{
-		dir = NULL;
 		goto done;
 	}
-	dir = NULL;
+	if (removed && fsync(root_fd) != 0)
+		goto done;
 	if (getenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_AFTER_ROOT") != NULL)
 	{
 		errno = EIO;
@@ -1745,12 +1814,11 @@ posix_timeline_wal_cleanup(uint32_t tl)
 		if (target != 0)
 			goto done;
 	}
-	if (errno != 0 || closedir(dir) != 0)
+	readdir_errno = errno;
+	if (posix_finish_scan(&dir, readdir_errno) != 0)
 	{
-		dir = NULL;
 		goto done;
 	}
-	dir = NULL;
 	/* Always sync on a successful retry.  If an earlier unlink/rmdir became
 	 * visible but its directory fsync reported an ambiguous failure, an empty
 	 * target set is the operation that closes that durability ambiguity. */

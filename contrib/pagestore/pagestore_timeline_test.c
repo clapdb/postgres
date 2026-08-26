@@ -1373,18 +1373,21 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store, "wal_2") && fixture_dir(store, "wal_segments_2") &&
 		  fixture_file(store, "wal_segments_2/foreign") &&
 		  fixture_file(store,
-					   "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
+					   "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
+		  fixture_file(store, "walidx_2_999"),
 		  "install non-canonical base/shard artifact");
 	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_2") &&
 		  fixture_exists(store, "wal_segments_2/foreign") &&
 		  fixture_exists(store,
-					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
+					 "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
+		  fixture_exists(store, "walidx_2_999"),
 		  "non-canonical base/shard artifact fails closed before partial cleanup");
 	check(fixture_path(path, sizeof(path), store, "wal_segments_2/foreign") &&
 		  unlink(path) == 0 && ps_core_maintenance() == 0 &&
 		  fixture_exists(store, "wal_2") &&
 		  fixture_exists(store,
-					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
+					 "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
+		  fixture_exists(store, "walidx_2_999"),
 		  "non-canonical base/shard artifact remains fail-closed");
 	check(create_branch(4, 0, 300) && begin_delete(4, 1, NULL) &&
 		  fixture_file(store, "wal_4") && ps_core_maintenance() == 1 &&
@@ -1395,7 +1398,10 @@ test_deleting_timeline_wal_cleanup(void)
 	check(fixture_path(path, sizeof(path), store,
 					   "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
 		  unlink(path) == 0 &&
-		  fixture_file(store,
+		  fixture_path(path, sizeof(path), store, "walidx_2_999") &&
+		  unlink(path) == 0,
+		  "remove non-canonical WAL-index shard fixtures");
+	check(fixture_file(store,
 					   "walidx_2_0_e00000000000000000001.size.tmp.01.999") &&
 		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
 		  "non-canonical watermark temporary fails closed");
@@ -1423,6 +1429,59 @@ test_deleting_timeline_wal_cleanup(void)
 		  "canonical watermark temporary is removable");
 	check(!fixture_exists(store, "wal_segments_2"),
 		  "target-private cleanup leaves no immutable directory");
+	check(create_branch(8, 0, 500) && begin_delete(8, 1, NULL) &&
+		  fixture_file(store, "wal_8") &&
+		  fixture_dir(store, "walidx_snapshots_8") &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.00000000000000000001.0"),
+		  "install non-canonical manifest PID temporary");
+	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+		  fixture_exists(store,
+					 "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.00000000000000000001.0"),
+		  "manifest PID with leading zero fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.00000000000000000001.0") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidx_prepared_v1.tmp.123.01"),
+		  "install non-canonical prepared attempt temporary");
+	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+		  fixture_exists(store,
+					 "walidx_snapshots_8/walidx_prepared_v1.tmp.123.01"),
+		  "prepared attempt with leading zero fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_snapshots_8/walidx_prepared_v1.tmp.123.01") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.128"),
+		  "install out-of-range snapshot attempt temporary");
+	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_8") &&
+		  fixture_exists(store,
+					 "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.128"),
+		  "snapshot attempt above 127 fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.128") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidx_manifest_v1.tmp.00000000000000000001.123.0") &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidx_prepared_v1.tmp.123.0") &&
+		  fixture_file(store,
+					   "walidx_snapshots_8/walidxg1_00000000000000000001_000.tmp.123.127"),
+		  "install canonical snapshot temporaries");
+	check(ps_core_maintenance() == 1 && !fixture_exists(store, "wal_8") &&
+		  !fixture_exists(store, "walidx_snapshots_8"),
+		  "canonical manifest, prepared, and shard temporaries are removable");
+	check(create_branch(9, 0, 550) && begin_delete(9, 1, NULL) &&
+		  fixture_file(store, "wal_9") &&
+		  setenv("PAGESTORE_TEST_REMOVE_TIMELINE_CLEANUP_TARGET_BEFORE_UNLINK",
+				 "1", 1) == 0,
+		  "install disappearing shared-root target fixture");
+	did = ps_core_maintenance();
+	check(unsetenv("PAGESTORE_TEST_REMOVE_TIMELINE_CLEANUP_TARGET_BEFORE_UNLINK") == 0,
+		  "disarm disappearing shared-root target hook");
+	check(did == 1 && !fixture_exists(store, "wal_9"),
+		  "ENOENT during delete scan does not become a false readdir failure");
 	check(create_branch(5, 0, 400) && begin_delete(5, 1, NULL) &&
 		  fixture_dir(store, "wal_segments_5") &&
 		  fixture_file(store, "wal_segments_5/wal_store_identity_v1") &&
@@ -1433,13 +1492,30 @@ test_deleting_timeline_wal_cleanup(void)
 	check(ps_core_open(store) == 0 &&
 		  unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_PRIVATE_DIR_FSYNC") == 0,
 		  "reopen with private-directory fsync fault armed");
-	do
-		did = ps_core_maintenance();
-	while (did);
-	check(fixture_exists(store, "wal_segments_5"),
+	did = ps_core_maintenance();
+	check(did == 1 && fixture_exists(store, "wal_segments_5"),
 		  "private-directory fsync failure leaves cleanup retryable");
-	check(ps_core_maintenance() == 1 && !fixture_exists(store, "wal_segments_5"),
+	for (int i = 0; i < 4 && fixture_exists(store, "wal_segments_5"); i++)
+		did = ps_core_maintenance();
+	check(!fixture_exists(store, "wal_segments_5"),
 		  "private-directory cleanup retry succeeds after fsync failure");
+
+	check(create_branch(7, 0, 600) && begin_delete(7, 1, NULL) &&
+		  fixture_file(store, "wal_7") &&
+		  setenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN", "1", 1) == 0,
+		  "install shared-root readdir fault fixture");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	check(ps_core_open(store) == 0 &&
+		  unsetenv("PAGESTORE_TEST_FAIL_TIMELINE_CLEANUP_SHARED_SCAN") == 0,
+		  "reopen with shared-root readdir fault armed");
+	did = ps_core_maintenance();
+	check(did == 1 && fixture_exists(store, "wal_7"),
+		  "shared-root readdir failure leaves cleanup retryable");
+	for (int i = 0; i < 4 && fixture_exists(store, "wal_7"); i++)
+		did = ps_core_maintenance();
+	check(!fixture_exists(store, "wal_7"),
+		  "shared-root scan retry closes its directory before retrying");
 
 	check(create_branch(3, 0, 300) && begin_delete(3, 1, NULL) &&
 		  fixture_file(store, "wal_3") && fixture_dir(store, "wal_segments_3") &&
