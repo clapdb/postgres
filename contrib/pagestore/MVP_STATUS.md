@@ -28,6 +28,15 @@ The MVP does not require S3/Lambda, SPDK layer recovery, multi-writer timelines,
 or production performance targets.  Those remain later deployment/performance
 work and must not expand the MVP critical path.
 
+The POSIX daemon's shared-memory readiness is a two-phase handshake.  On every
+start it invalidates the previous header before opening/recovering the store,
+keeps it invalid while workers are being created, and publishes the magic and
+`READY` state only after the request and maintenance workers exist.  Shutdown
+invalidates the header before flushing the store.  This preserves the MVP
+assumption that no live engine client remains attached while the daemon is
+restarted, while preventing stale health checks from admitting requests into a
+new daemon's zeroing/recovery window.
+
 ## What is implemented
 
 | Area | Status | Current proof |
@@ -150,7 +159,7 @@ plus the global map under `RelationMappingLock` into one CRC-protected
 ancestry, exact checkpoint redo `R`, checkpoint-record end `E`, materialized
 fork `L`, topology flags, map count, and the exact prepared SLRU manifest.  After
 a fresh same-build `initdb`,
-`pagestore_control_restore --archive-bootstrap --lsn R` restores exact control
+`pagestore_control_restore --archive-bootstrap --incarnation I --lsn R` restores exact control
 and forces archive recovery without forging shutdown state or checkpoint WAL.
 `pagestore_install_prepared_branch_bootstrap` validates that control against the
 artifact, installs maps and SLRUs, and publishes the ordinary branch manifest
@@ -214,8 +223,14 @@ publication-crash coverage.  Still required for the gate:
   deletion resumes after restart while sibling artifacts survive.  POSIX
   maintenance now durably revalidates all deletion consumers and fsyncs the
   same-incarnation DELETED state event before publishing it in memory; DELETED
-  timelines remain defined, reject normal operations, and reject same-ID
-  creation after restart.  SPDK async drain and ID reuse remain follow-up work.
+  timelines remain defined, reject normal operations, and expose their current
+  incarnation token through STATE.  POSIX CREATE_BRANCH can reuse an ID only
+  from durable DELETED with exactly the next nonzero incarnation; delayed
+  requests from older incarnations are rejected.  SPDK async drain remains
+  explicitly fail-closed: its daemon rejects reuse CREATE_BRANCH requests
+  before entering the shared core.  WAL and control restore clients carry the
+  immutable token from their startup configuration/manifest on every request;
+  control restore never queries mutable STATE.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.

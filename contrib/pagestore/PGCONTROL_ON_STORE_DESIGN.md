@@ -225,7 +225,7 @@ The portable branch path therefore uses the following narrower protocol:
    from two prepares cannot be mixed.  The controller restores both processes
    and publishes an atomic receipt carrying the exact `C/R/E/L` tuple.
 2. Run `initdb` with the same PostgreSQL build, while the target remains offline.
-3. Run `pagestore_control_restore --timeline <child> --lsn R
+3. Run `pagestore_control_restore --timeline <child> --incarnation <child-incarnation> --lsn R
    --archive-bootstrap <target>`.  This mode requires an exact-redo image.  It
    leaves the real checkpoint identity and database state intact, sets
    `minRecoveryPoint = R` with the checkpoint's physical WAL timeline, clears

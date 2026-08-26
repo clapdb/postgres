@@ -181,8 +181,9 @@ reconstruction.
    serve).  The boot half uses `pagestore_prepare_reader` to materialize
    the SLRUs without creating a timeline, then
    `pagestore_install_prepared_reader` installs them and publishes a durable
-   `pagestore_reader.manifest` last.  `pagestore_control_restore --lsn R`
-   installs the exact-R control image before startup.  A configured pin fails
+   `pagestore_reader.manifest` last.  `pagestore_control_restore --incarnation I --lsn R`
+   installs the exact-R control image before startup; `I` comes from the
+   immutable reader/branch manifest (the root fixture uses `1`).  A configured pin fails
    startup unless the manifest's timeline/read LSN and `pg_control` redo all
    agree.  Prepared readers require `pagestore.route_all`: every non-temporary
    relation must use the versioned store, including default/global tablespace

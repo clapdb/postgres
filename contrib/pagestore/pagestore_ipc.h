@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		34	/* 34: timeline deletion lifecycle/state query;
+#define PS_SHM_VERSION		36	/* 36: exact-token timeline info returns parent incarnation;
+								 * 34: timeline deletion lifecycle/state query;
 								 * 33: WAL-index known/FPI + record-end metadata;
 								 * 32: coherent page-pruning metrics;
 								 * 31: page-pruning metrics;
@@ -85,6 +86,13 @@
 #define PS_STATE_IDLE		0
 #define PS_STATE_REQUEST	1
 #define PS_STATE_DONE		2
+
+/* Shared-memory lifecycle.  The daemon keeps the magic invalid until the
+ * store has recovered and all request workers exist, so a restart cannot be
+ * mistaken for a ready daemon by a stale-header health check. */
+#define PS_SHM_STARTING		0
+#define PS_SHM_READY		1
+#define PS_SHM_STOPPING		2
 
 /* Operation codes */
 typedef enum PsOpcode
@@ -298,6 +306,7 @@ typedef struct PsChannel
 	uint32_t	pad1;			/* WAL_INDEX_GET: cursor is present */
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
 	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
+	uint64_t	incarnation;	/* expected timeline incarnation; 0 = legacy inc-1 */
 	PsKey		key;
 
 	/* result */
@@ -338,7 +347,7 @@ typedef struct PsShmHeader
 	uint64_t	admission_pending_lsn; /* relation mutations <= this LSN defer */
 	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
 	uint32_t	wal_index_lagging_timelines;
-	uint32_t	pad2;
+	uint32_t	startup_state; /* atomic: PS_SHM_{STARTING,READY,STOPPING} */
 	uint64_t	page_prune_metrics_seq;
 	uint64_t	page_prune_compactions;
 	uint64_t	page_prune_versions_scanned;

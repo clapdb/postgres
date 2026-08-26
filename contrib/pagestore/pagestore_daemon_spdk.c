@@ -58,7 +58,43 @@ static void
 on_signal(int sig)
 {
 	(void) sig;
+	if (daemon_hdr != NULL)
+	{
+		/* Invalidate readiness before recovery/flush shutdown can block. */
+		__atomic_store_n(&daemon_hdr->startup_state, PS_SHM_STOPPING,
+						 __ATOMIC_RELEASE);
+		__atomic_store_n(&daemon_hdr->magic, 0, __ATOMIC_RELEASE);
+	}
 	stop_requested = 1;
+}
+
+static void
+shm_mark_starting(PsShmHeader *hdr)
+{
+	/* Magic is the compatibility gate used by older inspectors as well. */
+	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&hdr->startup_state, PS_SHM_STARTING, __ATOMIC_RELEASE);
+}
+
+static void
+shm_mark_stopping(PsShmHeader *hdr)
+{
+	__atomic_store_n(&hdr->startup_state, PS_SHM_STOPPING, __ATOMIC_RELEASE);
+	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+}
+
+static int
+shm_publish_ready(PsShmHeader *hdr)
+{
+	uint32_t	expected = PS_SHM_STARTING;
+
+	/* Publish state first, then magic last after every header field is final. */
+	if (!__atomic_compare_exchange_n(&hdr->startup_state, &expected,
+									 PS_SHM_READY, 0, __ATOMIC_ACQ_REL,
+									 __ATOMIC_ACQUIRE))
+		return 0;
+	__atomic_store_n(&hdr->magic, PS_SHM_MAGIC, __ATOMIC_RELEASE);
+	return 1;
 }
 
 /* per-block context for one async page read: lets the completion populate the
@@ -186,6 +222,14 @@ begin(uint32_t i, PsChannel *ch)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
+		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
+		!ps_timeline_request_allowed(tl, ch->incarnation))
+	{
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return;
+	}
 
 	if (ps_handle_meta(ch))
 	{
@@ -398,6 +442,21 @@ run_request(uint32_t i, PsChannel *ch)
 		return 1;
 	}
 
+	/* Reuse is not safe while older async reads can still complete and insert
+	 * pages into the incarnation-keyed cache.  There is no SPDK request drain
+	 * in this slice, so reject both CHECK_BRANCH and CREATE_BRANCH carrying a
+	 * reuse token before taking core/map locks or entering ps_handle_meta().
+	 * This keeps branch prepare from doing work that a later CREATE_BRANCH could
+	 * not safely publish.  First-incarnation branch creation remains supported
+	 * (target token 0 or 1). */
+	if ((op == PS_OP_CHECK_BRANCH || op == PS_OP_CREATE_BRANCH) &&
+		ch->incarnation > 1)
+	{
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		return 1;
+	}
+
 	/* Retention registry operations own their own mutex; mutations can also
 	 * fsync host metadata.  Do not nest the global core lock around either. */
 	if (op == PS_OP_RETENTION_PIN_LOOKUP ||
@@ -580,12 +639,6 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	if (ps_core_open(store_dir) != 0)
-	{
-		fprintf(stderr, "pagestore_daemon_spdk: bring-up failed\n");
-		return 1;
-	}
-
 	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
 	if (fd < 0)
 	{
@@ -604,10 +657,19 @@ main(int argc, char **argv)
 		return 1;
 	}
 	close(fd);
-
 	hdr = (PsShmHeader *) shm;
+	daemon_hdr = hdr;
+	/* Invalidate a previous daemon's header before store recovery begins. */
+	shm_mark_starting(hdr);
+
+	if (ps_core_open(store_dir) != 0)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: bring-up failed\n");
+		munmap(shm, PS_SHM_SIZE);
+		return 1;
+	}
+
 	memset(shm, 0, PS_SHM_SIZE);
-	hdr->magic = PS_SHM_MAGIC;
 	hdr->version = PS_SHM_VERSION;
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
@@ -616,25 +678,11 @@ main(int argc, char **argv)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	ps_core_set_metrics_header(hdr);
-	daemon_hdr = hdr;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
-
-	fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
-			"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS, hdr->nshards);
-	if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
-	{
-		fprintf(stderr, "pagestore_daemon_spdk: fault probe daemon.after_ready failed\n");
-		ps_core_close();
-		ps_storage->close();
-		munmap(shm, PS_SHM_SIZE);
-		return 1;
-	}
 
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
@@ -676,6 +724,23 @@ main(int argc, char **argv)
 			else
 				maintenance_started = 1;
 		}
+		if (started == hdr->nshards && maintenance_started && !stop_requested &&
+			shm_publish_ready(hdr))
+		{
+			fprintf(stderr, "pagestore_daemon_spdk: shm=%s store=%s storage=%s "
+					"page_size=%u io_unit=%u channels=%u nshards=%u ready\n",
+					shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+					PS_MAX_CHANNELS, hdr->nshards);
+			if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon_spdk: fault probe daemon.after_ready failed\n");
+				shm_mark_stopping(hdr);
+				ps_core_close();
+				ps_storage->close();
+				munmap(shm, PS_SHM_SIZE);
+				return 1;
+			}
+		}
 
 		for (uint32_t shard = 0; shard < started; shard++)
 			pthread_join(threads[shard], NULL);
@@ -696,6 +761,7 @@ main(int argc, char **argv)
 				"miss=%llu evict=%llu)\n", (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);
 	}
+	shm_mark_stopping(hdr);
 	ps_core_close();			/* flush the memtable into a layer before detaching */
 	ps_storage->close();
 	munmap(shm, PS_SHM_SIZE);

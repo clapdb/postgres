@@ -59,9 +59,24 @@ typedef struct TestTimelineEvent
 	uint32_t state;
 	uint64_t branch_lsn;
 	uint64_t incarnation;
+	uint64_t parent_incarnation;
 	uint32_t crc;
 	uint32_t reserved;
 } TestTimelineEvent;
+
+typedef struct TestTimelineEventV1
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t kind;
+	uint32_t id;
+	int32_t	 parent;
+	uint32_t state;
+	uint64_t branch_lsn;
+	uint64_t incarnation;
+	uint32_t crc;
+	uint32_t reserved;
+} TestTimelineEventV1;
 
 typedef struct TestForkMetaRecV2
 {
@@ -259,6 +274,23 @@ fnv(const void *data, size_t len)
 }
 
 static void
+init_timeline_event_v1(TestTimelineEventV1 *event, uint32_t kind,
+					   uint32_t id, int32_t parent, uint32_t state,
+					   uint64_t branch_lsn, uint64_t incarnation)
+{
+	memset(event, 0, sizeof(*event));
+	event->magic = TEST_TIMELINE_MAGIC;
+	event->rec_len = sizeof(*event);
+	event->kind = kind;
+	event->id = id;
+	event->parent = parent;
+	event->state = state;
+	event->branch_lsn = branch_lsn;
+	event->incarnation = incarnation;
+	event->crc = fnv(event, sizeof(*event));
+}
+
+static void
 check(int ok, const char *name)
 {
 	checks++;
@@ -368,7 +400,36 @@ state_of(uint32_t timeline, PsTimelineState *state, uint64_t *incarnation)
 }
 
 static int
-create_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
+timeline_info_fenced(uint32_t timeline, uint64_t incarnation,
+					 uint32_t *parent, uint64_t *branch_lsn,
+					 uint64_t *parent_incarnation)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_TIMELINE_INFO;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_lifecycle_read_unlock();
+	if (ch.status != PS_STATUS_OK || ch.result == 0)
+		return 0;
+	if (parent != NULL)
+		*parent = ch.parent_timeline;
+	if (branch_lsn != NULL)
+		*branch_lsn = ch.req_lsn;
+	if (parent_incarnation != NULL)
+		*parent_incarnation = ch.req_seq;
+	return 1;
+}
+
+static int
+create_branch_fenced(uint32_t timeline, uint32_t parent, uint64_t branch_lsn,
+					 uint64_t target_incarnation, uint64_t parent_incarnation)
 {
 	PsChannel ch;
 
@@ -377,15 +438,27 @@ create_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
 	ch.timeline = timeline;
 	ch.parent_timeline = parent;
 	ch.req_lsn = branch_lsn;
+	ch.incarnation = target_incarnation;
+	ch.req_seq = parent_incarnation;
 	ch.status = PS_STATUS_OK;
 	ps_lifecycle_read_lock();
 	ps_admission_read_lock();
+	for (uint32_t sh = 0; sh < ps_nshards; sh++)
+		ps_lock_shard_wr(sh);
 	ps_lock_map_wr();
 	(void) ps_handle_meta(&ch);
 	ps_unlock_map();
+	for (uint32_t sh = ps_nshards; sh-- > 0;)
+		ps_unlock_shard(sh);
 	ps_admission_read_unlock();
 	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
+}
+
+static int
+create_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
+{
+	return create_branch_fenced(timeline, parent, branch_lsn, 0, 0);
 }
 
 static int
@@ -441,6 +514,50 @@ read_test_page(uint32_t timeline, uint32_t block, unsigned char *page)
 
 	rc = read_resolve(timeline, &key, block, UINT64_MAX, 0, page, NULL);
 	return rc;
+}
+
+/* Exercise the same request boundary used by the POSIX frontend, including
+ * the incarnation field that the direct core page helpers cannot carry. */
+static int
+fenced_meta_status(PsOpcode opcode, uint32_t timeline, uint64_t incarnation,
+					int *result_out)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	uint32_t shard = ps_shard_of(&key);
+	int write = opcode == PS_OP_CREATE;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = opcode;
+	ch.timeline = timeline;
+	ch.key = key;
+	ch.incarnation = incarnation;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	if (write)
+	{
+		ps_lock_shard_wr(shard);
+		(void) ps_handle_meta(&ch);
+		ps_unlock_shard(shard);
+	}
+	else if (opcode == PS_OP_RETENTION_FLOOR)
+	{
+		ps_lock_shard_rd(shard);
+		(void) ps_handle_meta(&ch);
+		ps_unlock_shard(shard);
+	}
+	else
+	{
+		ps_lock_shard_rd(shard);
+		ps_lock_map_rd();
+		(void) ps_handle_meta(&ch);
+		ps_unlock_map();
+		ps_unlock_shard(shard);
+	}
+	ps_lifecycle_read_unlock();
+	if (result_out != NULL)
+		*result_out = ch.result;
+	return ch.status == PS_STATUS_OK;
 }
 
 static uint32_t
@@ -1388,20 +1505,147 @@ wal_size_allowed(uint32_t timeline)
 }
 
 static int
+wal_size_fenced(uint32_t timeline, uint64_t incarnation)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_SIZE;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(0);
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+append_wal_fenced(uint32_t timeline, uint64_t incarnation,
+				  uint64_t start_lsn, const unsigned char *data, uint32_t len);
+
+static int
 append_wal(uint32_t timeline, uint64_t start_lsn, const unsigned char *data,
 		   uint32_t len)
+
+{
+	return append_wal_fenced(timeline, 0, start_lsn, data, len);
+}
+
+static int
+append_wal_fenced(uint32_t timeline, uint64_t incarnation,
+				  uint64_t start_lsn, const unsigned char *data, uint32_t len)
 {
 	PsChannel ch;
 
 	memset(&ch, 0, sizeof(ch));
 	ch.opcode = PS_OP_WAL_APPEND;
 	ch.timeline = timeline;
+	ch.incarnation = incarnation;
 	ch.req_lsn = start_lsn;
 	ch.datalen = len;
 	memcpy(ch.data, data, len);
 	ch.status = PS_STATUS_OK;
 	ps_lifecycle_read_lock();
 	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+walidx_add_fenced(uint32_t timeline, uint64_t incarnation, uint32_t block,
+				  uint64_t lsn)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsWalIndexEntry entry;
+
+	memset(&ch, 0, sizeof(ch));
+	memset(&entry, 0, sizeof(entry));
+	entry.key = key;
+	entry.block = block;
+	entry.lsn = lsn;
+	entry.end_lsn = lsn + 50;
+	entry.flags = PS_WAL_INDEX_FLAG_KNOWN | PS_WAL_INDEX_FLAG_FPI;
+	ch.opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.key = key;
+	ch.nblocks = 1;
+	ch.datalen = sizeof(entry);
+	memcpy(ch.data, &entry, sizeof(entry));
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_wr(ps_shard_of(&key));
+	(void) ps_handle_meta(&ch);
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+walidx_progress_fenced(uint32_t timeline, uint64_t incarnation,
+					   uint64_t start_lsn, uint64_t end_lsn)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.req_lsn = start_lsn;
+	ch.req_seq = end_lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+walidx_get_fenced(uint32_t timeline, uint64_t incarnation, uint32_t block,
+				  uint64_t read_lsn)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_GET;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.key = key;
+	ch.blocknum = block;
+	ch.req_lsn = read_lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+exists_at_fenced(uint32_t timeline, uint64_t incarnation, uint64_t read_lsn)
+{
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_EXISTS;
+	ch.timeline = timeline;
+	ch.incarnation = incarnation;
+	ch.key = key;
+	ch.req_lsn = read_lsn;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
 	ps_lifecycle_read_unlock();
 	return ch.status == PS_STATUS_OK;
 }
@@ -1426,6 +1670,284 @@ expect_open_failure(const char *store)
 	if (pid < 0 || waitpid(pid, &status, 0) != pid)
 		return 0;
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void
+test_timeline_incarnation_reuse(void)
+{
+	char store[] = "/tmp/pagestore-timeline-incarnation-reuse-XXXXXX";
+	unsigned char wal[] = {0x41, 0x42, 0x43};
+	unsigned char page[8192];
+	PsTimelineState state;
+	uint64_t incarnation;
+	uint64_t layer_ids;
+	int layer_remote;
+	int exists;
+
+	configure_timeline_core();
+	cache_pages = 8;
+	check(mkdtemp(store) != NULL, "create incarnation-reuse store");
+	check(ps_core_open(store) == 0 && create_branch(1, 0, 100) &&
+			state_of(1, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
+			incarnation == 1,
+			"create first incarnation and return its state token");
+	check(write_timeline_layer(1, 0, 100) == 0,
+			"write data into incarnation 1");
+	memset(page, 0, sizeof(page));
+	check(read_test_page(1, 0, page) == 1 && page[100] == 0x5A,
+			"read incarnation-1 page before deletion");
+	check(begin_delete(1, 1, NULL), "delete incarnation 1 with its token");
+	for (int i = 0; i < 256; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, &incarnation) &&
+			state == PS_TIMELINE_DELETED && incarnation == 1,
+			"publish durable DELETED before reuse");
+	check(timeline_layer_fingerprint(1, &layer_ids, &layer_remote) == 0,
+			"DELETED has no old image layers");
+
+	/* Every stale operation is rejected at the shared core boundary, including
+	 * paths that bypass ps_handle_meta() for byte I/O in the frontends. */
+	check(!fenced_meta_status(PS_OP_EXISTS, 1, 1, &exists) &&
+			!fenced_meta_status(PS_OP_CREATE, 1, 1, NULL) &&
+			!wal_size_fenced(1, 1) &&
+			!fenced_meta_status(PS_OP_RETENTION_FLOOR, 1, 1, NULL) &&
+			!begin_delete(1, 1, NULL),
+			"delayed incarnation-1 read/write/WAL/retention/delete are fenced");
+	check(!create_branch_fenced(1, 0, 100, 0, 1) &&
+			!create_branch_fenced(1, 0, 100, 1, 1) &&
+			!create_branch_fenced(1, 0, 100, 3, 1) &&
+			!create_branch_fenced(1, 0, 100, 2, 2),
+			"zero, rollback, skipped, and stale-parent reuse tokens are rejected");
+	{
+		char timelines_path[512];
+		struct stat before;
+		struct stat after;
+		TestTimelineEvent event;
+		int fd;
+
+		check(snprintf(timelines_path, sizeof(timelines_path), "%s/timelines",
+					   store) > 0 && stat(timelines_path, &before) == 0,
+				"stat lifecycle log before ambiguous LIVE create");
+		timeline_test_storage = PsStoragePosix;
+		timeline_test_storage.meta_append = test_meta_append;
+		timeline_append_mode = TIMELINE_APPEND_AMBIGUOUS;
+		ps_storage = &timeline_test_storage;
+		check(!create_branch_fenced(1, 0, 100, 2, 1),
+				"ambiguous LIVE create reports failure without publishing in memory");
+		fd = open(timelines_path, O_RDONLY);
+		check(stat(timelines_path, &after) == 0 &&
+				after.st_size == before.st_size + (off_t) sizeof(event) &&
+				fd >= 0 && pread(fd, &event, sizeof(event),
+					  before.st_size) == (ssize_t) sizeof(event) &&
+				event.kind == 1 && event.id == 1 && event.parent == 0 &&
+				event.state == PS_TIMELINE_LIVE && event.branch_lsn == 100 &&
+				event.incarnation == 2,
+				"ambiguous LIVE create leaves exactly one durable incarnation-2 event");
+		if (fd >= 0)
+			(void) close(fd);
+		timeline_append_mode = TIMELINE_APPEND_NORMAL;
+		ps_storage = &PsStoragePosix;
+	}
+	memset(page, 0, sizeof(page));
+	close_store();
+	check(ps_core_open(store) == 0, "restart after ambiguous LIVE create");
+	check(state_of(1, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
+			incarnation == 2 && read_test_page(1, 0, page) == 0,
+			"ambiguous LIVE create replays incarnation 2 without old page data");
+	check(create_branch_fenced(1, 0, 100, 2, 1),
+			"exact incarnation-2 CREATE_BRANCH retry is idempotent");
+	check(!create_branch_fenced(1, 0, 100, 0, 2) &&
+			!create_branch_fenced(1, 0, 101, 2, 1),
+			"incarnation-2 token and metadata mismatches are rejected");
+	check(fenced_meta_status(PS_OP_EXISTS, 1, 2, &exists) && !exists &&
+			fenced_meta_status(PS_OP_CREATE, 1, 2, NULL) &&
+			fenced_meta_status(PS_OP_EXISTS, 1, 2, &exists) && exists &&
+			append_wal_fenced(1, 2, 200, wal, sizeof(wal)) &&
+			!wal_size_fenced(1, 1),
+			"post-restart exact requests admit new fork/WAL state only");
+	check(!create_branch_fenced(2, 1, 100, 0, 1) &&
+			create_branch_fenced(2, 1, 100, 0, 2),
+			"CREATE_BRANCH fences the parent live incarnation");
+	{
+		uint32_t parent;
+		uint64_t branch_lsn;
+		uint64_t parent_incarnation;
+
+		check(!timeline_info_fenced(1, 1, NULL, NULL, NULL) &&
+			  timeline_info_fenced(1, 2, &parent, &branch_lsn,
+								 &parent_incarnation) &&
+			  parent == 0 && branch_lsn == 100 && parent_incarnation == 1,
+			  "TIMELINE_INFO requires the exact token and returns parent identity");
+		check(timeline_info_fenced(2, 1, &parent, &branch_lsn,
+								 &parent_incarnation) &&
+			  parent == 1 && branch_lsn == 100 && parent_incarnation == 2,
+			  "TIMELINE_INFO preserves a nested parent's reused incarnation");
+	}
+	check(!begin_delete(1, 2, NULL),
+			"a live child prevents deleting its reused parent");
+	check(begin_delete(2, 1, NULL), "delete the child with incarnation 1");
+	for (int i = 0; i < 64; i++)
+		(void) ps_core_maintenance();
+	check(state_of(2, &state, &incarnation) && state == PS_TIMELINE_DELETED,
+			"child reaches durable DELETED");
+	check(begin_delete(1, 2, NULL), "delete incarnation 2 with its token");
+	ps_test_forkmeta_snapshot_gc_retry_now();
+	for (int i = 0; i < 256; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, &incarnation) &&
+			state == PS_TIMELINE_DELETED && incarnation == 2,
+			"incarnation 2 reaches durable DELETED");
+	check(create_branch_fenced(1, 0, 100, 3, 1),
+			"reuse advances exactly to incarnation 3");
+	check(state_of(1, &state, &incarnation) && state == PS_TIMELINE_LIVE &&
+			incarnation == 3, "incarnation 3 is LIVE");
+	close_store();
+	check(ps_core_open(store) == 0 && state_of(1, &state, &incarnation) &&
+			state == PS_TIMELINE_LIVE && incarnation == 3,
+			"restart does not resurrect an older incarnation");
+	close_store();
+	remove_tree(store);
+}
+
+/* A reclaimed frontier belongs to the incarnation that produced it, not to
+ * the numeric timeline ID.  Exercise both frontiers through the real
+ * compaction paths, then reuse the ID below the old horizons. */
+static void
+test_timeline_incarnation_frontiers(void)
+{
+	char store[] = "/tmp/pagestore-timeline-incarnation-frontiers-XXXXXX";
+	unsigned char wal[800];
+	unsigned char page[8192];
+	PsRetentionPin pin;
+	PsTimelineState state;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	int old_page_frontier = 0;
+	int old_walidx_frontier = 0;
+
+	configure_timeline_core();
+	flush_pages = 1;
+	compact_layers = 0;
+	memset(wal, 0xA5, sizeof(wal));
+	check(mkdtemp(store) != NULL, "create incarnation-frontier store");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  ps_core_open(store) == 0 && create_branch(1, 0, 500),
+		"open the old incarnation below its future frontier");
+	check(write_timeline_layer(1, 0, 500) == 0 &&
+		  write_timeline_layer(1, 0, 600) == 0,
+		"write two old-incarnation page versions");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 1;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 8101;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 700;
+	pin.admission_seq = 1;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+		"install a high old page-history horizon");
+	check(append_wal_fenced(1, 1, 0, wal, sizeof(wal)) &&
+		  walidx_add_fenced(1, 1, 0, 600) &&
+		  walidx_add_fenced(1, 1, 0, 700) &&
+		  walidx_progress_fenced(1, 1, 0, sizeof(wal)),
+		"write old-incarnation WAL and WAL-index history");
+	for (int i = 0; i < 512; i++)
+	{
+		unsigned char ignored[8192];
+
+		(void) ps_core_maintenance();
+		if (read_resolve(1, &key, 0, 500, 0, ignored, NULL) == -2)
+			old_page_frontier = 1;
+		if (!walidx_get_fenced(1, 1, 0, 500))
+			old_walidx_frontier = 1;
+		if (old_page_frontier && old_walidx_frontier)
+			break;
+	}
+	check(old_page_frontier,
+		"publish a nonzero page frontier for incarnation 1");
+	check(old_walidx_frontier,
+		"publish a nonzero WAL-index frontier for incarnation 1");
+	check(ps_retention_drop(pin.timeline, pin.owner_kind, pin.owner_id,
+							 pin.generation) == PS_RETENTION_OK &&
+		  begin_delete(1, 1, NULL),
+		"release the old horizon and delete incarnation 1");
+	for (int i = 0; i < 512; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		"old incarnation reaches durable DELETED after frontier compaction");
+
+	/* Make the first reuse append ambiguous.  Replay must still select the new
+	 * incarnation, while the old frontier slots remain durable evidence. */
+	timeline_test_storage = PsStoragePosix;
+	timeline_test_storage.meta_append = test_meta_append;
+	timeline_append_mode = TIMELINE_APPEND_AMBIGUOUS;
+	ps_storage = &timeline_test_storage;
+	check(!create_branch_fenced(1, 0, 100, 2, 1),
+		"ambiguous reuse CREATE reports failure without in-memory cutover");
+	timeline_append_mode = TIMELINE_APPEND_NORMAL;
+	ps_storage = &PsStoragePosix;
+	close_store();
+	check(ps_core_open(store) == 0 && state_of(1, &state, NULL) &&
+		  state == PS_TIMELINE_LIVE && state_of(1, NULL, NULL),
+		"restart replays the ambiguous reuse as incarnation 2");
+	{
+		uint64_t incarnation;
+
+		check(state_of(1, NULL, &incarnation) && incarnation == 2,
+				"ambiguous reuse retains the new incarnation token");
+	}
+	check(fenced_meta_status(PS_OP_CREATE, 1, 2, NULL),
+		"new incarnation creates a fork below the old page frontier");
+	check(write_timeline_layer(1, 0, 100) == 0,
+		"new incarnation writes below the old page frontier");
+	{
+		/* A branch-local write at the fork horizon is deliberately clamped to
+		 * fork_lsn + 1, so read at that first local position. */
+		int rc = read_resolve(1, &key, 0, 101, 0, page, NULL);
+		check(rc == 1,
+		"new incarnation reads below the old page frontier");
+	}
+	check(exists_at_fenced(1, 2, 100),
+		"new incarnation metadata reads below the old page frontier");
+	check(append_wal_fenced(1, 2, 100, wal, 100) &&
+		  walidx_add_fenced(1, 2, 0, 120) &&
+		  walidx_progress_fenced(1, 2, 100, 200),
+		"new incarnation accepts WAL-index writes below the old frontier");
+	check(walidx_get_fenced(1, 2, 0, 150),
+		"new incarnation reads its WAL-index below the old frontier");
+	close_store();
+	check(ps_core_open(store) == 0,
+		"restart reused incarnation with old frontiers present");
+	{
+		int rc = read_resolve(1, &key, 0, 101, 0, page, NULL);
+		check(rc == 1,
+		"restart preserves lower-LSN page reads");
+	}
+	check(walidx_get_fenced(1, 2, 0, 150),
+		"restart preserves lower-LSN WAL-index reads");
+	check(append_wal_fenced(1, 2, 200, wal, 100) &&
+		  walidx_add_fenced(1, 2, 1, 220) &&
+		  walidx_progress_fenced(1, 2, 200, 300),
+		"post-restart WAL-index progress remains writable");
+	check(begin_delete(1, 2, NULL), "delete incarnation 2 before a second reuse");
+	for (int i = 0; i < 512; i++)
+		(void) ps_core_maintenance();
+	check(state_of(1, &state, NULL) && state == PS_TIMELINE_DELETED,
+		"second incarnation reaches durable DELETED");
+	check(create_branch_fenced(1, 0, 100, 3, 1),
+		"second reuse advances the incarnation monotonically");
+	close_store();
+	check(ps_core_open(store) == 0 && state_of(1, &state, NULL) &&
+		  state == PS_TIMELINE_LIVE,
+		"restart retains the second reuse as LIVE");
+	{
+		uint64_t incarnation;
+
+		check(state_of(1, NULL, &incarnation) && incarnation == 3,
+				"second reuse has incarnation 3 after restart");
+	}
+	close_store();
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	remove_tree(store);
 }
 
 static void
@@ -1500,6 +2022,47 @@ configure_timeline_core(void)
 	ps_nshards = 1;
 	use_layers = 1;
 	ps_storage = &PsStoragePosix;
+}
+
+static void
+test_old_event_replay_derives_reused_parent_incarnation(void)
+{
+	char store[] = "/tmp/pagestore-timeline-old-parent-XXXXXX";
+	char path[512];
+	TestTimelineEventV1 events[7];
+	PsTimelineState state;
+	uint64_t incarnation;
+	uint32_t parent;
+	uint64_t branch_lsn;
+	uint64_t parent_incarnation;
+
+	configure_timeline_core();
+	check(mkdtemp(store) != NULL, "create old-event reused-parent store");
+	check(snprintf(path, sizeof(path), "%s/timelines", store) > 0,
+		  "build old-event reused-parent timeline path");
+	init_timeline_event_v1(&events[0], 1, 1, 0, PS_TIMELINE_LIVE, 100, 1);
+	init_timeline_event_v1(&events[1], 2, 1, 0, PS_TIMELINE_DELETING, 100, 1);
+	init_timeline_event_v1(&events[2], 2, 1, 0, PS_TIMELINE_DELETED, 100, 1);
+	init_timeline_event_v1(&events[3], 1, 1, 0, PS_TIMELINE_LIVE, 100, 2);
+	init_timeline_event_v1(&events[4], 1, 2, 1, PS_TIMELINE_LIVE, 110, 1);
+	init_timeline_event_v1(&events[5], 1, 3, 1, PS_TIMELINE_LIVE, 120, 1);
+	init_timeline_event_v1(&events[6], 2, 3, 1, PS_TIMELINE_DELETING, 120, 1);
+	check(write_bytes(path, events, sizeof(events)) == 0,
+		  "write old events with a reused parent timeline");
+	check(ps_core_open(store) == 0,
+		  "replay old events whose parent is incarnation 2");
+	check(state_of(1, &state, &incarnation) &&
+		  state == PS_TIMELINE_LIVE && incarnation == 2,
+		  "old replay retains the reused parent's incarnation");
+	check(timeline_info_fenced(2, 1, &parent, &branch_lsn,
+							 &parent_incarnation) &&
+		  parent == 1 && branch_lsn == 110 && parent_incarnation == 2,
+		  "old child CREATE derives the parent's replay-time incarnation");
+	check(state_of(3, &state, &incarnation) &&
+		  state == PS_TIMELINE_DELETING && incarnation == 1,
+		  "old child STATE reuses its CREATE-time parent incarnation");
+	close_store();
+	remove_tree(store);
 }
 
 static void
@@ -2379,11 +2942,14 @@ test_deleting_timeline_page_cleanup_retired_short_segment(void)
 int
 main(void)
 {
+	test_old_event_replay_derives_reused_parent_incarnation();
 	test_legacy_migration_and_parser_fail_closed();
 	test_delete_discards_unflushed_memtable();
 	test_deleting_timeline_wal_cleanup();
 	test_deletion_requires_durable_forkmeta();
 	test_deletion_state_append_failure();
+	test_timeline_incarnation_reuse();
+	test_timeline_incarnation_frontiers();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_fail_closed();
 	test_deleting_timeline_page_cleanup_oversized();

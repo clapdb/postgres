@@ -200,7 +200,8 @@ client_attach(const char *shm_name, uint32_t expect_page_size)
 		exit(2);
 	}
 	hdr = (PsShmHeader *) cl_shm;
-	check(hdr->magic == PS_SHM_MAGIC, "shm magic");
+	check(hdr->magic == PS_SHM_MAGIC && hdr->startup_state == PS_SHM_READY,
+		  "shm is ready");
 	check(hdr->page_size == expect_page_size,
 		  "header page_size=%u expected %u", hdr->page_size, expect_page_size);
 	cl_nshards = hdr->nshards ? hdr->nshards : 1;
@@ -272,6 +273,7 @@ cl_setkey(PsChannel *ch, uint32_t rel, int32_t fork)
 	ch->timeline = 0;			/* default to the main timeline */
 	ch->req_lsn = 0;			/* explicit: channels are reused across op kinds */
 	ch->req_seq = 0;
+	ch->incarnation = 0;
 }
 
 static uint32_t
@@ -723,6 +725,7 @@ op_wal_retain_floor(uint32_t timeline)
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
 	ch->timeline = timeline;
+	ch->incarnation = 0;
 	ch->blocknum = 0;
 	ch->req_lsn = 0;
 	cl_exec();
@@ -899,16 +902,35 @@ op_retention_floor(uint32_t timeline, uint32_t resource, uint64_t *floor)
 
 /* --- timeline-aware operations (for branch tests) --- */
 
+/* Return the current lifecycle token through the public channel protocol. */
+static uint64_t
+op_timeline_incarnation(uint32_t timeline)
+{
+	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+
+	memset((void *) &ch->key, 0, sizeof(ch->key));
+	ch->opcode = PS_OP_TIMELINE_STATE;
+	ch->timeline = timeline;
+	ch->req_seq = 0;
+	ch->incarnation = 0;
+	if (cl_exec()->status != PS_STATUS_OK)
+		return 0;
+	return ch->req_seq;
+}
+
 /* Create timeline new_tl as a branch of parent_tl forked at branch_lsn. */
 static void
 op_create_branch(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = 0;
+	ch->req_seq = parent_incarnation;
 	cl_exec();
 }
 
@@ -917,11 +939,14 @@ static int
 op_create_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
 	ch->opcode = PS_OP_CREATE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = 0;
+	ch->req_seq = parent_incarnation;
 	return cl_exec()->status;
 }
 
@@ -930,24 +955,30 @@ static int
 op_check_branch_status(uint32_t new_tl, uint32_t parent_tl, uint64_t branch_lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
 	ch->opcode = PS_OP_CHECK_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = 0;
+	ch->req_seq = parent_incarnation;
 	return cl_exec()->status;
 }
 
 static int
 op_require_branch_status(uint32_t new_tl, uint32_t parent_tl,
-						 uint64_t branch_lsn)
+							 uint64_t branch_lsn)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
+	uint64_t	parent_incarnation = op_timeline_incarnation(parent_tl);
 
 	ch->opcode = PS_OP_REQUIRE_BRANCH;
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = 0;
+	ch->req_seq = parent_incarnation;
 	return cl_exec()->status;
 }
 
@@ -1140,6 +1171,7 @@ op_wal_append(uint32_t tl, uint64_t start_lsn, const void *data, uint32_t len)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->timeline = tl;
+	ch->incarnation = 0;
 	ch->opcode = PS_OP_WAL_APPEND;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
@@ -1155,6 +1187,7 @@ op_wal_append_status(uint32_t tl, uint64_t start_lsn, const void *data,
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->timeline = tl;
+	ch->incarnation = 0;
 	ch->opcode = PS_OP_WAL_APPEND;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
@@ -1169,6 +1202,7 @@ op_wal_size(uint32_t tl)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->timeline = tl;
+	ch->incarnation = 0;
 	ch->opcode = PS_OP_WAL_SIZE;
 	cl_exec();
 	return ch->req_lsn;
@@ -1181,6 +1215,7 @@ op_timeline_info(uint32_t tl, uint32_t *parent_tl, uint64_t *branch_lsn)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->timeline = tl;
+	ch->incarnation = 1;
 	ch->opcode = PS_OP_TIMELINE_INFO;
 	cl_exec();
 	*parent_tl = ch->parent_timeline;
@@ -1195,6 +1230,7 @@ op_wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
 	ch->timeline = tl;
+	ch->incarnation = 0;
 	ch->opcode = PS_OP_WAL_READ;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
@@ -1305,6 +1341,7 @@ op_walidx_progress(uint32_t tl, uint64_t start, uint64_t end, uint64_t *progress
 	int			ok;
 
 	ch->timeline = tl;
+	ch->incarnation = 0;
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->req_lsn = start;
 	ch->req_seq = end;
@@ -1487,6 +1524,7 @@ wait_ready(const char *shm, uint32_t page_size)
 			if (h != MAP_FAILED)
 			{
 				int			ready = (h->magic == PS_SHM_MAGIC &&
+									 h->startup_state == PS_SHM_READY &&
 									 h->page_size == page_size &&
 									 h->nchannels == PS_MAX_CHANNELS);
 
@@ -1530,10 +1568,21 @@ expect_daemon_open_failure(pid_t pid, const char *shm, const char *message)
 		  "%s", message);
 	{
 		int			fd = shm_open(shm, O_RDWR, 0600);
+		int			not_ready = fd < 0;
 
-		check(fd < 0, "%s does not publish shared-memory readiness", message);
 		if (fd >= 0)
+		{
+			PsShmHeader *h = mmap(NULL, sizeof(PsShmHeader), PROT_READ,
+							  MAP_SHARED, fd, 0);
+
+			not_ready = h == MAP_FAILED ||
+				(h->magic != PS_SHM_MAGIC ||
+				 h->startup_state != PS_SHM_READY);
+			if (h != MAP_FAILED)
+				munmap(h, sizeof(PsShmHeader));
 			close(fd);
+		}
+		check(not_ready, "%s does not publish shared-memory readiness", message);
 	}
 }
 
@@ -4590,8 +4639,6 @@ run_walidx_suite(const char *daemon_path, const char *tmpbase)
 	client_detach();
 	stop_daemon(dpid);
 	write_torn_wal_header(store, 3, 0x100000000ULL, 16);
-	/* Do not let wait_ready observe the stopped daemon's valid SHM header. */
-	shm_unlink(shm);
 	check(setenv("PAGESTORE_TEST_MAX_LOG_READ", "17", 1) == 0,
 		  "enable short log reads during WAL index recovery");
 	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&

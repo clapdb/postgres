@@ -115,6 +115,7 @@ static int timeline_delete_wal_cleanup_one(void);
 static int timeline_delete_page_cleanup_one(void);
 static int timeline_delete_publish_ready(uint32_t timeline);
 static int timeline_delete_publish_one(void);
+static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -207,33 +208,58 @@ static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *metrics_header;
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
-#define PS_PAGE_FRONTIER_VERSION 2
+#define PS_PAGE_FRONTIER_VERSION 3
+#define PS_PAGE_FRONTIER_SLOTS 2
+typedef struct PsPageFrontierEntry
+{
+	uint64_t	incarnation;
+	PsPruneFence fence;
+} PsPageFrontierEntry;
 typedef struct PsPageFrontierState
+{
+	uint32_t	magic;
+	uint32_t	version;
+	PsPageFrontierEntry entries[1024][PS_PAGE_FRONTIER_SLOTS];
+	uint32_t	crc;
+} PsPageFrontierState;
+typedef struct PsPageFrontierStateV2
 {
 	uint32_t	magic;
 	uint32_t	version;
 	PsPruneFence frontiers[1024];
 	uint32_t	crc;
-} PsPageFrontierState;
+} PsPageFrontierStateV2;
 static char page_frontier_path[4096];
 static char page_frontier_dir[4096];
-static PsPruneFence page_reclaimed_frontier[1024];
+static PsPageFrontierEntry page_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS];
 static int page_frontier_load(const char *store_dir);
 static int page_frontier_advance(uint32_t timeline, uint64_t floor,
-								 uint64_t admission_seq);
+									uint64_t admission_seq);
 
 #define PS_WALIDX_FRONTIER_MAGIC 0x46584957U /* "WIXF" */
-#define PS_WALIDX_FRONTIER_VERSION 1
+#define PS_WALIDX_FRONTIER_VERSION 2
+typedef struct PsWalIdxFrontierEntry
+{
+	uint64_t	incarnation;
+	uint64_t	frontier;
+} PsWalIdxFrontierEntry;
 typedef struct PsWalIdxFrontierState
+{
+	uint32_t	magic;
+	uint32_t	version;
+	PsWalIdxFrontierEntry entries[1024][PS_PAGE_FRONTIER_SLOTS];
+	uint32_t	crc;
+} PsWalIdxFrontierState;
+typedef struct PsWalIdxFrontierStateV1
 {
 	uint32_t	magic;
 	uint32_t	version;
 	uint64_t	frontiers[1024];
 	uint32_t	crc;
-} PsWalIdxFrontierState;
+} PsWalIdxFrontierStateV1;
 static char walidx_frontier_path[4096];
 static char walidx_frontier_dir[4096];
-static uint64_t walidx_reclaimed_frontier[1024];
+static PsWalIdxFrontierEntry walidx_reclaimed_frontier[1024][PS_PAGE_FRONTIER_SLOTS];
 static int walidx_frontier_load(const char *store_dir);
 static int walidx_frontier_advance(uint32_t timeline, uint64_t frontier);
 static int walidx_frontier_ancestry_allows(uint32_t reader_timeline,
@@ -2138,6 +2164,7 @@ typedef struct TimelineMeta
 	uint64_t	branch_lsn;		/* parent LSN this timeline forked at */
 	uint32_t	state;			/* PsTimelineState; published after durable append */
 	uint64_t	incarnation;		/* nonzero fencing generation */
+	uint64_t	parent_incarnation;	/* immutable generation of parent, or 1 for root */
 } TimelineMeta;
 
 static TimelineMeta timelines[MAX_TIMELINES];
@@ -2192,6 +2219,8 @@ static int timeline_used[MAX_TIMELINES];
 static unsigned char timeline_wal_cleanup_done[MAX_TIMELINES];
 static unsigned char timeline_page_cleanup_done[MAX_TIMELINES];
 static uint32_t timeline_page_cleanup_cursor;
+
+static void timeline_reset_reuse_runtime(uint32_t timeline);
 
 static inline void
 timeline_mark_used(uint32_t timeline)
@@ -2318,8 +2347,7 @@ page_frontier_publish(void)
 	memset(&state, 0, sizeof(state));
 	state.magic = PS_PAGE_FRONTIER_MAGIC;
 	state.version = PS_PAGE_FRONTIER_VERSION;
-	memcpy(state.frontiers, page_reclaimed_frontier,
-		   sizeof(state.frontiers));
+	memcpy(state.entries, page_reclaimed_frontier, sizeof(state.entries));
 	state.crc = page_frontier_crc(&state);
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", page_frontier_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
@@ -2350,7 +2378,8 @@ static int
 page_frontier_load(const char *store_dir)
 {
 	PsPageFrontierState state;
-	unsigned char extra;
+	PsPageFrontierStateV2 legacy;
+	struct stat st;
 	int			fd;
 	int			n;
 
@@ -2365,11 +2394,44 @@ page_frontier_load(const char *store_dir)
 	fd = open(page_frontier_path, O_RDONLY);
 	if (fd < 0)
 		return errno == ENOENT ? 0 : -1;
-	if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
-		read(fd, &extra, 1) != 0 ||
-		state.magic != PS_PAGE_FRONTIER_MAGIC ||
-		state.version != PS_PAGE_FRONTIER_VERSION ||
-		state.crc != page_frontier_crc(&state))
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (st.st_size == (off_t) sizeof(state))
+	{
+		if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+			state.magic != PS_PAGE_FRONTIER_MAGIC ||
+			state.version != PS_PAGE_FRONTIER_VERSION ||
+			state.crc != page_frontier_crc(&state))
+		{
+			close(fd);
+			errno = EILSEQ;
+			return -1;
+		}
+		memcpy(page_reclaimed_frontier, state.entries, sizeof(state.entries));
+	}
+	else if (st.st_size == (off_t) sizeof(legacy))
+	{
+		if (read(fd, &legacy, sizeof(legacy)) != (ssize_t) sizeof(legacy) ||
+			legacy.magic != PS_PAGE_FRONTIER_MAGIC || legacy.version != 2 ||
+			legacy.crc != fnv(&legacy, offsetof(PsPageFrontierStateV2, crc)))
+		{
+			close(fd);
+			errno = EILSEQ;
+			return -1;
+		}
+		/* The old format had no identity.  It is safe to use only for the
+		 * original incarnation; treating it as a reused incarnation would turn
+		 * an ambiguous numeric-ID value into a false rejection. */
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		{
+			page_reclaimed_frontier[tl][0].incarnation = 1;
+			page_reclaimed_frontier[tl][0].fence = legacy.frontiers[tl];
+		}
+	}
+	else
 	{
 		close(fd);
 		errno = EILSEQ;
@@ -2377,30 +2439,78 @@ page_frontier_load(const char *store_dir)
 	}
 	if (close(fd) != 0)
 		return -1;
-	memcpy(page_reclaimed_frontier, state.frontiers,
-		   sizeof(page_reclaimed_frontier));
 	return 0;
+}
+
+static PsPruneFence
+page_frontier_current(uint32_t timeline)
+{
+	PsPruneFence zero = {0, 0};
+	uint64_t incarnation;
+
+	if (timeline >= MAX_TIMELINES)
+		return zero;
+	incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+									 __ATOMIC_ACQUIRE);
+	if (incarnation == 0)
+		return zero;
+	for (uint32_t slot = 0; slot < PS_PAGE_FRONTIER_SLOTS; slot++)
+		if (page_reclaimed_frontier[timeline][slot].incarnation == incarnation)
+			return page_reclaimed_frontier[timeline][slot].fence;
+	return zero;
+}
+
+static PsPageFrontierEntry *
+page_frontier_slot(uint32_t timeline, uint64_t incarnation, int create)
+{
+	PsPageFrontierEntry *oldest = NULL;
+
+	for (uint32_t slot = 0; slot < PS_PAGE_FRONTIER_SLOTS; slot++)
+	{
+		PsPageFrontierEntry *entry = &page_reclaimed_frontier[timeline][slot];
+
+		if (entry->incarnation == incarnation)
+			return entry;
+		if (entry->incarnation == 0 || oldest == NULL ||
+			entry->incarnation < oldest->incarnation)
+			oldest = entry;
+	}
+	if (!create || oldest == NULL)
+		return NULL;
+	oldest->incarnation = incarnation;
+	oldest->fence = (PsPruneFence) {0, 0};
+	return oldest;
 }
 
 static int
 page_frontier_advance(uint32_t timeline, uint64_t floor,
 					  uint64_t admission_seq)
 {
-	PsPruneFence old;
+	PsPageFrontierEntry old;
+	PsPageFrontierEntry *entry;
 	PsPruneFence next;
+	uint64_t incarnation;
 
-	if (timeline >= MAX_TIMELINES || floor == 0)
+	if (timeline >= MAX_TIMELINES || floor == 0 ||
+		(incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+												 __ATOMIC_ACQUIRE)) == 0)
 		return -1;
-	old = page_reclaimed_frontier[timeline];
+	entry = page_frontier_slot(timeline, incarnation, 1);
+	if (entry == NULL)
+		return -1;
+	old = *entry;
+	if (old.incarnation != incarnation)
+		return -1;
+	old.fence = entry->fence;
 	next.lsn = floor;
 	next.admission_seq = admission_seq;
-	if (next.lsn < old.lsn ||
-		(next.lsn == old.lsn && next.admission_seq <= old.admission_seq))
+	if (next.lsn < old.fence.lsn ||
+		(next.lsn == old.fence.lsn && next.admission_seq <= old.fence.admission_seq))
 		return 0;
-	page_reclaimed_frontier[timeline] = next;
+	entry->fence = next;
 	if (page_frontier_publish() != 0)
 	{
-		page_reclaimed_frontier[timeline] = old;
+		*entry = old;
 		return -1;
 	}
 	return 0;
@@ -2471,7 +2581,7 @@ page_frontier_allows(uint32_t timeline, uint32_t reader_timeline,
 
 	if (timeline >= MAX_TIMELINES)
 		return 0;
-	frontier = page_reclaimed_frontier[timeline];
+	frontier = page_frontier_current(timeline);
 	if (lsn < frontier.lsn &&
 		!((admission_seq == 0 &&
 		   page_frontier_structural_fence_active(reader_timeline, timeline, lsn)) ||
@@ -2509,8 +2619,7 @@ walidx_frontier_publish(void)
 	memset(&state, 0, sizeof(state));
 	state.magic = PS_WALIDX_FRONTIER_MAGIC;
 	state.version = PS_WALIDX_FRONTIER_VERSION;
-	memcpy(state.frontiers, walidx_reclaimed_frontier,
-		   sizeof(state.frontiers));
+	memcpy(state.entries, walidx_reclaimed_frontier, sizeof(state.entries));
 	state.crc = walidx_frontier_crc(&state);
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", walidx_frontier_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
@@ -2541,7 +2650,8 @@ static int
 walidx_frontier_load(const char *store_dir)
 {
 	PsWalIdxFrontierState state;
-	unsigned char extra;
+	PsWalIdxFrontierStateV1 legacy;
+	struct stat st;
 	int			fd;
 	int			n;
 
@@ -2558,11 +2668,43 @@ walidx_frontier_load(const char *store_dir)
 	fd = open(walidx_frontier_path, O_RDONLY);
 	if (fd < 0)
 		return errno == ENOENT ? 0 : -1;
-	if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
-		read(fd, &extra, 1) != 0 ||
-		state.magic != PS_WALIDX_FRONTIER_MAGIC ||
-		state.version != PS_WALIDX_FRONTIER_VERSION ||
-		state.crc != walidx_frontier_crc(&state))
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (st.st_size == (off_t) sizeof(state))
+	{
+		if (read(fd, &state, sizeof(state)) != (ssize_t) sizeof(state) ||
+			state.magic != PS_WALIDX_FRONTIER_MAGIC ||
+			state.version != PS_WALIDX_FRONTIER_VERSION ||
+			state.crc != walidx_frontier_crc(&state))
+		{
+			close(fd);
+			errno = EILSEQ;
+			return -1;
+		}
+		memcpy(walidx_reclaimed_frontier, state.entries, sizeof(state.entries));
+	}
+	else if (st.st_size == (off_t) sizeof(legacy))
+	{
+		if (read(fd, &legacy, sizeof(legacy)) != (ssize_t) sizeof(legacy) ||
+			legacy.magic != PS_WALIDX_FRONTIER_MAGIC || legacy.version != 1 ||
+			legacy.crc != fnv(&legacy, offsetof(PsWalIdxFrontierStateV1, crc)))
+		{
+			close(fd);
+			errno = EILSEQ;
+			return -1;
+		}
+		/* As with page frontiers, an unkeyed legacy value belongs only to
+		 * incarnation one.  Reused IDs must rebuild from their own WAL. */
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		{
+			walidx_reclaimed_frontier[tl][0].incarnation = 1;
+			walidx_reclaimed_frontier[tl][0].frontier = legacy.frontiers[tl];
+		}
+	}
+	else
 	{
 		close(fd);
 		errno = EILSEQ;
@@ -2570,25 +2712,69 @@ walidx_frontier_load(const char *store_dir)
 	}
 	if (close(fd) != 0)
 		return -1;
-	memcpy(walidx_reclaimed_frontier, state.frontiers,
-		   sizeof(walidx_reclaimed_frontier));
 	return 0;
+}
+
+static uint64_t
+walidx_frontier_current(uint32_t timeline)
+{
+	uint64_t incarnation;
+
+	if (timeline >= MAX_TIMELINES)
+		return 0;
+	incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+									 __ATOMIC_ACQUIRE);
+	if (incarnation == 0)
+		return 0;
+	for (uint32_t slot = 0; slot < PS_PAGE_FRONTIER_SLOTS; slot++)
+		if (walidx_reclaimed_frontier[timeline][slot].incarnation == incarnation)
+			return walidx_reclaimed_frontier[timeline][slot].frontier;
+	return 0;
+}
+
+static PsWalIdxFrontierEntry *
+walidx_frontier_slot(uint32_t timeline, uint64_t incarnation, int create)
+{
+	PsWalIdxFrontierEntry *oldest = NULL;
+
+	for (uint32_t slot = 0; slot < PS_PAGE_FRONTIER_SLOTS; slot++)
+	{
+		PsWalIdxFrontierEntry *entry = &walidx_reclaimed_frontier[timeline][slot];
+
+		if (entry->incarnation == incarnation)
+			return entry;
+		if (entry->incarnation == 0 || oldest == NULL ||
+			entry->incarnation < oldest->incarnation)
+			oldest = entry;
+	}
+	if (!create || oldest == NULL)
+		return NULL;
+	oldest->incarnation = incarnation;
+	oldest->frontier = 0;
+	return oldest;
 }
 
 static int
 walidx_frontier_advance(uint32_t timeline, uint64_t frontier)
 {
-	uint64_t old;
+	PsWalIdxFrontierEntry old;
+	PsWalIdxFrontierEntry *entry;
+	uint64_t incarnation;
 
-	if (timeline >= MAX_TIMELINES || frontier == 0)
+	if (timeline >= MAX_TIMELINES || frontier == 0 ||
+		(incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+												 __ATOMIC_ACQUIRE)) == 0)
 		return -1;
-	old = walidx_reclaimed_frontier[timeline];
-	if (frontier <= old)
+	entry = walidx_frontier_slot(timeline, incarnation, 1);
+	if (entry == NULL)
+		return -1;
+	old = *entry;
+	if (frontier <= old.frontier)
 		return 0;
-	walidx_reclaimed_frontier[timeline] = frontier;
+	entry->frontier = frontier;
 	if (walidx_frontier_publish() != 0)
 	{
-		walidx_reclaimed_frontier[timeline] = old;
+		*entry = old;
 		return -1;
 	}
 	return 0;
@@ -2637,7 +2823,7 @@ walidx_frontier_allows(uint32_t timeline, uint64_t lsn)
 {
 	if (timeline >= MAX_TIMELINES)
 		return 0;
-	return lsn >= walidx_reclaimed_frontier[timeline] ||
+	return lsn >= walidx_frontier_current(timeline) ||
 		walidx_frontier_exception_active(timeline, lsn);
 }
 
@@ -3784,17 +3970,26 @@ fork_grow_replay(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 /* --- timeline metadata + read-through --- */
 
 static void
-timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
+timeline_define_incarnation(uint32_t id, int parent, uint64_t branch_lsn,
+							uint64_t incarnation, uint64_t parent_incarnation)
 {
-	if (id >= MAX_TIMELINES)
+	if (id >= MAX_TIMELINES || incarnation == 0 || parent_incarnation == 0)
 		return;
 	timelines[id].parent = parent;
 	timelines[id].branch_lsn = branch_lsn;
-	__atomic_store_n(&timelines[id].incarnation, 1, __ATOMIC_RELEASE);
+	timelines[id].parent_incarnation = parent_incarnation;
+	__atomic_store_n(&timelines[id].incarnation, incarnation, __ATOMIC_RELEASE);
 	__atomic_store_n(&timelines[id].state, PS_TIMELINE_LIVE, __ATOMIC_RELEASE);
+	__atomic_store_n(&timeline_used[id], 0, __ATOMIC_RELEASE);
 	/* Publish the complete definition last.  Readers outside map_lock use the
 	 * acquire load below and can never observe a half-defined branch. */
 	__atomic_store_n(&timelines[id].defined, 1, __ATOMIC_RELEASE);
+}
+
+static void
+timeline_define(uint32_t id, int parent, uint64_t branch_lsn)
+{
+	timeline_define_incarnation(id, parent, branch_lsn, 1, 1);
 }
 
 static int
@@ -3834,6 +4029,21 @@ ps_timeline_live(uint32_t timeline)
 
 	return ps_timeline_state(timeline, &state, NULL) &&
 		state == PS_TIMELINE_LIVE;
+}
+
+int
+ps_timeline_request_allowed(uint32_t timeline, uint64_t expected_incarnation)
+{
+	uint64_t current;
+
+	if (timeline_meta_poisoned_load() || timeline >= MAX_TIMELINES)
+		return 0;
+	if (!__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE))
+		return expected_incarnation == 0; /* legacy pre-metadata import */
+	current = __atomic_load_n(&timelines[timeline].incarnation, __ATOMIC_ACQUIRE);
+	return current != 0 &&
+		(expected_incarnation == current ||
+		 (expected_incarnation == 0 && current == 1));
 }
 
 static int
@@ -4000,6 +4210,21 @@ fork_has_wal_less_page(uint32_t timeline, const PsKey *key)
  * Returns 1 if (new_tl, parent, branch_lsn) can be used for CREATE_BRANCH.
  */
 static int
+branch_parent_chain_ok(uint32_t new_tl, int parent)
+{
+	/* Bound the walk as well as checking the requested id.  This makes replay
+	 * fail closed if a corrupt metadata record has already introduced a cycle. */
+	for (uint32_t steps = 0; steps < MAX_TIMELINES && parent >= 0; steps++)
+	{
+		if (parent >= MAX_TIMELINES || (uint32_t) parent == new_tl ||
+			!timelines[parent].defined)
+			return 0;
+		parent = timelines[parent].parent;
+	}
+	return parent < 0;
+}
+
+static int
 branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 {
 	/*
@@ -4022,13 +4247,79 @@ branch_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn)
 		PS_TIMELINE_LIVE)
 		return 0;
 
-	for (int t = parent; t >= 0 && t < MAX_TIMELINES; t = timelines[t].parent)
+	return branch_parent_chain_ok(new_tl, parent);
+}
+
+static int
+branch_parent_token_ok(int parent, uint64_t expected_incarnation)
+{
+	if (parent < 0 || parent >= MAX_TIMELINES || !timelines[parent].defined ||
+		__atomic_load_n(&timelines[parent].state, __ATOMIC_ACQUIRE) !=
+		PS_TIMELINE_LIVE)
+		return 0;
+	return ps_timeline_request_allowed((uint32_t) parent,
+									 expected_incarnation);
+}
+
+/* Validate both sides of CREATE_BRANCH.  The target token is deliberately
+ * separate from req_seq: req_seq is already the parent token for this op,
+ * while all other requests use it for admission/read fencing. */
+static int
+branch_create_request_ok(uint32_t new_tl, int parent, uint64_t branch_lsn,
+						 uint64_t target_incarnation,
+						 uint64_t parent_incarnation,
+						 uint64_t *new_incarnation)
+{
+	uint64_t current;
+	uint64_t parent_current;
+
+	if (!branch_parent_token_ok(parent, parent_incarnation))
+		return 0;
+	parent_current = __atomic_load_n(&timelines[parent].incarnation,
+								  __ATOMIC_ACQUIRE);
+	if (parent_current == 0)
+		return 0;
+	if (new_tl >= MAX_TIMELINES || new_tl == 0)
+		return 0;
+	if (!branch_parent_chain_ok(new_tl, parent))
+		return 0;
+	if (!timelines[new_tl].defined)
 	{
-		if ((uint32_t) t == new_tl)
-			return 0;			/* cycle */
-		if (!timelines[t].defined)
-			return 0;			/* broken chain: refuse rather than risk a loop */
+		if (target_incarnation != 0 && target_incarnation != 1)
+			return 0;
+		if (!branch_request_ok(new_tl, parent, branch_lsn) ||
+			!branch_frontiers_allow(parent, branch_lsn))
+			return 0;
+		if (new_incarnation)
+			*new_incarnation = 1;
+		return 1;
 	}
+	current = __atomic_load_n(&timelines[new_tl].incarnation, __ATOMIC_ACQUIRE);
+	if (current == 0)
+		return 0;
+	if (__atomic_load_n(&timelines[new_tl].state, __ATOMIC_ACQUIRE) ==
+		PS_TIMELINE_LIVE)
+	{
+		/* Exact metadata retries are the explicitly idempotent case. */
+		if (timelines[new_tl].parent != parent ||
+			timelines[new_tl].branch_lsn != branch_lsn ||
+			timelines[new_tl].parent_incarnation != parent_current ||
+			timeline_is_used(new_tl) || wal_end_read(new_tl) != 0 ||
+			((current > 1 && target_incarnation != current) ||
+			 (current == 1 && target_incarnation != 0 &&
+			  target_incarnation != current)))
+			return 0;
+		if (new_incarnation)
+			*new_incarnation = current;
+		return 1;
+	}
+	if (__atomic_load_n(&timelines[new_tl].state, __ATOMIC_ACQUIRE) !=
+		PS_TIMELINE_DELETED || current == UINT64_MAX ||
+		target_incarnation == 0 || target_incarnation != current + 1 ||
+		!branch_frontiers_allow(parent, branch_lsn))
+		return 0;
+	if (new_incarnation)
+		*new_incarnation = target_incarnation;
 	return 1;
 }
 
@@ -4043,8 +4334,8 @@ branch_frontiers_allow(int parent, uint64_t branch_lsn)
 	{
 		if (!timelines[t].defined ||
 			walidx_frontier_publication_pending((uint32_t) t) ||
-			cap < page_reclaimed_frontier[t].lsn ||
-			(cap < walidx_reclaimed_frontier[t] &&
+			cap < page_frontier_current((uint32_t) t).lsn ||
+			(cap < walidx_frontier_current((uint32_t) t) &&
 			 !walidx_frontier_exception_active((uint32_t) t, cap)))
 			return 0;
 		if (timelines[t].parent >= 0 && cap > timelines[t].branch_lsn)
@@ -4280,9 +4571,27 @@ typedef struct TimelineRecEvent
 	uint32_t state;
 	uint64_t branch_lsn;
 	uint64_t incarnation;
+	uint64_t parent_incarnation;
 	uint32_t crc;
 	uint32_t reserved;
 } TimelineRecEvent;
+
+/* Event records written before parent incarnation was part of the durable
+ * timeline identity.  They remain readable as generation-one ancestry only;
+ * a reused parent must be recreated with the new record shape. */
+typedef struct TimelineRecEventV1
+{
+	uint32_t magic;
+	uint32_t rec_len;
+	uint32_t kind;
+	uint32_t id;
+	int32_t	 parent;
+	uint32_t state;
+	uint64_t branch_lsn;
+	uint64_t incarnation;
+	uint32_t crc;
+	uint32_t reserved;
+} TimelineRecEventV1;
 
 static uint32_t
 timeline_rec_crc(TimelineRecV2 *rec)
@@ -4308,6 +4617,18 @@ timeline_event_crc(TimelineRecEvent *rec)
 	return crc;
 }
 
+static uint32_t
+timeline_event_v1_crc(TimelineRecEventV1 *rec)
+{
+	uint32_t save = rec->crc;
+	uint32_t crc;
+
+	rec->crc = 0;
+	crc = fnv(rec, sizeof(*rec));
+	rec->crc = save;
+	return crc;
+}
+
 static int
 timeline_meta_append(const void *data, uint32_t len)
 {
@@ -4319,7 +4640,8 @@ timeline_meta_append(const void *data, uint32_t len)
 }
 
 static int
-timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn)
+timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn,
+						uint64_t incarnation, uint64_t parent_incarnation)
 {
 	TimelineRecEvent rec;
 
@@ -4331,7 +4653,8 @@ timeline_persist_create(uint32_t id, int parent, uint64_t branch_lsn)
 	rec.parent = (int32_t) parent;
 	rec.state = PS_TIMELINE_LIVE;
 	rec.branch_lsn = branch_lsn;
-	rec.incarnation = 1;
+	rec.incarnation = incarnation;
+	rec.parent_incarnation = parent_incarnation;
 	rec.crc = timeline_event_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
@@ -4355,6 +4678,7 @@ timeline_persist_state(uint32_t id, PsTimelineState state,
 	rec.state = state;
 	rec.branch_lsn = timelines[id].branch_lsn;
 	rec.incarnation = incarnation;
+	rec.parent_incarnation = timelines[id].parent_incarnation;
 	rec.crc = timeline_event_crc(&rec);
 
 	return timeline_meta_append(&rec, sizeof(rec));
@@ -5222,21 +5546,22 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
 					}
 				if (!owns)
 					continue;
-				if (e->timeline >= MAX_TIMELINES ||
-					page_reclaimed_frontier[e->timeline].lsn == 0 ||
-					page_reclaimed_frontier[e->timeline].admission_seq == 0)
+				{
+					PsPruneFence frontier = page_frontier_current(e->timeline);
+
+					if (e->timeline >= MAX_TIMELINES ||
+						frontier.lsn == 0 || frontier.admission_seq == 0)
 				{
 					missing = 1;
 					continue;
 				}
-				if (!have ||
-					page_reclaimed_frontier[e->timeline].lsn < cutoff.lsn ||
-					(page_reclaimed_frontier[e->timeline].lsn == cutoff.lsn &&
-					 page_reclaimed_frontier[e->timeline].admission_seq <
-					 cutoff.admission_seq))
-				{
-					cutoff = page_reclaimed_frontier[e->timeline];
-					have = 1;
+					if (!have || frontier.lsn < cutoff.lsn ||
+						(frontier.lsn == cutoff.lsn &&
+						 frontier.admission_seq < cutoff.admission_seq))
+					{
+						cutoff = frontier;
+						have = 1;
+					}
 				}
 			}
 	if (missing || !have)
@@ -5909,6 +6234,7 @@ load_timelines(void)
 			memcpy(&rec_len, &header[1], sizeof(rec_len));
 			if (magic != TIMELINE_META_V2_MAGIC ||
 				(rec_len != sizeof(TimelineRecV2) &&
+				 rec_len != sizeof(TimelineRecEventV1) &&
 				 rec_len != sizeof(TimelineRecEvent)))
 				return -1;
 			if (rec_len == sizeof(TimelineRecV2))
@@ -5932,6 +6258,89 @@ load_timelines(void)
 				timeline_define(rec.id, rec.parent, rec.branch_lsn);
 				off += sizeof(rec);
 			}
+			else if (rec_len == sizeof(TimelineRecEventV1))
+			{
+				TimelineRecEventV1 rec;
+
+				n = ps_storage->meta_read(off, &rec, sizeof(rec));
+				if (n != (int) sizeof(rec))
+				{
+					if (n >= 0 && ps_storage->meta_truncate &&
+						ps_storage->meta_truncate(off) == 0)
+						break;
+					return -1;
+				}
+				if (rec.magic != TIMELINE_META_V2_MAGIC ||
+					rec.rec_len != sizeof(rec) || rec.reserved != 0 ||
+					rec.crc != timeline_event_v1_crc(&rec) ||
+					rec.id >= MAX_TIMELINES || rec.incarnation == 0 ||
+					rec.state < PS_TIMELINE_LIVE ||
+					rec.state > PS_TIMELINE_DELETED)
+					return -1;
+				if (rec.kind == TIMELINE_META_EVENT_CREATE)
+				{
+					uint64_t parent_incarnation;
+
+					/* Old events predate reusable-parent fencing, so they can
+					 * only inherit the parent's incarnation at replay position. */
+					if (rec.state != PS_TIMELINE_LIVE)
+						return -1;
+					if (rec.parent < 0 || rec.parent >= MAX_TIMELINES ||
+						!timelines[rec.parent].defined)
+						return -1;
+					parent_incarnation = __atomic_load_n(
+						&timelines[rec.parent].incarnation, __ATOMIC_ACQUIRE);
+					if (!branch_parent_token_ok(rec.parent, parent_incarnation))
+						return -1;
+					if (!timelines[rec.id].defined)
+					{
+						if (rec.incarnation != 1 ||
+							!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+							return -1;
+					}
+					else if (__atomic_load_n(&timelines[rec.id].state,
+											 __ATOMIC_ACQUIRE) == PS_TIMELINE_DELETED)
+					{
+						uint64_t old_incarnation =
+							__atomic_load_n(&timelines[rec.id].incarnation,
+											__ATOMIC_ACQUIRE);
+
+						if (old_incarnation == UINT64_MAX ||
+							rec.incarnation != old_incarnation + 1 ||
+							!branch_parent_chain_ok(rec.id, rec.parent))
+							return -1;
+					}
+					else
+						return -1;
+					timeline_define_incarnation(rec.id, rec.parent,
+											rec.branch_lsn, rec.incarnation,
+											parent_incarnation);
+				}
+				else if (rec.kind == TIMELINE_META_EVENT_STATE)
+				{
+					uint32_t old_state;
+
+					if (!timelines[rec.id].defined ||
+						timelines[rec.id].parent != rec.parent ||
+						timelines[rec.id].branch_lsn != rec.branch_lsn ||
+						__atomic_load_n(&timelines[rec.id].incarnation,
+											 __ATOMIC_ACQUIRE) != rec.incarnation)
+						return -1;
+					old_state = __atomic_load_n(&timelines[rec.id].state,
+											__ATOMIC_ACQUIRE);
+					if (!((old_state == PS_TIMELINE_LIVE &&
+							 rec.state == PS_TIMELINE_DELETING) ||
+							(old_state == PS_TIMELINE_DELETING &&
+							 (rec.state == PS_TIMELINE_DELETING ||
+							  rec.state == PS_TIMELINE_DELETED))))
+						return -1;
+					__atomic_store_n(&timelines[rec.id].state, rec.state,
+											 __ATOMIC_RELEASE);
+				}
+				else
+					return -1;
+				off += sizeof(rec);
+			}
 			else
 			{
 				TimelineRecEvent rec;
@@ -5953,10 +6362,39 @@ load_timelines(void)
 				if (rec.kind == TIMELINE_META_EVENT_CREATE)
 				{
 					if (rec.state != PS_TIMELINE_LIVE ||
-						rec.incarnation != 1 || timelines[rec.id].defined ||
-						!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+						rec.incarnation == 0 || rec.parent_incarnation == 0)
 						return -1;
-					timeline_define(rec.id, rec.parent, rec.branch_lsn);
+					if (!timelines[rec.id].defined)
+					{
+						if (rec.incarnation != 1 ||
+							!branch_parent_token_ok(rec.parent,
+												 rec.parent_incarnation) ||
+							!branch_request_ok(rec.id, rec.parent, rec.branch_lsn))
+							return -1;
+						timeline_define_incarnation(rec.id, rec.parent,
+											rec.branch_lsn, rec.incarnation,
+											rec.parent_incarnation);
+					}
+					else if (__atomic_load_n(&timelines[rec.id].state,
+													__ATOMIC_ACQUIRE) == PS_TIMELINE_DELETED)
+					{
+						uint64_t old_incarnation =
+							__atomic_load_n(&timelines[rec.id].incarnation,
+													__ATOMIC_ACQUIRE);
+
+						if (old_incarnation == UINT64_MAX ||
+							rec.incarnation != old_incarnation + 1 ||
+							!branch_parent_token_ok(rec.parent,
+												 rec.parent_incarnation))
+							return -1;
+						if (!branch_parent_chain_ok(rec.id, rec.parent))
+							return -1;
+						timeline_define_incarnation(rec.id, rec.parent,
+											rec.branch_lsn, rec.incarnation,
+											rec.parent_incarnation);
+					}
+					else
+						return -1;
 				}
 				else if (rec.kind == TIMELINE_META_EVENT_STATE)
 				{
@@ -5965,16 +6403,18 @@ load_timelines(void)
 					if (!timelines[rec.id].defined ||
 						timelines[rec.id].parent != rec.parent ||
 						timelines[rec.id].branch_lsn != rec.branch_lsn ||
+						timelines[rec.id].parent_incarnation !=
+							rec.parent_incarnation ||
 						__atomic_load_n(&timelines[rec.id].incarnation,
 																							__ATOMIC_ACQUIRE) != rec.incarnation)
 						return -1;
 					old_state = __atomic_load_n(&timelines[rec.id].state,
 																								__ATOMIC_ACQUIRE);
-					if (rec.state != old_state &&
-								!((old_state == PS_TIMELINE_LIVE &&
-									rec.state == PS_TIMELINE_DELETING) ||
-								  (old_state == PS_TIMELINE_DELETING &&
-									rec.state == PS_TIMELINE_DELETED)))
+					if (!((old_state == PS_TIMELINE_LIVE &&
+								 rec.state == PS_TIMELINE_DELETING) ||
+							(old_state == PS_TIMELINE_DELETING &&
+							 (rec.state == PS_TIMELINE_DELETING ||
+							  rec.state == PS_TIMELINE_DELETED))))
 						return -1;
 					__atomic_store_n(&timelines[rec.id].state, rec.state,
 																								__ATOMIC_RELEASE);
@@ -7067,7 +7507,7 @@ walidx_frontier_publication_pending(uint32_t timeline)
 	pthread_mutex_lock(&walidx_meta_lock);
 	snapshot_end = walidx_snapshot_end[timeline];
 	pthread_mutex_unlock(&walidx_meta_lock);
-	return snapshot_end < walidx_reclaimed_frontier[timeline];
+	return snapshot_end < walidx_frontier_current(timeline);
 }
 
 static void
@@ -7287,9 +7727,9 @@ walidx_purge_timeline(uint32_t tl)
 	walidx_snapshot_cleanup_pending[tl] = 0;
 	memset(&walidx_snapshot_cleanup_retry_at[tl], 0,
 		   sizeof(walidx_snapshot_cleanup_retry_at[tl]));
-	/* Keep walidx_reclaimed_frontier[tl] as the durable old-incarnation fence.
-	 * It lives in a shared metadata file and may be removed only by the later
-	 * crash-safe ID-reuse cutover, never by this private-artifact cleanup. */
+	/* The frontier slots are keyed by incarnation.  Private-artifact cleanup
+	 * resets runtime state only; the old durable slot remains available until a
+	 * later incarnation legitimately takes the ID. */
 	pthread_mutex_unlock(&walidx_meta_lock);
 }
 
@@ -7313,6 +7753,27 @@ wal_runtime_purge(uint32_t tl)
 	wal_covered_off[tl] = 0;
 	wal_covered_valid[tl] = 0;
 	walidx_purge_timeline(tl);
+}
+
+/* The durable DELETED event is the proof that all old-incarnation consumers
+ * have drained and have been removed.  Reinitialize only process-local state
+ * here; the page/WAL reclaimed frontiers remain durable fences for old
+ * horizons and are intentionally not reset on reuse. */
+static void
+timeline_reset_reuse_runtime(uint32_t timeline)
+{
+	page_cleanup_purge_timeline_locked(timeline);
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		if (g_shards[sh].memtable != NULL)
+			ps_memtable_discard_timeline(g_shards[sh].memtable, timeline);
+	ps_pgcache_invalidate_timeline(timeline);
+	wal_runtime_purge(timeline);
+	memset(page_prune_due[timeline], 0, sizeof(page_prune_due[timeline]));
+	__atomic_store_n(&timeline_used[timeline], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&timeline_wal_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&timeline_page_cleanup_done[timeline], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_deletion_cutover_done[timeline], 0,
+						 __ATOMIC_RELEASE);
 }
 
 /* The lifecycle writer has already drained all ordinary requests before the
@@ -8648,7 +9109,7 @@ walidx_snapshot_publish_one(void)
 			}
 			/* Full snapshots grow geometrically with the already snapshotted
 			 * log, bounding retained generations and total rewrite I/O. */
-			if (!invalid && (walidx_snapshot_end[tl] < walidx_reclaimed_frontier[tl] ||
+			if (!invalid && (walidx_snapshot_end[tl] < walidx_frontier_current(tl) ||
 						 walidx_snapshot_reshard_pending[tl] ||
 						 tail >= threshold))
 			{
@@ -8692,7 +9153,7 @@ walidx_snapshot_publish_one(void)
 			walidx_snapshot_start[tl] : wal_log_start(tl);
 		end_lsn = walidx_progress[tl];
 		previous_end = walidx_snapshot_end[tl];
-		frontier_pending = previous_end < walidx_reclaimed_frontier[tl];
+		frontier_pending = previous_end < walidx_frontier_current(tl);
 		pthread_mutex_unlock(&walidx_meta_lock);
 		if (start_lsn == UINT64_MAX ||
 			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
@@ -8711,7 +9172,7 @@ walidx_snapshot_publish_one(void)
 		if (prepared_generation < 0)
 		{
 			if (ps_walidx_snapshot_recover_prepared(directory, tl,
-										 walidx_reclaimed_frontier[tl]) != 0)
+											 walidx_frontier_current(tl)) != 0)
 			{
 				retry = 1;
 				goto publish_done;
@@ -10578,6 +11039,25 @@ recover_layer_prefix(uint32_t shard)
 	 * segments stay fenced from reclamation until filtered rewrite exists. */
 	if (nrec == 0)
 	{
+		int has_recovery_layer = 0;
+
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			if (ps_layer_map.layers[i].kind == PS_LAYER_IMAGE &&
+				!ps_layer_map.layers[i].deleting &&
+				timeline_recovery_allowed(ps_layer_map.layers[i].timeline) &&
+				layer_shard_from_id(ps_layer_map.layers[i].layer_id) == shard)
+			{
+				has_recovery_layer = 1;
+				break;
+			}
+		/* A reused id may be LIVE with no image layer at all: its old layer was
+		 * durably removed before DELETED, while the shard watermark remains a
+		 * global fence that must continue to skip the old segment prefix. */
+		if (!has_recovery_layer)
+		{
+			free(recs);
+			return 0;
+		}
 		if (timeline_delete_recovery_skip())
 		{
 			free(recs);
@@ -10880,7 +11360,8 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 }
 
 static int
-timeline_op_allowed(uint32_t timeline, PsOpcode opcode)
+timeline_op_allowed(uint32_t timeline, PsOpcode opcode,
+					uint64_t expected_incarnation)
 {
 	PsTimelineState state;
 
@@ -10890,23 +11371,37 @@ timeline_op_allowed(uint32_t timeline, PsOpcode opcode)
 	/* Lifecycle control and diagnostics remain available while a timeline is
 	 * deleting.  Branch validation is different: a new target is undefined and
 	 * may be checked, but an existing target must still be LIVE. */
-	if (opcode == PS_OP_BEGIN_DELETE || opcode == PS_OP_TIMELINE_STATE ||
-		opcode == PS_OP_TIMELINE_INFO || opcode == PS_OP_RETENTION_PIN_GET)
+	if (opcode == PS_OP_BEGIN_DELETE || opcode == PS_OP_TIMELINE_STATE)
 		return 1;
+	if (opcode == PS_OP_TIMELINE_INFO)
+	{
+		uint64_t incarnation;
+
+		if (timeline >= MAX_TIMELINES || !timelines[timeline].defined ||
+			__atomic_load_n(&timelines[timeline].state, __ATOMIC_ACQUIRE) !=
+			PS_TIMELINE_LIVE || expected_incarnation == 0)
+			return 0;
+		incarnation = __atomic_load_n(&timelines[timeline].incarnation,
+										 __ATOMIC_ACQUIRE);
+		return incarnation != 0 && expected_incarnation == incarnation;
+	}
 	if (opcode == PS_OP_CREATE_BRANCH || opcode == PS_OP_CHECK_BRANCH)
 	{
-		if (timeline >= MAX_TIMELINES || !ps_timeline_defined(timeline))
-			return 1;
-		return __atomic_load_n(&timelines[timeline].state, __ATOMIC_ACQUIRE) ==
-			PS_TIMELINE_LIVE;
+		/* The target may be undefined, LIVE (an exact idempotent retry), or
+		 * DELETED (the only reusable state).  branch_create_request_ok() fences
+		 * the target and parent tokens in the operation-specific manner. */
+		return timeline < MAX_TIMELINES;
 	}
 	if (opcode == PS_OP_REQUIRE_BRANCH)
-		return ps_timeline_live(timeline);
+		return ps_timeline_live(timeline) &&
+			ps_timeline_request_allowed(timeline, expected_incarnation);
 	if (timeline >= MAX_TIMELINES)
 		return 0;
 	/* Before lifecycle state existed, shipped WAL and page records could arrive
 	 * before ancestry metadata was defined.  Preserve that recovery/import
 	 * behavior: only a durably defined non-LIVE timeline is fenced here. */
+	if (!ps_timeline_request_allowed(timeline, expected_incarnation))
+		return 0;
 	if (!__atomic_load_n(&timelines[timeline].defined, __ATOMIC_ACQUIRE))
 		return 1;
 	state = (PsTimelineState) __atomic_load_n(&timelines[timeline].state,
@@ -10919,7 +11414,7 @@ ps_handle_meta(PsChannel *ch)
 {
 	uint32_t	tl = ch->timeline;
 
-	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode))
+	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
 		return 1;
@@ -11127,23 +11622,48 @@ ps_handle_meta(PsChannel *ch)
 			 * copied -- the branch shares the parent's pages by read-through
 			 * until it writes (copy-on-write).
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn) &&
-				(timelines[ch->timeline].defined ||
-				 branch_frontiers_allow((int) ch->parent_timeline,
-								ch->req_lsn)))
 			{
-				if (timelines[ch->timeline].defined)
+				uint64_t new_incarnation;
+				uint64_t parent_incarnation;
+
+				if (!branch_create_request_ok(ch->timeline,
+										(int) ch->parent_timeline, ch->req_lsn,
+										ch->incarnation, ch->req_seq,
+										&new_incarnation))
+				{
+					ch->status = PS_STATUS_ERROR;
 					break;
-				if (timeline_persist_create(ch->timeline, (int) ch->parent_timeline,
-									ch->req_lsn) == 0)
-					timeline_define(ch->timeline, (int) ch->parent_timeline,
-									ch->req_lsn);
+				}
+				parent_incarnation = __atomic_load_n(
+					&timelines[ch->parent_timeline].incarnation,
+					__ATOMIC_ACQUIRE);
+				if (parent_incarnation == 0)
+				{
+					ch->status = PS_STATUS_ERROR;
+					break;
+				}
+				if (timelines[ch->timeline].defined &&
+					__atomic_load_n(&timelines[ch->timeline].state,
+												__ATOMIC_ACQUIRE) == PS_TIMELINE_LIVE)
+				{
+					ch->incarnation = new_incarnation;
+					break; /* explicitly idempotent exact retry */
+				}
+				if (timeline_persist_create(ch->timeline,
+										(int) ch->parent_timeline, ch->req_lsn,
+										new_incarnation, parent_incarnation) == 0)
+				{
+					if (__atomic_load_n(&timelines[ch->timeline].state,
+												__ATOMIC_ACQUIRE) == PS_TIMELINE_DELETED)
+						timeline_reset_reuse_runtime(ch->timeline);
+					timeline_define_incarnation(ch->timeline,
+											(int) ch->parent_timeline, ch->req_lsn,
+											new_incarnation, parent_incarnation);
+					ch->incarnation = new_incarnation;
+				}
 				else
 					ch->status = PS_STATUS_ERROR;
 			}
-			else
-				ch->status = PS_STATUS_ERROR;
 			break;
 		case PS_OP_CHECK_BRANCH:
 			/*
@@ -11151,11 +11671,9 @@ ps_handle_meta(PsChannel *ch)
 			 * This keeps prepare/retry paths deterministic: invalid requests are
 			 * rejected in-place before any SLRU directory mutation.
 			 */
-			if (branch_request_ok(ch->timeline, (int) ch->parent_timeline,
-								 ch->req_lsn) &&
-				(timelines[ch->timeline].defined ||
-				 branch_frontiers_allow((int) ch->parent_timeline,
-								ch->req_lsn)))
+			if (branch_create_request_ok(ch->timeline,
+										(int) ch->parent_timeline, ch->req_lsn,
+										ch->incarnation, ch->req_seq, NULL))
 			{
 				/* valid */
 			}
@@ -11169,8 +11687,10 @@ ps_handle_meta(PsChannel *ch)
 			 * than CHECK_BRANCH, which also accepts a request that would be legal
 			 * to create.
 			 */
-			if (!branch_exists_with_metadata(ch->timeline,
-											 (int) ch->parent_timeline,
+			if (!branch_parent_token_ok((int) ch->parent_timeline, ch->req_seq) ||
+				!ps_timeline_request_allowed(ch->timeline, ch->incarnation) ||
+				!branch_exists_with_metadata(ch->timeline,
+													 (int) ch->parent_timeline,
 											 ch->req_lsn))
 				ch->status = PS_STATUS_ERROR;
 			break;
@@ -11182,6 +11702,7 @@ ps_handle_meta(PsChannel *ch)
 				ch->result = 1;
 				ch->parent_timeline = (uint32_t) timelines[tl].parent;
 				ch->req_lsn = timelines[tl].branch_lsn;
+				ch->req_seq = timelines[tl].parent_incarnation;
 			}
 			break;
 		case PS_OP_BEGIN_DELETE:
@@ -12859,14 +13380,14 @@ ps_core_open(const char *store_dir)
 
 				if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0 ||
 					ps_walidx_snapshot_recover_prepared(directory, tl,
-									walidx_reclaimed_frontier[tl]) != 0)
+									 walidx_frontier_current(tl)) != 0)
 					return -1;
 			}
 			if (walidx_snapshot_recover(tl) != 0)
 				return -1;
 			for (uint32_t shard = 0; shard < core_shards(); shard++)
-				if (walidx_recover_one(tl, shard) != 0)
-					return -1;
+					if (walidx_recover_one(tl, shard) != 0)
+						return -1;
 		}
 
 	if (publish_shard_count && publish_store_shard_count(store_dir) != 0)

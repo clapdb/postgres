@@ -111,7 +111,7 @@ rm -f "$D/$relfile"*
 # redo worker: now route relations to the store and recover from shipped WAL.
 sed -i 's/^pagestore.route_all = off/pagestore.route_all = on/' "$D/postgresql.conf"
 touch "$D/recovery.signal"
-echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 %f %p'" >> "$D/postgresql.conf"
+echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize 16777216 %f %p'" >> "$D/postgresql.conf"
 rm -f "$D"/pg_wal/0000000*
 
 if "$BIN/pg_ctl" -D "$D" -l "$D/r.log" -w start >/dev/null 2>&1; then
