@@ -40,6 +40,7 @@ extern int	ps_memtable_put(PsMemtable *mt, uint32_t timeline, const PsKey *key,
 
 extern uint32_t ps_memtable_count(const PsMemtable *mt);
 extern int	ps_memtable_full(const PsMemtable *mt);	/* count >= threshold */
+extern int	ps_memtable_has_timeline(const PsMemtable *mt, uint32_t timeline);
 /* Discard staged versions owned by a timeline after BEGIN_DELETE drains writers. */
 extern void ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline);
 

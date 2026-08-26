@@ -211,8 +211,11 @@ publication-crash coverage.  Still required for the gate:
   maintenance now validates and removes each deleting owner's private flat and
   immutable WAL plus WAL-index epochs, watermarks, and snapshots; it also
   atomically filters shared page segments and updates survivor offsets.  Partial
-  deletion resumes after restart while sibling artifacts survive.  SPDK async
-  drain, DELETED publication, and ID reuse remain follow-up work.
+  deletion resumes after restart while sibling artifacts survive.  POSIX
+  maintenance now durably revalidates all deletion consumers and fsyncs the
+  same-incarnation DELETED state event before publishing it in memory; DELETED
+  timelines remain defined, reject normal operations, and reject same-ID
+  creation after restart.  SPDK async drain and ID reuse remain follow-up work.
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.

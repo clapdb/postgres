@@ -196,6 +196,24 @@ ps_pgcache_invalidate_timeline(uint32_t timeline)
 	pthread_mutex_unlock(&cache_lock);
 }
 
+int
+ps_pgcache_has_timeline(uint32_t timeline)
+{
+	int found = 0;
+
+	if (cache_max == 0)
+		return 0;
+	pthread_mutex_lock(&cache_lock);
+	for (uint32_t i = 0; i < cache_max; i++)
+		if (slots[i].valid && slots[i].k.timeline == timeline)
+		{
+			found = 1;
+			break;
+		}
+	pthread_mutex_unlock(&cache_lock);
+	return found;
+}
+
 /* unlink slot s from its hash bucket chain */
 static void
 bucket_remove(int s)

@@ -109,9 +109,12 @@ static int retention_project_lsn(uint32_t descendant, uint32_t target,
 								 uint64_t *lsn);
 static int timeline_has_parent(uint32_t timeline);
 static int timeline_delete_active(void);
+static int timeline_delete_recovery_skip(void);
 static int timeline_recovery_allowed(uint32_t timeline);
 static int timeline_delete_wal_cleanup_one(void);
 static int timeline_delete_page_cleanup_one(void);
+static int timeline_delete_publish_ready(uint32_t timeline);
+static int timeline_delete_publish_one(void);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
 static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
@@ -3847,6 +3850,20 @@ timeline_delete_active(void)
 	return 0;
 }
 
+static int
+timeline_delete_recovery_skip(void)
+{
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		PsTimelineState state;
+
+		if (ps_timeline_state(tl, &state, NULL) &&
+			(state == PS_TIMELINE_DELETING || state == PS_TIMELINE_DELETED))
+			return 1;
+	}
+	return 0;
+}
+
 /* Legacy clients may write page data before creating timeline metadata.  Keep
  * that compatibility path recoverable; only an explicit durable lifecycle
  * state other than LIVE suppresses page/layer reconstruction. */
@@ -5130,6 +5147,17 @@ fork_meta_deletion_records_present_locked(void)
 			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
 				if (e->timeline < MAX_TIMELINES && e->nev != 0 &&
 					fork_meta_timeline_is_deleting(e->timeline))
+					return 1;
+	return 0;
+}
+
+static int
+fork_meta_timeline_records_present_locked(uint32_t target)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (ForkEnt *e = g_shards[sh].fork_idx[bucket]; e; e = e->next)
+				if (e->timeline == target && e->nev != 0)
 					return 1;
 	return 0;
 }
@@ -7399,6 +7427,346 @@ timeline_delete_page_cleanup_one(void)
 		 * from being attempted on the same maintenance tick. */
 	}
 	return 0;
+}
+
+/*
+ * The process-local cleanup bits above are scheduling hints only.  A crash can
+ * erase them, and a test/provider can make an artifact reappear after a bit is
+ * set.  DELETED therefore uses the durable state of every consumer as its
+ * completion proof and re-runs the idempotent physical checks while all
+ * lifecycle/admission/map fences are held.
+ */
+static int
+fork_meta_source_record_valid(const ForkMetaRecV2 *rec)
+{
+	PsKey zero_key;
+	int ordered_marker;
+
+	if (rec->magic != FORK_META_V2_MAGIC || rec->rec_len != sizeof(*rec) ||
+		rec->timeline >= MAX_TIMELINES ||
+		rec->key.klass > PS_KLASS_READER_SNAPSHOT ||
+		rec->pad[0] != 0 || rec->pad[1] != 0 || rec->pad[2] != 0)
+		return 0;
+	ordered_marker = rec->kind >= FEV_SEG_GROW &&
+		rec->kind <= FEV_SEG_COMMIT_BOUND;
+	if (ordered_marker)
+		return fork_meta_ordered_marker_valid(rec, 1);
+	if (rec->kind <= FEV_DEAD)
+		return rec->order_id == 0 &&
+			(rec->kind != FEV_DEAD || rec->nblocks == 0);
+	if (rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED)
+	{
+		memset(&zero_key, 0, sizeof(zero_key));
+		return rec->timeline == 0 && key_eq(&rec->key, &zero_key) &&
+			rec->lsn == 0 && rec->admission_seq == 0 && rec->order_id == 0 &&
+			rec->nblocks == 0;
+	}
+	if (rec->kind == FEV_SNAPSHOT_BASE)
+		return fork_meta_snapshot_marker_matches(rec);
+	return 0;
+}
+
+static int
+fork_meta_source_has_timeline(uint32_t target)
+{
+	uint64_t off = 0;
+
+	for (;;)
+	{
+		uint32_t first;
+		int nread;
+
+		nread = ps_storage->fork_meta_read(off, &first, sizeof(first));
+		if (nread == 0)
+			return 0;
+		if (nread != (int) sizeof(first))
+			return -1;
+		if (first == FORK_META_V2_MAGIC)
+		{
+			ForkMetaRecV2 rec;
+
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread != (int) sizeof(rec) ||
+				!fork_meta_source_record_valid(&rec))
+				return -1;
+			if (rec.timeline == target)
+				return 1;
+			off += sizeof(rec);
+		}
+		else
+		{
+			ForkMetaRecV1 rec;
+
+			nread = ps_storage->fork_meta_read(off, &rec, sizeof(rec));
+			if (nread != (int) sizeof(rec) || rec.timeline >= MAX_TIMELINES ||
+				rec.key.klass > PS_KLASS_READER_SNAPSHOT ||
+				rec.kind > FEV_DEAD ||
+				(rec.kind == FEV_DEAD && rec.nblocks != 0) ||
+				rec.pad[0] != 0 || rec.pad[1] != 0 || rec.pad[2] != 0)
+				return -1;
+			if (rec.timeline == target)
+				return 1;
+			off += sizeof(rec);
+		}
+	}
+}
+
+static int
+fork_meta_snapshot_has_timeline(uint32_t target)
+{
+	PsForkmetaSnapshot snapshot;
+
+	if (fork_meta_snapshot_generation == 0)
+		return 0;
+	if (ps_forkmeta_snapshot_open(&snapshot, fork_meta_snapshot_dir) != 0)
+		return -1;
+	for (unsigned int part = 0; part < 2; part++)
+	{
+		ForkMetaSnapshotPayloadHeader header;
+		uint64_t nrecords;
+		uint64_t record_bytes;
+		uint64_t expected;
+
+		if (ps_forkmeta_snapshot_read(&snapshot, part, 0, &header,
+									 sizeof(header)) != 0 ||
+				header.magic != FORK_META_SNAPSHOT_PAYLOAD_MAGIC ||
+				header.version != FORK_META_SNAPSHOT_PAYLOAD_VERSION ||
+				header.header_bytes != sizeof(header) || header.part != part ||
+				header.record_bytes != sizeof(ForkMetaRecV2) ||
+				header.generation != snapshot.generation ||
+				header.cutoff_lsn != snapshot.cutoff_lsn ||
+				header.cutoff_admission_seq != snapshot.cutoff_admission_seq ||
+				header.freeze_admission_seq == 0)
+			goto fail;
+		nrecords = part == FORK_META_SNAPSHOT_CHECKPOINT ?
+			header.checkpoint_records : header.tail_records;
+		if (nrecords > UINT64_MAX / sizeof(ForkMetaRecV2))
+			goto fail;
+		record_bytes = nrecords * sizeof(ForkMetaRecV2);
+		if (header.checkpoint_records > UINT64_MAX / sizeof(ForkMetaRecV2) ||
+			header.tail_records > UINT64_MAX / sizeof(ForkMetaRecV2) ||
+			header.checkpoint_bytes !=
+				header.checkpoint_records * sizeof(ForkMetaRecV2) ||
+			header.tail_bytes != header.tail_records * sizeof(ForkMetaRecV2) ||
+			record_bytes > UINT64_MAX - sizeof(header))
+			goto fail;
+		expected = sizeof(header) + record_bytes;
+		if (snapshot.checkpoint.len != expected &&
+			part == FORK_META_SNAPSHOT_CHECKPOINT)
+			goto fail;
+		if (snapshot.tail.len != expected && part == FORK_META_SNAPSHOT_TAIL)
+			goto fail;
+		for (uint64_t i = 0; i < nrecords; i++)
+		{
+			ForkMetaRecV2 rec;
+
+			if (ps_forkmeta_snapshot_read(&snapshot, part,
+									 sizeof(header) + i * sizeof(rec), &rec,
+									 sizeof(rec)) != 0 ||
+				!fork_meta_source_record_valid(&rec) ||
+				!fork_meta_snapshot_record_valid(&rec, 0, part,
+					(PsPruneFence) {snapshot.cutoff_lsn,
+					 snapshot.cutoff_admission_seq}))
+				goto fail;
+			if (rec.timeline == target)
+			{
+				ps_forkmeta_snapshot_close(&snapshot);
+				return 1;
+			}
+		}
+	}
+	ps_forkmeta_snapshot_close(&snapshot);
+	return 0;
+
+fail:
+	ps_forkmeta_snapshot_close(&snapshot);
+	return -1;
+}
+
+static int
+fork_meta_deletion_durable_complete(uint32_t target)
+{
+	int rc;
+
+	rc = fork_meta_source_has_timeline(target);
+	if (rc != 0)
+		return 0;
+	rc = fork_meta_snapshot_has_timeline(target);
+	return rc == 0;
+}
+
+static int
+walidx_runtime_has_timeline(uint32_t target)
+{
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		for (uint32_t bucket = 0; bucket < IDX_BUCKETS; bucket++)
+			for (WalIdxEnt *entry = g_shards[sh].walidx[bucket]; entry;
+				 entry = entry->next)
+				if (entry->timeline == target)
+					return 1;
+	return 0;
+}
+
+/* Caller holds lifecycle-write, admission-write, every shard-write, both
+ * pruning fences, the WAL-index publication gate, the target WAL lock, and
+ * map-write. */
+static int
+timeline_delete_publish_ready(uint32_t timeline)
+{
+	PsTimelineState state;
+	int page_rc;
+
+	if (!ps_timeline_state(timeline, &state, NULL) ||
+		state != PS_TIMELINE_DELETING || timeline_meta_poisoned_load() ||
+		ps_manifest_poisoned() || fork_meta_poisoned_load())
+		return 0;
+	/* A missing capability is never interpreted as an empty consumer.  In
+	 * particular this keeps SPDK's NULL same-id rewrite fail-closed. */
+	if (ps_storage->meta_append == NULL || ps_storage->fork_meta_read == NULL ||
+		ps_storage->fork_meta_rewrite == NULL ||
+		ps_storage->timeline_wal_cleanup == NULL ||
+		ps_storage->seg_read == NULL || ps_storage->seg_size == NULL ||
+		ps_storage->seg_rewrite == NULL ||
+		(use_layers && (ps_layer_store == NULL ||
+			ps_layer_store->layer_exists_local == NULL ||
+			ps_layer_store->delete_local_layer == NULL ||
+			ps_layer_store->delete_remote_layer == NULL ||
+			ps_layer_store->remote_uri == NULL ||
+			(ps_layer_store->verify_remote_layer == NULL &&
+			 ps_layer_store->layer_exists_remote == NULL))))
+		return 0;
+	/* No asynchronous layer publication or retry may still own a copied target
+	 * descriptor when the lifecycle state becomes terminal. */
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0 ||
+		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 ||
+		__atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE) != 0 ||
+		fork_meta_snapshot_gc_pending)
+		return 0;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		if (ps_layer_map.layers[i].timeline == timeline)
+			return 0;
+	/* Revalidate physical private WAL state even when its process-local done bit
+	 * says it was already handled.  The callback is idempotent and fail-closed. */
+	if (ps_storage->timeline_wal_cleanup(timeline) != 0 ||
+		wal_segment_store_opened[timeline] || wal_chunks[timeline] != NULL ||
+		wal_chunks_n[timeline] != 0 || wal_chunks_cap[timeline] != 0 ||
+		wal_log_bytes[timeline] != 0 || wal_end_read(timeline) != 0 ||
+		wal_start_valid[timeline] || wal_covered_valid[timeline] ||
+		walidx_runtime_has_timeline(timeline))
+		return 0;
+	if (__atomic_load_n(&walidx_snapshot_cleanup_pending[timeline],
+							__ATOMIC_ACQUIRE) || walidx_snapshot_gc_pending[timeline] ||
+		walidx_progress_valid[timeline] || walidx_progress[timeline] != 0 ||
+		walidx_snapshot_generation[timeline] != 0 ||
+		walidx_snapshot_start[timeline] != 0 ||
+		walidx_snapshot_end[timeline] != 0 || walidx_snapshot_bytes[timeline] != 0)
+		return 0;
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		if (walidx_log_epoch[timeline][sh] != 0 ||
+			walidx_snapshot_offsets[timeline][sh] != 0 ||
+			walidx_shard_offsets_seen[timeline][sh] != 0 ||
+			walidx_shard_offsets_required[timeline][sh] != 0)
+			return 0;
+	/* The filtered rewrite is itself the durable shared-segment predicate.  If a
+	 * late/recovered target record is found, schedule another retry and do not
+	 * trust the old done bit. */
+	page_rc = page_cleanup_scan_timeline_locked(timeline);
+	if (page_rc != 0)
+	{
+		__atomic_store_n(&timeline_page_cleanup_done[timeline], 0,
+						 __ATOMIC_RELEASE);
+		return 0;
+	}
+	/* This is a mandatory durable-consumer gate.  Runtime state may already be
+	 * empty after a restart, but that cannot substitute for proving that neither
+	 * the current forkmeta source nor its selected snapshot can resurrect the
+	 * target incarnation. */
+	if (!fork_meta_deletion_durable_complete(timeline))
+		return 0;
+	/* A restart can lose the cutover bit after the durable forkmeta source and
+	 * selected snapshot have already been filtered.  The remaining page/fork
+	 * indexes, memtables, and cache entries are runtime state, so remove them
+	 * under the same fences rather than treating the lost bit as proof that the
+	 * durable consumer is incomplete. */
+	if (page_cleanup_has_index_entries_locked(timeline) ||
+		 fork_meta_timeline_records_present_locked(timeline) ||
+		 ps_pgcache_has_timeline(timeline))
+	{
+		page_cleanup_purge_timeline_locked(timeline);
+		for (uint32_t sh = 0; sh < core_shards(); sh++)
+			ps_memtable_discard_timeline(g_shards[sh].memtable, timeline);
+		ps_pgcache_invalidate_timeline(timeline);
+		__atomic_store_n(&timeline_page_cleanup_done[timeline], 1,
+						 __ATOMIC_RELEASE);
+	}
+	if (page_cleanup_has_index_entries_locked(timeline) ||
+		fork_meta_timeline_records_present_locked(timeline) ||
+		ps_pgcache_has_timeline(timeline))
+		return 0;
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		if (ps_memtable_has_timeline(g_shards[sh].memtable, timeline))
+			return 0;
+	return 1;
+}
+
+static int
+timeline_delete_publish_one(void)
+{
+	int did = 0;
+
+	/* A maintenance call may have just handed work to an asynchronous worker.
+	 * Do not queue the lifecycle writer from that same foreground call: the
+	 * worker still owns a lifecycle-read reservation and needs the caller to
+	 * return so it can finish.  The next maintenance pass joins/reaps it and
+	 * retries publication. */
+	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) == 1 ||
+		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) == 1 ||
+		__atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE) == 1)
+		return 0;
+
+	if (ps_lifecycle_write_lock() != 0)
+		return 0;
+	if (ps_admission_write_lock() != 0)
+	{
+		ps_lifecycle_write_unlock();
+		return 0;
+	}
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_wr(sh);
+	pthread_rwlock_wrlock(&page_prune_lock);
+	pthread_rwlock_wrlock(&walidx_prune_lock);
+	walidx_publish_wrlock();
+	for (uint32_t tl = 1; tl < MAX_TIMELINES && !did; tl++)
+	{
+		pthread_rwlock_t *wal_lock;
+		uint64_t incarnation;
+
+		if (!ps_timeline_state(tl, NULL, &incarnation))
+			continue;
+		wal_lock = wal_log_lock_for(tl);
+		if (wal_lock == NULL)
+			continue;
+		pthread_rwlock_wrlock(wal_lock);
+		ps_lock_map_wr();
+		if (timeline_delete_publish_ready(tl) &&
+			timeline_persist_state(tl, PS_TIMELINE_DELETED, incarnation) == 0)
+		{
+			/* The append is fsync-durable before this release publication. */
+			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
+							 __ATOMIC_RELEASE);
+			did = 1;
+		}
+		ps_unlock_map();
+		pthread_rwlock_unlock(wal_lock);
+	}
+	walidx_publish_wrunlock();
+	pthread_rwlock_unlock(&walidx_prune_lock);
+	pthread_rwlock_unlock(&page_prune_lock);
+	for (uint32_t sh = core_shards(); sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	return did;
 }
 
 /* Keep each hash chain canonical so a fixed-size heap can merge the chains
@@ -10210,7 +10578,7 @@ recover_layer_prefix(uint32_t shard)
 	 * segments stay fenced from reclamation until filtered rewrite exists. */
 	if (nrec == 0)
 	{
-		if (timeline_delete_active())
+		if (timeline_delete_recovery_skip())
 		{
 			free(recs);
 			return 0;
@@ -12119,6 +12487,11 @@ ps_core_maintenance(void)
 	ps_lifecycle_read_lock();
 	did = ps_core_maintenance_impl();
 	ps_lifecycle_read_unlock();
+	/* A terminal lifecycle transition cannot upgrade the read section held by
+	 * the maintenance body.  Retry readiness under the exclusive lifecycle
+	 * writer fence after all ordinary/background work has drained. */
+	if (timeline_delete_publish_one())
+		did = 1;
 	return did;
 }
 
@@ -12469,7 +12842,8 @@ ps_core_open(const char *store_dir)
 			 * maintenance cleanup owns the retry and the tombstone remains
 			 * DELETING throughout. */
 			if (ps_timeline_state(tl, &timeline_state, NULL) &&
-				timeline_state == PS_TIMELINE_DELETING)
+				(timeline_state == PS_TIMELINE_DELETING ||
+				 timeline_state == PS_TIMELINE_DELETED))
 				continue;
 			if (wal_recover_one(tl) != 0)
 				return -1;
