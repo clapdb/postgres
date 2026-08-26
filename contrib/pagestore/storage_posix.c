@@ -17,6 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1234,6 +1235,61 @@ posix_all_digits(const char *begin, const char *end)
 	return 1;
 }
 
+/* The writer formats these fields with the ordinary non-negative decimal form.
+ * Keep the cleanup matcher equally narrow: a stale name is harmless only if
+ * it is exactly a name this producer could have created. */
+static int
+posix_canonical_decimal(const char *begin, const char *end,
+						unsigned long long max, unsigned long long *value)
+{
+	unsigned long long parsed = 0;
+	char canonical[32];
+	int n;
+
+	if (begin == end || (end - begin > 1 && *begin == '0'))
+		return 0;
+	for (const char *p = begin; p < end; p++)
+	{
+		unsigned int digit;
+
+		if (*p < '0' || *p > '9')
+			return 0;
+		digit = (unsigned int) (*p - '0');
+		if (digit > max || parsed > (max - digit) / 10)
+			return 0;
+		parsed = parsed * 10 + digit;
+	}
+	n = snprintf(canonical, sizeof(canonical), "%llu", parsed);
+	if (n < 0 || (size_t) n != (size_t) (end - begin) ||
+		memcmp(begin, canonical, (size_t) n) != 0)
+		return 0;
+	if (value != NULL)
+		*value = parsed;
+	return 1;
+}
+
+static int
+posix_canonical_pid(const char *begin, const char *end)
+{
+	unsigned long long parsed;
+	pid_t pid;
+	char canonical[32];
+	int n;
+
+	/* The producer casts getpid() to long before formatting it.  Round-trip
+	 * through pid_t and long so cleanup accepts the producer's actual domain,
+	 * rather than every value accepted by an arbitrary integer parser. */
+	if (!posix_canonical_decimal(begin, end, (unsigned long long) LONG_MAX,
+								&parsed))
+		return 0;
+	pid = (pid_t) parsed;
+	if (pid <= 0 || (long) pid != (long) parsed)
+		return 0;
+	n = snprintf(canonical, sizeof(canonical), "%ld", (long) pid);
+	return n >= 0 && (size_t) n == (size_t) (end - begin) &&
+		memcmp(begin, canonical, (size_t) n) == 0;
+}
+
 static int
 posix_alnum6(const char *name)
 {
@@ -1303,9 +1359,9 @@ posix_timeline_walidx_entry(uint32_t tl, const char *name)
 		const char *dot = strchr(q, '.');
 		size_t base_len;
 
-		if (dot == NULL || !posix_all_digits(q, dot) ||
-			!posix_all_digits(dot + 1, name + strlen(name)) ||
-			dot == q || dot[1] == '\0')
+		if (dot == NULL || !posix_canonical_pid(q, dot) ||
+			!posix_canonical_decimal(dot + 1, name + strlen(name), 127,
+										NULL))
 			return -1;
 		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
 						  canonical, sizeof(canonical)) != 0)

@@ -1373,30 +1373,56 @@ test_deleting_timeline_wal_cleanup(void)
 		  fixture_file(store, "wal_2") && fixture_dir(store, "wal_segments_2") &&
 		  fixture_file(store, "wal_segments_2/foreign") &&
 		  fixture_file(store,
-				   "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
-		  "install unknown target-private artifact");
+					   "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
+		  "install non-canonical base/shard artifact");
 	check(ps_core_maintenance() == 0 && fixture_exists(store, "wal_2") &&
 		  fixture_exists(store, "wal_segments_2/foreign") &&
 		  fixture_exists(store,
 					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
-		  "unknown private entry fails closed before partial cleanup");
+		  "non-canonical base/shard artifact fails closed before partial cleanup");
 	check(fixture_path(path, sizeof(path), store, "wal_segments_2/foreign") &&
 		  unlink(path) == 0 && ps_core_maintenance() == 0 &&
 		  fixture_exists(store, "wal_2") &&
 		  fixture_exists(store,
 					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
-		  "non-canonical WAL-index temporary fails closed");
+		  "non-canonical base/shard artifact remains fail-closed");
 	check(create_branch(4, 0, 300) && begin_delete(4, 1, NULL) &&
 		  fixture_file(store, "wal_4") && ps_core_maintenance() == 1 &&
-		  !fixture_exists(store, "wal_4"),
-		  "a failed timeline does not starve a later cleanup retry");
-	check(
-		  fixture_path(path, sizeof(path), store,
+		  !fixture_exists(store, "wal_4") && fixture_exists(store, "wal_2") &&
+		  fixture_exists(store,
+					 "walidx_2_00_e00000000000000000001.size.tmp.123.0"),
+		  "a blocked timeline does not starve a later cleanup");
+	check(fixture_path(path, sizeof(path), store,
 					   "walidx_2_00_e00000000000000000001.size.tmp.123.0") &&
-		  unlink(path) == 0 && ps_core_maintenance() == 1 &&
-		  !fixture_exists(store, "wal_2") &&
-		  !fixture_exists(store, "wal_segments_2"),
-		  "cleanup retries after unknown entry is reconciled");
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.01.999") &&
+		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+		  "non-canonical watermark temporary fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.01.999") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.123.128") &&
+		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+		  "out-of-range watermark attempt fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.123.128") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.999999999999999999999999.0") &&
+		  ps_core_maintenance() == 0 && fixture_exists(store, "wal_2"),
+		  "overflowed watermark PID fails closed");
+	check(fixture_path(path, sizeof(path), store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.999999999999999999999999.0") &&
+		  unlink(path) == 0 &&
+		  fixture_file(store,
+					   "walidx_2_0_e00000000000000000001.size.tmp.123.127"),
+		  "maximum watermark attempt is canonical");
+	check(ps_core_maintenance() == 1 && !fixture_exists(store, "wal_2"),
+		  "canonical watermark temporary is removable");
+	check(!fixture_exists(store, "wal_segments_2"),
+		  "target-private cleanup leaves no immutable directory");
 	check(create_branch(5, 0, 400) && begin_delete(5, 1, NULL) &&
 		  fixture_dir(store, "wal_segments_5") &&
 		  fixture_file(store, "wal_segments_5/wal_store_identity_v1") &&
