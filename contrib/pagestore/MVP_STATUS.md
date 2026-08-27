@@ -45,7 +45,7 @@ new daemon's zeroing/recovery window.
 | Image-layer path | Functional mechanisms implemented; phases 2–3 partial | manifest/compaction/segment-GC restart tests; sparse indexes and layer-block cache invalidation remain |
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
-| WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
+| WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; the flat-log copy of every complete sealed record is reclaimed, while the flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index plus crash-safe replacement-chain compaction, durable timeline frontier, multi-shard snapshot/log-epoch cutover, and old generation/epoch GC implemented | WAL redo demos plus discrete/operational chain pruning, frontier admission/restart/corruption/crash tests, snapshot publication, generation/epoch GC, and tail replay |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
@@ -199,7 +199,14 @@ pins from timeline metadata rather than duplicating them, and folds every
 branch-visible restorable control image into the WAL resource.  Page compaction
 consumes exact tuple fences, publishes its durable frontier before source
 retirement, and has bounded-churn, relation-lifecycle, descendant, and
-publication-crash coverage.  Still required for the gate:
+publication-crash coverage.  The first R3b retained-base foundation is now
+present in the standalone WAL store: its v2 identity durably records and
+checksums the physical directory start, retained base, and append end; reopen
+validates those values against a complete contiguous segment directory; old v1
+identities migrate only after that validation; and callers can monotonically
+advance the retained base with atomic metadata publication.  This slice does
+not unlink immutable segments, reclaim flat WAL, or alter retention cutoff
+policy.  Still required for the gate:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;

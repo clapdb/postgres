@@ -2,6 +2,7 @@
 #define PAGESTORE_WAL_STORE_H
 
 #include <stdint.h>
+#include <pthread.h>
 
 #include "pagestore_wal_segment.h"
 
@@ -13,6 +14,9 @@ typedef struct PsWalStoreEntry
 } PsWalStoreEntry;
 
 #define PS_WAL_STORE_VERIFY_CHUNK_BYTES (64u * 1024u)
+/* Keep the path stable so existing timeline directories remain discoverable.
+ * The contents are PSWALSTORE2; PSWALSTORE1 is accepted only long enough to
+ * validate the directory and migrate it atomically. */
 #define PS_WAL_STORE_IDENTITY_FILE "wal_store_identity_v1"
 
 typedef struct PsWalStore
@@ -21,9 +25,16 @@ typedef struct PsWalStore
 	uint32_t	timeline;
 	uint32_t	segment_size;
 	uint64_t	next_segment_no;
+	/* First segment still needed by the logical store.  Older, already
+	 * authorized segments may remain on disk until a later reclaimer unlinks
+	 * them. */
 	uint64_t	start_lsn;
+	uint64_t	retained_base_lsn;
 	uint64_t	end_lsn;
 	int			directory_fd;
+	int			metadata_fenced;
+	pthread_mutex_t lock;
+	int			lock_initialized;
 	PsWalStoreEntry *entries;
 	uint32_t	nentries;
 	uint32_t	capacity;
@@ -38,14 +49,25 @@ extern int ps_wal_store_open(PsWalStore *store, const char *directory,
 							 uint32_t segment_size);
 /* Read the durable store identity and validate the full immutable store.  This
  * is used after the duplicate flat-log prefix no longer records the immutable
- * store's original start LSN. */
+ * store's original start LSN.  Suffix reconciliation assumes this is a private
+ * single-writer directory managed by timeline/incarnation cleanup: only
+ * ps_wal_store_append/publish_segment can create a legal contiguous final
+ * segment, so a valid contiguous suffix represents a pre-metadata crash. */
 extern int ps_wal_store_open_existing(PsWalStore *store, const char *directory,
 								  uint32_t timeline, uint32_t segment_size);
 /* Append one or more complete, segment-aligned immutable WAL segments. */
 extern int ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
-							   const void *data, uint32_t len);
+								   const void *data, uint32_t len);
+/* Return the durable logical floor.  Invalid, unopened, or fenced stores fail
+ * without writing *out; this never removes an immutable file. */
+extern int ps_wal_store_retained_base(PsWalStore *store, uint64_t *out);
+/* Atomically publish a segment-aligned, monotonic logical floor. */
+extern int ps_wal_store_advance_retained_base(PsWalStore *store,
+									  uint64_t retained_base_lsn);
 extern int ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
-							 void *data, uint32_t len);
+								 void *data, uint32_t len);
+/* The caller must externally prevent concurrent operations and retain the
+ * store object's lifetime until all other API calls have returned. */
 extern void ps_wal_store_close(PsWalStore *store);
 
 #endif

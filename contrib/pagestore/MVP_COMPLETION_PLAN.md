@@ -276,9 +276,9 @@ Expected scope: one implementation PR and, if needed, one fault-test PR.
 ### R3. Reclaim shipped WAL
 
 Status: **R3a immutable segment/store primitives and live-path integration are
-implemented.  R3b now reclaims the flat-log copy of every complete record
-already sealed immutable; durable retained-base publication and immutable
-segment reclamation remain**.
+implemented.  The live path reclaims the flat-log copy of every complete sealed
+record; the first R3b slice supplies the durable retained-base foundation, while
+immutable-segment reclamation remains**.
 
 The transition path accepts the existing arbitrary-size archive IPC chunks in
 the flat staging log, seals every complete contiguous segment-aligned 1 MiB
@@ -302,7 +302,12 @@ bytes, so reclaim cannot reopen a divergent-history window.  Concurrent reads
 either finish on the old inode/offset catalog or begin on the new pair.
 
 This bounds the duplicate flat staging tail but deliberately does not advance a
-logical WAL frontier or unlink an immutable segment.  The compacted WAL index
+logical WAL frontier or unlink an immutable segment.  The first R3b slice adds a
+checksummed v2 identity carrying the physical directory start, retained base,
+and append end, validates that tuple against the complete contiguous directory
+on reopen, migrates the old v1 identity only after validation, and exposes a
+monotonic atomic retained-base advance.  It does not reclaim any file or change
+the retention cutoff policy.  The compacted WAL index
 still names FPI records in raw WAL; until those FPIs are published as independent
 replacement page bases, their immutable WAL segments remain reconstruction
 dependencies.  The next reclamation phase must remove that dependency, publish
@@ -841,8 +846,10 @@ causes unbounded copy cost and a larger crash-publication protocol.
 Decision: **accepted 2026-08-14**.  Use immutable fixed-size logical WAL
 segments with checksummed metadata and bounded chunk validation.  The segment
 store is integrated into daemon append/read/recovery with the flat log retained
-as migration/tail authority.  R3b will add retained-base publication, read
-pins, segment deletion, and reclamation of the corresponding flat prefix.
+as migration/tail authority.  The first R3b slice supplies the durable
+retained-base metadata and monotonic publication primitive; later R3b slices
+must add read pins, segment deletion, and reclamation of the corresponding
+flat prefix.
 
 ### D4. Timeline deletion with descendants
 
@@ -876,7 +883,7 @@ packaging do not block MVP completion.
 
 The remaining default sequence is:
 
-1. R3b WAL reclaimer, now enabled by replacement-base compaction;
+1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction;
 2. R4b forkmeta compaction/reclamation and publication crash tests;
 3. R5 timeline deletion;
 4. R5b reclaimer backpressure controllers;
@@ -902,6 +909,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-26 | Added R5 deletion-filtered forkmeta cutover: explicit DELETING owners are omitted from checkpoint, tail, and rewritten source while live and pre-metadata owners survive | Forced/ordinary generation, marker-only owner, multi-delete, restart, rewrite-failure, and existing crash-matrix coverage |
 | 2026-08-26 | Added R5 owner-scoped POSIX WAL cleanup for DELETING timelines: flat/immutable WAL and WAL-index logs/snapshots are validated, durably removed, and purged from runtime state without publishing DELETED | Focused normal/fail-closed/restart/sibling tests plus WAL, snapshot, forkmeta crash, and 1998-check standalone coverage; shared page segments remain |
 | 2026-08-26 | Added R5 durable DELETED publication and incarnation-aware numeric-ID reuse: the same-incarnation DELETED event is fsynced after owner-scoped cleanup, and CREATE_BRANCH admits only the exact next token after runtime reset | Focused normal/ASan publication, immediate same-horizon reuse, stale-token/parent fencing, restart, repeated-cycle, sibling-safety, and ambiguous-append coverage; SPDK async drain remains fail-closed |
+| 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Final focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |
