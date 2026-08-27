@@ -171,7 +171,7 @@ archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $RPORT
 hot_standby = on
-restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize 16777216 %f %p'
 EOF
 # Standby mode keeps retrying restore_command when it reaches the current end of
 # the archive; recovery.signal alone would promote as soon as WAL is exhausted.

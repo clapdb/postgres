@@ -30,6 +30,7 @@ header_valid(const PsShmHeader *hdr)
 {
 	return hdr->magic == PS_SHM_MAGIC &&
 		hdr->version == PS_SHM_VERSION &&
+		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
 		hdr->page_size != 0 && hdr->page_size <= PS_IO_UNIT &&
 		hdr->io_unit == PS_IO_UNIT &&
 		hdr->nchannels != 0 && hdr->nchannels <= PS_MAX_CHANNELS &&

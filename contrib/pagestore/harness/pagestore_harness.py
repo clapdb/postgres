@@ -429,6 +429,16 @@ def pagestore_import_command(
     ]
 
 
+def pagestore_control_restore_command(
+    restore: Path, shm: str, timeline: int, incarnation: int,
+    read_lsn: str, data: Path,
+) -> list[str]:
+    return [
+        str(restore), "--shm", shm, "--timeline", str(timeline),
+        "--incarnation", str(incarnation), "--lsn", read_lsn, str(data),
+    ]
+
+
 def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
     profile = runtime_capabilities(capabilities, runtime)
     for field in ("protocol_version", "page_size", "io_unit"):
@@ -1656,7 +1666,16 @@ CREATE OR REPLACE FUNCTION pagestore_validate_reader_manifest(text, int, pg_lsn)
                 shutil.copytree(seed, reader_data)
                 lsn = checkpoints[ref[1:]]["redo_lsn"]
                 assert control_restore is not None
-                subprocess.run([str(control_restore), "--shm", shm, "--timeline", "0", "--lsn", lsn, str(reader_data)], check=True, capture_output=True, encoding="utf-8", env=env)
+                # The harness reader fixture is rooted at timeline 0,
+                # incarnation 1.  Pass that immutable identity explicitly;
+                # control_restore must never infer it from mutable daemon
+                # state.
+                subprocess.run(
+                    pagestore_control_restore_command(
+                        control_restore, shm, 0, 1, lsn, reader_data,
+                    ),
+                    check=True, capture_output=True, encoding="utf-8", env=env,
+                )
                 setup = """CREATE OR REPLACE FUNCTION pagestore_install_prepared_reader(text, text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_install_prepared_reader' LANGUAGE C STRICT;
 CREATE OR REPLACE FUNCTION pagestore_mark_reader_catalog_snapshot(text, int, pg_lsn) RETURNS void AS 'pagestore','pagestore_mark_reader_catalog_snapshot' LANGUAGE C STRICT;"""
                 subprocess.run([str(pg_bin / "psql"), "-h", str(sockdir), "-p", str(port), "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-c", setup], check=True, capture_output=True, encoding="utf-8", env=env)
@@ -2045,7 +2064,7 @@ def run_materializer_smoke(
         restore_shm = str(shm).replace("%", "%%")
         restore_command = (
             f"{shlex.quote(restore_program)} --shm {shlex.quote(restore_shm)} "
-            "--timeline 0 --segsize 16777216 %f %p"
+            "--timeline 0 --incarnation 1 --segsize 16777216 %f %p"
         )
         restore_command_setting = postgresql_conf_string(restore_command)
         with (materializer_data / "postgresql.conf").open(

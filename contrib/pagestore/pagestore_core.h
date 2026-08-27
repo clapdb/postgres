@@ -175,6 +175,10 @@ extern int ps_timeline_defined(uint32_t timeline);
 extern int ps_timeline_state(uint32_t timeline, PsTimelineState *state,
 							 uint64_t *incarnation);
 extern int ps_timeline_live(uint32_t timeline);
+/* Validate the per-request incarnation fence.  A zero token is retained for
+ * legacy compatibility only while the current incarnation is 1. */
+extern int ps_timeline_request_allowed(uint32_t timeline,
+										 uint64_t expected_incarnation);
 
 /* Shard index that will be touched for 'key' (klass-aware); the frontend takes
  * the per-shard lock from the final request key, not a client-supplied shard. */
