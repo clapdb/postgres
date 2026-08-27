@@ -61,9 +61,16 @@ extern int ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 /* Return the durable logical floor.  Invalid, unopened, or fenced stores fail
  * without writing *out; this never removes an immutable file. */
 extern int ps_wal_store_retained_base(PsWalStore *store, uint64_t *out);
-/* Atomically publish a segment-aligned, monotonic logical floor. */
+/* Atomically publish a segment-aligned, monotonic logical floor.  This is a
+ * logical retention operation only; it never authorizes physical deletion. */
 extern int ps_wal_store_advance_retained_base(PsWalStore *store,
 									  uint64_t retained_base_lsn);
+/* Publish the logical/physical frontier, then reclaim only immutable segments
+ * strictly below target_lsn.  The store mutex drains readers and bars new
+ * below-frontier reads for the whole operation.  A successful call is the
+ * only WAL-store API that authorizes prefix unlink. */
+extern int ps_wal_store_reclaim_prefix(PsWalStore *store,
+								   uint64_t target_lsn);
 extern int ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 								 void *data, uint32_t len);
 /* The caller must externally prevent concurrent operations and retain the

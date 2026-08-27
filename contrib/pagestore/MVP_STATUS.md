@@ -199,14 +199,30 @@ pins from timeline metadata rather than duplicating them, and folds every
 branch-visible restorable control image into the WAL resource.  Page compaction
 consumes exact tuple fences, publishes its durable frontier before source
 retirement, and has bounded-churn, relation-lifecycle, descendant, and
-publication-crash coverage.  The first R3b retained-base foundation is now
-present in the standalone WAL store: its v2 identity durably records and
-checksums the physical directory start, retained base, and append end; reopen
-validates those values against a complete contiguous segment directory; old v1
-identities migrate only after that validation; and callers can monotonically
-advance the retained base with atomic metadata publication.  This slice does
-not unlink immutable segments, reclaim flat WAL, or alter retention cutoff
-policy.  Still required for the gate:
+publication-crash coverage.  R3b-1 is present in the standalone WAL store: its
+v2 identity durably records and checksums the physical directory start, retained
+base, and append end; reopen validates those values against a complete
+contiguous segment directory; old v1 identities migrate only after that
+validation; and callers can monotonically advance the logical retained base
+without deletion authority.  R3b-2 adds the standalone
+`ps_wal_store_reclaim_prefix()` primitive.  It publishes retained-base and
+physical-start frontiers atomically under the WAL mutex before unlinking only
+segments below an aligned target; the mutex drains in-flight reads and blocks
+new below-frontier reads, partial unlink keeps the memory catalog aligned with
+successful unlink calls, and ambiguous directory fsync fences until reopen.
+Reopen validates the authorized suffix and can retry residual prefix files
+idempotently.  Residual candidates are fully enumerated and validated before
+any unlink, sorted in ascending order, and required to form the contiguous
+suffix immediately below the target.  The main catalog path likewise validates
+each complete header, length, and payload CRC immediately before unlink; a
+corrupt low catalog segment deletes nothing, while a corrupt middle segment may
+delete only the already validated lower prefix and never the corrupt or higher
+segments.  Focused coverage includes real fork/`_exit` restart points,
+scan-error zero-unlink behavior, complete per-segment validation, corrupt
+catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
+read-versus-reclaim mutex barrier.
+This is not core maintenance, retention-cutoff selection, WAL index dependency
+removal, or flat-WAL reclamation.  Still required for the gate:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
