@@ -120,6 +120,17 @@ ps_memtable_full(const PsMemtable *mt)
 	return mt->n >= mt->threshold;
 }
 
+int
+ps_memtable_has_timeline(const PsMemtable *mt, uint32_t timeline)
+{
+	if (mt == NULL)
+		return 0;
+	for (uint32_t i = 0; i < mt->n; i++)
+		if (mt->ents[i].timeline == timeline)
+			return 1;
+	return 0;
+}
+
 void
 ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline)
 {
@@ -139,6 +150,17 @@ ps_memtable_discard_timeline(PsMemtable *mt, uint32_t timeline)
 		out++;
 	}
 	mt->n = out;
+}
+
+void
+ps_memtable_rewrite_segment(PsMemtable *mt, uint32_t seg_id,
+							uint64_t old_off, uint64_t new_off)
+{
+	if (mt == NULL)
+		return;
+	for (uint32_t i = 0; i < mt->n; i++)
+		if (mt->ents[i].seg_id == seg_id && mt->ents[i].seg_off == old_off)
+			mt->ents[i].seg_off = new_off;
 }
 
 int

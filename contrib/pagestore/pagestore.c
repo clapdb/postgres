@@ -928,6 +928,36 @@ pagestore_retention_drop(PG_FUNCTION_ARGS)
 		(uint32) generation));
 }
 
+PG_FUNCTION_INFO_V1(pagestore_retention_drop_with_incarnation);
+
+Datum
+pagestore_retention_drop_with_incarnation(PG_FUNCTION_ARGS)
+{
+	int32		timeline = PG_GETARG_INT32(0);
+	int32		owner_kind = PG_GETARG_INT32(1);
+	int64		owner_id = PG_GETARG_INT64(2);
+	int64		generation = PG_GETARG_INT64(3);
+	int64		incarnation = PG_GETARG_INT64(4);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to manage pagestore retention owners")));
+
+	if (pagestore_backend_name == NULL ||
+		strcmp(pagestore_backend_name, "localsvc") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pagestore retention operations require the localsvc backend")));
+	if (timeline < 0 || owner_kind < 0 || owner_id == 0 || generation <= 0 ||
+		(uint64) generation > UINT32_MAX || incarnation <= 0)
+		ereport(ERROR,
+				(errmsg("pagestore retention owner fields are invalid or out of range")));
+	PG_RETURN_INT32((int32) pagestore_localsvc_retention_drop_with_incarnation(
+		(uint32) timeline, (uint32) owner_kind, (uint64) owner_id,
+		(uint32) generation, (uint64) incarnation));
+}
+
 PG_FUNCTION_INFO_V1(pagestore_retention_owner_lsn);
 
 static bool
@@ -986,7 +1016,36 @@ pagestore_create_branch(PG_FUNCTION_ARGS)
 				(errmsg("pagestore branch timeline must be > 0 (0 is the main timeline)")));
 
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) lsn);
+									 (uint64) lsn, 1,
+									 pagestore_localsvc_expected_incarnation());
+	PG_RETURN_VOID();
+}
+
+/* Explicit control-plane branch creation.  The legacy entrypoint above is
+ * intentionally pinned to incarnation one and therefore cannot authorize a
+ * retry after DELETED. */
+PG_FUNCTION_INFO_V1(pagestore_create_branch_with_incarnation);
+Datum
+pagestore_create_branch_with_incarnation(PG_FUNCTION_ARGS)
+{
+	int32		new_tl = PG_GETARG_INT32(0);
+	int32		parent_tl = PG_GETARG_INT32(1);
+	int64		incarnation_arg = PG_GETARG_INT64(2);
+	uint64		incarnation;
+	XLogRecPtr	lsn = PG_GETARG_LSN(3);
+
+	if (new_tl <= 0 || parent_tl < 0 || incarnation_arg <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid branch timeline, parent, or incarnation")));
+	incarnation = (uint64) incarnation_arg;
+	if ((uint32) parent_tl != pagestore_localsvc_timeline())
+		ereport(ERROR,
+				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
+						parent_tl, pagestore_localsvc_timeline())));
+	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
+									 (uint64) lsn, incarnation,
+									 pagestore_localsvc_expected_incarnation());
 	PG_RETURN_VOID();
 }
 
@@ -9374,6 +9433,8 @@ pagestore_load_branch_bootstrap(const char *dir,
 static void
 pagestore_write_branch_manifest(const char *target_dir,
 								int32 new_tl, int32 parent_tl,
+								uint64 incarnation,
+								uint64 parent_incarnation,
 								XLogRecPtr base, XLogRecPtr target,
 								TransactionId oldest_xid,
 								TransactionId next_xid,
@@ -9390,9 +9451,11 @@ pagestore_write_branch_manifest(const char *target_dir,
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
-							"  \"format\": 1,\n"
+							"  \"format\": 2,\n"
 							"  \"new_timeline\": %d,\n"
 							"  \"parent_timeline\": %d,\n"
+							"  \"incarnation\": %llu,\n"
+							"  \"parent_incarnation\": %llu,\n"
 							"  \"base_lsn\": \"%X/%08X\",\n"
 							"  \"fork_lsn\": \"%X/%08X\",\n"
 							"  \"oldest_xid\": \"%u\",\n"
@@ -9406,6 +9469,8 @@ pagestore_write_branch_manifest(const char *target_dir,
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
 							new_tl, parent_tl,
+							(unsigned long long) incarnation,
+							(unsigned long long) parent_incarnation,
 							LSN_FORMAT_ARGS(base),
 							LSN_FORMAT_ARGS(target),
 							oldest_xid, next_xid,
@@ -9428,6 +9493,8 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 								XLogRecPtr base, XLogRecPtr read_lsn,
 								uint32 parent_timeline,
 								XLogRecPtr fork_lsn,
+								uint64 incarnation,
+								uint64 parent_incarnation,
 								TransactionId oldest_xid,
 								TransactionId next_xid,
 								TransactionId oldest_commit_ts_xid,
@@ -9446,8 +9513,11 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 	{
 		ancestry_len = snprintf(ancestry, sizeof(ancestry),
 								"  \"parent_timeline\": %u,\n"
+								"  \"parent_incarnation\": %llu,\n"
 								"  \"fork_lsn\": \"%X/%08X\",\n",
-								parent_timeline, LSN_FORMAT_ARGS(fork_lsn));
+								parent_timeline,
+								(unsigned long long) parent_incarnation,
+								LSN_FORMAT_ARGS(fork_lsn));
 		if (ancestry_len < 0 || ancestry_len >= (int) sizeof(ancestry))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -9456,10 +9526,11 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 
 	manifest_len = snprintf(manifest, sizeof(manifest),
 							"{\n"
-							"  \"format\": 2,\n"
+							"  \"format\": 3,\n"
 							"  \"kind\": \"pinned_reader\",\n"
 							"  \"catalog_provenance\": \"%s\",\n"
 							"  \"timeline\": %d,\n"
+							"  \"incarnation\": %llu,\n"
 							"%s"
 							"  \"base_lsn\": \"%X/%08X\",\n"
 							"  \"read_lsn\": \"%X/%08X\",\n"
@@ -9474,7 +9545,8 @@ pagestore_write_reader_manifest(const char *target_dir, int32 timeline,
 							"  \"seeded_slru_pages\": \"%lld\"\n"
 							"}\n",
 							PAGESTORE_READER_CATALOG_FILE,
-							timeline, ancestry, LSN_FORMAT_ARGS(base),
+							 timeline, (unsigned long long) incarnation, ancestry,
+							 LSN_FORMAT_ARGS(base),
 							LSN_FORMAT_ARGS(read_lsn), oldest_xid, next_xid,
 							oldest_commit_ts_xid, next_commit_ts_xid,
 							oldest_multi, next_multi,
@@ -9699,6 +9771,25 @@ pagestore_manifest_has_uint_token(const char *manifest, const char *key,
 	if (!pagestore_manifest_get_uint_token(manifest, key, &parsed))
 		return false;
 	return parsed == value;
+}
+
+static bool
+pagestore_manifest_get_uint64_token(const char *manifest, const char *key,
+									 uint64 *value)
+{
+	const char *field = pagestore_manifest_find_unique_field(manifest, key);
+	char	   *endptr;
+	unsigned long long parsed;
+
+	if (field == NULL || *field == '"' || *field < '0' || *field > '9')
+		return false;
+	errno = 0;
+	parsed = strtoull(field, &endptr, 10);
+	if (errno != 0 || endptr == field ||
+		!pagestore_manifest_value_delimited(endptr))
+		return false;
+	*value = (uint64) parsed;
+	return true;
 }
 
 static bool
@@ -10010,8 +10101,29 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	if (!pagestore_manifest_is_single_object(manifest))
 		return false;
 
-	if (!pagestore_manifest_has_uint_token(manifest, "format", 1))
-		return false;
+	{
+		uint32 format;
+		uint64 incarnation;
+		uint64 parent_incarnation;
+
+		if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
+			(format != 1 && format != 2))
+			return false;
+		if (format == 1)
+		{
+			/* Format 1 predates incarnation fields and is safe only as
+			 * generation one; startup still checks the daemon exactly. */
+			incarnation = 1;
+			parent_incarnation = 1;
+		}
+		else if (!pagestore_manifest_get_uint64_token(manifest, "incarnation",
+														 &incarnation) || incarnation == 0 ||
+								 !pagestore_manifest_get_uint64_token(manifest,
+															"parent_incarnation",
+															&parent_incarnation) ||
+								 parent_incarnation == 0)
+			return false;
+	}
 	len = snprintf(buf, sizeof(buf), "%u", new_tl);
 	if (len < 0 || len >= (int) sizeof(buf))
 		ereport(ERROR,
@@ -10036,25 +10148,70 @@ pagestore_manifest_matches(const char *manifest, int32 new_tl, int32 parent_tl,
 	return true;
 }
 
+static bool pagestore_manifest_get_branch_identity(const char *manifest,
+	uint32_t *new_tl, uint32_t *parent_tl, XLogRecPtr *fork_lsn,
+	uint64 *incarnation, uint64 *parent_incarnation);
+
+static bool
+pagestore_manifest_same_branch_identity(const char *left, const char *right)
+{
+	uint32		left_tl;
+	uint32		left_parent;
+	uint32		right_tl;
+	uint32		right_parent;
+	XLogRecPtr	left_fork;
+	XLogRecPtr	right_fork;
+	uint64		left_incarnation;
+	uint64		left_parent_incarnation;
+	uint64		right_incarnation;
+	uint64		right_parent_incarnation;
+
+	return pagestore_manifest_get_branch_identity(left, &left_tl, &left_parent,
+													 &left_fork, &left_incarnation,
+													 &left_parent_incarnation) &&
+		pagestore_manifest_get_branch_identity(right, &right_tl, &right_parent,
+													&right_fork, &right_incarnation,
+													&right_parent_incarnation) &&
+		left_tl == right_tl && left_parent == right_parent &&
+		left_fork == right_fork && left_incarnation == right_incarnation &&
+		left_parent_incarnation == right_parent_incarnation;
+}
+
 static bool
 pagestore_reader_manifest_get_branch_identity(const char *manifest,
-											  uint32 *timeline,
-											  uint32 *parent_timeline,
-											  XLogRecPtr *fork_lsn)
+												  uint32 *timeline,
+												  uint32 *parent_timeline,
+												  XLogRecPtr *fork_lsn,
+												  uint64 *incarnation,
+												  uint64 *parent_incarnation)
 {
 	uint32		format;
 
-	return pagestore_manifest_is_single_object(manifest) &&
-		pagestore_manifest_get_uint_token(manifest, "format", &format) &&
-		format == 2 &&
-		pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") &&
-		pagestore_manifest_has_string_token(manifest, "catalog_provenance",
-										PAGESTORE_READER_CATALOG_FILE) &&
-		pagestore_manifest_get_uint_token(manifest, "timeline", timeline) &&
-		*timeline != 0 &&
-		pagestore_manifest_get_uint_token(manifest, "parent_timeline",
-										 parent_timeline) &&
-		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+	if (!pagestore_manifest_is_single_object(manifest) ||
+		!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
+		(format != 2 && format != 3) ||
+		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
+		!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
+										 PAGESTORE_READER_CATALOG_FILE) ||
+		!pagestore_manifest_get_uint_token(manifest, "timeline", timeline) ||
+		*timeline == 0 ||
+		!pagestore_manifest_get_uint_token(manifest, "parent_timeline",
+															parent_timeline) ||
+		!pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn))
+		return false;
+	if (format == 2)
+	{
+		*incarnation = 1;
+		*parent_incarnation = 1;
+	}
+	else if (!pagestore_manifest_get_uint64_token(manifest, "incarnation",
+														 incarnation) || *incarnation == 0 ||
+								 !pagestore_manifest_get_uint64_token(manifest,
+															"parent_incarnation",
+															parent_incarnation) ||
+								 *parent_incarnation == 0)
+		return false;
+	return true;
 }
 
 static bool
@@ -10066,20 +10223,32 @@ pagestore_reader_manifest_matches(const char *manifest, int32 timeline,
 	uint32		manifest_timeline;
 	uint32		parent_timeline;
 	XLogRecPtr	fork_lsn;
+	uint64		incarnation;
 
-	if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
-		!pagestore_manifest_is_single_object(manifest) ||
-		!pagestore_manifest_has_uint_token(manifest, "format", 2) ||
-		!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
-		!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
-										 PAGESTORE_READER_CATALOG_FILE) ||
-		!pagestore_manifest_has_uint_token(manifest, "timeline", timeline))
-		return false;
+	{
+		uint32 format;
+
+		if (timeline < 0 || XLogRecPtrIsInvalid(read_lsn) ||
+			!pagestore_manifest_is_single_object(manifest) ||
+			!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
+			(format != 2 && format != 3) ||
+			!pagestore_manifest_has_string_token(manifest, "kind", "pinned_reader") ||
+			!pagestore_manifest_has_string_token(manifest, "catalog_provenance",
+												 PAGESTORE_READER_CATALOG_FILE) ||
+			!pagestore_manifest_has_uint_token(manifest, "timeline", timeline))
+			return false;
+		if (format == 2)
+			incarnation = 1;
+		else if (!pagestore_manifest_get_uint64_token(manifest, "incarnation",
+														 &incarnation) || incarnation == 0)
+			return false;
+	}
 	if (timeline > 0 &&
 		(!pagestore_reader_manifest_get_branch_identity(manifest,
-												  &manifest_timeline,
-												  &parent_timeline,
-												  &fork_lsn) ||
+													  &manifest_timeline,
+													  &parent_timeline,
+													  &fork_lsn, &incarnation,
+													  &(uint64) {0}) ||
 		 manifest_timeline != (uint32) timeline))
 		return false;
 	len = snprintf(buf, sizeof(buf), "%X/%08X", LSN_FORMAT_ARGS(read_lsn));
@@ -10099,6 +10268,8 @@ pagestore_manifest_has_line(const char *manifest, const char *line)
 static bool
 pagestore_existing_branch_manifest_matches(const char *target_dir,
 										   int32 new_tl, int32 parent_tl,
+										   uint64 incarnation,
+										   uint64 parent_incarnation,
 										   XLogRecPtr base, XLogRecPtr target,
 										   TransactionId oldest_xid,
 										   TransactionId next_xid,
@@ -10142,6 +10313,10 @@ pagestore_existing_branch_manifest_matches(const char *target_dir,
 		return false;
 	if (!pagestore_manifest_matches(manifest, new_tl, parent_tl, target))
 		return false;
+	CHECK_MANIFEST_LINE("  \"incarnation\": %llu,\n",
+						(unsigned long long) incarnation);
+	CHECK_MANIFEST_LINE("  \"parent_incarnation\": %llu,\n",
+						(unsigned long long) parent_incarnation);
 
 	CHECK_MANIFEST_LINE("  \"base_lsn\": \"%X/%08X\",\n", LSN_FORMAT_ARGS(base));
 	CHECK_MANIFEST_LINE("  \"oldest_xid\": \"%u\",\n", oldest_xid);
@@ -10310,19 +10485,33 @@ pagestore_require_disjoint_install_dirs(const char *prepared_dir,
 static bool
 pagestore_manifest_get_branch_identity(const char *manifest, uint32_t *new_tl,
 									   uint32_t *parent_tl,
-									   XLogRecPtr *fork_lsn)
+									   XLogRecPtr *fork_lsn,
+									   uint64 *incarnation,
+									   uint64 *parent_incarnation)
 {
 	uint32_t	format;
 
 	if (!pagestore_manifest_is_single_object(manifest))
 		return false;
 
-	return pagestore_manifest_get_uint_token(manifest, "format", &format) &&
-		format == 1 &&
-		pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) &&
-		*new_tl != 0 &&
-		pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) &&
-		pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn);
+	if (!pagestore_manifest_get_uint_token(manifest, "format", &format) ||
+		(format != 1 && format != 2) ||
+		!pagestore_manifest_get_uint_token(manifest, "new_timeline", new_tl) ||
+		*new_tl == 0 ||
+		!pagestore_manifest_get_uint_token(manifest, "parent_timeline", parent_tl) ||
+		!pagestore_manifest_get_lsn_token(manifest, "fork_lsn", fork_lsn))
+		return false;
+	if (format == 1)
+	{
+		*incarnation = 1;
+		*parent_incarnation = 1;
+		return true;
+	}
+	return pagestore_manifest_get_uint64_token(manifest, "incarnation",
+														 incarnation) && *incarnation != 0 &&
+		pagestore_manifest_get_uint64_token(manifest, "parent_incarnation",
+														 parent_incarnation) &&
+		*parent_incarnation != 0;
 }
 
 static bool
@@ -10359,6 +10548,94 @@ static inline bool
 pagestore_branch_backend_active(void)
 {
 	return pagestore_active_backend == &PageStoreBackendLocalSvc;
+}
+
+#define PAGESTORE_STARTUP_MAX_TIMELINES 1024
+
+/* Bind a token authorized by the durable control-plane manifest.  All
+ * subsequent validation is done by an exact-token TIMELINE_INFO request;
+ * normal page/WAL/metadata operations use the resulting immutable bindings
+ * and never refresh them. */
+static void
+pagestore_bind_startup_identity(uint32 timeline, uint64 expected)
+{
+	uint32 state;
+	uint64 current;
+
+	if (timeline >= PAGESTORE_STARTUP_MAX_TIMELINES || expected == 0 ||
+		(timeline == 0 && expected != 1) ||
+		!pagestore_localsvc_timeline_state(timeline, &state, &current) ||
+		state != PS_TIMELINE_LIVE || current != expected)
+		ereport(FATAL,
+				(errmsg("pagestore timeline %u incarnation is not live at startup",
+						timeline),
+				errdetail("Manifest expects incarnation %llu.",
+						  (unsigned long long) expected)));
+	pagestore_localsvc_bind_incarnation(timeline, expected);
+}
+
+/*
+ * Starting with the current timeline and its manifest-authorized immediate
+ * parent, walk the durable ancestry one exact-token hop at a time.  The
+ * parent token is returned by TIMELINE_INFO and is immediately bound before
+ * it is used for the next hop.  Thus a later delete/reuse cannot make an old
+ * ancestor silently resolve to a different incarnation.
+ */
+static void
+pagestore_bind_startup_ancestry(uint32 start_timeline,
+								uint32 manifest_parent_timeline,
+								uint64 manifest_parent_incarnation)
+{
+	bool		seen[PAGESTORE_STARTUP_MAX_TIMELINES] = {false};
+	uint32	current = start_timeline;
+	uint32	depth = 0;
+
+	while (current != 0)
+	{
+		uint32		parent_timeline;
+		uint64		branch_lsn;
+		uint64		parent_incarnation;
+
+		if (current >= PAGESTORE_STARTUP_MAX_TIMELINES || seen[current] ||
+			depth >= PAGESTORE_STARTUP_MAX_TIMELINES)
+			ereport(FATAL,
+					(errmsg("invalid pagestore timeline ancestry at timeline %u",
+							current),
+					 errdetail("The ancestry contains a cycle or exceeds the maximum depth.")));
+		seen[current] = true;
+
+		if (!pagestore_localsvc_timeline_info(current, &parent_timeline,
+											  &branch_lsn, &parent_incarnation, 5000))
+			ereport(FATAL,
+					(errmsg("could not read exact pagestore ancestry for timeline %u",
+							current)));
+		if (depth == 0 &&
+			(parent_timeline != manifest_parent_timeline ||
+			 parent_incarnation != manifest_parent_incarnation))
+			ereport(FATAL,
+					(errmsg("pagestore branch manifest has a different parent identity than the store"),
+					 errdetail("Manifest parent is %u/%llu, store parent is %u/%llu.",
+							   manifest_parent_timeline,
+							   (unsigned long long) manifest_parent_incarnation,
+							   parent_timeline,
+							   (unsigned long long) parent_incarnation)));
+		if (parent_timeline >= PAGESTORE_STARTUP_MAX_TIMELINES ||
+			parent_incarnation == 0 || parent_timeline == current ||
+			(parent_timeline == 0 && parent_incarnation != 1) ||
+			seen[parent_timeline])
+			ereport(FATAL,
+					(errmsg("malformed pagestore timeline ancestry at timeline %u",
+							current),
+					 errdetail("The parent timeline or immutable incarnation is invalid.")));
+
+		/* branch_lsn is intentionally decoded and returned by the protocol even
+		 * though startup only needs it for the store-side consistency check. */
+		(void) branch_lsn;
+		pagestore_bind_startup_identity(parent_timeline, parent_incarnation);
+		current = parent_timeline;
+		depth++;
+	}
+
 }
 
 /*
@@ -10480,6 +10757,10 @@ pagestore_validate_datadir_branch_manifest(void)
 	uint32		reader_parent_tl;
 	XLogRecPtr	fork_lsn;
 	XLogRecPtr	reader_fork_lsn;
+	uint64		incarnation;
+	uint64		parent_incarnation;
+	uint64		reader_incarnation;
+	uint64		reader_parent_incarnation;
 	uint64		read_lsn;
 	uint64		read_seq = 0;
 	uint64		pin_lsn;
@@ -10561,6 +10842,25 @@ pagestore_validate_datadir_branch_manifest(void)
 										 (XLogRecPtr) read_lsn))
 			ereport(FATAL,
 					(errmsg("pagestore.read_lsn or timeline does not match pagestore_reader.manifest")));
+		if (pagestore_localsvc_timeline() == 0)
+			pagestore_bind_startup_identity(0, 1);
+		else if (!pagestore_reader_manifest_get_branch_identity(reader_manifest,
+													 &reader_tl,
+													 &reader_parent_tl,
+													 &reader_fork_lsn,
+													 &reader_incarnation,
+													 &reader_parent_incarnation) ||
+							reader_tl != pagestore_localsvc_timeline())
+			 ereport(FATAL,
+					(errmsg("invalid branch identity in pagestore reader manifest")));
+		else
+		{
+			pagestore_bind_startup_identity(reader_tl, reader_incarnation);
+			pagestore_bind_startup_identity(reader_parent_tl,
+										 reader_parent_incarnation);
+			pagestore_bind_startup_ancestry(reader_tl, reader_parent_tl,
+											 reader_parent_incarnation);
+		}
 		control = get_controlfile(DataDir, &crc_ok);
 		if (!crc_ok || control->checkPointCopy.redo != (XLogRecPtr) read_lsn)
 			ereport(FATAL,
@@ -10681,12 +10981,16 @@ pagestore_validate_datadir_branch_manifest(void)
 			if (!pagestore_reader_manifest_get_branch_identity(reader_manifest,
 													  &reader_tl,
 													  &reader_parent_tl,
-													  &reader_fork_lsn))
+													  &reader_fork_lsn,
+													  &reader_incarnation,
+													  &reader_parent_incarnation))
 				ereport(FATAL,
 						(errmsg("invalid branch identity in pagestore reader manifest")));
 			pagestore_localsvc_require_branch_timeout(reader_tl,
-											  reader_parent_tl,
-											  (uint64) reader_fork_lsn, 5000);
+													  reader_parent_tl,
+													  (uint64) reader_fork_lsn,
+													  reader_incarnation,
+													  reader_parent_incarnation, 5000);
 			pagestore_localsvc_detach();
 		}
 		return;
@@ -10699,6 +11003,11 @@ pagestore_validate_datadir_branch_manifest(void)
 		if (pagestore_localsvc_timeline() != 0)
 			ereport(FATAL,
 					(errmsg("pagestore.timeline requires pagestore_branch.manifest")));
+		pagestore_bind_startup_identity(0, 1);
+		/* The postmaster must not fork children with its startup probe's channel
+		 * still claimed: they would inherit one mailbox index and race every
+		 * page/WAL request through the same shared-memory slot. */
+		pagestore_localsvc_detach();
 		return;
 	}
 	if (!pagestore_branch_backend_active())
@@ -10708,15 +11017,21 @@ pagestore_validate_datadir_branch_manifest(void)
 		ereport(FATAL,
 				(errmsg("pagestore.route_all must be enabled to use a branch manifest")));
 	if (!pagestore_manifest_get_branch_identity(manifest, &new_tl, &parent_tl,
-												&fork_lsn))
+													&fork_lsn, &incarnation,
+													&parent_incarnation))
 		ereport(FATAL,
 				(errmsg("invalid pagestore branch manifest in data directory")));
 	if (new_tl != pagestore_localsvc_timeline())
 		ereport(FATAL,
 				(errmsg("pagestore.timeline does not match pagestore_branch.manifest"),
 				 errdetail("Configured timeline is %u.", pagestore_localsvc_timeline())));
+	pagestore_bind_startup_identity(new_tl, incarnation);
+	pagestore_bind_startup_identity(parent_tl, parent_incarnation);
+	pagestore_bind_startup_ancestry(new_tl, parent_tl, parent_incarnation);
 	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl,
-											  (uint64) fork_lsn, 5000);
+													  (uint64) fork_lsn,
+													  incarnation,
+													  parent_incarnation, 5000);
 	pagestore_localsvc_detach();
 }
 
@@ -11059,6 +11374,8 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	uint32_t	target_new_tl;
 	uint32_t	target_parent_tl;
 	XLogRecPtr	target_fork_lsn;
+	uint64		target_incarnation;
+	uint64		target_parent_incarnation;
 	bool		commit_ts_required;
 
 	if (PG_NARGS() != 5)
@@ -11101,18 +11418,32 @@ pagestore_install_prepared_branch(PG_FUNCTION_ARGS)
 	pagestore_require_prepared_artifact(prepared_dir,
 										"pagestore_branch.manifest", false);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
-	if (target_manifest != NULL &&
-		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+	if (target_manifest != NULL)
 	{
-		if (parent_tl <= 0 ||
-			!pagestore_manifest_get_branch_identity(target_manifest, &target_new_tl,
-													&target_parent_tl,
-													&target_fork_lsn) ||
-			target_new_tl != (uint32_t) parent_tl)
-			ereport(ERROR,
-					(errmsg("target branch manifest does not match the requested branch identity")));
-		pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
-										  (uint64) target_fork_lsn);
+		if (pagestore_manifest_matches(target_manifest, new_tl, parent_tl,
+												 fork_lsn))
+		{
+			if (!pagestore_manifest_same_branch_identity(manifest_data,
+														 target_manifest))
+				ereport(ERROR,
+						(errmsg("target branch manifest has a different incarnation")));
+		}
+		else
+		{
+			if (parent_tl <= 0 ||
+				!pagestore_manifest_get_branch_identity(target_manifest, &target_new_tl,
+															&target_parent_tl,
+															&target_fork_lsn,
+															&target_incarnation,
+															&target_parent_incarnation) ||
+				target_new_tl != (uint32_t) parent_tl)
+				ereport(ERROR,
+						(errmsg("target branch manifest does not match the requested branch identity")));
+			pagestore_localsvc_require_branch(target_new_tl, target_parent_tl,
+											  (uint64) target_fork_lsn,
+											  target_incarnation,
+											  target_parent_incarnation);
+		}
 	}
 
 	pagestore_preflight_prepared_artifact(prepared_dir, target_dir,
@@ -11244,7 +11575,8 @@ pagestore_install_prepared_branch_bootstrap(PG_FUNCTION_ARGS)
 										  PAGESTORE_BRANCH_BOOTSTRAP_FILE, true);
 	target_manifest = pagestore_read_branch_manifest(target_dir);
 	if (target_manifest != NULL &&
-		!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn))
+		(!pagestore_manifest_matches(target_manifest, new_tl, parent_tl, fork_lsn) ||
+		 !pagestore_manifest_same_branch_identity(manifest_data, target_manifest)))
 		ereport(ERROR,
 				(errmsg("target branch manifest does not match the requested portable branch identity")));
 
@@ -11317,10 +11649,16 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 	char		path[MAXPGPATH];
 	uint32_t	branch_tl;
 	uint32_t	branch_parent;
+	uint64		branch_incarnation;
+	uint64		branch_parent_incarnation;
 	uint32		reader_tl = 0;
 	uint32		reader_parent = 0;
 	uint32		target_reader_tl = 0;
 	uint32		target_reader_parent = 0;
+	uint64		reader_incarnation = 0;
+	uint64		reader_parent_incarnation = 0;
+	uint64		target_reader_incarnation = 0;
+	uint64		target_reader_parent_incarnation = 0;
 	XLogRecPtr	branch_lsn;
 	XLogRecPtr	reader_fork_lsn = InvalidXLogRecPtr;
 	XLogRecPtr	target_reader_fork_lsn = InvalidXLogRecPtr;
@@ -11347,8 +11685,10 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 		(uint32) timeline, read_lsn, CurrentMemoryContext, ERROR);
 	if (timeline > 0 &&
 		!pagestore_reader_manifest_get_branch_identity(manifest, &reader_tl,
-													 &reader_parent,
-													 &reader_fork_lsn))
+														 &reader_parent,
+														 &reader_fork_lsn,
+														 &reader_incarnation,
+														 &reader_parent_incarnation))
 		ereport(ERROR,
 				(errmsg("prepared reader manifest has invalid branch identity")));
 	if (!pagestore_manifest_get_commit_ts_required(manifest,
@@ -11362,28 +11702,39 @@ pagestore_install_prepared_reader(PG_FUNCTION_ARGS)
 				(errmsg("target reader manifest does not match the requested reader identity")));
 	if (target_manifest != NULL && timeline > 0 &&
 		(!pagestore_reader_manifest_get_branch_identity(target_manifest,
-													   &target_reader_tl,
-													   &target_reader_parent,
-													   &target_reader_fork_lsn) ||
+															   &target_reader_tl,
+															   &target_reader_parent,
+															   &target_reader_fork_lsn,
+															   &target_reader_incarnation,
+															   &target_reader_parent_incarnation) ||
 		 target_reader_tl != reader_tl ||
 		 target_reader_parent != reader_parent ||
-		 target_reader_fork_lsn != reader_fork_lsn))
+		 target_reader_fork_lsn != reader_fork_lsn ||
+		 target_reader_incarnation != reader_incarnation ||
+		 target_reader_parent_incarnation != reader_parent_incarnation))
 		ereport(ERROR,
 				(errmsg("target reader manifest has a different branch identity")));
 	branch_manifest = pagestore_read_branch_manifest(target_dir);
 	if (branch_manifest != NULL)
 	{
 		if (!pagestore_manifest_get_branch_identity(branch_manifest, &branch_tl,
-												&branch_parent, &branch_lsn) ||
+															&branch_parent, &branch_lsn,
+															&branch_incarnation,
+															&branch_parent_incarnation) ||
 			branch_tl != (uint32) timeline ||
 			(timeline > 0 &&
-			 (branch_parent != reader_parent || branch_lsn != reader_fork_lsn)))
+			 (branch_parent != reader_parent ||
+			  branch_lsn != reader_fork_lsn ||
+			  branch_incarnation != reader_incarnation ||
+			  branch_parent_incarnation != reader_parent_incarnation)))
 			ereport(ERROR,
 					(errmsg("target branch manifest does not match the reader branch identity")));
 	}
 	if (timeline > 0)
 		pagestore_localsvc_require_branch(reader_tl, reader_parent,
-									  (uint64) reader_fork_lsn);
+									  (uint64) reader_fork_lsn,
+									  reader_incarnation,
+									  reader_parent_incarnation);
 	target_control = get_controlfile(target_dir, &target_control_crc_ok);
 	if (!target_control_crc_ok || target_control->checkPointCopy.redo != read_lsn)
 		ereport(ERROR,
@@ -11681,8 +12032,10 @@ pagestore_branch_checkpoint(PG_FUNCTION_ARGS)
 
 static int64
 pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
-							  int32 parent_tl, XLogRecPtr base,
-							  XLogRecPtr target,
+								  int32 parent_tl, XLogRecPtr base,
+								  XLogRecPtr target,
+								  uint64 incarnation,
+								  uint64 parent_incarnation,
 							  TransactionId oldest_xid,
 							  TransactionId next_xid,
 							  TransactionId oldest_commit_ts_xid,
@@ -11709,12 +12062,16 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 		ereport(ERROR,
 				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
 						parent_tl, pagestore_localsvc_timeline())));
+	if (incarnation == 0 || parent_incarnation == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch incarnation and parent incarnation must be nonzero")));
 	if (target < base)
 		ereport(ERROR,
 				(errmsg("target LSN precedes the base cutoff")));
 
 	pagestore_localsvc_check_branch((uint32) new_tl, (uint32) parent_tl,
-									(uint64) target);
+									(uint64) target, incarnation, parent_incarnation);
 
 	/*
 	 * Normalize the commit-ts horizons BEFORE the idempotency check and
@@ -11728,7 +12085,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 									&next_commit_ts_xid);
 
 	if (pagestore_existing_branch_manifest_matches(target_dir, new_tl, parent_tl,
-												   base, target,
+												   incarnation, parent_incarnation,
+													   base, target,
 												   oldest_xid, next_xid,
 												   oldest_commit_ts_xid,
 												   next_commit_ts_xid,
@@ -11737,7 +12095,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 												   &seeded))
 	{
 		pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-										 (uint64) target);
+										 (uint64) target, incarnation,
+										 parent_incarnation);
 		return seeded;
 	}
 
@@ -11768,7 +12127,8 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 											  oldest_multi, next_multi,
 											  oldest_member, next_member);
 	pagestore_localsvc_create_branch((uint32) new_tl, (uint32) parent_tl,
-									 (uint64) target);
+									 (uint64) target, incarnation,
+									 parent_incarnation);
 
 	/*
 	 * Publish the manifest only after the store-side timeline exists: the
@@ -11780,6 +12140,7 @@ pagestore_prepare_branch_impl(const char *target_dir, int32 new_tl,
 	 * re-runs CREATE_BRANCH idempotently.
 	 */
 	pagestore_write_branch_manifest(target_dir, new_tl, parent_tl,
+									incarnation, parent_incarnation,
 									base, target,
 									oldest_xid, next_xid,
 									oldest_commit_ts_xid,
@@ -11817,8 +12178,10 @@ pagestore_prepare_branch(PG_FUNCTION_ARGS)
 	int			pathlen;
 
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
-											base, target,
-											PG_GETARG_TRANSACTIONID(5),
+										base, target,
+										1,
+										pagestore_localsvc_expected_incarnation(),
+										PG_GETARG_TRANSACTIONID(5),
 											PG_GETARG_TRANSACTIONID(6),
 											PG_GETARG_TRANSACTIONID(7),
 											PG_GETARG_TRANSACTIONID(8),
@@ -11868,6 +12231,9 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	XLogRecPtr	base = PG_GETARG_LSN(3);
 	XLogRecPtr	checkpoint_redo = PG_GETARG_LSN(4);
 	XLogRecPtr	fork_lsn = PG_GETARG_LSN(5);
+	int64		incarnation_arg = PG_NARGS() == 7 ? PG_GETARG_INT64(6) : 1;
+	uint64		incarnation;
+	uint64		parent_incarnation;
 	XLogRecPtr	materialized;
 	PagestoreBranchHorizons h;
 	int64		seeded;
@@ -11887,6 +12253,12 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errmsg("pagestore parent timeline %d is not the active localsvc timeline %u",
 						parent_tl, pagestore_localsvc_timeline())));
+	parent_incarnation = pagestore_localsvc_expected_incarnation();
+	if (incarnation_arg <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("branch incarnation must be positive")));
+	incarnation = (uint64) incarnation_arg;
 	pagestore_branch_horizons_from_control(base, checkpoint_redo, &h);
 	if (fork_lsn < h.checkpoint_end_lsn)
 		ereport(ERROR,
@@ -11913,8 +12285,9 @@ pagestore_prepare_branch_from_control(PG_FUNCTION_ARGS)
 	}
 
 	seeded = pagestore_prepare_branch_impl(target_dir, new_tl, parent_tl,
-											base, fork_lsn,
-											h.oldest_xid, h.next_xid,
+										base, fork_lsn, incarnation,
+										parent_incarnation,
+										h.oldest_xid, h.next_xid,
 											h.oldest_commit_ts_xid,
 											h.next_commit_ts_xid,
 											h.oldest_multi, h.next_multi,
@@ -11981,6 +12354,8 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 	uint32		branch_timeline = 0;
 	uint32		parent_timeline = 0;
 	XLogRecPtr	fork_lsn = InvalidXLogRecPtr;
+	uint64		branch_incarnation = 0;
+	uint64		parent_incarnation = 0;
 	int			pathlen;
 	int64		seeded;
 
@@ -12000,14 +12375,17 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 		branch_manifest = pagestore_read_branch_manifest(DataDir);
 		if (branch_manifest == NULL ||
 			!pagestore_manifest_get_branch_identity(branch_manifest,
-													   &branch_timeline,
-													   &parent_timeline,
-													   &fork_lsn) ||
+															   &branch_timeline,
+															   &parent_timeline,
+															   &fork_lsn,
+															   &branch_incarnation,
+															   &parent_incarnation) ||
 			branch_timeline != (uint32) timeline)
 			ereport(ERROR,
 					(errmsg("active branch manifest does not match the reader timeline")));
 		pagestore_localsvc_require_branch(branch_timeline, parent_timeline,
-										  (uint64) fork_lsn);
+										  (uint64) fork_lsn,
+										  branch_incarnation, parent_incarnation);
 	}
 	if (!ps_control_asof(read_lsn, &control) ||
 		control.checkPointCopy.redo != read_lsn)
@@ -12055,8 +12433,10 @@ pagestore_prepare_reader(PG_FUNCTION_ARGS)
 										  oldest_member, next_member);
 	pagestore_write_reader_snapshot(target_dir, (uint32) timeline, read_lsn,
 								oldest_xid, next_xid);
-	pagestore_write_reader_manifest(target_dir, timeline, base, read_lsn,
+		pagestore_write_reader_manifest(target_dir, timeline, base, read_lsn,
 								parent_timeline, fork_lsn,
+								branch_incarnation ? branch_incarnation : 1,
+								parent_incarnation ? parent_incarnation : 1,
 								oldest_xid, next_xid,
 								oldest_commit_ts_xid,
 								next_commit_ts_xid,

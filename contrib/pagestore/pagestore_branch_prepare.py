@@ -43,6 +43,7 @@ CONFIG_FIELDS = {
     "prepared_dir",
     "new_timeline",
     "parent_timeline",
+    "new_incarnation",
     "database",
     "user",
     "poll_interval_ms",
@@ -195,6 +196,7 @@ class Config:
     prepared_dir: Path
     new_timeline: int
     parent_timeline: int
+    new_incarnation: int = 1
     database: str = "postgres"
     user: str = "postgres"
     poll_interval_ms: int = 100
@@ -269,6 +271,7 @@ class Config:
             "retention_owner_id": None,
             "new_timeline": None,
             "parent_timeline": None,
+            "new_incarnation": 1,
             "poll_interval_ms": 100,
             "progress_timeout_ms": 60000,
             "command_timeout_seconds": 60,
@@ -289,6 +292,8 @@ class Config:
                 raise ConfigError(f"branch config {field} exceeds 65535")
         if integers["retention_owner_id"] > (1 << 64) - 1:
             raise ConfigError("branch config retention_owner_id exceeds uint64")
+        if integers["new_incarnation"] > (1 << 63) - 1:
+            raise ConfigError("branch config new_incarnation exceeds int64")
         if integers["new_timeline"] == integers["parent_timeline"]:
             raise ConfigError("new_timeline must differ from parent_timeline")
         for field in ("new_timeline", "parent_timeline"):
@@ -532,7 +537,7 @@ class BranchPreparer:
         )
         prepare_signature = self.extension_function(
             self.writer_extension_schema,
-            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn)",
+            "pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)",
         )
         checkpoint_signature = self.extension_function(
             self.writer_extension_schema, "pagestore_branch_checkpoint()"
@@ -893,7 +898,9 @@ class BranchPreparer:
                 + sql_literal(redo)
                 + "::pg_lsn, "
                 + sql_literal(fork)
-                + "::pg_lsn)",
+                + "::pg_lsn, "
+                + str(self.config.new_incarnation)
+                + ")",
                 private=True,
             )
         )

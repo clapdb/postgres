@@ -15,12 +15,14 @@
  * Freestanding: only pagestore_ipc.h and libc.
  *
  * Usage (as restore_command):
- *   pagestore_walrestore --shm NAME --timeline N --segsize BYTES %f %p
+ *   pagestore_walrestore --shm NAME --timeline N --incarnation N \
+ *       --segsize BYTES %f %p
  *
  * src/../contrib/pagestore/pagestore_walrestore.c
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -105,7 +107,8 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 	}
 	close(fd);
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION)
+	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY)
 	{
 		fprintf(stderr, "bad shm header (magic/version mismatch; daemon and "
 				"walrestore built against different PS_SHM_VERSION?)\n");
@@ -156,11 +159,13 @@ client_attach(const char *shm_name, uint32_t page_size_unused)
 
 /* Read up to len WAL bytes from start_lsn on a timeline; returns bytes read. */
 static uint32_t
-wal_read(uint32_t tl, uint64_t start_lsn, uint32_t len, void *out)
+wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
+			 uint32_t len, void *out)
 {
 	PsChannel  *ch = ps_channel(shm, chan);
 
 	ch->timeline = tl;
+	ch->incarnation = incarnation;
 	ch->opcode = PS_OP_WAL_READ;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
@@ -178,6 +183,8 @@ main(int argc, char **argv)
 {
 	const char *shm_name = NULL;
 	uint32_t	timeline = 0;
+	uint64_t	incarnation = 0;
+	int			have_incarnation = 0;
 	uint64_t	segsize = 16 * 1024 * 1024;
 	const char *segname = NULL;
 	const char *outpath = NULL;
@@ -197,6 +204,26 @@ main(int argc, char **argv)
 			shm_name = argv[++i];
 		else if (strcmp(argv[i], "--timeline") == 0 && i + 1 < argc)
 			timeline = (uint32_t) strtoul(argv[++i], NULL, 10);
+		else if (strcmp(argv[i], "--incarnation") == 0 && i + 1 < argc)
+		{
+			char	   *end;
+			unsigned long long value;
+
+			if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9')
+			{
+				fprintf(stderr, "invalid --incarnation \"%s\"\n", argv[i + 1]);
+				return 2;
+			}
+			errno = 0;
+			value = strtoull(argv[++i], &end, 10);
+			if (errno != 0 || *end != '\0' || value == 0)
+			{
+				fprintf(stderr, "invalid --incarnation \"%s\"\n", argv[i]);
+				return 2;
+			}
+			incarnation = (uint64_t) value;
+			have_incarnation = 1;
+		}
 		else if (strcmp(argv[i], "--segsize") == 0 && i + 1 < argc)
 			segsize = strtoull(argv[++i], NULL, 10);
 		else if (!segname)
@@ -204,9 +231,9 @@ main(int argc, char **argv)
 		else if (!outpath)
 			outpath = argv[i];
 	}
-	if (!shm_name || !segname || !outpath)
+	if (!shm_name || !segname || !outpath || !have_incarnation)
 	{
-		fprintf(stderr, "usage: %s --shm NAME [--timeline N] [--segsize B] <segfile> <outpath>\n",
+		fprintf(stderr, "usage: %s --shm NAME [--timeline N] --incarnation N [--segsize B] <segfile> <outpath>\n",
 				argv[0]);
 		return 2;
 	}
@@ -263,7 +290,8 @@ main(int argc, char **argv)
 	{
 		uint32_t	want = (uint32_t) ((segsize - off) < PS_IO_UNIT ?
 									   (segsize - off) : PS_IO_UNIT);
-		uint32_t	got = wal_read(timeline, start_lsn + off, want, buf);
+		uint32_t	got = wal_read(timeline, incarnation, start_lsn + off,
+							 want, buf);
 
 		if (got == 0)
 			break;				/* not in the store: segment unavailable */

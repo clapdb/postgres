@@ -52,7 +52,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=34
+	local expected_version=36
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128
@@ -157,6 +157,8 @@ $P -c "CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn)
         AS 'pagestore','pagestore_retention_set' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_retention_drop(int,int,bigint,bigint) RETURNS int
         AS 'pagestore','pagestore_retention_drop' LANGUAGE C STRICT;
+       CREATE FUNCTION pagestore_retention_drop_with_incarnation(int,int,bigint,bigint,bigint) RETURNS int
+        AS 'pagestore','pagestore_retention_drop_with_incarnation' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_retention_owner_lsn(int,int,bigint,bigint) RETURNS pg_lsn
         AS 'pagestore','pagestore_retention_owner_lsn' LANGUAGE C STRICT;" >/dev/null
 assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,0,'0/1');")" "1" \
@@ -179,6 +181,23 @@ assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,6,7,'0/
 	"retention SET preserves a high-bit uint64 owner ID"
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,-9223372036854775808,6);")" "0" \
 	"retention DROP preserves a high-bit uint64 owner ID"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,7,7,'0/1');")" "0" \
+	"localsvc advances the high-bit owner for explicit-incarnation cleanup"
+assert "$($P -c "SELECT pagestore_retention_drop_with_incarnation(0,1,-9223372036854775808,7,1);")" "0" \
+	"explicit-incarnation DROP preserves a high-bit uint64 owner ID"
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9002,1,7,'0/1');")" "0" \
+	"localsvc registers an owner for explicit-incarnation cleanup"
+assert "$($P -c "SELECT pagestore_retention_drop_with_incarnation(0,1,9002,1,2);")" "1" \
+	"explicit retention DROP rejects a stale incarnation"
+assert "$($P -c "SELECT pagestore_retention_drop_with_incarnation(0,1,9002,1,1);")" "0" \
+	"explicit retention DROP accepts the authorized incarnation"
+if $P -v ON_ERROR_STOP=1 -c \
+	"SELECT pagestore_retention_drop_with_incarnation(0,1,9002,1,0);" >/dev/null 2>&1; then
+	echo "FAIL - explicit retention DROP accepts incarnation zero"
+	fail=1
+else
+	echo "ok   - explicit retention DROP rejects incarnation zero"
+fi
 assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/1');")" "0" \
 	"localsvc registers a durable retention owner generation"
 assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'0/2');")" "2" \
@@ -221,7 +240,7 @@ fi
 seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)" .done)
 out=$(mktemp)
 if [ -n "$seg" ] && "$BUILD/contrib/pagestore/pagestore_walrestore" \
-		--shm "$SHM" --timeline 0 --segsize 16777216 "$seg" "$out"; then
+		--shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 "$seg" "$out"; then
 	assert "$(stat -c %s "$out")" "16777216" "restored WAL segment $seg is a full standard segment"
 else
 	echo "FAIL - walrestore could not reconstruct segment '$seg'"
@@ -229,12 +248,41 @@ else
 fi
 rm -f "$out"
 
+# The restore command must carry the immutable incarnation selected by the
+# compute.  It must not recover that identity from the daemon's mutable state.
+missing_incarnation=$(
+	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
+		--timeline 0 --segsize 16777216 "$seg" "$out" >/dev/null 2>&1
+	echo $?
+)
+assert "$missing_incarnation" "2" \
+	"walrestore requires an immutable timeline incarnation"
+invalid_incarnation_ok=1
+for invalid_incarnation in 0 -1 invalid 18446744073709551616; do
+	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
+		--timeline 0 --incarnation "$invalid_incarnation" --segsize 16777216 \
+		"$seg" "$out" >/dev/null 2>&1
+	[ "$?" -eq 2 ] || { invalid_incarnation_ok=0; break; }
+done
+assert "$invalid_incarnation_ok" "1" \
+	"walrestore rejects zero, signed, malformed, and overflowing incarnations"
+rm -f "$out"
+"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
+	--timeline 0 --incarnation 2 --segsize 16777216 "$seg" "$out" \
+	>/dev/null 2>&1
+stale_incarnation_rc=$?
+assert "$stale_incarnation_rc" "1" \
+	"walrestore fences a stale or mismatched immutable incarnation"
+assert "$([ ! -e "$out" ] && echo absent || echo present)" "absent" \
+	"failed stale-incarnation restore leaves no WAL output"
+
 # A restore command is also asked for timeline-history files.  The pagestore
 # archive intentionally does not retain those auxiliary files, so walrestore
 # must report them unavailable (not a hard command error that aborts recovery).
 history_out=$(mktemp)
 rm -f "$history_out"
-"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --segsize 16777216 \
+
+"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 \
 	00000002.history "$history_out" >/dev/null 2>&1
 history_rc=$?
 if [ "$history_rc" -eq 1 ] && [ ! -e "$history_out" ]; then
@@ -253,7 +301,7 @@ walrestore_reuse_ok=1
 for _ in $(seq 1 160); do
 	rm -f "$missing_out"
 	"$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" \
-		--timeline 0 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
+		--timeline 0 --incarnation 1 --segsize 16777216 FFFFFFFFFFFFFFFFFFFFFFFF \
 		"$missing_out" >/dev/null 2>&1
 	[ "$?" -eq 1 ] || { walrestore_reuse_ok=0; break; }
 done
@@ -600,8 +648,8 @@ assert "$([ -d "$SEEDOUT/pg_commit_ts" ] && echo present)" "present" \
 # the same bytes the parent's own log serves.
 rt_seg=$(basename "$(ls "$DATA"/pg_wal/archive_status/*.done 2>/dev/null | head -1)" .done)
 rt0=$(mktemp); rt1=$(mktemp)
-if "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --segsize 16777216 "$rt_seg" "$rt0" >/dev/null 2>&1 \
-   && "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 1 --segsize 16777216 "$rt_seg" "$rt1" >/dev/null 2>&1; then
+if "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 0 --incarnation 1 --segsize 16777216 "$rt_seg" "$rt0" >/dev/null 2>&1 \
+   && "$BUILD/contrib/pagestore/pagestore_walrestore" --shm "$SHM" --timeline 1 --incarnation 1 --segsize 16777216 "$rt_seg" "$rt1" >/dev/null 2>&1; then
 	assert "$(md5sum < "$rt1" | cut -d' ' -f1)" "$(md5sum < "$rt0" | cut -d' ' -f1)" \
 		"branch timeline serves a pre-fork WAL segment identical to the parent's"
 else
@@ -666,6 +714,14 @@ cp -a "$BRANCHDATA" "$BADTARGET"
 sed 's/"new_timeline": 1/"new_timeline": 2/' "$SEEDOUT/pagestore_branch.manifest" > "$BADTARGET/pagestore_branch.manifest"
 target_mismatch=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BADTARGET', 1, 0, '$bL');" 2>/dev/null || echo error)
 assert "$target_mismatch" "error" "prepared branch install rejects an existing target manifest for another branch"
+rm -rf "$(dirname "$BADTARGET")"
+# Numeric timeline/fork identity is not sufficient after an ID has been reused:
+# an install must never overwrite a target belonging to another incarnation.
+BADTARGET=$(mktemp -d)/branch
+cp -a "$BRANCHDATA" "$BADTARGET"
+sed 's/"incarnation": 1/"incarnation": 2/' "$SEEDOUT/pagestore_branch.manifest" > "$BADTARGET/pagestore_branch.manifest"
+target_incarnation_mismatch=$($P -c "SELECT pagestore_install_prepared_branch('$SEEDOUT', '$BADTARGET', 1, 0, '$bL');" 2>/dev/null || echo error)
+assert "$target_incarnation_mismatch" "error" "prepared branch install rejects an existing target manifest for another incarnation"
 rm -rf "$(dirname "$BADTARGET")"
 # a branch timeline without a manifest must fail closed at startup: an
 # unprepared copy of the parent datadir cannot boot as a branch
@@ -1223,7 +1279,8 @@ assert "$($P -c "SELECT pagestore_control_image_asof('0/1'::pg_lsn) IS NULL;")" 
 # checkpoint the newest image equals the live pg_control byte-for-byte
 RESTOREDIR=$(mktemp -d)
 mkdir -p "$RESTOREDIR/global"
-if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 "$RESTOREDIR" >/dev/null; then
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 \
+	--incarnation 1 "$RESTOREDIR" >/dev/null; then
 	echo "ok   - pagestore_control_restore installed the mirrored control image"
 else
 	echo "FAIL - pagestore_control_restore failed"; fail=1
@@ -1235,20 +1292,38 @@ else
 fi
 ctrl_ok=$("$BIN/pg_controldata" -D "$RESTOREDIR" >/dev/null 2>&1 && echo ok || echo error)
 assert "$ctrl_ok" "ok" "pg_controldata accepts the restored control file"
+invalid_control_incarnation_ok=1
+for invalid_incarnation in 0 -1 invalid 18446744073709551616; do
+	"$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+		--timeline 0 --incarnation "$invalid_incarnation" "$RESTOREDIR" \
+		>/dev/null 2>&1
+	[ "$?" -eq 2 ] || { invalid_control_incarnation_ok=0; break; }
+done
+assert "$invalid_control_incarnation_ok" "1" \
+	"control restore rejects zero, signed, malformed, and overflowing incarnations"
+"$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 "$RESTOREDIR" >/dev/null 2>&1
+assert "$?" "2" "control restore requires an immutable timeline incarnation"
 if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --archive-bootstrap "$RESTOREDIR" >/dev/null 2>&1; then
+	--timeline 0 --incarnation 1 --archive-bootstrap "$RESTOREDIR" >/dev/null 2>&1; then
 	echo "FAIL - archive bootstrap without an exact LSN should fail closed"; fail=1
 else
 	echo "ok   - archive bootstrap requires an exact checkpoint-redo LSN"
 fi
 rm -f "$RESTOREDIR/global/pg_control"
-if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn 0/1 "$RESTOREDIR" >/dev/null 2>&1; then
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 \
+	--incarnation 1 --lsn 0/1 "$RESTOREDIR" >/dev/null 2>&1; then
 	echo "FAIL - restore below the first update LSN should fail closed"; fail=1
 else
 	echo "ok   - restore below the first update LSN fails closed"
 fi
 assert "$([ -e "$RESTOREDIR/global/pg_control" ] && echo present || echo absent)" "absent" \
 	"failed restore leaves no control file behind"
+"$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
+	--timeline 0 --incarnation 2 "$RESTOREDIR" >/dev/null 2>&1
+assert "$?" "1" "control restore fences a stale or mismatched incarnation"
+assert "$([ -e "$RESTOREDIR/global/pg_control" ] && echo present || echo absent)" "absent" \
+	"stale-incarnation control restore leaves no control file behind"
 rm -rf "$RESTOREDIR"
 # the daemon's durable WAL retention floor: every mirrored control image ships
 # a redo-pointer note, and shipped WAL at/above min(redo) must be retained
@@ -1498,17 +1573,65 @@ assert "$([ "${readerSnapshotBlocks:-0}" -gt 1 ] && echo ok || echo no)" "ok" \
 BRANCHREADERPREP=$(mktemp -d)
 cp -a "$READERPREP/." "$BRANCHREADERPREP"
 sed -i 's/"timeline": 0/"timeline": 1/' "$BRANCHREADERPREP/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$bL\"," \
+sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$bL\"," \
 	"$BRANCHREADERPREP/pagestore_reader.manifest"
+# Retag the copied snapshot to timeline 1 and recompute its PostgreSQL CRC32C.
+# This produces a structurally valid branch-reader fixture, so the install must
+# reach (and be rejected by) the target branch-manifest identity check below.
+python3 - "$BRANCHREADERPREP/pagestore_reader.snapshot" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+struct.pack_into("=I", data, 16, 1)
+crc = 0xFFFFFFFF
+for byte in data[:32] + data[40:]:
+    crc ^= byte
+    for _ in range(8):
+        crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+struct.pack_into("=I", data, 32, crc ^ 0xFFFFFFFF)
+open(path, "wb").write(data)
+PY
 BRANCHREADERTARGET=$(mktemp -d)
-branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCHREADERPREP', '$BRANCHREADERTARGET', 1, '$readerR');" \
-	>/dev/null 2>&1 && echo ok || echo error)
-assert "$branch_reader_install" "error" \
-	"reader install rejects a snapshot from a different timeline"
+
+touch "$BRANCHREADERTARGET/install-sentinel"
+sed -e 's/"new_timeline": 2/"new_timeline": 1/' \
+	-e "s#\"fork_lsn\": \"[^\"]*\"#\"fork_lsn\": \"$bL\"#" \
+	-e 's/"incarnation": 1/"incarnation": 2/' \
+	"$BRANCHDATA/pagestore_branch.manifest" > \
+	"$BRANCHREADERTARGET/pagestore_branch.manifest"
+target_manifest_before=$(sha256sum "$BRANCHREADERTARGET/pagestore_branch.manifest" | cut -d' ' -f1)
+branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCHREADERPREP', '$BRANCHREADERTARGET', 1, '$readerR');" 2>&1 || true)
+branch_reader_error_count=$(printf '%s\n' "$branch_reader_install" | grep -c 'target branch manifest does not match the reader branch identity')
+[ "$branch_reader_error_count" -eq 1 ] || printf '%s\n' "$branch_reader_install" >&2
+assert "$branch_reader_error_count" "1" \
+	"reader install rejects a target from another branch incarnation"
+assert "$(sha256sum "$BRANCHREADERTARGET/pagestore_branch.manifest" | cut -d' ' -f1)" "$target_manifest_before" \
+	"incarnation mismatch leaves the target branch manifest unchanged"
+assert "$([ -f "$BRANCHREADERTARGET/install-sentinel" ] && echo present)" "present" \
+	"incarnation mismatch leaves target artifacts untouched"
+
+sed -e 's/"new_timeline": 2/"new_timeline": 1/' \
+	-e "s#\"fork_lsn\": \"[^\"]*\"#\"fork_lsn\": \"$bL\"#" \
+	-e 's/"parent_incarnation": 1/"parent_incarnation": 2/' \
+	"$BRANCHDATA/pagestore_branch.manifest" > \
+	"$BRANCHREADERTARGET/pagestore_branch.manifest"
+target_manifest_before=$(sha256sum "$BRANCHREADERTARGET/pagestore_branch.manifest" | cut -d' ' -f1)
+branch_reader_install=$($P -c "SELECT pagestore_install_prepared_reader('$BRANCHREADERPREP', '$BRANCHREADERTARGET', 1, '$readerR');" 2>&1 || true)
+branch_reader_error_count=$(printf '%s\n' "$branch_reader_install" | grep -c 'target branch manifest does not match the reader branch identity')
+[ "$branch_reader_error_count" -eq 1 ] || printf '%s\n' "$branch_reader_install" >&2
+assert "$branch_reader_error_count" "1" \
+	"reader install rejects a target from another parent incarnation"
+assert "$(sha256sum "$BRANCHREADERTARGET/pagestore_branch.manifest" | cut -d' ' -f1)" "$target_manifest_before" \
+	"parent-incarnation mismatch leaves the target branch manifest unchanged"
+assert "$([ -f "$BRANCHREADERTARGET/install-sentinel" ] && echo present)" "present" \
+	"parent-incarnation mismatch leaves target artifacts untouched"
 rm -rf "$BRANCHREADERPREP" "$BRANCHREADERTARGET"
 # Emulate local recovery having replayed the later commit: newest pg_xact says
 # committed, but the fixed running-XID snapshot must retain R's visibility.
-if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 --lsn "$readerR" "$READERDATA" >/dev/null; then
+if "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" --timeline 0 \
+	--incarnation 1 --lsn "$readerR" "$READERDATA" >/dev/null; then
 	echo "ok   - reader bootstrap restored pg_control at exact R"
 else
 	echo "FAIL - reader bootstrap could not restore pg_control at exact R"; fail=1
@@ -1734,7 +1857,7 @@ BADREADER=$(mktemp -d)/reader
 cp -a "$READERDATA" "$BADREADER"
 BADREADER_SOCK=$(new_sockdir badreader)
 sed -i 's/"timeline": 0/"timeline": 1/' "$BADREADER/pagestore_reader.manifest"
-sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"fork_lsn\": \"$readerR\"," \
+sed -i "/\"timeline\": 1,/a\\  \"parent_timeline\": 0,\\n  \"parent_incarnation\": 1,\\n  \"fork_lsn\": \"$readerR\"," \
 	"$BADREADER/pagestore_reader.manifest"
 cat >> "$BADREADER/postgresql.conf" <<EOF
 pagestore.timeline = 1
@@ -1803,9 +1926,17 @@ assert "$($PR -c "SELECT nextval('reader_seq');" 2>&1 | grep -c 'read-only')" "1
 assert "$($PR -c "CREATE TABLE reader_ddl(i int);" 2>&1 | grep -c 'read-only')" "1" \
 	"pinned reader refuses DDL"
 # WAL-less (unlogged) pages carry version LSN 0: checkpoint R does not prove
-# them complete, so even an admission fence must fail closed.
-assert "$($PR -c "SELECT count(*) FROM reader_unlogged;" 2>&1 | grep -c 'daemon reported error')" "1" \
-	"pinned reader refuses WAL-less (unlogged) relation reads"
+# them complete, so the reader must never expose their rows.  PostgreSQL may
+# reset the unlogged main fork during startup before consulting the daemon; in
+# that case the equally fail-closed result is an empty relation.  Otherwise the
+# daemon rejects the capped WAL-less page read explicitly.
+wal_less_read=$($PR -At -c "SELECT count(*) FROM reader_unlogged;" 2>&1 || true)
+if [ "$wal_less_read" = "0" ] || printf '%s\n' "$wal_less_read" | grep -q 'daemon reported error'; then
+	echo "ok   - pinned reader does not expose WAL-less (unlogged) relation rows"
+else
+	echo "FAIL - pinned reader exposed or mishandled WAL-less relation rows: $wal_less_read"
+	fail=1
+fi
 # CHECKPOINT would make the (exempt) checkpointer insert private WAL
 assert "$($PR -c "CHECKPOINT;" 2>&1 | grep -c 'not allowed on a pinned reader')" "1" \
 	"pinned reader refuses manual CHECKPOINT"
@@ -1869,7 +2000,7 @@ assert "$($PR -c "SET max_parallel_workers_per_gather = 4;
 	"advancing readers cannot re-enable parallel plans with session settings"
 "$BIN/pg_ctl" -D "$ADVANCINGDATA" -w stop >/dev/null 2>&1
 if ! "$BUILD/contrib/pagestore/pagestore_control_restore" --shm "$SHM" \
-	--timeline 0 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
+	--timeline 0 --incarnation 1 --lsn "$readerR" "$ADVANCINGDATA" >/dev/null; then
 	echo "FAIL - advancing reader restart could not restore its boot control image"
 	exit 1
 fi

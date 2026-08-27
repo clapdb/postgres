@@ -53,7 +53,7 @@ wait_daemon_ready() {
 				continue
 			fi
 			[ "$magic" = "$((0x50414753))" ] &&
-				[ "$version" = 34 ] && [ "$page_size" = 8192 ] &&
+				[ "$version" = 36 ] && [ "$page_size" = 8192 ] &&
 				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&
 				[ "$nshards" = 1 ] && return 0
 		fi
@@ -154,7 +154,7 @@ done
 # 2) turn the instance into a redo worker: recover from the store's WAL only
 # (backup_label is already in PGDATA from pg_backup_stop above)
 touch "$D/recovery.signal"
-echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize 16777216 %f %p'" >> "$D/postgresql.conf"
+echo "restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize 16777216 %f %p'" >> "$D/postgresql.conf"
 rm -f "$D"/pg_wal/0000000*	# remove local WAL: recovery must fetch from the store
 
 if "$BIN/pg_ctl" -D "$D" -l "$D/r.log" -w start >/dev/null 2>&1; then

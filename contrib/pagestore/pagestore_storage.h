@@ -58,6 +58,9 @@ typedef struct PsStorage
 	int64_t		(*seg_size) (uint32_t shard, int seg);
 	/* Optional: remove a no-longer-referenced segment (ENOENT is success). */
 	int			(*seg_remove) (uint32_t shard, int seg);
+	/* Crash-safe same-id replacement: fsync temp, rename, fsync parent dir. */
+	int			(*seg_rewrite) (uint32_t shard, int seg, const void *buf,
+							 uint64_t len);
 
 	/*
 	 * Per-timeline shipped-WAL log.  wal_append takes the record header (a) and
@@ -92,6 +95,12 @@ typedef struct PsStorage
 								 uint64_t epoch);
 	int			(*walidx_epoch_gc) (uint32_t tl, const uint64_t *keep_epochs,
 								 uint32_t nshards);
+	/* Remove only the deleting timeline's private WAL/WAL-index artifacts.
+	 * The backend must validate the complete target set before unlinking any
+	 * entry, fsync every changed directory, and return an error for unknown or
+	 * non-regular entries.  A backend without a safe implementation leaves this
+	 * NULL (fail closed). */
+	int			(*timeline_wal_cleanup) (uint32_t tl);
 
 	/* timeline metadata log */
 	int			(*meta_append) (const void *buf, uint32_t len);

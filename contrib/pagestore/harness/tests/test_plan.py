@@ -185,7 +185,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 34, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 36, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -774,6 +774,19 @@ class PlanValidationTests(unittest.TestCase):
                 program,
             )
 
+    def test_control_restore_command_carries_immutable_incarnation(self):
+        self.assertEqual(
+            MODULE.pagestore_control_restore_command(
+                Path("/build/pagestore_control_restore"),
+                "/harness", 0, 1, "0/2", Path("/data"),
+            ),
+            [
+                "/build/pagestore_control_restore", "--shm", "/harness",
+                "--timeline", "0", "--incarnation", "1", "--lsn", "0/2",
+                "/data",
+            ],
+        )
+
     def test_missing_build_control_restore_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(MODULE.PlanError, "does not provide executable"):
@@ -1119,7 +1132,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":34,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":36,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -1194,7 +1207,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":34,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":36,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
