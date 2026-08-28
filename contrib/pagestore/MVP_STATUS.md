@@ -242,8 +242,9 @@ an already-published frontier can finish idempotent unlink without a new proof.
 Focused core coverage (62 checks) includes idle preselection, ancestry and timeline
 isolation, natural nonzero child fallback, child-local controls, target branch
 caps, LIVE/DELETING/DELETED floors, naturally nonzero starts, unaligned and
-boundary-crossing flat progress tails, snapshot recovery and re-ship admission
-after base advancement, pre-metadata reads, restart/residual retry, a read/frontier publication
+boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index
+re-ship admission after base advancement, pre-metadata reads, restart/residual
+retry, a read/frontier publication
 race, fenced residual-query suppression, pending-proof cleanup failure,
 metadata publication failure/backoff, and admission concurrency.
 

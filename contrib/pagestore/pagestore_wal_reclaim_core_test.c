@@ -599,8 +599,9 @@ test_restart_with_crossing_flat_tail(void)
 		  "publish a WAL-index snapshot before reclaiming its historical start");
 	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
 	check(maintenance_until_count(store, 0, 0) &&
-		  !append_wal_bytes(0, 0, 32 * 1024),
-		  "reclaim preserves the crossing tail and rejects a re-ship below its base");
+		  !append_wal_bytes(0, 0, 32 * 1024) &&
+		  !wal_index_add(0, 0),
+		  "reclaim rejects WAL and WAL-index re-ships below its retained base");
 	close_store();
 	check(ps_core_open(store) == 0,
 		  "restart restores durable progress through a crossing flat tail");

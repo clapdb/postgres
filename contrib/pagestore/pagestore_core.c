@@ -9283,9 +9283,14 @@ walidx_add_batch_locked(uint32_t tl, const PsWalIndexEntry *entries,
 		WalIdxRec  *rec;
 		int			pos;
 
+		/* The caller holds this shard write lock and the WAL-index publish
+		 * read gate.  Reclaim needs every shard write lock before its publish
+		 * write gate, so the complete ancestry frontier cannot advance between
+		 * this admission check and the durable batch append. */
 		if (ps_shard_of(&entries[i].key) != shard ||
 			!walidx_metadata_valid(entries[i].flags, entries[i].lsn,
-								 entries[i].end_lsn))
+								 entries[i].end_lsn) ||
+			!wal_reclaim_frontier_ancestry_allows(tl, entries[i].lsn))
 		{
 			free(records);
 			return -1;

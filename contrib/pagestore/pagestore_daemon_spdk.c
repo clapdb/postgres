@@ -510,7 +510,15 @@ run_request(uint32_t i, PsChannel *ch)
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
 		op == PS_OP_REQUIRE_BRANCH)
 		ps_lock_map_wr();
+	/* WAL-index inserts complete synchronously in ps_handle_meta().  Match the
+	 * POSIX frontend's shard exclusion so snapshot/prune maintenance and a
+	 * future retained-base publisher cannot race the batch admission or its
+	 * in-memory insertion.  Do not extend this lock across async page I/O. */
+	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
+		ps_lock_shard_wr(ps_shard_of(&ch->key));
 	begin(i, ch);
+	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
+		ps_unlock_shard(ps_shard_of(&ch->key));
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
 		op == PS_OP_REQUIRE_BRANCH)
 		ps_unlock_map();
