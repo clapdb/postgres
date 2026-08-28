@@ -580,6 +580,32 @@ test_residual_prefix_retry_after_reopen(void)
 }
 
 static void
+test_restart_with_crossing_flat_tail(void)
+{
+	const uint64_t crossing_start = WAL_SEGMENT - 32 * 1024;
+	const uint64_t tail_end = WAL_SEGMENT + 32 * 1024;
+	char store[] = "/tmp/pagestore-wal-policy-crossing-tail-XXXXXX";
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) crossing_start) &&
+		  append_wal_bytes(0, crossing_start, 64 * 1024) &&
+		  write_control(0, tail_end, tail_end) &&
+		  wal_index_progress(0, 0, tail_end) &&
+		  segment_count(store, 0) == 1,
+		  "construct immutable WAL with one flat record crossing its end");
+	check(maintenance_until_count(store, 0, 0),
+		  "reclaim the immutable prefix while preserving its crossing flat record");
+	close_store();
+	check(ps_core_open(store) == 0,
+		  "restart restores durable progress through a crossing flat tail");
+	check(wal_read_status(0, WAL_SEGMENT) == PS_STATUS_OK,
+		  "the surviving crossing flat tail remains readable after restart");
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_deleted_descendant_floor(void)
 {
 	const uint64_t branch_lsn = WAL_SEGMENT + WAL_SEGMENT / 2;
@@ -968,6 +994,7 @@ main(void)
 	test_progress_beyond_immutable_end();
 	test_child_branch_cap();
 	test_residual_prefix_retry_after_reopen();
+	test_restart_with_crossing_flat_tail();
 	test_deleted_descendant_floor();
 	test_fenced_residual_query_stops_retries();
 	test_undefined_timeline_read();

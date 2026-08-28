@@ -9982,7 +9982,13 @@ walidx_recover_one(uint32_t tl, uint32_t shard)
 				if (!walidx_progress_durable[tl] &&
 					wal_segment_store_opened[tl] &&
 					rec.start_lsn < wal_segment_stores[tl].start_lsn &&
-					walidx_progress[tl] == wal_segment_stores[tl].start_lsn)
+					(walidx_progress[tl] == wal_segment_stores[tl].start_lsn ||
+					 (wal_chunks_n[tl] != 0 &&
+					  wal_chunks[tl][0].start_lsn == walidx_progress[tl] &&
+					  wal_chunks[tl][0].start_lsn <
+						wal_segment_stores[tl].start_lsn &&
+					  wal_chunks[tl][0].end_lsn >
+						wal_segment_stores[tl].start_lsn)))
 					walidx_progress[tl] = rec.start_lsn;
 				if (rec.magic != WALIDX_PROGRESS_MAGIC ||
 					rec.rec_len != sizeof(rec) || rec.timeline != tl ||
