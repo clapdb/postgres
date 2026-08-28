@@ -594,8 +594,13 @@ test_restart_with_crossing_flat_tail(void)
 		  wal_index_progress(0, 0, tail_end) &&
 		  segment_count(store, 0) == 1,
 		  "construct immutable WAL with one flat record crossing its end");
-	check(maintenance_until_count(store, 0, 0),
-		  "reclaim the immutable prefix while preserving its crossing flat record");
+	check(setenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES", "1", 1) == 0 &&
+		  ps_core_maintenance() == 1 && segment_count(store, 0) == 1,
+		  "publish a WAL-index snapshot before reclaiming its historical start");
+	unsetenv("PAGESTORE_TEST_WALIDX_SNAPSHOT_BYTES");
+	check(maintenance_until_count(store, 0, 0) &&
+		  !append_wal_bytes(0, 0, 32 * 1024),
+		  "reclaim preserves the crossing tail and rejects a re-ship below its base");
 	close_store();
 	check(ps_core_open(store) == 0,
 		  "restart restores durable progress through a crossing flat tail");

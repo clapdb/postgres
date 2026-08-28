@@ -6790,7 +6790,8 @@ wal_append_locked(uint32_t tl, uint64_t start_lsn,
 {
 	WalRecHdr	h;
 
-	if (tl >= MAX_TIMELINES)
+	if (tl >= MAX_TIMELINES ||
+		!wal_reclaim_frontier_one_allows(tl, start_lsn))
 		return -1;
 
 	/*
@@ -9369,6 +9370,9 @@ walidx_snapshot_recover(uint32_t tl)
 	char directory[4096];
 	char manifest[4096];
 	struct stat st;
+	uint64_t coverage_start;
+	uint64_t first;
+	uint64_t retained_base = 0;
 	int reshard;
 	int n;
 
@@ -9381,11 +9385,25 @@ walidx_snapshot_recover(uint32_t tl)
 		return errno == ENOENT ? 0 : -1;
 	if (ps_walidx_snapshot_open(&snapshot, directory, tl) != 0)
 		return -1;
+	first = wal_log_start(tl);
+	coverage_start = snapshot.start_lsn;
+	if (wal_segment_store_opened[tl])
+	{
+		if (ps_wal_store_retained_base(&wal_segment_stores[tl],
+										&retained_base) != 0)
+			goto fail;
+		if (coverage_start < retained_base)
+			coverage_start = retained_base;
+	}
 	reshard = snapshot.nshards == 1 && core_shards() > 1;
 	if ((snapshot.nshards != core_shards() && !reshard) ||
-		snapshot.start_lsn != wal_log_start(tl) ||
+		(snapshot.start_lsn != first &&
+		 (!wal_segment_store_opened[tl] ||
+		  snapshot.start_lsn >= retained_base ||
+		  first < snapshot.start_lsn || first > retained_base)) ||
 		snapshot.end_lsn > wal_end_read(tl) ||
-		!wal_coverage_advance(tl, snapshot.start_lsn, snapshot.end_lsn))
+		(coverage_start < snapshot.end_lsn &&
+		 !wal_coverage_advance(tl, coverage_start, snapshot.end_lsn)))
 		goto fail;
 	for (uint32_t shard = 0; shard < snapshot.nshards; shard++)
 	{
