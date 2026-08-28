@@ -120,6 +120,10 @@ static int	ls_channel = -1;
 static uint32	ls_channel_shard = UINT32_MAX;
 static uint32	ls_nchannels = 0;
 static uint32	ls_nshards = 1;
+/* Bound once by the postmaster from the durable branch/reader manifest. */
+#define LS_MAX_TIMELINES	1024
+static uint64	localsvc_bound_incarnation[LS_MAX_TIMELINES];
+static bool	localsvc_incarnation_bound[LS_MAX_TIMELINES];
 
 /* max logical pages that fit in one transfer (io_unit) for this engine */
 #define LS_MAX_PAGES_PER_OP		(PS_IO_UNIT / BLCKSZ)
@@ -192,6 +196,7 @@ ls_attach(void)
 
 	hdr = (PsShmHeader *) shm;
 	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY ||
 		hdr->page_size != BLCKSZ)
 	{
 		uint32		got_magic = hdr->magic;
@@ -429,6 +434,45 @@ ls_exec(PsChannel *ch)
 	ls_exec_timeout(ch, 0);
 }
 
+static uint64
+ls_expected_incarnation(uint32 timeline)
+{
+	/* The daemon's root timeline is permanent and has generation one. */
+	if (timeline == 0)
+		return 1;
+	if (timeline >= LS_MAX_TIMELINES ||
+		!localsvc_incarnation_bound[timeline])
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: timeline %u has no immutable incarnation binding",
+					timeline),
+				errhint("Boot the compute with a matching pagestore branch or reader manifest.")));
+	return localsvc_bound_incarnation[timeline];
+}
+
+void
+pagestore_localsvc_bind_incarnation(uint32 timeline, uint64 incarnation)
+{
+	if (timeline >= LS_MAX_TIMELINES || incarnation == 0)
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: invalid timeline incarnation binding")));
+	if (localsvc_incarnation_bound[timeline] &&
+		localsvc_bound_incarnation[timeline] != incarnation)
+		ereport(ERROR,
+				(errmsg("pagestore localsvc: conflicting timeline incarnation binding"),
+				 errdetail("Timeline %u is already bound to %llu, requested %llu.",
+						   timeline,
+						   (unsigned long long) localsvc_bound_incarnation[timeline],
+						   (unsigned long long) incarnation)));
+	localsvc_bound_incarnation[timeline] = incarnation;
+	localsvc_incarnation_bound[timeline] = true;
+}
+
+uint64
+pagestore_localsvc_expected_incarnation(void)
+{
+	return ls_expected_incarnation((uint32) localsvc_timeline);
+}
+
 static void
 ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 {
@@ -444,10 +488,42 @@ ls_fill_key(PsChannel *ch, const PageStoreRelKey *key)
 	 * Channels are reused across op kinds and req_lsn now has meaning for
 	 * every metadata op (an event LSN for mutations, an as-of horizon for
 	 * queries).  Clear it here so no sender inherits a stale value; ops
-	 * that need one assign it after this call.
+	 * that need one assign it after this call.  The incarnation is assigned by
+	 * the stamped channel constructor and is intentionally preserved when this
+	 * helper is reused for a split-phase request.
 	 */
 	ch->req_lsn = 0;
 	ch->req_seq = 0;
+}
+
+static void
+ls_fill_key_stamped(PsChannel *ch, const PageStoreRelKey *key, uint32 timeline)
+{
+	ls_fill_key(ch, key);
+	ch->timeline = timeline;
+	ch->incarnation = ls_expected_incarnation(timeline);
+}
+
+/* Stamp the request from the startup-bound identity.  Normal operations must
+ * not query mutable daemon state: a query followed by an operation would
+ * permit a delete/reuse between the two messages. */
+static PsChannel *
+ls_chan_for_key_stamped(const PageStoreRelKey *key)
+{
+	PsChannel *ch = ls_chan_for_key(key);
+
+	ls_fill_key_stamped(ch, key, (uint32) localsvc_timeline);
+	return ch;
+}
+
+static PsChannel *
+ls_chan_for_key_klass_stamped(const PageStoreRelKey *key, uint32 klass,
+							 uint32 timeline)
+{
+	PsChannel *ch = ls_chan_for_key_klass(key, klass);
+
+	ls_fill_key_stamped(ch, key, timeline);
+	return ch;
 }
 
 /* Resolve the configured checkpoint redo to the control mirror's durable
@@ -471,6 +547,7 @@ pagestore_localsvc_read_fence_for_timeline_timeout(uint32 timeline,
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = 2;
 	ch->req_lsn = read_lsn;
+	ch->incarnation = ls_expected_incarnation(timeline);
 	ls_exec_timeout(ch, timeout_ms);
 	if (ch->result == 0 || ch->req_lsn != read_lsn)
 		return false;
@@ -591,13 +668,12 @@ static void
 ls_create(const PageStoreRelKey *key, void *localreln, bool isRedo,
 		  bool isRedoEnsure)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("relation create");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = isRedoEnsure ? 2 : (isRedo ? 1 : 0);
 	ch->req_lsn = ls_op_lsn();
@@ -609,9 +685,8 @@ static bool
 ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 {
 	uint64		read_seq = ls_pinned_read_seq();
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
 	ch->req_lsn = ls_read_lsn();
 	ch->req_seq = read_seq;
@@ -623,13 +698,12 @@ ls_fork_exists(const PageStoreRelKey *key, void *localreln)
 static void
 ls_unlink(const PageStoreRelKey *key, bool isRedo)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("relation unlink");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_UNLINK;
 	ch->is_redo = isRedo ? 1 : 0;
 	ch->req_lsn = ls_op_lsn();
@@ -657,9 +731,8 @@ static BlockNumber
 ls_nblocks(const PageStoreRelKey *key, void *localreln)
 {
 	uint64		read_seq = ls_pinned_read_seq();
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = ls_read_lsn();
 	ch->is_redo = AmStartupProcess() ? 1 : 0;
@@ -677,13 +750,12 @@ static void
 ls_truncate(const PageStoreRelKey *key, void *localreln,
 			BlockNumber old_blocks, BlockNumber nblocks)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("relation truncate");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_TRUNCATE;
 	ch->old_nblocks = old_blocks;
 	ch->nblocks = nblocks;
@@ -701,14 +773,14 @@ ls_readv(const PageStoreRelKey *key, void *localreln,
 		 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
 	uint64		read_seq = ls_pinned_read_seq();
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 	BlockNumber done = 0;
 
 	while (done < nblocks)
 	{
 		BlockNumber chunk = Min(nblocks - done, LS_MAX_PAGES_PER_OP);
 
-		ls_fill_key(ch, key);
+		ls_fill_key_stamped(ch, key, (uint32) localsvc_timeline);
 		ch->opcode = PS_OP_READV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
@@ -732,7 +804,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void **buffers, BlockNumber nblocks,
 		  bool skipFsync)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 	BlockNumber done = 0;
 
 
@@ -752,7 +824,7 @@ ls_writev(const PageStoreRelKey *key, void *localreln,
 	{
 		BlockNumber chunk = Min(nblocks - done, LS_MAX_PAGES_PER_OP);
 
-		ls_fill_key(ch, key);
+		ls_fill_key_stamped(ch, key, (uint32) localsvc_timeline);
 		ch->opcode = PS_OP_WRITEV;
 		ch->blocknum = blocknum + done;
 		ch->nblocks = chunk;
@@ -773,13 +845,12 @@ static void
 ls_extend(const PageStoreRelKey *key, void *localreln,
 		  BlockNumber blocknum, const void *buffer, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("relation extend");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXTEND;
 	ch->blocknum = blocknum;
 	ch->nblocks = 1;
@@ -802,13 +873,12 @@ static void
 ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 			  BlockNumber blocknum, int nblocks, bool skipFsync)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("relation extend");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_ZEROEXTEND;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
@@ -830,9 +900,8 @@ ls_zeroextend(const PageStoreRelKey *key, void *localreln,
 static void
 ls_immedsync(const PageStoreRelKey *key, void *localreln)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_IMMEDSYNC;
 	ls_exec(ch);
 }
@@ -842,7 +911,7 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 			   BlockNumber nblocks, int *out_fd, uint64 *out_offset)
 {
 	uint64		read_seq = ls_pinned_read_seq();
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 	if (nblocks > LS_MAX_PAGES_PER_OP)
 		ereport(ERROR,
@@ -850,7 +919,6 @@ ls_fetch_to_fd(const PageStoreRelKey *key, BlockNumber blocknum,
 						nblocks, LS_MAX_PAGES_PER_OP),
 				 errhint("Lower io_combine_limit.")));
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = blocknum;
 	ch->nblocks = nblocks;
@@ -891,9 +959,8 @@ void
 pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
 						   uint64 lsn, void *out)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = blocknum;
 	ch->nblocks = 1;
@@ -909,7 +976,8 @@ pagestore_localsvc_read_at(const PageStoreRelKey *key, BlockNumber blocknum,
  */
 void
 pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
-								uint64 branch_lsn)
+								uint64 branch_lsn, uint64 target_incarnation,
+								uint64 parent_incarnation)
 {
 	PsChannel  *ch = ls_chan();
 
@@ -917,19 +985,24 @@ pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = target_incarnation;
+	ch->req_seq = parent_incarnation;
 	ls_exec(ch);
 }
 
 void
 pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
-								  uint64 branch_lsn)
+								  uint64 branch_lsn, uint64 target_incarnation,
+								  uint64 parent_incarnation)
 {
-	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl, branch_lsn, 0);
+	pagestore_localsvc_require_branch_timeout(new_tl, parent_tl, branch_lsn,
+												 target_incarnation, parent_incarnation, 0);
 }
 
 void
 pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
-										  uint64 branch_lsn, int timeout_ms)
+										  uint64 branch_lsn, uint64 target_incarnation,
+										  uint64 parent_incarnation, int timeout_ms)
 {
 	PsChannel  *ch = ls_chan();
 
@@ -937,6 +1010,8 @@ pagestore_localsvc_require_branch_timeout(uint32 new_tl, uint32 parent_tl,
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = target_incarnation;
+	ch->req_seq = parent_incarnation;
 	ls_exec_timeout(ch, timeout_ms);
 }
 
@@ -957,9 +1032,9 @@ void
 pagestore_localsvc_store_sync_timeout(int timeout_ms)
 {
 	PageStoreRelKey key = {0};
-	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
+													(uint32) localsvc_timeline);
 
-	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_IMMEDSYNC;
 	ls_exec_timeout(ch, timeout_ms);
@@ -1003,9 +1078,9 @@ uint64
 pagestore_localsvc_admission_barrier_timeout(int timeout_ms)
 {
 	PageStoreRelKey key = {0};
-	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
+													(uint32) localsvc_timeline);
 
-	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_ADMISSION_BARRIER;
 	ls_exec_timeout(ch, timeout_ms);
@@ -1039,8 +1114,8 @@ pagestore_localsvc_wal_retain_floor(void)
 	PageStoreRelKey key = {0};
 
 	/* route by the control key so the query lands on its owner shard */
-	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
-	ls_fill_key(ch, &key);
+	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
+													(uint32) localsvc_timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_WAL_RETAIN_FLOOR;
 	ch->timeline = (uint32) localsvc_timeline;
@@ -1078,9 +1153,7 @@ pagestore_localsvc_retention_set_timeout(uint32 timeline, uint32 owner_kind,
 	if (generation == 0 || admission_seq == 0 ||
 		admission_seq >= UINT64_MAX - 1)
 		return PS_STATUS_ERROR;
-	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
-
-	ls_fill_key(ch, &key);
+	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_SET;
 	ch->timeline = timeline;
@@ -1108,8 +1181,7 @@ pagestore_localsvc_retention_reserve_timeout(uint32 timeline,
 	*admission_seq = 0;
 	if (generation == 0)
 		return PS_STATUS_ERROR;
-	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
-	ls_fill_key(ch, &key);
+	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_RESERVE;
 	ch->timeline = timeline;
@@ -1145,9 +1217,7 @@ pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
 
 	if (generation == 0)
 		return PS_STATUS_ERROR;
-	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
-
-	ls_fill_key(ch, &key);
+	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL, timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_DROP;
 	ch->timeline = timeline;
@@ -1157,16 +1227,47 @@ pagestore_localsvc_retention_drop_timeout(uint32 timeline, uint32 owner_kind,
 	return ls_exec_wait(ch, timeout_ms);
 }
 
+/*
+ * Drop a retention owner while explicitly naming the timeline incarnation.
+ * This is used by the controller, which may be managing a timeline that is
+ * not locally bound in the current backend.  In particular, do not use the
+ * stamped channel helper here: doing so would silently replace the supplied
+ * immutable token with the local timeline binding.
+ */
+uint8
+pagestore_localsvc_retention_drop_with_incarnation(uint32 timeline,
+										   uint32 owner_kind,
+										   uint64 owner_id,
+										   uint32 generation,
+										   uint64 incarnation)
+{
+	PageStoreRelKey key = {0};
+	PsChannel  *ch;
+
+	if (owner_id == 0 || generation == 0 || incarnation == 0)
+		return PS_STATUS_ERROR;
+	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	ls_fill_key(ch, &key);
+	ch->key.klass = PS_KLASS_CONTROL;
+	ch->timeline = timeline;
+	ch->incarnation = incarnation;
+	ch->opcode = PS_OP_RETENTION_PIN_DROP;
+	ch->blocknum = owner_kind;
+	ch->old_nblocks = generation;
+	ch->req_seq = owner_id;
+	return ls_exec_wait(ch, 0);
+}
+
 uint8
 pagestore_localsvc_retention_lookup(uint32 timeline, uint32 owner_kind,
 									uint64 owner_id, PsRetentionPin *pin,
 									bool *found, int timeout_ms)
 {
 	PageStoreRelKey key = {0};
-	PsChannel  *ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
+													timeline);
 	uint8		status;
 
-	ls_fill_key(ch, &key);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_LOOKUP;
 	ch->timeline = timeline;
@@ -1214,8 +1315,8 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
 	if (epoch == NULL)
 		return PS_STATUS_ERROR;
 
-	ch = ls_chan_for_key_klass(&key, PS_KLASS_CONTROL);
-	ls_fill_key(ch, &key);
+	ch = ls_chan_for_key_klass_stamped(&key, PS_KLASS_CONTROL,
+													(uint32) localsvc_timeline);
 	ch->key.klass = PS_KLASS_CONTROL;
 	ch->opcode = PS_OP_RETENTION_PIN_GET;
 	ch->blocknum = index;
@@ -1257,7 +1358,8 @@ pagestore_localsvc_retention_get(uint32 index, PsRetentionPin *pin,
  */
 void
 pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
-								 uint64 branch_lsn)
+								 uint64 branch_lsn, uint64 target_incarnation,
+								 uint64 parent_incarnation)
 {
 	PsChannel  *ch = ls_chan();
 
@@ -1268,6 +1370,8 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 	ch->timeline = new_tl;
 	ch->parent_timeline = parent_tl;
 	ch->req_lsn = branch_lsn;
+	ch->incarnation = target_incarnation;
+	ch->req_seq = parent_incarnation;
 	ls_exec(ch);
 }
 
@@ -1279,6 +1383,7 @@ pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
 void
 pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 {
+	uint64		incarnation = ls_expected_incarnation((uint32) localsvc_timeline);
 	PsChannel  *ch = ls_chan();
 
 	if (localsvc_read_lsn != 0)
@@ -1286,6 +1391,7 @@ pagestore_localsvc_wal_append(uint64 start_lsn, const void *data, uint32 len)
 
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_APPEND;
+	ch->incarnation = incarnation;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	memcpy(ch->data, data, len);
@@ -1302,10 +1408,12 @@ pagestore_localsvc_wal_end(void)
 uint64
 pagestore_localsvc_wal_end_timeout(int timeout_ms)
 {
+	uint64		incarnation = ls_expected_incarnation((uint32) localsvc_timeline);
 	PsChannel  *ch = ls_chan();
 
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->opcode = PS_OP_WAL_SIZE;
+	ch->incarnation = incarnation;
 	ls_exec_timeout(ch, timeout_ms);
 	return ch->req_lsn;
 }
@@ -1319,11 +1427,13 @@ int
 pagestore_localsvc_wal_read(uint32 timeline, uint64 start_lsn, uint32 len,
 							void *out)
 {
+	uint64		incarnation = ls_expected_incarnation(timeline);
 	PsChannel  *ch = ls_chan();
 	int			n;
 
 	ch->timeline = timeline;
 	ch->opcode = PS_OP_WAL_READ;
+	ch->incarnation = incarnation;
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	ls_exec(ch);
@@ -1349,9 +1459,8 @@ pagestore_localsvc_timeline(void)
 uint64
 pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_NBLOCKS;
 	ch->req_lsn = lsn;
 	ls_exec(ch);
@@ -1361,9 +1470,8 @@ pagestore_localsvc_nblocks_asof(const PageStoreRelKey *key, uint64 lsn)
 int
 pagestore_localsvc_exists_asof(const PageStoreRelKey *key, uint64 lsn)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_EXISTS;
 	ch->req_lsn = lsn;
 	ls_exec(ch);
@@ -1402,15 +1510,15 @@ void
 pagestore_localsvc_walidx_add(const PageStoreRelKey *key, BlockNumber block,
 							  uint64 lsn)
 {
-	PsChannel  *ch = ls_chan_for_key(key);
+	PsChannel  *ch = ls_chan_for_key_stamped(key);
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("WAL index append");
 
-	ls_fill_key(ch, key);
 	ch->opcode = PS_OP_WAL_INDEX_ADD;
 	ch->blocknum = block;
 	ch->req_lsn = lsn;
+	/* The stamped channel carries the local timeline token. */
 	ls_exec(ch);
 }
 
@@ -1420,11 +1528,13 @@ pagestore_localsvc_walidx_add_batch(const PageStoreWalIndexEntry *entries,
 {
 	PsWalIndexEntry *wire;
 	uint32		nshards;
+	uint64		incarnation;
 
 	if (nentries <= 0)
 		return;
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("WAL index append");
+	incarnation = ls_expected_incarnation((uint32) localsvc_timeline);
 	ls_attach();
 	nshards = ls_nshards;
 	wire = palloc(PS_IO_UNIT);
@@ -1460,6 +1570,7 @@ pagestore_localsvc_walidx_add_batch(const PageStoreWalIndexEntry *entries,
 		ch->key = wire[0].key;
 		ch->timeline = (uint32) localsvc_timeline;
 		ch->opcode = PS_OP_WAL_INDEX_ADD_BATCH;
+		ch->incarnation = incarnation;
 		ch->nblocks = count;
 		ch->datalen = count * sizeof(PsWalIndexEntry);
 		memcpy(ch->data, wire, ch->datalen);
@@ -1491,10 +1602,9 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 
 	for (;;)
 	{
-		PsChannel  *ch = ls_chan_for_key(key);
+		PsChannel  *ch = ls_chan_for_key_stamped(key);
 		int			n;
 
-		ls_fill_key(ch, key);
 		ch->opcode = PS_OP_WAL_INDEX_GET;
 		ch->blocknum = block;
 		ch->nblocks = batch_max;
@@ -1543,12 +1653,14 @@ pagestore_localsvc_walidx_get(const PageStoreRelKey *key, BlockNumber block,
 uint64
 pagestore_localsvc_walidx_progress(void)
 {
+	uint64		incarnation = ls_expected_incarnation((uint32) localsvc_timeline);
 	PsChannel  *ch = ls_chan();
 
 	ch->opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->req_lsn = 0;
 	ch->req_seq = 0;
+	ch->incarnation = incarnation;
 	ls_exec(ch);
 	return ch->req_lsn;
 }
@@ -1556,6 +1668,7 @@ pagestore_localsvc_walidx_progress(void)
 void
 pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
 {
+	uint64		incarnation = ls_expected_incarnation((uint32) localsvc_timeline);
 	PsChannel  *ch = ls_chan();
 
 	if (localsvc_read_lsn != 0)
@@ -1564,6 +1677,7 @@ pagestore_localsvc_walidx_commit(uint64 start_lsn, uint64 end_lsn)
 	ch->timeline = (uint32) localsvc_timeline;
 	ch->req_lsn = start_lsn;
 	ch->req_seq = end_lsn;
+	ch->incarnation = incarnation;
 	ls_exec(ch);
 }
 
@@ -1582,15 +1696,42 @@ pagestore_localsvc_timeline_parent_timeout(uint32 timeline,
 										  uint64 *branch_lsn,
 										  int timeout_ms)
 {
-	PsChannel  *ch = ls_chan();
+	uint64		parent_incarnation;
 
+	return pagestore_localsvc_timeline_info(timeline, parent_timeline,
+												branch_lsn, &parent_incarnation,
+												timeout_ms);
+}
+
+/* Return parent/fork metadata using the exact token already bound for the
+ * queried timeline.  The daemon returns the parent's immutable token in
+ * req_seq; a missing token is not a usable ancestry response. */
+bool
+pagestore_localsvc_timeline_info(uint32 timeline, uint32 *parent_timeline,
+								 uint64 *branch_lsn,
+								 uint64 *parent_incarnation,
+								 int timeout_ms)
+{
+	PsChannel  *ch;
+
+	if (timeline >= LS_MAX_TIMELINES || parent_timeline == NULL ||
+		branch_lsn == NULL || parent_incarnation == NULL)
+		return false;
+	ch = ls_chan();
 	ch->opcode = PS_OP_TIMELINE_INFO;
 	ch->timeline = timeline;
+	ch->incarnation = ls_expected_incarnation(timeline);
+	ch->req_lsn = 0;
+	ch->req_seq = 0;
+	ch->parent_timeline = 0;
+	ch->result = 0;
 	ls_exec_timeout(ch, timeout_ms);
-	if (ch->result == 0)
+	if (ch->result == 0 || ch->req_seq == 0 ||
+		ch->parent_timeline >= LS_MAX_TIMELINES)
 		return false;
 	*parent_timeline = ch->parent_timeline;
 	*branch_lsn = ch->req_lsn;
+	*parent_incarnation = ch->req_seq;
 	return true;
 }
 
@@ -1669,13 +1810,13 @@ pagestore_localsvc_obj_write_prepare_timeout(uint32 klass,
 											 const PageStoreRelKey *key,
 											 int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
+													(uint32) localsvc_timeline);
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("object write");
 
 	/* ensure the object's fork exists (tolerate an existing one) */
-	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_CREATE;
 	ch->is_redo = 1;
@@ -1695,12 +1836,12 @@ pagestore_localsvc_obj_write_post_timeout(uint32 klass,
 										  uint64 version, BlockNumber nb,
 										  int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
+													(uint32) localsvc_timeline);
 
 	if (localsvc_read_lsn != 0)
 		ls_reject_pinned_write("object write");
 
-	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	/* overwrite if the block already exists, else append */
 	ch->opcode = (block < nb) ? PS_OP_WRITEV : PS_OP_EXTEND;
@@ -1722,9 +1863,9 @@ void
 pagestore_localsvc_obj_read(uint32 klass, const PageStoreRelKey *key,
 							BlockNumber block, void *page)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
+													(uint32) localsvc_timeline);
 
-	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_READV;
 	ch->blocknum = block;
@@ -1757,10 +1898,10 @@ pagestore_localsvc_obj_read_at_timeout(uint32 klass, const PageStoreRelKey *key,
 									   void *page, uint64 *resolved,
 									   int timeout_ms)
 {
-	PsChannel  *ch = ls_chan_for_key_klass(key, klass);
+	PsChannel  *ch = ls_chan_for_key_klass_stamped(key, klass,
+													(uint32) localsvc_timeline);
 	bool		found;
 
-	ls_fill_key(ch, key);
 	ch->key.klass = klass;
 	ch->opcode = PS_OP_READ_AT;
 	ch->blocknum = block;

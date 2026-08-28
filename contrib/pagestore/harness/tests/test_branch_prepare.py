@@ -89,6 +89,27 @@ class BranchPrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ConfigError, "exceeds 1023"):
             MODULE.Config.load(self.write_config(new_timeline=1024))
 
+        max_int64 = MODULE.Config.load(
+            self.write_config(new_incarnation=(1 << 63) - 1)
+        )
+        self.assertEqual(max_int64.new_incarnation, (1 << 63) - 1)
+
+        too_large_root = self.root / "too-large"
+        too_large_root.mkdir()
+        too_large = self.write_config(
+            writer_log_file=str(too_large_root / "writer.log"),
+            private_socket_dir=str(too_large_root / "private-socket"),
+            retention_authority_dir=str(too_large_root / "authority"),
+            prepared_dir=str(too_large_root / "prepared"),
+            new_incarnation=(1 << 63),
+        )
+        with self.assertRaisesRegex(MODULE.ConfigError, "new_incarnation exceeds int64"):
+            MODULE.Config.load(too_large)
+        self.assertFalse((too_large_root / "writer.log").exists())
+        self.assertFalse((too_large_root / "private-socket").exists())
+        self.assertFalse((too_large_root / "authority").exists())
+        self.assertFalse((too_large_root / "prepared").exists())
+
         bad_log = self.root / "bad-log"
         bad_log.mkdir()
         with self.assertRaisesRegex(MODULE.ConfigError, "writer_log_file is not writable"):

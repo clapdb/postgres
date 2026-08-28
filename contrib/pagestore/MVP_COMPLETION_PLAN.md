@@ -517,7 +517,7 @@ Expected scope: one implementation PR and one crash-test PR.
 
 ### R5. Delete timelines durably
 
-Status: **foundation, POSIX runtime quiescence, layer cleanup, and forkmeta filtering implemented**.  The first
+Status: **foundation, POSIX runtime quiescence, layer/private-WAL cleanup, and forkmeta filtering implemented**.  The first
 slice adds legacy-only migration and V2 create/event mixed records,
 LIVE/DELETING state plus a reserved DELETED format value with incarnation,
 BEGIN_DELETE/STATE IPC, and descendant/retention-owner admission vetoes.  The
@@ -534,8 +534,25 @@ reconcile deterministic remote objects from completed-but-unpublished uploads.
 DELETING owners are also removed from the shared forkmeta checkpoint, tail,
 and source epoch through the existing crash-safe R4b publication protocol;
 surviving owners are retained losslessly in the deletion-forced generation.
-No DELETED transition is exposed yet; filtered shared page/WAL cleanup and ID
-reuse remain follow-up stacked work.
+The POSIX deletion worker now also removes the target's flat and immutable WAL,
+WAL-index epochs/watermarks, and WAL-index snapshot directory after validating
+the complete owner-scoped set.  Partial removal reopens without parsing the
+deleting owner's artifacts and resumes idempotently; live sibling artifacts are
+untouched.  POSIX maintenance now also parses and atomically filters every
+shared page segment containing the deleting owner, preserving survivor record
+bytes and rebasing the covered-prefix watermark before same-id replacement.
+Restart scans the filtered stream and never rebuilds DELETING owners; SPDK
+leaves this callback NULL.  POSIX maintenance now revalidates every durable
+consumer, appends and fsyncs a same-incarnation DELETED state event, and only
+then publishes DELETED in memory.  DELETED timelines remain defined and reject
+  normal operations.  POSIX CREATE_BRANCH reuses an ID only from durable DELETED
+  with exactly the next nonzero incarnation, after purging incarnation-local
+  runtime state; STATE returns the current token and requests for incarnations
+  greater than one must carry it.  SPDK async drain remains fail-closed: its
+  daemon rejects reuse CREATE_BRANCH before shared-core entry.  WAL and control
+  restore clients receive the immutable token from their startup
+  configuration/manifest and propagate it; control restore never queries
+  mutable STATE.
 
 Deliverables:
 
@@ -568,9 +585,11 @@ Deliverables:
   replacement and its coverage transition are durable;
 - restart resumes deletion and never resurrects a deleted timeline;
 - timeline-ID reuse is permitted only after cleanup is durable and only with a
-  higher incarnation generation carried by every request and durable record;
+  CREATE_BRANCH target token exactly one greater than the DELETED token;
   delayed metadata, retention mutations, and requests from an older
-  incarnation are rejected;
+  incarnation are rejected.  The existing page, forkmeta, WAL, and layer
+  formats remain unchanged: the durable DELETED event is the cutover proof
+  that all old-incarnation consumers and writers have drained before reuse;
 - before a numeric timeline ID becomes reusable, deletion purges every
   shard-local page/fork/WAL index and materialized-page cache entry for the old
   incarnation (or those runtime keys include the incarnation); tests reuse the
@@ -881,6 +900,8 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-25 | Added R5 POSIX runtime quiescence: lifecycle read coverage for complete requests and synchronous/asynchronous maintenance, fair queued-writer turnstile, and deterministic ordinary/maintenance/delete-drain tests | Focused POSIX timeline test: 58 checks, 0 failures; tiering worker/publication test: 23 checks, 0 failures; SPDK async drain remains explicitly fail-closed/follow-up |
 | 2026-08-26 | Added R5 manifest-owned layer cleanup for DELETING timelines: durable per-layer tombstones, asynchronous local/remote deletion, restart resume, orphan-object reconciliation, and retry backoff | Timeline cleanup/restart/failure coverage; strict focused suites and standalone 1998-check suite |
 | 2026-08-26 | Added R5 deletion-filtered forkmeta cutover: explicit DELETING owners are omitted from checkpoint, tail, and rewritten source while live and pre-metadata owners survive | Forced/ordinary generation, marker-only owner, multi-delete, restart, rewrite-failure, and existing crash-matrix coverage |
+| 2026-08-26 | Added R5 owner-scoped POSIX WAL cleanup for DELETING timelines: flat/immutable WAL and WAL-index logs/snapshots are validated, durably removed, and purged from runtime state without publishing DELETED | Focused normal/fail-closed/restart/sibling tests plus WAL, snapshot, forkmeta crash, and 1998-check standalone coverage; shared page segments remain |
+| 2026-08-26 | Added R5 durable DELETED publication and incarnation-aware numeric-ID reuse: the same-incarnation DELETED event is fsynced after owner-scoped cleanup, and CREATE_BRANCH admits only the exact next token after runtime reset | Focused normal/ASan publication, immediate same-horizon reuse, stale-token/parent fencing, restart, repeated-cycle, sibling-safety, and ambiguous-append coverage; SPDK async drain remains fail-closed |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |

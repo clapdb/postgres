@@ -50,7 +50,43 @@ static void
 on_signal(int sig)
 {
 	(void) sig;
+	if (daemon_hdr != NULL)
+	{
+		/* Invalidate readiness before recovery/flush shutdown can block. */
+		__atomic_store_n(&daemon_hdr->startup_state, PS_SHM_STOPPING,
+						 __ATOMIC_RELEASE);
+		__atomic_store_n(&daemon_hdr->magic, 0, __ATOMIC_RELEASE);
+	}
 	stop_requested = 1;
+}
+
+static void
+shm_mark_starting(PsShmHeader *hdr)
+{
+	/* Magic is the compatibility gate used by older inspectors as well. */
+	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&hdr->startup_state, PS_SHM_STARTING, __ATOMIC_RELEASE);
+}
+
+static void
+shm_mark_stopping(PsShmHeader *hdr)
+{
+	__atomic_store_n(&hdr->startup_state, PS_SHM_STOPPING, __ATOMIC_RELEASE);
+	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+}
+
+static int
+shm_publish_ready(PsShmHeader *hdr)
+{
+	uint32_t	expected = PS_SHM_STARTING;
+
+	/* Publish state first, then magic last after every header field is final. */
+	if (!__atomic_compare_exchange_n(&hdr->startup_state, &expected,
+									 PS_SHM_READY, 0, __ATOMIC_ACQ_REL,
+									 __ATOMIC_ACQUIRE))
+		return 0;
+	__atomic_store_n(&hdr->magic, PS_SHM_MAGIC, __ATOMIC_RELEASE);
+	return 1;
 }
 
 /*
@@ -64,6 +100,13 @@ handle_request(PsChannel *ch)
 
 	ch->status = PS_STATUS_OK;
 	ch->result = 0;
+	if ((ch->opcode == PS_OP_EXTEND || ch->opcode == PS_OP_WRITEV ||
+		 ch->opcode == PS_OP_READV || ch->opcode == PS_OP_READ_AT) &&
+		!ps_timeline_request_allowed(tl, ch->incarnation))
+	{
+		ch->status = PS_STATUS_ERROR;
+		return;
+	}
 
 	if (ps_handle_meta(ch))
 		return;
@@ -229,9 +272,9 @@ run_request_admitted(PsChannel *ch)
 	PsOpcode	op = (PsOpcode) ch->opcode;
 
 	/*
-	 * Branch creation mutates only the cross-shard timelines[]; take map_lock
-	 * alone (no shard lock), so it serializes against map readers/writers but
-	 * not against per-shard work on unrelated shards.
+	 * Branch creation normally mutates only timelines[].  Reuse additionally
+	 * purges every per-shard incarnation-local index/cache, so exclude all
+	 * shard workers before taking map_lock (the established shard->map order).
 	 */
 	if (op == PS_OP_RETENTION_PIN_LOOKUP || op == PS_OP_RETENTION_PIN_RESERVE ||
 		op == PS_OP_RETENTION_PIN_SET || op == PS_OP_RETENTION_PIN_DROP)
@@ -255,8 +298,20 @@ run_request_admitted(PsChannel *ch)
 		return;
 	}
 
-	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
-		op == PS_OP_REQUIRE_BRANCH)
+	if (op == PS_OP_CREATE_BRANCH)
+	{
+		for (uint32_t s = 0; s < ps_nshards; s++)
+			ps_lock_shard_wr(s);
+		ps_lock_map_wr();
+		handle_request(ch);
+		ps_store_release(&ch->state, PS_STATE_DONE);
+		ps_unlock_map();
+		for (uint32_t s = ps_nshards; s-- > 0;)
+			ps_unlock_shard(s);
+		return;
+	}
+
+	if (op == PS_OP_CHECK_BRANCH || op == PS_OP_REQUIRE_BRANCH)
 	{
 		ps_lock_map_wr();
 		handle_request(ch);
@@ -627,12 +682,6 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	if (ps_core_open(store_dir) != 0)
-	{
-		perror("storage open");
-		return 1;
-	}
-
 	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
 	if (fd < 0)
 	{
@@ -651,6 +700,17 @@ main(int argc, char **argv)
 		return 1;
 	}
 	close(fd);
+	hdr = (PsShmHeader *) shm;
+	daemon_hdr = hdr;
+	/* Invalidate a previous daemon's header before store recovery begins. */
+	shm_mark_starting(hdr);
+
+	if (ps_core_open(store_dir) != 0)
+	{
+		perror("storage open");
+		munmap(shm, PS_SHM_SIZE);
+		return 1;
+	}
 
 	/*
 	 * Initialize the shared region.  NB: this zeroes the whole segment, so the
@@ -659,9 +719,7 @@ main(int argc, char **argv)
 	 * version would attach without re-initializing when the header is already
 	 * valid.
 	 */
-	hdr = (PsShmHeader *) shm;
 	memset(shm, 0, PS_SHM_SIZE);
-	hdr->magic = PS_SHM_MAGIC;
 	hdr->version = PS_SHM_VERSION;
 	hdr->page_size = page_size;
 	hdr->io_unit = PS_IO_UNIT;
@@ -676,18 +734,6 @@ main(int argc, char **argv)
 	sa.sa_handler = on_signal;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
-
-	fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-			"io_unit=%u channels=%u nshards=%u ready\n",
-			shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-			PS_MAX_CHANNELS, hdr->nshards);
-	if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
-	{
-		fprintf(stderr, "pagestore_daemon: fault probe daemon.after_ready failed\n");
-		ps_core_close();
-		munmap(shm, PS_SHM_SIZE);
-		return 1;
-	}
 
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
@@ -729,6 +775,22 @@ main(int argc, char **argv)
 			else
 				maintenance_started = 1;
 		}
+		if (started == hdr->nshards && maintenance_started && !stop_requested &&
+			shm_publish_ready(hdr))
+		{
+			fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
+					"io_unit=%u channels=%u nshards=%u ready\n",
+					shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
+					PS_MAX_CHANNELS, hdr->nshards);
+			if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: fault probe daemon.after_ready failed\n");
+				shm_mark_stopping(hdr);
+				ps_core_close();
+				munmap(shm, PS_SHM_SIZE);
+				return 1;
+			}
+		}
 
 		for (uint32_t shard = 0; shard < started; shard++)
 			pthread_join(threads[shard], NULL);
@@ -756,6 +818,7 @@ main(int argc, char **argv)
 				(unsigned long long) rs, (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);
 	}
+	shm_mark_stopping(hdr);
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;

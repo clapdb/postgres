@@ -145,6 +145,7 @@ attach(const char *shm)
 
 			close(fd);
 			if (h != MAP_FAILED && h->magic == PS_SHM_MAGIC &&
+				__atomic_load_n(&h->startup_state, __ATOMIC_ACQUIRE) == PS_SHM_READY &&
 				h->page_size == PAGE)
 			{
 				g_shm = h;

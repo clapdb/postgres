@@ -32,6 +32,7 @@ typedef enum PsManifestEventType
 	PS_MANIFEST_REMOVE_LAYER = 5,
 	PS_MANIFEST_SET_FLUSH_WATERMARK = 6,
 	PS_MANIFEST_SET_REMOTE_LOCATION = 7,
+	PS_MANIFEST_REBASE_FLUSH_WATERMARK = 8,
 } PsManifestEventType;
 
 typedef struct PsManifestRecord
@@ -180,6 +181,7 @@ manifest_type_payload_len(uint32_t type)
 		case PS_MANIFEST_SET_REMOTE_LOCATION:
 			return (int) sizeof(PsManifestRemoteLocationEvent);
 		case PS_MANIFEST_SET_FLUSH_WATERMARK:
+		case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
 			return (int) sizeof(PsFlushWatermark);
 		default:
 			return -1;
@@ -733,6 +735,20 @@ ps_manifest_replay(PsLayerMap *map)
 				flush_watermark_valid[payload.watermark.shard] = 1;
 				break;
 
+			case PS_MANIFEST_REBASE_FLUSH_WATERMARK:
+				if (payload.watermark.shard >= PS_MAX_CHANNELS ||
+					!flush_watermark_valid[payload.watermark.shard] ||
+					payload.watermark.seg_id !=
+					flush_watermarks[payload.watermark.shard].seg_id ||
+					payload.watermark.seg_off >
+					flush_watermarks[payload.watermark.shard].seg_off)
+				{
+					close(fd);
+					return -1;
+				}
+				flush_watermarks[payload.watermark.shard] = payload.watermark;
+				break;
+
 			default:
 				close(fd);
 				return -1;
@@ -909,6 +925,28 @@ ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
 		return -1;
 	flush_watermarks[shard] = watermark;
 	flush_watermark_valid[shard] = 1;
+	return 0;
+}
+
+int
+ps_manifest_rebase_flush_watermark(uint32_t shard, uint32_t seg_id,
+							   uint64_t seg_off)
+{
+	PsFlushWatermark watermark;
+
+	if (shard >= PS_MAX_CHANNELS || !flush_watermark_valid[shard] ||
+		seg_id != flush_watermarks[shard].seg_id ||
+		seg_off > flush_watermarks[shard].seg_off)
+		return -1;
+	if (seg_off == flush_watermarks[shard].seg_off)
+		return 0;
+	watermark.shard = shard;
+	watermark.seg_id = seg_id;
+	watermark.seg_off = seg_off;
+	if (manifest_append(PS_MANIFEST_REBASE_FLUSH_WATERMARK, &watermark,
+						 sizeof(watermark)) != 0)
+		return -1;
+	flush_watermarks[shard] = watermark;
 	return 0;
 }
 

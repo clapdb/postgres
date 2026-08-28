@@ -22,9 +22,12 @@
  *   - any failure exits non-zero without replacing the existing file.
  *
  * Usage:
- *   pagestore_control_restore --shm NAME --timeline N [--lsn X/Y]
- *       [--archive-bootstrap] <datadir>
+ *   pagestore_control_restore --shm NAME --timeline N --incarnation N
+ *       [--lsn X/Y] [--archive-bootstrap] <datadir>
  *
+ * --incarnation is the immutable token from the branch/reader manifest.  It
+ * is mandatory even for the root timeline (whose fixture token is 1); the
+ * daemon's mutable TIMELINE_STATE is deliberately not consulted here.
  * --lsn is the as-of point (a branch passes its fork LSN); without it the
  * newest mirrored image on the timeline's ancestry is restored.
  * --archive-bootstrap requires an exact checkpoint-redo --lsn and adjusts
@@ -120,7 +123,8 @@ client_attach(const char *shm_name)
 		exit(2);
 	}
 	hdr = (PsShmHeader *) shm;
-	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION)
+	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY)
 	{
 		fprintf(stderr, "pagestore_control_restore: shm header mismatch (daemon built against a different PS_SHM_VERSION?)\n");
 		exit(2);
@@ -231,7 +235,8 @@ client_attach(const char *shm_name)
  * Returns true and fills 'out' (PG_CONTROL_FILE_SIZE bytes) on a hit.
  */
 static bool
-control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
+control_read_asof(uint32_t timeline, uint64_t incarnation,
+			  uint64_t read_lsn, unsigned char *out)
 {
 	PsChannel  *ch = ps_channel(shm, chan);
 
@@ -241,6 +246,7 @@ control_read_asof(uint32_t timeline, uint64_t read_lsn, unsigned char *out)
 	ch->blocknum = 0;
 	ch->req_lsn = read_lsn;
 	ch->req_seq = 0;
+	ch->incarnation = incarnation;
 	ch->opcode = PS_OP_READ_AT;
 
 	/*
@@ -284,6 +290,8 @@ main(int argc, char **argv)
 	const char *datadir = NULL;
 	uint32_t	timeline = 0;
 	bool		have_timeline = false;
+	uint64_t	incarnation = 0;
+	bool		have_incarnation = false;
 	uint64_t	read_lsn = UINT64_MAX;
 	bool		archive_bootstrap = false;
 	unsigned char image[PG_CONTROL_FILE_SIZE];
@@ -316,6 +324,36 @@ main(int argc, char **argv)
 			}
 			timeline = (uint32_t) v;
 			have_timeline = true;
+		}
+		else if (strcmp(argv[i], "--incarnation") == 0)
+		{
+			char	   *end;
+			unsigned long long v;
+			const char *arg;
+			bool		digits = true;
+
+			if (i + 1 >= argc)
+			{
+				fprintf(stderr, "pagestore_control_restore: --incarnation requires a positive integer\n");
+				return 2;
+			}
+			arg = argv[++i];
+			if (*arg == '\0')
+				digits = false;
+			for (const char *p = arg; *p != '\0'; p++)
+				if (*p < '0' || *p > '9')
+					digits = false;
+
+			errno = 0;
+			v = strtoull(arg, &end, 10);
+			if (!digits || errno != 0 || end == arg || *end != '\0' || v == 0)
+			{
+				fprintf(stderr, "pagestore_control_restore: invalid --incarnation \"%s\" (must be a positive integer)\n",
+						arg);
+				return 2;
+			}
+			incarnation = (uint64_t) v;
+			have_incarnation = true;
 		}
 		else if (strcmp(argv[i], "--lsn") == 0 && i + 1 < argc)
 		{
@@ -356,9 +394,9 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
-	if (!shm_name || !have_timeline || !datadir)
+	if (!shm_name || !have_timeline || !have_incarnation || !datadir)
 	{
-		fprintf(stderr, "usage: %s --shm NAME --timeline N [--lsn X/Y] [--archive-bootstrap] <datadir>\n",
+		fprintf(stderr, "usage: %s --shm NAME --timeline N --incarnation N [--lsn X/Y] [--archive-bootstrap] <datadir>\n",
 				argv[0]);
 		return 2;
 	}
@@ -432,10 +470,11 @@ main(int argc, char **argv)
 
 	client_attach(shm_name);
 
-	if (!control_read_asof(timeline, read_lsn, image))
+	if (!control_read_asof(timeline, incarnation, read_lsn, image))
 	{
-		fprintf(stderr, "pagestore_control_restore: no mirrored control image at/below %X/%08X on timeline %u\n",
-				(uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline);
+		fprintf(stderr, "pagestore_control_restore: no mirrored control image at/below %X/%08X on timeline %u incarnation %llu\n",
+				(uint32_t) (read_lsn >> 32), (uint32_t) read_lsn, timeline,
+				(unsigned long long) incarnation);
 		return 1;
 	}
 

@@ -267,7 +267,7 @@ archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $MPORT
 hot_standby = on
-restore_command = '$WALRESTORE --shm $SHM --timeline 0 --segsize $materializer_wal_segment_size %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize $materializer_wal_segment_size %f %p'
 EOF
 touch "$MATERIALIZER/standby.signal"
 find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
@@ -280,9 +280,19 @@ assert_eq "$("${MP[@]}" -c "SELECT pg_is_in_recovery();")" "t" \
 "${WP[@]}" -c "CREATE SCHEMA pagestore_ext;
 	CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.0';
 	ALTER EXTENSION pagestore UPDATE TO '1.1';
-		CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
-	 AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
-	CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
+	ALTER EXTENSION pagestore UPDATE TO '1.2';" >/dev/null ||
+fail "could not install the extension upgrade chain"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
+	"extension upgrades from 1.0 through 1.1 to 1.2"
+api_count=$("${WP[@]}" -c "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'pagestore_ext' AND p.oid IN ('pagestore_ext.pagestore_create_branch_with_incarnation(integer,integer,bigint,pg_lsn)'::regprocedure, 'pagestore_ext.pagestore_prepare_branch_from_control(text,integer,integer,pg_lsn,pg_lsn,pg_lsn,bigint)'::regprocedure, 'pagestore_ext.pagestore_retention_drop_with_incarnation(integer,integer,bigint,bigint,bigint)'::regprocedure);")
+assert_eq "$api_count" "3" "1.2 exposes immutable branch and retention control APIs after upgrade"
+"${WP[@]}" -c "DROP EXTENSION pagestore; CREATE EXTENSION pagestore WITH SCHEMA pagestore_ext VERSION '1.2';" >/dev/null ||
+	fail "could not install a fresh 1.2 extension"
+assert_eq "$("${WP[@]}" -c "SELECT extversion FROM pg_extension WHERE extname = 'pagestore';")" "1.2" \
+	"fresh extension install uses version 1.2"
+"${WP[@]}" -c "CREATE FUNCTION pagestore_read_at(regclass, int, int, pg_lsn) RETURNS bytea
+ AS 'pagestore','pagestore_read_at' LANGUAGE C STRICT;
+CREATE TABLE mvp_golden(id int primary key, note text);" >/dev/null ||
 	fail "could not create the golden test relation"
 ddl_checkpoint_lsn=$("${WP[@]}" -c "CHECKPOINT;
 	SELECT pg_current_wal_lsn();" | tail -1) ||
@@ -425,7 +435,7 @@ echo "ok   - parent advanced and was durably materialized beyond the child fork"
 # remains cut at the later durable materialized fork.
 "$BIN/initdb" -D "$BRANCH" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "branch bootstrap initdb failed"
-"$CONTROLRESTORE" --shm "$SHM" --timeline 1 --lsn "$checkpoint_redo" \
+"$CONTROLRESTORE" --shm "$SHM" --timeline 1 --incarnation 1 --lsn "$checkpoint_redo" \
 	--archive-bootstrap \
 	"$BRANCH" >/dev/null || fail "could not restore branch checkpoint control"
 branch_wal_segment_size=$(wal_segment_size "$BRANCH") ||
@@ -449,7 +459,7 @@ io_method = sync
 archive_mode = off
 listen_addresses = '127.0.0.1'
 port = $BPORT
-restore_command = '$WALRESTORE --shm $SHM --timeline 1 --segsize $branch_wal_segment_size %f %p'
+restore_command = '$WALRESTORE --shm $SHM --timeline 1 --incarnation 1 --segsize $branch_wal_segment_size %f %p'
 recovery_target_lsn = '$checkpoint_lsn'
 recovery_target_inclusive = on
 recovery_target_action = 'promote'

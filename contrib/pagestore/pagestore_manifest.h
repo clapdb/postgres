@@ -35,6 +35,8 @@ extern int	ps_manifest_mark_delete(uint64_t layer_id);
 extern int	ps_manifest_remove_layer(uint64_t layer_id);
 extern int	ps_manifest_set_flush_watermark(uint32_t shard, uint32_t seg_id,
 										 uint64_t seg_off);
+extern int	ps_manifest_rebase_flush_watermark(uint32_t shard, uint32_t seg_id,
+										 uint64_t seg_off);
 extern int	ps_manifest_get_flush_watermark(uint32_t shard,
 										 PsFlushWatermark *out);
 

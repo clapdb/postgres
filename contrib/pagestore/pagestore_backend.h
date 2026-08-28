@@ -153,18 +153,30 @@ extern const PageStoreBackend PageStoreBackendPassthrough;
 /* The localsvc backend (talks to the daemon), in backend_localsvc.c. */
 extern const PageStoreBackend PageStoreBackendLocalSvc;
 extern void pagestore_localsvc_init(void);
+/* Bind the postmaster's immutable compute identity before any normal I/O. */
+extern void pagestore_localsvc_bind_incarnation(uint32 timeline,
+													 uint64 incarnation);
+extern uint64 pagestore_localsvc_expected_incarnation(void);
 extern void pagestore_localsvc_read_at(const PageStoreRelKey *key,
 									   BlockNumber blocknum, uint64 lsn, void *out);
 extern void pagestore_localsvc_check_branch(uint32 new_tl, uint32 parent_tl,
-										   uint64 branch_lsn);
+										   uint64 branch_lsn,
+										   uint64 target_incarnation,
+										   uint64 parent_incarnation);
 extern void pagestore_localsvc_require_branch(uint32 new_tl, uint32 parent_tl,
-											 uint64 branch_lsn);
+											 uint64 branch_lsn,
+											 uint64 target_incarnation,
+											 uint64 parent_incarnation);
 extern void pagestore_localsvc_require_branch_timeout(uint32 new_tl,
-													 uint32 parent_tl,
-													 uint64 branch_lsn,
-													 int timeout_ms);
+														 uint32 parent_tl,
+														 uint64 branch_lsn,
+														 uint64 target_incarnation,
+														 uint64 parent_incarnation,
+														 int timeout_ms);
 extern void pagestore_localsvc_create_branch(uint32 new_tl, uint32 parent_tl,
-											 uint64 branch_lsn);
+												 uint64 branch_lsn,
+												 uint64 target_incarnation,
+												 uint64 parent_incarnation);
 extern void pagestore_localsvc_detach(void);
 extern void pagestore_localsvc_wal_append(uint64 start_lsn, const void *data,
 										  uint32 len);
@@ -187,6 +199,11 @@ extern bool pagestore_localsvc_timeline_parent(uint32 timeline,
 extern bool pagestore_localsvc_timeline_parent_timeout(
 	uint32 timeline, uint32 *parent_timeline, uint64 *branch_lsn,
 	int timeout_ms);
+/* Exact-token ancestry lookup.  The request is stamped with the immutable
+ * token bound for timeline; parent_incarnation is returned by the daemon. */
+extern bool pagestore_localsvc_timeline_info(uint32 timeline,
+	uint32 *parent_timeline, uint64 *branch_lsn,
+	uint64 *parent_incarnation, int timeout_ms);
 extern uint8 pagestore_localsvc_begin_delete(uint32 timeline,
 	uint64 expected_incarnation);
 extern bool pagestore_localsvc_timeline_state(uint32 timeline,
@@ -247,8 +264,11 @@ extern uint8 pagestore_localsvc_retention_get(uint32 index,
 											 PsRetentionPin *pin, uint32 *count,
 											 uint64 *epoch, bool *found);
 extern uint8 pagestore_localsvc_retention_drop_timeout(uint32 timeline,
-											  uint32 owner_kind, uint64 owner_id,
-											  uint32 generation, int timeout_ms);
+												  uint32 owner_kind, uint64 owner_id,
+												  uint32 generation, int timeout_ms);
+extern uint8 pagestore_localsvc_retention_drop_with_incarnation(
+	uint32 timeline, uint32 owner_kind, uint64 owner_id, uint32 generation,
+	uint64 incarnation);
 extern uint8 pagestore_localsvc_retention_lookup(uint32 timeline,
 											uint32 owner_kind, uint64 owner_id,
 											PsRetentionPin *pin, bool *found,

@@ -1,4 +1,9 @@
-/* contrib/pagestore/pagestore--1.0--1.1.sql */
+/* contrib/pagestore/pagestore--1.2.sql */
+
+CREATE FUNCTION pagestore_shipped_wal_lsn()
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_shipped_wal_lsn'
+LANGUAGE C PARALLEL RESTRICTED;
 
 CREATE FUNCTION pagestore_create_branch_with_incarnation(
     new_timeline integer,
@@ -8,6 +13,25 @@ CREATE FUNCTION pagestore_create_branch_with_incarnation(
 RETURNS void
 AS 'MODULE_PATHNAME', 'pagestore_create_branch_with_incarnation'
 LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION pagestore_materializer_lag_bytes()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pagestore_materializer_lag_bytes'
+LANGUAGE C PARALLEL RESTRICTED;
+
+CREATE FUNCTION pagestore_materialized_wal_lsn()
+RETURNS pg_lsn
+AS 'MODULE_PATHNAME', 'pagestore_materialized_wal_lsn'
+LANGUAGE C PARALLEL RESTRICTED;
+
+CREATE FUNCTION pagestore_materializer_status(
+    OUT shipped_wal_lsn pg_lsn,
+    OUT materialized_wal_lsn pg_lsn,
+    OUT lag_bytes bigint,
+    OUT release_checkpoint_lsn pg_lsn)
+RETURNS record
+AS 'MODULE_PATHNAME', 'pagestore_materializer_status'
+LANGUAGE C PARALLEL RESTRICTED;
 
 CREATE FUNCTION pagestore_prepare_branch_from_control(
     target_dir text,
@@ -64,6 +88,16 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'pagestore_retention_drop'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+CREATE FUNCTION pagestore_retention_drop_with_incarnation(
+    timeline integer,
+    owner_kind integer,
+    owner_id bigint,
+    generation bigint,
+    incarnation bigint)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'pagestore_retention_drop_with_incarnation'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
 CREATE FUNCTION pagestore_retention_owner_lsn(
     timeline integer,
     owner_kind integer,
@@ -85,6 +119,21 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'pagestore_install_prepared_branch_bootstrap'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+COMMENT ON FUNCTION pagestore_shipped_wal_lsn() IS
+'end of the durable WAL prefix available to this pagestore timeline';
+
+COMMENT ON FUNCTION pagestore_materializer_lag_bytes() IS
+'bytes from this declared pagestore materializer flushed watermark to its durable WAL end';
+
+COMMENT ON FUNCTION pagestore_materialized_wal_lsn() IS
+'last restartpoint boundary made durable by this declared pagestore materializer role';
+
+COMMENT ON FUNCTION pagestore_materializer_status() IS
+'store-observed materializer progress for writer-side control-plane monitoring';
+
+COMMENT ON FUNCTION pagestore_create_branch_with_incarnation(integer, integer, bigint, pg_lsn) IS
+'create a branch with an explicitly authorized immutable timeline incarnation';
+
 COMMENT ON FUNCTION pagestore_prepare_branch_from_control(text, integer, integer, pg_lsn, pg_lsn, pg_lsn) IS
 'idempotently prepare a materialized branch using bootstrap horizons derived from an exact durable checkpoint';
 
@@ -102,6 +151,9 @@ COMMENT ON FUNCTION pagestore_retention_set(integer, integer, bigint, bigint, in
 
 COMMENT ON FUNCTION pagestore_retention_drop(integer, integer, bigint, bigint) IS
 'durably release a fenced pagestore retention owner generation';
+
+COMMENT ON FUNCTION pagestore_retention_drop_with_incarnation(integer, integer, bigint, bigint, bigint) IS
+'durably release a fenced pagestore retention owner generation under an explicit immutable timeline incarnation';
 
 COMMENT ON FUNCTION pagestore_retention_owner_lsn(integer, integer, bigint, bigint) IS
 'return the durable LSN held by a fenced pagestore retention owner generation';

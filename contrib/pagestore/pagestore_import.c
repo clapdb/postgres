@@ -71,6 +71,7 @@ client_attach(const char *shm_name)
 	close(fd);
 	hdr = (PsShmHeader *) shm;
 	if (hdr->magic != PS_SHM_MAGIC || hdr->version != PS_SHM_VERSION ||
+		__atomic_load_n(&hdr->startup_state, __ATOMIC_ACQUIRE) != PS_SHM_READY ||
 		hdr->page_size != page_size)
 	{
 		fprintf(stderr, "shm header mismatch (daemon magic=0x%x version=%u "

@@ -37,7 +37,10 @@ read pages at an LSN.
    materializes pages into the store. 🔶 3a-3d-1 and 3c-1..4 done; 3d-2/3 partial:
    - **3a** Reconstruct standard WAL segment files from the `wal_<tl>` log. ✅
      `pagestore_walrestore` does this and works as a `restore_command`
-     (`pagestore_walrestore --shm NAME --timeline N --segsize B %f %p`); the
+     (`pagestore_walrestore --shm NAME --timeline N --incarnation I
+     --segsize B %f %p`); the incarnation is supplied by the immutable branch
+     identity in the compute's recovery configuration, rather than queried from
+     the daemon's mutable current state; the
      integration test reconstructs a shipped segment as a full standard segment.
    - **3b** Bring up a PG node in archive recovery with `route_all` on the store
      and its WAL fetched from the store; verify it materializes pages. ✅

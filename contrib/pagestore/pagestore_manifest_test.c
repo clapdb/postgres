@@ -17,6 +17,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -28,6 +29,9 @@ static int	run = 0,
 			failed = 0;
 
 #define TEST_MANIFEST_SET_REMOTE_LOCATION 7
+#define TEST_MANIFEST_REBASE_FLUSH_WATERMARK 8
+#define TEST_MANIFEST_MAGIC 0x504d414eU
+#define TEST_MANIFEST_VERSION 3U
 
 typedef struct TestManifestRecord
 {
@@ -37,6 +41,55 @@ typedef struct TestManifestRecord
 	uint32_t	len;
 	uint32_t	crc;
 } TestManifestRecord;
+
+static uint32_t
+test_manifest_fnv1a(uint32_t h, const void *data, size_t len)
+{
+	const unsigned char *p = data;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		h ^= p[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static uint32_t
+test_manifest_crc(const TestManifestRecord *record, const void *payload,
+				  uint32_t len)
+{
+	uint32_t crc = test_manifest_fnv1a(2166136261u, record,
+								  offsetof(TestManifestRecord, crc));
+
+	return len == 0 ? crc : test_manifest_fnv1a(crc, payload, len);
+}
+
+static int
+append_manifest_record(const char *path, uint32_t type, const void *payload,
+					   uint32_t len)
+{
+	TestManifestRecord record = {
+		.magic = TEST_MANIFEST_MAGIC,
+		.version = TEST_MANIFEST_VERSION,
+		.type = type,
+		.len = len
+	};
+	int fd;
+
+	record.crc = test_manifest_crc(&record, payload, len);
+	fd = open(path, O_WRONLY | O_APPEND);
+	if (fd < 0)
+		return -1;
+	if (write(fd, &record, sizeof(record)) != (ssize_t) sizeof(record) ||
+		(len > 0 && write(fd, payload, len) != (ssize_t) len) ||
+		fsync(fd) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	return close(fd);
+}
 
 /* Write a legacy-shaped manifest by removing only the new location event. */
 static int
@@ -159,7 +212,9 @@ main(void)
 		  "mark uploaded remote location durable");
 	check(ps_manifest_set_flush_watermark(3, 7, 12345) == 0,
 		  "persist flush watermark");
-	check(ps_manifest_set_flush_watermark(3, 7, 12344) != 0,
+	check(ps_manifest_rebase_flush_watermark(3, 7, 12344) == 0,
+		  "persist a conservative flush watermark rebase");
+	check(ps_manifest_set_flush_watermark(3, 7, 12343) != 0,
 		  "reject regressing flush watermark");
 	ps_manifest_close();
 	snprintf(mpath, sizeof(mpath), "%s/layers.manifest", dir);
@@ -182,7 +237,7 @@ main(void)
 	check(ps_manifest_replay(&ps_layer_map) == 0, "replay succeeds");
 	check(ps_layer_map_count(&ps_layer_map) == 2, "both layers replayed");
 	check(ps_manifest_get_flush_watermark(3, &watermark) == 1 &&
-		  watermark.seg_id == 7 && watermark.seg_off == 12345,
+		  watermark.seg_id == 7 && watermark.seg_off == 12344,
 		  "flush watermark replays");
 
 	/* layer 1: relation class survives */
@@ -233,7 +288,7 @@ main(void)
 	check(ps_manifest_open(dir) == 0, "open compacted manifest");
 	check(ps_manifest_replay(&ps_layer_map) == 0, "replay compacted manifest");
 	check(ps_manifest_get_flush_watermark(3, &watermark) == 1 &&
-		  watermark.seg_id == 7 && watermark.seg_off == 12345,
+		  watermark.seg_id == 7 && watermark.seg_off == 12344,
 		  "manifest compaction preserves flush watermark");
 	got = NULL;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
@@ -244,6 +299,19 @@ main(void)
 		  "manifest compaction preserves remote location and durability");
 
 	ps_manifest_close();		/* frees the in-memory map */
+	{
+		PsFlushWatermark invalid = {.shard = 3, .seg_id = 8, .seg_off = 0};
+
+		check(append_manifest_record(mpath,
+								TEST_MANIFEST_REBASE_FLUSH_WATERMARK,
+								&invalid, sizeof(invalid)) == 0,
+				  "append an invalid watermark-rebase event");
+		check(ps_manifest_open(dir) == 0 &&
+			  ps_manifest_replay(&ps_layer_map) != 0,
+			  "replay rejects a rebase for the wrong segment");
+		ps_manifest_close();
+		unlink(mpath);
+	}
 	check(ps_manifest_open(legacy_dir) == 0, "open legacy remote-durable manifest");
 	check(ps_manifest_replay(&ps_layer_map) == 0,
 		  "legacy remote-durable manifest replays without a URI");
