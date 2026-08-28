@@ -432,6 +432,25 @@ wal_payload_hash(uint32_t hash, const void *data, size_t len)
 	return hash;
 }
 
+/* Test-only gate used to prove that reclaim waits for a read which already
+ * owns the WAL mutex.  Production callers never set these environment vars. */
+static void
+test_read_barrier_gate(void)
+{
+	const char *gate = getenv("PAGESTORE_TEST_WAL_READ_GATE");
+	const char *release = getenv("PAGESTORE_TEST_WAL_READ_RELEASE");
+	int fd;
+
+	if (gate == NULL || release == NULL)
+		return;
+	fd = open(gate, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return;
+	(void) close(fd);
+	while (access(release, F_OK) != 0)
+		usleep(1000);
+}
+
 static int
 build_chunk_hashes_and_payload_crc(const void *payload, uint32_t payload_len,
 									 uint32_t **hashes_out, uint32_t *nchunks_out,
@@ -872,6 +891,206 @@ install_retained_frontier(PsWalStore *store, uint64_t retained_base_lsn)
 	store->nentries -= drop;
 	store->start_lsn = retained_base_lsn;
 	store->retained_base_lsn = retained_base_lsn;
+}
+
+/* Remove one prefix entry after unlinkat() has confirmed that the physical
+ * name is gone.  Keeping this update adjacent to the unlink is important:
+ * after a partial reclaim the in-memory catalog describes exactly the files
+ * which can still be opened, while the durable frontier already protects new
+ * readers from the removed prefix. */
+static void
+forget_reclaimed_entry(PsWalStore *store)
+{
+	if (store->nentries == 0)
+		return;
+	free(store->entries[0].chunk_hashes);
+	if (store->nentries > 1)
+		memmove(store->entries, store->entries + 1,
+				(size_t) (store->nentries - 1) * sizeof(*store->entries));
+	store->nentries--;
+	store->start_lsn += store->segment_size;
+}
+
+static int
+unlink_reclaim_segment(PsWalStore *store, uint64_t segment_no)
+{
+	char name[128];
+	const char *fail_segment =
+		getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO");
+	char *end = NULL;
+	unsigned long long requested;
+
+	if (fail_segment != NULL)
+	{
+		errno = 0;
+		requested = strtoull(fail_segment, &end, 10);
+		if (errno == 0 && end != fail_segment && *end == '\0' &&
+			(uint64_t) requested == segment_no)
+			return -1;
+	}
+	if (segment_name(store, segment_no, name, sizeof(name)) != 0)
+		return -1;
+	if (unlinkat(store->directory_fd, name, 0) == 0 || errno == ENOENT)
+		return 0;
+	return -1;
+}
+
+static int
+compare_segment_numbers(const void *left, const void *right)
+{
+	uint64_t a = *(const uint64_t *) left;
+	uint64_t b = *(const uint64_t *) right;
+
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static int
+reclaim_test_segment_matches(const char *variable, uint64_t segment_no)
+{
+	const char *value = getenv(variable);
+	char *end = NULL;
+	unsigned long long requested;
+
+	if (value == NULL)
+		return 0;
+	errno = 0;
+	requested = strtoull(value, &end, 10);
+	return errno == 0 && end != value && *end == '\0' &&
+		(uint64_t) requested == segment_no;
+}
+
+/* A process can stop after publishing the physical frontier and before any
+ * unlink.  On reopen those old, already-authorized files are intentionally not
+ * loaded into the logical catalog, so a retry must discover them separately. */
+static int
+unlink_residual_prefix(PsWalStore *store, uint64_t target_lsn,
+					   uint64_t *unlink_count)
+{
+	char prefix[64];
+	int prefix_len;
+	int scan_fd;
+	DIR *dir;
+	struct dirent *de;
+	uint64_t target_segment;
+	uint64_t *candidates = NULL;
+	size_t candidate_count = 0;
+	size_t candidate_capacity = 0;
+	int rc = -1;
+
+	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", store->timeline);
+	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
+		target_lsn % store->segment_size != 0)
+		return -1;
+	target_segment = target_lsn / store->segment_size;
+	/* Do not dup directory_fd: directory stream offsets are shared across dup'd
+	 * descriptors, and open() must start an independent scan for restart retry. */
+	scan_fd = openat(store->directory_fd, ".",
+					O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (scan_fd < 0)
+		return -1;
+	dir = fdopendir(scan_fd);
+	if (dir == NULL)
+	{
+		close(scan_fd);
+		return -1;
+	}
+	for (;;)
+	{
+		char expected[128];
+		char *end = NULL;
+		unsigned long long parsed;
+
+		errno = 0;
+		de = readdir(dir);
+		if (de == NULL)
+		{
+			if (errno != 0)
+				goto cleanup;
+			break;
+		}
+
+		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
+			continue;
+		/* Inject an error before EOF so the test proves that no candidate is
+		 * deleted until the complete directory scan has succeeded. */
+		if (reclaim_test_segment_matches(
+				"PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES",
+				candidate_count))
+		{
+			errno = EIO;
+			goto cleanup;
+		}
+		errno = 0;
+		parsed = strtoull(de->d_name + prefix_len, &end, 10);
+		if (errno == ERANGE || end == de->d_name + prefix_len ||
+			segment_name(store, (uint64_t) parsed, expected,
+						 sizeof(expected)) != 0 || *end != '\0' ||
+			strcmp(expected, de->d_name) != 0)
+			goto cleanup;
+		if ((uint64_t) parsed < target_segment)
+		{
+			if (candidate_count == candidate_capacity)
+			{
+				size_t grown_capacity = candidate_capacity == 0 ? 8 :
+					candidate_capacity * 2;
+
+				if (grown_capacity < candidate_capacity ||
+					grown_capacity > SIZE_MAX / sizeof(*candidates))
+					goto cleanup;
+				{
+					uint64_t *grown = realloc(candidates,
+										 grown_capacity * sizeof(*candidates));
+
+					if (grown == NULL)
+						goto cleanup;
+					candidates = grown;
+				}
+				candidate_capacity = grown_capacity;
+			}
+			candidates[candidate_count++] = (uint64_t) parsed;
+			if (reclaim_test_segment_matches(
+					"PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES",
+					candidate_count))
+			{
+				errno = EIO;
+				goto cleanup;
+			}
+		}
+	}
+	if (closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto cleanup;
+	}
+	dir = NULL;
+	if (candidate_count > 0)
+	{
+		qsort(candidates, candidate_count, sizeof(*candidates),
+			  compare_segment_numbers);
+		/* A residual prefix may have lost lower files already, but every
+		 * candidate must be the contiguous suffix ending immediately below the
+		 * durable frontier.  Validate the complete set before deleting any file. */
+		if (candidates[candidate_count - 1] + 1 != target_segment)
+			goto cleanup;
+		for (size_t i = 1; i < candidate_count; i++)
+			if (candidates[i] != candidates[i - 1] + 1)
+				goto cleanup;
+		for (size_t i = 0; i < candidate_count; i++)
+		{
+			if (validate_prefix_segment(store, candidates[i]) != 0)
+				goto cleanup;
+			if (unlink_reclaim_segment(store, candidates[i]) != 0)
+				goto cleanup;
+			(*unlink_count)++;
+		}
+	}
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	free(candidates);
+	return rc;
 }
 
 /* Resolve an error after metadata rename.  If the new record is visible, the
@@ -1419,6 +1638,7 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 		pthread_mutex_unlock(&store->lock);
 		return -1;
 	}
+	test_read_barrier_gate();
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < len; i++)
 	{
@@ -1488,18 +1708,103 @@ ps_wal_store_advance_retained_base(PsWalStore *store,
 		uint64_t old_base_lsn = store->retained_base_lsn;
 		uint64_t end_lsn = store->end_lsn;
 
-		if (publish_store_metadata(store, retained_base_lsn,
+		if (publish_store_metadata(store, store->start_lsn,
 								   retained_base_lsn, end_lsn) != 0)
 		{
 			reconcile_metadata_failure(store, old_start_lsn, old_base_lsn, end_lsn,
 									 retained_base_lsn, retained_base_lsn, end_lsn);
 			goto done_advance;
 		}
-		install_retained_frontier(store, retained_base_lsn);
+		/* This low-level API deliberately leaves the physical catalog and
+		 * directory start unchanged.  Only reclaim_prefix may authorize unlink. */
+		store->retained_base_lsn = retained_base_lsn;
 	}
 	rc = 0;
 
 done_advance:
+	pthread_mutex_unlock(&store->lock);
+	return rc;
+}
+
+int
+ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
+{
+	uint64_t segment_no;
+	uint64_t unlink_count = 0;
+	int rc = -1;
+
+	if (store == NULL || !store->lock_initialized ||
+		pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced ||
+		target_lsn < store->retained_base_lsn ||
+		target_lsn > store->end_lsn ||
+		target_lsn % store->segment_size != 0 ||
+		store->start_lsn > target_lsn)
+		goto done_reclaim;
+
+	/* A low-level advance may already have published the logical base.  The
+	 * physical frontier must still be atomically published by this API before
+	 * any unlink, including a retry after a partial earlier reclaim. */
+	if (store->start_lsn != target_lsn)
+	{
+		if (publish_store_metadata(store, target_lsn, target_lsn,
+								   store->end_lsn) != 0)
+			goto done_reclaim;
+	}
+	store->retained_base_lsn = target_lsn;
+
+	/* This hook models a stop/crash after the durable frontier publication and
+	 * before the first unlink.  The next process can retry idempotently. */
+	if (getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK") != NULL)
+		_exit(91);
+	if (getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK") != NULL)
+		goto done_reclaim;
+
+	segment_no = store->start_lsn / store->segment_size;
+	while (store->start_lsn < target_lsn)
+	{
+		if (store->nentries == 0 ||
+			store->entries[0].header.segment_no != segment_no ||
+			store->entries[0].header.start_lsn != store->start_lsn)
+			goto done_reclaim;
+		/* The catalog was loaded before this operation and the file may have
+		 * changed since then.  Validate the complete immutable segment before
+		 * authorizing its unlink; a failure leaves this and every higher segment
+		 * in place while the already-published frontier makes restart fail closed
+		 * until the file is repaired. */
+		if (validate_prefix_segment(store, segment_no) != 0)
+			goto done_reclaim;
+		if (unlink_reclaim_segment(store, segment_no) != 0)
+			goto done_reclaim;
+		forget_reclaimed_entry(store);
+		unlink_count++;
+		if (reclaim_test_segment_matches(
+				"PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
+				segment_no))
+			_exit(92);
+		segment_no++;
+	}
+	if (store->start_lsn != target_lsn)
+		goto done_reclaim;
+	if (unlink_residual_prefix(store, target_lsn, &unlink_count) != 0)
+		goto done_reclaim;
+	if (unlink_count > 0 &&
+		(getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL ||
+		 getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC") != NULL ||
+		 fsync(store->directory_fd) != 0))
+	{
+		if (getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL)
+			_exit(93);
+		/* The frontier is durable, but directory entry durability is ambiguous;
+		 * fence this instance and never continue deleting from it.  Reopen uses
+		 * the published frontier and safely tolerates any residual prefix. */
+		store->metadata_fenced = 1;
+		goto done_reclaim;
+	}
+	rc = 0;
+
+done_reclaim:
 	pthread_mutex_unlock(&store->lock);
 	return rc;
 }

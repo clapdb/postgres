@@ -5,8 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "pagestore_wal_store.h"
 
@@ -24,6 +26,18 @@ typedef struct ConcurrentWalArgs
 	int advance_rc;
 	int read_failures;
 } ConcurrentWalArgs;
+
+typedef struct ReclaimBarrierArgs
+{
+	PsWalStore *store;
+	const unsigned char *data;
+	int read_rc;
+	int reclaim_rc;
+	atomic_int read_started;
+	atomic_int read_done;
+	atomic_int reclaim_started;
+	atomic_int reclaim_done;
+} ReclaimBarrierArgs;
 
 static void *
 concurrent_append(void *arg)
@@ -60,6 +74,58 @@ concurrent_read(void *arg)
 							 window, sizeof(window)) != 0)
 			args->read_failures++;
 	return NULL;
+}
+
+static void *
+barrier_read(void *arg)
+{
+	ReclaimBarrierArgs *args = arg;
+	unsigned char window[256];
+
+	atomic_store(&args->read_started, 1);
+	args->read_rc = ps_wal_store_read(args->store, TEST_SEGMENT_BYTES,
+								 window, sizeof(window));
+	atomic_store(&args->read_done, 1);
+	return NULL;
+}
+
+static void *
+barrier_reclaim(void *arg)
+{
+	ReclaimBarrierArgs *args = arg;
+
+	atomic_store(&args->reclaim_started, 1);
+	args->reclaim_rc = ps_wal_store_reclaim_prefix(args->store,
+									  TEST_SEGMENT_BYTES);
+	atomic_store(&args->reclaim_done, 1);
+	return NULL;
+}
+
+static int
+run_reclaim_crash_child(const char *directory, uint32_t timeline,
+						uint64_t target_lsn, const char *hook,
+						const char *value, int expected_status)
+	{
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0)
+	{
+		PsWalStore child_store;
+
+		if (setenv(hook, value, 1) != 0 ||
+			ps_wal_store_open_existing(&child_store, directory, timeline,
+									 TEST_SEGMENT_BYTES) != 0)
+			_exit(120);
+		(void) ps_wal_store_reclaim_prefix(&child_store, target_lsn);
+		_exit(121);
+	}
+	if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status) == expected_status ? 0 : -1;
 }
 
 static uint32_t
@@ -172,6 +238,15 @@ main(void)
 	char path[1024];
 	char temporary_path[2048];
 	char retry_directory[512];
+	char partial_reclaim_directory[512];
+	char fsync_reclaim_directory[512];
+	char enumerate_reclaim_directory[512];
+	char crash_before_directory[512];
+	char crash_partial_directory[512];
+	char crash_fsync_directory[512];
+	char barrier_directory[512];
+	char barrier_gate_path[1024];
+	char barrier_release_path[1024];
 	char append_retry_directory[512];
 	char append_ambiguous_directory[512];
 	char frontier_directory[512];
@@ -189,6 +264,10 @@ main(void)
 	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
 	PsWalStore store;
 	PsWalStore retry_store;
+	PsWalStore partial_reclaim_store;
+	PsWalStore fsync_reclaim_store;
+	PsWalStore enumerate_reclaim_store;
+	PsWalStore barrier_store;
 	PsWalStore reconcile_store;
 	PsWalStore concurrent_store;
 	PsWalStore discover_store;
@@ -251,18 +330,21 @@ main(void)
 		  retained_base == 0 &&
 		  ps_wal_store_advance_retained_base(&store, TEST_SEGMENT_BYTES) == 0 &&
 		  ps_wal_store_retained_base(&store, &retained_base) == 0 &&
-		  retained_base == TEST_SEGMENT_BYTES,
-		  "retained base advances atomically at a segment boundary");
+		  retained_base == TEST_SEGMENT_BYTES && store.start_lsn == 0 &&
+		  store.nentries == 3,
+		  "logical retained base advances without changing the physical catalog");
+	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	check(ps_wal_store_read(&store, 0, window, 1) != 0 &&
+		  access(path, F_OK) == 0 &&
 		  ps_wal_store_advance_retained_base(&store, 0) != 0,
-		  "retained base rejects reads and monotonic rollback");
+		  "logical advance does not delete files or permit rollback");
 	ps_wal_store_close(&store);
 	check(ps_wal_store_open_existing(&store, directory, 7,
 								 TEST_SEGMENT_BYTES) == 0 &&
 		  ps_wal_store_retained_base(&store, &retained_base) == 0 &&
 		  retained_base == TEST_SEGMENT_BYTES &&
-		  store.start_lsn == TEST_SEGMENT_BYTES && store.nentries == 2,
-		  "reopen preserves the frontier and ignores the retained old prefix");
+		  store.start_lsn == 0 && store.nentries == 3,
+		  "reopen preserves a logical frontier without assuming physical deletion");
 	ps_wal_store_close(&store);
 	snprintf(path, sizeof(path), "%s/%s", directory,
 			 PS_WAL_STORE_IDENTITY_FILE);
@@ -398,23 +480,536 @@ main(void)
 			 directory);
 	check(ps_wal_store_create(&retry_store, frontier_directory, 15, 0,
 							 TEST_SEGMENT_BYTES) == 0 &&
-		  ps_wal_store_append(&retry_store, 0, input, 2 * TEST_SEGMENT_BYTES) == 0 &&
-		  ps_wal_store_advance_retained_base(&retry_store, TEST_SEGMENT_BYTES) == 0,
-		  "publish a retained frontier before prefix unlink");
+		  ps_wal_store_append(&retry_store, 0, input, 2 * TEST_SEGMENT_BYTES) == 0,
+		  "create a store for crash-safe prefix reclamation");
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK", "1", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&retry_store, TEST_SEGMENT_BYTES) != 0 &&
+		  ps_wal_store_retained_base(&retry_store, &retained_base) == 0 &&
+		  retained_base == TEST_SEGMENT_BYTES,
+		  "publish the reclaim frontier before a pre-unlink stop");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
 	ps_wal_store_close(&retry_store);
 	snprintf(path, sizeof(path), "%s/walv1_15_%020llu", frontier_directory,
-			 0ULL);
-	check(unlink(path) == 0,
-		  "unlink the authorized immutable prefix after successful advance");
+				 0ULL);
+	check(ps_wal_store_open_existing(&retry_store, frontier_directory, 15,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  retry_store.start_lsn == TEST_SEGMENT_BYTES &&
+		  retry_store.nentries == 1 && access(path, F_OK) == 0,
+		  "restart retains an old prefix file outside the logical catalog");
+	check(ps_wal_store_read(&retry_store, 0, window, 1) != 0 &&
+		  ps_wal_store_reclaim_prefix(&retry_store, TEST_SEGMENT_BYTES) == 0 &&
+		  access(path, F_OK) != 0 && retry_store.start_lsn == TEST_SEGMENT_BYTES &&
+		  retry_store.nentries == 1,
+		  "reclaim unlinks only the authorized prefix and drains its catalog");
+	check(ps_wal_store_reclaim_prefix(&retry_store, TEST_SEGMENT_BYTES) == 0 &&
+		  access(path, F_OK) != 0,
+		  "prefix reclaim is idempotent after the target is already installed");
+	ps_wal_store_close(&retry_store);
 	check(ps_wal_store_open_existing(&retry_store, frontier_directory, 15,
 								 TEST_SEGMENT_BYTES) == 0 &&
 		  retry_store.start_lsn == TEST_SEGMENT_BYTES &&
 		  retry_store.nentries == 1 &&
 		  ps_wal_store_read(&retry_store, TEST_SEGMENT_BYTES, window,
-								  sizeof(window)) == 0 &&
+								 sizeof(window)) == 0 &&
 		  memcmp(window, input + TEST_SEGMENT_BYTES, sizeof(window)) == 0,
 		  "reopen validates the retained physical suffix after prefix unlink");
 	ps_wal_store_close(&retry_store);
+
+	/* Validate catalog entries again after open: reclaim must not trust the
+	 * hashes and header captured by the initial catalog load. */
+	snprintf(partial_reclaim_directory, sizeof(partial_reclaim_directory),
+			 "%s/catalog_reclaim", directory);
+	check(ps_wal_store_create(&partial_reclaim_store,
+							 partial_reclaim_directory, 16,
+							 0, TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&partial_reclaim_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "create a catalog-validation reclaim store");
+	ps_wal_store_close(&partial_reclaim_store);
+	check(ps_wal_store_open_existing(&partial_reclaim_store,
+								 partial_reclaim_directory, 16,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.nentries == 3,
+		  "open all catalog segments before in-process corruption");
+	snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 0ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		unsigned char damaged = input[10] ^ 0xff;
+
+		check(pwrite_all(fd, &damaged, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "corrupt catalog segment zero after open");
+		close(fd);
+	}
+	else
+		check(0, "open catalog segment zero for corruption");
+	check(ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0 &&
+		  partial_reclaim_store.start_lsn == 0 &&
+		  partial_reclaim_store.nentries == 3,
+		  "corrupt catalog segment zero prevents every unlink");
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+				 partial_reclaim_directory, (unsigned long long) segment);
+		check(access(path, F_OK) == 0,
+			  "low catalog corruption leaves all segments present");
+	}
+	/* Recompute the name because the loop above leaves path at segment two. */
+	snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 0ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		check(pwrite_all(fd, input + 10, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "restore catalog segment zero after failed reclaim");
+		close(fd);
+	}
+	else
+		check(0, "open catalog segment zero for repair");
+	check(ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0,
+		  "repairing low catalog corruption permits retry");
+	ps_wal_store_close(&partial_reclaim_store);
+	snprintf(path, sizeof(path), "%s/%s", partial_reclaim_directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(partial_reclaim_directory);
+
+	snprintf(partial_reclaim_directory, sizeof(partial_reclaim_directory),
+			 "%s/catalog_middle_reclaim", directory);
+	check(ps_wal_store_create(&partial_reclaim_store,
+							 partial_reclaim_directory, 23,
+							 0, TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&partial_reclaim_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "create a middle-catalog-validation reclaim store");
+	ps_wal_store_close(&partial_reclaim_store);
+	check(ps_wal_store_open_existing(&partial_reclaim_store,
+								 partial_reclaim_directory, 23,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.nentries == 3,
+		  "reopen the middle-catalog-validation store");
+	snprintf(path, sizeof(path), "%s/walv1_23_%020llu",
+			 partial_reclaim_directory, 1ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		unsigned char damaged = input[TEST_SEGMENT_BYTES + 10] ^ 0xff;
+
+		check(pwrite_all(fd, &damaged, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "corrupt middle catalog segment after open");
+		close(fd);
+	}
+	else
+		check(0, "open middle catalog segment for corruption");
+	check(ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0 &&
+		  partial_reclaim_store.start_lsn == TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 2,
+		  "middle catalog corruption stops after only lower prefix unlink");
+	snprintf(path, sizeof(path), "%s/walv1_23_%020llu",
+			 partial_reclaim_directory, 0ULL);
+	snprintf(temporary_path, sizeof(temporary_path), "%s/walv1_23_%020llu",
+			 partial_reclaim_directory, 1ULL);
+	check(access(path, F_OK) != 0 && access(temporary_path, F_OK) == 0,
+		  "middle catalog corruption preserves the failed segment");
+	snprintf(path, sizeof(path), "%s/walv1_23_%020llu",
+			 partial_reclaim_directory, 2ULL);
+	check(access(path, F_OK) == 0,
+		  "middle catalog corruption preserves every higher segment");
+	snprintf(temporary_path, sizeof(temporary_path), "%s/walv1_23_%020llu",
+			 partial_reclaim_directory, 1ULL);
+	fd = open(temporary_path, O_RDWR);
+	if (fd >= 0)
+	{
+		check(pwrite_all(fd, input + TEST_SEGMENT_BYTES + 10, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "restore middle catalog segment after failed reclaim");
+		close(fd);
+	}
+	else
+		check(0, "open middle catalog segment for repair");
+	check(ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0,
+		  "repairing middle catalog corruption permits retry");
+	ps_wal_store_close(&partial_reclaim_store);
+	check(ps_wal_store_open_existing(&partial_reclaim_store,
+								 partial_reclaim_directory, 23,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0,
+		  "reopen succeeds after repairing middle catalog corruption");
+	ps_wal_store_close(&partial_reclaim_store);
+	snprintf(path, sizeof(path), "%s/%s", partial_reclaim_directory,
+			 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(partial_reclaim_directory);
+
+	snprintf(partial_reclaim_directory, sizeof(partial_reclaim_directory),
+			 "%s/partial_reclaim", directory);
+	check(ps_wal_store_create(&partial_reclaim_store,
+							 partial_reclaim_directory, 16, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&partial_reclaim_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "create a three-segment store for partial reclaim");
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO", "1", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0 &&
+		  partial_reclaim_store.retained_base_lsn ==
+							 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.start_lsn == TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 2,
+		  "partial unlink stops before the failed segment and keeps catalog parity");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO");
+	snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 0ULL);
+	check(access(path, F_OK) != 0,
+		  "partial reclaim never leaves a successfully unlinked prefix in catalog");
+	snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 1ULL);
+	snprintf(temporary_path, sizeof(temporary_path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 2ULL);
+	check(access(path, F_OK) == 0 && access(temporary_path, F_OK) == 0,
+		  "failed segment leaves only the contiguous residual suffix");
+	ps_wal_store_close(&partial_reclaim_store);
+	check(ps_wal_store_open_existing(&partial_reclaim_store,
+								 partial_reclaim_directory, 16,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0,
+		  "reopen accepts the residual suffix after a partial unlink");
+	snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+			 partial_reclaim_directory, 1ULL);
+	check(access(path, F_OK) == 0 &&
+		  ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0 && access(path, F_OK) != 0,
+		  "reclaim retry completes a partial prefix without crossing the target");
+	check(ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES + 1) != 0 &&
+		  ps_wal_store_reclaim_prefix(&partial_reclaim_store,
+								 4 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "reclaim is idempotent and rejects unaligned or beyond-end targets");
+	ps_wal_store_close(&partial_reclaim_store);
+	check(ps_wal_store_open_existing(&partial_reclaim_store,
+								 partial_reclaim_directory, 16,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  partial_reclaim_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  partial_reclaim_store.nentries == 0 &&
+		  ps_wal_store_read(&partial_reclaim_store,
+								 2 * (uint64_t) TEST_SEGMENT_BYTES,
+								 window, sizeof(window)) != 0,
+		  "restart preserves the completed frontier after partial retry");
+	ps_wal_store_close(&partial_reclaim_store);
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_16_%020llu",
+				 partial_reclaim_directory, (unsigned long long) segment);
+		unlink(path);
+	}
+	snprintf(path, sizeof(path), "%s/%s", partial_reclaim_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(partial_reclaim_directory);
+
+	snprintf(enumerate_reclaim_directory, sizeof(enumerate_reclaim_directory),
+			 "%s/enumerate_reclaim", directory);
+	check(ps_wal_store_create(&enumerate_reclaim_store,
+							 enumerate_reclaim_directory, 18, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&enumerate_reclaim_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0 &&
+		  setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK", "1", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "publish the full enumeration test frontier before stopping");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
+	ps_wal_store_close(&enumerate_reclaim_store);
+	/* Reinsert the three names in reverse order so a scan which deletes while
+	 * iterating would encounter a high segment before the failing segment 0. */
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		snprintf(temporary_path, sizeof(temporary_path), "%s/reorder_%llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		check(rename(path, temporary_path) == 0,
+			  "stage immutable files for reverse directory enumeration");
+	}
+	for (uint64_t segment = 3; segment-- > 0;)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		snprintf(temporary_path, sizeof(temporary_path), "%s/reorder_%llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		check(rename(temporary_path, path) == 0,
+			  "restore immutable files in reverse directory order");
+	}
+	check(ps_wal_store_open_existing(&enumerate_reclaim_store,
+								 enumerate_reclaim_directory, 18,
+								 TEST_SEGMENT_BYTES) == 0,
+		  "open the reverse-enumerated authorized prefix");
+	check(setenv("PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES", "1", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "scan error after a candidate fails before any residual unlink");
+	unsetenv("PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES");
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		check(access(path, F_OK) == 0,
+			  "scan error leaves every residual candidate intact");
+	}
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO", "0", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "candidate collection completes before a low-segment unlink failure");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO");
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		check(access(path, F_OK) == 0,
+			  "a failed lowest candidate leaves every higher candidate intact");
+	}
+	snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 0ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		unsigned char damaged = input[10] ^ 0xff;
+
+		check(pwrite_all(fd, &damaged, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "corrupt the lowest residual candidate after open");
+		close(fd);
+	}
+	else
+		check(0, "open the lowest residual candidate for corruption");
+	check(ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "corrupt lowest residual candidate stops reclaim before any unlink");
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+				 enumerate_reclaim_directory, (unsigned long long) segment);
+		check(access(path, F_OK) == 0,
+			  "low residual corruption preserves all candidates for diagnosis");
+	}
+	ps_wal_store_close(&enumerate_reclaim_store);
+	check(ps_wal_store_open_existing(&enumerate_reclaim_store,
+								 enumerate_reclaim_directory, 18,
+								 TEST_SEGMENT_BYTES) != 0,
+		  "reopen fails closed when a low residual segment is corrupt");
+	snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 0ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		check(pwrite_all(fd, input + 10, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "restore the lowest residual candidate after fail-closed reopen");
+		close(fd);
+	}
+	else
+		check(0, "open the lowest residual candidate for repair");
+	check(ps_wal_store_open_existing(&enumerate_reclaim_store,
+								 enumerate_reclaim_directory, 18,
+								 TEST_SEGMENT_BYTES) == 0,
+		  "reopen succeeds after repairing the low residual candidate");
+	snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 1ULL);
+	fd = open(path, O_RDWR);
+	if (fd >= 0)
+	{
+		unsigned char damaged = input[TEST_SEGMENT_BYTES + 10] ^ 0xff;
+
+		check(pwrite_all(fd, &damaged, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "corrupt a middle residual candidate after open");
+		close(fd);
+	}
+	else
+		check(0, "open the middle residual candidate for corruption");
+	check(ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) != 0,
+		  "middle residual corruption stops before the middle unlink");
+	snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 0ULL);
+	snprintf(temporary_path, sizeof(temporary_path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 1ULL);
+	check(access(path, F_OK) != 0 && access(temporary_path, F_OK) == 0,
+		  "middle corruption leaves the failed and higher residual candidates");
+	snprintf(path, sizeof(path), "%s/walv1_18_%020llu",
+			 enumerate_reclaim_directory, 2ULL);
+	check(access(path, F_OK) == 0,
+		  "middle corruption does not cross into the higher candidate");
+	ps_wal_store_close(&enumerate_reclaim_store);
+	check(ps_wal_store_open_existing(&enumerate_reclaim_store,
+								 enumerate_reclaim_directory, 18,
+								 TEST_SEGMENT_BYTES) != 0,
+		  "reopen fails closed while the middle residual segment is corrupt");
+	fd = open(temporary_path, O_RDWR);
+	if (fd >= 0)
+	{
+		check(pwrite_all(fd, input + TEST_SEGMENT_BYTES + 10, 1,
+						 PS_WAL_SEGMENT_HEADER_BYTES + 10) == 0,
+			  "restore the middle residual candidate after fail-closed reopen");
+		close(fd);
+	}
+	else
+		check(0, "open the middle residual candidate for repair");
+	check(ps_wal_store_open_existing(&enumerate_reclaim_store,
+								 enumerate_reclaim_directory, 18,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_reclaim_prefix(&enumerate_reclaim_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0,
+		  "repairing the middle residual permits complete retry");
+	ps_wal_store_close(&enumerate_reclaim_store);
+	snprintf(path, sizeof(path), "%s/%s", enumerate_reclaim_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(enumerate_reclaim_directory);
+
+	snprintf(fsync_reclaim_directory, sizeof(fsync_reclaim_directory),
+			 "%s/fsync_reclaim", directory);
+	check(ps_wal_store_create(&fsync_reclaim_store, fsync_reclaim_directory, 17, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&fsync_reclaim_store, 0, input,
+							 2 * TEST_SEGMENT_BYTES) == 0,
+		  "create a store for ambiguous reclaim directory fsync");
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC", "1", 1) == 0 &&
+		  ps_wal_store_reclaim_prefix(&fsync_reclaim_store, TEST_SEGMENT_BYTES) != 0 &&
+		  fsync_reclaim_store.metadata_fenced &&
+		  ps_wal_store_retained_base(&fsync_reclaim_store, &retained_base) != 0,
+		  "ambiguous reclaim directory fsync fences before further unlink");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC");
+	ps_wal_store_close(&fsync_reclaim_store);
+	check(ps_wal_store_open_existing(&fsync_reclaim_store,
+								 fsync_reclaim_directory, 17,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  fsync_reclaim_store.start_lsn == TEST_SEGMENT_BYTES &&
+		  fsync_reclaim_store.nentries == 1 &&
+		  ps_wal_store_reclaim_prefix(&fsync_reclaim_store,
+								 2 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  fsync_reclaim_store.nentries == 0,
+		  "restart clears the fenced reclaim and permits an idempotent retry");
+	ps_wal_store_close(&fsync_reclaim_store);
+	snprintf(path, sizeof(path), "%s/%s", fsync_reclaim_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(fsync_reclaim_directory);
+
+	snprintf(crash_before_directory, sizeof(crash_before_directory),
+			 "%s/crash_before_unlink", directory);
+	check(ps_wal_store_create(&retry_store, crash_before_directory, 19, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&retry_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "seed the real pre-unlink crash store");
+	ps_wal_store_close(&retry_store);
+	check(run_reclaim_crash_child(crash_before_directory, 19,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES,
+								 "PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK",
+								 "1", 91) == 0,
+		  "child exits after durable frontier and before first unlink");
+	check(ps_wal_store_open_existing(&retry_store, crash_before_directory, 19,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  retry_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  retry_store.nentries == 0,
+		  "parent reopens the pre-unlink crash state");
+	for (uint64_t segment = 0; segment < 3; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_19_%020llu",
+				 crash_before_directory, (unsigned long long) segment);
+		check(access(path, F_OK) == 0,
+			  "pre-unlink crash leaves every authorized prefix file");
+	}
+	check(ps_wal_store_reclaim_prefix(&retry_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0,
+		  "parent retries the complete residual prefix");
+	ps_wal_store_close(&retry_store);
+	snprintf(path, sizeof(path), "%s/%s", crash_before_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(crash_before_directory);
+
+	snprintf(crash_partial_directory, sizeof(crash_partial_directory),
+			 "%s/crash_partial_unlink", directory);
+	check(ps_wal_store_create(&retry_store, crash_partial_directory, 20, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&retry_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "seed the real partial-unlink crash store");
+	ps_wal_store_close(&retry_store);
+	check(run_reclaim_crash_child(crash_partial_directory, 20,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES,
+								 "PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
+								 "0", 92) == 0,
+		  "child exits after the first successful unlink");
+	check(ps_wal_store_open_existing(&retry_store, crash_partial_directory, 20,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  retry_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  retry_store.nentries == 0,
+		  "parent reopens the partial-unlink crash state");
+	snprintf(path, sizeof(path), "%s/walv1_20_%020llu",
+			 crash_partial_directory, 0ULL);
+	snprintf(temporary_path, sizeof(temporary_path), "%s/walv1_20_%020llu",
+			 crash_partial_directory, 1ULL);
+	check(access(path, F_OK) != 0 && access(temporary_path, F_OK) == 0,
+		  "partial crash removes only segment zero before stopping");
+	snprintf(path, sizeof(path), "%s/walv1_20_%020llu",
+			 crash_partial_directory, 2ULL);
+	check(access(path, F_OK) == 0 &&
+		  ps_wal_store_reclaim_prefix(&retry_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0 &&
+		  access(temporary_path, F_OK) != 0 && access(path, F_OK) != 0,
+		  "parent retries the contiguous residual segments one and two");
+	ps_wal_store_close(&retry_store);
+	snprintf(path, sizeof(path), "%s/%s", crash_partial_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(crash_partial_directory);
+
+	snprintf(crash_fsync_directory, sizeof(crash_fsync_directory),
+			 "%s/crash_before_dir_fsync", directory);
+	check(ps_wal_store_create(&retry_store, crash_fsync_directory, 21, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&retry_store, 0, input,
+							 3 * TEST_SEGMENT_BYTES) == 0,
+		  "seed the real pre-directory-fsync crash store");
+	ps_wal_store_close(&retry_store);
+	check(run_reclaim_crash_child(crash_fsync_directory, 21,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES,
+								 "PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC",
+								 "1", 93) == 0,
+		  "child exits after all unlink calls and before directory fsync");
+	check(ps_wal_store_open_existing(&retry_store, crash_fsync_directory, 21,
+								 TEST_SEGMENT_BYTES) == 0 &&
+		  retry_store.start_lsn == 3 * (uint64_t) TEST_SEGMENT_BYTES &&
+		  retry_store.nentries == 0 &&
+		  ps_wal_store_reclaim_prefix(&retry_store,
+								 3 * (uint64_t) TEST_SEGMENT_BYTES) == 0,
+		  "parent reopens and idempotently accepts the fully unlinked state");
+	ps_wal_store_close(&retry_store);
+	snprintf(path, sizeof(path), "%s/%s", crash_fsync_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	rmdir(crash_fsync_directory);
 	snprintf(path, sizeof(path), "%s/walv1_15_%020llu", frontier_directory,
 			 1ULL);
 	unlink(path);
@@ -714,6 +1309,87 @@ main(void)
 			 PS_WAL_STORE_IDENTITY_FILE);
 	unlink(path);
 	rmdir(concurrent_directory);
+
+	snprintf(barrier_directory, sizeof(barrier_directory), "%s/barrier",
+			 directory);
+	check(ps_wal_store_create(&barrier_store, barrier_directory, 22, 0,
+							 TEST_SEGMENT_BYTES) == 0 &&
+		  ps_wal_store_append(&barrier_store, 0, input,
+							 2 * TEST_SEGMENT_BYTES) == 0,
+		  "seed the reclaim reader-barrier store");
+	snprintf(barrier_gate_path, sizeof(barrier_gate_path), "%s/read.gate",
+			 barrier_directory);
+	snprintf(barrier_release_path, sizeof(barrier_release_path), "%s/read.release",
+			 barrier_directory);
+	check(setenv("PAGESTORE_TEST_WAL_READ_GATE", barrier_gate_path, 1) == 0 &&
+		  setenv("PAGESTORE_TEST_WAL_READ_RELEASE", barrier_release_path, 1) == 0,
+		  "arm the test-only reader gate");
+	{
+		ReclaimBarrierArgs args;
+		pthread_t reader_thread;
+		pthread_t reclaimer_thread;
+		int reader_created;
+		int reclaimer_created;
+		int gate_seen = 0;
+		int release_fd;
+
+		memset(&args, 0, sizeof(args));
+		args.store = &barrier_store;
+		atomic_init(&args.read_started, 0);
+		atomic_init(&args.read_done, 0);
+		atomic_init(&args.reclaim_started, 0);
+		atomic_init(&args.reclaim_done, 0);
+		reader_created = pthread_create(&reader_thread, NULL, barrier_read, &args) == 0;
+		for (int i = 0; reader_created && i < 5000; i++)
+		{
+			if (access(barrier_gate_path, F_OK) == 0)
+			{
+				gate_seen = 1;
+				break;
+			}
+			usleep(1000);
+		}
+		reclaimer_created = gate_seen &&
+			pthread_create(&reclaimer_thread, NULL, barrier_reclaim, &args) == 0;
+		for (int i = 0; reclaimer_created && i < 5000; i++)
+		{
+			if (atomic_load(&args.reclaim_started))
+				break;
+			usleep(1000);
+		}
+		check(reader_created && reclaimer_created && gate_seen &&
+			  !atomic_load(&args.read_done) && !atomic_load(&args.reclaim_done),
+			  "reclaimer waits while an already-held reader owns the WAL mutex");
+		release_fd = open(barrier_release_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+		if (release_fd >= 0)
+			close(release_fd);
+		if (reader_created)
+			pthread_join(reader_thread, NULL);
+		if (reclaimer_created)
+			pthread_join(reclaimer_thread, NULL);
+		check(args.read_rc == 0 && args.reclaim_rc == 0 &&
+			  atomic_load(&args.read_done) && atomic_load(&args.reclaim_done),
+			  "reader completes before the waiting reclaim proceeds");
+	}
+	unsetenv("PAGESTORE_TEST_WAL_READ_GATE");
+	unsetenv("PAGESTORE_TEST_WAL_READ_RELEASE");
+	snprintf(path, sizeof(path), "%s/walv1_22_%020llu", barrier_directory, 0ULL);
+	check(access(path, F_OK) != 0 && ps_wal_store_read(&barrier_store, 0,
+								 window, 1) != 0,
+		  "below-frontier reads fail after the reader barrier and reclaim");
+	ps_wal_store_close(&barrier_store);
+	for (uint64_t segment = 0; segment < 2; segment++)
+	{
+		snprintf(path, sizeof(path), "%s/walv1_22_%020llu", barrier_directory,
+				 (unsigned long long) segment);
+		unlink(path);
+	}
+	snprintf(path, sizeof(path), "%s/%s", barrier_directory,
+				 PS_WAL_STORE_IDENTITY_FILE);
+	unlink(path);
+	unlink(barrier_gate_path);
+	unlink(barrier_release_path);
+	rmdir(barrier_directory);
 
 	snprintf(path, sizeof(path), "%s/walv1_7_%020llu", directory, 0ULL);
 	fd = open(path, O_RDWR);
