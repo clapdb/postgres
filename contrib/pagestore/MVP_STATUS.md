@@ -232,13 +232,18 @@ pending snapshot state, non-POSIX providers, and publication failures all fail
 closed with a one-second retry backoff.  Durable retained-base metadata is the
 sole restart-stable admission frontier; physical directory start is not a
 runtime fence.  WAL reads recheck that fence under each visited timeline's WAL
-lock, while pre-metadata timelines retain local WAL readability.  Descendant
-control history and a target child's reclaim candidate are capped at their
-branch points, and durable index progress beyond the sealed prefix remains a
-valid proof.  Focused core coverage includes idle preselection, ancestry and
-timeline isolation, child-local controls, target branch caps, naturally
-nonzero starts, unaligned progress tails, pre-metadata reads, restart
-admission, a read/frontier publication race, pending-proof cleanup failure,
+lock; inherited history may bypass a child's natural local base and is then
+rechecked against the parent, while pre-metadata timelines retain local WAL
+readability.  Descendant control history and a target child's reclaim candidate
+are capped at their branch points, durable index progress beyond the sealed
+prefix remains a valid proof, and a durably DELETED descendant no longer pins
+its parent (DELETING still does).  Reopen reconstructs residual-prefix work so
+an already-published frontier can finish idempotent unlink without a new proof.
+Focused core coverage (57 checks) includes idle preselection, ancestry and timeline
+isolation, natural nonzero child fallback, child-local controls, target branch
+caps, LIVE/DELETING/DELETED floors, naturally nonzero starts, unaligned progress
+tails, pre-metadata reads, restart/residual retry, a read/frontier publication
+race, fenced residual-query suppression, pending-proof cleanup failure,
 metadata publication failure/backoff, and admission concurrency.
 
 This is a conservative R3b-3 policy integration.  It does not include sparse

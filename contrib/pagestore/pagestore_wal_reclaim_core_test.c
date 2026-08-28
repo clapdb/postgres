@@ -251,6 +251,51 @@ create_branch(uint32_t timeline, uint32_t parent, uint64_t lsn)
 }
 
 static int
+timeline_state(uint32_t timeline, PsTimelineState *state)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_TIMELINE_STATE;
+	ch.timeline = timeline;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_lifecycle_read_unlock();
+	if (ch.status != PS_STATUS_OK)
+		return 0;
+	*state = (PsTimelineState) ch.result;
+	return 1;
+}
+
+static int
+begin_delete(uint32_t timeline)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_BEGIN_DELETE;
+	ch.timeline = timeline;
+	ch.req_seq = 1;
+	ch.status = PS_STATUS_OK;
+	if (ps_lifecycle_write_lock() != 0)
+		return 0;
+	if (ps_admission_write_lock() != 0)
+	{
+		ps_lifecycle_write_unlock();
+		return 0;
+	}
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
 wal_read_status(uint32_t timeline, uint64_t lsn)
 {
 	PsChannel ch;
@@ -485,6 +530,7 @@ test_child_branch_cap(void)
 	const uint64_t child_start = branch_lsn - branch_lsn % WAL_SEGMENT;
 	const uint64_t child_end = child_start + 2 * WAL_SEGMENT;
 	char store[] = "/tmp/pagestore-wal-policy-branch-cap-XXXXXX";
+	uint64_t retained_base = 0;
 
 	configure_core();
 	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
@@ -495,10 +541,96 @@ test_child_branch_cap(void)
 		  write_control(1, child_end, child_end) &&
 		  wal_index_progress(0, 0, WAL_TOTAL) &&
 		  wal_index_progress(1, child_start, child_end) &&
+			  segment_count(store, 1) == 2,
+			  "construct a child whose copied WAL segment starts at its aligned fork");
+	check(ps_test_wal_retained_base(1, &retained_base) == 0 &&
+			  retained_base == child_start &&
+			  wal_read_status(1, 0) == PS_STATUS_OK &&
+			  wal_read_status(1, child_start) == PS_STATUS_OK,
+			  "a natural nonzero child retained base falls through to retained parent WAL");
+	check(maintenance_until_count(store, 0, 2) &&
 		  segment_count(store, 1) == 2 &&
-		  maintenance_until_count(store, 0, 2) &&
-		  segment_count(store, 1) == 2,
-		  "child reclaim stops at its fork while the parent still reclaims its safe prefix");
+		  wal_read_status(1, 0) == PS_STATUS_ERROR &&
+		  wal_read_status(1, child_start) == PS_STATUS_OK,
+		  "child reclaim stops at its fork and parent frontier still fences inherited WAL");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_residual_prefix_retry_after_reopen(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-residual-XXXXXX";
+
+	configure_core();
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
+		  "construct reclaimable WAL for a residual-prefix retry");
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK", "1", 1) == 0 &&
+		  ps_test_wal_reclaim_maintenance() == 0 &&
+		  segment_count(store, 0) == WAL_SEGMENTS,
+		  "publish the durable frontier but leave every authorized file residual");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
+	close_store();
+	check(ps_core_open(store) == 0 && segment_count(store, 0) == WAL_SEGMENTS &&
+		  ps_test_wal_reclaim_maintenance() == 1 &&
+		  segment_count(store, 0) == 0,
+		  "reopen retries residual unlink at the already-published frontier");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_deleted_descendant_floor(void)
+{
+	const uint64_t branch_lsn = WAL_SEGMENT + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-deleted-floor-XXXXXX";
+	PsTimelineState state = PS_TIMELINE_LIVE;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
+		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
+		  create_branch(1, 0, branch_lsn) &&
+		  ps_test_walidx_frontier_exception_active(0, branch_lsn) &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == branch_lsn,
+		  "a LIVE descendant structurally pins the parent WAL floor");
+	check(begin_delete(1) && timeline_state(1, &state) &&
+		  state == PS_TIMELINE_DELETING &&
+		  ps_test_walidx_frontier_exception_active(0, branch_lsn) &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == branch_lsn,
+		  "a DELETING descendant keeps its structural WAL pin");
+	for (int i = 0; i < 128 &&
+		 (!timeline_state(1, &state) || state != PS_TIMELINE_DELETED); i++)
+		(void) ps_core_maintenance();
+	check(timeline_state(1, &state) && state == PS_TIMELINE_DELETED &&
+		  !ps_test_walidx_frontier_exception_active(0, branch_lsn) &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) == WAL_TOTAL,
+		  "a durably DELETED descendant no longer pins the parent WAL floor");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_fenced_residual_query_stops_retries(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-fenced-residual-XXXXXX";
+	ReclaimAttemptCounter counter = {0};
+
+	configure_core();
+	check(prepare_store(store, WAL_SEGMENT, 0, 0, 1),
+		  "construct a one-segment reclaim candidate for directory-fsync fencing");
+	ps_test_set_wal_reclaim_attempt_hook(count_reclaim_attempt, &counter);
+	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC", "1", 1) == 0,
+		  "enable ambiguous reclaim directory-fsync failure");
+	for (int i = 0; i < 16 && counter.attempts == 0; i++)
+		(void) ps_core_maintenance();
+	check(counter.attempts == 1 && segment_count(store, 0) == WAL_SEGMENTS - 1,
+		  "directory-fsync failure fences after publishing and unlinking the prefix");
+	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC");
+	(void) sleep(2);
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.attempts == 1,
+		  "fenced residual-query failure suppresses futile retries until reopen");
+	ps_test_set_wal_reclaim_attempt_hook(NULL, NULL);
 	close_store();
 	remove_tree(store);
 }
@@ -835,6 +967,9 @@ main(void)
 	test_natural_nonzero_start();
 	test_progress_beyond_immutable_end();
 	test_child_branch_cap();
+	test_residual_prefix_retry_after_reopen();
+	test_deleted_descendant_floor();
+	test_fenced_residual_query_stops_retries();
 	test_undefined_timeline_read();
 	test_missing_proof_does_not_starve_later_timeline();
 	test_pending_durable_proof();

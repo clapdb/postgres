@@ -2839,8 +2839,11 @@ walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn)
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
 		uint64_t projected = UINT64_MAX;
+		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
+			ps_timeline_state(candidate, &state, NULL) &&
+			state != PS_TIMELINE_DELETED &&
 			retention_project_lsn(candidate, timeline, &projected) &&
 			projected == lsn)
 			return 1;
@@ -4045,6 +4048,21 @@ wal_reclaim_frontier_one_allows(uint32_t timeline, uint64_t lsn)
 	return lsn >= base;
 }
 
+/* A defined child may read the part of its visible history at or before its
+ * fork from the parent even when the child's own store starts at the aligned
+ * fork and therefore has a higher retained base.  This exception is local to
+ * a child level: roots, undefined timelines, and child-local post-fork WAL
+ * still have to pass their own retained-base fence. */
+static int
+wal_reclaim_frontier_level_allows(uint32_t timeline, uint64_t lsn)
+{
+	if (wal_reclaim_frontier_one_allows(timeline, lsn))
+		return 1;
+	return timeline < MAX_TIMELINES && timelines[timeline].defined &&
+		timelines[timeline].parent >= 0 &&
+		lsn <= timelines[timeline].branch_lsn;
+}
+
 /* Check every local history level, applying the same branch cap used by
  * read-through.  This is intentionally a contiguous frontier check: R3b-3
  * has no sparse exception protocol for a fixed reader or branch base. */
@@ -4057,7 +4075,7 @@ wal_reclaim_frontier_ancestry_allows(uint32_t timeline, uint64_t lsn)
 	for (uint32_t hops = 0; hops <= MAX_TIMELINES; hops++)
 	{
 		if (current >= MAX_TIMELINES ||
-			!wal_reclaim_frontier_one_allows(current, cap))
+			!wal_reclaim_frontier_level_allows(current, cap))
 			return 0;
 		/* A shipped WAL timeline can legitimately precede its ancestry
 		 * metadata.  Its local retained-base fence is still authoritative,
@@ -7337,7 +7355,10 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 		 * Recheck each visited history level while its WAL lock excludes reclaim;
 		 * otherwise a read that queued just before publication could return a
 		 * successful partial/empty result from an already removed prefix. */
-		if (!wal_reclaim_frontier_one_allows(tl, frontier))
+		/* This level is checked while its own WAL lock excludes reclaim.  The
+		 * next parent is checked again under the parent's lock on the next loop;
+		 * walking the complete ancestry here would reintroduce a TOCTOU gap. */
+		if (!wal_reclaim_frontier_level_allows(tl, frontier))
 		{
 			pthread_rwlock_unlock(lock);
 			return -1;
@@ -7858,6 +7879,9 @@ wal_reclaim_preselected(struct timespec *now_out)
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
 		pthread_rwlock_t *wal_lock;
+		uint64_t residual_target = 0;
+		int residual_pending;
+		int residual_status;
 		int eligible;
 
 		if (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
@@ -7869,13 +7893,18 @@ wal_reclaim_preselected(struct timespec *now_out)
 		if (wal_lock == NULL)
 			continue;
 		pthread_rwlock_rdlock(wal_lock);
-		eligible = wal_segment_store_opened[tl] &&
-			wal_segment_stores[tl].nentries != 0 &&
-			wal_segment_stores[tl].start_lsn <= UINT64_MAX -
-			wal_segment_stores[tl].segment_size &&
-			wal_segment_stores[tl].start_lsn +
-			wal_segment_stores[tl].segment_size <=
-			wal_segment_stores[tl].end_lsn;
+		residual_status = wal_segment_store_opened[tl] ?
+			ps_wal_store_residual_prefix_pending(&wal_segment_stores[tl],
+											 &residual_target) : 0;
+		residual_pending = residual_status > 0;
+		eligible = wal_segment_store_opened[tl] && residual_status >= 0 &&
+			(residual_pending ||
+			 (wal_segment_stores[tl].nentries != 0 &&
+			  wal_segment_stores[tl].start_lsn <= UINT64_MAX -
+			  wal_segment_stores[tl].segment_size &&
+			  wal_segment_stores[tl].start_lsn +
+			  wal_segment_stores[tl].segment_size <=
+			  wal_segment_stores[tl].end_lsn));
 		pthread_rwlock_unlock(wal_lock);
 		if (eligible)
 			return 1;
@@ -7916,9 +7945,12 @@ wal_segment_reclaim_one(void)
 		uint64_t raw_floor = 0;
 		uint64_t candidate;
 		uint64_t target;
+		uint64_t residual_target = 0;
 		int attempt = 0;
 		int rc;
 		int walidx_valid;
+		int residual_pending;
+		int residual_status;
 		int shards_locked = 0;
 
 		if (now.tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
@@ -7933,10 +7965,15 @@ wal_segment_reclaim_one(void)
 		/* Avoid taking the global drain for stale preselection results. */
 		pthread_rwlock_rdlock(wal_lock);
 		store = &wal_segment_stores[tl];
-		if (!wal_segment_store_opened[tl] || store->nentries == 0 ||
-			store->start_lsn > UINT64_MAX -
-															 store->segment_size ||
-															 store->start_lsn + store->segment_size > store->end_lsn)
+		residual_status = wal_segment_store_opened[tl] ?
+			ps_wal_store_residual_prefix_pending(store, &residual_target) : 0;
+		residual_pending = residual_status > 0;
+		if (!wal_segment_store_opened[tl] ||
+			residual_status < 0 ||
+			(!residual_pending &&
+			 (store->nentries == 0 || store->start_lsn > UINT64_MAX -
+														 store->segment_size ||
+			  store->start_lsn + store->segment_size > store->end_lsn)))
 		{
 			pthread_rwlock_unlock(wal_lock);
 			continue;
@@ -7951,14 +7988,43 @@ wal_segment_reclaim_one(void)
 		walidx_publish_wrlock();
 		pthread_rwlock_wrlock(wal_lock);
 		store = &wal_segment_stores[tl];
+		residual_status = wal_segment_store_opened[tl] ?
+			ps_wal_store_residual_prefix_pending(store, &residual_target) : 0;
+		residual_pending = residual_status > 0;
 		/* Full revalidation after all global gates. */
 		if (!ps_timeline_live(tl) ||
 			!wal_segment_store_opened[tl] ||
-			store->nentries == 0 || store->start_lsn > UINT64_MAX -
-															 store->segment_size ||
-															 store->start_lsn + store->segment_size > store->end_lsn)
+			residual_status < 0 ||
+			(!residual_pending &&
+			 (store->nentries == 0 || store->start_lsn > UINT64_MAX -
+																		 store->segment_size ||
+																		 store->start_lsn + store->segment_size > store->end_lsn)))
 			goto unlock_timeline;
 		attempt = 1;
+		if (residual_pending)
+		{
+			/* The durable frontier is already published.  The residual retry is
+			 * independent of WAL-index proof and may be the only work left after
+			 * a restart, including an empty logical catalog. */
+			for (uint32_t shard = nshards; shard > 0; shard--)
+				ps_unlock_shard(shard - 1);
+			shards_locked = 0;
+			if (residual_target < store->start_lsn ||
+				residual_target > store->end_lsn ||
+				residual_target % store->segment_size != 0)
+				goto retry_timeline;
+			if (wal_reclaim_attempt_test_hook != NULL)
+				wal_reclaim_attempt_test_hook(tl, wal_reclaim_attempt_test_hook_arg);
+			rc = ps_wal_store_reclaim_prefix(store, residual_target);
+			if (rc == 0)
+			{
+				memset(&wal_reclaim_retry_at[tl], 0,
+					   sizeof(wal_reclaim_retry_at[tl]));
+				did = 1;
+				goto selected_done;
+			}
+			goto retry_timeline;
+		}
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
 		pthread_mutex_unlock(&walidx_meta_lock);
@@ -8042,6 +8108,35 @@ int
 ps_test_wal_reclaim_maintenance(void)
 {
 	return wal_segment_reclaim_one();
+}
+
+int
+ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out)
+{
+	pthread_rwlock_t *wal_lock;
+	int rc;
+
+	if (base_out == NULL || timeline >= MAX_TIMELINES)
+		return -1;
+	wal_lock = wal_log_lock_for(timeline);
+	if (wal_lock == NULL)
+		return -1;
+	pthread_rwlock_rdlock(wal_lock);
+	rc = wal_segment_store_opened[timeline] ?
+		ps_wal_store_retained_base(&wal_segment_stores[timeline], base_out) : -1;
+	pthread_rwlock_unlock(wal_lock);
+	return rc;
+}
+
+int
+ps_test_walidx_frontier_exception_active(uint32_t timeline, uint64_t lsn)
+{
+	int active;
+
+	ps_lock_map_rd();
+	active = walidx_frontier_exception_active(timeline, lsn);
+	ps_unlock_map();
+	return active;
 }
 
 static void
@@ -11078,8 +11173,11 @@ page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
 		uint64_t cap = UINT64_MAX;
+		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
+			ps_timeline_state(candidate, &state, NULL) &&
+			state != PS_TIMELINE_DELETED &&
 			retention_project_lsn(candidate, timeline, &cap))
 		{
 			fences[nfences].lsn = cap;
@@ -11122,8 +11220,11 @@ walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
 		uint64_t projected = UINT64_MAX;
+		PsTimelineState state;
 
 		if (candidate != timeline && timelines[candidate].defined &&
+			ps_timeline_state(candidate, &state, NULL) &&
+			state != PS_TIMELINE_DELETED &&
 			retention_project_lsn(candidate, timeline, &projected))
 			fences[nfences++] = projected;
 	}
@@ -11202,8 +11303,11 @@ retention_effective_floor_internal(uint32_t timeline, uint32_t resource,
 	for (uint32_t candidate = 0; candidate < MAX_TIMELINES; candidate++)
 	{
 		uint64_t	cap = UINT64_MAX;
+		PsTimelineState state;
 
 		if (!timelines[candidate].defined ||
+			!ps_timeline_state(candidate, &state, NULL) ||
+			state == PS_TIMELINE_DELETED ||
 			!retention_project_lsn(candidate, timeline, &cap))
 			continue;
 		if (candidate != timeline && resource != PS_RETENTION_RESOURCE_PAGE_HISTORY)
