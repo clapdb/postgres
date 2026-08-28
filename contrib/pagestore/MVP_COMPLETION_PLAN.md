@@ -362,7 +362,25 @@ further deletion or an immediate stop, while a corrupt low residual prefix makes
 reopen fail closed until repaired.
 Operational cutoff selection, core maintenance wiring, retention-owner
 admission, WAL-index dependency removal, and continuous bounded-space
-acceptance remain future R3 work.
+acceptance are now supplied conservatively by R3b-3 on the POSIX path.
+
+R3b-3 is the conservative POSIX/core policy integration for that reclaimer.
+It admits at most one LIVE timeline per maintenance tick, drains ordinary
+admission before taking the WAL-index prune/publish gates, and takes one
+timeline WAL write lock.  All shard locks are released after the in-memory
+WAL-index dependency snapshot and before control-image reads, layer I/O,
+metadata publication, or unlink.  The candidate is the segment-aligned-down
+minimum of the effective WAL retention floor, durable WAL-index progress, and
+the oldest surviving raw WAL dependency.  Missing durable proof, pending or
+malformed snapshot state, non-POSIX providers, and any publication/unlink
+failure do not authorize deletion and retry after one second.  Durable
+retained-base metadata, including a naturally nonzero base after restart, is
+the sole admission frontier; physical directory start is not a runtime field
+or fence.
+
+This R3b-3 slice intentionally does not implement sparse/discrete retained
+base crossing or a bounded fixed-reader soak; those remain explicit follow-up
+acceptance work.
 
 With no owner floor, the WAL cutoff is the newest restart/recovery boundary
 whose control image and required WAL are durably published.  It is independent
@@ -936,6 +954,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-26 | Added R5 durable DELETED publication and incarnation-aware numeric-ID reuse: the same-incarnation DELETED event is fsynced after owner-scoped cleanup, and CREATE_BRANCH admits only the exact next token after runtime reset | Focused normal/ASan publication, immediate same-horizon reuse, stale-token/parent fencing, restart, repeated-cycle, sibling-safety, and ambiguous-append coverage; SPDK async drain remains fail-closed |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
 | 2026-08-28 | Added R3b-2 standalone crash-safe physical immutable-prefix reclamation: `ps_wal_store_reclaim_prefix()` publishes retained/physical frontiers before unlink, uses the WAL mutex as a reader drain/barrier, fully validates/sorts residual candidates before ascending unlink, revalidates every main-catalog candidate immediately before unlink, keeps partial unlink catalog state exact, fences ambiguous directory fsync, and retries residual prefixes after restart; no core maintenance or cutoff policy | Final focused WAL-store test: 166 checks, 0 failures; includes reverse-enumeration candidate ordering, scan-error zero-unlink, low/middle main-catalog corruption and residual corruption, lowest/middle unlink failures, per-candidate header/CRC validation, real fork/`_exit` stops before unlink/after partial unlink/before directory fsync, deterministic reader-barrier timing, idempotence, boundary rejection, and restart retry |
+| 2026-08-28 | Added conservative R3b-3 POSIX/core WAL reclaim policy integration: durable retained-base admission with a WAL-lock read recheck, fair one-LIVE-timeline scheduling ahead of continuous tier/remote-GC work, admission drain plus WAL-index freeze and single-timeline WAL locking, branch-capped control history, dependency/retention/progress minimum cutoff, fail-closed pending-proof and publication failure handling, and one-second retry backoff; physical directory start is not a runtime fence | Focused core policy test: 38 checks, 0 failures; covers ancestry, child-local controls, timeline isolation, naturally nonzero starts, restart, read/frontier publication races, no-proof candidate fairness, pending durable-proof cleanup failure, metadata publication failure/backoff, and admission concurrency; sparse/discrete base crossing and bounded fixed-reader soak remain out of scope |
 | 2026-08-15 | Added the pure R4 replacement-base planner: operational and discrete horizons retain a union of FPI-led redo chains, future records remain intact, and legacy/insufficient metadata fails closed | Dedicated planner unit tests; durable frontier and snapshot cutover remain the next stacked change |
 | 2026-08-15 | Split WAL-index snapshot publication into durable shard preparation and atomic manifest commit | Creates the crash-safe insertion point for the R4 reclaimed frontier without changing the existing one-shot API |
 | 2026-08-15 | Completed R4 WAL-index entry compaction and durable frontier admission | Multi-shard proof, discrete/operational chain integration, restart/corruption coverage, and a deterministic crash after frontier publication |

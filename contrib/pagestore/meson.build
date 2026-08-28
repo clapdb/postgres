@@ -238,6 +238,25 @@ test('pagestore_timeline',
   timeout: 60,
 )
 
+# Focused shared-core tests for the conservative POSIX WAL reclaim policy.
+pagestore_wal_reclaim_core_test = executable('pagestore_wal_reclaim_core_test',
+  files('pagestore_wal_reclaim_core_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_wal_reclaim_core',
+  pagestore_wal_reclaim_core_test,
+  suite: ['pagestore'],
+  timeout: 60,
+)
+
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',

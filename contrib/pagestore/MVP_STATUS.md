@@ -221,8 +221,26 @@ segments.  Focused coverage includes real fork/`_exit` restart points,
 scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
-This is not core maintenance, retention-cutoff selection, WAL index dependency
-removal, or flat-WAL reclamation.  Still required for the gate:
+R3b-3 is the conservative POSIX/core policy integration.  It admits at most
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work, drains ordinary admission before
+freezing the WAL index, snapshots raw WAL dependencies under short-lived
+shard/map protection, and releases all shard locks before control-image,
+layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
+minimum of the effective WAL retention floor, durable WAL-index progress, and
+the oldest surviving raw WAL dependency.  Missing durable proof, malformed or
+pending snapshot state, non-POSIX providers, and publication failures all fail
+closed with a one-second retry backoff.  Durable retained-base metadata is the
+sole restart-stable admission frontier; physical directory start is not a
+runtime fence.  WAL reads recheck that fence under each visited timeline's WAL
+lock, and descendant control history is capped at its branch point.  Focused
+core coverage includes ancestry and timeline isolation, child-local controls,
+naturally nonzero starts, restart admission, a read/frontier publication race,
+pending-proof cleanup failure, metadata publication failure/backoff, and
+admission concurrency.
+
+This is a conservative R3b-3 policy integration.  It does not include sparse
+or discrete retained-base crossing, or a bounded fixed-reader soak.  Still
+required for the gate:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;
