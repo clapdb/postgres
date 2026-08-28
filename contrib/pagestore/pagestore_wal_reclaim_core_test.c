@@ -26,6 +26,20 @@
 static int checks;
 static int failed;
 
+typedef struct AdmissionCallCounter
+{
+	unsigned int calls;
+} AdmissionCallCounter;
+
+static int
+count_admission_call(pthread_rwlock_t *lock, void *arg)
+{
+	AdmissionCallCounter *counter = arg;
+
+	counter->calls++;
+	return pthread_rwlock_wrlock(lock);
+}
+
 static void
 check(int ok, const char *name)
 {
@@ -333,6 +347,32 @@ test_no_floor_or_progress(void)
 }
 
 static void
+test_preselection_skips_empty_reclaim(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-preselection-XXXXXX";
+	AdmissionCallCounter counter = {0};
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, WAL_SEGMENT / 2),
+		  "construct a WAL tail without a complete immutable segment");
+	ps_test_set_admission_write_lock_hook(count_admission_call, &counter);
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 0,
+		  "cheap preselection skips the global drain when no segment is eligible");
+	check(append_wal_bytes(0, WAL_SEGMENT / 2,
+						 (uint32_t) (WAL_TOTAL - WAL_SEGMENT / 2)) &&
+		  write_control(0, WAL_TOTAL, WAL_SEGMENT / 2) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1,
+		  "a boundary-segment floor performs one full validation");
+	check(ps_test_wal_reclaim_maintenance() == 0 && counter.calls == 1,
+		  "boundary no-progress backoff skips repeated global drains");
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
+	close_store();
+	remove_tree(store);
+}
+
+static void
 test_dependency_cutoffs(void)
 {
 	const uint64_t limited = WAL_SEGMENT + WAL_SEGMENT / 2;
@@ -416,6 +456,63 @@ test_natural_nonzero_start(void)
 		  wal_read_status(0, start) == PS_STATUS_ERROR &&
 		  wal_read_status(0, end) == PS_STATUS_OK,
 		  "natural nonzero reclaim advances the fence without a directory hint");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_progress_beyond_immutable_end(void)
+{
+	const uint64_t tail = WAL_TOTAL + WAL_SEGMENT / 2;
+	char store[] = "/tmp/pagestore-wal-policy-progress-tail-XXXXXX";
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) tail) &&
+		  write_control(0, tail, tail) &&
+		  wal_index_progress(0, 0, tail) &&
+		  segment_count(store, 0) == WAL_SEGMENTS &&
+		  maintenance_until_count(store, 0, 0),
+		  "durable WAL-index progress beyond the sealed store end still reclaims the sealed prefix");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_child_branch_cap(void)
+{
+	const uint64_t branch_lsn = WAL_SEGMENT + WAL_SEGMENT / 2;
+	const uint64_t child_start = branch_lsn - branch_lsn % WAL_SEGMENT;
+	const uint64_t child_end = child_start + 2 * WAL_SEGMENT;
+	char store[] = "/tmp/pagestore-wal-policy-branch-cap-XXXXXX";
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(0, 0, (uint32_t) WAL_TOTAL) &&
+		  write_control(0, WAL_TOTAL, WAL_TOTAL) &&
+		  create_branch(1, 0, branch_lsn) &&
+		  append_wal_bytes(1, child_start, (uint32_t) (child_end - child_start)) &&
+		  write_control(1, child_end, child_end) &&
+		  wal_index_progress(0, 0, WAL_TOTAL) &&
+		  wal_index_progress(1, child_start, child_end) &&
+		  segment_count(store, 1) == 2 &&
+		  maintenance_until_count(store, 0, 2) &&
+		  segment_count(store, 1) == 2,
+		  "child reclaim stops at its fork while the parent still reclaims its safe prefix");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_undefined_timeline_read(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-undefined-read-XXXXXX";
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  append_wal_bytes(2, 0, WAL_SEGMENT / 2) &&
+		  !ps_timeline_defined(2) && wal_read_status(2, 0) == PS_STATUS_OK,
+		  "undefined shipped timeline keeps its local pre-metadata WAL readable");
 	close_store();
 	remove_tree(store);
 }
@@ -733,8 +830,12 @@ int
 main(void)
 {
 	test_no_floor_or_progress();
+	test_preselection_skips_empty_reclaim();
 	test_dependency_cutoffs();
 	test_natural_nonzero_start();
+	test_progress_beyond_immutable_end();
+	test_child_branch_cap();
+	test_undefined_timeline_read();
 	test_missing_proof_does_not_starve_later_timeline();
 	test_pending_durable_proof();
 	test_safe_delete_admission_restart_and_isolation();

@@ -124,6 +124,7 @@ extern void ps_test_set_wal_reclaim_attempt_hook(
 	PsWalReclaimAttemptTestHook hook, void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
+extern int ps_test_wal_reclaim_maintenance(void);
 /* Test-only scheduling seam for a pending forkmeta snapshot GC retry. */
 extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
 

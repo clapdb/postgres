@@ -222,7 +222,7 @@ scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
 R3b-3 is the conservative POSIX/core policy integration.  It admits at most
-one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work, drains ordinary admission before
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment; a selected candidate drains ordinary admission before
 freezing the WAL index, snapshots raw WAL dependencies under short-lived
 shard/map protection, and releases all shard locks before control-image,
 layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
@@ -232,11 +232,14 @@ pending snapshot state, non-POSIX providers, and publication failures all fail
 closed with a one-second retry backoff.  Durable retained-base metadata is the
 sole restart-stable admission frontier; physical directory start is not a
 runtime fence.  WAL reads recheck that fence under each visited timeline's WAL
-lock, and descendant control history is capped at its branch point.  Focused
-core coverage includes ancestry and timeline isolation, child-local controls,
-naturally nonzero starts, restart admission, a read/frontier publication race,
-pending-proof cleanup failure, metadata publication failure/backoff, and
-admission concurrency.
+lock, while pre-metadata timelines retain local WAL readability.  Descendant
+control history and a target child's reclaim candidate are capped at their
+branch points, and durable index progress beyond the sealed prefix remains a
+valid proof.  Focused core coverage includes idle preselection, ancestry and
+timeline isolation, child-local controls, target branch caps, naturally
+nonzero starts, unaligned progress tails, pre-metadata reads, restart
+admission, a read/frontier publication race, pending-proof cleanup failure,
+metadata publication failure/backoff, and admission concurrency.
 
 This is a conservative R3b-3 policy integration.  It does not include sparse
 or discrete retained-base crossing, or a bounded fixed-reader soak.  Still

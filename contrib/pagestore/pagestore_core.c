@@ -4056,11 +4056,21 @@ wal_reclaim_frontier_ancestry_allows(uint32_t timeline, uint64_t lsn)
 
 	for (uint32_t hops = 0; hops <= MAX_TIMELINES; hops++)
 	{
-		if (current >= MAX_TIMELINES || !timelines[current].defined ||
+		if (current >= MAX_TIMELINES ||
 			!wal_reclaim_frontier_one_allows(current, cap))
 			return 0;
+		/* A shipped WAL timeline can legitimately precede its ancestry
+		 * metadata.  Its local retained-base fence is still authoritative,
+		 * but there is no ancestry to walk until metadata is published. */
+		if (!timelines[current].defined)
+			return 1;
 		if (timelines[current].parent < 0)
 			return 1;
+		/* A defined timeline with an invalid or not-yet-defined parent is a
+		 * malformed ancestry chain, not a legacy pre-metadata read. */
+		if (timelines[current].parent >= MAX_TIMELINES ||
+			!timelines[timelines[current].parent].defined)
+			return 0;
 		if (timelines[current].branch_lsn < cap)
 			cap = timelines[current].branch_lsn;
 		current = (uint32_t) timelines[current].parent;
@@ -7315,6 +7325,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 	{
 		pthread_rwlock_t *lock = wal_log_lock_for(tl);
 		uint64_t	ls;
+		uint64_t	frontier = start < cap ? start : cap;
 
 		if (lock == NULL)
 			return -1;
@@ -7326,7 +7337,7 @@ wal_read_locked(uint32_t tl, uint64_t start, uint32_t len,
 		 * Recheck each visited history level while its WAL lock excludes reclaim;
 		 * otherwise a read that queued just before publication could return a
 		 * successful partial/empty result from an already removed prefix. */
-		if (!wal_reclaim_frontier_one_allows(tl, start))
+		if (!wal_reclaim_frontier_one_allows(tl, frontier))
 		{
 			pthread_rwlock_unlock(lock);
 			return -1;
@@ -7799,14 +7810,13 @@ wal_reclaim_raw_dependency_floor(uint32_t timeline, uint64_t store_start,
 /* Caller holds walidx_meta_lock.  A progress value initialized from the first
  * append is not durable and is intentionally rejected here. */
 static int
-wal_reclaim_walidx_state_valid(uint32_t timeline, uint64_t sealed_end,
-							   uint64_t *progress_out)
+wal_reclaim_walidx_state_valid(uint32_t timeline, uint64_t *progress_out)
 {
 	uint64_t progress;
 
 	if (timeline >= MAX_TIMELINES || !walidx_progress_valid[timeline] ||
 		!walidx_progress_durable[timeline] ||
-		(progress = walidx_progress[timeline]) > sealed_end || progress == 0 ||
+		(progress = walidx_progress[timeline]) == 0 ||
 		walidx_snapshot_reshard_pending[timeline] ||
 		walidx_snapshot_gc_pending[timeline] ||
 		__atomic_load_n(&walidx_snapshot_cleanup_pending[timeline],
@@ -7836,38 +7846,67 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
 		wal_reclaim_retry_at[timeline].tv_sec++;
 }
 
+/* Read only stable per-timeline state while the WAL lock excludes append,
+ * segment sync and reclaim.  This is deliberately weaker than a safety
+ * decision: the caller must repeat the complete validation after admission and
+ * the WAL-index gates have drained. */
+static int
+wal_reclaim_preselected(struct timespec *now_out)
+{
+	if (clock_gettime(CLOCK_MONOTONIC, now_out) != 0)
+		return 0;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		pthread_rwlock_t *wal_lock;
+		int eligible;
+
+		if (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
+			(now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
+			 now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec) ||
+			!ps_timeline_live(tl))
+			continue;
+		wal_lock = wal_log_lock_for(tl);
+		if (wal_lock == NULL)
+			continue;
+		pthread_rwlock_rdlock(wal_lock);
+		eligible = wal_segment_store_opened[tl] &&
+			wal_segment_stores[tl].nentries != 0 &&
+			wal_segment_stores[tl].start_lsn <= UINT64_MAX -
+			wal_segment_stores[tl].segment_size &&
+			wal_segment_stores[tl].start_lsn +
+			wal_segment_stores[tl].segment_size <=
+			wal_segment_stores[tl].end_lsn;
+		pthread_rwlock_unlock(wal_lock);
+		if (eligible)
+			return 1;
+	}
+	return 0;
+}
+
 /*
  * R3b-3 conservative core integration.  The caller already owns the
- * lifecycle read side; admission-write then drains all ordinary requests.
- * Lock order is admission -> all shards -> walidx_prune -> walidx publish ->
- * one timeline WAL lock -> short map snapshots.  The shard locks are released
- * immediately after the in-memory WAL-index dependency snapshot; they are not
- * held across retention/control I/O, layer I/O, or unlink.
+ * lifecycle read side.  A cheap WAL-lock-only preselection keeps the idle
+ * maintenance path from draining admission when no timeline can possibly
+ * reclaim a complete segment.  Each selected timeline is then revalidated in
+ * full under admission -> all shards -> walidx_prune -> walidx publish -> WAL;
+ * all-shard locks cover only the in-memory WAL-index snapshot and are released
+ * before retention/control I/O, layer I/O, or unlink.
  */
 static int
 wal_segment_reclaim_one(void)
 {
 	struct timespec now;
 	uint32_t nshards = core_shards();
-	int shards_locked = 0;
 	int did = 0;
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0)
 		return 0; /* SPDK and unknown providers have no safe R3b policy. */
+	if (!wal_reclaim_preselected(&now))
+		return 0;
 	if (admission_write_lock() != 0)
 		return 0;
-	/* WAL-index writers take shard-wr before the publish read gate.  Keep this
-	 * same order while taking the short dependency snapshot, then drop these
-	 * locks before any operation that can touch the control image or filesystem.
-	 */
-	for (uint32_t shard = 0; shard < nshards; shard++)
-		ps_lock_shard_wr(shard);
-	shards_locked = 1;
-	pthread_rwlock_wrlock(&walidx_prune_lock);
-	walidx_publish_wrlock();
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	for (uint32_t pass = 0; pass < MAX_TIMELINES && !did; pass++)
+	for (uint32_t pass = 0; pass < MAX_TIMELINES; pass++)
 	{
 		uint32_t tl = (wal_reclaim_cursor + pass) % MAX_TIMELINES;
 		PsWalStore *store;
@@ -7880,29 +7919,48 @@ wal_segment_reclaim_one(void)
 		int attempt = 0;
 		int rc;
 		int walidx_valid;
+		int shards_locked = 0;
 
 		if (now.tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
 			(now.tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
 			 now.tv_nsec < wal_reclaim_retry_at[tl].tv_nsec))
 			continue;
-		if (!ps_timeline_live(tl) || !wal_segment_store_opened[tl])
+		if (!ps_timeline_live(tl))
 			continue;
 		wal_lock = wal_log_lock_for(tl);
 		if (wal_lock == NULL)
 			continue;
-		pthread_rwlock_wrlock(wal_lock);
+		/* Avoid taking the global drain for stale preselection results. */
+		pthread_rwlock_rdlock(wal_lock);
 		store = &wal_segment_stores[tl];
-		if (store->nentries == 0 || store->start_lsn > UINT64_MAX -
-										 store->segment_size ||
-										 store->start_lsn + store->segment_size > store->end_lsn)
+		if (!wal_segment_store_opened[tl] || store->nentries == 0 ||
+			store->start_lsn > UINT64_MAX -
+															 store->segment_size ||
+															 store->start_lsn + store->segment_size > store->end_lsn)
 		{
 			pthread_rwlock_unlock(wal_lock);
 			continue;
 		}
+		pthread_rwlock_unlock(wal_lock);
+
+		/* WAL-index writers take shard-wr before the publish read gate. */
+		for (uint32_t shard = 0; shard < nshards; shard++)
+			ps_lock_shard_wr(shard);
+		shards_locked = 1;
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		/* Full revalidation after all global gates. */
+		if (!ps_timeline_live(tl) ||
+			!wal_segment_store_opened[tl] ||
+			store->nentries == 0 || store->start_lsn > UINT64_MAX -
+															 store->segment_size ||
+															 store->start_lsn + store->segment_size > store->end_lsn)
+			goto unlock_timeline;
 		attempt = 1;
 		pthread_mutex_lock(&walidx_meta_lock);
-		walidx_valid = wal_reclaim_walidx_state_valid(tl, store->end_lsn,
-													 &progress);
+		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
 		pthread_mutex_unlock(&walidx_meta_lock);
 		/* This is the only section that needs all shard locks.  It scans stable
 		 * in-memory entries while the publish/prune gates freeze index mutation.
@@ -7930,11 +7988,19 @@ wal_segment_reclaim_one(void)
 		candidate = retention_floor < progress ? retention_floor : progress;
 		if (raw_floor != 0 && raw_floor < candidate)
 			candidate = raw_floor;
+		if (timeline_has_parent(tl) && timelines[tl].branch_lsn < candidate)
+			candidate = timelines[tl].branch_lsn;
 		if (candidate > store->end_lsn)
 			candidate = store->end_lsn;
 		target = candidate - candidate % store->segment_size;
 		if (target <= store->start_lsn)
-			goto next_timeline;
+		{
+			/* A complete segment exists, but the proven floor is still in the
+			 * current boundary.  Avoid repeating the global drain every idle tick;
+			 * the cheap due-time preselection will retry after the bounded delay. */
+			wal_reclaim_backoff(tl, &now);
+			goto selected_done;
+		}
 		if (target > store->end_lsn)
 			goto retry_timeline;
 		if (wal_reclaim_attempt_test_hook != NULL)
@@ -7945,31 +8011,37 @@ wal_segment_reclaim_one(void)
 			memset(&wal_reclaim_retry_at[tl], 0,
 				   sizeof(wal_reclaim_retry_at[tl]));
 			did = 1;
-			goto next_timeline;
+			goto selected_done;
 		}
 
 retry_timeline:
 		if (attempt)
 			wal_reclaim_backoff(tl, &now);
 
-next_timeline:
+		/* Advance after every selected candidate, including fail-closed or failed
+		 * attempts, so it cannot starve later timelines on subsequent ticks. */
+selected_done:
+		wal_reclaim_cursor = (tl + 1) % MAX_TIMELINES;
+
+unlock_timeline:
 		pthread_rwlock_unlock(wal_lock);
-		/* Advance after every selected candidate, including a fail-closed or
-		 * failed attempt, so one timeline with permanently missing proof cannot
-		 * starve later reclaimable timelines. */
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		if (shards_locked)
+			for (uint32_t shard = nshards; shard > 0; shard--)
+				ps_unlock_shard(shard - 1);
+		/* At most one selected LIVE timeline per maintenance call. */
 		if (attempt)
-		{
-			wal_reclaim_cursor = (tl + 1) % MAX_TIMELINES;
 			break;
-		}
 	}
-	if (shards_locked)
-		for (uint32_t shard = nshards; shard > 0; shard--)
-			ps_unlock_shard(shard - 1);
-	walidx_publish_wrunlock();
-	pthread_rwlock_unlock(&walidx_prune_lock);
 	ps_admission_write_unlock();
 	return did;
+}
+
+int
+ps_test_wal_reclaim_maintenance(void)
+{
+	return wal_segment_reclaim_one();
 }
 
 static void
