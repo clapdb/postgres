@@ -244,6 +244,16 @@ static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
 static PsBackpressureController page_backpressure;
 static PsBackpressureController wal_backpressure;
 static int backpressure_shutdown_requested;
+static uint32_t backpressure_gate_mask;
+static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
+static void *backpressure_slow_path_test_hook_arg;
+
+#define PS_BACKPRESSURE_GATE_PAGE_ENABLED	(1u << 0)
+#define PS_BACKPRESSURE_GATE_WAL_ENABLED	(1u << 1)
+#define PS_BACKPRESSURE_GATE_PAGE_THROTTLED	(1u << 2)
+#define PS_BACKPRESSURE_GATE_WAL_THROTTLED	(1u << 3)
+#define PS_BACKPRESSURE_GATE_THROTTLED_MASK \
+	(PS_BACKPRESSURE_GATE_PAGE_THROTTLED | PS_BACKPRESSURE_GATE_WAL_THROTTLED)
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
@@ -587,7 +597,7 @@ ps_admission_read_unlock(void)
 static int
 backpressure_stop_observed(const volatile sig_atomic_t *stop_flag)
 {
-	if (backpressure_shutdown_requested ||
+	if (__atomic_load_n(&backpressure_shutdown_requested, __ATOMIC_ACQUIRE) ||
 		(stop_flag != NULL && *stop_flag != 0))
 		return 1;
 	/* The signal handler only publishes STOPPING in shared memory.  The worker
@@ -600,6 +610,19 @@ static void
 backpressure_publish_locked(void)
 {
 	PsShmHeader *hdr = metrics_header;
+	uint32_t gate_mask = 0;
+
+	if (page_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_ENABLED;
+	if (wal_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_WAL_ENABLED;
+	if (page_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_THROTTLED;
+	if (wal_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_WAL_THROTTLED;
+	/* Publish controller state before advertising the corresponding fast-path
+	 * mask.  Slow-path callers recheck authoritative state under the mutex. */
+	__atomic_store_n(&backpressure_gate_mask, gate_mask, __ATOMIC_RELEASE);
 
 	if (hdr == NULL)
 		return;
@@ -661,7 +684,7 @@ ps_backpressure_configure(uint64_t page_high_water,
 	page_backpressure.catchup_bytes = page_catchup;
 	wal_backpressure.high_water_bytes = wal_high_water;
 	wal_backpressure.catchup_bytes = wal_catchup;
-	backpressure_shutdown_requested = 0;
+	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
 	return 0;
@@ -672,6 +695,26 @@ ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
 						  uint32_t *cause_mask)
 {
 	uint32_t causes = 0;
+	uint32_t gate_mask;
+
+	/* The disabled/no-throttle path must stay out of the process-wide mutex.
+	 * STOPPING is checked first so disabling the controllers cannot hide
+	 * shutdown from a deferred foreground request. */
+	if (backpressure_stop_observed(stop_flag))
+	{
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return -1;
+	}
+	gate_mask = __atomic_load_n(&backpressure_gate_mask, __ATOMIC_ACQUIRE);
+	if ((gate_mask & PS_BACKPRESSURE_GATE_THROTTLED_MASK) == 0)
+	{
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return 1;
+	}
+	if (backpressure_slow_path_test_hook != NULL)
+		backpressure_slow_path_test_hook(backpressure_slow_path_test_hook_arg);
 
 	pthread_mutex_lock(&backpressure_lock);
 	if (backpressure_stop_observed(stop_flag))
@@ -712,7 +755,7 @@ void
 ps_backpressure_shutdown(void)
 {
 	pthread_mutex_lock(&backpressure_lock);
-	backpressure_shutdown_requested = 1;
+	__atomic_store_n(&backpressure_shutdown_requested, 1, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&backpressure_lock);
 }
 
@@ -728,6 +771,14 @@ ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag)
 							   wal_reclaim_catchup_bytes);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_test_set_backpressure_slow_path_hook(PsBackpressureSlowPathTestHook hook,
+									 void *arg)
+{
+	backpressure_slow_path_test_hook = hook;
+	backpressure_slow_path_test_hook_arg = arg;
 }
 
 void

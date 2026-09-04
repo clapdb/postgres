@@ -120,6 +120,9 @@ typedef void (*PsLifecycleWriteQueuedTestHook)(void *arg);
 typedef void (*PsWalReclaimAttemptTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReclaimBeforeFloorTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReadBeforeLockTestHook)(uint32_t timeline, void *arg);
+/* Called only when ps_backpressure_try_admit enters its mutex-protected
+ * throttle check; disabled and unthrottled fast paths never call it. */
+typedef void (*PsBackpressureSlowPathTestHook)(void *arg);
 /* Test-only replacement for the exact blocking admission-wr call.  The
  * production path invokes pthread_rwlock_wrlock directly; when installed,
  * the hook is called in its place and must call pthread_rwlock_wrlock(lock)
@@ -154,6 +157,8 @@ extern void ps_test_set_wal_reclaim_before_floor_hook(
 	PsWalReclaimBeforeFloorTestHook hook, void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
+extern void ps_test_set_backpressure_slow_path_hook(
+	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,

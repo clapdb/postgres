@@ -18,6 +18,19 @@
 static int checks;
 static int failed;
 
+typedef struct BackpressureSlowPathCounter
+{
+	unsigned int calls;
+} BackpressureSlowPathCounter;
+
+static void
+count_backpressure_slow_path(void *arg)
+{
+	BackpressureSlowPathCounter *counter = arg;
+
+	counter->calls++;
+}
+
 static void
 remove_tree(const char *path)
 {
@@ -105,15 +118,28 @@ static void
 test_nonblocking_admission_and_shutdown(void)
 {
 	PsShmHeader metrics;
+	BackpressureSlowPathCounter slow_path = {0};
 	volatile sig_atomic_t stop = 0;
 	uint32_t causes = 0;
 
 	reset_controller(&metrics);
+	ps_test_set_backpressure_slow_path_hook(count_backpressure_slow_path,
+										&slow_path);
+	check(ps_backpressure_try_admit(&stop, &causes) == 1 &&
+		  slow_path.calls == 0,
+		  "disabled controller admits without entering its slow path");
+	ps_backpressure_shutdown();
+	check(ps_backpressure_try_admit(&stop, &causes) == -1 &&
+		  slow_path.calls == 0,
+		  "disabled controller still observes shutdown without its slow path");
 	check(ps_backpressure_configure(100, 20, 0, 0) == 0,
 		  "page controller enables for admission test");
+	check(ps_backpressure_try_admit(&stop, &causes) == 1 &&
+		  slow_path.calls == 0,
+		  "enabled but unthrottled controller keeps the lock-free path");
 	ps_test_backpressure_set_lag(100, 0);
 	check(ps_backpressure_try_admit(&stop, &causes) == 0 &&
-		  causes == PS_BACKPRESSURE_PAGE,
+		  causes == PS_BACKPRESSURE_PAGE && slow_path.calls == 1,
 		  "throttled foreground mutation is deferred without blocking");
 	ps_test_backpressure_set_lag(20, 0);
 	check(ps_backpressure_try_admit(&stop, &causes) == 1 && causes == 0 &&
@@ -130,6 +156,7 @@ test_nonblocking_admission_and_shutdown(void)
 	check(ps_backpressure_try_admit(&stop, &causes) == -1,
 		  "shutdown cancels a deferred mutation without a stranded waiter");
 
+	ps_test_set_backpressure_slow_path_hook(NULL, NULL);
 	ps_core_set_metrics_header(NULL);
 }
 
