@@ -11899,6 +11899,7 @@ wal_reclaim_lag_bytes(void)
 		uint64_t residual_target = 0;
 		int residual_status;
 		int residual_pending;
+		int suffix_candidate;
 		int walidx_valid;
 		int proof_rc = 0;
 
@@ -11927,14 +11928,21 @@ wal_reclaim_lag_bytes(void)
 		end = store->end_lsn;
 		if (residual_pending)
 		{
-			/* start_lsn is already the restored logical frontier.  Count only
-			 * validated residual files still physically present before it;
-			 * target-start is zero after a normal reopen. */
+			/* Recovery publishes start_lsn at the logical frontier while the
+			 * residual marker describes only the older physical prefix.  The
+			 * two ranges are therefore disjoint, but only when the marker's
+			 * target agrees with that frontier. */
+			if (residual_target != start)
+			{
+				lag = UINT64_MAX;
+				goto wal_lag_unlock;
+			}
 			lag = backpressure_saturating_add(lag, residual_bytes);
-			goto wal_lag_unlock;
 		}
-		if (store->nentries == 0 || start > UINT64_MAX - store->segment_size ||
-			start + store->segment_size > end || store->segment_size == 0)
+		suffix_candidate = store->nentries != 0 && store->segment_size != 0 &&
+			start <= UINT64_MAX - store->segment_size &&
+			start + store->segment_size <= end;
+		if (!suffix_candidate)
 			goto wal_lag_unlock;
 		pthread_mutex_lock(&walidx_meta_lock);
 		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
@@ -11951,7 +11959,15 @@ wal_reclaim_lag_bytes(void)
 		if (!walidx_valid || proof_rc != 0 ||
 			retention_effective_floor(tl, PS_RETENTION_RESOURCE_WAL,
 									 &retention_floor) != 0 || retention_floor == 0)
+		{
+			/* If a residual was observed and a complete suffix candidate also
+			 * exists, returning only the residual would incorrectly release a
+			 * throttle.  The physical prefix remains evidence of debt, so an
+			 * unprovable suffix is deliberately fail-closed. */
+			if (residual_pending)
+				lag = UINT64_MAX;
 			continue;
+		}
 		for (uint32_t shard = 0; shard < core_shards(); shard++)
 			ps_lock_shard_wr(shard);
 		pthread_rwlock_wrlock(&walidx_prune_lock);
@@ -11960,7 +11976,11 @@ wal_reclaim_lag_bytes(void)
 		store = &wal_segment_stores[tl];
 		if (!wal_segment_store_opened[tl] || store->metadata_fenced ||
 			store->start_lsn != start || store->end_lsn != end)
+		{
+			if (residual_pending)
+				lag = UINT64_MAX;
 			goto wal_lag_unlock;
+		}
 		target = retention_floor < progress ? retention_floor : progress;
 		if (raw_floor != 0 && raw_floor < target)
 			target = raw_floor;

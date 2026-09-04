@@ -208,7 +208,8 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 }
 
 static int
-set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+set_wal_pin_generation(uint32_t timeline, uint64_t owner_id, uint32_t generation,
+					   uint64_t lsn)
 {
 	PsChannel ch;
 
@@ -217,10 +218,34 @@ set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 	ch.timeline = timeline;
 	ch.blocknum = PS_RETENTION_OWNER_READER;
 	ch.parent_timeline = PS_RETENTION_RESOURCE_WAL;
-	ch.old_nblocks = 1;
+	ch.old_nblocks = generation;
 	ch.req_seq = owner_id;
 	ch.req_lsn = lsn;
 	ch.nblocks = 1;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+{
+	return set_wal_pin_generation(timeline, owner_id, 1, lsn);
+}
+
+static int
+drop_wal_pin(uint32_t timeline, uint64_t owner_id, uint32_t generation)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_DROP;
+	ch.timeline = timeline;
+	ch.blocknum = PS_RETENTION_OWNER_READER;
+	ch.old_nblocks = generation;
+	ch.req_seq = owner_id;
 	ch.status = PS_STATUS_OK;
 	ps_lifecycle_read_lock();
 	(void) ps_handle_meta(&ch);
@@ -601,6 +626,96 @@ test_residual_prefix_retry_after_reopen(void)
 		  "successful residual cleanup releases WAL backpressure");
 	ps_core_set_metrics_header(NULL);
 	close_store();
+	remove_tree(store);
+}
+
+static void
+test_residual_prefix_and_suffix_debt(void)
+{
+	const uint32_t nsegments = 8;
+	const uint64_t total = (uint64_t) WAL_SEGMENT * nsegments;
+	const uint64_t residual = WAL_SEGMENT;
+	const uint64_t suffix = 3 * (uint64_t) WAL_SEGMENT;
+	char store[] = "/tmp/pagestore-wal-policy-residual-suffix-XXXXXX";
+	PsShmHeader metrics;
+	int opened = 0;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  (opened = 1) && append_wal_bytes(0, 0, (uint32_t) total) &&
+		  write_control(0, total, total) &&
+		  wal_index_progress(0, 0, total) &&
+		  set_wal_pin(0, 100, 5 * (uint64_t) WAL_SEGMENT) &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) ==
+			5 * (uint64_t) WAL_SEGMENT,
+		  "construct one residual plus multiple suffix WAL segments");
+	if (!opened)
+	{
+		remove_tree(store);
+		return;
+	}
+	{
+		pid_t pid;
+		int status = 0;
+
+		check(setenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
+					 "3", 1) == 0,
+			  "enable the crash point after three WAL prefix unlinks");
+		pid = fork();
+		if (pid == 0)
+		{
+			(void) ps_test_wal_reclaim_maintenance();
+			_exit(1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 92 &&
+			  segment_count(store, 0) == nsegments - 4,
+			  "crash leaves one residual and three post-frontier segments");
+		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO");
+	}
+	close_store();
+	opened = 0;
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, 3 * (uint64_t) WAL_SEGMENT,
+									WAL_SEGMENT / 2) == 0 &&
+		  ps_core_open(store) == 0 && (opened = 1) &&
+		  segment_count(store, 0) == nsegments - 4,
+		  "reopen the residual and suffix WAL layout");
+	check(drop_wal_pin(0, 100, 1),
+		  "remove the temporary floor so the suffix is independently eligible");
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.throttled != 0 &&
+		  metrics.wal_backpressure.lag_bytes == residual + suffix,
+		  "residual and post-frontier suffix debt are summed without overlap");
+	check(set_wal_pin_generation(0, 100, 2, 5 * (uint64_t) WAL_SEGMENT),
+		  "restore the floor to clean only the residual prefix");
+	check(ps_test_wal_reclaim_maintenance() == 1 &&
+		  segment_count(store, 0) == nsegments - 5,
+		  "residual cleanup leaves every suffix segment physically present");
+	check(drop_wal_pin(0, 100, 2),
+		  "remove the temporary floor after residual cleanup");
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.throttled != 0 &&
+		  metrics.wal_backpressure.lag_bytes == suffix,
+		  "suffix debt remains after residual cleanup");
+	check(maintenance_until_count(store, 0, 0) &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.lag_bytes == 0 &&
+		   metrics.wal_backpressure.throttled == 0),
+		  "suffix cleanup eventually releases WAL backpressure");
+	if (opened)
+	{
+		close_store();
+		opened = 0;
+	}
+	check(ps_core_open(store) == 0 && (opened = 1) &&
+		  segment_count(store, 0) == 0,
+		  "restart after combined residual cleanup preserves zero debt");
+	ps_core_set_metrics_header(NULL);
+	if (opened)
+		close_store();
+	ps_backpressure_configure(0, 0, 0, 0);
 	remove_tree(store);
 }
 
@@ -1248,6 +1363,7 @@ main(void)
 	test_progress_beyond_immutable_end();
 	test_child_branch_cap();
 	test_residual_prefix_retry_after_reopen();
+	test_residual_prefix_and_suffix_debt();
 	test_restart_with_crossing_flat_tail();
 	test_deleted_descendant_floor();
 	test_fenced_residual_query_stops_retries();
