@@ -434,6 +434,30 @@ test_walidx_append_tail_restart(void)
 		  metrics.walidx_backpressure.throttled == 0 &&
 		  ps_test_walidx_force_due(0) == 0,
 		  "forced same-frontier publication clears tail-only debt");
+	{
+		char orphan[1024];
+		int fd;
+
+		snprintf(orphan, sizeof(orphan),
+				 "%s/walidx_snapshots_0/walidxg1_%020llu_%03u",
+				 store, 99ULL, 0U);
+		fd = open(orphan, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && write(fd, "orphan", 6) == 6 &&
+			  fsync(fd) == 0 && close(fd) == 0,
+			  "create an orphan newer WAL-index snapshot shard");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.throttled != 0 &&
+			  ps_test_walidx_gc_force_due(0) != 0,
+			  "orphan snapshot debt marks a WAL-index GC candidate");
+		check(ps_core_maintenance() == 1 && access(orphan, F_OK) != 0 &&
+			  errno == ENOENT,
+			  "GC-force maintenance removes orphan snapshot debt");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.lag_bytes == 0 &&
+			  metrics.walidx_backpressure.throttled == 0 &&
+			  ps_test_walidx_gc_force_due(0) == 0,
+			  "orphan-only debt releases the WAL-index throttle");
+	}
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
@@ -540,6 +564,40 @@ test_walidx_aggregate_force(void)
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disable aggregate WAL-index backpressure");
+	remove_tree(store);
+}
+
+static void
+test_walidx_automatic_observation_rate(void)
+{
+	char store[] = "/tmp/pagestore-walidx-observation-XXXXXX";
+	PsShmHeader metrics;
+	uint64_t before;
+	uint64_t after;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 100, 0) == 0 &&
+		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open a store for automatic WAL-index observation pacing");
+	ps_core_set_metrics_header(&metrics);
+	before = ps_test_backpressure_walidx_observation_count();
+	ps_backpressure_refresh();
+	after = ps_test_backpressure_walidx_observation_count();
+	check(after > before,
+		  "explicit WAL-index observation runs immediately");
+	(void) ps_core_maintenance();
+	check(ps_test_backpressure_walidx_observation_count() == after,
+		  "automatic WAL-index observation is rate-limited while idle");
+	usleep(120000);
+	(void) ps_core_maintenance();
+	check(ps_test_backpressure_walidx_observation_count() > after,
+		  "automatic WAL-index observation resumes after its interval");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable WAL-index backpressure after observation pacing test");
 	remove_tree(store);
 }
 
@@ -914,6 +972,7 @@ main(void)
 	test_nonblocking_admission_and_shutdown();
 	test_walidx_append_tail_restart();
 	test_walidx_aggregate_force();
+	test_walidx_automatic_observation_rate();
 	test_admission_writer_preference();
 	test_page_storage_fail_closed();
 	test_ambiguous_page_segment_remove();

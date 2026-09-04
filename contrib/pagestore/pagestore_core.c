@@ -248,6 +248,10 @@ static PsBackpressureController wal_backpressure;
 static PsBackpressureController walidx_backpressure;
 #define MAX_TIMELINES	1024
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
+static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
+static uint64_t walidx_observation_next_ns;
+static uint64_t walidx_observation_count;
+#define WALIDX_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
 static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
@@ -265,7 +269,8 @@ static void *backpressure_slow_path_test_hook_arg;
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
-static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates);
+static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
+									unsigned char *gc_candidates);
 static int admission_write_lock(void);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
@@ -732,7 +737,11 @@ ps_backpressure_configure_all(uint64_t page_high_water,
 	walidx_backpressure.high_water_bytes = walidx_high_water;
 	walidx_backpressure.catchup_bytes = walidx_catchup;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
 		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
+	}
+	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
@@ -851,6 +860,20 @@ ps_test_walidx_force_due(uint32_t timeline)
 {
 	return timeline < MAX_TIMELINES ?
 		__atomic_load_n(&walidx_snapshot_force_due[timeline], __ATOMIC_ACQUIRE) : 0;
+}
+
+int
+ps_test_walidx_gc_force_due(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES ?
+		__atomic_load_n(&walidx_snapshot_gc_force_due[timeline],
+							__ATOMIC_ACQUIRE) : 0;
+}
+
+uint64_t
+ps_test_backpressure_walidx_observation_count(void)
+{
+	return __atomic_load_n(&walidx_observation_count, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -8794,6 +8817,8 @@ walidx_purge_timeline(uint32_t tl)
 		   sizeof(walidx_snapshot_retry_at[tl]));
 	memset(walidx_log_epoch[tl], 0, sizeof(walidx_log_epoch[tl]));
 	walidx_snapshot_gc_pending[tl] = 0;
+	__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&walidx_snapshot_gc_force_due[tl], 0, __ATOMIC_RELEASE);
 	memset(&walidx_snapshot_gc_retry_at[tl], 0,
 		   sizeof(walidx_snapshot_gc_retry_at[tl]));
 	memset(&walidx_snapshot_cleanup[tl], 0,
@@ -10550,7 +10575,9 @@ walidx_snapshot_gc_one(void)
 		uint32_t tl = (walidx_snapshot_gc_cursor + step) % MAX_TIMELINES;
 		struct timespec retry = walidx_snapshot_gc_retry_at[tl];
 
-		if (ps_timeline_live(tl) && walidx_snapshot_gc_pending[tl] &&
+		if (ps_timeline_live(tl) &&
+			(walidx_snapshot_gc_pending[tl] ||
+			 __atomic_load_n(&walidx_snapshot_gc_force_due[tl], __ATOMIC_ACQUIRE)) &&
 			(now.tv_sec > retry.tv_sec ||
 			 (now.tv_sec == retry.tv_sec && now.tv_nsec >= retry.tv_nsec)))
 		{
@@ -10579,6 +10606,12 @@ walidx_snapshot_gc_one(void)
 	if (rc >= 0)
 	{
 		walidx_snapshot_gc_pending[candidate] = 0;
+		__atomic_store_n(&walidx_snapshot_gc_force_due[candidate], 0,
+						  __ATOMIC_RELEASE);
+		/* GC changed the physical debt identity.  Re-evaluate it on the
+		 * maintenance return path even when the normal WAL-index observation
+		 * interval has not elapsed. */
+		__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 		memset(&walidx_snapshot_gc_retry_at[candidate], 0,
 			   sizeof(walidx_snapshot_gc_retry_at[candidate]));
 	}
@@ -12250,13 +12283,16 @@ wal_lag_unlock:
  * identity; the second short critical section rejects an observation that
  * raced a publish/append/recovery transition. */
 static uint64_t
-walidx_reclaim_lag_bytes(unsigned char *tail_candidates)
+walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
+						 unsigned char *gc_candidates)
 {
 	uint64_t lag = 0;
 	const uint32_t max_retries = 3;
 
 	if (tail_candidates != NULL)
 		memset(tail_candidates, 0, MAX_TIMELINES);
+	if (gc_candidates != NULL)
+		memset(gc_candidates, 0, MAX_TIMELINES);
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0 ||
@@ -12296,6 +12332,8 @@ walidx_reclaim_lag_bytes(unsigned char *tail_candidates)
 				lag = backpressure_saturating_add(lag, total);
 				if (tail_candidates != NULL && tail != 0)
 					tail_candidates[tl] = 1;
+				if (gc_candidates != NULL && obsolete_snapshot != 0)
+					gc_candidates[tl] = 1;
 				stable = 1;
 				break;
 			}
@@ -12333,16 +12371,79 @@ backpressure_update_locked(PsBackpressureController *controller,
 	}
 }
 
-void
-ps_backpressure_refresh(void)
+static uint64_t
+backpressure_monotonic_ns(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+		(uint64_t) now.tv_sec > (UINT64_MAX - (uint64_t) now.tv_nsec) /
+		UINT64_C(1000000000))
+		return UINT64_MAX;
+	return (uint64_t) now.tv_sec * UINT64_C(1000000000) +
+		(uint64_t) now.tv_nsec;
+}
+
+static int
+walidx_auto_observation_claim(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t next;
+
+	if (now == UINT64_MAX)
+		return 1;
+	for (;;)
+	{
+		next = __atomic_load_n(&walidx_observation_next_ns, __ATOMIC_ACQUIRE);
+		if (next == UINT64_MAX || now < next)
+			return 0;
+		/* Reserve the scan itself.  Arming from the completion timestamp is
+		 * important when the bounded physical scan takes >=100ms. */
+		if (__atomic_compare_exchange_n(&walidx_observation_next_ns, &next,
+										UINT64_MAX,
+										0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			return 1;
+	}
+}
+
+static void
+walidx_arm_observation_timer(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t due;
+
+	if (now == UINT64_MAX)
+	{
+		/* Do not leave the in-progress sentinel armed forever if the clock
+		 * cannot be sampled.  The next automatic call may retry safely. */
+		__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
+		return;
+	}
+	due = UINT64_MAX - now < WALIDX_AUTO_OBSERVATION_INTERVAL_NS ?
+		UINT64_MAX - 1 : now + WALIDX_AUTO_OBSERVATION_INTERVAL_NS;
+	__atomic_store_n(&walidx_observation_next_ns, due, __ATOMIC_RELEASE);
+}
+
+static void
+ps_backpressure_refresh_internal(int automatic)
 {
 	unsigned char walidx_tail_candidates[MAX_TIMELINES] = {0};
+	unsigned char walidx_gc_candidates[MAX_TIMELINES] = {0};
+	int observe_walidx = walidx_reclaim_high_water_bytes != 0 &&
+		(!automatic || walidx_auto_observation_claim());
 	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
 		page_reclaim_lag_bytes() : 0;
 	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
 		wal_reclaim_lag_bytes() : 0;
-	uint64_t walidx_lag = walidx_reclaim_high_water_bytes != 0 ?
-		walidx_reclaim_lag_bytes(walidx_tail_candidates) : 0;
+	uint64_t walidx_lag = observe_walidx ?
+		walidx_reclaim_lag_bytes(walidx_tail_candidates,
+									 walidx_gc_candidates) : 0;
+
+	if (observe_walidx)
+	{
+		__atomic_fetch_add(&walidx_observation_count, 1, __ATOMIC_RELAXED);
+		walidx_arm_observation_timer();
+	}
 
 	pthread_mutex_lock(&backpressure_lock);
 	backpressure_update_locked(&page_backpressure, page_lag,
@@ -12351,15 +12452,34 @@ ps_backpressure_refresh(void)
 	backpressure_update_locked(&wal_backpressure, wal_lag,
 							   wal_reclaim_high_water_bytes,
 							   wal_reclaim_catchup_bytes);
-	backpressure_update_locked(&walidx_backpressure, walidx_lag,
+	if (observe_walidx)
+	{
+		backpressure_update_locked(&walidx_backpressure, walidx_lag,
 											   walidx_reclaim_high_water_bytes,
 											   walidx_reclaim_catchup_bytes);
-	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
-		__atomic_store_n(&walidx_snapshot_force_due[tl],
-			walidx_backpressure.throttled && walidx_tail_candidates[tl],
-			__ATOMIC_RELEASE);
+		for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		{
+			__atomic_store_n(&walidx_snapshot_force_due[tl],
+				walidx_backpressure.throttled && walidx_tail_candidates[tl],
+				__ATOMIC_RELEASE);
+			__atomic_store_n(&walidx_snapshot_gc_force_due[tl],
+				walidx_gc_candidates[tl], __ATOMIC_RELEASE);
+		}
+	}
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_backpressure_refresh(void)
+{
+	ps_backpressure_refresh_internal(0);
+}
+
+static void
+ps_backpressure_refresh_automatic(void)
+{
+	ps_backpressure_refresh_internal(1);
 }
 
 /* ===================== recovery (layers + segment tail) =============== */
@@ -14569,7 +14689,7 @@ ps_core_maintenance(void)
 	if (page_reclaim_high_water_bytes != 0 ||
 		wal_reclaim_high_water_bytes != 0 ||
 		walidx_reclaim_high_water_bytes != 0)
-		ps_backpressure_refresh();
+		ps_backpressure_refresh_automatic();
 	return did;
 }
 
@@ -14587,6 +14707,7 @@ ps_core_open(const char *store_dir)
 	uint32_t	ns = core_shards();
 	int			publish_shard_count = 0;
 
+	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 	/* A test or embedding process may reopen without a fresh daemon.  Drop
 	 * every hash entry before recovery repopulates the indexes. */
 	free_page_fork_indexes();

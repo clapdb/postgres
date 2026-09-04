@@ -191,11 +191,24 @@ main(void)
 	check(ps_walidx_snapshot_publish(directory, 0, 3, 400, 1000,
 								 second, 3) != 0,
 		  "a newer generation cannot move its retained frontier backward");
-	check(setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD", "0", 1) == 0 &&
+	{
+		uint64_t baseline_obsolete = 0;
+		uint64_t orphan_obsolete = 0;
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &baseline_obsolete) == 0,
+			  "observe snapshot debt before an orphan newer generation");
+		check(setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD", "0", 1) == 0 &&
 		  ps_walidx_snapshot_publish(directory, 0, 3, 900, 1000,
 								 second, 3) != 0,
-		  "leave a newer unpublished shard for publication retry");
-	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+			  "leave an orphan newer shard after interrupted publication");
+		unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &orphan_obsolete) == 0 &&
+			  orphan_obsolete == baseline_obsolete + sizeof(newer0),
+			  "physical observation counts an orphan newer generation");
+	}
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
 			 directory, 4ULL, 0U, 123U, 0U);
 	{
@@ -217,8 +230,8 @@ main(void)
 		  "generation GC preserves the currently selected generation");
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 3ULL, 0U);
-	check(access(path, F_OK) == 0,
-		  "generation GC preserves newer unpublished retry state");
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "generation GC removes an orphan newer retry state");
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
 			 directory, 4ULL, 0U, 123U, 0U);
 	check(access(path, F_OK) != 0 && errno == ENOENT,
@@ -228,6 +241,38 @@ main(void)
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC");
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
 		  "generation GC durably completes an ambiguous sync retry");
+	{
+		char prepared_path[1200];
+		char prepared_shard[1200];
+
+		snprintf(prepared_path, sizeof(prepared_path), "%s/walidx_prepared_v1",
+				 directory);
+		snprintf(prepared_shard, sizeof(prepared_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 4ULL, 0U);
+		check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 4,
+									 900, 1000, second, 3) == 0 &&
+			  ps_walidx_snapshot_gc(directory, 0) == 0 &&
+			  access(prepared_path, F_OK) == 0 &&
+			  access(prepared_shard, F_OK) == 0,
+			  "generation GC preserves a valid newer prepared generation");
+		check(ps_walidx_snapshot_abort(&prepared) == 0,
+			  "abort the preserved newer prepared generation");
+	}
+	{
+		char prepared_path[1200];
+		char selected_shard[1200];
+
+		snprintf(prepared_path, sizeof(prepared_path), "%s/walidx_prepared_v1",
+				 directory);
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 0U);
+		check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 2,
+									 500, 900, second, 3) == 0 &&
+			  ps_walidx_snapshot_gc(directory, 0) == 1 &&
+			  access(prepared_path, F_OK) != 0 &&
+			  access(selected_shard, F_OK) == 0,
+			  "generation GC clears selected prepared residue without deleting shards");
+	}
 	{
 		uint64_t obsolete = 0;
 		char older_shard[1200];

@@ -734,6 +734,23 @@ prepared_equal(const PsWalIdxSnapshotPrepared *a,
 }
 
 static int
+prepared_matches_snapshot(const PsWalIdxSnapshotPrepared *prepared,
+						 const PsWalIdxSnapshot *snapshot)
+{
+	if (prepared->timeline != snapshot->timeline ||
+		prepared->nshards != snapshot->nshards ||
+		prepared->generation != snapshot->generation ||
+		prepared->start_lsn != snapshot->start_lsn ||
+		prepared->end_lsn != snapshot->end_lsn)
+		return 0;
+	for (uint32_t shard = 0; shard < prepared->nshards; shard++)
+		if (prepared->shards[shard].len != snapshot->shards[shard].len ||
+			prepared->shards[shard].crc != snapshot->shards[shard].crc)
+			return 0;
+	return 1;
+}
+
+static int
 publish_prepared(int directory_fd, const PsWalIdxSnapshotPrepared *prepared)
 {
 	PsWalIdxSnapshotPrepared existing;
@@ -1309,16 +1326,37 @@ int
 ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 {
 	PsWalIdxSnapshot current;
+	PsWalIdxSnapshotPrepared prepared;
 	struct dirent *entry;
 	char (*names)[128] = NULL;
+	unsigned char prepared_seen[PS_WALIDX_SNAPSHOT_MAX_SHARDS] = {0};
 	DIR *dir = NULL;
 	size_t count = 0;
 	size_t capacity = 0;
 	int scan_fd = -1;
+	int prepared_present = 0;
+	int clear_prepared_descriptor = 0;
 	int rc = -1;
 
 	if (ps_walidx_snapshot_open(&current, directory, timeline) != 0)
 		return -1;
+	if (faccessat(current.directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) == 0)
+	{
+		if (read_prepared(current.directory_fd, directory, timeline,
+						  &prepared, 1) != 0)
+			goto cleanup;
+		prepared_present = 1;
+		if (prepared.generation == current.generation)
+		{
+			if (!prepared_matches_snapshot(&prepared, &current))
+				goto cleanup;
+			clear_prepared_descriptor = 1;
+		}
+		else if (prepared.generation < current.generation)
+			clear_prepared_descriptor = 1;
+	}
+	else if (errno != ENOENT)
+		goto cleanup;
 	scan_fd = fcntl(current.directory_fd, F_DUPFD_CLOEXEC, 0);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
 		goto cleanup;
@@ -1327,12 +1365,45 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 	while ((entry = readdir(dir)) != NULL)
 	{
 		uint64_t generation;
+		uint32_t shard;
 		char (*grown)[128];
+		int remove_name = 0;
 
-		if (parse_shard_temp_name(entry->d_name) != 0 &&
-			(parse_shard_name(entry->d_name, &generation) != 0 ||
-			 generation >= current.generation))
+		if (parse_shard_temp_name(entry->d_name) == 0)
+			remove_name = 1;
+		else if (parse_shard_name_details(entry->d_name, &generation, &shard) == 0)
+		{
+			if (generation == current.generation)
+			{
+				/* The selected generation is immutable; an extra canonical
+				 * shard is an ambiguous identity rather than GC debt. */
+				if (shard >= current.nshards)
+					goto cleanup;
+				continue;
+			}
+			if (prepared_present && generation == prepared.generation)
+			{
+				if (shard >= prepared.nshards)
+					goto cleanup;
+				if (generation > current.generation)
+				{
+					prepared_seen[shard] = 1;
+					continue;
+				}
+			}
+			/* Older canonical generations and newer orphan generations are
+			 * reclaimable.  A newer prepared generation was handled above. */
+			remove_name = 1;
+		}
+		else if (strcmp(entry->d_name, WALIDX_SNAPSHOT_PREPARED) == 0)
 			continue;
+		else if (strncmp(entry->d_name, "walidxg1_", 9) == 0 ||
+				 strstr(entry->d_name, ".tmp.") != NULL)
+			goto cleanup;
+		if (!remove_name)
+			continue;
+		if (strlen(entry->d_name) >= sizeof(names[0]))
+			goto cleanup;
 		if (count == capacity)
 		{
 			size_t next = capacity == 0 ? 16 : capacity * 2;
@@ -1353,6 +1424,10 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 		if (scan_errno != 0 || close_rc != 0)
 			goto cleanup;
 	}
+	if (prepared_present && prepared.generation > current.generation)
+		for (uint32_t shard = 0; shard < prepared.nshards; shard++)
+			if (!prepared_seen[shard])
+				goto cleanup;
 	for (size_t i = 0; i < count; i++)
 		if (unlinkat(current.directory_fd, names[i], 0) != 0)
 			goto cleanup;
@@ -1364,7 +1439,10 @@ ps_walidx_snapshot_gc(const char *directory, uint32_t timeline)
 	}
 	if (fsync(current.directory_fd) != 0)
 		goto cleanup;
-	rc = count != 0;
+	if (clear_prepared_descriptor &&
+		clear_prepared(current.directory_fd) != 0)
+		goto cleanup;
+	rc = count != 0 || clear_prepared_descriptor;
 
 cleanup:
 	free(names);
@@ -1472,12 +1550,13 @@ ps_walidx_snapshot_reclaim_bytes(const char *directory, uint32_t timeline,
 			}
 			if (generation == selected_generation)
 				goto cleanup;
-			/* A newer canonical generation is retained for publication retry and
-			 * is not reclaim debt.  A prepared descriptor is different: its
-			 * physical files are still pending cleanup and are charged below. */
-			count = generation < selected_generation ||
-				(prepared_present && generation == prepared.generation &&
-				 shard < prepared.nshards);
+			if (prepared_present && generation == prepared.generation &&
+				shard >= prepared.nshards)
+				goto cleanup;
+			/* Every canonical generation other than selected is physical debt.
+			 * A newer generation with a valid prepared identity is still charged
+			 * here, but GC preserves it and validates it separately. */
+			count = 1;
 		}
 		else if (parse_shard_temp_name(entry->d_name) == 0 ||
 				 strcmp(entry->d_name, WALIDX_SNAPSHOT_PREPARED) == 0)

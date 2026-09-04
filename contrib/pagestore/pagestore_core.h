@@ -116,6 +116,8 @@ extern void ps_backpressure_shutdown(void);
 extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
 extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
 extern int ps_test_walidx_force_due(uint32_t timeline);
+extern int ps_test_walidx_gc_force_due(uint32_t timeline);
+extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.
