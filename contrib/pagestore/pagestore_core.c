@@ -3211,6 +3211,7 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	uint64_t off = 0, out_off = 0;
 	uint64_t watermark_new = 0, cursor_new = 0;
 	int watermark_seen = 0, cursor_seen = 0, cursor_retired = 0, found = 0;
+	int counted_debt = 0;
 	PsFlushWatermark watermark = {0};
 	int have_watermark = s->flush_watermark_valid &&
 		s->flush_watermark.seg_id == (uint32_t) seg;
@@ -3221,6 +3222,12 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
 		return -1;
+	/* PAGE debt is an aggregate of nonempty, covered segments in the
+	 * reclaimable prefix.  A successful deletion rewrite can turn one such
+	 * segment into an empty file before segment GC sees it. */
+	counted_debt = page_reclaim_high_water_bytes != 0 && bytes > 0 &&
+		s->flush_watermark_valid && (uint32_t) seg < s->flush_watermark.seg_id &&
+		(uint32_t) seg >= s->gc_next_seg && s->gc_debt_segments != 0;
 	if (have_watermark)
 	{
 		watermark = s->flush_watermark;
@@ -3399,6 +3406,8 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	}
 	if (s->cur_seg == seg)
 		s->cur_off = cursor_retired ? segment_size : cursor_new;
+	if (out_off == 0 && counted_debt)
+		s->gc_debt_segments--;
 	free(relocs);
 	free(replacement);
 	return 1;
@@ -12150,11 +12159,10 @@ recover(uint32_t shard)
 		errno = 0;
 		seg_bytes = ps_storage->seg_size(shard, id);
 		if (seg_bytes < 0)
-		{
-			if (errno != ENOENT)
-				return -1;
 			break;
-		}
+		/* A negative size is the storage contract's end-of-log sentinel.
+		 * In particular, SPDK intentionally does not set errno for this case.
+		 * PAGE debt observation has separate POSIX-specific error handling. */
 		if ((uint64_t) seg_bytes < off)
 			goto fail;
 		for (;;)

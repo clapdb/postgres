@@ -2787,6 +2787,76 @@ test_deleting_timeline_page_cleanup_fail_closed(void)
 }
 
 static void
+test_deleting_timeline_page_cleanup_backpressure_debt(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-debt-XXXXXX";
+	PsShmHeader metrics;
+	int64_t first_size;
+	int rewrite_seen = 0;
+
+	/* Put the deleting timeline in segment 0 and a live sibling in segment 1,
+	 * so the target segment is one covered, nonempty PAGE debt unit. */
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	segment_gc_enabled = 1;
+	check(ps_backpressure_configure(segment_size, 1, 0, 0) == 0,
+		  "configure PAGE debt for timeline deletion rewrite");
+	check(mkdtemp(store) != NULL, "create PAGE debt timeline-deletion store");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_core_open(store) == 0 && create_branch(2, 0, 100) &&
+			create_branch(10, 0, 100) &&
+			write_timeline_layer(2, 0, 100) == 0 &&
+			write_timeline_layer(10, 1, 200) == 0 &&
+			ps_storage->seg_size(0, 0) > 0 &&
+			ps_storage->seg_size(0, 1) > 0,
+		  "write target and sibling into separate PAGE segments");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.throttled != 0 &&
+			metrics.page_backpressure.lag_bytes == segment_size,
+		  "one covered target segment enters PAGE backpressure");
+	check(begin_delete(2, 1, NULL),
+		  "begin deletion while the covered target segment is throttled");
+	first_size = ps_storage->seg_size(0, 0);
+	check(first_size > 0 && ps_core_maintenance() == 1,
+		  "timeline deletion makes maintenance progress");
+	for (int i = 0; i < 64 && ps_storage->seg_size(0, 0) > 0; i++)
+	{
+		(void) ps_core_maintenance();
+		if (ps_storage->seg_size(0, 0) == 0)
+			rewrite_seen = 1;
+	}
+	check(rewrite_seen,
+		  "successful timeline rewrite consumes the counted segment debt");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+			metrics.page_backpressure.throttled == 0,
+		  "empty rewrite reaches PAGE catch-up and releases throttle");
+	for (int i = 0; i < 64; i++)
+		(void) ps_core_maintenance();
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+			metrics.page_backpressure.throttle_exits == 1,
+		  "later segment GC does not decrement rewritten debt twice");
+	close_store();
+	check(ps_core_open(store) == 0,
+		  "restart after timeline deletion debt cleanup");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+			metrics.page_backpressure.throttled == 0,
+		  "restart rebuild does not resurrect empty deleted-segment debt");
+	close_store();
+	ps_core_set_metrics_header(NULL);
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE debt after timeline deletion test");
+	segment_gc_enabled = 0;
+	remove_tree(store);
+}
+
+static void
 test_deleting_timeline_page_cleanup_oversized(void)
 {
 	char store[] = "/tmp/pagestore-timeline-page-oversized-XXXXXX";
@@ -2951,6 +3021,7 @@ main(void)
 	test_timeline_incarnation_reuse();
 	test_timeline_incarnation_frontiers();
 	test_deleting_timeline_page_cleanup();
+	test_deleting_timeline_page_cleanup_backpressure_debt();
 	test_deleting_timeline_page_cleanup_fail_closed();
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();

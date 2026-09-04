@@ -198,6 +198,20 @@ counting_segment_size(uint32_t shard, int seg)
 	return PsStoragePosix.seg_size(shard, seg);
 }
 
+/* Simulate SPDK's EOF sentinel: a missing segment is reported as -1 without
+ * setting errno.  The generic recovery scan must accept this contract. */
+static int64_t
+sentinel_segment_size(uint32_t shard, int seg)
+{
+	int64_t bytes;
+
+	errno = 0;
+	bytes = PsStoragePosix.seg_size(shard, seg);
+	if (bytes < 0)
+		errno = 0;
+	return bytes;
+}
+
 static void
 test_page_storage_fail_closed(void)
 {
@@ -237,6 +251,17 @@ test_page_storage_fail_closed(void)
 	ps_core_close();
 	ps_storage->close();
 
+	{
+		PsStorage sentinel_storage = PsStoragePosix;
+
+		sentinel_storage.seg_size = sentinel_segment_size;
+		ps_storage = &sentinel_storage;
+		ps_backpressure_configure(0, 0, 0, 0);
+		check(ps_core_open(store) == 0,
+			  "generic recovery accepts a backend EOF sentinel without errno");
+		ps_core_close();
+		ps_storage->close();
+	}
 	{
 		PsStorage counting_storage = PsStoragePosix;
 		int disabled_calls;
