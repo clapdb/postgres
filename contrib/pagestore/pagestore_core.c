@@ -13940,7 +13940,11 @@ ps_core_maintenance(void)
 	 * writer fence after all ordinary/background work has drained. */
 	if (timeline_delete_publish_one())
 		did = 1;
-	ps_backpressure_refresh();
+	/* Disabled-by-default controllers must not perturb the maintenance hot
+	 * path (or its scheduling) merely to republish an unchanged zero snapshot. */
+	if (page_reclaim_high_water_bytes != 0 ||
+		wal_reclaim_high_water_bytes != 0)
+		ps_backpressure_refresh();
 	return did;
 }
 
