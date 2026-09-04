@@ -269,6 +269,7 @@ cl_exec(void)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;					/* busy wait; single in-flight request */
@@ -278,6 +279,7 @@ cl_exec(void)
 static PsChannel *
 exec_channel(PsChannel *ch)
 {
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;
@@ -2302,6 +2304,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		write_ch->blocknum = 0;
 		write_ch->nblocks = 1;
 		fill_page(write_ch->data, ps, 12000, 102);
+		ps_request_generation_next(write_ch);
 		ps_store_release(&write_ch->state, PS_STATE_REQUEST);
 
 		for (uint32_t i = (uint32_t) cl_chan + hdr->nshards;
@@ -4619,6 +4622,7 @@ run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
 		pending->req_lsn = wal_total;
 		pending->datalen = sizeof(readback);
 		memset(pending->data, 0x6b, sizeof(readback));
+		ps_request_generation_next(pending);
 		ps_store_release(&pending->state, PS_STATE_REQUEST);
 		usleep(100000);
 		check(ps_load_acquire(&pending->state) == PS_STATE_REQUEST,

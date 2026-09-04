@@ -29,7 +29,9 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		37	/* 37: page/WAL reclaim backpressure controller metrics;
+#define PS_SHM_VERSION		38	/* 38: request generations and daemon-owned
+								 * shutdown cancellation state;
+								 * 37: page/WAL reclaim backpressure controller metrics;
 								 * 36: exact-token timeline info returns parent incarnation;
 								 * 34: timeline deletion lifecycle/state query;
 								 * 33: WAL-index known/FPI + record-end metadata;
@@ -87,6 +89,7 @@
 #define PS_STATE_IDLE		0
 #define PS_STATE_REQUEST	1
 #define PS_STATE_DONE		2
+#define PS_STATE_CANCELLING	3	/* daemon owns a deferred request during shutdown */
 
 /* Shared-memory lifecycle.  The daemon keeps the magic invalid until the
  * store has recovered and all request workers exist, so a restart cannot be
@@ -308,6 +311,7 @@ typedef struct PsChannel
 	uint64_t	req_lsn;		/* READ_AT/WAL_APPEND: LSN; WAL_SIZE: out end LSN */
 	uint64_t	req_seq;		/* admission sequence; WAL_INDEX_GET cursor LSN */
 	uint64_t	incarnation;	/* expected timeline incarnation; 0 = legacy inc-1 */
+	uint64_t	request_generation;	/* monotonically advances for every published request */
 	PsKey		key;
 
 	/* result */
@@ -318,6 +322,21 @@ typedef struct PsChannel
 	/* payload: up to PS_IO_UNIT bytes (io_unit / page_size pages) */
 	unsigned char data[PS_IO_UNIT];
 } PsChannel;
+
+/* The generation is written before the release that publishes REQUEST and is
+ * never reset when a channel is reclaimed.  A zero value is the initial
+ * generation; wrapping skips zero so a stale zero-initialized channel cannot
+ * alias a later request. */
+static inline uint64_t
+ps_request_generation_next(PsChannel *ch)
+{
+	uint64_t generation = ch->request_generation + 1;
+
+	if (generation == 0)
+		generation = 1;
+	ch->request_generation = generation;
+	return generation;
+}
 
 /* Block 2 of the mirrored control object maps checkpoint redo to the global
  * store-admission sequence that freezes same-LSN page/fork history. */

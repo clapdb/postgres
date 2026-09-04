@@ -170,6 +170,7 @@ wal_read(uint32_t tl, uint64_t incarnation, uint64_t start_lsn,
 	ch->req_lsn = start_lsn;
 	ch->datalen = len;
 	request_in_flight = 1;
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;

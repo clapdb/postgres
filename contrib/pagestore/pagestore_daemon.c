@@ -20,6 +20,7 @@
  */
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -38,6 +39,8 @@
 static volatile sig_atomic_t stop_requested = 0;
 static PsShmHeader *daemon_hdr = NULL;
 static const char *maintenance_pause_file = NULL;
+static const char *shutdown_cancel_pause_file = NULL;
+static int shutdown_cancel_ready_fd = -1;
 
 typedef struct WorkerArgs
 {
@@ -49,6 +52,7 @@ typedef struct WorkerArgs
 
 typedef struct BackpressureWaitSlot
 {
+	uint64_t	request_generation;
 	uint32_t	cause_mask;
 	uint64_t	last_probe_ns;
 	uint64_t	page_wait_ns;
@@ -99,15 +103,48 @@ accrue_backpressure_interval(BackpressureWaitSlot *slot, uint64_t now)
 }
 
 static void
-record_backpressure_probe(uint32_t channel, uint32_t cause_mask)
+capture_backpressure_request(BackpressureWaitSlot *slot,
+							 const PsChannel *ch)
+{
+	slot->request_generation =
+		__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE);
+}
+
+static int
+backpressure_request_matches(const BackpressureWaitSlot *slot,
+							 const PsChannel *ch)
+{
+	return slot->request_generation ==
+		__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE);
+}
+
+static void finish_backpressure_wait(uint32_t channel);
+
+static void
+record_backpressure_probe(uint32_t channel, PsChannel *ch,
+						  uint32_t cause_mask)
 {
 	BackpressureWaitSlot *slot = &backpressure_wait_slots[channel];
 	uint64_t now = monotonic_ns();
 
 	if (slot->active)
+	{
+		/* A channel is not normally mutable while it is REQUEST, but if a
+		 * client abandoned and replaced it, close the old accounting interval
+		 * before tracking the new request. */
+		if (!backpressure_request_matches(slot, ch))
+		{
+			finish_backpressure_wait(channel);
+			capture_backpressure_request(slot, ch);
+			slot->active = 1;
+		}
 		accrue_backpressure_interval(slot, now);
+	}
 	else
+	{
+		capture_backpressure_request(slot, ch);
 		slot->active = 1;
+	}
 	slot->cause_mask = cause_mask;
 	slot->last_probe_ns = now;
 }
@@ -153,6 +190,39 @@ shm_mark_stopping(PsShmHeader *hdr)
 {
 	__atomic_store_n(&hdr->startup_state, PS_SHM_STOPPING, __ATOMIC_RELEASE);
 	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+}
+
+#define SHUTDOWN_CANCEL_READY_BYTE 0x5a
+
+/* Test-only pipe publication point.  The descriptor is inherited across
+ * exec, so the byte cannot be confused with a stale filesystem artifact. */
+static int
+publish_shutdown_cancel_ready(void)
+{
+	unsigned char byte = SHUTDOWN_CANCEL_READY_BYTE;
+	int fd = shutdown_cancel_ready_fd;
+
+	shutdown_cancel_ready_fd = -1;
+	if (fd < 0)
+		return 0;
+	for (;;)
+	{
+		ssize_t n = write(fd, &byte, 1);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n != 1)
+		{
+			(void) close(fd);
+			return -1;
+		}
+		break;
+	}
+	/* The byte is the publication point.  Closing the inherited descriptor is
+	 * cleanup only; a close error must not make the already-published handshake
+	 * look like a failed publication or skip the test pause. */
+	(void) close(fd);
+	return 0;
 }
 
 static int
@@ -601,7 +671,7 @@ run_request(uint32_t channel, PsChannel *ch)
 		}
 		if (admit == 0)
 		{
-			record_backpressure_probe(channel, causes);
+			record_backpressure_probe(channel, ch, causes);
 			return 0;
 		}
 		/* Charge the complete final interval, including the probe which first
@@ -723,6 +793,51 @@ shard_worker(void *arg)
 	return NULL;
 }
 
+/* All request workers are joined before this pass, so no daemon thread can be
+ * executing or advancing a channel while it runs.  REQUEST -> CANCELLING is
+ * the daemon-owned handoff: a client cannot validly abandon/reclaim and publish
+ * a new generation after this CAS.  The generation recheck handles the small
+ * probe/CAS race by restoring REQUEST without touching the newer request. */
+static void
+cancel_deferred_channels(void *shm, uint32_t nchannels)
+{
+	for (uint32_t i = 0; i < nchannels; i++)
+	{
+		BackpressureWaitSlot *slot = &backpressure_wait_slots[i];
+		PsChannel *ch;
+		uint64_t generation;
+
+		if (!slot->active)
+			continue;
+		ch = ps_channel(shm, i);
+		generation = slot->request_generation;
+		if (ps_load_acquire(&ch->claimed) == 0 ||
+			!backpressure_request_matches(slot, ch) ||
+			!ps_cas(&ch->state, PS_STATE_REQUEST, PS_STATE_CANCELLING))
+		{
+			finish_backpressure_wait(i);
+			continue;
+		}
+		/* The state CAS is the ownership transfer.  A valid client publishes
+		 * generation before REQUEST and cannot mutate it while CANCELLING. */
+		if (__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE) !=
+			generation)
+		{
+			finish_backpressure_wait(i);
+			/* The CAS may have raced a client that changed REQUEST between
+			 * the cheap generation probe and the ownership transfer.  Do not
+			 * write status or publish DONE for that newer generation; return
+			 * the state only if we still own CANCELLING. */
+			(void) ps_cas(&ch->state, PS_STATE_CANCELLING,
+						  PS_STATE_REQUEST);
+			continue;
+		}
+		finish_backpressure_wait(i);
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+	}
+}
+
 /*
  * Keep potentially long tiering, GC, and compaction work off every shard's
  * foreground serve thread.  ps_core_maintenance() takes the shard and map
@@ -774,6 +889,17 @@ parse_u64_option(const char *text, uint64_t *value)
 	if (errno == ERANGE || end == text || *end != '\0')
 		return -1;
 	*value = (uint64_t) parsed;
+	return 0;
+}
+
+static int
+parse_fd_option(const char *text, int *value)
+{
+	uint64_t parsed;
+
+	if (parse_u64_option(text, &parsed) != 0 || parsed > INT_MAX)
+		return -1;
+	*value = (int) parsed;
 	return 0;
 }
 
@@ -831,6 +957,15 @@ main(int argc, char **argv)
 		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
 				 i + 1 < argc)
 			maintenance_pause_file = argv[++i];
+		else if (strcmp(argv[i], "--test-shutdown-cancel-pause-file") == 0 &&
+				 i + 1 < argc)
+			shutdown_cancel_pause_file = argv[++i];
+		else if (strcmp(argv[i], "--test-shutdown-cancel-ready-fd") == 0 &&
+				 i + 1 < argc)
+		{
+			if (parse_fd_option(argv[++i], &shutdown_cancel_ready_fd) != 0)
+				return 2;
+		}
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -854,7 +989,9 @@ main(int argc, char **argv)
 					"[--nshards N] [--storage NAME] "
 					"[--page-high-water-bytes N --page-catch-up-bytes N] "
 					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-					"[--test-maintenance-pause-file PATH]\n",
+					"[--test-maintenance-pause-file PATH] "
+					"[--test-shutdown-cancel-pause-file PATH] "
+					"[--test-shutdown-cancel-ready-fd N]\n",
 					argv[0]);
 			return 2;
 		}
@@ -867,7 +1004,9 @@ main(int argc, char **argv)
 				"[--nshards N] [--storage NAME] "
 				"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-				"[--test-maintenance-pause-file PATH]\n",
+				"[--test-maintenance-pause-file PATH] "
+				"[--test-shutdown-cancel-pause-file PATH] "
+				"[--test-shutdown-cancel-ready-fd N]\n",
 				argv[0]);
 		return 2;
 	}
@@ -1011,6 +1150,28 @@ main(int argc, char **argv)
 		free(workers);
 		free(threads);
 	}
+	/* The signal handler invalidates readiness immediately.  Once every daemon
+	 * worker has stopped, finish the requests that were deliberately retained
+	 * in REQUEST by backpressure before core/shm teardown. */
+	shm_mark_stopping(hdr);
+	/* Test-only seam: workers are already joined, so a client can deterministically
+	 * abandon/reuse a deferred channel before the generation-checked cancellation
+	 * pass.  This is never configured by normal daemon users. */
+	if (shutdown_cancel_ready_fd >= 0 &&
+		publish_shutdown_cancel_ready() != 0)
+		fprintf(stderr, "pagestore_daemon: could not publish shutdown cancellation byte; "
+				"skipping test pause\n");
+	else
+	{
+		while (shutdown_cancel_pause_file != NULL &&
+			   access(shutdown_cancel_pause_file, F_OK) == 0)
+		{
+			struct timespec ts = {0, 1000000};
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	cancel_deferred_channels(shm, hdr->nchannels);
 
 	{
 		uint64_t	rm,
@@ -1029,7 +1190,6 @@ main(int argc, char **argv)
 				(unsigned long long) rs, (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);
 	}
-	shm_mark_stopping(hdr);
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;

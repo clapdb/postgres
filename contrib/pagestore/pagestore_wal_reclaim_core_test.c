@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -561,20 +562,44 @@ static void
 test_residual_prefix_retry_after_reopen(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-residual-XXXXXX";
+	PsShmHeader metrics;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
 		  "construct reclaimable WAL for a residual-prefix retry");
-	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK", "1", 1) == 0 &&
-		  ps_test_wal_reclaim_maintenance() == 0 &&
-		  segment_count(store, 0) == WAL_SEGMENTS,
-		  "publish the durable frontier but leave every authorized file residual");
-	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
+	{
+		pid_t pid;
+		int status = 0;
+
+		check(setenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK", "1", 1) == 0,
+			  "enable the crash point after WAL frontier publication");
+		pid = fork();
+		if (pid == 0)
+		{
+			(void) ps_test_wal_reclaim_maintenance();
+			_exit(1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 91 &&
+			  segment_count(store, 0) == WAL_SEGMENTS,
+			  "crash leaves the authorized residual WAL prefix on disk");
+		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK");
+	}
 	close_store();
-	check(ps_core_open(store) == 0 && segment_count(store, 0) == WAL_SEGMENTS &&
-		  ps_test_wal_reclaim_maintenance() == 1 &&
-		  segment_count(store, 0) == 0,
-		  "reopen retries residual unlink at the already-published frontier");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0 &&
+		  ps_core_open(store) == 0 && segment_count(store, 0) == WAL_SEGMENTS &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.throttled != 0 &&
+		   metrics.wal_backpressure.lag_bytes >= WAL_TOTAL),
+		  "reopen reports physical residual WAL debt and keeps throttle active");
+	check(ps_test_wal_reclaim_maintenance() == 1 &&
+		  segment_count(store, 0) == 0 &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.throttled == 0),
+		  "successful residual cleanup releases WAL backpressure");
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }
@@ -647,8 +672,14 @@ test_fenced_residual_query_stops_retries(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-fenced-residual-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
+	AdmissionCallCounter admission = {0};
+	PsShmHeader metrics;
 
 	configure_core();
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL backpressure for fenced residual observation");
 	check(prepare_store(store, WAL_SEGMENT, 0, 0, 1),
 		  "construct a one-segment reclaim candidate for directory-fsync fencing");
 	ps_test_set_wal_reclaim_attempt_hook(count_reclaim_attempt, &counter);
@@ -658,11 +689,24 @@ test_fenced_residual_query_stops_retries(void)
 		(void) ps_core_maintenance();
 	check(counter.attempts == 1 && segment_count(store, 0) == WAL_SEGMENTS - 1,
 		  "directory-fsync failure fences after publishing and unlinking the prefix");
+	/* A fenced residual is an observation error, not a maintenance candidate:
+	 * keep the controller fail-closed without repeatedly draining admission. */
+	admission.calls = 0;
+	ps_test_set_admission_write_lock_hook(count_admission_call, &admission);
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.lag_bytes == UINT64_MAX &&
+		  metrics.wal_backpressure.throttled != 0 && admission.calls == 0,
+		  "fenced residual keeps WAL throttle without an admission drain");
+	check(ps_test_wal_reclaim_maintenance() == 0 && admission.calls == 0,
+		  "fenced residual is not a maintenance candidate");
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC");
 	(void) sleep(2);
 	check(ps_test_wal_reclaim_maintenance() == 0 && counter.attempts == 1,
 		  "fenced residual-query failure suppresses futile retries until reopen");
 	ps_test_set_wal_reclaim_attempt_hook(NULL, NULL);
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }

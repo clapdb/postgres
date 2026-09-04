@@ -380,6 +380,7 @@ ls_exec_wait(PsChannel *ch, int timeout_ms)
 
 	ch->shard = ls_channel_shard;
 
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
 	/*

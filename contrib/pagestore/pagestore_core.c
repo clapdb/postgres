@@ -8185,8 +8185,11 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
  * reclaim cannot make real physical debt disappear; maintenance passes
  * honor_retry_at to avoid repeatedly draining admission for the same failure. */
 static int
-wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at)
+wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
+						int *observation_error)
 {
+	if (observation_error != NULL)
+		*observation_error = 0;
 	if (clock_gettime(CLOCK_MONOTONIC, now_out) != 0)
 		return 0;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
@@ -8211,6 +8214,10 @@ wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at)
 			ps_wal_store_residual_prefix_pending(&wal_segment_stores[tl],
 											 &residual_target) : 0;
 		residual_pending = residual_status > 0;
+		if (residual_status < 0 && observation_error != NULL)
+			*observation_error = 1;
+		/* A residual/storage error is an observation failure, not a
+		 * maintenance candidate: draining admission cannot repair it. */
 		eligible = wal_segment_store_opened[tl] && residual_status >= 0 &&
 			(residual_pending ||
 			 (wal_segment_stores[tl].nentries != 0 &&
@@ -8245,7 +8252,7 @@ wal_segment_reclaim_one(void)
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0)
 		return 0; /* SPDK and unknown providers have no safe R3b policy. */
-	if (!wal_reclaim_preselected(&now, 1))
+	if (!wal_reclaim_preselected(&now, 1, NULL))
 		return 0;
 	if (admission_write_lock() != 0)
 		return 0;
@@ -11743,10 +11750,16 @@ wal_reclaim_lag_bytes(void)
 {
 	struct timespec now;
 	uint64_t lag = 0;
+	int observation_error = 0;
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
-		strcmp(ps_storage->name, "posix") != 0 ||
-		!wal_reclaim_preselected(&now, 0) || admission_write_lock() != 0)
+		strcmp(ps_storage->name, "posix") != 0)
+		return 0;
+	if (!wal_reclaim_preselected(&now, 0, &observation_error))
+		return observation_error ? UINT64_MAX : 0;
+	if (observation_error)
+		return UINT64_MAX;
+	if (admission_write_lock() != 0)
 		return 0;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
@@ -11758,6 +11771,7 @@ wal_reclaim_lag_bytes(void)
 		uint64_t raw_floor = 0;
 		uint64_t retention_floor = 0;
 		uint64_t target = 0;
+		uint64_t residual_bytes = 0;
 		uint64_t residual_target = 0;
 		int residual_status;
 		int residual_pending;
@@ -11775,16 +11789,24 @@ wal_reclaim_lag_bytes(void)
 		residual_status = wal_segment_store_opened[tl] ?
 			ps_wal_store_residual_prefix_pending(store, &residual_target) : 0;
 		residual_pending = residual_status > 0;
+		if (residual_status > 0 &&
+			ps_wal_store_residual_prefix_bytes(store, &residual_bytes) != 0)
+			residual_status = -1;
 		if (!wal_segment_store_opened[tl] || residual_status < 0 ||
 			store->metadata_fenced)
+		{
+			if (residual_status < 0 || store->metadata_fenced)
+				lag = UINT64_MAX;
 			goto wal_lag_unlock;
+		}
 		start = store->start_lsn;
 		end = store->end_lsn;
 		if (residual_pending)
 		{
-			target = residual_target;
-			if (target > start && target <= end)
-				lag = backpressure_saturating_add(lag, target - start);
+			/* start_lsn is already the restored logical frontier.  Count only
+			 * validated residual files still physically present before it;
+			 * target-start is zero after a normal reopen. */
+			lag = backpressure_saturating_add(lag, residual_bytes);
 			goto wal_lag_unlock;
 		}
 		if (store->nentries == 0 || start > UINT64_MAX - store->segment_size ||

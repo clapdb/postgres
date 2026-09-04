@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,8 @@
 #include <unistd.h>
 
 #include "pagestore_ipc.h"
+
+#define SHUTDOWN_CANCEL_READY_BYTE 0x5a
 
 static int checks;
 static int failed;
@@ -82,6 +85,7 @@ set_relation_key(PsChannel *ch, uint32_t rel)
 static void
 submit_and_wait(PsChannel *ch)
 {
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		sched_yield();
@@ -99,6 +103,42 @@ wait_for_state(PsChannel *ch, uint32_t state, int milliseconds)
 		sleep_ms(1);
 	}
 	return ps_load_acquire(&ch->state) == state;
+}
+
+static int
+wait_for_ready_byte(int fd, int milliseconds)
+{
+	struct pollfd pollfd;
+	unsigned char byte;
+
+	pollfd.fd = fd;
+	pollfd.events = POLLIN;
+	pollfd.revents = 0;
+	for (int i = 0; i < milliseconds; i++)
+	{
+		int result;
+
+		pollfd.revents = 0;
+		result = poll(&pollfd, 1, 1);
+		if (result < 0 && errno == EINTR)
+			continue;
+		if (result < 0)
+			return 0;
+		if (result == 0)
+			continue;
+		if ((pollfd.revents & (POLLERR | POLLNVAL)) != 0)
+			return 0;
+		if ((pollfd.revents & (POLLIN | POLLHUP)) != 0)
+		{
+			ssize_t n;
+
+			do
+				n = read(fd, &byte, 1);
+			while (n < 0 && errno == EINTR);
+			return n == 1 && byte == SHUTDOWN_CANCEL_READY_BYTE;
+		}
+	}
+	return 0;
 }
 
 static int
@@ -151,25 +191,57 @@ wait_for_exit(pid_t pid, int milliseconds)
 
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm_name,
-			 const char *store_dir, const char *pause_file, int enable_bp)
+				 const char *store_dir, const char *pause_file,
+				 const char *shutdown_pause_file,
+				 int ready_fd, int ready_read_fd, int enable_bp)
 {
+	char ready_fd_text[32];
 	pid_t pid = fork();
 
 	if (pid == 0)
 	{
+		if (ready_read_fd >= 0)
+			close(ready_read_fd);
+		if (ready_fd >= 0)
+		{
+			int flags = fcntl(ready_fd, F_GETFD);
+
+			if (flags < 0 || fcntl(ready_fd, F_SETFD,
+								 flags & ~FD_CLOEXEC) < 0)
+			{
+				close(ready_fd);
+				_exit(127);
+			}
+		}
+		if (ready_fd >= 0)
+			snprintf(ready_fd_text, sizeof(ready_fd_text), "%d", ready_fd);
 		if (enable_bp)
 			execl(daemon_path, daemon_path, "--shm", shm_name, "--store",
 				  store_dir, "--page-size", "8192", "--segment-size", "32768",
 				  "--nshards", "1", "--flush-pages", "1", "--compact-layers",
 				  "100", "--segment-gc", "1", "--page-high-water-bytes",
 				  "32768", "--page-catch-up-bytes", "1",
-				  "--test-maintenance-pause-file", pause_file, (char *) NULL);
+				  "--test-maintenance-pause-file", pause_file,
+				  shutdown_pause_file != NULL ?
+				  "--test-shutdown-cancel-pause-file" : NULL,
+				  shutdown_pause_file != NULL ? shutdown_pause_file : NULL,
+				  ready_fd >= 0 ? "--test-shutdown-cancel-ready-fd" : NULL,
+				  ready_fd >= 0 ? ready_fd_text : NULL,
+				  (char *) NULL);
 		else
 			execl(daemon_path, daemon_path, "--shm", shm_name, "--store",
 				  store_dir, "--page-size", "8192", "--segment-size", "32768",
 				  "--nshards", "1", "--flush-pages", "1", "--compact-layers",
 				  "100", "--segment-gc", "1", "--test-maintenance-pause-file",
-				  pause_file, (char *) NULL);
+				  pause_file,
+				  shutdown_pause_file != NULL ?
+				  "--test-shutdown-cancel-pause-file" : NULL,
+				  shutdown_pause_file != NULL ? shutdown_pause_file : NULL,
+				  ready_fd >= 0 ? "--test-shutdown-cancel-ready-fd" : NULL,
+				  ready_fd >= 0 ? ready_fd_text : NULL,
+				  (char *) NULL);
+		if (ready_fd >= 0)
+			close(ready_fd);
 		_exit(127);
 	}
 	return pid;
@@ -181,6 +253,7 @@ run_test(const char *daemon_path)
 	char shm_name[64];
 	char store_dir[128];
 	char pause_file[128];
+	char shutdown_pause_file[128];
 	char empty_segment[256];
 	const uint32_t page_size = 8192;
 	const uint32_t rel = 4242;
@@ -190,17 +263,22 @@ run_test(const char *daemon_path)
 	PsShmHeader *hdr;
 	PsChannel *reader = NULL;
 	PsChannel *pending = NULL;
+	PsChannel *aba = NULL;
 	unsigned char *readback = NULL;
 	int cleanup_kill = 0;
 	int pause_fd;
 	int ready;
+	int ready_pipe[2] = {-1, -1};
 
 	snprintf(shm_name, sizeof(shm_name), "/psbp_%d", (int) getpid());
 	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_store_%d", (int) getpid());
 	snprintf(pause_file, sizeof(pause_file), "/tmp/psbp_pause_%d", (int) getpid());
+	snprintf(shutdown_pause_file, sizeof(shutdown_pause_file),
+			 "/tmp/psbp_shutdown_pause_%d", (int) getpid());
 	snprintf(empty_segment, sizeof(empty_segment), "%s/seg_%08d", store_dir, 0);
 	shm_unlink(shm_name);
 	unlink(pause_file);
+	unlink(shutdown_pause_file);
 	/* Keep maintenance paused for both phases.  The first phase seeds the
 	 * durable debt with backpressure disabled; the second phase refreshes it at
 	 * startup and enters throttle before accepting test requests. */
@@ -217,7 +295,8 @@ run_test(const char *daemon_path)
 
 	/* Phase 1: seed complete reclaimable segments while the controller is
 	 * disabled, so no prefill request can ever be deferred. */
-	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file, 0);
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
+					   NULL, -1, -1, 0);
 	check(pid > 0, "real daemon starts for backpressure integration");
 	if (pid <= 0)
 		goto cleanup;
@@ -275,7 +354,8 @@ run_test(const char *daemon_path)
 	pid = -1;
 
 	/* Phase 2: startup recovery retains the seed's complete segment debt. */
-	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file, 1);
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
+					   NULL, -1, -1, 1);
 	check(pid > 0, "throttle daemon restarts for backpressure integration");
 	if (pid <= 0)
 		goto cleanup;
@@ -316,6 +396,7 @@ run_test(const char *daemon_path)
 	pending->blocknum = 20;
 	pending->nblocks = 1;
 	fill_page(pending->data, page_size, 99);
+	ps_request_generation_next(pending);
 	ps_store_release(&pending->state, PS_STATE_REQUEST);
 	sleep_ms(100);
 	check(ps_load_acquire(&pending->state) == PS_STATE_REQUEST,
@@ -325,6 +406,7 @@ run_test(const char *daemon_path)
 	reader->opcode = PS_OP_READV;
 	reader->blocknum = 0;
 	reader->nblocks = 1;
+	ps_request_generation_next(reader);
 	ps_store_release(&reader->state, PS_STATE_REQUEST);
 	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
 		  reader->status == PS_STATUS_OK,
@@ -340,6 +422,7 @@ run_test(const char *daemon_path)
 	reader->incarnation = 1;
 	reader->req_lsn = 0;
 	reader->req_seq = 0;
+	ps_request_generation_next(reader);
 	ps_store_release(&reader->state, PS_STATE_REQUEST);
 	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
 		  reader->status == PS_STATUS_OK,
@@ -350,6 +433,7 @@ run_test(const char *daemon_path)
 	reader->incarnation = 0;
 	reader->req_lsn = 0;
 	reader->req_seq = 1;
+	ps_request_generation_next(reader);
 	ps_store_release(&reader->state, PS_STATE_REQUEST);
 	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
 		  reader->status == PS_STATUS_OK,
@@ -394,7 +478,8 @@ run_test(const char *daemon_path)
 	check(pause_fd >= 0, "integration pauses maintenance for cursor restart");
 	if (pause_fd >= 0)
 		close(pause_fd);
-	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file, 1);
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
+					   NULL, -1, -1, 1);
 	check(pid > 0, "cursor-restart daemon starts");
 	if (pid <= 0)
 		goto cleanup;
@@ -456,9 +541,35 @@ run_test(const char *daemon_path)
 	cleanup_kill = 0;
 	pid = -1;
 
-	/* Final phase: startup refresh enters throttle before any request, then a
-	 * deferred mutation is present when SIGTERM arrives. */
-	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file, 1);
+	/* Final phase: startup refresh enters throttle before any request, then two
+	 * deferred mutations are present when SIGTERM arrives.  One remains a
+	 * normal deferred request; the other is reused after workers have joined to
+	 * make the shutdown ABA race deterministic. */
+	{
+		int shutdown_fd = open(shutdown_pause_file, O_CREAT | O_EXCL | O_WRONLY,
+						 0600);
+
+		check(shutdown_fd >= 0, "shutdown phase creates cancellation pause file");
+		if (shutdown_fd >= 0)
+			close(shutdown_fd);
+	}
+	check(pipe(ready_pipe) == 0, "shutdown phase creates ready pipe");
+	if (ready_pipe[0] < 0 || ready_pipe[1] < 0)
+		goto cleanup;
+	{
+		int flags = fcntl(ready_pipe[1], F_GETFD);
+		int set_flags = flags < 0 ? -1 : fcntl(ready_pipe[1], F_SETFD,
+										flags & ~FD_CLOEXEC);
+
+		check(flags >= 0 && set_flags == 0,
+			  "ready pipe write fd is inherited across exec");
+		if (flags < 0 || set_flags != 0)
+			goto cleanup;
+	}
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
+					   shutdown_pause_file, ready_pipe[1], ready_pipe[0], 1);
+	close(ready_pipe[1]);
+	ready_pipe[1] = -1;
 	check(pid > 0, "shutdown-phase daemon restarts");
 	if (pid <= 0)
 		goto cleanup;
@@ -478,10 +589,12 @@ run_test(const char *daemon_path)
 	hdr = (PsShmHeader *) shm;
 	reader = ps_channel(shm, 0);
 	pending = ps_channel(shm, 1);
-	check(ps_cas(&reader->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1),
-		  "shutdown phase claims two channels");
+	aba = ps_channel(shm, 2);
+	check(ps_cas(&reader->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1) &&
+		  ps_cas(&aba->claimed, 0, 1), "shutdown phase claims three channels");
 	if (ps_load_acquire(&reader->claimed) == 0 ||
-		ps_load_acquire(&pending->claimed) == 0)
+		ps_load_acquire(&pending->claimed) == 0 ||
+		ps_load_acquire(&aba->claimed) == 0)
 		goto cleanup;
 	for (int i = 0; i < 500; i++)
 	{
@@ -496,23 +609,61 @@ run_test(const char *daemon_path)
 	pending->blocknum = 50;
 	pending->nblocks = 1;
 	fill_page(pending->data, page_size, 99);
+	ps_request_generation_next(pending);
 	ps_store_release(&pending->state, PS_STATE_REQUEST);
 	sleep_ms(100);
 	check(ps_load_acquire(&pending->state) == PS_STATE_REQUEST,
 		  "shutdown phase has a mutation pending under throttle");
+	set_relation_key(aba, rel);
+	aba->opcode = PS_OP_WRITEV;
+	aba->blocknum = 51;
+	aba->nblocks = 1;
+	fill_page(aba->data, page_size, 100);
+	ps_request_generation_next(aba);
+	ps_store_release(&aba->state, PS_STATE_REQUEST);
+	sleep_ms(100);
+	check(ps_load_acquire(&aba->state) == PS_STATE_REQUEST,
+		  "shutdown ABA setup has a second deferred mutation");
 	kill(pid, SIGTERM);
-	if (wait_for_exit(pid, 2000))
+	/* startup_state changes in the signal handler; the test-only daemon seam
+	 * then keeps the parent after all workers have joined. */
+	if (!wait_for_ready_byte(ready_pipe[0], 2000))
 	{
-		cleanup_kill = 0;
-		pid = -1;
-		check(1, "SIGTERM exits the real daemon promptly while throttled");
-	}
-	else
-	{
-		check(0, "SIGTERM exits the real daemon promptly while throttled");
+		check(0, "ready pipe confirms workers joined before cancellation");
 		goto cleanup;
 	}
+	check(1, "ready pipe confirms workers joined before cancellation");
+	close(ready_pipe[0]);
+	ready_pipe[0] = -1;
+	{
+		uint64_t new_generation;
 
+		ps_store_release(&aba->state, PS_STATE_IDLE);
+		aba->status = PS_STATUS_STALE;
+		new_generation = ps_request_generation_next(aba);
+		ps_store_release(&aba->state, PS_STATE_REQUEST);
+		unlink(shutdown_pause_file);
+		if (wait_for_exit(pid, 2000))
+		{
+			cleanup_kill = 0;
+			pid = -1;
+			check(1, "SIGTERM exits the real daemon promptly while throttled");
+			check(ps_load_acquire(&pending->state) == PS_STATE_DONE &&
+				  pending->status == PS_STATUS_ERROR,
+				  "shutdown completes the normal deferred mutation with ERROR/DONE");
+			check(ps_load_acquire(&aba->state) == PS_STATE_REQUEST &&
+				  aba->status == PS_STATUS_STALE &&
+				  aba->request_generation == new_generation,
+				  "shutdown does not complete or pollute a reused generation");
+			check(ps_load_acquire_u64(&hdr->page_backpressure.foreground_wait_ns) != 0,
+				  "shutdown accounts deferred foreground wait before teardown");
+		}
+		else
+		{
+			check(0, "SIGTERM exits the real daemon promptly while throttled");
+			goto cleanup;
+		}
+	}
 cleanup:
 	if (cleanup_kill)
 	{
@@ -523,6 +674,11 @@ cleanup:
 			waitpid(pid, NULL, 0);
 		}
 	}
+	unlink(shutdown_pause_file);
+	if (ready_pipe[0] >= 0)
+		close(ready_pipe[0]);
+	if (ready_pipe[1] >= 0)
+		close(ready_pipe[1]);
 	if (pending != NULL)
 		ps_store_release(&pending->claimed, 0);
 	if (reader != NULL)

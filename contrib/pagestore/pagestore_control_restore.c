@@ -258,6 +258,7 @@ control_read_asof(uint32_t timeline, uint64_t incarnation,
 	 * paths reuse abandoned channels whose state is IDLE or DONE.
 	 */
 	request_in_flight = 1;
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 
 	/*

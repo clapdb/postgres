@@ -53,6 +53,7 @@ exec_on(int chan)
 {
 	PsChannel  *c = ps_channel(g_shm, chan);
 
+	ps_request_generation_next(c);
 	ps_store_release(&c->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&c->state) != PS_STATE_DONE)
 		;
