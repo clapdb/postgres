@@ -45,7 +45,7 @@ new daemon's zeroing/recovery window.
 | Image-layer path | Functional mechanisms implemented; phases 2–3 partial | manifest/compaction/segment-GC restart tests; sparse indexes and layer-block cache invalidation remain |
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
-| WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
+| WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; the flat-log copy of every complete sealed record is reclaimed, while the flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index plus crash-safe replacement-chain compaction, durable timeline frontier, multi-shard snapshot/log-epoch cutover, and old generation/epoch GC implemented | WAL redo demos plus discrete/operational chain pruning, frontier admission/restart/corruption/crash tests, snapshot publication, generation/epoch GC, and tail replay |
 | Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
@@ -199,7 +199,58 @@ pins from timeline metadata rather than duplicating them, and folds every
 branch-visible restorable control image into the WAL resource.  Page compaction
 consumes exact tuple fences, publishes its durable frontier before source
 retirement, and has bounded-churn, relation-lifecycle, descendant, and
-publication-crash coverage.  Still required for the gate:
+publication-crash coverage.  R3b-1 is present in the standalone WAL store: its
+v2 identity durably records and checksums the physical directory start, retained
+base, and append end; reopen validates those values against a complete
+contiguous segment directory; old v1 identities migrate only after that
+validation; and callers can monotonically advance the logical retained base
+without deletion authority.  R3b-2 adds the standalone
+`ps_wal_store_reclaim_prefix()` primitive.  It publishes retained-base and
+physical-start frontiers atomically under the WAL mutex before unlinking only
+segments below an aligned target; the mutex drains in-flight reads and blocks
+new below-frontier reads, partial unlink keeps the memory catalog aligned with
+successful unlink calls, and ambiguous directory fsync fences until reopen.
+Reopen validates the authorized suffix and can retry residual prefix files
+idempotently.  Residual candidates are fully enumerated and validated before
+any unlink, sorted in ascending order, and required to form the contiguous
+suffix immediately below the target.  The main catalog path likewise validates
+each complete header, length, and payload CRC immediately before unlink; a
+corrupt low catalog segment deletes nothing, while a corrupt middle segment may
+delete only the already validated lower prefix and never the corrupt or higher
+segments.  Focused coverage includes real fork/`_exit` restart points,
+scan-error zero-unlink behavior, complete per-segment validation, corrupt
+catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
+read-versus-reclaim mutex barrier.
+R3b-3 is the conservative POSIX/core policy integration.  It admits at most
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment; a selected candidate drains ordinary admission before
+freezing the WAL index, snapshots raw WAL dependencies under short-lived
+shard/map protection, and releases all shard locks before control-image,
+layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
+minimum of the effective WAL retention floor, durable WAL-index progress, and
+the oldest surviving raw WAL dependency.  Missing durable proof, malformed or
+pending snapshot state, non-POSIX providers, and publication failures all fail
+closed with a one-second retry backoff.  Durable retained-base metadata is the
+sole restart-stable admission frontier; physical directory start is not a
+runtime fence.  WAL reads recheck that fence under each visited timeline's WAL
+lock; inherited history may bypass a child's natural local base and is then
+rechecked against the parent, while pre-metadata timelines retain local WAL
+readability.  Descendant control history and a target child's reclaim candidate
+are capped at their branch points, durable index progress beyond the sealed
+prefix remains a valid proof, and a durably DELETED descendant no longer pins
+its parent (DELETING still does).  Reopen reconstructs residual-prefix work so
+an already-published frontier can finish idempotent unlink without a new proof.
+Focused core coverage (66 checks) includes idle preselection, ancestry and timeline
+isolation, natural nonzero child fallback, child-local controls, target branch
+caps, LIVE/DELETING/DELETED floors, naturally nonzero starts, unaligned and
+boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index
+re-ship admission after base advancement, pre-metadata reads, restart/residual
+retry, read/frontier publication and floor-scan lock-order races, fenced
+residual-query suppression, pending-proof cleanup failure,
+metadata publication failure/backoff, and admission concurrency.
+
+This is a conservative R3b-3 policy integration.  It does not include sparse
+or discrete retained-base crossing, or a bounded fixed-reader soak.  Still
+required for the gate:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;

@@ -19,27 +19,177 @@ static int read_all_at(int fd, void *data, size_t len, off_t offset);
 static int random_suffix(char suffix[7]);
 
 #define PS_WAL_STORE_IDENTITY_BYTES 128
+#define PS_WAL_STORE_METADATA_BYTES 64
+#define PS_WAL_STORE_METADATA_MAGIC 0x4d535732u /* "MSW2" */
+#define PS_WAL_STORE_METADATA_VERSION 2u
 
-static int
-format_store_identity(uint32_t timeline, uint64_t start_lsn,
-					  uint32_t segment_size, char *buf, size_t len)
+typedef struct PsWalStoreMetadata
 {
-	int n = snprintf(buf, len, "PSWALSTORE1 %u %u %020llu\n", timeline,
-					 segment_size, (unsigned long long) start_lsn);
+	uint32_t timeline;
+	uint32_t segment_size;
+	uint64_t directory_start_lsn;
+	uint64_t retained_base_lsn;
+	uint64_t end_lsn;
+} PsWalStoreMetadata;
 
-	return n < 0 || (size_t) n >= len ? -1 : n;
+static uint32_t
+metadata_hash(const unsigned char *data, size_t len)
+{
+	uint32_t hash = 2166136261u;
+
+	for (size_t i = 0; i < len; i++)
+	{
+		hash ^= data[i];
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+static uint32_t
+metadata_crc(const unsigned char encoded[PS_WAL_STORE_METADATA_BYTES])
+{
+	unsigned char copy[PS_WAL_STORE_METADATA_BYTES];
+
+	memcpy(copy, encoded, sizeof(copy));
+	memset(copy + 48, 0, 4);
+	return metadata_hash(copy, sizeof(copy));
+}
+
+static void
+put_metadata_le32(unsigned char *p, uint32_t value)
+{
+	for (unsigned int i = 0; i < 4; i++)
+		p[i] = (unsigned char) (value >> (i * 8));
+}
+
+static void
+put_metadata_le64(unsigned char *p, uint64_t value)
+{
+	for (unsigned int i = 0; i < 8; i++)
+		p[i] = (unsigned char) (value >> (i * 8));
+}
+
+static uint32_t
+get_metadata_le32(const unsigned char *p)
+{
+	return (uint32_t) p[0] | (uint32_t) p[1] << 8 |
+		(uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+}
+
+static uint64_t
+get_metadata_le64(const unsigned char *p)
+{
+	return (uint64_t) get_metadata_le32(p) |
+		(uint64_t) get_metadata_le32(p + 4) << 32;
+}
+
+static void
+encode_metadata(const PsWalStoreMetadata *metadata,
+				unsigned char encoded[PS_WAL_STORE_METADATA_BYTES])
+{
+	memset(encoded, 0, PS_WAL_STORE_METADATA_BYTES);
+	put_metadata_le32(encoded + 0, PS_WAL_STORE_METADATA_MAGIC);
+	put_metadata_le32(encoded + 4, PS_WAL_STORE_METADATA_VERSION);
+	put_metadata_le32(encoded + 8, PS_WAL_STORE_METADATA_BYTES);
+	put_metadata_le32(encoded + 16, metadata->timeline);
+	put_metadata_le32(encoded + 20, metadata->segment_size);
+	put_metadata_le64(encoded + 24, metadata->directory_start_lsn);
+	put_metadata_le64(encoded + 32, metadata->retained_base_lsn);
+	put_metadata_le64(encoded + 40, metadata->end_lsn);
+	put_metadata_le32(encoded + 48, metadata_crc(encoded));
 }
 
 static int
-read_store_identity_fd(int directory_fd, uint32_t *timeline,
-					   uint64_t *start_lsn, uint32_t *segment_size)
+decode_metadata(PsWalStoreMetadata *metadata,
+				const unsigned char encoded[PS_WAL_STORE_METADATA_BYTES])
+{
+	if (get_metadata_le32(encoded + 0) != PS_WAL_STORE_METADATA_MAGIC ||
+		get_metadata_le32(encoded + 4) != PS_WAL_STORE_METADATA_VERSION ||
+		get_metadata_le32(encoded + 8) != PS_WAL_STORE_METADATA_BYTES ||
+		get_metadata_le32(encoded + 12) != 0 ||
+		get_metadata_le32(encoded + 48) != metadata_crc(encoded) ||
+		get_metadata_le32(encoded + 52) != 0 ||
+		get_metadata_le64(encoded + 56) != 0)
+		return -1;
+	metadata->timeline = get_metadata_le32(encoded + 16);
+	metadata->segment_size = get_metadata_le32(encoded + 20);
+	metadata->directory_start_lsn = get_metadata_le64(encoded + 24);
+	metadata->retained_base_lsn = get_metadata_le64(encoded + 32);
+	metadata->end_lsn = get_metadata_le64(encoded + 40);
+	if (metadata->timeline == 0 ||
+		metadata->segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
+		metadata->segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
+		(metadata->segment_size & (metadata->segment_size - 1)) != 0 ||
+		metadata->directory_start_lsn % metadata->segment_size != 0 ||
+		metadata->retained_base_lsn % metadata->segment_size != 0 ||
+		metadata->end_lsn % metadata->segment_size != 0 ||
+		metadata->directory_start_lsn > metadata->retained_base_lsn ||
+		metadata->retained_base_lsn > metadata->end_lsn ||
+		metadata->end_lsn > UINT64_MAX - metadata->segment_size)
+		return -1;
+	return 0;
+}
+
+static int
+read_store_metadata_fd(int directory_fd, PsWalStoreMetadata *metadata)
+{
+	unsigned char encoded[PS_WAL_STORE_METADATA_BYTES];
+	struct stat st;
+	int fd;
+
+	fd = openat(directory_fd, PS_WAL_STORE_IDENTITY_FILE,
+				O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		st.st_size != (off_t) sizeof(encoded))
+	{
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	if (read_all_at(fd, encoded, sizeof(encoded), 0) != 0)
+	{
+		close(fd);
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return decode_metadata(metadata, encoded);
+}
+
+static int
+parse_decimal_u64(const char **cursor, uint64_t *value)
+{
+	const unsigned char *p = (const unsigned char *) *cursor;
+	uint64_t parsed = 0;
+	int digits = 0;
+
+	while (*p >= '0' && *p <= '9')
+	{
+		uint64_t digit = (uint64_t) (*p - '0');
+
+		if (parsed > (UINT64_MAX - digit) / 10)
+			return -1;
+		parsed = parsed * 10 + digit;
+		p++;
+		digits = 1;
+	}
+	if (!digits)
+		return -1;
+	*cursor = (const char *) p;
+	*value = parsed;
+	return 0;
+}
+
+static int
+read_store_identity_v1_fd(int directory_fd, uint32_t *timeline,
+						  uint64_t *start_lsn, uint32_t *segment_size)
 {
 	char buf[PS_WAL_STORE_IDENTITY_BYTES];
 	struct stat st;
-	unsigned int parsed_timeline;
-	unsigned int parsed_segment_size;
-	unsigned long long parsed_start;
-	int consumed = 0;
+	const char *cursor;
+	uint64_t parsed_timeline;
+	uint64_t parsed_segment_size;
+	uint64_t parsed_start;
 	int fd;
 
 	fd = openat(directory_fd, PS_WAL_STORE_IDENTITY_FILE,
@@ -59,49 +209,65 @@ read_store_identity_fd(int directory_fd, uint32_t *timeline,
 	if (close(fd) != 0)
 		return -1;
 	buf[st.st_size] = '\0';
-	if (sscanf(buf, "PSWALSTORE1 %u %u %llu%n", &parsed_timeline,
-			   &parsed_segment_size, &parsed_start, &consumed) != 3 ||
-		consumed < 0 || consumed + 1 != st.st_size || buf[consumed] != '\n' ||
-		parsed_timeline == 0 ||
+	cursor = buf;
+	if (strncmp(cursor, "PSWALSTORE1 ", 12) != 0)
+		return -1;
+	cursor += 12;
+	if (parse_decimal_u64(&cursor, &parsed_timeline) != 0 ||
+		*cursor++ != ' ' || parse_decimal_u64(&cursor, &parsed_segment_size) != 0 ||
+		*cursor++ != ' ' || parse_decimal_u64(&cursor, &parsed_start) != 0 ||
+		*cursor++ != '\n' || *cursor != '\0' ||
+		parsed_timeline == 0 || parsed_timeline > UINT32_MAX ||
+		parsed_segment_size > UINT32_MAX ||
 		parsed_segment_size < PS_WAL_SEGMENT_MIN_BYTES ||
 		parsed_segment_size > PS_WAL_SEGMENT_MAX_BYTES ||
 		(parsed_segment_size & (parsed_segment_size - 1)) != 0 ||
 		parsed_start % parsed_segment_size != 0 ||
 		parsed_start > UINT64_MAX - parsed_segment_size)
 		return -1;
-	*timeline = parsed_timeline;
-	*segment_size = parsed_segment_size;
+	*timeline = (uint32_t) parsed_timeline;
+	*segment_size = (uint32_t) parsed_segment_size;
 	*start_lsn = parsed_start;
 	return 0;
 }
 
 static int
-store_identity_matches(int directory_fd, uint32_t timeline,
-					   uint64_t start_lsn, uint32_t segment_size)
+metadata_matches(const PsWalStoreMetadata *metadata, uint32_t timeline,
+				 uint64_t directory_start_lsn, uint64_t retained_base_lsn,
+				 uint64_t end_lsn, uint32_t segment_size)
 {
-	uint32_t actual_timeline;
-	uint32_t actual_segment_size;
-	uint64_t actual_start;
-
-	return read_store_identity_fd(directory_fd, &actual_timeline,
-							  &actual_start, &actual_segment_size) == 0 &&
-		actual_timeline == timeline && actual_start == start_lsn &&
-		actual_segment_size == segment_size ? 0 : -1;
+	return metadata->timeline == timeline &&
+		metadata->directory_start_lsn == directory_start_lsn &&
+		metadata->retained_base_lsn == retained_base_lsn &&
+		metadata->end_lsn == end_lsn &&
+		metadata->segment_size == segment_size ? 0 : -1;
 }
 
 static int
-publish_store_identity(PsWalStore *store)
+publish_store_metadata(PsWalStore *store, uint64_t directory_start_lsn,
+					   uint64_t retained_base_lsn, uint64_t end_lsn)
 {
-	char buf[PS_WAL_STORE_IDENTITY_BYTES];
+	PsWalStoreMetadata metadata;
+	unsigned char encoded[PS_WAL_STORE_METADATA_BYTES];
 	char temporary[128] = {0};
-	int len;
 	int fd = -1;
 	int rc = -1;
 
-	len = format_store_identity(store->timeline, store->start_lsn,
-							store->segment_size, buf, sizeof(buf));
-	if (len < 0)
+	if (directory_start_lsn > retained_base_lsn ||
+		retained_base_lsn > end_lsn ||
+		directory_start_lsn % store->segment_size != 0 ||
+		retained_base_lsn % store->segment_size != 0 ||
+		directory_start_lsn > UINT64_MAX - store->segment_size ||
+		end_lsn < store->start_lsn ||
+		end_lsn % store->segment_size != 0 ||
+		end_lsn > UINT64_MAX - store->segment_size)
 		return -1;
+	metadata.timeline = store->timeline;
+	metadata.segment_size = store->segment_size;
+	metadata.directory_start_lsn = directory_start_lsn;
+	metadata.retained_base_lsn = retained_base_lsn;
+	metadata.end_lsn = end_lsn;
+	encode_metadata(&metadata, encoded);
 	for (unsigned int attempt = 0; attempt < 128; attempt++)
 	{
 		char suffix[7];
@@ -120,7 +286,8 @@ publish_store_identity(PsWalStore *store)
 	}
 	if (fd < 0)
 		return -1;
-	if (write_all(fd, buf, (size_t) len) != 0 || fsync(fd) != 0)
+	if (getenv("PAGESTORE_TEST_FAIL_WAL_METADATA_BEFORE_RENAME") != NULL ||
+		write_all(fd, encoded, sizeof(encoded)) != 0 || fsync(fd) != 0)
 		goto cleanup;
 	if (close(fd) != 0)
 	{
@@ -128,16 +295,20 @@ publish_store_identity(PsWalStore *store)
 		goto cleanup;
 	}
 	fd = -1;
-	if (linkat(store->directory_fd, temporary, store->directory_fd,
-			   PS_WAL_STORE_IDENTITY_FILE, 0) != 0 &&
-		!(errno == EEXIST &&
-		  store_identity_matches(store->directory_fd, store->timeline,
-							 store->start_lsn, store->segment_size) == 0))
+	if (renameat(store->directory_fd, temporary, store->directory_fd,
+				 PS_WAL_STORE_IDENTITY_FILE) != 0)
 		goto cleanup;
-	if (unlinkat(store->directory_fd, temporary, 0) != 0 ||
+	memset(temporary, 0, sizeof(temporary));
+	if (getenv("PAGESTORE_TEST_FAIL_WAL_METADATA_DIR_FSYNC") != NULL ||
 		fsync(store->directory_fd) != 0)
-		goto cleanup;
-	rc = 0;
+	{
+		/* The rename outcome is intentionally not enough to authorize a
+		 * frontier.  The current process must fence every caller until reopen
+		 * observes a crash-consistent metadata image. */
+		store->metadata_fenced = 1;
+		return -1;
+	}
+	return 0;
 
 cleanup:
 	if (fd >= 0)
@@ -183,10 +354,18 @@ initialize_store(PsWalStore *store, const char *directory, uint32_t timeline,
 	n = snprintf(store->directory, sizeof(store->directory), "%s", directory);
 	store->timeline = timeline;
 	store->segment_size = segment_size;
+	if (pthread_mutex_init(&store->lock, NULL) != 0)
+		return -1;
+	store->lock_initialized = 1;
 	if (n < 0 || (size_t) n >= sizeof(store->directory) ||
 		segment_name(store, UINT64_MAX, path, sizeof(path)) != 0)
+	{
+		pthread_mutex_destroy(&store->lock);
+		store->lock_initialized = 0;
 		return -1;
+	}
 	store->start_lsn = start_lsn;
+	store->retained_base_lsn = start_lsn;
 	store->end_lsn = start_lsn;
 	store->next_segment_no = start_lsn / segment_size;
 	return 0;
@@ -251,6 +430,25 @@ wal_payload_hash(uint32_t hash, const void *data, size_t len)
 		hash *= 16777619u;
 	}
 	return hash;
+}
+
+/* Test-only gate used to prove that reclaim waits for a read which already
+ * owns the WAL mutex.  Production callers never set these environment vars. */
+static void
+test_read_barrier_gate(void)
+{
+	const char *gate = getenv("PAGESTORE_TEST_WAL_READ_GATE");
+	const char *release = getenv("PAGESTORE_TEST_WAL_READ_RELEASE");
+	int fd;
+
+	if (gate == NULL || release == NULL)
+		return;
+	fd = open(gate, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return;
+	(void) close(fd);
+	while (access(release, F_OK) != 0)
+		usleep(1000);
 }
 
 static int
@@ -483,15 +681,33 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	if (mkdir(directory, 0700) == 0)
 		created = 1;
 	else if (errno != EEXIST)
+	{
+		ps_wal_store_close(store);
 		return -1;
+	}
+	if (!created)
+	{
+		/* An EEXIST retry must validate the existing identity and directory
+		 * before accepting it.  This is also the safe path for a legacy v1
+		 * directory whose first create attempt was interrupted. */
+		ps_wal_store_close(store);
+		return ps_wal_store_open(store, directory, timeline, start_lsn,
+								 segment_size);
+	}
 	store->directory_fd = open(directory,
 							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
+	{
+		ps_wal_store_close(store);
 		return -1;
-	if (publish_store_identity(store) != 0)
+	}
+	if (publish_store_metadata(store, store->start_lsn,
+							   store->start_lsn, store->end_lsn) != 0)
 	{
 		close(store->directory_fd);
 		store->directory_fd = -1;
+		pthread_mutex_destroy(&store->lock);
+		store->lock_initialized = 0;
 		return -1;
 	}
 	/* Always sync the parent, including EEXIST retries.  A prior attempt may
@@ -500,6 +716,8 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 	{
 		close(store->directory_fd);
 		store->directory_fd = -1;
+		pthread_mutex_destroy(&store->lock);
+		store->lock_initialized = 0;
 		return -1;
 	}
 	{
@@ -508,15 +726,19 @@ ps_wal_store_create(PsWalStore *store, const char *directory,
 		if (parent_fd < 0 || fsync(parent_fd) != 0)
 		{
 			if (parent_fd >= 0)
-				close(parent_fd);
+			close(parent_fd);
 			close(store->directory_fd);
 			store->directory_fd = -1;
+			pthread_mutex_destroy(&store->lock);
+			store->lock_initialized = 0;
 			return -1;
 		}
 		if (close(parent_fd) != 0)
 		{
 			close(store->directory_fd);
 			store->directory_fd = -1;
+			pthread_mutex_destroy(&store->lock);
+			store->lock_initialized = 0;
 			return -1;
 		}
 	}
@@ -538,6 +760,8 @@ load_segment(PsWalStore *store, uint64_t segment_no)
 	int fd = -1;
 	int rc = -1;
 
+	if (segment_no > UINT64_MAX / store->segment_size)
+		return -1;
 	if (segment_name(store, segment_no, name, sizeof(name)) != 0 ||
 		(fd = openat(store->directory_fd, name,
 					 O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) < 0 ||
@@ -587,6 +811,317 @@ cleanup:
 	return rc;
 }
 
+/* Validate an already-authorized prefix segment without adding it to the
+ * logical catalog.  The next reclaimer may unlink these files after the
+ * frontier metadata is durable, so reopen must tolerate their presence while
+ * still refusing an incorrectly named or corrupted prefix.
+ *
+ * Suffix reconciliation below has the same protocol boundary: this directory
+ * is private to one timeline/incarnation cleanup writer, and only
+ * publish_segment creates a legal final segment.  A contiguous suffix with
+ * valid headers and CRCs is therefore the only evidence accepted for a
+ * pre-metadata publication crash; gaps, unexpected names, and corruption
+ * remain fail-closed. */
+static int
+validate_prefix_segment(PsWalStore *store, uint64_t segment_no)
+{
+	unsigned char encoded[PS_WAL_SEGMENT_HEADER_BYTES];
+	unsigned char buf[PS_WAL_STORE_VERIFY_CHUNK_BYTES];
+	PsWalSegmentHeader header;
+	struct stat st;
+	char name[128];
+	uint32_t done = 0;
+	uint32_t payload_crc = 2166136261u;
+	int fd = -1;
+	int rc = -1;
+
+	if (segment_name(store, segment_no, name, sizeof(name)) != 0 ||
+		(fd = openat(store->directory_fd, name,
+					 O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)) < 0 ||
+		fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+		read_all_at(fd, encoded, sizeof(encoded), 0) != 0 ||
+		ps_wal_segment_decode(&header, encoded, sizeof(encoded)) != 0 ||
+		header.timeline != store->timeline ||
+		header.segment_no != segment_no ||
+		header.start_lsn != segment_no * store->segment_size ||
+		header.segment_size != store->segment_size ||
+		header.payload_len != store->segment_size ||
+		st.st_size != (off_t) (PS_WAL_SEGMENT_HEADER_BYTES +
+											 header.payload_len))
+		goto cleanup;
+	while (done < header.payload_len)
+	{
+		uint32_t amount = header.payload_len - done < sizeof(buf) ?
+			header.payload_len - done : (uint32_t) sizeof(buf);
+
+		if (read_all_at(fd, buf, amount,
+				PS_WAL_SEGMENT_HEADER_BYTES + (off_t) done) != 0)
+			goto cleanup;
+		payload_crc = wal_payload_hash(payload_crc, buf, amount);
+		done += amount;
+	}
+	if (payload_crc != header.payload_crc)
+		goto cleanup;
+	rc = 0;
+
+cleanup:
+	if (fd >= 0)
+		close(fd);
+	return rc;
+}
+
+static void
+install_retained_frontier(PsWalStore *store, uint64_t retained_base_lsn)
+{
+	uint64_t drop64;
+	uint32_t drop;
+
+	if (retained_base_lsn == store->start_lsn)
+	{
+		store->retained_base_lsn = retained_base_lsn;
+		return;
+	}
+	drop64 = (retained_base_lsn - store->start_lsn) / store->segment_size;
+	drop = drop64 > store->nentries ? store->nentries : (uint32_t) drop64;
+	for (uint32_t i = 0; i < drop; i++)
+		free(store->entries[i].chunk_hashes);
+	if (drop < store->nentries)
+		memmove(store->entries, store->entries + drop,
+				(size_t) (store->nentries - drop) * sizeof(*store->entries));
+	store->nentries -= drop;
+	store->start_lsn = retained_base_lsn;
+	store->retained_base_lsn = retained_base_lsn;
+}
+
+/* Remove one prefix entry after unlinkat() has confirmed that the physical
+ * name is gone.  Keeping this update adjacent to the unlink is important:
+ * after a partial reclaim the in-memory catalog describes exactly the files
+ * which can still be opened, while the durable frontier already protects new
+ * readers from the removed prefix. */
+static void
+forget_reclaimed_entry(PsWalStore *store)
+{
+	if (store->nentries == 0)
+		return;
+	free(store->entries[0].chunk_hashes);
+	if (store->nentries > 1)
+		memmove(store->entries, store->entries + 1,
+				(size_t) (store->nentries - 1) * sizeof(*store->entries));
+	store->nentries--;
+	store->start_lsn += store->segment_size;
+}
+
+static int
+unlink_reclaim_segment(PsWalStore *store, uint64_t segment_no)
+{
+	char name[128];
+	const char *fail_segment =
+		getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_UNLINK_SEGMENT_NO");
+	char *end = NULL;
+	unsigned long long requested;
+
+	if (fail_segment != NULL)
+	{
+		errno = 0;
+		requested = strtoull(fail_segment, &end, 10);
+		if (errno == 0 && end != fail_segment && *end == '\0' &&
+			(uint64_t) requested == segment_no)
+			return -1;
+	}
+	if (segment_name(store, segment_no, name, sizeof(name)) != 0)
+		return -1;
+	if (unlinkat(store->directory_fd, name, 0) == 0 || errno == ENOENT)
+		return 0;
+	return -1;
+}
+
+static int
+compare_segment_numbers(const void *left, const void *right)
+{
+	uint64_t a = *(const uint64_t *) left;
+	uint64_t b = *(const uint64_t *) right;
+
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static int
+reclaim_test_segment_matches(const char *variable, uint64_t segment_no)
+{
+	const char *value = getenv(variable);
+	char *end = NULL;
+	unsigned long long requested;
+
+	if (value == NULL)
+		return 0;
+	errno = 0;
+	requested = strtoull(value, &end, 10);
+	return errno == 0 && end != value && *end == '\0' &&
+		(uint64_t) requested == segment_no;
+}
+
+/* A process can stop after publishing the physical frontier and before any
+ * unlink.  On reopen those old, already-authorized files are intentionally not
+ * loaded into the logical catalog, so a retry must discover them separately. */
+static int
+unlink_residual_prefix(PsWalStore *store, uint64_t target_lsn,
+					   uint64_t *unlink_count)
+{
+	char prefix[64];
+	int prefix_len;
+	int scan_fd;
+	DIR *dir;
+	struct dirent *de;
+	uint64_t target_segment;
+	uint64_t *candidates = NULL;
+	size_t candidate_count = 0;
+	size_t candidate_capacity = 0;
+	int rc = -1;
+
+	prefix_len = snprintf(prefix, sizeof(prefix), "walv1_%u_", store->timeline);
+	if (prefix_len < 0 || (size_t) prefix_len >= sizeof(prefix) ||
+		target_lsn % store->segment_size != 0)
+		return -1;
+	target_segment = target_lsn / store->segment_size;
+	/* Do not dup directory_fd: directory stream offsets are shared across dup'd
+	 * descriptors, and open() must start an independent scan for restart retry. */
+	scan_fd = openat(store->directory_fd, ".",
+					O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (scan_fd < 0)
+		return -1;
+	dir = fdopendir(scan_fd);
+	if (dir == NULL)
+	{
+		close(scan_fd);
+		return -1;
+	}
+	for (;;)
+	{
+		char expected[128];
+		char *end = NULL;
+		unsigned long long parsed;
+
+		errno = 0;
+		de = readdir(dir);
+		if (de == NULL)
+		{
+			if (errno != 0)
+				goto cleanup;
+			break;
+		}
+
+		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
+			continue;
+		/* Inject an error before EOF so the test proves that no candidate is
+		 * deleted until the complete directory scan has succeeded. */
+		if (reclaim_test_segment_matches(
+				"PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES",
+				candidate_count))
+		{
+			errno = EIO;
+			goto cleanup;
+		}
+		errno = 0;
+		parsed = strtoull(de->d_name + prefix_len, &end, 10);
+		if (errno == ERANGE || end == de->d_name + prefix_len ||
+			segment_name(store, (uint64_t) parsed, expected,
+						 sizeof(expected)) != 0 || *end != '\0' ||
+			strcmp(expected, de->d_name) != 0)
+			goto cleanup;
+		if ((uint64_t) parsed < target_segment)
+		{
+			if (candidate_count == candidate_capacity)
+			{
+				size_t grown_capacity = candidate_capacity == 0 ? 8 :
+					candidate_capacity * 2;
+
+				if (grown_capacity < candidate_capacity ||
+					grown_capacity > SIZE_MAX / sizeof(*candidates))
+					goto cleanup;
+				{
+					uint64_t *grown = realloc(candidates,
+										 grown_capacity * sizeof(*candidates));
+
+					if (grown == NULL)
+						goto cleanup;
+					candidates = grown;
+				}
+				candidate_capacity = grown_capacity;
+			}
+			candidates[candidate_count++] = (uint64_t) parsed;
+			if (reclaim_test_segment_matches(
+					"PAGESTORE_TEST_WAL_RECLAIM_SCAN_ERROR_AFTER_CANDIDATES",
+					candidate_count))
+			{
+				errno = EIO;
+				goto cleanup;
+			}
+		}
+	}
+	if (closedir(dir) != 0)
+	{
+		dir = NULL;
+		goto cleanup;
+	}
+	dir = NULL;
+	if (candidate_count > 0)
+	{
+		qsort(candidates, candidate_count, sizeof(*candidates),
+			  compare_segment_numbers);
+		/* A residual prefix may have lost lower files already, but every
+		 * candidate must be the contiguous suffix ending immediately below the
+		 * durable frontier.  Validate the complete set before deleting any file. */
+		if (candidates[candidate_count - 1] + 1 != target_segment)
+			goto cleanup;
+		for (size_t i = 1; i < candidate_count; i++)
+			if (candidates[i] != candidates[i - 1] + 1)
+				goto cleanup;
+		for (size_t i = 0; i < candidate_count; i++)
+		{
+			if (validate_prefix_segment(store, candidates[i]) != 0)
+				goto cleanup;
+			if (unlink_reclaim_segment(store, candidates[i]) != 0)
+				goto cleanup;
+			(*unlink_count)++;
+		}
+	}
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	free(candidates);
+	return rc;
+}
+
+/* Resolve an error after metadata rename.  If the new record is visible, the
+ * caller must adopt it rather than restore the old in-memory frontier.  If no
+ * coherent old or new record can be observed, fence all operations until
+ * reopen makes the durable state authoritative. */
+static int
+reconcile_metadata_failure(PsWalStore *store, uint64_t old_start_lsn,
+							uint64_t old_base_lsn, uint64_t old_end_lsn,
+							uint64_t new_start_lsn, uint64_t new_base_lsn,
+							uint64_t new_end_lsn)
+{
+	PsWalStoreMetadata metadata;
+
+	if (store->metadata_fenced)
+		return -1;
+	if (read_store_metadata_fd(store->directory_fd, &metadata) == 0 &&
+		metadata_matches(&metadata, store->timeline, new_start_lsn,
+											 new_base_lsn, new_end_lsn, store->segment_size) == 0)
+	{
+		install_retained_frontier(store, new_base_lsn);
+		return 1;
+	}
+	if (read_store_metadata_fd(store->directory_fd, &metadata) == 0 &&
+		metadata_matches(&metadata, store->timeline, old_start_lsn,
+											 old_base_lsn, old_end_lsn, store->segment_size) == 0)
+		return 0;
+	store->metadata_fenced = 1;
+	return -1;
+}
+
 int
 ps_wal_store_open(PsWalStore *store, const char *directory,
 				  uint32_t timeline, uint64_t start_lsn,
@@ -595,11 +1130,15 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	struct dirent *de;
 	DIR *dir = NULL;
 	uint64_t count = 0;
+	uint64_t prefix_first = UINT64_MAX;
+	uint64_t prefix_count = 0;
 	char prefix[64];
 	int prefix_len;
 	int parent_fd = -1;
 	int scan_fd = -1;
 	int identity_missing = 0;
+	int identity_legacy = 0;
+	PsWalStoreMetadata metadata;
 	int removed_temporary = 0;
 	int rc = -1;
 
@@ -609,19 +1148,50 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	store->directory_fd = open(directory,
 							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (store->directory_fd < 0)
+	{
+		ps_wal_store_close(store);
 		return -1;
+	}
 	/* Explicit-start open remains the safe migration path for legacy stores
-	 * that predate the identity file.  Once an identity exists it is immutable
-	 * and must match exactly. */
-	if (store_identity_matches(store->directory_fd, timeline, start_lsn,
-							   segment_size) != 0)
+	 * that predate the identity file.  Once a v2 identity exists its complete
+	 * tuple is authoritative and must match exactly. */
 	{
 		struct stat identity_st;
 
 		if (fstatat(store->directory_fd, PS_WAL_STORE_IDENTITY_FILE,
-					&identity_st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+					&identity_st, AT_SYMLINK_NOFOLLOW) == 0)
+		{
+			if (!S_ISREG(identity_st.st_mode))
+				goto cleanup;
+			if (identity_st.st_size == (off_t) PS_WAL_STORE_METADATA_BYTES)
+			{
+				if (read_store_metadata_fd(store->directory_fd, &metadata) != 0 ||
+					metadata_matches(&metadata, timeline, start_lsn,
+									 metadata.retained_base_lsn, metadata.end_lsn,
+									 segment_size) != 0)
+					goto cleanup;
+				store->retained_base_lsn = metadata.retained_base_lsn;
+			}
+			else
+			{
+				uint32_t identity_timeline;
+				uint32_t identity_segment_size;
+				uint64_t identity_start;
+
+				if (read_store_identity_v1_fd(store->directory_fd,
+										  &identity_timeline, &identity_start,
+										  &identity_segment_size) != 0 ||
+					identity_timeline != timeline ||
+					identity_start != start_lsn ||
+					identity_segment_size != segment_size)
+					goto cleanup;
+				identity_legacy = 1;
+			}
+		}
+		else if (errno == ENOENT)
+			identity_missing = 1;
+		else
 			goto cleanup;
-		identity_missing = 1;
 	}
 	/* An earlier create may have exposed the directory and then reported an
 	 * ambiguous parent-fsync failure.  Reopen completes that durability step
@@ -659,19 +1229,50 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 		char *end = NULL;
 		unsigned long long parsed;
 		const char *suffix;
+		size_t identity_len = strlen(PS_WAL_STORE_IDENTITY_FILE);
+
+		if (strncmp(de->d_name, PS_WAL_STORE_IDENTITY_FILE,
+					identity_len) == 0 &&
+			strcmp(de->d_name, PS_WAL_STORE_IDENTITY_FILE) != 0)
+		{
+			suffix = de->d_name + identity_len;
+			if (strncmp(suffix, ".tmp.", 5) != 0 || strlen(suffix + 5) != 6)
+				goto cleanup;
+			for (size_t i = 0; i < 6; i++)
+				if (!((suffix[5 + i] >= '0' && suffix[5 + i] <= '9') ||
+					  (suffix[5 + i] >= 'A' && suffix[5 + i] <= 'Z') ||
+					  (suffix[5 + i] >= 'a' && suffix[5 + i] <= 'z')))
+					goto cleanup;
+			if (unlinkat(store->directory_fd, de->d_name, 0) != 0)
+				goto cleanup;
+			removed_temporary = 1;
+			continue;
+		}
 
 		if (strncmp(de->d_name, prefix, (size_t) prefix_len) != 0)
 			continue;
+		errno = 0;
 		parsed = strtoull(de->d_name + prefix_len, &end, 10);
-		if (end == de->d_name + prefix_len ||
+		if (errno == ERANGE || end == de->d_name + prefix_len ||
 			segment_name(store, (uint64_t) parsed, expected,
 						 sizeof(expected)) != 0)
 			goto cleanup;
 		if (*end == '\0' && strcmp(expected, de->d_name) == 0)
 		{
 			if ((uint64_t) parsed < store->next_segment_no)
-				goto cleanup;
-			count++;
+			{
+				if ((uint64_t) parsed < prefix_first)
+					prefix_first = (uint64_t) parsed;
+				if (prefix_count == UINT64_MAX)
+					goto cleanup;
+				prefix_count++;
+			}
+			else
+			{
+				if (count == UINT64_MAX)
+					goto cleanup;
+				count++;
+			}
 			continue;
 		}
 		/* A crash before publication may leave only the private staging link.
@@ -698,17 +1299,57 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 	dir = NULL;
 	if (removed_temporary && fsync(store->directory_fd) != 0)
 		goto cleanup;
+	if (prefix_first != UINT64_MAX)
+	{
+		if (prefix_first >= store->next_segment_no ||
+			store->next_segment_no - prefix_first != prefix_count)
+			goto cleanup;
+		for (uint64_t segment_no = prefix_first;
+				segment_no < store->next_segment_no; segment_no++)
+			if (validate_prefix_segment(store, segment_no) != 0)
+				goto cleanup;
+		/* The metadata frontier is already durable, so these files are no
+		 * longer part of the logical catalog.  Keep a retry marker until the
+		 * complete residual prefix has been unlinked and the directory synced. */
+		store->residual_prefix_pending = 1;
+		store->residual_prefix_target_lsn = store->start_lsn;
+	}
 	for (uint64_t i = 0; i < count; i++)
 		if (load_segment(store, store->next_segment_no) != 0)
 			goto cleanup;
+	if (!identity_missing && !identity_legacy)
+	{
+		if (metadata.end_lsn > store->end_lsn ||
+			metadata.retained_base_lsn > store->end_lsn)
+			goto cleanup;
+		if (metadata.end_lsn < store->end_lsn)
+		{
+			/* In the private single-writer directory protocol, a complete
+			 * validated contiguous suffix can only be a segment durable before
+			 * its end frontier publication.  Adopt it and atomically repair end. */
+			if (publish_store_metadata(store, store->start_lsn,
+								   metadata.retained_base_lsn,
+								   store->end_lsn) != 0)
+				goto cleanup;
+			metadata.end_lsn = store->end_lsn;
+		}
+		if (metadata_matches(&metadata, timeline, store->start_lsn,
+						  store->retained_base_lsn, store->end_lsn,
+						  segment_size) != 0)
+			goto cleanup;
+	}
 	/* A legacy store can be opened only with an externally proven start LSN.
-	 * Publish that identity after validating every immutable segment, before a
-	 * later flat-prefix reclaim removes the final duplicate source of truth. */
-	if (identity_missing && publish_store_identity(store) != 0)
-		goto cleanup;
+	 * Publish v2 after validating every immutable segment, before a later
+	 * flat-prefix reclaim removes the final duplicate source of truth. */
+	if (identity_missing || identity_legacy)
+	{
+		if (publish_store_metadata(store, store->start_lsn,
+							   store->start_lsn, store->end_lsn) != 0)
+			goto cleanup;
+	}
 	rc = 0;
 
-cleanup:
+	cleanup:
 	if (dir != NULL)
 		closedir(dir);
 	if (scan_fd >= 0)
@@ -724,18 +1365,37 @@ int
 ps_wal_store_open_existing(PsWalStore *store, const char *directory,
 						   uint32_t timeline, uint32_t segment_size)
 {
+	PsWalStoreMetadata metadata;
 	uint32_t identity_timeline;
 	uint32_t identity_segment_size;
 	uint64_t identity_start;
+	struct stat identity_st;
 	int directory_fd;
 	int rc;
 
+	memset(&metadata, 0, sizeof(metadata));
 	directory_fd = open(directory,
 						O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (directory_fd < 0)
 		return -1;
-	rc = read_store_identity_fd(directory_fd, &identity_timeline,
+	if (fstatat(directory_fd, PS_WAL_STORE_IDENTITY_FILE, &identity_st,
+				AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(identity_st.st_mode))
+	{
+		close(directory_fd);
+		return -1;
+	}
+	if (identity_st.st_size == (off_t) PS_WAL_STORE_METADATA_BYTES)
+	{
+		rc = read_store_metadata_fd(directory_fd, &metadata);
+		identity_timeline = metadata.timeline;
+		identity_segment_size = metadata.segment_size;
+		identity_start = metadata.directory_start_lsn;
+	}
+	else
+	{
+		rc = read_store_identity_v1_fd(directory_fd, &identity_timeline,
 								&identity_start, &identity_segment_size);
+	}
 	if (close(directory_fd) != 0)
 		rc = -1;
 	if (rc != 0 || identity_timeline != timeline ||
@@ -784,14 +1444,20 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 {
 	const unsigned char *bytes = data;
 	uint32_t done = 0;
+	int rc = -1;
 
-	if (store == NULL || store->directory_fd < 0 || data == NULL || len == 0 ||
+	if (store == NULL || data == NULL || len == 0 ||
+		start_lsn + len < start_lsn)
+		return -1;
+	if (!store->lock_initialized || pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced ||
+		store->residual_prefix_pending ||
 		start_lsn % store->segment_size != 0 ||
 		len % store->segment_size != 0 ||
 		start_lsn < store->start_lsn ||
-		start_lsn > store->end_lsn || start_lsn + len < start_lsn ||
-		start_lsn + len < store->end_lsn)
-		return -1;
+		start_lsn > store->end_lsn || start_lsn + len < store->end_lsn)
+		goto done_append;
 	/* A prior split append may have durably published a prefix before a later
 	 * segment failed.  Accept an identical retry and resume at end_lsn; reject
 	 * divergent bytes so immutable WAL identity remains fail closed. */
@@ -800,7 +1466,7 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 		uint32_t prefix = (uint32_t) (store->end_lsn - start_lsn);
 
 		if (validate_committed_prefix(store, start_lsn, bytes, prefix) != 0)
-			return -1;
+			goto done_append;
 		done = prefix;
 	}
 	while (done < len)
@@ -813,27 +1479,54 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 
 		if (segment_start % store->segment_size != 0 ||
 			segment_start / store->segment_size != store->next_segment_no)
-			return -1;
+			goto done_append;
 		{
 			const char *fail_segment = getenv("PAGESTORE_TEST_FAIL_WAL_SEGMENT_NO");
 
 			if (fail_segment != NULL &&
 				strtoull(fail_segment, NULL, 10) == store->next_segment_no)
-				return -1;
+				goto done_append;
 		}
-		if (reserve_entry(store) != 0 ||
-			build_chunk_hashes_and_payload_crc(bytes + done, chunk,
-															 &chunk_hashes, &nchunks,
-															 &header.payload_crc) != 0 ||
-			ps_wal_segment_seal_with_crc(&header, store->timeline,
-								 store->next_segment_no, start_lsn + done,
-								 store->segment_size, bytes + done, chunk,
-								 header.payload_crc) != 0)
-			return -1;
+		if (reserve_entry(store) != 0)
+			goto done_append;
+		if (build_chunk_hashes_and_payload_crc(bytes + done, chunk,
+														 &chunk_hashes, &nchunks,
+														 &header.payload_crc) != 0)
+		{
+			free(chunk_hashes);
+			goto done_append;
+		}
+		if (ps_wal_segment_seal_with_crc(&header, store->timeline,
+											 store->next_segment_no, start_lsn + done,
+											 store->segment_size, bytes + done, chunk,
+											 header.payload_crc) != 0)
+		{
+			free(chunk_hashes);
+			goto done_append;
+		}
 		if (publish_segment(store, &header, bytes + done) != 0)
 		{
 			free(chunk_hashes);
-			return -1;
+			goto done_append;
+		}
+		/* Publish the directory contents first, then atomically publish its
+		 * matching end frontier.  A crash between these points is fail-closed
+		 * on reopen because metadata end must equal the validated directory end. */
+		if (publish_store_metadata(store, store->start_lsn,
+								 store->retained_base_lsn,
+								 store->end_lsn + chunk) != 0)
+		{
+			uint64_t old_end_lsn = store->end_lsn;
+
+			(void) reconcile_metadata_failure(store,
+													  store->start_lsn,
+												  store->retained_base_lsn,
+												  old_end_lsn,
+												  store->start_lsn,
+												  store->retained_base_lsn,
+													  old_end_lsn + chunk);
+			free(chunk_hashes);
+			goto done_append;
 		}
 		store->entries[store->nentries].header = header;
 		store->entries[store->nentries].chunk_hashes = chunk_hashes;
@@ -843,7 +1536,11 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 		store->end_lsn += chunk;
 		done += chunk;
 	}
-	return 0;
+	rc = 0;
+
+done_append:
+	pthread_mutex_unlock(&store->lock);
+	return rc;
 }
 
 static int
@@ -939,8 +1636,15 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 	if (store == NULL || data == NULL || start_lsn + len < start_lsn)
 		return -1;
 	end_lsn = start_lsn + len;
-	if (start_lsn < store->start_lsn || end_lsn > store->end_lsn)
+	if (!store->lock_initialized || pthread_mutex_lock(&store->lock) != 0)
 		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced ||
+		start_lsn < store->retained_base_lsn || end_lsn > store->end_lsn)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	test_read_barrier_gate();
 	for (uint32_t i = (uint32_t) ((start_lsn - store->start_lsn) /
 			 store->segment_size); i < store->nentries && done < len; i++)
 	{
@@ -958,11 +1662,192 @@ ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 			if (read_validated_segment_range(store, entry,
 					overlap_start - header->start_lsn,
 					out + (overlap_start - start_lsn), NULL, amount) != 0)
+			{
+				pthread_mutex_unlock(&store->lock);
 				return -1;
+			}
 			done += (uint32_t) amount;
 		}
 	}
+	pthread_mutex_unlock(&store->lock);
 	return done == len ? 0 : -1;
+}
+
+int
+ps_wal_store_retained_base(PsWalStore *store, uint64_t *out)
+{
+	if (store == NULL || out == NULL || !store->lock_initialized)
+		return -1;
+	if (pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	*out = store->retained_base_lsn;
+	pthread_mutex_unlock(&store->lock);
+	return 0;
+}
+
+int
+ps_wal_store_residual_prefix_pending(PsWalStore *store, uint64_t *target_lsn_out)
+{
+	if (store == NULL || target_lsn_out == NULL || !store->lock_initialized)
+		return -1;
+	if (pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	*target_lsn_out = store->residual_prefix_target_lsn;
+	{
+		int pending = store->residual_prefix_pending;
+
+		pthread_mutex_unlock(&store->lock);
+		return pending;
+	}
+}
+
+int
+ps_wal_store_advance_retained_base(PsWalStore *store,
+								   uint64_t retained_base_lsn)
+{
+	int rc = -1;
+
+	if (store == NULL || !store->lock_initialized ||
+		pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced ||
+		store->residual_prefix_pending ||
+		retained_base_lsn < store->retained_base_lsn ||
+		retained_base_lsn > store->end_lsn ||
+		retained_base_lsn % store->segment_size != 0)
+		goto done_advance;
+	if (retained_base_lsn == store->retained_base_lsn)
+	{
+		rc = 0;
+		goto done_advance;
+	}
+	{
+		uint64_t old_start_lsn = store->start_lsn;
+		uint64_t old_base_lsn = store->retained_base_lsn;
+		uint64_t end_lsn = store->end_lsn;
+
+		if (publish_store_metadata(store, store->start_lsn,
+								   retained_base_lsn, end_lsn) != 0)
+		{
+			reconcile_metadata_failure(store, old_start_lsn, old_base_lsn, end_lsn,
+									 retained_base_lsn, retained_base_lsn, end_lsn);
+			goto done_advance;
+		}
+		/* This low-level API deliberately leaves the physical catalog and
+		 * directory start unchanged.  Only reclaim_prefix may authorize unlink. */
+		store->retained_base_lsn = retained_base_lsn;
+	}
+	rc = 0;
+
+done_advance:
+	pthread_mutex_unlock(&store->lock);
+	return rc;
+}
+
+int
+ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
+{
+	uint64_t segment_no;
+	uint64_t unlink_count = 0;
+	int rc = -1;
+
+	if (store == NULL || !store->lock_initialized ||
+		pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced ||
+		target_lsn < store->retained_base_lsn ||
+		target_lsn > store->end_lsn ||
+		target_lsn % store->segment_size != 0 ||
+		store->start_lsn > target_lsn)
+		goto done_reclaim;
+
+	/* A low-level advance may already have published the logical base.  The
+	 * physical frontier must still be atomically published by this API before
+	 * any unlink, including a retry after a partial earlier reclaim. */
+	if (store->start_lsn != target_lsn)
+	{
+		if (publish_store_metadata(store, target_lsn, target_lsn,
+								   store->end_lsn) != 0)
+			goto done_reclaim;
+	}
+	store->retained_base_lsn = target_lsn;
+	/* A newly published physical frontier, or a marker reconstructed by reopen,
+	 * requires a directory-sync-complete unlink retry.  A plain idempotent call
+	 * after a completed reclaim must not manufacture pending work. */
+	if (store->start_lsn != target_lsn || store->residual_prefix_pending)
+	{
+		store->residual_prefix_pending = 1;
+		store->residual_prefix_target_lsn = target_lsn;
+	}
+
+	/* This hook models a stop/crash after the durable frontier publication and
+	 * before the first unlink.  The next process can retry idempotently. */
+	if (getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK") != NULL)
+		_exit(91);
+	if (getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK") != NULL)
+		goto done_reclaim;
+
+	segment_no = store->start_lsn / store->segment_size;
+	while (store->start_lsn < target_lsn)
+	{
+		if (store->nentries == 0 ||
+			store->entries[0].header.segment_no != segment_no ||
+			store->entries[0].header.start_lsn != store->start_lsn)
+			goto done_reclaim;
+		/* The catalog was loaded before this operation and the file may have
+		 * changed since then.  Validate the complete immutable segment before
+		 * authorizing its unlink; a failure leaves this and every higher segment
+		 * in place while the already-published frontier makes restart fail closed
+		 * until the file is repaired. */
+		if (validate_prefix_segment(store, segment_no) != 0)
+			goto done_reclaim;
+		if (unlink_reclaim_segment(store, segment_no) != 0)
+			goto done_reclaim;
+		forget_reclaimed_entry(store);
+		unlink_count++;
+		if (reclaim_test_segment_matches(
+				"PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
+				segment_no))
+			_exit(92);
+		segment_no++;
+	}
+	if (store->start_lsn != target_lsn)
+		goto done_reclaim;
+	if (unlink_residual_prefix(store, target_lsn, &unlink_count) != 0)
+		goto done_reclaim;
+	if (store->residual_prefix_pending &&
+		(getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL ||
+		 getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC") != NULL ||
+		 fsync(store->directory_fd) != 0))
+	{
+		if (getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL)
+			_exit(93);
+		/* The frontier is durable, but directory entry durability is ambiguous;
+		 * fence this instance and never continue deleting from it.  Reopen uses
+		 * the published frontier and safely tolerates any residual prefix. */
+		store->metadata_fenced = 1;
+		goto done_reclaim;
+	}
+	if (store->residual_prefix_pending)
+	{
+		store->residual_prefix_pending = 0;
+		store->residual_prefix_target_lsn = 0;
+	}
+	rc = 0;
+
+done_reclaim:
+	pthread_mutex_unlock(&store->lock);
+	return rc;
 }
 
 void
@@ -970,11 +1855,18 @@ ps_wal_store_close(PsWalStore *store)
 {
 	if (store == NULL)
 		return;
+	if (store->lock_initialized)
+		(void) pthread_mutex_lock(&store->lock);
 	if (store->directory_fd >= 0)
 		close(store->directory_fd);
 	for (uint32_t i = 0; i < store->nentries; i++)
 		free(store->entries[i].chunk_hashes);
 	free(store->entries);
+	if (store->lock_initialized)
+	{
+		(void) pthread_mutex_unlock(&store->lock);
+		(void) pthread_mutex_destroy(&store->lock);
+	}
 	memset(store, 0, sizeof(*store));
 	store->directory_fd = -1;
 }

@@ -161,6 +161,7 @@ $P -c "CREATE FUNCTION pagestore_retention_set(int,int,bigint,bigint,int,pg_lsn)
         AS 'pagestore','pagestore_retention_drop_with_incarnation' LANGUAGE C STRICT;
        CREATE FUNCTION pagestore_retention_owner_lsn(int,int,bigint,bigint) RETURNS pg_lsn
         AS 'pagestore','pagestore_retention_owner_lsn' LANGUAGE C STRICT;" >/dev/null
+retentionStart=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,0,'0/1');")" "1" \
 	"retention SET reports daemon rejection of an invalid resource mask"
 if $P -v ON_ERROR_STOP=1 -c \
@@ -177,15 +178,15 @@ if $P -v ON_ERROR_STOP=1 -c \
 else
 	echo "ok   - retention SET rejects reserved generation zero"
 fi
-assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,6,7,'0/1');")" "0" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,6,7,'$retentionStart');")" "0" \
 	"retention SET preserves a high-bit uint64 owner ID"
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,-9223372036854775808,6);")" "0" \
 	"retention DROP preserves a high-bit uint64 owner ID"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,7,7,'0/1');")" "0" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,-9223372036854775808,7,7,'$retentionStart');")" "0" \
 	"localsvc advances the high-bit owner for explicit-incarnation cleanup"
 assert "$($P -c "SELECT pagestore_retention_drop_with_incarnation(0,1,-9223372036854775808,7,1);")" "0" \
 	"explicit-incarnation DROP preserves a high-bit uint64 owner ID"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9002,1,7,'0/1');")" "0" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9002,1,7,'$retentionStart');")" "0" \
 	"localsvc registers an owner for explicit-incarnation cleanup"
 assert "$($P -c "SELECT pagestore_retention_drop_with_incarnation(0,1,9002,1,2);")" "1" \
 	"explicit retention DROP rejects a stale incarnation"
@@ -198,9 +199,9 @@ if $P -v ON_ERROR_STOP=1 -c \
 else
 	echo "ok   - explicit retention DROP rejects incarnation zero"
 fi
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/1');")" "0" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'$retentionStart');")" "0" \
 	"localsvc registers a durable retention owner generation"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'0/2');")" "2" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'$retentionStart');")" "2" \
 	"localsvc reports a stale retention SET distinctly"
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,4);")" "2" \
 	"localsvc reports a stale retention DROP distinctly"
@@ -508,15 +509,15 @@ wait_daemon_ready
 "$BIN/pg_ctl" -D "$DATA" -l "$DATA/server.log" -w start >/dev/null 2>&1
 crash_ck2=$($P -c "SELECT md5(string_agg(v,',' ORDER BY id)) FROM crash;")
 assert "$crash_ck2" "$crash_ck" "un-flushed rows survive a daemon crash+restart (segment-log recovery)"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'0/2');")" "2" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,4,7,'$retentionStart');")" "2" \
 	"retention fencing survives daemon restart and backend reconnect"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/2');")" "0" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'$retentionStart');")" "0" \
 	"the current owner generation can update after reconnect"
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,5);")" "0" \
 	"the current owner generation can release after reconnect"
 assert "$($P -c "SELECT pagestore_retention_drop(0,1,9001,5);")" "0" \
 	"retention DROP retry is idempotent"
-assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'0/3');")" "2" \
+assert "$($P -c "SELECT pagestore_retention_set(0,1,9001,5,7,'$retentionStart');")" "2" \
 	"a released generation cannot resurrect through localsvc"
 
 # --- 16. SLRU snapshot shipping (M4 step 1): ship clog to the store, keyed by C ----
@@ -1518,7 +1519,8 @@ rm -f "$READER_SUBXID_SQL"
 # compaction is allowed to discard the SLRU/page base that prepare_reader will
 # consume after the checkpoint.  The fixed reader later takes over this exact
 # owner key and generation.
-assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'0/1');")" "0" \
+readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
+assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
 	"controller pins page history before creating reader checkpoint R"
 $P -c "CHECKPOINT;" >/dev/null
 read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerOldestMulti readerCtsOldest readerCtsNext <<< "$($P -c "
