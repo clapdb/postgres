@@ -96,6 +96,7 @@ typedef void (*PsLifecycleReadQueuedTestHook)(void *arg);
  * waits for active readers.  The callback must not take lifecycle locks. */
 typedef void (*PsLifecycleWriteQueuedTestHook)(void *arg);
 typedef void (*PsWalReclaimAttemptTestHook)(uint32_t timeline, void *arg);
+typedef void (*PsWalReclaimBeforeFloorTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReadBeforeLockTestHook)(uint32_t timeline, void *arg);
 /* Test-only replacement for the exact blocking admission-wr call.  The
  * production path invokes pthread_rwlock_wrlock directly; when installed,
@@ -122,6 +123,8 @@ extern void ps_test_set_lifecycle_write_lock_hook(
 	PsLifecycleWriteLockTestHook hook, void *arg);
 extern void ps_test_set_wal_reclaim_attempt_hook(
 	PsWalReclaimAttemptTestHook hook, void *arg);
+extern void ps_test_set_wal_reclaim_before_floor_hook(
+	PsWalReclaimBeforeFloorTestHook hook, void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);

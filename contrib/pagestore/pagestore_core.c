@@ -206,6 +206,8 @@ static PsLifecycleWriteLockTestHook lifecycle_write_lock_test_hook;
 static void *lifecycle_write_lock_test_hook_arg;
 static PsWalReclaimAttemptTestHook wal_reclaim_attempt_test_hook;
 static void *wal_reclaim_attempt_test_hook_arg;
+static PsWalReclaimBeforeFloorTestHook wal_reclaim_before_floor_test_hook;
+static void *wal_reclaim_before_floor_test_hook_arg;
 static PsWalReadBeforeLockTestHook wal_read_before_lock_test_hook;
 static void *wal_read_before_lock_test_hook_arg;
 /* A page-history pin must not change between a compaction floor snapshot and
@@ -580,6 +582,14 @@ ps_test_set_wal_reclaim_attempt_hook(PsWalReclaimAttemptTestHook hook,
 {
 	wal_reclaim_attempt_test_hook = hook;
 	wal_reclaim_attempt_test_hook_arg = arg;
+}
+
+void
+ps_test_set_wal_reclaim_before_floor_hook(
+	PsWalReclaimBeforeFloorTestHook hook, void *arg)
+{
+	wal_reclaim_before_floor_test_hook = hook;
+	wal_reclaim_before_floor_test_hook_arg = arg;
 }
 
 void
@@ -8042,12 +8052,29 @@ wal_segment_reclaim_one(void)
 		for (uint32_t shard = nshards; shard > 0; shard--)
 			ps_unlock_shard(shard - 1);
 		shards_locked = 0;
-		/* No shard lock is held below this point.  admission-wr still excludes
-		 * ordinary requests, while this timeline WAL lock excludes WAL append/read
-		 * and the WAL-store mutex drains segment readers during unlink.
-		 */
-		if (!walidx_valid || rc != 0 || retention_effective_floor(tl,
-									 PS_RETENTION_RESOURCE_WAL, &retention_floor) != 0 ||
+		/* Do not hold reader-facing WAL/WAL-index gates while the effective-floor
+		 * scan may refresh a layer under map-wr.  WAL_READ and WAL_INDEX_GET can
+		 * hold map-rd before taking those gates, so retaining them here would form
+		 * a map lock cycle.  admission-wr keeps append and WAL-index mutation frozen
+		 * across the unlocked interval. */
+		pthread_rwlock_unlock(wal_lock);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		if (wal_reclaim_before_floor_test_hook != NULL)
+			wal_reclaim_before_floor_test_hook(tl,
+										 wal_reclaim_before_floor_test_hook_arg);
+		rc = rc != 0 ? rc : retention_effective_floor(tl,
+											 PS_RETENTION_RESOURCE_WAL,
+											 &retention_floor);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		/* Revalidate the physical store after readers admitted during the floor
+		 * scan have drained.  No writer could pass admission-wr in the interval. */
+		if (!ps_timeline_live(tl) || !wal_segment_store_opened[tl] ||
+			store->metadata_fenced ||
+			!walidx_valid || rc != 0 ||
 			retention_floor == 0)
 		{
 			goto retry_timeline;

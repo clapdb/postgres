@@ -239,13 +239,13 @@ are capped at their branch points, durable index progress beyond the sealed
 prefix remains a valid proof, and a durably DELETED descendant no longer pins
 its parent (DELETING still does).  Reopen reconstructs residual-prefix work so
 an already-published frontier can finish idempotent unlink without a new proof.
-Focused core coverage (62 checks) includes idle preselection, ancestry and timeline
+Focused core coverage (66 checks) includes idle preselection, ancestry and timeline
 isolation, natural nonzero child fallback, child-local controls, target branch
 caps, LIVE/DELETING/DELETED floors, naturally nonzero starts, unaligned and
 boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index
 re-ship admission after base advancement, pre-metadata reads, restart/residual
-retry, a read/frontier publication
-race, fenced residual-query suppression, pending-proof cleanup failure,
+retry, read/frontier publication and floor-scan lock-order races, fenced
+residual-query suppression, pending-proof cleanup failure,
 metadata publication failure/backoff, and admission concurrency.
 
 This is a conservative R3b-3 policy integration.  It does not include sparse

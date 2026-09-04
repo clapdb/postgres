@@ -790,6 +790,17 @@ typedef struct ReadFrontierGate
 	int status;
 } ReadFrontierGate;
 
+typedef struct ReclaimFloorGate
+{
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	int entered;
+	int release;
+	int reader_done;
+	int wal_status;
+	int walidx_status;
+} ReclaimFloorGate;
+
 static void
 gate_wal_read_before_lock(uint32_t timeline, void *arg)
 {
@@ -811,6 +822,104 @@ frontier_read_thread(void *arg)
 
 	gate->status = wal_read_status(0, 0);
 	return NULL;
+}
+
+static void
+gate_reclaim_before_floor(uint32_t timeline, void *arg)
+{
+	ReclaimFloorGate *gate = arg;
+
+	(void) timeline;
+	pthread_mutex_lock(&gate->mutex);
+	gate->entered = 1;
+	pthread_cond_broadcast(&gate->cond);
+	while (!gate->release)
+		pthread_cond_wait(&gate->cond, &gate->mutex);
+	pthread_mutex_unlock(&gate->mutex);
+}
+
+static void *
+map_first_wal_readers_thread(void *arg)
+{
+	ReclaimFloorGate *gate = arg;
+	PsChannel ch;
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_READ;
+	ch.timeline = 0;
+	ch.datalen = 1;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(0);
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_lifecycle_read_unlock();
+	gate->wal_status = ch.status;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_WAL_INDEX_GET;
+	ch.timeline = 0;
+	ch.key = key;
+	ch.nblocks = 1;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(0);
+	ps_lock_map_rd();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_lifecycle_read_unlock();
+	gate->walidx_status = ch.status;
+
+	pthread_mutex_lock(&gate->mutex);
+	gate->reader_done = 1;
+	pthread_cond_broadcast(&gate->cond);
+	pthread_mutex_unlock(&gate->mutex);
+	return NULL;
+}
+
+static void
+test_floor_scan_does_not_hold_reader_gates(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-floor-locks-XXXXXX";
+	ReclaimFloorGate gate;
+	pthread_t maintenance;
+	pthread_t reader;
+
+	configure_core();
+	memset(&gate, 0, sizeof(gate));
+	pthread_mutex_init(&gate.mutex, NULL);
+	pthread_cond_init(&gate.cond, NULL);
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
+		  "construct reclaimable WAL for the floor-scan lock test");
+	ps_test_set_wal_reclaim_before_floor_hook(gate_reclaim_before_floor, &gate);
+	check(pthread_create(&maintenance, NULL, maintenance_thread, NULL) == 0,
+		  "pause reclaim after releasing reader-facing gates");
+	pthread_mutex_lock(&gate.mutex);
+	while (!gate.entered)
+		pthread_cond_wait(&gate.cond, &gate.mutex);
+	pthread_mutex_unlock(&gate.mutex);
+	check(pthread_create(&reader, NULL, map_first_wal_readers_thread, &gate) == 0,
+		  "start map-first WAL readers during the floor scan");
+	pthread_mutex_lock(&gate.mutex);
+	while (!gate.reader_done)
+		pthread_cond_wait(&gate.cond, &gate.mutex);
+	gate.release = 1;
+	pthread_cond_broadcast(&gate.cond);
+	pthread_mutex_unlock(&gate.mutex);
+	pthread_join(reader, NULL);
+	pthread_join(maintenance, NULL);
+	check(gate.wal_status == PS_STATUS_OK &&
+		  gate.walidx_status == PS_STATUS_OK,
+		  "map-first WAL and WAL-index reads do not deadlock with the floor scan");
+	ps_test_set_wal_reclaim_before_floor_hook(NULL, NULL);
+	pthread_cond_destroy(&gate.cond);
+	pthread_mutex_destroy(&gate.mutex);
+	close_store();
+	remove_tree(store);
 }
 
 static void
@@ -1008,6 +1117,7 @@ main(void)
 	test_pending_durable_proof();
 	test_safe_delete_admission_restart_and_isolation();
 	test_read_rechecks_frontier_under_wal_lock();
+	test_floor_scan_does_not_hold_reader_gates();
 	test_failure_backoff();
 	test_concurrent_admission();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
