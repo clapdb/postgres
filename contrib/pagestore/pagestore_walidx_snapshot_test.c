@@ -1,9 +1,12 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "pagestore_walidx_snapshot.h"
@@ -65,6 +68,7 @@ main(void)
 	char directory[1024];
 	char recovery_directory[1024];
 	char reshard_directory[1024];
+	char unselected_directory[1024];
 	char path[1200];
 	unsigned char shard0[257];
 	unsigned char shard1[513];
@@ -98,6 +102,8 @@ main(void)
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
 	snprintf(recovery_directory, sizeof(recovery_directory), "%s/timeline_1", root);
 	snprintf(reshard_directory, sizeof(reshard_directory), "%s/timeline_2", root);
+	snprintf(unselected_directory, sizeof(unselected_directory),
+			 "%s/timeline_unselected", root);
 	{
 		uint64_t obsolete = UINT64_MAX;
 
@@ -105,7 +111,39 @@ main(void)
 			  obsolete == 0,
 			  "an absent never-selected snapshot directory has no reclaim debt");
 		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 1, &obsolete) != 0,
-			  "an absent selected snapshot directory fails closed");
+				"an absent selected snapshot directory fails closed");
+	}
+	{
+		char manifest_temp[1200];
+		char prepared_temp[1200];
+		uint64_t obsolete = 0;
+		int manifest_fd;
+		int prepared_fd;
+
+		check(mkdir(unselected_directory, 0700) == 0,
+				"create an empty unselected snapshot directory");
+		snprintf(manifest_temp, sizeof(manifest_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u",
+				 unselected_directory, 7ULL, (long) getpid(), 0U);
+		snprintf(prepared_temp, sizeof(prepared_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u",
+				 unselected_directory, (long) getpid(), 1U);
+		manifest_fd = open(manifest_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		prepared_fd = open(prepared_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(manifest_fd >= 0 && prepared_fd >= 0 &&
+				write(manifest_fd, "manifest", 8) == 8 &&
+				write(prepared_fd, "prepared", 8) == 8 &&
+				close(manifest_fd) == 0 && close(prepared_fd) == 0,
+				"create exact residue without a selected snapshot");
+		check(ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+										 &obsolete) == 0 && obsolete == 16,
+				"unselected snapshot residue is counted as debt");
+		check(ps_walidx_snapshot_gc(unselected_directory, 0) == 1 &&
+				access(manifest_temp, F_OK) != 0 &&
+				access(prepared_temp, F_OK) != 0 &&
+				ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+										 &obsolete) == 0 && obsolete == 0,
+				"unselected snapshot GC removes residue and clears debt");
 	}
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,
@@ -268,10 +306,106 @@ main(void)
 				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 0U);
 		check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 2,
 									 500, 900, second, 3) == 0 &&
-			  ps_walidx_snapshot_gc(directory, 0) == 1 &&
-			  access(prepared_path, F_OK) != 0 &&
-			  access(selected_shard, F_OK) == 0,
-			  "generation GC clears selected prepared residue without deleting shards");
+				  ps_walidx_snapshot_gc(directory, 0) == 1 &&
+				  access(prepared_path, F_OK) != 0 &&
+				  access(selected_shard, F_OK) == 0,
+				  "generation GC clears selected prepared residue without deleting shards");
+	}
+	{
+		char manifest_temp[1200];
+		char prepared_temp[1200];
+		char malformed_manifest[1200];
+		char malformed_prepared[1200];
+		uint64_t obsolete = 0;
+		int manifest_fd;
+		int prepared_fd;
+		int malformed_manifest_fd;
+		int malformed_prepared_fd;
+
+		snprintf(manifest_temp, sizeof(manifest_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 5ULL, (long) getpid(), 0U);
+		snprintf(prepared_temp, sizeof(prepared_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 1U);
+		manifest_fd = open(manifest_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		prepared_fd = open(prepared_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(manifest_fd >= 0 && prepared_fd >= 0 &&
+				write(manifest_fd, "manifest residue", 16) == 16 &&
+				write(prepared_fd, "prepared residue", 16) == 16 &&
+				close(manifest_fd) == 0 && close(prepared_fd) == 0,
+				"create canonical snapshot publication residue");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) == 0 &&
+				obsolete == 32,
+				"snapshot publication residue is counted as physical debt");
+		check(ps_walidx_snapshot_gc(directory, 0) == 1 &&
+				access(manifest_temp, F_OK) != 0 &&
+				access(prepared_temp, F_OK) != 0 &&
+				ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) == 0 &&
+				obsolete == 0,
+				"snapshot GC removes publication residue and releases debt");
+
+		snprintf(malformed_manifest, sizeof(malformed_manifest),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 6ULL, (long) getpid(), 128U);
+		snprintf(malformed_prepared, sizeof(malformed_prepared),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 128U);
+		malformed_manifest_fd = open(malformed_manifest, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		malformed_prepared_fd = open(malformed_prepared, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(malformed_manifest_fd >= 0 && malformed_prepared_fd >= 0 &&
+				close(malformed_manifest_fd) == 0 && close(malformed_prepared_fd) == 0,
+				"create near-miss snapshot temporary names");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+				ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				access(malformed_manifest, F_OK) == 0 &&
+				access(malformed_prepared, F_OK) == 0,
+				"near-miss snapshot residue fails closed and is not deleted");
+		unlink(malformed_manifest);
+		unlink(malformed_prepared);
+		if (sizeof(pid_t) < sizeof(long))
+		{
+			char malformed_pid[1200];
+			int malformed_pid_fd;
+
+			snprintf(malformed_pid, sizeof(malformed_pid),
+					 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+					 LONG_MAX, 0U);
+			malformed_pid_fd = open(malformed_pid, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(malformed_pid_fd >= 0 && close(malformed_pid_fd) == 0 &&
+					ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+					ps_walidx_snapshot_gc(directory, 0) != 0 &&
+					access(malformed_pid, F_OK) == 0,
+					"a non-round-trippable pid residue fails closed and is not deleted");
+			unlink(malformed_pid);
+		}
+	}
+	{
+		char symlink_temp[1200];
+		char directory_temp[1200];
+		struct stat symlink_st;
+		int gc_symlink_ok;
+		int gc_directory_ok;
+
+		snprintf(symlink_temp, sizeof(symlink_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 8ULL, (long) getpid(), 0U);
+		snprintf(directory_temp, sizeof(directory_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 2U);
+		gc_symlink_ok = symlink("walidx_manifest_v1", symlink_temp) == 0;
+		gc_directory_ok = mkdir(directory_temp, 0700) == 0;
+		check(gc_symlink_ok && gc_directory_ok &&
+				ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				lstat(symlink_temp, &symlink_st) == 0 &&
+				S_ISLNK(symlink_st.st_mode) &&
+				access(directory_temp, F_OK) == 0,
+				"snapshot GC rejects exact temporary symlink and preserves it");
+		unlink(symlink_temp);
+		check(gc_directory_ok && ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				access(directory_temp, F_OK) == 0,
+				"snapshot GC rejects exact temporary directory and preserves it");
+		rmdir(directory_temp);
 	}
 	{
 		uint64_t obsolete = 0;
@@ -422,6 +556,7 @@ main(void)
 	unlink(path);
 	rmdir(recovery_directory);
 	rmdir(reshard_directory);
+	rmdir(unselected_directory);
 	rmdir(directory);
 	rmdir(root);
 

@@ -101,9 +101,15 @@ static void posix_walidx_locks_clear(void);
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
 static int posix_log_append_locked(const char *name, const void *buf,
-								 uint32_t len);
+									 uint32_t len);
 static PosixWalLock *posix_wal_lock_for(uint32_t tl);
 static PosixWalIdxLock *posix_walidx_lock_for(uint32_t tl, uint32_t shard);
+static int posix_all_digits(const char *begin, const char *end);
+static int posix_canonical_pid(const char *begin, const char *end);
+static int posix_canonical_attempt(const char *begin, const char *end);
+static int posix_parse_walidx_entry(uint32_t tl, const char *name,
+								uint32_t *shard_out, uint64_t *epoch_out,
+								int *is_marker_out, int *is_temp_out);
 
 static void
 seg_path(char *buf, size_t buflen, uint32_t shard, int seg)
@@ -1405,51 +1411,62 @@ posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
 	errno = 0;
 	while ((entry = readdir(dir)) != NULL)
 	{
-		char canonical[128];
-		char marker[160];
-		char *shard_end = NULL;
-		unsigned long parsed_shard;
-		uint64_t epoch = 0;
-		const char *suffix;
-		const char *digits = NULL;
-		char *end = NULL;
-		int is_marker = 0;
+		uint32_t parsed_shard;
+		uint64_t epoch;
+		int is_temp;
+		int parsed;
 
-		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+		parsed = posix_parse_walidx_entry(tl, entry->d_name,
+									 &parsed_shard, &epoch, NULL, &is_temp);
+		if (parsed == 0)
 			continue;
-		errno = 0;
-		parsed_shard = strtoul(entry->d_name + n, &shard_end, 10);
-		if (errno != 0 || shard_end == entry->d_name + n ||
-			parsed_shard >= nshards)
-			goto next_entry;
-		suffix = shard_end;
-		if (strncmp(suffix, "_e", 2) == 0)
-		{
-			digits = suffix + 2;
-			if (strlen(digits) != 20 &&
-				!(strlen(digits) == 25 && strcmp(digits + 20, ".size") == 0))
-				goto next_entry;
-			for (size_t i = 0; i < 20; i++)
-				if (digits[i] < '0' || digits[i] > '9')
-					goto next_entry;
-			errno = 0;
-			epoch = strtoull(digits, &end, 10);
-			if (errno != 0 || end != digits + 20 || epoch == 0)
-				goto next_entry;
-			is_marker = strcmp(end, ".size") == 0;
-		}
-		else if (*suffix != '\0')
-			goto next_entry;
-		if (posix_walidx_name(tl, (uint32_t) parsed_shard, epoch,
-							 canonical, sizeof(canonical)) != 0 ||
-			posix_walidx_watermark_name(canonical, marker, sizeof(marker)) != 0 ||
-			strcmp(entry->d_name, is_marker ? marker : canonical) != 0)
-			goto next_entry;
-		if (epoch >= keep_epochs[parsed_shard])
-			goto next_entry;
-		if (unlinkat(directory_fd, entry->d_name, 0) != 0)
+		if (parsed < 0)
 			goto cleanup;
-		removed = 1;
+		if (parsed_shard >= nshards)
+			goto next_entry;
+		if (!is_temp && epoch >= keep_epochs[parsed_shard])
+			goto next_entry;
+		if (is_temp)
+		{
+			PosixWalIdxLock *lock = posix_walidx_lock_for(tl, parsed_shard);
+			struct stat st;
+			int unlink_rc;
+
+			if (lock == NULL)
+				goto cleanup;
+			pthread_mutex_lock(&lock->lock);
+			if (fstatat(directory_fd, entry->d_name, &st,
+						AT_SYMLINK_NOFOLLOW) != 0)
+			{
+				int stat_errno = errno;
+
+				pthread_mutex_unlock(&lock->lock);
+				if (stat_errno == ENOENT)
+					goto next_entry;
+				goto cleanup;
+			}
+			if (!S_ISREG(st.st_mode))
+			{
+				pthread_mutex_unlock(&lock->lock);
+				goto cleanup;
+			}
+			unlink_rc = unlinkat(directory_fd, entry->d_name, 0);
+			if (unlink_rc == 0)
+				removed = 1;
+			else if (errno != ENOENT)
+			{
+				pthread_mutex_unlock(&lock->lock);
+				goto cleanup;
+			}
+			/* ENOENT means the publisher already renamed or cleaned the temp. */
+			pthread_mutex_unlock(&lock->lock);
+		}
+		else
+		{
+			if (unlinkat(directory_fd, entry->d_name, 0) != 0)
+				goto cleanup;
+			removed = 1;
+		}
 next_entry:
 		errno = 0;
 	}
@@ -1504,55 +1521,30 @@ posix_walidx_reclaim_bytes(uint32_t tl, const uint64_t *keep_epochs,
 	errno = 0;
 	while ((entry = readdir(dir)) != NULL)
 	{
-		char canonical[128];
-		char marker[160];
-		char *shard_end = NULL;
-		unsigned long parsed_shard;
-		uint64_t epoch = 0;
-		const char *suffix;
-		const char *digits;
-		char *end = NULL;
 		struct stat st;
-		int is_marker = 0;
+		char canonical[160];
+		uint32_t parsed_shard;
+		uint64_t epoch;
+		int is_marker;
+		int is_temp;
+		int parsed;
 		uint64_t amount;
 
-		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+		parsed = posix_parse_walidx_entry(tl, entry->d_name,
+									 &parsed_shard, &epoch, &is_marker, &is_temp);
+		if (parsed == 0)
 			continue;
-		errno = 0;
-		parsed_shard = strtoul(entry->d_name + n, &shard_end, 10);
-		if (errno != 0 || shard_end == entry->d_name + n ||
-			parsed_shard >= nshards)
+		if (parsed < 0 || parsed_shard >= nshards)
 			goto cleanup;
-		suffix = shard_end;
-		if (strncmp(suffix, "_e", 2) == 0)
-		{
-			digits = suffix + 2;
-			if (strlen(digits) != 20 &&
-				!(strlen(digits) == 25 &&
-				  strcmp(digits + 20, ".size") == 0))
-				goto cleanup;
-			for (size_t i = 0; i < 20; i++)
-				if (digits[i] < '0' || digits[i] > '9')
-					goto cleanup;
-			errno = 0;
-			epoch = strtoull(digits, &end, 10);
-			if (errno != 0 || end != digits + 20 || epoch == 0)
-				goto cleanup;
-			is_marker = strcmp(end, ".size") == 0;
-		}
-		else if (*suffix != '\0')
-			goto cleanup;
-		if (posix_walidx_name(tl, (uint32_t) parsed_shard, epoch,
-							  canonical, sizeof(canonical)) != 0 ||
-			posix_walidx_watermark_name(canonical, marker, sizeof(marker)) != 0 ||
-			strcmp(entry->d_name, is_marker ? marker : canonical) != 0)
+		if (posix_walidx_name(tl, parsed_shard, epoch,
+						  canonical, sizeof(canonical)) != 0)
 			goto cleanup;
 		if (fstatat(directory_fd, entry->d_name, &st,
 					AT_SYMLINK_NOFOLLOW) != 0 ||
 			!S_ISREG(st.st_mode) || st.st_size < 0)
 			goto cleanup;
 		amount = (uint64_t) st.st_size;
-		if (epoch == keep_epochs[parsed_shard] && !is_marker)
+		if (epoch == keep_epochs[parsed_shard] && !is_marker && !is_temp)
 		{
 			if (current_files[parsed_shard])
 				goto cleanup;
@@ -1721,77 +1713,131 @@ posix_alnum6(const char *name)
 }
 
 static int
-posix_timeline_walidx_entry(uint32_t tl, const char *name)
+posix_fixed_epoch(const char *begin, uint64_t *epoch_out)
+{
+	uint64_t epoch = 0;
+
+	for (size_t i = 0; i < 20; i++)
+	{
+		uint64_t digit;
+
+		if (begin[i] < '0' || begin[i] > '9')
+			return 0;
+		digit = (uint64_t) (begin[i] - '0');
+		if (epoch > (UINT64_MAX - digit) / 10)
+			return 0;
+		epoch = epoch * 10 + digit;
+	}
+	if (epoch == 0)
+		return 0;
+	if (epoch_out != NULL)
+		*epoch_out = epoch;
+	return 1;
+}
+
+static int
+posix_parse_walidx_entry(uint32_t tl, const char *name,
+						 uint32_t *shard_out, uint64_t *epoch_out,
+						 int *is_marker_out, int *is_temp_out)
 {
 	char prefix[64];
 	char canonical[160];
 	char watermark[192];
 	const char *p;
-	char *end;
-	unsigned long shard;
-	unsigned long long epoch;
+	const char *digits_end;
+	const char *suffix;
+	unsigned long long shard;
+	uint64_t epoch = 0;
+	int is_marker = 0;
+	int is_temp = 0;
 	int n;
 
 	n = snprintf(prefix, sizeof(prefix), "walidx_%u_", tl);
-	if (n < 0 || (size_t) n >= sizeof(prefix) ||
-		strncmp(name, prefix, (size_t) n) != 0)
+	if (n < 0 || (size_t) n >= sizeof(prefix))
+		return -1;
+	if (strncmp(name, prefix, (size_t) n) != 0)
 		return 0;
 	p = name + n;
-	errno = 0;
-	shard = strtoul(p, &end, 10);
-	if (errno != 0 || end == p || shard > UINT32_MAX ||
-		shard >= PS_MAX_CHANNELS ||
-		!posix_all_digits(p, end))
+	digits_end = p;
+	while (*digits_end >= '0' && *digits_end <= '9')
+		digits_end++;
+	if (!posix_canonical_decimal(p, digits_end, PS_MAX_CHANNELS - 1,
+								 &shard))
 		return -1;
-	if (*end == '\0')
+	if (*digits_end == '\0')
 	{
 		if (posix_walidx_name(tl, (uint32_t) shard, 0,
 						  canonical, sizeof(canonical)) != 0 ||
 			strcmp(name, canonical) != 0)
 			return -1;
+		if (shard_out != NULL)
+			*shard_out = (uint32_t) shard;
+		if (epoch_out != NULL)
+			*epoch_out = 0;
+		if (is_marker_out != NULL)
+			*is_marker_out = 0;
+		if (is_temp_out != NULL)
+			*is_temp_out = 0;
 		return 1;
 	}
-	if (strncmp(end, "_e", 2) != 0)
+	if (strncmp(digits_end, "_e", 2) != 0 ||
+		strlen(digits_end + 2) < 20 ||
+		!posix_fixed_epoch(digits_end + 2, &epoch))
 		return -1;
-	p = end + 2;
-	if (strlen(p) < 20 || !posix_all_digits(p, p + 20))
-		return -1;
-	errno = 0;
-	epoch = strtoull(p, &end, 10);
-	if (errno != 0 || epoch == 0 || end != p + 20)
-		return -1;
-	if (*end == '\0' || (strcmp(end, ".size") == 0))
+	suffix = digits_end + 2 + 20;
+	if (*suffix == '\0' || strcmp(suffix, ".size") == 0)
 	{
 		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
-						  canonical, sizeof(canonical)) != 0)
+						  canonical, sizeof(canonical)) != 0 ||
+			posix_walidx_watermark_name(canonical, watermark,
+								 sizeof(watermark)) != 0)
 			return -1;
-		if (strcmp(name, canonical) == 0)
-			return 1;
-		if (posix_walidx_watermark_name(canonical, watermark,
-							 sizeof(watermark)) != 0)
-			return -1;
-		return strcmp(name, watermark) == 0 ? 1 : -1;
+		if (*suffix == '\0')
+		{
+			if (strcmp(name, canonical) != 0)
+				return -1;
+		}
+		else
+		{
+			if (strcmp(name, watermark) != 0)
+				return -1;
+			is_marker = 1;
+		}
 	}
-	/* Exact generated watermark temporary: <canonical>.size.tmp.<pid>.<try>. */
-	if (strncmp(end, ".size.tmp.", 10) == 0)
+	else if (strncmp(suffix, ".size.tmp.", 10) == 0)
 	{
-		const char *q = end + 10;
-		const char *dot = strchr(q, '.');
-		size_t base_len;
+		const char *temporary = suffix + 10;
+		const char *pid_end = strchr(temporary, '.');
 
-		if (dot == NULL || !posix_canonical_pid(q, dot) ||
-			!posix_canonical_attempt(dot + 1, name + strlen(name)))
-			return -1;
 		if (posix_walidx_name(tl, (uint32_t) shard, epoch,
-						  canonical, sizeof(canonical)) != 0)
+						  canonical, sizeof(canonical)) != 0 ||
+			posix_walidx_watermark_name(canonical, watermark,
+								 sizeof(watermark)) != 0 ||
+			pid_end == NULL || !posix_canonical_pid(temporary, pid_end) ||
+			!posix_canonical_attempt(pid_end + 1, name + strlen(name)) ||
+			strlen(name) <= strlen(watermark) + 5 ||
+			strncmp(name, watermark, strlen(watermark)) != 0 ||
+			memcmp(name + strlen(watermark), ".tmp.", 5) != 0)
 			return -1;
-		base_len = (size_t) (end - name);
-		if (strlen(canonical) != base_len ||
-			memcmp(name, canonical, base_len) != 0)
-			return -1;
-		return 1;
+		is_temp = 1;
 	}
-	return -1;
+	else
+		return -1;
+	if (shard_out != NULL)
+		*shard_out = (uint32_t) shard;
+	if (epoch_out != NULL)
+		*epoch_out = epoch;
+	if (is_marker_out != NULL)
+		*is_marker_out = is_marker;
+	if (is_temp_out != NULL)
+		*is_temp_out = is_temp;
+	return 1;
+}
+
+static int
+posix_timeline_walidx_entry(uint32_t tl, const char *name)
+{
+	return posix_parse_walidx_entry(tl, name, NULL, NULL, NULL, NULL);
 }
 
 static int

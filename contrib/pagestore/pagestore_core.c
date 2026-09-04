@@ -12332,7 +12332,8 @@ walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 				lag = backpressure_saturating_add(lag, total);
 				if (tail_candidates != NULL && tail != 0)
 					tail_candidates[tl] = 1;
-				if (gc_candidates != NULL && obsolete_snapshot != 0)
+				if (gc_candidates != NULL &&
+					(obsolete_epoch != 0 || obsolete_snapshot != 0))
 					gc_candidates[tl] = 1;
 				stable = 1;
 				break;

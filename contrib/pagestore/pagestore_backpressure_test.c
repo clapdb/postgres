@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -332,6 +333,69 @@ test_walidx_append_tail_restart(void)
 			(void) unlink(obsolete_marker);
 			(void) unlink(obsolete_log);
 		}
+	}
+	{
+		char current_log[1024];
+		char current_marker[1024];
+		char watermark_temp[1200];
+		char malformed_temp[1200];
+		int fd;
+
+		snprintf(current_log, sizeof(current_log),
+				 "%s/walidx_0_0_e%020llu", store, 1ULL);
+		snprintf(current_marker, sizeof(current_marker), "%s.size", current_log);
+		snprintf(watermark_temp, sizeof(watermark_temp),
+				 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 0U);
+		fd = open(watermark_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && write(fd, "watermark", 9) == 9 &&
+				fsync(fd) == 0 && close(fd) == 0,
+				"create canonical watermark publication residue");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.lag_bytes >= 9 &&
+				metrics.walidx_backpressure.throttled != 0,
+				"watermark publication residue is counted as WAL-index debt");
+		check(ps_test_walidx_gc_force_due(0) != 0,
+				"watermark publication residue schedules epoch GC");
+		check(ps_core_maintenance() == 1 && access(watermark_temp, F_OK) != 0,
+				"epoch GC removes canonical watermark residue");
+		for (int i = 0; i < 8 && metrics.walidx_backpressure.throttled != 0; i++)
+		{
+			(void) ps_core_maintenance();
+			ps_backpressure_refresh();
+		}
+		check(metrics.walidx_backpressure.lag_bytes == 0 &&
+				metrics.walidx_backpressure.throttled == 0,
+				"watermark residue cleanup releases WAL-index debt");
+		{
+			uint64_t keep_epochs[1] = {1};
+			int gc_symlink_ok;
+			int gc_directory_ok;
+
+			snprintf(watermark_temp, sizeof(watermark_temp),
+					 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 2U);
+			gc_symlink_ok = symlink(current_marker, watermark_temp) == 0;
+			check(gc_symlink_ok && ps_storage->walidx_epoch_gc(0, keep_epochs, 1) < 0 &&
+					access(watermark_temp, F_OK) == 0,
+					"epoch GC rejects exact watermark temporary symlink and preserves it");
+			unlink(watermark_temp);
+
+			gc_directory_ok = mkdir(watermark_temp, 0700) == 0;
+			check(gc_directory_ok && ps_storage->walidx_epoch_gc(0, keep_epochs, 1) < 0 &&
+					access(watermark_temp, F_OK) == 0,
+					"epoch GC rejects exact watermark temporary directory and preserves it");
+			rmdir(watermark_temp);
+		}
+
+		snprintf(malformed_temp, sizeof(malformed_temp),
+				 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 128U);
+		fd = open(malformed_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && close(fd) == 0,
+				"create a near-miss watermark temporary name");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX &&
+				ps_core_maintenance() != 1 && access(malformed_temp, F_OK) == 0,
+				"near-miss watermark residue fails closed and is not deleted");
+		unlink(malformed_temp);
 	}
 	for (int i = 0; i < 16 && metrics.walidx_backpressure.throttled != 0; i++)
 	{
