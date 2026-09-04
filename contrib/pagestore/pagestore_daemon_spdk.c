@@ -589,6 +589,22 @@ maintenance_worker(void *arg)
 	return NULL;
 }
 
+static int
+parse_u64_option(const char *text, uint64_t *value)
+{
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (text == NULL || *text == '\0' || text[0] == '-')
+		return -1;
+	errno = 0;
+	parsed = strtoull(text, &end, 10);
+	if (errno == ERANGE || end == text || *end != '\0')
+		return -1;
+	*value = (uint64_t) parsed;
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -624,10 +640,32 @@ main(int argc, char **argv)
 			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--page-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--page-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-					"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
+					"[--page-size N] [--segment-size N] [--nshards N] "
+					"[--page-high-water-bytes N --page-catch-up-bytes N] "
+					"[--wal-high-water-bytes N --wal-catch-up-bytes N]\n", argv[0]);
 			return 2;
 		}
 	}
@@ -635,7 +673,18 @@ main(int argc, char **argv)
 		nshards == 0 || nshards > PS_MAX_CHANNELS)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
-				"[--page-size N] [--segment-size N] [--nshards N]\n", argv[0]);
+				"[--page-size N] [--segment-size N] [--nshards N] "
+				"[--page-high-water-bytes N --page-catch-up-bytes N] "
+				"[--wal-high-water-bytes N --wal-catch-up-bytes N]\n", argv[0]);
+		return 2;
+	}
+	if (page_reclaim_high_water_bytes != 0 ||
+		page_reclaim_catchup_bytes != 0 ||
+		wal_reclaim_high_water_bytes != 0 ||
+		wal_reclaim_catchup_bytes != 0)
+	{
+		fprintf(stderr, "pagestore_daemon_spdk: backpressure requires the POSIX "
+				"storage backend (selected 'spdk')\n");
 		return 2;
 	}
 	ps_nshards = nshards;

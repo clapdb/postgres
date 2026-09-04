@@ -93,6 +93,7 @@ client_attach(const char *shm_name)
 static void
 cl_exec(PsChannel *ch)
 {
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;

@@ -134,7 +134,13 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"request\":0") != NULL &&
 		  strstr(output, "\"done\":0") != NULL &&
 		  strstr(output, "\"wal_index_pending_bytes\":0") != NULL &&
-		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL,
+		  strstr(output, "\"wal_index_lagging_timelines\":0") != NULL &&
+		  strstr(output, "\"page_lag_bytes\":0") != NULL &&
+		  strstr(output, "\"page_high_water_bytes\":0") != NULL &&
+		  strstr(output, "\"page_throttled\":0") != NULL &&
+		  strstr(output, "\"wal_lag_bytes\":0") != NULL &&
+		  strstr(output, "\"wal_high_water_bytes\":0") != NULL &&
+		  strstr(output, "\"wal_throttled\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
 	check(run_inspector(shm, "pruning", output, sizeof(output)),
 		  "read-only inspector pruning exits cleanly");
@@ -243,10 +249,27 @@ client_detach(void)
 }
 
 static PsChannel *
+claim_extra_channel(void)
+{
+	PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+
+	for (uint32_t i = 0; i < hdr->nchannels; i++)
+		if ((int) i != cl_chan)
+		{
+			PsChannel *ch = ps_channel(cl_shm, i);
+
+			if (ps_cas(&ch->claimed, 0, 1))
+				return ch;
+		}
+	return NULL;
+}
+
+static PsChannel *
 cl_exec(void)
 {
 	PsChannel  *ch = ps_channel(cl_shm, cl_chan);
 
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;					/* busy wait; single in-flight request */
@@ -256,6 +279,7 @@ cl_exec(void)
 static PsChannel *
 exec_channel(PsChannel *ch)
 {
+	ps_request_generation_next(ch);
 	ps_store_release(&ch->state, PS_STATE_REQUEST);
 	while (ps_load_acquire(&ch->state) != PS_STATE_DONE)
 		;
@@ -1508,6 +1532,40 @@ spawn_daemon_gc(const char *daemon_path, const char *shm, const char *store,
 							  0, 0, 0, 1);
 }
 
+/* Two-phase shipped-WAL backpressure setup.  The pause file is deliberately
+ * test-only: phase one seeds a proof-complete WAL prefix with the controller
+ * disabled, and phase two recovers it with the real controller enabled. */
+static pid_t
+spawn_daemon_wal_backpressure(const char *daemon_path, const char *shm,
+							  const char *store, const char *pause_file,
+							  int enable_controller)
+{
+	pid_t pid = fork();
+
+	if (pid < 0)
+	{
+		perror("fork WAL backpressure daemon");
+		exit(2);
+	}
+	if (pid == 0)
+	{
+		if (enable_controller)
+			execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
+				  "--page-size", "8192", "--segment-size", "65536",
+				  "--nshards", "1", "--flush-pages", "8", "--segment-gc", "0",
+				  "--wal-high-water-bytes", "1048576", "--wal-catch-up-bytes", "1",
+				  "--test-maintenance-pause-file", pause_file, (char *) NULL);
+		else
+			execl(daemon_path, daemon_path, "--shm", shm, "--store", store,
+				  "--page-size", "8192", "--segment-size", "65536",
+				  "--nshards", "1", "--flush-pages", "8", "--segment-gc", "0",
+				  "--test-maintenance-pause-file", pause_file, (char *) NULL);
+		perror("execl WAL backpressure daemon");
+		_exit(127);
+	}
+	return pid;
+}
+
 /* Wait until the daemon has published a valid header. */
 static void
 wait_ready(const char *shm, uint32_t page_size)
@@ -2246,6 +2304,7 @@ run_segment_gc_suite(const char *daemon_path, const char *tmpbase)
 		write_ch->blocknum = 0;
 		write_ch->nblocks = 1;
 		fill_page(write_ch->data, ps, 12000, 102);
+		ps_request_generation_next(write_ch);
 		ps_store_release(&write_ch->state, PS_STATE_REQUEST);
 
 		for (uint32_t i = (uint32_t) cl_chan + hdr->nshards;
@@ -4486,6 +4545,122 @@ run_wal_suite(const char *daemon_path, const char *tmpbase)
 	free(segment);
 }
 
+/* Real shipped-WAL backpressure: use the same WAL append, control-note, and
+ * durable WAL-index progress protocol as run_wal_suite(), then let the
+ * production R3b proof compute and consume the immutable prefix. */
+static void
+run_wal_backpressure_suite(const char *daemon_path, const char *tmpbase)
+{
+	const uint64_t wal_segment = UINT64_C(1024) * 1024;
+	const uint64_t wal_total = wal_segment * 3;
+	char shm[64];
+	char store[256];
+	char pause_file[256];
+	unsigned char chunk[PS_IO_UNIT];
+	unsigned char note[8192] = {0};
+	unsigned char image[8192];
+	unsigned char readback[16];
+	uint64_t redo = wal_segment;
+	PsChannel *pending;
+	PsShmHeader *hdr;
+	pid_t dpid;
+	int pause_fd;
+
+	fprintf(stderr, "== shipped WAL backpressure ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_wal_bp", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_wal_bp", tmpbase);
+	snprintf(pause_file, sizeof(pause_file), "%s/wal_bp_pause", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+	unlink(pause_file);
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(pause_fd >= 0, "WAL backpressure test arms maintenance pause");
+	if (pause_fd >= 0)
+		close(pause_fd);
+
+	/* Seed real shipped WAL while the controller is disabled and reclaim is
+	 * paused.  The control note/image pair and durable index progress are the
+	 * same proof inputs used by the normal WAL policy tests. */
+	dpid = spawn_daemon_wal_backpressure(daemon_path, shm, store, pause_file, 0);
+	wait_ready(shm, 8192);
+	client_attach(shm, 8192);
+	memset(chunk, 0x5a, sizeof(chunk));
+	for (uint64_t off = 0; off < wal_total; off += sizeof(chunk))
+		op_wal_append(0, off, chunk,
+					(uint32_t) ((wal_total - off < sizeof(chunk)) ?
+									(wal_total - off) : sizeof(chunk)));
+	memset(image, 0xc3, sizeof(image));
+	memcpy(note, &redo, sizeof(redo));
+	op_write_control(1, note, redo);
+	op_write_control(0, image, redo);
+	check(op_wal_retain_floor(0) == wal_segment,
+		  "real WAL setup publishes a segment-aligned retention floor");
+	check(op_walidx_progress(0, 0, wal_total, NULL) == 0,
+		  "real WAL setup publishes durable index progress");
+	check(op_wal_size(0) == wal_total,
+		  "real WAL setup ships three complete immutable segments");
+	client_detach();
+	stop_daemon(dpid);
+	shm_unlink(shm);
+
+	/* Recovery with thresholds enabled must report debt from the actual WAL
+	 * store/proof state before any test request is submitted. */
+	dpid = spawn_daemon_wal_backpressure(daemon_path, shm, store, pause_file, 1);
+	wait_ready(shm, 8192);
+	client_attach(shm, 8192);
+	hdr = (PsShmHeader *) cl_shm;
+	check(ps_load_acquire_u64(&hdr->wal_backpressure.lag_bytes) >= wal_segment &&
+		  ps_load_acquire(&hdr->wal_backpressure.throttled) != 0,
+		  "real WAL proof state enters shipped-WAL throttle at startup");
+	pending = claim_extra_channel();
+	check(pending != NULL, "WAL backpressure test claims a deferred channel");
+	if (pending != NULL)
+	{
+		pending->timeline = 0;
+		pending->incarnation = 0;
+		pending->opcode = PS_OP_WAL_APPEND;
+		pending->req_lsn = wal_total;
+		pending->datalen = sizeof(readback);
+		memset(pending->data, 0x6b, sizeof(readback));
+		ps_request_generation_next(pending);
+		ps_store_release(&pending->state, PS_STATE_REQUEST);
+		usleep(100000);
+		check(ps_load_acquire(&pending->state) == PS_STATE_REQUEST,
+			  "shipped-WAL mutation remains deferred under real throttle");
+		memset(readback, 0, sizeof(readback));
+		check(op_wal_read(0, 0, sizeof(readback), readback) == sizeof(readback) &&
+			  readback[0] == 0x5a,
+			  "shipped-WAL read continues while mutation is deferred");
+	}
+	unlink(pause_file);
+	if (pending != NULL)
+	{
+		int done = 0;
+
+		for (int i = 0; i < 5000; i++)
+		{
+			if (ps_load_acquire(&pending->state) == PS_STATE_DONE)
+			{
+				done = 1;
+				break;
+			}
+			usleep(1000);
+		}
+		check(done && pending->status == PS_STATUS_OK,
+			  "WAL maintenance catch-up releases the deferred mutation");
+	}
+	check(ps_load_acquire(&hdr->wal_backpressure.throttled) == 0 &&
+		  ps_load_acquire_u64(&hdr->wal_backpressure.throttle_exits) != 0,
+		  "real WAL controller exits after immutable-prefix reclaim");
+	if (pending != NULL)
+		ps_store_release(&pending->claimed, 0);
+	client_detach();
+	stop_daemon(dpid);
+	rm_rf(store);
+	shm_unlink(shm);
+	unlink(pause_file);
+}
+
 /*
  * Per-page WAL index: record which WAL LSNs modify each page and query the ones
  * visible as-of an LSN -- the lookup single-page materialization will use.
@@ -5334,6 +5509,7 @@ main(int argc, char **argv)
 
 	/* shipped-WAL durability */
 	run_wal_suite(daemon_path, tmpbase);
+	run_wal_backpressure_suite(daemon_path, tmpbase);
 
 	/* per-page WAL index */
 	run_walidx_suite(daemon_path, tmpbase);

@@ -18,6 +18,16 @@ BUILD=$(CDPATH= cd -- "$BUILD" && pwd) || {
 	echo "FAIL - cannot resolve build directory: $BUILD"
 	exit 1
 }
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+IPC_HEADER="$SCRIPT_DIR/pagestore_ipc.h"
+IPC_VERSION=$(awk '$1 == "#define" && $2 == "PS_SHM_VERSION" { print $3; exit }' \
+	"$IPC_HEADER")
+case "$IPC_VERSION" in
+	''|*[!0-9]*)
+		echo "FAIL - cannot determine PS_SHM_VERSION from $IPC_HEADER"
+		exit 1
+		;;
+esac
 PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' -type f 2>/dev/null | head -1)
 [ -z "$PGCTL" ] && { echo "FAIL - no tmp_install (run: meson test -C $BUILD --suite setup)"; exit 1; }
 BIN=$(dirname "$PGCTL")
@@ -53,7 +63,7 @@ wait_daemon_ready() {
 				continue
 			fi
 			[ "$magic" = "$((0x50414753))" ] &&
-				[ "$version" = 36 ] && [ "$page_size" = 8192 ] &&
+				[ "$version" = "$IPC_VERSION" ] && [ "$page_size" = 8192 ] &&
 				[ "$io_unit" = $((256 * 1024)) ] && [ "$nchannels" = 128 ] &&
 				[ "$nshards" = 1 ] && return 0
 		fi

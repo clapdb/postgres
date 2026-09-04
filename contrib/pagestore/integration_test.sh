@@ -13,6 +13,16 @@
 set -uo pipefail
 
 BUILD=${1:?usage: integration_test.sh <meson-build-dir>}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+IPC_HEADER="$SCRIPT_DIR/pagestore_ipc.h"
+IPC_VERSION=$(awk '$1 == "#define" && $2 == "PS_SHM_VERSION" { print $3; exit }' \
+	"$IPC_HEADER")
+case "$IPC_VERSION" in
+	''|*[!0-9]*)
+		echo "FAIL - cannot determine PS_SHM_VERSION from $IPC_HEADER"
+		exit 1
+		;;
+esac
 # Locate the temporary install tree robustly (its path depends on the configured
 # prefix), by finding pg_ctl under tmp_install.
 PGCTL=$(find "$BUILD/tmp_install" -path '*/bin/pg_ctl' -type f 2>/dev/null | head -1)
@@ -52,7 +62,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=36
+	local expected_version="$IPC_VERSION"
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128

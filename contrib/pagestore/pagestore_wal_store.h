@@ -35,6 +35,9 @@ typedef struct PsWalStore
 	 * process stop.  This state is runtime-only and is reconstructed by the
 	 * open-time residual-prefix scan. */
 	int		residual_prefix_pending;
+	/* First physical segment still present in an authorized residual prefix;
+	 * this is distinct from start_lsn, the already-advanced logical frontier. */
+	uint64_t	residual_prefix_start_lsn;
 	uint64_t	residual_prefix_target_lsn;
 	int			directory_fd;
 	int			metadata_fenced;
@@ -80,6 +83,9 @@ extern int ps_wal_store_reclaim_prefix(PsWalStore *store,
  * The result and target are read under the store mutex. */
 extern int ps_wal_store_residual_prefix_pending(PsWalStore *store,
 										 uint64_t *target_lsn_out);
+/* Return bytes of the still-existing residual physical prefix. */
+extern int ps_wal_store_residual_prefix_bytes(PsWalStore *store,
+										 uint64_t *bytes_out);
 extern int ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 								 void *data, uint32_t len);
 /* The caller must externally prevent concurrent operations and retain the

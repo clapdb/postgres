@@ -718,14 +718,16 @@ Expected scope: one PR.  Passing it closes the retention MVP gate.
 
 ### R5b. Add reclaimer backpressure controllers
 
-Status: **blocked on R2-R5**.
+Status: **partial: R5b-1 page/WAL controller foundation implemented; WAL-index
+and forkmeta controllers remain follow-up work**.
 
-Before the soak test, add one lean lag controller for page, WAL, WAL-index, and
-forkmeta reclamation.  Each controller publishes a high-water threshold and
-catch-up target, throttles foreground admission when lag exceeds the threshold,
-and releases admission only after the target is reached.  Controller state and
-wait time are inspectable, shard-local work remains run-to-completion, and
-tests prove bounded queues under ingestion faster than maintenance.
+R5b-1 adds lean independent PAGE and shipped-WAL lag controllers.  They publish
+high-water/catch-up configuration, hysteretic throttle state, transitions, and
+foreground wait time; POSIX foreground mutations wait before entering runtime
+locks, while reads and maintenance continue.  PAGE debt is limited to complete
+flush-covered segments, and WAL debt uses the existing retention, raw
+dependency, and branch proofs.  WAL-index and forkmeta categories, queue-bound
+soak evidence, and controller-specific tuning remain follow-up work.
 
 Expected scope: one or two PRs.  R6 consumes these controls; it does not
 introduce them.

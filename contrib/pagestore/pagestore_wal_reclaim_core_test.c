@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
@@ -207,7 +208,8 @@ write_control(uint32_t timeline, uint64_t version, uint64_t redo)
 }
 
 static int
-set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+set_wal_pin_generation(uint32_t timeline, uint64_t owner_id, uint32_t generation,
+					   uint64_t lsn)
 {
 	PsChannel ch;
 
@@ -216,10 +218,34 @@ set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
 	ch.timeline = timeline;
 	ch.blocknum = PS_RETENTION_OWNER_READER;
 	ch.parent_timeline = PS_RETENTION_RESOURCE_WAL;
-	ch.old_nblocks = 1;
+	ch.old_nblocks = generation;
 	ch.req_seq = owner_id;
 	ch.req_lsn = lsn;
 	ch.nblocks = 1;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	(void) ps_handle_meta(&ch);
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+set_wal_pin(uint32_t timeline, uint64_t owner_id, uint64_t lsn)
+{
+	return set_wal_pin_generation(timeline, owner_id, 1, lsn);
+}
+
+static int
+drop_wal_pin(uint32_t timeline, uint64_t owner_id, uint32_t generation)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_RETENTION_PIN_DROP;
+	ch.timeline = timeline;
+	ch.blocknum = PS_RETENTION_OWNER_READER;
+	ch.old_nblocks = generation;
+	ch.req_seq = owner_id;
 	ch.status = PS_STATUS_OK;
 	ps_lifecycle_read_lock();
 	(void) ps_handle_meta(&ch);
@@ -561,21 +587,135 @@ static void
 test_residual_prefix_retry_after_reopen(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-residual-XXXXXX";
+	PsShmHeader metrics;
 
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
 		  "construct reclaimable WAL for a residual-prefix retry");
-	check(setenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK", "1", 1) == 0 &&
-		  ps_test_wal_reclaim_maintenance() == 0 &&
-		  segment_count(store, 0) == WAL_SEGMENTS,
-		  "publish the durable frontier but leave every authorized file residual");
-	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
+	{
+		pid_t pid;
+		int status = 0;
+
+		check(setenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK", "1", 1) == 0,
+			  "enable the crash point after WAL frontier publication");
+		pid = fork();
+		if (pid == 0)
+		{
+			(void) ps_test_wal_reclaim_maintenance();
+			_exit(1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 91 &&
+			  segment_count(store, 0) == WAL_SEGMENTS,
+			  "crash leaves the authorized residual WAL prefix on disk");
+		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK");
+	}
 	close_store();
-	check(ps_core_open(store) == 0 && segment_count(store, 0) == WAL_SEGMENTS &&
-		  ps_test_wal_reclaim_maintenance() == 1 &&
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0 &&
+		  ps_core_open(store) == 0 && segment_count(store, 0) == WAL_SEGMENTS &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.throttled != 0 &&
+		   metrics.wal_backpressure.lag_bytes >= WAL_TOTAL),
+		  "reopen reports physical residual WAL debt and keeps throttle active");
+	check(ps_test_wal_reclaim_maintenance() == 1 &&
+		  segment_count(store, 0) == 0 &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.throttled == 0),
+		  "successful residual cleanup releases WAL backpressure");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_residual_prefix_and_suffix_debt(void)
+{
+	const uint32_t nsegments = 8;
+	const uint64_t total = (uint64_t) WAL_SEGMENT * nsegments;
+	const uint64_t residual = WAL_SEGMENT;
+	const uint64_t suffix = 3 * (uint64_t) WAL_SEGMENT;
+	char store[] = "/tmp/pagestore-wal-policy-residual-suffix-XXXXXX";
+	PsShmHeader metrics;
+	int opened = 0;
+
+	configure_core();
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  (opened = 1) && append_wal_bytes(0, 0, (uint32_t) total) &&
+		  write_control(0, total, total) &&
+		  wal_index_progress(0, 0, total) &&
+		  set_wal_pin(0, 100, 5 * (uint64_t) WAL_SEGMENT) &&
+		  effective_floor(0, PS_RETENTION_RESOURCE_WAL) ==
+			5 * (uint64_t) WAL_SEGMENT,
+		  "construct one residual plus multiple suffix WAL segments");
+	if (!opened)
+	{
+		remove_tree(store);
+		return;
+	}
+	{
+		pid_t pid;
+		int status = 0;
+
+		check(setenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
+					 "3", 1) == 0,
+			  "enable the crash point after three WAL prefix unlinks");
+		pid = fork();
+		if (pid == 0)
+		{
+			(void) ps_test_wal_reclaim_maintenance();
+			_exit(1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 92 &&
+			  segment_count(store, 0) == nsegments - 4,
+			  "crash leaves one residual and three post-frontier segments");
+		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO");
+	}
+	close_store();
+	opened = 0;
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, 3 * (uint64_t) WAL_SEGMENT,
+									WAL_SEGMENT / 2) == 0 &&
+		  ps_core_open(store) == 0 && (opened = 1) &&
+		  segment_count(store, 0) == nsegments - 4,
+		  "reopen the residual and suffix WAL layout");
+	check(drop_wal_pin(0, 100, 1),
+		  "remove the temporary floor so the suffix is independently eligible");
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.throttled != 0 &&
+		  metrics.wal_backpressure.lag_bytes == residual + suffix,
+		  "residual and post-frontier suffix debt are summed without overlap");
+	check(set_wal_pin_generation(0, 100, 2, 5 * (uint64_t) WAL_SEGMENT),
+		  "restore the floor to clean only the residual prefix");
+	check(ps_test_wal_reclaim_maintenance() == 1 &&
+		  segment_count(store, 0) == nsegments - 5,
+		  "residual cleanup leaves every suffix segment physically present");
+	check(drop_wal_pin(0, 100, 2),
+		  "remove the temporary floor after residual cleanup");
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.throttled != 0 &&
+		  metrics.wal_backpressure.lag_bytes == suffix,
+		  "suffix debt remains after residual cleanup");
+	check(maintenance_until_count(store, 0, 0) &&
+		  (ps_backpressure_refresh(),
+		   metrics.wal_backpressure.lag_bytes == 0 &&
+		   metrics.wal_backpressure.throttled == 0),
+		  "suffix cleanup eventually releases WAL backpressure");
+	if (opened)
+	{
+		close_store();
+		opened = 0;
+	}
+	check(ps_core_open(store) == 0 && (opened = 1) &&
 		  segment_count(store, 0) == 0,
-		  "reopen retries residual unlink at the already-published frontier");
-	close_store();
+		  "restart after combined residual cleanup preserves zero debt");
+	ps_core_set_metrics_header(NULL);
+	if (opened)
+		close_store();
+	ps_backpressure_configure(0, 0, 0, 0);
 	remove_tree(store);
 }
 
@@ -647,8 +787,14 @@ test_fenced_residual_query_stops_retries(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-fenced-residual-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
+	AdmissionCallCounter admission = {0};
+	PsShmHeader metrics;
 
 	configure_core();
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL backpressure for fenced residual observation");
 	check(prepare_store(store, WAL_SEGMENT, 0, 0, 1),
 		  "construct a one-segment reclaim candidate for directory-fsync fencing");
 	ps_test_set_wal_reclaim_attempt_hook(count_reclaim_attempt, &counter);
@@ -658,11 +804,24 @@ test_fenced_residual_query_stops_retries(void)
 		(void) ps_core_maintenance();
 	check(counter.attempts == 1 && segment_count(store, 0) == WAL_SEGMENTS - 1,
 		  "directory-fsync failure fences after publishing and unlinking the prefix");
+	/* A fenced residual is an observation error, not a maintenance candidate:
+	 * keep the controller fail-closed without repeatedly draining admission. */
+	admission.calls = 0;
+	ps_test_set_admission_write_lock_hook(count_admission_call, &admission);
+	ps_backpressure_refresh();
+	check(metrics.wal_backpressure.lag_bytes == UINT64_MAX &&
+		  metrics.wal_backpressure.throttled != 0 && admission.calls == 0,
+		  "fenced residual keeps WAL throttle without an admission drain");
+	check(ps_test_wal_reclaim_maintenance() == 0 && admission.calls == 0,
+		  "fenced residual is not a maintenance candidate");
+	ps_test_set_admission_write_lock_hook(NULL, NULL);
 	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC");
 	(void) sleep(2);
 	check(ps_test_wal_reclaim_maintenance() == 0 && counter.attempts == 1,
 		  "fenced residual-query failure suppresses futile retries until reopen");
 	ps_test_set_wal_reclaim_attempt_hook(NULL, NULL);
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }
@@ -969,8 +1128,13 @@ test_failure_backoff(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-failure-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
+	PsShmHeader metrics;
 
 	configure_core();
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL controller for failure-backoff observation");
 	/* Keep the control pages in the memtable; otherwise page-prune work can
 	 * legitimately make the aggregate maintenance call return 1 after the WAL
 	 * reclaim attempt fails, obscuring the policy result under test. */
@@ -994,6 +1158,10 @@ test_failure_backoff(void)
 		check(counter.attempts == 1 && did == 0 &&
 			  segment_count(store, 0) == WAL_SEGMENTS,
 			  "metadata publication failure does not report reclaim work");
+		ps_backpressure_refresh();
+		check(metrics.wal_backpressure.throttled != 0 &&
+			  metrics.wal_backpressure.lag_bytes >= WAL_SEGMENT,
+			  "failed reclaim remains WAL backpressure debt during retry backoff");
 	}
 	{
 		int did = ps_core_maintenance();
@@ -1007,6 +1175,8 @@ test_failure_backoff(void)
 	(void) sleep(2);
 	check(maintenance_until_count(store, 0, 0),
 		  "failed reclaim retries after backoff and then deletes safely");
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }
@@ -1099,6 +1269,90 @@ test_concurrent_admission(void)
 	remove_tree(store);
 }
 
+typedef struct AdmissionTraffic
+{
+	volatile int stop;
+	volatile int reader_started;
+	volatile int refresh_done;
+} AdmissionTraffic;
+
+static void *
+admission_traffic_reader(void *arg)
+{
+	AdmissionTraffic *traffic = arg;
+
+	while (!__atomic_load_n(&traffic->stop, __ATOMIC_ACQUIRE))
+	{
+		ps_admission_read_lock();
+		__atomic_store_n(&traffic->reader_started, 1, __ATOMIC_RELEASE);
+		ps_admission_read_unlock();
+	}
+	return NULL;
+}
+
+static void *
+admission_traffic_refresh(void *arg)
+{
+	AdmissionTraffic *traffic = arg;
+
+	ps_backpressure_refresh();
+	__atomic_store_n(&traffic->refresh_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void
+test_wal_observation_beats_reader_traffic(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-reader-traffic-XXXXXX";
+	PsShmHeader metrics;
+	AdmissionTraffic traffic;
+	pthread_t readers[4];
+	pthread_t refresh;
+	int nreaders = 0;
+	int refresh_started = 0;
+
+	configure_core();
+	memset(&traffic, 0, sizeof(traffic));
+	memset(&metrics, 0, sizeof(metrics));
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
+		  "construct WAL debt for reader-preference observation");
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL backpressure for reader-preference observation");
+	for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++)
+	{
+		if (pthread_create(&readers[nreaders], NULL, admission_traffic_reader,
+						   &traffic) != 0)
+			break;
+		nreaders++;
+	}
+	for (int i = 0; i < 2000 &&
+			!__atomic_load_n(&traffic.reader_started, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+	check(nreaders == 4 &&
+			__atomic_load_n(&traffic.reader_started, __ATOMIC_ACQUIRE) != 0,
+		  "sustained admission readers are active before WAL observation");
+	if (pthread_create(&refresh, NULL, admission_traffic_refresh, &traffic) == 0)
+		refresh_started = 1;
+	for (int i = 0; refresh_started && i < 2000 &&
+			!__atomic_load_n(&traffic.refresh_done, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+	check(refresh_started &&
+			__atomic_load_n(&traffic.refresh_done, __ATOMIC_ACQUIRE) != 0 &&
+			ps_load_acquire(&metrics.wal_backpressure.throttled) != 0 &&
+			ps_load_acquire_u64(&metrics.wal_backpressure.lag_bytes) >= WAL_SEGMENT,
+		  "WAL lag observation eventually activates under reader traffic");
+	__atomic_store_n(&traffic.stop, 1, __ATOMIC_RELEASE);
+	for (int i = 0; i < nreaders; i++)
+		pthread_join(readers[i], NULL);
+	if (refresh_started)
+		pthread_join(refresh, NULL);
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -1109,6 +1363,7 @@ main(void)
 	test_progress_beyond_immutable_end();
 	test_child_branch_cap();
 	test_residual_prefix_retry_after_reopen();
+	test_residual_prefix_and_suffix_debt();
 	test_restart_with_crossing_flat_tail();
 	test_deleted_descendant_floor();
 	test_fenced_residual_query_stops_retries();
@@ -1120,6 +1375,7 @@ main(void)
 	test_floor_scan_does_not_hold_reader_gates();
 	test_failure_backoff();
 	test_concurrent_admission();
+	test_wal_observation_beats_reader_traffic();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

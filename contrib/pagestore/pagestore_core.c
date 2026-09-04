@@ -66,6 +66,10 @@ int			flush_pages = 256;	/* memtable flush threshold (pages) */
 int			compact_layers = 8;	/* compact a timeline past this many image layers */
 int			segment_gc_enabled = 1;
 int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
+uint64_t	page_reclaim_high_water_bytes;
+uint64_t	page_reclaim_catchup_bytes;
+uint64_t	wal_reclaim_high_water_bytes;
+uint64_t	wal_reclaim_catchup_bytes;
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -188,6 +192,11 @@ static uint32_t lifecycle_active_readers;
 static uint32_t lifecycle_waiting_writers;
 static int lifecycle_writer_active;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t admission_turnstile = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t admission_turnstile_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t admission_active_readers;
+static uint32_t admission_waiting_writers;
+static int admission_writer_active;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
@@ -202,6 +211,8 @@ static PsLifecycleWriteQueuedTestHook lifecycle_write_queued_test_hook;
 static void *lifecycle_write_queued_test_hook_arg;
 static PsAdmissionWriteLockTestHook admission_write_lock_test_hook;
 static void *admission_write_lock_test_hook_arg;
+static PsAdmissionWriteQueuedTestHook admission_write_queued_test_hook;
+static void *admission_write_queued_test_hook_arg;
 static PsLifecycleWriteLockTestHook lifecycle_write_lock_test_hook;
 static void *lifecycle_write_lock_test_hook_arg;
 static PsWalReclaimAttemptTestHook wal_reclaim_attempt_test_hook;
@@ -217,6 +228,41 @@ static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
  * durable frontier and generation-manifest cutover. */
 static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *metrics_header;
+
+typedef struct PsBackpressureController
+{
+	uint64_t	high_water_bytes;
+	uint64_t	catchup_bytes;
+	uint64_t	lag_bytes;
+	int		throttled;
+	uint64_t	throttle_enters;
+	uint64_t	throttle_exits;
+	uint64_t	foreground_wait_ns;
+} PsBackpressureController;
+
+static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
+static PsBackpressureController page_backpressure;
+static PsBackpressureController wal_backpressure;
+static int backpressure_shutdown_requested;
+static uint32_t backpressure_gate_mask;
+static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
+static void *backpressure_slow_path_test_hook_arg;
+
+#define PS_BACKPRESSURE_GATE_PAGE_ENABLED	(1u << 0)
+#define PS_BACKPRESSURE_GATE_WAL_ENABLED	(1u << 1)
+#define PS_BACKPRESSURE_GATE_PAGE_THROTTLED	(1u << 2)
+#define PS_BACKPRESSURE_GATE_WAL_THROTTLED	(1u << 3)
+#define PS_BACKPRESSURE_GATE_THROTTLED_MASK \
+	(PS_BACKPRESSURE_GATE_PAGE_THROTTLED | PS_BACKPRESSURE_GATE_WAL_THROTTLED)
+
+static uint64_t page_reclaim_lag_bytes(void);
+static uint64_t wal_reclaim_lag_bytes(void);
+static int admission_write_lock(void);
+static void backpressure_publish_locked(void);
+static void backpressure_update_locked(PsBackpressureController *controller,
+										 uint64_t lag, uint64_t high,
+										 uint64_t catchup);
+static uint32_t core_shards(void);
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
 #define PS_PAGE_FRONTIER_VERSION 3
@@ -504,7 +550,30 @@ ps_lifecycle_write_unlock(void)
 void
 ps_admission_read_lock(void)
 {
-	pthread_rwlock_rdlock(&admission_lock);
+	int rc;
+
+	pthread_mutex_lock(&admission_turnstile);
+	while (admission_waiting_writers != 0 || admission_writer_active)
+		pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+	if (admission_active_readers == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	/* Reserve the reader before dropping the turnstile.  A writer which queues
+	 * between this point and pthread_rwlock_rdlock() must still wait for us. */
+	admission_active_readers++;
+	pthread_mutex_unlock(&admission_turnstile);
+	rc = pthread_rwlock_rdlock(&admission_lock);
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&admission_turnstile);
+		admission_active_readers--;
+		if (admission_active_readers == 0)
+			pthread_cond_broadcast(&admission_turnstile_cond);
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
 	if (admission_read_test_hook != NULL)
 		admission_read_test_hook(admission_read_test_hook_arg);
 }
@@ -513,6 +582,203 @@ void
 ps_admission_read_unlock(void)
 {
 	pthread_rwlock_unlock(&admission_lock);
+	pthread_mutex_lock(&admission_turnstile);
+	if (admission_active_readers == 0)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	admission_active_readers--;
+	if (admission_active_readers == 0)
+		pthread_cond_broadcast(&admission_turnstile_cond);
+	pthread_mutex_unlock(&admission_turnstile);
+}
+
+static int
+backpressure_stop_observed(const volatile sig_atomic_t *stop_flag)
+{
+	if (__atomic_load_n(&backpressure_shutdown_requested, __ATOMIC_ACQUIRE) ||
+		(stop_flag != NULL && *stop_flag != 0))
+		return 1;
+	/* The signal handler only publishes STOPPING in shared memory.  The worker
+	 * admission probe observes it without calling pthread APIs from the handler. */
+	return metrics_header != NULL &&
+		ps_load_acquire(&metrics_header->startup_state) == PS_SHM_STOPPING;
+}
+
+static void
+backpressure_publish_locked(void)
+{
+	PsShmHeader *hdr = metrics_header;
+	uint32_t gate_mask = 0;
+
+	if (page_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_ENABLED;
+	if (wal_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_WAL_ENABLED;
+	if (page_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_THROTTLED;
+	if (wal_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_WAL_THROTTLED;
+	/* Publish controller state before advertising the corresponding fast-path
+	 * mask.  Slow-path callers recheck authoritative state under the mutex. */
+	__atomic_store_n(&backpressure_gate_mask, gate_mask, __ATOMIC_RELEASE);
+
+	if (hdr == NULL)
+		return;
+	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
+	ps_store_release_u64(&hdr->page_backpressure.lag_bytes,
+						 page_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->page_backpressure.high_water_bytes,
+						 page_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->page_backpressure.catchup_bytes,
+						 page_backpressure.catchup_bytes);
+	ps_store_release(&hdr->page_backpressure.throttled,
+					 page_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->page_backpressure.throttle_enters,
+						 page_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->page_backpressure.throttle_exits,
+						 page_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->page_backpressure.foreground_wait_ns,
+						 page_backpressure.foreground_wait_ns);
+	ps_store_release_u64(&hdr->wal_backpressure.lag_bytes,
+						 wal_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->wal_backpressure.high_water_bytes,
+						 wal_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->wal_backpressure.catchup_bytes,
+						 wal_backpressure.catchup_bytes);
+	ps_store_release(&hdr->wal_backpressure.throttled,
+					 wal_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->wal_backpressure.throttle_enters,
+						 wal_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->wal_backpressure.throttle_exits,
+						 wal_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->wal_backpressure.foreground_wait_ns,
+						 wal_backpressure.foreground_wait_ns);
+	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
+}
+
+int
+ps_backpressure_configure(uint64_t page_high_water,
+						  uint64_t page_catchup,
+						  uint64_t wal_high_water,
+						  uint64_t wal_catchup)
+{
+	if ((page_high_water == 0 && page_catchup != 0) ||
+		(page_high_water != 0 && page_catchup >= page_high_water) ||
+		(page_high_water != 0 && !segment_gc_enabled) ||
+		(wal_high_water == 0 && wal_catchup != 0) ||
+		(wal_high_water != 0 && wal_catchup >= wal_high_water))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	page_reclaim_high_water_bytes = page_high_water;
+	page_reclaim_catchup_bytes = page_catchup;
+	wal_reclaim_high_water_bytes = wal_high_water;
+	wal_reclaim_catchup_bytes = wal_catchup;
+	pthread_mutex_lock(&backpressure_lock);
+	memset(&page_backpressure, 0, sizeof(page_backpressure));
+	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
+	page_backpressure.high_water_bytes = page_high_water;
+	page_backpressure.catchup_bytes = page_catchup;
+	wal_backpressure.high_water_bytes = wal_high_water;
+	wal_backpressure.catchup_bytes = wal_catchup;
+	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+	return 0;
+}
+
+int
+ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
+						  uint32_t *cause_mask)
+{
+	uint32_t causes = 0;
+	uint32_t gate_mask;
+
+	/* The disabled/no-throttle path must stay out of the process-wide mutex.
+	 * STOPPING is checked first so disabling the controllers cannot hide
+	 * shutdown from a deferred foreground request. */
+	if (backpressure_stop_observed(stop_flag))
+	{
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return -1;
+	}
+	gate_mask = __atomic_load_n(&backpressure_gate_mask, __ATOMIC_ACQUIRE);
+	if ((gate_mask & PS_BACKPRESSURE_GATE_THROTTLED_MASK) == 0)
+	{
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return 1;
+	}
+	if (backpressure_slow_path_test_hook != NULL)
+		backpressure_slow_path_test_hook(backpressure_slow_path_test_hook_arg);
+
+	pthread_mutex_lock(&backpressure_lock);
+	if (backpressure_stop_observed(stop_flag))
+	{
+		pthread_mutex_unlock(&backpressure_lock);
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return -1;
+	}
+	if (page_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_PAGE;
+	if (wal_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_WAL;
+	pthread_mutex_unlock(&backpressure_lock);
+	if (cause_mask != NULL)
+		*cause_mask = causes;
+	return causes == 0 ? 1 : 0;
+}
+
+void
+ps_backpressure_record_wait(uint64_t page_wait_ns, uint64_t wal_wait_ns)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	if (page_wait_ns != 0)
+		page_backpressure.foreground_wait_ns =
+			UINT64_MAX - page_backpressure.foreground_wait_ns < page_wait_ns ?
+			UINT64_MAX : page_backpressure.foreground_wait_ns + page_wait_ns;
+	if (wal_wait_ns != 0)
+		wal_backpressure.foreground_wait_ns =
+			UINT64_MAX - wal_backpressure.foreground_wait_ns < wal_wait_ns ?
+			UINT64_MAX : wal_backpressure.foreground_wait_ns + wal_wait_ns;
+	if (page_wait_ns != 0 || wal_wait_ns != 0)
+		backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_backpressure_shutdown(void)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	__atomic_store_n(&backpressure_shutdown_requested, 1, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&page_backpressure, page_lag,
+							   page_reclaim_high_water_bytes,
+							   page_reclaim_catchup_bytes);
+	backpressure_update_locked(&wal_backpressure, wal_lag,
+							   wal_reclaim_high_water_bytes,
+							   wal_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_test_set_backpressure_slow_path_hook(PsBackpressureSlowPathTestHook hook,
+									 void *arg)
+{
+	backpressure_slow_path_test_hook = hook;
+	backpressure_slow_path_test_hook_arg = arg;
 }
 
 void
@@ -569,6 +835,14 @@ ps_test_set_admission_write_lock_hook(PsAdmissionWriteLockTestHook hook,
 }
 
 void
+ps_test_set_admission_write_queued_hook(PsAdmissionWriteQueuedTestHook hook,
+										void *arg)
+{
+	admission_write_queued_test_hook = hook;
+	admission_write_queued_test_hook_arg = arg;
+}
+
+void
 ps_test_set_lifecycle_write_lock_hook(PsLifecycleWriteLockTestHook hook,
 									  void *arg)
 {
@@ -603,10 +877,43 @@ ps_test_set_wal_read_before_lock_hook(PsWalReadBeforeLockTestHook hook,
 static int
 admission_write_lock(void)
 {
+	int rc;
+
+	pthread_mutex_lock(&admission_turnstile);
+	admission_waiting_writers++;
+	if (admission_write_queued_test_hook != NULL)
+		admission_write_queued_test_hook(admission_write_queued_test_hook_arg);
 	if (admission_write_lock_test_hook != NULL)
-		return admission_write_lock_test_hook(&admission_lock,
-										  admission_write_lock_test_hook_arg);
-	return pthread_rwlock_wrlock(&admission_lock);
+	{
+		/* Preserve the hook's historical meaning: it replaces the blocking
+		 * pthread rwlock call, so tests can observe that call while readers are
+		 * still active.  Mark the writer active before dropping the turnstile;
+		 * otherwise a new reader could pass while the hook is blocked. */
+		while (admission_writer_active)
+			pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+		admission_waiting_writers--;
+		admission_writer_active = 1;
+		pthread_mutex_unlock(&admission_turnstile);
+		rc = admission_write_lock_test_hook(&admission_lock,
+										 admission_write_lock_test_hook_arg);
+	}
+	else
+	{
+		while (admission_writer_active || admission_active_readers != 0)
+			pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+		admission_waiting_writers--;
+		admission_writer_active = 1;
+		pthread_mutex_unlock(&admission_turnstile);
+		rc = pthread_rwlock_wrlock(&admission_lock);
+	}
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&admission_turnstile);
+		admission_writer_active = 0;
+		pthread_cond_broadcast(&admission_turnstile_cond);
+		pthread_mutex_unlock(&admission_turnstile);
+	}
+	return rc;
 }
 
 int
@@ -619,6 +926,15 @@ void
 ps_admission_write_unlock(void)
 {
 	pthread_rwlock_unlock(&admission_lock);
+	pthread_mutex_lock(&admission_turnstile);
+	if (!admission_writer_active)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	admission_writer_active = 0;
+	pthread_cond_broadcast(&admission_turnstile_cond);
+	pthread_mutex_unlock(&admission_turnstile);
 }
 
 uint64_t
@@ -626,11 +942,12 @@ ps_admission_barrier(void)
 {
 	uint64_t	seq;
 
-	pthread_rwlock_wrlock(&admission_lock);
+	if (admission_write_lock() != 0)
+		return 0;
 	seq = admission_seq_alloc();
 	if (seq != 0 && ps_retention_reserve_admission_seq(seq) != 0)
 		seq = 0;
-	pthread_rwlock_unlock(&admission_lock);
+	ps_admission_write_unlock();
 	return seq;
 }
 
@@ -682,6 +999,10 @@ typedef struct Shard
 	uint64_t	cur_off;			/* append cursor byte offset within cur_seg */
 	PsFlushWatermark flush_watermark;
 	uint32_t	gc_next_seg;		/* oldest segment not yet reclaimed */
+	uint64_t	gc_debt_segments;	/* existing, nonempty covered segments */
+	uint32_t	gc_pending_remove_seg;	/* victim whose remove result is ambiguous */
+	int			gc_pending_remove;
+	int			gc_storage_error;	/* sticky fail-closed storage observation */
 	int			flush_watermark_valid;
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
@@ -691,6 +1012,141 @@ typedef struct Shard
 } Shard;
 
 static Shard g_shards[MAX_SHARDS];
+
+static uint64_t
+backpressure_saturating_add(uint64_t left, uint64_t right)
+{
+	return UINT64_MAX - left < right ? UINT64_MAX : left + right;
+}
+
+/* Settle one physical PAGE-debt unit.  A pending remove identifies the only
+ * victim whose result is ambiguous; matching it here also clears that state,
+ * so a later remove/ENOENT observation cannot settle the same (shard, seg)
+ * twice.  Callers without a pending remove must explicitly prove that the
+ * segment was counted before asking to settle it. */
+static void
+page_gc_debt_settle(Shard *s, uint32_t seg, int known_counted)
+{
+	int pending = s->gc_pending_remove &&
+		s->gc_pending_remove_seg == seg;
+
+	if (!pending && !known_counted)
+		return;
+	if (s->gc_debt_segments != 0)
+		s->gc_debt_segments--;
+	if (pending)
+		s->gc_pending_remove = 0;
+}
+
+/* Only complete segments already covered by a durable flush watermark are
+ * debt.  Live versions/retained bytes in the boundary segment are not. */
+static uint64_t
+page_reclaim_lag_bytes(void)
+{
+	uint64_t lag = 0;
+
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		uint64_t segments;
+
+		ps_lock_shard_rd(shard);
+		/* The count is rebuilt once at startup and maintained by successful GC;
+		 * controller refresh therefore remains O(number of shards), independent
+		 * of the historical segment-id span.  Any runtime storage error is sticky
+		 * and reports fail-closed lag rather than clearing an active throttle. */
+		if (g_shards[shard].gc_storage_error)
+		{
+			ps_unlock_shard(shard);
+			return UINT64_MAX;
+		}
+		segments = g_shards[shard].gc_debt_segments;
+		ps_unlock_shard(shard);
+		if (segment_size != 0 && segments > UINT64_MAX / segment_size)
+			return UINT64_MAX;
+		lag = backpressure_saturating_add(lag, segments * segment_size);
+	}
+	return lag;
+}
+
+/* Rebuild the process-local GC cursor and the incremental debt count from the
+ * durable watermark.  This is a startup-only scan; refreshes use the count.
+ * Zero-length files are present cursor entries but do not represent debt. */
+static int
+rebuild_page_gc_state(Shard *s)
+{
+	uint32_t boundary;
+	int found = 0;
+
+	s->gc_next_seg = 0;
+	s->gc_debt_segments = 0;
+	s->gc_pending_remove_seg = 0;
+	s->gc_pending_remove = 0;
+	s->gc_storage_error = 0;
+	if (!s->flush_watermark_valid || ps_storage == NULL ||
+		ps_storage->seg_size == NULL)
+		return 0;
+	boundary = s->flush_watermark.seg_id;
+	s->gc_next_seg = boundary;
+	for (uint32_t seg = 0; seg < boundary; seg++)
+	{
+		int64_t bytes;
+
+		errno = 0;
+		bytes = ps_storage->seg_size(s->id, (int) seg);
+		if (bytes < 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			if (errno == 0)
+				errno = EIO;
+			return -1;
+		}
+		if (!found)
+		{
+			s->gc_next_seg = seg;
+			found = 1;
+		}
+		if (bytes > 0)
+			s->gc_debt_segments = backpressure_saturating_add(
+				s->gc_debt_segments, 1);
+	}
+	return 0;
+}
+
+/* Add only physical segments newly covered by a durable watermark.  The
+ * watermark is an id boundary, not proof that every id below it has a file:
+ * POSIX stores may be sparse and an empty file is not reclaimable debt.  This
+ * is incremental (newly covered ids only); startup is the only historical
+ * scan, and refresh remains O(number of shards). */
+static void
+account_page_gc_coverage(Shard *s, uint32_t old_boundary,
+						 uint32_t new_boundary)
+{
+	if (ps_storage == NULL || ps_storage->seg_size == NULL)
+		return;
+	for (uint32_t seg = old_boundary; seg < new_boundary; seg++)
+	{
+		int64_t bytes;
+
+		errno = 0;
+		bytes = ps_storage->seg_size(s->id, (int) seg);
+		if (bytes < 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			if (errno == 0)
+				errno = EIO;
+			/* The manifest watermark is already durable.  Do not invent a
+			 * count after an uncertain size observation; the sticky error
+			 * makes the controller fail closed until the next open. */
+			s->gc_storage_error = 1;
+			return;
+		}
+		if (bytes > 0)
+			s->gc_debt_segments = backpressure_saturating_add(
+				s->gc_debt_segments, 1);
+	}
+}
 
 /*
  * Concurrency.  A per-shard rwlock guards each shard's in-memory state
@@ -1072,6 +1528,8 @@ static int
 flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 {
 	int			rc;
+	uint32_t	old_boundary = s->flush_watermark_valid ?
+		s->flush_watermark.seg_id : 0;
 
 	if (!s->memtable || ps_memtable_count(s->memtable) == 0)
 		return 0;
@@ -1088,6 +1546,10 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 		s->coverage_broken = 1;
 		return -1;
 	}
+	/* Keep the disabled controller off the extra per-segment metadata path as
+	 * well.  A later enabled open rebuilds the durable prefix exactly once. */
+	if (page_reclaim_high_water_bytes != 0 && seg_id > old_boundary)
+		account_page_gc_coverage(s, old_boundary, seg_id);
 	s->flush_watermark.shard = s->id;
 	s->flush_watermark.seg_id = seg_id;
 	s->flush_watermark.seg_off = seg_off;
@@ -2908,21 +3370,30 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 static int
 page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 {
-	int64_t bytes = ps_storage->seg_size(s->id, seg);
+	int64_t bytes;
 	unsigned char *replacement = NULL;
 	SegmentReloc *relocs = NULL;
 	uint32_t nrelocs = 0, reloc_cap = 0;
 	uint64_t off = 0, out_off = 0;
 	uint64_t watermark_new = 0, cursor_new = 0;
 	int watermark_seen = 0, cursor_seen = 0, cursor_retired = 0, found = 0;
+	int counted_debt = 0;
 	PsFlushWatermark watermark = {0};
 	int have_watermark = s->flush_watermark_valid &&
 		s->flush_watermark.seg_id == (uint32_t) seg;
 
+	errno = 0;
+	bytes = ps_storage->seg_size(s->id, seg);
 	if (bytes < 0 || (uint64_t) bytes > segment_size ||
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
 		return -1;
+	/* PAGE debt is an aggregate of nonempty, covered segments in the
+	 * reclaimable prefix.  A successful deletion rewrite can turn one such
+	 * segment into an empty file before segment GC sees it. */
+	counted_debt = page_reclaim_high_water_bytes != 0 && bytes > 0 &&
+		s->flush_watermark_valid && (uint32_t) seg < s->flush_watermark.seg_id &&
+		(uint32_t) seg >= s->gc_next_seg && s->gc_debt_segments != 0;
 	if (have_watermark)
 	{
 		watermark = s->flush_watermark;
@@ -3101,6 +3572,8 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	}
 	if (s->cur_seg == seg)
 		s->cur_off = cursor_retired ? segment_size : cursor_new;
+	if (out_off == 0 && counted_debt)
+		page_gc_debt_settle(s, (uint32_t) seg, 1);
 	free(relocs);
 	free(replacement);
 	return 1;
@@ -7693,6 +8166,8 @@ ps_core_set_metrics_header(PsShmHeader *hdr)
 {
 	metrics_header = hdr;
 	publish_wal_index_metrics();
+	if (hdr != NULL)
+		ps_backpressure_refresh();
 }
 
 static void
@@ -7881,10 +8356,15 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
 /* Read only stable per-timeline state while the WAL lock excludes append,
  * segment sync and reclaim.  This is deliberately weaker than a safety
  * decision: the caller must repeat the complete validation after admission and
- * the WAL-index gates have drained. */
+ * the WAL-index gates have drained.  Observation ignores retry_at so a failed
+ * reclaim cannot make real physical debt disappear; maintenance passes
+ * honor_retry_at to avoid repeatedly draining admission for the same failure. */
 static int
-wal_reclaim_preselected(struct timespec *now_out)
+wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at,
+						int *observation_error)
 {
+	if (observation_error != NULL)
+		*observation_error = 0;
 	if (clock_gettime(CLOCK_MONOTONIC, now_out) != 0)
 		return 0;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
@@ -7895,9 +8375,10 @@ wal_reclaim_preselected(struct timespec *now_out)
 		int residual_status;
 		int eligible;
 
-		if (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
-			(now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
-			 now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec) ||
+		if ((honor_retry_at &&
+			 (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
+			  (now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
+			   now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec))) ||
 			!ps_timeline_live(tl))
 			continue;
 		wal_lock = wal_log_lock_for(tl);
@@ -7908,6 +8389,10 @@ wal_reclaim_preselected(struct timespec *now_out)
 			ps_wal_store_residual_prefix_pending(&wal_segment_stores[tl],
 											 &residual_target) : 0;
 		residual_pending = residual_status > 0;
+		if (residual_status < 0 && observation_error != NULL)
+			*observation_error = 1;
+		/* A residual/storage error is an observation failure, not a
+		 * maintenance candidate: draining admission cannot repair it. */
 		eligible = wal_segment_store_opened[tl] && residual_status >= 0 &&
 			(residual_pending ||
 			 (wal_segment_stores[tl].nentries != 0 &&
@@ -7942,7 +8427,7 @@ wal_segment_reclaim_one(void)
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0)
 		return 0; /* SPDK and unknown providers have no safe R3b policy. */
-	if (!wal_reclaim_preselected(&now))
+	if (!wal_reclaim_preselected(&now, 1, NULL))
 		return 0;
 	if (admission_write_lock() != 0)
 		return 0;
@@ -11432,6 +11917,189 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 	return retention_effective_floor_internal(timeline, resource, floor_out, 0);
 }
 
+/* Return only immutable WAL bytes which the existing R3b proof would permit
+ * this maintenance pass to reclaim.  In particular, this never treats the
+ * current boundary or an unproven end-start interval as lag. */
+static uint64_t
+wal_reclaim_lag_bytes(void)
+{
+	struct timespec now;
+	uint64_t lag = 0;
+	int observation_error = 0;
+
+	if (ps_storage == NULL || ps_storage->name == NULL ||
+		strcmp(ps_storage->name, "posix") != 0)
+		return 0;
+	if (!wal_reclaim_preselected(&now, 0, &observation_error))
+		return observation_error ? UINT64_MAX : 0;
+	if (observation_error)
+		return UINT64_MAX;
+	if (admission_write_lock() != 0)
+		return 0;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		pthread_rwlock_t *wal_lock;
+		PsWalStore *store;
+		uint64_t start;
+		uint64_t end;
+		uint64_t progress = 0;
+		uint64_t raw_floor = 0;
+		uint64_t retention_floor = 0;
+		uint64_t target = 0;
+		uint64_t residual_bytes = 0;
+		uint64_t residual_target = 0;
+		int residual_status;
+		int residual_pending;
+		int suffix_candidate;
+		int walidx_valid;
+		int proof_rc = 0;
+
+		if (!ps_timeline_live(tl) || (wal_lock = wal_log_lock_for(tl)) == NULL)
+			continue;
+		for (uint32_t shard = 0; shard < core_shards(); shard++)
+			ps_lock_shard_wr(shard);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		residual_status = wal_segment_store_opened[tl] ?
+			ps_wal_store_residual_prefix_pending(store, &residual_target) : 0;
+		residual_pending = residual_status > 0;
+		if (residual_status > 0 &&
+			ps_wal_store_residual_prefix_bytes(store, &residual_bytes) != 0)
+			residual_status = -1;
+		if (!wal_segment_store_opened[tl] || residual_status < 0 ||
+			store->metadata_fenced)
+		{
+			if (residual_status < 0 || store->metadata_fenced)
+				lag = UINT64_MAX;
+			goto wal_lag_unlock;
+		}
+		start = store->start_lsn;
+		end = store->end_lsn;
+		if (residual_pending)
+		{
+			/* Recovery publishes start_lsn at the logical frontier while the
+			 * residual marker describes only the older physical prefix.  The
+			 * two ranges are therefore disjoint, but only when the marker's
+			 * target agrees with that frontier. */
+			if (residual_target != start)
+			{
+				lag = UINT64_MAX;
+				goto wal_lag_unlock;
+			}
+			lag = backpressure_saturating_add(lag, residual_bytes);
+		}
+		suffix_candidate = store->nentries != 0 && store->segment_size != 0 &&
+			start <= UINT64_MAX - store->segment_size &&
+			start + store->segment_size <= end;
+		if (!suffix_candidate)
+			goto wal_lag_unlock;
+		pthread_mutex_lock(&walidx_meta_lock);
+		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
+		pthread_mutex_unlock(&walidx_meta_lock);
+		ps_lock_map_rd();
+		if (walidx_valid)
+			proof_rc = wal_reclaim_raw_dependency_floor(tl, start, &raw_floor);
+		ps_unlock_map();
+		for (uint32_t shard = core_shards(); shard > 0; shard--)
+			ps_unlock_shard(shard - 1);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		pthread_rwlock_unlock(wal_lock);
+		if (!walidx_valid || proof_rc != 0 ||
+			retention_effective_floor(tl, PS_RETENTION_RESOURCE_WAL,
+									 &retention_floor) != 0 || retention_floor == 0)
+		{
+			/* If a residual was observed and a complete suffix candidate also
+			 * exists, returning only the residual would incorrectly release a
+			 * throttle.  The physical prefix remains evidence of debt, so an
+			 * unprovable suffix is deliberately fail-closed. */
+			if (residual_pending)
+				lag = UINT64_MAX;
+			continue;
+		}
+		for (uint32_t shard = 0; shard < core_shards(); shard++)
+			ps_lock_shard_wr(shard);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		if (!wal_segment_store_opened[tl] || store->metadata_fenced ||
+			store->start_lsn != start || store->end_lsn != end)
+		{
+			if (residual_pending)
+				lag = UINT64_MAX;
+			goto wal_lag_unlock;
+		}
+		target = retention_floor < progress ? retention_floor : progress;
+		if (raw_floor != 0 && raw_floor < target)
+			target = raw_floor;
+		if (timeline_has_parent(tl) && timelines[tl].branch_lsn < target)
+			target = timelines[tl].branch_lsn;
+		if (target > end)
+			target = end;
+		target -= target % store->segment_size;
+		if (target > start)
+			lag = backpressure_saturating_add(lag, target - start);
+
+wal_lag_unlock:
+		pthread_rwlock_unlock(wal_lock);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		for (uint32_t shard = core_shards(); shard > 0; shard--)
+			ps_unlock_shard(shard - 1);
+	}
+	ps_admission_write_unlock();
+	return lag;
+}
+
+static void
+backpressure_update_locked(PsBackpressureController *controller,
+						   uint64_t lag, uint64_t high, uint64_t catchup)
+{
+	controller->lag_bytes = lag;
+	controller->high_water_bytes = high;
+	controller->catchup_bytes = catchup;
+	if (high == 0)
+	{
+		if (controller->throttled)
+		{
+			controller->throttled = 0;
+			controller->throttle_exits++;
+		}
+	}
+	else if (!controller->throttled && lag >= high)
+	{
+		controller->throttled = 1;
+		controller->throttle_enters++;
+	}
+	else if (controller->throttled && lag <= catchup)
+	{
+		controller->throttled = 0;
+		controller->throttle_exits++;
+	}
+}
+
+void
+ps_backpressure_refresh(void)
+{
+	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
+		page_reclaim_lag_bytes() : 0;
+	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
+		wal_reclaim_lag_bytes() : 0;
+
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&page_backpressure, page_lag,
+							   page_reclaim_high_water_bytes,
+							   page_reclaim_catchup_bytes);
+	backpressure_update_locked(&wal_backpressure, wal_lag,
+							   wal_reclaim_high_water_bytes,
+							   wal_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
 /* ===================== recovery (layers + segment tail) =============== */
 
 typedef struct LayerRecoverRec
@@ -11671,11 +12339,16 @@ recover(uint32_t shard)
 	{
 		uint64_t	off = (id == first && s->flush_watermark_valid) ?
 			s->flush_watermark.seg_off : 0;
-		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
+		int64_t		seg_bytes;
 		int			retire_segment = 0;
 
+		errno = 0;
+		seg_bytes = ps_storage->seg_size(shard, id);
 		if (seg_bytes < 0)
 			break;
+		/* A negative size is the storage contract's end-of-log sentinel.
+		 * In particular, SPDK intentionally does not set errno for this case.
+		 * PAGE debt observation has separate POSIX-specific error handling. */
 		if ((uint64_t) seg_bytes < off)
 			goto fail;
 		for (;;)
@@ -12411,7 +13084,10 @@ ps_handle_meta(PsChannel *ch)
 					/* A retried controller fence may be newer than this
 					 * process's recovered allocator.  Serialize its durable SET
 					 * with mutations and advance allocation before admitting more. */
-					pthread_rwlock_wrlock(&admission_lock);
+					if (admission_write_lock() != 0)
+						ret = PS_RETENTION_ERROR;
+					else
+					{
 					pthread_rwlock_wrlock(&page_prune_lock);
 					pthread_rwlock_wrlock(&walidx_prune_lock);
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
@@ -12470,7 +13146,8 @@ ps_handle_meta(PsChannel *ch)
 					}
 					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
-					pthread_rwlock_unlock(&admission_lock);
+					ps_admission_write_unlock();
+					}
 				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
@@ -12500,7 +13177,8 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
-				pthread_rwlock_wrlock(&admission_lock);
+				if (admission_write_lock() == 0)
+				{
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
 				pthread_rwlock_wrlock(&page_prune_lock);
@@ -12553,7 +13231,8 @@ ps_handle_meta(PsChannel *ch)
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
-				pthread_rwlock_unlock(&admission_lock);
+				ps_admission_write_unlock();
+				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
@@ -12936,12 +13615,37 @@ reclaim_one_segment(Shard *s)
 {
 	uint32_t	victim;
 	uint32_t	ns = core_shards();
+	int64_t		seg_bytes;
 	int			refs;
 
 	if (!s->flush_watermark_valid || !ps_storage->seg_remove ||
 		s->gc_next_seg >= s->flush_watermark.seg_id)
 		return 0;
 	victim = s->gc_next_seg;
+	if (ps_storage->seg_size != NULL)
+	{
+		errno = 0;
+		seg_bytes = ps_storage->seg_size(s->id, (int) victim);
+		if (seg_bytes < 0)
+		{
+			if (errno == ENOENT)
+			{
+				/* A sparse hole is not debt.  A prior remove may have
+				 * unlinked it before reporting an ambiguous directory fsync;
+				 * settle that already-counted victim exactly once when its
+				 * absence is confirmed. */
+				page_gc_debt_settle(s, victim, 0);
+				s->gc_next_seg++;
+				return 1;
+			}
+			if (errno == 0)
+				errno = EIO;
+			s->gc_storage_error = 1;
+			return 0;
+		}
+	}
+	else
+		seg_bytes = (int64_t) segment_size;
 	refs = segment_has_references(s->id, victim);
 	if (verify_segment_layers_locked(s->id, victim, refs) != 0)
 		return 0;
@@ -12955,8 +13659,18 @@ reclaim_one_segment(Shard *s)
 						e->vers[i].seg = -1;
 						e->vers[i].off = 0;
 					}
+	/* Once a positive-size covered victim is known to be counted, remember it
+	 * before remove().  POSIX may unlink it and then fail the directory fsync;
+	 * the next ENOENT observation must settle the same debt unit. */
+	if (!s->gc_pending_remove && seg_bytes > 0 &&
+		s->gc_debt_segments != 0)
+	{
+		s->gc_pending_remove_seg = victim;
+		s->gc_pending_remove = 1;
+	}
 	if (ps_storage->seg_remove(s->id, (int) victim) != 0)
 		return 0;
+	page_gc_debt_settle(s, victim, 0);
 	s->gc_next_seg++;
 	return 1;
 }
@@ -13391,7 +14105,7 @@ ps_core_maintenance_impl(void)
 		pthread_rwlock_unlock(&page_prune_lock);
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
-		pthread_rwlock_unlock(&admission_lock);
+		ps_admission_write_unlock();
 		if (snapshot_rc)
 			return 1;
 	}
@@ -13588,6 +14302,11 @@ ps_core_maintenance(void)
 	 * writer fence after all ordinary/background work has drained. */
 	if (timeline_delete_publish_one())
 		did = 1;
+	/* Disabled-by-default controllers must not perturb the maintenance hot
+	 * path (or its scheduling) merely to republish an unchanged zero snapshot. */
+	if (page_reclaim_high_water_bytes != 0 ||
+		wal_reclaim_high_water_bytes != 0)
+		ps_backpressure_refresh();
 	return did;
 }
 
@@ -13727,12 +14446,24 @@ ps_core_open(const char *store_dir)
 		g_shards[i].cur_seg = -1;
 		g_shards[i].cur_off = 0;
 		g_shards[i].gc_next_seg = 0;
+		g_shards[i].gc_debt_segments = 0;
+		g_shards[i].gc_pending_remove_seg = 0;
+		g_shards[i].gc_pending_remove = 0;
+		g_shards[i].gc_storage_error = 0;
 		g_shards[i].coverage_broken = 0;
 		g_shards[i].flush_watermark_valid = 0;
 		if (use_layers && ps_manifest_get_flush_watermark(i, &watermark))
 		{
 			g_shards[i].flush_watermark = watermark;
 			g_shards[i].flush_watermark_valid = 1;
+			/* Rebuild the oldest present covered segment and the incremental
+			 * positive-size debt count.  Non-ENOENT storage errors fail startup
+			 * closed, preserving errno and never advancing the cursor.  Keep
+			 * the disabled controller off this path: it must not add a startup
+			 * storage scan to the default or SPDK behavior. */
+			if (page_reclaim_high_water_bytes != 0 &&
+				rebuild_page_gc_state(&g_shards[i]) != 0)
+				return -1;
 		}
 		g_shards[i].next_layer_id = 1;
 		pthread_rwlock_init(&shard_locks[i], NULL);

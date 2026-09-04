@@ -20,6 +20,7 @@
  */
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,6 +38,9 @@
 
 static volatile sig_atomic_t stop_requested = 0;
 static PsShmHeader *daemon_hdr = NULL;
+static const char *maintenance_pause_file = NULL;
+static const char *shutdown_cancel_pause_file = NULL;
+static int shutdown_cancel_ready_fd = -1;
 
 typedef struct WorkerArgs
 {
@@ -45,6 +49,119 @@ typedef struct WorkerArgs
 	uint32_t	nchannels;
 	uint32_t	nshards;
 } WorkerArgs;
+
+typedef struct BackpressureWaitSlot
+{
+	uint64_t	request_generation;
+	uint32_t	cause_mask;
+	uint64_t	last_probe_ns;
+	uint64_t	page_wait_ns;
+	uint64_t	wal_wait_ns;
+	int		active;
+} BackpressureWaitSlot;
+
+/* A channel belongs to exactly one shard worker, so these slots need no
+ * additional synchronization.  Keeping them per channel avoids charging a
+ * later request for time spent by an earlier deferred request. */
+static BackpressureWaitSlot backpressure_wait_slots[PS_MAX_CHANNELS];
+
+static uint64_t
+monotonic_ns(void)
+{
+	struct timespec now;
+	uint64_t sec;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0)
+		return 0;
+	sec = (uint64_t) now.tv_sec;
+	if (sec > UINT64_MAX / UINT64_C(1000000000))
+		return UINT64_MAX;
+	sec *= UINT64_C(1000000000);
+	if ((uint64_t) now.tv_nsec > UINT64_MAX - sec)
+		return UINT64_MAX;
+	return sec + (uint64_t) now.tv_nsec;
+}
+
+static void
+add_wait_ns(uint64_t *total, uint64_t elapsed)
+{
+	*total = UINT64_MAX - *total < elapsed ? UINT64_MAX : *total + elapsed;
+}
+
+static void
+accrue_backpressure_interval(BackpressureWaitSlot *slot, uint64_t now)
+{
+	uint64_t elapsed;
+
+	if (!slot->active || now < slot->last_probe_ns)
+		return;
+	elapsed = now - slot->last_probe_ns;
+	if ((slot->cause_mask & PS_BACKPRESSURE_PAGE) != 0)
+		add_wait_ns(&slot->page_wait_ns, elapsed);
+	if ((slot->cause_mask & PS_BACKPRESSURE_WAL) != 0)
+		add_wait_ns(&slot->wal_wait_ns, elapsed);
+}
+
+static void
+capture_backpressure_request(BackpressureWaitSlot *slot,
+							 const PsChannel *ch)
+{
+	slot->request_generation =
+		__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE);
+}
+
+static int
+backpressure_request_matches(const BackpressureWaitSlot *slot,
+							 const PsChannel *ch)
+{
+	return slot->request_generation ==
+		__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE);
+}
+
+static void finish_backpressure_wait(uint32_t channel);
+
+static void
+record_backpressure_probe(uint32_t channel, PsChannel *ch,
+						  uint32_t cause_mask)
+{
+	BackpressureWaitSlot *slot = &backpressure_wait_slots[channel];
+	uint64_t now = monotonic_ns();
+
+	if (slot->active)
+	{
+		/* A channel is not normally mutable while it is REQUEST, but if a
+		 * client abandoned and replaced it, close the old accounting interval
+		 * before tracking the new request. */
+		if (!backpressure_request_matches(slot, ch))
+		{
+			finish_backpressure_wait(channel);
+			capture_backpressure_request(slot, ch);
+			slot->active = 1;
+		}
+		accrue_backpressure_interval(slot, now);
+	}
+	else
+	{
+		capture_backpressure_request(slot, ch);
+		slot->active = 1;
+	}
+	slot->cause_mask = cause_mask;
+	slot->last_probe_ns = now;
+}
+
+static void
+finish_backpressure_wait(uint32_t channel)
+{
+	BackpressureWaitSlot *slot = &backpressure_wait_slots[channel];
+	uint64_t now;
+
+	if (!slot->active)
+		return;
+	now = monotonic_ns();
+	accrue_backpressure_interval(slot, now);
+	ps_backpressure_record_wait(slot->page_wait_ns, slot->wal_wait_ns);
+	memset(slot, 0, sizeof(*slot));
+}
 
 static void
 on_signal(int sig)
@@ -73,6 +190,39 @@ shm_mark_stopping(PsShmHeader *hdr)
 {
 	__atomic_store_n(&hdr->startup_state, PS_SHM_STOPPING, __ATOMIC_RELEASE);
 	__atomic_store_n(&hdr->magic, 0, __ATOMIC_RELEASE);
+}
+
+#define SHUTDOWN_CANCEL_READY_BYTE 0x5a
+
+/* Test-only pipe publication point.  The descriptor is inherited across
+ * exec, so the byte cannot be confused with a stale filesystem artifact. */
+static int
+publish_shutdown_cancel_ready(void)
+{
+	unsigned char byte = SHUTDOWN_CANCEL_READY_BYTE;
+	int fd = shutdown_cancel_ready_fd;
+
+	shutdown_cancel_ready_fd = -1;
+	if (fd < 0)
+		return 0;
+	for (;;)
+	{
+		ssize_t n = write(fd, &byte, 1);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n != 1)
+		{
+			(void) close(fd);
+			return -1;
+		}
+		break;
+	}
+	/* The byte is the publication point.  Closing the inherited descriptor is
+	 * cleanup only; a close error must not make the already-published handshake
+	 * look like a failed publication or skip the test pause. */
+	(void) close(fd);
+	return 0;
 }
 
 static int
@@ -263,6 +413,41 @@ request_is_write(PsOpcode opcode)
 			return 0;
 		default:
 			return 1;
+	}
+}
+
+/* Controller gating covers only operations which are known to mutate state.
+ * Keep this separate from request_is_write(): that function intentionally
+ * defaults unknown opcodes to the existing write/admission behavior, while a
+ * controller must never accidentally throttle a new or metadata-read opcode.
+ * Retention pin state changes intentionally remain outside request_is_write()'s
+ * admission-rd behavior. */
+static int
+request_is_mutation(const PsChannel *ch)
+{
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_BEGIN_DELETE:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_WAL_INDEX_ADD_BATCH:
+		case PS_OP_IMMEDSYNC:
+		case PS_OP_RETENTION_PIN_RESERVE:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_DROP:
+			return 1;
+		case PS_OP_WAL_INDEX_PROGRESS:
+			/* 0/0 is the read-current-progress form. */
+			return ch->req_lsn != 0 || ch->req_seq != 0;
+		default:
+			return 0;
 	}
 }
 
@@ -465,9 +650,34 @@ active_fence_epoch(void)
 /* Returns zero when a relation mutation is intentionally left in REQUEST
  * until the checkpoint owner publishes and syncs its admission fence. */
 static int
-run_request(PsChannel *ch)
+run_request(uint32_t channel, PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	/* Backpressure is checked before any lifecycle/admission/shard/map lock.
+	 * A throttled mutation remains in REQUEST so this worker can scan the next
+	 * channel; reads and maintenance never enter controller gating. */
+	if (request_is_mutation(ch))
+	{
+		uint32_t causes = 0;
+		int admit = ps_backpressure_try_admit(&stop_requested, &causes);
+
+		if (admit < 0)
+		{
+			finish_backpressure_wait(channel);
+			ch->status = PS_STATUS_ERROR;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			return 1;
+		}
+		if (admit == 0)
+		{
+			record_backpressure_probe(channel, ch, causes);
+			return 0;
+		}
+		/* Charge the complete final interval, including the probe which first
+		 * observed the controller catch-up transition. */
+		finish_backpressure_wait(channel);
+	}
 
 	if (op == PS_OP_BEGIN_DELETE)
 	{
@@ -568,7 +778,7 @@ shard_worker(void *arg)
 			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
 				continue;
 
-			if (run_request(ch))
+			if (run_request(i, ch))
 				did_work = 1;
 		}
 
@@ -581,6 +791,51 @@ shard_worker(void *arg)
 	}
 
 	return NULL;
+}
+
+/* All request workers are joined before this pass, so no daemon thread can be
+ * executing or advancing a channel while it runs.  REQUEST -> CANCELLING is
+ * the daemon-owned handoff: a client cannot validly abandon/reclaim and publish
+ * a new generation after this CAS.  The generation recheck handles the small
+ * probe/CAS race by restoring REQUEST without touching the newer request. */
+static void
+cancel_deferred_channels(void *shm, uint32_t nchannels)
+{
+	for (uint32_t i = 0; i < nchannels; i++)
+	{
+		BackpressureWaitSlot *slot = &backpressure_wait_slots[i];
+		PsChannel *ch;
+		uint64_t generation;
+
+		if (!slot->active)
+			continue;
+		ch = ps_channel(shm, i);
+		generation = slot->request_generation;
+		if (ps_load_acquire(&ch->claimed) == 0 ||
+			!backpressure_request_matches(slot, ch) ||
+			!ps_cas(&ch->state, PS_STATE_REQUEST, PS_STATE_CANCELLING))
+		{
+			finish_backpressure_wait(i);
+			continue;
+		}
+		/* The state CAS is the ownership transfer.  A valid client publishes
+		 * generation before REQUEST and cannot mutate it while CANCELLING. */
+		if (__atomic_load_n(&ch->request_generation, __ATOMIC_ACQUIRE) !=
+			generation)
+		{
+			finish_backpressure_wait(i);
+			/* The CAS may have raced a client that changed REQUEST between
+			 * the cheap generation probe and the ownership transfer.  Do not
+			 * write status or publish DONE for that newer generation; return
+			 * the state only if we still own CANCELLING. */
+			(void) ps_cas(&ch->state, PS_STATE_CANCELLING,
+						  PS_STATE_REQUEST);
+			continue;
+		}
+		finish_backpressure_wait(i);
+		ch->status = PS_STATUS_ERROR;
+		ps_store_release(&ch->state, PS_STATE_DONE);
+	}
 }
 
 /*
@@ -597,6 +852,19 @@ maintenance_worker(void *arg)
 
 	while (!stop_requested)
 	{
+		/* Test-only deterministic seam: keep the real maintenance thread alive
+		 * and refreshing controller state, while withholding reclaim progress. */
+		if (maintenance_pause_file != NULL &&
+			access(maintenance_pause_file, F_OK) == 0)
+		{
+			ps_backpressure_refresh();
+			{
+				struct timespec ts = {0, 1000000};
+
+				nanosleep(&ts, NULL);
+			}
+			continue;
+		}
 		if (!ps_core_maintenance())
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
@@ -606,6 +874,33 @@ maintenance_worker(void *arg)
 	}
 
 	return NULL;
+}
+
+static int
+parse_u64_option(const char *text, uint64_t *value)
+{
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (text == NULL || *text == '\0' || text[0] == '-')
+		return -1;
+	errno = 0;
+	parsed = strtoull(text, &end, 10);
+	if (errno == ERANGE || end == text || *end != '\0')
+		return -1;
+	*value = (uint64_t) parsed;
+	return 0;
+}
+
+static int
+parse_fd_option(const char *text, int *value)
+{
+	uint64_t parsed;
+
+	if (parse_u64_option(text, &parsed) != 0 || parsed > INT_MAX)
+		return -1;
+	*value = (int) parsed;
+	return 0;
 }
 
 int
@@ -639,6 +934,38 @@ main(int argc, char **argv)
 			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--page-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--page-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
+				 i + 1 < argc)
+			maintenance_pause_file = argv[++i];
+		else if (strcmp(argv[i], "--test-shutdown-cancel-pause-file") == 0 &&
+				 i + 1 < argc)
+			shutdown_cancel_pause_file = argv[++i];
+		else if (strcmp(argv[i], "--test-shutdown-cancel-ready-fd") == 0 &&
+				 i + 1 < argc)
+		{
+			if (parse_fd_option(argv[++i], &shutdown_cancel_ready_fd) != 0)
+				return 2;
+		}
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -659,7 +986,12 @@ main(int argc, char **argv)
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
 					"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
-					"[--nshards N] [--storage NAME]\n",
+					"[--nshards N] [--storage NAME] "
+					"[--page-high-water-bytes N --page-catch-up-bytes N] "
+					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+					"[--test-maintenance-pause-file PATH] "
+					"[--test-shutdown-cancel-pause-file PATH] "
+					"[--test-shutdown-cancel-ready-fd N]\n",
 					argv[0]);
 			return 2;
 		}
@@ -669,8 +1001,37 @@ main(int argc, char **argv)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
 				"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
-				"[--nshards N] [--storage NAME]\n",
+				"[--nshards N] [--storage NAME] "
+				"[--page-high-water-bytes N --page-catch-up-bytes N] "
+				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+				"[--test-maintenance-pause-file PATH] "
+				"[--test-shutdown-cancel-pause-file PATH] "
+				"[--test-shutdown-cancel-ready-fd N]\n",
 				argv[0]);
+		return 2;
+	}
+	if ((page_reclaim_high_water_bytes != 0 ||
+		 wal_reclaim_high_water_bytes != 0) &&
+		(ps_storage == NULL || ps_storage->name == NULL ||
+		 strcmp(ps_storage->name, "posix") != 0))
+	{
+		fprintf(stderr, "pagestore_daemon: backpressure requires the POSIX "
+				"storage backend (selected '%s')\n",
+				ps_storage != NULL && ps_storage->name != NULL ?
+				ps_storage->name : "none");
+		return 2;
+	}
+	if (ps_backpressure_configure(page_reclaim_high_water_bytes,
+								  page_reclaim_catchup_bytes,
+								  wal_reclaim_high_water_bytes,
+								  wal_reclaim_catchup_bytes) != 0)
+	{
+		if (page_reclaim_high_water_bytes != 0 && !segment_gc_enabled)
+			fprintf(stderr, "pagestore_daemon: page backpressure requires "
+					"--segment-gc 1 when page high-water is enabled\n");
+		else
+			fprintf(stderr, "pagestore_daemon: catch-up threshold must be less "
+					"than the enabled high-water threshold\n");
 		return 2;
 	}
 	ps_nshards = nshards;
@@ -800,6 +1161,28 @@ main(int argc, char **argv)
 		free(workers);
 		free(threads);
 	}
+	/* The signal handler invalidates readiness immediately.  Once every daemon
+	 * worker has stopped, finish the requests that were deliberately retained
+	 * in REQUEST by backpressure before core/shm teardown. */
+	shm_mark_stopping(hdr);
+	/* Test-only seam: workers are already joined, so a client can deterministically
+	 * abandon/reuse a deferred channel before the generation-checked cancellation
+	 * pass.  This is never configured by normal daemon users. */
+	if (shutdown_cancel_ready_fd >= 0 &&
+		publish_shutdown_cancel_ready() != 0)
+		fprintf(stderr, "pagestore_daemon: could not publish shutdown cancellation byte; "
+				"skipping test pause\n");
+	else
+	{
+		while (shutdown_cancel_pause_file != NULL &&
+			   access(shutdown_cancel_pause_file, F_OK) == 0)
+		{
+			struct timespec ts = {0, 1000000};
+
+			nanosleep(&ts, NULL);
+		}
+	}
+	cancel_deferred_channels(shm, hdr->nchannels);
 
 	{
 		uint64_t	rm,
@@ -818,7 +1201,6 @@ main(int argc, char **argv)
 				(unsigned long long) rs, (unsigned long long) ch,
 				(unsigned long long) cm, (unsigned long long) ce);
 	}
-	shm_mark_stopping(hdr);
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
 	return 0;

@@ -1081,9 +1081,12 @@ unlink_residual_prefix(PsWalStore *store, uint64_t target_lsn,
 				goto cleanup;
 			if (unlink_reclaim_segment(store, candidates[i]) != 0)
 				goto cleanup;
+			store->residual_prefix_start_lsn += store->segment_size;
 			(*unlink_count)++;
 		}
 	}
+	else
+		store->residual_prefix_start_lsn = target_lsn;
 	rc = 0;
 
 cleanup:
@@ -1312,6 +1315,7 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 		 * longer part of the logical catalog.  Keep a retry marker until the
 		 * complete residual prefix has been unlinked and the directory synced. */
 		store->residual_prefix_pending = 1;
+		store->residual_prefix_start_lsn = prefix_first * store->segment_size;
 		store->residual_prefix_target_lsn = store->start_lsn;
 	}
 	for (uint64_t i = 0; i < count; i++)
@@ -1712,6 +1716,69 @@ ps_wal_store_residual_prefix_pending(PsWalStore *store, uint64_t *target_lsn_out
 }
 
 int
+ps_wal_store_residual_prefix_bytes(PsWalStore *store, uint64_t *bytes_out)
+{
+	uint64_t first_segment;
+	uint64_t target_segment;
+	uint64_t bytes = 0;
+
+	if (store == NULL || bytes_out == NULL || !store->lock_initialized)
+		return -1;
+	if (pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	if (!store->residual_prefix_pending)
+		*bytes_out = 0;
+	else if (store->residual_prefix_start_lsn >
+			 store->residual_prefix_target_lsn ||
+			 store->residual_prefix_target_lsn > store->end_lsn ||
+			 store->residual_prefix_start_lsn % store->segment_size != 0 ||
+			 store->residual_prefix_target_lsn % store->segment_size != 0)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	else
+	{
+		first_segment = store->residual_prefix_start_lsn / store->segment_size;
+		target_segment = store->residual_prefix_target_lsn / store->segment_size;
+		for (uint64_t segment_no = first_segment;
+			 segment_no < target_segment; segment_no++)
+		{
+			char name[128];
+			struct stat st;
+
+			if (segment_name(store, segment_no, name, sizeof(name)) != 0)
+				goto fail;
+			if (fstatat(store->directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			{
+				/* A successfully unlinked residual is no longer debt.  Any
+				 * other storage error is fail-closed. */
+				if (errno == ENOENT)
+					continue;
+				goto fail;
+			}
+			if (!S_ISREG(st.st_mode) || validate_prefix_segment(store, segment_no) != 0)
+				goto fail;
+			if (bytes > UINT64_MAX - store->segment_size)
+				goto fail;
+			bytes += store->segment_size;
+		}
+		*bytes_out = bytes;
+	}
+	pthread_mutex_unlock(&store->lock);
+	return 0;
+
+fail:
+	pthread_mutex_unlock(&store->lock);
+	return -1;
+}
+
+int
 ps_wal_store_advance_retained_base(PsWalStore *store,
 								   uint64_t retained_base_lsn)
 {
@@ -1786,6 +1853,8 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 	 * after a completed reclaim must not manufacture pending work. */
 	if (store->start_lsn != target_lsn || store->residual_prefix_pending)
 	{
+		if (!store->residual_prefix_pending)
+			store->residual_prefix_start_lsn = store->start_lsn;
 		store->residual_prefix_pending = 1;
 		store->residual_prefix_target_lsn = target_lsn;
 	}
@@ -1814,6 +1883,7 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 		if (unlink_reclaim_segment(store, segment_no) != 0)
 			goto done_reclaim;
 		forget_reclaimed_entry(store);
+		store->residual_prefix_start_lsn += store->segment_size;
 		unlink_count++;
 		if (reclaim_test_segment_matches(
 				"PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO",
@@ -1841,6 +1911,7 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 	if (store->residual_prefix_pending)
 	{
 		store->residual_prefix_pending = 0;
+		store->residual_prefix_start_lsn = 0;
 		store->residual_prefix_target_lsn = 0;
 	}
 	rc = 0;
