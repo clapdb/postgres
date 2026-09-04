@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		36	/* 36: exact-token timeline info returns parent incarnation;
+#define PS_SHM_VERSION		37	/* 37: page/WAL reclaim backpressure controller metrics;
+								 * 36: exact-token timeline info returns parent incarnation;
 								 * 34: timeline deletion lifecycle/state query;
 								 * 33: WAL-index known/FPI + record-end metadata;
 								 * 32: coherent page-pruning metrics;
@@ -331,6 +332,21 @@ typedef struct PsAdmissionFence
 	uint64_t	admission_seq;
 } PsAdmissionFence;
 
+/* A controller snapshot is copied under backpressure_metrics_seq.  The
+ * fields themselves are deliberately plain integers: inspectors use the
+ * surrounding seqlock and daemon writers use the acquire/release helpers. */
+typedef struct PsBackpressureMetrics
+{
+	uint64_t	lag_bytes;
+	uint64_t	high_water_bytes;
+	uint64_t	catchup_bytes;
+	uint32_t	throttled;
+	uint32_t	reserved;
+	uint64_t	throttle_enters;
+	uint64_t	throttle_exits;
+	uint64_t	foreground_wait_ns;
+} PsBackpressureMetrics;
+
 typedef struct PsShmHeader
 {
 	uint32_t	magic;
@@ -353,6 +369,9 @@ typedef struct PsShmHeader
 	uint64_t	page_prune_versions_scanned;
 	uint64_t	page_prune_versions_kept;
 	uint64_t	page_prune_versions_deleted;
+	uint64_t	backpressure_metrics_seq;
+	PsBackpressureMetrics page_backpressure;
+	PsBackpressureMetrics wal_backpressure;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

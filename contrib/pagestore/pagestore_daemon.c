@@ -37,6 +37,7 @@
 
 static volatile sig_atomic_t stop_requested = 0;
 static PsShmHeader *daemon_hdr = NULL;
+static const char *maintenance_pause_file = NULL;
 
 typedef struct WorkerArgs
 {
@@ -45,6 +46,85 @@ typedef struct WorkerArgs
 	uint32_t	nchannels;
 	uint32_t	nshards;
 } WorkerArgs;
+
+typedef struct BackpressureWaitSlot
+{
+	uint32_t	cause_mask;
+	uint64_t	last_probe_ns;
+	uint64_t	page_wait_ns;
+	uint64_t	wal_wait_ns;
+	int		active;
+} BackpressureWaitSlot;
+
+/* A channel belongs to exactly one shard worker, so these slots need no
+ * additional synchronization.  Keeping them per channel avoids charging a
+ * later request for time spent by an earlier deferred request. */
+static BackpressureWaitSlot backpressure_wait_slots[PS_MAX_CHANNELS];
+
+static uint64_t
+monotonic_ns(void)
+{
+	struct timespec now;
+	uint64_t sec;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0)
+		return 0;
+	sec = (uint64_t) now.tv_sec;
+	if (sec > UINT64_MAX / UINT64_C(1000000000))
+		return UINT64_MAX;
+	sec *= UINT64_C(1000000000);
+	if ((uint64_t) now.tv_nsec > UINT64_MAX - sec)
+		return UINT64_MAX;
+	return sec + (uint64_t) now.tv_nsec;
+}
+
+static void
+add_wait_ns(uint64_t *total, uint64_t elapsed)
+{
+	*total = UINT64_MAX - *total < elapsed ? UINT64_MAX : *total + elapsed;
+}
+
+static void
+accrue_backpressure_interval(BackpressureWaitSlot *slot, uint64_t now)
+{
+	uint64_t elapsed;
+
+	if (!slot->active || now < slot->last_probe_ns)
+		return;
+	elapsed = now - slot->last_probe_ns;
+	if ((slot->cause_mask & PS_BACKPRESSURE_PAGE) != 0)
+		add_wait_ns(&slot->page_wait_ns, elapsed);
+	if ((slot->cause_mask & PS_BACKPRESSURE_WAL) != 0)
+		add_wait_ns(&slot->wal_wait_ns, elapsed);
+}
+
+static void
+record_backpressure_probe(uint32_t channel, uint32_t cause_mask)
+{
+	BackpressureWaitSlot *slot = &backpressure_wait_slots[channel];
+	uint64_t now = monotonic_ns();
+
+	if (slot->active)
+		accrue_backpressure_interval(slot, now);
+	else
+		slot->active = 1;
+	slot->cause_mask = cause_mask;
+	slot->last_probe_ns = now;
+}
+
+static void
+finish_backpressure_wait(uint32_t channel)
+{
+	BackpressureWaitSlot *slot = &backpressure_wait_slots[channel];
+	uint64_t now;
+
+	if (!slot->active)
+		return;
+	now = monotonic_ns();
+	accrue_backpressure_interval(slot, now);
+	ps_backpressure_record_wait(slot->page_wait_ns, slot->wal_wait_ns);
+	memset(slot, 0, sizeof(*slot));
+}
 
 static void
 on_signal(int sig)
@@ -266,6 +346,19 @@ request_is_write(PsOpcode opcode)
 	}
 }
 
+/* Controller gating covers every foreground mutation, including retention
+ * pin state changes which intentionally remain outside request_is_write()'s
+ * admission-rd behavior. */
+static int
+request_is_mutation(PsOpcode opcode)
+{
+	if (request_is_write(opcode))
+		return 1;
+	return opcode == PS_OP_RETENTION_PIN_RESERVE ||
+		opcode == PS_OP_RETENTION_PIN_SET ||
+		opcode == PS_OP_RETENTION_PIN_DROP;
+}
+
 static void
 run_request_admitted(PsChannel *ch)
 {
@@ -465,9 +558,34 @@ active_fence_epoch(void)
 /* Returns zero when a relation mutation is intentionally left in REQUEST
  * until the checkpoint owner publishes and syncs its admission fence. */
 static int
-run_request(PsChannel *ch)
+run_request(uint32_t channel, PsChannel *ch)
 {
 	PsOpcode	op = (PsOpcode) ch->opcode;
+
+	/* Backpressure is checked before any lifecycle/admission/shard/map lock.
+	 * A throttled mutation remains in REQUEST so this worker can scan the next
+	 * channel; reads and maintenance never enter controller gating. */
+	if (request_is_mutation(op))
+	{
+		uint32_t causes = 0;
+		int admit = ps_backpressure_try_admit(&stop_requested, &causes);
+
+		if (admit < 0)
+		{
+			finish_backpressure_wait(channel);
+			ch->status = PS_STATUS_ERROR;
+			ps_store_release(&ch->state, PS_STATE_DONE);
+			return 1;
+		}
+		if (admit == 0)
+		{
+			record_backpressure_probe(channel, causes);
+			return 0;
+		}
+		/* Charge the complete final interval, including the probe which first
+		 * observed the controller catch-up transition. */
+		finish_backpressure_wait(channel);
+	}
 
 	if (op == PS_OP_BEGIN_DELETE)
 	{
@@ -568,7 +686,7 @@ shard_worker(void *arg)
 			if (ps_load_acquire(&ch->state) != PS_STATE_REQUEST)
 				continue;
 
-			if (run_request(ch))
+			if (run_request(i, ch))
 				did_work = 1;
 		}
 
@@ -597,6 +715,19 @@ maintenance_worker(void *arg)
 
 	while (!stop_requested)
 	{
+		/* Test-only deterministic seam: keep the real maintenance thread alive
+		 * and refreshing controller state, while withholding reclaim progress. */
+		if (maintenance_pause_file != NULL &&
+			access(maintenance_pause_file, F_OK) == 0)
+		{
+			ps_backpressure_refresh();
+			{
+				struct timespec ts = {0, 1000000};
+
+				nanosleep(&ts, NULL);
+			}
+			continue;
+		}
 		if (!ps_core_maintenance())
 		{
 			struct timespec ts = {0, 20000};	/* 20us */
@@ -606,6 +737,22 @@ maintenance_worker(void *arg)
 	}
 
 	return NULL;
+}
+
+static int
+parse_u64_option(const char *text, uint64_t *value)
+{
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (text == NULL || *text == '\0' || text[0] == '-')
+		return -1;
+	errno = 0;
+	parsed = strtoull(text, &end, 10);
+	if (errno == ERANGE || end == text || *end != '\0')
+		return -1;
+	*value = (uint64_t) parsed;
+	return 0;
 }
 
 int
@@ -639,6 +786,29 @@ main(int argc, char **argv)
 			nshards = (uint32_t) strtoul(argv[++i], NULL, 10);
 		else if (strcmp(argv[i], "--cache-pages") == 0 && i + 1 < argc)
 			cache_pages = atoi(argv[++i]);
+		else if (strcmp(argv[i], "--page-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--page-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &page_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--wal-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &wal_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
+				 i + 1 < argc)
+			maintenance_pause_file = argv[++i];
 		else if (strcmp(argv[i], "--storage") == 0 && i + 1 < argc)
 		{
 			const char *name = argv[++i];
@@ -659,7 +829,10 @@ main(int argc, char **argv)
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR "
 					"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
-					"[--nshards N] [--storage NAME]\n",
+					"[--nshards N] [--storage NAME] "
+					"[--page-high-water-bytes N --page-catch-up-bytes N] "
+					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+					"[--test-maintenance-pause-file PATH]\n",
 					argv[0]);
 			return 2;
 		}
@@ -669,8 +842,24 @@ main(int argc, char **argv)
 	{
 		fprintf(stderr, "usage: %s --shm NAME --store DIR "
 				"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
-				"[--nshards N] [--storage NAME]\n",
+				"[--nshards N] [--storage NAME] "
+				"[--page-high-water-bytes N --page-catch-up-bytes N] "
+				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+				"[--test-maintenance-pause-file PATH]\n",
 				argv[0]);
+		return 2;
+	}
+	if (ps_backpressure_configure(page_reclaim_high_water_bytes,
+								  page_reclaim_catchup_bytes,
+								  wal_reclaim_high_water_bytes,
+								  wal_reclaim_catchup_bytes) != 0)
+	{
+		if (page_reclaim_high_water_bytes != 0 && !segment_gc_enabled)
+			fprintf(stderr, "pagestore_daemon: page backpressure requires "
+					"--segment-gc 1 when page high-water is enabled\n");
+		else
+			fprintf(stderr, "pagestore_daemon: catch-up threshold must be less "
+					"than the enabled high-water threshold\n");
 		return 2;
 	}
 	ps_nshards = nshards;

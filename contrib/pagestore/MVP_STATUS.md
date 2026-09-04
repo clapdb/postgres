@@ -285,8 +285,11 @@ required for the gate:
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
-Until the remaining consumers land, correctness demos run and page history is
-bounded, but total disk use can still grow without bound.
+R5b-1 now provides disabled-by-default, hysteretic POSIX backpressure for page
+segment and shipped-WAL reclaim debt, with safe shared-memory inspection and
+deterministic admission tests.  WAL-index and forkmeta lag controllers remain
+follow-up work.  Until those remaining consumers land, correctness demos run
+and page history is bounded, but total disk use can still grow without bound.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
 

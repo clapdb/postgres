@@ -53,12 +53,64 @@ print_health(PsShmHeader *hdr)
 }
 
 static void
+read_backpressure_metrics(PsShmHeader *hdr, PsBackpressureMetrics *page,
+						   PsBackpressureMetrics *wal)
+{
+	const unsigned int max_attempts = 10000;
+	uint64_t before;
+	uint64_t after;
+
+	for (unsigned int attempt = 0; attempt < max_attempts; attempt++)
+	{
+		before = ps_load_acquire_u64(&hdr->backpressure_metrics_seq);
+		if (before & 1)
+		{
+			usleep(100);
+			continue;
+		}
+		page->lag_bytes = ps_load_acquire_u64(&hdr->page_backpressure.lag_bytes);
+		page->high_water_bytes =
+			ps_load_acquire_u64(&hdr->page_backpressure.high_water_bytes);
+		page->catchup_bytes =
+			ps_load_acquire_u64(&hdr->page_backpressure.catchup_bytes);
+		page->throttled = ps_load_acquire(&hdr->page_backpressure.throttled);
+		page->throttle_enters =
+			ps_load_acquire_u64(&hdr->page_backpressure.throttle_enters);
+		page->throttle_exits =
+			ps_load_acquire_u64(&hdr->page_backpressure.throttle_exits);
+		page->foreground_wait_ns =
+			ps_load_acquire_u64(&hdr->page_backpressure.foreground_wait_ns);
+		*wal = *page;
+		wal->lag_bytes = ps_load_acquire_u64(&hdr->wal_backpressure.lag_bytes);
+		wal->high_water_bytes =
+			ps_load_acquire_u64(&hdr->wal_backpressure.high_water_bytes);
+		wal->catchup_bytes =
+			ps_load_acquire_u64(&hdr->wal_backpressure.catchup_bytes);
+		wal->throttled = ps_load_acquire(&hdr->wal_backpressure.throttled);
+		wal->throttle_enters =
+			ps_load_acquire_u64(&hdr->wal_backpressure.throttle_enters);
+		wal->throttle_exits =
+			ps_load_acquire_u64(&hdr->wal_backpressure.throttle_exits);
+		wal->foreground_wait_ns =
+			ps_load_acquire_u64(&hdr->wal_backpressure.foreground_wait_ns);
+		after = ps_load_acquire_u64(&hdr->backpressure_metrics_seq);
+		if (before == after && !(after & 1))
+			return;
+		usleep(100);
+	}
+	fprintf(stderr, "pagestore_inspect: backpressure metrics stayed unstable\n");
+	exit(1);
+}
+
+static void
 print_backpressure(void *shm, PsShmHeader *hdr)
 {
 	uint32_t idle = 0;
 	uint32_t claimed = 0;
 	uint32_t request = 0;
 	uint32_t done = 0;
+	PsBackpressureMetrics page;
+	PsBackpressureMetrics wal;
 
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
 	{
@@ -82,12 +134,33 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 				exit(1);
 		}
 	}
+	read_backpressure_metrics(hdr, &page, &wal);
 	printf("{\"idle\":%u,\"claimed\":%u,\"request\":%u,"
 		   "\"done\":%u,\"shards\":%u,\"wal_index_pending_bytes\":%llu,"
-		   "\"wal_index_lagging_timelines\":%u}\n",
+		   "\"wal_index_lagging_timelines\":%u,"
+		   "\"page_lag_bytes\":%llu,\"page_high_water_bytes\":%llu,"
+		   "\"page_catchup_bytes\":%llu,\"page_throttled\":%u,"
+		   "\"page_throttle_enters\":%llu,\"page_throttle_exits\":%llu,"
+		   "\"page_foreground_wait_ns\":%llu,"
+		   "\"wal_lag_bytes\":%llu,\"wal_high_water_bytes\":%llu,"
+		   "\"wal_catchup_bytes\":%llu,\"wal_throttled\":%u,"
+		   "\"wal_throttle_enters\":%llu,\"wal_throttle_exits\":%llu,"
+		   "\"wal_foreground_wait_ns\":%llu}\n",
 		   idle, claimed, request, done, hdr->nshards,
 		   (unsigned long long) ps_load_acquire_u64(&hdr->wal_index_pending_bytes),
-		   ps_load_acquire(&hdr->wal_index_lagging_timelines));
+		   ps_load_acquire(&hdr->wal_index_lagging_timelines),
+		   (unsigned long long) page.lag_bytes,
+		   (unsigned long long) page.high_water_bytes,
+		   (unsigned long long) page.catchup_bytes, page.throttled,
+		   (unsigned long long) page.throttle_enters,
+		   (unsigned long long) page.throttle_exits,
+		   (unsigned long long) page.foreground_wait_ns,
+		   (unsigned long long) wal.lag_bytes,
+		   (unsigned long long) wal.high_water_bytes,
+		   (unsigned long long) wal.catchup_bytes, wal.throttled,
+		   (unsigned long long) wal.throttle_enters,
+		   (unsigned long long) wal.throttle_exits,
+		   (unsigned long long) wal.foreground_wait_ns);
 }
 
 static void

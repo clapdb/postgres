@@ -66,6 +66,10 @@ int			flush_pages = 256;	/* memtable flush threshold (pages) */
 int			compact_layers = 8;	/* compact a timeline past this many image layers */
 int			segment_gc_enabled = 1;
 int			cache_pages = 1024;	/* materialized-page cache size (pages; 0=off) */
+uint64_t	page_reclaim_high_water_bytes;
+uint64_t	page_reclaim_catchup_bytes;
+uint64_t	wal_reclaim_high_water_bytes;
+uint64_t	wal_reclaim_catchup_bytes;
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -217,6 +221,30 @@ static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
  * durable frontier and generation-manifest cutover. */
 static pthread_rwlock_t walidx_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
 static PsShmHeader *metrics_header;
+
+typedef struct PsBackpressureController
+{
+	uint64_t	high_water_bytes;
+	uint64_t	catchup_bytes;
+	uint64_t	lag_bytes;
+	int		throttled;
+	uint64_t	throttle_enters;
+	uint64_t	throttle_exits;
+	uint64_t	foreground_wait_ns;
+} PsBackpressureController;
+
+static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
+static PsBackpressureController page_backpressure;
+static PsBackpressureController wal_backpressure;
+static int backpressure_shutdown_requested;
+
+static uint64_t page_reclaim_lag_bytes(void);
+static uint64_t wal_reclaim_lag_bytes(void);
+static void backpressure_publish_locked(void);
+static void backpressure_update_locked(PsBackpressureController *controller,
+										 uint64_t lag, uint64_t high,
+										 uint64_t catchup);
+static uint32_t core_shards(void);
 
 #define PS_PAGE_FRONTIER_MAGIC 0x46504750U /* "PGPF" */
 #define PS_PAGE_FRONTIER_VERSION 3
@@ -515,6 +543,152 @@ ps_admission_read_unlock(void)
 	pthread_rwlock_unlock(&admission_lock);
 }
 
+static int
+backpressure_stop_observed(const volatile sig_atomic_t *stop_flag)
+{
+	if (backpressure_shutdown_requested ||
+		(stop_flag != NULL && *stop_flag != 0))
+		return 1;
+	/* The signal handler only publishes STOPPING in shared memory.  The worker
+	 * admission probe observes it without calling pthread APIs from the handler. */
+	return metrics_header != NULL &&
+		ps_load_acquire(&metrics_header->startup_state) == PS_SHM_STOPPING;
+}
+
+static void
+backpressure_publish_locked(void)
+{
+	PsShmHeader *hdr = metrics_header;
+
+	if (hdr == NULL)
+		return;
+	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
+	ps_store_release_u64(&hdr->page_backpressure.lag_bytes,
+						 page_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->page_backpressure.high_water_bytes,
+						 page_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->page_backpressure.catchup_bytes,
+						 page_backpressure.catchup_bytes);
+	ps_store_release(&hdr->page_backpressure.throttled,
+					 page_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->page_backpressure.throttle_enters,
+						 page_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->page_backpressure.throttle_exits,
+						 page_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->page_backpressure.foreground_wait_ns,
+						 page_backpressure.foreground_wait_ns);
+	ps_store_release_u64(&hdr->wal_backpressure.lag_bytes,
+						 wal_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->wal_backpressure.high_water_bytes,
+						 wal_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->wal_backpressure.catchup_bytes,
+						 wal_backpressure.catchup_bytes);
+	ps_store_release(&hdr->wal_backpressure.throttled,
+					 wal_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->wal_backpressure.throttle_enters,
+						 wal_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->wal_backpressure.throttle_exits,
+						 wal_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->wal_backpressure.foreground_wait_ns,
+						 wal_backpressure.foreground_wait_ns);
+	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
+}
+
+int
+ps_backpressure_configure(uint64_t page_high_water,
+						  uint64_t page_catchup,
+						  uint64_t wal_high_water,
+						  uint64_t wal_catchup)
+{
+	if ((page_high_water == 0 && page_catchup != 0) ||
+		(page_high_water != 0 && page_catchup >= page_high_water) ||
+		(page_high_water != 0 && !segment_gc_enabled) ||
+		(wal_high_water == 0 && wal_catchup != 0) ||
+		(wal_high_water != 0 && wal_catchup >= wal_high_water))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	page_reclaim_high_water_bytes = page_high_water;
+	page_reclaim_catchup_bytes = page_catchup;
+	wal_reclaim_high_water_bytes = wal_high_water;
+	wal_reclaim_catchup_bytes = wal_catchup;
+	pthread_mutex_lock(&backpressure_lock);
+	memset(&page_backpressure, 0, sizeof(page_backpressure));
+	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
+	page_backpressure.high_water_bytes = page_high_water;
+	page_backpressure.catchup_bytes = page_catchup;
+	wal_backpressure.high_water_bytes = wal_high_water;
+	wal_backpressure.catchup_bytes = wal_catchup;
+	backpressure_shutdown_requested = 0;
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+	return 0;
+}
+
+int
+ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
+						  uint32_t *cause_mask)
+{
+	uint32_t causes = 0;
+
+	pthread_mutex_lock(&backpressure_lock);
+	if (backpressure_stop_observed(stop_flag))
+	{
+		pthread_mutex_unlock(&backpressure_lock);
+		if (cause_mask != NULL)
+			*cause_mask = 0;
+		return -1;
+	}
+	if (page_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_PAGE;
+	if (wal_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_WAL;
+	pthread_mutex_unlock(&backpressure_lock);
+	if (cause_mask != NULL)
+		*cause_mask = causes;
+	return causes == 0 ? 1 : 0;
+}
+
+void
+ps_backpressure_record_wait(uint64_t page_wait_ns, uint64_t wal_wait_ns)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	if (page_wait_ns != 0)
+		page_backpressure.foreground_wait_ns =
+			UINT64_MAX - page_backpressure.foreground_wait_ns < page_wait_ns ?
+			UINT64_MAX : page_backpressure.foreground_wait_ns + page_wait_ns;
+	if (wal_wait_ns != 0)
+		wal_backpressure.foreground_wait_ns =
+			UINT64_MAX - wal_backpressure.foreground_wait_ns < wal_wait_ns ?
+			UINT64_MAX : wal_backpressure.foreground_wait_ns + wal_wait_ns;
+	if (page_wait_ns != 0 || wal_wait_ns != 0)
+		backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_backpressure_shutdown(void)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_shutdown_requested = 1;
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&page_backpressure, page_lag,
+							   page_reclaim_high_water_bytes,
+							   page_reclaim_catchup_bytes);
+	backpressure_update_locked(&wal_backpressure, wal_lag,
+							   wal_reclaim_high_water_bytes,
+							   wal_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
 void
 ps_test_set_forkmeta_cutover_hook(PsForkmetaCutoverTestHook hook, void *arg)
 {
@@ -691,6 +865,36 @@ typedef struct Shard
 } Shard;
 
 static Shard g_shards[MAX_SHARDS];
+
+static uint64_t
+backpressure_saturating_add(uint64_t left, uint64_t right)
+{
+	return UINT64_MAX - left < right ? UINT64_MAX : left + right;
+}
+
+/* Only complete segments already covered by a durable flush watermark are
+ * debt.  Live versions/retained bytes in the boundary segment are not. */
+static uint64_t
+page_reclaim_lag_bytes(void)
+{
+	uint64_t lag = 0;
+
+	for (uint32_t shard = 0; shard < core_shards(); shard++)
+	{
+		uint64_t segments = 0;
+
+		ps_lock_shard_rd(shard);
+		if (g_shards[shard].flush_watermark_valid &&
+			g_shards[shard].flush_watermark.seg_id > g_shards[shard].gc_next_seg)
+			segments = (uint64_t) g_shards[shard].flush_watermark.seg_id -
+				g_shards[shard].gc_next_seg;
+		ps_unlock_shard(shard);
+		if (segment_size != 0 && segments > UINT64_MAX / segment_size)
+			return UINT64_MAX;
+		lag = backpressure_saturating_add(lag, segments * segment_size);
+	}
+	return lag;
+}
 
 /*
  * Concurrency.  A per-shard rwlock guards each shard's in-memory state
@@ -7693,6 +7897,8 @@ ps_core_set_metrics_header(PsShmHeader *hdr)
 {
 	metrics_header = hdr;
 	publish_wal_index_metrics();
+	if (hdr != NULL)
+		ps_backpressure_refresh();
 }
 
 static void
@@ -11432,6 +11638,152 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 	return retention_effective_floor_internal(timeline, resource, floor_out, 0);
 }
 
+/* Return only immutable WAL bytes which the existing R3b proof would permit
+ * this maintenance pass to reclaim.  In particular, this never treats the
+ * current boundary or an unproven end-start interval as lag. */
+static uint64_t
+wal_reclaim_lag_bytes(void)
+{
+	uint64_t lag = 0;
+
+	if (ps_storage == NULL || ps_storage->name == NULL ||
+		strcmp(ps_storage->name, "posix") != 0 || admission_write_lock() != 0)
+		return 0;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		pthread_rwlock_t *wal_lock;
+		PsWalStore *store;
+		uint64_t start;
+		uint64_t end;
+		uint64_t progress = 0;
+		uint64_t raw_floor = 0;
+		uint64_t retention_floor = 0;
+		uint64_t target = 0;
+		uint64_t residual_target = 0;
+		int residual_status;
+		int residual_pending;
+		int walidx_valid;
+		int proof_rc = 0;
+
+		if (!ps_timeline_live(tl) || (wal_lock = wal_log_lock_for(tl)) == NULL)
+			continue;
+		for (uint32_t shard = 0; shard < core_shards(); shard++)
+			ps_lock_shard_wr(shard);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		residual_status = wal_segment_store_opened[tl] ?
+			ps_wal_store_residual_prefix_pending(store, &residual_target) : 0;
+		residual_pending = residual_status > 0;
+		if (!wal_segment_store_opened[tl] || residual_status < 0 ||
+			store->metadata_fenced)
+			goto wal_lag_unlock;
+		start = store->start_lsn;
+		end = store->end_lsn;
+		if (residual_pending)
+		{
+			target = residual_target;
+			if (target > start && target <= end)
+				lag = backpressure_saturating_add(lag, target - start);
+			goto wal_lag_unlock;
+		}
+		if (store->nentries == 0 || start > UINT64_MAX - store->segment_size ||
+			start + store->segment_size > end || store->segment_size == 0)
+			goto wal_lag_unlock;
+		pthread_mutex_lock(&walidx_meta_lock);
+		walidx_valid = wal_reclaim_walidx_state_valid(tl, &progress);
+		pthread_mutex_unlock(&walidx_meta_lock);
+		ps_lock_map_rd();
+		if (walidx_valid)
+			proof_rc = wal_reclaim_raw_dependency_floor(tl, start, &raw_floor);
+		ps_unlock_map();
+		for (uint32_t shard = core_shards(); shard > 0; shard--)
+			ps_unlock_shard(shard - 1);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		pthread_rwlock_unlock(wal_lock);
+		if (!walidx_valid || proof_rc != 0 ||
+			retention_effective_floor(tl, PS_RETENTION_RESOURCE_WAL,
+									 &retention_floor) != 0 || retention_floor == 0)
+			continue;
+		for (uint32_t shard = 0; shard < core_shards(); shard++)
+			ps_lock_shard_wr(shard);
+		pthread_rwlock_wrlock(&walidx_prune_lock);
+		walidx_publish_wrlock();
+		pthread_rwlock_wrlock(wal_lock);
+		store = &wal_segment_stores[tl];
+		if (!wal_segment_store_opened[tl] || store->metadata_fenced ||
+			store->start_lsn != start || store->end_lsn != end)
+			goto wal_lag_unlock;
+		target = retention_floor < progress ? retention_floor : progress;
+		if (raw_floor != 0 && raw_floor < target)
+			target = raw_floor;
+		if (timeline_has_parent(tl) && timelines[tl].branch_lsn < target)
+			target = timelines[tl].branch_lsn;
+		if (target > end)
+			target = end;
+		target -= target % store->segment_size;
+		if (target > start)
+			lag = backpressure_saturating_add(lag, target - start);
+
+wal_lag_unlock:
+		pthread_rwlock_unlock(wal_lock);
+		walidx_publish_wrunlock();
+		pthread_rwlock_unlock(&walidx_prune_lock);
+		for (uint32_t shard = core_shards(); shard > 0; shard--)
+			ps_unlock_shard(shard - 1);
+	}
+	ps_admission_write_unlock();
+	return lag;
+}
+
+static void
+backpressure_update_locked(PsBackpressureController *controller,
+						   uint64_t lag, uint64_t high, uint64_t catchup)
+{
+	controller->lag_bytes = lag;
+	controller->high_water_bytes = high;
+	controller->catchup_bytes = catchup;
+	if (high == 0)
+	{
+		if (controller->throttled)
+		{
+			controller->throttled = 0;
+			controller->throttle_exits++;
+		}
+	}
+	else if (!controller->throttled && lag >= high)
+	{
+		controller->throttled = 1;
+		controller->throttle_enters++;
+	}
+	else if (controller->throttled && lag <= catchup)
+	{
+		controller->throttled = 0;
+		controller->throttle_exits++;
+	}
+}
+
+void
+ps_backpressure_refresh(void)
+{
+	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
+		page_reclaim_lag_bytes() : 0;
+	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
+		wal_reclaim_lag_bytes() : 0;
+
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&page_backpressure, page_lag,
+							   page_reclaim_high_water_bytes,
+							   page_reclaim_catchup_bytes);
+	backpressure_update_locked(&wal_backpressure, wal_lag,
+							   wal_reclaim_high_water_bytes,
+							   wal_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
 /* ===================== recovery (layers + segment tail) =============== */
 
 typedef struct LayerRecoverRec
@@ -13588,6 +13940,7 @@ ps_core_maintenance(void)
 	 * writer fence after all ordinary/background work has drained. */
 	if (timeline_delete_publish_one())
 		did = 1;
+	ps_backpressure_refresh();
 	return did;
 }
 

@@ -257,6 +257,40 @@ test('pagestore_wal_reclaim_core',
   timeout: 60,
 )
 
+# Deterministic page/WAL lag-controller and admission-wait coverage.
+pagestore_backpressure_test = executable('pagestore_backpressure_test',
+  files('pagestore_backpressure_test.c', 'pagestore_core.c',
+        'pagestore_fault.c', 'storage_posix.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_manifest.c',
+        'pagestore_memtable.c', 'pagestore_pgcache.c', 'pagestore_prune.c',
+        'pagestore_retention.c', 'pagestore_wal_store.c',
+        'pagestore_wal_segment.c', 'pagestore_walidx_prune.c',
+        'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
+        'pagestore_forkmeta_snapshot.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('pagestore_backpressure',
+  pagestore_backpressure_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+# Real POSIX daemon coverage for deferred mutation admission and prompt
+# shutdown.  The maintenance pause option is test-only and keeps controller
+# refreshes live while making reclaim progress deterministic.
+pagestore_backpressure_daemon_test = executable('pagestore_backpressure_daemon_test',
+  files('pagestore_backpressure_daemon_test.c'),
+  install: false,
+)
+test('pagestore_backpressure_daemon',
+  pagestore_backpressure_daemon_test,
+  args: [pagestore_daemon],
+  depends: [pagestore_daemon],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',

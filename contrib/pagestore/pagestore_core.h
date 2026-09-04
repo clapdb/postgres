@@ -44,6 +44,10 @@ extern int	compact_layers;		/* compact a timeline past this many image layers */
 extern int	segment_gc_enabled;	/* reclaim layer-covered POSIX segments */
 extern int	cache_pages;		/* materialized-page cache size (pages; 0=off) */
 extern int	use_layers;			/* rebuild read state from layers (vs segments) */
+extern uint64_t page_reclaim_high_water_bytes;
+extern uint64_t page_reclaim_catchup_bytes;
+extern uint64_t wal_reclaim_high_water_bytes;
+extern uint64_t wal_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;
 extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
@@ -77,9 +81,27 @@ extern void ps_lifecycle_write_unlock(void);
 /* Assign a fence sequence only after all prior mutation bodies have left. */
 extern void ps_admission_read_lock(void);
 extern void ps_admission_read_unlock(void);
+/* Nonblocking admission probe.  Returns 1 to admit, 0 to leave the channel in
+ * REQUEST, and -1 when shutdown was observed. */
+#define PS_BACKPRESSURE_PAGE 1u
+#define PS_BACKPRESSURE_WAL  2u
+extern int ps_backpressure_try_admit(
+	const volatile sig_atomic_t *stop_flag, uint32_t *cause_mask);
+/* Add one completed deferred interval per controller.  The daemon aggregates
+ * intervals locally and calls this once when a channel is admitted/cancelled. */
+extern void ps_backpressure_record_wait(uint64_t page_wait_ns,
+										 uint64_t wal_wait_ns);
 extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
+extern int ps_backpressure_configure(uint64_t page_high_water,
+									 uint64_t page_catchup,
+									 uint64_t wal_high_water,
+									 uint64_t wal_catchup);
+extern void ps_backpressure_refresh(void);
+extern void ps_backpressure_shutdown(void);
+/* Test-only deterministic lag injection; production maintenance never calls it. */
+extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.
