@@ -189,6 +189,77 @@ wait_for_exit(pid_t pid, int milliseconds)
 	return 0;
 }
 
+static void
+test_unsupported_backend_cli_case(const char *daemon_path,
+								const char *option, const char *value,
+								const char *case_name)
+{
+	char shm_name[64];
+	char store_dir[128];
+	char output[1024];
+	int pipefd[2];
+	pid_t pid;
+	int status = 0;
+	ssize_t n;
+	size_t used = 0;
+
+	snprintf(shm_name, sizeof(shm_name), "/psbp_cli_%d", (int) getpid());
+	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_cli_store_%d",
+			 (int) getpid());
+	shm_unlink(shm_name);
+	if (pipe(pipefd) != 0)
+	{
+		check(0, "unsupported-backend CLI test creates stderr pipe");
+		return;
+	}
+	pid = fork();
+	if (pid == 0)
+	{
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[0]);
+		close(pipefd[1]);
+		execl(daemon_path, daemon_path, "--shm", shm_name, "--store",
+			  store_dir, option, value,
+			  (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	memset(output, 0, sizeof(output));
+	while (used + 1 < sizeof(output))
+	{
+		n = read(pipefd[0], output + used, sizeof(output) - used - 1);
+		if (n > 0)
+		{
+			used += (size_t) n;
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		break;
+	}
+	close(pipefd[0]);
+	check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			WIFEXITED(status) && WEXITSTATUS(status) == 2,
+		  case_name);
+	check(strstr(output, "backpressure requires the POSIX storage backend") != NULL,
+		  "unsupported-backend CLI reports the POSIX-only controller contract");
+	shm_unlink(shm_name);
+}
+
+static void
+test_unsupported_backend_cli(const char *daemon_path)
+{
+	test_unsupported_backend_cli_case(daemon_path,
+								  "--page-high-water-bytes", "1",
+								  "non-POSIX CLI rejects page high-water backpressure");
+	test_unsupported_backend_cli_case(daemon_path,
+								  "--page-catch-up-bytes", "1",
+								  "non-POSIX CLI rejects page catch-up-only backpressure");
+	test_unsupported_backend_cli_case(daemon_path,
+								  "--wal-catch-up-bytes", "1",
+								  "non-POSIX CLI rejects WAL catch-up-only backpressure");
+}
+
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm_name,
 				 const char *store_dir, const char *pause_file,
@@ -702,12 +773,15 @@ cleanup:
 int
 main(int argc, char **argv)
 {
-	if (argc != 2)
+	if (argc != 2 && argc != 3)
 	{
-		fprintf(stderr, "usage: %s <path-to-pagestore_daemon>\n", argv[0]);
+		fprintf(stderr, "usage: %s <path-to-pagestore_daemon> "
+				"[path-to-pagestore_daemon_spdk]\n", argv[0]);
 		return 2;
 	}
 	(void) run_test(argv[1]);
+	if (argc == 3)
+		test_unsupported_backend_cli(argv[2]);
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

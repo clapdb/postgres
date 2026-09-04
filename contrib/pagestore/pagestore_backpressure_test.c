@@ -4,6 +4,7 @@
 #endif
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -130,6 +131,123 @@ test_nonblocking_admission_and_shutdown(void)
 		  "shutdown cancels a deferred mutation without a stranded waiter");
 
 	ps_core_set_metrics_header(NULL);
+}
+
+typedef struct AdmissionFairnessState
+{
+	volatile int reader1_ready;
+	volatile int release_reader1;
+	volatile int writer_queued;
+	volatile int writer_acquired;
+	volatile int release_writer;
+	volatile int reader2_acquired;
+} AdmissionFairnessState;
+
+static void
+wait_flag(volatile int *flag)
+{
+	for (int i = 0; i < 2000 && !__atomic_load_n(flag, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+}
+
+static void
+admission_writer_queued(void *arg)
+{
+	AdmissionFairnessState *state = arg;
+
+	__atomic_store_n(&state->writer_queued, 1, __ATOMIC_RELEASE);
+}
+
+static void *
+admission_reader_one(void *arg)
+{
+	AdmissionFairnessState *state = arg;
+
+	ps_admission_read_lock();
+	__atomic_store_n(&state->reader1_ready, 1, __ATOMIC_RELEASE);
+	while (!__atomic_load_n(&state->release_reader1, __ATOMIC_ACQUIRE))
+		sched_yield();
+	ps_admission_read_unlock();
+	return NULL;
+}
+
+static void *
+admission_writer(void *arg)
+{
+	AdmissionFairnessState *state = arg;
+
+	if (ps_admission_write_lock() != 0)
+		return NULL;
+	__atomic_store_n(&state->writer_acquired, 1, __ATOMIC_RELEASE);
+	while (!__atomic_load_n(&state->release_writer, __ATOMIC_ACQUIRE))
+		sched_yield();
+	ps_admission_write_unlock();
+	return NULL;
+}
+
+static void *
+admission_reader_two(void *arg)
+{
+	AdmissionFairnessState *state = arg;
+
+	ps_admission_read_lock();
+	__atomic_store_n(&state->reader2_acquired, 1, __ATOMIC_RELEASE);
+	ps_admission_read_unlock();
+	return NULL;
+}
+
+static void
+test_admission_writer_preference(void)
+{
+	AdmissionFairnessState state;
+	pthread_t reader1;
+	pthread_t writer;
+	pthread_t reader2;
+	int have_reader1 = 0;
+	int have_writer = 0;
+	int have_reader2 = 0;
+	int rc;
+
+	memset(&state, 0, sizeof(state));
+	ps_test_set_admission_write_queued_hook(admission_writer_queued, &state);
+	rc = pthread_create(&reader1, NULL, admission_reader_one, &state);
+	have_reader1 = rc == 0;
+	check(rc == 0,
+		  "start the admission fairness reader");
+	wait_flag(&state.reader1_ready);
+	check(__atomic_load_n(&state.reader1_ready, __ATOMIC_ACQUIRE) != 0,
+		  "first admission reader holds the lock");
+	rc = pthread_create(&writer, NULL, admission_writer, &state);
+	have_writer = rc == 0;
+	check(rc == 0,
+		  "queue an admission writer behind the reader");
+	wait_flag(&state.writer_queued);
+	check(__atomic_load_n(&state.writer_queued, __ATOMIC_ACQUIRE) != 0,
+		  "admission writer is recorded at the turnstile");
+	rc = pthread_create(&reader2, NULL, admission_reader_two, &state);
+	have_reader2 = rc == 0;
+	check(rc == 0,
+		  "start a reader after the writer queues");
+	usleep(20000);
+	check(__atomic_load_n(&state.reader2_acquired, __ATOMIC_ACQUIRE) == 0,
+		  "new admission reader cannot pass a queued writer");
+	__atomic_store_n(&state.release_reader1, 1, __ATOMIC_RELEASE);
+	wait_flag(&state.writer_acquired);
+	check(__atomic_load_n(&state.writer_acquired, __ATOMIC_ACQUIRE) != 0,
+		  "queued admission writer acquires after the old reader releases");
+	check(__atomic_load_n(&state.reader2_acquired, __ATOMIC_ACQUIRE) == 0,
+		  "new admission reader waits while writer is active");
+	__atomic_store_n(&state.release_writer, 1, __ATOMIC_RELEASE);
+	wait_flag(&state.reader2_acquired);
+	check(__atomic_load_n(&state.reader2_acquired, __ATOMIC_ACQUIRE) != 0,
+		  "new admission reader acquires after the writer releases");
+	if (have_reader1)
+		pthread_join(reader1, NULL);
+	if (have_writer)
+		pthread_join(writer, NULL);
+	if (have_reader2)
+		pthread_join(reader2, NULL);
+	ps_test_set_admission_write_queued_hook(NULL, NULL);
 }
 
 static void
@@ -314,6 +432,7 @@ main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_admission_writer_preference();
 	test_page_storage_fail_closed();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;

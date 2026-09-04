@@ -1154,6 +1154,90 @@ test_concurrent_admission(void)
 	remove_tree(store);
 }
 
+typedef struct AdmissionTraffic
+{
+	volatile int stop;
+	volatile int reader_started;
+	volatile int refresh_done;
+} AdmissionTraffic;
+
+static void *
+admission_traffic_reader(void *arg)
+{
+	AdmissionTraffic *traffic = arg;
+
+	while (!__atomic_load_n(&traffic->stop, __ATOMIC_ACQUIRE))
+	{
+		ps_admission_read_lock();
+		__atomic_store_n(&traffic->reader_started, 1, __ATOMIC_RELEASE);
+		ps_admission_read_unlock();
+	}
+	return NULL;
+}
+
+static void *
+admission_traffic_refresh(void *arg)
+{
+	AdmissionTraffic *traffic = arg;
+
+	ps_backpressure_refresh();
+	__atomic_store_n(&traffic->refresh_done, 1, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+static void
+test_wal_observation_beats_reader_traffic(void)
+{
+	char store[] = "/tmp/pagestore-wal-policy-reader-traffic-XXXXXX";
+	PsShmHeader metrics;
+	AdmissionTraffic traffic;
+	pthread_t readers[4];
+	pthread_t refresh;
+	int nreaders = 0;
+	int refresh_started = 0;
+
+	configure_core();
+	memset(&traffic, 0, sizeof(traffic));
+	memset(&metrics, 0, sizeof(metrics));
+	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
+		  "construct WAL debt for reader-preference observation");
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL backpressure for reader-preference observation");
+	for (size_t i = 0; i < sizeof(readers) / sizeof(readers[0]); i++)
+	{
+		if (pthread_create(&readers[nreaders], NULL, admission_traffic_reader,
+						   &traffic) != 0)
+			break;
+		nreaders++;
+	}
+	for (int i = 0; i < 2000 &&
+			!__atomic_load_n(&traffic.reader_started, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+	check(nreaders == 4 &&
+			__atomic_load_n(&traffic.reader_started, __ATOMIC_ACQUIRE) != 0,
+		  "sustained admission readers are active before WAL observation");
+	if (pthread_create(&refresh, NULL, admission_traffic_refresh, &traffic) == 0)
+		refresh_started = 1;
+	for (int i = 0; refresh_started && i < 2000 &&
+			!__atomic_load_n(&traffic.refresh_done, __ATOMIC_ACQUIRE); i++)
+		usleep(1000);
+	check(refresh_started &&
+			__atomic_load_n(&traffic.refresh_done, __ATOMIC_ACQUIRE) != 0 &&
+			ps_load_acquire(&metrics.wal_backpressure.throttled) != 0 &&
+			ps_load_acquire_u64(&metrics.wal_backpressure.lag_bytes) >= WAL_SEGMENT,
+		  "WAL lag observation eventually activates under reader traffic");
+	__atomic_store_n(&traffic.stop, 1, __ATOMIC_RELEASE);
+	for (int i = 0; i < nreaders; i++)
+		pthread_join(readers[i], NULL);
+	if (refresh_started)
+		pthread_join(refresh, NULL);
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -1175,6 +1259,7 @@ main(void)
 	test_floor_scan_does_not_hold_reader_gates();
 	test_failure_backoff();
 	test_concurrent_admission();
+	test_wal_observation_beats_reader_traffic();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

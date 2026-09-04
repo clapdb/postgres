@@ -126,6 +126,9 @@ typedef void (*PsWalReadBeforeLockTestHook)(uint32_t timeline, void *arg);
  * itself.  This lets a test observe entry to the real blocking call without
  * adding a separate try-lock probe to production maintenance. */
 typedef int (*PsAdmissionWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
+/* Called after an admission writer is queued and before it waits for active
+ * readers.  The callback must not take admission locks. */
+typedef void (*PsAdmissionWriteQueuedTestHook)(void *arg);
 typedef int (*PsLifecycleWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
@@ -141,6 +144,8 @@ extern void ps_test_set_lifecycle_write_queued_hook(
 	PsLifecycleWriteQueuedTestHook hook, void *arg);
 extern void ps_test_set_admission_write_lock_hook(
 	PsAdmissionWriteLockTestHook hook, void *arg);
+extern void ps_test_set_admission_write_queued_hook(
+	PsAdmissionWriteQueuedTestHook hook, void *arg);
 extern void ps_test_set_lifecycle_write_lock_hook(
 	PsLifecycleWriteLockTestHook hook, void *arg);
 extern void ps_test_set_wal_reclaim_attempt_hook(

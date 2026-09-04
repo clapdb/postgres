@@ -1010,6 +1010,17 @@ main(int argc, char **argv)
 				argv[0]);
 		return 2;
 	}
+	if ((page_reclaim_high_water_bytes != 0 ||
+		 wal_reclaim_high_water_bytes != 0) &&
+		(ps_storage == NULL || ps_storage->name == NULL ||
+		 strcmp(ps_storage->name, "posix") != 0))
+	{
+		fprintf(stderr, "pagestore_daemon: backpressure requires the POSIX "
+				"storage backend (selected '%s')\n",
+				ps_storage != NULL && ps_storage->name != NULL ?
+				ps_storage->name : "none");
+		return 2;
+	}
 	if (ps_backpressure_configure(page_reclaim_high_water_bytes,
 								  page_reclaim_catchup_bytes,
 								  wal_reclaim_high_water_bytes,

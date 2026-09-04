@@ -192,6 +192,11 @@ static uint32_t lifecycle_active_readers;
 static uint32_t lifecycle_waiting_writers;
 static int lifecycle_writer_active;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t admission_turnstile = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t admission_turnstile_cond = PTHREAD_COND_INITIALIZER;
+static uint32_t admission_active_readers;
+static uint32_t admission_waiting_writers;
+static int admission_writer_active;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
@@ -206,6 +211,8 @@ static PsLifecycleWriteQueuedTestHook lifecycle_write_queued_test_hook;
 static void *lifecycle_write_queued_test_hook_arg;
 static PsAdmissionWriteLockTestHook admission_write_lock_test_hook;
 static void *admission_write_lock_test_hook_arg;
+static PsAdmissionWriteQueuedTestHook admission_write_queued_test_hook;
+static void *admission_write_queued_test_hook_arg;
 static PsLifecycleWriteLockTestHook lifecycle_write_lock_test_hook;
 static void *lifecycle_write_lock_test_hook_arg;
 static PsWalReclaimAttemptTestHook wal_reclaim_attempt_test_hook;
@@ -240,6 +247,7 @@ static int backpressure_shutdown_requested;
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
+static int admission_write_lock(void);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
 										 uint64_t lag, uint64_t high,
@@ -532,7 +540,30 @@ ps_lifecycle_write_unlock(void)
 void
 ps_admission_read_lock(void)
 {
-	pthread_rwlock_rdlock(&admission_lock);
+	int rc;
+
+	pthread_mutex_lock(&admission_turnstile);
+	while (admission_waiting_writers != 0 || admission_writer_active)
+		pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+	if (admission_active_readers == UINT32_MAX)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	/* Reserve the reader before dropping the turnstile.  A writer which queues
+	 * between this point and pthread_rwlock_rdlock() must still wait for us. */
+	admission_active_readers++;
+	pthread_mutex_unlock(&admission_turnstile);
+	rc = pthread_rwlock_rdlock(&admission_lock);
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&admission_turnstile);
+		admission_active_readers--;
+		if (admission_active_readers == 0)
+			pthread_cond_broadcast(&admission_turnstile_cond);
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
 	if (admission_read_test_hook != NULL)
 		admission_read_test_hook(admission_read_test_hook_arg);
 }
@@ -541,6 +572,16 @@ void
 ps_admission_read_unlock(void)
 {
 	pthread_rwlock_unlock(&admission_lock);
+	pthread_mutex_lock(&admission_turnstile);
+	if (admission_active_readers == 0)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	admission_active_readers--;
+	if (admission_active_readers == 0)
+		pthread_cond_broadcast(&admission_turnstile_cond);
+	pthread_mutex_unlock(&admission_turnstile);
 }
 
 static int
@@ -743,6 +784,14 @@ ps_test_set_admission_write_lock_hook(PsAdmissionWriteLockTestHook hook,
 }
 
 void
+ps_test_set_admission_write_queued_hook(PsAdmissionWriteQueuedTestHook hook,
+										void *arg)
+{
+	admission_write_queued_test_hook = hook;
+	admission_write_queued_test_hook_arg = arg;
+}
+
+void
 ps_test_set_lifecycle_write_lock_hook(PsLifecycleWriteLockTestHook hook,
 									  void *arg)
 {
@@ -777,10 +826,43 @@ ps_test_set_wal_read_before_lock_hook(PsWalReadBeforeLockTestHook hook,
 static int
 admission_write_lock(void)
 {
+	int rc;
+
+	pthread_mutex_lock(&admission_turnstile);
+	admission_waiting_writers++;
+	if (admission_write_queued_test_hook != NULL)
+		admission_write_queued_test_hook(admission_write_queued_test_hook_arg);
 	if (admission_write_lock_test_hook != NULL)
-		return admission_write_lock_test_hook(&admission_lock,
-										  admission_write_lock_test_hook_arg);
-	return pthread_rwlock_wrlock(&admission_lock);
+	{
+		/* Preserve the hook's historical meaning: it replaces the blocking
+		 * pthread rwlock call, so tests can observe that call while readers are
+		 * still active.  Mark the writer active before dropping the turnstile;
+		 * otherwise a new reader could pass while the hook is blocked. */
+		while (admission_writer_active)
+			pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+		admission_waiting_writers--;
+		admission_writer_active = 1;
+		pthread_mutex_unlock(&admission_turnstile);
+		rc = admission_write_lock_test_hook(&admission_lock,
+										 admission_write_lock_test_hook_arg);
+	}
+	else
+	{
+		while (admission_writer_active || admission_active_readers != 0)
+			pthread_cond_wait(&admission_turnstile_cond, &admission_turnstile);
+		admission_waiting_writers--;
+		admission_writer_active = 1;
+		pthread_mutex_unlock(&admission_turnstile);
+		rc = pthread_rwlock_wrlock(&admission_lock);
+	}
+	if (rc != 0)
+	{
+		pthread_mutex_lock(&admission_turnstile);
+		admission_writer_active = 0;
+		pthread_cond_broadcast(&admission_turnstile_cond);
+		pthread_mutex_unlock(&admission_turnstile);
+	}
+	return rc;
 }
 
 int
@@ -793,6 +875,15 @@ void
 ps_admission_write_unlock(void)
 {
 	pthread_rwlock_unlock(&admission_lock);
+	pthread_mutex_lock(&admission_turnstile);
+	if (!admission_writer_active)
+	{
+		pthread_mutex_unlock(&admission_turnstile);
+		abort();
+	}
+	admission_writer_active = 0;
+	pthread_cond_broadcast(&admission_turnstile_cond);
+	pthread_mutex_unlock(&admission_turnstile);
 }
 
 uint64_t
@@ -800,11 +891,12 @@ ps_admission_barrier(void)
 {
 	uint64_t	seq;
 
-	pthread_rwlock_wrlock(&admission_lock);
+	if (admission_write_lock() != 0)
+		return 0;
 	seq = admission_seq_alloc();
 	if (seq != 0 && ps_retention_reserve_admission_seq(seq) != 0)
 		seq = 0;
-	pthread_rwlock_unlock(&admission_lock);
+	ps_admission_write_unlock();
 	return seq;
 }
 
@@ -12898,7 +12990,10 @@ ps_handle_meta(PsChannel *ch)
 					/* A retried controller fence may be newer than this
 					 * process's recovered allocator.  Serialize its durable SET
 					 * with mutations and advance allocation before admitting more. */
-					pthread_rwlock_wrlock(&admission_lock);
+					if (admission_write_lock() != 0)
+						ret = PS_RETENTION_ERROR;
+					else
+					{
 					pthread_rwlock_wrlock(&page_prune_lock);
 					pthread_rwlock_wrlock(&walidx_prune_lock);
 					old_found = ps_retention_lookup(tl, pin.owner_kind,
@@ -12957,7 +13052,8 @@ ps_handle_meta(PsChannel *ch)
 					}
 					pthread_rwlock_unlock(&walidx_prune_lock);
 					pthread_rwlock_unlock(&page_prune_lock);
-					pthread_rwlock_unlock(&admission_lock);
+					ps_admission_write_unlock();
+					}
 				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
@@ -12987,7 +13083,8 @@ ps_handle_meta(PsChannel *ch)
 				pin.generation = ch->old_nblocks;
 				pin.owner_id = ch->req_seq;
 				pin.lsn = ch->req_lsn;
-				pthread_rwlock_wrlock(&admission_lock);
+				if (admission_write_lock() == 0)
+				{
 				seq = admission_seq_alloc();
 				pin.admission_seq = seq;
 				pthread_rwlock_wrlock(&page_prune_lock);
@@ -13040,7 +13137,8 @@ ps_handle_meta(PsChannel *ch)
 				}
 				pthread_rwlock_unlock(&walidx_prune_lock);
 				pthread_rwlock_unlock(&page_prune_lock);
-				pthread_rwlock_unlock(&admission_lock);
+				ps_admission_write_unlock();
+				}
 				if (ret == PS_RETENTION_STALE)
 					ch->status = PS_STATUS_STALE;
 				else if (ret != PS_RETENTION_OK)
@@ -13902,7 +14000,7 @@ ps_core_maintenance_impl(void)
 		pthread_rwlock_unlock(&page_prune_lock);
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
-		pthread_rwlock_unlock(&admission_lock);
+		ps_admission_write_unlock();
 		if (snapshot_rc)
 			return 1;
 	}
