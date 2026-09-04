@@ -221,8 +221,36 @@ segments.  Focused coverage includes real fork/`_exit` restart points,
 scan-error zero-unlink behavior, complete per-segment validation, corrupt
 catalog/residual fail-closed behavior, repair-and-retry, and a deterministic
 read-versus-reclaim mutex barrier.
-This is not core maintenance, retention-cutoff selection, WAL index dependency
-removal, or flat-WAL reclamation.  Still required for the gate:
+R3b-3 is the conservative POSIX/core policy integration.  It admits at most
+one LIVE timeline per maintenance tick ahead of continuous tier/remote-GC work.  A cheap WAL-lock-only preselection avoids draining admission when no complete prefix exists, and a bounded no-progress backoff suppresses repeated drains while a safe floor remains in the boundary segment; a selected candidate drains ordinary admission before
+freezing the WAL index, snapshots raw WAL dependencies under short-lived
+shard/map protection, and releases all shard locks before control-image,
+layer, metadata, or unlink I/O.  Its deletion candidate is the aligned-down
+minimum of the effective WAL retention floor, durable WAL-index progress, and
+the oldest surviving raw WAL dependency.  Missing durable proof, malformed or
+pending snapshot state, non-POSIX providers, and publication failures all fail
+closed with a one-second retry backoff.  Durable retained-base metadata is the
+sole restart-stable admission frontier; physical directory start is not a
+runtime fence.  WAL reads recheck that fence under each visited timeline's WAL
+lock; inherited history may bypass a child's natural local base and is then
+rechecked against the parent, while pre-metadata timelines retain local WAL
+readability.  Descendant control history and a target child's reclaim candidate
+are capped at their branch points, durable index progress beyond the sealed
+prefix remains a valid proof, and a durably DELETED descendant no longer pins
+its parent (DELETING still does).  Reopen reconstructs residual-prefix work so
+an already-published frontier can finish idempotent unlink without a new proof.
+Focused core coverage (66 checks) includes idle preselection, ancestry and timeline
+isolation, natural nonzero child fallback, child-local controls, target branch
+caps, LIVE/DELETING/DELETED floors, naturally nonzero starts, unaligned and
+boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index
+re-ship admission after base advancement, pre-metadata reads, restart/residual
+retry, read/frontier publication and floor-scan lock-order races, fenced
+residual-query suppression, pending-proof cleanup failure,
+metadata publication failure/backoff, and admission concurrency.
+
+This is a conservative R3b-3 policy integration.  It does not include sparse
+or discrete retained-base crossing, or a bounded fixed-reader soak.  Still
+required for the gate:
 
 - shipped-WAL reclamation without crossing the durable control/WAL floor;
 - WAL-index log compaction/reclamation;

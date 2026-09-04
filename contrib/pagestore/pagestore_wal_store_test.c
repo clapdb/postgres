@@ -487,6 +487,14 @@ main(void)
 		  ps_wal_store_retained_base(&retry_store, &retained_base) == 0 &&
 		  retained_base == TEST_SEGMENT_BYTES,
 		  "publish the reclaim frontier before a pre-unlink stop");
+	check(ps_wal_store_advance_retained_base(&retry_store,
+										 2 * TEST_SEGMENT_BYTES) != 0 &&
+		  ps_wal_store_append(&retry_store, 2 * TEST_SEGMENT_BYTES, input,
+							  TEST_SEGMENT_BYTES) != 0 &&
+		  ps_wal_store_retained_base(&retry_store, &retained_base) == 0 &&
+		  retained_base == TEST_SEGMENT_BYTES &&
+		  retry_store.end_lsn == 2 * TEST_SEGMENT_BYTES,
+		  "pending physical reclaim blocks independent advance and append");
 	unsetenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_BEFORE_UNLINK");
 	ps_wal_store_close(&retry_store);
 	snprintf(path, sizeof(path), "%s/walv1_15_%020llu", frontier_directory,

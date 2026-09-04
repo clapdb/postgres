@@ -1305,9 +1305,14 @@ ps_wal_store_open(PsWalStore *store, const char *directory,
 			store->next_segment_no - prefix_first != prefix_count)
 			goto cleanup;
 		for (uint64_t segment_no = prefix_first;
-			 segment_no < store->next_segment_no; segment_no++)
+				segment_no < store->next_segment_no; segment_no++)
 			if (validate_prefix_segment(store, segment_no) != 0)
 				goto cleanup;
+		/* The metadata frontier is already durable, so these files are no
+		 * longer part of the logical catalog.  Keep a retry marker until the
+		 * complete residual prefix has been unlinked and the directory synced. */
+		store->residual_prefix_pending = 1;
+		store->residual_prefix_target_lsn = store->start_lsn;
 	}
 	for (uint64_t i = 0; i < count; i++)
 		if (load_segment(store, store->next_segment_no) != 0)
@@ -1447,6 +1452,7 @@ ps_wal_store_append(PsWalStore *store, uint64_t start_lsn,
 	if (!store->lock_initialized || pthread_mutex_lock(&store->lock) != 0)
 		return -1;
 	if (store->directory_fd < 0 || store->metadata_fenced ||
+		store->residual_prefix_pending ||
 		start_lsn % store->segment_size != 0 ||
 		len % store->segment_size != 0 ||
 		start_lsn < store->start_lsn ||
@@ -1685,6 +1691,27 @@ ps_wal_store_retained_base(PsWalStore *store, uint64_t *out)
 }
 
 int
+ps_wal_store_residual_prefix_pending(PsWalStore *store, uint64_t *target_lsn_out)
+{
+	if (store == NULL || target_lsn_out == NULL || !store->lock_initialized)
+		return -1;
+	if (pthread_mutex_lock(&store->lock) != 0)
+		return -1;
+	if (store->directory_fd < 0 || store->metadata_fenced)
+	{
+		pthread_mutex_unlock(&store->lock);
+		return -1;
+	}
+	*target_lsn_out = store->residual_prefix_target_lsn;
+	{
+		int pending = store->residual_prefix_pending;
+
+		pthread_mutex_unlock(&store->lock);
+		return pending;
+	}
+}
+
+int
 ps_wal_store_advance_retained_base(PsWalStore *store,
 								   uint64_t retained_base_lsn)
 {
@@ -1694,6 +1721,7 @@ ps_wal_store_advance_retained_base(PsWalStore *store,
 		pthread_mutex_lock(&store->lock) != 0)
 		return -1;
 	if (store->directory_fd < 0 || store->metadata_fenced ||
+		store->residual_prefix_pending ||
 		retained_base_lsn < store->retained_base_lsn ||
 		retained_base_lsn > store->end_lsn ||
 		retained_base_lsn % store->segment_size != 0)
@@ -1753,6 +1781,14 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 			goto done_reclaim;
 	}
 	store->retained_base_lsn = target_lsn;
+	/* A newly published physical frontier, or a marker reconstructed by reopen,
+	 * requires a directory-sync-complete unlink retry.  A plain idempotent call
+	 * after a completed reclaim must not manufacture pending work. */
+	if (store->start_lsn != target_lsn || store->residual_prefix_pending)
+	{
+		store->residual_prefix_pending = 1;
+		store->residual_prefix_target_lsn = target_lsn;
+	}
 
 	/* This hook models a stop/crash after the durable frontier publication and
 	 * before the first unlink.  The next process can retry idempotently. */
@@ -1789,7 +1825,7 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 		goto done_reclaim;
 	if (unlink_residual_prefix(store, target_lsn, &unlink_count) != 0)
 		goto done_reclaim;
-	if (unlink_count > 0 &&
+	if (store->residual_prefix_pending &&
 		(getenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_DIR_FSYNC") != NULL ||
 		 getenv("PAGESTORE_TEST_FAIL_WAL_RECLAIM_DIR_FSYNC") != NULL ||
 		 fsync(store->directory_fd) != 0))
@@ -1801,6 +1837,11 @@ ps_wal_store_reclaim_prefix(PsWalStore *store, uint64_t target_lsn)
 		 * the published frontier and safely tolerates any residual prefix. */
 		store->metadata_fenced = 1;
 		goto done_reclaim;
+	}
+	if (store->residual_prefix_pending)
+	{
+		store->residual_prefix_pending = 0;
+		store->residual_prefix_target_lsn = 0;
 	}
 	rc = 0;
 

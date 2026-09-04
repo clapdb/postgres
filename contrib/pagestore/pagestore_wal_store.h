@@ -31,6 +31,11 @@ typedef struct PsWalStore
 	uint64_t	start_lsn;
 	uint64_t	retained_base_lsn;
 	uint64_t	end_lsn;
+	/* A durable physical frontier can outlive the unlink phase across a
+	 * process stop.  This state is runtime-only and is reconstructed by the
+	 * open-time residual-prefix scan. */
+	int		residual_prefix_pending;
+	uint64_t	residual_prefix_target_lsn;
 	int			directory_fd;
 	int			metadata_fenced;
 	pthread_mutex_t lock;
@@ -71,6 +76,10 @@ extern int ps_wal_store_advance_retained_base(PsWalStore *store,
  * only WAL-store API that authorizes prefix unlink. */
 extern int ps_wal_store_reclaim_prefix(PsWalStore *store,
 								   uint64_t target_lsn);
+/* Return whether a previously published prefix still needs physical unlink.
+ * The result and target are read under the store mutex. */
+extern int ps_wal_store_residual_prefix_pending(PsWalStore *store,
+										 uint64_t *target_lsn_out);
 extern int ps_wal_store_read(PsWalStore *store, uint64_t start_lsn,
 								 void *data, uint32_t len);
 /* The caller must externally prevent concurrent operations and retain the
