@@ -52,7 +52,7 @@ assert() {  # $1=actual $2=expected $3=message
 wait_daemon_ready() {
 	local shm_path="/dev/shm$SHM"
 	local expected_magic=$((0x50414753))
-	local expected_version=36
+	local expected_version=37
 	local expected_page_size=8192
 	local expected_io_unit=$((256 * 1024))
 	local expected_channels=128
