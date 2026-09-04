@@ -70,6 +70,8 @@ uint64_t	page_reclaim_high_water_bytes;
 uint64_t	page_reclaim_catchup_bytes;
 uint64_t	wal_reclaim_high_water_bytes;
 uint64_t	wal_reclaim_catchup_bytes;
+uint64_t	walidx_reclaim_high_water_bytes;
+uint64_t	walidx_reclaim_catchup_bytes;
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -243,6 +245,9 @@ typedef struct PsBackpressureController
 static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
 static PsBackpressureController page_backpressure;
 static PsBackpressureController wal_backpressure;
+static PsBackpressureController walidx_backpressure;
+#define MAX_TIMELINES	1024
+static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
 static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
@@ -252,11 +257,15 @@ static void *backpressure_slow_path_test_hook_arg;
 #define PS_BACKPRESSURE_GATE_WAL_ENABLED	(1u << 1)
 #define PS_BACKPRESSURE_GATE_PAGE_THROTTLED	(1u << 2)
 #define PS_BACKPRESSURE_GATE_WAL_THROTTLED	(1u << 3)
+#define PS_BACKPRESSURE_GATE_WALIDX_ENABLED	(1u << 4)
+#define PS_BACKPRESSURE_GATE_WALIDX_THROTTLED	(1u << 5)
 #define PS_BACKPRESSURE_GATE_THROTTLED_MASK \
-	(PS_BACKPRESSURE_GATE_PAGE_THROTTLED | PS_BACKPRESSURE_GATE_WAL_THROTTLED)
+	(PS_BACKPRESSURE_GATE_PAGE_THROTTLED | PS_BACKPRESSURE_GATE_WAL_THROTTLED | \
+	 PS_BACKPRESSURE_GATE_WALIDX_THROTTLED)
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
+static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates);
 static int admission_write_lock(void);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
@@ -616,10 +625,14 @@ backpressure_publish_locked(void)
 		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_ENABLED;
 	if (wal_backpressure.high_water_bytes != 0)
 		gate_mask |= PS_BACKPRESSURE_GATE_WAL_ENABLED;
+	if (walidx_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_WALIDX_ENABLED;
 	if (page_backpressure.throttled)
 		gate_mask |= PS_BACKPRESSURE_GATE_PAGE_THROTTLED;
 	if (wal_backpressure.throttled)
 		gate_mask |= PS_BACKPRESSURE_GATE_WAL_THROTTLED;
+	if (walidx_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_WALIDX_THROTTLED;
 	/* Publish controller state before advertising the corresponding fast-path
 	 * mask.  Slow-path callers recheck authoritative state under the mutex. */
 	__atomic_store_n(&backpressure_gate_mask, gate_mask, __ATOMIC_RELEASE);
@@ -655,6 +668,20 @@ backpressure_publish_locked(void)
 						 wal_backpressure.throttle_exits);
 	ps_store_release_u64(&hdr->wal_backpressure.foreground_wait_ns,
 						 wal_backpressure.foreground_wait_ns);
+	ps_store_release_u64(&hdr->walidx_backpressure.lag_bytes,
+						 walidx_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->walidx_backpressure.high_water_bytes,
+						 walidx_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->walidx_backpressure.catchup_bytes,
+						 walidx_backpressure.catchup_bytes);
+	ps_store_release(&hdr->walidx_backpressure.throttled,
+						 walidx_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->walidx_backpressure.throttle_enters,
+						 walidx_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->walidx_backpressure.throttle_exits,
+						 walidx_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->walidx_backpressure.foreground_wait_ns,
+						 walidx_backpressure.foreground_wait_ns);
 	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
 }
 
@@ -663,12 +690,27 @@ ps_backpressure_configure(uint64_t page_high_water,
 						  uint64_t page_catchup,
 						  uint64_t wal_high_water,
 						  uint64_t wal_catchup)
+
+{
+	return ps_backpressure_configure_all(page_high_water, page_catchup,
+									 wal_high_water, wal_catchup, 0, 0);
+}
+
+int
+ps_backpressure_configure_all(uint64_t page_high_water,
+							  uint64_t page_catchup,
+							  uint64_t wal_high_water,
+							  uint64_t wal_catchup,
+							  uint64_t walidx_high_water,
+							  uint64_t walidx_catchup)
 {
 	if ((page_high_water == 0 && page_catchup != 0) ||
 		(page_high_water != 0 && page_catchup >= page_high_water) ||
 		(page_high_water != 0 && !segment_gc_enabled) ||
 		(wal_high_water == 0 && wal_catchup != 0) ||
-		(wal_high_water != 0 && wal_catchup >= wal_high_water))
+		(wal_high_water != 0 && wal_catchup >= wal_high_water) ||
+		(walidx_high_water == 0 && walidx_catchup != 0) ||
+		(walidx_high_water != 0 && walidx_catchup >= walidx_high_water))
 	{
 		errno = EINVAL;
 		return -1;
@@ -677,13 +719,20 @@ ps_backpressure_configure(uint64_t page_high_water,
 	page_reclaim_catchup_bytes = page_catchup;
 	wal_reclaim_high_water_bytes = wal_high_water;
 	wal_reclaim_catchup_bytes = wal_catchup;
+	walidx_reclaim_high_water_bytes = walidx_high_water;
+	walidx_reclaim_catchup_bytes = walidx_catchup;
 	pthread_mutex_lock(&backpressure_lock);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
 	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
+	memset(&walidx_backpressure, 0, sizeof(walidx_backpressure));
 	page_backpressure.high_water_bytes = page_high_water;
 	page_backpressure.catchup_bytes = page_catchup;
 	wal_backpressure.high_water_bytes = wal_high_water;
 	wal_backpressure.catchup_bytes = wal_catchup;
+	walidx_backpressure.high_water_bytes = walidx_high_water;
+	walidx_backpressure.catchup_bytes = walidx_catchup;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
@@ -728,6 +777,8 @@ ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
 		causes |= PS_BACKPRESSURE_PAGE;
 	if (wal_backpressure.throttled)
 		causes |= PS_BACKPRESSURE_WAL;
+	if (walidx_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_WALIDX;
 	pthread_mutex_unlock(&backpressure_lock);
 	if (cause_mask != NULL)
 		*cause_mask = causes;
@@ -736,6 +787,13 @@ ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
 
 void
 ps_backpressure_record_wait(uint64_t page_wait_ns, uint64_t wal_wait_ns)
+{
+	ps_backpressure_record_wait3(page_wait_ns, wal_wait_ns, 0);
+}
+
+void
+ps_backpressure_record_wait3(uint64_t page_wait_ns, uint64_t wal_wait_ns,
+							 uint64_t walidx_wait_ns)
 {
 	pthread_mutex_lock(&backpressure_lock);
 	if (page_wait_ns != 0)
@@ -746,7 +804,11 @@ ps_backpressure_record_wait(uint64_t page_wait_ns, uint64_t wal_wait_ns)
 		wal_backpressure.foreground_wait_ns =
 			UINT64_MAX - wal_backpressure.foreground_wait_ns < wal_wait_ns ?
 			UINT64_MAX : wal_backpressure.foreground_wait_ns + wal_wait_ns;
-	if (page_wait_ns != 0 || wal_wait_ns != 0)
+	if (walidx_wait_ns != 0)
+		walidx_backpressure.foreground_wait_ns =
+			UINT64_MAX - walidx_backpressure.foreground_wait_ns < walidx_wait_ns ?
+			UINT64_MAX : walidx_backpressure.foreground_wait_ns + walidx_wait_ns;
+	if (page_wait_ns != 0 || wal_wait_ns != 0 || walidx_wait_ns != 0)
 		backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
 }
@@ -771,6 +833,24 @@ ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag)
 							   wal_reclaim_catchup_bytes);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
+}
+
+void
+ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&walidx_backpressure, walidx_lag,
+							   walidx_reclaim_high_water_bytes,
+							   walidx_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+int
+ps_test_walidx_force_due(uint32_t timeline)
+{
+	return timeline < MAX_TIMELINES ?
+		__atomic_load_n(&walidx_snapshot_force_due[timeline], __ATOMIC_ACQUIRE) : 0;
 }
 
 void
@@ -2653,8 +2733,6 @@ free_page_fork_indexes(void)
  * fall through to the parent as-of that branch LSN, so the branch is a stable
  * copy-on-write snapshot.
  */
-#define MAX_TIMELINES	1024
-
 /* Per-timeline immutable WAL stores are declared before the admission helpers
  * because the same retained-base fence is used by reads and branch admission. */
 static PsWalStore wal_segment_stores[MAX_TIMELINES];
@@ -9472,6 +9550,114 @@ walidx_snapshot_path(uint32_t tl, char *path, size_t path_len)
 	return n < 0 || (size_t) n >= path_len ? -1 : 0;
 }
 
+typedef struct WalIdxDebtSnapshot
+{
+	uint64_t generation;
+	uint64_t epochs[PS_MAX_CHANNELS];
+	uint64_t covered_offsets[PS_MAX_CHANNELS];
+	uint64_t observed_offsets[PS_MAX_CHANNELS];
+	char directory[4096];
+	int cleanup_pending;
+	PsWalIdxSnapshotPrepared cleanup;
+	int valid;
+} WalIdxDebtSnapshot;
+
+static int
+walidx_prepared_identity_equal(const PsWalIdxSnapshotPrepared *a,
+							   const PsWalIdxSnapshotPrepared *b)
+{
+	if (strcmp(a->directory, b->directory) != 0 ||
+		a->timeline != b->timeline || a->nshards != b->nshards ||
+		a->generation != b->generation || a->start_lsn != b->start_lsn ||
+		a->end_lsn != b->end_lsn)
+		return 0;
+	for (uint32_t shard = 0; shard < a->nshards; shard++)
+		if (a->shards[shard].len != b->shards[shard].len ||
+			a->shards[shard].crc != b->shards[shard].crc)
+			return 0;
+	return 1;
+}
+
+/* Capture only a short, coherent logical identity.  Physical inspection is
+ * deliberately performed after all of these locks are released. */
+static int
+walidx_debt_snapshot(uint32_t tl, WalIdxDebtSnapshot *snapshot)
+{
+	uint32_t ns = core_shards();
+	int rc = 0;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	pthread_rwlock_rdlock(&walidx_prune_lock);
+	ps_lock_map_rd();
+	walidx_publish_wrlock();
+	pthread_mutex_lock(&walidx_meta_lock);
+	if (ps_timeline_live(tl))
+	{
+		snapshot->generation = walidx_snapshot_generation[tl];
+		for (uint32_t shard = 0; shard < ns; shard++)
+		{
+			snapshot->epochs[shard] = walidx_log_epoch[tl][shard];
+			snapshot->covered_offsets[shard] =
+				walidx_snapshot_offsets[tl][shard];
+			snapshot->observed_offsets[shard] =
+				walidx_shard_offsets_seen[tl][shard];
+		}
+		snapshot->cleanup_pending =
+			__atomic_load_n(&walidx_snapshot_cleanup_pending[tl], __ATOMIC_ACQUIRE);
+		if (snapshot->cleanup_pending)
+			snapshot->cleanup = walidx_snapshot_cleanup[tl];
+		rc = walidx_snapshot_path(tl, snapshot->directory,
+								  sizeof(snapshot->directory));
+		if (rc == 0)
+			snapshot->valid = 1;
+	}
+	pthread_mutex_unlock(&walidx_meta_lock);
+	walidx_publish_wrunlock();
+	ps_unlock_map();
+	pthread_rwlock_unlock(&walidx_prune_lock);
+	return rc;
+}
+
+static int
+walidx_debt_snapshot_unchanged(uint32_t tl,
+							   const WalIdxDebtSnapshot *snapshot)
+{
+	uint32_t ns = core_shards();
+	int unchanged = 0;
+
+	pthread_rwlock_rdlock(&walidx_prune_lock);
+	ps_lock_map_rd();
+	walidx_publish_wrlock();
+	pthread_mutex_lock(&walidx_meta_lock);
+	if (ps_timeline_live(tl) &&
+		walidx_snapshot_generation[tl] == snapshot->generation)
+	{
+		unchanged = 1;
+		if (snapshot->cleanup_pending !=
+			__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
+							__ATOMIC_ACQUIRE) ||
+			(snapshot->cleanup_pending &&
+			 !walidx_prepared_identity_equal(&snapshot->cleanup,
+										  &walidx_snapshot_cleanup[tl])))
+			unchanged = 0;
+		for (uint32_t shard = 0; shard < ns; shard++)
+			if (walidx_log_epoch[tl][shard] != snapshot->epochs[shard] ||
+				walidx_snapshot_offsets[tl][shard] !=
+				 snapshot->covered_offsets[shard] ||
+				walidx_shard_offsets_seen[tl][shard] !=
+				 snapshot->observed_offsets[shard])
+			{
+				unchanged = 0;
+				break;
+			}
+	}
+	pthread_mutex_unlock(&walidx_meta_lock);
+	walidx_publish_wrunlock();
+	ps_unlock_map();
+	pthread_rwlock_unlock(&walidx_prune_lock);
+	return unchanged;
+}
+
 static int
 walidx_entry_prune_plan(const WalIdxEnt *e, uint64_t cutoff,
 						const uint64_t *horizons, uint32_t nhorizons,
@@ -10071,7 +10257,6 @@ walidx_snapshot_publish_one(void)
 	int candidate = -1;
 	int retry = 0;
 	int rc = 0;
-
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 		if (__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
@@ -10098,14 +10283,16 @@ walidx_snapshot_publish_one(void)
 	{
 		uint32_t tl = (walidx_snapshot_cursor + step) % MAX_TIMELINES;
 		struct timespec retry_at = walidx_snapshot_retry_at[tl];
+		int force_due = __atomic_load_n(&walidx_snapshot_force_due[tl],
+											 __ATOMIC_ACQUIRE);
 
-			if (ps_timeline_live(tl) &&
+		if (ps_timeline_live(tl) &&
 				(now.tv_sec > retry_at.tv_sec ||
 			 (now.tv_sec == retry_at.tv_sec && now.tv_nsec >= retry_at.tv_nsec)) &&
 			!__atomic_load_n(&walidx_snapshot_cleanup_pending[tl],
 							 __ATOMIC_ACQUIRE) &&
-			(walidx_snapshot_reshard_pending[tl] ||
-			 walidx_progress[tl] > walidx_snapshot_end[tl]))
+				(walidx_snapshot_reshard_pending[tl] ||
+				 walidx_progress[tl] > walidx_snapshot_end[tl] || force_due))
 		{
 			uint64_t tail = 0;
 			uint64_t threshold =
@@ -10129,7 +10316,7 @@ walidx_snapshot_publish_one(void)
 			/* Full snapshots grow geometrically with the already snapshotted
 			 * log, bounding retained generations and total rewrite I/O. */
 			if (!invalid && (walidx_snapshot_end[tl] < walidx_frontier_current(tl) ||
-						 walidx_snapshot_reshard_pending[tl] ||
+						 walidx_snapshot_reshard_pending[tl] || force_due ||
 						 tail >= threshold))
 			{
 				candidate = (int) tl;
@@ -10166,6 +10353,8 @@ walidx_snapshot_publish_one(void)
 		int compact = 0;
 		int frontier_pending;
 		int prepared_generation;
+		int force_due = __atomic_load_n(&walidx_snapshot_force_due[tl],
+											 __ATOMIC_ACQUIRE);
 
 		pthread_mutex_lock(&walidx_meta_lock);
 		start_lsn = walidx_snapshot_generation[tl] != 0 ?
@@ -10175,7 +10364,9 @@ walidx_snapshot_publish_one(void)
 		frontier_pending = previous_end < walidx_frontier_current(tl);
 		pthread_mutex_unlock(&walidx_meta_lock);
 		if (start_lsn == UINT64_MAX ||
-			(!walidx_snapshot_reshard_pending[tl] && end_lsn <= previous_end) ||
+			(!walidx_snapshot_reshard_pending[tl] &&
+				 (end_lsn < previous_end ||
+				  (end_lsn == previous_end && !force_due))) ||
 			(walidx_snapshot_reshard_pending[tl] && end_lsn < previous_end))
 			goto publish_done;
 		if (walidx_snapshot_path(tl, directory, sizeof(directory)) != 0)
@@ -12054,6 +12245,67 @@ wal_lag_unlock:
 	return lag;
 }
 
+/* Observe one timeline without holding runtime locks across filesystem I/O.
+ * The publication writer lock makes the captured offsets a coherent logical
+ * identity; the second short critical section rejects an observation that
+ * raced a publish/append/recovery transition. */
+static uint64_t
+walidx_reclaim_lag_bytes(unsigned char *tail_candidates)
+{
+	uint64_t lag = 0;
+	const uint32_t max_retries = 3;
+
+	if (tail_candidates != NULL)
+		memset(tail_candidates, 0, MAX_TIMELINES);
+
+	if (ps_storage == NULL || ps_storage->name == NULL ||
+		strcmp(ps_storage->name, "posix") != 0 ||
+		ps_storage->walidx_reclaim_bytes == NULL)
+		return UINT64_MAX;
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		WalIdxDebtSnapshot snapshot;
+		uint64_t tail = 0;
+		uint64_t obsolete_epoch = 0;
+		uint64_t obsolete_snapshot = 0;
+		uint64_t total;
+		int stable = 0;
+
+		for (uint32_t attempt = 0; attempt < max_retries; attempt++)
+		{
+			if (walidx_debt_snapshot(tl, &snapshot) != 0)
+				return UINT64_MAX;
+			if (!snapshot.valid)
+			{
+				stable = 1;
+				break;
+			}
+			if (ps_storage->walidx_reclaim_bytes(tl, snapshot.epochs,
+												 snapshot.covered_offsets,
+												 snapshot.observed_offsets,
+												 core_shards(), &tail,
+												 &obsolete_epoch) != 0 ||
+				ps_walidx_snapshot_reclaim_bytes(snapshot.directory, tl,
+												 snapshot.generation,
+												 &obsolete_snapshot) != 0)
+				return UINT64_MAX;
+			total = backpressure_saturating_add(tail, obsolete_epoch);
+			total = backpressure_saturating_add(total, obsolete_snapshot);
+			if (walidx_debt_snapshot_unchanged(tl, &snapshot))
+			{
+				lag = backpressure_saturating_add(lag, total);
+				if (tail_candidates != NULL && tail != 0)
+					tail_candidates[tl] = 1;
+				stable = 1;
+				break;
+			}
+		}
+		if (!stable)
+			return UINT64_MAX;
+	}
+	return lag;
+}
+
 static void
 backpressure_update_locked(PsBackpressureController *controller,
 						   uint64_t lag, uint64_t high, uint64_t catchup)
@@ -12084,10 +12336,13 @@ backpressure_update_locked(PsBackpressureController *controller,
 void
 ps_backpressure_refresh(void)
 {
+	unsigned char walidx_tail_candidates[MAX_TIMELINES] = {0};
 	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
 		page_reclaim_lag_bytes() : 0;
 	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
 		wal_reclaim_lag_bytes() : 0;
+	uint64_t walidx_lag = walidx_reclaim_high_water_bytes != 0 ?
+		walidx_reclaim_lag_bytes(walidx_tail_candidates) : 0;
 
 	pthread_mutex_lock(&backpressure_lock);
 	backpressure_update_locked(&page_backpressure, page_lag,
@@ -12096,6 +12351,13 @@ ps_backpressure_refresh(void)
 	backpressure_update_locked(&wal_backpressure, wal_lag,
 							   wal_reclaim_high_water_bytes,
 							   wal_reclaim_catchup_bytes);
+	backpressure_update_locked(&walidx_backpressure, walidx_lag,
+											   walidx_reclaim_high_water_bytes,
+											   walidx_reclaim_catchup_bytes);
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+		__atomic_store_n(&walidx_snapshot_force_due[tl],
+			walidx_backpressure.throttled && walidx_tail_candidates[tl],
+			__ATOMIC_RELEASE);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
 }
@@ -14305,7 +14567,8 @@ ps_core_maintenance(void)
 	/* Disabled-by-default controllers must not perturb the maintenance hot
 	 * path (or its scheduling) merely to republish an unchanged zero snapshot. */
 	if (page_reclaim_high_water_bytes != 0 ||
-		wal_reclaim_high_water_bytes != 0)
+		wal_reclaim_high_water_bytes != 0 ||
+		walidx_reclaim_high_water_bytes != 0)
 		ps_backpressure_refresh();
 	return did;
 }

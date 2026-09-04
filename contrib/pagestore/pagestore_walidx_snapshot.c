@@ -306,6 +306,24 @@ parse_shard_name(const char *name, uint64_t *generation_out)
 }
 
 static int
+parse_shard_name_details(const char *name, uint64_t *generation_out,
+							 uint32_t *shard_out)
+{
+	uint64_t generation;
+	const char *digits;
+	uint32_t shard = 0;
+
+	if (parse_shard_name(name, &generation) != 0)
+		return -1;
+	digits = name + strlen(name) - 3;
+	for (int i = 0; i < 3; i++)
+		shard = shard * 10 + (uint32_t) (digits[i] - '0');
+	*generation_out = generation;
+	*shard_out = shard;
+	return 0;
+}
+
+static int
 parse_shard_temp_name(const char *name)
 {
 	const char *marker = strstr(name, ".tmp.");
@@ -1154,9 +1172,23 @@ cleanup:
 	return rc;
 }
 
-int
-ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot, const char *directory,
-						uint32_t timeline)
+static int
+validate_shard_metadata(int directory_fd, uint64_t generation,
+						uint32_t shard, uint64_t expected_len)
+{
+	char name[128];
+	struct stat st;
+
+	return shard_name(generation, shard, name, sizeof(name)) == 0 &&
+		fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+		S_ISREG(st.st_mode) && st.st_size >= 0 &&
+		(uint64_t) st.st_size == expected_len ? 0 : -1;
+}
+
+static int
+ps_walidx_snapshot_open_internal(PsWalIdxSnapshot *snapshot,
+								  const char *directory, uint32_t timeline,
+								  int validate_payload)
 {
 	unsigned char header[WALIDX_SNAPSHOT_HEADER_BYTES];
 	unsigned char *encoded = NULL;
@@ -1219,7 +1251,10 @@ ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot, const char *directory,
 			goto cleanup;
 		snapshot->shards[i].crc = get_le32(entry + 4);
 		snapshot->shards[i].len = get_le64(entry + 8);
-		if (validate_shard(snapshot, i) != 0)
+		if ((validate_payload && validate_shard(snapshot, i) != 0) ||
+			(!validate_payload &&
+			 validate_shard_metadata(snapshot->directory_fd, snapshot->generation,
+								 i, snapshot->shards[i].len) != 0))
 			goto cleanup;
 	}
 	rc = 0;
@@ -1231,6 +1266,20 @@ cleanup:
 	if (rc != 0)
 		ps_walidx_snapshot_close(snapshot);
 	return rc;
+}
+
+int
+ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot, const char *directory,
+						uint32_t timeline)
+{
+	return ps_walidx_snapshot_open_internal(snapshot, directory, timeline, 1);
+}
+
+int
+ps_walidx_snapshot_open_metadata(PsWalIdxSnapshot *snapshot,
+								 const char *directory, uint32_t timeline)
+{
+	return ps_walidx_snapshot_open_internal(snapshot, directory, timeline, 0);
 }
 
 int
@@ -1324,6 +1373,161 @@ cleanup:
 	else if (scan_fd >= 0)
 		close(scan_fd);
 	ps_walidx_snapshot_close(&current);
+	return rc;
+}
+
+int
+ps_walidx_snapshot_reclaim_bytes(const char *directory, uint32_t timeline,
+								  uint64_t selected_generation,
+								  uint64_t *bytes_out)
+{
+	struct dirent *entry;
+	PsWalIdxSnapshot selected;
+	PsWalIdxSnapshotPrepared prepared;
+	DIR *dir = NULL;
+	int directory_fd = -1;
+	int scan_fd = -1;
+	uint64_t total = 0;
+	uint32_t selected_nshards = 0;
+	unsigned char selected_present[PS_WALIDX_SNAPSHOT_MAX_SHARDS] = {0};
+	unsigned char prepared_shards_present[PS_WALIDX_SNAPSHOT_MAX_SHARDS] = {0};
+	int prepared_present = 0;
+	int selected_open = 0;
+	int rc = -1;
+
+	(void) timeline;
+	if (directory == NULL || bytes_out == NULL)
+		return -1;
+	if (selected_generation != 0)
+	{
+		if (ps_walidx_snapshot_open_metadata(&selected, directory, timeline) != 0 ||
+			selected.generation != selected_generation)
+		{
+			ps_walidx_snapshot_close(&selected);
+			return -1;
+		}
+		selected_nshards = selected.nshards;
+		selected_open = 1;
+	}
+	directory_fd = open_directory(directory, 0);
+	if (directory_fd < 0)
+	{
+		if (errno == ENOENT && selected_generation == 0)
+		{
+			*bytes_out = 0;
+			rc = 0;
+		}
+		goto cleanup;
+	}
+	if (selected_generation == 0)
+	{
+		struct stat manifest_st;
+
+		if (fstatat(directory_fd, WALIDX_SNAPSHOT_MANIFEST, &manifest_st,
+					AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+			goto cleanup;
+	}
+	if (faccessat(directory_fd, WALIDX_SNAPSHOT_PREPARED, F_OK, 0) == 0)
+	{
+		if (read_prepared(directory_fd, directory, timeline, &prepared, 0) != 0)
+			goto cleanup;
+		prepared_present = 1;
+	}
+	else if (errno != ENOENT)
+		goto cleanup;
+	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		uint64_t generation = 0;
+		uint32_t shard = 0;
+		struct stat st;
+		int count = 0;
+
+		if (parse_shard_name_details(entry->d_name, &generation, &shard) == 0)
+		{
+			/* A missing selected manifest is not a safe identity. */
+			if (selected_generation == 0)
+				goto cleanup;
+			if (generation == selected_generation && shard < selected_nshards)
+			{
+				if (selected_present[shard] ||
+					fstatat(directory_fd, entry->d_name, &st,
+							AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+					st.st_size < 0 ||
+					(uint64_t) st.st_size != selected.shards[shard].len)
+					goto cleanup;
+				if (prepared_present && generation == prepared.generation &&
+					shard < prepared.nshards &&
+					(uint64_t) st.st_size != prepared.shards[shard].len)
+					goto cleanup;
+				selected_present[shard] = 1;
+				if (prepared_present && generation == prepared.generation &&
+					shard < prepared.nshards)
+					prepared_shards_present[shard] = 1;
+				continue;
+			}
+			if (generation == selected_generation)
+				goto cleanup;
+			/* A newer canonical generation is retained for publication retry and
+			 * is not reclaim debt.  A prepared descriptor is different: its
+			 * physical files are still pending cleanup and are charged below. */
+			count = generation < selected_generation ||
+				(prepared_present && generation == prepared.generation &&
+				 shard < prepared.nshards);
+		}
+		else if (parse_shard_temp_name(entry->d_name) == 0 ||
+				 strcmp(entry->d_name, WALIDX_SNAPSHOT_PREPARED) == 0)
+			count = 1;
+		else if (strncmp(entry->d_name, "walidxg1_", 9) == 0 ||
+				 strstr(entry->d_name, ".tmp.") != NULL)
+			goto cleanup;
+		if (strcmp(entry->d_name, WALIDX_SNAPSHOT_PREPARED) == 0 &&
+			!prepared_present)
+			goto cleanup;
+		if (!count)
+			continue;
+		if (fstatat(directory_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+			!S_ISREG(st.st_mode) || st.st_size < 0)
+			goto cleanup;
+		if (prepared_present && generation != 0 &&
+			generation == prepared.generation && shard < prepared.nshards &&
+			(uint64_t) st.st_size != prepared.shards[shard].len)
+			goto cleanup;
+		if (prepared_present && generation != 0 &&
+			generation == prepared.generation && shard < prepared.nshards)
+			prepared_shards_present[shard] = 1;
+		if ((uint64_t) st.st_size > UINT64_MAX - total)
+		{
+			total = UINT64_MAX;
+			continue;
+		}
+		total += (uint64_t) st.st_size;
+	}
+	if (errno != 0)
+		goto cleanup;
+	for (uint32_t shard = 0; shard < selected_nshards; shard++)
+		if (!selected_present[shard])
+			goto cleanup;
+	if (prepared_present)
+		for (uint32_t shard = 0; shard < prepared.nshards; shard++)
+			if (!prepared_shards_present[shard])
+				goto cleanup;
+	*bytes_out = total;
+	rc = 0;
+
+cleanup:
+	if (selected_open)
+		ps_walidx_snapshot_close(&selected);
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	if (directory_fd >= 0)
+		close(directory_fd);
 	return rc;
 }
 

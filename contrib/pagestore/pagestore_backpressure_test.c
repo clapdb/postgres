@@ -3,7 +3,9 @@
 #define _GNU_SOURCE
 #endif
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -17,6 +19,8 @@
 
 static int checks;
 static int failed;
+
+static void configure_page_core(void);
 
 typedef struct BackpressureSlowPathCounter
 {
@@ -51,6 +55,31 @@ check(int ok, const char *name)
 	}
 }
 
+typedef struct TestWalIdxWatermark
+{
+	uint64_t magic;
+	uint64_t length;
+	uint32_t crc;
+	uint32_t reserved;
+} TestWalIdxWatermark;
+
+static uint32_t
+test_walidx_watermark_crc(TestWalIdxWatermark *watermark)
+{
+	unsigned char *bytes = (unsigned char *) watermark;
+	uint32_t saved = watermark->crc;
+	uint32_t hash = 2166136261u;
+
+	watermark->crc = 0;
+	for (size_t i = 0; i < sizeof(*watermark); i++)
+	{
+		hash ^= bytes[i];
+		hash *= 16777619u;
+	}
+	watermark->crc = saved;
+	return hash;
+}
+
 static void
 reset_controller(PsShmHeader *metrics)
 {
@@ -82,6 +111,24 @@ test_validation_and_hysteresis(void)
 		  "WAL catch-up equal to high-water is rejected");
 	check(ps_backpressure_configure(100, 40, 200, 80) == 0,
 		  "independent page and WAL thresholds are accepted");
+	check(ps_backpressure_configure_all(100, 40, 200, 80, 300, 120) == 0,
+		  "the independent WAL-index thresholds are accepted");
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 300, 301) != 0 &&
+		  ps_backpressure_configure_all(0, 0, 0, 0, 0, 1) != 0,
+		  "WAL-index catch-up validation rejects invalid configurations");
+	ps_test_backpressure_set_walidx_lag(299);
+	check(metrics.walidx_backpressure.throttled == 0,
+		  "WAL-index lag below high-water does not throttle");
+	ps_test_backpressure_set_walidx_lag(300);
+	check(metrics.walidx_backpressure.throttled == 1 &&
+		  metrics.walidx_backpressure.lag_bytes == 300,
+		  "WAL-index controller enters independently");
+	ps_test_backpressure_set_walidx_lag(120);
+	check(metrics.walidx_backpressure.throttled == 0 &&
+		  metrics.walidx_backpressure.throttle_exits == 1,
+		  "WAL-index controller releases at its catch-up target");
+	check(ps_backpressure_configure(100, 40, 200, 80) == 0,
+		  "restore page/WAL controller configuration for shared checks");
 	ps_test_backpressure_set_lag(99, 199);
 	check(metrics.page_backpressure.throttled == 0 &&
 		  metrics.wal_backpressure.throttled == 0,
@@ -138,6 +185,19 @@ test_nonblocking_admission_and_shutdown(void)
 		  slow_path.calls == 0,
 		  "enabled but unthrottled controller keeps the lock-free path");
 	ps_test_backpressure_set_lag(100, 0);
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 100, 20) == 0,
+		  "WAL-index controller enables for cause accounting");
+	ps_test_backpressure_set_walidx_lag(100);
+	check(ps_backpressure_try_admit(&stop, &causes) == 0 &&
+		  causes == PS_BACKPRESSURE_WALIDX,
+		  "WAL-index throttle reports only its own admission cause");
+	ps_backpressure_record_wait3(0, 0, 4321);
+	check(ps_load_acquire_u64(&metrics.walidx_backpressure.foreground_wait_ns) == 4321,
+		  "WAL-index deferred wait is charged independently");
+	check(ps_backpressure_configure(100, 20, 0, 0) == 0,
+		  "restore page controller for shutdown admission test");
+	slow_path.calls = 0;
+	ps_test_backpressure_set_lag(100, 0);
 	check(ps_backpressure_try_admit(&stop, &causes) == 0 &&
 		  causes == PS_BACKPRESSURE_PAGE && slow_path.calls == 1,
 		  "throttled foreground mutation is deferred without blocking");
@@ -158,6 +218,329 @@ test_nonblocking_admission_and_shutdown(void)
 
 	ps_test_set_backpressure_slow_path_hook(NULL, NULL);
 	ps_core_set_metrics_header(NULL);
+}
+
+static void
+test_walidx_append_tail_restart(void)
+{
+	char store[] = "/tmp/pagestore-walidx-backpressure-XXXXXX";
+	PsShmHeader metrics;
+	PsChannel channel;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 1, 0) == 0,
+		  "configure WAL-index backpressure for append-tail coverage");
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open a store for WAL-index append-tail coverage");
+	ps_core_set_metrics_header(&metrics);
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = 0;
+	ps_backpressure_refresh();
+	check(metrics.walidx_backpressure.lag_bytes == 0 &&
+		  metrics.walidx_backpressure.throttled == 0,
+		  "legacy epoch-zero lazy absence is clean for an untouched shard");
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	channel.opcode = PS_OP_WAL_APPEND;
+	channel.datalen = 128;
+	memset(channel.data, 0xa5, channel.datalen);
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append shipped WAL backing the WAL-index frontier");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = 0;
+	channel.opcode = PS_OP_WAL_INDEX_ADD;
+	channel.blocknum = 0;
+	channel.req_lsn = 100;
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append one durable WAL-index record");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = 0;
+	channel.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	channel.req_lsn = 0;
+	channel.req_seq = 128;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "publish the durable WAL-index frontier");
+	ps_backpressure_refresh();
+	check(metrics.walidx_backpressure.lag_bytes >= sizeof(uint64_t) * 8 &&
+		  metrics.walidx_backpressure.throttled != 0,
+		  "WAL-index append tail enters the independent controller");
+	{
+		char log_path[1024];
+		char saved_path[1024];
+
+		snprintf(log_path, sizeof(log_path), "%s/walidx_0_0", store);
+		snprintf(saved_path, sizeof(saved_path), "%s/walidx_0_0.saved", store);
+		check(rename(log_path, saved_path) == 0,
+			  "locate the active legacy epoch-zero WAL-index file");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX &&
+			  metrics.walidx_backpressure.throttled != 0,
+			  "missing current WAL-index file fails closed");
+		check(rename(saved_path, log_path) == 0,
+			  "restore the active legacy WAL-index file");
+		ps_backpressure_refresh();
+	}
+	{
+		char obsolete_log[1024];
+		char obsolete_marker[1024];
+		unsigned char obsolete_data[7] = {0, 1, 2, 3, 4, 5, 6};
+		TestWalIdxWatermark watermark;
+		uint64_t baseline;
+		int fd;
+		int created = 0;
+
+		/* The recorded length is deliberately different from the physical
+		 * log size: obsolete debt must charge log bytes plus marker bytes. */
+		snprintf(obsolete_log, sizeof(obsolete_log),
+				 "%s/walidx_0_0_e%020llu", store, 1ULL);
+		snprintf(obsolete_marker, sizeof(obsolete_marker), "%s.size", obsolete_log);
+		memset(&watermark, 0, sizeof(watermark));
+		watermark.magic = UINT64_C(0x31524b4d58444957);
+		watermark.length = 123;
+		watermark.crc = test_walidx_watermark_crc(&watermark);
+		baseline = metrics.walidx_backpressure.lag_bytes;
+		fd = open(obsolete_log, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (fd >= 0 && write(fd, obsolete_data, sizeof(obsolete_data)) ==
+			(ssize_t) sizeof(obsolete_data) && fsync(fd) == 0 && close(fd) == 0)
+			created = 1;
+		else if (fd >= 0)
+			close(fd);
+		fd = open(obsolete_marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		if (created && fd >= 0 && write(fd, &watermark, sizeof(watermark)) ==
+			(ssize_t) sizeof(watermark) && fsync(fd) == 0 && close(fd) == 0)
+			created = 1;
+		else
+		{
+			created = 0;
+			if (fd >= 0)
+				close(fd);
+		}
+		check(created, "create a physical obsolete epoch and watermark");
+		if (created)
+		{
+			ps_backpressure_refresh();
+			check(metrics.walidx_backpressure.lag_bytes == baseline +
+				  sizeof(obsolete_data) + sizeof(watermark),
+				  "obsolete debt charges exact physical epoch plus marker bytes");
+			check(unlink(obsolete_marker) == 0 && unlink(obsolete_log) == 0,
+				  "remove the synthetic obsolete epoch artifacts");
+			ps_backpressure_refresh();
+		}
+		else
+		{
+			(void) unlink(obsolete_marker);
+			(void) unlink(obsolete_log);
+		}
+	}
+	for (int i = 0; i < 16 && metrics.walidx_backpressure.throttled != 0; i++)
+	{
+		(void) ps_core_maintenance();
+		ps_backpressure_refresh();
+	}
+	check(metrics.walidx_backpressure.lag_bytes == 0 &&
+		  metrics.walidx_backpressure.throttled == 0,
+		  "below-trigger WAL-index debt is snapshotted, GC'd, and released");
+	{
+		char current_log[1024];
+		char current_marker[1024];
+		char saved_path[1024];
+		TestWalIdxWatermark original;
+		int fd;
+		int watermark_ok = 0;
+
+		/* Publication rotates to epoch one.  Its empty log still has a
+		 * required CRC-protected active watermark. */
+		snprintf(current_log, sizeof(current_log),
+				 "%s/walidx_0_0_e%020llu", store, 1ULL);
+		snprintf(current_marker, sizeof(current_marker), "%s.size", current_log);
+		snprintf(saved_path, sizeof(saved_path), "%s.saved", current_marker);
+		fd = open(current_marker, O_RDONLY);
+		if (fd >= 0 && read(fd, &original, sizeof(original)) ==
+			(ssize_t) sizeof(original) && close(fd) == 0)
+			watermark_ok = 1;
+		fd = -1;
+		check(access(current_log, F_OK) == 0 && watermark_ok,
+			  "snapshot publication leaves the selected epoch watermark");
+		if (access(current_log, F_OK) == 0 && access(current_marker, F_OK) == 0)
+		{
+			check(rename(current_log, saved_path) == 0,
+				  "rename the selected epoch file for a presence fault");
+			ps_backpressure_refresh();
+			check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX,
+				  "missing selected epoch file fails closed");
+			check(rename(saved_path, current_log) == 0,
+				  "restore the selected epoch file");
+
+			check(rename(current_marker, saved_path) == 0,
+				  "rename the selected active watermark for a presence fault");
+			ps_backpressure_refresh();
+			check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX,
+				  "missing selected active watermark fails closed");
+			check(rename(saved_path, current_marker) == 0,
+				  "restore the selected active watermark");
+
+			fd = open(current_marker, O_WRONLY);
+			check(fd >= 0 && pwrite(fd, "x", 1, 0) == 1 && fsync(fd) == 0 &&
+				  close(fd) == 0,
+				  "corrupt the selected active watermark");
+			ps_backpressure_refresh();
+			check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX,
+				  "corrupt selected active watermark fails closed");
+			fd = open(current_marker, O_WRONLY);
+			check(fd >= 0 && pwrite(fd, &original, sizeof(original), 0) ==
+				  (ssize_t) sizeof(original) && fsync(fd) == 0 && close(fd) == 0,
+				  "restore the selected active watermark after corruption");
+
+			/* A validly encoded but mismatched recorded length is unsafe too. */
+		original.length++;
+		original.crc = test_walidx_watermark_crc(&original);
+		fd = open(current_marker, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &original, sizeof(original), 0) ==
+				  (ssize_t) sizeof(original) && fsync(fd) == 0 && close(fd) == 0,
+				  "write a mismatched selected watermark length");
+		ps_backpressure_refresh();
+		check(metrics.walidx_backpressure.lag_bytes == UINT64_MAX,
+			  "mismatched selected active watermark fails closed");
+		original.length--;
+		original.crc = test_walidx_watermark_crc(&original);
+		fd = open(current_marker, O_WRONLY);
+		check(fd >= 0 && pwrite(fd, &original, sizeof(original), 0) ==
+				  (ssize_t) sizeof(original) && fsync(fd) == 0 && close(fd) == 0,
+				  "restore the selected watermark after mismatch");
+		}
+	}
+	/* The published WAL-index frontier can have no progress delta while the
+	 * active epoch still accumulates an append tail.  Force eligibility must
+	 * select this timeline despite the normal geometric snapshot trigger. */
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = 0;
+	channel.opcode = PS_OP_WAL_INDEX_ADD;
+	channel.blocknum = 1;
+	channel.req_lsn = 100;
+	channel.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+		  "append WAL-index tail without advancing the published frontier");
+	ps_backpressure_refresh();
+	check(metrics.walidx_backpressure.throttled != 0 &&
+		  ps_test_walidx_force_due(0) != 0,
+		  "tail-only debt throttles and marks its timeline force-eligible");
+	for (int i = 0; i < 16 && metrics.walidx_backpressure.throttled != 0; i++)
+	{
+		(void) ps_core_maintenance();
+		ps_backpressure_refresh();
+	}
+	check(metrics.walidx_backpressure.lag_bytes == 0 &&
+		  metrics.walidx_backpressure.throttled == 0 &&
+		  ps_test_walidx_force_due(0) == 0,
+		  "forced same-frontier publication clears tail-only debt");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_core_open(store) == 0,
+		  "restart WAL-index append-tail store");
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.walidx_backpressure.lag_bytes == 0 &&
+		  metrics.walidx_backpressure.throttled == 0,
+		  "restart sees no debt after the append tail was reclaimed");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable WAL-index backpressure after append-tail test");
+	remove_tree(store);
+}
+
+static int
+create_test_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
+{
+	PsChannel ch;
+	uint64_t parent_incarnation;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_TIMELINE_STATE;
+	ch.timeline = parent;
+	ch.status = PS_STATUS_OK;
+	if (ps_handle_meta(&ch) != 1 || ch.status != PS_STATUS_OK)
+		return 0;
+	parent_incarnation = ch.req_seq;
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_CREATE_BRANCH;
+	ch.timeline = timeline;
+	ch.parent_timeline = parent;
+	ch.req_lsn = branch_lsn;
+	ch.req_seq = parent_incarnation;
+	ch.status = PS_STATUS_OK;
+	ps_lifecycle_read_lock();
+	ps_admission_read_lock();
+	ps_lock_shard_wr(0);
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_admission_read_unlock();
+	ps_lifecycle_read_unlock();
+	return ch.status == PS_STATUS_OK;
+}
+
+static int
+append_test_walidx_tail(uint32_t timeline, uint64_t progress)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.timeline = timeline;
+	ch.opcode = PS_OP_WAL_APPEND;
+	ch.datalen = 128;
+	memset(ch.data, 0xa5, ch.datalen);
+	if (ps_handle_meta(&ch) != 1 || ch.status != PS_STATUS_OK)
+		return 0;
+	memset(&ch, 0, sizeof(ch));
+	ch.timeline = timeline;
+	ch.opcode = PS_OP_WAL_INDEX_ADD;
+	ch.req_lsn = 100;
+	ch.key = (PsKey) {1, 1, 1, 0, PS_KLASS_RELATION};
+	if (ps_handle_meta(&ch) != 1 || ch.status != PS_STATUS_OK)
+		return 0;
+	memset(&ch, 0, sizeof(ch));
+	ch.timeline = timeline;
+	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
+	ch.req_lsn = 0;
+	ch.req_seq = progress;
+	return ps_handle_meta(&ch) == 1 && ch.status == PS_STATUS_OK;
+}
+
+static void
+test_walidx_aggregate_force(void)
+{
+	char store[] = "/tmp/pagestore-walidx-aggregate-XXXXXX";
+	PsShmHeader metrics;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure_all(0, 0, 0, 0, 100, 0) == 0 &&
+		  mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open a store for aggregate WAL-index force scheduling");
+	ps_core_set_metrics_header(&metrics);
+	check(append_test_walidx_tail(0, 128),
+		  "seed the root timeline WAL-index tail");
+	check(create_test_branch(1, 0, 0),
+		  "create a second timeline for aggregate WAL-index debt");
+	check(append_test_walidx_tail(1, 128),
+		  "seed the second timeline WAL-index tail");
+	ps_backpressure_refresh();
+	check(metrics.walidx_backpressure.lag_bytes >= 100 &&
+		  metrics.walidx_backpressure.throttled != 0 &&
+		  ps_test_walidx_force_due(0) != 0 &&
+		  ps_test_walidx_force_due(1) != 0,
+		  "aggregate WAL-index debt forces every timeline with append tail");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable aggregate WAL-index backpressure");
+	remove_tree(store);
 }
 
 typedef struct AdmissionFairnessState
@@ -529,6 +912,8 @@ main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_walidx_append_tail_restart();
+	test_walidx_aggregate_force();
 	test_admission_writer_preference();
 	test_page_storage_fail_closed();
 	test_ambiguous_page_segment_remove();

@@ -285,11 +285,14 @@ required for the gate:
 
 The `timelines` log uses CRC-protected records, rejects truncated or corrupt
 entries, and atomically migrates complete legacy logs before opening the store.
-R5b-1 now provides disabled-by-default, hysteretic POSIX backpressure for page
-segment and shipped-WAL reclaim debt, with safe shared-memory inspection and
-deterministic admission tests.  WAL-index and forkmeta lag controllers remain
-follow-up work.  Until those remaining consumers land, correctness demos run
-and page history is bounded, but total disk use can still grow without bound.
+R5b-1 provides disabled-by-default, hysteretic POSIX backpressure for page
+segment and shipped-WAL reclaim debt.  R5b-2 adds the same foundation for
+WAL-index append tails and physically obsolete snapshot/epoch files, using
+bounded lock-free filesystem observation and shared-memory inspection.  This
+is still a partial R5b implementation: forkmeta has no controller, and the
+WAL-index controller is POSIX-only.  Until the remaining consumer lands,
+correctness demos run and page/WAL-index history is bounded, but total disk use
+can still grow without bound in the uncovered forkmeta area.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
 

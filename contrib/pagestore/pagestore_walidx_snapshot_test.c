@@ -76,6 +76,7 @@ main(void)
 	PsWalIdxSnapshot wrong;
 	ProduceCtx streamed;
 	PsWalIdxSnapshotPrepared prepared;
+	uint64_t prepared_obsolete = 0;
 
 	check(mkdtemp(root) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
@@ -97,6 +98,15 @@ main(void)
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
 	snprintf(recovery_directory, sizeof(recovery_directory), "%s/timeline_1", root);
 	snprintf(reshard_directory, sizeof(reshard_directory), "%s/timeline_2", root);
+	{
+		uint64_t obsolete = UINT64_MAX;
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 0, &obsolete) == 0 &&
+			  obsolete == 0,
+			  "an absent never-selected snapshot directory has no reclaim debt");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 1, &obsolete) != 0,
+			  "an absent selected snapshot directory fails closed");
+	}
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,
 								 first, 3) != 0 && access(directory, F_OK) != 0,
@@ -218,15 +228,55 @@ main(void)
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC");
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
 		  "generation GC durably completes an ambiguous sync retry");
+	{
+		uint64_t obsolete = 0;
+		char older_shard[1200];
+		char selected_shard[1200];
+		char selected_saved[1200];
+		int fd;
+
+		snprintf(older_shard, sizeof(older_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 1ULL, 0U);
+		fd = open(older_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && write(fd, "old", 3) == 3 && close(fd) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										   &obsolete) == 0 && obsolete == 3,
+			  "physical observation counts only older generations");
+		check(unlink(older_shard) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										   &obsolete) == 0 && obsolete == 0,
+			  "selected and newer retry generations are excluded from debt");
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 0U);
+		snprintf(selected_saved, sizeof(selected_saved), "%s.saved", selected_shard);
+		check(rename(selected_shard, selected_saved) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+			  rename(selected_saved, selected_shard) == 0,
+			  "physical observation rejects an incomplete selected generation");
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 3U);
+		{
+			int extra_fd = open(selected_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+			check(extra_fd >= 0 && write(extra_fd, "x", 1) == 1 &&
+				  close(extra_fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0,
+				  "physical observation rejects an unexpected selected-generation shard");
+			unlink(selected_shard);
+		}
+	}
 
 	check(ps_walidx_snapshot_publish(recovery_directory, 1, 1, 100, 500,
 								 first, 3) == 0 &&
-		  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+			  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
 								 500, 900, second, 3) == 0 &&
-		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
-		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
-		  snapshot.generation == 1,
-		  "restart aborts a durable prepare intent behind an old frontier");
+			  ps_walidx_snapshot_reclaim_bytes(recovery_directory, 1, 1,
+										  &prepared_obsolete) == 0 &&
+			  prepared_obsolete > 0 &&
+			  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
+			  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+			  snapshot.generation == 1,
+			  "prepared artifacts are counted until restart aborts them behind the frontier");
 	ps_walidx_snapshot_close(&snapshot);
 	check(ps_walidx_snapshot_publish(reshard_directory, 2, 1, 100, 500,
 								 first, 1) == 0 &&
@@ -272,7 +322,11 @@ main(void)
 	check(pwrite_byte(path, 17, shard1[17] ^ 0xff) == 0,
 		  "corrupt one selected shard byte");
 	check(ps_walidx_snapshot_open(&snapshot, directory, 0) != 0,
-		  "recovery rejects a corrupt shard in the selected generation");
+			  "recovery rejects a corrupt shard in the selected generation");
+	check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &prepared_obsolete) == 0 &&
+			  prepared_obsolete == 0,
+			  "metadata observation excludes newer unpublished retry shards");
 	check(ps_walidx_snapshot_gc(directory, 0) != 0,
 		  "generation GC fails closed when the selected generation is corrupt");
 	check(pwrite_byte(path, 17, shard1[17]) == 0 &&

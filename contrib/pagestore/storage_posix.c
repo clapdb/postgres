@@ -1468,6 +1468,176 @@ cleanup:
 }
 
 static int
+posix_walidx_reclaim_bytes(uint32_t tl, const uint64_t *keep_epochs,
+						   const uint64_t *covered_offsets,
+						   const uint64_t *observed_offsets,
+						   uint32_t nshards, uint64_t *tail_bytes,
+						   uint64_t *obsolete_bytes)
+{
+	char prefix[128];
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int directory_fd = -1;
+	int scan_fd = -1;
+	uint64_t tail = 0;
+	uint64_t obsolete = 0;
+	uint64_t current_lengths[PS_MAX_CHANNELS] = {0};
+	uint64_t current_watermark_lengths[PS_MAX_CHANNELS] = {0};
+	unsigned char current_files[PS_MAX_CHANNELS] = {0};
+	unsigned char current_markers[PS_MAX_CHANNELS] = {0};
+	int rc = -1;
+	int n;
+
+	if (keep_epochs == NULL || covered_offsets == NULL ||
+		observed_offsets == NULL || nshards == 0 ||
+		tail_bytes == NULL || obsolete_bytes == NULL)
+		return -1;
+	n = snprintf(prefix, sizeof(prefix), "walidx_%u_", tl);
+	if (n < 0 || (size_t) n >= sizeof(prefix))
+		return -1;
+	directory_fd = open(posix_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (directory_fd < 0 ||
+		(scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0)) < 0 ||
+		(dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		char canonical[128];
+		char marker[160];
+		char *shard_end = NULL;
+		unsigned long parsed_shard;
+		uint64_t epoch = 0;
+		const char *suffix;
+		const char *digits;
+		char *end = NULL;
+		struct stat st;
+		int is_marker = 0;
+		uint64_t amount;
+
+		if (strncmp(entry->d_name, prefix, (size_t) n) != 0)
+			continue;
+		errno = 0;
+		parsed_shard = strtoul(entry->d_name + n, &shard_end, 10);
+		if (errno != 0 || shard_end == entry->d_name + n ||
+			parsed_shard >= nshards)
+			goto cleanup;
+		suffix = shard_end;
+		if (strncmp(suffix, "_e", 2) == 0)
+		{
+			digits = suffix + 2;
+			if (strlen(digits) != 20 &&
+				!(strlen(digits) == 25 &&
+				  strcmp(digits + 20, ".size") == 0))
+				goto cleanup;
+			for (size_t i = 0; i < 20; i++)
+				if (digits[i] < '0' || digits[i] > '9')
+					goto cleanup;
+			errno = 0;
+			epoch = strtoull(digits, &end, 10);
+			if (errno != 0 || end != digits + 20 || epoch == 0)
+				goto cleanup;
+			is_marker = strcmp(end, ".size") == 0;
+		}
+		else if (*suffix != '\0')
+			goto cleanup;
+		if (posix_walidx_name(tl, (uint32_t) parsed_shard, epoch,
+							  canonical, sizeof(canonical)) != 0 ||
+			posix_walidx_watermark_name(canonical, marker, sizeof(marker)) != 0 ||
+			strcmp(entry->d_name, is_marker ? marker : canonical) != 0)
+			goto cleanup;
+		if (fstatat(directory_fd, entry->d_name, &st,
+					AT_SYMLINK_NOFOLLOW) != 0 ||
+			!S_ISREG(st.st_mode) || st.st_size < 0)
+			goto cleanup;
+		amount = (uint64_t) st.st_size;
+		if (epoch == keep_epochs[parsed_shard] && !is_marker)
+		{
+			if (current_files[parsed_shard])
+				goto cleanup;
+			current_files[parsed_shard] = 1;
+			current_lengths[parsed_shard] = amount;
+			if (amount < observed_offsets[parsed_shard] ||
+				amount < covered_offsets[parsed_shard])
+				goto cleanup;
+			amount -= covered_offsets[parsed_shard];
+			if (UINT64_MAX - tail < amount)
+				tail = UINT64_MAX;
+			else
+				tail += amount;
+		}
+		else if (epoch == keep_epochs[parsed_shard] && is_marker)
+		{
+			uint64_t watermark_length = 0;
+
+			if (current_markers[parsed_shard] ||
+				posix_walidx_watermark_read(canonical, &watermark_length) != 0)
+				goto cleanup;
+			current_markers[parsed_shard] = 1;
+			current_watermark_lengths[parsed_shard] = watermark_length;
+		}
+		else if (is_marker)
+		{
+			uint64_t recorded_length = 0;
+
+			/* Validate the logical watermark, but charge the marker's physical
+			 * directory entry size.  The two values need not be equal. */
+			if (posix_walidx_watermark_read(canonical, &recorded_length) != 0)
+				goto cleanup;
+			if (UINT64_MAX - obsolete < amount)
+				obsolete = UINT64_MAX;
+			else
+				obsolete += amount;
+		}
+		else if (UINT64_MAX - obsolete < amount)
+			obsolete = UINT64_MAX;
+		else
+			obsolete += amount;
+	}
+	if (errno != 0)
+		goto cleanup;
+	for (uint32_t shard = 0; shard < nshards; shard++)
+	{
+		/* Epoch zero predates the CRC watermark and is created lazily.  An
+		 * untouched shard may therefore have neither file.  Once it has a
+		 * logical offset, the log itself is required; a present legacy marker
+		 * is still validated, but its absence is not corruption.  New epochs
+		 * always require the log and its recorded-length watermark. */
+		if (keep_epochs[shard] != 0)
+		{
+			if (!current_files[shard] || !current_markers[shard] ||
+				current_watermark_lengths[shard] != current_lengths[shard] ||
+				current_watermark_lengths[shard] != observed_offsets[shard])
+				goto cleanup;
+		}
+		else if (covered_offsets[shard] != 0 || observed_offsets[shard] != 0)
+		{
+			if (!current_files[shard])
+				goto cleanup;
+			if (current_markers[shard] &&
+				(current_watermark_lengths[shard] != current_lengths[shard] ||
+				 current_watermark_lengths[shard] != observed_offsets[shard]))
+				goto cleanup;
+		}
+		else if (current_files[shard] && !current_markers[shard])
+			continue; /* legacy epoch-zero file with no watermark */
+	}
+	*tail_bytes = tail;
+	*obsolete_bytes = obsolete;
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		closedir(dir);
+	else if (scan_fd >= 0)
+		close(scan_fd);
+	if (directory_fd >= 0)
+		close(directory_fd);
+	return rc;
+}
+
+static int
 posix_all_digits(const char *begin, const char *end)
 {
 	if (begin == end)
@@ -2463,6 +2633,7 @@ const PsStorage PsStoragePosix = {
 	.walidx_truncate = posix_walidx_truncate,
 	.walidx_epoch_create = posix_walidx_epoch_create,
 	.walidx_epoch_gc = posix_walidx_epoch_gc,
+	.walidx_reclaim_bytes = posix_walidx_reclaim_bytes,
 	.timeline_wal_cleanup = posix_timeline_wal_cleanup,
 	.meta_append = posix_meta_append,
 	.meta_read = posix_meta_read,

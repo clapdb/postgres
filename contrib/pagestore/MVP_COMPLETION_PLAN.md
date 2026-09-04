@@ -718,16 +718,22 @@ Expected scope: one PR.  Passing it closes the retention MVP gate.
 
 ### R5b. Add reclaimer backpressure controllers
 
-Status: **partial: R5b-1 page/WAL controller foundation implemented; WAL-index
-and forkmeta controllers remain follow-up work**.
+Status: **partial: page/WAL and WAL-index controllers implemented; forkmeta
+controller remains follow-up work**.
 
 R5b-1 adds lean independent PAGE and shipped-WAL lag controllers.  They publish
 high-water/catch-up configuration, hysteretic throttle state, transitions, and
 foreground wait time; POSIX foreground mutations wait before entering runtime
 locks, while reads and maintenance continue.  PAGE debt is limited to complete
 flush-covered segments, and WAL debt uses the existing retention, raw
-dependency, and branch proofs.  WAL-index and forkmeta categories, queue-bound
-soak evidence, and controller-specific tuning remain follow-up work.
+dependency, and branch proofs.  R5b-2 adds an independent POSIX WAL-index
+controller whose debt is the saturating sum of append tails, obsolete
+epoch/watermark bytes, and obsolete snapshot generations.  Its bounded
+metadata-only refresh validates selected manifest/shard identity while
+immutable payload checksums remain a startup/publication responsibility, and
+per-timeline tail candidates can force fair snapshot publication below the
+geometric trigger.  Forkmeta, queue-bound soak evidence, and controller-specific
+tuning remain follow-up work.
 
 Expected scope: one or two PRs.  R6 consumes these controls; it does not
 introduce them.

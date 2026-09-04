@@ -370,6 +370,9 @@ INSPECTION_RESPONSES = {
         "page_foreground_wait_ns", "wal_lag_bytes", "wal_high_water_bytes",
         "wal_catchup_bytes", "wal_throttled", "wal_throttle_enters",
         "wal_throttle_exits", "wal_foreground_wait_ns",
+        "walidx_lag_bytes", "walidx_high_water_bytes", "walidx_catchup_bytes",
+        "walidx_throttled", "walidx_throttle_enters", "walidx_throttle_exits",
+        "walidx_foreground_wait_ns",
     },
     "pruning": {
         "compactions", "versions_scanned", "versions_kept", "versions_deleted",
