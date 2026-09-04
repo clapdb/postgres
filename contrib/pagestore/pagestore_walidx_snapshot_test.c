@@ -232,7 +232,7 @@ main(void)
 		uint64_t obsolete = 0;
 		char older_shard[1200];
 		char selected_shard[1200];
-		char selected_saved[1200];
+		char selected_saved[sizeof(selected_shard) + sizeof(".saved")];
 		int fd;
 
 		snprintf(older_shard, sizeof(older_shard),
