@@ -60,6 +60,8 @@ static int test_fail_seg_rewrite_before_rename;
 static int test_fail_seg_rewrite_cache_refresh;
 static int test_fail_seg_rewrite_file_fsync;
 static int test_fail_seg_rewrite_dir_fsync;
+static int test_fail_seg_remove_before_unlink;
+static int test_fail_seg_remove_dir_fsync;
 static int test_fail_seg_size;
 static int posix_seg_rewrite_poisoned;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -251,6 +253,8 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_seg_rewrite_cache_refresh;
 	const char *fail_seg_rewrite_file_fsync;
 	const char *fail_seg_rewrite_dir_fsync;
+	const char *fail_seg_remove_before_unlink;
+	const char *fail_seg_remove_dir_fsync;
 	const char *fail_seg_size;
 	int		dfd;
 
@@ -303,6 +307,12 @@ posix_open(const char *path, uint64_t segment_size)
 	fail_seg_rewrite_dir_fsync = getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_DIR_FSYNC");
 	test_fail_seg_rewrite_dir_fsync = fail_seg_rewrite_dir_fsync ?
 		atoi(fail_seg_rewrite_dir_fsync) : 0;
+	fail_seg_remove_before_unlink = getenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_BEFORE_UNLINK");
+	test_fail_seg_remove_before_unlink = fail_seg_remove_before_unlink ?
+		atoi(fail_seg_remove_before_unlink) : 0;
+	fail_seg_remove_dir_fsync = getenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_DIR_FSYNC");
+	test_fail_seg_remove_dir_fsync = fail_seg_remove_dir_fsync ?
+		atoi(fail_seg_remove_dir_fsync) : 0;
 	fail_seg_size = getenv("PAGESTORE_TEST_FAIL_SEG_SIZE");
 	test_fail_seg_size = fail_seg_size ? atoi(fail_seg_size) : 0;
 	posix_seg_rewrite_poisoned = 0;
@@ -402,15 +412,31 @@ posix_seg_remove(uint32_t shard, int seg)
 		close(seg_fds[shard][seg]);
 		seg_fds[shard][seg] = -1;
 	}
+	if (test_fail_seg_remove_before_unlink > 0 &&
+		--test_fail_seg_remove_before_unlink == 0)
+	{
+		errno = EIO;
+		pthread_mutex_unlock(&seg_fds_lock);
+		return -1;
+	}
 	if (unlink(path) != 0 && errno != ENOENT)
 		rc = -1;
 	if (rc == 0)
 	{
-		dfd = open(posix_dir, O_RDONLY);
-		if (dfd < 0 || fsync(dfd) != 0)
+		if (test_fail_seg_remove_dir_fsync > 0 &&
+			--test_fail_seg_remove_dir_fsync == 0)
+		{
+			errno = EIO;
 			rc = -1;
-		if (dfd >= 0)
-			close(dfd);
+		}
+		else
+		{
+			dfd = open(posix_dir, O_RDONLY);
+			if (dfd < 0 || fsync(dfd) != 0)
+				rc = -1;
+			if (dfd >= 0)
+				close(dfd);
+		}
 	}
 	pthread_mutex_unlock(&seg_fds_lock);
 	return rc;

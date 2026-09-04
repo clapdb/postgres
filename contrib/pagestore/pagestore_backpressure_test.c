@@ -427,6 +427,76 @@ test_page_storage_fail_closed(void)
 	remove_tree(store);
 }
 
+static void
+test_ambiguous_page_segment_remove(void)
+{
+	char store[] = "/tmp/pagestore-page-backpressure-remove-XXXXXX";
+	PsShmHeader metrics;
+	int64_t removed_size;
+
+	configure_page_core();
+	check(ps_backpressure_configure(32768, 1, 0, 0) == 0,
+		  "configure PAGE debt for ambiguous segment removal");
+	if (!make_page_debt_store(store))
+	{
+		check(0, "construct PAGE debt for ambiguous segment removal");
+		remove_tree(store);
+		return;
+	}
+	check(1, "construct PAGE debt for ambiguous segment removal");
+	ps_core_close();
+	ps_storage->close();
+
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_DIR_FSYNC", "1", 1) == 0 &&
+		  ps_core_open(store) == 0,
+		  "reopen PAGE debt store with post-unlink directory-fsync fault");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == segment_size &&
+		  metrics.page_backpressure.throttled != 0,
+		  "covered segment debt is throttled before ambiguous removal");
+	(void) ps_core_maintenance();
+	errno = 0;
+	removed_size = ps_storage->seg_size(0, 0);
+	check(removed_size < 0 && errno == ENOENT,
+		  "post-unlink directory-fsync failure physically unlinks the segment");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == segment_size &&
+		  metrics.page_backpressure.throttled != 0,
+		  "lag remains while the ambiguous counted removal is pending");
+
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_DIR_FSYNC");
+	check(ps_core_maintenance() == 1,
+		  "confirmed ENOENT settles the pending removal");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+		  metrics.page_backpressure.throttled == 0 &&
+		  metrics.page_backpressure.throttle_exits == 1,
+		  "confirmed removal reaches catch-up without double decrement");
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0,
+		  "repeated maintenance does not underflow or resurrect PAGE debt");
+
+	ps_core_close();
+	ps_storage->close();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_core_open(store) == 0,
+		  "restart after ambiguous segment removal");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+		  metrics.page_backpressure.throttled == 0,
+		  "restart rebuild agrees that the removed segment has no debt");
+	ps_core_close();
+	ps_storage->close();
+	ps_core_set_metrics_header(NULL);
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE debt after ambiguous segment removal test");
+	remove_tree(store);
+}
+
 int
 main(void)
 {
@@ -434,6 +504,7 @@ main(void)
 	test_nonblocking_admission_and_shutdown();
 	test_admission_writer_preference();
 	test_page_storage_fail_closed();
+	test_ambiguous_page_segment_remove();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

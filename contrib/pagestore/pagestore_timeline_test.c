@@ -2857,6 +2857,99 @@ test_deleting_timeline_page_cleanup_backpressure_debt(void)
 }
 
 static void
+test_deleting_timeline_page_cleanup_pending_remove(void)
+{
+	char store[] = "/tmp/pagestore-timeline-page-pending-remove-XXXXXX";
+	PsShmHeader metrics;
+	int64_t size0;
+	int64_t size1;
+	int rewrite_seen = 0;
+
+	/* Build two covered debt segments ahead of the current boundary.  Segment 0
+	 * belongs only to the timeline that will be deleted; segment 1 remains live
+	 * so a mistaken second decrement is observable while it still exists. */
+	configure_timeline_core();
+	segment_size = 16384;
+	flush_pages = 1;
+	segment_gc_enabled = 1;
+	check(ps_backpressure_configure(segment_size, 1, 0, 0) == 0,
+		  "configure PAGE debt for pending-remove rewrite test");
+	check(mkdtemp(store) != NULL,
+		  "create pending-remove timeline-deletion store");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(setenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_BEFORE_UNLINK", "1", 1) == 0 &&
+		  ps_core_open(store) == 0 && create_branch(2, 0, 100) &&
+		  create_branch(10, 0, 100) &&
+		  write_timeline_layer(2, 0, 100) == 0 &&
+		  write_timeline_layer(10, 1, 200) == 0 &&
+		  write_timeline_layer(10, 2, 300) == 0 &&
+		  ps_storage->seg_size(0, 0) > 0 &&
+		  ps_storage->seg_size(0, 1) > 0 &&
+		  ps_storage->seg_size(0, 2) > 0,
+		  "write two covered debt segments and a boundary segment");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 2 * segment_size &&
+		  metrics.page_backpressure.throttled != 0,
+		  "two covered segments enter PAGE backpressure");
+	(void) ps_core_maintenance();
+	unsetenv("PAGESTORE_TEST_FAIL_SEG_REMOVE_BEFORE_UNLINK");
+	errno = 0;
+	size0 = ps_storage->seg_size(0, 0);
+	check(size0 > 0,
+		  "remove-before-unlink fault leaves the pending victim present");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 2 * segment_size &&
+		  metrics.page_backpressure.throttled != 0,
+		  "failed remove keeps both physical debt units throttled");
+
+	check(begin_delete(2, 1, NULL),
+		  "begin deletion after a pending segment remove");
+	for (int i = 0; i < 64; i++)
+	{
+		(void) ps_core_maintenance();
+		size0 = ps_storage->seg_size(0, 0);
+		if (size0 == 0)
+		{
+			rewrite_seen = 1;
+			break;
+		}
+	}
+	check(rewrite_seen,
+		  "timeline rewrite empties the victim with a pending remove");
+	ps_backpressure_refresh();
+	size1 = ps_storage->seg_size(0, 1);
+	check(size1 > 0 && metrics.page_backpressure.lag_bytes == segment_size &&
+		  metrics.page_backpressure.throttled != 0,
+		  "rewrite settles only the victim and keeps the second debt throttled");
+	for (int i = 0; i < 64 && metrics.page_backpressure.lag_bytes != 0; i++)
+	{
+		(void) ps_core_maintenance();
+		ps_backpressure_refresh();
+	}
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+		  metrics.page_backpressure.throttled == 0 &&
+		  metrics.page_backpressure.throttle_exits == 1,
+		  "later GC clears the second debt without double decrement");
+
+	close_store();
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_core_open(store) == 0,
+		  "restart after pending-remove and timeline rewrite cleanup");
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.lag_bytes == 0 &&
+		  metrics.page_backpressure.throttled == 0,
+		  "restart rebuild agrees with the fully cleaned debt state");
+	close_store();
+	ps_core_set_metrics_header(NULL);
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE debt after pending-remove rewrite test");
+	segment_gc_enabled = 0;
+	remove_tree(store);
+}
+
+static void
 test_deleting_timeline_page_cleanup_oversized(void)
 {
 	char store[] = "/tmp/pagestore-timeline-page-oversized-XXXXXX";
@@ -3022,6 +3115,7 @@ main(void)
 	test_timeline_incarnation_frontiers();
 	test_deleting_timeline_page_cleanup();
 	test_deleting_timeline_page_cleanup_backpressure_debt();
+	test_deleting_timeline_page_cleanup_pending_remove();
 	test_deleting_timeline_page_cleanup_fail_closed();
 	test_deleting_timeline_page_cleanup_oversized();
 	test_deleting_timeline_page_cleanup_prefix_hole();

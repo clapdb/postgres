@@ -949,6 +949,8 @@ typedef struct Shard
 	PsFlushWatermark flush_watermark;
 	uint32_t	gc_next_seg;		/* oldest segment not yet reclaimed */
 	uint64_t	gc_debt_segments;	/* existing, nonempty covered segments */
+	uint32_t	gc_pending_remove_seg;	/* victim whose remove result is ambiguous */
+	int			gc_pending_remove;
 	int			gc_storage_error;	/* sticky fail-closed storage observation */
 	int			flush_watermark_valid;
 	int			coverage_broken;	/* a record was not staged; do not advance */
@@ -964,6 +966,25 @@ static uint64_t
 backpressure_saturating_add(uint64_t left, uint64_t right)
 {
 	return UINT64_MAX - left < right ? UINT64_MAX : left + right;
+}
+
+/* Settle one physical PAGE-debt unit.  A pending remove identifies the only
+ * victim whose result is ambiguous; matching it here also clears that state,
+ * so a later remove/ENOENT observation cannot settle the same (shard, seg)
+ * twice.  Callers without a pending remove must explicitly prove that the
+ * segment was counted before asking to settle it. */
+static void
+page_gc_debt_settle(Shard *s, uint32_t seg, int known_counted)
+{
+	int pending = s->gc_pending_remove &&
+		s->gc_pending_remove_seg == seg;
+
+	if (!pending && !known_counted)
+		return;
+	if (s->gc_debt_segments != 0)
+		s->gc_debt_segments--;
+	if (pending)
+		s->gc_pending_remove = 0;
 }
 
 /* Only complete segments already covered by a durable flush watermark are
@@ -1007,6 +1028,8 @@ rebuild_page_gc_state(Shard *s)
 
 	s->gc_next_seg = 0;
 	s->gc_debt_segments = 0;
+	s->gc_pending_remove_seg = 0;
+	s->gc_pending_remove = 0;
 	s->gc_storage_error = 0;
 	if (!s->flush_watermark_valid || ps_storage == NULL ||
 		ps_storage->seg_size == NULL)
@@ -3499,7 +3522,7 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	if (s->cur_seg == seg)
 		s->cur_off = cursor_retired ? segment_size : cursor_new;
 	if (out_off == 0 && counted_debt)
-		s->gc_debt_segments--;
+		page_gc_debt_settle(s, (uint32_t) seg, 1);
 	free(relocs);
 	free(replacement);
 	return 1;
@@ -13536,8 +13559,11 @@ reclaim_one_segment(Shard *s)
 		{
 			if (errno == ENOENT)
 			{
-				/* A sparse hole is not debt; advance it without asking the
-				 * layer verifier to materialize a segment that is absent. */
+				/* A sparse hole is not debt.  A prior remove may have
+				 * unlinked it before reporting an ambiguous directory fsync;
+				 * settle that already-counted victim exactly once when its
+				 * absence is confirmed. */
+				page_gc_debt_settle(s, victim, 0);
 				s->gc_next_seg++;
 				return 1;
 			}
@@ -13562,10 +13588,18 @@ reclaim_one_segment(Shard *s)
 						e->vers[i].seg = -1;
 						e->vers[i].off = 0;
 					}
+	/* Once a positive-size covered victim is known to be counted, remember it
+	 * before remove().  POSIX may unlink it and then fail the directory fsync;
+	 * the next ENOENT observation must settle the same debt unit. */
+	if (!s->gc_pending_remove && seg_bytes > 0 &&
+		s->gc_debt_segments != 0)
+	{
+		s->gc_pending_remove_seg = victim;
+		s->gc_pending_remove = 1;
+	}
 	if (ps_storage->seg_remove(s->id, (int) victim) != 0)
 		return 0;
-	if (seg_bytes > 0 && s->gc_debt_segments != 0)
-		s->gc_debt_segments--;
+	page_gc_debt_settle(s, victim, 0);
 	s->gc_next_seg++;
 	return 1;
 }
@@ -14342,6 +14376,8 @@ ps_core_open(const char *store_dir)
 		g_shards[i].cur_off = 0;
 		g_shards[i].gc_next_seg = 0;
 		g_shards[i].gc_debt_segments = 0;
+		g_shards[i].gc_pending_remove_seg = 0;
+		g_shards[i].gc_pending_remove = 0;
 		g_shards[i].gc_storage_error = 0;
 		g_shards[i].coverage_broken = 0;
 		g_shards[i].flush_watermark_valid = 0;
