@@ -856,6 +856,8 @@ typedef struct Shard
 	uint64_t	cur_off;			/* append cursor byte offset within cur_seg */
 	PsFlushWatermark flush_watermark;
 	uint32_t	gc_next_seg;		/* oldest segment not yet reclaimed */
+	uint64_t	gc_debt_segments;	/* existing, nonempty covered segments */
+	int			gc_storage_error;	/* sticky fail-closed storage observation */
 	int			flush_watermark_valid;
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
@@ -881,19 +883,103 @@ page_reclaim_lag_bytes(void)
 
 	for (uint32_t shard = 0; shard < core_shards(); shard++)
 	{
-		uint64_t segments = 0;
+		uint64_t segments;
 
 		ps_lock_shard_rd(shard);
-		if (g_shards[shard].flush_watermark_valid &&
-			g_shards[shard].flush_watermark.seg_id > g_shards[shard].gc_next_seg)
-			segments = (uint64_t) g_shards[shard].flush_watermark.seg_id -
-				g_shards[shard].gc_next_seg;
+		/* The count is rebuilt once at startup and maintained by successful GC;
+		 * controller refresh therefore remains O(number of shards), independent
+		 * of the historical segment-id span.  Any runtime storage error is sticky
+		 * and reports fail-closed lag rather than clearing an active throttle. */
+		if (g_shards[shard].gc_storage_error)
+		{
+			ps_unlock_shard(shard);
+			return UINT64_MAX;
+		}
+		segments = g_shards[shard].gc_debt_segments;
 		ps_unlock_shard(shard);
 		if (segment_size != 0 && segments > UINT64_MAX / segment_size)
 			return UINT64_MAX;
 		lag = backpressure_saturating_add(lag, segments * segment_size);
 	}
 	return lag;
+}
+
+/* Rebuild the process-local GC cursor and the incremental debt count from the
+ * durable watermark.  This is a startup-only scan; refreshes use the count.
+ * Zero-length files are present cursor entries but do not represent debt. */
+static int
+rebuild_page_gc_state(Shard *s)
+{
+	uint32_t boundary;
+	int found = 0;
+
+	s->gc_next_seg = 0;
+	s->gc_debt_segments = 0;
+	s->gc_storage_error = 0;
+	if (!s->flush_watermark_valid || ps_storage == NULL ||
+		ps_storage->seg_size == NULL)
+		return 0;
+	boundary = s->flush_watermark.seg_id;
+	s->gc_next_seg = boundary;
+	for (uint32_t seg = 0; seg < boundary; seg++)
+	{
+		int64_t bytes;
+
+		errno = 0;
+		bytes = ps_storage->seg_size(s->id, (int) seg);
+		if (bytes < 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			if (errno == 0)
+				errno = EIO;
+			return -1;
+		}
+		if (!found)
+		{
+			s->gc_next_seg = seg;
+			found = 1;
+		}
+		if (bytes > 0)
+			s->gc_debt_segments = backpressure_saturating_add(
+				s->gc_debt_segments, 1);
+	}
+	return 0;
+}
+
+/* Add only physical segments newly covered by a durable watermark.  The
+ * watermark is an id boundary, not proof that every id below it has a file:
+ * POSIX stores may be sparse and an empty file is not reclaimable debt.  This
+ * is incremental (newly covered ids only); startup is the only historical
+ * scan, and refresh remains O(number of shards). */
+static void
+account_page_gc_coverage(Shard *s, uint32_t old_boundary,
+						 uint32_t new_boundary)
+{
+	if (ps_storage == NULL || ps_storage->seg_size == NULL)
+		return;
+	for (uint32_t seg = old_boundary; seg < new_boundary; seg++)
+	{
+		int64_t bytes;
+
+		errno = 0;
+		bytes = ps_storage->seg_size(s->id, (int) seg);
+		if (bytes < 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			if (errno == 0)
+				errno = EIO;
+			/* The manifest watermark is already durable.  Do not invent a
+			 * count after an uncertain size observation; the sticky error
+			 * makes the controller fail closed until the next open. */
+			s->gc_storage_error = 1;
+			return;
+		}
+		if (bytes > 0)
+			s->gc_debt_segments = backpressure_saturating_add(
+				s->gc_debt_segments, 1);
+	}
 }
 
 /*
@@ -1276,6 +1362,8 @@ static int
 flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 {
 	int			rc;
+	uint32_t	old_boundary = s->flush_watermark_valid ?
+		s->flush_watermark.seg_id : 0;
 
 	if (!s->memtable || ps_memtable_count(s->memtable) == 0)
 		return 0;
@@ -1292,6 +1380,10 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 		s->coverage_broken = 1;
 		return -1;
 	}
+	/* Keep the disabled controller off the extra per-segment metadata path as
+	 * well.  A later enabled open rebuilds the durable prefix exactly once. */
+	if (page_reclaim_high_water_bytes != 0 && seg_id > old_boundary)
+		account_page_gc_coverage(s, old_boundary, seg_id);
 	s->flush_watermark.shard = s->id;
 	s->flush_watermark.seg_id = seg_id;
 	s->flush_watermark.seg_off = seg_off;
@@ -3112,7 +3204,7 @@ page_find(uint32_t timeline, const PsKey *key, uint32_t block)
 static int
 page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 {
-	int64_t bytes = ps_storage->seg_size(s->id, seg);
+	int64_t bytes;
 	unsigned char *replacement = NULL;
 	SegmentReloc *relocs = NULL;
 	uint32_t nrelocs = 0, reloc_cap = 0;
@@ -3123,6 +3215,8 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	int have_watermark = s->flush_watermark_valid &&
 		s->flush_watermark.seg_id == (uint32_t) seg;
 
+	errno = 0;
+	bytes = ps_storage->seg_size(s->id, seg);
 	if (bytes < 0 || (uint64_t) bytes > segment_size ||
 		(uint64_t) bytes > SIZE_MAX ||
 		(uint64_t) bytes > (uint64_t) LLONG_MAX)
@@ -8087,9 +8181,11 @@ wal_reclaim_backoff(uint32_t timeline, const struct timespec *now)
 /* Read only stable per-timeline state while the WAL lock excludes append,
  * segment sync and reclaim.  This is deliberately weaker than a safety
  * decision: the caller must repeat the complete validation after admission and
- * the WAL-index gates have drained. */
+ * the WAL-index gates have drained.  Observation ignores retry_at so a failed
+ * reclaim cannot make real physical debt disappear; maintenance passes
+ * honor_retry_at to avoid repeatedly draining admission for the same failure. */
 static int
-wal_reclaim_preselected(struct timespec *now_out)
+wal_reclaim_preselected(struct timespec *now_out, int honor_retry_at)
 {
 	if (clock_gettime(CLOCK_MONOTONIC, now_out) != 0)
 		return 0;
@@ -8101,9 +8197,10 @@ wal_reclaim_preselected(struct timespec *now_out)
 		int residual_status;
 		int eligible;
 
-		if (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
-			(now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
-			 now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec) ||
+		if ((honor_retry_at &&
+			 (now_out->tv_sec < wal_reclaim_retry_at[tl].tv_sec ||
+			  (now_out->tv_sec == wal_reclaim_retry_at[tl].tv_sec &&
+			   now_out->tv_nsec < wal_reclaim_retry_at[tl].tv_nsec))) ||
 			!ps_timeline_live(tl))
 			continue;
 		wal_lock = wal_log_lock_for(tl);
@@ -8148,7 +8245,7 @@ wal_segment_reclaim_one(void)
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0)
 		return 0; /* SPDK and unknown providers have no safe R3b policy. */
-	if (!wal_reclaim_preselected(&now))
+	if (!wal_reclaim_preselected(&now, 1))
 		return 0;
 	if (admission_write_lock() != 0)
 		return 0;
@@ -11644,10 +11741,12 @@ retention_effective_floor(uint32_t timeline, uint32_t resource,
 static uint64_t
 wal_reclaim_lag_bytes(void)
 {
+	struct timespec now;
 	uint64_t lag = 0;
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
-		strcmp(ps_storage->name, "posix") != 0 || admission_write_lock() != 0)
+		strcmp(ps_storage->name, "posix") != 0 ||
+		!wal_reclaim_preselected(&now, 0) || admission_write_lock() != 0)
 		return 0;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
@@ -12023,11 +12122,17 @@ recover(uint32_t shard)
 	{
 		uint64_t	off = (id == first && s->flush_watermark_valid) ?
 			s->flush_watermark.seg_off : 0;
-		int64_t		seg_bytes = ps_storage->seg_size(shard, id);
+		int64_t		seg_bytes;
 		int			retire_segment = 0;
 
+		errno = 0;
+		seg_bytes = ps_storage->seg_size(shard, id);
 		if (seg_bytes < 0)
+		{
+			if (errno != ENOENT)
+				return -1;
 			break;
+		}
 		if ((uint64_t) seg_bytes < off)
 			goto fail;
 		for (;;)
@@ -13288,12 +13393,34 @@ reclaim_one_segment(Shard *s)
 {
 	uint32_t	victim;
 	uint32_t	ns = core_shards();
+	int64_t		seg_bytes;
 	int			refs;
 
 	if (!s->flush_watermark_valid || !ps_storage->seg_remove ||
 		s->gc_next_seg >= s->flush_watermark.seg_id)
 		return 0;
 	victim = s->gc_next_seg;
+	if (ps_storage->seg_size != NULL)
+	{
+		errno = 0;
+		seg_bytes = ps_storage->seg_size(s->id, (int) victim);
+		if (seg_bytes < 0)
+		{
+			if (errno == ENOENT)
+			{
+				/* A sparse hole is not debt; advance it without asking the
+				 * layer verifier to materialize a segment that is absent. */
+				s->gc_next_seg++;
+				return 1;
+			}
+			if (errno == 0)
+				errno = EIO;
+			s->gc_storage_error = 1;
+			return 0;
+		}
+	}
+	else
+		seg_bytes = (int64_t) segment_size;
 	refs = segment_has_references(s->id, victim);
 	if (verify_segment_layers_locked(s->id, victim, refs) != 0)
 		return 0;
@@ -13309,6 +13436,8 @@ reclaim_one_segment(Shard *s)
 					}
 	if (ps_storage->seg_remove(s->id, (int) victim) != 0)
 		return 0;
+	if (seg_bytes > 0 && s->gc_debt_segments != 0)
+		s->gc_debt_segments--;
 	s->gc_next_seg++;
 	return 1;
 }
@@ -14084,12 +14213,22 @@ ps_core_open(const char *store_dir)
 		g_shards[i].cur_seg = -1;
 		g_shards[i].cur_off = 0;
 		g_shards[i].gc_next_seg = 0;
+		g_shards[i].gc_debt_segments = 0;
+		g_shards[i].gc_storage_error = 0;
 		g_shards[i].coverage_broken = 0;
 		g_shards[i].flush_watermark_valid = 0;
 		if (use_layers && ps_manifest_get_flush_watermark(i, &watermark))
 		{
 			g_shards[i].flush_watermark = watermark;
 			g_shards[i].flush_watermark_valid = 1;
+			/* Rebuild the oldest present covered segment and the incremental
+			 * positive-size debt count.  Non-ENOENT storage errors fail startup
+			 * closed, preserving errno and never advancing the cursor.  Keep
+			 * the disabled controller off this path: it must not add a startup
+			 * storage scan to the default or SPDK behavior. */
+			if (page_reclaim_high_water_bytes != 0 &&
+				rebuild_page_gc_state(&g_shards[i]) != 0)
+				return -1;
 		}
 		g_shards[i].next_layer_id = 1;
 		pthread_rwlock_init(&shard_locks[i], NULL);

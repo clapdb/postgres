@@ -181,6 +181,7 @@ run_test(const char *daemon_path)
 	char shm_name[64];
 	char store_dir[128];
 	char pause_file[128];
+	char empty_segment[256];
 	const uint32_t page_size = 8192;
 	const uint32_t rel = 4242;
 	pid_t pid = -1;
@@ -197,6 +198,7 @@ run_test(const char *daemon_path)
 	snprintf(shm_name, sizeof(shm_name), "/psbp_%d", (int) getpid());
 	snprintf(store_dir, sizeof(store_dir), "/tmp/psbp_store_%d", (int) getpid());
 	snprintf(pause_file, sizeof(pause_file), "/tmp/psbp_pause_%d", (int) getpid());
+	snprintf(empty_segment, sizeof(empty_segment), "%s/seg_%08d", store_dir, 0);
 	shm_unlink(shm_name);
 	unlink(pause_file);
 	/* Keep maintenance paused for both phases.  The first phase seeds the
@@ -331,6 +333,28 @@ run_test(const char *daemon_path)
 	check(page_has_tag(readback, page_size, 10),
 		  "same-shard read returns the existing page during throttle");
 
+	/* These metadata probes are reads even though request_is_write() retains
+	 * its historical default-true behavior for unknown opcodes. */
+	reader->opcode = PS_OP_TIMELINE_INFO;
+	reader->timeline = 0;
+	reader->incarnation = 1;
+	reader->req_lsn = 0;
+	reader->req_seq = 0;
+	ps_store_release(&reader->state, PS_STATE_REQUEST);
+	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
+		  reader->status == PS_STATUS_OK,
+		  "TIMELINE_INFO continues during page throttle");
+	reader->opcode = PS_OP_CHECK_BRANCH;
+	reader->timeline = 77;
+	reader->parent_timeline = 0;
+	reader->incarnation = 0;
+	reader->req_lsn = 0;
+	reader->req_seq = 1;
+	ps_store_release(&reader->state, PS_STATE_REQUEST);
+	check(wait_for_state(reader, PS_STATE_DONE, 1000) &&
+		  reader->status == PS_STATUS_OK,
+		  "CHECK_BRANCH continues during page throttle");
+
 	unlink(pause_file);
 	check(wait_for_state(pending, PS_STATE_DONE, 5000) &&
 		  pending->status == PS_STATUS_OK,
@@ -339,24 +363,9 @@ run_test(const char *daemon_path)
 		  ps_load_acquire_u64(&hdr->page_backpressure.throttle_exits) != 0,
 		  "controller exits throttle after maintenance catch-up");
 
-	/* Make a second complete-segment debt in one already-admitted vectored
-	 * mutation.  This prepares a fresh throttle state for the shutdown phase
-	 * without allowing a multi-request prefill to race its own controller. */
-	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
-	check(pause_fd >= 0, "integration re-pauses maintenance for shutdown phase");
-	if (pause_fd >= 0)
-		close(pause_fd);
-	set_relation_key(reader, rel);
-	reader->opcode = PS_OP_WRITEV;
-	reader->blocknum = 30;
-	reader->nblocks = 5;
-	for (uint32_t block = 0; block < 5; block++)
-		fill_page(reader->data + (size_t) block * page_size, page_size,
-				  (unsigned char) (40 + block));
-	submit_and_wait(reader);
-	check(reader->status == PS_STATUS_OK,
-		  "integration seeds shutdown throttle in one admitted mutation");
-
+	/* Restart with the old debt fully caught up.  This specifically exercises
+	 * rebuilding gc_next_seg: deleted historical segment ids must not become
+	 * phantom debt when the process starts with a fresh in-memory cursor. */
 	ps_store_release(&pending->claimed, 0);
 	ps_store_release(&reader->claimed, 0);
 	munmap(shm, PS_SHM_SIZE);
@@ -368,7 +377,80 @@ run_test(const char *daemon_path)
 	kill(pid, SIGTERM);
 	if (!wait_for_exit(pid, 5000))
 	{
-		check(0, "second daemon stops cleanly before shutdown restart");
+		check(0, "daemon stops cleanly before page cursor restart");
+		goto cleanup;
+	}
+	cleanup_kill = 0;
+	pid = -1;
+	{
+		int empty_fd = open(empty_segment, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+
+		check(empty_fd >= 0,
+			  "integration creates an empty covered historical segment");
+		if (empty_fd >= 0)
+			close(empty_fd);
+	}
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(pause_fd >= 0, "integration pauses maintenance for cursor restart");
+	if (pause_fd >= 0)
+		close(pause_fd);
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file, 1);
+	check(pid > 0, "cursor-restart daemon starts");
+	if (pid <= 0)
+		goto cleanup;
+	cleanup_kill = 1;
+	ready = wait_for_ready(shm_name);
+	check(ready, "cursor-restart daemon publishes ready state");
+	if (!ready)
+		goto cleanup;
+	fd = shm_open(shm_name, O_RDWR, 0600);
+	check(fd >= 0, "cursor-restart client opens shared memory");
+	if (fd < 0)
+		goto cleanup;
+	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	check(shm != MAP_FAILED, "cursor-restart client maps shared memory");
+	if (shm == MAP_FAILED)
+		goto cleanup;
+	hdr = (PsShmHeader *) shm;
+	reader = ps_channel(shm, 0);
+	check(ps_cas(&reader->claimed, 0, 1),
+		  "cursor-restart claims a channel");
+	check(ps_load_acquire_u64(&hdr->page_backpressure.lag_bytes) == 0 &&
+		  ps_load_acquire(&hdr->page_backpressure.throttled) == 0,
+		  "restart ignores deleted and empty historical page segments");
+	unlink(pause_file);
+	for (int i = 0; i < 500 && access(empty_segment, F_OK) == 0; i++)
+		sleep_ms(1);
+	check(access(empty_segment, F_OK) != 0,
+		  "maintenance can unlink an empty covered page segment");
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(pause_fd >= 0, "integration re-pauses after empty-segment cleanup");
+	if (pause_fd >= 0)
+		close(pause_fd);
+
+	/* Seed one new covered segment only after the no-false-throttle assertion;
+	 * this leaves a fresh, deterministic debt for the shutdown restart. */
+	set_relation_key(reader, rel);
+	reader->opcode = PS_OP_WRITEV;
+	reader->blocknum = 30;
+	reader->nblocks = 5;
+	for (uint32_t block = 0; block < 5; block++)
+		fill_page(reader->data + (size_t) block * page_size, page_size,
+				  (unsigned char) (40 + block));
+	submit_and_wait(reader);
+	check(reader->status == PS_STATUS_OK,
+		  "cursor-restart seeds shutdown throttle in one admitted mutation");
+
+	ps_store_release(&reader->claimed, 0);
+	munmap(shm, PS_SHM_SIZE);
+	shm = MAP_FAILED;
+	close(fd);
+	fd = -1;
+	reader = NULL;
+	kill(pid, SIGTERM);
+	if (!wait_for_exit(pid, 5000))
+	{
+		check(0, "cursor-restart daemon stops cleanly");
 		goto cleanup;
 	}
 	cleanup_kill = 0;

@@ -3,16 +3,28 @@
 #define _GNU_SOURCE
 #endif
 
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_core.h"
 
 static int checks;
 static int failed;
+
+static void
+remove_tree(const char *path)
+{
+	char command[512];
+
+	if (snprintf(command, sizeof(command), "rm -rf -- '%s'", path) > 0)
+		(void) system(command);
+}
 
 static void
 check(int ok, const char *name)
@@ -120,11 +132,164 @@ test_nonblocking_admission_and_shutdown(void)
 	ps_core_set_metrics_header(NULL);
 }
 
+static void
+fill_page(unsigned char *page, unsigned char tag)
+{
+	uint64_t lsn = 1000 + tag;
+	uint32_t hi = (uint32_t) (lsn >> 32);
+	uint32_t lo = (uint32_t) lsn;
+
+	memset(page, tag, page_size);
+	memcpy(page, &hi, sizeof(hi));
+	memcpy(page + sizeof(hi), &lo, sizeof(lo));
+}
+
+static void
+configure_page_core(void)
+{
+	page_size = 8192;
+	segment_size = 32768;
+	flush_pages = 1;
+	compact_layers = 1000000;
+	segment_gc_enabled = 1;
+	cache_pages = 0;
+	use_layers = 1;
+	ps_nshards = 1;
+	ps_storage = &PsStoragePosix;
+}
+
+static int
+make_page_debt_store(char *store)
+{
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+		return 0;
+	for (uint32_t block = 0; block < 5; block++)
+	{
+		fill_page(page, (unsigned char) (10 + block));
+		ps_lock_shard_wr(0);
+		if (append_page(0, &key, block, page, 0, NULL) != 0)
+		{
+			ps_unlock_shard(0);
+			return 0;
+		}
+		ps_unlock_shard(0);
+	}
+	return ps_storage->sync() == 0;
+}
+
+static int64_t
+fail_segment_size(uint32_t shard, int seg)
+{
+	(void) shard;
+	(void) seg;
+	errno = EIO;
+	return -1;
+}
+
+static int segment_size_calls;
+
+static int64_t
+counting_segment_size(uint32_t shard, int seg)
+{
+	segment_size_calls++;
+	return PsStoragePosix.seg_size(shard, seg);
+}
+
+static void
+test_page_storage_fail_closed(void)
+{
+	char store[] = "/tmp/pagestore-page-backpressure-eio-XXXXXX";
+	PsShmHeader metrics;
+	PsStorage failing_storage;
+
+	configure_page_core();
+	check(ps_backpressure_configure(32768, 1, 0, 0) == 0,
+		  "page controller is configured before standalone core open");
+	if (!make_page_debt_store(store))
+	{
+		check(0, "construct covered page segment for storage-error tests");
+		remove_tree(store);
+		return;
+	}
+	check(1,
+		  "construct covered page segment for storage-error tests");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(32768, 1, 0, 0) == 0 &&
+		  (ps_backpressure_refresh(),
+		   metrics.page_backpressure.throttled != 0 &&
+		   metrics.page_backpressure.lag_bytes >= 32768),
+		  "positive covered page segment enters backpressure");
+	failing_storage = PsStoragePosix;
+	failing_storage.seg_size = fail_segment_size;
+	ps_storage = &failing_storage;
+	(void) ps_core_maintenance();
+	ps_backpressure_refresh();
+	check(metrics.page_backpressure.throttled != 0 &&
+		  metrics.page_backpressure.lag_bytes == UINT64_MAX,
+		  "runtime non-ENOENT segment-size failure keeps page throttle fail closed");
+	ps_storage = &PsStoragePosix;
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+
+	{
+		PsStorage counting_storage = PsStoragePosix;
+		int disabled_calls;
+		int enabled_calls;
+
+		counting_storage.seg_size = counting_segment_size;
+		ps_storage = &counting_storage;
+		ps_backpressure_configure(0, 0, 0, 0);
+		segment_size_calls = 0;
+		check(ps_core_open(store) == 0,
+			  "disabled page controller reopens the standalone store");
+		disabled_calls = segment_size_calls;
+		ps_core_close();
+		ps_storage->close();
+
+		ps_backpressure_configure(32768, 1, 0, 0);
+		segment_size_calls = 0;
+		check(ps_core_open(store) == 0,
+			  "enabled page controller reopens the standalone store");
+		enabled_calls = segment_size_calls;
+		check(enabled_calls > disabled_calls,
+			  "disabled page controller avoids the startup PAGE debt scan");
+		ps_core_close();
+		ps_storage->close();
+	}
+	{
+		pid_t pid = fork();
+		int status = 0;
+
+		if (pid == 0)
+		{
+			int rc;
+
+			setenv("PAGESTORE_TEST_FAIL_SEG_SIZE", "1", 1);
+			configure_page_core();
+			(void) ps_backpressure_configure(32768, 1, 0, 0);
+			errno = 0;
+			rc = ps_core_open(store);
+			_exit(rc != 0 && errno == EIO ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "enabled page controller fails startup on non-ENOENT segment-size error");
+	}
+	remove_tree(store);
+}
+
 int
 main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_page_storage_fail_closed();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

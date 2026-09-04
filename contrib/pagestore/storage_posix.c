@@ -60,6 +60,7 @@ static int test_fail_seg_rewrite_before_rename;
 static int test_fail_seg_rewrite_cache_refresh;
 static int test_fail_seg_rewrite_file_fsync;
 static int test_fail_seg_rewrite_dir_fsync;
+static int test_fail_seg_size;
 static int posix_seg_rewrite_poisoned;
 static pthread_mutex_t seg_fds_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -250,6 +251,7 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_seg_rewrite_cache_refresh;
 	const char *fail_seg_rewrite_file_fsync;
 	const char *fail_seg_rewrite_dir_fsync;
+	const char *fail_seg_size;
 	int		dfd;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
@@ -301,6 +303,8 @@ posix_open(const char *path, uint64_t segment_size)
 	fail_seg_rewrite_dir_fsync = getenv("PAGESTORE_TEST_FAIL_SEG_REWRITE_DIR_FSYNC");
 	test_fail_seg_rewrite_dir_fsync = fail_seg_rewrite_dir_fsync ?
 		atoi(fail_seg_rewrite_dir_fsync) : 0;
+	fail_seg_size = getenv("PAGESTORE_TEST_FAIL_SEG_SIZE");
+	test_fail_seg_size = fail_seg_size ? atoi(fail_seg_size) : 0;
 	posix_seg_rewrite_poisoned = 0;
 	{
 		const char *value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
@@ -464,6 +468,12 @@ posix_seg_size(uint32_t shard, int seg)
 
 	if (posix_seg_rewrite_poisoned)
 	{
+		errno = EIO;
+		return -1;
+	}
+	if (test_fail_seg_size > 0)
+	{
+		test_fail_seg_size--;
 		errno = EIO;
 		return -1;
 	}

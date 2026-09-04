@@ -969,8 +969,13 @@ test_failure_backoff(void)
 {
 	char store[] = "/tmp/pagestore-wal-policy-failure-XXXXXX";
 	ReclaimAttemptCounter counter = {0};
+	PsShmHeader metrics;
 
 	configure_core();
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0,
+		  "enable WAL controller for failure-backoff observation");
 	/* Keep the control pages in the memtable; otherwise page-prune work can
 	 * legitimately make the aggregate maintenance call return 1 after the WAL
 	 * reclaim attempt fails, obscuring the policy result under test. */
@@ -994,6 +999,10 @@ test_failure_backoff(void)
 		check(counter.attempts == 1 && did == 0 &&
 			  segment_count(store, 0) == WAL_SEGMENTS,
 			  "metadata publication failure does not report reclaim work");
+		ps_backpressure_refresh();
+		check(metrics.wal_backpressure.throttled != 0 &&
+			  metrics.wal_backpressure.lag_bytes >= WAL_SEGMENT,
+			  "failed reclaim remains WAL backpressure debt during retry backoff");
 	}
 	{
 		int did = ps_core_maintenance();
@@ -1007,6 +1016,8 @@ test_failure_backoff(void)
 	(void) sleep(2);
 	check(maintenance_until_count(store, 0, 0),
 		  "failed reclaim retries after backoff and then deletes safely");
+	ps_backpressure_configure(0, 0, 0, 0);
+	ps_core_set_metrics_header(NULL);
 	close_store();
 	remove_tree(store);
 }

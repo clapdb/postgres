@@ -346,17 +346,39 @@ request_is_write(PsOpcode opcode)
 	}
 }
 
-/* Controller gating covers every foreground mutation, including retention
- * pin state changes which intentionally remain outside request_is_write()'s
+/* Controller gating covers only operations which are known to mutate state.
+ * Keep this separate from request_is_write(): that function intentionally
+ * defaults unknown opcodes to the existing write/admission behavior, while a
+ * controller must never accidentally throttle a new or metadata-read opcode.
+ * Retention pin state changes intentionally remain outside request_is_write()'s
  * admission-rd behavior. */
 static int
-request_is_mutation(PsOpcode opcode)
+request_is_mutation(const PsChannel *ch)
 {
-	if (request_is_write(opcode))
-		return 1;
-	return opcode == PS_OP_RETENTION_PIN_RESERVE ||
-		opcode == PS_OP_RETENTION_PIN_SET ||
-		opcode == PS_OP_RETENTION_PIN_DROP;
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_BEGIN_DELETE:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+		case PS_OP_WAL_APPEND:
+		case PS_OP_WAL_INDEX_ADD:
+		case PS_OP_WAL_INDEX_ADD_BATCH:
+		case PS_OP_IMMEDSYNC:
+		case PS_OP_RETENTION_PIN_RESERVE:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_DROP:
+			return 1;
+		case PS_OP_WAL_INDEX_PROGRESS:
+			/* 0/0 is the read-current-progress form. */
+			return ch->req_lsn != 0 || ch->req_seq != 0;
+		default:
+			return 0;
+	}
 }
 
 static void
@@ -565,7 +587,7 @@ run_request(uint32_t channel, PsChannel *ch)
 	/* Backpressure is checked before any lifecycle/admission/shard/map lock.
 	 * A throttled mutation remains in REQUEST so this worker can scan the next
 	 * channel; reads and maintenance never enter controller gating. */
-	if (request_is_mutation(op))
+	if (request_is_mutation(ch))
 	{
 		uint32_t causes = 0;
 		int admit = ps_backpressure_try_admit(&stop_requested, &causes);
