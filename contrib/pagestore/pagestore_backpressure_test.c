@@ -832,7 +832,7 @@ test_forkmeta_backpressure_observer(void)
 	PsChannel channel;
 	volatile sig_atomic_t stop = 0;
 	uint32_t causes = 0;
-	uint64_t expected;
+	BackpressureSlowPathCounter cutover_attempts = {0};
 
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
@@ -901,15 +901,14 @@ test_forkmeta_backpressure_observer(void)
 				 snapshots) >= 0 && write_test_file(old_checkpoint, 11) &&
 			write_test_file(old_tail, 13) && write_test_file(temporary, 7),
 			"create obsolete forkmeta generations and temporary debris");
-	expected = 11 + 13 + 7;
 	ps_backpressure_refresh();
-	check(metrics.forkmeta_backpressure.lag_bytes == expected &&
-			metrics.forkmeta_backpressure.throttled != 0,
-			"forkmeta debt charges source growth plus obsolete metadata only");
+	check(metrics.forkmeta_backpressure.lag_bytes == 7 &&
+			metrics.forkmeta_backpressure.throttled == 0 &&
+			ps_test_forkmeta_serviceable_work_due() != 0,
+			"only immediately GC-serviceable debris counts without a cutoff");
 	check(ps_backpressure_try_admit_mask(&stop, PS_BACKPRESSURE_FORKMETA,
-										 &causes) == 0 &&
-			causes == PS_BACKPRESSURE_FORKMETA,
-				"forkmeta growth admission is deferred with its own cause");
+										 &causes) == 1 && causes == 0,
+							"cutoff-dependent debris does not defer admission");
 
 	check(snprintf(malformed, sizeof(malformed), "%s/unexpected", snapshots) >= 0 &&
 			write_test_file(malformed, 3),
@@ -918,8 +917,41 @@ test_forkmeta_backpressure_observer(void)
 	check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
 			metrics.forkmeta_backpressure.throttled != 0,
 			"unsafe snapshot observation fails closed");
-	check(ps_test_forkmeta_force_due() != 0,
-			"forkmeta throttle forces maintenance below the geometric trigger");
+	check(ps_test_forkmeta_force_due() != 0 &&
+			ps_test_forkmeta_serviceable_work_due() == 0,
+			"observation error throttles but does not force snapshot work");
+	check(setenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES", "1024", 1) == 0,
+			"lower snapshot trigger for persistent observation error test");
+	{
+		int churn_ok = 1;
+
+		for (unsigned int i = 0; i < 32; i++)
+		{
+			memset(&channel, 0, sizeof(channel));
+			channel.opcode = PS_OP_CREATE;
+			channel.timeline = 0;
+			channel.key = (PsKey) {100 + i, 100 + i, 100 + i, 0,
+				PS_KLASS_RELATION};
+			channel.req_lsn = 400 + i;
+			if (ps_handle_meta(&channel) != 1 ||
+				channel.status != PS_STATUS_OK)
+				churn_ok = 0;
+		}
+		check(churn_ok, "grow source while the snapshot observation is invalid");
+	}
+	ps_backpressure_refresh();
+	ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										  &cutover_attempts);
+	for (int i = 0; i < 3; i++)
+	{
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		(void) ps_core_maintenance();
+	}
+	ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+	check(cutover_attempts.calls == 0,
+			"persistent observation error does not retry snapshot cutover");
+	check(unsetenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES") == 0,
+			"restore snapshot trigger after persistent observation test");
 	(void) unlink(malformed);
 	check(snprintf(malformed_temp, sizeof(malformed_temp),
 					 "%s/forkmeta_checkpoint_v1_bad.tmp.1.1", snapshots) >= 0 &&

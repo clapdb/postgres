@@ -1572,10 +1572,16 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	}
 	{
 		int scan_errno = errno;
+		int close_rc = closedir(dir);
 
-		if (closedir(dir) != 0 || scan_errno != 0)
-			goto cleanup;
+		/* closedir consumes the stream even when it reports an error. */
 		dir = NULL;
+		/* Test-only fault injection preserves the real closedir call, then
+		 * exercises the error cleanup path without leaving a live stream. */
+		if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") != NULL)
+			close_rc = -1;
+		if (close_rc != 0 || scan_errno != 0)
+			goto cleanup;
 	}
 	for (size_t i = 0; i < count; i++)
 	{
@@ -1796,12 +1802,15 @@ forkmeta_add_bytes(uint64_t *total, uint64_t bytes)
 
 static int
 forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
-							uint64_t prepared_generation, uint64_t *debt_out)
+												uint64_t prepared_generation,
+												uint64_t *gc_debt_out,
+												uint64_t *cutoff_debt_out)
 {
 	struct dirent *entry;
 	DIR *dir = NULL;
 	int scan_fd = -1;
-	uint64_t total = 0;
+	uint64_t gc_total = 0;
+	uint64_t cutoff_total = 0;
 	unsigned int nentries = 0;
 	unsigned char selected_seen[2] = {0, 0};
 	unsigned char prepared_seen[2] = {0, 0};
@@ -1820,7 +1829,6 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 		int tail_status;
 		int is_canonical = 0;
 		int is_temp;
-		int is_prepared_temp;
 		struct stat st;
 
 		if (++nentries > FORKMETA_OBSERVATION_MAX_ENTRIES)
@@ -1840,9 +1848,6 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 			 * still checked by the caller around this scan. */
 			continue;
 		}
-		is_prepared_temp = strncmp(entry->d_name,
-								  FORKMETA_SNAPSHOT_PREPARED ".tmp.",
-								  strlen(FORKMETA_SNAPSHOT_PREPARED ".tmp.")) == 0;
 		checkpoint_status = strncmp(entry->d_name,
 									FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
 									strlen(FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX)) == 0 ?
@@ -1894,18 +1899,33 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 			prepared_seen[part] = 1;
 			continue;
 		}
-		if (is_prepared_temp)
-			continue;
-		forkmeta_add_bytes(&total, bytes);
+		/* Every recognized temp is owned by GC, including an orphaned prepared
+		 * intent temp.  Canonical generations older than the selected authority
+		 * are also immediately removable; all other canonical residue needs a
+		 * newer safe snapshot/cutoff first. */
+		if (is_temp || (is_canonical && selected_generation != 0 &&
+								 generation < selected_generation))
+			forkmeta_add_bytes(&gc_total, bytes);
+		else
+			forkmeta_add_bytes(&cutoff_total, bytes);
 	}
-	if (errno != 0 || closedir(dir) != 0)
-		goto cleanup;
-	dir = NULL;
+	{
+		int scan_errno = errno;
+		int close_rc = closedir(dir);
+
+		/* closedir consumes the stream even when it reports an error. */
+		dir = NULL;
+		if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") != NULL)
+			close_rc = -1;
+		if (scan_errno != 0 || close_rc != 0)
+			goto cleanup;
+	}
 	if (selected_generation != 0 && (!selected_seen[0] || !selected_seen[1]))
 		goto cleanup;
 	if (prepared_generation != 0 && (!prepared_seen[0] || !prepared_seen[1]))
 		goto cleanup;
-	*debt_out = total;
+	*gc_debt_out = gc_total;
+	*cutoff_debt_out = cutoff_total;
 	rc = 0;
 
 cleanup:
@@ -1917,12 +1937,12 @@ cleanup:
 }
 
 int
-ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
+ps_forkmeta_snapshot_reclaim_observation(const char *directory,
 										 const char *source_directory,
 										 uint64_t source_baseline,
 										 int source_debt_enabled,
 										 const PsForkmetaSnapshotExpected *expected,
-										 uint64_t *bytes_out)
+										 PsForkmetaSnapshotReclaimObservation *observation)
 {
 	SnapshotRecord selected_before;
 	SnapshotRecord selected_after;
@@ -1937,7 +1957,8 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 	ForkmetaObservationIdentity prepared_identity_before, prepared_identity_after;
 	ForkmetaObservationIdentity selected_parts_before[2], selected_parts_after[2];
 	ForkmetaObservationIdentity prepared_parts_before[2], prepared_parts_after[2];
-	uint64_t total;
+	uint64_t gc_debt;
+	uint64_t cutoff_debt;
 	uint64_t source_debt;
 	int source_fd = -1;
 	int snapshot_fd = -1;
@@ -1947,9 +1968,9 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 	int prepared_present_after;
 
 	if (directory == NULL || source_directory == NULL || expected == NULL ||
-		bytes_out == NULL)
+		observation == NULL)
 		return -1;
-	*bytes_out = 0;
+	memset(observation, 0, sizeof(*observation));
 	source_fd = open(source_directory,
 					 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (source_fd < 0)
@@ -2027,9 +2048,10 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 					forkmeta_snapshot_parts_identity(snapshot_fd, &prepared_before,
 															 prepared_parts_before) != 0) ||
 				forkmeta_snapshot_debt_scan(snapshot_fd, expected->generation,
-														 prepared_present_before ?
-														 prepared_before.generation : 0,
-														 &total) != 0)
+																		prepared_present_before ?
+																		prepared_before.generation : 0,
+																		&gc_debt,
+																		&cutoff_debt) != 0)
 				goto fail;
 			if (observation_test_hook != NULL)
 				observation_test_hook(attempt, observation_test_hook_arg);
@@ -2077,7 +2099,8 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 				goto fail;
 			selected_present_before = selected_present_after = 0;
 			prepared_present_before = prepared_present_after = 0;
-			total = 0;
+			gc_debt = 0;
+			cutoff_debt = 0;
 		}
 		if (forkmeta_identity_at(source_fd, "forkmeta", &source_after) != 0 ||
 			forkmeta_directory_identity(source_fd, &source_dir_after) != 0 ||
@@ -2122,8 +2145,14 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 				goto fail;
 			source_debt = 0;
 		}
-		forkmeta_add_bytes(&source_debt, total);
-		*bytes_out = source_debt;
+		observation->source_debt_bytes = source_debt;
+		observation->gc_serviceable_bytes = gc_debt;
+		observation->cutoff_dependent_bytes = cutoff_debt;
+		observation->bytes = source_debt;
+		forkmeta_add_bytes(&observation->bytes,
+						   observation->gc_serviceable_bytes);
+		forkmeta_add_bytes(&observation->bytes,
+						   observation->cutoff_dependent_bytes);
 		(void) close(source_fd);
 		if (snapshot_fd >= 0)
 			(void) close(snapshot_fd);
@@ -2136,6 +2165,25 @@ fail:
 	if (snapshot_fd >= 0)
 		(void) close(snapshot_fd);
 	return -1;
+}
+
+int
+ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 int source_debt_enabled,
+										 const PsForkmetaSnapshotExpected *expected,
+										 uint64_t *bytes_out)
+{
+	PsForkmetaSnapshotReclaimObservation observation;
+
+	if (bytes_out == NULL ||
+		ps_forkmeta_snapshot_reclaim_observation(directory, source_directory,
+											 source_baseline, source_debt_enabled,
+											 expected, &observation) != 0)
+		return -1;
+	*bytes_out = observation.bytes;
+	return 0;
 }
 
 void

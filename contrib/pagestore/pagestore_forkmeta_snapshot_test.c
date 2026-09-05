@@ -551,6 +551,7 @@ main(void)
 		char old_checkpoint[1200];
 		char old_tail[1200];
 		char temp[1200];
+		char prepared_temp[1200];
 		char newer_tail[1200];
 		char unrelated[1200];
 		char older_fixture[1200];
@@ -592,6 +593,14 @@ main(void)
 										 &expected, &debt) == 0 &&
 				  debt >= 6,
 				  "recognized temporary snapshot residue is counted as physical debt");
+		baseline = debt;
+		snprintf(prepared_temp, sizeof(prepared_temp),
+				 "%s/forkmeta_prepared_v1.tmp.1.1", directory);
+		check(write_file(prepared_temp, "prepared", 8, 0) == 0 &&
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
+										 &expected, &debt) == 0 &&
+				  debt == baseline + 8,
+				  "orphaned prepared intent temp is counted as GC debris");
 		baseline = debt;
 		snprintf(older_fixture, sizeof(older_fixture), "%s/prepared_older", root);
 		check(stat(old_checkpoint, &old_checkpoint_stat) == 0 &&
@@ -644,9 +653,19 @@ main(void)
 				  "equal prepared generation is excluded while obsolete debris counts");
 		check(ps_forkmeta_snapshot_commit(&prepared) == 0 && unlink(unrelated) == 0,
 				  "commit the equal prepared generation fixture");
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR", "1", 1) == 0 &&
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
+										 &expected, &debt) != 0 &&
+			  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") == 0,
+				  "closedir failure does not double-close the consumed scan stream");
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR", "1", 1) == 0 &&
+			  ps_forkmeta_snapshot_gc(directory) < 0 &&
+			  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") == 0,
+				  "GC closedir failure does not reuse the consumed stream");
 		check(ps_forkmeta_snapshot_gc(directory) == 1 &&
-			  access(old_checkpoint, F_OK) != 0 &&
-			  access(temp, F_OK) != 0 && access(newer_tail, F_OK) == 0,
+				  access(old_checkpoint, F_OK) != 0 &&
+				  access(temp, F_OK) != 0 && access(prepared_temp, F_OK) != 0 &&
+				  access(newer_tail, F_OK) == 0,
 			  "GC removes old generation and recognized temp debris");
 	}
 	check(part_path(directory, "forkmeta_checkpoint_v1_", 4, path,

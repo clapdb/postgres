@@ -61,6 +61,16 @@ typedef struct PsForkmetaSnapshotExpected
 	PsForkmetaSnapshotPart tail;
 } PsForkmetaSnapshotExpected;
 
+/* Separate debt that can be serviced by the current GC from residue that
+ * needs a newly published snapshot/cutoff before it is safe to reclaim. */
+typedef struct PsForkmetaSnapshotReclaimObservation
+{
+	uint64_t bytes;
+	uint64_t gc_serviceable_bytes;
+	uint64_t cutoff_dependent_bytes;
+	uint64_t source_debt_bytes;
+} PsForkmetaSnapshotReclaimObservation;
+
 typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
 															 void *arg);
 
@@ -175,7 +185,14 @@ extern int ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 										 uint64_t source_baseline,
 										 int source_debt_enabled,
 										 const PsForkmetaSnapshotExpected *expected,
-										uint64_t *bytes_out);
+										 uint64_t *bytes_out);
+extern int ps_forkmeta_snapshot_reclaim_observation(
+										 const char *directory,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 int source_debt_enabled,
+										 const PsForkmetaSnapshotExpected *expected,
+										 PsForkmetaSnapshotReclaimObservation *observation);
 /* Release the stable part descriptors and directory descriptor. */
 extern void ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot);
 

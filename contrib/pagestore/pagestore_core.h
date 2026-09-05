@@ -134,6 +134,7 @@ extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
 extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
 extern void ps_test_backpressure_set_forkmeta_lag(uint64_t forkmeta_lag);
 extern int ps_test_forkmeta_force_due(void);
+extern int ps_test_forkmeta_serviceable_work_due(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);

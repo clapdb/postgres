@@ -262,6 +262,11 @@ static uint64_t walidx_observation_count;
 static uint64_t forkmeta_observation_next_ns;
 static uint64_t forkmeta_observation_count;
 #define FORKMETA_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
+/* Physical observations publish this independently of lag/throttle state.
+ * Errors may require fail-closed admission while providing no safe work for
+ * snapshot/GC forcing. */
+static unsigned char fork_meta_serviceable_work_due;
+static unsigned char fork_meta_observation_error;
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
 static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
@@ -780,6 +785,8 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	forkmeta_reclaim_catchup_bytes = forkmeta_catchup;
 	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&forkmeta_observation_count, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	pthread_mutex_lock(&backpressure_lock);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
 	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
@@ -960,6 +967,12 @@ int
 ps_test_forkmeta_force_due(void)
 {
 	return fork_meta_backpressure_throttled();
+}
+
+int
+ps_test_forkmeta_serviceable_work_due(void)
+{
+	return __atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE);
 }
 
 int
@@ -5720,10 +5733,14 @@ static uint64_t
 forkmeta_reclaim_lag_bytes(void)
 {
 	PsForkmetaSnapshotExpected expected;
+	PsForkmetaSnapshotReclaimObservation observation;
 	int source_debt_enabled;
 	int scan_rc;
-	uint64_t debt;
+	uint64_t serviceable_lag;
 	uint64_t source_baseline;
+
+	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_observation_error, 1, __ATOMIC_RELEASE);
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0 ||
@@ -5750,11 +5767,11 @@ forkmeta_reclaim_lag_bytes(void)
 	 * disabled; snapshot/debris debt remains observable, while the new owner's
 	 * unproven source bytes cannot enter the throttle. */
 	source_debt_enabled = fork_meta_source_cutoff_provable();
-	scan_rc = ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
+	scan_rc = ps_forkmeta_snapshot_reclaim_observation(fork_meta_snapshot_dir,
 										wal_segment_root,
 										source_baseline,
 										source_debt_enabled,
-										&expected, &debt);
+										&expected, &observation);
 	if (scan_rc != 0)
 	{
 		ps_admission_write_unlock();
@@ -5762,18 +5779,27 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	if (source_debt_enabled && !fork_meta_source_cutoff_provable())
 	{
-		scan_rc = ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
+		scan_rc = ps_forkmeta_snapshot_reclaim_observation(
+										 fork_meta_snapshot_dir,
 										 wal_segment_root,
 										 source_baseline,
-										 0, &expected, &debt);
+										 0, &expected, &observation);
 		if (scan_rc != 0)
 		{
 			ps_admission_write_unlock();
 			return UINT64_MAX;
 		}
 	}
+	serviceable_lag = observation.gc_serviceable_bytes;
+	if (UINT64_MAX - serviceable_lag < observation.source_debt_bytes)
+		serviceable_lag = UINT64_MAX;
+	else
+		serviceable_lag += observation.source_debt_bytes;
+	__atomic_store_n(&fork_meta_serviceable_work_due,
+					 serviceable_lag != 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	ps_admission_write_unlock();
-	return debt;
+	return serviceable_lag;
 }
 
 
@@ -7004,7 +7030,9 @@ fork_meta_snapshot_due_locked(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(fork_meta_backpressure_throttled() || fork_meta_bytes_load() >= threshold ||
+		(__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE) ||
+		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+		  fork_meta_bytes_load() >= threshold) ||
 		 fork_meta_deletion_cutover_due_locked());
 }
 
@@ -7023,7 +7051,9 @@ fork_meta_snapshot_due(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(fork_meta_backpressure_throttled() || fork_meta_bytes_load() >= threshold ||
+		(__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE) ||
+		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+		  fork_meta_bytes_load() >= threshold) ||
 		 fork_meta_deletion_probe_due());
 }
 
@@ -15184,6 +15214,8 @@ ps_core_open(const char *store_dir)
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
 	fork_meta_snapshot_gc_ambiguous = 0;
+	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	memset(fork_meta_deletion_cutover_done, 0,
 		   sizeof(fork_meta_deletion_cutover_done));
 	memset(&fork_meta_snapshot_retry_at, 0,
