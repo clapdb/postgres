@@ -699,8 +699,9 @@ main(void)
 				  access(temp_only, F_OK) != 0,
 				  "temp-only GC works before the first manifest publication");
 
-		/* Overflow is still a valid observation when every entry is an owned
-		 * temporary.  Cleanup is deliberately bounded and can be repeated. */
+		/* Overflow is a stable but incomplete observation.  It must remain
+		 * fail-closed to admission while still exposing validated temporary
+		 * cleanup work.  Cleanup is deliberately bounded and can be repeated. */
 		for (unsigned int i = 0; i < 4097; i++)
 		{
 			int n = snprintf(temp_only, sizeof(temp_only),
@@ -717,10 +718,12 @@ main(void)
 		memset(&expected, 0, sizeof(expected));
 		check(created &&
 				  ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
-													 &expected, &observation) == 0 &&
+															 &expected, &observation) ==
+				  PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW &&
 				  observation.gc_serviceable_overflow != 0 &&
+				  observation.gc_temp_gc_due != 0 &&
 				  observation.gc_serviceable_bytes != 0,
-				  "recognized temporary overflow remains executable GC work");
+				  "temporary overflow is incomplete but remains executable GC work");
 		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1,
 				  "overflow cleanup removes only a bounded temporary batch");
 		for (unsigned int pass = 0; pass < 64 &&
@@ -728,6 +731,144 @@ main(void)
 			;
 		check(ps_forkmeta_snapshot_gc_temporary(directory) == 0,
 				  "repeated bounded temporary cleanup drains the backlog");
+		{
+			char unknown[1200];
+			int observation_rc;
+
+			/* Selected parts and an unknown entry must not be silently skipped
+			 * when the cursor crosses the bound.  The result is incomplete and
+			 * therefore cannot authorize admission; after temp cleanup the
+			 * complete scan must expose the unknown entry. */
+			for (unsigned int i = 0;
+				 i < PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES; i++)
+			{
+				int n = snprintf(temp_only, sizeof(temp_only),
+							 "%s/forkmeta_tail_v1_%020u.tmp.2.1", directory,
+							 i + 10000);
+
+				if (n < 0 || (size_t) n >= sizeof(temp_only) ||
+					write_file(temp_only, "x", 1, 0) != 0)
+				{
+					created = 0;
+					break;
+				}
+			}
+			snprintf(unknown, sizeof(unknown), "%s/not-a-forkmeta-entry", directory);
+			check(created && write_file(unknown, "unknown", 7, 0) == 0 &&
+					  ps_forkmeta_snapshot_publish(directory, 1, 100, 1, &cp_input,
+													  &stream_input) == 0 &&
+					  ps_forkmeta_snapshot_open(&snapshot, directory) == 0,
+					  "create selected parts beyond an overflow cursor");
+			if (access(unknown, F_OK) == 0 && snapshot.generation != 0)
+			{
+				expected.generation = snapshot.generation;
+				expected.cutoff_lsn = snapshot.cutoff_lsn;
+				expected.cutoff_admission_seq = snapshot.cutoff_admission_seq;
+				expected.checkpoint = snapshot.checkpoint;
+				expected.tail = snapshot.tail;
+				ps_forkmeta_snapshot_close(&snapshot);
+				observation_rc = ps_forkmeta_snapshot_reclaim_observation(
+					directory, root, 0, 0, &expected, &observation);
+				check(observation_rc != 0 &&
+						(observation_rc !=
+						 PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW ||
+						 observation.gc_temp_gc_due != 0),
+						  "overflow does not claim complete selected/unknown accounting");
+				for (unsigned int pass = 0; pass < 64; pass++)
+					if (ps_forkmeta_snapshot_gc_temporary(directory) == 0)
+						break;
+				check(ps_forkmeta_snapshot_reclaim_observation(
+						 directory, root, 0, 0, &expected, &observation) != 0,
+						"complete scan exposes unknown entry after bounded cleanup");
+			}
+		}
+	}
+	{
+		char overflow_symlink[1200];
+		char temp_only[1200];
+		PsForkmetaSnapshotExpected expected;
+		PsForkmetaSnapshotReclaimObservation observation;
+		int created = 1;
+
+		check(make_dir(root, "overflow_symlink", directory,
+					   sizeof(directory)) == 0,
+				  "create overflow symlink fixture");
+		for (unsigned int i = 0;
+			 i < PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES; i++)
+		{
+			int n = snprintf(temp_only, sizeof(temp_only),
+						 "%s/forkmeta_tail_v1_%020u.tmp.3.1", directory,
+						 i + 20000);
+
+			if (n < 0 || (size_t) n >= sizeof(temp_only) ||
+				write_file(temp_only, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		snprintf(overflow_symlink, sizeof(overflow_symlink),
+				 "%s/forkmeta_tail_v1_99999999999999999999.tmp.3.1", directory);
+		memset(&expected, 0, sizeof(expected));
+		check(created && symlink("/dev/null", overflow_symlink) == 0 &&
+				  ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
+														 &expected, &observation) != 0 &&
+				  access(overflow_symlink, F_OK) == 0,
+				  "overflow never treats an exact temporary symlink as validated cleanup");
+		check(ps_forkmeta_snapshot_gc_temporary(directory) < 0 &&
+			  access(overflow_symlink, F_OK) == 0,
+			  "temporary GC preserves the overflow symlink");
+	}
+	{
+		char canonical[1200];
+		char temp_later[1200];
+		PsForkmetaSnapshotExpected expected;
+		PsForkmetaSnapshotReclaimObservation observation;
+		int created = 1;
+
+		check(make_dir(root, "overflow_canonical_cursor", directory,
+					   sizeof(directory)) == 0,
+				  "create canonical overflow cursor fixture");
+		for (unsigned int i = 0; i < 2048; i++)
+		{
+			for (unsigned int part = 0; part < 2; part++)
+			{
+				const char *prefix = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+					"forkmeta_checkpoint_v1_" : "forkmeta_tail_v1_";
+				int n = snprintf(canonical, sizeof(canonical), "%s/%s%020u",
+							 directory, prefix, i + 30000);
+
+				if (n < 0 || (size_t) n >= sizeof(canonical) ||
+					write_file(canonical, "x", 1, 0) != 0)
+				{
+					created = 0;
+					break;
+				}
+			}
+			if (!created)
+				break;
+		}
+		check(created &&
+				  snprintf(canonical, sizeof(canonical),
+						   "%s/forkmeta_checkpoint_v1_00000000000000009999",
+						   directory) >= 0 && write_file(canonical, "x", 1, 0) == 0 &&
+				  snprintf(temp_later, sizeof(temp_later),
+						   "%s/forkmeta_tail_v1_00000000000000009998.tmp.4.1",
+						   directory) >= 0 && write_file(temp_later, "later", 5, 0) == 0,
+				  "create temp after the canonical overflow cursor");
+		memset(&expected, 0, sizeof(expected));
+		check(created &&
+			  ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
+														 &expected, &observation) ==
+			  PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW &&
+			  observation.gc_temp_gc_due != 0,
+			  "canonical overflow schedules an external temporary GC probe");
+		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
+			  access(temp_later, F_OK) != 0,
+			  "external temporary GC reaches valid temp after canonical overflow");
+		check(ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
+														 &expected, &observation) != 0,
+			  "canonical overflow remains fail-closed until below the bound");
 	}
 	{
 		char temp[1200];

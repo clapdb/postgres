@@ -5686,6 +5686,8 @@ static int fork_meta_snapshot_gc_ambiguous;
 static struct timespec fork_meta_snapshot_retry_at;
 static char fork_meta_snapshot_dir[4096];
 
+static void forkmeta_observation_force_now(void);
+
 /* The baseline is deliberately conservative across restart.  Before the first
  * selected snapshot only the strictly validated migration-marker prefix is
  * irreducible.  Once a selected snapshot exists, its source epoch marker is
@@ -5746,6 +5748,7 @@ forkmeta_reclaim_lag_bytes(void)
 	PsForkmetaSnapshotReclaimObservation observation;
 	int source_debt_enabled;
 	int scan_rc;
+	int observation_overflow;
 	uint64_t serviceable_lag;
 	uint64_t source_baseline;
 
@@ -5783,11 +5786,13 @@ forkmeta_reclaim_lag_bytes(void)
 										source_baseline,
 										source_debt_enabled,
 										&expected, &observation);
-	if (scan_rc != 0)
+	if (scan_rc < 0)
 	{
 		ps_admission_write_unlock();
 		return UINT64_MAX;
 	}
+	observation_overflow =
+		scan_rc == PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW;
 	if (source_debt_enabled && !fork_meta_source_cutoff_provable())
 	{
 		source_debt_enabled = 0;
@@ -5796,11 +5801,13 @@ forkmeta_reclaim_lag_bytes(void)
 										 wal_segment_root,
 										 source_baseline,
 										 0, &expected, &observation);
-		if (scan_rc != 0)
+		if (scan_rc < 0)
 		{
 			ps_admission_write_unlock();
 			return UINT64_MAX;
 		}
+		observation_overflow =
+			scan_rc == PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW;
 	}
 	serviceable_lag = observation.gc_serviceable_bytes;
 	if (UINT64_MAX - serviceable_lag < observation.source_debt_bytes)
@@ -5815,13 +5822,13 @@ forkmeta_reclaim_lag_bytes(void)
 			serviceable_lag += observation.cutoff_dependent_bytes;
 	}
 	__atomic_store_n(&fork_meta_serviceable_work_due,
-					 serviceable_lag != 0 || observation.gc_serviceable_overflow,
+					 !observation_overflow && serviceable_lag != 0,
 					 __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_gc_serviceable_work_due,
 					 observation.gc_temp_bytes != 0 ||
-					 observation.gc_serviceable_overflow,
+					 observation.gc_temp_gc_due,
 					 __ATOMIC_RELEASE);
-	if (observation.gc_temp_bytes != 0 || observation.gc_serviceable_overflow)
+	if (observation.gc_temp_bytes != 0 || observation.gc_temp_gc_due)
 	{
 		fork_meta_temp_gc_pending = 1;
 		if (!fork_meta_temp_gc_ambiguous)
@@ -5830,7 +5837,11 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	else if (!fork_meta_temp_gc_ambiguous)
 		fork_meta_temp_gc_pending = 0;
-	if (observation.gc_canonical_bytes != 0)
+	/* An incomplete directory scan may have stopped before obsolete canonical
+	 * parts.  With a selected manifest, probe canonical GC outside the
+	 * admission fence just as we probe temp GC on overflow. */
+	if (observation.gc_canonical_bytes != 0 ||
+		(observation_overflow && expected.generation != 0))
 	{
 		fork_meta_canonical_gc_pending = 1;
 		if (!fork_meta_canonical_gc_ambiguous)
@@ -5839,9 +5850,10 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	else if (!fork_meta_canonical_gc_ambiguous)
 		fork_meta_canonical_gc_pending = 0;
-	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_observation_error, observation_overflow,
+					 __ATOMIC_RELEASE);
 	ps_admission_write_unlock();
-	return serviceable_lag;
+	return observation_overflow ? UINT64_MAX : serviceable_lag;
 }
 
 
@@ -7103,10 +7115,10 @@ fork_meta_snapshot_due_locked(void)
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
 		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
-		((fork_meta_backpressure_throttled() &&
-		  __atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
-		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
-		  fork_meta_bytes_load() >= threshold) ||
+		((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+		  ((fork_meta_backpressure_throttled() &&
+			__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
+		   fork_meta_bytes_load() >= threshold)) ||
 		 fork_meta_deletion_cutover_due_locked());
 }
 
@@ -7126,10 +7138,10 @@ fork_meta_snapshot_due(void)
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
 		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
-		((fork_meta_backpressure_throttled() &&
-		  __atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
-		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
-		  fork_meta_bytes_load() >= threshold) ||
+		((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+		  ((fork_meta_backpressure_throttled() &&
+			__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
+		   fork_meta_bytes_load() >= threshold)) ||
 		 fork_meta_deletion_probe_due());
 }
 
@@ -7178,6 +7190,7 @@ fork_meta_snapshot_maintenance(void)
 			fork_meta_snapshot_gc_ambiguous = 0;
 			memset(&fork_meta_snapshot_retry_at, 0,
 				   sizeof(fork_meta_snapshot_retry_at));
+			forkmeta_observation_force_now();
 			/* Let the outer maintenance cycle refresh backpressure before it
 			 * considers another forced snapshot. */
 			return 1;
@@ -12940,6 +12953,15 @@ forkmeta_arm_observation_timer(void)
 	__atomic_store_n(&forkmeta_observation_next_ns, due, __ATOMIC_RELEASE);
 }
 
+/* A successful forkmeta GC changes the directory contents observed by the
+ * backpressure controller.  Do not let the automatic 100 ms pacing window
+ * keep stale throttle/force state alive after that operation. */
+static void
+forkmeta_observation_force_now(void)
+{
+	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
+}
+
 static void
 ps_backpressure_refresh_internal(int automatic)
 {
@@ -14994,12 +15016,11 @@ ps_core_maintenance_impl(void)
 		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
-	if (fork_meta_temp_gc_pending)
+	if (fork_meta_temp_gc_pending && fork_meta_temp_gc_due())
 	{
 		int gc;
+		int was_ambiguous = fork_meta_temp_gc_ambiguous;
 
-		if (!fork_meta_temp_gc_due())
-			return 0;
 		gc = ps_forkmeta_snapshot_gc_temporary(fork_meta_snapshot_dir);
 		if (gc >= 0)
 		{
@@ -15007,8 +15028,11 @@ ps_core_maintenance_impl(void)
 			fork_meta_temp_gc_ambiguous = 0;
 			memset(&fork_meta_temp_gc_retry_at, 0,
 				   sizeof(fork_meta_temp_gc_retry_at));
-			if (gc > 0)
+			if (gc > 0 || was_ambiguous)
+			{
+				forkmeta_observation_force_now();
 				return 1;
+			}
 		}
 		else
 		{
@@ -15016,15 +15040,13 @@ ps_core_maintenance_impl(void)
 				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_temp_gc_retry_at);
 			fork_meta_temp_gc_retry_at.tv_sec++;
-			return 0;
 		}
 	}
-	if (fork_meta_canonical_gc_pending)
+	if (fork_meta_canonical_gc_pending && fork_meta_canonical_gc_due())
 	{
 		int gc;
+		int was_ambiguous = fork_meta_canonical_gc_ambiguous;
 
-		if (!fork_meta_canonical_gc_due())
-			return 0;
 		gc = ps_forkmeta_snapshot_gc(fork_meta_snapshot_dir);
 		if (gc >= 0)
 		{
@@ -15032,14 +15054,19 @@ ps_core_maintenance_impl(void)
 			fork_meta_canonical_gc_ambiguous = 0;
 			memset(&fork_meta_canonical_gc_retry_at, 0,
 				   sizeof(fork_meta_canonical_gc_retry_at));
-			if (gc > 0)
+			if (gc > 0 || was_ambiguous)
+			{
+				forkmeta_observation_force_now();
 				return 1;
+			}
 		}
-		fork_meta_canonical_gc_ambiguous =
-			gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
-		clock_gettime(CLOCK_MONOTONIC, &fork_meta_canonical_gc_retry_at);
-		fork_meta_canonical_gc_retry_at.tv_sec++;
-		return 0;
+		else
+		{
+			fork_meta_canonical_gc_ambiguous =
+				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+			clock_gettime(CLOCK_MONOTONIC, &fork_meta_canonical_gc_retry_at);
+			fork_meta_canonical_gc_retry_at.tv_sec++;
+		}
 	}
 	if (fork_meta_snapshot_gc_due() || fork_meta_snapshot_due())
 	{
@@ -15285,6 +15312,7 @@ ps_core_open(const char *store_dir)
 	int			publish_shard_count = 0;
 
 	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
 	/* A test or embedding process may reopen without a fresh daemon.  Drop
 	 * every hash entry before recovery repopulates the indexes. */
 	free_page_fork_indexes();

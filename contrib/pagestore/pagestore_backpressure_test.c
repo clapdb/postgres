@@ -832,6 +832,7 @@ test_forkmeta_backpressure_observer(void)
 	PsChannel channel;
 	volatile sig_atomic_t stop = 0;
 	uint32_t causes = 0;
+	uint64_t observations_before_reopen;
 	BackpressureSlowPathCounter cutover_attempts = {0};
 
 	configure_page_core();
@@ -877,17 +878,20 @@ test_forkmeta_backpressure_observer(void)
 	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
 			metrics.forkmeta_backpressure.throttled == 0,
 			"metadata-only churn does not deadlock without a safe frontier");
-	ps_core_set_metrics_header(NULL);
+	observations_before_reopen = ps_test_backpressure_forkmeta_observation_count();
 	ps_core_close();
 	ps_storage->close();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_core_open(store) == 0,
 			"restart before the first selected snapshot");
-	ps_core_set_metrics_header(&metrics);
-	ps_backpressure_refresh();
+	(void) ps_core_maintenance();
+	check(ps_test_backpressure_forkmeta_observation_count() >
+			observations_before_reopen,
+			"reopen resets automatic forkmeta observation pacing");
 	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
 			metrics.forkmeta_backpressure.throttled == 0,
 			"restart does not charge source history without a safe frontier");
+	ps_backpressure_refresh();
 	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
 																				20, 10) == 0,
 			"lower forkmeta threshold for physical-debris admission test");
@@ -908,10 +912,10 @@ test_forkmeta_backpressure_observer(void)
 			"only immediately GC-serviceable debris counts without a cutoff");
 	ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
 									 &cutover_attempts);
-	check(ps_core_maintenance() == 1 && access(temporary, F_OK) != 0,
-				"temp-only GC runs without forcing a below-threshold cutover");
+	check(ps_core_maintenance() == 1 && access(temporary, F_OK) != 0 &&
+			metrics.forkmeta_backpressure.lag_bytes == 0,
+				"temp-only GC refreshes forkmeta state before returning");
 	ps_test_set_forkmeta_cutover_hook(NULL, NULL);
-	ps_backpressure_refresh();
 	check(cutover_attempts.calls == 0,
 				"below-threshold serviceable lag does not force snapshot publication");
 	check(metrics.forkmeta_backpressure.lag_bytes == 0,
@@ -924,9 +928,9 @@ test_forkmeta_backpressure_observer(void)
 			unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
 				"temp GC keeps a pending retry after post-unlink fsync ambiguity");
 	ps_test_forkmeta_snapshot_gc_retry_now();
-	check(ps_core_maintenance() == 0,
+	check(ps_core_maintenance() == 1 &&
+			metrics.forkmeta_backpressure.lag_bytes == 0,
 				"temp GC retry reconciles the empty directory after ambiguity");
-	ps_backpressure_refresh();
 	check(metrics.forkmeta_backpressure.lag_bytes == 0,
 				"temp GC retry clears reconciled serviceable debt");
 	check(ps_backpressure_try_admit_mask(&stop, PS_BACKPRESSURE_FORKMETA,
@@ -1002,6 +1006,8 @@ test_forkmeta_self_recovery(void)
 	char snapshots[1200];
 	char old_checkpoint[1200];
 	char old_tail[1200];
+	char temporary[1200];
+	char canonical[1200];
 	char source[1200];
 	struct stat source_before;
 	struct stat source_after;
@@ -1019,6 +1025,7 @@ test_forkmeta_self_recovery(void)
 	int did = 0;
 	int reopen_rc;
 	uint64_t selected_generation = 0;
+	BackpressureSlowPathCounter cutover_attempts = {0};
 
 	configure_page_core();
 	compact_layers = 0;
@@ -1219,7 +1226,101 @@ test_forkmeta_self_recovery(void)
 	if (selected_generation > 1)
 	{
 		uint64_t old_generation = selected_generation - 1;
+		int overflow_entries_created = 1;
 
+		/* Finish any post-publication snapshot GC left by the preceding
+		 * cutover before installing the overflow-only fixture. */
+		(void) ps_core_maintenance();
+		ps_backpressure_refresh();
+		/* The selected manifest and its two canonical parts are authoritative.
+		 * Add only newer canonical parts until the bounded observer overflows;
+		 * none of these entries is reclaimable, so overflow must fail closed
+		 * without publishing a snapshot or spinning maintenance. */
+		for (unsigned int i = 0; i < 4095; i++)
+		{
+			int n = snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 1000000 + i));
+
+			if (n < 0 || (size_t) n >= sizeof(canonical) ||
+				!write_test_file(canonical, 1))
+			{
+				overflow_entries_created = 0;
+				break;
+			}
+		}
+		ps_backpressure_refresh();
+		check(overflow_entries_created &&
+				metrics.forkmeta_backpressure.throttled != 0 &&
+				ps_test_forkmeta_force_due() != 0 &&
+				ps_test_forkmeta_serviceable_work_due() == 0,
+				"canonical overflow remains fail-closed without serviceable GC debt");
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										 &cutover_attempts);
+		check(ps_core_maintenance() == 0,
+				"canonical overflow maintenance completes without extra work");
+		check(cutover_attempts.calls == 0,
+				"canonical overflow does not invoke snapshot cutover");
+		check(ps_core_maintenance() == 0,
+				"canonical overflow does not busy-loop maintenance");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		for (unsigned int i = 0; i < 4095; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
+				unlink(canonical) != 0)
+				overflow_entries_created = 0;
+		}
+		check(overflow_entries_created,
+				"remove canonical overflow regression entries");
+		ps_backpressure_refresh();
+
+		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
+					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  snprintf(old_tail, sizeof(old_tail),
+					   "%s/forkmeta_tail_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  write_test_file(old_checkpoint, 11) &&
+				  write_test_file(old_tail, 13),
+				  "create canonical residue for no-op temp probe fairness");
+		for (unsigned int i = 0; i < 4095; i++)
+		{
+			int n = snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 1000000 + i));
+
+			if (n < 0 || (size_t) n >= sizeof(canonical) ||
+				write_test_file(canonical, 1) == 0)
+			{
+				check(0, "create canonical overflow residue for no-op probe");
+				break;
+			}
+		}
+		ps_backpressure_refresh();
+		check(ps_core_maintenance() == 1 &&
+				  access(old_checkpoint, F_OK) != 0 && access(old_tail, F_OK) != 0,
+				  "canonical GC is not starved by a no-op temp probe");
+		for (unsigned int i = 0; i < 4095; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
+				unlink(canonical) != 0)
+				check(0, "remove canonical no-op probe residue");
+		}
+
+		check(snprintf(temporary, sizeof(temporary),
+					   "%s/forkmeta_tail_v1_%020llu.tmp.1.1", snapshots,
+					   (unsigned long long) selected_generation) >= 0 &&
+				  write_test_file(temporary, 7),
+				  "create temporary debris for GC backoff fairness");
+		ps_backpressure_refresh();
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
+				  ps_core_maintenance() == 0 && access(temporary, F_OK) != 0 &&
+				  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
+				  "temp GC enters its dedicated durability backoff");
 		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
 					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
 					   (unsigned long long) old_generation) >= 0 &&
@@ -1230,18 +1331,26 @@ test_forkmeta_self_recovery(void)
 				  write_test_file(old_tail, 13),
 				  "create canonical generation debris for ambiguity retry");
 		ps_backpressure_refresh();
+		check(ps_core_maintenance() == 1 &&
+				  access(old_checkpoint, F_OK) != 0 && access(old_tail, F_OK) != 0,
+				  "canonical GC proceeds while temporary GC waits for backoff");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		check(ps_core_maintenance() == 1,
+				  "temporary GC backoff retry remains independently serviceable");
+		check(write_test_file(old_checkpoint, 11) && write_test_file(old_tail, 13),
+				  "recreate canonical debris for durability ambiguity");
+		ps_backpressure_refresh();
 		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
 				  ps_core_maintenance() == 0 &&
 				  access(old_checkpoint, F_OK) != 0 &&
 				  access(old_tail, F_OK) != 0 &&
 				  ps_test_forkmeta_canonical_gc_ambiguous() != 0 &&
 				  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
-				  "canonical GC retains pending ambiguity after post-unlink fsync fault");
+					  "canonical GC retains pending ambiguity after post-unlink fsync fault");
 		ps_test_forkmeta_snapshot_gc_retry_now();
-		check(ps_core_maintenance() == 0 &&
+		check(ps_core_maintenance() == 1 &&
 				  ps_test_forkmeta_canonical_gc_ambiguous() == 0,
 				  "canonical GC empty retry closes directory-fsync ambiguity");
-		ps_backpressure_refresh();
 		check(metrics.forkmeta_backpressure.lag_bytes == 0,
 				  "canonical GC retry reconciles physical debt");
 	}

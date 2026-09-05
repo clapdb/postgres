@@ -71,10 +71,18 @@ typedef struct PsForkmetaSnapshotReclaimObservation
 	uint64_t gc_canonical_bytes;
 	uint64_t cutoff_dependent_bytes;
 	uint64_t source_debt_bytes;
-	/* The bounded observer saw more recognized temporary debris than it can
-	 * account in one pass.  This is executable GC work, not an unknown error. */
+	/* The bounded observer did not prove that the directory is complete. */
 	int gc_serviceable_overflow;
+	/* An overflow or a validated temporary means the admission-fence-external
+	 * exact-temp GC/probe should run; this does not claim complete validation. */
+	int gc_temp_gc_due;
 } PsForkmetaSnapshotReclaimObservation;
+
+/* The observation is stable but incomplete.  Its accounting is usable only
+ * to schedule bounded temporary cleanup; callers must fail closed for
+ * admission until a later complete observation succeeds. */
+#define PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW 1
+#define PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES 4096U
 
 typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
 															 void *arg);
