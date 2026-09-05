@@ -560,6 +560,7 @@ main(void)
 		struct stat old_checkpoint_stat;
 		struct stat old_tail_stat;
 		PsForkmetaSnapshotExpected expected;
+		PsForkmetaSnapshotReclaimObservation observation;
 		uint64_t debt = 0;
 		uint64_t baseline;
 
@@ -593,6 +594,13 @@ main(void)
 										 &expected, &debt) == 0 &&
 				  debt >= 6,
 				  "recognized temporary snapshot residue is counted as physical debt");
+		check(ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 1,
+												 &expected, &observation) == 0,
+				  "safe cutoff observation succeeds with canonical residue");
+		check(observation.gc_canonical_bytes == 45,
+				  "safe cutoff observation classifies old canonical GC residue");
+		check(observation.cutoff_dependent_bytes == 15,
+				  "safe cutoff observation includes newer canonical residue");
 		baseline = debt;
 		snprintf(prepared_temp, sizeof(prepared_temp),
 				 "%s/forkmeta_prepared_v1.tmp.1.1", directory);
@@ -670,7 +678,57 @@ main(void)
 	}
 	check(part_path(directory, "forkmeta_checkpoint_v1_", 4, path,
 					 sizeof(path)) == 0 && access(path, F_OK) == 0,
-			  "GC preserves newer unpublished generation");
+				  "GC preserves newer unpublished generation");
+	check(make_dir(root, "temp_only", directory, sizeof(directory)) == 0,
+			  "create a temp-only directory without a selected manifest");
+	{
+		char temp_only[1200];
+		char manifest[1200];
+		PsForkmetaSnapshotExpected expected;
+		PsForkmetaSnapshotReclaimObservation observation;
+		int created = 1;
+
+		snprintf(temp_only, sizeof(temp_only),
+				 "%s/forkmeta_tail_v1_00000000000000000001.tmp.1.1",
+				 directory);
+		snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1",
+				 directory);
+		check(write_file(temp_only, "temp", 4, 0) == 0 &&
+				  access(manifest, F_OK) != 0 &&
+				  ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
+				  access(temp_only, F_OK) != 0,
+				  "temp-only GC works before the first manifest publication");
+
+		/* Overflow is still a valid observation when every entry is an owned
+		 * temporary.  Cleanup is deliberately bounded and can be repeated. */
+		for (unsigned int i = 0; i < 4097; i++)
+		{
+			int n = snprintf(temp_only, sizeof(temp_only),
+						 "%s/forkmeta_tail_v1_%020u.tmp.1.1", directory,
+						 i + 1);
+
+			if (n < 0 || (size_t) n >= sizeof(temp_only) ||
+				write_file(temp_only, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		memset(&expected, 0, sizeof(expected));
+		check(created &&
+				  ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
+													 &expected, &observation) == 0 &&
+				  observation.gc_serviceable_overflow != 0 &&
+				  observation.gc_serviceable_bytes != 0,
+				  "recognized temporary overflow remains executable GC work");
+		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1,
+				  "overflow cleanup removes only a bounded temporary batch");
+		for (unsigned int pass = 0; pass < 64 &&
+				 ps_forkmeta_snapshot_gc_temporary(directory) > 0; pass++)
+			;
+		check(ps_forkmeta_snapshot_gc_temporary(directory) == 0,
+				  "repeated bounded temporary cleanup drains the backlog");
+	}
 	{
 		char temp[1200];
 		char near_final[1200];

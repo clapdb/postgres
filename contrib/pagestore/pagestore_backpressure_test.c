@@ -906,6 +906,29 @@ test_forkmeta_backpressure_observer(void)
 			metrics.forkmeta_backpressure.throttled == 0 &&
 			ps_test_forkmeta_serviceable_work_due() != 0,
 			"only immediately GC-serviceable debris counts without a cutoff");
+	ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									 &cutover_attempts);
+	check(ps_core_maintenance() == 1 && access(temporary, F_OK) != 0,
+				"temp-only GC runs without forcing a below-threshold cutover");
+	ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+	ps_backpressure_refresh();
+	check(cutover_attempts.calls == 0,
+				"below-threshold serviceable lag does not force snapshot publication");
+	check(metrics.forkmeta_backpressure.lag_bytes == 0,
+				"bounded temp GC clears serviceable lag below the snapshot threshold");
+	check(write_test_file(temporary, 7),
+				"recreate temporary debris for GC fsync ambiguity");
+	ps_backpressure_refresh();
+	check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
+			ps_core_maintenance() == 0 && access(temporary, F_OK) != 0 &&
+			unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
+				"temp GC keeps a pending retry after post-unlink fsync ambiguity");
+	ps_test_forkmeta_snapshot_gc_retry_now();
+	check(ps_core_maintenance() == 0,
+				"temp GC retry reconciles the empty directory after ambiguity");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == 0,
+				"temp GC retry clears reconciled serviceable debt");
 	check(ps_backpressure_try_admit_mask(&stop, PS_BACKPRESSURE_FORKMETA,
 										 &causes) == 1 && causes == 0,
 							"cutoff-dependent debris does not defer admission");
@@ -976,6 +999,9 @@ test_forkmeta_self_recovery(void)
 {
 	char store[] = "/tmp/pagestore-forkmeta-self-recovery-XXXXXX";
 	char manifest[1200];
+	char snapshots[1200];
+	char old_checkpoint[1200];
+	char old_tail[1200];
 	char source[1200];
 	struct stat source_before;
 	struct stat source_after;
@@ -992,6 +1018,7 @@ test_forkmeta_self_recovery(void)
 	uint64_t branch_throttle_enters;
 	int did = 0;
 	int reopen_rc;
+	uint64_t selected_generation = 0;
 
 	configure_page_core();
 	compact_layers = 0;
@@ -1174,6 +1201,50 @@ test_forkmeta_self_recovery(void)
 	}
 	check(did && metrics.forkmeta_backpressure.throttled == 0,
 			"new timeline forkmeta debt remains serviceable after frontier cutover");
+	{
+		PsForkmetaSnapshot selected;
+		int selected_open = -1;
+
+		check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots",
+					   store) >= 0 &&
+				(selected_open = ps_forkmeta_snapshot_open(&selected, snapshots)) == 0 &&
+				selected.generation > 1,
+				"open the selected snapshot for canonical GC ambiguity");
+		if (selected_open == 0)
+		{
+			selected_generation = selected.generation;
+			ps_forkmeta_snapshot_close(&selected);
+		}
+	}
+	if (selected_generation > 1)
+	{
+		uint64_t old_generation = selected_generation - 1;
+
+		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
+					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  snprintf(old_tail, sizeof(old_tail),
+					   "%s/forkmeta_tail_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  write_test_file(old_checkpoint, 11) &&
+				  write_test_file(old_tail, 13),
+				  "create canonical generation debris for ambiguity retry");
+		ps_backpressure_refresh();
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
+				  ps_core_maintenance() == 0 &&
+				  access(old_checkpoint, F_OK) != 0 &&
+				  access(old_tail, F_OK) != 0 &&
+				  ps_test_forkmeta_canonical_gc_ambiguous() != 0 &&
+				  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
+				  "canonical GC retains pending ambiguity after post-unlink fsync fault");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		check(ps_core_maintenance() == 0 &&
+				  ps_test_forkmeta_canonical_gc_ambiguous() == 0,
+				  "canonical GC empty retry closes directory-fsync ambiguity");
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes == 0,
+				  "canonical GC retry reconciles physical debt");
+	}
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();

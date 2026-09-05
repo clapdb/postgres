@@ -67,8 +67,13 @@ typedef struct PsForkmetaSnapshotReclaimObservation
 {
 	uint64_t bytes;
 	uint64_t gc_serviceable_bytes;
+	uint64_t gc_temp_bytes;
+	uint64_t gc_canonical_bytes;
 	uint64_t cutoff_dependent_bytes;
 	uint64_t source_debt_bytes;
+	/* The bounded observer saw more recognized temporary debris than it can
+	 * account in one pass.  This is executable GC work, not an unknown error. */
+	int gc_serviceable_overflow;
 } PsForkmetaSnapshotReclaimObservation;
 
 typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
@@ -172,6 +177,10 @@ extern int ps_forkmeta_snapshot_read_tail(
  * durable-prepared generations.  Every call fsyncs the directory, including
  * an empty retry after an ambiguous prior unlink fsync. */
 extern int ps_forkmeta_snapshot_gc(const char *directory);
+/* Remove a bounded batch of recognized temporary debris without requiring a
+ * selected manifest.  Canonical manifests/parts and durable prepared intent
+ * are never removed by this path. */
+extern int ps_forkmeta_snapshot_gc_temporary(const char *directory);
 #define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
 /* Metadata-only physical debt scan.  The source baseline growth is charged
  * only when source_debt_enabled is nonzero; when it is zero, source bytes are

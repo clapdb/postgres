@@ -210,8 +210,9 @@ extern int ps_test_wal_reclaim_maintenance(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,
 	uint64_t lsn);
-/* Test-only scheduling seam for a pending forkmeta snapshot GC retry. */
+/* Test-only scheduling seam for pending forkmeta GC/snapshot retries. */
 extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
+extern int ps_test_forkmeta_canonical_gc_ambiguous(void);
 
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);

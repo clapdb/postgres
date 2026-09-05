@@ -266,6 +266,9 @@ static uint64_t forkmeta_observation_count;
  * Errors may require fail-closed admission while providing no safe work for
  * snapshot/GC forcing. */
 static unsigned char fork_meta_serviceable_work_due;
+/* A subset of serviceable work that can be executed by temp-only GC, even
+ * before a selected snapshot exists. */
+static unsigned char fork_meta_gc_serviceable_work_due;
 static unsigned char fork_meta_observation_error;
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
@@ -786,6 +789,7 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&forkmeta_observation_count, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	pthread_mutex_lock(&backpressure_lock);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
@@ -5665,6 +5669,12 @@ static uint64_t fork_meta_snapshot_bytes;
 static PsForkmetaSnapshotPart fork_meta_snapshot_checkpoint_meta;
 static PsForkmetaSnapshotPart fork_meta_snapshot_tail_meta;
 static int fork_meta_snapshot_gc_pending;
+static int fork_meta_temp_gc_pending;
+static int fork_meta_temp_gc_ambiguous;
+static struct timespec fork_meta_temp_gc_retry_at;
+static int fork_meta_canonical_gc_pending;
+static int fork_meta_canonical_gc_ambiguous;
+static struct timespec fork_meta_canonical_gc_retry_at;
 /* A successful deletion-filtered cutover is sufficient for this process.  The
  * selected snapshot/source pair remains authoritative after restart, while
  * this transient fence prevents an idle maintenance loop from publishing the
@@ -5740,6 +5750,7 @@ forkmeta_reclaim_lag_bytes(void)
 	uint64_t source_baseline;
 
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 1, __ATOMIC_RELEASE);
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
@@ -5779,6 +5790,7 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	if (source_debt_enabled && !fork_meta_source_cutoff_provable())
 	{
+		source_debt_enabled = 0;
 		scan_rc = ps_forkmeta_snapshot_reclaim_observation(
 										 fork_meta_snapshot_dir,
 										 wal_segment_root,
@@ -5795,8 +5807,38 @@ forkmeta_reclaim_lag_bytes(void)
 		serviceable_lag = UINT64_MAX;
 	else
 		serviceable_lag += observation.source_debt_bytes;
+	if (source_debt_enabled)
+	{
+		if (UINT64_MAX - serviceable_lag < observation.cutoff_dependent_bytes)
+			serviceable_lag = UINT64_MAX;
+		else
+			serviceable_lag += observation.cutoff_dependent_bytes;
+	}
 	__atomic_store_n(&fork_meta_serviceable_work_due,
-					 serviceable_lag != 0, __ATOMIC_RELEASE);
+					 serviceable_lag != 0 || observation.gc_serviceable_overflow,
+					 __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_gc_serviceable_work_due,
+					 observation.gc_temp_bytes != 0 ||
+					 observation.gc_serviceable_overflow,
+					 __ATOMIC_RELEASE);
+	if (observation.gc_temp_bytes != 0 || observation.gc_serviceable_overflow)
+	{
+		fork_meta_temp_gc_pending = 1;
+		if (!fork_meta_temp_gc_ambiguous)
+			memset(&fork_meta_temp_gc_retry_at, 0,
+				   sizeof(fork_meta_temp_gc_retry_at));
+	}
+	else if (!fork_meta_temp_gc_ambiguous)
+		fork_meta_temp_gc_pending = 0;
+	if (observation.gc_canonical_bytes != 0)
+	{
+		fork_meta_canonical_gc_pending = 1;
+		if (!fork_meta_canonical_gc_ambiguous)
+			memset(&fork_meta_canonical_gc_retry_at, 0,
+				   sizeof(fork_meta_canonical_gc_retry_at));
+	}
+	else if (!fork_meta_canonical_gc_ambiguous)
+		fork_meta_canonical_gc_pending = 0;
 	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	ps_admission_write_unlock();
 	return serviceable_lag;
@@ -5807,6 +5849,17 @@ void
 ps_test_forkmeta_snapshot_gc_retry_now(void)
 {
 	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
+	memset(&fork_meta_temp_gc_retry_at, 0,
+		   sizeof(fork_meta_temp_gc_retry_at));
+	memset(&fork_meta_canonical_gc_retry_at, 0,
+		   sizeof(fork_meta_canonical_gc_retry_at));
+}
+
+int
+ps_test_forkmeta_canonical_gc_ambiguous(void)
+{
+	return fork_meta_canonical_gc_pending &&
+		fork_meta_canonical_gc_ambiguous;
 }
 
 typedef struct ForkMetaByteVec
@@ -6992,14 +7045,33 @@ fail_entry:
 }
 
 static int
-fork_meta_snapshot_retry_due(void)
+fork_meta_retry_due_at(const struct timespec *retry_at)
 {
 	struct timespec now;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	return now.tv_sec > fork_meta_snapshot_retry_at.tv_sec ||
-		(now.tv_sec == fork_meta_snapshot_retry_at.tv_sec &&
-		 now.tv_nsec >= fork_meta_snapshot_retry_at.tv_nsec);
+	return now.tv_sec > retry_at->tv_sec ||
+		(now.tv_sec == retry_at->tv_sec && now.tv_nsec >= retry_at->tv_nsec);
+}
+
+static int
+fork_meta_snapshot_retry_due(void)
+{
+	return fork_meta_retry_due_at(&fork_meta_snapshot_retry_at);
+}
+
+static int
+fork_meta_temp_gc_due(void)
+{
+	return fork_meta_temp_gc_pending &&
+		fork_meta_retry_due_at(&fork_meta_temp_gc_retry_at);
+}
+
+static int
+fork_meta_canonical_gc_due(void)
+{
+	return fork_meta_canonical_gc_pending &&
+		fork_meta_retry_due_at(&fork_meta_canonical_gc_retry_at);
 }
 
 static int
@@ -7030,7 +7102,9 @@ fork_meta_snapshot_due_locked(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE) ||
+		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
+		((fork_meta_backpressure_throttled() &&
+		  __atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
 		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
 		  fork_meta_bytes_load() >= threshold) ||
 		 fork_meta_deletion_cutover_due_locked());
@@ -7051,7 +7125,9 @@ fork_meta_snapshot_due(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE) ||
+		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
+		((fork_meta_backpressure_throttled() &&
+		  __atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
 		 (!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
 		  fork_meta_bytes_load() >= threshold) ||
 		 fork_meta_deletion_probe_due());
@@ -14918,6 +14994,53 @@ ps_core_maintenance_impl(void)
 		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
+	if (fork_meta_temp_gc_pending)
+	{
+		int gc;
+
+		if (!fork_meta_temp_gc_due())
+			return 0;
+		gc = ps_forkmeta_snapshot_gc_temporary(fork_meta_snapshot_dir);
+		if (gc >= 0)
+		{
+			fork_meta_temp_gc_pending = 0;
+			fork_meta_temp_gc_ambiguous = 0;
+			memset(&fork_meta_temp_gc_retry_at, 0,
+				   sizeof(fork_meta_temp_gc_retry_at));
+			if (gc > 0)
+				return 1;
+		}
+		else
+		{
+			fork_meta_temp_gc_ambiguous =
+				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+			clock_gettime(CLOCK_MONOTONIC, &fork_meta_temp_gc_retry_at);
+			fork_meta_temp_gc_retry_at.tv_sec++;
+			return 0;
+		}
+	}
+	if (fork_meta_canonical_gc_pending)
+	{
+		int gc;
+
+		if (!fork_meta_canonical_gc_due())
+			return 0;
+		gc = ps_forkmeta_snapshot_gc(fork_meta_snapshot_dir);
+		if (gc >= 0)
+		{
+			fork_meta_canonical_gc_pending = 0;
+			fork_meta_canonical_gc_ambiguous = 0;
+			memset(&fork_meta_canonical_gc_retry_at, 0,
+				   sizeof(fork_meta_canonical_gc_retry_at));
+			if (gc > 0)
+				return 1;
+		}
+		fork_meta_canonical_gc_ambiguous =
+			gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+		clock_gettime(CLOCK_MONOTONIC, &fork_meta_canonical_gc_retry_at);
+		fork_meta_canonical_gc_retry_at.tv_sec++;
+		return 0;
+	}
 	if (fork_meta_snapshot_gc_due() || fork_meta_snapshot_due())
 	{
 		int snapshot_rc;
@@ -15213,8 +15336,17 @@ ps_core_open(const char *store_dir)
 	fork_meta_irreducible_prefix_bytes = 0;
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
+	fork_meta_temp_gc_pending = 0;
+	fork_meta_temp_gc_ambiguous = 0;
+	memset(&fork_meta_temp_gc_retry_at, 0,
+		   sizeof(fork_meta_temp_gc_retry_at));
+	fork_meta_canonical_gc_pending = 0;
+	fork_meta_canonical_gc_ambiguous = 0;
+	memset(&fork_meta_canonical_gc_retry_at, 0,
+		   sizeof(fork_meta_canonical_gc_retry_at));
 	fork_meta_snapshot_gc_ambiguous = 0;
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
 	memset(fork_meta_deletion_cutover_done, 0,
 		   sizeof(fork_meta_deletion_cutover_done));

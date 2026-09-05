@@ -1631,6 +1631,7 @@ cleanup:
 
 #define FORKMETA_OBSERVATION_MAX_ENTRIES 4096U
 #define FORKMETA_OBSERVATION_RETRIES 3U
+#define FORKMETA_TEMP_GC_BATCH 128U
 
 typedef struct ForkmetaObservationIdentity
 {
@@ -1804,17 +1805,23 @@ static int
 forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 												uint64_t prepared_generation,
 												uint64_t *gc_debt_out,
-												uint64_t *cutoff_debt_out)
+												uint64_t *gc_temp_out,
+												uint64_t *gc_canonical_out,
+												uint64_t *cutoff_debt_out,
+												int *gc_overflow_out)
 {
 	struct dirent *entry;
 	DIR *dir = NULL;
 	int scan_fd = -1;
 	uint64_t gc_total = 0;
+	uint64_t gc_temp = 0;
+	uint64_t gc_canonical = 0;
 	uint64_t cutoff_total = 0;
 	unsigned int nentries = 0;
 	unsigned char selected_seen[2] = {0, 0};
 	unsigned char prepared_seen[2] = {0, 0};
 	int rc = -1;
+	int gc_overflow = 0;
 
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
@@ -1831,8 +1838,6 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 		int is_temp;
 		struct stat st;
 
-		if (++nentries > FORKMETA_OBSERVATION_MAX_ENTRIES)
-			goto cleanup;
 		if (strcmp(entry->d_name, ".") == 0 ||
 			strcmp(entry->d_name, "..") == 0 ||
 			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0)
@@ -1870,6 +1875,16 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 		}
 		if (!is_canonical && !is_temp)
 			goto cleanup;
+		if (++nentries > FORKMETA_OBSERVATION_MAX_ENTRIES)
+		{
+			/* A recognized temporary is still executable cleanup work.  Keep
+			 * this observation successful, but let the controller run the
+			 * bounded temp-GC path until the directory is below the cap.  Any
+			 * unrecognized entry remains an observation error.  Canonical
+			 * entries still have to be validated and classified. */
+			if (is_temp)
+				gc_overflow = 1;
+		}
 		if (fstatat(directory_fd, entry->d_name, &st,
 						 AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
 			st.st_size < 0)
@@ -1903,9 +1918,17 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 		 * intent temp.  Canonical generations older than the selected authority
 		 * are also immediately removable; all other canonical residue needs a
 		 * newer safe snapshot/cutoff first. */
-		if (is_temp || (is_canonical && selected_generation != 0 &&
-								 generation < selected_generation))
+		if (is_temp)
+		{
 			forkmeta_add_bytes(&gc_total, bytes);
+			forkmeta_add_bytes(&gc_temp, bytes);
+		}
+		else if (is_canonical && selected_generation != 0 &&
+				 generation < selected_generation)
+		{
+			forkmeta_add_bytes(&gc_total, bytes);
+			forkmeta_add_bytes(&gc_canonical, bytes);
+		}
 		else
 			forkmeta_add_bytes(&cutoff_total, bytes);
 	}
@@ -1925,7 +1948,13 @@ forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
 	if (prepared_generation != 0 && (!prepared_seen[0] || !prepared_seen[1]))
 		goto cleanup;
 	*gc_debt_out = gc_total;
+	if (gc_temp_out != NULL)
+		*gc_temp_out = gc_temp;
+	if (gc_canonical_out != NULL)
+		*gc_canonical_out = gc_canonical;
 	*cutoff_debt_out = cutoff_total;
+	if (gc_overflow_out != NULL)
+		*gc_overflow_out = gc_overflow;
 	rc = 0;
 
 cleanup:
@@ -1933,6 +1962,115 @@ cleanup:
 		(void) closedir(dir);
 	else if (scan_fd >= 0)
 		(void) close(scan_fd);
+	return rc;
+}
+
+/* Remove only recognized temporary files.  This path is intentionally
+ * independent of the selected manifest: an interrupted first publication can
+ * leave executable debris before any manifest exists.  It removes a bounded
+ * batch so a large valid-temp backlog cannot monopolize maintenance. */
+int
+ps_forkmeta_snapshot_gc_temporary(const char *directory)
+{
+	struct dirent *entry;
+	char names[FORKMETA_TEMP_GC_BATCH][256];
+	DIR *dir = NULL;
+	int directory_fd = -1;
+	int scan_fd = -1;
+	int removed = 0;
+	int unlink_failed = 0;
+	int rc = -1;
+	size_t count = 0;
+
+	if (directory == NULL)
+		return -1;
+	directory_fd = open_directory(directory, 0);
+	if (directory_fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		int temp_status;
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
+			continue;
+		temp_status = parse_temp_name(entry->d_name);
+		if (temp_status != 0)
+		{
+			/* A near-miss .tmp. name is not safe to ignore.  Canonical final
+			 * parts and unrelated names are not owned by this cleanup path. */
+			if (strstr(entry->d_name, ".tmp.") != NULL)
+				goto cleanup;
+			continue;
+		}
+		if (snapshot_gc_entry_regular(directory_fd, entry->d_name) != 1)
+			goto cleanup;
+		if (count < FORKMETA_TEMP_GC_BATCH)
+		{
+			if (strlen(entry->d_name) >= sizeof(names[0]))
+				goto cleanup;
+			memcpy(names[count++], entry->d_name,
+				   strlen(entry->d_name) + 1);
+		}
+	}
+	{
+		int scan_errno = errno;
+		int close_rc = closedir(dir);
+
+		dir = NULL;
+		if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") != NULL)
+			close_rc = -1;
+		if (scan_errno != 0 || close_rc != 0)
+			goto cleanup;
+	}
+	for (size_t i = 0; i < count; i++)
+	{
+		int regular = snapshot_gc_entry_regular(directory_fd, names[i]);
+
+		if (regular < 0)
+		{
+			unlink_failed = 1;
+			continue;
+		}
+		if (regular == 0)
+			continue;
+		if (unlinkat(directory_fd, names[i], 0) != 0)
+		{
+			if (errno != ENOENT)
+				unlink_failed = 1;
+		}
+		else
+			removed = 1;
+	}
+	if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != NULL)
+	{
+		if (removed)
+			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+		goto cleanup;
+	}
+	if (fsync(directory_fd) != 0)
+	{
+		unlink_failed = 1;
+		if (removed)
+			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+	}
+	if (!unlink_failed)
+		rc = removed ? 1 : 0;
+
+cleanup:
+	if (dir != NULL)
+		(void) closedir(dir);
+	else if (scan_fd >= 0)
+		(void) close(scan_fd);
+	if (directory_fd >= 0)
+		(void) close(directory_fd);
 	return rc;
 }
 
@@ -1958,8 +2096,11 @@ ps_forkmeta_snapshot_reclaim_observation(const char *directory,
 	ForkmetaObservationIdentity selected_parts_before[2], selected_parts_after[2];
 	ForkmetaObservationIdentity prepared_parts_before[2], prepared_parts_after[2];
 	uint64_t gc_debt;
+	uint64_t gc_temp;
+	uint64_t gc_canonical;
 	uint64_t cutoff_debt;
 	uint64_t source_debt;
+	int gc_overflow;
 	int source_fd = -1;
 	int snapshot_fd = -1;
 	int selected_present_before;
@@ -2048,10 +2189,13 @@ ps_forkmeta_snapshot_reclaim_observation(const char *directory,
 					forkmeta_snapshot_parts_identity(snapshot_fd, &prepared_before,
 															 prepared_parts_before) != 0) ||
 				forkmeta_snapshot_debt_scan(snapshot_fd, expected->generation,
-																		prepared_present_before ?
-																		prepared_before.generation : 0,
-																		&gc_debt,
-																		&cutoff_debt) != 0)
+															prepared_present_before ?
+															prepared_before.generation : 0,
+															&gc_debt,
+															&gc_temp,
+															&gc_canonical,
+															&cutoff_debt,
+															&gc_overflow) != 0)
 				goto fail;
 			if (observation_test_hook != NULL)
 				observation_test_hook(attempt, observation_test_hook_arg);
@@ -2100,7 +2244,10 @@ ps_forkmeta_snapshot_reclaim_observation(const char *directory,
 			selected_present_before = selected_present_after = 0;
 			prepared_present_before = prepared_present_after = 0;
 			gc_debt = 0;
+			gc_temp = 0;
+			gc_canonical = 0;
 			cutoff_debt = 0;
+			gc_overflow = 0;
 		}
 		if (forkmeta_identity_at(source_fd, "forkmeta", &source_after) != 0 ||
 			forkmeta_directory_identity(source_fd, &source_dir_after) != 0 ||
@@ -2147,7 +2294,10 @@ ps_forkmeta_snapshot_reclaim_observation(const char *directory,
 		}
 		observation->source_debt_bytes = source_debt;
 		observation->gc_serviceable_bytes = gc_debt;
+		observation->gc_temp_bytes = gc_temp;
+		observation->gc_canonical_bytes = gc_canonical;
 		observation->cutoff_dependent_bytes = cutoff_debt;
+		observation->gc_serviceable_overflow = gc_overflow;
 		observation->bytes = source_debt;
 		forkmeta_add_bytes(&observation->bytes,
 						   observation->gc_serviceable_bytes);
