@@ -373,6 +373,9 @@ INSPECTION_RESPONSES = {
         "walidx_lag_bytes", "walidx_high_water_bytes", "walidx_catchup_bytes",
         "walidx_throttled", "walidx_throttle_enters", "walidx_throttle_exits",
         "walidx_foreground_wait_ns",
+        "forkmeta_lag_bytes", "forkmeta_high_water_bytes", "forkmeta_catchup_bytes",
+        "forkmeta_throttled", "forkmeta_throttle_enters", "forkmeta_throttle_exits",
+        "forkmeta_foreground_wait_ns",
     },
     "pruning": {
         "compactions", "versions_scanned", "versions_kept", "versions_deleted",

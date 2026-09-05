@@ -1350,6 +1350,9 @@ main(void)
 		  "post-cutover append follows marker exactly once");
 	close_runtime();
 	check(ps_core_open(store) == 0, "reopen selected forkmeta epoch");
+	/* A successful pending-GC resolution reports one maintenance unit and
+	 * intentionally does not fall through to a new snapshot in the same tick. */
+	(void) ps_core_maintenance();
 	check(read_resolve(0, &page_key, 0, UINT64_MAX, 0, page, NULL) == 1,
 		  "page state remains readable after snapshot reopen");
 	check(read_resolve(0, &page_key, 1, UINT64_MAX, 0, page, NULL) == 1,
@@ -1474,6 +1477,7 @@ main(void)
 	check(setenv("PAGESTORE_TEST_FAIL_FORK_META_APPEND_AT", "1", 1) == 0 &&
 		  ps_core_open(store) == 0,
 		  "reopen with ordered marker append failure armed");
+	(void) ps_core_maintenance();
 	check(append_relation_tag(&boundary_key, 0, 199, page, 0xa5, NULL) != 0,
 		  "complete ordered body fails when its bound marker append fails");
 	check(append_relation_tag(&page_key, 0, 600, page, 0x33, NULL) == 0,
@@ -1489,6 +1493,7 @@ main(void)
 		  read_resolve(0, &boundary_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0,
 		  "restart skips failed post-cutover ordered body above prior freeze");
+	(void) ps_core_maintenance();
 	check(append_relation_tag(&boundary_key, 0, 199, page, 0x5a, NULL) == 0,
 		  "fresh process resumes ordered marker publication safely");
 	close_runtime();
@@ -1496,6 +1501,7 @@ main(void)
 		  read_resolve(0, &boundary_key, 0, UINT64_MAX, 0, page, NULL) == 1 &&
 		  page[128] == 0x5a,
 		  "successfully marked ordered page survives the following restart");
+	(void) ps_core_maintenance();
 
 	check(append_growth_batch(1000, 600),
 		  "append source suffix for manifest-before-rename fault");
@@ -1511,6 +1517,7 @@ main(void)
 	close_runtime();
 	check(ps_core_open(store) == 0,
 		  "restart aborts non-surviving manifest intent");
+	(void) ps_core_maintenance();
 	check(ps_forkmeta_snapshot_read_prepared(snapshots, &stale) == 0,
 		  "non-surviving manifest intent is no liveness blocker");
 
@@ -1528,6 +1535,7 @@ main(void)
 	close_runtime();
 	check(ps_core_open(store) == 0 && source_is_marker_only(store, &marker),
 		  "restart selects survived manifest and replaces the old epoch");
+	(void) ps_core_maintenance();
 	check(ps_forkmeta_snapshot_read_prepared(snapshots, &stale) == 0,
 		  "matching selected intent is finalized on restart");
 
@@ -1535,6 +1543,7 @@ main(void)
 	check(setenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME", "1", 1) == 0 &&
 		  ps_core_open(store) == 0,
 		  "open with source rewrite before-rename fault armed");
+	(void) ps_core_maintenance();
 	check(append_growth_batch(1400, 1000),
 		  "append source suffix for rewrite-before-rename fault");
 	source_before_fault = file_size(source);
@@ -1546,11 +1555,13 @@ main(void)
 	unsetenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_BEFORE_RENAME");
 	check(ps_core_open(store) == 0 && source_is_marker_only(store, &marker),
 		  "restart reconciles selected manifest after pre-rename rewrite failure");
+	(void) ps_core_maintenance();
 
 	close_runtime();
 	check(setenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC", "1", 1) == 0 &&
 		  ps_core_open(store) == 0,
 		  "open with source rewrite post-rename fault armed");
+	(void) ps_core_maintenance();
 	check(append_growth_batch(1600, 1200),
 		  "append source suffix for rewrite-post-rename fault");
 	(void) ps_core_maintenance();
@@ -1561,6 +1572,7 @@ main(void)
 	unsetenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
 	check(ps_core_open(store) == 0 && source_is_marker_only(store, &marker),
 		  "restart reconciles post-rename source ambiguity deterministically");
+	(void) ps_core_maintenance();
 	close_runtime();
 	{
 		TestForkMetaRecV2 valid = marker;

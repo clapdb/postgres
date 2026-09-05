@@ -2591,6 +2591,42 @@ posix_fork_meta_truncate(uint64_t len)
 }
 
 static int
+posix_fork_meta_size(uint64_t *len)
+{
+	char path[4096];
+	struct stat st;
+	int n;
+
+	if (len == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	n = snprintf(path, sizeof(path), "%s/forkmeta", posix_dir);
+	if (n < 0 || (size_t) n >= sizeof(path))
+	{
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (stat(path, &st) != 0)
+	{
+		if (errno == ENOENT)
+		{
+			*len = 0;
+			return 0;
+		}
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size < 0)
+	{
+		errno = EIO;
+		return -1;
+	}
+	*len = (uint64_t) st.st_size;
+	return 0;
+}
+
+static int
 posix_fork_meta_rewrite(const void *buf, uint32_t len)
 {
 	char path[4096], tmp[4096];
@@ -2688,5 +2724,6 @@ const PsStorage PsStoragePosix = {
 	.fork_meta_append = posix_fork_meta_append,
 	.fork_meta_read = posix_fork_meta_read,
 	.fork_meta_truncate = posix_fork_meta_truncate,
+	.fork_meta_size = posix_fork_meta_size,
 	.fork_meta_rewrite = posix_fork_meta_rewrite,
 };

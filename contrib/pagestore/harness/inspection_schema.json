@@ -22,7 +22,7 @@
       "response": ["retained_horizons", "queue_length", "completed_phase"]
     },
     "backpressure": {
-      "response": ["idle", "claimed", "request", "done", "shards", "wal_index_pending_bytes", "wal_index_lagging_timelines", "page_lag_bytes", "page_high_water_bytes", "page_catchup_bytes", "page_throttled", "page_throttle_enters", "page_throttle_exits", "page_foreground_wait_ns", "wal_lag_bytes", "wal_high_water_bytes", "wal_catchup_bytes", "wal_throttled", "wal_throttle_enters", "wal_throttle_exits", "wal_foreground_wait_ns", "walidx_lag_bytes", "walidx_high_water_bytes", "walidx_catchup_bytes", "walidx_throttled", "walidx_throttle_enters", "walidx_throttle_exits", "walidx_foreground_wait_ns"]
+      "response": ["idle", "claimed", "request", "done", "shards", "wal_index_pending_bytes", "wal_index_lagging_timelines", "page_lag_bytes", "page_high_water_bytes", "page_catchup_bytes", "page_throttled", "page_throttle_enters", "page_throttle_exits", "page_foreground_wait_ns", "wal_lag_bytes", "wal_high_water_bytes", "wal_catchup_bytes", "wal_throttled", "wal_throttle_enters", "wal_throttle_exits", "wal_foreground_wait_ns", "walidx_lag_bytes", "walidx_high_water_bytes", "walidx_catchup_bytes", "walidx_throttled", "walidx_throttle_enters", "walidx_throttle_exits", "walidx_foreground_wait_ns", "forkmeta_lag_bytes", "forkmeta_high_water_bytes", "forkmeta_catchup_bytes", "forkmeta_throttled", "forkmeta_throttle_enters", "forkmeta_throttle_exits", "forkmeta_foreground_wait_ns"]
     },
     "pruning": {
       "response": ["compactions", "versions_scanned", "versions_kept", "versions_deleted"]
