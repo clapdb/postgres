@@ -30,6 +30,7 @@ static int append_test_walidx_tail(uint32_t timeline, uint64_t progress);
 static int append_test_walidx_identity(uint32_t timeline);
 static int test_path_suffix(char *path, size_t path_size, const char *base,
 						const char *suffix);
+static void wait_flag(volatile int *flag);
 
 typedef struct WalIdxObservationRetryTest
 {
@@ -200,6 +201,50 @@ static void
 remove_forkmeta_source(void *arg)
 {
 	(void) unlink((const char *) arg);
+}
+
+typedef struct ForkmetaRuntimeEnableRace
+{
+	volatile int baseline_entered;
+	volatile int release_baseline;
+	volatile int close_started;
+	volatile int close_completed;
+	int configure_rc;
+} ForkmetaRuntimeEnableRace;
+
+static void
+block_forkmeta_baseline_init(void *arg)
+{
+	ForkmetaRuntimeEnableRace *race = arg;
+
+	__atomic_store_n(&race->baseline_entered, 1, __ATOMIC_RELEASE);
+	while (!__atomic_load_n(&race->release_baseline, __ATOMIC_ACQUIRE))
+		sched_yield();
+}
+
+static void *
+enable_forkmeta_runtime(void *arg)
+{
+	ForkmetaRuntimeEnableRace *race = arg;
+
+	race->configure_rc = ps_backpressure_configure_all_with_forkmeta(
+		0, 0, 0, 0, 0, 0, 128, 20);
+	return NULL;
+}
+
+static void *
+close_forkmeta_runtime(void *arg)
+{
+	ForkmetaRuntimeEnableRace *race = arg;
+
+	__atomic_store_n(&race->close_started, 1, __ATOMIC_RELEASE);
+	/* The core-state mutex must keep this real close behind the complete
+	 * baseline/configuration transaction; no lifecycle writer is acquired here
+	 * because close drains internal workers before returning. */
+	ps_core_close();
+	ps_storage->close();
+	__atomic_store_n(&race->close_completed, 1, __ATOMIC_RELEASE);
+	return NULL;
 }
 
 static void
@@ -873,6 +918,167 @@ test_path_suffix(char *path, size_t path_size, const char *base,
 }
 
 static void
+test_forkmeta_runtime_enable_and_symlink_root(void)
+{
+	char store[] = "/tmp/pagestore-forkmeta-runtime-enable-XXXXXX";
+	char symlink_root[] = "/tmp/pagestore-forkmeta-symlink-XXXXXX";
+	char target_a[1024];
+	char target_b[1024];
+	char link_path[1024];
+	char replacement_link[1024];
+	char source_a[1200];
+	char source_b[1200];
+	struct stat before;
+	struct stat after;
+	PsShmHeader metrics;
+	PsChannel channel;
+	ForkmetaRuntimeEnableRace race;
+	pthread_t configure_thread;
+	pthread_t close_thread;
+	int have_configure_thread = 0;
+	int have_close_thread = 0;
+	int opened = 0;
+	int rc;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0 &&
+			mkdtemp(store) != NULL && (opened = ps_core_open(store) == 0),
+			"open with forkmeta observation disabled");
+	if (opened)
+	{
+		ps_core_set_metrics_header(&metrics);
+		memset(&race, 0, sizeof(race));
+		race.configure_rc = -1;
+		ps_test_set_forkmeta_baseline_init_hook(block_forkmeta_baseline_init,
+										 &race);
+		rc = pthread_create(&configure_thread, NULL, enable_forkmeta_runtime,
+						&race);
+		have_configure_thread = rc == 0;
+		check(rc == 0, "start runtime forkmeta enable");
+		if (have_configure_thread)
+			wait_flag(&race.baseline_entered);
+		check(__atomic_load_n(&race.baseline_entered, __ATOMIC_ACQUIRE) != 0,
+				"runtime forkmeta enable reaches baseline initialization");
+		if (__atomic_load_n(&race.baseline_entered, __ATOMIC_ACQUIRE))
+		{
+			rc = pthread_create(&close_thread, NULL,
+							close_forkmeta_runtime, &race);
+			have_close_thread = rc == 0;
+			check(rc == 0, "start close/reopen during runtime enable");
+			if (have_close_thread)
+				wait_flag(&race.close_started);
+			check(__atomic_load_n(&race.close_started, __ATOMIC_ACQUIRE) != 0,
+					"close/reopen reaches the core-state mutex");
+			usleep(20000);
+			check(__atomic_load_n(&race.close_completed, __ATOMIC_ACQUIRE) == 0,
+					"runtime baseline holds close behind the configuration transaction");
+			check(ps_load_acquire_u64(
+					&metrics.forkmeta_backpressure.high_water_bytes) == 0,
+					"forkmeta threshold is not published before its baseline completes");
+		}
+		__atomic_store_n(&race.release_baseline, 1, __ATOMIC_RELEASE);
+		if (have_configure_thread)
+			pthread_join(configure_thread, NULL);
+		if (have_close_thread)
+			pthread_join(close_thread, NULL);
+		ps_test_set_forkmeta_baseline_init_hook(NULL, NULL);
+		check(race.configure_rc == 0,
+				"runtime forkmeta enable establishes its baseline");
+		check(!have_close_thread ||
+				__atomic_load_n(&race.close_completed, __ATOMIC_ACQUIRE) != 0,
+				"close/reopen proceeds after configuration publish");
+		if (have_close_thread &&
+			__atomic_load_n(&race.close_completed, __ATOMIC_ACQUIRE))
+		{
+			check(ps_core_open(store) == 0,
+					"reopen after the fenced runtime-enable close");
+			ps_core_set_metrics_header(&metrics);
+			ps_backpressure_refresh();
+			check(metrics.forkmeta_backpressure.lag_bytes != UINT64_MAX &&
+					metrics.forkmeta_backpressure.throttled == 0,
+					"reopened runtime-enabled forkmeta observation remains finite");
+		}
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes != UINT64_MAX &&
+				metrics.forkmeta_backpressure.throttled == 0,
+				"runtime-enabled forkmeta observation is finite and unthrottled");
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+				128, 20) == 0,
+				"repeated runtime forkmeta configuration remains idempotent");
+		ps_core_set_metrics_header(NULL);
+		ps_core_close();
+		ps_storage->close();
+	}
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+			"disable forkmeta observation after runtime-enable test");
+	remove_tree(store);
+
+	opened = 0;
+	memset(&metrics, 0, sizeof(metrics));
+	check(mkdtemp(symlink_root) != NULL &&
+			snprintf(target_a, sizeof(target_a), "%s/store-a", symlink_root) >= 0 &&
+			snprintf(target_b, sizeof(target_b), "%s/store-b", symlink_root) >= 0 &&
+			snprintf(link_path, sizeof(link_path), "%s/store-link", symlink_root) >= 0 &&
+			snprintf(replacement_link, sizeof(replacement_link),
+					 "%s/store-link.next", symlink_root) >= 0 &&
+			snprintf(source_a, sizeof(source_a), "%s/forkmeta", target_a) >= 0 &&
+			snprintf(source_b, sizeof(source_b), "%s/forkmeta", target_b) >= 0 &&
+			mkdir(target_a, 0700) == 0 && mkdir(target_b, 0700) == 0 &&
+			symlink("store-a", link_path) == 0 &&
+			ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+				128, 20) == 0 && (opened = ps_core_open(link_path) == 0),
+			"open a forkmeta-enabled POSIX store through a symlink root");
+	if (opened)
+	{
+		ps_core_set_metrics_header(&metrics);
+		check(stat(source_a, &before) == 0 && access(source_b, F_OK) != 0,
+				"symlink-root open initializes only its canonical target");
+		check(symlink("store-b", replacement_link) == 0 &&
+				rename(replacement_link, link_path) == 0,
+				"atomically replace the caller's store-root symlink");
+		memset(&channel, 0, sizeof(channel));
+		channel.opcode = PS_OP_CREATE;
+		channel.timeline = 0;
+		channel.key = (PsKey) {77, 77, 77, 0, PS_KLASS_RELATION};
+		channel.req_lsn = 100;
+		check(ps_handle_meta(&channel) == 1 &&
+				channel.status == PS_STATUS_OK && stat(source_a, &after) == 0 &&
+				after.st_size > before.st_size && access(source_b, F_OK) != 0,
+				"backend and core stay on the opened target after symlink replacement");
+		memset(&channel, 0, sizeof(channel));
+		channel.opcode = PS_OP_EXISTS;
+		channel.timeline = 0;
+		channel.key = (PsKey) {77, 77, 77, 0, PS_KLASS_RELATION};
+		check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+				channel.result == 1,
+				"core reads forkmeta state from the original target after replacement");
+		{
+			uint64_t forkmeta_prefix;
+
+			check(ps_storage->fork_meta_read != NULL &&
+					ps_storage->fork_meta_read(0, &forkmeta_prefix,
+											 sizeof(forkmeta_prefix)) ==
+					(int) sizeof(forkmeta_prefix),
+					"backend reads forkmeta from the original target after replacement");
+		}
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes != UINT64_MAX &&
+				metrics.forkmeta_backpressure.throttled == 0,
+				"symlink-root forkmeta observation succeeds without weakening leaves");
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+				128, 20) == 0,
+				"repeated configure-after-open keeps the canonical root");
+		ps_core_set_metrics_header(NULL);
+		ps_core_close();
+		ps_storage->close();
+	}
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+			"disable forkmeta observation after symlink-root test");
+	remove_tree(symlink_root);
+}
+
+static void
 test_forkmeta_backpressure_observer(void)
 {
 	char store[] = "/tmp/pagestore-forkmeta-backpressure-XXXXXX";
@@ -1232,62 +1438,6 @@ test_forkmeta_self_recovery(void)
 		metrics.forkmeta_backpressure.lag_bytes <= 20 &&
 		metrics.forkmeta_backpressure.throttled == 0,
 		"maintenance publishes snapshot/GC and clears forkmeta throttle");
-	{
-		const uint64_t pin_seq_a = 1;
-		const uint64_t pin_seq_b = 2;
-		PsRetentionPin active_pin;
-		PsRetentionPin retained_pin;
-		PsChannel pin_channel;
-
-		/* Root compaction has advanced past LSN 1001.  Seed the already-active
-		 * reader fence that protects (1001, A), then verify that (1001, B) has no
-		 * independent frontier proof before exercising the owner exception. */
-		memset(&active_pin, 0, sizeof(active_pin));
-		active_pin.timeline = 0;
-		active_pin.owner_kind = PS_RETENTION_OWNER_READER;
-		active_pin.owner_id = 19003;
-		active_pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
-		active_pin.generation = 1;
-		active_pin.lsn = 1001;
-		active_pin.admission_seq = pin_seq_a;
-		check(ps_retention_set(&active_pin) == PS_RETENTION_OK,
-				"seed a lower same-LSN active page-history fence");
-		memset(&pin_channel, 0, sizeof(pin_channel));
-		pin_channel.opcode = PS_OP_EXISTS;
-		pin_channel.timeline = active_pin.timeline;
-		pin_channel.key = key;
-		pin_channel.req_lsn = active_pin.lsn;
-		pin_channel.req_seq = pin_seq_b;
-		pin_channel.status = PS_STATUS_OK;
-		check(ps_handle_meta(&pin_channel) == 1 &&
-				pin_channel.status == PS_STATUS_ERROR,
-				"newer same-LSN fence lacks independent frontier proof");
-		memset(&pin_channel, 0, sizeof(pin_channel));
-		pin_channel.opcode = PS_OP_RETENTION_PIN_SET;
-		pin_channel.timeline = active_pin.timeline;
-		pin_channel.blocknum = active_pin.owner_kind;
-		pin_channel.parent_timeline = active_pin.resources;
-		pin_channel.old_nblocks = active_pin.generation;
-		pin_channel.req_seq = active_pin.owner_id;
-		pin_channel.req_lsn = active_pin.lsn;
-		pin_channel.nblocks = (uint32_t) pin_seq_b;
-		pin_channel.status = PS_STATUS_OK;
-		check(ps_handle_meta(&pin_channel) == 1 &&
-				pin_channel.status == PS_STATUS_OK,
-				"active lower same-LSN fence permits sequence advancement");
-		pin_channel.nblocks = (uint32_t) pin_seq_a;
-		pin_channel.status = PS_STATUS_OK;
-		check(ps_handle_meta(&pin_channel) == 1 &&
-				pin_channel.status == PS_STATUS_ERROR &&
-				ps_retention_lookup(active_pin.timeline, active_pin.owner_kind,
-					active_pin.owner_id, &retained_pin) == 1 &&
-				retained_pin.lsn == active_pin.lsn &&
-				retained_pin.admission_seq == pin_seq_b,
-				"same-LSN sequence regression still requires frontier proof");
-		check(ps_retention_drop(active_pin.timeline, active_pin.owner_kind,
-				active_pin.owner_id, active_pin.generation) == PS_RETENTION_OK,
-				"drop the same-LSN advancement test owner");
-	}
 	/* The selected generation covers timeline 0, but not a new owner created
 	 * after that cutover.  Metadata-only churn on the new timeline must remain
 	 * admissible until that timeline has a real page-reclamation frontier. */
@@ -2635,6 +2785,7 @@ main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_forkmeta_runtime_enable_and_symlink_root();
 	test_forkmeta_backpressure_observer();
 	test_forkmeta_self_recovery();
 	test_walidx_append_tail_restart();

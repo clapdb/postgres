@@ -92,6 +92,10 @@ static uint64_t tier_upload_layer_cursor[PS_MAX_CHANNELS];
 static int tier_one_layer(void);
 static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
+static int core_opened;
+static int fork_meta_reclaim_baseline_init(void);
+static int ps_core_open_impl(const char *store_dir);
+static void ps_core_close_impl(void);
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static int refresh_remote_only_layer(const PsLayerDesc *layer);
 static int read_image_index_refreshing(const PsLayerDesc *layer,
@@ -195,6 +199,10 @@ static pthread_cond_t lifecycle_turnstile_cond = PTHREAD_COND_INITIALIZER;
 static uint32_t lifecycle_active_readers;
 static uint32_t lifecycle_waiting_writers;
 static int lifecycle_writer_active;
+/* Serialize complete open/close/configure state transitions.  The lock order
+ * is core_state -> lifecycle -> admission; keeping this outside the lifecycle
+ * gate lets close drain internal workers without upgrading a lifecycle read. */
+static pthread_mutex_t core_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t admission_lock = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_mutex_t admission_turnstile = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t admission_turnstile_cond = PTHREAD_COND_INITIALIZER;
@@ -780,6 +788,12 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 										uint64_t forkmeta_high_water,
 										uint64_t forkmeta_catchup)
 {
+	int baseline_locked = 0;
+	int lifecycle_locked = 0;
+	int rc = -1;
+
+	pthread_mutex_lock(&core_state_lock);
+
 	if ((page_high_water == 0 && page_catchup != 0) ||
 		(page_high_water != 0 && page_catchup >= page_high_water) ||
 		(page_high_water != 0 && !segment_gc_enabled) ||
@@ -791,7 +805,33 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 		(forkmeta_high_water != 0 && forkmeta_catchup >= forkmeta_high_water))
 	{
 		errno = EINVAL;
-		return -1;
+		goto out;
+	}
+	/* A runtime 0 -> enabled transition must establish its source baseline
+	 * before observations can charge pre-enable bytes.  Configure-before-open
+	 * remains handled by ps_core_open(), and non-POSIX backends retain their
+	 * scan-free startup/runtime behavior. */
+	if (forkmeta_reclaim_high_water_bytes == 0 && forkmeta_high_water != 0)
+	{
+		ps_lifecycle_read_lock();
+		lifecycle_locked = 1;
+		/* Recheck after lifecycle-rd: configure-before-open needs no baseline,
+		 * while an open POSIX core cannot close or reopen until configuration
+		 * releases this section. */
+		if (__atomic_load_n(&core_opened, __ATOMIC_ACQUIRE) &&
+			ps_storage != NULL && ps_storage->name != NULL &&
+			strcmp(ps_storage->name, "posix") == 0)
+		{
+			if (admission_write_lock() != 0)
+			{
+				goto out;
+			}
+			baseline_locked = 1;
+			if (fork_meta_reclaim_baseline_init() != 0)
+			{
+				goto out;
+			}
+		}
 	}
 	page_reclaim_high_water_bytes = page_high_water;
 	page_reclaim_catchup_bytes = page_catchup;
@@ -833,7 +873,15 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	__atomic_store_n(&backpressure_shutdown_requested, 0, __ATOMIC_RELEASE);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
-	return 0;
+	rc = 0;
+
+	out:
+	if (baseline_locked)
+		ps_admission_write_unlock();
+	if (lifecycle_locked)
+		ps_lifecycle_read_unlock();
+	pthread_mutex_unlock(&core_state_lock);
+	return rc;
 }
 
 int
@@ -14201,11 +14249,9 @@ ps_handle_meta(PsChannel *ch)
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
 							   (old_pin.lsn < pin.lsn ||
+								/* An exact retry cannot expose a new fence. */
 								(old_pin.lsn == pin.lsn &&
-								 /* Same-LSN advancement remains protected by the
-								  * owner's older lexicographic fence; equality is
-								  * an exact retry. */
-								 old_pin.admission_seq <= pin.admission_seq)))) ||
+								 old_pin.admission_seq == pin.admission_seq)))) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL) != 0 &&
 							 !wal_allowed) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
@@ -14453,6 +14499,14 @@ ps_handle_meta(PsChannel *ch)
 void
 ps_core_close(void)
 {
+	pthread_mutex_lock(&core_state_lock);
+	ps_core_close_impl();
+	pthread_mutex_unlock(&core_state_lock);
+}
+
+static void
+ps_core_close_impl(void)
+{
 	uint32_t	ns = core_shards();
 	int		join_gc = 0;
 	int		join_upload = 0;
@@ -14460,6 +14514,8 @@ ps_core_close(void)
 	int		evict_state;
 	struct timespec deadline;
 	int		join_rc;
+
+	__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
 
 	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0)
 	{
@@ -15549,9 +15605,26 @@ ps_core_maintenance(void)
 int
 ps_core_open(const char *store_dir)
 {
+	int rc;
+
+	pthread_mutex_lock(&core_state_lock);
+	rc = ps_core_open_impl(store_dir);
+	pthread_mutex_unlock(&core_state_lock);
+	return rc;
+}
+
+static int
+ps_core_open_impl(const char *store_dir)
+{
 	uint32_t	ns = core_shards();
 	int			publish_shard_count = 0;
+	int			path_len;
+	char		runtime_store_root[PATH_MAX];
+	char		next_wal_segment_root[sizeof(wal_segment_root)];
+	char		next_fork_meta_snapshot_dir[sizeof(fork_meta_snapshot_dir)];
+	const char *runtime_store_dir = store_dir;
 
+	__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
 	/* A test or embedding process may reopen without a fresh daemon.  Drop
@@ -15635,13 +15708,6 @@ ps_core_open(const char *store_dir)
 	memset(tier_upload_layer_cursor, 0, sizeof(tier_upload_layer_cursor));
 	__atomic_store_n(&gc_remote_state, 0, __ATOMIC_RELEASE);
 	gc_remote_layer_cursor = 0;
-	if (snprintf(wal_segment_root, sizeof(wal_segment_root), "%s", store_dir) < 0 ||
-		strlen(store_dir) >= sizeof(wal_segment_root))
-		return -1;
-	if (snprintf(fork_meta_snapshot_dir, sizeof(fork_meta_snapshot_dir),
-				 "%s/forkmeta_snapshots", store_dir) < 0 ||
-		strlen(fork_meta_snapshot_dir) >= sizeof(fork_meta_snapshot_dir))
-		return -1;
 	memset(wal_segment_store_opened, 0, sizeof(wal_segment_store_opened));
 	memset(walidx_progress, 0, sizeof(walidx_progress));
 	memset(walidx_progress_valid, 0, sizeof(walidx_progress_valid));
@@ -15676,16 +15742,42 @@ ps_core_open(const char *store_dir)
 	__atomic_store_n(&evict_local_state, 0, __ATOMIC_RELEASE);
 	evict_local_map_cursor = 0;
 
-	if (ps_storage->open(store_dir, segment_size) != 0)
+	/* POSIX creates the root before canonicalizing it, then every provider in
+	 * this open uses the same stable spelling.  Replacing the caller's symlink
+	 * later cannot split storage writes from core observations.  Other backends
+	 * retain the original path and perform no POSIX path lookup. */
+	if (ps_storage->name != NULL && strcmp(ps_storage->name, "posix") == 0)
+	{
+		if ((mkdir(store_dir, 0700) != 0 && errno != EEXIST) ||
+			realpath(store_dir, runtime_store_root) == NULL)
+			return -1;
+		runtime_store_dir = runtime_store_root;
+	}
+	path_len = snprintf(next_wal_segment_root, sizeof(next_wal_segment_root), "%s",
+					runtime_store_dir);
+	if (path_len < 0 || (size_t) path_len >= sizeof(next_wal_segment_root))
 		return -1;
+	path_len = snprintf(next_fork_meta_snapshot_dir,
+					sizeof(next_fork_meta_snapshot_dir),
+					"%s/forkmeta_snapshots", runtime_store_dir);
+	if (path_len < 0 ||
+		(size_t) path_len >= sizeof(next_fork_meta_snapshot_dir))
+		return -1;
+	if (ps_storage->open(runtime_store_dir, segment_size) != 0)
+		return -1;
+	memcpy(wal_segment_root, next_wal_segment_root,
+		   strlen(next_wal_segment_root) + 1);
+	memcpy(fork_meta_snapshot_dir, next_fork_meta_snapshot_dir,
+		   strlen(next_fork_meta_snapshot_dir) + 1);
 	ps_layer_store_set_page_size(page_size);
-	if (ps_layer_store->open(store_dir) != 0)
+	if (ps_layer_store->open(runtime_store_dir) != 0)
 		return -1;
-	if (ps_manifest_open(store_dir) != 0)
+	if (ps_manifest_open(runtime_store_dir) != 0)
 		return -1;
 	if (ps_manifest_replay(&ps_layer_map) != 0)
 		return -1;
-	if (validate_store_shard_count(store_dir, &publish_shard_count) != 0)
+	if (validate_store_shard_count(runtime_store_dir,
+							   &publish_shard_count) != 0)
 		return -1;
 	/* Leave deleting layers for asynchronous maintenance: recovery must not
 	 * block on an unavailable remote object that is already excluded from reads. */
@@ -15763,14 +15855,14 @@ ps_core_open(const char *store_dir)
 	 * later CREATE_BRANCH requests must not reuse any discovered id. */
 	if (wal_segment_discover_used() != 0)
 		return -1;
-	if (ps_retention_open(store_dir) != 0)
+	if (ps_retention_open(runtime_store_dir) != 0)
 		return -1;
-	if (page_frontier_load(store_dir) != 0)
+	if (page_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt page reclamation frontiers\n");
 		return -1;
 	}
-	if (walidx_frontier_load(store_dir) != 0)
+	if (walidx_frontier_load(runtime_store_dir) != 0)
 	{
 		fprintf(stderr, "pagestore: refusing to open corrupt WAL-index "
 				"reclamation frontiers\n");
@@ -15962,11 +16054,13 @@ ps_core_open(const char *store_dir)
 					return -1;
 		}
 
-	if (publish_shard_count && publish_store_shard_count(store_dir) != 0)
+	if (publish_shard_count &&
+		publish_store_shard_count(runtime_store_dir) != 0)
 		return -1;
 	if (forkmeta_reclaim_high_water_bytes != 0 &&
 		fork_meta_reclaim_baseline_init() != 0)
 		return -1;
+	__atomic_store_n(&core_opened, 1, __ATOMIC_RELEASE);
 
 	return 0;
 }
