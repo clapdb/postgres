@@ -1817,7 +1817,8 @@ ps_walidx_snapshot_reclaim_bytes(const char *directory, uint32_t timeline,
 					 (uint64_t) st.st_size != prepared.shards[shard].len))
 					goto cleanup;
 				selected_present[shard] = 1;
-				if (prepared_present && shard < prepared.nshards)
+				if (prepared_present && generation == prepared.generation &&
+					shard < prepared.nshards)
 					prepared_shards_present[shard] = 1;
 				continue;
 			}
