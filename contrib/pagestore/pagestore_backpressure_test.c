@@ -57,6 +57,80 @@ typedef struct BackpressureSlowPathCounter
 	unsigned int calls;
 } BackpressureSlowPathCounter;
 
+typedef struct ForkmetaProofRace
+{
+	PsChannel channel;
+	PsKey key;
+	pthread_t worker;
+	unsigned int calls;
+	volatile int started;
+	volatile int go;
+	volatile int attempting_read_lock;
+	volatile int hook_returned;
+	volatile int acquired;
+	volatile int acquired_before_hook_returned;
+	int worker_created;
+	int failed;
+} ForkmetaProofRace;
+
+static void *
+forkmeta_proof_race_worker(void *arg)
+{
+	ForkmetaProofRace *race = arg;
+
+	__atomic_store_n(&race->started, 1, __ATOMIC_RELEASE);
+	while (!__atomic_load_n(&race->go, __ATOMIC_ACQUIRE))
+		sched_yield();
+	/* This is the final handshake before entering the admission fence.  The
+	 * observation hook waits for it before it is allowed to return. */
+	__atomic_store_n(&race->attempting_read_lock, 1, __ATOMIC_RELEASE);
+	ps_admission_read_lock();
+	if (!__atomic_load_n(&race->hook_returned, __ATOMIC_ACQUIRE))
+		__atomic_store_n(&race->acquired_before_hook_returned, 1,
+						 __ATOMIC_RELEASE);
+	__atomic_store_n(&race->acquired, 1, __ATOMIC_RELEASE);
+	memset(&race->channel, 0, sizeof(race->channel));
+	race->channel.timeline = 1;
+	race->channel.opcode = PS_OP_CREATE;
+	race->channel.key = race->key;
+	race->channel.req_lsn = 1050;
+	if (ps_handle_meta(&race->channel) != 1 ||
+		race->channel.status != PS_STATUS_OK)
+		race->failed = 1;
+	ps_admission_read_unlock();
+	return NULL;
+}
+
+static void
+forkmeta_proof_race(unsigned int attempt, void *arg)
+{
+	ForkmetaProofRace *race = arg;
+
+	/* Mutate only the first observation.  A source identity change should make
+	 * the observer retry, while the post-scan owner proof must still reject the
+	 * stale source-debt authorization. */
+	if (attempt != 0 || race->calls != 0)
+		return;
+	race->calls++;
+	if (pthread_create(&race->worker, NULL, forkmeta_proof_race_worker,
+					   race) != 0)
+	{
+		race->failed = 1;
+		return;
+	}
+	race->worker_created = 1;
+	while (!__atomic_load_n(&race->started, __ATOMIC_ACQUIRE))
+		sched_yield();
+	__atomic_store_n(&race->go, 1, __ATOMIC_RELEASE);
+	/* Do not use a timeout as evidence of blocking.  Wait until the worker has
+	 * reached the instruction immediately before admission-rd; if the
+	 * observation were unfenced, that worker is then allowed to proceed and the
+	 * post-join assertion would catch an early acquisition. */
+	while (!__atomic_load_n(&race->attempting_read_lock, __ATOMIC_ACQUIRE))
+		sched_yield();
+	__atomic_store_n(&race->hook_returned, 1, __ATOMIC_RELEASE);
+}
+
 static void
 count_backpressure_slow_path(void *arg)
 {
@@ -877,10 +951,12 @@ test_forkmeta_self_recovery(void)
 	PsChannel channel;
 	PsRetentionPin pin;
 	PsKey key = {11, 11, 11, 0, PS_KLASS_RELATION};
+	ForkmetaProofRace race;
 	PsKey branch_page_key = {22, 22, 22, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	uint64_t page_admission_seq = 0;
 	uint64_t branch_page_admission_seq = 0;
+	uint64_t race_throttle_enters;
 	uint64_t branch_throttle_enters;
 	int did = 0;
 	int reopen_rc;
@@ -961,6 +1037,29 @@ test_forkmeta_self_recovery(void)
 	 * admissible until that timeline has a real page-reclamation frontier. */
 	check(create_test_branch(1, 0, 1002),
 			"create a new timeline after selecting the forkmeta snapshot");
+	memset(&race, 0, sizeof(race));
+	race.key = (PsKey) {33, 33, 33, 0, PS_KLASS_RELATION};
+	race_throttle_enters = metrics.forkmeta_backpressure.throttle_enters;
+	ps_test_set_forkmeta_snapshot_observation_hook(forkmeta_proof_race, &race);
+	ps_backpressure_refresh();
+	ps_test_set_forkmeta_snapshot_observation_hook(NULL, NULL);
+	if (race.worker_created)
+		pthread_join(race.worker, NULL);
+	check(race.calls == 1 && race.worker_created && !race.failed &&
+			!__atomic_load_n(&race.acquired_before_hook_returned,
+						 __ATOMIC_ACQUIRE) &&
+			__atomic_load_n(&race.acquired, __ATOMIC_ACQUIRE),
+			"foreground metadata mutation waits for the observation fence");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0 &&
+			metrics.forkmeta_backpressure.throttle_enters ==
+			race_throttle_enters,
+			"next refresh rejects source debt for the newly admitted owner");
+	check(race.calls == 1 && !race.failed &&
+			metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"source debt is dropped when a new owner appears during observation");
 	memset(&channel, 0, sizeof(channel));
 	channel.timeline = 1;
 	channel.opcode = PS_OP_CREATE;

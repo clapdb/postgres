@@ -5720,11 +5720,21 @@ static uint64_t
 forkmeta_reclaim_lag_bytes(void)
 {
 	PsForkmetaSnapshotExpected expected;
+	int source_debt_enabled;
+	int scan_rc;
 	uint64_t debt;
+	uint64_t source_baseline;
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0 ||
 		!fork_meta_reclaim_baseline_valid)
+		return UINT64_MAX;
+	/* Admission-rd is the fence used by foreground metadata mutations.  Hold
+	 * its write side across both the owner proof and the stable/retrying source
+	 * observation, so a CREATE cannot invalidate the proof in the middle of
+	 * the scan.  The lock order remains admission -> shard -> map, matching
+	 * maintenance and the request path. */
+	if (ps_admission_write_lock() != 0)
 		return UINT64_MAX;
 	memset(&expected, 0, sizeof(expected));
 	expected.generation = fork_meta_snapshot_generation;
@@ -5732,12 +5742,37 @@ forkmeta_reclaim_lag_bytes(void)
 	expected.cutoff_admission_seq = fork_meta_snapshot_cutoff_seq;
 	expected.checkpoint = fork_meta_snapshot_checkpoint_meta;
 	expected.tail = fork_meta_snapshot_tail_meta;
-	if (ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
+	source_baseline = fork_meta_reclaim_baseline_bytes;
+	/* The logical owner proof is necessarily separate from the physical scan:
+	 * the latter may retry while a foreground CREATE appends forkmeta.  Do not
+	 * let a proof from before that scan authorize source growth permanently.
+	 * If the owner set changed, repeat the stable observation with source debt
+	 * disabled; snapshot/debris debt remains observable, while the new owner's
+	 * unproven source bytes cannot enter the throttle. */
+	source_debt_enabled = fork_meta_source_cutoff_provable();
+	scan_rc = ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
 										wal_segment_root,
-										fork_meta_reclaim_baseline_bytes,
-										fork_meta_source_cutoff_provable(),
-										&expected, &debt) != 0)
+										source_baseline,
+										source_debt_enabled,
+										&expected, &debt);
+	if (scan_rc != 0)
+	{
+		ps_admission_write_unlock();
 		return UINT64_MAX;
+	}
+	if (source_debt_enabled && !fork_meta_source_cutoff_provable())
+	{
+		scan_rc = ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
+										 wal_segment_root,
+										 source_baseline,
+										 0, &expected, &debt);
+		if (scan_rc != 0)
+		{
+			ps_admission_write_unlock();
+			return UINT64_MAX;
+		}
+	}
+	ps_admission_write_unlock();
 	return debt;
 }
 
