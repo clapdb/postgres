@@ -214,6 +214,9 @@ extern int ps_forkmeta_snapshot_read_tail(
  * both require another tick without treating the result as fresh observation
  * or forcing admission state to change. */
 extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc(const char *directory);
+/* Close all retained full/temp GC directory streams and discard continuation
+ * authorities.  Call this during core shutdown before the provider closes. */
+extern void ps_forkmeta_snapshot_gc_reset(void);
 /* Remove a bounded batch of recognized temporary debris without requiring a
  * selected manifest.  Canonical manifests/parts and durable prepared intent
  * are never removed by this path.  A REMOVED_SCAN_INCOMPLETE result means

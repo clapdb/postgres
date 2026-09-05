@@ -807,10 +807,17 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 		errno = EINVAL;
 		goto out;
 	}
+	if (forkmeta_high_water != 0 &&
+		(ps_storage == NULL || ps_storage->name == NULL ||
+		 strcmp(ps_storage->name, "posix") != 0))
+	{
+		errno = EINVAL;
+		goto out;
+	}
 	/* A runtime 0 -> enabled transition must establish its source baseline
 	 * before observations can charge pre-enable bytes.  Configure-before-open
-	 * remains handled by ps_core_open(), and non-POSIX backends retain their
-	 * scan-free startup/runtime behavior. */
+	 * remains handled by ps_core_open(); incompatible backends were rejected
+	 * above before any controller state could be published. */
 	if (forkmeta_reclaim_high_water_bytes == 0 && forkmeta_high_water != 0)
 	{
 		ps_lifecycle_read_lock();
@@ -14615,6 +14622,9 @@ ps_core_close_impl(void)
 			wal_segment_store_opened[tl] = 0;
 		}
 	ps_retention_close();
+	/* GC may retain directory streams between bounded batches.  Drop those
+	 * streams before the storage provider is closed or the store is reopened. */
+	ps_forkmeta_snapshot_gc_reset();
 	ps_manifest_close();
 	free_page_fork_indexes();
 	free_walidx_indexes();
@@ -15623,6 +15633,14 @@ ps_core_open_impl(const char *store_dir)
 	char		next_wal_segment_root[sizeof(wal_segment_root)];
 	char		next_fork_meta_snapshot_dir[sizeof(fork_meta_snapshot_dir)];
 	const char *runtime_store_dir = store_dir;
+
+	if (forkmeta_reclaim_high_water_bytes != 0 &&
+		(ps_storage == NULL || ps_storage->name == NULL ||
+		 strcmp(ps_storage->name, "posix") != 0))
+	{
+		errno = EINVAL;
+		return -1;
+	}
 
 	__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);

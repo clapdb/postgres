@@ -447,6 +447,30 @@ test_nonblocking_admission_and_shutdown(void)
 }
 
 static void
+test_forkmeta_rejects_nonposix_provider(void)
+{
+	PsStorage fake_storage = PsStoragePosix;
+	uint64_t old_high_water;
+
+	configure_page_core();
+	fake_storage.name = "fake";
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					128, 20) == 0,
+				"configure forkmeta before provider compatibility check");
+	old_high_water = forkmeta_reclaim_high_water_bytes;
+	ps_storage = &fake_storage;
+	errno = 0;
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					256, 32) < 0 && errno == EINVAL &&
+				forkmeta_reclaim_high_water_bytes == old_high_water,
+				"non-POSIX forkmeta enable is rejected without publishing");
+	ps_storage = &PsStoragePosix;
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					0, 0) == 0,
+				"restore forkmeta configuration after provider compatibility check");
+}
+
+static void
 test_walidx_append_tail_restart(void)
 {
 	char store[] = "/tmp/pagestore-walidx-backpressure-XXXXXX";
@@ -1990,6 +2014,7 @@ test_forkmeta_self_recovery(void)
 					(unlink(canonical) != 0 && errno != ENOENT))
 					check(0, "remove canonical no-op probe residue");
 			}
+			ps_forkmeta_snapshot_gc_reset();
 			check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
 					ps_forkmeta_snapshot_gc(snapshots) >= 0,
 					"reset forkmeta GC cursors after canonical prefix probe");
@@ -2081,6 +2106,7 @@ test_forkmeta_self_recovery(void)
 				  "canonical GC empty retry closes directory-fsync ambiguity");
 		check(metrics.forkmeta_backpressure.lag_bytes == 0,
 				  "canonical GC retry reconciles physical debt");
+		ps_forkmeta_snapshot_gc_reset();
 		check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
 				ps_forkmeta_snapshot_gc(snapshots) >= 0,
 				"reset forkmeta GC cursors before temporary cursor fixture");
@@ -2180,6 +2206,7 @@ test_forkmeta_self_recovery(void)
 		}
 		check(unlink(old_checkpoint) == 0 || errno == ENOENT,
 				  "remove old canonical fairness fixture");
+		ps_forkmeta_snapshot_gc_reset();
 		check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
 				ps_forkmeta_snapshot_gc(snapshots) >= 0,
 				"reset cursors after temp/canonical fairness fixture");
@@ -2785,6 +2812,7 @@ main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_forkmeta_rejects_nonposix_provider();
 	test_forkmeta_runtime_enable_and_symlink_root();
 	test_forkmeta_backpressure_observer();
 	test_forkmeta_self_recovery();

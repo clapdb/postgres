@@ -52,6 +52,8 @@ typedef struct ForkmetaGcAuthority
 {
 	int present;
 	struct stat stat;
+	int parts_valid;
+	struct stat parts[2];
 	SnapshotRecord record;
 } ForkmetaGcAuthority;
 
@@ -90,6 +92,13 @@ static PsForkmetaSnapshotGenerationScanTestHook generation_scan_test_hook;
 static void *generation_scan_test_hook_arg;
 static ForkmetaGcDirectoryCursor forkmeta_temp_gc_cursor;
 static ForkmetaSnapshotGcCursor forkmeta_snapshot_gc_cursor;
+
+static int open_validated_part(int directory_fd, unsigned int part,
+						   uint64_t generation, uint64_t len,
+						   uint32_t expected_crc, int *fd_out,
+						   struct stat *stat_out);
+static int part_name(uint64_t generation, unsigned int part, char *name,
+					 size_t name_len);
 
 void
 ps_test_set_forkmeta_snapshot_observation_hook(
@@ -235,17 +244,6 @@ forkmeta_gc_authority_read(int directory_fd, const char *name,
 }
 
 static void
-forkmeta_gc_record_from_snapshot(const PsForkmetaSnapshot *snapshot,
-							 SnapshotRecord *record)
-{
-	record->generation = snapshot->generation;
-	record->cutoff_lsn = snapshot->cutoff_lsn;
-	record->cutoff_admission_seq = snapshot->cutoff_admission_seq;
-	record->checkpoint = snapshot->checkpoint;
-	record->tail = snapshot->tail;
-}
-
-static void
 forkmeta_gc_record_from_prepared(const PsForkmetaSnapshotPrepared *prepared,
 							 SnapshotRecord *record)
 {
@@ -263,6 +261,10 @@ forkmeta_gc_authority_equal(const ForkmetaGcAuthority *left,
 	return left->present == right->present &&
 		(!left->present ||
 		 (forkmeta_gc_stat_equal(&left->stat, &right->stat) &&
+		  left->parts_valid == right->parts_valid &&
+		  (!left->parts_valid ||
+		   (forkmeta_gc_stat_equal(&left->parts[0], &right->parts[0]) &&
+			forkmeta_gc_stat_equal(&left->parts[1], &right->parts[1]))) &&
 		  left->record.generation == right->record.generation &&
 		  left->record.cutoff_lsn == right->record.cutoff_lsn &&
 		  left->record.cutoff_admission_seq ==
@@ -273,6 +275,53 @@ forkmeta_gc_authority_equal(const ForkmetaGcAuthority *left,
 		  left->record.tail.crc == right->record.tail.crc));
 }
 
+static int
+forkmeta_gc_selected_parts_stat(int directory_fd,
+						ForkmetaGcAuthority *authority)
+{
+	char names[2][128];
+
+	if (!authority->present ||
+		part_name(authority->record.generation,
+				  PS_FORKMETA_SNAPSHOT_CHECKPOINT, names[0], sizeof(names[0])) != 0 ||
+		part_name(authority->record.generation,
+				  PS_FORKMETA_SNAPSHOT_TAIL, names[1], sizeof(names[1])) != 0)
+		return -1;
+	for (unsigned int i = 0; i < 2; i++)
+	{
+		if (fstatat(directory_fd, names[i], &authority->parts[i],
+					AT_SYMLINK_NOFOLLOW) != 0 ||
+			!S_ISREG(authority->parts[i].st_mode) ||
+			authority->parts[i].st_size < 0 ||
+			(uint64_t) authority->parts[i].st_size !=
+				(i == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+				 authority->record.checkpoint.len : authority->record.tail.len))
+			return -1;
+	}
+	authority->parts_valid = 1;
+	return 0;
+}
+
+static int
+forkmeta_gc_selected_parts_validate(int directory_fd,
+						 ForkmetaGcAuthority *authority)
+{
+	if (!authority->present ||
+		open_validated_part(directory_fd, PS_FORKMETA_SNAPSHOT_CHECKPOINT,
+						 authority->record.generation,
+						 authority->record.checkpoint.len,
+						 authority->record.checkpoint.crc, NULL,
+						 &authority->parts[PS_FORKMETA_SNAPSHOT_CHECKPOINT]) != 0 ||
+		open_validated_part(directory_fd, PS_FORKMETA_SNAPSHOT_TAIL,
+						 authority->record.generation,
+						 authority->record.tail.len,
+						 authority->record.tail.crc, NULL,
+						 &authority->parts[PS_FORKMETA_SNAPSHOT_TAIL]) != 0)
+		return -1;
+	authority->parts_valid = 1;
+	return 0;
+}
+
 static void
 forkmeta_snapshot_gc_cursor_reset(void)
 {
@@ -281,6 +330,13 @@ forkmeta_snapshot_gc_cursor_reset(void)
 		   sizeof(forkmeta_snapshot_gc_cursor.current));
 	memset(&forkmeta_snapshot_gc_cursor.prepared, 0,
 		   sizeof(forkmeta_snapshot_gc_cursor.prepared));
+}
+
+void
+ps_forkmeta_snapshot_gc_reset(void)
+{
+	forkmeta_snapshot_gc_cursor_reset();
+	forkmeta_gc_directory_cursor_reset(&forkmeta_temp_gc_cursor);
 }
 
 static int
@@ -304,8 +360,14 @@ forkmeta_snapshot_gc_cursor_prepare(const char *directory, int directory_fd,
 	{
 		forkmeta_snapshot_gc_cursor_reset();
 		if (forkmeta_gc_directory_cursor_prepare(directory, directory_fd,
-									 &forkmeta_snapshot_gc_cursor.scan,
-									 NULL) != 0)
+										&forkmeta_snapshot_gc_cursor.scan,
+										NULL) != 0)
+			return -1;
+		/* The first pass proves the selected immutable payloads.  Continuations
+		 * retain only their fstat identities, never their part descriptors. */
+		forkmeta_snapshot_gc_cursor.current = *current;
+		if (forkmeta_gc_selected_parts_validate(directory_fd,
+										 &forkmeta_snapshot_gc_cursor.current) != 0)
 			return -1;
 	}
 	forkmeta_snapshot_gc_cursor.current = *current;
@@ -739,7 +801,8 @@ encode_record(const SnapshotRecord *record, unsigned char encoded[80])
 
 static int
 open_validated_part(int directory_fd, unsigned int part, uint64_t generation,
-					uint64_t len, uint32_t expected_crc, int *fd_out)
+					uint64_t len, uint32_t expected_crc, int *fd_out,
+					struct stat *stat_out)
 {
 	unsigned char buffer[VERIFY_BYTES];
 	char name[128];
@@ -767,6 +830,8 @@ open_validated_part(int directory_fd, unsigned int part, uint64_t generation,
 	}
 	if (crc == expected_crc)
 	{
+		if (stat_out != NULL)
+			*stat_out = st;
 		if (fd_out != NULL)
 		{
 			*fd_out = fd;
@@ -786,7 +851,7 @@ published_part_valid(int directory_fd, unsigned int part, uint64_t generation,
 					 uint64_t len, uint32_t expected_crc)
 {
 	return open_validated_part(directory_fd, part, generation, len,
-						   expected_crc, NULL);
+						   expected_crc, NULL, NULL);
 }
 
 static int
@@ -1714,10 +1779,10 @@ ps_forkmeta_snapshot_open(PsForkmetaSnapshot *snapshot, const char *directory)
 	snapshot->tail = record.tail;
 	if (open_validated_part(directory_fd, PS_FORKMETA_SNAPSHOT_CHECKPOINT,
 						 record.generation, record.checkpoint.len,
-						 record.checkpoint.crc, &snapshot->checkpoint_fd) != 0 ||
+						 record.checkpoint.crc, &snapshot->checkpoint_fd, NULL) != 0 ||
 		open_validated_part(directory_fd, PS_FORKMETA_SNAPSHOT_TAIL,
 						 record.generation, record.tail.len, record.tail.crc,
-						 &snapshot->tail_fd) != 0)
+						 &snapshot->tail_fd, NULL) != 0)
 	{
 		ps_forkmeta_snapshot_close(snapshot);
 		return -1;
@@ -1767,7 +1832,6 @@ PsForkmetaSnapshotGcResult
 ps_forkmeta_snapshot_gc(const char *directory)
 {
 	PsForkmetaSnapshotPrepared durable_prepared;
-	PsForkmetaSnapshot current;
 	PsForkmetaSnapshotPrepared prepared_after;
 	SnapshotRecord current_record;
 	SnapshotRecord prepared_record;
@@ -1777,6 +1841,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	ForkmetaGcAuthority prepared_after_authority;
 	struct dirent *entry;
 	char names[PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH][256];
+	int directory_fd = -1;
 	int rc = -1;
 	int intent_exists;
 	int intent_after;
@@ -1787,29 +1852,30 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	unsigned int inspected = 0;
 	size_t count = 0;
 
-	if (ps_forkmeta_snapshot_open(&current, directory) != 0)
+	if (directory == NULL || (directory_fd = open_directory(directory, 0)) < 0)
 	{
 		forkmeta_snapshot_gc_cursor_reset();
 		return -1;
 	}
-	if (read_prepared_metadata_if_exists(current.directory_fd, directory,
-									 &durable_prepared, &intent_exists) != 0)
+	if (read_record(directory_fd, directory, FORKMETA_SNAPSHOT_MANIFEST,
+					&current_record, 0) != 0 ||
+		forkmeta_gc_authority_read(directory_fd, FORKMETA_SNAPSHOT_MANIFEST,
+								 &current_record, &current_authority) != 0 ||
+		forkmeta_gc_selected_parts_stat(directory_fd, &current_authority) != 0)
 		goto cleanup;
-	forkmeta_gc_record_from_snapshot(&current, &current_record);
-	if (forkmeta_gc_authority_read(current.directory_fd,
-								 FORKMETA_SNAPSHOT_MANIFEST, &current_record,
-								 &current_authority) != 0)
+	if (read_prepared_metadata_if_exists(directory_fd, directory,
+									 &durable_prepared, &intent_exists) != 0)
 		goto cleanup;
 	memset(&prepared_authority, 0, sizeof(prepared_authority));
 	if (intent_exists)
 	{
 		forkmeta_gc_record_from_prepared(&durable_prepared, &prepared_record);
-		if (forkmeta_gc_authority_read(current.directory_fd,
+		if (forkmeta_gc_authority_read(directory_fd,
 									 FORKMETA_SNAPSHOT_PREPARED, &prepared_record,
 									 &prepared_authority) != 0)
 			goto cleanup;
 	}
-	if (forkmeta_snapshot_gc_cursor_prepare(directory, current.directory_fd,
+	if (forkmeta_snapshot_gc_cursor_prepare(directory, directory_fd,
 										&current_authority,
 										&prepared_authority) != 0)
 		goto cleanup;
@@ -1856,12 +1922,12 @@ ps_forkmeta_snapshot_gc(const char *directory)
 				checkpoint_status < 0 || tail_status < 0)
 				goto cleanup;
 			recognized = checkpoint_status == 0 || tail_status == 0;
-			if (!recognized || generation >= current.generation ||
+			if (!recognized || generation >= current_record.generation ||
 				(intent_exists && generation == durable_prepared.generation))
 			{
 				if (recognized)
 				{
-					int regular = snapshot_gc_entry_regular(current.directory_fd,
+					int regular = snapshot_gc_entry_regular(directory_fd,
 											 entry->d_name);
 
 					if (regular < 0)
@@ -1871,7 +1937,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 			}
 		}
 		{
-			int regular = snapshot_gc_entry_regular(current.directory_fd,
+			int regular = snapshot_gc_entry_regular(directory_fd,
 										 entry->d_name);
 
 			if (regular < 0)
@@ -1900,19 +1966,20 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	}
 	/* Do not unlink against an authority that changed while the bounded scan
 	 * was in progress.  The next call starts at the new authority's prefix. */
-	if (read_record(current.directory_fd, directory, FORKMETA_SNAPSHOT_MANIFEST,
+	if (read_record(directory_fd, directory, FORKMETA_SNAPSHOT_MANIFEST,
 					&current_record, 0) != 0 ||
-		forkmeta_gc_authority_read(current.directory_fd,
-							 FORKMETA_SNAPSHOT_MANIFEST, &current_record,
-							 &current_after_authority) != 0 ||
-		read_prepared_metadata_if_exists(current.directory_fd, directory,
+		forkmeta_gc_authority_read(directory_fd,
+								 FORKMETA_SNAPSHOT_MANIFEST, &current_record,
+								 &current_after_authority) != 0 ||
+		forkmeta_gc_selected_parts_stat(directory_fd, &current_after_authority) != 0 ||
+		read_prepared_metadata_if_exists(directory_fd, directory,
 									 &prepared_after, &intent_after) != 0)
 		goto cleanup;
 	memset(&prepared_after_authority, 0, sizeof(prepared_after_authority));
 	if (intent_after)
 	{
 		forkmeta_gc_record_from_prepared(&prepared_after, &prepared_record);
-		if (forkmeta_gc_authority_read(current.directory_fd,
+		if (forkmeta_gc_authority_read(directory_fd,
 									 FORKMETA_SNAPSHOT_PREPARED, &prepared_record,
 									 &prepared_after_authority) != 0)
 			goto cleanup;
@@ -1927,7 +1994,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 		forkmeta_snapshot_gc_cursor_reset();
 	for (size_t i = 0; i < count; i++)
 	{
-		int regular = snapshot_gc_entry_regular(current.directory_fd, names[i]);
+		int regular = snapshot_gc_entry_regular(directory_fd, names[i]);
 
 		if (regular < 0)
 		{
@@ -1936,7 +2003,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 		}
 		if (regular == 0)
 			continue;
-		if (unlinkat(current.directory_fd, names[i], 0) != 0)
+		if (unlinkat(directory_fd, names[i], 0) != 0)
 		{
 			if (errno != ENOENT)
 				unlink_failed = 1;
@@ -1953,7 +2020,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 		goto cleanup;
 	}
 	/* Always sync: an empty retry closes an ambiguous prior unlink fsync. */
-	if (fsync(current.directory_fd) != 0)
+	if (fsync(directory_fd) != 0)
 	{
 		unlink_failed = 1;
 		keep_cursor = 0;
@@ -1962,7 +2029,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	}
 	else if (keep_cursor && removed &&
 		forkmeta_gc_directory_cursor_refresh(
-			&forkmeta_snapshot_gc_cursor.scan, current.directory_fd) != 0)
+			&forkmeta_snapshot_gc_cursor.scan, directory_fd) != 0)
 	{
 		unlink_failed = 1;
 		keep_cursor = 0;
@@ -1977,7 +2044,8 @@ ps_forkmeta_snapshot_gc(const char *directory)
 cleanup:
 	if (rc < 0)
 		keep_cursor = 0;
-	ps_forkmeta_snapshot_close(&current);
+	if (directory_fd >= 0)
+		(void) close(directory_fd);
 	if (!keep_cursor)
 		forkmeta_snapshot_gc_cursor_reset();
 	return rc;
