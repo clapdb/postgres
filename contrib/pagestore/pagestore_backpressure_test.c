@@ -25,6 +25,7 @@ static int failed;
 
 static void configure_page_core(void);
 static void fill_page(unsigned char *page, unsigned char tag);
+static void fill_page_lsn(unsigned char *page, unsigned char tag, uint64_t lsn);
 static int append_test_walidx_tail(uint32_t timeline, uint64_t progress);
 static int append_test_walidx_identity(uint32_t timeline);
 static int test_path_suffix(char *path, size_t path_size, const char *base,
@@ -876,8 +877,11 @@ test_forkmeta_self_recovery(void)
 	PsChannel channel;
 	PsRetentionPin pin;
 	PsKey key = {11, 11, 11, 0, PS_KLASS_RELATION};
+	PsKey branch_page_key = {22, 22, 22, 0, PS_KLASS_RELATION};
 	unsigned char page[8192];
 	uint64_t page_admission_seq = 0;
+	uint64_t branch_page_admission_seq = 0;
+	uint64_t branch_throttle_enters;
 	int did = 0;
 	int reopen_rc;
 
@@ -952,6 +956,93 @@ test_forkmeta_self_recovery(void)
 		metrics.forkmeta_backpressure.lag_bytes <= 20 &&
 		metrics.forkmeta_backpressure.throttled == 0,
 		"maintenance publishes snapshot/GC and clears forkmeta throttle");
+	/* The selected generation covers timeline 0, but not a new owner created
+	 * after that cutover.  Metadata-only churn on the new timeline must remain
+	 * admissible until that timeline has a real page-reclamation frontier. */
+	check(create_test_branch(1, 0, 1002),
+			"create a new timeline after selecting the forkmeta snapshot");
+	memset(&channel, 0, sizeof(channel));
+	channel.timeline = 1;
+	channel.opcode = PS_OP_CREATE;
+	channel.key = key;
+	channel.req_lsn = 1100;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"append CREATE metadata on the new timeline without a frontier");
+	channel.opcode = PS_OP_ZEROEXTEND;
+	channel.blocknum = 0;
+	channel.nblocks = 1;
+	channel.req_lsn = 1150;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"append ZEROEXTEND metadata on the new timeline without a frontier");
+	channel.opcode = PS_OP_UNLINK;
+	channel.req_lsn = 1200;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"append UNLINK metadata on the new timeline without a frontier");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"selected snapshot does not charge an uncovered metadata-only owner");
+	branch_throttle_enters = metrics.forkmeta_backpressure.throttle_enters;
+	/* Establish progress on that same owner.  Once its durable page frontier is
+	 * published, source growth becomes eligible and the controller can cut over
+	 * instead of deadlocking behind its own forkmeta gate. */
+	for (unsigned char tag = 1; tag <= 2; tag++)
+	{
+		fill_page_lsn(page, tag, 2000 + tag);
+		ps_admission_read_lock();
+		ps_lock_shard_wr(0);
+		check(append_page(1, &branch_page_key, 0, page, 0,
+				tag == 2 ? &branch_page_admission_seq : NULL) == 0,
+				"write page history for the new timeline frontier");
+		ps_unlock_shard(0);
+		ps_admission_read_unlock();
+	}
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 1;
+	pin.owner_kind = PS_RETENTION_OWNER_CONFIGURED;
+	pin.owner_id = 19002;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 2002;
+	pin.admission_seq = branch_page_admission_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+			"pin the new timeline page frontier");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_core_open(store) == 0,
+			"reopen the new timeline page history for frontier maintenance");
+	ps_core_set_metrics_header(&metrics);
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"reopen observes no source debt before the new timeline frontier");
+	/* The initial recovery fixture uses zero to force root compaction.  Keep the
+	 * single root layer out of this phase so the two new timeline layers can
+	 * publish their frontier and expose the post-maintenance refresh. */
+	compact_layers = 1;
+	segment_gc_enabled = 0;
+	for (int i = 0; i < 64; i++)
+	{
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		(void) ps_core_maintenance();
+		ps_backpressure_refresh();
+		if (metrics.forkmeta_backpressure.throttle_enters > branch_throttle_enters)
+			break;
+	}
+	check(metrics.forkmeta_backpressure.throttle_enters > branch_throttle_enters,
+			"new timeline source debt becomes eligible after its frontier");
+	did = 0;
+	for (int i = 0; i < 64; i++)
+	{
+		if (ps_core_maintenance())
+			did = 1;
+		ps_backpressure_refresh();
+		if (metrics.forkmeta_backpressure.throttled == 0)
+			break;
+	}
+	check(did && metrics.forkmeta_backpressure.throttled == 0,
+			"new timeline forkmeta debt remains serviceable after frontier cutover");
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
@@ -1155,6 +1246,13 @@ static void
 fill_page(unsigned char *page, unsigned char tag)
 {
 	uint64_t lsn = 1000 + tag;
+
+	fill_page_lsn(page, tag, lsn);
+}
+
+static void
+fill_page_lsn(unsigned char *page, unsigned char tag, uint64_t lsn)
+{
 	uint32_t hi = (uint32_t) (lsn >> 32);
 	uint32_t lo = (uint32_t) lsn;
 

@@ -6404,6 +6404,28 @@ fork_meta_timeline_records_present_locked(uint32_t target)
 	return 0;
 }
 
+/* A selected snapshot can cover an owner that no longer has a live page
+ * frontier only when every fork-size event currently visible for that owner
+ * is at or before the selected cutoff.  In particular, a newly-created
+ * metadata-only timeline is not covered by the old snapshot: its first event
+ * is in the source suffix and still needs a real page frontier before source
+ * growth may be charged as reclaimable debt. */
+static int
+fork_meta_owner_covered_by_selected_cutoff(const ForkEnt *e)
+{
+	if (fork_meta_snapshot_generation == 0 ||
+		fork_meta_snapshot_cutoff_lsn == 0 ||
+		fork_meta_snapshot_cutoff_seq == 0)
+		return 0;
+	for (uint32_t i = 0; i < e->nev; i++)
+		if (e->ev[i].kind <= FEV_DEAD &&
+			fork_meta_event_future(e->ev[i].lsn, e->ev[i].admission_seq,
+							   fork_meta_snapshot_cutoff_lsn,
+							   fork_meta_snapshot_cutoff_seq))
+			return 0;
+	return 1;
+}
+
 /* Caller holds admission-write, every shard-write lock, and map-write. */
 static int
 fork_meta_deletion_cutover_due_locked(void)
@@ -6469,10 +6491,18 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
 
 					if (e->timeline >= MAX_TIMELINES ||
 						frontier.lsn == 0 || frontier.admission_seq == 0)
-				{
-					missing = 1;
-					continue;
-				}
+					{
+						if (fork_meta_owner_covered_by_selected_cutoff(e))
+						{
+							frontier.lsn = fork_meta_snapshot_cutoff_lsn;
+							frontier.admission_seq = fork_meta_snapshot_cutoff_seq;
+						}
+						else
+						{
+							missing = 1;
+							continue;
+						}
+					}
 					if (!have || frontier.lsn < cutoff.lsn ||
 						(frontier.lsn == cutoff.lsn &&
 						 frontier.admission_seq < cutoff.admission_seq))
@@ -6531,10 +6561,6 @@ fork_meta_source_cutoff_provable(void)
 
 	if (!map_locks_ready)
 		return 0;
-	if (fork_meta_snapshot_generation != 0 &&
-		fork_meta_snapshot_cutoff_lsn != 0 &&
-		fork_meta_snapshot_cutoff_seq != 0)
-		return 1;
 	for (uint32_t sh = 0; sh < core_shards(); sh++)
 		ps_lock_shard_rd(sh);
 	ps_lock_map_rd();
