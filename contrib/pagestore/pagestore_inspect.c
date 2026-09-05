@@ -55,7 +55,8 @@ print_health(PsShmHeader *hdr)
 static void
 read_backpressure_metrics(PsShmHeader *hdr, PsBackpressureMetrics *page,
 						   PsBackpressureMetrics *wal,
-						   PsBackpressureMetrics *walidx)
+						   PsBackpressureMetrics *walidx,
+						   PsBackpressureMetrics *forkmeta)
 {
 	const unsigned int max_attempts = 10000;
 	uint64_t before;
@@ -102,6 +103,14 @@ read_backpressure_metrics(PsShmHeader *hdr, PsBackpressureMetrics *page,
 		walidx->throttle_enters = ps_load_acquire_u64(&hdr->walidx_backpressure.throttle_enters);
 		walidx->throttle_exits = ps_load_acquire_u64(&hdr->walidx_backpressure.throttle_exits);
 		walidx->foreground_wait_ns = ps_load_acquire_u64(&hdr->walidx_backpressure.foreground_wait_ns);
+		*forkmeta = *page;
+		forkmeta->lag_bytes = ps_load_acquire_u64(&hdr->forkmeta_backpressure.lag_bytes);
+		forkmeta->high_water_bytes = ps_load_acquire_u64(&hdr->forkmeta_backpressure.high_water_bytes);
+		forkmeta->catchup_bytes = ps_load_acquire_u64(&hdr->forkmeta_backpressure.catchup_bytes);
+		forkmeta->throttled = ps_load_acquire(&hdr->forkmeta_backpressure.throttled);
+		forkmeta->throttle_enters = ps_load_acquire_u64(&hdr->forkmeta_backpressure.throttle_enters);
+		forkmeta->throttle_exits = ps_load_acquire_u64(&hdr->forkmeta_backpressure.throttle_exits);
+		forkmeta->foreground_wait_ns = ps_load_acquire_u64(&hdr->forkmeta_backpressure.foreground_wait_ns);
 		after = ps_load_acquire_u64(&hdr->backpressure_metrics_seq);
 		if (before == after && !(after & 1))
 			return;
@@ -121,6 +130,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 	PsBackpressureMetrics page;
 	PsBackpressureMetrics wal;
 	PsBackpressureMetrics walidx;
+	PsBackpressureMetrics forkmeta;
 
 	for (uint32_t i = 0; i < hdr->nchannels; i++)
 	{
@@ -144,7 +154,7 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 				exit(1);
 		}
 	}
-	read_backpressure_metrics(hdr, &page, &wal, &walidx);
+	read_backpressure_metrics(hdr, &page, &wal, &walidx, &forkmeta);
 	printf("{\"idle\":%u,\"claimed\":%u,\"request\":%u,"
 		   "\"done\":%u,\"shards\":%u,\"wal_index_pending_bytes\":%llu,"
 		   "\"wal_index_lagging_timelines\":%u,"
@@ -159,7 +169,11 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   "\"walidx_lag_bytes\":%llu,\"walidx_high_water_bytes\":%llu,"
 		   "\"walidx_catchup_bytes\":%llu,\"walidx_throttled\":%u,"
 		   "\"walidx_throttle_enters\":%llu,\"walidx_throttle_exits\":%llu,"
-		   "\"walidx_foreground_wait_ns\":%llu}\n",
+		   "\"walidx_foreground_wait_ns\":%llu,"
+		   "\"forkmeta_lag_bytes\":%llu,\"forkmeta_high_water_bytes\":%llu,"
+		   "\"forkmeta_catchup_bytes\":%llu,\"forkmeta_throttled\":%u,"
+		   "\"forkmeta_throttle_enters\":%llu,\"forkmeta_throttle_exits\":%llu,"
+		   "\"forkmeta_foreground_wait_ns\":%llu}\n",
 		   idle, claimed, request, done, hdr->nshards,
 		   (unsigned long long) ps_load_acquire_u64(&hdr->wal_index_pending_bytes),
 		   ps_load_acquire(&hdr->wal_index_lagging_timelines),
@@ -180,7 +194,13 @@ print_backpressure(void *shm, PsShmHeader *hdr)
 		   (unsigned long long) walidx.catchup_bytes, walidx.throttled,
 		   (unsigned long long) walidx.throttle_enters,
 		   (unsigned long long) walidx.throttle_exits,
-		   (unsigned long long) walidx.foreground_wait_ns);
+		   (unsigned long long) walidx.foreground_wait_ns,
+		   (unsigned long long) forkmeta.lag_bytes,
+		   (unsigned long long) forkmeta.high_water_bytes,
+		   (unsigned long long) forkmeta.catchup_bytes, forkmeta.throttled,
+		   (unsigned long long) forkmeta.throttle_enters,
+		   (unsigned long long) forkmeta.throttle_exits,
+		   (unsigned long long) forkmeta.foreground_wait_ns);
 }
 
 static void

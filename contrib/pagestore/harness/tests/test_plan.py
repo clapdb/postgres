@@ -185,7 +185,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 39, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 40, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -1132,7 +1132,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":39,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":40,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -1148,7 +1148,10 @@ class PlanValidationTests(unittest.TestCase):
             "\"walidx_lag_bytes\":0,\"walidx_high_water_bytes\":0,"
             "\"walidx_catchup_bytes\":0,\"walidx_throttled\":0,"
             "\"walidx_throttle_enters\":0,\"walidx_throttle_exits\":0,"
-            "\"walidx_foreground_wait_ns\":0}' ;;\n"
+            "\"walidx_foreground_wait_ns\":0,\"forkmeta_lag_bytes\":0,"
+            "\"forkmeta_high_water_bytes\":0,\"forkmeta_catchup_bytes\":0,"
+            "\"forkmeta_throttled\":0,\"forkmeta_throttle_enters\":0,"
+            "\"forkmeta_throttle_exits\":0,\"forkmeta_foreground_wait_ns\":0}' ;;\n"
             "pruning) printf '%s\\n' "
             "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
             "\"versions_deleted\":0}' ;;\n"
@@ -1218,7 +1221,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":39,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":40,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
@@ -1234,7 +1237,10 @@ class PlanValidationTests(unittest.TestCase):
             "\"walidx_lag_bytes\":0,\"walidx_high_water_bytes\":0,"
             "\"walidx_catchup_bytes\":0,\"walidx_throttled\":0,"
             "\"walidx_throttle_enters\":0,\"walidx_throttle_exits\":0,"
-            "\"walidx_foreground_wait_ns\":0}' ;;\n"
+            "\"walidx_foreground_wait_ns\":0,\"forkmeta_lag_bytes\":0,"
+            "\"forkmeta_high_water_bytes\":0,\"forkmeta_catchup_bytes\":0,"
+            "\"forkmeta_throttled\":0,\"forkmeta_throttle_enters\":0,"
+            "\"forkmeta_throttle_exits\":0,\"forkmeta_foreground_wait_ns\":0}' ;;\n"
             "pruning) printf '%s\\n' "
             "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
             "\"versions_deleted\":0}' ;;\n"

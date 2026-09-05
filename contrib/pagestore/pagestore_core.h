@@ -50,6 +50,8 @@ extern uint64_t wal_reclaim_high_water_bytes;
 extern uint64_t wal_reclaim_catchup_bytes;
 extern uint64_t walidx_reclaim_high_water_bytes;
 extern uint64_t walidx_reclaim_catchup_bytes;
+extern uint64_t forkmeta_reclaim_high_water_bytes;
+extern uint64_t forkmeta_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;
 extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
@@ -88,6 +90,12 @@ extern void ps_admission_read_unlock(void);
 #define PS_BACKPRESSURE_PAGE 1u
 #define PS_BACKPRESSURE_WAL  2u
 #define PS_BACKPRESSURE_WALIDX 4u
+#define PS_BACKPRESSURE_FORKMETA 8u
+#define PS_BACKPRESSURE_ALL (PS_BACKPRESSURE_PAGE | PS_BACKPRESSURE_WAL | \
+	PS_BACKPRESSURE_WALIDX | PS_BACKPRESSURE_FORKMETA)
+extern int ps_backpressure_try_admit_mask(
+	const volatile sig_atomic_t *stop_flag, uint32_t controller_mask,
+	uint32_t *cause_mask);
 extern int ps_backpressure_try_admit(
 	const volatile sig_atomic_t *stop_flag, uint32_t *cause_mask);
 /* Add one completed deferred interval per controller.  The daemon aggregates
@@ -97,6 +105,10 @@ extern void ps_backpressure_record_wait(uint64_t page_wait_ns,
 extern void ps_backpressure_record_wait3(uint64_t page_wait_ns,
 										  uint64_t wal_wait_ns,
 										  uint64_t walidx_wait_ns);
+extern void ps_backpressure_record_wait4(uint64_t page_wait_ns,
+										  uint64_t wal_wait_ns,
+										  uint64_t walidx_wait_ns,
+										  uint64_t forkmeta_wait_ns);
 extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
@@ -110,14 +122,22 @@ extern int ps_backpressure_configure_all(uint64_t page_high_water,
 										 uint64_t wal_catchup,
 										 uint64_t walidx_high_water,
 										 uint64_t walidx_catchup);
+extern int ps_backpressure_configure_all_with_forkmeta(
+	uint64_t page_high_water, uint64_t page_catchup,
+	uint64_t wal_high_water, uint64_t wal_catchup,
+	uint64_t walidx_high_water, uint64_t walidx_catchup,
+	uint64_t forkmeta_high_water, uint64_t forkmeta_catchup);
 extern void ps_backpressure_refresh(void);
 extern void ps_backpressure_shutdown(void);
 /* Test-only deterministic lag injection; production maintenance never calls it. */
 extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
 extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
+extern void ps_test_backpressure_set_forkmeta_lag(uint64_t forkmeta_lag);
+extern int ps_test_forkmeta_force_due(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
+extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.

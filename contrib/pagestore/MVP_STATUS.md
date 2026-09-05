@@ -51,7 +51,7 @@ new daemon's zeroing/recovery window.
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
-| Retention horizon authority | Reader/materializer owners plus page-history and WAL-index frontiers implemented; WAL and forkmeta reclaim consumers remain | restart/corruption tests, exact-fence admission, branch projection, page/WAL-index publication crash tests, and bounded page churn |
+| Retention horizon authority | Reader/materializer owners plus page-history, WAL, WAL-index, and forkmeta reclaim frontiers/controllers implemented; queue-bound evidence remains R6 | restart/corruption tests, exact-fence admission, branch projection, page/WAL-index publication crash tests, forkmeta observer/controller tests, and bounded page churn |
 | Logical sharding | Implemented with shared-map locking | multi-shard standalone stress |
 | Background maintenance | Implemented for POSIX | dedicated maintenance controller; no foreground inline compaction |
 
@@ -288,11 +288,12 @@ entries, and atomically migrates complete legacy logs before opening the store.
 R5b-1 provides disabled-by-default, hysteretic POSIX backpressure for page
 segment and shipped-WAL reclaim debt.  R5b-2 adds the same foundation for
 WAL-index append tails and physically obsolete snapshot/epoch files, using
-bounded lock-free filesystem observation and shared-memory inspection.  This
-is still a partial R5b implementation: forkmeta has no controller, and the
-WAL-index controller is POSIX-only.  Until the remaining consumer lands,
-correctness demos run and page/WAL-index history is bounded, but total disk use
-can still grow without bound in the uncovered forkmeta area.
+bounded lock-free filesystem observation and shared-memory inspection.  R5b
+also covers forkmeta with a compacted-source baseline, append growth, and
+obsolete snapshot/temp debt; its forkmeta gate is limited to forkmeta-growing
+mutations and its snapshot maintenance can be forced below the geometric
+trigger.  All three controllers are POSIX-only; forkmeta does not claim the
+remaining R6 queue-bound soak/tuning work.
 
 ### 5. Composed crash and format-compatibility coverage -- remaining
 

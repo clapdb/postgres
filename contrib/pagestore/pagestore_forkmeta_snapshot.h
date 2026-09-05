@@ -49,6 +49,18 @@ typedef struct PsForkmetaSnapshotPrepared
 	PsForkmetaSnapshotPart tail;
 } PsForkmetaSnapshotPrepared;
 
+/* The in-memory selected tuple is the expected identity for periodic
+ * metadata observation.  A zero generation means that no snapshot is
+ * selected; an unexpected manifest is then unsafe rather than free debt. */
+typedef struct PsForkmetaSnapshotExpected
+{
+	uint64_t generation;
+	uint64_t cutoff_lsn;
+	uint64_t cutoff_admission_seq;
+	PsForkmetaSnapshotPart checkpoint;
+	PsForkmetaSnapshotPart tail;
+} PsForkmetaSnapshotExpected;
+
 /*
  * MUTATOR SERIALIZATION CONTRACT
  *
@@ -143,6 +155,16 @@ extern int ps_forkmeta_snapshot_read_tail(
  * an empty retry after an ambiguous prior unlink fsync. */
 extern int ps_forkmeta_snapshot_gc(const char *directory);
 #define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
+/* Metadata-only physical debt scan.  The source baseline is not charged.
+ * The selected and prepared manifest records, their file identities, and
+ * canonical part lengths are checked before and after a bounded scan.  The
+ * immutable payload CRCs are compared as metadata only and never reread on
+ * this periodic path. */
+extern int ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
+										const char *source_directory,
+										uint64_t source_baseline,
+										const PsForkmetaSnapshotExpected *expected,
+										uint64_t *bytes_out);
 /* Release the stable part descriptors and directory descriptor. */
 extern void ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot);
 

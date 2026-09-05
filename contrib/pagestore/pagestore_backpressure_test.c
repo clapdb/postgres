@@ -17,13 +17,17 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_retention.h"
 
 static int checks;
 static int failed;
 
 static void configure_page_core(void);
+static void fill_page(unsigned char *page, unsigned char tag);
 static int append_test_walidx_tail(uint32_t timeline, uint64_t progress);
 static int append_test_walidx_identity(uint32_t timeline);
+static int test_path_suffix(char *path, size_t path_size, const char *base,
+						const char *suffix);
 
 typedef struct WalIdxObservationRetryTest
 {
@@ -151,6 +155,20 @@ test_validation_and_hysteresis(void)
 	check(metrics.walidx_backpressure.throttled == 0 &&
 		  metrics.walidx_backpressure.throttle_exits == 1,
 		  "WAL-index controller releases at its catch-up target");
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+										 300, 120) == 0,
+		  "independent forkmeta thresholds are accepted");
+	ps_test_backpressure_set_forkmeta_lag(299);
+	check(metrics.forkmeta_backpressure.throttled == 0,
+		  "forkmeta lag below high-water does not throttle");
+	ps_test_backpressure_set_forkmeta_lag(300);
+	check(metrics.forkmeta_backpressure.throttled == 1 &&
+		  metrics.forkmeta_backpressure.lag_bytes == 300,
+		  "forkmeta controller enters independently");
+	ps_test_backpressure_set_forkmeta_lag(120);
+	check(metrics.forkmeta_backpressure.throttled == 0 &&
+		  metrics.forkmeta_backpressure.throttle_exits == 1,
+		  "forkmeta controller releases at catch-up");
 	check(ps_backpressure_configure(100, 40, 200, 80) == 0,
 		  "restore page/WAL controller configuration for shared checks");
 	ps_test_backpressure_set_lag(99, 199);
@@ -290,11 +308,12 @@ test_walidx_append_tail_restart(void)
 		  metrics.walidx_backpressure.throttled != 0,
 		  "WAL-index append tail enters the independent controller");
 	{
-		char log_path[1024];
-		char saved_path[1024];
+		char log_path[2048];
+		char saved_path[2048];
 
 		snprintf(log_path, sizeof(log_path), "%s/walidx_0_0", store);
-		snprintf(saved_path, sizeof(saved_path), "%s/walidx_0_0.saved", store);
+		check(snprintf(saved_path, sizeof(saved_path), "%s/walidx_0_0.saved", store) >= 0,
+			  "build the saved WAL-index path");
 		check(rename(log_path, saved_path) == 0,
 			  "locate the active legacy epoch-zero WAL-index file");
 		ps_backpressure_refresh();
@@ -306,8 +325,8 @@ test_walidx_append_tail_restart(void)
 		ps_backpressure_refresh();
 	}
 	{
-		char obsolete_log[1024];
-		char obsolete_marker[1024];
+		char obsolete_log[2048];
+		char obsolete_marker[2048];
 		unsigned char obsolete_data[7] = {0, 1, 2, 3, 4, 5, 6};
 		TestWalIdxWatermark watermark;
 		uint64_t baseline;
@@ -318,7 +337,9 @@ test_walidx_append_tail_restart(void)
 		 * log size: obsolete debt must charge log bytes plus marker bytes. */
 		snprintf(obsolete_log, sizeof(obsolete_log),
 				 "%s/walidx_0_0_e%020llu", store, 1ULL);
-		snprintf(obsolete_marker, sizeof(obsolete_marker), "%s.size", obsolete_log);
+		check(test_path_suffix(obsolete_marker, sizeof(obsolete_marker),
+						   obsolete_log, ".size") == 0,
+			  "build the obsolete watermark path");
 		memset(&watermark, 0, sizeof(watermark));
 		watermark.magic = UINT64_C(0x31524b4d58444957);
 		watermark.length = 123;
@@ -358,17 +379,20 @@ test_walidx_append_tail_restart(void)
 		}
 	}
 	{
-		char current_log[1024];
-		char current_marker[1024];
-		char watermark_temp[1200];
-		char malformed_temp[1200];
+		char current_log[2048];
+		char current_marker[2048];
+		char watermark_temp[4096];
+		char malformed_temp[4096];
 		int fd;
 
 		snprintf(current_log, sizeof(current_log),
 				 "%s/walidx_0_0_e%020llu", store, 1ULL);
-		snprintf(current_marker, sizeof(current_marker), "%s.size", current_log);
-		snprintf(watermark_temp, sizeof(watermark_temp),
-				 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 0U);
+		check(test_path_suffix(current_marker, sizeof(current_marker),
+						   current_log, ".size") == 0,
+			  "build the current watermark path");
+		check(snprintf(watermark_temp, sizeof(watermark_temp),
+						 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 0U) >= 0,
+			  "build the watermark residue path");
 		fd = open(watermark_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		check(fd >= 0 && write(fd, "watermark", 9) == 9 &&
 				fsync(fd) == 0 && close(fd) == 0,
@@ -394,8 +418,9 @@ test_walidx_append_tail_restart(void)
 			int gc_symlink_ok;
 			int gc_directory_ok;
 
-			snprintf(watermark_temp, sizeof(watermark_temp),
-					 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 2U);
+			check(snprintf(watermark_temp, sizeof(watermark_temp),
+						 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 2U) >= 0,
+				  "build the symlink watermark path");
 			gc_symlink_ok = symlink(current_marker, watermark_temp) == 0;
 			check(gc_symlink_ok && ps_storage->walidx_epoch_gc(0, keep_epochs, 1) < 0 &&
 					access(watermark_temp, F_OK) == 0,
@@ -409,8 +434,9 @@ test_walidx_append_tail_restart(void)
 			rmdir(watermark_temp);
 		}
 
-		snprintf(malformed_temp, sizeof(malformed_temp),
-				 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 128U);
+		check(snprintf(malformed_temp, sizeof(malformed_temp),
+					 "%s.tmp.%ld.%u", current_marker, (long) getpid(), 128U) >= 0,
+			  "build the malformed watermark path");
 		fd = open(malformed_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		check(fd >= 0 && close(fd) == 0,
 				"create a near-miss watermark temporary name");
@@ -429,9 +455,9 @@ test_walidx_append_tail_restart(void)
 		  metrics.walidx_backpressure.throttled == 0,
 		  "below-trigger WAL-index debt is snapshotted, GC'd, and released");
 	{
-		char current_log[1024];
-		char current_marker[1024];
-		char saved_path[1024];
+		char current_log[2048];
+		char current_marker[2048];
+		char saved_path[2048];
 		TestWalIdxWatermark original;
 		int fd;
 		int watermark_ok = 0;
@@ -440,8 +466,11 @@ test_walidx_append_tail_restart(void)
 		 * required CRC-protected active watermark. */
 		snprintf(current_log, sizeof(current_log),
 				 "%s/walidx_0_0_e%020llu", store, 1ULL);
-		snprintf(current_marker, sizeof(current_marker), "%s.size", current_log);
-		snprintf(saved_path, sizeof(saved_path), "%s.saved", current_marker);
+		check(test_path_suffix(current_marker, sizeof(current_marker),
+						   current_log, ".size") == 0 &&
+			  test_path_suffix(saved_path, sizeof(saved_path), current_marker,
+							 ".saved") == 0,
+			  "build the selected watermark paths");
 		fd = open(current_marker, O_RDONLY);
 		if (fd >= 0 && read(fd, &original, sizeof(original)) ==
 			(ssize_t) sizeof(original) && close(fd) == 0)
@@ -669,6 +698,226 @@ append_test_walidx_identity(uint32_t timeline)
 	ch.req_lsn = 200;
 	ch.key = (PsKey) {2, 2, 2, 0, PS_KLASS_RELATION};
 	return ps_handle_meta(&ch) == 1 && ch.status == PS_STATUS_OK;
+}
+
+static int
+write_test_file(const char *path, size_t len)
+{
+	unsigned char bytes[32];
+	int fd;
+
+	if (len > sizeof(bytes))
+		return 0;
+	memset(bytes, 0xa5, sizeof(bytes));
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	if (fd < 0 || write(fd, bytes, len) != (ssize_t) len || fsync(fd) != 0)
+	{
+		if (fd >= 0)
+			(void) close(fd);
+		return 0;
+	}
+	return close(fd) == 0;
+}
+
+static int
+test_path_suffix(char *path, size_t path_size, const char *base,
+				 const char *suffix)
+{
+	size_t base_len = strlen(base);
+	size_t suffix_len = strlen(suffix);
+
+	if (base_len >= path_size || suffix_len > path_size - 1 - base_len)
+		return -1;
+	memcpy(path, base, base_len);
+	memcpy(path + base_len, suffix, suffix_len + 1);
+	return 0;
+}
+
+static void
+test_forkmeta_backpressure_observer(void)
+{
+	char store[] = "/tmp/pagestore-forkmeta-backpressure-XXXXXX";
+	char snapshots[1024];
+	char old_checkpoint[1200];
+	char old_tail[1200];
+	char temporary[1200];
+	char malformed[1200];
+	char malformed_temp[1200];
+	char source[1024];
+	struct stat before;
+	struct stat after;
+	PsShmHeader metrics;
+	PsChannel channel;
+	volatile sig_atomic_t stop = 0;
+	uint32_t causes = 0;
+	uint64_t expected;
+
+	configure_page_core();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+																						180, 20) == 0 &&
+			mkdtemp(store) != NULL && ps_core_open(store) == 0,
+				"open a store for forkmeta backpressure observation");
+	ps_core_set_metrics_header(&metrics);
+	check(snprintf(source, sizeof(source), "%s/forkmeta", store) >= 0 &&
+			stat(source, &before) == 0,
+			"locate the stable forkmeta source baseline");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == (uint64_t) before.st_size &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"conservative pre-snapshot source history remains charged as debt");
+
+	memset(&channel, 0, sizeof(channel));
+	channel.opcode = PS_OP_CREATE;
+	channel.timeline = 0;
+	channel.key = (PsKey) {11, 11, 11, 0, PS_KLASS_RELATION};
+	channel.req_lsn = 100;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+			stat(source, &after) == 0,
+			"append a forkmeta growth event after the baseline");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_core_open(store) == 0,
+			"restart before the first selected snapshot");
+	ps_core_set_metrics_header(&metrics);
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes >= (uint64_t) after.st_size &&
+			metrics.forkmeta_backpressure.throttled != 0,
+			"restart conservatively charges preexisting unselected source history");
+	check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
+			mkdir(snapshots, 0700) == 0 &&
+		snprintf(old_checkpoint, sizeof(old_checkpoint),
+				 "%s/forkmeta_checkpoint_v1_00000000000000000001", snapshots) >= 0 &&
+		snprintf(old_tail, sizeof(old_tail),
+				 "%s/forkmeta_tail_v1_00000000000000000001", snapshots) >= 0 &&
+		snprintf(temporary, sizeof(temporary), "%s/forkmeta_tail_v1_00000000000000000002.tmp.1.1",
+				 snapshots) >= 0 && write_test_file(old_checkpoint, 11) &&
+			write_test_file(old_tail, 13) && write_test_file(temporary, 7),
+			"create obsolete forkmeta generations and temporary debris");
+	expected = (uint64_t) after.st_size + 11 + 13 + 7;
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == expected &&
+			metrics.forkmeta_backpressure.throttled != 0,
+			"forkmeta debt charges source growth plus obsolete metadata only");
+	check(ps_backpressure_try_admit_mask(&stop, PS_BACKPRESSURE_FORKMETA,
+										 &causes) == 0 &&
+			causes == PS_BACKPRESSURE_FORKMETA,
+				"forkmeta growth admission is deferred with its own cause");
+
+	check(snprintf(malformed, sizeof(malformed), "%s/unexpected", snapshots) >= 0 &&
+			write_test_file(malformed, 3),
+			"create an unrecognized snapshot entry");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+			metrics.forkmeta_backpressure.throttled != 0,
+			"unsafe snapshot observation fails closed");
+	check(ps_test_forkmeta_force_due() != 0,
+			"forkmeta throttle forces maintenance below the geometric trigger");
+	(void) unlink(malformed);
+	check(snprintf(malformed_temp, sizeof(malformed_temp),
+					 "%s/forkmeta_checkpoint_v1_bad.tmp.1.1", snapshots) >= 0 &&
+			write_test_file(malformed_temp, 5),
+			"create a malformed owned temporary snapshot name");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX,
+			"malformed owned snapshot names fail closed");
+	(void) unlink(malformed_temp);
+	check(metrics.forkmeta_backpressure.throttle_enters == 1,
+			"forkmeta controller records one throttle transition");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+			"disable forkmeta backpressure after observer test");
+	remove_tree(store);
+}
+
+static void
+test_forkmeta_self_recovery(void)
+{
+	char store[] = "/tmp/pagestore-forkmeta-self-recovery-XXXXXX";
+	char manifest[1200];
+	PsShmHeader metrics;
+	PsChannel channel;
+	PsRetentionPin pin;
+	PsKey key = {11, 11, 11, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	uint64_t page_admission_seq = 0;
+	int did = 0;
+
+	configure_page_core();
+	compact_layers = 0;
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+			180, 20) == 0 &&
+			mkdtemp(store) != NULL && ps_core_open(store) == 0,
+			"open a store for forkmeta self-recovery");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	for (unsigned char tag = 1; tag <= 2; tag++)
+	{
+		fill_page(page, tag);
+		ps_admission_read_lock();
+		ps_lock_shard_wr(0);
+		check(append_page(0, &key, 0, page, 0,
+				tag == 2 ? &page_admission_seq : NULL) == 0,
+				"seed replaceable page versions for a safe snapshot cutoff");
+		ps_unlock_shard(0);
+		ps_admission_read_unlock();
+	}
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_CONFIGURED;
+	pin.owner_id = 19001;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 1002;
+	pin.admission_seq = page_admission_seq;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+			"pin the newest page version as the safe compaction cutoff");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_core_open(store) == 0,
+			"reopen with flushed page layers before maintenance recovery");
+	ps_core_set_metrics_header(&metrics);
+	for (int i = 0; i < 8; i++)
+		(void) ps_core_maintenance();
+	memset(&channel, 0, sizeof(channel));
+	channel.opcode = PS_OP_CREATE;
+	channel.timeline = 0;
+	channel.key = key;
+	channel.req_lsn = 100;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"seed forkmeta lifecycle history after a safe page frontier exists");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes >= 180 &&
+			metrics.forkmeta_backpressure.throttled != 0,
+			"forkmeta debt throttles below the geometric trigger");
+	check(snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
+				store) >= 0,
+			"build the forkmeta self-recovery manifest path");
+	for (int i = 0; i < 64; i++)
+	{
+		if (ps_core_maintenance())
+			did = 1;
+		ps_backpressure_refresh();
+		if (access(manifest, F_OK) == 0 &&
+			metrics.forkmeta_backpressure.lag_bytes <= 20 &&
+			metrics.forkmeta_backpressure.throttled == 0)
+			break;
+	}
+	check(did && access(manifest, F_OK) == 0 &&
+		metrics.forkmeta_backpressure.lag_bytes <= 20 &&
+		metrics.forkmeta_backpressure.throttled == 0,
+			"maintenance publishes snapshot/GC and clears forkmeta throttle");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+			"disable forkmeta backpressure after self-recovery test");
+	remove_tree(store);
 }
 
 static void
@@ -1106,6 +1355,8 @@ main(void)
 {
 	test_validation_and_hysteresis();
 	test_nonblocking_admission_and_shutdown();
+	test_forkmeta_backpressure_observer();
+	test_forkmeta_self_recovery();
 	test_walidx_append_tail_restart();
 	test_walidx_aggregate_force();
 	test_walidx_automatic_observation_rate();

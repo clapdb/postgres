@@ -72,6 +72,8 @@ uint64_t	wal_reclaim_high_water_bytes;
 uint64_t	wal_reclaim_catchup_bytes;
 uint64_t	walidx_reclaim_high_water_bytes;
 uint64_t	walidx_reclaim_catchup_bytes;
+uint64_t	forkmeta_reclaim_high_water_bytes;
+uint64_t	forkmeta_reclaim_catchup_bytes;
 /*
  * Use the LSM read path: rebuild the index from image layers on restart and
  * (in the frontend) serve reads via read_resolve.  The POSIX daemon enables it;
@@ -248,16 +250,21 @@ static pthread_mutex_t backpressure_lock = PTHREAD_MUTEX_INITIALIZER;
 static PsBackpressureController page_backpressure;
 static PsBackpressureController wal_backpressure;
 static PsBackpressureController walidx_backpressure;
+static PsBackpressureController forkmeta_backpressure;
 #define MAX_TIMELINES	1024
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
 static uint64_t walidx_observation_next_ns;
 static uint64_t walidx_observation_count;
 #define WALIDX_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
+static uint64_t forkmeta_observation_next_ns;
+static uint64_t forkmeta_observation_count;
+#define FORKMETA_AUTO_OBSERVATION_INTERVAL_NS UINT64_C(100000000)
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
 static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
 static void *backpressure_slow_path_test_hook_arg;
+static char wal_segment_root[4096];
 
 #define PS_BACKPRESSURE_GATE_PAGE_ENABLED	(1u << 0)
 #define PS_BACKPRESSURE_GATE_WAL_ENABLED	(1u << 1)
@@ -265,14 +272,18 @@ static void *backpressure_slow_path_test_hook_arg;
 #define PS_BACKPRESSURE_GATE_WAL_THROTTLED	(1u << 3)
 #define PS_BACKPRESSURE_GATE_WALIDX_ENABLED	(1u << 4)
 #define PS_BACKPRESSURE_GATE_WALIDX_THROTTLED	(1u << 5)
+#define PS_BACKPRESSURE_GATE_FORKMETA_ENABLED	(1u << 6)
+#define PS_BACKPRESSURE_GATE_FORKMETA_THROTTLED	(1u << 7)
 #define PS_BACKPRESSURE_GATE_THROTTLED_MASK \
 	(PS_BACKPRESSURE_GATE_PAGE_THROTTLED | PS_BACKPRESSURE_GATE_WAL_THROTTLED | \
-	 PS_BACKPRESSURE_GATE_WALIDX_THROTTLED)
+	 PS_BACKPRESSURE_GATE_WALIDX_THROTTLED | PS_BACKPRESSURE_GATE_FORKMETA_THROTTLED)
 
 static uint64_t page_reclaim_lag_bytes(void);
 static uint64_t wal_reclaim_lag_bytes(void);
 static uint64_t walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 									unsigned char *gc_candidates);
+static uint64_t forkmeta_reclaim_lag_bytes(void);
+static int fork_meta_backpressure_throttled(void);
 static int admission_write_lock(void);
 static void backpressure_publish_locked(void);
 static void backpressure_update_locked(PsBackpressureController *controller,
@@ -640,6 +651,10 @@ backpressure_publish_locked(void)
 		gate_mask |= PS_BACKPRESSURE_GATE_WAL_THROTTLED;
 	if (walidx_backpressure.throttled)
 		gate_mask |= PS_BACKPRESSURE_GATE_WALIDX_THROTTLED;
+	if (forkmeta_backpressure.high_water_bytes != 0)
+		gate_mask |= PS_BACKPRESSURE_GATE_FORKMETA_ENABLED;
+	if (forkmeta_backpressure.throttled)
+		gate_mask |= PS_BACKPRESSURE_GATE_FORKMETA_THROTTLED;
 	/* Publish controller state before advertising the corresponding fast-path
 	 * mask.  Slow-path callers recheck authoritative state under the mutex. */
 	__atomic_store_n(&backpressure_gate_mask, gate_mask, __ATOMIC_RELEASE);
@@ -689,6 +704,20 @@ backpressure_publish_locked(void)
 						 walidx_backpressure.throttle_exits);
 	ps_store_release_u64(&hdr->walidx_backpressure.foreground_wait_ns,
 						 walidx_backpressure.foreground_wait_ns);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.lag_bytes,
+						 forkmeta_backpressure.lag_bytes);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.high_water_bytes,
+						 forkmeta_backpressure.high_water_bytes);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.catchup_bytes,
+						 forkmeta_backpressure.catchup_bytes);
+	ps_store_release(&hdr->forkmeta_backpressure.throttled,
+						 forkmeta_backpressure.throttled != 0);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.throttle_enters,
+						 forkmeta_backpressure.throttle_enters);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.throttle_exits,
+						 forkmeta_backpressure.throttle_exits);
+	ps_store_release_u64(&hdr->forkmeta_backpressure.foreground_wait_ns,
+						 forkmeta_backpressure.foreground_wait_ns);
 	ps_fetch_add_u64(&hdr->backpressure_metrics_seq, 1);
 }
 
@@ -708,8 +737,23 @@ ps_backpressure_configure_all(uint64_t page_high_water,
 							  uint64_t page_catchup,
 							  uint64_t wal_high_water,
 							  uint64_t wal_catchup,
-							  uint64_t walidx_high_water,
-							  uint64_t walidx_catchup)
+								  uint64_t walidx_high_water,
+								  uint64_t walidx_catchup)
+{
+	return ps_backpressure_configure_all_with_forkmeta(page_high_water,
+		page_catchup, wal_high_water, wal_catchup, walidx_high_water,
+		walidx_catchup, 0, 0);
+}
+
+int
+ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
+										uint64_t page_catchup,
+										uint64_t wal_high_water,
+										uint64_t wal_catchup,
+										uint64_t walidx_high_water,
+										uint64_t walidx_catchup,
+										uint64_t forkmeta_high_water,
+										uint64_t forkmeta_catchup)
 {
 	if ((page_high_water == 0 && page_catchup != 0) ||
 		(page_high_water != 0 && page_catchup >= page_high_water) ||
@@ -717,7 +761,9 @@ ps_backpressure_configure_all(uint64_t page_high_water,
 		(wal_high_water == 0 && wal_catchup != 0) ||
 		(wal_high_water != 0 && wal_catchup >= wal_high_water) ||
 		(walidx_high_water == 0 && walidx_catchup != 0) ||
-		(walidx_high_water != 0 && walidx_catchup >= walidx_high_water))
+		(walidx_high_water != 0 && walidx_catchup >= walidx_high_water) ||
+		(forkmeta_high_water == 0 && forkmeta_catchup != 0) ||
+		(forkmeta_high_water != 0 && forkmeta_catchup >= forkmeta_high_water))
 	{
 		errno = EINVAL;
 		return -1;
@@ -728,16 +774,23 @@ ps_backpressure_configure_all(uint64_t page_high_water,
 	wal_reclaim_catchup_bytes = wal_catchup;
 	walidx_reclaim_high_water_bytes = walidx_high_water;
 	walidx_reclaim_catchup_bytes = walidx_catchup;
+	forkmeta_reclaim_high_water_bytes = forkmeta_high_water;
+	forkmeta_reclaim_catchup_bytes = forkmeta_catchup;
+	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&forkmeta_observation_count, 0, __ATOMIC_RELEASE);
 	pthread_mutex_lock(&backpressure_lock);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
 	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
 	memset(&walidx_backpressure, 0, sizeof(walidx_backpressure));
+	memset(&forkmeta_backpressure, 0, sizeof(forkmeta_backpressure));
 	page_backpressure.high_water_bytes = page_high_water;
 	page_backpressure.catchup_bytes = page_catchup;
 	wal_backpressure.high_water_bytes = wal_high_water;
 	wal_backpressure.catchup_bytes = wal_catchup;
 	walidx_backpressure.high_water_bytes = walidx_high_water;
 	walidx_backpressure.catchup_bytes = walidx_catchup;
+	forkmeta_backpressure.high_water_bytes = forkmeta_high_water;
+	forkmeta_backpressure.catchup_bytes = forkmeta_catchup;
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
 		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
@@ -751,8 +804,9 @@ ps_backpressure_configure_all(uint64_t page_high_water,
 }
 
 int
-ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
-						  uint32_t *cause_mask)
+ps_backpressure_try_admit_mask(const volatile sig_atomic_t *stop_flag,
+								 uint32_t controller_mask,
+								 uint32_t *cause_mask)
 {
 	uint32_t causes = 0;
 	uint32_t gate_mask;
@@ -767,7 +821,16 @@ ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
 		return -1;
 	}
 	gate_mask = __atomic_load_n(&backpressure_gate_mask, __ATOMIC_ACQUIRE);
-	if ((gate_mask & PS_BACKPRESSURE_GATE_THROTTLED_MASK) == 0)
+	if ((gate_mask & (PS_BACKPRESSURE_GATE_THROTTLED_MASK &
+						  (controller_mask == PS_BACKPRESSURE_ALL ? UINT32_MAX :
+						   ((controller_mask & PS_BACKPRESSURE_PAGE) ?
+							PS_BACKPRESSURE_GATE_PAGE_THROTTLED : 0) |
+						   ((controller_mask & PS_BACKPRESSURE_WAL) ?
+							PS_BACKPRESSURE_GATE_WAL_THROTTLED : 0) |
+						   ((controller_mask & PS_BACKPRESSURE_WALIDX) ?
+							PS_BACKPRESSURE_GATE_WALIDX_THROTTLED : 0) |
+						   ((controller_mask & PS_BACKPRESSURE_FORKMETA) ?
+							PS_BACKPRESSURE_GATE_FORKMETA_THROTTLED : 0)))) == 0)
 	{
 		if (cause_mask != NULL)
 			*cause_mask = 0;
@@ -790,21 +853,39 @@ ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
 		causes |= PS_BACKPRESSURE_WAL;
 	if (walidx_backpressure.throttled)
 		causes |= PS_BACKPRESSURE_WALIDX;
+	if (forkmeta_backpressure.throttled)
+		causes |= PS_BACKPRESSURE_FORKMETA;
+	causes &= controller_mask;
 	pthread_mutex_unlock(&backpressure_lock);
 	if (cause_mask != NULL)
 		*cause_mask = causes;
 	return causes == 0 ? 1 : 0;
 }
 
+int
+ps_backpressure_try_admit(const volatile sig_atomic_t *stop_flag,
+						  uint32_t *cause_mask)
+{
+	return ps_backpressure_try_admit_mask(stop_flag, PS_BACKPRESSURE_ALL,
+										  cause_mask);
+}
+
 void
 ps_backpressure_record_wait(uint64_t page_wait_ns, uint64_t wal_wait_ns)
 {
-	ps_backpressure_record_wait3(page_wait_ns, wal_wait_ns, 0);
+	ps_backpressure_record_wait4(page_wait_ns, wal_wait_ns, 0, 0);
 }
 
 void
 ps_backpressure_record_wait3(uint64_t page_wait_ns, uint64_t wal_wait_ns,
-							 uint64_t walidx_wait_ns)
+								 uint64_t walidx_wait_ns)
+{
+	ps_backpressure_record_wait4(page_wait_ns, wal_wait_ns, walidx_wait_ns, 0);
+}
+
+void
+ps_backpressure_record_wait4(uint64_t page_wait_ns, uint64_t wal_wait_ns,
+							 uint64_t walidx_wait_ns, uint64_t forkmeta_wait_ns)
 {
 	pthread_mutex_lock(&backpressure_lock);
 	if (page_wait_ns != 0)
@@ -819,7 +900,12 @@ ps_backpressure_record_wait3(uint64_t page_wait_ns, uint64_t wal_wait_ns,
 		walidx_backpressure.foreground_wait_ns =
 			UINT64_MAX - walidx_backpressure.foreground_wait_ns < walidx_wait_ns ?
 			UINT64_MAX : walidx_backpressure.foreground_wait_ns + walidx_wait_ns;
-	if (page_wait_ns != 0 || wal_wait_ns != 0 || walidx_wait_ns != 0)
+	if (forkmeta_wait_ns != 0)
+		forkmeta_backpressure.foreground_wait_ns =
+			UINT64_MAX - forkmeta_backpressure.foreground_wait_ns < forkmeta_wait_ns ?
+			UINT64_MAX : forkmeta_backpressure.foreground_wait_ns + forkmeta_wait_ns;
+	if (page_wait_ns != 0 || wal_wait_ns != 0 || walidx_wait_ns != 0 ||
+		forkmeta_wait_ns != 0)
 		backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
 }
@@ -857,6 +943,23 @@ ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag)
 	pthread_mutex_unlock(&backpressure_lock);
 }
 
+void
+ps_test_backpressure_set_forkmeta_lag(uint64_t forkmeta_lag)
+{
+	pthread_mutex_lock(&backpressure_lock);
+	backpressure_update_locked(&forkmeta_backpressure, forkmeta_lag,
+							   forkmeta_reclaim_high_water_bytes,
+							   forkmeta_reclaim_catchup_bytes);
+	backpressure_publish_locked();
+	pthread_mutex_unlock(&backpressure_lock);
+}
+
+int
+ps_test_forkmeta_force_due(void)
+{
+	return fork_meta_backpressure_throttled();
+}
+
 int
 ps_test_walidx_force_due(uint32_t timeline)
 {
@@ -876,6 +979,12 @@ uint64_t
 ps_test_backpressure_walidx_observation_count(void)
 {
 	return __atomic_load_n(&walidx_observation_count, __ATOMIC_ACQUIRE);
+}
+
+uint64_t
+ps_test_backpressure_forkmeta_observation_count(void)
+{
+	return __atomic_load_n(&forkmeta_observation_count, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -5433,8 +5542,15 @@ static uint64_t fork_meta_snapshot_generation;
 static uint64_t fork_meta_snapshot_cutoff_lsn;
 static uint64_t fork_meta_snapshot_cutoff_seq;
 static uint64_t fork_meta_snapshot_freeze_seq;
+/* The selected source is a compacted baseline, not controller debt.  Only
+ * bytes appended after this baseline are charged.  The value is rebuilt after
+ * recovery and advanced only after a durable source rewrite. */
+static uint64_t fork_meta_reclaim_baseline_bytes;
+static int fork_meta_reclaim_baseline_valid;
 static int fork_meta_event_future(uint64_t lsn, uint64_t admission_seq,
 							  uint64_t cutoff_lsn, uint64_t cutoff_seq);
+static int fork_meta_snapshot_marker_matches(const ForkMetaRecV2 *rec);
+static int fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec);
 
 static int
 fork_meta_mutation_future(uint64_t lsn, uint64_t admission_seq)
@@ -5520,6 +5636,8 @@ static int fork_meta_migrated = 0;	/* the log carries the migration-done marker 
 static int fork_meta_legacy = 0;	/* replay lsn-0 records during a known migration */
 static int fork_meta_migrate_failed = 0;	/* a migration persist failed this run */
 static uint64_t fork_meta_snapshot_bytes;
+static PsForkmetaSnapshotPart fork_meta_snapshot_checkpoint_meta;
+static PsForkmetaSnapshotPart fork_meta_snapshot_tail_meta;
 static int fork_meta_snapshot_gc_pending;
 /* A successful deletion-filtered cutover is sufficient for this process.  The
  * selected snapshot/source pair remains authoritative after restart, while
@@ -5531,6 +5649,60 @@ static unsigned char fork_meta_deletion_cutover_done[MAX_TIMELINES];
 static int fork_meta_snapshot_gc_ambiguous;
 static struct timespec fork_meta_snapshot_retry_at;
 static char fork_meta_snapshot_dir[4096];
+
+/* The baseline is deliberately conservative across restart.  There is no
+ * persisted source-length marker in the v1 snapshot manifest, so reopening
+ * with a zero baseline charges all preexisting source bytes until the next
+ * durable rewrite.  This can throttle after restart, but cannot silently
+ * forgive arbitrarily large history. */
+static int
+fork_meta_reclaim_baseline_init(void)
+{
+	struct stat st;
+	int directory_fd;
+	int rc = 0;
+
+	directory_fd = open(wal_segment_root,
+						O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (directory_fd < 0)
+		return -1;
+	if (fstatat(directory_fd, "forkmeta", &st, AT_SYMLINK_NOFOLLOW) != 0)
+		rc = errno == ENOENT ? 0 : -1;
+	else if (!S_ISREG(st.st_mode) || st.st_size < 0)
+		rc = -1;
+	if (close(directory_fd) != 0)
+		rc = -1;
+	if (rc != 0)
+		return -1;
+	fork_meta_reclaim_baseline_bytes = 0;
+	fork_meta_reclaim_baseline_valid = 1;
+	return 0;
+}
+
+static uint64_t
+forkmeta_reclaim_lag_bytes(void)
+{
+	PsForkmetaSnapshotExpected expected;
+	uint64_t debt;
+
+	if (ps_storage == NULL || ps_storage->name == NULL ||
+		strcmp(ps_storage->name, "posix") != 0 ||
+		!fork_meta_reclaim_baseline_valid)
+		return UINT64_MAX;
+	memset(&expected, 0, sizeof(expected));
+	expected.generation = fork_meta_snapshot_generation;
+	expected.cutoff_lsn = fork_meta_snapshot_cutoff_lsn;
+	expected.cutoff_admission_seq = fork_meta_snapshot_cutoff_seq;
+	expected.checkpoint = fork_meta_snapshot_checkpoint_meta;
+	expected.tail = fork_meta_snapshot_tail_meta;
+	if (ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
+										wal_segment_root,
+										fork_meta_reclaim_baseline_bytes,
+										&expected, &debt) != 0)
+		return UINT64_MAX;
+	return debt;
+}
+
 
 void
 ps_test_forkmeta_snapshot_gc_retry_now(void)
@@ -5864,6 +6036,8 @@ fork_meta_snapshot_load(const char *directory)
 	fork_meta_snapshot_cutoff_seq = snapshot.cutoff_admission_seq;
 	fork_meta_snapshot_freeze_seq = headers[0].freeze_admission_seq;
 	fork_meta_snapshot_bytes = snapshot.checkpoint.len + snapshot.tail.len;
+	fork_meta_snapshot_checkpoint_meta = snapshot.checkpoint;
+	fork_meta_snapshot_tail_meta = snapshot.tail;
 	ps_forkmeta_snapshot_close(&snapshot);
 	free(data[0]);
 	free(data[1]);
@@ -6657,6 +6831,13 @@ fork_meta_snapshot_gc_due(void)
 }
 
 static int
+fork_meta_backpressure_throttled(void)
+{
+	return (__atomic_load_n(&backpressure_gate_mask, __ATOMIC_ACQUIRE) &
+			PS_BACKPRESSURE_GATE_FORKMETA_THROTTLED) != 0;
+}
+
+static int
 fork_meta_snapshot_due_locked(void)
 {
 	const char *value = getenv("PAGESTORE_FORKMETA_SNAPSHOT_TRIGGER_BYTES");
@@ -6671,7 +6852,7 @@ fork_meta_snapshot_due_locked(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(fork_meta_bytes_load() >= threshold ||
+		(fork_meta_backpressure_throttled() || fork_meta_bytes_load() >= threshold ||
 		 fork_meta_deletion_cutover_due_locked());
 }
 
@@ -6690,7 +6871,7 @@ fork_meta_snapshot_due(void)
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		(fork_meta_bytes_load() >= threshold ||
+		(fork_meta_backpressure_throttled() || fork_meta_bytes_load() >= threshold ||
 		 fork_meta_deletion_probe_due());
 }
 
@@ -6851,11 +7032,15 @@ fork_meta_snapshot_maintenance(void)
 	 * directory have been fsynced. */
 	(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_SOURCE_REWRITE);
 	fork_meta_bytes_store(source.len);
+	fork_meta_reclaim_baseline_bytes = source.len;
+	fork_meta_reclaim_baseline_valid = 1;
 	fork_meta_snapshot_generation = generation;
 	fork_meta_snapshot_cutoff_lsn = cutoff.lsn;
 	fork_meta_snapshot_cutoff_seq = cutoff.admission_seq;
 	fork_meta_snapshot_freeze_seq = freeze_seq;
 	fork_meta_snapshot_bytes = checkpoint.len + tail.len;
+	fork_meta_snapshot_checkpoint_meta = prepared.checkpoint;
+	fork_meta_snapshot_tail_meta = prepared.tail;
 	fork_meta_snapshot_gc_pending = 1;
 	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
 	if (filter_deleting)
@@ -7200,7 +7385,6 @@ static uint32_t wal_chunks_n[MAX_TIMELINES];
 static uint32_t wal_chunks_cap[MAX_TIMELINES];
 static uint64_t wal_log_bytes[MAX_TIMELINES];
 #define WAL_IMMUTABLE_SEGMENT_BYTES PS_WAL_SEGMENT_MIN_BYTES
-static char wal_segment_root[4096];
 static struct timespec wal_reclaim_retry_at[MAX_TIMELINES];
 static uint32_t wal_reclaim_cursor;
 
@@ -12459,6 +12643,42 @@ walidx_arm_observation_timer(void)
 	__atomic_store_n(&walidx_observation_next_ns, due, __ATOMIC_RELEASE);
 }
 
+static int
+forkmeta_auto_observation_claim(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t next;
+
+	if (now == UINT64_MAX)
+		return 1;
+	for (;;)
+	{
+		next = __atomic_load_n(&forkmeta_observation_next_ns, __ATOMIC_ACQUIRE);
+		if (next == UINT64_MAX || now < next)
+			return 0;
+		if (__atomic_compare_exchange_n(&forkmeta_observation_next_ns, &next,
+										UINT64_MAX, 0, __ATOMIC_ACQ_REL,
+										__ATOMIC_ACQUIRE))
+			return 1;
+	}
+}
+
+static void
+forkmeta_arm_observation_timer(void)
+{
+	uint64_t now = backpressure_monotonic_ns();
+	uint64_t due;
+
+	if (now == UINT64_MAX)
+	{
+		__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
+		return;
+	}
+	due = UINT64_MAX - now < FORKMETA_AUTO_OBSERVATION_INTERVAL_NS ?
+		UINT64_MAX - 1 : now + FORKMETA_AUTO_OBSERVATION_INTERVAL_NS;
+	__atomic_store_n(&forkmeta_observation_next_ns, due, __ATOMIC_RELEASE);
+}
+
 static void
 ps_backpressure_refresh_internal(int automatic)
 {
@@ -12466,6 +12686,8 @@ ps_backpressure_refresh_internal(int automatic)
 	unsigned char walidx_gc_candidates[MAX_TIMELINES] = {0};
 	int observe_walidx = walidx_reclaim_high_water_bytes != 0 &&
 		(!automatic || walidx_auto_observation_claim());
+	int observe_forkmeta = forkmeta_reclaim_high_water_bytes != 0 &&
+		(!automatic || forkmeta_auto_observation_claim());
 	uint64_t page_lag = page_reclaim_high_water_bytes != 0 ?
 		page_reclaim_lag_bytes() : 0;
 	uint64_t wal_lag = wal_reclaim_high_water_bytes != 0 ?
@@ -12473,11 +12695,18 @@ ps_backpressure_refresh_internal(int automatic)
 	uint64_t walidx_lag = observe_walidx ?
 		walidx_reclaim_lag_bytes(walidx_tail_candidates,
 									 walidx_gc_candidates) : 0;
+	uint64_t forkmeta_lag = observe_forkmeta ?
+		forkmeta_reclaim_lag_bytes() : 0;
 
 	if (observe_walidx)
 	{
 		__atomic_fetch_add(&walidx_observation_count, 1, __ATOMIC_RELAXED);
 		walidx_arm_observation_timer();
+	}
+	if (observe_forkmeta)
+	{
+		__atomic_fetch_add(&forkmeta_observation_count, 1, __ATOMIC_RELAXED);
+		forkmeta_arm_observation_timer();
 	}
 
 	pthread_mutex_lock(&backpressure_lock);
@@ -12501,6 +12730,10 @@ ps_backpressure_refresh_internal(int automatic)
 				walidx_gc_candidates[tl], __ATOMIC_RELEASE);
 		}
 	}
+	if (observe_forkmeta)
+		backpressure_update_locked(&forkmeta_backpressure, forkmeta_lag,
+										 forkmeta_reclaim_high_water_bytes,
+										 forkmeta_reclaim_catchup_bytes);
 	backpressure_publish_locked();
 	pthread_mutex_unlock(&backpressure_lock);
 }
@@ -14723,7 +14956,8 @@ ps_core_maintenance(void)
 	 * path (or its scheduling) merely to republish an unchanged zero snapshot. */
 	if (page_reclaim_high_water_bytes != 0 ||
 		wal_reclaim_high_water_bytes != 0 ||
-		walidx_reclaim_high_water_bytes != 0)
+		walidx_reclaim_high_water_bytes != 0 ||
+		forkmeta_reclaim_high_water_bytes != 0)
 		ps_backpressure_refresh_automatic();
 	return did;
 }
@@ -14785,6 +15019,12 @@ ps_core_open(const char *store_dir)
 	fork_meta_snapshot_cutoff_lsn = 0;
 	fork_meta_snapshot_cutoff_seq = 0;
 	fork_meta_snapshot_freeze_seq = 0;
+	memset(&fork_meta_snapshot_checkpoint_meta, 0,
+		   sizeof(fork_meta_snapshot_checkpoint_meta));
+	memset(&fork_meta_snapshot_tail_meta, 0,
+		   sizeof(fork_meta_snapshot_tail_meta));
+	fork_meta_reclaim_baseline_bytes = 0;
+	fork_meta_reclaim_baseline_valid = 0;
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
 	fork_meta_snapshot_gc_ambiguous = 0;
@@ -15119,6 +15359,9 @@ ps_core_open(const char *store_dir)
 		}
 
 	if (publish_shard_count && publish_store_shard_count(store_dir) != 0)
+		return -1;
+	if (forkmeta_reclaim_high_water_bytes != 0 &&
+		fork_meta_reclaim_baseline_init() != 0)
 		return -1;
 
 	return 0;

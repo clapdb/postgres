@@ -323,6 +323,41 @@ parse_generation_name(const char *name, const char *prefix,
 }
 
 static int
+parse_pid_attempt(const char *text)
+{
+	uint64_t pid_value = 0;
+	uint64_t attempt = 0;
+	const char *p = text;
+	pid_t pid;
+
+	if (*p < '0' || *p > '9')
+		return -1;
+	for (; *p >= '0' && *p <= '9'; p++)
+	{
+		unsigned int digit = (unsigned int) (*p - '0');
+
+		if (pid_value > (UINT64_MAX - digit) / 10)
+			return -1;
+		pid_value = pid_value * 10 + digit;
+	}
+	if (*p++ != '.' || *p < '0' || *p > '9')
+		return -1;
+	for (; *p >= '0' && *p <= '9'; p++)
+	{
+		unsigned int digit = (unsigned int) (*p - '0');
+
+		if (attempt > (UINT64_MAX - digit) / 10)
+			return -1;
+		attempt = attempt * 10 + digit;
+	}
+	if (*p != '\0' || pid_value == 0 || attempt >= 128 ||
+		pid_value > (uint64_t) LONG_MAX)
+		return -1;
+	pid = (pid_t) pid_value;
+	return pid > 0 && (uint64_t) (long) pid == pid_value ? 0 : -1;
+}
+
+static int
 parse_temp_name(const char *name)
 {
 	const char *bases[] = {FORKMETA_SNAPSHOT_MANIFEST,
@@ -346,37 +381,17 @@ parse_temp_name(const char *name)
 		if (parse_generation_name(base, part_prefixes[i],
 								  &(uint64_t) {0}) == 0)
 		{
-			const char *p = marker + 5;
-
-			if (*p < '0' || *p > '9')
-				return -1;
-			while (*p >= '0' && *p <= '9')
-				p++;
-			if (*p++ != '.' || *p < '0' || *p > '9')
-				return -1;
-			while (*p >= '0' && *p <= '9')
-				p++;
-			return *p == '\0' ? 0 : -1;
+			return parse_pid_attempt(marker + 5);
 		}
 	}
 	for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++)
 	{
 		size_t base_len = strlen(bases[i]);
-		const char *p;
 
 		if ((size_t) (marker - name) != base_len ||
 			memcmp(name, bases[i], base_len) != 0)
 			continue;
-		p = marker + 5;
-		if (*p < '0' || *p > '9')
-			return -1;
-		while (*p >= '0' && *p <= '9')
-			p++;
-		if (*p++ != '.' || *p < '0' || *p > '9')
-			return -1;
-		while (*p >= '0' && *p <= '9')
-			p++;
-		return *p == '\0' ? 0 : -1;
+		return parse_pid_attempt(marker + 5);
 	}
 	return -1;
 }
@@ -1200,6 +1215,16 @@ remove_generation_files(int directory_fd, uint64_t generation)
 	return rc;
 }
 
+static int
+snapshot_gc_entry_regular(int directory_fd, const char *name)
+{
+	struct stat st;
+
+	if (fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT ? 0 : -1;
+	return S_ISREG(st.st_mode) ? 1 : -1;
+}
+
 int
 ps_forkmeta_snapshot_abort(const PsForkmetaSnapshotPrepared *prepared)
 {
@@ -1492,15 +1517,27 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	while ((entry = readdir(dir)) != NULL)
 	{
 		uint64_t generation;
-		int recognized = parse_temp_name(entry->d_name) == 0;
+		int temp_status = parse_temp_name(entry->d_name);
+		int recognized = temp_status == 0;
 
 		if (!recognized)
 		{
-			recognized = parse_generation_name(entry->d_name,
-									 FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
-									 &generation) == 0 ||
+			int checkpoint_status =
+				strncmp(entry->d_name, FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
+						strlen(FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX)) == 0 ?
 				parse_generation_name(entry->d_name,
-									 FORKMETA_SNAPSHOT_TAIL_PREFIX, &generation) == 0;
+										 FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
+										 &generation) : 1;
+			int tail_status =
+				strncmp(entry->d_name, FORKMETA_SNAPSHOT_TAIL_PREFIX,
+						strlen(FORKMETA_SNAPSHOT_TAIL_PREFIX)) == 0 ?
+				parse_generation_name(entry->d_name,
+										 FORKMETA_SNAPSHOT_TAIL_PREFIX, &generation) : 1;
+
+			if ((strstr(entry->d_name, ".tmp.") != NULL && temp_status != 0) ||
+				checkpoint_status < 0 || tail_status < 0)
+				goto cleanup;
+			recognized = checkpoint_status == 0 || tail_status == 0;
 			if (!recognized || generation >= current.generation ||
 				(intent_exists && generation == durable_prepared.generation))
 				continue;
@@ -1531,8 +1568,20 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	}
 	for (size_t i = 0; i < count; i++)
 	{
-		if (unlinkat(current.directory_fd, names[i], 0) != 0)
+		int regular = snapshot_gc_entry_regular(current.directory_fd, names[i]);
+
+		if (regular < 0)
+		{
 			unlink_failed = 1;
+			continue;
+		}
+		if (regular == 0)
+			continue;
+		if (unlinkat(current.directory_fd, names[i], 0) != 0)
+		{
+			if (errno != ENOENT)
+				unlink_failed = 1;
+		}
 		else
 			removed = 1;
 	}
@@ -1561,6 +1610,500 @@ cleanup:
 		(void) close(scan_fd);
 	ps_forkmeta_snapshot_close(&current);
 	return rc;
+}
+
+#define FORKMETA_OBSERVATION_MAX_ENTRIES 4096U
+#define FORKMETA_OBSERVATION_RETRIES 3U
+
+typedef struct ForkmetaObservationIdentity
+{
+	int present;
+	dev_t dev;
+	ino_t ino;
+	off_t size;
+	time_t mtime_sec;
+	long mtime_nsec;
+	time_t ctime_sec;
+	long ctime_nsec;
+} ForkmetaObservationIdentity;
+
+static int
+forkmeta_identity_equal(const ForkmetaObservationIdentity *left,
+						const ForkmetaObservationIdentity *right)
+{
+	return left->present == right->present &&
+		(!left->present ||
+		 (left->dev == right->dev && left->ino == right->ino &&
+		  left->size == right->size && left->mtime_sec == right->mtime_sec &&
+		  left->mtime_nsec == right->mtime_nsec &&
+		  left->ctime_sec == right->ctime_sec &&
+		  left->ctime_nsec == right->ctime_nsec));
+}
+
+static int
+forkmeta_identity_at(int directory_fd, const char *name,
+					 ForkmetaObservationIdentity *identity)
+{
+	struct stat st;
+
+	memset(identity, 0, sizeof(*identity));
+	if (fstatat(directory_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (!S_ISREG(st.st_mode) || st.st_size < 0)
+		return -1;
+	identity->present = 1;
+	identity->dev = st.st_dev;
+	identity->ino = st.st_ino;
+	identity->size = st.st_size;
+	identity->mtime_sec = st.st_mtim.tv_sec;
+	identity->mtime_nsec = st.st_mtim.tv_nsec;
+	identity->ctime_sec = st.st_ctim.tv_sec;
+	identity->ctime_nsec = st.st_ctim.tv_nsec;
+	return 0;
+}
+
+static int
+forkmeta_directory_identity(int directory_fd,
+						 ForkmetaObservationIdentity *identity)
+{
+	struct stat st;
+
+	memset(identity, 0, sizeof(*identity));
+	if (fstat(directory_fd, &st) != 0 || !S_ISDIR(st.st_mode))
+		return -1;
+	identity->present = 1;
+	identity->dev = st.st_dev;
+	identity->ino = st.st_ino;
+	identity->mtime_sec = st.st_mtim.tv_sec;
+	identity->mtime_nsec = st.st_mtim.tv_nsec;
+	identity->ctime_sec = st.st_ctim.tv_sec;
+	identity->ctime_nsec = st.st_ctim.tv_nsec;
+	return 0;
+}
+
+static int
+forkmeta_directory_path_identity(const char *path,
+						  ForkmetaObservationIdentity *identity)
+{
+	int fd;
+	int rc;
+
+	memset(identity, 0, sizeof(*identity));
+	fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	rc = forkmeta_directory_identity(fd, identity);
+	if (close(fd) != 0)
+		rc = -1;
+	return rc;
+}
+
+static int
+forkmeta_record_equal_expected(const SnapshotRecord *record,
+						   const PsForkmetaSnapshotExpected *expected)
+{
+	return record->generation == expected->generation &&
+		record->cutoff_lsn == expected->cutoff_lsn &&
+		record->cutoff_admission_seq == expected->cutoff_admission_seq &&
+		record->checkpoint.len == expected->checkpoint.len &&
+		record->checkpoint.crc == expected->checkpoint.crc &&
+		record->tail.len == expected->tail.len &&
+			record->tail.crc == expected->tail.crc;
+}
+
+static int
+forkmeta_record_equal(const SnapshotRecord *left, const SnapshotRecord *right)
+{
+	return left->generation == right->generation &&
+		left->cutoff_lsn == right->cutoff_lsn &&
+		left->cutoff_admission_seq == right->cutoff_admission_seq &&
+		left->checkpoint.len == right->checkpoint.len &&
+		left->checkpoint.crc == right->checkpoint.crc &&
+		left->tail.len == right->tail.len &&
+		left->tail.crc == right->tail.crc;
+}
+
+static int
+forkmeta_read_record_metadata(int directory_fd, const char *directory,
+							 const char *name, SnapshotRecord *record,
+							 ForkmetaObservationIdentity *identity)
+{
+	if (forkmeta_identity_at(directory_fd, name, identity) != 0 ||
+		!identity->present || read_record(directory_fd, directory, name,
+										 record, 0) != 0)
+		return -1;
+	return 0;
+}
+
+static int
+forkmeta_read_optional_record(int directory_fd, const char *directory,
+							 const char *name, SnapshotRecord *record,
+							 ForkmetaObservationIdentity *identity,
+							 int *present)
+{
+	if (forkmeta_identity_at(directory_fd, name, identity) != 0)
+		return -1;
+	if (!identity->present)
+	{
+		*present = 0;
+		return 0;
+	}
+	if (read_record(directory_fd, directory, name, record, 0) != 0)
+		return -1;
+	*present = 1;
+	return 0;
+}
+
+static int
+forkmeta_snapshot_parts_identity(int directory_fd, const SnapshotRecord *record,
+							 ForkmetaObservationIdentity identities[2])
+{
+	for (unsigned int part = 0; part < 2; part++)
+	{
+		char name[128];
+		uint64_t expected_len = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+			record->checkpoint.len : record->tail.len;
+
+		if (part_name(record->generation, part, name, sizeof(name)) != 0 ||
+			forkmeta_identity_at(directory_fd, name, &identities[part]) != 0 ||
+			!identities[part].present ||
+			(uint64_t) identities[part].size != expected_len)
+			return -1;
+	}
+	return 0;
+}
+
+static int
+forkmeta_add_bytes(uint64_t *total, uint64_t bytes)
+{
+	if (UINT64_MAX - *total < bytes)
+		*total = UINT64_MAX;
+	else
+		*total += bytes;
+	return 0;
+}
+
+static int
+forkmeta_snapshot_debt_scan(int directory_fd, uint64_t selected_generation,
+							uint64_t prepared_generation, uint64_t *debt_out)
+{
+	struct dirent *entry;
+	DIR *dir = NULL;
+	int scan_fd = -1;
+	uint64_t total = 0;
+	unsigned int nentries = 0;
+	unsigned char selected_seen[2] = {0, 0};
+	unsigned char prepared_seen[2] = {0, 0};
+	int rc = -1;
+
+	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
+	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
+		goto cleanup;
+	scan_fd = -1;
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		uint64_t generation = 0;
+		uint64_t bytes;
+		int checkpoint_status;
+		int tail_status;
+		int is_canonical = 0;
+		int is_temp;
+		int is_prepared_temp;
+		struct stat st;
+
+		if (++nentries > FORKMETA_OBSERVATION_MAX_ENTRIES)
+			goto cleanup;
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0)
+			continue;
+		if (strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
+		{
+			if (fstatat(directory_fd, entry->d_name, &st,
+							AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+				st.st_size < 0)
+				goto cleanup;
+			/* The prepared intent is retained until commit/abort resolves it;
+			 * its bytes are not reclaimable debt.  Its identity and content are
+			 * still checked by the caller around this scan. */
+			continue;
+		}
+		is_prepared_temp = strncmp(entry->d_name,
+								  FORKMETA_SNAPSHOT_PREPARED ".tmp.",
+								  strlen(FORKMETA_SNAPSHOT_PREPARED ".tmp.")) == 0;
+		checkpoint_status = strncmp(entry->d_name,
+									FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
+									strlen(FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX)) == 0 ?
+			parse_generation_name(entry->d_name,
+										FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX, &generation) : 1;
+		tail_status = strncmp(entry->d_name, FORKMETA_SNAPSHOT_TAIL_PREFIX,
+									 strlen(FORKMETA_SNAPSHOT_TAIL_PREFIX)) == 0 ?
+			parse_generation_name(entry->d_name,
+									 FORKMETA_SNAPSHOT_TAIL_PREFIX, &generation) : 1;
+		is_temp = parse_temp_name(entry->d_name) == 0;
+		if (checkpoint_status == 0 || tail_status == 0)
+			is_canonical = 1;
+		else if (!is_temp && (checkpoint_status < 0 || tail_status < 0))
+		{
+			if (strncmp(entry->d_name, FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
+							strlen(FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX)) == 0 ||
+				strncmp(entry->d_name, FORKMETA_SNAPSHOT_TAIL_PREFIX,
+							strlen(FORKMETA_SNAPSHOT_TAIL_PREFIX)) == 0)
+				goto cleanup;
+		}
+		if (!is_canonical && !is_temp)
+			goto cleanup;
+		if (fstatat(directory_fd, entry->d_name, &st,
+						 AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+			st.st_size < 0)
+			goto cleanup;
+		bytes = (uint64_t) st.st_size;
+		if (is_canonical && generation == selected_generation &&
+			selected_generation != 0)
+		{
+			unsigned int part = checkpoint_status == 0 ?
+				PS_FORKMETA_SNAPSHOT_CHECKPOINT : PS_FORKMETA_SNAPSHOT_TAIL;
+
+			if (selected_seen[part])
+				goto cleanup;
+			selected_seen[part] = 1;
+			if (prepared_generation == selected_generation)
+				prepared_seen[part] = 1;
+			continue;
+		}
+		if (is_canonical && prepared_generation != 0 &&
+			generation == prepared_generation)
+		{
+			unsigned int part = checkpoint_status == 0 ?
+				PS_FORKMETA_SNAPSHOT_CHECKPOINT : PS_FORKMETA_SNAPSHOT_TAIL;
+
+			if (prepared_seen[part])
+				goto cleanup;
+			prepared_seen[part] = 1;
+			continue;
+		}
+		if (is_prepared_temp)
+			continue;
+		forkmeta_add_bytes(&total, bytes);
+	}
+	if (errno != 0 || closedir(dir) != 0)
+		goto cleanup;
+	dir = NULL;
+	if (selected_generation != 0 && (!selected_seen[0] || !selected_seen[1]))
+		goto cleanup;
+	if (prepared_generation != 0 && (!prepared_seen[0] || !prepared_seen[1]))
+		goto cleanup;
+	*debt_out = total;
+	rc = 0;
+
+cleanup:
+	if (dir != NULL)
+		(void) closedir(dir);
+	else if (scan_fd >= 0)
+		(void) close(scan_fd);
+	return rc;
+}
+
+int
+ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 const PsForkmetaSnapshotExpected *expected,
+										 uint64_t *bytes_out)
+{
+	SnapshotRecord selected_before;
+	SnapshotRecord selected_after;
+	SnapshotRecord prepared_before;
+	SnapshotRecord prepared_after;
+	ForkmetaObservationIdentity source_dir_before, source_dir_after;
+	ForkmetaObservationIdentity source_path_before, source_path_after;
+	ForkmetaObservationIdentity source_before, source_after;
+	ForkmetaObservationIdentity snapshot_dir_before, snapshot_dir_after;
+	ForkmetaObservationIdentity snapshot_path_before, snapshot_path_after;
+	ForkmetaObservationIdentity manifest_before, manifest_after;
+	ForkmetaObservationIdentity prepared_identity_before, prepared_identity_after;
+	ForkmetaObservationIdentity selected_parts_before[2], selected_parts_after[2];
+	ForkmetaObservationIdentity prepared_parts_before[2], prepared_parts_after[2];
+	uint64_t total;
+	uint64_t source_debt;
+	int source_fd = -1;
+	int snapshot_fd = -1;
+	int selected_present_before;
+	int selected_present_after;
+	int prepared_present_before;
+	int prepared_present_after;
+
+	if (directory == NULL || source_directory == NULL || expected == NULL ||
+		bytes_out == NULL)
+		return -1;
+	*bytes_out = 0;
+	source_fd = open(source_directory,
+					 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (source_fd < 0)
+		return -1;
+	snapshot_fd = open(directory,
+					 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (snapshot_fd < 0 && errno != ENOENT)
+		goto fail;
+	if (snapshot_fd < 0 && expected->generation != 0)
+		goto fail;
+	memset(&manifest_before, 0, sizeof(manifest_before));
+	memset(&manifest_after, 0, sizeof(manifest_after));
+	for (unsigned int attempt = 0; attempt < FORKMETA_OBSERVATION_RETRIES;
+		 attempt++)
+	{
+		if (forkmeta_directory_identity(source_fd, &source_dir_before) != 0 ||
+			forkmeta_directory_path_identity(source_directory,
+												&source_path_before) != 0 ||
+			!forkmeta_identity_equal(&source_dir_before, &source_path_before) ||
+			forkmeta_identity_at(source_fd, "forkmeta", &source_before) != 0)
+			goto fail;
+		if (snapshot_fd >= 0)
+		{
+			if (forkmeta_directory_identity(snapshot_fd, &snapshot_dir_before) != 0 ||
+				forkmeta_directory_path_identity(directory,
+												 &snapshot_path_before) != 0 ||
+				!forkmeta_identity_equal(&snapshot_dir_before,
+												 &snapshot_path_before))
+				goto fail;
+			if (expected->generation == 0)
+			{
+				if (forkmeta_identity_at(snapshot_fd, FORKMETA_SNAPSHOT_MANIFEST,
+													 &manifest_before) != 0 ||
+													 manifest_before.present)
+					goto fail;
+				selected_present_before = 0;
+			}
+			else
+			{
+				if (forkmeta_read_record_metadata(snapshot_fd, directory,
+													 FORKMETA_SNAPSHOT_MANIFEST,
+													 &selected_before, &manifest_before) != 0 ||
+													 !forkmeta_record_equal_expected(&selected_before,
+																	 expected) ||
+													 forkmeta_snapshot_parts_identity(snapshot_fd,
+																			 &selected_before,
+																			 selected_parts_before) != 0)
+					goto fail;
+				selected_present_before = 1;
+			}
+			if (forkmeta_read_optional_record(snapshot_fd, directory,
+													 FORKMETA_SNAPSHOT_PREPARED,
+													 &prepared_before,
+													 &prepared_identity_before,
+													 &prepared_present_before) != 0 ||
+				(prepared_present_before &&
+					forkmeta_snapshot_parts_identity(snapshot_fd, &prepared_before,
+															 prepared_parts_before) != 0) ||
+				forkmeta_snapshot_debt_scan(snapshot_fd, expected->generation,
+													 prepared_present_before ?
+													 prepared_before.generation : 0,
+													 &total) != 0)
+				goto fail;
+			if (expected->generation == 0)
+			{
+				if (forkmeta_identity_at(snapshot_fd, FORKMETA_SNAPSHOT_MANIFEST,
+													 &manifest_after) != 0 ||
+													 manifest_after.present)
+				goto fail;
+				selected_present_after = 0;
+			}
+			else
+			{
+				if (forkmeta_read_record_metadata(snapshot_fd, directory,
+													 FORKMETA_SNAPSHOT_MANIFEST,
+													 &selected_after, &manifest_after) != 0 ||
+													 !forkmeta_record_equal_expected(&selected_after,
+																	 expected) ||
+													 forkmeta_snapshot_parts_identity(snapshot_fd,
+																			 &selected_after,
+																			 selected_parts_after) != 0)
+				goto fail;
+				selected_present_after = 1;
+			}
+			if (forkmeta_read_optional_record(snapshot_fd, directory,
+													 FORKMETA_SNAPSHOT_PREPARED,
+													 &prepared_after,
+													 &prepared_identity_after,
+													 &prepared_present_after) != 0 ||
+				(prepared_present_after &&
+					forkmeta_snapshot_parts_identity(snapshot_fd, &prepared_after,
+															 prepared_parts_after) != 0) ||
+				forkmeta_directory_identity(snapshot_fd, &snapshot_dir_after) != 0 ||
+				forkmeta_directory_path_identity(directory,
+												 &snapshot_path_after) != 0)
+				goto fail;
+		}
+		else
+		{
+			memset(&snapshot_dir_before, 0, sizeof(snapshot_dir_before));
+			memset(&snapshot_path_before, 0, sizeof(snapshot_path_before));
+			memset(&snapshot_dir_after, 0, sizeof(snapshot_dir_after));
+			if (forkmeta_directory_path_identity(directory,
+												 &snapshot_path_after) != 0)
+				goto fail;
+			selected_present_before = selected_present_after = 0;
+			prepared_present_before = prepared_present_after = 0;
+			total = 0;
+		}
+		if (forkmeta_identity_at(source_fd, "forkmeta", &source_after) != 0 ||
+			forkmeta_directory_identity(source_fd, &source_dir_after) != 0 ||
+			forkmeta_directory_path_identity(source_directory,
+												&source_path_after) != 0 ||
+			!forkmeta_identity_equal(&source_dir_after, &source_path_after) ||
+			!forkmeta_identity_equal(&source_before, &source_after) ||
+			!forkmeta_identity_equal(&source_dir_before, &source_dir_after) ||
+			!forkmeta_identity_equal(&source_path_before, &source_path_after) ||
+			!forkmeta_identity_equal(&snapshot_dir_before, &snapshot_dir_after) ||
+			!forkmeta_identity_equal(&snapshot_path_before, &snapshot_path_after) ||
+			selected_present_before != selected_present_after ||
+			(prepared_present_before != prepared_present_after) ||
+			(selected_present_before &&
+			 (!forkmeta_identity_equal(&manifest_before, &manifest_after) ||
+			  !forkmeta_identity_equal(&selected_parts_before[0],
+													 &selected_parts_after[0]) ||
+			  !forkmeta_identity_equal(&selected_parts_before[1],
+													 &selected_parts_after[1]))) ||
+			(prepared_present_before &&
+			 (!forkmeta_identity_equal(&prepared_identity_before,
+													&prepared_identity_after) ||
+			  !forkmeta_record_equal(&prepared_before, &prepared_after) ||
+			  !forkmeta_identity_equal(&prepared_parts_before[0],
+													 &prepared_parts_after[0]) ||
+			  !forkmeta_identity_equal(&prepared_parts_before[1],
+													 &prepared_parts_after[1]))) ||
+			(expected->generation == 0 &&
+			 !forkmeta_identity_equal(&manifest_before, &manifest_after)))
+			continue;
+		if (source_after.present)
+		{
+			uint64_t source_size = (uint64_t) source_after.size;
+
+			if (source_size < source_baseline)
+				goto fail;
+			source_debt = source_size - source_baseline;
+		}
+		else
+		{
+			if (source_baseline != 0)
+				goto fail;
+			source_debt = 0;
+		}
+		forkmeta_add_bytes(&source_debt, total);
+		*bytes_out = source_debt;
+		(void) close(source_fd);
+		if (snapshot_fd >= 0)
+			(void) close(snapshot_fd);
+		return 0;
+	}
+
+fail:
+	if (source_fd >= 0)
+		(void) close(source_fd);
+	if (snapshot_fd >= 0)
+		(void) close(snapshot_fd);
+	return -1;
 }
 
 void

@@ -479,11 +479,23 @@ main(void)
 		  "old generation exists before GC");
 	{
 		char old_checkpoint[1200];
+		char old_tail[1200];
 		char temp[1200];
 		char newer_tail[1200];
+		char unrelated[1200];
+		char older_fixture[1200];
+		char prepared_intent_path[1200];
+		char fixture_intent_path[1200];
+		struct stat old_checkpoint_stat;
+		struct stat old_tail_stat;
+		PsForkmetaSnapshotExpected expected;
+		uint64_t debt = 0;
+		uint64_t baseline;
 
 		part_path(directory, "forkmeta_checkpoint_v1_", 2, old_checkpoint,
 				  sizeof(old_checkpoint));
+		part_path(directory, "forkmeta_tail_v1_", 2, old_tail,
+				  sizeof(old_tail));
 		snprintf(temp, sizeof(temp), "%s/forkmeta_tail_v1_00000000000000000003.tmp.1.1",
 				 directory);
 		part_path(directory, "forkmeta_checkpoint_v1_", 4, path,
@@ -499,7 +511,69 @@ main(void)
 		check(ps_forkmeta_snapshot_open(&snapshot, directory) == 0 &&
 			  snapshot.generation == 3,
 			  "unselected debris is ignored by open");
+		memset(&expected, 0, sizeof(expected));
+		expected.generation = snapshot.generation;
+		expected.cutoff_lsn = snapshot.cutoff_lsn;
+		expected.cutoff_admission_seq = snapshot.cutoff_admission_seq;
+		expected.checkpoint = snapshot.checkpoint;
+		expected.tail = snapshot.tail;
 		ps_forkmeta_snapshot_close(&snapshot);
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &debt) == 0 &&
+				  debt >= 6,
+				  "recognized temporary snapshot residue is counted as physical debt");
+		baseline = debt;
+		snprintf(older_fixture, sizeof(older_fixture), "%s/prepared_older", root);
+		check(stat(old_checkpoint, &old_checkpoint_stat) == 0 &&
+			  stat(old_tail, &old_tail_stat) == 0 &&
+			  mkdir(older_fixture, 0700) == 0 &&
+			  prepared_path(directory, prepared_intent_path,
+							 sizeof(prepared_intent_path)) == 0 &&
+			  prepared_path(older_fixture, fixture_intent_path,
+							 sizeof(fixture_intent_path)) == 0 &&
+			  prepare_two(&prepared, older_fixture, 2, 200, 1, checkpoint,
+						   sizeof(checkpoint) - 1, tail, sizeof(tail) - 1) == 0 &&
+			  link(fixture_intent_path, prepared_intent_path) == 0,
+				  "prepare an older generation alongside the selected snapshot");
+		snprintf(unrelated, sizeof(unrelated),
+				 "%s/forkmeta_tail_v1_00000000000000000009.tmp.1.1", directory);
+		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &debt) == 0 &&
+			  debt == baseline - (uint64_t) old_checkpoint_stat.st_size -
+				  (uint64_t) old_tail_stat.st_size + 9,
+				  "older prepared intent and parts are excluded while obsolete debris counts");
+		check(unlink(prepared_intent_path) == 0 && unlink(unrelated) == 0 &&
+			  remove_tree(older_fixture) == 0,
+				  "remove the older prepared generation fixture");
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &baseline) == 0,
+				  "restore the debt baseline after older prepared fixture");
+		check(prepare_two(&prepared, directory, 5, 500, 1, replacement,
+						   sizeof(replacement) - 1, tail, sizeof(tail) - 1) == 0,
+				  "prepare a newer generation alongside the selected snapshot");
+		snprintf(unrelated, sizeof(unrelated),
+				 "%s/forkmeta_tail_v1_00000000000000000010.tmp.1.1", directory);
+		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &debt) == 0 && debt == baseline + 9,
+				  "newer prepared intent and parts are excluded while obsolete debris counts");
+		check(ps_forkmeta_snapshot_abort(&prepared) == 0 && unlink(unrelated) == 0,
+				  "remove the newer prepared generation fixture");
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &baseline) == 0,
+				  "restore the debt baseline after newer prepared fixture");
+		check(prepare_two(&prepared, directory, 3, 300, 1, checkpoint,
+						   sizeof(checkpoint) - 1, tail, sizeof(tail) - 1) == 0,
+				  "prepare a generation equal to the selected snapshot");
+		snprintf(unrelated, sizeof(unrelated),
+				 "%s/forkmeta_tail_v1_00000000000000000011.tmp.1.1", directory);
+		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+										 &expected, &debt) == 0 && debt == baseline + 9,
+				  "equal prepared generation is excluded while obsolete debris counts");
+		check(ps_forkmeta_snapshot_commit(&prepared) == 0 && unlink(unrelated) == 0,
+				  "commit the equal prepared generation fixture");
 		check(ps_forkmeta_snapshot_gc(directory) == 1 &&
 			  access(old_checkpoint, F_OK) != 0 &&
 			  access(temp, F_OK) != 0 && access(newer_tail, F_OK) == 0,
@@ -507,7 +581,33 @@ main(void)
 	}
 	check(part_path(directory, "forkmeta_checkpoint_v1_", 4, path,
 					 sizeof(path)) == 0 && access(path, F_OK) == 0,
-		  "GC preserves newer unpublished generation");
+			  "GC preserves newer unpublished generation");
+	{
+		char temp[1200];
+		char near_final[1200];
+
+		snprintf(temp, sizeof(temp),
+				 "%s/forkmeta_tail_v1_00000000000000000004.tmp.1.2",
+				 directory);
+		check(symlink(path, temp) == 0 &&
+			  ps_forkmeta_snapshot_gc(directory) < 0 && access(temp, F_OK) == 0,
+			  "GC rejects an exact snapshot temporary symlink without unlinking it");
+		(void) unlink(temp);
+		snprintf(temp, sizeof(temp),
+				 "%s/forkmeta_tail_v1_00000000000000000004.tmp.1.128",
+				 directory);
+		check(write_file(temp, "bad", 3, 0) == 0 &&
+			  ps_forkmeta_snapshot_gc(directory) < 0 && access(temp, F_OK) == 0,
+			  "GC fails closed on a near-miss temporary name");
+		(void) unlink(temp);
+		snprintf(near_final, sizeof(near_final), "%s/forkmeta_tail_v1_1",
+				 directory);
+		check(write_file(near_final, "bad-final", 9, 0) == 0 &&
+			  ps_forkmeta_snapshot_gc(directory) < 0 &&
+			  access(near_final, F_OK) == 0,
+			  "GC fails closed on a non-canonical final generation name");
+		(void) unlink(near_final);
+	}
 
 	check(make_dir(root, "gc_fsync_retry", directory, sizeof(directory)) == 0 &&
 		  ps_forkmeta_snapshot_publish(directory, 1, 100, 1, &cp_input,
