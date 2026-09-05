@@ -887,15 +887,123 @@ main(void)
 			  PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW &&
 			  observation.gc_temp_gc_due != 0,
 			  "canonical overflow schedules an external temporary GC probe");
-		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
-				gc_inspection_hook, &inspection);
-		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
-			  access(temp_later, F_OK) != 0 && inspection.calls != 0,
-			  "external temporary GC traverses canonical prefix to valid temp");
-		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+		{
+			int gc_rc = 0;
+			unsigned int calls = 0;
+
+			while (access(temp_later, F_OK) == 0 && calls < 64)
+			{
+				inspection.calls = 0;
+				ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+						gc_inspection_hook, &inspection);
+				gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+				ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+				check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+						"temporary GC bounds each cursor inspection batch");
+				calls++;
+				if (gc_rc < 0)
+					break;
+			}
+			check(access(temp_later, F_OK) != 0 && gc_rc > 0,
+					"external temporary GC traverses canonical prefix to valid temp");
+		}
 		check(ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
 														 &expected, &observation) != 0,
-			  "canonical overflow remains fail-closed until below the bound");
+				  "canonical overflow remains fail-closed until below the bound");
+	}
+	{
+		char canonical[1200];
+		char temp[1200];
+		GcInspectionTest inspection = {0};
+		int created = 1;
+		int gc_rc = PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE;
+		unsigned int calls = 0;
+
+		check(make_dir(root, "cursor_no_temp", directory,
+					   sizeof(directory)) == 0,
+				  "create no-temp cursor fixture");
+		for (unsigned int i = 0; i < 300; i++)
+		{
+			int n = snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020u", directory,
+						 i + 50000);
+
+			if (n < 0 || (size_t) n >= sizeof(canonical) ||
+				write_file(canonical, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		while (created && gc_rc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE &&
+			   calls < 8)
+		{
+			inspection.calls = 0;
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+					gc_inspection_hook, &inspection);
+			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+					"no-temp traversal remains bounded per call");
+			calls++;
+		}
+		check(created && gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK && calls >= 3,
+				"no-temp cursor reaches EOF and resets");
+		check(snprintf(temp, sizeof(temp),
+					   "%s/forkmeta_tail_v1_00000000000000000001.tmp.5.1",
+					   directory) >= 0 && write_file(temp, "x", 1, 0) == 0,
+				  "add temp after no-temp cursor EOF");
+		gc_rc = PS_FORKMETA_SNAPSHOT_GC_NO_WORK;
+		for (calls = 0; access(temp, F_OK) == 0 && calls < 8; calls++)
+			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+		check(access(temp, F_OK) != 0 && gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED,
+				"EOF reset makes later temp reachable");
+	}
+	{
+		char replacement[1200];
+		char old_directory[1200];
+		char canonical[1200];
+		char temp[1200];
+		GcInspectionTest inspection = {0};
+		int created = 1;
+		int gc_rc;
+
+		check(make_dir(root, "cursor_replacement", replacement,
+					   sizeof(replacement)) == 0,
+				  "create cursor identity fixture");
+		for (unsigned int i = 0; i < 256; i++)
+		{
+			int n = snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020u", replacement,
+						 i + 60000);
+
+			if (n < 0 || (size_t) n >= sizeof(canonical) ||
+				write_file(canonical, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		inspection.calls = 0;
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
+		gc_rc = ps_forkmeta_snapshot_gc_temporary(replacement);
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+		check(created && gc_rc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE &&
+				inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				"cursor identity fixture advances one bounded prefix");
+		check(snprintf(old_directory, sizeof(old_directory), "%s.old", replacement) >= 0 &&
+				rename(replacement, old_directory) == 0 &&
+				mkdir(replacement, 0700) == 0 &&
+				snprintf(temp, sizeof(temp),
+						 "%s/forkmeta_tail_v1_00000000000000000002.tmp.6.1",
+						 replacement) >= 0 && write_file(temp, "x", 1, 0) == 0,
+				"replace cursor path with a new directory identity");
+		gc_rc = ps_forkmeta_snapshot_gc_temporary(replacement);
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED && access(temp, F_OK) != 0,
+				"directory identity change resets the cursor");
+		check(remove_tree(old_directory) == 0,
+				"remove old cursor identity fixture");
 	}
 	{
 		char temp[1200];

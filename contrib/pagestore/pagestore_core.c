@@ -269,7 +269,18 @@ static unsigned char fork_meta_serviceable_work_due;
 /* A subset of serviceable work that can be executed by temp-only GC, even
  * before a selected snapshot exists. */
 static unsigned char fork_meta_gc_serviceable_work_due;
+/* An overflow asks for one bounded temp-GC probe.  Keep that probe separate
+ * from actual temp debt: a canonical-only overflow must not let the harmless
+ * no-op probe block the exceptional canonical cutover forever. */
+static unsigned char fork_meta_temp_gc_probe_pending;
+static unsigned char fork_meta_canonical_gc_probe_pending;
 static unsigned char fork_meta_observation_error;
+/* A bounded scan may prove that the observed overflow is canonical residue
+ * which is already covered by a valid owner/cutoff proof.  Permit exactly one
+ * cutover to move that residue below the new selected generation; after that
+ * cutover another incomplete observation must not publish snapshots forever. */
+static unsigned char fork_meta_overflow_cutover_due;
+static unsigned char fork_meta_overflow_cutover_blocked;
 static int backpressure_shutdown_requested;
 static uint32_t backpressure_gate_mask;
 static PsBackpressureSlowPathTestHook backpressure_slow_path_test_hook;
@@ -790,7 +801,12 @@ ps_backpressure_configure_all_with_forkmeta(uint64_t page_high_water,
 	__atomic_store_n(&forkmeta_observation_count, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_overflow_cutover_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_overflow_cutover_blocked, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
+					 __ATOMIC_RELEASE);
 	pthread_mutex_lock(&backpressure_lock);
 	memset(&page_backpressure, 0, sizeof(page_backpressure));
 	memset(&wal_backpressure, 0, sizeof(wal_backpressure));
@@ -5755,6 +5771,10 @@ forkmeta_reclaim_lag_bytes(void)
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 1, __ATOMIC_RELEASE);
+	/* An observation which fails or proves only an unsafe overflow must revoke
+	 * an unconsumed one-shot arm.  A completed observation below clears the
+	 * post-cutover suppression latch. */
+	__atomic_store_n(&fork_meta_overflow_cutover_due, 0, __ATOMIC_RELEASE);
 
 	if (ps_storage == NULL || ps_storage->name == NULL ||
 		strcmp(ps_storage->name, "posix") != 0 ||
@@ -5830,26 +5850,60 @@ forkmeta_reclaim_lag_bytes(void)
 					 __ATOMIC_RELEASE);
 	if (observation.gc_temp_bytes != 0 || observation.gc_temp_gc_due)
 	{
-		fork_meta_temp_gc_pending = 1;
+		if (observation.gc_temp_bytes != 0)
+			fork_meta_temp_gc_pending = 1;
+		__atomic_store_n(&fork_meta_temp_gc_probe_pending,
+						 observation.gc_temp_gc_due, __ATOMIC_RELEASE);
 		if (!fork_meta_temp_gc_ambiguous)
 			memset(&fork_meta_temp_gc_retry_at, 0,
 				   sizeof(fork_meta_temp_gc_retry_at));
 	}
 	else if (!fork_meta_temp_gc_ambiguous)
+	{
 		fork_meta_temp_gc_pending = 0;
+		__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0,
+						 __ATOMIC_RELEASE);
+	}
 	/* An incomplete directory scan may have stopped before obsolete canonical
 	 * parts.  With a selected manifest, probe canonical GC outside the
 	 * admission fence just as we probe temp GC on overflow. */
-	if (observation.gc_canonical_bytes != 0 ||
-		(observation_overflow && expected.generation != 0))
+	if (observation.gc_canonical_bytes != 0)
 	{
 		fork_meta_canonical_gc_pending = 1;
+		__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
+						 __ATOMIC_RELEASE);
+		if (!fork_meta_canonical_gc_ambiguous)
+			memset(&fork_meta_canonical_gc_retry_at, 0,
+				   sizeof(fork_meta_canonical_gc_retry_at));
+	}
+	else if (observation_overflow && expected.generation != 0)
+	{
+		/* Probe manifest-aware GC once outside the admission fence.  A
+		 * canonical-only overflow normally has no old files to remove, and that
+		 * no-op probe must not suppress the explicitly armed cutover. */
+		__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 1,
+						 __ATOMIC_RELEASE);
 		if (!fork_meta_canonical_gc_ambiguous)
 			memset(&fork_meta_canonical_gc_retry_at, 0,
 				   sizeof(fork_meta_canonical_gc_retry_at));
 	}
 	else if (!fork_meta_canonical_gc_ambiguous)
+	{
 		fork_meta_canonical_gc_pending = 0;
+		__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
+						 __ATOMIC_RELEASE);
+	}
+	if (!observation_overflow)
+		__atomic_store_n(&fork_meta_overflow_cutover_blocked, 0,
+						 __ATOMIC_RELEASE);
+	else if (source_debt_enabled &&
+			 !__atomic_load_n(&fork_meta_overflow_cutover_blocked,
+							 __ATOMIC_ACQUIRE))
+		/* A current owner/cutoff proof safely authorizes one exceptional
+		 * snapshot even though the bounded scan cannot classify its suffix.
+		 * Temp GC normally drains temp-only overflow first; the sticky latch
+		 * prevents an unknown suffix from causing repeated publications. */
+		__atomic_store_n(&fork_meta_overflow_cutover_due, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, observation_overflow,
 					 __ATOMIC_RELEASE);
 	ps_admission_write_unlock();
@@ -5870,7 +5924,9 @@ ps_test_forkmeta_snapshot_gc_retry_now(void)
 int
 ps_test_forkmeta_canonical_gc_ambiguous(void)
 {
-	return fork_meta_canonical_gc_pending &&
+	return (fork_meta_canonical_gc_pending ||
+			__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
+							__ATOMIC_ACQUIRE)) &&
 		fork_meta_canonical_gc_ambiguous;
 }
 
@@ -7080,9 +7136,24 @@ fork_meta_temp_gc_due(void)
 }
 
 static int
+fork_meta_temp_gc_probe_due(void)
+{
+	return __atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) &&
+		fork_meta_retry_due_at(&fork_meta_temp_gc_retry_at);
+}
+
+static int
 fork_meta_canonical_gc_due(void)
 {
 	return fork_meta_canonical_gc_pending &&
+		fork_meta_retry_due_at(&fork_meta_canonical_gc_retry_at);
+}
+
+static int
+fork_meta_canonical_gc_probe_due(void)
+{
+	return __atomic_load_n(&fork_meta_canonical_gc_probe_pending,
+						   __ATOMIC_ACQUIRE) &&
 		fork_meta_retry_due_at(&fork_meta_canonical_gc_retry_at);
 }
 
@@ -7115,11 +7186,18 @@ fork_meta_snapshot_due_locked(void)
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
 		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
-		((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
-		  ((fork_meta_backpressure_throttled() &&
-			__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
-		   fork_meta_bytes_load() >= threshold)) ||
-		 fork_meta_deletion_cutover_due_locked());
+		(fork_meta_deletion_cutover_due_locked() ||
+		 ((!__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) &&
+		   !__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
+							  __ATOMIC_ACQUIRE)) &&
+		  ((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+			((fork_meta_backpressure_throttled() &&
+			  __atomic_load_n(&fork_meta_serviceable_work_due,
+							 __ATOMIC_ACQUIRE)) ||
+			 fork_meta_bytes_load() >= threshold)) ||
+		   (__atomic_load_n(&fork_meta_overflow_cutover_due, __ATOMIC_ACQUIRE) &&
+			!__atomic_load_n(&fork_meta_overflow_cutover_blocked,
+							   __ATOMIC_ACQUIRE)))));
 }
 
 static int
@@ -7138,11 +7216,18 @@ fork_meta_snapshot_due(void)
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
 		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
-		((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
-		  ((fork_meta_backpressure_throttled() &&
-			__atomic_load_n(&fork_meta_serviceable_work_due, __ATOMIC_ACQUIRE)) ||
-		   fork_meta_bytes_load() >= threshold)) ||
-		 fork_meta_deletion_probe_due());
+		(fork_meta_deletion_probe_due() ||
+		 ((!__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) &&
+		   !__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
+							  __ATOMIC_ACQUIRE)) &&
+		  ((!__atomic_load_n(&fork_meta_observation_error, __ATOMIC_ACQUIRE) &&
+			((fork_meta_backpressure_throttled() &&
+			  __atomic_load_n(&fork_meta_serviceable_work_due,
+							 __ATOMIC_ACQUIRE)) ||
+			 fork_meta_bytes_load() >= threshold)) ||
+		   (__atomic_load_n(&fork_meta_overflow_cutover_due, __ATOMIC_ACQUIRE) &&
+			!__atomic_load_n(&fork_meta_overflow_cutover_blocked,
+							   __ATOMIC_ACQUIRE)))));
 }
 
 static int
@@ -7169,6 +7254,7 @@ fork_meta_snapshot_maintenance(void)
 	uint64_t freeze_seq;
 	int force_deleting;
 	int filter_deleting;
+	int overflow_cutover;
 	int rc = 0;
 
 	if (fork_meta_snapshot_gc_pending)
@@ -7205,6 +7291,9 @@ fork_meta_snapshot_maintenance(void)
 		}
 	}
 	force_deleting = fork_meta_deletion_cutover_due_locked();
+	overflow_cutover =
+		__atomic_load_n(&fork_meta_overflow_cutover_due, __ATOMIC_ACQUIRE) &&
+		!__atomic_load_n(&fork_meta_overflow_cutover_blocked, __ATOMIC_ACQUIRE);
 	filter_deleting = fork_meta_deletion_records_present_locked();
 	/* A restart after a completed filtered cutover has DELETING lifecycle state
 	 * but no matching fork entries.  Record that one locked probe as complete
@@ -7213,7 +7302,7 @@ fork_meta_snapshot_maintenance(void)
 		fork_meta_mark_deletion_cutover_done_locked();
 	if ((!fork_meta_snapshot_due_locked() && !force_deleting) ||
 		fork_meta_snapshot_cutoff(&cutoff, filter_deleting,
-							  force_deleting) != 0)
+								  force_deleting) != 0)
 	{
 		if (fork_meta_bytes_load() != 0)
 		{
@@ -7317,6 +7406,12 @@ fork_meta_snapshot_maintenance(void)
 	fork_meta_snapshot_tail_meta = prepared.tail;
 	fork_meta_snapshot_gc_pending = 1;
 	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
+	if (overflow_cutover)
+	{
+		__atomic_store_n(&fork_meta_overflow_cutover_due, 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&fork_meta_overflow_cutover_blocked, 1,
+						 __ATOMIC_RELEASE);
+	}
 	if (filter_deleting)
 		fork_meta_mark_deletion_cutover_done_locked();
 	/* Keep the in-memory chain conservative until the next restart.  All
@@ -15016,15 +15111,34 @@ ps_core_maintenance_impl(void)
 		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
-	if (fork_meta_temp_gc_pending && fork_meta_temp_gc_due())
+	if ((fork_meta_temp_gc_pending && fork_meta_temp_gc_due()) ||
+		fork_meta_temp_gc_probe_due())
 	{
 		int gc;
 		int was_ambiguous = fork_meta_temp_gc_ambiguous;
 
 		gc = ps_forkmeta_snapshot_gc_temporary(fork_meta_snapshot_dir);
+		if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE)
+		{
+			/* The persistent cursor advanced outside the admission fence, but
+			 * the directory did not change.  Keep scheduling cursor batches
+			 * without forcing another bounded debt observation. */
+			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
+							 __ATOMIC_RELEASE);
+			if (was_ambiguous)
+			{
+				fork_meta_temp_gc_ambiguous = 0;
+				memset(&fork_meta_temp_gc_retry_at, 0,
+					   sizeof(fork_meta_temp_gc_retry_at));
+				forkmeta_observation_force_now();
+			}
+			return 1;
+		}
 		if (gc >= 0)
 		{
 			fork_meta_temp_gc_pending = 0;
+			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0,
+							 __ATOMIC_RELEASE);
 			fork_meta_temp_gc_ambiguous = 0;
 			memset(&fork_meta_temp_gc_retry_at, 0,
 				   sizeof(fork_meta_temp_gc_retry_at));
@@ -15036,13 +15150,16 @@ ps_core_maintenance_impl(void)
 		}
 		else
 		{
+			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
+						 __ATOMIC_RELEASE);
 			fork_meta_temp_gc_ambiguous =
 				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_temp_gc_retry_at);
 			fork_meta_temp_gc_retry_at.tv_sec++;
 		}
 	}
-	if (fork_meta_canonical_gc_pending && fork_meta_canonical_gc_due())
+	if ((fork_meta_canonical_gc_pending && fork_meta_canonical_gc_due()) ||
+		fork_meta_canonical_gc_probe_due())
 	{
 		int gc;
 		int was_ambiguous = fork_meta_canonical_gc_ambiguous;
@@ -15051,6 +15168,8 @@ ps_core_maintenance_impl(void)
 		if (gc >= 0)
 		{
 			fork_meta_canonical_gc_pending = 0;
+			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
+							 __ATOMIC_RELEASE);
 			fork_meta_canonical_gc_ambiguous = 0;
 			memset(&fork_meta_canonical_gc_retry_at, 0,
 				   sizeof(fork_meta_canonical_gc_retry_at));
@@ -15062,6 +15181,8 @@ ps_core_maintenance_impl(void)
 		}
 		else
 		{
+			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 1,
+						 __ATOMIC_RELEASE);
 			fork_meta_canonical_gc_ambiguous =
 				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_canonical_gc_retry_at);
@@ -15365,17 +15486,22 @@ ps_core_open(const char *store_dir)
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
 	fork_meta_temp_gc_pending = 0;
+	__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0, __ATOMIC_RELEASE);
 	fork_meta_temp_gc_ambiguous = 0;
 	memset(&fork_meta_temp_gc_retry_at, 0,
 		   sizeof(fork_meta_temp_gc_retry_at));
 	fork_meta_canonical_gc_pending = 0;
 	fork_meta_canonical_gc_ambiguous = 0;
+	__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
+					 __ATOMIC_RELEASE);
 	memset(&fork_meta_canonical_gc_retry_at, 0,
 		   sizeof(fork_meta_canonical_gc_retry_at));
 	fork_meta_snapshot_gc_ambiguous = 0;
 	__atomic_store_n(&fork_meta_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_gc_serviceable_work_due, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_observation_error, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_overflow_cutover_due, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&fork_meta_overflow_cutover_blocked, 0, __ATOMIC_RELEASE);
 	memset(fork_meta_deletion_cutover_done, 0,
 		   sizeof(fork_meta_deletion_cutover_done));
 	memset(&fork_meta_snapshot_retry_at, 0,

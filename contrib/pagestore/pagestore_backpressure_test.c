@@ -936,6 +936,49 @@ test_forkmeta_backpressure_observer(void)
 	check(ps_backpressure_try_admit_mask(&stop, PS_BACKPRESSURE_FORKMETA,
 										 &causes) == 1 && causes == 0,
 							"cutoff-dependent debris does not defer admission");
+	{
+		int overflow_entries_created = 1;
+
+		/* There is no selected snapshot and timeline 0 has no page frontier in
+		 * this fixture.  Even a canonical overflow therefore has no safe
+		 * cutoff and must remain fail-closed. */
+		for (unsigned int i = 0; i < 4096; i++)
+		{
+			int n = snprintf(malformed, sizeof(malformed),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (1000000 + i));
+
+			if (n < 0 || (size_t) n >= sizeof(malformed) ||
+				!write_test_file(malformed, 1))
+			{
+				overflow_entries_created = 0;
+				break;
+			}
+		}
+		ps_backpressure_refresh();
+		check(overflow_entries_created &&
+				metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+				metrics.forkmeta_backpressure.throttled != 0,
+				"canonical overflow without an owner cutoff fails closed");
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										  &cutover_attempts);
+		(void) ps_core_maintenance();
+		check(cutover_attempts.calls == 0,
+				"unprovable canonical overflow cannot trigger cutover");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		for (unsigned int i = 0; i < 4096; i++)
+		{
+			if (snprintf(malformed, sizeof(malformed),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (1000000 + i)) < 0 ||
+				unlink(malformed) != 0)
+				overflow_entries_created = 0;
+		}
+		check(overflow_entries_created,
+				"remove unprovable canonical overflow entries");
+		ps_backpressure_refresh();
+	}
 
 	check(snprintf(malformed, sizeof(malformed), "%s/unexpected", snapshots) >= 0 &&
 			write_test_file(malformed, 3),
@@ -988,8 +1031,8 @@ test_forkmeta_backpressure_observer(void)
 	check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX,
 			"malformed owned snapshot names fail closed");
 	(void) unlink(malformed_temp);
-	check(metrics.forkmeta_backpressure.throttle_enters == 1,
-			"forkmeta controller records one throttle transition");
+	check(metrics.forkmeta_backpressure.throttle_enters >= 1,
+			"forkmeta controller records throttle transitions");
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
@@ -1009,6 +1052,12 @@ test_forkmeta_self_recovery(void)
 	char temporary[1200];
 	char canonical[1200];
 	char source[1200];
+	char snapshots_saved[1200];
+	char snapshots_probe[1200];
+	char selected_manifest[1200];
+	char selected_checkpoint[1200];
+	char selected_tail[1200];
+	char bad_temp[1200];
 	struct stat source_before;
 	struct stat source_after;
 	PsShmHeader metrics;
@@ -1233,9 +1282,9 @@ test_forkmeta_self_recovery(void)
 		(void) ps_core_maintenance();
 		ps_backpressure_refresh();
 		/* The selected manifest and its two canonical parts are authoritative.
-		 * Add only newer canonical parts until the bounded observer overflows;
-		 * none of these entries is reclaimable, so overflow must fail closed
-		 * without publishing a snapshot or spinning maintenance. */
+		 * Add only newer canonical parts until the bounded observer overflows.
+		 * The selected owner/cutoff proof makes this cutoff-dependent residue
+		 * eligible for one exceptional cutover. */
 		for (unsigned int i = 0; i < 4095; i++)
 		{
 			int n = snprintf(canonical, sizeof(canonical),
@@ -1254,16 +1303,200 @@ test_forkmeta_self_recovery(void)
 				metrics.forkmeta_backpressure.throttled != 0 &&
 				ps_test_forkmeta_force_due() != 0 &&
 				ps_test_forkmeta_serviceable_work_due() == 0,
-				"canonical overflow remains fail-closed without serviceable GC debt");
+				"provable canonical overflow remains throttled without serviceable GC debt");
+		/* Move the overflow aside and replace the path with only the selected
+		 * parts plus one malformed temp.  This makes the temp probe failure occur
+		 * in its first bounded batch, independent of directory enumeration order. */
+		check(snprintf(snapshots_saved, sizeof(snapshots_saved), "%s.saved", snapshots) >= 0 &&
+				snprintf(snapshots_probe, sizeof(snapshots_probe), "%s.probe", snapshots) >= 0 &&
+				rename(snapshots, snapshots_saved) == 0 && mkdir(snapshots, 0700) == 0 &&
+				snprintf(selected_manifest, sizeof(selected_manifest),
+						 "%s/forkmeta_manifest_v1", snapshots_saved) >= 0 &&
+				snprintf(selected_checkpoint, sizeof(selected_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(selected_tail, sizeof(selected_tail),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots) >= 0 &&
+				snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				link(selected_manifest, manifest) == 0 &&
+				link(selected_checkpoint, canonical) == 0 &&
+				link(selected_tail, temporary) == 0 &&
+				snprintf(bad_temp, sizeof(bad_temp),
+						 "%s/forkmeta_checkpoint_v1_bad.tmp.1.1", snapshots) >= 0 &&
+				write_test_file(bad_temp, 1),
+				"build malformed-temp probe fixture");
+		cutover_attempts.calls = 0;
 		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
 										 &cutover_attempts);
-		check(ps_core_maintenance() == 0,
-				"canonical overflow maintenance completes without extra work");
-		check(cutover_attempts.calls == 0,
-				"canonical overflow does not invoke snapshot cutover");
-		check(ps_core_maintenance() == 0,
-				"canonical overflow does not busy-loop maintenance");
+		(void) ps_core_maintenance();
 		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(cutover_attempts.calls == 0,
+				"malformed temp probe failure blocks overflow cutover");
+		check(unlink(bad_temp) == 0 && rename(snapshots, snapshots_probe) == 0 &&
+				rename(snapshots_saved, snapshots) == 0,
+				"restore canonical overflow after malformed temp probe");
+		remove_tree(snapshots_probe);
+		ps_backpressure_refresh();
+		/* Repeat with a symlink to exercise the no-follow failure path. */
+		check(rename(snapshots, snapshots_saved) == 0 && mkdir(snapshots, 0700) == 0 &&
+				snprintf(selected_manifest, sizeof(selected_manifest),
+						 "%s/forkmeta_manifest_v1", snapshots_saved) >= 0 &&
+				snprintf(selected_checkpoint, sizeof(selected_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(selected_tail, sizeof(selected_tail),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots) >= 0 &&
+				snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				link(selected_manifest, manifest) == 0 &&
+				link(selected_checkpoint, canonical) == 0 &&
+				link(selected_tail, temporary) == 0 &&
+				snprintf(bad_temp, sizeof(bad_temp),
+						 "%s/forkmeta_checkpoint_v1_00000000000000000000.tmp.1.1",
+						 snapshots) >= 0 &&
+				symlink("missing-target", bad_temp) == 0,
+				"build symlink-temp probe fixture");
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										 &cutover_attempts);
+		(void) ps_core_maintenance();
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(cutover_attempts.calls == 0,
+				"symlink temp probe failure blocks overflow cutover");
+		check(unlink(bad_temp) == 0 && rename(snapshots, snapshots_probe) == 0 &&
+				rename(snapshots_saved, snapshots) == 0,
+				"restore canonical overflow after symlink temp probe");
+		remove_tree(snapshots_probe);
+		ps_backpressure_refresh();
+		/* A durability-ambiguous canonical probe must also suppress the armed
+		 * cutover for this tick.  Keep the old generation in a small replacement
+		 * directory so the fsync fault deterministically unlinks it. */
+		check(rename(snapshots, snapshots_saved) == 0 && mkdir(snapshots, 0700) == 0 &&
+				snprintf(selected_manifest, sizeof(selected_manifest),
+						 "%s/forkmeta_manifest_v1", snapshots_saved) >= 0 &&
+				snprintf(selected_checkpoint, sizeof(selected_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(selected_tail, sizeof(selected_tail),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1", snapshots) >= 0 &&
+				snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				link(selected_manifest, manifest) == 0 &&
+				link(selected_checkpoint, canonical) == 0 &&
+				link(selected_tail, temporary) == 0 &&
+				snprintf(old_checkpoint, sizeof(old_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) old_generation) >= 0 &&
+				snprintf(old_tail, sizeof(old_tail),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots,
+						 (unsigned long long) old_generation) >= 0 &&
+				write_test_file(old_checkpoint, 11) && write_test_file(old_tail, 13),
+				"build canonical probe ambiguity fixture");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										 &cutover_attempts);
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0,
+				"arm canonical probe fsync failure");
+		(void) ps_core_maintenance();
+		check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
+				"disarm canonical probe fsync failure");
+		check(cutover_attempts.calls == 0 &&
+				ps_test_forkmeta_canonical_gc_ambiguous() != 0,
+				"canonical probe ambiguity remains pending and keeps cutover idle");
+		check(access(old_checkpoint, F_OK) != 0 && access(old_tail, F_OK) != 0,
+				"canonical probe unlinks before the ambiguous fsync result");
+		/* The retry deadline is persistent, so a later maintenance tick must not
+		 * fall through to the armed overflow cutover. */
+		cutover_attempts.calls = 0;
+		(void) ps_core_maintenance();
+		check(cutover_attempts.calls == 0 &&
+				ps_test_forkmeta_canonical_gc_ambiguous() != 0,
+				"canonical probe backoff blocks cutover on the next tick");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		/* Only an explicit retry followed by a successful reconciliation may
+		 * release the gate.  The successful probe itself returns before snapshot
+		 * publication; the following tick is the one allowed to cut over. */
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		check(ps_core_maintenance() == 1 &&
+				ps_test_forkmeta_canonical_gc_ambiguous() == 0,
+				"canonical probe retry reconciles ambiguity and clears the gate");
+		check(rename(snapshots, snapshots_probe) == 0 &&
+				rename(snapshots_saved, snapshots) == 0,
+				"restore canonical overflow after ambiguity probe");
+		remove_tree(snapshots_probe);
+		ps_backpressure_refresh();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+										 &cutover_attempts);
+		for (int i = 0; i < 128 && cutover_attempts.calls == 0; i++)
+			(void) ps_core_maintenance();
+		check(cutover_attempts.calls == 1,
+				"provable canonical overflow performs one snapshot cutover");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		{
+			PsForkmetaSnapshot selected;
+			int selected_open;
+
+			selected_open = ps_forkmeta_snapshot_open(&selected, snapshots);
+			check(selected_open == 0 &&
+					selected.generation > selected_generation + 1000000 + 4094,
+					"overflow cutover allocates above every canonical residue");
+			if (selected_open == 0 &&
+				selected.generation > selected_generation + 1000000 + 4094)
+				selected_generation = selected.generation;
+			if (selected_open == 0)
+				ps_forkmeta_snapshot_close(&selected);
+		}
+		/* The first maintenance pass has left snapshot GC pending.  Add a fresh
+		 * overflow before the old residue is reclaimed: the one-shot latch must
+		 * keep this second overflow from publishing another generation. */
+		for (unsigned int i = 0; i < 4095; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
+				!write_test_file(canonical, 1))
+				overflow_entries_created = 0;
+		}
+		check(overflow_entries_created,
+				"create a second canonical overflow while cutover GC is pending");
+		check(ps_core_maintenance() == 1 && ps_core_maintenance() == 1,
+				"canonical and snapshot GC remain independently serviceable");
+		ps_backpressure_refresh();
+		for (int i = 0; i < 3; i++)
+		{
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			(void) ps_core_maintenance();
+		}
+		{
+			PsForkmetaSnapshot selected;
+			int selected_open = ps_forkmeta_snapshot_open(&selected, snapshots);
+
+			check(selected_open == 0 && selected.generation == selected_generation,
+					"overflow after a successful cutover cannot publish repeatedly");
+			if (selected_open == 0)
+				ps_forkmeta_snapshot_close(&selected);
+		}
 		for (unsigned int i = 0; i < 4095; i++)
 		{
 			if (snprintf(canonical, sizeof(canonical),
@@ -1273,7 +1506,7 @@ test_forkmeta_self_recovery(void)
 				overflow_entries_created = 0;
 		}
 		check(overflow_entries_created,
-				"remove canonical overflow regression entries");
+				"remove repeated canonical overflow entries");
 		ps_backpressure_refresh();
 
 		check(snprintf(old_checkpoint, sizeof(old_checkpoint),

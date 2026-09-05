@@ -85,6 +85,15 @@ typedef struct PsForkmetaSnapshotReclaimObservation
 #define PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES 4096U
 #define PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH 128U
 
+typedef enum PsForkmetaSnapshotGcResult
+{
+	PS_FORKMETA_SNAPSHOT_GC_NO_WORK = 0,
+	PS_FORKMETA_SNAPSHOT_GC_REMOVED = 1,
+	/* The scan cursor advanced without deleting a file; keep scheduling it. */
+	PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE = 2,
+	PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS = -2
+} PsForkmetaSnapshotGcResult;
+
 typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
 															 void *arg);
 
@@ -193,8 +202,10 @@ extern int ps_forkmeta_snapshot_gc(const char *directory);
 /* Remove a bounded batch of recognized temporary debris without requiring a
  * selected manifest.  Canonical manifests/parts and durable prepared intent
  * are never removed by this path. */
-extern int ps_forkmeta_snapshot_gc_temporary(const char *directory);
-#define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
+/* A SCAN_INCOMPLETE result is distinct from REMOVED: callers must schedule
+ * another tick without forcing a fresh observation as if files changed. */
+extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc_temporary(
+		const char *directory);
 /* Metadata-only physical debt scan.  The source baseline growth is charged
  * only when source_debt_enabled is nonzero; when it is zero, source bytes are
  * observed for identity stability but contribute no reclaimable debt.

@@ -1656,6 +1656,55 @@ typedef struct ForkmetaObservationIdentity
 	long ctime_nsec;
 } ForkmetaObservationIdentity;
 
+typedef struct ForkmetaTempGcCursor
+{
+	int valid;
+	char directory[PS_FORKMETA_SNAPSHOT_PATH_MAX];
+	dev_t dev;
+	ino_t ino;
+	long offset;
+} ForkmetaTempGcCursor;
+
+static ForkmetaTempGcCursor forkmeta_temp_gc_cursor;
+
+static void
+forkmeta_temp_gc_cursor_reset(void)
+{
+	memset(&forkmeta_temp_gc_cursor, 0, sizeof(forkmeta_temp_gc_cursor));
+}
+
+static int
+forkmeta_temp_gc_cursor_prepare(const char *directory, int directory_fd,
+								DIR *dir)
+{
+	struct stat st;
+	int same_directory;
+
+	if (fstat(directory_fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+		strlen(directory) >= sizeof(forkmeta_temp_gc_cursor.directory))
+	{
+		forkmeta_temp_gc_cursor_reset();
+		return -1;
+	}
+	same_directory = forkmeta_temp_gc_cursor.valid &&
+		strcmp(forkmeta_temp_gc_cursor.directory, directory) == 0 &&
+		forkmeta_temp_gc_cursor.dev == st.st_dev &&
+		forkmeta_temp_gc_cursor.ino == st.st_ino;
+	if (!same_directory)
+		forkmeta_temp_gc_cursor_reset();
+	else
+		seekdir(dir, forkmeta_temp_gc_cursor.offset);
+	if (!forkmeta_temp_gc_cursor.valid)
+	{
+		memset(&forkmeta_temp_gc_cursor, 0, sizeof(forkmeta_temp_gc_cursor));
+		memcpy(forkmeta_temp_gc_cursor.directory, directory, strlen(directory) + 1);
+		forkmeta_temp_gc_cursor.dev = st.st_dev;
+		forkmeta_temp_gc_cursor.ino = st.st_ino;
+		forkmeta_temp_gc_cursor.valid = 1;
+	}
+	return 0;
+}
+
 static int
 forkmeta_identity_equal(const ForkmetaObservationIdentity *left,
 						const ForkmetaObservationIdentity *right)
@@ -1985,10 +2034,10 @@ cleanup:
 
 /* Remove only recognized temporary files.  This path is intentionally
  * independent of the selected manifest: an interrupted first publication can
- * leave executable debris before any manifest exists.  It scans sequentially
- * and stops after a bounded batch of valid temporary files, so canonical
- * entries do not hide later temporary debris. */
-int
+ * leave executable debris before any manifest exists.  It scans at most a
+ * bounded prefix per call and resumes from a validated directory cursor, so
+ * canonical entries do not hide later temporary debris. */
+PsForkmetaSnapshotGcResult
 ps_forkmeta_snapshot_gc_temporary(const char *directory)
 {
 	struct dirent *entry;
@@ -1999,27 +2048,44 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 	int removed = 0;
 	int unlink_failed = 0;
 	int rc = -1;
+	int scan_incomplete = 0;
+	int keep_cursor = 0;
+	unsigned int inspected = 0;
 	size_t count = 0;
 
 	if (directory == NULL)
+	{
+		forkmeta_temp_gc_cursor_reset();
 		return -1;
+	}
 	directory_fd = open_directory(directory, 0);
 	if (directory_fd < 0)
+	{
+		forkmeta_temp_gc_cursor_reset();
 		return errno == ENOENT ? 0 : -1;
+	}
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
+	if (forkmeta_temp_gc_cursor_prepare(directory, directory_fd, dir) != 0)
+		goto cleanup;
 	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
+	while (inspected < FORKMETA_TEMP_GC_BATCH && (entry = readdir(dir)) != NULL)
 	{
 		int temp_status;
+		long offset;
 
+		offset = telldir(dir);
+		if (offset == -1)
+			goto cleanup;
+		forkmeta_temp_gc_cursor.offset = offset;
 		if (strcmp(entry->d_name, ".") == 0 ||
 			strcmp(entry->d_name, "..") == 0 ||
 			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0 ||
 			strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
 			continue;
+		inspected++;
 		if (gc_inspection_test_hook != NULL)
 			gc_inspection_test_hook(gc_inspection_test_hook_arg);
 		temp_status = parse_temp_name(entry->d_name);
@@ -2037,11 +2103,10 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 			goto cleanup;
 		memcpy(names[count++], entry->d_name,
 			   strlen(entry->d_name) + 1);
-		if (count == FORKMETA_TEMP_GC_BATCH)
-			break;
 	}
+	scan_incomplete = inspected == FORKMETA_TEMP_GC_BATCH;
 	{
-		int scan_errno = count == FORKMETA_TEMP_GC_BATCH ? 0 : errno;
+		int scan_errno = scan_incomplete ? 0 : errno;
 		int close_rc = closedir(dir);
 
 		dir = NULL;
@@ -2050,6 +2115,9 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 		if (scan_errno != 0 || close_rc != 0)
 			goto cleanup;
 	}
+	keep_cursor = scan_incomplete;
+	if (!keep_cursor)
+		forkmeta_temp_gc_cursor_reset();
 	for (size_t i = 0; i < count; i++)
 	{
 		int regular = snapshot_gc_entry_regular(directory_fd, names[i]);
@@ -2071,6 +2139,7 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 	}
 	if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != NULL)
 	{
+		keep_cursor = 0;
 		if (removed)
 			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 		goto cleanup;
@@ -2078,19 +2147,26 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 	if (fsync(directory_fd) != 0)
 	{
 		unlink_failed = 1;
+		keep_cursor = 0;
 		if (removed)
 			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 	}
 	if (!unlink_failed)
-		rc = removed ? 1 : 0;
+		rc = removed ? PS_FORKMETA_SNAPSHOT_GC_REMOVED :
+		keep_cursor ? PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE :
+		PS_FORKMETA_SNAPSHOT_GC_NO_WORK;
 
 cleanup:
+	if (rc < 0)
+		keep_cursor = 0;
 	if (dir != NULL)
 		(void) closedir(dir);
 	else if (scan_fd >= 0)
 		(void) close(scan_fd);
 	if (directory_fd >= 0)
 		(void) close(directory_fd);
+	if (!keep_cursor)
+		forkmeta_temp_gc_cursor_reset();
 	return rc;
 }
 
