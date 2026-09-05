@@ -91,6 +91,8 @@ typedef enum PsForkmetaSnapshotGcResult
 	PS_FORKMETA_SNAPSHOT_GC_REMOVED = 1,
 	/* The scan cursor advanced without deleting a file; keep scheduling it. */
 	PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE = 2,
+	/* A deletion batch completed, but the persistent scan cursor remains. */
+	PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE = 3,
 	PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS = -2
 } PsForkmetaSnapshotGcResult;
 
@@ -194,16 +196,22 @@ extern int ps_forkmeta_snapshot_read_checkpoint(
 extern int ps_forkmeta_snapshot_read_tail(
 	const PsForkmetaSnapshot *snapshot, uint64_t offset, void *data,
 	uint64_t len);
-/* After publisher serialization and reader drain, remove recognized temp
- * debris and final files older than selected, preserving selected, newer, and
- * durable-prepared generations.  Every call fsyncs the directory, including
- * an empty retry after an ambiguous prior unlink fsync. */
-extern int ps_forkmeta_snapshot_gc(const char *directory);
+/* After publisher serialization and reader drain, remove a bounded batch of
+ * recognized temp debris and final files older than selected, preserving
+ * selected, newer, and durable-prepared generations.  Every call fsyncs the
+ * directory, including an empty retry after an ambiguous prior unlink fsync.
+ * SCAN_INCOMPLETE means the persistent cursor advanced without mutation, and
+ * REMOVED_SCAN_INCOMPLETE means a deletion batch also left more scan work;
+ * both require another tick without treating the result as fresh observation
+ * or forcing admission state to change. */
+extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc(const char *directory);
 /* Remove a bounded batch of recognized temporary debris without requiring a
  * selected manifest.  Canonical manifests/parts and durable prepared intent
- * are never removed by this path. */
-/* A SCAN_INCOMPLETE result is distinct from REMOVED: callers must schedule
- * another tick without forcing a fresh observation as if files changed. */
+ * are never removed by this path.  A REMOVED_SCAN_INCOMPLETE result means
+ * this batch removed files but the persistent cursor still has a suffix;
+ * callers must schedule another tick without forcing a fresh observation as
+ * if files changed.  SCAN_INCOMPLETE has the same scheduling requirement
+ * without a directory mutation. */
 extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc_temporary(
 		const char *directory);
 /* Metadata-only physical debt scan.  The source baseline growth is charged

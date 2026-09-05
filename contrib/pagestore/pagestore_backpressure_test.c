@@ -891,12 +891,37 @@ test_forkmeta_backpressure_observer(void)
 	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
 			metrics.forkmeta_backpressure.throttled == 0,
 			"restart does not charge source history without a safe frontier");
-	ps_backpressure_refresh();
-	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
-																				20, 10) == 0,
-			"lower forkmeta threshold for physical-debris admission test");
 	check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
 			mkdir(snapshots, 0700) == 0 &&
+			snprintf(temporary, sizeof(temporary),
+					 "%s/forkmeta_tail_v1_00000000000000000002.tmp.123.1",
+					 snapshots) >= 0 &&
+			write_test_file(temporary, 7),
+			"seed an orphan temporary part without a selected manifest");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	check(ps_core_open(store) == 0,
+			"restart a no-manifest store with an orphan temporary part");
+	/* Keep startup baseline initialization enabled, then disable only the
+	 * observation controller so the startup-armed temp pending state is tested
+	 * independently. */
+	forkmeta_reclaim_high_water_bytes = 0;
+	forkmeta_reclaim_catchup_bytes = 0;
+	ps_core_set_metrics_header(&metrics);
+	ps_test_forkmeta_snapshot_gc_retry_now();
+	(void) ps_core_maintenance();
+	check(access(temporary, F_OK) != 0,
+			"no-manifest restart drains orphan temp with observation disabled");
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					128, 20) == 0,
+			"restore forkmeta observation after no-manifest restart GC");
+	ps_backpressure_refresh();
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+																	20, 10) == 0,
+			"lower forkmeta threshold for physical-debris admission test");
+	check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
+			(errno = 0, mkdir(snapshots, 0700) == 0 || errno == EEXIST) &&
 		snprintf(old_checkpoint, sizeof(old_checkpoint),
 				 "%s/forkmeta_checkpoint_v1_00000000000000000001", snapshots) >= 0 &&
 		snprintf(old_tail, sizeof(old_tail),
@@ -1075,6 +1100,8 @@ test_forkmeta_self_recovery(void)
 	int reopen_rc;
 	uint64_t selected_generation = 0;
 	BackpressureSlowPathCounter cutover_attempts = {0};
+	BackpressureSlowPathCounter post_gc_continuations = {0};
+	BackpressureSlowPathCounter prefix_gc_inspections = {0};
 
 	configure_page_core();
 	compact_layers = 0;
@@ -1508,16 +1535,25 @@ test_forkmeta_self_recovery(void)
 		check(overflow_entries_created,
 				"remove repeated canonical overflow entries");
 		ps_backpressure_refresh();
+		/* Drain any residue left by the preceding overflow passes before creating
+		 * the prefix fixture.  Directly removing the overflow files can leave an
+		 * older canonical generation for the next bounded GC call to remove first,
+		 * which would mask the intended SCAN_INCOMPLETE result. */
+		for (int i = 0; i < 64; i++)
+		{
+			PsForkmetaSnapshotGcResult temp_gc =
+				ps_forkmeta_snapshot_gc_temporary(snapshots);
+			PsForkmetaSnapshotGcResult canonical_gc =
+				ps_forkmeta_snapshot_gc(snapshots);
 
-		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
-					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
-					   (unsigned long long) old_generation) >= 0 &&
-				  snprintf(old_tail, sizeof(old_tail),
-					   "%s/forkmeta_tail_v1_%020llu", snapshots,
-					   (unsigned long long) old_generation) >= 0 &&
-				  write_test_file(old_checkpoint, 11) &&
-				  write_test_file(old_tail, 13),
-				  "create canonical residue for no-op temp probe fairness");
+			check(temp_gc >= 0 && canonical_gc >= 0,
+					  "drain forkmeta GC cursors before canonical prefix fixture");
+			if (temp_gc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK &&
+				canonical_gc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK)
+				break;
+		}
+		ps_backpressure_refresh();
+
 		for (unsigned int i = 0; i < 4095; i++)
 		{
 			int n = snprintf(canonical, sizeof(canonical),
@@ -1532,17 +1568,64 @@ test_forkmeta_self_recovery(void)
 			}
 		}
 		ps_backpressure_refresh();
-		check(ps_core_maintenance() == 1 &&
-				  access(old_checkpoint, F_OK) != 0 && access(old_tail, F_OK) != 0,
-				  "canonical GC is not starved by a no-op temp probe");
-		for (unsigned int i = 0; i < 4095; i++)
 		{
-			if (snprintf(canonical, sizeof(canonical),
-						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
-						 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
-				unlink(canonical) != 0)
-				check(0, "remove canonical no-op probe residue");
+			int canonical_gc_did = 0;
+
+			post_gc_continuations.calls = 0;
+			prefix_gc_inspections.calls = 0;
+			ps_test_set_forkmeta_post_gc_hook(count_backpressure_slow_path,
+										  &post_gc_continuations);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				count_backpressure_slow_path, &prefix_gc_inspections);
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			canonical_gc_did |= ps_core_maintenance() != 0;
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			ps_test_set_forkmeta_post_gc_hook(NULL, NULL);
+			check(prefix_gc_inspections.calls >= 128,
+					  "canonical-prefix fixture reaches bounded GC scans");
+			check(post_gc_continuations.calls == 1,
+					  "canonical-prefix temp probe does not starve later maintenance phases");
+			/* Do not let the overflow-only suffix run into a later cutover while
+			 * this fixture is being torn down.  Its purpose here is the first
+			 * bounded SCAN_INCOMPLETE pass, not reclaim of newer residue. */
+			for (unsigned int i = 0; i < 4095; i++)
+			{
+				if (snprintf(canonical, sizeof(canonical),
+							 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+							 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
+					(unlink(canonical) != 0 && errno != ENOENT))
+					check(0, "remove canonical no-op probe residue");
+			}
+			check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
+					ps_forkmeta_snapshot_gc(snapshots) >= 0,
+					"reset forkmeta GC cursors after canonical prefix probe");
+			ps_backpressure_refresh();
+			check(snprintf(old_checkpoint, sizeof(old_checkpoint),
+					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  snprintf(old_tail, sizeof(old_tail),
+					   "%s/forkmeta_tail_v1_%020llu", snapshots,
+					   (unsigned long long) old_generation) >= 0 &&
+				  write_test_file(old_checkpoint, 11) &&
+				  write_test_file(old_tail, 13),
+				  "create canonical residue for no-op temp probe fairness");
+			ps_backpressure_refresh();
+
+			for (int i = 0; i < 64 &&
+					(access(old_checkpoint, F_OK) == 0 ||
+					 access(old_tail, F_OK) == 0); i++)
+			{
+				ps_test_forkmeta_snapshot_gc_retry_now();
+				canonical_gc_did |= ps_core_maintenance() != 0;
+			}
+			check(canonical_gc_did && access(old_checkpoint, F_OK) != 0 &&
+					  access(old_tail, F_OK) != 0,
+					  "canonical GC is not starved by a no-op temp probe");
+			check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
+					ps_forkmeta_snapshot_gc(snapshots) >= 0,
+					"reset forkmeta GC cursors before later fault fixtures");
 		}
+		ps_backpressure_refresh();
 
 		check(snprintf(temporary, sizeof(temporary),
 					   "%s/forkmeta_tail_v1_%020llu.tmp.1.1", snapshots,
@@ -1551,7 +1634,7 @@ test_forkmeta_self_recovery(void)
 				  "create temporary debris for GC backoff fairness");
 		ps_backpressure_refresh();
 		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0 &&
-				  ps_core_maintenance() == 0 && access(temporary, F_OK) != 0 &&
+				  ps_core_maintenance() >= 0 && access(temporary, F_OK) != 0 &&
 				  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
 				  "temp GC enters its dedicated durability backoff");
 		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
@@ -1564,12 +1647,30 @@ test_forkmeta_self_recovery(void)
 				  write_test_file(old_tail, 13),
 				  "create canonical generation debris for ambiguity retry");
 		ps_backpressure_refresh();
-		check(ps_core_maintenance() == 1 &&
-				  access(old_checkpoint, F_OK) != 0 && access(old_tail, F_OK) != 0,
-				  "canonical GC proceeds while temporary GC waits for backoff");
-		ps_test_forkmeta_snapshot_gc_retry_now();
-		check(ps_core_maintenance() == 1,
-				  "temporary GC backoff retry remains independently serviceable");
+		{
+			int canonical_gc_did = 0;
+
+			for (int i = 0; i < 64 &&
+					(access(old_checkpoint, F_OK) == 0 ||
+					 access(old_tail, F_OK) == 0); i++)
+			{
+				canonical_gc_did |= ps_core_maintenance() != 0;
+			}
+			check(canonical_gc_did && access(old_checkpoint, F_OK) != 0 &&
+					  access(old_tail, F_OK) != 0,
+					  "canonical GC proceeds while temporary GC waits for backoff");
+		}
+		{
+			BackpressureSlowPathCounter retry_attempts = {0};
+
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				count_backpressure_slow_path, &retry_attempts);
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			(void) ps_core_maintenance();
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			check(retry_attempts.calls != 0,
+					  "temporary GC backoff retry remains independently serviceable");
+		}
 		check(write_test_file(old_checkpoint, 11) && write_test_file(old_tail, 13),
 				  "recreate canonical debris for durability ambiguity");
 		ps_backpressure_refresh();
@@ -1586,6 +1687,251 @@ test_forkmeta_self_recovery(void)
 				  "canonical GC empty retry closes directory-fsync ambiguity");
 		check(metrics.forkmeta_backpressure.lag_bytes == 0,
 				  "canonical GC retry reconciles physical debt");
+		check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
+				ps_forkmeta_snapshot_gc(snapshots) >= 0,
+				"reset forkmeta GC cursors before temporary cursor fixture");
+	}
+	{
+		const unsigned int temp_backlog_entries = 257;
+		int temp_backlog_created = 1;
+
+		/* Schedule a multi-batch temporary backlog while observation is enabled,
+		 * then disable only the observer.  Pending GC must remain serviceable and
+		 * drain every batch without a refresh clearing its controller state. */
+		for (unsigned int i = 0; i < temp_backlog_entries; i++)
+		{
+			if (snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.1", snapshots,
+						 (unsigned long long) selected_generation, i + 1) < 0 ||
+				!write_test_file(temporary, 1))
+				temp_backlog_created = 0;
+		}
+		ps_backpressure_refresh();
+		check(temp_backlog_created && metrics.forkmeta_backpressure.lag_bytes != 0,
+				  "schedule a >batch temporary GC backlog");
+		forkmeta_reclaim_high_water_bytes = 0;
+		forkmeta_reclaim_catchup_bytes = 0;
+		for (int i = 0; i < 8; i++)
+		{
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			(void) ps_core_maintenance();
+		}
+		for (unsigned int i = 0; i < temp_backlog_entries; i++)
+		{
+			if (snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.1", snapshots,
+						 (unsigned long long) selected_generation, i + 1) < 0 ||
+				access(temporary, F_OK) == 0)
+				check(0, "disabled-observation temp GC drains every batch");
+		}
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					32, 20) == 0,
+				  "restore forkmeta observation after temporary backlog test");
+	}
+	{
+		const unsigned int temp_entries = 257;
+		const unsigned int canonical_entries = 129;
+		int fixture_created = 1;
+
+		/* Put the temporary entries before a newer canonical prefix and an old
+		 * part.  The first temp removal batch returns REMOVED_SCAN_INCOMPLETE;
+		 * canonical GC then gets a bounded no-op batch in the same maintenance
+		 * tick, proving the retained result does not starve later classes. */
+		for (unsigned int i = 0; i < temp_entries; i++)
+		{
+			if (snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.2", snapshots,
+						 (unsigned long long) selected_generation, i + 1) < 0 ||
+				!write_test_file(temporary, 1))
+				fixture_created = 0;
+		}
+		for (unsigned int i = 0; i < canonical_entries; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 2000000 + i)) < 0 ||
+				!write_test_file(canonical, 1))
+				fixture_created = 0;
+		}
+		check(snprintf(old_checkpoint, sizeof(old_checkpoint),
+					   "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+					   (unsigned long long) (selected_generation - 1)) >= 0 &&
+				  write_test_file(old_checkpoint, 1),
+				  "create old canonical entry for temp GC fairness");
+		ps_backpressure_refresh();
+		check(fixture_created, "create temp/canonical same-tick fairness fixture");
+		post_gc_continuations.calls = 0;
+		ps_test_set_forkmeta_post_gc_hook(count_backpressure_slow_path,
+									  &post_gc_continuations);
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		(void) ps_core_maintenance();
+		ps_test_set_forkmeta_post_gc_hook(NULL, NULL);
+		check(post_gc_continuations.calls == 1,
+				  "temp removal plus incomplete scan reaches canonical maintenance");
+		for (unsigned int i = 0; i < temp_entries; i++)
+		{
+			if (snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.2", snapshots,
+						 (unsigned long long) selected_generation, i + 1) < 0 ||
+				(unlink(temporary) != 0 && errno != ENOENT))
+				check(0, "remove temp fairness fixture");
+		}
+		for (unsigned int i = 0; i < canonical_entries; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation + 2000000 + i)) < 0 ||
+				(unlink(canonical) != 0 && errno != ENOENT))
+				check(0, "remove canonical fairness fixture");
+		}
+		check(unlink(old_checkpoint) == 0 || errno == ENOENT,
+				  "remove old canonical fairness fixture");
+		check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
+				ps_forkmeta_snapshot_gc(snapshots) >= 0,
+				"reset cursors after temp/canonical fairness fixture");
+		ps_backpressure_refresh();
+	}
+	{
+		int canonical_progress = 0;
+
+		/* Each tick gets a fresh, complete temp batch.  A successful temp return
+		 * must still fall through so the already-pending canonical residue is
+		 * reclaimed instead of being starved by continuous temp churn. */
+		check(selected_generation > 100 &&
+				snprintf(old_checkpoint, sizeof(old_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (selected_generation - 100)) >= 0 &&
+				write_test_file(old_checkpoint, 1),
+				  "create canonical residue for completed-temp fairness");
+		for (unsigned int i = 0; i < 4; i++)
+		{
+			check(snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.3", snapshots,
+						 (unsigned long long) selected_generation, i + 1) >= 0 &&
+				write_test_file(temporary, 1),
+					  "create fresh small temp batch for canonical fairness");
+			ps_backpressure_refresh();
+			(void) ps_core_maintenance();
+			if (access(old_checkpoint, F_OK) != 0)
+				canonical_progress = 1;
+		}
+		check(canonical_progress,
+				  "completed temp cleanup does not starve canonical GC");
+		for (unsigned int i = 0; i < 4; i++)
+		{
+			if (snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.%u.3", snapshots,
+						 (unsigned long long) selected_generation, i + 1) < 0 ||
+				(unlink(temporary) != 0 && errno != ENOENT))
+				check(0, "remove completed-temp fairness residue");
+		}
+		check(unlink(old_checkpoint) == 0 || errno == ENOENT,
+				  "remove completed-temp canonical residue");
+		check(ps_forkmeta_snapshot_gc_temporary(snapshots) >= 0 &&
+				ps_forkmeta_snapshot_gc(snapshots) >= 0,
+				"reset cursors after completed-temp fairness");
+		ps_backpressure_refresh();
+	}
+	{
+		/* The temp unlink clears pending debt, but the observation used to arm
+		 * this tick still says serviceable work is throttling.  That stale state
+		 * must not publish a snapshot before the forced refresh runs. */
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					20, 10) == 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.321.4", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				write_test_file(temporary, 32),
+				  "create temp debt for same-tick stale-observation test");
+		ps_backpressure_refresh();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		(void) ps_core_maintenance();
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(cutover_attempts.calls == 0 && access(temporary, F_OK) != 0,
+				  "temp deletion does not publish from stale same-tick debt");
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					32, 20) == 0,
+				  "restore forkmeta thresholds after stale-observation test");
+		ps_backpressure_refresh();
+	}
+	{
+		/* An empty retry closes a post-unlink durability ambiguity, but the
+		 * observation still predates that reconciliation.  It must not publish
+		 * from the stale serviceable-debt result in the same tick. */
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					20, 10) == 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu.tmp.321.5", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				write_test_file(temporary, 32),
+				  "create temp debt for ambiguity-retry stale-observation test");
+		ps_backpressure_refresh();
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0,
+				  "arm temp GC ambiguity for stale-observation retry");
+		(void) ps_core_maintenance();
+		check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0 &&
+				access(temporary, F_OK) != 0,
+				  "temp ambiguity retry fixture unlinks before fsync failure");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		(void) ps_core_maintenance();
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(cutover_attempts.calls == 0,
+				  "empty temp ambiguity retry does not publish stale snapshot");
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					32, 20) == 0,
+				  "restore forkmeta thresholds after ambiguity-retry test");
+		ps_backpressure_refresh();
+	}
+	{
+		const unsigned int startup_gc_entries = 257;
+		uint64_t startup_gc_base;
+		int startup_gc_entries_created = 1;
+
+		/* Startup cleanup must not depend on the backpressure observer: seed more
+		 * obsolete canonical entries than one full-GC batch and verify that the
+		 * retained cursor drains every batch after a fresh open. */
+		check(selected_generation > startup_gc_entries,
+				  "selected generation leaves room for startup GC residue");
+		startup_gc_base = selected_generation - startup_gc_entries;
+		for (unsigned int i = 0; i < startup_gc_entries; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (startup_gc_base + i)) < 0 ||
+				!write_test_file(canonical, 1))
+				startup_gc_entries_created = 0;
+		}
+		check(startup_gc_entries_created,
+				  "create >batch canonical residue for restart GC");
+		ps_core_set_metrics_header(NULL);
+		ps_core_close();
+		ps_storage->close();
+		check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+				  "disable forkmeta backpressure before restart GC");
+		check(ps_core_open(store) == 0,
+				  "restart with >batch canonical residue and disabled observation");
+		ps_core_set_metrics_header(&metrics);
+		for (int i = 0; i < 8; i++)
+		{
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			(void) ps_core_maintenance();
+		}
+		for (unsigned int i = 0; i < startup_gc_entries; i++)
+		{
+			if (snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) (startup_gc_base + i)) < 0 ||
+				access(canonical, F_OK) == 0)
+				check(0, "restart GC drains every canonical residue batch");
+		}
+		check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+					32, 20) == 0,
+				  "restore forkmeta observation after restart GC regression");
 	}
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();

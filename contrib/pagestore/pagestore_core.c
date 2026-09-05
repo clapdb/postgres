@@ -203,6 +203,8 @@ static uint32_t admission_waiting_writers;
 static int admission_writer_active;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
+static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
+static void *forkmeta_post_gc_test_hook_arg;
 static PsForkmetaBaselineInitTestHook forkmeta_baseline_init_test_hook;
 static void *forkmeta_baseline_init_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
@@ -1035,6 +1037,13 @@ ps_test_set_forkmeta_cutover_hook(PsForkmetaCutoverTestHook hook, void *arg)
 {
 	forkmeta_cutover_test_hook = hook;
 	forkmeta_cutover_test_hook_arg = arg;
+}
+
+void
+ps_test_set_forkmeta_post_gc_hook(PsForkmetaPostGcTestHook hook, void *arg)
+{
+	forkmeta_post_gc_test_hook = hook;
+	forkmeta_post_gc_test_hook_arg = arg;
 }
 
 void
@@ -7243,6 +7252,10 @@ fork_meta_prepared_matches_selected(const PsForkmetaSnapshotPrepared *pending,
 		pending->tail.crc == selected->tail.crc;
 }
 
+/* Internal result: a bounded GC batch made progress but left its cursor live.
+ * The outer controller folds this into did and continues other maintenance. */
+#define FORKMETA_MAINTENANCE_CONTINUE 2
+
 static int
 fork_meta_snapshot_maintenance(void)
 {
@@ -7270,8 +7283,24 @@ fork_meta_snapshot_maintenance(void)
 			/* The unlink set and its directory fsync are complete.  A crash
 			 * here must reopen the selected generation with no dependence on
 			 * the retired generation. */
-			if (gc > 0 || fork_meta_snapshot_gc_ambiguous)
+			if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED ||
+				gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE ||
+				fork_meta_snapshot_gc_ambiguous)
 				(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_SNAPSHOT_GC);
+			if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE ||
+				gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
+			{
+				/* A bounded full-GC pass may have removed files and still have a
+				 * live cursor.  Keep the startup/publish cleanup pending until a
+				 * later pass reaches EOF, but let the outer controller service its
+				 * other maintenance classes in this tick. */
+				fork_meta_snapshot_gc_pending = 1;
+				fork_meta_snapshot_gc_ambiguous = 0;
+				memset(&fork_meta_snapshot_retry_at, 0,
+					   sizeof(fork_meta_snapshot_retry_at));
+				forkmeta_observation_force_now();
+				return FORKMETA_MAINTENANCE_CONTINUE;
+			}
 			fork_meta_snapshot_gc_pending = 0;
 			fork_meta_snapshot_gc_ambiguous = 0;
 			memset(&fork_meta_snapshot_retry_at, 0,
@@ -15096,6 +15125,8 @@ ps_core_maintenance_impl(void)
 	int			found = 0;
 	int			did = 0;
 	int			legacy_compaction = 0;
+	int			forkmeta_gc_scan_incomplete = 0;
+	int			forkmeta_temp_gc_observation_stale = 0;
 
 	/* A failed timeline metadata append may already be durable.  Until reopen
 	 * resolves that ambiguity, background work must fail closed alongside the
@@ -15118,23 +15149,36 @@ ps_core_maintenance_impl(void)
 		int was_ambiguous = fork_meta_temp_gc_ambiguous;
 
 		gc = ps_forkmeta_snapshot_gc_temporary(fork_meta_snapshot_dir);
-		if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE)
+		if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE ||
+			gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
 		{
-			/* The persistent cursor advanced outside the admission fence, but
-			 * the directory did not change.  Keep scheduling cursor batches
-			 * without forcing another bounded debt observation. */
+			/* The persistent cursor advanced outside the admission fence.  A
+			 * removal-plus-incomplete result also changed the directory, so retain
+			 * both pending state and the probe, refresh the observation deadline,
+			 * and still let later maintenance classes get a turn in this tick. */
+			if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
+			{
+				fork_meta_temp_gc_pending = 1;
+				fork_meta_temp_gc_ambiguous = 0;
+				memset(&fork_meta_temp_gc_retry_at, 0,
+					   sizeof(fork_meta_temp_gc_retry_at));
+				forkmeta_observation_force_now();
+				forkmeta_temp_gc_observation_stale = 1;
+			}
 			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
 							 __ATOMIC_RELEASE);
+			did = 1;
+			forkmeta_gc_scan_incomplete = 1;
 			if (was_ambiguous)
 			{
 				fork_meta_temp_gc_ambiguous = 0;
 				memset(&fork_meta_temp_gc_retry_at, 0,
 					   sizeof(fork_meta_temp_gc_retry_at));
 				forkmeta_observation_force_now();
+				forkmeta_temp_gc_observation_stale = 1;
 			}
-			return 1;
 		}
-		if (gc >= 0)
+		else if (gc >= 0)
 		{
 			fork_meta_temp_gc_pending = 0;
 			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0,
@@ -15145,7 +15189,13 @@ ps_core_maintenance_impl(void)
 			if (gc > 0 || was_ambiguous)
 			{
 				forkmeta_observation_force_now();
-				return 1;
+				/* A completed temp batch must not monopolize maintenance when
+				 * foreground churn keeps making another small batch due. */
+				did = 1;
+				if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED ||
+					gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE ||
+					was_ambiguous)
+					forkmeta_temp_gc_observation_stale = 1;
 			}
 		}
 		else
@@ -15165,7 +15215,28 @@ ps_core_maintenance_impl(void)
 		int was_ambiguous = fork_meta_canonical_gc_ambiguous;
 
 		gc = ps_forkmeta_snapshot_gc(fork_meta_snapshot_dir);
-		if (gc >= 0)
+		if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE ||
+			gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
+		{
+			/* Keep a future cursor batch due, including a batch which removed
+			 * files, but let WAL/timeline/segment/compaction maintenance run in
+			 * the same tick. */
+			fork_meta_canonical_gc_pending = 1;
+			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 1,
+							 __ATOMIC_RELEASE);
+			did = 1;
+			forkmeta_gc_scan_incomplete = 1;
+			if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
+				forkmeta_observation_force_now();
+			if (was_ambiguous)
+			{
+				fork_meta_canonical_gc_ambiguous = 0;
+				memset(&fork_meta_canonical_gc_retry_at, 0,
+					   sizeof(fork_meta_canonical_gc_retry_at));
+				forkmeta_observation_force_now();
+			}
+		}
+		else if (gc >= 0)
 		{
 			fork_meta_canonical_gc_pending = 0;
 			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
@@ -15189,7 +15260,14 @@ ps_core_maintenance_impl(void)
 			fork_meta_canonical_gc_retry_at.tv_sec++;
 		}
 	}
-	if (fork_meta_snapshot_gc_due() || fork_meta_snapshot_due())
+	if (forkmeta_gc_scan_incomplete && forkmeta_post_gc_test_hook != NULL)
+		forkmeta_post_gc_test_hook(forkmeta_post_gc_test_hook_arg);
+	/* A temp unlink or successful ambiguity reconciliation changes what the last
+	 * observation can prove.  Do not publish from that stale debt in this same
+	 * tick; the forced observation becomes visible after maintenance returns.  A
+	 * pending post-cutover GC is independent and remains safe to service here. */
+	if (fork_meta_snapshot_gc_due() ||
+		(!forkmeta_temp_gc_observation_stale && fork_meta_snapshot_due()))
 	{
 		int snapshot_rc;
 
@@ -15212,7 +15290,9 @@ ps_core_maintenance_impl(void)
 		for (uint32_t sh = core_shards(); sh > 0; sh--)
 			ps_unlock_shard(sh - 1);
 		ps_admission_write_unlock();
-		if (snapshot_rc)
+		if (snapshot_rc == FORKMETA_MAINTENANCE_CONTINUE)
+			did = 1;
+		else if (snapshot_rc)
 			return 1;
 	}
 	if (!use_layers)
@@ -15738,6 +15818,15 @@ ps_core_open(const char *store_dir)
 			if (have_prepared == 1 &&
 				ps_forkmeta_snapshot_abort(&prepared) != 0)
 				return -1;
+			/* There is no selected manifest to make the normal observation arm
+			 * this path, but an interrupted first publication may have left valid
+			 * temporary parts.  Schedule bounded temp GC independently of
+			 * backpressure observation and make its first retry immediately due. */
+			fork_meta_temp_gc_pending = 1;
+			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
+							 __ATOMIC_RELEASE);
+			memset(&fork_meta_temp_gc_retry_at, 0,
+				   sizeof(fork_meta_temp_gc_retry_at));
 		}
 	}
 

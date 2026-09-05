@@ -32,6 +32,29 @@ typedef struct SnapshotRecord
 	PsForkmetaSnapshotPart tail;
 } SnapshotRecord;
 
+typedef struct ForkmetaGcDirectoryCursor
+{
+	int valid;
+	char directory[PS_FORKMETA_SNAPSHOT_PATH_MAX];
+	dev_t dev;
+	ino_t ino;
+	long offset;
+} ForkmetaGcDirectoryCursor;
+
+typedef struct ForkmetaGcAuthority
+{
+	int present;
+	struct stat stat;
+	SnapshotRecord record;
+} ForkmetaGcAuthority;
+
+typedef struct ForkmetaSnapshotGcCursor
+{
+	ForkmetaGcDirectoryCursor scan;
+	ForkmetaGcAuthority current;
+	ForkmetaGcAuthority prepared;
+} ForkmetaSnapshotGcCursor;
+
 typedef struct SnapshotCrcCtx
 {
 	uint32_t crc;
@@ -56,6 +79,8 @@ static PsForkmetaSnapshotObservationTestHook observation_test_hook;
 static void *observation_test_hook_arg;
 static PsForkmetaSnapshotGcInspectionTestHook gc_inspection_test_hook;
 static void *gc_inspection_test_hook_arg;
+static ForkmetaGcDirectoryCursor forkmeta_temp_gc_cursor;
+static ForkmetaSnapshotGcCursor forkmeta_snapshot_gc_cursor;
 
 void
 ps_test_set_forkmeta_snapshot_observation_hook(
@@ -71,6 +96,152 @@ ps_test_set_forkmeta_snapshot_gc_inspection_hook(
 {
 	gc_inspection_test_hook = hook;
 	gc_inspection_test_hook_arg = arg;
+}
+
+static void
+forkmeta_gc_directory_cursor_reset(ForkmetaGcDirectoryCursor *cursor)
+{
+	memset(cursor, 0, sizeof(*cursor));
+}
+
+static int
+forkmeta_gc_stat_equal(const struct stat *left, const struct stat *right)
+{
+	return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+		left->st_mode == right->st_mode && left->st_size == right->st_size &&
+		left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+		left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
+		left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+		left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+}
+
+static int
+forkmeta_gc_directory_cursor_prepare(const char *directory, int directory_fd,
+								 DIR *dir, ForkmetaGcDirectoryCursor *cursor,
+								 int *same_directory_out)
+{
+	struct stat st;
+	int same_directory;
+
+	if (fstat(directory_fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+		strlen(directory) >= sizeof(cursor->directory))
+	{
+		forkmeta_gc_directory_cursor_reset(cursor);
+		return -1;
+	}
+	same_directory = cursor->valid &&
+		strcmp(cursor->directory, directory) == 0 &&
+		cursor->dev == st.st_dev && cursor->ino == st.st_ino;
+	if (same_directory)
+		seekdir(dir, cursor->offset);
+	else
+		forkmeta_gc_directory_cursor_reset(cursor);
+	if (!cursor->valid)
+	{
+		memset(cursor, 0, sizeof(*cursor));
+		memcpy(cursor->directory, directory, strlen(directory) + 1);
+		cursor->dev = st.st_dev;
+		cursor->ino = st.st_ino;
+		cursor->valid = 1;
+	}
+	if (same_directory_out != NULL)
+		*same_directory_out = same_directory;
+	return 0;
+}
+
+static int
+forkmeta_gc_authority_read(int directory_fd, const char *name,
+							 const SnapshotRecord *record,
+							 ForkmetaGcAuthority *authority)
+{
+	memset(authority, 0, sizeof(*authority));
+	if (fstatat(directory_fd, name, &authority->stat,
+					AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT ? 0 : -1;
+	if (!S_ISREG(authority->stat.st_mode) || authority->stat.st_size < 0)
+		return -1;
+	authority->present = 1;
+	if (record != NULL)
+		authority->record = *record;
+	return 0;
+}
+
+static void
+forkmeta_gc_record_from_snapshot(const PsForkmetaSnapshot *snapshot,
+							 SnapshotRecord *record)
+{
+	record->generation = snapshot->generation;
+	record->cutoff_lsn = snapshot->cutoff_lsn;
+	record->cutoff_admission_seq = snapshot->cutoff_admission_seq;
+	record->checkpoint = snapshot->checkpoint;
+	record->tail = snapshot->tail;
+}
+
+static void
+forkmeta_gc_record_from_prepared(const PsForkmetaSnapshotPrepared *prepared,
+							 SnapshotRecord *record)
+{
+	record->generation = prepared->generation;
+	record->cutoff_lsn = prepared->cutoff_lsn;
+	record->cutoff_admission_seq = prepared->cutoff_admission_seq;
+	record->checkpoint = prepared->checkpoint;
+	record->tail = prepared->tail;
+}
+
+static int
+forkmeta_gc_authority_equal(const ForkmetaGcAuthority *left,
+							const ForkmetaGcAuthority *right)
+{
+	return left->present == right->present &&
+		(!left->present ||
+		 (forkmeta_gc_stat_equal(&left->stat, &right->stat) &&
+		  left->record.generation == right->record.generation &&
+		  left->record.cutoff_lsn == right->record.cutoff_lsn &&
+		  left->record.cutoff_admission_seq ==
+		  right->record.cutoff_admission_seq &&
+		  left->record.checkpoint.len == right->record.checkpoint.len &&
+		  left->record.checkpoint.crc == right->record.checkpoint.crc &&
+		  left->record.tail.len == right->record.tail.len &&
+		  left->record.tail.crc == right->record.tail.crc));
+}
+
+static void
+forkmeta_snapshot_gc_cursor_reset(void)
+{
+	memset(&forkmeta_snapshot_gc_cursor, 0,
+		   sizeof(forkmeta_snapshot_gc_cursor));
+}
+
+static int
+forkmeta_snapshot_gc_cursor_prepare(const char *directory, int directory_fd,
+								DIR *dir,
+								const ForkmetaGcAuthority *current,
+								const ForkmetaGcAuthority *prepared)
+{
+	int same_directory;
+	int same_authority;
+
+	if (forkmeta_gc_directory_cursor_prepare(directory, directory_fd, dir,
+									 &forkmeta_snapshot_gc_cursor.scan,
+									 &same_directory) != 0)
+		return -1;
+	same_authority = same_directory &&
+		forkmeta_gc_authority_equal(&forkmeta_snapshot_gc_cursor.current,
+									current) &&
+		forkmeta_gc_authority_equal(&forkmeta_snapshot_gc_cursor.prepared,
+									prepared);
+	if (!same_authority)
+	{
+		forkmeta_snapshot_gc_cursor_reset();
+		rewinddir(dir);
+		if (forkmeta_gc_directory_cursor_prepare(directory, directory_fd, dir,
+									 &forkmeta_snapshot_gc_cursor.scan,
+									 NULL) != 0)
+			return -1;
+	}
+	forkmeta_snapshot_gc_cursor.current = *current;
+	forkmeta_snapshot_gc_cursor.prepared = *prepared;
+	return 0;
 }
 
 static size_t
@@ -1509,38 +1680,83 @@ ps_forkmeta_snapshot_read_tail(const PsForkmetaSnapshot *snapshot,
 							 offset, data, len);
 }
 
-int
+PsForkmetaSnapshotGcResult
 ps_forkmeta_snapshot_gc(const char *directory)
 {
 	PsForkmetaSnapshotPrepared durable_prepared;
 	PsForkmetaSnapshot current;
+	PsForkmetaSnapshotPrepared prepared_after;
+	SnapshotRecord current_record;
+	SnapshotRecord prepared_record;
+	ForkmetaGcAuthority current_authority;
+	ForkmetaGcAuthority prepared_authority;
+	ForkmetaGcAuthority current_after_authority;
+	ForkmetaGcAuthority prepared_after_authority;
 	struct dirent *entry;
-	char (*names)[256] = NULL;
+	char names[PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH][256];
 	DIR *dir = NULL;
 	int scan_fd = -1;
 	int rc = -1;
 	int intent_exists;
+	int intent_after;
 	int unlink_failed = 0;
 	int removed = 0;
+	int scan_incomplete = 0;
+	int keep_cursor = 0;
+	unsigned int inspected = 0;
 	size_t count = 0;
-	size_t capacity = 0;
 
 	if (ps_forkmeta_snapshot_open(&current, directory) != 0)
+	{
+		forkmeta_snapshot_gc_cursor_reset();
 		return -1;
+	}
 	if (read_prepared_metadata_if_exists(current.directory_fd, directory,
 									 &durable_prepared, &intent_exists) != 0)
 		goto cleanup;
+	forkmeta_gc_record_from_snapshot(&current, &current_record);
+	if (forkmeta_gc_authority_read(current.directory_fd,
+								 FORKMETA_SNAPSHOT_MANIFEST, &current_record,
+								 &current_authority) != 0)
+		goto cleanup;
+	memset(&prepared_authority, 0, sizeof(prepared_authority));
+	if (intent_exists)
+	{
+		forkmeta_gc_record_from_prepared(&durable_prepared, &prepared_record);
+		if (forkmeta_gc_authority_read(current.directory_fd,
+									 FORKMETA_SNAPSHOT_PREPARED, &prepared_record,
+									 &prepared_authority) != 0)
+			goto cleanup;
+	}
 	scan_fd = fcntl(current.directory_fd, F_DUPFD_CLOEXEC, 0);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
+	if (forkmeta_snapshot_gc_cursor_prepare(directory, current.directory_fd, dir,
+											&current_authority,
+											&prepared_authority) != 0)
+		goto cleanup;
 	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
+	while (inspected < PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH &&
+		   (entry = readdir(dir)) != NULL)
 	{
 		uint64_t generation;
+		long offset;
 		int temp_status = parse_temp_name(entry->d_name);
 		int recognized = temp_status == 0;
 
+		offset = telldir(dir);
+		if (offset == -1)
+			goto cleanup;
+		forkmeta_snapshot_gc_cursor.scan.offset = offset;
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
+			continue;
+		inspected++;
+		if (gc_inspection_test_hook != NULL)
+			gc_inspection_test_hook(gc_inspection_test_hook_arg);
 		if (!recognized)
 		{
 			int checkpoint_status =
@@ -1561,27 +1777,22 @@ ps_forkmeta_snapshot_gc(const char *directory)
 			recognized = checkpoint_status == 0 || tail_status == 0;
 			if (!recognized || generation >= current.generation ||
 				(intent_exists && generation == durable_prepared.generation))
+			{
+				if (recognized && snapshot_gc_entry_regular(current.directory_fd,
+											 entry->d_name) != 1)
+					goto cleanup;
 				continue;
+			}
 		}
-		if (count == capacity)
-		{
-			size_t next = capacity == 0 ? 16 : capacity * 2;
-			void *grown;
-
-			if (next < capacity || next > SIZE_MAX / sizeof(*names))
-				goto cleanup;
-			grown = realloc(names, next * sizeof(*names));
-			if (grown == NULL)
-				goto cleanup;
-			names = grown;
-			capacity = next;
-		}
+		if (snapshot_gc_entry_regular(current.directory_fd, entry->d_name) != 1)
+			goto cleanup;
 		if (strlen(entry->d_name) >= sizeof(names[0]))
 			goto cleanup;
 		memcpy(names[count++], entry->d_name, strlen(entry->d_name) + 1);
 	}
+	scan_incomplete = inspected == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH;
 	{
-		int scan_errno = errno;
+		int scan_errno = scan_incomplete ? 0 : errno;
 		int close_rc = closedir(dir);
 
 		/* closedir consumes the stream even when it reports an error. */
@@ -1593,6 +1804,33 @@ ps_forkmeta_snapshot_gc(const char *directory)
 		if (close_rc != 0 || scan_errno != 0)
 			goto cleanup;
 	}
+	/* Do not unlink against an authority that changed while the bounded scan
+	 * was in progress.  The next call starts at the new authority's prefix. */
+	if (read_record(current.directory_fd, directory, FORKMETA_SNAPSHOT_MANIFEST,
+					&current_record, 0) != 0 ||
+		forkmeta_gc_authority_read(current.directory_fd,
+							 FORKMETA_SNAPSHOT_MANIFEST, &current_record,
+							 &current_after_authority) != 0 ||
+		read_prepared_metadata_if_exists(current.directory_fd, directory,
+									 &prepared_after, &intent_after) != 0)
+		goto cleanup;
+	memset(&prepared_after_authority, 0, sizeof(prepared_after_authority));
+	if (intent_after)
+	{
+		forkmeta_gc_record_from_prepared(&prepared_after, &prepared_record);
+		if (forkmeta_gc_authority_read(current.directory_fd,
+									 FORKMETA_SNAPSHOT_PREPARED, &prepared_record,
+									 &prepared_after_authority) != 0)
+			goto cleanup;
+	}
+	if (!forkmeta_gc_authority_equal(&current_authority,
+								 &current_after_authority) ||
+		!forkmeta_gc_authority_equal(&prepared_authority,
+								 &prepared_after_authority))
+		goto cleanup;
+	keep_cursor = scan_incomplete;
+	if (!keep_cursor)
+		forkmeta_snapshot_gc_cursor_reset();
 	for (size_t i = 0; i < count; i++)
 	{
 		int regular = snapshot_gc_entry_regular(current.directory_fd, names[i]);
@@ -1614,6 +1852,7 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	}
 	if (getenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") != NULL)
 	{
+		keep_cursor = 0;
 		errno = EIO;
 		if (removed)
 			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
@@ -1623,19 +1862,27 @@ ps_forkmeta_snapshot_gc(const char *directory)
 	if (fsync(current.directory_fd) != 0)
 	{
 		unlink_failed = 1;
+		keep_cursor = 0;
 		if (removed)
 			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 	}
 	if (!unlink_failed)
-		rc = removed ? 1 : 0;
+		rc = removed ? (keep_cursor ?
+		PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE :
+		PS_FORKMETA_SNAPSHOT_GC_REMOVED) :
+		keep_cursor ? PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE :
+		PS_FORKMETA_SNAPSHOT_GC_NO_WORK;
 
 cleanup:
-	free(names);
+	if (rc < 0)
+		keep_cursor = 0;
 	if (dir != NULL)
 		(void) closedir(dir);
 	else if (scan_fd >= 0)
 		(void) close(scan_fd);
 	ps_forkmeta_snapshot_close(&current);
+	if (!keep_cursor)
+		forkmeta_snapshot_gc_cursor_reset();
 	return rc;
 }
 
@@ -1655,55 +1902,6 @@ typedef struct ForkmetaObservationIdentity
 	time_t ctime_sec;
 	long ctime_nsec;
 } ForkmetaObservationIdentity;
-
-typedef struct ForkmetaTempGcCursor
-{
-	int valid;
-	char directory[PS_FORKMETA_SNAPSHOT_PATH_MAX];
-	dev_t dev;
-	ino_t ino;
-	long offset;
-} ForkmetaTempGcCursor;
-
-static ForkmetaTempGcCursor forkmeta_temp_gc_cursor;
-
-static void
-forkmeta_temp_gc_cursor_reset(void)
-{
-	memset(&forkmeta_temp_gc_cursor, 0, sizeof(forkmeta_temp_gc_cursor));
-}
-
-static int
-forkmeta_temp_gc_cursor_prepare(const char *directory, int directory_fd,
-								DIR *dir)
-{
-	struct stat st;
-	int same_directory;
-
-	if (fstat(directory_fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
-		strlen(directory) >= sizeof(forkmeta_temp_gc_cursor.directory))
-	{
-		forkmeta_temp_gc_cursor_reset();
-		return -1;
-	}
-	same_directory = forkmeta_temp_gc_cursor.valid &&
-		strcmp(forkmeta_temp_gc_cursor.directory, directory) == 0 &&
-		forkmeta_temp_gc_cursor.dev == st.st_dev &&
-		forkmeta_temp_gc_cursor.ino == st.st_ino;
-	if (!same_directory)
-		forkmeta_temp_gc_cursor_reset();
-	else
-		seekdir(dir, forkmeta_temp_gc_cursor.offset);
-	if (!forkmeta_temp_gc_cursor.valid)
-	{
-		memset(&forkmeta_temp_gc_cursor, 0, sizeof(forkmeta_temp_gc_cursor));
-		memcpy(forkmeta_temp_gc_cursor.directory, directory, strlen(directory) + 1);
-		forkmeta_temp_gc_cursor.dev = st.st_dev;
-		forkmeta_temp_gc_cursor.ino = st.st_ino;
-		forkmeta_temp_gc_cursor.valid = 1;
-	}
-	return 0;
-}
 
 static int
 forkmeta_identity_equal(const ForkmetaObservationIdentity *left,
@@ -2055,20 +2253,21 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 
 	if (directory == NULL)
 	{
-		forkmeta_temp_gc_cursor_reset();
+		forkmeta_gc_directory_cursor_reset(&forkmeta_temp_gc_cursor);
 		return -1;
 	}
 	directory_fd = open_directory(directory, 0);
 	if (directory_fd < 0)
 	{
-		forkmeta_temp_gc_cursor_reset();
+		forkmeta_gc_directory_cursor_reset(&forkmeta_temp_gc_cursor);
 		return errno == ENOENT ? 0 : -1;
 	}
 	scan_fd = fcntl(directory_fd, F_DUPFD_CLOEXEC, 0);
 	if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL)
 		goto cleanup;
 	scan_fd = -1;
-	if (forkmeta_temp_gc_cursor_prepare(directory, directory_fd, dir) != 0)
+	if (forkmeta_gc_directory_cursor_prepare(directory, directory_fd, dir,
+									 &forkmeta_temp_gc_cursor, NULL) != 0)
 		goto cleanup;
 	errno = 0;
 	while (inspected < FORKMETA_TEMP_GC_BATCH && (entry = readdir(dir)) != NULL)
@@ -2117,7 +2316,7 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 	}
 	keep_cursor = scan_incomplete;
 	if (!keep_cursor)
-		forkmeta_temp_gc_cursor_reset();
+		forkmeta_gc_directory_cursor_reset(&forkmeta_temp_gc_cursor);
 	for (size_t i = 0; i < count; i++)
 	{
 		int regular = snapshot_gc_entry_regular(directory_fd, names[i]);
@@ -2152,7 +2351,9 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 			rc = PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
 	}
 	if (!unlink_failed)
-		rc = removed ? PS_FORKMETA_SNAPSHOT_GC_REMOVED :
+		rc = removed ? (keep_cursor ?
+		PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE :
+		PS_FORKMETA_SNAPSHOT_GC_REMOVED) :
 		keep_cursor ? PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE :
 		PS_FORKMETA_SNAPSHOT_GC_NO_WORK;
 
@@ -2166,7 +2367,7 @@ cleanup:
 	if (directory_fd >= 0)
 		(void) close(directory_fd);
 	if (!keep_cursor)
-		forkmeta_temp_gc_cursor_reset();
+		forkmeta_gc_directory_cursor_reset(&forkmeta_temp_gc_cursor);
 	return rc;
 }
 

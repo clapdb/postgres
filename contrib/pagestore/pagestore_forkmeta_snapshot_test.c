@@ -692,6 +692,115 @@ main(void)
 	check(part_path(directory, "forkmeta_checkpoint_v1_", 4, path,
 					 sizeof(path)) == 0 && access(path, F_OK) == 0,
 				  "GC preserves newer unpublished generation");
+
+	/* Full GC has the same bounded cursor contract as temporary GC.  Keep a
+	 * large, entirely reclaimable residue set so every batch makes progress
+	 * without allocating a directory-sized name list. */
+	check(make_dir(root, "gc_bounded", directory, sizeof(directory)) == 0 &&
+		  ps_forkmeta_snapshot_publish(directory, 1000, 100000, 1,
+									   &cp_input, &stream_input) == 0,
+			  "create bounded full-GC fixture");
+	{
+		char residue[1200];
+		char selected[1200];
+		GcInspectionTest inspection = {0};
+		int gc_rc;
+		int created = 1;
+
+		for (uint64_t generation = 1; generation <= 300; generation++)
+		{
+			for (unsigned int part = 0; part <= PS_FORKMETA_SNAPSHOT_TAIL;
+				 part++)
+			{
+				const char *prefix = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+					"forkmeta_checkpoint_v1_" : "forkmeta_tail_v1_";
+
+				if (part_path(directory, prefix, generation, residue,
+							 sizeof(residue)) != 0 ||
+					write_file(residue, "old", 3, 0) != 0)
+				{
+					created = 0;
+					break;
+				}
+			}
+			if (!created)
+				break;
+		}
+		check(part_path(directory, "forkmeta_checkpoint_v1_", 1, residue,
+					 sizeof(residue)) == 0 &&
+			  part_path(directory, "forkmeta_checkpoint_v1_", 1000, selected,
+					 sizeof(selected)) == 0,
+			  "locate bounded full-GC entries");
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
+		gc_rc = ps_forkmeta_snapshot_gc(directory);
+		check(created && gc_rc ==
+				  PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE &&
+				  inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "full GC reports removal with more bounded work");
+		for (unsigned int pass = 0; pass < 64 && gc_rc > 0; pass++)
+		{
+			inspection.calls = 0;
+			gc_rc = ps_forkmeta_snapshot_gc(directory);
+			check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "full GC keeps every repeated batch bounded");
+		}
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK &&
+			  access(residue, F_OK) != 0 && access(selected, F_OK) == 0,
+			  "repeated full-GC batches drain residue and preserve current");
+	}
+
+	/* A scan containing only newer canonical entries must retain its cursor and
+	 * report SCAN_INCOMPLETE, rather than looking like a mutation or spinning
+	 * through the complete directory in one maintenance tick. */
+	check(make_dir(root, "gc_scan_incomplete", directory, sizeof(directory)) == 0 &&
+		  ps_forkmeta_snapshot_publish(directory, 1, 100, 1, &cp_input,
+								  &stream_input) == 0,
+			  "create no-removal full-GC fixture");
+	{
+		char newer[1200];
+		GcInspectionTest inspection = {0};
+		int gc_rc;
+		int created = 1;
+
+		for (uint64_t generation = 2; generation <= 300; generation++)
+		{
+			for (unsigned int part = 0; part <= PS_FORKMETA_SNAPSHOT_TAIL;
+				 part++)
+			{
+				const char *prefix = part == PS_FORKMETA_SNAPSHOT_CHECKPOINT ?
+					"forkmeta_checkpoint_v1_" : "forkmeta_tail_v1_";
+
+				if (part_path(directory, prefix, generation, newer,
+							 sizeof(newer)) != 0 ||
+					write_file(newer, "new", 3, 0) != 0)
+				{
+					created = 0;
+					break;
+				}
+			}
+			if (!created)
+				break;
+		}
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
+		gc_rc = ps_forkmeta_snapshot_gc(directory);
+		check(created && gc_rc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE &&
+				  inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "full GC reports an incomplete no-removal batch");
+		for (unsigned int pass = 0; pass < 64 && gc_rc ==
+				 PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE; pass++)
+		{
+			inspection.calls = 0;
+			gc_rc = ps_forkmeta_snapshot_gc(directory);
+			check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "incomplete full-GC cursor remains bounded");
+		}
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK,
+			  "incomplete full-GC scan reaches EOF without mutation");
+	}
 	check(make_dir(root, "temp_only", directory, sizeof(directory)) == 0,
 			  "create a temp-only directory without a selected manifest");
 	{
@@ -701,6 +810,9 @@ main(void)
 		PsForkmetaSnapshotReclaimObservation observation;
 		GcInspectionTest inspection = {0};
 		int created = 1;
+		int gc_rc;
+		int saw_removed_scan_incomplete = 0;
+		int saw_removed_at_eof = 0;
 
 		snprintf(temp_only, sizeof(temp_only),
 				 "%s/forkmeta_tail_v1_00000000000000000001.tmp.1.1",
@@ -740,15 +852,25 @@ main(void)
 				  "temporary overflow is incomplete but remains executable GC work");
 		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
 				gc_inspection_hook, &inspection);
-		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
+		gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE &&
 				  inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
-				  "temporary GC inspects only one bounded prefix per call");
+				  "temporary GC reports removal with more bounded work");
+		for (unsigned int pass = 0; pass < 64 && gc_rc > 0; pass++)
+		{
+			inspection.calls = 0;
+			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+			if (gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
+				saw_removed_scan_incomplete = 1;
+			if (gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED)
+				saw_removed_at_eof = 1;
+			check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "temporary GC keeps repeated removal batches bounded");
+		}
 		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
-		for (unsigned int pass = 0; pass < 64 &&
-				 ps_forkmeta_snapshot_gc_temporary(directory) > 0; pass++)
-			;
-		check(ps_forkmeta_snapshot_gc_temporary(directory) == 0,
-				  "repeated bounded temporary cleanup drains the backlog");
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK &&
+			  saw_removed_scan_incomplete && saw_removed_at_eof,
+			  "temporary GC distinguishes suffix work through complete drain");
 		{
 			char unknown[1200];
 			int observation_rc;
@@ -956,8 +1078,17 @@ main(void)
 		gc_rc = PS_FORKMETA_SNAPSHOT_GC_NO_WORK;
 		for (calls = 0; access(temp, F_OK) == 0 && calls < 8; calls++)
 			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
-		check(access(temp, F_OK) != 0 && gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED,
-				"EOF reset makes later temp reachable");
+		check(access(temp, F_OK) != 0 &&
+			  (gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED ||
+			   gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE),
+			  "EOF reset makes later temp reachable");
+		while (gc_rc > 0 && calls < 16)
+		{
+			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+			calls++;
+		}
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK,
+			  "later temporary deletion completes its cursor drain");
 	}
 	{
 		char replacement[1200];
