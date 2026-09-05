@@ -1,9 +1,12 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "pagestore_walidx_snapshot.h"
@@ -65,6 +68,7 @@ main(void)
 	char directory[1024];
 	char recovery_directory[1024];
 	char reshard_directory[1024];
+	char unselected_directory[1024];
 	char path[1200];
 	unsigned char shard0[257];
 	unsigned char shard1[513];
@@ -76,6 +80,7 @@ main(void)
 	PsWalIdxSnapshot wrong;
 	ProduceCtx streamed;
 	PsWalIdxSnapshotPrepared prepared;
+	uint64_t prepared_obsolete = 0;
 
 	check(mkdtemp(root) != NULL, "create snapshot test root");
 	for (size_t i = 0; i < sizeof(shard0); i++)
@@ -97,6 +102,96 @@ main(void)
 	snprintf(directory, sizeof(directory), "%s/timeline_0", root);
 	snprintf(recovery_directory, sizeof(recovery_directory), "%s/timeline_1", root);
 	snprintf(reshard_directory, sizeof(reshard_directory), "%s/timeline_2", root);
+	snprintf(unselected_directory, sizeof(unselected_directory),
+			 "%s/timeline_unselected", root);
+	{
+		uint64_t obsolete = UINT64_MAX;
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 0, &obsolete) == 0 &&
+			  obsolete == 0,
+			  "an absent never-selected snapshot directory has no reclaim debt");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 1, &obsolete) != 0,
+				"an absent selected snapshot directory fails closed");
+	}
+	{
+		char manifest_temp[1200];
+		char prepared_temp[1200];
+		uint64_t obsolete = 0;
+		int manifest_fd;
+		int prepared_fd;
+
+		check(mkdir(unselected_directory, 0700) == 0,
+				"create an empty unselected snapshot directory");
+		snprintf(manifest_temp, sizeof(manifest_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u",
+				 unselected_directory, 7ULL, (long) getpid(), 0U);
+		snprintf(prepared_temp, sizeof(prepared_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u",
+				 unselected_directory, (long) getpid(), 1U);
+		manifest_fd = open(manifest_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		prepared_fd = open(prepared_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(manifest_fd >= 0 && prepared_fd >= 0 &&
+				write(manifest_fd, "manifest", 8) == 8 &&
+				write(prepared_fd, "prepared", 8) == 8 &&
+				close(manifest_fd) == 0 && close(prepared_fd) == 0,
+				"create exact residue without a selected snapshot");
+		check(ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+										 &obsolete) == 0 && obsolete == 16,
+				"unselected snapshot residue is counted as debt");
+		check(ps_walidx_snapshot_gc(unselected_directory, 0) == 1 &&
+				access(manifest_temp, F_OK) != 0 &&
+				access(prepared_temp, F_OK) != 0 &&
+				ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+										 &obsolete) == 0 && obsolete == 0,
+				"unselected snapshot GC removes residue and clears debt");
+		{
+			char orphan_shard[1200];
+			char prepared_path[1200];
+			char extra_shard[1200];
+			int fd;
+
+			snprintf(orphan_shard, sizeof(orphan_shard),
+					 "%s/walidxg1_%020llu_%03u", unselected_directory,
+					 1ULL, 0U);
+			fd = open(orphan_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(fd >= 0 && write(fd, "orphan", 6) == 6 && close(fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete == 6,
+				  "an orphan canonical shard without a manifest is physical debt");
+			check(ps_walidx_snapshot_gc(unselected_directory, 0) == 1 &&
+				  access(orphan_shard, F_OK) != 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete == 0,
+				  "no-manifest GC removes an orphan canonical shard");
+
+			snprintf(prepared_path, sizeof(prepared_path), "%s/%s",
+					 unselected_directory, "walidx_prepared_v1");
+			check(ps_walidx_snapshot_prepare(&prepared, unselected_directory, 0,
+									 2, 500, 900, first, 3) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 &&
+				  obsolete == 112 + sizeof(shard0) + sizeof(shard1),
+				  "a complete no-manifest prepared generation is counted");
+			check(ps_walidx_snapshot_gc(unselected_directory, 0) == 0 &&
+				  access(prepared_path, F_OK) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete != 0,
+				  "no-manifest GC preserves a complete prepared generation");
+			snprintf(extra_shard, sizeof(extra_shard),
+					 "%s/walidxg1_%020llu_%03u", unselected_directory,
+					 2ULL, 3U);
+			fd = open(extra_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(fd >= 0 && close(fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) != 0 &&
+				  ps_walidx_snapshot_gc(unselected_directory, 0) != 0 &&
+				  access(extra_shard, F_OK) == 0,
+				  "an extra shard in a prepared no-manifest generation fails closed");
+			check(unlink(extra_shard) == 0 &&
+				  ps_walidx_snapshot_abort(&prepared) == 0,
+				  "abort the preserved no-manifest prepared generation");
+		}
+	}
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,
 								 first, 3) != 0 && access(directory, F_OK) != 0,
@@ -181,11 +276,24 @@ main(void)
 	check(ps_walidx_snapshot_publish(directory, 0, 3, 400, 1000,
 								 second, 3) != 0,
 		  "a newer generation cannot move its retained frontier backward");
-	check(setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD", "0", 1) == 0 &&
+	{
+		uint64_t baseline_obsolete = 0;
+		uint64_t orphan_obsolete = 0;
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &baseline_obsolete) == 0,
+			  "observe snapshot debt before an orphan newer generation");
+		check(setenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD", "0", 1) == 0 &&
 		  ps_walidx_snapshot_publish(directory, 0, 3, 900, 1000,
 								 second, 3) != 0,
-		  "leave a newer unpublished shard for publication retry");
-	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+			  "leave an orphan newer shard after interrupted publication");
+		unsetenv("PAGESTORE_TEST_FAIL_WALIDX_AFTER_SHARD");
+
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &orphan_obsolete) == 0 &&
+			  orphan_obsolete == baseline_obsolete + sizeof(newer0),
+			  "physical observation counts an orphan newer generation");
+	}
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
 			 directory, 4ULL, 0U, 123U, 0U);
 	{
@@ -207,8 +315,8 @@ main(void)
 		  "generation GC preserves the currently selected generation");
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u",
 			 directory, 3ULL, 0U);
-	check(access(path, F_OK) == 0,
-		  "generation GC preserves newer unpublished retry state");
+	check(access(path, F_OK) != 0 && errno == ENOENT,
+		  "generation GC removes an orphan newer retry state");
 	snprintf(path, sizeof(path), "%s/walidxg1_%020llu_%03u.tmp.%u.%u",
 			 directory, 4ULL, 0U, 123U, 0U);
 	check(access(path, F_OK) != 0 && errno == ENOENT,
@@ -218,15 +326,183 @@ main(void)
 	unsetenv("PAGESTORE_TEST_FAIL_WALIDX_GC_FSYNC");
 	check(ps_walidx_snapshot_gc(directory, 0) == 0,
 		  "generation GC durably completes an ambiguous sync retry");
+	{
+		char prepared_path[1200];
+		char prepared_shard[1200];
+
+		snprintf(prepared_path, sizeof(prepared_path), "%s/walidx_prepared_v1",
+				 directory);
+		snprintf(prepared_shard, sizeof(prepared_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 4ULL, 0U);
+		check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 4,
+									 900, 1000, second, 3) == 0 &&
+			  ps_walidx_snapshot_gc(directory, 0) == 0 &&
+			  access(prepared_path, F_OK) == 0 &&
+			  access(prepared_shard, F_OK) == 0,
+			  "generation GC preserves a valid newer prepared generation");
+		check(ps_walidx_snapshot_abort(&prepared) == 0,
+			  "abort the preserved newer prepared generation");
+	}
+	{
+		char prepared_path[1200];
+		char selected_shard[1200];
+
+		snprintf(prepared_path, sizeof(prepared_path), "%s/walidx_prepared_v1",
+				 directory);
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 0U);
+		check(ps_walidx_snapshot_prepare(&prepared, directory, 0, 2,
+									 500, 900, second, 3) == 0 &&
+				  ps_walidx_snapshot_gc(directory, 0) == 1 &&
+				  access(prepared_path, F_OK) != 0 &&
+				  access(selected_shard, F_OK) == 0,
+				  "generation GC clears selected prepared residue without deleting shards");
+	}
+	{
+		char manifest_temp[1200];
+		char prepared_temp[1200];
+		char malformed_manifest[1200];
+		char malformed_prepared[1200];
+		uint64_t obsolete = 0;
+		int manifest_fd;
+		int prepared_fd;
+		int malformed_manifest_fd;
+		int malformed_prepared_fd;
+
+		snprintf(manifest_temp, sizeof(manifest_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 5ULL, (long) getpid(), 0U);
+		snprintf(prepared_temp, sizeof(prepared_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 1U);
+		manifest_fd = open(manifest_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		prepared_fd = open(prepared_temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(manifest_fd >= 0 && prepared_fd >= 0 &&
+				write(manifest_fd, "manifest residue", 16) == 16 &&
+				write(prepared_fd, "prepared residue", 16) == 16 &&
+				close(manifest_fd) == 0 && close(prepared_fd) == 0,
+				"create canonical snapshot publication residue");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) == 0 &&
+				obsolete == 32,
+				"snapshot publication residue is counted as physical debt");
+		check(ps_walidx_snapshot_gc(directory, 0) == 1 &&
+				access(manifest_temp, F_OK) != 0 &&
+				access(prepared_temp, F_OK) != 0 &&
+				ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) == 0 &&
+				obsolete == 0,
+				"snapshot GC removes publication residue and releases debt");
+
+		snprintf(malformed_manifest, sizeof(malformed_manifest),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 6ULL, (long) getpid(), 128U);
+		snprintf(malformed_prepared, sizeof(malformed_prepared),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 128U);
+		malformed_manifest_fd = open(malformed_manifest, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		malformed_prepared_fd = open(malformed_prepared, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(malformed_manifest_fd >= 0 && malformed_prepared_fd >= 0 &&
+				close(malformed_manifest_fd) == 0 && close(malformed_prepared_fd) == 0,
+				"create near-miss snapshot temporary names");
+		check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+				ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				access(malformed_manifest, F_OK) == 0 &&
+				access(malformed_prepared, F_OK) == 0,
+				"near-miss snapshot residue fails closed and is not deleted");
+		unlink(malformed_manifest);
+		unlink(malformed_prepared);
+		if (sizeof(pid_t) < sizeof(long))
+		{
+			char malformed_pid[1200];
+			int malformed_pid_fd;
+
+			snprintf(malformed_pid, sizeof(malformed_pid),
+					 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+					 LONG_MAX, 0U);
+			malformed_pid_fd = open(malformed_pid, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(malformed_pid_fd >= 0 && close(malformed_pid_fd) == 0 &&
+					ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+					ps_walidx_snapshot_gc(directory, 0) != 0 &&
+					access(malformed_pid, F_OK) == 0,
+					"a non-round-trippable pid residue fails closed and is not deleted");
+			unlink(malformed_pid);
+		}
+	}
+	{
+		char symlink_temp[1200];
+		char directory_temp[1200];
+		struct stat symlink_st;
+		int gc_symlink_ok;
+		int gc_directory_ok;
+
+		snprintf(symlink_temp, sizeof(symlink_temp),
+				 "%s/walidx_manifest_v1.tmp.%020llu.%ld.%u", directory,
+				 8ULL, (long) getpid(), 0U);
+		snprintf(directory_temp, sizeof(directory_temp),
+				 "%s/walidx_prepared_v1.tmp.%ld.%u", directory,
+				 (long) getpid(), 2U);
+		gc_symlink_ok = symlink("walidx_manifest_v1", symlink_temp) == 0;
+		gc_directory_ok = mkdir(directory_temp, 0700) == 0;
+		check(gc_symlink_ok && gc_directory_ok &&
+				ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				lstat(symlink_temp, &symlink_st) == 0 &&
+				S_ISLNK(symlink_st.st_mode) &&
+				access(directory_temp, F_OK) == 0,
+				"snapshot GC rejects exact temporary symlink and preserves it");
+		unlink(symlink_temp);
+		check(gc_directory_ok && ps_walidx_snapshot_gc(directory, 0) != 0 &&
+				access(directory_temp, F_OK) == 0,
+				"snapshot GC rejects exact temporary directory and preserves it");
+		rmdir(directory_temp);
+	}
+	{
+		uint64_t obsolete = 0;
+		char older_shard[1200];
+		char selected_shard[1200];
+		char selected_saved[sizeof(selected_shard) + sizeof(".saved")];
+		int fd;
+
+		snprintf(older_shard, sizeof(older_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 1ULL, 0U);
+		fd = open(older_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && write(fd, "old", 3) == 3 && close(fd) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										   &obsolete) == 0 && obsolete == 3,
+			  "physical observation counts only older generations");
+		check(unlink(older_shard) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										   &obsolete) == 0 && obsolete == 0,
+			  "selected and newer retry generations are excluded from debt");
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 0U);
+		snprintf(selected_saved, sizeof(selected_saved), "%s.saved", selected_shard);
+		check(rename(selected_shard, selected_saved) == 0 &&
+			  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0 &&
+			  rename(selected_saved, selected_shard) == 0,
+			  "physical observation rejects an incomplete selected generation");
+		snprintf(selected_shard, sizeof(selected_shard),
+				 "%s/walidxg1_%020llu_%03u", directory, 2ULL, 3U);
+		{
+			int extra_fd = open(selected_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+			check(extra_fd >= 0 && write(extra_fd, "x", 1) == 1 &&
+				  close(extra_fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(directory, 0, 2, &obsolete) != 0,
+				  "physical observation rejects an unexpected selected-generation shard");
+			unlink(selected_shard);
+		}
+	}
 
 	check(ps_walidx_snapshot_publish(recovery_directory, 1, 1, 100, 500,
 								 first, 3) == 0 &&
-		  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
+			  ps_walidx_snapshot_prepare(&prepared, recovery_directory, 1, 2,
 								 500, 900, second, 3) == 0 &&
-		  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
-		  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
-		  snapshot.generation == 1,
-		  "restart aborts a durable prepare intent behind an old frontier");
+			  ps_walidx_snapshot_reclaim_bytes(recovery_directory, 1, 1,
+										  &prepared_obsolete) == 0 &&
+			  prepared_obsolete > 0 &&
+			  ps_walidx_snapshot_recover_prepared(recovery_directory, 1, 499) == 0 &&
+			  ps_walidx_snapshot_open(&snapshot, recovery_directory, 1) == 0 &&
+			  snapshot.generation == 1,
+			  "prepared artifacts are counted until restart aborts them behind the frontier");
 	ps_walidx_snapshot_close(&snapshot);
 	check(ps_walidx_snapshot_publish(reshard_directory, 2, 1, 100, 500,
 								 first, 1) == 0 &&
@@ -272,7 +548,11 @@ main(void)
 	check(pwrite_byte(path, 17, shard1[17] ^ 0xff) == 0,
 		  "corrupt one selected shard byte");
 	check(ps_walidx_snapshot_open(&snapshot, directory, 0) != 0,
-		  "recovery rejects a corrupt shard in the selected generation");
+			  "recovery rejects a corrupt shard in the selected generation");
+	check(ps_walidx_snapshot_reclaim_bytes(directory, 0, 2,
+										  &prepared_obsolete) == 0 &&
+			  prepared_obsolete == 0,
+			  "metadata observation excludes newer unpublished retry shards");
 	check(ps_walidx_snapshot_gc(directory, 0) != 0,
 		  "generation GC fails closed when the selected generation is corrupt");
 	check(pwrite_byte(path, 17, shard1[17]) == 0 &&
@@ -323,6 +603,7 @@ main(void)
 	unlink(path);
 	rmdir(recovery_directory);
 	rmdir(reshard_directory);
+	rmdir(unselected_directory);
 	rmdir(directory);
 	rmdir(root);
 

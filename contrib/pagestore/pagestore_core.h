@@ -48,6 +48,8 @@ extern uint64_t page_reclaim_high_water_bytes;
 extern uint64_t page_reclaim_catchup_bytes;
 extern uint64_t wal_reclaim_high_water_bytes;
 extern uint64_t wal_reclaim_catchup_bytes;
+extern uint64_t walidx_reclaim_high_water_bytes;
+extern uint64_t walidx_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;
 extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
@@ -85,23 +87,37 @@ extern void ps_admission_read_unlock(void);
  * REQUEST, and -1 when shutdown was observed. */
 #define PS_BACKPRESSURE_PAGE 1u
 #define PS_BACKPRESSURE_WAL  2u
+#define PS_BACKPRESSURE_WALIDX 4u
 extern int ps_backpressure_try_admit(
 	const volatile sig_atomic_t *stop_flag, uint32_t *cause_mask);
 /* Add one completed deferred interval per controller.  The daemon aggregates
  * intervals locally and calls this once when a channel is admitted/cancelled. */
 extern void ps_backpressure_record_wait(uint64_t page_wait_ns,
 										 uint64_t wal_wait_ns);
+extern void ps_backpressure_record_wait3(uint64_t page_wait_ns,
+										  uint64_t wal_wait_ns,
+										  uint64_t walidx_wait_ns);
 extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
 extern int ps_backpressure_configure(uint64_t page_high_water,
 									 uint64_t page_catchup,
-									 uint64_t wal_high_water,
-									 uint64_t wal_catchup);
+										 uint64_t wal_high_water,
+										 uint64_t wal_catchup);
+extern int ps_backpressure_configure_all(uint64_t page_high_water,
+										 uint64_t page_catchup,
+										 uint64_t wal_high_water,
+										 uint64_t wal_catchup,
+										 uint64_t walidx_high_water,
+										 uint64_t walidx_catchup);
 extern void ps_backpressure_refresh(void);
 extern void ps_backpressure_shutdown(void);
 /* Test-only deterministic lag injection; production maintenance never calls it. */
 extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
+extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
+extern int ps_test_walidx_force_due(uint32_t timeline);
+extern int ps_test_walidx_gc_force_due(uint32_t timeline);
+extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.
@@ -120,6 +136,10 @@ typedef void (*PsLifecycleWriteQueuedTestHook)(void *arg);
 typedef void (*PsWalReclaimAttemptTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReclaimBeforeFloorTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReadBeforeLockTestHook)(uint32_t timeline, void *arg);
+/* Called after a WAL-index physical observation fails, before the logical
+ * identity is revalidated.  Test code may use this to deterministically move
+ * the identity and verify that the bounded retry is exercised. */
+typedef void (*PsWalIdxObservationErrorTestHook)(uint32_t timeline, void *arg);
 /* Called only when ps_backpressure_try_admit enters its mutex-protected
  * throttle check; disabled and unthrottled fast paths never call it. */
 typedef void (*PsBackpressureSlowPathTestHook)(void *arg);
@@ -157,6 +177,8 @@ extern void ps_test_set_wal_reclaim_before_floor_hook(
 	PsWalReclaimBeforeFloorTestHook hook, void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
+extern void ps_test_set_walidx_observation_error_hook(
+	PsWalIdxObservationErrorTestHook hook, void *arg);
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);

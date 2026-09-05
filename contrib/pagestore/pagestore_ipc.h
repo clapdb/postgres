@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		38	/* 38: request generations and daemon-owned
+#define PS_SHM_VERSION		39	/* 39: WAL-index reclaim backpressure metrics;
+								 * 38: request generations and daemon-owned
 								 * shutdown cancellation state;
 								 * 37: page/WAL reclaim backpressure controller metrics;
 								 * 36: exact-token timeline info returns parent incarnation;
@@ -391,6 +392,7 @@ typedef struct PsShmHeader
 	uint64_t	backpressure_metrics_seq;
 	PsBackpressureMetrics page_backpressure;
 	PsBackpressureMetrics wal_backpressure;
+	PsBackpressureMetrics walidx_backpressure;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

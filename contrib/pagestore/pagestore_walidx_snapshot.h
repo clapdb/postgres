@@ -96,6 +96,11 @@ extern int ps_walidx_snapshot_discard_generation(const char *directory,
 extern int ps_walidx_snapshot_open(PsWalIdxSnapshot *snapshot,
 								   const char *directory,
 								   uint32_t timeline);
+/* Validate only manifest identity and selected shard metadata.  Immutable
+ * payload CRCs are established at startup/publication, not every refresh. */
+extern int ps_walidx_snapshot_open_metadata(PsWalIdxSnapshot *snapshot,
+									 const char *directory,
+									 uint32_t timeline);
 extern int ps_walidx_snapshot_read(const PsWalIdxSnapshot *snapshot,
 								   uint32_t shard, uint64_t offset,
 								   void *data, uint32_t len);
@@ -103,6 +108,13 @@ extern int ps_walidx_snapshot_read(const PsWalIdxSnapshot *snapshot,
  * validated manifest.  Returns 1 if files were removed, 0 if already clean,
  * and -1 on error.  Newer unpublished files are left for publication retry. */
 extern int ps_walidx_snapshot_gc(const char *directory, uint32_t timeline);
+/* Sum physical immutable snapshot generations other than the selected one.
+ * Canonical names and regular-file types are required; any scan/stat error
+ * fails closed. */
+extern int ps_walidx_snapshot_reclaim_bytes(const char *directory,
+										uint32_t timeline,
+										uint64_t selected_generation,
+										uint64_t *bytes_out);
 extern void ps_walidx_snapshot_close(PsWalIdxSnapshot *snapshot);
 
 #endif

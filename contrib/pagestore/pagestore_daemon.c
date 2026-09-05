@@ -57,6 +57,7 @@ typedef struct BackpressureWaitSlot
 	uint64_t	last_probe_ns;
 	uint64_t	page_wait_ns;
 	uint64_t	wal_wait_ns;
+	uint64_t	walidx_wait_ns;
 	int		active;
 } BackpressureWaitSlot;
 
@@ -100,6 +101,8 @@ accrue_backpressure_interval(BackpressureWaitSlot *slot, uint64_t now)
 		add_wait_ns(&slot->page_wait_ns, elapsed);
 	if ((slot->cause_mask & PS_BACKPRESSURE_WAL) != 0)
 		add_wait_ns(&slot->wal_wait_ns, elapsed);
+	if ((slot->cause_mask & PS_BACKPRESSURE_WALIDX) != 0)
+		add_wait_ns(&slot->walidx_wait_ns, elapsed);
 }
 
 static void
@@ -159,7 +162,8 @@ finish_backpressure_wait(uint32_t channel)
 		return;
 	now = monotonic_ns();
 	accrue_backpressure_interval(slot, now);
-	ps_backpressure_record_wait(slot->page_wait_ns, slot->wal_wait_ns);
+	ps_backpressure_record_wait3(slot->page_wait_ns, slot->wal_wait_ns,
+							 slot->walidx_wait_ns);
 	memset(slot, 0, sizeof(*slot));
 }
 
@@ -954,6 +958,16 @@ main(int argc, char **argv)
 			if (parse_u64_option(argv[++i], &wal_reclaim_catchup_bytes) != 0)
 				return 2;
 		}
+		else if (strcmp(argv[i], "--walidx-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &walidx_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--walidx-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &walidx_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
 		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
 				 i + 1 < argc)
 			maintenance_pause_file = argv[++i];
@@ -989,6 +1003,7 @@ main(int argc, char **argv)
 					"[--nshards N] [--storage NAME] "
 					"[--page-high-water-bytes N --page-catch-up-bytes N] "
 					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+					"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
 					"[--test-maintenance-pause-file PATH] "
 					"[--test-shutdown-cancel-pause-file PATH] "
 					"[--test-shutdown-cancel-ready-fd N]\n",
@@ -1004,14 +1019,16 @@ main(int argc, char **argv)
 				"[--nshards N] [--storage NAME] "
 				"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
 				"[--test-maintenance-pause-file PATH] "
 				"[--test-shutdown-cancel-pause-file PATH] "
 				"[--test-shutdown-cancel-ready-fd N]\n",
 				argv[0]);
 		return 2;
 	}
-	if ((page_reclaim_high_water_bytes != 0 ||
-		 wal_reclaim_high_water_bytes != 0) &&
+	if ((page_reclaim_high_water_bytes != 0 || page_reclaim_catchup_bytes != 0 ||
+		 wal_reclaim_high_water_bytes != 0 || wal_reclaim_catchup_bytes != 0 ||
+		 walidx_reclaim_high_water_bytes != 0 || walidx_reclaim_catchup_bytes != 0) &&
 		(ps_storage == NULL || ps_storage->name == NULL ||
 		 strcmp(ps_storage->name, "posix") != 0))
 	{
@@ -1021,10 +1038,12 @@ main(int argc, char **argv)
 				ps_storage->name : "none");
 		return 2;
 	}
-	if (ps_backpressure_configure(page_reclaim_high_water_bytes,
+	if (ps_backpressure_configure_all(page_reclaim_high_water_bytes,
 								  page_reclaim_catchup_bytes,
 								  wal_reclaim_high_water_bytes,
-								  wal_reclaim_catchup_bytes) != 0)
+								  wal_reclaim_catchup_bytes,
+								  walidx_reclaim_high_water_bytes,
+								  walidx_reclaim_catchup_bytes) != 0)
 	{
 		if (page_reclaim_high_water_bytes != 0 && !segment_gc_enabled)
 			fprintf(stderr, "pagestore_daemon: page backpressure requires "

@@ -95,6 +95,19 @@ typedef struct PsStorage
 								 uint64_t epoch);
 	int			(*walidx_epoch_gc) (uint32_t tl, const uint64_t *keep_epochs,
 								 uint32_t nshards);
+	/* Return append-tail (physical bytes after covered_offsets) and obsolete
+	 * physical WAL-index bytes for one previously captured identity;
+	 * observed_offsets are the current logical end used for consistency checks.
+	 * Implementations must scan
+	 * without depending on core runtime locks; the caller revalidates identity
+	 * after the scan. */
+	int			(*walidx_reclaim_bytes) (uint32_t tl,
+								 const uint64_t *keep_epochs,
+								 const uint64_t *covered_offsets,
+								 const uint64_t *observed_offsets,
+								 uint32_t nshards,
+								 uint64_t *tail_bytes,
+								 uint64_t *obsolete_bytes);
 	/* Remove only the deleting timeline's private WAL/WAL-index artifacts.
 	 * The backend must validate the complete target set before unlinking any
 	 * entry, fsync every changed directory, and return an error for unknown or
