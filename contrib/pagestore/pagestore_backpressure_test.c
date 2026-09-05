@@ -22,6 +22,29 @@ static int checks;
 static int failed;
 
 static void configure_page_core(void);
+static int append_test_walidx_tail(uint32_t timeline, uint64_t progress);
+static int append_test_walidx_identity(uint32_t timeline);
+
+typedef struct WalIdxObservationRetryTest
+{
+	char manifest[1024];
+	char saved_manifest[1024];
+	int calls;
+	int repaired;
+} WalIdxObservationRetryTest;
+
+static void
+walidx_observation_error_repair(uint32_t timeline, void *arg)
+{
+	WalIdxObservationRetryTest *test = arg;
+
+	test->calls++;
+	if (test->calls != 1 ||
+		rename(test->saved_manifest, test->manifest) != 0 ||
+		!append_test_walidx_identity(timeline))
+		return;
+	test->repaired = 1;
+}
 
 typedef struct BackpressureSlowPathCounter
 {
@@ -499,6 +522,38 @@ test_walidx_append_tail_restart(void)
 		  ps_test_walidx_force_due(0) == 0,
 		  "forced same-frontier publication clears tail-only debt");
 	{
+		WalIdxObservationRetryTest retry_test;
+		int hidden;
+
+		memset(&retry_test, 0, sizeof(retry_test));
+		snprintf(retry_test.manifest, sizeof(retry_test.manifest),
+				 "%s/walidx_snapshots_0/walidx_manifest_v1", store);
+		snprintf(retry_test.saved_manifest, sizeof(retry_test.saved_manifest),
+				 "%s/walidx_snapshots_0/walidx_manifest_v1.saved", store);
+		hidden = rename(retry_test.manifest, retry_test.saved_manifest) == 0;
+		check(hidden, "hide the selected manifest for observation retry setup");
+		if (hidden)
+		{
+			ps_test_set_walidx_observation_error_hook(
+				walidx_observation_error_repair, &retry_test);
+			ps_backpressure_refresh();
+			ps_test_set_walidx_observation_error_hook(NULL, NULL);
+			check(retry_test.calls == 1 && retry_test.repaired &&
+				  metrics.walidx_backpressure.lag_bytes != UINT64_MAX,
+				  "a moving identity retries a failed physical observation");
+		}
+		else
+			ps_test_set_walidx_observation_error_hook(NULL, NULL);
+		for (int i = 0; i < 16 &&
+			 metrics.walidx_backpressure.throttled != 0; i++)
+		{
+			(void) ps_core_maintenance();
+			ps_backpressure_refresh();
+		}
+		check(!hidden || metrics.walidx_backpressure.lag_bytes == 0,
+			  "observation retry debt remains serviceable");
+	}
+	{
 		char orphan[1024];
 		int fd;
 
@@ -596,6 +651,23 @@ append_test_walidx_tail(uint32_t timeline, uint64_t progress)
 	ch.opcode = PS_OP_WAL_INDEX_PROGRESS;
 	ch.req_lsn = 0;
 	ch.req_seq = progress;
+	return ps_handle_meta(&ch) == 1 && ch.status == PS_STATUS_OK;
+}
+
+/* Keep the observation retry test's logical identity transition independent
+ * of WAL_INDEX_PROGRESS.  The latter is a monotonic frontier publication and
+ * is not needed to make walidx_shard_offsets_seen change. */
+static int
+append_test_walidx_identity(uint32_t timeline)
+{
+	PsChannel ch;
+
+	memset(&ch, 0, sizeof(ch));
+	ch.timeline = timeline;
+	ch.opcode = PS_OP_WAL_INDEX_ADD;
+	ch.blocknum = 2;
+	ch.req_lsn = 200;
+	ch.key = (PsKey) {2, 2, 2, 0, PS_KLASS_RELATION};
 	return ps_handle_meta(&ch) == 1 && ch.status == PS_STATUS_OK;
 }
 

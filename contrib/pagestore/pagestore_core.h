@@ -136,6 +136,10 @@ typedef void (*PsLifecycleWriteQueuedTestHook)(void *arg);
 typedef void (*PsWalReclaimAttemptTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReclaimBeforeFloorTestHook)(uint32_t timeline, void *arg);
 typedef void (*PsWalReadBeforeLockTestHook)(uint32_t timeline, void *arg);
+/* Called after a WAL-index physical observation fails, before the logical
+ * identity is revalidated.  Test code may use this to deterministically move
+ * the identity and verify that the bounded retry is exercised. */
+typedef void (*PsWalIdxObservationErrorTestHook)(uint32_t timeline, void *arg);
 /* Called only when ps_backpressure_try_admit enters its mutex-protected
  * throttle check; disabled and unthrottled fast paths never call it. */
 typedef void (*PsBackpressureSlowPathTestHook)(void *arg);
@@ -173,6 +177,8 @@ extern void ps_test_set_wal_reclaim_before_floor_hook(
 	PsWalReclaimBeforeFloorTestHook hook, void *arg);
 extern void ps_test_set_wal_read_before_lock_hook(
 	PsWalReadBeforeLockTestHook hook, void *arg);
+extern void ps_test_set_walidx_observation_error_hook(
+	PsWalIdxObservationErrorTestHook hook, void *arg);
 extern void ps_test_set_backpressure_slow_path_hook(
 	PsBackpressureSlowPathTestHook hook, void *arg);
 extern int ps_test_wal_reclaim_maintenance(void);

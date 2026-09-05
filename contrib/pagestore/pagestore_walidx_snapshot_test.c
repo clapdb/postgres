@@ -144,6 +144,53 @@ main(void)
 				ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
 										 &obsolete) == 0 && obsolete == 0,
 				"unselected snapshot GC removes residue and clears debt");
+		{
+			char orphan_shard[1200];
+			char prepared_path[1200];
+			char extra_shard[1200];
+			int fd;
+
+			snprintf(orphan_shard, sizeof(orphan_shard),
+					 "%s/walidxg1_%020llu_%03u", unselected_directory,
+					 1ULL, 0U);
+			fd = open(orphan_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(fd >= 0 && write(fd, "orphan", 6) == 6 && close(fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete == 6,
+				  "an orphan canonical shard without a manifest is physical debt");
+			check(ps_walidx_snapshot_gc(unselected_directory, 0) == 1 &&
+				  access(orphan_shard, F_OK) != 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete == 0,
+				  "no-manifest GC removes an orphan canonical shard");
+
+			snprintf(prepared_path, sizeof(prepared_path), "%s/%s",
+					 unselected_directory, "walidx_prepared_v1");
+			check(ps_walidx_snapshot_prepare(&prepared, unselected_directory, 0,
+									 2, 500, 900, first, 3) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 &&
+				  obsolete == 112 + sizeof(shard0) + sizeof(shard1),
+				  "a complete no-manifest prepared generation is counted");
+			check(ps_walidx_snapshot_gc(unselected_directory, 0) == 0 &&
+				  access(prepared_path, F_OK) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) == 0 && obsolete != 0,
+				  "no-manifest GC preserves a complete prepared generation");
+			snprintf(extra_shard, sizeof(extra_shard),
+					 "%s/walidxg1_%020llu_%03u", unselected_directory,
+					 2ULL, 3U);
+			fd = open(extra_shard, O_CREAT | O_EXCL | O_WRONLY, 0600);
+			check(fd >= 0 && close(fd) == 0 &&
+				  ps_walidx_snapshot_reclaim_bytes(unselected_directory, 0, 0,
+											 &obsolete) != 0 &&
+				  ps_walidx_snapshot_gc(unselected_directory, 0) != 0 &&
+				  access(extra_shard, F_OK) == 0,
+				  "an extra shard in a prepared no-manifest generation fails closed");
+			check(unlink(extra_shard) == 0 &&
+				  ps_walidx_snapshot_abort(&prepared) == 0,
+				  "abort the preserved no-manifest prepared generation");
+		}
 	}
 
 	check(ps_walidx_snapshot_publish(directory, 0, 0, 100, 500,

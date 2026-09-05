@@ -223,6 +223,8 @@ static PsWalReclaimBeforeFloorTestHook wal_reclaim_before_floor_test_hook;
 static void *wal_reclaim_before_floor_test_hook_arg;
 static PsWalReadBeforeLockTestHook wal_read_before_lock_test_hook;
 static void *wal_read_before_lock_test_hook_arg;
+static PsWalIdxObservationErrorTestHook walidx_observation_error_test_hook;
+static void *walidx_observation_error_test_hook_arg;
 /* A page-history pin must not change between a compaction floor snapshot and
  * publication of the pruned replacement layer. */
 static pthread_rwlock_t page_prune_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -975,6 +977,14 @@ ps_test_set_wal_read_before_lock_hook(PsWalReadBeforeLockTestHook hook,
 {
 	wal_read_before_lock_test_hook = hook;
 	wal_read_before_lock_test_hook_arg = arg;
+}
+
+void
+ps_test_set_walidx_observation_error_hook(
+	PsWalIdxObservationErrorTestHook hook, void *arg)
+{
+	walidx_observation_error_test_hook = hook;
+	walidx_observation_error_test_hook_arg = arg;
 }
 
 static int
@@ -10542,6 +10552,12 @@ walidx_snapshot_publish_one(void)
 		}
 		walidx_snapshot_gc_pending[tl] = 1;
 		pthread_mutex_unlock(&walidx_meta_lock);
+		/* A forced publication consumed the observed append-tail frontier.
+		 * Clear only after the durable metadata update succeeds; a failed
+		 * publication must remain eligible for retry.  Request an immediate
+		 * post-maintenance observation so the new physical debt is measured. */
+		__atomic_store_n(&walidx_snapshot_force_due[tl], 0, __ATOMIC_RELEASE);
+		__atomic_store_n(&walidx_observation_next_ns, 0, __ATOMIC_RELEASE);
 		rc = 1;
 	}
 
@@ -12309,6 +12325,13 @@ walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 
 		for (uint32_t attempt = 0; attempt < max_retries; attempt++)
 		{
+			/* Every physical scan owns its outputs for this attempt.  In
+			 * particular, never let a failed scan reuse a prior attempt's
+			 * candidate bytes. */
+			tail = 0;
+			obsolete_epoch = 0;
+			obsolete_snapshot = 0;
+			total = 0;
 			if (walidx_debt_snapshot(tl, &snapshot) != 0)
 				return UINT64_MAX;
 			if (!snapshot.valid)
@@ -12317,14 +12340,25 @@ walidx_reclaim_lag_bytes(unsigned char *tail_candidates,
 				break;
 			}
 			if (ps_storage->walidx_reclaim_bytes(tl, snapshot.epochs,
-												 snapshot.covered_offsets,
-												 snapshot.observed_offsets,
-												 core_shards(), &tail,
-												 &obsolete_epoch) != 0 ||
-				ps_walidx_snapshot_reclaim_bytes(snapshot.directory, tl,
-												 snapshot.generation,
-												 &obsolete_snapshot) != 0)
-				return UINT64_MAX;
+											 snapshot.covered_offsets,
+											 snapshot.observed_offsets,
+											 core_shards(), &tail,
+											 &obsolete_epoch) != 0 ||
+								ps_walidx_snapshot_reclaim_bytes(snapshot.directory, tl,
+														 snapshot.generation,
+														 &obsolete_snapshot) != 0)
+			{
+				/* A failed physical observation is retryable when the logical
+				 * identity moved while it was in flight.  If it did not move,
+				 * fail closed rather than turning an I/O/corruption error into
+				 * zero debt. */
+				if (walidx_observation_error_test_hook != NULL)
+					walidx_observation_error_test_hook(tl,
+											 walidx_observation_error_test_hook_arg);
+				if (walidx_debt_snapshot_unchanged(tl, &snapshot))
+					return UINT64_MAX;
+				continue;
+			}
 			total = backpressure_saturating_add(tail, obsolete_epoch);
 			total = backpressure_saturating_add(total, obsolete_snapshot);
 			if (walidx_debt_snapshot_unchanged(tl, &snapshot))
