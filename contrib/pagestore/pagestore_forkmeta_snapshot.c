@@ -54,6 +54,8 @@ typedef struct SnapshotCompareCtx
 
 static PsForkmetaSnapshotObservationTestHook observation_test_hook;
 static void *observation_test_hook_arg;
+static PsForkmetaSnapshotGcInspectionTestHook gc_inspection_test_hook;
+static void *gc_inspection_test_hook_arg;
 
 void
 ps_test_set_forkmeta_snapshot_observation_hook(
@@ -61,6 +63,14 @@ ps_test_set_forkmeta_snapshot_observation_hook(
 {
 	observation_test_hook = hook;
 	observation_test_hook_arg = arg;
+}
+
+void
+ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+		PsForkmetaSnapshotGcInspectionTestHook hook, void *arg)
+{
+	gc_inspection_test_hook = hook;
+	gc_inspection_test_hook_arg = arg;
 }
 
 static size_t
@@ -1632,7 +1642,7 @@ cleanup:
 #define FORKMETA_OBSERVATION_MAX_ENTRIES \
 	PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES
 #define FORKMETA_OBSERVATION_RETRIES 3U
-#define FORKMETA_TEMP_GC_BATCH 128U
+#define FORKMETA_TEMP_GC_BATCH PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH
 
 typedef struct ForkmetaObservationIdentity
 {
@@ -1975,8 +1985,9 @@ cleanup:
 
 /* Remove only recognized temporary files.  This path is intentionally
  * independent of the selected manifest: an interrupted first publication can
- * leave executable debris before any manifest exists.  It removes a bounded
- * batch so a large valid-temp backlog cannot monopolize maintenance. */
+ * leave executable debris before any manifest exists.  It scans sequentially
+ * and stops after a bounded batch of valid temporary files, so canonical
+ * entries do not hide later temporary debris. */
 int
 ps_forkmeta_snapshot_gc_temporary(const char *directory)
 {
@@ -2009,6 +2020,8 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0 ||
 			strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
 			continue;
+		if (gc_inspection_test_hook != NULL)
+			gc_inspection_test_hook(gc_inspection_test_hook_arg);
 		temp_status = parse_temp_name(entry->d_name);
 		if (temp_status != 0)
 		{
@@ -2020,16 +2033,15 @@ ps_forkmeta_snapshot_gc_temporary(const char *directory)
 		}
 		if (snapshot_gc_entry_regular(directory_fd, entry->d_name) != 1)
 			goto cleanup;
-		if (count < FORKMETA_TEMP_GC_BATCH)
-		{
-			if (strlen(entry->d_name) >= sizeof(names[0]))
-				goto cleanup;
-			memcpy(names[count++], entry->d_name,
-				   strlen(entry->d_name) + 1);
-		}
+		if (strlen(entry->d_name) >= sizeof(names[0]))
+			goto cleanup;
+		memcpy(names[count++], entry->d_name,
+			   strlen(entry->d_name) + 1);
+		if (count == FORKMETA_TEMP_GC_BATCH)
+			break;
 	}
 	{
-		int scan_errno = errno;
+		int scan_errno = count == FORKMETA_TEMP_GC_BATCH ? 0 : errno;
 		int close_rc = closedir(dir);
 
 		dir = NULL;

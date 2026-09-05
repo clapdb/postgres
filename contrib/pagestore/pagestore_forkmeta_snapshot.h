@@ -83,6 +83,7 @@ typedef struct PsForkmetaSnapshotReclaimObservation
  * admission until a later complete observation succeeds. */
 #define PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW 1
 #define PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES 4096U
+#define PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH 128U
 
 typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
 															 void *arg);
@@ -91,6 +92,10 @@ typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
  * prove that retry opens a fresh directory stream. */
 extern void ps_test_set_forkmeta_snapshot_observation_hook(
 		PsForkmetaSnapshotObservationTestHook hook, void *arg);
+
+typedef void (*PsForkmetaSnapshotGcInspectionTestHook)(void *arg);
+extern void ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+		PsForkmetaSnapshotGcInspectionTestHook hook, void *arg);
 
 /*
  * MUTATOR SERIALIZATION CONTRACT

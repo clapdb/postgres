@@ -141,6 +141,19 @@ typedef struct ObservationRetryTest
 	unsigned int calls;
 } ObservationRetryTest;
 
+typedef struct GcInspectionTest
+{
+	unsigned int calls;
+} GcInspectionTest;
+
+static void
+gc_inspection_hook(void *arg)
+{
+	GcInspectionTest *test = arg;
+
+	test->calls++;
+}
+
 static void
 observation_retry_hook(unsigned int attempt, void *arg)
 {
@@ -686,6 +699,7 @@ main(void)
 		char manifest[1200];
 		PsForkmetaSnapshotExpected expected;
 		PsForkmetaSnapshotReclaimObservation observation;
+		GcInspectionTest inspection = {0};
 		int created = 1;
 
 		snprintf(temp_only, sizeof(temp_only),
@@ -724,8 +738,12 @@ main(void)
 				  observation.gc_temp_gc_due != 0 &&
 				  observation.gc_serviceable_bytes != 0,
 				  "temporary overflow is incomplete but remains executable GC work");
-		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1,
-				  "overflow cleanup removes only a bounded temporary batch");
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
+		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
+				  inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "temporary GC inspects only one bounded prefix per call");
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
 		for (unsigned int pass = 0; pass < 64 &&
 				 ps_forkmeta_snapshot_gc_temporary(directory) > 0; pass++)
 			;
@@ -815,15 +833,21 @@ main(void)
 														 &expected, &observation) != 0 &&
 				  access(overflow_symlink, F_OK) == 0,
 				  "overflow never treats an exact temporary symlink as validated cleanup");
-		check(ps_forkmeta_snapshot_gc_temporary(directory) < 0 &&
-			  access(overflow_symlink, F_OK) == 0,
-			  "temporary GC preserves the overflow symlink");
+		{
+			int gc_rc = 1;
+
+			for (unsigned int pass = 0; pass < 64 && gc_rc > 0; pass++)
+				gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+			check(gc_rc < 0 && access(overflow_symlink, F_OK) == 0,
+				  "temporary GC eventually preserves the overflow symlink");
+		}
 	}
 	{
 		char canonical[1200];
 		char temp_later[1200];
 		PsForkmetaSnapshotExpected expected;
 		PsForkmetaSnapshotReclaimObservation observation;
+		GcInspectionTest inspection = {0};
 		int created = 1;
 
 		check(make_dir(root, "overflow_canonical_cursor", directory,
@@ -863,9 +887,12 @@ main(void)
 			  PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW &&
 			  observation.gc_temp_gc_due != 0,
 			  "canonical overflow schedules an external temporary GC probe");
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
 		check(ps_forkmeta_snapshot_gc_temporary(directory) == 1 &&
-			  access(temp_later, F_OK) != 0,
-			  "external temporary GC reaches valid temp after canonical overflow");
+			  access(temp_later, F_OK) != 0 && inspection.calls != 0,
+			  "external temporary GC traverses canonical prefix to valid temp");
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
 		check(ps_forkmeta_snapshot_reclaim_observation(directory, root, 0, 0,
 														 &expected, &observation) != 0,
 			  "canonical overflow remains fail-closed until below the bound");
