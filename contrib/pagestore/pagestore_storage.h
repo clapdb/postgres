@@ -131,6 +131,9 @@ typedef struct PsStorage
 	int			(*fork_meta_append) (const void *buf, uint32_t len);
 	int			(*fork_meta_read) (uint64_t off, void *buf, uint32_t len);
 	int			(*fork_meta_truncate) (uint64_t len);
+	/* Return the current physical fork-meta source length.  ENOENT is an
+	 * empty source; other errors are not silently converted to zero. */
+	int			(*fork_meta_size) (uint64_t *len);
 	/*
 	 * Atomically replace the fixed fork-meta log via durable temporary file,
 	 * rename, and parent-directory fsync.  The core externally serializes this

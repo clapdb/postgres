@@ -49,6 +49,74 @@ typedef struct PsForkmetaSnapshotPrepared
 	PsForkmetaSnapshotPart tail;
 } PsForkmetaSnapshotPrepared;
 
+/* The in-memory selected tuple is the expected identity for periodic
+ * metadata observation.  A zero generation means that no snapshot is
+ * selected; an unexpected manifest is then unsafe rather than free debt. */
+typedef struct PsForkmetaSnapshotExpected
+{
+	uint64_t generation;
+	uint64_t cutoff_lsn;
+	uint64_t cutoff_admission_seq;
+	PsForkmetaSnapshotPart checkpoint;
+	PsForkmetaSnapshotPart tail;
+} PsForkmetaSnapshotExpected;
+
+/* Separate debt that can be serviced by the current GC from residue that
+ * needs a newly published snapshot/cutoff before it is safe to reclaim. */
+typedef struct PsForkmetaSnapshotReclaimObservation
+{
+	uint64_t bytes;
+	uint64_t gc_serviceable_bytes;
+	uint64_t gc_temp_bytes;
+	uint64_t gc_canonical_bytes;
+	uint64_t cutoff_dependent_bytes;
+	uint64_t source_debt_bytes;
+	/* The bounded observer did not prove that the directory is complete. */
+	int gc_serviceable_overflow;
+	/* An overflow or a validated temporary means the admission-fence-external
+	 * exact-temp GC/probe should run; this does not claim complete validation. */
+	int gc_temp_gc_due;
+} PsForkmetaSnapshotReclaimObservation;
+
+/* The observation is stable but incomplete.  Its accounting is usable only
+ * to schedule bounded temporary cleanup; callers must fail closed for
+ * admission until a later complete observation succeeds. */
+#define PS_FORKMETA_SNAPSHOT_RECLAIM_OBSERVATION_OVERFLOW 1
+#define PS_FORKMETA_SNAPSHOT_RECLAIM_MAX_ENTRIES 4096U
+#define PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH 128U
+
+typedef enum PsForkmetaSnapshotGcResult
+{
+	PS_FORKMETA_SNAPSHOT_GC_NO_WORK = 0,
+	PS_FORKMETA_SNAPSHOT_GC_REMOVED = 1,
+	/* The scan cursor advanced without deleting a file; keep scheduling it. */
+	PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE = 2,
+	/* A deletion batch completed, but the persistent scan cursor remains. */
+	PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE = 3,
+	PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS = -2
+} PsForkmetaSnapshotGcResult;
+
+typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
+															 void *arg);
+
+/* Test-only seam used to change a directory after the first bounded scan and
+ * prove that retry opens a fresh directory stream. */
+extern void ps_test_set_forkmeta_snapshot_observation_hook(
+		PsForkmetaSnapshotObservationTestHook hook, void *arg);
+
+typedef void (*PsForkmetaSnapshotGcInspectionTestHook)(void *arg);
+extern void ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+		PsForkmetaSnapshotGcInspectionTestHook hook, void *arg);
+
+/* Test-only seam for proving generation-allocation traversal.  The callback
+ * runs once for each non-special directory entry; generation is zero when the
+ * entry is not a recognized canonical or part-temporary name, and highest is
+ * the maximum seen through the current entry. */
+typedef void (*PsForkmetaSnapshotGenerationScanTestHook)(
+		const char *name, uint64_t generation, uint64_t highest, void *arg);
+extern void ps_test_set_forkmeta_snapshot_generation_scan_hook(
+		PsForkmetaSnapshotGenerationScanTestHook hook, void *arg);
+
 /*
  * MUTATOR SERIALIZATION CONTRACT
  *
@@ -137,12 +205,47 @@ extern int ps_forkmeta_snapshot_read_checkpoint(
 extern int ps_forkmeta_snapshot_read_tail(
 	const PsForkmetaSnapshot *snapshot, uint64_t offset, void *data,
 	uint64_t len);
-/* After publisher serialization and reader drain, remove recognized temp
- * debris and final files older than selected, preserving selected, newer, and
- * durable-prepared generations.  Every call fsyncs the directory, including
- * an empty retry after an ambiguous prior unlink fsync. */
-extern int ps_forkmeta_snapshot_gc(const char *directory);
-#define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
+/* After publisher serialization and reader drain, remove a bounded batch of
+ * recognized temp debris and final files older than selected, preserving
+ * selected, newer, and durable-prepared generations.  Every call fsyncs the
+ * directory, including an empty retry after an ambiguous prior unlink fsync.
+ * SCAN_INCOMPLETE means the persistent cursor advanced without mutation, and
+ * REMOVED_SCAN_INCOMPLETE means a deletion batch also left more scan work;
+ * both require another tick without treating the result as fresh observation
+ * or forcing admission state to change. */
+extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc(const char *directory);
+/* Close all retained full/temp GC directory streams and discard continuation
+ * authorities.  Call this during core shutdown before the provider closes. */
+extern void ps_forkmeta_snapshot_gc_reset(void);
+/* Remove a bounded batch of recognized temporary debris without requiring a
+ * selected manifest.  Canonical manifests/parts and durable prepared intent
+ * are never removed by this path.  A REMOVED_SCAN_INCOMPLETE result means
+ * this batch removed files but the persistent cursor still has a suffix;
+ * callers must schedule another tick without forcing a fresh observation as
+ * if files changed.  SCAN_INCOMPLETE has the same scheduling requirement
+ * without a directory mutation. */
+extern PsForkmetaSnapshotGcResult ps_forkmeta_snapshot_gc_temporary(
+		const char *directory);
+/* Metadata-only physical debt scan.  The source baseline growth is charged
+ * only when source_debt_enabled is nonzero; when it is zero, source bytes are
+ * observed for identity stability but contribute no reclaimable debt.
+ * The selected and prepared manifest records, their file identities, and
+ * canonical part lengths are checked before and after a bounded scan.  The
+ * immutable payload CRCs are compared as metadata only and never reread on
+ * this periodic path. */
+extern int ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 int source_debt_enabled,
+										 const PsForkmetaSnapshotExpected *expected,
+										 uint64_t *bytes_out);
+extern int ps_forkmeta_snapshot_reclaim_observation(
+										 const char *directory,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 int source_debt_enabled,
+										 const PsForkmetaSnapshotExpected *expected,
+										 PsForkmetaSnapshotReclaimObservation *observation);
 /* Release the stable part descriptors and directory descriptor. */
 extern void ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot);
 

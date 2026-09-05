@@ -140,7 +140,10 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"page_throttled\":0") != NULL &&
 		  strstr(output, "\"wal_lag_bytes\":0") != NULL &&
 		  strstr(output, "\"wal_high_water_bytes\":0") != NULL &&
-		  strstr(output, "\"wal_throttled\":0") != NULL,
+		  strstr(output, "\"wal_throttled\":0") != NULL &&
+		  strstr(output, "\"forkmeta_lag_bytes\":0") != NULL &&
+		  strstr(output, "\"forkmeta_high_water_bytes\":0") != NULL &&
+		  strstr(output, "\"forkmeta_throttled\":0") != NULL,
 		  "read-only inspector reports idle mailbox backpressure state");
 	check(run_inspector(shm, "pruning", output, sizeof(output)),
 		  "read-only inspector pruning exits cleanly");

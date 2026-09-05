@@ -718,8 +718,8 @@ Expected scope: one PR.  Passing it closes the retention MVP gate.
 
 ### R5b. Add reclaimer backpressure controllers
 
-Status: **partial: page/WAL and WAL-index controllers implemented; forkmeta
-controller remains follow-up work**.
+Status: **R5b controllers complete for PAGE, shipped-WAL, WAL-index, and
+forkmeta; queue-bound soak/tuning remains R6 work**.
 
 R5b-1 adds lean independent PAGE and shipped-WAL lag controllers.  They publish
 high-water/catch-up configuration, hysteretic throttle state, transitions, and
@@ -732,8 +732,11 @@ epoch/watermark bytes, and obsolete snapshot generations.  Its bounded
 metadata-only refresh validates selected manifest/shard identity while
 immutable payload checksums remain a startup/publication responsibility, and
 per-timeline tail candidates can force fair snapshot publication below the
-geometric trigger.  Forkmeta, queue-bound soak evidence, and controller-specific
-tuning remain follow-up work.
+geometric trigger.  Forkmeta adds a POSIX-only compacted-source baseline plus
+append growth and obsolete snapshot/temp debris, with bounded metadata
+observation and forced fair snapshot maintenance.  Queue-bound soak evidence
+and controller-specific tuning remain follow-up work in R6; forkmeta does not
+include any forkmeta-index or H0 changes.
 
 Expected scope: one or two PRs.  R6 consumes these controls; it does not
 introduce them.
@@ -937,7 +940,7 @@ The remaining default sequence is:
 1. R3b retained-base foundation, then the WAL reclaimer enabled by replacement-base compaction;
 2. R4b forkmeta compaction/reclamation and publication crash tests;
 3. R5 timeline deletion;
-4. R5b reclaimer backpressure controllers;
+4. R5b reclaimer backpressure controllers (implementation complete; R6 owns soak/tuning);
 5. H0 fault/inspection primitives;
 6. H1 composed crash scenarios;
 7. H2 format fixtures and compatibility CI;
@@ -960,6 +963,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-08-26 | Added R5 deletion-filtered forkmeta cutover: explicit DELETING owners are omitted from checkpoint, tail, and rewritten source while live and pre-metadata owners survive | Forced/ordinary generation, marker-only owner, multi-delete, restart, rewrite-failure, and existing crash-matrix coverage |
 | 2026-08-26 | Added R5 owner-scoped POSIX WAL cleanup for DELETING timelines: flat/immutable WAL and WAL-index logs/snapshots are validated, durably removed, and purged from runtime state without publishing DELETED | Focused normal/fail-closed/restart/sibling tests plus WAL, snapshot, forkmeta crash, and 1998-check standalone coverage; shared page segments remain |
 | 2026-08-26 | Added R5 durable DELETED publication and incarnation-aware numeric-ID reuse: the same-incarnation DELETED event is fsynced after owner-scoped cleanup, and CREATE_BRANCH admits only the exact next token after runtime reset | Focused normal/ASan publication, immediate same-horizon reuse, stale-token/parent fencing, restart, repeated-cycle, sibling-safety, and ambiguous-append coverage; SPDK async drain remains fail-closed |
+| 2026-09-05 | Completed R5b forkmeta reclamation backpressure: stable compacted-source baseline debt, bounded fail-closed POSIX metadata observation, forkmeta-specific mutation admission, shared-memory/inspect/daemon metrics, and forced fair snapshot/GC catch-up | Focused POSIX backpressure, daemon, inspect, and forkmeta observer/controller coverage; queue-bound soak and tuning remain R6 |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
 | 2026-08-28 | Added R3b-2 standalone crash-safe physical immutable-prefix reclamation: `ps_wal_store_reclaim_prefix()` publishes retained/physical frontiers before unlink, uses the WAL mutex as a reader drain/barrier, fully validates/sorts residual candidates before ascending unlink, revalidates every main-catalog candidate immediately before unlink, keeps partial unlink catalog state exact, fences ambiguous directory fsync, and retries residual prefixes after restart; no core maintenance or cutoff policy | Final focused WAL-store test: 167 checks, 0 failures; includes reverse-enumeration candidate ordering, scan-error zero-unlink, low/middle main-catalog corruption and residual corruption, lowest/middle unlink failures, per-candidate header/CRC validation, real fork/`_exit` stops before unlink/after partial unlink/before directory fsync, pending-reclaim advance fencing, deterministic reader-barrier timing, idempotence, boundary rejection, and restart retry |
 | 2026-08-28 | Added conservative R3b-3 POSIX/core WAL reclaim policy integration: cheap WAL-lock-only due preselection plus bounded no-progress backoff, durable retained-base admission with per-level WAL-lock read rechecks and inherited-parent fallback, fair one-LIVE-timeline scheduling ahead of continuous tier/remote-GC work, admission drain plus WAL-index freeze and single-timeline WAL locking, target branch/control caps, dependency/retention/progress minimum cutoff (including progress beyond the sealed prefix), residual-prefix retry at an already-published frontier, DELETED-descendant release, fail-closed pending-proof/publication handling, and one-second retry backoff; physical directory start is not a runtime fence and pre-metadata timelines retain local WAL reads | Focused core policy test: 66 checks, 0 failures; covers empty and boundary-floor preselection, ancestry and natural nonzero child fallback, child-local controls and target branch caps, LIVE/DELETING/DELETED structural floors and WAL-index exceptions, timeline isolation, naturally nonzero starts, unaligned and boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index re-ship admission after base advancement, pre-metadata reads, restart/residual retry, fenced residual-query suppression, read/frontier publication and floor-scan lock-order races, no-proof candidate fairness, pending durable-proof cleanup failure, metadata publication failure/backoff, and admission concurrency; sparse/discrete base crossing and bounded fixed-reader soak remain out of scope |

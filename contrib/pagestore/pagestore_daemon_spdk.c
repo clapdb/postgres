@@ -670,13 +670,24 @@ main(int argc, char **argv)
 			if (parse_u64_option(argv[++i], &walidx_reclaim_catchup_bytes) != 0)
 				return 2;
 		}
+		else if (strcmp(argv[i], "--forkmeta-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &forkmeta_reclaim_high_water_bytes) != 0)
+				return 2;
+		}
+		else if (strcmp(argv[i], "--forkmeta-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &forkmeta_reclaim_catchup_bytes) != 0)
+				return 2;
+		}
 		else
 		{
 			fprintf(stderr, "usage: %s --shm NAME --store DIR --pci ADDR "
 					"[--page-size N] [--segment-size N] [--nshards N] "
 					"[--page-high-water-bytes N --page-catch-up-bytes N] "
 					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-					"[--walidx-high-water-bytes N --walidx-catch-up-bytes N]\n",
+					"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+					"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N]\n",
 					argv[0]);
 			return 2;
 		}
@@ -688,7 +699,8 @@ main(int argc, char **argv)
 				"[--page-size N] [--segment-size N] [--nshards N] "
 				"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N]\n",
+				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N]\n",
 				argv[0]);
 		return 2;
 	}
@@ -696,8 +708,10 @@ main(int argc, char **argv)
 		 page_reclaim_catchup_bytes != 0 ||
 		 wal_reclaim_high_water_bytes != 0 ||
 		 wal_reclaim_catchup_bytes != 0 ||
-		 walidx_reclaim_high_water_bytes != 0 ||
-		 walidx_reclaim_catchup_bytes != 0)
+			 walidx_reclaim_high_water_bytes != 0 ||
+			 walidx_reclaim_catchup_bytes != 0 ||
+			 forkmeta_reclaim_high_water_bytes != 0 ||
+			 forkmeta_reclaim_catchup_bytes != 0)
 	{
 		fprintf(stderr, "pagestore_daemon_spdk: backpressure requires the POSIX "
 				"storage backend (selected 'spdk')\n");

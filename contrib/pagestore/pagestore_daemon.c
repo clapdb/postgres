@@ -58,6 +58,7 @@ typedef struct BackpressureWaitSlot
 	uint64_t	page_wait_ns;
 	uint64_t	wal_wait_ns;
 	uint64_t	walidx_wait_ns;
+	uint64_t	forkmeta_wait_ns;
 	int		active;
 } BackpressureWaitSlot;
 
@@ -103,6 +104,8 @@ accrue_backpressure_interval(BackpressureWaitSlot *slot, uint64_t now)
 		add_wait_ns(&slot->wal_wait_ns, elapsed);
 	if ((slot->cause_mask & PS_BACKPRESSURE_WALIDX) != 0)
 		add_wait_ns(&slot->walidx_wait_ns, elapsed);
+	if ((slot->cause_mask & PS_BACKPRESSURE_FORKMETA) != 0)
+		add_wait_ns(&slot->forkmeta_wait_ns, elapsed);
 }
 
 static void
@@ -162,8 +165,8 @@ finish_backpressure_wait(uint32_t channel)
 		return;
 	now = monotonic_ns();
 	accrue_backpressure_interval(slot, now);
-	ps_backpressure_record_wait3(slot->page_wait_ns, slot->wal_wait_ns,
-							 slot->walidx_wait_ns);
+	ps_backpressure_record_wait4(slot->page_wait_ns, slot->wal_wait_ns,
+								 slot->walidx_wait_ns, slot->forkmeta_wait_ns);
 	memset(slot, 0, sizeof(*slot));
 }
 
@@ -455,6 +458,34 @@ request_is_mutation(const PsChannel *ch)
 	}
 }
 
+/* PAGE/WAL/WAL-index retain their historical mutation gate.  Forkmeta is
+ * narrower: only requests which can append a fork-size event are included,
+ * so reads and timeline/retention bookkeeping cannot be blocked by it. */
+static uint32_t
+request_backpressure_mask(const PsChannel *ch)
+{
+	uint32_t mask;
+
+	if (!request_is_mutation(ch))
+		return 0;
+	mask = PS_BACKPRESSURE_PAGE | PS_BACKPRESSURE_WAL |
+		PS_BACKPRESSURE_WALIDX;
+	switch ((PsOpcode) ch->opcode)
+	{
+		case PS_OP_CREATE:
+		case PS_OP_UNLINK:
+		case PS_OP_TRUNCATE:
+		case PS_OP_ZEROEXTEND:
+		case PS_OP_EXTEND:
+		case PS_OP_WRITEV:
+			mask |= PS_BACKPRESSURE_FORKMETA;
+			break;
+		default:
+			break;
+	}
+	return mask;
+}
+
 static void
 run_request_admitted(PsChannel *ch)
 {
@@ -664,7 +695,8 @@ run_request(uint32_t channel, PsChannel *ch)
 	if (request_is_mutation(ch))
 	{
 		uint32_t causes = 0;
-		int admit = ps_backpressure_try_admit(&stop_requested, &causes);
+		int admit = ps_backpressure_try_admit_mask(&stop_requested,
+			request_backpressure_mask(ch), &causes);
 
 		if (admit < 0)
 		{
@@ -917,6 +949,8 @@ main(int argc, char **argv)
 	const char *store_dir = NULL;
 	const char *shm_name = NULL;
 	uint32_t	nshards = 1;
+	int		forkmeta_high_water_cli = 0;
+	int		forkmeta_catchup_cli = 0;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -968,6 +1002,18 @@ main(int argc, char **argv)
 			if (parse_u64_option(argv[++i], &walidx_reclaim_catchup_bytes) != 0)
 				return 2;
 		}
+		else if (strcmp(argv[i], "--forkmeta-high-water-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &forkmeta_reclaim_high_water_bytes) != 0)
+				return 2;
+			forkmeta_high_water_cli = 1;
+		}
+		else if (strcmp(argv[i], "--forkmeta-catch-up-bytes") == 0 && i + 1 < argc)
+		{
+			if (parse_u64_option(argv[++i], &forkmeta_reclaim_catchup_bytes) != 0)
+				return 2;
+			forkmeta_catchup_cli = 1;
+		}
 		else if (strcmp(argv[i], "--test-maintenance-pause-file") == 0 &&
 				 i + 1 < argc)
 			maintenance_pause_file = argv[++i];
@@ -1002,12 +1048,42 @@ main(int argc, char **argv)
 					"[--page-size N] [--segment-size N] [--segment-gc 0|1] "
 					"[--nshards N] [--storage NAME] "
 					"[--page-high-water-bytes N --page-catch-up-bytes N] "
-					"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
-					"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
+				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 					"[--test-maintenance-pause-file PATH] "
 					"[--test-shutdown-cancel-pause-file PATH] "
 					"[--test-shutdown-cancel-ready-fd N]\n",
 					argv[0]);
+			return 2;
+		}
+	}
+	/* Environment configuration is useful for service managers that do not
+	 * construct a long option list.  The explicit CLI spelling wins, and the
+	 * RECLAIM aliases keep the names self-describing for operators. */
+	if (!forkmeta_high_water_cli)
+	{
+		const char *value = getenv("PAGESTORE_FORKMETA_HIGH_WATER_BYTES");
+
+		if (value == NULL)
+			value = getenv("PAGESTORE_FORKMETA_RECLAIM_HIGH_WATER_BYTES");
+		if (value != NULL &&
+			parse_u64_option(value, &forkmeta_reclaim_high_water_bytes) != 0)
+		{
+			fprintf(stderr, "pagestore_daemon: invalid forkmeta high-water environment value\n");
+			return 2;
+		}
+	}
+	if (!forkmeta_catchup_cli)
+	{
+		const char *value = getenv("PAGESTORE_FORKMETA_CATCH_UP_BYTES");
+
+		if (value == NULL)
+			value = getenv("PAGESTORE_FORKMETA_RECLAIM_CATCH_UP_BYTES");
+		if (value != NULL &&
+			parse_u64_option(value, &forkmeta_reclaim_catchup_bytes) != 0)
+		{
+			fprintf(stderr, "pagestore_daemon: invalid forkmeta catch-up environment value\n");
 			return 2;
 		}
 	}
@@ -1020,6 +1096,7 @@ main(int argc, char **argv)
 				"[--page-high-water-bytes N --page-catch-up-bytes N] "
 				"[--wal-high-water-bytes N --wal-catch-up-bytes N] "
 				"[--walidx-high-water-bytes N --walidx-catch-up-bytes N] "
+				"[--forkmeta-high-water-bytes N --forkmeta-catch-up-bytes N] "
 				"[--test-maintenance-pause-file PATH] "
 				"[--test-shutdown-cancel-pause-file PATH] "
 				"[--test-shutdown-cancel-ready-fd N]\n",
@@ -1028,7 +1105,9 @@ main(int argc, char **argv)
 	}
 	if ((page_reclaim_high_water_bytes != 0 || page_reclaim_catchup_bytes != 0 ||
 		 wal_reclaim_high_water_bytes != 0 || wal_reclaim_catchup_bytes != 0 ||
-		 walidx_reclaim_high_water_bytes != 0 || walidx_reclaim_catchup_bytes != 0) &&
+		 walidx_reclaim_high_water_bytes != 0 || walidx_reclaim_catchup_bytes != 0 ||
+		 forkmeta_reclaim_high_water_bytes != 0 ||
+		 forkmeta_reclaim_catchup_bytes != 0) &&
 		(ps_storage == NULL || ps_storage->name == NULL ||
 		 strcmp(ps_storage->name, "posix") != 0))
 	{
@@ -1038,12 +1117,14 @@ main(int argc, char **argv)
 				ps_storage->name : "none");
 		return 2;
 	}
-	if (ps_backpressure_configure_all(page_reclaim_high_water_bytes,
+	if (ps_backpressure_configure_all_with_forkmeta(page_reclaim_high_water_bytes,
 								  page_reclaim_catchup_bytes,
 								  wal_reclaim_high_water_bytes,
 								  wal_reclaim_catchup_bytes,
 								  walidx_reclaim_high_water_bytes,
-								  walidx_reclaim_catchup_bytes) != 0)
+								  walidx_reclaim_catchup_bytes,
+								  forkmeta_reclaim_high_water_bytes,
+								  forkmeta_reclaim_catchup_bytes) != 0)
 	{
 		if (page_reclaim_high_water_bytes != 0 && !segment_gc_enabled)
 			fprintf(stderr, "pagestore_daemon: page backpressure requires "
@@ -1159,9 +1240,12 @@ main(int argc, char **argv)
 			shm_publish_ready(hdr))
 		{
 			fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
-					"io_unit=%u channels=%u nshards=%u ready\n",
+					"io_unit=%u channels=%u nshards=%u forkmeta_high=%llu "
+					"forkmeta_catchup=%llu ready\n",
 					shm_name, store_dir, ps_storage->name, page_size, PS_IO_UNIT,
-					PS_MAX_CHANNELS, hdr->nshards);
+					PS_MAX_CHANNELS, hdr->nshards,
+					(unsigned long long) forkmeta_reclaim_high_water_bytes,
+					(unsigned long long) forkmeta_reclaim_catchup_bytes);
 			if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: fault probe daemon.after_ready failed\n");

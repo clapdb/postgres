@@ -263,8 +263,9 @@ test_unsupported_backend_cli(const char *daemon_path)
 static pid_t
 spawn_daemon(const char *daemon_path, const char *shm_name,
 				 const char *store_dir, const char *pause_file,
-				 const char *shutdown_pause_file,
-				 int ready_fd, int ready_read_fd, int enable_bp)
+					 const char *shutdown_pause_file,
+					 int ready_fd, int ready_read_fd, int enable_bp,
+					 int enable_forkmeta_bp)
 {
 	char ready_fd_text[32];
 	pid_t pid = fork();
@@ -298,6 +299,14 @@ spawn_daemon(const char *daemon_path, const char *shm_name,
 				  shutdown_pause_file != NULL ? shutdown_pause_file : NULL,
 				  ready_fd >= 0 ? "--test-shutdown-cancel-ready-fd" : NULL,
 				  ready_fd >= 0 ? ready_fd_text : NULL,
+				  (char *) NULL);
+		else if (enable_forkmeta_bp)
+			execl(daemon_path, daemon_path, "--shm", shm_name, "--store",
+				  store_dir, "--page-size", "8192", "--segment-size", "32768",
+				  "--nshards", "1", "--flush-pages", "1", "--compact-layers",
+				  "100", "--segment-gc", "1", "--forkmeta-high-water-bytes",
+				  "180", "--forkmeta-catch-up-bytes", "20",
+				  "--test-maintenance-pause-file", pause_file,
 				  (char *) NULL);
 		else
 			execl(daemon_path, daemon_path, "--shm", shm_name, "--store",
@@ -367,7 +376,7 @@ run_test(const char *daemon_path)
 	/* Phase 1: seed complete reclaimable segments while the controller is
 	 * disabled, so no prefill request can ever be deferred. */
 	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
-					   NULL, -1, -1, 0);
+					   NULL, -1, -1, 0, 0);
 	check(pid > 0, "real daemon starts for backpressure integration");
 	if (pid <= 0)
 		goto cleanup;
@@ -426,7 +435,7 @@ run_test(const char *daemon_path)
 
 	/* Phase 2: startup recovery retains the seed's complete segment debt. */
 	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
-					   NULL, -1, -1, 1);
+					   NULL, -1, -1, 1, 0);
 	check(pid > 0, "throttle daemon restarts for backpressure integration");
 	if (pid <= 0)
 		goto cleanup;
@@ -550,7 +559,7 @@ run_test(const char *daemon_path)
 	if (pause_fd >= 0)
 		close(pause_fd);
 	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
-					   NULL, -1, -1, 1);
+					   NULL, -1, -1, 1, 0);
 	check(pid > 0, "cursor-restart daemon starts");
 	if (pid <= 0)
 		goto cleanup;
@@ -638,7 +647,7 @@ run_test(const char *daemon_path)
 			goto cleanup;
 	}
 	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
-					   shutdown_pause_file, ready_pipe[1], ready_pipe[0], 1);
+					   shutdown_pause_file, ready_pipe[1], ready_pipe[0], 1, 0);
 	close(ready_pipe[1]);
 	ready_pipe[1] = -1;
 	check(pid > 0, "shutdown-phase daemon restarts");
@@ -770,6 +779,171 @@ cleanup:
 	return failed == 0;
 }
 
+/* Keep the forkmeta admission proof small and independent from page/WAL debt:
+ * CREATE is deferred after the source grows past its forkmeta controller, but
+ * WAL_APPEND and a read-only timeline probe still complete on the same shard. */
+static void
+test_forkmeta_request_classification(const char *daemon_path)
+{
+	char shm_name[64];
+	char store_dir[128];
+	char pause_file[128];
+	char frontier_file[256];
+	PsShmHeader *hdr = NULL;
+	PsChannel *writer = NULL;
+	PsChannel *pending = NULL;
+	void *shm = MAP_FAILED;
+	pid_t pid = -1;
+	int fd = -1;
+	int pause_fd;
+	int ready;
+
+	snprintf(shm_name, sizeof(shm_name), "/psforkmeta_%d", (int) getpid());
+	snprintf(store_dir, sizeof(store_dir), "/tmp/psforkmeta_store_%d", (int) getpid());
+	snprintf(pause_file, sizeof(pause_file), "/tmp/psforkmeta_pause_%d", (int) getpid());
+	snprintf(frontier_file, sizeof(frontier_file), "%s/page-prune.frontiers",
+			 store_dir);
+	shm_unlink(shm_name);
+	unlink(pause_file);
+	{
+		char command[256];
+
+		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
+		(void) system(command);
+	}
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(pause_fd >= 0, "forkmeta classification pauses maintenance");
+	if (pause_fd >= 0)
+		close(pause_fd);
+	pid = spawn_daemon(daemon_path, shm_name, store_dir, pause_file,
+					   NULL, -1, -1, 0, 1);
+	check(pid > 0, "forkmeta classification daemon starts");
+	if (pid <= 0)
+		goto cleanup;
+	ready = wait_for_ready(shm_name);
+	check(ready, "forkmeta classification daemon publishes ready state");
+	if (!ready)
+		goto cleanup;
+	fd = shm_open(shm_name, O_RDWR, 0600);
+	check(fd >= 0, "forkmeta classification opens shared memory");
+	if (fd < 0)
+		goto cleanup;
+	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	check(shm != MAP_FAILED, "forkmeta classification maps shared memory");
+	if (shm == MAP_FAILED)
+		goto cleanup;
+	hdr = (PsShmHeader *) shm;
+	writer = ps_channel(shm, 0);
+	pending = ps_channel(shm, 1);
+	check(ps_cas(&writer->claimed, 0, 1) && ps_cas(&pending->claimed, 0, 1),
+			"forkmeta classification claims two channels");
+	if (ps_load_acquire(&writer->claimed) == 0 ||
+		ps_load_acquire(&pending->claimed) == 0)
+		goto cleanup;
+	for (uint32_t i = 0; i < 3; i++)
+	{
+		set_relation_key(writer, 5000 + i);
+		writer->opcode = PS_OP_CREATE;
+		submit_and_wait(writer);
+		check(writer->status == PS_STATUS_OK,
+				"forkmeta classification seeds source growth");
+	}
+	/* Give the forkmeta records a real page-reclamation frontier.  Without this
+	 * fixture, source growth is intentionally not reclaimable debt. */
+	for (uint32_t block = 0; block < 5; block++)
+	{
+		for (uint32_t version = 0; version < 2; version++)
+		{
+			set_relation_key(writer, 5000);
+			writer->opcode = PS_OP_WRITEV;
+			writer->blocknum = block;
+			writer->nblocks = 1;
+			fill_page(writer->data, 8192,
+					  (unsigned char) (20 + block * 2 + version));
+			submit_and_wait(writer);
+			check(writer->status == PS_STATUS_OK,
+					"forkmeta classification seeds a page frontier");
+		}
+	}
+	set_relation_key(writer, 5000);
+	writer->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	writer->blocknum = PS_RETENTION_OWNER_CONFIGURED;
+	writer->parent_timeline = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	writer->old_nblocks = 1;
+	writer->req_seq = 19002;
+	writer->req_lsn = 2000;
+	submit_and_wait(writer);
+	check(writer->status == PS_STATUS_OK,
+			"forkmeta classification pins the page compaction frontier");
+	unlink(pause_file);
+	for (int i = 0; i < 5000 && access(frontier_file, F_OK) != 0; i++)
+		sleep_ms(1);
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(access(frontier_file, F_OK) == 0 && pause_fd >= 0,
+			"forkmeta classification establishes a durable page frontier");
+	if (pause_fd >= 0)
+		close(pause_fd);
+	for (int i = 0; i < 500; i++)
+	{
+		if (ps_load_acquire(&hdr->forkmeta_backpressure.throttled) != 0)
+			break;
+		sleep_ms(1);
+	}
+	check(ps_load_acquire(&hdr->forkmeta_backpressure.throttled) != 0,
+			"forkmeta source growth enters forkmeta throttle");
+	set_relation_key(pending, 6000);
+	pending->opcode = PS_OP_CREATE;
+	ps_request_generation_next(pending);
+	ps_store_release(&pending->state, PS_STATE_REQUEST);
+	sleep_ms(100);
+	check(ps_load_acquire(&pending->state) == PS_STATE_REQUEST,
+			"forkmeta-growing CREATE is deferred before admission locks");
+	writer->opcode = PS_OP_WAL_APPEND;
+	writer->timeline = 0;
+	writer->incarnation = 0;
+	writer->req_lsn = 100;
+	writer->datalen = 1;
+	writer->data[0] = 0x5a;
+	submit_and_wait(writer);
+	check(writer->status == PS_STATUS_OK,
+			"non-forkmeta WAL mutation bypasses forkmeta throttle");
+	writer->opcode = PS_OP_TIMELINE_STATE;
+	writer->timeline = 0;
+	writer->incarnation = 0;
+	writer->req_lsn = 0;
+	writer->req_seq = 0;
+	submit_and_wait(writer);
+	check(writer->status == PS_STATUS_OK,
+			"read-only timeline probe bypasses forkmeta throttle");
+
+cleanup:
+	if (pid > 0)
+	{
+		kill(pid, SIGTERM);
+		if (!wait_for_exit(pid, 2000))
+		{
+			kill(pid, SIGKILL);
+			waitpid(pid, NULL, 0);
+		}
+	}
+	if (pending != NULL)
+		ps_store_release(&pending->claimed, 0);
+	if (writer != NULL)
+		ps_store_release(&writer->claimed, 0);
+	if (shm != MAP_FAILED)
+		munmap(shm, PS_SHM_SIZE);
+	if (fd >= 0)
+		close(fd);
+	shm_unlink(shm_name);
+	unlink(pause_file);
+	{
+		char command[256];
+
+		snprintf(command, sizeof(command), "rm -rf '%s'", store_dir);
+		(void) system(command);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -780,6 +954,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 	(void) run_test(argv[1]);
+	test_forkmeta_request_classification(argv[1]);
 	if (argc == 3)
 		test_unsupported_backend_cli(argv[2]);
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);

@@ -1532,6 +1532,13 @@ rm -f "$READER_SUBXID_SQL"
 readerPinStart=$($P -c "SELECT pg_current_wal_lsn();")
 assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerPinStart');")" "0" \
 	"controller pins page history before creating reader checkpoint R"
+# A restore point emits WAL without changing relation/catalog contents or the
+# reader-visible transaction state.  It makes the subsequent checkpoint redo
+# pointer strictly newer than the controller's initial pin even when both
+# operations would otherwise observe the same WAL insertion position.
+readerPinAdvance=$($P -c "SELECT pg_create_restore_point('pagestore_reader_pin_advance');")
+assert "$($P -c "SELECT pg_wal_lsn_diff('$readerPinAdvance', '$readerPinStart') > 0;")" "t" \
+	"reader setup advances WAL after establishing the initial controller pin"
 $P -c "CHECKPOINT;" >/dev/null
 read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerOldestMulti readerCtsOldest readerCtsNext <<< "$($P -c "
 	SELECT redo_lsn || ' ' || split_part(next_xid, ':', 2) || ' ' || oldest_xid || ' ' ||
@@ -1539,6 +1546,8 @@ read -r readerR readerNext readerOldest readerNextMulti readerNextMember readerO
 	       CASE WHEN oldest_commit_ts_xid::text = '0' THEN '1' ELSE oldest_commit_ts_xid::text END || ' ' ||
 	       CASE WHEN newest_commit_ts_xid::text = '0' THEN '1' ELSE ((newest_commit_ts_xid::text::bigint + 1) & 4294967295)::text END
 	FROM pg_control_checkpoint();")"
+assert "$($P -c "SELECT pg_wal_lsn_diff('$readerR', '$readerPinStart') > 0;")" "t" \
+	"prepared reader checkpoint R is strictly newer than its initial pin"
 assert "$($P -c "SELECT pagestore_retention_set(0,1,8001,1,7,'$readerR');")" "0" \
 	"controller advances the prepared reader owner to exact checkpoint R"
 # This test has no concurrent catalog-changing workload across the checkpoint,

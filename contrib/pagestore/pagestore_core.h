@@ -50,6 +50,8 @@ extern uint64_t wal_reclaim_high_water_bytes;
 extern uint64_t wal_reclaim_catchup_bytes;
 extern uint64_t walidx_reclaim_high_water_bytes;
 extern uint64_t walidx_reclaim_catchup_bytes;
+extern uint64_t forkmeta_reclaim_high_water_bytes;
+extern uint64_t forkmeta_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;
 extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
@@ -88,6 +90,12 @@ extern void ps_admission_read_unlock(void);
 #define PS_BACKPRESSURE_PAGE 1u
 #define PS_BACKPRESSURE_WAL  2u
 #define PS_BACKPRESSURE_WALIDX 4u
+#define PS_BACKPRESSURE_FORKMETA 8u
+#define PS_BACKPRESSURE_ALL (PS_BACKPRESSURE_PAGE | PS_BACKPRESSURE_WAL | \
+	PS_BACKPRESSURE_WALIDX | PS_BACKPRESSURE_FORKMETA)
+extern int ps_backpressure_try_admit_mask(
+	const volatile sig_atomic_t *stop_flag, uint32_t controller_mask,
+	uint32_t *cause_mask);
 extern int ps_backpressure_try_admit(
 	const volatile sig_atomic_t *stop_flag, uint32_t *cause_mask);
 /* Add one completed deferred interval per controller.  The daemon aggregates
@@ -97,6 +105,10 @@ extern void ps_backpressure_record_wait(uint64_t page_wait_ns,
 extern void ps_backpressure_record_wait3(uint64_t page_wait_ns,
 										  uint64_t wal_wait_ns,
 										  uint64_t walidx_wait_ns);
+extern void ps_backpressure_record_wait4(uint64_t page_wait_ns,
+										  uint64_t wal_wait_ns,
+										  uint64_t walidx_wait_ns,
+										  uint64_t forkmeta_wait_ns);
 extern int ps_admission_write_lock(void);
 extern void ps_admission_write_unlock(void);
 extern uint64_t ps_admission_barrier(void);
@@ -110,19 +122,36 @@ extern int ps_backpressure_configure_all(uint64_t page_high_water,
 										 uint64_t wal_catchup,
 										 uint64_t walidx_high_water,
 										 uint64_t walidx_catchup);
+extern int ps_backpressure_configure_all_with_forkmeta(
+	uint64_t page_high_water, uint64_t page_catchup,
+	uint64_t wal_high_water, uint64_t wal_catchup,
+	uint64_t walidx_high_water, uint64_t walidx_catchup,
+	uint64_t forkmeta_high_water, uint64_t forkmeta_catchup);
 extern void ps_backpressure_refresh(void);
 extern void ps_backpressure_shutdown(void);
 /* Test-only deterministic lag injection; production maintenance never calls it. */
 extern void ps_test_backpressure_set_lag(uint64_t page_lag, uint64_t wal_lag);
 extern void ps_test_backpressure_set_walidx_lag(uint64_t walidx_lag);
+extern void ps_test_backpressure_set_forkmeta_lag(uint64_t forkmeta_lag);
+extern int ps_test_forkmeta_force_due(void);
+extern int ps_test_forkmeta_serviceable_work_due(void);
 extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
+extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.
  * Production frontends never install these hooks. */
 typedef void (*PsForkmetaCutoverTestHook)(void *arg);
+/* Called after a forkmeta GC cursor reports SCAN_INCOMPLETE and maintenance
+ * continues into the later WAL/timeline/segment/compaction phases. */
+typedef void (*PsForkmetaPostGcTestHook)(void *arg);
+/* Called only when maintenance explicitly invalidates the automatic
+ * forkmeta-observation pacing deadline. */
+typedef void (*PsForkmetaObservationForceTestHook)(void *arg);
+/* Called immediately before baseline source identity observation. */
+typedef void (*PsForkmetaBaselineInitTestHook)(void *arg);
 typedef void (*PsAdmissionReadTestHook)(void *arg);
 typedef void (*PsLifecycleReadTestHook)(void *arg);
 typedef void (*PsTierUploadBeforePublishTestHook)(void *arg);
@@ -155,6 +184,12 @@ typedef void (*PsAdmissionWriteQueuedTestHook)(void *arg);
 typedef int (*PsLifecycleWriteLockTestHook)(pthread_rwlock_t *lock, void *arg);
 extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
+extern void ps_test_set_forkmeta_post_gc_hook(
+	PsForkmetaPostGcTestHook hook, void *arg);
+extern void ps_test_set_forkmeta_observation_force_hook(
+	PsForkmetaObservationForceTestHook hook, void *arg);
+extern void ps_test_set_forkmeta_baseline_init_hook(
+	PsForkmetaBaselineInitTestHook hook, void *arg);
 extern void ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook,
 	void *arg);
 extern void ps_test_set_lifecycle_read_hook(PsLifecycleReadTestHook hook,
@@ -185,8 +220,9 @@ extern int ps_test_wal_reclaim_maintenance(void);
 extern int ps_test_wal_retained_base(uint32_t timeline, uint64_t *base_out);
 extern int ps_test_walidx_frontier_exception_active(uint32_t timeline,
 	uint64_t lsn);
-/* Test-only scheduling seam for a pending forkmeta snapshot GC retry. */
+/* Test-only scheduling seam for pending forkmeta GC/snapshot retries. */
 extern void ps_test_forkmeta_snapshot_gc_retry_now(void);
+extern int ps_test_forkmeta_canonical_gc_ambiguous(void);
 
 /* Read-path source counts: served from memtable / image layer / segment. */
 extern void ps_core_read_stats(uint64_t *mem, uint64_t *layer, uint64_t *seg);
