@@ -5839,6 +5839,7 @@ forkmeta_reclaim_lag_bytes(void)
 	int source_debt_enabled;
 	int scan_rc;
 	int observation_overflow;
+	int durability_ambiguous;
 	uint64_t serviceable_lag;
 	uint64_t source_baseline;
 
@@ -5861,6 +5862,11 @@ forkmeta_reclaim_lag_bytes(void)
 	 * maintenance and the request path. */
 	if (ps_admission_write_lock() != 0)
 		return UINT64_MAX;
+	/* An unlink followed by a failed directory fsync is durability-ambiguous:
+	 * retain the normal metadata scan so any other GC class is still queued,
+	 * then override the resulting admission debt below until reconciliation. */
+	durability_ambiguous = fork_meta_temp_gc_ambiguous ||
+		fork_meta_canonical_gc_ambiguous || fork_meta_snapshot_gc_ambiguous;
 	memset(&expected, 0, sizeof(expected));
 	expected.generation = fork_meta_snapshot_generation;
 	expected.cutoff_lsn = fork_meta_snapshot_cutoff_lsn;
@@ -5915,12 +5921,15 @@ forkmeta_reclaim_lag_bytes(void)
 		else
 			serviceable_lag += observation.cutoff_dependent_bytes;
 	}
+	if (durability_ambiguous)
+		serviceable_lag = UINT64_MAX;
 	__atomic_store_n(&fork_meta_serviceable_work_due,
-					 !observation_overflow && serviceable_lag != 0,
+					 !observation_overflow && serviceable_lag != 0 &&
+					 !durability_ambiguous,
 					 __ATOMIC_RELEASE);
 	__atomic_store_n(&fork_meta_gc_serviceable_work_due,
 					 observation.gc_temp_bytes != 0 ||
-					 observation.gc_temp_gc_due,
+					 observation.gc_temp_gc_due || durability_ambiguous,
 					 __ATOMIC_RELEASE);
 	if (observation.gc_temp_bytes != 0 || observation.gc_temp_gc_due)
 	{
@@ -5978,10 +5987,12 @@ forkmeta_reclaim_lag_bytes(void)
 		 * Temp GC normally drains temp-only overflow first; the sticky latch
 		 * prevents an unknown suffix from causing repeated publications. */
 		__atomic_store_n(&fork_meta_overflow_cutover_due, 1, __ATOMIC_RELEASE);
-	__atomic_store_n(&fork_meta_observation_error, observation_overflow,
+	__atomic_store_n(&fork_meta_observation_error,
+					 observation_overflow || durability_ambiguous,
 					 __ATOMIC_RELEASE);
 	ps_admission_write_unlock();
-	return observation_overflow ? UINT64_MAX : serviceable_lag;
+	return observation_overflow || durability_ambiguous ? UINT64_MAX :
+		serviceable_lag;
 }
 
 
@@ -7232,6 +7243,13 @@ fork_meta_canonical_gc_probe_due(void)
 }
 
 static int
+fork_meta_gc_durability_ambiguous(void)
+{
+	return fork_meta_temp_gc_ambiguous ||
+		fork_meta_canonical_gc_ambiguous || fork_meta_snapshot_gc_ambiguous;
+}
+
+static int
 fork_meta_snapshot_gc_due(void)
 {
 	return fork_meta_snapshot_gc_pending && fork_meta_snapshot_retry_due();
@@ -7256,6 +7274,8 @@ fork_meta_snapshot_due_locked(void)
 		fork_meta_snapshot_bytes <= UINT64_MAX / 2 &&
 		fork_meta_snapshot_bytes * 2 > threshold)
 		threshold = fork_meta_snapshot_bytes * 2;
+	if (fork_meta_gc_durability_ambiguous())
+		return 0;
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
@@ -7286,6 +7306,8 @@ fork_meta_snapshot_due(void)
 		fork_meta_snapshot_bytes <= UINT64_MAX / 2 &&
 		fork_meta_snapshot_bytes * 2 > threshold)
 		threshold = fork_meta_snapshot_bytes * 2;
+	if (fork_meta_gc_durability_ambiguous())
+		return 0;
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
 	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
@@ -7381,12 +7403,20 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 		if (gc < 0)
 		{
 			if (gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS)
+			{
 				fork_meta_snapshot_gc_ambiguous = 1;
+				forkmeta_observation_force_now();
+			}
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
 			fork_meta_snapshot_retry_at.tv_sec++;
 			return 0;
 		}
 	}
+	/* A failed GC directory fsync is a hard barrier for every new snapshot,
+	 * including deletion-forced cutovers.  The pending GC retry above remains
+	 * serviceable and is the only path allowed to clear this barrier. */
+	if (fork_meta_gc_durability_ambiguous())
+		return 0;
 	force_deleting = fork_meta_deletion_cutover_due_locked();
 	overflow_cutover =
 		__atomic_load_n(&fork_meta_overflow_cutover_due, __ATOMIC_ACQUIRE) &&
@@ -15292,9 +15322,14 @@ ps_core_maintenance_impl(void)
 		else
 		{
 			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
-						 __ATOMIC_RELEASE);
-			fork_meta_temp_gc_ambiguous =
+							 __ATOMIC_RELEASE);
+			/* Once an unlink/fsync result is ambiguous, a later ordinary
+			 * retry failure cannot reconcile it.  Preserve the latch until a
+			 * successful (nonnegative) GC result reaches the branch above. */
+			fork_meta_temp_gc_ambiguous = was_ambiguous ||
 				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+			if (fork_meta_temp_gc_ambiguous)
+				forkmeta_observation_force_now();
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_temp_gc_retry_at);
 			fork_meta_temp_gc_retry_at.tv_sec++;
 		}
@@ -15344,9 +15379,13 @@ ps_core_maintenance_impl(void)
 		else
 		{
 			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 1,
-						 __ATOMIC_RELEASE);
-			fork_meta_canonical_gc_ambiguous =
+							 __ATOMIC_RELEASE);
+			/* A normal retry error supplies no durability evidence.  Keep an
+			 * existing ambiguity hard gate until a successful GC/fsync retry. */
+			fork_meta_canonical_gc_ambiguous = was_ambiguous ||
 				gc == PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS;
+			if (fork_meta_canonical_gc_ambiguous)
+				forkmeta_observation_force_now();
 			clock_gettime(CLOCK_MONOTONIC, &fork_meta_canonical_gc_retry_at);
 			fork_meta_canonical_gc_retry_at.tv_sec++;
 		}

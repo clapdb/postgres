@@ -865,6 +865,37 @@ create_test_branch(uint32_t timeline, uint32_t parent, uint64_t branch_lsn)
 }
 
 static int
+begin_delete_test(uint32_t timeline)
+{
+	PsChannel ch;
+	PsTimelineState state;
+	uint64_t incarnation;
+	int lifecycle_locked;
+
+	if (!ps_timeline_state(timeline, &state, &incarnation) ||
+		state != PS_TIMELINE_LIVE || incarnation == 0)
+		return 0;
+	memset(&ch, 0, sizeof(ch));
+	ch.opcode = PS_OP_BEGIN_DELETE;
+	ch.timeline = timeline;
+	ch.req_seq = incarnation;
+	ch.status = PS_STATUS_OK;
+	lifecycle_locked = ps_lifecycle_write_lock() == 0;
+	if (!lifecycle_locked || ps_admission_write_lock() != 0)
+	{
+		if (lifecycle_locked)
+			ps_lifecycle_write_unlock();
+		return 0;
+	}
+	ps_lock_map_wr();
+	(void) ps_handle_meta(&ch);
+	ps_unlock_map();
+	ps_admission_write_unlock();
+	ps_lifecycle_write_unlock();
+	return ch.status == PS_STATUS_OK && ch.result == PS_TIMELINE_DELETING;
+}
+
+static int
 append_test_walidx_tail(uint32_t timeline, uint64_t progress)
 {
 	PsChannel ch;
@@ -1239,6 +1270,9 @@ test_forkmeta_backpressure_observer(void)
 			ps_core_maintenance() == 0 && access(temporary, F_OK) != 0 &&
 			unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
 				"temp GC keeps a pending retry after post-unlink fsync ambiguity");
+	check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+			metrics.forkmeta_backpressure.throttled != 0,
+				"temporary GC fsync ambiguity keeps forkmeta admission fail-closed");
 	ps_test_forkmeta_snapshot_gc_retry_now();
 	check(ps_core_maintenance() == 1 &&
 			metrics.forkmeta_backpressure.lag_bytes == 0,
@@ -2099,7 +2133,21 @@ test_forkmeta_self_recovery(void)
 				  access(old_tail, F_OK) != 0 &&
 				  ps_test_forkmeta_canonical_gc_ambiguous() != 0 &&
 				  unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
-					  "canonical GC retains pending ambiguity after post-unlink fsync fault");
+				  "canonical GC retains pending ambiguity after post-unlink fsync fault");
+		check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+				  metrics.forkmeta_backpressure.throttled != 0,
+				  "canonical GC fsync ambiguity keeps forkmeta admission fail-closed");
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR", "1", 1) == 0,
+				  "arm an ordinary canonical GC retry failure");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		(void) ps_core_maintenance();
+		check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") == 0,
+				  "disarm the ordinary canonical GC retry failure");
+		ps_backpressure_refresh();
+		check(ps_test_forkmeta_canonical_gc_ambiguous() != 0 &&
+				  metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+				  metrics.forkmeta_backpressure.throttled != 0,
+				  "ordinary canonical retry failure preserves ambiguity and its gate");
 		ps_test_forkmeta_snapshot_gc_retry_now();
 		check(ps_core_maintenance() == 1 &&
 				  ps_test_forkmeta_canonical_gc_ambiguous() == 0,
@@ -2307,6 +2355,79 @@ test_forkmeta_self_recovery(void)
 					32, 20) == 0,
 				  "restore forkmeta thresholds after ambiguity-retry test");
 		ps_backpressure_refresh();
+	}
+	{
+		PsKey delete_key = {44, 44, 44, 0, PS_KLASS_RELATION};
+
+		/* A zero-byte temp is still owned by the probe even though it contributes
+		 * no byte debt.  Make a deleting owner arm its forced cutover, then inject
+		 * the POSIX unlink/fsync ambiguity in that probe. */
+		check(create_test_branch(2, 0, 3000),
+			  "create a forkmeta owner for deletion-driven cutover");
+		memset(&channel, 0, sizeof(channel));
+		channel.opcode = PS_OP_CREATE;
+		channel.timeline = 2;
+		channel.key = delete_key;
+		channel.req_lsn = 3000;
+		check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+			  begin_delete_test(2),
+			  "put the forkmeta owner into durable deletion");
+		check(snprintf(temporary, sizeof(temporary),
+					   "%s/forkmeta_tail_v1_%020llu.tmp.226.1", snapshots,
+					   (unsigned long long) selected_generation) >= 0 &&
+				  write_test_file(temporary, 0),
+				  "create zero-length temp probe debris");
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			  ps_test_forkmeta_serviceable_work_due() == 0 &&
+			  access(temporary, F_OK) == 0,
+			  "zero-length temp remains probe-only before deletion cutover");
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC", "1", 1) == 0,
+			  "arm zero-length probe fsync failure");
+		(void) ps_core_maintenance();
+		check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_GC_FSYNC") == 0,
+			  "disarm zero-length probe fsync failure");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(cutover_attempts.calls == 0 && access(temporary, F_OK) != 0,
+			  "zero-length probe unlinks but blocks deletion cutover on ambiguity");
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+			  metrics.forkmeta_backpressure.throttled != 0,
+			  "zero-length probe ambiguity keeps admission fail-closed");
+		check(setenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR", "1", 1) == 0,
+			  "arm an ordinary temp GC retry failure");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		(void) ps_core_maintenance();
+		check(unsetenv("PAGESTORE_TEST_FAIL_FORKMETA_CLOSEDIR") == 0,
+			  "disarm the ordinary temp GC retry failure");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		ps_backpressure_refresh();
+		check(cutover_attempts.calls == 0 &&
+			  metrics.forkmeta_backpressure.lag_bytes == UINT64_MAX &&
+			  metrics.forkmeta_backpressure.throttled != 0,
+			  "ordinary temp retry failure preserves ambiguity and blocks cutover");
+		ps_test_forkmeta_snapshot_gc_retry_now();
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		check(ps_core_maintenance() == 1 && cutover_attempts.calls == 0,
+			  "successful empty fsync retry clears ambiguity before cutover");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		ps_backpressure_refresh();
+		check(metrics.forkmeta_backpressure.lag_bytes == 0,
+			  "empty fsync retry reconciles zero-length probe debt");
+		cutover_attempts.calls = 0;
+		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
+									  &cutover_attempts);
+		check(ps_core_maintenance() == 1 && cutover_attempts.calls == 1,
+			  "deletion cutover runs only after empty fsync reconciliation");
+		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
 	}
 	{
 		const unsigned int startup_gc_entries = 257;
