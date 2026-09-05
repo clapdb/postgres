@@ -1232,6 +1232,62 @@ test_forkmeta_self_recovery(void)
 		metrics.forkmeta_backpressure.lag_bytes <= 20 &&
 		metrics.forkmeta_backpressure.throttled == 0,
 		"maintenance publishes snapshot/GC and clears forkmeta throttle");
+	{
+		const uint64_t pin_seq_a = 1;
+		const uint64_t pin_seq_b = 2;
+		PsRetentionPin active_pin;
+		PsRetentionPin retained_pin;
+		PsChannel pin_channel;
+
+		/* Root compaction has advanced past LSN 1001.  Seed the already-active
+		 * reader fence that protects (1001, A), then verify that (1001, B) has no
+		 * independent frontier proof before exercising the owner exception. */
+		memset(&active_pin, 0, sizeof(active_pin));
+		active_pin.timeline = 0;
+		active_pin.owner_kind = PS_RETENTION_OWNER_READER;
+		active_pin.owner_id = 19003;
+		active_pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+		active_pin.generation = 1;
+		active_pin.lsn = 1001;
+		active_pin.admission_seq = pin_seq_a;
+		check(ps_retention_set(&active_pin) == PS_RETENTION_OK,
+				"seed a lower same-LSN active page-history fence");
+		memset(&pin_channel, 0, sizeof(pin_channel));
+		pin_channel.opcode = PS_OP_EXISTS;
+		pin_channel.timeline = active_pin.timeline;
+		pin_channel.key = key;
+		pin_channel.req_lsn = active_pin.lsn;
+		pin_channel.req_seq = pin_seq_b;
+		pin_channel.status = PS_STATUS_OK;
+		check(ps_handle_meta(&pin_channel) == 1 &&
+				pin_channel.status == PS_STATUS_ERROR,
+				"newer same-LSN fence lacks independent frontier proof");
+		memset(&pin_channel, 0, sizeof(pin_channel));
+		pin_channel.opcode = PS_OP_RETENTION_PIN_SET;
+		pin_channel.timeline = active_pin.timeline;
+		pin_channel.blocknum = active_pin.owner_kind;
+		pin_channel.parent_timeline = active_pin.resources;
+		pin_channel.old_nblocks = active_pin.generation;
+		pin_channel.req_seq = active_pin.owner_id;
+		pin_channel.req_lsn = active_pin.lsn;
+		pin_channel.nblocks = (uint32_t) pin_seq_b;
+		pin_channel.status = PS_STATUS_OK;
+		check(ps_handle_meta(&pin_channel) == 1 &&
+				pin_channel.status == PS_STATUS_OK,
+				"active lower same-LSN fence permits sequence advancement");
+		pin_channel.nblocks = (uint32_t) pin_seq_a;
+		pin_channel.status = PS_STATUS_OK;
+		check(ps_handle_meta(&pin_channel) == 1 &&
+				pin_channel.status == PS_STATUS_ERROR &&
+				ps_retention_lookup(active_pin.timeline, active_pin.owner_kind,
+					active_pin.owner_id, &retained_pin) == 1 &&
+				retained_pin.lsn == active_pin.lsn &&
+				retained_pin.admission_seq == pin_seq_b,
+				"same-LSN sequence regression still requires frontier proof");
+		check(ps_retention_drop(active_pin.timeline, active_pin.owner_kind,
+				active_pin.owner_id, active_pin.generation) == PS_RETENTION_OK,
+				"drop the same-LSN advancement test owner");
+	}
 	/* The selected generation covers timeline 0, but not a new owner created
 	 * after that cutover.  Metadata-only churn on the new timeline must remain
 	 * admissible until that timeline has a real page-reclamation frontier. */

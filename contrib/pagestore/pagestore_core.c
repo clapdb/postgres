@@ -14201,9 +14201,11 @@ ps_handle_meta(PsChannel *ch)
 							   old_pin.generation == pin.generation &&
 							   old_pin.resources == pin.resources &&
 							   (old_pin.lsn < pin.lsn ||
-								/* An exact retry cannot expose a new fence. */
 								(old_pin.lsn == pin.lsn &&
-								 old_pin.admission_seq == pin.admission_seq)))) ||
+								 /* Same-LSN advancement remains protected by the
+								  * owner's older lexicographic fence; equality is
+								  * an exact retry. */
+								 old_pin.admission_seq <= pin.admission_seq)))) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL) != 0 &&
 							 !wal_allowed) ||
 							((pin.resources & PS_RETENTION_RESOURCE_WAL_INDEX) != 0 &&
