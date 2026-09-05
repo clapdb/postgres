@@ -251,7 +251,7 @@ static void
 reset_controller(PsShmHeader *metrics)
 {
 	/* The previous test's stack header may no longer exist. */
-	ps_core_set_metrics_header(NULL);
+		ps_core_set_metrics_header(NULL);
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 		  "disabled controller configuration is accepted");
 	memset(metrics, 0, sizeof(*metrics));
@@ -1361,6 +1361,9 @@ test_forkmeta_self_recovery(void)
 	{
 		uint64_t old_generation = selected_generation - 1;
 		int overflow_entries_created = 1;
+		int original_renamed = 0;
+		int replacement_created = 0;
+		int isolated_gc_fixture = 0;
 
 		/* Finish any post-publication snapshot GC left by the preceding
 		 * cutover before installing the overflow-only fixture. */
@@ -1564,9 +1567,126 @@ test_forkmeta_self_recovery(void)
 			if (selected_open == 0)
 				ps_forkmeta_snapshot_close(&selected);
 		}
-		/* The first maintenance pass has left snapshot GC pending.  Add a fresh
-		 * overflow before the old residue is reclaimed: the one-shot latch must
-		 * keep this second overflow from publishing another generation. */
+		/* Isolate the nonmutating GC-only assertion from old residue left by the
+		 * first cutover.  Precompute every path before renaming the original so a
+		 * failed setup never leaves a partially named replacement to unwind. */
+		{
+			int paths_ready =
+				snprintf(snapshots_saved, sizeof(snapshots_saved), "%s.saved",
+						 snapshots) >= 0 &&
+				snprintf(snapshots_probe, sizeof(snapshots_probe), "%s.probe",
+						 snapshots) >= 0 &&
+				snprintf(selected_manifest, sizeof(selected_manifest),
+						 "%s/forkmeta_manifest_v1", snapshots_saved) >= 0 &&
+				snprintf(selected_checkpoint, sizeof(selected_checkpoint),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(selected_tail, sizeof(selected_tail),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots_saved,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(manifest, sizeof(manifest), "%s/forkmeta_manifest_v1",
+						 snapshots) >= 0 &&
+				snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0 &&
+				snprintf(temporary, sizeof(temporary),
+						 "%s/forkmeta_tail_v1_%020llu", snapshots,
+						 (unsigned long long) selected_generation) >= 0;
+			int replacement_moved = 0;
+			int original_restored = 1;
+			int replacement_entries_ready = 1;
+
+			if (paths_ready && rename(snapshots, snapshots_saved) == 0)
+				original_renamed = 1;
+			if (original_renamed && mkdir(snapshots, 0700) == 0)
+				replacement_created = 1;
+			if (replacement_created &&
+				link(selected_manifest, manifest) == 0 &&
+				link(selected_checkpoint, canonical) == 0 &&
+				link(selected_tail, temporary) == 0)
+				isolated_gc_fixture = 1;
+			check(isolated_gc_fixture,
+					"isolate nonmutating GC-only fixture from old residue");
+			if (isolated_gc_fixture)
+			{
+				for (unsigned int i = 0; i < 4095; i++)
+				{
+					if (snprintf(canonical, sizeof(canonical),
+								 "%s/forkmeta_checkpoint_v1_%020llu", snapshots,
+								 (unsigned long long) (selected_generation + 1000000 + i)) < 0 ||
+						!write_test_file(canonical, 1))
+						replacement_entries_ready = 0;
+				}
+				check(replacement_entries_ready,
+						"create newer nonreclaimable canonical GC entries");
+			}
+			if (isolated_gc_fixture && replacement_entries_ready)
+			{
+				ForkmetaGenerationAdmissionOrder generation_gc_only = {0};
+				BackpressureSlowPathCounter gc_inspections = {0};
+				BackpressureSlowPathCounter forced_observations = {0};
+				int first_rc;
+				int second_rc;
+
+				/* Pending full GC is the only eligible snapshot work here.  Its
+				 * bounded, nonmutating cursor batch must not allocate a generation. */
+				ps_test_set_forkmeta_snapshot_generation_scan_hook(
+						forkmeta_generation_scan_hook, &generation_gc_only);
+				ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+						count_backpressure_slow_path, &gc_inspections);
+				ps_backpressure_refresh();
+				ps_test_set_forkmeta_observation_force_hook(
+						count_backpressure_slow_path, &forced_observations);
+				ps_test_forkmeta_snapshot_gc_retry_now();
+				first_rc = ps_core_maintenance();
+				ps_test_forkmeta_snapshot_gc_retry_now();
+				second_rc = ps_core_maintenance();
+				ps_test_set_forkmeta_observation_force_hook(NULL, NULL);
+				ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+				ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
+				check(first_rc == 1 && second_rc == 1 &&
+						generation_gc_only.scan_calls == 0,
+						"snapshot GC-only maintenance does not scan generations");
+				check(gc_inspections.calls >= 128 && forced_observations.calls == 0,
+						"pure nonmutating GC cursors do not repeatedly force observation");
+			}
+			/* Always reset hooks before unwinding the temporary directory. */
+			ps_test_set_forkmeta_observation_force_hook(NULL, NULL);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
+
+			if (original_renamed)
+			{
+				if (replacement_created)
+					replacement_moved = rename(snapshots, snapshots_probe) == 0;
+				if (!replacement_moved && replacement_created)
+				{
+					remove_tree(snapshots);
+					replacement_moved = 1;
+				}
+				if (!replacement_created)
+					replacement_moved = 1;
+				if (replacement_moved)
+					original_restored = rename(snapshots_saved, snapshots) == 0;
+				if (original_restored && replacement_created)
+					remove_tree(snapshots_probe);
+				check(original_restored,
+						"restore original residue after isolated GC-only fixture");
+				if (!original_restored)
+				{
+					/* No later assertion is valid with an unknown snapshot root. */
+					ps_core_set_metrics_header(NULL);
+					ps_core_close();
+					ps_storage->close();
+					(void) ps_backpressure_configure(0, 0, 0, 0);
+					remove_tree(store);
+					return;
+				}
+				original_renamed = 0;
+			}
+		}
+		/* Keep the original second-overflow latch regression independent of the
+		 * temporary GC-only replacement above. */
 		for (unsigned int i = 0; i < 4095; i++)
 		{
 			if (snprintf(canonical, sizeof(canonical),
@@ -1577,35 +1697,6 @@ test_forkmeta_self_recovery(void)
 		}
 		check(overflow_entries_created,
 				"create a second canonical overflow while cutover GC is pending");
-		{
-			ForkmetaGenerationAdmissionOrder generation_gc_only = {0};
-			BackpressureSlowPathCounter gc_inspections = {0};
-			BackpressureSlowPathCounter forced_observations = {0};
-			int first_rc;
-			int second_rc;
-
-			/* Pending full GC is the only eligible snapshot work here.  Its
-			 * bounded, nonmutating cursor batch must not allocate a generation. */
-			ps_test_set_forkmeta_snapshot_generation_scan_hook(
-					forkmeta_generation_scan_hook, &generation_gc_only);
-			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
-					count_backpressure_slow_path, &gc_inspections);
-			ps_backpressure_refresh();
-			ps_test_set_forkmeta_observation_force_hook(
-					count_backpressure_slow_path, &forced_observations);
-			ps_test_forkmeta_snapshot_gc_retry_now();
-			first_rc = ps_core_maintenance();
-			ps_test_forkmeta_snapshot_gc_retry_now();
-			second_rc = ps_core_maintenance();
-			ps_test_set_forkmeta_observation_force_hook(NULL, NULL);
-			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
-			ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
-			check(first_rc == 1 && second_rc == 1 &&
-					generation_gc_only.scan_calls == 0,
-					"snapshot GC-only maintenance does not scan generations");
-			check(gc_inspections.calls >= 128 && forced_observations.calls == 0,
-					"pure nonmutating GC cursors do not repeatedly force observation");
-		}
 		ps_backpressure_refresh();
 		for (int i = 0; i < 3; i++)
 		{
