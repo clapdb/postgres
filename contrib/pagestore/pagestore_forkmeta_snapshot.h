@@ -61,6 +61,14 @@ typedef struct PsForkmetaSnapshotExpected
 	PsForkmetaSnapshotPart tail;
 } PsForkmetaSnapshotExpected;
 
+typedef void (*PsForkmetaSnapshotObservationTestHook)(unsigned int attempt,
+															 void *arg);
+
+/* Test-only seam used to change a directory after the first bounded scan and
+ * prove that retry opens a fresh directory stream. */
+extern void ps_test_set_forkmeta_snapshot_observation_hook(
+		PsForkmetaSnapshotObservationTestHook hook, void *arg);
+
 /*
  * MUTATOR SERIALIZATION CONTRACT
  *
@@ -155,15 +163,18 @@ extern int ps_forkmeta_snapshot_read_tail(
  * an empty retry after an ambiguous prior unlink fsync. */
 extern int ps_forkmeta_snapshot_gc(const char *directory);
 #define PS_FORKMETA_SNAPSHOT_GC_DURABILITY_AMBIGUOUS (-2)
-/* Metadata-only physical debt scan.  The source baseline is not charged.
+/* Metadata-only physical debt scan.  The source baseline growth is charged
+ * only when source_debt_enabled is nonzero; when it is zero, source bytes are
+ * observed for identity stability but contribute no reclaimable debt.
  * The selected and prepared manifest records, their file identities, and
  * canonical part lengths are checked before and after a bounded scan.  The
  * immutable payload CRCs are compared as metadata only and never reread on
  * this periodic path. */
 extern int ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
-										const char *source_directory,
-										uint64_t source_baseline,
-										const PsForkmetaSnapshotExpected *expected,
+										 const char *source_directory,
+										 uint64_t source_baseline,
+										 int source_debt_enabled,
+										 const PsForkmetaSnapshotExpected *expected,
 										uint64_t *bytes_out);
 /* Release the stable part descriptors and directory descriptor. */
 extern void ps_forkmeta_snapshot_close(PsForkmetaSnapshot *snapshot);

@@ -52,6 +52,17 @@ typedef struct SnapshotCompareCtx
 	uint64_t offset;
 } SnapshotCompareCtx;
 
+static PsForkmetaSnapshotObservationTestHook observation_test_hook;
+static void *observation_test_hook_arg;
+
+void
+ps_test_set_forkmeta_snapshot_observation_hook(
+		PsForkmetaSnapshotObservationTestHook hook, void *arg)
+{
+	observation_test_hook = hook;
+	observation_test_hook_arg = arg;
+}
+
 static size_t
 io_amount(uint64_t remaining)
 {
@@ -1909,6 +1920,7 @@ int
 ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 										 const char *source_directory,
 										 uint64_t source_baseline,
+										 int source_debt_enabled,
 										 const PsForkmetaSnapshotExpected *expected,
 										 uint64_t *bytes_out)
 {
@@ -1951,8 +1963,26 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 	memset(&manifest_before, 0, sizeof(manifest_before));
 	memset(&manifest_after, 0, sizeof(manifest_after));
 	for (unsigned int attempt = 0; attempt < FORKMETA_OBSERVATION_RETRIES;
-		 attempt++)
+			 attempt++)
 	{
+		/* Do not duplicate the previous scan's open file description: its
+		 * directory offset is shared by dup'd descriptors.  Reopen the trusted
+		 * directory for every retry so a second scan starts at entry zero. */
+		if (snapshot_fd >= 0)
+		{
+			if (close(snapshot_fd) != 0)
+				goto fail;
+			snapshot_fd = -1;
+		}
+		if (forkmeta_directory_path_identity(directory, &snapshot_path_before) != 0)
+			goto fail;
+		if (snapshot_path_before.present)
+		{
+			snapshot_fd = open(directory,
+							 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+			if (snapshot_fd < 0)
+				goto fail;
+		}
 		if (forkmeta_directory_identity(source_fd, &source_dir_before) != 0 ||
 			forkmeta_directory_path_identity(source_directory,
 												&source_path_before) != 0 ||
@@ -1997,10 +2027,12 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 					forkmeta_snapshot_parts_identity(snapshot_fd, &prepared_before,
 															 prepared_parts_before) != 0) ||
 				forkmeta_snapshot_debt_scan(snapshot_fd, expected->generation,
-													 prepared_present_before ?
-													 prepared_before.generation : 0,
-													 &total) != 0)
+														 prepared_present_before ?
+														 prepared_before.generation : 0,
+														 &total) != 0)
 				goto fail;
+			if (observation_test_hook != NULL)
+				observation_test_hook(attempt, observation_test_hook_arg);
 			if (expected->generation == 0)
 			{
 				if (forkmeta_identity_at(snapshot_fd, FORKMETA_SNAPSHOT_MANIFEST,
@@ -2082,7 +2114,7 @@ ps_forkmeta_snapshot_reclaim_bytes(const char *directory,
 
 			if (source_size < source_baseline)
 				goto fail;
-			source_debt = source_size - source_baseline;
+			source_debt = source_debt_enabled ? source_size - source_baseline : 0;
 		}
 		else
 		{

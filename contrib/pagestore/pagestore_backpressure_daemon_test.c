@@ -788,6 +788,7 @@ test_forkmeta_request_classification(const char *daemon_path)
 	char shm_name[64];
 	char store_dir[128];
 	char pause_file[128];
+	char frontier_file[256];
 	PsShmHeader *hdr = NULL;
 	PsChannel *writer = NULL;
 	PsChannel *pending = NULL;
@@ -800,6 +801,8 @@ test_forkmeta_request_classification(const char *daemon_path)
 	snprintf(shm_name, sizeof(shm_name), "/psforkmeta_%d", (int) getpid());
 	snprintf(store_dir, sizeof(store_dir), "/tmp/psforkmeta_store_%d", (int) getpid());
 	snprintf(pause_file, sizeof(pause_file), "/tmp/psforkmeta_pause_%d", (int) getpid());
+	snprintf(frontier_file, sizeof(frontier_file), "%s/page-prune.frontiers",
+			 store_dir);
 	shm_unlink(shm_name);
 	unlink(pause_file);
 	{
@@ -845,6 +848,41 @@ test_forkmeta_request_classification(const char *daemon_path)
 		check(writer->status == PS_STATUS_OK,
 				"forkmeta classification seeds source growth");
 	}
+	/* Give the forkmeta records a real page-reclamation frontier.  Without this
+	 * fixture, source growth is intentionally not reclaimable debt. */
+	for (uint32_t block = 0; block < 5; block++)
+	{
+		for (uint32_t version = 0; version < 2; version++)
+		{
+			set_relation_key(writer, 5000);
+			writer->opcode = PS_OP_WRITEV;
+			writer->blocknum = block;
+			writer->nblocks = 1;
+			fill_page(writer->data, 8192,
+					  (unsigned char) (20 + block * 2 + version));
+			submit_and_wait(writer);
+			check(writer->status == PS_STATUS_OK,
+					"forkmeta classification seeds a page frontier");
+		}
+	}
+	set_relation_key(writer, 5000);
+	writer->opcode = PS_OP_RETENTION_PIN_RESERVE;
+	writer->blocknum = PS_RETENTION_OWNER_CONFIGURED;
+	writer->parent_timeline = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	writer->old_nblocks = 1;
+	writer->req_seq = 19002;
+	writer->req_lsn = 2000;
+	submit_and_wait(writer);
+	check(writer->status == PS_STATUS_OK,
+			"forkmeta classification pins the page compaction frontier");
+	unlink(pause_file);
+	for (int i = 0; i < 5000 && access(frontier_file, F_OK) != 0; i++)
+		sleep_ms(1);
+	pause_fd = open(pause_file, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	check(access(frontier_file, F_OK) == 0 && pause_fd >= 0,
+			"forkmeta classification establishes a durable page frontier");
+	if (pause_fd >= 0)
+		close(pause_fd);
 	for (int i = 0; i < 500; i++)
 	{
 		if (ps_load_acquire(&hdr->forkmeta_backpressure.throttled) != 0)

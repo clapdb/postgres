@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "pagestore_core.h"
+#include "pagestore_forkmeta_snapshot.h"
 #include "pagestore_retention.h"
 
 static int checks;
@@ -61,6 +62,12 @@ count_backpressure_slow_path(void *arg)
 	BackpressureSlowPathCounter *counter = arg;
 
 	counter->calls++;
+}
+
+static void
+remove_forkmeta_source(void *arg)
+{
+	(void) unlink((const char *) arg);
 }
 
 static void
@@ -755,7 +762,7 @@ test_forkmeta_backpressure_observer(void)
 	configure_page_core();
 	memset(&metrics, 0, sizeof(metrics));
 	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
-																						180, 20) == 0 &&
+																				128, 20) == 0 &&
 			mkdtemp(store) != NULL && ps_core_open(store) == 0,
 				"open a store for forkmeta backpressure observation");
 	ps_core_set_metrics_header(&metrics);
@@ -763,18 +770,38 @@ test_forkmeta_backpressure_observer(void)
 			stat(source, &before) == 0,
 			"locate the stable forkmeta source baseline");
 	ps_backpressure_refresh();
-	check(metrics.forkmeta_backpressure.lag_bytes == (uint64_t) before.st_size &&
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
 			metrics.forkmeta_backpressure.throttled == 0,
-			"conservative pre-snapshot source history remains charged as debt");
+			"migration marker prefix is not reclaimable source debt");
 
 	memset(&channel, 0, sizeof(channel));
 	channel.opcode = PS_OP_CREATE;
 	channel.timeline = 0;
 	channel.key = (PsKey) {11, 11, 11, 0, PS_KLASS_RELATION};
 	channel.req_lsn = 100;
-	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
+		check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK &&
 			stat(source, &after) == 0,
 			"append a forkmeta growth event after the baseline");
+	channel.opcode = PS_OP_CREATE;
+	channel.key = (PsKey) {12, 12, 12, 0, PS_KLASS_RELATION};
+	channel.req_lsn = 150;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"metadata-only create churn is admitted without a frontier");
+	channel.opcode = PS_OP_ZEROEXTEND;
+	channel.blocknum = 0;
+	channel.nblocks = 1;
+	channel.req_lsn = 200;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"metadata-only zero-extend churn is admitted without a frontier");
+	channel.opcode = PS_OP_UNLINK;
+	channel.key = (PsKey) {11, 11, 11, 0, PS_KLASS_RELATION};
+	channel.req_lsn = 300;
+	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
+			"metadata-only unlink churn is admitted without a frontier");
+	ps_backpressure_refresh();
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"metadata-only churn does not deadlock without a safe frontier");
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
 	ps_storage->close();
@@ -783,9 +810,12 @@ test_forkmeta_backpressure_observer(void)
 			"restart before the first selected snapshot");
 	ps_core_set_metrics_header(&metrics);
 	ps_backpressure_refresh();
-	check(metrics.forkmeta_backpressure.lag_bytes >= (uint64_t) after.st_size &&
-			metrics.forkmeta_backpressure.throttled != 0,
-			"restart conservatively charges preexisting unselected source history");
+	check(metrics.forkmeta_backpressure.lag_bytes == 0 &&
+			metrics.forkmeta_backpressure.throttled == 0,
+			"restart does not charge source history without a safe frontier");
+	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
+																				20, 10) == 0,
+			"lower forkmeta threshold for physical-debris admission test");
 	check(snprintf(snapshots, sizeof(snapshots), "%s/forkmeta_snapshots", store) >= 0 &&
 			mkdir(snapshots, 0700) == 0 &&
 		snprintf(old_checkpoint, sizeof(old_checkpoint),
@@ -796,7 +826,7 @@ test_forkmeta_backpressure_observer(void)
 				 snapshots) >= 0 && write_test_file(old_checkpoint, 11) &&
 			write_test_file(old_tail, 13) && write_test_file(temporary, 7),
 			"create obsolete forkmeta generations and temporary debris");
-	expected = (uint64_t) after.st_size + 11 + 13 + 7;
+	expected = 11 + 13 + 7;
 	ps_backpressure_refresh();
 	check(metrics.forkmeta_backpressure.lag_bytes == expected &&
 			metrics.forkmeta_backpressure.throttled != 0,
@@ -839,6 +869,9 @@ test_forkmeta_self_recovery(void)
 {
 	char store[] = "/tmp/pagestore-forkmeta-self-recovery-XXXXXX";
 	char manifest[1200];
+	char source[1200];
+	struct stat source_before;
+	struct stat source_after;
 	PsShmHeader metrics;
 	PsChannel channel;
 	PsRetentionPin pin;
@@ -846,11 +879,12 @@ test_forkmeta_self_recovery(void)
 	unsigned char page[8192];
 	uint64_t page_admission_seq = 0;
 	int did = 0;
+	int reopen_rc;
 
 	configure_page_core();
 	compact_layers = 0;
 	check(ps_backpressure_configure_all_with_forkmeta(0, 0, 0, 0, 0, 0,
-			180, 20) == 0 &&
+			32, 20) == 0 &&
 			mkdtemp(store) != NULL && ps_core_open(store) == 0,
 			"open a store for forkmeta self-recovery");
 	memset(&metrics, 0, sizeof(metrics));
@@ -882,6 +916,9 @@ test_forkmeta_self_recovery(void)
 	check(ps_core_open(store) == 0,
 			"reopen with flushed page layers before maintenance recovery");
 	ps_core_set_metrics_header(&metrics);
+	check(snprintf(source, sizeof(source), "%s/forkmeta", store) >= 0 &&
+			stat(source, &source_before) == 0,
+			"locate migration-marker baseline after restart");
 	for (int i = 0; i < 8; i++)
 		(void) ps_core_maintenance();
 	memset(&channel, 0, sizeof(channel));
@@ -892,9 +929,12 @@ test_forkmeta_self_recovery(void)
 	check(ps_handle_meta(&channel) == 1 && channel.status == PS_STATUS_OK,
 			"seed forkmeta lifecycle history after a safe page frontier exists");
 	ps_backpressure_refresh();
-	check(metrics.forkmeta_backpressure.lag_bytes >= 180 &&
+	check(stat(source, &source_after) == 0 &&
+			source_after.st_size > source_before.st_size &&
+			metrics.forkmeta_backpressure.lag_bytes ==
+			(uint64_t) (source_after.st_size - source_before.st_size) &&
 			metrics.forkmeta_backpressure.throttled != 0,
-			"forkmeta debt throttles below the geometric trigger");
+			"restart excludes migration prefix but charges frontier-covered history");
 	check(snprintf(manifest, sizeof(manifest), "%s/forkmeta_snapshots/forkmeta_manifest_v1",
 				store) >= 0,
 			"build the forkmeta self-recovery manifest path");
@@ -911,9 +951,17 @@ test_forkmeta_self_recovery(void)
 	check(did && access(manifest, F_OK) == 0 &&
 		metrics.forkmeta_backpressure.lag_bytes <= 20 &&
 		metrics.forkmeta_backpressure.throttled == 0,
-			"maintenance publishes snapshot/GC and clears forkmeta throttle");
+		"maintenance publishes snapshot/GC and clears forkmeta throttle");
 	ps_core_set_metrics_header(NULL);
 	ps_core_close();
+	ps_storage->close();
+	check(unlink(source) == 0,
+			"remove selected snapshot source for baseline-init fixture");
+	ps_test_set_forkmeta_baseline_init_hook(remove_forkmeta_source, source);
+	reopen_rc = ps_core_open(store);
+	ps_test_set_forkmeta_baseline_init_hook(NULL, NULL);
+	check(reopen_rc != 0,
+			"selected snapshot with missing source fails closed on restart");
 	ps_storage->close();
 	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
 			"disable forkmeta backpressure after self-recovery test");

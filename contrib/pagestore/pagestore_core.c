@@ -203,6 +203,8 @@ static uint32_t admission_waiting_writers;
 static int admission_writer_active;
 static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
+static PsForkmetaBaselineInitTestHook forkmeta_baseline_init_test_hook;
+static void *forkmeta_baseline_init_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
 static void *admission_read_test_hook_arg;
 static PsLifecycleReadTestHook lifecycle_read_test_hook;
@@ -1000,6 +1002,14 @@ ps_test_set_forkmeta_cutover_hook(PsForkmetaCutoverTestHook hook, void *arg)
 {
 	forkmeta_cutover_test_hook = hook;
 	forkmeta_cutover_test_hook_arg = arg;
+}
+
+void
+ps_test_set_forkmeta_baseline_init_hook(PsForkmetaBaselineInitTestHook hook,
+											 void *arg)
+{
+	forkmeta_baseline_init_test_hook = hook;
+	forkmeta_baseline_init_test_hook_arg = arg;
 }
 
 void
@@ -5547,10 +5557,13 @@ static uint64_t fork_meta_snapshot_freeze_seq;
  * recovery and advanced only after a durable source rewrite. */
 static uint64_t fork_meta_reclaim_baseline_bytes;
 static int fork_meta_reclaim_baseline_valid;
+static uint64_t fork_meta_irreducible_prefix_bytes;
 static int fork_meta_event_future(uint64_t lsn, uint64_t admission_seq,
 							  uint64_t cutoff_lsn, uint64_t cutoff_seq);
+static int fork_meta_migration_marker_valid(const ForkMetaRecV2 *rec);
 static int fork_meta_snapshot_marker_matches(const ForkMetaRecV2 *rec);
 static int fork_meta_selected_suffix_valid(const ForkMetaRecV2 *rec);
+static int fork_meta_source_cutoff_provable(void);
 
 static int
 fork_meta_mutation_future(uint64_t lsn, uint64_t admission_seq)
@@ -5650,31 +5663,55 @@ static int fork_meta_snapshot_gc_ambiguous;
 static struct timespec fork_meta_snapshot_retry_at;
 static char fork_meta_snapshot_dir[4096];
 
-/* The baseline is deliberately conservative across restart.  There is no
- * persisted source-length marker in the v1 snapshot manifest, so reopening
- * with a zero baseline charges all preexisting source bytes until the next
- * durable rewrite.  This can throttle after restart, but cannot silently
- * forgive arbitrarily large history. */
+/* The baseline is deliberately conservative across restart.  Before the first
+ * selected snapshot only the strictly validated migration-marker prefix is
+ * irreducible.  Once a selected snapshot exists, its source epoch marker is
+ * the only persisted compacted baseline; every suffix record is conservatively
+ * reclaimable source debt until a durable rewrite advances that baseline. */
 static int
 fork_meta_reclaim_baseline_init(void)
 {
+	ForkMetaRecV2 marker;
 	struct stat st;
 	int directory_fd;
+	int source_present = 0;
 	int rc = 0;
 
+	memset(&st, 0, sizeof(st));
+	if (forkmeta_baseline_init_test_hook != NULL)
+		forkmeta_baseline_init_test_hook(forkmeta_baseline_init_test_hook_arg);
 	directory_fd = open(wal_segment_root,
 						O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (directory_fd < 0)
 		return -1;
 	if (fstatat(directory_fd, "forkmeta", &st, AT_SYMLINK_NOFOLLOW) != 0)
-		rc = errno == ENOENT ? 0 : -1;
+	{
+		if (errno != ENOENT)
+			rc = -1;
+	}
 	else if (!S_ISREG(st.st_mode) || st.st_size < 0)
 		rc = -1;
+	else
+		source_present = 1;
 	if (close(directory_fd) != 0)
 		rc = -1;
 	if (rc != 0)
 		return -1;
-	fork_meta_reclaim_baseline_bytes = 0;
+	if (fork_meta_snapshot_generation != 0)
+	{
+		if (!source_present || st.st_size < (off_t) sizeof(marker) ||
+			ps_storage->fork_meta_read == NULL ||
+			ps_storage->fork_meta_read(0, &marker, sizeof(marker)) !=
+			(int) sizeof(marker) || !fork_meta_snapshot_marker_matches(&marker))
+			return -1;
+		fork_meta_reclaim_baseline_bytes = sizeof(marker);
+	}
+	else
+	{
+		if (!source_present && fork_meta_irreducible_prefix_bytes != 0)
+			return -1;
+		fork_meta_reclaim_baseline_bytes = fork_meta_irreducible_prefix_bytes;
+	}
 	fork_meta_reclaim_baseline_valid = 1;
 	return 0;
 }
@@ -5698,6 +5735,7 @@ forkmeta_reclaim_lag_bytes(void)
 	if (ps_forkmeta_snapshot_reclaim_bytes(fork_meta_snapshot_dir,
 										wal_segment_root,
 										fork_meta_reclaim_baseline_bytes,
+										fork_meta_source_cutoff_provable(),
 										&expected, &debt) != 0)
 		return UINT64_MAX;
 	return debt;
@@ -6163,6 +6201,8 @@ load_fork_meta(void)
 	int			have_records = 0;
 	int			nread = 0;
 	uint64_t	record_number = 0;
+	uint64_t	migration_prefix_bytes = 0;
+	int			migration_prefix_valid = 1;
 
 	for (;;)
 	{
@@ -6227,6 +6267,11 @@ load_fork_meta(void)
 				}
 			}
 		}
+		if (migration_prefix_valid &&
+			fork_meta_migration_marker_valid(&rec))
+			migration_prefix_bytes += rec_size;
+		else
+			migration_prefix_valid = 0;
 		have_records = 1;
 		if (fork_meta_snapshot_generation != 0)
 			if ((record_number == 0 && !fork_meta_snapshot_marker_matches(&rec)) ||
@@ -6275,6 +6320,10 @@ load_fork_meta(void)
 	if (nread < 0 && off != 0)
 		return -1;
 	fork_meta_bytes_store(off);
+	/* Keep the proof accumulated before the first ordinary record.  A later
+	 * MIGRATED seal is not part of that proof unless it was itself contiguous
+	 * with the strictly validated marker prefix. */
+	fork_meta_irreducible_prefix_bytes = migration_prefix_bytes;
 	/*
 	 * Only an absent/empty log is unambiguously a pre-fork-events store.  A
 	 * nonempty log without either marker was written by the immediately
@@ -6297,7 +6346,10 @@ load_fork_meta(void)
 			return -1;
 		}
 		else
+		{
 			fork_meta_migrating = 1;
+			fork_meta_irreducible_prefix_bytes = sizeof(ForkMetaRecV2);
+		}
 		fork_meta_legacy = 1;
 	}
 	else
@@ -6468,6 +6520,31 @@ fork_meta_snapshot_cutoff(PsPruneFence *cutoff_out, int filter_deleting,
 	return 0;
 }
 
+/* Source growth is reclaimable only when the current compactor can name an
+ * operational page/forkmeta cutoff.  A migration marker prefix alone is not
+ * such a cutoff and must never make metadata churn throttle. */
+static int
+fork_meta_source_cutoff_provable(void)
+{
+	PsPruneFence cutoff;
+	int rc;
+
+	if (!map_locks_ready)
+		return 0;
+	if (fork_meta_snapshot_generation != 0 &&
+		fork_meta_snapshot_cutoff_lsn != 0 &&
+		fork_meta_snapshot_cutoff_seq != 0)
+		return 1;
+	for (uint32_t sh = 0; sh < core_shards(); sh++)
+		ps_lock_shard_rd(sh);
+	ps_lock_map_rd();
+	rc = fork_meta_snapshot_cutoff(&cutoff, 0, 0);
+	ps_unlock_map();
+	for (uint32_t sh = core_shards(); sh > 0; sh--)
+		ps_unlock_shard(sh - 1);
+	return rc == 0;
+}
+
 static int
 fork_meta_snapshot_marker_present(const ForkMetaRecV2 *rec)
 {
@@ -6614,6 +6691,20 @@ fork_meta_snapshot_append_source_markers(ForkMetaByteVec *checkpoint,
 			}
 		}
 	}
+}
+
+static int
+fork_meta_migration_marker_valid(const ForkMetaRecV2 *rec)
+{
+	PsKey zero_key;
+
+	memset(&zero_key, 0, sizeof(zero_key));
+	return rec->magic == FORK_META_V2_MAGIC &&
+		rec->rec_len == sizeof(*rec) && rec->timeline == 0 &&
+		key_eq(&rec->key, &zero_key) && rec->lsn == 0 &&
+		rec->admission_seq == 0 && rec->order_id == 0 && rec->nblocks == 0 &&
+		(rec->kind == FEV_MIGRATING || rec->kind == FEV_MIGRATED) &&
+		rec->pad[0] == 0 && rec->pad[1] == 0 && rec->pad[2] == 0;
 }
 
 static int
@@ -6920,6 +7011,9 @@ fork_meta_snapshot_maintenance(void)
 			fork_meta_snapshot_gc_ambiguous = 0;
 			memset(&fork_meta_snapshot_retry_at, 0,
 				   sizeof(fork_meta_snapshot_retry_at));
+			/* Let the outer maintenance cycle refresh backpressure before it
+			 * considers another forced snapshot. */
+			return 1;
 		}
 		if (gc < 0)
 		{
@@ -15025,6 +15119,7 @@ ps_core_open(const char *store_dir)
 		   sizeof(fork_meta_snapshot_tail_meta));
 	fork_meta_reclaim_baseline_bytes = 0;
 	fork_meta_reclaim_baseline_valid = 0;
+	fork_meta_irreducible_prefix_bytes = 0;
 	fork_meta_snapshot_bytes = 0;
 	fork_meta_snapshot_gc_pending = 0;
 	fork_meta_snapshot_gc_ambiguous = 0;
@@ -15318,6 +15413,7 @@ ps_core_open(const char *store_dir)
 			fprintf(stderr, "pagestore: could not seal the fork-meta migration\n");
 			return -1;
 		}
+		fork_meta_irreducible_prefix_bytes += sizeof(ForkMetaRecV2);
 	}
 
 	/* rebuild each timeline's shipped-WAL end LSN from its log */

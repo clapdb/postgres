@@ -123,6 +123,37 @@ prepared_path(const char *directory, char *path, size_t path_len)
 }
 
 static int
+path_suffix(const char *base, const char *suffix, char *path, size_t path_len)
+{
+	size_t base_len = strlen(base);
+	size_t suffix_len = strlen(suffix);
+
+	if (base_len >= path_len || suffix_len > path_len - base_len - 1)
+		return -1;
+	memcpy(path, base, base_len);
+	memcpy(path + base_len, suffix, suffix_len + 1);
+	return 0;
+}
+
+typedef struct ObservationRetryTest
+{
+	char debris[1200];
+	unsigned int calls;
+} ObservationRetryTest;
+
+static void
+observation_retry_hook(unsigned int attempt, void *arg)
+{
+	ObservationRetryTest *test = arg;
+
+	if (attempt == 0)
+	{
+		test->calls++;
+		(void) write_file(test->debris, "retry-debris", 12, 0);
+	}
+}
+
+static int
 sync_directory(const char *directory)
 {
 	int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -247,6 +278,45 @@ main(void)
 			  "new open rejects path replacement against selected manifest");
 	}
 	ps_forkmeta_snapshot_close(&snapshot);
+
+	/* A mutation after the first scan must retry from a fresh directory stream,
+	 * not a dup'd descriptor whose readdir offset is already at EOF. */
+	check(make_dir(root, "observation_retry", directory, sizeof(directory)) == 0 &&
+		  ps_forkmeta_snapshot_publish(directory, 1, 120, 3, &cp_input,
+								  &stream_input) == 0,
+		  "create observation retry fixture");
+	{
+		ObservationRetryTest retry;
+		PsForkmetaSnapshotExpected expected;
+		uint64_t debt = 0;
+		int reclaim_rc;
+
+		memset(&retry, 0, sizeof(retry));
+		check(path_suffix(directory,
+					  "/forkmeta_tail_v1_00000000000000000002.tmp.1.1",
+					  retry.debris, sizeof(retry.debris)) == 0 &&
+			  ps_forkmeta_snapshot_open(&snapshot, directory) == 0,
+			  "prepare observation retry paths");
+		memset(&expected, 0, sizeof(expected));
+		expected.generation = snapshot.generation;
+		expected.cutoff_lsn = snapshot.cutoff_lsn;
+		expected.cutoff_admission_seq = snapshot.cutoff_admission_seq;
+		expected.checkpoint = snapshot.checkpoint;
+		expected.tail = snapshot.tail;
+		ps_forkmeta_snapshot_close(&snapshot);
+		ps_test_set_forkmeta_snapshot_observation_hook(observation_retry_hook,
+											 &retry);
+		reclaim_rc = ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 0,
+												 &expected, &debt);
+		ps_test_set_forkmeta_snapshot_observation_hook(NULL, NULL);
+		check(reclaim_rc == 0 && retry.calls == 1 && debt == 12,
+			  "observation retry reopens directory and counts new finite debt");
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 1, 0,
+												 &expected, &debt) != 0,
+			  "missing source fails closed even when source debt is ineligible");
+		check(unlink(retry.debris) == 0 && remove_tree(directory) == 0,
+			  "remove observation retry fixture");
+	}
 
 	check(make_dir(root, "empty", directory, sizeof(directory)) == 0 &&
 		  ps_forkmeta_snapshot_publish(directory, 1, 101, 1, &empty_input,
@@ -518,7 +588,7 @@ main(void)
 		expected.checkpoint = snapshot.checkpoint;
 		expected.tail = snapshot.tail;
 		ps_forkmeta_snapshot_close(&snapshot);
-		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &debt) == 0 &&
 				  debt >= 6,
 				  "recognized temporary snapshot residue is counted as physical debt");
@@ -538,7 +608,7 @@ main(void)
 		snprintf(unrelated, sizeof(unrelated),
 				 "%s/forkmeta_tail_v1_00000000000000000009.tmp.1.1", directory);
 		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
-			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &debt) == 0 &&
 			  debt == baseline - (uint64_t) old_checkpoint_stat.st_size -
 				  (uint64_t) old_tail_stat.st_size + 9,
@@ -546,7 +616,7 @@ main(void)
 		check(unlink(prepared_intent_path) == 0 && unlink(unrelated) == 0 &&
 			  remove_tree(older_fixture) == 0,
 				  "remove the older prepared generation fixture");
-		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &baseline) == 0,
 				  "restore the debt baseline after older prepared fixture");
 		check(prepare_two(&prepared, directory, 5, 500, 1, replacement,
@@ -555,12 +625,12 @@ main(void)
 		snprintf(unrelated, sizeof(unrelated),
 				 "%s/forkmeta_tail_v1_00000000000000000010.tmp.1.1", directory);
 		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
-			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &debt) == 0 && debt == baseline + 9,
 				  "newer prepared intent and parts are excluded while obsolete debris counts");
 		check(ps_forkmeta_snapshot_abort(&prepared) == 0 && unlink(unrelated) == 0,
 				  "remove the newer prepared generation fixture");
-		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+		check(ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &baseline) == 0,
 				  "restore the debt baseline after newer prepared fixture");
 		check(prepare_two(&prepared, directory, 3, 300, 1, checkpoint,
@@ -569,7 +639,7 @@ main(void)
 		snprintf(unrelated, sizeof(unrelated),
 				 "%s/forkmeta_tail_v1_00000000000000000011.tmp.1.1", directory);
 		check(write_file(unrelated, "unrelated", 9, 0) == 0 &&
-			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0,
+			  ps_forkmeta_snapshot_reclaim_bytes(directory, root, 0, 1,
 										 &expected, &debt) == 0 && debt == baseline + 9,
 				  "equal prepared generation is excluded while obsolete debris counts");
 		check(ps_forkmeta_snapshot_commit(&prepared) == 0 && unlink(unrelated) == 0,
