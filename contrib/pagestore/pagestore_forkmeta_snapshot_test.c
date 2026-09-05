@@ -1158,6 +1158,80 @@ main(void)
 			  "later temporary deletion completes its cursor drain");
 	}
 	{
+		char canonical[1200];
+		char temp[1200];
+		char late_temp[1200];
+		GcInspectionTest inspection = {0};
+		int created = 1;
+		int gc_rc;
+		unsigned int calls;
+
+		check(make_dir(root, "cursor_deleted_prefix", directory,
+					   sizeof(directory)) == 0,
+			  "create deleted-prefix cursor fixture");
+		/* The first batch is reclaimable and is removed before the next call.
+		 * Keep a long final-name prefix after it: temporary GC must continue
+		 * through those nonreclaimable entries to reach the late debris. */
+		for (unsigned int i = 0; i < PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH; i++)
+		{
+			int n = snprintf(temp, sizeof(temp),
+						 "%s/forkmeta_manifest_v1.tmp.%ld.%u",
+						 directory, (long) getpid(), i);
+
+			if (n < 0 || (size_t) n >= sizeof(temp) ||
+				write_file(temp, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		for (unsigned int i = 0; created && i < 256; i++)
+		{
+			int n = snprintf(canonical, sizeof(canonical),
+						 "%s/forkmeta_checkpoint_v1_%020u", directory,
+						 i + 70000);
+
+			if (n < 0 || (size_t) n >= sizeof(canonical) ||
+				write_file(canonical, "x", 1, 0) != 0)
+			{
+				created = 0;
+				break;
+			}
+		}
+		{
+			int late_ok = snprintf(late_temp, sizeof(late_temp),
+						 "%s/forkmeta_prepared_v1.tmp.%ld.0",
+						 directory, (long) getpid()) >= 0 &&
+					write_file(late_temp, "late", 4, 0) == 0;
+			check(late_ok,
+			  "create late temporary debris after the nonreclaimable prefix");
+		}
+		inspection.calls = 0;
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+				gc_inspection_hook, &inspection);
+		gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+		ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+		check(created && inspection.calls == PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH &&
+				(gc_rc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE ||
+				 gc_rc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE),
+			  "first deleted cursor batch is bounded");
+		for (calls = 0; gc_rc > 0 && calls < 24; calls++)
+		{
+			inspection.calls = 0;
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+					gc_inspection_hook, &inspection);
+			gc_rc = ps_forkmeta_snapshot_gc_temporary(directory);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			check(inspection.calls <= PS_FORKMETA_SNAPSHOT_TEMP_GC_BATCH,
+				  "deleted-prefix continuation remains bounded");
+			if (gc_rc < 0)
+				break;
+		}
+		check(gc_rc == PS_FORKMETA_SNAPSHOT_GC_NO_WORK &&
+			  access(temp, F_OK) != 0 && access(late_temp, F_OK) != 0,
+			  "same-stream continuation drains debris and closes at EOF");
+	}
+	{
 		char replacement[1200];
 		char old_directory[1200];
 		char canonical[1200];
