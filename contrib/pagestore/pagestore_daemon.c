@@ -949,6 +949,7 @@ main(int argc, char **argv)
 	const char *store_dir = NULL;
 	const char *shm_name = NULL;
 	uint32_t	nshards = 1;
+	int		exit_status = 0;
 	int		forkmeta_high_water_cli = 0;
 	int		forkmeta_catchup_cli = 0;
 
@@ -1249,10 +1250,9 @@ main(int argc, char **argv)
 			if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: fault probe daemon.after_ready failed\n");
+				exit_status = 1;
+				stop_requested = 1;
 				shm_mark_stopping(hdr);
-				ps_core_close();
-				munmap(shm, PS_SHM_SIZE);
-				return 1;
 			}
 		}
 
@@ -1306,5 +1306,5 @@ main(int argc, char **argv)
 	}
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
-	return 0;
+	return exit_status;
 }

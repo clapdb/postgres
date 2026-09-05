@@ -13,9 +13,11 @@
       "io_unit": 262144
     },
     "daemon_fault_smoke": {
-      "operations": ["crash"],
+      "operations": ["crash", "set_fault", "release_fault"],
       "constraints": {
-        "crash": {}
+        "crash": {},
+        "set_fault": {},
+        "release_fault": {"target": ["store"]}
       },
       "protocol_version": 40,
       "page_size": 8192,
@@ -54,6 +56,7 @@
   "shards": [1],
   "compute": ["writer", "reader", "branch", "materializer"],
   "crash_models": ["power_loss", "compute", "process_abort"],
+  "fault_actions": ["crash", "error", "pause"],
   "fault_catalog": "../pagestore_fault_points.def",
   "operations": [
     "sql",

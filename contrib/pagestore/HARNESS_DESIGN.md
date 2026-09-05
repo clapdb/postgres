@@ -369,15 +369,16 @@ inspect another process, then release it.  Faults must be compiled into test
 builds only or guarded by explicit `PAGESTORE_TEST_FAULT_*` settings;
 production configuration never activates them.
 
-The first registry slice is deliberately crash-only.  Its canonical names and
-harness metadata share `pagestore_fault_points.def`; the registry is inert when
-no fault variables are present, while a partial
+Canonical names, allowed actions, and harness metadata share
+`pagestore_fault_points.def`; the registry is inert when no fault variables are
+present, while a partial
 `PAGESTORE_TEST_FAULT_{NAME,ACTION,HIT,DIR}` configuration fails closed.
 The control directory is outside the store, contains fixed `arm` and
-`report.jsonl` names, and is never fsynced by a fault probe.  Error and pause
-actions remain future work.  A future pause point must be outside core locks;
+`release`/`report.jsonl` names, and is never fsynced by a fault probe.  The
+lock-free `daemon.after_ready` point supports crash, error, and bounded pause;
 publication probes reached while holding shard, map, or WAL-index locks remain
-crash-only.
+crash-only.  Reports are atomically published with scenario, seed, hit, PID,
+and operation identity before the selected action becomes observable.
 
 Each scenario explores one fault point per run.  The coordinator enumerates
 them deterministically instead of injecting several independent crashes into
@@ -574,10 +575,10 @@ advancing durable horizon.
    current reader R test, including running-XID and oversized-subxid cases, and
    add the local-control differential trace.
 3. [partial] Add the test-only fault registry with reachability accounting.
-   The crash-only registry, daemon after-ready reachability case, and existing
-   page/GC/WAL-index publication crash windows use canonical names.  Error and
-   pause actions plus composed manifest/segment/GC daemon-restart scenarios
-   remain to be added.
+   The registry supports crash/error/pause at the safe daemon after-ready
+   point, and existing page/GC/WAL-index publication crash windows use
+   canonical names.  Composed manifest/segment/GC daemon-restart scenarios and
+   additional lock-free error/pause points remain to be added.
 4. Add branch, control, SLRU, lifecycle, and corruption scenarios, retaining
    one understandable topology per scenario.
 5. Add WAL redo/materialization topology and direct-versus-redo cases; then add

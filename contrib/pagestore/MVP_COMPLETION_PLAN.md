@@ -745,13 +745,15 @@ introduce them.
 
 ### H0. Add common fault and inspection primitives
 
-Status: **partial harness and crash-only named fault registry exist**.
+Status: **fault-action foundation complete; inspection primitives remain**.
 
 The first H0 slice uses one canonical fault catalog for C and Python, proves a
 pre-armed daemon fault was reached, and checks two recovery opens.  Existing
 page-compaction, GC mark-delete, page-frontier, and WAL-index-frontier crash
-windows now use the same registry.  Error/pause actions, the remaining
-inspection operations, and the composed H1 scenarios are still outstanding.
+windows use the same registry.  The lock-free `daemon.after_ready` point also
+supports error and bounded pause actions, with real crash/error/pause daemon
+recovery scenarios.  The remaining inspection operations and composed H1
+scenarios are still outstanding.
 
 Deliverables:
 

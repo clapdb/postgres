@@ -616,6 +616,7 @@ main(int argc, char **argv)
 	const char *shm_name = NULL;
 	const char *pci_addr = NULL;
 	uint32_t	nshards = 1;
+	int		exit_status = 0;
 
 	ps_storage = &PsStorageSpdk;
 	use_layers = 0;				/* SPDK reads serve by segment offset for now */
@@ -821,11 +822,9 @@ main(int argc, char **argv)
 			if (ps_fault_probe(PS_FAULT_POINT_DAEMON_AFTER_READY) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon_spdk: fault probe daemon.after_ready failed\n");
+				exit_status = 1;
+				stop_requested = 1;
 				shm_mark_stopping(hdr);
-				ps_core_close();
-				ps_storage->close();
-				munmap(shm, PS_SHM_SIZE);
-				return 1;
 			}
 		}
 
@@ -852,5 +851,5 @@ main(int argc, char **argv)
 	ps_core_close();			/* flush the memtable into a layer before detaching */
 	ps_storage->close();
 	munmap(shm, PS_SHM_SIZE);
-	return 0;
+	return exit_status;
 }
