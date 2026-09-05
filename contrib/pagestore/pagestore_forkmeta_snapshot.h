@@ -108,6 +108,15 @@ typedef void (*PsForkmetaSnapshotGcInspectionTestHook)(void *arg);
 extern void ps_test_set_forkmeta_snapshot_gc_inspection_hook(
 		PsForkmetaSnapshotGcInspectionTestHook hook, void *arg);
 
+/* Test-only seam for proving generation-allocation traversal.  The callback
+ * runs once for each non-special directory entry; generation is zero when the
+ * entry is not a recognized canonical or part-temporary name, and highest is
+ * the maximum seen through the current entry. */
+typedef void (*PsForkmetaSnapshotGenerationScanTestHook)(
+		const char *name, uint64_t generation, uint64_t highest, void *arg);
+extern void ps_test_set_forkmeta_snapshot_generation_scan_hook(
+		PsForkmetaSnapshotGenerationScanTestHook hook, void *arg);
+
 /*
  * MUTATOR SERIALIZATION CONTRACT
  *

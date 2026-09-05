@@ -146,12 +146,43 @@ typedef struct GcInspectionTest
 	unsigned int calls;
 } GcInspectionTest;
 
+typedef struct GenerationScanTest
+{
+	unsigned int calls;
+	unsigned int recognized;
+	unsigned int unrecognized;
+	uint64_t maximum_generation;
+	uint64_t last_highest;
+	int monotonic;
+} GenerationScanTest;
+
 static void
 gc_inspection_hook(void *arg)
 {
 	GcInspectionTest *test = arg;
 
 	test->calls++;
+}
+
+static void
+generation_scan_hook(const char *name, uint64_t generation,
+					 uint64_t highest, void *arg)
+{
+	GenerationScanTest *test = arg;
+
+	(void) name;
+	test->calls++;
+	if (generation == 0)
+		test->unrecognized++;
+	else
+	{
+		test->recognized++;
+		if (generation > test->maximum_generation)
+			test->maximum_generation = generation;
+	}
+	if (highest < test->last_highest)
+		test->monotonic = 0;
+	test->last_highest = highest;
 }
 
 static void
@@ -271,6 +302,42 @@ main(void)
 	check(ps_forkmeta_snapshot_read_tail(&snapshot, sizeof(tail), output, 1) != 0,
 		  "bounded read rejects overrun");
 	ps_forkmeta_snapshot_close(&snapshot);
+
+	/* Generation allocation must account for every recognized final and
+	 * part-temporary entry.  The test hook makes that traversal observable to
+	 * the admission-fence test without changing core. */
+	check(make_dir(root, "next_generation_scan", directory, sizeof(directory)) == 0 &&
+		  ps_forkmeta_snapshot_publish(directory, 1, 110, 2, &cp_input,
+								  &stream_input) == 0,
+		  "create generation-allocation scan fixture");
+	{
+		char entry_path[1200];
+		GenerationScanTest scan = {.monotonic = 1};
+		uint64_t next_generation = 0;
+
+		check(part_path(directory, "forkmeta_checkpoint_v1_", 17, entry_path,
+					 sizeof(entry_path)) == 0 &&
+			  write_file(entry_path, "checkpoint", 10, 0) == 0 &&
+			  part_path(directory, "forkmeta_tail_v1_", 23, entry_path,
+					 sizeof(entry_path)) == 0 &&
+			  write_file(entry_path, "tail", 4, 0) == 0 &&
+			  snprintf(entry_path, sizeof(entry_path),
+						   "%s/forkmeta_tail_v1_%020u.tmp.7.1", directory, 29u) >= 0 &&
+			  write_file(entry_path, "temporary", 9, 0) == 0 &&
+			  snprintf(entry_path, sizeof(entry_path), "%s/unrelated", directory) >= 0 &&
+			  write_file(entry_path, "other", 5, 0) == 0,
+			  "create recognized and unrelated generation entries");
+		ps_test_set_forkmeta_snapshot_generation_scan_hook(
+				generation_scan_hook, &scan);
+		check(ps_forkmeta_snapshot_next_generation(directory, 1,
+										   &next_generation) == 0 &&
+			  next_generation == 30 && scan.calls == 6 &&
+			  scan.recognized == 5 && scan.unrecognized == 1 &&
+			  scan.maximum_generation == 29 && scan.last_highest == 29 &&
+			  scan.monotonic,
+			  "generation scan hook reports traversal and highest generation");
+		ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
+	}
 
 	check(make_dir(root, "stable_read", directory, sizeof(directory)) == 0 &&
 		  ps_forkmeta_snapshot_publish(directory, 1, 110, 2, &cp_input,

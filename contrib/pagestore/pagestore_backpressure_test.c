@@ -57,6 +57,63 @@ typedef struct BackpressureSlowPathCounter
 	unsigned int calls;
 } BackpressureSlowPathCounter;
 
+typedef struct ForkmetaGenerationAdmissionOrder
+{
+	unsigned int scan_calls;
+	unsigned int cutover_calls;
+	unsigned int snapshot_lock_calls;
+	unsigned int expected_scan_calls;
+	unsigned int scan_calls_at_cutover;
+	unsigned int last_scan_calls_at_cutover;
+	int awaiting_snapshot_lock;
+	int generation_candidate_at_cutover;
+	int incomplete_before_lock;
+} ForkmetaGenerationAdmissionOrder;
+
+static void
+forkmeta_generation_scan_hook(const char *name, uint64_t generation,
+							  uint64_t highest, void *arg)
+{
+	ForkmetaGenerationAdmissionOrder *order = arg;
+
+	(void) name;
+	(void) generation;
+	(void) highest;
+	order->scan_calls++;
+}
+
+static int
+forkmeta_generation_admission_lock_hook(pthread_rwlock_t *lock, void *arg)
+{
+	ForkmetaGenerationAdmissionOrder *order = arg;
+
+	if (order->awaiting_snapshot_lock)
+	{
+		order->awaiting_snapshot_lock = 0;
+		if (order->generation_candidate_at_cutover)
+		{
+			order->snapshot_lock_calls++;
+			if (order->scan_calls_at_cutover <
+				order->expected_scan_calls)
+				order->incomplete_before_lock = 1;
+		}
+	}
+	return pthread_rwlock_wrlock(lock);
+}
+
+static void
+forkmeta_generation_cutover_hook(void *arg)
+{
+	ForkmetaGenerationAdmissionOrder *order = arg;
+
+	order->cutover_calls++;
+	order->generation_candidate_at_cutover =
+		order->scan_calls > order->last_scan_calls_at_cutover;
+	order->scan_calls_at_cutover = order->scan_calls;
+	order->last_scan_calls_at_cutover = order->scan_calls;
+	order->awaiting_snapshot_lock = 1;
+}
+
 typedef struct ForkmetaProofRace
 {
 	PsChannel channel;
@@ -1102,6 +1159,7 @@ test_forkmeta_self_recovery(void)
 	BackpressureSlowPathCounter cutover_attempts = {0};
 	BackpressureSlowPathCounter post_gc_continuations = {0};
 	BackpressureSlowPathCounter prefix_gc_inspections = {0};
+	ForkmetaGenerationAdmissionOrder generation_order = {0};
 
 	configure_page_core();
 	compact_layers = 0;
@@ -1472,14 +1530,26 @@ test_forkmeta_self_recovery(void)
 				"restore canonical overflow after ambiguity probe");
 		remove_tree(snapshots_probe);
 		ps_backpressure_refresh();
-		cutover_attempts.calls = 0;
-		ps_test_set_forkmeta_cutover_hook(count_backpressure_slow_path,
-										 &cutover_attempts);
-		for (int i = 0; i < 128 && cutover_attempts.calls == 0; i++)
+		memset(&generation_order, 0, sizeof(generation_order));
+		generation_order.expected_scan_calls = 4097;
+		ps_test_set_forkmeta_snapshot_generation_scan_hook(
+				forkmeta_generation_scan_hook, &generation_order);
+		ps_test_set_admission_write_lock_hook(
+				forkmeta_generation_admission_lock_hook, &generation_order);
+		ps_test_set_forkmeta_cutover_hook(forkmeta_generation_cutover_hook,
+										 &generation_order);
+		for (int i = 0; i < 128 &&
+				generation_order.snapshot_lock_calls == 0; i++)
 			(void) ps_core_maintenance();
-		check(cutover_attempts.calls == 1,
-				"provable canonical overflow performs one snapshot cutover");
+		ps_test_set_admission_write_lock_hook(NULL, NULL);
+		ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
 		ps_test_set_forkmeta_cutover_hook(NULL, NULL);
+		check(generation_order.snapshot_lock_calls == 1,
+				"provable canonical overflow performs one snapshot cutover");
+		check(generation_order.scan_calls >= generation_order.expected_scan_calls &&
+				generation_order.snapshot_lock_calls == 1 &&
+				!generation_order.incomplete_before_lock,
+				"generation traversal completes before the admission fence");
 		{
 			PsForkmetaSnapshot selected;
 			int selected_open;
@@ -1507,8 +1577,35 @@ test_forkmeta_self_recovery(void)
 		}
 		check(overflow_entries_created,
 				"create a second canonical overflow while cutover GC is pending");
-		check(ps_core_maintenance() == 1 && ps_core_maintenance() == 1,
-				"canonical and snapshot GC remain independently serviceable");
+		{
+			ForkmetaGenerationAdmissionOrder generation_gc_only = {0};
+			BackpressureSlowPathCounter gc_inspections = {0};
+			BackpressureSlowPathCounter forced_observations = {0};
+			int first_rc;
+			int second_rc;
+
+			/* Pending full GC is the only eligible snapshot work here.  Its
+			 * bounded, nonmutating cursor batch must not allocate a generation. */
+			ps_test_set_forkmeta_snapshot_generation_scan_hook(
+					forkmeta_generation_scan_hook, &generation_gc_only);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(
+					count_backpressure_slow_path, &gc_inspections);
+			ps_backpressure_refresh();
+			ps_test_set_forkmeta_observation_force_hook(
+					count_backpressure_slow_path, &forced_observations);
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			first_rc = ps_core_maintenance();
+			ps_test_forkmeta_snapshot_gc_retry_now();
+			second_rc = ps_core_maintenance();
+			ps_test_set_forkmeta_observation_force_hook(NULL, NULL);
+			ps_test_set_forkmeta_snapshot_gc_inspection_hook(NULL, NULL);
+			ps_test_set_forkmeta_snapshot_generation_scan_hook(NULL, NULL);
+			check(first_rc == 1 && second_rc == 1 &&
+					generation_gc_only.scan_calls == 0,
+					"snapshot GC-only maintenance does not scan generations");
+			check(gc_inspections.calls >= 128 && forced_observations.calls == 0,
+					"pure nonmutating GC cursors do not repeatedly force observation");
+		}
 		ps_backpressure_refresh();
 		for (int i = 0; i < 3; i++)
 		{

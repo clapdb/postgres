@@ -205,6 +205,8 @@ static PsForkmetaCutoverTestHook forkmeta_cutover_test_hook;
 static void *forkmeta_cutover_test_hook_arg;
 static PsForkmetaPostGcTestHook forkmeta_post_gc_test_hook;
 static void *forkmeta_post_gc_test_hook_arg;
+static PsForkmetaObservationForceTestHook forkmeta_observation_force_test_hook;
+static void *forkmeta_observation_force_test_hook_arg;
 static PsForkmetaBaselineInitTestHook forkmeta_baseline_init_test_hook;
 static void *forkmeta_baseline_init_test_hook_arg;
 static PsAdmissionReadTestHook admission_read_test_hook;
@@ -1044,6 +1046,14 @@ ps_test_set_forkmeta_post_gc_hook(PsForkmetaPostGcTestHook hook, void *arg)
 {
 	forkmeta_post_gc_test_hook = hook;
 	forkmeta_post_gc_test_hook_arg = arg;
+}
+
+void
+ps_test_set_forkmeta_observation_force_hook(
+	PsForkmetaObservationForceTestHook hook, void *arg)
+{
+	forkmeta_observation_force_test_hook = hook;
+	forkmeta_observation_force_test_hook_arg = arg;
 }
 
 void
@@ -5948,7 +5958,7 @@ typedef struct ForkMetaByteVec
 
 static int fork_meta_snapshot_load(const char *directory);
 static int fork_meta_snapshot_reconcile_source(void);
-static int fork_meta_snapshot_maintenance(void);
+static int fork_meta_snapshot_maintenance(uint64_t precomputed_generation);
 static int fork_meta_snapshot_due(void);
 static int fork_meta_snapshot_due_locked(void);
 
@@ -7257,13 +7267,13 @@ fork_meta_prepared_matches_selected(const PsForkmetaSnapshotPrepared *pending,
 #define FORKMETA_MAINTENANCE_CONTINUE 2
 
 static int
-fork_meta_snapshot_maintenance(void)
+fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 {
 	PsPruneFence cutoff;
 	ForkMetaByteVec checkpoint = {0}, tail = {0}, source = {0};
 	PsForkmetaSnapshotInput cp, tl;
 	PsForkmetaSnapshotPrepared prepared;
-	uint64_t generation;
+	uint64_t generation = precomputed_generation;
 	uint64_t freeze_seq;
 	int force_deleting;
 	int filter_deleting;
@@ -7273,6 +7283,7 @@ fork_meta_snapshot_maintenance(void)
 	if (fork_meta_snapshot_gc_pending)
 	{
 		int gc;
+		int was_ambiguous = fork_meta_snapshot_gc_ambiguous;
 
 		if (!fork_meta_snapshot_retry_due())
 			return 0;
@@ -7285,7 +7296,7 @@ fork_meta_snapshot_maintenance(void)
 			 * the retired generation. */
 			if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED ||
 				gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE ||
-				fork_meta_snapshot_gc_ambiguous)
+				was_ambiguous)
 				(void) ps_fault_probe(PS_FAULT_POINT_FORKMETA_AFTER_SNAPSHOT_GC);
 			if (gc == PS_FORKMETA_SNAPSHOT_GC_SCAN_INCOMPLETE ||
 				gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
@@ -7298,7 +7309,9 @@ fork_meta_snapshot_maintenance(void)
 				fork_meta_snapshot_gc_ambiguous = 0;
 				memset(&fork_meta_snapshot_retry_at, 0,
 					   sizeof(fork_meta_snapshot_retry_at));
-				forkmeta_observation_force_now();
+				if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE ||
+					was_ambiguous)
+					forkmeta_observation_force_now();
 				return FORKMETA_MAINTENANCE_CONTINUE;
 			}
 			fork_meta_snapshot_gc_pending = 0;
@@ -7372,8 +7385,11 @@ fork_meta_snapshot_maintenance(void)
 			else if (ps_forkmeta_snapshot_abort(&pending) != 0)
 				goto retry;
 		}
-		if (ps_forkmeta_snapshot_next_generation(fork_meta_snapshot_dir,
-										 fork_meta_snapshot_generation, &generation) != 0)
+		/* Generation allocation is deliberately performed before the outer
+		 * maintenance controller acquires admission/shard/page/WAL-index/map
+		 * locks.  The candidate already includes durable prepared state; if that
+		 * state is reconciled above, consuming a generation is harmless. */
+		if (generation == 0)
 			goto retry;
 	}
 	/* A legacy-only source has no admission sequence to observe during replay.
@@ -13084,6 +13100,9 @@ static void
 forkmeta_observation_force_now(void)
 {
 	__atomic_store_n(&forkmeta_observation_next_ns, 0, __ATOMIC_RELEASE);
+	if (forkmeta_observation_force_test_hook != NULL)
+		forkmeta_observation_force_test_hook(
+			forkmeta_observation_force_test_hook_arg);
 }
 
 static void
@@ -15127,6 +15146,10 @@ ps_core_maintenance_impl(void)
 	int			legacy_compaction = 0;
 	int			forkmeta_gc_scan_incomplete = 0;
 	int			forkmeta_temp_gc_observation_stale = 0;
+	int			snapshot_gc_due;
+	int			snapshot_cutover_due;
+	int			snapshot_generation_ready = 0;
+	uint64_t	snapshot_generation = 0;
 
 	/* A failed timeline metadata append may already be durable.  Until reopen
 	 * resolves that ambiguity, background work must fail closed alongside the
@@ -15266,8 +15289,23 @@ ps_core_maintenance_impl(void)
 	 * observation can prove.  Do not publish from that stale debt in this same
 	 * tick; the forced observation becomes visible after maintenance returns.  A
 	 * pending post-cutover GC is independent and remains safe to service here. */
-	if (fork_meta_snapshot_gc_due() ||
-		(!forkmeta_temp_gc_observation_stale && fork_meta_snapshot_due()))
+	snapshot_gc_due = fork_meta_snapshot_gc_due();
+	snapshot_cutover_due = !forkmeta_temp_gc_observation_stale &&
+		fork_meta_snapshot_due();
+	if (snapshot_cutover_due &&
+		ps_forkmeta_snapshot_next_generation(fork_meta_snapshot_dir,
+									 fork_meta_snapshot_generation,
+									 &snapshot_generation) == 0)
+		snapshot_generation_ready = 1;
+	else if (snapshot_cutover_due)
+	{
+		/* Generation allocation is a directory scan and must not be allowed to
+		 * hold up the admission/shard/page/WAL-index/map fence.  Back off only
+		 * this cutover; the later maintenance classes remain serviceable. */
+		clock_gettime(CLOCK_MONOTONIC, &fork_meta_snapshot_retry_at);
+		fork_meta_snapshot_retry_at.tv_sec++;
+	}
+	if (snapshot_gc_due || (snapshot_cutover_due && snapshot_generation_ready))
 	{
 		int snapshot_rc;
 
@@ -15283,7 +15321,7 @@ ps_core_maintenance_impl(void)
 		pthread_rwlock_wrlock(&page_prune_lock);
 		pthread_rwlock_wrlock(&walidx_prune_lock);
 		ps_lock_map_wr();
-		snapshot_rc = fork_meta_snapshot_maintenance();
+		snapshot_rc = fork_meta_snapshot_maintenance(snapshot_generation);
 		ps_unlock_map();
 		pthread_rwlock_unlock(&walidx_prune_lock);
 		pthread_rwlock_unlock(&page_prune_lock);

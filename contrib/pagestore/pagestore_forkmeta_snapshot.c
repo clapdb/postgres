@@ -79,6 +79,8 @@ static PsForkmetaSnapshotObservationTestHook observation_test_hook;
 static void *observation_test_hook_arg;
 static PsForkmetaSnapshotGcInspectionTestHook gc_inspection_test_hook;
 static void *gc_inspection_test_hook_arg;
+static PsForkmetaSnapshotGenerationScanTestHook generation_scan_test_hook;
+static void *generation_scan_test_hook_arg;
 static ForkmetaGcDirectoryCursor forkmeta_temp_gc_cursor;
 static ForkmetaSnapshotGcCursor forkmeta_snapshot_gc_cursor;
 
@@ -96,6 +98,14 @@ ps_test_set_forkmeta_snapshot_gc_inspection_hook(
 {
 	gc_inspection_test_hook = hook;
 	gc_inspection_test_hook_arg = arg;
+}
+
+void
+ps_test_set_forkmeta_snapshot_generation_scan_hook(
+		PsForkmetaSnapshotGenerationScanTestHook hook, void *arg)
+{
+	generation_scan_test_hook = hook;
+	generation_scan_test_hook_arg = arg;
 }
 
 static void
@@ -1165,7 +1175,14 @@ ps_forkmeta_snapshot_next_generation(const char *directory,
 	errno = 0;
 	while ((entry = readdir(dir)) != NULL)
 	{
-		uint64_t generation;
+		uint64_t generation = 0;
+		int recognized = 0;
+
+		if (strcmp(entry->d_name, ".") == 0 ||
+			strcmp(entry->d_name, "..") == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_MANIFEST) == 0 ||
+			strcmp(entry->d_name, FORKMETA_SNAPSHOT_PREPARED) == 0)
+			continue;
 
 		if (parse_generation_name(entry->d_name,
 							 FORKMETA_SNAPSHOT_CHECKPOINT_PREFIX,
@@ -1173,14 +1190,21 @@ ps_forkmeta_snapshot_next_generation(const char *directory,
 			parse_generation_name(entry->d_name, FORKMETA_SNAPSHOT_TAIL_PREFIX,
 								  &generation) == 0)
 		{
+			recognized = 1;
 			if (generation > highest)
 				highest = generation;
-			continue;
 		}
-		if (parse_temp_name(entry->d_name) == 0 &&
-			parse_part_temp_generation(entry->d_name, &generation) == 0 &&
-			generation > highest)
-			highest = generation;
+		else if (parse_temp_name(entry->d_name) == 0 &&
+				 parse_part_temp_generation(entry->d_name, &generation) == 0)
+		{
+			recognized = 1;
+			if (generation > highest)
+				highest = generation;
+		}
+		if (generation_scan_test_hook != NULL)
+			generation_scan_test_hook(entry->d_name,
+								  recognized ? generation : 0, highest,
+								  generation_scan_test_hook_arg);
 	}
 	{
 		int scan_errno = errno;

@@ -147,6 +147,9 @@ typedef void (*PsForkmetaCutoverTestHook)(void *arg);
 /* Called after a forkmeta GC cursor reports SCAN_INCOMPLETE and maintenance
  * continues into the later WAL/timeline/segment/compaction phases. */
 typedef void (*PsForkmetaPostGcTestHook)(void *arg);
+/* Called only when maintenance explicitly invalidates the automatic
+ * forkmeta-observation pacing deadline. */
+typedef void (*PsForkmetaObservationForceTestHook)(void *arg);
 /* Called immediately before baseline source identity observation. */
 typedef void (*PsForkmetaBaselineInitTestHook)(void *arg);
 typedef void (*PsAdmissionReadTestHook)(void *arg);
@@ -183,6 +186,8 @@ extern void ps_test_set_forkmeta_cutover_hook(
 	PsForkmetaCutoverTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_post_gc_hook(
 	PsForkmetaPostGcTestHook hook, void *arg);
+extern void ps_test_set_forkmeta_observation_force_hook(
+	PsForkmetaObservationForceTestHook hook, void *arg);
 extern void ps_test_set_forkmeta_baseline_init_hook(
 	PsForkmetaBaselineInitTestHook hook, void *arg);
 extern void ps_test_set_admission_read_hook(PsAdmissionReadTestHook hook,
