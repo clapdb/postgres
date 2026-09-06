@@ -5494,7 +5494,8 @@ ps_core_inspection_relation(uint32_t timeline, const PsKey *key,
 
 	if (key == NULL || result == NULL || timeline >= MAX_TIMELINES ||
 		key->klass != PS_KLASS_RELATION || key->forkNum != 0 ||
-		!timelines[timeline].defined || timeline_meta_poisoned_load())
+		!timelines[timeline].defined || timeline_meta_poisoned_load() ||
+		fork_meta_poisoned_load())
 		return -1;
 
 	/* An as-of request is only honest when the page-history frontier and
@@ -5534,6 +5535,14 @@ ps_core_inspection_relation(uint32_t timeline, const PsKey *key,
 	result->selected_version = 0;
 	return 0;
 }
+
+#ifdef PAGESTORE_RELATION_INSPECTION_TEST
+void
+ps_test_forkmeta_set_poisoned(int poisoned)
+{
+	fork_meta_poisoned_store(poisoned != 0);
+}
+#endif
 
 /* Caller holds the key's shard lock and map_lock for reading.  Find the newest
  * fork/page LSN reachable through the child's ancestry, respecting every

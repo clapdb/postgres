@@ -921,11 +921,6 @@ shard_worker(void *arg)
 	{
 		int			did_work = 0;
 
-		/* Only shard zero services the single dedicated inspection slot.  The
-		 * slot has its own state machine and is unrelated to channel ownership. */
-		if (shard == 0 && run_inspection_request(shm))
-			did_work = 1;
-
 		for (uint32_t i = shard; i < nchannels; i += nshards)
 		{
 			PsChannel  *ch = ps_channel(shm, i);
@@ -945,6 +940,24 @@ shard_worker(void *arg)
 		}
 	}
 
+	return NULL;
+}
+
+/* Keep the control-plane mailbox off every channel worker.  In particular,
+ * relation inspection may wait for the lifecycle, admission, shard, and map
+ * read gates; that wait must never delay ordinary channel service. */
+static void *
+inspection_worker(void *arg)
+{
+	void *shm = arg;
+
+	while (!stop_requested)
+	{
+		struct timespec ts = {0, 1000000};	/* 1ms bounded mailbox poll */
+
+		(void) run_inspection_request(shm);
+		nanosleep(&ts, NULL);
+	}
 	return NULL;
 }
 
@@ -1360,8 +1373,10 @@ main(int argc, char **argv)
 	{
 		WorkerArgs *workers = malloc((size_t) hdr->nshards * sizeof(WorkerArgs));
 		pthread_t  *threads = malloc((size_t) hdr->nshards * sizeof(pthread_t));
+		pthread_t	inspection;
 		pthread_t	maintenance;
 		uint32_t	started = 0;
+		int			inspection_started = 0;
 		int			maintenance_started = 0;
 
 		if (!workers || !threads)
@@ -1393,6 +1408,16 @@ main(int argc, char **argv)
 		}
 		if (started == hdr->nshards)
 		{
+			if (pthread_create(&inspection, NULL, inspection_worker, shm) != 0)
+			{
+				fprintf(stderr, "pagestore_daemon: failed to start inspection worker\n");
+				stop_requested = 1;
+			}
+			else
+				inspection_started = 1;
+		}
+		if (started == hdr->nshards && inspection_started)
+		{
 			if (pthread_create(&maintenance, NULL, maintenance_worker, NULL) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: failed to start maintenance worker\n");
@@ -1401,7 +1426,8 @@ main(int argc, char **argv)
 			else
 				maintenance_started = 1;
 		}
-		if (started == hdr->nshards && maintenance_started && !stop_requested &&
+		if (started == hdr->nshards && inspection_started && maintenance_started &&
+			!stop_requested &&
 			shm_publish_ready(hdr))
 		{
 			/* READY is the publication point.  The byte-one lease remains held
@@ -1426,6 +1452,8 @@ main(int argc, char **argv)
 
 		for (uint32_t shard = 0; shard < started; shard++)
 			pthread_join(threads[shard], NULL);
+		if (inspection_started)
+			pthread_join(inspection, NULL);
 		if (maintenance_started)
 			pthread_join(maintenance, NULL);
 

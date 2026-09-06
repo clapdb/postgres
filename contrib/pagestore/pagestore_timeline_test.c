@@ -2024,6 +2024,39 @@ configure_timeline_core(void)
 	ps_storage = &PsStoragePosix;
 }
 
+static void
+test_relation_inspection_forkmeta_poison(void)
+{
+	char store[] = "/tmp/pagestore-relation-inspection-poison-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsInspectionRelationResult result;
+	int rc;
+
+	configure_timeline_core();
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open relation inspection poison fixture");
+		remove_tree(store);
+		return;
+	}
+	memset(&result, 0, sizeof(result));
+	result.exists = 7;
+	result.fork_count = 7;
+	ps_test_forkmeta_set_poisoned(1);
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(0);
+	ps_lock_map_rd();
+	rc = ps_core_inspection_relation(0, &key, 0, &result);
+	ps_unlock_map();
+	ps_unlock_shard(0);
+	ps_lifecycle_read_unlock();
+	check(rc != 0 && result.exists == 7 && result.fork_count == 7,
+		  "relation inspection fails closed on poisoned fork metadata");
+	ps_test_forkmeta_set_poisoned(0);
+	close_store();
+	remove_tree(store);
+}
+
 /* Keep the inspection structural pass bounded on a maximally deep timeline
  * chain.  This also exercises the real LSN-0 branch-cap sentinel: it must
  * publish as horizon 1 rather than disappearing as an unconstrained zero. */
@@ -3272,6 +3305,7 @@ main(void)
 	test_deleting_timeline_page_cleanup_prefix_hole();
 	test_deleting_timeline_page_cleanup_retired_short_segment();
 	test_v2_and_mixed_lifecycle();
+	test_relation_inspection_forkmeta_poison();
 	test_inspection_timeline_cache_deep_ancestry();
 	test_inspection_structural_horizon_lifecycle_states();
 	test_inspection_retention_snapshot_alloc_failure();

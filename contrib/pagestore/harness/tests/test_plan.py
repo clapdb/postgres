@@ -625,6 +625,42 @@ class PlanValidationTests(unittest.TestCase):
             ["/inspect", "--shm", "/unused", "relation", "7", "1663", "1", "42", "123"],
         )
 
+    def test_relation_inspection_validates_native_fork_invariants(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        valid = {
+            "exists": True,
+            "forks": [{"fork": 0, "nblocks": 3}, {"fork": 2, "nblocks": 1}],
+            "selected_version": None,
+        }
+        invalid_cases = [
+            ("too many forks", {"fork": 3, "nblocks": 1}),
+            ("fork number out of range", [{"fork": 0, "nblocks": 1}, {"fork": 4, "nblocks": 1}]),
+            ("out of order forks", [{"fork": 1, "nblocks": 1}, {"fork": 0, "nblocks": 1}]),
+            ("duplicate forks", [{"fork": 0, "nblocks": 1}, {"fork": 0, "nblocks": 2}]),
+            ("exists without main fork", {"exists": True, "forks": []}),
+            ("main fork without exists", {"exists": False, "forks": [{"fork": 0, "nblocks": 1}]}),
+        ]
+        for label, change in invalid_cases:
+            with self.subTest(label=label):
+                response = dict(valid)
+                if label == "too many forks":
+                    response["forks"] = valid["forks"] + [change, change, change]
+                elif label in {"fork number out of range", "out of order forks", "duplicate forks"}:
+                    response["forks"] = change
+                else:
+                    response.update(change)
+                result = mock.Mock(
+                    returncode=0, stdout=json.dumps(response), stderr=""
+                )
+                with (
+                    mock.patch.object(MODULE.subprocess, "run", return_value=result),
+                    self.assertRaisesRegex(MODULE.PlanError, "fork|exists"),
+                ):
+                    MODULE.inspect_store(
+                        Path("/inspect"), "/unused", "relation", schema,
+                        timeline=7, relation_key=(1663, 1, 42), lsn=123,
+                    )
+
     def test_inspector_response_must_match_schema(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

@@ -1214,6 +1214,10 @@ def inspect_store(
         forks = value.get("forks")
         if not isinstance(forks, list):
             raise PlanError("inspector relation field 'forks' must be an array")
+        if len(forks) > 4:
+            raise PlanError("inspector relation field 'forks' has too many entries")
+        has_main_fork = False
+        previous_fork = -1
         for fork in forks:
             if (
                 not isinstance(fork, dict)
@@ -1226,6 +1230,16 @@ def inspect_store(
                 or fork["nblocks"] < 0
             ):
                 raise PlanError("inspector relation fork entries have invalid types")
+            if fork["fork"] <= previous_fork:
+                raise PlanError(
+                    "inspector relation fork entries must be strictly increasing"
+                )
+            previous_fork = fork["fork"]
+            has_main_fork = has_main_fork or fork["fork"] == 0
+        if value["exists"] != has_main_fork:
+            raise PlanError(
+                "inspector relation 'exists' must match presence of fork 0"
+            )
         if value.get("selected_version") is not None:
             raise PlanError(
                 "inspector relation selected_version must be null when unavailable"
