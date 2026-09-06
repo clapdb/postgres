@@ -459,7 +459,8 @@ ps_fault_init(const char *store_dir)
 		!S_ISDIR(control_lstat.st_mode) ||
 		absolute_realpath(control, control_real, sizeof(control_real)) != 0 ||
 		absolute_realpath(store_dir, store_real, sizeof(store_real)) != 0 ||
-		paths_overlap(control_real, store_real) || action_allowed(point, action) != 0 ||
+		paths_overlap(control_real, store_real) ||
+		action_allowed(point, action) != 0 ||
 		(fault_catalog[point].max_hit != 0 && target > fault_catalog[point].max_hit) ||
 		copy_identity(scenario, fault.scenario, scenario != NULL) != 0 ||
 		copy_identity(seed, fault.seed, seed != NULL) != 0 ||
@@ -495,6 +496,12 @@ ps_fault_init(const char *store_dir)
 	fault.dirfd = dirfd;
 	fault.enabled = 1;
 	return 0;
+}
+
+int
+ps_fault_is_initialized(void)
+{
+	return fault.initialized;
 }
 
 int

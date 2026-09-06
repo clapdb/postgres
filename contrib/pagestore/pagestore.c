@@ -68,6 +68,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/optimizer.h"
 #include "pagestore_backend.h"
+#include "pagestore_fault.h"
 #include "pagestore_ipc.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
@@ -1418,6 +1419,12 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
 		(*prev_restartpoint_flush_hook) (replay_lsn, restart_redo_lsn);
 	if (!RecoveryInProgress() || XLogRecPtrIsInvalid(replay_lsn))
 		return;
+	/* The restartpoint hook runs in the checkpointer child.  Initialize the
+	 * process-local canonical fault state here as a fallback for PostgreSQL
+	 * versions that load the extension before all postmaster GUCs are final. */
+	if (!ps_fault_is_initialized() && ps_fault_init(DataDir) != 0)
+		ereport(ERROR,
+				(errmsg("could not initialize materializer restartpoint fault controls")));
 
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
@@ -1439,12 +1446,18 @@ pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
 	{
 		pagestore_localsvc_store_sync_timeout(
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		if (ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_RELATION_SYNC) != 0)
+			ereport(ERROR,
+					(errmsg("pagestore materializer relation-sync fault probe failed")));
 		pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
 										PS_MATERIALIZER_MARKER_BLOCK, page,
 										(uint64) replay_lsn,
 										PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 		pagestore_localsvc_store_sync_timeout(
 			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+		if (ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_MARKER_SYNC) != 0)
+			ereport(ERROR,
+					(errmsg("pagestore materializer marker-sync fault probe failed")));
 		published = true;
 	}
 	PG_CATCH();
@@ -12958,10 +12971,13 @@ _PG_init(void)
 				(errmsg("pagestore.materializer cannot use pagestore.read_lsn")));
 	if (pagestore_materializer &&
 		(pagestore_retention_owner_id == 0 ||
-		 pagestore_retention_owner_generation == 0))
+			pagestore_retention_owner_generation == 0))
 		ereport(ERROR,
 				(errmsg("pagestore.materializer requires retention owner authority"),
 				 errhint("Set pagestore.retention_owner_id and pagestore.retention_owner_generation from durable controller state.")));
+	if (pagestore_materializer && ps_fault_init(DataDir) != 0)
+		ereport(ERROR,
+				(errmsg("could not initialize pagestore materializer fault controls")));
 	if (pagestore_localsvc_read_lsn() != 0 &&
 		(pagestore_retention_owner_id == 0 ||
 		 pagestore_retention_owner_generation == 0))

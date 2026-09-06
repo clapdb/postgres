@@ -75,6 +75,44 @@ class PlanValidationTests(unittest.TestCase):
             "unexpected_exit",
         )
 
+    def test_materializer_status_parser_preserves_actual_values_and_nulls(self):
+        self.assertEqual(
+            MODULE.parse_materializer_status_row("(0/04000000,0/03045670,4096)"),
+            {
+                "shipped_wal_lsn": "0/04000000",
+                "materialized_wal_lsn": "0/03045670",
+                "lag_bytes": "4096",
+            },
+        )
+        self.assertEqual(
+            MODULE.parse_materializer_status_row("(0/04000000,,)"),
+            {
+                "shipped_wal_lsn": "0/04000000",
+                "materialized_wal_lsn": None,
+                "lag_bytes": None,
+            },
+        )
+
+    def test_materializer_crash_evidence_precedes_recovery(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index('"post_crash_durable_state"'),
+            source.index('"materializer-supervisor-recovery.log"'),
+        )
+        self.assertLess(
+            source.index("post_crash_status = read_materializer_status()"),
+            source.index("recovered_status = read_materializer_status()"),
+        )
+        self.assertLess(
+            source.index("marker_at_report = sql_scalar"),
+            source.index("crash_materializer(action[\"id\"])", source.index("marker_at_report = sql_scalar")),
+        )
+        self.assertNotIn('"action_skip"', source)
+        self.assertIn(
+            '"post_recovery" if materializer_recovered else "pre_crash"',
+            source,
+        )
+
     def test_accepts_declared_horizon(self):
         path = self.write_plan([
             self.header(),
@@ -968,6 +1006,90 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_runtime_plan(
             MODULE.read_plan(path), capabilities, "materializer_smoke"
         )
+
+    def test_materializer_runtime_accepts_named_fault_and_relation_snapshots(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["scenario"] = "materializer-restartpoint-after-relation-sync-before-marker"
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+             "relation": "materializer_crash_relation", "lsn": "$R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_relation_sync", "action": "pause",
+             "hit": 1, "timeout": 30, "name": "R2"},
+            {"op": "inspect_relation", "id": "inspect-r2", "target": "materializer",
+             "relation": "materializer_crash_relation", "lsn": "$R2"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities)
+        MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
+    def test_materializer_runtime_rejects_non_pause_named_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "process_abort",
+             "hit": 1, "timeout": 30, "name": "R2"},
+        ])
+        plan = MODULE.read_plan(path)
+        with self.assertRaisesRegex(MODULE.PlanError, "allows action.*pause"):
+            MODULE.validate_plan(plan, capabilities)
+
+    def test_materializer_fault_rejects_unsafe_name(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 30, "name": "../R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "name must be a safe path component"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_materializer_fault_rejects_unbounded_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 301, "name": "R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_pause_fault_report_mock_allows_recovery_child_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1,
+                "fault": "materializer.after_marker_sync",
+                "name": "materializer.after_marker_sync",
+                "action": "pause",
+                "hit": 1,
+                "pid": 43210,
+                "scenario": "materializer-restartpoint-after-marker-sync",
+                "seed": 1,
+                "operation": "fault-after-marker-sync",
+                "state": "reached",
+                "watchdog_ms": 0,
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "materializer.after_marker_sync", 1, None, "pause",
+                "materializer-restartpoint-after-marker-sync", 1,
+                "fault-after-marker-sync",
+            )
+            self.assertEqual(value["pid"], 43210)
 
     def test_materializer_runtime_requires_exact_topology(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")

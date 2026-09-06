@@ -146,7 +146,15 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     `continuous_redo_demo.sh` keeps a WAL-only writer and a distinct recovery
     worker online together while later archived segments are materialized.
     Restartpoints publish a durable `pagestore_materialized_wal_lsn()` only
-    after their buffer flush completes.  Supervisors compare that watermark
+    after their buffer flush completes.  The publication order is relation-page
+    store sync, marker write, marker store sync, and retention advance.  The
+    named H1 fault points pause after relation-page sync/before marker write or
+    after marker sync/before retention advance; they are pause-only test
+    controls and add no durability edge when disabled.  Because the hook runs
+    in PostgreSQL's checkpointer child, the harness records the exact child
+    report, stops the complete materializer postmaster, safely removes the
+    release/control markers, and lets the supervisor recover without assuming
+    that its worker generation changed at the probe.  Supervisors compare that watermark
     with `pagestore_shipped_wal_lsn()`, or read
     `pagestore_materializer_lag_bytes()` directly; the lag API fails closed
     outside recovery so a writer cannot masquerade as a

@@ -23,6 +23,7 @@ typedef enum PsFaultPoint
 } PsFaultPoint;
 
 int ps_fault_init(const char *store_dir);
+int ps_fault_is_initialized(void);
 int ps_fault_lookup(const char *name, PsFaultPoint *point);
 const char *ps_fault_name(PsFaultPoint point);
 const char *ps_fault_allowed_actions(PsFaultPoint point);

@@ -767,7 +767,11 @@ existence/fork-size results, and explicit `selected_version: null` when the
 core cannot prove one aggregate version.  The relation mailbox is advertised
 only by the POSIX frontend; standalone relation assertions are capability-gated
 so the SPDK frontend remains runnable without that POSIX-only mailbox.
-The composed H1 scenarios remain outstanding.
+The first composed H1 materializer slice is now implemented: the two
+restartpoint plans pause the checkpointer child after relation-page sync/before
+marker write and after marker sync, then stop and recover the whole
+materializer.  The remaining branch, layer, reclaim, and GC H1 families remain
+outstanding.
 
 Deliverables:
 
@@ -793,7 +797,8 @@ Expected scope: one or two PRs.
 
 ### H1. Compose process-level crash scenarios
 
-Status: **blocked partly on H0; GC cases also depend on R2-R5**.
+Status: **materializer replay/restartpoint slice implemented; branch, layer,
+reclaim, and GC cases remain and depend on H0/R2-R5**.
 
 Required scenario families:
 
@@ -803,6 +808,14 @@ Required scenario families:
 - page pruning, WAL reclaim, WAL-index compaction, remote upload intent and
   orphan reconciliation, and timeline deletion;
 - daemon, writer, materializer, and branch-compute restart combinations.
+
+The materializer slice is split into two focused plans: one pauses after
+relation-page store sync and before marker write, and one pauses after marker
+store sync and before retention advance.  The pause is reported by the named
+fault machinery, while the harness immediately stops the complete materializer
+postmaster and lets the supervisor recover it; it does not assume that the
+checkpointer child is the supervisor's worker generation.  Each plan records
+both R1 and R2 relation metadata and requires the R2 main fork to grow.
 
 Acceptance:
 
@@ -988,6 +1001,7 @@ lands, use stacked PRs and finish with an explicit roll-up PR to `pagestore`.
 | 2026-09-06 | Added the minimal H1 relation inspection slice: protocol 45/schema 4, a dedicated private request/response mailbox with daemon-instance, generation, timeout, and concurrent-client fencing, strict relation-only read validation, coherent all-shard as-of existence/fork nblocks, explicit unavailable selected version, and expected timeline-incarnation fencing | POSIX standalone plus Python schema/runtime coverage; no SPDK execution |
 | 2026-09-06 | Hardened H1 relation inspection follow-up: protocol 45, POSIX fd ownership lock across the complete inspector transaction, direct release-published REQUEST without CLAIMED, bounded abandoned-slot recovery, and strict main-fork/existence consistency validation | Focused POSIX mailbox coverage plus standalone/Python tests; no SPDK execution |
 | 2026-09-06 | Closed H1 relation-mailbox ownership gaps: byte-zero initialization/client gate, byte-one daemon lifetime lease acquired after byte zero and retained on the shm fd through shutdown, lease-gated stale REQUEST/BUSY recovery, and real fork/SIGKILL lock coverage; published the POSIX-only mailbox capability so standalone assertions are skipped for unsupported frontends | POSIX mailbox, standalone, and Python tests; no SPDK execution |
+| 2026-09-06 | Added the first composed H1 materializer crash slice: pause-only checkpointer-child probes after relation sync/before marker write and after marker sync/before retention advance, whole-postmaster recovery, exact fault reports, marker monotonicity, R1/R2 timeline-0 incarnation-1 relation inspection with main-fork growth, and recovered SQL visibility | Python validation/runtime mocks, focused plan validation, explicit PostgreSQL CI lane; real integration lane is CI-owned; no SPDK execution |
 | 2026-08-28 | Added the first R3b retained-base foundation: checksummed identity v2, validated v1 migration, strict base/end reopen validation, monotonic atomic retained-base publication, explicit getter status, append publication-fault recovery, and fail-closed ambiguous directory-fsync handling; immutable segments and retention policy are unchanged | Focused WAL-store coverage for getter validation, reopen, monotonic advance/rollback rejection, metadata corruption, append/advance publication faults, crash recovery, prefix unlink/reopen, unexpected suffix validation, recognized temporary cleanup, and 83 checks with 0 failures |
 | 2026-08-28 | Added R3b-2 standalone crash-safe physical immutable-prefix reclamation: `ps_wal_store_reclaim_prefix()` publishes retained/physical frontiers before unlink, uses the WAL mutex as a reader drain/barrier, fully validates/sorts residual candidates before ascending unlink, revalidates every main-catalog candidate immediately before unlink, keeps partial unlink catalog state exact, fences ambiguous directory fsync, and retries residual prefixes after restart; no core maintenance or cutoff policy | Final focused WAL-store test: 167 checks, 0 failures; includes reverse-enumeration candidate ordering, scan-error zero-unlink, low/middle main-catalog corruption and residual corruption, lowest/middle unlink failures, per-candidate header/CRC validation, real fork/`_exit` stops before unlink/after partial unlink/before directory fsync, pending-reclaim advance fencing, deterministic reader-barrier timing, idempotence, boundary rejection, and restart retry |
 | 2026-08-28 | Added conservative R3b-3 POSIX/core WAL reclaim policy integration: cheap WAL-lock-only due preselection plus bounded no-progress backoff, durable retained-base admission with per-level WAL-lock read rechecks and inherited-parent fallback, fair one-LIVE-timeline scheduling ahead of continuous tier/remote-GC work, admission drain plus WAL-index freeze and single-timeline WAL locking, target branch/control caps, dependency/retention/progress minimum cutoff (including progress beyond the sealed prefix), residual-prefix retry at an already-published frontier, DELETED-descendant release, fail-closed pending-proof/publication handling, and one-second retry backoff; physical directory start is not a runtime fence and pre-metadata timelines retain local WAL reads | Focused core policy test: 66 checks, 0 failures; covers empty and boundary-floor preselection, ancestry and natural nonzero child fallback, child-local controls and target branch caps, LIVE/DELETING/DELETED structural floors and WAL-index exceptions, timeline isolation, naturally nonzero starts, unaligned and boundary-crossing flat progress tails, snapshot recovery plus WAL/WAL-index re-ship admission after base advancement, pre-metadata reads, restart/residual retry, fenced residual-query suppression, read/frontier publication and floor-scan lock-order races, no-proof candidate fairness, pending durable-proof cleanup failure, metadata publication failure/backoff, and admission concurrency; sparse/discrete base crossing and bounded fixed-reader soak remain out of scope |

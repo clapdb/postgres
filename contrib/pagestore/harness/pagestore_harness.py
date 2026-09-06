@@ -54,6 +54,7 @@ FAULT_REPORT_FIELDS = {
     "schema", "scenario", "seed", "fault", "action", "hit", "pid", "operation",
 }
 FAULT_REPORT_MAX_BYTES = 4096
+MAX_FAULT_TIMEOUT_SECONDS = 300.0
 
 
 def fault_failure_classification(error: Exception) -> str:
@@ -64,6 +65,43 @@ def fault_failure_classification(error: Exception) -> str:
     if isinstance(error, UnexpectedExit):
         return "unexpected_exit"
     return "setup"
+
+
+def parse_materializer_status_row(value: str) -> dict[str, str | None]:
+    """Parse the writer-side composite status without inventing progress."""
+    text = value.strip()
+    if len(text) < 2 or not text.startswith("(") or not text.endswith(")"):
+        raise PlanError(f"invalid materializer status row: {value!r}")
+    fields = text[1:-1].split(",")
+    if len(fields) != 3:
+        raise PlanError(f"invalid materializer status row: {value!r}")
+    shipped, materialized, lag = (field.strip() or None for field in fields)
+    if lag is not None:
+        try:
+            int(lag)
+        except ValueError as error:
+            raise PlanError(f"invalid materializer status lag: {value!r}") from error
+    return {
+        "shipped_wal_lsn": shipped,
+        "materialized_wal_lsn": materialized,
+        "lag_bytes": lag,
+    }
+
+
+def fault_watchdog_milliseconds(value: Any) -> int:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise PlanError("fault timeout must be finite and positive")
+    if value < 0.001 or value > MAX_FAULT_TIMEOUT_SECONDS:
+        raise PlanError("fault timeout must map to 1..300000 milliseconds")
+    milliseconds = math.ceil(value * 1000.0)
+    if milliseconds < 1 or milliseconds > 300000:
+        raise PlanError("fault timeout does not fit the watchdog millisecond range")
+    return milliseconds
 
 
 def expected_error_exit(action: str, returncode: int | None) -> bool:
@@ -128,6 +166,8 @@ HEADER_FIELDS = {"schema", "scenario", "seed", "contracts", "case", "extra"}
 ACTION_FIELDS = {
     "sql": {"op", "id", "target", "sql", "expect_error", "expect_sqlstate", "extra"},
     "checkpoint": {"op", "id", "target", "name", "extra"},
+    "materializer_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "name", "extra"},
+    "inspect_relation": {"op", "id", "target", "relation", "lsn", "extra"},
     "prepare_branch": {"op", "id", "target", "fork_lsn", "extra"},
     "install_branch": {"op", "id", "target", "fork_lsn", "extra"},
     "prepare_reader": {"op", "id", "target", "base", "read_lsn", "extra"},
@@ -152,6 +192,8 @@ ACTION_FIELDS = {
 REQUIRED_FIELDS = {
     "sql": {"target", "sql"},
     "checkpoint": {"target", "name"},
+    "materializer_fault": {"target", "fault", "action", "hit", "name", "timeout"},
+    "inspect_relation": {"target", "relation", "lsn"},
     "prepare_branch": {"target", "fork_lsn"},
     "install_branch": {"target", "fork_lsn"},
     "prepare_reader": {"target", "base", "read_lsn"},
@@ -178,6 +220,7 @@ SAFE_COMPONENT_FIELDS = {
     "reader_base": {"name"},
     "capture": {"name"},
     "install_reader": {"prepared"},
+    "materializer_fault": {"name"},
 }
 
 
@@ -507,7 +550,9 @@ RUNTIME_OPERATIONS = {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
     },
-    "materializer_smoke": {"sql", "checkpoint", "crash", "assert"},
+    "materializer_smoke": {
+        "sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert",
+    },
 }
 
 RUNTIME_CONSTRAINTS = {
@@ -544,6 +589,8 @@ RUNTIME_CONSTRAINTS = {
         "assert": {
             "target": ["writer", "materializer"], "oracle": ["sql_scalar"],
         },
+        "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
+        "inspect_relation": {"target": ["materializer"]},
     },
 }
 
@@ -778,6 +825,33 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
         if len(computes) != len(required) or set(computes) != required:
             raise PlanError(
                 f"runtime {runtime!r} requires exactly writer and materializer computes"
+            )
+        fault_actions = [
+            action for action in plan.actions if action["op"] == "materializer_fault"
+        ]
+        if len(fault_actions) > 1:
+            raise PlanError(
+                f"runtime {runtime!r} permits at most one materializer_fault action"
+            )
+        if fault_actions:
+            fault_action = fault_actions[0]
+            validate_fault_action(
+                fault_action, capabilities, f"{plan.path}:{fault_action['id']}",
+                require_model=False,
+            )
+            if fault_action["action"] != "pause":
+                raise PlanError(
+                    f"runtime {runtime!r} materializer_fault must use pause"
+                )
+            try:
+                fault_watchdog_milliseconds(fault_action.get("timeout"))
+            except PlanError as error:
+                raise PlanError(
+                    f"runtime {runtime!r} materializer_fault has invalid timeout: {error}"
+                ) from error
+        if any(action["op"] == "crash" and "fault" in action for action in plan.actions):
+            raise PlanError(
+                f"runtime {runtime!r} uses materializer_fault for named process faults"
             )
     elif runtime == "daemon_fault_smoke":
         named = [
@@ -1026,7 +1100,7 @@ def validate_plan(
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
-        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect", "hit"}:
+        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect", "hit", "timeout"}:
             require_string(action, field, action_context)
         if operation == "assert" and not isinstance(action["expect"], str):
             raise PlanError(f"{action_context}: expect must be a string")
@@ -1055,6 +1129,21 @@ def validate_plan(
             if boundary in boundaries:
                 raise PlanError(f"{action_context}: duplicate durability boundary {boundary!r}")
             boundaries.add(boundary)
+        if operation == "materializer_fault":
+            boundary = require_string(action, "name", action_context)
+            if boundary in boundaries:
+                raise PlanError(f"{action_context}: duplicate durability boundary {boundary!r}")
+            boundaries.add(boundary)
+            validate_fault_identity(action["fault"], "fault", action_context)
+            validate_fault_action(
+                action, capabilities, action_context, catalog_path, require_model=False,
+            )
+            if action.get("action") != "pause":
+                raise PlanError(
+                    f"{action_context}: materializer fault scenarios must use pause"
+                )
+        if operation == "inspect_relation":
+            validate_fault_identity(action["relation"], "relation", action_context)
         if operation == "reader_base":
             boundary = require_string(action, "name", action_context)
             if boundary in boundaries:
@@ -1098,21 +1187,11 @@ def validate_plan(
             steps = action["steps"]
             if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
                 raise PlanError(f"{action_context}: steps must be a positive integer")
-        if operation in ("crash", "set_fault") and "timeout" in action:
-            timeout = action["timeout"]
-            if (
-                not isinstance(timeout, (int, float))
-                or isinstance(timeout, bool)
-                or not math.isfinite(timeout)
-                or timeout <= 0
-            ):
-                raise PlanError(f"{action_context}: timeout must be finite and positive")
-            if action.get("action") == "pause" and (
-                timeout < 0.001 or timeout > 300.0
-            ):
-                raise PlanError(
-                    f"{action_context}: pause timeout must map to 1..300000 milliseconds"
-                )
+        if operation in ("crash", "set_fault", "materializer_fault") and "timeout" in action:
+            try:
+                fault_watchdog_milliseconds(action["timeout"])
+            except PlanError as error:
+                raise PlanError(f"{action_context}: {error}") from error
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
@@ -1519,7 +1598,7 @@ def _disarm_fault_control(control: Path) -> None:
 
 
 def _fault_report(
-    path: Path, expected_name: str, expected_hit: int, expected_pid: int,
+    path: Path, expected_name: str, expected_hit: int, expected_pid: int | None,
     expected_action: str = "crash", expected_scenario: str | None = None,
     expected_seed: int | None = None, expected_operation: str | None = None,
     expected_state: str | None = None,
@@ -1564,7 +1643,8 @@ def _fault_report(
         or not isinstance(value["hit"], int) or value["hit"] <= 0
         or value["hit"] > 2**63 - 1
         or not isinstance(value["pid"], int) or isinstance(value["pid"], bool)
-        or value["pid"] <= 0 or value["pid"] != expected_pid
+        or value["pid"] <= 0
+        or (expected_pid is not None and value["pid"] != expected_pid)
         or value["pid"] > 2**31 - 1
     ):
         raise FaultNotReached("fault report fields do not match expected fault")
@@ -2391,18 +2471,40 @@ def run_materializer_smoke(
     supervisor_proc: subprocess.Popen[str] | None = None
     materializer_generation = 0
     materializer_retention_generation = 0
+    materializer_recovered = False
+    materializer_fault_actions = [
+        item for item in plan.actions if item["op"] == "materializer_fault"
+    ]
+    materializer_fault = materializer_fault_actions[0] if materializer_fault_actions else None
+    fault_control = root / "control" / "materializer-fault"
+    fault_report = fault_control / "report.jsonl"
+    fault_trigger_proc: subprocess.Popen[str] | None = None
+    checkpoints: dict[str, dict[str, Any]] = {}
+    relation_observations: dict[str, dict[str, object]] = {}
 
-    def sql_result(socket_dir: Path, port: int, sql: str) -> subprocess.CompletedProcess[str]:
+    def sql_result(
+        socket_dir: Path, port: int, sql: str, timeout: float | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 str(pg_bin / "psql"), "-h", str(socket_dir), "-p", str(port),
                 "-U", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql,
             ],
             check=True, capture_output=True, encoding="utf-8", env=env,
+            timeout=timeout,
         )
 
-    def sql_scalar(socket_dir: Path, port: int, sql: str) -> str:
-        return sql_result(socket_dir, port, sql).stdout.strip()
+    def sql_scalar(
+        socket_dir: Path, port: int, sql: str, timeout: float | None = None,
+    ) -> str:
+        return sql_result(socket_dir, port, sql, timeout=timeout).stdout.strip()
+
+    def read_materializer_status() -> dict[str, str | None]:
+        return parse_materializer_status_row(sql_scalar(
+            writer_socket, writer_port,
+            "SELECT row(shipped_wal_lsn::text, materialized_wal_lsn::text, "
+            "lag_bytes::text)::text FROM pagestore_materializer_status();",
+        ))
 
     def wait_scalar(
         socket_dir: Path, port: int, sql: str, expected: str, context: str,
@@ -2459,7 +2561,39 @@ def run_materializer_smoke(
         materializer_retention_generation = retention_generation
         return generation
 
+    def pid_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def wait_materializer_stopped(pid: int, timeout: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout
+        last_status = ""
+        pidfile = materializer_data / "postmaster.pid"
+        while time.monotonic() < deadline:
+            status = subprocess.run(
+                [str(pg_bin / "pg_ctl"), "status", "-D", str(materializer_data)],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=env,
+            )
+            last_status = status.stdout.strip()
+            if not pidfile.exists() and not pid_exists(pid):
+                return
+            time.sleep(0.05)
+        raise PlanError(
+            "materializer immediate stop did not finish: "
+            f"pidfile={pidfile.exists()} pid_exists={pid_exists(pid)} "
+            f"pg_ctl={last_status!r}"
+        )
+
     def crash_materializer(reason: str) -> None:
+        pid = postmaster_pid()
         subprocess.run(
             [
                 str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
@@ -2468,10 +2602,34 @@ def run_materializer_smoke(
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env,
         )
+        wait_materializer_stopped(pid)
         events.emit(
             "process_stop", target="materializer",
             generation=materializer_generation, mode="immediate", reason=reason,
         )
+
+    def postmaster_pid() -> int:
+        try:
+            value = int(
+                (materializer_data / "postmaster.pid")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+        except (OSError, ValueError, IndexError) as error:
+            raise PlanError(f"materializer postmaster pid is unreadable: {error}") from error
+        if value <= 0:
+            raise PlanError(f"materializer postmaster pid is invalid: {value}")
+        return value
+
+    def lsn_value(value: str) -> int:
+        try:
+            high, low = value.split("/", 1)
+            result = (int(high, 16) << 32) | int(low, 16)
+        except (AttributeError, ValueError) as error:
+            raise PlanError(f"invalid PostgreSQL LSN {value!r}") from error
+        if result < 0:
+            raise PlanError(f"invalid PostgreSQL LSN {value!r}")
+        return result
 
     def archive_current_wal() -> str:
         wal_file = sql_scalar(
@@ -2515,12 +2673,14 @@ def run_materializer_smoke(
             f"supervisor did not publish zero lag for {action['name']}",
         )
         sync_materializer_generation(supervisor_status)
-        status = sql_scalar(
-            writer_socket, writer_port,
-            "SELECT row(shipped_wal_lsn::text, materialized_wal_lsn::text, "
-            "lag_bytes)::text FROM pagestore_materializer_status();",
-        )
-        shipped, materialized, lag = status.strip("()").split(",")
+        status = read_materializer_status()
+        shipped = status["shipped_wal_lsn"]
+        materialized = status["materialized_wal_lsn"]
+        lag = status["lag_bytes"]
+        if shipped is None or materialized is None or lag is None:
+            raise PlanError(
+                f"materializer boundary {action['name']} returned incomplete status"
+            )
         if lag != "0":
             raise PlanError(
                 f"materializer boundary {action['name']} retained {lag} bytes of lag"
@@ -2538,6 +2698,117 @@ def run_materializer_smoke(
             horizon=horizon,
         )
         return horizon
+
+    def inspect_relation_action(action: dict[str, Any], phase: str) -> None:
+        if not action["lsn"].startswith("$"):
+            raise PlanError(
+                f"inspect_relation {action['id']} requires a boundary LSN reference"
+            )
+        boundary = checkpoints.get(action["lsn"][1:])
+        if boundary is None:
+            raise PlanError(
+                f"inspect_relation {action['id']} references an unknown boundary"
+            )
+        metadata = sql_scalar(
+            writer_socket, writer_port,
+            "SELECT COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text "
+            "|| '|' || d.oid::text || '|' || pg_relation_filenode(c.oid)::text "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_database d ON d.datname = current_database() "
+            f"WHERE n.nspname = 'public' AND c.relname = '{action['relation']}'",
+        )
+        fields = metadata.split("|")
+        if len(fields) != 3 or any(not field.isdigit() for field in fields):
+            raise OracleMismatch(
+                f"could not resolve actual relation key for {action['relation']!r}: {metadata!r}"
+            )
+        relation_key = tuple(int(field) for field in fields)
+        relation = inspect_store(
+            inspector, shm, "relation", schema,
+            timeline=0, incarnation=1, relation_key=relation_key,
+            lsn=lsn_value(boundary["checkpoint_lsn"]),
+        )
+        main_fork = next(
+            (fork for fork in relation["forks"] if fork["fork"] == 0), None
+        )
+        if not relation["exists"] or main_fork is None or main_fork["nblocks"] <= 0:
+            raise OracleMismatch(
+                f"relation inspection did not find a nonempty main fork: {relation!r}"
+            )
+        observation = {
+            "relation_key": relation_key,
+            "declared_lsn": boundary["checkpoint_lsn"],
+            "main_nblocks": main_fork["nblocks"],
+            "result": relation,
+        }
+        relation_observations[action["lsn"]] = observation
+        if action["lsn"] == "$R2":
+            old_observation = relation_observations.get("$R1")
+            if old_observation is None:
+                raise OracleMismatch(
+                    "R2 relation inspection has no R1 relation snapshot"
+                )
+            if relation_key != old_observation["relation_key"]:
+                raise OracleMismatch(
+                    "relation key changed between the R1 and R2 snapshots"
+                )
+            if main_fork["nblocks"] <= old_observation["main_nblocks"]:
+                raise OracleMismatch(
+                    "R2 relation main fork did not grow beyond the old R1 snapshot"
+                )
+        events.emit(
+            "relation_inspection", id=action["id"], target=action["target"],
+            relation=action["relation"], timeline=0, incarnation=1,
+            relation_key=relation_key, declared_lsn=boundary["checkpoint_lsn"],
+            result=relation, main_nblocks=main_fork["nblocks"], phase=phase,
+            compared_to_r1=action["lsn"] == "$R2",
+        )
+
+    cleanup_errors: list[str] = []
+    run_error: Exception | None = None
+
+    def cleanup_step(label: str, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception as error:
+            cleanup_errors.append(f"{label}: {error}")
+
+    def stop_child(process: subprocess.Popen[str] | None) -> None:
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def stop_materializer_for_cleanup() -> None:
+        if not (materializer_data / "postmaster.pid").exists():
+            return
+        pid = postmaster_pid()
+        subprocess.run(
+            [str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+             "-m", "immediate", "-w", "stop"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        wait_materializer_stopped(pid)
+
+    def stop_writer_for_cleanup() -> None:
+        pidfile = writer_data / "postmaster.pid"
+        if not pidfile.exists():
+            return
+        pid = int(pidfile.read_text(encoding="utf-8").splitlines()[0])
+        subprocess.run(
+            [str(pg_bin / "pg_ctl"), "-D", str(writer_data),
+             "-m", "immediate", "-w", "stop"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        deadline = time.monotonic() + 15.0
+        while pidfile.exists() or pid_exists(pid):
+            if time.monotonic() >= deadline:
+                raise PlanError("writer immediate stop did not finish")
+            time.sleep(0.05)
 
     try:
         events.emit(
@@ -2672,6 +2943,23 @@ def run_materializer_smoke(
             ) + "\n",
             encoding="utf-8",
         )
+        supervisor_env = env.copy()
+        if materializer_fault is not None:
+            fault_control.mkdir(mode=0o700, parents=True, exist_ok=False)
+            supervisor_env.update(
+                {
+                    "PAGESTORE_TEST_FAULT_NAME": materializer_fault["fault"],
+                    "PAGESTORE_TEST_FAULT_ACTION": materializer_fault["action"],
+                    "PAGESTORE_TEST_FAULT_HIT": str(materializer_fault["hit"]),
+                    "PAGESTORE_TEST_FAULT_DIR": str(fault_control),
+                    "PAGESTORE_TEST_FAULT_SCENARIO": plan.header["scenario"],
+                    "PAGESTORE_TEST_FAULT_SEED": str(plan.header["seed"]),
+                    "PAGESTORE_TEST_FAULT_OPERATION": materializer_fault["id"],
+                    "PAGESTORE_TEST_FAULT_WATCHDOG_MS": str(
+                        fault_watchdog_milliseconds(materializer_fault["timeout"])
+                    ),
+                }
+            )
         with (trace / "materializer-supervisor.log").open(
             "w", encoding="utf-8"
         ) as log:
@@ -2680,7 +2968,7 @@ def run_materializer_smoke(
                     sys.executable, str(supervisor),
                     "--config", str(supervisor_config),
                 ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
             )
         supervisor_status = wait_supervisor_status(
             lambda status: (
@@ -2728,7 +3016,7 @@ def run_materializer_smoke(
                     sys.executable, str(supervisor),
                     "--config", str(supervisor_config),
                 ],
-                stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+                stdout=log, stderr=subprocess.STDOUT, text=True, env=supervisor_env,
             )
         supervisor_status = wait_supervisor_status(
             lambda status: (
@@ -2802,6 +3090,7 @@ def run_materializer_smoke(
                 ).stdout.strip().splitlines()
                 checkpoint_lsn = output[-1]
                 horizon = make_boundary_durable(action, checkpoint_lsn)
+                checkpoints[action["name"]] = horizon
                 (artifacts / f"{action['name']}.json").write_text(
                     json.dumps(horizon, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
@@ -2809,6 +3098,284 @@ def run_materializer_smoke(
                 events.emit(
                     "checkpoint", id=action["id"], name=action["name"],
                     horizon=horizon,
+                )
+            elif action["op"] == "materializer_fault":
+                if materializer_fault is None or action["id"] != materializer_fault["id"]:
+                    raise PlanError(
+                        "materializer smoke encountered an unexpected fault action"
+                    )
+                if supervisor_proc is not None and supervisor_proc.poll() is None:
+                    supervisor_proc.terminate()
+                    try:
+                        supervisor_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        supervisor_proc.kill()
+                        supervisor_proc.wait(timeout=5)
+                    events.emit(
+                        "process_stop", target="materializer-supervisor",
+                        pid=supervisor_proc.pid,
+                        reason="harness owns the named restartpoint trigger",
+                    )
+                _atomic_arm_marker(fault_control / "arm")
+                events.emit(
+                    "fault_arm", target="materializer", name=action["fault"],
+                    hit=action["hit"], action=action["action"],
+                )
+                output = sql_result(
+                    writer_socket, writer_port,
+                    "CHECKPOINT; SELECT pg_current_wal_lsn();",
+                ).stdout.strip().splitlines()
+                checkpoint_lsn = output[-1]
+                wal_file = archive_current_wal()
+                wait_scalar(
+                    materializer_socket, materializer_port,
+                    f"SELECT pg_last_wal_replay_lsn() >= '{checkpoint_lsn}'::pg_lsn",
+                    "t", f"materializer did not replay fault checkpoint {checkpoint_lsn}",
+                    timeout=float(action.get("timeout", 30.0)),
+                )
+                replay_before_trigger = sql_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn)::text",
+                )
+                marker_before_trigger = sql_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT pagestore_materialized_wal_lsn()::text",
+                )
+                fault_trigger_proc = subprocess.Popen(
+                    [
+                        str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
+                        "-m", "fast", "-w", "stop",
+                    ],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                )
+                events.emit(
+                    "restartpoint_trigger", target="materializer",
+                    pid=fault_trigger_proc.pid, model="fast_shutdown",
+                    replay_lsn=replay_before_trigger,
+                    marker_lsn=marker_before_trigger,
+                )
+                deadline = time.monotonic() + float(action.get("timeout", 30.0))
+                while not fault_report.exists() and time.monotonic() < deadline:
+                    if fault_trigger_proc.poll() is not None and not fault_report.exists():
+                        raise PlanError(
+                            "materializer fast-stop trigger exited before the named fault report"
+                        )
+                    time.sleep(0.02)
+                if not fault_report.exists():
+                    _capture_fault_diagnostics(
+                        root, fault_control, trace / "materializer.log",
+                        reason="materializer fault watchdog expired before report",
+                        scenario=plan.header["scenario"], seed=plan.header["seed"],
+                        fault=action["fault"], action=action["action"],
+                        hit=action["hit"], operation=action["id"], process=None,
+                    )
+                    raise FaultNotReached(
+                        f"materializer fault {action['fault']!r} watchdog expired"
+                    )
+                report = _fault_report(
+                    fault_report, action["fault"], action["hit"], None,
+                    action["action"], plan.header["scenario"],
+                    plan.header["seed"], action["id"],
+                )
+                (trace / "materializer-fault-report.jsonl").write_text(
+                    fault_report.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                old_postmaster_pid = postmaster_pid()
+                fault_pid = report["pid"]
+                if fault_pid in {old_postmaster_pid, supervisor_proc.pid if supervisor_proc else -1}:
+                    raise PlanError(
+                        "materializer fault report was not emitted by a recovery child"
+                    )
+                replay_at_fault = replay_before_trigger
+                declared_lsn = lsn_value(checkpoint_lsn)
+                marker_at_report = None
+                marker_at_report_error = None
+                try:
+                    marker_at_report = sql_scalar(
+                        materializer_socket, materializer_port,
+                        "SELECT pagestore_materialized_wal_lsn()::text",
+                        timeout=2.0,
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    marker_at_report_error = str(error)
+                baseline_marker = checkpoints["R1"]["materialized_wal_lsn"]
+                if baseline_marker is None:
+                    raise OracleMismatch("R1 has no durable materializer marker")
+                if marker_at_report is not None:
+                    if action["fault"] == "materializer.after_relation_sync" and (
+                        marker_at_report != baseline_marker
+                        or lsn_value(marker_at_report) >= declared_lsn
+                    ):
+                        raise OracleMismatch(
+                            "before-marker fault report did not observe the unchanged R1 marker"
+                        )
+                    if action["fault"] == "materializer.after_marker_sync" and (
+                        lsn_value(marker_at_report) < declared_lsn
+                    ):
+                        raise OracleMismatch(
+                            "after-marker fault report did not observe the durable R2 marker"
+                        )
+                events.emit(
+                    "fault_reached", target="materializer", name=action["fault"],
+                    report=report, reached=True, fault_pid=fault_pid,
+                    postmaster_pid=old_postmaster_pid, replay_lsn=replay_at_fault,
+                    marker_lsn=marker_at_report,
+                    marker_source=(
+                        "materializer SQL at report"
+                        if marker_at_report is not None
+                        else "post-crash writer status required"
+                    ),
+                    marker_sql_error=marker_at_report_error,
+                    declared_lsn=checkpoint_lsn,
+                    wal_file=wal_file,
+                )
+                crashed_generation = materializer_generation
+                crashed_retention_generation = materializer_retention_generation
+                crash_materializer(action["id"])
+                if fault_trigger_proc is not None:
+                    try:
+                        fault_trigger_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        fault_trigger_proc.kill()
+                        fault_trigger_proc.wait(timeout=5)
+                    fault_trigger_proc = None
+                _disarm_fault_control(fault_control)
+                _cleanup_fault_control(fault_control)
+                if (materializer_data / "postmaster.pid").exists():
+                    raise OracleMismatch(
+                        "materializer remained up while collecting post-crash evidence"
+                    )
+                post_crash_status = read_materializer_status()
+                post_crash_marker = post_crash_status.get("materialized_wal_lsn")
+                if baseline_marker is None or post_crash_marker is None:
+                    raise OracleMismatch(
+                        "post-crash materializer status did not contain a durable marker"
+                    )
+                if action["fault"] == "materializer.after_relation_sync":
+                    if post_crash_marker != baseline_marker:
+                        raise OracleMismatch(
+                            "before-marker crash changed the durable marker beyond R1"
+                        )
+                    if lsn_value(post_crash_marker) >= declared_lsn:
+                        raise OracleMismatch(
+                            "before-marker crash left a durable marker at or beyond R2"
+                        )
+                elif lsn_value(post_crash_marker) < declared_lsn:
+                    raise OracleMismatch(
+                        "after-marker crash did not leave R2's marker durable"
+                    )
+                checkpoints[action["name"]] = {"checkpoint_lsn": checkpoint_lsn}
+                for relation_action in plan.actions:
+                    if (
+                        relation_action["op"] == "inspect_relation"
+                        and relation_action["lsn"] in {"$R1", "$R2"}
+                    ):
+                        pre_action = dict(relation_action)
+                        pre_action["id"] = (
+                            f"pre-recovery-{relation_action['id']}"
+                        )
+                        inspect_relation_action(
+                            pre_action, "post_crash_pre_recovery"
+                        )
+                events.emit(
+                    "post_crash_durable_state", target="materializer",
+                    status=post_crash_status, marker_lsn=post_crash_marker,
+                    baseline_marker_lsn=baseline_marker,
+                    declared_lsn=checkpoint_lsn,
+                    materializer_down=True,
+                    marker_source="writer status direct store read after report",
+                )
+                events.emit(
+                    "crash", id=action["id"], target="materializer", model="compute",
+                    postmaster_pid=old_postmaster_pid, fault_pid=fault_pid,
+                    generation=crashed_generation,
+                    retention_generation=crashed_retention_generation,
+                )
+                with (trace / "materializer-supervisor-recovery.log").open(
+                    "w", encoding="utf-8"
+                ) as log:
+                    supervisor_proc = subprocess.Popen(
+                        [sys.executable, str(supervisor), "--config", str(supervisor_config)],
+                        stdout=log, stderr=subprocess.STDOUT, text=True, env=env,
+                    )
+                supervisor_status = wait_supervisor_status(
+                    lambda status: (
+                        status.get("owner_pid") == supervisor_proc.pid
+                        and status.get("state")
+                        in {"running", "waiting_for_progress_api"}
+                    ),
+                    "materializer supervisor did not recover the faulted postmaster",
+                    timeout=float(action.get("timeout", 30.0)) + 20.0,
+                )
+                sync_materializer_generation(supervisor_status)
+                new_postmaster_pid = postmaster_pid()
+                if new_postmaster_pid == old_postmaster_pid:
+                    raise OracleMismatch(
+                        "materializer recovery reused the faulted postmaster PID"
+                    )
+                wait_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT pg_is_in_recovery() AND "
+                    "current_setting('pagestore.materializer')::boolean",
+                    "t", "recovered materializer did not become healthy",
+                    timeout=float(action.get("timeout", 30.0)) + 20.0,
+                )
+                materializer_recovered = True
+                recovered_replay_lsn = sql_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn)::text",
+                )
+                recovered_marker_lsn = sql_scalar(
+                    materializer_socket, materializer_port,
+                    "SELECT pagestore_materialized_wal_lsn()::text",
+                )
+                recovered_status = read_materializer_status()
+                if lsn_value(recovered_marker_lsn) < lsn_value(post_crash_marker):
+                    raise OracleMismatch(
+                        "recovered materializer marker regressed across process crash"
+                    )
+                if (
+                    action["fault"] == "materializer.after_marker_sync"
+                    and lsn_value(recovered_marker_lsn) < declared_lsn
+                ):
+                    raise OracleMismatch(
+                        "recovered materializer marker did not cover the declared checkpoint"
+                    )
+                horizon = {
+                    "checkpoint_lsn": checkpoint_lsn,
+                    "shipped_wal_lsn": post_crash_status["shipped_wal_lsn"],
+                    "materialized_wal_lsn": post_crash_status["materialized_wal_lsn"],
+                    "lag_bytes": post_crash_status["lag_bytes"],
+                    "post_crash_status": post_crash_status,
+                    "recovered_status": recovered_status,
+                    "wal_file": wal_file,
+                    "materializer_generation": materializer_generation,
+                    "old_postmaster_pid": old_postmaster_pid,
+                    "new_postmaster_pid": new_postmaster_pid,
+                    "replay_lsn_at_fault": replay_at_fault,
+                    "recovered_replay_lsn": recovered_replay_lsn,
+                    "marker_before_trigger": marker_before_trigger,
+                    "marker_at_report": marker_at_report,
+                    "marker_after_report_before_recovery": post_crash_marker,
+                    "marker_report_sql_error": marker_at_report_error,
+                    "post_crash_marker_lsn": post_crash_marker,
+                    "recovered_marker_lsn": recovered_marker_lsn,
+                    "fault_pid": fault_pid,
+                    "fault_report_lines": 1,
+                }
+                checkpoints[action["name"]] = horizon
+                (artifacts / f"{action['name']}.json").write_text(
+                    json.dumps(horizon, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                events.emit(
+                    "materialized_boundary", id=action["id"], name=action["name"],
+                    horizon=horizon, marker_monotonic=True, fault_replayed_once=True,
+                )
+            elif action["op"] == "inspect_relation":
+                inspect_relation_action(
+                    action,
+                    "post_recovery" if materializer_recovered else "pre_crash",
                 )
             elif action["op"] == "crash":
                 crashed_generation = materializer_generation
@@ -2874,6 +3441,7 @@ def run_materializer_smoke(
             "run_pass", materializer_generation=materializer_generation
         )
     except Exception as error:
+        run_error = error
         classification = (
             "oracle_mismatch" if isinstance(error, OracleMismatch) else "setup"
         )
@@ -2891,35 +3459,21 @@ def run_materializer_smoke(
             f"materializer smoke failed; failure bundle: {root}: {error}"
         ) from error
     finally:
-        if supervisor_proc is not None and supervisor_proc.poll() is None:
-            supervisor_proc.terminate()
-            try:
-                supervisor_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                supervisor_proc.kill()
-                supervisor_proc.wait(timeout=5)
-        if (materializer_data / "postmaster.pid").exists():
-            subprocess.run(
-                [
-                    str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
-                    "-m", "immediate", "-w", "stop",
-                ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-            )
-        if (writer_data / "postmaster.pid").exists():
-            subprocess.run(
-                [
-                    str(pg_bin / "pg_ctl"), "-D", str(writer_data),
-                    "-m", "immediate", "-w", "stop",
-                ],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-            )
-        if dproc is not None and dproc.poll() is None:
-            dproc.terminate()
-            dproc.wait(timeout=5)
-        remove_shm(shm)
+        cleanup_step("fault trigger", lambda: stop_child(fault_trigger_proc))
+        cleanup_step("fault disarm", lambda: _disarm_fault_control(fault_control))
+        cleanup_step("fault control cleanup", lambda: _cleanup_fault_control(fault_control))
+        cleanup_step("materializer supervisor", lambda: stop_child(supervisor_proc))
+        cleanup_step("materializer postmaster", stop_materializer_for_cleanup)
+        cleanup_step("writer postmaster", stop_writer_for_cleanup)
+        cleanup_step("pagestore daemon", lambda: stop_child(dproc))
+        cleanup_step("shared memory", lambda: remove_shm(shm))
     if temporary and not keep:
-        shutil.rmtree(root)
+        try:
+            shutil.rmtree(root)
+        except Exception as error:
+            cleanup_errors.append(f"run root cleanup: {error}")
+    if cleanup_errors and run_error is None:
+        raise PlanError("materializer smoke cleanup failed: " + "; ".join(cleanup_errors))
     return root
 
 
