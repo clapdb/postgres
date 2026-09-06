@@ -106,6 +106,32 @@ def relation_metadata_sql(relation: str) -> str:
     )
 
 
+def record_relation_observation(
+    observations: dict[tuple[str, str], dict[str, object]],
+    relation_name: str,
+    boundary_ref: str,
+    observation: dict[str, object],
+    fault_boundary_ref: str | None,
+) -> bool:
+    observations[(relation_name, boundary_ref)] = observation
+    if fault_boundary_ref is None or boundary_ref != fault_boundary_ref:
+        return False
+    old_observation = observations.get((relation_name, "$R1"))
+    if old_observation is None:
+        raise OracleMismatch(
+            f"{relation_name} fault-boundary relation inspection has no R1 snapshot"
+        )
+    if observation["relation_key"] != old_observation["relation_key"]:
+        raise OracleMismatch(
+            f"{relation_name} relation key changed between the R1 and fault snapshots"
+        )
+    if observation["main_nblocks"] <= old_observation["main_nblocks"]:
+        raise OracleMismatch(
+            f"{relation_name} fault-boundary main fork did not grow beyond R1"
+        )
+    return True
+
+
 def fault_watchdog_milliseconds(value: Any) -> int:
     if (
         not isinstance(value, (int, float))
@@ -2558,7 +2584,7 @@ def run_materializer_smoke(
     fault_report = fault_control / "report.jsonl"
     fault_trigger_proc: subprocess.Popen[str] | None = None
     checkpoints: dict[str, dict[str, Any]] = {}
-    relation_observations: dict[str, dict[str, object]] = {}
+    relation_observations: dict[tuple[str, str], dict[str, object]] = {}
 
     def sql_result(
         socket_dir: Path, port: int, sql: str, timeout: float | None = None,
@@ -2814,27 +2840,20 @@ def run_materializer_smoke(
             "main_nblocks": main_fork["nblocks"],
             "result": relation,
         }
-        relation_observations[action["lsn"]] = observation
-        if action["lsn"] == "$R2":
-            old_observation = relation_observations.get("$R1")
-            if old_observation is None:
-                raise OracleMismatch(
-                    "R2 relation inspection has no R1 relation snapshot"
-                )
-            if relation_key != old_observation["relation_key"]:
-                raise OracleMismatch(
-                    "relation key changed between the R1 and R2 snapshots"
-                )
-            if main_fork["nblocks"] <= old_observation["main_nblocks"]:
-                raise OracleMismatch(
-                    "R2 relation main fork did not grow beyond the old R1 snapshot"
-                )
+        fault_boundary_ref = (
+            f"${materializer_fault['name']}"
+            if materializer_fault is not None else None
+        )
+        compared_to_r1 = record_relation_observation(
+            relation_observations, action["relation"], action["lsn"],
+            observation, fault_boundary_ref,
+        )
         events.emit(
             "relation_inspection", id=action["id"], target=action["target"],
             relation=action["relation"], timeline=0, incarnation=1,
             relation_key=relation_key, declared_lsn=boundary["checkpoint_lsn"],
             result=relation, main_nblocks=main_fork["nblocks"], phase=phase,
-            compared_to_r1=action["lsn"] == "$R2",
+            compared_to_r1=compared_to_r1,
         )
 
     cleanup_errors: list[str] = []
@@ -3189,11 +3208,6 @@ def run_materializer_smoke(
                         pid=supervisor_proc.pid,
                         reason="harness owns the named restartpoint trigger",
                     )
-                _atomic_arm_marker(fault_control / "arm")
-                events.emit(
-                    "fault_arm", target="materializer", name=action["fault"],
-                    hit=action["hit"], action=action["action"],
-                )
                 output = sql_result(
                     writer_socket, writer_port,
                     "CHECKPOINT; SELECT pg_current_wal_lsn();",
@@ -3213,6 +3227,11 @@ def run_materializer_smoke(
                 marker_before_trigger = sql_scalar(
                     materializer_socket, materializer_port,
                     "SELECT pagestore_materialized_wal_lsn()::text",
+                )
+                _atomic_arm_marker(fault_control / "arm")
+                events.emit(
+                    "fault_arm", target="materializer", name=action["fault"],
+                    hit=action["hit"], action=action["action"],
                 )
                 fault_trigger_proc = subprocess.Popen(
                     [
@@ -3338,10 +3357,11 @@ def run_materializer_smoke(
                         "after-marker crash did not leave R2's marker durable"
                     )
                 checkpoints[action["name"]] = {"checkpoint_lsn": checkpoint_lsn}
+                fault_boundary_ref = f"${action['name']}"
                 for relation_action in plan.actions:
                     if (
                         relation_action["op"] == "inspect_relation"
-                        and relation_action["lsn"] in {"$R1", "$R2"}
+                        and relation_action["lsn"] in {"$R1", fault_boundary_ref}
                     ):
                         pre_action = dict(relation_action)
                         pre_action["id"] = (

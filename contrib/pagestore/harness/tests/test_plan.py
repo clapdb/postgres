@@ -117,6 +117,41 @@ class PlanValidationTests(unittest.TestCase):
             source.index("materializer_recovered = True"),
         )
 
+    def test_materializer_fault_arms_only_after_replay_and_marker_observation(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        start = source.index('elif action["op"] == "materializer_fault":')
+        wait = source.index("materializer did not replay fault checkpoint", start)
+        marker = source.index("marker_before_trigger =", start)
+        arm = source.index('_atomic_arm_marker(fault_control / "arm")', start)
+        trigger = source.index("fault_trigger_proc = subprocess.Popen", start)
+        self.assertLess(wait, arm)
+        self.assertLess(marker, arm)
+        self.assertLess(arm, trigger)
+
+    def test_relation_observation_comparison_is_per_relation(self):
+        observations = {}
+        for name, key, blocks in (
+            ("relation_a", (1, 1, 1), 10),
+            ("relation_b", (1, 1, 2), 2),
+        ):
+            MODULE.record_relation_observation(
+                observations, name, "$R1",
+                {"relation_key": key, "main_nblocks": blocks}, "$R9",
+            )
+        self.assertTrue(
+            MODULE.record_relation_observation(
+                observations, "relation_a", "$R9",
+                {"relation_key": (1, 1, 1), "main_nblocks": 11}, "$R9",
+            )
+        )
+        self.assertTrue(
+            MODULE.record_relation_observation(
+                observations, "relation_b", "$R9",
+                {"relation_key": (1, 1, 2), "main_nblocks": 3}, "$R9",
+            )
+        )
+        self.assertEqual(len(observations), 4)
+
     def test_materializer_status_and_fault_errors_have_specific_classes(self):
         self.assertEqual(
             MODULE.fault_failure_classification(MODULE.OracleMismatch("oracle")),
@@ -1105,9 +1140,9 @@ class PlanValidationTests(unittest.TestCase):
              "relation": "materializer_crash_relation", "lsn": "$R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_relation_sync", "action": "pause",
-             "hit": 1, "timeout": 30, "name": "R2"},
-            {"op": "inspect_relation", "id": "inspect-r2", "target": "materializer",
-             "relation": "materializer_crash_relation", "lsn": "$R2"},
+             "hit": 1, "timeout": 30, "name": "R9"},
+            {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+             "relation": "materializer_crash_relation", "lsn": "$R9"},
         ])
         plan = MODULE.read_plan(path)
         MODULE.validate_plan(plan, capabilities)
