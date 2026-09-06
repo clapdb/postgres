@@ -257,6 +257,12 @@ logical parent/child timelines; and optional database, user, polling, progress,
 and command timeouts.  `--check-config` validates the topology and prepares the
 owner-only socket/artifact directories.
 
+The H1 branch-crash slice adds a CRC-protected operation journal around the
+prepared receipt and service restoration. It covers only the controller's
+prepared-receipt, materializer-resume, and normal-writer-restore transitions;
+bootstrap installation, page-store layer recovery, and GC are outside this
+slice.
+
 The controller serializes the complete branch boundary:
 
 1. Take a writer-PGDATA operation lock and the materializer supervisor's own
