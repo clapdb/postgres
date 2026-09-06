@@ -114,6 +114,45 @@ run_inspector(const char *shm, const char *operation, char *output, size_t outpu
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static int
+run_inspector_timeline(const char *shm, uint32_t timeline,
+						   char *output, size_t output_size)
+{
+	char id[32];
+	int pipefd[2];
+	pid_t pid;
+	int status;
+	ssize_t nread;
+
+	snprintf(id, sizeof(id), "%u", timeline);
+	if (pipe(pipefd) != 0)
+		return 0;
+	pid = fork();
+	if (pid < 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return 0;
+	}
+	if (pid == 0)
+	{
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		execl(inspect_path, inspect_path, "--shm", shm, "timeline", id,
+			  (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	nread = read(pipefd[0], output, output_size - 1);
+	close(pipefd[0]);
+	if (nread < 0)
+		nread = 0;
+	output[nread] = '\0';
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static void
 check_inspector(const char *shm, uint32_t page_size)
 {
@@ -154,10 +193,9 @@ check_inspector(const char *shm, uint32_t page_size)
 		  "read-only inspector reports page-pruning counters");
 	check(run_inspector(shm, "timeline", output, sizeof(output)),
 		  "read-only inspector timeline snapshot exits cleanly");
-	check(strcmp(output, "{\"timeline_count\":1,\"live_timelines\":1,"
-			 "\"deleting_timelines\":0,\"deleted_timelines\":0,"
-			 "\"metadata_poisoned\":false}\n") == 0,
-		  "read-only inspector reports exact initial timeline values and JSON boolean");
+	check(strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
+				 "\"retained_horizon\":0}\n") == 0,
+		  "read-only inspector reports the exact root timeline contract");
 	check(run_inspector(shm, "manifest", output, sizeof(output)),
 		  "read-only inspector manifest snapshot exits cleanly");
 	check(strcmp(output, "{\"layer_count\":0,\"deleting_layers\":0,"
@@ -170,13 +208,15 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"deleting_layers\":") != NULL &&
 		  strstr(output, "\"remote_cleanup_pending\":") != NULL &&
 		  (strstr(output, "\"forkmeta_pending\":true") != NULL ||
-		   strstr(output, "\"forkmeta_pending\":false") != NULL),
+		   strstr(output, "\"forkmeta_pending\":false") != NULL) &&
+		  (strstr(output, "\"forkmeta_poisoned\":true") != NULL ||
+		   strstr(output, "\"forkmeta_poisoned\":false") != NULL),
 		  "read-only inspector reports the GC snapshot contract");
 	check(run_inspector(shm, "owners", output, sizeof(output)),
 		  "read-only inspector owners snapshot exits cleanly");
 	check(strcmp(output, "{\"owner_count\":0,\"page_history_owners\":0,"
-			 "\"wal_owners\":0,\"wal_index_owners\":0,"
-			 "\"max_generation\":0}\n") == 0,
+				 "\"wal_owners\":0,\"wal_index_owners\":0,"
+				 "\"max_generation\":0,\"retention_poisoned\":false}\n") == 0,
 		  "read-only inspector reports exact initial owner values");
 }
 
@@ -216,6 +256,8 @@ check_inspector_seqlock(void)
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
 	hdr->startup_state = PS_SHM_READY;
+	hdr->inspection.timeline_entries[0].parent_timeline = -1;
+	hdr->inspection.timeline_entries[0].defined = 1;
 	hdr->inspection.timeline_count = 99;
 	ps_store_release_u64(&hdr->inspection_metrics_seq, 1);
 	writer = fork();
@@ -226,14 +268,12 @@ check_inspector_seqlock(void)
 		hdr->inspection.live_timelines = 2;
 		hdr->inspection.deleting_timelines = 1;
 		hdr->inspection.deleted_timelines = 0;
-		hdr->inspection.metadata_poisoned = 1;
 		ps_store_release_u64(&hdr->inspection_metrics_seq, 2);
 		_exit(0);
 	}
 	check(run_inspector(name, "timeline", output, sizeof(output)) &&
-		  strcmp(output, "{\"timeline_count\":3,\"live_timelines\":2,"
-				 "\"deleting_timelines\":1,\"deleted_timelines\":0,"
-				 "\"metadata_poisoned\":true}\n") == 0,
+		  strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
+				 "\"retained_horizon\":0}\n") == 0,
 		  "inspector retries an odd seqlock and never emits a torn snapshot");
 	waitpid(writer, &status, 0);
 	check(ps_load_acquire(&ps_channel(base, 0)->state) == PS_STATE_IDLE,
@@ -3922,9 +3962,13 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 
 		check(run_inspector(shm, "owners", output, sizeof(output)) &&
 			  strcmp(output, "{\"owner_count\":3,\"page_history_owners\":2,"
-					 "\"wal_owners\":2,\"wal_index_owners\":2,"
-					 "\"max_generation\":1}\n") == 0,
+						 "\"wal_owners\":2,\"wal_index_owners\":2,"
+						 "\"max_generation\":1,\"retention_poisoned\":false}\n") == 0,
 			  "owner snapshot is refreshed before a successful SET completes");
+		check(run_inspector_timeline(shm, 0, output, sizeof(output)) &&
+			  strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
+						 "\"retained_horizon\":4000}\n") == 0,
+			  "timeline snapshot reports the effective page-history horizon");
 	}
 	check(op_retention_get(0, &pin, &count) && count == 3 &&
 		  pin.timeline == 0 && pin.owner_kind == PS_RETENTION_OWNER_READER &&
@@ -4140,6 +4184,16 @@ run_branch_suite(const char *daemon_path, const char *tmpbase)
 
 	/* branch T1 off main at LSN 1500 -- instant, no data copied */
 	op_create_branch(1, 0, 1500);
+	{
+		char output[256];
+
+		check(run_inspector_timeline(shm, 1, output, sizeof(output)) &&
+			  strcmp(output, "{\"parent_timeline\":0,\"fork_lsn\":1500,"
+						 "\"retained_horizon\":0}\n") == 0,
+			  "read-only inspector returns the immutable per-ID branch entry");
+		check(!run_inspector_timeline(shm, 999, output, sizeof(output)),
+			  "read-only inspector rejects a nonexistent timeline clearly");
+	}
 	op_read_tl(1, REL_B, FORK0, 0, rb);
 	check(page_has_tag(rb, ps, 11), "branch sees parent page via read-through (no copy)");
 

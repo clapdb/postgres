@@ -1194,48 +1194,36 @@ ps_retention_count(uint32_t *count_out)
 	return rc;
 }
 
-void
-ps_retention_diagnostic_counts(uint64_t *owner_count,
-							   uint64_t *page_history_owners,
-							   uint64_t *wal_owners,
-							   uint64_t *wal_index_owners,
-							   uint64_t *max_generation)
+int
+ps_retention_diagnostic_snapshot(PsRetentionDiagnostic *out)
 {
-	uint64_t	owners = 0;
-	uint64_t	page = 0;
-	uint64_t	wal = 0;
-	uint64_t	wal_index = 0;
-	uint64_t	generation = 0;
-
+	if (out == NULL)
+		return -1;
+	memset(out, 0, sizeof(*out));
 	pthread_mutex_lock(&retention_lock);
-	for (uint32_t i = 0; i < retention_npins; i++)
+	if (retention_is_poisoned)
+		out->poisoned = 1;
+	else
 	{
-		const PsRetentionPin *pin = &retention_pins[i];
+		for (uint32_t i = 0; i < retention_npins; i++)
+		{
+			const PsRetentionPin *pin = &retention_pins[i];
 
-		if (!retention_pin_active(pin))
-			continue;
-		owners++;
-		if (pin->resources & PS_RETENTION_RESOURCE_PAGE_HISTORY)
-			page++;
-		if (pin->resources & PS_RETENTION_RESOURCE_WAL)
-			wal++;
-		if (pin->resources & PS_RETENTION_RESOURCE_WAL_INDEX)
-			wal_index++;
-		if (pin->generation > generation)
-			generation = pin->generation;
+			if (!retention_pin_active(pin))
+				continue;
+			out->owner_count++;
+			if (pin->resources & PS_RETENTION_RESOURCE_PAGE_HISTORY)
+				out->page_history_owners++;
+			if (pin->resources & PS_RETENTION_RESOURCE_WAL)
+				out->wal_owners++;
+			if (pin->resources & PS_RETENTION_RESOURCE_WAL_INDEX)
+				out->wal_index_owners++;
+			if (pin->generation > out->max_generation)
+				out->max_generation = pin->generation;
+		}
 	}
 	pthread_mutex_unlock(&retention_lock);
-
-	if (owner_count)
-		*owner_count = owners;
-	if (page_history_owners)
-		*page_history_owners = page;
-	if (wal_owners)
-		*wal_owners = wal;
-	if (wal_index_owners)
-		*wal_index_owners = wal_index;
-	if (max_generation)
-		*max_generation = generation;
+	return 0;
 }
 
 int

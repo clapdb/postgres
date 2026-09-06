@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		41	/* 41: bounded runtime inspection snapshots;
+#define PS_SHM_VERSION		42	/* 42: per-timeline inspection snapshots;
+								 * 41: bounded runtime inspection snapshots;
 							 * 40: forkmeta reclaim backpressure metrics;
 								 * 39: WAL-index reclaim backpressure metrics;
 								 * 38: request generations and daemon-owned
@@ -369,6 +370,20 @@ typedef struct PsBackpressureMetrics
 	uint64_t	foreground_wait_ns;
 } PsBackpressureMetrics;
 
+#define PS_INSPECTION_MAX_TIMELINES	1024
+
+/* One immutable timeline entry in the diagnostic publication.  `defined` is
+ * an internal presence bit; inspectors expose only the three contract fields.
+ * The signed parent makes the root's -1 unambiguous. */
+typedef struct PsInspectionTimeline
+{
+	int64_t		parent_timeline;
+	uint64_t	fork_lsn;
+	uint64_t	retained_horizon;
+	uint32_t	defined;
+	uint32_t	reserved;
+} PsInspectionTimeline;
+
 /* A bounded runtime diagnostic snapshot.  Writers publish the complete
  * structure under inspection_metrics_seq; readers never inspect live core
  * state or claim a channel.  Plain fields are intentional: the sequence is
@@ -400,6 +415,12 @@ typedef struct PsInspectionMetrics
 	uint64_t	wal_owners;
 	uint64_t	wal_index_owners;
 	uint64_t	max_generation;
+	uint32_t	retention_poisoned;
+	uint32_t	reserved4;
+	uint32_t	forkmeta_poisoned;
+	uint32_t	reserved5;
+
+	PsInspectionTimeline timeline_entries[PS_INSPECTION_MAX_TIMELINES];
 } PsInspectionMetrics;
 
 typedef struct PsShmHeader

@@ -101,6 +101,9 @@ static pthread_mutex_t inspection_metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t inspection_mutation_epoch;
 static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
+static volatile int inspection_timeline_cache_dirty = 1;
+static int inspection_timeline_cache_valid;
+static PsInspectionTimeline inspection_timeline_cache[PS_INSPECTION_MAX_TIMELINES];
 static int fork_meta_reclaim_baseline_init(void);
 static int ps_core_open_impl(const char *store_dir);
 static void ps_core_close_impl(void);
@@ -136,6 +139,7 @@ static int timeline_delete_page_cleanup_one(void);
 static int timeline_delete_publish_ready(uint32_t timeline);
 static int timeline_delete_publish_one(void);
 static void inspection_metrics_changed(void);
+static void inspection_timeline_cache_changed(void);
 static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
@@ -144,6 +148,7 @@ static int walidx_prune_fences(uint32_t timeline, uint64_t **fences_out,
 								   uint32_t *nfences_out);
 static int retention_effective_floor(uint32_t timeline, uint32_t resource,
 									 uint64_t *floor_out);
+static void retention_floor_add(uint64_t candidate, uint64_t *floor);
 static int wal_reclaim_frontier_ancestry_allows(uint32_t timeline,
 											uint64_t lsn);
 static int wal_segment_reclaim_one(void);
@@ -276,6 +281,8 @@ static PsBackpressureController wal_backpressure;
 static PsBackpressureController walidx_backpressure;
 static PsBackpressureController forkmeta_backpressure;
 #define MAX_TIMELINES	1024
+_Static_assert(MAX_TIMELINES == PS_INSPECTION_MAX_TIMELINES,
+			   "inspection timeline capacity must match core capacity");
 static unsigned char walidx_snapshot_force_due[MAX_TIMELINES];
 static unsigned char walidx_snapshot_gc_force_due[MAX_TIMELINES];
 static uint64_t walidx_observation_next_ns;
@@ -4852,6 +4859,7 @@ timeline_define_incarnation(uint32_t id, int parent, uint64_t branch_lsn,
 	/* Publish the complete definition last.  Readers outside map_lock use the
 	 * acquire load below and can never observe a half-defined branch. */
 	__atomic_store_n(&timelines[id].defined, 1, __ATOMIC_RELEASE);
+	inspection_timeline_cache_changed();
 }
 
 static void
@@ -7743,7 +7751,8 @@ load_timelines(void)
 							  rec.state == PS_TIMELINE_DELETED))))
 						return -1;
 					__atomic_store_n(&timelines[rec.id].state, rec.state,
-											 __ATOMIC_RELEASE);
+									 __ATOMIC_RELEASE);
+					inspection_timeline_cache_changed();
 				}
 				else
 					return -1;
@@ -7825,7 +7834,8 @@ load_timelines(void)
 							  rec.state == PS_TIMELINE_DELETED))))
 						return -1;
 					__atomic_store_n(&timelines[rec.id].state, rec.state,
-																								__ATOMIC_RELEASE);
+											 __ATOMIC_RELEASE);
+					inspection_timeline_cache_changed();
 				}
 				else
 					return -1;
@@ -9022,6 +9032,82 @@ inspection_metrics_changed(void)
 }
 
 static void
+inspection_timeline_cache_changed(void)
+{
+	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
+	inspection_metrics_changed();
+}
+
+/* Build all PAGE_HISTORY horizons from one retention snapshot.  The walk from
+ * each owner through its bounded ancestry projects that owner once onto every
+ * ancestor, so periodic inspection refreshes reuse this immutable cache rather
+ * than allocating and rescanning retention state once per timeline.  Caller
+ * holds the map read lock. */
+static int
+refresh_inspection_timeline_cache(void)
+{
+	PsRetentionDiagnostic diagnostic;
+	PsRetentionPin *pins = NULL;
+	uint32_t npins = 0;
+
+	memset(inspection_timeline_cache, 0,
+		   sizeof(inspection_timeline_cache));
+	for (uint32_t tl = 0; tl < PS_INSPECTION_MAX_TIMELINES; tl++)
+	{
+		if (!timelines[tl].defined)
+			continue;
+		inspection_timeline_cache[tl].defined = 1;
+		inspection_timeline_cache[tl].parent_timeline = timelines[tl].parent;
+		inspection_timeline_cache[tl].fork_lsn = timelines[tl].branch_lsn;
+	}
+
+	if (ps_retention_diagnostic_snapshot(&diagnostic) != 0)
+		return -1;
+	/* The entry's ancestry is still useful for diagnosing a poisoned registry,
+	 * but no retention number may be presented as a healthy horizon. */
+	if (diagnostic.poisoned)
+		return 0;
+	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
+		return -1;
+	for (uint32_t i = 0; i < npins; i++)
+	{
+		uint32_t current = pins[i].timeline;
+		uint64_t projected = pins[i].lsn;
+
+		if ((pins[i].resources & PS_RETENTION_RESOURCE_PAGE_HISTORY) == 0)
+			continue;
+		for (uint32_t hops = 0; hops <= PS_INSPECTION_MAX_TIMELINES; hops++)
+		{
+			if (current >= PS_INSPECTION_MAX_TIMELINES ||
+				!timelines[current].defined)
+			{
+				free(pins);
+				return -1;
+			}
+			retention_floor_add(projected,
+						   &inspection_timeline_cache[current].retained_horizon);
+			if (timelines[current].parent < 0)
+				break;
+			if (timelines[current].parent >= PS_INSPECTION_MAX_TIMELINES)
+			{
+				free(pins);
+				return -1;
+			}
+			if (timelines[current].branch_lsn < projected)
+				projected = timelines[current].branch_lsn;
+			current = (uint32_t) timelines[current].parent;
+			if (hops == PS_INSPECTION_MAX_TIMELINES)
+			{
+				free(pins);
+				return -1;
+			}
+		}
+	}
+	free(pins);
+	return 0;
+}
+
+static void
 publish_inspection_metrics(int force)
 {
 	PsInspectionMetrics snapshot;
@@ -9030,8 +9116,7 @@ publish_inspection_metrics(int force)
 	uint64_t epoch = __atomic_load_n(&inspection_mutation_epoch,
 									 __ATOMIC_ACQUIRE);
 
-	if (!force && epoch == __atomic_load_n(&inspection_published_epoch,
-											 __ATOMIC_ACQUIRE) && now != 0 &&
+	if (!force && now != 0 &&
 		now < __atomic_load_n(&inspection_next_refresh_ns, __ATOMIC_ACQUIRE))
 		return;
 	pthread_mutex_lock(&inspection_metrics_mutex);
@@ -9042,7 +9127,7 @@ publish_inspection_metrics(int force)
 		pthread_mutex_unlock(&inspection_metrics_mutex);
 		return;
 	}
-	if (!force && epoch == inspection_published_epoch && now != 0 &&
+	if (!force && now != 0 &&
 		now < __atomic_load_n(&inspection_next_refresh_ns, __ATOMIC_RELAXED))
 	{
 		pthread_mutex_unlock(&inspection_metrics_mutex);
@@ -9054,6 +9139,15 @@ publish_inspection_metrics(int force)
 	 * MAX_TIMELINES and the current layer-map capacity; it never allocates. */
 	if (map_locks_ready)
 		ps_lock_map_rd();
+	if (__atomic_exchange_n(&inspection_timeline_cache_dirty, 0,
+								__ATOMIC_ACQ_REL) || !inspection_timeline_cache_valid)
+	{
+		inspection_timeline_cache_valid =
+			refresh_inspection_timeline_cache() == 0;
+		if (!inspection_timeline_cache_valid)
+			memset(inspection_timeline_cache, 0,
+				   sizeof(inspection_timeline_cache));
+	}
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
 		PsTimelineState state;
@@ -9104,11 +9198,19 @@ publish_inspection_metrics(int force)
 		ps_unlock_shard(shard);
 	}
 
-	ps_retention_diagnostic_counts(&snapshot.owner_count,
-								  &snapshot.page_history_owners,
-								  &snapshot.wal_owners,
-								  &snapshot.wal_index_owners,
-								  &snapshot.max_generation);
+	{
+		PsRetentionDiagnostic diagnostic;
+
+		if (ps_retention_diagnostic_snapshot(&diagnostic) == 0)
+		{
+			snapshot.owner_count = diagnostic.owner_count;
+			snapshot.page_history_owners = diagnostic.page_history_owners;
+			snapshot.wal_owners = diagnostic.wal_owners;
+			snapshot.wal_index_owners = diagnostic.wal_index_owners;
+			snapshot.max_generation = diagnostic.max_generation;
+			snapshot.retention_poisoned = diagnostic.poisoned != 0;
+		}
+	}
 
 	snapshot.metadata_poisoned = timeline_meta_poisoned_load() != 0;
 	snapshot.manifest_poisoned = ps_manifest_poisoned() != 0;
@@ -9118,6 +9220,10 @@ publish_inspection_metrics(int force)
 		fork_meta_pending_load(&fork_meta_canonical_gc_pending) ||
 		(__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) != 0) ||
 		(__atomic_load_n(&fork_meta_canonical_gc_probe_pending, __ATOMIC_ACQUIRE) != 0);
+	snapshot.forkmeta_poisoned = fork_meta_poisoned_load() != 0;
+	if (inspection_timeline_cache_valid)
+		memcpy(snapshot.timeline_entries, inspection_timeline_cache,
+			   sizeof(snapshot.timeline_entries));
 
 	/* Start/end sequence stores are the only publication edge for this view. */
 	ps_fetch_add_u64(&hdr->inspection_metrics_seq, 1);
@@ -9159,6 +9265,24 @@ publish_inspection_metrics(int force)
 						 snapshot.wal_index_owners);
 	ps_store_release_u64(&hdr->inspection.max_generation,
 						 snapshot.max_generation);
+	ps_store_release(&hdr->inspection.retention_poisoned,
+					 snapshot.retention_poisoned);
+	ps_store_release(&hdr->inspection.forkmeta_poisoned,
+					 snapshot.forkmeta_poisoned);
+	for (uint32_t tl = 0; tl < PS_INSPECTION_MAX_TIMELINES; tl++)
+	{
+		const PsInspectionTimeline *entry = &snapshot.timeline_entries[tl];
+
+		__atomic_store_n(&hdr->inspection.timeline_entries[tl].parent_timeline,
+						 entry->parent_timeline, __ATOMIC_RELEASE);
+		ps_store_release_u64(&hdr->inspection.timeline_entries[tl].fork_lsn,
+						 entry->fork_lsn);
+		ps_store_release_u64(
+			&hdr->inspection.timeline_entries[tl].retained_horizon,
+			entry->retained_horizon);
+		ps_store_release(&hdr->inspection.timeline_entries[tl].defined,
+					 entry->defined);
+	}
 	ps_fetch_add_u64(&hdr->inspection_metrics_seq, 1);
 	__atomic_store_n(&inspection_published_epoch, epoch, __ATOMIC_RELEASE);
 	__atomic_store_n(&inspection_next_refresh_ns,
@@ -9171,8 +9295,6 @@ publish_inspection_metrics(int force)
 void
 ps_core_inspection_request_complete(PsOpcode opcode, uint32_t status)
 {
-	if (status != PS_STATUS_OK)
-		return;
 	switch (opcode)
 	{
 		case PS_OP_CREATE_BRANCH:
@@ -9180,10 +9302,21 @@ ps_core_inspection_request_complete(PsOpcode opcode, uint32_t status)
 		case PS_OP_RETENTION_PIN_SET:
 		case PS_OP_RETENTION_PIN_RESERVE:
 		case PS_OP_RETENTION_PIN_DROP:
-			inspection_metrics_changed();
+			/* These are the uncommon metadata completions for which the
+			 * inspector is allowed to observe the new immutable view now.  Mark
+			 * even failed retention completions: an ambiguous append poisons the
+			 * registry and must not leave healthy-looking counts published. */
+			if (opcode == PS_OP_CREATE_BRANCH ||
+				opcode == PS_OP_BEGIN_DELETE ||
+				status == PS_STATUS_OK || status == PS_STATUS_STALE)
+				inspection_timeline_cache_changed();
+			else
+				inspection_metrics_changed();
 			publish_inspection_metrics(1);
-			break;
+			return;
 		default:
+			if (status != PS_STATUS_OK)
+				return;
 			/* Ordinary requests never scan diagnostic state synchronously.
 			 * record_layer() dirties the epoch; maintenance publishes it. */
 			return;
@@ -10233,6 +10366,7 @@ timeline_delete_publish_one(void)
 			/* The append is fsync-durable before this release publication. */
 			__atomic_store_n(&timelines[tl].state, PS_TIMELINE_DELETED,
 							 __ATOMIC_RELEASE);
+			inspection_timeline_cache_changed();
 			did = 1;
 		}
 		ps_unlock_map();
@@ -10248,7 +10382,9 @@ timeline_delete_publish_one(void)
 	if (did)
 	{
 		inspection_metrics_changed();
-		publish_inspection_metrics(1);
+		/* DELETED is a maintenance-side completion; the fallback publication
+		 * remains subject to the normal 100ms deadline. */
+		publish_inspection_metrics(0);
 	}
 	return did;
 }
@@ -13979,7 +14115,8 @@ timeline_begin_delete(uint32_t timeline, PsChannel *ch)
 	 * observing DELETING.  SPDK BEGIN_DELETE remains fail-closed until its async
 	 * request drain exists. */
 	__atomic_store_n(&timelines[timeline].state, PS_TIMELINE_DELETING,
-																__ATOMIC_RELEASE);
+									 __ATOMIC_RELEASE);
+	inspection_timeline_cache_changed();
 	ch->result = PS_TIMELINE_DELETING;
 	ch->req_seq = incarnation;
 	return 0;
@@ -15862,7 +15999,7 @@ ps_core_maintenance(void)
 	did = ps_core_maintenance_impl();
 	/* Publish only after maintenance has completed its bounded work.  The
 	 * snapshot has no role in deciding or committing that work. */
-	publish_inspection_metrics(did);
+	publish_inspection_metrics(0);
 	ps_lifecycle_read_unlock();
 	/* A terminal lifecycle transition cannot upgrade the read section held by
 	 * the maintenance body.  Retry readiness under the exclusive lifecycle
@@ -15951,6 +16088,10 @@ ps_core_open_impl(const char *store_dir)
 	memset(wal_covered_valid, 0, sizeof(wal_covered_valid));
 	/* Metadata is rebuilt below; a close/open cycle must not retain branches. */
 	memset(timelines, 0, sizeof(timelines));
+	memset(inspection_timeline_cache, 0,
+		   sizeof(inspection_timeline_cache));
+	inspection_timeline_cache_valid = 0;
+	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));
 	memset(timeline_wal_cleanup_done, 0, sizeof(timeline_wal_cleanup_done));

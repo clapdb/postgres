@@ -69,7 +69,7 @@ extern int	ps_core_maintenance(void);
 extern uint32_t ps_core_layer_count(void);
 extern void ps_core_set_metrics_header(PsShmHeader *hdr);
 extern void ps_core_inspection_request_complete(PsOpcode opcode,
-									 uint32_t status);
+										 uint32_t status);
 
 /* Runtime lifecycle gate.  POSIX frontend requests and complete maintenance
  * work take the read side; destructive lifecycle transitions take the write

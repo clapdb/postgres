@@ -31,7 +31,7 @@ CAPABILITIES = {
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 41,
+            "operations": ["crash"], "protocol_version": 42,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -348,7 +348,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 41, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 42, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -563,16 +563,16 @@ class PlanValidationTests(unittest.TestCase):
         self.assertEqual(
             set(schema["operations"]),
             {"health", "timeline", "manifest", "gc", "owners", "backpressure",
-             "pruning"},
+             "pruning", "relation"},
         )
-        self.assertNotIn("relation", schema["operations"])
+        self.assertNotIn("relation", schema["implemented_operations"])
+        self.assertNotIn("relation", capabilities["inspection_operations"])
 
     def test_inspection_schema_advertises_exact_response_fields(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         for operation, fields in {
             "timeline": [
-                "timeline_count", "live_timelines", "deleting_timelines",
-                "deleted_timelines", "metadata_poisoned",
+                "parent_timeline", "fork_lsn", "retained_horizon",
             ],
             "manifest": [
                 "layer_count", "deleting_layers", "local_layers",
@@ -580,11 +580,11 @@ class PlanValidationTests(unittest.TestCase):
             ],
             "gc": [
                 "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
-                "forkmeta_pending",
+                "forkmeta_pending", "forkmeta_poisoned",
             ],
             "owners": [
                 "owner_count", "page_history_owners", "wal_owners",
-                "wal_index_owners", "max_generation",
+                "wal_index_owners", "max_generation", "retention_poisoned",
             ],
         }.items():
             self.assertEqual(schema["operations"][operation]["response"], fields)
@@ -596,7 +596,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "*) exit 1 ;;\n"
@@ -608,15 +608,59 @@ class PlanValidationTests(unittest.TestCase):
         value = MODULE.inspect_store(inspector, "/unused", "health", schema)
         self.assertEqual(value["page_size"], 8192)
 
+    def test_timeline_inspection_passes_a_validated_id(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        result = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                "parent_timeline": 0,
+                "fork_lsn": 0,
+                "retained_horizon": 0,
+            }),
+            stderr="",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=result) as run:
+            value = MODULE.inspect_store(
+                Path("/inspect"), "/unused", "timeline", schema, timeline=7
+            )
+        self.assertEqual(value["parent_timeline"], 0)
+        self.assertEqual(run.call_args.args[0], ["/inspect", "--shm", "/unused", "timeline", "7"])
+
+    def test_inspection_request_arguments_are_rejected_for_other_operations(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for operation in ("health", "gc", "owners"):
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                MODULE.PlanError, "does not accept request arguments"
+            ):
+                MODULE.inspect_store(
+                    Path("/inspect"), "/unused", operation, schema, timeline=7
+                )
+
+    def test_timeline_inspection_requires_a_nonnegative_integer_id(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for timeline in (None, -1, True):
+            with self.subTest(timeline=timeline), self.assertRaisesRegex(
+                MODULE.PlanError, "nonnegative timeline ID"
+            ):
+                MODULE.inspect_store(
+                    Path("/inspect"), "/unused", "timeline", schema,
+                    timeline=timeline,
+                )
+
     def test_inspector_response_fields_have_strict_json_types(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         all_fields = set().union(*MODULE.INSPECTION_RESPONSES.values())
         self.assertEqual(
             MODULE.INSPECTION_BOOLEAN_FIELDS,
-            {"metadata_poisoned", "manifest_poisoned", "forkmeta_pending"},
+            {
+                "manifest_poisoned", "forkmeta_pending",
+                "forkmeta_poisoned", "retention_poisoned",
+            },
         )
         self.assertEqual(
-            MODULE.INSPECTION_COUNTER_FIELDS | MODULE.INSPECTION_BOOLEAN_FIELDS,
+            MODULE.INSPECTION_COUNTER_FIELDS
+            | MODULE.INSPECTION_SIGNED_FIELDS
+            | MODULE.INSPECTION_BOOLEAN_FIELDS,
             all_fields,
         )
         self.assertFalse(
@@ -625,11 +669,19 @@ class PlanValidationTests(unittest.TestCase):
 
         for operation, fields in MODULE.INSPECTION_RESPONSES.items():
             valid = {
-                field: False if field in MODULE.INSPECTION_BOOLEAN_FIELDS else 0
+                field: (
+                    False if field in MODULE.INSPECTION_BOOLEAN_FIELDS
+                    else -1 if field in MODULE.INSPECTION_SIGNED_FIELDS
+                    else 0
+                )
                 for field in fields
             }
             invalid_values = {
-                field: (0,) if field in MODULE.INSPECTION_BOOLEAN_FIELDS else (False, -1)
+                field: (
+                    (0,) if field in MODULE.INSPECTION_BOOLEAN_FIELDS
+                    else (False, -2) if field in MODULE.INSPECTION_SIGNED_FIELDS
+                    else (False, -1)
+                )
                 for field in fields
             }
             for field, values in invalid_values.items():
@@ -649,7 +701,8 @@ class PlanValidationTests(unittest.TestCase):
                             self.assertRaisesRegex(MODULE.PlanError, field),
                         ):
                             MODULE.inspect_store(
-                                Path("/inspect"), "/unused", operation, schema
+                                Path("/inspect"), "/unused", operation, schema,
+                                timeline=0 if operation == "timeline" else None,
                             )
 
     def test_runtime_rejects_an_operation_the_runner_cannot_execute(self):
@@ -1209,7 +1262,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 41, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 42, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -1226,21 +1279,22 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\n"
             "case \"$3\" in\n"
             "health) printf '%s\\n' '"
-            "{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
+            "{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
-            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
-            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "{\"parent_timeline\":0,\"fork_lsn\":0,\"retained_horizon\":0}' ;;\n"
             "manifest) printf '%s\\n' '"
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
             "{\"page_debt_segments\":0,\"deleting_layers\":0,"
-            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
+            "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"
             "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
-            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
+            "\"wal_index_owners\":0,\"max_generation\":0,"
+            "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' '"
             "{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
@@ -1416,21 +1470,22 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
-            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
-            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "{\"parent_timeline\":0,\"fork_lsn\":0,\"retained_horizon\":0}' ;;\n"
             "manifest) printf '%s\\n' '"
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
             "{\"page_debt_segments\":0,\"deleting_layers\":0,"
-            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
+            "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"
             "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
-            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
+            "\"wal_index_owners\":0,\"max_generation\":0,"
+            "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
@@ -1517,21 +1572,22 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
-            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
-            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "{\"parent_timeline\":0,\"fork_lsn\":0,\"retained_horizon\":0}' ;;\n"
             "manifest) printf '%s\\n' '"
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
             "{\"page_debt_segments\":0,\"deleting_layers\":0,"
-            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
+            "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"
             "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
-            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
+            "\"wal_index_owners\":0,\"max_generation\":0,"
+            "\"retention_poisoned\":false}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"

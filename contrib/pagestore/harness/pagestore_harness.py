@@ -250,7 +250,9 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
             f"{path}: implemented inspection operations do not match runner implementation"
         )
     operations = schema.get("operations")
-    if not isinstance(operations, dict) or set(operations) != INSPECTION_OPERATIONS:
+    if not isinstance(operations, dict) or set(operations) != (
+        INSPECTION_OPERATIONS | INSPECTION_PLANNED_OPERATIONS
+    ):
         raise PlanError(f"{path}: inspection operations must be an object")
     for operation, expected_response in sorted(INSPECTION_RESPONSES.items()):
         definition = operations.get(operation)
@@ -264,6 +266,29 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
             raise PlanError(
                 f"{path}: inspection operation {operation!r} response fields "
                 "do not match runner implementation"
+            )
+        expected_request = list(INSPECTION_REQUESTS.get(operation, ()))
+        request = definition.get("request", []) if isinstance(definition, dict) else None
+        if request != expected_request:
+            raise PlanError(
+                f"{path}: inspection operation {operation!r} request fields "
+                "do not match its contract"
+            )
+    for operation, expected_response in INSPECTION_PLANNED_RESPONSES.items():
+        definition = operations.get(operation)
+        if not isinstance(definition, dict):
+            raise PlanError(
+                f"{path}: planned inspection operation {operation!r} must be an object"
+            )
+        if definition.get("request") != list(INSPECTION_REQUESTS[operation]):
+            raise PlanError(
+                f"{path}: planned inspection operation {operation!r} request fields "
+                "do not match its contract"
+            )
+        if definition.get("response") != list(expected_response):
+            raise PlanError(
+                f"{path}: planned inspection operation {operation!r} response fields "
+                "do not match its contract"
             )
     return schema
 
@@ -424,8 +449,7 @@ INSPECTION_RESPONSES = {
         "forkmeta_foreground_wait_ns",
     },
     "timeline": {
-        "timeline_count", "live_timelines", "deleting_timelines",
-        "deleted_timelines", "metadata_poisoned",
+        "parent_timeline", "fork_lsn", "retained_horizon",
     },
     "manifest": {
         "layer_count", "deleting_layers", "local_layers",
@@ -433,22 +457,33 @@ INSPECTION_RESPONSES = {
     },
     "gc": {
         "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
-        "forkmeta_pending",
+        "forkmeta_pending", "forkmeta_poisoned",
     },
     "owners": {
         "owner_count", "page_history_owners", "wal_owners",
-        "wal_index_owners", "max_generation",
+        "wal_index_owners", "max_generation", "retention_poisoned",
     },
     "pruning": {
         "compactions", "versions_scanned", "versions_kept", "versions_deleted",
     },
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
-INSPECTION_BOOLEAN_FIELDS = {
-    "metadata_poisoned", "manifest_poisoned", "forkmeta_pending",
+INSPECTION_PLANNED_RESPONSES = {
+    "relation": ("exists", "forks", "nblocks", "selected_lsn"),
 }
+INSPECTION_PLANNED_OPERATIONS = set(INSPECTION_PLANNED_RESPONSES)
+INSPECTION_REQUESTS = {
+    "timeline": ("timeline",),
+    "relation": ("timeline", "key", "lsn"),
+}
+INSPECTION_BOOLEAN_FIELDS = {
+    "retention_poisoned", "manifest_poisoned",
+    "forkmeta_pending", "forkmeta_poisoned",
+}
+INSPECTION_SIGNED_FIELDS = {"parent_timeline"}
 INSPECTION_COUNTER_FIELDS = (
-    set().union(*INSPECTION_RESPONSES.values()) - INSPECTION_BOOLEAN_FIELDS
+    set().union(*INSPECTION_RESPONSES.values())
+    - INSPECTION_BOOLEAN_FIELDS - INSPECTION_SIGNED_FIELDS
 )
 INSPECTION_SCHEMA_VERSION = 2
 INSPECTION_TRANSPORT = "private-test-ipc"
@@ -870,7 +905,8 @@ def probe_runtime_inspection(
     observations = {}
     for operation in sorted(capability_values(capabilities, "inspection_operations")):
         observations[operation] = inspect_store(
-            inspector, shm, operation, inspection_schema
+            inspector, shm, operation, inspection_schema,
+            timeline=0 if operation == "timeline" else None,
         )
     return observations
 
@@ -1093,7 +1129,13 @@ def write_junit(path: Path, name: str, errors: list[PlanError]) -> None:
     path.write_text(f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}\n", encoding="utf-8")
 
 
-def inspect_store(binary: Path, shm: str, operation: str, schema: dict[str, Any]) -> dict[str, Any]:
+def inspect_store(
+    binary: Path,
+    shm: str,
+    operation: str,
+    schema: dict[str, Any],
+    timeline: int | None = None,
+) -> dict[str, Any]:
     implemented = schema.get("implemented_operations")
     operations = schema.get("operations")
     if not isinstance(implemented, list) or operation not in implemented:
@@ -1103,9 +1145,23 @@ def inspect_store(binary: Path, shm: str, operation: str, schema: dict[str, Any]
     expected = operations[operation].get("response")
     if not isinstance(expected, list) or not all(isinstance(field, str) for field in expected):
         raise PlanError(f"inspection schema: invalid response definition for {operation!r}")
+    if operation == "timeline":
+        if (
+            not isinstance(timeline, int)
+            or isinstance(timeline, bool)
+            or timeline < 0
+        ):
+            raise PlanError("inspection operation 'timeline' requires a nonnegative timeline ID")
+        request = [str(timeline)]
+    elif timeline is not None:
+        raise PlanError(
+            f"inspection operation {operation!r} does not accept request arguments"
+        )
     try:
         result = subprocess.run(
-            [str(binary), "--shm", shm, operation],
+            [str(binary), "--shm", shm, operation, *request]
+            if operation == "timeline"
+            else [str(binary), "--shm", shm, operation],
             capture_output=True,
             check=False,
             encoding="utf-8",
@@ -1126,6 +1182,16 @@ def inspect_store(binary: Path, shm: str, operation: str, schema: dict[str, Any]
             if not isinstance(observed, bool):
                 raise PlanError(
                     f"inspector {operation} field {field!r} must be a boolean"
+                )
+        elif field in INSPECTION_SIGNED_FIELDS:
+            if (
+                not isinstance(observed, int)
+                or isinstance(observed, bool)
+                or observed < -1
+            ):
+                raise PlanError(
+                    f"inspector {operation} field {field!r} must be -1 or a "
+                    "nonnegative integer"
                 )
         elif field in INSPECTION_COUNTER_FIELDS:
             if (
@@ -2815,6 +2881,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         default=Path(__file__).resolve().parents[1] / "integration_test.sh")
     parser.add_argument("--inspect-binary", type=Path)
     parser.add_argument("--shm")
+    parser.add_argument("--timeline", type=int, metavar="ID")
     parser.add_argument("--inspection-schema", type=Path)
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--keep", action="store_true")
@@ -2822,6 +2889,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.inspect and (args.inspect_binary is None or not args.shm):
         parser.error("--inspect requires --inspect-binary and --shm")
+    if args.inspect == "timeline":
+        if args.timeline is None or args.timeline < 0:
+            parser.error("--inspect timeline requires a nonnegative --timeline ID")
+    elif args.timeline is not None:
+        parser.error("--timeline is only valid with --inspect timeline")
     if args.daemon_smoke and (args.daemon_binary is None or args.inspect_binary is None):
         parser.error("--daemon-smoke requires --daemon-binary and --inspect-binary")
     if args.daemon_fault_smoke and (args.daemon_binary is None or args.inspect_binary is None):
@@ -2857,7 +2929,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise PlanError(f"capabilities: inspection operation {args.inspect!r} is unavailable")
             schema_path = args.inspection_schema or args.capabilities.with_name("inspection_schema.json")
             schema = read_inspection_schema(schema_path, capabilities)
-            print(json.dumps(inspect_store(args.inspect_binary, args.shm, args.inspect, schema), sort_keys=True))
+            print(json.dumps(
+                inspect_store(
+                    args.inspect_binary, args.shm, args.inspect, schema,
+                    timeline=args.timeline,
+                ),
+                sort_keys=True,
+            ))
             return 0
         if args.daemon_smoke:
             plan = read_plan(args.daemon_smoke)
