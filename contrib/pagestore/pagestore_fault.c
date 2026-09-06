@@ -287,7 +287,7 @@ monotonic_ms(void)
 
 static int
 report_fault(const char *action, const char *state, unsigned int timeout_ms,
-		int append)
+		int append, uint64_t replay_lsn)
 {
 	const char *filename = append ? "report.jsonl" : "report.tmp";
 	char line[1024];
@@ -325,6 +325,19 @@ report_fault(const char *action, const char *state, unsigned int timeout_ms,
 		if (!append)
 			(void) unlinkat(fault.dirfd, filename, 0);
 		return -1;
+	}
+	if (replay_lsn != 0)
+	{
+		n += snprintf(line + n, sizeof(line) - (size_t) n,
+				",\"replay_lsn\":\"%X/%X\"",
+				(uint32_t) (replay_lsn >> 32), (uint32_t) replay_lsn);
+		if (n <= 0 || (size_t) n >= sizeof(line))
+		{
+			close(fd);
+			if (!append)
+				(void) unlinkat(fault.dirfd, filename, 0);
+			return -1;
+		}
 	}
 	if (n > 0 && (size_t) n < sizeof(line) && state != NULL)
 		n += snprintf(line + n, sizeof(line) - (size_t) n,
@@ -491,6 +504,14 @@ ps_fault_init(const char *store_dir)
 		close(dirfd);
 		return -1;
 	}
+	if (strncmp(fault_catalog[point].name, "materializer.",
+				strlen("materializer.")) == 0 &&
+		strcmp(action, "pause") == 0 &&
+		fault.watchdog_ms < PS_FAULT_MATERIALIZER_MIN_WATCHDOG_MS)
+	{
+		close(dirfd);
+		return -1;
+	}
 	fault.point = point;
 	__atomic_store_n(&fault.hits, 0, __ATOMIC_RELAXED);
 	fault.dirfd = dirfd;
@@ -519,7 +540,7 @@ ps_fault_query(PsFaultPoint point, PsFaultStatus *status)
 }
 
 int
-ps_fault_probe(PsFaultPoint point)
+ps_fault_probe_at(PsFaultPoint point, uint64_t replay_lsn)
 {
 	uint64_t observed;
 	struct stat st;
@@ -545,23 +566,29 @@ ps_fault_probe(PsFaultPoint point)
 	action = fault.action;
 	if (strcmp(action, "crash") == 0)
 	{
-		if (report_fault(action, NULL, 0, 0) != 0)
+		if (report_fault(action, NULL, 0, 0, replay_lsn) != 0)
 			_exit(PS_FAULT_REPORT_FAILURE_EXIT);
 		_exit(PS_FAULT_CRASH_EXIT);
 	}
 	if (strcmp(action, "error") == 0)
-		return report_fault(action, NULL, 0, 0) == 0 ? PS_FAULT_PROBE_ERROR : PS_FAULT_PROBE_ERROR;
+		return report_fault(action, NULL, 0, 0, replay_lsn) == 0 ? PS_FAULT_PROBE_ERROR : PS_FAULT_PROBE_ERROR;
 	if (strcmp(action, "pause") != 0)
 		return PS_FAULT_PROBE_ERROR;
-	if (report_fault(action, "reached", 0, 0) != 0)
+	if (report_fault(action, "reached", 0, 0, replay_lsn) != 0)
 		return PS_FAULT_PROBE_ERROR;
 	result = wait_for_release();
 	if (result == PS_FAULT_PROBE_PAUSE_TIMEOUT)
 	{
-		(void) report_fault(action, "timeout", fault.watchdog_ms, 0);
+		(void) report_fault(action, "timeout", fault.watchdog_ms, 0, replay_lsn);
 		_exit(PS_FAULT_PAUSE_TIMEOUT_EXIT);
 	}
 	return result;
+}
+
+int
+ps_fault_probe(PsFaultPoint point)
+{
+	return ps_fault_probe_at(point, 0);
 }
 
 void

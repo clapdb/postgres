@@ -146,7 +146,8 @@ static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL
 #define PS_MATERIALIZER_RELEASE_MAGIC		0x50534d52
 #define PS_MATERIALIZER_RELEASE_VERSION	2
 #define PS_MATERIALIZER_RELEASE_BLOCK		4
-#define PS_MATERIALIZER_MARKER_TIMEOUT_MS 10000
+#define PS_MATERIALIZER_MARKER_TIMEOUT_MS \
+	PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS
 #define PS_MATERIALIZER_RETENTION_RESOURCES \
 	(PS_RETENTION_RESOURCE_WAL | PS_RETENTION_RESOURCE_WAL_INDEX)
 #define PS_READER_RETENTION_RESOURCES PS_RETENTION_RESOURCE_ALL
@@ -1354,7 +1355,8 @@ pagestore_materializer_publish_marker(XLogRecPtr replay_lsn,
 	pagestore_localsvc_store_sync_timeout(
 		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	if (run_fault_probes &&
-		ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_RELATION_SYNC) != 0)
+		ps_fault_probe_at(PS_FAULT_POINT_MATERIALIZER_AFTER_RELATION_SYNC,
+						(uint64) replay_lsn) != 0)
 		ereport(ERROR,
 				(errmsg("pagestore materializer relation-sync fault probe failed")));
 	pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
@@ -1364,7 +1366,8 @@ pagestore_materializer_publish_marker(XLogRecPtr replay_lsn,
 	pagestore_localsvc_store_sync_timeout(
 		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
 	if (run_fault_probes &&
-		ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_MARKER_SYNC) != 0)
+		ps_fault_probe_at(PS_FAULT_POINT_MATERIALIZER_AFTER_MARKER_SYNC,
+						(uint64) replay_lsn) != 0)
 		ereport(ERROR,
 				(errmsg("pagestore materializer marker-sync fault probe failed")));
 }

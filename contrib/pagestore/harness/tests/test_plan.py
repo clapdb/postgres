@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -131,6 +132,175 @@ class PlanValidationTests(unittest.TestCase):
         self.assertLess(marker, arm)
         self.assertLess(arm, trigger)
 
+    def test_process_stat_parser_handles_parentheses_and_spaces_in_comm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stat_path = Path(temporary) / "123" / "stat"
+            stat_path.parent.mkdir()
+            fields = ["S"] + [str(value) for value in range(4, 22)] + ["4242"]
+            stat_path.write_text(
+                "123 (postgres worker ) with spaces) " + " ".join(fields),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                MODULE.read_process_starttime(123, Path(temporary)), 4242
+            )
+
+    def test_pidfd_signal_and_poll_are_identity_bound_and_closed(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        poller = mock.Mock()
+        poller.poll.return_value = [(41, MODULE.select.POLLIN)]
+        with mock.patch.object(MODULE.signal, "pidfd_send_signal") as send, \
+                mock.patch.object(MODULE.select, "poll", return_value=poller):
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("pidfd_send_signal", "signaled"),
+            )
+            self.assertEqual(MODULE.wait_process_exit(identity, 1), "pidfd_poll")
+        send.assert_called_once_with(41, MODULE.signal.SIGQUIT, None, 0)
+        poller.register.assert_called_once()
+
+    def test_capture_pidfd_esrch_is_already_exited_without_reacquiring_pid(self):
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=77) as read, \
+                mock.patch.object(MODULE.os, "pidfd_open", side_effect=ProcessLookupError):
+            identity = MODULE.capture_process_identity(123)
+        self.assertTrue(identity.already_exited)
+        self.assertEqual(identity.status, "already_exited")
+        read.assert_called_once_with(123)
+
+    def test_capture_procfs_absent_before_pidfd_is_already_exited(self):
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
+                mock.patch.object(MODULE, "procfs_available", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open") as pidfd_open, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            read = MODULE.read_process_starttime
+            identity = MODULE.capture_process_identity(123)
+        self.assertTrue(identity.already_exited)
+        self.assertEqual(identity.status, "already_exited")
+        read.assert_called_once_with(123)
+        pidfd_open.assert_not_called()
+        send.assert_not_called()
+
+    def test_procfs_unavailable_live_unverifiable_fails_safe_without_signal(self):
+        with mock.patch.object(MODULE, "procfs_available", return_value=False), \
+                mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
+                mock.patch.object(MODULE, "process_exists", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open") as pidfd_open, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            with self.assertRaisesRegex(MODULE.PlanError, "procfs unavailable"):
+                MODULE.capture_process_identity(123)
+        pidfd_open.assert_not_called()
+        send.assert_not_called()
+
+    def test_process_starttime_io_error_is_not_treated_as_exit(self):
+        with mock.patch.object(
+            MODULE.Path, "read_text", side_effect=OSError("I/O error")
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "cannot read process identity"):
+                MODULE.read_process_starttime(123)
+
+    def test_capture_pidfd_replacement_is_already_exited_and_not_signaled(self):
+        with mock.patch.object(
+            MODULE, "read_process_starttime", side_effect=[77, 78]
+        ) as read, mock.patch.object(MODULE.os, "pidfd_open", return_value=41), \
+                mock.patch.object(MODULE.os, "close") as close, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            identity = MODULE.capture_process_identity(123)
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("already_exited", "already_exited"),
+            )
+        self.assertEqual(read.call_count, 2)
+        close.assert_called_once_with(41)
+        send.assert_not_called()
+        self.assertEqual(identity.status, "already_exited")
+
+    def test_starttime_fallback_pid_reuse_is_already_exited_before_signal(self):
+        identity = MODULE.ProcessIdentity(123, 77)
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=78), \
+                mock.patch.object(MODULE.os, "kill") as kill:
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("pidfd-unavailable", "already_exited"),
+            )
+        kill.assert_not_called()
+
+    def test_pidfd_unavailable_live_capture_and_stop_fail_closed(self):
+        with mock.patch.object(MODULE, "procfs_available", return_value=True), \
+                mock.patch.object(MODULE, "read_process_starttime", return_value=77), \
+                mock.patch.object(MODULE, "process_exists", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open", None), \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal", None), \
+                mock.patch.object(MODULE.os, "kill") as kill:
+            with self.assertRaisesRegex(MODULE.PlanError, "pidfd support is unavailable"):
+                MODULE.capture_process_identity(123)
+            with self.assertRaisesRegex(MODULE.PlanError, "pidfd support is unavailable"):
+                MODULE.stop_process_immediately(123)
+        kill.assert_not_called()
+
+    def test_stop_already_exited_does_not_wait(self):
+        identity = MODULE.ProcessIdentity(
+            123, 77, already_exited=True, status="already_exited"
+        )
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(MODULE, "wait_process_exit") as wait, \
+                mock.patch.object(MODULE, "close_process_identity"):
+            result = MODULE.stop_process_immediately(123)
+        wait.assert_not_called()
+        self.assertEqual(result.status, "already_exited")
+        self.assertEqual(result.wait_method, "already_exited")
+
+    def test_process_stop_waits_for_real_child_and_closes_pidfd(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            result = MODULE.stop_process_immediately(process.pid, timeout=5)
+            self.assertEqual(result.pid, process.pid)
+            self.assertEqual(result.signal_method, "pidfd_send_signal")
+            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime"})
+            self.assertEqual(result.status, "signaled")
+            self.assertIsNotNone(process.wait(timeout=1))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_process_stop_timeout_is_bounded(self):
+        identity = MODULE.ProcessIdentity(123, 77)
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(
+                    MODULE, "send_process_sigquit",
+                    return_value=("mock", "signaled"),
+                ), \
+                mock.patch.object(MODULE, "wait_process_exit", side_effect=MODULE.HarnessTimeout("late")), \
+                mock.patch.object(MODULE, "close_process_identity") as close:
+            with self.assertRaises(MODULE.HarnessTimeout):
+                MODULE.stop_process_immediately(123, timeout=1)
+        close.assert_called_once_with(identity)
+
+    def test_pidfd_close_failure_does_not_mask_primary_failure(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        primary = MODULE.PlanError("signal failed")
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(MODULE, "send_process_sigquit", side_effect=primary), \
+                mock.patch.object(
+                    MODULE, "close_process_identity", side_effect=MODULE.PlanError("close failed")
+                ):
+            with self.assertRaisesRegex(MODULE.PlanError, "signal failed"):
+                MODULE.stop_process_immediately(123)
+
+    def test_pidfd_close_failure_is_reported_on_success(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(
+                    MODULE, "send_process_sigquit",
+                    return_value=("pidfd_send_signal", "signaled"),
+                ), mock.patch.object(
+                    MODULE, "wait_process_exit", return_value="pidfd_poll"
+                ), mock.patch.object(
+                    MODULE, "close_process_identity", side_effect=MODULE.PlanError("close failed")
+                ):
+            with self.assertRaisesRegex(MODULE.PlanError, "close failed"):
+                MODULE.stop_process_immediately(123)
+
     def test_recovery_retries_restartpoint_before_marker_and_retention(self):
         source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
         recovery = source.index(
@@ -223,19 +393,19 @@ class PlanValidationTests(unittest.TestCase):
             [
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R2"},
+                 "hit": 1, "timeout": 45, "name": "R2"},
             ],
             [
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R2"},
+                 "hit": 1, "timeout": 45, "name": "R2"},
                 {"op": "checkpoint", "id": "late-r1", "target": "writer", "name": "R1"},
             ],
             [
                 {"op": "checkpoint", "id": "wrong", "target": "writer", "name": "OLD"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R2"},
+                 "hit": 1, "timeout": 45, "name": "R2"},
             ],
         ]
         for actions in cases:
@@ -538,6 +708,46 @@ class PlanValidationTests(unittest.TestCase):
                 report, "test.fault", 1, 123, "pause", "s", 9, "op", "timeout",
             )
             self.assertEqual(value["watchdog_ms"], 5000)
+
+    def test_materializer_fault_report_requires_actual_replay_lsn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "materializer.after_marker_sync",
+                "action": "pause", "scenario": "s", "seed": 9,
+                "hit": 1, "pid": 123, "operation": "op",
+                "state": "reached", "watchdog_ms": 0,
+                "replay_lsn": "0/2000000",
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "materializer.after_marker_sync", 1, 123, "pause",
+                "s", 9, "op", require_replay_lsn=True,
+            )
+            self.assertEqual(MODULE.parse_lsn_value(value["replay_lsn"]), 0x2000000)
+
+            report.write_text(json.dumps({
+                "schema": 1, "name": "materializer.after_marker_sync",
+                "action": "pause", "scenario": "s", "seed": 9,
+                "hit": 1, "pid": 123, "operation": "op",
+                "state": "reached", "watchdog_ms": 0,
+            }) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.FaultNotReached, "replay_lsn"):
+                MODULE._fault_report(
+                    report, "materializer.after_marker_sync", 1, 123, "pause",
+                    "s", 9, "op", require_replay_lsn=True,
+                )
+
+    def test_legacy_fault_report_allows_replay_lsn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "test.fault", "action": "crash",
+                "hit": 1, "pid": 123, "replay_lsn": "0/2000000",
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "test.fault", 1, 123, "crash", require_replay_lsn=True,
+            )
+            self.assertEqual(value["replay_lsn"], "0/2000000")
 
     def test_pause_timeout_bundle_contains_actionable_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1197,7 +1407,7 @@ class PlanValidationTests(unittest.TestCase):
              "relation": "materializer_crash_relation", "lsn": "$R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_relation_sync", "action": "pause",
-             "hit": 1, "timeout": 30, "name": "R9"},
+             "hit": 1, "timeout": 45, "name": "R9"},
             {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
              "relation": "materializer_crash_relation", "lsn": "$R9"},
         ])
@@ -1227,7 +1437,7 @@ class PlanValidationTests(unittest.TestCase):
                 {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R9"},
+                 "hit": 1, "timeout": 45, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_a", "lsn": "$R9"},
             ],
@@ -1237,7 +1447,7 @@ class PlanValidationTests(unittest.TestCase):
                  "relation": "relation_a", "lsn": "$R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R9"},
+                 "hit": 1, "timeout": 45, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_b", "lsn": "$R9"},
             ],
@@ -1245,7 +1455,7 @@ class PlanValidationTests(unittest.TestCase):
                 {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R9"},
+                 "hit": 1, "timeout": 45, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_a", "lsn": "$R9"},
                 {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
@@ -1276,18 +1486,18 @@ class PlanValidationTests(unittest.TestCase):
                  "relation": "materializer_crash_relation", "lsn": lsn},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 30, "name": "R2"},
+                 "hit": 1, "timeout": 45, "name": "R2"},
             ])
             with self.assertRaisesRegex(MODULE.PlanError, expected):
                 MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
-    def test_materializer_pause_timeout_has_five_second_floor(self):
+    def test_materializer_pause_timeout_covers_marker_work_and_margin(self):
         self.assertEqual(MODULE.fault_watchdog_milliseconds(0.5), 500)
-        with self.assertRaisesRegex(MODULE.PlanError, "at least 5 seconds"):
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 45 seconds"):
             MODULE.materializer_fault_watchdog_milliseconds(0.5)
-        with self.assertRaisesRegex(MODULE.PlanError, "at least 5 seconds"):
-            MODULE.materializer_fault_watchdog_milliseconds(1)
-        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(5), 5000)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 45 seconds"):
+            MODULE.materializer_fault_watchdog_milliseconds(40)
+        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(45), 45000)
 
     def test_inspect_relation_allows_dollar_prefixed_relation_name(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
@@ -1324,7 +1534,7 @@ class PlanValidationTests(unittest.TestCase):
             {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "pause",
-             "hit": 1, "timeout": 30, "name": "R2"},
+             "hit": 1, "timeout": 45, "name": "R2"},
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "scenario.*fault identity"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
@@ -1338,7 +1548,7 @@ class PlanValidationTests(unittest.TestCase):
             {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "process_abort",
-             "hit": 1, "timeout": 30, "name": "R2"},
+             "hit": 1, "timeout": 45, "name": "R2"},
         ])
         plan = MODULE.read_plan(path)
         with self.assertRaisesRegex(MODULE.PlanError, "allows action.*pause"):
@@ -1352,7 +1562,7 @@ class PlanValidationTests(unittest.TestCase):
             header,
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "pause",
-             "hit": 1, "timeout": 30, "name": "../R2"},
+             "hit": 1, "timeout": 45, "name": "../R2"},
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "name must be a safe path component"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)

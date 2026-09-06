@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -55,6 +56,14 @@ FAULT_REPORT_FIELDS = {
 }
 FAULT_REPORT_MAX_BYTES = 4096
 MAX_FAULT_TIMEOUT_SECONDS = 300.0
+MATERIALIZER_MARKER_TIMEOUT_MS = 10000
+MATERIALIZER_FAULT_PHASE_COUNT = 4
+MATERIALIZER_FAULT_SCHEDULING_MARGIN_MS = 5000
+MATERIALIZER_FAULT_MIN_WATCHDOG_MS = (
+    MATERIALIZER_MARKER_TIMEOUT_MS * MATERIALIZER_FAULT_PHASE_COUNT
+    + MATERIALIZER_FAULT_SCHEDULING_MARGIN_MS
+)
+MATERIALIZER_FAULT_MIN_TIMEOUT_SECONDS = MATERIALIZER_FAULT_MIN_WATCHDOG_MS / 1000.0
 
 
 def fault_failure_classification(error: Exception) -> str:
@@ -150,8 +159,12 @@ def fault_watchdog_milliseconds(value: Any) -> int:
 
 def materializer_fault_watchdog_milliseconds(value: Any) -> int:
     milliseconds = fault_watchdog_milliseconds(value)
-    if value < 5.0:
-        raise PlanError("materializer fault timeout must be at least 5 seconds")
+    if milliseconds < MATERIALIZER_FAULT_MIN_WATCHDOG_MS:
+        raise PlanError(
+            "materializer fault timeout must be at least "
+            f"{MATERIALIZER_FAULT_MIN_TIMEOUT_SECONDS:g} seconds "
+            "(four 10-second marker phases plus 5-second scheduling margin)"
+        )
     return milliseconds
 
 
@@ -217,6 +230,19 @@ def sqlstate_from_output(output: str) -> str | None:
     """Extract PostgreSQL's SQLSTATE from psql verbose error output."""
     match = re.search(r"(?:ERROR|FATAL):\s+([0-9A-Z]{5}):", output)
     return match.group(1) if match else None
+
+
+def parse_lsn_value(value: Any) -> int:
+    if not isinstance(value, str):
+        raise PlanError(f"invalid PostgreSQL LSN {value!r}")
+    try:
+        high, low = value.split("/", 1)
+        result = (int(high, 16) << 32) | int(low, 16)
+    except (ValueError, TypeError) as error:
+        raise PlanError(f"invalid PostgreSQL LSN {value!r}") from error
+    if result < 0:
+        raise PlanError(f"invalid PostgreSQL LSN {value!r}")
+    return result
 
 
 def postgresql_conf_string(value: str | Path) -> str:
@@ -1542,6 +1568,285 @@ def signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) ->
         pass
 
 
+@dataclass
+class ProcessIdentity:
+    """A process identity that remains safe across pidfile replacement."""
+
+    pid: int
+    starttime: int | None
+    pidfd: int | None = None
+    already_exited: bool = False
+    status: str = "captured"
+
+
+@dataclass(frozen=True)
+class ProcessStopResult:
+    """Evidence for an immediate stop performed against one identity."""
+
+    pid: int
+    starttime: int | None
+    status: str
+    signal_method: str
+    wait_method: str
+
+
+def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
+    """Read Linux proc stat field 22, parsing comm through its final ')' safely."""
+    stat_path = proc_root / str(pid) / "stat"
+    try:
+        text = stat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except PermissionError as error:
+        raise PlanError(f"cannot read process identity {stat_path}: {error}") from error
+    except OSError as error:
+        raise PlanError(f"cannot read process identity {stat_path}: {error}") from error
+
+    closing_paren = text.rfind(")")
+    if closing_paren < 0:
+        raise PlanError(f"malformed process stat for pid {pid}")
+    fields = text[closing_paren + 1:].split()
+    # fields[0] is state (field 3); starttime is field 22.
+    if len(fields) <= 19:
+        raise PlanError(f"short process stat for pid {pid}")
+    try:
+        return int(fields[19])
+    except ValueError as error:
+        raise PlanError(f"invalid process starttime for pid {pid}") from error
+
+
+def procfs_available(proc_root: Path = Path("/proc")) -> bool:
+    """Return whether this host exposes a usable procfs process view."""
+    try:
+        (proc_root / "self" / "stat").read_text(encoding="utf-8")
+    except PermissionError as error:
+        raise PlanError(f"cannot read procfs process identity: {error}") from error
+    except OSError:
+        return False
+    return True
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        raise PlanError(f"cannot verify whether pid {pid} exists: {error}") from error
+    return True
+
+
+def pidfile_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").splitlines()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def capture_process_identity(pid: int) -> ProcessIdentity:
+    """Capture a stable identity without ever reacquiring a replacement PID."""
+    if pid <= 0:
+        raise PlanError(f"invalid process pid: {pid}")
+    # Always take the first observation before pidfd_open.  If the process
+    # disappears during pidfd_open, do not read the PID again: that read could
+    # describe a supervisor replacement rather than the old postmaster.
+    procfs_is_available = procfs_available()
+    first_starttime = read_process_starttime(pid)
+    if procfs_is_available and first_starttime is None:
+        return ProcessIdentity(
+            pid, None, already_exited=True, status="already_exited"
+        )
+    if first_starttime is None:
+        if not process_exists(pid):
+            return ProcessIdentity(
+                pid, None, already_exited=True, status="already_exited"
+            )
+        raise PlanError(
+            f"cannot capture live pid {pid}: procfs unavailable and identity is unverifiable"
+        )
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        if not process_exists(pid):
+            return ProcessIdentity(
+                pid, first_starttime, already_exited=True, status="already_exited"
+            )
+        raise PlanError(
+            f"cannot capture live pid {pid}: pidfd support is unavailable"
+        )
+
+    try:
+        pidfd = pidfd_open(pid, 0)
+    except ProcessLookupError:
+        return ProcessIdentity(
+            pid, first_starttime, already_exited=True, status="already_exited"
+        )
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return ProcessIdentity(
+                pid, first_starttime, already_exited=True, status="already_exited"
+            )
+        if error.errno not in {
+            errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP,
+        }:
+            raise PlanError(f"cannot capture pidfd for pid {pid}: {error}") from error
+        if not process_exists(pid):
+            return ProcessIdentity(
+                pid, first_starttime, already_exited=True, status="already_exited"
+            )
+        raise PlanError(
+            f"cannot capture live pid {pid}: pidfd support is unavailable"
+        )
+
+    second_starttime = read_process_starttime(pid)
+    if (
+        first_starttime is not None
+        and second_starttime is not None
+        and first_starttime != second_starttime
+    ):
+        try:
+            os.close(pidfd)
+        except OSError as error:
+            raise PlanError(
+                f"cannot close pidfd {pidfd} after pid {pid} identity changed: {error}"
+            ) from error
+        return ProcessIdentity(
+            pid, first_starttime, already_exited=True, status="already_exited"
+        )
+    # pidfd is the authoritative identity if /proc is unavailable after the
+    # second read; retain the first observation for diagnostics/fallback.
+    return ProcessIdentity(pid, first_starttime, pidfd)
+
+
+def close_process_identity(identity: ProcessIdentity) -> None:
+    if identity.pidfd is None:
+        return
+    pidfd = identity.pidfd
+    identity.pidfd = None
+    try:
+        os.close(pidfd)
+    except OSError as error:
+        raise PlanError(f"cannot close pidfd {pidfd} for pid {identity.pid}: {error}") from error
+
+
+def send_process_sigquit(identity: ProcessIdentity) -> tuple[str, str]:
+    """Send SIGQUIT only to the captured process identity."""
+    if identity.already_exited or identity.status == "already_exited":
+        identity.already_exited = True
+        identity.status = "already_exited"
+        return "already_exited", "already_exited"
+    if identity.pidfd is not None:
+        try:
+            signal.pidfd_send_signal(identity.pidfd, signal.SIGQUIT, None, 0)
+            identity.status = "signaled"
+            return "pidfd_send_signal", "signaled"
+        except ProcessLookupError:
+            identity.already_exited = True
+            identity.status = "already_exited"
+            return "pidfd_send_signal", "already_exited"
+        except PermissionError as error:
+            raise PlanError(f"permission denied signalling pid {identity.pid}: {error}") from error
+        except OSError as error:
+            raise PlanError(f"cannot signal pidfd for pid {identity.pid}: {error}") from error
+
+    if identity.starttime is None:
+        if not process_exists(identity.pid):
+            identity.already_exited = True
+            identity.status = "already_exited"
+            return "pidfd-unavailable", "already_exited"
+        raise PlanError(
+            f"cannot safely signal live pid {identity.pid}: no pidfd identity"
+        )
+    before = read_process_starttime(identity.pid)
+    if before is None:
+        if process_exists(identity.pid):
+            raise PlanError(
+                f"cannot verify live pid {identity.pid} before SIGQUIT"
+            )
+        identity.already_exited = True
+        identity.status = "already_exited"
+        return "pidfd-unavailable", "already_exited"
+    if before != identity.starttime:
+        identity.already_exited = True
+        identity.status = "already_exited"
+        return "pidfd-unavailable", "already_exited"
+    raise PlanError(
+        f"cannot signal live pid {identity.pid}: pidfd identity is unavailable"
+    )
+
+
+def wait_process_exit(identity: ProcessIdentity, timeout: float) -> str:
+    """Wait for the captured identity, never for a replacement pidfile owner."""
+    if identity.already_exited or identity.status == "already_exited":
+        return "already_exited"
+    deadline = time.monotonic() + timeout
+    if identity.pidfd is not None:
+        poller = select.poll()
+        poller.register(identity.pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while time.monotonic() < deadline:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            if poller.poll(remaining_ms):
+                return "pidfd_poll"
+        raise HarnessTimeout(f"timed out waiting for pidfd of pid {identity.pid}")
+
+    while time.monotonic() < deadline:
+        current = read_process_starttime(identity.pid)
+        if current is None:
+            if not process_exists(identity.pid):
+                return "proc_starttime"
+            raise PlanError(
+                f"cannot verify pid {identity.pid} while waiting: /proc identity unavailable"
+            )
+        if identity.starttime is None:
+            raise PlanError(f"cannot verify pid {identity.pid} while waiting")
+        if current != identity.starttime:
+            raise PlanError(
+                f"pid {identity.pid} was reused while waiting: "
+                f"captured starttime={identity.starttime} current={current}"
+            )
+        time.sleep(.05)
+    raise HarnessTimeout(f"timed out waiting for pid {identity.pid} to exit")
+
+
+def stop_process_immediately(
+    pid: int, timeout: float = 15.0, diagnostic_pidfile: Path | None = None,
+) -> ProcessStopResult:
+    """SIGQUIT one captured postmaster and wait for that same identity."""
+    identity = capture_process_identity(pid)
+    try:
+        signal_method, status = send_process_sigquit(identity)
+        if status == "already_exited":
+            wait_method = "already_exited"
+        else:
+            try:
+                wait_method = wait_process_exit(identity, timeout)
+            except HarnessTimeout as error:
+                diagnostic = ""
+                if diagnostic_pidfile is not None:
+                    diagnostic = (
+                        f" pidfile={diagnostic_pidfile.exists()}"
+                        f" pidfile_pid={pidfile_pid(diagnostic_pidfile)}"
+                    )
+                raise HarnessTimeout(f"{error}; old_pid={pid}{diagnostic}") from error
+        result = ProcessStopResult(
+            pid, identity.starttime, status, signal_method, wait_method
+        )
+    except BaseException:
+        # Cleanup must not replace the signal/wait/timeout failure with a
+        # secondary pidfd close error.
+        try:
+            close_process_identity(identity)
+        except Exception:
+            pass
+        raise
+    close_process_identity(identity)
+    return result
+
+
 def run_daemon_smoke(
     plan: Plan,
     capabilities: dict[str, Any],
@@ -1755,7 +2060,7 @@ def _fault_report(
     path: Path, expected_name: str, expected_hit: int, expected_pid: int | None,
     expected_action: str = "crash", expected_scenario: str | None = None,
     expected_seed: int | None = None, expected_operation: str | None = None,
-    expected_state: str | None = None,
+    expected_state: str | None = None, require_replay_lsn: bool = False,
 ) -> dict[str, Any]:
     try:
         file_stat = path.lstat()
@@ -1778,15 +2083,25 @@ def _fault_report(
     extended_keys = FAULT_REPORT_FIELDS
     extended_name_keys = (extended_keys - {"fault"}) | {"name"}
     extended_both_keys = extended_keys | {"name"}
+    replay_lsn_key_sets = {
+        frozenset(keys | {"replay_lsn"}) for keys in (
+            extended_keys, extended_name_keys, extended_both_keys,
+        )
+    }
     pause_suffix = {"state", "watchdog_ms"}
     allowed_key_sets = {
         frozenset(legacy_keys), frozenset(extended_keys),
         frozenset(extended_name_keys), frozenset(extended_both_keys),
-    }
+        frozenset(legacy_keys | {"replay_lsn"}),
+    } | replay_lsn_key_sets
     if expected_action == "pause":
-        allowed_key_sets |= {frozenset(keys | pause_suffix) for keys in (
-            extended_keys, extended_name_keys, extended_both_keys,
-        )}
+        allowed_key_sets |= {
+            frozenset(keys | pause_suffix)
+            for keys in (
+                extended_keys, extended_name_keys, extended_both_keys,
+                *replay_lsn_key_sets,
+            )
+        }
     if frozenset(value) not in allowed_key_sets:
         raise FaultNotReached("fault report has unexpected keys")
     fault_name = value.get("fault", value.get("name"))
@@ -1802,6 +2117,13 @@ def _fault_report(
         or value["pid"] > 2**31 - 1
     ):
         raise FaultNotReached("fault report fields do not match expected fault")
+    if "replay_lsn" in value:
+        try:
+            parse_lsn_value(value["replay_lsn"])
+        except PlanError as error:
+            raise FaultNotReached("fault report replay_lsn is invalid") from error
+    elif require_replay_lsn:
+        raise FaultNotReached("fault report lacks actual replay_lsn")
     is_extended = "scenario" in value
     if is_extended:
         if (
@@ -2723,51 +3045,16 @@ def run_materializer_smoke(
         materializer_retention_generation = retention_generation
         return generation
 
-    def pid_exists(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except OSError:
-            return False
-        return True
-
-    def wait_materializer_stopped(pid: int, timeout: float = 15.0) -> None:
-        deadline = time.monotonic() + timeout
-        last_status = ""
-        pidfile = materializer_data / "postmaster.pid"
-        while time.monotonic() < deadline:
-            status = subprocess.run(
-                [str(pg_bin / "pg_ctl"), "status", "-D", str(materializer_data)],
-                check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, env=env,
-            )
-            last_status = status.stdout.strip()
-            if not pidfile.exists() and not pid_exists(pid):
-                return
-            time.sleep(0.05)
-        raise PlanError(
-            "materializer immediate stop did not finish: "
-            f"pidfile={pidfile.exists()} pid_exists={pid_exists(pid)} "
-            f"pg_ctl={last_status!r}"
-        )
-
     def crash_materializer(reason: str) -> None:
         pid = postmaster_pid()
-        subprocess.run(
-            [
-                str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
-                "-m", "immediate", "-W", "stop",
-            ],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
+        stop = stop_process_immediately(
+            pid, diagnostic_pidfile=materializer_data / "postmaster.pid"
         )
-        wait_materializer_stopped(pid)
         events.emit(
             "process_stop", target="materializer",
             generation=materializer_generation, mode="immediate", reason=reason,
+            pid=stop.pid, starttime=stop.starttime,
+            signal=stop.signal_method, wait=stop.wait_method,
         )
 
     def postmaster_pid() -> int:
@@ -2944,12 +3231,9 @@ def run_materializer_smoke(
         if not (materializer_data / "postmaster.pid").exists():
             return
         pid = postmaster_pid()
-        subprocess.run(
-            [str(pg_bin / "pg_ctl"), "-D", str(materializer_data),
-             "-m", "immediate", "-w", "stop"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        stop_process_immediately(
+            pid, diagnostic_pidfile=materializer_data / "postmaster.pid"
         )
-        wait_materializer_stopped(pid)
 
     def stop_writer_for_cleanup() -> None:
         pidfile = writer_data / "postmaster.pid"
@@ -2962,7 +3246,7 @@ def run_materializer_smoke(
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
         deadline = time.monotonic() + 15.0
-        while pidfile.exists() or pid_exists(pid):
+        while pidfile.exists() or process_exists(pid):
             if time.monotonic() >= deadline:
                 raise PlanError("writer immediate stop did not finish")
             time.sleep(0.05)
@@ -3333,6 +3617,7 @@ def run_materializer_smoke(
                     fault_report, action["fault"], action["hit"], None,
                     action["action"], plan.header["scenario"],
                     plan.header["seed"], action["id"],
+                    require_replay_lsn=True,
                 )
                 (trace / "materializer-fault-report.jsonl").write_text(
                     fault_report.read_text(encoding="utf-8"), encoding="utf-8"
@@ -3343,8 +3628,13 @@ def run_materializer_smoke(
                     raise PlanError(
                         "materializer fault report was not emitted by a recovery child"
                     )
-                replay_at_fault = replay_before_trigger
                 declared_lsn = lsn_value(checkpoint_lsn)
+                replay_at_fault = parse_lsn_value(report["replay_lsn"])
+                if replay_at_fault < declared_lsn:
+                    raise OracleMismatch(
+                        "materializer fault report replay_lsn precedes declared checkpoint"
+                    )
+                replay_at_fault_text = report["replay_lsn"]
                 baseline_marker = checkpoints["R1"]["materialized_wal_lsn"]
                 if baseline_marker is None:
                     raise OracleMismatch("R1 has no durable materializer marker")
@@ -3358,7 +3648,9 @@ def run_materializer_smoke(
                 events.emit(
                     "fault_reached", target="materializer", name=action["fault"],
                     report=report, reached=True, fault_pid=fault_pid,
-                    postmaster_pid=old_postmaster_pid, replay_lsn=replay_at_fault,
+                    postmaster_pid=old_postmaster_pid,
+                    replay_lsn=replay_at_fault_text,
+                    replay_lsn_source="fault report actual probe replay_lsn",
                     marker_lsn=None,
                     marker_source="post-crash writer status",
                     declared_lsn=checkpoint_lsn,
@@ -3543,7 +3835,7 @@ def run_materializer_smoke(
                     "materializer_generation": materializer_generation,
                     "old_postmaster_pid": old_postmaster_pid,
                     "new_postmaster_pid": new_postmaster_pid,
-                    "replay_lsn_at_fault": replay_at_fault,
+                    "replay_lsn_at_fault": replay_at_fault_text,
                     "recovered_replay_lsn": recovered_replay_lsn,
                     "marker_before_trigger": marker_before_trigger,
                     "marker_after_report_before_recovery": post_crash_marker,
