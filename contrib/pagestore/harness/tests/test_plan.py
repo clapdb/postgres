@@ -179,6 +179,28 @@ class PlanValidationTests(unittest.TestCase):
         ])
         MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+    def test_pause_timeout_must_fit_registry_watchdog(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for timeout in (0.0009, 300.001):
+            path = self.write_plan([
+                {
+                    "schema": 1, "scenario": "daemon-fault-pause", "seed": 1,
+                    "contracts": ["fault_reachability"],
+                    "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+                },
+                {
+                    "op": "set_fault", "id": "fault", "target": "store",
+                    "fault": "daemon.after_ready", "action": "pause", "hit": 1,
+                    "timeout": timeout,
+                },
+                {
+                    "op": "release_fault", "id": "release", "target": "store",
+                    "fault": "daemon.after_ready",
+                },
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
     def test_named_fault_rejects_unencodable_scenario_identity(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         for scenario in ('bad"scenario', "bad\\scenario", "x" * 129):

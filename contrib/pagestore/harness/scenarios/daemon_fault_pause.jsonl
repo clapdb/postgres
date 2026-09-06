@@ -1,3 +1,3 @@
 {"schema":1,"scenario":"daemon-fault-pause","seed":1432778634,"contracts":["fault_reachability","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
-{"op":"set_fault","id":"daemon-after-ready-pause","target":"store","fault":"daemon.after_ready","action":"pause","hit":1}
+{"op":"set_fault","id":"daemon-after-ready-pause","target":"store","fault":"daemon.after_ready","action":"pause","hit":1,"timeout":3}
 {"op":"release_fault","id":"release-daemon-after-ready","target":"store","fault":"daemon.after_ready"}

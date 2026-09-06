@@ -1023,6 +1023,12 @@ def validate_plan(
                 or timeout <= 0
             ):
                 raise PlanError(f"{action_context}: timeout must be finite and positive")
+            if operation == "set_fault" and action["action"] == "pause" and (
+                timeout < 0.001 or timeout > 300.0
+            ):
+                raise PlanError(
+                    f"{action_context}: pause timeout must map to 1..300000 milliseconds"
+                )
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
@@ -1492,6 +1498,7 @@ def run_daemon_fault_recovery(
     catalog_entry = fault_catalog(capabilities, capabilities_path)[fault_name]
     fault_action = action["action"]
     fault_hit = action["hit"]
+    fault_timeout = float(action.get("timeout", timeout))
     fault_model = action.get("model", catalog_entry["model"])
     release_actions = [
         item for item in plan.actions
@@ -1562,11 +1569,14 @@ def run_daemon_fault_recovery(
                 "PAGESTORE_TEST_FAULT_ACTION": fault_action,
                 "PAGESTORE_TEST_FAULT_HIT": str(fault_hit),
                 "PAGESTORE_TEST_FAULT_DIR": str(control),
-                "PAGESTORE_TEST_FAULT_RELEASE": str(release),
                 "PAGESTORE_TEST_FAULT_SCENARIO": scenario,
                 "PAGESTORE_TEST_FAULT_SEED": str(seed),
                 "PAGESTORE_TEST_FAULT_OPERATION": str(action["id"]),
             })
+            if fault_action == "pause":
+                env["PAGESTORE_TEST_FAULT_WATCHDOG_MS"] = str(
+                    math.ceil(fault_timeout * 1000.0)
+                )
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
@@ -1622,7 +1632,7 @@ def run_daemon_fault_recovery(
         current_action_id = action["id"]
         emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
         process = start_daemon(True, action["id"])
-        deadline = time.monotonic() + float(action.get("timeout", timeout))
+        deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
             while process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
@@ -1736,6 +1746,19 @@ def run_daemon_fault_recovery(
                     )
                 current_action_id = action["id"]
                 stop_daemon()
+                if process.returncode == 90:
+                    _fault_report(
+                        report, fault_name, fault_hit, process.pid, fault_action,
+                        scenario, seed, action["id"], "timeout",
+                    )
+                    raise HarnessTimeout(
+                        f"fault {fault_name!r} pause watchdog expired after release"
+                    )
+                if process.returncode != 0:
+                    raise UnexpectedExit(
+                        f"fault {fault_name!r} did not stop cleanly after release; "
+                        f"status {process.returncode}"
+                    )
                 emit("process_stop", target="store", pid=process.pid,
                      returncode=process.returncode)
                 process = None

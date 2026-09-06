@@ -172,6 +172,14 @@ main(void)
 	setenv("PAGESTORE_TEST_FAULT_SCENARIO", "only-scenario", 1);
 	check(ps_fault_init(store) != 0, "partial identity rejected");
 	clear_config();
+	configure("daemon.after_ready", "error", "1", control);
+	setenv("PAGESTORE_TEST_FAULT_SCENARIO", "fault-actions", 1);
+	setenv("PAGESTORE_TEST_FAULT_OPERATION", "ready", 1);
+	setenv("PAGESTORE_TEST_FAULT_SEED", "01", 1);
+	check(ps_fault_init(store) != 0, "leading-zero seed rejected");
+	setenv("PAGESTORE_TEST_FAULT_SEED", "+1", 1);
+	check(ps_fault_init(store) != 0, "signed seed rejected");
+	clear_config();
 
 	/* Unhit reporting/query and exact hit accounting. */
 	configure("page_prune.after_frontier", "crash", "3", control);

@@ -373,6 +373,7 @@ ps_fault_init(const char *store_dir)
 	const char *watchdog = getenv("PAGESTORE_TEST_FAULT_WATCHDOG_MS");
 	char control_real[PATH_MAX];
 	char store_real[PATH_MAX];
+	char seed_canonical[32];
 	PsFaultPoint point;
 	uint64_t target;
 	uint64_t seed_value;
@@ -387,6 +388,18 @@ ps_fault_init(const char *store_dir)
 	fault.initialized = 1;
 	if (!any)
 		return 0;
+	if (seed != NULL)
+	{
+		int seed_length;
+
+		if (parse_uint64(seed, &seed_value, 1) != 0)
+			return -1;
+		seed_length = snprintf(seed_canonical, sizeof(seed_canonical), "%llu",
+			(unsigned long long) seed_value);
+		if (seed_length <= 0 || (size_t) seed_length >= sizeof(seed_canonical) ||
+			strcmp(seed, seed_canonical) != 0)
+			return -1;
+	}
 	if (name == NULL || action == NULL || hit == NULL || control == NULL ||
 		ps_fault_lookup(name, &point) != 0 || parse_uint64(hit, &target, 0) != 0 ||
 		control[0] != '/' || lstat(control, &control_lstat) != 0 ||
@@ -404,7 +417,6 @@ ps_fault_init(const char *store_dir)
 			(scenario == NULL || seed == NULL || (operation == NULL && operation_id == NULL))) ||
 		parse_watchdog(watchdog, &fault.watchdog_ms) != 0 ||
 		(strlen(action) >= sizeof(fault.action)) ||
-		(seed != NULL && parse_uint64(seed, &seed_value, 1) != 0) ||
 		(strcmp(action, "pause") != 0 && watchdog != NULL))
 		return -1;
 	memcpy(fault.action, action, strlen(action) + 1);
