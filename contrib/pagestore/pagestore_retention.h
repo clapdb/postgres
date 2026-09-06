@@ -38,7 +38,14 @@ extern int ps_retention_page_fence_active(uint32_t timeline, uint64_t lsn,
 extern int ps_retention_snapshot(PsRetentionPin *pins, uint32_t capacity,
 								 uint32_t *count_out);
 extern int ps_retention_snapshot_alloc(PsRetentionPin **pins_out,
-									   uint32_t *count_out);
+										   uint32_t *count_out);
+/* Bounded diagnostic aggregation under the retention mutex.  Each resource
+ * count is the number of active owners carrying that resource bit. */
+extern void ps_retention_diagnostic_counts(uint64_t *owner_count,
+										  uint64_t *page_history_owners,
+										  uint64_t *wal_owners,
+										  uint64_t *wal_index_owners,
+										  uint64_t *max_generation);
 
 extern int ps_retention_should_compact(void);
 extern int ps_retention_compact(void);

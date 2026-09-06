@@ -469,7 +469,10 @@ run_request(uint32_t i, PsChannel *ch)
 		timeline_ok = ps_timeline_defined(ch->timeline);
 		pthread_rwlock_unlock(&core_rwlock);
 		if (timeline_ok)
+		{
 			begin(i, ch);
+			ps_core_inspection_request_complete(op, ch->status);
+		}
 		else
 		{
 			ch->status = PS_STATUS_ERROR;
@@ -525,6 +528,7 @@ run_request(uint32_t i, PsChannel *ch)
 	if (is_write)
 		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);
+	ps_core_inspection_request_complete(op, ch->status);
 	return 1;
 }
 

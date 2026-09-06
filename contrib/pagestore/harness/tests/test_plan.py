@@ -19,16 +19,19 @@ SPEC.loader.exec_module(MODULE)
 
 CAPABILITIES = {
     "schema": 1,
+    "inspection_schema": 2,
     "storage": ["posix"],
     "shards": [1],
     "compute": ["writer", "reader"],
     "crash_models": ["power_loss"],
     "operations": ["sql", "checkpoint", "prepare_reader", "assert", "crash"],
-    "inspection_operations": ["health", "backpressure"],
+    "inspection_operations": [
+        "health", "timeline", "manifest", "gc", "owners", "backpressure", "pruning",
+    ],
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 32,
+            "operations": ["crash"], "protocol_version": 41,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -345,7 +348,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 40, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 41, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -552,14 +555,39 @@ class PlanValidationTests(unittest.TestCase):
 
     def test_inspection_schema_is_read_only_and_versioned(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
-        self.assertEqual(schema["schema"], 1)
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        self.assertEqual(schema["schema"], 2)
+        self.assertEqual(capabilities["inspection_schema"], 2)
         self.assertEqual(schema["transport"], "private-test-ipc")
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
             set(schema["operations"]),
-            {"health", "timeline", "relation", "manifest", "gc", "backpressure",
+            {"health", "timeline", "manifest", "gc", "owners", "backpressure",
              "pruning"},
         )
+        self.assertNotIn("relation", schema["operations"])
+
+    def test_inspection_schema_advertises_exact_response_fields(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for operation, fields in {
+            "timeline": [
+                "timeline_count", "live_timelines", "deleting_timelines",
+                "deleted_timelines", "metadata_poisoned",
+            ],
+            "manifest": [
+                "layer_count", "deleting_layers", "local_layers",
+                "remote_durable_layers", "manifest_poisoned",
+            ],
+            "gc": [
+                "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
+                "forkmeta_pending",
+            ],
+            "owners": [
+                "owner_count", "page_history_owners", "wal_owners",
+                "wal_index_owners", "max_generation",
+            ],
+        }.items():
+            self.assertEqual(schema["operations"][operation]["response"], fields)
 
     def test_inspector_response_must_match_schema(self):
         directory = tempfile.TemporaryDirectory()
@@ -568,11 +596,10 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
-            "backpressure) printf '%s\\n' "
-            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
+            "*) exit 1 ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -580,6 +607,50 @@ class PlanValidationTests(unittest.TestCase):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         value = MODULE.inspect_store(inspector, "/unused", "health", schema)
         self.assertEqual(value["page_size"], 8192)
+
+    def test_inspector_response_fields_have_strict_json_types(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        all_fields = set().union(*MODULE.INSPECTION_RESPONSES.values())
+        self.assertEqual(
+            MODULE.INSPECTION_BOOLEAN_FIELDS,
+            {"metadata_poisoned", "manifest_poisoned", "forkmeta_pending"},
+        )
+        self.assertEqual(
+            MODULE.INSPECTION_COUNTER_FIELDS | MODULE.INSPECTION_BOOLEAN_FIELDS,
+            all_fields,
+        )
+        self.assertFalse(
+            MODULE.INSPECTION_COUNTER_FIELDS & MODULE.INSPECTION_BOOLEAN_FIELDS
+        )
+
+        for operation, fields in MODULE.INSPECTION_RESPONSES.items():
+            valid = {
+                field: False if field in MODULE.INSPECTION_BOOLEAN_FIELDS else 0
+                for field in fields
+            }
+            invalid_values = {
+                field: (0,) if field in MODULE.INSPECTION_BOOLEAN_FIELDS else (False, -1)
+                for field in fields
+            }
+            for field, values in invalid_values.items():
+                for invalid in values:
+                    with self.subTest(
+                        operation=operation, field=field, invalid=invalid
+                    ):
+                        response = dict(valid)
+                        response[field] = invalid
+                        result = mock.Mock(
+                            returncode=0, stdout=json.dumps(response), stderr=""
+                        )
+                        with (
+                            mock.patch.object(
+                                MODULE.subprocess, "run", return_value=result
+                            ),
+                            self.assertRaisesRegex(MODULE.PlanError, field),
+                        ):
+                            MODULE.inspect_store(
+                                Path("/inspect"), "/unused", operation, schema
+                            )
 
     def test_runtime_rejects_an_operation_the_runner_cannot_execute(self):
         path = self.write_plan([
@@ -1039,6 +1110,17 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "version does not match capabilities"):
             MODULE.read_inspection_schema(schema, MODULE.read_json(ROOT / "capabilities.json"))
 
+    def test_legacy_inspection_schema_version_does_not_match_runner(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        capabilities["inspection_schema"] = 1
+        schema["schema"] = 1
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schema.json"
+            path.write_text(json.dumps(schema), encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.PlanError, "runner implementation"):
+                MODULE.read_inspection_schema(path, capabilities)
+
     def test_inspection_operations_must_match_runner_before_launch(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
@@ -1047,9 +1129,9 @@ class PlanValidationTests(unittest.TestCase):
         missing["implemented_operations"].remove("backpressure")
         cases.append((capabilities, missing))
         extra_capability = json.loads(json.dumps(capabilities))
-        extra_capability["inspection_operations"].append("timeline")
+        extra_capability["inspection_operations"].append("relation")
         extra_schema = json.loads(json.dumps(schema))
-        extra_schema["implemented_operations"].append("timeline")
+        extra_schema["implemented_operations"].append("relation")
         cases.append((extra_capability, extra_schema))
         for number, (candidate_capabilities, candidate_schema) in enumerate(cases):
             with self.subTest(number=number), tempfile.TemporaryDirectory() as temporary:
@@ -1067,6 +1149,21 @@ class PlanValidationTests(unittest.TestCase):
             path.write_text(json.dumps(schema), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.PlanError, "backpressure.*do not match runner"):
                 MODULE.read_inspection_schema(path, capabilities)
+
+    def test_inspection_schema_rejects_non_read_only_contract_metadata(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for field, value, message in (
+            ("transport", "public-api", "transport"),
+            ("mutating_operations", ["delete"], "mutating"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                candidate = json.loads(json.dumps(schema))
+                candidate[field] = value
+                path = Path(temporary) / "schema.json"
+                path.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.PlanError, message):
+                    MODULE.read_inspection_schema(path, capabilities)
 
     def test_inspection_response_fields_must_match_runner(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
@@ -1112,7 +1209,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 32, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 41, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -1127,21 +1224,48 @@ class PlanValidationTests(unittest.TestCase):
         inspector = Path(directory.name) / "inspect"
         inspector.write_text(
             "#!/bin/sh\n"
-            "if [ \"$3\" = health ]; then\n"
-            "  echo '{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
+            "case \"$3\" in\n"
+            "health) printf '%s\\n' '"
+            "{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
-            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}'\n"
-            "else\n"
-            "  echo 'unsupported operation' >&2; exit 1\n"
-            "fi\n",
+            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "timeline) printf '%s\\n' '"
+            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
+            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "manifest) printf '%s\\n' '"
+            "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
+            "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
+            "gc) printf '%s\\n' '"
+            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "owners) printf '%s\\n' '"
+            "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
+            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
+            "backpressure) printf '%s\\n' '"
+            "{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
+            "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
+            "\"page_lag_bytes\":0,\"page_high_water_bytes\":0,\"page_catchup_bytes\":0,"
+            "\"page_throttled\":0,\"page_throttle_enters\":0,\"page_throttle_exits\":0,"
+            "\"page_foreground_wait_ns\":0,\"wal_lag_bytes\":0,\"wal_high_water_bytes\":0,"
+            "\"wal_catchup_bytes\":0,\"wal_throttled\":0,\"wal_throttle_enters\":0,"
+            "\"wal_throttle_exits\":0,\"wal_foreground_wait_ns\":0,\"walidx_lag_bytes\":0,"
+            "\"walidx_high_water_bytes\":0,\"walidx_catchup_bytes\":0,\"walidx_throttled\":0,"
+            "\"walidx_throttle_enters\":0,\"walidx_throttle_exits\":0,\"walidx_foreground_wait_ns\":0,"
+            "\"forkmeta_lag_bytes\":0,\"forkmeta_high_water_bytes\":0,\"forkmeta_catchup_bytes\":0,"
+            "\"forkmeta_throttled\":0,\"forkmeta_throttle_enters\":0,"
+            "\"forkmeta_throttle_exits\":0,\"forkmeta_foreground_wait_ns\":0}' ;;\n"
+            "pruning) printf '%s\\n' '{\"compactions\":0,\"versions_scanned\":0,"
+            "\"versions_kept\":0,\"versions_deleted\":0}' ;;\n"
+            "*) echo 'unsupported operation' >&2; exit 1 ;;\n"
+            "esac\n",
             encoding="utf-8",
         )
         inspector.chmod(0o755)
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
-        with self.assertRaisesRegex(MODULE.PlanError, "inspector backpressure failed"):
-            MODULE.probe_runtime_inspection(
-                inspector, "/unused", CAPABILITIES, schema
-            )
+        observations = MODULE.probe_runtime_inspection(
+            inspector, "/unused", CAPABILITIES, schema
+        )
+        self.assertEqual(set(observations), set(CAPABILITIES["inspection_operations"]))
 
     def test_postgres_runtime_major_must_be_advertised(self):
         directory = tempfile.TemporaryDirectory()
@@ -1292,9 +1416,21 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":40,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "timeline) printf '%s\\n' '"
+            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
+            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "manifest) printf '%s\\n' '"
+            "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
+            "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
+            "gc) printf '%s\\n' '"
+            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "owners) printf '%s\\n' '"
+            "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
+            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
@@ -1381,9 +1517,21 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":40,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":41,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
+            "timeline) printf '%s\\n' '"
+            "{\"timeline_count\":0,\"live_timelines\":0,\"deleting_timelines\":0,"
+            "\"deleted_timelines\":0,\"metadata_poisoned\":false}' ;;\n"
+            "manifest) printf '%s\\n' '"
+            "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
+            "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
+            "gc) printf '%s\\n' '"
+            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false}' ;;\n"
+            "owners) printf '%s\\n' '"
+            "{\"owner_count\":0,\"page_history_owners\":0,\"wal_owners\":0,"
+            "\"wal_index_owners\":0,\"max_generation\":0}' ;;\n"
             "backpressure) printf '%s\\n' "
             "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1,"
             "\"wal_index_pending_bytes\":0,\"wal_index_lagging_timelines\":0,"
@@ -1437,17 +1585,7 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
             encoding="utf-8",
         )
-        inspector.write_text(
-            "#!/bin/sh\ncase \"$3\" in\n"
-            "health) printf '%s\\n' "
-            "'{\"protocol_version\":32,\"page_size\":8192,\"io_unit\":262144,"
-            "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
-            "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
-            "backpressure) printf '%s\\n' "
-            "'{\"idle\":128,\"claimed\":0,\"request\":0,\"done\":0,\"shards\":1}' ;;\n"
-            "esac\n",
-            encoding="utf-8",
-        )
+        inspector.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         daemon.chmod(0o755)
         inspector.chmod(0o755)
         plan = self.write_plan([

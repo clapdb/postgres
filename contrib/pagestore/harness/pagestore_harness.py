@@ -221,8 +221,19 @@ def read_plan(path: Path) -> Plan:
 
 def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str, Any]:
     schema = read_json(path)
+    if capabilities.get("inspection_schema") != INSPECTION_SCHEMA_VERSION:
+        raise PlanError(
+            "capabilities: inspection schema version does not match "
+            "runner implementation"
+        )
     if schema.get("schema") != capabilities.get("inspection_schema"):
         raise PlanError(f"{path}: inspection schema version does not match capabilities")
+    if schema.get("transport") != INSPECTION_TRANSPORT:
+        raise PlanError(
+            f"{path}: inspection transport must be {INSPECTION_TRANSPORT!r}"
+        )
+    if schema.get("mutating_operations") != []:
+        raise PlanError(f"{path}: inspection schema must not advertise mutating operations")
     advertised = capability_values(capabilities, "inspection_operations")
     if advertised != INSPECTION_OPERATIONS:
         raise PlanError(
@@ -239,7 +250,7 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
             f"{path}: implemented inspection operations do not match runner implementation"
         )
     operations = schema.get("operations")
-    if not isinstance(operations, dict):
+    if not isinstance(operations, dict) or set(operations) != INSPECTION_OPERATIONS:
         raise PlanError(f"{path}: inspection operations must be an object")
     for operation, expected_response in sorted(INSPECTION_RESPONSES.items()):
         definition = operations.get(operation)
@@ -412,11 +423,35 @@ INSPECTION_RESPONSES = {
         "forkmeta_throttled", "forkmeta_throttle_enters", "forkmeta_throttle_exits",
         "forkmeta_foreground_wait_ns",
     },
+    "timeline": {
+        "timeline_count", "live_timelines", "deleting_timelines",
+        "deleted_timelines", "metadata_poisoned",
+    },
+    "manifest": {
+        "layer_count", "deleting_layers", "local_layers",
+        "remote_durable_layers", "manifest_poisoned",
+    },
+    "gc": {
+        "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
+        "forkmeta_pending",
+    },
+    "owners": {
+        "owner_count", "page_history_owners", "wal_owners",
+        "wal_index_owners", "max_generation",
+    },
     "pruning": {
         "compactions", "versions_scanned", "versions_kept", "versions_deleted",
     },
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
+INSPECTION_BOOLEAN_FIELDS = {
+    "metadata_poisoned", "manifest_poisoned", "forkmeta_pending",
+}
+INSPECTION_COUNTER_FIELDS = (
+    set().union(*INSPECTION_RESPONSES.values()) - INSPECTION_BOOLEAN_FIELDS
+)
+INSPECTION_SCHEMA_VERSION = 2
+INSPECTION_TRANSPORT = "private-test-ipc"
 PG_CONTROL_FILE_SIZE = 8192
 
 
@@ -1085,6 +1120,27 @@ def inspect_store(binary: Path, shm: str, operation: str, schema: dict[str, Any]
         raise PlanError(f"inspector {operation} returned invalid JSON: {error.msg}") from error
     if not isinstance(value, dict) or set(value) != set(expected):
         raise PlanError(f"inspector {operation} returned a response outside its schema")
+    for field in expected:
+        observed = value[field]
+        if field in INSPECTION_BOOLEAN_FIELDS:
+            if not isinstance(observed, bool):
+                raise PlanError(
+                    f"inspector {operation} field {field!r} must be a boolean"
+                )
+        elif field in INSPECTION_COUNTER_FIELDS:
+            if (
+                not isinstance(observed, int)
+                or isinstance(observed, bool)
+                or observed < 0
+            ):
+                raise PlanError(
+                    f"inspector {operation} field {field!r} must be a "
+                    "nonnegative integer"
+                )
+        else:
+            raise PlanError(
+                f"inspection schema: field {field!r} has no response type"
+            )
     return value
 
 
@@ -2743,7 +2799,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--validate", type=Path, metavar="PLAN")
     group.add_argument("--list", type=Path, metavar="SCENARIO_DIR")
-    group.add_argument("--inspect", choices=["health", "backpressure", "pruning"])
+    group.add_argument("--inspect", choices=sorted(INSPECTION_OPERATIONS))
     group.add_argument("--daemon-smoke", type=Path, metavar="PLAN")
     group.add_argument(
         "--daemon-fault-smoke", "--daemon-fault-recovery",

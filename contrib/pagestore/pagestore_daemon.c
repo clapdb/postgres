@@ -514,6 +514,7 @@ run_request_admitted(PsChannel *ch)
 			handle_request(ch);
 		else
 			ch->status = PS_STATUS_ERROR;
+		ps_core_inspection_request_complete(op, ch->status);
 		ps_store_release(&ch->state, PS_STATE_DONE);
 		return;
 	}
@@ -524,10 +525,11 @@ run_request_admitted(PsChannel *ch)
 			ps_lock_shard_wr(s);
 		ps_lock_map_wr();
 		handle_request(ch);
-		ps_store_release(&ch->state, PS_STATE_DONE);
 		ps_unlock_map();
 		for (uint32_t s = ps_nshards; s-- > 0;)
 			ps_unlock_shard(s);
+		ps_core_inspection_request_complete(op, ch->status);
+		ps_store_release(&ch->state, PS_STATE_DONE);
 		return;
 	}
 
@@ -608,8 +610,9 @@ run_request_admitted(PsChannel *ch)
 			 */
 			ps_lock_shard_wr(shard);
 			handle_request(ch);
-			ps_store_release(&ch->state, PS_STATE_DONE);
 			ps_unlock_shard(shard);
+			ps_core_inspection_request_complete(op, ch->status);
+			ps_store_release(&ch->state, PS_STATE_DONE);
 		}
 		else
 		{
@@ -728,6 +731,7 @@ run_request(uint32_t channel, PsChannel *ch)
 			ps_unlock_map();
 			ps_admission_write_unlock();
 			ps_lifecycle_write_unlock();
+			ps_core_inspection_request_complete(op, ch->status);
 		}
 		else
 		{

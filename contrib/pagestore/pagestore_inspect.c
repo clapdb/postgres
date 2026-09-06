@@ -22,7 +22,8 @@
 static void
 usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s --shm NAME health|backpressure|pruning\n", prog);
+	fprintf(stderr, "usage: %s --shm NAME health|timeline|manifest|gc|owners|"
+			"backpressure|pruning\n", prog);
 }
 
 static int
@@ -246,6 +247,131 @@ print_pruning(PsShmHeader *hdr)
 		   (unsigned long long) deleted);
 }
 
+static void
+read_inspection_metrics(PsShmHeader *hdr, PsInspectionMetrics *metrics)
+{
+	const unsigned int max_attempts = 10000;
+	uint64_t before;
+	uint64_t after;
+
+	for (unsigned int attempt = 0; attempt < max_attempts; attempt++)
+	{
+		before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
+		if (before & 1)
+		{
+			usleep(100);
+			continue;
+		}
+		metrics->timeline_count =
+			ps_load_acquire_u64(&hdr->inspection.timeline_count);
+		metrics->live_timelines =
+			ps_load_acquire_u64(&hdr->inspection.live_timelines);
+		metrics->deleting_timelines =
+			ps_load_acquire_u64(&hdr->inspection.deleting_timelines);
+		metrics->deleted_timelines =
+			ps_load_acquire_u64(&hdr->inspection.deleted_timelines);
+		metrics->metadata_poisoned =
+			ps_load_acquire(&hdr->inspection.metadata_poisoned);
+		metrics->layer_count =
+			ps_load_acquire_u64(&hdr->inspection.layer_count);
+		metrics->deleting_layers =
+			ps_load_acquire_u64(&hdr->inspection.deleting_layers);
+		metrics->local_layers =
+			ps_load_acquire_u64(&hdr->inspection.local_layers);
+		metrics->remote_durable_layers =
+			ps_load_acquire_u64(&hdr->inspection.remote_durable_layers);
+		metrics->manifest_poisoned =
+			ps_load_acquire(&hdr->inspection.manifest_poisoned);
+		metrics->page_debt_segments =
+			ps_load_acquire_u64(&hdr->inspection.page_debt_segments);
+		metrics->gc_deleting_layers =
+			ps_load_acquire_u64(&hdr->inspection.gc_deleting_layers);
+		metrics->remote_cleanup_pending =
+			ps_load_acquire_u64(&hdr->inspection.remote_cleanup_pending);
+		metrics->forkmeta_pending =
+			ps_load_acquire(&hdr->inspection.forkmeta_pending);
+		metrics->owner_count =
+			ps_load_acquire_u64(&hdr->inspection.owner_count);
+		metrics->page_history_owners =
+			ps_load_acquire_u64(&hdr->inspection.page_history_owners);
+		metrics->wal_owners =
+			ps_load_acquire_u64(&hdr->inspection.wal_owners);
+		metrics->wal_index_owners =
+			ps_load_acquire_u64(&hdr->inspection.wal_index_owners);
+		metrics->max_generation =
+			ps_load_acquire_u64(&hdr->inspection.max_generation);
+		after = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
+		if (before == after && !(after & 1))
+			return;
+		usleep(100);
+	}
+	fprintf(stderr,
+			"pagestore_inspect: inspection metrics snapshot stayed unstable\n");
+	exit(1);
+}
+
+static void
+print_timeline(PsShmHeader *hdr)
+{
+	PsInspectionMetrics metrics;
+
+	read_inspection_metrics(hdr, &metrics);
+	printf("{\"timeline_count\":%llu,\"live_timelines\":%llu,"
+		   "\"deleting_timelines\":%llu,\"deleted_timelines\":%llu,"
+		   "\"metadata_poisoned\":%s}\n",
+		   (unsigned long long) metrics.timeline_count,
+		   (unsigned long long) metrics.live_timelines,
+		   (unsigned long long) metrics.deleting_timelines,
+		   (unsigned long long) metrics.deleted_timelines,
+		   metrics.metadata_poisoned ? "true" : "false");
+}
+
+static void
+print_manifest(PsShmHeader *hdr)
+{
+	PsInspectionMetrics metrics;
+
+	read_inspection_metrics(hdr, &metrics);
+	printf("{\"layer_count\":%llu,\"deleting_layers\":%llu,"
+		   "\"local_layers\":%llu,\"remote_durable_layers\":%llu,"
+		   "\"manifest_poisoned\":%s}\n",
+		   (unsigned long long) metrics.layer_count,
+		   (unsigned long long) metrics.deleting_layers,
+		   (unsigned long long) metrics.local_layers,
+		   (unsigned long long) metrics.remote_durable_layers,
+		   metrics.manifest_poisoned ? "true" : "false");
+}
+
+static void
+print_gc(PsShmHeader *hdr)
+{
+	PsInspectionMetrics metrics;
+
+	read_inspection_metrics(hdr, &metrics);
+	printf("{\"page_debt_segments\":%llu,\"deleting_layers\":%llu,"
+		   "\"remote_cleanup_pending\":%llu,\"forkmeta_pending\":%s}\n",
+		   (unsigned long long) metrics.page_debt_segments,
+		   (unsigned long long) metrics.gc_deleting_layers,
+		   (unsigned long long) metrics.remote_cleanup_pending,
+		   metrics.forkmeta_pending ? "true" : "false");
+}
+
+static void
+print_owners(PsShmHeader *hdr)
+{
+	PsInspectionMetrics metrics;
+
+	read_inspection_metrics(hdr, &metrics);
+	printf("{\"owner_count\":%llu,\"page_history_owners\":%llu,"
+		   "\"wal_owners\":%llu,\"wal_index_owners\":%llu,"
+		   "\"max_generation\":%llu}\n",
+		   (unsigned long long) metrics.owner_count,
+		   (unsigned long long) metrics.page_history_owners,
+		   (unsigned long long) metrics.wal_owners,
+		   (unsigned long long) metrics.wal_index_owners,
+		   (unsigned long long) metrics.max_generation);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -262,6 +388,10 @@ main(int argc, char **argv)
 	}
 	if (shm_name == NULL ||
 		(strcmp(operation, "health") != 0 &&
+		 strcmp(operation, "timeline") != 0 &&
+		 strcmp(operation, "manifest") != 0 &&
+		 strcmp(operation, "gc") != 0 &&
+		 strcmp(operation, "owners") != 0 &&
 		 strcmp(operation, "backpressure") != 0 &&
 		 strcmp(operation, "pruning") != 0))
 	{
@@ -290,6 +420,14 @@ main(int argc, char **argv)
 	}
 	if (strcmp(operation, "health") == 0)
 		print_health(hdr);
+	else if (strcmp(operation, "timeline") == 0)
+		print_timeline(hdr);
+	else if (strcmp(operation, "manifest") == 0)
+		print_manifest(hdr);
+	else if (strcmp(operation, "gc") == 0)
+		print_gc(hdr);
+	else if (strcmp(operation, "owners") == 0)
+		print_owners(hdr);
 	else if (strcmp(operation, "backpressure") == 0)
 		print_backpressure(shm, hdr);
 	else

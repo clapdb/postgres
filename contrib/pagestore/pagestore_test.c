@@ -152,6 +152,94 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"versions_kept\":") != NULL &&
 		  strstr(output, "\"versions_deleted\":") != NULL,
 		  "read-only inspector reports page-pruning counters");
+	check(run_inspector(shm, "timeline", output, sizeof(output)),
+		  "read-only inspector timeline snapshot exits cleanly");
+	check(strcmp(output, "{\"timeline_count\":1,\"live_timelines\":1,"
+			 "\"deleting_timelines\":0,\"deleted_timelines\":0,"
+			 "\"metadata_poisoned\":false}\n") == 0,
+		  "read-only inspector reports exact initial timeline values and JSON boolean");
+	check(run_inspector(shm, "manifest", output, sizeof(output)),
+		  "read-only inspector manifest snapshot exits cleanly");
+	check(strcmp(output, "{\"layer_count\":0,\"deleting_layers\":0,"
+			 "\"local_layers\":0,\"remote_durable_layers\":0,"
+			 "\"manifest_poisoned\":false}\n") == 0,
+		  "read-only inspector reports exact empty-manifest values and JSON boolean");
+	check(run_inspector(shm, "gc", output, sizeof(output)),
+		  "read-only inspector GC snapshot exits cleanly");
+	check(strstr(output, "\"page_debt_segments\":") != NULL &&
+		  strstr(output, "\"deleting_layers\":") != NULL &&
+		  strstr(output, "\"remote_cleanup_pending\":") != NULL &&
+		  (strstr(output, "\"forkmeta_pending\":true") != NULL ||
+		   strstr(output, "\"forkmeta_pending\":false") != NULL),
+		  "read-only inspector reports the GC snapshot contract");
+	check(run_inspector(shm, "owners", output, sizeof(output)),
+		  "read-only inspector owners snapshot exits cleanly");
+	check(strcmp(output, "{\"owner_count\":0,\"page_history_owners\":0,"
+			 "\"wal_owners\":0,\"wal_index_owners\":0,"
+			 "\"max_generation\":0}\n") == 0,
+		  "read-only inspector reports exact initial owner values");
+}
+
+static void
+check_inspector_seqlock(void)
+{
+	char name[64];
+	char output[256];
+	int fd;
+	void *base;
+	PsShmHeader *hdr;
+	pid_t writer;
+	int status;
+
+	check(ps_saturating_add_u64(UINT64_MAX - 1, 2) == UINT64_MAX,
+		  "inspection debt aggregation saturates instead of wrapping");
+
+	snprintf(name, sizeof(name), "/pstest_%d_inspection_seq", (int) getpid());
+	shm_unlink(name);
+	fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+	check(fd >= 0 && ftruncate(fd, PS_SHM_SIZE) == 0,
+		  "create synthetic inspection seqlock shared memory");
+	if (fd < 0)
+		return;
+	base = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (base == MAP_FAILED)
+		return;
+	memset(base, 0, PS_SHM_SIZE);
+	hdr = base;
+	hdr->magic = PS_SHM_MAGIC;
+	hdr->version = PS_SHM_VERSION;
+	hdr->page_size = 8192;
+	hdr->io_unit = PS_IO_UNIT;
+	hdr->nchannels = 1;
+	hdr->nshards = 1;
+	hdr->channel_stride = PS_CHANNEL_STRIDE;
+	hdr->channels_off = PS_CHANNELS_OFF;
+	hdr->startup_state = PS_SHM_READY;
+	hdr->inspection.timeline_count = 99;
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 1);
+	writer = fork();
+	if (writer == 0)
+	{
+		usleep(20000);
+		hdr->inspection.timeline_count = 3;
+		hdr->inspection.live_timelines = 2;
+		hdr->inspection.deleting_timelines = 1;
+		hdr->inspection.deleted_timelines = 0;
+		hdr->inspection.metadata_poisoned = 1;
+		ps_store_release_u64(&hdr->inspection_metrics_seq, 2);
+		_exit(0);
+	}
+	check(run_inspector(name, "timeline", output, sizeof(output)) &&
+		  strcmp(output, "{\"timeline_count\":3,\"live_timelines\":2,"
+				 "\"deleting_timelines\":1,\"deleted_timelines\":0,"
+				 "\"metadata_poisoned\":true}\n") == 0,
+		  "inspector retries an odd seqlock and never emits a torn snapshot");
+	waitpid(writer, &status, 0);
+	check(ps_load_acquire(&ps_channel(base, 0)->state) == PS_STATE_IDLE,
+		  "inspector does not claim a channel while reading a snapshot");
+	munmap(base, PS_SHM_SIZE);
+	shm_unlink(name);
 }
 
 static int
@@ -3243,9 +3331,21 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	wait_ready(shm, page_size);
 	check_inspector(shm, page_size);
 	client_attach(shm, page_size);
-	check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29001, 1,
-						   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1) == PS_STATUS_OK,
-		  "generic as-of tests pin the history they later read");
+	{
+		PsShmHeader *hdr = (PsShmHeader *) cl_shm;
+		uint64_t before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
+		uint64_t metadata_seq;
+
+		check(op_retention_set(0, PS_RETENTION_OWNER_READER, 29001, 1,
+							   PS_RETENTION_RESOURCE_PAGE_HISTORY, 1) == PS_STATUS_OK,
+			  "generic as-of tests pin the history they later read");
+		metadata_seq = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
+		check(metadata_seq >= before + 2,
+			  "successful retention metadata synchronously publishes inspection state");
+		(void) op_exists(REL_A, FORK0);
+		check(ps_load_acquire_u64(&hdr->inspection_metrics_seq) == metadata_seq,
+			  "ordinary request cannot synchronously publish inspection state");
+	}
 
 	/* --- lifecycle / metadata --- */
 	check(!op_exists(REL_A, FORK0), "fork should not exist before create");
@@ -3817,6 +3917,15 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_set(0, PS_RETENTION_OWNER_CONFIGURED, 303,
 						   1, PS_RETENTION_RESOURCE_PAGE_HISTORY, 4000) == PS_STATUS_OK,
 		  "configured page-history pin is registered");
+	{
+		char output[256];
+
+		check(run_inspector(shm, "owners", output, sizeof(output)) &&
+			  strcmp(output, "{\"owner_count\":3,\"page_history_owners\":2,"
+					 "\"wal_owners\":2,\"wal_index_owners\":2,"
+					 "\"max_generation\":1}\n") == 0,
+			  "owner snapshot is refreshed before a successful SET completes");
+	}
 	check(op_retention_get(0, &pin, &count) && count == 3 &&
 		  pin.timeline == 0 && pin.owner_kind == PS_RETENTION_OWNER_READER &&
 		  pin.owner_id == 101 && pin.generation == 1 && pin.lsn == 5000,
@@ -5475,6 +5584,7 @@ main(int argc, char **argv)
 		perror("mkdtemp");
 		return 2;
 	}
+	check_inspector_seqlock();
 
 	/* Legacy migration must seal before the daemon publishes readiness. */
 	run_migration_failure_suite(daemon_path, tmpbase);

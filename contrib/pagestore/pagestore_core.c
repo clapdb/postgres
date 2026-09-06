@@ -93,6 +93,14 @@ static int tier_one_layer(void);
 static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
 static int core_opened;
+/* Every snapshot writer is serialized here.  Mutations refresh at their next
+ * lock-safe completion point; a 100ms fallback bounds otherwise untracked
+ * poison-state staleness without scanning in every 20us maintenance pass. */
+#define INSPECTION_REFRESH_NS UINT64_C(100000000)
+static pthread_mutex_t inspection_metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t inspection_mutation_epoch;
+static uint64_t inspection_published_epoch;
+static uint64_t inspection_next_refresh_ns;
 static int fork_meta_reclaim_baseline_init(void);
 static int ps_core_open_impl(const char *store_dir);
 static void ps_core_close_impl(void);
@@ -127,6 +135,8 @@ static int timeline_delete_wal_cleanup_one(void);
 static int timeline_delete_page_cleanup_one(void);
 static int timeline_delete_publish_ready(uint32_t timeline);
 static int timeline_delete_publish_one(void);
+static void inspection_metrics_changed(void);
+static void publish_inspection_metrics(int force);
 static int branch_frontiers_allow(int parent, uint64_t branch_lsn);
 static int page_prune_fences(uint32_t timeline, PsPruneFence **fences_out,
 								 uint32_t *nfences_out);
@@ -1828,10 +1838,15 @@ alloc_layer_id(void *ctx)
 static int
 record_layer(void *ctx, const PsLayerDesc *desc)
 {
+	int rc;
+
 	(void) ctx;
 	/* ps_manifest_add_layer persists the ADD event *and* adds it to the layer
 	 * map (idempotently); do not add to the map a second time. */
-	return ps_manifest_add_layer(desc);
+	rc = ps_manifest_add_layer(desc);
+	if (rc == 0)
+		inspection_metrics_changed();
+	return rc;
 }
 
 static int
@@ -5776,6 +5791,18 @@ static int fork_meta_snapshot_gc_ambiguous;
 static struct timespec fork_meta_snapshot_retry_at;
 static char fork_meta_snapshot_dir[4096];
 
+static inline int
+fork_meta_pending_load(const int *pending)
+{
+	return __atomic_load_n(pending, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+fork_meta_pending_store(int *pending, int value)
+{
+	__atomic_store_n(pending, value, __ATOMIC_RELEASE);
+}
+
 static void forkmeta_observation_force_now(void);
 
 /* The baseline is deliberately conservative across restart.  Before the first
@@ -5934,7 +5961,7 @@ forkmeta_reclaim_lag_bytes(void)
 	if (observation.gc_temp_bytes != 0 || observation.gc_temp_gc_due)
 	{
 		if (observation.gc_temp_bytes != 0)
-			fork_meta_temp_gc_pending = 1;
+			fork_meta_pending_store(&fork_meta_temp_gc_pending, 1);
 		__atomic_store_n(&fork_meta_temp_gc_probe_pending,
 						 observation.gc_temp_gc_due, __ATOMIC_RELEASE);
 		if (!fork_meta_temp_gc_ambiguous)
@@ -5943,7 +5970,7 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	else if (!fork_meta_temp_gc_ambiguous)
 	{
-		fork_meta_temp_gc_pending = 0;
+		fork_meta_pending_store(&fork_meta_temp_gc_pending, 0);
 		__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0,
 						 __ATOMIC_RELEASE);
 	}
@@ -5952,7 +5979,7 @@ forkmeta_reclaim_lag_bytes(void)
 	 * admission fence just as we probe temp GC on overflow. */
 	if (observation.gc_canonical_bytes != 0)
 	{
-		fork_meta_canonical_gc_pending = 1;
+		fork_meta_pending_store(&fork_meta_canonical_gc_pending, 1);
 		__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
 						 __ATOMIC_RELEASE);
 		if (!fork_meta_canonical_gc_ambiguous)
@@ -5972,7 +5999,7 @@ forkmeta_reclaim_lag_bytes(void)
 	}
 	else if (!fork_meta_canonical_gc_ambiguous)
 	{
-		fork_meta_canonical_gc_pending = 0;
+		fork_meta_pending_store(&fork_meta_canonical_gc_pending, 0);
 		__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
 						 __ATOMIC_RELEASE);
 	}
@@ -6009,7 +6036,7 @@ ps_test_forkmeta_snapshot_gc_retry_now(void)
 int
 ps_test_forkmeta_canonical_gc_ambiguous(void)
 {
-	return (fork_meta_canonical_gc_pending ||
+	return (fork_meta_pending_load(&fork_meta_canonical_gc_pending) ||
 			__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
 							__ATOMIC_ACQUIRE)) &&
 		fork_meta_canonical_gc_ambiguous;
@@ -7216,7 +7243,7 @@ fork_meta_snapshot_retry_due(void)
 static int
 fork_meta_temp_gc_due(void)
 {
-	return fork_meta_temp_gc_pending &&
+	return fork_meta_pending_load(&fork_meta_temp_gc_pending) &&
 		fork_meta_retry_due_at(&fork_meta_temp_gc_retry_at);
 }
 
@@ -7230,7 +7257,7 @@ fork_meta_temp_gc_probe_due(void)
 static int
 fork_meta_canonical_gc_due(void)
 {
-	return fork_meta_canonical_gc_pending &&
+	return fork_meta_pending_load(&fork_meta_canonical_gc_pending) &&
 		fork_meta_retry_due_at(&fork_meta_canonical_gc_retry_at);
 }
 
@@ -7252,7 +7279,8 @@ fork_meta_gc_durability_ambiguous(void)
 static int
 fork_meta_snapshot_gc_due(void)
 {
-	return fork_meta_snapshot_gc_pending && fork_meta_snapshot_retry_due();
+	return fork_meta_pending_load(&fork_meta_snapshot_gc_pending) &&
+		fork_meta_snapshot_retry_due();
 }
 
 static int
@@ -7278,8 +7306,10 @@ fork_meta_snapshot_due_locked(void)
 		return 0;
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
-	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
+	return !fork_meta_poisoned_load() &&
+		!fork_meta_pending_load(&fork_meta_snapshot_gc_pending) &&
+		!fork_meta_pending_load(&fork_meta_temp_gc_pending) &&
+		!fork_meta_pending_load(&fork_meta_canonical_gc_pending) &&
 		(fork_meta_deletion_cutover_due_locked() ||
 		 ((!__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) &&
 		   !__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
@@ -7310,8 +7340,10 @@ fork_meta_snapshot_due(void)
 		return 0;
 	if (!fork_meta_snapshot_retry_due())
 		return 0;
-	return !fork_meta_poisoned_load() && !fork_meta_snapshot_gc_pending &&
-		!fork_meta_temp_gc_pending && !fork_meta_canonical_gc_pending &&
+	return !fork_meta_poisoned_load() &&
+		!fork_meta_pending_load(&fork_meta_snapshot_gc_pending) &&
+		!fork_meta_pending_load(&fork_meta_temp_gc_pending) &&
+		!fork_meta_pending_load(&fork_meta_canonical_gc_pending) &&
 		(fork_meta_deletion_probe_due() ||
 		 ((!__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) &&
 		   !__atomic_load_n(&fork_meta_canonical_gc_probe_pending,
@@ -7357,7 +7389,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	int overflow_cutover;
 	int rc = 0;
 
-	if (fork_meta_snapshot_gc_pending)
+	if (fork_meta_pending_load(&fork_meta_snapshot_gc_pending))
 	{
 		int gc;
 		int was_ambiguous = fork_meta_snapshot_gc_ambiguous;
@@ -7382,7 +7414,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 				 * live cursor.  Keep the startup/publish cleanup pending until a
 				 * later pass reaches EOF, but let the outer controller service its
 				 * other maintenance classes in this tick. */
-				fork_meta_snapshot_gc_pending = 1;
+				fork_meta_pending_store(&fork_meta_snapshot_gc_pending, 1);
 				fork_meta_snapshot_gc_ambiguous = 0;
 				memset(&fork_meta_snapshot_retry_at, 0,
 					   sizeof(fork_meta_snapshot_retry_at));
@@ -7391,7 +7423,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 					forkmeta_observation_force_now();
 				return FORKMETA_MAINTENANCE_CONTINUE;
 			}
-			fork_meta_snapshot_gc_pending = 0;
+			fork_meta_pending_store(&fork_meta_snapshot_gc_pending, 0);
 			fork_meta_snapshot_gc_ambiguous = 0;
 			memset(&fork_meta_snapshot_retry_at, 0,
 				   sizeof(fork_meta_snapshot_retry_at));
@@ -7534,7 +7566,7 @@ fork_meta_snapshot_maintenance(uint64_t precomputed_generation)
 	fork_meta_snapshot_bytes = checkpoint.len + tail.len;
 	fork_meta_snapshot_checkpoint_meta = prepared.checkpoint;
 	fork_meta_snapshot_tail_meta = prepared.tail;
-	fork_meta_snapshot_gc_pending = 1;
+	fork_meta_pending_store(&fork_meta_snapshot_gc_pending, 1);
 	memset(&fork_meta_snapshot_retry_at, 0, sizeof(fork_meta_snapshot_retry_at));
 	if (overflow_cutover)
 	{
@@ -7856,6 +7888,10 @@ load_timelines(void)
 
 static void publish_wal_index_metrics(void);
 
+/* Publish the bounded, read-only diagnostic view after core work has reached a
+ * lock-safe point.  This intentionally observes in-memory state only: it does
+ * not force a flush, advance a frontier, or participate in any durability
+ * protocol. */
 /*
  * Each timeline has an append-only WAL log "wal_<tl>" of self-describing
  * records [WalRecHdr | bytes].  This is the durability/transport half of WAL
@@ -8958,10 +8994,200 @@ publish_wal_index_metrics(void)
 void
 ps_core_set_metrics_header(PsShmHeader *hdr)
 {
+	pthread_mutex_lock(&inspection_metrics_mutex);
 	metrics_header = hdr;
+	inspection_next_refresh_ns = 0;
+	pthread_mutex_unlock(&inspection_metrics_mutex);
+	publish_inspection_metrics(1);
 	publish_wal_index_metrics();
 	if (hdr != NULL)
 		ps_backpressure_refresh();
+}
+
+static uint64_t
+inspection_now_ns(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0)
+		return 0;
+	return (uint64_t) now.tv_sec * UINT64_C(1000000000) +
+		(uint64_t) now.tv_nsec;
+}
+
+static void
+inspection_metrics_changed(void)
+{
+	__atomic_add_fetch(&inspection_mutation_epoch, 1, __ATOMIC_RELEASE);
+}
+
+static void
+publish_inspection_metrics(int force)
+{
+	PsInspectionMetrics snapshot;
+	PsShmHeader *hdr;
+	uint64_t now = inspection_now_ns();
+	uint64_t epoch = __atomic_load_n(&inspection_mutation_epoch,
+									 __ATOMIC_ACQUIRE);
+
+	if (!force && epoch == __atomic_load_n(&inspection_published_epoch,
+											 __ATOMIC_ACQUIRE) && now != 0 &&
+		now < __atomic_load_n(&inspection_next_refresh_ns, __ATOMIC_ACQUIRE))
+		return;
+	pthread_mutex_lock(&inspection_metrics_mutex);
+	hdr = metrics_header;
+	epoch = __atomic_load_n(&inspection_mutation_epoch, __ATOMIC_ACQUIRE);
+	if (hdr == NULL)
+	{
+		pthread_mutex_unlock(&inspection_metrics_mutex);
+		return;
+	}
+	if (!force && epoch == inspection_published_epoch && now != 0 &&
+		now < __atomic_load_n(&inspection_next_refresh_ns, __ATOMIC_RELAXED))
+	{
+		pthread_mutex_unlock(&inspection_metrics_mutex);
+		return;
+	}
+	memset(&snapshot, 0, sizeof(snapshot));
+
+	/* Timeline and manifest state share the map lock.  The scan is bounded by
+	 * MAX_TIMELINES and the current layer-map capacity; it never allocates. */
+	if (map_locks_ready)
+		ps_lock_map_rd();
+	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
+	{
+		PsTimelineState state;
+
+		if (!__atomic_load_n(&timelines[tl].defined, __ATOMIC_ACQUIRE))
+			continue;
+		snapshot.timeline_count++;
+		state = (PsTimelineState) __atomic_load_n(&timelines[tl].state,
+															__ATOMIC_ACQUIRE);
+		if (state == PS_TIMELINE_LIVE)
+			snapshot.live_timelines++;
+		else if (state == PS_TIMELINE_DELETING)
+			snapshot.deleting_timelines++;
+		else if (state == PS_TIMELINE_DELETED)
+			snapshot.deleted_timelines++;
+	}
+
+	snapshot.layer_count = ps_layer_map.nlayers;
+	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+	{
+		const PsLayerDesc *layer = &ps_layer_map.layers[i];
+		int has_remote;
+
+		if (layer->deleting)
+		{
+			snapshot.deleting_layers++;
+			snapshot.gc_deleting_layers++;
+		}
+		if (tier_local_location(layer) != NULL)
+			snapshot.local_layers++;
+		if (layer->remote_durable)
+			snapshot.remote_durable_layers++;
+		has_remote = tier_remote_location(layer) != NULL ||
+			layer->remote_durable;
+		if (layer->deleting && has_remote && !layer->remote_cleanup_done)
+			snapshot.remote_cleanup_pending++;
+	}
+	if (map_locks_ready)
+		ps_unlock_map();
+
+	/* PAGE debt is maintained incrementally per shard.  Taking each shard read
+	 * lock makes the aggregate coherent without scanning historical segments. */
+	for (uint32_t shard = 0; map_locks_ready && shard < core_shards(); shard++)
+	{
+		ps_lock_shard_rd(shard);
+		snapshot.page_debt_segments = ps_saturating_add_u64(
+			snapshot.page_debt_segments, g_shards[shard].gc_debt_segments);
+		ps_unlock_shard(shard);
+	}
+
+	ps_retention_diagnostic_counts(&snapshot.owner_count,
+								  &snapshot.page_history_owners,
+								  &snapshot.wal_owners,
+								  &snapshot.wal_index_owners,
+								  &snapshot.max_generation);
+
+	snapshot.metadata_poisoned = timeline_meta_poisoned_load() != 0;
+	snapshot.manifest_poisoned = ps_manifest_poisoned() != 0;
+	snapshot.forkmeta_pending =
+		fork_meta_pending_load(&fork_meta_snapshot_gc_pending) ||
+		fork_meta_pending_load(&fork_meta_temp_gc_pending) ||
+		fork_meta_pending_load(&fork_meta_canonical_gc_pending) ||
+		(__atomic_load_n(&fork_meta_temp_gc_probe_pending, __ATOMIC_ACQUIRE) != 0) ||
+		(__atomic_load_n(&fork_meta_canonical_gc_probe_pending, __ATOMIC_ACQUIRE) != 0);
+
+	/* Start/end sequence stores are the only publication edge for this view. */
+	ps_fetch_add_u64(&hdr->inspection_metrics_seq, 1);
+	ps_store_release_u64(&hdr->inspection.timeline_count,
+						 snapshot.timeline_count);
+	ps_store_release_u64(&hdr->inspection.live_timelines,
+						 snapshot.live_timelines);
+	ps_store_release_u64(&hdr->inspection.deleting_timelines,
+						 snapshot.deleting_timelines);
+	ps_store_release_u64(&hdr->inspection.deleted_timelines,
+						 snapshot.deleted_timelines);
+	ps_store_release(&hdr->inspection.metadata_poisoned,
+					 snapshot.metadata_poisoned);
+	ps_store_release_u64(&hdr->inspection.layer_count,
+						 snapshot.layer_count);
+	ps_store_release_u64(&hdr->inspection.deleting_layers,
+						 snapshot.deleting_layers);
+	ps_store_release_u64(&hdr->inspection.local_layers,
+						 snapshot.local_layers);
+	ps_store_release_u64(&hdr->inspection.remote_durable_layers,
+						 snapshot.remote_durable_layers);
+	ps_store_release(&hdr->inspection.manifest_poisoned,
+					 snapshot.manifest_poisoned);
+	ps_store_release_u64(&hdr->inspection.page_debt_segments,
+						 snapshot.page_debt_segments);
+	ps_store_release_u64(&hdr->inspection.gc_deleting_layers,
+						 snapshot.gc_deleting_layers);
+	ps_store_release_u64(&hdr->inspection.remote_cleanup_pending,
+						 snapshot.remote_cleanup_pending);
+	ps_store_release(&hdr->inspection.forkmeta_pending,
+					 snapshot.forkmeta_pending);
+	ps_store_release_u64(&hdr->inspection.owner_count,
+						 snapshot.owner_count);
+	ps_store_release_u64(&hdr->inspection.page_history_owners,
+						 snapshot.page_history_owners);
+	ps_store_release_u64(&hdr->inspection.wal_owners,
+						 snapshot.wal_owners);
+	ps_store_release_u64(&hdr->inspection.wal_index_owners,
+						 snapshot.wal_index_owners);
+	ps_store_release_u64(&hdr->inspection.max_generation,
+						 snapshot.max_generation);
+	ps_fetch_add_u64(&hdr->inspection_metrics_seq, 1);
+	__atomic_store_n(&inspection_published_epoch, epoch, __ATOMIC_RELEASE);
+	__atomic_store_n(&inspection_next_refresh_ns,
+					 now == 0 ? 0 :
+					 (UINT64_MAX - now < INSPECTION_REFRESH_NS ? UINT64_MAX :
+					  now + INSPECTION_REFRESH_NS), __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&inspection_metrics_mutex);
+}
+
+void
+ps_core_inspection_request_complete(PsOpcode opcode, uint32_t status)
+{
+	if (status != PS_STATUS_OK)
+		return;
+	switch (opcode)
+	{
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_BEGIN_DELETE:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_RESERVE:
+		case PS_OP_RETENTION_PIN_DROP:
+			inspection_metrics_changed();
+			publish_inspection_metrics(1);
+			break;
+		default:
+			/* Ordinary requests never scan diagnostic state synchronously.
+			 * record_layer() dirties the epoch; maintenance publishes it. */
+			return;
+	}
 }
 
 static void
@@ -9893,7 +10119,7 @@ timeline_delete_publish_ready(uint32_t timeline)
 	if (__atomic_load_n(&gc_remote_state, __ATOMIC_ACQUIRE) != 0 ||
 		__atomic_load_n(&tier_upload_state, __ATOMIC_ACQUIRE) != 0 ||
 		__atomic_load_n(&evict_local_state, __ATOMIC_ACQUIRE) != 0 ||
-		fork_meta_snapshot_gc_pending)
+		fork_meta_pending_load(&fork_meta_snapshot_gc_pending))
 		return 0;
 	for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
 		if (ps_layer_map.layers[i].timeline == timeline)
@@ -10019,6 +10245,11 @@ timeline_delete_publish_one(void)
 		ps_unlock_shard(sh - 1);
 	ps_admission_write_unlock();
 	ps_lifecycle_write_unlock();
+	if (did)
+	{
+		inspection_metrics_changed();
+		publish_inspection_metrics(1);
+	}
 	return did;
 }
 
@@ -15263,7 +15494,8 @@ ps_core_maintenance_impl(void)
 		return 1;
 	if (walidx_snapshot_publish_one())
 		return 1;
-	if ((fork_meta_temp_gc_pending && fork_meta_temp_gc_due()) ||
+	if ((fork_meta_pending_load(&fork_meta_temp_gc_pending) &&
+		 fork_meta_temp_gc_due()) ||
 		fork_meta_temp_gc_probe_due())
 	{
 		int gc;
@@ -15279,7 +15511,7 @@ ps_core_maintenance_impl(void)
 			 * and still let later maintenance classes get a turn in this tick. */
 			if (gc == PS_FORKMETA_SNAPSHOT_GC_REMOVED_SCAN_INCOMPLETE)
 			{
-				fork_meta_temp_gc_pending = 1;
+				fork_meta_pending_store(&fork_meta_temp_gc_pending, 1);
 				fork_meta_temp_gc_ambiguous = 0;
 				memset(&fork_meta_temp_gc_retry_at, 0,
 					   sizeof(fork_meta_temp_gc_retry_at));
@@ -15301,7 +15533,7 @@ ps_core_maintenance_impl(void)
 		}
 		else if (gc >= 0)
 		{
-			fork_meta_temp_gc_pending = 0;
+			fork_meta_pending_store(&fork_meta_temp_gc_pending, 0);
 			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0,
 							 __ATOMIC_RELEASE);
 			fork_meta_temp_gc_ambiguous = 0;
@@ -15334,7 +15566,8 @@ ps_core_maintenance_impl(void)
 			fork_meta_temp_gc_retry_at.tv_sec++;
 		}
 	}
-	if ((fork_meta_canonical_gc_pending && fork_meta_canonical_gc_due()) ||
+	if ((fork_meta_pending_load(&fork_meta_canonical_gc_pending) &&
+		 fork_meta_canonical_gc_due()) ||
 		fork_meta_canonical_gc_probe_due())
 	{
 		int gc;
@@ -15347,7 +15580,7 @@ ps_core_maintenance_impl(void)
 			/* Keep a future cursor batch due, including a batch which removed
 			 * files, but let WAL/timeline/segment/compaction maintenance run in
 			 * the same tick. */
-			fork_meta_canonical_gc_pending = 1;
+			fork_meta_pending_store(&fork_meta_canonical_gc_pending, 1);
 			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 1,
 							 __ATOMIC_RELEASE);
 			did = 1;
@@ -15364,7 +15597,7 @@ ps_core_maintenance_impl(void)
 		}
 		else if (gc >= 0)
 		{
-			fork_meta_canonical_gc_pending = 0;
+			fork_meta_pending_store(&fork_meta_canonical_gc_pending, 0);
 			__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
 							 __ATOMIC_RELEASE);
 			fork_meta_canonical_gc_ambiguous = 0;
@@ -15627,6 +15860,9 @@ ps_core_maintenance(void)
 	 * releases that reservation from its thread cleanup handler. */
 	ps_lifecycle_read_lock();
 	did = ps_core_maintenance_impl();
+	/* Publish only after maintenance has completed its bounded work.  The
+	 * snapshot has no role in deciding or committing that work. */
+	publish_inspection_metrics(did);
 	ps_lifecycle_read_unlock();
 	/* A terminal lifecycle transition cannot upgrade the read section held by
 	 * the maintenance body.  Retry readiness under the exclusive lifecycle
@@ -15734,13 +15970,13 @@ ps_core_open_impl(const char *store_dir)
 	fork_meta_reclaim_baseline_valid = 0;
 	fork_meta_irreducible_prefix_bytes = 0;
 	fork_meta_snapshot_bytes = 0;
-	fork_meta_snapshot_gc_pending = 0;
-	fork_meta_temp_gc_pending = 0;
+	fork_meta_pending_store(&fork_meta_snapshot_gc_pending, 0);
+	fork_meta_pending_store(&fork_meta_temp_gc_pending, 0);
 	__atomic_store_n(&fork_meta_temp_gc_probe_pending, 0, __ATOMIC_RELEASE);
 	fork_meta_temp_gc_ambiguous = 0;
 	memset(&fork_meta_temp_gc_retry_at, 0,
 		   sizeof(fork_meta_temp_gc_retry_at));
-	fork_meta_canonical_gc_pending = 0;
+	fork_meta_pending_store(&fork_meta_canonical_gc_pending, 0);
 	fork_meta_canonical_gc_ambiguous = 0;
 	__atomic_store_n(&fork_meta_canonical_gc_probe_pending, 0,
 					 __ATOMIC_RELEASE);
@@ -15992,7 +16228,7 @@ ps_core_open_impl(const char *store_dir)
 			/* Startup has selected the authoritative generation.  Reclaim older
 			 * generations asynchronously; recovery must not leave them behind just
 			 * because the in-memory pending bit was reset for this process. */
-			fork_meta_snapshot_gc_pending = 1;
+			fork_meta_pending_store(&fork_meta_snapshot_gc_pending, 1);
 			memset(&fork_meta_snapshot_retry_at, 0,
 				   sizeof(fork_meta_snapshot_retry_at));
 		}
@@ -16011,7 +16247,7 @@ ps_core_open_impl(const char *store_dir)
 			 * this path, but an interrupted first publication may have left valid
 			 * temporary parts.  Schedule bounded temp GC independently of
 			 * backpressure observation and make its first retry immediately due. */
-			fork_meta_temp_gc_pending = 1;
+			fork_meta_pending_store(&fork_meta_temp_gc_pending, 1);
 			__atomic_store_n(&fork_meta_temp_gc_probe_pending, 1,
 							 __ATOMIC_RELEASE);
 			memset(&fork_meta_temp_gc_retry_at, 0,
