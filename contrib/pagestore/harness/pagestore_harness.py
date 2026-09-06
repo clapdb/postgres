@@ -66,6 +66,10 @@ def fault_failure_classification(error: Exception) -> str:
     return "setup"
 
 
+def expected_error_exit(action: str, returncode: int | None) -> bool:
+    return action == "error" and returncode == 1
+
+
 class EventLog:
     """Append-only event stream retained as part of every run bundle."""
 
@@ -137,7 +141,7 @@ ACTION_FIELDS = {
     "parallel": {"op", "id", "lanes", "barrier", "extra"},
     "wait": {"op", "id", "target", "predicate", "timeout", "extra"},
     "sync": {"op", "id", "target", "kind", "extra"},
-    "set_fault": {"op", "id", "target", "fault", "action", "hit", "extra"},
+    "set_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "extra"},
     "release_fault": {"op", "id", "target", "fault", "extra"},
     "capture": {"op", "id", "target", "kind", "name", "horizon", "extra"},
     "compare": {"op", "id", "left", "right", "extra"},
@@ -859,6 +863,22 @@ def reject_unknown_fields(record: dict[str, Any], allowed: set[str], context: st
         raise PlanError(f"{context}: extra must be an object")
 
 
+def validate_fault_identity(value: str, field: str, context: str) -> None:
+    """Match the bounded, directly JSON-embeddable C fault identity contract."""
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise PlanError(f"{context}: {field} is not valid UTF-8") from error
+    if (
+        not encoded or len(encoded) > 128 or '"' in value or "\\" in value
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise PlanError(
+            f"{context}: {field} must be a 1..128-byte fault identity without "
+            "quotes, backslashes, or control characters"
+        )
+
+
 def validate_plan(
     plan: Plan, capabilities: dict[str, Any], catalog_path: Path | None = None,
 ) -> None:
@@ -961,6 +981,7 @@ def validate_plan(
             if model not in capability_values(capabilities, "crash_models"):
                 raise PlanError(f"{action_context}: unsupported crash model {model!r}")
             if "fault" in action:
+                validate_fault_identity(header["scenario"], "scenario", context)
                 validate_fault_action(action, capabilities, action_context, catalog_path)
                 armed_fault_actions[action["fault"]] = action["action"]
             elif "action" in action or "hit" in action:
@@ -969,6 +990,7 @@ def validate_plan(
                 )
         elif operation == "set_fault":
             name = require_string(action, "fault", action_context)
+            validate_fault_identity(header["scenario"], "scenario", context)
             validate_fault_action(
                 action, capabilities, action_context, catalog_path, require_model=False,
             )
@@ -1661,7 +1683,9 @@ def run_daemon_fault_recovery(
                 raise HarnessTimeout(
                     f"fault {fault_name!r} pause watchdog expired before release"
                 )
-            if process.poll() is not None:
+            if process.poll() is not None and not expected_error_exit(
+                fault_action, process.returncode,
+            ):
                 raise UnexpectedExit(
                     f"fault {fault_name!r} {fault_action} report arrived after daemon exit"
                 )

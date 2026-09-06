@@ -316,10 +316,10 @@ wait_for_release(void)
 
 	for (;;)
 	{
-		if (control_regular(fault.dirfd, "release", 0) == 0)
-			return 0;
 		if (monotonic_ms() >= deadline)
 			return PS_FAULT_PROBE_PAUSE_TIMEOUT;
+		if (control_regular(fault.dirfd, "release", 0) == 0)
+			return 0;
 		{
 			struct timespec delay = {0, (long) PS_FAULT_POLL_NS};
 			nanosleep(&delay, NULL);

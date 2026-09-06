@@ -163,6 +163,44 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "finite and positive"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+    def test_set_fault_accepts_a_bounded_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-error", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "set_fault", "id": "fault", "target": "store",
+                "fault": "daemon.after_ready", "action": "error", "hit": 1,
+                "timeout": 2.5,
+            },
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_named_fault_rejects_unencodable_scenario_identity(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for scenario in ('bad"scenario', "bad\\scenario", "x" * 129):
+            path = self.write_plan([
+                {
+                    "schema": 1, "scenario": scenario, "seed": 1,
+                    "contracts": ["fault_reachability"],
+                    "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+                },
+                {
+                    "op": "set_fault", "id": "fault", "target": "store",
+                    "fault": "daemon.after_ready", "action": "error", "hit": 1,
+                },
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, "fault identity"):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_expected_error_exit_accepts_orderly_status_one(self):
+        self.assertTrue(MODULE.expected_error_exit("error", 1))
+        self.assertFalse(MODULE.expected_error_exit("error", -11))
+        self.assertFalse(MODULE.expected_error_exit("pause", 1))
+
     def test_fault_marker_is_created_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "arm"
