@@ -201,6 +201,25 @@ class PlanValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
                 MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+        crash_path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-pause", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "pause", "hit": 1, "timeout": 301,
+            },
+            {
+                "op": "release_fault", "id": "release", "target": "store",
+                "fault": "daemon.after_ready",
+            },
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+            MODULE.validate_plan(MODULE.read_plan(crash_path), capabilities)
+
     def test_named_fault_rejects_unencodable_scenario_identity(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         for scenario in ('bad"scenario', "bad\\scenario", "x" * 129):

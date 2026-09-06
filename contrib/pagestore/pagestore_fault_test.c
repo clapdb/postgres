@@ -179,6 +179,25 @@ main(void)
 	check(ps_fault_init(store) != 0, "leading-zero seed rejected");
 	setenv("PAGESTORE_TEST_FAULT_SEED", "+1", 1);
 	check(ps_fault_init(store) != 0, "signed seed rejected");
+	{
+		char invalid_utf8[] = {'b', (char) 0xc0, (char) 0xaf, '\0'};
+
+		setenv("PAGESTORE_TEST_FAULT_SEED", "1", 1);
+		setenv("PAGESTORE_TEST_FAULT_SCENARIO", invalid_utf8, 1);
+		check(ps_fault_init(store) != 0, "invalid UTF-8 identity rejected");
+	}
+	{
+		char truncated_two[] = {(char) 0xc2, '\0'};
+		char truncated_three[] = {(char) 0xe0, (char) 0xa0, '\0'};
+		char truncated_four[] = {(char) 0xf0, (char) 0x90, (char) 0x80, '\0'};
+
+		setenv("PAGESTORE_TEST_FAULT_SCENARIO", truncated_two, 1);
+		check(ps_fault_init(store) != 0, "truncated two-byte UTF-8 rejected");
+		setenv("PAGESTORE_TEST_FAULT_SCENARIO", truncated_three, 1);
+		check(ps_fault_init(store) != 0, "truncated three-byte UTF-8 rejected");
+		setenv("PAGESTORE_TEST_FAULT_SCENARIO", truncated_four, 1);
+		check(ps_fault_init(store) != 0, "truncated four-byte UTF-8 rejected");
+	}
 	clear_config();
 
 	/* Unhit reporting/query and exact hit accounting. */

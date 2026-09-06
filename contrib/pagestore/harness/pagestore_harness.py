@@ -1023,7 +1023,7 @@ def validate_plan(
                 or timeout <= 0
             ):
                 raise PlanError(f"{action_context}: timeout must be finite and positive")
-            if operation == "set_fault" and action["action"] == "pause" and (
+            if action.get("action") == "pause" and (
                 timeout < 0.001 or timeout > 300.0
             ):
                 raise PlanError(
@@ -1699,10 +1699,24 @@ def run_daemon_fault_recovery(
                 raise UnexpectedExit(
                     f"fault {fault_name!r} {fault_action} report arrived after daemon exit"
                 )
-            result = _fault_report(
-                report, fault_name, fault_hit, process.pid, fault_action,
-                scenario, seed, action["id"],
-            )
+            try:
+                result = _fault_report(
+                    report, fault_name, fault_hit, process.pid, fault_action,
+                    scenario, seed, action["id"],
+                )
+            except FaultNotReached as reached_error:
+                if fault_action != "pause":
+                    raise
+                try:
+                    _fault_report(
+                        report, fault_name, fault_hit, process.pid, fault_action,
+                        scenario, seed, action["id"], "timeout",
+                    )
+                except FaultNotReached:
+                    raise reached_error
+                raise HarnessTimeout(
+                    f"fault {fault_name!r} pause watchdog expired before release"
+                ) from reached_error
             shutil.copy2(report, trace / "fault-report.jsonl")
             emit("fault_reached", target="store", name=fault_name, model=fault_model,
                  report=result, reached=True)

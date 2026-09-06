@@ -154,6 +154,58 @@ parse_watchdog(const char *value, unsigned int *result)
 }
 
 static int
+valid_utf8(const unsigned char *value, size_t remaining)
+{
+	while (remaining > 0)
+	{
+		if (*value <= 0x7f)
+		{
+			value++;
+			remaining--;
+			continue;
+		}
+		if (remaining >= 2 && *value >= 0xc2 && *value <= 0xdf &&
+			value[1] >= 0x80 && value[1] <= 0xbf)
+		{
+			value += 2;
+			remaining -= 2;
+			continue;
+		}
+		if (remaining >= 3 &&
+			((*value == 0xe0 && value[1] >= 0xa0 && value[1] <= 0xbf) ||
+			 (*value >= 0xe1 && *value <= 0xec && value[1] >= 0x80 && value[1] <= 0xbf) ||
+			 (*value >= 0xee && *value <= 0xef && value[1] >= 0x80 && value[1] <= 0xbf)) &&
+			value[2] >= 0x80 && value[2] <= 0xbf)
+		{
+			value += 3;
+			remaining -= 3;
+			continue;
+		}
+		if (remaining >= 3 && *value == 0xed &&
+			value[1] >= 0x80 && value[1] <= 0x9f &&
+			value[2] >= 0x80 && value[2] <= 0xbf)
+		{
+			value += 3;
+			remaining -= 3;
+			continue;
+		}
+		if (remaining >= 4 &&
+			((*value == 0xf0 && value[1] >= 0x90 && value[1] <= 0xbf) ||
+			 (*value >= 0xf1 && *value <= 0xf3 && value[1] >= 0x80 && value[1] <= 0xbf) ||
+			 (*value == 0xf4 && value[1] >= 0x80 && value[1] <= 0x8f)) &&
+			value[2] >= 0x80 && value[2] <= 0xbf &&
+			value[3] >= 0x80 && value[3] <= 0xbf)
+		{
+			value += 4;
+			remaining -= 4;
+			continue;
+		}
+		return 0;
+	}
+	return 1;
+}
+
+static int
 copy_identity(const char *value, char *destination, int required)
 {
 	size_t length;
@@ -166,7 +218,8 @@ copy_identity(const char *value, char *destination, int required)
 		return 0;
 	}
 	length = strlen(value);
-	if (length == 0 || length > PS_FAULT_FIELD_MAX)
+	if (length == 0 || length > PS_FAULT_FIELD_MAX ||
+		!valid_utf8((const unsigned char *) value, length))
 		return -1;
 	for (size_t i = 0; i < length; i++)
 		if ((unsigned char) value[i] < 0x20 || value[i] == '"' || value[i] == '\\')
