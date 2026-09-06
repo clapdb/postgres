@@ -1113,6 +1113,47 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_plan(plan, capabilities)
         MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
 
+    def test_inspect_relation_requires_prior_boundary_reference(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        for lsn, expected in (
+            ("R1", "must reference"),
+            ("$R2", "no completed boundary"),
+        ):
+            path = self.write_plan([
+                header,
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "inspect_relation", "id": "inspect", "target": "materializer",
+                 "relation": "materializer_crash_relation", "lsn": lsn},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R2"},
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, expected):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_materializer_pause_timeout_has_one_second_floor(self):
+        self.assertEqual(MODULE.fault_watchdog_milliseconds(0.5), 500)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 1 second"):
+            MODULE.materializer_fault_watchdog_milliseconds(0.5)
+        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(1), 1000)
+
+    def test_materializer_fault_validates_scenario_identity(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["scenario"] = 'bad"scenario'
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 30, "name": "R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "scenario.*fault identity"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
     def test_materializer_runtime_rejects_non_pause_named_fault(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         header = self.header()

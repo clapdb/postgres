@@ -122,6 +122,13 @@ def fault_watchdog_milliseconds(value: Any) -> int:
     return milliseconds
 
 
+def materializer_fault_watchdog_milliseconds(value: Any) -> int:
+    milliseconds = fault_watchdog_milliseconds(value)
+    if value < 1.0:
+        raise PlanError("materializer fault timeout must be at least 1 second")
+    return milliseconds
+
+
 def fault_timeout_seconds(value: Any) -> float:
     if (
         not isinstance(value, (int, float))
@@ -882,7 +889,7 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                     f"runtime {runtime!r} materializer_fault must use pause"
                 )
             try:
-                fault_watchdog_milliseconds(fault_action.get("timeout"))
+                materializer_fault_watchdog_milliseconds(fault_action.get("timeout"))
             except PlanError as error:
                 raise PlanError(
                     f"runtime {runtime!r} materializer_fault has invalid timeout: {error}"
@@ -1172,6 +1179,7 @@ def validate_plan(
             if boundary in boundaries:
                 raise PlanError(f"{action_context}: duplicate durability boundary {boundary!r}")
             boundaries.add(boundary)
+            validate_fault_identity(header["scenario"], "scenario", context)
             validate_fault_identity(action["fault"], "fault", action_context)
             validate_fault_action(
                 action, capabilities, action_context, catalog_path, require_model=False,
@@ -1181,6 +1189,12 @@ def validate_plan(
                     f"{action_context}: materializer fault scenarios must use pause"
                 )
         if operation == "inspect_relation":
+            lsn = require_string(action, "lsn", action_context)
+            if not lsn.startswith("$") or lsn[1:] not in boundaries:
+                raise PlanError(
+                    f"{action_context}: inspect_relation lsn must reference an earlier "
+                    "checkpoint or materializer boundary"
+                )
             validate_fault_identity(action["relation"], "relation", action_context)
         if operation == "reader_base":
             boundary = require_string(action, "name", action_context)
@@ -1227,7 +1241,9 @@ def validate_plan(
                 raise PlanError(f"{action_context}: steps must be a positive integer")
         if operation in ("crash", "set_fault", "materializer_fault") and "timeout" in action:
             try:
-                if operation == "materializer_fault" or action.get("action") == "pause":
+                if operation == "materializer_fault":
+                    materializer_fault_watchdog_milliseconds(action["timeout"])
+                elif action.get("action") == "pause":
                     fault_watchdog_milliseconds(action["timeout"])
                 else:
                     fault_timeout_seconds(action["timeout"])
@@ -3013,7 +3029,7 @@ def run_materializer_smoke(
                     "PAGESTORE_TEST_FAULT_SEED": str(plan.header["seed"]),
                     "PAGESTORE_TEST_FAULT_OPERATION": materializer_fault["id"],
                     "PAGESTORE_TEST_FAULT_WATCHDOG_MS": str(
-                        fault_watchdog_milliseconds(materializer_fault["timeout"])
+                        materializer_fault_watchdog_milliseconds(materializer_fault["timeout"])
                     ),
                 }
             )
