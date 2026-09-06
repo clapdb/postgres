@@ -263,6 +263,15 @@ class PlanValidationTests(unittest.TestCase):
                 process.kill()
                 process.wait()
 
+    def test_materializer_stop_requires_signaled_status(self):
+        signaled = MODULE.ProcessStopResult(123, 77, "signaled", "pidfd_send_signal", "pidfd_poll")
+        MODULE.require_signaled_process_stop(signaled, "materializer")
+        already_exited = MODULE.ProcessStopResult(
+            123, 77, "already_exited", "already_exited", "already_exited"
+        )
+        with self.assertRaisesRegex(MODULE.UnexpectedExit, "did not signal"):
+            MODULE.require_signaled_process_stop(already_exited, "materializer")
+
     def test_process_stop_timeout_is_bounded(self):
         identity = MODULE.ProcessIdentity(123, 77)
         with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
@@ -393,19 +402,19 @@ class PlanValidationTests(unittest.TestCase):
             [
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R2"},
+                 "hit": 1, "timeout": 65, "name": "R2"},
             ],
             [
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R2"},
+                 "hit": 1, "timeout": 65, "name": "R2"},
                 {"op": "checkpoint", "id": "late-r1", "target": "writer", "name": "R1"},
             ],
             [
                 {"op": "checkpoint", "id": "wrong", "target": "writer", "name": "OLD"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R2"},
+                 "hit": 1, "timeout": 65, "name": "R2"},
             ],
         ]
         for actions in cases:
@@ -1407,7 +1416,7 @@ class PlanValidationTests(unittest.TestCase):
              "relation": "materializer_crash_relation", "lsn": "$R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_relation_sync", "action": "pause",
-             "hit": 1, "timeout": 45, "name": "R9"},
+             "hit": 1, "timeout": 65, "name": "R9"},
             {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
              "relation": "materializer_crash_relation", "lsn": "$R9"},
         ])
@@ -1437,7 +1446,7 @@ class PlanValidationTests(unittest.TestCase):
                 {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R9"},
+                 "hit": 1, "timeout": 65, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_a", "lsn": "$R9"},
             ],
@@ -1447,7 +1456,7 @@ class PlanValidationTests(unittest.TestCase):
                  "relation": "relation_a", "lsn": "$R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R9"},
+                 "hit": 1, "timeout": 65, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_b", "lsn": "$R9"},
             ],
@@ -1455,7 +1464,7 @@ class PlanValidationTests(unittest.TestCase):
                 {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R9"},
+                 "hit": 1, "timeout": 65, "name": "R9"},
                 {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
                  "relation": "relation_a", "lsn": "$R9"},
                 {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
@@ -1486,18 +1495,18 @@ class PlanValidationTests(unittest.TestCase):
                  "relation": "materializer_crash_relation", "lsn": lsn},
                 {"op": "materializer_fault", "id": "fault", "target": "materializer",
                  "fault": "materializer.after_marker_sync", "action": "pause",
-                 "hit": 1, "timeout": 45, "name": "R2"},
+                 "hit": 1, "timeout": 65, "name": "R2"},
             ])
             with self.assertRaisesRegex(MODULE.PlanError, expected):
                 MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
     def test_materializer_pause_timeout_covers_marker_work_and_margin(self):
         self.assertEqual(MODULE.fault_watchdog_milliseconds(0.5), 500)
-        with self.assertRaisesRegex(MODULE.PlanError, "at least 45 seconds"):
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 65 seconds"):
             MODULE.materializer_fault_watchdog_milliseconds(0.5)
-        with self.assertRaisesRegex(MODULE.PlanError, "at least 45 seconds"):
-            MODULE.materializer_fault_watchdog_milliseconds(40)
-        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(45), 45000)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 65 seconds"):
+            MODULE.materializer_fault_watchdog_milliseconds(64)
+        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(65), 65000)
 
     def test_inspect_relation_allows_dollar_prefixed_relation_name(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
@@ -1534,7 +1543,7 @@ class PlanValidationTests(unittest.TestCase):
             {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "pause",
-             "hit": 1, "timeout": 45, "name": "R2"},
+             "hit": 1, "timeout": 65, "name": "R2"},
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "scenario.*fault identity"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
@@ -1548,7 +1557,7 @@ class PlanValidationTests(unittest.TestCase):
             {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "process_abort",
-             "hit": 1, "timeout": 45, "name": "R2"},
+             "hit": 1, "timeout": 65, "name": "R2"},
         ])
         plan = MODULE.read_plan(path)
         with self.assertRaisesRegex(MODULE.PlanError, "allows action.*pause"):
@@ -1562,7 +1571,7 @@ class PlanValidationTests(unittest.TestCase):
             header,
             {"op": "materializer_fault", "id": "fault", "target": "materializer",
              "fault": "materializer.after_marker_sync", "action": "pause",
-             "hit": 1, "timeout": 45, "name": "../R2"},
+             "hit": 1, "timeout": 65, "name": "../R2"},
         ])
         with self.assertRaisesRegex(MODULE.PlanError, "name must be a safe path component"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)

@@ -211,7 +211,13 @@ jobs:
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run H1 materializer crash after relation sync
-        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \
@@ -224,7 +230,13 @@ jobs:
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
       - name: Run H1 materializer crash after marker sync
-        if: github.ref_name != 'branchdb_13' && github.ref_name != 'branchdb_14'
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
         run: |
           python3 contrib/pagestore/harness/pagestore_harness.py \
             --capabilities contrib/pagestore/harness/capabilities.json \

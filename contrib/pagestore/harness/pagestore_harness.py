@@ -57,7 +57,7 @@ FAULT_REPORT_FIELDS = {
 FAULT_REPORT_MAX_BYTES = 4096
 MAX_FAULT_TIMEOUT_SECONDS = 300.0
 MATERIALIZER_MARKER_TIMEOUT_MS = 10000
-MATERIALIZER_FAULT_PHASE_COUNT = 4
+MATERIALIZER_FAULT_PHASE_COUNT = 6
 MATERIALIZER_FAULT_SCHEDULING_MARGIN_MS = 5000
 MATERIALIZER_FAULT_MIN_WATCHDOG_MS = (
     MATERIALIZER_MARKER_TIMEOUT_MS * MATERIALIZER_FAULT_PHASE_COUNT
@@ -163,7 +163,8 @@ def materializer_fault_watchdog_milliseconds(value: Any) -> int:
         raise PlanError(
             "materializer fault timeout must be at least "
             f"{MATERIALIZER_FAULT_MIN_TIMEOUT_SECONDS:g} seconds "
-            "(four 10-second marker phases plus 5-second scheduling margin)"
+            "(six 10-second mailbox phases plus 5-second scheduling margin: "
+            "marker read, initial sync, CREATE, NBLOCKS, WRITE/EXTEND, final sync)"
         )
     return milliseconds
 
@@ -1588,6 +1589,15 @@ class ProcessStopResult:
     status: str
     signal_method: str
     wait_method: str
+
+
+def require_signaled_process_stop(result: ProcessStopResult, target: str) -> None:
+    """Require that a requested whole-process stop actually delivered SIGQUIT."""
+    if result.status != "signaled":
+        raise UnexpectedExit(
+            f"{target} immediate stop did not signal the captured process: "
+            f"status={result.status} pid={result.pid}"
+        )
 
 
 def read_process_starttime(pid: int, proc_root: Path = Path("/proc")) -> int | None:
@@ -3050,6 +3060,7 @@ def run_materializer_smoke(
         stop = stop_process_immediately(
             pid, diagnostic_pidfile=materializer_data / "postmaster.pid"
         )
+        require_signaled_process_stop(stop, "materializer")
         events.emit(
             "process_stop", target="materializer",
             generation=materializer_generation, mode="immediate", reason=reason,

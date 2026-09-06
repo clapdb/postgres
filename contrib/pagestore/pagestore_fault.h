@@ -15,7 +15,7 @@
 /* Materializer restartpoint probes may spend the marker store timeout before
  * reporting.  Keep the harness watchdog contract above that bounded work. */
 #define PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS 10000U
-#define PS_FAULT_MATERIALIZER_PHASE_COUNT 4U
+#define PS_FAULT_MATERIALIZER_PHASE_COUNT 6U
 #define PS_FAULT_MATERIALIZER_SCHEDULING_MARGIN_MS 5000U
 #define PS_FAULT_MATERIALIZER_MIN_WATCHDOG_MS \
 	(PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS * \
