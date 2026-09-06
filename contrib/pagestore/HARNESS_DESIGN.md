@@ -341,12 +341,22 @@ backpressure() -> per-shard queued/in-flight work and admission state
 The interface explains failures and proves fault reachability.  SQL-visible
 state remains the primary external correctness oracle.
 
-The first implementation is `pagestore_inspect`, a separate read-only client
-of the existing private shared-memory transport.  The H0 foundation provides
-schema-validated aggregate observations plus a per-timeline query foundation
-and never claims a mailbox.  Relation inspection remains a planned,
-non-advertised H1 operation until it can be exposed without creating a
-mutation or production-management surface.
+The implementation is `pagestore_inspect`, a separate read-only client of the
+private shared-memory transport.  Aggregate observations remain seqlock
+snapshots and do not claim a mailbox.  The H1 relation operation uses a
+dedicated one-request inspection slot, never a normal I/O channel: the client
+claims it with a generation, daemon instance, and deadline while holding the
+shm object's byte-zero exclusive lock.  Daemon startup acquires byte zero and
+then a byte-one process-lifetime lease before initializing the shm object;
+READY releases byte zero while the lease remains held.  A stale REQUEST/BUSY
+slot is reclaimed only after a bounded wait and a successful byte-one lease
+probe, so a live daemon fails closed and a dead daemon can be recovered.  The
+client probes byte one again after recovery and before request publication;
+if the lease is free, it leaves the mailbox IDLE and reports unavailable.
+Restart, timeout, concurrent claims, invalid parameters, and unavailable
+as-of frontiers fail closed.  The current core does not expose one version
+identity for a multi-fork relation, so
+`selected_version` is explicitly JSON `null` rather than a fabricated LSN.
 
 ## Fault model
 

@@ -274,6 +274,16 @@ def read_inspection_schema(path: Path, capabilities: dict[str, Any]) -> dict[str
                 f"{path}: inspection operation {operation!r} request fields "
                 "do not match its contract"
             )
+        if operation == "relation":
+            response_types = definition.get("response_types")
+            if response_types != {
+                "exists": "boolean",
+                "forks": "array",
+                "selected_version": "null",
+            }:
+                raise PlanError(
+                    f"{path}: relation inspection response types are invalid"
+                )
     for operation, expected_response in INSPECTION_PLANNED_RESPONSES.items():
         definition = operations.get(operation)
         if not isinstance(definition, dict):
@@ -467,11 +477,10 @@ INSPECTION_RESPONSES = {
     "pruning": {
         "compactions", "versions_scanned", "versions_kept", "versions_deleted",
     },
+    "relation": {"exists", "forks", "selected_version"},
 }
 INSPECTION_OPERATIONS = set(INSPECTION_RESPONSES)
-INSPECTION_PLANNED_RESPONSES = {
-    "relation": ("exists", "forks", "nblocks", "selected_lsn"),
-}
+INSPECTION_PLANNED_RESPONSES = {}
 INSPECTION_PLANNED_OPERATIONS = set(INSPECTION_PLANNED_RESPONSES)
 INSPECTION_REQUESTS = {
     "timeline": ("timeline",),
@@ -486,7 +495,7 @@ INSPECTION_COUNTER_FIELDS = (
     set().union(*INSPECTION_RESPONSES.values())
     - INSPECTION_BOOLEAN_FIELDS - INSPECTION_SIGNED_FIELDS
 )
-INSPECTION_SCHEMA_VERSION = 2
+INSPECTION_SCHEMA_VERSION = 3
 INSPECTION_TRANSPORT = "private-test-ipc"
 PG_CONTROL_FILE_SIZE = 8192
 
@@ -907,7 +916,9 @@ def probe_runtime_inspection(
     for operation in sorted(capability_values(capabilities, "inspection_operations")):
         observations[operation] = inspect_store(
             inspector, shm, operation, inspection_schema,
-            timeline=0 if operation == "timeline" else None,
+            timeline=0 if operation in {"timeline", "relation"} else None,
+            relation_key=(1, 1, 1) if operation == "relation" else None,
+            lsn=0 if operation == "relation" else None,
         )
     return observations
 
@@ -1136,6 +1147,8 @@ def inspect_store(
     operation: str,
     schema: dict[str, Any],
     timeline: int | None = None,
+    relation_key: tuple[int, int, int] | None = None,
+    lsn: int | None = None,
 ) -> dict[str, Any]:
     implemented = schema.get("implemented_operations")
     operations = schema.get("operations")
@@ -1154,6 +1167,24 @@ def inspect_store(
         ):
             raise PlanError("inspection operation 'timeline' requires a nonnegative timeline ID")
         request = [str(timeline)]
+    elif operation == "relation":
+        if not isinstance(timeline, int) or isinstance(timeline, bool) or timeline < 0:
+            raise PlanError("inspection operation 'relation' requires a nonnegative timeline ID")
+        if (
+            not isinstance(relation_key, tuple)
+            or len(relation_key) != 3
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in relation_key
+            )
+            or not isinstance(lsn, int)
+            or isinstance(lsn, bool)
+            or lsn < 0
+        ):
+            raise PlanError(
+                "inspection operation 'relation' requires a nonnegative key and LSN"
+            )
+        request = [str(timeline), *(str(value) for value in relation_key), str(lsn)]
     elif timeline is not None:
         raise PlanError(
             f"inspection operation {operation!r} does not accept request arguments"
@@ -1161,7 +1192,7 @@ def inspect_store(
     try:
         result = subprocess.run(
             [str(binary), "--shm", shm, operation, *request]
-            if operation == "timeline"
+            if operation in {"timeline", "relation"}
             else [str(binary), "--shm", shm, operation],
             capture_output=True,
             check=False,
@@ -1177,6 +1208,29 @@ def inspect_store(
         raise PlanError(f"inspector {operation} returned invalid JSON: {error.msg}") from error
     if not isinstance(value, dict) or set(value) != set(expected):
         raise PlanError(f"inspector {operation} returned a response outside its schema")
+    if operation == "relation":
+        if not isinstance(value.get("exists"), bool):
+            raise PlanError("inspector relation field 'exists' must be a boolean")
+        forks = value.get("forks")
+        if not isinstance(forks, list):
+            raise PlanError("inspector relation field 'forks' must be an array")
+        for fork in forks:
+            if (
+                not isinstance(fork, dict)
+                or set(fork) != {"fork", "nblocks"}
+                or not isinstance(fork["fork"], int)
+                or isinstance(fork["fork"], bool)
+                or not 0 <= fork["fork"] < 4
+                or not isinstance(fork["nblocks"], int)
+                or isinstance(fork["nblocks"], bool)
+                or fork["nblocks"] < 0
+            ):
+                raise PlanError("inspector relation fork entries have invalid types")
+        if value.get("selected_version") is not None:
+            raise PlanError(
+                "inspector relation selected_version must be null when unavailable"
+            )
+        return value
     for field in expected:
         observed = value[field]
         if field in INSPECTION_BOOLEAN_FIELDS:
@@ -2885,6 +2939,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--inspect-binary", type=Path)
     parser.add_argument("--shm")
     parser.add_argument("--timeline", type=int, metavar="ID")
+    parser.add_argument("--spc-oid", type=int, metavar="OID")
+    parser.add_argument("--db-oid", type=int, metavar="OID")
+    parser.add_argument("--rel-number", type=int, metavar="OID")
+    parser.add_argument("--lsn", type=int, metavar="LSN")
     parser.add_argument("--inspection-schema", type=Path)
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--keep", action="store_true")
@@ -2895,6 +2953,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.inspect == "timeline":
         if args.timeline is None or args.timeline < 0:
             parser.error("--inspect timeline requires a nonnegative --timeline ID")
+    elif args.inspect == "relation":
+        relation_values = (args.timeline, args.spc_oid, args.db_oid, args.rel_number, args.lsn)
+        if any(value is None or isinstance(value, bool) or value < 0 for value in relation_values):
+            parser.error(
+                "--inspect relation requires nonnegative --timeline, --spc-oid, "
+                "--db-oid, --rel-number and --lsn"
+            )
     elif args.timeline is not None:
         parser.error("--timeline is only valid with --inspect timeline")
     if args.daemon_smoke and (args.daemon_binary is None or args.inspect_binary is None):
@@ -2936,6 +3001,9 @@ def main(argv: list[str] | None = None) -> int:
                 inspect_store(
                     args.inspect_binary, args.shm, args.inspect, schema,
                     timeline=args.timeline,
+                    relation_key=(args.spc_oid, args.db_oid, args.rel_number)
+                    if args.inspect == "relation" else None,
+                    lsn=args.lsn if args.inspect == "relation" else None,
                 ),
                 sort_keys=True,
             ))

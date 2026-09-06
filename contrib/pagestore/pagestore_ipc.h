@@ -29,7 +29,11 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		43	/* 43: explicit unavailable PAGE-debt diagnostics;
+
+#define PS_SHM_VERSION		44	/* 44: isolated relation inspection request;
+							 * relation inspection uses an fd lock and
+							 * publishes directly IDLE -> REQUEST;
+								 * 43: explicit unavailable PAGE-debt diagnostics;
 								 * 42: per-timeline inspection snapshots;
 								 * 41: bounded runtime inspection snapshots;
 							 * 40: forkmeta reclaim backpressure metrics;
@@ -192,6 +196,62 @@ typedef struct PsKey
 	int32_t		forkNum;
 	uint32_t	klass;			/* PsObjClass; 0 = relation (default) */
 } PsKey;
+
+/* The inspection mailbox is deliberately not a PsChannel.  It is a private,
+ * one-request-at-a-time control slot and can never consume or contend for an
+ * ordinary PostgreSQL I/O channel. */
+#define PS_INSPECTION_RELATION_MAX_FORKS	4
+#define PS_INSPECTION_STATE_IDLE		0
+#define PS_INSPECTION_STATE_REQUEST	1
+#define PS_INSPECTION_STATE_BUSY		2
+#define PS_INSPECTION_STATE_DONE		3
+
+/* Byte zero serializes initialization and the complete inspector
+ * transaction; byte one is the daemon's process-lifetime lease. */
+#define PS_INSPECTION_CLIENT_LOCK_BYTE	0
+#define PS_INSPECTION_DAEMON_LOCK_BYTE	1
+
+typedef enum PsInspectionOpcode
+{
+	PS_INSPECT_NONE = 0,
+	PS_INSPECT_RELATION = 1
+} PsInspectionOpcode;
+
+typedef struct PsInspectionFork
+{
+	int32_t		fork_num;
+	uint32_t	nblocks;
+} PsInspectionFork;
+
+/* selected_version is intentionally unavailable in protocol 44.  A relation
+ * consists of multiple independently versioned forks and the current core has
+ * no single durable version identity that covers the aggregate.  The explicit
+ * availability bit prevents clients from treating the numeric field as real. */
+typedef struct PsInspectionRelationResult
+{
+	uint32_t	exists;
+	uint32_t	fork_count;
+	uint32_t	selected_version_available;
+	uint32_t	reserved;
+	uint64_t	selected_version;
+	PsInspectionFork forks[PS_INSPECTION_RELATION_MAX_FORKS];
+} PsInspectionRelationResult;
+
+typedef struct PsInspectionRequest
+{
+	uint32_t	state;			/* atomic: PS_INSPECTION_STATE_* */
+	uint32_t	protocol_version;
+	uint32_t	opcode;
+	uint32_t	status;
+	uint64_t	request_generation;
+	uint64_t	daemon_instance;
+	uint64_t	deadline_ns;
+	uint32_t	timeline;
+	uint32_t	reserved;
+	uint64_t	lsn;
+	PsKey		key;
+	PsInspectionRelationResult relation;
+} PsInspectionRequest;
 
 /*
  * A per-page WAL-index record: one WAL record that touched the page, tagged with
@@ -451,8 +511,10 @@ typedef struct PsShmHeader
 	PsBackpressureMetrics wal_backpressure;
 	PsBackpressureMetrics walidx_backpressure;
 	PsBackpressureMetrics forkmeta_backpressure;
+	uint64_t	daemon_instance;	/* nonzero generation for this daemon boot */
 	uint64_t	inspection_metrics_seq;
 	PsInspectionMetrics inspection;
+	PsInspectionRequest inspection_request;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)

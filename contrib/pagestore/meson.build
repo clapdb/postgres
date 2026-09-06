@@ -136,6 +136,20 @@ test('pagestore_standalone',
   timeout: 120,
 )
 
+# Focused POSIX mailbox lifecycle coverage.  It drives only the inspector and
+# forked lock/lease holders; no pagestore daemon or SPDK frontend runs.
+pagestore_inspect_mailbox_test = executable('pagestore_inspect_mailbox_test',
+  files('pagestore_inspect_mailbox_test.c'),
+  install: false,
+)
+test('pagestore_inspect_mailbox',
+  pagestore_inspect_mailbox_test,
+  args: [pagestore_inspect],
+  depends: [pagestore_inspect],
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Unit test for the immutable image-layer file format (no daemon, no PG).
 pagestore_layer_test = executable('pagestore_layer_test',
   files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_layer_store.c'),

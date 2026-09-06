@@ -5485,6 +5485,56 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 	return 0;
 }
 
+int
+ps_core_inspection_relation(uint32_t timeline, const PsKey *key,
+							uint64_t read_lsn,
+							PsInspectionRelationResult *result)
+{
+	uint64_t	visible_lsn;
+
+	if (key == NULL || result == NULL || timeline >= MAX_TIMELINES ||
+		key->klass != PS_KLASS_RELATION || key->forkNum != 0 ||
+		!timelines[timeline].defined || timeline_meta_poisoned_load())
+		return -1;
+
+	/* An as-of request is only honest when the page-history frontier and
+	 * WAL-less ambiguity checks used by EXISTS/NBLOCKS both pass.  Newest
+	 * inspection (lsn zero) deliberately retains the existing unrestricted
+	 * semantics. */
+	visible_lsn = read_lsn == 0 ? UINT64_MAX : read_lsn;
+	if (read_lsn != 0 &&
+		!page_frontier_ancestry_allows(timeline, read_lsn, 0))
+		return -1;
+
+	memset(result, 0, sizeof(*result));
+	for (int32_t fork = 0;
+		 fork < PS_INSPECTION_RELATION_MAX_FORKS; fork++)
+	{
+		PsKey		fork_key = *key;
+		int		exists;
+
+		fork_key.forkNum = fork;
+		if (read_lsn != 0 && fork_has_wal_less_page(timeline, &fork_key))
+			return -1;
+		exists = fork_exists_through(timeline, &fork_key, visible_lsn, 0);
+		if (!exists)
+			continue;
+		if (result->fork_count >= PS_INSPECTION_RELATION_MAX_FORKS)
+			return -1;
+		result->forks[result->fork_count].fork_num = fork;
+		result->forks[result->fork_count].nblocks =
+			fork_nblocks_through(timeline, &fork_key, visible_lsn, 0);
+		result->fork_count++;
+		if (fork == 0)
+			result->exists = 1;
+	}
+
+	/* There is no single version identity for this multi-fork aggregate. */
+	result->selected_version_available = 0;
+	result->selected_version = 0;
+	return 0;
+}
+
 /* Caller holds the key's shard lock and map_lock for reading.  Find the newest
  * fork/page LSN reachable through the child's ancestry, respecting every
  * branch cap.  Page versions require a per-entry lookup when a local fork's

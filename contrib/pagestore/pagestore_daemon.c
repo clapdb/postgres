@@ -18,6 +18,10 @@
  *
  *-------------------------------------------------------------------------
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -41,6 +45,35 @@ static PsShmHeader *daemon_hdr = NULL;
 static const char *maintenance_pause_file = NULL;
 static const char *shutdown_cancel_pause_file = NULL;
 static int shutdown_cancel_ready_fd = -1;
+
+/* The daemon uses traditional POSIX record locks for portability.  The shm
+ * descriptor below is deliberately kept open until daemon shutdown: POSIX
+ * record locks are process-owned and closing any descriptor for the inode can
+ * release all locks held by this process.  No duplicate shm descriptor is
+ * opened or closed by this frontend after the lease is acquired. */
+static int
+set_inspection_lock(int fd, off_t byte, short type)
+{
+	struct flock lock;
+
+	memset(&lock, 0, sizeof(lock));
+	lock.l_type = type;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = byte;
+	lock.l_len = 1;
+	return fcntl(fd, F_SETLK, &lock);
+}
+
+static int
+release_inspection_lock(int fd, off_t byte)
+{
+	if (set_inspection_lock(fd, byte, F_UNLCK) != 0)
+	{
+		perror("pagestore_daemon: fcntl lock release");
+		return -1;
+	}
+	return 0;
+}
 
 typedef struct WorkerArgs
 {
@@ -82,6 +115,22 @@ monotonic_ns(void)
 	if ((uint64_t) now.tv_nsec > UINT64_MAX - sec)
 		return UINT64_MAX;
 	return sec + (uint64_t) now.tv_nsec;
+}
+
+static uint64_t
+new_daemon_instance(void)
+{
+	struct timespec now;
+	uint64_t value;
+
+	if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0)
+		value = 0;
+	else
+		value = (uint64_t) now.tv_sec * UINT64_C(1000000000) +
+			(uint64_t) now.tv_nsec;
+	value ^= ((uint64_t) (unsigned long) getpid() << 32);
+	value ^= (uintptr_t) &now;
+	return value == 0 ? 1 : value;
 }
 
 static void
@@ -168,6 +217,67 @@ finish_backpressure_wait(uint32_t channel)
 	ps_backpressure_record_wait4(slot->page_wait_ns, slot->wal_wait_ns,
 								 slot->walidx_wait_ns, slot->forkmeta_wait_ns);
 	memset(slot, 0, sizeof(*slot));
+}
+
+/* Serve the private relation-inspection mailbox.  This path never claims or
+ * examines a PsChannel: inspection cannot consume an ordinary I/O channel and
+ * an unrecognised opcode is rejected before entering the core. */
+static int
+run_inspection_request(void *shm)
+{
+	PsInspectionRequest *request = &((PsShmHeader *) shm)->inspection_request;
+	PsInspectionRelationResult result;
+	uint64_t generation;
+	uint64_t instance;
+	uint64_t now;
+	uint32_t status = PS_STATUS_ERROR;
+
+	/* The inspector publishes every ordinary request field before the
+	 * release-store to REQUEST.  Never inspect IDLE or an intermediate claim:
+	 * an abandoned request is recovered by the next inspector while holding
+	 * the shm fd lock, and the daemon only consumes an acquire-visible REQUEST. */
+	if (ps_load_acquire(&request->state) != PS_INSPECTION_STATE_REQUEST ||
+		!ps_cas(&request->state, PS_INSPECTION_STATE_REQUEST,
+					PS_INSPECTION_STATE_BUSY))
+		return 0;
+	generation = request->request_generation;
+	instance = request->daemon_instance;
+	memset(&result, 0, sizeof(result));
+
+	now = monotonic_ns();
+	if (request->protocol_version == PS_SHM_VERSION &&
+		request->opcode == PS_INSPECT_RELATION &&
+		request->reserved == 0 && generation != 0 &&
+		request->daemon_instance ==
+		ps_load_acquire_u64(&daemon_hdr->daemon_instance) &&
+		request->deadline_ns != 0 && now != 0 && now < request->deadline_ns &&
+		request->key.klass == PS_KLASS_RELATION && request->key.forkNum == 0)
+	{
+		ps_lifecycle_read_lock();
+		ps_admission_read_lock();
+		for (uint32_t shard = 0; shard < ps_nshards; shard++)
+			ps_lock_shard_rd(shard);
+		ps_lock_map_rd();
+		if (!stop_requested && ps_core_inspection_relation(
+				request->timeline, &request->key, request->lsn, &result) == 0)
+			status = PS_STATUS_OK;
+		ps_unlock_map();
+		for (uint32_t shard = ps_nshards; shard-- > 0;)
+			ps_unlock_shard(shard);
+		ps_admission_read_unlock();
+		ps_lifecycle_read_unlock();
+	}
+
+	/* The daemon instance and request generation are the response identity. */
+	if (request->request_generation == generation &&
+		request->daemon_instance == instance &&
+		ps_load_acquire_u64(&daemon_hdr->daemon_instance) == instance)
+	{
+		request->relation = result;
+		request->status = status;
+		ps_store_release(&request->state, PS_INSPECTION_STATE_DONE);
+	}
+	return 1;
 }
 
 static void
@@ -811,6 +921,11 @@ shard_worker(void *arg)
 	{
 		int			did_work = 0;
 
+		/* Only shard zero services the single dedicated inspection slot.  The
+		 * slot has its own state machine and is unrelated to channel ownership. */
+		if (shard == 0 && run_inspection_request(shm))
+			did_work = 1;
+
 		for (uint32_t i = shard; i < nchannels; i += nshards)
 		{
 			PsChannel  *ch = ps_channel(shm, i);
@@ -958,6 +1073,8 @@ main(int argc, char **argv)
 	const char *shm_name = NULL;
 	uint32_t	nshards = 1;
 	int		exit_status = 0;
+	int		client_lock_held = 0;
+	int		daemon_lease_held = 0;
 	int		forkmeta_high_water_cli = 0;
 	int		forkmeta_catchup_cli = 0;
 
@@ -1158,18 +1275,49 @@ main(int argc, char **argv)
 		perror("shm_open");
 		return 1;
 	}
+	/* Acquire byte zero before byte one.  Byte zero gates the destructive
+	 * initialization and is retained until READY; byte one is the daemon
+	 * process-lifetime lease. */
+	if (set_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE, F_WRLCK) != 0)
+	{
+		if (errno == EACCES || errno == EAGAIN)
+			fprintf(stderr, "pagestore_daemon: shm initialization is busy\n");
+		else
+			perror("pagestore_daemon: fcntl client initialization lock");
+		close(fd);
+		return 1;
+	}
+	client_lock_held = 1;
+	if (set_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE, F_WRLCK) != 0)
+	{
+		if (errno == EACCES || errno == EAGAIN)
+			fprintf(stderr, "pagestore_daemon: another daemon owns the shm lease\n");
+		else
+			perror("pagestore_daemon: fcntl daemon lease lock");
+		release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		close(fd);
+		return 1;
+	}
+	daemon_lease_held = 1;
+	/* Both ownership locks must be held before changing the shm object's size;
+	 * initialization is serialized with both inspectors and other daemons. */
 	if (ftruncate(fd, PS_SHM_SIZE) != 0)
 	{
 		perror("ftruncate shm");
+		release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+		release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		close(fd);
 		return 1;
 	}
 	shm = mmap(NULL, PS_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (shm == MAP_FAILED)
 	{
 		perror("mmap");
+		release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+		release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		close(fd);
 		return 1;
 	}
-	close(fd);
 	hdr = (PsShmHeader *) shm;
 	daemon_hdr = hdr;
 	/* Invalidate a previous daemon's header before store recovery begins. */
@@ -1179,6 +1327,9 @@ main(int argc, char **argv)
 	{
 		perror("storage open");
 		munmap(shm, PS_SHM_SIZE);
+		release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+		release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+		close(fd);
 		return 1;
 	}
 
@@ -1197,6 +1348,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);
 
@@ -1217,7 +1369,11 @@ main(int argc, char **argv)
 			fprintf(stderr, "pagestore_daemon: cannot allocate worker slots\n");
 			free(workers);
 			free(threads);
+			ps_core_close();
 			munmap(shm, PS_SHM_SIZE);
+			release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+			release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+			close(fd);
 			return 1;
 		}
 
@@ -1248,6 +1404,10 @@ main(int argc, char **argv)
 		if (started == hdr->nshards && maintenance_started && !stop_requested &&
 			shm_publish_ready(hdr))
 		{
+			/* READY is the publication point.  The byte-one lease remains held
+			 * on fd until the final shutdown cleanup below. */
+			if (release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE) == 0)
+				client_lock_held = 0;
 			fprintf(stderr, "pagestore_daemon: shm=%s store=%s storage=%s page_size=%u "
 					"io_unit=%u channels=%u nshards=%u forkmeta_high=%llu "
 					"forkmeta_catchup=%llu ready\n",
@@ -1314,5 +1474,10 @@ main(int argc, char **argv)
 	}
 	ps_core_close();			/* flush the memtable so restart rebuilds from layers */
 	munmap(shm, PS_SHM_SIZE);
+	if (daemon_lease_held)
+		release_inspection_lock(fd, PS_INSPECTION_DAEMON_LOCK_BYTE);
+	if (client_lock_held)
+		release_inspection_lock(fd, PS_INSPECTION_CLIENT_LOCK_BYTE);
+	close(fd);
 	return exit_status;
 }

@@ -154,6 +154,51 @@ run_inspector_timeline(const char *shm, uint32_t timeline,
 }
 
 static int
+run_inspector_relation(const char *shm, uint32_t timeline, uint32_t spc,
+					   uint32_t db, uint32_t rel, uint64_t lsn,
+					   char *output, size_t output_size)
+{
+	char timeline_text[32], spc_text[32], db_text[32], rel_text[32], lsn_text[32];
+	int pipefd[2];
+	pid_t pid;
+	int status;
+	ssize_t nread;
+
+	snprintf(timeline_text, sizeof(timeline_text), "%u", timeline);
+	snprintf(spc_text, sizeof(spc_text), "%u", spc);
+	snprintf(db_text, sizeof(db_text), "%u", db);
+	snprintf(rel_text, sizeof(rel_text), "%u", rel);
+	snprintf(lsn_text, sizeof(lsn_text), "%llu", (unsigned long long) lsn);
+	if (pipe(pipefd) != 0)
+		return 0;
+	pid = fork();
+	if (pid < 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return 0;
+	}
+	if (pid == 0)
+	{
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		execl(inspect_path, inspect_path, "--shm", shm, "relation",
+			  timeline_text, spc_text, db_text, rel_text, lsn_text,
+			  (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	nread = read(pipefd[0], output, output_size - 1);
+	close(pipefd[0]);
+	if (nread < 0)
+		nread = 0;
+	output[nread] = '\0';
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int
 run_inspector_timeline_error(const char *shm, uint32_t timeline,
 							 char *output, size_t output_size)
 {
@@ -299,6 +344,12 @@ check_inspector(const char *shm, uint32_t page_size)
 				 "\"wal_owners\":0,\"wal_index_owners\":0,"
 				 "\"max_generation\":0,\"retention_poisoned\":false}\n") == 0,
 		  "read-only inspector reports exact initial owner values");
+	check(run_inspector_relation(shm, 0, 1, 1, 1, 0, output,
+							 sizeof(output)),
+		  "relation inspector uses the dedicated private mailbox");
+	check(strcmp(output, "{\"exists\":false,\"forks\":[],"
+				 "\"selected_version\":null}\n") == 0,
+		  "relation inspector reports a typed empty response and unavailable version");
 }
 
 static void
@@ -3459,6 +3510,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	unsigned char *pa,
 			   *pb,
 			   *rb;
+	char		output[1024];
 
 	fprintf(stderr, "== page_size=%u ==\n", page_size);
 
@@ -3521,6 +3573,18 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_nblocks(REL_A, FORK0) == 28, "nblocks==28 after zeroextend");
 	op_read_one(REL_A, FORK0, 26, rb);
 	check(page_all_zero(rb, page_size), "zero-extended block reads as zeros");
+	op_create(REL_B, FORK0);
+	op_zeroextend(REL_B, FORK0, 0, 2);
+	op_create(REL_B, 1);
+	op_zeroextend(REL_B, 1, 0, 3);
+	check(run_inspector_relation(shm, 0, 1, 1, REL_B, 0, output,
+							 sizeof(output)),
+		  "relation inspector serves an existing relation through private IPC");
+	check(strstr(output, "\"exists\":true") != NULL &&
+		  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL &&
+		  strstr(output, "\"fork\":1,\"nblocks\":3") != NULL &&
+		  strstr(output, "\"selected_version\":null") != NULL,
+		  "relation inspector reports every fork size and explicit unavailable version");
 
 	/* --- truncate --- */
 	op_truncate(REL_A, FORK0, 10);
@@ -3554,6 +3618,11 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_nblocks_asof(REL_C, FORK0, 1500) == 0, "no blocks below the first write's LSN");
 	check(op_nblocks_asof(REL_C, FORK0, 2000) == 1, "one block as of its pd_lsn");
 	check(op_nblocks_asof(REL_C, FORK0, 3500) == 2, "two blocks between the 2nd and 3rd writes");
+	check(run_inspector_relation(shm, 0, 1, 1, REL_C, 3500, output,
+							 sizeof(output)) &&
+		  strstr(output, "\"exists\":true") != NULL &&
+		  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL,
+		  "relation inspector applies the requested as-of LSN");
 	check(op_nblocks(REL_C, FORK0) == 3, "newest size after three writes");
 	fill_page(pa, page_size, 5000, 9);
 	op_write_one(REL_C, FORK0, 0, pa);	/* rewrite: no size change */
