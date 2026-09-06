@@ -105,6 +105,7 @@ static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
 static volatile int inspection_timeline_cache_dirty = 1;
 static int inspection_timeline_cache_valid;
+static int inspection_timeline_cache_retention_usable;
 static uint64_t inspection_timeline_cache_retention_epoch;
 static PsInspectionTimeline inspection_timeline_cache[PS_INSPECTION_MAX_TIMELINES];
 static int fork_meta_reclaim_baseline_init(void);
@@ -9113,7 +9114,7 @@ inspection_timeline_cache_changed(void)
  * branch-fence rule as page_prune_fences().  Caller holds the map read lock. */
 static int
 refresh_inspection_timeline_cache(const PsRetentionPin *pins,
-								  uint32_t npins, int retention_poisoned)
+								  uint32_t npins, int retention_usable)
 {
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
@@ -9126,9 +9127,11 @@ refresh_inspection_timeline_cache(const PsRetentionPin *pins,
 		inspection_timeline_cache[tl].fork_lsn = timelines[tl].branch_lsn;
 	}
 
-	/* The entry's ancestry is still useful for diagnosing a poisoned registry,
-	 * but no retention number may be presented as a healthy horizon. */
-	if (retention_poisoned)
+	/* The entry's identity is still useful for diagnosing an unavailable or
+	 * poisoned registry, but no retention number may be presented as a healthy
+	 * horizon.  In particular, an allocation failure must not erase defined
+	 * timelines and make the inspector report them as absent. */
+	if (!retention_usable)
 		return 0;
 	for (uint32_t i = 0; i < npins; i++)
 	{
@@ -9237,18 +9240,24 @@ publish_inspection_metrics(int force)
 											 &retention_npins,
 											 &retention_diagnostic,
 											 &retention_epoch) == 0;
-	if (__atomic_exchange_n(&inspection_timeline_cache_dirty, 0,
-								__ATOMIC_ACQ_REL) || !inspection_timeline_cache_valid ||
-		inspection_timeline_cache_retention_epoch != retention_epoch ||
-		!retention_snapshot_ok)
 	{
-		inspection_timeline_cache_valid = retention_snapshot_ok &&
-			refresh_inspection_timeline_cache(retention_pins, retention_npins,
-											 retention_diagnostic.poisoned) == 0;
-		inspection_timeline_cache_retention_epoch = retention_epoch;
-		if (!inspection_timeline_cache_valid)
-			memset(inspection_timeline_cache, 0,
-				   sizeof(inspection_timeline_cache));
+		int retention_usable = retention_snapshot_ok &&
+			!retention_diagnostic.poisoned;
+
+		if (__atomic_exchange_n(&inspection_timeline_cache_dirty, 0,
+								__ATOMIC_ACQ_REL) || !inspection_timeline_cache_valid ||
+			inspection_timeline_cache_retention_epoch != retention_epoch ||
+			inspection_timeline_cache_retention_usable != retention_usable)
+		{
+			inspection_timeline_cache_valid =
+				refresh_inspection_timeline_cache(retention_pins, retention_npins,
+											 retention_usable) == 0;
+			inspection_timeline_cache_retention_usable = retention_usable;
+			inspection_timeline_cache_retention_epoch = retention_epoch;
+			if (!inspection_timeline_cache_valid)
+				memset(inspection_timeline_cache, 0,
+					   sizeof(inspection_timeline_cache));
+		}
 	}
 	for (uint32_t tl = 0; tl < MAX_TIMELINES; tl++)
 	{
@@ -9315,10 +9324,12 @@ publish_inspection_metrics(int force)
 		snapshot.wal_owners = retention_diagnostic.wal_owners;
 		snapshot.wal_index_owners = retention_diagnostic.wal_index_owners;
 		snapshot.max_generation = retention_diagnostic.max_generation;
-		snapshot.retention_poisoned = retention_diagnostic.poisoned != 0;
 	}
-	else
-		snapshot.retention_poisoned = 1;
+	/* The public poison bit also covers a snapshot that was unavailable due to
+	 * allocation failure; otherwise timeline inspection could consume the
+	 * identity-only cache as if its horizons were trustworthy. */
+	snapshot.retention_poisoned = !retention_snapshot_ok ||
+		retention_diagnostic.poisoned != 0;
 	free(retention_pins);
 
 	snapshot.metadata_poisoned = timeline_meta_poisoned_load() != 0;
@@ -16202,6 +16213,7 @@ ps_core_open_impl(const char *store_dir)
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
 	inspection_timeline_cache_valid = 0;
+	inspection_timeline_cache_retention_usable = 0;
 	__atomic_store_n(&inspection_timeline_cache_dirty, 1, __ATOMIC_RELEASE);
 	__atomic_store_n(&timeline_meta_poisoned, 0, __ATOMIC_RELEASE);
 	memset(timeline_used, 0, sizeof(timeline_used));

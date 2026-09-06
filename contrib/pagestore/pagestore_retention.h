@@ -65,6 +65,11 @@ extern int ps_retention_snapshot_alloc_with_diagnostic(
  * registry. */
 extern int ps_retention_diagnostic_snapshot(PsRetentionDiagnostic *out);
 
+#ifdef PAGESTORE_RETENTION_TEST
+/* Deterministically fail only the allocating diagnostic snapshot path. */
+extern void ps_test_retention_fail_snapshot_alloc(int fail);
+#endif
+
 extern int ps_retention_should_compact(void);
 extern int ps_retention_compact(void);
 

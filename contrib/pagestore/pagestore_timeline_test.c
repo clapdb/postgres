@@ -2116,6 +2116,65 @@ test_inspection_structural_horizon_lifecycle_states(void)
 	remove_tree(store);
 }
 
+/* A failed retention snapshot must preserve timeline identity for diagnosis.
+ * Only retained horizons are unavailable, and a later successful snapshot
+ * must be able to rebuild them at the same retention epoch. */
+static void
+test_inspection_retention_snapshot_alloc_failure(void)
+{
+	char store[] = "/tmp/pagestore-timeline-inspection-retention-XXXXXX";
+	PsShmHeader metrics;
+	PsRetentionPin pin;
+
+	configure_timeline_core();
+	ps_core_set_metrics_header(NULL);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+			create_branch(1, 0, 500),
+		  "open retention allocation-failure inspection store");
+	memset(&pin, 0, sizeof(pin));
+	pin.timeline = 0;
+	pin.owner_kind = PS_RETENTION_OWNER_READER;
+	pin.owner_id = 8801;
+	pin.resources = PS_RETENTION_RESOURCE_PAGE_HISTORY;
+	pin.generation = 1;
+	pin.lsn = 400;
+	pin.admission_seq = 1;
+	check(ps_retention_set(&pin) == PS_RETENTION_OK,
+		  "install a page-history pin for the allocation-failure fixture");
+
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.timeline_entries[0].defined &&
+			metrics.inspection.timeline_entries[0].parent_timeline == -1 &&
+			metrics.inspection.timeline_entries[0].retained_horizon == 400 &&
+			metrics.inspection.timeline_entries[1].defined &&
+			metrics.inspection.timeline_entries[1].parent_timeline == 0 &&
+			metrics.inspection.timeline_entries[1].fork_lsn == 500,
+		  "healthy inspection cache publishes timeline identity and horizon");
+
+	ps_test_retention_fail_snapshot_alloc(1);
+	ps_core_inspection_request_complete(PS_OP_RETENTION_PIN_SET, PS_STATUS_OK);
+	check(metrics.inspection.retention_poisoned &&
+			metrics.inspection.timeline_entries[0].defined &&
+			metrics.inspection.timeline_entries[0].parent_timeline == -1 &&
+			metrics.inspection.timeline_entries[0].retained_horizon == 0 &&
+			metrics.inspection.timeline_entries[1].defined &&
+			metrics.inspection.timeline_entries[1].parent_timeline == 0 &&
+			metrics.inspection.timeline_entries[1].fork_lsn == 500 &&
+			metrics.inspection.timeline_entries[1].retained_horizon == 0,
+		  "failed retention snapshot preserves identity and fails closed horizons");
+
+	ps_test_retention_fail_snapshot_alloc(0);
+	ps_core_inspection_request_complete(PS_OP_RETENTION_PIN_SET, PS_STATUS_OK);
+	check(!metrics.inspection.retention_poisoned &&
+			metrics.inspection.timeline_entries[0].retained_horizon == 400,
+		  "a later successful snapshot rebuilds horizons after allocation failure");
+
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_old_event_replay_derives_reused_parent_incarnation(void)
 {
@@ -3215,6 +3274,7 @@ main(void)
 	test_v2_and_mixed_lifecycle();
 	test_inspection_timeline_cache_deep_ancestry();
 	test_inspection_structural_horizon_lifecycle_states();
+	test_inspection_retention_snapshot_alloc_failure();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

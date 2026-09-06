@@ -230,6 +230,7 @@ pagestore_timeline_test = executable('pagestore_timeline_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_RETENTION_TEST'],
   install: false,
 )
 test('pagestore_timeline',

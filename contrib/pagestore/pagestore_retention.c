@@ -106,6 +106,17 @@ static dev_t retention_dev;
 static ino_t retention_ino;
 static struct timespec retention_compact_retry_at;
 static pthread_mutex_t retention_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef PAGESTORE_RETENTION_TEST
+static int retention_test_fail_snapshot_alloc;
+#endif
+
+#ifdef PAGESTORE_RETENTION_TEST
+void
+ps_test_retention_fail_snapshot_alloc(int fail)
+{
+	retention_test_fail_snapshot_alloc = fail != 0;
+}
+#endif
 
 static int
 retention_new_incarnation(uint64_t *epoch)
@@ -1443,6 +1454,10 @@ ps_retention_snapshot_alloc_with_diagnostic(PsRetentionPin **pins_out,
 	count = retention_active_count();
 	if (count != 0)
 	{
+#ifdef PAGESTORE_RETENTION_TEST
+		if (retention_test_fail_snapshot_alloc)
+			goto done;
+#endif
 		snapshot = malloc((size_t) count * sizeof(*snapshot));
 		if (snapshot == NULL)
 			goto done;

@@ -329,6 +329,16 @@ check_inspector_seqlock(void)
 	ps_store_release(&hdr->inspection.metadata_poisoned, 0);
 	ps_store_release_u64(&hdr->inspection_metrics_seq, 5);
 	ps_store_release_u64(&hdr->inspection_metrics_seq, 6);
+	ps_store_release(&hdr->inspection.retention_poisoned, 1);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 7);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 8);
+	check(run_inspector_timeline_error(name, 0, output, sizeof(output)) &&
+		  strstr(output, "retention metadata is poisoned") != NULL &&
+		  strstr(output, "does not exist") == NULL,
+		  "retention poison is reported after preserving timeline identity");
+	ps_store_release(&hdr->inspection.retention_poisoned, 0);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 9);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 10);
 	check(run_inspector_timeline_error(name, 7, output, sizeof(output)) &&
 		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
 		  "a clean timeline snapshot reports a genuinely absent timeline");
