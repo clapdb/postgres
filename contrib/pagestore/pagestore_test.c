@@ -192,6 +192,43 @@ run_inspector_timeline_error(const char *shm, uint32_t timeline,
 	return WIFEXITED(status) && WEXITSTATUS(status) != 0;
 }
 
+static int
+run_inspector_timeline_missing(const char *shm, char *output,
+						   size_t output_size)
+{
+	int pipefd[2];
+	pid_t pid;
+	int status;
+	ssize_t nread;
+
+	if (pipe(pipefd) != 0)
+		return 0;
+	pid = fork();
+	if (pid < 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return 0;
+	}
+	if (pid == 0)
+	{
+		close(pipefd[0]);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		execl(inspect_path, inspect_path, "--shm", shm, "timeline",
+			  (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	nread = read(pipefd[0], output, output_size - 1);
+	close(pipefd[0]);
+	if (nread < 0)
+		nread = 0;
+	output[nread] = '\0';
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) == 2;
+}
+
 static void
 check_inspector(const char *shm, uint32_t page_size)
 {
@@ -230,8 +267,11 @@ check_inspector(const char *shm, uint32_t page_size)
 		  strstr(output, "\"versions_kept\":") != NULL &&
 		  strstr(output, "\"versions_deleted\":") != NULL,
 		  "read-only inspector reports page-pruning counters");
-	check(run_inspector(shm, "timeline", output, sizeof(output)),
-		  "read-only inspector timeline snapshot exits cleanly");
+	check(run_inspector_timeline_missing(shm, output, sizeof(output)) &&
+		  strstr(output, "timeline ID") != NULL,
+		  "read-only inspector rejects a timeline request without an ID");
+	check(run_inspector_timeline(shm, 0, output, sizeof(output)),
+		  "read-only inspector accepts an explicit root timeline ID");
 	check(strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
 				 "\"retained_horizon\":0}\n") == 0,
 		  "read-only inspector reports the exact root timeline contract");
@@ -312,7 +352,7 @@ check_inspector_seqlock(void)
 		ps_store_release_u64(&hdr->inspection_metrics_seq, 2);
 		_exit(0);
 	}
-	check(run_inspector(name, "timeline", output, sizeof(output)) &&
+	check(run_inspector_timeline(name, 0, output, sizeof(output)) &&
 		  strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
 				 "\"retained_horizon\":0}\n") == 0,
 		  "inspector retries an odd seqlock and never emits a torn snapshot");

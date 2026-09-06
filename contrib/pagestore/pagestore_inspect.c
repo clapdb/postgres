@@ -23,7 +23,7 @@
 static void
 usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s --shm NAME health|timeline [ID]|manifest|gc|"
+	fprintf(stderr, "usage: %s --shm NAME health|timeline ID|manifest|gc|"
 			"owners|backpressure|pruning\n", prog);
 }
 
@@ -431,12 +431,12 @@ main(int argc, char **argv)
 	{
 		shm_name = argv[2];
 		operation = argv[3];
-		if (argc == 5)
+		if (strcmp(operation, "timeline") == 0)
 		{
 			char *end = NULL;
 			unsigned long long parsed;
 
-			if (strcmp(operation, "timeline") != 0 || argv[4][0] == '-')
+			if (argc != 5 || argv[4][0] == '-')
 				operation = NULL;
 			else
 			{
@@ -449,6 +449,8 @@ main(int argc, char **argv)
 					timeline_id = (uint32_t) parsed;
 			}
 		}
+		else if (argc != 4)
+			operation = NULL;
 	}
 	if (shm_name == NULL || operation == NULL ||
 		(strcmp(operation, "health") != 0 &&
