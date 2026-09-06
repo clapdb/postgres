@@ -285,6 +285,8 @@ read_inspection_metrics(PsShmHeader *hdr, PsInspectionMetrics *metrics)
 			ps_load_acquire(&hdr->inspection.manifest_poisoned);
 		metrics->page_debt_segments =
 			ps_load_acquire_u64(&hdr->inspection.page_debt_segments);
+		metrics->page_debt_unavailable =
+			ps_load_acquire(&hdr->inspection.page_debt_unavailable);
 		metrics->gc_deleting_layers =
 			ps_load_acquire_u64(&hdr->inspection.gc_deleting_layers);
 		metrics->remote_cleanup_pending =
@@ -384,10 +386,12 @@ print_gc(PsShmHeader *hdr)
 	PsInspectionMetrics metrics;
 
 	read_inspection_metrics(hdr, &metrics);
-	printf("{\"page_debt_segments\":%llu,\"deleting_layers\":%llu,"
+	printf("{\"page_debt_segments\":%llu,\"page_debt_unavailable\":%s,"
+		   "\"deleting_layers\":%llu,"
 		   "\"remote_cleanup_pending\":%llu,\"forkmeta_pending\":%s,"
 		   "\"forkmeta_poisoned\":%s}\n",
 		   (unsigned long long) metrics.page_debt_segments,
+		   metrics.page_debt_unavailable ? "true" : "false",
 		   (unsigned long long) metrics.gc_deleting_layers,
 		   (unsigned long long) metrics.remote_cleanup_pending,
 		   metrics.forkmeta_pending ? "true" : "false",

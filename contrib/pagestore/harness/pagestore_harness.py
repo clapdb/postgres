@@ -456,7 +456,8 @@ INSPECTION_RESPONSES = {
         "remote_durable_layers", "manifest_poisoned",
     },
     "gc": {
-        "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
+        "page_debt_segments", "page_debt_unavailable", "deleting_layers",
+        "remote_cleanup_pending",
         "forkmeta_pending", "forkmeta_poisoned",
     },
     "owners": {
@@ -478,7 +479,7 @@ INSPECTION_REQUESTS = {
 }
 INSPECTION_BOOLEAN_FIELDS = {
     "retention_poisoned", "manifest_poisoned",
-    "forkmeta_pending", "forkmeta_poisoned",
+    "forkmeta_pending", "forkmeta_poisoned", "page_debt_unavailable",
 }
 INSPECTION_SIGNED_FIELDS = {"parent_timeline"}
 INSPECTION_COUNTER_FIELDS = (

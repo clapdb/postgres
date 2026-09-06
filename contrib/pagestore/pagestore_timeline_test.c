@@ -2024,6 +2024,98 @@ configure_timeline_core(void)
 	ps_storage = &PsStoragePosix;
 }
 
+/* Keep the inspection structural pass bounded on a maximally deep timeline
+ * chain.  This also exercises the real LSN-0 branch-cap sentinel: it must
+ * publish as horizon 1 rather than disappearing as an unconstrained zero. */
+static void
+test_inspection_timeline_cache_deep_ancestry(void)
+{
+	char store[] = "/tmp/pagestore-timeline-inspection-depth-XXXXXX";
+	PsShmHeader metrics;
+	int created = 1;
+
+	configure_timeline_core();
+	ps_core_set_metrics_header(NULL);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open maximally deep inspection timeline store");
+	for (uint32_t timeline = 1;
+		 timeline < PS_INSPECTION_MAX_TIMELINES && created; timeline++)
+	{
+		uint64_t branch_lsn = timeline == 2 ? 0 : 1000 + timeline;
+
+		if (!create_branch(timeline, timeline - 1, branch_lsn))
+			created = 0;
+	}
+	check(created, "create a full-depth live timeline ancestry chain");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.timeline_entries[0].retained_horizon == 1 &&
+		  metrics.inspection.timeline_entries[1].retained_horizon == 1,
+		  "structural horizon projects the LSN-0 cap through all ancestors");
+	check(metrics.inspection.timeline_entries[PS_INSPECTION_MAX_TIMELINES - 1].defined &&
+		  metrics.inspection.timeline_entries[PS_INSPECTION_MAX_TIMELINES - 1].parent_timeline ==
+			(int64_t) PS_INSPECTION_MAX_TIMELINES - 2 &&
+		  metrics.inspection.timeline_entries[PS_INSPECTION_MAX_TIMELINES - 1].retained_horizon == 0,
+		  "deepest timeline keeps its ancestry metadata without a child fence");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_inspection_structural_horizon_lifecycle_states(void)
+{
+	char store[] = "/tmp/pagestore-timeline-inspection-state-XXXXXX";
+	char blocker[1024];
+	PsShmHeader metrics;
+	PsTimelineState deleting_state = PS_TIMELINE_LIVE;
+	PsTimelineState deleted_state = PS_TIMELINE_LIVE;
+
+	configure_timeline_core();
+	ps_core_set_metrics_header(NULL);
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0 &&
+		  create_branch(1, 0, 500) && create_branch(2, 0, 300) &&
+		  create_branch(3, 0, 100),
+		  "create LIVE, DELETING, and DELETED inspection branches");
+	check(begin_delete(2, 1, NULL) &&
+		  fixture_file(store, "walidx_2_999") &&
+		  begin_delete(3, 1, NULL),
+		  "hold one branch DELETING while another can finish deletion");
+	for (int i = 0; i < 32; i++)
+	{
+		(void) ps_core_maintenance();
+		if (state_of(2, &deleting_state, NULL) &&
+			state_of(3, &deleted_state, NULL) &&
+			deleted_state == PS_TIMELINE_DELETED)
+			break;
+	}
+	check(deleting_state == PS_TIMELINE_DELETING &&
+		  deleted_state == PS_TIMELINE_DELETED,
+		  "establish mixed LIVE, DELETING, and DELETED states");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.timeline_entries[0].retained_horizon == 300,
+		  "DELETING structural fence is included while DELETED is excluded");
+
+	check(fixture_path(blocker, sizeof(blocker), store, "walidx_2_999") &&
+		  unlink(blocker) == 0,
+		  "remove the DELETING branch cleanup blocker");
+	for (int i = 0; i < 32; i++)
+	{
+		(void) ps_core_maintenance();
+		if (state_of(2, &deleting_state, NULL) &&
+			deleting_state == PS_TIMELINE_DELETED)
+			break;
+	}
+	ps_core_set_metrics_header(&metrics);
+	check(deleting_state == PS_TIMELINE_DELETED &&
+		  metrics.inspection.timeline_entries[0].retained_horizon == 500,
+		  "structural horizon drops a branch only after durable DELETED");
+	ps_core_set_metrics_header(NULL);
+	close_store();
+	remove_tree(store);
+}
+
 static void
 test_old_event_replay_derives_reused_parent_incarnation(void)
 {
@@ -3121,6 +3213,8 @@ main(void)
 	test_deleting_timeline_page_cleanup_prefix_hole();
 	test_deleting_timeline_page_cleanup_retired_short_segment();
 	test_v2_and_mixed_lifecycle();
+	test_inspection_timeline_cache_deep_ancestry();
+	test_inspection_structural_horizon_lifecycle_states();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);
 	return failed != 0;
 }

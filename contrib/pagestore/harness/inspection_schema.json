@@ -19,7 +19,7 @@
       "response": ["layer_count", "deleting_layers", "local_layers", "remote_durable_layers", "manifest_poisoned"]
     },
     "gc": {
-      "response": ["page_debt_segments", "deleting_layers", "remote_cleanup_pending", "forkmeta_pending", "forkmeta_poisoned"]
+      "response": ["page_debt_segments", "page_debt_unavailable", "deleting_layers", "remote_cleanup_pending", "forkmeta_pending", "forkmeta_poisoned"]
     },
     "owners": {
       "response": ["owner_count", "page_history_owners", "wal_owners", "wal_index_owners", "max_generation", "retention_poisoned"]

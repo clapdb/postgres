@@ -205,6 +205,8 @@ check_inspector(const char *shm, uint32_t page_size)
 	check(run_inspector(shm, "gc", output, sizeof(output)),
 		  "read-only inspector GC snapshot exits cleanly");
 	check(strstr(output, "\"page_debt_segments\":") != NULL &&
+		  (strstr(output, "\"page_debt_unavailable\":true") != NULL ||
+		   strstr(output, "\"page_debt_unavailable\":false") != NULL) &&
 		  strstr(output, "\"deleting_layers\":") != NULL &&
 		  strstr(output, "\"remote_cleanup_pending\":") != NULL &&
 		  (strstr(output, "\"forkmeta_pending\":true") != NULL ||

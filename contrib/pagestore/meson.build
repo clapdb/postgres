@@ -268,6 +268,7 @@ pagestore_backpressure_test = executable('pagestore_backpressure_test',
         'pagestore_walidx_snapshot.c', 'pagestore_forkmeta_prune.c',
         'pagestore_forkmeta_snapshot.c'),
   dependencies: [dependency('threads')],
+  c_args: ['-DPAGESTORE_BACKPRESSURE_TEST'],
   install: false,
 )
 test('pagestore_backpressure',

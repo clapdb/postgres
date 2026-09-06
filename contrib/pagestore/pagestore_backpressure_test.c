@@ -2739,11 +2739,23 @@ fail_segment_size(uint32_t shard, int seg)
 }
 
 static int segment_size_calls;
+static int partial_account_failure;
 
 static int64_t
 counting_segment_size(uint32_t shard, int seg)
 {
 	segment_size_calls++;
+	return PsStoragePosix.seg_size(shard, seg);
+}
+
+static int64_t
+partial_account_segment_size(uint32_t shard, int seg)
+{
+	if (partial_account_failure && seg == 1)
+	{
+		errno = EIO;
+		return -1;
+	}
 	return PsStoragePosix.seg_size(shard, seg);
 }
 
@@ -2759,6 +2771,142 @@ sentinel_segment_size(uint32_t shard, int seg)
 	if (bytes < 0)
 		errno = 0;
 	return bytes;
+}
+
+static void
+test_page_debt_disabled_fast_path(void)
+{
+	char store[] = "/tmp/pagestore-page-debt-disabled-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	PsShmHeader metrics;
+	PsStorage counting_storage = PsStoragePosix;
+	uint64_t observations_before;
+	int appended = 1;
+
+	configure_page_core();
+	flush_pages = 9;
+	check(ps_backpressure_configure(0, 0, 0, 0) == 0,
+		  "disable PAGE controller for debt fast-path test");
+	counting_storage.seg_size = counting_segment_size;
+	ps_storage = &counting_storage;
+	segment_size_calls = 0;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open disabled PAGE debt fast-path store");
+	observations_before = ps_test_page_gc_coverage_observation_count();
+	for (uint32_t block = 0; block < 9 && appended; block++)
+	{
+		fill_page(page, (unsigned char) (20 + block));
+		ps_lock_shard_wr(0);
+		if (append_page(0, &key, block, page, 0, NULL) != 0)
+			appended = 0;
+		ps_unlock_shard(0);
+	}
+	check(appended &&
+		  ps_test_page_gc_coverage_observation_count() == observations_before,
+		  "disabled PAGE controller performs no per-flush segment-size I/O");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 0,
+		  "disabled PAGE debt inspection is explicitly unavailable");
+	check(ps_backpressure_configure(1ULL << 40, 1, 0, 0) == 0,
+		  "enable PAGE controller dynamically after untracked coverage");
+	ps_backpressure_refresh();
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.page_backpressure.lag_bytes == UINT64_MAX &&
+		  metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 0,
+		  "dynamic enable remains fail closed until an enabled reopen");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+
+	segment_size_calls = 0;
+	check(ps_core_open(store) == 0,
+		  "enabled reopen rebuilds previously untracked PAGE debt");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(segment_size_calls > 0 &&
+		  !metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 2,
+		  "enabled startup scan publishes exact PAGE debt");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	remove_tree(store);
+}
+
+static void
+test_page_debt_partial_account_unavailable(void)
+{
+	char store[] = "/tmp/pagestore-page-debt-unavailable-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	unsigned char page[8192];
+	PsShmHeader metrics;
+	PsStorage faulting_storage = PsStoragePosix;
+	int appended = 1;
+	int removed = 0;
+
+	configure_page_core();
+	flush_pages = 9;
+	check(ps_backpressure_configure(1ULL << 40, 1, 0, 0) == 0,
+		  "enable PAGE controller for partial diagnostic accounting");
+	faulting_storage.seg_size = partial_account_segment_size;
+	ps_storage = &faulting_storage;
+	partial_account_failure = 0;
+	check(mkdtemp(store) != NULL && ps_core_open(store) == 0,
+		  "open PAGE debt unavailable test store");
+	partial_account_failure = 1;
+	for (uint32_t block = 0; block < 9 && appended; block++)
+	{
+		fill_page(page, (unsigned char) (40 + block));
+		ps_lock_shard_wr(0);
+		if (append_page(0, &key, block, page, 0, NULL) != 0)
+			appended = 0;
+		ps_unlock_shard(0);
+	}
+	check(appended && ps_test_page_gc_debt_unavailable(0) &&
+		  ps_test_page_gc_debt_segments(0) == 1,
+		  "partial coverage observation preserves its prefix count as unavailable");
+	memset(&metrics, 0, sizeof(metrics));
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 0,
+		  "inspection suppresses a partial PAGE debt count");
+
+	partial_account_failure = 0;
+	ps_storage = &PsStoragePosix;
+	for (int i = 0; i < 32 && !removed; i++)
+	{
+		(void) ps_core_maintenance();
+		errno = 0;
+		removed = ps_storage->seg_size(0, 0) < 0 && errno == ENOENT;
+	}
+	check(removed && ps_test_page_gc_debt_unavailable(0) &&
+		  ps_test_page_gc_debt_segments(0) == 1,
+		  "segment removal does not heuristically decrement unavailable debt");
+	ps_core_set_metrics_header(&metrics);
+	check(metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 0,
+		  "unavailable PAGE debt remains fail closed until restart");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+
+	memset(&metrics, 0, sizeof(metrics));
+	check(ps_backpressure_configure(1ULL << 40, 1, 0, 0) == 0,
+		  "keep PAGE controller enabled for exact restart rebuild");
+	check(ps_core_open(store) == 0,
+		  "restart rebuilds PAGE debt after unavailable observation");
+	ps_core_set_metrics_header(&metrics);
+	check(!metrics.inspection.page_debt_unavailable &&
+		  metrics.inspection.page_debt_segments == 1,
+		  "restart publishes the exact remaining PAGE debt");
+	ps_core_set_metrics_header(NULL);
+	ps_core_close();
+	ps_storage->close();
+	remove_tree(store);
 }
 
 static void
@@ -2821,8 +2969,14 @@ test_page_storage_fail_closed(void)
 		ps_backpressure_configure(0, 0, 0, 0);
 		segment_size_calls = 0;
 		check(ps_core_open(store) == 0,
-			  "disabled page controller reopens the standalone store");
+			  "disabled page controller reopens without rebuilding coverage");
 		disabled_calls = segment_size_calls;
+		memset(&metrics, 0, sizeof(metrics));
+		ps_core_set_metrics_header(&metrics);
+		check(metrics.inspection.page_debt_unavailable &&
+			  metrics.inspection.page_debt_segments == 0,
+			  "disabled startup reports PAGE debt unavailable");
+		ps_core_set_metrics_header(NULL);
 		ps_core_close();
 		ps_storage->close();
 
@@ -2833,6 +2987,12 @@ test_page_storage_fail_closed(void)
 		enabled_calls = segment_size_calls;
 		check(enabled_calls > disabled_calls,
 			  "disabled page controller avoids the startup PAGE debt scan");
+		memset(&metrics, 0, sizeof(metrics));
+		ps_core_set_metrics_header(&metrics);
+		check(!metrics.inspection.page_debt_unavailable &&
+			  metrics.inspection.page_debt_segments == 1,
+			  "enabled startup reports exact PAGE debt");
+		ps_core_set_metrics_header(NULL);
 		ps_core_close();
 		ps_storage->close();
 	}
@@ -2941,6 +3101,8 @@ main(void)
 	test_walidx_aggregate_force();
 	test_walidx_automatic_observation_rate();
 	test_admission_writer_preference();
+	test_page_debt_disabled_fast_path();
+	test_page_debt_partial_account_unavailable();
 	test_page_storage_fail_closed();
 	test_ambiguous_page_segment_remove();
 	fprintf(stderr, "%d checks, %d failures\n", checks, failed);

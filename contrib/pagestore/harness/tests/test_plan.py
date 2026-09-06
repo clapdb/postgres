@@ -31,7 +31,7 @@ CAPABILITIES = {
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 42,
+            "operations": ["crash"], "protocol_version": 43,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -348,7 +348,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 42, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 43, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -591,7 +591,8 @@ class PlanValidationTests(unittest.TestCase):
                 "remote_durable_layers", "manifest_poisoned",
             ],
             "gc": [
-                "page_debt_segments", "deleting_layers", "remote_cleanup_pending",
+                "page_debt_segments", "page_debt_unavailable", "deleting_layers",
+                "remote_cleanup_pending",
                 "forkmeta_pending", "forkmeta_poisoned",
             ],
             "owners": [
@@ -608,7 +609,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "*) exit 1 ;;\n"
@@ -667,6 +668,7 @@ class PlanValidationTests(unittest.TestCase):
             {
                 "manifest_poisoned", "forkmeta_pending",
                 "forkmeta_poisoned", "retention_poisoned",
+                "page_debt_unavailable",
             },
         )
         self.assertEqual(
@@ -1274,7 +1276,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 42, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 43, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -1291,7 +1293,7 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\n"
             "case \"$3\" in\n"
             "health) printf '%s\\n' '"
-            "{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
+            "{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1300,7 +1302,8 @@ class PlanValidationTests(unittest.TestCase):
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
-            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "{\"page_debt_segments\":0,\"page_debt_unavailable\":false,"
+            "\"deleting_layers\":0,"
             "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
             "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"
@@ -1482,7 +1485,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1491,7 +1494,8 @@ class PlanValidationTests(unittest.TestCase):
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
-            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "{\"page_debt_segments\":0,\"page_debt_unavailable\":false,"
+            "\"deleting_layers\":0,"
             "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
             "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"
@@ -1584,7 +1588,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":42,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1593,7 +1597,8 @@ class PlanValidationTests(unittest.TestCase):
             "{\"layer_count\":0,\"deleting_layers\":0,\"local_layers\":0,"
             "\"remote_durable_layers\":0,\"manifest_poisoned\":false}' ;;\n"
             "gc) printf '%s\\n' '"
-            "{\"page_debt_segments\":0,\"deleting_layers\":0,"
+            "{\"page_debt_segments\":0,\"page_debt_unavailable\":false,"
+            "\"deleting_layers\":0,"
             "\"remote_cleanup_pending\":0,\"forkmeta_pending\":false,"
             "\"forkmeta_poisoned\":false}' ;;\n"
             "owners) printf '%s\\n' '"

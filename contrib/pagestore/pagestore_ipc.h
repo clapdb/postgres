@@ -29,7 +29,8 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		42	/* 42: per-timeline inspection snapshots;
+#define PS_SHM_VERSION		43	/* 43: explicit unavailable PAGE-debt diagnostics;
+								 * 42: per-timeline inspection snapshots;
 								 * 41: bounded runtime inspection snapshots;
 							 * 40: forkmeta reclaim backpressure metrics;
 								 * 39: WAL-index reclaim backpressure metrics;
@@ -408,7 +409,7 @@ typedef struct PsInspectionMetrics
 	uint64_t	gc_deleting_layers;
 	uint64_t	remote_cleanup_pending;
 	uint32_t	forkmeta_pending;
-	uint32_t	reserved3;
+	uint32_t	page_debt_unavailable;
 
 	uint64_t	owner_count;
 	uint64_t	page_history_owners;

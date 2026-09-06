@@ -1360,6 +1360,7 @@ typedef struct Shard
 	uint32_t	gc_pending_remove_seg;	/* victim whose remove result is ambiguous */
 	int			gc_pending_remove;
 	int			gc_storage_error;	/* sticky fail-closed storage observation */
+	int			gc_debt_unavailable;	/* coverage was intentionally not tracked */
 	int			flush_watermark_valid;
 	int			coverage_broken;	/* a record was not staged; do not advance */
 	uint64_t	next_layer_id;		/* next layer-local id for this shard */
@@ -1369,6 +1370,9 @@ typedef struct Shard
 } Shard;
 
 static Shard g_shards[MAX_SHARDS];
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+static uint64_t page_gc_coverage_observation_count;
+#endif
 
 static uint64_t
 backpressure_saturating_add(uint64_t left, uint64_t right)
@@ -1387,6 +1391,12 @@ page_gc_debt_settle(Shard *s, uint32_t seg, int known_counted)
 	int pending = s->gc_pending_remove &&
 		s->gc_pending_remove_seg == seg;
 
+	/* Once physical coverage observation fails, gc_debt_segments may contain
+	 * only a prefix of the real debt.  Do not guess which later victim belonged
+	 * to that prefix; the unavailable state remains sticky until startup rebuilds
+	 * the count from durable watermarks. */
+	if (s->gc_storage_error || s->gc_debt_unavailable)
+		return;
 	if (!pending && !known_counted)
 		return;
 	if (s->gc_debt_segments != 0)
@@ -1411,7 +1421,8 @@ page_reclaim_lag_bytes(void)
 		 * controller refresh therefore remains O(number of shards), independent
 		 * of the historical segment-id span.  Any runtime storage error is sticky
 		 * and reports fail-closed lag rather than clearing an active throttle. */
-		if (g_shards[shard].gc_storage_error)
+		if (g_shards[shard].gc_storage_error ||
+			g_shards[shard].gc_debt_unavailable)
 		{
 			ps_unlock_shard(shard);
 			return UINT64_MAX;
@@ -1439,6 +1450,7 @@ rebuild_page_gc_state(Shard *s)
 	s->gc_pending_remove_seg = 0;
 	s->gc_pending_remove = 0;
 	s->gc_storage_error = 0;
+	s->gc_debt_unavailable = 0;
 	if (!s->flush_watermark_valid || ps_storage == NULL ||
 		ps_storage->seg_size == NULL)
 		return 0;
@@ -1479,12 +1491,17 @@ static void
 account_page_gc_coverage(Shard *s, uint32_t old_boundary,
 						 uint32_t new_boundary)
 {
-	if (ps_storage == NULL || ps_storage->seg_size == NULL)
+	if (s->gc_storage_error || s->gc_debt_unavailable ||
+		ps_storage == NULL ||
+		ps_storage->seg_size == NULL)
 		return;
 	for (uint32_t seg = old_boundary; seg < new_boundary; seg++)
 	{
 		int64_t bytes;
 
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+		page_gc_coverage_observation_count++;
+#endif
 		errno = 0;
 		bytes = ps_storage->seg_size(s->id, (int) seg);
 		if (bytes < 0)
@@ -1542,6 +1559,41 @@ ps_unlock_shard(uint32_t shard)
 {
 	pthread_rwlock_unlock(&shard_locks[shard]);
 }
+
+uint64_t
+ps_test_page_gc_debt_segments(uint32_t shard)
+{
+	uint64_t segments = 0;
+
+	if (shard >= core_shards())
+		return 0;
+	ps_lock_shard_rd(shard);
+	segments = g_shards[shard].gc_debt_segments;
+	ps_unlock_shard(shard);
+	return segments;
+}
+
+int
+ps_test_page_gc_debt_unavailable(uint32_t shard)
+{
+	int unavailable = 1;
+
+	if (shard >= core_shards())
+		return 1;
+	ps_lock_shard_rd(shard);
+	unavailable = g_shards[shard].gc_storage_error != 0 ||
+		g_shards[shard].gc_debt_unavailable != 0;
+	ps_unlock_shard(shard);
+	return unavailable;
+}
+
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+uint64_t
+ps_test_page_gc_coverage_observation_count(void)
+{
+	return page_gc_coverage_observation_count;
+}
+#endif
 
 void
 ps_lock_map_rd(void)
@@ -1908,10 +1960,17 @@ flush_memtable(Shard *s, uint32_t seg_id, uint64_t seg_off)
 		s->coverage_broken = 1;
 		return -1;
 	}
-	/* Keep the disabled controller off the extra per-segment metadata path as
-	 * well.  A later enabled open rebuilds the durable prefix exactly once. */
-	if (page_reclaim_high_water_bytes != 0 && seg_id > old_boundary)
-		account_page_gc_coverage(s, old_boundary, seg_id);
+	/* Keep the disabled controller off the per-segment metadata path.  Once a
+	 * newly covered range is skipped, its debt cannot be reconstructed without
+	 * a historical scan, so a later runtime enable must fail closed until the
+	 * next enabled open rebuilds the count. */
+	if (seg_id > old_boundary)
+	{
+		if (page_reclaim_high_water_bytes != 0)
+			account_page_gc_coverage(s, old_boundary, seg_id);
+		else
+			s->gc_debt_unavailable = 1;
+	}
 	s->flush_watermark.shard = s->id;
 	s->flush_watermark.seg_id = seg_id;
 	s->flush_watermark.seg_off = seg_off;
@@ -3751,7 +3810,8 @@ page_cleanup_rewrite_segment(Shard *s, int seg, uint32_t target)
 	/* PAGE debt is an aggregate of nonempty, covered segments in the
 	 * reclaimable prefix.  A successful deletion rewrite can turn one such
 	 * segment into an empty file before segment GC sees it. */
-	counted_debt = page_reclaim_high_water_bytes != 0 && bytes > 0 &&
+	counted_debt = !s->gc_storage_error && !s->gc_debt_unavailable &&
+		bytes > 0 &&
 		s->flush_watermark_valid && (uint32_t) seg < s->flush_watermark.seg_id &&
 		(uint32_t) seg >= s->gc_next_seg && s->gc_debt_segments != 0;
 	if (have_watermark)
@@ -9093,26 +9153,39 @@ refresh_inspection_timeline_cache(const PsRetentionPin *pins,
 				return -1;
 		}
 	}
-	for (uint32_t target = 0; target < PS_INSPECTION_MAX_TIMELINES; target++)
+	/* Project each non-deleted descendant up its ancestry once.  The old
+	 * target/candidate loop called retention_project_lsn for every pair and
+	 * therefore made a deep timeline tree O(T^3).  page_prune_fences() adds
+	 * exactly the same cap for every live descendant/ancestor pair; doing the
+	 * projection while walking the descendant's chain preserves that contract
+	 * in O(T^2) worst case. */
+	for (uint32_t descendant = 0;
+		 descendant < PS_INSPECTION_MAX_TIMELINES; descendant++)
 	{
-		if (!timelines[target].defined)
-			continue;
-		for (uint32_t candidate = 0;
-			 candidate < PS_INSPECTION_MAX_TIMELINES; candidate++)
-		{
-			uint64_t cap = UINT64_MAX;
-			PsTimelineState state;
+		uint32_t current;
+		uint32_t hops = 0;
+		uint64_t projected = UINT64_MAX;
+		PsTimelineState state;
 
-			if (candidate == target || !timelines[candidate].defined ||
-				!ps_timeline_state(candidate, &state, NULL) ||
-				state == PS_TIMELINE_DELETED ||
-				!retention_project_lsn(candidate, target, &cap))
-				continue;
-			/* This is the structural candidate loop from page_prune_fences():
-			 * every live descendant retains its projected branch fence, even
-			 * without an explicit owner pin. */
-			retention_floor_add(cap,
-							 &inspection_timeline_cache[target].retained_horizon);
+		if (!timelines[descendant].defined ||
+			!ps_timeline_state(descendant, &state, NULL) ||
+			state == PS_TIMELINE_DELETED)
+			continue;
+		current = descendant;
+		while (timelines[current].parent >= 0)
+		{
+			uint32_t parent = (uint32_t) timelines[current].parent;
+
+			if (++hops > PS_INSPECTION_MAX_TIMELINES)
+				return -1;
+			if (parent >= PS_INSPECTION_MAX_TIMELINES ||
+				!timelines[parent].defined)
+				return -1;
+			if (timelines[current].branch_lsn < projected)
+				projected = timelines[current].branch_lsn;
+			retention_floor_add(projected,
+							 &inspection_timeline_cache[parent].retained_horizon);
+			current = parent;
 		}
 	}
 	return 0;
@@ -9215,15 +9288,22 @@ publish_inspection_metrics(int force)
 	if (map_locks_ready)
 		ps_unlock_map();
 
-	/* PAGE debt is maintained incrementally per shard.  Taking each shard read
-	 * lock makes the aggregate coherent without scanning historical segments. */
+	/* PAGE debt is maintained incrementally per shard.  A storage error can
+	 * leave a prefix-only count, so publish no numeric estimate once any shard
+	 * marks the diagnostic unavailable. */
 	for (uint32_t shard = 0; map_locks_ready && shard < core_shards(); shard++)
 	{
 		ps_lock_shard_rd(shard);
-		snapshot.page_debt_segments = ps_saturating_add_u64(
-			snapshot.page_debt_segments, g_shards[shard].gc_debt_segments);
+		if (g_shards[shard].gc_storage_error ||
+			g_shards[shard].gc_debt_unavailable)
+			snapshot.page_debt_unavailable = 1;
+		else
+			snapshot.page_debt_segments = ps_saturating_add_u64(
+				snapshot.page_debt_segments, g_shards[shard].gc_debt_segments);
 		ps_unlock_shard(shard);
 	}
+	if (snapshot.page_debt_unavailable)
+		snapshot.page_debt_segments = 0;
 
 	if (retention_snapshot_ok)
 	{
@@ -9276,6 +9356,8 @@ publish_inspection_metrics(int force)
 					 snapshot.manifest_poisoned);
 	ps_store_release_u64(&hdr->inspection.page_debt_segments,
 						 snapshot.page_debt_segments);
+	ps_store_release(&hdr->inspection.page_debt_unavailable,
+					 snapshot.page_debt_unavailable);
 	ps_store_release_u64(&hdr->inspection.gc_deleting_layers,
 						 snapshot.gc_deleting_layers);
 	ps_store_release_u64(&hdr->inspection.remote_cleanup_pending,
@@ -15230,7 +15312,8 @@ reclaim_one_segment(Shard *s)
 	/* Once a positive-size covered victim is known to be counted, remember it
 	 * before remove().  POSIX may unlink it and then fail the directory fsync;
 	 * the next ENOENT observation must settle the same debt unit. */
-	if (!s->gc_pending_remove && seg_bytes > 0 &&
+	if (!s->gc_storage_error && !s->gc_debt_unavailable &&
+		!s->gc_pending_remove && seg_bytes > 0 &&
 		s->gc_debt_segments != 0)
 	{
 		s->gc_pending_remove_seg = victim;
@@ -16255,17 +16338,17 @@ ps_core_open_impl(const char *store_dir)
 		g_shards[i].gc_pending_remove_seg = 0;
 		g_shards[i].gc_pending_remove = 0;
 		g_shards[i].gc_storage_error = 0;
+		g_shards[i].gc_debt_unavailable =
+			page_reclaim_high_water_bytes == 0;
 		g_shards[i].coverage_broken = 0;
 		g_shards[i].flush_watermark_valid = 0;
 		if (use_layers && ps_manifest_get_flush_watermark(i, &watermark))
 		{
 			g_shards[i].flush_watermark = watermark;
 			g_shards[i].flush_watermark_valid = 1;
-			/* Rebuild the oldest present covered segment and the incremental
-			 * positive-size debt count.  Non-ENOENT storage errors fail startup
-			 * closed, preserving errno and never advancing the cursor.  Keep
-			 * the disabled controller off this path: it must not add a startup
-			 * storage scan to the default or SPDK behavior. */
+			/* Rebuild exact debt only when the PAGE controller needs it.  A
+			 * disabled open deliberately avoids historical segment metadata I/O
+			 * and exposes the diagnostic as unavailable. */
 			if (page_reclaim_high_water_bytes != 0 &&
 				rebuild_page_gc_state(&g_shards[i]) != 0)
 				return -1;
