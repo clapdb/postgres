@@ -3,13 +3,16 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 
 PAGESTORE_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PAGESTORE_ROOT))
 SPEC = importlib.util.spec_from_file_location(
     "pagestore_branch_prepare",
     PAGESTORE_ROOT / "pagestore_branch_prepare.py",
@@ -278,6 +281,195 @@ class BranchPrepareTests(unittest.TestCase):
             preparer.execute()
         self.assertTrue(preparer.restored)
         self.assertFalse(config.receipt_file.exists())
+
+    def test_journal_rejects_legacy_incomplete_corrupt_and_identity_mismatch(self):
+        config = MODULE.Config.load(self.write_config())
+        preparer = MODULE.BranchPreparer(config)
+        config.receipt_file.write_text(
+            json.dumps({"schema": 1, "state": "prepared"}) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "legacy incomplete"):
+            preparer.read_journal()
+
+        preparer.write_journal(preparer.new_journal())
+        value = json.loads(config.receipt_file.read_text(encoding="utf-8"))
+        value["state"] = "prepared"
+        config.receipt_file.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "CRC"):
+            preparer.read_journal()
+
+        preparer.write_journal(preparer.new_journal())
+        other_path = self.write_config(
+            new_timeline=2, prepared_dir=str(config.prepared_dir)
+        )
+        other = MODULE.BranchPreparer(MODULE.Config.load(other_path))
+        with self.assertRaisesRegex(MODULE.BranchPrepareError, "identity mismatch"):
+            other.read_journal()
+
+    def test_branch_fault_points_exit_and_recover_from_operation_journal(self):
+        child = textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, {str(PAGESTORE_ROOT)!r})
+            import pagestore_branch_prepare as m
+
+            calls = Path({str(self.root / 'prepare.calls')!r})
+            service = Path({str(self.root / 'service-state.json')!r})
+            def set_service(**values):
+                current = {{
+                    "retention_owned": False,
+                    "materializer_paused": False,
+                    "writer_mode": "normal",
+                }}
+                if service.exists():
+                    current.update(__import__("json").loads(service.read_text()))
+                current.update(values)
+                service.write_text(__import__("json").dumps(current))
+            class Fake(m.BranchPreparer):
+                def preflight(self):
+                    pass
+                def capture_and_pin_base(self):
+                    self.branch_retention_generation = 1
+                    self.branch_retention_owned = True
+                    set_service(retention_owned=True)
+                    return "0/10"
+                def stop_writer(self):
+                    self.writer_owned = True
+                    set_service(writer_mode="stopped")
+                def start_restricted_writer(self):
+                    self.writer_owned = True
+                    self.restricted_writer_running = True
+                    set_service(writer_mode="restricted")
+                def select_checkpoint(self):
+                    return "0/20", "0/30"
+                def archive_checkpoint(self):
+                    return "0/40"
+                def wait_materializer(self, target):
+                    pass
+                def pause_and_capture(self, keep_paused):
+                    self.pause_owned = True
+                    set_service(materializer_paused=True)
+                    return "0/40"
+                def prepare_branch(self, base, redo, fork):
+                    with calls.open("a", encoding="utf-8") as stream:
+                        stream.write(base + "," + redo + "," + fork + "\\n")
+                    return 7
+                def release_branch_retention(self):
+                    self.branch_retention_owned = False
+                    set_service(retention_owned=False)
+                def resume_materializer(self):
+                    self.pause_owned = False
+                    set_service(materializer_paused=False)
+                def restore_writer(self):
+                    self.writer_owned = False
+                    self.restricted_writer_running = False
+                    set_service(writer_mode="normal")
+                def materializer_sql(self, sql):
+                    if "pg_get_wal_replay_pause_state" in sql:
+                        return "not paused"
+                    raise AssertionError(sql)
+
+            Fake(m.Config.load(Path(sys.argv[1]))).execute()
+            """
+        )
+        points = (
+            ("branch_prepare.before_prepared_receipt", "branch_prepared"),
+            ("branch_prepare.after_prepared_receipt", "prepared"),
+            ("branch_prepare.after_materializer_resume", "materializer_resumed"),
+            ("branch_prepare.after_writer_restore", "writer_restored"),
+        )
+        for point, crashed_state in points:
+            with self.subTest(point=point):
+                prepared_dir = self.root / point.replace(".", "-")
+                config_path = self.write_config(prepared_dir=str(prepared_dir))
+                config = MODULE.Config.load(config_path)
+                control = self.root / (point + ".control")
+                control.mkdir()
+                (control / "arm").write_text("arm\n", encoding="utf-8")
+                env = os.environ.copy()
+                for key in (
+                    "PAGESTORE_TEST_FAULT_NAME", "PAGESTORE_TEST_FAULT_ACTION",
+                    "PAGESTORE_TEST_FAULT_HIT", "PAGESTORE_TEST_FAULT_DIR",
+                    "PAGESTORE_TEST_FAULT_SCENARIO", "PAGESTORE_TEST_FAULT_SEED",
+                    "PAGESTORE_TEST_FAULT_OPERATION", "PAGESTORE_TEST_FAULT_OPERATION_ID",
+                ):
+                    env.pop(key, None)
+                env.update({
+                    "PAGESTORE_TEST_FAULT_NAME": point,
+                    "PAGESTORE_TEST_FAULT_ACTION": "crash",
+                    "PAGESTORE_TEST_FAULT_HIT": "1",
+                    "PAGESTORE_TEST_FAULT_DIR": str(control),
+                    "PAGESTORE_TEST_FAULT_SCENARIO": "branch-h1",
+                    "PAGESTORE_TEST_FAULT_SEED": "1",
+                    "PAGESTORE_TEST_FAULT_OPERATION": point,
+                })
+                result = subprocess.run(
+                    [sys.executable, "-c", child, str(config_path)],
+                    env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 88)
+                report = json.loads((control / "report.jsonl").read_text(encoding="utf-8"))
+                self.assertEqual(report["name"], point)
+                self.assertEqual(report["operation"], point)
+                crashed = MODULE.BranchPreparer(config).read_journal()
+                self.assertEqual(crashed["state"], crashed_state)
+                self.assertEqual(crashed["base_lsn"], "0/10")
+                self.assertEqual(crashed["checkpoint_redo_lsn"], "0/20")
+                self.assertEqual(crashed["checkpoint_end_lsn"], "0/30")
+                self.assertEqual(crashed["fork_lsn"], "0/40")
+
+                class RecoveryFake(MODULE.BranchPreparer):
+                    def discover_recovery_services(self):
+                        self.writer_extension_schema = '"writer"'
+                        self.materializer_extension_schema = '"materializer"'
+                    def observe_materializer_pause(self):
+                        return "paused" if json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())["materializer_paused"] else "not paused"
+                    def observe_writer_mode(self):
+                        return json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())["writer_mode"]
+                    def observe_recovery_ownership(self):
+                        mode = self.observe_writer_mode()
+                        self.pause_owned = self.observe_materializer_pause() == "paused"
+                        self.writer_owned = mode in {"restricted", "stopped"}
+                        self.restricted_writer_running = mode == "restricted"
+                        self.branch_retention_generation = self.journal["retention_generation"]
+                        self.branch_retention_owned = True
+                        return mode
+                    def materializer_sql(self, sql):
+                        if "pg_get_wal_replay_pause_state" in sql:
+                            return "not paused"
+                        raise AssertionError(sql)
+                    def release_branch_retention(self):
+                        self.branch_retention_owned = False
+                        state = json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())
+                        state["retention_owned"] = False
+                        (self.config.prepared_dir.parent / "service-state.json").write_text(json.dumps(state))
+                    def resume_materializer(self):
+                        self.pause_owned = False
+                        state = json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())
+                        state["materializer_paused"] = False
+                        (self.config.prepared_dir.parent / "service-state.json").write_text(json.dumps(state))
+                    def restore_writer(self):
+                        self.writer_owned = False
+                        self.restricted_writer_running = False
+                        state = json.loads((self.config.prepared_dir.parent / "service-state.json").read_text())
+                        state["writer_mode"] = "normal"
+                        (self.config.prepared_dir.parent / "service-state.json").write_text(json.dumps(state))
+
+                recovered = RecoveryFake(config).execute()
+                self.assertEqual(recovered["state"], "complete")
+                self.assertFalse(recovered["retention_owned"])
+                self.assertTrue(recovered["materializer_resumed"])
+                self.assertTrue(recovered["writer_restored"])
+                service_state = json.loads((self.root / "service-state.json").read_text())
+                self.assertEqual(
+                    service_state,
+                    {"retention_owned": False, "materializer_paused": False, "writer_mode": "normal"},
+                )
+                self.assertEqual(
+                    (self.root / "prepare.calls").read_text(encoding="utf-8").count("0/10,0/20,0/40"),
+                    points.index((point, crashed_state)) + 1,
+                )
 
     def test_wait_does_not_swallow_cancellation(self):
         config = MODULE.Config.load(self.write_config())

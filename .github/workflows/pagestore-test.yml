@@ -263,5 +263,8 @@ jobs:
       - name: Run composed pagestore MVP golden scenario
         run: contrib/pagestore/mvp_golden_test.sh "$(pwd)/build"
 
+      - name: Run H1 branch controller prepared-receipt crash slice
+        run: meson test -C build pagestore_branch_prepare --print-errorlogs
+
       - name: Run end-to-end branch boot test
         run: contrib/pagestore/branch_boot_test.sh "$(pwd)/build"
