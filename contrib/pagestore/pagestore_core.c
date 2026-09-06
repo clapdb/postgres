@@ -103,6 +103,7 @@ static uint64_t inspection_published_epoch;
 static uint64_t inspection_next_refresh_ns;
 static volatile int inspection_timeline_cache_dirty = 1;
 static int inspection_timeline_cache_valid;
+static uint64_t inspection_timeline_cache_retention_epoch;
 static PsInspectionTimeline inspection_timeline_cache[PS_INSPECTION_MAX_TIMELINES];
 static int fork_meta_reclaim_baseline_init(void);
 static int ps_core_open_impl(const char *store_dir);
@@ -9014,6 +9015,12 @@ ps_core_set_metrics_header(PsShmHeader *hdr)
 		ps_backpressure_refresh();
 }
 
+void
+ps_core_inspection_refresh(void)
+{
+	publish_inspection_metrics(0);
+}
+
 static uint64_t
 inspection_now_ns(void)
 {
@@ -9040,16 +9047,12 @@ inspection_timeline_cache_changed(void)
 
 /* Build all PAGE_HISTORY horizons from one retention snapshot.  The walk from
  * each owner through its bounded ancestry projects that owner once onto every
- * ancestor, so periodic inspection refreshes reuse this immutable cache rather
- * than allocating and rescanning retention state once per timeline.  Caller
- * holds the map read lock. */
+ * ancestor.  The structural pass is deliberately the same live-descendant
+ * branch-fence rule as page_prune_fences().  Caller holds the map read lock. */
 static int
-refresh_inspection_timeline_cache(void)
+refresh_inspection_timeline_cache(const PsRetentionPin *pins,
+								  uint32_t npins, int retention_poisoned)
 {
-	PsRetentionDiagnostic diagnostic;
-	PsRetentionPin *pins = NULL;
-	uint32_t npins = 0;
-
 	memset(inspection_timeline_cache, 0,
 		   sizeof(inspection_timeline_cache));
 	for (uint32_t tl = 0; tl < PS_INSPECTION_MAX_TIMELINES; tl++)
@@ -9061,14 +9064,10 @@ refresh_inspection_timeline_cache(void)
 		inspection_timeline_cache[tl].fork_lsn = timelines[tl].branch_lsn;
 	}
 
-	if (ps_retention_diagnostic_snapshot(&diagnostic) != 0)
-		return -1;
 	/* The entry's ancestry is still useful for diagnosing a poisoned registry,
 	 * but no retention number may be presented as a healthy horizon. */
-	if (diagnostic.poisoned)
+	if (retention_poisoned)
 		return 0;
-	if (ps_retention_snapshot_alloc(&pins, &npins) != 0)
-		return -1;
 	for (uint32_t i = 0; i < npins; i++)
 	{
 		uint32_t current = pins[i].timeline;
@@ -9080,30 +9079,42 @@ refresh_inspection_timeline_cache(void)
 		{
 			if (current >= PS_INSPECTION_MAX_TIMELINES ||
 				!timelines[current].defined)
-			{
-				free(pins);
 				return -1;
-			}
 			retention_floor_add(projected,
 						   &inspection_timeline_cache[current].retained_horizon);
 			if (timelines[current].parent < 0)
 				break;
 			if (timelines[current].parent >= PS_INSPECTION_MAX_TIMELINES)
-			{
-				free(pins);
 				return -1;
-			}
 			if (timelines[current].branch_lsn < projected)
 				projected = timelines[current].branch_lsn;
 			current = (uint32_t) timelines[current].parent;
 			if (hops == PS_INSPECTION_MAX_TIMELINES)
-			{
-				free(pins);
 				return -1;
-			}
 		}
 	}
-	free(pins);
+	for (uint32_t target = 0; target < PS_INSPECTION_MAX_TIMELINES; target++)
+	{
+		if (!timelines[target].defined)
+			continue;
+		for (uint32_t candidate = 0;
+			 candidate < PS_INSPECTION_MAX_TIMELINES; candidate++)
+		{
+			uint64_t cap = UINT64_MAX;
+			PsTimelineState state;
+
+			if (candidate == target || !timelines[candidate].defined ||
+				!ps_timeline_state(candidate, &state, NULL) ||
+				state == PS_TIMELINE_DELETED ||
+				!retention_project_lsn(candidate, target, &cap))
+				continue;
+			/* This is the structural candidate loop from page_prune_fences():
+			 * every live descendant retains its projected branch fence, even
+			 * without an explicit owner pin. */
+			retention_floor_add(cap,
+							 &inspection_timeline_cache[target].retained_horizon);
+		}
+	}
 	return 0;
 }
 
@@ -9111,7 +9122,12 @@ static void
 publish_inspection_metrics(int force)
 {
 	PsInspectionMetrics snapshot;
+	PsRetentionDiagnostic retention_diagnostic;
+	PsRetentionPin *retention_pins = NULL;
 	PsShmHeader *hdr;
+	uint32_t retention_npins = 0;
+	uint64_t retention_epoch = 0;
+	int retention_snapshot_ok;
 	uint64_t now = inspection_now_ns();
 	uint64_t epoch = __atomic_load_n(&inspection_mutation_epoch,
 									 __ATOMIC_ACQUIRE);
@@ -9139,11 +9155,22 @@ publish_inspection_metrics(int force)
 	 * MAX_TIMELINES and the current layer-map capacity; it never allocates. */
 	if (map_locks_ready)
 		ps_lock_map_rd();
+	/* Take owners and pins under one retention mutex acquisition.  The map read
+	 * lock also keeps the timeline ancestry used below stable for this view. */
+	retention_snapshot_ok =
+		ps_retention_snapshot_alloc_with_diagnostic(&retention_pins,
+											 &retention_npins,
+											 &retention_diagnostic,
+											 &retention_epoch) == 0;
 	if (__atomic_exchange_n(&inspection_timeline_cache_dirty, 0,
-								__ATOMIC_ACQ_REL) || !inspection_timeline_cache_valid)
+								__ATOMIC_ACQ_REL) || !inspection_timeline_cache_valid ||
+		inspection_timeline_cache_retention_epoch != retention_epoch ||
+		!retention_snapshot_ok)
 	{
-		inspection_timeline_cache_valid =
-			refresh_inspection_timeline_cache() == 0;
+		inspection_timeline_cache_valid = retention_snapshot_ok &&
+			refresh_inspection_timeline_cache(retention_pins, retention_npins,
+											 retention_diagnostic.poisoned) == 0;
+		inspection_timeline_cache_retention_epoch = retention_epoch;
 		if (!inspection_timeline_cache_valid)
 			memset(inspection_timeline_cache, 0,
 				   sizeof(inspection_timeline_cache));
@@ -9198,19 +9225,19 @@ publish_inspection_metrics(int force)
 		ps_unlock_shard(shard);
 	}
 
+	if (retention_snapshot_ok)
 	{
-		PsRetentionDiagnostic diagnostic;
-
-		if (ps_retention_diagnostic_snapshot(&diagnostic) == 0)
-		{
-			snapshot.owner_count = diagnostic.owner_count;
-			snapshot.page_history_owners = diagnostic.page_history_owners;
-			snapshot.wal_owners = diagnostic.wal_owners;
-			snapshot.wal_index_owners = diagnostic.wal_index_owners;
-			snapshot.max_generation = diagnostic.max_generation;
-			snapshot.retention_poisoned = diagnostic.poisoned != 0;
-		}
+		snapshot.owner_count = retention_diagnostic.owner_count;
+		snapshot.page_history_owners =
+			retention_diagnostic.page_history_owners;
+		snapshot.wal_owners = retention_diagnostic.wal_owners;
+		snapshot.wal_index_owners = retention_diagnostic.wal_index_owners;
+		snapshot.max_generation = retention_diagnostic.max_generation;
+		snapshot.retention_poisoned = retention_diagnostic.poisoned != 0;
 	}
+	else
+		snapshot.retention_poisoned = 1;
+	free(retention_pins);
 
 	snapshot.metadata_poisoned = timeline_meta_poisoned_load() != 0;
 	snapshot.manifest_poisoned = ps_manifest_poisoned() != 0;
@@ -9306,12 +9333,11 @@ ps_core_inspection_request_complete(PsOpcode opcode, uint32_t status)
 			 * inspector is allowed to observe the new immutable view now.  Mark
 			 * even failed retention completions: an ambiguous append poisons the
 			 * registry and must not leave healthy-looking counts published. */
-			if (opcode == PS_OP_CREATE_BRANCH ||
-				opcode == PS_OP_BEGIN_DELETE ||
-				status == PS_STATUS_OK || status == PS_STATUS_STALE)
-				inspection_timeline_cache_changed();
-			else
-				inspection_metrics_changed();
+			/* Retention failures can poison the registry without advancing its
+			 * mutation epoch (for example an exact retry whose log changed).
+			 * Rebuild the timeline cache on every retention completion so a
+			 * poisoned view cannot retain previously published horizons. */
+			inspection_timeline_cache_changed();
 			publish_inspection_metrics(1);
 			return;
 		default:

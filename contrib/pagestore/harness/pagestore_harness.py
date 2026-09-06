@@ -1903,6 +1903,7 @@ def run_daemon_fault_recovery(
         # Recovery is intentionally followed by one additional clean restart.
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
+        probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
         emit("process_stop", target="store", pid=process.pid,
@@ -1910,6 +1911,7 @@ def run_daemon_fault_recovery(
         remove_shm(shm)
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
+        probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")
     except Exception as error:

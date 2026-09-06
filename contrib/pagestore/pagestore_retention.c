@@ -291,6 +291,34 @@ retention_active_count(void)
 	return count;
 }
 
+/* Caller holds retention_lock. */
+static void
+retention_diagnostic_fill_locked(PsRetentionDiagnostic *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (retention_is_poisoned)
+	{
+		out->poisoned = 1;
+		return;
+	}
+	for (uint32_t i = 0; i < retention_npins; i++)
+	{
+		const PsRetentionPin *pin = &retention_pins[i];
+
+		if (!retention_pin_active(pin))
+			continue;
+		out->owner_count++;
+		if (pin->resources & PS_RETENTION_RESOURCE_PAGE_HISTORY)
+			out->page_history_owners++;
+		if (pin->resources & PS_RETENTION_RESOURCE_WAL)
+			out->wal_owners++;
+		if (pin->resources & PS_RETENTION_RESOURCE_WAL_INDEX)
+			out->wal_index_owners++;
+		if (pin->generation > out->max_generation)
+			out->max_generation = pin->generation;
+	}
+}
+
 /* Exact retries must still notice a lost, truncated, or replaced log. */
 static int
 retention_log_matches(void)
@@ -1199,29 +1227,8 @@ ps_retention_diagnostic_snapshot(PsRetentionDiagnostic *out)
 {
 	if (out == NULL)
 		return -1;
-	memset(out, 0, sizeof(*out));
 	pthread_mutex_lock(&retention_lock);
-	if (retention_is_poisoned)
-		out->poisoned = 1;
-	else
-	{
-		for (uint32_t i = 0; i < retention_npins; i++)
-		{
-			const PsRetentionPin *pin = &retention_pins[i];
-
-			if (!retention_pin_active(pin))
-				continue;
-			out->owner_count++;
-			if (pin->resources & PS_RETENTION_RESOURCE_PAGE_HISTORY)
-				out->page_history_owners++;
-			if (pin->resources & PS_RETENTION_RESOURCE_WAL)
-				out->wal_owners++;
-			if (pin->resources & PS_RETENTION_RESOURCE_WAL_INDEX)
-				out->wal_index_owners++;
-			if (pin->generation > out->max_generation)
-				out->max_generation = pin->generation;
-		}
-	}
+	retention_diagnostic_fill_locked(out);
 	pthread_mutex_unlock(&retention_lock);
 	return 0;
 }
@@ -1401,6 +1408,55 @@ ps_retention_snapshot_alloc(PsRetentionPin **pins_out, uint32_t *count_out)
 	*pins_out = snapshot;
 	rc = 0;
 done:
+	pthread_mutex_unlock(&retention_lock);
+	return rc;
+}
+
+int
+ps_retention_snapshot_alloc_with_diagnostic(PsRetentionPin **pins_out,
+											 uint32_t *count_out,
+											 PsRetentionDiagnostic *diagnostic_out,
+											 uint64_t *epoch_out)
+{
+	PsRetentionPin *snapshot = NULL;
+	uint32_t	count = 0;
+	int			rc = -1;
+
+	if (pins_out == NULL || count_out == NULL || diagnostic_out == NULL ||
+		epoch_out == NULL)
+		return -1;
+	*pins_out = NULL;
+	*count_out = 0;
+	*epoch_out = 0;
+	memset(diagnostic_out, 0, sizeof(*diagnostic_out));
+
+	pthread_mutex_lock(&retention_lock);
+	*epoch_out = retention_mutation_epoch;
+	retention_diagnostic_fill_locked(diagnostic_out);
+	if (retention_is_poisoned)
+	{
+		/* The poison bit is the useful result; no caller may consume a partial
+		 * pin array as if it were a healthy snapshot. */
+		rc = 0;
+		goto done;
+	}
+	count = retention_active_count();
+	if (count != 0)
+	{
+		snapshot = malloc((size_t) count * sizeof(*snapshot));
+		if (snapshot == NULL)
+			goto done;
+		count = 0;
+		for (uint32_t i = 0; i < retention_npins; i++)
+			if (retention_pin_active(&retention_pins[i]))
+				snapshot[count++] = retention_pins[i];
+	}
+	*pins_out = snapshot;
+	*count_out = count;
+	rc = 0;
+done:
+	if (rc != 0)
+		free(snapshot);
 	pthread_mutex_unlock(&retention_lock);
 	return rc;
 }

@@ -353,6 +353,7 @@ class PlanValidationTests(unittest.TestCase):
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
         calls = []
+        inspection_probes = []
 
         class FakeProcess:
             next_pid = 700
@@ -392,6 +393,10 @@ class PlanValidationTests(unittest.TestCase):
             mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
             mock.patch.object(MODULE, "inspect_store", return_value=health),
             mock.patch.object(MODULE, "validate_runtime_health"),
+            mock.patch.object(
+                MODULE, "probe_runtime_inspection",
+                side_effect=lambda *args: inspection_probes.append(args),
+            ),
             mock.patch.object(MODULE, "signal_process_group"),
             mock.patch.object(MODULE, "remove_shm"),
         ):
@@ -400,6 +405,13 @@ class PlanValidationTests(unittest.TestCase):
                 ROOT / "capabilities.json",
             )
         self.assertEqual([call[1] for call in calls], [True, False, False])
+        self.assertEqual(len(inspection_probes), 2)
+        self.assertEqual(
+            [probe[0] for probe in inspection_probes],
+            [Path("inspect").resolve()] * 2,
+        )
+        self.assertEqual([probe[2] for probe in inspection_probes], [capabilities] * 2)
+        self.assertNotEqual(inspection_probes[0][1], inspection_probes[1][1])
         self.assertTrue(calls[0][2])
         self.assertTrue(Path(calls[0][3][0]).is_absolute())
         self.assertTrue(

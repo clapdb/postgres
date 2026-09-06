@@ -4049,6 +4049,14 @@ run_retention_suite(const char *daemon_path, const char *tmpbase)
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_PAGE_HISTORY, &floor) ==
 		  PS_STATUS_OK && floor == 4000,
 		  "a child fork point does not lower the operational page floor");
+	{
+		char output[256];
+
+		check(run_inspector_timeline(shm, 0, output, sizeof(output)) &&
+			  strcmp(output, "{\"parent_timeline\":-1,\"fork_lsn\":0,"
+						 "\"retained_horizon\":1500}\n") == 0,
+			  "timeline inspection includes the live child's structural page fence");
+	}
 	check(op_retention_floor(0, PS_RETENTION_RESOURCE_WAL_INDEX, &floor) ==
 		  PS_STATUS_OK && floor == 1500,
 		  "a child fork point structurally pins the parent WAL index");

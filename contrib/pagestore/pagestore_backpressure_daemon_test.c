@@ -460,6 +460,25 @@ run_test(const char *daemon_path)
 	if (ps_load_acquire(&reader->claimed) == 0 ||
 		ps_load_acquire(&pending->claimed) == 0)
 		goto cleanup;
+	{
+		uint64_t before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
+		int refreshed = 0;
+
+		/* A maintenance pause suppresses reclaim, not the documented inspection
+		 * publication cadence.  Wait long enough to observe a post-startup
+		 * publication while the pause file remains present. */
+		for (int i = 0; i < 1000; i++)
+		{
+			sleep_ms(1);
+			if (ps_load_acquire_u64(&hdr->inspection_metrics_seq) != before)
+			{
+				refreshed = 1;
+				break;
+			}
+		}
+		check(refreshed,
+			  "maintenance pause keeps inspection metrics within the refresh cadence");
+	}
 
 	for (int i = 0; i < 500; i++)
 	{

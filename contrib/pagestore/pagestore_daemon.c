@@ -897,6 +897,9 @@ maintenance_worker(void *arg)
 		if (maintenance_pause_file != NULL &&
 			access(maintenance_pause_file, F_OK) == 0)
 		{
+			/* The core's diagnostic publisher owns the 100 ms cadence.  This
+			 * entry point performs no reclaim, compaction, or tiering work. */
+			ps_core_inspection_refresh();
 			ps_backpressure_refresh();
 			{
 				struct timespec ts = {0, 1000000};

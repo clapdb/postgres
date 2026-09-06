@@ -49,6 +49,17 @@ typedef struct PsRetentionDiagnostic
 	int			poisoned;
 } PsRetentionDiagnostic;
 
+/* Allocate one coherent view of the registry.  The pins and diagnostic
+ * counters are copied while retention_lock is held and therefore describe
+ * the same mutation epoch.  A poisoned registry returns success with a NULL
+ * pin array and diagnostic.poisoned set, so callers can publish a fail-closed
+ * result without mistaking an empty registry for a healthy one. */
+extern int ps_retention_snapshot_alloc_with_diagnostic(
+									PsRetentionPin **pins_out,
+									uint32_t *count_out,
+									PsRetentionDiagnostic *diagnostic_out,
+									uint64_t *epoch_out);
+
 /* Returns a coherent diagnostic result.  Counts are zero when poisoned; the
  * caller must use poisoned, rather than interpreting zero as a healthy empty
  * registry. */
