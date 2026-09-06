@@ -97,6 +97,16 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "unsupported crash model"):
             MODULE.validate_plan(MODULE.read_plan(path), CAPABILITIES)
 
+    def test_seed_must_fit_fault_report_integer_contract(self):
+        for seed in (0, 2**63 - 1):
+            records = [self.header()]
+            records[0]["seed"] = seed
+            MODULE.validate_plan(MODULE.read_plan(self.write_plan(records)), CAPABILITIES)
+        records = [self.header()]
+        records[0]["seed"] = 2**63
+        with self.assertRaisesRegex(MODULE.PlanError, "bounded non-negative integer"):
+            MODULE.validate_plan(MODULE.read_plan(self.write_plan(records)), CAPABILITIES)
+
     def test_named_fault_catalog_validates_target_model_action_and_hit(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([
@@ -153,6 +163,85 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "finite and positive"):
             MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
+    def test_set_fault_accepts_a_bounded_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-error", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "set_fault", "id": "fault", "target": "store",
+                "fault": "daemon.after_ready", "action": "error", "hit": 1,
+                "timeout": 2.5,
+            },
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_pause_timeout_must_fit_registry_watchdog(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for timeout in (0.0009, 300.001):
+            path = self.write_plan([
+                {
+                    "schema": 1, "scenario": "daemon-fault-pause", "seed": 1,
+                    "contracts": ["fault_reachability"],
+                    "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+                },
+                {
+                    "op": "set_fault", "id": "fault", "target": "store",
+                    "fault": "daemon.after_ready", "action": "pause", "hit": 1,
+                    "timeout": timeout,
+                },
+                {
+                    "op": "release_fault", "id": "release", "target": "store",
+                    "fault": "daemon.after_ready",
+                },
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+        crash_path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-pause", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "daemon.after_ready",
+                "action": "pause", "hit": 1, "timeout": 301,
+            },
+            {
+                "op": "release_fault", "id": "release", "target": "store",
+                "fault": "daemon.after_ready",
+            },
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+            MODULE.validate_plan(MODULE.read_plan(crash_path), capabilities)
+
+    def test_named_fault_rejects_unencodable_scenario_identity(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        for scenario in ('bad"scenario', "bad\\scenario", "x" * 129):
+            path = self.write_plan([
+                {
+                    "schema": 1, "scenario": scenario, "seed": 1,
+                    "contracts": ["fault_reachability"],
+                    "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+                },
+                {
+                    "op": "set_fault", "id": "fault", "target": "store",
+                    "fault": "daemon.after_ready", "action": "error", "hit": 1,
+                },
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, "fault identity"):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_expected_error_exit_accepts_orderly_status_one(self):
+        self.assertTrue(MODULE.expected_error_exit("error", 1))
+        self.assertFalse(MODULE.expected_error_exit("error", -11))
+        self.assertFalse(MODULE.expected_error_exit("pause", 1))
+
     def test_fault_marker_is_created_atomically(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / "arm"
@@ -174,6 +263,77 @@ class PlanValidationTests(unittest.TestCase):
             report.write_text(json.dumps({"name": "wrong", "hit": 1}), encoding="utf-8")
             with self.assertRaises(MODULE.FaultNotReached):
                 MODULE._fault_report(report, "daemon.after_ready", 1, 123)
+
+    def test_catalog_action_list_and_legacy_single_action(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog = root / "faults.def"
+            catalog.write_text(
+                'PAGESTORE_FAULT_POINT(TEST, "test.fault", "store", '
+                '"process_abort", "crash|error|pause", 1, 1)\n'
+                'PAGESTORE_FAULT_POINT(OLD, "test.old", "store", '
+                '"process_abort", "crash", 1, 1)\n', encoding="utf-8",
+            )
+            capabilities = MODULE.read_json(ROOT / "capabilities.json")
+            capabilities["fault_catalog"] = catalog.name
+            entries = MODULE.fault_catalog(capabilities, root / "capabilities.json")
+            self.assertEqual(entries["test.fault"]["actions"], ("crash", "error", "pause"))
+            self.assertEqual(entries["test.old"]["actions"], ("crash",))
+
+    def test_error_report_requires_reach_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.json"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "test.fault", "action": "error",
+                "hit": 1, "pid": 123,
+            }), encoding="utf-8")
+            with self.assertRaises(MODULE.FaultNotReached):
+                MODULE._fault_report(report, "test.fault", 1, 123, "error")
+            report.write_text(json.dumps({
+                "schema": 1, "scenario": "s", "seed": 9, "fault": "test.fault",
+                "action": "error", "hit": 1, "pid": 123, "operation": "op",
+            }), encoding="utf-8")
+            self.assertEqual(
+                MODULE._fault_report(report, "test.fault", 1, 123, "error", "s", 9, "op")["hit"],
+                1,
+            )
+
+    def test_pause_release_marker_is_safe_regular_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "release"
+            MODULE._atomic_release_marker(marker)
+            self.assertTrue(marker.is_file())
+            self.assertFalse(marker.is_symlink())
+            with self.assertRaises(FileExistsError):
+                MODULE._atomic_release_marker(marker)
+
+    def test_pause_timeout_report_is_structured(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "test.fault", "action": "pause",
+                "scenario": "s", "seed": 9, "hit": 1, "pid": 123,
+                "operation": "op", "state": "timeout", "watchdog_ms": 5000,
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "test.fault", 1, 123, "pause", "s", 9, "op", "timeout",
+            )
+            self.assertEqual(value["watchdog_ms"], 5000)
+
+    def test_pause_timeout_bundle_contains_actionable_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            control = root / "control"
+            control.mkdir()
+            diagnostic = MODULE._capture_fault_diagnostics(
+                root, control, root / "daemon.log", reason="watchdog",
+                scenario="s", seed=9, fault="test.fault", action="pause", hit=2,
+                operation="op", process=None,
+            )
+            value = json.loads(diagnostic.read_text(encoding="utf-8"))
+            self.assertEqual(value["fault"], "test.fault")
+            self.assertEqual(value["operation_id"], "op")
+            self.assertEqual(value["hit_count"], 2)
 
     def test_fault_runtime_arms_before_popen_and_restarts_twice(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")

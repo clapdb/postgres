@@ -49,6 +49,13 @@ class UnexpectedExit(PlanError):
     """A faulted process exited for a reason other than the expected abort."""
 
 
+FAULT_ACTIONS = {"crash", "error", "pause"}
+FAULT_REPORT_FIELDS = {
+    "schema", "scenario", "seed", "fault", "action", "hit", "pid", "operation",
+}
+FAULT_REPORT_MAX_BYTES = 4096
+
+
 def fault_failure_classification(error: Exception) -> str:
     if isinstance(error, FaultNotReached):
         return "fault_not_reached"
@@ -59,12 +66,21 @@ def fault_failure_classification(error: Exception) -> str:
     return "setup"
 
 
+def expected_error_exit(action: str, returncode: int | None) -> bool:
+    return action == "error" and returncode == 1
+
+
 class EventLog:
     """Append-only event stream retained as part of every run bundle."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, context: dict[str, Any] | None = None) -> None:
         self.path = path
         self.sequence = 0
+        self.context = {
+            "scenario": None, "seed": None, "fault": None, "action": None,
+            "hit": None, "hit_count": None, "operation": None,
+            "operation_id": None, **(context or {}),
+        }
 
     def emit(self, event: str, **fields: Any) -> None:
         self.sequence += 1
@@ -73,8 +89,17 @@ class EventLog:
             "event": event,
             "monotonic_ns": time.monotonic_ns(),
             "wall_time": time.time(),
+            **self.context,
             **fields,
         }
+        if record.get("operation_id") is None and record.get("action_id") is not None:
+            record["operation_id"] = record["action_id"]
+        if record.get("operation") is None and record.get("operation_id") is not None:
+            record["operation"] = record["operation_id"]
+        if record.get("fault") is None and record.get("name") is not None:
+            record["fault"] = record["name"]
+        if record.get("hit_count") is None and record.get("hit") is not None:
+            record["hit_count"] = record["hit"]
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
 
@@ -116,7 +141,7 @@ ACTION_FIELDS = {
     "parallel": {"op", "id", "lanes", "barrier", "extra"},
     "wait": {"op", "id", "target", "predicate", "timeout", "extra"},
     "sync": {"op", "id", "target", "kind", "extra"},
-    "set_fault": {"op", "id", "target", "fault", "action", "hit", "extra"},
+    "set_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "extra"},
     "release_fault": {"op", "id", "target", "fault", "extra"},
     "capture": {"op", "id", "target", "kind", "name", "horizon", "extra"},
     "compare": {"op", "id", "left", "right", "extra"},
@@ -277,7 +302,7 @@ def fault_catalog(
         r'^PAGESTORE_FAULT_POINT\('
         r'([A-Z][A-Z0-9_]*),\s*"([a-z][a-z0-9_.-]*)",\s*'
         r'"([a-z][a-z0-9_-]*)",\s*"([a-z][a-z0-9_-]*)",\s*'
-        r'"([a-z]+)",\s*([1-9][0-9]*),\s*([0-9]+)\)$'
+        r'"([a-z]+(?:\s*\|\s*[a-z]+)*)",\s*([1-9][0-9]*),\s*([0-9]+)\)$'
     )
     symbols: set[str] = set()
     for number, raw in enumerate(lines, start=1):
@@ -287,7 +312,17 @@ def fault_catalog(
         match = pattern.fullmatch(line)
         if match is None:
             raise PlanError(f"fault catalog {path}:{number}: invalid record")
-        symbol, name, target, model, action, hit_text, max_hit_text = match.groups()
+        symbol, name, target, model, action_text, hit_text, max_hit_text = match.groups()
+        actions = tuple(part.strip() for part in action_text.split("|"))
+        configured_actions = capabilities.get("fault_actions", sorted(FAULT_ACTIONS))
+        if not isinstance(configured_actions, list) or not all(
+            isinstance(item, str) and item in FAULT_ACTIONS for item in configured_actions
+        ):
+            raise PlanError("capabilities: fault_actions must be a supported action subset")
+        if not actions or len(set(actions)) != len(actions) or any(
+            item not in set(configured_actions) for item in actions
+        ):
+            raise PlanError(f"fault catalog {path}:{number}: invalid action list")
         hit = int(hit_text, 10)
         max_hit = int(max_hit_text, 10)
         if hit <= 0 or hit > 2**63 - 1:
@@ -300,13 +335,12 @@ def fault_catalog(
         computes = capabilities.get("compute", [])
         if isinstance(computes, list) and target != "store" and target not in computes:
             raise PlanError(f"fault catalog {path}:{number}: unknown target {target!r}")
-        if action != "crash":
-            raise PlanError(f"fault catalog {path}:{number}: unknown action {action!r}")
         if name in entries or symbol in symbols:
             raise PlanError(f"fault catalog {path}:{number}: duplicate fault name or symbol")
         symbols.add(symbol)
         entries[name] = {"name": name, "target": target, "model": model,
-                         "action": action, "hit": hit, "max_hit": max_hit,
+                         "action": actions[0] if len(actions) == 1 else action_text,
+                         "actions": actions, "hit": hit, "max_hit": max_hit,
                          "symbol": symbol}
     if not entries:
         raise PlanError(f"fault catalog {path}: no fault points")
@@ -315,7 +349,7 @@ def fault_catalog(
 
 def validate_fault_action(
     action: dict[str, Any], capabilities: dict[str, Any], context: str,
-    catalog_path: Path | None = None,
+    catalog_path: Path | None = None, *, require_model: bool = True,
 ) -> None:
     """Validate a crash action against the named fault catalog."""
     name = action.get("fault")
@@ -334,16 +368,17 @@ def validate_fault_action(
         or action["hit"] <= 0 or action["hit"] > 2**63 - 1
     ):
         raise PlanError(f"{context}: named fault hit must be a bounded positive integer")
-    for field in ("target", "model"):
+    for field in ("target",) + (("model",) if require_model else ()):
         if action.get(field) != entry[field]:
             raise PlanError(
                 f"{context}: fault {name!r} requires {field}={entry[field]!r}, "
                 f"got {action.get(field)!r}"
             )
     action_name = action["action"]
-    if action_name != entry["action"]:
+    if action_name not in set(entry["actions"]):
         raise PlanError(
-            f"{context}: fault {name!r} requires action={entry['action']!r}, "
+            f"{context}: fault {name!r} allows action(s)="
+            f"{'|'.join(entry['actions'])!r}, "
             f"got {action_name!r}"
         )
     hit = action["hit"]
@@ -387,7 +422,7 @@ PG_CONTROL_FILE_SIZE = 8192
 
 RUNTIME_OPERATIONS = {
     "daemon_smoke": {"crash"},
-    "daemon_fault_smoke": {"crash"},
+    "daemon_fault_smoke": {"crash", "set_fault", "release_fault"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
@@ -404,6 +439,8 @@ RUNTIME_CONSTRAINTS = {
     },
     "daemon_fault_smoke": {
         "crash": {},
+        "set_fault": {},
+        "release_fault": {"target": ["store"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -665,15 +702,26 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
     elif runtime == "daemon_fault_smoke":
         named = [
             action for action in plan.actions
-            if action["op"] == "crash" and "fault" in action
+            if action["op"] in ("crash", "set_fault") and "fault" in action
         ]
         if len(named) != 1 or any(
             action["op"] == "crash" and "fault" not in action
             for action in plan.actions
         ):
             raise PlanError(
-                "runtime daemon_fault_smoke requires exactly one named crash action"
+                "runtime daemon_fault_smoke requires exactly one named fault action"
             )
+        fault = named[0]
+        releases = [
+            action for action in plan.actions
+            if action["op"] == "release_fault" and action["fault"] == fault["fault"]
+        ]
+        if fault["action"] == "pause" and len(releases) != 1:
+            raise PlanError(
+                "runtime daemon_fault_smoke requires one release_fault for a pause"
+            )
+        if fault["action"] != "pause" and releases:
+            raise PlanError("runtime daemon_fault_smoke only releases pause faults")
 
 
 def validate_runtime_health(
@@ -815,6 +863,22 @@ def reject_unknown_fields(record: dict[str, Any], allowed: set[str], context: st
         raise PlanError(f"{context}: extra must be an object")
 
 
+def validate_fault_identity(value: str, field: str, context: str) -> None:
+    """Match the bounded, directly JSON-embeddable C fault identity contract."""
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise PlanError(f"{context}: {field} is not valid UTF-8") from error
+    if (
+        not encoded or len(encoded) > 128 or '"' in value or "\\" in value
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise PlanError(
+            f"{context}: {field} must be a 1..128-byte fault identity without "
+            "quotes, backslashes, or control characters"
+        )
+
+
 def validate_plan(
     plan: Plan, capabilities: dict[str, Any], catalog_path: Path | None = None,
 ) -> None:
@@ -825,8 +889,11 @@ def validate_plan(
         raise PlanError(f"{context}: header schema must be 1")
     require_string(header, "scenario", context)
     seed = header.get("seed")
-    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
-        raise PlanError(f"{context}: seed must be a non-negative integer")
+    if (
+        not isinstance(seed, int) or isinstance(seed, bool)
+        or seed < 0 or seed > 2**63 - 1
+    ):
+        raise PlanError(f"{context}: seed must be a bounded non-negative integer")
     contracts = header.get("contracts")
     if not isinstance(contracts, list) or not contracts or not all(
         isinstance(contract, str) and contract for contract in contracts
@@ -857,6 +924,7 @@ def validate_plan(
     operations = capability_values(capabilities, "operations")
     action_ids: set[str] = set()
     boundaries: set[str] = set()
+    armed_fault_actions: dict[str, str] = {}
     for number, action in enumerate(plan.actions, start=2):
         action_context = f"{context}:{number}"
         operation = require_string(action, "op", action_context)
@@ -874,7 +942,7 @@ def validate_plan(
         for field in REQUIRED_FIELDS[operation]:
             if field not in action:
                 raise PlanError(f"{action_context}: missing required field {field!r}")
-        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect"}:
+        for field in REQUIRED_FIELDS[operation] - {"lanes", "steps", "expect", "hit"}:
             require_string(action, field, action_context)
         if operation == "assert" and not isinstance(action["expect"], str):
             raise PlanError(f"{action_context}: expect must be a string")
@@ -913,20 +981,40 @@ def validate_plan(
             if model not in capability_values(capabilities, "crash_models"):
                 raise PlanError(f"{action_context}: unsupported crash model {model!r}")
             if "fault" in action:
+                validate_fault_identity(header["scenario"], "scenario", context)
                 validate_fault_action(action, capabilities, action_context, catalog_path)
+                armed_fault_actions[action["fault"]] = action["action"]
             elif "action" in action or "hit" in action:
                 raise PlanError(
                     f"{action_context}: crash action/hit fields require a named fault"
                 )
-        elif operation in ("set_fault", "release_fault"):
+        elif operation == "set_fault":
             name = require_string(action, "fault", action_context)
-            if name not in fault_catalog(capabilities, catalog_path):
+            validate_fault_identity(header["scenario"], "scenario", context)
+            validate_fault_action(
+                action, capabilities, action_context, catalog_path, require_model=False,
+            )
+            armed_fault_actions[name] = action["action"]
+        elif operation == "release_fault":
+            name = require_string(action, "fault", action_context)
+            entry = fault_catalog(capabilities, catalog_path).get(name)
+            if entry is None:
                 raise PlanError(f"{action_context}: unknown fault {name!r}")
+            if action.get("target") != entry["target"]:
+                raise PlanError(
+                    f"{action_context}: fault {name!r} requires target={entry['target']!r}, "
+                    f"got {action.get('target')!r}"
+                )
+            if armed_fault_actions.get(name) != "pause":
+                raise PlanError(
+                    f"{action_context}: release_fault requires an earlier pause action "
+                    f"for fault {name!r}"
+                )
         if operation == "advance":
             steps = action["steps"]
             if not isinstance(steps, int) or isinstance(steps, bool) or steps <= 0:
                 raise PlanError(f"{action_context}: steps must be a positive integer")
-        if operation == "crash" and "timeout" in action:
+        if operation in ("crash", "set_fault") and "timeout" in action:
             timeout = action["timeout"]
             if (
                 not isinstance(timeout, (int, float))
@@ -935,6 +1023,12 @@ def validate_plan(
                 or timeout <= 0
             ):
                 raise PlanError(f"{action_context}: timeout must be finite and positive")
+            if action.get("action") == "pause" and (
+                timeout < 0.001 or timeout > 300.0
+            ):
+                raise PlanError(
+                    f"{action_context}: pause timeout must map to 1..300000 milliseconds"
+                )
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
@@ -1172,6 +1266,11 @@ def _atomic_arm_marker(path: Path) -> None:
         os.close(fd)
 
 
+def _atomic_release_marker(path: Path) -> None:
+    """Create the regular-file marker used to release a paused fault."""
+    _atomic_arm_marker(path)
+
+
 def _cleanup_fault_control(control: Path) -> None:
     """Remove only a real control directory; preserve other diagnostics."""
     try:
@@ -1217,6 +1316,9 @@ def _disarm_fault_control(control: Path) -> None:
 
 def _fault_report(
     path: Path, expected_name: str, expected_hit: int, expected_pid: int,
+    expected_action: str = "crash", expected_scenario: str | None = None,
+    expected_seed: int | None = None, expected_operation: str | None = None,
+    expected_state: str | None = None,
 ) -> dict[str, Any]:
     try:
         file_stat = path.lstat()
@@ -1225,7 +1327,7 @@ def _fault_report(
     if path.is_symlink() or not stat.S_ISREG(file_stat.st_mode):
         raise FaultNotReached(f"fault report {path} is not a regular file")
     try:
-        if file_stat.st_size <= 0 or file_stat.st_size > 4096:
+        if file_stat.st_size <= 0 or file_stat.st_size > FAULT_REPORT_MAX_BYTES:
             raise ValueError("report size is outside the bounded schema")
         lines = path.read_text(encoding="utf-8").splitlines()
         if len(lines) != 1 or not lines[0].strip():
@@ -1235,11 +1337,25 @@ def _fault_report(
         raise FaultNotReached(f"fault report {path} is missing or invalid: {error}") from error
     if not isinstance(value, dict):
         raise FaultNotReached("fault report must be an object")
-    if set(value) != {"schema", "name", "action", "hit", "pid"}:
+    legacy_keys = {"schema", "name", "action", "hit", "pid"}
+    extended_keys = FAULT_REPORT_FIELDS
+    extended_name_keys = (extended_keys - {"fault"}) | {"name"}
+    extended_both_keys = extended_keys | {"name"}
+    pause_suffix = {"state", "watchdog_ms"}
+    allowed_key_sets = {
+        frozenset(legacy_keys), frozenset(extended_keys),
+        frozenset(extended_name_keys), frozenset(extended_both_keys),
+    }
+    if expected_action == "pause":
+        allowed_key_sets |= {frozenset(keys | pause_suffix) for keys in (
+            extended_keys, extended_name_keys, extended_both_keys,
+        )}
+    if frozenset(value) not in allowed_key_sets:
         raise FaultNotReached("fault report has unexpected keys")
+    fault_name = value.get("fault", value.get("name"))
     if (
         value["schema"] != 1 or isinstance(value["schema"], bool)
-        or value["name"] != expected_name or value["action"] != "crash"
+        or fault_name != expected_name or value["action"] != expected_action
         or value["hit"] != expected_hit or isinstance(value["hit"], bool)
         or not isinstance(value["hit"], int) or value["hit"] <= 0
         or value["hit"] > 2**63 - 1
@@ -1248,7 +1364,73 @@ def _fault_report(
         or value["pid"] > 2**31 - 1
     ):
         raise FaultNotReached("fault report fields do not match expected fault")
+    is_extended = "scenario" in value
+    if is_extended:
+        if (
+            expected_scenario is not None and value["scenario"] != expected_scenario
+            or expected_seed is not None and value["seed"] != expected_seed
+            or expected_operation is not None and value["operation"] != expected_operation
+        ):
+            raise FaultNotReached("fault report metadata does not match expected operation")
+        if expected_action == "pause":
+            state = expected_state or "reached"
+            watchdog_ms = value.get("watchdog_ms")
+            if (
+                value.get("state") != state or isinstance(watchdog_ms, bool)
+                or not isinstance(watchdog_ms, int)
+                or (state == "reached" and watchdog_ms != 0)
+                or (state == "timeout" and watchdog_ms <= 0)
+            ):
+                raise FaultNotReached(
+                    f"pause fault report does not describe the {state} state"
+                )
+    elif expected_action != "crash":
+        raise FaultNotReached(
+            f"fault report for action {expected_action!r} lacks extended metadata"
+        )
     return value
+
+
+def _capture_fault_diagnostics(
+    root: Path, control: Path, daemon_log: Path, *, reason: str,
+    scenario: str, seed: int, fault: str, action: str, hit: int,
+    operation: str, process: subprocess.Popen[str] | None,
+) -> Path:
+    diagnostics = {
+        "schema": 1, "reason": reason, "scenario": scenario, "seed": seed,
+        "fault": fault, "action": action, "hit": hit, "hit_count": hit,
+        "operation": operation, "operation_id": operation,
+        "pid": process.pid if process is not None else None,
+        "returncode": process.poll() if process is not None else None,
+        "control": str(control), "control_entries": [], "daemon_log": str(daemon_log),
+    }
+    try:
+        entries = []
+        if control.is_dir() and not control.is_symlink():
+            for child in sorted(control.iterdir()):
+                try:
+                    child_stat = child.lstat()
+                except OSError as error:
+                    entries.append({"name": child.name, "error": str(error)})
+                    continue
+                entries.append({
+                    "name": child.name, "mode": stat.S_IFMT(child_stat.st_mode),
+                    "size": child_stat.st_size, "regular": stat.S_ISREG(child_stat.st_mode),
+                    "symlink": stat.S_ISLNK(child_stat.st_mode),
+                })
+        diagnostics["control_entries"] = entries
+        (root / "fault-diagnostics.json").write_text(
+            json.dumps(diagnostics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError as error:
+        diagnostics["write_error"] = str(error)
+        try:
+            (root / "fault-diagnostics.json").write_text(
+                json.dumps(diagnostics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+    return root / "fault-diagnostics.json"
 
 
 def run_daemon_fault_recovery(
@@ -1266,6 +1448,8 @@ def run_daemon_fault_recovery(
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
     daemon = daemon.resolve()
     inspector = inspector.resolve()
+    validate_plan(plan, capabilities, capabilities_path)
+    validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
     root, temporary = run_root(requested_root)
     # The C fault registry rejects relative control paths. Resolve before
     # deriving store, trace, bundle, and control paths; ordinary daemon smoke
@@ -1295,22 +1479,48 @@ def run_daemon_fault_recovery(
         json.dumps(inspection_schema, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    events = EventLog(trace / "events.jsonl")
     scenario = plan.header["scenario"]
     seed = plan.header["seed"]
-    named_crashes = [
-        item for item in plan.actions if item["op"] == "crash" and "fault" in item
+    named_faults = [
+        item for item in plan.actions
+        if item["op"] in ("crash", "set_fault") and "fault" in item
     ]
-    if len(named_crashes) != 1 or any(
+    if len(named_faults) != 1 or any(
         item["op"] == "crash" and "fault" not in item for item in plan.actions
     ):
-        raise PlanError("daemon fault recovery requires exactly one named crash action")
-    action = named_crashes[0]
+        raise PlanError("daemon fault recovery requires exactly one named fault action")
+    action = named_faults[0]
     validate_fault_action(
         action, capabilities, f"{plan.path}:{action['id']}", capabilities_path,
+        require_model=action["op"] == "crash",
     )
     fault_name = action["fault"]
+    catalog_entry = fault_catalog(capabilities, capabilities_path)[fault_name]
+    fault_action = action["action"]
     fault_hit = action["hit"]
+    fault_timeout = float(action.get("timeout", timeout))
+    fault_model = action.get("model", catalog_entry["model"])
+    release_actions = [
+        item for item in plan.actions
+        if item["op"] == "release_fault" and item["fault"] == fault_name
+    ]
+    if fault_action == "pause" and len(release_actions) != 1:
+        raise PlanError("daemon fault pause requires exactly one release_fault action")
+    if fault_action != "pause" and release_actions:
+        raise PlanError("release_fault is only valid for a pause fault")
+    events = EventLog(
+        trace / "events.jsonl",
+        {"scenario": scenario, "seed": seed, "fault": fault_name,
+         "action": fault_action, "hit": fault_hit, "hit_count": fault_hit,
+         "operation": action["id"], "operation_id": action["id"]},
+    )
+    (root / "run.json").write_text(
+        json.dumps({"schema": 1, "scenario": scenario, "seed": seed,
+                    "fault": fault_name, "action": fault_action,
+                    "hit": fault_hit, "hit_count": fault_hit,
+                    "operation": action["id"], "operation_id": action["id"]},
+                   indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     generation = 0  # next generation; fault, recovery, clean restart: 0, 1, 2
     active_generation = 0
     process: subprocess.Popen[str] | None = None
@@ -1320,6 +1530,7 @@ def run_daemon_fault_recovery(
     daemon_log = trace / "daemon.log"
     marker = control / "arm"
     report = control / "report.jsonl"
+    release = control / "release"
     failure: Exception | None = None
     current_action_id: str | None = None
 
@@ -1328,6 +1539,12 @@ def run_daemon_fault_recovery(
         fields.setdefault("seed", seed)
         fields.setdefault("action_id", current_action_id)
         fields.setdefault("generation", active_generation)
+        fields.setdefault("fault", fault_name)
+        fields.setdefault("action", fault_action)
+        fields.setdefault("hit", fault_hit)
+        fields.setdefault("hit_count", fault_hit)
+        fields.setdefault("operation", current_action_id)
+        fields.setdefault("operation_id", current_action_id)
         events.emit(event, **fields)
 
     def start_daemon(inject_fault: bool, action_id: str | None = None) -> subprocess.Popen[str]:
@@ -1349,10 +1566,17 @@ def run_daemon_fault_recovery(
             # are removed by private_environment before this point.
             env.update({
                 "PAGESTORE_TEST_FAULT_NAME": fault_name,
-                "PAGESTORE_TEST_FAULT_ACTION": "crash",
+                "PAGESTORE_TEST_FAULT_ACTION": fault_action,
                 "PAGESTORE_TEST_FAULT_HIT": str(fault_hit),
                 "PAGESTORE_TEST_FAULT_DIR": str(control),
+                "PAGESTORE_TEST_FAULT_SCENARIO": scenario,
+                "PAGESTORE_TEST_FAULT_SEED": str(seed),
+                "PAGESTORE_TEST_FAULT_OPERATION": str(action["id"]),
             })
+            if fault_action == "pause":
+                env["PAGESTORE_TEST_FAULT_WATCHDOG_MS"] = str(
+                    math.ceil(fault_timeout * 1000.0)
+                )
         with daemon_log.open("a", encoding="utf-8") as log:
             daemon_process = subprocess.Popen(
                 command, stdout=log, stderr=subprocess.STDOUT, text=True,
@@ -1408,44 +1632,152 @@ def run_daemon_fault_recovery(
         current_action_id = action["id"]
         emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
         process = start_daemon(True, action["id"])
-        deadline = time.monotonic() + float(action.get("timeout", timeout))
-        while process.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if process.poll() is None:
-            raise HarnessTimeout(f"deadline waiting for fault {fault_name!r} expired")
-        if process.returncode != 88:
-            exit_status = process.returncode
-            emit(
-                "crash_exit", target="store", name=fault_name, action="crash",
-                hit=fault_hit, returncode=process.returncode,
-            )
-            emit(
-                "process_stop", target="store", pid=process.pid, name=fault_name,
-                action="crash", hit=fault_hit, returncode=process.returncode,
-            )
+        deadline = time.monotonic() + fault_timeout
+        if fault_action == "crash":
+            while process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if process.poll() is None:
+                raise FaultNotReached(
+                    f"deadline waiting for fault {fault_name!r} expired; expected crash was unhit"
+                )
+            if process.returncode != 88:
+                exit_status = process.returncode
+                emit("crash_exit", target="store", name=fault_name,
+                     returncode=process.returncode)
+                emit("process_stop", target="store", pid=process.pid, name=fault_name,
+                     returncode=process.returncode)
+                process = None
+                raise UnexpectedExit(
+                    f"fault {fault_name!r} exited with status {exit_status}, expected 88"
+                )
+            fault_process = process
             process = None
-            raise UnexpectedExit(
-                f"fault {fault_name!r} exited with status {exit_status}, expected 88"
+            emit("crash_exit", target="store", name=fault_name,
+                 returncode=fault_process.returncode)
+            emit("process_stop", target="store", pid=fault_process.pid, name=fault_name,
+                 returncode=fault_process.returncode)
+            result = _fault_report(
+                report, fault_name, fault_hit, fault_process.pid, fault_action,
+                scenario, seed, action["id"],
             )
-        fault_process = process
-        process = None
-        # The exit itself is evidence even if report validation fails. Keep
-        # these events before parsing so missing/corrupt reports retain a
-        # complete process lifecycle in the diagnostic bundle.
-        emit(
-            "crash_exit", target="store", name=fault_name, action="crash",
-            hit=fault_hit, returncode=fault_process.returncode,
-        )
-        emit(
-            "process_stop", target="store", pid=fault_process.pid, name=fault_name,
-            action="crash", hit=fault_hit, returncode=fault_process.returncode,
-        )
-        result = _fault_report(report, fault_name, fault_hit, fault_process.pid)
-        shutil.copy2(report, trace / "fault-report.jsonl")
-        emit("fault", target="store", name=fault_name, hit=fault_hit,
-             model=action["model"], returncode=fault_process.returncode, report=result)
-        remove_shm(shm)
-        shutil.rmtree(control)
+            shutil.copy2(report, trace / "fault-report.jsonl")
+            emit("fault", target="store", name=fault_name, model=fault_model,
+                 returncode=fault_process.returncode, report=result, reached=True)
+            remove_shm(shm)
+            shutil.rmtree(control)
+        else:
+            while time.monotonic() < deadline:
+                if report.exists():
+                    break
+                if process.poll() is not None:
+                    raise FaultNotReached(
+                        f"fault {fault_name!r} exited before its {fault_action} reached report"
+                    )
+                time.sleep(0.02)
+            if not report.exists():
+                _capture_fault_diagnostics(
+                    root, control, daemon_log,
+                    reason="fault watchdog expired before reached report",
+                    scenario=scenario, seed=seed, fault=fault_name,
+                    action=fault_action, hit=fault_hit, operation=action["id"],
+                    process=process,
+                )
+                raise FaultNotReached(
+                    f"fault {fault_name!r} watchdog expired; expected {fault_action} was unhit"
+                )
+            if fault_action == "pause" and process.poll() == 90:
+                _fault_report(
+                    report, fault_name, fault_hit, process.pid, fault_action,
+                    scenario, seed, action["id"], "timeout",
+                )
+                raise HarnessTimeout(
+                    f"fault {fault_name!r} pause watchdog expired before release"
+                )
+            if process.poll() is not None and not expected_error_exit(
+                fault_action, process.returncode,
+            ):
+                raise UnexpectedExit(
+                    f"fault {fault_name!r} {fault_action} report arrived after daemon exit"
+                )
+            try:
+                result = _fault_report(
+                    report, fault_name, fault_hit, process.pid, fault_action,
+                    scenario, seed, action["id"],
+                )
+            except FaultNotReached as reached_error:
+                if fault_action != "pause":
+                    raise
+                try:
+                    _fault_report(
+                        report, fault_name, fault_hit, process.pid, fault_action,
+                        scenario, seed, action["id"], "timeout",
+                    )
+                except FaultNotReached:
+                    raise reached_error
+                raise HarnessTimeout(
+                    f"fault {fault_name!r} pause watchdog expired before release"
+                ) from reached_error
+            shutil.copy2(report, trace / "fault-report.jsonl")
+            emit("fault_reached", target="store", name=fault_name, model=fault_model,
+                 report=result, reached=True)
+            if fault_action == "error":
+                while process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if process.poll() is None:
+                    raise HarnessTimeout(
+                        f"fault {fault_name!r} returned an error but daemon did not exit"
+                    )
+                if process.returncode != 1:
+                    raise UnexpectedExit(
+                        f"fault {fault_name!r} error exited with status "
+                        f"{process.returncode}, expected 1"
+                    )
+                emit("error_exit", target="store", name=fault_name,
+                     returncode=process.returncode)
+                emit("process_stop", target="store", pid=process.pid,
+                     returncode=process.returncode)
+                process = None
+            else:
+                current_action_id = release_actions[0]["id"]
+                _atomic_release_marker(release)
+                emit("fault_release", target="store", name=fault_name,
+                     release_marker=str(release), released=True)
+                release_deadline = min(deadline + 1.0, time.monotonic() + 1.0)
+                while process.poll() is None and time.monotonic() < release_deadline:
+                    time.sleep(0.02)
+                if process.poll() is not None:
+                    if process.returncode == 90:
+                        _fault_report(
+                            report, fault_name, fault_hit, process.pid, fault_action,
+                            scenario, seed, action["id"], "timeout",
+                        )
+                        raise HarnessTimeout(
+                            f"fault {fault_name!r} pause watchdog expired during release"
+                        )
+                    raise UnexpectedExit(
+                        f"fault {fault_name!r} exited after release marker with status "
+                        f"{process.returncode}"
+                    )
+                current_action_id = action["id"]
+                stop_daemon()
+                if process.returncode == 90:
+                    _fault_report(
+                        report, fault_name, fault_hit, process.pid, fault_action,
+                        scenario, seed, action["id"], "timeout",
+                    )
+                    raise HarnessTimeout(
+                        f"fault {fault_name!r} pause watchdog expired after release"
+                    )
+                if process.returncode != 0:
+                    raise UnexpectedExit(
+                        f"fault {fault_name!r} did not stop cleanly after release; "
+                        f"status {process.returncode}"
+                    )
+                emit("process_stop", target="store", pid=process.pid,
+                     returncode=process.returncode)
+                process = None
+            remove_shm(shm)
+            shutil.rmtree(control)
         # Recovery is intentionally followed by one additional clean restart.
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
@@ -1461,12 +1793,22 @@ def run_daemon_fault_recovery(
     except Exception as error:
         failure = error
         classification = fault_failure_classification(error)
+        if fault_action in ("error", "pause") and not (root / "fault-diagnostics.json").exists():
+            _capture_fault_diagnostics(
+                root, control, daemon_log, reason=str(error), scenario=scenario,
+                seed=seed, fault=fault_name, action=fault_action, hit=fault_hit,
+                operation=action["id"], process=process,
+            )
         emit("run_fail", error=str(error), error_type=type(error).__name__,
              classification=classification)
         metadata = {
+            "schema": 1,
             "classification": classification,
             "error_type": type(error).__name__,
             "error": str(error),
+            "scenario": scenario, "seed": seed, "fault": fault_name,
+            "action": fault_action, "hit": fault_hit, "hit_count": fault_hit,
+            "operation": action["id"], "operation_id": action["id"],
             "run_root": str(root),
             "plan": str(root / "plan.jsonl"),
             "capabilities": str(bundle_capabilities),

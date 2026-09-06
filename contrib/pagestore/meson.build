@@ -511,3 +511,16 @@ test('pagestore_harness_daemon_fault_recovery',
   suite: ['pagestore'],
   timeout: 30,
 )
+foreach fault_scenario : ['daemon_fault_error', 'daemon_fault_pause']
+  test('pagestore_harness_' + fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endforeach

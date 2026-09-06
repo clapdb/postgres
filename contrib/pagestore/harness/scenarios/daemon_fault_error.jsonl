@@ -1,0 +1,2 @@
+{"schema":1,"scenario":"daemon-fault-error","seed":1432778633,"contracts":["fault_reachability","restart_idempotence"],"case":{"storage":"posix","shards":1,"compute":["writer"]}}
+{"op":"set_fault","id":"daemon-after-ready-error","target":"store","fault":"daemon.after_ready","action":"error","hit":1}
