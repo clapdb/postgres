@@ -153,6 +153,45 @@ run_inspector_timeline(const char *shm, uint32_t timeline,
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+static int
+run_inspector_timeline_error(const char *shm, uint32_t timeline,
+							 char *output, size_t output_size)
+{
+	char id[32];
+	int pipefd[2];
+	pid_t pid;
+	int status;
+	ssize_t nread;
+
+	snprintf(id, sizeof(id), "%u", timeline);
+	if (pipe(pipefd) != 0)
+		return 0;
+	pid = fork();
+	if (pid < 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return 0;
+	}
+	if (pid == 0)
+	{
+		close(pipefd[0]);
+		dup2(pipefd[1], STDERR_FILENO);
+		close(pipefd[1]);
+		execl(inspect_path, inspect_path, "--shm", shm, "timeline", id,
+			  (char *) NULL);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	nread = read(pipefd[0], output, output_size - 1);
+	close(pipefd[0]);
+	if (nread < 0)
+		nread = 0;
+	output[nread] = '\0';
+	waitpid(pid, &status, 0);
+	return WIFEXITED(status) && WEXITSTATUS(status) != 0;
+}
+
 static void
 check_inspector(const char *shm, uint32_t page_size)
 {
@@ -280,6 +319,19 @@ check_inspector_seqlock(void)
 	waitpid(writer, &status, 0);
 	check(ps_load_acquire(&ps_channel(base, 0)->state) == PS_STATE_IDLE,
 		  "inspector does not claim a channel while reading a snapshot");
+	ps_store_release(&hdr->inspection.metadata_poisoned, 1);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 3);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 4);
+	check(run_inspector_timeline_error(name, 7, output, sizeof(output)) &&
+		  strstr(output, "timeline metadata is poisoned") != NULL &&
+		  strstr(output, "does not exist") == NULL,
+		  "poisoned timeline metadata is reported before an ambiguous absence");
+	ps_store_release(&hdr->inspection.metadata_poisoned, 0);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 5);
+	ps_store_release_u64(&hdr->inspection_metrics_seq, 6);
+	check(run_inspector_timeline_error(name, 7, output, sizeof(output)) &&
+		  strcmp(output, "pagestore_inspect: timeline 7 does not exist\n") == 0,
+		  "a clean timeline snapshot reports a genuinely absent timeline");
 	munmap(base, PS_SHM_SIZE);
 	shm_unlink(name);
 }

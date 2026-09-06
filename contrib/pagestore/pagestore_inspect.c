@@ -338,16 +338,16 @@ print_timeline(PsShmHeader *hdr, uint32_t timeline)
 	PsInspectionTimeline *entry;
 
 	read_inspection_metrics(hdr, &metrics);
+	if (metrics.metadata_poisoned)
+	{
+		fprintf(stderr, "pagestore_inspect: timeline metadata is poisoned\n");
+		return 1;
+	}
 	if (timeline >= PS_INSPECTION_MAX_TIMELINES ||
 		!metrics.timeline_entries[timeline].defined)
 	{
 		fprintf(stderr, "pagestore_inspect: timeline %u does not exist\n",
 				timeline);
-		return 1;
-	}
-	if (metrics.metadata_poisoned)
-	{
-		fprintf(stderr, "pagestore_inspect: timeline metadata is poisoned\n");
 		return 1;
 	}
 	if (metrics.retention_poisoned)
