@@ -103,10 +103,13 @@ class PlanValidationTests(unittest.TestCase):
             source.index("post_crash_status = read_materializer_status()"),
             source.index("recovered_status = read_materializer_status()"),
         )
-        self.assertLess(
-            source.index("marker_at_report = sql_scalar"),
-            source.index("crash_materializer(action[\"id\"])", source.index("marker_at_report = sql_scalar")),
-        )
+        self.assertNotIn("marker_at_report", source)
+        self.assertIn('marker_source="post-crash writer status"', source)
+        self.assertIn("pagestore_retention_owner_lsn", source)
+        self.assertIn('"retention_recovered"', source)
+        self.assertIn("::pg_lsn) > '", source)
+        self.assertIn("+ baseline_retention_owner_lsn + \"'::pg_lsn\"", source)
+        self.assertIn("advancement_delta=retention_advancement", source)
         self.assertNotIn('"action_skip"', source)
         self.assertIn(
             '"post_recovery" if materializer_recovered else "pre_crash"',
@@ -127,6 +130,60 @@ class PlanValidationTests(unittest.TestCase):
         self.assertLess(wait, arm)
         self.assertLess(marker, arm)
         self.assertLess(arm, trigger)
+
+    def test_recovery_retries_restartpoint_before_marker_and_retention(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        recovery = source.index(
+            '"recovered materializer did not replay the fault checkpoint"'
+        )
+        restartpoint = source.index(
+            "recovery_restartpoint_result = sql_result(", recovery
+        )
+        event = source.index('"recovery_restartpoint"', restartpoint)
+        marker = source.index(
+            '"recovered materializer did not publish the fault marker"', event
+        )
+        retention = source.index(
+            '"recovered retention owner did not advance beyond R1"', marker
+        )
+        self.assertLess(recovery, restartpoint)
+        self.assertLess(restartpoint, event)
+        self.assertLess(event, marker)
+        self.assertLess(marker, retention)
+        self.assertIn('materializer_socket, materializer_port, "CHECKPOINT;"',
+                      source[restartpoint:event])
+        self.assertNotIn("recovery_supervisor_pid", source[recovery:retention])
+        self.assertNotIn('"recovery-resume"', source[recovery:retention])
+
+    def test_restartpoint_hook_preserves_abi_and_durability_order(self):
+        source = (ROOT.parent / "pagestore.c").read_text(encoding="utf-8")
+        xlog = (ROOT.parent.parent.parent / "src/backend/access/transam/xlog.c").read_text(
+            encoding="utf-8"
+        )
+        header = (ROOT.parent.parent.parent / "src/include/access/xlog.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)", source)
+        self.assertNotIn("durable_replay_lsn", source)
+        self.assertIn("recovery_start_hook_type) (XLogRecPtr redo_lsn);", header)
+        self.assertIn("recovery_restartpoint_pre_control_hook", header)
+        create = xlog.index('INJECTION_POINT("create-restart-point"')
+        control = xlog.index("LWLockAcquire(ControlFileLock", create)
+        self.assertIn("recovery_restartpoint_pre_control_hook", xlog[create:control])
+        pre = source.index("pagestore_materializer_restartpoint_pre_control")
+        post = source.index("pagestore_materializer_restartpoint_flush", pre)
+        pre_body = source[pre:post]
+        publish = source.index("pagestore_materializer_publish_marker")
+        self.assertIn("ps_fault_probe", source[publish:pre])
+        self.assertIn("pagestore_materializer_publish_marker(replay_lsn, true)", pre_body)
+        self.assertNotIn("PG_CATCH();", pre_body)
+        self.assertNotIn("ereport(WARNING", pre_body)
+        post_end = source.index("static XLogRecPtr", post)
+        post_body = source[post:post_end]
+        self.assertIn("pagestore_materialized_wal_lsn_internal", post_body)
+        self.assertIn("pagestore_materializer_retention_advance", post_body)
+        self.assertNotIn("pagestore_materializer_publish_marker", post_body)
+        self.assertIn("pagestore_materializer_marker_needs_publish", source)
 
     def test_relation_observation_comparison_is_per_relation(self):
         observations = {}
@@ -1224,11 +1281,25 @@ class PlanValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PlanError, expected):
                 MODULE.validate_plan(MODULE.read_plan(path), capabilities)
 
-    def test_materializer_pause_timeout_has_one_second_floor(self):
+    def test_materializer_pause_timeout_has_five_second_floor(self):
         self.assertEqual(MODULE.fault_watchdog_milliseconds(0.5), 500)
-        with self.assertRaisesRegex(MODULE.PlanError, "at least 1 second"):
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 5 seconds"):
             MODULE.materializer_fault_watchdog_milliseconds(0.5)
-        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(1), 1000)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 5 seconds"):
+            MODULE.materializer_fault_watchdog_milliseconds(1)
+        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(5), 5000)
+
+    def test_inspect_relation_allows_dollar_prefixed_relation_name(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        plan = MODULE.read_plan(self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "inspect_relation", "id": "inspect", "target": "materializer",
+             "relation": "$relation", "lsn": "$R1"},
+        ]))
+        MODULE.validate_plan(plan, capabilities)
 
     def test_cleanup_errors_preserve_temporary_materializer_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:

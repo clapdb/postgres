@@ -146,8 +146,15 @@ row shows the *only* thing that varies is the binding — the pipeline is the sa
     `continuous_redo_demo.sh` keeps a WAL-only writer and a distinct recovery
     worker online together while later archived segments are materialized.
     Restartpoints publish a durable `pagestore_materialized_wal_lsn()` only
-    after their buffer flush completes.  The publication order is relation-page
-    store sync, marker write, marker store sync, and retention advance.  The
+    after their buffer flush completes.  The pre-control publication order is
+    relation-page store sync, the after-relation-sync probe, marker write,
+    marker store sync, and the after-marker-sync probe.  PostgreSQL then makes
+    the local restartpoint durable in `pg_control`; only after that does the
+    post-control hook advance retention.  Both H1 probes are therefore before
+    `pg_control` durability, and a failed pre-control publication leaves the
+    old local restartpoint authoritative so recovery can retry.  This covers
+    process crashes within the materializer; it does not claim recovery from
+    store loss or any failure outside that boundary.
     named H1 fault points pause after relation-page sync/before marker write or
     after marker sync/before retention advance; they are pause-only test
     controls and add no durability edge when disabled.  Because the hook runs

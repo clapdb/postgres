@@ -150,8 +150,8 @@ def fault_watchdog_milliseconds(value: Any) -> int:
 
 def materializer_fault_watchdog_milliseconds(value: Any) -> int:
     milliseconds = fault_watchdog_milliseconds(value)
-    if value < 1.0:
-        raise PlanError("materializer fault timeout must be at least 1 second")
+    if value < 5.0:
+        raise PlanError("materializer fault timeout must be at least 5 seconds")
     return milliseconds
 
 
@@ -283,6 +283,17 @@ SAFE_COMPONENT_FIELDS = {
     "capture": {"name"},
     "install_reader": {"prepared"},
     "materializer_fault": {"name"},
+}
+
+REFERENCE_FIELDS = {
+    "prepare_branch": {"fork_lsn"},
+    "install_branch": {"fork_lsn"},
+    "prepare_reader": {"base", "read_lsn"},
+    "reader_base": {"checkpoint"},
+    "install_reader": {"read_lsn"},
+    "capture": {"horizon"},
+    "inspect_relation": {"lsn"},
+    "compare": {"left", "right"},
 }
 
 
@@ -1214,7 +1225,8 @@ def validate_plan(
                     raise PlanError(
                         f"{action_context}: expect_sqlstate must be five characters"
                     )
-        for value in action.values():
+        for field in REFERENCE_FIELDS.get(operation, set()):
+            value = action.get(field)
             if isinstance(value, str) and value.startswith("$"):
                 boundary = value[1:]
                 if boundary not in boundaries:
@@ -2648,6 +2660,14 @@ def run_materializer_smoke(
             "lag_bytes::text)::text FROM pagestore_materializer_status();",
         ))
 
+    def read_retention_owner_lsn(generation: int) -> str | None:
+        value = sql_scalar(
+            writer_socket, writer_port,
+            "SELECT pagestore_retention_owner_lsn(0, 2, 1, "
+            + str(generation) + ")::text",
+        )
+        return value or None
+
     def wait_scalar(
         socket_dir: Path, port: int, sql: str, expected: str, context: str,
         timeout: float = 40,
@@ -2827,6 +2847,11 @@ def run_materializer_smoke(
             raise PlanError(
                 f"materializer boundary {action['name']} retained {lag} bytes of lag"
             )
+        retention_owner_lsn = read_retention_owner_lsn(materializer_retention_generation)
+        if retention_owner_lsn is None:
+            raise PlanError(
+                f"materializer boundary {action['name']} has no durable retention owner LSN"
+            )
         horizon = {
             "checkpoint_lsn": checkpoint_lsn,
             "shipped_wal_lsn": shipped,
@@ -2834,6 +2859,8 @@ def run_materializer_smoke(
             "lag_bytes": lag,
             "wal_file": wal_file,
             "materializer_generation": materializer_generation,
+            "retention_owner_generation": materializer_retention_generation,
+            "retention_owner_lsn": retention_owner_lsn,
         }
         events.emit(
             "materialized_boundary", id=action["id"], name=action["name"],
@@ -3318,44 +3345,22 @@ def run_materializer_smoke(
                     )
                 replay_at_fault = replay_before_trigger
                 declared_lsn = lsn_value(checkpoint_lsn)
-                marker_at_report = None
-                marker_at_report_error = None
-                try:
-                    marker_at_report = sql_scalar(
-                        materializer_socket, materializer_port,
-                        "SELECT pagestore_materialized_wal_lsn()::text",
-                        timeout=2.0,
-                    )
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-                    marker_at_report_error = str(error)
                 baseline_marker = checkpoints["R1"]["materialized_wal_lsn"]
                 if baseline_marker is None:
                     raise OracleMismatch("R1 has no durable materializer marker")
-                if marker_at_report is not None:
-                    if action["fault"] == "materializer.after_relation_sync" and (
-                        marker_at_report != baseline_marker
-                        or lsn_value(marker_at_report) >= declared_lsn
-                    ):
-                        raise OracleMismatch(
-                            "before-marker fault report did not observe the unchanged R1 marker"
-                        )
-                    if action["fault"] == "materializer.after_marker_sync" and (
-                        lsn_value(marker_at_report) < declared_lsn
-                    ):
-                        raise OracleMismatch(
-                            "after-marker fault report did not observe the durable R2 marker"
-                        )
+                baseline_retention_owner_lsn = checkpoints["R1"].get(
+                    "retention_owner_lsn"
+                )
+                if baseline_retention_owner_lsn is None:
+                    raise OracleMismatch(
+                        "R1 has no durable materializer retention owner LSN"
+                    )
                 events.emit(
                     "fault_reached", target="materializer", name=action["fault"],
                     report=report, reached=True, fault_pid=fault_pid,
                     postmaster_pid=old_postmaster_pid, replay_lsn=replay_at_fault,
-                    marker_lsn=marker_at_report,
-                    marker_source=(
-                        "materializer SQL at report"
-                        if marker_at_report is not None
-                        else "post-crash writer status required"
-                    ),
-                    marker_sql_error=marker_at_report_error,
+                    marker_lsn=None,
+                    marker_source="post-crash writer status",
                     declared_lsn=checkpoint_lsn,
                     wal_file=wal_file,
                 )
@@ -3458,11 +3463,26 @@ def run_materializer_smoke(
                     "t", "recovered materializer did not replay the fault checkpoint",
                     timeout=float(action.get("timeout", 30.0)) + 20.0,
                 )
-                materializer_recovered = True
                 recovered_replay_lsn = sql_scalar(
                     materializer_socket, materializer_port,
                     "SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn)::text",
                 )
+                recovery_restartpoint_result = sql_result(
+                    materializer_socket, materializer_port, "CHECKPOINT;"
+                ).stdout.strip()
+                events.emit(
+                    "recovery_restartpoint", target="materializer",
+                    replay_lsn=recovered_replay_lsn,
+                    result=recovery_restartpoint_result,
+                )
+                wait_scalar(
+                    materializer_socket, materializer_port,
+                    f"SELECT COALESCE(pagestore_materialized_wal_lsn(), '0/0'::pg_lsn) >= "
+                    f"'{checkpoint_lsn}'::pg_lsn",
+                    "t", "recovered materializer did not publish the fault marker",
+                    timeout=float(action.get("timeout", 30.0)) + 20.0,
+                )
+                materializer_recovered = True
                 recovered_marker_lsn = sql_scalar(
                     materializer_socket, materializer_port,
                     "SELECT pagestore_materialized_wal_lsn()::text",
@@ -3472,13 +3492,46 @@ def run_materializer_smoke(
                     raise OracleMismatch(
                         "recovered materializer marker regressed across process crash"
                     )
-                if (
-                    action["fault"] == "materializer.after_marker_sync"
-                    and lsn_value(recovered_marker_lsn) < declared_lsn
-                ):
+                if lsn_value(recovered_marker_lsn) < declared_lsn:
                     raise OracleMismatch(
                         "recovered materializer marker did not cover the declared checkpoint"
                     )
+                retention_timeout = float(action.get("timeout", 30.0)) + 20.0
+                wait_scalar(
+                    writer_socket, writer_port,
+                    "SELECT COALESCE(pagestore_retention_owner_lsn(0, 2, 1, "
+                    + str(materializer_retention_generation)
+                    + "), '0/0'::pg_lsn) > '"
+                    + baseline_retention_owner_lsn + "'::pg_lsn",
+                    "t", "recovered retention owner did not advance beyond R1",
+                    timeout=retention_timeout,
+                )
+                recovered_retention_owner_lsn = read_retention_owner_lsn(
+                    materializer_retention_generation
+                )
+                if recovered_retention_owner_lsn is None:
+                    raise OracleMismatch(
+                        "recovered materializer has no durable retention owner LSN"
+                    )
+                if lsn_value(recovered_retention_owner_lsn) <= lsn_value(
+                    baseline_retention_owner_lsn
+                ):
+                    raise OracleMismatch(
+                        "recovered retention owner did not advance beyond the R1 owner LSN"
+                    )
+                retention_advancement = (
+                    lsn_value(recovered_retention_owner_lsn)
+                    - lsn_value(baseline_retention_owner_lsn)
+                )
+                events.emit(
+                    "retention_recovered", target="materializer",
+                    owner_kind=2, owner_id=1,
+                    owner_generation=materializer_retention_generation,
+                    r1_owner_lsn=baseline_retention_owner_lsn,
+                    recovered_owner_lsn=recovered_retention_owner_lsn,
+                    advancement_delta=retention_advancement,
+                    declared_lsn=checkpoint_lsn,
+                )
                 horizon = {
                     "checkpoint_lsn": checkpoint_lsn,
                     "shipped_wal_lsn": post_crash_status["shipped_wal_lsn"],
@@ -3493,11 +3546,13 @@ def run_materializer_smoke(
                     "replay_lsn_at_fault": replay_at_fault,
                     "recovered_replay_lsn": recovered_replay_lsn,
                     "marker_before_trigger": marker_before_trigger,
-                    "marker_at_report": marker_at_report,
                     "marker_after_report_before_recovery": post_crash_marker,
-                    "marker_report_sql_error": marker_at_report_error,
                     "post_crash_marker_lsn": post_crash_marker,
                     "recovered_marker_lsn": recovered_marker_lsn,
+                    "r1_retention_owner_lsn": baseline_retention_owner_lsn,
+                    "recovered_retention_owner_lsn": recovered_retention_owner_lsn,
+                    "retention_advancement_delta": retention_advancement,
+                    "retention_owner_generation": materializer_retention_generation,
                     "fault_pid": fault_pid,
                     "fault_report_lines": 1,
                 }

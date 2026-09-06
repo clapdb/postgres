@@ -80,6 +80,16 @@ test('pagestore_fault',
   timeout: 30,
 )
 
+pagestore_materializer_marker_test = executable('pagestore_materializer_marker_test',
+  files('pagestore_materializer_marker_test.c'),
+  install: false,
+)
+test('pagestore_materializer_marker',
+  pagestore_materializer_marker_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Import an existing PGDATA's relation files into the daemon, so a whole
 # database can be moved onto the page store.  Freestanding like the daemon.
 pagestore_import = executable('pagestore_import',

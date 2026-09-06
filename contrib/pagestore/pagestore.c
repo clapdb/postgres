@@ -70,6 +70,7 @@
 #include "pagestore_backend.h"
 #include "pagestore_fault.h"
 #include "pagestore_ipc.h"
+#include "pagestore_materializer_marker.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/bgwriter.h"
@@ -136,6 +137,7 @@ static xact_start_hook_type prev_xact_start_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorRun_hook_type prev_executor_run_hook = NULL;
 static recovery_start_hook_type prev_recovery_start_hook = NULL;
+static recovery_restartpoint_pre_control_hook_type prev_restartpoint_pre_control_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
 
 #define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
@@ -1319,6 +1321,54 @@ pagestore_materializer_shipped_lsn(int timeout_ms)
 	return (XLogRecPtr) shipped;
 }
 
+static XLogRecPtr pagestore_materialized_wal_lsn_internal(void);
+
+/* Publish a restartpoint marker after relation pages are durable. */
+static void
+pagestore_materializer_publish_marker(XLogRecPtr replay_lsn,
+									 bool run_fault_probes)
+{
+	PageStoreRelKey key = {0};
+	PsMaterializerMarker marker;
+	char		page[BLCKSZ];
+	XLogRecPtr existing;
+
+	if (XLogRecPtrIsInvalid(replay_lsn))
+		return;
+	existing = pagestore_materialized_wal_lsn_internal();
+	if (!pagestore_materializer_marker_needs_publish(
+			XLogRecPtrIsValid(existing), (uint64) existing,
+			true, (uint64) replay_lsn))
+		return;
+
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
+	marker.version = PS_MATERIALIZER_MARKER_VERSION;
+	marker.timeline = pagestore_localsvc_timeline();
+	marker.materialized_lsn = (uint64) replay_lsn;
+	marker.materialized_lsn_complement = ~marker.materialized_lsn;
+	memset(page, 0, sizeof(page));
+	memcpy(page, &marker, sizeof(marker));
+
+	/* Relation pages must be durable before the progress marker advances. */
+	pagestore_localsvc_store_sync_timeout(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	if (run_fault_probes &&
+		ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_RELATION_SYNC) != 0)
+		ereport(ERROR,
+				(errmsg("pagestore materializer relation-sync fault probe failed")));
+	pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
+										PS_MATERIALIZER_MARKER_BLOCK, page,
+										(uint64) replay_lsn,
+										PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	pagestore_localsvc_store_sync_timeout(
+		PS_MATERIALIZER_MARKER_TIMEOUT_MS);
+	if (run_fault_probes &&
+		ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_MARKER_SYNC) != 0)
+		ereport(ERROR,
+				(errmsg("pagestore materializer marker-sync fault probe failed")));
+}
+
 /* Fence this recovery process before it can consume the first WAL record. */
 static void
 pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)
@@ -1405,77 +1455,53 @@ pagestore_materializer_retention_advance(XLogRecPtr replay_lsn)
 				(errmsg("pagestore materializer retention advance was rejected by the daemon")));
 }
 
-/* Publish a durable marker only after a restartpoint flushed relation pages. */
+/*
+ * Publish relation and marker durability before pg_control advances.  Errors
+ * deliberately escape this hook: CreateRestartPoint then leaves the old
+ * pg_control authoritative and recovery can retry without killing the
+ * recovery postmaster.
+ */
 static void
-pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
-											XLogRecPtr restart_redo_lsn)
+pagestore_materializer_restartpoint_pre_control(XLogRecPtr replay_lsn,
+									 XLogRecPtr restart_redo_lsn)
 {
-	PageStoreRelKey key = {0};
-	PsMaterializerMarker marker;
-	char		page[BLCKSZ];
-	bool		published = false;
+	(void) restart_redo_lsn;
 
-	if (prev_restartpoint_flush_hook)
-		(*prev_restartpoint_flush_hook) (replay_lsn, restart_redo_lsn);
+	if (prev_restartpoint_pre_control_hook)
+		(*prev_restartpoint_pre_control_hook) (replay_lsn, restart_redo_lsn);
 	if (!RecoveryInProgress() || XLogRecPtrIsInvalid(replay_lsn))
 		return;
-	/* The restartpoint hook runs in the checkpointer child.  Initialize the
-	 * process-local canonical fault state here as a fallback for PostgreSQL
-	 * versions that load the extension before all postmaster GUCs are final. */
 	if (!ps_fault_is_initialized() && ps_fault_init(DataDir) != 0)
 		ereport(ERROR,
 				(errmsg("could not initialize materializer restartpoint fault controls")));
 
-	memset(&marker, 0, sizeof(marker));
-	marker.magic = PS_MATERIALIZER_MARKER_MAGIC;
-	marker.version = PS_MATERIALIZER_MARKER_VERSION;
-	marker.timeline = pagestore_localsvc_timeline();
-	marker.materialized_lsn = (uint64) replay_lsn;
-	marker.materialized_lsn_complement = ~marker.materialized_lsn;
-	memset(page, 0, sizeof(page));
-	memcpy(page, &marker, sizeof(marker));
+	/* No PG_TRY/PG_CATCH here: a failed publication aborts this restartpoint. */
+	pagestore_materializer_publish_marker(replay_lsn, true);
+}
 
-	/*
-	 * A store outage must leave the old marker in place, not fail recovery.
-	 * CheckPointGuts has issued the relation writes, but remote smgr sync is a
-	 * no-op.  Persist those pages before making the new marker readable, then
-	 * persist the marker itself.  A crash between marker write and its sync can
-	 * only regress monitoring to the previous conservative boundary.
-	 */
-	PG_TRY();
-	{
-		pagestore_localsvc_store_sync_timeout(
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
-		if (ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_RELATION_SYNC) != 0)
-			ereport(ERROR,
-					(errmsg("pagestore materializer relation-sync fault probe failed")));
-		pagestore_localsvc_obj_write_timeout(PS_KLASS_CONTROL, &key,
-										PS_MATERIALIZER_MARKER_BLOCK, page,
-										(uint64) replay_lsn,
-										PS_MATERIALIZER_MARKER_TIMEOUT_MS);
-		pagestore_localsvc_store_sync_timeout(
-			PS_MATERIALIZER_MARKER_TIMEOUT_MS);
-		if (ps_fault_probe(PS_FAULT_POINT_MATERIALIZER_AFTER_MARKER_SYNC) != 0)
-			ereport(ERROR,
-					(errmsg("pagestore materializer marker-sync fault probe failed")));
-		published = true;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-		MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+/* Advance retention only after the local restartpoint is durable. */
+static void
+pagestore_materializer_restartpoint_flush(XLogRecPtr replay_lsn,
+									 XLogRecPtr restart_redo_lsn)
+{
+	XLogRecPtr marker;
 
-		edata = CopyErrorData();
-		MemoryContextSwitchTo(old_context);
-		FlushErrorState();
+	if (prev_restartpoint_flush_hook)
+		(*prev_restartpoint_flush_hook) (replay_lsn, restart_redo_lsn);
+	if (!RecoveryInProgress() || XLogRecPtrIsInvalid(replay_lsn) ||
+		XLogRecPtrIsInvalid(restart_redo_lsn))
+		return;
+	marker = pagestore_materialized_wal_lsn_internal();
+	if (XLogRecPtrIsInvalid(marker) || marker < replay_lsn)
+	{
 		ereport(WARNING,
-				(errmsg("pagestore materializer watermark publish failed: %s",
-						edata->message)));
-		FreeErrorData(edata);
+				(errmsg("pagestore materializer marker is behind durable restartpoint"),
+				 errdetail("marker %X/%X, replay %X/%X",
+								 (uint32) (marker >> 32), (uint32) marker,
+								 (uint32) (replay_lsn >> 32), (uint32) replay_lsn)));
+		return;
 	}
-	PG_END_TRY();
-	if (published && !XLogRecPtrIsInvalid(restart_redo_lsn))
-		pagestore_materializer_retention_advance(restart_redo_lsn);
+	pagestore_materializer_retention_advance(restart_redo_lsn);
 }
 
 static XLogRecPtr
@@ -13050,6 +13076,10 @@ _PG_init(void)
 	{
 		prev_recovery_start_hook = recovery_start_hook;
 		recovery_start_hook = pagestore_materializer_recovery_start;
+		prev_restartpoint_pre_control_hook =
+			recovery_restartpoint_pre_control_hook;
+		recovery_restartpoint_pre_control_hook =
+			pagestore_materializer_restartpoint_pre_control;
 		prev_restartpoint_flush_hook = recovery_restartpoint_flush_hook;
 		recovery_restartpoint_flush_hook =
 			pagestore_materializer_restartpoint_flush;
