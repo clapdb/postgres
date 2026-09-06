@@ -6,5 +6,5 @@
 {"op":"sql","id":"new-value","target":"writer","sql":"UPDATE materializer_crash_relation SET v=repeat('new-replayed-value-', 20) WHERE id=1; INSERT INTO materializer_crash_relation SELECT g, repeat('new-replayed-value-', 20) FROM generate_series(2, 300) AS g"}
 {"op":"materializer_fault","id":"fault-after-marker-sync","target":"materializer","fault":"materializer.after_marker_sync","action":"pause","hit":1,"timeout":30,"name":"R2"}
 {"op":"inspect_relation","id":"inspect-after-recovery","target":"materializer","relation":"materializer_crash_relation","lsn":"$R2"}
-{"op":"assert","id":"new-value-visible","target":"materializer","oracle":"sql_scalar","sql":"SELECT count(*)::text || ':' || (min(v) = repeat('new-replayed-value-', 20))::text FROM materializer_crash_relation","expect":"300:true"}
+{"op":"assert","id":"new-value-visible","target":"materializer","oracle":"sql_scalar","sql":"SELECT count(*)::text || ':' || bool_and(v IS NOT DISTINCT FROM repeat('new-replayed-value-', 20))::text FROM materializer_crash_relation","expect":"300:true"}
 {"op":"assert","id":"writer-zero-lag","target":"writer","oracle":"sql_scalar","sql":"SELECT lag_bytes = 0 FROM pagestore_materializer_status()","expect":"t"}

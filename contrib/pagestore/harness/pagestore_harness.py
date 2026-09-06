@@ -677,6 +677,7 @@ def pagestore_control_restore_command(
 
 
 def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str) -> None:
+    validate_materializer_relation_pairing(plan)
     profile = runtime_capabilities(capabilities, runtime)
     for field in ("protocol_version", "page_size", "io_unit"):
         value = profile.get(field)
@@ -1108,6 +1109,31 @@ def validate_fault_identity(value: str, field: str, context: str) -> None:
         )
 
 
+def validate_materializer_relation_pairing(plan: Plan) -> None:
+    """Require each fault-boundary relation snapshot to have its own prior R1."""
+    r1_relations: set[str] = set()
+    fault_r1_relations: dict[str, set[str]] = {}
+    for action in plan.actions:
+        if action["op"] == "materializer_fault":
+            fault_r1_relations[action["name"]] = set(r1_relations)
+            continue
+        if action["op"] != "inspect_relation":
+            continue
+        boundary_ref = action["lsn"]
+        if boundary_ref == "$R1":
+            r1_relations.add(action["relation"])
+            continue
+        if not boundary_ref.startswith("$"):
+            continue
+        fault_r1 = fault_r1_relations.get(boundary_ref[1:])
+        if fault_r1 is not None and action["relation"] not in fault_r1:
+            raise PlanError(
+                f"{plan.path}:{action['id']}: inspect_relation {action['relation']!r} "
+                f"at {boundary_ref} requires a prior same-relation $R1 inspection "
+                "before the materializer fault"
+            )
+
+
 def validate_plan(
     plan: Plan, capabilities: dict[str, Any], catalog_path: Path | None = None,
 ) -> None:
@@ -1275,6 +1301,7 @@ def validate_plan(
                     fault_timeout_seconds(action["timeout"])
             except PlanError as error:
                 raise PlanError(f"{action_context}: {error}") from error
+    validate_materializer_relation_pairing(plan)
 
 
 def plan_files(directory: Path) -> Iterable[Path]:
@@ -1461,6 +1488,17 @@ def run_root(path: Path | None) -> tuple[Path, bool]:
         raise PlanError(f"run root must be empty: {path}")
     path.mkdir(parents=True, exist_ok=True)
     return path, False
+
+
+def cleanup_temporary_root(
+    root: Path, temporary: bool, keep: bool, cleanup_errors: list[str],
+) -> None:
+    if not temporary or keep or cleanup_errors:
+        return
+    try:
+        shutil.rmtree(root)
+    except Exception as error:
+        cleanup_errors.append(f"run root cleanup: {error}")
 
 
 def remove_shm(shm: str) -> None:
@@ -3566,13 +3604,12 @@ def run_materializer_smoke(
         cleanup_step("writer postmaster", stop_writer_for_cleanup)
         cleanup_step("pagestore daemon", lambda: stop_child(dproc))
         cleanup_step("shared memory", lambda: remove_shm(shm))
-    if temporary and not keep:
-        try:
-            shutil.rmtree(root)
-        except Exception as error:
-            cleanup_errors.append(f"run root cleanup: {error}")
+    cleanup_temporary_root(root, temporary, keep, cleanup_errors)
     if cleanup_errors and run_error is None:
-        raise PlanError("materializer smoke cleanup failed: " + "; ".join(cleanup_errors))
+        raise PlanError(
+            f"materializer smoke cleanup failed; failure bundle: {root}: "
+            + "; ".join(cleanup_errors)
+        )
     return root
 
 

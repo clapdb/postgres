@@ -1148,6 +1148,62 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_plan(plan, capabilities)
         MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
 
+    def test_materializer_scenarios_use_null_safe_full_row_oracle(self):
+        for name in (
+            "materializer_restartpoint_after_relation_sync_before_marker.jsonl",
+            "materializer_restartpoint_after_marker_sync.jsonl",
+        ):
+            plan = MODULE.read_plan(ROOT / "scenarios" / name)
+            assertion = next(
+                action for action in plan.actions if action["id"] == "new-value-visible"
+            )
+            self.assertIn(
+                "bool_and(v IS NOT DISTINCT FROM repeat(", assertion["sql"]
+            )
+            self.assertIn("count(*)::text", assertion["sql"])
+            self.assertNotIn("min(v)", assertion["sql"])
+
+    def test_fault_boundary_requires_same_relation_pre_fault_r1_inspection(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        cases = [
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R9"},
+            ],
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_b", "lsn": "$R9"},
+            ],
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R9"},
+                {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R1"},
+            ],
+        ]
+        for actions in cases:
+            header = self.header()
+            header["case"]["compute"] = ["writer", "materializer"]
+            plan = MODULE.read_plan(self.write_plan([header, *actions]))
+            with self.assertRaisesRegex(MODULE.PlanError, "prior same-relation.*\\$R1"):
+                MODULE.validate_plan(plan, capabilities)
+            with self.assertRaisesRegex(MODULE.PlanError, "prior same-relation.*\\$R1"):
+                MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
     def test_inspect_relation_requires_prior_boundary_reference(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         header = self.header()
@@ -1173,6 +1229,19 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "at least 1 second"):
             MODULE.materializer_fault_watchdog_milliseconds(0.5)
         self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(1), 1000)
+
+    def test_cleanup_errors_preserve_temporary_materializer_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "bundle"
+            (root / "trace").mkdir(parents=True)
+            evidence = root / "failure.json"
+            evidence.write_text("evidence\n", encoding="utf-8")
+            cleanup_errors = ["postmaster: still running"]
+            MODULE.cleanup_temporary_root(root, True, False, cleanup_errors)
+            self.assertTrue(root.is_dir())
+            self.assertTrue(evidence.is_file())
+            MODULE.cleanup_temporary_root(root, True, False, [])
+            self.assertFalse(root.exists())
 
     def test_materializer_fault_validates_scenario_identity(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
