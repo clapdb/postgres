@@ -2964,6 +2964,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.inspect and (args.inspect_binary is None or not args.shm):
         parser.error("--inspect requires --inspect-binary and --shm")
+    relation_flag_values = (args.spc_oid, args.db_oid, args.rel_number, args.lsn)
+    if args.inspect != "relation" and any(value is not None for value in relation_flag_values):
+        parser.error(
+            "--spc-oid, --db-oid, --rel-number and --lsn are only valid with "
+            "--inspect relation"
+        )
     if args.inspect == "timeline":
         if args.timeline is None or args.timeline < 0:
             parser.error("--inspect timeline requires a nonnegative --timeline ID")

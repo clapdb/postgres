@@ -708,6 +708,19 @@ class PlanValidationTests(unittest.TestCase):
                     Path("/inspect"), "/unused", operation, schema, timeline=7
                 )
 
+    def test_relation_only_cli_flags_are_rejected_for_other_inspections(self):
+        base = [
+            "--capabilities", str(ROOT / "capabilities.json"),
+            "--inspect", "health", "--inspect-binary", "/inspect", "--shm", "/unused",
+        ]
+        for flag in ("--spc-oid", "--db-oid", "--rel-number", "--lsn"):
+            with self.subTest(flag=flag):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        MODULE.parse_args([*base, flag, "1"])
+                self.assertNotEqual(raised.exception.code, 0)
+                self.assertIn("only valid with --inspect relation", stderr.getvalue())
+
     def test_timeline_inspection_requires_a_nonnegative_integer_id(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         for timeline in (None, -1, True):
