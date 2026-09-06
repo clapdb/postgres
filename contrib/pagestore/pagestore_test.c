@@ -1820,6 +1820,55 @@ spawn_daemon(const char *daemon_path, const char *shm, const char *store,
 }
 
 static pid_t
+spawn_daemon_fail_inspection_worker(const char *daemon_path, const char *shm,
+								const char *store, uint32_t page_size,
+								uint32_t nshards)
+{
+	const char *previous = getenv("PAGESTORE_TEST_FAIL_INSPECTION_WORKER");
+	char	   *previous_copy = NULL;
+	pid_t		pid;
+
+	if (previous != NULL)
+	{
+		previous_copy = strdup(previous);
+		if (previous_copy == NULL)
+		{
+			perror("strdup inspection-worker startup failure seam");
+			exit(2);
+		}
+	}
+	if (setenv("PAGESTORE_TEST_FAIL_INSPECTION_WORKER", "1", 1) != 0)
+	{
+		perror("setenv inspection-worker startup failure seam");
+		free(previous_copy);
+		exit(2);
+	}
+	pid = spawn_daemon(daemon_path, shm, store, page_size, nshards);
+	if (previous_copy != NULL)
+	{
+		if (setenv("PAGESTORE_TEST_FAIL_INSPECTION_WORKER", previous_copy, 1) != 0)
+		{
+			perror("restore inspection-worker startup failure seam");
+			(void) kill(pid, SIGKILL);
+			while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+				;
+			free(previous_copy);
+			exit(2);
+		}
+	}
+	else if (unsetenv("PAGESTORE_TEST_FAIL_INSPECTION_WORKER") != 0)
+	{
+		perror("unset inspection-worker startup failure seam");
+		(void) kill(pid, SIGKILL);
+		while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+			;
+		exit(2);
+	}
+	free(previous_copy);
+	return pid;
+}
+
+static pid_t
 spawn_daemon_gc(const char *daemon_path, const char *shm, const char *store,
 				uint32_t page_size, uint32_t nshards)
 {
@@ -2213,6 +2262,27 @@ run_migration_failure_suite(const char *daemon_path, const char *tmpbase)
 		rm_rf(store);
 		shm_unlink(shm);
 	}
+}
+
+static void
+run_worker_startup_failure_suite(const char *daemon_path, const char *tmpbase)
+{
+	char		shm[64];
+	char		store[256];
+	const uint32_t ps = 8192;
+	pid_t		pid;
+
+	fprintf(stderr, "== worker startup failures ==\n");
+	snprintf(shm, sizeof(shm), "/pstest_%d_inspection_worker", (int) getpid());
+	snprintf(store, sizeof(store), "%s/store_inspection_worker", tmpbase);
+	rm_rf(store);
+	shm_unlink(shm);
+	pid = spawn_daemon_fail_inspection_worker(daemon_path, shm, store, ps,
+										  test_nshards);
+	expect_daemon_open_failure(pid, shm,
+							   "inspection worker startup failure aborts daemon");
+	rm_rf(store);
+	shm_unlink(shm);
 }
 
 static void
@@ -5839,6 +5909,8 @@ main(int argc, char **argv)
 
 	/* Legacy migration must seal before the daemon publishes readiness. */
 	run_migration_failure_suite(daemon_path, tmpbase);
+	/* Every required worker must make startup fail closed if it cannot start. */
+	run_worker_startup_failure_suite(daemon_path, tmpbase);
 	/* A failed ordering-marker append must not commit segment bytes. */
 	run_order_marker_failure_suite(daemon_path, tmpbase);
 	/* Transitional SEG0 records may duplicate already-persisted growth. */

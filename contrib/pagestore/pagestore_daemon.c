@@ -46,6 +46,10 @@ static const char *maintenance_pause_file = NULL;
 static const char *shutdown_cancel_pause_file = NULL;
 static int shutdown_cancel_ready_fd = -1;
 
+/* Test-only startup seam; this is consumed only by the POSIX standalone
+ * daemon tests and lets them exercise the pthread-create error path. */
+static int fail_inspection_worker_startup = 0;
+
 /* The daemon uses traditional POSIX record locks for portability.  The shm
  * descriptor below is deliberately kept open until daemon shutdown: POSIX
  * record locks are process-owned and closing any descriptor for the inode can
@@ -1282,6 +1286,12 @@ main(int argc, char **argv)
 		fprintf(stderr, "pagestore_daemon: invalid fault configuration\n");
 		return 1;
 	}
+	{
+		const char *value = getenv("PAGESTORE_TEST_FAIL_INSPECTION_WORKER");
+
+		if (value != NULL && strcmp(value, "1") == 0)
+			fail_inspection_worker_startup = 1;
+	}
 
 	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
 	if (fd < 0)
@@ -1403,6 +1413,7 @@ main(int argc, char **argv)
 			if (pthread_create(&threads[shard], NULL, shard_worker, &workers[shard]) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: failed to start worker %u\n", shard);
+				exit_status = 1;
 				stop_requested = 1;
 				break;
 			}
@@ -1410,9 +1421,11 @@ main(int argc, char **argv)
 		}
 		if (started == hdr->nshards)
 		{
-			if (pthread_create(&inspection, NULL, inspection_worker, shm) != 0)
+			if (fail_inspection_worker_startup ||
+				pthread_create(&inspection, NULL, inspection_worker, shm) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: failed to start inspection worker\n");
+				exit_status = 1;
 				stop_requested = 1;
 			}
 			else
@@ -1423,6 +1436,7 @@ main(int argc, char **argv)
 			if (pthread_create(&maintenance, NULL, maintenance_worker, NULL) != 0)
 			{
 				fprintf(stderr, "pagestore_daemon: failed to start maintenance worker\n");
+				exit_status = 1;
 				stop_requested = 1;
 			}
 			else
