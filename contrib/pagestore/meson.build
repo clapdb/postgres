@@ -3,6 +3,7 @@
 pagestore_sources = files(
   'backend_localsvc.c',
   'backend_passthrough.c',
+  'pagestore_fault.c',
   'pagestore.c',
   'pagestore_control.c',
   'pagestore_slru.c',
@@ -75,6 +76,16 @@ pagestore_fault_test = executable('pagestore_fault_test',
 )
 test('pagestore_fault',
   pagestore_fault_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
+pagestore_materializer_marker_test = executable('pagestore_materializer_marker_test',
+  files('pagestore_materializer_marker_test.c'),
+  install: false,
+)
+test('pagestore_materializer_marker',
+  pagestore_materializer_marker_test,
   suite: ['pagestore'],
   timeout: 30,
 )
@@ -494,6 +505,19 @@ test('pagestore_harness_materializer_lifecycle_plan',
   suite: ['pagestore'],
   timeout: 30,
 )
+foreach materializer_fault_scenario : [
+  'materializer_restartpoint_after_relation_sync_before_marker',
+  'materializer_restartpoint_after_marker_sync',
+]
+  test('pagestore_harness_' + materializer_fault_scenario + '_plan',
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--validate', files('harness/scenarios/' + materializer_fault_scenario + '.jsonl')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
+endforeach
 test('pagestore_harness_daemon_smoke',
   pagestore_harness_python,
   args: [files('harness/pagestore_harness.py'),

@@ -210,6 +210,44 @@ jobs:
             --materializer-supervisor \
               "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
 
+      - name: Run H1 materializer crash after relation sync
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restartpoint_after_relation_sync_before_marker.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
+      - name: Run H1 materializer crash after marker sync
+        if: >
+          (github.event_name == 'pull_request' &&
+           github.base_ref != 'branchdb_13' &&
+           github.base_ref != 'branchdb_14') ||
+          (github.event_name != 'pull_request' &&
+           github.ref_name != 'branchdb_13' &&
+           github.ref_name != 'branchdb_14')
+        run: |
+          python3 contrib/pagestore/harness/pagestore_harness.py \
+            --capabilities contrib/pagestore/harness/capabilities.json \
+            --materializer-smoke \
+              contrib/pagestore/harness/scenarios/materializer_restartpoint_after_marker_sync.jsonl \
+            --build-dir "$(pwd)/build" \
+            --daemon-binary "$(pwd)/build/contrib/pagestore/pagestore_daemon" \
+            --inspect-binary "$(pwd)/build/contrib/pagestore/pagestore_inspect" \
+            --materializer-supervisor \
+              "$(pwd)/contrib/pagestore/pagestore_materializer_supervisor.py"
+
       - name: Run pagestore integration test
         run: contrib/pagestore/integration_test.sh "$(pwd)/build"
 

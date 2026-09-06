@@ -47,7 +47,7 @@ new daemon's zeroing/recovery window.
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; the flat-log copy of every complete sealed record is reclaimed, while the flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
 | Per-page WAL index and PostgreSQL `rm_redo` reuse | Live index plus crash-safe replacement-chain compaction, durable timeline frontier, multi-shard snapshot/log-epoch cutover, and old generation/epoch GC implemented | WAL redo demos plus discrete/operational chain pruning, frontier admission/restart/corruption/crash tests, snapshot publication, generation/epoch GC, and tail replay |
-| Continuous recovery materializer | Local POSIX supervisor implemented | ownership fencing, bounded restart/restartpoint policy, atomic status, and `materializer_smoke` crash replacement |
+| Continuous recovery materializer | Local POSIX supervisor implemented; H1 restartpoint crash slice wired with pre-control relation/marker publication and post-control retention | ownership fencing, bounded restart/restartpoint policy, atomic status, `materializer_smoke` crash replacement, and focused pause-only crashes after relation sync/before marker write and after marker sync; both probes precede local `pg_control` durability and scope remains process-crash recovery |
 | Composed MVP data path | Implemented | `mvp_golden_test.sh`: WAL-only writer -> materializer -> durable fork -> independent branch, including restarts |
 | `pg_control` and branch SLRU/catalog bootstrap | Serialized portable local path implemented | one-shot lifecycle controller plus fresh-initdb golden boot from CRC-bound maps/SLRUs/control |
 | Fixed/advancing readers and handoff | Implemented | integration coverage for reader artifacts and view adoption |
@@ -66,6 +66,11 @@ The existing CI proves both focused subsystem paths and the composed contract:
   owns a provisioned WAL-only worker, turns writer checkpoints into durable
   materialized boundaries, replaces a crashed worker, and continues following
   WAL;
+- the two H1 materializer plans exercise the checkpointer-child restartpoint
+  boundary with a whole-postmaster stop: they inspect R1 and R2 at timeline 0,
+  incarnation 1, require main-fork growth and monotonic markers, and retain
+  old/new SQL visibility checks.  Meson validates only these plans; the real
+  runs are an explicit PostgreSQL CI lane;
 - `mvp_golden_test.sh` composes WAL-only ingest, durable materialization,
   a proven recovery-produced SLRU base, portable branch boot from a fresh
   `initdb` skeleton (no parent PGDATA copy), parent/child isolation, and

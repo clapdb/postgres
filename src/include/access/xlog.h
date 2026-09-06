@@ -287,6 +287,12 @@ typedef void (*recovery_restartpoint_flush_hook_type) (XLogRecPtr replay_lsn,
 														XLogRecPtr restart_redo_lsn);
 extern PGDLLIMPORT recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook;
 
+/* Called after restartpoint buffers are flushed and the injection point has
+ * run, but before the restartpoint updates durable pg_control. */
+typedef void (*recovery_restartpoint_pre_control_hook_type) (XLogRecPtr replay_lsn,
+														XLogRecPtr restart_redo_lsn);
+extern PGDLLIMPORT recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook;
+
 /* Called in the startup process after the checkpoint redo pointer is known
  * and before the checkpoint or redo WAL is read.  Consumers that depend on
  * retained history use this point to establish their durable protection. */

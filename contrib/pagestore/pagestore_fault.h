@@ -12,6 +12,16 @@
 #define PS_FAULT_REPORT_FAILURE_EXIT 89
 #define PS_FAULT_PAUSE_TIMEOUT_EXIT 90 /* reserved process-level mapping */
 
+/* Materializer restartpoint probes may spend the marker store timeout before
+ * reporting.  Keep the harness watchdog contract above that bounded work. */
+#define PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS 10000U
+#define PS_FAULT_MATERIALIZER_PHASE_COUNT 6U
+#define PS_FAULT_MATERIALIZER_SCHEDULING_MARGIN_MS 5000U
+#define PS_FAULT_MATERIALIZER_MIN_WATCHDOG_MS \
+	(PS_FAULT_MATERIALIZER_MARKER_TIMEOUT_MS * \
+	 PS_FAULT_MATERIALIZER_PHASE_COUNT + \
+	 PS_FAULT_MATERIALIZER_SCHEDULING_MARGIN_MS)
+
 typedef enum PsFaultPoint
 {
 #define PAGESTORE_FAULT_POINT(symbol, name, target, model, action, hit, max_hit) \
@@ -23,6 +33,7 @@ typedef enum PsFaultPoint
 } PsFaultPoint;
 
 int ps_fault_init(const char *store_dir);
+int ps_fault_is_initialized(void);
 int ps_fault_lookup(const char *name, PsFaultPoint *point);
 const char *ps_fault_name(PsFaultPoint point);
 const char *ps_fault_allowed_actions(PsFaultPoint point);
@@ -42,6 +53,7 @@ typedef struct PsFaultStatus
  * setup without inspecting the report file. */
 int ps_fault_query(PsFaultPoint point, PsFaultStatus *status);
 int ps_fault_probe(PsFaultPoint point);
+int ps_fault_probe_at(PsFaultPoint point, uint64_t replay_lsn);
 void ps_fault_reset(void);
 
 #endif

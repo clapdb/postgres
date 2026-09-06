@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,400 @@ class PlanValidationTests(unittest.TestCase):
             MODULE.fault_failure_classification(MODULE.UnexpectedExit("status")),
             "unexpected_exit",
         )
+
+    def test_materializer_status_parser_preserves_actual_values_and_nulls(self):
+        self.assertEqual(
+            MODULE.parse_materializer_status_row("(0/04000000,0/03045670,4096)"),
+            {
+                "shipped_wal_lsn": "0/04000000",
+                "materialized_wal_lsn": "0/03045670",
+                "lag_bytes": "4096",
+            },
+        )
+        self.assertEqual(
+            MODULE.parse_materializer_status_row("(0/04000000,,)"),
+            {
+                "shipped_wal_lsn": "0/04000000",
+                "materialized_wal_lsn": None,
+                "lag_bytes": None,
+            },
+        )
+
+    def test_materializer_crash_evidence_precedes_recovery(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        self.assertLess(
+            source.index('"post_crash_durable_state"'),
+            source.index('"materializer-supervisor-recovery.log"'),
+        )
+        self.assertLess(
+            source.index("post_crash_status = read_materializer_status()"),
+            source.index("recovered_status = read_materializer_status()"),
+        )
+        self.assertNotIn("marker_at_report", source)
+        self.assertIn('marker_source="post-crash writer status"', source)
+        self.assertIn("pagestore_retention_owner_lsn", source)
+        self.assertIn('"retention_recovered"', source)
+        self.assertIn("::pg_lsn) > '", source)
+        self.assertIn("+ baseline_retention_owner_lsn + \"'::pg_lsn\"", source)
+        self.assertIn("advancement_delta=retention_advancement", source)
+        self.assertNotIn('"action_skip"', source)
+        self.assertIn(
+            '"post_recovery" if materializer_recovered else "pre_crash"',
+            source,
+        )
+        self.assertLess(
+            source.index("recovered materializer did not replay the fault checkpoint"),
+            source.index("materializer_recovered = True"),
+        )
+
+    def test_materializer_fault_arms_only_after_replay_and_marker_observation(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        start = source.index('elif action["op"] == "materializer_fault":')
+        wait = source.index("materializer did not replay fault checkpoint", start)
+        marker = source.index("marker_before_trigger =", start)
+        arm = source.index('_atomic_arm_marker(fault_control / "arm")', start)
+        trigger = source.index("fault_trigger_proc = subprocess.Popen", start)
+        self.assertLess(wait, arm)
+        self.assertLess(marker, arm)
+        self.assertLess(arm, trigger)
+
+    def test_process_stat_parser_handles_parentheses_and_spaces_in_comm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stat_path = Path(temporary) / "123" / "stat"
+            stat_path.parent.mkdir()
+            fields = ["S"] + [str(value) for value in range(4, 22)] + ["4242"]
+            stat_path.write_text(
+                "123 (postgres worker ) with spaces) " + " ".join(fields),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                MODULE.read_process_starttime(123, Path(temporary)), 4242
+            )
+
+    def test_pidfd_signal_and_poll_are_identity_bound_and_closed(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        poller = mock.Mock()
+        poller.poll.return_value = [(41, MODULE.select.POLLIN)]
+        with mock.patch.object(MODULE.signal, "pidfd_send_signal") as send, \
+                mock.patch.object(MODULE.select, "poll", return_value=poller):
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("pidfd_send_signal", "signaled"),
+            )
+            self.assertEqual(MODULE.wait_process_exit(identity, 1), "pidfd_poll")
+        send.assert_called_once_with(41, MODULE.signal.SIGQUIT, None, 0)
+        poller.register.assert_called_once()
+
+    def test_capture_pidfd_esrch_is_already_exited_without_reacquiring_pid(self):
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=77) as read, \
+                mock.patch.object(MODULE.os, "pidfd_open", side_effect=ProcessLookupError):
+            identity = MODULE.capture_process_identity(123)
+        self.assertTrue(identity.already_exited)
+        self.assertEqual(identity.status, "already_exited")
+        read.assert_called_once_with(123)
+
+    def test_capture_procfs_absent_before_pidfd_is_already_exited(self):
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
+                mock.patch.object(MODULE, "procfs_available", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open") as pidfd_open, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            read = MODULE.read_process_starttime
+            identity = MODULE.capture_process_identity(123)
+        self.assertTrue(identity.already_exited)
+        self.assertEqual(identity.status, "already_exited")
+        read.assert_called_once_with(123)
+        pidfd_open.assert_not_called()
+        send.assert_not_called()
+
+    def test_procfs_unavailable_live_unverifiable_fails_safe_without_signal(self):
+        with mock.patch.object(MODULE, "procfs_available", return_value=False), \
+                mock.patch.object(MODULE, "read_process_starttime", return_value=None), \
+                mock.patch.object(MODULE, "process_exists", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open") as pidfd_open, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            with self.assertRaisesRegex(MODULE.PlanError, "procfs unavailable"):
+                MODULE.capture_process_identity(123)
+        pidfd_open.assert_not_called()
+        send.assert_not_called()
+
+    def test_process_starttime_io_error_is_not_treated_as_exit(self):
+        with mock.patch.object(
+            MODULE.Path, "read_text", side_effect=OSError("I/O error")
+        ):
+            with self.assertRaisesRegex(MODULE.PlanError, "cannot read process identity"):
+                MODULE.read_process_starttime(123)
+
+    def test_capture_pidfd_replacement_is_already_exited_and_not_signaled(self):
+        with mock.patch.object(
+            MODULE, "read_process_starttime", side_effect=[77, 78]
+        ) as read, mock.patch.object(MODULE.os, "pidfd_open", return_value=41), \
+                mock.patch.object(MODULE.os, "close") as close, \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal") as send:
+            identity = MODULE.capture_process_identity(123)
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("already_exited", "already_exited"),
+            )
+        self.assertEqual(read.call_count, 2)
+        close.assert_called_once_with(41)
+        send.assert_not_called()
+        self.assertEqual(identity.status, "already_exited")
+
+    def test_starttime_fallback_pid_reuse_is_already_exited_before_signal(self):
+        identity = MODULE.ProcessIdentity(123, 77)
+        with mock.patch.object(MODULE, "read_process_starttime", return_value=78), \
+                mock.patch.object(MODULE.os, "kill") as kill:
+            self.assertEqual(
+                MODULE.send_process_sigquit(identity),
+                ("pidfd-unavailable", "already_exited"),
+            )
+        kill.assert_not_called()
+
+    def test_pidfd_unavailable_live_capture_and_stop_fail_closed(self):
+        with mock.patch.object(MODULE, "procfs_available", return_value=True), \
+                mock.patch.object(MODULE, "read_process_starttime", return_value=77), \
+                mock.patch.object(MODULE, "process_exists", return_value=True), \
+                mock.patch.object(MODULE.os, "pidfd_open", None), \
+                mock.patch.object(MODULE.signal, "pidfd_send_signal", None), \
+                mock.patch.object(MODULE.os, "kill") as kill:
+            with self.assertRaisesRegex(MODULE.PlanError, "pidfd support is unavailable"):
+                MODULE.capture_process_identity(123)
+            with self.assertRaisesRegex(MODULE.PlanError, "pidfd support is unavailable"):
+                MODULE.stop_process_immediately(123)
+        kill.assert_not_called()
+
+    def test_stop_already_exited_does_not_wait(self):
+        identity = MODULE.ProcessIdentity(
+            123, 77, already_exited=True, status="already_exited"
+        )
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(MODULE, "wait_process_exit") as wait, \
+                mock.patch.object(MODULE, "close_process_identity"):
+            result = MODULE.stop_process_immediately(123)
+        wait.assert_not_called()
+        self.assertEqual(result.status, "already_exited")
+        self.assertEqual(result.wait_method, "already_exited")
+
+    def test_process_stop_waits_for_real_child_and_closes_pidfd(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            result = MODULE.stop_process_immediately(process.pid, timeout=5)
+            self.assertEqual(result.pid, process.pid)
+            self.assertEqual(result.signal_method, "pidfd_send_signal")
+            self.assertIn(result.wait_method, {"pidfd_poll", "proc_starttime"})
+            self.assertEqual(result.status, "signaled")
+            self.assertIsNotNone(process.wait(timeout=1))
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_materializer_stop_requires_signaled_status(self):
+        signaled = MODULE.ProcessStopResult(123, 77, "signaled", "pidfd_send_signal", "pidfd_poll")
+        MODULE.require_signaled_process_stop(signaled, "materializer")
+        already_exited = MODULE.ProcessStopResult(
+            123, 77, "already_exited", "already_exited", "already_exited"
+        )
+        with self.assertRaisesRegex(MODULE.UnexpectedExit, "did not signal"):
+            MODULE.require_signaled_process_stop(already_exited, "materializer")
+
+    def test_process_stop_timeout_is_bounded(self):
+        identity = MODULE.ProcessIdentity(123, 77)
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(
+                    MODULE, "send_process_sigquit",
+                    return_value=("mock", "signaled"),
+                ), \
+                mock.patch.object(MODULE, "wait_process_exit", side_effect=MODULE.HarnessTimeout("late")), \
+                mock.patch.object(MODULE, "close_process_identity") as close:
+            with self.assertRaises(MODULE.HarnessTimeout):
+                MODULE.stop_process_immediately(123, timeout=1)
+        close.assert_called_once_with(identity)
+
+    def test_pidfd_close_failure_does_not_mask_primary_failure(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        primary = MODULE.PlanError("signal failed")
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(MODULE, "send_process_sigquit", side_effect=primary), \
+                mock.patch.object(
+                    MODULE, "close_process_identity", side_effect=MODULE.PlanError("close failed")
+                ):
+            with self.assertRaisesRegex(MODULE.PlanError, "signal failed"):
+                MODULE.stop_process_immediately(123)
+
+    def test_pidfd_close_failure_is_reported_on_success(self):
+        identity = MODULE.ProcessIdentity(123, 77, 41)
+        with mock.patch.object(MODULE, "capture_process_identity", return_value=identity), \
+                mock.patch.object(
+                    MODULE, "send_process_sigquit",
+                    return_value=("pidfd_send_signal", "signaled"),
+                ), mock.patch.object(
+                    MODULE, "wait_process_exit", return_value="pidfd_poll"
+                ), mock.patch.object(
+                    MODULE, "close_process_identity", side_effect=MODULE.PlanError("close failed")
+                ):
+            with self.assertRaisesRegex(MODULE.PlanError, "close failed"):
+                MODULE.stop_process_immediately(123)
+
+    def test_recovery_retries_restartpoint_before_marker_and_retention(self):
+        source = (ROOT / "pagestore_harness.py").read_text(encoding="utf-8")
+        recovery = source.index(
+            '"recovered materializer did not replay the fault checkpoint"'
+        )
+        restartpoint = source.index(
+            "recovery_restartpoint_result = sql_result(", recovery
+        )
+        event = source.index('"recovery_restartpoint"', restartpoint)
+        marker = source.index(
+            '"recovered materializer did not publish the fault marker"', event
+        )
+        retention = source.index(
+            '"recovered retention owner did not advance beyond R1"', marker
+        )
+        self.assertLess(recovery, restartpoint)
+        self.assertLess(restartpoint, event)
+        self.assertLess(event, marker)
+        self.assertLess(marker, retention)
+        self.assertIn('materializer_socket, materializer_port, "CHECKPOINT;"',
+                      source[restartpoint:event])
+        self.assertNotIn("recovery_supervisor_pid", source[recovery:retention])
+        self.assertNotIn('"recovery-resume"', source[recovery:retention])
+
+    def test_restartpoint_hook_preserves_abi_and_durability_order(self):
+        source = (ROOT.parent / "pagestore.c").read_text(encoding="utf-8")
+        xlog = (ROOT.parent.parent.parent / "src/backend/access/transam/xlog.c").read_text(
+            encoding="utf-8"
+        )
+        header = (ROOT.parent.parent.parent / "src/include/access/xlog.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pagestore_materializer_recovery_start(XLogRecPtr redo_lsn)", source)
+        self.assertNotIn("durable_replay_lsn", source)
+        self.assertIn("recovery_start_hook_type) (XLogRecPtr redo_lsn);", header)
+        self.assertIn("recovery_restartpoint_pre_control_hook", header)
+        create = xlog.index('INJECTION_POINT("create-restart-point"')
+        control = xlog.index("LWLockAcquire(ControlFileLock", create)
+        self.assertIn("recovery_restartpoint_pre_control_hook", xlog[create:control])
+        pre = source.index("pagestore_materializer_restartpoint_pre_control")
+        post = source.index("pagestore_materializer_restartpoint_flush", pre)
+        pre_body = source[pre:post]
+        publish = source.index("pagestore_materializer_publish_marker")
+        self.assertIn("ps_fault_probe", source[publish:pre])
+        self.assertIn("pagestore_materializer_publish_marker(replay_lsn, true)", pre_body)
+        self.assertNotIn("PG_CATCH();", pre_body)
+        self.assertNotIn("ereport(WARNING", pre_body)
+        post_end = source.index("static XLogRecPtr", post)
+        post_body = source[post:post_end]
+        self.assertIn("pagestore_materialized_wal_lsn_internal", post_body)
+        self.assertIn("pagestore_materializer_retention_advance", post_body)
+        self.assertNotIn("pagestore_materializer_publish_marker", post_body)
+        self.assertIn("pagestore_materializer_marker_needs_publish", source)
+
+    def test_relation_observation_comparison_is_per_relation(self):
+        observations = {}
+        for name, key, blocks in (
+            ("relation_a", (1, 1, 1), 10),
+            ("relation_b", (1, 1, 2), 2),
+        ):
+            MODULE.record_relation_observation(
+                observations, name, "$R1",
+                {"relation_key": key, "main_nblocks": blocks}, "$R9",
+            )
+        self.assertTrue(
+            MODULE.record_relation_observation(
+                observations, "relation_a", "$R9",
+                {"relation_key": (1, 1, 1), "main_nblocks": 11}, "$R9",
+            )
+        )
+        self.assertTrue(
+            MODULE.record_relation_observation(
+                observations, "relation_b", "$R9",
+                {"relation_key": (1, 1, 2), "main_nblocks": 3}, "$R9",
+            )
+        )
+        self.assertEqual(len(observations), 4)
+
+    def test_materializer_status_and_fault_errors_have_specific_classes(self):
+        self.assertEqual(
+            MODULE.fault_failure_classification(MODULE.OracleMismatch("oracle")),
+            "oracle_mismatch",
+        )
+
+    def test_materializer_fault_requires_prior_r1_checkpoint(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        cases = [
+            [
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R2"},
+            ],
+            [
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R2"},
+                {"op": "checkpoint", "id": "late-r1", "target": "writer", "name": "R1"},
+            ],
+            [
+                {"op": "checkpoint", "id": "wrong", "target": "writer", "name": "OLD"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R2"},
+            ],
+        ]
+        for actions in cases:
+            path = self.write_plan([header, *actions])
+            plan = MODULE.read_plan(path)
+            MODULE.validate_plan(plan, capabilities)
+            with self.assertRaisesRegex(MODULE.PlanError, "prior checkpoint named R1"):
+                MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
+    def test_non_pause_fault_timeout_keeps_old_positive_semantics(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-error", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "set_fault", "id": "fault", "target": "store",
+             "fault": "daemon.after_ready", "action": "error", "hit": 1,
+             "timeout": 301},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_relation_metadata_sql_quotes_complete_predicate_once(self):
+        sql = MODULE.relation_metadata_sql("relation'with-quote")
+        self.assertEqual(
+            sql,
+            "SELECT COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text "
+            "|| '|' || d.oid::text || '|' || pg_relation_filenode(c.oid)::text "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_database d ON d.datname = current_database() "
+            "WHERE n.nspname = 'public' AND c.relname = 'relation''with-quote'",
+        )
+        self.assertEqual(sql.count("AND c.relname ="), 1)
+        self.assertNotIn("c.relname = AND", sql)
+
+    def test_fault_evidence_is_preserved_before_safe_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            control = root / "control"
+            trace = root / "trace"
+            control.mkdir()
+            trace.mkdir()
+            (control / "report.jsonl").write_text("{partial\n", encoding="utf-8")
+            target = root / "target"
+            target.write_text("do-not-follow", encoding="utf-8")
+            (control / "report-link").symlink_to(target)
+            MODULE._preserve_fault_evidence(control, trace)
+            evidence = trace / "materializer-fault-control"
+            self.assertEqual((evidence / "report.jsonl").read_text(), "{partial\n")
+            self.assertEqual((evidence / "report-link.symlink").read_text(), str(target))
+            MODULE._cleanup_fault_control(control)
+            self.assertFalse(control.exists())
+            self.assertEqual((evidence / "report.jsonl").read_text(), "{partial\n")
 
     def test_accepts_declared_horizon(self):
         path = self.write_plan([
@@ -322,6 +717,46 @@ class PlanValidationTests(unittest.TestCase):
                 report, "test.fault", 1, 123, "pause", "s", 9, "op", "timeout",
             )
             self.assertEqual(value["watchdog_ms"], 5000)
+
+    def test_materializer_fault_report_requires_actual_replay_lsn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "materializer.after_marker_sync",
+                "action": "pause", "scenario": "s", "seed": 9,
+                "hit": 1, "pid": 123, "operation": "op",
+                "state": "reached", "watchdog_ms": 0,
+                "replay_lsn": "0/2000000",
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "materializer.after_marker_sync", 1, 123, "pause",
+                "s", 9, "op", require_replay_lsn=True,
+            )
+            self.assertEqual(MODULE.parse_lsn_value(value["replay_lsn"]), 0x2000000)
+
+            report.write_text(json.dumps({
+                "schema": 1, "name": "materializer.after_marker_sync",
+                "action": "pause", "scenario": "s", "seed": 9,
+                "hit": 1, "pid": 123, "operation": "op",
+                "state": "reached", "watchdog_ms": 0,
+            }) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.FaultNotReached, "replay_lsn"):
+                MODULE._fault_report(
+                    report, "materializer.after_marker_sync", 1, 123, "pause",
+                    "s", 9, "op", require_replay_lsn=True,
+                )
+
+    def test_legacy_fault_report_allows_replay_lsn(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report = Path(temporary) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1, "name": "test.fault", "action": "crash",
+                "hit": 1, "pid": 123, "replay_lsn": "0/2000000",
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "test.fault", 1, 123, "crash", require_replay_lsn=True,
+            )
+            self.assertEqual(value["replay_lsn"], "0/2000000")
 
     def test_pause_timeout_bundle_contains_actionable_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -968,6 +1403,214 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_runtime_plan(
             MODULE.read_plan(path), capabilities, "materializer_smoke"
         )
+
+    def test_materializer_runtime_accepts_named_fault_and_relation_snapshots(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["scenario"] = "materializer-restartpoint-after-relation-sync-before-marker"
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+             "relation": "materializer_crash_relation", "lsn": "$R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_relation_sync", "action": "pause",
+             "hit": 1, "timeout": 65, "name": "R9"},
+            {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+             "relation": "materializer_crash_relation", "lsn": "$R9"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities)
+        MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
+    def test_materializer_scenarios_use_null_safe_full_row_oracle(self):
+        for name in (
+            "materializer_restartpoint_after_relation_sync_before_marker.jsonl",
+            "materializer_restartpoint_after_marker_sync.jsonl",
+        ):
+            plan = MODULE.read_plan(ROOT / "scenarios" / name)
+            assertion = next(
+                action for action in plan.actions if action["id"] == "new-value-visible"
+            )
+            self.assertIn(
+                "bool_and(v IS NOT DISTINCT FROM repeat(", assertion["sql"]
+            )
+            self.assertIn("count(*)::text", assertion["sql"])
+            self.assertNotIn("min(v)", assertion["sql"])
+
+    def test_fault_boundary_requires_same_relation_pre_fault_r1_inspection(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        cases = [
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R9"},
+            ],
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_b", "lsn": "$R9"},
+            ],
+            [
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R9"},
+                {"op": "inspect_relation", "id": "inspect-r9", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R9"},
+                {"op": "inspect_relation", "id": "inspect-r1", "target": "materializer",
+                 "relation": "relation_a", "lsn": "$R1"},
+            ],
+        ]
+        for actions in cases:
+            header = self.header()
+            header["case"]["compute"] = ["writer", "materializer"]
+            plan = MODULE.read_plan(self.write_plan([header, *actions]))
+            with self.assertRaisesRegex(MODULE.PlanError, "prior same-relation.*\\$R1"):
+                MODULE.validate_plan(plan, capabilities)
+            with self.assertRaisesRegex(MODULE.PlanError, "prior same-relation.*\\$R1"):
+                MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
+    def test_inspect_relation_requires_prior_boundary_reference(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        for lsn, expected in (
+            ("R1", "must reference"),
+            ("$R2", "no completed boundary"),
+        ):
+            path = self.write_plan([
+                header,
+                {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+                {"op": "inspect_relation", "id": "inspect", "target": "materializer",
+                 "relation": "materializer_crash_relation", "lsn": lsn},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 65, "name": "R2"},
+            ])
+            with self.assertRaisesRegex(MODULE.PlanError, expected):
+                MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_materializer_pause_timeout_covers_marker_work_and_margin(self):
+        self.assertEqual(MODULE.fault_watchdog_milliseconds(0.5), 500)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 65 seconds"):
+            MODULE.materializer_fault_watchdog_milliseconds(0.5)
+        with self.assertRaisesRegex(MODULE.PlanError, "at least 65 seconds"):
+            MODULE.materializer_fault_watchdog_milliseconds(64)
+        self.assertEqual(MODULE.materializer_fault_watchdog_milliseconds(65), 65000)
+
+    def test_inspect_relation_allows_dollar_prefixed_relation_name(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        plan = MODULE.read_plan(self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "inspect_relation", "id": "inspect", "target": "materializer",
+             "relation": "$relation", "lsn": "$R1"},
+        ]))
+        MODULE.validate_plan(plan, capabilities)
+
+    def test_cleanup_errors_preserve_temporary_materializer_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "bundle"
+            (root / "trace").mkdir(parents=True)
+            evidence = root / "failure.json"
+            evidence.write_text("evidence\n", encoding="utf-8")
+            cleanup_errors = ["postmaster: still running"]
+            MODULE.cleanup_temporary_root(root, True, False, cleanup_errors)
+            self.assertTrue(root.is_dir())
+            self.assertTrue(evidence.is_file())
+            MODULE.cleanup_temporary_root(root, True, False, [])
+            self.assertFalse(root.exists())
+
+    def test_materializer_fault_validates_scenario_identity(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["scenario"] = 'bad"scenario'
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 65, "name": "R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "scenario.*fault identity"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_materializer_runtime_rejects_non_pause_named_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "checkpoint", "id": "old", "target": "writer", "name": "R1"},
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "process_abort",
+             "hit": 1, "timeout": 65, "name": "R2"},
+        ])
+        plan = MODULE.read_plan(path)
+        with self.assertRaisesRegex(MODULE.PlanError, "allows action.*pause"):
+            MODULE.validate_plan(plan, capabilities)
+
+    def test_materializer_fault_rejects_unsafe_name(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 65, "name": "../R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "name must be a safe path component"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_materializer_fault_rejects_unbounded_timeout(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        path = self.write_plan([
+            header,
+            {"op": "materializer_fault", "id": "fault", "target": "materializer",
+             "fault": "materializer.after_marker_sync", "action": "pause",
+             "hit": 1, "timeout": 301, "name": "R2"},
+        ])
+        with self.assertRaisesRegex(MODULE.PlanError, "1..300000 milliseconds"):
+            MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_pause_fault_report_mock_allows_recovery_child_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.jsonl"
+            report.write_text(json.dumps({
+                "schema": 1,
+                "fault": "materializer.after_marker_sync",
+                "name": "materializer.after_marker_sync",
+                "action": "pause",
+                "hit": 1,
+                "pid": 43210,
+                "scenario": "materializer-restartpoint-after-marker-sync",
+                "seed": 1,
+                "operation": "fault-after-marker-sync",
+                "state": "reached",
+                "watchdog_ms": 0,
+            }) + "\n", encoding="utf-8")
+            value = MODULE._fault_report(
+                report, "materializer.after_marker_sync", 1, None, "pause",
+                "materializer-restartpoint-after-marker-sync", 1,
+                "fault-after-marker-sync",
+            )
+            self.assertEqual(value["pid"], 43210)
 
     def test_materializer_runtime_requires_exact_topology(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")

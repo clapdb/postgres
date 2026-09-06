@@ -4651,6 +4651,7 @@ control_file_flush_hook_type control_file_flush_hook = NULL;
 
 /* Post-buffer-flush publication point for recovery materializers. */
 recovery_restartpoint_flush_hook_type recovery_restartpoint_flush_hook = NULL;
+recovery_restartpoint_pre_control_hook_type recovery_restartpoint_pre_control_hook = NULL;
 recovery_start_hook_type recovery_start_hook = NULL;
 
 static inline void
@@ -8466,6 +8467,16 @@ CreateRestartPoint(int flags)
 	 * work has already happened during this checkpoint.
 	 */
 	INJECTION_POINT("create-restart-point", NULL);
+
+	/*
+	 * Publish any external relation/marker durability before pg_control is
+	 * advanced.  A failure leaves the old local restartpoint authoritative and
+	 * lets recovery retry this restartpoint safely.
+	 */
+	if (recovery_restartpoint_pre_control_hook &&
+		!XLogRecPtrIsInvalid(flushReplayPtr))
+		(*recovery_restartpoint_pre_control_hook) (flushReplayPtr,
+											 lastCheckPoint.redo);
 
 	/*
 	 * Remember the prior checkpoint's redo ptr for

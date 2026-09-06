@@ -39,12 +39,14 @@
       "io_unit": 262144
     },
     "materializer_smoke": {
-      "operations": ["sql", "checkpoint", "crash", "assert"],
+      "operations": ["sql", "checkpoint", "materializer_fault", "inspect_relation", "crash", "assert"],
       "constraints": {
         "sql": {"target": ["writer"], "forbidden_fields": ["expect_error", "expect_sqlstate"]},
         "checkpoint": {"target": ["writer"]},
         "crash": {"target": ["materializer"], "model": ["compute"], "forbidden_fields": ["fault"]},
-        "assert": {"target": ["writer", "materializer"], "oracle": ["sql_scalar"]}
+        "assert": {"target": ["writer", "materializer"], "oracle": ["sql_scalar"]},
+        "materializer_fault": {"target": ["materializer"], "action": ["pause"]},
+        "inspect_relation": {"target": ["materializer"]}
       },
       "protocol_version": 45,
       "page_size": 8192,
@@ -71,6 +73,8 @@
     "crash",
     "advance",
     "assert",
+    "materializer_fault",
+    "inspect_relation",
     "parallel",
     "wait",
     "sync",
