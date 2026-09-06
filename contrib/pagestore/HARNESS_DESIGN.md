@@ -342,11 +342,11 @@ The interface explains failures and proves fault reachability.  SQL-visible
 state remains the primary external correctness oracle.
 
 The first implementation is `pagestore_inspect`, a separate read-only client
-of the existing private shared-memory transport.  It implements `health` and
-`backpressure` only, emits schema-validated JSON, and never claims a mailbox.
-The timeline, relation, manifest, and GC operations above remain planned until
-they can be exposed without creating a mutation or production-management
-surface.
+of the existing private shared-memory transport.  The H0 foundation provides
+schema-validated aggregate observations plus a per-timeline query foundation
+and never claims a mailbox.  Relation inspection remains a planned,
+non-advertised H1 operation until it can be exposed without creating a
+mutation or production-management surface.
 
 ## Fault model
 

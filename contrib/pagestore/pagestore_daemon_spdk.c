@@ -208,15 +208,35 @@ request_is_write(PsOpcode opcode)
 	}
 }
 
+/* These metadata mutations refresh the read-only inspection snapshot from
+ * ps_core_inspection_request_complete().  Keep their IPC completion behind
+ * both the frontend locks and that refresh, matching the POSIX frontend. */
+static int
+inspection_completion_required(PsOpcode opcode)
+{
+	switch (opcode)
+	{
+		case PS_OP_CREATE_BRANCH:
+		case PS_OP_RETENTION_PIN_SET:
+		case PS_OP_RETENTION_PIN_RESERVE:
+		case PS_OP_RETENTION_PIN_DROP:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
 /*
  * Begin serving the request on channel 'i'.  Synchronous ops (metadata, buffered
- * writes) finish and publish DONE here; read ops submit their page reads and
- * return, leaving DONE to read_done().  Index pointers from read_through() are
- * dereferenced (seg/off taken) synchronously here, never held across the async
- * wait, so a concurrent write reallocating a version array cannot dangle them.
+ * writes) normally finish and publish DONE here; inspection-affecting metadata
+ * callers pass defer_done so run_request() can publish after the post-lock
+ * inspection hook.  Read ops submit their page reads and return, leaving DONE
+ * to read_done().  Index pointers from read_through() are dereferenced
+ * (seg/off taken) synchronously here, never held across the async wait, so a
+ * concurrent write reallocating a version array cannot dangle them.
  */
 static void
-begin(uint32_t i, PsChannel *ch)
+begin(uint32_t i, PsChannel *ch, int defer_done)
 {
 	uint32_t	tl = ch->timeline;
 
@@ -233,7 +253,8 @@ begin(uint32_t i, PsChannel *ch)
 
 	if (ps_handle_meta(ch))
 	{
-		ps_store_release(&ch->state, PS_STATE_DONE);
+		if (!defer_done)
+			ps_store_release(&ch->state, PS_STATE_DONE);
 		return;
 	}
 
@@ -469,12 +490,16 @@ run_request(uint32_t i, PsChannel *ch)
 		timeline_ok = ps_timeline_defined(ch->timeline);
 		pthread_rwlock_unlock(&core_rwlock);
 		if (timeline_ok)
-			begin(i, ch);
+		{
+			begin(i, ch, 1);
+			ps_core_inspection_request_complete(op, ch->status);
+		}
 		else
 		{
 			ch->status = PS_STATUS_ERROR;
-			ps_store_release(&ch->state, PS_STATE_DONE);
+			ps_core_inspection_request_complete(op, ch->status);
 		}
+		ps_store_release(&ch->state, PS_STATE_DONE);
 		return 1;
 	}
 
@@ -516,7 +541,7 @@ run_request(uint32_t i, PsChannel *ch)
 	 * in-memory insertion.  Do not extend this lock across async page I/O. */
 	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
 		ps_lock_shard_wr(ps_shard_of(&ch->key));
-	begin(i, ch);
+	begin(i, ch, inspection_completion_required(op));
 	if (op == PS_OP_WAL_INDEX_ADD || op == PS_OP_WAL_INDEX_ADD_BATCH)
 		ps_unlock_shard(ps_shard_of(&ch->key));
 	if (op == PS_OP_CREATE_BRANCH || op == PS_OP_CHECK_BRANCH ||
@@ -525,6 +550,9 @@ run_request(uint32_t i, PsChannel *ch)
 	if (is_write)
 		ps_admission_read_unlock();
 	pthread_rwlock_unlock(&core_rwlock);
+	ps_core_inspection_request_complete(op, ch->status);
+	if (inspection_completion_required(op))
+		ps_store_release(&ch->state, PS_STATE_DONE);
 	return 1;
 }
 

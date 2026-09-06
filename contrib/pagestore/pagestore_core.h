@@ -68,6 +68,13 @@ extern int	ps_core_maintenance(void);
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 extern void ps_core_set_metrics_header(PsShmHeader *hdr);
+/* Opportunistically publish read-only diagnostics when the maintenance-side
+ * refresh rate limit permits, without running tiering, GC, or compaction work.
+ * This is best effort: long synchronous maintenance may defer publication;
+ * metadata completion paths use the immediate publication path separately. */
+extern void ps_core_inspection_refresh(void);
+extern void ps_core_inspection_request_complete(PsOpcode opcode,
+										 uint32_t status);
 
 /* Runtime lifecycle gate.  POSIX frontend requests and complete maintenance
  * work take the read side; destructive lifecycle transitions take the write
@@ -139,6 +146,11 @@ extern int ps_test_walidx_force_due(uint32_t timeline);
 extern int ps_test_walidx_gc_force_due(uint32_t timeline);
 extern uint64_t ps_test_backpressure_walidx_observation_count(void);
 extern uint64_t ps_test_backpressure_forkmeta_observation_count(void);
+extern uint64_t ps_test_page_gc_debt_segments(uint32_t shard);
+extern int ps_test_page_gc_debt_unavailable(uint32_t shard);
+#ifdef PAGESTORE_BACKPRESSURE_TEST
+extern uint64_t ps_test_page_gc_coverage_observation_count(void);
+#endif
 
 /* Test-only observability for deterministic admission/cutover overlap.  The
  * admission callback runs after a test operation acquires admission-rd.

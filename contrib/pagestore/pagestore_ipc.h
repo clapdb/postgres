@@ -29,7 +29,10 @@
 #include <stdint.h>
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
-#define PS_SHM_VERSION		40	/* 40: forkmeta reclaim backpressure metrics;
+#define PS_SHM_VERSION		43	/* 43: explicit unavailable PAGE-debt diagnostics;
+								 * 42: per-timeline inspection snapshots;
+								 * 41: bounded runtime inspection snapshots;
+							 * 40: forkmeta reclaim backpressure metrics;
 								 * 39: WAL-index reclaim backpressure metrics;
 								 * 38: request generations and daemon-owned
 								 * shutdown cancellation state;
@@ -368,6 +371,59 @@ typedef struct PsBackpressureMetrics
 	uint64_t	foreground_wait_ns;
 } PsBackpressureMetrics;
 
+#define PS_INSPECTION_MAX_TIMELINES	1024
+
+/* One immutable timeline entry in the diagnostic publication.  `defined` is
+ * an internal presence bit; inspectors expose only the three contract fields.
+ * The signed parent makes the root's -1 unambiguous. */
+typedef struct PsInspectionTimeline
+{
+	int64_t		parent_timeline;
+	uint64_t	fork_lsn;
+	uint64_t	retained_horizon;
+	uint32_t	defined;
+	uint32_t	reserved;
+} PsInspectionTimeline;
+
+/* A bounded runtime diagnostic snapshot.  Writers publish the complete
+ * structure under inspection_metrics_seq; readers never inspect live core
+ * state or claim a channel.  Plain fields are intentional: the sequence is
+ * the coherence mechanism for this private protocol object. */
+typedef struct PsInspectionMetrics
+{
+	uint64_t	timeline_count;
+	uint64_t	live_timelines;
+	uint64_t	deleting_timelines;
+	uint64_t	deleted_timelines;
+	uint32_t	metadata_poisoned;
+	uint32_t	reserved1;
+
+	uint64_t	layer_count;
+	uint64_t	deleting_layers;
+	uint64_t	local_layers;
+	uint64_t	remote_durable_layers;
+	uint32_t	manifest_poisoned;
+	uint32_t	reserved2;
+
+	uint64_t	page_debt_segments;
+	uint64_t	gc_deleting_layers;
+	uint64_t	remote_cleanup_pending;
+	uint32_t	forkmeta_pending;
+	uint32_t	page_debt_unavailable;
+
+	uint64_t	owner_count;
+	uint64_t	page_history_owners;
+	uint64_t	wal_owners;
+	uint64_t	wal_index_owners;
+	uint64_t	max_generation;
+	uint32_t	retention_poisoned;
+	uint32_t	reserved4;
+	uint32_t	forkmeta_poisoned;
+	uint32_t	reserved5;
+
+	PsInspectionTimeline timeline_entries[PS_INSPECTION_MAX_TIMELINES];
+} PsInspectionMetrics;
+
 typedef struct PsShmHeader
 {
 	uint32_t	magic;
@@ -395,6 +451,8 @@ typedef struct PsShmHeader
 	PsBackpressureMetrics wal_backpressure;
 	PsBackpressureMetrics walidx_backpressure;
 	PsBackpressureMetrics forkmeta_backpressure;
+	uint64_t	inspection_metrics_seq;
+	PsInspectionMetrics inspection;
 } PsShmHeader;
 
 #define PS_CHANNELS_OFF		(((sizeof(PsShmHeader) + 63) / 64) * 64)
@@ -454,6 +512,12 @@ static inline uint64_t
 ps_fetch_add_u64(volatile uint64_t *p, uint64_t v)
 {
 	return __atomic_fetch_add(p, v, __ATOMIC_ACQ_REL);
+}
+
+static inline uint64_t
+ps_saturating_add_u64(uint64_t a, uint64_t b)
+{
+	return UINT64_MAX - a < b ? UINT64_MAX : a + b;
 }
 
 static inline int

@@ -1,8 +1,8 @@
 {
-  "schema": 1,
+  "schema": 2,
   "transport": "private-test-ipc",
   "mutating_operations": [],
-  "implemented_operations": ["health", "backpressure", "pruning"],
+  "implemented_operations": ["health", "timeline", "manifest", "gc", "owners", "backpressure", "pruning"],
   "operations": {
     "health": {
       "response": ["protocol_version", "page_size", "io_unit", "nchannels", "nshards", "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn"]
@@ -16,10 +16,13 @@
       "response": ["exists", "forks", "nblocks", "selected_lsn"]
     },
     "manifest": {
-      "response": ["generation", "checksum", "live_layers", "pending_delete_layers"]
+      "response": ["layer_count", "deleting_layers", "local_layers", "remote_durable_layers", "manifest_poisoned"]
     },
     "gc": {
-      "response": ["retained_horizons", "queue_length", "completed_phase"]
+      "response": ["page_debt_segments", "page_debt_unavailable", "deleting_layers", "remote_cleanup_pending", "forkmeta_pending", "forkmeta_poisoned"]
+    },
+    "owners": {
+      "response": ["owner_count", "page_history_owners", "wal_owners", "wal_index_owners", "max_generation", "retention_poisoned"]
     },
     "backpressure": {
       "response": ["idle", "claimed", "request", "done", "shards", "wal_index_pending_bytes", "wal_index_lagging_timelines", "page_lag_bytes", "page_high_water_bytes", "page_catchup_bytes", "page_throttled", "page_throttle_enters", "page_throttle_exits", "page_foreground_wait_ns", "wal_lag_bytes", "wal_high_water_bytes", "wal_catchup_bytes", "wal_throttled", "wal_throttle_enters", "wal_throttle_exits", "wal_foreground_wait_ns", "walidx_lag_bytes", "walidx_high_water_bytes", "walidx_catchup_bytes", "walidx_throttled", "walidx_throttle_enters", "walidx_throttle_exits", "walidx_foreground_wait_ns", "forkmeta_lag_bytes", "forkmeta_high_water_bytes", "forkmeta_catchup_bytes", "forkmeta_throttled", "forkmeta_throttle_enters", "forkmeta_throttle_exits", "forkmeta_foreground_wait_ns"]
