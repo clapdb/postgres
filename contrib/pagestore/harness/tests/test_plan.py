@@ -19,19 +19,19 @@ SPEC.loader.exec_module(MODULE)
 
 CAPABILITIES = {
     "schema": 1,
-    "inspection_schema": 2,
+    "inspection_schema": 4,
     "storage": ["posix"],
     "shards": [1],
     "compute": ["writer", "reader"],
     "crash_models": ["power_loss"],
     "operations": ["sql", "checkpoint", "prepare_reader", "assert", "crash"],
     "inspection_operations": [
-        "health", "timeline", "manifest", "gc", "owners", "backpressure", "pruning",
+        "health", "timeline", "relation", "manifest", "gc", "owners", "backpressure", "pruning",
     ],
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 43,
+            "operations": ["crash"], "protocol_version": 45,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -348,7 +348,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 43, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 45, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -568,8 +568,8 @@ class PlanValidationTests(unittest.TestCase):
     def test_inspection_schema_is_read_only_and_versioned(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
-        self.assertEqual(schema["schema"], 2)
-        self.assertEqual(capabilities["inspection_schema"], 2)
+        self.assertEqual(schema["schema"], 4)
+        self.assertEqual(capabilities["inspection_schema"], 4)
         self.assertEqual(schema["transport"], "private-test-ipc")
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
@@ -577,8 +577,8 @@ class PlanValidationTests(unittest.TestCase):
             {"health", "timeline", "manifest", "gc", "owners", "backpressure",
              "pruning", "relation"},
         )
-        self.assertNotIn("relation", schema["implemented_operations"])
-        self.assertNotIn("relation", capabilities["inspection_operations"])
+        self.assertIn("relation", schema["implemented_operations"])
+        self.assertIn("relation", capabilities["inspection_operations"])
 
     def test_inspection_schema_advertises_exact_response_fields(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
@@ -599,8 +599,80 @@ class PlanValidationTests(unittest.TestCase):
                 "owner_count", "page_history_owners", "wal_owners",
                 "wal_index_owners", "max_generation", "retention_poisoned",
             ],
+            "relation": ["exists", "forks", "selected_version"],
         }.items():
             self.assertEqual(schema["operations"][operation]["response"], fields)
+
+    def test_relation_inspection_validates_nested_read_only_response(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        result = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                "exists": True,
+                "forks": [{"fork": 0, "nblocks": 3}],
+                "selected_version": None,
+            }),
+            stderr="",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=result) as run:
+            value = MODULE.inspect_store(
+                Path("/inspect"), "/unused", "relation", schema,
+                timeline=7, incarnation=9, relation_key=(1663, 1, 42), lsn=123,
+            )
+        self.assertTrue(value["exists"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/inspect", "--shm", "/unused", "relation", "7", "9", "1663", "1", "42", "123"],
+        )
+
+    def test_relation_inspection_requires_positive_incarnation(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for incarnation in (None, 0, -1, True):
+            with self.subTest(incarnation=incarnation), self.assertRaisesRegex(
+                MODULE.PlanError, "positive incarnation"
+            ):
+                MODULE.inspect_store(
+                    Path("/inspect"), "/unused", "relation", schema,
+                    timeline=7, incarnation=incarnation,
+                    relation_key=(1663, 1, 42), lsn=123,
+                )
+
+    def test_relation_inspection_validates_native_fork_invariants(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        valid = {
+            "exists": True,
+            "forks": [{"fork": 0, "nblocks": 3}, {"fork": 2, "nblocks": 1}],
+            "selected_version": None,
+        }
+        invalid_cases = [
+            ("too many forks", {"fork": 3, "nblocks": 1}),
+            ("fork number out of range", [{"fork": 0, "nblocks": 1}, {"fork": 4, "nblocks": 1}]),
+            ("out of order forks", [{"fork": 1, "nblocks": 1}, {"fork": 0, "nblocks": 1}]),
+            ("duplicate forks", [{"fork": 0, "nblocks": 1}, {"fork": 0, "nblocks": 2}]),
+            ("exists without main fork", {"exists": True, "forks": []}),
+            ("main fork without exists", {"exists": False, "forks": [{"fork": 0, "nblocks": 1}]}),
+        ]
+        for label, change in invalid_cases:
+            with self.subTest(label=label):
+                response = dict(valid)
+                if label == "too many forks":
+                    response["forks"] = valid["forks"] + [change, change, change]
+                elif label in {"fork number out of range", "out of order forks", "duplicate forks"}:
+                    response["forks"] = change
+                else:
+                    response.update(change)
+                result = mock.Mock(
+                    returncode=0, stdout=json.dumps(response), stderr=""
+                )
+                with (
+                    mock.patch.object(MODULE.subprocess, "run", return_value=result),
+                    self.assertRaisesRegex(MODULE.PlanError, "fork|exists"),
+                ):
+                    MODULE.inspect_store(
+                        Path("/inspect"), "/unused", "relation", schema,
+                        timeline=7, incarnation=9,
+                        relation_key=(1663, 1, 42), lsn=123,
+                    )
 
     def test_inspector_response_must_match_schema(self):
         directory = tempfile.TemporaryDirectory()
@@ -609,7 +681,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "*) exit 1 ;;\n"
@@ -649,6 +721,19 @@ class PlanValidationTests(unittest.TestCase):
                     Path("/inspect"), "/unused", operation, schema, timeline=7
                 )
 
+    def test_relation_only_cli_flags_are_rejected_for_other_inspections(self):
+        base = [
+            "--capabilities", str(ROOT / "capabilities.json"),
+            "--inspect", "health", "--inspect-binary", "/inspect", "--shm", "/unused",
+        ]
+        for flag in ("--incarnation", "--spc-oid", "--db-oid", "--rel-number", "--lsn"):
+            with self.subTest(flag=flag):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        MODULE.parse_args([*base, flag, "1"])
+                self.assertNotEqual(raised.exception.code, 0)
+                self.assertIn("only valid with --inspect relation", stderr.getvalue())
+
     def test_timeline_inspection_requires_a_nonnegative_integer_id(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         for timeline in (None, -1, True):
@@ -682,6 +767,8 @@ class PlanValidationTests(unittest.TestCase):
         )
 
         for operation, fields in MODULE.INSPECTION_RESPONSES.items():
+            if operation == "relation":
+                continue
             valid = {
                 field: (
                     False if field in MODULE.INSPECTION_BOOLEAN_FIELDS
@@ -1276,7 +1363,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 43, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 45, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -1293,7 +1380,7 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\n"
             "case \"$3\" in\n"
             "health) printf '%s\\n' '"
-            "{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
+            "{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1325,6 +1412,8 @@ class PlanValidationTests(unittest.TestCase):
             "\"forkmeta_throttle_exits\":0,\"forkmeta_foreground_wait_ns\":0}' ;;\n"
             "pruning) printf '%s\\n' '{\"compactions\":0,\"versions_scanned\":0,"
             "\"versions_kept\":0,\"versions_deleted\":0}' ;;\n"
+            "relation) printf '%s\\n' '{\"exists\":false,\"forks\":[],"
+            "\"selected_version\":null}' ;;\n"
             "*) echo 'unsupported operation' >&2; exit 1 ;;\n"
             "esac\n",
             encoding="utf-8",
@@ -1485,7 +1574,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1522,6 +1611,8 @@ class PlanValidationTests(unittest.TestCase):
             "pruning) printf '%s\\n' "
             "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
             "\"versions_deleted\":0}' ;;\n"
+            "relation) printf '%s\\n' "
+            "'{\"exists\":false,\"forks\":[],\"selected_version\":null}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -1588,7 +1679,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":43,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1625,6 +1716,8 @@ class PlanValidationTests(unittest.TestCase):
             "pruning) printf '%s\\n' "
             "'{\"compactions\":0,\"versions_scanned\":0,\"versions_kept\":0,"
             "\"versions_deleted\":0}' ;;\n"
+            "relation) printf '%s\\n' "
+            "'{\"exists\":false,\"forks\":[],\"selected_version\":null}' ;;\n"
             "esac\n",
             encoding="utf-8",
         )

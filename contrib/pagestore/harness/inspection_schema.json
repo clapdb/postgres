@@ -1,8 +1,8 @@
 {
-  "schema": 2,
+  "schema": 4,
   "transport": "private-test-ipc",
   "mutating_operations": [],
-  "implemented_operations": ["health", "timeline", "manifest", "gc", "owners", "backpressure", "pruning"],
+  "implemented_operations": ["health", "timeline", "relation", "manifest", "gc", "owners", "backpressure", "pruning"],
   "operations": {
     "health": {
       "response": ["protocol_version", "page_size", "io_unit", "nchannels", "nshards", "admission_fence_epoch", "admission_pending_epoch", "admission_pending_lsn"]
@@ -12,8 +12,13 @@
       "response": ["parent_timeline", "fork_lsn", "retained_horizon"]
     },
     "relation": {
-      "request": ["timeline", "key", "lsn"],
-      "response": ["exists", "forks", "nblocks", "selected_lsn"]
+      "request": ["timeline", "incarnation", "key", "lsn"],
+      "response": ["exists", "forks", "selected_version"],
+      "response_types": {
+        "exists": "boolean",
+        "forks": "array",
+        "selected_version": "null"
+      }
     },
     "manifest": {
       "response": ["layer_count", "deleting_layers", "local_layers", "remote_durable_layers", "manifest_poisoned"]
