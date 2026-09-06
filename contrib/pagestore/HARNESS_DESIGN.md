@@ -332,7 +332,7 @@ operations:
 ```text
 health() -> format, generation, shard count, last durable LSN
 timeline(id) -> parent, fork LSN, retained horizon
-relation(timeline, key, lsn) -> existence, forks, nblocks, selected version
+relation(timeline, incarnation, key, lsn) -> existence, forks, nblocks, selected version
 manifest() -> generation, checksum, live layers, pending deletion
 gc() -> retained horizons, queue length, completed phase
 backpressure() -> per-shard queued/in-flight work and admission state

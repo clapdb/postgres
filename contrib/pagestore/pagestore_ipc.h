@@ -30,7 +30,8 @@
 
 #define PS_SHM_MAGIC		0x50414753	/* "PAGS" */
 
-#define PS_SHM_VERSION		44	/* 44: isolated relation inspection request;
+#define PS_SHM_VERSION		45	/* 45: relation inspection incarnation fence;
+								 * 44: isolated relation inspection request;
 							 * relation inspection uses an fd lock and
 							 * publishes directly IDLE -> REQUEST;
 								 * 43: explicit unavailable PAGE-debt diagnostics;
@@ -106,6 +107,11 @@
 #define PS_SHM_STARTING		0
 #define PS_SHM_READY		1
 #define PS_SHM_STOPPING		2
+
+/* Frontend capabilities published in PsShmHeader.  The POSIX frontend owns
+ * the fcntl-backed relation mailbox; the optional SPDK frontend deliberately
+ * leaves this bit clear until it has an equivalent control path. */
+#define PS_FRONTEND_CAP_RELATION_INSPECTION	(UINT32_C(1) << 0)
 
 /* Operation codes */
 typedef enum PsOpcode
@@ -223,9 +229,9 @@ typedef struct PsInspectionFork
 	uint32_t	nblocks;
 } PsInspectionFork;
 
-/* selected_version is intentionally unavailable in protocol 44.  A relation
- * consists of multiple independently versioned forks and the current core has
- * no single durable version identity that covers the aggregate.  The explicit
+/* selected_version is intentionally unavailable.  A relation consists of
+ * multiple independently versioned forks and the current core has no single
+ * durable version identity that covers the aggregate.  The explicit
  * availability bit prevents clients from treating the numeric field as real. */
 typedef struct PsInspectionRelationResult
 {
@@ -248,6 +254,7 @@ typedef struct PsInspectionRequest
 	uint64_t	deadline_ns;
 	uint32_t	timeline;
 	uint32_t	reserved;
+	uint64_t	expected_incarnation;
 	uint64_t	lsn;
 	PsKey		key;
 	PsInspectionRelationResult relation;
@@ -501,6 +508,8 @@ typedef struct PsShmHeader
 	uint64_t	wal_index_pending_bytes; /* shipped WAL not durably indexed */
 	uint32_t	wal_index_lagging_timelines;
 	uint32_t	startup_state; /* atomic: PS_SHM_{STARTING,READY,STOPPING} */
+	uint32_t	frontend_capabilities; /* PS_FRONTEND_CAP_* */
+	uint32_t	reserved_frontend;
 	uint64_t	page_prune_metrics_seq;
 	uint64_t	page_prune_compactions;
 	uint64_t	page_prune_versions_scanned;

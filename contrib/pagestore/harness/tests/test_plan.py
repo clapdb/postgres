@@ -19,7 +19,7 @@ SPEC.loader.exec_module(MODULE)
 
 CAPABILITIES = {
     "schema": 1,
-    "inspection_schema": 3,
+    "inspection_schema": 4,
     "storage": ["posix"],
     "shards": [1],
     "compute": ["writer", "reader"],
@@ -31,7 +31,7 @@ CAPABILITIES = {
     "postgres_major": [13, 14, 15, 16, 17, 18, 19],
     "runtimes": {
         "daemon_smoke": {
-            "operations": ["crash"], "protocol_version": 44,
+            "operations": ["crash"], "protocol_version": 45,
             "page_size": 8192, "io_unit": 262144,
             "constraints": {
                 "crash": {
@@ -348,7 +348,7 @@ class PlanValidationTests(unittest.TestCase):
         self.addCleanup(MODULE.os.chdir, previous_cwd)
         root = Path("run")
         health = {
-            "protocol_version": 44, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 45, "page_size": 8192, "io_unit": 262144,
             "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
             "admission_pending_epoch": 0, "admission_pending_lsn": 0,
         }
@@ -568,8 +568,8 @@ class PlanValidationTests(unittest.TestCase):
     def test_inspection_schema_is_read_only_and_versioned(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
-        self.assertEqual(schema["schema"], 3)
-        self.assertEqual(capabilities["inspection_schema"], 3)
+        self.assertEqual(schema["schema"], 4)
+        self.assertEqual(capabilities["inspection_schema"], 4)
         self.assertEqual(schema["transport"], "private-test-ipc")
         self.assertEqual(schema["mutating_operations"], [])
         self.assertEqual(
@@ -617,13 +617,25 @@ class PlanValidationTests(unittest.TestCase):
         with mock.patch.object(MODULE.subprocess, "run", return_value=result) as run:
             value = MODULE.inspect_store(
                 Path("/inspect"), "/unused", "relation", schema,
-                timeline=7, relation_key=(1663, 1, 42), lsn=123,
+                timeline=7, incarnation=9, relation_key=(1663, 1, 42), lsn=123,
             )
         self.assertTrue(value["exists"])
         self.assertEqual(
             run.call_args.args[0],
-            ["/inspect", "--shm", "/unused", "relation", "7", "1663", "1", "42", "123"],
+            ["/inspect", "--shm", "/unused", "relation", "7", "9", "1663", "1", "42", "123"],
         )
+
+    def test_relation_inspection_requires_positive_incarnation(self):
+        schema = MODULE.read_json(ROOT / "inspection_schema.json")
+        for incarnation in (None, 0, -1, True):
+            with self.subTest(incarnation=incarnation), self.assertRaisesRegex(
+                MODULE.PlanError, "positive incarnation"
+            ):
+                MODULE.inspect_store(
+                    Path("/inspect"), "/unused", "relation", schema,
+                    timeline=7, incarnation=incarnation,
+                    relation_key=(1663, 1, 42), lsn=123,
+                )
 
     def test_relation_inspection_validates_native_fork_invariants(self):
         schema = MODULE.read_json(ROOT / "inspection_schema.json")
@@ -658,7 +670,8 @@ class PlanValidationTests(unittest.TestCase):
                 ):
                     MODULE.inspect_store(
                         Path("/inspect"), "/unused", "relation", schema,
-                        timeline=7, relation_key=(1663, 1, 42), lsn=123,
+                        timeline=7, incarnation=9,
+                        relation_key=(1663, 1, 42), lsn=123,
                     )
 
     def test_inspector_response_must_match_schema(self):
@@ -668,7 +681,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":44,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "*) exit 1 ;;\n"
@@ -713,7 +726,7 @@ class PlanValidationTests(unittest.TestCase):
             "--capabilities", str(ROOT / "capabilities.json"),
             "--inspect", "health", "--inspect-binary", "/inspect", "--shm", "/unused",
         ]
-        for flag in ("--spc-oid", "--db-oid", "--rel-number", "--lsn"):
+        for flag in ("--incarnation", "--spc-oid", "--db-oid", "--rel-number", "--lsn"):
             with self.subTest(flag=flag):
                 with contextlib.redirect_stderr(io.StringIO()) as stderr:
                     with self.assertRaises(SystemExit) as raised:
@@ -1350,7 +1363,7 @@ class PlanValidationTests(unittest.TestCase):
     def test_runtime_requires_advertised_inspection_operations(self):
         path = self.write_plan([self.header()])
         health = {
-            "protocol_version": 44, "page_size": 8192, "io_unit": 262144,
+            "protocol_version": 45, "page_size": 8192, "io_unit": 262144,
             "nshards": 1,
         }
         schema = {"implemented_operations": ["health"]}
@@ -1367,7 +1380,7 @@ class PlanValidationTests(unittest.TestCase):
             "#!/bin/sh\n"
             "case \"$3\" in\n"
             "health) printf '%s\\n' '"
-            "{\"protocol_version\":44,\"page_size\":8192,\"io_unit\":262144,"
+            "{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1561,7 +1574,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":44,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"
@@ -1666,7 +1679,7 @@ class PlanValidationTests(unittest.TestCase):
         inspector.write_text(
             "#!/bin/sh\ncase \"$3\" in\n"
             "health) printf '%s\\n' "
-            "'{\"protocol_version\":44,\"page_size\":8192,\"io_unit\":262144,"
+            "'{\"protocol_version\":45,\"page_size\":8192,\"io_unit\":262144,"
             "\"nchannels\":128,\"nshards\":1,\"admission_fence_epoch\":0,"
             "\"admission_pending_epoch\":0,\"admission_pending_lsn\":0}' ;;\n"
             "timeline) printf '%s\\n' '"

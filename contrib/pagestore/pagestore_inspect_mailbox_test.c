@@ -100,6 +100,7 @@ init_header(PsShmHeader *hdr, uint32_t state, uint64_t generation)
 	hdr->nshards = 1;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION;
 	hdr->startup_state = PS_SHM_READY;
 	hdr->daemon_instance = 1;
 	hdr->inspection_request.request_generation = generation;
@@ -151,7 +152,7 @@ start_inspector(const char *inspector, const char *name)
 	if (pid == 0)
 	{
 		execl(inspector, inspector, "--shm", name, "relation", "0", "1",
-			  "1", "42", "0", (char *) NULL);
+			  "1", "1", "42", "0", (char *) NULL);
 		_exit(127);
 	}
 	return pid;

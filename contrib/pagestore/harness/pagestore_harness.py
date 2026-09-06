@@ -484,7 +484,7 @@ INSPECTION_PLANNED_RESPONSES = {}
 INSPECTION_PLANNED_OPERATIONS = set(INSPECTION_PLANNED_RESPONSES)
 INSPECTION_REQUESTS = {
     "timeline": ("timeline",),
-    "relation": ("timeline", "key", "lsn"),
+    "relation": ("timeline", "incarnation", "key", "lsn"),
 }
 INSPECTION_BOOLEAN_FIELDS = {
     "retention_poisoned", "manifest_poisoned",
@@ -495,7 +495,7 @@ INSPECTION_COUNTER_FIELDS = (
     set().union(*INSPECTION_RESPONSES.values())
     - INSPECTION_BOOLEAN_FIELDS - INSPECTION_SIGNED_FIELDS
 )
-INSPECTION_SCHEMA_VERSION = 3
+INSPECTION_SCHEMA_VERSION = 4
 INSPECTION_TRANSPORT = "private-test-ipc"
 PG_CONTROL_FILE_SIZE = 8192
 
@@ -917,6 +917,7 @@ def probe_runtime_inspection(
         observations[operation] = inspect_store(
             inspector, shm, operation, inspection_schema,
             timeline=0 if operation in {"timeline", "relation"} else None,
+            incarnation=1 if operation == "relation" else None,
             relation_key=(1, 1, 1) if operation == "relation" else None,
             lsn=0 if operation == "relation" else None,
         )
@@ -1147,6 +1148,7 @@ def inspect_store(
     operation: str,
     schema: dict[str, Any],
     timeline: int | None = None,
+    incarnation: int | None = None,
     relation_key: tuple[int, int, int] | None = None,
     lsn: int | None = None,
 ) -> dict[str, Any]:
@@ -1171,6 +1173,14 @@ def inspect_store(
         if not isinstance(timeline, int) or isinstance(timeline, bool) or timeline < 0:
             raise PlanError("inspection operation 'relation' requires a nonnegative timeline ID")
         if (
+            not isinstance(incarnation, int)
+            or isinstance(incarnation, bool)
+            or incarnation <= 0
+        ):
+            raise PlanError(
+                "inspection operation 'relation' requires a positive incarnation"
+            )
+        if (
             not isinstance(relation_key, tuple)
             or len(relation_key) != 3
             or any(
@@ -1184,8 +1194,11 @@ def inspect_store(
             raise PlanError(
                 "inspection operation 'relation' requires a nonnegative key and LSN"
             )
-        request = [str(timeline), *(str(value) for value in relation_key), str(lsn)]
-    elif timeline is not None:
+        request = [
+            str(timeline), str(incarnation),
+            *(str(value) for value in relation_key), str(lsn),
+        ]
+    elif any(value is not None for value in (timeline, incarnation, relation_key, lsn)):
         raise PlanError(
             f"inspection operation {operation!r} does not accept request arguments"
         )
@@ -2953,6 +2966,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--inspect-binary", type=Path)
     parser.add_argument("--shm")
     parser.add_argument("--timeline", type=int, metavar="ID")
+    parser.add_argument("--incarnation", type=int, metavar="GENERATION")
     parser.add_argument("--spc-oid", type=int, metavar="OID")
     parser.add_argument("--db-oid", type=int, metavar="OID")
     parser.add_argument("--rel-number", type=int, metavar="OID")
@@ -2964,21 +2978,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.inspect and (args.inspect_binary is None or not args.shm):
         parser.error("--inspect requires --inspect-binary and --shm")
-    relation_flag_values = (args.spc_oid, args.db_oid, args.rel_number, args.lsn)
+    relation_flag_values = (
+        args.incarnation, args.spc_oid, args.db_oid, args.rel_number, args.lsn,
+    )
     if args.inspect != "relation" and any(value is not None for value in relation_flag_values):
-        parser.error(
-            "--spc-oid, --db-oid, --rel-number and --lsn are only valid with "
-            "--inspect relation"
-        )
+            parser.error(
+                "--incarnation, --spc-oid, --db-oid, --rel-number and --lsn are only valid with "
+                "--inspect relation"
+            )
     if args.inspect == "timeline":
         if args.timeline is None or args.timeline < 0:
             parser.error("--inspect timeline requires a nonnegative --timeline ID")
     elif args.inspect == "relation":
-        relation_values = (args.timeline, args.spc_oid, args.db_oid, args.rel_number, args.lsn)
-        if any(value is None or isinstance(value, bool) or value < 0 for value in relation_values):
+        relation_values = (
+            args.timeline, args.spc_oid, args.db_oid, args.rel_number, args.lsn,
+        )
+        if (
+            args.incarnation is None
+            or isinstance(args.incarnation, bool)
+            or args.incarnation <= 0
+            or any(value is None or isinstance(value, bool) or value < 0
+                   for value in relation_values)
+        ):
             parser.error(
                 "--inspect relation requires nonnegative --timeline, --spc-oid, "
-                "--db-oid, --rel-number and --lsn"
+                "--db-oid, --rel-number and --lsn plus a positive --incarnation"
             )
     elif args.timeline is not None:
         parser.error("--timeline is only valid with --inspect timeline")
@@ -3021,6 +3045,7 @@ def main(argv: list[str] | None = None) -> int:
                 inspect_store(
                     args.inspect_binary, args.shm, args.inspect, schema,
                     timeline=args.timeline,
+                    incarnation=args.incarnation if args.inspect == "relation" else None,
                     relation_key=(args.spc_oid, args.db_oid, args.rel_number)
                     if args.inspect == "relation" else None,
                     lsn=args.lsn if args.inspect == "relation" else None,

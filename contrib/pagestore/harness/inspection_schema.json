@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "transport": "private-test-ipc",
   "mutating_operations": [],
   "implemented_operations": ["health", "timeline", "relation", "manifest", "gc", "owners", "backpressure", "pruning"],
@@ -12,7 +12,7 @@
       "response": ["parent_timeline", "fork_lsn", "retained_horizon"]
     },
     "relation": {
-      "request": ["timeline", "key", "lsn"],
+      "request": ["timeline", "incarnation", "key", "lsn"],
       "response": ["exists", "forks", "selected_version"],
       "response_types": {
         "exists": "boolean",

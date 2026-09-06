@@ -259,7 +259,8 @@ run_inspection_request(void *shm)
 			ps_lock_shard_rd(shard);
 		ps_lock_map_rd();
 		if (!stop_requested && ps_core_inspection_relation(
-				request->timeline, &request->key, request->lsn, &result) == 0)
+				request->timeline, &request->key,
+				request->expected_incarnation, request->lsn, &result) == 0)
 			status = PS_STATUS_OK;
 		ps_unlock_map();
 		for (uint32_t shard = ps_nshards; shard-- > 0;)
@@ -1361,6 +1362,7 @@ main(int argc, char **argv)
 	hdr->nshards = nshards;
 	hdr->channel_stride = PS_CHANNEL_STRIDE;
 	hdr->channels_off = PS_CHANNELS_OFF;
+	hdr->frontend_capabilities = PS_FRONTEND_CAP_RELATION_INSPECTION;
 	hdr->daemon_instance = new_daemon_instance();
 	daemon_hdr = hdr;
 	ps_core_set_metrics_header(hdr);

@@ -2046,7 +2046,7 @@ test_relation_inspection_forkmeta_poison(void)
 	ps_lifecycle_read_lock();
 	ps_lock_shard_rd(0);
 	ps_lock_map_rd();
-	rc = ps_core_inspection_relation(0, &key, 0, &result);
+	rc = ps_core_inspection_relation(0, &key, 1, 0, &result);
 	ps_unlock_map();
 	ps_unlock_shard(0);
 	ps_lifecycle_read_unlock();
@@ -2099,12 +2099,90 @@ test_relation_inspection_rejects_non_live_timeline(void)
 	ps_lifecycle_read_lock();
 	ps_lock_shard_rd(ps_shard_of(&key));
 	ps_lock_map_rd();
-	rc = ps_core_inspection_relation(1, &key, 0, &result);
+	rc = ps_core_inspection_relation(1, &key, 1, 0, &result);
 	ps_unlock_map();
 	ps_unlock_shard(ps_shard_of(&key));
 	ps_lifecycle_read_unlock();
 	check(rc != 0 && result.exists == 7 && result.fork_count == 7,
 		  "relation inspection rejects a durably DELETING timeline");
+	close_store();
+	remove_tree(store);
+}
+
+static void
+test_relation_inspection_rejects_reused_timeline_incarnation(void)
+{
+	char store[] = "/tmp/pagestore-relation-inspection-incarnation-XXXXXX";
+	PsKey key = {1, 1, 1, 0, PS_KLASS_RELATION};
+	PsInspectionRelationResult result;
+	PsTimelineState state;
+	uint64_t old_incarnation;
+	uint64_t new_incarnation;
+	int opened = 0;
+	int setup_ok;
+	int rc;
+
+	configure_timeline_core();
+	if (mkdtemp(store) == NULL || ps_core_open(store) != 0)
+	{
+		check(0, "open reused-incarnation relation-inspection fixture");
+		remove_tree(store);
+		return;
+	}
+	opened = 1;
+	setup_ok = create_branch(1, 0, 100) &&
+		state_of(1, &state, &old_incarnation) &&
+		state == PS_TIMELINE_LIVE && old_incarnation == 1;
+	check(setup_ok,
+		  "create the original relation-inspection incarnation");
+	if (!setup_ok)
+	{
+		if (opened)
+			close_store();
+		remove_tree(store);
+		return;
+	}
+	check(begin_delete(1, old_incarnation, NULL),
+		  "delete the original relation-inspection incarnation");
+	for (int i = 0; i < 256; i++)
+		(void) ps_core_maintenance();
+	setup_ok = state_of(1, &state, &old_incarnation) &&
+			state == PS_TIMELINE_DELETED && old_incarnation == 1 &&
+			create_branch_fenced(1, 0, 200, 2, 1) &&
+			state_of(1, &state, &new_incarnation) &&
+			state == PS_TIMELINE_LIVE && new_incarnation == 2;
+	check(setup_ok,
+		  "reuse the numeric timeline ID with a new incarnation");
+	if (!setup_ok)
+	{
+		close_store();
+		remove_tree(store);
+		return;
+	}
+
+	memset(&result, 0, sizeof(result));
+	result.exists = 7;
+	result.fork_count = 7;
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	ps_lock_map_rd();
+	rc = ps_core_inspection_relation(1, &key, 1, 0, &result);
+	ps_unlock_map();
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	check(rc != 0 && result.exists == 7 && result.fork_count == 7,
+		  "a queued old-incarnation inspection cannot read replacement data");
+
+	memset(&result, 0, sizeof(result));
+	ps_lifecycle_read_lock();
+	ps_lock_shard_rd(ps_shard_of(&key));
+	ps_lock_map_rd();
+	rc = ps_core_inspection_relation(1, &key, new_incarnation, 0, &result);
+	ps_unlock_map();
+	ps_unlock_shard(ps_shard_of(&key));
+	ps_lifecycle_read_unlock();
+	check(rc == 0,
+		  "the current-incarnation relation inspection remains available");
 	close_store();
 	remove_tree(store);
 }
@@ -3359,6 +3437,7 @@ main(void)
 	test_v2_and_mixed_lifecycle();
 	test_relation_inspection_forkmeta_poison();
 	test_relation_inspection_rejects_non_live_timeline();
+	test_relation_inspection_rejects_reused_timeline_incarnation();
 	test_inspection_timeline_cache_deep_ancestry();
 	test_inspection_structural_horizon_lifecycle_states();
 	test_inspection_retention_snapshot_alloc_failure();

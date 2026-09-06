@@ -154,17 +154,21 @@ run_inspector_timeline(const char *shm, uint32_t timeline,
 }
 
 static int
-run_inspector_relation(const char *shm, uint32_t timeline, uint32_t spc,
+run_inspector_relation(const char *shm, uint32_t timeline,
+					   uint64_t incarnation, uint32_t spc,
 					   uint32_t db, uint32_t rel, uint64_t lsn,
 					   char *output, size_t output_size)
 {
-	char timeline_text[32], spc_text[32], db_text[32], rel_text[32], lsn_text[32];
+	char timeline_text[32], incarnation_text[32];
+	char spc_text[32], db_text[32], rel_text[32], lsn_text[32];
 	int pipefd[2];
 	pid_t pid;
 	int status;
 	ssize_t nread;
 
 	snprintf(timeline_text, sizeof(timeline_text), "%u", timeline);
+	snprintf(incarnation_text, sizeof(incarnation_text), "%llu",
+			 (unsigned long long) incarnation);
 	snprintf(spc_text, sizeof(spc_text), "%u", spc);
 	snprintf(db_text, sizeof(db_text), "%u", db);
 	snprintf(rel_text, sizeof(rel_text), "%u", rel);
@@ -184,7 +188,8 @@ run_inspector_relation(const char *shm, uint32_t timeline, uint32_t spc,
 		dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[1]);
 		execl(inspect_path, inspect_path, "--shm", shm, "relation",
-			  timeline_text, spc_text, db_text, rel_text, lsn_text,
+			  timeline_text, incarnation_text, spc_text, db_text, rel_text,
+			  lsn_text,
 			  (char *) NULL);
 		_exit(127);
 	}
@@ -275,7 +280,8 @@ run_inspector_timeline_missing(const char *shm, char *output,
 }
 
 static void
-check_inspector(const char *shm, uint32_t page_size)
+check_inspector(const char *shm, uint32_t page_size,
+				uint32_t frontend_capabilities)
 {
 	char		output[1024];
 	char		page_size_json[64];
@@ -344,12 +350,15 @@ check_inspector(const char *shm, uint32_t page_size)
 				 "\"wal_owners\":0,\"wal_index_owners\":0,"
 				 "\"max_generation\":0,\"retention_poisoned\":false}\n") == 0,
 		  "read-only inspector reports exact initial owner values");
-	check(run_inspector_relation(shm, 0, 1, 1, 1, 0, output,
+	if ((frontend_capabilities & PS_FRONTEND_CAP_RELATION_INSPECTION) != 0)
+	{
+		check(run_inspector_relation(shm, 0, 1, 1, 1, 1, 0, output,
 							 sizeof(output)),
-		  "relation inspector uses the dedicated private mailbox");
-	check(strcmp(output, "{\"exists\":false,\"forks\":[],"
+			  "relation inspector uses the dedicated private mailbox");
+		check(strcmp(output, "{\"exists\":false,\"forks\":[],"
 				 "\"selected_version\":null}\n") == 0,
-		  "relation inspector reports a typed empty response and unavailable version");
+			  "relation inspector reports a typed empty response and unavailable version");
+	}
 }
 
 static void
@@ -1853,7 +1862,7 @@ spawn_daemon_wal_backpressure(const char *daemon_path, const char *shm,
 }
 
 /* Wait until the daemon has published a valid header. */
-static void
+static uint32_t
 wait_ready(const char *shm, uint32_t page_size)
 {
 	for (int i = 0; i < 500; i++)	/* up to ~5s */
@@ -1871,11 +1880,12 @@ wait_ready(const char *shm, uint32_t page_size)
 									 h->startup_state == PS_SHM_READY &&
 									 h->page_size == page_size &&
 									 h->nchannels == PS_MAX_CHANNELS);
+				uint32_t	capabilities = h->frontend_capabilities;
 
 				munmap(h, sizeof(PsShmHeader));
 				close(fd);
 				if (ready)
-					return;
+					return capabilities;
 			}
 			else
 				close(fd);
@@ -1884,6 +1894,7 @@ wait_ready(const char *shm, uint32_t page_size)
 	}
 	fprintf(stderr, "daemon did not become ready\n");
 	exit(2);
+	return 0;
 }
 
 static void
@@ -3511,6 +3522,7 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 			   *pb,
 			   *rb;
 	char		output[1024];
+	uint32_t	frontend_capabilities;
 
 	fprintf(stderr, "== page_size=%u ==\n", page_size);
 
@@ -3524,8 +3536,8 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	rb = malloc(page_size);
 
 	dpid = spawn_daemon(daemon_path, shm, store, page_size, test_nshards);
-	wait_ready(shm, page_size);
-	check_inspector(shm, page_size);
+	frontend_capabilities = wait_ready(shm, page_size);
+	check_inspector(shm, page_size, frontend_capabilities);
 	client_attach(shm, page_size);
 	{
 		PsShmHeader *hdr = (PsShmHeader *) cl_shm;
@@ -3577,14 +3589,17 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	op_zeroextend(REL_B, FORK0, 0, 2);
 	op_create(REL_B, 1);
 	op_zeroextend(REL_B, 1, 0, 3);
-	check(run_inspector_relation(shm, 0, 1, 1, REL_B, 0, output,
+	if ((frontend_capabilities & PS_FRONTEND_CAP_RELATION_INSPECTION) != 0)
+	{
+		check(run_inspector_relation(shm, 0, 1, 1, 1, REL_B, 0, output,
 							 sizeof(output)),
-		  "relation inspector serves an existing relation through private IPC");
-	check(strstr(output, "\"exists\":true") != NULL &&
-		  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL &&
-		  strstr(output, "\"fork\":1,\"nblocks\":3") != NULL &&
-		  strstr(output, "\"selected_version\":null") != NULL,
-		  "relation inspector reports every fork size and explicit unavailable version");
+			  "relation inspector serves an existing relation through private IPC");
+		check(strstr(output, "\"exists\":true") != NULL &&
+			  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL &&
+			  strstr(output, "\"fork\":1,\"nblocks\":3") != NULL &&
+			  strstr(output, "\"selected_version\":null") != NULL,
+			  "relation inspector reports every fork size and explicit unavailable version");
+	}
 
 	/* --- truncate --- */
 	op_truncate(REL_A, FORK0, 10);
@@ -3618,11 +3633,12 @@ run_suite(const char *daemon_path, const char *tmpbase, uint32_t page_size)
 	check(op_nblocks_asof(REL_C, FORK0, 1500) == 0, "no blocks below the first write's LSN");
 	check(op_nblocks_asof(REL_C, FORK0, 2000) == 1, "one block as of its pd_lsn");
 	check(op_nblocks_asof(REL_C, FORK0, 3500) == 2, "two blocks between the 2nd and 3rd writes");
-	check(run_inspector_relation(shm, 0, 1, 1, REL_C, 3500, output,
+	if ((frontend_capabilities & PS_FRONTEND_CAP_RELATION_INSPECTION) != 0)
+		check(run_inspector_relation(shm, 0, 1, 1, 1, REL_C, 3500, output,
 							 sizeof(output)) &&
-		  strstr(output, "\"exists\":true") != NULL &&
-		  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL,
-		  "relation inspector applies the requested as-of LSN");
+			  strstr(output, "\"exists\":true") != NULL &&
+			  strstr(output, "\"fork\":0,\"nblocks\":2") != NULL,
+			  "relation inspector applies the requested as-of LSN");
 	check(op_nblocks(REL_C, FORK0) == 3, "newest size after three writes");
 	fill_page(pa, page_size, 5000, 9);
 	op_write_one(REL_C, FORK0, 0, pa);	/* rewrite: no size change */

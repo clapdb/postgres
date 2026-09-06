@@ -78,7 +78,9 @@ extern void ps_core_inspection_request_complete(PsOpcode opcode,
 /* Read one relation's fork metadata as of read_lsn.  The caller must hold the
  * lifecycle/admission read gates, every shard read lock, and map_lock for
  * reading so the returned fork list is one coherent snapshot. */
-extern int ps_core_inspection_relation(uint32_t timeline, const PsKey *key,
+extern int ps_core_inspection_relation(uint32_t timeline,
+										 const PsKey *key,
+										 uint64_t expected_incarnation,
 										 uint64_t read_lsn,
 										 PsInspectionRelationResult *result);
 #ifdef PAGESTORE_RELATION_INSPECTION_TEST

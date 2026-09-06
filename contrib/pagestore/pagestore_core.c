@@ -5487,17 +5487,20 @@ fork_exists_through(uint32_t timeline, const PsKey *key, uint64_t read_lsn,
 
 int
 ps_core_inspection_relation(uint32_t timeline, const PsKey *key,
+							uint64_t expected_incarnation,
 							uint64_t read_lsn,
 							PsInspectionRelationResult *result)
 {
 	uint64_t	visible_lsn;
+	uint64_t	incarnation;
 	PsTimelineState state;
 
 	if (key == NULL || result == NULL || timeline >= MAX_TIMELINES ||
 		key->klass != PS_KLASS_RELATION || key->forkNum != 0 ||
 		!timelines[timeline].defined || timeline_meta_poisoned_load() ||
 		fork_meta_poisoned_load() ||
-		!ps_timeline_state(timeline, &state, NULL) ||
+		!ps_timeline_state(timeline, &state, &incarnation) ||
+		expected_incarnation == 0 || incarnation != expected_incarnation ||
 		state != PS_TIMELINE_LIVE)
 		return -1;
 

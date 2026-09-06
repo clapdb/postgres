@@ -30,7 +30,8 @@ static void
 usage(const char *prog)
 {
 	fprintf(stderr, "usage: %s --shm NAME health|timeline ID|manifest|gc|"
-			"owners|backpressure|pruning|relation TIMELINE SPC DB REL LSN\n",
+			"owners|backpressure|pruning|relation TIMELINE INCARNATION "
+			"SPC DB REL LSN\n",
 			prog);
 }
 
@@ -602,7 +603,8 @@ print_owners(PsShmHeader *hdr)
 }
 
 static int
-print_relation(int fd, PsShmHeader *hdr, uint32_t timeline, const PsKey *key,
+print_relation(int fd, PsShmHeader *hdr, uint32_t timeline,
+				   uint64_t expected_incarnation, const PsKey *key,
 				   uint64_t lsn)
 {
 	PsInspectionRequest *request = &hdr->inspection_request;
@@ -612,6 +614,12 @@ print_relation(int fd, PsShmHeader *hdr, uint32_t timeline, const PsKey *key,
 	uint64_t now;
 	uint64_t deadline;
 
+	if ((hdr->frontend_capabilities & PS_FRONTEND_CAP_RELATION_INSPECTION) == 0)
+	{
+		fprintf(stderr,
+				"pagestore_inspect: relation inspection is unavailable for this frontend\n");
+		return 1;
+	}
 	instance = ps_load_acquire_u64(&hdr->daemon_instance);
 	if (instance == 0 || recover_relation_mailbox(fd, request) != 0)
 		return 1;
@@ -643,6 +651,7 @@ print_relation(int fd, PsShmHeader *hdr, uint32_t timeline, const PsKey *key,
 	request->deadline_ns = deadline;
 	request->timeline = timeline;
 	request->reserved = 0;
+	request->expected_incarnation = expected_incarnation;
 	request->lsn = lsn;
 	request->key = *key;
 	request->relation = result;
@@ -714,6 +723,7 @@ main(int argc, char **argv)
 	int		relation_operation = 0;
 
 	uint32_t timeline_id = 0;
+	uint64_t expected_incarnation = 0;
 	int timeline_status = 0;
 	PsKey relation_key;
 	uint64_t relation_lsn = 0;
@@ -730,12 +740,14 @@ main(int argc, char **argv)
 			uint32_t db_oid;
 			uint32_t rel_number;
 
-			if (argc != 9 ||
+			if (argc != 10 ||
 				parse_decimal_u32(argv[4], &timeline_id) != 0 ||
-				parse_decimal_u32(argv[5], &spc_oid) != 0 ||
-				parse_decimal_u32(argv[6], &db_oid) != 0 ||
-				parse_decimal_u32(argv[7], &rel_number) != 0 ||
-				parse_decimal_u64(argv[8], &relation_lsn) != 0)
+				parse_decimal_u64(argv[5], &expected_incarnation) != 0 ||
+				expected_incarnation == 0 ||
+				parse_decimal_u32(argv[6], &spc_oid) != 0 ||
+				parse_decimal_u32(argv[7], &db_oid) != 0 ||
+				parse_decimal_u32(argv[8], &rel_number) != 0 ||
+				parse_decimal_u64(argv[9], &relation_lsn) != 0)
 				operation = NULL;
 			else
 			{
@@ -823,8 +835,8 @@ main(int argc, char **argv)
 	else if (strcmp(operation, "timeline") == 0)
 		timeline_status = print_timeline(hdr, timeline_id);
 	else if (strcmp(operation, "relation") == 0)
-		timeline_status = print_relation(fd, hdr, timeline_id, &relation_key,
-							 relation_lsn);
+		timeline_status = print_relation(fd, hdr, timeline_id,
+							 expected_incarnation, &relation_key, relation_lsn);
 	else if (strcmp(operation, "manifest") == 0)
 		print_manifest(hdr);
 	else if (strcmp(operation, "gc") == 0)
