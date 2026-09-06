@@ -94,8 +94,10 @@ static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
 static int core_opened;
 /* Every snapshot writer is serialized here.  Mutations refresh at their next
- * lock-safe completion point; a 100ms fallback bounds otherwise untracked
- * poison-state staleness without scanning in every 20us maintenance pass. */
+ * lock-safe completion point.  Maintenance may also attempt an opportunistic
+ * fallback between work items, with 100ms as a minimum spacing between such
+ * publications; this is a rate limit, not a staleness bound, and a long
+ * synchronous maintenance operation may defer the fallback. */
 #define INSPECTION_REFRESH_NS UINT64_C(100000000)
 static pthread_mutex_t inspection_metrics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t inspection_mutation_epoch;
@@ -10490,8 +10492,8 @@ timeline_delete_publish_one(void)
 	if (did)
 	{
 		inspection_metrics_changed();
-		/* DELETED is a maintenance-side completion; the fallback publication
-		 * remains subject to the normal 100ms deadline. */
+		/* DELETED is a maintenance-side completion; the best-effort fallback
+		 * publication remains subject to the normal 100ms minimum spacing. */
 		publish_inspection_metrics(0);
 	}
 	return did;

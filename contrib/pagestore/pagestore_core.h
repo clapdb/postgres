@@ -68,8 +68,10 @@ extern int	ps_core_maintenance(void);
 /* Number of image layers currently in the layer map (for stats/diagnostics). */
 extern uint32_t ps_core_layer_count(void);
 extern void ps_core_set_metrics_header(PsShmHeader *hdr);
-/* Publish read-only diagnostics when their bounded refresh interval is due,
- * without running tiering, GC, or compaction work. */
+/* Opportunistically publish read-only diagnostics when the maintenance-side
+ * refresh rate limit permits, without running tiering, GC, or compaction work.
+ * This is best effort: long synchronous maintenance may defer publication;
+ * metadata completion paths use the immediate publication path separately. */
 extern void ps_core_inspection_refresh(void);
 extern void ps_core_inspection_request_complete(PsOpcode opcode,
 										 uint32_t status);

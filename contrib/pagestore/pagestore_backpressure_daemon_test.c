@@ -464,9 +464,10 @@ run_test(const char *daemon_path)
 		uint64_t before = ps_load_acquire_u64(&hdr->inspection_metrics_seq);
 		int refreshed = 0;
 
-		/* A maintenance pause suppresses reclaim, not the documented inspection
-		 * publication cadence.  Wait long enough to observe a post-startup
-		 * publication while the pause file remains present. */
+		/* A maintenance pause suppresses reclaim, not best-effort inspection
+		 * publication.  Wait long enough to observe a post-startup publication
+		 * while the pause file remains present; this does not assert a staleness
+		 * bound for a long synchronous maintenance operation. */
 		for (int i = 0; i < 1000; i++)
 		{
 			sleep_ms(1);
@@ -477,7 +478,7 @@ run_test(const char *daemon_path)
 			}
 		}
 		check(refreshed,
-			  "maintenance pause keeps inspection metrics within the refresh cadence");
+			  "maintenance pause continues best-effort inspection publication");
 	}
 
 	for (int i = 0; i < 500; i++)
