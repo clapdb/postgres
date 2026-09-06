@@ -112,6 +112,92 @@ class PlanValidationTests(unittest.TestCase):
             '"post_recovery" if materializer_recovered else "pre_crash"',
             source,
         )
+        self.assertLess(
+            source.index("recovered materializer did not replay the fault checkpoint"),
+            source.index("materializer_recovered = True"),
+        )
+
+    def test_materializer_status_and_fault_errors_have_specific_classes(self):
+        self.assertEqual(
+            MODULE.fault_failure_classification(MODULE.OracleMismatch("oracle")),
+            "oracle_mismatch",
+        )
+
+    def test_materializer_fault_requires_prior_r1_checkpoint(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        header = self.header()
+        header["case"]["compute"] = ["writer", "materializer"]
+        cases = [
+            [
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R2"},
+            ],
+            [
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R2"},
+                {"op": "checkpoint", "id": "late-r1", "target": "writer", "name": "R1"},
+            ],
+            [
+                {"op": "checkpoint", "id": "wrong", "target": "writer", "name": "OLD"},
+                {"op": "materializer_fault", "id": "fault", "target": "materializer",
+                 "fault": "materializer.after_marker_sync", "action": "pause",
+                 "hit": 1, "timeout": 30, "name": "R2"},
+            ],
+        ]
+        for actions in cases:
+            path = self.write_plan([header, *actions])
+            plan = MODULE.read_plan(path)
+            MODULE.validate_plan(plan, capabilities)
+            with self.assertRaisesRegex(MODULE.PlanError, "prior checkpoint named R1"):
+                MODULE.validate_runtime_plan(plan, capabilities, "materializer_smoke")
+
+    def test_non_pause_fault_timeout_keeps_old_positive_semantics(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "daemon-fault-error", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {"op": "set_fault", "id": "fault", "target": "store",
+             "fault": "daemon.after_ready", "action": "error", "hit": 1,
+             "timeout": 301},
+        ])
+        MODULE.validate_plan(MODULE.read_plan(path), capabilities)
+
+    def test_relation_metadata_sql_quotes_complete_predicate_once(self):
+        sql = MODULE.relation_metadata_sql("relation'with-quote")
+        self.assertEqual(
+            sql,
+            "SELECT COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text "
+            "|| '|' || d.oid::text || '|' || pg_relation_filenode(c.oid)::text "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_database d ON d.datname = current_database() "
+            "WHERE n.nspname = 'public' AND c.relname = 'relation''with-quote'",
+        )
+        self.assertEqual(sql.count("AND c.relname ="), 1)
+        self.assertNotIn("c.relname = AND", sql)
+
+    def test_fault_evidence_is_preserved_before_safe_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            control = root / "control"
+            trace = root / "trace"
+            control.mkdir()
+            trace.mkdir()
+            (control / "report.jsonl").write_text("{partial\n", encoding="utf-8")
+            target = root / "target"
+            target.write_text("do-not-follow", encoding="utf-8")
+            (control / "report-link").symlink_to(target)
+            MODULE._preserve_fault_evidence(control, trace)
+            evidence = trace / "materializer-fault-control"
+            self.assertEqual((evidence / "report.jsonl").read_text(), "{partial\n")
+            self.assertEqual((evidence / "report-link.symlink").read_text(), str(target))
+            MODULE._cleanup_fault_control(control)
+            self.assertFalse(control.exists())
+            self.assertEqual((evidence / "report.jsonl").read_text(), "{partial\n")
 
     def test_accepts_declared_horizon(self):
         path = self.write_plan([

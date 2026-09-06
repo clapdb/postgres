@@ -64,6 +64,8 @@ def fault_failure_classification(error: Exception) -> str:
         return "timeout"
     if isinstance(error, UnexpectedExit):
         return "unexpected_exit"
+    if isinstance(error, OracleMismatch):
+        return "oracle_mismatch"
     return "setup"
 
 
@@ -88,6 +90,22 @@ def parse_materializer_status_row(value: str) -> dict[str, str | None]:
     }
 
 
+def postgres_string_literal(value: str) -> str:
+    """Quote a value for a SQL string literal with standard SQL escaping."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def relation_metadata_sql(relation: str) -> str:
+    return (
+        "SELECT COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text "
+        "|| '|' || d.oid::text || '|' || pg_relation_filenode(c.oid)::text "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_database d ON d.datname = current_database() "
+        "WHERE n.nspname = 'public' AND c.relname = "
+        + postgres_string_literal(relation)
+    )
+
+
 def fault_watchdog_milliseconds(value: Any) -> int:
     if (
         not isinstance(value, (int, float))
@@ -102,6 +120,17 @@ def fault_watchdog_milliseconds(value: Any) -> int:
     if milliseconds < 1 or milliseconds > 300000:
         raise PlanError("fault timeout does not fit the watchdog millisecond range")
     return milliseconds
+
+
+def fault_timeout_seconds(value: Any) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise PlanError("fault timeout must be finite and positive")
+    return float(value)
 
 
 def expected_error_exit(action: str, returncode: int | None) -> bool:
@@ -835,6 +864,15 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             )
         if fault_actions:
             fault_action = fault_actions[0]
+            fault_index = plan.actions.index(fault_action)
+            prior_r1 = any(
+                earlier["op"] == "checkpoint" and earlier.get("name") == "R1"
+                for earlier in plan.actions[:fault_index]
+            )
+            if not prior_r1:
+                raise PlanError(
+                    f"runtime {runtime!r} materializer_fault requires a prior checkpoint named R1"
+                )
             validate_fault_action(
                 fault_action, capabilities, f"{plan.path}:{fault_action['id']}",
                 require_model=False,
@@ -1189,7 +1227,10 @@ def validate_plan(
                 raise PlanError(f"{action_context}: steps must be a positive integer")
         if operation in ("crash", "set_fault", "materializer_fault") and "timeout" in action:
             try:
-                fault_watchdog_milliseconds(action["timeout"])
+                if operation == "materializer_fault" or action.get("action") == "pause":
+                    fault_watchdog_milliseconds(action["timeout"])
+                else:
+                    fault_timeout_seconds(action["timeout"])
             except PlanError as error:
                 raise PlanError(f"{action_context}: {error}") from error
 
@@ -1595,6 +1636,27 @@ def _disarm_fault_control(control: Path) -> None:
             marker.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _preserve_fault_evidence(control: Path, trace: Path) -> None:
+    """Best-effort copy of raw fault-control files before failure cleanup."""
+    try:
+        control_stat = control.lstat()
+        if not stat.S_ISDIR(control_stat.st_mode) or control.is_symlink():
+            return
+        evidence = trace / "materializer-fault-control"
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for child in control.iterdir():
+            child_stat = child.lstat()
+            destination = evidence / child.name
+            if stat.S_ISREG(child_stat.st_mode) and not child.is_symlink():
+                shutil.copyfile(child, destination, follow_symlinks=False)
+            elif child.is_symlink():
+                destination.with_name(destination.name + ".symlink").write_text(
+                    os.readlink(child), encoding="utf-8"
+                )
+    except (OSError, UnicodeError):
+        return
 
 
 def _fault_report(
@@ -2710,12 +2772,7 @@ def run_materializer_smoke(
                 f"inspect_relation {action['id']} references an unknown boundary"
             )
         metadata = sql_scalar(
-            writer_socket, writer_port,
-            "SELECT COALESCE(NULLIF(c.reltablespace, 0), d.dattablespace)::text "
-            "|| '|' || d.oid::text || '|' || pg_relation_filenode(c.oid)::text "
-            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "JOIN pg_database d ON d.datname = current_database() "
-            f"WHERE n.nspname = 'public' AND c.relname = '{action['relation']}'",
+            writer_socket, writer_port, relation_metadata_sql(action["relation"]),
         )
         fields = metadata.split("|")
         if len(fields) != 3 or any(not field.isdigit() for field in fields):
@@ -3320,6 +3377,13 @@ def run_materializer_smoke(
                     "t", "recovered materializer did not become healthy",
                     timeout=float(action.get("timeout", 30.0)) + 20.0,
                 )
+                wait_scalar(
+                    materializer_socket, materializer_port,
+                    f"SELECT COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn) >= "
+                    f"'{checkpoint_lsn}'::pg_lsn",
+                    "t", "recovered materializer did not replay the fault checkpoint",
+                    timeout=float(action.get("timeout", 30.0)) + 20.0,
+                )
                 materializer_recovered = True
                 recovered_replay_lsn = sql_scalar(
                     materializer_socket, materializer_port,
@@ -3442,9 +3506,8 @@ def run_materializer_smoke(
         )
     except Exception as error:
         run_error = error
-        classification = (
-            "oracle_mismatch" if isinstance(error, OracleMismatch) else "setup"
-        )
+        classification = fault_failure_classification(error)
+        _preserve_fault_evidence(fault_control, trace)
         events.emit(
             "run_fail", error=str(error), error_type=type(error).__name__,
             materializer_generation=materializer_generation,
