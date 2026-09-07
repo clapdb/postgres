@@ -79,7 +79,20 @@ H0 harness fault/inspection primitives
 
 R2-R5, including R4b, feed GC scenarios in H1.  R6 and H2 close the two MVP
 gates.
+
 ```
+
+### H1 branch-controller prepared-receipt crash slice
+
+Status: **implemented for the prepared-receipt/service-restore slice**.
+
+`pagestore_branch_prepare` publishes a CRC-protected, configuration-bound
+operation journal before changing service state. Recovery only continues a
+fully recorded branch boundary and converges the temporary retention pin,
+materializer pause, and writer ownership through idempotent/read-only checks.
+The four process-abort points cover receipt publication and service-restore
+edges. Bootstrap installation, page-store layer recovery, and GC are outside
+this slice.
 
 R0 and H0 may proceed independently.  Reclaimers must not be enabled before R1
 has made every in-scope runtime owner visible to the retention authority.

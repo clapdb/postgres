@@ -208,11 +208,15 @@ main(void)
 		"unhit point is queryable");
 	check(ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) == 0 &&
 		create_control_file(control, "arm") == 0 &&
-		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) == 0 &&
+		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) == 0,
+		"arm after initialization and probe once");
+	remove_control_file(control, "arm");
+	check(ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) == 0 &&
+		create_control_file(control, "arm") == 0 &&
 		ps_fault_probe(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER) == 0 &&
 		ps_fault_query(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER, &status) == 0 &&
 		status.hits == 2 && !status.reached,
-		"unarmed and pre-target probes count exactly");
+		"dynamic disarm/rearm and pre-target probes count exactly");
 	remove_control_file(control, "arm");
 	clear_config();
 

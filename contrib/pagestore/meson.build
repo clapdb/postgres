@@ -50,6 +50,19 @@ if host_system != 'windows'
     install_mode: 'rwxr-xr-x',
     rename: 'pagestore_branch_prepare',
   )
+  install_data(
+    'pagestore_branch_fault.py',
+    install_dir: dir_bin,
+    install_mode: 'rwxr-xr-x',
+    rename: 'pagestore_branch_fault.py',
+  )
+  # The installed controller resolves the canonical registry beside its
+  # helper, just as source-tree tests do.
+  install_data(
+    'pagestore_fault_points.def',
+    install_dir: dir_bin,
+    install_mode: 'r--r--r--',
+  )
 endif
 
 # Standalone storage daemon for the "localsvc" backend.  Freestanding: it

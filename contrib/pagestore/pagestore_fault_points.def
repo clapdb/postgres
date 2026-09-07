@@ -16,3 +16,7 @@ PAGESTORE_FAULT_POINT(FORKMETA_AFTER_SNAPSHOT_GC, "forkmeta.after_snapshot_gc", 
 // whole recovery postmaster after the checkpointer reaches the boundary.
 PAGESTORE_FAULT_POINT(MATERIALIZER_AFTER_RELATION_SYNC, "materializer.after_relation_sync", "materializer", "process_abort", "pause", 1, 1)
 PAGESTORE_FAULT_POINT(MATERIALIZER_AFTER_MARKER_SYNC, "materializer.after_marker_sync", "materializer", "process_abort", "pause", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_BEFORE_PREPARED_RECEIPT, "branch_prepare.before_prepared_receipt", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_PREPARED_RECEIPT, "branch_prepare.after_prepared_receipt", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_MATERIALIZER_RESUME, "branch_prepare.after_materializer_resume", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_WRITER_RESTORE, "branch_prepare.after_writer_restore", "branch", "process_abort", "crash", 1, 1)

@@ -158,6 +158,14 @@ prepares maps, SLRUs, and the store branch before resuming the materializer and
 restoring the normal writer.  An atomic JSON receipt records `C/R/E/L`, archive
 coverage, seeded page count, and whether service restoration completed.
 
+The H1 branch crash slice evolves that receipt into a CRC-protected,
+configuration-bound operation journal written before the first service
+mutation. Four process-abort points cover the prepared-receipt and
+service-restore edges; recovery drops the temporary pin, resumes the
+materializer, restores the normal writer, and advances the journal
+monotonically to `complete`. Bootstrap installation, layer recovery, and GC
+remain outside this slice.
+
 The same prepare now captures every default-tablespace database relation map
 plus the global map under `RelationMappingLock` into one CRC-protected
 `pagestore_branch.bootstrap`.  Its header binds the system identifier, logical
