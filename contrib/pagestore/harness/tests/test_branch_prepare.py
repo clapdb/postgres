@@ -203,6 +203,25 @@ class BranchPrepareTests(unittest.TestCase):
             probe.probe("branch_prepare.before_prepared_receipt")
             self.assertEqual(probe.hit, 1)
 
+        failed_control = self.root / "failed-report-control"
+        failed_control.mkdir()
+        (failed_control / "arm").write_text("arm\n", encoding="utf-8")
+        failed_env = dict(env, PAGESTORE_TEST_FAULT_DIR=str(failed_control))
+        with mock.patch.dict(os.environ, failed_env, clear=False):
+            failed_probe = installed.BranchFaultProbe()
+            real_open = installed.os.open
+
+            def fail_report_open(path, flags, mode=0o777):
+                if Path(path).name == "report.tmp":
+                    raise OSError("report publication failed")
+                return real_open(path, flags, mode)
+
+            with mock.patch.object(installed.os, "open", side_effect=fail_report_open):
+                with mock.patch.object(installed.os, "_exit", side_effect=RuntimeError("exit")) as exit_mock:
+                    with self.assertRaisesRegex(RuntimeError, "exit"):
+                        failed_probe.probe("branch_prepare.before_prepared_receipt")
+            exit_mock.assert_called_once_with(installed.REPORT_FAILURE_EXIT)
+
         broken_control = self.root / "broken-fault-control"
         broken_control.mkdir()
         (broken_control / "arm").symlink_to(self.root / "does-not-exist")
@@ -569,6 +588,33 @@ class BranchPrepareTests(unittest.TestCase):
         journal = MODULE.BranchPreparer(config).read_journal()
         self.assertEqual(journal["state"], "fork_captured")
         self.assertEqual(journal["intent"], "prepare_branch")
+
+    def test_execute_removes_safe_journal_before_propagating_cancellation(self):
+        config = MODULE.Config.load(self.write_config())
+
+        class CancelledPreparer(MODULE.BranchPreparer):
+            def preflight(self):
+                pass
+
+            def capture_and_pin_base(self):
+                return "0/10"
+
+            def stop_writer(self):
+                pass
+
+            def start_restricted_writer(self):
+                pass
+
+            def select_checkpoint(self):
+                raise MODULE.CancelledError("cancelled")
+
+            def restore_services(self):
+                return []
+
+        preparer = CancelledPreparer(config)
+        with self.assertRaisesRegex(MODULE.CancelledError, "cancelled"):
+            preparer.execute()
+        self.assertFalse(config.receipt_file.exists())
 
     def test_failed_prepared_journal_write_retries_exact_fenced_boundary(self):
         config = MODULE.Config.load(self.write_config())

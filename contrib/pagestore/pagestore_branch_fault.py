@@ -12,6 +12,7 @@ from typing import Iterable
 
 
 CRASH_EXIT = 88
+REPORT_FAILURE_EXIT = 89
 FIELD_MAX = 128
 _POINT = re.compile(
     r'^PAGESTORE_FAULT_POINT\([A-Z][A-Z0-9_]*,\s*"([a-z][a-z0-9_.-]*)",\s*'
@@ -222,12 +223,15 @@ class BranchFaultProbe:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, final)
-        except OSError as error:
+        except OSError:
             if fd >= 0:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 temporary.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
-            raise BranchFaultError(f"cannot publish branch fault report: {error}") from error
+            os._exit(REPORT_FAILURE_EXIT)
         os._exit(CRASH_EXIT)

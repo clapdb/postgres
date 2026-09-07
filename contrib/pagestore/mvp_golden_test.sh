@@ -377,6 +377,7 @@ printf 'arm\n' > "$BRANCH_FAULT_CONTROL/arm" ||
 	fail "could not arm branch fault control"
 env \
 	-u PAGESTORE_TEST_FAULT_OPERATION_ID \
+	-u PAGESTORE_TEST_FAULT_WATCHDOG_MS \
 	PAGESTORE_TEST_FAULT_NAME=branch_prepare.after_prepared_receipt \
 	PAGESTORE_TEST_FAULT_ACTION=crash \
 	PAGESTORE_TEST_FAULT_HIT=1 \
@@ -450,6 +451,7 @@ branch_receipt=$(env \
 	-u PAGESTORE_TEST_FAULT_SEED \
 	-u PAGESTORE_TEST_FAULT_OPERATION \
 	-u PAGESTORE_TEST_FAULT_OPERATION_ID \
+	-u PAGESTORE_TEST_FAULT_WATCHDOG_MS \
 	"$BRANCHPREP" --config "$BRANCH_CONFIG") ||
 	fail "installed branch controller recovery failed"
 IFS='|' read -r receipt_state base_lsn checkpoint_redo checkpoint_lsn \

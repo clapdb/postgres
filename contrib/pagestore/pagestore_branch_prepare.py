@@ -1579,8 +1579,6 @@ class BranchPreparer:
         )
         if failure is not None:
             detail = f"; cleanup also failed: {'; '.join(cleanup_errors)}" if cleanup_errors else ""
-            if isinstance(failure, (KeyboardInterrupt, CancelledError)):
-                raise failure
             # Once prepare_branch returned, the journal is the recovery proof
             # and must survive even if best-effort cleanup happened to work.
             # Only an operation that never crossed the prepared boundary may
@@ -1596,6 +1594,8 @@ class BranchPreparer:
                     self.config.receipt_file.unlink()
                 except FileNotFoundError:
                     pass
+            if isinstance(failure, (KeyboardInterrupt, CancelledError)):
+                raise failure
             if preserve_prepare_fence:
                 detail += "; recovery journal retained and services remain fenced"
             raise BranchPrepareError(f"{failure}{detail}") from failure
