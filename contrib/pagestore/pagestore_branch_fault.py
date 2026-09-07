@@ -24,14 +24,6 @@ class BranchFaultError(ValueError):
     pass
 
 
-def _fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 class BranchFaultProbe:
     """A process-abort-only probe using the same env/control/report protocol."""
 
@@ -53,12 +45,12 @@ class BranchFaultProbe:
         self._load()
 
     @staticmethod
-    def _canonical_uint64(value: str, field: str) -> int:
+    def _canonical_protocol_integer(value: str, field: str) -> int:
         if not re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
-            raise BranchFaultError(f"branch fault {field} must be canonical uint64")
+            raise BranchFaultError(f"branch fault {field} must be a canonical integer")
         parsed = int(value, 10)
-        if parsed > (1 << 64) - 1:
-            raise BranchFaultError(f"branch fault {field} exceeds uint64")
+        if parsed > (1 << 63) - 1:
+            raise BranchFaultError(f"branch fault {field} exceeds the protocol int64 bound")
         return parsed
 
     @staticmethod
@@ -85,6 +77,17 @@ class BranchFaultProbe:
                 os.close(fd)
 
     @staticmethod
+    def _exists_nofollow(path: Path, description: str) -> bool:
+        """Return whether a directory entry exists, including a dangling symlink."""
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise BranchFaultError(f"{description} is unreadable: {error}") from error
+        return True
+
+    @staticmethod
     def _field(name: str) -> str | None:
         return os.environ.get(name)
 
@@ -94,6 +97,7 @@ class BranchFaultProbe:
             "PAGESTORE_TEST_FAULT_HIT", "PAGESTORE_TEST_FAULT_DIR",
             "PAGESTORE_TEST_FAULT_SCENARIO", "PAGESTORE_TEST_FAULT_SEED",
             "PAGESTORE_TEST_FAULT_OPERATION", "PAGESTORE_TEST_FAULT_OPERATION_ID",
+            "PAGESTORE_TEST_FAULT_WATCHDOG_MS",
         )
         values = {name: self._field(name) for name in names}
         if not any(value is not None for value in values.values()):
@@ -122,7 +126,9 @@ class BranchFaultProbe:
         target, model, min_hit, max_hit = catalog[name]
         if target != "branch" or model != "process_abort" or "crash" not in actions.split("|"):
             raise BranchFaultError(f"fault {name} is not a branch crash point")
-        target_hit = self._canonical_uint64(hit, "hit")
+        if values["PAGESTORE_TEST_FAULT_WATCHDOG_MS"] is not None:
+            raise BranchFaultError("branch crash faults do not accept a watchdog")
+        target_hit = self._canonical_protocol_integer(hit, "hit")
         if target_hit < min_hit or (max_hit and target_hit > max_hit):
             raise BranchFaultError("branch fault hit is outside its catalog bounds")
         path = Path(control)
@@ -141,10 +147,14 @@ class BranchFaultProbe:
         if any(self._overlaps(path, scope) for scope in self.scope_paths):
             raise BranchFaultError("branch fault control overlaps a protected store/config scope")
         arm = path / "arm"
-        self._validate_regular(arm, "branch fault arm")
-        if (path / "release").exists():
+        if os.path.lexists(arm):
+            self._validate_regular(arm, "branch fault arm")
+        if self._exists_nofollow(path / "release", "branch fault release"):
             raise BranchFaultError("branch fault control has an invalid arm/release state")
-        if (path / "report.jsonl").exists() or (path / "report.tmp").exists():
+        if (
+            self._exists_nofollow(path / "report.jsonl", "branch fault report.jsonl")
+            or self._exists_nofollow(path / "report.tmp", "branch fault report.tmp")
+        ):
             raise BranchFaultError("branch fault control already contains a report")
         operation = values["PAGESTORE_TEST_FAULT_OPERATION"]
         operation_id = values["PAGESTORE_TEST_FAULT_OPERATION_ID"]
@@ -164,7 +174,9 @@ class BranchFaultProbe:
             raise BranchFaultError("branch fault metadata contains invalid identity characters")
         seed = None
         if values["PAGESTORE_TEST_FAULT_SEED"] is not None:
-            seed = self._canonical_uint64(values["PAGESTORE_TEST_FAULT_SEED"], "seed")
+            seed = self._canonical_protocol_integer(
+                values["PAGESTORE_TEST_FAULT_SEED"], "seed"
+            )
         self.point = name
         self.action = action
         self.target_hit = target_hit
@@ -174,6 +186,13 @@ class BranchFaultProbe:
 
     def probe(self, name: str) -> None:
         if self.point != name or self.control is None:
+            return
+        arm = self.control / "arm"
+        try:
+            self._validate_regular(arm, "branch fault arm")
+        except BranchFaultError:
+            # Arming is deliberately dynamic.  A missing or invalid marker
+            # makes this probe inert, just like the canonical C probe.
             return
         self.hit += 1
         if self.hit != self.target_hit:
@@ -203,7 +222,6 @@ class BranchFaultProbe:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, final)
-            _fsync_directory(self.control)
         except OSError as error:
             if fd >= 0:
                 os.close(fd)

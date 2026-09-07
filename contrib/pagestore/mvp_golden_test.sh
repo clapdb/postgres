@@ -40,6 +40,7 @@ STORE="$TMPROOT/store"
 BRANCH_SCRATCH="$TMPROOT/branch-walredo"
 PRIVATE_SOCKET="$TMPROOT/private-writer-socket"
 BRANCH_CONFIG="$TMPROOT/branch-prepare.json"
+BRANCH_FAULT_CONTROL="$TMPROOT/branch-prepare-fault-control"
 SHM=/psmvpgolden_$$
 WPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 MPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
@@ -48,6 +49,7 @@ PRIVATE_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1"
 WP=("$BIN/psql" -h 127.0.0.1 -p "$WPORT" -U postgres -tA -v ON_ERROR_STOP=1)
 MP=("$BIN/psql" -h 127.0.0.1 -p "$MPORT" -U postgres -tA -v ON_ERROR_STOP=1)
 BP=("$BIN/psql" -h 127.0.0.1 -p "$BPORT" -U postgres -tA -v ON_ERROR_STOP=1)
+RWP=("$BIN/psql" -h "$PRIVATE_SOCKET" -p "$PRIVATE_PORT" -U postgres -tA -v ON_ERROR_STOP=1)
 
 cleanup()
 {
@@ -270,7 +272,8 @@ hot_standby = on
 restore_command = '$WALRESTORE --shm $SHM --timeline 0 --incarnation 1 --segsize $materializer_wal_segment_size %f %p'
 EOF
 touch "$MATERIALIZER/standby.signal"
-find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
+find "$MATERIALIZER/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete ||
+	fail "could not remove copied materializer WAL"
 
 "$BIN/pg_ctl" -D "$MATERIALIZER" -l "$MATERIALIZER/materializer.log" \
 	-w start >/dev/null 2>&1 || fail "continuous materializer did not start"
@@ -364,8 +367,91 @@ cat > "$BRANCH_CONFIG" <<EOF
   "command_timeout_seconds": 60
 }
 EOF
-branch_receipt=$("$BRANCHPREP" --config "$BRANCH_CONFIG") ||
-	fail "serialized branch preparation failed"
+# Crash the installed controller after it has published the prepared receipt.
+# The real writer, materializer, retention registry, and branch-preparation SQL
+# are active here; only the process-abort point is injected by the canonical
+# fault-control protocol.
+mkdir -m 700 "$BRANCH_FAULT_CONTROL" ||
+	fail "could not create branch fault control directory"
+printf 'arm\n' > "$BRANCH_FAULT_CONTROL/arm" ||
+	fail "could not arm branch fault control"
+env \
+	-u PAGESTORE_TEST_FAULT_OPERATION_ID \
+	PAGESTORE_TEST_FAULT_NAME=branch_prepare.after_prepared_receipt \
+	PAGESTORE_TEST_FAULT_ACTION=crash \
+	PAGESTORE_TEST_FAULT_HIT=1 \
+	PAGESTORE_TEST_FAULT_DIR="$BRANCH_FAULT_CONTROL" \
+	PAGESTORE_TEST_FAULT_SCENARIO=mvp-golden \
+	PAGESTORE_TEST_FAULT_SEED=1 \
+	PAGESTORE_TEST_FAULT_OPERATION=branch-prepare-crash \
+	"$BRANCHPREP" --config "$BRANCH_CONFIG" \
+	> "$TMPROOT/branch-crash.stdout" 2> "$TMPROOT/branch-crash.stderr"
+branch_crash_status=$?
+assert_eq "$branch_crash_status" "88" \
+	"installed branch controller aborts with the canonical crash status"
+python3 - "$BRANCH_FAULT_CONTROL/report.jsonl" <<'PY' || fail "branch crash report is not authentic"
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert report["schema"] == 1
+assert report["name"] == "branch_prepare.after_prepared_receipt"
+assert report["action"] == "crash"
+assert report["hit"] == 1
+assert report["scenario"] == "mvp-golden"
+assert report["operation"] == "branch-prepare-crash"
+assert isinstance(report["pid"], int) and report["pid"] > 0
+PY
+echo "ok   - installed controller published an authenticated crash report"
+python3 - "$PREPARED/pagestore_branch.prepare.json" <<'PY' || fail "crashed branch controller did not leave a prepared journal"
+import json
+import sys
+from pathlib import Path
+
+journal = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert journal["state"] == "prepared"
+assert journal["retention_owned"] is True
+assert journal["retention_set_attempted"] is True
+assert journal["pause_owned"] is True
+assert journal["materializer_resumed"] is False
+assert journal["writer_owned"] is True
+assert journal["restricted_writer_running"] is True
+assert journal["writer_restored"] is False
+PY
+retention_generation=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["retention_generation"])' \
+	"$PREPARED/pagestore_branch.prepare.json") ||
+	fail "could not read the crashed retention generation"
+assert_eq "$("${MP[@]}" -c "SELECT pg_get_wal_replay_pause_state();")" "paused" \
+	"crashed controller leaves the materializer paused and fenced"
+if "${WP[@]}" -c "SELECT 1;" >/dev/null 2>&1; then
+	fail "crashed controller left the public writer reachable"
+fi
+assert_eq "$("${RWP[@]}" -c "SELECT current_setting('listen_addresses') = ''; ")" "t" \
+	"crashed controller leaves only the restricted writer reachable"
+assert_eq "$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_retention_owner_lsn(0, 3, 1, $retention_generation) IS NOT NULL;")" "t" \
+	"crashed controller leaves the exact branch retention pin installed"
+
+# Remove the one-shot report control before the recovery process.  The second
+# controller has no fault environment and therefore cannot consume stale arm
+# or report state.
+rm -f "$BRANCH_FAULT_CONTROL/arm" \
+	"$BRANCH_FAULT_CONTROL/report.jsonl" \
+	"$BRANCH_FAULT_CONTROL/report.tmp" ||
+	fail "could not clear branch fault control"
+rmdir "$BRANCH_FAULT_CONTROL" || fail "branch fault control remained active"
+
+branch_receipt=$(env \
+	-u PAGESTORE_TEST_FAULT_NAME \
+	-u PAGESTORE_TEST_FAULT_ACTION \
+	-u PAGESTORE_TEST_FAULT_HIT \
+	-u PAGESTORE_TEST_FAULT_DIR \
+	-u PAGESTORE_TEST_FAULT_SCENARIO \
+	-u PAGESTORE_TEST_FAULT_SEED \
+	-u PAGESTORE_TEST_FAULT_OPERATION \
+	-u PAGESTORE_TEST_FAULT_OPERATION_ID \
+	"$BRANCHPREP" --config "$BRANCH_CONFIG") ||
+	fail "installed branch controller recovery failed"
 IFS='|' read -r receipt_state base_lsn checkpoint_redo checkpoint_lsn \
 	fork_lsn seeded <<EOF
 $(python3 -c 'import json, sys
@@ -375,8 +461,14 @@ print("|".join(str(r[k]) for k in (
     "fork_lsn", "seeded_slru_pages")))' "$branch_receipt")
 EOF
 assert_eq "$receipt_state" "complete" \
-	"branch controller restored both services after prepare"
+	"second installed controller completed the prepared branch"
 [ "${seeded:-0}" -gt 0 ] || fail "branch preparation seeded no SLRU pages"
+assert_eq "$("${MP[@]}" -c "SELECT pagestore_ext.pagestore_retention_owner_lsn(0, 3, 1, $retention_generation) IS NULL;")" "t" \
+	"recovery controller released the exact temporary retention pin"
+assert_eq "$("${MP[@]}" -c "SELECT pg_get_wal_replay_pause_state();")" "not paused" \
+	"recovery controller resumed the materializer"
+assert_eq "$("${WP[@]}" -c "SELECT NOT pg_is_in_recovery() AND current_setting('listen_addresses') <> ''; ")" "t" \
+	"recovery controller restored the normal public writer"
 echo "ok   - serialized branch window selected C=$base_lsn R=$checkpoint_redo E=$checkpoint_lsn L=$fork_lsn"
 
 wait_materializer_note 1 before_fork ||
@@ -445,7 +537,8 @@ branch_wal_segment_size=$(wal_segment_size "$BRANCH") ||
 	'$fork_lsn');" >/dev/null || fail "could not install the portable branch bootstrap"
 # Remove the unrelated WAL segment created by the fresh initdb.  The restored
 # cluster identity must fetch its checkpoint and all subsequent WAL from store.
-find "$BRANCH/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete
+find "$BRANCH/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete ||
+	fail "could not remove unrelated branch initdb WAL"
 "$BIN/initdb" -D "$BRANCH_SCRATCH" -U postgres -A trust >/dev/null 2>&1 ||
 	fail "branch WAL-redo scratch initdb failed"
 cat >> "$BRANCH/postgresql.conf" <<EOF

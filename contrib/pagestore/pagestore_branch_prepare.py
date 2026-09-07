@@ -39,7 +39,7 @@ JOURNAL_KEYS = {
     "checkpoint_redo_lsn", "checkpoint_end_lsn", "switch_lsn",
     "archived_through_lsn", "fork_lsn",
     "seeded_slru_pages", "retention_generation", "pause_owned", "writer_owned",
-    "retention_owned",
+    "retention_owned", "retention_set_attempted",
     "restricted_writer_running", "materializer_resumed", "writer_restored",
     "prepared_dir", "crc32",
 }
@@ -440,6 +440,7 @@ class BranchPreparer:
         self.materializer_extension_schema: str | None = None
         self.branch_retention_generation: int | None = None
         self.branch_retention_owned = False
+        self.branch_retention_set_attempted = False
         self.journal: dict[str, Any] | None = None
         self.fault_probe = BranchFaultProbe(
             scope_paths=(
@@ -486,6 +487,7 @@ class BranchPreparer:
             "pause_owned": False,
             "writer_owned": False,
             "retention_owned": False,
+            "retention_set_attempted": False,
             "restricted_writer_running": False,
             "materializer_resumed": False,
             "writer_restored": False,
@@ -506,18 +508,9 @@ class BranchPreparer:
         if not isinstance(value, dict):
             raise BranchPrepareError("branch journal must be a JSON object")
         if value.get("schema") == LEGACY_RECEIPT_SCHEMA:
-            if value.get("state") == "complete":
-                if (
-                    value.get("new_timeline") != self.config.new_timeline
-                    or value.get("parent_timeline") != self.config.parent_timeline
-                    or value.get("prepared_dir") != str(self.config.prepared_dir)
-                ):
-                    raise BranchPrepareError(
-                        "legacy complete branch receipt identity mismatch"
-                    )
-                return value
             raise BranchPrepareError(
-                "legacy incomplete branch receipt is unsupported; refusing recovery"
+                "legacy branch receipt is unsupported without a full prepared-manifest identity; "
+                "refusing recovery"
             )
         if value.get("schema") != RECEIPT_SCHEMA or set(value) != JOURNAL_KEYS:
             raise BranchPrepareError("branch journal schema or fields are invalid")
@@ -531,7 +524,8 @@ class BranchPreparer:
             raise BranchPrepareError("branch journal intent is invalid")
         for field in (
             "pause_owned", "writer_owned", "restricted_writer_running",
-            "retention_owned", "materializer_resumed", "writer_restored",
+            "retention_owned", "retention_set_attempted", "materializer_resumed",
+            "writer_restored",
         ):
             if not isinstance(value[field], bool):
                 raise BranchPrepareError(f"branch journal {field} is invalid")
@@ -564,9 +558,39 @@ class BranchPreparer:
             raise BranchPrepareError("branch journal is not loaded")
         self.branch_retention_generation = self.journal["retention_generation"]
         self.branch_retention_owned = self.journal["retention_owned"]
+        self.branch_retention_set_attempted = self.journal["retention_set_attempted"]
         self.pause_owned = self.journal["pause_owned"]
         self.writer_owned = self.journal["writer_owned"]
         self.restricted_writer_running = self.journal["restricted_writer_running"]
+
+    def journal_owns_pause(self) -> bool:
+        """Infer an in-flight pause from the intent-before-action fence."""
+        if self.journal is None:
+            return False
+        if self.journal["pause_owned"]:
+            return True
+        return (
+            (self.journal["state"] == "preflight_complete"
+             and self.journal.get("intent") in {"capture_base", "install_retention"})
+            or
+            (self.journal["state"] == "checkpoint_archived"
+             and self.journal.get("intent") == "capture_fork")
+        )
+
+    def journal_owns_writer(self) -> bool:
+        """Infer writer ownership when a stop completed before its state write."""
+        if self.journal is None:
+            return False
+        if self.journal["writer_owned"]:
+            return True
+        if (
+            self.journal["state"] == "base_captured"
+            and self.journal.get("intent") == "stop_writer"
+        ):
+            return True
+        return self.journal["state"] not in {
+            "started", "preflight_complete", "base_captured",
+        }
 
     def observe_recovery_ownership(self) -> str:
         """Replace ambiguous journal booleans with observations of live services."""
@@ -575,23 +599,32 @@ class BranchPreparer:
         pause_state = self.observe_materializer_pause()
         if pause_state not in {"paused", "not paused"}:
             raise BranchPrepareError(f"unknown materializer pause state {pause_state}")
-        self.pause_owned = pause_state == "paused"
+        self.pause_owned = pause_state == "paused" and self.journal_owns_pause()
         mode = self.observe_writer_mode()
         if mode == "unknown":
             raise BranchPrepareError("cannot identify the surviving writer process")
         self.restricted_writer_running = mode == "restricted"
-        self.writer_owned = mode in {"restricted", "stopped"}
+        self.writer_owned = mode in {"restricted", "stopped"} and self.journal_owns_writer()
         # A generation is a scoped, idempotent owner identity.  Treat its
         # presence as a cleanup candidate even when an intent update was lost;
         # do not trust a stale false ownership bit.
         self.branch_retention_generation = self.journal["retention_generation"]
-        self.branch_retention_owned = self.branch_retention_generation is not None
+        self.branch_retention_set_attempted = (
+            self.branch_retention_generation is not None
+            and (
+                self.journal["retention_set_attempted"]
+                or self.journal["retention_owned"]
+            )
+        )
+        self.branch_retention_owned = self.journal["retention_owned"]
         return mode
 
     def restore_ambiguous_services(self, mode: str) -> None:
         """Restore observed services before rejecting an unsafe early journal."""
         errors: list[str] = []
-        if self.branch_retention_owned:
+        owns_pause = self.journal_owns_pause()
+        owns_writer = self.journal_owns_writer()
+        if self.branch_retention_set_attempted or self.branch_retention_owned:
             try:
                 self.release_branch_retention()
             except Exception as error:
@@ -599,21 +632,29 @@ class BranchPreparer:
         try:
             pause_state = self.observe_materializer_pause()
             if pause_state == "paused":
-                self.pause_owned = True
-                self.resume_materializer()
+                if not owns_pause:
+                    errors.append(
+                        "materializer is externally paused before branch ownership was established"
+                    )
+                else:
+                    self.pause_owned = True
+                    self.resume_materializer()
             elif pause_state != "not paused":
                 errors.append(f"unknown materializer pause state {pause_state}")
         except Exception as error:
             errors.append(f"could not restore materializer: {error}")
-        if mode == "restricted":
+        writer_ownership_established = owns_writer
+        if mode == "restricted" and writer_ownership_established:
             self.writer_owned = True
             try:
                 self.restore_writer()
             except Exception as error:
                 errors.append(f"could not restore normal writer: {error}")
-        elif mode == "stopped" and self.journal is not None and self.journal["state"] not in {
-            "started", "preflight_complete"
-        }:
+        elif mode == "restricted":
+            errors.append(
+                "writer is restricted before branch ownership was established"
+            )
+        elif mode == "stopped" and writer_ownership_established:
             # The journal proves this operation stopped the writer after the
             # initial preflight.  Starting the configured normal writer is the
             # only safe restoration; no checkpoint is selected here.
@@ -739,7 +780,13 @@ class BranchPreparer:
             if last_output_line(
                 self.writer_sql(
                     "SELECT NOT pg_is_in_recovery()"
-                    " AND current_setting('listen_addresses') <> ''"
+                    " AND current_setting('pagestore.backend') = 'localsvc'"
+                    " AND current_setting('pagestore.timeline')::integer = "
+                    + str(self.config.parent_timeline)
+                    + " AND COALESCE(NULLIF(current_setting('pagestore.read_lsn'), ''),"
+                    " '0/0')::pg_lsn = '0/0'::pg_lsn"
+                    " AND current_setting('data_directory') = "
+                    + sql_literal(str(self.config.writer_data_dir))
                 )
             ) == "t":
                 return "normal"
@@ -994,6 +1041,18 @@ class BranchPreparer:
         owner_id = self.config.retention_owner_id
         if owner_id > (1 << 63) - 1:
             owner_id -= 1 << 64
+        # Persist the exact generation before sending the command.  A committed
+        # set with a lost response is indistinguishable from a failed set at
+        # this boundary, so both cases must remain an idempotent drop
+        # candidate.  `retention_owned` is only set after status 0.
+        self.branch_retention_set_attempted = True
+        if self.journal is not None:
+            self.journal_update(
+                self.journal["state"], "install_retention",
+                retention_generation=self.branch_retention_generation,
+                retention_set_attempted=True,
+                retention_owned=False,
+            )
         status = last_output_line(
             self.materializer_sql(
                 "SELECT "
@@ -1012,9 +1071,16 @@ class BranchPreparer:
                 f"could not install branch-base retention pin (status {status})"
             )
         self.branch_retention_owned = True
+        if self.journal is not None:
+            self.journal_update(
+                self.journal["state"], "capture_base",
+                retention_generation=self.branch_retention_generation,
+                retention_set_attempted=True,
+                retention_owned=True,
+            )
 
     def release_branch_retention(self) -> None:
-        if not self.branch_retention_owned:
+        if not (self.branch_retention_owned or self.branch_retention_set_attempted):
             return
         if self.branch_retention_generation is None:
             raise BranchPrepareError("branch retention generation is unavailable")
@@ -1037,6 +1103,13 @@ class BranchPreparer:
                 f"could not release branch-base retention pin (status {status})"
             )
         self.branch_retention_owned = False
+        self.branch_retention_set_attempted = False
+        if self.journal is not None:
+            self.journal_update(
+                self.journal["state"], self.journal.get("intent"),
+                retention_owned=False,
+                retention_set_attempted=False,
+            )
 
     def capture_and_pin_base(self) -> str:
         base = self.pause_and_capture(keep_paused=True)
@@ -1225,14 +1298,7 @@ class BranchPreparer:
         return seeded
 
     def writer_is_normal(self) -> bool:
-        if not self.server_running(self.config.writer_data_dir):
-            return False
-        try:
-            return last_output_line(
-                self.writer_sql("SELECT current_setting('listen_addresses') <> ''")
-            ) == "t"
-        except BranchPrepareError:
-            return False
+        return self.observe_writer_mode() == "normal"
 
     def restore_writer(self) -> None:
         if not self.writer_owned:
@@ -1263,14 +1329,18 @@ class BranchPreparer:
                 raise BranchPrepareError("; ".join(errors))
             self.journal_update(
                 "complete", None, pause_owned=False, retention_owned=False,
+                retention_set_attempted=False,
                 materializer_resumed=True, writer_restored=True,
                 writer_owned=False, restricted_writer_running=False,
             )
             return
-        if self.branch_retention_owned:
+        if self.branch_retention_owned or self.branch_retention_set_attempted:
             self.journal_update("prepared", "drop_temporary_pin")
             self.release_branch_retention()
-            self.journal_update("prepared", None, retention_owned=False)
+            self.journal_update(
+                "prepared", None, retention_owned=False,
+                retention_set_attempted=False,
+            )
         if not self.journal["materializer_resumed"] or self.pause_owned:
             self.journal_update("prepared", "resume_materializer")
             state = last_output_line(
@@ -1335,6 +1405,39 @@ class BranchPreparer:
         if state == "fork_captured":
             if self.journal.get("intent") not in (None, "prepare_branch"):
                 raise BranchPrepareError("branch journal has a contradictory prepare intent")
+            for field in (
+                "base_lsn", "checkpoint_redo_lsn", "checkpoint_end_lsn",
+                "switch_lsn", "fork_lsn",
+            ):
+                value = self.journal.get(field)
+                if not isinstance(value, str):
+                    raise BranchPrepareError(
+                        f"branch journal is missing persisted exact boundary {field}"
+                    )
+                parse_lsn(value)
+            archived_through = self.journal.get("archived_through_lsn")
+            if archived_through is not None:
+                if not isinstance(archived_through, str):
+                    raise BranchPrepareError(
+                        "branch journal archived coverage is invalid"
+                    )
+                parse_lsn(archived_through)
+                if archived_through != self.journal["switch_lsn"]:
+                    raise BranchPrepareError(
+                        "branch journal archived coverage differs from switch boundary"
+                    )
+            if parse_lsn(self.journal["base_lsn"]) > parse_lsn(
+                self.journal["checkpoint_redo_lsn"]
+            ):
+                raise BranchPrepareError("branch journal base follows checkpoint redo")
+            if parse_lsn(self.journal["checkpoint_end_lsn"]) > parse_lsn(
+                self.journal["switch_lsn"]
+            ):
+                raise BranchPrepareError("branch journal archive does not cover checkpoint")
+            if parse_lsn(self.journal["fork_lsn"]) < parse_lsn(
+                self.journal["checkpoint_end_lsn"]
+            ):
+                raise BranchPrepareError("branch journal fork does not cover checkpoint")
             seeded = self.prepare_branch(
                 self.journal["base_lsn"],
                 self.journal["checkpoint_redo_lsn"],
@@ -1344,6 +1447,7 @@ class BranchPreparer:
                 "branch_prepared", None, seeded_slru_pages=seeded,
                 pause_owned=self.pause_owned, writer_owned=self.writer_owned,
                 restricted_writer_running=self.restricted_writer_running,
+                archived_through_lsn=self.journal["switch_lsn"],
             )
             state = "branch_prepared"
         if state == "branch_prepared":
@@ -1356,7 +1460,7 @@ class BranchPreparer:
 
     def restore_services(self) -> list[str]:
         errors: list[str] = []
-        if self.branch_retention_owned:
+        if self.branch_retention_owned or self.branch_retention_set_attempted:
             try:
                 self.release_branch_retention()
             except Exception as error:
@@ -1397,6 +1501,7 @@ class BranchPreparer:
                 "base_captured", None, base_lsn=base,
                 retention_generation=self.branch_retention_generation,
                 retention_owned=self.branch_retention_owned,
+                retention_set_attempted=self.branch_retention_set_attempted,
                 materializer_resumed=True,
             )
             self.journal_update("base_captured", "stop_writer")
@@ -1433,6 +1538,7 @@ class BranchPreparer:
                 raise BranchPrepareError("materialized fork does not cover the checkpoint")
             self.journal_update(
                 "fork_captured", None, fork_lsn=fork, pause_owned=self.pause_owned,
+                archived_through_lsn=switch_lsn, materializer_resumed=False,
             )
             self.journal_update("fork_captured", "prepare_branch")
             seeded = self.prepare_branch(base, redo, fork)
@@ -1444,6 +1550,7 @@ class BranchPreparer:
                 pause_owned=self.pause_owned, writer_owned=self.writer_owned,
                 restricted_writer_running=self.restricted_writer_running,
                 retention_owned=self.branch_retention_owned,
+                retention_set_attempted=self.branch_retention_set_attempted,
             )
             self.fault("branch_prepare.before_prepared_receipt")
             self.journal_update("branch_prepared", "publish_prepared_receipt")
@@ -1453,8 +1560,21 @@ class BranchPreparer:
         except BaseException as error:
             failure = error
 
+        preserve_prepare_fence = (
+            self.journal is not None
+            and self.journal.get("intent") in {
+                "prepare_branch", "publish_prepared_receipt",
+            }
+        )
         cleanup_errors = (
-            [] if self.journal is not None and self.journal.get("state") == "complete"
+            []
+            if (
+                self.journal is not None
+                and (
+                    self.journal.get("state") == "complete"
+                    or preserve_prepare_fence
+                )
+            )
             else self.restore_services()
         )
         if failure is not None:
@@ -1471,11 +1591,13 @@ class BranchPreparer:
                 "branch_prepared", "prepared", "materializer_resumed",
                 "writer_restored", "complete",
             }
-            if not cleanup_errors and not prepared_boundary:
+            if not cleanup_errors and not prepared_boundary and not preserve_prepare_fence:
                 try:
                     self.config.receipt_file.unlink()
                 except FileNotFoundError:
                     pass
+            if preserve_prepare_fence:
+                detail += "; recovery journal retained and services remain fenced"
             raise BranchPrepareError(f"{failure}{detail}") from failure
         if cleanup_errors:
             raise BranchPrepareError("; ".join(cleanup_errors))
