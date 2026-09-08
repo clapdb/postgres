@@ -140,6 +140,11 @@ static recovery_start_hook_type prev_recovery_start_hook = NULL;
 static recovery_restartpoint_pre_control_hook_type prev_restartpoint_pre_control_hook = NULL;
 static recovery_restartpoint_flush_hook_type prev_restartpoint_flush_hook = NULL;
 
+/* Fault probes below are scoped to the portable bootstrap installer.  Legacy
+ * branch installs and reader installs must keep their existing fault surface. */
+static bool pagestore_portable_install_faults = false;
+static bool pagestore_portable_install_faults_owned = false;
+
 #define PS_MATERIALIZER_MARKER_MAGIC		0x50534d57
 #define PS_MATERIALIZER_MARKER_VERSION	2
 #define PS_MATERIALIZER_MARKER_BLOCK		3
@@ -10458,6 +10463,46 @@ pagestore_require_prepared_artifact(const char *prepared_dir,
 }
 
 /*
+ * Portable bootstrap faults are opt-in and process-abort-only.  Do not call
+ * ps_fault_init() for ordinary installs: a materializer may already own the
+ * process-local fault state, and legacy/readers installs must not acquire a
+ * portable branch fault surface by accident.
+ */
+static void
+pagestore_prepare_portable_install_faults(void)
+{
+	const char *name = getenv("PAGESTORE_TEST_FAULT_NAME");
+	bool		already_initialized;
+
+	if (name == NULL || strncmp(name, "branch_install.",
+							strlen("branch_install.")) != 0)
+		return;
+	already_initialized = ps_fault_is_initialized();
+	if (!already_initialized)
+	{
+		if (ps_fault_init(DataDir) != 0)
+		{
+			/* ps_fault_init marks the state initialized before validating the
+			 * control protocol; do not strand that partial state across a
+			 * retry after the ERROR below. */
+			ps_fault_reset();
+			ereport(ERROR,
+					(errmsg("could not initialize pagestore portable install fault controls")));
+		}
+		pagestore_portable_install_faults_owned = true;
+	}
+}
+
+static void
+pagestore_portable_install_fault(PsFaultPoint point)
+{
+	if (pagestore_portable_install_faults &&
+		ps_fault_probe(point) == PS_FAULT_PROBE_ERROR)
+		ereport(ERROR,
+				(errmsg("pagestore portable install fault probe failed")));
+}
+
+/*
  * Absolutize (against the backend cwd, i.e. the data directory) and
  * canonicalize an install path so relative and absolute spellings of the same
  * tree compare equal.
@@ -11132,6 +11177,8 @@ pagestore_install_prepared_dir(const char *prepared_dir, const char *target_dir,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not remove existing branch artifact \"%s\"", dst)));
+	if (strcmp(relpath, "pg_xact") == 0)
+		pagestore_portable_install_fault(PS_FAULT_POINT_BRANCH_INSTALL_AFTER_SLRU_REMOVE);
 	if (rename(stage, dst) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -11210,11 +11257,15 @@ pagestore_install_prepared_file(const char *prepared_dir, const char *target_dir
 				(errcode_for_file_access(),
 				 errmsg("could not clear branch install staging file \"%s\": %m", stage)));
 	copy_file(src, stage);
+	if (strcmp(relpath, "pagestore_branch.manifest") == 0)
+		pagestore_portable_install_fault(PS_FAULT_POINT_BRANCH_INSTALL_BEFORE_MANIFEST);
 	if (durable_rename(stage, dst, ERROR) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not install branch artifact \"%s\": %m", dst)));
 	fsync_fname(target_dir, true);
+	if (strcmp(relpath, "pagestore_branch.manifest") == 0)
+		pagestore_portable_install_fault(PS_FAULT_POINT_BRANCH_INSTALL_AFTER_MANIFEST);
 }
 
 static void
@@ -11381,7 +11432,8 @@ pagestore_install_branch_bootstrap_maps(const char *prepared_dir,
 								   (int) entry.size);
 	}
 	pagestore_install_prepared_file(prepared_dir, target_dir,
-									PAGESTORE_BRANCH_BOOTSTRAP_FILE, true);
+								PAGESTORE_BRANCH_BOOTSTRAP_FILE, true);
+	pagestore_portable_install_fault(PS_FAULT_POINT_BRANCH_INSTALL_AFTER_MAPS);
 }
 
 /*
@@ -11656,23 +11708,38 @@ pagestore_install_prepared_branch_bootstrap(PG_FUNCTION_ARGS)
 
 	/* A previous successful install is no longer evidence of readiness while
 	 * maps are being replaced.  Publish the new manifest only after all files. */
-	snprintf(manifest_path, sizeof(manifest_path), "%s/pagestore_branch.manifest",
-			 target_dir);
-	if (unlink(manifest_path) == 0)
-		fsync_fname(target_dir, true);
-	else if (errno != ENOENT)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove stale branch manifest \"%s\": %m",
-						manifest_path)));
+	pagestore_prepare_portable_install_faults();
+	pagestore_portable_install_faults = true;
+	PG_TRY();
+	{
+		snprintf(manifest_path, sizeof(manifest_path),
+				  "%s/pagestore_branch.manifest", target_dir);
+		if (unlink(manifest_path) == 0)
+			fsync_fname(target_dir, true);
+		else if (errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove stale branch manifest \"%s\": %m",
+							 manifest_path)));
 
-	pagestore_install_branch_bootstrap_maps(prepared_dir, target_dir,
-											artifact, header);
-	pfree(artifact);
-	result = DirectFunctionCall5(pagestore_install_prepared_branch,
-								 PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
-								 PG_GETARG_DATUM(2), PG_GETARG_DATUM(3),
-								 PG_GETARG_DATUM(6));
+		pagestore_install_branch_bootstrap_maps(prepared_dir, target_dir,
+										 artifact, header);
+		pfree(artifact);
+		result = DirectFunctionCall5(pagestore_install_prepared_branch,
+									 PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
+									 PG_GETARG_DATUM(2), PG_GETARG_DATUM(3),
+									 PG_GETARG_DATUM(6));
+	}
+	PG_FINALLY();
+	{
+		pagestore_portable_install_faults = false;
+		if (pagestore_portable_install_faults_owned)
+		{
+			ps_fault_reset();
+			pagestore_portable_install_faults_owned = false;
+		}
+	}
+	PG_END_TRY();
 	return result;
 }
 

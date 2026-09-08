@@ -529,6 +529,12 @@ if host_system != 'windows'
     suite: ['pagestore'],
     timeout: 30,
   )
+  test('pagestore_bootstrap_install_oracle',
+    pagestore_harness_python,
+    args: [files('harness/tests/test_bootstrap_install_oracle.py')],
+    suite: ['pagestore'],
+    timeout: 30,
+  )
 endif
 test('pagestore_harness_reader_visibility_plan',
   pagestore_harness_python,

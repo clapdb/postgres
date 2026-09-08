@@ -200,6 +200,14 @@ materializer, restores the normal writer, and advances the journal
 monotonically to `complete`. Bootstrap installation, layer recovery, and GC
 remain outside this slice.
 
+Portable bootstrap installation has a separate golden-scenario crash slice:
+installer-backend aborts after maps, in the pg_xact replacement gap, and on
+both sides of final manifest publication. It checks startup rejection while
+the manifest is absent, unchanged prepared inputs/control, exact artifact
+recovery and idempotent retry, followed by branch SQL visibility and isolation.
+The target stays offline under one installer; concurrent installation and
+power-loss durability are not claimed by these process-abort tests.
+
 The same prepare now captures every default-tablespace database relation map
 plus the global map under `RelationMappingLock` into one CRC-protected
 `pagestore_branch.bootstrap`.  Its header binds the system identifier, logical
@@ -347,7 +355,7 @@ remaining R6 queue-bound soak/tuning work.
 The POSIX image-layer publication slice is now covered by the declarative
 harness.  Other crash boundaries remain outside this slice.
 Before declaring the MVP repeatable, add process-level fault scenarios around
-branch bootstrap/install, manifest replacement, and retention/reclaim/GC, plus
+manifest replacement and retention/reclaim/GC, plus
 a persisted-format fixture for restart/upgrade compatibility.
 
 ## Recommended sequence
