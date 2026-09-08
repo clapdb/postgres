@@ -104,6 +104,9 @@ The persistent lock file must not be removed while a store is in use. Older
 binaries and external tools that do not acquire the lock must remain stopped
 during recovery; the lock is advisory, not a fence against arbitrary filesystem
 writes. This is local POSIX recovery, not SPDK or power-loss certification.
+Child processes cannot mutate through inherited provider handles; a child that
+inherits an open core must exec a fresh process before using the core. SPDK
+storage retains its original caller-owned teardown contract.
 
 ## MVP gates
 

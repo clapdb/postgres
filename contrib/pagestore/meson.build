@@ -449,6 +449,19 @@ test('storage_posix_wal',
   timeout: 30,
 )
 
+storage_posix_fork_owner_test = executable('storage_posix_fork_owner_test',
+  files('storage_posix_fork_owner_test.c', 'storage_posix.c',
+        'pagestore_store_owner.c', 'pagestore_manifest.c', 'pagestore_layer.c',
+        'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
+  install: false,
+)
+test('storage_posix_fork_owner',
+  storage_posix_fork_owner_test,
+  suite: ['pagestore'],
+  timeout: 30,
+)
+
 # Crash-atomic multi-shard WAL-index snapshot generation publication.
 pagestore_walidx_snapshot_test = executable('pagestore_walidx_snapshot_test',
   files('pagestore_walidx_snapshot_test.c', 'pagestore_walidx_snapshot.c'),

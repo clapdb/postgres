@@ -55,7 +55,11 @@ extern uint64_t forkmeta_reclaim_catchup_bytes;
 extern const PsStorage *ps_storage;
 extern uint32_t	ps_nshards;		/* logical shards configured for this daemon */
 
-/* Open the store and rebuild all in-memory state (timelines, indexes, WAL). */
+/* Open the store and rebuild all in-memory state (timelines, indexes, WAL).
+ * A core inherited while open across fork is unusable in the child; exec a
+ * fresh process instead of reopening or flushing inherited mutex/buffer state.
+ * On success non-POSIX storage retains caller-owned close.  On failure core
+ * closes only providers whose open completed; failed opens clean themselves. */
 extern int	ps_core_open(const char *store_dir);
 
 /* Clean-shutdown: flush the memtable into a layer and close the manifest. */

@@ -209,9 +209,19 @@ local_open(const char *store_dir)
 	char		probe[PS_LAYER_URI_MAX];
 
 	if (layer_owner != NULL)
+	{
+		/* Do not enter the process-global owner mutex from a fork child.  A
+		 * provider inherited across fork must exec before it can be reopened. */
+		if (ps_store_owner_require_current(layer_owner) != 0)
+			return -1;
 		local_close();
+	}
 	if (ps_store_owner_acquire(store_dir, &layer_owner) != 0)
 		return -1;
+	if (ps_store_owner_require_current(layer_owner) != 0)
+	{
+		goto fail;
+	}
 	n = snprintf(layer_dir, sizeof(layer_dir), "%s",
 				 ps_store_owner_root(layer_owner));
 	if (n < 0 || (size_t) n >= sizeof(layer_dir))
@@ -295,6 +305,17 @@ local_layer_path(uint64_t layer_id, char *buf, size_t buflen)
 }
 
 static int
+local_owner_current(void)
+{
+	if (layer_owner == NULL)
+	{
+		errno = EPERM;
+		return 0;
+	}
+	return ps_store_owner_require_current(layer_owner) == 0;
+}
+
+static int
 hex_digit(unsigned char c)
 {
 	if (c >= '0' && c <= '9')
@@ -343,13 +364,78 @@ parse_canonical_layer_name(const char *name, uint64_t *layer_id)
 	return 1;
 }
 
+/* A copy temp is still provider-owned namespace, even when its PID is alive
+ * because that PID has since been reused.  Recovery must recognize the name
+ * before applying canonical-layer validation, then leave it for the copier. */
 static int
-layer_map_has_id(const PsLayerMap *map, uint64_t layer_id)
+parse_copy_temp_name(const char *name, pid_t *pid_out)
 {
-	for (uint32_t i = 0; i < map->nlayers; i++)
-		if (map->layers[i].layer_id == layer_id)
-			return 1;
-	return 0;
+	const char *tmp;
+	const char *pid_text;
+	const char *attempt_text;
+	char		base[NAME_MAX + 1];
+	char		canonical_suffix[64];
+	char		*end;
+	unsigned long attempt;
+	long		pid;
+	uint64_t	layer_id;
+	size_t		base_len;
+
+	if (strncmp(name, "layer_", 6) != 0)
+		return 0;
+	tmp = strstr(name, ".tmp.");
+	if (tmp == NULL)
+		return 0;
+	base_len = (size_t) (tmp - name);
+	if (base_len == 0 || base_len > NAME_MAX)
+		return -1;
+	memcpy(base, name, base_len);
+	base[base_len] = '\0';
+	if (parse_canonical_layer_name(base, &layer_id) != 1)
+		return -1;
+
+	pid_text = tmp + strlen(".tmp.");
+	if (*pid_text < '0' || *pid_text > '9')
+		return -1;
+	errno = 0;
+	pid = strtol(pid_text, &end, 10);
+	if (errno == ERANGE || end == pid_text || pid <= 0 ||
+		(pid_t) pid != pid || *end != '.')
+		return -1;
+	attempt_text = end + 1;
+	if (*attempt_text < '0' || *attempt_text > '9')
+		return -1;
+	errno = 0;
+	attempt = strtoul(attempt_text, &end, 10);
+	if (errno == ERANGE || end == attempt_text || *end != '\0' ||
+		attempt > UINT_MAX ||
+		snprintf(canonical_suffix, sizeof(canonical_suffix), "%ld.%u", pid,
+				 (unsigned int) attempt) < 0 ||
+		strcmp(canonical_suffix, pid_text) != 0)
+		return -1;
+	(void) layer_id;
+	(void) attempt;
+	if (pid_out != NULL)
+		*pid_out = (pid_t) pid;
+	return 1;
+}
+
+static int
+compare_layer_ids(const void *left, const void *right)
+{
+	const uint64_t a = *(const uint64_t *) left;
+	const uint64_t b = *(const uint64_t *) right;
+
+	return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static int
+layer_map_has_id(const uint64_t *map_ids, size_t nmap_ids, uint64_t layer_id)
+{
+	if (nmap_ids == 0)
+		return 0;
+	return bsearch(&layer_id, map_ids, nmap_ids, sizeof(*map_ids),
+				   compare_layer_ids) != NULL;
 }
 
 static int
@@ -441,6 +527,7 @@ static int
 local_recover_local_layers(const PsLayerMap *map)
 {
 	LocalLayerCandidate *candidates = NULL;
+	uint64_t  *map_ids = NULL;
 	uint32_t	ncandidates = 0;
 	uint32_t	capacity = 0;
 	DIR		*dir = NULL;
@@ -450,35 +537,51 @@ local_recover_local_layers(const PsLayerMap *map)
 	int		changed = 0;
 	int		rc = -1;
 	int		save_errno = 0;
+	size_t		map_count = (size_t) 0;
 
-	if (map == NULL || layer_dir[0] == '\0' || layer_owner == NULL)
+	if (map == NULL || layer_dir[0] == '\0')
 	{
 		errno = EINVAL;
 		return -1;
 	}
+	if (!local_owner_current())
+		return -1;
 	if (local_validate_layer_locations(map) != 0)
 		return -1;
+	map_count = (size_t) map->nlayers;
+	if (map_count > 0)
+	{
+		/* On 64-bit builds uint32_t nlayers cannot overflow this allocation.
+		 * Keep the check for narrower size_t targets without provoking a
+		 * -Wtype-limits diagnostic on the normal build. */
+#if SIZE_MAX < UINT64_MAX
+		if ((uint64_t) map_count > (uint64_t) SIZE_MAX / sizeof(*map_ids))
+		{
+			errno = EOVERFLOW;
+			return -1;
+		}
+#endif
+		map_ids = malloc(map_count * sizeof(*map_ids));
+		if (map_ids == NULL)
+			return -1;
+		for (size_t i = 0; i < map_count; i++)
+			map_ids[i] = map->layers[i].layer_id;
+		qsort(map_ids, map_count, sizeof(*map_ids), compare_layer_ids);
+	}
 	scanfd = open(layer_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (scanfd < 0)
-		return -1;
+		goto done;
 	unlinkfd = dup(scanfd);
 	if (unlinkfd < 0 || fcntl(unlinkfd, F_SETFD, FD_CLOEXEC) != 0)
 	{
 		save_errno = errno;
-		if (unlinkfd >= 0)
-			close(unlinkfd);
-		close(scanfd);
-		errno = save_errno;
-		return -1;
+		goto done;
 	}
 	dir = fdopendir(scanfd);
 	if (dir == NULL)
 	{
 		save_errno = errno;
-		close(scanfd);
-		close(unlinkfd);
-		errno = save_errno;
-		return -1;
+		goto done;
 	}
 	scanfd = -1; /* owned by DIR now */
 	errno = 0;
@@ -487,10 +590,19 @@ local_recover_local_layers(const PsLayerMap *map)
 		LocalLayerCandidate candidate;
 		uint64_t		layer_id;
 		int			parsed;
+		int			copy_temp;
 		struct stat	st;
 
 		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
 			continue;
+		copy_temp = parse_copy_temp_name(ent->d_name, NULL);
+		if (copy_temp == 1)
+			continue;
+		if (copy_temp < 0)
+		{
+			errno = EINVAL;
+			goto done;
+		}
 		parsed = parse_canonical_layer_name(ent->d_name, &layer_id);
 		if (parsed == 0)
 			continue;
@@ -592,7 +704,7 @@ local_recover_local_layers(const PsLayerMap *map)
 		struct stat st;
 		int		fd;
 
-		if (layer_map_has_id(map, candidates[i].layer_id))
+		if (layer_map_has_id(map_ids, map_count, candidates[i].layer_id))
 			continue;
 		if (fstatat(unlinkfd, candidates[i].name, &st, AT_SYMLINK_NOFOLLOW) != 0)
 		{
@@ -639,6 +751,7 @@ done:
 		close(unlinkfd);
 	if (scanfd >= 0)
 		close(scanfd);
+	free(map_ids);
 	free(candidates);
 	if (rc != 0)
 	{
@@ -722,9 +835,7 @@ cleanup_stale_copy_temps(const char *dir)
 	DIR			*d;
 	struct dirent *ent;
 	char		path[4096];
-	char		*tmp;
-	char		*end;
-	long		pid;
+	pid_t		pid;
 	int			n;
 
 	d = opendir(dir);
@@ -732,13 +843,9 @@ cleanup_stale_copy_temps(const char *dir)
 		return -1;
 	while ((ent = readdir(d)) != NULL)
 	{
-		if (strncmp(ent->d_name, "layer_", strlen("layer_")) != 0 ||
-			(tmp = strstr(ent->d_name, ".tmp.")) == NULL)
+		if (parse_copy_temp_name(ent->d_name, &pid) != 1)
 			continue;
-		errno = 0;
-		pid = strtol(tmp + strlen(".tmp."), &end, 10);
-		if (errno != 0 || end == tmp + strlen(".tmp.") || *end != '.' || pid <= 0 ||
-			(kill((pid_t) pid, 0) != -1 || errno != ESRCH))
+		if (kill(pid, 0) != -1 || errno != ESRCH)
 			continue;
 		n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
 		if (n >= 0 && (size_t) n < sizeof(path))
@@ -826,6 +933,8 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 	int			fd;
 	int			n;
 
+	if (!local_owner_current())
+		return -1;
 	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -853,6 +962,8 @@ local_layer_exists(uint64_t layer_id)
 {
 	char		path[4096];
 
+	if (!local_owner_current())
+		return -1;
 	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
 		return -1;
 	if (access(path, F_OK) == 0)
@@ -868,6 +979,8 @@ local_write_local_layer(uint64_t layer_id, const void *buf, uint64_t len)
 	const char *p = buf;
 	uint64_t	done = 0;
 
+	if (!local_owner_current())
+		return -1;
 	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = open(path, O_WRONLY);
@@ -895,6 +1008,8 @@ local_seal_local_layer(uint64_t layer_id)
 	int			fd;
 	int			rc;
 
+	if (!local_owner_current())
+		return -1;
 	if (local_layer_path(layer_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = open(path, O_RDONLY);
@@ -916,6 +1031,8 @@ local_read_layer_block(const PsLayerDesc *layer, uint64_t off,
 	ssize_t		n;
 	uint32_t	nlocs;
 
+	if (!local_owner_current())
+		return -1;
 	nlocs = layer->location_count;
 	if (nlocs > PS_LAYER_MAX_LOCATIONS)
 		return -1;
@@ -976,6 +1093,9 @@ local_refresh_layer_cache(const PsLayerDesc *layer)
 	const PsLayerLocation *local_loc;
 	char		local[4096];
 
+	if (!local_owner_current())
+		return -1;
+
 	local_loc = local_location(layer);
 	/* Before upload durability, a manifest-owned local layer is the only source
 	 * of truth.  After remote durability, the verified remote object may repair
@@ -997,6 +1117,8 @@ local_remote_uri(uint64_t layer_id, char *uri, uint32_t uri_len)
 	char		path[4096];
 	int			n;
 
+	if (!local_owner_current())
+		return -1;
 	if (object_layer_path(layer_id, path, sizeof(path)) != 0)
 		return -1;
 	n = snprintf(uri, uri_len, "%s", path);
@@ -1019,6 +1141,9 @@ local_upload_layer(const PsLayerDesc *layer)
 	const PsLayerLocation *source;
 	const PsLayerLocation *published;
 	char		remote[4096];
+
+	if (!local_owner_current())
+		return -1;
 
 	source = local_location(layer);
 	published = remote_location(layer);
@@ -1064,6 +1189,9 @@ local_download_layer(const PsLayerDesc *layer)
 	const PsLayerLocation *source;
 	char		local[4096];
 	struct stat st;
+
+	if (!local_owner_current())
+		return -1;
 
 	source = remote_location(layer);
 	if (source == NULL || local_layer_path(layer->layer_id, local, sizeof(local)) != 0)
@@ -1112,6 +1240,9 @@ local_delete_remote_layer(const PsLayerDesc *layer)
 	const PsLayerLocation *location;
 	char		expected[4096];
 
+	if (!local_owner_current())
+		return -1;
+
 	location = remote_location(layer);
 	if (location == NULL ||
 		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||
@@ -1128,6 +1259,9 @@ local_delete_local_layer(const PsLayerDesc *layer)
 	int			rc = 0;
 	int			unlinked = 0;
 	uint32_t	nlocs;
+
+	if (!local_owner_current())
+		return -1;
 
 	nlocs = layer->location_count;
 	if (nlocs > PS_LAYER_MAX_LOCATIONS)
@@ -1169,6 +1303,8 @@ local_layer_exists_remote(const PsLayerDesc *layer)
 	const PsLayerLocation *location;
 	char		expected[4096];
 
+	if (!local_owner_current())
+		return -1;
 	location = remote_location(layer);
 	if (location == NULL ||
 		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||
@@ -1187,6 +1323,8 @@ local_verify_remote_layer(const PsLayerDesc *layer)
 	char		expected[4096];
 	struct stat st;
 
+	if (!local_owner_current())
+		return -1;
 	location = remote_location(layer);
 	if (location == NULL ||
 		object_layer_path(layer->layer_id, expected, sizeof(expected)) != 0 ||

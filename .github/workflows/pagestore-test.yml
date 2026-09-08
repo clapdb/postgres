@@ -91,6 +91,7 @@ jobs:
           cc -O2 -Wall -Wextra -Werror -o pagestore_walidx_snapshot_test pagestore_walidx_snapshot_test.c pagestore_walidx_snapshot.c -lrt
           cc -O2 -Wall -Wextra -Werror -o pagestore_forkmeta_snapshot_test pagestore_forkmeta_snapshot_test.c pagestore_forkmeta_snapshot.c -lrt
           cc -O2 -Wall -Wextra -Werror -o storage_posix_wal_test storage_posix_wal_test.c storage_posix.c pagestore_store_owner.c -lrt -lpthread
+          cc -O2 -Wall -Wextra -Werror -o storage_posix_fork_owner_test storage_posix_fork_owner_test.c storage_posix.c pagestore_store_owner.c pagestore_manifest.c pagestore_layer.c pagestore_layer_store.c pagestore_fault.c -lrt -lpthread
           cc -O2 -Wall -Wextra -Werror -o pagestore_fault_test pagestore_fault_test.c pagestore_fault.c -pthread
 
       - name: Run standalone test suite
@@ -100,6 +101,7 @@ jobs:
       - name: Run store ownership and orphan recovery tests
         working-directory: contrib/pagestore
         run: |
+          ./storage_posix_fork_owner_test
           python3 harness/tests/test_store_owner_recovery.py \
             --daemon-binary ./pagestore_daemon \
             --inspect-binary ./pagestore_inspect

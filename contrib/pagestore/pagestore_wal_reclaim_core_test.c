@@ -592,6 +592,9 @@ test_residual_prefix_retry_after_reopen(void)
 	configure_core();
 	check(prepare_store(store, WAL_TOTAL, 0, 0, 1),
 		  "construct reclaimable WAL for a residual-prefix retry");
+	/* Crash the child-owned recovery instance, not a fork-inherited provider.
+	 * Ownership fencing deliberately forbids mutation through the latter. */
+	close_store();
 	{
 		pid_t pid;
 		int status = 0;
@@ -601,6 +604,8 @@ test_residual_prefix_retry_after_reopen(void)
 		pid = fork();
 		if (pid == 0)
 		{
+			if (ps_core_open(store) != 0)
+				_exit(2);
 			(void) ps_test_wal_reclaim_maintenance();
 			_exit(1);
 		}
@@ -610,7 +615,6 @@ test_residual_prefix_retry_after_reopen(void)
 			  "crash leaves the authorized residual WAL prefix on disk");
 		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_BEFORE_UNLINK");
 	}
-	close_store();
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
 	check(ps_backpressure_configure(0, 0, WAL_SEGMENT, WAL_SEGMENT / 2) == 0 &&
@@ -654,6 +658,8 @@ test_residual_prefix_and_suffix_debt(void)
 		remove_tree(store);
 		return;
 	}
+	close_store();
+	opened = 0;
 	{
 		pid_t pid;
 		int status = 0;
@@ -664,6 +670,8 @@ test_residual_prefix_and_suffix_debt(void)
 		pid = fork();
 		if (pid == 0)
 		{
+			if (ps_core_open(store) != 0)
+				_exit(2);
 			(void) ps_test_wal_reclaim_maintenance();
 			_exit(1);
 		}
@@ -673,8 +681,6 @@ test_residual_prefix_and_suffix_debt(void)
 			  "crash leaves one residual and three post-frontier segments");
 		unsetenv("PAGESTORE_TEST_WAL_RECLAIM_CRASH_AFTER_UNLINK_SEGMENT_NO");
 	}
-	close_store();
-	opened = 0;
 	memset(&metrics, 0, sizeof(metrics));
 	ps_core_set_metrics_header(&metrics);
 	check(ps_backpressure_configure(0, 0, 3 * (uint64_t) WAL_SEGMENT,

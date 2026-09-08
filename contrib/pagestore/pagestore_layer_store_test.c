@@ -53,6 +53,7 @@ main(void)
 	char		object_dir[] = "/tmp/pslayerstoreobjectXXXXXX";
 	char		owner_path[sizeof(object_dir) + 32];
 	char		stale_path[sizeof(object_dir) + 64];
+	char		retained_path[sizeof(local_dir) + 64];
 	char		configured_object_dir[sizeof(object_dir) + 2];
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
@@ -76,7 +77,7 @@ main(void)
 		  ps_layer_store->open(local_dir) == 0,
 		  "open exclusive object directory");
 	ps_layer_store->close();
-	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0000000000000011.tmp.999999.0",
+	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0003000000000011.tmp.999999.0",
 			 object_dir);
 	{
 		int fd = open(stale_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -85,9 +86,19 @@ main(void)
 			close(fd);
 		check(fd >= 0, "create interrupted-copy temporary");
 	}
+	snprintf(retained_path, sizeof(retained_path),
+			 "%s/layer_3_0003000000000012.tmp.%ld.0", local_dir,
+			 (long) getpid());
+	{
+		int fd = open(retained_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+		check(fd >= 0 && close(fd) == 0,
+			  "create a copy temporary with the current PID");
+	}
 	snprintf(configured_object_dir, sizeof(configured_object_dir), "%s/", object_dir);
 	check(setenv("PAGESTORE_OBJECT_DIR", configured_object_dir, 1) == 0 &&
-		  ps_layer_store->open(local_dir) == 0 && access(stale_path, F_OK) != 0,
+		  ps_layer_store->open(local_dir) == 0 && access(stale_path, F_OK) != 0 &&
+		  access(retained_path, F_OK) == 0,
 		  "canonicalize object directory and reap interrupted copies at startup");
 	ps_layer_store->close();
 	check(ps_layer_store->open(other_local_dir) != 0,
@@ -97,6 +108,58 @@ main(void)
 	{
 		fprintf(stderr, "could not reopen object directory\n");
 		return 2;
+	}
+	{
+		PsLayerMap empty;
+
+		ps_layer_map_init(&empty);
+		check(ps_layer_store->recover_local_layers(&empty) == 0 &&
+			  access(retained_path, F_OK) == 0,
+			  "recovery skips a live-PID copy temporary by its known grammar");
+		ps_layer_map_free(&empty);
+	}
+	{
+		const uint64_t fork_layer_id = (3ULL << 48) | 16;
+		const uint64_t child_layer_id = (3ULL << 48) | 26;
+		char		fork_layer_uri[PS_LAYER_URI_MAX];
+		char		child_layer_uri[PS_LAYER_URI_MAX];
+		pid_t		pid;
+		int		status = 0;
+
+		fork_layer_uri[0] = '\0';
+		check(ps_layer_store->create_local_layer(fork_layer_id,
+											 fork_layer_uri,
+											 sizeof(fork_layer_uri)) == 0,
+				  "create a provider layer before fork");
+		snprintf(child_layer_uri, sizeof(child_layer_uri),
+				 "%s/layer_3_%016llx", local_dir,
+				 (unsigned long long) child_layer_id);
+		pid = fork();
+		if (pid == 0)
+		{
+			char		child_uri[PS_LAYER_URI_MAX];
+			int		open_rc;
+			int		open_errno;
+			int		create_rc;
+			int		write_rc;
+
+			open_rc = ps_layer_store->open(local_dir);
+			open_errno = errno;
+			create_rc = ps_layer_store->create_local_layer(child_layer_id,
+											 child_uri,
+											 sizeof(child_uri));
+			write_rc = ps_layer_store->write_local_layer(fork_layer_id,
+											 "child", 5);
+			_exit(open_rc != 0 && open_errno == ECHILD &&
+					create_rc != 0 && write_rc != 0 ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+			  access(child_layer_uri, F_OK) != 0,
+			  "forked provider rejects inherited-owner reopen and mutations");
+		if (fork_layer_uri[0] != '\0')
+			unlink(fork_layer_uri);
+		unlink(child_layer_uri);
 	}
 	{
 		PsStoreOwner *owner1 = NULL;
@@ -158,6 +221,27 @@ main(void)
 		  "write and seal local layer");
 	snprintf(layer.locations[0].uri, sizeof(layer.locations[0].uri), "%s", local_uri);
 	layer.locations[0].size = strlen(contents);
+	{
+		char		child_buf[64];
+		pid_t		pid;
+		int		status = 0;
+
+		pid = fork();
+		if (pid == 0)
+		{
+			int read_rc;
+			int read_errno;
+
+			errno = 0;
+			read_rc = ps_layer_store->read_layer_block(&layer, 0,
+										 child_buf, strlen(contents));
+			read_errno = errno;
+			_exit(read_rc != 0 && read_errno == ECHILD ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "forked provider rejects inherited-owner reads");
+	}
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
 												 sizeof(remote_uri)) == 0,
@@ -237,15 +321,28 @@ main(void)
 	{
 		PsLayerMap map;
 		char		orphan[PS_LAYER_URI_MAX];
+		char		protected_path[PS_LAYER_URI_MAX];
 		char		bad_name[PS_LAYER_URI_MAX];
 		char		hard_name[PS_LAYER_URI_MAX];
 		int		fd;
 		uint64_t	orphan_id = (3ULL << 48) | 19;
 		uint64_t	bad_id = (3ULL << 48) | 20;
+		uint64_t	protected_id = (3ULL << 48) | 5;
+		PsLayerDesc protected_layer;
 
 		ps_layer_map_init(&map);
 		check(ps_layer_map_add(&map, &layer) == 0,
 			  "build recovery reference map");
+		memset(&protected_layer, 0, sizeof(protected_layer));
+		protected_layer.layer_id = protected_id;
+		check(ps_layer_map_add(&map, &protected_layer) == 0,
+			  "add an out-of-order manifest layer ID");
+		check(ps_layer_store->create_local_layer(protected_id, protected_path,
+										 sizeof(protected_path)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(protected_path, F_OK) == 0,
+			  "sorted manifest IDs protect a referenced layer");
+		unlink(protected_path);
 		/* The recovery corruption case models a live, not-yet-remote-durable
 		 * reference; test remote-durable/unavailable semantics separately below. */
 		map.layers[0].remote_durable = false;
@@ -293,9 +390,14 @@ main(void)
 		fd = open(local_uri, O_WRONLY | O_TRUNC);
 		if (fd >= 0)
 		{
-			(void) write(fd, contents, strlen(contents));
-			close(fd);
+			ssize_t nw = write(fd, contents, strlen(contents));
+			int close_rc = close(fd);
+
+			check(nw == (ssize_t) strlen(contents) && close_rc == 0,
+				  "restore the referenced layer after corruption");
 		}
+		else
+			check(0, "open the referenced layer for restoration");
 		check(unlink(local_uri) == 0,
 			  "remove referenced local layer for deleting recovery");
 		map.layers[0].deleting = true;
@@ -344,6 +446,7 @@ main(void)
 
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	unlink(retained_path);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-owner", object_dir);
 	unlink(owner_path);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", local_dir);

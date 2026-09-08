@@ -18,6 +18,10 @@ extern int ps_store_owner_acquire(const char *store_dir,
 /* The canonical root spelling held by an acquired lease. */
 extern const char *ps_store_owner_root(const PsStoreOwner *owner);
 
+/* Require that a lease belongs to this process.  Inherited handles fail with
+ * ECHILD before callers touch cached descriptors, paths, or provider locks. */
+extern int ps_store_owner_require_current(const PsStoreOwner *owner);
+
 /* Release one same-process reference.  A handle inherited across fork is a
  * no-op in the child, so it cannot release or reuse the parent's ownership. */
 extern void ps_store_owner_release(PsStoreOwner *owner);

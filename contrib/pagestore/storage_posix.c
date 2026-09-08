@@ -101,6 +101,13 @@ static void posix_wal_locks_clear(void);
 static void posix_walidx_locks_clear(void);
 static void posix_close(void);
 
+/* Check before touching copied caches, descriptors, or provider mutexes. */
+static int
+posix_require_owner(void)
+{
+	return ps_store_owner_require_current(posix_owner);
+}
+
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
 static int posix_log_append_locked(const char *name, const void *buf,
@@ -273,7 +280,11 @@ posix_open(const char *path, uint64_t segment_size)
 	 * that reopen behavior, but make the replacement release its old lease before
 	 * attempting to claim a different root. */
 	if (posix_owner != NULL)
+	{
+		if (ps_store_owner_require_current(posix_owner) != 0)
+			return -1;
 		posix_close();
+	}
 	if (ps_store_owner_acquire(path, &posix_owner) != 0)
 		return -1;
 	if (snprintf(posix_dir, sizeof(posix_dir), "%s",
@@ -369,6 +380,13 @@ fail:
 static void
 posix_close(void)
 {
+	if (posix_owner != NULL && ps_store_owner_require_current(posix_owner) != 0)
+	{
+		/* An inherited provider remains unusable until exec.  Keep the stale
+		 * token so repeated close calls take this branch without touching any
+		 * copied provider mutex or cache. */
+		return;
+	}
 	pthread_mutex_lock(&seg_fds_lock);
 	free_shard_caches();
 	pthread_mutex_unlock(&seg_fds_lock);
@@ -386,6 +404,9 @@ static int
 posix_sync(void)
 {
 	int			rc = 0;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	/*
 	 * Walk the shared seg-fd cache under seg_fds_lock so a concurrent shard
@@ -436,6 +457,9 @@ posix_seg_remove(uint32_t shard, int seg)
 	int			dfd;
 	int			rc = 0;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	seg_path(path, sizeof(path), shard, seg);
 	pthread_mutex_lock(&seg_fds_lock);
 	if (shard < (uint32_t) seg_shards_cap && seg >= 0 &&
@@ -479,12 +503,16 @@ static int
 posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 			uint32_t len)
 {
+	int			fd;
+
+	if (posix_require_owner() != 0)
+		return -1;
 	if (posix_seg_rewrite_poisoned)
 	{
 		errno = EIO;
 		return -1;
 	}
-	int		fd = seg_fd(shard, seg, 1);
+	fd = seg_fd(shard, seg, 1);
 
 	if (fd < 0)
 		return -1;
@@ -505,12 +533,16 @@ posix_seg_write(uint32_t shard, int seg, uint64_t off, const void *buf,
 static int
 posix_seg_read(uint32_t shard, int seg, uint64_t off, void *buf, uint32_t len)
 {
+	int			fd;
+
+	if (posix_require_owner() != 0)
+		return -1;
 	if (posix_seg_rewrite_poisoned)
 	{
 		errno = EIO;
 		return -1;
 	}
-	int		fd = seg_fd(shard, seg, 0);
+	fd = seg_fd(shard, seg, 0);
 
 	if (fd < 0)
 		return -1;
@@ -524,6 +556,9 @@ posix_seg_size(uint32_t shard, int seg)
 {
 	char		path[4096];
 	struct stat st;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (posix_seg_rewrite_poisoned)
 	{
@@ -555,6 +590,9 @@ posix_seg_rewrite(uint32_t shard, int seg, const void *buf, uint64_t len)
 	int newfd = -1;
 	int cache_locked = 0;
 	int rc = -1;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (posix_seg_rewrite_poisoned)
 	{
@@ -777,8 +815,12 @@ static int
 posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 			 const void *b, uint32_t blen)
 {
-	PosixWalLock *lock = posix_wal_lock_for(tl);
+	PosixWalLock *lock;
 	int rc;
+
+	if (posix_require_owner() != 0)
+		return -1;
+	lock = posix_wal_lock_for(tl);
 
 	if (lock == NULL)
 		return -1;
@@ -792,11 +834,15 @@ posix_wal_append(uint32_t tl, const void *a, uint32_t alen,
 static int
 posix_wal_read(uint32_t tl, uint64_t off, void *buf, uint32_t len)
 {
-	PosixWalLock *lock = posix_wal_lock_for(tl);
+	PosixWalLock *lock;
 	char		path[4096];
 	int		fd;
 	ssize_t		n;
 	uint32_t	done = 0;
+
+	if (posix_require_owner() != 0)
+		return -1;
+	lock = posix_wal_lock_for(tl);
 
 	if (lock == NULL)
 		return -1;
@@ -854,8 +900,12 @@ posix_wal_truncate_locked(uint32_t tl, uint64_t len)
 static int
 posix_wal_truncate(uint32_t tl, uint64_t len)
 {
-	PosixWalLock *lock = posix_wal_lock_for(tl);
+	PosixWalLock *lock;
 	int rc;
+
+	if (posix_require_owner() != 0)
+		return -1;
+	lock = posix_wal_lock_for(tl);
 
 	if (lock == NULL)
 		return -1;
@@ -875,7 +925,7 @@ posix_wal_truncate(uint32_t tl, uint64_t len)
 static int
 posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 {
-	PosixWalLock *lock = posix_wal_lock_for(tl);
+	PosixWalLock *lock;
 	char		path[4096];
 	char		tmp[4096];
 	unsigned char buf[64 * 1024];
@@ -885,6 +935,10 @@ posix_wal_rewrite_prefix(uint32_t tl, uint64_t keep_off)
 	int		dst = -1;
 	int		dfd = -1;
 	int		rc = -1;
+
+	if (posix_require_owner() != 0)
+		return -1;
+	lock = posix_wal_lock_for(tl);
 
 	if (lock == NULL)
 		return -1;
@@ -1212,6 +1266,9 @@ posix_walidx_append(uint32_t tl, uint32_t shard, uint64_t epoch,
 	uint64_t	old_length = 0;
 	int			rc;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0)
 		return -1;
 	lock = posix_walidx_lock_for(tl, shard);
@@ -1301,6 +1358,9 @@ posix_walidx_read(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t off,
 	uint64_t	length;
 	int			rc;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0)
 		return -1;
 	if (epoch == 0)
@@ -1333,6 +1393,9 @@ posix_walidx_truncate(uint32_t tl, uint32_t shard, uint64_t epoch, uint64_t len)
 	int			fd;
 	int			rc = 0;
 	PosixWalIdxLock *lock;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0 ||
 		snprintf(path, sizeof(path), "%s/%s", posix_dir, name) < 0 ||
@@ -1378,6 +1441,9 @@ posix_walidx_epoch_create(uint32_t tl, uint32_t shard, uint64_t epoch)
 	int fd = -1;
 	int rc = -1;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	if (epoch == 0 ||
 		posix_walidx_name(tl, shard, epoch, name, sizeof(name)) != 0 ||
 		snprintf(path, sizeof(path), "%s/%s", posix_dir, name) < 0 ||
@@ -1411,7 +1477,7 @@ cleanup:
 
 static int
 posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
-					 uint32_t nshards)
+						 uint32_t nshards)
 {
 	char prefix[128];
 	struct dirent *entry;
@@ -1421,6 +1487,9 @@ posix_walidx_epoch_gc(uint32_t tl, const uint64_t *keep_epochs,
 	int removed = 0;
 	int rc = -1;
 	int n;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (keep_epochs == NULL || nshards == 0)
 		return -1;
@@ -1531,6 +1600,9 @@ posix_walidx_reclaim_bytes(uint32_t tl, const uint64_t *keep_epochs,
 	unsigned char current_markers[PS_MAX_CHANNELS] = {0};
 	int rc = -1;
 	int n;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (keep_epochs == NULL || covered_offsets == NULL ||
 		observed_offsets == NULL || nshards == 0 ||
@@ -2168,6 +2240,9 @@ posix_timeline_wal_cleanup(uint32_t tl)
 	int rc = -1;
 	int readdir_errno;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	if (tl == 0 || tl == UINT32_MAX ||
 		snprintf(wal_name, sizeof(wal_name), "wal_%u", tl) < 0 ||
 		snprintf(wal_rewrite_name, sizeof(wal_rewrite_name),
@@ -2460,6 +2535,9 @@ posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len)
 	ssize_t		n;
 	uint32_t	done = 0;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
@@ -2493,6 +2571,9 @@ posix_log_append(const char *name, const void *buf, uint32_t len)
 {
 	int			rc;
 
+	if (posix_require_owner() != 0)
+		return -1;
+
 	pthread_mutex_lock(&posix_log_lock);
 	rc = posix_log_append_locked(name, buf, len);
 	pthread_mutex_unlock(&posix_log_lock);
@@ -2517,6 +2598,9 @@ posix_log_truncate(const char *name, uint64_t len)
 	char		path[4096];
 	int			fd;
 	int			rc = 0;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	snprintf(path, sizeof(path), "%s/%s", posix_dir, name);
 	pthread_mutex_lock(&posix_log_lock);
@@ -2546,6 +2630,9 @@ posix_meta_rewrite(const void *buf, uint32_t len)
 	char path[4096], tmp[4096];
 	int fd = -1, dfd = -1, rc = -1;
 	ssize_t n;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	snprintf(path, sizeof(path), "%s/timelines", posix_dir);
 	snprintf(tmp, sizeof(tmp), "%s/timelines.tmp", posix_dir);
@@ -2595,6 +2682,8 @@ out:
 static int
 posix_fork_meta_append(const void *buf, uint32_t len)
 {
+	if (posix_require_owner() != 0)
+		return -1;
 	/* Standalone-test fault injection; ordinary deployments leave this zero. */
 	if (test_fail_fork_meta_append_at > 0 &&
 		--test_fail_fork_meta_append_at == 0)
@@ -2623,6 +2712,9 @@ posix_fork_meta_size(uint64_t *len)
 	char path[4096];
 	struct stat st;
 	int n;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (len == NULL)
 	{
@@ -2659,6 +2751,9 @@ posix_fork_meta_rewrite(const void *buf, uint32_t len)
 	char path[4096], tmp[4096];
 	int fd = -1, dfd = -1, rc = -1;
 	uint32_t off = 0;
+
+	if (posix_require_owner() != 0)
+		return -1;
 
 	if (buf == NULL && len != 0)
 		return -1;

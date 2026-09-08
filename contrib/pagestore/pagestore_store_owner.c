@@ -290,6 +290,22 @@ ps_store_owner_root(const PsStoreOwner *owner)
 	return owner->entry->root;
 }
 
+int
+ps_store_owner_require_current(const PsStoreOwner *owner)
+{
+	if (owner == NULL || owner->entry == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if (owner->pid != getpid())
+	{
+		errno = ECHILD;
+		return -1;
+	}
+	return 0;
+}
+
 void
 ps_store_owner_release(PsStoreOwner *owner)
 {

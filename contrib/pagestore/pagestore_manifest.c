@@ -322,6 +322,9 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	int			rc = 0;
 	int			created = 0;
 
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
+
 	/* once the tail may be torn, never append again (see manifest_poisoned) */
 	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;
@@ -515,7 +518,11 @@ ps_manifest_open(const char *store_dir)
 	int			save_errno;
 
 	if (manifest_owner != NULL)
+	{
+		if (ps_store_owner_require_current(manifest_owner) != 0)
+			return -1;
 		ps_manifest_close();
+	}
 	if (ps_store_owner_acquire(store_dir, &manifest_owner) != 0)
 		return -1;
 	n = snprintf(manifest_dir, sizeof(manifest_dir), "%s",
@@ -557,6 +564,9 @@ fail:
 void
 ps_manifest_close(void)
 {
+	if (manifest_owner != NULL &&
+		ps_store_owner_require_current(manifest_owner) != 0)
+		return;
 	ps_layer_map_free(&ps_layer_map);
 	manifest_path[0] = '\0';
 	manifest_dir[0] = '\0';
@@ -594,6 +604,8 @@ ps_manifest_replay_had_manifest(void)
 int
 ps_manifest_orphan_sweep_inhibited(void)
 {
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
 	return manifest_validate_repair_marker();
 }
 
@@ -678,6 +690,9 @@ ps_manifest_replay(PsLayerMap *map)
 	int			file_v2;
 	off_t		file_size;
 	struct stat st;
+
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
 
 	manifest_nrecords = 0;
 	fd = open(manifest_path,
@@ -1191,6 +1206,9 @@ ps_manifest_compact(void)
 	int			rc = 0;
 	uint64_t	nrec = 0;
 	int			n;
+
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
 
 	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;

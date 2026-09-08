@@ -5,7 +5,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
 #include <pthread.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +45,121 @@ static BlockingGate upload_gate;
 static BlockingGate publication_gate;
 static BlockingGate verification_gate;
 static PsLayerStore blocking_store;
+
+static int mock_close_calls;
+
+static void
+mock_storage_close(void)
+{
+	mock_close_calls++;
+	PsStoragePosix.close();
+}
+
+static int
+mock_storage_failed_open(const char *path, uint64_t size)
+{
+	/* Model an attach failure after acquiring the delegated POSIX lease. */
+	if (PsStoragePosix.open(path, size) != 0)
+		return -1;
+	PsStoragePosix.close();
+	errno = EIO;
+	return -1;
+}
+
+static int
+mock_layer_failed_open(const char *path)
+{
+	(void) path;
+	errno = EIO;
+	return -1;
+}
+
+static void
+test_core_provider_lifecycle(void)
+{
+	char dir[] = "/tmp/ps-core-owner-XXXXXX";
+	PsStorage mock = PsStoragePosix;
+	PsLayerStore mock_layer = PsLayerStoreLocal;
+	PsKey key = {1, 1, 5, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	pid_t pid;
+	int status;
+	int rc;
+
+	if (mkdtemp(dir) == NULL)
+	{
+		check(0, "create core lifecycle test store");
+		return;
+	}
+	page_size = PSZ;
+	segment_size = 1024 * 1024;
+	flush_pages = 1024;
+	cache_pages = 0;
+	use_layers = 1;
+	ps_nshards = 1;
+	mock.name = "mock-non-posix";
+	mock.close = mock_storage_close;
+	mock.open = mock_storage_failed_open;
+	ps_storage = &mock;
+	mock_close_calls = 0;
+	errno = 0;
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO && mock_close_calls == 0,
+		  "failed non-POSIX open never calls catalog-publishing close");
+	mock.open = PsStoragePosix.open;
+	mock_layer.open = mock_layer_failed_open;
+	ps_layer_store = &mock_layer;
+	errno = 0;
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO && mock_close_calls == 1,
+		  "late core open failure closes fully initialized non-POSIX storage once");
+	ps_layer_store = &PsLayerStoreLocal;
+	mock_close_calls = 0;
+	check(ps_core_open(dir) == 0, "reopen after failed provider initialization");
+	ps_core_close();
+	check(mock_close_calls == 0, "core leaves non-POSIX teardown to its caller");
+	ps_storage->close();
+	check(mock_close_calls == 1, "caller closes non-POSIX provider exactly once");
+
+	ps_storage = &PsStoragePosix;
+	check(ps_core_open(dir) == 0, "POSIX core reopens after caller teardown");
+	check(append_page(0, &key, 0, page, 1, NULL) == 0,
+		  "buffer a parent page before fork");
+	pid = fork();
+	if (pid == 0)
+	{
+		PsChannel channel;
+		PageVer version = {.seg = 0};
+		int good = 1;
+
+		alarm(3);
+		errno = 0;
+		ps_core_close();
+		good = good && errno == ECHILD;
+		good = good && ps_core_maintenance() == -1 && errno == ECHILD;
+		good = good && append_page(0, &key, 1, page, 2, NULL) == -1 &&
+			errno == ECHILD;
+		good = good && fork_grow(0, &key, 3, 3) == -1 && errno == ECHILD;
+		good = good && read_through(0, &key, 0, UINT64_MAX, 0) == NULL &&
+			errno == ECHILD;
+		good = good && read_version(&version, page) == -1 && errno == ECHILD;
+		good = good && read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == -1 &&
+			errno == ECHILD;
+		memset(&channel, 0, sizeof(channel));
+		channel.opcode = PS_OP_CREATE;
+		channel.key = key;
+		good = good && ps_handle_meta(&channel) == 1 &&
+			channel.status == PS_STATUS_ERROR;
+		good = good && ps_core_open(dir) == -1 && errno == ECHILD;
+		_exit(good ? 0 : 1);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		  "forked core cannot flush, mutate, or reopen inherited state");
+	check(append_page(0, &key, 1, page, 2, NULL) == 0,
+		  "parent remains writable after child rejects inherited core");
+	ps_core_close();
+}
 
 static int
 blocking_upload(const PsLayerDesc *layer)
@@ -512,6 +629,7 @@ main(void)
 	pthread_cond_destroy(&verification_gate.cond);
 	pthread_mutex_destroy(&verification_gate.mutex);
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	test_core_provider_lifecycle();
 	printf("pagestore_tiering_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }
