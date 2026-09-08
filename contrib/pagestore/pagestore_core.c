@@ -15142,7 +15142,10 @@ ps_core_close(void)
 	if (!core_process_valid())
 		return;
 	pthread_mutex_lock(&core_state_lock);
-	ps_core_close_impl();
+	/* Failed startup already unwinds providers, and a prior close released
+	 * their leases.  Neither state may enter the flushing shutdown path. */
+	if (__atomic_load_n(&core_opened, __ATOMIC_ACQUIRE))
+		ps_core_close_impl();
 	__atomic_store_n(&core_pid, 0, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&core_state_lock);
 }
@@ -16287,6 +16290,7 @@ ps_core_open(const char *store_dir)
 		/* Provider opens own the store lease.  Unwind all lifecycle refs on every
 		 * startup failure, including failures after manifest replay begins. */
 		save_errno = errno;
+		__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
 		ps_manifest_close();
 		if (ps_layer_store != NULL && ps_layer_store->close != NULL)
 			ps_layer_store->close();

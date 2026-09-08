@@ -109,6 +109,9 @@ test_core_provider_lifecycle(void)
 	rc = ps_core_open(dir);
 	check(rc != 0 && errno == EIO && mock_close_calls == 0,
 		  "failed non-POSIX open never calls catalog-publishing close");
+	ps_core_close();
+	ps_core_close();
+	check(mock_close_calls == 0, "repeated close after provider-open failure is harmless");
 	mock.open = PsStoragePosix.open;
 	mock_layer.open = mock_layer_failed_open;
 	ps_layer_store = &mock_layer;
@@ -116,6 +119,9 @@ test_core_provider_lifecycle(void)
 	rc = ps_core_open(dir);
 	check(rc != 0 && errno == EIO && mock_close_calls == 1,
 		  "late core open failure closes fully initialized non-POSIX storage once");
+	ps_core_close();
+	ps_core_close();
+	check(mock_close_calls == 1, "close after late startup failure does not close again");
 	ps_layer_store = &PsLayerStoreLocal;
 	mock_close_calls = 0;
 	check(ps_core_open(dir) == 0, "reopen after failed provider initialization");
@@ -161,6 +167,9 @@ test_core_provider_lifecycle(void)
 		  "forked core cannot flush, mutate, or reopen inherited state");
 	check(append_page(0, &key, 1, page, 2, NULL) == 0,
 		  "parent remains writable after child rejects inherited core");
+	ps_core_close();
+	ps_core_close();
+	check(ps_core_open(dir) == 0, "POSIX core reopens after repeated close");
 	ps_core_close();
 }
 

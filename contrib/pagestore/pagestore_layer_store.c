@@ -692,7 +692,23 @@ local_recover_local_layers(PsLayerMap *map)
 			continue;
 		copy_temp = parse_copy_temp_name(ent->d_name, NULL);
 		if (copy_temp == 1)
+		{
+			if (fstatat(dirfd(dir), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			{
+				if (errno == ENOENT)
+				{
+					errno = 0;
+					continue;
+				}
+				goto done;
+			}
+			if (!S_ISREG(st.st_mode) || st.st_nlink != 1)
+			{
+				errno = EINVAL;
+				goto done;
+			}
 			continue;
+		}
 		if (copy_temp < 0)
 		{
 			errno = EINVAL;
@@ -929,25 +945,69 @@ cleanup_stale_copy_temps(const char *dir)
 {
 	DIR			*d;
 	struct dirent *ent;
-	char		path[4096];
+	struct stat	st;
 	pid_t		pid;
-	int			n;
+	int			changed = 0;
+	int			rc = 0;
+	int			save_errno = 0;
 
 	d = opendir(dir);
 	if (d == NULL)
 		return -1;
-	while ((ent = readdir(d)) != NULL)
+	for (;;)
 	{
+		errno = 0;
+		ent = readdir(d);
+		if (ent == NULL)
+		{
+			if (errno != 0)
+			{
+				rc = -1;
+				save_errno = errno;
+			}
+			break;
+		}
 		if (parse_copy_temp_name(ent->d_name, &pid) != 1)
 			continue;
+		if (fstatat(dirfd(d), ent->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			rc = -1;
+			save_errno = errno;
+			break;
+		}
+		if (!S_ISREG(st.st_mode) || st.st_nlink != 1)
+		{
+			rc = -1;
+			save_errno = EINVAL;
+			break;
+		}
 		if (kill(pid, 0) != -1 || errno != ESRCH)
 			continue;
-		n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
-		if (n >= 0 && (size_t) n < sizeof(path))
-			unlink(path);
+		if (unlinkat(dirfd(d), ent->d_name, 0) != 0)
+		{
+			if (errno == ENOENT)
+				continue;
+			rc = -1;
+			save_errno = errno;
+			break;
+		}
+		changed = 1;
 	}
-	closedir(d);
-	return 0;
+	if (changed && fsync(dirfd(d)) != 0 && rc == 0)
+	{
+		rc = -1;
+		save_errno = errno;
+	}
+	if (closedir(d) != 0 && rc == 0)
+	{
+		rc = -1;
+		save_errno = errno;
+	}
+	if (rc != 0)
+		errno = save_errno != 0 ? save_errno : EIO;
+	return rc;
 }
 
 static int

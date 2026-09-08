@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -347,6 +348,89 @@ main(void)
 		ps_layer_map_free(&legacy);
 		if (alias_ready)
 			unlink(alias_dir);
+	}
+	{
+		PsLayerMap unsafe_map;
+		char		unsafe_orphan[PS_LAYER_URI_MAX];
+		char		unsafe_temp[PS_LAYER_URI_MAX];
+		char		hard_target[PS_LAYER_URI_MAX];
+		int		fd;
+		int		temp_ready;
+
+		ps_layer_map_init(&unsafe_map);
+		snprintf(unsafe_orphan, sizeof(unsafe_orphan),
+				 "%s/layer_3_0003000000000019", local_dir);
+		snprintf(unsafe_temp, sizeof(unsafe_temp),
+				 "%s/layer_3_0003000000000027.tmp.%ld.1", local_dir,
+				 (long) getpid());
+		check(ps_layer_map_add(&unsafe_map, &layer) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 25,
+										 unsafe_orphan,
+										 sizeof(unsafe_orphan)) == 0 &&
+			  ps_layer_store->write_local_layer((3ULL << 48) | 25, contents,
+										 strlen(contents)) == 0,
+			  "seed an orphan before unsafe copy-temp checks");
+
+		temp_ready = mkdir(unsafe_temp, 0700) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a directory copy temporary before orphan cleanup");
+		if (temp_ready)
+			rmdir(unsafe_temp);
+
+		temp_ready = symlink(local_uri, unsafe_temp) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a symlink copy temporary before orphan cleanup");
+		if (temp_ready)
+			unlink(unsafe_temp);
+
+		snprintf(hard_target, sizeof(hard_target), "%s/copy-temp-target", local_dir);
+		fd = open(hard_target, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		temp_ready = fd >= 0 && close(fd) == 0 && link(hard_target, unsafe_temp) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a hard-linked copy temporary before orphan cleanup");
+		if (temp_ready)
+			unlink(unsafe_temp);
+		unlink(hard_target);
+
+		check(ps_layer_store->recover_local_layers(&unsafe_map) == 0 &&
+			  access(unsafe_orphan, F_OK) != 0,
+			  "safe recovery removes the orphan after unsafe temps are gone");
+		ps_layer_map_free(&unsafe_map);
+	}
+	{
+		char		stale_dir[PS_LAYER_URI_MAX];
+		pid_t		dead_pid;
+		int		status = 0;
+		int		made = 0;
+
+		dead_pid = fork();
+		if (dead_pid == 0)
+			_exit(0);
+		if (dead_pid > 0 && waitpid(dead_pid, &status, 0) == dead_pid &&
+			WIFEXITED(status))
+		{
+			snprintf(stale_dir, sizeof(stale_dir),
+					 "%s/layer_3_0003000000000028.tmp.%ld.1", local_dir,
+					 (long) dead_pid);
+			made = mkdir(stale_dir, 0700) == 0;
+		}
+		check(made, "seed an unlink-failing stale copy temporary");
+		if (made)
+		{
+			ps_layer_store->close();
+			check(ps_layer_store->open(local_dir) != 0,
+				  "propagate stale copy-temp unlink failure at startup");
+			check(rmdir(stale_dir) == 0,
+				  "remove the stale cleanup failure fixture");
+			check(ps_layer_store->open(local_dir) == 0,
+				  "reopen after stale cleanup failure is repaired");
+		}
 	}
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,

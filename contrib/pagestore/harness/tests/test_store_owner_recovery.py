@@ -372,6 +372,42 @@ def test_unsafe_layer_entries_fail_closed(
             process.cleanup()
 
 
+def test_unsafe_copy_temporaries_fail_closed(
+    daemon: Path, inspector: Path, root: Path, timeout: float
+) -> None:
+    exited = subprocess.Popen([sys.executable, "-c", "pass"], env=private_environment())
+    require(exited.wait(timeout=timeout) == 0, "prepare exited copy-owner PID")
+    for label, pid in (("live", os.getpid()), ("exited", exited.pid)):
+        for kind in ("directory", "symlink", "hardlink"):
+            case = f"copy-{label}-{kind}"
+            store = root / f"{case}-store"
+            store.mkdir()
+            seed_store(daemon, inspector, store, root / f"{case}-seed.log", timeout)
+            establish_clean_manifest(
+                daemon, inspector, store, root / f"{case}-manifest.log", timeout
+            )
+            orphan = layer_path(store, ORPHAN_ID)
+            orphan.touch()
+            unsafe = store / f"{layer_path(store, ORPHAN_ID + 1).name}.tmp.{pid}.1"
+            outside = root / f"{case}-outside"
+            outside.write_bytes(b"outside bytes\n")
+            if kind == "directory":
+                unsafe.mkdir()
+            elif kind == "symlink":
+                unsafe.symlink_to(outside)
+            else:
+                os.link(outside, unsafe)
+            before = snapshot_tree(store)
+            process = launch_daemon(daemon, store, root / f"{case}.log")
+            try:
+                wait_exit(process, timeout, 1, case)
+                assert_tree_unchanged(before, store, case)
+                require(outside.read_bytes() == b"outside bytes\n",
+                        f"{case}: outside target changed")
+            finally:
+                process.cleanup()
+
+
 def test_malformed_inhibition_markers_fail_closed(
     daemon: Path, inspector: Path, root: Path, timeout: float
 ) -> None:
@@ -625,6 +661,7 @@ def run(args: argparse.Namespace) -> None:
             ("empty orphan cleanup", test_empty_orphan_is_removed),
             ("missing manifest skips sweep", test_missing_manifest_skips_sweep),
             ("unsafe layer fail-closed", test_unsafe_layer_entries_fail_closed),
+            ("unsafe copy temporaries fail-closed", test_unsafe_copy_temporaries_fail_closed),
             ("malformed inhibition markers fail-closed", test_malformed_inhibition_markers_fail_closed),
             ("manifest aliases fail-closed", test_manifest_aliases_fail_closed),
             ("corrupt manifest tail safety", test_corrupt_manifest_tail_does_not_delete_orphan),
