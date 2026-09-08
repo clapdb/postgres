@@ -13,11 +13,12 @@
       "io_unit": 262144
     },
     "daemon_fault_smoke": {
-      "operations": ["crash", "set_fault", "release_fault"],
+      "operations": ["crash", "set_fault", "release_fault", "layer_seed"],
       "constraints": {
         "crash": {},
         "set_fault": {},
-        "release_fault": {"target": ["store"]}
+        "release_fault": {"target": ["store"]},
+        "layer_seed": {"target": ["store"]}
       },
       "protocol_version": 45,
       "page_size": 8192,
@@ -71,6 +72,7 @@
     "install_reader",
     "restart",
     "crash",
+    "layer_seed",
     "advance",
     "assert",
     "materializer_fault",

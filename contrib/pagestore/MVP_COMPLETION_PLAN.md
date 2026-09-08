@@ -783,8 +783,9 @@ so the SPDK frontend remains runnable without that POSIX-only mailbox.
 The first composed H1 materializer slice is now implemented: the two
 restartpoint plans pause the checkpointer child after relation-page sync/before
 marker write and after marker sync, then stop and recover the whole
-materializer.  The remaining branch, layer, reclaim, and GC H1 families remain
-outstanding.
+materializer.  The prepared-receipt/service-restore branch slice and the POSIX
+image-layer create/write/seal/manifest-ADD publication slice are also covered.
+Branch bootstrap/install, manifest replacement, reclaim, and GC H1 cases remain.
 
 Deliverables:
 
@@ -810,8 +811,10 @@ Expected scope: one or two PRs.
 
 ### H1. Compose process-level crash scenarios
 
-Status: **materializer replay/restartpoint slice implemented; branch, layer,
-reclaim, and GC cases remain and depend on H0/R2-R5**.
+Status: **materializer replay/restartpoint, branch prepared-receipt/service-
+restore, and POSIX image-layer publication slices implemented; branch
+bootstrap/install, manifest replacement, reclaim, and GC cases remain and
+depend on H0/R2-R5**.
 
 Required scenario families:
 

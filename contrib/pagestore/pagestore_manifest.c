@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pagestore_manifest.h"
+#include "pagestore_fault.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
@@ -792,6 +793,10 @@ ps_manifest_add_layer(const PsLayerDesc *desc)
 	if (manifest_encode_layer(&disk, desc) != 0)
 		return -1;
 	if (manifest_append(PS_MANIFEST_ADD_LAYER, &disk, sizeof(disk)) != 0)
+		return -1;
+	/* The ADD record is now durable.  The in-memory map update follows this
+	 * probe, so recovery must be able to choose the replayed old/new state. */
+	if (ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_MANIFEST_ADD) != 0)
 		return -1;
 	return ps_layer_map_add(&ps_layer_map, desc);
 }

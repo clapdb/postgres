@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "pagestore_fault.h"
 #include "pagestore_layer_store.h"
 
 static uint32_t layer_page_size = PS_DEFAULT_PAGE_SIZE;
@@ -448,6 +449,8 @@ local_create_local_layer(uint64_t layer_id, char *uri, uint32_t uri_len)
 		unlink(path);
 		return -1;
 	}
+	if (ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_CREATE) != 0)
+		return -1;
 	n = snprintf(uri, uri_len, "%s", path);
 	if (n < 0 || (uint32_t) n >= uri_len)
 	{
@@ -494,7 +497,7 @@ local_write_local_layer(uint64_t layer_id, const void *buf, uint64_t len)
 		done += (uint64_t) w;
 	}
 	close(fd);
-	return 0;
+	return ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_WRITE) == 0 ? 0 : -1;
 }
 
 static int
@@ -511,7 +514,9 @@ local_seal_local_layer(uint64_t layer_id)
 		return -1;
 	rc = fsync(fd);
 	close(fd);
-	return rc;
+	if (rc != 0)
+		return rc;
+	return ps_fault_probe(PS_FAULT_POINT_IMAGE_LAYER_AFTER_SEAL) == 0 ? 0 : -1;
 }
 
 static int

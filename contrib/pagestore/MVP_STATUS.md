@@ -42,7 +42,7 @@ new daemon's zeroing/recovery window.
 | Area | Status | Current proof |
 |---|---|---|
 | Page ingest and copy-on-write reads | Implemented | standalone and PostgreSQL integration suites |
-| Image-layer path | Functional mechanisms implemented; phases 2–3 partial | manifest/compaction/segment-GC restart tests; sparse indexes and layer-block cache invalidation remain |
+| Image-layer path | Functional mechanisms implemented; H1 POSIX publication crash slice covered; phases 2–3 partial | manifest/compaction/segment-GC restart tests plus create/write/seal/manifest-ADD crash recovery scenarios with sentinel/LSN and idempotent restart checks; sparse indexes and layer-block cache invalidation remain |
 | Filesystem object tier | Upload done; cache/GC operations partial | download, eviction, refresh, and remote-delete tests; cache policy and orphan reconciliation remain |
 | Materialized-page cache | Basic version cache implemented; phase partial | bounded cache/invalidation tests; cost-aware admission and integrated redo avoidance remain |
 | WAL shipping and ancestry-aware WAL reads | Immutable 1 MiB segments integrated for sealed prefixes; the flat-log copy of every complete sealed record is reclaimed, while the flat log remains migration/tail authority | chunk assembly, reopen, ancestry, and WAL segment/store tests |
@@ -77,6 +77,18 @@ The existing CI proves both focused subsystem paths and the composed contract:
   store/materializer/compute restarts in one topology;
 - `branch_boot_test.sh` proves an independent branch compute can boot, preserve
   fork-point visibility, and write on its own timeline.
+
+The H1 image-layer crash slice is limited to POSIX local layers and process
+abort.  Its four ordered stages cover canonical file creation, file writes
+before seal, sealed layer data, and durable `layers.manifest` ADD publication;
+the write stage does not claim power-loss durability.  The composed
+harness keeps the pre-recovery physical snapshot, then checks a sentinel
+page/LSN, the expected manifest state, and one additional restart for
+idempotence.  A crash after ADD but before its flush watermark conservatively
+retains the durable layer and republishes segment-backed coverage once; the
+intervening clean shutdown compacts that conservative duplicate, and the second
+restart proves convergence to one layer.  The slice does not delete crash
+orphans; cross-process ownership is required before adding that policy.
 
 ## MVP gates
 
@@ -308,12 +320,13 @@ mutations and its snapshot maintenance can be forced below the geometric
 trigger.  All three controllers are POSIX-only; forkmeta does not claim the
 remaining R6 queue-bound soak/tuning work.
 
-### 5. Composed crash and format-compatibility coverage -- remaining
+### 5. Composed crash and format-compatibility coverage -- partial
 
-Focused crash-safety tests exist, while the declarative harness remains partial.
+The POSIX image-layer publication slice is now covered by the declarative
+harness.  Other crash boundaries remain outside this slice.
 Before declaring the MVP repeatable, add process-level fault scenarios around
-materializer progress, branch prepare/install, manifest/layer publication, and
-retention GC, plus a persisted-format fixture for restart/upgrade compatibility.
+branch bootstrap/install, manifest replacement, and retention/reclaim/GC, plus
+a persisted-format fixture for restart/upgrade compatibility.
 
 ## Recommended sequence
 
