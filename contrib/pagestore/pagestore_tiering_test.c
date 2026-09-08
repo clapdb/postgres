@@ -5,7 +5,12 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +48,214 @@ static BlockingGate upload_gate;
 static BlockingGate publication_gate;
 static BlockingGate verification_gate;
 static PsLayerStore blocking_store;
+
+static int mock_close_calls;
+
+static void
+mock_storage_close(void)
+{
+	mock_close_calls++;
+	PsStoragePosix.close();
+}
+
+static int
+mock_storage_failed_open(const char *path, uint64_t size)
+{
+	/* Model an attach failure after acquiring the delegated POSIX lease. */
+	if (PsStoragePosix.open(path, size) != 0)
+		return -1;
+	PsStoragePosix.close();
+	errno = EIO;
+	return -1;
+}
+
+static int
+mock_layer_failed_open(const char *path)
+{
+	(void) path;
+	errno = EIO;
+	return -1;
+}
+
+static void
+test_core_provider_lifecycle(void)
+{
+	char dir[] = "/tmp/ps-core-owner-XXXXXX";
+	PsStorage mock = PsStoragePosix;
+	PsLayerStore mock_layer = PsLayerStoreLocal;
+	PsKey key = {1, 1, 5, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ] = {0};
+	pid_t pid;
+	int status;
+	int rc;
+
+	if (mkdtemp(dir) == NULL)
+	{
+		check(0, "create core lifecycle test store");
+		return;
+	}
+	page_size = PSZ;
+	segment_size = 1024 * 1024;
+	flush_pages = 1024;
+	cache_pages = 0;
+	use_layers = 1;
+	ps_nshards = 1;
+	mock.name = "mock-non-posix";
+	mock.close = mock_storage_close;
+	mock.open = mock_storage_failed_open;
+	ps_storage = &mock;
+	mock_close_calls = 0;
+	errno = 0;
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO && mock_close_calls == 0,
+		  "failed non-POSIX open never calls catalog-publishing close");
+	ps_core_close();
+	ps_core_close();
+	check(mock_close_calls == 0, "repeated close after provider-open failure is harmless");
+	mock.open = PsStoragePosix.open;
+	mock_layer.open = mock_layer_failed_open;
+	ps_layer_store = &mock_layer;
+	errno = 0;
+	rc = ps_core_open(dir);
+	check(rc != 0 && errno == EIO && mock_close_calls == 1,
+		  "late core open failure closes fully initialized non-POSIX storage once");
+	ps_core_close();
+	ps_core_close();
+	check(mock_close_calls == 1, "close after late startup failure does not close again");
+	ps_layer_store = &PsLayerStoreLocal;
+	mock_close_calls = 0;
+	check(ps_core_open(dir) == 0, "reopen after failed provider initialization");
+	ps_core_close();
+	check(mock_close_calls == 0, "core leaves non-POSIX teardown to its caller");
+	ps_storage->close();
+	check(mock_close_calls == 1, "caller closes non-POSIX provider exactly once");
+
+	ps_storage = &PsStoragePosix;
+	check(ps_core_open(dir) == 0, "POSIX core reopens after caller teardown");
+	check(append_page(0, &key, 0, page, 1, NULL) == 0,
+		  "buffer a parent page before fork");
+	pid = fork();
+	if (pid == 0)
+	{
+		PsChannel channel;
+		PageVer version = {.seg = 0};
+		int good = 1;
+
+		alarm(3);
+		errno = 0;
+		ps_core_close();
+		good = good && errno == ECHILD;
+		good = good && ps_core_maintenance() == -1 && errno == ECHILD;
+		good = good && append_page(0, &key, 1, page, 2, NULL) == -1 &&
+			errno == ECHILD;
+		good = good && fork_grow(0, &key, 3, 3) == -1 && errno == ECHILD;
+		good = good && read_through(0, &key, 0, UINT64_MAX, 0) == NULL &&
+			errno == ECHILD;
+		good = good && read_version(&version, page) == -1 && errno == ECHILD;
+		good = good && read_resolve(0, &key, 0, UINT64_MAX, 0, page, NULL) == -1 &&
+			errno == ECHILD;
+		memset(&channel, 0, sizeof(channel));
+		channel.opcode = PS_OP_CREATE;
+		channel.key = key;
+		good = good && ps_handle_meta(&channel) == 1 &&
+			channel.status == PS_STATUS_ERROR;
+		good = good && ps_core_open(dir) == -1 && errno == ECHILD;
+		_exit(good ? 0 : 1);
+	}
+	check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+		  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		  "forked core cannot flush, mutate, or reopen inherited state");
+	check(append_page(0, &key, 1, page, 2, NULL) == 0,
+		  "parent remains writable after child rejects inherited core");
+	ps_core_close();
+	ps_core_close();
+	check(ps_core_open(dir) == 0, "POSIX core reopens after repeated close");
+	ps_core_close();
+}
+
+static void
+test_legacy_local_uri_reopen(void)
+{
+	char root[] = "/tmp/ps-legacy-uri-XXXXXX";
+	char store[PATH_MAX];
+	char previous_cwd[PATH_MAX];
+	const char *spellings[] = {"store", "alias", "store/../store"};
+	PsKey key = {1, 1, 5, 0, PS_KLASS_RELATION};
+	unsigned char page[PSZ];
+	unsigned char out[PSZ];
+
+	if (getcwd(previous_cwd, sizeof(previous_cwd)) == NULL ||
+		mkdtemp(root) == NULL)
+	{
+		check(0, "prepare legacy URI fixture");
+		return;
+	}
+	snprintf(store, sizeof(store), "%s/store", root);
+	if (chdir(root) != 0)
+	{
+		check(0, "enter legacy URI fixture directory");
+		return;
+	}
+	memset(page, 0x5a, sizeof(page));
+	flush_pages = 1;
+	check(ps_core_open(store) == 0 &&
+		  append_page(0, &key, 0, page, 1, NULL) == 0,
+		  "persist a page for legacy path upgrade");
+	ps_core_close();
+	check(symlink("store", "alias") == 0, "create legacy store alias");
+	for (size_t n = 0; n < sizeof(spellings) / sizeof(spellings[0]); n++)
+	{
+		char orphan[PATH_MAX];
+		int fd;
+		int opened;
+		int normalized = 1;
+
+		check(ps_manifest_open(store) == 0 &&
+			  ps_manifest_replay(&ps_layer_map) == 0 && ps_layer_map.nlayers > 0,
+			  "replay manifest for legacy spelling fixture");
+		/* Model an older binary's on-disk spelling, without relying on the new
+		 * provider's canonical path writer to produce that old format. */
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+		{
+			PsLayerDesc *layer = &ps_layer_map.layers[i];
+
+			for (uint32_t j = 0; j < layer->location_count; j++)
+				if (layer->locations[j].tier == PS_LAYER_TIER_LOCAL_HOT ||
+					layer->locations[j].tier == PS_LAYER_TIER_LOCAL_COLD)
+					snprintf(layer->locations[j].uri, sizeof(layer->locations[j].uri),
+							 "%s/layer_%u_%016llx", spellings[n],
+							 (unsigned int) (layer->layer_id >> 48),
+							 (unsigned long long) layer->layer_id);
+		}
+		check(ps_manifest_compact() == 0, "persist old local URI spelling");
+		ps_manifest_close();
+		snprintf(orphan, sizeof(orphan), "%s/layer_0_000000000000ffff", "store");
+		fd = open(orphan, O_CREAT | O_EXCL | O_WRONLY, 0600);
+		check(fd >= 0 && close(fd) == 0, "seed canonical orphan before upgrade");
+		opened = ps_core_open(spellings[n]) == 0;
+		check(opened, "upgrade reopens relative, symlinked, or dot-dot store spelling");
+		if (!opened)
+			continue;
+		check(read_resolve(0, &key, 0, UINT64_MAX, 0, out, NULL) == 1 &&
+			  memcmp(page, out, sizeof(page)) == 0,
+			  "upgrade preserves referenced page bytes");
+		for (uint32_t i = 0; i < ps_layer_map.nlayers; i++)
+			for (uint32_t j = 0; j < ps_layer_map.layers[i].location_count; j++)
+			{
+				const PsLayerLocation *location = &ps_layer_map.layers[i].locations[j];
+
+				if ((location->tier == PS_LAYER_TIER_LOCAL_HOT ||
+					 location->tier == PS_LAYER_TIER_LOCAL_COLD) &&
+					strncmp(location->uri, store, strlen(store)) != 0)
+					normalized = 0;
+			}
+		check(normalized && access(orphan, F_OK) != 0,
+			  "upgrade canonicalizes live URIs and reclaims only the orphan");
+		check(ps_manifest_compact() == 0, "canonical spelling can be persisted");
+		ps_core_close();
+	}
+	check(chdir(previous_cwd) == 0, "restore test working directory");
+}
 
 static int
 blocking_upload(const PsLayerDesc *layer)
@@ -512,6 +725,8 @@ main(void)
 	pthread_cond_destroy(&verification_gate.cond);
 	pthread_mutex_destroy(&verification_gate.mutex);
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	test_core_provider_lifecycle();
+	test_legacy_local_uri_reopen();
 	printf("pagestore_tiering_test: %d checks, %d failed\n", run, failed);
 	return failed ? 1 : 0;
 }

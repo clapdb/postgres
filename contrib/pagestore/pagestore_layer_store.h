@@ -21,6 +21,10 @@ typedef struct PsLayerStore
 
 	int			(*open) (const char *store_dir);
 	void		(*close) (void);
+	/* Validate and normalize replayed local URIs in-place before core handoff. */
+	int			(*validate_local_layers) (PsLayerMap *map);
+	/* Reconcile canonical local layers after a complete manifest replay. */
+	int			(*recover_local_layers) (PsLayerMap *map);
 	int			(*create_local_layer) (uint64_t layer_id, char *uri,
 									   uint32_t uri_len);
 	int			(*layer_exists_local) (uint64_t layer_id);

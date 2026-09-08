@@ -6,12 +6,16 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_layer_store.h"
+#include "pagestore_store_owner.h"
 
 static int run = 0,
 			failed = 0;
@@ -50,6 +54,9 @@ main(void)
 	char		object_dir[] = "/tmp/pslayerstoreobjectXXXXXX";
 	char		owner_path[sizeof(object_dir) + 32];
 	char		stale_path[sizeof(object_dir) + 64];
+	char		retained_path[sizeof(local_dir) + 64];
+	char		alias_dir[] = "/tmp/pslayerstorealiasXXXXXX";
+	char		saved_cwd[4096];
 	char		configured_object_dir[sizeof(object_dir) + 2];
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
@@ -73,7 +80,7 @@ main(void)
 		  ps_layer_store->open(local_dir) == 0,
 		  "open exclusive object directory");
 	ps_layer_store->close();
-	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0000000000000011.tmp.999999.0",
+	snprintf(stale_path, sizeof(stale_path), "%s/layer_3_0003000000000011.tmp.999999.0",
 			 object_dir);
 	{
 		int fd = open(stale_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -82,9 +89,19 @@ main(void)
 			close(fd);
 		check(fd >= 0, "create interrupted-copy temporary");
 	}
+	snprintf(retained_path, sizeof(retained_path),
+			 "%s/layer_3_0003000000000012.tmp.%ld.0", local_dir,
+			 (long) getpid());
+	{
+		int fd = open(retained_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+		check(fd >= 0 && close(fd) == 0,
+			  "create a copy temporary with the current PID");
+	}
 	snprintf(configured_object_dir, sizeof(configured_object_dir), "%s/", object_dir);
 	check(setenv("PAGESTORE_OBJECT_DIR", configured_object_dir, 1) == 0 &&
-		  ps_layer_store->open(local_dir) == 0 && access(stale_path, F_OK) != 0,
+		  ps_layer_store->open(local_dir) == 0 && access(stale_path, F_OK) != 0 &&
+		  access(retained_path, F_OK) == 0,
 		  "canonicalize object directory and reap interrupted copies at startup");
 	ps_layer_store->close();
 	check(ps_layer_store->open(other_local_dir) != 0,
@@ -94,6 +111,103 @@ main(void)
 	{
 		fprintf(stderr, "could not reopen object directory\n");
 		return 2;
+	}
+	{
+		PsLayerMap empty;
+
+		ps_layer_map_init(&empty);
+		check(ps_layer_store->recover_local_layers(&empty) == 0 &&
+			  access(retained_path, F_OK) == 0,
+			  "recovery skips a live-PID copy temporary by its known grammar");
+		ps_layer_map_free(&empty);
+	}
+	{
+		const uint64_t fork_layer_id = (3ULL << 48) | 16;
+		const uint64_t child_layer_id = (3ULL << 48) | 26;
+		char		fork_layer_uri[PS_LAYER_URI_MAX];
+		char		child_layer_uri[PS_LAYER_URI_MAX];
+		pid_t		pid;
+		int		status = 0;
+
+		fork_layer_uri[0] = '\0';
+		check(ps_layer_store->create_local_layer(fork_layer_id,
+											 fork_layer_uri,
+											 sizeof(fork_layer_uri)) == 0,
+				  "create a provider layer before fork");
+		snprintf(child_layer_uri, sizeof(child_layer_uri),
+				 "%s/layer_3_%016llx", local_dir,
+				 (unsigned long long) child_layer_id);
+		pid = fork();
+		if (pid == 0)
+		{
+			char		child_uri[PS_LAYER_URI_MAX];
+			int		open_rc;
+			int		open_errno;
+			int		create_rc;
+			int		write_rc;
+
+			open_rc = ps_layer_store->open(local_dir);
+			open_errno = errno;
+			create_rc = ps_layer_store->create_local_layer(child_layer_id,
+											 child_uri,
+											 sizeof(child_uri));
+			write_rc = ps_layer_store->write_local_layer(fork_layer_id,
+											 "child", 5);
+			_exit(open_rc != 0 && open_errno == ECHILD &&
+					create_rc != 0 && write_rc != 0 ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+			  access(child_layer_uri, F_OK) != 0,
+			  "forked provider rejects inherited-owner reopen and mutations");
+		if (fork_layer_uri[0] != '\0')
+			unlink(fork_layer_uri);
+		unlink(child_layer_uri);
+	}
+	{
+		PsStoreOwner *owner1 = NULL;
+		PsStoreOwner *owner2 = NULL;
+		char		canonical[4096];
+
+		check(realpath(local_dir, canonical) != NULL &&
+			  ps_store_owner_acquire(local_dir, &owner1) == 0 &&
+			  ps_store_owner_acquire(local_dir, &owner2) == 0 &&
+			  strcmp(ps_store_owner_root(owner1), canonical) == 0 &&
+			  strcmp(ps_store_owner_root(owner2), canonical) == 0,
+			  "same-process owner references share the canonical lease");
+		ps_store_owner_release(owner1);
+		ps_store_owner_release(owner2);
+	}
+	{
+		PsStoreOwner *held = NULL;
+		PsStoreOwner *after = NULL;
+		pid_t pid;
+		int status = 0;
+
+		check(ps_store_owner_acquire(local_dir, &held) == 0,
+			  "hold owner lease across fork test");
+		pid = fork();
+		if (pid == 0)
+		{
+			PsStoreOwner *child = NULL;
+			int rc;
+
+			/* This inherited handle is not a child lease; release must not
+			 * decrement the parent's refcount or unlock its flock. */
+			ps_store_owner_release(held);
+			errno = 0;
+			rc = ps_store_owner_acquire(local_dir, &child);
+			if (child != NULL)
+				ps_store_owner_release(child);
+			_exit(rc != 0 && (errno == EWOULDBLOCK || errno == EAGAIN) ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "forked child cannot reuse inherited owner lease");
+		ps_store_owner_release(held);
+		check(ps_store_owner_acquire(local_dir, &after) == 0,
+			  "owner lease is reacquirable after parent release");
+		ps_store_owner_release(after);
 	}
 
 	memset(&layer, 0, sizeof(layer));
@@ -110,6 +224,214 @@ main(void)
 		  "write and seal local layer");
 	snprintf(layer.locations[0].uri, sizeof(layer.locations[0].uri), "%s", local_uri);
 	layer.locations[0].size = strlen(contents);
+	{
+		char		child_buf[64];
+		pid_t		pid;
+		int		status = 0;
+
+		pid = fork();
+		if (pid == 0)
+		{
+			int read_rc;
+			int read_errno;
+
+			errno = 0;
+			read_rc = ps_layer_store->read_layer_block(&layer, 0,
+										 child_buf, strlen(contents));
+			read_errno = errno;
+			_exit(read_rc != 0 && read_errno == ECHILD ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "forked provider rejects inherited-owner reads");
+	}
+	{
+		PsLayerMap legacy;
+		char		legacy_uri[PS_LAYER_URI_MAX];
+		char		leaf_symlink[PS_LAYER_URI_MAX];
+		char		validation_orphan[PS_LAYER_URI_MAX];
+		const char *basename = strrchr(local_uri, '/') + 1;
+		int		alias_ready;
+		int		relative_ok = 0;
+		int		leaf_linked;
+
+		ps_layer_map_init(&legacy);
+		alias_ready = mkdtemp(alias_dir) != NULL && rmdir(alias_dir) == 0 &&
+			symlink(local_dir, alias_dir) == 0;
+		check(alias_ready, "create a legacy store spelling alias");
+		snprintf(validation_orphan, sizeof(validation_orphan),
+				 "%s/layer_3_0003000000000019", local_dir);
+		check(ps_layer_map_add(&legacy, &layer) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 25,
+										 validation_orphan,
+										 sizeof(validation_orphan)) == 0 &&
+			  ps_layer_store->write_local_layer((3ULL << 48) | 25, contents,
+										 strlen(contents)) == 0,
+			  "seed an orphan for invalid URI recovery checks");
+		if (alias_ready)
+		{
+			snprintf(legacy_uri, sizeof(legacy_uri), "%s/./%s", alias_dir,
+					 basename);
+			check(snprintf(legacy.layers[0].locations[0].uri,
+							   sizeof(legacy.layers[0].locations[0].uri), "%s",
+							   legacy_uri) >= 0 &&
+				  ps_layer_store->validate_local_layers(&legacy) == 0 &&
+				  strcmp(legacy.layers[0].locations[0].uri, local_uri) == 0,
+				  "normalize a symlinked legacy local URI");
+
+			if (getcwd(saved_cwd, sizeof(saved_cwd)) != NULL &&
+				chdir(local_dir) == 0)
+			{
+				relative_ok = snprintf(legacy.layers[0].locations[0].uri,
+								   sizeof(legacy.layers[0].locations[0].uri), "./%s",
+								   basename) >= 0 &&
+					ps_layer_store->validate_local_layers(&legacy) == 0 &&
+					strcmp(legacy.layers[0].locations[0].uri, local_uri) == 0;
+				if (chdir(saved_cwd) != 0)
+					relative_ok = 0;
+			}
+			check(relative_ok, "normalize a same-directory relative local URI");
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/%s", object_dir,
+					 basename);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a foreign parent before orphan recovery");
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/layer_3_%016llx",
+					 local_dir, (unsigned long long) layer.layer_id + 1);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a wrong layer ID before orphan recovery");
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri),
+					 "%s/layer_3_0003000000000014.bad", local_dir);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a malformed leaf before orphan recovery");
+
+			snprintf(leaf_symlink, sizeof(leaf_symlink),
+					 "%s/layer_3_0003000000000016", local_dir);
+			leaf_linked = symlink(local_uri, leaf_symlink) == 0;
+			legacy.layers[0].layer_id = (3ULL << 48) | 22;
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s", leaf_symlink);
+			check(leaf_linked && ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a symlinked leaf before orphan recovery");
+			if (leaf_linked)
+				unlink(leaf_symlink);
+			legacy.layers[0].layer_id = layer.layer_id;
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/./%s", alias_dir,
+					 basename);
+			check(unlink(alias_dir) == 0 &&
+				  ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a disappeared alias before orphan recovery");
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s", local_uri);
+			check(ps_layer_store->recover_local_layers(&legacy) == 0 &&
+				  access(validation_orphan, F_OK) != 0,
+				  "valid canonical recovery can sweep the seeded orphan");
+		}
+		else
+			unlink(validation_orphan);
+		ps_layer_map_free(&legacy);
+		if (alias_ready)
+			unlink(alias_dir);
+	}
+	{
+		PsLayerMap unsafe_map;
+		char		unsafe_orphan[PS_LAYER_URI_MAX];
+		char		unsafe_temp[PS_LAYER_URI_MAX];
+		char		hard_target[PS_LAYER_URI_MAX];
+		int		fd;
+		int		temp_ready;
+
+		ps_layer_map_init(&unsafe_map);
+		snprintf(unsafe_orphan, sizeof(unsafe_orphan),
+				 "%s/layer_3_0003000000000019", local_dir);
+		snprintf(unsafe_temp, sizeof(unsafe_temp),
+				 "%s/layer_3_0003000000000027.tmp.%ld.1", local_dir,
+				 (long) getpid());
+		check(ps_layer_map_add(&unsafe_map, &layer) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 25,
+										 unsafe_orphan,
+										 sizeof(unsafe_orphan)) == 0 &&
+			  ps_layer_store->write_local_layer((3ULL << 48) | 25, contents,
+										 strlen(contents)) == 0,
+			  "seed an orphan before unsafe copy-temp checks");
+
+		temp_ready = mkdir(unsafe_temp, 0700) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a directory copy temporary before orphan cleanup");
+		if (temp_ready)
+			rmdir(unsafe_temp);
+
+		temp_ready = symlink(local_uri, unsafe_temp) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a symlink copy temporary before orphan cleanup");
+		if (temp_ready)
+			unlink(unsafe_temp);
+
+		snprintf(hard_target, sizeof(hard_target), "%s/copy-temp-target", local_dir);
+		fd = open(hard_target, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		temp_ready = fd >= 0 && close(fd) == 0 && link(hard_target, unsafe_temp) == 0;
+		check(temp_ready && ps_layer_store->recover_local_layers(&unsafe_map) != 0 &&
+			  access(unsafe_temp, F_OK) == 0 &&
+			  access(unsafe_orphan, F_OK) == 0,
+			  "reject a hard-linked copy temporary before orphan cleanup");
+		if (temp_ready)
+			unlink(unsafe_temp);
+		unlink(hard_target);
+
+		check(ps_layer_store->recover_local_layers(&unsafe_map) == 0 &&
+			  access(unsafe_orphan, F_OK) != 0,
+			  "safe recovery removes the orphan after unsafe temps are gone");
+		ps_layer_map_free(&unsafe_map);
+	}
+	{
+		char		stale_dir[PS_LAYER_URI_MAX];
+		pid_t		dead_pid;
+		int		status = 0;
+		int		made = 0;
+
+		dead_pid = fork();
+		if (dead_pid == 0)
+			_exit(0);
+		if (dead_pid > 0 && waitpid(dead_pid, &status, 0) == dead_pid &&
+			WIFEXITED(status))
+		{
+			snprintf(stale_dir, sizeof(stale_dir),
+					 "%s/layer_3_0003000000000028.tmp.%ld.1", local_dir,
+					 (long) dead_pid);
+			made = mkdir(stale_dir, 0700) == 0;
+		}
+		check(made, "seed an unlink-failing stale copy temporary");
+		if (made)
+		{
+			ps_layer_store->close();
+			check(ps_layer_store->open(local_dir) != 0,
+				  "propagate stale copy-temp unlink failure at startup");
+			check(rmdir(stale_dir) == 0,
+				  "remove the stale cleanup failure fixture");
+			check(ps_layer_store->open(local_dir) == 0,
+				  "reopen after stale cleanup failure is repaired");
+		}
+	}
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
 												 sizeof(remote_uri)) == 0,
@@ -186,9 +508,135 @@ main(void)
 	check(ps_layer_store->delete_remote_layer(&layer) == 0 &&
 		  ps_layer_store->layer_exists_remote(&layer) == 0,
 		  "remote delete is idempotent");
+	{
+		PsLayerMap map;
+		char		orphan[PS_LAYER_URI_MAX];
+		char		protected_path[PS_LAYER_URI_MAX];
+		char		bad_name[PS_LAYER_URI_MAX];
+		char		hard_name[PS_LAYER_URI_MAX];
+		int		fd;
+		uint64_t	orphan_id = (3ULL << 48) | 19;
+		uint64_t	bad_id = (3ULL << 48) | 20;
+		uint64_t	protected_id = (3ULL << 48) | 5;
+		PsLayerDesc protected_layer;
+
+		ps_layer_map_init(&map);
+		check(ps_layer_map_add(&map, &layer) == 0,
+			  "build recovery reference map");
+		memset(&protected_layer, 0, sizeof(protected_layer));
+		protected_layer.layer_id = protected_id;
+		check(ps_layer_map_add(&map, &protected_layer) == 0,
+			  "add an out-of-order manifest layer ID");
+		check(ps_layer_store->create_local_layer(protected_id, protected_path,
+										 sizeof(protected_path)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(protected_path, F_OK) == 0,
+			  "sorted manifest IDs protect a referenced layer");
+		unlink(protected_path);
+		/* The recovery corruption case models a live, not-yet-remote-durable
+		 * reference; test remote-durable/unavailable semantics separately below. */
+		map.layers[0].remote_durable = false;
+		check(ps_layer_store->create_local_layer(orphan_id, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->write_local_layer(orphan_id, contents,
+									 strlen(contents)) == 0,
+			  "create an unreferenced canonical layer");
+		check(ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0 && access(local_uri, F_OK) == 0,
+			  "reconcile removes only unreferenced canonical layers");
+		check(ps_layer_store->recover_local_layers(&map) == 0,
+			  "reconciliation is retry-safe after a completed sweep");
+
+		snprintf(bad_name, sizeof(bad_name), "%s/layer_3_0003000000000014.bad",
+				 local_dir);
+		fd = open(bad_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0)
+			close(fd);
+		check(fd >= 0 && ps_layer_store->create_local_layer(bad_id, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(bad_name, F_OK) == 0 && access(orphan, F_OK) == 0,
+			  "malformed layer namespace fails closed without unlinking");
+		unlink(bad_name);
+		unlink(orphan);
+
+		snprintf(hard_name, sizeof(hard_name), "%s/layer_3_0003000000000015",
+				 local_dir);
+		fd = link(local_uri, hard_name);
+		check(fd == 0 && ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(hard_name, F_OK) == 0,
+			  "hard-linked canonical layer fails closed");
+		if (fd == 0)
+			unlink(hard_name);
+		check(ps_layer_store->recover_local_layers(&map) == 0,
+			  "hard-link rejection can be retried safely");
+		check(truncate(local_uri, 1) == 0,
+			  "prepare a size-corrupt referenced layer");
+		check(ps_layer_store->create_local_layer((3ULL << 48) | 21, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0,
+			  "size-corrupt live layer fails closed");
+		fd = open(local_uri, O_WRONLY | O_TRUNC);
+		if (fd >= 0)
+		{
+			ssize_t nw = write(fd, contents, strlen(contents));
+			int close_rc = close(fd);
+
+			check(nw == (ssize_t) strlen(contents) && close_rc == 0,
+				  "restore the referenced layer after corruption");
+		}
+		else
+			check(0, "open the referenced layer for restoration");
+		check(unlink(local_uri) == 0,
+			  "remove referenced local layer for deleting recovery");
+		map.layers[0].deleting = true;
+		check(ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0 && access(local_uri, F_OK) != 0,
+			  "missing deleting layer does not block retry cleanup");
+		map.layers[0].deleting = false;
+		map.layers[0].remote_durable = true;
+		map.layers[0].locations[0].available = false;
+		check(ps_layer_store->create_local_layer(layer.layer_id, local_uri,
+									 sizeof(local_uri)) == 0 &&
+			  ps_layer_store->write_local_layer(layer.layer_id, contents,
+									 strlen(contents)) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 22, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(local_uri, F_OK) == 0 && access(orphan, F_OK) != 0,
+			  "unavailable remote-durable reference remains protected");
+		check(truncate(local_uri, 1) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 24, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0 &&
+			  ps_layer_store->write_local_layer(layer.layer_id, contents,
+									 strlen(contents)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0,
+			  "present corrupt remote-durable cache fails closed");
+		map.layers[0].remote_durable = false;
+		map.layers[0].locations[0].available = true;
+		map.layers[0].location_count = 2;
+		snprintf(map.layers[0].locations[1].uri,
+				 sizeof(map.layers[0].locations[1].uri), "%s/not-canonical",
+				 local_dir);
+		map.layers[0].locations[1].tier = PS_LAYER_TIER_LOCAL_COLD;
+		map.layers[0].locations[1].available = false;
+		check(ps_layer_store->create_local_layer((3ULL << 48) | 23, orphan,
+								 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0,
+			  "conflicting second local location fails closed");
+		map.layers[0].location_count = 1;
+		unlink(orphan);
+		ps_layer_map_free(&map);
+	}
 
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");
+	unlink(retained_path);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-owner", object_dir);
 	unlink(owner_path);
 	snprintf(owner_path, sizeof(owner_path), "%s/.pagestore-store-id", local_dir);

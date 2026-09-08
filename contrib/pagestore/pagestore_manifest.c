@@ -19,6 +19,7 @@
 
 #include "pagestore_manifest.h"
 #include "pagestore_fault.h"
+#include "pagestore_store_owner.h"
 
 #define PS_MANIFEST_MAGIC	0x504d414e	/* "PMAN" */
 #define PS_MANIFEST_VERSION 3	/* 3: per-record CRC (over the header + payload) */
@@ -99,6 +100,7 @@ typedef struct PsManifestLayerDisk
 
 static char manifest_path[4096];
 static char manifest_dir[2048];
+static PsStoreOwner *manifest_owner;
 PsLayerMap ps_layer_map;
 static PsFlushWatermark flush_watermarks[PS_MAX_CHANNELS];
 static uint8_t flush_watermark_valid[PS_MAX_CHANNELS];
@@ -116,6 +118,8 @@ static uint8_t flush_watermark_valid[PS_MAX_CHANNELS];
  * reads the flag), so all reads/writes go through __atomic.
  */
 static int	manifest_poisoned = 0;
+static int	manifest_replay_repaired;
+static int	manifest_replay_had_file;
 
 /*
  * Records currently in the on-disk log (set by replay, bumped by append, reset by
@@ -137,6 +141,110 @@ manifest_fsync_dir(void)
 	rc = fsync(fd);
 	close(fd);
 	return rc;
+}
+
+static int
+manifest_repair_marker_path(char *path, size_t path_len)
+{
+	int n = snprintf(path, path_len, "%s/.pagestore-orphan-sweep-inhibited",
+					 manifest_dir);
+
+	if (n < 0 || (size_t) n >= path_len)
+	{
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	return 0;
+}
+
+static int
+manifest_validate_repair_marker(void)
+{
+	char		path[4096];
+	struct stat st;
+	int		fd;
+
+	if (manifest_repair_marker_path(path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+	if (fd < 0)
+		return errno == ENOENT ? 0 : -1;
+	if (fstat(fd, &st) != 0)
+	{
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_size != 0)
+	{
+		close(fd);
+		errno = EINVAL;
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return 1;
+}
+
+/* Install the quarantine before changing the manifest.  A zero-length regular
+ * file is enough: its durable existence, not its contents, is the provenance. */
+static int
+manifest_install_repair_marker(void)
+{
+	char		path[4096];
+	struct stat st;
+	int		fd;
+
+	if (manifest_repair_marker_path(path, sizeof(path)) != 0)
+		return -1;
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd < 0)
+	{
+		if (errno != EEXIST)
+			return -1;
+		if (manifest_validate_repair_marker() != 1)
+			return -1;
+		fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+		if (fd < 0)
+			return -1;
+		if (fsync(fd) != 0)
+		{
+			int save_errno = errno;
+
+			close(fd);
+			errno = save_errno;
+			return -1;
+		}
+		if (close(fd) != 0)
+			return -1;
+		return manifest_fsync_dir();
+	}
+	{
+		int fstat_rc = fstat(fd, &st);
+
+		if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+		{
+			int save_errno = fstat_rc != 0 ? errno : EINVAL;
+
+			close(fd);
+			(void) unlink(path);
+			errno = save_errno;
+			return -1;
+		}
+	}
+	if (fsync(fd) != 0)
+	{
+		int save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		return -1;
+	}
+	if (close(fd) != 0)
+		return -1;
+	return manifest_fsync_dir();
 }
 
 /* FNV-1a (streaming): not cryptographic, just integrity.  Matches img_crc(). */
@@ -214,13 +322,32 @@ manifest_append(uint32_t type, const void *payload, uint32_t len)
 	int			rc = 0;
 	int			created = 0;
 
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
+
 	/* once the tail may be torn, never append again (see manifest_poisoned) */
 	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;
 
-	fd = open(manifest_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+	fd = open(manifest_path,
+			  O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW |
+			  O_NONBLOCK, 0600);
 	if (fd < 0)
 		return -1;				/* nothing written; tail not torn */
+	{
+		struct stat st;
+		int fstat_rc;
+
+		fstat_rc = fstat(fd, &st);
+		if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+		{
+			int save_errno = fstat_rc != 0 ? errno : EINVAL;
+
+			close(fd);
+			errno = save_errno;
+			return -1;
+		}
+	}
 	if (lseek(fd, 0, SEEK_END) == 0)
 		created = 1;
 
@@ -388,27 +515,66 @@ int
 ps_manifest_open(const char *store_dir)
 {
 	int			n;
+	int			save_errno;
 
-	n = snprintf(manifest_dir, sizeof(manifest_dir), "%s", store_dir);
+	if (manifest_owner != NULL)
+	{
+		if (ps_store_owner_require_current(manifest_owner) != 0)
+			return -1;
+		ps_manifest_close();
+	}
+	if (ps_store_owner_acquire(store_dir, &manifest_owner) != 0)
+		return -1;
+	n = snprintf(manifest_dir, sizeof(manifest_dir), "%s",
+				 ps_store_owner_root(manifest_owner));
 	if (n < 0 || (size_t) n >= sizeof(manifest_dir))
-		return -1;
-	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest", store_dir);
+	{
+		errno = ENAMETOOLONG;
+		goto fail;
+	}
+	n = snprintf(manifest_path, sizeof(manifest_path), "%s/layers.manifest",
+				 manifest_dir);
 	if (n < 0 || (size_t) n >= sizeof(manifest_path))
-		return -1;
+	{
+		errno = ENAMETOOLONG;
+		goto fail;
+	}
+	if (manifest_validate_repair_marker() < 0)
+		goto fail;
 	/* replay truncates any torn tail; start clean */
 	__atomic_store_n(&manifest_poisoned, 0, __ATOMIC_RELEASE);
 	manifest_nrecords = 0;
+	manifest_replay_repaired = 0;
+	manifest_replay_had_file = 0;
 	memset(flush_watermarks, 0, sizeof(flush_watermarks));
 	memset(flush_watermark_valid, 0, sizeof(flush_watermark_valid));
 	ps_layer_map_init(&ps_layer_map);
 	return 0;
+
+fail:
+	save_errno = errno;
+	ps_store_owner_release(manifest_owner);
+	manifest_owner = NULL;
+	manifest_dir[0] = '\0';
+	manifest_path[0] = '\0';
+	errno = save_errno;
+	return -1;
 }
 
 void
 ps_manifest_close(void)
 {
+	if (manifest_owner != NULL &&
+		ps_store_owner_require_current(manifest_owner) != 0)
+		return;
 	ps_layer_map_free(&ps_layer_map);
 	manifest_path[0] = '\0';
+	manifest_dir[0] = '\0';
+	if (manifest_owner != NULL)
+	{
+		ps_store_owner_release(manifest_owner);
+		manifest_owner = NULL;
+	}
 }
 
 /*
@@ -421,6 +587,26 @@ int
 ps_manifest_poisoned(void)
 {
 	return __atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE);
+}
+
+int
+ps_manifest_replay_repaired(void)
+{
+	return manifest_replay_repaired;
+}
+
+int
+ps_manifest_replay_had_manifest(void)
+{
+	return manifest_replay_had_file;
+}
+
+int
+ps_manifest_orphan_sweep_inhibited(void)
+{
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
+	return manifest_validate_repair_marker();
 }
 
 /*
@@ -505,18 +691,30 @@ ps_manifest_replay(PsLayerMap *map)
 	off_t		file_size;
 	struct stat st;
 
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
+
 	manifest_nrecords = 0;
-	fd = open(manifest_path, O_RDWR);
+	fd = open(manifest_path,
+			  O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
 			return 0;
 		return -1;
 	}
-	if (fstat(fd, &st) != 0)
+	manifest_replay_had_file = 1;
 	{
-		close(fd);
-		return -1;
+		int fstat_rc = fstat(fd, &st);
+
+		if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+		{
+			int save_errno = fstat_rc != 0 ? errno : EINVAL;
+
+			close(fd);
+			errno = save_errno;
+			return -1;
+		}
 	}
 	file_size = st.st_size;
 
@@ -758,12 +956,19 @@ ps_manifest_replay(PsLayerMap *map)
 		manifest_nrecords++;
 	}
 
+	if (truncate_tail && manifest_install_repair_marker() != 0)
+	{
+		close(fd);
+		return -1;
+	}
 	if (truncate_tail &&
 		(ftruncate(fd, good_off) != 0 || fsync(fd) != 0))
 	{
 		close(fd);
 		return -1;
 	}
+	if (truncate_tail)
+		manifest_replay_repaired = 1;
 	close(fd);
 
 	/*
@@ -1002,15 +1207,33 @@ ps_manifest_compact(void)
 	uint64_t	nrec = 0;
 	int			n;
 
+	if (ps_store_owner_require_current(manifest_owner) != 0)
+		return -1;
+
 	if (__atomic_load_n(&manifest_poisoned, __ATOMIC_ACQUIRE))
 		return -1;
 	n = snprintf(tmp, sizeof(tmp), "%s.tmp", manifest_path);
 	if (n < 0 || (size_t) n >= sizeof(tmp))
 		return -1;
 
-	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC |
+			  O_NOFOLLOW | O_NONBLOCK, 0600);
 	if (fd < 0)
 		return -1;
+	{
+		struct stat st;
+		int fstat_rc = fstat(fd, &st);
+
+		if (fstat_rc != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1)
+		{
+			int save_errno = fstat_rc != 0 ? errno : EINVAL;
+
+			close(fd);
+			unlink(tmp);
+			errno = save_errno;
+			return -1;
+		}
+	}
 	for (uint32_t i = 0; i < ps_layer_map.nlayers && rc == 0; i++)
 	{
 		PsManifestLayerDisk disk;

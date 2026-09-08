@@ -809,6 +809,25 @@ Acceptance:
 
 Expected scope: one or two PRs.
 
+### Local POSIX store ownership and orphan-layer recovery
+
+Store recovery and local provider mutations share an exclusive advisory store
+lease. Startup may remove canonical, unreferenced local layer files only after
+validating the manifest and the complete candidate namespace. Manifest-owned
+IDs, including deleting and remote-only records, remain protected. Unknown
+non-layer files and object-tier artifacts are not part of this sweep.
+
+Ambiguous manifest-tail repair must durably inhibit orphan sweeping before
+truncating the manifest, and the inhibition persists across restart. Missing
+manifest metadata does not authorize deletion. Recovery retries must preserve
+referenced data after partial unlink or directory-sync failures.
+
+Acceptance includes competing owners with distinct SHM names, release after
+process death, failed-open cleanup, canonical orphan reclamation, namespace
+validation before deletion, and continued H1 sentinel recovery. This closes
+local orphan cleanup only; the other H1 crash families and R6 space acceptance
+remain separate gates.
+
 ### H1. Compose process-level crash scenarios
 
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-

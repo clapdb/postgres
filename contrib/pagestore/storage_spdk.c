@@ -532,7 +532,7 @@ spdk_open(const char *path, uint64_t segment_size)
 	{
 		fprintf(stderr, "storage_spdk: spdk_env_init failed\n");
 		spdk_emit_env_diag(pci);
-		return -1;
+		goto fail;
 	}
 
 	memset(&trid, 0, sizeof(trid));
@@ -542,21 +542,21 @@ spdk_open(const char *path, uint64_t segment_size)
 	{
 		fprintf(stderr, "storage_spdk: could not attach NVMe at %s "
 				"(bound to vfio-pci? see spdk_setup.sh)\n", pci);
-		return -1;
+		goto fail;
 	}
 
 	g_ns = spdk_nvme_ctrlr_get_ns(g_ctrlr, 1);
 	if (!g_ns || !spdk_nvme_ns_is_active(g_ns))
 	{
 		fprintf(stderr, "storage_spdk: namespace 1 not active\n");
-		return -1;
+		goto fail;
 	}
 	g_sector = spdk_nvme_ns_get_sector_size(g_ns);
 	if (g_segsize % g_sector != 0)
 	{
 		fprintf(stderr, "storage_spdk: segment size %llu not a multiple of "
 				"sector %u\n", (unsigned long long) g_segsize, g_sector);
-		return -1;
+		goto fail;
 	}
 	g_secs_per_seg = (uint32_t) (g_segsize / g_sector);
 
@@ -571,20 +571,31 @@ spdk_open(const char *path, uint64_t segment_size)
 			fprintf(stderr, "storage_spdk: failed to allocate shard-%u context\n", i);
 			for (uint32_t j = 0; j < i; j++)
 				thread_free(&g_threads[j]);
-			if (g_ctrlr)
-			{
-				spdk_nvme_detach(g_ctrlr);
-				g_ctrlr = NULL;
-			}
-			g_ns = NULL;
-			PsStoragePosix.close();
-			return -1;
+			goto fail;
 		}
 	}
 
 	fprintf(stderr, "storage_spdk: %s ns1 sector=%u segsize=%llu nshards=%u\n",
 			pci, g_sector, (unsigned long long) g_segsize, g_nshards);
 	return 0;
+
+fail:
+	/* Initialization never established a writable segment catalog.  Release
+	 * the delegated POSIX lease without spdk_close()/super_write(), which would
+	 * publish uninitialized or partially cleared segment counts.  SPDK attach
+	 * failures remain process-terminal (the frontend exits); this is not a
+	 * same-process spdk_env_init retry path. */
+	{
+		int save_errno = errno;
+
+		if (g_ctrlr)
+			spdk_nvme_detach(g_ctrlr);
+		g_ctrlr = NULL;
+		g_ns = NULL;
+		PsStoragePosix.close();
+		errno = save_errno;
+	}
+	return -1;
 }
 
 static void

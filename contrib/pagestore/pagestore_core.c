@@ -93,6 +93,32 @@ static int tier_one_layer(void);
 static int finish_upload(const PsLayerDesc *candidate);
 static int map_locks_ready;
 static int core_opened;
+static pid_t core_pid;
+
+/* A fork inherits mutexes and buffered mutations, not a usable core instance.
+ * Check before taking any core lock or flushing inherited state. */
+static int
+core_process_valid(void)
+{
+	pid_t pid = __atomic_load_n(&core_pid, __ATOMIC_ACQUIRE);
+
+	if (pid != 0 && pid != getpid())
+	{
+		errno = ECHILD;
+		return 0;
+	}
+	return 1;
+}
+
+/* POSIX close is idempotent and participates in this PR's store lease.
+ * Other providers retain their existing caller-owned teardown contract. */
+static void
+core_close_posix_storage(void)
+{
+	if (ps_storage != NULL && ps_storage->name != NULL &&
+		strcmp(ps_storage->name, "posix") == 0 && ps_storage->close != NULL)
+		ps_storage->close();
+}
 /* Every snapshot writer is serialized here.  Mutations refresh at their next
  * lock-safe completion point.  Maintenance may also attempt an opportunistic
  * fallback between work items, with 100ms as a minimum spacing between such
@@ -109,7 +135,7 @@ static int inspection_timeline_cache_retention_usable;
 static uint64_t inspection_timeline_cache_retention_epoch;
 static PsInspectionTimeline inspection_timeline_cache[PS_INSPECTION_MAX_TIMELINES];
 static int fork_meta_reclaim_baseline_init(void);
-static int ps_core_open_impl(const char *store_dir);
+static int ps_core_open_impl(const char *store_dir, int *storage_opened);
 static void ps_core_close_impl(void);
 static const PsLayerLocation *tier_local_location(const PsLayerDesc *layer);
 static int refresh_remote_only_layer(const PsLayerDesc *layer);
@@ -4742,8 +4768,11 @@ int
 fork_grow(uint32_t timeline, const PsKey *key, uint32_t to_nblocks,
 		  uint64_t lsn)
 {
-	uint64_t admission_seq = admission_seq_alloc();
+	uint64_t admission_seq;
 
+	if (!core_process_valid())
+		return -1;
+	admission_seq = admission_seq_alloc();
 	if (admission_seq == 0)
 		return -1;
 	return fork_grow_with_seq(timeline, key, to_nblocks, lsn, admission_seq);
@@ -5369,8 +5398,11 @@ PageVer *
 read_through(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn, uint64_t read_seq)
 {
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w;
 
+	if (!core_process_valid())
+		return NULL;
+	w = tl_walk_first(timeline, read_lsn);
 	do
 	{
 		ForkEnt    *fe = fork_find(w.tl, key);
@@ -12312,16 +12344,22 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 	uint64_t	hdr_grow_lsn = 0;
 	uint64_t	order_id = 0;
 	uint64_t	page_version;
-	uint64_t	admission_seq = admission_seq_alloc();
+	uint64_t	admission_seq;
 	int			clamped = 0;
 	int			ordered_record = 0;
 	int			segment_grows = 0;
 	int			zero_version = 0;
-	Shard	   *s = shard_for(key);
-	ForkEnt    *fe = fork_find(timeline, key);
+	Shard	   *s;
+	ForkEnt    *fe;
 	uint64_t	branch_floor = 0;
-	uint64_t	growth_floor = fe ? fe->last_def_lsn : 0;
+	uint64_t	growth_floor;
 
+	if (!core_process_valid())
+		return -1;
+	admission_seq = admission_seq_alloc();
+	s = shard_for(key);
+	fe = fork_find(timeline, key);
+	growth_floor = fe ? fe->last_def_lsn : 0;
 	if (admission_seq == 0)
 		return -1;
 
@@ -12561,6 +12599,8 @@ append_page(uint32_t timeline, const PsKey *key, uint32_t block,
 int
 read_version(const PageVer *v, unsigned char *out)
 {
+	if (!core_process_valid())
+		return -1;
 	if (v->seg < 0)				/* layer-origin version (no segment copy) */
 		return -1;
 	if (ps_storage->seg_read(v->shard, v->seg, v->off, out, page_size) != 0)
@@ -12701,11 +12741,15 @@ read_resolve(uint32_t timeline, const PsKey *key, uint32_t block,
 			 uint64_t read_lsn, uint64_t read_seq, unsigned char *out,
 			 uint64_t *out_ver)
 {
-	Shard	   *s = shard_for(key);	/* same shard across the ancestry walk */
+	Shard	   *s;				/* same shard across the ancestry walk */
 	TlWalk		walk[MAX_TIMELINES];
 	uint32_t	levels = 0;
-	TlWalk		w = tl_walk_first(timeline, read_lsn);
+	TlWalk		w;
 
+	if (!core_process_valid())
+		return -1;
+	s = shard_for(key);
+	w = tl_walk_first(timeline, read_lsn);
 	/*
 	 * A durable compaction frontier makes older page history unavailable even
 	 * while a crash-recovery pass still has its source layers to clean up.
@@ -14363,6 +14407,11 @@ ps_handle_meta(PsChannel *ch)
 {
 	uint32_t	tl = ch->timeline;
 
+	if (!core_process_valid())
+	{
+		ch->status = PS_STATUS_ERROR;
+		return 1;
+	}
 	if (!timeline_op_allowed(tl, (PsOpcode) ch->opcode, ch->incarnation))
 	{
 		ch->status = PS_STATUS_ERROR;
@@ -15090,8 +15139,14 @@ ps_handle_meta(PsChannel *ch)
 void
 ps_core_close(void)
 {
+	if (!core_process_valid())
+		return;
 	pthread_mutex_lock(&core_state_lock);
-	ps_core_close_impl();
+	/* Failed startup already unwinds providers, and a prior close released
+	 * their leases.  Neither state may enter the flushing shutdown path. */
+	if (__atomic_load_n(&core_opened, __ATOMIC_ACQUIRE))
+		ps_core_close_impl();
+	__atomic_store_n(&core_pid, 0, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&core_state_lock);
 }
 
@@ -15210,6 +15265,11 @@ ps_core_close_impl(void)
 	 * streams before the storage provider is closed or the store is reopened. */
 	ps_forkmeta_snapshot_gc_reset();
 	ps_manifest_close();
+	/* Release local provider leases after all core users have stopped.  SPDK
+	 * storage is still closed by its daemon; it is not an idempotent provider. */
+	if (ps_layer_store != NULL && ps_layer_store->close != NULL)
+		ps_layer_store->close();
+	core_close_posix_storage();
 	free_page_fork_indexes();
 	free_walidx_indexes();
 }
@@ -16179,6 +16239,8 @@ ps_core_maintenance(void)
 {
 	int did;
 
+	if (!core_process_valid())
+		return -1;
 	/* Keep lifecycle-rd across the complete synchronous call.  Any asynchronous
 	 * worker started within it reserves an additional reader before create and
 	 * releases that reservation from its thread cleanup handler. */
@@ -16215,15 +16277,37 @@ int
 ps_core_open(const char *store_dir)
 {
 	int rc;
+	int save_errno;
+	int storage_opened = 0;
 
+	if (!core_process_valid())
+		return -1;
 	pthread_mutex_lock(&core_state_lock);
-	rc = ps_core_open_impl(store_dir);
+	__atomic_store_n(&core_pid, getpid(), __ATOMIC_RELEASE);
+	rc = ps_core_open_impl(store_dir, &storage_opened);
+	if (rc != 0)
+	{
+		/* Provider opens own the store lease.  Unwind all lifecycle refs on every
+		 * startup failure, including failures after manifest replay begins. */
+		save_errno = errno;
+		__atomic_store_n(&core_opened, 0, __ATOMIC_RELEASE);
+		ps_manifest_close();
+		if (ps_layer_store != NULL && ps_layer_store->close != NULL)
+			ps_layer_store->close();
+		/* A fully initialized provider may use its ordinary close, including
+		 * SPDK after a later replay failure.  A failed provider open must unwind
+		 * itself: its normal close may publish uninitialized persistent state. */
+		if (storage_opened && ps_storage->close != NULL)
+			ps_storage->close();
+		__atomic_store_n(&core_pid, 0, __ATOMIC_RELEASE);
+		errno = save_errno;
+	}
 	pthread_mutex_unlock(&core_state_lock);
 	return rc;
 }
 
 static int
-ps_core_open_impl(const char *store_dir)
+ps_core_open_impl(const char *store_dir, int *storage_opened)
 {
 	uint32_t	ns = core_shards();
 	int			publish_shard_count = 0;
@@ -16387,6 +16471,7 @@ ps_core_open_impl(const char *store_dir)
 		return -1;
 	if (ps_storage->open(runtime_store_dir, segment_size) != 0)
 		return -1;
+	*storage_opened = 1;
 	memcpy(wal_segment_root, next_wal_segment_root,
 		   strlen(next_wal_segment_root) + 1);
 	memcpy(fork_meta_snapshot_dir, next_fork_meta_snapshot_dir,
@@ -16401,6 +16486,26 @@ ps_core_open_impl(const char *store_dir)
 	if (validate_store_shard_count(runtime_store_dir,
 							   &publish_shard_count) != 0)
 		return -1;
+	if (use_layers && ps_layer_store->validate_local_layers != NULL &&
+		ps_layer_store->validate_local_layers(&ps_layer_map) != 0)
+		return -1;
+	if (use_layers && mark_legacy_shard_zero_layers() != 0)
+		return -1;
+	/* The map is now a complete, shard-compatible replay result.  A tolerated
+	 * manifest tail repair is deliberately not authority for destructive orphan
+	 * cleanup; its durable quarantine marker suppresses this and all future
+	 * sweeps until an operator/repair workflow removes the ambiguity. */
+	if (use_layers && ps_layer_store->recover_local_layers != NULL)
+	{
+		int sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
+
+		if (sweep_inhibited < 0)
+			return -1;
+		if (ps_manifest_replay_had_manifest() &&
+			!ps_manifest_replay_repaired() && !sweep_inhibited &&
+			ps_layer_store->recover_local_layers(&ps_layer_map) != 0)
+			return -1;
+	}
 	/* Leave deleting layers for asynchronous maintenance: recovery must not
 	 * block on an unavailable remote object that is already excluded from reads. */
 
@@ -16445,9 +16550,6 @@ ps_core_open_impl(const char *store_dir)
 		if (sh < ns && lid + 1 > g_shards[sh].next_layer_id)
 			g_shards[sh].next_layer_id = lid + 1;
 	}
-	if (use_layers && mark_legacy_shard_zero_layers() != 0)
-		return -1;
-
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  One
 	 * memtable per shard. */
