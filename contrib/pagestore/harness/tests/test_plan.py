@@ -558,6 +558,21 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "layer_seed before"):
             MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_layer_client_uses_absolute_executable_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = Path("pagestore_layer_crash_client")
+            expected = str(client.resolve())
+            result = mock.Mock(returncode=0)
+            with (
+                mock.patch.object(MODULE.subprocess, "Popen") as popen,
+                mock.patch.object(MODULE.subprocess, "run", return_value=result) as run,
+            ):
+                MODULE._start_layer_client(client, "/shm", "seed", root / "seed.log")
+                MODULE._verify_layer_client(client, "/shm", root / "verify.log", 1.0)
+        self.assertEqual(popen.call_args.args[0][0], expected)
+        self.assertEqual(run.call_args.args[0][0], expected)
+
     def test_named_fault_catalog_rejects_wrong_hit_without_launch(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([

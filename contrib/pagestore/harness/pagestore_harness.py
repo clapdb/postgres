@@ -2299,7 +2299,7 @@ def _start_layer_client(
 ) -> subprocess.Popen[str]:
     with log.open("a", encoding="utf-8") as output:
         return subprocess.Popen(
-            [str(client), "--shm", shm, "--mode", mode],
+            [str(client.resolve()), "--shm", shm, "--mode", mode],
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), start_new_session=True,
         )
@@ -2308,7 +2308,7 @@ def _start_layer_client(
 def _verify_layer_client(client: Path, shm: str, log: Path, timeout: float) -> None:
     with log.open("a", encoding="utf-8") as output:
         result = subprocess.run(
-            [str(client), "--shm", shm, "--mode", "verify"],
+            [str(client.resolve()), "--shm", shm, "--mode", "verify"],
             stdout=output, stderr=subprocess.STDOUT, text=True,
             env=private_environment(), timeout=max(5.0, timeout), check=False,
         )
