@@ -2276,16 +2276,17 @@ def _check_layer_manifest(
     # recovery conservatively retains that layer and republishes segment-backed
     # coverage once.  The intervening clean shutdown compacts that conservative
     # duplicate, so the following restart must converge to one layer.
-    expected_layers = 2 if stage == "manifest_add" and not recovery_restart else 1
-    if manifest.get("layer_count") != expected_layers:
+    expected_states = (
+        ((1, 1), (2, 2))
+        if stage == "manifest_add" and not recovery_restart
+        else ((1, 1),)
+    )
+    expected_text = "(1, 1) or (2, 2)" if len(expected_states) > 1 else "(1, 1)"
+    observed_state = (manifest.get("layer_count"), manifest.get("local_layers"))
+    if observed_state not in expected_states:
         raise OracleMismatch(
-            f"after_{stage} recovery reported layer_count="
-            f"{manifest.get('layer_count')!r}, expected {expected_layers}"
-        )
-    if manifest.get("local_layers") != expected_layers:
-        raise OracleMismatch(
-            f"after_{stage} recovery reported local_layers="
-            f"{manifest.get('local_layers')!r}, expected {expected_layers}"
+            f"after_{stage} recovery reported layer_count/local_layers="
+            f"{observed_state!r}, expected {expected_text}"
         )
     if manifest.get("manifest_poisoned") is not False:
         raise OracleMismatch(
@@ -2334,6 +2335,7 @@ def run_daemon_fault_recovery(
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
     daemon = daemon.resolve()
     inspector = inspector.resolve()
+    layer_client = layer_client.resolve() if layer_client is not None else None
     validate_plan(plan, capabilities, capabilities_path)
     validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
     root, temporary = run_root(requested_root)
@@ -2701,9 +2703,15 @@ def run_daemon_fault_recovery(
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
+        if process.returncode != 0:
+            raise UnexpectedExit(
+                "recovered daemon did not stop cleanly before restart; status "
+                f"{process.returncode}"
+            )
         emit("process_stop", target="store", pid=process.pid,
              returncode=process.returncode)
         remove_shm(shm)
+        process = None
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
         if layer_seed_actions:

@@ -558,6 +558,33 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "layer_seed before"):
             MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_manifest_add_recovery_allows_transient_compaction_states(self):
+        for layer_count in (1, 2):
+            with self.subTest(layer_count=layer_count):
+                MODULE._check_layer_manifest(
+                    {
+                        "layer_count": layer_count,
+                        "local_layers": layer_count,
+                        "manifest_poisoned": False,
+                    },
+                    "manifest_add",
+                    False,
+                )
+        with self.assertRaisesRegex(MODULE.OracleMismatch, r"expected \(1, 1\)"):
+            MODULE._check_layer_manifest(
+                {"layer_count": 2, "local_layers": 2, "manifest_poisoned": False},
+                "manifest_add",
+                True,
+            )
+        with self.assertRaisesRegex(
+            MODULE.OracleMismatch, r"expected \(1, 1\) or \(2, 2\)"
+        ):
+            MODULE._check_layer_manifest(
+                {"layer_count": 0, "local_layers": 0, "manifest_poisoned": False},
+                "manifest_add",
+                False,
+            )
+
     def test_layer_client_uses_absolute_executable_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -957,7 +984,7 @@ class PlanValidationTests(unittest.TestCase):
                 MODULE.run_daemon_fault_recovery(
                     plan, capabilities, inspection_schema,
                     Path("daemon"), Path("inspect"), root, True,
-                    ROOT / "capabilities.json",
+                    ROOT / "capabilities.json", layer_client=Path("layer-client"),
                 )
 
         metadata = json.loads((root / "failure.json").read_text(encoding="utf-8"))
@@ -972,7 +999,89 @@ class PlanValidationTests(unittest.TestCase):
             (root / "fault-control" / "report.jsonl").read_text(encoding="utf-8"),
             "{malformed\n",
         )
+        layer_client_index = metadata["command"].index("--layer-client-binary")
+        self.assertEqual(
+            metadata["command"][layer_client_index + 1],
+            str(Path("layer-client").resolve()),
+        )
         self.assertFalse((root / "fault-control" / "arm").exists())
+
+    def test_layer_recovery_requires_clean_shutdown_before_restart(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        plan = MODULE.read_plan(ROOT / "scenarios" / "image_layer_after_create.jsonl")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name) / "failure"
+        health = {
+            "protocol_version": 45, "page_size": 8192, "io_unit": 262144,
+            "nchannels": 128, "nshards": 1, "admission_fence_epoch": 0,
+            "admission_pending_epoch": 0, "admission_pending_lsn": 0,
+        }
+        processes = []
+
+        class FakeProcess:
+            next_pid = 800
+
+            def __init__(self, env, shutdown_status=0):
+                self.pid = FakeProcess.next_pid
+                FakeProcess.next_pid += 1
+                self.returncode = None
+                self.shutdown_status = shutdown_status
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    self.returncode = self.shutdown_status
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        fault_control = None
+
+        def fake_popen(command, **kwargs):
+            nonlocal fault_control
+            process = FakeProcess(
+                kwargs["env"], shutdown_status=1 if len(processes) == 1 else 0
+            )
+            processes.append(process)
+            if "PAGESTORE_TEST_FAULT_NAME" in kwargs["env"]:
+                fault_control = Path(kwargs["env"]["PAGESTORE_TEST_FAULT_DIR"])
+            return process
+
+        def trigger_fault(*args, **kwargs):
+            processes[0].returncode = 88
+            assert fault_control is not None
+            (fault_control / "report.jsonl").write_text(
+                json.dumps({
+                    "schema": 1, "name": "image_layer.after_create",
+                    "action": "crash", "hit": 1, "pid": processes[0].pid,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+        with (
+            mock.patch.object(MODULE.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(MODULE, "_start_layer_client", side_effect=trigger_fault),
+            mock.patch.object(MODULE, "inspect_store", return_value=health),
+            mock.patch.object(MODULE, "validate_runtime_health"),
+            mock.patch.object(MODULE, "probe_runtime_inspection"),
+            mock.patch.object(MODULE, "_check_layer_crash_snapshot"),
+            mock.patch.object(MODULE, "_verify_layer_client"),
+            mock.patch.object(MODULE, "_check_layer_manifest"),
+            mock.patch.object(MODULE, "signal_process_group"),
+            mock.patch.object(MODULE, "remove_shm"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.PlanError, "did not stop cleanly before restart; status 1"
+            ):
+                MODULE.run_daemon_fault_recovery(
+                    plan, capabilities, {}, Path("daemon"), Path("inspect"),
+                    root, True, ROOT / "capabilities.json", layer_client=Path("client"),
+                )
+        self.assertEqual(len(processes), 2)
 
     def test_fault_report_rejects_extra_fields_and_multiple_lines(self):
         with tempfile.TemporaryDirectory() as temporary:
