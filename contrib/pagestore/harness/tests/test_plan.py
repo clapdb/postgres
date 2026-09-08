@@ -585,6 +585,82 @@ class PlanValidationTests(unittest.TestCase):
                 False,
             )
 
+    def test_manifest_add_restart_polls_until_compaction_converges(self):
+        manifests = [
+            {"layer_count": 2, "local_layers": 2, "manifest_poisoned": False},
+            {"layer_count": 1, "local_layers": 1, "manifest_poisoned": False},
+        ]
+        with (
+            mock.patch.object(MODULE, "inspect_store", side_effect=manifests) as inspect,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[10.0, 10.01]),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE._check_layer_manifest_after_restart(
+                Path("inspect"), "/shm", {}, "manifest_add", 1.0
+            )
+        self.assertEqual(inspect.call_count, 2)
+        sleep.assert_called_once_with(0.05)
+
+    def test_manifest_add_restart_accepts_immediate_convergence(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "inspect_store",
+                return_value={
+                    "layer_count": 1,
+                    "local_layers": 1,
+                    "manifest_poisoned": False,
+                },
+            ) as inspect,
+            mock.patch.object(MODULE.time, "monotonic", return_value=10.0),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE._check_layer_manifest_after_restart(
+                Path("inspect"), "/shm", {}, "manifest_add", 1.0
+            )
+        inspect.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_manifest_add_restart_times_out_on_persistent_duplicate(self):
+        with (
+            mock.patch.object(
+                MODULE,
+                "inspect_store",
+                return_value={
+                    "layer_count": 2,
+                    "local_layers": 2,
+                    "manifest_poisoned": False,
+                },
+            ) as inspect,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[10.0, 10.1]),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(MODULE.HarnessTimeout, "did not converge"):
+                MODULE._check_layer_manifest_after_restart(
+                    Path("inspect"), "/shm", {}, "manifest_add", 0.05
+                )
+        inspect.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_manifest_add_restart_rejects_invalid_or_poisoned_state_immediately(self):
+        cases = [
+            (
+                {"layer_count": 2, "local_layers": 1, "manifest_poisoned": False},
+                r"expected \(1, 1\)",
+            ),
+            (
+                {"layer_count": 2, "local_layers": 2, "manifest_poisoned": True},
+                "manifest_poisoned=True",
+            ),
+        ]
+        for manifest, message in cases:
+            with self.subTest(manifest=manifest):
+                with mock.patch.object(MODULE, "inspect_store", return_value=manifest):
+                    with self.assertRaisesRegex(MODULE.OracleMismatch, message):
+                        MODULE._check_layer_manifest_after_restart(
+                            Path("inspect"), "/shm", {}, "manifest_add", 1.0
+                        )
+
     def test_layer_client_uses_absolute_executable_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

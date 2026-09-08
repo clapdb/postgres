@@ -2295,6 +2295,46 @@ def _check_layer_manifest(
         )
 
 
+def _check_layer_manifest_after_restart(
+    inspector: Path,
+    shm: str,
+    inspection_schema: dict[str, Any],
+    stage: str,
+    timeout: float,
+) -> None:
+    """Wait for the second restart to compact a manifest_add duplicate."""
+    poll_timeout = max(0.0, min(10.0, timeout))
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+        observed_state = (manifest.get("layer_count"), manifest.get("local_layers"))
+        if manifest.get("manifest_poisoned") is not False:
+            raise OracleMismatch(
+                f"after_{stage} recovery reported manifest_poisoned="
+                f"{manifest.get('manifest_poisoned')!r}"
+            )
+        if observed_state == (1, 1):
+            _check_layer_manifest(manifest, stage, True)
+            return
+
+        # Only the coherent duplicate produced by manifest_add recovery is
+        # allowed to remain transient. Poisoned or otherwise inconsistent
+        # observations must not be hidden by a later successful poll.
+        if (
+            stage != "manifest_add"
+            or observed_state != (2, 2)
+        ):
+            _check_layer_manifest(manifest, stage, True)
+
+        now = time.monotonic()
+        if now >= deadline:
+            raise HarnessTimeout(
+                f"after_{stage} recovery manifest did not converge to (1, 1) "
+                f"within {poll_timeout:.3f}s; last state={observed_state!r}"
+            )
+        time.sleep(min(0.05, deadline - now))
+
+
 def _start_layer_client(
     client: Path, shm: str, mode: str, log: Path,
 ) -> subprocess.Popen[str]:
@@ -2716,8 +2756,9 @@ def run_daemon_fault_recovery(
         health = wait_ready(process)
         if layer_seed_actions:
             _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
-            manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
-            _check_layer_manifest(manifest, layer_stage, True)
+            _check_layer_manifest_after_restart(
+                inspector, shm, inspection_schema, layer_stage, timeout
+            )
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")
