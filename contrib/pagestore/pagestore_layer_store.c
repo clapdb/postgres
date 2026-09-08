@@ -439,16 +439,110 @@ layer_map_has_id(const uint64_t *map_ids, size_t nmap_ids, uint64_t layer_id)
 }
 
 static int
-local_validate_layer_locations(const PsLayerMap *map)
+canonicalize_local_layer_uri(PsLayerLocation *location,
+							 const char *expected)
+{
+	char		resolved[4096];
+	char		parent[PS_LAYER_URI_MAX];
+	char		joined[4096];
+	const char *slash;
+	const char *basename;
+	const char *expected_basename;
+	struct stat st;
+	struct stat parent_st;
+	struct stat root_st;
+	size_t		uri_len;
+	size_t		parent_len;
+	int		n;
+
+	uri_len = strnlen(location->uri, sizeof(location->uri));
+	if (uri_len == sizeof(location->uri))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	slash = strrchr(location->uri, '/');
+	if (slash == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	parent_len = (size_t) (slash - location->uri);
+	if (parent_len == 0)
+		parent_len = 1;
+	if (parent_len >= sizeof(parent))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	memcpy(parent, location->uri, parent_len);
+	if (slash == location->uri)
+		parent[0] = '/';
+	parent[parent_len] = '\0';
+	basename = slash + 1;
+	if (basename[0] == '\0')
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	expected_basename = strrchr(expected, '/') + 1;
+	if (strcmp(basename, expected_basename) != 0 ||
+		realpath(parent, resolved) == NULL)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if (stat(resolved, &parent_st) != 0 || stat(layer_dir, &root_st) != 0 ||
+		parent_st.st_dev != root_st.st_dev || parent_st.st_ino != root_st.st_ino)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	n = snprintf(joined, sizeof(joined), "%s/%s", resolved, basename);
+	if (n < 0 || (size_t) n >= sizeof(joined) ||
+		strcmp(joined, expected) != 0)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	/* The leaf may be absent while a remote-durable or deleting layer is
+	 * replayed.  If present, it must already be a non-symlink regular file. */
+	if (lstat(location->uri, &st) == 0)
+	{
+		if (!S_ISREG(st.st_mode))
+		{
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	else if (errno != ENOENT)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if (strlen(expected) >= sizeof(location->uri))
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if (strcmp(location->uri, expected) != 0)
+		snprintf(location->uri, sizeof(location->uri), "%s", expected);
+	return 0;
+}
+
+static int
+local_validate_layer_locations(PsLayerMap *map)
 {
 	if (map == NULL)
 	{
 		errno = EINVAL;
 		return -1;
 	}
+	if (!local_owner_current())
+		return -1;
 	for (uint32_t i = 0; i < map->nlayers; i++)
 	{
-		const PsLayerDesc *layer = &map->layers[i];
+		PsLayerDesc *layer = &map->layers[i];
 		char expected[4096];
 		int local_count = 0;
 
@@ -459,7 +553,7 @@ local_validate_layer_locations(const PsLayerMap *map)
 		}
 		for (uint32_t j = 0; j < layer->location_count; j++)
 		{
-			const PsLayerLocation *location = &layer->locations[j];
+			PsLayerLocation *location = &layer->locations[j];
 
 			switch (location->tier)
 			{
@@ -468,7 +562,8 @@ local_validate_layer_locations(const PsLayerMap *map)
 					if (++local_count > 1 ||
 						local_layer_path(layer->layer_id, expected,
 										 sizeof(expected)) != 0 ||
-						strcmp(location->uri, expected) != 0)
+						canonicalize_local_layer_uri(location,
+												 expected) != 0)
 					{
 						errno = EINVAL;
 						return -1;
@@ -524,7 +619,7 @@ validate_layer_candidate(int dirfd, const LocalLayerCandidate *candidate)
 }
 
 static int
-local_recover_local_layers(const PsLayerMap *map)
+local_recover_local_layers(PsLayerMap *map)
 {
 	LocalLayerCandidate *candidates = NULL;
 	uint64_t  *map_ids = NULL;

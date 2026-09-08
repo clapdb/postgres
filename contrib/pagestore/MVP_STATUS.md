@@ -94,6 +94,10 @@ and provider teardown. Cooperating storage and local-layer
 provider users share the same ownership mechanism. After successful manifest
 replay, startup reconciles canonical local layer files against manifest-owned
 IDs, preserving referenced layers and removing validated unreferenced files.
+Legacy relative, symlinked-directory, and dot-dot local URI spellings are
+normalized in the replayed map when their parent resolves to the owned store
+and their filename matches the layer ID. Unresolvable or foreign-store paths
+still fail closed; this is not an arbitrary store-relocation mechanism.
 An invalid layer namespace or unsafe file type fails closed before deletion;
 unrelated files and object-tier contents are outside this reconciliation.
 Missing manifests do not authorize a sweep. Before accepting an ambiguous

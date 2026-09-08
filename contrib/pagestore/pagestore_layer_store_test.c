@@ -54,6 +54,8 @@ main(void)
 	char		owner_path[sizeof(object_dir) + 32];
 	char		stale_path[sizeof(object_dir) + 64];
 	char		retained_path[sizeof(local_dir) + 64];
+	char		alias_dir[] = "/tmp/pslayerstorealiasXXXXXX";
+	char		saved_cwd[4096];
 	char		configured_object_dir[sizeof(object_dir) + 2];
 	char		expected_remote_uri[PS_LAYER_URI_MAX];
 	char		local_uri[PS_LAYER_URI_MAX];
@@ -241,6 +243,110 @@ main(void)
 		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
 			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
 			  "forked provider rejects inherited-owner reads");
+	}
+	{
+		PsLayerMap legacy;
+		char		legacy_uri[PS_LAYER_URI_MAX];
+		char		leaf_symlink[PS_LAYER_URI_MAX];
+		char		validation_orphan[PS_LAYER_URI_MAX];
+		const char *basename = strrchr(local_uri, '/') + 1;
+		int		alias_ready;
+		int		relative_ok = 0;
+		int		leaf_linked;
+
+		ps_layer_map_init(&legacy);
+		alias_ready = mkdtemp(alias_dir) != NULL && rmdir(alias_dir) == 0 &&
+			symlink(local_dir, alias_dir) == 0;
+		check(alias_ready, "create a legacy store spelling alias");
+		snprintf(validation_orphan, sizeof(validation_orphan),
+				 "%s/layer_3_0003000000000019", local_dir);
+		check(ps_layer_map_add(&legacy, &layer) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 25,
+										 validation_orphan,
+										 sizeof(validation_orphan)) == 0 &&
+			  ps_layer_store->write_local_layer((3ULL << 48) | 25, contents,
+										 strlen(contents)) == 0,
+			  "seed an orphan for invalid URI recovery checks");
+		if (alias_ready)
+		{
+			snprintf(legacy_uri, sizeof(legacy_uri), "%s/./%s", alias_dir,
+					 basename);
+			check(snprintf(legacy.layers[0].locations[0].uri,
+							   sizeof(legacy.layers[0].locations[0].uri), "%s",
+							   legacy_uri) >= 0 &&
+				  ps_layer_store->validate_local_layers(&legacy) == 0 &&
+				  strcmp(legacy.layers[0].locations[0].uri, local_uri) == 0,
+				  "normalize a symlinked legacy local URI");
+
+			if (getcwd(saved_cwd, sizeof(saved_cwd)) != NULL &&
+				chdir(local_dir) == 0)
+			{
+				relative_ok = snprintf(legacy.layers[0].locations[0].uri,
+								   sizeof(legacy.layers[0].locations[0].uri), "./%s",
+								   basename) >= 0 &&
+					ps_layer_store->validate_local_layers(&legacy) == 0 &&
+					strcmp(legacy.layers[0].locations[0].uri, local_uri) == 0;
+				if (chdir(saved_cwd) != 0)
+					relative_ok = 0;
+			}
+			check(relative_ok, "normalize a same-directory relative local URI");
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/%s", object_dir,
+					 basename);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a foreign parent before orphan recovery");
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/layer_3_%016llx",
+					 local_dir, (unsigned long long) layer.layer_id + 1);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a wrong layer ID before orphan recovery");
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri),
+					 "%s/layer_3_0003000000000014.bad", local_dir);
+			check(ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a malformed leaf before orphan recovery");
+
+			snprintf(leaf_symlink, sizeof(leaf_symlink),
+					 "%s/layer_3_0003000000000016", local_dir);
+			leaf_linked = symlink(local_uri, leaf_symlink) == 0;
+			legacy.layers[0].layer_id = (3ULL << 48) | 22;
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s", leaf_symlink);
+			check(leaf_linked && ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a symlinked leaf before orphan recovery");
+			if (leaf_linked)
+				unlink(leaf_symlink);
+			legacy.layers[0].layer_id = layer.layer_id;
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s/./%s", alias_dir,
+					 basename);
+			check(unlink(alias_dir) == 0 &&
+				  ps_layer_store->validate_local_layers(&legacy) != 0 &&
+				  ps_layer_store->recover_local_layers(&legacy) != 0 &&
+				  access(validation_orphan, F_OK) == 0,
+				  "reject a disappeared alias before orphan recovery");
+
+			snprintf(legacy.layers[0].locations[0].uri,
+					 sizeof(legacy.layers[0].locations[0].uri), "%s", local_uri);
+			check(ps_layer_store->recover_local_layers(&legacy) == 0 &&
+				  access(validation_orphan, F_OK) != 0,
+				  "valid canonical recovery can sweep the seeded orphan");
+		}
+		else
+			unlink(validation_orphan);
+		ps_layer_map_free(&legacy);
+		if (alias_ready)
+			unlink(alias_dir);
 	}
 
 	check(ps_layer_store->remote_uri(layer.layer_id, remote_uri,
