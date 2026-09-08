@@ -86,9 +86,24 @@ harness keeps the pre-recovery physical snapshot, then checks a sentinel
 page/LSN, the expected manifest state, and one additional restart for
 idempotence.  A crash after ADD but before its flush watermark conservatively
 retains the durable layer and republishes segment-backed coverage once; the
-intervening clean shutdown compacts that conservative duplicate, and the second
-restart proves convergence to one layer.  The slice does not delete crash
-orphans; cross-process ownership is required before adding that policy.
+second restart waits for background maintenance to compact that conservative
+duplicate to one layer. Clean shutdown alone does not guarantee compaction.
+
+POSIX store opens now hold an exclusive advisory ownership lease across recovery
+and provider teardown. Cooperating storage and local-layer
+provider users share the same ownership mechanism. After successful manifest
+replay, startup reconciles canonical local layer files against manifest-owned
+IDs, preserving referenced layers and removing validated unreferenced files.
+An invalid layer namespace or unsafe file type fails closed before deletion;
+unrelated files and object-tier contents are outside this reconciliation.
+Missing manifests do not authorize a sweep. Before accepting an ambiguous
+manifest-tail repair, recovery durably records an orphan-sweep inhibition
+marker; automatic cleanup remains disabled across subsequent restarts because
+the repaired manifest cannot prove that omitted files were never referenced.
+The persistent lock file must not be removed while a store is in use. Older
+binaries and external tools that do not acquire the lock must remain stopped
+during recovery; the lock is advisory, not a fence against arbitrary filesystem
+writes. This is local POSIX recovery, not SPDK or power-loss certification.
 
 ## MVP gates
 

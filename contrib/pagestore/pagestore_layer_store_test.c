@@ -6,12 +6,15 @@
  *-------------------------------------------------------------------------
  */
 #include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "pagestore_layer_store.h"
+#include "pagestore_store_owner.h"
 
 static int run = 0,
 			failed = 0;
@@ -94,6 +97,51 @@ main(void)
 	{
 		fprintf(stderr, "could not reopen object directory\n");
 		return 2;
+	}
+	{
+		PsStoreOwner *owner1 = NULL;
+		PsStoreOwner *owner2 = NULL;
+		char		canonical[4096];
+
+		check(realpath(local_dir, canonical) != NULL &&
+			  ps_store_owner_acquire(local_dir, &owner1) == 0 &&
+			  ps_store_owner_acquire(local_dir, &owner2) == 0 &&
+			  strcmp(ps_store_owner_root(owner1), canonical) == 0 &&
+			  strcmp(ps_store_owner_root(owner2), canonical) == 0,
+			  "same-process owner references share the canonical lease");
+		ps_store_owner_release(owner1);
+		ps_store_owner_release(owner2);
+	}
+	{
+		PsStoreOwner *held = NULL;
+		PsStoreOwner *after = NULL;
+		pid_t pid;
+		int status = 0;
+
+		check(ps_store_owner_acquire(local_dir, &held) == 0,
+			  "hold owner lease across fork test");
+		pid = fork();
+		if (pid == 0)
+		{
+			PsStoreOwner *child = NULL;
+			int rc;
+
+			/* This inherited handle is not a child lease; release must not
+			 * decrement the parent's refcount or unlock its flock. */
+			ps_store_owner_release(held);
+			errno = 0;
+			rc = ps_store_owner_acquire(local_dir, &child);
+			if (child != NULL)
+				ps_store_owner_release(child);
+			_exit(rc != 0 && (errno == EWOULDBLOCK || errno == EAGAIN) ? 0 : 1);
+		}
+		check(pid > 0 && waitpid(pid, &status, 0) == pid &&
+			  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+			  "forked child cannot reuse inherited owner lease");
+		ps_store_owner_release(held);
+		check(ps_store_owner_acquire(local_dir, &after) == 0,
+			  "owner lease is reacquirable after parent release");
+		ps_store_owner_release(after);
 	}
 
 	memset(&layer, 0, sizeof(layer));
@@ -186,6 +234,113 @@ main(void)
 	check(ps_layer_store->delete_remote_layer(&layer) == 0 &&
 		  ps_layer_store->layer_exists_remote(&layer) == 0,
 		  "remote delete is idempotent");
+	{
+		PsLayerMap map;
+		char		orphan[PS_LAYER_URI_MAX];
+		char		bad_name[PS_LAYER_URI_MAX];
+		char		hard_name[PS_LAYER_URI_MAX];
+		int		fd;
+		uint64_t	orphan_id = (3ULL << 48) | 19;
+		uint64_t	bad_id = (3ULL << 48) | 20;
+
+		ps_layer_map_init(&map);
+		check(ps_layer_map_add(&map, &layer) == 0,
+			  "build recovery reference map");
+		/* The recovery corruption case models a live, not-yet-remote-durable
+		 * reference; test remote-durable/unavailable semantics separately below. */
+		map.layers[0].remote_durable = false;
+		check(ps_layer_store->create_local_layer(orphan_id, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->write_local_layer(orphan_id, contents,
+									 strlen(contents)) == 0,
+			  "create an unreferenced canonical layer");
+		check(ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0 && access(local_uri, F_OK) == 0,
+			  "reconcile removes only unreferenced canonical layers");
+		check(ps_layer_store->recover_local_layers(&map) == 0,
+			  "reconciliation is retry-safe after a completed sweep");
+
+		snprintf(bad_name, sizeof(bad_name), "%s/layer_3_0003000000000014.bad",
+				 local_dir);
+		fd = open(bad_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0)
+			close(fd);
+		check(fd >= 0 && ps_layer_store->create_local_layer(bad_id, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(bad_name, F_OK) == 0 && access(orphan, F_OK) == 0,
+			  "malformed layer namespace fails closed without unlinking");
+		unlink(bad_name);
+		unlink(orphan);
+
+		snprintf(hard_name, sizeof(hard_name), "%s/layer_3_0003000000000015",
+				 local_dir);
+		fd = link(local_uri, hard_name);
+		check(fd == 0 && ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(hard_name, F_OK) == 0,
+			  "hard-linked canonical layer fails closed");
+		if (fd == 0)
+			unlink(hard_name);
+		check(ps_layer_store->recover_local_layers(&map) == 0,
+			  "hard-link rejection can be retried safely");
+		check(truncate(local_uri, 1) == 0,
+			  "prepare a size-corrupt referenced layer");
+		check(ps_layer_store->create_local_layer((3ULL << 48) | 21, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0,
+			  "size-corrupt live layer fails closed");
+		fd = open(local_uri, O_WRONLY | O_TRUNC);
+		if (fd >= 0)
+		{
+			(void) write(fd, contents, strlen(contents));
+			close(fd);
+		}
+		check(unlink(local_uri) == 0,
+			  "remove referenced local layer for deleting recovery");
+		map.layers[0].deleting = true;
+		check(ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0 && access(local_uri, F_OK) != 0,
+			  "missing deleting layer does not block retry cleanup");
+		map.layers[0].deleting = false;
+		map.layers[0].remote_durable = true;
+		map.layers[0].locations[0].available = false;
+		check(ps_layer_store->create_local_layer(layer.layer_id, local_uri,
+									 sizeof(local_uri)) == 0 &&
+			  ps_layer_store->write_local_layer(layer.layer_id, contents,
+									 strlen(contents)) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 22, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(local_uri, F_OK) == 0 && access(orphan, F_OK) != 0,
+			  "unavailable remote-durable reference remains protected");
+		check(truncate(local_uri, 1) == 0 &&
+			  ps_layer_store->create_local_layer((3ULL << 48) | 24, orphan,
+									 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0 &&
+			  ps_layer_store->write_local_layer(layer.layer_id, contents,
+									 strlen(contents)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) == 0 &&
+			  access(orphan, F_OK) != 0,
+			  "present corrupt remote-durable cache fails closed");
+		map.layers[0].remote_durable = false;
+		map.layers[0].locations[0].available = true;
+		map.layers[0].location_count = 2;
+		snprintf(map.layers[0].locations[1].uri,
+				 sizeof(map.layers[0].locations[1].uri), "%s/not-canonical",
+				 local_dir);
+		map.layers[0].locations[1].tier = PS_LAYER_TIER_LOCAL_COLD;
+		map.layers[0].locations[1].available = false;
+		check(ps_layer_store->create_local_layer((3ULL << 48) | 23, orphan,
+								 sizeof(orphan)) == 0 &&
+			  ps_layer_store->recover_local_layers(&map) != 0 &&
+			  access(orphan, F_OK) == 0,
+			  "conflicting second local location fails closed");
+		map.layers[0].location_count = 1;
+		unlink(orphan);
+		ps_layer_map_free(&map);
+	}
 
 	ps_layer_store->close();
 	unsetenv("PAGESTORE_OBJECT_DIR");

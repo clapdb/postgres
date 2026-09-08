@@ -27,10 +27,12 @@
 
 #include "pagestore_storage.h"
 #include "pagestore_ipc.h"
+#include "pagestore_store_owner.h"
 #include "pagestore_wal_store.h"
 
 /* bounded well under the 4096-byte path buffers so suffixes never truncate */
 static char posix_dir[2048];
+static PsStoreOwner *posix_owner;
 
 /*
  * One cached OS fd per segment shard+id (opened lazily, never closed during a
@@ -97,6 +99,7 @@ static pthread_mutex_t posix_walidx_locks_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void posix_wal_locks_clear(void);
 static void posix_walidx_locks_clear(void);
+static void posix_close(void);
 
 static int posix_log_read(const char *name, uint64_t off, void *buf, uint32_t len);
 static int posix_log_append(const char *name, const void *buf, uint32_t len);
@@ -263,10 +266,23 @@ posix_open(const char *path, uint64_t segment_size)
 	const char *fail_seg_remove_dir_fsync;
 	const char *fail_seg_size;
 	int		dfd;
+	int		save_errno;
 
 	(void) segment_size; 	/* the file backend has no fixed-region layout */
-	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+	/* Explicit OPEN has historically replaced the previous POSIX instance.  Keep
+	 * that reopen behavior, but make the replacement release its old lease before
+	 * attempting to claim a different root. */
+	if (posix_owner != NULL)
+		posix_close();
+	if (ps_store_owner_acquire(path, &posix_owner) != 0)
 		return -1;
+	if (snprintf(posix_dir, sizeof(posix_dir), "%s",
+				 ps_store_owner_root(posix_owner)) < 0 ||
+		strlen(ps_store_owner_root(posix_owner)) >= sizeof(posix_dir))
+	{
+		errno = ENAMETOOLONG;
+		goto fail;
+	}
 
 	/* Backend ownership permits an explicit OPEN to abandon a previous POSIX
 	 * instance.  Serialize teardown before installing the new path so stale fd
@@ -328,7 +344,6 @@ posix_open(const char *path, uint64_t segment_size)
 		value = getenv("PAGESTORE_TEST_FAIL_FORK_META_REWRITE_DIR_FSYNC");
 		test_fail_fork_meta_rewrite_dir_fsync = value ? atoi(value) : 0;
 	}
-	snprintf(posix_dir, sizeof(posix_dir), "%s", path);
 	/* A prior metadata rename whose directory sync failed must be made durable
 	 * before this process can accept writes against its visible replacement. */
 	dfd = open(posix_dir, O_RDONLY | O_DIRECTORY);
@@ -336,13 +351,19 @@ posix_open(const char *path, uint64_t segment_size)
 	{
 		if (dfd >= 0)
 			close(dfd);
-		return -1;
+		goto fail;
 	}
 	if (close(dfd) != 0)
-		return -1;
+		goto fail;
 	/* A successful reopen has reconciled any ambiguous post-rename state. */
 	posix_wal_locks_clear();
 	return 0;
+
+fail:
+	save_errno = errno;
+	posix_close();
+	errno = save_errno;
+	return -1;
 }
 
 static void
@@ -353,6 +374,12 @@ posix_close(void)
 	pthread_mutex_unlock(&seg_fds_lock);
 	posix_wal_locks_clear();
 	posix_walidx_locks_clear();
+	posix_dir[0] = '\0';
+	if (posix_owner != NULL)
+	{
+		ps_store_owner_release(posix_owner);
+		posix_owner = NULL;
+	}
 }
 
 static int

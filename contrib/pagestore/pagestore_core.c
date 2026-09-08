@@ -15210,6 +15210,14 @@ ps_core_close_impl(void)
 	 * streams before the storage provider is closed or the store is reopened. */
 	ps_forkmeta_snapshot_gc_reset();
 	ps_manifest_close();
+	/* Provider teardown is part of the core lifecycle: this releases the
+	 * process-local store lease after all core users have stopped.  Existing
+	 * callers may still call provider close explicitly; provider closes are
+	 * idempotent for reopen compatibility. */
+	if (ps_layer_store != NULL && ps_layer_store->close != NULL)
+		ps_layer_store->close();
+	if (ps_storage != NULL && ps_storage->close != NULL)
+		ps_storage->close();
 	free_page_fork_indexes();
 	free_walidx_indexes();
 }
@@ -16215,9 +16223,22 @@ int
 ps_core_open(const char *store_dir)
 {
 	int rc;
+	int save_errno;
 
 	pthread_mutex_lock(&core_state_lock);
 	rc = ps_core_open_impl(store_dir);
+	if (rc != 0)
+	{
+		/* Provider opens own the store lease.  Unwind all lifecycle refs on every
+		 * startup failure, including failures after manifest replay begins. */
+		save_errno = errno;
+		ps_manifest_close();
+		if (ps_layer_store != NULL && ps_layer_store->close != NULL)
+			ps_layer_store->close();
+		if (ps_storage != NULL && ps_storage->close != NULL)
+			ps_storage->close();
+		errno = save_errno;
+	}
 	pthread_mutex_unlock(&core_state_lock);
 	return rc;
 }
@@ -16401,6 +16422,26 @@ ps_core_open_impl(const char *store_dir)
 	if (validate_store_shard_count(runtime_store_dir,
 							   &publish_shard_count) != 0)
 		return -1;
+	if (use_layers && ps_layer_store->validate_local_layers != NULL &&
+		ps_layer_store->validate_local_layers(&ps_layer_map) != 0)
+		return -1;
+	if (use_layers && mark_legacy_shard_zero_layers() != 0)
+		return -1;
+	/* The map is now a complete, shard-compatible replay result.  A tolerated
+	 * manifest tail repair is deliberately not authority for destructive orphan
+	 * cleanup; its durable quarantine marker suppresses this and all future
+	 * sweeps until an operator/repair workflow removes the ambiguity. */
+	if (use_layers && ps_layer_store->recover_local_layers != NULL)
+	{
+		int sweep_inhibited = ps_manifest_orphan_sweep_inhibited();
+
+		if (sweep_inhibited < 0)
+			return -1;
+		if (ps_manifest_replay_had_manifest() &&
+			!ps_manifest_replay_repaired() && !sweep_inhibited &&
+			ps_layer_store->recover_local_layers(&ps_layer_map) != 0)
+			return -1;
+	}
 	/* Leave deleting layers for asynchronous maintenance: recovery must not
 	 * block on an unavailable remote object that is already excluded from reads. */
 
@@ -16445,9 +16486,6 @@ ps_core_open_impl(const char *store_dir)
 		if (sh < ns && lid + 1 > g_shards[sh].next_layer_id)
 			g_shards[sh].next_layer_id = lid + 1;
 	}
-	if (use_layers && mark_legacy_shard_zero_layers() != 0)
-		return -1;
-
 	/* the LSM write side (memtable/flush/compaction) runs only when layers are
 	 * the read path; the SPDK daemon stays on the segment path for now.  One
 	 * memtable per shard. */

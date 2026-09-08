@@ -24,6 +24,11 @@ typedef struct PsFlushWatermark
 extern int	ps_manifest_open(const char *store_dir);
 extern void ps_manifest_close(void);
 extern int	ps_manifest_poisoned(void);
+extern int	ps_manifest_replay_repaired(void);
+extern int	ps_manifest_replay_had_manifest(void);
+/* 1 means a durable replay-repair quarantine marker exists, 0 means absent,
+ * and -1 means the marker itself is invalid. */
+extern int	ps_manifest_orphan_sweep_inhibited(void);
 extern int	ps_manifest_replay(PsLayerMap *map);
 extern int	ps_manifest_add_layer(const PsLayerDesc *desc);
 extern int	ps_manifest_set_remote_location(uint64_t layer_id,
