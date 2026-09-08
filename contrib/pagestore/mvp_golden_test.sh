@@ -534,9 +534,6 @@ echo "ok   - parent advanced and was durably materialized beyond the child fork"
 	"$BRANCH" >/dev/null || fail "could not restore branch checkpoint control"
 branch_wal_segment_size=$(wal_segment_size "$BRANCH") ||
 	fail "could not read branch WAL segment size"
-"${WP[@]}" -c "SELECT pagestore_ext.pagestore_install_prepared_branch_bootstrap(
-	'$PREPARED', '$BRANCH', 1, 0, '$checkpoint_redo', '$checkpoint_lsn',
-	'$fork_lsn');" >/dev/null || fail "could not install the portable branch bootstrap"
 # Remove the unrelated WAL segment created by the fresh initdb.  The restored
 # cluster identity must fetch its checkpoint and all subsequent WAL from store.
 find "$BRANCH/pg_wal" -maxdepth 1 -type f -name '0000000*' -delete ||
@@ -560,6 +557,87 @@ recovery_target_inclusive = on
 recovery_target_action = 'promote'
 EOF
 touch "$BRANCH/recovery.signal"
+
+# Exercise the portable installer in a real writer backend.  Its process exits
+# at the named boundary; the target remains offline until an unarmed retry.
+# Each iteration also covers reinstalling an already completed target.
+INSTALL_ORACLE="$(dirname "$0")/harness/tests/bootstrap_install_oracle.py"
+install_branch_bootstrap()
+{
+	"${WP[@]}" -c "SELECT pagestore_ext.pagestore_install_prepared_branch_bootstrap(
+		'$PREPARED', '$BRANCH', 1, 0, '$checkpoint_redo', '$checkpoint_lsn',
+		'$fork_lsn');"
+}
+for install_phase in after_maps after_slru_remove before_manifest after_manifest; do
+	install_control="$TMPROOT/install-$install_phase"
+	mkdir -m 700 "$install_control" || fail "could not create install fault control"
+	printf 'arm\n' > "$install_control/arm" || fail "could not arm install fault"
+	python3 "$INSTALL_ORACLE" snapshot "$PREPARED" "$BRANCH" \
+		"$install_control/before.json" || fail "could not snapshot install inputs"
+	"$BIN/pg_ctl" -D "$WRITER" -m fast -w stop >/dev/null 2>&1 ||
+		fail "could not stop writer before install crash"
+	env -u PAGESTORE_TEST_FAULT_OPERATION_ID -u PAGESTORE_TEST_FAULT_WATCHDOG_MS \
+		PAGESTORE_TEST_FAULT_NAME="branch_install.$install_phase" \
+		PAGESTORE_TEST_FAULT_ACTION=crash PAGESTORE_TEST_FAULT_HIT=1 \
+		PAGESTORE_TEST_FAULT_DIR="$install_control" \
+		PAGESTORE_TEST_FAULT_SCENARIO=mvp-golden PAGESTORE_TEST_FAULT_SEED=1 \
+		PAGESTORE_TEST_FAULT_OPERATION="install-$install_phase" \
+		"$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start \
+		>/dev/null 2>&1 || fail "could not start fault-enabled installer host"
+	if install_branch_bootstrap > "$install_control/sql.log" 2>&1; then
+		fail "install fault was not reached: $install_phase"
+	fi
+	install_pid=$(python3 "$INSTALL_ORACLE" report "$install_control/report.jsonl" \
+		"branch_install.$install_phase" "install-$install_phase") ||
+		fail "install crash report does not match the requested boundary"
+	# psql's connection failure is insufficient proof: require the backend's
+	# exact PID and the canonical process-abort exit code in the server log.
+	for ((attempt=0; attempt<100; attempt++)); do
+		if grep -E "(client backend|server process) \(PID $install_pid\) exited with exit code 88" \
+			"$WRITER/writer.log" >/dev/null; then
+			break
+		fi
+		sleep 0.1
+	done
+	[ "$attempt" -lt 100 ] || fail "installer did not exit with fault status 88"
+	"$BIN/pg_ctl" -D "$WRITER" -m immediate -w stop >/dev/null 2>&1 ||
+		fail "could not stop fault-enabled writer"
+	env -u PAGESTORE_TEST_FAULT_NAME -u PAGESTORE_TEST_FAULT_ACTION \
+		-u PAGESTORE_TEST_FAULT_HIT -u PAGESTORE_TEST_FAULT_DIR \
+		-u PAGESTORE_TEST_FAULT_SCENARIO -u PAGESTORE_TEST_FAULT_SEED \
+		-u PAGESTORE_TEST_FAULT_OPERATION -u PAGESTORE_TEST_FAULT_OPERATION_ID \
+		-u PAGESTORE_TEST_FAULT_WATCHDOG_MS \
+		"$BIN/pg_ctl" -D "$WRITER" -l "$WRITER/writer.log" -w start \
+		>/dev/null 2>&1 || fail "could not restart unarmed writer"
+	python3 "$INSTALL_ORACLE" unchanged "$PREPARED" "$BRANCH" \
+		"$install_control/before.json" || fail "install crash changed its source or control"
+	if [ "$install_phase" != after_manifest ]; then
+		[ ! -e "$BRANCH/pagestore_branch.manifest" ] ||
+			fail "incomplete install published a branch manifest"
+		if "$BIN/pg_ctl" -D "$BRANCH" -l "$install_control/startup.log" -w start \
+			>/dev/null 2>&1; then
+			fail "partially installed branch was admitted"
+		fi
+		grep -F 'pagestore.timeline requires pagestore_branch.manifest' \
+			"$install_control/startup.log" >/dev/null ||
+			fail "partial branch failed for a reason other than the manifest fence"
+		[ ! -e "$BRANCH/postmaster.pid" ] || fail "failed branch startup remains live"
+	else
+		python3 "$INSTALL_ORACLE" installed "$PREPARED" "$BRANCH" ||
+			fail "post-publication crash left an incomplete installation"
+	fi
+	install_branch_bootstrap >/dev/null || fail "portable install retry failed"
+	python3 "$INSTALL_ORACLE" installed "$PREPARED" "$BRANCH" ||
+		fail "retried installation differs from prepared artifacts"
+	python3 "$INSTALL_ORACLE" snapshot-installed "$BRANCH" \
+		"$install_control/installed.json" || fail "could not snapshot completed install"
+	install_branch_bootstrap >/dev/null || fail "repeated portable install failed"
+	python3 "$INSTALL_ORACLE" equal-installed "$BRANCH" \
+		"$install_control/installed.json" || fail "repeated portable install is not idempotent"
+	python3 "$INSTALL_ORACLE" unchanged "$PREPARED" "$BRANCH" \
+		"$install_control/before.json" || fail "install retry changed its source or control"
+	echo "ok   - portable bootstrap crash/retry: $install_phase"
+done
 
 "$BIN/pg_ctl" -D "$BRANCH" -l "$BRANCH/branch.log" -w start >/dev/null 2>&1 ||
 	fail "independent branch compute did not boot"

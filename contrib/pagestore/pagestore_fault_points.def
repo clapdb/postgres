@@ -27,3 +27,7 @@ PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_CREATE, "image_layer.after_create", "sto
 PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_WRITE, "image_layer.after_write", "store", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_SEAL, "image_layer.after_seal", "store", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_MANIFEST_ADD, "image_layer.after_manifest_add", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MAPS, "branch_install.after_maps", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_SLRU_REMOVE, "branch_install.after_slru_remove", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_BEFORE_MANIFEST, "branch_install.before_manifest", "branch", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(BRANCH_INSTALL_AFTER_MANIFEST, "branch_install.after_manifest", "branch", "process_abort", "crash", 1, 1)

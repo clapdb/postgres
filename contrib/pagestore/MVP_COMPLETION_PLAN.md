@@ -785,7 +785,8 @@ restartpoint plans pause the checkpointer child after relation-page sync/before
 marker write and after marker sync, then stop and recover the whole
 materializer.  The prepared-receipt/service-restore branch slice and the POSIX
 image-layer create/write/seal/manifest-ADD publication slice are also covered.
-Branch bootstrap/install, manifest replacement, reclaim, and GC H1 cases remain.
+Portable bootstrap/install is covered by the golden scenario's installer
+crash/retry matrix. Manifest replacement, reclaim, and GC H1 cases remain.
 
 Deliverables:
 
@@ -831,8 +832,8 @@ remain separate gates.
 ### H1. Compose process-level crash scenarios
 
 Status: **materializer replay/restartpoint, branch prepared-receipt/service-
-restore, and POSIX image-layer publication slices implemented; branch
-bootstrap/install, manifest replacement, reclaim, and GC cases remain and
+restore, portable bootstrap/install, and POSIX image-layer publication slices
+implemented; manifest replacement, reclaim, and GC cases remain and
 depend on H0/R2-R5**.
 
 Required scenario families:
@@ -843,6 +844,16 @@ Required scenario families:
 - page pruning, WAL reclaim, WAL-index compaction, remote upload intent and
   orphan reconciliation, and timeline deletion;
 - daemon, writer, materializer, and branch-compute restart combinations.
+
+The portable install slice in `mvp_golden_test.sh` targets an offline same-build,
+default-tablespace skeleton. Four named installer-backend aborts cover maps
+installed, the pg_xact remove/rename gap, and both sides of final manifest
+publication. Each case checks the exact fault report and backend exit,
+unchanged prepared inputs and restored control, startup rejection before
+publication, full artifact recovery on retry, and byte-idempotent reinstall.
+The resulting branch must pass golden SQL fork-point, parent/child isolation,
+and restart checks. Power-loss recovery and concurrent installers/service
+managers are outside this process-abort contract.
 
 The materializer slice is split into two focused plans: one pauses after
 relation-page store sync and before marker write, and one pauses after marker

@@ -110,6 +110,9 @@ jobs:
         working-directory: contrib/pagestore
         run: ./pagestore_fault_test
 
+      - name: Run portable bootstrap install oracle unit tests
+        run: python3 -B contrib/pagestore/harness/tests/test_bootstrap_install_oracle.py
+
       - name: Run named fault recovery harness
         working-directory: contrib/pagestore
         run: |
