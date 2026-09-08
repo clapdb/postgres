@@ -158,7 +158,13 @@ main(void)
 		point == PS_FAULT_POINT_DAEMON_AFTER_READY &&
 		strcmp(ps_fault_allowed_actions(point), "crash|error|pause") == 0 &&
 		strcmp(ps_fault_allowed_actions(PS_FAULT_POINT_PAGE_PRUNE_AFTER_FRONTIER),
-			"crash") == 0, "catalog exposes action policy");
+			"crash") == 0 &&
+		ps_fault_lookup("image_layer.after_create", &point) == 0 &&
+		strcmp(ps_fault_allowed_actions(point), "crash") == 0 &&
+		ps_fault_lookup("image_layer.after_write", &point) == 0 &&
+		ps_fault_lookup("image_layer.after_seal", &point) == 0 &&
+		ps_fault_lookup("image_layer.after_manifest_add", &point) == 0,
+		"catalog exposes action policy and H1 image-layer points");
 
 	/* Partial configuration, bad hit values, and non-crash lock-held actions fail closed. */
 	setenv("PAGESTORE_TEST_FAULT_ACTION", "crash", 1);

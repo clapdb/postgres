@@ -272,6 +272,7 @@ ACTION_FIELDS = {
     "sync": {"op", "id", "target", "kind", "extra"},
     "set_fault": {"op", "id", "target", "fault", "action", "hit", "timeout", "extra"},
     "release_fault": {"op", "id", "target", "fault", "extra"},
+    "layer_seed": {"op", "id", "target", "extra"},
     "capture": {"op", "id", "target", "kind", "name", "horizon", "extra"},
     "compare": {"op", "id", "left", "right", "extra"},
     "expect_failure": {"op", "id", "target", "command", "sqlstate", "extra"},
@@ -298,6 +299,7 @@ REQUIRED_FIELDS = {
     "sync": {"target", "kind"},
     "set_fault": {"target", "fault", "action"},
     "release_fault": {"target", "fault"},
+    "layer_seed": {"target"},
     "capture": {"target", "kind", "name", "horizon"},
     "compare": {"left", "right"},
     "expect_failure": {"target", "command"},
@@ -645,7 +647,7 @@ PG_CONTROL_FILE_SIZE = 8192
 
 RUNTIME_OPERATIONS = {
     "daemon_smoke": {"crash"},
-    "daemon_fault_smoke": {"crash", "set_fault", "release_fault"},
+    "daemon_fault_smoke": {"crash", "set_fault", "release_fault", "layer_seed"},
     "writer_smoke": {
         "sql", "checkpoint", "prepare_reader", "reader_base", "bootstrap",
         "install_reader", "assert", "capture",
@@ -666,6 +668,7 @@ RUNTIME_CONSTRAINTS = {
         "crash": {},
         "set_fault": {},
         "release_fault": {"target": ["store"]},
+        "layer_seed": {"target": ["store"]},
     },
     "writer_smoke": {
         "checkpoint": {"target": ["writer"]},
@@ -964,6 +967,11 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
                 f"runtime {runtime!r} uses materializer_fault for named process faults"
             )
     elif runtime == "daemon_fault_smoke":
+        seed_actions = [action for action in plan.actions if action["op"] == "layer_seed"]
+        if len(seed_actions) > 1:
+            raise PlanError(
+                f"runtime {runtime!r} permits at most one layer_seed action"
+            )
         named = [
             action for action in plan.actions
             if action["op"] in ("crash", "set_fault") and "fault" in action
@@ -975,7 +983,18 @@ def validate_runtime_plan(plan: Plan, capabilities: dict[str, Any], runtime: str
             raise PlanError(
                 "runtime daemon_fault_smoke requires exactly one named fault action"
             )
+        if seed_actions and plan.actions.index(seed_actions[0]) > plan.actions.index(named[0]):
+            raise PlanError(
+                "runtime daemon_fault_smoke requires layer_seed before the named fault"
+            )
         fault = named[0]
+        if seed_actions and fault["fault"] not in {
+            "image_layer.after_create", "image_layer.after_write",
+            "image_layer.after_seal", "image_layer.after_manifest_add",
+        }:
+            raise PlanError(
+                "runtime daemon_fault_smoke layer_seed requires an H1 image-layer fault"
+            )
         releases = [
             action for action in plan.actions
             if action["op"] == "release_fault" and action["fault"] == fault["fault"]
@@ -2203,6 +2222,102 @@ def _capture_fault_diagnostics(
     return root / "fault-diagnostics.json"
 
 
+def _layer_fault_stage(fault_name: str) -> str | None:
+    stages = {
+        "image_layer.after_create": "create",
+        "image_layer.after_write": "write",
+        "image_layer.after_seal": "seal",
+        "image_layer.after_manifest_add": "manifest_add",
+    }
+    return stages.get(fault_name)
+
+
+def _canonical_layer_files(store: Path) -> list[Path]:
+    files: list[Path] = []
+    pattern = re.compile(r"^layer_(?:0|[1-9][0-9]*)_[0-9a-fA-F]{16}$")
+    for path in sorted(store.iterdir()):
+        if not pattern.fullmatch(path.name):
+            continue
+        value = path.lstat()
+        if stat.S_ISREG(value.st_mode):
+            files.append(path)
+    return files
+
+
+def _check_layer_crash_snapshot(store: Path, stage: str) -> None:
+    """Check process-abort physical state before recovery mutates the store.
+
+    The after_write point deliberately proves only the write-stage ordering;
+    it is not a power-loss or file-fsync durability claim.
+    """
+    files = _canonical_layer_files(store)
+    if len(files) != 1:
+        raise OracleMismatch(
+            f"H1 {stage} crash left {len(files)} canonical layer files, expected one"
+        )
+    manifest = store / "layers.manifest"
+    manifest_size = manifest.stat().st_size if manifest.exists() else 0
+    size = files[0].stat().st_size
+    if stage == "create" and size != 0:
+        raise OracleMismatch("after_create did not leave an empty canonical layer")
+    if stage in {"write", "seal"} and size == 0:
+        raise OracleMismatch(f"after_{stage} did not leave written layer bytes")
+    if stage != "manifest_add" and manifest_size != 0:
+        raise OracleMismatch(f"after_{stage} unexpectedly published layers.manifest")
+    if stage == "manifest_add" and manifest_size == 0:
+        raise OracleMismatch("after_manifest_add did not leave a durable manifest ADD")
+
+
+def _check_layer_manifest(
+    manifest: dict[str, Any], stage: str, recovery_restart: bool,
+) -> None:
+    # Before manifest publication, segment replay rebuilds and republishes the
+    # interrupted flush.  After ADD publication but before the flush watermark,
+    # recovery conservatively retains that layer and republishes segment-backed
+    # coverage once.  The intervening clean shutdown compacts that conservative
+    # duplicate, so the following restart must converge to one layer.
+    expected_layers = 2 if stage == "manifest_add" and not recovery_restart else 1
+    if manifest.get("layer_count") != expected_layers:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported layer_count="
+            f"{manifest.get('layer_count')!r}, expected {expected_layers}"
+        )
+    if manifest.get("local_layers") != expected_layers:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported local_layers="
+            f"{manifest.get('local_layers')!r}, expected {expected_layers}"
+        )
+    if manifest.get("manifest_poisoned") is not False:
+        raise OracleMismatch(
+            f"after_{stage} recovery reported manifest_poisoned="
+            f"{manifest.get('manifest_poisoned')!r}"
+        )
+
+
+def _start_layer_client(
+    client: Path, shm: str, mode: str, log: Path,
+) -> subprocess.Popen[str]:
+    with log.open("a", encoding="utf-8") as output:
+        return subprocess.Popen(
+            [str(client), "--shm", shm, "--mode", mode],
+            stdout=output, stderr=subprocess.STDOUT, text=True,
+            env=private_environment(), start_new_session=True,
+        )
+
+
+def _verify_layer_client(client: Path, shm: str, log: Path, timeout: float) -> None:
+    with log.open("a", encoding="utf-8") as output:
+        result = subprocess.run(
+            [str(client), "--shm", shm, "--mode", "verify"],
+            stdout=output, stderr=subprocess.STDOUT, text=True,
+            env=private_environment(), timeout=max(5.0, timeout), check=False,
+        )
+    if result.returncode != 0:
+        raise OracleMismatch(
+            f"layer sentinel client failed after recovery with status {result.returncode}"
+        )
+
+
 def run_daemon_fault_recovery(
     plan: Plan,
     capabilities: dict[str, Any],
@@ -2214,6 +2329,7 @@ def run_daemon_fault_recovery(
     capabilities_path: Path | None = None,
     rerun_command: list[str] | None = None,
     timeout: float = 15.0,
+    layer_client: Path | None = None,
 ) -> Path:
     """Run one pre-armed named daemon fault and prove recovery is idempotent."""
     daemon = daemon.resolve()
@@ -2260,6 +2376,10 @@ def run_daemon_fault_recovery(
     ):
         raise PlanError("daemon fault recovery requires exactly one named fault action")
     action = named_faults[0]
+    layer_seed_actions = [item for item in plan.actions if item["op"] == "layer_seed"]
+    if layer_seed_actions and layer_client is None:
+        raise PlanError("layer_seed requires --layer-client-binary")
+    layer_stage = _layer_fault_stage(action["fault"]) if layer_seed_actions else None
     validate_fault_action(
         action, capabilities, f"{plan.path}:{action['id']}", capabilities_path,
         require_model=action["op"] == "crash",
@@ -2294,6 +2414,7 @@ def run_daemon_fault_recovery(
     generation = 0  # next generation; fault, recovery, clean restart: 0, 1, 2
     active_generation = 0
     process: subprocess.Popen[str] | None = None
+    layer_client_process: subprocess.Popen[str] | None = None
     shm_names: list[str] = []
     shm_base = f"/psharness_{os.getpid()}_{time.monotonic_ns()}"
     shm = ""
@@ -2330,6 +2451,9 @@ def run_daemon_fault_recovery(
             "--nshards", str(plan.header["case"]["shards"]),
             "--storage", plan.header["case"]["storage"],
         ]
+        if layer_seed_actions:
+            command.extend(["--segment-size", "65536", "--flush-pages", "2",
+                            "--compact-layers", "1000"])
         env = private_environment()
         if inject_fault:
             # Keep these names local and explicit: inherited PAGESTORE_* values
@@ -2402,9 +2526,22 @@ def run_daemon_fault_recovery(
         current_action_id = action["id"]
         emit("fault_arm", target="store", name=fault_name, hit=fault_hit)
         process = start_daemon(True, action["id"])
+        if layer_seed_actions:
+            wait_ready(process)
+            layer_client_process = _start_layer_client(
+                layer_client, shm, "seed", trace / "layer-client.log"
+            )
         deadline = time.monotonic() + fault_timeout
         if fault_action == "crash":
             while process.poll() is None and time.monotonic() < deadline:
+                if layer_client_process is not None and layer_client_process.poll() is not None:
+                    if layer_client_process.returncode == 0:
+                        raise FaultNotReached(
+                            f"layer workload completed before fault {fault_name!r}"
+                        )
+                    raise UnexpectedExit(
+                        f"layer workload exited with status {layer_client_process.returncode}"
+                    )
                 time.sleep(0.02)
             if process.poll() is None:
                 raise FaultNotReached(
@@ -2431,6 +2568,12 @@ def run_daemon_fault_recovery(
                 scenario, seed, action["id"],
             )
             shutil.copy2(report, trace / "fault-report.jsonl")
+            if layer_stage is not None:
+                _check_layer_crash_snapshot(store, layer_stage)
+            if layer_client_process is not None and layer_client_process.poll() is None:
+                layer_client_process.kill()
+                layer_client_process.wait(timeout=5)
+            layer_client_process = None
             emit("fault", target="store", name=fault_name, model=fault_model,
                  returncode=fault_process.returncode, report=result, reached=True)
             remove_shm(shm)
@@ -2551,6 +2694,10 @@ def run_daemon_fault_recovery(
         # Recovery is intentionally followed by one additional clean restart.
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
+        if layer_seed_actions:
+            _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
+            manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+            _check_layer_manifest(manifest, layer_stage, False)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("recovered", target="store", health=health)
         stop_daemon()
@@ -2559,6 +2706,10 @@ def run_daemon_fault_recovery(
         remove_shm(shm)
         process = start_daemon(False, action["id"])
         health = wait_ready(process)
+        if layer_seed_actions:
+            _verify_layer_client(layer_client, shm, trace / "layer-client.log", timeout)
+            manifest = inspect_store(inspector, shm, "manifest", inspection_schema)
+            _check_layer_manifest(manifest, layer_stage, True)
         probe_runtime_inspection(inspector, shm, capabilities, inspection_schema)
         emit("restarted", target="store", health=health)
         emit("run_pass")
@@ -2593,6 +2744,8 @@ def run_daemon_fault_recovery(
                 "--inspection-schema", str(bundle_inspection_schema),
                 "--daemon-fault-recovery", str(root / "plan.jsonl"),
                 "--daemon-binary", str(daemon), "--inspect-binary", str(inspector),
+                *( ["--layer-client-binary", str(layer_client)]
+                   if layer_client is not None else [] ),
                 "--run-root", str(root.parent / f"{root.name}.rerun"), "--keep",
             ],
         }
@@ -2600,6 +2753,9 @@ def run_daemon_fault_recovery(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     finally:
+        if layer_client_process is not None and layer_client_process.poll() is None:
+            layer_client_process.kill()
+            layer_client_process.wait(timeout=5)
         if process is not None:
             stop_daemon()
             emit("process_stop", target="store", pid=process.pid,
@@ -4007,6 +4163,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     group.add_argument("--materializer-smoke", type=Path, metavar="PLAN")
     group.add_argument("--legacy-integration", action="store_true")
     parser.add_argument("--daemon-binary", type=Path)
+    parser.add_argument("--layer-client-binary", type=Path)
     parser.add_argument("--materializer-supervisor", type=Path)
     parser.add_argument("--build-dir", type=Path)
     parser.add_argument("--integration-script", type=Path,
@@ -4134,6 +4291,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 args.daemon_binary, args.inspect_binary, args.run_root, args.keep,
                 args.capabilities, command,
+                layer_client=args.layer_client_binary,
             )
             if args.keep or args.run_root:
                 print(root)

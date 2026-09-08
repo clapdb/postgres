@@ -20,3 +20,10 @@ PAGESTORE_FAULT_POINT(BRANCH_PREPARE_BEFORE_PREPARED_RECEIPT, "branch_prepare.be
 PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_PREPARED_RECEIPT, "branch_prepare.after_prepared_receipt", "branch", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_MATERIALIZER_RESUME, "branch_prepare.after_materializer_resume", "branch", "process_abort", "crash", 1, 1)
 PAGESTORE_FAULT_POINT(BRANCH_PREPARE_AFTER_WRITER_RESTORE, "branch_prepare.after_writer_restore", "branch", "process_abort", "crash", 1, 1)
+// Image-layer H1 probes are ordered POSIX-local process-abort boundaries: the
+// file exists, has been written but not sealed, has been fsync'd, and its ADD
+// has been fsync'd in layers.manifest.  after_write is not a power-loss claim.
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_CREATE, "image_layer.after_create", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_WRITE, "image_layer.after_write", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_SEAL, "image_layer.after_seal", "store", "process_abort", "crash", 1, 1)
+PAGESTORE_FAULT_POINT(IMAGE_LAYER_AFTER_MANIFEST_ADD, "image_layer.after_manifest_add", "store", "process_abort", "crash", 1, 1)

@@ -523,6 +523,41 @@ class PlanValidationTests(unittest.TestCase):
         MODULE.validate_plan(plan, capabilities)
         MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
 
+    def test_image_layer_fault_scenarios_validate_as_ordered_composed_slices(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        scenario_dir = ROOT / "scenarios"
+        scenarios = [
+            scenario_dir / "image_layer_after_create.jsonl",
+            scenario_dir / "image_layer_after_write.jsonl",
+            scenario_dir / "image_layer_after_seal.jsonl",
+            scenario_dir / "image_layer_after_manifest_add.jsonl",
+        ]
+        for path in scenarios:
+            with self.subTest(scenario=path.name):
+                plan = MODULE.read_plan(path)
+                MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+                MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
+    def test_image_layer_seed_cannot_follow_named_fault(self):
+        capabilities = MODULE.read_json(ROOT / "capabilities.json")
+        path = self.write_plan([
+            {
+                "schema": 1, "scenario": "bad-layer-order", "seed": 1,
+                "contracts": ["fault_reachability"],
+                "case": {"storage": "posix", "shards": 1, "compute": ["writer"]},
+            },
+            {
+                "op": "crash", "id": "fault", "target": "store",
+                "model": "process_abort", "fault": "image_layer.after_create",
+                "action": "crash", "hit": 1,
+            },
+            {"op": "layer_seed", "id": "seed", "target": "store"},
+        ])
+        plan = MODULE.read_plan(path)
+        MODULE.validate_plan(plan, capabilities, ROOT / "capabilities.json")
+        with self.assertRaisesRegex(MODULE.PlanError, "layer_seed before"):
+            MODULE.validate_runtime_plan(plan, capabilities, "daemon_fault_smoke")
+
     def test_named_fault_catalog_rejects_wrong_hit_without_launch(self):
         capabilities = MODULE.read_json(ROOT / "capabilities.json")
         path = self.write_plan([

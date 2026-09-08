@@ -81,6 +81,14 @@ pagestore_daemon = executable('pagestore_daemon',
 )
 contrib_targets += pagestore_daemon
 
+# Deterministic POSIX image-layer crash workload/oracle used by the H1 harness
+# slice.  It only speaks the standalone daemon IPC protocol.
+pagestore_layer_crash_client = executable('pagestore_layer_crash_client',
+  files('pagestore_layer_crash_client.c'),
+  kwargs: default_bin_args,
+)
+contrib_targets += pagestore_layer_crash_client
+
 # Pure process-local unit test for the first crash-only named fault registry.
 pagestore_fault_test = executable('pagestore_fault_test',
   files('pagestore_fault_test.c', 'pagestore_fault.c'),
@@ -176,7 +184,9 @@ test('pagestore_inspect_mailbox',
 
 # Unit test for the immutable image-layer file format (no daemon, no PG).
 pagestore_layer_test = executable('pagestore_layer_test',
-  files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_layer_store.c'),
+  files('pagestore_layer_test.c', 'pagestore_layer.c', 'pagestore_layer_store.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_layer',
@@ -187,7 +197,9 @@ test('pagestore_layer',
 
 # Unit test for the filesystem-backed remote object provider (no daemon, no PG).
 pagestore_layer_store_test = executable('pagestore_layer_store_test',
-  files('pagestore_layer_store_test.c', 'pagestore_layer_store.c', 'pagestore_layer.c'),
+  files('pagestore_layer_store_test.c', 'pagestore_layer_store.c', 'pagestore_layer.c',
+        'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_layer_store',
@@ -334,7 +346,8 @@ test('pagestore_backpressure_daemon',
 # Unit test for the durable layer manifest replay (no daemon, no PG).
 pagestore_manifest_test = executable('pagestore_manifest_test',
   files('pagestore_manifest_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
-        'pagestore_layer_store.c'),
+        'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_manifest',
@@ -358,7 +371,8 @@ test('pagestore_retention',
 # Unit test for crash-safe compaction/GC recovery (no daemon, no PG).
 pagestore_gc_test = executable('pagestore_gc_test',
   files('pagestore_gc_test.c', 'pagestore_manifest.c', 'pagestore_layer.c',
-        'pagestore_layer_store.c'),
+        'pagestore_layer_store.c', 'pagestore_fault.c'),
+  dependencies: [dependency('threads')],
   install: false,
 )
 test('pagestore_gc',
@@ -575,5 +589,24 @@ foreach fault_scenario : ['daemon_fault_error', 'daemon_fault_pause']
     depends: [pagestore_daemon, pagestore_inspect],
     suite: ['pagestore'],
     timeout: 30,
+  )
+endforeach
+foreach layer_fault_scenario : [
+  'image_layer_after_create',
+  'image_layer_after_write',
+  'image_layer_after_seal',
+  'image_layer_after_manifest_add',
+]
+  test('pagestore_harness_' + layer_fault_scenario,
+    pagestore_harness_python,
+    args: [files('harness/pagestore_harness.py'),
+           '--capabilities', files('harness/capabilities.json'),
+           '--daemon-fault-recovery', files('harness/scenarios/' + layer_fault_scenario + '.jsonl'),
+           '--daemon-binary', pagestore_daemon,
+           '--layer-client-binary', pagestore_layer_crash_client,
+           '--inspect-binary', pagestore_inspect],
+    depends: [pagestore_daemon, pagestore_layer_crash_client, pagestore_inspect],
+    suite: ['pagestore'],
+    timeout: 60,
   )
 endforeach
